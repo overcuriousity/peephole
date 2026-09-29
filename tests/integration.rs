@@ -379,3 +379,63 @@ async fn export_download_requires_auth_and_filters() {
     assert_eq!(resp.status(), 200);
     assert!(resp.bytes().await.unwrap().len() > 100);
 }
+
+#[tokio::test]
+async fn full_stack_smoke() {
+    // Start the real run() against a temp config with ephemeral ports.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_text = format!(r#"
+trap_listen = "127.0.0.1:18080"
+admin_listen = "127.0.0.1:18443"
+database_path = "{db}"
+data_dir = "{d}"
+rules_dir = "rules"
+trusted_proxies = ["127.0.0.1/32"]
+[webauthn]
+rp_id = "localhost"
+origin = "https://localhost"
+rp_name = "peephole-test"
+[maxmind]
+account_id = "1"
+license_key = "k"
+[scan]
+max_workers = 1
+timeout_secs = 5
+rescan_cooldown_hours = 24
+max_scans_per_hour = 100
+"#, db = dir.path().join("t.db").display(), d = dir.path().display());
+    let cfg_path = dir.path().join("c.toml");
+    std::fs::write(&cfg_path, &cfg_text).unwrap();
+    // Point the scan pool at the fake nmap so the smoke test needs no privileges.
+    // SAFETY: test-only; PEEPHOLE_NMAP_PATH is read once by run() below and no
+    // other test in this binary touches the environment.
+    unsafe { std::env::set_var("PEEPHOLE_NMAP_PATH", fake_nmap(dir.path())); }
+    let handle = tokio::spawn(peephole::run(cfg_path.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client.get("http://127.0.0.1:18080/bot-traffic").send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+    let resp = client.get("http://127.0.0.1:18443/api/stats").send().await.unwrap();
+    let stats: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(stats["total_requests"], 1);
+    // Fake nmap should have completed the queued scan.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let stats: serde_json::Value = client.get("http://127.0.0.1:18443/api/stats")
+            .send().await.unwrap().json().await.unwrap();
+        if stats["scans_done"].as_i64().unwrap() >= 1 { break; }
+        assert!(std::time::Instant::now() < deadline, "scan did not complete");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    handle.abort();
+}
+
+fn fake_nmap(dir: &std::path::Path) -> String {
+    let fake = dir.join("fake-nmap");
+    std::fs::write(&fake, "#!/bin/sh\ncat \"$(dirname \"$0\")/nmap.xml\"\n").unwrap();
+    std::fs::copy("tests/fixtures/nmap-basic.xml", dir.join("nmap.xml")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fake.to_string_lossy().into_owned()
+}

@@ -1,0 +1,16 @@
+[Unit]
+Description=peephole — scan-the-scanners honeypot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/peephole /etc/peephole/config.toml
+Restart=on-failure
+RestartSec=5
+# Runs as root by design (nmap -sS/-O). nmap is spawned with fixed argv, no shell.
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
