@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod detail;
 pub mod sse;
 
 use crate::config::Config;
@@ -30,16 +31,13 @@ pub fn router(state: Arc<AdminState>) -> Router {
 /// routes behind `auth::SessionUser` here too).
 pub fn router_with_auth(store: Store, cfg: Config) -> Router {
     let state = Arc::new(AdminState::public_only(store, cfg));
-    // Gated placeholders until Tasks 10–11 mount the real detail/export routes.
+    // /export stays a gated placeholder until Task 11 mounts the real routes.
     let stubs = Router::new()
-        .route("/requests", get(auth_placeholder))
-        .route("/ips/{id}", get(auth_placeholder))
-        .route("/inbox", get(auth_placeholder))
         .route("/export", get(auth_placeholder))
-        .route("/keys", get(auth_placeholder))
         .with_state(state.clone());
     router(state.clone())
         .merge(auth::auth_routes().with_state(state.clone()))
+        .merge(detail::routes().with_state(state.clone()))
         .merge(stubs)
 }
 

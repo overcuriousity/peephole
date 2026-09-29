@@ -284,3 +284,73 @@ async fn webauthn_ceremony_with_soft_token() {
         .fetch_one(&store.pool).await.unwrap();
     assert!(sessions >= 1);
 }
+
+/// Spins `router_with_auth` on an ephemeral port and runs the soft-passkey
+/// enroll ceremony (fresh store per test, so the setup token is issuable).
+async fn enrolled_admin_client(store: Store, cfg: Config) -> (reqwest::Client, String) {
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+    use webauthn_authenticator_rs::AuthenticatorBackend;
+    use webauthn_authenticator_rs::prelude::Url;
+    let token = peephole::admin::auth::ensure_setup_token(&store, std::path::Path::new("/tmp"))
+        .await.unwrap().expect("setup token issuable on fresh store");
+    let app = peephole::admin::router_with_auth(store, cfg);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::builder().cookie_store(true).build().unwrap();
+    let mut soft = SoftPasskey::new(true);
+    let resp = client.post(format!("{base}/enroll/start"))
+        .json(&serde_json::json!({"setup_token": token, "label": "test-key"}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let cco: serde_json::Value = resp.json().await.unwrap();
+    let options: webauthn_rs_proto::PublicKeyCredentialCreationOptions =
+        serde_json::from_value(cco["publicKey"].clone()).unwrap();
+    let cred = soft.perform_register(Url::parse("https://localhost").unwrap(), options, 60_000).unwrap();
+    let resp = client.post(format!("{base}/enroll/finish"))
+        .json(&serde_json::json!({"credential": cred}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200, "enroll finish failed");
+    (client, base)
+}
+
+#[tokio::test]
+async fn detail_views_and_inbox_work_with_session() {
+    let (trap_base, store, dir) = spawn_trap().await;
+    let client_pub = reqwest::Client::new();
+    // Seed: one probe, one fp claim with email, one sqli.
+    let _ = client_pub.get(format!("{trap_base}/hello")).header("x-forwarded-for", "203.0.113.77").send().await.unwrap();
+    let _ = client_pub.post(format!("{trap_base}/claim")).header("x-forwarded-for", "203.0.113.77")
+        .form(&[("email", "lost@example.org")]).send().await.unwrap();
+    let _ = client_pub.get(format!("{trap_base}/login?u=' OR '1'='1")).header("x-forwarded-for", "203.0.113.78").send().await.unwrap();
+
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store.clone(), cfg).await;
+
+    // Request list with filter.
+    let html = client.get(format!("{base}/requests?path=/hello")).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("/hello"));
+    assert!(!html.contains("/login"));
+
+    // Per-request detail contains headers and body (authenticated only).
+    let rid: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/hello' LIMIT 1")
+        .fetch_one(&store.pool).await.unwrap();
+    let html = client.get(format!("{base}/requests/{rid}")).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("x-forwarded-for"));
+
+    // Per-IP detail.
+    let ip_id: i64 = sqlx::query_scalar("SELECT id FROM ips WHERE ip = '203.0.113.77'")
+        .fetch_one(&store.pool).await.unwrap();
+    let html = client.get(format!("{base}/ips/{ip_id}")).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("203.0.113.77"));
+    assert!(html.contains("/hello"));
+
+    // Inbox shows the fp claim with contact email.
+    let html = client.get(format!("{base}/inbox")).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("lost@example.org"));
+
+    // Keys page lists enrolled key.
+    let html = client.get(format!("{base}/keys")).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("test-key") || html.contains("credential"));
+}
