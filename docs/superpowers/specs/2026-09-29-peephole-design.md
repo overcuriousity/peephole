@@ -123,7 +123,7 @@ Scan (worker pool):
 | 1     | superficial | single plain 4xx probe                            | `-sS -T2 --top-ports 100`                        |
 | 2     | standard    | repeated distinct path scanning, scanner UA       | `-sS -sV -T3 --top-ports 1000`                   |
 | 3     | deep        | trap-form interaction, generic injection patterns | `-sS -sV -O -T3 -p- --script=default`            |
-| 4     | intensive   | clear exploit payload (SQLi/RCE/traversal sig)    | `-sS -sV -O -A -T3/-T4 -p- --script=default,intrusive` |
+| 4     | intensive   | clear exploit payload (SQLi/RCE/traversal sig)    | `-sS -sV -O -A -T4 -p- --script=default,intrusive` |
 
 Exact argv per level lives in `config.toml` (sensible defaults above, operator
 editable; non-silent/faster timing allowed at higher levels).
