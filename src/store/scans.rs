@@ -44,9 +44,10 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         if let Some((last_level,)) = recent
-            && (level as i64) <= last_level {
-                return Ok(EnqueueOutcome::Cooldown);
-            }
+            && (level as i64) <= last_level
+        {
+            return Ok(EnqueueOutcome::Cooldown);
+        }
         let pending: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM scan_jobs WHERE ip_id = ? AND status IN ('queued','running')",
         )

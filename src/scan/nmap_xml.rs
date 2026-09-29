@@ -89,22 +89,22 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
                             }
                         }
                     }
-                    b"osmatch"
-                        if os_guess.is_none() => {
-                            for a in e.attributes().flatten() {
-                                if a.key.as_ref() == b"name" {
-                                    os_guess = Some(String::from_utf8_lossy(&a.value).into_owned());
-                                }
+                    b"osmatch" if os_guess.is_none() => {
+                        for a in e.attributes().flatten() {
+                            if a.key.as_ref() == b"name" {
+                                os_guess = Some(String::from_utf8_lossy(&a.value).into_owned());
                             }
                         }
+                    }
                     _ => {}
                 }
             }
             Event::End(e) if e.name().as_ref() == b"port" => {
                 if let Some(p) = cur.take()
-                    && p.port > 0 {
-                        ports.push(p);
-                    }
+                    && p.port > 0
+                {
+                    ports.push(p);
+                }
             }
             Event::Eof => break,
             _ => {}
