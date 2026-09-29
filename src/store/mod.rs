@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod fingerprints;
 pub mod requests;
 pub mod scans;

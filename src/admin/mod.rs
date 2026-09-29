@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod sse;
 
 use crate::config::Config;
@@ -23,6 +24,27 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/api/stats", get(stats_json))
         .route("/api/queue", get(sse::queue_stream))
         .with_state(state)
+}
+
+/// Full admin router including auth + authenticated routes (Task 10 mounts its
+/// routes behind `auth::SessionUser` here too).
+pub fn router_with_auth(store: Store, cfg: Config) -> Router {
+    let state = Arc::new(AdminState::public_only(store, cfg));
+    // Gated placeholders until Tasks 10–11 mount the real detail/export routes.
+    let stubs = Router::new()
+        .route("/requests", get(auth_placeholder))
+        .route("/ips/{id}", get(auth_placeholder))
+        .route("/inbox", get(auth_placeholder))
+        .route("/export", get(auth_placeholder))
+        .route("/keys", get(auth_placeholder))
+        .with_state(state.clone());
+    router(state.clone())
+        .merge(auth::auth_routes().with_state(state.clone()))
+        .merge(stubs)
+}
+
+async fn auth_placeholder(_u: auth::SessionUser) -> impl IntoResponse {
+    (axum::http::StatusCode::NOT_IMPLEMENTED, "landing in Tasks 10–11")
 }
 
 async fn dashboard(State(state): State<Arc<AdminState>>) -> impl IntoResponse {

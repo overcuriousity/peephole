@@ -15,6 +15,7 @@ path = "src/main.rs"
 anyhow = "1"
 askama = "0.14"
 axum = "0.8"
+axum-extra = { version = "0.10", features = ["cookie-signed"] }
 chrono = { version = "0.4", features = ["serde"] }
 data-encoding = "2"
 flate2 = "1"
@@ -24,7 +25,7 @@ maxminddb = "0.26"
 quick-xml = "0.37"
 rand = "0.9"
 regex = "1"
-reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "json"] }
+reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "json", "cookies"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -35,7 +36,10 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
+webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
+webauthn-rs-proto = "0.5"

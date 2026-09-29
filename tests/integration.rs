@@ -213,3 +213,74 @@ async fn queue_sse_streams_job_updates() {
     }).await.unwrap();
     assert!(body.contains("queued") || body.contains("running") || body.contains("done"));
 }
+
+#[tokio::test]
+async fn authenticated_routes_redirect_without_session() {
+    let (_trap_base, store, dir) = spawn_trap().await;
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let app = peephole::admin::router_with_auth(store, cfg);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    for path in ["/requests", "/ips/1", "/inbox", "/export", "/keys"] {
+        let resp = client.get(format!("http://{addr}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), 303, "{path} must redirect to login");
+        assert_eq!(resp.headers().get("location").unwrap(), "/login");
+    }
+    // Public routes stay public.
+    let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client.get(format!("http://{addr}/login")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn webauthn_ceremony_with_soft_token() {
+    // Full ceremony: enroll (with setup token) then login, using
+    // webauthn-authenticator-rs's soft token.
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+    use webauthn_authenticator_rs::AuthenticatorBackend;
+    use webauthn_authenticator_rs::prelude::Url;
+    let (_trap_base, store, dir) = spawn_trap().await;
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let token = peephole::admin::auth::ensure_setup_token(&store, std::path::Path::new("/tmp")).await.unwrap();
+    let app = peephole::admin::router_with_auth(store.clone(), cfg);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::builder().cookie_store(true).build().unwrap();
+
+    let mut soft = SoftPasskey::new(true);
+    // Enrollment start: server returns PublicKeyCredentialCreationOptions JSON + challenge id cookie.
+    let resp = client.post(format!("{base}/enroll/start"))
+        .json(&serde_json::json!({"setup_token": token.unwrap(), "label": "test-key"}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let cco: serde_json::Value = resp.json().await.unwrap();
+    let options: webauthn_rs_proto::PublicKeyCredentialCreationOptions =
+        serde_json::from_value(cco["publicKey"].clone()).unwrap();
+    let origin = Url::parse("https://localhost").unwrap();
+    let cred = soft.perform_register(origin, options, 60_000).unwrap();
+    let resp = client.post(format!("{base}/enroll/finish"))
+        .json(&serde_json::json!({"credential": cred}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200, "enroll finish failed: {:?}", resp.text().await);
+    assert_eq!(store.load_credentials().await.unwrap().len(), 1);
+
+    // Login with the same soft token.
+    let resp = client.post(format!("{base}/login/start")).send().await.unwrap();
+    let cro: serde_json::Value = resp.json().await.unwrap();
+    let options: webauthn_rs_proto::PublicKeyCredentialRequestOptions =
+        serde_json::from_value(cro["publicKey"].clone()).unwrap();
+    let assertion = soft.perform_auth(Url::parse("https://localhost").unwrap(), options, 60_000).unwrap();
+    let resp = client.post(format!("{base}/login/finish"))
+        .json(&serde_json::json!({"credential": assertion}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    // Login created a valid session (covered by the cookie set on /login/finish).
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+        .fetch_one(&store.pool).await.unwrap();
+    assert!(sessions >= 1);
+}
