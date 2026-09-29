@@ -27,3 +27,17 @@ impl Store {
         Ok(Self { pool })
     }
 }
+
+impl Store {
+    pub async fn intel_get(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT value FROM intel_meta WHERE key = ?")
+            .bind(key).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn intel_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO intel_meta (key, value) VALUES (?, ?)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(key).bind(value).execute(&self.pool).await?;
+        Ok(())
+    }
+}
