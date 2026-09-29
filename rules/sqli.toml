@@ -1,0 +1,9 @@
+[[rule]]
+label = "sqli"
+weight = 4
+target_regex = "('|%27)(\\s|%20)*(or|and)(\\s|%20)+('|%27)?[0-9'=%20]+('|%27)?=|union(\\s|%20)+select|information_schema|sleep\\s*\\(|benchmark\\s*\\(|updatexml|extractvalue"
+
+[[rule]]
+label = "sqli"
+weight = 4
+body_regex = "('|%27)(\\s|%20)*(or|and)(\\s|%20)+|union(\\s|%20)+select|sleep\\s*\\("

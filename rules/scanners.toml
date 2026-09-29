@@ -1,0 +1,4 @@
+[[rule]]
+label = "scanner-ua"
+weight = 2
+ua_regex = "sqlmap|nikto|nmap|masscan|nuclei|acunetix|nessus|openvas|wpscan|dirbuster|gobuster|hydra|metasploit|zgrab"

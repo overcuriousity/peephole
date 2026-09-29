@@ -1,0 +1,4 @@
+[[rule]]
+label = "xss"
+weight = 3
+target_regex = "<script|%3Cscript|javascript:|onerror\\s*=|onload\\s*="

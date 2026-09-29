@@ -1,0 +1,9 @@
+[[rule]]
+label = "rce"
+weight = 4
+target_regex = ";\\s*(id|whoami|cat\\s+/etc)|\\|\\s*(nc|curl|wget)\\s|\\$\\(.*\\)|`.*`|/bin/(sh|bash)|cmd\\.exe|powershell"
+
+[[rule]]
+label = "rce"
+weight = 4
+body_regex = "/bin/(sh|bash)|cmd\\.exe|powershell|\\|\\s*(nc|curl|wget)\\s"

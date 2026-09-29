@@ -1,0 +1,4 @@
+[[rule]]
+label = "path-traversal"
+weight = 4
+target_regex = "\\.\\./|\\.\\.%2f|%2e%2e|/etc/passwd|/proc/self|win.ini"

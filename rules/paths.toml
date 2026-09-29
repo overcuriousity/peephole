@@ -1,0 +1,14 @@
+[[rule]]
+label = "sensitive-path"
+weight = 2
+path_exact = "/.env"
+
+[[rule]]
+label = "sensitive-path"
+weight = 2
+path_exact = "/.git/config"
+
+[[rule]]
+label = "sensitive-path"
+weight = 2
+target_regex = "/wp-(login|admin|content|includes)|/phpmyadmin|/\\.well-known/|/xmlrpc\\.php|/cgi-bin/"
