@@ -1,5 +1,6 @@
 pub mod config;
+pub mod store;
 
 fn main() {
-    println!("peephole: see Task 12 for wiring");
+    println!("peephole: store + config ready");
 }
