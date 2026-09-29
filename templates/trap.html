@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Notice — undefined route</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: system-ui, sans-serif; background:#f8fafc; color:#0f172a;
+         max-width: 680px; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.55; }
+  .card { background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:1.5rem; margin-bottom:1.25rem; }
+  h1 { font-size:1.35rem; margin:0 0 .75rem; }
+  .muted { color:#64748b; font-size:.9rem; }
+  button { background:#2563eb; color:#fff; border:0; border-radius:6px; padding:.55rem 1rem;
+           font-size:.95rem; cursor:pointer; }
+  button:hover { background:#1d4ed8; }
+  input[type=email], input[type=text], input[type=password] {
+    width:100%; box-sizing:border-box; padding:.5rem; border:1px solid #cbd5e1; border-radius:6px; margin:.25rem 0 .75rem; }
+  .bait { border:1px dashed #94a3b8; }
+  #email-row { display:none; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>⚠ Notice — undefined route</h1>
+    <p>This request was directed to a route which does not exist. Your IP address was
+       classified as potentially malicious and will be scanned.</p>
+    <p class="muted">Browser characteristics are recorded for security research.</p>
+  </div>
+
+  <div class="card">
+    <button id="accident-btn" type="button">I landed here by accident</button>
+    <form id="email-row" method="post" action="/claim">
+      <p class="muted">The admin was notified. If you want to be contacted for
+         clarification, fill in your email address here (optional):</p>
+      <input type="email" name="email" placeholder="you@example.org">
+      <button type="submit">Submit</button>
+    </form>
+  </div>
+
+  <div class="card bait">
+    <p class="muted"><em>this login form is for malicious bots. if you want to ensure
+       to get flagged, fill this form.</em></p>
+    <form method="post" action="/login">
+      <label>Username <input type="text" name="username" autocomplete="off"></label>
+      <label>Password <input type="password" name="password"></label>
+      <button type="submit">Log in</button>
+    </form>
+  </div>
+
+  <div id="fingerprint-panel"></div>
+
+  <script>
+    document.getElementById('accident-btn').addEventListener('click', function () {
+      this.style.display = 'none';
+      document.getElementById('email-row').style.display = 'block';
+    });
+    window.PEEPHOLE_TOKEN = "__PAGE_TOKEN__";
+  </script>
+  <script src="/collect.js" defer></script>
+</body>
+</html>

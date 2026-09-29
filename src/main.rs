@@ -1,9 +1,3 @@
-pub mod classify;
-pub mod config;
-pub mod intel;
-pub mod scan;
-pub mod store;
-
 fn main() {
-    println!("peephole: store + config ready");
+    println!("peephole: see src/lib.rs; full wiring in Task 12");
 }

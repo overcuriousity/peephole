@@ -40,4 +40,19 @@ impl Store {
             .bind(key).bind(value).execute(&self.pool).await?;
         Ok(())
     }
+
+    pub async fn ip_history(&self, ip_id: i64) -> anyhow::Result<crate::classify::IpHistory> {
+        let (paths, reqs): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT path), COUNT(*) FROM requests
+             WHERE ip_id = ? AND ts > datetime('now','-1 hour')",
+        ).bind(ip_id).fetch_one(&self.pool).await?;
+        let last_level: Option<i64> = sqlx::query_scalar(
+            "SELECT level FROM scans WHERE ip_id = ? ORDER BY finished_at DESC LIMIT 1",
+        ).bind(ip_id).fetch_optional(&self.pool).await?;
+        Ok(crate::classify::IpHistory {
+            distinct_paths_1h: paths as u32,
+            requests_1h: reqs as u32,
+            last_scan_level: last_level.unwrap_or(0) as u8,
+        })
+    }
 }

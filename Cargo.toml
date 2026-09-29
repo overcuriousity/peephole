@@ -3,8 +3,17 @@ name = "peephole"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "peephole"
+path = "src/lib.rs"
+
+[[bin]]
+name = "peephole"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
+askama = "0.14"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 data-encoding = "2"
