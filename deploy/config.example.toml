@@ -1,0 +1,40 @@
+# peephole configuration
+# Copy to /etc/peephole/config.toml and edit.
+
+# Trap listener: HAProxy routes fallback (nonexistent-route) traffic here directly.
+trap_listen = "0.0.0.0:8080"
+# Admin listener: nginx terminates TLS in front of this.
+admin_listen = "127.0.0.1:8443"
+
+# SQLite database (WAL mode) and data dir (MaxMind DBs, Tor exit list snapshot).
+database_path = "/var/lib/peephole/peephole.db"
+data_dir = "/var/lib/peephole"
+
+# Directory with TOML signature rules (ships with defaults; editable without recompile).
+rules_dir = "/etc/peephole/rules"
+
+# Proxies whose X-Forwarded-For header is trusted for the real client IP.
+trusted_proxies = ["10.0.0.0/8"]
+
+[webauthn]
+# Public domain the dashboard is reached at through nginx (FIDO2 relying party).
+rp_id = "peephole.example.net"
+origin = "https://peephole.example.net"
+rp_name = "peephole"
+
+[maxmind]
+# GeoLite2 account credentials (https://www.maxmind.com/en/accounts/current/license-key).
+account_id = "123456"
+license_key = "testkey"
+
+[scan]
+max_workers = 2            # concurrent nmap subprocesses
+timeout_secs = 900         # per-scan wall-clock timeout
+rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
+max_scans_per_hour = 30    # global rate cap; excess jobs stay queued
+never_scan = ["192.168.0.0/16"] # CIDRs never counter-scanned (own infra, monitoring)
+
+# Optional per-level nmap argv overrides; {target} is NOT used — the target IP is
+# appended as the final argument. Example:
+# [scan.level_argv]
+# 2 = ["-sS", "-sV", "-T3", "--top-ports", "2000"]
