@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sS -sV -oX - 198.51.100.23" start="1759100000" version="7.92">
+  <host starttime="1759100000" endtime="1759100042">
+    <status state="up" reason="syn-ack"/>
+    <address addr="198.51.100.23" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open" reason="syn-ack"/>
+        <service name="ssh" product="OpenSSH" version="9.2p1" method="probed" conf="10"/>
+      </port>
+      <port protocol="tcp" portid="80">
+        <state state="open" reason="syn-ack"/>
+        <service name="http" product="nginx" version="1.25.4" method="probed" conf="10"/>
+      </port>
+      <port protocol="tcp" portid="443">
+        <state state="filtered" reason="no-response"/>
+      </port>
+    </ports>
+    <os>
+      <osmatch name="Linux 5.X" accuracy="95"/>
+    </os>
+  </host>
+  <runstats><finished time="1759100042"/></runstats>
+</nmaprun>

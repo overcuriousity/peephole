@@ -1,4 +1,5 @@
 pub mod requests;
+pub mod scans;
 
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};

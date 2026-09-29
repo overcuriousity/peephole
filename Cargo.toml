@@ -10,6 +10,7 @@ chrono = { version = "0.4", features = ["serde"] }
 data-encoding = "2"
 ipnet = { version = "2", features = ["serde"] }
 maxminddb = "0.26"
+quick-xml = "0.37"
 rand = "0.9"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
@@ -21,6 +22,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
