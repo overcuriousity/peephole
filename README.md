@@ -13,6 +13,9 @@ Tor-exit intelligence, and the interesting ones get **scanned back** with nmap.
 [![CI](https://github.com/overcuriousity/peephole/actions/workflows/ci.yml/badge.svg)](https://github.com/overcuriousity/peephole/actions/workflows/ci.yml)
 [![Release](https://github.com/overcuriousity/peephole/actions/workflows/release.yml/badge.svg)](https://github.com/overcuriousity/peephole/actions/workflows/release.yml)
 
+**Think twice before deploying this!**
+While I find it ethically ok to scan anybody who scans you, be aware that this procedure might be illegal in some jusrisdictions, and may get your ip-address flagged for abuse. Deploy mindfully!
+
 ## Install
 
 One line, on a fresh Debian/Ubuntu machine:
