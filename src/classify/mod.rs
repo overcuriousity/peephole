@@ -73,15 +73,23 @@ impl Classifier {
             Some(q) => format!("{}?{}", req.path, q),
             None => req.path.to_string(),
         };
-        let ua = req.headers.iter()
+        let ua = req
+            .headers
+            .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
-            .map(|(_, v)| v.as_str()).unwrap_or("");
-        let body = req.body.map(|b| String::from_utf8_lossy(b)).unwrap_or_default();
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let body = req
+            .body
+            .map(|b| String::from_utf8_lossy(b))
+            .unwrap_or_default();
 
         for r in &self.rules {
             let hit = r.path_exact.as_deref() == Some(req.path)
                 || r.target.as_ref().is_some_and(|re| re.is_match(&target))
-                || r.body.as_ref().is_some_and(|re| !body.is_empty() && re.is_match(&body))
+                || r.body
+                    .as_ref()
+                    .is_some_and(|re| !body.is_empty() && re.is_match(&body))
                 || r.ua.as_ref().is_some_and(|re| re.is_match(ua));
             if hit {
                 labels.push(r.label.clone());
@@ -113,7 +121,11 @@ impl Classifier {
         labels.sort();
         labels.dedup();
         let scan_level = weight.min(4);
-        Verdict { severity: weight, scan_level, labels }
+        Verdict {
+            severity: weight,
+            scan_level,
+            labels,
+        }
     }
 }
 
@@ -130,34 +142,58 @@ mod tests {
     fn classifier() -> Classifier {
         Classifier::from_dir(std::path::Path::new("rules")).unwrap()
     }
-    fn view<'a>(method: &'a str, path: &'a str, query: Option<&'a str>, ua: &'a str, body: Option<&'a [u8]>) -> RequestView<'a> {
+    fn view<'a>(
+        method: &'a str,
+        path: &'a str,
+        query: Option<&'a str>,
+        ua: &'a str,
+        body: Option<&'a [u8]>,
+    ) -> RequestView<'a> {
         RequestView {
-            method, path, query,
+            method,
+            path,
+            query,
             headers: vec![("user-agent".into(), ua.into())],
             body,
         }
     }
     fn hist(paths: u32, reqs: u32) -> IpHistory {
-        IpHistory { distinct_paths_1h: paths, requests_1h: reqs, last_scan_level: 0 }
+        IpHistory {
+            distinct_paths_1h: paths,
+            requests_1h: reqs,
+            last_scan_level: 0,
+        }
     }
 
     #[test]
     fn single_plain_probe_is_level_1() {
-        let v = classifier().classify(&view("GET", "/nonexistent", None, "Mozilla/5.0", None), &hist(1, 1), &BotTells::default());
+        let v = classifier().classify(
+            &view("GET", "/nonexistent", None, "Mozilla/5.0", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
         assert_eq!(v.scan_level, 1);
         assert!(v.labels.contains(&"probe".to_string()));
     }
 
     #[test]
     fn repeated_scanning_is_level_2() {
-        let v = classifier().classify(&view("GET", "/a", None, "Mozilla/5.0", None), &hist(15, 20), &BotTells::default());
+        let v = classifier().classify(
+            &view("GET", "/a", None, "Mozilla/5.0", None),
+            &hist(15, 20),
+            &BotTells::default(),
+        );
         assert_eq!(v.scan_level, 2);
         assert!(v.labels.contains(&"path-scanner".to_string()));
     }
 
     #[test]
     fn scanner_user_agent_is_level_2() {
-        let v = classifier().classify(&view("GET", "/", None, "sqlmap/1.7.11", None), &hist(1, 1), &BotTells::default());
+        let v = classifier().classify(
+            &view("GET", "/", None, "sqlmap/1.7.11", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
         assert_eq!(v.scan_level, 2);
         assert!(v.labels.contains(&"scanner-ua".to_string()));
     }
@@ -165,30 +201,59 @@ mod tests {
     #[test]
     fn sqli_in_query_is_level_4() {
         let v = classifier().classify(
-            &view("GET", "/login", Some("user=admin'%20OR%20'1'='1"), "Mozilla/5.0", None),
-            &hist(1, 1), &BotTells::default());
+            &view(
+                "GET",
+                "/login",
+                Some("user=admin'%20OR%20'1'='1"),
+                "Mozilla/5.0",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
         assert_eq!(v.scan_level, 4);
         assert!(v.labels.iter().any(|l| l == "sqli"));
     }
 
     #[test]
     fn bait_form_post_is_at_least_level_3() {
-        let v = classifier().classify(&view("POST", "/login", None, "Mozilla/5.0", Some(b"username=a&password=b")), &hist(2, 3), &BotTells::default());
+        let v = classifier().classify(
+            &view(
+                "POST",
+                "/login",
+                None,
+                "Mozilla/5.0",
+                Some(b"username=a&password=b"),
+            ),
+            &hist(2, 3),
+            &BotTells::default(),
+        );
         assert!(v.scan_level >= 3);
         assert!(v.labels.contains(&"form-interaction".to_string()));
     }
 
     #[test]
     fn sensitive_path_label() {
-        let v = classifier().classify(&view("GET", "/.env", None, "curl/8.0", None), &hist(1, 1), &BotTells::default());
+        let v = classifier().classify(
+            &view("GET", "/.env", None, "curl/8.0", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
         assert!(v.labels.contains(&"sensitive-path".to_string()));
         assert!(v.scan_level >= 2);
     }
 
     #[test]
     fn webdriver_escalates() {
-        let bot = BotTells { webdriver: true, inhuman_fill: false };
-        let v = classifier().classify(&view("GET", "/x", None, "Mozilla/5.0", None), &hist(1, 1), &bot);
+        let bot = BotTells {
+            webdriver: true,
+            inhuman_fill: false,
+        };
+        let v = classifier().classify(
+            &view("GET", "/x", None, "Mozilla/5.0", None),
+            &hist(1, 1),
+            &bot,
+        );
         assert!(v.scan_level >= 2);
         assert!(v.labels.contains(&"automation".to_string()));
     }

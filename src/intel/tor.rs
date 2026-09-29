@@ -10,7 +10,9 @@ pub struct TorExitList {
     set: BTreeSet<IpAddr>,
 }
 
-fn file(data_dir: &Path) -> PathBuf { data_dir.join("tor-exit.txt") }
+fn file(data_dir: &Path) -> PathBuf {
+    data_dir.join("tor-exit.txt")
+}
 
 impl TorExitList {
     pub fn load(data_dir: &Path) -> Result<Self> {
@@ -29,9 +31,16 @@ impl TorExitList {
 
     /// Download a fresh list; on failure the old file is left untouched.
     pub async fn refresh(data_dir: &Path) -> Result<u64> {
-        let body = reqwest::get(TOR_EXIT_URL).await?.error_for_status()?
-            .text().await.context("fetching tor exit list")?;
-        let count = body.lines().filter(|l| l.trim().parse::<IpAddr>().is_ok()).count() as u64;
+        let body = reqwest::get(TOR_EXIT_URL)
+            .await?
+            .error_for_status()?
+            .text()
+            .await
+            .context("fetching tor exit list")?;
+        let count = body
+            .lines()
+            .filter(|l| l.trim().parse::<IpAddr>().is_ok())
+            .count() as u64;
         anyhow::ensure!(count > 100, "tor exit list suspiciously small ({count})");
         let tmp = data_dir.join("tor-exit.txt.tmp");
         std::fs::write(&tmp, &body)?;
@@ -48,7 +57,11 @@ mod tests {
     #[test]
     fn parses_exit_list_and_matches() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("tor-exit.txt"), "203.0.113.1\n198.51.100.44\n\n2001:db8::5\n").unwrap();
+        std::fs::write(
+            dir.path().join("tor-exit.txt"),
+            "203.0.113.1\n198.51.100.44\n\n2001:db8::5\n",
+        )
+        .unwrap();
         let list = TorExitList::load(dir.path()).unwrap();
         assert!(list.contains(&"203.0.113.1".parse::<IpAddr>().unwrap()));
         assert!(list.contains(&"2001:db8::5".parse::<IpAddr>().unwrap()));

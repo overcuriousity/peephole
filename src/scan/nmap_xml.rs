@@ -1,6 +1,6 @@
-use anyhow::{bail, Context, Result};
-use quick_xml::events::Event;
+use anyhow::{Context, Result, bail};
 use quick_xml::Reader;
+use quick_xml::events::Event;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PortResult {
@@ -28,7 +28,10 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
     let mut buf = Vec::new();
 
     loop {
-        match reader.read_event_into(&mut buf).context("parsing nmap xml")? {
+        match reader
+            .read_event_into(&mut buf)
+            .context("parsing nmap xml")?
+        {
             Event::Start(e) | Event::Empty(e) => {
                 let name = e.name();
                 match name.as_ref() {
@@ -38,14 +41,22 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
                         let mut proto = String::from("tcp");
                         for a in e.attributes().flatten() {
                             match a.key.as_ref() {
-                                b"portid" => port = String::from_utf8_lossy(&a.value).parse().unwrap_or(0),
-                                b"protocol" => proto = String::from_utf8_lossy(&a.value).into_owned(),
+                                b"portid" => {
+                                    port = String::from_utf8_lossy(&a.value).parse().unwrap_or(0)
+                                }
+                                b"protocol" => {
+                                    proto = String::from_utf8_lossy(&a.value).into_owned()
+                                }
                                 _ => {}
                             }
                         }
                         cur = Some(PortResult {
-                            port, proto, state: "unknown".into(),
-                            service: None, product: None, version: None,
+                            port,
+                            proto,
+                            state: "unknown".into(),
+                            service: None,
+                            product: None,
+                            version: None,
                         });
                     }
                     b"state" => {
@@ -61,30 +72,39 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
                         if let Some(p) = cur.as_mut() {
                             for a in e.attributes().flatten() {
                                 match a.key.as_ref() {
-                                    b"name" => p.service = Some(String::from_utf8_lossy(&a.value).into_owned()),
-                                    b"product" => p.product = Some(String::from_utf8_lossy(&a.value).into_owned()),
-                                    b"version" => p.version = Some(String::from_utf8_lossy(&a.value).into_owned()),
+                                    b"name" => {
+                                        p.service =
+                                            Some(String::from_utf8_lossy(&a.value).into_owned())
+                                    }
+                                    b"product" => {
+                                        p.product =
+                                            Some(String::from_utf8_lossy(&a.value).into_owned())
+                                    }
+                                    b"version" => {
+                                        p.version =
+                                            Some(String::from_utf8_lossy(&a.value).into_owned())
+                                    }
                                     _ => {}
                                 }
                             }
                         }
                     }
-                    b"osmatch" => {
-                        if os_guess.is_none() {
+                    b"osmatch"
+                        if os_guess.is_none() => {
                             for a in e.attributes().flatten() {
                                 if a.key.as_ref() == b"name" {
                                     os_guess = Some(String::from_utf8_lossy(&a.value).into_owned());
                                 }
                             }
                         }
-                    }
                     _ => {}
                 }
             }
             Event::End(e) if e.name().as_ref() == b"port" => {
-                if let Some(p) = cur.take() {
-                    if p.port > 0 { ports.push(p); }
-                }
+                if let Some(p) = cur.take()
+                    && p.port > 0 {
+                        ports.push(p);
+                    }
             }
             Event::Eof => break,
             _ => {}
@@ -94,7 +114,11 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
     if !saw_host && ports.is_empty() {
         bail!("nmap xml contained no host data");
     }
-    Ok(ScanResult { os_guess, ports, raw_xml: xml.to_vec() })
+    Ok(ScanResult {
+        os_guess,
+        ports,
+        raw_xml: xml.to_vec(),
+    })
 }
 
 #[cfg(test)]

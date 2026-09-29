@@ -32,8 +32,8 @@ pub fn load_dir(dir: &Path) -> Result<Vec<Rule>> {
     entries.sort();
     for path in entries {
         let text = std::fs::read_to_string(&path)?;
-        let file: RuleFile = toml::from_str(&text)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let file: RuleFile =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         rules.extend(file.rule);
     }
     Ok(rules)

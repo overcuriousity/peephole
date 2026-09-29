@@ -4,7 +4,12 @@ pub mod sse;
 
 use crate::config::Config;
 use crate::store::Store;
-use axum::{Router, extract::State, response::{Html, IntoResponse, Json}, routing::get};
+use axum::{
+    Router,
+    extract::State,
+    response::{Html, IntoResponse, Json},
+    routing::get,
+};
 use std::sync::Arc;
 
 pub struct AdminState {
@@ -37,7 +42,11 @@ pub fn router_with_auth(store: Store, cfg: Config) -> Router {
 }
 
 async fn dashboard(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let stats = state.store.public_stats().await.unwrap_or_else(|_| crate::store::PublicStats::default_stats());
+    let stats = state
+        .store
+        .public_stats()
+        .await
+        .unwrap_or_else(|_| crate::store::PublicStats::default_stats());
     Html(render_dashboard(&stats))
 }
 
@@ -53,7 +62,11 @@ fn render_dashboard(s: &crate::store::PublicStats) -> String {
     for r in &s.recent {
         rows.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}{}</td></tr>",
-            esc(&r.ts), esc(&r.ip), esc(&r.method), esc(&r.path), r.severity,
+            esc(&r.ts),
+            esc(&r.ip),
+            esc(&r.method),
+            esc(&r.path),
+            r.severity,
             esc(&r.country.clone().unwrap_or_default()),
             if r.is_tor { " [tor]" } else { "" },
         ));
@@ -64,7 +77,8 @@ fn render_dashboard(s: &crate::store::PublicStats) -> String {
     }
     // Stale-intel badge (spec §9): warn when tor/maxmind data is older than 48h.
     let stale = |key: &str| -> bool {
-        s.intel.get(key)
+        s.intel
+            .get(key)
             .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
             .map(|t| chrono::Utc::now().signed_duration_since(t).num_hours() > 48)
             .unwrap_or(true)
@@ -84,5 +98,8 @@ fn render_dashboard(s: &crate::store::PublicStats) -> String {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }

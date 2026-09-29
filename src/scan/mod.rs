@@ -31,15 +31,22 @@ pub async fn run_workers(
             // Global rate cap (spec §5): don't start new scans past the hourly cap.
             match store.recent_scans_last_hour().await {
                 Ok(n) if n >= cfg.scan.max_scans_per_hour => break,
-                Err(e) => { warn!(?e, "rate cap check failed"); break; }
+                Err(e) => {
+                    warn!(?e, "rate cap check failed");
+                    break;
+                }
                 _ => {}
             }
             match store.next_queued_job().await {
                 Ok(Some(job)) => {
                     let ip: String = sqlx::query_scalar("SELECT ip FROM ips WHERE id=?")
-                        .bind(job.ip_id).fetch_one(&store.pool).await
+                        .bind(job.ip_id)
+                        .fetch_one(&store.pool)
+                        .await
                         .unwrap_or_default();
-                    let Ok(target) = ip.parse::<IpAddr>() else { continue };
+                    let Ok(target) = ip.parse::<IpAddr>() else {
+                        continue;
+                    };
                     let argv = nmap_argv(job.level as u8, &target, &cfg);
                     let store2 = store.clone();
                     let nmap = nmap_path.clone();
@@ -57,19 +64,36 @@ pub async fn run_workers(
                                         let _ = store2.finish_job(job.id, Some(&res), None).await;
                                         info!(target = %target, level = job.level, "scan done");
                                     }
-                                    Err(e) => { let _ = store2.finish_job(job.id, None, Some(&e.to_string())).await; }
+                                    Err(e) => {
+                                        let _ = store2
+                                            .finish_job(job.id, None, Some(&e.to_string()))
+                                            .await;
+                                    }
                                 }
                             }
                             Ok(Ok(out)) => {
-                                let _ = store2.finish_job(job.id, None, Some(&format!("exit {:?}", out.status.code()))).await;
+                                let _ = store2
+                                    .finish_job(
+                                        job.id,
+                                        None,
+                                        Some(&format!("exit {:?}", out.status.code())),
+                                    )
+                                    .await;
                             }
-                            Ok(Err(e)) => { let _ = store2.finish_job(job.id, None, Some(&e.to_string())).await; }
-                            Err(_) => { let _ = store2.finish_job(job.id, None, Some("timeout")).await; }
+                            Ok(Err(e)) => {
+                                let _ = store2.finish_job(job.id, None, Some(&e.to_string())).await;
+                            }
+                            Err(_) => {
+                                let _ = store2.finish_job(job.id, None, Some("timeout")).await;
+                            }
                         }
                     });
                 }
                 Ok(None) => break,
-                Err(e) => { warn!(?e, "queue poll failed"); break; }
+                Err(e) => {
+                    warn!(?e, "queue poll failed");
+                    break;
+                }
             }
         }
         tokio::select! {
@@ -89,7 +113,8 @@ mod tests {
     use std::net::IpAddr;
 
     fn test_config(dir: &std::path::Path) -> Config {
-        let toml = format!(r#"
+        let toml = format!(
+            r#"
 trap_listen = "0.0.0.0:8080"
 admin_listen = "127.0.0.1:8443"
 database_path = "{db}"
@@ -102,7 +127,10 @@ rp_name = "x"
 [maxmind]
 account_id = "1"
 license_key = "k"
-"#, db = dir.join("t.db").display(), dir = dir.display());
+"#,
+            db = dir.join("t.db").display(),
+            dir = dir.display()
+        );
         let path = dir.join("c.toml");
         std::fs::write(&path, toml).unwrap();
         Config::load(&path).unwrap()
@@ -123,7 +151,10 @@ license_key = "k"
     async fn cooldown_suppresses_rescan_but_allows_upgrade_once() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
-        let ip = store.upsert_ip("198.51.100.1".parse().unwrap()).await.unwrap();
+        let ip = store
+            .upsert_ip("198.51.100.1".parse().unwrap())
+            .await
+            .unwrap();
         // Pretend a level-1 scan finished just now.
         let job = match store.enqueue_scan(ip.id, 1, 24).await.unwrap() {
             crate::store::scans::EnqueueOutcome::Queued(id) => id,
@@ -155,7 +186,10 @@ license_key = "k"
 
         let cfg = test_config(dir.path());
         let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
-        let ip = store.upsert_ip("198.51.100.23".parse().unwrap()).await.unwrap();
+        let ip = store
+            .upsert_ip("198.51.100.23".parse().unwrap())
+            .await
+            .unwrap();
         store.enqueue_scan(ip.id, 2, 24).await.unwrap();
 
         let (tx, rx) = tokio::sync::watch::channel(false);
@@ -164,15 +198,24 @@ license_key = "k"
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let done: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scans")
-                .fetch_one(&store.pool).await.unwrap();
-            if done == 1 { break; }
-            assert!(std::time::Instant::now() < deadline, "worker did not finish");
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+            if done == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not finish"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         tx.send(true).unwrap();
         pool.await.unwrap();
         let ports: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ports")
-            .fetch_one(&store.pool).await.unwrap();
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
         assert_eq!(ports, 3);
         let mut f = std::fs::File::create("/dev/null").unwrap();
         f.write_all(b"").unwrap(); // keeps Write import used

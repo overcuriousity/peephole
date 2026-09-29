@@ -21,13 +21,21 @@ pub fn routes() -> Router<Arc<AdminState>> {
 
 #[derive(serde::Deserialize, Default)]
 pub struct RequestFilter {
-    pub ip: Option<String>, pub path: Option<String>, pub label: Option<String>,
-    pub severity: Option<i64>, pub country: Option<String>, pub asn: Option<i64>,
-    pub from: Option<String>, pub to: Option<String>,
+    pub ip: Option<String>,
+    pub path: Option<String>,
+    pub label: Option<String>,
+    pub severity: Option<i64>,
+    pub country: Option<String>,
+    pub asn: Option<i64>,
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 async fn requests_page(
@@ -41,8 +49,15 @@ async fn requests_page(
         trs.push_str(&format!(
             "<tr><td>{}</td><td><a href=\"/ips/{}\">{}</a></td><td>{}</td>\
              <td><a href=\"/requests/{}\">{}</a></td><td>{}</td><td>{}</td></tr>",
-            esc(&r.ts), r.ip_id, esc(&r.ip), esc(&r.method), r.id, esc(&r.path),
-            r.severity, esc(&r.labels_json)));
+            esc(&r.ts),
+            r.ip_id,
+            esc(&r.ip),
+            esc(&r.method),
+            r.id,
+            esc(&r.path),
+            r.severity,
+            esc(&r.labels_json)
+        ));
     }
     Html(include_str!("../../templates/requests.html").replace("__ROWS__", &trs))
 }
@@ -54,14 +69,16 @@ async fn request_detail_page(
 ) -> Html<String> {
     let d = state.store.request_detail(id).await.ok().flatten();
     Html(match d {
-        Some((req, headers_pretty, body_pretty)) => include_str!("../../templates/request_detail.html")
-            .replace("__METHOD__", &esc(&req.method))
-            .replace("__PATH__", &esc(&req.path))
-            .replace("__TS__", &esc(&req.ts.to_string()))
-            .replace("__LABELS__", &esc(&req.labels_json))
-            .replace("__SEVERITY__", &req.severity.to_string())
-            .replace("__HEADERS__", &esc(&headers_pretty))
-            .replace("__BODY__", &esc(&body_pretty)),
+        Some((req, headers_pretty, body_pretty)) => {
+            include_str!("../../templates/request_detail.html")
+                .replace("__METHOD__", &esc(&req.method))
+                .replace("__PATH__", &esc(&req.path))
+                .replace("__TS__", &esc(&req.ts.to_string()))
+                .replace("__LABELS__", &esc(&req.labels_json))
+                .replace("__SEVERITY__", &req.severity.to_string())
+                .replace("__HEADERS__", &esc(&headers_pretty))
+                .replace("__BODY__", &esc(&body_pretty))
+        }
         None => "<p>not found</p>".to_string(),
     })
 }
@@ -84,13 +101,21 @@ async fn inbox_page(_u: SessionUser, State(state): State<Arc<AdminState>>) -> Ht
     for c in &claims {
         trs.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            esc(&c.ts), esc(&c.ip), esc(&c.contact_email.clone().unwrap_or_default()), esc(&c.user_agent)));
+            esc(&c.ts),
+            esc(&c.ip),
+            esc(&c.contact_email.clone().unwrap_or_default()),
+            esc(&c.user_agent)
+        ));
     }
     Html(include_str!("../../templates/inbox.html").replace("__ROWS__", &trs))
 }
 
 async fn keys_page(_u: SessionUser, State(state): State<Arc<AdminState>>) -> Html<String> {
-    let keys = state.store.list_credential_labels().await.unwrap_or_default();
+    let keys = state
+        .store
+        .list_credential_labels()
+        .await
+        .unwrap_or_default();
     let mut trs = String::new();
     for (cred_id_hex, label, created) in &keys {
         trs.push_str(&format!(
@@ -102,7 +127,9 @@ async fn keys_page(_u: SessionUser, State(state): State<Arc<AdminState>>) -> Htm
 }
 
 #[derive(serde::Deserialize)]
-pub struct KeyDeleteForm { cred_id: String }
+pub struct KeyDeleteForm {
+    cred_id: String,
+}
 
 async fn key_delete(
     _u: SessionUser,
@@ -112,7 +139,13 @@ async fn key_delete(
     // SQLite hex() is uppercase; normalize before decoding.
     if let Ok(bytes) = data_encoding::HEXLOWER.decode(f.cred_id.to_lowercase().as_bytes()) {
         // Guard: never delete the last remaining key (would lock the admin out).
-        if state.store.load_credentials().await.map(|c| c.len() > 1).unwrap_or(false) {
+        if state
+            .store
+            .load_credentials()
+            .await
+            .map(|c| c.len() > 1)
+            .unwrap_or(false)
+        {
             let _ = state.store.delete_credential(&bytes).await;
         }
     }
@@ -131,8 +164,10 @@ async fn export_download(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let filter = crate::export::ExportFilter {
-        from: q.get("from").cloned(), to: q.get("to").cloned(),
-        ip: q.get("ip").cloned(), label: q.get("label").cloned(),
+        from: q.get("from").cloned(),
+        to: q.get("to").cloned(),
+        ip: q.get("ip").cloned(),
+        label: q.get("label").cloned(),
         min_severity: q.get("min_severity").and_then(|s| s.parse().ok()),
     };
     let rows = match state.store.export_requests(&filter).await {
@@ -140,15 +175,31 @@ async fn export_download(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     let (body, ext, mime) = match q.get("format").map(String::as_str) {
-        Some("csv") => (crate::export::requests_csv(&rows).into_bytes(), "csv", "text/csv".to_string()),
-        Some("jsonl") => (crate::export::requests_timesketch(&rows).into_bytes(), "jsonl", "application/x-ndjson".to_string()),
+        Some("csv") => (
+            crate::export::requests_csv(&rows).into_bytes(),
+            "csv",
+            "text/csv".to_string(),
+        ),
+        Some("jsonl") => (
+            crate::export::requests_timesketch(&rows).into_bytes(),
+            "jsonl",
+            "application/x-ndjson".to_string(),
+        ),
         Some("parquet") => match crate::export::parquet::requests_parquet(&rows) {
             Ok(b) => (b, "parquet", "application/octet-stream".to_string()),
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         _ => return (StatusCode::BAD_REQUEST, "format must be csv|jsonl|parquet").into_response(),
     };
-    ([(axum::http::header::CONTENT_TYPE, mime),
-      (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"peephole-export.{ext}\""))],
-     body).into_response()
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, mime),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"peephole-export.{ext}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }

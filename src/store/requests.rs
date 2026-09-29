@@ -1,7 +1,7 @@
+use super::Store;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::net::IpAddr;
-use super::Store;
 
 pub struct NewRequest {
     pub ip_id: i64,
@@ -55,25 +55,42 @@ impl Store {
             "INSERT INTO ips (ip, first_seen, last_seen) VALUES (?, datetime('now'), datetime('now'))
              ON CONFLICT(ip) DO UPDATE SET last_seen = datetime('now')",
         ).bind(&s).execute(&self.pool).await?;
-        Ok(sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE ip = ?").bind(&s)
-            .fetch_one(&self.pool).await?)
+        Ok(sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE ip = ?")
+            .bind(&s)
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     pub async fn ip_by_id(&self, id: i64) -> Result<Option<IpRow>> {
-        Ok(sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE id = ?").bind(id)
-            .fetch_optional(&self.pool).await?)
+        Ok(sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
     }
 
-    pub async fn set_ip_geo(&self, ip_id: i64, country: Option<&str>, asn: Option<u32>, asn_org: Option<&str>) -> Result<()> {
+    pub async fn set_ip_geo(
+        &self,
+        ip_id: i64,
+        country: Option<&str>,
+        asn: Option<u32>,
+        asn_org: Option<&str>,
+    ) -> Result<()> {
         sqlx::query("UPDATE ips SET country = ?, asn = ?, asn_org = ? WHERE id = ?")
-            .bind(country).bind(asn.map(|a| a as i64)).bind(asn_org).bind(ip_id)
-            .execute(&self.pool).await?;
+            .bind(country)
+            .bind(asn.map(|a| a as i64))
+            .bind(asn_org)
+            .bind(ip_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     pub async fn set_ip_tor(&self, ip_id: i64, is_tor: bool) -> Result<()> {
         sqlx::query("UPDATE ips SET is_tor_exit = ? WHERE id = ?")
-            .bind(is_tor).bind(ip_id).execute(&self.pool).await?;
+            .bind(is_tor)
+            .bind(ip_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -90,14 +107,27 @@ impl Store {
     }
 
     pub async fn request_by_id(&self, id: i64) -> Result<Option<RequestRow>> {
-        Ok(sqlx::query_as::<_, RequestRow>("SELECT * FROM requests WHERE id = ?")
-            .bind(id).fetch_optional(&self.pool).await?)
+        Ok(
+            sqlx::query_as::<_, RequestRow>("SELECT * FROM requests WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
-    pub async fn insert_fp_claim(&self, ip_id: i64, request_id: i64, email: Option<&str>, ua: &str) -> Result<()> {
+    pub async fn insert_fp_claim(
+        &self,
+        ip_id: i64,
+        request_id: i64,
+        email: Option<&str>,
+        ua: &str,
+    ) -> Result<()> {
         sqlx::query("INSERT INTO fp_claims (ip_id, request_id, ts, contact_email, user_agent) VALUES (?,?,datetime('now'),?,?)")
             .bind(ip_id).bind(request_id).bind(email).bind(ua).execute(&self.pool).await?;
-        sqlx::query("UPDATE ips SET fp_claimed = 1 WHERE id = ?").bind(ip_id).execute(&self.pool).await?;
+        sqlx::query("UPDATE ips SET fp_claimed = 1 WHERE id = ?")
+            .bind(ip_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }
@@ -130,16 +160,22 @@ mod tests {
     async fn insert_request_roundtrip() {
         let s = test_store().await;
         let ip = s.upsert_ip("198.51.100.9".parse().unwrap()).await.unwrap();
-        let id = s.insert_request(&NewRequest {
-            ip_id: ip.id,
-            method: "GET".into(),
-            path: "/wp-login.php".into(),
-            query: None,
-            headers_json: r#"[["user-agent","sqlmap/1.7"]]"#.into(),
-            body: None,
-            labels_json: r#"["scanner-ua","sensitive-path"]"#.into(),
-            severity: 3, scan_level: 2, is_fp_claim: false, page_token: None,
-        }).await.unwrap();
+        let id = s
+            .insert_request(&NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/wp-login.php".into(),
+                query: None,
+                headers_json: r#"[["user-agent","sqlmap/1.7"]]"#.into(),
+                body: None,
+                labels_json: r#"["scanner-ua","sensitive-path"]"#.into(),
+                severity: 3,
+                scan_level: 2,
+                is_fp_claim: false,
+                page_token: None,
+            })
+            .await
+            .unwrap();
         let row = s.request_by_id(id).await.unwrap().unwrap();
         assert_eq!(row.path, "/wp-login.php");
         assert_eq!(row.severity, 3);
@@ -149,13 +185,25 @@ mod tests {
     async fn fp_claim_marks_ip() {
         let s = test_store().await;
         let ip = s.upsert_ip("192.0.2.5".parse().unwrap()).await.unwrap();
-        let rid = s.insert_request(&NewRequest {
-            ip_id: ip.id, method: "POST".into(), path: "/i-landed-here-by-accident".into(),
-            query: None, headers_json: "[]".into(), body: None,
-            labels_json: "[]".into(), severity: 0, scan_level: 0,
-            is_fp_claim: true, page_token: None,
-        }).await.unwrap();
-        s.insert_fp_claim(ip.id, rid, Some("human@example.org"), "Mozilla/5.0").await.unwrap();
+        let rid = s
+            .insert_request(&NewRequest {
+                ip_id: ip.id,
+                method: "POST".into(),
+                path: "/i-landed-here-by-accident".into(),
+                query: None,
+                headers_json: "[]".into(),
+                body: None,
+                labels_json: "[]".into(),
+                severity: 0,
+                scan_level: 0,
+                is_fp_claim: true,
+                page_token: None,
+            })
+            .await
+            .unwrap();
+        s.insert_fp_claim(ip.id, rid, Some("human@example.org"), "Mozilla/5.0")
+            .await
+            .unwrap();
         let row = s.ip_by_id(ip.id).await.unwrap().unwrap();
         assert!(row.fp_claimed);
     }

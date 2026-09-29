@@ -31,15 +31,18 @@ struct AsnRecord {
 
 impl GeoIp {
     pub fn load(data_dir: &Path) -> Result<Self> {
-        let city = Reader::open_readfile(data_dir.join("GeoLite2-City.mmdb")).context("opening city mmdb")?;
-        let asn = Reader::open_readfile(data_dir.join("GeoLite2-ASN.mmdb")).context("opening asn mmdb")?;
+        let city = Reader::open_readfile(data_dir.join("GeoLite2-City.mmdb"))
+            .context("opening city mmdb")?;
+        let asn = Reader::open_readfile(data_dir.join("GeoLite2-ASN.mmdb"))
+            .context("opening asn mmdb")?;
         Ok(Self { city, asn })
     }
 
     pub fn lookup(&self, ip: &IpAddr) -> Geo {
         let mut g = Geo::default();
         if let Ok(Some(rec)) = self.city.lookup::<CityRecord>(*ip) {
-            g.country = rec.country
+            g.country = rec
+                .country
                 .and_then(|c| c.names)
                 .and_then(|mut n| n.remove("en"));
         }
@@ -58,10 +61,14 @@ pub async fn download(data_dir: &Path, account_id: &str, license_key: &str) -> R
             "https://download.maxmind.com/geoip/databases/{edition}/download?suffix=tar.gz"
         );
         let client = reqwest::Client::new();
-        let bytes = client.get(&url)
+        let bytes = client
+            .get(&url)
             .basic_auth(account_id, Some(license_key))
-            .send().await?.error_for_status()?
-            .bytes().await?;
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
         let tar = flate2::read::GzDecoder::new(&bytes[..]);
         let mut archive = tar::Archive::new(tar);
         let mut found = false;
@@ -90,8 +97,16 @@ mod tests {
     #[test]
     fn lookup_known_ip_from_fixture() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::copy("tests/fixtures/GeoLite2-City-Test.mmdb", dir.path().join("GeoLite2-City.mmdb")).unwrap();
-        std::fs::copy("tests/fixtures/GeoLite2-ASN-Test.mmdb", dir.path().join("GeoLite2-ASN.mmdb")).unwrap();
+        std::fs::copy(
+            "tests/fixtures/GeoLite2-City-Test.mmdb",
+            dir.path().join("GeoLite2-City.mmdb"),
+        )
+        .unwrap();
+        std::fs::copy(
+            "tests/fixtures/GeoLite2-ASN-Test.mmdb",
+            dir.path().join("GeoLite2-ASN.mmdb"),
+        )
+        .unwrap();
         let geo = GeoIp::load(dir.path()).unwrap();
         let g = geo.lookup(&"2.125.160.216".parse::<IpAddr>().unwrap());
         assert_eq!(g.country.as_deref(), Some("United Kingdom"));
@@ -100,8 +115,16 @@ mod tests {
     #[test]
     fn unknown_ip_yields_empty_geo() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::copy("tests/fixtures/GeoLite2-City-Test.mmdb", dir.path().join("GeoLite2-City.mmdb")).unwrap();
-        std::fs::copy("tests/fixtures/GeoLite2-ASN-Test.mmdb", dir.path().join("GeoLite2-ASN.mmdb")).unwrap();
+        std::fs::copy(
+            "tests/fixtures/GeoLite2-City-Test.mmdb",
+            dir.path().join("GeoLite2-City.mmdb"),
+        )
+        .unwrap();
+        std::fs::copy(
+            "tests/fixtures/GeoLite2-ASN-Test.mmdb",
+            dir.path().join("GeoLite2-ASN.mmdb"),
+        )
+        .unwrap();
         let geo = GeoIp::load(dir.path()).unwrap();
         let g = geo.lookup(&"10.1.2.3".parse::<IpAddr>().unwrap());
         assert!(g.country.is_none());

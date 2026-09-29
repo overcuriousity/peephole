@@ -32,7 +32,9 @@ impl TrapState {
     pub fn for_test(store: Store, cfg: Config) -> Self {
         let classifier = Classifier::from_dir(&cfg.rules_dir).expect("rules");
         Self {
-            store, cfg, classifier,
+            store,
+            cfg,
+            classifier,
             geo: Arc::new(RwLock::new(None)),
             tor: Arc::new(RwLock::new(TorExitList::default())),
         }
@@ -54,7 +56,8 @@ pub fn client_ip(headers: &HeaderMap, fallback: IpAddr, trusted: &[IpNet]) -> Ip
     if !trusted.iter().any(|n| n.contains(&fallback)) {
         return fallback;
     }
-    headers.get("x-forwarded-for")
+    headers
+        .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(',').next_back())
         .and_then(|s| s.trim().parse().ok())
@@ -74,42 +77,59 @@ async fn record_and_respond(
     // Enrichment (every IP, every request — spec §4).
     let geo_hit = state.geo.read().unwrap().as_ref().map(|g| g.lookup(&ip));
     if let Some(g) = geo_hit {
-        state.store.set_ip_geo(ip_row.id, g.country.as_deref(), g.asn, g.asn_org.as_deref()).await?;
+        state
+            .store
+            .set_ip_geo(ip_row.id, g.country.as_deref(), g.asn, g.asn_org.as_deref())
+            .await?;
     }
     if state.tor.read().unwrap().contains(&ip) {
         state.store.set_ip_tor(ip_row.id, true).await?;
     }
 
     let history = state.store.ip_history(ip_row.id).await.unwrap_or_default();
-    let verdict = state.classifier.classify(view, &history, &BotTells::default());
+    let verdict = state
+        .classifier
+        .classify(view, &history, &BotTells::default());
     let labels_json = serde_json::to_string(&verdict.labels)?;
     let page_token = uuid::Uuid::new_v4().to_string();
 
-    let request_id = state.store.insert_request(&NewRequest {
-        ip_id: ip_row.id,
-        method: view.method.to_string(),
-        path: view.path.to_string(),
-        query: view.query.map(str::to_string),
-        headers_json: serde_json::to_string(raw_headers)?,
-        body: body.map(|b| b.to_vec()),
-        labels_json,
-        severity: verdict.severity as i64,
-        scan_level: verdict.scan_level as i64,
-        is_fp_claim,
-        page_token: Some(page_token.clone()),
-    }).await?;
+    let request_id = state
+        .store
+        .insert_request(&NewRequest {
+            ip_id: ip_row.id,
+            method: view.method.to_string(),
+            path: view.path.to_string(),
+            query: view.query.map(str::to_string),
+            headers_json: serde_json::to_string(raw_headers)?,
+            body: body.map(|b| b.to_vec()),
+            labels_json,
+            severity: verdict.severity as i64,
+            scan_level: verdict.scan_level as i64,
+            is_fp_claim,
+            page_token: Some(page_token.clone()),
+        })
+        .await?;
 
     // Enqueue counter-scan unless tor / allowlisted / level 0 (spec §4-5).
     let is_tor = state.tor.read().unwrap().contains(&ip);
     let allowlisted = state.cfg.scan.never_scan.iter().any(|n| n.contains(&ip));
     if verdict.scan_level > 0 && !is_tor && !allowlisted {
-        state.store.enqueue_scan(ip_row.id, verdict.scan_level, state.cfg.scan.rescan_cooldown_hours).await?;
+        state
+            .store
+            .enqueue_scan(
+                ip_row.id,
+                verdict.scan_level,
+                state.cfg.scan.rescan_cooldown_hours,
+            )
+            .await?;
     }
     Ok((request_id, verdict, ip_row.id))
 }
 
 fn header_pairs(h: &HeaderMap) -> Vec<(String, String)> {
-    h.iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string())).collect()
+    h.iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect()
 }
 
 async fn trap_handler(
@@ -128,10 +148,21 @@ async fn trap_handler(
         headers: header_pairs(&headers),
         body: if body.is_empty() { None } else { Some(&body) },
     };
-    match record_and_respond(&state, ip, &view, &header_pairs(&headers), Some(body.clone()), false).await {
-        Ok((_rid, _verdict, _ip_id)) => {
-            (StatusCode::NOT_FOUND, Html(pages::trap_page(&uuid::Uuid::new_v4().to_string()))).into_response()
-        }
+    match record_and_respond(
+        &state,
+        ip,
+        &view,
+        &header_pairs(&headers),
+        Some(body.clone()),
+        false,
+    )
+    .await
+    {
+        Ok((_rid, _verdict, _ip_id)) => (
+            StatusCode::NOT_FOUND,
+            Html(pages::trap_page(&uuid::Uuid::new_v4().to_string())),
+        )
+            .into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response(),
     }
 }
@@ -148,20 +179,34 @@ async fn claim_handler(
     Form(form): Form<ClaimForm>,
 ) -> impl IntoResponse {
     let ip = client_ip(&headers, peer.ip(), &state.cfg.trusted_proxies);
-    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let ua = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let raw = header_pairs(&headers);
     let view = RequestView {
-        method: "POST", path: "/claim", query: None, headers: raw.clone(), body: None,
+        method: "POST",
+        path: "/claim",
+        query: None,
+        headers: raw.clone(),
+        body: None,
     };
     if let Ok((rid, _v, ip_id)) = record_and_respond(&state, ip, &view, &raw, None, true).await {
         let email = form.email.filter(|e| !e.trim().is_empty());
-        let _ = state.store.insert_fp_claim(ip_id, rid, email.as_deref(), &ua).await;
+        let _ = state
+            .store
+            .insert_fp_claim(ip_id, rid, email.as_deref(), &ua)
+            .await;
     }
     Html(pages::claim_confirmation()).into_response()
 }
 
 async fn collector_js() -> impl IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "text/javascript")], COLLECTOR_JS)
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/javascript")],
+        COLLECTOR_JS,
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -182,20 +227,39 @@ async fn collect_handler(
         // Attribute the fingerprint to the page view that issued the token;
         // fall back to the connection IP for unknown tokens.
         let req: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT id, ip_id FROM requests WHERE page_token = ? ORDER BY id DESC LIMIT 1")
-            .bind(&payload.token)
-            .fetch_optional(&state.store.pool).await.unwrap_or(None);
+            "SELECT id, ip_id FROM requests WHERE page_token = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&payload.token)
+        .fetch_optional(&state.store.pool)
+        .await
+        .unwrap_or(None);
         let (request_id, ip_id) = match req {
             Some((rid, iid)) => (Some(rid), iid),
             None => (None, ip_row.id),
         };
         let hash = crate::fingerprint::fp_hash(&payload.attrs);
-        let visitor = payload.attrs.get("visitor_id").and_then(|v| v.as_str()).map(str::to_string);
-        let events = payload.behavior.get("events").map(|e| e.to_string()).unwrap_or_default();
-        let _ = state.store.insert_fingerprint(
-            request_id, ip_id, &hash, visitor.as_deref(),
-            &payload.attrs.to_string(), &payload.behavior.to_string(), events.as_bytes(),
-        ).await;
+        let visitor = payload
+            .attrs
+            .get("visitor_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let events = payload
+            .behavior
+            .get("events")
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        let _ = state
+            .store
+            .insert_fingerprint(
+                request_id,
+                ip_id,
+                &hash,
+                visitor.as_deref(),
+                &payload.attrs.to_string(),
+                &payload.behavior.to_string(),
+                events.as_bytes(),
+            )
+            .await;
     }
     axum::Json(serde_json::json!({"ok": true})) // opaque ack (spec §8.3)
 }
@@ -211,7 +275,11 @@ async fn panel_handler(
         Ok(Some((ip_id, hash, attrs, behavior))) => {
             let attrs: serde_json::Value = serde_json::from_str(&attrs).unwrap_or_default();
             let behavior: serde_json::Value = serde_json::from_str(&behavior).unwrap_or_default();
-            let seen = state.store.fingerprint_ip_count(&hash, ip_id).await.unwrap_or(0);
+            let seen = state
+                .store
+                .fingerprint_ip_count(&hash, ip_id)
+                .await
+                .unwrap_or(0);
             let pairs = crate::fingerprint::panel_summary(&attrs, &behavior, seen);
             Html(render_panel_scrambled(&pairs)).into_response()
         }
@@ -219,7 +287,8 @@ async fn panel_handler(
         _ => Html(render_panel_scrambled(&[(
             "Status".into(),
             "collecting browser characteristics…".into(),
-        )])).into_response(),
+        )]))
+        .into_response(),
     }
 }
 
@@ -231,22 +300,40 @@ fn render_panel_scrambled(pairs: &[(String, String)]) -> String {
     let mut items: Vec<&(String, String)> = pairs.iter().collect();
     items.shuffle(&mut rng);
     let rid = |rng: &mut rand::rngs::ThreadRng| -> String {
-        (0..8).map(|_| (b'a' + (rand::Rng::random_range(rng, 0..26)) as u8) as char).collect()
+        (0..8)
+            .map(|_| (b'a' + (rand::Rng::random_range(rng, 0..26)) as u8) as char)
+            .collect()
     };
     let mut html = String::from("<div><h2>What we see about you</h2>");
     for (k, v) in items {
         let cls = rid(&mut rng);
-        html.push_str(&format!("<div class=\"{cls}\"><span>{}</span>: ", escape(k)));
+        html.push_str(&format!(
+            "<div class=\"{cls}\"><span>{}</span>: ",
+            escape(k)
+        ));
         // Split value into 2-4 chunks across separate <i> nodes with decoys.
         // Short values stay whole (splitting would destroy any readability gain).
         let chars: Vec<char> = v.chars().collect();
-        let n = if chars.len() <= 8 { 1 } else { 2 + rand::Rng::random_range(&mut rng, 0..3usize) };
+        let n = if chars.len() <= 8 {
+            1
+        } else {
+            2 + rand::Rng::random_range(&mut rng, 0..3usize)
+        };
         let mut idx = 0usize;
         for i in 0..n {
-            let end = if i == n - 1 { chars.len() } else { idx + (chars.len() - idx) / (n - i) };
+            let end = if i == n - 1 {
+                chars.len()
+            } else {
+                idx + (chars.len() - idx) / (n - i)
+            };
             let chunk: String = chars[idx..end].iter().collect();
             idx = end;
-            html.push_str(&format!("<i data-x=\"{}\">{}</i><b style=\"display:none\">{}</b>", rid(&mut rng), escape(&chunk), rid(&mut rng)));
+            html.push_str(&format!(
+                "<i data-x=\"{}\">{}</i><b style=\"display:none\">{}</b>",
+                rid(&mut rng),
+                escape(&chunk),
+                rid(&mut rng)
+            ));
         }
         html.push_str("</div>");
     }
@@ -255,5 +342,8 @@ fn render_panel_scrambled(pairs: &[(String, String)]) -> String {
 }
 
 fn escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }

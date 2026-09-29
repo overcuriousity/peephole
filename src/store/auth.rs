@@ -1,21 +1,31 @@
-use anyhow::Result;
 use super::Store;
+use anyhow::Result;
 
 impl Store {
-    pub async fn save_credential(&self, cred_id: &[u8], passkey_json: &str, label: Option<&str>) -> Result<()> {
+    pub async fn save_credential(
+        &self,
+        cred_id: &[u8],
+        passkey_json: &str,
+        label: Option<&str>,
+    ) -> Result<()> {
         sqlx::query("INSERT INTO credentials (cred_id, passkey_json, created_at, label) VALUES (?,?,datetime('now'),?)")
             .bind(cred_id).bind(passkey_json).bind(label).execute(&self.pool).await?;
         Ok(())
     }
 
     pub async fn load_credentials(&self) -> Result<Vec<(Vec<u8>, String)>> {
-        Ok(sqlx::query_as("SELECT cred_id, passkey_json FROM credentials ORDER BY id")
-            .fetch_all(&self.pool).await?)
+        Ok(
+            sqlx::query_as("SELECT cred_id, passkey_json FROM credentials ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn delete_credential(&self, cred_id: &[u8]) -> Result<()> {
         sqlx::query("DELETE FROM credentials WHERE cred_id = ?")
-            .bind(cred_id).execute(&self.pool).await?;
+            .bind(cred_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -28,13 +38,19 @@ impl Store {
 
     pub async fn validate_session(&self, id: &str) -> Result<bool> {
         let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sessions WHERE id = ? AND expires_at > datetime('now')")
-            .bind(id).fetch_one(&self.pool).await?;
+            "SELECT COUNT(*) FROM sessions WHERE id = ? AND expires_at > datetime('now')",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(n == 1)
     }
 
     pub async fn destroy_session(&self, id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM sessions WHERE id = ?").bind(id).execute(&self.pool).await?;
+        sqlx::query("DELETE FROM sessions WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }
@@ -47,8 +63,12 @@ mod tests {
     async fn credential_roundtrip_and_delete() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
-        s.save_credential(b"cred-1", r#"{"k":"v"}"#, Some("yubikey-5")).await.unwrap();
-        s.save_credential(b"cred-2", r#"{"k":"w"}"#, None).await.unwrap();
+        s.save_credential(b"cred-1", r#"{"k":"v"}"#, Some("yubikey-5"))
+            .await
+            .unwrap();
+        s.save_credential(b"cred-2", r#"{"k":"w"}"#, None)
+            .await
+            .unwrap();
         let all = s.load_credentials().await.unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].0, b"cred-1");

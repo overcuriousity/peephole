@@ -28,19 +28,29 @@ pub struct ExportRow {
 pub fn requests_csv(rows: &[ExportRow]) -> String {
     // Header unquoted; data rows fully quoted (fields like joined labels are
     // always delimited, keeping downstream parsing unambiguous).
-    let mut out = String::from("ts,ip,method,path,query,severity,scan_level,labels,country,asn,asn_org,is_tor\n");
+    let mut out = String::from(
+        "ts,ip,method,path,query,severity,scan_level,labels,country,asn,asn_org,is_tor\n",
+    );
     let mut w = csv::WriterBuilder::new()
         .quote_style(csv::QuoteStyle::Always)
         .has_headers(false)
         .from_writer(vec![]);
     for r in rows {
         w.write_record([
-            r.ts.as_str(), r.ip.as_str(), r.method.as_str(), r.path.as_str(),
-            r.query.as_deref().unwrap_or(""), &r.severity.to_string(), &r.scan_level.to_string(),
-            &r.labels.join(";"), r.country.as_deref().unwrap_or(""),
+            r.ts.as_str(),
+            r.ip.as_str(),
+            r.method.as_str(),
+            r.path.as_str(),
+            r.query.as_deref().unwrap_or(""),
+            &r.severity.to_string(),
+            &r.scan_level.to_string(),
+            &r.labels.join(";"),
+            r.country.as_deref().unwrap_or(""),
             &r.asn.map(|a| a.to_string()).unwrap_or_default(),
-            r.asn_org.as_deref().unwrap_or(""), if r.is_tor { "1" } else { "0" },
-        ]).unwrap();
+            r.asn_org.as_deref().unwrap_or(""),
+            if r.is_tor { "1" } else { "0" },
+        ])
+        .unwrap();
     }
     out.push_str(&String::from_utf8(w.into_inner().unwrap()).unwrap());
     out
@@ -77,10 +87,17 @@ mod tests {
 
     fn row() -> ExportRow {
         ExportRow {
-            ts: "2026-09-29T12:00:00Z".into(), ip: "203.0.113.5".into(),
-            method: "GET".into(), path: "/.env".into(), query: None,
-            severity: 2, scan_level: 2, labels: vec!["sensitive-path".into()],
-            country: Some("Germany".into()), asn: Some(3320), asn_org: Some("DTAG".into()),
+            ts: "2026-09-29T12:00:00Z".into(),
+            ip: "203.0.113.5".into(),
+            method: "GET".into(),
+            path: "/.env".into(),
+            query: None,
+            severity: 2,
+            scan_level: 2,
+            labels: vec!["sensitive-path".into()],
+            country: Some("Germany".into()),
+            asn: Some(3320),
+            asn_org: Some("DTAG".into()),
             is_tor: false,
         }
     }

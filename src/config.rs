@@ -49,10 +49,18 @@ pub struct ScanConfig {
     pub level_argv: std::collections::HashMap<u8, Vec<String>>,
 }
 
-fn default_workers() -> usize { 2 }
-fn default_timeout() -> u64 { 900 }
-fn default_cooldown() -> i64 { 24 }
-fn default_rate() -> i64 { 30 }
+fn default_workers() -> usize {
+    2
+}
+fn default_timeout() -> u64 {
+    900
+}
+fn default_cooldown() -> i64 {
+    24
+}
+fn default_rate() -> i64 {
+    30
+}
 
 impl Default for ScanConfig {
     fn default() -> Self {
@@ -69,8 +77,8 @@ impl Default for ScanConfig {
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let cfg: Config = toml::from_str(&text).context("parsing config.toml")?;
         if cfg.webauthn.rp_id.is_empty() || cfg.webauthn.origin.starts_with("http://") {
             bail!("webauthn.rp_id must be set and origin must be https");
@@ -106,7 +114,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("peephole-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        std::fs::write(&path, r#"
+        std::fs::write(
+            &path,
+            r#"
 trap_listen = "0.0.0.0:8080"
 admin_listen = "127.0.0.1:8443"
 database_path = "/var/lib/peephole/peephole.db"
@@ -129,7 +139,9 @@ timeout_secs = 900
 rescan_cooldown_hours = 24
 max_scans_per_hour = 30
 never_scan = ["192.168.0.0/16"]
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.trap_listen.to_string(), "0.0.0.0:8080");
         assert_eq!(cfg.webauthn.rp_id, "peephole.example.net");
@@ -144,7 +156,9 @@ never_scan = ["192.168.0.0/16"]
         let dir = std::env::temp_dir().join(format!("peephole-cfg2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        std::fs::write(&path, r#"
+        std::fs::write(
+            &path,
+            r#"
 trap_listen = "0.0.0.0:8080"
 admin_listen = "127.0.0.1:8443"
 database_path = "/tmp/x.db"
@@ -153,7 +167,9 @@ rules_dir = "/tmp/rules"
 [maxmind]
 account_id = "1"
 license_key = "k"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         assert!(Config::load(&path).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }

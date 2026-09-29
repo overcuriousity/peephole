@@ -1,5 +1,5 @@
-use anyhow::Result;
 use super::Store;
+use anyhow::Result;
 
 impl Store {
     #[allow(clippy::too_many_arguments)]
@@ -28,14 +28,24 @@ impl Store {
     pub async fn fingerprint_ip_count(&self, fp_hash: &str, exclude_ip_id: i64) -> Result<i64> {
         Ok(sqlx::query_scalar(
             "SELECT COUNT(DISTINCT ip_id) FROM fingerprints WHERE fp_hash = ? AND ip_id != ?",
-        ).bind(fp_hash).bind(exclude_ip_id).fetch_one(&self.pool).await?)
+        )
+        .bind(fp_hash)
+        .bind(exclude_ip_id)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
-    pub async fn fingerprint_by_token(&self, token: &str) -> Result<Option<(i64, String, String, String)>> {
+    pub async fn fingerprint_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<(i64, String, String, String)>> {
         Ok(sqlx::query_as(
             "SELECT f.ip_id, f.fp_hash, f.attributes_json, f.behavior_summary_json
              FROM fingerprints f JOIN requests r ON f.request_id = r.id
              WHERE r.page_token = ? ORDER BY f.id DESC LIMIT 1",
-        ).bind(token).fetch_optional(&self.pool).await?)
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 }

@@ -1,7 +1,7 @@
+use super::Store;
+use crate::scan::nmap_xml::ScanResult;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use crate::scan::nmap_xml::ScanResult;
-use super::Store;
 
 #[derive(Debug, PartialEq)]
 pub enum EnqueueOutcome {
@@ -26,7 +26,12 @@ pub struct ScanJobRow {
 impl Store {
     /// Cooldown (spec §5): a finished scan of level >= requested within the
     /// window suppresses; a higher requested level upgrades exactly once.
-    pub async fn enqueue_scan(&self, ip_id: i64, level: u8, cooldown_hours: i64) -> Result<EnqueueOutcome> {
+    pub async fn enqueue_scan(
+        &self,
+        ip_id: i64,
+        level: u8,
+        cooldown_hours: i64,
+    ) -> Result<EnqueueOutcome> {
         if level == 0 {
             return Ok(EnqueueOutcome::Suppressed);
         }
@@ -38,14 +43,16 @@ impl Store {
         .bind(format!("-{cooldown_hours} hours"))
         .fetch_optional(&self.pool)
         .await?;
-        if let Some((last_level,)) = recent {
-            if (level as i64) <= last_level {
+        if let Some((last_level,)) = recent
+            && (level as i64) <= last_level {
                 return Ok(EnqueueOutcome::Cooldown);
             }
-        }
         let pending: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM scan_jobs WHERE ip_id = ? AND status IN ('queued','running')",
-        ).bind(ip_id).fetch_one(&self.pool).await?;
+        )
+        .bind(ip_id)
+        .fetch_one(&self.pool)
+        .await?;
         if pending > 0 {
             return Ok(EnqueueOutcome::Cooldown);
         }
@@ -58,7 +65,9 @@ impl Store {
     pub async fn recent_scans_last_hour(&self) -> Result<i64> {
         Ok(sqlx::query_scalar(
             "SELECT COUNT(*) FROM scans WHERE finished_at > datetime('now','-1 hour')",
-        ).fetch_one(&self.pool).await?)
+        )
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     pub async fn next_queued_job(&self) -> Result<Option<ScanJobRow>> {
@@ -72,9 +81,16 @@ impl Store {
         Ok(job)
     }
 
-    pub async fn finish_job(&self, job_id: i64, result: Option<&ScanResult>, error: Option<&str>) -> Result<()> {
+    pub async fn finish_job(
+        &self,
+        job_id: i64,
+        result: Option<&ScanResult>,
+        error: Option<&str>,
+    ) -> Result<()> {
         let job = sqlx::query_as::<_, ScanJobRow>("SELECT * FROM scan_jobs WHERE id=?")
-            .bind(job_id).fetch_one(&self.pool).await?;
+            .bind(job_id)
+            .fetch_one(&self.pool)
+            .await?;
         match result {
             Some(res) => {
                 let compressed = zstd::encode_all(res.raw_xml.as_slice(), 3)?;
@@ -94,8 +110,12 @@ impl Store {
                     .bind(&p.service).bind(&p.product).bind(&p.version)
                     .execute(&self.pool).await?;
                 }
-                sqlx::query("UPDATE scan_jobs SET status='done', finished_at=datetime('now') WHERE id=?")
-                    .bind(job_id).execute(&self.pool).await?;
+                sqlx::query(
+                    "UPDATE scan_jobs SET status='done', finished_at=datetime('now') WHERE id=?",
+                )
+                .bind(job_id)
+                .execute(&self.pool)
+                .await?;
             }
             None => {
                 sqlx::query("UPDATE scan_jobs SET status='failed', finished_at=datetime('now'), error=? WHERE id=?")

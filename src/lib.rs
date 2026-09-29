@@ -19,17 +19,25 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
 
     // Startup validation (spec §12).
     let nmap_path = std::env::var("PEEPHOLE_NMAP_PATH").unwrap_or_else(|_| "nmap".into());
-    let nmap_out = tokio::process::Command::new(&nmap_path).arg("--version").output().await
+    let nmap_out = tokio::process::Command::new(&nmap_path)
+        .arg("--version")
+        .output()
+        .await
         .context("nmap not found — install nmap")?;
     anyhow::ensure!(nmap_out.status.success(), "nmap --version failed");
     let classifier = classify::Classifier::from_dir(&cfg.rules_dir).context("loading rules")?;
     let store = store::Store::connect(&cfg.database_path).await?;
 
     let geo = Arc::new(RwLock::new(
-        intel::geo::GeoIp::load(&cfg.data_dir).map(Some).unwrap_or_else(|e| {
-            warn!(?e, "maxmind dbs not loaded yet; geo enrichment deferred to scheduler");
-            None
-        }),
+        intel::geo::GeoIp::load(&cfg.data_dir)
+            .map(Some)
+            .unwrap_or_else(|e| {
+                warn!(
+                    ?e,
+                    "maxmind dbs not loaded yet; geo enrichment deferred to scheduler"
+                );
+                None
+            }),
     ));
     let tor = Arc::new(RwLock::new(
         intel::tor::TorExitList::load(&cfg.data_dir).unwrap_or_default(),
@@ -46,17 +54,31 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         let mut rx = shutdown_rx.clone();
         tokio::spawn(async move {
             // One immediate pass when stale, then delegate to the scheduler loop.
-            if intel::tor::TorExitList::refresh(&cfg2.data_dir).await.is_ok() {
+            if intel::tor::TorExitList::refresh(&cfg2.data_dir)
+                .await
+                .is_ok()
+            {
                 if let Ok(l) = intel::tor::TorExitList::load(&cfg2.data_dir) {
                     *tor.write().unwrap() = l;
                 }
-                let _ = store.intel_set("tor_last_fetch", &chrono::Utc::now().to_rfc3339()).await;
+                let _ = store
+                    .intel_set("tor_last_fetch", &chrono::Utc::now().to_rfc3339())
+                    .await;
             }
-            if intel::geo::download(&cfg2.data_dir, &cfg2.maxmind.account_id, &cfg2.maxmind.license_key).await.is_ok() {
+            if intel::geo::download(
+                &cfg2.data_dir,
+                &cfg2.maxmind.account_id,
+                &cfg2.maxmind.license_key,
+            )
+            .await
+            .is_ok()
+            {
                 if let Ok(g) = intel::geo::GeoIp::load(&cfg2.data_dir) {
                     *geo.write().unwrap() = Some(g);
                 }
-                let _ = store.intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339()).await;
+                let _ = store
+                    .intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339())
+                    .await;
             }
             intel::run_scheduler(store, cfg2, rx.clone()).await;
             let _ = &mut rx;
@@ -67,7 +89,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     {
         let store = store.clone();
         let cfg2 = cfg.clone();
-        tokio::spawn(scan::run_workers(store, cfg2, PathBuf::from(nmap_path), shutdown_rx.clone()));
+        tokio::spawn(scan::run_workers(
+            store,
+            cfg2,
+            PathBuf::from(nmap_path),
+            shutdown_rx.clone(),
+        ));
     }
 
     // First-run admin setup token (spec §8.4).
@@ -75,15 +102,20 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
 
     // Listeners.
     let trap_state = Arc::new(trap::TrapState {
-        store: store.clone(), cfg: cfg.clone(), classifier,
-        geo: geo.clone(), tor: tor.clone(),
+        store: store.clone(),
+        cfg: cfg.clone(),
+        classifier,
+        geo: geo.clone(),
+        tor: tor.clone(),
     });
     let trap_app = trap::router(trap_state);
     let admin_app = admin::router_with_auth(store.clone(), cfg.clone());
 
-    let trap_listener = tokio::net::TcpListener::bind(cfg.trap_listen).await
+    let trap_listener = tokio::net::TcpListener::bind(cfg.trap_listen)
+        .await
         .with_context(|| format!("binding trap listener {}", cfg.trap_listen))?;
-    let admin_listener = tokio::net::TcpListener::bind(cfg.admin_listen).await
+    let admin_listener = tokio::net::TcpListener::bind(cfg.admin_listen)
+        .await
         .with_context(|| format!("binding admin listener {}", cfg.admin_listen))?;
     info!(trap = %cfg.trap_listen, admin = %cfg.admin_listen, "peephole up");
 
