@@ -25,7 +25,7 @@ futures = "0.3"
 ipnet = { version = "2", features = ["serde"] }
 maxminddb = "0.26"
 parquet = "55"
-quick-xml = "0.37"
+quick-xml = "0.42"
 rand = "0.9"
 regex = "1"
 reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "json", "cookies"] }
