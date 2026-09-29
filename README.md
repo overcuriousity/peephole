@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="peephole logo — a bloodshot eye peeking through a hole" width="200">
+</p>
+
 # peephole
 
 A scan-the-scanners honeypot. peephole sits behind your web stack as the

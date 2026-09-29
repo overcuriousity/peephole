@@ -27,9 +27,20 @@ impl AdminState {
 pub fn router(state: Arc<AdminState>) -> Router {
     Router::new()
         .route("/", get(dashboard))
+        .route("/logo.svg", get(logo))
         .route("/api/stats", get(stats_json))
         .route("/api/queue", get(sse::queue_stream))
         .with_state(state)
+}
+
+async fn logo() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/svg+xml"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        include_str!("../../assets/logo.svg"),
+    )
 }
 
 /// Full admin router including auth + authenticated routes (Task 10 mounts its

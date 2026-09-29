@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- white background -->
+  <rect width="512" height="512" fill="#ffffff"/>
+
+  <!-- jagged hole in the wall -->
+  <path fill="#0d0d0d" d="M256 40 L283 98 L345 62 L355 125 L420 108 L410 172 L472 186 L445 243 L494 280 L446 318 L470 374 L408 375 L404 438 L350 414 L325 470 L283 428 L238 472 L212 422 L148 444 L152 382 L90 376 L108 318 L40 300 L82 252 L44 200 L116 192 L110 128 L172 140 L186 82 L238 104 Z"/>
+
+  <!-- eye, clipped to the strained lid opening -->
+  <clipPath id="opening">
+    <path d="M86 256 C 150 165, 362 165, 426 256 C 362 347, 150 347, 86 256 Z"/>
+  </clipPath>
+  <g clip-path="url(#opening)">
+    <!-- white eyeball -->
+    <rect x="60" y="140" width="392" height="232" fill="#ffffff"/>
+
+    <!-- bloodshot flush in the corners -->
+    <ellipse cx="106" cy="256" rx="34" ry="52" fill="#d00000" opacity="0.22"/>
+    <ellipse cx="412" cy="256" rx="26" ry="44" fill="#d00000" opacity="0.25"/>
+
+    <!-- red iris straining hard to the side, black pupil -->
+    <circle cx="352" cy="256" r="70" fill="#a30000"/>
+    <circle cx="352" cy="256" r="70" fill="none" stroke="#5e0000" stroke-width="6"/>
+    <circle cx="352" cy="256" r="44" fill="#6e0000"/>
+    <circle cx="352" cy="256" r="26" fill="#000000"/>
+    <circle cx="336" cy="240" r="8" fill="#ffffff" opacity="0.85"/>
+
+    <!-- veins, bloodshot white straining toward the iris -->
+    <g fill="none" stroke-linecap="round">
+      <path d="M92 244 C 130 236, 152 232, 192 240 C 222 246, 244 248, 268 248" stroke="#cc0000" stroke-width="6"/>
+      <path d="M96 274 C 140 284, 176 282, 216 270 C 240 264, 256 262, 272 262" stroke="#990000" stroke-width="5"/>
+      <path d="M106 222 C 145 204, 178 208, 216 222 C 236 230, 252 232, 266 234" stroke="#cc0000" stroke-width="4"/>
+      <path d="M160 238 C 165 224, 174 216, 186 212" stroke="#cc0000" stroke-width="3"/>
+      <path d="M150 262 C 158 274, 170 280, 184 282" stroke="#990000" stroke-width="3"/>
+      <path d="M118 296 C 150 308, 186 304, 224 288 C 244 280, 258 276, 270 274" stroke="#b30000" stroke-width="4"/>
+      <path d="M190 292 C 196 302, 208 306, 220 306" stroke="#990000" stroke-width="2.5"/>
+      <path d="M200 236 C 206 246, 216 252, 228 254" stroke="#cc0000" stroke-width="2.5"/>
+      <path d="M88 256 C 120 252, 140 252, 168 254" stroke="#e00000" stroke-width="7"/>
+      <path d="M236 178 C 244 194, 244 206, 240 220" stroke="#cc0000" stroke-width="3"/>
+      <path d="M186 336 C 194 320, 196 308, 192 294" stroke="#990000" stroke-width="3"/>
+      <path d="M268 332 C 262 316, 262 304, 266 292" stroke="#b30000" stroke-width="3"/>
+      <path d="M300 172 C 296 186, 296 196, 300 208" stroke="#990000" stroke-width="2.5"/>
+    </g>
+
+    <!-- burst vessels -->
+    <ellipse cx="134" cy="288" rx="16" ry="8" fill="#cc0000" opacity="0.6" transform="rotate(-14 134 288)"/>
+    <ellipse cx="212" cy="222" rx="10" ry="5" fill="#cc0000" opacity="0.5" transform="rotate(18 212 222)"/>
+  </g>
+
+  <!-- inflamed lid margins -->
+  <path d="M86 256 C 150 165, 362 165, 426 256 C 362 347, 150 347, 86 256 Z"
+        fill="none" stroke="#8a0000" stroke-width="9"/>
+  <path d="M86 256 C 150 165, 362 165, 426 256" fill="none" stroke="#c40000" stroke-width="4"/>
+  <path d="M86 256 C 150 347, 362 347, 426 256" fill="none" stroke="#c40000" stroke-width="4"/>
+</svg>
