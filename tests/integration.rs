@@ -105,3 +105,54 @@ async fn bait_login_post_escalates() {
     assert_eq!(level, 4);
     assert!(labels.contains("form-interaction"));
 }
+
+#[tokio::test]
+async fn collect_stores_fingerprint_and_correlates_ips() {
+    let (base, store, _dir) = spawn_trap().await;
+    let client = reqwest::Client::new();
+    // Request 1 from "IP A" (simulated via X-Forwarded-For, 127.0.0.1 is trusted).
+    let _ = client.get(format!("{base}/r1")).header("x-forwarded-for", "203.0.113.50").send().await.unwrap();
+    let token: String = sqlx::query_scalar("SELECT page_token FROM requests ORDER BY id DESC LIMIT 1")
+        .fetch_one(&store.pool).await.unwrap();
+    let payload = serde_json::json!({
+        "token": token,
+        "attrs": {"canvas":"abc","webgl_renderer":"Mesa","fonts_hash":"f1","audio":"0.4","screen":"1920x1080x24","timezone":"UTC","platform":"Linux","webdriver":false},
+        "behavior": {"fill_seconds": null, "mouse_events": 5, "events": []}
+    });
+    let resp = client.post(format!("{base}/collect")).json(&payload).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    // Same fingerprint from a second IP.
+    let _ = client.get(format!("{base}/r2")).header("x-forwarded-for", "198.51.100.60").send().await.unwrap();
+    let token2: String = sqlx::query_scalar("SELECT page_token FROM requests ORDER BY id DESC LIMIT 1")
+        .fetch_one(&store.pool).await.unwrap();
+    let mut p2 = payload.clone();
+    p2["token"] = serde_json::json!(token2);
+    let _ = client.post(format!("{base}/collect")).json(&p2).send().await.unwrap();
+
+    let fps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fingerprints")
+        .fetch_one(&store.pool).await.unwrap();
+    assert_eq!(fps, 2);
+    let hash: String = sqlx::query_scalar("SELECT fp_hash FROM fingerprints LIMIT 1")
+        .fetch_one(&store.pool).await.unwrap();
+    let distinct: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT ip_id) FROM fingerprints WHERE fp_hash = ?")
+        .bind(&hash).fetch_one(&store.pool).await.unwrap();
+    assert_eq!(distinct, 2, "same operator across IPs — the core correlation");
+
+    // Panel endpoint returns human-readable, non-JSON HTML.
+    let panel = client.get(format!("{base}/panel?token={token}")).send().await.unwrap().text().await.unwrap();
+    assert!(panel.contains("What we see about you"));
+    assert!(panel.contains("Mesa"));
+}
+
+#[tokio::test]
+async fn panel_is_structurally_randomized() {
+    let (base, _store, _dir) = spawn_trap().await;
+    let client = reqwest::Client::new();
+    let _ = client.get(format!("{base}/r1")).send().await.unwrap();
+    let token: String = sqlx::query_scalar("SELECT page_token FROM requests LIMIT 1")
+        .fetch_one(&_store.pool).await.unwrap();
+    let a = client.get(format!("{base}/panel?token={token}")).send().await.unwrap().text().await.unwrap();
+    let b = client.get(format!("{base}/panel?token={token}")).send().await.unwrap().text().await.unwrap();
+    assert_ne!(a, b, "panel markup must differ per request (bot-unfriendly)");
+}

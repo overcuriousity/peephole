@@ -18,7 +18,7 @@ use ipnet::IpNet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
-const COLLECTOR_JS: &str = "// peephole collector stub — replaced in Task 7\n";
+const COLLECTOR_JS: &str = include_str!("../fingerprint/collector.js");
 
 pub struct TrapState {
     pub store: Store,
@@ -42,6 +42,8 @@ impl TrapState {
 pub fn router(state: Arc<TrapState>) -> Router {
     Router::new()
         .route("/claim", post(claim_handler))
+        .route("/collect", post(collect_handler))
+        .route("/panel", get(panel_handler))
         .route("/collect.js", get(collector_js))
         .fallback(any(trap_handler))
         .with_state(state)
@@ -160,4 +162,98 @@ async fn claim_handler(
 
 async fn collector_js() -> impl IntoResponse {
     ([(axum::http::header::CONTENT_TYPE, "text/javascript")], COLLECTOR_JS)
+}
+
+#[derive(serde::Deserialize)]
+pub struct CollectPayload {
+    token: String,
+    attrs: serde_json::Value,
+    behavior: serde_json::Value,
+}
+
+async fn collect_handler(
+    State(state): State<Arc<TrapState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::Json(payload): axum::Json<CollectPayload>,
+) -> impl IntoResponse {
+    let ip = client_ip(&headers, peer.ip(), &state.cfg.trusted_proxies);
+    if let Ok(ip_row) = state.store.upsert_ip(ip).await {
+        // Attribute the fingerprint to the page view that issued the token;
+        // fall back to the connection IP for unknown tokens.
+        let req: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT id, ip_id FROM requests WHERE page_token = ? ORDER BY id DESC LIMIT 1")
+            .bind(&payload.token)
+            .fetch_optional(&state.store.pool).await.unwrap_or(None);
+        let (request_id, ip_id) = match req {
+            Some((rid, iid)) => (Some(rid), iid),
+            None => (None, ip_row.id),
+        };
+        let hash = crate::fingerprint::fp_hash(&payload.attrs);
+        let visitor = payload.attrs.get("visitor_id").and_then(|v| v.as_str()).map(str::to_string);
+        let events = payload.behavior.get("events").map(|e| e.to_string()).unwrap_or_default();
+        let _ = state.store.insert_fingerprint(
+            request_id, ip_id, &hash, visitor.as_deref(),
+            &payload.attrs.to_string(), &payload.behavior.to_string(), events.as_bytes(),
+        ).await;
+    }
+    axum::Json(serde_json::json!({"ok": true})) // opaque ack (spec §8.3)
+}
+
+async fn panel_handler(
+    State(state): State<Arc<TrapState>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(token) = q.get("token") else {
+        return (StatusCode::BAD_REQUEST, "missing token").into_response();
+    };
+    match state.store.fingerprint_by_token(token).await {
+        Ok(Some((ip_id, hash, attrs, behavior))) => {
+            let attrs: serde_json::Value = serde_json::from_str(&attrs).unwrap_or_default();
+            let behavior: serde_json::Value = serde_json::from_str(&behavior).unwrap_or_default();
+            let seen = state.store.fingerprint_ip_count(&hash, ip_id).await.unwrap_or(0);
+            let pairs = crate::fingerprint::panel_summary(&attrs, &behavior, seen);
+            Html(render_panel_scrambled(&pairs)).into_response()
+        }
+        // No fingerprint yet: still scrambled markup (bot-unfriendly, spec §8.3).
+        _ => Html(render_panel_scrambled(&[(
+            "Status".into(),
+            "collecting browser characteristics…".into(),
+        )])).into_response(),
+    }
+}
+
+/// Bot-unfriendly panel rendering (spec §8.3): randomized ids/classes,
+/// shuffled section order, values split across multiple text nodes.
+fn render_panel_scrambled(pairs: &[(String, String)]) -> String {
+    use rand::seq::SliceRandom;
+    let mut rng = rand::rng();
+    let mut items: Vec<&(String, String)> = pairs.iter().collect();
+    items.shuffle(&mut rng);
+    let rid = |rng: &mut rand::rngs::ThreadRng| -> String {
+        (0..8).map(|_| (b'a' + (rand::Rng::random_range(rng, 0..26)) as u8) as char).collect()
+    };
+    let mut html = String::from("<div><h2>What we see about you</h2>");
+    for (k, v) in items {
+        let cls = rid(&mut rng);
+        html.push_str(&format!("<div class=\"{cls}\"><span>{}</span>: ", escape(k)));
+        // Split value into 2-4 chunks across separate <i> nodes with decoys.
+        // Short values stay whole (splitting would destroy any readability gain).
+        let chars: Vec<char> = v.chars().collect();
+        let n = if chars.len() <= 8 { 1 } else { 2 + rand::Rng::random_range(&mut rng, 0..3usize) };
+        let mut idx = 0usize;
+        for i in 0..n {
+            let end = if i == n - 1 { chars.len() } else { idx + (chars.len() - idx) / (n - i) };
+            let chunk: String = chars[idx..end].iter().collect();
+            idx = end;
+            html.push_str(&format!("<i data-x=\"{}\">{}</i><b style=\"display:none\">{}</b>", rid(&mut rng), escape(&chunk), rid(&mut rng)));
+        }
+        html.push_str("</div>");
+    }
+    html.push_str("</div>");
+    html
+}
+
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
