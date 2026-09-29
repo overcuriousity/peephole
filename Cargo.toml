@@ -26,7 +26,7 @@ ipnet = { version = "2", features = ["serde"] }
 maxminddb = "0.26"
 parquet = "55"
 quick-xml = "0.37"
-rand = "0.9"
+rand = "0.10"
 regex = "1"
 reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "json", "cookies"] }
 serde = { version = "1", features = ["derive"] }
