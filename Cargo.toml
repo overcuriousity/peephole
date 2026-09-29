@@ -18,6 +18,7 @@ axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 data-encoding = "2"
 flate2 = "1"
+futures = "0.3"
 ipnet = { version = "2", features = ["serde"] }
 maxminddb = "0.26"
 quick-xml = "0.37"

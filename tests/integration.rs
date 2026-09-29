@@ -156,3 +156,60 @@ async fn panel_is_structurally_randomized() {
     let b = client.get(format!("{base}/panel?token={token}")).send().await.unwrap().text().await.unwrap();
     assert_ne!(a, b, "panel markup must differ per request (bot-unfriendly)");
 }
+
+use peephole::admin::{self, AdminState};
+
+async fn spawn_admin_with(store: Store, dir: &std::path::Path) -> String {
+    let cfg_path = dir.join("c.toml");
+    let cfg = Config::load(&cfg_path).unwrap();
+    let app = admin::router(std::sync::Arc::new(AdminState::public_only(store, cfg)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn dashboard_shows_aggregates_not_payloads() {
+    let (trap_base, store, dir) = spawn_trap().await;
+    let client = reqwest::Client::new();
+    // Generate traffic with a distinctive payload that must NOT leak to public pages.
+    let _ = client.post(format!("{trap_base}/login"))
+        .header("x-forwarded-for", "203.0.113.99")
+        .form(&[("username", "SECRET-PAYLOAD-MARKER"), ("password", "x")])
+        .send().await.unwrap();
+    let admin_base = spawn_admin_with(store.clone(), dir.path()).await;
+
+    let html = reqwest::get(format!("{admin_base}/")).await.unwrap().text().await.unwrap();
+    assert!(html.contains("peephole"));
+    assert!(html.contains("203.0.113.99"));          // IP is fine on the wall of shame
+    assert!(!html.contains("SECRET-PAYLOAD-MARKER")); // payloads never public
+
+    let stats: serde_json::Value = reqwest::get(format!("{admin_base}/api/stats"))
+        .await.unwrap().json().await.unwrap();
+    assert!(stats["total_requests"].as_i64().unwrap() >= 1);
+    assert!(stats["unique_ips"].as_i64().unwrap() >= 1);
+    assert!(!stats.to_string().contains("SECRET-PAYLOAD-MARKER"));
+}
+
+#[tokio::test]
+async fn queue_sse_streams_job_updates() {
+    let (trap_base, store, dir) = spawn_trap().await;
+    let _ = reqwest::get(format!("{trap_base}/probe")).await.unwrap();
+    let admin_base = spawn_admin_with(store, dir.path()).await;
+    let resp = reqwest::get(format!("{admin_base}/api/queue")).await.unwrap();
+    assert_eq!(resp.headers().get("content-type").unwrap(), "text/event-stream");
+    // SSE streams forever; read only the first chunks under a deadline.
+    let body = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut resp = resp;
+        let mut buf = String::new();
+        while buf.len() < 16 {
+            match resp.chunk().await.unwrap() {
+                Some(c) => buf.push_str(&String::from_utf8_lossy(&c)),
+                None => break,
+            }
+        }
+        buf
+    }).await.unwrap();
+    assert!(body.contains("queued") || body.contains("running") || body.contains("done"));
+}

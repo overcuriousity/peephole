@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod classify;
 pub mod config;
 pub mod fingerprint;
