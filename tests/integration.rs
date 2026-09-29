@@ -354,3 +354,28 @@ async fn detail_views_and_inbox_work_with_session() {
     let html = client.get(format!("{base}/keys")).send().await.unwrap().text().await.unwrap();
     assert!(html.contains("test-key") || html.contains("credential"));
 }
+
+#[tokio::test]
+async fn export_download_requires_auth_and_filters() {
+    let (trap_base, store, dir) = spawn_trap().await;
+    let client_pub = reqwest::Client::new();
+    let _ = client_pub.get(format!("{trap_base}/a")).header("x-forwarded-for", "203.0.113.1").send().await.unwrap();
+    let _ = client_pub.get(format!("{trap_base}/b")).header("x-forwarded-for", "198.51.100.2").send().await.unwrap();
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store, cfg).await;
+
+    let resp = client.get(format!("{base}/export/download?format=csv&ip=203.0.113.1")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("content-disposition").unwrap().to_str().unwrap().contains("attachment"));
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("203.0.113.1"));
+    assert!(!body.contains("198.51.100.2"));
+
+    let resp = client.get(format!("{base}/export/download?format=jsonl")).send().await.unwrap();
+    let first: serde_json::Value = serde_json::from_str(resp.text().await.unwrap().lines().next().unwrap()).unwrap();
+    assert!(first.get("datetime").is_some());
+
+    let resp = client.get(format!("{base}/export/download?format=parquet")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.bytes().await.unwrap().len() > 100);
+}

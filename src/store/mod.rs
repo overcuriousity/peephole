@@ -236,3 +236,29 @@ impl Store {
             .fetch_all(&self.pool).await?)
     }
 }
+
+impl Store {
+    pub async fn export_requests(&self, f: &crate::export::ExportFilter) -> anyhow::Result<Vec<crate::export::ExportRow>> {
+        let mut sql = String::from(
+            "SELECT r.ts, i.ip, r.method, r.path, r.query, r.severity, r.scan_level,
+                    r.labels_json, i.country, i.asn, i.asn_org, i.is_tor_exit
+             FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1");
+        let mut binds: Vec<String> = vec![];
+        if let Some(v) = &f.from         { sql.push_str(" AND r.ts >= ?"); binds.push(v.clone()); }
+        if let Some(v) = &f.to           { sql.push_str(" AND r.ts <= ?"); binds.push(v.clone()); }
+        if let Some(v) = &f.ip           { sql.push_str(" AND i.ip = ?"); binds.push(v.clone()); }
+        if let Some(v) = &f.label        { sql.push_str(" AND r.labels_json LIKE ?"); binds.push(format!("%\"{v}\"%")); }
+        if let Some(v) = &f.min_severity { sql.push_str(" AND r.severity >= ?"); binds.push(v.to_string()); }
+        sql.push_str(" ORDER BY r.ts ASC LIMIT 100000");
+        let mut q = sqlx::query_as::<_, (String, String, String, String, Option<String>, i64, i64, String, Option<String>, Option<i64>, Option<String>, bool)>(&sql);
+        for b in binds { q = q.bind(b); }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(ts, ip, method, path, query, severity, scan_level, labels_json, country, asn, asn_org, is_tor)| {
+            crate::export::ExportRow {
+                ts, ip, method, path, query, severity, scan_level,
+                labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+                country, asn, asn_org, is_tor,
+            }
+        }).collect())
+    }
+}

@@ -15,6 +15,8 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/inbox", get(inbox_page))
         .route("/keys", get(keys_page))
         .route("/keys/delete", post(key_delete))
+        .route("/export", get(export_page))
+        .route("/export/download", get(export_download))
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -115,4 +117,38 @@ async fn key_delete(
         }
     }
     axum::response::Redirect::to("/keys")
+}
+
+async fn export_page(_u: SessionUser) -> Html<&'static str> {
+    Html(include_str!("../../templates/export.html"))
+}
+
+async fn export_download(
+    _u: SessionUser,
+    State(state): State<Arc<AdminState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let filter = crate::export::ExportFilter {
+        from: q.get("from").cloned(), to: q.get("to").cloned(),
+        ip: q.get("ip").cloned(), label: q.get("label").cloned(),
+        min_severity: q.get("min_severity").and_then(|s| s.parse().ok()),
+    };
+    let rows = match state.store.export_requests(&filter).await {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let (body, ext, mime) = match q.get("format").map(String::as_str) {
+        Some("csv") => (crate::export::requests_csv(&rows).into_bytes(), "csv", "text/csv".to_string()),
+        Some("jsonl") => (crate::export::requests_timesketch(&rows).into_bytes(), "jsonl", "application/x-ndjson".to_string()),
+        Some("parquet") => match crate::export::parquet::requests_parquet(&rows) {
+            Ok(b) => (b, "parquet", "application/octet-stream".to_string()),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
+        _ => return (StatusCode::BAD_REQUEST, "format must be csv|jsonl|parquet").into_response(),
+    };
+    ([(axum::http::header::CONTENT_TYPE, mime),
+      (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"peephole-export.{ext}\""))],
+     body).into_response()
 }

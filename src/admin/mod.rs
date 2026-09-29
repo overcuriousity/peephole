@@ -31,18 +31,9 @@ pub fn router(state: Arc<AdminState>) -> Router {
 /// routes behind `auth::SessionUser` here too).
 pub fn router_with_auth(store: Store, cfg: Config) -> Router {
     let state = Arc::new(AdminState::public_only(store, cfg));
-    // /export stays a gated placeholder until Task 11 mounts the real routes.
-    let stubs = Router::new()
-        .route("/export", get(auth_placeholder))
-        .with_state(state.clone());
     router(state.clone())
         .merge(auth::auth_routes().with_state(state.clone()))
-        .merge(detail::routes().with_state(state.clone()))
-        .merge(stubs)
-}
-
-async fn auth_placeholder(_u: auth::SessionUser) -> impl IntoResponse {
-    (axum::http::StatusCode::NOT_IMPLEMENTED, "landing in Tasks 10–11")
+        .merge(detail::routes().with_state(state))
 }
 
 async fn dashboard(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
