@@ -716,3 +716,63 @@ fn fake_nmap(dir: &std::path::Path) -> String {
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     fake.to_string_lossy().into_owned()
 }
+
+#[tokio::test]
+async fn assets_and_security_headers() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let base = spawn_admin_with(store, dir.path()).await;
+    let resp = reqwest::get(format!("{base}/assets/app.css"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("max-age=31536000")
+    );
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/css")
+    );
+    let css = resp.text().await.unwrap();
+    assert!(css.contains("--color-accent"));
+    assert!(css.contains("@font-face"));
+
+    let resp = reqwest::get(format!("{base}/assets/fonts/inter-400.woff2"))
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get("content-type").unwrap(), "font/woff2");
+
+    let resp = reqwest::get(format!("{base}/")).await.unwrap();
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("script-src 'self'"));
+    assert!(csp.contains("frame-ancestors 'none'"));
+    assert_eq!(
+        resp.headers().get("referrer-policy").unwrap(),
+        "no-referrer"
+    );
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+
+    assert_eq!(
+        reqwest::get(format!("{base}/assets/nope.css"))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+}

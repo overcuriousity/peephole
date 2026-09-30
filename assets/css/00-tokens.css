@@ -1,0 +1,163 @@
+/* Tokens: fonts, type scale, geometry, both themes. Sorted first so every
+   later layer can rely on them. Structure follows engram; palette is
+   peephole's own: near-black with the logo's bloodshot red as brand hue and
+   a cool cyan as the interactive accent. */
+
+@font-face { font-family: Inter; font-weight: 400; font-display: swap;
+  src: url("/assets/fonts/inter-400.woff2") format("woff2"); }
+@font-face { font-family: Inter; font-weight: 500; font-display: swap;
+  src: url("/assets/fonts/inter-500.woff2") format("woff2"); }
+@font-face { font-family: Inter; font-weight: 600; font-display: swap;
+  src: url("/assets/fonts/inter-600.woff2") format("woff2"); }
+@font-face { font-family: "JetBrains Mono"; font-weight: 400; font-display: swap;
+  src: url("/assets/fonts/jetbrains-mono-400.woff2") format("woff2"); }
+@font-face { font-family: "JetBrains Mono"; font-weight: 500; font-display: swap;
+  src: url("/assets/fonts/jetbrains-mono-500.woff2") format("woff2"); }
+
+:root {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Consolas, monospace;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-md: 0.9375rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.375rem;
+  --text-2xl: 1.75rem;
+  --text-3xl: 2.5rem;
+
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+
+  --shell-max: 80rem;
+
+  /* Light: warm paper, ink, teal-blue accent, the logo's red as brand. */
+  --color-bg-base: #f6f5f0;
+  --color-bg-surface: #efede6;
+  --color-bg-elevated: #ffffff;
+  --color-bg-hover: #e8e5dc;
+  --color-bg-active: #ddd9cd;
+
+  --color-fg-primary: #1f2024;
+  --color-fg-secondary: #4f5159;
+  --color-fg-muted: #66686f;
+
+  --color-border: #d9d5c9;
+  --color-border-strong: #c3beaf;
+  --color-border-subtle: #e6e3da;
+
+  --color-accent: #1f6f8b;
+  --color-accent-dim: rgba(31, 111, 139, 0.10);
+  --color-accent-muted: rgba(31, 111, 139, 0.30);
+  --color-accent-fg: #ffffff;
+
+  --color-brand: #b30000;
+  --color-brand-dim: rgba(179, 0, 0, 0.10);
+
+  --color-danger: #b3382c;  --color-danger-dim: rgba(179, 56, 44, 0.10);
+  --color-warning: #845b16; --color-warning-dim: rgba(132, 91, 22, 0.10);
+  --color-success: #2b7048; --color-success-dim: rgba(43, 112, 72, 0.10);
+
+  /* Severity 0..4: grey → amber → orange → red → violet. Text-safe on base. */
+  --sev-0: #63656c; --sev-0-dim: rgba(99, 101, 108, 0.14);
+  --sev-1: #7f6100; --sev-1-dim: rgba(127, 97, 0, 0.14);
+  --sev-2: #b04a00; --sev-2-dim: rgba(176, 74, 0, 0.14);
+  --sev-3: #b31c1c; --sev-3-dim: rgba(179, 28, 28, 0.14);
+  --sev-4: #7a1fa2; --sev-4-dim: rgba(122, 31, 162, 0.14);
+
+  /* Sequential ramp for the map (accent-based, not severity). */
+  --ramp-0: var(--color-bg-hover);
+  --ramp-1: rgba(31, 111, 139, 0.25);
+  --ramp-2: rgba(31, 111, 139, 0.45);
+  --ramp-3: rgba(31, 111, 139, 0.70);
+  --ramp-4: #1f6f8b;
+
+  --grid-texture: none;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-bg-base: #0a0b10;
+    --color-bg-surface: #10121a;
+    --color-bg-elevated: #171a24;
+    --color-bg-hover: #1f2330;
+    --color-bg-active: #282d3c;
+
+    --color-fg-primary: #e4e6ee;
+    --color-fg-secondary: #a0a4b8;
+    --color-fg-muted: #8a8ea6;
+
+    --color-border: #22263a;
+    --color-border-strong: #2f3449;
+    --color-border-subtle: #171a26;
+
+    --color-accent: #4fd1e0;
+    --color-accent-dim: rgba(79, 209, 224, 0.14);
+    --color-accent-muted: rgba(79, 209, 224, 0.35);
+    --color-accent-fg: #0a0b10;
+
+    --color-brand: #ff3b3b;
+    --color-brand-dim: rgba(255, 59, 59, 0.14);
+
+    --color-danger: #ff6b6b;  --color-danger-dim: rgba(255, 107, 107, 0.15);
+    --color-warning: #f0b344; --color-warning-dim: rgba(240, 179, 68, 0.15);
+    --color-success: #5fd39a; --color-success-dim: rgba(95, 211, 154, 0.15);
+
+    --sev-0: #9a9eb2; --sev-0-dim: rgba(154, 158, 178, 0.16);
+    --sev-1: #f0c34a; --sev-1-dim: rgba(240, 195, 74, 0.16);
+    --sev-2: #ff9440; --sev-2-dim: rgba(255, 148, 64, 0.16);
+    --sev-3: #ff5c5c; --sev-3-dim: rgba(255, 92, 92, 0.16);
+    --sev-4: #d17dff; --sev-4-dim: rgba(209, 125, 255, 0.16);
+
+    --ramp-0: #1a1e2b;
+    --ramp-1: rgba(79, 209, 224, 0.22);
+    --ramp-2: rgba(79, 209, 224, 0.42);
+    --ramp-3: rgba(79, 209, 224, 0.68);
+    --ramp-4: #4fd1e0;
+
+    --grid-texture:
+      repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 32px),
+      repeating-linear-gradient(90deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 32px);
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --color-bg-base: #0a0b10;
+  --color-bg-surface: #10121a;
+  --color-bg-elevated: #171a24;
+  --color-bg-hover: #1f2330;
+  --color-bg-active: #282d3c;
+  --color-fg-primary: #e4e6ee;
+  --color-fg-secondary: #a0a4b8;
+  --color-fg-muted: #8a8ea6;
+  --color-border: #22263a;
+  --color-border-strong: #2f3449;
+  --color-border-subtle: #171a26;
+  --color-accent: #4fd1e0;
+  --color-accent-dim: rgba(79, 209, 224, 0.14);
+  --color-accent-muted: rgba(79, 209, 224, 0.35);
+  --color-accent-fg: #0a0b10;
+  --color-brand: #ff3b3b;
+  --color-brand-dim: rgba(255, 59, 59, 0.14);
+  --color-danger: #ff6b6b;  --color-danger-dim: rgba(255, 107, 107, 0.15);
+  --color-warning: #f0b344; --color-warning-dim: rgba(240, 179, 68, 0.15);
+  --color-success: #5fd39a; --color-success-dim: rgba(95, 211, 154, 0.15);
+  --sev-0: #9a9eb2; --sev-0-dim: rgba(154, 158, 178, 0.16);
+  --sev-1: #f0c34a; --sev-1-dim: rgba(240, 195, 74, 0.16);
+  --sev-2: #ff9440; --sev-2-dim: rgba(255, 148, 64, 0.16);
+  --sev-3: #ff5c5c; --sev-3-dim: rgba(255, 92, 92, 0.16);
+  --sev-4: #d17dff; --sev-4-dim: rgba(209, 125, 255, 0.16);
+  --ramp-0: #1a1e2b;
+  --ramp-1: rgba(79, 209, 224, 0.22);
+  --ramp-2: rgba(79, 209, 224, 0.42);
+  --ramp-3: rgba(79, 209, 224, 0.68);
+  --ramp-4: #4fd1e0;
+  --grid-texture:
+    repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 32px),
+    repeating-linear-gradient(90deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 32px);
+  color-scheme: dark;
+}

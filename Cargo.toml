@@ -2,6 +2,7 @@
 name = "peephole"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [lib]
 name = "peephole"
@@ -14,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 arrow = "55"
-askama = "0.14"
+askama = "0.16"
 axum = "0.8"
 axum-extra = { version = "0.10", features = ["cookie-signed"] }
 chrono = { version = "0.4", features = ["serde"] }

@@ -1,6 +1,8 @@
+pub mod assets;
 pub mod auth;
 pub mod detail;
 pub mod sse;
+pub mod views;
 
 use crate::config::Config;
 use crate::store::Store;
@@ -24,32 +26,51 @@ impl AdminState {
     }
 }
 
-pub fn router(state: Arc<AdminState>) -> Router {
+pub fn router_with_auth(store: Store, cfg: Config) -> Router {
+    let state = Arc::new(AdminState::public_only(store, cfg));
+    full_router(state)
+}
+
+/// Every route on the admin listener: public pages, assets, auth, admin.
+pub fn full_router(state: Arc<AdminState>) -> Router {
     Router::new()
         .route("/", get(dashboard))
-        .route("/logo.svg", get(logo))
         .route("/api/stats", get(stats_json))
         .route("/api/queue", get(sse::queue_stream))
+        .merge(assets::router())
+        .merge(auth::auth_routes())
+        .merge(detail::routes())
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
 
-async fn logo() -> impl IntoResponse {
-    (
-        [
-            (axum::http::header::CONTENT_TYPE, "image/svg+xml"),
-            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
-        ],
-        include_str!("../../assets/logo.svg"),
-    )
+/// Public-only router used by early tests; same middleware.
+pub fn router(state: Arc<AdminState>) -> Router {
+    full_router(state)
 }
 
-/// Full admin router including auth + authenticated routes (Task 10 mounts its
-/// routes behind `auth::SessionUser` here too).
-pub fn router_with_auth(store: Store, cfg: Config) -> Router {
-    let state = Arc::new(AdminState::public_only(store, cfg));
-    router(state.clone())
-        .merge(auth::auth_routes().with_state(state.clone()))
-        .merge(detail::routes().with_state(state))
+async fn security_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static(
+            "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; \
+             connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+        ),
+    );
+    h.insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    res
 }
 
 async fn dashboard(State(state): State<Arc<AdminState>>) -> impl IntoResponse {

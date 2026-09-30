@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <script src="/assets/js/theme.js?v={{ chrome.stamp }}"></script>
+  <title>{% block title %}peephole{% endblock %}</title>
+  <link rel="icon" href="/assets/logo.svg?v={{ chrome.stamp }}" type="image/svg+xml">
+  <meta name="theme-color" content="#f6f5f0" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0a0b10" media="(prefers-color-scheme: dark)">
+  <link rel="stylesheet" href="/assets/app.css?v={{ chrome.stamp }}">
+  <script src="/assets/js/app.js?v={{ chrome.stamp }}" defer></script>
+  {% block head %}{% endblock %}
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-row">
+    <a class="brand" href="/"><img src="/assets/logo.svg?v={{ chrome.stamp }}" alt=""><span>peephole</span></a>
+    <nav class="nav" aria-label="Primary">
+      <a href="/"{% if chrome.active == "wall" %} aria-current="page"{% endif %}>Wall</a>
+      <a href="/ips"{% if chrome.active == "ips" %} aria-current="page"{% endif %}>IPs</a>
+      <a href="/requests"{% if chrome.active == "requests" %} aria-current="page"{% endif %}>Requests</a>
+      {% if chrome.authed %}<a href="/admin"{% if chrome.active == "admin" %} aria-current="page"{% endif %}>Admin</a>{% endif %}
+    </nav>
+    <div class="topbar-actions">
+      <button class="btn btn-ghost btn-sm" type="button" data-theme-toggle aria-label="Toggle theme"><span data-theme-label>Auto</span></button>
+      {% if chrome.authed %}
+        <form method="post" action="/logout"><button class="btn btn-ghost btn-sm" type="submit">Log out</button></form>
+      {% else %}
+        <a class="btn btn-ghost btn-sm" href="/login">Admin login</a>
+      {% endif %}
+    </div>
+  </div>
+</header>
+<main class="shell">
+{% block content %}{% endblock %}
+</main>
+<footer class="footer"><span>peephole · scan the scanners</span><span class="mono">{{ chrome.version }}</span></footer>
+</body>
+</html>
