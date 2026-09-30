@@ -342,7 +342,7 @@ impl Store {
             "{IP_SUMMARY_SELECT}{} GROUP BY i.id{} ORDER BY {order} LIMIT {limit} OFFSET {off}",
             fs.where_sql, fs.having
         );
-        let mut q = sqlx::query_as::<_, IpSummary>(&sql);
+        let mut q = sqlx::query_as::<_, IpSummary>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &fs.binds {
             q = q.bind(b);
         }
@@ -371,7 +371,7 @@ impl Store {
             "SELECT i.id, i.ip FROM ips i LEFT JOIN requests r ON r.ip_id = i.id{} GROUP BY i.id{} LIMIT {MATCH_LIMIT}",
             fs.where_sql, fs.having
         );
-        let mut q = sqlx::query_as::<_, (i64, String)>(&sql);
+        let mut q = sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &fs.binds {
             q = q.bind(b);
         }
@@ -401,7 +401,7 @@ impl Store {
             "SELECT COUNT(*) FROM (SELECT i.id FROM ips i LEFT JOIN requests r ON r.ip_id = i.id{} GROUP BY i.id{})",
             fs.where_sql, fs.having
         );
-        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &fs.binds {
             q = q.bind(b);
         }
@@ -413,7 +413,7 @@ impl Store {
         let (w, binds) = request_filter_sql(f);
         let sql =
             format!("SELECT COUNT(*) FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w}");
-        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &binds {
             q = q.bind(b);
         }
@@ -426,7 +426,7 @@ impl Store {
         let sql = format!(
             "SELECT r.id FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w} ORDER BY r.id DESC LIMIT {MATCH_LIMIT}"
         );
-        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &binds {
             q = q.bind(b);
         }
@@ -489,7 +489,7 @@ impl Store {
             PAGE_SIZE + 1,
             offset(page)
         );
-        let rows = sqlx::query_as::<_, RequestListRow>(&sql)
+        let rows = sqlx::query_as::<_, RequestListRow>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(ip_id)
             .fetch_all(&self.pool)
             .await?;
@@ -504,7 +504,7 @@ impl Store {
             PAGE_SIZE + 1,
             offset(page)
         );
-        let mut q = sqlx::query_as::<_, RequestListRow>(&sql);
+        let mut q = sqlx::query_as::<_, RequestListRow>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &binds {
             q = q.bind(b);
         }

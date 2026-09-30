@@ -101,17 +101,17 @@ pub fn optional_key_notes(path: &Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return vec![];
     };
-    let Ok(doc) = text.parse::<toml::Value>() else {
+    let Ok(doc) = text.parse::<toml::Table>() else {
         return vec![];
     };
     let mut notes = vec![];
     let mut missing_tables = std::collections::BTreeSet::new();
     for (table, key, default) in OPTIONAL_KEYS {
         let present = if table.is_empty() {
-            doc.get(key).is_some()
+            doc.get(*key).is_some()
         } else {
-            match doc.get(table) {
-                Some(t) => t.get(key).is_some(),
+            match doc.get(*table) {
+                Some(t) => t.get(*key).is_some(),
                 None => {
                     missing_tables.insert(*table);
                     continue;

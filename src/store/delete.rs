@@ -33,7 +33,10 @@ impl Store {
             "DELETE FROM fp_claims WHERE ip_id = ?",
             "DELETE FROM requests WHERE ip_id = ?",
         ] {
-            sqlx::query(sql).bind(ip_id).execute(&mut *tx).await?;
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(ip_id)
+                .execute(&mut *tx)
+                .await?;
         }
         let n = sqlx::query("DELETE FROM ips WHERE id = ?")
             .bind(ip_id)
@@ -87,14 +90,14 @@ impl Store {
                 format!("DELETE FROM fp_claims WHERE request_id IN ({ph})"),
                 format!("DELETE FROM fingerprints WHERE request_id IN ({ph})"),
             ] {
-                let mut q = sqlx::query(&sql);
+                let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
                 for id in chunk {
                     q = q.bind(id);
                 }
                 q.execute(&mut *tx).await?;
             }
             let sql = format!("DELETE FROM requests WHERE id IN ({ph})");
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 q = q.bind(id);
             }
@@ -120,14 +123,14 @@ impl Store {
                 format!("DELETE FROM fp_claims WHERE ip_id IN ({ph})"),
                 format!("DELETE FROM requests WHERE ip_id IN ({ph})"),
             ] {
-                let mut q = sqlx::query(&sql);
+                let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
                 for id in chunk {
                     q = q.bind(id);
                 }
                 q.execute(&mut *tx).await?;
             }
             let sql = format!("DELETE FROM ips WHERE id IN ({ph})");
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 q = q.bind(id);
             }
@@ -203,11 +206,13 @@ mod tests {
     }
 
     async fn count(s: &Store, table: &str, col: &str, id: i64) -> i64 {
-        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE {col} = ?"))
-            .bind(id)
-            .fetch_one(&s.pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE {col} = ?"
+        )))
+        .bind(id)
+        .fetch_one(&s.pool)
+        .await
+        .unwrap()
     }
 
     #[tokio::test]

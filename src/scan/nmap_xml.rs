@@ -35,18 +35,14 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
             Event::Start(e) | Event::Empty(e) => {
                 let name = e.name();
                 match name.as_ref() {
-                    b"host" => saw_host = true,
-                    b"port" => {
+                    "host" => saw_host = true,
+                    "port" => {
                         let mut port = 0u16;
                         let mut proto = String::from("tcp");
                         for a in e.attributes().flatten() {
                             match a.key.as_ref() {
-                                b"portid" => {
-                                    port = String::from_utf8_lossy(&a.value).parse().unwrap_or(0)
-                                }
-                                b"protocol" => {
-                                    proto = String::from_utf8_lossy(&a.value).into_owned()
-                                }
+                                "portid" => port = a.value.parse().unwrap_or(0),
+                                "protocol" => proto = a.value.clone().into_owned(),
                                 _ => {}
                             }
                         }
@@ -59,47 +55,38 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
                             version: None,
                         });
                     }
-                    b"state" => {
+                    "state" => {
                         if let Some(p) = cur.as_mut() {
                             for a in e.attributes().flatten() {
-                                if a.key.as_ref() == b"state" {
-                                    p.state = String::from_utf8_lossy(&a.value).into_owned();
+                                if a.key.as_ref() == "state" {
+                                    p.state = a.value.clone().into_owned();
                                 }
                             }
                         }
                     }
-                    b"service" => {
+                    "service" => {
                         if let Some(p) = cur.as_mut() {
                             for a in e.attributes().flatten() {
                                 match a.key.as_ref() {
-                                    b"name" => {
-                                        p.service =
-                                            Some(String::from_utf8_lossy(&a.value).into_owned())
-                                    }
-                                    b"product" => {
-                                        p.product =
-                                            Some(String::from_utf8_lossy(&a.value).into_owned())
-                                    }
-                                    b"version" => {
-                                        p.version =
-                                            Some(String::from_utf8_lossy(&a.value).into_owned())
-                                    }
+                                    "name" => p.service = Some(a.value.clone().into_owned()),
+                                    "product" => p.product = Some(a.value.clone().into_owned()),
+                                    "version" => p.version = Some(a.value.clone().into_owned()),
                                     _ => {}
                                 }
                             }
                         }
                     }
-                    b"osmatch" if os_guess.is_none() => {
+                    "osmatch" if os_guess.is_none() => {
                         for a in e.attributes().flatten() {
-                            if a.key.as_ref() == b"name" {
-                                os_guess = Some(String::from_utf8_lossy(&a.value).into_owned());
+                            if a.key.as_ref() == "name" {
+                                os_guess = Some(a.value.clone().into_owned());
                             }
                         }
                     }
                     _ => {}
                 }
             }
-            Event::End(e) if e.name().as_ref() == b"port" => {
+            Event::End(e) if e.name().as_ref() == "port" => {
                 if let Some(p) = cur.take()
                     && p.port > 0
                 {

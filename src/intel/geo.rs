@@ -40,13 +40,24 @@ impl GeoIp {
 
     pub fn lookup(&self, ip: &IpAddr) -> Geo {
         let mut g = Geo::default();
-        if let Ok(Some(rec)) = self.city.lookup::<CityRecord>(*ip) {
+        // maxminddb 0.32: lookup yields a LookupResult; decode the record.
+        if let Some(rec) = self
+            .city
+            .lookup(*ip)
+            .ok()
+            .and_then(|r| r.decode::<CityRecord>().ok().flatten())
+        {
             g.country = rec
                 .country
                 .and_then(|c| c.names)
                 .and_then(|mut n| n.remove("en"));
         }
-        if let Ok(Some(rec)) = self.asn.lookup::<AsnRecord>(*ip) {
+        if let Some(rec) = self
+            .asn
+            .lookup(*ip)
+            .ok()
+            .and_then(|r| r.decode::<AsnRecord>().ok().flatten())
+        {
             g.asn = rec.autonomous_system_number;
             g.asn_org = rec.autonomous_system_organization;
         }

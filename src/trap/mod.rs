@@ -308,7 +308,7 @@ fn render_panel_scrambled(pairs: &[(String, String)]) -> String {
     items.shuffle(&mut rng);
     let rid = |rng: &mut rand::rngs::ThreadRng| -> String {
         (0..8)
-            .map(|_| (b'a' + (rand::Rng::random_range(rng, 0..26)) as u8) as char)
+            .map(|_| (b'a' + (rand::RngExt::random_range(rng, 0..26)) as u8) as char)
             .collect()
     };
     let mut html = String::from("<div><h2>What we see about you</h2>");
@@ -324,7 +324,7 @@ fn render_panel_scrambled(pairs: &[(String, String)]) -> String {
         let n = if chars.len() <= 8 {
             1
         } else {
-            2 + rand::Rng::random_range(&mut rng, 0..3usize)
+            2 + rand::RngExt::random_range(&mut rng, 0..3usize)
         };
         let mut idx = 0usize;
         for i in 0..n {
