@@ -69,7 +69,8 @@ src/
 │   └── ...           # existing files; ip_detail() HTML builder removed
 ├── scan/mod.rs       # publishes QueueEvent on every job transition
 ├── trap/mod.rs       # publishes QueueEvent on enqueue
-└── events.rs         # QueueEvent + broadcast::Sender wrapper (Notifier)
+├── events.rs         # QueueEvent + broadcast::Sender wrapper (Notifier)
+└── main.rs           # `--version`, `check-config <path>`, default: run
 templates/            # askama: layout.html, partials, one file per page, trap.html
 assets/
 ├── css/00-tokens.css … 40-charts.css   # concatenated by build.rs → assets/app.css
@@ -351,7 +352,91 @@ Integration (`tests/integration.rs`, adapted and extended):
   or `/login` link to the admin host.
 - Existing WebAuthn, export and full-stack smoke tests continue to pass.
 
-## 12. Out of scope (recommended follow-ups)
+## 12. Installer and deployment
+
+`install.sh` stays the single entry point (`curl … | sudo bash`) and becomes an
+idempotent install-or-upgrade tool. Every run detects whether peephole is
+already installed and takes the matching path.
+
+### 12.1 Robustness
+
+- The whole script body lives in `main()` and the last line is `main "$@"`,
+  so a truncated download executes nothing rather than half a script.
+- Preconditions checked up front with clear messages: root, `apt-get`,
+  `systemctl` present and systemd running as PID 1, `uname -m` is `x86_64`
+  (the only published asset; other architectures get an explicit "build from
+  source" error instead of a 404).
+- Prerequisites are installed only when missing (`command -v` / `dpkg -s`);
+  `apt-get update` runs only in that case.
+- Downloads use `curl --fail --retry 5 --retry-delay 3 --retry-all-errors`
+  and fail cleanly if the rolling release is mid-recreation (the release
+  workflow deletes and recreates the `latest` tag, leaving a window of 404s).
+- The release tarball gains a `VERSION` file (`<git sha> <utc build time>`);
+  the binary reports the same via `peephole --version`, compiled in from a
+  `PEEPHOLE_VERSION` env var set by the release workflow (`option_env!`,
+  fallback `dev`). The installer compares the two and skips download and
+  restart when they match unless `PEEPHOLE_FORCE=1` is set.
+- The binary is installed to `${INSTALL_BIN}.new` and moved into place
+  atomically; the previous binary is kept as `${INSTALL_BIN}.prev`.
+- `peephole check-config <path>` is a new subcommand: loads and validates the
+  config, parses the rule directory, checks `nmap --version`. Exit code
+  non-zero with a readable message on failure. The installer runs it against
+  the existing config **before** restarting; a failure aborts the upgrade
+  with the message and leaves the old binary running.
+- After (re)start the installer waits up to 20 s for
+  `http://<admin_listen>/healthz` (address read from `config.toml`) to answer
+  `200`. On timeout it restores `${INSTALL_BIN}.prev`, restarts, prints the
+  last 30 journal lines, and exits non-zero.
+- `shellcheck` and `bash -n` run on `install.sh` in CI.
+
+### 12.2 Upgrade path (config present)
+
+- Config is never rewritten. The installer only reports missing keys that the
+  new version knows about (via `check-config`, which warns on absent optional
+  sections) so the operator can add them.
+- Shipped rule files are treated like conffiles: the installer records the
+  checksum of every rule file it installs in `${DATA_DIR}/.installed-rules.sha256`.
+  On upgrade, a rule file whose current checksum still matches the recorded
+  one is replaced by the new shipped version; a file the operator edited is
+  kept and a warning names it and the path of the new version left beside it
+  as `<name>.toml.new`.
+- The systemd unit is reinstalled (operator customisations belong in a
+  `peephole.service.d/` drop-in, which survives). `daemon-reload`, then
+  `restart`.
+- Deployment snippets: `deploy/nginx.example.conf` is added to the tarball
+  and installed to `${CONFIG_DIR}/nginx.example.conf` (never enabled
+  automatically). It terminates TLS, proxies to `admin_listen`, and for
+  `/admin/api/queue` sets `proxy_buffering off`, `proxy_cache off`,
+  `proxy_read_timeout 1h` and `X-Accel-Buffering: no` so Server-Sent Events
+  stream through nginx. Without this the live queue stalls behind nginx.
+
+### 12.3 First install (no config)
+
+Unchanged prompts and env overrides. After the health check succeeds the
+installer reads the setup token from the journal (`journalctl -u peephole
+--since -2min`) and prints it together with the enrollment URL
+`https://<domain>/enroll`, so the operator does not have to find it in the
+logs. If the token line is absent (already consumed) the message says so.
+
+### 12.4 Release workflow changes
+
+- Writes `VERSION` into the tarball and passes `PEEPHOLE_VERSION=<sha>` to
+  `cargo build`.
+- Packages `deploy/nginx.example.conf`.
+- Runs `shellcheck install.sh` as part of CI.
+
+### 12.5 Tests
+
+- `install.sh` is exercised in CI on `ubuntu-latest` inside a Debian
+  container with a stubbed download (local tarball served by `python3 -m
+  http.server`, `BASE_URL` override honoured by the script): fresh install
+  with env-provided settings, then a second run that must report "already
+  up to date", then a forced run with an edited rule file that must keep the
+  edit and drop a `.new` beside it.
+- Unit test for `check-config` on the example config and on a broken one.
+- Integration test: `peephole --version` prints the compiled version.
+
+## 13. Out of scope (recommended follow-ups)
 
 Retention/prune + vacuum; per-IP rate limits on `/collect` and `/claim`;
 manual scan control (enqueue/cancel/retry/runtime never-scan); scans/ports
