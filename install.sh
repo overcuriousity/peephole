@@ -11,6 +11,16 @@
 # download executes nothing rather than half a script.
 set -euo pipefail
 
+# Pull the one-time setup token out of journal output. journalctl's default
+# format prefixes every line with a timestamp/host/unit, so match the UUID
+# itself rather than a column.
+extract_token() {
+    grep -A2 'enter this one-time token' \
+        | grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+        | head -1 || true
+}
+if [ "${1:-}" = "--extract-token" ]; then extract_token; exit 0; fi
+
 main() {
 REPO="overcuriousity/peephole"
 ASSET="peephole-x86_64-unknown-linux-gnu"
@@ -30,6 +40,9 @@ die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "must run as root (use sudo)"
 command -v apt-get >/dev/null 2>&1 || die "this installer supports Debian/Ubuntu (apt) systems only"
 command -v systemctl >/dev/null 2>&1 || die "systemd is required (systemctl not found)"
+if [ "${PEEPHOLE_ALLOW_NO_SYSTEMD:-0}" != "1" ] && [ "$(cat /proc/1/comm 2>/dev/null)" != "systemd" ]; then
+    die "systemd is not PID 1 (container or chroot?). The service cannot be managed here; set PEEPHOLE_ALLOW_NO_SYSTEMD=1 to install anyway."
+fi
 [ "$(uname -m)" = "x86_64" ] || die "only x86_64 builds are published; build from source on $(uname -m) (see README)"
 
 if [ -r /dev/tty ]; then INTERACTIVE=1; else INTERACTIVE=0; fi
@@ -223,7 +236,7 @@ fi
 
 token=""
 if [ "${PEEPHOLE_SKIP_HEALTH:-0}" != "1" ]; then
-    token="$(journalctl -u peephole --since '-2min' --no-pager 2>/dev/null | grep -A2 'enter this one-time token' | tail -1 | tr -d ' ' || true)"
+    token="$(journalctl -u peephole --since '-2min' --no-pager -o cat 2>/dev/null | extract_token)"
 fi
 cat <<DONE
 

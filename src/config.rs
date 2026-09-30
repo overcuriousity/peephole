@@ -83,6 +83,60 @@ impl Default for ScanConfig {
     }
 }
 
+/// Optional settings and their defaults, so `check-config` can point out
+/// keys an older config predates. (`table`, `key`, `default`)
+const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
+    ("", "trusted_proxies", "[]"),
+    ("webauthn", "secure_cookies", "true"),
+    ("scan", "max_workers", "2"),
+    ("scan", "timeout_secs", "900"),
+    ("scan", "rescan_cooldown_hours", "24"),
+    ("scan", "max_scans_per_hour", "30"),
+    ("scan", "never_scan", "[]"),
+];
+
+/// One human-readable note per optional key the file does not set.
+/// Unparsable files yield no notes; `load` reports those errors.
+pub fn optional_key_notes(path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return vec![];
+    };
+    let Ok(doc) = text.parse::<toml::Value>() else {
+        return vec![];
+    };
+    let mut notes = vec![];
+    let mut missing_tables = std::collections::BTreeSet::new();
+    for (table, key, default) in OPTIONAL_KEYS {
+        let present = if table.is_empty() {
+            doc.get(key).is_some()
+        } else {
+            match doc.get(table) {
+                Some(t) => t.get(key).is_some(),
+                None => {
+                    missing_tables.insert(*table);
+                    continue;
+                }
+            }
+        };
+        if !present {
+            let full = if table.is_empty() {
+                key.to_string()
+            } else {
+                format!("{table}.{key}")
+            };
+            notes.push(format!(
+                "note: optional `{full}` not set (default {default})"
+            ));
+        }
+    }
+    for t in missing_tables {
+        notes.push(format!(
+            "note: optional [{t}] section absent; defaults apply (see deploy/config.example.toml)"
+        ));
+    }
+    notes
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text =

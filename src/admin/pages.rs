@@ -440,12 +440,24 @@ async fn bulk_delete_requests(
     body: String,
 ) -> AppResult<Redirect> {
     let form = parse_bulk::<RequestFilter>(&body)?;
-    let ids: Vec<i64> = if form.all {
-        st.store.matching_request_ids(&form.filter).await?
+    let n = if form.all {
+        // Rounds of MATCH_LIMIT until nothing matches, so "all" means all.
+        let mut total = 0u64;
+        loop {
+            let ids = st.store.matching_request_ids(&form.filter).await?;
+            if ids.is_empty() {
+                break;
+            }
+            total += st.store.delete_requests(&ids).await?;
+            if (ids.len() as i64) < crate::store::browse::MATCH_LIMIT {
+                break;
+            }
+        }
+        total
     } else {
-        form.ids.iter().filter_map(|v| v.parse().ok()).collect()
+        let ids: Vec<i64> = form.ids.iter().filter_map(|v| v.parse().ok()).collect();
+        st.store.delete_requests(&ids).await?
     };
-    let n = st.store.delete_requests(&ids).await?;
     tracing::info!(deleted = n, all = form.all, "bulk request delete");
     Ok(Redirect::to(&format!(
         "/requests?{}",
@@ -459,18 +471,28 @@ async fn bulk_delete_ips(
     body: String,
 ) -> AppResult<Redirect> {
     let form = parse_bulk::<IpFilter>(&body)?;
-    let ids: Vec<i64> = if form.all {
-        st.store.matching_ip_ids(&form.filter).await?
-    } else {
-        let mut out = vec![];
-        for addr in &form.ids {
-            if let Some(ip) = st.store.ip_by_addr(addr).await? {
-                out.push(ip.id);
+    let n = if form.all {
+        let mut total = 0u64;
+        loop {
+            let ids = st.store.matching_ip_ids(&form.filter).await?;
+            if ids.is_empty() {
+                break;
+            }
+            total += st.store.delete_ips(&ids).await?;
+            if (ids.len() as i64) < crate::store::browse::MATCH_LIMIT {
+                break;
             }
         }
-        out
+        total
+    } else {
+        let mut ids = vec![];
+        for addr in &form.ids {
+            if let Some(ip) = st.store.ip_by_addr(addr).await? {
+                ids.push(ip.id);
+            }
+        }
+        st.store.delete_ips(&ids).await?
     };
-    let n = st.store.delete_ips(&ids).await?;
     tracing::info!(deleted = n, all = form.all, "bulk ip delete");
     Ok(Redirect::to(&format!(
         "/ips?{}",

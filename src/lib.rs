@@ -27,6 +27,7 @@ pub async fn check_config(
     config_path: &std::path::Path,
 ) -> Result<(config::Config, classify::Classifier, String)> {
     let cfg = config::Config::load(config_path).context("config")?;
+    let notes = config::optional_key_notes(config_path);
     let classifier = classify::Classifier::from_dir(&cfg.rules_dir).context("loading rules")?;
     let nmap = nmap_path();
     let out = tokio::process::Command::new(&nmap)
@@ -40,11 +41,15 @@ pub async fn check_config(
         .next()
         .unwrap_or("nmap")
         .to_string();
-    let summary = format!(
+    let mut summary = format!(
         "ok: config, rules ({}), {}",
         classifier.rule_count(),
         nmap_line
     );
+    for n in notes {
+        summary.push('\n');
+        summary.push_str(&n);
+    }
     Ok((cfg, classifier, summary))
 }
 

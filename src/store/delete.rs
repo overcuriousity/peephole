@@ -278,6 +278,7 @@ mod tests {
         };
         let ids = s.matching_request_ids(&f).await.unwrap();
         assert_eq!(ids.len(), 3);
+        assert_eq!(s.count_requests(&f).await.unwrap(), 3);
         assert_eq!(s.delete_requests(&ids[1..]).await.unwrap(), 2);
         assert_eq!(s.matching_request_ids(&f).await.unwrap().len(), 1);
         let total_claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fp_claims")
@@ -292,6 +293,26 @@ mod tests {
         };
         let ip_ids = s.matching_ip_ids(&ipf).await.unwrap();
         assert_eq!(ip_ids.len(), 2);
+        assert_eq!(s.count_ips(&ipf).await.unwrap(), 2);
+        // a and b lost their requests above; only c still has a severity-1 row.
+        assert_eq!(
+            s.count_ips(&IpFilter {
+                min_severity: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.count_ips(&IpFilter {
+                q: Some("garbage".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+            0
+        );
         assert!(ip_ids.contains(&a) && ip_ids.contains(&b));
         assert_eq!(s.delete_ips(&ip_ids).await.unwrap(), 2);
         assert_eq!(count(&s, "ips", "id", a).await, 0);

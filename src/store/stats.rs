@@ -345,10 +345,17 @@ pub fn intel_stale(intel: &HashMap<String, String>) -> bool {
 
 const TTL: Duration = Duration::from_secs(15);
 
+/// Bound on cached IP-directory pages (anonymous traffic only).
+pub const IPS_CACHE_MAX: usize = 64;
+
+type IpsPage = Arc<super::browse::Page<super::browse::IpSummary>>;
+
 #[derive(Default)]
 pub struct StatsCache {
     stats: RwLock<HashMap<Range, (Instant, Arc<Stats>)>>,
     map: RwLock<HashMap<Range, (Instant, Arc<MapCounts>)>>,
+    /// Keyed by the full query string (filter + page).
+    ips: RwLock<HashMap<String, (Instant, IpsPage)>>,
 }
 
 impl StatsCache {
@@ -368,6 +375,42 @@ impl StatsCache {
             .await
             .insert(r, (Instant::now(), fresh.clone()));
         Ok(fresh)
+    }
+
+    /// Public IP-directory pages: the unfiltered first page is what anonymous
+    /// crawlers hit, and it aggregates the whole requests table.
+    pub async fn ips(
+        &self,
+        store: &Store,
+        f: &super::browse::IpFilter,
+        key: String,
+    ) -> Result<IpsPage> {
+        if let Some((t, v)) = self.ips.read().await.get(&key)
+            && t.elapsed() < TTL
+        {
+            return Ok(v.clone());
+        }
+        let fresh = Arc::new(store.list_ips(f).await?);
+        let mut w = self.ips.write().await;
+        if w.len() >= IPS_CACHE_MAX {
+            // Drop expired entries first, then the oldest, to stay bounded.
+            w.retain(|_, (t, _)| t.elapsed() < TTL);
+            if w.len() >= IPS_CACHE_MAX
+                && let Some(oldest) = w
+                    .iter()
+                    .min_by_key(|(_, (t, _))| *t)
+                    .map(|(k, _)| k.clone())
+            {
+                w.remove(&oldest);
+            }
+        }
+        w.insert(key, (Instant::now(), fresh.clone()));
+        Ok(fresh)
+    }
+
+    #[cfg(test)]
+    pub async fn ips_len(&self) -> usize {
+        self.ips.read().await.len()
     }
 
     pub async fn map(&self, store: &Store, r: Range) -> Result<Arc<MapCounts>> {
@@ -497,6 +540,34 @@ mod tests {
         assert_eq!(b.total_requests, 3, "stale within ttl by design");
         let d7 = c.stats(&s, Range::D7).await.unwrap();
         assert_eq!(d7.total_requests, 5, "other range is computed fresh");
+    }
+
+    #[tokio::test]
+    async fn ip_directory_cache_is_keyed_and_bounded() {
+        use crate::store::browse::IpFilter;
+        let s = seeded().await;
+        let c = StatsCache::new();
+        let f = IpFilter::default();
+        let a = c.ips(&s, &f, "".into()).await.unwrap();
+        let b = c.ips(&s, &f, "".into()).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        let other = c
+            .ips(
+                &s,
+                &IpFilter {
+                    country: Some("DE".into()),
+                    ..Default::default()
+                },
+                "country=DE&".into(),
+            )
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&a, &other));
+        assert_eq!(other.items.len(), 1);
+        for i in 0..(IPS_CACHE_MAX + 5) {
+            c.ips(&s, &f, format!("k{i}&")).await.unwrap();
+        }
+        assert!(c.ips_len().await <= IPS_CACHE_MAX);
     }
 
     #[test]

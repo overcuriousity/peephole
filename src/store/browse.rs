@@ -313,8 +313,8 @@ fn request_filter_sql(f: &RequestFilter) -> (String, Vec<String>) {
     (sql, binds)
 }
 
-/// Upper bound for unpaged id lookups (bulk delete, CIDR candidates).
-const MATCH_LIMIT: i64 = 100_000;
+/// Upper bound for one unpaged id lookup (bulk delete works in rounds of this size).
+pub const MATCH_LIMIT: i64 = 100_000;
 
 impl Store {
     pub async fn list_ips(&self, f: &IpFilter) -> Result<Page<IpSummary>> {
@@ -387,6 +387,37 @@ impl Store {
             })
             .map(|(id, _)| id)
             .collect())
+    }
+
+    /// Number of IPs matching the filter (CIDR filtered in Rust, like `list_ips`).
+    pub async fn count_ips(&self, f: &IpFilter) -> Result<i64> {
+        let Some(fs) = ip_filter_sql(f) else {
+            return Ok(0);
+        };
+        if fs.net.is_some() {
+            return Ok(self.matching_ip_ids(f).await?.len() as i64);
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM (SELECT i.id FROM ips i LEFT JOIN requests r ON r.ip_id = i.id{} GROUP BY i.id{})",
+            fs.where_sql, fs.having
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        for b in &fs.binds {
+            q = q.bind(b);
+        }
+        Ok(q.fetch_one(&self.pool).await?)
+    }
+
+    /// Number of requests matching the filter.
+    pub async fn count_requests(&self, f: &RequestFilter) -> Result<i64> {
+        let (w, binds) = request_filter_sql(f);
+        let sql =
+            format!("SELECT COUNT(*) FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w}");
+        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        for b in &binds {
+            q = q.bind(b);
+        }
+        Ok(q.fetch_one(&self.pool).await?)
     }
 
     /// Every request id matching the filter (unpaged; bulk delete + counts).

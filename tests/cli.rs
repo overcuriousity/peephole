@@ -52,6 +52,13 @@ license_key = "k"
         stdout.contains("ok:") && stdout.contains("rules"),
         "{stdout}"
     );
+    // Optional keys the config leaves out are pointed out, so operators learn
+    // about new settings on upgrade.
+    assert!(
+        stdout.contains("note: optional") && stdout.contains("secure_cookies"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("[scan]"), "{stdout}");
 
     let bad = dir.path().join("bad.toml");
     std::fs::write(&bad, "trap_listen = 12\n").unwrap();

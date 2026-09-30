@@ -152,7 +152,7 @@ fn urlencode(s: &str) -> String {
 struct IpsPage {
     chrome: Chrome,
     f: IpFilter,
-    page: Page<IpSummary>,
+    page: Arc<Page<IpSummary>>,
     qs: String,
     /// Rows matching the filter across all pages; `Some` only with a session.
     bulk_total: Option<i64>,
@@ -189,13 +189,16 @@ async fn ips(
     State(state): State<Arc<AdminState>>,
     Query(f): Query<IpFilter>,
 ) -> AppResult<Html<String>> {
-    let page = state.store.list_ips(&f).await?;
-    let bulk_total = if authed {
-        Some(state.store.matching_ip_ids(&f).await?.len() as i64)
-    } else {
-        None
-    };
     let qs = ip_qs(&f);
+    // Anonymous views go through the 15 s cache (spec §6.3 rationale);
+    // an admin always sees fresh rows.
+    let (page, bulk_total) = if authed {
+        let page = Arc::new(state.store.list_ips(&f).await?);
+        (page, Some(state.store.count_ips(&f).await?))
+    } else {
+        let key = format!("{qs}page={}", page_num(f.page));
+        (state.stats_cache.ips(&state.store, &f, key).await?, None)
+    };
     render(&IpsPage {
         chrome: Chrome::new(authed, "ips"),
         f,
@@ -222,7 +225,7 @@ async fn requests(
 ) -> AppResult<Html<String>> {
     let page = state.store.search_requests(&f).await?;
     let bulk_total = if authed {
-        Some(state.store.matching_request_ids(&f).await?.len() as i64)
+        Some(state.store.count_requests(&f).await?)
     } else {
         None
     };

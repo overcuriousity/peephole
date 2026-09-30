@@ -34,6 +34,15 @@ export PATH="/tmp/bin:$PATH"
 export PEEPHOLE_SKIP_APT=1 PEEPHOLE_SKIP_HEALTH=1 BASE_URL="http://127.0.0.1:8999"
 export MAXMIND_ACCOUNT_ID=1 MAXMIND_LICENSE_KEY=k PEEPHOLE_DOMAIN=peephole.test PEEPHOLE_TRUSTED_PROXIES=10.0.0.0/8
 
+echo "== token extraction survives journalctl prefixes"
+tok="$(printf 'Sep 30 10:00:00 host peephole[123]: Open /enroll on the admin interface and enter this one-time token:\nSep 30 10:00:00 host peephole[123]: \nSep 30 10:00:00 host peephole[123]:   3f2a1c4e-1111-4222-8333-444455556666\n' | bash install.sh --extract-token)"
+[ "$tok" = "3f2a1c4e-1111-4222-8333-444455556666" ] || { echo "token extraction broken: '$tok'"; exit 1; }
+
+echo "== refuses to install when systemd is not PID 1 (unless overridden)"
+if PEEPHOLE_ALLOW_NO_SYSTEMD= bash install.sh >/tmp/nopid1.log 2>&1; then echo "expected failure"; exit 1; fi
+grep -q "PID 1" /tmp/nopid1.log
+export PEEPHOLE_ALLOW_NO_SYSTEMD=1
+
 echo "== fresh install"
 bash install.sh
 test -x /usr/local/bin/peephole
