@@ -3,8 +3,38 @@ pub mod tor;
 
 use crate::config::Config;
 use crate::store::Store;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tracing::{info, warn};
+
+/// GeoIP readers shared with the trap; None until the MaxMind DBs exist.
+pub type SharedGeo = Arc<RwLock<Option<geo::GeoIp>>>;
+/// Tor exit list shared with the trap.
+pub type SharedTor = Arc<RwLock<tor::TorExitList>>;
+
+/// Rewrite country names left by older builds to ISO codes (needs the MaxMind DBs).
+pub async fn backfill_geo(store: &Store, geo: &RwLock<Option<geo::GeoIp>>) {
+    let rows = match store.ips_with_legacy_country().await {
+        Ok(r) if !r.is_empty() => r,
+        Ok(_) => return,
+        Err(e) => return warn!(?e, "geo backfill: query failed"),
+    };
+    let updates = {
+        let guard = geo.read().unwrap();
+        match guard.as_ref() {
+            Some(g) => g.relookup(&rows),
+            None => return,
+        }
+    };
+    match geo::backfill_iso_codes(store, updates).await {
+        Ok(n) => info!(
+            fixed = n,
+            pending = rows.len(),
+            "geo backfill: country names -> ISO codes"
+        ),
+        Err(e) => warn!(?e, "geo backfill failed"),
+    }
+}
 
 async fn is_stale(store: &Store, key: &str) -> bool {
     match store.intel_get(key).await {
@@ -15,17 +45,27 @@ async fn is_stale(store: &Store, key: &str) -> bool {
     }
 }
 
-/// Daily intel refresh (spec §9): startup-if-stale, then every 24h ± jitter.
+/// Daily intel refresh (spec §9): at startup (Tor always, MaxMind when stale
+/// or not loaded, to spare its download quota), then every 24h ± jitter.
+/// Each successful fetch is loaded into the shared state the trap reads.
 pub async fn run_scheduler(
     store: Store,
     cfg: Config,
+    geo: SharedGeo,
+    tor: SharedTor,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    backfill_geo(&store, &geo).await;
+    let mut first = true;
     loop {
-        if is_stale(&store, "tor_last_fetch").await {
+        if first || is_stale(&store, "tor_last_fetch").await {
             match tor::TorExitList::refresh(&cfg.data_dir).await {
                 Ok(n) => {
                     info!(n, "tor exit list refreshed");
+                    match tor::TorExitList::load(&cfg.data_dir) {
+                        Ok(l) => *tor.write().unwrap() = l,
+                        Err(e) => warn!(?e, "tor exit list reload failed"),
+                    }
                     let _ = store
                         .intel_set("tor_last_fetch", &chrono::Utc::now().to_rfc3339())
                         .await;
@@ -33,7 +73,8 @@ pub async fn run_scheduler(
                 Err(e) => warn!(?e, "tor exit list refresh failed; keeping previous"),
             }
         }
-        if is_stale(&store, "maxmind_last_fetch").await {
+        let geo_missing = geo.read().unwrap().is_none();
+        if geo_missing || is_stale(&store, "maxmind_last_fetch").await {
             match geo::download(
                 &cfg.data_dir,
                 &cfg.maxmind.account_id,
@@ -43,6 +84,13 @@ pub async fn run_scheduler(
             {
                 Ok(()) => {
                     info!("maxmind databases refreshed");
+                    match geo::GeoIp::load(&cfg.data_dir) {
+                        Ok(g) => {
+                            *geo.write().unwrap() = Some(g);
+                            backfill_geo(&store, &geo).await;
+                        }
+                        Err(e) => warn!(?e, "maxmind reload failed"),
+                    }
                     let _ = store
                         .intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339())
                         .await;
@@ -50,6 +98,7 @@ pub async fn run_scheduler(
                 Err(e) => warn!(?e, "maxmind download failed; keeping previous"),
             }
         }
+        first = false;
         // 24h ± up to 1h deterministic-ish jitter from nanos.
         let jitter =
             Duration::from_secs((chrono::Utc::now().timestamp_subsec_nanos() as u64) % 3600);

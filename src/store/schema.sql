@@ -65,3 +65,6 @@ CREATE INDEX IF NOT EXISTS idx_ports_scan ON ports(scan_id);
 CREATE INDEX IF NOT EXISTS idx_fingerprints_ip ON fingerprints(ip_id);
 CREATE INDEX IF NOT EXISTS idx_fp_claims_ip ON fp_claims(ip_id);
 CREATE INDEX IF NOT EXISTS idx_scan_jobs_ip ON scan_jobs(ip_id);
+-- Runtime settings changed from the admin UI (override config defaults).
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_queued_at ON scan_jobs(queued_at);

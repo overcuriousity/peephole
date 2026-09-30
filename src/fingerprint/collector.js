@@ -157,10 +157,16 @@
     });
   }
 
+  // 202 = fingerprint not stored yet (beacon still in flight): show the
+  // interim status and poll again with backoff, up to ~1 minute in total.
+  var panelTries = 0;
   function refreshPanel() {
     try {
       fetch("/panel?token=" + encodeURIComponent(TOKEN))
-        .then(function (r) { return r.ok ? r.text() : ""; })
+        .then(function (r) {
+          if (r.status === 202 && ++panelTries < 8) setTimeout(refreshPanel, 1500 * panelTries);
+          return r.ok ? r.text() : "";
+        })
         .then(function (html) {
           if (!html) return;
           var host = document.getElementById("fingerprint-panel");

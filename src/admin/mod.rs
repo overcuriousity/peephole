@@ -17,20 +17,29 @@ pub struct AdminState {
     pub cfg: Config,
     pub notifier: crate::events::Notifier,
     pub stats_cache: crate::store::stats::StatsCache,
+    pub pace: crate::scan::pace::SharedPace,
 }
 
 impl AdminState {
-    pub fn new(store: Store, cfg: Config, notifier: crate::events::Notifier) -> Self {
+    pub fn new(
+        store: Store,
+        cfg: Config,
+        notifier: crate::events::Notifier,
+        pace: crate::scan::pace::SharedPace,
+    ) -> Self {
         Self {
             store,
             cfg,
             notifier,
             stats_cache: crate::store::stats::StatsCache::new(),
+            pace,
         }
     }
     /// State with a private notifier (tests, or when nothing publishes).
     pub fn public_only(store: Store, cfg: Config) -> Self {
-        Self::new(store, cfg, crate::events::Notifier::new())
+        let pace =
+            crate::scan::pace::SharedPace::new(crate::scan::pace::Pace::from_config(&cfg.scan));
+        Self::new(store, cfg, crate::events::Notifier::new(), pace)
     }
 }
 

@@ -1,0 +1,7 @@
+{# Current filter, carried through bulk-delete forms so the redirect keeps it. #}
+<input type="hidden" name="q" value="{{ f.q.as_deref().unwrap_or_default() }}">
+<input type="hidden" name="country" value="{{ f.country.as_deref().unwrap_or_default() }}">
+<input type="hidden" name="asn" value="{% if let Some(v) = f.asn %}{{ v }}{% endif %}">
+<input type="hidden" name="label" value="{{ f.label.as_deref().unwrap_or_default() }}">
+<input type="hidden" name="min_severity" value="{% if let Some(v) = f.min_severity %}{{ v }}{% endif %}">
+<input type="hidden" name="tor" value="{{ f.tor.as_deref().unwrap_or_default() }}">

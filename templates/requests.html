@@ -24,20 +24,13 @@
   <dialog id="dlg-bulk-all"><h3>Delete all {{ t }} requests matching this filter?</h3><p class="muted">Across every page, not just the rows shown. Cannot be undone.</p>
     <form method="post" action="/admin/requests/bulk-delete" class="actions">
       <input type="hidden" name="all" value="1">
-      <input type="hidden" name="ip" value="{{ f.ip.as_deref().unwrap_or_default() }}">
-      <input type="hidden" name="path" value="{{ f.path.as_deref().unwrap_or_default() }}">
-      <input type="hidden" name="label" value="{{ f.label.as_deref().unwrap_or_default() }}">
-      <input type="hidden" name="severity" value="{% if let Some(v) = f.severity %}{{ v }}{% endif %}">
-      <input type="hidden" name="min_severity" value="{% if let Some(v) = f.min_severity %}{{ v }}{% endif %}">
-      <input type="hidden" name="country" value="{{ f.country.as_deref().unwrap_or_default() }}">
-      <input type="hidden" name="asn" value="{% if let Some(v) = f.asn %}{{ v }}{% endif %}">
-      <input type="hidden" name="from" value="{{ f.from.as_deref().unwrap_or_default() }}">
-      <input type="hidden" name="to" value="{{ f.to.as_deref().unwrap_or_default() }}">
+      {% include "_request_filter_hidden.html" %}
       <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Delete all {{ t }}</button>
     </form></dialog>
   {% endif %}
 </div>
 <form id="bulk-form" method="post" action="/admin/requests/bulk-delete">
+{% include "_request_filter_hidden.html" %}
 {% endif %}
 <div class="table-wrap"><table>
   <thead><tr>{% if chrome.authed %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>Time (UTC)</th><th>IP</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th>{% if chrome.authed %}<th></th>{% endif %}</tr></thead>

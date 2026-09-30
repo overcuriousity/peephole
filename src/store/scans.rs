@@ -72,6 +72,128 @@ impl Store {
         .await?)
     }
 
+    /// Jobs started in the last hour, whatever their outcome: the global rate
+    /// cap limits nmap launches, so failed and still-running scans count too.
+    pub async fn jobs_started_last_hour(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_jobs WHERE started_at > datetime('now','-1 hour')",
+        )
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Jobs left `running` by a crash or restart go back to the queue;
+    /// otherwise they block their IP from ever being scanned again.
+    pub async fn requeue_orphaned_jobs(&self) -> Result<u64> {
+        Ok(sqlx::query(
+            "UPDATE scan_jobs SET status='queued', started_at=NULL WHERE status='running'",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    pub async fn setting_get(&self, key: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn setting_set(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Queue growth measurements for the pacing recommendation.
+    pub async fn queue_metrics(&self) -> Result<crate::scan::pace::QueueMetrics> {
+        // SUM over zero rows is NULL.
+        type Sums = (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let (backlog, running, a1, a24, c1, c24): Sums = sqlx::query_as(
+            "SELECT SUM(status='queued'), SUM(status='running'),
+                    SUM(queued_at > datetime('now','-1 hour')),
+                    SUM(queued_at > datetime('now','-24 hours')),
+                    SUM(status IN ('done','failed') AND finished_at > datetime('now','-1 hour')),
+                    SUM(status IN ('done','failed') AND finished_at > datetime('now','-24 hours'))
+             FROM scan_jobs",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        // How much of the 24h window has data: the first job ever queued.
+        let first_age_h: Option<f64> = sqlx::query_scalar(
+            "SELECT (julianday('now') - julianday(MIN(queued_at))) * 24 FROM scan_jobs",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let avg_scan_secs: Option<f64> = sqlx::query_scalar(
+            "SELECT AVG((julianday(finished_at) - julianday(started_at)) * 86400)
+             FROM scan_jobs WHERE status = 'done' AND started_at IS NOT NULL
+               AND finished_at > datetime('now','-7 days')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let oldest_queued_secs: Option<i64> = sqlx::query_scalar(
+            "SELECT CAST((julianday('now') - julianday(MIN(queued_at))) * 86400 AS INTEGER)
+             FROM scan_jobs WHERE status = 'queued'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        // Hour buckets by age: 0 = the last 60 minutes.
+        let hourly = |col: &'static str, extra: &'static str| {
+            format!(
+                "SELECT CAST((julianday('now') - julianday({col})) * 24 AS INTEGER) AS h, COUNT(*)
+                 FROM scan_jobs WHERE {col} > datetime('now','-24 hours'){extra} GROUP BY h"
+            )
+        };
+        let mut hourly_arrivals = vec![0i64; 24];
+        let mut hourly_completions = vec![0i64; 24];
+        for (sql, out) in [
+            (hourly("queued_at", ""), &mut hourly_arrivals),
+            (
+                hourly("finished_at", " AND status IN ('done','failed')"),
+                &mut hourly_completions,
+            ),
+        ] {
+            let rows: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .fetch_all(&self.pool)
+                .await?;
+            for (h, n) in rows {
+                if (0..24).contains(&h) {
+                    out[23 - h as usize] += n;
+                }
+            }
+        }
+        Ok(crate::scan::pace::QueueMetrics {
+            backlog: backlog.unwrap_or(0),
+            running: running.unwrap_or(0),
+            arrivals_1h: a1.unwrap_or(0),
+            arrivals_24h: a24.unwrap_or(0),
+            completed_1h: c1.unwrap_or(0),
+            completed_24h: c24.unwrap_or(0),
+            observed_hours: first_age_h.unwrap_or(24.0).clamp(1.0, 24.0),
+            avg_scan_secs,
+            oldest_queued_secs,
+            hourly_arrivals,
+            hourly_completions,
+        })
+    }
+
     pub async fn next_queued_job(&self) -> Result<Option<ScanJobRow>> {
         let job = sqlx::query_as::<_, ScanJobRow>(
             "SELECT * FROM scan_jobs WHERE status = 'queued' ORDER BY level DESC, queued_at ASC LIMIT 1",
@@ -173,5 +295,60 @@ mod tests {
         let snap = s.queue_snapshot(50).await.unwrap();
         assert_eq!(snap.len(), 1);
         assert!(s.queue_job(9999).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn orphaned_running_jobs_are_requeued_and_rate_counts_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = s.upsert_ip("203.0.113.6".parse().unwrap()).await.unwrap();
+        s.enqueue_scan(ip.id, 2, 24).await.unwrap();
+        let job = s.next_queued_job().await.unwrap().unwrap();
+        assert_eq!(s.jobs_started_last_hour().await.unwrap(), 1);
+        // Simulated restart mid-scan.
+        assert_eq!(s.requeue_orphaned_jobs().await.unwrap(), 1);
+        assert_eq!(s.queue_job(job.id).await.unwrap().unwrap().status, "queued");
+        assert_eq!(s.next_queued_job().await.unwrap().unwrap().id, job.id);
+        s.finish_job(job.id, None, Some("timeout")).await.unwrap();
+        // The IP can be queued again once the job has ended.
+        assert_eq!(s.requeue_orphaned_jobs().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn queue_metrics_count_arrivals_completions_and_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        for i in 0..3 {
+            let ip = s
+                .upsert_ip(format!("203.0.113.{}", 10 + i).parse().unwrap())
+                .await
+                .unwrap();
+            s.enqueue_scan(ip.id, 2, 24).await.unwrap();
+        }
+        let job = s.next_queued_job().await.unwrap().unwrap();
+        sqlx::query(
+            "UPDATE scan_jobs SET status='done', started_at=datetime('now','-2 minutes'),
+             finished_at=datetime('now') WHERE id=?",
+        )
+        .bind(job.id)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let m = s.queue_metrics().await.unwrap();
+        assert_eq!(m.backlog, 2);
+        assert_eq!(m.arrivals_1h, 3);
+        assert_eq!(m.arrivals_24h, 3);
+        assert_eq!(m.completed_24h, 1);
+        assert_eq!(m.hourly_arrivals.len(), 24);
+        assert_eq!(m.hourly_arrivals[23], 3);
+        assert_eq!(m.hourly_completions[23], 1);
+        assert_eq!(m.observed_hours, 1.0);
+        assert!((m.avg_scan_secs.unwrap() - 120.0).abs() < 1.0);
+        assert!(m.oldest_queued_secs.is_some());
+
+        assert_eq!(s.setting_get("k").await.unwrap(), None);
+        s.setting_set("k", "1").await.unwrap();
+        s.setting_set("k", "2").await.unwrap();
+        assert_eq!(s.setting_get("k").await.unwrap().as_deref(), Some("2"));
     }
 }

@@ -220,10 +220,17 @@ async fn enroll_finish(
     match wa.finish_passkey_registration(&body.credential, &reg_state) {
         Ok(passkey) => {
             let json = serde_json::to_string(&passkey).unwrap();
-            let _ = state
+            // A key that was not stored must not consume the one-time setup
+            // token, or the admin is locked out once this session expires.
+            if let Err(e) = state
                 .store
                 .save_credential(passkey.cred_id(), &json, label.as_deref())
-                .await;
+                .await
+            {
+                tracing::warn!(?e, "could not store the enrolled key");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "could not store the key")
+                    .into_response();
+            }
             let _ = state
                 .store
                 .intel_set("webauthn_setup_token_hash", "consumed")

@@ -78,48 +78,21 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Daily intel; refresh shared state after each successful fetch.
-    {
-        let store = store.clone();
-        let cfg2 = cfg.clone();
-        let geo = geo.clone();
-        let tor = tor.clone();
-        let mut rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            // One immediate pass when stale, then delegate to the scheduler loop.
-            if intel::tor::TorExitList::refresh(&cfg2.data_dir)
-                .await
-                .is_ok()
-            {
-                if let Ok(l) = intel::tor::TorExitList::load(&cfg2.data_dir) {
-                    *tor.write().unwrap() = l;
-                }
-                let _ = store
-                    .intel_set("tor_last_fetch", &chrono::Utc::now().to_rfc3339())
-                    .await;
-            }
-            if intel::geo::download(
-                &cfg2.data_dir,
-                &cfg2.maxmind.account_id,
-                &cfg2.maxmind.license_key,
-            )
-            .await
-            .is_ok()
-            {
-                if let Ok(g) = intel::geo::GeoIp::load(&cfg2.data_dir) {
-                    *geo.write().unwrap() = Some(g);
-                }
-                let _ = store
-                    .intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339())
-                    .await;
-            }
-            intel::run_scheduler(store, cfg2, rx.clone()).await;
-            let _ = &mut rx;
-        });
-    }
+    // Daily intel: the scheduler refreshes the files and swaps the shared
+    // state after each successful fetch, so the trap sees fresh data.
+    tokio::spawn(intel::run_scheduler(
+        store.clone(),
+        cfg.clone(),
+        geo.clone(),
+        tor.clone(),
+        shutdown_rx.clone(),
+    ));
 
     // Queue change notifications: trap + workers publish, admin SSE subscribes.
     let notifier = events::Notifier::new();
+
+    // Scan pace: config defaults, overridden from the admin queue page.
+    let pace = scan::pace::SharedPace::load(&store, &cfg.scan).await?;
 
     // Scan worker pool.
     {
@@ -128,6 +101,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         tokio::spawn(scan::run_workers(
             store,
             cfg2,
+            pace.clone(),
             PathBuf::from(nmap_path),
             shutdown_rx.clone(),
             notifier.clone(),
@@ -151,6 +125,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         store.clone(),
         cfg.clone(),
         notifier,
+        pace,
     )));
 
     let trap_listener = tokio::net::TcpListener::bind(cfg.trap_listen)
