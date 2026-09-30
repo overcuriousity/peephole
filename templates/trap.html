@@ -4,52 +4,78 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
-<title>Notice — undefined route</title>
+<title>Undefined route</title>
 <style>
-  :root { color-scheme: light; }
-  body { font-family: system-ui, sans-serif; background:#f8fafc; color:#0f172a;
-         max-width: 680px; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.55; }
-  .card { background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:1.5rem; margin-bottom:1.25rem; }
-  h1 { font-size:1.35rem; margin:0 0 .75rem; }
-  .muted { color:#64748b; font-size:.9rem; }
-  button { background:#2563eb; color:#fff; border:0; border-radius:6px; padding:.55rem 1rem;
-           font-size:.95rem; cursor:pointer; }
-  button:hover { background:#1d4ed8; }
-  input[type=email], input[type=text], input[type=password] {
-    width:100%; box-sizing:border-box; padding:.5rem; border:1px solid #cbd5e1; border-radius:6px; margin:.25rem 0 .75rem; }
-  .bait { border:1px dashed #94a3b8; }
-  #email-row { display:none; }
+  :root {
+    --bg: #f6f5f0; --surface: #ffffff; --fg: #1f2024; --muted: #66686f; --border: #d9d5c9;
+    --accent: #1f6f8b; --accent-fg: #ffffff; --brand: #b30000; --field: #ffffff;
+    --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0a0b10; --surface: #171a24; --fg: #e4e6ee; --muted: #8a8ea6; --border: #22263a;
+            --accent: #4fd1e0; --accent-fg: #0a0b10; --brand: #ff3b3b; --field: #10121a; color-scheme: dark; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--font); font-size: 15px; line-height: 1.55;
+         padding: 3rem 1rem 4rem; }
+  main { max-width: 40rem; margin: 0 auto; display: grid; gap: 1rem; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem 1.5rem; }
+  .head { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
+  .mark { width: 28px; height: 28px; border-radius: 50%; flex: none;
+          background: radial-gradient(circle at 50% 50%, var(--brand) 0 28%, var(--surface) 30% 45%, var(--fg) 47% 100%); }
+  h1 { font-size: 1.2rem; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 1rem; margin: 0 0 0.75rem; }
+  p { margin: 0 0 0.5rem; }
+  .muted { color: var(--muted); font-size: 0.85rem; }
+  .fine { color: var(--muted); font-size: 0.75rem; margin: 0.75rem 0 0; }
+  label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.6rem; }
+  input { display: block; width: 100%; margin-top: 0.25rem; padding: 0.55rem 0.7rem; border: 1px solid var(--border); border-radius: 6px;
+          background: var(--field); color: var(--fg); font: inherit; }
+  input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent); }
+  .btn { display: inline-block; padding: 0.55rem 1rem; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-fg);
+         font: inherit; font-weight: 500; cursor: pointer; }
+  .btn:hover { filter: brightness(1.08); }
+  .link { background: none; border: 0; padding: 0; color: var(--accent); font: inherit; cursor: pointer; text-decoration: underline; }
+  .row { display: flex; gap: 0.5rem; align-items: center; }
+  .mt { margin-top: 0.75rem; }
+  #email-row { display: none; margin-top: 0.75rem; }
+  #fingerprint-panel:empty { display: none; }
+  #fingerprint-panel div { font-size: 0.85rem; }
+  #fingerprint-panel span { color: var(--muted); }
+  #fingerprint-panel i { font-style: normal; font-family: var(--mono); }
+  .ref { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); }
 </style>
 </head>
 <body>
-  <div class="card">
-    <h1>⚠ Notice — undefined route</h1>
-    <p>This request was directed to a route which does not exist. Your IP address was
-       classified as potentially malicious and will be scanned.</p>
+<main>
+  <section class="card">
+    <div class="head"><span class="mark" aria-hidden="true"></span><h1>Undefined route</h1></div>
+    <p>This request was directed to a route which does not exist. Your IP address was classified as potentially malicious and will be scanned.</p>
     <p class="muted">Browser characteristics are recorded for security research.</p>
-  </div>
-
-  <div class="card">
-    <button id="accident-btn" type="button">I landed here by accident</button>
+    <p class="ref">ref <span id="ref"></span></p>
+    <div class="row mt">
+      <button id="accident-btn" type="button" class="link">I landed here by accident</button>
+    </div>
     <form id="email-row" method="post" action="/claim">
-      <p class="muted">The admin was notified. If you want to be contacted for
-         clarification, fill in your email address here (optional):</p>
-      <input type="email" name="email" placeholder="you@example.org">
-      <button type="submit">Submit</button>
+      <p class="muted">The administrator has been notified. If you want to be contacted for clarification, leave an email address (optional).</p>
+      <label>Email <input type="email" name="email" placeholder="you@example.org"></label>
+      <button type="submit" class="btn">Send</button>
     </form>
-  </div>
+  </section>
 
-  <div class="card bait">
-    <p class="muted"><em>this login form is for malicious bots. if you want to ensure
-       to get flagged, fill this form.</em></p>
-    <form method="post" action="/login">
-      <label>Username <input type="text" name="username" autocomplete="off"></label>
+  <section class="card">
+    <h2>Staff sign-in</h2>
+    <form method="post" action="/login" autocomplete="off">
+      <label>Username <input type="text" name="username"></label>
       <label>Password <input type="password" name="password"></label>
-      <button type="submit">Log in</button>
+      <button type="submit" class="btn">Sign in</button>
     </form>
-  </div>
+    <p class="fine">This form is a decoy for automated tools. Real staff do not sign in here; submissions are recorded and flagged.</p>
+  </section>
 
-  <div id="fingerprint-panel"></div>
+  <section class="card" id="fingerprint-panel"></section>
 
   <script>
     document.getElementById('accident-btn').addEventListener('click', function () {
@@ -57,7 +83,9 @@
       document.getElementById('email-row').style.display = 'block';
     });
     window.PEEPHOLE_TOKEN = "__PAGE_TOKEN__";
+    document.getElementById('ref').textContent = window.PEEPHOLE_TOKEN.slice(0, 8);
   </script>
   <script src="/collect.js" defer></script>
+</main>
 </body>
 </html>

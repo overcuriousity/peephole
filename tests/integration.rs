@@ -56,7 +56,7 @@ async fn probe_request_is_logged_and_serves_trap_page() {
     assert!(html.contains("route which does not exist"));
     assert!(html.contains("classified as potentially malicious"));
     assert!(html.contains("I landed here by accident"));
-    assert!(html.contains("this login form is for malicious bots"));
+    assert!(html.contains("decoy for automated tools"));
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
         .fetch_one(&store.pool)
         .await
@@ -111,7 +111,7 @@ async fn fp_claim_is_stored_and_scan_still_proceeds() {
         .unwrap();
     assert!(resp.status().is_success());
     let html = resp.text().await.unwrap();
-    assert!(html.contains("admin was notified"));
+    assert!(html.contains("administrator has been notified"));
     let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fp_claims")
         .fetch_one(&store.pool)
         .await
@@ -1236,4 +1236,34 @@ async fn public_directory_and_request_search() {
         .await
         .unwrap();
     assert!(html.contains("/a"), "bad page falls back to page 1");
+}
+
+#[tokio::test]
+async fn trap_page_is_a_realistic_notice_with_honest_footnote() {
+    let (base, _store, _dir) = spawn_trap().await;
+    let resp = reqwest::get(format!("{base}/anything")).await.unwrap();
+    assert_eq!(resp.status(), 404);
+    let html = resp.text().await.unwrap();
+    assert!(html.contains("Staff sign-in"));
+    assert!(html.contains("decoy for automated tools"));
+    assert!(html.contains("I landed here by accident"));
+    assert!(html.contains("prefers-color-scheme: dark"));
+    assert!(html.contains("noindex"));
+    assert!(html.contains("window.PEEPHOLE_TOKEN"));
+    assert!(!html.contains("href=\"/login\"") && !html.contains("/admin"));
+    assert!(
+        !html.contains("@font-face"),
+        "trap uses the system font stack"
+    );
+    assert!(!html.contains("⚠"));
+    let ok = reqwest::Client::new()
+        .post(format!("{base}/claim"))
+        .form(&[("email", "")])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(ok.contains("Thank you") && ok.contains("prefers-color-scheme: dark"));
 }
