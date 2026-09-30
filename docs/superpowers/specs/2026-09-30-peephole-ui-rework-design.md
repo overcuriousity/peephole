@@ -45,9 +45,10 @@ conflict. Everything else in the original spec stands.
 - Trap page uses the system font stack (one response per scanner hit, no
   asset fetches on the trap listener beyond `/collect.js`). Operator may flip
   this later.
-- `askama = "0.14"` as already declared in `Cargo.toml` is used as-is;
-  `askama.toml` sets `dirs = ["templates"]`. `rust-embed` is not added:
-  assets are embedded with `include_bytes!` through a small static table.
+- `askama = "0.16"` (bumped from the declared-but-unused 0.14: it is the
+  line engram uses and the only one cached locally); `askama.toml` sets
+  `dirs = ["templates"]`. `rust-embed` is not added: assets are embedded
+  with `include_bytes!` through a small static table.
 
 ## 3. Module changes
 
