@@ -776,3 +776,16 @@ async fn assets_and_security_headers() {
         404
     );
 }
+
+#[tokio::test]
+async fn unknown_route_renders_styled_404() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let base = spawn_admin_with(store, dir.path()).await;
+    let resp = reqwest::get(format!("{base}/this/does/not/exist"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let html = resp.text().await.unwrap();
+    assert!(html.contains("Not found"));
+    assert!(html.contains("/assets/app.css"));
+}
