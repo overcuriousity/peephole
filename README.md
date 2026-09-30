@@ -75,8 +75,10 @@ internet ──► nginx (TLS) ──► peephole admin listener  127.0.0.1:8443
   (configurable levels, cooldowns, and never-scan CIDRs).
 - **Wall of shame** (public, no login) — aggregate statistics per time range,
   a choropleth map, a searchable IP directory (exact / prefix / CIDR), per-IP
-  request history and request search. No payloads, headers, fingerprints or
-  scan results are ever public.
+  request history and request search. No query strings, payloads, headers,
+  fingerprints or scan results are ever public: a legitimate client that
+  mistypes an API URL would otherwise publish its credentials. Credentials
+  embedded in the URL path itself are still shown.
 - **Admin area** (FIDO2 only, no passwords, under `/admin`) — live scan queue
   over Server-Sent Events, counter-scan results with ports and raw nmap XML,
   raw request headers and bodies, fingerprint correlation across IPs, the

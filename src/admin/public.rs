@@ -4,7 +4,7 @@ use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
 use crate::admin::{AdminState, RangeQuery};
 use crate::store::browse::{
-    IpFilter, IpOverview, IpSummary, Page, RequestFilter, RequestListRow, page_num,
+    Audience, IpFilter, IpOverview, IpSummary, Page, RequestFilter, RequestListRow, page_num,
 };
 use crate::store::inspect::{FpClaimRow, FpSummary, PortRow, ScanSummary};
 use crate::store::stats::{MapCounts, Range, Stats, intel_stale};
@@ -223,7 +223,10 @@ async fn requests(
     State(state): State<Arc<AdminState>>,
     Query(f): Query<RequestFilter>,
 ) -> AppResult<Html<String>> {
-    let page = state.store.search_requests(&f).await?;
+    let page = state
+        .store
+        .search_requests(&f, Audience::of(authed))
+        .await?;
     let bulk_total = if authed {
         Some(state.store.count_requests(&f).await?)
     } else {
@@ -279,7 +282,10 @@ async fn ip_page(
     let Some(ov) = state.store.ip_overview(ip.id).await? else {
         return Err(AppError::NotFound);
     };
-    let page = state.store.requests_for_ip(ip.id, page_num(q.page)).await?;
+    let page = state
+        .store
+        .requests_for_ip(ip.id, page_num(q.page), Audience::of(authed))
+        .await?;
     // Admin-only data is only *queried* with a session (spec §5).
     let admin = if authed {
         let mut scans = vec![];

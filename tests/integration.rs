@@ -1583,3 +1583,62 @@ async fn trap_page_token_links_collect_to_panel() {
     assert!(panel.contains("Mesa"));
     assert!(!panel.contains("collecting browser characteristics"));
 }
+
+/// A legitimate client that mistypes an API URL lands in the trap with its
+/// credentials in the query string. Query strings are admin-only: never
+/// shown publicly and never matched by public search (no probing oracle).
+#[tokio::test]
+async fn query_strings_are_admin_only() {
+    let (trap_base, store, dir) = spawn_trap().await;
+    const KEY: &str = "sk_live_51H8zzSECRETzz0123";
+    let _ = reqwest::Client::new()
+        .get(format!("{trap_base}/api/v1/usres?api_key={KEY}&page=2"))
+        .header("x-forwarded-for", "203.0.113.200")
+        .send()
+        .await
+        .unwrap();
+    let base = spawn_admin_with(store.clone(), dir.path()).await;
+    let get = |url: String| async move { reqwest::get(url).await.unwrap().text().await.unwrap() };
+    for url in [
+        format!("{base}/requests"),
+        format!("{base}/requests?ip=203.0.113.200"),
+        format!("{base}/ip/203.0.113.200"),
+        format!("{base}/"),
+        format!("{base}/api/stats?range=24h"),
+    ] {
+        let body = get(url.clone()).await;
+        assert!(!body.contains("SECRET"), "{url} leaks the query string");
+    }
+    let listed = get(format!("{base}/requests?ip=203.0.113.200")).await;
+    assert!(listed.contains("/api/v1/usres"), "path stays public");
+
+    // No search oracle over hidden query strings.
+    for probe in ["sk_live_51H8", "SECRET", "api_key"] {
+        let body = get(format!("{base}/requests?path={probe}")).await;
+        assert!(
+            !body.contains("203.0.113.200"),
+            "public search for {probe} reveals the request"
+        );
+    }
+    let body = get(format!("{base}/requests?path=usres")).await;
+    assert!(
+        body.contains("203.0.113.200"),
+        "public path search still works"
+    );
+
+    // Admins see and search the query string.
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (admin, abase) = enrolled_admin_client(store.clone(), cfg).await;
+    let body = admin
+        .get(format!("{abase}/requests?path=SECRET"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains(KEY),
+        "admin search and view include the query"
+    );
+}

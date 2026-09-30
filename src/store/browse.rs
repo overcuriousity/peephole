@@ -184,10 +184,37 @@ const IP_SUMMARY_SELECT: &str =
             COUNT(r.id) AS request_count, COALESCE(MAX(r.severity), 0) AS max_severity
      FROM ips i LEFT JOIN requests r ON r.ip_id = i.id";
 
-const REQUEST_ROW_SELECT: &str =
-    "SELECT r.id, r.ts, r.ip_id, i.ip, r.method, r.path, r.query, r.severity, r.labels_json,
-            i.country, i.is_tor_exit AS is_tor
-     FROM requests r JOIN ips i ON r.ip_id = i.id";
+/// Who a request listing is for. A mistyped legitimate API call lands in
+/// the trap with its credentials in the query string, so query strings are
+/// admin-only: public views never show them and public search never
+/// matches them (it would otherwise reveal a hidden value by probing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Audience {
+    Public,
+    Admin,
+}
+
+impl Audience {
+    pub fn of(authed: bool) -> Self {
+        if authed { Self::Admin } else { Self::Public }
+    }
+    /// The query column this audience may see.
+    fn query_col(self) -> &'static str {
+        match self {
+            Self::Admin => "r.query",
+            Self::Public => "NULL",
+        }
+    }
+}
+
+fn request_row_select(a: Audience) -> String {
+    format!(
+        "SELECT r.id, r.ts, r.ip_id, i.ip, r.method, r.path, {} AS query,
+                r.severity, r.labels_json, i.country, i.is_tor_exit AS is_tor
+         FROM requests r JOIN ips i ON r.ip_id = i.id",
+        a.query_col()
+    )
+}
 
 fn nonempty(s: &Option<String>) -> Option<String> {
     s.as_deref()
@@ -269,7 +296,7 @@ fn ip_filter_sql(f: &IpFilter) -> Option<IpFilterSql> {
 }
 
 /// `AND …` fragments plus binds for a `RequestFilter`.
-fn request_filter_sql(f: &RequestFilter) -> (String, Vec<String>) {
+fn request_filter_sql(f: &RequestFilter, a: Audience) -> (String, Vec<String>) {
     let mut sql = String::new();
     let mut binds: Vec<String> = vec![];
     if let Some(v) = nonempty(&f.ip) {
@@ -277,8 +304,12 @@ fn request_filter_sql(f: &RequestFilter) -> (String, Vec<String>) {
         binds.push(canonical_ip(&v));
     }
     if let Some(v) = nonempty(&f.path) {
-        sql.push_str(" AND (r.path LIKE ? OR r.query LIKE ?)");
-        binds.push(format!("%{v}%"));
+        if a == Audience::Admin {
+            sql.push_str(" AND (r.path LIKE ? OR r.query LIKE ?)");
+            binds.push(format!("%{v}%"));
+        } else {
+            sql.push_str(" AND r.path LIKE ?");
+        }
         binds.push(format!("%{v}%"));
     }
     if let Some(v) = nonempty(&f.label) {
@@ -430,7 +461,7 @@ impl Store {
 
     /// Number of requests matching the filter.
     pub async fn count_requests(&self, f: &RequestFilter) -> Result<i64> {
-        let (w, binds) = request_filter_sql(f);
+        let (w, binds) = request_filter_sql(f, Audience::Admin);
         let sql =
             format!("SELECT COUNT(*) FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w}");
         let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
@@ -442,7 +473,7 @@ impl Store {
 
     /// Every request id matching the filter (unpaged; bulk delete + counts).
     pub async fn matching_request_ids(&self, f: &RequestFilter) -> Result<Vec<i64>> {
-        let (w, binds) = request_filter_sql(f);
+        let (w, binds) = request_filter_sql(f, Audience::Admin);
         let sql = format!(
             "SELECT r.id FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w} ORDER BY r.id DESC LIMIT {MATCH_LIMIT}"
         );
@@ -503,9 +534,15 @@ impl Store {
         }))
     }
 
-    pub async fn requests_for_ip(&self, ip_id: i64, page: u32) -> Result<Page<RequestListRow>> {
+    pub async fn requests_for_ip(
+        &self,
+        ip_id: i64,
+        page: u32,
+        a: Audience,
+    ) -> Result<Page<RequestListRow>> {
         let sql = format!(
-            "{REQUEST_ROW_SELECT} WHERE r.ip_id = ? ORDER BY r.id DESC LIMIT {} OFFSET {}",
+            "{} WHERE r.ip_id = ? ORDER BY r.id DESC LIMIT {} OFFSET {}",
+            request_row_select(a),
             PAGE_SIZE + 1,
             offset(page)
         );
@@ -516,11 +553,16 @@ impl Store {
         Ok(Page::from_rows(rows, page))
     }
 
-    pub async fn search_requests(&self, f: &RequestFilter) -> Result<Page<RequestListRow>> {
+    pub async fn search_requests(
+        &self,
+        f: &RequestFilter,
+        a: Audience,
+    ) -> Result<Page<RequestListRow>> {
         let page = page_num(f.page);
-        let (w, binds) = request_filter_sql(f);
+        let (w, binds) = request_filter_sql(f, a);
         let sql = format!(
-            "{REQUEST_ROW_SELECT} WHERE 1=1{w} ORDER BY r.id DESC LIMIT {} OFFSET {}",
+            "{} WHERE 1=1{w} ORDER BY r.id DESC LIMIT {} OFFSET {}",
+            request_row_select(a),
             PAGE_SIZE + 1,
             offset(page)
         );
@@ -700,7 +742,7 @@ mod tests {
     async fn requests_paginate_and_filter() {
         let s = seeded().await;
         let ip = s.ip_by_addr("203.0.113.1").await.unwrap().unwrap();
-        let p = s.requests_for_ip(ip.id, 1).await.unwrap();
+        let p = s.requests_for_ip(ip.id, 1, Audience::Admin).await.unwrap();
         assert_eq!(p.items.len(), 3);
         assert!(!p.has_next);
         assert_eq!(p.items[0].labels(), vec!["sensitive-path".to_string()]);
@@ -709,7 +751,7 @@ mod tests {
             path: Some("wp".into()),
             ..Default::default()
         };
-        let r = s.search_requests(&f).await.unwrap();
+        let r = s.search_requests(&f, Audience::Admin).await.unwrap();
         assert_eq!(r.items.len(), 1);
         assert_eq!(r.items[0].ip, "203.0.113.200");
         assert_eq!(r.items[0].country.as_deref(), Some("DE"));
@@ -718,7 +760,14 @@ mod tests {
             country: Some("DE".into()),
             ..Default::default()
         };
-        assert_eq!(s.search_requests(&f).await.unwrap().items.len(), 4);
+        assert_eq!(
+            s.search_requests(&f, Audience::Admin)
+                .await
+                .unwrap()
+                .items
+                .len(),
+            4
+        );
         // Pagination: 103 rows → page 1 has 100 and has_next, page 2 has the rest.
         for _ in 0..100 {
             s.insert_request(&NewRequest {
@@ -737,12 +786,12 @@ mod tests {
             .await
             .unwrap();
         }
-        let p1 = s.requests_for_ip(ip.id, 1).await.unwrap();
+        let p1 = s.requests_for_ip(ip.id, 1, Audience::Admin).await.unwrap();
         assert_eq!(p1.items.len(), 100);
         assert!(p1.has_next);
         assert_eq!(p1.next(), Some(2));
         assert_eq!(p1.prev(), None);
-        let p2 = s.requests_for_ip(ip.id, 2).await.unwrap();
+        let p2 = s.requests_for_ip(ip.id, 2, Audience::Admin).await.unwrap();
         assert_eq!(p2.items.len(), 3);
         assert!(!p2.has_next);
         assert_eq!(p2.prev(), Some(1));
