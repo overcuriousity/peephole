@@ -26,6 +26,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin", get(home))
         .route("/admin/queue", get(queue))
         .route("/admin/queue/pace", post(queue_pace))
+        .route("/admin/queue/retry-failed", post(queue_retry_failed))
         .route("/admin/requests/{id}", get(request_page))
         .route("/admin/requests/{id}/delete", post(request_delete))
         .route("/admin/ips/{addr}/delete", post(ip_delete))
@@ -92,6 +93,8 @@ pub struct QueueFilter {
     pub level: Option<String>,
     /// Set by the redirect after saving the pace.
     pub saved: Option<String>,
+    /// Set by the redirect after retrying failed jobs: how many.
+    pub retried: Option<String>,
 }
 
 #[derive(Template)]
@@ -125,8 +128,24 @@ struct PaceView {
     completions_json: String,
     max_workers: usize,
     max_per_hour: i64,
+    timeout_min: String,
+    rec_timeout_min: String,
+    min_timeout_min: u64,
+    max_timeout_min: u64,
+    /// Share of last-24h jobs that hit the timeout, e.g. "25%".
+    timeout_share: String,
+    timeouts_high: bool,
     notice: Option<String>,
     error: Option<String>,
+}
+
+/// Seconds as minutes for the form: "15", or "1.5" when not whole.
+fn minutes(secs: u64) -> String {
+    if secs.is_multiple_of(60) {
+        (secs / 60).to_string()
+    } else {
+        format!("{:.1}", secs as f64 / 60.0)
+    }
 }
 
 fn fmt_rate(v: f64) -> String {
@@ -161,7 +180,7 @@ async fn pace_view(
 ) -> AppResult<PaceView> {
     let m = st.store.queue_metrics().await?;
     let current = st.pace.get();
-    let r = recommend(&m, current, st.cfg.scan.timeout_secs);
+    let r = recommend(&m, current);
     Ok(PaceView {
         current,
         rec: r.pace,
@@ -182,7 +201,10 @@ async fn pace_view(
         },
         cadence: cadence(current),
         rec_cadence: cadence(r.pace),
-        scan_secs: fmt_secs(r.scan_secs),
+        scan_secs: m
+            .avg_scan_secs
+            .map(fmt_secs)
+            .unwrap_or_else(|| fmt_secs(pace::DEFAULT_SCAN_SECS)),
         scan_secs_measured: r.scan_secs_measured,
         oldest: m
             .oldest_queued_secs
@@ -193,6 +215,12 @@ async fn pace_view(
         m,
         max_workers: pace::MAX_WORKERS,
         max_per_hour: pace::MAX_PER_HOUR,
+        timeout_min: minutes(current.timeout_secs),
+        rec_timeout_min: minutes(r.pace.timeout_secs),
+        min_timeout_min: pace::MIN_TIMEOUT / 60,
+        max_timeout_min: pace::MAX_TIMEOUT / 60,
+        timeout_share: format!("{:.0}%", r.timeout_share * 100.0),
+        timeouts_high: r.pace.timeout_secs > current.timeout_secs,
         notice,
         error,
     })
@@ -214,10 +242,17 @@ async fn queue(
     {
         jobs.retain(|j| j.level == l);
     }
-    let notice = f
-        .saved
-        .is_some()
-        .then(|| "Pace saved. Workers apply it on their next pass.".to_string());
+    let notice = match (
+        &f.saved,
+        f.retried.as_deref().and_then(|n| n.parse::<u64>().ok()),
+    ) {
+        (Some(_), _) => Some("Pace saved. Workers apply it on their next pass.".to_string()),
+        (_, Some(n)) => Some(format!(
+            "{n} failed {} back in the queue.",
+            if n == 1 { "job is" } else { "jobs are" }
+        )),
+        _ => None,
+    };
     let pace = pace_view(&st, notice, None).await?;
     render(&QueuePage {
         chrome: chrome(),
@@ -228,10 +263,22 @@ async fn queue(
     })
 }
 
+/// Retry the last week's failed jobs (one per IP, none with a pending job).
+async fn queue_retry_failed(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+) -> AppResult<Redirect> {
+    let n = st.store.requeue_failed_jobs(7).await?;
+    tracing::info!(requeued = n, "retry failed scans");
+    Ok(Redirect::to(&format!("/admin/queue?retried={n}")))
+}
+
 #[derive(serde::Deserialize)]
 struct PaceForm {
     max_workers: String,
     max_scans_per_hour: String,
+    /// Minutes; absent keeps the current timeout.
+    timeout_minutes: Option<String>,
 }
 
 async fn queue_pace(
@@ -245,13 +292,22 @@ async fn queue_pace(
         .parse::<usize>()
         .ok()
         .zip(form.max_scans_per_hour.trim().parse::<i64>().ok())
-        .map(|(w, h)| Pace {
+        .zip(match form.timeout_minutes.as_deref().map(str::trim) {
+            None | Some("") => Some(st.pace.get().timeout_secs),
+            Some(m) => m
+                .parse::<f64>()
+                .ok()
+                .filter(|m| m.is_finite() && *m > 0.0)
+                .map(|m| (m * 60.0).round() as u64),
+        })
+        .map(|((w, h), t)| Pace {
             max_workers: w,
             max_scans_per_hour: h,
+            timeout_secs: t,
         });
     let outcome = match parsed {
         Some(p) => st.pace.set(&st.store, p).await?,
-        None => Err("workers and scans per hour must be whole numbers".into()),
+        None => Err("workers, scans per hour and timeout must be numbers".into()),
     };
     match outcome {
         Ok(()) => Ok(Redirect::to("/admin/queue?saved=1").into_response()),

@@ -101,3 +101,4 @@ td.check input, th.check input { margin: 0; vertical-align: middle; accent-color
 .pace-form input[type="number"] { width: 7rem; }
 .pace-note { flex-basis: 100%; margin: 0; font-size: var(--text-xs); }
 .pace-rec p { margin: 0 0 0.5rem; font-size: var(--text-sm); }
+.pace-retry { margin-top: 1rem; font-size: var(--text-sm); }

@@ -25,6 +25,7 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
     let mut os_guess: Option<String> = None;
     let mut cur: Option<PortResult> = None;
     let mut saw_host = false;
+    let mut host_timed_out = false;
     let mut buf = Vec::new();
 
     loop {
@@ -35,7 +36,13 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
             Event::Start(e) | Event::Empty(e) => {
                 let name = e.name();
                 match name.as_ref() {
-                    "host" => saw_host = true,
+                    "host" => {
+                        saw_host = true;
+                        host_timed_out |= e
+                            .attributes()
+                            .flatten()
+                            .any(|a| a.key.as_ref() == "timedout" && a.value.as_ref() == "true");
+                    }
                     "port" => {
                         let mut port = 0u16;
                         let mut proto = String::from("tcp");
@@ -98,8 +105,12 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
         }
         buf.clear();
     }
+    // nmap's --host-timeout discards the host's results (7.9x): not a scan.
+    if host_timed_out {
+        bail!("timeout (nmap host-timeout)");
+    }
     if !saw_host && ports.is_empty() {
-        bail!("nmap xml contained no host data");
+        bail!("host reported down: no reply to nmap's discovery probes (use -Pn)");
     }
     Ok(ScanResult {
         os_guess,
@@ -130,5 +141,16 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(parse_nmap_xml(b"not xml at all").is_err());
+    }
+
+    #[test]
+    fn down_and_timed_out_hosts_are_named() {
+        let down = br#"<nmaprun><runstats><hosts up="0" down="1" total="1"/></runstats></nmaprun>"#;
+        let e = parse_nmap_xml(down).unwrap_err().to_string();
+        assert!(e.contains("host reported down"), "{e}");
+        let timed_out = br#"<nmaprun><host timedout="true"><status state="up"/>
+            <address addr="192.0.2.1" addrtype="ipv4"/></host></nmaprun>"#;
+        let e = parse_nmap_xml(timed_out).unwrap_err().to_string();
+        assert!(e.starts_with("timeout"), "{e}");
     }
 }

@@ -1477,14 +1477,23 @@ async fn scan_pace_is_adjustable_from_the_queue_page() {
 
     let resp = client
         .post(format!("{base}/admin/queue/pace"))
-        .form(&[("max_workers", "4"), ("max_scans_per_hour", "90")])
+        .form(&[
+            ("max_workers", "4"),
+            ("max_scans_per_hour", "90"),
+            ("timeout_minutes", "45"),
+        ])
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "redirect followed back to the queue");
-    assert!(resp.text().await.unwrap().contains("Pace saved"));
+    let html = resp.text().await.unwrap();
+    assert!(html.contains("Pace saved"));
+    assert!(html.contains("name=\"timeout_minutes\"") && html.contains("value=\"45\""));
     let p = state.pace.get();
-    assert_eq!((p.max_workers, p.max_scans_per_hour), (4, 90));
+    assert_eq!(
+        (p.max_workers, p.max_scans_per_hour, p.timeout_secs),
+        (4, 90, 2700)
+    );
     // Persisted: a fresh load (as on restart) sees the admin's values.
     let reloaded = peephole::scan::pace::SharedPace::load(&store, &state.cfg.scan)
         .await
@@ -1501,6 +1510,43 @@ async fn scan_pace_is_adjustable_from_the_queue_page() {
     assert_eq!(bad.status(), 400);
     assert!(bad.text().await.unwrap().contains("Pace not saved"));
     assert_eq!(state.pace.get(), p, "invalid input leaves the pace alone");
+    let bad = client
+        .post(format!("{base}/admin/queue/pace"))
+        .form(&[
+            ("max_workers", "2"),
+            ("max_scans_per_hour", "90"),
+            ("timeout_minutes", "0.5"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400, "timeout below the minimum");
+    assert_eq!(state.pace.get(), p);
+
+    // Retry: the failed job goes back in the queue.
+    let job = store.next_queued_job().await.unwrap().unwrap();
+    store
+        .finish_job(job.id, None, Some("host reported down"))
+        .await
+        .unwrap();
+    let resp = client
+        .post(format!("{base}/admin/queue/retry-failed"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.text()
+            .await
+            .unwrap()
+            .contains("1 failed job is back in the queue")
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(job.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "queued");
 
     // Without a session the endpoint is closed.
     let anon = reqwest::Client::builder()

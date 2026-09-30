@@ -64,14 +64,6 @@ impl Store {
         Ok(EnqueueOutcome::Queued(r.last_insert_rowid()))
     }
 
-    pub async fn recent_scans_last_hour(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar(
-            "SELECT COUNT(*) FROM scans WHERE finished_at > datetime('now','-1 hour')",
-        )
-        .fetch_one(&self.pool)
-        .await?)
-    }
-
     /// Jobs started in the last hour, whatever their outcome: the global rate
     /// cap limits nmap launches, so failed and still-running scans count too.
     pub async fn jobs_started_last_hour(&self) -> Result<i64> {
@@ -88,6 +80,23 @@ impl Store {
         Ok(sqlx::query(
             "UPDATE scan_jobs SET status='queued', started_at=NULL WHERE status='running'",
         )
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    /// Put jobs that failed in the last `days` back in the queue, unless
+    /// their IP already has a pending job. Returns how many were requeued.
+    pub async fn requeue_failed_jobs(&self, days: i64) -> Result<u64> {
+        Ok(sqlx::query(
+            "UPDATE scan_jobs SET status='queued', started_at=NULL, finished_at=NULL, error=NULL
+             WHERE status='failed' AND finished_at > datetime('now', ?)
+               AND NOT EXISTS (SELECT 1 FROM scan_jobs p WHERE p.ip_id = scan_jobs.ip_id
+                               AND p.status IN ('queued','running'))
+               AND id = (SELECT MAX(f.id) FROM scan_jobs f
+                         WHERE f.ip_id = scan_jobs.ip_id AND f.status = 'failed')",
+        )
+        .bind(format!("-{days} days"))
         .execute(&self.pool)
         .await?
         .rows_affected())
@@ -124,13 +133,18 @@ impl Store {
             Option<i64>,
             Option<i64>,
             Option<i64>,
+            Option<i64>,
+            Option<i64>,
         );
-        let (backlog, running, a1, a24, c1, c24): Sums = sqlx::query_as(
+        let (backlog, running, a1, a24, c1, c24, f24, t24): Sums = sqlx::query_as(
             "SELECT SUM(status='queued'), SUM(status='running'),
                     SUM(queued_at > datetime('now','-1 hour')),
                     SUM(queued_at > datetime('now','-24 hours')),
                     SUM(status IN ('done','failed') AND finished_at > datetime('now','-1 hour')),
-                    SUM(status IN ('done','failed') AND finished_at > datetime('now','-24 hours'))
+                    SUM(status IN ('done','failed') AND finished_at > datetime('now','-24 hours')),
+                    SUM(status = 'failed' AND finished_at > datetime('now','-24 hours')),
+                    SUM(status = 'failed' AND error LIKE 'timeout%'
+                        AND finished_at > datetime('now','-24 hours'))
              FROM scan_jobs",
         )
         .fetch_one(&self.pool)
@@ -143,7 +157,7 @@ impl Store {
         .await?;
         let avg_scan_secs: Option<f64> = sqlx::query_scalar(
             "SELECT AVG((julianday(finished_at) - julianday(started_at)) * 86400)
-             FROM scan_jobs WHERE status = 'done' AND started_at IS NOT NULL
+             FROM scan_jobs WHERE status IN ('done','failed') AND started_at IS NOT NULL
                AND finished_at > datetime('now','-7 days')",
         )
         .fetch_one(&self.pool)
@@ -186,6 +200,8 @@ impl Store {
             arrivals_24h: a24.unwrap_or(0),
             completed_1h: c1.unwrap_or(0),
             completed_24h: c24.unwrap_or(0),
+            failed_24h: f24.unwrap_or(0),
+            timeouts_24h: t24.unwrap_or(0),
             observed_hours: first_age_h.unwrap_or(24.0).clamp(1.0, 24.0),
             avg_scan_secs,
             oldest_queued_secs,
@@ -312,6 +328,40 @@ mod tests {
         s.finish_job(job.id, None, Some("timeout")).await.unwrap();
         // The IP can be queued again once the job has ended.
         assert_eq!(s.requeue_orphaned_jobs().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_jobs_can_be_retried_once_per_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let a = s.upsert_ip("203.0.113.20".parse().unwrap()).await.unwrap();
+        let b = s.upsert_ip("203.0.113.21".parse().unwrap()).await.unwrap();
+        // a: two failures (only the latest is retried); b: a failure plus a pending job.
+        for _ in 0..2 {
+            s.enqueue_scan(a.id, 3, 0).await.unwrap();
+            let j = s.next_queued_job().await.unwrap().unwrap();
+            s.finish_job(j.id, None, Some("host reported down"))
+                .await
+                .unwrap();
+        }
+        s.enqueue_scan(b.id, 3, 0).await.unwrap();
+        let j = s.next_queued_job().await.unwrap().unwrap();
+        s.finish_job(j.id, None, Some("timeout")).await.unwrap();
+        sqlx::query("INSERT INTO scan_jobs (ip_id, level, status, queued_at) VALUES (?, 4, 'queued', datetime('now'))")
+            .bind(b.id)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(s.requeue_failed_jobs(7).await.unwrap(), 1);
+        let queued: Vec<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT ip_id, error FROM scan_jobs WHERE status = 'queued' ORDER BY id",
+        )
+        .fetch_all(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!(queued, vec![(a.id, None), (b.id, None)]);
+        assert_eq!(s.requeue_failed_jobs(7).await.unwrap(), 0, "idempotent");
     }
 
     #[tokio::test]

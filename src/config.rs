@@ -61,7 +61,8 @@ fn default_workers() -> usize {
     2
 }
 fn default_timeout() -> u64 {
-    900
+    // Full-range levels (-p- -sV -O) on filtered hosts need well over 15 min.
+    1800
 }
 fn default_cooldown() -> i64 {
     24
@@ -89,7 +90,7 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("", "trusted_proxies", "[]"),
     ("webauthn", "secure_cookies", "true"),
     ("scan", "max_workers", "2"),
-    ("scan", "timeout_secs", "900"),
+    ("scan", "timeout_secs", "1800"),
     ("scan", "rescan_cooldown_hours", "24"),
     ("scan", "max_scans_per_hour", "30"),
     ("scan", "never_scan", "[]"),
@@ -154,11 +155,15 @@ impl Config {
         if let Some(custom) = self.scan.level_argv.get(&level) {
             return custom.clone();
         }
+        // -Pn: the target just connected to us, so it is up; nmap's own
+        // discovery probes are often filtered and would report it down.
+        // Full-range levels cap retransmissions so filtered ports don't
+        // stretch a scan past the timeout.
         match level {
-            1 => "-sS -T2 --top-ports 100",
-            2 => "-sS -sV -T3 --top-ports 1000",
-            3 => "-sS -sV -O -T3 -p- --script=default",
-            4 => "-sS -sV -O -A -T4 -p- --script=default,intrusive",
+            1 => "-Pn -sS -T2 --top-ports 100",
+            2 => "-Pn -sS -sV -T3 --top-ports 1000",
+            3 => "-Pn -sS -sV -O -T4 --max-retries 2 -p- --script=default",
+            4 => "-Pn -sS -sV -O -A -T4 --max-retries 2 -p- --script=default,intrusive",
             _ => "",
         }
         .split_whitespace()
@@ -170,6 +175,33 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The target just connected to us, so it is up. Without -Pn nmap's own
+    /// discovery probes (often filtered) decide "down" and nothing is scanned.
+    #[test]
+    fn default_presets_skip_host_discovery() {
+        let cfg: Config = toml::from_str(
+            r#"
+trap_listen = "0.0.0.0:8080"
+admin_listen = "127.0.0.1:8443"
+database_path = "/tmp/x.db"
+data_dir = "/tmp"
+rules_dir = "rules"
+[webauthn]
+rp_id = "x.example"
+origin = "https://x.example"
+rp_name = "x"
+[maxmind]
+account_id = "1"
+license_key = "k"
+"#,
+        )
+        .unwrap();
+        for level in 1..=4 {
+            let argv = cfg.default_level_argv(level);
+            assert!(argv.iter().any(|a| a == "-Pn"), "level {level}: {argv:?}");
+        }
+    }
 
     #[test]
     fn loads_minimal_valid_config() {
@@ -209,7 +241,7 @@ never_scan = ["192.168.0.0/16"]
         assert_eq!(cfg.webauthn.rp_id, "peephole.example.net");
         assert_eq!(cfg.scan.max_workers, 2);
         assert_eq!(cfg.scan.never_scan.len(), 1);
-        assert_eq!(cfg.default_level_argv(4)[0], "-sS");
+        assert!(cfg.default_level_argv(4).iter().any(|a| a == "-sS"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

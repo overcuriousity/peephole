@@ -219,7 +219,8 @@ impl Store {
             running: r.unwrap_or(0),
             done_24h: d.unwrap_or(0),
             failed_24h: f.unwrap_or(0),
-            scans_last_hour: self.recent_scans_last_hour().await?,
+            // Same count the hourly cap uses: every nmap launch, any outcome.
+            scans_last_hour: self.jobs_started_last_hour().await?,
         })
     }
 
@@ -407,7 +408,7 @@ mod tests {
         assert_eq!(q.done_24h, 1);
         assert_eq!(q.failed_24h, 1);
         assert_eq!(q.queued, 0);
-        assert_eq!(q.scans_last_hour, 1);
+        assert_eq!(q.scans_last_hour, 2, "done + failed: both were launched");
         let failed = s.recent_failed_jobs(10).await.unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].error.as_deref(), Some("timeout"));
