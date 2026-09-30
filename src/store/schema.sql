@@ -56,3 +56,12 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS intel_meta (
   key TEXT PRIMARY KEY, value TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_requests_severity ON requests(severity);
+CREATE INDEX IF NOT EXISTS idx_requests_ip_id_id ON requests(ip_id, id);
+CREATE INDEX IF NOT EXISTS idx_ips_country ON ips(country);
+CREATE INDEX IF NOT EXISTS idx_ips_asn ON ips(asn);
+CREATE INDEX IF NOT EXISTS idx_scans_ip ON scans(ip_id);
+CREATE INDEX IF NOT EXISTS idx_ports_scan ON ports(scan_id);
+CREATE INDEX IF NOT EXISTS idx_fingerprints_ip ON fingerprints(ip_id);
+CREATE INDEX IF NOT EXISTS idx_fp_claims_ip ON fp_claims(ip_id);
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_ip ON scan_jobs(ip_id);

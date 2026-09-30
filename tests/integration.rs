@@ -742,18 +742,16 @@ max_scans_per_hour = 100
         .unwrap();
     let stats: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(stats["total_requests"], 1);
-    // Fake nmap should have completed the queued scan.
+    // Fake nmap should have completed the queued scan. `/api/stats` is
+    // cached for 15 s by design, so poll the database file directly.
+    let probe = Store::connect(&dir.path().join("t.db")).await.unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let stats: serde_json::Value = client
-            .get("http://127.0.0.1:18443/api/stats")
-            .send()
-            .await
-            .unwrap()
-            .json()
+        let scans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scans")
+            .fetch_one(&probe.pool)
             .await
             .unwrap();
-        if stats["scans_done"].as_i64().unwrap() >= 1 {
+        if scans >= 1 {
             break;
         }
         assert!(
@@ -845,4 +843,47 @@ async fn unknown_route_renders_styled_404() {
     let html = resp.text().await.unwrap();
     assert!(html.contains("Not found"));
     assert!(html.contains("/assets/app.css"));
+}
+
+#[tokio::test]
+async fn stats_and_map_json_by_range() {
+    let (trap_base, store, dir) = spawn_trap().await;
+    let _ = reqwest::Client::new()
+        .get(format!("{trap_base}/x"))
+        .header("x-forwarded-for", "203.0.113.9")
+        .send()
+        .await
+        .unwrap();
+    let base = spawn_admin_with(store, dir.path()).await;
+    let s: serde_json::Value = reqwest::get(format!("{base}/api/stats?range=7d"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["range"], "7d");
+    assert_eq!(s["total_requests"], 1);
+    assert!(s["timeline"].as_array().unwrap().len() == 1);
+    let s2: serde_json::Value = reqwest::get(format!("{base}/api/stats?range=7d"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["generated_at"], s2["generated_at"], "served from cache");
+    let bad: serde_json::Value = reqwest::get(format!("{base}/api/stats?range=1y"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bad["range"], "24h");
+    let m: serde_json::Value = reqwest::get(format!("{base}/api/map"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(m["countries"].is_object());
+    assert_eq!(m["max"], 0, "no geoip in tests");
 }
