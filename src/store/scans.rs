@@ -134,22 +134,22 @@ const QUEUE_JOB_SQL: &str =
 
 impl Store {
     pub async fn queue_job(&self, id: i64) -> Result<Option<QueueJob>> {
-        Ok(
-            sqlx::query_as::<_, QueueJob>(&format!("{QUEUE_JOB_SQL} WHERE j.id = ?"))
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?,
-        )
+        Ok(sqlx::query_as::<_, QueueJob>(sqlx::AssertSqlSafe(format!(
+            "{QUEUE_JOB_SQL} WHERE j.id = ?"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     /// Newest jobs first; `limit` rows.
     pub async fn queue_snapshot(&self, limit: i64) -> Result<Vec<QueueJob>> {
-        Ok(
-            sqlx::query_as::<_, QueueJob>(&format!("{QUEUE_JOB_SQL} ORDER BY j.id DESC LIMIT ?"))
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?,
-        )
+        Ok(sqlx::query_as::<_, QueueJob>(sqlx::AssertSqlSafe(format!(
+            "{QUEUE_JOB_SQL} ORDER BY j.id DESC LIMIT ?"
+        )))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
     }
 }
 

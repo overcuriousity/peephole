@@ -149,15 +149,20 @@ type RecentTuple = (
 
 impl Store {
     async fn count_where(&self, sql: &str, since: Option<&'static str>) -> Result<i64> {
-        Ok(bind_since!(sqlx::query_scalar::<_, i64>(sql), since)
-            .fetch_one(&self.pool)
-            .await?)
+        Ok(bind_since!(
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql)),
+            since
+        )
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     async fn named(&self, sql: &str, since: Option<&'static str>) -> Result<Vec<Named>> {
-        Ok(bind_since!(sqlx::query_as::<_, Named>(sql), since)
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(
+            bind_since!(sqlx::query_as::<_, Named>(sqlx::AssertSqlSafe(sql)), since)
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn stats(&self, r: Range) -> Result<Stats> {
@@ -206,9 +211,12 @@ impl Store {
              FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w}
              GROUP BY i.id ORDER BY count DESC LIMIT 20"
         );
-        let top_ips = bind_since!(sqlx::query_as::<_, TopIp>(&sql), since)
-            .fetch_all(&self.pool)
-            .await?;
+        let top_ips = bind_since!(
+            sqlx::query_as::<_, TopIp>(sqlx::AssertSqlSafe(sql.as_str())),
+            since
+        )
+        .fetch_all(&self.pool)
+        .await?;
         let top_countries = self
             .named(
                 &format!(
@@ -257,18 +265,24 @@ impl Store {
             "SELECT strftime('{fmt}', r.ts) AS ts, COUNT(*) AS count FROM requests r
              WHERE 1=1{w} GROUP BY ts ORDER BY ts"
         );
-        let timeline = bind_since!(sqlx::query_as::<_, Bucket>(&sql), since)
-            .fetch_all(&self.pool)
-            .await?;
+        let timeline = bind_since!(
+            sqlx::query_as::<_, Bucket>(sqlx::AssertSqlSafe(sql.as_str())),
+            since
+        )
+        .fetch_all(&self.pool)
+        .await?;
         let sql = format!(
             "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, i.country,
                     i.is_tor_exit
              FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w}
              ORDER BY r.id DESC LIMIT 50"
         );
-        let recent_rows = bind_since!(sqlx::query_as::<_, RecentTuple>(&sql), since)
-            .fetch_all(&self.pool)
-            .await?;
+        let recent_rows = bind_since!(
+            sqlx::query_as::<_, RecentTuple>(sqlx::AssertSqlSafe(sql.as_str())),
+            since
+        )
+        .fetch_all(&self.pool)
+        .await?;
         let recent = recent_rows
             .into_iter()
             .map(

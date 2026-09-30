@@ -83,10 +83,12 @@ const BODY_LIMIT: usize = 16 * 1024;
 impl Store {
     pub async fn scans_for_ip(&self, ip_id: i64) -> Result<Vec<ScanSummary>> {
         let sql = format!("{SCAN_SELECT} WHERE s.ip_id = ? ORDER BY s.id DESC");
-        Ok(sqlx::query_as::<_, ScanSummary>(&sql)
-            .bind(ip_id)
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, ScanSummary>(sqlx::AssertSqlSafe(sql.as_str()))
+                .bind(ip_id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn list_scans(&self, page: u32) -> Result<Page<ScanSummary>> {
@@ -96,7 +98,7 @@ impl Store {
             PAGE_SIZE + 1,
             offset(page)
         );
-        let rows = sqlx::query_as::<_, ScanSummary>(&sql)
+        let rows = sqlx::query_as::<_, ScanSummary>(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(&self.pool)
             .await?;
         Ok(Page::from_rows(rows, page))
@@ -104,10 +106,12 @@ impl Store {
 
     pub async fn scan_by_id(&self, id: i64) -> Result<Option<ScanSummary>> {
         let sql = format!("{SCAN_SELECT} WHERE s.id = ?");
-        Ok(sqlx::query_as::<_, ScanSummary>(&sql)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, ScanSummary>(sqlx::AssertSqlSafe(sql.as_str()))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn ports_for_scan(&self, scan_id: i64) -> Result<Vec<PortRow>> {
@@ -183,17 +187,21 @@ impl Store {
 
     pub async fn claims_for_ip(&self, ip_id: i64) -> Result<Vec<FpClaimRow>> {
         let sql = format!("{CLAIM_SELECT} WHERE c.ip_id = ? ORDER BY c.id DESC");
-        Ok(sqlx::query_as::<_, FpClaimRow>(&sql)
-            .bind(ip_id)
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, FpClaimRow>(sqlx::AssertSqlSafe(sql.as_str()))
+                .bind(ip_id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn inbox(&self) -> Result<Vec<FpClaimRow>> {
         let sql = format!("{CLAIM_SELECT} ORDER BY c.id DESC LIMIT 500");
-        Ok(sqlx::query_as::<_, FpClaimRow>(&sql)
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, FpClaimRow>(sqlx::AssertSqlSafe(sql.as_str()))
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn queue_summary(&self) -> Result<QueueSummary> {

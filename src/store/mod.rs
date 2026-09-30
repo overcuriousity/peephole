@@ -35,7 +35,7 @@ impl Store {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            sqlx::query(stmt)
+            sqlx::query(sqlx::AssertSqlSafe(stmt))
                 .execute(&pool)
                 .await
                 .context("migration")?;
@@ -136,7 +136,7 @@ impl Store {
                 Option<String>,
                 bool,
             ),
-        >(&sql);
+        >(sqlx::AssertSqlSafe(sql.as_str()));
         for b in binds {
             q = q.bind(b);
         }
