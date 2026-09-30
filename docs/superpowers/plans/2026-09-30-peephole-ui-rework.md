@@ -5173,3 +5173,35 @@ Claude-Session: https://claude.ai/code/session_013RowmGTWy4WJN7FrdvTCvs"
 ```
 
 Then invoke `superpowers:finishing-a-development-branch`.
+
+---
+
+### Task 15: Bulk delete on the request and IP lists (added mid-execution at the user's request)
+
+**Files:**
+- Modify: `src/store/browse.rs` (`matching_request_ids`, `matching_ip_ids`), `src/store/delete.rs` (`delete_requests`, `delete_ips`), `src/admin/pages.rs` (two bulk routes), `src/admin/public.rs` (pass `bulk_total` when authed), `templates/requests.html`, `templates/ips.html`, `assets/js/app.js` (check-all, enable button), `Cargo.toml` (`serde_urlencoded` as a normal dependency)
+- Test: `src/store/delete.rs`, `tests/integration.rs`
+
+**Interfaces:**
+- Produces:
+  ```rust
+  impl Store {
+    pub async fn matching_request_ids(&self, f: &RequestFilter) -> Result<Vec<i64>>;  // unpaged, ≤100_000
+    pub async fn matching_ip_ids(&self, f: &IpFilter) -> Result<Vec<i64>>;            // CIDR filtered in Rust
+    pub async fn delete_requests(&self, ids: &[i64]) -> Result<u64>;                  // one transaction
+    pub async fn delete_ips(&self, ids: &[i64]) -> Result<u64>;
+  }
+  ```
+  Routes: `POST /admin/requests/bulk-delete`, `POST /admin/ips/bulk-delete`. Body is a urlencoded form parsed as `Vec<(String,String)>`: repeated `ids` = checked rows (request ids / IP addresses); `all=1` = every row matching the filter fields also present in the body. Redirects back to the list with the filter preserved. Anonymous → 303 `/login`.
+  Templates gain (authed only) a checkbox column, a "check all on this page" header box, a "Delete selected" dialog and a "Delete all N matching" dialog whose form carries the current filter as hidden fields.
+
+- [ ] **Step 1: Failing tests**
+
+Store (`delete.rs` tests): seed 3 IPs × requests; `matching_request_ids(path="/x")` returns all; `delete_requests(&ids[..2])` → 2 rows gone, dependents gone; `matching_ip_ids(q="203.0.113.0/24")` → the two matching; `delete_ips` removes them and their requests, spares the third.
+
+Integration: anonymous POST to both bulk routes → 303; with a session: seed 120 requests on `/bulk` from one IP plus one `/keep`; POST `ids=<two ids>` → those two gone; POST `all=1&path=/bulk` → zero `/bulk` remain, `/keep` remains (pagination crossed); redirect `Location` ends with `/requests?path=%2Fbulk&`; IPs: seed `127.0.0.1`, `127.0.0.2`, `203.0.113.1`; POST `all=1&q=127.0.0.0/8` → both loopbacks gone, the third stays; GET `/requests?path=/keep` with session contains `name="ids"` and `Delete all`; anonymous GET does not contain `name="ids"`.
+
+- [ ] **Step 2: Implement store methods** — `matching_*` reuse the filter SQL by extracting `fn request_filter_sql(f) -> (String, Vec<String>)` and the IP where/having builder; `delete_*` loop the four `DELETE`s per id inside one transaction (ids chunked, ≤ 500 per statement via `IN (...)` placeholders).
+- [ ] **Step 3: Handlers** — `bulk_delete_requests` / `bulk_delete_ips` read `String` body, `serde_urlencoded::from_str::<Vec<(String,String)>>`, collect `ids`, detect `all`, rebuild filter with `serde_urlencoded::from_str::<RequestFilter>(&body)` (unknown keys ignored), resolve ids, delete, redirect to `/requests?{qs}` / `/ips?{qs}` using `qs_without_page` (make it `pub(crate)`).
+- [ ] **Step 4: Templates + JS** — checkbox column and toolbar only under `{% if chrome.authed %}`; `bulk_total: Option<i64>` on the page structs; JS: header checkbox toggles all, "Delete selected" disabled until one box is checked.
+- [ ] **Step 5: fmt, clippy, full suite, commit** `feat(admin): bulk delete of filtered/checked requests and IPs`.

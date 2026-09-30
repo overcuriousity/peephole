@@ -196,91 +196,158 @@ fn nonempty(s: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
-impl Store {
-    pub async fn list_ips(&self, f: &IpFilter) -> Result<Page<IpSummary>> {
-        let page = page_num(f.page);
-        let mut wheres: Vec<String> = vec![];
-        let mut binds: Vec<String> = vec![];
-        let mut net_filter: Option<IpNet> = None;
-        if let Some(q) = nonempty(&f.q) {
-            match parse_q(&q) {
-                IpQuery::Exact(ip) => {
-                    wheres.push("i.ip = ?".into());
-                    binds.push(ip);
-                }
-                IpQuery::Net(net) => {
-                    let p = net_like_prefix(&net);
-                    if !p.is_empty() {
-                        wheres.push("i.ip LIKE ?".into());
-                        binds.push(format!("{p}%"));
-                    }
-                    net_filter = Some(net);
-                }
-                IpQuery::Prefix(p) => {
+/// SQL fragments for an `IpFilter`; `None` when the query box holds garbage.
+struct IpFilterSql {
+    where_sql: String,
+    binds: Vec<String>,
+    having: &'static str,
+    net: Option<IpNet>,
+}
+
+fn ip_filter_sql(f: &IpFilter) -> Option<IpFilterSql> {
+    let mut wheres: Vec<String> = vec![];
+    let mut binds: Vec<String> = vec![];
+    let mut net: Option<IpNet> = None;
+    if let Some(q) = nonempty(&f.q) {
+        match parse_q(&q) {
+            IpQuery::Exact(ip) => {
+                wheres.push("i.ip = ?".into());
+                binds.push(ip);
+            }
+            IpQuery::Net(n) => {
+                let p = net_like_prefix(&n);
+                if !p.is_empty() {
                     wheres.push("i.ip LIKE ?".into());
                     binds.push(format!("{p}%"));
                 }
-                IpQuery::Invalid => {
-                    return Ok(Page {
-                        items: vec![],
-                        page,
-                        has_next: false,
-                    });
-                }
+                net = Some(n);
             }
-        }
-        if let Some(c) = nonempty(&f.country) {
-            wheres.push("i.country = ?".into());
-            binds.push(c.to_ascii_uppercase());
-        }
-        if let Some(a) = f.asn {
-            wheres.push("i.asn = ?".into());
-            binds.push(a.to_string());
-        }
-        if f.tor.as_deref() == Some("1") {
-            wheres.push("i.is_tor_exit = 1".into());
-        }
-        if let Some(l) = nonempty(&f.label) {
-            wheres.push(
-                "EXISTS (SELECT 1 FROM requests rx, json_each(rx.labels_json) je \
-                 WHERE rx.ip_id = i.id AND je.value = ?)"
-                    .into(),
-            );
-            binds.push(l);
-        }
-        let having = match f.min_severity {
-            Some(m) => {
-                binds.push(m.to_string());
-                " HAVING COALESCE(MAX(r.severity),0) >= CAST(? AS INTEGER)"
+            IpQuery::Prefix(p) => {
+                wheres.push("i.ip LIKE ?".into());
+                binds.push(format!("{p}%"));
             }
-            None => "",
+            IpQuery::Invalid => return None,
+        }
+    }
+    if let Some(c) = nonempty(&f.country) {
+        wheres.push("i.country = ?".into());
+        binds.push(c.to_ascii_uppercase());
+    }
+    if let Some(a) = f.asn {
+        wheres.push("i.asn = ?".into());
+        binds.push(a.to_string());
+    }
+    if f.tor.as_deref() == Some("1") {
+        wheres.push("i.is_tor_exit = 1".into());
+    }
+    if let Some(l) = nonempty(&f.label) {
+        wheres.push(
+            "EXISTS (SELECT 1 FROM requests rx, json_each(rx.labels_json) je \
+             WHERE rx.ip_id = i.id AND je.value = ?)"
+                .into(),
+        );
+        binds.push(l);
+    }
+    let having = match f.min_severity {
+        Some(m) => {
+            binds.push(m.to_string());
+            " HAVING COALESCE(MAX(r.severity),0) >= CAST(? AS INTEGER)"
+        }
+        None => "",
+    };
+    let where_sql = if wheres.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", wheres.join(" AND "))
+    };
+    Some(IpFilterSql {
+        where_sql,
+        binds,
+        having,
+        net,
+    })
+}
+
+/// `AND …` fragments plus binds for a `RequestFilter`.
+fn request_filter_sql(f: &RequestFilter) -> (String, Vec<String>) {
+    let mut sql = String::new();
+    let mut binds: Vec<String> = vec![];
+    if let Some(v) = nonempty(&f.ip) {
+        sql.push_str(" AND i.ip = ?");
+        binds.push(v);
+    }
+    if let Some(v) = nonempty(&f.path) {
+        sql.push_str(" AND (r.path LIKE ? OR r.query LIKE ?)");
+        binds.push(format!("%{v}%"));
+        binds.push(format!("%{v}%"));
+    }
+    if let Some(v) = nonempty(&f.label) {
+        sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(r.labels_json) je WHERE je.value = ?)");
+        binds.push(v);
+    }
+    if let Some(v) = f.severity {
+        sql.push_str(" AND r.severity = ?");
+        binds.push(v.to_string());
+    }
+    if let Some(v) = f.min_severity {
+        sql.push_str(" AND r.severity >= ?");
+        binds.push(v.to_string());
+    }
+    if let Some(v) = nonempty(&f.country) {
+        sql.push_str(" AND i.country = ?");
+        binds.push(v.to_ascii_uppercase());
+    }
+    if let Some(v) = f.asn {
+        sql.push_str(" AND i.asn = ?");
+        binds.push(v.to_string());
+    }
+    // datetime-local inputs send `T`; SQLite stores a space.
+    if let Some(v) = nonempty(&f.from) {
+        sql.push_str(" AND r.ts >= ?");
+        binds.push(v.replace('T', " "));
+    }
+    if let Some(v) = nonempty(&f.to) {
+        sql.push_str(" AND r.ts <= ?");
+        binds.push(v.replace('T', " "));
+    }
+    (sql, binds)
+}
+
+/// Upper bound for unpaged id lookups (bulk delete, CIDR candidates).
+const MATCH_LIMIT: i64 = 100_000;
+
+impl Store {
+    pub async fn list_ips(&self, f: &IpFilter) -> Result<Page<IpSummary>> {
+        let page = page_num(f.page);
+        let Some(fs) = ip_filter_sql(f) else {
+            return Ok(Page {
+                items: vec![],
+                page,
+                has_next: false,
+            });
         };
         let order = if f.sort.as_deref() == Some("recent") {
             "i.last_seen DESC"
         } else {
             "request_count DESC, i.last_seen DESC"
         };
-        let where_sql = if wheres.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", wheres.join(" AND "))
-        };
         // CIDR: fetch candidates unpaged (bounded by the LIKE prefix), filter,
         // then page in Rust.
-        let (limit, off) = if net_filter.is_some() {
-            (100_000, 0)
+        let (limit, off) = if fs.net.is_some() {
+            (MATCH_LIMIT, 0)
         } else {
             (PAGE_SIZE + 1, offset(page))
         };
         let sql = format!(
-            "{IP_SUMMARY_SELECT}{where_sql} GROUP BY i.id{having} ORDER BY {order} LIMIT {limit} OFFSET {off}"
+            "{IP_SUMMARY_SELECT}{} GROUP BY i.id{} ORDER BY {order} LIMIT {limit} OFFSET {off}",
+            fs.where_sql, fs.having
         );
         let mut q = sqlx::query_as::<_, IpSummary>(&sql);
-        for b in &binds {
+        for b in &fs.binds {
             q = q.bind(b);
         }
         let mut rows = q.fetch_all(&self.pool).await?;
-        if let Some(net) = net_filter {
+        if let Some(net) = fs.net {
             rows.retain(|r| {
                 r.ip.parse::<IpAddr>()
                     .map(|ip| net.contains(&ip))
@@ -293,6 +360,46 @@ impl Store {
                 .collect();
         }
         Ok(Page::from_rows(rows, page))
+    }
+
+    /// Every IP id matching the filter (unpaged; bulk delete + counts).
+    pub async fn matching_ip_ids(&self, f: &IpFilter) -> Result<Vec<i64>> {
+        let Some(fs) = ip_filter_sql(f) else {
+            return Ok(vec![]);
+        };
+        let sql = format!(
+            "SELECT i.id, i.ip FROM ips i LEFT JOIN requests r ON r.ip_id = i.id{} GROUP BY i.id{} LIMIT {MATCH_LIMIT}",
+            fs.where_sql, fs.having
+        );
+        let mut q = sqlx::query_as::<_, (i64, String)>(&sql);
+        for b in &fs.binds {
+            q = q.bind(b);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, ip)| match fs.net {
+                Some(net) => ip
+                    .parse::<IpAddr>()
+                    .map(|a| net.contains(&a))
+                    .unwrap_or(false),
+                None => true,
+            })
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    /// Every request id matching the filter (unpaged; bulk delete + counts).
+    pub async fn matching_request_ids(&self, f: &RequestFilter) -> Result<Vec<i64>> {
+        let (w, binds) = request_filter_sql(f);
+        let sql = format!(
+            "SELECT r.id FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w} ORDER BY r.id DESC LIMIT {MATCH_LIMIT}"
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        for b in &binds {
+            q = q.bind(b);
+        }
+        Ok(q.fetch_all(&self.pool).await?)
     }
 
     pub async fn ip_by_addr(&self, addr: &str) -> Result<Option<IpRow>> {
@@ -360,53 +467,12 @@ impl Store {
 
     pub async fn search_requests(&self, f: &RequestFilter) -> Result<Page<RequestListRow>> {
         let page = page_num(f.page);
-        let mut sql = format!("{REQUEST_ROW_SELECT} WHERE 1=1");
-        let mut binds: Vec<String> = vec![];
-        if let Some(v) = nonempty(&f.ip) {
-            sql.push_str(" AND i.ip = ?");
-            binds.push(v);
-        }
-        if let Some(v) = nonempty(&f.path) {
-            sql.push_str(" AND (r.path LIKE ? OR r.query LIKE ?)");
-            binds.push(format!("%{v}%"));
-            binds.push(format!("%{v}%"));
-        }
-        if let Some(v) = nonempty(&f.label) {
-            sql.push_str(
-                " AND EXISTS (SELECT 1 FROM json_each(r.labels_json) je WHERE je.value = ?)",
-            );
-            binds.push(v);
-        }
-        if let Some(v) = f.severity {
-            sql.push_str(" AND r.severity = ?");
-            binds.push(v.to_string());
-        }
-        if let Some(v) = f.min_severity {
-            sql.push_str(" AND r.severity >= ?");
-            binds.push(v.to_string());
-        }
-        if let Some(v) = nonempty(&f.country) {
-            sql.push_str(" AND i.country = ?");
-            binds.push(v.to_ascii_uppercase());
-        }
-        if let Some(v) = f.asn {
-            sql.push_str(" AND i.asn = ?");
-            binds.push(v.to_string());
-        }
-        // datetime-local inputs send `T`; SQLite stores a space.
-        if let Some(v) = nonempty(&f.from) {
-            sql.push_str(" AND r.ts >= ?");
-            binds.push(v.replace('T', " "));
-        }
-        if let Some(v) = nonempty(&f.to) {
-            sql.push_str(" AND r.ts <= ?");
-            binds.push(v.replace('T', " "));
-        }
-        sql.push_str(&format!(
-            " ORDER BY r.id DESC LIMIT {} OFFSET {}",
+        let (w, binds) = request_filter_sql(f);
+        let sql = format!(
+            "{REQUEST_ROW_SELECT} WHERE 1=1{w} ORDER BY r.id DESC LIMIT {} OFFSET {}",
             PAGE_SIZE + 1,
             offset(page)
-        ));
+        );
         let mut q = sqlx::query_as::<_, RequestListRow>(&sql);
         for b in &binds {
             q = q.bind(b);

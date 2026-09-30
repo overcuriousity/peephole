@@ -126,5 +126,22 @@
     es.addEventListener("job", function (ev) { try { apply(JSON.parse(ev.data)); } catch (e) {} });
   }
 
+  // Bulk selection: header box toggles the page, "Delete selected" needs a tick.
+  function refreshBulkButtons() {
+    document.querySelectorAll("[data-needs-checked]").forEach(function (b) {
+      var form = document.getElementById(b.getAttribute("data-needs-checked"));
+      b.disabled = !form || !form.querySelector('input[name="ids"]:checked');
+    });
+  }
+  document.querySelectorAll("[data-check-all]").forEach(function (h) {
+    var form = document.getElementById(h.getAttribute("data-check-all"));
+    h.addEventListener("change", function () {
+      if (form) form.querySelectorAll('input[name="ids"]').forEach(function (c) { c.checked = h.checked; });
+      refreshBulkButtons();
+    });
+  });
+  document.addEventListener("change", function (e) { if (e.target && e.target.name === "ids") refreshBulkButtons(); });
+  refreshBulkButtons();
+
   window.peephole = window.peephole || {};
 })();

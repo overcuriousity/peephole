@@ -14,11 +14,37 @@
   <label>To (UTC) <input name="to" type="datetime-local" value="{{ f.to.as_deref().unwrap_or_default() }}"></label>
   <button class="btn btn-primary" type="submit">Filter</button>
 </form>
+{% if chrome.authed %}
+<div class="row bulk-bar">
+  <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-sel" data-needs-checked="bulk-form">Delete selected</button>
+  <dialog id="dlg-bulk-sel"><h3>Delete the selected requests?</h3><p class="muted">Only the rows checked on this page. Cannot be undone.</p>
+    <div class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit" form="bulk-form">Delete selected</button></div></dialog>
+  {% if let Some(t) = bulk_total %}
+  <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-all">Delete all {{ t }} matching</button>
+  <dialog id="dlg-bulk-all"><h3>Delete all {{ t }} requests matching this filter?</h3><p class="muted">Across every page, not just the rows shown. Cannot be undone.</p>
+    <form method="post" action="/admin/requests/bulk-delete" class="actions">
+      <input type="hidden" name="all" value="1">
+      <input type="hidden" name="ip" value="{{ f.ip.as_deref().unwrap_or_default() }}">
+      <input type="hidden" name="path" value="{{ f.path.as_deref().unwrap_or_default() }}">
+      <input type="hidden" name="label" value="{{ f.label.as_deref().unwrap_or_default() }}">
+      <input type="hidden" name="severity" value="{% if let Some(v) = f.severity %}{{ v }}{% endif %}">
+      <input type="hidden" name="min_severity" value="{% if let Some(v) = f.min_severity %}{{ v }}{% endif %}">
+      <input type="hidden" name="country" value="{{ f.country.as_deref().unwrap_or_default() }}">
+      <input type="hidden" name="asn" value="{% if let Some(v) = f.asn %}{{ v }}{% endif %}">
+      <input type="hidden" name="from" value="{{ f.from.as_deref().unwrap_or_default() }}">
+      <input type="hidden" name="to" value="{{ f.to.as_deref().unwrap_or_default() }}">
+      <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Delete all {{ t }}</button>
+    </form></dialog>
+  {% endif %}
+</div>
+<form id="bulk-form" method="post" action="/admin/requests/bulk-delete">
+{% endif %}
 <div class="table-wrap"><table>
-  <thead><tr><th>Time (UTC)</th><th>IP</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th>{% if chrome.authed %}<th></th>{% endif %}</tr></thead>
+  <thead><tr>{% if chrome.authed %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>Time (UTC)</th><th>IP</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th>{% if chrome.authed %}<th></th>{% endif %}</tr></thead>
   <tbody>
   {% for r in page.items %}
     <tr>
+      {% if chrome.authed %}<td class="check"><input type="checkbox" name="ids" value="{{ r.id }}" aria-label="Select request {{ r.id }}"></td>{% endif %}
       <td class="ts">{{ r.ts }}</td>
       <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% if r.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
       <td class="mono">{{ r.method }}</td>
@@ -28,8 +54,9 @@
       {% if chrome.authed %}<td><a class="btn btn-sm btn-ghost" href="/admin/requests/{{ r.id }}">inspect</a></td>{% endif %}
     </tr>
   {% endfor %}
-  {% if page.items.is_empty() %}<tr><td colspan="7" class="empty">No requests match.</td></tr>{% endif %}
+  {% if page.items.is_empty() %}<tr><td colspan="8" class="empty">No requests match.</td></tr>{% endif %}
   </tbody>
 </table></div>
+{% if chrome.authed %}</form>{% endif %}
 {% include "_pagination.html" %}
 {% endblock %}

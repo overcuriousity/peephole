@@ -124,7 +124,7 @@ async fn healthz(State(state): State<Arc<AdminState>>) -> Response {
 }
 
 /// Query string of every filter except `page`, ending in `&` when non-empty.
-fn qs_without_page(pairs: &[(&str, Option<String>)]) -> String {
+pub(crate) fn qs_without_page(pairs: &[(&str, Option<String>)]) -> String {
     let mut out = String::new();
     for (k, v) in pairs {
         if let Some(v) = v.as_deref().filter(|s| !s.is_empty()) {
@@ -154,6 +154,34 @@ struct IpsPage {
     f: IpFilter,
     page: Page<IpSummary>,
     qs: String,
+    /// Rows matching the filter across all pages; `Some` only with a session.
+    bulk_total: Option<i64>,
+}
+
+pub(crate) fn ip_qs(f: &IpFilter) -> String {
+    qs_without_page(&[
+        ("q", f.q.clone()),
+        ("country", f.country.clone()),
+        ("asn", f.asn.map(|a| a.to_string())),
+        ("label", f.label.clone()),
+        ("min_severity", f.min_severity.map(|a| a.to_string())),
+        ("tor", f.tor.clone()),
+        ("sort", f.sort.clone()),
+    ])
+}
+
+pub(crate) fn request_qs(f: &RequestFilter) -> String {
+    qs_without_page(&[
+        ("ip", f.ip.clone()),
+        ("path", f.path.clone()),
+        ("label", f.label.clone()),
+        ("severity", f.severity.map(|a| a.to_string())),
+        ("min_severity", f.min_severity.map(|a| a.to_string())),
+        ("country", f.country.clone()),
+        ("asn", f.asn.map(|a| a.to_string())),
+        ("from", f.from.clone()),
+        ("to", f.to.clone()),
+    ])
 }
 
 async fn ips(
@@ -162,20 +190,18 @@ async fn ips(
     Query(f): Query<IpFilter>,
 ) -> AppResult<Html<String>> {
     let page = state.store.list_ips(&f).await?;
-    let qs = qs_without_page(&[
-        ("q", f.q.clone()),
-        ("country", f.country.clone()),
-        ("asn", f.asn.map(|a| a.to_string())),
-        ("label", f.label.clone()),
-        ("min_severity", f.min_severity.map(|a| a.to_string())),
-        ("tor", f.tor.clone()),
-        ("sort", f.sort.clone()),
-    ]);
+    let bulk_total = if authed {
+        Some(state.store.matching_ip_ids(&f).await?.len() as i64)
+    } else {
+        None
+    };
+    let qs = ip_qs(&f);
     render(&IpsPage {
         chrome: Chrome::new(authed, "ips"),
         f,
         page,
         qs,
+        bulk_total,
     })
 }
 
@@ -186,6 +212,7 @@ struct RequestsPage {
     f: RequestFilter,
     page: Page<RequestListRow>,
     qs: String,
+    bulk_total: Option<i64>,
 }
 
 async fn requests(
@@ -194,22 +221,18 @@ async fn requests(
     Query(f): Query<RequestFilter>,
 ) -> AppResult<Html<String>> {
     let page = state.store.search_requests(&f).await?;
-    let qs = qs_without_page(&[
-        ("ip", f.ip.clone()),
-        ("path", f.path.clone()),
-        ("label", f.label.clone()),
-        ("severity", f.severity.map(|a| a.to_string())),
-        ("min_severity", f.min_severity.map(|a| a.to_string())),
-        ("country", f.country.clone()),
-        ("asn", f.asn.map(|a| a.to_string())),
-        ("from", f.from.clone()),
-        ("to", f.to.clone()),
-    ]);
+    let bulk_total = if authed {
+        Some(state.store.matching_request_ids(&f).await?.len() as i64)
+    } else {
+        None
+    };
+    let qs = request_qs(&f);
     render(&RequestsPage {
         chrome: Chrome::new(authed, "requests"),
         f,
         page,
         qs,
+        bulk_total,
     })
 }
 

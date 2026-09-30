@@ -4,7 +4,7 @@ use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
 use crate::events::QueueJob;
-use crate::store::browse::{Page, page_num};
+use crate::store::browse::{IpFilter, Page, RequestFilter, page_num};
 use crate::store::inspect::{
     FpClaimRow, FpCluster, PortRow, QueueSummary, RequestDetail, ScanSummary,
 };
@@ -27,6 +27,8 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/requests/{id}", get(request_page))
         .route("/admin/requests/{id}/delete", post(request_delete))
         .route("/admin/ips/{addr}/delete", post(ip_delete))
+        .route("/admin/requests/bulk-delete", post(bulk_delete_requests))
+        .route("/admin/ips/bulk-delete", post(bulk_delete_ips))
         .route("/admin/scans", get(scans))
         .route("/admin/scans/{id}", get(scan_page))
         .route("/admin/scans/{id}/xml", get(scan_xml))
@@ -407,4 +409,71 @@ async fn key_delete(
         }
     }
     Redirect::to("/admin/keys")
+}
+
+/// Parsed bulk form: checked row keys, or "everything matching the filter".
+struct BulkForm<F> {
+    all: bool,
+    ids: Vec<String>,
+    filter: F,
+}
+
+fn parse_bulk<F: serde::de::DeserializeOwned>(body: &str) -> AppResult<BulkForm<F>> {
+    let pairs: Vec<(String, String)> =
+        serde_urlencoded::from_str(body).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let filter: F =
+        serde_urlencoded::from_str(body).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(BulkForm {
+        all: pairs.iter().any(|(k, v)| k == "all" && v == "1"),
+        ids: pairs
+            .into_iter()
+            .filter(|(k, _)| k == "ids")
+            .map(|(_, v)| v)
+            .collect(),
+        filter,
+    })
+}
+
+async fn bulk_delete_requests(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    body: String,
+) -> AppResult<Redirect> {
+    let form = parse_bulk::<RequestFilter>(&body)?;
+    let ids: Vec<i64> = if form.all {
+        st.store.matching_request_ids(&form.filter).await?
+    } else {
+        form.ids.iter().filter_map(|v| v.parse().ok()).collect()
+    };
+    let n = st.store.delete_requests(&ids).await?;
+    tracing::info!(deleted = n, all = form.all, "bulk request delete");
+    Ok(Redirect::to(&format!(
+        "/requests?{}",
+        crate::admin::public::request_qs(&form.filter)
+    )))
+}
+
+async fn bulk_delete_ips(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    body: String,
+) -> AppResult<Redirect> {
+    let form = parse_bulk::<IpFilter>(&body)?;
+    let ids: Vec<i64> = if form.all {
+        st.store.matching_ip_ids(&form.filter).await?
+    } else {
+        let mut out = vec![];
+        for addr in &form.ids {
+            if let Some(ip) = st.store.ip_by_addr(addr).await? {
+                out.push(ip.id);
+            }
+        }
+        out
+    };
+    let n = st.store.delete_ips(&ids).await?;
+    tracing::info!(deleted = n, all = form.all, "bulk ip delete");
+    Ok(Redirect::to(&format!(
+        "/ips?{}",
+        crate::admin::public::ip_qs(&form.filter)
+    )))
 }

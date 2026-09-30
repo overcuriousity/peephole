@@ -18,11 +18,34 @@
   </select></label>
   <button class="btn btn-primary" type="submit">Filter</button>
 </form>
+{% if chrome.authed %}
+<div class="row bulk-bar">
+  <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-sel" data-needs-checked="bulk-form">Delete selected</button>
+  <dialog id="dlg-bulk-sel"><h3>Delete the selected IPs?</h3><p class="muted">Each IP goes with all its requests, scans, fingerprints and claims. Cannot be undone.</p>
+    <div class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit" form="bulk-form">Delete selected</button></div></dialog>
+  {% if let Some(t) = bulk_total %}
+  <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-all">Delete all {{ t }} matching</button>
+  <dialog id="dlg-bulk-all"><h3>Delete all {{ t }} IPs matching this filter?</h3><p class="muted">Across every page, with everything recorded about them. Cannot be undone.</p>
+    <form method="post" action="/admin/ips/bulk-delete" class="actions">
+      <input type="hidden" name="all" value="1">
+      <input type="hidden" name="q" value="{{ f.q.as_deref().unwrap_or_default() }}">
+      <input type="hidden" name="country" value="{{ f.country.as_deref().unwrap_or_default() }}">
+      <input type="hidden" name="asn" value="{% if let Some(v) = f.asn %}{{ v }}{% endif %}">
+      <input type="hidden" name="label" value="{{ f.label.as_deref().unwrap_or_default() }}">
+      <input type="hidden" name="min_severity" value="{% if let Some(v) = f.min_severity %}{{ v }}{% endif %}">
+      <input type="hidden" name="tor" value="{{ f.tor.as_deref().unwrap_or_default() }}">
+      <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Delete all {{ t }}</button>
+    </form></dialog>
+  {% endif %}
+</div>
+<form id="bulk-form" method="post" action="/admin/ips/bulk-delete">
+{% endif %}
 <div class="table-wrap"><table>
-  <thead><tr><th>IP</th><th>Country</th><th>Network</th><th class="num">Requests</th><th>Max sev</th><th>First seen</th><th>Last seen</th></tr></thead>
+  <thead><tr>{% if chrome.authed %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>IP</th><th>Country</th><th>Network</th><th class="num">Requests</th><th>Max sev</th><th>First seen</th><th>Last seen</th></tr></thead>
   <tbody>
   {% for i in page.items %}
     <tr>
+      {% if chrome.authed %}<td class="check"><input type="checkbox" name="ids" value="{{ i.ip }}" aria-label="Select {{ i.ip }}"></td>{% endif %}
       <td class="ip"><a href="/ip/{{ i.ip }}">{{ i.ip }}</a>{% if i.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
       <td>{% if let Some(c) = i.country %}{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}{% else %}<span class="muted">—</span>{% endif %}</td>
       <td>{% if let Some(o) = i.asn_org %}{{ o }}{% if let Some(a) = i.asn %} <span class="muted mono">AS{{ a }}</span>{% endif %}{% else %}<span class="muted">—</span>{% endif %}</td>
@@ -32,8 +55,9 @@
       <td class="ts">{{ i.last_seen }}</td>
     </tr>
   {% endfor %}
-  {% if page.items.is_empty() %}<tr><td colspan="7" class="empty">No IPs match.</td></tr>{% endif %}
+  {% if page.items.is_empty() %}<tr><td colspan="8" class="empty">No IPs match.</td></tr>{% endif %}
   </tbody>
 </table></div>
+{% if chrome.authed %}</form>{% endif %}
 {% include "_pagination.html" %}
 {% endblock %}

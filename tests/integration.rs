@@ -1267,3 +1267,151 @@ async fn trap_page_is_a_realistic_notice_with_honest_footnote() {
         .unwrap();
     assert!(ok.contains("Thank you") && ok.contains("prefers-color-scheme: dark"));
 }
+
+#[tokio::test]
+async fn bulk_delete_checked_and_filtered() {
+    let (trap_base, store, dir) = spawn_trap().await;
+    let c = reqwest::Client::new();
+    let ip = store
+        .upsert_ip("203.0.113.50".parse().unwrap())
+        .await
+        .unwrap();
+    for _ in 0..120 {
+        store
+            .insert_request(&peephole::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/bulk".into(),
+                query: None,
+                headers_json: "[]".into(),
+                body: None,
+                labels_json: "[]".into(),
+                severity: 0,
+                scan_level: 0,
+                is_fp_claim: false,
+                page_token: None,
+            })
+            .await
+            .unwrap();
+    }
+    let _ = c
+        .get(format!("{trap_base}/keep"))
+        .header("x-forwarded-for", "203.0.113.50")
+        .send()
+        .await
+        .unwrap();
+    for lo in ["127.0.0.1", "127.0.0.2"] {
+        let _ = c
+            .get(format!("{trap_base}/lo"))
+            .header("x-forwarded-for", lo)
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Anonymous: gated.
+    let base = spawn_admin_with(store.clone(), dir.path()).await;
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    for p in ["/admin/requests/bulk-delete", "/admin/ips/bulk-delete"] {
+        let resp = anon
+            .post(format!("{base}{p}"))
+            .form(&[("all", "1")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 303, "{p}");
+    }
+    let html = reqwest::get(format!("{base}/requests?path=/keep"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !html.contains("name=\"ids\""),
+        "no checkboxes for anonymous users"
+    );
+
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, abase) = enrolled_admin_client(store.clone(), cfg).await;
+    let html = client
+        .get(format!("{abase}/requests?path=/keep"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("name=\"ids\"") && html.contains("Delete all"));
+
+    // Checked rows.
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/bulk' LIMIT 2")
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+    let noredir = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    // Share the session cookie with the redirect-following client.
+    let cookie = client.get(format!("{abase}/admin")).send().await.unwrap();
+    assert_eq!(cookie.status(), 200);
+    let resp = client
+        .post(format!("{abase}/admin/requests/bulk-delete"))
+        .form(&[("ids", ids[0].to_string()), ("ids", ids[1].to_string())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE path = '/bulk'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 118);
+
+    // Everything matching the filter, across pages.
+    let resp = client
+        .post(format!("{abase}/admin/requests/bulk-delete"))
+        .form(&[("all", "1"), ("path", "/bulk")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.url().query().unwrap_or("").contains("path=%2Fbulk"));
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE path = '/bulk'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+    let keep: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE path = '/keep'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(keep, 1);
+    drop(noredir);
+
+    // IPs matching a CIDR.
+    let resp = client
+        .post(format!("{abase}/admin/ips/bulk-delete"))
+        .form(&[("all", "1"), ("q", "127.0.0.0/8")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(store.ip_by_addr("127.0.0.1").await.unwrap().is_none());
+    assert!(store.ip_by_addr("127.0.0.2").await.unwrap().is_none());
+    assert!(store.ip_by_addr("203.0.113.50").await.unwrap().is_some());
+    // Checked IPs by address.
+    let resp = client
+        .post(format!("{abase}/admin/ips/bulk-delete"))
+        .form(&[("ids", "203.0.113.50")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(store.ip_by_addr("203.0.113.50").await.unwrap().is_none());
+}

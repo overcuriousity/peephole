@@ -69,6 +69,75 @@ impl Store {
     }
 }
 
+/// `?,?,…` for `n` binds.
+fn placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
+}
+
+const CHUNK: usize = 500;
+
+impl Store {
+    /// Delete many requests (and their claims/fingerprints) in one transaction.
+    pub async fn delete_requests(&self, ids: &[i64]) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let mut n = 0u64;
+        for chunk in ids.chunks(CHUNK) {
+            let ph = placeholders(chunk.len());
+            for sql in [
+                format!("DELETE FROM fp_claims WHERE request_id IN ({ph})"),
+                format!("DELETE FROM fingerprints WHERE request_id IN ({ph})"),
+            ] {
+                let mut q = sqlx::query(&sql);
+                for id in chunk {
+                    q = q.bind(id);
+                }
+                q.execute(&mut *tx).await?;
+            }
+            let sql = format!("DELETE FROM requests WHERE id IN ({ph})");
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            n += q.execute(&mut *tx).await?.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(n)
+    }
+
+    /// Delete many IPs with everything hanging off them, in one transaction.
+    pub async fn delete_ips(&self, ids: &[i64]) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let mut n = 0u64;
+        for chunk in ids.chunks(CHUNK) {
+            let ph = placeholders(chunk.len());
+            for sql in [
+                format!(
+                    "DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE ip_id IN ({ph}))"
+                ),
+                format!("DELETE FROM scans WHERE ip_id IN ({ph})"),
+                format!("DELETE FROM scan_jobs WHERE ip_id IN ({ph})"),
+                format!("DELETE FROM fingerprints WHERE ip_id IN ({ph})"),
+                format!("DELETE FROM fp_claims WHERE ip_id IN ({ph})"),
+                format!("DELETE FROM requests WHERE ip_id IN ({ph})"),
+            ] {
+                let mut q = sqlx::query(&sql);
+                for id in chunk {
+                    q = q.bind(id);
+                }
+                q.execute(&mut *tx).await?;
+            }
+            let sql = format!("DELETE FROM ips WHERE id IN ({ph})");
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            n += q.execute(&mut *tx).await?.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::scan::nmap_xml::{PortResult, ScanResult};
@@ -181,6 +250,54 @@ mod tests {
         assert_eq!(count(&s, "fingerprints", "request_id", rid).await, 0);
         assert_eq!(count(&s, "ips", "id", a).await, 1, "ip row stays");
         assert_eq!(count(&s, "scans", "ip_id", a).await, 1, "scans stay");
+    }
+
+    #[tokio::test]
+    async fn bulk_matching_and_delete() {
+        use crate::store::browse::{IpFilter, RequestFilter};
+        let (s, a, b) = seeded().await;
+        let c = s.upsert_ip("198.51.100.9".parse().unwrap()).await.unwrap();
+        s.insert_request(&NewRequest {
+            ip_id: c.id,
+            method: "GET".into(),
+            path: "/x".into(),
+            query: None,
+            headers_json: "[]".into(),
+            body: None,
+            labels_json: "[]".into(),
+            severity: 1,
+            scan_level: 1,
+            is_fp_claim: false,
+            page_token: None,
+        })
+        .await
+        .unwrap();
+        let f = RequestFilter {
+            path: Some("/x".into()),
+            ..Default::default()
+        };
+        let ids = s.matching_request_ids(&f).await.unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(s.delete_requests(&ids[1..]).await.unwrap(), 2);
+        assert_eq!(s.matching_request_ids(&f).await.unwrap().len(), 1);
+        let total_claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fp_claims")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert!(total_claims <= 1, "claims of deleted requests are gone");
+
+        let ipf = IpFilter {
+            q: Some("203.0.113.0/24".into()),
+            ..Default::default()
+        };
+        let ip_ids = s.matching_ip_ids(&ipf).await.unwrap();
+        assert_eq!(ip_ids.len(), 2);
+        assert!(ip_ids.contains(&a) && ip_ids.contains(&b));
+        assert_eq!(s.delete_ips(&ip_ids).await.unwrap(), 2);
+        assert_eq!(count(&s, "ips", "id", a).await, 0);
+        assert_eq!(count(&s, "ips", "id", c.id).await, 1);
+        assert_eq!(count(&s, "requests", "ip_id", c.id).await, 1);
+        assert_eq!(s.delete_ips(&[]).await.unwrap(), 0);
     }
 
     #[tokio::test]

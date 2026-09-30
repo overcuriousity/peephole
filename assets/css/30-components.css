@@ -88,3 +88,7 @@ pre.panel { background: var(--color-bg-surface); border: 1px solid var(--color-b
 .auth-card label { display: block; text-align: left; margin-bottom: 0.75rem; }
 .auth-card label input { width: 100%; margin-top: 0.25rem; }
 .status { min-height: 1.5rem; margin-top: 0.75rem; color: var(--color-danger); font-size: var(--text-sm); }
+
+.bulk-bar { margin-bottom: 0.75rem; }
+th.check, td.check { width: 2rem; padding-right: 0; }
+td.check input, th.check input { margin: 0; vertical-align: middle; accent-color: var(--color-accent); }
