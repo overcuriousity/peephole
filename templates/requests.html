@@ -1,7 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — requests{% endblock %}
 {% block content %}
-<div class="page-head"><div><h1>Requests</h1><p class="muted">Every captured request. Paths and query strings are shown as received.</p></div></div>
+<div class="page-head"><div><h1>Requests</h1><p class="muted">Every captured request. {% if chrome.authed %}Paths and query strings are shown as received.{% else %}Paths are shown as received; query strings can carry credentials and stay private.{% endif %}</p></div></div>
 <form class="filters" method="get" action="/requests">
   <label>IP <input name="ip" value="{{ f.ip.as_deref().unwrap_or_default() }}"></label>
   <label>Path contains <input name="path" value="{{ f.path.as_deref().unwrap_or_default() }}"></label>
