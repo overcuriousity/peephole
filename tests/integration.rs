@@ -302,23 +302,11 @@ async fn dashboard_shows_aggregates_not_payloads() {
     assert!(!stats.to_string().contains("SECRET-PAYLOAD-MARKER"));
 }
 
-#[tokio::test]
-async fn queue_sse_streams_job_updates() {
-    let (trap_base, store, dir) = spawn_trap().await;
-    let _ = reqwest::get(format!("{trap_base}/probe")).await.unwrap();
-    let admin_base = spawn_admin_with(store, dir.path()).await;
-    let resp = reqwest::get(format!("{admin_base}/api/queue"))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.headers().get("content-type").unwrap(),
-        "text/event-stream"
-    );
-    // SSE streams forever; read only the first chunks under a deadline.
-    let body = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+async fn read_sse_until(resp: reqwest::Response, needle: &str, secs: u64) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(secs), async {
         let mut resp = resp;
         let mut buf = String::new();
-        while buf.len() < 16 {
+        while !buf.contains(needle) {
             match resp.chunk().await.unwrap() {
                 Some(c) => buf.push_str(&String::from_utf8_lossy(&c)),
                 None => break,
@@ -327,8 +315,60 @@ async fn queue_sse_streams_job_updates() {
         buf
     })
     .await
-    .unwrap();
-    assert!(body.contains("queued") || body.contains("running") || body.contains("done"));
+    .expect("sse deadline")
+}
+
+#[tokio::test]
+async fn queue_sse_requires_session_and_streams_snapshot_then_jobs() {
+    let (trap_base, store, dir) = spawn_trap().await;
+    let _ = reqwest::get(format!("{trap_base}/probe")).await.unwrap();
+    // Unauthenticated → redirect to /login.
+    let admin_base = spawn_admin_with(store.clone(), dir.path()).await;
+    let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .get(format!("{admin_base}/admin/api/queue"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(resp.headers().get("location").unwrap(), "/login");
+
+    // Authenticated: first event is a snapshot containing the queued probe job.
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base, state) = enrolled_admin_client_with_state(store.clone(), cfg).await;
+    let resp = client
+        .get(format!("{base}/admin/api/queue"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    let body = read_sse_until(resp, "event: snapshot", 5).await;
+    assert!(body.contains("\"status\":\"queued\""));
+
+    // A published job arrives as `event: job`.
+    let resp = client
+        .get(format!("{base}/admin/api/queue"))
+        .send()
+        .await
+        .unwrap();
+    let ip = store
+        .upsert_ip("198.51.100.77".parse().unwrap())
+        .await
+        .unwrap();
+    let id = match store.enqueue_scan(ip.id, 3, 24).await.unwrap() {
+        peephole::store::scans::EnqueueOutcome::Queued(id) => id,
+        o => panic!("{o:?}"),
+    };
+    state
+        .notifier
+        .publish(store.queue_job(id).await.unwrap().unwrap());
+    let body = read_sse_until(resp, "event: job", 5).await;
+    assert!(body.contains("198.51.100.77"));
 }
 
 #[tokio::test]
@@ -343,7 +383,14 @@ async fn authenticated_routes_redirect_without_session() {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
-    for path in ["/requests", "/ips/1", "/inbox", "/export", "/keys"] {
+    for path in [
+        "/requests",
+        "/ips/1",
+        "/inbox",
+        "/export",
+        "/keys",
+        "/admin/api/queue",
+    ] {
         let resp = client
             .get(format!("http://{addr}{path}"))
             .send()
@@ -440,9 +487,13 @@ async fn webauthn_ceremony_with_soft_token() {
     assert!(sessions >= 1);
 }
 
-/// Spins `router_with_auth` on an ephemeral port and runs the soft-passkey
+/// Spins the full router on an ephemeral port and runs the soft-passkey
 /// enroll ceremony (fresh store per test, so the setup token is issuable).
-async fn enrolled_admin_client(store: Store, cfg: Config) -> (reqwest::Client, String) {
+/// Returns the shared state too, so tests can publish queue events.
+async fn enrolled_admin_client_with_state(
+    store: Store,
+    cfg: Config,
+) -> (reqwest::Client, String, Arc<AdminState>) {
     use webauthn_authenticator_rs::AuthenticatorBackend;
     use webauthn_authenticator_rs::prelude::Url;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
@@ -450,7 +501,8 @@ async fn enrolled_admin_client(store: Store, cfg: Config) -> (reqwest::Client, S
         .await
         .unwrap()
         .expect("setup token issuable on fresh store");
-    let app = peephole::admin::router_with_auth(store, cfg);
+    let state = Arc::new(AdminState::public_only(store, cfg));
+    let app = peephole::admin::full_router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -480,7 +532,12 @@ async fn enrolled_admin_client(store: Store, cfg: Config) -> (reqwest::Client, S
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "enroll finish failed");
-    (client, base)
+    (client, base, state)
+}
+
+async fn enrolled_admin_client(store: Store, cfg: Config) -> (reqwest::Client, String) {
+    let (c, b, _) = enrolled_admin_client_with_state(store, cfg).await;
+    (c, b)
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod classify;
 pub mod config;
+pub mod events;
 pub mod export;
 pub mod fingerprint;
 pub mod intel;
@@ -85,6 +86,9 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         });
     }
 
+    // Queue change notifications: trap + workers publish, admin SSE subscribes.
+    let notifier = events::Notifier::new();
+
     // Scan worker pool.
     {
         let store = store.clone();
@@ -94,6 +98,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             cfg2,
             PathBuf::from(nmap_path),
             shutdown_rx.clone(),
+            notifier.clone(),
         ));
     }
 
@@ -107,9 +112,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         classifier,
         geo: geo.clone(),
         tor: tor.clone(),
+        notifier: notifier.clone(),
     });
     let trap_app = trap::router(trap_state);
-    let admin_app = admin::router_with_auth(store.clone(), cfg.clone());
+    let admin_app = admin::full_router(Arc::new(admin::AdminState::new(
+        store.clone(),
+        cfg.clone(),
+        notifier,
+    )));
 
     let trap_listener = tokio::net::TcpListener::bind(cfg.trap_listen)
         .await

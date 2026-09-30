@@ -1,4 +1,5 @@
 use super::Store;
+use crate::events::QueueJob;
 use crate::scan::nmap_xml::ScanResult;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -124,5 +125,53 @@ impl Store {
             }
         }
         Ok(())
+    }
+}
+
+const QUEUE_JOB_SQL: &str =
+    "SELECT j.id, i.ip, j.level, j.status, j.queued_at, j.started_at, j.finished_at, j.error
+     FROM scan_jobs j JOIN ips i ON j.ip_id = i.id";
+
+impl Store {
+    pub async fn queue_job(&self, id: i64) -> Result<Option<QueueJob>> {
+        Ok(
+            sqlx::query_as::<_, QueueJob>(&format!("{QUEUE_JOB_SQL} WHERE j.id = ?"))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Newest jobs first; `limit` rows.
+    pub async fn queue_snapshot(&self, limit: i64) -> Result<Vec<QueueJob>> {
+        Ok(
+            sqlx::query_as::<_, QueueJob>(&format!("{QUEUE_JOB_SQL} ORDER BY j.id DESC LIMIT ?"))
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    #[tokio::test]
+    async fn queue_job_and_snapshot_join_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = s.upsert_ip("203.0.113.5".parse().unwrap()).await.unwrap();
+        let id = match s.enqueue_scan(ip.id, 2, 24).await.unwrap() {
+            EnqueueOutcome::Queued(id) => id,
+            other => panic!("{other:?}"),
+        };
+        let job = s.queue_job(id).await.unwrap().unwrap();
+        assert_eq!(job.ip, "203.0.113.5");
+        assert_eq!(job.status, "queued");
+        let snap = s.queue_snapshot(50).await.unwrap();
+        assert_eq!(snap.len(), 1);
+        assert!(s.queue_job(9999).await.unwrap().is_none());
     }
 }

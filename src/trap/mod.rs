@@ -26,6 +26,7 @@ pub struct TrapState {
     pub classifier: Classifier,
     pub geo: Arc<RwLock<Option<GeoIp>>>,
     pub tor: Arc<RwLock<TorExitList>>,
+    pub notifier: crate::events::Notifier,
 }
 
 impl TrapState {
@@ -37,6 +38,7 @@ impl TrapState {
             classifier,
             geo: Arc::new(RwLock::new(None)),
             tor: Arc::new(RwLock::new(TorExitList::default())),
+            notifier: Default::default(),
         }
     }
 }
@@ -113,15 +115,20 @@ async fn record_and_respond(
     // Enqueue counter-scan unless tor / allowlisted / level 0 (spec §4-5).
     let is_tor = state.tor.read().unwrap().contains(&ip);
     let allowlisted = state.cfg.scan.never_scan.iter().any(|n| n.contains(&ip));
-    if verdict.scan_level > 0 && !is_tor && !allowlisted {
-        state
+    if verdict.scan_level > 0
+        && !is_tor
+        && !allowlisted
+        && let crate::store::scans::EnqueueOutcome::Queued(job_id) = state
             .store
             .enqueue_scan(
                 ip_row.id,
                 verdict.scan_level,
                 state.cfg.scan.rescan_cooldown_hours,
             )
-            .await?;
+            .await?
+        && let Ok(Some(job)) = state.store.queue_job(job_id).await
+    {
+        state.notifier.publish(job);
     }
     Ok((request_id, verdict, ip_row.id))
 }

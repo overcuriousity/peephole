@@ -18,12 +18,20 @@ use std::sync::Arc;
 pub struct AdminState {
     pub store: Store,
     pub cfg: Config,
+    pub notifier: crate::events::Notifier,
 }
 
 impl AdminState {
-    /// Public-only state (Tasks 9–11 extend this struct with auth).
+    pub fn new(store: Store, cfg: Config, notifier: crate::events::Notifier) -> Self {
+        Self {
+            store,
+            cfg,
+            notifier,
+        }
+    }
+    /// State with a private notifier (tests, or when nothing publishes).
     pub fn public_only(store: Store, cfg: Config) -> Self {
-        Self { store, cfg }
+        Self::new(store, cfg, crate::events::Notifier::new())
     }
 }
 
@@ -37,7 +45,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/api/stats", get(stats_json))
-        .route("/api/queue", get(sse::queue_stream))
+        .route("/admin/api/queue", get(sse::queue_stream))
         .merge(assets::router())
         .merge(auth::auth_routes())
         .merge(detail::routes())

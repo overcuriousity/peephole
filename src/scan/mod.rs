@@ -21,6 +21,7 @@ pub async fn run_workers(
     cfg: Config,
     nmap_path: PathBuf,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    notifier: crate::events::Notifier,
 ) {
     let mut joinset = tokio::task::JoinSet::new();
     loop {
@@ -47,8 +48,12 @@ pub async fn run_workers(
                     let Ok(target) = ip.parse::<IpAddr>() else {
                         continue;
                     };
+                    if let Ok(Some(j)) = store.queue_job(job.id).await {
+                        notifier.publish(j);
+                    }
                     let argv = nmap_argv(job.level as u8, &target, &cfg);
                     let store2 = store.clone();
+                    let notifier2 = notifier.clone();
                     let nmap = nmap_path.clone();
                     let timeout = Duration::from_secs(cfg.scan.timeout_secs);
                     joinset.spawn(async move {
@@ -86,6 +91,9 @@ pub async fn run_workers(
                             Err(_) => {
                                 let _ = store2.finish_job(job.id, None, Some("timeout")).await;
                             }
+                        }
+                        if let Ok(Some(j)) = store2.queue_job(job.id).await {
+                            notifier2.publish(j);
                         }
                     });
                 }
@@ -193,7 +201,13 @@ license_key = "k"
         store.enqueue_scan(ip.id, 2, 24).await.unwrap();
 
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let pool = tokio::spawn(run_workers(store.clone(), cfg, fake.clone(), rx));
+        let pool = tokio::spawn(run_workers(
+            store.clone(),
+            cfg,
+            fake.clone(),
+            rx,
+            crate::events::Notifier::new(),
+        ));
         // Wait until the job is done (poll DB, max 5s).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {

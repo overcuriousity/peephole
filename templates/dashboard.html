@@ -35,9 +35,6 @@
     <div class="stat"><b>__SCANS__</b> counter-scans completed</div>
   </div>
 
-  <h2>Live scan queue</h2>
-  <table><thead><tr><th>Job</th><th>Level</th><th>Status</th><th>Target</th></tr></thead>
-    <tbody id="queue-body"><tr><td colspan="4">connecting…</td></tr></tbody></table>
 
   <div class="grid">
     <section>
@@ -52,15 +49,5 @@
     </section>
   </div>
 </main>
-<script>
-  var es = new EventSource("/api/queue");
-  es.addEventListener("queue", function (ev) {
-    var rows = JSON.parse(ev.data);
-    var body = document.getElementById("queue-body");
-    body.innerHTML = rows.map(function (r) {
-      return "<tr><td>#" + r.id + "</td><td>" + r.level + "</td><td>" + r.status + "</td><td>" + r.ip + "</td></tr>";
-    }).join("") || "<tr><td colspan='4'>queue empty</td></tr>";
-  });
-</script>
 </body>
 </html>
