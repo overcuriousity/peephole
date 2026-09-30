@@ -20,8 +20,23 @@ impl Chrome {
     }
 }
 
-/// CSS class for a severity 0..4 (clamped). Generic so templates can pass
-/// either an `i64` or the `&i64` a `{% let %}` binding produces.
-pub fn sev_class<S: std::borrow::Borrow<i64>>(sev: S) -> String {
-    format!("sev sev-{}", sev.borrow().clamp(&0, &4))
+/// Anything a template may hand us as a severity: `i64` or any depth of
+/// reference to one (askama binds loop variables and `{% let %}` by reference).
+pub trait SevValue {
+    fn sev(&self) -> i64;
+}
+impl SevValue for i64 {
+    fn sev(&self) -> i64 {
+        *self
+    }
+}
+impl<T: SevValue + ?Sized> SevValue for &T {
+    fn sev(&self) -> i64 {
+        (**self).sev()
+    }
+}
+
+/// CSS class for a severity 0..4 (clamped).
+pub fn sev_class<S: SevValue>(sev: S) -> String {
+    format!("sev sev-{}", sev.sev().clamp(0, 4))
 }

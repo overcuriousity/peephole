@@ -3,19 +3,13 @@ pub mod auth;
 pub mod countries;
 pub mod detail;
 pub mod error;
+pub mod public;
 pub mod sse;
 pub mod views;
 
-use crate::admin::error::AppResult;
 use crate::config::Config;
 use crate::store::Store;
-use crate::store::stats::{MapCounts, Range, Stats};
-use axum::{
-    Router,
-    extract::{Query, State},
-    response::{Html, Json},
-    routing::get,
-};
+use axum::{Router, routing::get};
 use std::sync::Arc;
 
 pub struct AdminState {
@@ -48,10 +42,8 @@ pub fn router_with_auth(store: Store, cfg: Config) -> Router {
 /// Every route on the admin listener: public pages, assets, auth, admin.
 pub fn full_router(state: Arc<AdminState>) -> Router {
     Router::new()
-        .route("/", get(dashboard))
-        .route("/api/stats", get(stats_json))
-        .route("/api/map", get(map_json))
         .route("/admin/api/queue", get(sse::queue_stream))
+        .merge(public::routes())
         .merge(assets::router())
         .merge(auth::auth_routes())
         .merge(detail::routes())
@@ -92,83 +84,4 @@ async fn security_headers(
 #[derive(serde::Deserialize, Default)]
 pub struct RangeQuery {
     pub range: Option<String>,
-}
-
-async fn dashboard(
-    State(state): State<Arc<AdminState>>,
-    Query(q): Query<RangeQuery>,
-) -> AppResult<Html<String>> {
-    let stats = state
-        .stats_cache
-        .stats(&state.store, Range::parse(q.range.as_deref()))
-        .await?;
-    Ok(Html(render_dashboard(&stats)))
-}
-
-async fn stats_json(
-    State(state): State<Arc<AdminState>>,
-    Query(q): Query<RangeQuery>,
-) -> AppResult<Json<Arc<Stats>>> {
-    Ok(Json(
-        state
-            .stats_cache
-            .stats(&state.store, Range::parse(q.range.as_deref()))
-            .await?,
-    ))
-}
-
-async fn map_json(
-    State(state): State<Arc<AdminState>>,
-    Query(q): Query<RangeQuery>,
-) -> AppResult<Json<Arc<MapCounts>>> {
-    Ok(Json(
-        state
-            .stats_cache
-            .map(&state.store, Range::parse(q.range.as_deref()))
-            .await?,
-    ))
-}
-
-/// Interim renderer for the old dashboard template; replaced in Task 8.
-fn render_dashboard(s: &Stats) -> String {
-    let mut rows = String::new();
-    for r in &s.recent {
-        rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}{}</td></tr>",
-            esc(&r.ts),
-            esc(&r.ip),
-            esc(&r.method),
-            esc(&r.path),
-            r.severity,
-            esc(&r.country.clone().unwrap_or_default()),
-            if r.is_tor { " [tor]" } else { "" },
-        ));
-    }
-    let mut top = String::new();
-    for t in &s.top_ips {
-        top.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td></tr>",
-            esc(&t.ip),
-            t.count
-        ));
-    }
-    let badge = if crate::store::stats::intel_stale(&s.intel) {
-        "<div class=\"banner banner-warning\">Intel data missing or older than 48h — check the intel scheduler.</div>"
-    } else {
-        ""
-    };
-    include_str!("../../templates/dashboard.html")
-        .replace("__TOTAL__", &s.total_requests.to_string())
-        .replace("__UNIQUE_IPS__", &s.unique_ips.to_string())
-        .replace("__SCANS__", &s.scans_done.to_string())
-        .replace("__RECENT_ROWS__", &rows)
-        .replace("__TOP_IP_ROWS__", &top)
-        .replace("__INTEL_BADGE__", badge)
-}
-
-fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }

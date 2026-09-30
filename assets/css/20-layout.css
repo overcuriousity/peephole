@@ -16,6 +16,7 @@
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
 .stack { display: grid; gap: 1rem; }
+.stack > *, .grid-2 > *, .grid-3 > *, .tiles > * { min-width: 0; }
 .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
 .footer { max-width: var(--shell-max); margin: 0 auto; padding: 1rem; color: var(--color-fg-muted); font-size: var(--text-xs); display: flex; justify-content: space-between; }
 @media (max-width: 48rem) {

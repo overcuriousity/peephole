@@ -1,1 +1,29 @@
-/* charts: filled in Task 8 */
+.chart { width: 100%; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart .bar { fill: var(--color-accent); }
+.chart .bar:hover { fill: var(--color-brand); }
+.chart .axis text { fill: var(--color-fg-muted); font-size: 10px; font-family: var(--font-mono); }
+.chart .axis line, .chart .grid line { stroke: var(--color-border); }
+.chart .hbar-label { fill: var(--color-fg-primary); font-size: 11px; }
+.chart .hbar-value { fill: var(--color-fg-muted); font-size: 11px; font-family: var(--font-mono); }
+.chart .hbar { fill: var(--color-accent-muted); }
+.chart .sev-bar-0 { fill: var(--sev-0); } .chart .sev-bar-1 { fill: var(--sev-1); }
+.chart .sev-bar-2 { fill: var(--sev-2); } .chart .sev-bar-3 { fill: var(--sev-3); } .chart .sev-bar-4 { fill: var(--sev-4); }
+.chart .empty-note { fill: var(--color-fg-muted); font-size: 12px; }
+.map svg { display: block; width: 100%; height: auto; }
+.map .sphere { fill: var(--color-bg-surface); }
+.map .country { fill: var(--ramp-0); stroke: var(--color-bg-elevated); stroke-width: 0.5; transition: fill 200ms; cursor: pointer; }
+.map .country[data-bin="1"] { fill: var(--ramp-1); } .map .country[data-bin="2"] { fill: var(--ramp-2); }
+.map .country[data-bin="3"] { fill: var(--ramp-3); } .map .country[data-bin="4"] { fill: var(--ramp-4); }
+.map .country:hover { stroke: var(--color-brand); stroke-width: 1; }
+.legend { display: flex; gap: 0.75rem; align-items: center; margin-top: 0.5rem; font-size: var(--text-xs); color: var(--color-fg-muted); flex-wrap: wrap; }
+.legend .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: -2px; margin-right: 0.3rem; border: 1px solid var(--color-border-strong); }
+.legend .swatch[data-bin="0"] { background: var(--ramp-0); } .legend .swatch[data-bin="1"] { background: var(--ramp-1); }
+.legend .swatch[data-bin="2"] { background: var(--ramp-2); } .legend .swatch[data-bin="3"] { background: var(--ramp-3); }
+.legend .swatch[data-bin="4"] { background: var(--ramp-4); }
+.tooltip { position: fixed; pointer-events: none; background: var(--color-bg-elevated); border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md); padding: 0.3rem 0.55rem; font-size: var(--text-xs); color: var(--color-fg-primary); z-index: 20; display: none; }
+.sparkline { width: 100%; height: 2.5rem; }
+.sparkline svg { display: block; width: 100%; height: 100%; }
+.sparkline rect { fill: var(--color-accent-muted); }
+.sparkline rect:last-child { fill: var(--color-accent); }

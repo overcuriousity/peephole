@@ -268,10 +268,9 @@ async fn spawn_admin_with(store: Store, dir: &std::path::Path) -> String {
 }
 
 #[tokio::test]
-async fn dashboard_shows_aggregates_not_payloads() {
+async fn wall_shows_aggregates_not_payloads() {
     let (trap_base, store, dir) = spawn_trap().await;
     let client = reqwest::Client::new();
-    // Generate traffic with a distinctive payload that must NOT leak to public pages.
     let _ = client
         .post(format!("{trap_base}/login"))
         .header("x-forwarded-for", "203.0.113.99")
@@ -279,27 +278,40 @@ async fn dashboard_shows_aggregates_not_payloads() {
         .send()
         .await
         .unwrap();
+    let _ = client
+        .get(format!("{trap_base}/wp-login.php"))
+        .header("x-forwarded-for", "203.0.113.99")
+        .header("x-secret-header", "HEADER-MARKER")
+        .send()
+        .await
+        .unwrap();
     let admin_base = spawn_admin_with(store.clone(), dir.path()).await;
-
-    let html = reqwest::get(format!("{admin_base}/"))
+    let resp = reqwest::get(format!("{admin_base}/?range=7d"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let html = resp.text().await.unwrap();
+    assert!(html.contains("203.0.113.99"));
+    assert!(html.contains("/wp-login.php"));
+    assert!(html.contains("href=\"/ip/203.0.113.99\""));
+    assert!(html.contains("Last 7 days"));
+    assert!(html.contains("data-range=\"7d\""));
+    assert!(html.contains("id=\"map\""));
+    assert!(html.contains("/assets/js/charts.js"));
+    assert!(!html.contains("SECRET-PAYLOAD-MARKER"));
+    assert!(!html.contains("HEADER-MARKER"));
+    assert!(!html.contains("<script>"), "no inline scripts under CSP");
+    assert!(!html.contains(" style=\""), "no inline styles under CSP");
+    let ok = reqwest::get(format!("{admin_base}/healthz")).await.unwrap();
+    assert_eq!(ok.status(), 200);
+    assert_eq!(ok.text().await.unwrap(), "ok");
+    let svg = reqwest::get(format!("{admin_base}/assets/world.svg"))
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
-    assert!(html.contains("peephole"));
-    assert!(html.contains("203.0.113.99")); // IP is fine on the wall of shame
-    assert!(!html.contains("SECRET-PAYLOAD-MARKER")); // payloads never public
-
-    let stats: serde_json::Value = reqwest::get(format!("{admin_base}/api/stats"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(stats["total_requests"].as_i64().unwrap() >= 1);
-    assert!(stats["unique_ips"].as_i64().unwrap() >= 1);
-    assert!(!stats.to_string().contains("SECRET-PAYLOAD-MARKER"));
+    assert!(svg.contains("id=\"DE\""));
 }
 
 async fn read_sse_until(resp: reqwest::Response, needle: &str, secs: u64) -> String {
