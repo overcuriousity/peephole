@@ -261,6 +261,14 @@ pub fn country_name(alpha2: &str) -> &str {
     }
 }
 
+/// ISO code for an English country name (case-insensitive), if known.
+pub fn code_for_name(name: &str) -> Option<&'static str> {
+    TABLE
+        .iter()
+        .find(|(_, n)| n.eq_ignore_ascii_case(name))
+        .map(|(c, _)| *c)
+}
+
 /// Regional-indicator pair, or empty when the code is not two ASCII letters.
 pub fn flag(alpha2: &str) -> String {
     let b = alpha2.as_bytes();
@@ -282,6 +290,8 @@ mod tests {
         assert_eq!(country_name("ZZ"), "ZZ");
         assert_eq!(country_name("??"), "??");
         assert_eq!(flag("DE"), "🇩🇪");
+        assert_eq!(code_for_name("germany"), Some("DE"));
+        assert_eq!(code_for_name("Atlantis"), None);
         assert_eq!(flag("??"), "");
         assert!(TABLE.len() >= 240);
         assert!(TABLE.windows(2).all(|w| w[0].0 < w[1].0), "table sorted");

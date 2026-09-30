@@ -1,4 +1,5 @@
 pub mod nmap_xml;
+pub mod pace;
 
 use crate::config::Config;
 use crate::store::Store;
@@ -19,19 +20,35 @@ pub fn nmap_argv(level: u8, target: &IpAddr, cfg: &Config) -> Vec<String> {
 pub async fn run_workers(
     store: Store,
     cfg: Config,
+    pace: pace::SharedPace,
     nmap_path: PathBuf,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     notifier: crate::events::Notifier,
 ) {
+    match store.requeue_orphaned_jobs().await {
+        Ok(0) => {}
+        Ok(n) => info!(jobs = n, "requeued scans interrupted by the last shutdown"),
+        Err(e) => warn!(?e, "could not requeue interrupted scans"),
+    }
     let mut joinset = tokio::task::JoinSet::new();
+    let mut last_start: Option<tokio::time::Instant> = None;
     loop {
         if *shutdown.borrow() {
             break;
         }
-        while joinset.len() < cfg.scan.max_workers {
-            // Global rate cap (spec §5): don't start new scans past the hourly cap.
-            match store.recent_scans_last_hour().await {
-                Ok(n) if n >= cfg.scan.max_scans_per_hour => break,
+        // Reap finished scans: JoinSet::len() counts them until joined.
+        while joinset.try_join_next().is_some() {}
+        // Re-read every pass so admin changes apply without a restart.
+        let p = pace.get();
+        while joinset.len() < p.max_workers {
+            // Cadence: space starts evenly instead of bursting up to the cap.
+            let Some(interval) = p.interval() else { break };
+            if last_start.is_some_and(|t| t.elapsed() < interval) {
+                break;
+            }
+            // Global rate cap (spec §5), also across restarts.
+            match store.jobs_started_last_hour().await {
+                Ok(n) if n >= p.max_scans_per_hour => break,
                 Err(e) => {
                     warn!(?e, "rate cap check failed");
                     break;
@@ -46,11 +63,13 @@ pub async fn run_workers(
                         .await
                         .unwrap_or_default();
                     let Ok(target) = ip.parse::<IpAddr>() else {
+                        let _ = store.finish_job(job.id, None, Some("invalid target")).await;
                         continue;
                     };
                     if let Ok(Some(j)) = store.queue_job(job.id).await {
                         notifier.publish(j);
                     }
+                    last_start = Some(tokio::time::Instant::now());
                     let argv = nmap_argv(job.level as u8, &target, &cfg);
                     let store2 = store.clone();
                     let notifier2 = notifier.clone();
@@ -222,6 +241,68 @@ license_key = "k"
         assert!(s.queue_job(job).await.unwrap().is_none());
     }
 
+    fn fake_nmap(dir: &std::path::Path) -> PathBuf {
+        let fake = dir.join("fake-nmap");
+        std::fs::write(&fake, "#!/bin/sh\ncat \"$(dirname \"$0\")/nmap.xml\"\n").unwrap();
+        std::fs::copy("tests/fixtures/nmap-basic.xml", dir.join("nmap.xml")).unwrap();
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+        fake
+    }
+
+    async fn wait_for_scans(store: &Store, n: i64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let done: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scans")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+            if done >= n {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {done} of {n} scans finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Regression: finished tasks were never reaped from the JoinSet, so the
+    /// pool stalled for good after `max_workers` scans.
+    #[tokio::test]
+    async fn worker_keeps_draining_after_first_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_nmap(dir.path());
+        let cfg = test_config(dir.path());
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let jobs = cfg.scan.max_workers as i64 * 2 + 1;
+        for i in 0..jobs {
+            let ip = store
+                .upsert_ip(format!("198.51.100.{}", 30 + i).parse().unwrap())
+                .await
+                .unwrap();
+            store.enqueue_scan(ip.id, 2, 24).await.unwrap();
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let p = pace::SharedPace::new(pace::Pace {
+            max_workers: cfg.scan.max_workers,
+            max_scans_per_hour: 3600,
+        });
+        let pool = tokio::spawn(run_workers(
+            store.clone(),
+            cfg,
+            p,
+            fake,
+            rx,
+            crate::events::Notifier::new(),
+        ));
+        wait_for_scans(&store, jobs).await;
+        tx.send(true).unwrap();
+        pool.await.unwrap();
+    }
+
     #[tokio::test]
     async fn worker_runs_fake_nmap_and_stores_ports() {
         let dir = tempfile::tempdir().unwrap();
@@ -242,9 +323,11 @@ license_key = "k"
         store.enqueue_scan(ip.id, 2, 24).await.unwrap();
 
         let (tx, rx) = tokio::sync::watch::channel(false);
+        let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
         let pool = tokio::spawn(run_workers(
             store.clone(),
             cfg,
+            p,
             fake.clone(),
             rx,
             crate::events::Notifier::new(),

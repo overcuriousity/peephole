@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 
-const SNAPSHOT_ROWS: i64 = 100;
+/// Matches the queue page's server-rendered rows, so a resync never shrinks it.
+const SNAPSHOT_ROWS: i64 = 500;
 
 fn snapshot_event(jobs: &[QueueJob]) -> Event {
     Event::default()

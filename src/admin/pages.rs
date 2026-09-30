@@ -4,6 +4,7 @@ use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
 use crate::events::QueueJob;
+use crate::scan::pace::{self, Pace, QueueMetrics, recommend};
 use crate::store::browse::{IpFilter, Page, RequestFilter, page_num};
 use crate::store::inspect::{
     FpClaimRow, FpCluster, PortRow, QueueSummary, RequestDetail, ScanSummary,
@@ -24,6 +25,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/admin", get(home))
         .route("/admin/queue", get(queue))
+        .route("/admin/queue/pace", post(queue_pace))
         .route("/admin/requests/{id}", get(request_page))
         .route("/admin/requests/{id}/delete", post(request_delete))
         .route("/admin/ips/{addr}/delete", post(ip_delete))
@@ -73,8 +75,8 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
     render(&HomePage {
         chrome: chrome(),
         q: st.store.queue_summary().await?,
-        workers: st.cfg.scan.max_workers,
-        cap: st.cfg.scan.max_scans_per_hour,
+        workers: st.pace.get().max_workers,
+        cap: st.pace.get().max_scans_per_hour,
         inbox: st.store.inbox().await?.len(),
         jobs: st.store.queue_snapshot(25).await?,
         failed: st.store.recent_failed_jobs(10).await?,
@@ -88,6 +90,8 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
 pub struct QueueFilter {
     pub status: Option<String>,
     pub level: Option<String>,
+    /// Set by the redirect after saving the pace.
+    pub saved: Option<String>,
 }
 
 #[derive(Template)]
@@ -97,6 +101,101 @@ struct QueuePage {
     jobs: Vec<QueueJob>,
     f: QueueFilter,
     statuses: [&'static str; 4],
+    pace: PaceView,
+}
+
+/// Queue growth, current pace and the recommendation, pre-formatted.
+struct PaceView {
+    current: Pace,
+    rec: Pace,
+    rec_differs: bool,
+    paused: bool,
+    growing: bool,
+    m: QueueMetrics,
+    arrival: String,
+    capacity: String,
+    net: String,
+    drain: String,
+    cadence: String,
+    rec_cadence: String,
+    scan_secs: String,
+    scan_secs_measured: bool,
+    oldest: String,
+    arrivals_json: String,
+    completions_json: String,
+    max_workers: usize,
+    max_per_hour: i64,
+    notice: Option<String>,
+    error: Option<String>,
+}
+
+fn fmt_rate(v: f64) -> String {
+    if v >= 10.0 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+fn fmt_secs(secs: f64) -> String {
+    let s = secs.round() as i64;
+    match s {
+        s if s < 90 => format!("{s} s"),
+        s if s < 90 * 60 => format!("{:.0} min", s as f64 / 60.0),
+        s if s < 48 * 3600 => format!("{:.1} h", s as f64 / 3600.0),
+        s => format!("{:.1} days", s as f64 / 86400.0),
+    }
+}
+
+fn cadence(p: Pace) -> String {
+    match p.interval() {
+        Some(d) => format!("one start every {}", fmt_secs(d.as_secs_f64())),
+        None => "paused".into(),
+    }
+}
+
+async fn pace_view(
+    st: &AdminState,
+    notice: Option<String>,
+    error: Option<String>,
+) -> AppResult<PaceView> {
+    let m = st.store.queue_metrics().await?;
+    let current = st.pace.get();
+    let r = recommend(&m, current, st.cfg.scan.timeout_secs);
+    Ok(PaceView {
+        current,
+        rec: r.pace,
+        rec_differs: r.pace != current,
+        paused: current.paused(),
+        growing: r.growing(),
+        arrival: fmt_rate(r.arrival_per_hour),
+        capacity: fmt_rate(r.capacity_per_hour),
+        net: format!(
+            "{}{}",
+            if r.net_growth_per_hour > 0.0 { "+" } else { "" },
+            fmt_rate(r.net_growth_per_hour)
+        ),
+        drain: match r.drain_hours {
+            Some(0.0) => "empty".into(),
+            Some(h) => fmt_secs(h * 3600.0),
+            None => "never at this pace".into(),
+        },
+        cadence: cadence(current),
+        rec_cadence: cadence(r.pace),
+        scan_secs: fmt_secs(r.scan_secs),
+        scan_secs_measured: r.scan_secs_measured,
+        oldest: m
+            .oldest_queued_secs
+            .map(|s| fmt_secs(s as f64))
+            .unwrap_or_else(|| "—".into()),
+        arrivals_json: serde_json::to_string(&m.hourly_arrivals).unwrap_or_default(),
+        completions_json: serde_json::to_string(&m.hourly_completions).unwrap_or_default(),
+        m,
+        max_workers: pace::MAX_WORKERS,
+        max_per_hour: pace::MAX_PER_HOUR,
+        notice,
+        error,
+    })
 }
 
 async fn queue(
@@ -115,12 +214,59 @@ async fn queue(
     {
         jobs.retain(|j| j.level == l);
     }
+    let notice = f
+        .saved
+        .is_some()
+        .then(|| "Pace saved. Workers apply it on their next pass.".to_string());
+    let pace = pace_view(&st, notice, None).await?;
     render(&QueuePage {
         chrome: chrome(),
         jobs,
         f,
         statuses: ["queued", "running", "done", "failed"],
+        pace,
     })
+}
+
+#[derive(serde::Deserialize)]
+struct PaceForm {
+    max_workers: String,
+    max_scans_per_hour: String,
+}
+
+async fn queue_pace(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Form(form): Form<PaceForm>,
+) -> AppResult<Response> {
+    let parsed = form
+        .max_workers
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .zip(form.max_scans_per_hour.trim().parse::<i64>().ok())
+        .map(|(w, h)| Pace {
+            max_workers: w,
+            max_scans_per_hour: h,
+        });
+    let outcome = match parsed {
+        Some(p) => st.pace.set(&st.store, p).await?,
+        None => Err("workers and scans per hour must be whole numbers".into()),
+    };
+    match outcome {
+        Ok(()) => Ok(Redirect::to("/admin/queue?saved=1").into_response()),
+        Err(e) => {
+            let pace = pace_view(&st, None, Some(e)).await?;
+            let body = render(&QueuePage {
+                chrome: chrome(),
+                jobs: st.store.queue_snapshot(500).await?,
+                f: QueueFilter::default(),
+                statuses: ["queued", "running", "done", "failed"],
+                pace,
+            })?;
+            Ok((StatusCode::BAD_REQUEST, body).into_response())
+        }
+    }
 }
 
 #[derive(Template)]
@@ -309,12 +455,14 @@ async fn export_download(
     State(state): State<Arc<AdminState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    // The form submits blank fields; blank means "no filter".
+    let field = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
     let filter = crate::export::ExportFilter {
-        from: q.get("from").cloned(),
-        to: q.get("to").cloned(),
-        ip: q.get("ip").cloned(),
-        label: q.get("label").cloned(),
-        min_severity: q.get("min_severity").and_then(|s| s.parse().ok()),
+        from: field("from").map(|v| crate::store::browse::ts_bound(v, false)),
+        to: field("to").map(|v| crate::store::browse::ts_bound(v, true)),
+        ip: field("ip").map(crate::store::browse::canonical_ip),
+        label: field("label").map(str::to_string),
+        min_severity: field("min_severity").and_then(|s| s.parse().ok()),
     };
     let rows = match state.store.export_requests(&filter).await {
         Ok(r) => r,

@@ -849,6 +849,35 @@ async fn export_download_requires_auth_and_filters() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert!(resp.bytes().await.unwrap().len() > 100);
+
+    // The export form submits every field, blank ones included.
+    let body = client
+        .get(format!(
+            "{base}/admin/export/download?format=csv&from=&to=&ip=&label=&min_severity="
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(body.lines().count(), 3, "header + both rows: {body}");
+
+    // datetime-local bounds: today's minute range must include today's rows.
+    let now = chrono::Utc::now();
+    let from = (now - chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M");
+    let to = now.format("%Y-%m-%dT%H:%M");
+    let body = client
+        .get(format!(
+            "{base}/admin/export/download?format=csv&from={from}&to={to}&ip=&label="
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(body.lines().count(), 3, "rows inside [from, to]: {body}");
 }
 
 #[tokio::test]
@@ -1346,6 +1375,12 @@ async fn bulk_delete_checked_and_filtered() {
         .await
         .unwrap();
     assert!(html.contains("name=\"ids\"") && html.contains("Delete all"));
+    // "Delete selected" carries the filter so its redirect keeps it.
+    let bulk_form = html.split("id=\"bulk-form\"").nth(1).unwrap();
+    assert!(
+        bulk_form.contains("name=\"path\" value=\"/keep\""),
+        "bulk form keeps the filter"
+    );
 
     // Checked rows.
     let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/bulk' LIMIT 2")
@@ -1414,4 +1449,137 @@ async fn bulk_delete_checked_and_filtered() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert!(store.ip_by_addr("203.0.113.50").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn scan_pace_is_adjustable_from_the_queue_page() {
+    let (trap_base, store, dir) = spawn_trap().await;
+    // One queued job so the metrics have something to measure.
+    let _ = reqwest::Client::new()
+        .get(format!("{trap_base}/login?u=admin'%20OR%20'1'='1"))
+        .header("x-forwarded-for", "203.0.113.90")
+        .send()
+        .await
+        .unwrap();
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base, state) = enrolled_admin_client_with_state(store.clone(), cfg).await;
+
+    let page = client
+        .get(format!("{base}/admin/queue"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(html.contains("Save pace"), "pace form on queue page");
+    assert!(html.contains("Recommended:"));
+    assert!(html.contains("Arrivals / h"));
+
+    let resp = client
+        .post(format!("{base}/admin/queue/pace"))
+        .form(&[("max_workers", "4"), ("max_scans_per_hour", "90")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "redirect followed back to the queue");
+    assert!(resp.text().await.unwrap().contains("Pace saved"));
+    let p = state.pace.get();
+    assert_eq!((p.max_workers, p.max_scans_per_hour), (4, 90));
+    // Persisted: a fresh load (as on restart) sees the admin's values.
+    let reloaded = peephole::scan::pace::SharedPace::load(&store, &state.cfg.scan)
+        .await
+        .unwrap()
+        .get();
+    assert_eq!(reloaded, p);
+
+    let bad = client
+        .post(format!("{base}/admin/queue/pace"))
+        .form(&[("max_workers", "999"), ("max_scans_per_hour", "90")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    assert!(bad.text().await.unwrap().contains("Pace not saved"));
+    assert_eq!(state.pace.get(), p, "invalid input leaves the pace alone");
+
+    // Without a session the endpoint is closed.
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .post(format!("{base}/admin/queue/pace"))
+        .form(&[("max_workers", "1"), ("max_scans_per_hour", "1")])
+        .send()
+        .await
+        .unwrap();
+    assert!(anon.status().is_redirection() || anon.status() == 401);
+    assert_eq!(state.pace.get(), p);
+}
+
+/// Regression: the page rendered a fresh token instead of the stored one, so
+/// the browser's /collect never matched a request and /panel stayed on
+/// "collecting browser characteristics…" forever.
+#[tokio::test]
+async fn trap_page_token_links_collect_to_panel() {
+    let (base, store, _dir) = spawn_trap().await;
+    let client = reqwest::Client::new();
+    let html = client
+        .get(format!("{base}/some-page"))
+        .header("x-forwarded-for", "203.0.113.51")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let token = html
+        .split("window.PEEPHOLE_TOKEN = \"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("token in page")
+        .to_string();
+    let stored: String =
+        sqlx::query_scalar("SELECT page_token FROM requests ORDER BY id DESC LIMIT 1")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(token, stored, "page shows the token that was stored");
+
+    let pending = client
+        .get(format!("{base}/panel?token={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pending.status(),
+        202,
+        "no fingerprint yet: tells the page to retry"
+    );
+
+    let payload = serde_json::json!({
+        "token": token,
+        "attrs": {"canvas":"abc","webgl_renderer":"Mesa","platform":"Linux","webdriver":false},
+        "behavior": {"mouse_events": 5}
+    });
+    client
+        .post(format!("{base}/collect"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    let linked: Option<i64> =
+        sqlx::query_scalar("SELECT request_id FROM fingerprints ORDER BY id DESC LIMIT 1")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert!(linked.is_some(), "fingerprint linked to the page view");
+    let panel = client
+        .get(format!("{base}/panel?token={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(panel.status(), 200);
+    let panel = panel.text().await.unwrap();
+    assert!(panel.contains("Mesa"));
+    assert!(!panel.contains("collecting browser characteristics"));
 }

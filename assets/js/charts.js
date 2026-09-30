@@ -36,7 +36,8 @@
     var byKey = {};
     buckets.forEach(function (b) { byKey[b.ts] = b.count; });
     var out = [], now = new Date(), stepMs = spec[1] ? 3600e3 : 86400e3;
-    for (var i = spec[0] - 1; i >= 0; i--) {
+    // A rolling window touches n+1 calendar buckets (the oldest is partial).
+    for (var i = spec[0]; i >= 0; i--) {
       var k = bucketKey(new Date(now.getTime() - i * stepMs), spec[1]);
       out.push({ ts: k, count: byKey[k] || 0 });
     }

@@ -274,7 +274,7 @@ fn request_filter_sql(f: &RequestFilter) -> (String, Vec<String>) {
     let mut binds: Vec<String> = vec![];
     if let Some(v) = nonempty(&f.ip) {
         sql.push_str(" AND i.ip = ?");
-        binds.push(v);
+        binds.push(canonical_ip(&v));
     }
     if let Some(v) = nonempty(&f.path) {
         sql.push_str(" AND (r.path LIKE ? OR r.query LIKE ?)");
@@ -301,16 +301,36 @@ fn request_filter_sql(f: &RequestFilter) -> (String, Vec<String>) {
         sql.push_str(" AND i.asn = ?");
         binds.push(v.to_string());
     }
-    // datetime-local inputs send `T`; SQLite stores a space.
     if let Some(v) = nonempty(&f.from) {
         sql.push_str(" AND r.ts >= ?");
-        binds.push(v.replace('T', " "));
+        binds.push(ts_bound(&v, false));
     }
     if let Some(v) = nonempty(&f.to) {
         sql.push_str(" AND r.ts <= ?");
-        binds.push(v.replace('T', " "));
+        binds.push(ts_bound(&v, true));
     }
     (sql, binds)
+}
+
+/// IPs are stored in canonical form (`IpAddr::to_string`); match user input
+/// like `2001:DB8:0::1` against that. Non-IPs pass through unchanged.
+pub fn canonical_ip(v: &str) -> String {
+    v.trim()
+        .parse::<IpAddr>()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|_| v.trim().to_string())
+}
+
+/// A `datetime-local` value (`2026-09-30T12:00`) as a bound on SQLite's
+/// `YYYY-MM-DD HH:MM:SS` timestamps. Upper bounds cover their whole last
+/// minute (or day, for a bare date), so `to=12:00` includes 12:00:59.
+pub fn ts_bound(v: &str, upper: bool) -> String {
+    let v = v.trim().replace('T', " ");
+    match (upper, v.len()) {
+        (true, 10) => format!("{v} 23:59:59"),
+        (true, 16) => format!("{v}:59"),
+        _ => v,
+    }
 }
 
 /// Upper bound for one unpaged id lookup (bulk delete works in rounds of this size).
@@ -509,6 +529,26 @@ impl Store {
             q = q.bind(b);
         }
         Ok(Page::from_rows(q.fetch_all(&self.pool).await?, page))
+    }
+}
+
+#[cfg(test)]
+mod ts_tests {
+    #[test]
+    fn ts_bounds_match_sqlite_format() {
+        use super::ts_bound;
+        assert_eq!(ts_bound("2026-09-30T12:00", false), "2026-09-30 12:00");
+        assert_eq!(ts_bound("2026-09-30T12:00", true), "2026-09-30 12:00:59");
+        assert_eq!(ts_bound("2026-09-30", true), "2026-09-30 23:59:59");
+        assert_eq!(ts_bound("2026-09-30T12:00:05", true), "2026-09-30 12:00:05");
+    }
+
+    #[test]
+    fn ip_filter_input_is_canonicalised() {
+        use super::canonical_ip;
+        assert_eq!(canonical_ip(" 2001:DB8:0::1 "), "2001:db8::1");
+        assert_eq!(canonical_ip("203.0.113.1"), "203.0.113.1");
+        assert_eq!(canonical_ip("not-an-ip"), "not-an-ip");
     }
 }
 

@@ -108,14 +108,20 @@
       tr.appendChild(cell("mono", esc(j.error)));
       return tr;
     };
+    // The page's status/level filter applies to live rows too.
+    var fStatus = qt.getAttribute("data-filter-status") || "", fLevel = qt.getAttribute("data-filter-level") || "";
+    var matches = function (j) { return (!fStatus || j.status === fStatus) && (!fLevel || String(j.level) === fLevel); };
     var apply = function (j) {
+      var existing = tbody.querySelector('[data-job="' + j.id + '"]');
+      if (!matches(j)) { if (existing) existing.remove(); return; }
       var empty = tbody.querySelector("[data-empty]"); if (empty) empty.remove();
-      var existing = tbody.querySelector('[data-job="' + j.id + '"]'), fresh = row(j);
+      var fresh = row(j);
       if (existing) tbody.replaceChild(fresh, existing); else tbody.insertBefore(fresh, tbody.firstChild);
       while (tbody.children.length > limit) tbody.removeChild(tbody.lastChild);
     };
     var snapshot = function (jobs) {
       tbody.innerHTML = "";
+      jobs = jobs.filter(matches);
       jobs.slice(0, limit).forEach(function (j) { tbody.appendChild(row(j)); });
       if (!jobs.length) { var tr = document.createElement("tr"); tr.setAttribute("data-empty", ""); var td = cell("empty", "Queue empty."); td.setAttribute("colspan", "7"); tr.appendChild(td); tbody.appendChild(tr); }
     };

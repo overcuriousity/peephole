@@ -73,7 +73,7 @@ async fn record_and_respond(
     raw_headers: &[(String, String)],
     body: Option<Bytes>,
     is_fp_claim: bool,
-) -> Result<(i64, crate::classify::Verdict, i64)> {
+) -> Result<Recorded> {
     let ip_row = state.store.upsert_ip(ip).await?;
 
     // Enrichment (every IP, every request — spec §4).
@@ -130,7 +130,19 @@ async fn record_and_respond(
     {
         state.notifier.publish(job);
     }
-    Ok((request_id, verdict, ip_row.id))
+    Ok(Recorded {
+        request_id,
+        ip_id: ip_row.id,
+        page_token,
+    })
+}
+
+/// What the trap stored for one request.
+struct Recorded {
+    request_id: i64,
+    ip_id: i64,
+    /// Rendered into the trap page so `/collect` can link the fingerprint.
+    page_token: String,
 }
 
 fn header_pairs(h: &HeaderMap) -> Vec<(String, String)> {
@@ -165,9 +177,9 @@ async fn trap_handler(
     )
     .await
     {
-        Ok((_rid, _verdict, _ip_id)) => (
+        Ok(rec) => (
             StatusCode::NOT_FOUND,
-            Html(pages::trap_page(&uuid::Uuid::new_v4().to_string())),
+            Html(pages::trap_page(&rec.page_token)),
         )
             .into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response(),
@@ -199,11 +211,11 @@ async fn claim_handler(
         headers: raw.clone(),
         body: None,
     };
-    if let Ok((rid, _v, ip_id)) = record_and_respond(&state, ip, &view, &raw, None, true).await {
+    if let Ok(rec) = record_and_respond(&state, ip, &view, &raw, None, true).await {
         let email = form.email.filter(|e| !e.trim().is_empty());
         let _ = state
             .store
-            .insert_fp_claim(ip_id, rid, email.as_deref(), &ua)
+            .insert_fp_claim(rec.ip_id, rec.request_id, email.as_deref(), &ua)
             .await;
     }
     Html(pages::claim_confirmation()).into_response()
@@ -291,11 +303,15 @@ async fn panel_handler(
             Html(render_panel_scrambled(&pairs)).into_response()
         }
         // No fingerprint yet: still scrambled markup (bot-unfriendly, spec §8.3).
-        _ => Html(render_panel_scrambled(&[(
-            "Status".into(),
-            "collecting browser characteristics…".into(),
-        )]))
-        .into_response(),
+        // 202 tells the page to poll again; the beacon may still be in flight.
+        _ => (
+            StatusCode::ACCEPTED,
+            Html(render_panel_scrambled(&[(
+                "Status".into(),
+                "collecting browser characteristics…".into(),
+            )])),
+        )
+            .into_response(),
     }
 }
 
