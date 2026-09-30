@@ -38,4 +38,18 @@ jobs:
       - name: shellcheck install.sh
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
-          shellcheck install.sh
+          shellcheck install.sh tests/install-smoke.sh
+
+  installer:
+    name: install.sh smoke (apt container)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - name: build release binary (stamped like the smoke test's first tarball)
+        run: PEEPHOLE_VERSION=test1 cargo build --release --locked
+      # The container's glibc must be >= the build host's, so use the runner's own release.
+      - name: run installer smoke test in ubuntu:24.04
+        run: docker run --rm -v "$PWD":/src -w /src ubuntu:24.04 bash tests/install-smoke.sh
