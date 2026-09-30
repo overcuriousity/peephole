@@ -74,10 +74,13 @@ pub async fn run_workers(
                     let store2 = store.clone();
                     let notifier2 = notifier.clone();
                     let nmap = nmap_path.clone();
-                    let timeout = Duration::from_secs(cfg.scan.timeout_secs);
+                    let timeout = Duration::from_secs(p.timeout_secs);
                     joinset.spawn(async move {
+                        // kill_on_drop: when the timeout drops this future, nmap
+                        // must die with it, not linger behind a freed worker slot.
                         let run = tokio::process::Command::new(nmap)
                             .args(&argv)
+                            .kill_on_drop(true)
                             .stdout(std::process::Stdio::piped())
                             .stderr(std::process::Stdio::null())
                             .output();
@@ -289,6 +292,7 @@ license_key = "k"
         let p = pace::SharedPace::new(pace::Pace {
             max_workers: cfg.scan.max_workers,
             max_scans_per_hour: 3600,
+            timeout_secs: 60,
         });
         let pool = tokio::spawn(run_workers(
             store.clone(),
@@ -301,6 +305,78 @@ license_key = "k"
         wait_for_scans(&store, jobs).await;
         tx.send(true).unwrap();
         pool.await.unwrap();
+    }
+
+    /// Regression: on timeout the output future was dropped but the nmap
+    /// child kept running, so orphans piled up behind freed worker slots.
+    #[tokio::test]
+    async fn timed_out_nmap_is_killed_and_job_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let fake = dir.path().join("slow-nmap");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+
+        let cfg = test_config(dir.path());
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = store
+            .upsert_ip("198.51.100.99".parse().unwrap())
+            .await
+            .unwrap();
+        store.enqueue_scan(ip.id, 1, 24).await.unwrap();
+        let p = pace::SharedPace::new(pace::Pace {
+            max_workers: 1,
+            max_scans_per_hour: 3600,
+            timeout_secs: 1,
+        });
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let pool = tokio::spawn(run_workers(
+            store.clone(),
+            cfg,
+            p,
+            fake,
+            rx,
+            crate::events::Notifier::new(),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let err = loop {
+            let e: Option<String> =
+                sqlx::query_scalar("SELECT error FROM scan_jobs WHERE status = 'failed'")
+                    .fetch_optional(&store.pool)
+                    .await
+                    .unwrap()
+                    .flatten();
+            if let Some(e) = e {
+                break e;
+            }
+            assert!(std::time::Instant::now() < deadline, "job never timed out");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        assert!(err.contains("timeout"), "{err}");
+        tx.send(true).unwrap();
+        pool.await.unwrap();
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        let proc = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+        for _ in 0..20 {
+            // A killed child may linger as a zombie until reaped; check state.
+            let alive = std::fs::read_to_string(proc.join("stat"))
+                .map(|s| s.split_whitespace().nth(2).is_none_or(|st| st != "Z"))
+                .unwrap_or(false);
+            if !alive {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("nmap child {} still running after timeout", pid.trim());
     }
 
     #[tokio::test]

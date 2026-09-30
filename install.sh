@@ -187,7 +187,7 @@ license_key = "${MAXMIND_LICENSE_KEY}"
 
 [scan]
 max_workers = 2            # concurrent nmap subprocesses
-timeout_secs = 900         # per-scan wall-clock timeout
+timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admin queue page)
 rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
 max_scans_per_hour = 30    # global rate cap; excess jobs stay queued
 never_scan = ["192.168.0.0/16"] # CIDRs never counter-scanned (own infra, monitoring)

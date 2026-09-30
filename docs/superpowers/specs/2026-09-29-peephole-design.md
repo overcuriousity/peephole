@@ -120,10 +120,10 @@ Scan (worker pool):
 | Level | Name        | Trigger example                                   | nmap profile (indicative)                        |
 |-------|-------------|---------------------------------------------------|--------------------------------------------------|
 | 0     | none        | Tor exit node, allowlisted CIDR                   | —                                                |
-| 1     | superficial | single plain 4xx probe                            | `-sS -T2 --top-ports 100`                        |
-| 2     | standard    | repeated distinct path scanning, scanner UA       | `-sS -sV -T3 --top-ports 1000`                   |
-| 3     | deep        | trap-form interaction, generic injection patterns | `-sS -sV -O -T3 -p- --script=default`            |
-| 4     | intensive   | clear exploit payload (SQLi/RCE/traversal sig)    | `-sS -sV -O -A -T4 -p- --script=default,intrusive` |
+| 1     | superficial | single plain 4xx probe                            | `-Pn -sS -T2 --top-ports 100` |
+| 2     | standard    | repeated distinct path scanning, scanner UA       | `-Pn -sS -sV -T3 --top-ports 1000` |
+| 3     | deep        | trap-form interaction, generic injection patterns | `-Pn -sS -sV -O -T4 --max-retries 2 -p- --script=default` |
+| 4     | intensive   | clear exploit payload (SQLi/RCE/traversal sig)    | `-Pn -sS -sV -O -A -T4 --max-retries 2 -p- --script=default,intrusive` |
 
 Exact argv per level lives in `config.toml` (sensible defaults above, operator
 editable; non-silent/faster timing allowed at higher levels).

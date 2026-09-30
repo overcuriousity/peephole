@@ -5,6 +5,7 @@
   <span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></div>
 {% if let Some(n) = pace.notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
 {% if let Some(e) = pace.error %}<div class="banner banner-warning">Pace not saved: {{ e }}</div>{% endif %}
+{% if pace.timeouts_high %}<div class="banner banner-warning">{{ pace.timeout_share }} of the scans finished in the last 24 h hit the {{ pace.timeout_min }} min timeout. The recommendation below raises it to {{ pace.rec_timeout_min }} min.</div>{% endif %}
 {% if pace.growing %}<div class="banner banner-warning">The queue grows by about {{ pace.net }} jobs per hour at the current pace. Apply the recommendation below or raise the pace.</div>{% endif %}
 <section class="card pace" id="pace">
   <div class="card-head"><h2>Pace</h2><span class="muted">{% if pace.paused %}scanning paused{% else %}{{ pace.cadence }}{% endif %}</span></div>
@@ -14,6 +15,7 @@
     <div class="tile"><span class="label">Capacity / h</span><div class="value">{{ pace.capacity }}</div><div class="hint">{{ pace.m.completed_1h }} finished last hour · {{ pace.m.completed_24h }} last 24 h</div></div>
     <div class="tile"><span class="label">Net growth / h</span><div class="value{% if pace.growing %} brand{% endif %}">{{ pace.net }}</div><div class="hint">backlog drains: {{ pace.drain }}</div></div>
     <div class="tile"><span class="label">Scan duration</span><div class="value">{{ pace.scan_secs }}</div><div class="hint">{% if pace.scan_secs_measured %}mean of the last 7 days{% else %}assumed, nothing measured yet{% endif %}</div></div>
+    <div class="tile"><span class="label">Failed · 24 h</span><div class="value{% if pace.m.failed_24h > 0 %} brand{% endif %}">{{ pace.m.failed_24h }}</div><div class="hint">{{ pace.m.timeouts_24h }} timeouts ({{ pace.timeout_share }} of finished)</div></div>
   </div>
   <div class="grid-2 pace-trend">
     <div><span class="label">Queued per hour · last 24 h</span><div class="sparkline" data-sparkline="{{ pace.arrivals_json }}"></div></div>
@@ -23,17 +25,20 @@
     <form class="filters pace-form" method="post" action="/admin/queue/pace">
       <label>Workers <input type="number" name="max_workers" min="0" max="{{ pace.max_workers }}" value="{{ pace.current.max_workers }}" required></label>
       <label>Scans per hour <input type="number" name="max_scans_per_hour" min="0" max="{{ pace.max_per_hour }}" value="{{ pace.current.max_scans_per_hour }}" required></label>
+      <label>Timeout (min) <input type="number" name="timeout_minutes" min="{{ pace.min_timeout_min }}" max="{{ pace.max_timeout_min }}" step="any" value="{{ pace.timeout_min }}" required></label>
       <button class="btn btn-primary" type="submit">Save pace</button>
-      <p class="muted pace-note">0 in either field pauses scanning. Starts are spaced evenly over the hour.</p>
+      <p class="muted pace-note">0 workers or 0 scans per hour pauses scanning. Starts are spaced evenly over the hour. nmap is killed when it exceeds the timeout.</p>
     </form>
     <form class="pace-rec" method="post" action="/admin/queue/pace">
       <input type="hidden" name="max_workers" value="{{ pace.rec.max_workers }}">
       <input type="hidden" name="max_scans_per_hour" value="{{ pace.rec.max_scans_per_hour }}">
-      <p><strong>Recommended:</strong> {{ pace.rec.max_workers }} workers, {{ pace.rec.max_scans_per_hour }} scans per hour ({{ pace.rec_cadence }}).</p>
-      <p class="muted">Covers the arrival rate with 25% headroom and clears the current backlog within a day.</p>
+      <input type="hidden" name="timeout_minutes" value="{{ pace.rec_timeout_min }}">
+      <p><strong>Recommended:</strong> {{ pace.rec.max_workers }} workers, {{ pace.rec.max_scans_per_hour }} scans per hour ({{ pace.rec_cadence }}), {{ pace.rec_timeout_min }} min timeout.</p>
+      <p class="muted">Covers the arrival rate with 25% headroom and clears the current backlog within a day. Raises the timeout by half when more than 10% of scans hit it.</p>
       {% if pace.rec_differs %}<button class="btn" type="submit">Apply recommendation</button>{% else %}<p class="muted">The current pace matches.</p>{% endif %}
     </form>
   </div>
+  {% if pace.m.failed_24h > 0 %}<form method="post" action="/admin/queue/retry-failed" class="pace-retry"><button class="btn btn-sm" type="submit">Retry failed scans</button> <span class="muted">Requeues the latest failed job per IP from the last 7 days.</span></form>{% endif %}
 </section>
 <form class="filters" method="get" action="/admin/queue">
   <label>Status <select name="status"><option value="">any</option>

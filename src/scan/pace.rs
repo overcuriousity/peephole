@@ -20,8 +20,15 @@ const HEADROOM: f64 = 1.25;
 /// Horizon over which a recommendation drains the current backlog.
 const DRAIN_HOURS: f64 = 24.0;
 
+/// Per-scan wall-clock limit bounds settable from the admin UI.
+pub const MIN_TIMEOUT: u64 = 60;
+pub const MAX_TIMEOUT: u64 = 4 * 3600;
+/// Share of finished scans that may time out before a longer limit is advised.
+const TIMEOUT_SHARE: f64 = 0.10;
+
 const KEY_WORKERS: &str = "scan.max_workers";
 const KEY_PER_HOUR: &str = "scan.max_scans_per_hour";
+const KEY_TIMEOUT: &str = "scan.timeout_secs";
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct Pace {
@@ -29,6 +36,8 @@ pub struct Pace {
     pub max_workers: usize,
     /// Scans started per rolling hour; starts are spaced evenly. 0 pauses.
     pub max_scans_per_hour: i64,
+    /// Wall-clock limit per nmap run; the process is killed after it.
+    pub timeout_secs: u64,
 }
 
 impl Pace {
@@ -36,6 +45,7 @@ impl Pace {
         Self {
             max_workers: c.max_workers,
             max_scans_per_hour: c.max_scans_per_hour,
+            timeout_secs: c.timeout_secs,
         }
     }
 
@@ -56,6 +66,11 @@ impl Pace {
         if !(0..=MAX_PER_HOUR).contains(&self.max_scans_per_hour) {
             return Err(format!(
                 "scans per hour must be between 0 and {MAX_PER_HOUR}"
+            ));
+        }
+        if !(MIN_TIMEOUT..=MAX_TIMEOUT).contains(&self.timeout_secs) {
+            return Err(format!(
+                "timeout must be between {MIN_TIMEOUT} and {MAX_TIMEOUT} seconds"
             ));
         }
         Ok(())
@@ -88,6 +103,13 @@ impl SharedPace {
         {
             p.max_scans_per_hour = v;
         }
+        if let Some(v) = store
+            .setting_get(KEY_TIMEOUT)
+            .await?
+            .and_then(|v| v.parse().ok())
+        {
+            p.timeout_secs = v;
+        }
         if p.validate().is_err() {
             p = Pace::from_config(c);
         }
@@ -109,6 +131,9 @@ impl SharedPace {
         store
             .setting_set(KEY_PER_HOUR, &p.max_scans_per_hour.to_string())
             .await?;
+        store
+            .setting_set(KEY_TIMEOUT, &p.timeout_secs.to_string())
+            .await?;
         *self.0.write().unwrap() = p;
         Ok(Ok(()))
     }
@@ -123,9 +148,12 @@ pub struct QueueMetrics {
     pub arrivals_24h: i64,
     pub completed_1h: i64,
     pub completed_24h: i64,
+    /// Failed / timed-out jobs among `completed_24h`.
+    pub failed_24h: i64,
+    pub timeouts_24h: i64,
     /// Hours the 24h window actually covers (a fresh install has less), >= 1.
     pub observed_hours: f64,
-    /// Mean wall-clock seconds of scans finished in the last 7 days.
+    /// Mean seconds a job held a worker (done, failed or timed out), last 7 days.
     pub avg_scan_secs: Option<f64>,
     pub oldest_queued_secs: Option<i64>,
     /// Per hour, oldest first, 24 entries.
@@ -145,6 +173,8 @@ pub struct Recommendation {
     pub drain_hours: Option<f64>,
     pub scan_secs: f64,
     pub scan_secs_measured: bool,
+    /// Share of jobs finished in the last 24h that hit the timeout.
+    pub timeout_share: f64,
     pub pace: Pace,
 }
 
@@ -169,13 +199,29 @@ pub fn capacity(p: Pace, scan_secs: f64) -> f64 {
 
 /// Size the pace to absorb arrivals with headroom and drain the backlog
 /// within [`DRAIN_HOURS`], never below one scan per hour and one worker.
-pub fn recommend(m: &QueueMetrics, current: Pace, timeout_secs: u64) -> Recommendation {
-    let scan_secs = m
+/// When more than [`TIMEOUT_SHARE`] of recent scans hit the limit, the
+/// timeout is raised by half (rounded up to a minute) and the worker count
+/// is sized for scans that may take that long.
+pub fn recommend(m: &QueueMetrics, current: Pace) -> Recommendation {
+    let timeout_share = if m.completed_24h > 0 {
+        m.timeouts_24h as f64 / m.completed_24h as f64
+    } else {
+        0.0
+    };
+    let timeout_secs = if m.completed_24h >= 3 && timeout_share > TIMEOUT_SHARE {
+        (current.timeout_secs * 3 / 2).div_ceil(60) * 60
+    } else {
+        current.timeout_secs
+    }
+    .clamp(MIN_TIMEOUT, MAX_TIMEOUT);
+    let measured = m
         .avg_scan_secs
         .unwrap_or(DEFAULT_SCAN_SECS)
-        .clamp(1.0, timeout_secs.max(1) as f64);
+        .clamp(1.0, current.timeout_secs.max(1) as f64);
+    // Timed-out scans would have run longer: budget them at the new limit.
+    let scan_secs = measured * (1.0 - timeout_share) + timeout_secs as f64 * timeout_share;
     let arrival = m.arrivals_24h as f64 / m.observed_hours.clamp(1.0, 24.0);
-    let cap_now = capacity(current, scan_secs);
+    let cap_now = capacity(current, measured);
     let net = arrival - cap_now;
     let drain_hours = match m.backlog {
         0 => Some(0.0),
@@ -195,9 +241,11 @@ pub fn recommend(m: &QueueMetrics, current: Pace, timeout_secs: u64) -> Recommen
         drain_hours,
         scan_secs,
         scan_secs_measured: m.avg_scan_secs.is_some(),
+        timeout_share,
         pace: Pace {
             max_workers: workers,
             max_scans_per_hour: per_hour,
+            timeout_secs,
         },
     }
 }
@@ -218,6 +266,7 @@ mod tests {
     const P: Pace = Pace {
         max_workers: 2,
         max_scans_per_hour: 30,
+        timeout_secs: 900,
     };
 
     #[test]
@@ -239,7 +288,7 @@ mod tests {
     #[test]
     fn keeps_up_with_arrivals_and_drains_backlog_in_a_day() {
         // 240 arrivals/day = 10/h; backlog 480 → +20/h; ×1.25 headroom on arrivals.
-        let r = recommend(&m(480, 240, Some(300.0)), P, 900);
+        let r = recommend(&m(480, 240, Some(300.0)), P);
         assert_eq!(r.arrival_per_hour, 10.0);
         assert_eq!(r.pace.max_scans_per_hour, 33); // ceil(12.5 + 20)
         assert_eq!(r.pace.max_workers, 3); // 33 × 300s / 3600 = 2.75
@@ -251,7 +300,7 @@ mod tests {
 
     #[test]
     fn growing_queue_never_drains() {
-        let r = recommend(&m(100, 24 * 50, None), P, 900);
+        let r = recommend(&m(100, 24 * 50, None), P);
         assert!(r.growing());
         assert_eq!(r.drain_hours, None);
         assert_eq!(r.scan_secs, DEFAULT_SCAN_SECS);
@@ -260,12 +309,13 @@ mod tests {
 
     #[test]
     fn idle_queue_recommends_the_minimum() {
-        let r = recommend(&m(0, 0, None), P, 900);
+        let r = recommend(&m(0, 0, None), P);
         assert_eq!(
             r.pace,
             Pace {
                 max_workers: 1,
-                max_scans_per_hour: 1
+                max_scans_per_hour: 1,
+                timeout_secs: 900,
             }
         );
         assert_eq!(r.drain_hours, Some(0.0));
@@ -275,17 +325,41 @@ mod tests {
     fn short_observation_window_is_not_diluted() {
         let mut q = m(0, 20, Some(60.0));
         q.observed_hours = 2.0;
-        assert_eq!(recommend(&q, P, 900).arrival_per_hour, 10.0);
+        assert_eq!(recommend(&q, P).arrival_per_hour, 10.0);
     }
 
     #[test]
     fn workers_are_capped() {
-        let r = recommend(&m(0, 24 * 1000, Some(900.0)), P, 900);
+        let r = recommend(&m(0, 24 * 1000, Some(900.0)), P);
         assert_eq!(r.pace.max_workers, MAX_WORKERS);
     }
 
     #[test]
+    fn frequent_timeouts_raise_the_limit_and_the_workers() {
+        let mut q = m(0, 24 * 10, Some(300.0));
+        q.completed_24h = 20;
+        q.timeouts_24h = 5; // 25% hit the 900 s limit
+        let r = recommend(&q, P);
+        assert_eq!(r.timeout_share, 0.25);
+        assert_eq!(r.pace.timeout_secs, 1380); // 1350 rounded up to a minute
+        // 75% × 300 s + 25% × 1380 s = 570 s per job; 13/h needs 3 workers.
+        assert_eq!(r.scan_secs, 570.0);
+        assert_eq!(r.pace.max_workers, 3);
+
+        q.timeouts_24h = 1; // 5%: below the threshold
+        assert_eq!(recommend(&q, P).pace.timeout_secs, 900);
+    }
+
+    #[test]
     fn validation_and_interval() {
+        assert!(
+            Pace {
+                timeout_secs: 30,
+                ..P
+            }
+            .validate()
+            .is_err()
+        );
         assert!(
             Pace {
                 max_workers: 17,
