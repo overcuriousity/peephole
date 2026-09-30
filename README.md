@@ -43,8 +43,20 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
        PEEPHOLE_DOMAIN=peephole.example.net bash
 ```
 
-Re-running the installer upgrades the binary and rules while leaving your
-existing config untouched.
+Re-running the installer upgrades in place: it skips when the installed
+version already matches, validates your existing config with the new binary
+before restarting, waits for `/healthz`, and rolls back to the previous
+binary if the service does not come up. Shipped rule files are treated like
+conffiles — a rule you edited is kept and the new upstream version is placed
+beside it as `<name>.toml.new`. Your config is never rewritten.
+
+The installer also drops `deploy/nginx.example.conf` into `/etc/peephole/`.
+Use it as the basis for the TLS vhost: the live scan queue is streamed over
+Server-Sent Events, which needs `proxy_buffering off` on `/admin/api/queue`
+or the queue never updates behind nginx.
+
+Published binaries are built on Ubuntu 22.04 and run on Debian 12 / Ubuntu
+22.04 or newer (glibc ≥ 2.35).
 
 ## Architecture
 
@@ -61,9 +73,20 @@ internet ──► nginx (TLS) ──► peephole admin listener  127.0.0.1:8443
   MaxMind GeoLite2 + Tor exit list, queues counter-scans.
 - **Scanner** — rate-limited nmap counter-scans of caught scanners
   (configurable levels, cooldowns, and never-scan CIDRs).
-- **Admin dashboard** — FIDO2-only authentication (no passwords), wall-of-shame
-  dashboard, request/IP detail views, live scan queue over SSE, and exports
-  (CSV, Timesketch JSONL, Parquet).
+- **Wall of shame** (public, no login) — aggregate statistics per time range,
+  a choropleth map, a searchable IP directory (exact / prefix / CIDR), per-IP
+  request history and request search. No payloads, headers, fingerprints or
+  scan results are ever public.
+- **Admin area** (FIDO2 only, no passwords, under `/admin`) — live scan queue
+  over Server-Sent Events, counter-scan results with ports and raw nmap XML,
+  raw request headers and bodies, fingerprint correlation across IPs, the
+  false-positive inbox, exports (CSV, Timesketch JSONL, Parquet), key
+  management, and deletion of records (single, checked, or everything
+  matching a filter).
+
+Both sites follow the system light/dark preference (with a manual toggle),
+ship their fonts, scripts and map inside the binary, and make no external
+requests.
 
 ## Configuration
 
@@ -77,9 +100,14 @@ them without recompiling; see [`rules/`](rules/) for the shipped defaults.
 ## Operations
 
 ```sh
-systemctl status peephole     # service status
-journalctl -u peephole -f     # logs (incl. FIDO2 enrollment instructions)
+systemctl status peephole                     # service status
+journalctl -u peephole -f                     # logs (incl. FIDO2 enrollment instructions)
+peephole --version                            # installed build
+peephole check-config /etc/peephole/config.toml   # validate config, rules and nmap
 ```
+
+Additional FIDO2 keys can be enrolled from **Admin → Keys** while logged in;
+the one-time setup token is only needed for the very first key.
 
 ## Building from source
 
@@ -90,8 +118,11 @@ cargo test
 cargo build --release
 ```
 
-Every push to `master` runs CI (fmt, clippy, tests) and publishes a fresh
-binary to the rolling
+The world map served on the wall of shame is a generated asset; see
+[`assets/README.md`](assets/README.md) for provenance and how to regenerate it.
+
+Every push to `master` runs CI (fmt, clippy, tests, an installer smoke test
+in a container) and publishes a fresh binary to the rolling
 [`latest` prerelease](https://github.com/overcuriousity/peephole/releases/tag/latest).
 
 ## License
