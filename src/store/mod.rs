@@ -1,6 +1,8 @@
 pub mod auth;
 pub mod browse;
+pub mod delete;
 pub mod fingerprints;
+pub mod inspect;
 pub mod requests;
 pub mod scans;
 pub mod stats;
@@ -83,67 +85,6 @@ impl Store {
             requests_1h: reqs as u32,
             last_scan_level: last_level.unwrap_or(0) as u8,
         })
-    }
-}
-
-pub struct FpClaimRow {
-    pub ts: String,
-    pub ip: String,
-    pub contact_email: Option<String>,
-    pub user_agent: String,
-}
-
-impl Store {
-    pub async fn request_detail(
-        &self,
-        id: i64,
-    ) -> anyhow::Result<Option<(crate::store::requests::RequestRow, String, String)>> {
-        let Some(row) = self.request_by_id(id).await? else {
-            return Ok(None);
-        };
-        let headers: Vec<(String, String)> =
-            serde_json::from_str(&row.headers_json).unwrap_or_default();
-        let headers_pretty = headers
-            .iter()
-            .map(|(k, v)| format!("{k}: {v}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let body_pretty = row
-            .body
-            .as_ref()
-            .map(|b| {
-                String::from_utf8_lossy(b)
-                    .chars()
-                    .take(16384)
-                    .collect::<String>()
-            })
-            .unwrap_or_default();
-        Ok(Some((row, headers_pretty, body_pretty)))
-    }
-
-    pub async fn inbox(&self) -> anyhow::Result<Vec<FpClaimRow>> {
-        Ok(
-            sqlx::query_as::<_, (String, String, Option<String>, String)>(
-                "SELECT c.ts, i.ip, c.contact_email, c.user_agent
-             FROM fp_claims c JOIN ips i ON c.ip_id = i.id ORDER BY c.id DESC",
-            )
-            .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .map(|(ts, ip, contact_email, user_agent)| FpClaimRow {
-                ts,
-                ip,
-                contact_email,
-                user_agent,
-            })
-            .collect(),
-        )
-    }
-
-    pub async fn list_credential_labels(&self) -> anyhow::Result<Vec<(String, String, String)>> {
-        Ok(sqlx::query_as(
-            "SELECT hex(cred_id), COALESCE(label,'(unnamed)'), created_at FROM credentials ORDER BY id")
-            .fetch_all(&self.pool).await?)
     }
 }
 

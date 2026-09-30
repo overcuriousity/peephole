@@ -64,15 +64,21 @@ async fn request_detail_page(
 ) -> Html<String> {
     let d = state.store.request_detail(id).await.ok().flatten();
     Html(match d {
-        Some((req, headers_pretty, body_pretty)) => {
+        Some(d) => {
+            let headers_pretty = d
+                .headers
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join("\n");
             include_str!("../../templates/request_detail.html")
-                .replace("__METHOD__", &esc(&req.method))
-                .replace("__PATH__", &esc(&req.path))
-                .replace("__TS__", &esc(&req.ts.to_string()))
-                .replace("__LABELS__", &esc(&req.labels_json))
-                .replace("__SEVERITY__", &req.severity.to_string())
+                .replace("__METHOD__", &esc(&d.row.method))
+                .replace("__PATH__", &esc(&d.row.path))
+                .replace("__TS__", &esc(&d.row.ts.to_string()))
+                .replace("__LABELS__", &esc(&d.row.labels_json))
+                .replace("__SEVERITY__", &d.row.severity.to_string())
                 .replace("__HEADERS__", &esc(&headers_pretty))
-                .replace("__BODY__", &esc(&body_pretty))
+                .replace("__BODY__", &esc(&d.body_text))
         }
         None => "<p>not found</p>".to_string(),
     })

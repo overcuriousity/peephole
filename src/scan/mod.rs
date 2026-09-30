@@ -66,30 +66,56 @@ pub async fn run_workers(
                             Ok(Ok(out)) if out.status.success() => {
                                 match nmap_xml::parse_nmap_xml(&out.stdout) {
                                     Ok(res) => {
-                                        let _ = store2.finish_job(job.id, Some(&res), None).await;
+                                        if let Err(e) =
+                                            store2.finish_job(job.id, Some(&res), None).await
+                                        {
+                                            warn!(
+                                                job = job.id,
+                                                ?e,
+                                                "could not record scan result (job deleted?)"
+                                            );
+                                        }
                                         info!(target = %target, level = job.level, "scan done");
                                     }
                                     Err(e) => {
-                                        let _ = store2
+                                        if let Err(e2) = store2
                                             .finish_job(job.id, None, Some(&e.to_string()))
-                                            .await;
+                                            .await
+                                        {
+                                            warn!(
+                                                job = job.id,
+                                                ?e2,
+                                                "could not record scan failure"
+                                            );
+                                        }
                                     }
                                 }
                             }
                             Ok(Ok(out)) => {
-                                let _ = store2
+                                if let Err(e) = store2
                                     .finish_job(
                                         job.id,
                                         None,
                                         Some(&format!("exit {:?}", out.status.code())),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    warn!(job = job.id, ?e, "could not record scan failure");
+                                }
                             }
                             Ok(Err(e)) => {
-                                let _ = store2.finish_job(job.id, None, Some(&e.to_string())).await;
+                                if let Err(e2) =
+                                    store2.finish_job(job.id, None, Some(&e.to_string())).await
+                                {
+                                    warn!(job = job.id, ?e2, "could not record scan failure");
+                                }
                             }
                             Err(_) => {
-                                let _ = store2.finish_job(job.id, None, Some("timeout")).await;
+                                if let Err(e) =
+                                    store2.finish_job(job.id, None, Some("timeout")).await
+                                {
+                                    warn!(job = job.id, ?e, "could not record scan timeout");
+                                }
                             }
                         }
                         if let Ok(Some(j)) = store2.queue_job(job.id).await {
@@ -179,6 +205,21 @@ license_key = "k"
             store.enqueue_scan(ip.id, 3, 24).await.unwrap(),
             crate::store::scans::EnqueueOutcome::Queued(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn finish_job_on_deleted_ip_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = s.upsert_ip("203.0.113.9".parse().unwrap()).await.unwrap();
+        let job = match s.enqueue_scan(ip.id, 1, 24).await.unwrap() {
+            crate::store::scans::EnqueueOutcome::Queued(j) => j,
+            o => panic!("{o:?}"),
+        };
+        s.next_queued_job().await.unwrap();
+        assert!(s.delete_ip(ip.id).await.unwrap());
+        assert!(s.finish_job(job, None, Some("timeout")).await.is_err());
+        assert!(s.queue_job(job).await.unwrap().is_none());
     }
 
     #[tokio::test]
