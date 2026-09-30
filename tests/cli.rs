@@ -4,6 +4,16 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_peephole"))
 }
 
+/// A stand-in `nmap` so the test does not depend on nmap being installed
+/// (CI runners do not have it). `check-config` only runs `nmap --version`.
+fn fake_nmap(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("fake-nmap");
+    std::fs::write(&p, "#!/bin/sh\necho 'Nmap version 7.99 ( fake )'\n").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
 #[test]
 fn version_flag_prints_version() {
     let out = bin().arg("--version").output().unwrap();
@@ -38,7 +48,9 @@ license_key = "k"
         ),
     )
     .unwrap();
+    let nmap = fake_nmap(dir.path());
     let out = bin()
+        .env("PEEPHOLE_NMAP_PATH", &nmap)
         .args(["check-config", good.to_str().unwrap()])
         .output()
         .unwrap();
@@ -63,6 +75,7 @@ license_key = "k"
     let bad = dir.path().join("bad.toml");
     std::fs::write(&bad, "trap_listen = 12\n").unwrap();
     let out = bin()
+        .env("PEEPHOLE_NMAP_PATH", &nmap)
         .args(["check-config", bad.to_str().unwrap()])
         .output()
         .unwrap();

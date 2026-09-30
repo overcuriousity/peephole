@@ -24,6 +24,10 @@ jobs:
 
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
+        with:
+          # Own key: the runner moved to 22.04 and a cache restored from the
+          # old image left fingerprints without the matching rlibs.
+          prefix-key: v1-rust-release-22.04
 
       - name: Build release binary
         run: PEEPHOLE_VERSION="${GITHUB_SHA::12}" cargo build --release --locked
