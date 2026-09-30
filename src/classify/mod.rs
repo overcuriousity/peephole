@@ -48,6 +48,11 @@ pub struct Classifier {
 }
 
 impl Classifier {
+    /// Number of compiled signature rules.
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
     pub fn from_dir(dir: &Path) -> Result<Self> {
         let rules = rules::load_dir(dir)?
             .into_iter()

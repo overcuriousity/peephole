@@ -25,7 +25,7 @@ jobs:
         uses: swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --locked
+        run: PEEPHOLE_VERSION="${GITHUB_SHA::12}" cargo build --release --locked
 
       - name: Package tarball
         run: |
@@ -34,7 +34,8 @@ jobs:
           cp target/release/peephole "$staging/"
           cp -r rules "$staging/rules"
           mkdir -p "$staging/deploy"
-          cp deploy/peephole.service deploy/config.example.toml "$staging/deploy/"
+          cp deploy/peephole.service deploy/config.example.toml deploy/nginx.example.conf "$staging/deploy/"
+          printf '%s %s\n' "${GITHUB_SHA::12}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$staging/VERSION"
           tar -czf "$ASSET.tar.gz" "$staging"
           sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"
 

@@ -14,19 +14,46 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
-pub async fn run(config_path: PathBuf) -> Result<()> {
-    let cfg = config::Config::load(&config_path)?;
-    std::fs::create_dir_all(&cfg.data_dir)?;
+/// Build version, baked in by `build.rs` from `PEEPHOLE_VERSION` ("dev" locally).
+pub const VERSION: &str = env!("PEEPHOLE_VERSION");
 
-    // Startup validation (spec §12).
-    let nmap_path = std::env::var("PEEPHOLE_NMAP_PATH").unwrap_or_else(|_| "nmap".into());
-    let nmap_out = tokio::process::Command::new(&nmap_path)
+fn nmap_path() -> String {
+    std::env::var("PEEPHOLE_NMAP_PATH").unwrap_or_else(|_| "nmap".into())
+}
+
+/// Startup validation shared by `run` and `check-config`: config parses and
+/// is sane, rules load, nmap is executable. Returns a one-line summary.
+pub async fn check_config(
+    config_path: &std::path::Path,
+) -> Result<(config::Config, classify::Classifier, String)> {
+    let cfg = config::Config::load(config_path).context("config")?;
+    let classifier = classify::Classifier::from_dir(&cfg.rules_dir).context("loading rules")?;
+    let nmap = nmap_path();
+    let out = tokio::process::Command::new(&nmap)
         .arg("--version")
         .output()
         .await
-        .context("nmap not found — install nmap")?;
-    anyhow::ensure!(nmap_out.status.success(), "nmap --version failed");
-    let classifier = classify::Classifier::from_dir(&cfg.rules_dir).context("loading rules")?;
+        .with_context(|| format!("nmap not found at {nmap} — install nmap"))?;
+    anyhow::ensure!(out.status.success(), "nmap --version failed");
+    let nmap_line = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("nmap")
+        .to_string();
+    let summary = format!(
+        "ok: config, rules ({}), {}",
+        classifier.rule_count(),
+        nmap_line
+    );
+    Ok((cfg, classifier, summary))
+}
+
+pub async fn run(config_path: PathBuf) -> Result<()> {
+    // Startup validation (spec §12).
+    let (cfg, classifier, summary) = check_config(&config_path).await?;
+    info!(version = VERSION, "{summary}");
+    std::fs::create_dir_all(&cfg.data_dir)?;
+    let nmap_path = nmap_path();
     let store = store::Store::connect(&cfg.database_path).await?;
 
     let geo = Arc::new(RwLock::new(
