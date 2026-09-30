@@ -1,0 +1,11 @@
+<div class="table-wrap"><table>
+  <thead><tr><th>Port</th><th>State</th><th>Service</th><th>Product</th><th>Version</th></tr></thead>
+  <tbody>
+  {% for p in ports %}
+    <tr><td class="mono">{{ p.port }}/{{ p.proto }}</td>
+        <td><span class="badge badge-status" data-status="{% if p.state == "open" %}done{% else %}queued{% endif %}">{{ p.state }}</span></td>
+        <td>{{ p.service.as_deref().unwrap_or("") }}</td><td>{{ p.product.as_deref().unwrap_or("") }}</td><td>{{ p.version.as_deref().unwrap_or("") }}</td></tr>
+  {% endfor %}
+  {% if ports.is_empty() %}<tr><td colspan="5" class="empty">No ports recorded.</td></tr>{% endif %}
+  </tbody>
+</table></div>

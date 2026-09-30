@@ -1,13 +1,17 @@
 //! Unauthenticated pages. Never load admin-only data here.
 use crate::admin::countries;
-use crate::admin::error::{AppResult, render};
+use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
 use crate::admin::{AdminState, RangeQuery};
+use crate::store::browse::{
+    IpFilter, IpOverview, IpSummary, Page, RequestFilter, RequestListRow, page_num,
+};
+use crate::store::inspect::{FpClaimRow, FpSummary, PortRow, ScanSummary};
 use crate::store::stats::{MapCounts, Range, Stats, intel_stale};
 use askama::Template;
 use axum::{
     Router,
-    extract::{FromRequestParts, Query, State},
+    extract::{FromRequestParts, Path, Query, State},
     http::request::Parts,
     response::{Html, IntoResponse, Json, Response},
     routing::get,
@@ -42,6 +46,9 @@ impl FromRequestParts<Arc<AdminState>> for MaybeUser {
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/", get(wall))
+        .route("/ips", get(ips))
+        .route("/ip/{addr}", get(ip_page))
+        .route("/requests", get(requests))
         .route("/api/stats", get(stats_json))
         .route("/api/map", get(map_json))
         .route("/api/countries", get(countries_json))
@@ -114,4 +121,160 @@ async fn healthz(State(state): State<Arc<AdminState>>) -> Response {
         Ok(_) => "ok".into_response(),
         Err(e) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     }
+}
+
+/// Query string of every filter except `page`, ending in `&` when non-empty.
+fn qs_without_page(pairs: &[(&str, Option<String>)]) -> String {
+    let mut out = String::new();
+    for (k, v) in pairs {
+        if let Some(v) = v.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(&format!("{k}={}&", urlencode(v)));
+        }
+    }
+    out
+}
+
+fn urlencode(s: &str) -> String {
+    let mut o = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                o.push(b as char)
+            }
+            _ => o.push_str(&format!("%{b:02X}")),
+        }
+    }
+    o
+}
+
+#[derive(Template)]
+#[template(path = "ips.html")]
+struct IpsPage {
+    chrome: Chrome,
+    f: IpFilter,
+    page: Page<IpSummary>,
+    qs: String,
+}
+
+async fn ips(
+    MaybeUser(authed): MaybeUser,
+    State(state): State<Arc<AdminState>>,
+    Query(f): Query<IpFilter>,
+) -> AppResult<Html<String>> {
+    let page = state.store.list_ips(&f).await?;
+    let qs = qs_without_page(&[
+        ("q", f.q.clone()),
+        ("country", f.country.clone()),
+        ("asn", f.asn.map(|a| a.to_string())),
+        ("label", f.label.clone()),
+        ("min_severity", f.min_severity.map(|a| a.to_string())),
+        ("tor", f.tor.clone()),
+        ("sort", f.sort.clone()),
+    ]);
+    render(&IpsPage {
+        chrome: Chrome::new(authed, "ips"),
+        f,
+        page,
+        qs,
+    })
+}
+
+#[derive(Template)]
+#[template(path = "requests.html")]
+struct RequestsPage {
+    chrome: Chrome,
+    f: RequestFilter,
+    page: Page<RequestListRow>,
+    qs: String,
+}
+
+async fn requests(
+    MaybeUser(authed): MaybeUser,
+    State(state): State<Arc<AdminState>>,
+    Query(f): Query<RequestFilter>,
+) -> AppResult<Html<String>> {
+    let page = state.store.search_requests(&f).await?;
+    let qs = qs_without_page(&[
+        ("ip", f.ip.clone()),
+        ("path", f.path.clone()),
+        ("label", f.label.clone()),
+        ("severity", f.severity.map(|a| a.to_string())),
+        ("min_severity", f.min_severity.map(|a| a.to_string())),
+        ("country", f.country.clone()),
+        ("asn", f.asn.map(|a| a.to_string())),
+        ("from", f.from.clone()),
+        ("to", f.to.clone()),
+    ]);
+    render(&RequestsPage {
+        chrome: Chrome::new(authed, "requests"),
+        f,
+        page,
+        qs,
+    })
+}
+
+pub struct ScanWithPorts {
+    pub s: ScanSummary,
+    pub ports: Vec<PortRow>,
+}
+
+/// Admin-only sections of the IP page. Loaded only with a session.
+pub struct IpAdminData {
+    pub scans: Vec<ScanWithPorts>,
+    pub fingerprints: Vec<FpSummary>,
+    pub claims: Vec<FpClaimRow>,
+}
+
+#[derive(Template)]
+#[template(path = "ip.html")]
+struct IpPage {
+    chrome: Chrome,
+    ov: IpOverview,
+    sparkline_json: String,
+    page: Page<RequestListRow>,
+    admin: Option<IpAdminData>,
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct PageQuery {
+    #[serde(default, deserialize_with = "crate::store::browse::lenient_i64")]
+    pub page: Option<i64>,
+}
+
+async fn ip_page(
+    MaybeUser(authed): MaybeUser,
+    State(state): State<Arc<AdminState>>,
+    Path(addr): Path<String>,
+    Query(q): Query<PageQuery>,
+) -> AppResult<Html<String>> {
+    let Some(ip) = state.store.ip_by_addr(&addr).await? else {
+        return Err(AppError::NotFound);
+    };
+    let Some(ov) = state.store.ip_overview(ip.id).await? else {
+        return Err(AppError::NotFound);
+    };
+    let page = state.store.requests_for_ip(ip.id, page_num(q.page)).await?;
+    // Admin-only data is only *queried* with a session (spec §5).
+    let admin = if authed {
+        let mut scans = vec![];
+        for s in state.store.scans_for_ip(ip.id).await? {
+            let ports = state.store.ports_for_scan(s.id).await?;
+            scans.push(ScanWithPorts { s, ports });
+        }
+        Some(IpAdminData {
+            scans,
+            fingerprints: state.store.fingerprints_for_ip(ip.id).await?,
+            claims: state.store.claims_for_ip(ip.id).await?,
+        })
+    } else {
+        None
+    };
+    let sparkline_json = serde_json::to_string(&ov.sparkline).unwrap_or_else(|_| "[]".into());
+    render(&IpPage {
+        chrome: Chrome::new(authed, "ips"),
+        ov,
+        sparkline_json,
+        page,
+        admin,
+    })
 }

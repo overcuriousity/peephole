@@ -1,0 +1,7 @@
+{% if page.prev().is_some() || page.next().is_some() %}
+<nav class="pagination" aria-label="Pagination">
+  <span>{% if let Some(p) = page.prev() %}<a class="btn btn-sm" href="?{{ qs }}page={{ p }}">← Previous</a>{% endif %}</span>
+  <span class="muted">page {{ page.page }}</span>
+  <span>{% if let Some(n) = page.next() %}<a class="btn btn-sm" href="?{{ qs }}page={{ n }}">Next →</a>{% endif %}</span>
+</nav>
+{% endif %}

@@ -1,0 +1,91 @@
+{% extends "layout.html" %}
+{% block title %}peephole — {{ ov.ip.ip }}{% endblock %}
+{% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
+{% block content %}
+<div class="page-head ip-head">
+  <div>
+    <h1>{{ ov.ip.ip }}{% if ov.ip.is_tor_exit %} <span class="badge badge-tor">tor exit</span>{% endif %}</h1>
+    <div class="meta">
+      {% if let Some(c) = ov.ip.country %}<span>{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}</span>{% endif %}
+      {% if let Some(o) = ov.ip.asn_org %}<span>{{ o }}{% if let Some(a) = ov.ip.asn %} <span class="mono muted">AS{{ a }}</span>{% endif %}</span>{% endif %}
+      <span>first seen <span class="mono">{{ ov.ip.first_seen }}</span></span>
+      <span>last seen <span class="mono">{{ ov.ip.last_seen }}</span></span>
+    </div>
+  </div>
+  <div class="tiles">
+    <div class="tile"><span class="label">Requests</span><div class="value">{{ ov.request_count }}</div></div>
+    <div class="tile"><span class="label">Max severity</span><div class="value">{% let sev = ov.max_severity %}{% include "_severity.html" %}</div></div>
+  </div>
+</div>
+
+<div class="stack">
+  <section class="card">
+    <div class="card-head"><h2>Last 24 hours</h2><span class="muted">requests per hour</span></div>
+    <div class="sparkline" data-sparkline="{{ sparkline_json }}"></div>
+    {% if !ov.labels.is_empty() %}<div class="chips">{% for l in ov.labels %}<span class="badge badge-label">{{ l.name }} <span class="muted">×{{ l.count }}</span></span>{% endfor %}</div>{% endif %}
+  </section>
+
+  {% if let Some(adm) = admin %}
+  <section class="card">
+    <div class="card-head"><h2>Counter-scans</h2><span class="muted">admin only</span></div>
+    {% if adm.scans.is_empty() %}<p class="muted">No completed scans.</p>{% endif %}
+    {% for sc in adm.scans %}
+      <h3>Level {{ sc.s.level }} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {{ sc.s.os_guess.as_deref().unwrap_or("OS unknown") }}
+        · <a href="/admin/scans/{{ sc.s.id }}">details</a> · <a href="/admin/scans/{{ sc.s.id }}/xml">raw XML</a></h3>
+      {% let ports = sc.ports %}{% include "_ports.html" %}
+    {% endfor %}
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>Fingerprints</h2><span class="muted">admin only</span></div>
+    {% if adm.fingerprints.is_empty() %}<p class="muted">No browser fingerprints collected.</p>{% endif %}
+    {% for f in adm.fingerprints %}
+      <p><a class="mono" href="/admin/fingerprints#{{ f.hash }}">{{ f.hash }}</a> ×{{ f.count }} — seen from <b>{{ f.other_ips }}</b> other IPs
+        {% for v in f.visitor_ids %}<span class="badge badge-label">visitor {{ v }}</span>{% endfor %}</p>
+    {% endfor %}
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>False-positive claims</h2><span class="muted">admin only</span></div>
+    {% if adm.claims.is_empty() %}<p class="muted">None.</p>{% endif %}
+    {% for c in adm.claims %}<p><span class="mono">{{ c.ts }}</span> · {{ c.contact_email.as_deref().unwrap_or("no email") }} · <span class="muted">{{ c.user_agent }}</span></p>{% endfor %}
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <div class="card-head"><h2>Requests</h2></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Time (UTC)</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th>{% if chrome.authed %}<th></th>{% endif %}</tr></thead>
+      <tbody>
+      {% for r in page.items %}
+        <tr>
+          <td class="ts">{{ r.ts }}</td><td class="mono">{{ r.method }}</td>
+          <td class="path">{{ r.path }}{% if let Some(q) = r.query %}<span class="muted">?{{ q }}</span>{% endif %}</td>
+          <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
+          <td><span class="chips">{% for l in r.labels() %}<span class="badge badge-label">{{ l }}</span>{% endfor %}</span></td>
+          {% if chrome.authed %}<td><a class="btn btn-sm btn-ghost" href="/admin/requests/{{ r.id }}">inspect</a></td>{% endif %}
+        </tr>
+      {% endfor %}
+      {% if page.items.is_empty() %}<tr><td colspan="6" class="empty">No requests recorded.</td></tr>{% endif %}
+      </tbody>
+    </table></div>
+    {% let qs = "" %}{% include "_pagination.html" %}
+  </section>
+
+  {% if admin.is_some() %}
+  <section class="card danger-zone">
+    <h2>Danger zone</h2>
+    <p class="muted">Removes this IP with all its requests, scans, fingerprints and claims. Cannot be undone.</p>
+    <button class="btn btn-danger" type="button" data-confirm="dlg-delete-ip">Delete this IP</button>
+    <dialog id="dlg-delete-ip">
+      <h3>Delete {{ ov.ip.ip }}?</h3>
+      <p class="muted">All {{ ov.request_count }} requests and every dependent record will be removed.</p>
+      <form method="post" action="/admin/ips/{{ ov.ip.ip }}/delete" class="actions">
+        <button class="btn" type="button" data-close>Cancel</button>
+        <button class="btn btn-danger" type="submit">Delete</button>
+      </form>
+    </dialog>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}

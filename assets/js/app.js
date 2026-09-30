@@ -18,5 +18,15 @@
     });
     render();
   }
+  // Confirmation dialogs for destructive forms.
+  document.querySelectorAll("[data-confirm]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var d = document.getElementById(b.getAttribute("data-confirm"));
+      if (d && d.showModal) d.showModal();
+    });
+  });
+  document.querySelectorAll("dialog [data-close]").forEach(function (b) {
+    b.addEventListener("click", function () { b.closest("dialog").close(); });
+  });
   window.peephole = window.peephole || {};
 })();

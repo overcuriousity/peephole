@@ -9,9 +9,7 @@ use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/requests", get(requests_page))
         .route("/requests/{id}", get(request_detail_page))
-        .route("/ips/{id}", get(ip_detail_page))
         .route("/inbox", get(inbox_page))
         .route("/keys", get(keys_page))
         .route("/keys/delete", post(key_delete))
@@ -19,42 +17,11 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/export/download", get(export_download))
 }
 
-use crate::store::browse::RequestFilter;
-
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-}
-
-async fn requests_page(
-    _u: SessionUser,
-    State(state): State<Arc<AdminState>>,
-    Query(f): Query<RequestFilter>,
-) -> Html<String> {
-    let rows = state
-        .store
-        .search_requests(&f)
-        .await
-        .map(|p| p.items)
-        .unwrap_or_default();
-    let mut trs = String::new();
-    for r in &rows {
-        trs.push_str(&format!(
-            "<tr><td>{}</td><td><a href=\"/ips/{}\">{}</a></td><td>{}</td>\
-             <td><a href=\"/requests/{}\">{}</a></td><td>{}</td><td>{}</td></tr>",
-            esc(&r.ts),
-            r.ip_id,
-            esc(&r.ip),
-            esc(&r.method),
-            r.id,
-            esc(&r.path),
-            r.severity,
-            esc(&r.labels_json)
-        ));
-    }
-    Html(include_str!("../../templates/requests.html").replace("__ROWS__", &trs))
 }
 
 async fn request_detail_page(
@@ -82,29 +49,6 @@ async fn request_detail_page(
         }
         None => "<p>not found</p>".to_string(),
     })
-}
-
-async fn ip_detail_page(
-    _u: SessionUser,
-    State(state): State<Arc<AdminState>>,
-    Path(id): Path<i64>,
-) -> Html<String> {
-    // Interim: replaced by the public/admin IP page in Task 9.
-    let Ok(Some(ip)) = state.store.ip_by_id(id).await else {
-        return Html("<p>not found</p>".to_string());
-    };
-    let rows = state
-        .store
-        .requests_for_ip(id, 1)
-        .await
-        .map(|p| p.items)
-        .unwrap_or_default();
-    let mut html = format!("<h1>{}</h1><ul>", esc(&ip.ip));
-    for r in &rows {
-        html.push_str(&format!("<li>{}</li>", esc(&r.path)));
-    }
-    html.push_str("</ul>");
-    Html(include_str!("../../templates/ip_detail.html").replace("__CONTENT__", &html))
 }
 
 async fn inbox_page(_u: SessionUser, State(state): State<Arc<AdminState>>) -> Html<String> {

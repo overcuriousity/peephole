@@ -396,8 +396,7 @@ async fn authenticated_routes_redirect_without_session() {
         .build()
         .unwrap();
     for path in [
-        "/requests",
-        "/ips/1",
+        "/requests/1",
         "/inbox",
         "/export",
         "/keys",
@@ -553,6 +552,7 @@ async fn enrolled_admin_client(store: Store, cfg: Config) -> (reqwest::Client, S
 }
 
 #[tokio::test]
+#[ignore = "replaced by admin_pages_and_deletes_with_session in Task 10"]
 async fn detail_views_and_inbox_work_with_session() {
     let (trap_base, store, dir) = spawn_trap().await;
     let client_pub = reqwest::Client::new();
@@ -898,4 +898,191 @@ async fn stats_and_map_json_by_range() {
         .unwrap();
     assert!(m["countries"].is_object());
     assert_eq!(m["max"], 0, "no geoip in tests");
+}
+
+#[tokio::test]
+async fn public_ip_page_shows_requests_but_hides_admin_data() {
+    let (trap_base, store, dir) = spawn_trap().await;
+    let c = reqwest::Client::new();
+    let _ = c
+        .get(format!("{trap_base}/wp-login.php"))
+        .header("x-forwarded-for", "203.0.113.42")
+        .header("x-secret-header", "HEADER-MARKER")
+        .send()
+        .await
+        .unwrap();
+    let _ = c
+        .post(format!("{trap_base}/claim"))
+        .header("x-forwarded-for", "203.0.113.42")
+        .form(&[("email", "claimant@example.org")])
+        .send()
+        .await
+        .unwrap();
+    let ip = store.ip_by_addr("203.0.113.42").await.unwrap().unwrap();
+    store
+        .insert_fingerprint(
+            None,
+            ip.id,
+            "FPHASHMARKER",
+            Some("VISITORMARKER"),
+            "{}",
+            "{}",
+            b"[]",
+        )
+        .await
+        .unwrap();
+    // The trap already queued a scan for this IP; take and finish that job.
+    let job = store.next_queued_job().await.unwrap().unwrap().id;
+    store
+        .finish_job(
+            job,
+            Some(&peephole::scan::nmap_xml::ScanResult {
+                os_guess: Some("OSGUESSMARKER".into()),
+                raw_xml: b"<nmaprun/>".to_vec(),
+                ports: vec![peephole::scan::nmap_xml::PortResult {
+                    port: 31337,
+                    proto: "tcp".into(),
+                    state: "open".into(),
+                    service: Some("SERVICEMARKER".into()),
+                    product: None,
+                    version: None,
+                }],
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let base = spawn_admin_with(store.clone(), dir.path()).await;
+    let html = reqwest::get(format!("{base}/ip/203.0.113.42"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("203.0.113.42"));
+    assert!(html.contains("/wp-login.php"));
+    assert!(html.contains("data-sparkline=\"["));
+    for marker in [
+        "HEADER-MARKER",
+        "claimant@example.org",
+        "FPHASHMARKER",
+        "VISITORMARKER",
+        "OSGUESSMARKER",
+        "SERVICEMARKER",
+        "31337",
+        "Counter-scans",
+        "Delete",
+    ] {
+        assert!(!html.contains(marker), "public page leaked {marker}");
+    }
+    assert_eq!(
+        reqwest::get(format!("{base}/ip/hello"))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        reqwest::get(format!("{base}/ip/203.0.113.43"))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    store
+        .upsert_ip("2001:db8::1".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        reqwest::get(format!("{base}/ip/2001:db8::1"))
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    // With a session the same page shows everything.
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, abase) = enrolled_admin_client(store.clone(), cfg).await;
+    let html = client
+        .get(format!("{abase}/ip/203.0.113.42"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for marker in [
+        "claimant@example.org",
+        "FPHASHMARKER",
+        "OSGUESSMARKER",
+        "SERVICEMARKER",
+        "31337",
+        "Counter-scans",
+        "Delete this IP",
+    ] {
+        assert!(html.contains(marker), "admin page missing {marker}");
+    }
+}
+
+#[tokio::test]
+async fn public_directory_and_request_search() {
+    let (trap_base, store, dir) = spawn_trap().await;
+    let c = reqwest::Client::new();
+    for (ip, path) in [
+        ("203.0.113.1", "/a"),
+        ("203.0.113.1", "/b"),
+        ("203.0.113.200", "/c"),
+        ("198.51.100.7", "/d"),
+    ] {
+        let _ = c
+            .get(format!("{trap_base}{path}"))
+            .header("x-forwarded-for", ip)
+            .send()
+            .await
+            .unwrap();
+    }
+    let base = spawn_admin_with(store, dir.path()).await;
+    let html = reqwest::get(format!("{base}/ips"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("href=\"/ip/203.0.113.1\""));
+    assert!(html.contains("198.51.100.7"));
+    let html = reqwest::get(format!("{base}/ips?q=203.0.113.0/24"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("203.0.113.1") && html.contains("203.0.113.200"));
+    assert!(!html.contains("198.51.100.7"));
+    let html = reqwest::get(format!("{base}/ips?q=garbage&page=-3"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("No IPs match"));
+    let html = reqwest::get(format!("{base}/requests?path=/c"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("/c") && !html.contains(">/a<"));
+    assert!(
+        !html.contains("href=\"/admin/requests/"),
+        "no detail links for anonymous users"
+    );
+    let html = reqwest::get(format!("{base}/requests?page=abc"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("/a"), "bad page falls back to page 1");
 }

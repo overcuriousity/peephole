@@ -1,0 +1,39 @@
+{% extends "layout.html" %}
+{% block title %}peephole — IPs{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>Source IPs</h1><p class="muted">Every address that has hit the trap. Search by IP, prefix or CIDR.</p></div></div>
+<form class="filters" method="get" action="/ips">
+  <label>Address / prefix / CIDR <input name="q" value="{{ f.q.as_deref().unwrap_or_default() }}" placeholder="203.0.113.0/24"></label>
+  <label>Country <input name="country" size="3" maxlength="2" value="{{ f.country.as_deref().unwrap_or_default() }}" placeholder="DE"></label>
+  <label>ASN <input name="asn" size="7" value="{% if let Some(a) = f.asn %}{{ a }}{% endif %}"></label>
+  <label>Label <input name="label" value="{{ f.label.as_deref().unwrap_or_default() }}"></label>
+  <label>Min severity <select name="min_severity">
+    <option value="">any</option>
+    {% for s in 1..5 %}<option value="{{ s }}"{% if f.min_severity == Some(s.clone()) %} selected{% endif %}>{{ s }}+</option>{% endfor %}
+  </select></label>
+  <label>Tor <select name="tor"><option value="">any</option><option value="1"{% if f.tor.as_deref() == Some("1") %} selected{% endif %}>exits only</option></select></label>
+  <label>Sort <select name="sort">
+    <option value="count"{% if f.sort.as_deref() != Some("recent") %} selected{% endif %}>most requests</option>
+    <option value="recent"{% if f.sort.as_deref() == Some("recent") %} selected{% endif %}>last seen</option>
+  </select></label>
+  <button class="btn btn-primary" type="submit">Filter</button>
+</form>
+<div class="table-wrap"><table>
+  <thead><tr><th>IP</th><th>Country</th><th>Network</th><th class="num">Requests</th><th>Max sev</th><th>First seen</th><th>Last seen</th></tr></thead>
+  <tbody>
+  {% for i in page.items %}
+    <tr>
+      <td class="ip"><a href="/ip/{{ i.ip }}">{{ i.ip }}</a>{% if i.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
+      <td>{% if let Some(c) = i.country %}{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}{% else %}<span class="muted">—</span>{% endif %}</td>
+      <td>{% if let Some(o) = i.asn_org %}{{ o }}{% if let Some(a) = i.asn %} <span class="muted mono">AS{{ a }}</span>{% endif %}{% else %}<span class="muted">—</span>{% endif %}</td>
+      <td class="num">{{ i.request_count }}</td>
+      <td>{% let sev = i.max_severity %}{% include "_severity.html" %}</td>
+      <td class="ts">{{ i.first_seen }}</td>
+      <td class="ts">{{ i.last_seen }}</td>
+    </tr>
+  {% endfor %}
+  {% if page.items.is_empty() %}<tr><td colspan="7" class="empty">No IPs match.</td></tr>{% endif %}
+  </tbody>
+</table></div>
+{% include "_pagination.html" %}
+{% endblock %}

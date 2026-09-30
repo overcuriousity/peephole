@@ -117,6 +117,8 @@
 
   function sparkline(host, values) {
     var W = 240, H = 40, n = values.length || 1, s = svg(host, W, H), max = Math.max.apply(null, values) || 1, bw = W / n;
+    s.setAttribute("preserveAspectRatio", "none");
+    s.removeAttribute("height");
     values.forEach(function (v, i) { var h = (v / max) * H; el("rect", { x: i * bw + 0.5, y: H - h, width: Math.max(bw - 1, 1), height: h }, s); });
   }
 
