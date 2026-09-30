@@ -1,0 +1,9 @@
+<tr data-job="{{ j.id }}">
+  <td class="mono">#{{ j.id }}</td>
+  <td class="ip"><a href="/ip/{{ j.ip }}">{{ j.ip }}</a></td>
+  <td>{{ j.level }}</td>
+  <td><span class="badge badge-status" data-status="{{ j.status }}">{{ j.status }}</span></td>
+  <td class="ts">{{ j.queued_at }}</td>
+  <td class="ts">{{ j.finished_at.as_deref().unwrap_or("") }}</td>
+  <td class="mono">{{ j.error.as_deref().unwrap_or("") }}</td>
+</tr>

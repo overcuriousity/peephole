@@ -80,17 +80,48 @@ pub fn auth_routes() -> Router<Arc<AdminState>> {
         .route("/logout", post(logout))
 }
 
-async fn login_page() -> Html<&'static str> {
-    Html(include_str!("../../templates/login.html"))
+fn session_cookie(
+    cfg: &crate::config::Config,
+    id: String,
+) -> axum_extra::extract::cookie::Cookie<'static> {
+    axum_extra::extract::cookie::Cookie::build(("peephole_session", id))
+        .path("/")
+        .http_only(true)
+        .secure(cfg.webauthn.secure_cookies)
+        .same_site(axum_extra::extract::cookie::SameSite::Strict)
+        .build()
 }
-async fn enroll_page() -> Html<&'static str> {
-    Html(include_str!("../../templates/enroll.html"))
+
+#[derive(askama::Template)]
+#[template(path = "login.html")]
+struct LoginPage {
+    chrome: crate::admin::views::Chrome,
+}
+
+#[derive(askama::Template)]
+#[template(path = "enroll.html")]
+struct EnrollPage {
+    chrome: crate::admin::views::Chrome,
+}
+
+async fn login_page(
+    crate::admin::public::MaybeUser(authed): crate::admin::public::MaybeUser,
+) -> crate::admin::error::AppResult<Html<String>> {
+    crate::admin::error::render(&LoginPage {
+        chrome: crate::admin::views::Chrome::new(authed, ""),
+    })
+}
+async fn enroll_page(
+    crate::admin::public::MaybeUser(authed): crate::admin::public::MaybeUser,
+) -> crate::admin::error::AppResult<Html<String>> {
+    crate::admin::error::render(&EnrollPage {
+        chrome: crate::admin::views::Chrome::new(authed, ""),
+    })
 }
 
 #[derive(serde::Deserialize)]
 pub struct EnrollStart {
-    setup_token: String,
-    #[allow(dead_code)]
+    setup_token: Option<String>,
     label: Option<String>,
 }
 
@@ -99,10 +130,26 @@ async fn enroll_start(
     jar: axum_extra::extract::CookieJar,
     Json(body): Json<EnrollStart>,
 ) -> Response {
-    let provided = data_encoding::HEXLOWER.encode(&Sha256::digest(body.setup_token.as_bytes()));
-    match state.store.intel_get("webauthn_setup_token_hash").await {
-        Ok(Some(stored)) if stored == provided => {}
-        _ => return (StatusCode::FORBIDDEN, "invalid setup token").into_response(),
+    // Either the one-time setup token or a live admin session authorises this.
+    let by_session = match jar.get("peephole_session") {
+        Some(c) => state
+            .store
+            .validate_session(c.value())
+            .await
+            .unwrap_or(false),
+        None => false,
+    };
+    let by_token = match (
+        &body.setup_token,
+        state.store.intel_get("webauthn_setup_token_hash").await,
+    ) {
+        (Some(t), Ok(Some(stored))) => {
+            stored == data_encoding::HEXLOWER.encode(&Sha256::digest(t.as_bytes()))
+        }
+        _ => false,
+    };
+    if !by_session && !by_token {
+        return (StatusCode::FORBIDDEN, "invalid setup token").into_response();
     }
     let wa = match webauthn_for(&state.cfg) {
         Ok(w) => w,
@@ -123,15 +170,23 @@ async fn enroll_start(
         Some(existing.iter().map(|p| p.cred_id().clone()).collect()),
     ) {
         Ok((ccr, state_reg)) => {
-            let jar = jar.add(
-                axum_extra::extract::cookie::Cookie::build((
-                    "wa_reg",
-                    serde_json::to_string(&state_reg).unwrap(),
-                ))
-                .path("/")
-                .http_only(true)
-                .same_site(axum_extra::extract::cookie::SameSite::Strict),
-            );
+            let label = body.label.clone().unwrap_or_default();
+            let jar = jar
+                .add(
+                    axum_extra::extract::cookie::Cookie::build((
+                        "wa_reg",
+                        serde_json::to_string(&state_reg).unwrap(),
+                    ))
+                    .path("/")
+                    .http_only(true)
+                    .same_site(axum_extra::extract::cookie::SameSite::Strict),
+                )
+                .add(
+                    axum_extra::extract::cookie::Cookie::build(("wa_label", label))
+                        .path("/")
+                        .http_only(true)
+                        .same_site(axum_extra::extract::cookie::SameSite::Strict),
+                );
             (jar, Json(serde_json::json!({"publicKey": ccr.public_key}))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -158,12 +213,16 @@ async fn enroll_finish(
         Ok(w) => w,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    let label = jar
+        .get("wa_label")
+        .map(|c| c.value().trim().to_string())
+        .filter(|l| !l.is_empty());
     match wa.finish_passkey_registration(&body.credential, &reg_state) {
         Ok(passkey) => {
             let json = serde_json::to_string(&passkey).unwrap();
             let _ = state
                 .store
-                .save_credential(passkey.cred_id(), &json, None)
+                .save_credential(passkey.cred_id(), &json, label.as_deref())
                 .await;
             let _ = state
                 .store
@@ -173,13 +232,9 @@ async fn enroll_finish(
             match state.store.create_session().await {
                 Ok(id) => {
                     let jar = jar
-                        .add(
-                            axum_extra::extract::cookie::Cookie::build(("peephole_session", id))
-                                .path("/")
-                                .http_only(true)
-                                .same_site(axum_extra::extract::cookie::SameSite::Strict),
-                        )
-                        .remove(axum_extra::extract::cookie::Cookie::from("wa_reg"));
+                        .add(session_cookie(&state.cfg, id))
+                        .remove(axum_extra::extract::cookie::Cookie::from("wa_reg"))
+                        .remove(axum_extra::extract::cookie::Cookie::from("wa_label"));
                     (jar, StatusCode::OK).into_response()
                 }
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -246,12 +301,7 @@ async fn login_finish(
         Ok(_result) => match state.store.create_session().await {
             Ok(id) => {
                 let jar = jar
-                    .add(
-                        axum_extra::extract::cookie::Cookie::build(("peephole_session", id))
-                            .path("/")
-                            .http_only(true)
-                            .same_site(axum_extra::extract::cookie::SameSite::Strict),
-                    )
+                    .add(session_cookie(&state.cfg, id))
                     .remove(axum_extra::extract::cookie::Cookie::from("wa_auth"));
                 (jar, StatusCode::OK).into_response()
             }

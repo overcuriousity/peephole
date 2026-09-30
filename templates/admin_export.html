@@ -1,0 +1,14 @@
+{% extends "layout.html" %}
+{% block title %}peephole — export{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>Export requests</h1><p class="muted">CSV, Timesketch JSONL or Parquet. Filters are optional; up to 100 000 rows.</p></div></div>
+<form class="filters card" method="get" action="/admin/export/download">
+  <label>Format <select name="format"><option value="csv">CSV</option><option value="jsonl">Timesketch JSONL</option><option value="parquet">Parquet</option></select></label>
+  <label>From (UTC) <input name="from" type="datetime-local"></label>
+  <label>To (UTC) <input name="to" type="datetime-local"></label>
+  <label>IP <input name="ip"></label>
+  <label>Label <input name="label"></label>
+  <label>Min severity <input name="min_severity" type="number" min="0" max="4"></label>
+  <button class="btn btn-primary" type="submit">Download</button>
+</form>
+{% endblock %}

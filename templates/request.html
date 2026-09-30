@@ -1,0 +1,22 @@
+{% extends "layout.html" %}
+{% block title %}peephole — request #{{ d.row.id }}{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1><span class="mono">{{ d.row.method }}</span> <span class="mono">{{ d.row.path }}</span></h1>
+  <div class="meta"><span class="mono">{{ d.row.ts }}</span><span>from <a class="mono" href="/ip/{{ d.ip }}">{{ d.ip }}</a></span>
+    <span>severity {% let sev = d.row.severity %}{% include "_severity.html" %}</span><span>scan level {{ d.row.scan_level }}</span>{% if d.row.is_fp_claim %}<span class="badge badge-label">fp claim</span>{% endif %}</div>
+</div>
+<button class="btn btn-danger" type="button" data-confirm="dlg-del">Delete request</button>
+<dialog id="dlg-del"><h3>Delete request #{{ d.row.id }}?</h3><form method="post" action="/admin/requests/{{ d.row.id }}/delete" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Delete</button></form></dialog>
+</div>
+<div class="stack">
+  <section class="card"><h2>Labels</h2><div class="chips">{% for l in labels %}<span class="badge badge-label">{{ l }}</span>{% endfor %}{% if labels.is_empty() %}<span class="muted">none</span>{% endif %}</div></section>
+  {% if let Some(q) = d.row.query %}<section class="card"><h2>Query string</h2><pre class="panel">{{ q }}</pre></section>{% endif %}
+  <section class="card"><h2>Headers <span class="muted">in received order</span></h2>
+    <dl class="kv">{% for (k, v) in d.headers %}<dt>{{ k }}</dt><dd>{{ v }}</dd>{% endfor %}</dl></section>
+  <section class="card"><div class="card-head"><h2>Body <span class="muted">{{ d.body_len }} bytes{% if d.body_truncated %}, showing first 16 KiB{% endif %}</span></h2>
+    <button class="btn btn-sm" type="button" data-hex-toggle="body">hex</button></div>
+    <pre class="panel" id="body" data-text="{{ d.body_text }}">{% if d.body_text.is_empty() %}<span class="muted">(empty)</span>{% else %}{{ d.body_text }}{% endif %}</pre></section>
+  {% if let Some(fp) = d.fingerprint %}<section class="card"><h2>Fingerprint</h2><p><a class="mono" href="/admin/fingerprints#{{ fp.hash }}">{{ fp.hash }}</a> — seen from <b>{{ fp.other_ips }}</b> other IPs</p></section>{% endif %}
+</div>
+{% endblock %}

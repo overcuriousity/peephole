@@ -1,8 +1,8 @@
 pub mod assets;
 pub mod auth;
 pub mod countries;
-pub mod detail;
 pub mod error;
+pub mod pages;
 pub mod public;
 pub mod sse;
 pub mod views;
@@ -46,7 +46,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(public::routes())
         .merge(assets::router())
         .merge(auth::auth_routes())
-        .merge(detail::routes())
+        .merge(pages::routes())
         .fallback(error::not_found)
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)

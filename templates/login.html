@@ -1,41 +1,11 @@
-<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow">
-<title>peephole — admin login</title>
-<link rel="icon" type="image/svg+xml" href="/logo.svg">
-<style>body{font-family:system-ui,sans-serif;background:#f8fafc;color:#0f172a;max-width:480px;margin:4rem auto;padding:0 1rem}
-.card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:1.5rem}
-button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:.6rem 1.2rem;font-size:1rem;cursor:pointer;width:100%}
-#msg{color:#b91c1c;margin-top:.75rem}</style></head><body>
-<img src="/logo.svg" alt="" style="display:block;margin:0 auto 1.25rem;height:72px;width:72px;border-radius:14px">
-<div class="card">
-<h1>Admin login</h1>
-<p>FIDO2 security key required. No password exists.</p>
-<button id="go">Authenticate with security key</button>
-<div id="msg"></div>
+{% extends "layout.html" %}
+{% block title %}peephole — admin login{% endblock %}
+{% block content %}
+<div class="card auth-card" data-webauthn="login">
+  <img src="/assets/logo.svg?v={{ chrome.stamp }}" alt="">
+  <h1>Admin login</h1>
+  <p class="muted">FIDO2 security key required. There is no password.</p>
+  <button class="btn btn-primary btn-block" type="button" data-go>Authenticate with security key</button>
+  <div class="status" data-msg></div>
 </div>
-<script>
-document.getElementById("go").addEventListener("click", async function () {
-  var msg = document.getElementById("msg"); msg.textContent = "";
-  try {
-    var start = await fetch("/login/start", { method: "POST" });
-    if (!start.ok) throw new Error("login start failed: " + start.status);
-    var opts = (await start.json()).publicKey;
-    opts.challenge = Uint8Array.from(atob(opts.challenge.replace(/-/g,"+").replace(/_/g,"/")), c=>c.charCodeAt(0)).buffer;
-    if (opts.allowCredentials) opts.allowCredentials = opts.allowCredentials.map(function(c){
-      c.id = Uint8Array.from(atob(c.id.replace(/-/g,"+").replace(/_/g,"/")), x=>x.charCodeAt(0)).buffer; return c; });
-    var cred = await navigator.credentials.get({ publicKey: opts });
-    var body = { credential: {
-      id: cred.id, rawId: btoa(String.fromCharCode.apply(null, new Uint8Array(cred.rawId))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""),
-      type: cred.type,
-      response: {
-        authenticatorData: btoa(String.fromCharCode.apply(null, new Uint8Array(cred.response.authenticatorData))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""),
-        clientDataJSON: btoa(String.fromCharCode.apply(null, new Uint8Array(cred.response.clientDataJSON))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""),
-        signature: btoa(String.fromCharCode.apply(null, new Uint8Array(cred.response.signature))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""),
-        userHandle: cred.response.userHandle ? btoa(String.fromCharCode.apply(null, new Uint8Array(cred.response.userHandle))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"") : null
-      } } };
-    var fin = await fetch("/login/finish", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify(body) });
-    if (fin.ok) location.href = "/requests";
-    else msg.textContent = "authentication failed (" + fin.status + ")";
-  } catch (e) { msg.textContent = e.message || String(e); }
-});
-</script></body></html>
+{% endblock %}

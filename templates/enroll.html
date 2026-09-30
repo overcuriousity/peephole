@@ -1,46 +1,17 @@
-<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow">
-<title>peephole — enroll security key</title>
-<link rel="icon" type="image/svg+xml" href="/logo.svg">
-<style>body{font-family:system-ui,sans-serif;background:#f8fafc;color:#0f172a;max-width:480px;margin:4rem auto;padding:0 1rem}
-.card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:1.5rem}
-button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:.6rem 1.2rem;font-size:1rem;cursor:pointer;width:100%}
-input{width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #cbd5e1;border-radius:6px;margin:.25rem 0 .75rem}
-#msg{color:#b91c1c;margin-top:.75rem}</style></head><body>
-<img src="/logo.svg" alt="" style="display:block;margin:0 auto 1.25rem;height:72px;width:72px;border-radius:14px">
-<div class="card">
-<h1>Enroll security key</h1>
-<p>Enter the one-time setup token printed to the console on first start.</p>
-<label>Setup token <input type="text" id="token" autocomplete="off"></label>
-<label>Key label (optional) <input type="text" id="label" placeholder="yubikey-5"></label>
-<button id="go">Register security key</button>
-<div id="msg"></div>
+{% extends "layout.html" %}
+{% block title %}peephole — enroll security key{% endblock %}
+{% block content %}
+<div class="card auth-card" data-webauthn="enroll">
+  <img src="/assets/logo.svg?v={{ chrome.stamp }}" alt="">
+  <h1>Enroll security key</h1>
+  {% if chrome.authed %}
+  <p class="muted">You are logged in; the new key is added to your account.</p>
+  {% else %}
+  <p class="muted">Enter the one-time setup token printed to the service log on first start.</p>
+  <label class="label">Setup token <input type="text" data-token autocomplete="off"></label>
+  {% endif %}
+  <label class="label">Key label (optional) <input type="text" data-label placeholder="yubikey-5"></label>
+  <button class="btn btn-primary btn-block" type="button" data-go>Register security key</button>
+  <div class="status" data-msg></div>
 </div>
-<script>
-document.getElementById("go").addEventListener("click", async function () {
-  var msg = document.getElementById("msg"); msg.textContent = "";
-  try {
-    var start = await fetch("/enroll/start", { method: "POST",
-      headers: {"content-type":"application/json"},
-      body: JSON.stringify({ setup_token: document.getElementById("token").value.trim(),
-                             label: document.getElementById("label").value.trim() || null }) });
-    if (!start.ok) throw new Error("enroll start failed: " + start.status);
-    var opts = (await start.json()).publicKey;
-    opts.challenge = Uint8Array.from(atob(opts.challenge.replace(/-/g,"+").replace(/_/g,"/")), c=>c.charCodeAt(0)).buffer;
-    opts.user.id = Uint8Array.from(atob(opts.user.id.replace(/-/g,"+").replace(/_/g,"/")), x=>x.charCodeAt(0)).buffer;
-    if (opts.excludeCredentials) opts.excludeCredentials = opts.excludeCredentials.map(function(c){
-      c.id = Uint8Array.from(atob(c.id.replace(/-/g,"+").replace(/_/g,"/")), x=>x.charCodeAt(0)).buffer; return c; });
-    var cred = await navigator.credentials.create({ publicKey: opts });
-    var body = { credential: {
-      id: cred.id, rawId: btoa(String.fromCharCode.apply(null, new Uint8Array(cred.rawId))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""),
-      type: cred.type,
-      response: {
-        attestationObject: btoa(String.fromCharCode.apply(null, new Uint8Array(cred.response.attestationObject))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""),
-        clientDataJSON: btoa(String.fromCharCode.apply(null, new Uint8Array(cred.response.clientDataJSON))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/, "")
-      } } };
-    var fin = await fetch("/enroll/finish", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify(body) });
-    if (fin.ok) location.href = "/requests";
-    else msg.textContent = "enrollment failed (" + fin.status + ")";
-  } catch (e) { msg.textContent = e.message || String(e); }
-});
-</script></body></html>
+{% endblock %}

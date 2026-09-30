@@ -1,0 +1,40 @@
+{% extends "layout.html" %}
+{% block title %}peephole — admin{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>Admin</h1><p class="muted">Operational view. Everything on this page is private.</p></div>
+  <nav class="seg"><a href="/admin/queue">Queue</a><a href="/admin/scans">Scans</a><a href="/admin/fingerprints">Fingerprints</a><a href="/admin/inbox">Inbox</a><a href="/admin/export">Export</a><a href="/admin/keys">Keys</a></nav>
+</div>
+{% if stale %}<div class="banner banner-warning">Intel data (Tor exit list / GeoIP) is missing or older than 48 hours.</div>{% endif %}
+<div class="tiles">
+  <div class="tile"><span class="label">Queued</span><div class="value">{{ q.queued }}</div></div>
+  <div class="tile"><span class="label">Running</span><div class="value">{{ q.running }}</div><div class="hint">{{ workers }} workers</div></div>
+  <div class="tile"><span class="label">Done · 24h</span><div class="value">{{ q.done_24h }}</div></div>
+  <div class="tile"><span class="label">Failed · 24h</span><div class="value{% if q.failed_24h > 0 %} brand{% endif %}">{{ q.failed_24h }}</div></div>
+  <div class="tile"><span class="label">Scans this hour</span><div class="value">{{ q.scans_last_hour }}<span class="muted"> / {{ cap }}</span></div></div>
+  <div class="tile"><span class="label">Inbox</span><div class="value">{{ inbox }}</div><div class="hint"><a href="/admin/inbox">{{ inbox }} unread claims</a></div></div>
+</div>
+<div class="stack">
+  <section class="card">
+    <div class="card-head"><h2>Scan queue</h2><span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></div>
+    <div class="table-wrap"><table data-queue data-src="/admin/api/queue" data-limit="25">
+      <thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Status</th><th>Queued</th><th>Finished</th><th>Error</th></tr></thead>
+      <tbody>{% for j in jobs %}{% include "_queue_row.html" %}{% endfor %}
+      {% if jobs.is_empty() %}<tr data-empty><td colspan="7" class="empty">Queue empty.</td></tr>{% endif %}</tbody>
+    </table></div>
+  </section>
+  <section class="card">
+    <div class="card-head"><h2>Recent failures</h2></div>
+    {% if failed.is_empty() %}<p class="muted">None.</p>{% else %}
+    <div class="table-wrap"><table><thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Finished</th><th>Error</th></tr></thead><tbody>
+      {% for j in failed %}<tr><td class="mono">#{{ j.id }}</td><td class="ip"><a href="/ip/{{ j.ip }}">{{ j.ip }}</a></td><td>{{ j.level }}</td><td class="ts">{{ j.finished_at.as_deref().unwrap_or("") }}</td><td class="mono">{{ j.error.as_deref().unwrap_or("") }}</td></tr>{% endfor %}
+    </tbody></table></div>{% endif %}
+  </section>
+  <section class="card">
+    <div class="card-head"><h2>Intel</h2></div>
+    <dl class="kv">
+      <dt>Tor exit list</dt><dd>{{ tor_fetch }}</dd>
+      <dt>MaxMind GeoLite2</dt><dd>{{ maxmind_fetch }}</dd>
+    </dl>
+  </section>
+</div>
+{% endblock %}

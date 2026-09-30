@@ -28,5 +28,103 @@
   document.querySelectorAll("dialog [data-close]").forEach(function (b) {
     b.addEventListener("click", function () { b.closest("dialog").close(); });
   });
+  // WebAuthn ceremonies (moved out of inline scripts for CSP).
+  function b64uToBuf(s) { return Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), function (c) { return c.charCodeAt(0); }).buffer; }
+  function bufToB64u(b) { return btoa(String.fromCharCode.apply(null, new Uint8Array(b))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
+  var wa = document.querySelector("[data-webauthn]");
+  if (wa) {
+    var mode = wa.getAttribute("data-webauthn"), msg = wa.querySelector("[data-msg]");
+    wa.querySelector("[data-go]").addEventListener("click", async function () {
+      msg.textContent = "";
+      try {
+        if (mode === "login") {
+          var start = await fetch("/login/start", { method: "POST" });
+          if (!start.ok) throw new Error("login start failed: " + start.status);
+          var opts = (await start.json()).publicKey;
+          opts.challenge = b64uToBuf(opts.challenge);
+          if (opts.allowCredentials) opts.allowCredentials = opts.allowCredentials.map(function (c) { c.id = b64uToBuf(c.id); return c; });
+          var cred = await navigator.credentials.get({ publicKey: opts });
+          var body = { credential: { id: cred.id, rawId: bufToB64u(cred.rawId), type: cred.type, response: {
+            authenticatorData: bufToB64u(cred.response.authenticatorData), clientDataJSON: bufToB64u(cred.response.clientDataJSON),
+            signature: bufToB64u(cred.response.signature), userHandle: cred.response.userHandle ? bufToB64u(cred.response.userHandle) : null } } };
+          var fin = await fetch("/login/finish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+          if (fin.ok) location.href = "/admin"; else msg.textContent = "authentication failed (" + fin.status + ")";
+        } else {
+          var tokenEl = wa.querySelector("[data-token]"), labelEl = wa.querySelector("[data-label]");
+          var payload = { label: (labelEl && labelEl.value.trim()) || null };
+          if (tokenEl) payload.setup_token = tokenEl.value.trim();
+          var start2 = await fetch("/enroll/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+          if (!start2.ok) throw new Error("enroll start failed: " + start2.status);
+          var copts = (await start2.json()).publicKey;
+          copts.challenge = b64uToBuf(copts.challenge);
+          copts.user.id = b64uToBuf(copts.user.id);
+          if (copts.excludeCredentials) copts.excludeCredentials = copts.excludeCredentials.map(function (c) { c.id = b64uToBuf(c.id); return c; });
+          var ccred = await navigator.credentials.create({ publicKey: copts });
+          var cbody = { credential: { id: ccred.id, rawId: bufToB64u(ccred.rawId), type: ccred.type, response: {
+            attestationObject: bufToB64u(ccred.response.attestationObject), clientDataJSON: bufToB64u(ccred.response.clientDataJSON) },
+            extensions: ccred.getClientExtensionResults ? ccred.getClientExtensionResults() : {} } };
+          var fin2 = await fetch("/enroll/finish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(cbody) });
+          if (fin2.ok) location.href = "/admin/keys"; else msg.textContent = "enrollment failed (" + fin2.status + ")";
+        }
+      } catch (e) { msg.textContent = e.message || String(e); }
+    });
+  }
+
+  // Body panel: text ⇄ hex dump.
+  document.querySelectorAll("[data-hex-toggle]").forEach(function (b) {
+    var pre = document.getElementById(b.getAttribute("data-hex-toggle")), text = pre.getAttribute("data-text"), hex = null, on = false;
+    b.addEventListener("click", function () {
+      on = !on;
+      if (on && hex === null) {
+        var bytes = new TextEncoder().encode(text), lines = [];
+        for (var i = 0; i < bytes.length; i += 16) {
+          var chunk = Array.prototype.slice.call(bytes, i, i + 16);
+          lines.push(i.toString(16).padStart(8, "0") + "  " + chunk.map(function (x) { return x.toString(16).padStart(2, "0"); }).join(" ").padEnd(48) + "  " +
+            chunk.map(function (x) { return x >= 32 && x < 127 ? String.fromCharCode(x) : "."; }).join(""));
+        }
+        hex = lines.join("\n");
+      }
+      pre.textContent = on ? hex : text;
+      b.textContent = on ? "text" : "hex";
+    });
+  });
+
+  // Live scan queue over SSE.
+  var qt = document.querySelector("[data-queue]");
+  if (qt && window.EventSource) {
+    var live = document.querySelector("[data-live]"), liveLabel = live && live.querySelector("[data-live-label]");
+    var tbody = qt.querySelector("tbody"), limit = parseInt(qt.getAttribute("data-limit") || "25", 10);
+    var setLive = function (state, label) { if (live) { live.setAttribute("data-state", state); if (liveLabel) liveLabel.textContent = label; } };
+    var cell = function (cls, html) { var td = document.createElement("td"); if (cls) td.className = cls; td.innerHTML = html; return td; };
+    var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); };
+    var row = function (j) {
+      var tr = document.createElement("tr"); tr.setAttribute("data-job", j.id);
+      tr.appendChild(cell("mono", "#" + esc(j.id)));
+      tr.appendChild(cell("ip", '<a href="/ip/' + esc(j.ip) + '">' + esc(j.ip) + "</a>"));
+      tr.appendChild(cell("", esc(j.level)));
+      tr.appendChild(cell("", '<span class="badge badge-status" data-status="' + esc(j.status) + '">' + esc(j.status) + "</span>"));
+      tr.appendChild(cell("ts", esc(j.queued_at)));
+      tr.appendChild(cell("ts", esc(j.finished_at)));
+      tr.appendChild(cell("mono", esc(j.error)));
+      return tr;
+    };
+    var apply = function (j) {
+      var empty = tbody.querySelector("[data-empty]"); if (empty) empty.remove();
+      var existing = tbody.querySelector('[data-job="' + j.id + '"]'), fresh = row(j);
+      if (existing) tbody.replaceChild(fresh, existing); else tbody.insertBefore(fresh, tbody.firstChild);
+      while (tbody.children.length > limit) tbody.removeChild(tbody.lastChild);
+    };
+    var snapshot = function (jobs) {
+      tbody.innerHTML = "";
+      jobs.slice(0, limit).forEach(function (j) { tbody.appendChild(row(j)); });
+      if (!jobs.length) { var tr = document.createElement("tr"); tr.setAttribute("data-empty", ""); var td = cell("empty", "Queue empty."); td.setAttribute("colspan", "7"); tr.appendChild(td); tbody.appendChild(tr); }
+    };
+    var es = new EventSource(qt.getAttribute("data-src"));
+    es.addEventListener("open", function () { setLive("open", "live"); });
+    es.addEventListener("error", function () { setLive("reconnecting", "reconnecting…"); });
+    es.addEventListener("snapshot", function (ev) { try { snapshot(JSON.parse(ev.data)); } catch (e) {} });
+    es.addEventListener("job", function (ev) { try { apply(JSON.parse(ev.data)); } catch (e) {} });
+  }
+
   window.peephole = window.peephole || {};
 })();

@@ -24,6 +24,14 @@ pub struct WebauthnConfig {
     pub rp_id: String,
     pub origin: String,
     pub rp_name: String,
+    /// `Secure` flag on the session cookie. Leave `true`; tests over plain
+    /// http set it to `false`.
+    #[serde(default = "default_true")]
+    pub secure_cookies: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

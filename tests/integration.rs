@@ -17,6 +17,7 @@ trusted_proxies = ["127.0.0.1/32"]
 rp_id = "localhost"
 origin = "https://localhost"
 rp_name = "peephole-test"
+secure_cookies = false
 [maxmind]
 account_id = "1"
 license_key = "k"
@@ -384,41 +385,45 @@ async fn queue_sse_requires_session_and_streams_snapshot_then_jobs() {
 }
 
 #[tokio::test]
-async fn authenticated_routes_redirect_without_session() {
+async fn admin_routes_redirect_without_session() {
     let (_trap_base, store, dir) = spawn_trap().await;
-    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
-    let app = peephole::admin::router_with_auth(store, cfg);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = spawn_admin_with(store, dir.path()).await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
     for path in [
-        "/requests/1",
-        "/inbox",
-        "/export",
-        "/keys",
-        "/admin/api/queue",
+        "/admin",
+        "/admin/queue",
+        "/admin/requests/1",
+        "/admin/scans",
+        "/admin/scans/1",
+        "/admin/scans/1/xml",
+        "/admin/fingerprints",
+        "/admin/inbox",
+        "/admin/export",
+        "/admin/export/download?format=csv",
+        "/admin/keys",
     ] {
-        let resp = client
-            .get(format!("http://{addr}{path}"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 303, "{path} must redirect to login");
-        assert_eq!(resp.headers().get("location").unwrap(), "/login");
+        let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), 303, "{path}");
+        assert_eq!(resp.headers().get("location").unwrap(), "/login", "{path}");
+    }
+    for path in [
+        "/admin/requests/1/delete",
+        "/admin/ips/203.0.113.1/delete",
+        "/admin/scans/1/delete",
+        "/admin/claims/1/delete",
+        "/admin/keys/delete",
+    ] {
+        let resp = client.post(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), 303, "{path}");
     }
     // Public routes stay public.
-    let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
-    assert_eq!(resp.status(), 200);
-    let resp = client
-        .get(format!("http://{addr}/login"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    for path in ["/", "/login", "/ips", "/requests"] {
+        let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{path}");
+    }
 }
 
 #[tokio::test]
@@ -552,98 +557,241 @@ async fn enrolled_admin_client(store: Store, cfg: Config) -> (reqwest::Client, S
 }
 
 #[tokio::test]
-#[ignore = "replaced by admin_pages_and_deletes_with_session in Task 10"]
-async fn detail_views_and_inbox_work_with_session() {
+async fn admin_pages_and_deletes_with_session() {
     let (trap_base, store, dir) = spawn_trap().await;
-    let client_pub = reqwest::Client::new();
-    // Seed: one probe, one fp claim with email, one sqli.
-    let _ = client_pub
+    let c = reqwest::Client::new();
+    let _ = c
         .get(format!("{trap_base}/hello"))
         .header("x-forwarded-for", "203.0.113.77")
+        .header("x-marker", "HEADER-MARKER")
         .send()
         .await
         .unwrap();
-    let _ = client_pub
+    let _ = c
         .post(format!("{trap_base}/claim"))
         .header("x-forwarded-for", "203.0.113.77")
         .form(&[("email", "lost@example.org")])
         .send()
         .await
         .unwrap();
-    let _ = client_pub
-        .get(format!("{trap_base}/login?u=' OR '1'='1"))
+    let _ = c
+        .post(format!("{trap_base}/login"))
         .header("x-forwarded-for", "203.0.113.78")
+        .form(&[("username", "BODY-MARKER"), ("password", "x")])
         .send()
         .await
         .unwrap();
+    let ip77 = store.ip_by_addr("203.0.113.77").await.unwrap().unwrap();
+    let ip78 = store.ip_by_addr("203.0.113.78").await.unwrap().unwrap();
+    store
+        .insert_fingerprint(None, ip77.id, "CLUSTERHASH", None, "{}", "{}", b"[]")
+        .await
+        .unwrap();
+    store
+        .insert_fingerprint(None, ip78.id, "CLUSTERHASH", None, "{}", "{}", b"[]")
+        .await
+        .unwrap();
+    // Finish every job the trap queued (78's bait POST is the interesting one).
+    while let Some(job) = store.next_queued_job().await.unwrap() {
+        store
+            .finish_job(
+                job.id,
+                Some(&peephole::scan::nmap_xml::ScanResult {
+                    os_guess: Some("Linux".into()),
+                    raw_xml: b"<nmaprun>RAWXML</nmaprun>".to_vec(),
+                    ports: vec![peephole::scan::nmap_xml::PortResult {
+                        port: 22,
+                        proto: "tcp".into(),
+                        state: "open".into(),
+                        service: Some("ssh".into()),
+                        product: None,
+                        version: None,
+                    }],
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+    }
 
     let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
     let (client, base) = enrolled_admin_client(store.clone(), cfg).await;
+    let get = |p: &str| client.get(format!("{base}{p}")).send();
 
-    // Request list with filter.
-    let html = client
-        .get(format!("{base}/requests?path=/hello"))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(html.contains("/hello"));
-    assert!(!html.contains("/login"));
+    let html = get("/admin").await.unwrap().text().await.unwrap();
+    assert!(
+        html.contains("Scan queue")
+            && html.contains("data-queue")
+            && html.contains("/admin/api/queue")
+    );
+    assert!(html.contains("unread"));
+    let html = get("/admin/queue").await.unwrap().text().await.unwrap();
+    assert!(html.contains("203.0.113.78") && html.contains("done"));
 
-    // Per-request detail contains headers and body (authenticated only).
-    let rid: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/hello' LIMIT 1")
+    let rid: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/login'")
         .fetch_one(&store.pool)
         .await
         .unwrap();
-    let html = client
-        .get(format!("{base}/requests/{rid}"))
-        .send()
+    let html = get(&format!("/admin/requests/{rid}"))
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
-    assert!(html.contains("x-forwarded-for"));
+    assert!(
+        html.contains("BODY-MARKER")
+            && html.contains("x-forwarded-for")
+            && html.contains("form-interaction")
+    );
 
-    // Per-IP detail.
-    let ip_id: i64 = sqlx::query_scalar("SELECT id FROM ips WHERE ip = '203.0.113.77'")
+    let html = get("/admin/scans").await.unwrap().text().await.unwrap();
+    assert!(html.contains("203.0.113.78"));
+    let sid: i64 = sqlx::query_scalar("SELECT id FROM scans WHERE ip_id = ?")
+        .bind(ip78.id)
         .fetch_one(&store.pool)
         .await
         .unwrap();
-    let html = client
-        .get(format!("{base}/ips/{ip_id}"))
-        .send()
+    let html = get(&format!("/admin/scans/{sid}"))
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
-    assert!(html.contains("203.0.113.77"));
-    assert!(html.contains("/hello"));
+    assert!(html.contains("22/tcp") && html.contains("ssh"));
+    let xml = get(&format!("/admin/scans/{sid}/xml")).await.unwrap();
+    assert_eq!(
+        xml.headers().get("content-type").unwrap(),
+        "application/xml"
+    );
+    assert!(xml.text().await.unwrap().contains("RAWXML"));
 
-    // Inbox shows the fp claim with contact email.
-    let html = client
-        .get(format!("{base}/inbox"))
-        .send()
+    let html = get("/admin/fingerprints")
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
+    assert!(
+        html.contains("CLUSTERHASH")
+            && html.contains("203.0.113.77")
+            && html.contains("203.0.113.78")
+    );
+    let html = get("/admin/inbox").await.unwrap().text().await.unwrap();
     assert!(html.contains("lost@example.org"));
+    let html = get("/admin/keys").await.unwrap().text().await.unwrap();
+    assert!(html.contains("test-key") && html.contains("/enroll"));
+    let html = get("/admin/export").await.unwrap().text().await.unwrap();
+    assert!(html.contains("/admin/export/download"));
+    for html_path in [
+        "/admin",
+        "/admin/queue",
+        &format!("/admin/requests/{rid}"),
+        "/admin/keys",
+    ] {
+        let html = get(html_path).await.unwrap().text().await.unwrap();
+        assert!(
+            !html.contains("<script>") && !html.contains(" style=\""),
+            "{html_path} inline code"
+        );
+    }
 
-    // Keys page lists enrolled key.
-    let html = client
-        .get(format!("{base}/keys"))
+    // Deletes.
+    let resp = client
+        .post(format!("{base}/admin/scans/{sid}/delete"))
         .send()
         .await
-        .unwrap()
-        .text()
+        .unwrap();
+    assert_eq!(resp.status(), 200); // followed redirect
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scans WHERE id = ?")
+        .bind(sid)
+        .fetch_one(&store.pool)
         .await
         .unwrap();
-    assert!(html.contains("test-key") || html.contains("credential"));
+    assert_eq!(n, 0);
+    let cid: i64 = sqlx::query_scalar("SELECT id FROM fp_claims")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/admin/claims/{cid}/delete"))
+        .send()
+        .await
+        .unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fp_claims")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+    client
+        .post(format!("{base}/admin/requests/{rid}/delete"))
+        .send()
+        .await
+        .unwrap();
+    assert!(store.request_by_id(rid).await.unwrap().is_none());
+    let resp = client
+        .post(format!("{base}/admin/ips/203.0.113.77/delete"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.url().path(), "/ips", "redirects to the directory");
+    assert!(store.ip_by_addr("203.0.113.77").await.unwrap().is_none());
+    assert!(store.ip_by_addr("203.0.113.78").await.unwrap().is_some());
+    assert_eq!(
+        client
+            .post(format!("{base}/admin/ips/nope/delete"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+}
+
+#[tokio::test]
+async fn enroll_additional_key_with_session() {
+    use webauthn_authenticator_rs::AuthenticatorBackend;
+    use webauthn_authenticator_rs::prelude::Url;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+    let (_trap_base, store, dir) = spawn_trap().await;
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store.clone(), cfg).await;
+    // No setup token: the session alone authorises enrollment.
+    let resp = client
+        .post(format!("{base}/enroll/start"))
+        .json(&serde_json::json!({"label": "second"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let cco: serde_json::Value = resp.json().await.unwrap();
+    let options: webauthn_rs_proto::PublicKeyCredentialCreationOptions =
+        serde_json::from_value(cco["publicKey"].clone()).unwrap();
+    let mut soft = SoftPasskey::new(true);
+    let cred = soft
+        .perform_register(Url::parse("https://localhost").unwrap(), options, 60_000)
+        .unwrap();
+    let resp = client
+        .post(format!("{base}/enroll/finish"))
+        .json(&serde_json::json!({"credential": cred}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(store.load_credentials().await.unwrap().len(), 2);
+    let labels = store.list_credential_labels().await.unwrap();
+    assert!(
+        labels.iter().any(|(_, l, _)| l == "second"),
+        "label stored: {labels:?}"
+    );
+    // Anonymous without token → 403.
+    let anon = reqwest::Client::new();
+    let resp = anon
+        .post(format!("{base}/enroll/start"))
+        .json(&serde_json::json!({"label": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
 }
 
 #[tokio::test]
@@ -666,7 +814,9 @@ async fn export_download_requires_auth_and_filters() {
     let (client, base) = enrolled_admin_client(store, cfg).await;
 
     let resp = client
-        .get(format!("{base}/export/download?format=csv&ip=203.0.113.1"))
+        .get(format!(
+            "{base}/admin/export/download?format=csv&ip=203.0.113.1"
+        ))
         .send()
         .await
         .unwrap();
@@ -684,7 +834,7 @@ async fn export_download_requires_auth_and_filters() {
     assert!(!body.contains("198.51.100.2"));
 
     let resp = client
-        .get(format!("{base}/export/download?format=jsonl"))
+        .get(format!("{base}/admin/export/download?format=jsonl"))
         .send()
         .await
         .unwrap();
@@ -693,7 +843,7 @@ async fn export_download_requires_auth_and_filters() {
     assert!(first.get("datetime").is_some());
 
     let resp = client
-        .get(format!("{base}/export/download?format=parquet"))
+        .get(format!("{base}/admin/export/download?format=parquet"))
         .send()
         .await
         .unwrap();
@@ -717,6 +867,7 @@ trusted_proxies = ["127.0.0.1/32"]
 rp_id = "localhost"
 origin = "https://localhost"
 rp_name = "peephole-test"
+secure_cookies = false
 [maxmind]
 account_id = "1"
 license_key = "k"

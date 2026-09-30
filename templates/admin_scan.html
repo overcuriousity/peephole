@@ -1,0 +1,16 @@
+{% extends "layout.html" %}
+{% block title %}peephole — scan #{{ s.id }}{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Scan #{{ s.id }} · <a class="mono" href="/ip/{{ s.ip }}">{{ s.ip }}</a></h1>
+  <div class="meta"><span>level {{ s.level }}</span><span>started <span class="mono">{{ s.started_at }}</span></span>
+    <span>finished <span class="mono">{{ s.finished_at.as_deref().unwrap_or("—") }}</span></span><span>OS: {{ s.os_guess.as_deref().unwrap_or("unknown") }}</span></div>
+</div>
+<div class="row">
+  <a class="btn" href="/admin/scans/{{ s.id }}/xml">Download raw XML</a>
+  <button class="btn btn-danger" type="button" data-confirm="dlg-del">Delete scan</button>
+  <dialog id="dlg-del"><h3>Delete scan #{{ s.id }}?</h3><p class="muted">Ports recorded by this scan are removed too.</p>
+    <form method="post" action="/admin/scans/{{ s.id }}/delete" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Delete</button></form></dialog>
+</div></div>
+<section class="card"><h2>Ports</h2>{% include "_ports.html" %}</section>
+{% endblock %}
