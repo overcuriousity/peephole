@@ -39,7 +39,7 @@ tok="$(printf 'Sep 30 10:00:00 host peephole[123]: Open /enroll on the admin int
 [ "$tok" = "3f2a1c4e-1111-4222-8333-444455556666" ] || { echo "token extraction broken: '$tok'"; exit 1; }
 
 echo "== refuses to install when systemd is not PID 1 (unless overridden)"
-if PEEPHOLE_ALLOW_NO_SYSTEMD= bash install.sh >/tmp/nopid1.log 2>&1; then echo "expected failure"; exit 1; fi
+if PEEPHOLE_ALLOW_NO_SYSTEMD='' bash install.sh >/tmp/nopid1.log 2>&1; then echo "expected failure"; exit 1; fi
 grep -q "PID 1" /tmp/nopid1.log
 export PEEPHOLE_ALLOW_NO_SYSTEMD=1
 
