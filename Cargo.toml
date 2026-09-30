@@ -45,6 +45,7 @@ zstd = "0.13"
 
 [dev-dependencies]
 bytes = "1"
+serde_urlencoded = "0.7"
 tempfile = "3"
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
 webauthn-rs-proto = "0.5"

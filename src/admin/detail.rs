@@ -19,17 +19,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/export/download", get(export_download))
 }
 
-#[derive(serde::Deserialize, Default)]
-pub struct RequestFilter {
-    pub ip: Option<String>,
-    pub path: Option<String>,
-    pub label: Option<String>,
-    pub severity: Option<i64>,
-    pub country: Option<String>,
-    pub asn: Option<i64>,
-    pub from: Option<String>,
-    pub to: Option<String>,
-}
+use crate::store::browse::RequestFilter;
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -43,7 +33,12 @@ async fn requests_page(
     State(state): State<Arc<AdminState>>,
     Query(f): Query<RequestFilter>,
 ) -> Html<String> {
-    let rows = state.store.search_requests(&f).await.unwrap_or_default();
+    let rows = state
+        .store
+        .search_requests(&f)
+        .await
+        .map(|p| p.items)
+        .unwrap_or_default();
     let mut trs = String::new();
     for r in &rows {
         trs.push_str(&format!(
@@ -88,11 +83,22 @@ async fn ip_detail_page(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> Html<String> {
-    let d = state.store.ip_detail(id).await.ok().flatten();
-    Html(match d {
-        Some(page) => include_str!("../../templates/ip_detail.html").replace("__CONTENT__", &page),
-        None => "<p>not found</p>".to_string(),
-    })
+    // Interim: replaced by the public/admin IP page in Task 9.
+    let Ok(Some(ip)) = state.store.ip_by_id(id).await else {
+        return Html("<p>not found</p>".to_string());
+    };
+    let rows = state
+        .store
+        .requests_for_ip(id, 1)
+        .await
+        .map(|p| p.items)
+        .unwrap_or_default();
+    let mut html = format!("<h1>{}</h1><ul>", esc(&ip.ip));
+    for r in &rows {
+        html.push_str(&format!("<li>{}</li>", esc(&r.path)));
+    }
+    html.push_str("</ul>");
+    Html(include_str!("../../templates/ip_detail.html").replace("__CONTENT__", &html))
 }
 
 async fn inbox_page(_u: SessionUser, State(state): State<Arc<AdminState>>) -> Html<String> {

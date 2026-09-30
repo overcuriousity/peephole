@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod browse;
 pub mod fingerprints;
 pub mod requests;
 pub mod scans;
@@ -85,18 +86,6 @@ impl Store {
     }
 }
 
-#[derive(serde::Serialize, sqlx::FromRow)]
-pub struct RequestListRow {
-    pub id: i64,
-    pub ts: String,
-    pub ip_id: i64,
-    pub ip: String,
-    pub method: String,
-    pub path: String,
-    pub severity: i64,
-    pub labels_json: String,
-}
-
 pub struct FpClaimRow {
     pub ts: String,
     pub ip: String,
@@ -105,55 +94,6 @@ pub struct FpClaimRow {
 }
 
 impl Store {
-    pub async fn search_requests(
-        &self,
-        f: &crate::admin::detail::RequestFilter,
-    ) -> anyhow::Result<Vec<RequestListRow>> {
-        let mut sql = String::from(
-            "SELECT r.id, r.ts, r.ip_id, i.ip, r.method, r.path, r.severity, r.labels_json
-             FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1",
-        );
-        let mut binds: Vec<String> = vec![];
-        if let Some(v) = &f.ip {
-            sql.push_str(" AND i.ip = ?");
-            binds.push(v.clone());
-        }
-        if let Some(v) = &f.path {
-            sql.push_str(" AND r.path LIKE ?");
-            binds.push(format!("%{v}%"));
-        }
-        if let Some(v) = &f.label {
-            sql.push_str(" AND r.labels_json LIKE ?");
-            binds.push(format!("%\"{v}\"%"));
-        }
-        if let Some(v) = &f.severity {
-            sql.push_str(" AND r.severity = ?");
-            binds.push(v.to_string());
-        }
-        if let Some(v) = &f.country {
-            sql.push_str(" AND i.country = ?");
-            binds.push(v.clone());
-        }
-        if let Some(v) = &f.asn {
-            sql.push_str(" AND i.asn = ?");
-            binds.push(v.to_string());
-        }
-        if let Some(v) = &f.from {
-            sql.push_str(" AND r.ts >= ?");
-            binds.push(v.clone());
-        }
-        if let Some(v) = &f.to {
-            sql.push_str(" AND r.ts <= ?");
-            binds.push(v.clone());
-        }
-        sql.push_str(" ORDER BY r.id DESC LIMIT 500");
-        let mut q = sqlx::query_as::<_, RequestListRow>(&sql);
-        for b in binds {
-            q = q.bind(b);
-        }
-        Ok(q.fetch_all(&self.pool).await?)
-    }
-
     pub async fn request_detail(
         &self,
         id: i64,
@@ -179,103 +119,6 @@ impl Store {
             })
             .unwrap_or_default();
         Ok(Some((row, headers_pretty, body_pretty)))
-    }
-
-    pub async fn ip_detail(&self, ip_id: i64) -> anyhow::Result<Option<String>> {
-        let Some(ip) = self.ip_by_id(ip_id).await? else {
-            return Ok(None);
-        };
-        let requests = sqlx::query_as::<_, (String, String, String, i64, String)>(
-            "SELECT ts, method, path, severity, labels_json FROM requests
-             WHERE ip_id = ? ORDER BY id DESC LIMIT 100",
-        )
-        .bind(ip_id)
-        .fetch_all(&self.pool)
-        .await?;
-        let scans = sqlx::query_as::<_, (i64, i64, String, Option<String>)>(
-            "SELECT id, level, COALESCE(finished_at,''), os_guess FROM scans
-             WHERE ip_id = ? ORDER BY id DESC",
-        )
-        .bind(ip_id)
-        .fetch_all(&self.pool)
-        .await?;
-        let fps = sqlx::query_as::<_, (String, i64)>(
-            "SELECT fp_hash, COUNT(*) FROM fingerprints WHERE ip_id = ? GROUP BY fp_hash",
-        )
-        .bind(ip_id)
-        .fetch_all(&self.pool)
-        .await?;
-        let esc = |s: &str| {
-            s.replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-        };
-        let mut html = format!(
-            "<h1>{}</h1><p>first seen {} · last seen {} · country {} · AS{} {} {}</p>",
-            esc(&ip.ip),
-            ip.first_seen,
-            ip.last_seen,
-            esc(&ip.country.clone().unwrap_or("?".into())),
-            ip.asn.map(|a| a.to_string()).unwrap_or("?".into()),
-            esc(&ip.asn_org.clone().unwrap_or_default()),
-            if ip.is_tor_exit {
-                " · <b>tor exit node</b>"
-            } else {
-                ""
-            }
-        );
-        html.push_str("<h2>Scans</h2>");
-        for (scan_id, level, finished, os) in &scans {
-            html.push_str(&format!(
-                "<h3>level {level} · {finished} · {}</h3><ul>",
-                esc(&os.clone().unwrap_or("os unknown".into()))
-            ));
-            let ports = sqlx::query_as::<
-                _,
-                (
-                    i64,
-                    String,
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                ),
-            >(
-                "SELECT port, proto, state, service, product, version FROM ports WHERE scan_id = ?",
-            )
-            .bind(scan_id)
-            .fetch_all(&self.pool)
-            .await?;
-            for (port, proto, state, service, product, version) in &ports {
-                html.push_str(&format!(
-                    "<li>{port}/{proto} {state} {} {} {}</li>",
-                    esc(&service.clone().unwrap_or_default()),
-                    esc(&product.clone().unwrap_or_default()),
-                    esc(&version.clone().unwrap_or_default())
-                ));
-            }
-            html.push_str("</ul>");
-        }
-        html.push_str("<h2>Fingerprints</h2><ul>");
-        for (hash, n) in &fps {
-            let others = self.fingerprint_ip_count(hash, ip_id).await.unwrap_or(0);
-            html.push_str(&format!(
-                "<li><code>{}</code> ×{n} — seen from {others} other IPs</li>",
-                esc(&hash[..16.min(hash.len())])
-            ));
-        }
-        html.push_str("</ul><h2>Requests</h2><table><tr><th>ts</th><th>method</th><th>path</th><th>severity</th><th>labels</th></tr>");
-        for (ts, method, path, severity, labels) in &requests {
-            html.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{severity}</td><td>{}</td></tr>",
-                esc(ts),
-                esc(method),
-                esc(path),
-                esc(labels)
-            ));
-        }
-        html.push_str("</table>");
-        Ok(Some(html))
     }
 
     pub async fn inbox(&self) -> anyhow::Result<Vec<FpClaimRow>> {
