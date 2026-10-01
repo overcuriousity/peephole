@@ -9,6 +9,7 @@ pub mod intel;
 pub mod net;
 pub mod scan;
 pub mod settings;
+pub mod settings_cli;
 pub mod store;
 pub mod trap;
 
@@ -87,7 +88,7 @@ pub fn retention_applies(cfg: &config::Config) -> bool {
 
 pub async fn run(config_path: PathBuf) -> Result<()> {
     // Startup validation (spec §12).
-    let (cfg, classifier, summary) = check_config(&config_path).await?;
+    let (cfg, _, summary) = check_config(&config_path).await?;
     info!(version = VERSION, "{summary}");
     std::fs::create_dir_all(&cfg.data_dir)?;
     let store = store::Store::connect(&cfg.database_path).await?;
@@ -165,13 +166,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // RPC listener and sync loops.
     if let Some(node) = &node {
         scan::arbiter::Arbiter::start(node.clone(), shutdown_rx.clone()).await?;
-        if cfg.roles.scanner {
-            scan::pace::serve_remote(node, pace.clone());
-            tokio::spawn(scan::arbiter::takeover_loop(
-                node.clone(),
-                shutdown_rx.clone(),
-            ));
-        }
+        scan::pace::serve_remote(node, pace.clone());
+        // Does nothing unless this node currently scans.
+        tokio::spawn(scan::arbiter::takeover_loop(
+            node.clone(),
+            shutdown_rx.clone(),
+        ));
         cluster::start(node.clone(), shutdown_rx.clone()).await?;
         tokio::spawn(forward_job_events(
             node.clone(),
@@ -180,71 +180,226 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         ));
     }
 
-    // Scan worker pool.
-    if cfg.roles.scanner {
-        tokio::spawn(scan::run_workers(
-            recorder.clone(),
-            cfg.clone(),
-            pace.clone(),
-            PathBuf::from(nmap_path()),
-            shutdown_rx.clone(),
-            notifier.clone(),
-        ));
+    // Roles run under a supervisor that starts and stops them when the
+    // effective roles change (admin UI, CLI, or a config key holder).
+    let roles = RoleRunner {
+        cfg: cfg.clone(),
+        store: store.clone(),
+        recorder: recorder.clone(),
+        geo,
+        tor,
+        notifier,
+        settings: settings.clone(),
+        node: node.clone(),
+    };
+    // At startup a role that cannot start is fatal, as it always was (the
+    // installer's health check relies on it); later changes are retried.
+    let mut running = Running3::default();
+    roles.reconcile(&mut running, true).await?;
+    info!(roles = %settings.roles().names().join(","), "peephole up");
+    let supervisor = tokio::spawn(roles.supervise(running, shutdown_rx.clone()));
+    shutdown_signal().await;
+    info!("shutting down");
+    let _ = shutdown_tx.send(true);
+    let _ = supervisor.await;
+    Ok(())
+}
+
+/// How often the daemon re-reads settings another process (the CLI) may
+/// have written, and retries a role that failed to start.
+pub const SETTINGS_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A running role: stop it by sending `true`, then wait for the task.
+struct Running {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Running {
+    async fn stop(self) {
+        let _ = self.stop.send(true);
+        let _ = self.task.await;
+    }
+}
+
+/// The three roles' tasks, where running.
+#[derive(Default)]
+struct Running3 {
+    trap: Option<Running>,
+    scanner: Option<Running>,
+    web: Option<Running>,
+}
+
+/// Everything needed to start any role.
+struct RoleRunner {
+    cfg: config::Config,
+    store: store::Store,
+    recorder: store::recorder::Recorder,
+    geo: intel::SharedGeo,
+    tor: intel::SharedTor,
+    notifier: events::Notifier,
+    settings: settings::Settings,
+    node: Option<Arc<cluster::Node>>,
+}
+
+impl RoleRunner {
+    /// Make the running roles equal to the effective ones. `strict`: a role
+    /// that cannot start is an error; otherwise it is logged and tried
+    /// again on the next pass.
+    async fn reconcile(&self, r: &mut Running3, strict: bool) -> Result<()> {
+        let want = self.settings.roles();
+        // A task that ended by itself (listener error) is started afresh.
+        for slot in [&mut r.trap, &mut r.scanner, &mut r.web] {
+            if slot.as_ref().is_some_and(|x| x.task.is_finished()) {
+                *slot = None;
+            }
+        }
+        for (slot, want, name) in [
+            (&mut r.trap, want.listener, "trap"),
+            (&mut r.scanner, want.scanner, "scanner"),
+            (&mut r.web, want.web, "web"),
+        ] {
+            match (want, slot.is_some()) {
+                (true, false) => {
+                    let started = match name {
+                        "trap" => self.start_trap().await,
+                        "scanner" => self.start_scanner().await,
+                        _ => self.start_web().await,
+                    };
+                    match started {
+                        Ok(x) => {
+                            info!(role = name, "role started");
+                            *slot = Some(x);
+                        }
+                        Err(e) if strict => return Err(e.context(format!("starting {name}"))),
+                        Err(e) => {
+                            warn!(role = name, error = %format!("{e:#}"), "role could not start; retrying")
+                        }
+                    }
+                }
+                (false, true) => {
+                    if let Some(x) = slot.take() {
+                        x.stop().await;
+                        info!(role = name, "role stopped");
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(node) = &self.node
+            && let Err(e) = node.set_roles(want).await
+        {
+            warn!(?e, "publishing the new roles failed");
+        }
+        Ok(())
     }
 
-    let mut servers = tokio::task::JoinSet::new();
-    if let (true, Some(addr), Some(classifier)) = (cfg.roles.listener, cfg.trap_listen, classifier)
-    {
-        let trap_app = trap::router(Arc::new(trap::TrapState {
-            store: store.clone(),
-            recorder: recorder.clone(),
-            cfg: cfg.clone(),
+    /// Keep the running roles equal to the effective ones until shutdown.
+    async fn supervise(
+        self,
+        mut running: Running3,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut changes = self.settings.subscribe();
+        loop {
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = tokio::time::sleep(SETTINGS_TICK) => {
+                    if let Err(e) = self.settings.reload().await {
+                        warn!(?e, "reloading settings failed");
+                    }
+                }
+                _ = shutdown.changed() => break,
+            }
+            let _ = self.reconcile(&mut running, false).await;
+        }
+        for r in [running.trap, running.scanner, running.web]
+            .into_iter()
+            .flatten()
+        {
+            r.stop().await;
+        }
+    }
+
+    async fn start_trap(&self) -> Result<Running> {
+        let (Some(addr), Some(dir)) = (self.cfg.trap_listen, &self.cfg.rules_dir) else {
+            anyhow::bail!("trap_listen and rules_dir are required");
+        };
+        // Loaded on every start, so edited rules apply when the role is
+        // switched off and on.
+        let classifier = classify::Classifier::from_dir(dir).context("loading rules")?;
+        let app = trap::router(Arc::new(trap::TrapState {
+            store: self.store.clone(),
+            recorder: self.recorder.clone(),
+            cfg: self.cfg.clone(),
             classifier,
-            geo: geo.clone(),
-            tor: tor.clone(),
-            notifier: notifier.clone(),
+            geo: self.geo.clone(),
+            tor: self.tor.clone(),
+            notifier: self.notifier.clone(),
             helper_rate: Default::default(),
-            pace: pace.clone(),
+            pace: self.settings.pace.clone(),
         }));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding trap listener {addr}"))?;
         info!(%addr, "trap listener up");
-        let trap_shutdown = shutdown_rx.clone();
-        servers.spawn(async move {
-            serve_trap(listener, trap_app, trap_shutdown).await;
-            Ok::<(), std::io::Error>(())
-        });
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        Ok(Running {
+            stop,
+            task: tokio::spawn(serve_trap(listener, app, rx)),
+        })
     }
-    if let (true, Some(addr)) = (cfg.roles.web, cfg.admin_listen) {
+
+    async fn start_scanner(&self) -> Result<Running> {
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        Ok(Running {
+            stop,
+            task: tokio::spawn(scan::run_workers(
+                self.recorder.clone(),
+                self.cfg.clone(),
+                self.settings.pace.clone(),
+                PathBuf::from(nmap_path()),
+                rx,
+                self.notifier.clone(),
+            )),
+        })
+    }
+
+    async fn start_web(&self) -> Result<Running> {
+        let Some(addr) = self.cfg.admin_listen else {
+            anyhow::bail!("admin_listen is required");
+        };
         // First-run admin setup token (spec §8.4).
-        let _ = admin::auth::ensure_setup_token(&store, &cfg.data_dir).await;
-        let admin_app = admin::full_router(Arc::new(
-            admin::AdminState::new(store.clone(), cfg.clone(), notifier, pace)
-                .with_recorder(recorder.clone())
-                .with_settings(settings.clone()),
+        let _ = admin::auth::ensure_setup_token(&self.store, &self.cfg.data_dir).await;
+        let app = admin::full_router(Arc::new(
+            admin::AdminState::new(
+                self.store.clone(),
+                self.cfg.clone(),
+                self.notifier.clone(),
+                self.settings.pace.clone(),
+            )
+            .with_recorder(self.recorder.clone())
+            .with_settings(self.settings.clone()),
         ));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding admin listener {addr}"))?;
         info!(%addr, "admin listener up");
-        servers.spawn(async move { axum::serve(listener, admin_app).await });
+        let (stop, mut rx) = tokio::sync::watch::channel(false);
+        Ok(Running {
+            stop,
+            task: tokio::spawn(async move {
+                let served = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.changed().await;
+                    })
+                    .await;
+                if let Err(e) = served {
+                    warn!(?e, "admin listener stopped");
+                }
+            }),
+        })
     }
-    info!(roles = %cfg.roles.names().join(","), "peephole up");
-
-    // A scanner-only node serves nothing; it runs until interrupted.
-    let served = async {
-        match servers.join_next().await {
-            Some(r) => r.map_err(anyhow::Error::from)?.map_err(anyhow::Error::from),
-            None => std::future::pending().await,
-        }
-    };
-    tokio::select! {
-        r = served => { r?; }
-        _ = shutdown_signal() => { info!("shutting down"); }
-    }
-    let _ = shutdown_tx.send(true);
-    Ok(())
 }
 
 /// Resolve on Ctrl-C or SIGTERM. systemd stops the service with SIGTERM, so

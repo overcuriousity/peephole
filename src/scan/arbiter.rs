@@ -338,7 +338,7 @@ impl Arbiter {
                     || (!self.node.is_blocked(id) && self.node.silent_for(id) < SCANNER_PRESENT)
             })
             .collect();
-        if self.node.roles.scanner && !v.contains(&me) {
+        if self.node.roles().scanner && !v.contains(&me) {
             v.push(me);
         }
         v
@@ -485,7 +485,7 @@ async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Re
         .into_iter()
         .filter(|id| *id == me || scanner(id))
         .min();
-    if lowest_live_scanner != Some(me) || !node.roles.scanner {
+    if lowest_live_scanner != Some(me) || !node.roles().scanner {
         return Ok(());
     }
     let arbiters: Vec<Vec<u8>> = sqlx::query_scalar(

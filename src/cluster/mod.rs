@@ -166,7 +166,7 @@ pub struct Node {
     pub identity: Identity,
     pub cert: tls::NodeCert,
     pub cfg: ClusterConfig,
-    pub roles: Roles,
+    roles: RwLock<Roles>,
     pub proto: (u32, u32),
     pub store: Store,
     pub hlc: hlc::Hlc,
@@ -215,7 +215,7 @@ impl Node {
             identity: p.identity,
             cert,
             cfg: p.cluster,
-            roles: p.roles,
+            roles: RwLock::new(p.roles),
             proto: p.proto,
             store: p.store,
             hlc: hlc::Hlc::new(),
@@ -269,13 +269,34 @@ impl Node {
         self.identity.id
     }
 
+    /// The roles this node runs right now.
+    pub fn roles(&self) -> Roles {
+        *self.roles.read().unwrap()
+    }
+
+    /// Adopt new roles and tell the cluster (member info and heartbeat).
+    pub async fn set_roles(&self, r: Roles) -> Result<()> {
+        if self.roles() == r {
+            return Ok(());
+        }
+        *self.roles.write().unwrap() = r;
+        repl::append(self, &[Record::MemberUpdate(self.self_info())]).await?;
+        self.publish_status();
+        Ok(())
+    }
+
     /// How this node describes itself to the cluster.
     pub fn self_info(&self) -> MemberInfo {
         MemberInfo {
             id: self.id(),
             name: self.cfg.node_name.clone(),
             address: self.cfg.advertise.clone(),
-            roles: self.roles.names().into_iter().map(str::to_string).collect(),
+            roles: self
+                .roles()
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             proto_min: self.proto.0,
             proto_max: self.proto.1,
         }
@@ -469,7 +490,12 @@ impl Node {
             proto_max: self.proto.1,
             node_name: self.cfg.node_name.clone(),
             version: crate::VERSION.to_string(),
-            roles: self.roles.names().into_iter().map(str::to_string).collect(),
+            roles: self
+                .roles()
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
         }
     }
 

@@ -237,7 +237,7 @@ async fn pace_view(
         timeouts_high: r.pace.timeout_secs > current.timeout_secs,
         notice,
         error,
-        not_scanning: st.recorder.node().is_some() && !st.cfg.roles.scanner,
+        not_scanning: st.recorder.node().is_some() && !st.settings.roles().scanner,
     })
 }
 

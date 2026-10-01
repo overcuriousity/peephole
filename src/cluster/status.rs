@@ -205,7 +205,12 @@ impl Node {
             node: self.id(),
             at_ms: self.status.next_at(),
             neighbours: self.status.neighbours(),
-            roles: self.roles.names().into_iter().map(str::to_string).collect(),
+            roles: self
+                .roles()
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             version: crate::VERSION.to_string(),
             pace: local.pace,
             active_scans: local.active_scans,
