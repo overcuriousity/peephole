@@ -50,9 +50,14 @@ It does not install or change nginx. The example has a TLS server block for
 the admin area (the live scan queue needs `proxy_buffering off` on
 `/admin/api/queue`, which the example sets) and a catch-all `default_server`
 that sends everything no real site claims to the trap. The catch-all sets
-`X-Forwarded-For` to the real peer address, so a client cannot spoof it. If
-you front peephole with HAProxy instead, route its fallback backend to the
-trap listener and list the proxy in `trusted_proxies`.
+`X-Forwarded-For` to the real peer address, so a client cannot spoof it. The
+installer prints the nginx steps in the order that works on a stock
+Debian/Ubuntu nginx: get the admin site's certificate
+(`certbot certonly --nginx`) while the default site still serves, remove
+`/etc/nginx/sites-enabled/default` (it also claims `default_server`), then
+enable the example and reload. If you front peephole with HAProxy instead,
+route its fallback backend to the trap listener and list the proxy in
+`trusted_proxies`.
 
 Non-interactive installs can pass the answers as environment variables:
 
