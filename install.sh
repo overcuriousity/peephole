@@ -6,11 +6,14 @@
 #   MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY, PEEPHOLE_DOMAIN, PEEPHOLE_TRUSTED_PROXIES  (first install)
 #   PEEPHOLE_LOCAL_PROXY=1|0  a reverse proxy on this machine fronts the trap (first install)
 #   PEEPHOLE_TTY       read the wizard's answers from this file instead of the terminal (tests)
-#   PEEPHOLE_ROLES     comma-separated subset of listener,scanner,web (default: all three)
-#   PEEPHOLE_CLUSTER_NAME      enables distributed mode with this node name (first install)
+#   PEEPHOLE_ROLES     comma-separated subset of listener,scanner,web (asked when a terminal is
+#                      present; all three when there is none)
+#   PEEPHOLE_CLUSTER=1|0       take part in a cluster (a preset PEEPHOLE_CLUSTER_NAME implies 1)
+#   PEEPHOLE_CLUSTER_NAME      this node's name in the cluster (first install)
 #   PEEPHOLE_CLUSTER_LISTEN    RPC listener (default 0.0.0.0:7443)
 #   PEEPHOLE_CLUSTER_ADVERTISE host:port peers dial (omit for an outbound-only node)
 #   PEEPHOLE_JOIN_TOKEN        invite from an existing member; joined before the first start
+#   PEEPHOLE_REMOTE_CONFIG=1|0 let holders of this node's config key change its settings (cluster only)
 #   PEEPHOLE_FORCE=1   reinstall even when the installed version matches
 #   BASE_URL           alternative download base (tests, mirrors)
 #
@@ -163,6 +166,7 @@ fi
 
 # --- questions (first install only; nothing is written before they are done) --
 if [ "$upgrade" -ne 1 ]; then
+    ROLE_TRAP=""; ROLE_SCANNER=""; ROLE_WEB=""
     if [ -z "${PEEPHOLE_ROLES:-}" ]; then
         if [ "$INTERACTIVE" -eq 1 ]; then
             say $'\nWhat should this node do? Any combination works; a cluster shares the work.\n'
@@ -187,6 +191,9 @@ if [ "$upgrade" -ne 1 ]; then
         ask_yn PEEPHOLE_LOCAL_PROXY "Is a reverse proxy on this machine (nginx) in front of the trap?" n
         if [ "$PEEPHOLE_LOCAL_PROXY" = 1 ]; then
             TRAP_LISTEN="127.0.0.1:8080"
+            if [ -n "${PEEPHOLE_TRUSTED_PROXIES:-}" ] && [ "$PEEPHOLE_TRUSTED_PROXIES" != "127.0.0.1/32,::1/128" ]; then
+                warn "PEEPHOLE_TRUSTED_PROXIES is ignored: with a proxy on this machine only loopback is trusted"
+            fi
             PEEPHOLE_TRUSTED_PROXIES="127.0.0.1/32,::1/128"
         else
             prompt PEEPHOLE_TRUSTED_PROXIES "Trusted proxy CIDRs, comma-separated (X-Forwarded-For is trusted from these)" "10.0.0.0/8"
@@ -195,10 +202,24 @@ if [ "$upgrade" -ne 1 ]; then
     if has_role web; then
         prompt PEEPHOLE_DOMAIN "Public domain of the admin dashboard (WebAuthn relying party)"
     fi
-    prompt_optional PEEPHOLE_CLUSTER_NAME "Distributed mode: this node's name"
-    if [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ]; then
+    # A preset node name means "yes" (unattended installs from before this
+    # question existed).
+    [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ] && PEEPHOLE_CLUSTER="${PEEPHOLE_CLUSTER:-1}"
+    if [ "$INTERACTIVE" -eq 1 ] && [ -z "${PEEPHOLE_CLUSTER:-}" ]; then
+        say $'\nA cluster shares requests, the scan queue and results between nodes of different operators.\n'
+    fi
+    ask_yn PEEPHOLE_CLUSTER "Take part in a cluster (join one now or later, or start one)?" n
+    if [ "$PEEPHOLE_CLUSTER" = 1 ]; then
+        prompt PEEPHOLE_CLUSTER_NAME "This node's name (other operators see it in their admin area)"
         prompt PEEPHOLE_CLUSTER_LISTEN "Cluster RPC listener" "0.0.0.0:7443"
         prompt_optional PEEPHOLE_CLUSTER_ADVERTISE "Address other nodes dial (host:port; empty for an outbound-only node)"
+        prompt_optional PEEPHOLE_JOIN_TOKEN "Invite token from a member (empty to start a new cluster or join later)"
+        if [ "$INTERACTIVE" -eq 1 ] && [ -z "${PEEPHOLE_REMOTE_CONFIG:-}" ]; then
+            say $'\nRemote configuration: this node gets a config key. Whoever you give it to can change\nthis node\'s scan pace, rescan cooldown and roles from their own node. You can rotate the key at any time.\n'
+        fi
+        ask_yn PEEPHOLE_REMOTE_CONFIG "Allow holders of this node's config key to change its settings?" n
+        toml_safe "$PEEPHOLE_CLUSTER_NAME"; toml_safe "$PEEPHOLE_CLUSTER_LISTEN"
+        toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"; toml_safe "${PEEPHOLE_JOIN_TOKEN:-}"
     fi
     prompt_optional MAXMIND_ACCOUNT_ID "MaxMind GeoLite2 account ID (https://www.maxmind.com/en/accounts/current/license-key; optional: in a cluster the lookups of a member with credentials are shared, the databases are not)"
     if [ -n "${MAXMIND_ACCOUNT_ID:-}" ]; then
@@ -210,6 +231,7 @@ if [ "$upgrade" -ne 1 ]; then
     toml_safe "${PEEPHOLE_DOMAIN:-}"; toml_safe "${PEEPHOLE_TRUSTED_PROXIES:-}"
     toml_safe "${PEEPHOLE_CLUSTER_NAME:-}"; toml_safe "${PEEPHOLE_CLUSTER_LISTEN:-}"; toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"
     toml_safe "${MAXMIND_ACCOUNT_ID:-}"; toml_safe "${MAXMIND_LICENSE_KEY:-}"
+    exec 3<&-
 fi
 
 # --- install files -----------------------------------------------------------
@@ -248,6 +270,7 @@ mv -f "$new_manifest" "$RULES_MANIFEST"
 install -m 0644 "${src}/deploy/nginx.example.conf" "${CONFIG_DIR}/nginx.example.conf"
 
 # --- configuration (first install only) --------------------------------------
+CONFIG_KEY=""
 if [ "$upgrade" -eq 1 ]; then
     info "Existing config at ${CONFIG_FILE} left untouched"
 else
@@ -308,7 +331,7 @@ retention_days = 90        # standalone only: delete older requests and scans; 0
 # Non-global addresses (loopback, private, link-local, …) are never scanned.
 never_scan = ["192.168.0.0/16"] # extra CIDRs this node's scanner never scans (own infra, monitoring)
 CONFIG
-        if [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ]; then
+        if [ "${PEEPHOLE_CLUSTER:-0}" = 1 ]; then
             cat <<CONFIG
 
 [cluster]
@@ -320,12 +343,17 @@ CONFIG
             else
                 echo "# No advertise address: outbound-only (this node dials its peers)."
             fi
+            if [ "$PEEPHOLE_REMOTE_CONFIG" = 1 ]; then
+                echo "remote_config = true   # holders of this node's config key may change pace, cooldown and roles"
+            else
+                echo "remote_config = false  # only this node's admin interface, CLI and this file change its settings"
+            fi
         fi
     } > "$CONFIG_FILE"
     chmod 0600 "$CONFIG_FILE"
     info "Wrote ${CONFIG_FILE} (mode 0600 — may contain your MaxMind license key)"
     "$INSTALL_BIN" check-config "$CONFIG_FILE" || die "generated config failed validation"
-    if [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ]; then
+    if [ "${PEEPHOLE_CLUSTER:-0}" = 1 ]; then
         info "Node key: $("$INSTALL_BIN" cluster id "$CONFIG_FILE" 2>/dev/null)"
         if [ -n "${PEEPHOLE_JOIN_TOKEN:-}" ]; then
             if "$INSTALL_BIN" cluster join "$PEEPHOLE_JOIN_TOKEN" "$CONFIG_FILE"; then
@@ -333,6 +361,9 @@ CONFIG
             else
                 warn "joining the cluster failed; retry with: peephole cluster join <token>"
             fi
+        fi
+        if [ "$PEEPHOLE_REMOTE_CONFIG" = 1 ]; then
+            CONFIG_KEY="$("$INSTALL_BIN" cluster config-key show "$CONFIG_FILE" 2>/dev/null || true)"
         fi
     fi
 fi
@@ -396,16 +427,21 @@ peephole ${new_version} is installed and running.
 
 Next steps:
 DONE
-if [ -n "$(sed -n 's/^trap_listen *= *"\([^"]*\)".*/\1/p' "$CONFIG_FILE")" ]; then
-    echo "  - Send requests that match no real site to the trap listener (${TRAP_LISTEN:-0.0.0.0:8080}); see the nginx example."
+trap_listen="$(sed -n 's/^trap_listen *= *"\([^"]*\)".*/\1/p' "$CONFIG_FILE")"
+if [ -n "$trap_listen" ]; then
+    echo "  - Send requests that match no real site to the trap listener (${trap_listen}); see the nginx example."
 fi
 if grep -q '^\[cluster\]' "$CONFIG_FILE"; then
-    echo "  - Distributed mode: open the cluster RPC port to the other nodes only."
+    echo "  - Cluster: open the RPC port to the other nodes only."
     echo "    Node key: $("$INSTALL_BIN" cluster id "$CONFIG_FILE" 2>/dev/null)"
     if grep -q '^advertise' "$CONFIG_FILE"; then
-        echo "    Add members with the reusable invite from 'peephole cluster invite' here and 'peephole cluster join <token>' there."
-    else
-        echo "    Outbound-only: join a reachable member with 'peephole cluster join <token>' (invite created there)."
+        echo "    Invite others with 'peephole cluster invite' (the invite is reusable; limit it with --uses or --ttl)."
+    fi
+    echo "    Join a cluster with 'peephole cluster join <token>'; leave with 'peephole cluster leave'."
+    if [ -n "$CONFIG_KEY" ]; then
+        echo "    Config key (give it only to operators who may change this node's pace, cooldown and roles):"
+        echo "      $CONFIG_KEY"
+        echo "    Withdraw it from everyone with 'peephole cluster config-key rotate'."
     fi
 fi
 if [ -n "$admin_listen" ]; then

@@ -93,10 +93,12 @@ reset_install() {
 
 echo "== wizard: trap only, behind a local nginx (answers typed at the prompts)"
 reset_install
-# trap? yes · scanner? no · web? no · local proxy? yes · cluster name: none · MaxMind: skip
+# trap? yes · scanner? no · web? no · local proxy? yes · cluster? no · MaxMind: skip
 printf 'y\nn\nn\ny\n\n\n' > /tmp/answers
-env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN -u PEEPHOLE_TRUSTED_PROXIES \
+# PEEPHOLE_TRUSTED_PROXIES stays preset (10.0.0.0/8): the local proxy answer replaces it, with a warning.
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard1.log 2>&1 || { cat /tmp/wizard1.log; exit 1; }
+grep -q 'PEEPHOLE_TRUSTED_PROXIES.*ignored' /tmp/wizard1.log
 grep -q '^listener = true' /etc/peephole/config.toml
 grep -q '^scanner = false' /etc/peephole/config.toml
 grep -q '^web = false' /etc/peephole/config.toml
@@ -129,4 +131,28 @@ fi
 grep -q "not allowed" /tmp/wizard3.log
 test ! -e /etc/peephole/config.toml
 test ! -e /usr/local/bin/peephole
+echo "== wizard: scanner in a cluster with remote configuration on"
+reset_install
+# trap? no · scanner? yes · web? no · cluster? yes · name · listen (default) ·
+# advertise · token (none) · remote config? yes · MaxMind: skip
+printf 'n\ny\nn\ny\nscanner-9\n\nscan9.example:7443\n\ny\n\n' > /tmp/answers
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+    PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard4.log 2>&1 || { cat /tmp/wizard4.log; exit 1; }
+grep -q '^node_name = "scanner-9"' /etc/peephole/config.toml
+grep -q '^listen = "0.0.0.0:7443"' /etc/peephole/config.toml
+grep -q '^advertise = "scan9.example:7443"' /etc/peephole/config.toml
+grep -q '^remote_config = true' /etc/peephole/config.toml
+grep -q 'peephole-cfg1:' /tmp/wizard4.log
+grep -q 'ed25519:' /tmp/wizard4.log
+/usr/local/bin/peephole check-config /etc/peephole/config.toml | grep -q 'remote config: on'
+
+echo "== unattended: a bad join token does not fail the install"
+reset_install
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+    PEEPHOLE_ROLES=scanner PEEPHOLE_CLUSTER_NAME=scanner-2 PEEPHOLE_CLUSTER_LISTEN=0.0.0.0:7443 \
+    PEEPHOLE_JOIN_TOKEN=peephole1:garbage PEEPHOLE_REMOTE_CONFIG=0 \
+    bash install.sh > /tmp/badjoin.log 2>&1 || { cat /tmp/badjoin.log; exit 1; }
+grep -q 'joining the cluster failed' /tmp/badjoin.log
+grep -q '^remote_config = false' /etc/peephole/config.toml
+if grep -q 'peephole-cfg1:' /tmp/badjoin.log; then echo "locked node printed a config key"; exit 1; fi
 echo "== ok"
