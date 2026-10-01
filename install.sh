@@ -250,9 +250,9 @@ max_workers = 2            # concurrent nmap subprocesses
 timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admin queue page)
 rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
 max_scans_per_hour = 30    # rate cap of this scanner; excess jobs stay queued
-retention_days = 90        # delete requests and scan results older than this; 0 = keep forever
+retention_days = 90        # standalone only: delete older requests and scans; 0 = keep forever (ignored in a cluster)
 # Non-global addresses (loopback, private, link-local, …) are never scanned.
-never_scan = ["192.168.0.0/16"] # extra CIDRs never counter-scanned (own infra, monitoring)
+never_scan = ["192.168.0.0/16"] # extra CIDRs this node's scanner never scans (own infra, monitoring)
 CONFIG
         if [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ]; then
             cat <<CONFIG
@@ -349,7 +349,7 @@ if grep -q '^\[cluster\]' "$CONFIG_FILE"; then
     echo "  - Distributed mode: open the cluster RPC port to the other nodes only."
     echo "    Node key: $("$INSTALL_BIN" cluster id "$CONFIG_FILE" 2>/dev/null)"
     if grep -q '^advertise' "$CONFIG_FILE"; then
-        echo "    Add members with 'peephole cluster invite' here and 'peephole cluster join <token>' there."
+        echo "    Add members with the reusable invite from 'peephole cluster invite' here and 'peephole cluster join <token>' there."
     else
         echo "    Outbound-only: join a reachable member with 'peephole cluster join <token>' (invite created there)."
     fi

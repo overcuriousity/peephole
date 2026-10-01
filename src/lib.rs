@@ -65,12 +65,23 @@ pub async fn check_config(
             )),
             Err(e) => return Err(e.context("node key")),
         }
+        if cfg.scan.retention_days > 0 {
+            summary.push_str(
+                "\nnote: scan.retention_days is ignored in a cluster (the shared dataset is persistent)",
+            );
+        }
     }
     for n in notes {
         summary.push('\n');
         summary.push_str(&n);
     }
     Ok((cfg, classifier, summary))
+}
+
+/// Whether old records are deleted by age. Only on a standalone node: a
+/// cluster's dataset is persistent, and nothing in it is erased by age.
+pub fn retention_applies(cfg: &config::Config) -> bool {
+    cfg.cluster.is_none() && cfg.scan.retention_days > 0
 }
 
 pub async fn run(config_path: PathBuf) -> Result<()> {
@@ -123,13 +134,15 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         shutdown_rx.clone(),
     ));
 
-    // Retention: prune requests and scan results older than the configured
-    // window so the database does not grow without bound.
-    tokio::spawn(run_retention(
-        recorder.clone(),
-        cfg.scan.retention_days,
-        shutdown_rx.clone(),
-    ));
+    // Retention (standalone only): prune requests and scan results older
+    // than the configured window so the database does not grow without bound.
+    if retention_applies(&cfg) {
+        tokio::spawn(run_retention(
+            recorder.clone(),
+            cfg.scan.retention_days,
+            shutdown_rx.clone(),
+        ));
+    }
 
     // Queue change notifications: trap + workers publish, admin SSE subscribes.
     let notifier = events::Notifier::new();
@@ -382,5 +395,26 @@ async fn forward_job_events(
                 notifier.publish(j);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(extra: &str) -> config::Config {
+        toml::from_str(&format!(
+            "database_path = \"/x\"\ndata_dir = \"/x\"\n[roles]\nlistener = false\nweb = false\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn retention_only_applies_to_standalone_nodes() {
+        assert!(retention_applies(&cfg("")));
+        assert!(!retention_applies(&cfg("[scan]\nretention_days = 0\n")));
+        assert!(!retention_applies(&cfg(
+            "[cluster]\nnode_name = \"n\"\nlisten = \"127.0.0.1:7443\"\n"
+        )));
     }
 }
