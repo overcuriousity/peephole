@@ -1183,3 +1183,60 @@ async fn outbound_only_scanner_drains_the_queue() {
     })
     .await;
 }
+
+/// A web node changes a headless scanner's pace; it is applied, persisted
+/// there and visible in the scanner's heartbeat.
+#[tokio::test]
+async fn pace_is_set_remotely() {
+    let tools = tempfile::tempdir().unwrap();
+    let nmap = fake_nmap(tools.path(), 0.1);
+    let (ia, a) = new_node("a");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&c], DEFAULT).await;
+    let nc = boot(
+        ic,
+        &c,
+        &[&a],
+        Opts {
+            scanner: Some(nmap),
+            ..DEFAULT
+        },
+    )
+    .await;
+    peephole::scan::pace::serve_remote(&nc.node, nc.pace.clone());
+    let new = peephole::scan::pace::Pace {
+        max_workers: 3,
+        max_scans_per_hour: 42,
+        timeout_secs: 600,
+    };
+    peephole::scan::pace::set_remote(&na.node, c.id, new)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(nc.pace.get(), new);
+    let saved = nc
+        .store
+        .setting_get("scan.max_scans_per_hour")
+        .await
+        .unwrap();
+    assert_eq!(saved.as_deref(), Some("42"));
+    // Invalid values are refused by the scanner, which keeps its pace.
+    let bad = peephole::scan::pace::Pace {
+        max_workers: 999,
+        ..new
+    };
+    assert!(
+        peephole::scan::pace::set_remote(&na.node, c.id, bad)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(nc.pace.get(), new);
+    eventually_for(Duration::from_secs(40), "a sees c's new pace", || async {
+        na.status
+            .known(&c.id)
+            .and_then(|k| k.hb.pace)
+            .is_some_and(|p| p.max_scans_per_hour == 42)
+    })
+    .await;
+}

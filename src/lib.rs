@@ -128,11 +128,19 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // Scan pace: config defaults, overridden from the admin queue page.
     let pace = scan::pace::SharedPace::load(&store, &cfg.scan).await?;
 
-    // Distributed mode: RPC listener and peer loops.
-    if cfg.cluster.is_some() {
-        let node =
-            cluster::Node::open(cluster::NodeParams::from_config(&cfg, store.clone())?).await?;
-        cluster::start(node, shutdown_rx.clone()).await?;
+    // Distributed mode: job arbiter (answers scanners' claims), remote pace
+    // changes and takeover of silent arbiters' queues (scanners), then the
+    // RPC listener and sync loops.
+    if let Some(node) = &node {
+        scan::arbiter::Arbiter::start(node.clone(), shutdown_rx.clone()).await?;
+        if cfg.roles.scanner {
+            scan::pace::serve_remote(node, pace.clone());
+            tokio::spawn(scan::arbiter::takeover_loop(
+                node.clone(),
+                shutdown_rx.clone(),
+            ));
+        }
+        cluster::start(node.clone(), shutdown_rx.clone()).await?;
     }
 
     // Scan worker pool.

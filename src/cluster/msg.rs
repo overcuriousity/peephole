@@ -66,6 +66,14 @@ pub enum Msg {
     RequeueReply {
         n: u64,
     },
+    /// Admin → scanner: change its scan pace (persisted there).
+    SetPace {
+        pace: super::status::PaceInfo,
+    },
+    /// `error` is None on success.
+    SetPaceReply {
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

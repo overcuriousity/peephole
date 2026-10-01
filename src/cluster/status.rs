@@ -215,6 +215,12 @@ impl Node {
         self.status.merge(hb, SignedHeartbeat { body, sig });
     }
 
+    /// Publish a status change now instead of with the next idle round.
+    pub fn publish_status(&self) {
+        self.refresh_heartbeat();
+        self.notify_changed();
+    }
+
     /// Merge gossiped heartbeats from members; returns how many were new.
     pub fn merge_heartbeats(&self, incoming: Vec<SignedHeartbeat>) -> usize {
         incoming

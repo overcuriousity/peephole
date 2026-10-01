@@ -250,6 +250,68 @@ pub fn recommend(m: &QueueMetrics, current: Pace) -> Recommendation {
     }
 }
 
+/// Answer pace changes sent by web nodes (scanner nodes in a cluster).
+pub fn serve_remote(node: &Arc<crate::cluster::Node>, pace: SharedPace) {
+    use crate::cluster::msg::Msg;
+    let store = node.store.clone();
+    let weak = Arc::downgrade(node);
+    node.on_message(Arc::new(move |from, msg| {
+        let (pace, store, weak) = (pace.clone(), store.clone(), weak.clone());
+        Box::pin(async move {
+            let Msg::SetPace { pace: p } = msg else {
+                return None;
+            };
+            let new = Pace {
+                max_workers: p.max_workers as usize,
+                max_scans_per_hour: p.max_scans_per_hour,
+                timeout_secs: p.timeout_secs,
+            };
+            let error = match pace.set(&store, new).await {
+                Ok(Ok(())) => {
+                    tracing::info!(by = %from.short(), ?new, "scan pace changed remotely");
+                    if let Some(node) = weak.upgrade() {
+                        node.status.local.lock().unwrap().pace = Some(p);
+                        node.publish_status();
+                    }
+                    None
+                }
+                Ok(Err(e)) => Some(e),
+                Err(e) => Some(format!("{e:#}")),
+            };
+            Some(Msg::SetPaceReply { error })
+        })
+    }));
+}
+
+/// Change the pace of scanner `target` from this node.
+pub async fn set_remote(
+    node: &Arc<crate::cluster::Node>,
+    target: crate::cluster::identity::NodeId,
+    p: Pace,
+) -> Result<Result<(), String>> {
+    use crate::cluster::msg::Msg;
+    if let Err(e) = p.validate() {
+        return Ok(Err(e));
+    }
+    let pace = crate::cluster::status::PaceInfo {
+        max_workers: p.max_workers as u32,
+        max_scans_per_hour: p.max_scans_per_hour,
+        timeout_secs: p.timeout_secs,
+    };
+    match node
+        .request(
+            target,
+            Msg::SetPace { pace },
+            std::time::Duration::from_secs(15),
+        )
+        .await?
+    {
+        Msg::SetPaceReply { error: None } => Ok(Ok(())),
+        Msg::SetPaceReply { error: Some(e) } => Ok(Err(e)),
+        other => anyhow::bail!("unexpected answer {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
