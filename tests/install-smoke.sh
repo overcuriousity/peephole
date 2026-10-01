@@ -87,4 +87,46 @@ grep -q 'ed25519:' /tmp/headless.log
 # The node lists itself once the daemon has run (`cluster members` is read-only
 # and systemd is stubbed here); the config names it.
 grep -q '^node_name = "scanner-1"' /etc/peephole/config.toml
+reset_install() {
+    rm -rf /etc/peephole /var/lib/peephole /usr/local/bin/peephole /usr/local/bin/peephole.prev /tmp/enabled
+}
+
+echo "== wizard: trap only, behind a local nginx (answers typed at the prompts)"
+reset_install
+# trap? yes · scanner? no · web? no · local proxy? yes · cluster name: none · MaxMind: skip
+printf 'y\nn\nn\ny\n\n\n' > /tmp/answers
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN -u PEEPHOLE_TRUSTED_PROXIES \
+    PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard1.log 2>&1 || { cat /tmp/wizard1.log; exit 1; }
+grep -q '^listener = true' /etc/peephole/config.toml
+grep -q '^scanner = false' /etc/peephole/config.toml
+grep -q '^web = false' /etc/peephole/config.toml
+grep -q '^trap_listen = "127.0.0.1:8080"' /etc/peephole/config.toml
+grep -q '^trusted_proxies = \["127.0.0.1/32","::1/128"\]' /etc/peephole/config.toml
+if grep -q 'webauthn\|maxmind\|\[cluster\]\|admin_listen' /etc/peephole/config.toml; then
+    echo "trap-only config has other roles' settings"; cat /etc/peephole/config.toml; exit 1
+fi
+/usr/local/bin/peephole check-config /etc/peephole/config.toml
+
+echo "== wizard: no role at all is refused before anything is written"
+reset_install
+printf 'n\nn\nn\n' > /tmp/answers
+if env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+    PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard2.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q "at least one" /tmp/wizard2.log
+test ! -e /etc/peephole/config.toml
+test ! -e /usr/local/bin/peephole
+
+echo "== wizard: a quote in an answer is refused"
+reset_install
+# trap? no · scanner? no · web? yes · domain with a quote
+printf 'n\nn\ny\nbad"domain\n' > /tmp/answers
+if env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+    PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard3.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q "not allowed" /tmp/wizard3.log
+test ! -e /etc/peephole/config.toml
+test ! -e /usr/local/bin/peephole
 echo "== ok"

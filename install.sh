@@ -4,6 +4,8 @@
 #
 # Re-running upgrades an existing installation. Environment overrides:
 #   MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY, PEEPHOLE_DOMAIN, PEEPHOLE_TRUSTED_PROXIES  (first install)
+#   PEEPHOLE_LOCAL_PROXY=1|0  a reverse proxy on this machine fronts the trap (first install)
+#   PEEPHOLE_TTY       read the wizard's answers from this file instead of the terminal (tests)
 #   PEEPHOLE_ROLES     comma-separated subset of listener,scanner,web (default: all three)
 #   PEEPHOLE_CLUSTER_NAME      enables distributed mode with this node name (first install)
 #   PEEPHOLE_CLUSTER_LISTEN    RPC listener (default 0.0.0.0:7443)
@@ -50,39 +52,65 @@ if [ "${PEEPHOLE_ALLOW_NO_SYSTEMD:-0}" != "1" ] && [ "$(cat /proc/1/comm 2>/dev/
 fi
 [ "$(uname -m)" = "x86_64" ] || die "only x86_64 builds are published; build from source on $(uname -m) (see README)"
 
-# Interactive only if a terminal can actually be opened (in containers
-# /dev/tty may exist without one).
-if { exec 3</dev/tty; } 2>/dev/null; then INTERACTIVE=1; exec 3<&-; else INTERACTIVE=0; fi
-
-prompt() {
-    # prompt <varname> <message> [default]
-    local var="$1" msg="$2" default="${3:-}" value
-    if [ -n "${!var:-}" ]; then return 0; fi
-    [ "$INTERACTIVE" -eq 1 ] || die "missing required setting: ${var} (set it as an environment variable for non-interactive installs)"
-    if [ -n "$default" ]; then printf '%s [%s]: ' "$msg" "$default" > /dev/tty; else printf '%s: ' "$msg" > /dev/tty; fi
-    read -r value < /dev/tty
-    [ -n "$value" ] || value="$default"
-    [ -n "$value" ] || die "no value provided for ${var}"
-    printf -v "$var" '%s' "$value"
-}
-
-# Like prompt, but an empty answer (or a non-interactive install without the
-# variable) leaves it empty.
-prompt_optional() {
-    local var="$1" msg="$2" value
-    if [ -n "${!var:-}" ] || [ "$INTERACTIVE" -ne 1 ]; then return 0; fi
-    printf '%s (empty to skip): ' "$msg" > /dev/tty
-    read -r value < /dev/tty
-    printf -v "$var" '%s' "$value"
-}
-
-has_role() { [[ ",${PEEPHOLE_ROLES}," == *",$1,"* ]]; }
+# Questions are read from the terminal, or from the file PEEPHOLE_TTY names
+# (tests). One descriptor stays open so answers are consumed in order.
+# Interactive only if it can actually be opened (in containers /dev/tty may
+# exist without a terminal behind it).
+TTY_IN="${PEEPHOLE_TTY:-/dev/tty}"
+if { exec 3<"$TTY_IN"; } 2>/dev/null; then INTERACTIVE=1; else INTERACTIVE=0; fi
+# Prompts go to the terminal; when answers come from a file, to stderr.
+say() { if [ -z "${PEEPHOLE_TTY:-}" ] && [ "$INTERACTIVE" -eq 1 ]; then printf '%s' "$*" > /dev/tty; else printf '%s' "$*" >&2; fi; }
 
 toml_safe() {
     if [[ "$1" == *[\"\\]* ]] || [[ "$1" == *$'\n'* ]]; then
         die "value contains characters that are not allowed (quote, backslash, newline): $1"
     fi
 }
+
+prompt() {
+    # prompt <varname> <message> [default]: a required value.
+    local var="$1" msg="$2" default="${3:-}" value=""
+    if [ -n "${!var:-}" ]; then return 0; fi
+    [ "$INTERACTIVE" -eq 1 ] || die "missing required setting: ${var} (set it as an environment variable for non-interactive installs)"
+    if [ -n "$default" ]; then say "${msg} [${default}]: "; else say "${msg}: "; fi
+    read -r value <&3 || true
+    [ -n "$value" ] || value="$default"
+    [ -n "$value" ] || die "no value provided for ${var}"
+    toml_safe "$value"
+    printf -v "$var" '%s' "$value"
+}
+
+# Like prompt, but an empty answer (or a non-interactive install without the
+# variable) leaves it empty.
+prompt_optional() {
+    local var="$1" msg="$2" value=""
+    if [ -n "${!var:-}" ] || [ "$INTERACTIVE" -ne 1 ]; then return 0; fi
+    say "${msg} (empty to skip): "
+    read -r value <&3 || true
+    toml_safe "$value"
+    printf -v "$var" '%s' "$value"
+}
+
+# ask_yn <varname> <question> <default y|n>: sets the variable to 1 or 0.
+# A preset value (1/0/y/n/yes/no) is kept; without a terminal the default is
+# taken.
+ask_yn() {
+    local var="$1" msg="$2" default="$3" value="${!1:-}"
+    if [ -z "$value" ]; then
+        if [ "$INTERACTIVE" -eq 1 ]; then
+            if [ "$default" = y ]; then say "${msg} [Y/n]: "; else say "${msg} [y/N]: "; fi
+            read -r value <&3 || true
+        fi
+        [ -n "$value" ] || value="$default"
+    fi
+    case "$value" in
+        1|y|Y|yes|Yes|YES) printf -v "$var" '1' ;;
+        0|n|N|no|No|NO) printf -v "$var" '0' ;;
+        *) die "${var}: answer yes or no (got '${value}')" ;;
+    esac
+}
+
+has_role() { [[ ",${PEEPHOLE_ROLES}," == *",$1,"* ]]; }
 
 # --- prerequisites (only what is missing) ------------------------------------
 if [ "${PEEPHOLE_SKIP_APT:-0}" != "1" ]; then
@@ -133,6 +161,57 @@ if [ "$upgrade" -eq 1 ]; then
     fi
 fi
 
+# --- questions (first install only; nothing is written before they are done) --
+if [ "$upgrade" -ne 1 ]; then
+    if [ -z "${PEEPHOLE_ROLES:-}" ]; then
+        if [ "$INTERACTIVE" -eq 1 ]; then
+            say $'\nWhat should this node do? Any combination works; a cluster shares the work.\n'
+            ask_yn ROLE_TRAP "Run a trap (catch and record requests that reach no real site)?" y
+            ask_yn ROLE_SCANNER "Run the scanner (nmap counter-scans, from this machine's address)?" y
+            ask_yn ROLE_WEB "Have the web interface (public wall of shame and admin area)?" y
+            PEEPHOLE_ROLES=""
+            [ "$ROLE_TRAP" = 1 ] && PEEPHOLE_ROLES="listener"
+            [ "$ROLE_SCANNER" = 1 ] && PEEPHOLE_ROLES="${PEEPHOLE_ROLES:+$PEEPHOLE_ROLES,}scanner"
+            [ "$ROLE_WEB" = 1 ] && PEEPHOLE_ROLES="${PEEPHOLE_ROLES:+$PEEPHOLE_ROLES,}web"
+            [ -n "$PEEPHOLE_ROLES" ] || die "enable at least one of trap, scanner and web interface"
+        else
+            PEEPHOLE_ROLES="listener,scanner,web"
+        fi
+    fi
+    PEEPHOLE_ROLES="$(printf '%s' "$PEEPHOLE_ROLES" | tr -d ' ')"
+    for r in $(printf '%s' "$PEEPHOLE_ROLES" | tr ',' ' '); do
+        case "$r" in listener|scanner|web) ;; *) die "unknown role '$r' in PEEPHOLE_ROLES (listener, scanner, web)";; esac
+    done
+    TRAP_LISTEN="0.0.0.0:8080"
+    if has_role listener; then
+        ask_yn PEEPHOLE_LOCAL_PROXY "Is a reverse proxy on this machine (nginx) in front of the trap?" n
+        if [ "$PEEPHOLE_LOCAL_PROXY" = 1 ]; then
+            TRAP_LISTEN="127.0.0.1:8080"
+            PEEPHOLE_TRUSTED_PROXIES="127.0.0.1/32,::1/128"
+        else
+            prompt PEEPHOLE_TRUSTED_PROXIES "Trusted proxy CIDRs, comma-separated (X-Forwarded-For is trusted from these)" "10.0.0.0/8"
+        fi
+    fi
+    if has_role web; then
+        prompt PEEPHOLE_DOMAIN "Public domain of the admin dashboard (WebAuthn relying party)"
+    fi
+    prompt_optional PEEPHOLE_CLUSTER_NAME "Distributed mode: this node's name"
+    if [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ]; then
+        prompt PEEPHOLE_CLUSTER_LISTEN "Cluster RPC listener" "0.0.0.0:7443"
+        prompt_optional PEEPHOLE_CLUSTER_ADVERTISE "Address other nodes dial (host:port; empty for an outbound-only node)"
+    fi
+    prompt_optional MAXMIND_ACCOUNT_ID "MaxMind GeoLite2 account ID (https://www.maxmind.com/en/accounts/current/license-key; optional: in a cluster the lookups of a member with credentials are shared, the databases are not)"
+    if [ -n "${MAXMIND_ACCOUNT_ID:-}" ]; then
+        prompt MAXMIND_LICENSE_KEY "MaxMind GeoLite2 license key"
+    else
+        warn "no MaxMind credentials: this node cannot look up GeoIP data; it shows what other cluster members look up, if any can"
+    fi
+    # Values that arrived preset from the environment were not checked by a prompt.
+    toml_safe "${PEEPHOLE_DOMAIN:-}"; toml_safe "${PEEPHOLE_TRUSTED_PROXIES:-}"
+    toml_safe "${PEEPHOLE_CLUSTER_NAME:-}"; toml_safe "${PEEPHOLE_CLUSTER_LISTEN:-}"; toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"
+    toml_safe "${MAXMIND_ACCOUNT_ID:-}"; toml_safe "${MAXMIND_LICENSE_KEY:-}"
+fi
+
 # --- install files -----------------------------------------------------------
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "${CONFIG_DIR}/rules"
 info "Installing binary to ${INSTALL_BIN}"
@@ -173,31 +252,6 @@ if [ "$upgrade" -eq 1 ]; then
     info "Existing config at ${CONFIG_FILE} left untouched"
 else
     info "Configuring peephole"
-    PEEPHOLE_ROLES="${PEEPHOLE_ROLES:-listener,scanner,web}"
-    PEEPHOLE_ROLES="$(printf '%s' "$PEEPHOLE_ROLES" | tr -d ' ')"
-    for r in $(printf '%s' "$PEEPHOLE_ROLES" | tr ',' ' '); do
-        case "$r" in listener|scanner|web) ;; *) die "unknown role '$r' in PEEPHOLE_ROLES (listener, scanner, web)";; esac
-    done
-    prompt_optional MAXMIND_ACCOUNT_ID "MaxMind GeoLite2 account ID (https://www.maxmind.com/en/accounts/current/license-key; optional: in a cluster the lookups of a member with credentials are shared, the databases are not)"
-    if [ -n "${MAXMIND_ACCOUNT_ID:-}" ]; then
-        prompt MAXMIND_LICENSE_KEY "MaxMind GeoLite2 license key"
-    else
-        warn "no MaxMind credentials: this node cannot look up GeoIP data; it shows what other cluster members look up, if any can"
-    fi
-    if has_role web; then
-        prompt PEEPHOLE_DOMAIN "Public domain of the admin dashboard (WebAuthn relying party)"
-        toml_safe "$PEEPHOLE_DOMAIN"
-    fi
-    if has_role listener; then
-        prompt PEEPHOLE_TRUSTED_PROXIES "Trusted proxy CIDRs, comma-separated (X-Forwarded-For is trusted from these)" "10.0.0.0/8"
-    fi
-    prompt_optional PEEPHOLE_CLUSTER_NAME "Distributed mode: this node's name"
-    if [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ]; then
-        prompt PEEPHOLE_CLUSTER_LISTEN "Cluster RPC listener" "0.0.0.0:7443"
-        prompt_optional PEEPHOLE_CLUSTER_ADVERTISE "Address other nodes dial (host:port; empty for an outbound-only node)"
-        toml_safe "$PEEPHOLE_CLUSTER_NAME"; toml_safe "$PEEPHOLE_CLUSTER_LISTEN"; toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"
-    fi
-    toml_safe "${MAXMIND_ACCOUNT_ID:-}"; toml_safe "${MAXMIND_LICENSE_KEY:-}"
     proxies_toml="$(printf '%s' "${PEEPHOLE_TRUSTED_PROXIES:-}" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | sed '/^$/d' | sed 's/.*/"&"/' | paste -sd',' -)"
     role() { if has_role "$1"; then echo true; else echo false; fi; }
     {
@@ -205,8 +259,8 @@ else
         echo "# Full reference: https://github.com/${REPO}/blob/master/deploy/config.example.toml"
         if has_role listener; then
             echo
-            echo "# Trap listener: HAProxy routes fallback (nonexistent-route) traffic here directly."
-            echo 'trap_listen = "0.0.0.0:8080"'
+            echo "# Trap listener: your reverse proxy sends requests that match no real site here."
+            echo "trap_listen = \"${TRAP_LISTEN}\""
             echo "rules_dir = \"${CONFIG_DIR}/rules\""
             echo "# Proxies whose X-Forwarded-For header is trusted for the real client IP."
             echo "trusted_proxies = [${proxies_toml}]"
@@ -343,7 +397,7 @@ peephole ${new_version} is installed and running.
 Next steps:
 DONE
 if [ -n "$(sed -n 's/^trap_listen *= *"\([^"]*\)".*/\1/p' "$CONFIG_FILE")" ]; then
-    echo "  - Route fallback traffic from HAProxy to the trap listener (0.0.0.0:8080)."
+    echo "  - Send requests that match no real site to the trap listener (${TRAP_LISTEN:-0.0.0.0:8080}); see the nginx example."
 fi
 if grep -q '^\[cluster\]' "$CONFIG_FILE"; then
     echo "  - Distributed mode: open the cluster RPC port to the other nodes only."
