@@ -112,6 +112,9 @@ pub struct Stats {
     pub top_labels: Vec<Named>,
     pub severity_distribution: Vec<Named>,
     pub timeline: Vec<Bucket>,
+    /// Admin-only, rendered server-side on the wall. Never serialized to the
+    /// public `/api/stats` JSON — request rows identify individual clients.
+    #[serde(skip_serializing)]
     pub recent: Vec<RecentRequest>,
     pub intel: HashMap<String, String>,
 }

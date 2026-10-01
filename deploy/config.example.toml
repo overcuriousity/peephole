@@ -44,10 +44,14 @@ rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
 max_scans_per_hour = 30    # global rate cap; excess jobs stay queued
 never_scan = ["192.168.0.0/16"] # CIDRs never counter-scanned (own infra, monitoring)
 
-# Optional per-level nmap argv overrides; {target} is NOT used — the target IP is
-# appended as the final argument. Example:
+# Default scans are non-intrusive: no -A, no intrusive NSE scripts, timing
+# capped at -T3. Severity escalates by scope (ports, -sV, -O, discovery/safe
+# scripts). Optional per-level argv overrides below; {target} is NOT used — the
+# target IP is appended as the final argument. A script selector with spaces is
+# one element. Example:
 # [scan.level_argv]
 # 2 = ["-Pn", "-sS", "-sV", "-T3", "--top-ports", "2000"]
+# 3 = ["-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000", "--script", "(discovery or safe) and not intrusive"]
 
 # Distributed mode: share requests, scan queue, results and intel with other
 # nodes (README: Distributed mode). Absent: standalone. The node key is

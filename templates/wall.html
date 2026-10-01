@@ -79,6 +79,7 @@
     </section>
   </div>
 
+  {% if chrome.authed %}
   <section class="card">
     <div class="card-head"><h2>Recent activity</h2><a href="/requests">search all →</a></div>
     <div class="table-wrap"><table>
@@ -98,5 +99,6 @@
       </tbody>
     </table></div>
   </section>
+  {% endif %}
 </div>
 {% endblock %}
