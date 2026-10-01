@@ -44,14 +44,18 @@ pub struct RequestRec {
     pub page_token: Option<String>,
 }
 
-/// GeoIP / Tor facts about an IP (last write wins by HLC).
+/// One provider's result for an IP (per origin, newest wins by HLC).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct IpEnrichRec {
+pub struct IpIntelRec {
     pub ip: String,
-    pub country: Option<String>,
-    pub asn: Option<i64>,
-    pub asn_org: Option<String>,
-    pub tor: bool,
+    /// `maxmind-geolite2`, `tor-exits`; later `shodan`, `abuseipdb`.
+    pub provider: String,
+    pub fetched_at: String,
+    /// Version of the provider's data, if it has one (database build date).
+    pub source_version: Option<String>,
+    /// Provider-specific fields as a JSON object. `{}`: the provider was
+    /// asked and knows nothing.
+    pub data_json: String,
 }
 
 /// "I landed here by accident" claim.
@@ -178,7 +182,7 @@ pub enum Record {
         id: NodeId,
     },
     Request(RequestRec),
-    IpEnrich(IpEnrichRec),
+    IpIntel(IpIntelRec),
     FpClaim(FpClaimRec),
     Fingerprint(FingerprintRec),
     ScanJob(ScanJobRec),
@@ -200,7 +204,7 @@ impl Record {
             Record::MemberUpdate(_) => "member_update",
             Record::MemberRevoke { .. } => "member_revoke",
             Record::Request(_) => "request",
-            Record::IpEnrich(_) => "ip_enrich",
+            Record::IpIntel(_) => "ip_intel",
             Record::FpClaim(_) => "fp_claim",
             Record::Fingerprint(_) => "fingerprint",
             Record::ScanJob(_) => "scan_job",

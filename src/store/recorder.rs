@@ -8,7 +8,7 @@ use super::scans::{EnqueueOutcome, ScanJobRow};
 use crate::cluster::Node;
 use crate::cluster::hlc::Hlc;
 use crate::cluster::record::{
-    FingerprintRec, FpClaimRec, IpEnrichRec, JobStatusRec, PortRec, Record, RequestRec, ScanJobRec,
+    FingerprintRec, FpClaimRec, IpIntelRec, JobStatusRec, PortRec, Record, RequestRec, ScanJobRec,
     ScanResultRec, TombstoneRec,
 };
 use crate::scan::nmap_xml::ScanResult;
@@ -137,7 +137,59 @@ impl Recorder {
         self.id_by_uid("requests", &uid).await
     }
 
-    /// Set GeoIP / Tor facts for an IP, writing only if they changed.
+    /// Record one provider's result for an IP. Nothing is written when this
+    /// node's last result for it says the same, so a cluster does not
+    /// replicate one record per request.
+    pub async fn record_intel(
+        &self,
+        ip: &str,
+        provider: &str,
+        source_version: Option<&str>,
+        data: serde_json::Value,
+    ) -> Result<()> {
+        let data_json = data.to_string();
+        let mine = self.node_id().map(|id| id.0.to_vec()).unwrap_or_default();
+        let last: Option<String> = sqlx::query_scalar(
+            "SELECT data_json FROM ip_intel WHERE ip = ? AND provider = ? AND origin = ?",
+        )
+        .bind(ip)
+        .bind(provider)
+        .bind(mine)
+        .fetch_optional(&self.store().pool)
+        .await?;
+        if last.as_deref() == Some(data_json.as_str()) {
+            return Ok(());
+        }
+        self.write(vec![Record::IpIntel(IpIntelRec {
+            ip: ip.to_string(),
+            provider: provider.to_string(),
+            fetched_at: now_ts(),
+            source_version: source_version.map(str::to_string),
+            data_json,
+        })])
+        .await
+    }
+
+    /// GeoIP facts as a MaxMind result (fields that are unknown are left out).
+    pub fn geo_data(
+        country: Option<&str>,
+        asn: Option<u32>,
+        asn_org: Option<&str>,
+    ) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        if let Some(c) = country {
+            m.insert("country".into(), c.into());
+        }
+        if let Some(a) = asn {
+            m.insert("asn".into(), a.into());
+        }
+        if let Some(o) = asn_org {
+            m.insert("asn_org".into(), o.into());
+        }
+        serde_json::Value::Object(m)
+    }
+
+    /// Set GeoIP / Tor facts for an IP (tests and legacy callers).
     pub async fn enrich_ip(
         &self,
         ip_id: i64,
@@ -146,25 +198,24 @@ impl Recorder {
         asn_org: Option<&str>,
         tor: bool,
     ) -> Result<()> {
-        let cur: Option<data::IpFacts<String>> =
-            sqlx::query_as("SELECT ip, country, asn, asn_org, is_tor_exit FROM ips WHERE id = ?")
-                .bind(ip_id)
-                .fetch_optional(&self.store().pool)
-                .await?;
-        let Some((ip, c, a, o, t)) = cur else {
+        let Ok(ip) = self.ip_of(ip_id).await else {
             return Ok(());
         };
-        let asn = asn.map(i64::from);
-        if c.as_deref() == country && a == asn && o.as_deref() == asn_org && t == tor {
-            return Ok(());
+        if country.is_some() || asn.is_some() || asn_org.is_some() {
+            self.record_intel(
+                &ip,
+                crate::intel::MAXMIND,
+                None,
+                Self::geo_data(country, asn, asn_org),
+            )
+            .await?;
         }
-        self.write(vec![Record::IpEnrich(IpEnrichRec {
-            ip,
-            country: country.map(str::to_string),
-            asn,
-            asn_org: asn_org.map(str::to_string),
-            tor,
-        })])
+        self.record_intel(
+            &ip,
+            crate::intel::TOR,
+            None,
+            serde_json::json!({ "exit": tor }),
+        )
         .await
     }
 

@@ -2549,3 +2549,66 @@ async fn admin_configures_another_node_with_its_key() {
     );
     assert_eq!(s.cooldown_hours, 6);
 }
+
+/// Enrichment results replicate with their origin; a blocked peer's results
+/// stop counting and come back on unblock.
+#[tokio::test]
+async fn enrichment_results_replicate_and_follow_blocks() {
+    use peephole::cluster::block;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    record(&nb, "203.0.113.90", "/x").await;
+    rec(&na)
+        .record_intel(
+            "203.0.113.90",
+            peephole::intel::MAXMIND,
+            Some("2026-09-30"),
+            serde_json::json!({"country": "NL", "asn": 1}),
+        )
+        .await
+        .unwrap();
+    let country = |n: &TestNode| {
+        let pool = n.store.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT country FROM ips WHERE ip = '203.0.113.90'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .flatten()
+        }
+    };
+    eventually("b shows a's result", || async {
+        country(&nb).await.as_deref() == Some("NL")
+    })
+    .await;
+    let origin: Vec<u8> = sqlx::query_scalar("SELECT origin FROM ip_intel")
+        .fetch_one(&nb.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(origin, a.id.0.to_vec(), "provenance is kept");
+    // The same result again writes nothing.
+    let head = head_of(&na, a.id).await;
+    rec(&na)
+        .record_intel(
+            "203.0.113.90",
+            peephole::intel::MAXMIND,
+            Some("2026-09-30"),
+            serde_json::json!({"country": "NL", "asn": 1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head_of(&na, a.id).await, head);
+
+    block::block(&nb, a.id).await.unwrap();
+    assert_eq!(
+        country(&nb).await,
+        None,
+        "a blocked peer's results do not count"
+    );
+    block::unblock(&nb, a.id).await.unwrap();
+    assert_eq!(country(&nb).await.as_deref(), Some("NL"));
+}

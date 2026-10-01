@@ -674,7 +674,7 @@ pub async fn rematerialize(node: &Node) -> Result<usize> {
         "SELECT origin, seq FROM repl_log
          WHERE payload IS NOT NULL
            AND kind IN ('request','scan_job','job_adopt','job_status','fp_claim',
-                        'fingerprint','scan_result','ip_enrich')
+                        'fingerprint','scan_result','ip_intel')
          ORDER BY CASE kind WHEN 'request' THEN 0 WHEN 'scan_job' THEN 1
                             WHEN 'job_adopt' THEN 2 WHEN 'job_status' THEN 3 ELSE 4 END, hlc",
     )

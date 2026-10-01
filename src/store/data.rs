@@ -8,7 +8,7 @@
 //! that arrives later is dropped instead of resurrecting.
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{
-    FingerprintRec, FpClaimRec, IntelManifestRec, IpEnrichRec, JobAdoptRec, JobStatusRec, PortRec,
+    FingerprintRec, FpClaimRec, IntelManifestRec, IpIntelRec, JobAdoptRec, JobStatusRec, PortRec,
     ROW_BACKED, Record, RequestRec, ScanJobRec, ScanResultRec, TombstoneRec,
 };
 use anyhow::Result;
@@ -74,7 +74,7 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
     }
     match r {
         Record::Request(r) => request(conn, ctx, r).await,
-        Record::IpEnrich(r) => ip_enrich(conn, ctx, r).await,
+        Record::IpIntel(r) => ip_intel(conn, ctx, r).await,
         Record::FpClaim(r) => fp_claim(conn, ctx, r).await,
         Record::Fingerprint(r) => fingerprint(conn, ctx, r).await,
         Record::ScanJob(r) => scan_job(conn, ctx, r).await,
@@ -97,7 +97,7 @@ const CONTENT_KINDS: [&str; 6] = [
     "fp_claim",
     "scan_job",
     "scan_result",
-    "ip_enrich",
+    "ip_intel",
 ];
 
 async fn origin_blocked(conn: &mut SqliteConnection, origin: Option<&NodeId>) -> Result<bool> {
@@ -163,8 +163,6 @@ async fn erased_by(conn: &mut SqliteConnection, uid: &str) -> Result<Option<Stri
     )
 }
 
-/// `(hlc or id, country, asn, asn_org, tor)`: an IP's GeoIP / Tor facts.
-pub type IpFacts<K> = (K, Option<String>, Option<i64>, Option<String>, bool);
 /// `(port, proto, state, service, product, version)`.
 type PortRow = (
     i64,
@@ -206,31 +204,7 @@ async fn ensure_ip(conn: &mut SqliteConnection, ip: &str, seen: Option<&str>) ->
             .await?
             .last_insert_rowid(),
     };
-    // Enrichment that arrived before the IP's first record.
-    let pending: Option<IpFacts<i64>> = sqlx::query_as(
-        "SELECT hlc, country, asn, asn_org, tor FROM ip_enrich_pending WHERE ip = ?",
-    )
-    .bind(ip)
-    .fetch_optional(&mut *conn)
-    .await?;
-    if let Some((hlc, country, asn, asn_org, tor)) = pending {
-        sqlx::query(
-            "UPDATE ips SET country = ?, asn = ?, asn_org = ?, is_tor_exit = ?, geo_hlc = ?
-             WHERE id = ?",
-        )
-        .bind(country)
-        .bind(asn)
-        .bind(asn_org)
-        .bind(tor)
-        .bind(hlc)
-        .bind(id)
-        .execute(&mut *conn)
-        .await?;
-        sqlx::query("DELETE FROM ip_enrich_pending WHERE ip = ?")
-            .bind(ip)
-            .execute(&mut *conn)
-            .await?;
-    }
+    refresh_ip_view(conn, ip).await?;
     Ok(id)
 }
 
@@ -264,45 +238,67 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     Ok(Effect::Applied)
 }
 
-async fn ip_enrich(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpEnrichRec) -> Result<Effect> {
-    let n = sqlx::query(
-        "UPDATE ips SET country = ?, asn = ?, asn_org = ?, is_tor_exit = ?, geo_hlc = ?
-         WHERE ip = ? AND geo_hlc < ?",
+/// Store one provider's result for an IP (per origin, newest wins) and
+/// bring the IP's shown facts up to date.
+async fn ip_intel(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpIntelRec) -> Result<Effect> {
+    sqlx::query(
+        "INSERT INTO ip_intel (ip, provider, origin, hlc, fetched_at, source_version, data_json)
+         VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(ip, provider, origin) DO UPDATE SET hlc = excluded.hlc,
+           fetched_at = excluded.fetched_at, source_version = excluded.source_version,
+           data_json = excluded.data_json
+         WHERE excluded.hlc > ip_intel.hlc",
     )
-    .bind(&r.country)
-    .bind(r.asn)
-    .bind(&r.asn_org)
-    .bind(r.tor)
-    .bind(ctx.hlc as i64)
     .bind(&r.ip)
+    .bind(&r.provider)
+    .bind(ctx.origin_bytes().unwrap_or_default())
     .bind(ctx.hlc as i64)
+    .bind(&r.fetched_at)
+    .bind(&r.source_version)
+    .bind(&r.data_json)
     .execute(&mut *conn)
-    .await?
-    .rows_affected();
-    if n == 0 {
-        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM ips WHERE ip = ?")
-            .bind(&r.ip)
-            .fetch_optional(&mut *conn)
-            .await?;
-        if exists.is_none() {
-            sqlx::query(
-                "INSERT INTO ip_enrich_pending (ip, hlc, country, asn, asn_org, tor)
-                 VALUES (?,?,?,?,?,?)
-                 ON CONFLICT(ip) DO UPDATE SET hlc = excluded.hlc, country = excluded.country,
-                   asn = excluded.asn, asn_org = excluded.asn_org, tor = excluded.tor
-                 WHERE excluded.hlc > ip_enrich_pending.hlc",
-            )
-            .bind(&r.ip)
-            .bind(ctx.hlc as i64)
-            .bind(&r.country)
-            .bind(r.asn)
-            .bind(&r.asn_org)
-            .bind(r.tor)
-            .execute(&mut *conn)
-            .await?;
-        }
-    }
+    .await?;
+    refresh_ip_view(conn, &r.ip).await?;
     Ok(Effect::Applied)
+}
+
+/// The newest result of `provider` for `ip`, as JSON (None: no result, or
+/// one that is not a JSON object).
+async fn newest_intel(
+    conn: &mut SqliteConnection,
+    ip: &str,
+    provider: &str,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT data_json FROM ip_intel WHERE ip = ? AND provider = ? ORDER BY hlc DESC LIMIT 1",
+    )
+    .bind(ip)
+    .bind(provider)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(raw
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+        .and_then(|v| v.as_object().cloned()))
+}
+
+/// Set the facts shown for an IP (country, ASN, Tor flag) from the newest
+/// result of each provider. Does nothing while the IP has no row yet.
+pub(crate) async fn refresh_ip_view(conn: &mut SqliteConnection, ip: &str) -> Result<()> {
+    let geo = newest_intel(conn, ip, crate::intel::MAXMIND)
+        .await?
+        .unwrap_or_default();
+    let tor = newest_intel(conn, ip, crate::intel::TOR)
+        .await?
+        .unwrap_or_default();
+    sqlx::query("UPDATE ips SET country = ?, asn = ?, asn_org = ?, is_tor_exit = ? WHERE ip = ?")
+        .bind(geo.get("country").and_then(|v| v.as_str()))
+        .bind(geo.get("asn").and_then(|v| v.as_i64()))
+        .bind(geo.get("asn_org").and_then(|v| v.as_str()))
+        .bind(tor.get("exit").and_then(|v| v.as_bool()).unwrap_or(false))
+        .bind(ip)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 async fn request_id(conn: &mut SqliteConnection, uid: &str) -> Result<Option<i64>> {
@@ -703,7 +699,11 @@ async fn tombstone(conn: &mut SqliteConnection, ctx: Ctx<'_>, t: &TombstoneRec) 
 
 /// Remove an IP row once nothing refers to it any more.
 pub(crate) async fn drop_orphan_ip(conn: &mut SqliteConnection, ip_id: i64) -> Result<()> {
-    sqlx::query(
+    let ip: Option<String> = sqlx::query_scalar("SELECT ip FROM ips WHERE id = ?")
+        .bind(ip_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let dropped = sqlx::query(
         "DELETE FROM ips WHERE id = ?1
            AND NOT EXISTS (SELECT 1 FROM requests WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM scan_jobs WHERE ip_id = ?1)
@@ -713,7 +713,17 @@ pub(crate) async fn drop_orphan_ip(conn: &mut SqliteConnection, ip_id: i64) -> R
     )
     .bind(ip_id)
     .execute(&mut *conn)
-    .await?;
+    .await?
+    .rows_affected();
+    // The IP's enrichment results go with it.
+    if dropped > 0
+        && let Some(ip) = ip
+    {
+        sqlx::query("DELETE FROM ip_intel WHERE ip = ?")
+            .bind(ip)
+            .execute(&mut *conn)
+            .await?;
+    }
     Ok(())
 }
 
@@ -1001,6 +1011,190 @@ mod tests {
             .fetch_one(&mut *conn)
             .await
             .unwrap()
+    }
+
+    use crate::cluster::record::IpIntelRec;
+
+    fn intel(ip: &str, provider: &str, data: &str) -> Record {
+        Record::IpIntel(IpIntelRec {
+            ip: ip.into(),
+            provider: provider.into(),
+            fetched_at: now_ts(),
+            source_version: Some("2026-09-30".into()),
+            data_json: data.into(),
+        })
+    }
+
+    type View = (Option<String>, Option<i64>, Option<String>, bool);
+
+    async fn view(conn: &mut SqliteConnection, ip: &str) -> View {
+        sqlx::query_as("SELECT country, asn, asn_org, is_tor_exit FROM ips WHERE ip = ?")
+            .bind(ip)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_newest_result_wins_whatever_the_arrival_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let (a, b) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        );
+        let ip = "203.0.113.7";
+        apply(
+            &mut conn,
+            Ctx {
+                origin: Some(&a),
+                hlc: 5,
+            },
+            &request(&format!("{}r", a.uid_prefix()), "/x"),
+        )
+        .await
+        .unwrap();
+        let de = r#"{"country":"DE","asn":3320,"asn_org":"DTAG"}"#;
+        let us = r#"{"country":"US","asn":15169,"asn_org":"Google"}"#;
+        // B's newer result arrives first, A's older one afterwards.
+        apply(
+            &mut conn,
+            Ctx {
+                origin: Some(&b),
+                hlc: 20,
+            },
+            &intel(ip, "maxmind-geolite2", us),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            Ctx {
+                origin: Some(&a),
+                hlc: 10,
+            },
+            &intel(ip, "maxmind-geolite2", de),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            view(&mut conn, ip).await,
+            (Some("US".into()), Some(15169), Some("Google".into()), false)
+        );
+        // Both results are kept, with their origin.
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ip_intel").await, 2);
+        // A node's own newer result replaces its older one.
+        apply(
+            &mut conn,
+            Ctx {
+                origin: Some(&a),
+                hlc: 30,
+            },
+            &intel(ip, "maxmind-geolite2", "{}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ip_intel").await, 2);
+        assert_eq!(
+            view(&mut conn, ip).await,
+            (None, None, None, false),
+            "newest says unknown"
+        );
+        // Tor is its own provider.
+        apply(
+            &mut conn,
+            Ctx {
+                origin: Some(&b),
+                hlc: 40,
+            },
+            &intel(ip, "tor-exits", r#"{"exit":true}"#),
+        )
+        .await
+        .unwrap();
+        assert!(view(&mut conn, ip).await.3);
+    }
+
+    #[tokio::test]
+    async fn a_result_that_arrives_before_the_ip_shows_once_the_ip_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let ctx = |hlc| Ctx { origin: None, hlc };
+        apply(
+            &mut conn,
+            ctx(1),
+            &intel("203.0.113.7", "maxmind-geolite2", r#"{"country":"NL"}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ips").await, 0);
+        apply(&mut conn, ctx(2), &request("req", "/x"))
+            .await
+            .unwrap();
+        assert_eq!(
+            view(&mut conn, "203.0.113.7").await.0.as_deref(),
+            Some("NL")
+        );
+        // Garbage in the data field is stored but changes nothing shown.
+        apply(
+            &mut conn,
+            ctx(3),
+            &intel("203.0.113.7", "maxmind-geolite2", "not json"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view(&mut conn, "203.0.113.7").await.0, None);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_ip_leaves_no_intel_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let ctx = |hlc| Ctx { origin: None, hlc };
+        let ip = "203.0.113.7";
+        apply(&mut conn, ctx(1), &request("req", "/x"))
+            .await
+            .unwrap();
+        apply(
+            &mut conn,
+            ctx(2),
+            &intel(ip, "maxmind-geolite2", r#"{"country":"NL"}"#),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx(3),
+            &intel("198.51.100.1", "tor-exits", r#"{"exit":true}"#),
+        )
+        .await
+        .unwrap();
+        let ip_id: i64 = sqlx::query_scalar("SELECT id FROM ips WHERE ip = ?")
+            .bind(ip)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        // Still referenced by its request: nothing goes.
+        drop_orphan_ip(&mut conn, ip_id).await.unwrap();
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ip_intel").await, 2);
+        sqlx::query("DELETE FROM requests")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop_orphan_ip(&mut conn, ip_id).await.unwrap();
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ips").await, 0);
+        // The other IP has no row yet; its result waits for it.
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) FROM ip_intel WHERE ip = '203.0.113.7'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ip_intel").await, 1);
     }
 
     #[tokio::test]

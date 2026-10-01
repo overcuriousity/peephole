@@ -39,6 +39,13 @@ impl GeoIp {
         Ok(Self { city, asn })
     }
 
+    /// Build date of the city database (`YYYY-MM-DD`), as the version of
+    /// the data a lookup came from.
+    pub fn build_date(&self) -> Option<String> {
+        chrono::DateTime::from_timestamp(self.city.metadata().build_epoch as i64, 0)
+            .map(|t| t.format("%Y-%m-%d").to_string())
+    }
+
     pub fn lookup(&self, ip: &IpAddr) -> Geo {
         let mut g = Geo::default();
         // maxminddb 0.32: lookup yields a LookupResult; decode the record.

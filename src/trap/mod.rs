@@ -163,24 +163,39 @@ async fn record_and_respond(
 ) -> Result<Recorded> {
     let ip_row = state.store.upsert_ip(ip).await?;
 
-    // Enrichment (every IP, every request — spec §4). Written only when it
-    // changes, so a cluster does not replicate one record per request.
-    let geo_hit = state.geo.read().unwrap().as_ref().map(|g| g.lookup(&ip));
-    let is_tor = state.tor.read().unwrap().contains(&ip);
-    if geo_hit.is_some() || is_tor {
-        let g = geo_hit.unwrap_or_else(|| crate::intel::geo::Geo {
-            country: ip_row.country.clone(),
-            asn: ip_row.asn.map(|a| a as u32),
-            asn_org: ip_row.asn_org.clone(),
-        });
+    // Enrichment (every IP, every request — spec §4): what this node can
+    // look up itself. Written only when it changes. IPs this node cannot
+    // look up are filled in by a node that can (intel::enrich_once).
+    let geo_hit = state
+        .geo
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|g| (g.lookup(&ip), g.build_date()));
+    if let Some((g, version)) = geo_hit {
         state
             .recorder
-            .enrich_ip(
-                ip_row.id,
-                g.country.as_deref(),
-                g.asn,
-                g.asn_org.as_deref(),
-                ip_row.is_tor_exit || is_tor,
+            .record_intel(
+                &ip_row.ip,
+                crate::intel::MAXMIND,
+                version.as_deref(),
+                crate::store::recorder::Recorder::geo_data(
+                    g.country.as_deref(),
+                    g.asn,
+                    g.asn_org.as_deref(),
+                ),
+            )
+            .await?;
+    }
+    let is_tor = state.tor.read().unwrap().contains(&ip);
+    if is_tor {
+        state
+            .recorder
+            .record_intel(
+                &ip_row.ip,
+                crate::intel::TOR,
+                None,
+                serde_json::json!({ "exit": true }),
             )
             .await?;
     }

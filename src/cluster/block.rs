@@ -61,6 +61,29 @@ pub async fn block(node: &Node, id: NodeId) -> Result<u64> {
             tx.commit().await?;
         }
     }
+    // Its enrichment results go too; the IPs fall back to other nodes' results.
+    loop {
+        let _g = node.apply_lock.lock().await;
+        let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let ips: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT ip FROM ip_intel WHERE origin = ? LIMIT ?")
+                .bind(&id.0[..])
+                .bind(BATCH as i64)
+                .fetch_all(&mut *tx)
+                .await?;
+        if ips.is_empty() {
+            break;
+        }
+        for ip in &ips {
+            sqlx::query("DELETE FROM ip_intel WHERE origin = ? AND ip = ?")
+                .bind(&id.0[..])
+                .bind(ip)
+                .execute(&mut *tx)
+                .await?;
+            data::refresh_ip_view(&mut tx, ip).await?;
+        }
+        tx.commit().await?;
+    }
     tracing::info!(id = %id.short(), records = n, "peer blocked");
     Ok(n)
 }

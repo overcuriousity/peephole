@@ -2,6 +2,10 @@ pub mod geo;
 pub mod share;
 pub mod tor;
 
+/// Provider names in `ip_intel` records.
+pub const MAXMIND: &str = "maxmind-geolite2";
+pub const TOR: &str = "tor-exits";
+
 use crate::config::Config;
 use crate::store::Store;
 use crate::store::recorder::Recorder;
