@@ -1,143 +1,33 @@
-//! Admin deletes. Each runs in one transaction and returns whether the
-//! primary row existed. Foreign keys are ON, so dependents go first.
+//! Admin deletes, as tombstone records (see `store::data`). Each returns
+//! whether the primary row existed.
 use super::Store;
 use anyhow::Result;
 
 impl Store {
     pub async fn delete_request(&self, id: i64) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM fp_claims WHERE request_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM fingerprints WHERE request_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        let n = sqlx::query("DELETE FROM requests WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        tx.commit().await?;
-        Ok(n > 0)
+        self.local().delete_request(id).await
     }
 
     pub async fn delete_ip(&self, ip_id: i64) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        for sql in [
-            "DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE ip_id = ?)",
-            "DELETE FROM scans WHERE ip_id = ?",
-            "DELETE FROM scan_jobs WHERE ip_id = ?",
-            "DELETE FROM fingerprints WHERE ip_id = ?",
-            "DELETE FROM fp_claims WHERE ip_id = ?",
-            "DELETE FROM requests WHERE ip_id = ?",
-        ] {
-            sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(ip_id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        let n = sqlx::query("DELETE FROM ips WHERE id = ?")
-            .bind(ip_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        tx.commit().await?;
-        Ok(n > 0)
+        self.local().delete_ip(ip_id).await
     }
 
     pub async fn delete_scan(&self, scan_id: i64) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM ports WHERE scan_id = ?")
-            .bind(scan_id)
-            .execute(&mut *tx)
-            .await?;
-        let n = sqlx::query("DELETE FROM scans WHERE id = ?")
-            .bind(scan_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        tx.commit().await?;
-        Ok(n > 0)
+        self.local().delete_scan(scan_id).await
     }
 
     pub async fn delete_claim(&self, id: i64) -> Result<bool> {
-        let n = sqlx::query("DELETE FROM fp_claims WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-        Ok(n > 0)
+        self.local().delete_claim(id).await
     }
-}
 
-/// `?,?,…` for `n` binds.
-fn placeholders(n: usize) -> String {
-    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
-}
-
-const CHUNK: usize = 500;
-
-impl Store {
-    /// Delete many requests (and their claims/fingerprints) in one transaction.
+    /// Delete many requests (and their claims/fingerprints) atomically.
     pub async fn delete_requests(&self, ids: &[i64]) -> Result<u64> {
-        let mut tx = self.pool.begin().await?;
-        let mut n = 0u64;
-        for chunk in ids.chunks(CHUNK) {
-            let ph = placeholders(chunk.len());
-            for sql in [
-                format!("DELETE FROM fp_claims WHERE request_id IN ({ph})"),
-                format!("DELETE FROM fingerprints WHERE request_id IN ({ph})"),
-            ] {
-                let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-                for id in chunk {
-                    q = q.bind(id);
-                }
-                q.execute(&mut *tx).await?;
-            }
-            let sql = format!("DELETE FROM requests WHERE id IN ({ph})");
-            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-            for id in chunk {
-                q = q.bind(id);
-            }
-            n += q.execute(&mut *tx).await?.rows_affected();
-        }
-        tx.commit().await?;
-        Ok(n)
+        self.local().delete_requests(ids).await
     }
 
-    /// Delete many IPs with everything hanging off them, in one transaction.
+    /// Delete many IPs with everything hanging off them, atomically.
     pub async fn delete_ips(&self, ids: &[i64]) -> Result<u64> {
-        let mut tx = self.pool.begin().await?;
-        let mut n = 0u64;
-        for chunk in ids.chunks(CHUNK) {
-            let ph = placeholders(chunk.len());
-            for sql in [
-                format!(
-                    "DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE ip_id IN ({ph}))"
-                ),
-                format!("DELETE FROM scans WHERE ip_id IN ({ph})"),
-                format!("DELETE FROM scan_jobs WHERE ip_id IN ({ph})"),
-                format!("DELETE FROM fingerprints WHERE ip_id IN ({ph})"),
-                format!("DELETE FROM fp_claims WHERE ip_id IN ({ph})"),
-                format!("DELETE FROM requests WHERE ip_id IN ({ph})"),
-            ] {
-                let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-                for id in chunk {
-                    q = q.bind(id);
-                }
-                q.execute(&mut *tx).await?;
-            }
-            let sql = format!("DELETE FROM ips WHERE id IN ({ph})");
-            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-            for id in chunk {
-                q = q.bind(id);
-            }
-            n += q.execute(&mut *tx).await?.rows_affected();
-        }
-        tx.commit().await?;
-        Ok(n)
+        self.local().delete_ips(ids).await
     }
 }
 

@@ -1,0 +1,379 @@
+//! Replicated records and their signed wire form.
+//!
+//! Every record is created by exactly one node (its *origin*), numbered by
+//! a per-origin sequence and signed with the origin's key over the exact
+//! payload bytes. Relays store and forward entries verbatim, so they cannot
+//! alter or forge them, and can forward kinds they do not understand.
+use super::identity::{Identity, NodeId};
+use serde::{Deserialize, Serialize};
+
+const SIG_DOMAIN: &[u8] = b"peephole-repl-v1\0";
+
+/// Self-description of a node, as carried in membership records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemberInfo {
+    pub id: NodeId,
+    pub name: String,
+    /// `host:port` others dial; None for outbound-only nodes.
+    pub address: Option<String>,
+    pub roles: Vec<String>,
+    /// CIDRs this node never scans; every scanner honours them.
+    pub never_scan: Vec<String>,
+    pub proto_min: u32,
+    pub proto_max: u32,
+}
+
+/// A request caught by a trap listener. Timestamps everywhere are UTC
+/// `YYYY-MM-DD HH:MM:SS`, as the rows store them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestRec {
+    pub uid: String,
+    pub ts: String,
+    pub ip: String,
+    pub method: String,
+    pub path: String,
+    pub query: Option<String>,
+    pub headers_json: String,
+    #[serde(with = "serde_bytes")]
+    pub body: Option<Vec<u8>>,
+    pub labels_json: String,
+    pub severity: i64,
+    pub scan_level: i64,
+    pub is_fp_claim: bool,
+    pub page_token: Option<String>,
+}
+
+/// GeoIP / Tor facts about an IP (last write wins by HLC).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpEnrichRec {
+    pub ip: String,
+    pub country: Option<String>,
+    pub asn: Option<i64>,
+    pub asn_org: Option<String>,
+    pub tor: bool,
+}
+
+/// "I landed here by accident" claim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FpClaimRec {
+    pub uid: String,
+    pub request_uid: String,
+    pub ip: String,
+    pub ts: String,
+    pub contact_email: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+/// Browser fingerprint from the trap page's collector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FingerprintRec {
+    pub uid: String,
+    pub request_uid: Option<String>,
+    pub ip: String,
+    pub ts: String,
+    pub fp_hash: Option<String>,
+    pub visitor_id: Option<String>,
+    pub attributes_json: Option<String>,
+    pub behavior_summary_json: Option<String>,
+    /// zstd-compressed, as stored.
+    #[serde(with = "serde_bytes")]
+    pub event_blob: Option<Vec<u8>>,
+}
+
+/// A queued counter-scan. The origin arbitrates the job.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanJobRec {
+    pub uid: String,
+    pub ip: String,
+    pub level: i64,
+    pub queued_at: String,
+}
+
+/// A job's state (last write wins by HLC; only the arbiter writes it).
+/// Statuses: queued, running, done, failed, superseded (a scan of the IP
+/// at this level or higher already exists), refused (never_scan).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobStatusRec {
+    pub job_uid: String,
+    pub status: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+    pub attempts: i64,
+    /// The node running (or that ran) the scan.
+    #[serde(default)]
+    pub scanner: Option<NodeId>,
+}
+
+/// Queued jobs taken over from an arbiter that has been unreachable for
+/// `cluster.takeover_hours`; the origin becomes their arbiter. When two
+/// nodes adopt the same job, the lowest node key wins everywhere.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobAdoptRec {
+    pub from: NodeId,
+    pub job_uids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortRec {
+    pub port: i64,
+    pub proto: String,
+    pub state: String,
+    pub service: Option<String>,
+    pub product: Option<String>,
+    pub version: Option<String>,
+}
+
+/// A finished counter-scan with its ports.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanResultRec {
+    pub uid: String,
+    pub job_uid: String,
+    pub ip: String,
+    pub level: i64,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub os_guess: Option<String>,
+    /// zstd-compressed nmap XML, as stored.
+    #[serde(with = "serde_bytes")]
+    pub raw_xml: Option<Vec<u8>>,
+    pub ports: Vec<PortRec>,
+}
+
+/// A new version of a shared intel file, fetched by the origin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntelManifestRec {
+    /// `geolite2-city`, `geolite2-asn` or `tor-exits`.
+    pub kind: String,
+    pub sha256: String,
+    pub size: u64,
+    pub fetched_at: String,
+}
+
+/// What a tombstone deletes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum TombTarget {
+    /// These requests with their claims and fingerprints.
+    Requests {
+        uids: Vec<String>,
+    },
+    /// Everything about an IP recorded up to the tombstone's HLC.
+    Ip {
+        ip: String,
+    },
+    Scan {
+        uid: String,
+    },
+    Claim {
+        uid: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TombstoneRec {
+    pub uid: String,
+    pub target: TombTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "k", rename_all = "snake_case")]
+pub enum Record {
+    /// The origin vouches for a node (config peer, or a redeemed invite).
+    MemberAdd(MemberInfo),
+    /// A node describes itself; origin must equal `id`.
+    MemberUpdate(MemberInfo),
+    /// The origin revokes a node cluster-wide.
+    MemberRevoke {
+        id: NodeId,
+    },
+    Request(RequestRec),
+    IpEnrich(IpEnrichRec),
+    FpClaim(FpClaimRec),
+    Fingerprint(FingerprintRec),
+    ScanJob(ScanJobRec),
+    JobStatus(JobStatusRec),
+    JobAdopt(JobAdoptRec),
+    ScanResult(ScanResultRec),
+    Tombstone(TombstoneRec),
+    IntelManifest(IntelManifestRec),
+}
+
+/// Kinds whose payload is not stored in the log but rebuilt from their row
+/// (they are large); see `store::data::rebuild`.
+pub const ROW_BACKED: &[&str] = &["request", "fingerprint", "scan_result"];
+
+impl Record {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Record::MemberAdd(_) => "member_add",
+            Record::MemberUpdate(_) => "member_update",
+            Record::MemberRevoke { .. } => "member_revoke",
+            Record::Request(_) => "request",
+            Record::IpEnrich(_) => "ip_enrich",
+            Record::FpClaim(_) => "fp_claim",
+            Record::Fingerprint(_) => "fingerprint",
+            Record::ScanJob(_) => "scan_job",
+            Record::JobStatus(_) => "job_status",
+            Record::JobAdopt(_) => "job_adopt",
+            Record::ScanResult(_) => "scan_result",
+            Record::Tombstone(_) => "tombstone",
+            Record::IntelManifest(_) => "intel_manifest",
+        }
+    }
+
+    /// The uid of the row this record creates; tombstones erase log
+    /// entries by it.
+    pub fn uid(&self) -> Option<String> {
+        match self {
+            Record::Request(r) => Some(r.uid.clone()),
+            Record::FpClaim(r) => Some(r.uid.clone()),
+            Record::Fingerprint(r) => Some(r.uid.clone()),
+            Record::ScanJob(r) => Some(r.uid.clone()),
+            Record::ScanResult(r) => Some(r.uid.clone()),
+            Record::Tombstone(r) => Some(r.uid.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// A log entry as stored and exchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WireEntry {
+    pub origin: NodeId,
+    pub seq: u64,
+    pub hlc: u64,
+    pub kind: String,
+    pub uid: Option<String>,
+    /// CBOR of the [`Record`]; None for an entry a tombstone erased.
+    #[serde(with = "serde_bytes")]
+    pub payload: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes")]
+    pub sig: Option<Vec<u8>>,
+    /// The tombstone that erased this entry (payload and sig are gone).
+    pub erased_by: Option<String>,
+}
+
+fn signing_bytes(
+    origin: &NodeId,
+    seq: u64,
+    hlc: u64,
+    kind: &str,
+    uid: Option<&str>,
+    payload: &[u8],
+) -> Vec<u8> {
+    let uid = uid.unwrap_or("");
+    let mut m = Vec::with_capacity(SIG_DOMAIN.len() + 52 + kind.len() + uid.len() + payload.len());
+    m.extend_from_slice(SIG_DOMAIN);
+    m.extend_from_slice(&origin.0);
+    m.extend_from_slice(&seq.to_be_bytes());
+    m.extend_from_slice(&hlc.to_be_bytes());
+    m.extend_from_slice(&(kind.len() as u16).to_be_bytes());
+    m.extend_from_slice(kind.as_bytes());
+    m.extend_from_slice(&(uid.len() as u16).to_be_bytes());
+    m.extend_from_slice(uid.as_bytes());
+    m.extend_from_slice(payload);
+    m
+}
+
+impl WireEntry {
+    /// Encode and sign a record created by `identity`.
+    pub fn sign(identity: &Identity, seq: u64, hlc: u64, record: &Record) -> anyhow::Result<Self> {
+        let payload = super::rpc::cbor::encode(record)?;
+        let kind = record.kind().to_string();
+        let uid = record.uid();
+        let sig = identity.sign(&signing_bytes(
+            &identity.id,
+            seq,
+            hlc,
+            &kind,
+            uid.as_deref(),
+            &payload,
+        ));
+        Ok(Self {
+            origin: identity.id,
+            seq,
+            hlc,
+            kind,
+            uid,
+            payload: Some(payload),
+            sig: Some(sig),
+            erased_by: None,
+        })
+    }
+
+    /// True if payload and signature are present and the origin signed them.
+    pub fn verify(&self) -> bool {
+        match (&self.payload, &self.sig) {
+            (Some(p), Some(s)) => self.origin.verify(
+                &signing_bytes(
+                    &self.origin,
+                    self.seq,
+                    self.hlc,
+                    &self.kind,
+                    self.uid.as_deref(),
+                    p,
+                ),
+                s,
+            ),
+            _ => false,
+        }
+    }
+
+    /// Decode the payload; None for erased entries or kinds this build
+    /// does not know.
+    pub fn record(&self) -> Option<Record> {
+        let r: Record = super::rpc::cbor::decode(self.payload.as_ref()?).ok()?;
+        (r.kind() == self.kind).then_some(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(id: NodeId) -> MemberInfo {
+        MemberInfo {
+            id,
+            name: "n".into(),
+            address: Some("h:1".into()),
+            roles: vec!["listener".into()],
+            never_scan: vec![],
+            proto_min: 1,
+            proto_max: 1,
+        }
+    }
+
+    #[test]
+    fn signed_entry_verifies_and_tampering_breaks_it() {
+        let me = Identity::generate().unwrap();
+        let e = WireEntry::sign(&me, 7, 42, &Record::MemberUpdate(info(me.id))).unwrap();
+        assert!(e.verify());
+        assert_eq!(e.record(), Some(Record::MemberUpdate(info(me.id))));
+        // Roundtrip through the wire encoding.
+        let back: WireEntry =
+            super::super::rpc::cbor::decode(&super::super::rpc::cbor::encode(&e).unwrap()).unwrap();
+        assert_eq!(back, e);
+        assert!(back.verify());
+        for tamper in [
+            |e: &mut WireEntry| e.seq += 1,
+            |e: &mut WireEntry| e.hlc += 1,
+            |e: &mut WireEntry| e.kind = "member_add".into(),
+            |e: &mut WireEntry| e.uid = Some("x".into()),
+            |e: &mut WireEntry| e.payload.as_mut().unwrap()[3] ^= 1,
+            |e: &mut WireEntry| e.origin = Identity::generate().unwrap().id,
+        ] {
+            let mut t = e.clone();
+            tamper(&mut t);
+            assert!(!t.verify());
+        }
+    }
+
+    #[test]
+    fn unknown_kinds_decode_to_none() {
+        let me = Identity::generate().unwrap();
+        let mut e = WireEntry::sign(&me, 1, 1, &Record::MemberRevoke { id: me.id }).unwrap();
+        e.kind = "from_the_future".into();
+        assert_eq!(e.record(), None);
+    }
+}

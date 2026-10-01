@@ -16,6 +16,8 @@ pub struct ScanSummary {
     pub finished_at: Option<String>,
     pub os_guess: Option<String>,
     pub open_ports: i64,
+    /// Distributed mode: the node that ran the scan (admin only).
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -69,11 +71,14 @@ pub struct RequestDetail {
     pub body_len: usize,
     pub body_truncated: bool,
     pub fingerprint: Option<FpSummary>,
+    /// Distributed mode: the node that recorded it.
+    pub node: Option<String>,
 }
 
 const SCAN_SELECT: &str =
     "SELECT s.id, s.ip_id, i.ip, s.level, s.started_at, s.finished_at, s.os_guess,
-            (SELECT COUNT(*) FROM ports p WHERE p.scan_id = s.id AND p.state = 'open') AS open_ports
+            (SELECT COUNT(*) FROM ports p WHERE p.scan_id = s.id AND p.state = 'open') AS open_ports,
+            (SELECT name FROM members m WHERE m.id = s.origin) AS node
      FROM scans s JOIN ips i ON s.ip_id = i.id";
 
 const CLAIM_SELECT: &str = "SELECT c.id, c.ts, i.ip, c.contact_email, c.user_agent FROM fp_claims c JOIN ips i ON c.ip_id = i.id";
@@ -225,11 +230,10 @@ impl Store {
     }
 
     pub async fn recent_failed_jobs(&self, limit: i64) -> Result<Vec<QueueJob>> {
-        Ok(sqlx::query_as::<_, QueueJob>(
-            "SELECT j.id, i.ip, j.level, j.status, j.queued_at, j.started_at, j.finished_at, j.error
-             FROM scan_jobs j JOIN ips i ON j.ip_id = i.id WHERE j.status = 'failed'
-             ORDER BY j.id DESC LIMIT ?",
-        )
+        Ok(sqlx::query_as::<_, QueueJob>(sqlx::AssertSqlSafe(format!(
+            "{} WHERE j.status = 'failed' ORDER BY j.id DESC LIMIT ?",
+            super::scans::QUEUE_JOB_SQL
+        )))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?)
@@ -264,7 +268,14 @@ impl Store {
             }),
             None => None,
         };
+        let node: Option<String> = sqlx::query_scalar(
+            "SELECT m.name FROM requests r JOIN members m ON m.id = r.origin WHERE r.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(Some(RequestDetail {
+            node,
             row,
             ip,
             headers,

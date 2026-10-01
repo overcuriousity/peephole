@@ -68,6 +68,7 @@ impl Store {
             .await?)
     }
 
+    /// Set an IP's GeoIP facts (keeps its Tor flag).
     pub async fn set_ip_geo(
         &self,
         ip_id: i64,
@@ -75,14 +76,13 @@ impl Store {
         asn: Option<u32>,
         asn_org: Option<&str>,
     ) -> Result<()> {
-        sqlx::query("UPDATE ips SET country = ?, asn = ?, asn_org = ? WHERE id = ?")
-            .bind(country)
-            .bind(asn.map(|a| a as i64))
-            .bind(asn_org)
+        let tor: Option<bool> = sqlx::query_scalar("SELECT is_tor_exit FROM ips WHERE id = ?")
             .bind(ip_id)
-            .execute(&self.pool)
+            .fetch_optional(&self.pool)
             .await?;
-        Ok(())
+        self.local()
+            .enrich_ip(ip_id, country, asn, asn_org, tor.unwrap_or(false))
+            .await
     }
 
     /// `(id, ip, country)` for IPs whose country is not an ISO alpha-2 code.
@@ -95,24 +95,21 @@ impl Store {
     }
 
     pub async fn set_ip_tor(&self, ip_id: i64, is_tor: bool) -> Result<()> {
-        sqlx::query("UPDATE ips SET is_tor_exit = ? WHERE id = ?")
-            .bind(is_tor)
-            .bind(ip_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        let row = self.ip_by_id(ip_id).await?;
+        let Some(r) = row else { return Ok(()) };
+        self.local()
+            .enrich_ip(
+                ip_id,
+                r.country.as_deref(),
+                r.asn.map(|a| a as u32),
+                r.asn_org.as_deref(),
+                is_tor,
+            )
+            .await
     }
 
     pub async fn insert_request(&self, n: &NewRequest) -> Result<i64> {
-        let r = sqlx::query(
-            "INSERT INTO requests (ts, ip_id, method, path, query, headers_json, body, labels_json, severity, scan_level, is_fp_claim, page_token)
-             VALUES (datetime('now'),?,?,?,?,?,?,?,?,?,?,?)",
-        )
-        .bind(n.ip_id).bind(&n.method).bind(&n.path).bind(&n.query)
-        .bind(&n.headers_json).bind(&n.body).bind(&n.labels_json)
-        .bind(n.severity).bind(n.scan_level).bind(n.is_fp_claim).bind(&n.page_token)
-        .execute(&self.pool).await?;
-        Ok(r.last_insert_rowid())
+        self.local().insert_request(n).await
     }
 
     pub async fn request_by_id(&self, id: i64) -> Result<Option<RequestRow>> {
@@ -131,13 +128,9 @@ impl Store {
         email: Option<&str>,
         ua: &str,
     ) -> Result<()> {
-        sqlx::query("INSERT INTO fp_claims (ip_id, request_id, ts, contact_email, user_agent) VALUES (?,?,datetime('now'),?,?)")
-            .bind(ip_id).bind(request_id).bind(email).bind(ua).execute(&self.pool).await?;
-        sqlx::query("UPDATE ips SET fp_claimed = 1 WHERE id = ?")
-            .bind(ip_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        self.local()
+            .insert_fp_claim(ip_id, request_id, email, ua)
+            .await
     }
 }
 

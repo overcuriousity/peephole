@@ -70,4 +70,19 @@ grep -q '# upstream change' /etc/peephole/rules/xss.toml
 test ! -e /etc/peephole/rules/xss.toml.new
 grep -q 'systemctl restart peephole' /tmp/systemctl.log
 test -x /usr/local/bin/peephole.prev
+
+echo "== fresh headless scanner in distributed mode: no domain, no MaxMind"
+rm -rf /etc/peephole /var/lib/peephole /usr/local/bin/peephole /usr/local/bin/peephole.prev /tmp/enabled
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+    PEEPHOLE_ROLES=scanner PEEPHOLE_CLUSTER_NAME=scanner-1 PEEPHOLE_CLUSTER_LISTEN=0.0.0.0:7443 \
+    bash install.sh > /tmp/headless.log 2>&1 || { cat /tmp/headless.log; exit 1; }
+grep -q '^\[cluster\]' /etc/peephole/config.toml
+grep -q '^listener = false' /etc/peephole/config.toml
+grep -q '^web = false' /etc/peephole/config.toml
+if grep -q 'webauthn\|maxmind\|trap_listen\|admin_listen' /etc/peephole/config.toml; then
+    echo "headless config has role-specific settings"; exit 1
+fi
+grep -q 'ed25519:' /tmp/headless.log
+/usr/local/bin/peephole check-config /etc/peephole/config.toml
+/usr/local/bin/peephole cluster members /etc/peephole/config.toml | grep -q 'scanner-1'
 echo "== ok"

@@ -1,6 +1,12 @@
 # peephole configuration
 # Copy to /etc/peephole/config.toml and edit.
 
+# What this deployment does. All three are on when the section is absent.
+# [roles]
+# listener = true   # trap listener (needs trap_listen, rules_dir)
+# scanner  = true   # nmap counter-scans (needs nmap)
+# web      = true   # wall of shame + admin area (needs admin_listen, [webauthn])
+
 # Trap listener: HAProxy routes fallback (nonexistent-route) traffic here directly.
 trap_listen = "0.0.0.0:8080"
 # Admin listener: nginx terminates TLS in front of this.
@@ -26,6 +32,7 @@ rp_name = "peephole"
 secure_cookies = true
 
 [maxmind]
+# Optional. Without it GeoIP enrichment is off.
 # GeoLite2 account credentials (https://www.maxmind.com/en/accounts/current/license-key).
 account_id = "123456"
 license_key = "testkey"
@@ -41,3 +48,20 @@ never_scan = ["192.168.0.0/16"] # CIDRs never counter-scanned (own infra, monito
 # appended as the final argument. Example:
 # [scan.level_argv]
 # 2 = ["-Pn", "-sS", "-sV", "-T3", "--top-ports", "2000"]
+
+# Distributed mode: share requests, scan queue, results and intel with other
+# nodes (README: Distributed mode). Absent: standalone. The node key is
+# created on first start; print it with `peephole cluster id`. Add nodes with
+# `peephole cluster invite` / `peephole cluster join <token>` or list them
+# below. Open `listen` to the other nodes only.
+# [cluster]
+# node_name = "server-a"            # shown in the admin UI only
+# listen    = "0.0.0.0:7443"        # RPC listener (mutual TLS, pinned keys)
+# advertise = "a.example.net:7443"  # how peers reach us; omit if outbound-only
+# takeover_hours = 6                # adopt an unreachable node's queued jobs after
+# lease_secs     = 120              # scan lease, renewed while nmap runs
+#
+# [[cluster.peers]]
+# name = "server-b"
+# address = "b.example.net:7443"
+# public_key = "ed25519:..."

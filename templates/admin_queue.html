@@ -7,6 +7,7 @@
 {% if let Some(e) = pace.error %}<div class="banner banner-warning">Pace not saved: {{ e }}</div>{% endif %}
 {% if pace.timeouts_high %}<div class="banner banner-warning">{{ pace.timeout_share }} of the scans finished in the last 24 h hit the {{ pace.timeout_min }} min timeout. The recommendation below raises it to {{ pace.rec_timeout_min }} min.</div>{% endif %}
 {% if pace.growing %}<div class="banner banner-warning">The queue grows by about {{ pace.net }} jobs per hour at the current pace. Apply the recommendation below or raise the pace.</div>{% endif %}
+{% if pace.not_scanning %}<div class="banner banner-warning">This node does not scan. The queue below is the whole cluster's; set each scanner's pace on the <a href="/admin/cluster">Cluster</a> page.</div>{% endif %}
 <section class="card pace" id="pace">
   <div class="card-head"><h2>Pace</h2><span class="muted">{% if pace.paused %}scanning paused{% else %}{{ pace.cadence }}{% endif %}</span></div>
   <div class="tiles">
@@ -47,8 +48,8 @@
   <button class="btn btn-primary" type="submit">Filter</button>
 </form>
 <div class="table-wrap"><table data-queue data-src="/admin/api/queue" data-limit="500" data-filter-status="{{ f.status.as_deref().unwrap_or_default() }}" data-filter-level="{{ f.level.as_deref().unwrap_or_default().trim() }}">
-  <thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Status</th><th>Queued</th><th>Finished</th><th>Error</th></tr></thead>
+  <thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Status</th><th>Queued</th><th>Finished</th><th>Error</th><th>Node</th></tr></thead>
   <tbody>{% for j in jobs %}{% include "_queue_row.html" %}{% endfor %}
-  {% if jobs.is_empty() %}<tr data-empty><td colspan="7" class="empty">Queue empty.</td></tr>{% endif %}</tbody>
+  {% if jobs.is_empty() %}<tr data-empty><td colspan="8" class="empty">Queue empty.</td></tr>{% endif %}</tbody>
 </table></div>
 {% endblock %}

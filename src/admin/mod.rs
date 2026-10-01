@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod auth;
+pub mod cluster;
 pub mod countries;
 pub mod error;
 pub mod pages;
@@ -14,6 +15,8 @@ use std::sync::Arc;
 
 pub struct AdminState {
     pub store: Store,
+    /// Writes (deletes, requeues); replicated in a cluster.
+    pub recorder: crate::store::recorder::Recorder,
     pub cfg: Config,
     pub notifier: crate::events::Notifier,
     pub stats_cache: crate::store::stats::StatsCache,
@@ -28,6 +31,7 @@ impl AdminState {
         pace: crate::scan::pace::SharedPace,
     ) -> Self {
         Self {
+            recorder: store.local(),
             store,
             cfg,
             notifier,
@@ -35,6 +39,12 @@ impl AdminState {
             pace,
         }
     }
+    /// Route writes through `recorder` (a cluster node's log).
+    pub fn with_recorder(mut self, recorder: crate::store::recorder::Recorder) -> Self {
+        self.recorder = recorder;
+        self
+    }
+
     /// State with a private notifier (tests, or when nothing publishes).
     pub fn public_only(store: Store, cfg: Config) -> Self {
         let pace =
@@ -56,6 +66,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(assets::router())
         .merge(auth::auth_routes())
         .merge(pages::routes())
+        .merge(cluster::routes())
         .fallback(error::not_found)
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)

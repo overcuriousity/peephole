@@ -90,6 +90,53 @@ Both sites follow the system light/dark preference (with a manual toggle),
 ship their fonts, scripts and map inside the binary, and make no external
 requests.
 
+## Distributed mode
+
+Several deployments can form a cluster that shares everything: every
+request, the scan queue, scan results and the GeoIP/Tor intel. Each node
+runs any combination of three roles, set in `[roles]`:
+
+| Role | Does | Needs |
+|---|---|---|
+| `listener` | trap listener, classification, queues scans | `trap_listen`, `rules_dir` |
+| `scanner` | runs nmap for jobs from any node | nmap |
+| `web` | wall of shame and admin area | `admin_listen`, `[webauthn]` |
+
+Every node keeps a full copy of the dataset, so any web node shows the
+whole cluster. Scanners claim jobs from the node that queued them; jobs go
+to the scanner with the fewest recent scans, so equally paced scanners
+share the queue equally. Only one node with a MaxMind key downloads the
+GeoLite2 databases; the others copy them from the cluster.
+
+Enable it with a `[cluster]` section (see the example config), then add
+nodes:
+
+```sh
+peephole cluster id                 # this node's key (also printed by check-config)
+peephole cluster invite             # on a member: one-time token, valid 24 h
+peephole cluster join <token>       # on the new node; or Admin → Cluster
+peephole cluster members            # status; revoke with: peephole cluster revoke <name>
+```
+
+Peers can also be listed under `[[cluster.peers]]` with their key. Any
+member can admit or revoke nodes for the whole cluster, so treat every
+node's admin access as cluster-wide. Nodes talk HTTP/2 over mutual TLS with
+pinned Ed25519 keys on `cluster.listen` (default port 7443). Open that port
+to the other nodes only. A node without `advertise` is outbound-only: it
+dials its peers and still syncs both ways.
+
+Things to know:
+
+- Counter-scans come from the scanner node's address, not the listener's.
+  Abuse reports go to that node's hosting provider.
+- Scanners never scan cluster members or anything in any member's
+  `never_scan`.
+- Run NTP on every node: cooldowns compare timestamps written by different
+  nodes. The Cluster page flags clock differences.
+- Deletes propagate. A standalone node that joins brings its history with
+  it.
+- Node names and keys appear only in the admin area, never on public pages.
+
 ## Configuration
 
 Everything lives in `/etc/peephole/config.toml` — see

@@ -8,3 +8,4 @@
 <input type="hidden" name="asn" value="{% if let Some(v) = f.asn %}{{ v }}{% endif %}">
 <input type="hidden" name="from" value="{{ f.from.as_deref().unwrap_or_default() }}">
 <input type="hidden" name="to" value="{{ f.to.as_deref().unwrap_or_default() }}">
+<input type="hidden" name="node" value="{{ f.node.as_deref().unwrap_or_default() }}">

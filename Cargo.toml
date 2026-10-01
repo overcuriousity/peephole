@@ -14,34 +14,45 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1.9.2"
 arrow = "60"
 askama = "0.16"
+aws-lc-rs = "1"
 axum = "0.8"
 axum-extra = { version = "0.12", features = ["cookie-signed"] }
 chrono = { version = "0.4", features = ["serde"] }
+ciborium = "0.2.2"
 csv = "1.4"
 data-encoding = "2"
 flate2 = "1"
 futures = "0.3"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "http1", "http2", "tokio", "service"] }
 ipnet = { version = "2", features = ["serde"] }
 maxminddb = "0.32"
 parquet = "60"
 quick-xml = "0.42"
 rand = "0.10"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 regex = "1"
 reqwest = { version = "0.13", features = ["rustls", "gzip", "json", "cookies", "form"] }
+rustls = "0.23"
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11.19"
 serde_json = "1"
 serde_urlencoded = "0.7"
 sha2 = "0.11"
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono", "ipnetwork"] }
 tar = "0.4"
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
 toml = "1.1"
+tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+x509-parser = "0.16"
 zstd = "0.14"
 
 [dev-dependencies]

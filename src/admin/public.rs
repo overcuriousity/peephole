@@ -181,6 +181,7 @@ pub(crate) fn request_qs(f: &RequestFilter) -> String {
         ("asn", f.asn.map(|a| a.to_string())),
         ("from", f.from.clone()),
         ("to", f.to.clone()),
+        ("node", f.node.clone()),
     ])
 }
 
@@ -216,6 +217,9 @@ struct RequestsPage {
     page: Page<RequestListRow>,
     qs: String,
     bulk_total: Option<i64>,
+    /// Cluster member names for the admin-only node filter (empty
+    /// standalone or for the public).
+    nodes: Vec<String>,
 }
 
 async fn requests(
@@ -233,12 +237,22 @@ async fn requests(
         None
     };
     let qs = request_qs(&f);
+    let nodes = if authed {
+        crate::cluster::members::all(&state.store)
+            .await?
+            .into_iter()
+            .map(|m| m.name)
+            .collect()
+    } else {
+        vec![]
+    };
     render(&RequestsPage {
         chrome: Chrome::new(authed, "requests"),
         f,
         page,
         qs,
         bulk_total,
+        nodes,
     })
 }
 

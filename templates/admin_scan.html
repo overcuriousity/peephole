@@ -4,7 +4,7 @@
 <div class="page-head"><div>
   <h1>Scan #{{ s.id }} · <a class="mono" href="/ip/{{ s.ip }}">{{ s.ip }}</a></h1>
   <div class="meta"><span>level {{ s.level }}</span><span>started <span class="mono">{{ s.started_at }}</span></span>
-    <span>finished <span class="mono">{{ s.finished_at.as_deref().unwrap_or("—") }}</span></span><span>OS: {{ s.os_guess.as_deref().unwrap_or("unknown") }}</span></div>
+    <span>finished <span class="mono">{{ s.finished_at.as_deref().unwrap_or("—") }}</span></span><span>OS: {{ s.os_guess.as_deref().unwrap_or("unknown") }}</span>{% if let Some(n) = s.node %}<span>scanned by {{ n }}</span>{% endif %}</div>
 </div>
 <div class="row">
   <a class="btn" href="/admin/scans/{{ s.id }}/xml">Download raw XML</a>

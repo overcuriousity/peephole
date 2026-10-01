@@ -480,7 +480,7 @@ mod tests {
             .unwrap();
         s.insert_request(&req(b.id, "/", 0)).await.unwrap();
         // One request 3 days old: outside 24h, inside 7d.
-        sqlx::query("INSERT INTO requests (ts, ip_id, method, path, headers_json, labels_json, severity) VALUES (datetime('now','-3 days'), ?, 'GET', '/old', '[]', '[]', 1)")
+        sqlx::query("INSERT INTO requests (uid, ts, ip_id, method, path, headers_json, labels_json, severity) VALUES ('raw-old', datetime('now','-3 days'), ?, 'GET', '/old', '[]', '[]', 1)")
             .bind(b.id).execute(&s.pool).await.unwrap();
         s
     }

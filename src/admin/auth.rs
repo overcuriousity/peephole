@@ -62,10 +62,10 @@ pub async fn ensure_setup_token(
 }
 
 fn webauthn_for(cfg: &crate::config::Config) -> Result<Webauthn> {
-    let origin = Url::parse(&cfg.webauthn.origin).context("webauthn origin")?;
-    let builder = WebauthnBuilder::new(&cfg.webauthn.rp_id, &origin)
+    let origin = Url::parse(&cfg.webauthn().origin).context("webauthn origin")?;
+    let builder = WebauthnBuilder::new(&cfg.webauthn().rp_id, &origin)
         .context("webauthn builder")?
-        .rp_name(&cfg.webauthn.rp_name);
+        .rp_name(&cfg.webauthn().rp_name);
     builder.build().context("webauthn build")
 }
 
@@ -87,7 +87,7 @@ fn session_cookie(
     axum_extra::extract::cookie::Cookie::build(("peephole_session", id))
         .path("/")
         .http_only(true)
-        .secure(cfg.webauthn.secure_cookies)
+        .secure(cfg.webauthn().secure_cookies)
         .same_site(axum_extra::extract::cookie::SameSite::Strict)
         .build()
 }

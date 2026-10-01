@@ -1,12 +1,17 @@
+pub mod arbiter;
 pub mod nmap_xml;
 pub mod pace;
 
+use crate::cluster::Node;
+use crate::cluster::identity::NodeId;
+use crate::cluster::msg::Msg;
 use crate::config::Config;
-use crate::store::Store;
+use crate::store::recorder::Recorder;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// nmap argv (after the binary name) for a level and target (spec §5).
 pub fn nmap_argv(level: u8, target: &IpAddr, cfg: &Config) -> Vec<String> {
@@ -17,19 +22,423 @@ pub fn nmap_argv(level: u8, target: &IpAddr, cfg: &Config) -> Vec<String> {
     argv
 }
 
+/// A scan to run, and who to report it to.
+#[derive(Clone)]
+enum Job {
+    /// Standalone: a row in our own queue.
+    Local { id: i64, ip: IpAddr, level: u8 },
+    /// Cluster: granted by `arbiter` under a lease.
+    Granted {
+        arbiter: NodeId,
+        uid: String,
+        ip: IpAddr,
+        level: u8,
+        lease: Duration,
+        started_at: String,
+    },
+}
+
+impl Job {
+    fn ip(&self) -> IpAddr {
+        match self {
+            Job::Local { ip, .. } | Job::Granted { ip, .. } => *ip,
+        }
+    }
+    fn level(&self) -> u8 {
+        match self {
+            Job::Local { level, .. } | Job::Granted { level, .. } => *level,
+        }
+    }
+}
+
+/// How a scan ended.
+enum Outcome {
+    Done(nmap_xml::ScanResult),
+    Failed(String),
+    /// The arbiter gave the job to someone else (lease lost).
+    Abandoned,
+}
+
+/// How long to wait for an arbiter's answer to a claim.
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
+/// Skip an arbiter that did not answer for this long.
+const ARBITER_BACKOFF: Duration = Duration::from_secs(30);
+/// Rebuild the never-scan set this often (member list, DNS).
+const SAFETY_REFRESH: Duration = Duration::from_secs(300);
+
+/// Targets this scanner refuses: its own never_scan, every member's, and
+/// the addresses of all cluster members.
+struct Safety {
+    nets: Vec<ipnet::IpNet>,
+    addrs: std::collections::HashSet<IpAddr>,
+    built: Option<std::time::Instant>,
+}
+
+impl Safety {
+    fn new() -> Self {
+        Self {
+            nets: vec![],
+            addrs: Default::default(),
+            built: None,
+        }
+    }
+
+    async fn refresh(&mut self, node: &Node, own: &[ipnet::IpNet]) {
+        if self.built.is_some_and(|t| t.elapsed() < SAFETY_REFRESH) {
+            return;
+        }
+        let mut nets = own.to_vec();
+        let mut addrs = std::collections::HashSet::new();
+        let mut hosts: Vec<String> = node.dial_targets().into_iter().map(|t| t.2).collect();
+        if let Ok(rows) = crate::cluster::members::all(&node.store).await {
+            for m in rows {
+                nets.extend(
+                    m.never_scan
+                        .iter()
+                        .filter_map(|n| n.parse::<ipnet::IpNet>().ok()),
+                );
+                hosts.extend(m.address);
+            }
+        }
+        hosts.extend(node.cfg.advertise.clone());
+        for h in hosts {
+            if let Ok(Ok(it)) =
+                tokio::time::timeout(Duration::from_secs(3), tokio::net::lookup_host(h)).await
+            {
+                addrs.extend(it.map(|sa| sa.ip()));
+            }
+        }
+        self.nets = nets;
+        self.addrs = addrs;
+        self.built = Some(std::time::Instant::now());
+    }
+
+    fn refuses(&self, ip: &IpAddr) -> Option<String> {
+        if self.addrs.contains(ip) {
+            return Some("cluster member address".into());
+        }
+        self.nets
+            .iter()
+            .find(|n| n.contains(ip))
+            .map(|n| format!("never_scan {n}"))
+    }
+}
+
+/// Where jobs come from and where outcomes go.
+struct Source {
+    rec: Recorder,
+    cfg: Config,
+    safety: tokio::sync::Mutex<Safety>,
+    unreachable: std::sync::Mutex<std::collections::HashMap<NodeId, std::time::Instant>>,
+}
+
+impl Source {
+    fn node(&self) -> Option<&Arc<Node>> {
+        match &self.rec {
+            Recorder::Cluster(n) => Some(n),
+            Recorder::Local(_) => None,
+        }
+    }
+
+    /// Next job to run, or None when there is nothing for us.
+    async fn acquire(&self) -> anyhow::Result<Option<Job>> {
+        let Some(node) = self.node() else {
+            let Some(job) = self.rec.next_queued_job().await? else {
+                return Ok(None);
+            };
+            let ip: String = sqlx::query_scalar("SELECT ip FROM ips WHERE id=?")
+                .bind(job.ip_id)
+                .fetch_one(&self.rec.store().pool)
+                .await
+                .unwrap_or_default();
+            let Ok(ip) = ip.parse::<IpAddr>() else {
+                let _ = self
+                    .rec
+                    .finish_job(job.id, None, Some("invalid target"))
+                    .await;
+                return Box::pin(self.acquire()).await;
+            };
+            return Ok(Some(Job::Local {
+                id: job.id,
+                ip,
+                level: job.level as u8,
+            }));
+        };
+        // Arbiters with queued work, most urgent first.
+        let arbiters: Vec<(Vec<u8>, i64, String)> = sqlx::query_as(
+            "SELECT arbiter, MAX(level) AS l, MIN(queued_at) AS q FROM scan_jobs
+             WHERE status = 'queued' AND arbiter IS NOT NULL
+             GROUP BY arbiter ORDER BY l DESC, q ASC",
+        )
+        .fetch_all(&node.store.pool)
+        .await?;
+        for (a, _, _) in arbiters {
+            let Ok(arbiter) = NodeId::from_slice(&a) else {
+                continue;
+            };
+            if self
+                .unreachable
+                .lock()
+                .unwrap()
+                .get(&arbiter)
+                .is_some_and(|t| t.elapsed() < ARBITER_BACKOFF)
+            {
+                continue;
+            }
+            let grant = match node.request(arbiter, Msg::Claim, CLAIM_TIMEOUT).await {
+                Ok(Msg::ClaimReply { grant }) => grant,
+                Ok(_) => None,
+                Err(e) => {
+                    debug!(arbiter = %arbiter.short(), ?e, "claim failed");
+                    self.unreachable
+                        .lock()
+                        .unwrap()
+                        .insert(arbiter, std::time::Instant::now());
+                    None
+                }
+            };
+            let Some(g) = grant else { continue };
+            let Ok(ip) = g.ip.parse::<IpAddr>() else {
+                self.report(
+                    node,
+                    arbiter,
+                    &g.job_uid,
+                    "failed",
+                    Some("invalid target".into()),
+                )
+                .await;
+                continue;
+            };
+            // Pre-flight: refused targets and duplicates never reach nmap.
+            let refused = {
+                let mut s = self.safety.lock().await;
+                s.refresh(node, &self.cfg.scan.never_scan).await;
+                s.refuses(&ip)
+            };
+            if let Some(why) = refused {
+                info!(target = %ip, %why, "scan refused");
+                self.report(node, arbiter, &g.job_uid, "refused", Some(why))
+                    .await;
+                continue;
+            }
+            if self.duplicate(&g.job_uid, &g.ip, g.level).await? {
+                self.report(node, arbiter, &g.job_uid, "superseded", None)
+                    .await;
+                continue;
+            }
+            return Ok(Some(Job::Granted {
+                arbiter,
+                uid: g.job_uid,
+                ip,
+                level: g.level as u8,
+                lease: Duration::from_secs(g.lease_secs),
+                started_at: crate::store::data::now_ts(),
+            }));
+        }
+        Ok(None)
+    }
+
+    /// A scan of this IP at this level or higher is running, or finished
+    /// within the cooldown.
+    async fn duplicate(&self, uid: &str, ip: &str, level: i64) -> anyhow::Result<bool> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
+             WHERE i.ip = ? AND j.uid != ? AND j.level >= ?
+               AND (j.status = 'running'
+                    OR (j.status = 'done' AND j.finished_at > datetime('now', ?)))",
+        )
+        .bind(ip)
+        .bind(uid)
+        .bind(level)
+        .bind(format!("-{} hours", self.cfg.scan.rescan_cooldown_hours))
+        .fetch_one(&self.rec.store().pool)
+        .await?;
+        Ok(n > 0)
+    }
+
+    /// Tell the arbiter how a job ended, retrying for about two minutes; if
+    /// it never hears, its lease sweep finds our result (or requeues).
+    async fn report(
+        &self,
+        node: &Arc<Node>,
+        arbiter: NodeId,
+        uid: &str,
+        status: &str,
+        error: Option<String>,
+    ) {
+        let msg = Msg::Complete {
+            job_uid: uid.to_string(),
+            status: status.to_string(),
+            error,
+        };
+        let mut wait = Duration::from_secs(2);
+        for _ in 0..6 {
+            match node.request(arbiter, msg.clone(), CLAIM_TIMEOUT).await {
+                Ok(Msg::CompleteReply { ok: true }) => return,
+                Ok(_) => {
+                    warn!(job = %uid, arbiter = %arbiter.short(), "arbiter refused the outcome");
+                    return;
+                }
+                Err(e) => debug!(job = %uid, ?e, "reporting outcome failed; retrying"),
+            }
+            tokio::time::sleep(wait).await;
+            wait *= 2;
+        }
+        warn!(job = %uid, arbiter = %arbiter.short(), "arbiter unreachable; outcome not reported");
+    }
+
+    /// Record a finished job.
+    async fn finish(&self, job: &Job, outcome: Outcome) {
+        match (job, self.node()) {
+            (Job::Local { id, .. }, _) => {
+                let r = match &outcome {
+                    Outcome::Done(res) => self.rec.finish_job(*id, Some(res), None).await,
+                    Outcome::Failed(e) => self.rec.finish_job(*id, None, Some(e)).await,
+                    Outcome::Abandoned => Ok(()),
+                };
+                if let Err(e) = r {
+                    warn!(job = id, ?e, "could not record scan outcome (job deleted?)");
+                }
+            }
+            (
+                Job::Granted {
+                    arbiter,
+                    uid,
+                    ip,
+                    level,
+                    started_at,
+                    ..
+                },
+                Some(node),
+            ) => match outcome {
+                Outcome::Done(res) => {
+                    if let Err(e) = self
+                        .rec
+                        .record_scan_result(uid, &ip.to_string(), *level as i64, started_at, &res)
+                        .await
+                    {
+                        warn!(job = %uid, ?e, "could not record scan result");
+                        self.report(node, *arbiter, uid, "failed", Some(e.to_string()))
+                            .await;
+                        return;
+                    }
+                    self.report(node, *arbiter, uid, "done", None).await;
+                }
+                Outcome::Failed(e) => self.report(node, *arbiter, uid, "failed", Some(e)).await,
+                Outcome::Abandoned => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Queue row for the live queue view, if we have it.
+    async fn queue_row(&self, job: &Job) -> Option<crate::events::QueueJob> {
+        let store = self.rec.store();
+        let id = match job {
+            Job::Local { id, .. } => *id,
+            Job::Granted { uid, .. } => {
+                sqlx::query_scalar("SELECT id FROM scan_jobs WHERE uid = ?")
+                    .bind(uid)
+                    .fetch_optional(&store.pool)
+                    .await
+                    .ok()??
+            }
+        };
+        store.queue_job(id).await.ok()?
+    }
+}
+
+/// Run nmap for `job`; in a cluster, renew the lease meanwhile and give up
+/// if the arbiter says it is no longer ours.
+async fn run_scan(
+    source: &Source,
+    job: &Job,
+    argv: Vec<String>,
+    nmap: PathBuf,
+    timeout: Duration,
+) -> Outcome {
+    // kill_on_drop: when the timeout (or a lost lease) drops this future,
+    // nmap must die with it, not linger behind a freed worker slot.
+    let run = async {
+        let out = tokio::process::Command::new(nmap)
+            .args(&argv)
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output();
+        match tokio::time::timeout(timeout, out).await {
+            Ok(Ok(out)) if out.status.success() => match nmap_xml::parse_nmap_xml(&out.stdout) {
+                Ok(res) => Outcome::Done(res),
+                Err(e) => Outcome::Failed(e.to_string()),
+            },
+            Ok(Ok(out)) => Outcome::Failed(format!("exit {:?}", out.status.code())),
+            Ok(Err(e)) => Outcome::Failed(e.to_string()),
+            Err(_) => Outcome::Failed("timeout".into()),
+        }
+    };
+    let (
+        Job::Granted {
+            arbiter,
+            uid,
+            lease,
+            ..
+        },
+        Some(node),
+    ) = (job, source.node())
+    else {
+        return run.await;
+    };
+    let renew = async {
+        let every = (*lease / 3).max(Duration::from_millis(200));
+        loop {
+            tokio::time::sleep(every).await;
+            let renewed = node
+                .request(
+                    *arbiter,
+                    Msg::Renew {
+                        job_uid: uid.clone(),
+                    },
+                    every,
+                )
+                .await;
+            // An unreachable arbiter is not a refusal: keep scanning; it
+            // requeues the job if the lease runs out.
+            if let Ok(Msg::RenewReply { ok: false }) = renewed {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        o = run => o,
+        _ = renew => {
+            warn!(job = %uid, "scan lease lost; nmap stopped");
+            Outcome::Abandoned
+        }
+    }
+}
+
 pub async fn run_workers(
-    store: Store,
+    rec: Recorder,
     cfg: Config,
     pace: pace::SharedPace,
     nmap_path: PathBuf,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     notifier: crate::events::Notifier,
 ) {
-    match store.requeue_orphaned_jobs().await {
-        Ok(0) => {}
-        Ok(n) => info!(jobs = n, "requeued scans interrupted by the last shutdown"),
-        Err(e) => warn!(?e, "could not requeue interrupted scans"),
+    if matches!(rec, Recorder::Local(_)) {
+        // In a cluster the arbiters recover their own jobs.
+        match rec.requeue_orphaned_jobs().await {
+            Ok(0) => {}
+            Ok(n) => info!(jobs = n, "requeued scans interrupted by the last shutdown"),
+            Err(e) => warn!(?e, "could not requeue interrupted scans"),
+        }
     }
+    let source = Arc::new(Source {
+        rec: rec.clone(),
+        cfg: cfg.clone(),
+        safety: tokio::sync::Mutex::new(Safety::new()),
+        unreachable: Default::default(),
+    });
     let mut joinset = tokio::task::JoinSet::new();
     let mut last_start: Option<tokio::time::Instant> = None;
     loop {
@@ -40,14 +449,24 @@ pub async fn run_workers(
         while joinset.try_join_next().is_some() {}
         // Re-read every pass so admin changes apply without a restart.
         let p = pace.get();
+        if let Some(node) = source.node() {
+            *node.status.local.lock().unwrap() = crate::cluster::status::LocalStatus {
+                pace: Some(crate::cluster::status::PaceInfo {
+                    max_workers: p.max_workers as u32,
+                    max_scans_per_hour: p.max_scans_per_hour,
+                    timeout_secs: p.timeout_secs,
+                }),
+                active_scans: joinset.len() as u32,
+            };
+        }
         while joinset.len() < p.max_workers {
             // Cadence: space starts evenly instead of bursting up to the cap.
             let Some(interval) = p.interval() else { break };
             if last_start.is_some_and(|t| t.elapsed() < interval) {
                 break;
             }
-            // Global rate cap (spec §5), also across restarts.
-            match store.jobs_started_last_hour().await {
+            // Rate cap (spec §5), also across restarts; per scanner.
+            match rec.jobs_started_last_hour().await {
                 Ok(n) if n >= p.max_scans_per_hour => break,
                 Err(e) => {
                     warn!(?e, "rate cap check failed");
@@ -55,102 +474,33 @@ pub async fn run_workers(
                 }
                 _ => {}
             }
-            match store.next_queued_job().await {
-                Ok(Some(job)) => {
-                    let ip: String = sqlx::query_scalar("SELECT ip FROM ips WHERE id=?")
-                        .bind(job.ip_id)
-                        .fetch_one(&store.pool)
-                        .await
-                        .unwrap_or_default();
-                    let Ok(target) = ip.parse::<IpAddr>() else {
-                        let _ = store.finish_job(job.id, None, Some("invalid target")).await;
-                        continue;
-                    };
-                    if let Ok(Some(j)) = store.queue_job(job.id).await {
-                        notifier.publish(j);
-                    }
-                    last_start = Some(tokio::time::Instant::now());
-                    let argv = nmap_argv(job.level as u8, &target, &cfg);
-                    let store2 = store.clone();
-                    let notifier2 = notifier.clone();
-                    let nmap = nmap_path.clone();
-                    let timeout = Duration::from_secs(p.timeout_secs);
-                    joinset.spawn(async move {
-                        // kill_on_drop: when the timeout drops this future, nmap
-                        // must die with it, not linger behind a freed worker slot.
-                        let run = tokio::process::Command::new(nmap)
-                            .args(&argv)
-                            .kill_on_drop(true)
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::null())
-                            .output();
-                        match tokio::time::timeout(timeout, run).await {
-                            Ok(Ok(out)) if out.status.success() => {
-                                match nmap_xml::parse_nmap_xml(&out.stdout) {
-                                    Ok(res) => {
-                                        if let Err(e) =
-                                            store2.finish_job(job.id, Some(&res), None).await
-                                        {
-                                            warn!(
-                                                job = job.id,
-                                                ?e,
-                                                "could not record scan result (job deleted?)"
-                                            );
-                                        }
-                                        info!(target = %target, level = job.level, "scan done");
-                                    }
-                                    Err(e) => {
-                                        if let Err(e2) = store2
-                                            .finish_job(job.id, None, Some(&e.to_string()))
-                                            .await
-                                        {
-                                            warn!(
-                                                job = job.id,
-                                                ?e2,
-                                                "could not record scan failure"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(Ok(out)) => {
-                                if let Err(e) = store2
-                                    .finish_job(
-                                        job.id,
-                                        None,
-                                        Some(&format!("exit {:?}", out.status.code())),
-                                    )
-                                    .await
-                                {
-                                    warn!(job = job.id, ?e, "could not record scan failure");
-                                }
-                            }
-                            Ok(Err(e)) => {
-                                if let Err(e2) =
-                                    store2.finish_job(job.id, None, Some(&e.to_string())).await
-                                {
-                                    warn!(job = job.id, ?e2, "could not record scan failure");
-                                }
-                            }
-                            Err(_) => {
-                                if let Err(e) =
-                                    store2.finish_job(job.id, None, Some("timeout")).await
-                                {
-                                    warn!(job = job.id, ?e, "could not record scan timeout");
-                                }
-                            }
-                        }
-                        if let Ok(Some(j)) = store2.queue_job(job.id).await {
-                            notifier2.publish(j);
-                        }
-                    });
-                }
+            let job = match source.acquire().await {
+                Ok(Some(job)) => job,
                 Ok(None) => break,
                 Err(e) => {
                     warn!(?e, "queue poll failed");
                     break;
                 }
+            };
+            if let Some(j) = source.queue_row(&job).await {
+                notifier.publish(j);
             }
+            last_start = Some(tokio::time::Instant::now());
+            let argv = nmap_argv(job.level(), &job.ip(), &cfg);
+            let source2 = source.clone();
+            let notifier2 = notifier.clone();
+            let nmap = nmap_path.clone();
+            let timeout = Duration::from_secs(p.timeout_secs);
+            joinset.spawn(async move {
+                let outcome = run_scan(&source2, &job, argv, nmap, timeout).await;
+                if let Outcome::Done(_) = &outcome {
+                    info!(target = %job.ip(), level = job.level(), "scan done");
+                }
+                source2.finish(&job, outcome).await;
+                if let Some(j) = source2.queue_row(&job).await {
+                    notifier2.publish(j);
+                }
+            });
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(500)) => {}
@@ -295,7 +645,7 @@ license_key = "k"
             timeout_secs: 60,
         });
         let pool = tokio::spawn(run_workers(
-            store.clone(),
+            store.local(),
             cfg,
             p,
             fake,
@@ -340,7 +690,7 @@ license_key = "k"
         });
         let (tx, rx) = tokio::sync::watch::channel(false);
         let pool = tokio::spawn(run_workers(
-            store.clone(),
+            store.local(),
             cfg,
             p,
             fake,
@@ -401,7 +751,7 @@ license_key = "k"
         let (tx, rx) = tokio::sync::watch::channel(false);
         let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
         let pool = tokio::spawn(run_workers(
-            store.clone(),
+            store.local(),
             cfg,
             p,
             fake.clone(),
