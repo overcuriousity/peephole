@@ -270,7 +270,7 @@ async fn newest_intel(
     provider: &str,
 ) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
     let raw: Option<String> = sqlx::query_scalar(
-        "SELECT data_json FROM ip_intel WHERE ip = ? AND provider = ? ORDER BY hlc DESC LIMIT 1",
+        "SELECT data_json FROM ip_intel WHERE ip = ? AND provider = ? ORDER BY hlc DESC, origin DESC LIMIT 1",
     )
     .bind(ip)
     .bind(provider)

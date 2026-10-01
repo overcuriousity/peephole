@@ -1024,9 +1024,10 @@ async fn data_replicates_cluster_wide() {
         .upsert_ip("198.51.100.77".parse().unwrap())
         .await
         .unwrap();
-    r.enrich_ip(ip.id, Some("DE"), Some(64500), Some("Example AS"), true)
+    r.record_geo(ip.id, None, Some("DE"), Some(64500), Some("Example AS"))
         .await
         .unwrap();
+    r.record_tor(ip.id, true).await.unwrap();
     let req = r
         .insert_request(&new_request(ip.id, "/login"))
         .await
@@ -2611,4 +2612,51 @@ async fn enrichment_results_replicate_and_follow_blocks() {
     );
     block::unblock(&nb, a.id).await.unwrap();
     assert_eq!(country(&nb).await.as_deref(), Some("NL"));
+}
+
+/// A node that consulted only GeoIP writes no Tor result of its own and
+/// leaves another node's Tor result alone.
+#[tokio::test]
+async fn a_geo_only_write_leaves_tor_alone() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    record(&nb, "203.0.113.91", "/x").await;
+    rec(&na)
+        .record_intel(
+            "203.0.113.91",
+            peephole::intel::TOR,
+            None,
+            serde_json::json!({"exit": true}),
+        )
+        .await
+        .unwrap();
+    let tor = |n: &TestNode| {
+        let pool = n.store.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>("SELECT is_tor_exit FROM ips WHERE ip = '203.0.113.91'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    eventually("b shows a's tor result", || async { tor(&nb).await }).await;
+    let ip_id: i64 = sqlx::query_scalar("SELECT id FROM ips WHERE ip = '203.0.113.91'")
+        .fetch_one(&nb.store.pool)
+        .await
+        .unwrap();
+    rec(&nb)
+        .record_geo(ip_id, Some("2026-09-30"), Some("NL"), Some(1), None)
+        .await
+        .unwrap();
+    let mine: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ip_intel WHERE provider = 'tor-exits' AND origin = ?",
+    )
+    .bind(&b.id.0[..])
+    .fetch_one(&nb.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(mine, 0, "no Tor row of its own");
+    assert!(tor(&nb).await, "a's Tor result still shows");
 }

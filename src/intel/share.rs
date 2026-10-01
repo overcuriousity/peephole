@@ -264,27 +264,34 @@ pub async fn sync_files(node: &Node, data_dir: &Path) -> Result<Vec<String>> {
 /// without the databases). Only the node that fetched the current
 /// databases does this, so the cluster writes each fact once.
 pub async fn backfill_missing_geo(rec: &Recorder, geo: &super::SharedGeo) -> Result<usize> {
-    let rows: Vec<(i64, String, bool)> = sqlx::query_as(
-        "SELECT id, ip, is_tor_exit FROM ips WHERE country IS NULL AND asn IS NULL LIMIT 5000",
-    )
-    .fetch_all(&rec.store().pool)
-    .await?;
-    let updates: Vec<_> = {
+    let rows: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, ip FROM ips WHERE country IS NULL AND asn IS NULL LIMIT 5000")
+            .fetch_all(&rec.store().pool)
+            .await?;
+    let (updates, version): (Vec<_>, _) = {
         let guard = geo.read().unwrap();
         let Some(g) = guard.as_ref() else {
             return Ok(0);
         };
-        rows.into_iter()
-            .filter_map(|(id, ip, tor)| {
+        let updates = rows
+            .into_iter()
+            .filter_map(|(id, ip)| {
                 let hit = g.lookup(&ip.parse().ok()?);
-                (hit.country.is_some() || hit.asn.is_some()).then_some((id, hit, tor))
+                (hit.country.is_some() || hit.asn.is_some()).then_some((id, hit))
             })
-            .collect()
+            .collect();
+        (updates, g.build_date())
     };
     let n = updates.len();
-    for (id, g, tor) in updates {
-        rec.enrich_ip(id, g.country.as_deref(), g.asn, g.asn_org.as_deref(), tor)
-            .await?;
+    for (id, g) in updates {
+        rec.record_geo(
+            id,
+            version.as_deref(),
+            g.country.as_deref(),
+            g.asn,
+            g.asn_org.as_deref(),
+        )
+        .await?;
     }
     Ok(n)
 }

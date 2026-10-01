@@ -147,7 +147,6 @@ impl Recorder {
         source_version: Option<&str>,
         data: serde_json::Value,
     ) -> Result<()> {
-        let data_json = data.to_string();
         let mine = self.node_id().map(|id| id.0.to_vec()).unwrap_or_default();
         let last: Option<String> = sqlx::query_scalar(
             "SELECT data_json FROM ip_intel WHERE ip = ? AND provider = ? AND origin = ?",
@@ -157,7 +156,12 @@ impl Recorder {
         .bind(mine)
         .fetch_optional(&self.store().pool)
         .await?;
-        if last.as_deref() == Some(data_json.as_str()) {
+        // Compared as JSON: rows from the migration differ in key order and
+        // explicit nulls.
+        let same = last
+            .and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+            .is_some_and(|l| l == data);
+        if same {
             return Ok(());
         }
         self.write(vec![Record::IpIntel(IpIntelRec {
@@ -165,7 +169,7 @@ impl Recorder {
             provider: provider.to_string(),
             fetched_at: now_ts(),
             source_version: source_version.map(str::to_string),
-            data_json,
+            data_json: data.to_string(),
         })])
         .await
     }
@@ -189,34 +193,48 @@ impl Recorder {
         serde_json::Value::Object(m)
     }
 
-    /// Set GeoIP / Tor facts for an IP (tests and legacy callers).
-    pub async fn enrich_ip(
+    /// Record this node's MaxMind result for an IP. Only the provider that
+    /// was consulted is written; other providers' results are not touched.
+    pub async fn record_geo(
         &self,
         ip_id: i64,
+        source_version: Option<&str>,
         country: Option<&str>,
         asn: Option<u32>,
         asn_org: Option<&str>,
-        tor: bool,
     ) -> Result<()> {
-        let Ok(ip) = self.ip_of(ip_id).await else {
+        let Some(ip) = self.find_ip(ip_id).await? else {
             return Ok(());
         };
-        if country.is_some() || asn.is_some() || asn_org.is_some() {
-            self.record_intel(
-                &ip,
-                crate::intel::MAXMIND,
-                None,
-                Self::geo_data(country, asn, asn_org),
-            )
-            .await?;
-        }
+        self.record_intel(
+            &ip,
+            crate::intel::MAXMIND,
+            source_version,
+            Self::geo_data(country, asn, asn_org),
+        )
+        .await
+    }
+
+    /// Record this node's Tor exit list result for an IP.
+    pub async fn record_tor(&self, ip_id: i64, exit: bool) -> Result<()> {
+        let Some(ip) = self.find_ip(ip_id).await? else {
+            return Ok(());
+        };
         self.record_intel(
             &ip,
             crate::intel::TOR,
             None,
-            serde_json::json!({ "exit": tor }),
+            serde_json::json!({ "exit": exit }),
         )
         .await
+    }
+
+    /// The IP's text, None when the row does not exist.
+    async fn find_ip(&self, ip_id: i64) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT ip FROM ips WHERE id = ?")
+            .bind(ip_id)
+            .fetch_optional(&self.store().pool)
+            .await?)
     }
 
     pub async fn insert_fp_claim(

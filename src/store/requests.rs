@@ -68,7 +68,7 @@ impl Store {
             .await?)
     }
 
-    /// Set an IP's GeoIP facts (keeps its Tor flag).
+    /// Set an IP's GeoIP facts (this node's MaxMind result; Tor is untouched).
     pub async fn set_ip_geo(
         &self,
         ip_id: i64,
@@ -76,12 +76,8 @@ impl Store {
         asn: Option<u32>,
         asn_org: Option<&str>,
     ) -> Result<()> {
-        let tor: Option<bool> = sqlx::query_scalar("SELECT is_tor_exit FROM ips WHERE id = ?")
-            .bind(ip_id)
-            .fetch_optional(&self.pool)
-            .await?;
         self.local()
-            .enrich_ip(ip_id, country, asn, asn_org, tor.unwrap_or(false))
+            .record_geo(ip_id, None, country, asn, asn_org)
             .await
     }
 
@@ -94,18 +90,9 @@ impl Store {
         .await?)
     }
 
+    /// Set an IP's Tor flag (this node's Tor result; GeoIP is untouched).
     pub async fn set_ip_tor(&self, ip_id: i64, is_tor: bool) -> Result<()> {
-        let row = self.ip_by_id(ip_id).await?;
-        let Some(r) = row else { return Ok(()) };
-        self.local()
-            .enrich_ip(
-                ip_id,
-                r.country.as_deref(),
-                r.asn.map(|a| a as u32),
-                r.asn_org.as_deref(),
-                is_tor,
-            )
-            .await
+        self.local().record_tor(ip_id, is_tor).await
     }
 
     pub async fn insert_request(&self, n: &NewRequest) -> Result<i64> {

@@ -25,6 +25,11 @@ impl TorExitList {
         Ok(Self { set })
     }
 
+    /// Whether no list is loaded (so nothing can be said about any IP).
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
     pub fn contains(&self, ip: &IpAddr) -> bool {
         self.set.contains(ip)
     }

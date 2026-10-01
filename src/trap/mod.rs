@@ -187,15 +187,21 @@ async fn record_and_respond(
             )
             .await?;
     }
-    let is_tor = state.tor.read().unwrap().contains(&ip);
-    if is_tor {
+    // With a Tor list loaded, every IP gets a result (false included); with
+    // none, this node has nothing to say.
+    let tor_hit = {
+        let tor = state.tor.read().unwrap();
+        (!tor.is_empty()).then(|| tor.contains(&ip))
+    };
+    let is_tor = tor_hit == Some(true);
+    if let Some(exit) = tor_hit {
         state
             .recorder
             .record_intel(
                 &ip_row.ip,
                 crate::intel::TOR,
                 None,
-                serde_json::json!({ "exit": true }),
+                serde_json::json!({ "exit": exit }),
             )
             .await?;
     }

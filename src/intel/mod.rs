@@ -26,14 +26,14 @@ pub async fn backfill_geo(rec: &Recorder, geo: &RwLock<Option<geo::GeoIp>>) {
         Ok(_) => return,
         Err(e) => return warn!(?e, "geo backfill: query failed"),
     };
-    let updates = {
+    let (updates, version) = {
         let guard = geo.read().unwrap();
         match guard.as_ref() {
-            Some(g) => g.relookup(&rows),
+            Some(g) => (g.relookup(&rows), g.build_date()),
             None => return,
         }
     };
-    match geo::backfill_iso_codes(rec, updates).await {
+    match geo::backfill_iso_codes(rec, updates, version.as_deref()).await {
         Ok(n) => info!(
             fixed = n,
             pending = rows.len(),
