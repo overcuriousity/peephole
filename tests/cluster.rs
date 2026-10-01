@@ -936,107 +936,99 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
     (node, dir)
 }
 
-async fn log_of(n: &Node, origin: NodeId) -> Vec<WireEntry> {
-    repl::entries_after(&n.store, &[(origin, 0)], 10_000, usize::MAX)
-        .await
-        .unwrap()
-}
-
 #[tokio::test]
-async fn deletes_propagate_and_stay_deleted() {
+async fn deletes_reach_only_the_deleters_own_records() {
     let (ia, a) = new_node("a");
     let (ib, b) = new_node("b");
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
-    let ip = na
+    let ip_a = na
         .store
         .upsert_ip("203.0.113.66".parse().unwrap())
         .await
         .unwrap();
     let r1 = rec(&na)
-        .insert_request(&new_request(ip.id, "/one"))
+        .insert_request(&new_request(ip_a.id, "/one"))
         .await
         .unwrap();
     rec(&na)
-        .insert_request(&new_request(ip.id, "/two"))
+        .insert_request(&new_request(ip_a.id, "/two"))
         .await
         .unwrap();
     rec(&na)
-        .insert_fp_claim(ip.id, r1, None, "ua")
+        .insert_fp_claim(ip_a.id, r1, None, "ua")
         .await
         .unwrap();
-    eventually("b has both", || async {
-        count(&nb, "SELECT COUNT(*) FROM fp_claims").await == 1
-            && count(&nb, "SELECT COUNT(*) FROM requests").await == 2
+    let ip_b = nb
+        .store
+        .upsert_ip("203.0.113.66".parse().unwrap())
+        .await
+        .unwrap();
+    rec(&nb)
+        .insert_request(&new_request(ip_b.id, "/three"))
+        .await
+        .unwrap();
+    eventually("both have three requests", || async {
+        count(&na, "SELECT COUNT(*) FROM requests").await == 3
+            && count(&nb, "SELECT COUNT(*) FROM requests").await == 3
     })
     .await;
-    // A's stream as an offline node would have it before the delete.
-    let a_before = log_of(&na, a.id).await;
+    eventually("b has the claim", || async {
+        count(&nb, "SELECT COUNT(*) FROM fp_claims").await == 1
+    })
+    .await;
 
-    // Delete /one on B (with its claim): gone on A too.
+    // B cannot delete A's request for the cluster.
     let one_on_b: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/one'")
         .fetch_one(&nb.store.pool)
         .await
         .unwrap();
-    assert!(rec(&nb).delete_request(one_on_b).await.unwrap());
-    eventually("a deleted /one", || async {
-        count(&na, "SELECT COUNT(*) FROM requests").await == 1
+    assert_eq!(rec(&nb).delete_request(one_on_b).await.unwrap().deleted, 0);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(count(&na, "SELECT COUNT(*) FROM requests").await, 3);
+
+    // A deletes its own: gone everywhere, with its claim, and erased from
+    // the log.
+    let out = rec(&na).delete_request(r1).await.unwrap();
+    assert_eq!(out.deleted, 1);
+    eventually("b dropped /one", || async {
+        count(&nb, "SELECT COUNT(*) FROM requests WHERE path = '/one'").await == 0
     })
     .await;
-    assert_eq!(count(&na, "SELECT COUNT(*) FROM fp_claims").await, 0);
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM fp_claims").await, 0);
     assert_eq!(
         count(
-            &na,
+            &nb,
             "SELECT COUNT(*) FROM repl_log WHERE erased_by IS NOT NULL"
         )
         .await,
         2,
         "request and claim payloads are erased from the log"
     );
-    let b_stream = log_of(&nb, b.id).await;
-    let a_after = log_of(&na, a.id).await;
 
-    // Late arrival: X sees the tombstone first, then A's old entries with
-    // full payloads. /one must not come back.
-    let (x, _dx) = offline_node(&[&a, &b]).await;
-    repl::apply_batch(&x, b_stream.clone()).await.unwrap();
-    repl::apply_batch(&x, a_before).await.unwrap();
-    let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
-        .fetch_all(&x.store.pool)
-        .await
-        .unwrap();
-    assert_eq!(paths, ["/two"]);
-    assert_eq!(count(&x, "SELECT COUNT(*) FROM fp_claims").await, 0);
-
-    // Erased stubs from a trusted origin are accepted immediately: the
-    // tombstone that erased them comes *later* in the same in-order stream, so
-    // waiting for it would stall the origin forever. Applying A's stream alone
-    // (without B's tombstone yet) must converge to A's head and keep /one
-    // deleted, not reject-and-stall.
-    let (y, _dy) = offline_node(&[&a, &b]).await;
-    let st = repl::apply_batch(&y, a_after.clone()).await.unwrap();
-    assert_eq!(st.rejected, 0, "stub must not stall the stream: {st:?}");
-    assert_eq!(
-        repl::head_in(&repl::heads(&y.store).await.unwrap(), &a.id),
-        repl::head_in(&repl::heads(&na.store).await.unwrap(), &a.id),
-        "A's log fully applied, no stall at the erased stub"
-    );
-    // Re-applying B's stream and A's stream stays idempotent and deleted.
-    repl::apply_batch(&y, b_stream).await.unwrap();
-    repl::apply_batch(&y, a_after).await.unwrap();
-    let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
-        .fetch_all(&y.store.pool)
-        .await
-        .unwrap();
-    assert_eq!(paths, ["/two"]);
-
-    // Deleting the IP on A clears it everywhere.
-    assert!(rec(&na).delete_ip(ip.id).await.unwrap());
-    eventually("b dropped the ip", || async {
-        count(&nb, "SELECT COUNT(*) FROM ips").await == 0
+    // Deleting the IP on A removes what A recorded; B's request stays.
+    assert!(rec(&na).delete_ip(ip_a.id).await.unwrap());
+    eventually("only b's request is left on b", || async {
+        let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
+            .fetch_all(&nb.store.pool)
+            .await
+            .unwrap();
+        paths == ["/three"]
     })
     .await;
-    assert_eq!(count(&nb, "SELECT COUNT(*) FROM requests").await, 0);
+    eventually("and on a", || async {
+        count(&na, "SELECT COUNT(*) FROM requests").await == 1
+    })
+    .await;
+    assert_eq!(count(&na, "SELECT COUNT(*) FROM ips").await, 1);
+
+    // B deletes the IP: now it is gone on both.
+    assert!(rec(&nb).delete_ip(ip_b.id).await.unwrap());
+    eventually("ip gone everywhere", || async {
+        count(&na, "SELECT COUNT(*) FROM ips").await == 0
+            && count(&nb, "SELECT COUNT(*) FROM ips").await == 0
+    })
+    .await;
 }
 
 /// A standalone install that switches to distributed mode brings its

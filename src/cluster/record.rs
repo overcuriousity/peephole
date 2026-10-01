@@ -148,30 +148,13 @@ pub struct IntelManifestRec {
     pub fetched_at: String,
 }
 
-/// What a tombstone deletes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "t", rename_all = "snake_case")]
-pub enum TombTarget {
-    /// These requests with their claims and fingerprints.
-    Requests {
-        uids: Vec<String>,
-    },
-    /// Everything about an IP recorded up to the tombstone's HLC.
-    Ip {
-        ip: String,
-    },
-    Scan {
-        uid: String,
-    },
-    Claim {
-        uid: String,
-    },
-}
-
+/// A delete by the node that created the listed records. Wherever it is
+/// applied, it only affects entries of the tombstone's own origin; uids of
+/// other nodes' records in the list are ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TombstoneRec {
     pub uid: String,
-    pub target: TombTarget,
+    pub uids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

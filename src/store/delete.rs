@@ -5,7 +5,7 @@ use anyhow::Result;
 
 impl Store {
     pub async fn delete_request(&self, id: i64) -> Result<bool> {
-        self.local().delete_request(id).await
+        Ok(self.local().delete_request(id).await?.deleted > 0)
     }
 
     pub async fn delete_ip(&self, ip_id: i64) -> Result<bool> {
@@ -13,21 +13,26 @@ impl Store {
     }
 
     pub async fn delete_scan(&self, scan_id: i64) -> Result<bool> {
-        self.local().delete_scan(scan_id).await
+        Ok(self.local().delete_scan(scan_id).await?.deleted > 0)
     }
 
     pub async fn delete_claim(&self, id: i64) -> Result<bool> {
-        self.local().delete_claim(id).await
+        Ok(self.local().delete_claim(id).await?.deleted > 0)
     }
 
-    /// Delete many requests (and their claims/fingerprints) atomically.
+    /// Delete many requests (and their claims/fingerprints).
     pub async fn delete_requests(&self, ids: &[i64]) -> Result<u64> {
-        self.local().delete_requests(ids).await
+        Ok(self.local().delete_requests(ids).await?.deleted)
     }
 
-    /// Delete many IPs with everything hanging off them, atomically.
+    /// Delete many IPs with everything hanging off them; returns how many
+    /// of them existed.
     pub async fn delete_ips(&self, ids: &[i64]) -> Result<u64> {
-        self.local().delete_ips(ids).await
+        let mut n = 0;
+        for id in ids {
+            n += self.local().delete_ip(*id).await? as u64;
+        }
+        Ok(n)
     }
 }
 

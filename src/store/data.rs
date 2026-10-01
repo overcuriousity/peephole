@@ -3,13 +3,13 @@
 //! directly on a standalone node, through the replication log in a cluster
 //! — so both modes share one set of semantics.
 //!
-//! Deletes are tombstones: they remove the rows, remember the deleted uids
-//! (and per-IP cut-offs), and records that arrive later for something
-//! already deleted are dropped instead of resurrecting it.
+//! Deletes are tombstones: they list the uids to remove, affect only records
+//! of the tombstone's own origin, and remember the deleted uids so a record
+//! that arrives later is dropped instead of resurrecting.
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{
     FingerprintRec, FpClaimRec, IntelManifestRec, IpEnrichRec, JobAdoptRec, JobStatusRec, PortRec,
-    Record, RequestRec, ScanJobRec, ScanResultRec, TombTarget, TombstoneRec,
+    ROW_BACKED, Record, RequestRec, ScanJobRec, ScanResultRec, TombstoneRec,
 };
 use anyhow::Result;
 use sqlx::SqliteConnection;
@@ -79,26 +79,10 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
 }
 
 /// The tombstone that already deleted this record, if any.
-async fn erased_by(
-    conn: &mut SqliteConnection,
-    uids: &[Option<&str>],
-    ip: &str,
-    hlc: u64,
-) -> Result<Option<String>> {
-    for uid in uids.iter().flatten() {
-        let t: Option<String> =
-            sqlx::query_scalar("SELECT tombstone_uid FROM tombstoned WHERE uid = ?")
-                .bind(uid)
-                .fetch_optional(&mut *conn)
-                .await?;
-        if t.is_some() {
-            return Ok(t);
-        }
-    }
+async fn erased_by(conn: &mut SqliteConnection, uid: &str) -> Result<Option<String>> {
     Ok(
-        sqlx::query_scalar("SELECT tombstone_uid FROM ip_tombstones WHERE ip = ? AND hlc >= ?")
-            .bind(ip)
-            .bind(hlc as i64)
+        sqlx::query_scalar("SELECT tombstone_uid FROM tombstoned WHERE uid = ?")
+            .bind(uid)
             .fetch_optional(&mut *conn)
             .await?,
     )
@@ -176,7 +160,7 @@ async fn ensure_ip(conn: &mut SqliteConnection, ip: &str, seen: Option<&str>) ->
 }
 
 async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> Result<Effect> {
-    if let Some(t) = erased_by(conn, &[Some(&r.uid)], &r.ip, ctx.hlc).await? {
+    if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
     }
     let ip_id = ensure_ip(conn, &r.ip, Some(&r.ts)).await?;
@@ -206,9 +190,6 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
 }
 
 async fn ip_enrich(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpEnrichRec) -> Result<Effect> {
-    if erased_by(conn, &[], &r.ip, ctx.hlc).await?.is_some() {
-        return Ok(Effect::Ignored);
-    }
     let n = sqlx::query(
         "UPDATE ips SET country = ?, asn = ?, asn_org = ?, is_tor_exit = ?, geo_hlc = ?
          WHERE ip = ? AND geo_hlc < ?",
@@ -257,9 +238,10 @@ async fn request_id(conn: &mut SqliteConnection, uid: &str) -> Result<Option<i64
 }
 
 async fn fp_claim(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &FpClaimRec) -> Result<Effect> {
-    if let Some(t) = erased_by(conn, &[Some(&r.uid), Some(&r.request_uid)], &r.ip, ctx.hlc).await? {
+    if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
     }
+    // A claim on a request that is gone is not applied; it stays in the log.
     let Some(rid) = request_id(conn, &r.request_uid).await? else {
         return Ok(Effect::Ignored);
     };
@@ -292,14 +274,7 @@ async fn fingerprint(
     ctx: Ctx<'_>,
     r: &FingerprintRec,
 ) -> Result<Effect> {
-    if let Some(t) = erased_by(
-        conn,
-        &[Some(&r.uid), r.request_uid.as_deref()],
-        &r.ip,
-        ctx.hlc,
-    )
-    .await?
-    {
+    if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
     }
     let rid = match &r.request_uid {
@@ -330,7 +305,7 @@ async fn fingerprint(
 }
 
 async fn scan_job(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &ScanJobRec) -> Result<Effect> {
-    if let Some(t) = erased_by(conn, &[Some(&r.uid)], &r.ip, ctx.hlc).await? {
+    if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
     }
     let ip_id = ensure_ip(conn, &r.ip, None).await?;
@@ -427,7 +402,7 @@ async fn scan_result(
     ctx: Ctx<'_>,
     r: &ScanResultRec,
 ) -> Result<Effect> {
-    if let Some(t) = erased_by(conn, &[Some(&r.uid)], &r.ip, ctx.hlc).await? {
+    if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
     }
     let job_id: Option<i64> = sqlx::query_scalar("SELECT id FROM scan_jobs WHERE uid = ?")
@@ -565,144 +540,100 @@ async fn uids_where(
     Ok(out)
 }
 
+/// Delete the listed records, as far as the tombstone's origin created
+/// them. Records of other nodes that hang off a deleted one (a claim on a
+/// deleted request, a scan of a deleted job) are not this origin's to erase:
+/// they leave the tables, because their parent is gone, and stay in the log.
 async fn tombstone(conn: &mut SqliteConnection, ctx: Ctx<'_>, t: &TombstoneRec) -> Result<Effect> {
-    match &t.target {
-        TombTarget::Requests { uids } => {
-            let claims = uids_where(
-                conn,
-                "SELECT uid FROM fp_claims WHERE request_uid IN ({})",
-                uids,
-            )
-            .await?;
-            let fps = uids_where(
-                conn,
-                "SELECT uid FROM fingerprints WHERE request_uid IN ({})",
-                uids,
-            )
-            .await?;
-            let all: Vec<String> = uids.iter().chain(&claims).chain(&fps).cloned().collect();
-            bury(conn, &all, &t.uid).await?;
-            for_uids(
-                conn,
-                "DELETE FROM fp_claims WHERE request_uid IN ({})",
-                uids,
-            )
-            .await?;
-            for_uids(
-                conn,
-                "DELETE FROM fingerprints WHERE request_uid IN ({})",
-                uids,
-            )
-            .await?;
-            for_uids(conn, "DELETE FROM requests WHERE uid IN ({})", uids).await?;
+    // In a cluster the log says who created what; a standalone node created
+    // everything it holds.
+    let own: Vec<String> = match ctx.origin {
+        Some(o) => {
+            let mut v = vec![];
+            for chunk in t.uids.chunks(400) {
+                let sql = format!(
+                    "SELECT uid FROM repl_log WHERE origin = ? AND kind != 'tombstone' AND uid IN ({})",
+                    placeholders(chunk.len())
+                );
+                let mut q =
+                    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(&o.0[..]);
+                for uid in chunk {
+                    q = q.bind(uid);
+                }
+                v.extend(q.fetch_all(&mut *conn).await?);
+            }
+            v
         }
-        TombTarget::Scan { uid } => {
-            bury(conn, std::slice::from_ref(uid), &t.uid).await?;
-            sqlx::query("DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE uid = ?)")
-                .bind(uid)
-                .execute(&mut *conn)
-                .await?;
-            sqlx::query("DELETE FROM scans WHERE uid = ?")
-                .bind(uid)
-                .execute(&mut *conn)
-                .await?;
+        None => t.uids.clone(),
+    };
+    if own.is_empty() {
+        return Ok(Effect::Applied);
+    }
+    let mine: std::collections::HashSet<&str> = own.iter().map(String::as_str).collect();
+    let mut ips = std::collections::BTreeSet::new();
+    for table in [
+        "requests",
+        "fp_claims",
+        "fingerprints",
+        "scan_jobs",
+        "scans",
+    ] {
+        let sql = format!("SELECT DISTINCT ip_id FROM {table} WHERE uid IN ({{}})");
+        for chunk in own.chunks(400) {
+            let sql = sql.replace("{}", &placeholders(chunk.len()));
+            let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
+            for uid in chunk {
+                q = q.bind(uid);
+            }
+            ips.extend(q.fetch_all(&mut *conn).await?);
         }
-        TombTarget::Claim { uid } => {
-            bury(conn, std::slice::from_ref(uid), &t.uid).await?;
-            sqlx::query("DELETE FROM fp_claims WHERE uid = ?")
-                .bind(uid)
-                .execute(&mut *conn)
-                .await?;
-        }
-        TombTarget::Ip { ip } => tombstone_ip(conn, ctx, ip, &t.uid).await?,
+    }
+    // Dependents that are not part of this delete.
+    let claims = uids_where(
+        conn,
+        "SELECT uid FROM fp_claims WHERE request_uid IN ({})",
+        &own,
+    )
+    .await?;
+    for uid in claims.iter().filter(|u| !mine.contains(u.as_str())) {
+        unmaterialize(conn, "fp_claim", uid).await?;
+    }
+    let scans = uids_where(conn, "SELECT uid FROM scans WHERE job_uid IN ({})", &own).await?;
+    for uid in scans.iter().filter(|u| !mine.contains(u.as_str())) {
+        unmaterialize(conn, "scan_result", uid).await?;
+    }
+    for_uids(
+        conn,
+        "UPDATE fingerprints SET request_id = NULL WHERE request_uid IN ({})",
+        &own,
+    )
+    .await?;
+    bury(conn, &own, &t.uid).await?;
+    // Children before parents.
+    for_uids(
+        conn,
+        "DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE uid IN ({}))",
+        &own,
+    )
+    .await?;
+    for table in [
+        "scans",
+        "fp_claims",
+        "fingerprints",
+        "scan_jobs",
+        "requests",
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE uid IN ({{}})");
+        for_uids(conn, &sql, &own).await?;
+    }
+    for ip_id in ips {
+        drop_orphan_ip(conn, ip_id).await?;
     }
     Ok(Effect::Applied)
 }
 
-/// Uids of `table` rows for an IP recorded at or before `cut`.
-async fn uids_for_ip(
-    conn: &mut SqliteConnection,
-    table: &'static str,
-    ip_id: i64,
-    cut: i64,
-) -> Result<Vec<String>> {
-    let sql = format!("SELECT uid FROM {table} WHERE ip_id = ? AND COALESCE(hlc, 0) <= ?");
-    Ok(sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
-        .bind(ip_id)
-        .bind(cut)
-        .fetch_all(&mut *conn)
-        .await?)
-}
-
-/// Delete everything about `ip` recorded up to the tombstone's HLC. Rows
-/// that depend on deleted rows go too, whatever their HLC.
-async fn tombstone_ip(
-    conn: &mut SqliteConnection,
-    ctx: Ctx<'_>,
-    ip: &str,
-    tomb: &str,
-) -> Result<()> {
-    let cut = ctx.hlc as i64;
-    sqlx::query(
-        "INSERT INTO ip_tombstones (ip, hlc, tombstone_uid) VALUES (?,?,?)
-         ON CONFLICT(ip) DO UPDATE SET hlc = excluded.hlc, tombstone_uid = excluded.tombstone_uid
-         WHERE excluded.hlc > ip_tombstones.hlc",
-    )
-    .bind(ip)
-    .bind(cut)
-    .bind(tomb)
-    .execute(&mut *conn)
-    .await?;
-    sqlx::query("DELETE FROM ip_enrich_pending WHERE ip = ? AND hlc <= ?")
-        .bind(ip)
-        .bind(cut)
-        .execute(&mut *conn)
-        .await?;
-    let ip_id: Option<i64> = sqlx::query_scalar("SELECT id FROM ips WHERE ip = ?")
-        .bind(ip)
-        .fetch_optional(&mut *conn)
-        .await?;
-    let Some(ip_id) = ip_id else { return Ok(()) };
-    let reqs = uids_for_ip(conn, "requests", ip_id, cut).await?;
-    let jobs = uids_for_ip(conn, "scan_jobs", ip_id, cut).await?;
-    let mut claims = uids_for_ip(conn, "fp_claims", ip_id, cut).await?;
-    let mut fps = uids_for_ip(conn, "fingerprints", ip_id, cut).await?;
-    let mut scans = uids_for_ip(conn, "scans", ip_id, cut).await?;
-    claims.extend(
-        uids_where(
-            conn,
-            "SELECT uid FROM fp_claims WHERE request_uid IN ({})",
-            &reqs,
-        )
-        .await?,
-    );
-    fps.extend(
-        uids_where(
-            conn,
-            "SELECT uid FROM fingerprints WHERE request_uid IN ({})",
-            &reqs,
-        )
-        .await?,
-    );
-    scans.extend(uids_where(conn, "SELECT uid FROM scans WHERE job_uid IN ({})", &jobs).await?);
-    let all: Vec<String> = [&reqs, &jobs, &claims, &fps, &scans]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .collect();
-    bury(conn, &all, tomb).await?;
-    for_uids(
-        conn,
-        "DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE uid IN ({}))",
-        &scans,
-    )
-    .await?;
-    for_uids(conn, "DELETE FROM scans WHERE uid IN ({})", &scans).await?;
-    for_uids(conn, "DELETE FROM scan_jobs WHERE uid IN ({})", &jobs).await?;
-    for_uids(conn, "DELETE FROM fp_claims WHERE uid IN ({})", &claims).await?;
-    for_uids(conn, "DELETE FROM fingerprints WHERE uid IN ({})", &fps).await?;
-    for_uids(conn, "DELETE FROM requests WHERE uid IN ({})", &reqs).await?;
-    // The IP itself goes once nothing refers to it any more.
+/// Remove an IP row once nothing refers to it any more.
+pub(crate) async fn drop_orphan_ip(conn: &mut SqliteConnection, ip_id: i64) -> Result<()> {
     sqlx::query(
         "DELETE FROM ips WHERE id = ?1
            AND NOT EXISTS (SELECT 1 FROM requests WHERE ip_id = ?1)
@@ -715,6 +646,97 @@ async fn tombstone_ip(
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+/// Put a row-backed record's payload back into its log entry, so the entry
+/// can be relayed without the row.
+async fn keep_payload(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Result<()> {
+    if !ROW_BACKED.contains(&kind) {
+        return Ok(());
+    }
+    if let Some(rec) = rebuild(conn, kind, uid).await? {
+        sqlx::query(
+            "UPDATE repl_log SET payload = ?
+             WHERE uid = ? AND kind = ? AND payload IS NULL AND erased_by IS NULL",
+        )
+        .bind(crate::cluster::rpc::cbor::encode(&rec)?)
+        .bind(uid)
+        .bind(kind)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Take a record out of the tables but keep it in the log with its payload,
+/// so this node still relays it. Children that cannot exist without it leave
+/// the tables the same way. Returns the row's IP id if there was a row.
+pub(crate) async fn unmaterialize(
+    conn: &mut SqliteConnection,
+    kind: &str,
+    uid: &str,
+) -> Result<Option<i64>> {
+    let table = match kind {
+        "request" => "requests",
+        "fp_claim" => "fp_claims",
+        "fingerprint" => "fingerprints",
+        "scan_job" => "scan_jobs",
+        "scan_result" => "scans",
+        _ => return Ok(None),
+    };
+    let sql = format!("SELECT ip_id FROM {table} WHERE uid = ?");
+    let ip_id: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(uid)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if ip_id.is_none() {
+        return Ok(None);
+    }
+    keep_payload(conn, kind, uid).await?;
+    match kind {
+        "request" => {
+            sqlx::query("DELETE FROM fp_claims WHERE request_uid = ?")
+                .bind(uid)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("UPDATE fingerprints SET request_id = NULL WHERE request_uid = ?")
+                .bind(uid)
+                .execute(&mut *conn)
+                .await?;
+        }
+        "scan_job" => {
+            let scans: Vec<String> = sqlx::query_scalar("SELECT uid FROM scans WHERE job_uid = ?")
+                .bind(uid)
+                .fetch_all(&mut *conn)
+                .await?;
+            for s in scans {
+                keep_payload(conn, "scan_result", &s).await?;
+                sqlx::query(
+                    "DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE uid = ?)",
+                )
+                .bind(&s)
+                .execute(&mut *conn)
+                .await?;
+                sqlx::query("DELETE FROM scans WHERE uid = ?")
+                    .bind(&s)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+        }
+        "scan_result" => {
+            sqlx::query("DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE uid = ?)")
+                .bind(uid)
+                .execute(&mut *conn)
+                .await?;
+        }
+        _ => {}
+    }
+    let sql = format!("DELETE FROM {table} WHERE uid = ?");
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(uid)
+        .execute(&mut *conn)
+        .await?;
+    Ok(ip_id)
 }
 
 /// Rebuild a row-backed record from its row, byte-for-byte as it was
@@ -860,6 +882,188 @@ mod tests {
     use super::*;
     use crate::cluster::record::{Record, ScanResultRec};
     use crate::store::Store;
+
+    use crate::cluster::identity::Identity;
+    use crate::cluster::record::{RequestRec, ScanJobRec, TombstoneRec};
+
+    fn request(uid: &str, path: &str) -> Record {
+        Record::Request(RequestRec {
+            uid: uid.into(),
+            ts: now_ts(),
+            ip: "203.0.113.7".into(),
+            method: "GET".into(),
+            path: path.into(),
+            query: None,
+            headers_json: "[]".into(),
+            body: None,
+            labels_json: "[]".into(),
+            severity: 1,
+            scan_level: 1,
+            is_fp_claim: false,
+            page_token: None,
+        })
+    }
+
+    /// A log row as the replication layer would hold it for an applied,
+    /// row-backed record (payload dropped).
+    async fn log_row(
+        conn: &mut SqliteConnection,
+        origin: &NodeId,
+        seq: i64,
+        kind: &str,
+        uid: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO repl_log (origin, seq, hlc, kind, uid, payload, sig, applied, received_at)
+             VALUES (?, ?, ?, ?, ?, NULL, x'00', 1, datetime('now'))",
+        )
+        .bind(&origin.0[..])
+        .bind(seq)
+        .bind(seq)
+        .bind(kind)
+        .bind(uid)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    }
+
+    async fn count(conn: &mut SqliteConnection, sql: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_string()))
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_only_deletes_its_own_origins_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let (a, b) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        );
+        for (origin, uid, seq) in [(&a, "req-a", 1), (&b, "req-b", 1)] {
+            let ctx = Ctx {
+                origin: Some(origin),
+                hlc: 10,
+            };
+            assert_eq!(
+                apply(&mut conn, ctx, &request(uid, "/x")).await.unwrap(),
+                Effect::Applied
+            );
+            log_row(&mut conn, origin, seq, "request", uid).await;
+        }
+        // B lists both; only its own goes.
+        let t = Record::Tombstone(TombstoneRec {
+            uid: "tomb-1".into(),
+            uids: vec!["req-a".into(), "req-b".into()],
+        });
+        let ctx = Ctx {
+            origin: Some(&b),
+            hlc: 20,
+        };
+        apply(&mut conn, ctx, &t).await.unwrap();
+        let left: Vec<String> = sqlx::query_scalar("SELECT uid FROM requests")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(left, ["req-a"]);
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) FROM tombstoned WHERE uid = 'req-a'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) FROM repl_log WHERE uid = 'req-a' AND erased_by IS NOT NULL"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) FROM repl_log WHERE uid = 'req-b' AND erased_by = 'tomb-1'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(&mut conn, "SELECT COUNT(*) FROM ips").await,
+            1,
+            "a's request keeps the ip"
+        );
+    }
+
+    /// A tombstone that names a parent but not its children must not trip a
+    /// foreign key and stall the origin's stream.
+    #[tokio::test]
+    async fn children_left_out_of_a_tombstone_leave_the_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let ctx = |hlc| Ctx { origin: None, hlc };
+        apply(&mut conn, ctx(1), &request("req", "/x"))
+            .await
+            .unwrap();
+        apply(
+            &mut conn,
+            ctx(2),
+            &Record::FpClaim(crate::cluster::record::FpClaimRec {
+                uid: "claim".into(),
+                request_uid: "req".into(),
+                ip: "203.0.113.7".into(),
+                ts: now_ts(),
+                contact_email: None,
+                user_agent: None,
+            }),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx(3),
+            &Record::ScanJob(ScanJobRec {
+                uid: "job".into(),
+                ip: "203.0.113.7".into(),
+                level: 2,
+                queued_at: now_ts(),
+            }),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx(4),
+            &Record::ScanResult(ScanResultRec {
+                uid: "scan".into(),
+                job_uid: "job".into(),
+                ip: "203.0.113.7".into(),
+                level: 2,
+                started_at: now_ts(),
+                finished_at: Some(now_ts()),
+                os_guess: None,
+                raw_xml: None,
+                ports: vec![],
+            }),
+        )
+        .await
+        .unwrap();
+        let t = Record::Tombstone(TombstoneRec {
+            uid: "tomb".into(),
+            uids: vec!["req".into(), "job".into()],
+        });
+        assert_eq!(apply(&mut conn, ctx(5), &t).await.unwrap(), Effect::Applied);
+        for table in ["requests", "fp_claims", "scan_jobs", "scans", "ips"] {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(count(&mut conn, &sql).await, 0, "{table}");
+        }
+    }
 
     #[tokio::test]
     async fn scan_result_defers_until_its_job_exists() {

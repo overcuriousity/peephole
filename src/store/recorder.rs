@@ -9,7 +9,7 @@ use crate::cluster::Node;
 use crate::cluster::hlc::Hlc;
 use crate::cluster::record::{
     FingerprintRec, FpClaimRec, IpEnrichRec, JobStatusRec, PortRec, Record, RequestRec, ScanJobRec,
-    ScanResultRec, TombTarget, TombstoneRec,
+    ScanResultRec, TombstoneRec,
 };
 use crate::scan::nmap_xml::ScanResult;
 use anyhow::{Context, Result};
@@ -548,82 +548,151 @@ impl Recorder {
         .await
     }
 
-    fn tomb(target: TombTarget) -> Record {
-        Record::Tombstone(TombstoneRec {
-            uid: new_uid(),
-            target,
-        })
-    }
-
-    pub async fn delete_request(&self, id: i64) -> Result<bool> {
-        let Some(uid) = self.uid_by_id("requests", id).await? else {
-            return Ok(false);
+    /// Uids of `table` rows whose `col` is one of `keys`, split into what
+    /// this node originated and what other nodes did. Only the former can be
+    /// deleted cluster-wide.
+    async fn split(
+        &self,
+        table: &'static str,
+        col: &'static str,
+        keys: Keys<'_>,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let me = self.node_id().map(|id| id.0.to_vec());
+        let n = match keys {
+            Keys::Ids(k) => k.len(),
+            Keys::Uids(k) => k.len(),
         };
-        self.write(vec![Self::tomb(TombTarget::Requests { uids: vec![uid] })])
-            .await?;
-        Ok(true)
-    }
-
-    /// Delete many requests (and their claims/fingerprints) atomically.
-    pub async fn delete_requests(&self, ids: &[i64]) -> Result<u64> {
-        let mut uids = vec![];
-        for id in ids {
-            if let Some(u) = self.uid_by_id("requests", *id).await? {
-                uids.push(u);
+        let (mut own, mut other) = (vec![], vec![]);
+        for start in (0..n).step_by(400) {
+            let end = (start + 400).min(n);
+            let sql = format!(
+                "SELECT uid, origin FROM {table} WHERE uid IS NOT NULL AND {col} IN ({})",
+                vec!["?"; end - start].join(",")
+            );
+            let mut q = sqlx::query_as::<_, (String, Option<Vec<u8>>)>(sqlx::AssertSqlSafe(sql));
+            match keys {
+                Keys::Ids(k) => {
+                    for v in &k[start..end] {
+                        q = q.bind(*v);
+                    }
+                }
+                Keys::Uids(k) => {
+                    for v in &k[start..end] {
+                        q = q.bind(v.as_str());
+                    }
+                }
+            }
+            for (uid, origin) in q.fetch_all(&self.store().pool).await? {
+                if origin == me {
+                    own.push(uid);
+                } else {
+                    other.push(uid);
+                }
             }
         }
-        let n = uids.len() as u64;
+        Ok((own, other))
+    }
+
+    /// Delete records this node originated, everywhere.
+    async fn bury(&self, uids: Vec<String>) -> Result<()> {
         let records: Vec<_> = uids
             .chunks(TOMB_CHUNK)
-            .map(|c| Self::tomb(TombTarget::Requests { uids: c.to_vec() }))
+            .map(|c| {
+                Record::Tombstone(TombstoneRec {
+                    uid: new_uid(),
+                    uids: c.to_vec(),
+                })
+            })
             .collect();
         if !records.is_empty() {
             self.write(records).await?;
         }
-        Ok(n)
+        Ok(())
     }
 
+    /// Records other nodes originated cannot be deleted from here.
+    async fn hide(&self, _uids: Vec<String>) -> Result<u64> {
+        Ok(0)
+    }
+
+    pub async fn delete_request(&self, id: i64) -> Result<Deleted> {
+        self.delete_requests(&[id]).await
+    }
+
+    /// Delete requests. Ours go cluster-wide, together with our claims and
+    /// fingerprints on them.
+    pub async fn delete_requests(&self, ids: &[i64]) -> Result<Deleted> {
+        let (reqs, foreign) = self.split("requests", "id", Keys::Ids(ids)).await?;
+        let (claims, _) = self
+            .split("fp_claims", "request_uid", Keys::Uids(&reqs))
+            .await?;
+        let (fps, _) = self
+            .split("fingerprints", "request_uid", Keys::Uids(&reqs))
+            .await?;
+        let deleted = reqs.len() as u64;
+        self.bury([reqs, claims, fps].concat()).await?;
+        Ok(Deleted {
+            deleted,
+            hidden: self.hide(foreign).await?,
+        })
+    }
+
+    /// Whether the IP existed. Everything this node recorded about it is
+    /// deleted cluster-wide.
     pub async fn delete_ip(&self, ip_id: i64) -> Result<bool> {
-        Ok(self.delete_ips(&[ip_id]).await? == 1)
+        let existed = self.ip_of(ip_id).await.is_ok();
+        self.delete_ips(&[ip_id]).await?;
+        Ok(existed)
     }
 
-    /// Delete IPs with everything hanging off them, atomically.
-    pub async fn delete_ips(&self, ids: &[i64]) -> Result<u64> {
-        let mut records = vec![];
+    /// Delete everything about these IPs, as far as this node recorded it.
+    pub async fn delete_ips(&self, ids: &[i64]) -> Result<Deleted> {
+        let (mut own, mut foreign) = (vec![], vec![]);
+        for table in [
+            "requests",
+            "fp_claims",
+            "fingerprints",
+            "scan_jobs",
+            "scans",
+        ] {
+            let (o, f) = self.split(table, "ip_id", Keys::Ids(ids)).await?;
+            own.extend(o);
+            foreign.extend(f);
+        }
+        let deleted = own.len() as u64;
+        self.bury(own).await?;
+        let hidden = self.hide(foreign).await?;
+        // An IP without any record left (or that never had one) goes too.
+        let mut conn = self.store().pool.acquire().await?;
         for id in ids {
-            if let Ok(ip) = self.ip_of(*id).await {
-                records.push(Self::tomb(TombTarget::Ip { ip }));
-            }
+            data::drop_orphan_ip(&mut conn, *id).await?;
         }
-        let n = records.len() as u64;
-        if n > 0 {
-            self.write(records).await?;
-        }
-        Ok(n)
+        Ok(Deleted { deleted, hidden })
     }
 
-    pub async fn delete_scan(&self, id: i64) -> Result<bool> {
-        let Some(uid) = self.uid_by_id("scans", id).await? else {
-            return Ok(false);
-        };
-        self.write(vec![Self::tomb(TombTarget::Scan { uid })])
-            .await?;
-        Ok(true)
+    pub async fn delete_scan(&self, id: i64) -> Result<Deleted> {
+        let (own, foreign) = self.split("scans", "id", Keys::Ids(&[id])).await?;
+        let deleted = own.len() as u64;
+        self.bury(own).await?;
+        Ok(Deleted {
+            deleted,
+            hidden: self.hide(foreign).await?,
+        })
     }
 
-    pub async fn delete_claim(&self, id: i64) -> Result<bool> {
-        let Some(uid) = self.uid_by_id("fp_claims", id).await? else {
-            return Ok(false);
-        };
-        self.write(vec![Self::tomb(TombTarget::Claim { uid })])
-            .await?;
-        Ok(true)
+    pub async fn delete_claim(&self, id: i64) -> Result<Deleted> {
+        let (own, foreign) = self.split("fp_claims", "id", Keys::Ids(&[id])).await?;
+        let deleted = own.len() as u64;
+        self.bury(own).await?;
+        Ok(Deleted {
+            deleted,
+            hidden: self.hide(foreign).await?,
+        })
     }
 
-    /// Retention: tombstone requests (with their claims/fingerprints) and scan
-    /// results older than `days`. Bounded per call so a huge backlog is drained
-    /// over several daily runs rather than one enormous transaction. Returns
-    /// (requests, scans) removed. Deletes propagate in a cluster via tombstones.
+    /// Retention (standalone nodes): delete requests, with their claims and
+    /// fingerprints, and scan results older than `days`. Bounded per call so
+    /// a huge backlog drains over several runs. Returns (requests, scans).
     pub async fn prune_older_than(&self, days: u32) -> Result<(u64, u64)> {
         if days == 0 {
             return Ok((0, 0));
@@ -638,8 +707,7 @@ impl Recorder {
         .bind(BATCH)
         .fetch_all(pool)
         .await?;
-        let reqs = self.delete_requests(&req_ids).await?;
-
+        let reqs = self.delete_requests(&req_ids).await?.deleted;
         let scan_uids: Vec<String> = sqlx::query_scalar(
             "SELECT uid FROM scans
              WHERE COALESCE(finished_at, started_at) < datetime('now', ?)
@@ -650,13 +718,23 @@ impl Recorder {
         .fetch_all(pool)
         .await?;
         let scans = scan_uids.len() as u64;
-        let records: Vec<_> = scan_uids
-            .into_iter()
-            .map(|uid| Self::tomb(TombTarget::Scan { uid }))
-            .collect();
-        for chunk in records.chunks(TOMB_CHUNK) {
-            self.write(chunk.to_vec()).await?;
-        }
+        self.bury(scan_uids).await?;
         Ok((reqs, scans))
     }
+}
+
+/// Row keys for [`Recorder::split`].
+#[derive(Clone, Copy)]
+enum Keys<'a> {
+    Ids(&'a [i64]),
+    Uids(&'a [String]),
+}
+
+/// What a delete did, counted in the records that were asked for.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Deleted {
+    /// Records this node originated: deleted on every node.
+    pub deleted: u64,
+    /// Records other nodes originated: hidden on this node only.
+    pub hidden: u64,
 }

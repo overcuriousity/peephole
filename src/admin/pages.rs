@@ -368,7 +368,8 @@ async fn request_delete(
     State(st): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> AppResult<Redirect> {
-    if !st.recorder.delete_request(id).await? {
+    let out = st.recorder.delete_request(id).await?;
+    if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
     }
     Ok(Redirect::to("/requests"))
@@ -462,7 +463,8 @@ async fn scan_delete(
     State(st): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> AppResult<Redirect> {
-    if !st.recorder.delete_scan(id).await? {
+    let out = st.recorder.delete_scan(id).await?;
+    if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
     }
     Ok(Redirect::to("/admin/scans"))
@@ -504,7 +506,8 @@ async fn claim_delete(
     State(st): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> AppResult<Redirect> {
-    if !st.recorder.delete_claim(id).await? {
+    let out = st.recorder.delete_claim(id).await?;
+    if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
     }
     Ok(Redirect::to("/admin/inbox"))
@@ -660,15 +663,21 @@ async fn bulk_delete_requests(
             if ids.is_empty() {
                 break;
             }
-            total += st.recorder.delete_requests(&ids).await?;
-            if (ids.len() as i64) < crate::store::browse::MATCH_LIMIT {
+            let out = st.recorder.delete_requests(&ids).await?;
+            total += out.deleted + out.hidden;
+            // Stop when a round changed nothing: what still matches cannot
+            // be removed from here.
+            if out.deleted + out.hidden == 0
+                || (ids.len() as i64) < crate::store::browse::MATCH_LIMIT
+            {
                 break;
             }
         }
         total
     } else {
         let ids: Vec<i64> = form.ids.iter().filter_map(|v| v.parse().ok()).collect();
-        st.recorder.delete_requests(&ids).await?
+        let out = st.recorder.delete_requests(&ids).await?;
+        out.deleted + out.hidden
     };
     tracing::info!(deleted = n, all = form.all, "bulk request delete");
     Ok(Redirect::to(&format!(
@@ -690,8 +699,11 @@ async fn bulk_delete_ips(
             if ids.is_empty() {
                 break;
             }
-            total += st.recorder.delete_ips(&ids).await?;
-            if (ids.len() as i64) < crate::store::browse::MATCH_LIMIT {
+            let out = st.recorder.delete_ips(&ids).await?;
+            total += out.deleted + out.hidden;
+            if out.deleted + out.hidden == 0
+                || (ids.len() as i64) < crate::store::browse::MATCH_LIMIT
+            {
                 break;
             }
         }
@@ -703,7 +715,8 @@ async fn bulk_delete_ips(
                 ids.push(ip.id);
             }
         }
-        st.recorder.delete_ips(&ids).await?
+        let out = st.recorder.delete_ips(&ids).await?;
+        out.deleted + out.hidden
     };
     tracing::info!(deleted = n, all = form.all, "bulk ip delete");
     Ok(Redirect::to(&format!(
