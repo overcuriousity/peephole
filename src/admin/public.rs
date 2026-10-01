@@ -120,7 +120,11 @@ async fn healthz(State(state): State<Arc<AdminState>>) -> Response {
         .await
     {
         Ok(_) => "ok".into_response(),
-        Err(e) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+        Err(e) => {
+            // Log the detail; return a generic body (the endpoint is public).
+            tracing::warn!(?e, "healthz database check failed");
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response()
+        }
     }
 }
 

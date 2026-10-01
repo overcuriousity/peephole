@@ -81,6 +81,30 @@ async fn security_headers(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    // CSRF defence in depth: a mutating request must be same-origin. The
+    // SameSite=Strict session cookie already covers this, but a browser also
+    // sends Sec-Fetch-Site (and/or Origin); reject a cross-site write so XSS
+    // on a sibling vhost behind the same proxy cannot drive admin actions.
+    // Non-browser clients (curl, the test suite) send neither and are allowed;
+    // the cookie still gates them.
+    if method_mutates(&method) && !same_origin(req.headers()) {
+        use axum::response::IntoResponse;
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "cross-site request refused",
+        )
+            .into_response();
+    }
+    // Admin/auth pages must not sit in a shared or back/forward cache after
+    // logout (invite tokens, request bodies, headers).
+    let sensitive = path.starts_with("/admin")
+        || path.starts_with("/login")
+        || path.starts_with("/enroll")
+        || path == "/logout"
+        || path == "/requests";
+
     let mut res = next.run(req).await;
     let h = res.headers_mut();
     h.insert(
@@ -98,7 +122,53 @@ async fn security_headers(
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
         axum::http::HeaderValue::from_static("nosniff"),
     );
+    // The admin listener is reached over TLS via nginx; pin that with HSTS.
+    h.insert(
+        axum::http::header::STRICT_TRANSPORT_SECURITY,
+        axum::http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+    if sensitive {
+        h.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
     res
+}
+
+fn method_mutates(m: &axum::http::Method) -> bool {
+    matches!(
+        *m,
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+            | axum::http::Method::DELETE
+    )
+}
+
+/// Whether a mutating request is same-origin, from the browser fetch-metadata
+/// and Origin headers. Requests with neither (non-browser clients) are treated
+/// as allowed — the SameSite=Strict cookie is the primary control.
+fn same_origin(h: &axum::http::HeaderMap) -> bool {
+    if let Some(site) = h.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        // "same-origin"/"none" are safe; "same-site"/"cross-site" are not.
+        return site == "same-origin" || site == "none";
+    }
+    match (
+        h.get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        h.get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        // Compare the Origin's host:port to the Host header.
+        (Some(origin), Some(host)) => origin
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .is_some_and(|oh| oh.eq_ignore_ascii_case(host)),
+        // No Origin header at all: not a cross-site browser form post.
+        (None, _) => true,
+        _ => false,
+    }
 }
 
 #[derive(serde::Deserialize, Default)]

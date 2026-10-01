@@ -16,7 +16,7 @@
     <dl class="kv">{% for (k, v) in d.headers %}<dt>{{ k }}</dt><dd>{{ v }}</dd>{% endfor %}</dl></section>
   <section class="card"><div class="card-head"><h2>Body <span class="muted">{{ d.body_len }} bytes{% if d.body_truncated %}, showing first 16 KiB{% endif %}</span></h2>
     <button class="btn btn-sm" type="button" data-hex-toggle="body">hex</button></div>
-    <pre class="panel" id="body" data-text="{{ d.body_text }}">{% if d.body_text.is_empty() %}<span class="muted">(empty)</span>{% else %}{{ d.body_text }}{% endif %}</pre></section>
+    <pre class="panel" id="body" data-text="{{ d.body_text }}" data-b64="{{ d.body_b64 }}">{% if d.body_text.is_empty() %}<span class="muted">(empty)</span>{% else %}{{ d.body_text }}{% endif %}</pre></section>
   {% if let Some(fp) = d.fingerprint %}<section class="card"><h2>Fingerprint</h2><p><a class="mono" href="/admin/fingerprints#{{ fp.hash }}">{{ fp.hash }}</a> — seen from <b>{{ fp.other_ips }}</b> other IPs</p></section>{% endif %}
 </div>
 {% endblock %}

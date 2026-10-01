@@ -68,6 +68,9 @@ pub struct RequestDetail {
     pub ip: String,
     pub headers: Vec<(String, String)>,
     pub body_text: String,
+    /// Base64 of the raw (shown) body bytes, for an accurate hex view — the
+    /// lossy `body_text` and HTML newline normalisation corrupt binary bytes.
+    pub body_b64: String,
     pub body_len: usize,
     pub body_truncated: bool,
     pub fingerprint: Option<FpSummary>,
@@ -252,7 +255,9 @@ impl Store {
         let body = row.body.clone().unwrap_or_default();
         let body_len = body.len();
         let body_truncated = body_len > BODY_LIMIT;
-        let body_text = String::from_utf8_lossy(&body[..body_len.min(BODY_LIMIT)]).into_owned();
+        let shown = &body[..body_len.min(BODY_LIMIT)];
+        let body_text = String::from_utf8_lossy(shown).into_owned();
+        let body_b64 = data_encoding::BASE64.encode(shown);
         let fp: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT fp_hash, visitor_id FROM fingerprints WHERE request_id = ? ORDER BY id DESC LIMIT 1",
         )
@@ -280,6 +285,7 @@ impl Store {
             ip,
             headers,
             body_text,
+            body_b64,
             body_len,
             body_truncated,
             fingerprint,

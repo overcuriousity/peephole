@@ -34,9 +34,13 @@ impl<T> Page<T> {
     }
 }
 
+/// Hard cap on page number. Bounds the SQL OFFSET so an anonymous caller
+/// cannot force a scan deep into the table with a huge `page=` value.
+pub const MAX_PAGE: u32 = 100_000;
+
 pub fn page_num(p: Option<i64>) -> u32 {
     p.filter(|n| *n >= 1)
-        .map(|n| n.min(u32::MAX as i64) as u32)
+        .map(|n| n.min(MAX_PAGE as i64) as u32)
         .unwrap_or(1)
 }
 

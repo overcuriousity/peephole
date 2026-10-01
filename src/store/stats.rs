@@ -307,11 +307,16 @@ impl Store {
                 },
             )
             .collect();
-        let intel = sqlx::query_as::<_, (String, String)>("SELECT key, value FROM intel_meta")
-            .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .collect();
+        // Only the public refresh timestamps — never the whole intel_meta
+        // table, which also holds webauthn_setup_token_hash. `intel` is
+        // serialized into the public /api/stats response.
+        let intel = sqlx::query_as::<_, (String, String)>(
+            "SELECT key, value FROM intel_meta WHERE key IN ('tor_last_fetch','maxmind_last_fetch')",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect();
         Ok(Stats {
             range: r.key(),
             generated_at: chrono::Utc::now().to_rfc3339(),
@@ -522,6 +527,23 @@ mod tests {
         assert_eq!(Range::parse(Some("all")), Range::All);
         assert_eq!(Range::parse(Some("1y")), Range::H24);
         assert_eq!(Range::parse(None), Range::H24);
+    }
+
+    #[tokio::test]
+    async fn stats_intel_excludes_setup_token_hash() {
+        let s = seeded().await;
+        s.intel_set("webauthn_setup_token_hash", "deadbeef")
+            .await
+            .unwrap();
+        s.intel_set("tor_last_fetch", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        let st = s.stats(Range::All).await.unwrap();
+        assert!(
+            !st.intel.contains_key("webauthn_setup_token_hash"),
+            "setup token hash must never reach public /api/stats"
+        );
+        assert!(st.intel.contains_key("tor_last_fetch"));
     }
 
     #[tokio::test]
