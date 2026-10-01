@@ -324,7 +324,10 @@ impl WireEntry {
     /// does not know.
     pub fn record(&self) -> Option<Record> {
         let r: Record = super::rpc::cbor::decode(self.payload.as_ref()?).ok()?;
-        (r.kind() == self.kind).then_some(r)
+        // The entry's kind and uid must match the signed payload, so the
+        // envelope columns (which indexes and the stub path rely on) cannot
+        // disagree with what was actually signed.
+        (r.kind() == self.kind && r.uid() == self.uid).then_some(r)
     }
 }
 

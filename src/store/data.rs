@@ -35,6 +35,20 @@ pub enum Effect {
     Erased(String),
     /// Not applied, nothing to remember (stale, or its parent is gone).
     Ignored,
+    /// Not applied yet: a parent row (e.g. the scan job for a scan result) has
+    /// not replicated here. Kept unapplied so a later pass retries it once the
+    /// parent arrives, rather than dropping it permanently.
+    Deferred,
+}
+
+/// Whether `uid` has been deleted (so a missing parent is gone for good, not
+/// merely not-yet-replicated).
+async fn is_tombstoned(conn: &mut SqliteConnection, uid: &str) -> Result<bool> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tombstoned WHERE uid = ?")
+        .bind(uid)
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(n > 0)
 }
 
 /// UTC timestamp in the rows' format.
@@ -343,7 +357,13 @@ async fn job_status(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &JobStatusRec)
             .fetch_optional(&mut *conn)
             .await?;
     let Some(arbiter) = arbiter else {
-        return Ok(Effect::Ignored); // job deleted
+        // No such job: deleted → drop; otherwise it has not replicated here
+        // yet → defer so the status is applied once the job arrives.
+        return Ok(if is_tombstoned(conn, &r.job_uid).await? {
+            Effect::Ignored
+        } else {
+            Effect::Deferred
+        });
     };
     // Only the job's arbiter changes its state.
     if let Some(o) = ctx.origin
@@ -380,9 +400,17 @@ async fn job_adopt(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &JobAdoptRec) -
     };
     let (from, me) = (r.from.0.to_vec(), adopter.0.to_vec());
     for uid in &r.job_uids {
+        // Adopt queued jobs, and requeue a job still marked 'running' under
+        // the (silent) origin — its lease is long gone, so the adopter reruns
+        // it. The CASE reads the pre-update status. Taking over does not alter
+        // a job already done/failed.
         sqlx::query(
-            "UPDATE scan_jobs SET arbiter = ?1, adopted_from = ?2
-             WHERE uid = ?3 AND status = 'queued'
+            "UPDATE scan_jobs
+               SET arbiter = ?1, adopted_from = ?2,
+                   status = CASE WHEN status = 'running' THEN 'queued' ELSE status END,
+                   started_at = CASE WHEN status = 'running' THEN NULL ELSE started_at END,
+                   scanner = CASE WHEN status = 'running' THEN NULL ELSE scanner END
+             WHERE uid = ?3 AND status IN ('queued','running')
                AND (arbiter = ?2 OR (adopted_from = ?2 AND arbiter > ?1))",
         )
         .bind(&me)
@@ -407,7 +435,13 @@ async fn scan_result(
         .fetch_optional(&mut *conn)
         .await?;
     let Some(job_id) = job_id else {
-        return Ok(Effect::Ignored);
+        // The scan job has not replicated here yet (cross-origin ordering):
+        // defer so the result is stored once it does, unless it was deleted.
+        return Ok(if is_tombstoned(conn, &r.job_uid).await? {
+            Effect::Ignored
+        } else {
+            Effect::Deferred
+        });
     };
     let ip_id = ensure_ip(conn, &r.ip, None).await?;
     let res = sqlx::query(
@@ -819,4 +853,66 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
         }
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::record::{Record, ScanResultRec};
+    use crate::store::Store;
+
+    #[tokio::test]
+    async fn scan_result_defers_until_its_job_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = store
+            .upsert_ip("203.0.113.9".parse().unwrap())
+            .await
+            .unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let res = ScanResultRec {
+            uid: new_uid(),
+            job_uid: "job-not-here-yet".into(),
+            ip: "203.0.113.9".into(),
+            level: 2,
+            started_at: now_ts(),
+            finished_at: Some(now_ts()),
+            os_guess: None,
+            raw_xml: None,
+            ports: vec![],
+        };
+        // The parent job has not replicated yet → deferred, not dropped.
+        let eff = apply(
+            &mut conn,
+            Ctx {
+                origin: None,
+                hlc: 1,
+            },
+            &Record::ScanResult(res.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(eff, Effect::Deferred);
+        // Once the job arrives, the same record applies.
+        sqlx::query(
+            "INSERT INTO scan_jobs (uid, ip_id, level, status, queued_at) VALUES (?,?,2,'running',?)",
+        )
+        .bind("job-not-here-yet")
+        .bind(ip.id)
+        .bind(now_ts())
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        let eff = apply(
+            &mut conn,
+            Ctx {
+                origin: None,
+                hlc: 2,
+            },
+            &Record::ScanResult(res),
+        )
+        .await
+        .unwrap();
+        assert_eq!(eff, Effect::Applied);
+    }
 }

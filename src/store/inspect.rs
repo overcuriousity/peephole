@@ -87,6 +87,22 @@ const SCAN_SELECT: &str =
 const CLAIM_SELECT: &str = "SELECT c.id, c.ts, i.ip, c.contact_email, c.user_agent FROM fp_claims c JOIN ips i ON c.ip_id = i.id";
 
 const BODY_LIMIT: usize = 16 * 1024;
+/// Upper bound on a decompressed scan's raw nmap XML.
+const MAX_RAW_XML: u64 = 64 * 1024 * 1024;
+
+/// Decompress zstd data, refusing output larger than `limit` (bomb guard).
+fn zstd_decode_capped(data: &[u8], limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut dec = zstd::stream::Decoder::new(data)?;
+    let mut out = Vec::new();
+    // Read one byte past the limit to detect overflow.
+    let n = dec.by_ref().take(limit + 1).read_to_end(&mut out)?;
+    anyhow::ensure!(
+        n as u64 <= limit,
+        "decompressed scan XML exceeds {limit} bytes"
+    );
+    Ok(out)
+}
 
 impl Store {
     pub async fn scans_for_ip(&self, ip_id: i64) -> Result<Vec<ScanSummary>> {
@@ -139,7 +155,10 @@ impl Store {
                 .fetch_optional(&self.pool)
                 .await?;
         match blob.flatten() {
-            Some(b) => Ok(Some(zstd::decode_all(b.as_slice())?)),
+            // Cap the decompressed size: raw_xml can arrive from any cluster
+            // member, so a decompression bomb must not exhaust memory when an
+            // admin opens the scan.
+            Some(b) => Ok(Some(zstd_decode_capped(&b, MAX_RAW_XML)?)),
             None => Ok(None),
         }
     }

@@ -386,7 +386,7 @@ async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Re
     }
     let arbiters: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT DISTINCT arbiter FROM scan_jobs
-         WHERE status = 'queued' AND arbiter IS NOT NULL AND arbiter != ?",
+         WHERE status IN ('queued','running') AND arbiter IS NOT NULL AND arbiter != ?",
     )
     .bind(&me.0[..])
     .fetch_all(&node.store.pool)
@@ -398,8 +398,11 @@ async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Re
         if node.silent_for(&from) < window {
             continue;
         }
+        // Include 'running' jobs: after takeover_hours of silence any lease is
+        // long expired, so a job still marked running under a dead arbiter is
+        // stale and would otherwise block its IP cluster-wide forever.
         let uids: Vec<String> = sqlx::query_scalar(
-            "SELECT uid FROM scan_jobs WHERE status = 'queued' AND arbiter = ? LIMIT 500",
+            "SELECT uid FROM scan_jobs WHERE status IN ('queued','running') AND arbiter = ? LIMIT 500",
         )
         .bind(&a)
         .fetch_all(&node.store.pool)

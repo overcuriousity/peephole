@@ -19,8 +19,12 @@ use proto::Hello;
 use server::Peer;
 use std::sync::Arc;
 
-/// Largest RPC body (backfill batches are paced well below this).
+/// Largest member RPC body (backfill batches are paced well below this).
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
+/// `/join` is reachable by any key that completes the TLS handshake (not yet a
+/// member), so its body is capped tightly — a JoinReq is a token plus small
+/// node info — to deny an unauthenticated memory-exhaustion vector.
+const JOIN_BODY_LIMIT: usize = 64 * 1024;
 
 pub fn router(node: Arc<Node>) -> Router {
     let members_only = Router::new()
@@ -36,13 +40,13 @@ pub fn router(node: Arc<Node>) -> Router {
         .route_layer(axum::middleware::from_fn_with_state(
             node.clone(),
             require_member,
-        ));
-    // The only route open to keys that are not members yet.
-    let open = Router::new().route("/rpc/v1/join", post(join));
-    members_only
-        .merge(open)
-        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
-        .with_state(node)
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT));
+    // The only route open to keys that are not members yet, with a tight limit.
+    let open = Router::new()
+        .route("/rpc/v1/join", post(join))
+        .layer(axum::extract::DefaultBodyLimit::max(JOIN_BODY_LIMIT));
+    members_only.merge(open).with_state(node)
 }
 
 fn internal(e: anyhow::Error) -> Response {

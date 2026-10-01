@@ -98,17 +98,31 @@ async fn peer_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut backoff = Duration::from_secs(1);
+    // Separate, growing backoff for the "stuck" case (peer offers entries we
+    // cannot apply): without it the loop would re-poll /wait — which answers
+    // at once while the peer is ahead — and busy-spin at full CPU.
+    let mut stuck_backoff = Duration::from_secs(1);
     let mut last_hello: Option<tokio::time::Instant> = None;
     let mut changes = node.subscribe_changes();
     loop {
         changes.borrow_and_update();
         let hello_due = last_hello.is_none_or(|t| t.elapsed() > HELLO_EVERY);
         match reconcile(&node, peer, &addr, hello_due).await {
-            Ok(()) => {
+            Ok(stuck) => {
                 if hello_due {
                     last_hello = Some(tokio::time::Instant::now());
                 }
                 backoff = Duration::from_secs(1);
+                if stuck {
+                    tokio::select! {
+                        _ = tokio::time::sleep(stuck_backoff) => {}
+                        _ = changes.changed() => {}
+                        _ = shutdown.changed() => return,
+                    }
+                    stuck_backoff = (stuck_backoff * 2).min(Duration::from_secs(60));
+                    continue;
+                }
+                stuck_backoff = Duration::from_secs(1);
             }
             Err(e) => {
                 node.record_status(peer, &name, Err(format!("{e:#}"))).await;
@@ -136,8 +150,11 @@ async fn peer_loop(
     }
 }
 
-/// One full exchange with a peer.
-pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Result<()> {
+/// One full exchange with a peer. Returns `true` when it is "stuck": the peer
+/// offered entries but none could be applied or parked (and we are still
+/// behind), so the caller must back off instead of immediately re-polling
+/// `/wait` (which answers at once while the peer is ahead) and busy-spinning.
+pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Result<bool> {
     let name = node
         .members()
         .get(&peer)
@@ -154,6 +171,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         .await?;
     node.merge_heartbeats(gossip);
     // Pull what we lack.
+    let mut stuck = false;
     loop {
         let ours = repl::heads(&node.store).await?;
         let wants: Vec<_> = theirs
@@ -181,6 +199,9 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         }
         let st = repl::apply_batch(node, entries).await?;
         if st.applied + st.parked == 0 {
+            // The peer has entries we cannot make progress on; stop pulling and
+            // signal the caller to back off rather than spin.
+            stuck = true;
             break;
         }
     }
@@ -209,5 +230,5 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         theirs = after;
     }
     node.record_status(peer, &name, Ok(None)).await;
-    Ok(())
+    Ok(stuck)
 }

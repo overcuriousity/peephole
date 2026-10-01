@@ -228,8 +228,8 @@ pub async fn append_in_tx(
         + 1;
     let e = WireEntry::sign(&node.identity, seq, node.hlc.now(), record)?;
     insert_log(conn, &e, true).await?;
-    let changed = apply_record(node, conn, &e, record).await?;
-    Ok((e, changed))
+    let settled = apply_record(node, conn, &e, record).await?;
+    Ok((e, settled.membership))
 }
 
 /// Log a record whose rows already exist (history adoption): sign and
@@ -294,6 +294,8 @@ pub async fn apply_batch(node: &Node, entries: Vec<WireEntry>) -> Result<Applied
     }
     if st.applied > 0 {
         drain_pending(node, &mut tx, &mut st).await?;
+        // Newly-applied entries may be the parent of earlier deferred ones.
+        retry_deferred(node, &mut tx, &mut st).await?;
     }
     tx.commit().await?;
     drop(guard);
@@ -333,24 +335,39 @@ async fn apply_one(
         return Ok(());
     }
     if held > have || !trusted(node, conn, &e.origin).await? {
-        sqlx::query(
-            "INSERT INTO repl_pending (origin, seq, entry, received_at) VALUES (?,?,?,datetime('now'))",
-        )
-        .bind(&e.origin.0[..])
-        .bind(e.seq as i64)
-        .bind(super::rpc::cbor::encode(&e)?)
-        .execute(&mut *conn)
-        .await?;
-        bump_head(conn, &e.origin, e.seq).await?;
+        park(conn, &e).await?;
         st.parked += 1;
         return Ok(());
     }
     apply_verified(node, conn, e, st).await
 }
 
-/// An entry a tombstone erased: accepted once that tombstone is known here
-/// (its uid is then remembered as deleted). Never parked; a later round
-/// re-sends it after the tombstone has arrived.
+/// Store an entry we cannot apply yet (a gap ahead, or its origin not trusted
+/// here yet) and advance the held head so the stream can continue; a later
+/// [`drain_pending`] applies it once the obstacle clears.
+async fn park(conn: &mut SqliteConnection, e: &WireEntry) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO repl_pending (origin, seq, entry, received_at) VALUES (?,?,?,datetime('now'))",
+    )
+    .bind(&e.origin.0[..])
+    .bind(e.seq as i64)
+    .bind(super::rpc::cbor::encode(e)?)
+    .execute(&mut *conn)
+    .await?;
+    bump_head(conn, &e.origin, e.seq).await?;
+    Ok(())
+}
+
+/// An entry its origin deleted (payload erased, `erased_by` naming the
+/// tombstone). The tombstone sits *later* in the same origin's in-order
+/// stream, so requiring it first would stall the origin forever; instead a
+/// stub from a trusted origin is applied immediately (remembering the uid as
+/// deleted), and one from an untrusted/not-yet-trusted origin — or behind a
+/// gap — is parked for a later drain. NOTE: erased stubs carry no signature
+/// (the payload, and thus the signature, were dropped on erasure), so a
+/// trusted relaying member could forge one; this matches the existing threat
+/// model (any member may delete anything) but a future protocol revision
+/// should sign stubs at the origin.
 async fn apply_stub(
     node: &Node,
     conn: &mut SqliteConnection,
@@ -358,21 +375,28 @@ async fn apply_stub(
     blocked: bool,
     st: &mut Applied,
 ) -> Result<()> {
-    let Some(tomb) = &e.erased_by else {
-        st.rejected += 1;
-        return Ok(());
-    };
-    let known: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM repl_log WHERE kind = 'tombstone' AND uid = ?")
-            .bind(tomb)
-            .fetch_one(&mut *conn)
-            .await?;
-    if known == 0 || blocked || !trusted(node, conn, &e.origin).await? {
+    if e.erased_by.is_none() {
+        // A payload-less entry that is not an erased stub is malformed.
         st.rejected += 1;
         return Ok(());
     }
-    insert_log(conn, &e, true).await?;
-    if let Some(uid) = &e.uid {
+    if blocked || !trusted(node, conn, &e.origin).await? {
+        park(conn, &e).await?;
+        st.parked += 1;
+        return Ok(());
+    }
+    apply_stub_now(node, conn, &e, st).await
+}
+
+/// Record an erased stub whose origin is trusted and whose position is next.
+async fn apply_stub_now(
+    node: &Node,
+    conn: &mut SqliteConnection,
+    e: &WireEntry,
+    st: &mut Applied,
+) -> Result<()> {
+    insert_log(conn, e, true).await?;
+    if let (Some(uid), Some(tomb)) = (&e.uid, &e.erased_by) {
         sqlx::query("INSERT OR IGNORE INTO tombstoned (uid, tombstone_uid) VALUES (?, ?)")
             .bind(uid)
             .bind(tomb)
@@ -406,7 +430,16 @@ async fn apply_verified(
     let record = e.record();
     insert_log(conn, &e, record.is_some()).await?;
     if let Some(r) = &record {
-        st.membership_changed |= apply_record(node, conn, &e, r).await?;
+        let settled = apply_record(node, conn, &e, r).await?;
+        st.membership_changed |= settled.membership;
+        if settled.deferred {
+            // Parent not here yet: keep it unapplied for retry_deferred.
+            sqlx::query("UPDATE repl_log SET applied = 0 WHERE origin = ? AND seq = ?")
+                .bind(&e.origin.0[..])
+                .bind(e.seq as i64)
+                .execute(&mut *conn)
+                .await?;
+        }
         // Sent before commit; listeners re-read the row after a moment.
         announce_job(node, &e.kind, r);
     }
@@ -442,7 +475,13 @@ async fn drain_pending(node: &Node, conn: &mut SqliteConnection, st: &mut Applie
                     continue; // already applied via another path
                 }
                 let e: WireEntry = super::rpc::cbor::decode(&blob)?;
-                apply_verified(node, conn, e, st).await?;
+                // A parked erased stub records the deletion; everything else
+                // carries a signed payload to apply.
+                if e.payload.is_none() {
+                    apply_stub_now(node, conn, &e, st).await?;
+                } else {
+                    apply_verified(node, conn, e, st).await?;
+                }
                 progress = true;
             }
         }
@@ -466,36 +505,90 @@ pub async fn apply_unknown_kinds(node: &Node) -> Result<usize> {
     for r in rows {
         let e = from_row(r)?;
         if let Some(rec) = e.record() {
-            apply_record(node, &mut tx, &e, &rec).await?;
-            sqlx::query("UPDATE repl_log SET applied = 1 WHERE origin = ? AND seq = ?")
-                .bind(&e.origin.0[..])
-                .bind(e.seq as i64)
-                .execute(&mut *tx)
-                .await?;
-            n += 1;
+            let settled = apply_record(node, &mut tx, &e, &rec).await?;
+            // A still-deferred entry (parent absent) stays unapplied for a
+            // later retry; do not mark it applied.
+            if !settled.deferred {
+                sqlx::query("UPDATE repl_log SET applied = 1 WHERE origin = ? AND seq = ?")
+                    .bind(&e.origin.0[..])
+                    .bind(e.seq as i64)
+                    .execute(&mut *tx)
+                    .await?;
+                n += 1;
+            }
         }
     }
     tx.commit().await?;
     Ok(n)
 }
 
+/// Re-apply entries that were deferred because their parent row was missing,
+/// now that newly-applied entries may have supplied it. Loops until no entry
+/// moves. Runs inside the batch transaction.
+async fn retry_deferred(node: &Node, conn: &mut SqliteConnection, st: &mut Applied) -> Result<()> {
+    loop {
+        let rows: Vec<LogRow> = sqlx::query_as(
+            "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by FROM repl_log
+             WHERE applied = 0 AND payload IS NOT NULL ORDER BY hlc",
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut progress = false;
+        for r in rows {
+            let e = from_row(r)?;
+            let Some(rec) = e.record() else { continue };
+            let settled = apply_record(node, conn, &e, &rec).await?;
+            st.membership_changed |= settled.membership;
+            if !settled.deferred {
+                sqlx::query("UPDATE repl_log SET applied = 1 WHERE origin = ? AND seq = ?")
+                    .bind(&e.origin.0[..])
+                    .bind(e.seq as i64)
+                    .execute(&mut *conn)
+                    .await?;
+                announce_job(node, &e.kind, &rec);
+                progress = true;
+            }
+        }
+        if !progress {
+            return Ok(());
+        }
+    }
+}
+
+/// What applying a record did, beyond its table effects.
+#[derive(Default, Clone, Copy)]
+struct Settled {
+    membership: bool,
+    /// The record's parent row is not here yet; keep the entry unapplied.
+    deferred: bool,
+}
+
 /// Effects of one record on the materialized tables, then settle its log
 /// entry: erased if a tombstone already deleted it, payload dropped if it
-/// can be rebuilt from its row. Returns true if membership changed.
+/// can be rebuilt from its row.
 async fn apply_record(
     node: &Node,
     conn: &mut SqliteConnection,
     e: &WireEntry,
     r: &Record,
-) -> Result<bool> {
+) -> Result<Settled> {
     if super::members::apply(node, conn, e, r).await? {
-        return Ok(true);
+        return Ok(Settled {
+            membership: true,
+            deferred: false,
+        });
     }
     let ctx = Ctx {
         origin: Some(&e.origin),
         hlc: e.hlc,
     };
     match data::apply(conn, ctx, r).await? {
+        Effect::Deferred => {
+            return Ok(Settled {
+                membership: false,
+                deferred: true,
+            });
+        }
         Effect::Erased(t) => {
             sqlx::query(
                 "UPDATE repl_log SET payload = NULL, sig = NULL, erased_by = ?
@@ -524,7 +617,7 @@ async fn apply_record(
         }
         _ => {}
     }
-    Ok(false)
+    Ok(Settled::default())
 }
 
 #[cfg(test)]
