@@ -1,4 +1,5 @@
 <form method="post" action="/admin/cluster/settings" class="filters">
+  <input type="hidden" name="base_version" value="{{ settings.version }}">
   <label>Rescan cooldown (h) <input type="number" name="cooldown_hours" min="0" max="8760" value="{{ settings.cooldown_hours }}" required></label>
   <label title="{{ settings.listener_missing }}"><input type="checkbox" name="listener"{% if settings.listener %} checked{% endif %}{% if !settings.listener && !settings.listener_missing.is_empty() %} disabled{% endif %}> Trap</label>
   <label title="{{ settings.scanner_missing }}"><input type="checkbox" name="scanner"{% if settings.scanner %} checked{% endif %}{% if !settings.scanner && !settings.scanner_missing.is_empty() %} disabled{% endif %}> Scanner</label>

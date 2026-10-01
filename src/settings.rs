@@ -310,6 +310,9 @@ impl Settings {
     /// Re-read the database (another process may have written); true if
     /// anything changed.
     pub async fn reload(&self) -> Result<bool> {
+        // Under the writers' lock: a write committed and adopted between
+        // the read and the adopt would otherwise be rolled back in memory.
+        let _g = self.lock.lock().await;
         let s = self.stored().await?;
         if s == self.snapshot() {
             return Ok(false);

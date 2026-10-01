@@ -280,8 +280,12 @@ impl Node {
         if self.roles() == r {
             return Ok(());
         }
-        *self.roles.write().unwrap() = r;
-        repl::append(self, &[Record::MemberUpdate(self.self_info())]).await?;
+        let before = std::mem::replace(&mut *self.roles.write().unwrap(), r);
+        if let Err(e) = repl::append(self, &[Record::MemberUpdate(self.self_info())]).await {
+            // Not announced: try again on the next call.
+            *self.roles.write().unwrap() = before;
+            return Err(e);
+        }
         self.publish_status();
         Ok(())
     }

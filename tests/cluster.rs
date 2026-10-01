@@ -2492,18 +2492,60 @@ async fn admin_configures_another_node_with_its_key() {
         "unchecked role is off"
     );
 
-    // This node's own settings from its own page.
+    // The pace row cannot change B behind the version check.
     let r = admin
-        .post(format!("{base}/admin/cluster/settings"))
+        .post(format!("{base}/admin/cluster/pace"))
         .form(&[
-            ("cooldown_hours", "6"),
-            ("listener", "on"),
-            ("scanner", "on"),
-            ("web", "on"),
+            ("key", b.id.to_string()),
+            ("max_workers", "1".into()),
+            ("max_scans_per_hour", "11".into()),
+            ("timeout_minutes", "5".into()),
         ])
         .send()
         .await
         .unwrap();
     assert!(r.status().is_success());
+    assert_eq!(nb.settings.snapshot().pace.max_scans_per_hour, 55);
+
+    // This node's own settings from its own page, which carries the version
+    // it showed.
+    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    let shown = na.settings.snapshot().version;
+    assert!(
+        page.contains(&format!("name=\"base_version\" value=\"{shown}\"")),
+        "own form carries the version"
+    );
+    let own = |base_version: u64, cooldown: &'static str| {
+        admin
+            .post(format!("{base}/admin/cluster/settings"))
+            .form(&[
+                ("base_version", base_version.to_string()),
+                ("cooldown_hours", cooldown.into()),
+                ("listener", "on".into()),
+                ("scanner", "on".into()),
+                ("web", "on".into()),
+            ])
+            .send()
+    };
+    assert!(own(shown, "6").await.unwrap().status().is_success());
     assert_eq!(na.settings.snapshot().cooldown_hours, 6);
+    // A change made elsewhere after the page was loaded is not overwritten.
+    na.settings
+        .apply(
+            &peephole::settings::Changes {
+                scanner: Some(false),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(own(shown + 1, "7").await.unwrap().status().is_success());
+    let s = na.settings.snapshot();
+    assert!(
+        !s.roles.scanner,
+        "a stale form does not switch the scanner back on"
+    );
+    assert_eq!(s.cooldown_hours, 6);
 }

@@ -7,7 +7,6 @@ use crate::admin::views::Chrome;
 use crate::cluster::identity::NodeId;
 use crate::cluster::status::PaceInfo;
 use crate::cluster::{Node, invite, members, repl};
-use crate::scan::pace::Pace;
 use askama::Template;
 use axum::{
     Router,
@@ -635,7 +634,15 @@ async fn set_own(
         Ok(c) => c,
         Err(e) => return Ok(back(None, Some(e))),
     };
-    Ok(match st.settings.apply(&changes, None).await? {
+    // The form sends every role, so it must not overwrite a change made
+    // elsewhere (CLI, a config key holder) after the page was loaded.
+    let Some(base) = f.base_version else {
+        return Ok(back(
+            None,
+            Some("Settings not saved: reload the page and try again".into()),
+        ));
+    };
+    Ok(match st.settings.apply_at(base, &changes, None).await? {
         Ok(_) => back(
             Some("Settings saved. Roles switch within seconds.".into()),
             None,
@@ -819,8 +826,23 @@ async fn set_pace(
     Form(f): Form<PaceForm>,
 ) -> AppResult<Redirect> {
     let node = node(&st)?;
+    let Ok(id) = NodeId::parse(&f.key) else {
+        return Ok(back(None, Some("unknown node".into())));
+    };
+    // Other nodes are changed from their own page, which carries the
+    // settings version it showed (a change made meanwhile is refused).
+    if id != node.id() {
+        return Ok(back(
+            None,
+            Some(format!(
+                "Change {}'s pace from its page: /admin/cluster/node/{}",
+                id.short(),
+                f.key
+            )),
+        ));
+    }
     let parsed = (
-        f.max_workers.trim().parse::<usize>(),
+        f.max_workers.trim().parse::<u32>(),
         f.max_scans_per_hour.trim().parse::<i64>(),
         f.timeout_minutes.trim().parse::<f64>(),
     );
@@ -830,54 +852,28 @@ async fn set_pace(
     if !t.is_finite() || t <= 0.0 {
         return Ok(back(None, Some("timeout must be positive".into())));
     }
-    let p = Pace {
-        max_workers: w,
-        max_scans_per_hour: h,
-        timeout_secs: (t * 60.0).round() as u64,
-    };
-    let Ok(id) = NodeId::parse(&f.key) else {
-        return Ok(back(None, Some("unknown node".into())));
-    };
-    let outcome = if id == node.id() {
-        let r = st
-            .settings
-            .apply(
-                &crate::settings::Changes {
-                    max_workers: Some(w as u32),
-                    max_scans_per_hour: Some(h),
-                    timeout_secs: Some(p.timeout_secs),
-                    ..Default::default()
-                },
-                None,
-            )
-            .await?
-            .map(|_| ());
-        if r.is_ok() {
-            node.status.local.lock().unwrap().pace = Some(PaceInfo {
-                max_workers: w as u32,
-                max_scans_per_hour: h,
-                timeout_secs: p.timeout_secs,
-            });
-            node.publish_status();
-        }
-        r
-    } else {
-        let changes = crate::settings::Changes {
-            max_workers: Some(w as u32),
-            max_scans_per_hour: Some(h),
-            timeout_secs: Some(p.timeout_secs),
-            ..Default::default()
-        };
-        match crate::cluster::confkey::get(node, id).await {
-            Ok(state) => {
-                match crate::cluster::confkey::set(node, id, state.version, &changes).await {
-                    Ok(r) => r.map(|_| ()),
-                    Err(e) => Err(format!("{e:#}")),
-                }
-            }
-            Err(e) => Err(format!("{e:#}")),
-        }
-    };
+    let timeout_secs = (t * 60.0).round() as u64;
+    let outcome = st
+        .settings
+        .apply(
+            &crate::settings::Changes {
+                max_workers: Some(w),
+                max_scans_per_hour: Some(h),
+                timeout_secs: Some(timeout_secs),
+                ..Default::default()
+            },
+            None,
+        )
+        .await?
+        .map(|_| ());
+    if outcome.is_ok() {
+        node.status.local.lock().unwrap().pace = Some(PaceInfo {
+            max_workers: w,
+            max_scans_per_hour: h,
+            timeout_secs,
+        });
+        node.publish_status();
+    }
     Ok(match outcome {
         Ok(()) => back(Some(format!("Pace of {} saved.", id.short())), None),
         Err(e) => back(None, Some(format!("Pace not saved: {e}"))),

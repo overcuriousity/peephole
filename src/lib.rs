@@ -216,25 +216,48 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
 /// have written, and retries a role that failed to start.
 pub const SETTINGS_TICK: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// A running role: stop it by sending `true`, then wait for the task.
+/// How long a stopping web interface may finish open requests before its
+/// listener task is dropped.
+const WEB_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long shutdown waits for the roles to stop (scans to finish) before it
+/// abandons them; interrupted scans are requeued as after a crash.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Longest wait between attempts to start a role that keeps failing.
+const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A running role: send `true` to make it stop; the task ends by itself.
 struct Running {
     stop: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Running {
-    async fn stop(self) {
+    /// Ask the role to stop, without waiting for it.
+    fn signal(self) -> tokio::task::JoinHandle<()> {
         let _ = self.stop.send(true);
-        let _ = self.task.await;
+        self.task
     }
 }
 
-/// The three roles' tasks, where running.
+/// One role's state in the supervisor.
+#[derive(Default)]
+struct Slot {
+    running: Option<Running>,
+    /// The previous instance, asked to stop and still finishing (a scanner
+    /// lets its scans end). The role is not started again until it is gone:
+    /// a fresh scanner would requeue the jobs it is still running.
+    stopping: Option<tokio::task::JoinHandle<()>>,
+    /// Failed starts in a row, and when to try again.
+    failures: u32,
+    next_try: Option<tokio::time::Instant>,
+}
+
+/// The three roles: trap, scanner, web.
 #[derive(Default)]
 struct Running3 {
-    trap: Option<Running>,
-    scanner: Option<Running>,
-    web: Option<Running>,
+    trap: Slot,
+    scanner: Slot,
+    web: Slot,
 }
 
 /// Everything needed to start any role.
@@ -250,58 +273,105 @@ struct RoleRunner {
 }
 
 impl RoleRunner {
-    /// Make the running roles equal to the effective ones. `strict`: a role
-    /// that cannot start is an error; otherwise it is logged and tried
-    /// again on the next pass.
-    async fn reconcile(&self, r: &mut Running3, strict: bool) -> Result<()> {
+    /// Make the running roles equal to the effective ones. Never waits for a
+    /// role to stop. `startup`: a role the config file enables that cannot
+    /// start is an error (the installer's health check relies on it); every
+    /// other failure is logged and retried with a growing delay.
+    async fn reconcile(&self, r: &mut Running3, startup: bool) -> Result<()> {
         let want = self.settings.roles();
-        // A task that ended by itself (listener error) is started afresh.
-        for slot in [&mut r.trap, &mut r.scanner, &mut r.web] {
-            if slot.as_ref().is_some_and(|x| x.task.is_finished()) {
-                *slot = None;
-            }
-        }
-        for (slot, want, name) in [
-            (&mut r.trap, want.listener, "trap"),
-            (&mut r.scanner, want.scanner, "scanner"),
-            (&mut r.web, want.web, "web"),
+        let now = tokio::time::Instant::now();
+        for (slot, want, from_file, name, key) in [
+            (
+                &mut r.trap,
+                want.listener,
+                self.cfg.roles.listener,
+                "trap",
+                "roles.listener",
+            ),
+            (
+                &mut r.scanner,
+                want.scanner,
+                self.cfg.roles.scanner,
+                "scanner",
+                "roles.scanner",
+            ),
+            (&mut r.web, want.web, self.cfg.roles.web, "web", "roles.web"),
         ] {
-            match (want, slot.is_some()) {
-                (true, false) => {
-                    let started = match name {
-                        "trap" => self.start_trap().await,
-                        "scanner" => self.start_scanner().await,
-                        _ => self.start_web().await,
+            if slot.stopping.as_ref().is_some_and(|t| t.is_finished()) {
+                slot.stopping = None;
+                info!(role = name, "role stopped");
+            }
+            // A task that ended by itself (listener error) is started afresh.
+            if slot.running.as_ref().is_some_and(|x| x.task.is_finished()) {
+                slot.running = None;
+            }
+            if !want {
+                slot.failures = 0;
+                slot.next_try = None;
+                if let Some(x) = slot.running.take() {
+                    info!(role = name, "role stopping");
+                    slot.stopping = Some(x.signal());
+                }
+                continue;
+            }
+            if slot.running.is_some()
+                || slot.stopping.is_some()
+                || slot.next_try.is_some_and(|t| t > now)
+            {
+                continue;
+            }
+            let started = match name {
+                "trap" => self.start_trap().await,
+                "scanner" => self.start_scanner().await,
+                _ => self.start_web().await,
+            };
+            match started {
+                Ok(x) => {
+                    info!(role = name, "role started");
+                    slot.running = Some(x);
+                    slot.failures = 0;
+                    slot.next_try = None;
+                }
+                Err(e) if startup && from_file => {
+                    return Err(e.context(format!("starting {name}")));
+                }
+                Err(e) => {
+                    slot.failures += 1;
+                    let wait =
+                        (SETTINGS_TICK * 2u32.saturating_pow(slot.failures - 1)).min(RETRY_MAX);
+                    slot.next_try = Some(now + wait);
+                    let why = if from_file {
+                        String::new()
+                    } else {
+                        format!(
+                            " (switched on by a runtime setting; `peephole settings reset {key}` undoes that)"
+                        )
                     };
-                    match started {
-                        Ok(x) => {
-                            info!(role = name, "role started");
-                            *slot = Some(x);
-                        }
-                        Err(e) if strict => return Err(e.context(format!("starting {name}"))),
-                        Err(e) => {
-                            warn!(role = name, error = %format!("{e:#}"), "role could not start; retrying")
-                        }
-                    }
+                    warn!(
+                        role = name,
+                        error = %format!("{e:#}"),
+                        retry_in_secs = wait.as_secs(),
+                        "role could not start{why}"
+                    );
                 }
-                (false, true) => {
-                    if let Some(x) = slot.take() {
-                        x.stop().await;
-                        info!(role = name, "role stopped");
-                    }
-                }
-                _ => {}
             }
         }
-        if let Some(node) = &self.node
-            && let Err(e) = node.set_roles(want).await
-        {
-            warn!(?e, "publishing the new roles failed");
+        // Tell the cluster what this node actually runs.
+        if let Some(node) = &self.node {
+            let running = config::Roles {
+                listener: r.trap.running.is_some(),
+                scanner: r.scanner.running.is_some(),
+                web: r.web.running.is_some(),
+            };
+            if let Err(e) = node.set_roles(running).await {
+                warn!(?e, "publishing the new roles failed");
+            }
         }
         Ok(())
     }
 
-    /// Keep the running roles equal to the effective ones until shutdown.
+    /// Keep the running roles equal to the effective ones until shutdown,
+    /// then stop them all, waiting at most [`SHUTDOWN_GRACE`].
     async fn supervise(
         self,
         mut running: Running3,
@@ -320,11 +390,20 @@ impl RoleRunner {
             }
             let _ = self.reconcile(&mut running, false).await;
         }
-        for r in [running.trap, running.scanner, running.web]
-            .into_iter()
-            .flatten()
+        let mut tasks = vec![];
+        for slot in [running.trap, running.scanner, running.web] {
+            tasks.extend(slot.running.map(Running::signal));
+            tasks.extend(slot.stopping);
+        }
+        let aborts: Vec<_> = tasks.iter().map(|t| t.abort_handle()).collect();
+        if tokio::time::timeout(SHUTDOWN_GRACE, futures::future::join_all(tasks))
+            .await
+            .is_err()
         {
-            r.stop().await;
+            warn!("roles did not stop in time; running scans are interrupted and requeued");
+            for a in aborts {
+                a.abort();
+            }
         }
     }
 
@@ -378,6 +457,7 @@ impl RoleRunner {
         };
         // First-run admin setup token (spec §8.4).
         let _ = admin::auth::ensure_setup_token(&self.store, &self.cfg.data_dir).await;
+        let (stop, mut rx) = tokio::sync::watch::channel(false);
         let app = admin::full_router(Arc::new(
             admin::AdminState::new(
                 self.store.clone(),
@@ -386,23 +466,28 @@ impl RoleRunner {
                 self.settings.pace.clone(),
             )
             .with_recorder(self.recorder.clone())
-            .with_settings(self.settings.clone()),
+            .with_settings(self.settings.clone())
+            .with_closing(rx.clone()),
         ));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding admin listener {addr}"))?;
         info!(%addr, "admin listener up");
-        let (stop, mut rx) = tokio::sync::watch::channel(false);
         Ok(Running {
             stop,
             task: tokio::spawn(async move {
-                let served = axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        let _ = rx.changed().await;
-                    })
-                    .await;
-                if let Err(e) = served {
-                    warn!(?e, "admin listener stopped");
+                let mut grace = rx.clone();
+                let served = axum::serve(listener, app).with_graceful_shutdown(async move {
+                    let _ = rx.wait_for(|v| *v).await;
+                });
+                tokio::select! {
+                    r = served => if let Err(e) = r {
+                        warn!(?e, "admin listener stopped");
+                    },
+                    _ = async {
+                        let _ = grace.wait_for(|v| *v).await;
+                        tokio::time::sleep(WEB_GRACE).await;
+                    } => warn!("admin listener stopped with requests still open"),
                 }
             }),
         })
