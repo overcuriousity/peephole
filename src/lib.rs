@@ -216,10 +216,34 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     };
     tokio::select! {
         r = served => { r?; }
-        _ = tokio::signal::ctrl_c() => { info!("shutting down"); }
+        _ = shutdown_signal() => { info!("shutting down"); }
     }
     let _ = shutdown_tx.send(true);
     Ok(())
+}
+
+/// Resolve on Ctrl-C or SIGTERM. systemd stops the service with SIGTERM, so
+/// without this the graceful path (watch channel → task shutdown) never ran.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Daily retention sweep. Runs an initial pass shortly after start, then once
