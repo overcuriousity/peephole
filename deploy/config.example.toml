@@ -42,7 +42,10 @@ max_workers = 2            # concurrent nmap subprocesses
 timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admin queue page)
 rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
 max_scans_per_hour = 30    # global rate cap; excess jobs stay queued
-never_scan = ["192.168.0.0/16"] # CIDRs never counter-scanned (own infra, monitoring)
+retention_days = 90        # delete requests and scan results older than this; 0 = keep forever
+never_scan = ["192.168.0.0/16"] # extra CIDRs never counter-scanned (own infra, monitoring)
+# Non-global addresses (loopback, private, CGNAT, link-local, multicast,
+# reserved) are never counter-scanned regardless of never_scan.
 
 # Default scans are non-intrusive: no -A, no intrusive NSE scripts, timing
 # capped at -T3. Severity escalates by scope (ports, -sV, -O, discovery/safe

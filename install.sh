@@ -250,7 +250,9 @@ max_workers = 2            # concurrent nmap subprocesses
 timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admin queue page)
 rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
 max_scans_per_hour = 30    # rate cap of this scanner; excess jobs stay queued
-never_scan = ["192.168.0.0/16"] # CIDRs never counter-scanned (own infra, monitoring)
+retention_days = 90        # delete requests and scan results older than this; 0 = keep forever
+# Non-global addresses (loopback, private, link-local, …) are never scanned.
+never_scan = ["192.168.0.0/16"] # extra CIDRs never counter-scanned (own infra, monitoring)
 CONFIG
         if [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ]; then
             cat <<CONFIG

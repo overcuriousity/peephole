@@ -135,6 +135,10 @@ pub struct ScanConfig {
     pub rescan_cooldown_hours: i64,
     #[serde(default = "default_rate")]
     pub max_scans_per_hour: i64,
+    /// Delete requests and scan results older than this many days. Default 90;
+    /// 0 disables pruning (keep forever). Bounds unbounded database growth.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
     #[serde(default)]
     pub never_scan: Vec<IpNet>,
     /// Optional per-level argv overrides. The target IP is appended as the
@@ -156,6 +160,9 @@ fn default_cooldown() -> i64 {
 fn default_rate() -> i64 {
     30
 }
+fn default_retention_days() -> u32 {
+    90
+}
 
 impl Default for ScanConfig {
     fn default() -> Self {
@@ -164,6 +171,7 @@ impl Default for ScanConfig {
             timeout_secs: default_timeout(),
             rescan_cooldown_hours: default_cooldown(),
             max_scans_per_hour: default_rate(),
+            retention_days: default_retention_days(),
             never_scan: vec![],
             level_argv: Default::default(),
         }
@@ -182,6 +190,7 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("scan", "timeout_secs", "1800"),
     ("scan", "rescan_cooldown_hours", "24"),
     ("scan", "max_scans_per_hour", "30"),
+    ("scan", "retention_days", "90"),
     ("scan", "never_scan", "[]"),
 ];
 

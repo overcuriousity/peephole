@@ -233,9 +233,14 @@ impl Store {
         let top_asns = self
             .named(
                 &format!(
-                    "SELECT COALESCE(i.asn_org,'unknown') AS name, COUNT(DISTINCT i.id) AS count
+                    // Group by ASN (not the org text): different ASNs can
+                    // share an org name, and one ASN can carry slightly
+                    // different org strings. Show a representative org, else
+                    // the AS number.
+                    "SELECT COALESCE(MAX(i.asn_org), 'AS' || i.asn, 'unknown') AS name,
+                            COUNT(DISTINCT i.id) AS count
                      FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w}
-                     GROUP BY i.asn_org ORDER BY count DESC LIMIT 20"
+                     GROUP BY i.asn ORDER BY count DESC LIMIT 20"
                 ),
                 since,
             )
@@ -373,6 +378,10 @@ pub struct StatsCache {
     map: RwLock<HashMap<Range, (Instant, Arc<MapCounts>)>>,
     /// Keyed by the full query string (filter + page).
     ips: RwLock<HashMap<String, (Instant, IpsPage)>>,
+    /// Single-flight guard: on a miss only one task recomputes (each of these
+    /// aggregations scans much of the table), the rest wait and read the
+    /// freshly cached value, so an expiry under load is not a stampede.
+    refresh: tokio::sync::Mutex<()>,
 }
 
 impl StatsCache {
@@ -381,6 +390,13 @@ impl StatsCache {
     }
 
     pub async fn stats(&self, store: &Store, r: Range) -> Result<Arc<Stats>> {
+        if let Some((t, v)) = self.stats.read().await.get(&r)
+            && t.elapsed() < TTL
+        {
+            return Ok(v.clone());
+        }
+        let _flight = self.refresh.lock().await;
+        // Another task may have refreshed while we waited for the guard.
         if let Some((t, v)) = self.stats.read().await.get(&r)
             && t.elapsed() < TTL
         {
@@ -402,6 +418,12 @@ impl StatsCache {
         f: &super::browse::IpFilter,
         key: String,
     ) -> Result<IpsPage> {
+        if let Some((t, v)) = self.ips.read().await.get(&key)
+            && t.elapsed() < TTL
+        {
+            return Ok(v.clone());
+        }
+        let _flight = self.refresh.lock().await;
         if let Some((t, v)) = self.ips.read().await.get(&key)
             && t.elapsed() < TTL
         {
@@ -431,6 +453,12 @@ impl StatsCache {
     }
 
     pub async fn map(&self, store: &Store, r: Range) -> Result<Arc<MapCounts>> {
+        if let Some((t, v)) = self.map.read().await.get(&r)
+            && t.elapsed() < TTL
+        {
+            return Ok(v.clone());
+        }
+        let _flight = self.refresh.lock().await;
         if let Some((t, v)) = self.map.read().await.get(&r)
             && t.elapsed() < TTL
         {

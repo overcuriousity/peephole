@@ -619,4 +619,44 @@ impl Recorder {
             .await?;
         Ok(true)
     }
+
+    /// Retention: tombstone requests (with their claims/fingerprints) and scan
+    /// results older than `days`. Bounded per call so a huge backlog is drained
+    /// over several daily runs rather than one enormous transaction. Returns
+    /// (requests, scans) removed. Deletes propagate in a cluster via tombstones.
+    pub async fn prune_older_than(&self, days: u32) -> Result<(u64, u64)> {
+        if days == 0 {
+            return Ok((0, 0));
+        }
+        const BATCH: i64 = 20_000;
+        let pool = &self.store().pool;
+        let cutoff = format!("-{days} days");
+        let req_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM requests WHERE ts < datetime('now', ?) ORDER BY id LIMIT ?",
+        )
+        .bind(&cutoff)
+        .bind(BATCH)
+        .fetch_all(pool)
+        .await?;
+        let reqs = self.delete_requests(&req_ids).await?;
+
+        let scan_uids: Vec<String> = sqlx::query_scalar(
+            "SELECT uid FROM scans
+             WHERE COALESCE(finished_at, started_at) < datetime('now', ?)
+             ORDER BY id LIMIT ?",
+        )
+        .bind(&cutoff)
+        .bind(BATCH)
+        .fetch_all(pool)
+        .await?;
+        let scans = scan_uids.len() as u64;
+        let records: Vec<_> = scan_uids
+            .into_iter()
+            .map(|uid| Self::tomb(TombTarget::Scan { uid }))
+            .collect();
+        for chunk in records.chunks(TOMB_CHUNK) {
+            self.write(chunk.to_vec()).await?;
+        }
+        Ok((reqs, scans))
+    }
 }

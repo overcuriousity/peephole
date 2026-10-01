@@ -234,4 +234,39 @@ mod tests {
         assert!(s.delete_claim(cid).await.unwrap());
         assert!(!s.delete_claim(cid).await.unwrap());
     }
+
+    #[tokio::test]
+    async fn retention_prunes_old_requests_and_scans() {
+        let (s, _a, _b) = seeded().await;
+        // Age everything past the window.
+        sqlx::query("UPDATE requests SET ts = datetime('now','-100 days')")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE scans SET finished_at = datetime('now','-100 days')")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let (reqs, scans) = s.local().prune_older_than(90).await.unwrap();
+        assert_eq!(reqs, 2);
+        assert_eq!(scans, 2);
+        let rc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        let sc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scans")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 0, "old requests pruned");
+        assert_eq!(sc, 0, "old scans pruned");
+        // Claims and fingerprints of pruned requests are gone too.
+        let fc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fingerprints")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(fc, 0);
+        // Disabled retention is a no-op.
+        assert_eq!(s.local().prune_older_than(0).await.unwrap(), (0, 0));
+    }
 }

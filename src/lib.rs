@@ -123,6 +123,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         shutdown_rx.clone(),
     ));
 
+    // Retention: prune requests and scan results older than the configured
+    // window so the database does not grow without bound.
+    tokio::spawn(run_retention(
+        recorder.clone(),
+        cfg.scan.retention_days,
+        shutdown_rx.clone(),
+    ));
+
     // Queue change notifications: trap + workers publish, admin SSE subscribes.
     let notifier = events::Notifier::new();
 
@@ -212,6 +220,46 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     }
     let _ = shutdown_tx.send(true);
     Ok(())
+}
+
+/// Daily retention sweep. Runs an initial pass shortly after start, then once
+/// a day, draining any backlog in bounded batches. `days == 0` disables it.
+async fn run_retention(
+    recorder: store::recorder::Recorder,
+    days: u32,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    if days == 0 {
+        return;
+    }
+    // Small initial delay so startup is not competing with the first sweep.
+    let mut first = std::time::Duration::from_secs(300);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(first) => {}
+            _ = shutdown.changed() => break,
+        }
+        first = std::time::Duration::from_secs(24 * 3600);
+        // Drain in batches until a pass removes nothing.
+        loop {
+            match recorder.prune_older_than(days).await {
+                Ok((0, 0)) => break,
+                Ok((r, s)) => {
+                    info!(requests = r, scans = s, "retention: pruned old records");
+                    if r == 0 && s == 0 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(?e, "retention sweep failed");
+                    break;
+                }
+            }
+            if *shutdown.borrow() {
+                break;
+            }
+        }
+    }
 }
 
 /// Serve the public trap listener with slowloris protection: a per-connection

@@ -158,6 +158,14 @@ fn parse_q(q: &str) -> IpQuery {
     IpQuery::Invalid
 }
 
+/// Escape SQL LIKE metacharacters so user text matches literally under
+/// `LIKE ? ESCAPE '\'`. Escapes the backslash itself first.
+pub(crate) fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// LIKE prefix that bounds a CIDR's candidates before exact filtering in Rust.
 fn net_like_prefix(net: &IpNet) -> String {
     match net {
@@ -317,13 +325,17 @@ fn request_filter_sql(f: &RequestFilter, a: Audience) -> (String, Vec<String>) {
         binds.push(canonical_ip(&v));
     }
     if let Some(v) = nonempty(&f.path) {
+        // Escape LIKE wildcards so a path containing % or _ (both common in
+        // scanner traffic, e.g. _vti_bin) matches literally — otherwise the
+        // listing, its count, and "delete all matching" cover a broader set.
+        let pat = format!("%{}%", like_escape(&v));
         if a == Audience::Admin {
-            sql.push_str(" AND (r.path LIKE ? OR r.query LIKE ?)");
-            binds.push(format!("%{v}%"));
+            sql.push_str(" AND (r.path LIKE ? ESCAPE '\\' OR r.query LIKE ? ESCAPE '\\')");
+            binds.push(pat.clone());
         } else {
-            sql.push_str(" AND r.path LIKE ?");
+            sql.push_str(" AND r.path LIKE ? ESCAPE '\\'");
         }
-        binds.push(format!("%{v}%"));
+        binds.push(pat);
     }
     if let Some(v) = nonempty(&f.label) {
         sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(r.labels_json) je WHERE je.value = ?)");
