@@ -788,6 +788,7 @@ mod tests {
                 key_path: None,
                 takeover_hours: 6.0,
                 lease_secs: 120,
+                remote_config: false,
                 peers: vec![],
             },
             roles: Default::default(),
@@ -808,6 +809,7 @@ mod tests {
                 roles: vec![],
                 proto_min: 1,
                 proto_max: 1,
+                remote_config: false,
             })
         };
         // A parked entry from an unknown origin counts as held.

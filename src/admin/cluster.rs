@@ -548,8 +548,19 @@ async fn set_pace(
         }
         r
     } else {
-        match crate::scan::pace::set_remote(node, id, p).await {
-            Ok(r) => r,
+        let changes = crate::settings::Changes {
+            max_workers: Some(w as u32),
+            max_scans_per_hour: Some(h),
+            timeout_secs: Some(p.timeout_secs),
+            ..Default::default()
+        };
+        match crate::cluster::confkey::get(node, id).await {
+            Ok(state) => {
+                match crate::cluster::confkey::set(node, id, state.version, &changes).await {
+                    Ok(r) => r.map(|_| ()),
+                    Err(e) => Err(format!("{e:#}")),
+                }
+            }
             Err(e) => Err(format!("{e:#}")),
         }
     };

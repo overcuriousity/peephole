@@ -54,6 +54,7 @@ struct TestNode {
     dir: tempfile::TempDir,
     _stop: tokio::sync::watch::Sender<bool>,
     pace: peephole::scan::pace::SharedPace,
+    settings: peephole::settings::Settings,
     workers: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -83,6 +84,8 @@ struct Opts {
     /// Run scan workers with this fake nmap.
     scanner: Option<std::path::PathBuf>,
     workers: usize,
+    /// Let config key holders change this node's settings.
+    remote_config: bool,
 }
 
 const DEFAULT: Opts = Opts {
@@ -93,6 +96,7 @@ const DEFAULT: Opts = Opts {
     never_scan: vec![],
     scanner: None,
     workers: 1,
+    remote_config: false,
 };
 
 async fn boot(identity: Identity, me: &Addr, peers: &[&Addr], o: Opts) -> TestNode {
@@ -116,6 +120,7 @@ async fn boot_in(
         key_path: None,
         takeover_hours: o.takeover_hours,
         lease_secs: o.lease_secs,
+        remote_config: o.remote_config,
         peers: peers
             .iter()
             .map(|p| PeerConfig {
@@ -154,8 +159,18 @@ async fn boot_in(
         max_scans_per_hour: 3600,
         timeout_secs: 60,
     });
+    let settings = peephole::settings::Settings::with_pace(
+        node.store.clone(),
+        &scan_config(&o.never_scan),
+        pace.clone(),
+    );
+    if o.remote_config {
+        cluster::confkey::ensure(&node.store, node.id())
+            .await
+            .unwrap();
+    }
+    cluster::confkey::serve(&node, settings.clone());
     let workers = o.scanner.as_ref().map(|nmap| {
-        peephole::scan::pace::serve_remote(&node, pace.clone());
         tokio::spawn(peephole::scan::arbiter::takeover_loop(
             node.clone(),
             rx.clone(),
@@ -175,6 +190,7 @@ async fn boot_in(
         dir,
         _stop: tx,
         pace,
+        settings,
         workers,
     }
 }
@@ -347,6 +363,7 @@ async fn outbound_only_member_syncs_both_ways() {
         roles: vec![],
         proto_min: 0,
         proto_max: 0,
+        remote_config: false,
     });
     repl::append(&na, &[rec]).await.unwrap();
     eventually("c sees a's newest record", || async {
@@ -529,6 +546,7 @@ async fn entries_of_a_departed_member_still_apply() {
         roles: vec![],
         proto_min: 2,
         proto_max: 2,
+        remote_config: false,
     };
     let entries = vec![
         WireEntry::sign(&a_id, 1, 10, &Record::MemberUpdate(info("a"))).unwrap(),
@@ -568,6 +586,7 @@ async fn members_silent_for_30_days_are_pruned_and_revive_with_a_sign_of_life() 
         roles: vec![],
         proto_min: 2,
         proto_max: 2,
+        remote_config: false,
     };
     // A admitted B 40 days ago; B described itself then and went silent.
     let st = repl::apply_batch(
@@ -657,6 +676,7 @@ async fn a_node_offline_for_over_30_days_starts_detached() {
                 key_path: None,
                 takeover_hours: 6.0,
                 lease_secs: 120,
+                remote_config: false,
                 peers: vec![PeerConfig {
                     name: "a".into(),
                     address: a.address(),
@@ -761,6 +781,7 @@ async fn a_future_dated_admission_cannot_keep_a_node_from_leaving() {
         roles: vec![],
         proto_min: 2,
         proto_max: 2,
+        remote_config: false,
     };
     let far = hlc_days_ago(0, 1) + ((400u64 * 24 * 3600 * 1000) << 16);
     repl::apply_batch(
@@ -868,6 +889,7 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
             key_path: None,
             takeover_hours: 6.0,
             lease_secs: 120,
+            remote_config: false,
             peers: vec![PeerConfig {
                 name: "a".into(),
                 address: "127.0.0.1:1".into(),
@@ -891,6 +913,7 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
         roles: vec![],
         proto_min: 1,
         proto_max: 1,
+        remote_config: false,
     };
     // Forgery: b signs an entry claiming to come from a.
     let mut forged =
@@ -1080,6 +1103,7 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
             key_path: None,
             takeover_hours: 6.0,
             lease_secs: 120,
+            remote_config: false,
             peers: peers
                 .iter()
                 .map(|p| PeerConfig {
@@ -1991,63 +2015,126 @@ async fn outbound_only_scanner_drains_the_queue() {
     .await;
 }
 
-/// A web node changes a headless scanner's pace; it is applied, persisted
-/// there and visible in the scanner's heartbeat.
+/// A config key holder changes another node's settings; nobody else can.
 #[tokio::test]
-async fn pace_is_set_remotely() {
-    let tools = tempfile::tempdir().unwrap();
-    let nmap = fake_nmap(tools.path(), 0.1);
+async fn config_key_holders_change_a_nodes_settings() {
+    use peephole::cluster::confkey;
+    use peephole::settings::Changes;
     let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
     let (ic, c) = new_node("c");
-    let na = boot(ia, &a, &[&c], DEFAULT).await;
-    let nc = boot(
-        ic,
-        &c,
-        &[&a],
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a, &c],
         Opts {
-            scanner: Some(nmap),
+            remote_config: true,
             ..DEFAULT
         },
     )
     .await;
-    let new = peephole::scan::pace::Pace {
-        max_workers: 3,
-        max_scans_per_hour: 42,
-        timeout_secs: 600,
-    };
-    peephole::scan::pace::set_remote(&na.node, c.id, new)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(nc.pace.get(), new);
-    let saved = nc
-        .store
-        .setting_get("scan.max_scans_per_hour")
-        .await
-        .unwrap();
-    assert_eq!(saved.as_deref(), Some("42"));
-    // Invalid values are refused by the scanner, which keeps its pace.
-    let bad = peephole::scan::pace::Pace {
-        max_workers: 999,
-        ..new
-    };
-    assert!(
-        peephole::scan::pace::set_remote(&na.node, c.id, bad)
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    eventually("a sees that b is open", || async {
+        members::all(&na.store)
             .await
             .unwrap()
-            .is_err()
-    );
-    assert_eq!(nc.pace.get(), new);
-    eventually_for(Duration::from_secs(40), "a sees c's new pace", || async {
-        na.status
-            .known(&c.id)
-            .and_then(|k| k.hb.pace)
-            .is_some_and(|p| p.max_scans_per_hour == 42)
+            .iter()
+            .any(|m| m.id == b.id && m.remote_config)
     })
     .await;
-}
 
-// --------------------------------------------------------------- intel
+    // Anyone may look.
+    let state = confkey::get(&na.node, b.id).await.unwrap();
+    assert!(state.open);
+    assert_eq!(state.version, 0);
+    let faster = Changes {
+        max_scans_per_hour: Some(77),
+        ..Default::default()
+    };
+
+    // Without the key: refused, before any message is sent.
+    let e = confkey::set(&na.node, b.id, 0, &faster)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("no config key"), "{e}");
+
+    // B's operator hands A the key.
+    let key = confkey::own(&nb.store, b.id).await.unwrap().unwrap();
+    assert_eq!(
+        confkey::add(&na.store, a.id, &key.encode()).await.unwrap(),
+        b.id
+    );
+    assert_eq!(
+        confkey::set(&na.node, b.id, 0, &faster).await.unwrap(),
+        Ok(1)
+    );
+    assert_eq!(nb.pace.get().max_scans_per_hour, 77);
+    let audit = nb.settings.audit(10).await.unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].by, Some(a.id));
+
+    // A stale version (a second editor, or a replay) changes nothing.
+    let e = confkey::set(&na.node, b.id, 0, &faster)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("changed meanwhile"), "{e}");
+
+    // Invalid values are refused by the same rules as locally.
+    let e = confkey::set(
+        &na.node,
+        b.id,
+        1,
+        &Changes {
+            listener: Some(false),
+            scanner: Some(false),
+            web: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(e.contains("at least one role"), "{e}");
+
+    // C holds a wrong key for B.
+    let wrong = confkey::ConfigKey {
+        id: b.id,
+        key: [0u8; 32],
+    };
+    confkey::add(&nc.store, c.id, &wrong.encode())
+        .await
+        .unwrap();
+    let e = confkey::set(&nc.node, b.id, 1, &faster)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("not accepted"), "{e}");
+
+    // Rotation cuts A off.
+    confkey::rotate(&nb.store, b.id).await.unwrap();
+    let e = confkey::set(&na.node, b.id, 1, &faster)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("not accepted"), "{e}");
+    assert_eq!(nb.settings.snapshot().version, 1);
+
+    // A locked node refuses even a correct key.
+    confkey::ensure(&na.store, a.id).await.unwrap();
+    let a_key = confkey::own(&na.store, a.id).await.unwrap().unwrap();
+    confkey::add(&nb.store, b.id, &a_key.encode())
+        .await
+        .unwrap();
+    assert!(!confkey::get(&nb.node, a.id).await.unwrap().open);
+    let e = confkey::set(&nb.node, a.id, 0, &faster)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("switched off"), "{e}");
+}
 
 use peephole::intel::share;
 
@@ -2253,7 +2340,11 @@ async fn admin_cluster_page_and_private_attribution() {
         .await
         .unwrap();
     assert!(r.status().is_success());
-    assert_eq!(nb.pace.get().max_scans_per_hour, 77);
+    assert_ne!(
+        nb.pace.get().max_scans_per_hour,
+        77,
+        "no config key: the pace of another node cannot be changed"
+    );
     // Invites are shown once.
     let r = admin
         .post(format!("{base}/admin/cluster/invite"))

@@ -67,6 +67,11 @@ pub async fn check_config(
             )),
             Err(e) => return Err(e.context("node key")),
         }
+        summary.push_str(if cfg.cluster.as_ref().is_some_and(|c| c.remote_config) {
+            "\nremote config: on (config key holders may change runtime settings)"
+        } else {
+            "\nremote config: off"
+        });
         if cfg.scan.retention_days > 0 {
             summary.push_str(
                 "\nnote: scan.retention_days is ignored in a cluster (the shared dataset is persistent)",
@@ -159,14 +164,16 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let settings =
         settings::Settings::load(&store, &cfg, settings::Prereqs::from_config(&cfg, nmap_ok))
             .await?;
-    let pace = settings.pace.clone();
 
     // Distributed mode: job arbiter (answers scanners' claims), remote pace
     // changes and takeover of silent arbiters' queues (scanners), then the
     // RPC listener and sync loops.
     if let Some(node) = &node {
         scan::arbiter::Arbiter::start(node.clone(), shutdown_rx.clone()).await?;
-        scan::pace::serve_remote(node, pace.clone());
+        if cfg.cluster.as_ref().is_some_and(|c| c.remote_config) {
+            cluster::confkey::ensure(&store, node.id()).await?;
+        }
+        cluster::confkey::serve(node, settings.clone());
         // Does nothing unless this node currently scans.
         tokio::spawn(scan::arbiter::takeover_loop(
             node.clone(),

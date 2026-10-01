@@ -547,6 +547,7 @@ mod tests {
                 key_path: None,
                 takeover_hours: 6.0,
                 lease_secs: 120,
+                remote_config: false,
                 peers: vec![],
             },
             roles: Default::default(),

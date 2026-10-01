@@ -88,6 +88,8 @@ pub struct MemberRow {
     pub info_hlc: u64,
     /// HLC of the newest log entry this member signed (0: none held).
     pub last_entry_hlc: u64,
+    /// The member lets config key holders change its runtime settings.
+    pub remote_config: bool,
 }
 
 type Row = (
@@ -101,18 +103,19 @@ type Row = (
     i64,
     i64,
     Option<i64>,
+    i64,
     Option<i64>,
 );
 
 const SELECT: &str = "SELECT id, name, address, roles_json, proto_min, proto_max,
-                             sponsor, info_hlc, admitted_hlc, revoked_hlc,
+                             sponsor, info_hlc, admitted_hlc, revoked_hlc, remote_config,
                              (SELECT l.hlc FROM repl_log l
                               WHERE l.origin = members.id AND l.sig IS NOT NULL
                               ORDER BY l.seq DESC LIMIT 1)
                       FROM members";
 
 fn from_row(r: Row, now_ms: u64) -> Result<MemberRow> {
-    let last_entry_hlc = r.10.unwrap_or(0) as u64;
+    let last_entry_hlc = r.11.unwrap_or(0) as u64;
     let standing = standing(r.8 as u64, r.9.map(|v| v as u64), last_entry_hlc, now_ms);
     Ok(MemberRow {
         id: NodeId::from_slice(&r.0)?,
@@ -126,6 +129,7 @@ fn from_row(r: Row, now_ms: u64) -> Result<MemberRow> {
         active: standing == Standing::Active,
         standing,
         last_entry_hlc,
+        remote_config: r.10 != 0,
     })
 }
 
@@ -153,13 +157,14 @@ async fn get(conn: &mut SqliteConnection, id: &NodeId) -> Result<Option<MemberRo
 async fn write_info(conn: &mut SqliteConnection, info: &MemberInfo, info_hlc: u64) -> Result<()> {
     sqlx::query(
         "UPDATE members SET name = ?, address = ?, roles_json = ?,
-                proto_min = ?, proto_max = ?, info_hlc = ? WHERE id = ?",
+                proto_min = ?, proto_max = ?, remote_config = ?, info_hlc = ? WHERE id = ?",
     )
     .bind(&info.name)
     .bind(&info.address)
     .bind(serde_json::to_string(&info.roles)?)
     .bind(info.proto_min as i64)
     .bind(info.proto_max as i64)
+    .bind(info.remote_config)
     .bind(info_hlc as i64)
     .bind(&info.id.0[..])
     .execute(&mut *conn)
@@ -176,8 +181,8 @@ async fn insert(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO members (id, name, address, roles_json, proto_min, proto_max,
-                              sponsor, info_hlc, admitted_hlc)
-         VALUES (?,?,?,?,?,?,?,?,?)",
+                              remote_config, sponsor, info_hlc, admitted_hlc)
+         VALUES (?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&info.id.0[..])
     .bind(&info.name)
@@ -185,6 +190,7 @@ async fn insert(
     .bind(serde_json::to_string(&info.roles)?)
     .bind(info.proto_min as i64)
     .bind(info.proto_max as i64)
+    .bind(info.remote_config)
     .bind(&sponsor.0[..])
     .bind(info_hlc as i64)
     .bind(admitted_hlc as i64)

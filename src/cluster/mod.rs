@@ -3,6 +3,7 @@
 pub mod adopt;
 pub mod block;
 pub mod cli;
+pub mod confkey;
 pub mod hlc;
 pub mod identity;
 pub mod invite;
@@ -299,6 +300,7 @@ impl Node {
                 .collect(),
             proto_min: self.proto.0,
             proto_max: self.proto.1,
+            remote_config: self.cfg.remote_config,
         }
     }
 
@@ -314,6 +316,7 @@ impl Node {
                 && m.name == mine.name
                 && m.address == mine.address
                 && m.roles == mine.roles
+                && m.remote_config == mine.remote_config
                 && (m.proto_min, m.proto_max) == (mine.proto_min, mine.proto_max)
         });
         let mut records = vec![];
@@ -330,6 +333,7 @@ impl Node {
                     roles: vec![],
                     proto_min: 0,
                     proto_max: 0,
+                    remote_config: false,
                 })),
                 Some(m) if !m.active => warn!(
                     peer = %p.name,

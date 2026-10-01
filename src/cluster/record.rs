@@ -19,6 +19,9 @@ pub struct MemberInfo {
     pub roles: Vec<String>,
     pub proto_min: u32,
     pub proto_max: u32,
+    /// Whether the node lets config key holders change its runtime settings.
+    #[serde(default)]
+    pub remote_config: bool,
 }
 
 /// A request caught by a trap listener. Timestamps everywhere are UTC
@@ -330,6 +333,7 @@ mod tests {
             roles: vec!["listener".into()],
             proto_min: 1,
             proto_max: 1,
+            remote_config: false,
         }
     }
 
