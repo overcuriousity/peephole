@@ -51,7 +51,9 @@ steps_in_order() {
     local log="$1" prev=0 n; shift
     for s in "$@"; do
         n="$(step_line "$s" "$log")"
-        [ -n "$n" ] && [ "$n" -gt "$prev" ] || { echo "nginx step '$s' missing or out of order"; cat "$log"; exit 1; }
+        if [ -z "$n" ] || [ "$n" -le "$prev" ]; then
+            echo "nginx step '$s' missing or out of order"; cat "$log"; exit 1
+        fi
         prev="$n"
     done
 }
