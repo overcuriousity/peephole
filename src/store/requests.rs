@@ -51,14 +51,33 @@ pub struct RequestRow {
 impl Store {
     pub async fn upsert_ip(&self, ip: IpAddr) -> Result<IpRow> {
         let s = ip.to_string();
-        sqlx::query(
-            "INSERT INTO ips (ip, first_seen, last_seen) VALUES (?, datetime('now'), datetime('now'))
-             ON CONFLICT(ip) DO UPDATE SET last_seen = datetime('now')",
-        ).bind(&s).execute(&self.pool).await?;
-        Ok(sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE ip = ?")
+        // One transaction: a result applied between the insert and the
+        // refresh would otherwise be overwritten by a stale view.
+        let mut conn = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let created = sqlx::query(
+            "INSERT OR IGNORE INTO ips (ip, first_seen, last_seen)
+             VALUES (?, datetime('now'), datetime('now'))",
+        )
+        .bind(&s)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected()
+            == 1;
+        if created {
+            // Results may have arrived before the IP did.
+            super::data::refresh_ip_view(&mut conn, &s).await?;
+        } else {
+            sqlx::query("UPDATE ips SET last_seen = datetime('now') WHERE ip = ?")
+                .bind(&s)
+                .execute(&mut *conn)
+                .await?;
+        }
+        let row = sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE ip = ?")
             .bind(&s)
-            .fetch_one(&self.pool)
-            .await?)
+            .fetch_one(&mut *conn)
+            .await?;
+        conn.commit().await?;
+        Ok(row)
     }
 
     pub async fn ip_by_id(&self, id: i64) -> Result<Option<IpRow>> {
@@ -68,7 +87,7 @@ impl Store {
             .await?)
     }
 
-    /// Set an IP's GeoIP facts (keeps its Tor flag).
+    /// Set an IP's GeoIP facts (this node's MaxMind result; Tor is untouched).
     pub async fn set_ip_geo(
         &self,
         ip_id: i64,
@@ -76,13 +95,30 @@ impl Store {
         asn: Option<u32>,
         asn_org: Option<&str>,
     ) -> Result<()> {
-        let tor: Option<bool> = sqlx::query_scalar("SELECT is_tor_exit FROM ips WHERE id = ?")
-            .bind(ip_id)
-            .fetch_optional(&self.pool)
-            .await?;
         self.local()
-            .enrich_ip(ip_id, country, asn, asn_org, tor.unwrap_or(false))
+            .record_geo(ip_id, None, country, asn, asn_org)
             .await
+    }
+
+    /// IPs first seen at least `older_than_secs` ago that have no result
+    /// from `provider`, oldest first.
+    pub async fn ips_missing_intel(
+        &self,
+        provider: &str,
+        older_than_secs: i64,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT i.ip FROM ips i
+             WHERE i.first_seen <= datetime('now', ?)
+               AND NOT EXISTS (SELECT 1 FROM ip_intel t WHERE t.ip = i.ip AND t.provider = ?)
+             ORDER BY i.id LIMIT ?",
+        )
+        .bind(format!("-{older_than_secs} seconds"))
+        .bind(provider)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// `(id, ip, country)` for IPs whose country is not an ISO alpha-2 code.
@@ -94,18 +130,9 @@ impl Store {
         .await?)
     }
 
+    /// Set an IP's Tor flag (this node's Tor result; GeoIP is untouched).
     pub async fn set_ip_tor(&self, ip_id: i64, is_tor: bool) -> Result<()> {
-        let row = self.ip_by_id(ip_id).await?;
-        let Some(r) = row else { return Ok(()) };
-        self.local()
-            .enrich_ip(
-                ip_id,
-                r.country.as_deref(),
-                r.asn.map(|a| a as u32),
-                r.asn_org.as_deref(),
-                is_tor,
-            )
-            .await
+        self.local().record_tor(ip_id, is_tor).await
     }
 
     pub async fn insert_request(&self, n: &NewRequest) -> Result<i64> {
@@ -156,6 +183,63 @@ mod tests {
         assert_eq!(a.id, b.id);
         assert_eq!(a.ip, "203.0.113.7");
         assert!(!a.is_tor_exit);
+    }
+
+    #[tokio::test]
+    async fn a_result_stored_before_the_ip_shows_once_the_trap_sees_it() {
+        let s = test_store().await;
+        s.local()
+            .record_intel(
+                "203.0.113.8",
+                crate::intel::MAXMIND,
+                None,
+                serde_json::json!({"country": "NL"}),
+            )
+            .await
+            .unwrap();
+        let ip = s.upsert_ip("203.0.113.8".parse().unwrap()).await.unwrap();
+        assert_eq!(ip.country.as_deref(), Some("NL"));
+        s.insert_request(&NewRequest {
+            ip_id: ip.id,
+            method: "GET".into(),
+            path: "/".into(),
+            query: None,
+            headers_json: "[]".into(),
+            body: None,
+            labels_json: "[]".into(),
+            severity: 0,
+            scan_level: 0,
+            is_fp_claim: false,
+            page_token: None,
+        })
+        .await
+        .unwrap();
+        let row = s.ip_by_id(ip.id).await.unwrap().unwrap();
+        assert_eq!(row.country.as_deref(), Some("NL"));
+    }
+
+    #[tokio::test]
+    async fn a_migrated_result_that_says_the_same_is_not_written_again() {
+        let s = test_store().await;
+        let ip = s.upsert_ip("203.0.113.9".parse().unwrap()).await.unwrap();
+        // As migration 0017 leaves it: explicit nulls, hlc 0.
+        sqlx::query(
+            "INSERT INTO ip_intel (ip, provider, origin, hlc, fetched_at, source_version, data_json)
+             VALUES ('203.0.113.9', 'maxmind-geolite2', x'', 0, '2026-01-01 00:00:00', NULL,
+                     '{\"country\":\"DE\",\"asn\":null,\"asn_org\":null}')",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        s.set_ip_geo(ip.id, Some("DE"), None, None).await.unwrap();
+        let hlc: i64 = sqlx::query_scalar("SELECT hlc FROM ip_intel")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(hlc, 0, "same facts: nothing written");
+        s.set_ip_geo(ip.id, Some("NL"), None, None).await.unwrap();
+        let row = s.ip_by_id(ip.id).await.unwrap().unwrap();
+        assert_eq!(row.country.as_deref(), Some("NL"));
     }
 
     #[tokio::test]

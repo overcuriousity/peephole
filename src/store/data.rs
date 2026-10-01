@@ -3,13 +3,13 @@
 //! directly on a standalone node, through the replication log in a cluster
 //! — so both modes share one set of semantics.
 //!
-//! Deletes are tombstones: they remove the rows, remember the deleted uids
-//! (and per-IP cut-offs), and records that arrive later for something
-//! already deleted are dropped instead of resurrecting it.
+//! Deletes are tombstones: they list the uids to remove, affect only records
+//! of the tombstone's own origin, and remember the deleted uids so a record
+//! that arrives later is dropped instead of resurrecting.
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{
-    FingerprintRec, FpClaimRec, IntelManifestRec, IpEnrichRec, JobAdoptRec, JobStatusRec, PortRec,
-    Record, RequestRec, ScanJobRec, ScanResultRec, TombTarget, TombstoneRec,
+    FingerprintRec, FpClaimRec, IntelManifestRec, IpIntelRec, JobAdoptRec, JobStatusRec, PortRec,
+    ROW_BACKED, Record, RequestRec, ScanJobRec, ScanResultRec, TombstoneRec,
 };
 use anyhow::Result;
 use sqlx::SqliteConnection;
@@ -61,9 +61,20 @@ pub fn new_uid() -> String {
 }
 
 pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Result<Effect> {
+    // Hides and blocks only exist in a cluster.
+    if ctx.origin.is_some() && CONTENT_KINDS.contains(&r.kind()) {
+        if origin_blocked(conn, ctx.origin).await? {
+            return Ok(Effect::Ignored);
+        }
+        if let Some(uid) = r.uid()
+            && suppressed(conn, &uid).await?
+        {
+            return Ok(Effect::Ignored);
+        }
+    }
     match r {
         Record::Request(r) => request(conn, ctx, r).await,
-        Record::IpEnrich(r) => ip_enrich(conn, ctx, r).await,
+        Record::IpIntel(r) => ip_intel(conn, ctx, r).await,
         Record::FpClaim(r) => fp_claim(conn, ctx, r).await,
         Record::Fingerprint(r) => fingerprint(conn, ctx, r).await,
         Record::ScanJob(r) => scan_job(conn, ctx, r).await,
@@ -78,34 +89,80 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
     }
 }
 
-/// The tombstone that already deleted this record, if any.
-async fn erased_by(
-    conn: &mut SqliteConnection,
-    uids: &[Option<&str>],
-    ip: &str,
-    hlc: u64,
-) -> Result<Option<String>> {
-    for uid in uids.iter().flatten() {
-        let t: Option<String> =
-            sqlx::query_scalar("SELECT tombstone_uid FROM tombstoned WHERE uid = ?")
-                .bind(uid)
-                .fetch_optional(&mut *conn)
-                .await?;
-        if t.is_some() {
-            return Ok(t);
+/// Record kinds a local hide or block keeps out of the tables. Membership,
+/// tombstones and scan-job state still apply, so the cluster stays in step.
+const CONTENT_KINDS: [&str; 6] = [
+    "request",
+    "fingerprint",
+    "fp_claim",
+    "scan_job",
+    "scan_result",
+    "ip_intel",
+];
+
+async fn origin_blocked(conn: &mut SqliteConnection, origin: Option<&NodeId>) -> Result<bool> {
+    let Some(o) = origin else { return Ok(false) };
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blocked_peers WHERE id = ?")
+        .bind(&o.0[..])
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(n > 0)
+}
+
+/// Whether `uid` is kept out of the tables locally: hidden by an admin, or
+/// created by a blocked node.
+async fn suppressed(conn: &mut SqliteConnection, uid: &str) -> Result<bool> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM hidden WHERE uid = ?1)
+             OR EXISTS(SELECT 1 FROM repl_log l JOIN blocked_peers b ON b.id = l.origin
+                       WHERE l.uid = ?1)",
+    )
+    .bind(uid)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(n > 0)
+}
+
+/// Whether a parent row that is missing is gone for good (deleted, hidden or
+/// blocked) rather than not replicated yet.
+async fn gone(conn: &mut SqliteConnection, uid: &str) -> Result<bool> {
+    Ok(is_tombstoned(conn, uid).await? || suppressed(conn, uid).await?)
+}
+
+/// Local delete of records other nodes created: they leave this node's
+/// tables for good and stay in its log. Returns how many were hidden.
+pub async fn hide(conn: &mut SqliteConnection, uids: &[String]) -> Result<u64> {
+    let mut n = 0;
+    for uid in uids {
+        let kind: Option<String> = sqlx::query_scalar(
+            "SELECT kind FROM repl_log WHERE uid = ? AND kind != 'tombstone' LIMIT 1",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(kind) = kind else { continue };
+        sqlx::query("INSERT OR IGNORE INTO hidden (uid, hidden_at) VALUES (?, datetime('now'))")
+            .bind(uid)
+            .execute(&mut *conn)
+            .await?;
+        if let Some(ip_id) = unmaterialize(conn, &kind, uid).await? {
+            drop_orphan_ip(conn, ip_id).await?;
+            n += 1;
         }
     }
+    Ok(n)
+}
+
+/// The tombstone that already deleted this record, if any.
+async fn erased_by(conn: &mut SqliteConnection, uid: &str) -> Result<Option<String>> {
     Ok(
-        sqlx::query_scalar("SELECT tombstone_uid FROM ip_tombstones WHERE ip = ? AND hlc >= ?")
-            .bind(ip)
-            .bind(hlc as i64)
+        sqlx::query_scalar("SELECT tombstone_uid FROM tombstoned WHERE uid = ?")
+            .bind(uid)
             .fetch_optional(&mut *conn)
             .await?,
     )
 }
 
-/// `(hlc or id, country, asn, asn_org, tor)`: an IP's GeoIP / Tor facts.
-pub type IpFacts<K> = (K, Option<String>, Option<i64>, Option<String>, bool);
 /// `(port, proto, state, service, product, version)`.
 type PortRow = (
     i64,
@@ -147,37 +204,17 @@ async fn ensure_ip(conn: &mut SqliteConnection, ip: &str, seen: Option<&str>) ->
             .await?
             .last_insert_rowid(),
     };
-    // Enrichment that arrived before the IP's first record.
-    let pending: Option<IpFacts<i64>> = sqlx::query_as(
-        "SELECT hlc, country, asn, asn_org, tor FROM ip_enrich_pending WHERE ip = ?",
-    )
-    .bind(ip)
-    .fetch_optional(&mut *conn)
-    .await?;
-    if let Some((hlc, country, asn, asn_org, tor)) = pending {
-        sqlx::query(
-            "UPDATE ips SET country = ?, asn = ?, asn_org = ?, is_tor_exit = ?, geo_hlc = ?
-             WHERE id = ?",
-        )
-        .bind(country)
-        .bind(asn)
-        .bind(asn_org)
-        .bind(tor)
-        .bind(hlc)
-        .bind(id)
-        .execute(&mut *conn)
-        .await?;
-        sqlx::query("DELETE FROM ip_enrich_pending WHERE ip = ?")
-            .bind(ip)
-            .execute(&mut *conn)
-            .await?;
-    }
+    refresh_ip_view(conn, ip).await?;
     Ok(id)
 }
 
 async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> Result<Effect> {
-    if let Some(t) = erased_by(conn, &[Some(&r.uid)], &r.ip, ctx.hlc).await? {
+    if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
+    }
+    // A request always comes from an address; anything else is junk.
+    if r.ip.parse::<std::net::IpAddr>().is_err() {
+        return Ok(Effect::Ignored);
     }
     let ip_id = ensure_ip(conn, &r.ip, Some(&r.ts)).await?;
     sqlx::query(
@@ -205,48 +242,71 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     Ok(Effect::Applied)
 }
 
-async fn ip_enrich(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpEnrichRec) -> Result<Effect> {
-    if erased_by(conn, &[], &r.ip, ctx.hlc).await?.is_some() {
+/// Store one provider's result for an IP (per origin, newest wins) and
+/// bring the IP's shown facts up to date.
+async fn ip_intel(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpIntelRec) -> Result<Effect> {
+    // Only providers this version knows, so nobody pre-fills others.
+    if ![crate::intel::MAXMIND, crate::intel::TOR].contains(&r.provider.as_str()) {
         return Ok(Effect::Ignored);
     }
-    let n = sqlx::query(
-        "UPDATE ips SET country = ?, asn = ?, asn_org = ?, is_tor_exit = ?, geo_hlc = ?
-         WHERE ip = ? AND geo_hlc < ?",
+    sqlx::query(
+        "INSERT INTO ip_intel (ip, provider, origin, hlc, fetched_at, source_version, data_json)
+         VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(ip, provider, origin) DO UPDATE SET hlc = excluded.hlc,
+           fetched_at = excluded.fetched_at, source_version = excluded.source_version,
+           data_json = excluded.data_json
+         WHERE excluded.hlc > ip_intel.hlc",
     )
-    .bind(&r.country)
-    .bind(r.asn)
-    .bind(&r.asn_org)
-    .bind(r.tor)
-    .bind(ctx.hlc as i64)
     .bind(&r.ip)
+    .bind(&r.provider)
+    .bind(ctx.origin_bytes().unwrap_or_default())
     .bind(ctx.hlc as i64)
+    .bind(&r.fetched_at)
+    .bind(&r.source_version)
+    .bind(&r.data_json)
     .execute(&mut *conn)
-    .await?
-    .rows_affected();
-    if n == 0 {
-        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM ips WHERE ip = ?")
-            .bind(&r.ip)
-            .fetch_optional(&mut *conn)
-            .await?;
-        if exists.is_none() {
-            sqlx::query(
-                "INSERT INTO ip_enrich_pending (ip, hlc, country, asn, asn_org, tor)
-                 VALUES (?,?,?,?,?,?)
-                 ON CONFLICT(ip) DO UPDATE SET hlc = excluded.hlc, country = excluded.country,
-                   asn = excluded.asn, asn_org = excluded.asn_org, tor = excluded.tor
-                 WHERE excluded.hlc > ip_enrich_pending.hlc",
-            )
-            .bind(&r.ip)
-            .bind(ctx.hlc as i64)
-            .bind(&r.country)
-            .bind(r.asn)
-            .bind(&r.asn_org)
-            .bind(r.tor)
-            .execute(&mut *conn)
-            .await?;
-        }
-    }
+    .await?;
+    refresh_ip_view(conn, &r.ip).await?;
     Ok(Effect::Applied)
+}
+
+/// The newest result of `provider` for `ip`, as JSON (None: no result, or
+/// one that is not a JSON object).
+async fn newest_intel(
+    conn: &mut SqliteConnection,
+    ip: &str,
+    provider: &str,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT data_json FROM ip_intel WHERE ip = ? AND provider = ? ORDER BY hlc DESC, origin DESC LIMIT 1",
+    )
+    .bind(ip)
+    .bind(provider)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(raw
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+        .and_then(|v| v.as_object().cloned()))
+}
+
+/// Set the facts shown for an IP (country, ASN, Tor flag) from the newest
+/// result of each provider. Does nothing while the IP has no row yet.
+pub(crate) async fn refresh_ip_view(conn: &mut SqliteConnection, ip: &str) -> Result<()> {
+    let geo = newest_intel(conn, ip, crate::intel::MAXMIND)
+        .await?
+        .unwrap_or_default();
+    let tor = newest_intel(conn, ip, crate::intel::TOR)
+        .await?
+        .unwrap_or_default();
+    sqlx::query("UPDATE ips SET country = ?, asn = ?, asn_org = ?, is_tor_exit = ? WHERE ip = ?")
+        .bind(geo.get("country").and_then(|v| v.as_str()))
+        .bind(geo.get("asn").and_then(|v| v.as_i64()))
+        .bind(geo.get("asn_org").and_then(|v| v.as_str()))
+        .bind(tor.get("exit").and_then(|v| v.as_bool()).unwrap_or(false))
+        .bind(ip)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 async fn request_id(conn: &mut SqliteConnection, uid: &str) -> Result<Option<i64>> {
@@ -257,9 +317,10 @@ async fn request_id(conn: &mut SqliteConnection, uid: &str) -> Result<Option<i64
 }
 
 async fn fp_claim(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &FpClaimRec) -> Result<Effect> {
-    if let Some(t) = erased_by(conn, &[Some(&r.uid), Some(&r.request_uid)], &r.ip, ctx.hlc).await? {
+    if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
     }
+    // A claim on a request that is gone is not applied; it stays in the log.
     let Some(rid) = request_id(conn, &r.request_uid).await? else {
         return Ok(Effect::Ignored);
     };
@@ -292,14 +353,7 @@ async fn fingerprint(
     ctx: Ctx<'_>,
     r: &FingerprintRec,
 ) -> Result<Effect> {
-    if let Some(t) = erased_by(
-        conn,
-        &[Some(&r.uid), r.request_uid.as_deref()],
-        &r.ip,
-        ctx.hlc,
-    )
-    .await?
-    {
+    if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
     }
     let rid = match &r.request_uid {
@@ -330,7 +384,7 @@ async fn fingerprint(
 }
 
 async fn scan_job(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &ScanJobRec) -> Result<Effect> {
-    if let Some(t) = erased_by(conn, &[Some(&r.uid)], &r.ip, ctx.hlc).await? {
+    if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
     }
     let ip_id = ensure_ip(conn, &r.ip, None).await?;
@@ -357,9 +411,10 @@ async fn job_status(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &JobStatusRec)
             .fetch_optional(&mut *conn)
             .await?;
     let Some(arbiter) = arbiter else {
-        // No such job: deleted → drop; otherwise it has not replicated here
-        // yet → defer so the status is applied once the job arrives.
-        return Ok(if is_tombstoned(conn, &r.job_uid).await? {
+        // No such job: deleted, hidden or blocked → drop; otherwise it has
+        // not replicated here yet → defer so the status is applied once the
+        // job arrives.
+        return Ok(if gone(conn, &r.job_uid).await? {
             Effect::Ignored
         } else {
             Effect::Deferred
@@ -427,7 +482,7 @@ async fn scan_result(
     ctx: Ctx<'_>,
     r: &ScanResultRec,
 ) -> Result<Effect> {
-    if let Some(t) = erased_by(conn, &[Some(&r.uid)], &r.ip, ctx.hlc).await? {
+    if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
     }
     let job_id: Option<i64> = sqlx::query_scalar("SELECT id FROM scan_jobs WHERE uid = ?")
@@ -436,8 +491,9 @@ async fn scan_result(
         .await?;
     let Some(job_id) = job_id else {
         // The scan job has not replicated here yet (cross-origin ordering):
-        // defer so the result is stored once it does, unless it was deleted.
-        return Ok(if is_tombstoned(conn, &r.job_uid).await? {
+        // defer so the result is stored once it does, unless the job is gone
+        // for good (deleted, hidden or blocked).
+        return Ok(if gone(conn, &r.job_uid).await? {
             Effect::Ignored
         } else {
             Effect::Deferred
@@ -489,6 +545,10 @@ async fn intel_manifest(
     ctx: Ctx<'_>,
     m: &IntelManifestRec,
 ) -> Result<Effect> {
+    // Only the public Tor exit list is shared as a file.
+    if crate::intel::share::file_name(&m.kind).is_none() {
+        return Ok(Effect::Ignored);
+    }
     sqlx::query(
         "INSERT INTO intel_files (kind, sha256, size, fetched_at, origin, hlc) VALUES (?,?,?,?,?,?)
          ON CONFLICT(kind) DO UPDATE SET sha256 = excluded.sha256, size = excluded.size,
@@ -565,145 +625,97 @@ async fn uids_where(
     Ok(out)
 }
 
+/// Delete the listed records, as far as the tombstone's origin created
+/// them. Records of other nodes that hang off a deleted one (a claim on a
+/// deleted request, a scan of a deleted job) are not this origin's to erase:
+/// they leave the tables, because their parent is gone, and stay in the log.
 async fn tombstone(conn: &mut SqliteConnection, ctx: Ctx<'_>, t: &TombstoneRec) -> Result<Effect> {
-    match &t.target {
-        TombTarget::Requests { uids } => {
-            let claims = uids_where(
-                conn,
-                "SELECT uid FROM fp_claims WHERE request_uid IN ({})",
-                uids,
-            )
-            .await?;
-            let fps = uids_where(
-                conn,
-                "SELECT uid FROM fingerprints WHERE request_uid IN ({})",
-                uids,
-            )
-            .await?;
-            let all: Vec<String> = uids.iter().chain(&claims).chain(&fps).cloned().collect();
-            bury(conn, &all, &t.uid).await?;
-            for_uids(
-                conn,
-                "DELETE FROM fp_claims WHERE request_uid IN ({})",
-                uids,
-            )
-            .await?;
-            for_uids(
-                conn,
-                "DELETE FROM fingerprints WHERE request_uid IN ({})",
-                uids,
-            )
-            .await?;
-            for_uids(conn, "DELETE FROM requests WHERE uid IN ({})", uids).await?;
+    // Uids carry their origin's prefix, so a tombstone can only name
+    // records its own origin created. A standalone node created everything.
+    let own: Vec<String> = match ctx.origin {
+        Some(o) => {
+            let prefix = o.uid_prefix();
+            t.uids
+                .iter()
+                .filter(|u| u.starts_with(&prefix))
+                .cloned()
+                .collect()
         }
-        TombTarget::Scan { uid } => {
-            bury(conn, std::slice::from_ref(uid), &t.uid).await?;
-            sqlx::query("DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE uid = ?)")
-                .bind(uid)
-                .execute(&mut *conn)
-                .await?;
-            sqlx::query("DELETE FROM scans WHERE uid = ?")
-                .bind(uid)
-                .execute(&mut *conn)
-                .await?;
+        None => t.uids.clone(),
+    };
+    if own.is_empty() {
+        return Ok(Effect::Applied);
+    }
+    let mine: std::collections::HashSet<&str> = own.iter().map(String::as_str).collect();
+    let mut ips = std::collections::BTreeSet::new();
+    for table in [
+        "requests",
+        "fp_claims",
+        "fingerprints",
+        "scan_jobs",
+        "scans",
+    ] {
+        let sql = format!("SELECT DISTINCT ip_id FROM {table} WHERE uid IN ({{}})");
+        for chunk in own.chunks(400) {
+            let sql = sql.replace("{}", &placeholders(chunk.len()));
+            let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
+            for uid in chunk {
+                q = q.bind(uid);
+            }
+            ips.extend(q.fetch_all(&mut *conn).await?);
         }
-        TombTarget::Claim { uid } => {
-            bury(conn, std::slice::from_ref(uid), &t.uid).await?;
-            sqlx::query("DELETE FROM fp_claims WHERE uid = ?")
-                .bind(uid)
-                .execute(&mut *conn)
-                .await?;
-        }
-        TombTarget::Ip { ip } => tombstone_ip(conn, ctx, ip, &t.uid).await?,
+    }
+    // Dependents that are not part of this delete.
+    let claims = uids_where(
+        conn,
+        "SELECT uid FROM fp_claims WHERE request_uid IN ({})",
+        &own,
+    )
+    .await?;
+    for uid in claims.iter().filter(|u| !mine.contains(u.as_str())) {
+        unmaterialize(conn, "fp_claim", uid).await?;
+    }
+    let scans = uids_where(conn, "SELECT uid FROM scans WHERE job_uid IN ({})", &own).await?;
+    for uid in scans.iter().filter(|u| !mine.contains(u.as_str())) {
+        unmaterialize(conn, "scan_result", uid).await?;
+    }
+    for_uids(
+        conn,
+        "UPDATE fingerprints SET request_id = NULL WHERE request_uid IN ({})",
+        &own,
+    )
+    .await?;
+    bury(conn, &own, &t.uid).await?;
+    // Children before parents.
+    for_uids(
+        conn,
+        "DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE uid IN ({}))",
+        &own,
+    )
+    .await?;
+    for table in [
+        "scans",
+        "fp_claims",
+        "fingerprints",
+        "scan_jobs",
+        "requests",
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE uid IN ({{}})");
+        for_uids(conn, &sql, &own).await?;
+    }
+    for ip_id in ips {
+        drop_orphan_ip(conn, ip_id).await?;
     }
     Ok(Effect::Applied)
 }
 
-/// Uids of `table` rows for an IP recorded at or before `cut`.
-async fn uids_for_ip(
-    conn: &mut SqliteConnection,
-    table: &'static str,
-    ip_id: i64,
-    cut: i64,
-) -> Result<Vec<String>> {
-    let sql = format!("SELECT uid FROM {table} WHERE ip_id = ? AND COALESCE(hlc, 0) <= ?");
-    Ok(sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
+/// Remove an IP row once nothing refers to it any more.
+pub(crate) async fn drop_orphan_ip(conn: &mut SqliteConnection, ip_id: i64) -> Result<()> {
+    let ip: Option<String> = sqlx::query_scalar("SELECT ip FROM ips WHERE id = ?")
         .bind(ip_id)
-        .bind(cut)
-        .fetch_all(&mut *conn)
-        .await?)
-}
-
-/// Delete everything about `ip` recorded up to the tombstone's HLC. Rows
-/// that depend on deleted rows go too, whatever their HLC.
-async fn tombstone_ip(
-    conn: &mut SqliteConnection,
-    ctx: Ctx<'_>,
-    ip: &str,
-    tomb: &str,
-) -> Result<()> {
-    let cut = ctx.hlc as i64;
-    sqlx::query(
-        "INSERT INTO ip_tombstones (ip, hlc, tombstone_uid) VALUES (?,?,?)
-         ON CONFLICT(ip) DO UPDATE SET hlc = excluded.hlc, tombstone_uid = excluded.tombstone_uid
-         WHERE excluded.hlc > ip_tombstones.hlc",
-    )
-    .bind(ip)
-    .bind(cut)
-    .bind(tomb)
-    .execute(&mut *conn)
-    .await?;
-    sqlx::query("DELETE FROM ip_enrich_pending WHERE ip = ? AND hlc <= ?")
-        .bind(ip)
-        .bind(cut)
-        .execute(&mut *conn)
-        .await?;
-    let ip_id: Option<i64> = sqlx::query_scalar("SELECT id FROM ips WHERE ip = ?")
-        .bind(ip)
         .fetch_optional(&mut *conn)
         .await?;
-    let Some(ip_id) = ip_id else { return Ok(()) };
-    let reqs = uids_for_ip(conn, "requests", ip_id, cut).await?;
-    let jobs = uids_for_ip(conn, "scan_jobs", ip_id, cut).await?;
-    let mut claims = uids_for_ip(conn, "fp_claims", ip_id, cut).await?;
-    let mut fps = uids_for_ip(conn, "fingerprints", ip_id, cut).await?;
-    let mut scans = uids_for_ip(conn, "scans", ip_id, cut).await?;
-    claims.extend(
-        uids_where(
-            conn,
-            "SELECT uid FROM fp_claims WHERE request_uid IN ({})",
-            &reqs,
-        )
-        .await?,
-    );
-    fps.extend(
-        uids_where(
-            conn,
-            "SELECT uid FROM fingerprints WHERE request_uid IN ({})",
-            &reqs,
-        )
-        .await?,
-    );
-    scans.extend(uids_where(conn, "SELECT uid FROM scans WHERE job_uid IN ({})", &jobs).await?);
-    let all: Vec<String> = [&reqs, &jobs, &claims, &fps, &scans]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .collect();
-    bury(conn, &all, tomb).await?;
-    for_uids(
-        conn,
-        "DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE uid IN ({}))",
-        &scans,
-    )
-    .await?;
-    for_uids(conn, "DELETE FROM scans WHERE uid IN ({})", &scans).await?;
-    for_uids(conn, "DELETE FROM scan_jobs WHERE uid IN ({})", &jobs).await?;
-    for_uids(conn, "DELETE FROM fp_claims WHERE uid IN ({})", &claims).await?;
-    for_uids(conn, "DELETE FROM fingerprints WHERE uid IN ({})", &fps).await?;
-    for_uids(conn, "DELETE FROM requests WHERE uid IN ({})", &reqs).await?;
-    // The IP itself goes once nothing refers to it any more.
-    sqlx::query(
+    let dropped = sqlx::query(
         "DELETE FROM ips WHERE id = ?1
            AND NOT EXISTS (SELECT 1 FROM requests WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM scan_jobs WHERE ip_id = ?1)
@@ -713,8 +725,109 @@ async fn tombstone_ip(
     )
     .bind(ip_id)
     .execute(&mut *conn)
-    .await?;
+    .await?
+    .rows_affected();
+    // The IP's enrichment results go with it.
+    if dropped > 0
+        && let Some(ip) = ip
+    {
+        sqlx::query("DELETE FROM ip_intel WHERE ip = ?")
+            .bind(ip)
+            .execute(&mut *conn)
+            .await?;
+    }
     Ok(())
+}
+
+/// Put a row-backed record's payload back into its log entry, so the entry
+/// can be relayed without the row.
+async fn keep_payload(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Result<()> {
+    if !ROW_BACKED.contains(&kind) {
+        return Ok(());
+    }
+    if let Some(rec) = rebuild(conn, kind, uid).await? {
+        sqlx::query(
+            "UPDATE repl_log SET payload = ?
+             WHERE uid = ? AND kind = ? AND payload IS NULL AND erased_by IS NULL",
+        )
+        .bind(crate::cluster::rpc::cbor::encode(&rec)?)
+        .bind(uid)
+        .bind(kind)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Take a record out of the tables but keep it in the log with its payload,
+/// so this node still relays it. Children that cannot exist without it leave
+/// the tables the same way. Returns the row's IP id if there was a row.
+pub(crate) async fn unmaterialize(
+    conn: &mut SqliteConnection,
+    kind: &str,
+    uid: &str,
+) -> Result<Option<i64>> {
+    let table = match kind {
+        "request" => "requests",
+        "fp_claim" => "fp_claims",
+        "fingerprint" => "fingerprints",
+        "scan_job" => "scan_jobs",
+        "scan_result" => "scans",
+        _ => return Ok(None),
+    };
+    let sql = format!("SELECT ip_id FROM {table} WHERE uid = ?");
+    let ip_id: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(uid)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if ip_id.is_none() {
+        return Ok(None);
+    }
+    keep_payload(conn, kind, uid).await?;
+    match kind {
+        "request" => {
+            sqlx::query("DELETE FROM fp_claims WHERE request_uid = ?")
+                .bind(uid)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("UPDATE fingerprints SET request_id = NULL WHERE request_uid = ?")
+                .bind(uid)
+                .execute(&mut *conn)
+                .await?;
+        }
+        "scan_job" => {
+            let scans: Vec<String> = sqlx::query_scalar("SELECT uid FROM scans WHERE job_uid = ?")
+                .bind(uid)
+                .fetch_all(&mut *conn)
+                .await?;
+            for s in scans {
+                keep_payload(conn, "scan_result", &s).await?;
+                sqlx::query(
+                    "DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE uid = ?)",
+                )
+                .bind(&s)
+                .execute(&mut *conn)
+                .await?;
+                sqlx::query("DELETE FROM scans WHERE uid = ?")
+                    .bind(&s)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+        }
+        "scan_result" => {
+            sqlx::query("DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE uid = ?)")
+                .bind(uid)
+                .execute(&mut *conn)
+                .await?;
+        }
+        _ => {}
+    }
+    let sql = format!("DELETE FROM {table} WHERE uid = ?");
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(uid)
+        .execute(&mut *conn)
+        .await?;
+    Ok(ip_id)
 }
 
 /// Rebuild a row-backed record from its row, byte-for-byte as it was
@@ -861,6 +974,382 @@ mod tests {
     use crate::cluster::record::{Record, ScanResultRec};
     use crate::store::Store;
 
+    use crate::cluster::identity::Identity;
+    use crate::cluster::record::{RequestRec, ScanJobRec, TombstoneRec};
+
+    fn request(uid: &str, path: &str) -> Record {
+        Record::Request(RequestRec {
+            uid: uid.into(),
+            ts: now_ts(),
+            ip: "203.0.113.7".into(),
+            method: "GET".into(),
+            path: path.into(),
+            query: None,
+            headers_json: "[]".into(),
+            body: None,
+            labels_json: "[]".into(),
+            severity: 1,
+            scan_level: 1,
+            is_fp_claim: false,
+            page_token: None,
+        })
+    }
+
+    /// A log row as the replication layer would hold it for an applied,
+    /// row-backed record (payload dropped).
+    async fn log_row(
+        conn: &mut SqliteConnection,
+        origin: &NodeId,
+        seq: i64,
+        kind: &str,
+        uid: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO repl_log (origin, seq, hlc, kind, uid, payload, sig, applied, received_at)
+             VALUES (?, ?, ?, ?, ?, NULL, x'00', 1, datetime('now'))",
+        )
+        .bind(&origin.0[..])
+        .bind(seq)
+        .bind(seq)
+        .bind(kind)
+        .bind(uid)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    }
+
+    async fn count(conn: &mut SqliteConnection, sql: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_string()))
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    use crate::cluster::record::IpIntelRec;
+
+    fn intel(ip: &str, provider: &str, data: &str) -> Record {
+        Record::IpIntel(IpIntelRec {
+            ip: ip.into(),
+            provider: provider.into(),
+            fetched_at: now_ts(),
+            source_version: Some("2026-09-30".into()),
+            data_json: data.into(),
+        })
+    }
+
+    type View = (Option<String>, Option<i64>, Option<String>, bool);
+
+    async fn view(conn: &mut SqliteConnection, ip: &str) -> View {
+        sqlx::query_as("SELECT country, asn, asn_org, is_tor_exit FROM ips WHERE ip = ?")
+            .bind(ip)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_newest_result_wins_whatever_the_arrival_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let (a, b) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        );
+        let ip = "203.0.113.7";
+        apply(
+            &mut conn,
+            Ctx {
+                origin: Some(&a),
+                hlc: 5,
+            },
+            &request(&format!("{}r", a.uid_prefix()), "/x"),
+        )
+        .await
+        .unwrap();
+        let de = r#"{"country":"DE","asn":3320,"asn_org":"DTAG"}"#;
+        let us = r#"{"country":"US","asn":15169,"asn_org":"Google"}"#;
+        // B's newer result arrives first, A's older one afterwards.
+        apply(
+            &mut conn,
+            Ctx {
+                origin: Some(&b),
+                hlc: 20,
+            },
+            &intel(ip, "maxmind-geolite2", us),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            Ctx {
+                origin: Some(&a),
+                hlc: 10,
+            },
+            &intel(ip, "maxmind-geolite2", de),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            view(&mut conn, ip).await,
+            (Some("US".into()), Some(15169), Some("Google".into()), false)
+        );
+        // Both results are kept, with their origin.
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ip_intel").await, 2);
+        // A node's own newer result replaces its older one.
+        apply(
+            &mut conn,
+            Ctx {
+                origin: Some(&a),
+                hlc: 30,
+            },
+            &intel(ip, "maxmind-geolite2", "{}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ip_intel").await, 2);
+        assert_eq!(
+            view(&mut conn, ip).await,
+            (None, None, None, false),
+            "newest says unknown"
+        );
+        // Tor is its own provider.
+        apply(
+            &mut conn,
+            Ctx {
+                origin: Some(&b),
+                hlc: 40,
+            },
+            &intel(ip, "tor-exits", r#"{"exit":true}"#),
+        )
+        .await
+        .unwrap();
+        assert!(view(&mut conn, ip).await.3);
+    }
+
+    #[tokio::test]
+    async fn a_result_that_arrives_before_the_ip_shows_once_the_ip_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let ctx = |hlc| Ctx { origin: None, hlc };
+        apply(
+            &mut conn,
+            ctx(1),
+            &intel("203.0.113.7", "maxmind-geolite2", r#"{"country":"NL"}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ips").await, 0);
+        apply(&mut conn, ctx(2), &request("req", "/x"))
+            .await
+            .unwrap();
+        assert_eq!(
+            view(&mut conn, "203.0.113.7").await.0.as_deref(),
+            Some("NL")
+        );
+        // Garbage in the data field is stored but changes nothing shown.
+        apply(
+            &mut conn,
+            ctx(3),
+            &intel("203.0.113.7", "maxmind-geolite2", "not json"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view(&mut conn, "203.0.113.7").await.0, None);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_ip_leaves_no_intel_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let ctx = |hlc| Ctx { origin: None, hlc };
+        let ip = "203.0.113.7";
+        apply(&mut conn, ctx(1), &request("req", "/x"))
+            .await
+            .unwrap();
+        apply(
+            &mut conn,
+            ctx(2),
+            &intel(ip, "maxmind-geolite2", r#"{"country":"NL"}"#),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx(3),
+            &intel("198.51.100.1", "tor-exits", r#"{"exit":true}"#),
+        )
+        .await
+        .unwrap();
+        let ip_id: i64 = sqlx::query_scalar("SELECT id FROM ips WHERE ip = ?")
+            .bind(ip)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        // Still referenced by its request: nothing goes.
+        drop_orphan_ip(&mut conn, ip_id).await.unwrap();
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ip_intel").await, 2);
+        sqlx::query("DELETE FROM requests")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop_orphan_ip(&mut conn, ip_id).await.unwrap();
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ips").await, 0);
+        // The other IP has no row yet; its result waits for it.
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) FROM ip_intel WHERE ip = '203.0.113.7'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ip_intel").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_only_deletes_its_own_origins_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let (a, b) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        );
+        let (ua, ub) = (
+            format!("{}req", a.uid_prefix()),
+            format!("{}req", b.uid_prefix()),
+        );
+        for (origin, uid, seq) in [(&a, ua.as_str(), 1), (&b, ub.as_str(), 1)] {
+            let ctx = Ctx {
+                origin: Some(origin),
+                hlc: 10,
+            };
+            assert_eq!(
+                apply(&mut conn, ctx, &request(uid, "/x")).await.unwrap(),
+                Effect::Applied
+            );
+            log_row(&mut conn, origin, seq, "request", uid).await;
+        }
+        // B lists both; only its own goes.
+        let t = Record::Tombstone(TombstoneRec {
+            uid: "tomb-1".into(),
+            uids: vec![ua.clone(), ub.clone()],
+            seqs: vec![],
+        });
+        let ctx = Ctx {
+            origin: Some(&b),
+            hlc: 20,
+        };
+        apply(&mut conn, ctx, &t).await.unwrap();
+        let left: Vec<String> = sqlx::query_scalar("SELECT uid FROM requests")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(left, std::slice::from_ref(&ua));
+        assert_eq!(
+            count(
+                &mut conn,
+                &format!("SELECT COUNT(*) FROM tombstoned WHERE uid = '{ua}'")
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(
+                &mut conn,
+                &format!(
+                    "SELECT COUNT(*) FROM repl_log WHERE uid = '{ua}' AND erased_by IS NOT NULL"
+                )
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(
+                &mut conn,
+                &format!(
+                    "SELECT COUNT(*) FROM repl_log WHERE uid = '{ub}' AND erased_by = 'tomb-1'"
+                )
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(&mut conn, "SELECT COUNT(*) FROM ips").await,
+            1,
+            "a's request keeps the ip"
+        );
+    }
+
+    /// A tombstone that names a parent but not its children must not trip a
+    /// foreign key and stall the origin's stream.
+    #[tokio::test]
+    async fn children_left_out_of_a_tombstone_leave_the_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let ctx = |hlc| Ctx { origin: None, hlc };
+        apply(&mut conn, ctx(1), &request("req", "/x"))
+            .await
+            .unwrap();
+        apply(
+            &mut conn,
+            ctx(2),
+            &Record::FpClaim(crate::cluster::record::FpClaimRec {
+                uid: "claim".into(),
+                request_uid: "req".into(),
+                ip: "203.0.113.7".into(),
+                ts: now_ts(),
+                contact_email: None,
+                user_agent: None,
+            }),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx(3),
+            &Record::ScanJob(ScanJobRec {
+                uid: "job".into(),
+                ip: "203.0.113.7".into(),
+                level: 2,
+                queued_at: now_ts(),
+            }),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx(4),
+            &Record::ScanResult(ScanResultRec {
+                uid: "scan".into(),
+                job_uid: "job".into(),
+                ip: "203.0.113.7".into(),
+                level: 2,
+                started_at: now_ts(),
+                finished_at: Some(now_ts()),
+                os_guess: None,
+                raw_xml: None,
+                ports: vec![],
+            }),
+        )
+        .await
+        .unwrap();
+        let t = Record::Tombstone(TombstoneRec {
+            uid: "tomb".into(),
+            uids: vec!["req".into(), "job".into()],
+            seqs: vec![],
+        });
+        assert_eq!(apply(&mut conn, ctx(5), &t).await.unwrap(), Effect::Applied);
+        for table in ["requests", "fp_claims", "scan_jobs", "scans", "ips"] {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(count(&mut conn, &sql).await, 0, "{table}");
+        }
+    }
+
     #[tokio::test]
     async fn scan_result_defers_until_its_job_exists() {
         let dir = tempfile::tempdir().unwrap();
@@ -914,5 +1403,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(eff, Effect::Applied);
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_ip_is_not_an_address_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let Record::Request(mut r) = request(&format!("{}r", a.uid_prefix()), "/x") else {
+            unreachable!()
+        };
+        r.ip = "x".into();
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let eff = apply(&mut conn, ctx, &Record::Request(r)).await.unwrap();
+        assert_eq!(eff, Effect::Ignored);
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ips").await, 0);
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM requests").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_result_from_an_unknown_provider_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let eff = apply(
+            &mut conn,
+            ctx,
+            &intel("203.0.113.7", "made-up", r#"{"country":"NL"}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(eff, Effect::Ignored);
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ip_intel").await, 0);
     }
 }

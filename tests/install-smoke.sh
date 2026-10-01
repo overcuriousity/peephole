@@ -43,15 +43,37 @@ if PEEPHOLE_ALLOW_NO_SYSTEMD='' bash install.sh >/tmp/nopid1.log 2>&1; then echo
 grep -q "PID 1" /tmp/nopid1.log
 export PEEPHOLE_ALLOW_NO_SYSTEMD=1
 
+# The nginx steps in the closing summary appear in this order (certificate
+# while the distribution's default site still serves, then the default site
+# out of the way of the catch-all, then the site in, then a reload).
+step_line() { grep -nF -- "$1" "$2" | head -1 | cut -d: -f1; }
+steps_in_order() {
+    local log="$1" prev=0 n; shift
+    for s in "$@"; do
+        n="$(step_line "$s" "$log")"
+        if [ -z "$n" ] || [ "$n" -le "$prev" ]; then
+            echo "nginx step '$s' missing or out of order"; cat "$log"; exit 1
+        fi
+        prev="$n"
+    done
+}
+
 echo "== fresh install"
-bash install.sh
+bash install.sh > /tmp/fresh.log 2>&1 || { cat /tmp/fresh.log; exit 1; }
 test -x /usr/local/bin/peephole
 test -f /etc/peephole/config.toml
 test -f /etc/peephole/rules/sqli.toml
 test -f /etc/peephole/nginx.example.conf
 test -f /var/lib/peephole/.installed-rules.sha256
 grep -q 'peephole.test' /etc/peephole/config.toml
+grep -q 'server_name peephole.test;' /etc/peephole/nginx.example.conf
+grep -q 'default_server' /etc/peephole/nginx.example.conf
 grep -q 'systemctl enable --now peephole' /tmp/systemctl.log
+steps_in_order /tmp/fresh.log 'certbot certonly --nginx -d peephole.test' 'rm /etc/nginx/sites-enabled/default' \
+    'cp /etc/peephole/nginx.example.conf' 'ln -s ../sites-available/peephole' 'nginx -t && systemctl reload nginx'
+grep -q 'listen 443 ssl http2;' /etc/peephole/nginx.example.conf
+if grep -q '^ *http2 on' /etc/peephole/nginx.example.conf; then echo "http2 on needs nginx >= 1.25.1"; exit 1; fi
+grep -q 'sites-enabled/default' /etc/peephole/nginx.example.conf
 
 echo "== re-run is a no-op"
 out="$(bash install.sh)"
@@ -63,13 +85,22 @@ printf 'test2 2026-01-02T00:00:00Z\n' > "/tmp/$ASSET/VERSION"
 echo '# upstream change' >> "/tmp/$ASSET/rules/xss.toml"
 echo '# upstream change' >> "/tmp/$ASSET/rules/sqli.toml"
 ( cd /tmp && tar -czf "srv/$ASSET.tar.gz" "$ASSET" && cd srv && sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256" )
+echo '# operator note' >> /etc/peephole/nginx.example.conf
 PEEPHOLE_FORCE=1 bash install.sh
+grep -q '# operator note' /etc/peephole/nginx.example.conf
 grep -q '# operator edit' /etc/peephole/rules/sqli.toml
 test -f /etc/peephole/rules/sqli.toml.new
 grep -q '# upstream change' /etc/peephole/rules/xss.toml
 test ! -e /etc/peephole/rules/xss.toml.new
 grep -q 'systemctl restart peephole' /tmp/systemctl.log
 test -x /usr/local/bin/peephole.prev
+
+echo "== forced re-run with wizard variables set leaves config and nginx example alone"
+md5sum /etc/peephole/config.toml /etc/peephole/nginx.example.conf > /tmp/before.md5
+PEEPHOLE_FORCE=1 PEEPHOLE_ROLES=scanner PEEPHOLE_LOCAL_PROXY=1 PEEPHOLE_CLUSTER=1 \
+    PEEPHOLE_CLUSTER_NAME=other PEEPHOLE_CLUSTER_LISTEN=0.0.0.0:7443 PEEPHOLE_REMOTE_CONFIG=1 \
+    bash install.sh > /tmp/forced-vars.log 2>&1 || { cat /tmp/forced-vars.log; exit 1; }
+md5sum -c --quiet /tmp/before.md5
 
 echo "== fresh headless scanner in distributed mode: no domain, no MaxMind"
 rm -rf /etc/peephole /var/lib/peephole /usr/local/bin/peephole /usr/local/bin/peephole.prev /tmp/enabled
@@ -83,6 +114,107 @@ if grep -q 'webauthn\|maxmind\|trap_listen\|admin_listen' /etc/peephole/config.t
     echo "headless config has role-specific settings"; exit 1
 fi
 grep -q 'ed25519:' /tmp/headless.log
+test ! -e /etc/peephole/nginx.example.conf
 /usr/local/bin/peephole check-config /etc/peephole/config.toml
-/usr/local/bin/peephole cluster members /etc/peephole/config.toml | grep -q 'scanner-1'
+# The node lists itself once the daemon has run (`cluster members` is read-only
+# and systemd is stubbed here); the config names it.
+grep -q '^node_name = "scanner-1"' /etc/peephole/config.toml
+reset_install() {
+    rm -rf /etc/peephole /var/lib/peephole /usr/local/bin/peephole /usr/local/bin/peephole.prev /tmp/enabled
+}
+
+echo "== wizard: trap only, behind a local nginx (answers typed at the prompts)"
+reset_install
+# trap? yes · scanner? no · web? no · local proxy? yes · cluster? no · MaxMind: skip
+printf 'y\nn\nn\ny\n\n\n' > /tmp/answers
+# PEEPHOLE_TRUSTED_PROXIES stays preset (10.0.0.0/8): the local proxy answer replaces it, with a warning.
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+    PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard1.log 2>&1 || { cat /tmp/wizard1.log; exit 1; }
+grep -q 'PEEPHOLE_TRUSTED_PROXIES.*ignored' /tmp/wizard1.log
+grep -q '^listener = true' /etc/peephole/config.toml
+grep -q '^scanner = false' /etc/peephole/config.toml
+grep -q '^web = false' /etc/peephole/config.toml
+grep -q '^trap_listen = "127.0.0.1:8080"' /etc/peephole/config.toml
+grep -q '^trusted_proxies = \["127.0.0.1/32","::1/128"\]' /etc/peephole/config.toml
+if grep -q 'webauthn\|maxmind\|\[cluster\]\|admin_listen' /etc/peephole/config.toml; then
+    echo "trap-only config has other roles' settings"; cat /etc/peephole/config.toml; exit 1
+fi
+/usr/local/bin/peephole check-config /etc/peephole/config.toml
+grep -q 'trap listener (127.0.0.1:8080)' /tmp/wizard1.log
+steps_in_order /tmp/wizard1.log 'rm /etc/nginx/sites-enabled/default' 'cp /etc/peephole/nginx.example.conf' 'nginx -t && systemctl reload nginx'
+if grep -q 'certbot\|certificate' /tmp/wizard1.log; then echo "trap-only node told to get a certificate"; exit 1; fi
+grep -q 'default_server' /etc/peephole/nginx.example.conf
+grep -q 'proxy_pass http://127.0.0.1:8080' /etc/peephole/nginx.example.conf
+# shellcheck disable=SC2016  # the dollar sign is literal nginx syntax
+grep -qF 'X-Forwarded-For $remote_addr' /etc/peephole/nginx.example.conf
+if grep -q 'server_name peephole\|8443\|proxy_add_x_forwarded_for' /etc/peephole/nginx.example.conf; then
+    echo "trap-only nginx example has an admin block or a spoofable header"; exit 1
+fi
+
+echo "== wizard: no role at all is refused before anything is written"
+reset_install
+printf 'n\nn\nn\n' > /tmp/answers
+if env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+    PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard2.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q "at least one" /tmp/wizard2.log
+test ! -e /etc/peephole/config.toml
+test ! -e /usr/local/bin/peephole
+
+echo "== wizard: a quote in an answer is refused"
+reset_install
+# trap? no · scanner? no · web? yes · domain with a quote
+printf 'n\nn\ny\nbad"domain\n' > /tmp/answers
+if env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+    PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard3.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q "not allowed" /tmp/wizard3.log
+test ! -e /etc/peephole/config.toml
+test ! -e /usr/local/bin/peephole
+
+echo "== preset roles with no role in them are refused before anything is written"
+reset_install
+if PEEPHOLE_ROLES=, bash install.sh > /tmp/noroles.log 2>&1; then echo "expected failure"; exit 1; fi
+grep -q "at least one" /tmp/noroles.log
+test ! -e /usr/local/bin/peephole
+
+echo "== wizard: a value the binary rejects leaves no config behind"
+reset_install
+# trap? no · scanner? yes · web? no · cluster? yes · name · listen "bogus" ·
+# advertise (none) · token (none) · remote config? no · MaxMind: skip
+printf 'n\ny\nn\ny\nscanner-9\nbogus\n\n\nn\n\n' > /tmp/answers
+if env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+    PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard-bad.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q "failed validation" /tmp/wizard-bad.log
+test ! -e /etc/peephole/config.toml
+
+echo "== wizard: re-run after the rejected answer asks again (scanner in a cluster, remote configuration on)"
+# No reset: the binary and rules from the failed run are in place.
+# trap? no · scanner? yes · web? no · cluster? yes · name · listen (default) ·
+# advertise · token (none) · remote config? yes · MaxMind: skip
+printf 'n\ny\nn\ny\nscanner-9\n\nscan9.example:7443\n\ny\n\n' > /tmp/answers
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+    PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard4.log 2>&1 || { cat /tmp/wizard4.log; exit 1; }
+if grep -q 'already up to date' /tmp/wizard4.log; then echo "re-run after a failed first install skipped the wizard"; exit 1; fi
+grep -q '^node_name = "scanner-9"' /etc/peephole/config.toml
+grep -q '^listen = "0.0.0.0:7443"' /etc/peephole/config.toml
+grep -q '^advertise = "scan9.example:7443"' /etc/peephole/config.toml
+grep -q '^remote_config = true' /etc/peephole/config.toml
+grep -q 'peephole-cfg1:' /tmp/wizard4.log
+grep -q 'ed25519:' /tmp/wizard4.log
+/usr/local/bin/peephole check-config /etc/peephole/config.toml | grep -q 'remote config: on'
+
+echo "== unattended: a bad join token does not fail the install"
+reset_install
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+    PEEPHOLE_ROLES=scanner PEEPHOLE_CLUSTER_NAME=scanner-2 PEEPHOLE_CLUSTER_LISTEN=0.0.0.0:7443 \
+    PEEPHOLE_JOIN_TOKEN=peephole1:garbage PEEPHOLE_REMOTE_CONFIG=0 \
+    bash install.sh > /tmp/badjoin.log 2>&1 || { cat /tmp/badjoin.log; exit 1; }
+grep -q 'joining the cluster failed' /tmp/badjoin.log
+grep -q '^remote_config = false' /etc/peephole/config.toml
+if grep -q 'peephole-cfg1:' /tmp/badjoin.log; then echo "locked node printed a config key"; exit 1; fi
 echo "== ok"

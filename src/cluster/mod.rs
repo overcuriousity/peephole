@@ -1,7 +1,9 @@
 //! Distributed mode: node identity, pinned-key mTLS RPC, replicated log,
 //! membership.
 pub mod adopt;
+pub mod block;
 pub mod cli;
+pub mod confkey;
 pub mod hlc;
 pub mod identity;
 pub mod invite;
@@ -31,13 +33,9 @@ pub struct NodeParams {
     pub identity: Identity,
     pub cluster: ClusterConfig,
     pub roles: Roles,
-    /// This node's `scan.never_scan`, published to the cluster.
-    pub never_scan: Vec<String>,
     pub store: Store,
     /// Supported protocol range; constants except in interop tests.
     pub proto: (u32, u32),
-    /// This node has MaxMind credentials (published in heartbeats).
-    pub has_maxmind: bool,
     /// Where shared intel files live (served to peers).
     pub data_dir: std::path::PathBuf,
 }
@@ -53,13 +51,105 @@ impl NodeParams {
             identity: Identity::load_or_create(&cfg.node_key_path())?,
             cluster,
             roles: cfg.roles,
-            never_scan: cfg.scan.never_scan.iter().map(|n| n.to_string()).collect(),
             store,
             proto: (proto::PROTO_MIN, proto::PROTO_VERSION),
-            has_maxmind: cfg.maxmind.is_some(),
             data_dir: cfg.data_dir.clone(),
         })
     }
+}
+
+/// Why this node no longer takes part in its cluster. It keeps its copy of
+/// the data and what it contributed stays in the cluster.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Detached {
+    /// It left (`peephole cluster leave`).
+    Left,
+    /// It was offline for longer than the prune window.
+    Pruned,
+}
+
+const DETACHED_KEY: &str = "cluster.detached";
+
+impl Detached {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Detached::Left => "left",
+            Detached::Pruned => "pruned",
+        }
+    }
+
+    /// What the admin UI and CLI say about it.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Detached::Left => {
+                "This node left its cluster and no longer syncs. Rejoin with an invite."
+            }
+            Detached::Pruned => {
+                "This node was silent for more than 30 days and has been pruned from its cluster. Rejoin with an invite."
+            }
+        }
+    }
+}
+
+impl Detached {
+    /// The persisted state (CLI; the daemon caches it in [`Node::detached`]).
+    pub async fn read(store: &Store) -> Result<Option<Detached>> {
+        read_detached(store).await
+    }
+}
+
+async fn read_detached(store: &Store) -> Result<Option<Detached>> {
+    let v: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(DETACHED_KEY)
+        .fetch_optional(&store.pool)
+        .await?;
+    Ok(match v.as_deref() {
+        Some("left") => Some(Detached::Left),
+        Some("pruned") => Some(Detached::Pruned),
+        _ => None,
+    })
+}
+
+/// Persist (or clear) the detached state; the daemon picks it up within
+/// seconds, also when the CLI wrote it.
+pub async fn set_detached(store: &Store, d: Option<Detached>) -> Result<()> {
+    match d {
+        Some(d) => {
+            sqlx::query(
+                "INSERT INTO settings (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(DETACHED_KEY)
+            .bind(d.as_str())
+            .execute(&store.pool)
+            .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM settings WHERE key = ?")
+                .bind(DETACHED_KEY)
+                .execute(&store.pool)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Leave the cluster: announce it, hand the announcement to every peer we
+/// can reach, then stop syncing. Returns how many peers were told.
+pub async fn leave(node: &Node) -> Result<usize> {
+    repl::append(node, &[Record::MemberRevoke { id: node.id() }]).await?;
+    let mut told = 0;
+    for (peer, _, addr) in node.dial_targets() {
+        if sync::reconcile(node, peer, &addr, false).await.is_ok() {
+            told += 1;
+        }
+    }
+    if told == 0 {
+        warn!("left the cluster without reaching a peer; it will prune this node after 30 days");
+    }
+    set_detached(&node.store, Some(Detached::Left)).await?;
+    node.reload_members().await?;
+    Ok(told)
 }
 
 /// Last contact with a peer, for logs and the admin UI.
@@ -74,13 +164,21 @@ pub struct Node {
     pub identity: Identity,
     pub cert: tls::NodeCert,
     pub cfg: ClusterConfig,
-    pub roles: Roles,
-    pub never_scan: Vec<String>,
+    roles: RwLock<Roles>,
     pub proto: (u32, u32),
     pub store: Store,
     pub hlc: hlc::Hlc,
     /// Active members (including this node), refreshed from the database.
     members: RwLock<Arc<HashMap<NodeId, MemberRow>>>,
+    /// Set while this node is out of its cluster (left or pruned).
+    detached: RwLock<Option<Detached>>,
+    /// Every other member looks pruned to us: more likely we are the one
+    /// that was cut off. They are then still dialled, to find out.
+    isolated: std::sync::atomic::AtomicBool,
+    /// Peers this node blocked (a local decision, see [`block`]).
+    blocked: RwLock<Arc<std::collections::HashSet<NodeId>>>,
+    /// The standing of every known node, members or not.
+    standings: RwLock<Arc<HashMap<NodeId, members::Standing>>>,
     /// Addresses from `[[cluster.peers]]`, preferred over published ones.
     address_override: HashMap<NodeId, String>,
     clients: Mutex<HashMap<NodeId, reqwest::Client>>,
@@ -92,7 +190,8 @@ pub struct Node {
     join_attempts: Mutex<std::collections::VecDeque<std::time::Instant>>,
     /// Wakes the sync supervisor when the set of dialable members changes.
     pub members_changed: tokio::sync::Notify,
-    pub has_maxmind: bool,
+    /// Enrichment providers this node can query right now (heartbeats).
+    providers: RwLock<Vec<String>>,
     pub data_dir: std::path::PathBuf,
     /// Contacts and heartbeats (ephemeral).
     pub status: status::Status,
@@ -115,12 +214,15 @@ impl Node {
             identity: p.identity,
             cert,
             cfg: p.cluster,
-            roles: p.roles,
-            never_scan: p.never_scan,
+            roles: RwLock::new(p.roles),
             proto: p.proto,
             store: p.store,
             hlc: hlc::Hlc::new(),
             members: RwLock::new(Arc::new(HashMap::new())),
+            detached: RwLock::new(None),
+            isolated: Default::default(),
+            blocked: RwLock::new(Arc::new(Default::default())),
+            standings: RwLock::new(Arc::new(HashMap::new())),
             address_override,
             clients: Mutex::new(HashMap::new()),
             peer_status: RwLock::new(HashMap::new()),
@@ -128,7 +230,7 @@ impl Node {
             changed: tokio::sync::watch::channel(0).0,
             join_attempts: Mutex::new(Default::default()),
             members_changed: tokio::sync::Notify::new(),
-            has_maxmind: p.has_maxmind,
+            providers: RwLock::new(vec![]),
             data_dir: p.data_dir,
             status: Default::default(),
             msg: Default::default(),
@@ -142,6 +244,19 @@ impl Node {
             .await?;
         node.hlc.observe(max_hlc.unwrap_or(0) as u64);
         node.reload_members().await?;
+        // Offline for longer than the prune window: the cluster dropped us,
+        // and our log is too old to judge anyone else by.
+        if node.detached().is_none()
+            && let Some(last) = node.own_last_hlc().await?
+            && hlc::wall_ms().saturating_sub(hlc::physical_ms(last)) > members::PRUNE_AFTER_MS
+            && node.standings.read().unwrap().len() > 1
+        {
+            warn!(
+                "no entry of our own for over 30 days: pruned from the cluster; rejoin with an invite"
+            );
+            set_detached(&node.store, Some(Detached::Pruned)).await?;
+            node.reload_members().await?;
+        }
         let n = repl::apply_unknown_kinds(&node).await?;
         if n > 0 {
             info!(n, "applied log entries from a newer protocol");
@@ -153,16 +268,41 @@ impl Node {
         self.identity.id
     }
 
+    /// The roles this node runs right now.
+    pub fn roles(&self) -> Roles {
+        *self.roles.read().unwrap()
+    }
+
+    /// Adopt new roles and tell the cluster (member info and heartbeat).
+    pub async fn set_roles(&self, r: Roles) -> Result<()> {
+        if self.roles() == r {
+            return Ok(());
+        }
+        let before = std::mem::replace(&mut *self.roles.write().unwrap(), r);
+        if let Err(e) = repl::append(self, &[Record::MemberUpdate(self.self_info())]).await {
+            // Not announced: try again on the next call.
+            *self.roles.write().unwrap() = before;
+            return Err(e);
+        }
+        self.publish_status();
+        Ok(())
+    }
+
     /// How this node describes itself to the cluster.
     pub fn self_info(&self) -> MemberInfo {
         MemberInfo {
             id: self.id(),
             name: self.cfg.node_name.clone(),
             address: self.cfg.advertise.clone(),
-            roles: self.roles.names().into_iter().map(str::to_string).collect(),
-            never_scan: self.never_scan.clone(),
+            roles: self
+                .roles()
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             proto_min: self.proto.0,
             proto_max: self.proto.1,
+            remote_config: self.cfg.remote_config,
         }
     }
 
@@ -178,7 +318,7 @@ impl Node {
                 && m.name == mine.name
                 && m.address == mine.address
                 && m.roles == mine.roles
-                && m.never_scan == mine.never_scan
+                && m.remote_config == mine.remote_config
                 && (m.proto_min, m.proto_max) == (mine.proto_min, mine.proto_max)
         });
         let mut records = vec![];
@@ -193,9 +333,9 @@ impl Node {
                     name: p.name.clone(),
                     address: Some(p.address.clone()),
                     roles: vec![],
-                    never_scan: vec![],
                     proto_min: 0,
                     proto_max: 0,
+                    remote_config: false,
                 })),
                 Some(m) if !m.active => warn!(
                     peer = %p.name,
@@ -210,15 +350,94 @@ impl Node {
         Ok(())
     }
 
+    /// Enrichment providers this node can query right now.
+    pub fn providers(&self) -> Vec<String> {
+        self.providers.read().unwrap().clone()
+    }
+
+    pub fn set_providers(&self, p: Vec<String>) {
+        if *self.providers.read().unwrap() != p {
+            *self.providers.write().unwrap() = p;
+            self.publish_status();
+        }
+    }
+
+    pub fn detached(&self) -> Option<Detached> {
+        *self.detached.read().unwrap()
+    }
+
+    /// Whether every other member looks pruned from here (see `isolated`).
+    pub fn isolated(&self) -> bool {
+        self.isolated.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether this node blocked `id` (a local decision, see [`block`]).
+    pub fn is_blocked(&self, id: &NodeId) -> bool {
+        self.blocked.read().unwrap().contains(id)
+    }
+
+    /// The standing of any known node, member or not.
+    pub fn standing_of(&self, id: &NodeId) -> Option<members::Standing> {
+        self.standings.read().unwrap().get(id).copied()
+    }
+
+    /// HLC of the newest entry this node wrote, if any.
+    async fn own_last_hlc(&self) -> Result<Option<u64>> {
+        let h: Option<i64> = sqlx::query_scalar(
+            "SELECT hlc FROM repl_log WHERE origin = ? ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&self.id().0[..])
+        .fetch_optional(&self.store.pool)
+        .await?;
+        Ok(h.map(|h| h as u64))
+    }
+
+    /// Write a sign of life when this node has been quiet for a day, so the
+    /// cluster does not prune a node that merely has nothing to record.
+    /// Returns whether an entry was written.
+    pub async fn keepalive(&self) -> Result<bool> {
+        if self.detached().is_some() {
+            return Ok(false);
+        }
+        let last = self.own_last_hlc().await?.map_or(0, hlc::physical_ms);
+        if hlc::wall_ms().saturating_sub(last) < members::KEEPALIVE_MS {
+            return Ok(false);
+        }
+        repl::append(self, &[Record::MemberUpdate(self.self_info())]).await?;
+        Ok(true)
+    }
+
     pub async fn reload_members(&self) -> Result<()> {
         let rows = members::all(&self.store).await?;
+        let detached = read_detached(&self.store).await?;
+        let blocked: std::collections::HashSet<NodeId> =
+            block::list(&self.store).await?.into_iter().collect();
+        let standings: HashMap<_, _> = rows.iter().map(|m| (m.id, m.standing)).collect();
+        // When nobody else is active but some were pruned, we were probably
+        // the one out of touch: keep treating them as members, so contact
+        // can resume or they can tell us that we were pruned.
+        let me = self.identity.id;
+        let others = |s: members::Standing| {
+            rows.iter()
+                .filter(|m| m.id != me && m.standing == s)
+                .count()
+        };
+        let isolated =
+            others(members::Standing::Active) == 0 && others(members::Standing::Pruned) > 0;
+        self.isolated
+            .store(isolated, std::sync::atomic::Ordering::Relaxed);
         let map: HashMap<_, _> = rows
             .into_iter()
-            .filter(|m| m.active || m.id == self.identity.id)
+            .filter(|m| {
+                m.active || m.id == me || (isolated && m.standing == members::Standing::Pruned)
+            })
             .map(|m| (m.id, m))
             .collect();
         let before = self.dial_targets();
         *self.members.write().unwrap() = Arc::new(map);
+        *self.detached.write().unwrap() = detached;
+        *self.blocked.write().unwrap() = Arc::new(blocked);
+        *self.standings.write().unwrap() = Arc::new(standings);
         if self.dial_targets() != before {
             self.members_changed.notify_one();
         }
@@ -234,12 +453,16 @@ impl Node {
         self.members.read().unwrap().clone()
     }
 
-    /// Active members we can dial: `(id, name, address)`.
+    /// Active members we can dial: `(id, name, address)`. None while this
+    /// node is detached from its cluster.
     pub fn dial_targets(&self) -> Vec<(NodeId, String, String)> {
+        if self.detached().is_some() {
+            return vec![];
+        }
         let mut v: Vec<_> = self
             .members()
             .values()
-            .filter(|m| m.id != self.id())
+            .filter(|m| m.id != self.id() && !self.is_blocked(&m.id))
             .filter_map(|m| {
                 let addr = self
                     .address_override
@@ -285,7 +508,12 @@ impl Node {
             proto_max: self.proto.1,
             node_name: self.cfg.node_name.clone(),
             version: crate::VERSION.to_string(),
-            roles: self.roles.names().into_iter().map(str::to_string).collect(),
+            roles: self
+                .roles()
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
         }
     }
 
@@ -472,6 +700,9 @@ async fn heartbeat_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Recei
             );
         }
         node.refresh_heartbeat();
+        if let Err(e) = node.keepalive().await {
+            warn!(?e, "keepalive failed");
+        }
         tokio::select! {
             _ = tokio::time::sleep(status::HEARTBEAT_EVERY) => {}
             _ = shutdown.changed() => break,

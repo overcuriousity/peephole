@@ -9,6 +9,7 @@ use crate::store::browse::{IpFilter, Page, RequestFilter, page_num};
 use crate::store::inspect::{
     FpClaimRow, FpCluster, PortRow, QueueSummary, RequestDetail, ScanSummary,
 };
+use crate::store::recorder::Deleted;
 use crate::store::stats::intel_stale;
 use askama::Template;
 use axum::{
@@ -41,6 +42,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/claims/{id}/delete", post(claim_delete))
         .route("/admin/export", get(export_page))
         .route("/admin/export/download", get(export_download))
+        .route("/admin/export/intel", get(export_intel))
         .route("/admin/keys", get(keys))
         .route("/admin/keys/delete", post(key_delete))
 }
@@ -236,7 +238,7 @@ async fn pace_view(
         timeouts_high: r.pace.timeout_secs > current.timeout_secs,
         notice,
         error,
-        not_scanning: st.recorder.node().is_some() && !st.cfg.roles.scanner,
+        not_scanning: st.recorder.node().is_some() && !st.settings.roles().scanner,
     })
 }
 
@@ -320,7 +322,19 @@ async fn queue_pace(
             timeout_secs: t,
         });
     let outcome = match parsed {
-        Some(p) => st.pace.set(&st.store, p).await?,
+        Some(p) => st
+            .settings
+            .apply(
+                &crate::settings::Changes {
+                    max_workers: Some(p.max_workers as u32),
+                    max_scans_per_hour: Some(p.max_scans_per_hour),
+                    timeout_secs: Some(p.timeout_secs),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?
+            .map(|_| ()),
         None => Err("workers, scans per hour and timeout must be numbers".into()),
     };
     match outcome {
@@ -363,27 +377,52 @@ async fn request_page(
     })
 }
 
+/// What a delete did, for the admin.
+fn deleted_msg(d: Deleted) -> String {
+    match (d.deleted, d.hidden) {
+        (n, 0) => format!("Deleted {n} record(s)."),
+        (0, h) => format!(
+            "Hid {h} record(s) on this node only: other nodes recorded them, so they stay in the cluster."
+        ),
+        (n, h) => format!(
+            "Deleted {n} record(s) cluster-wide; hid {h} record(s) of other nodes on this node only."
+        ),
+    }
+}
+
+/// Redirect with a one-shot notice. It travels in a short-lived cookie the
+/// page script shows and clears, so a crafted link cannot plant a message.
+fn redirect_with_notice(to: &str, msg: &str) -> Response {
+    let enc = serde_urlencoded::to_string([("m", msg)]).unwrap_or_default();
+    let cookie = format!(
+        "peephole_flash={}; Path=/; Max-Age=30; SameSite=Strict",
+        enc.trim_start_matches("m=")
+    );
+    ([(axum::http::header::SET_COOKIE, cookie)], Redirect::to(to)).into_response()
+}
+
 async fn request_delete(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Path(id): Path<i64>,
-) -> AppResult<Redirect> {
-    if !st.recorder.delete_request(id).await? {
+) -> AppResult<Response> {
+    let out = st.recorder.delete_request(id).await?;
+    if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
     }
-    Ok(Redirect::to("/requests"))
+    Ok(redirect_with_notice("/requests", &deleted_msg(out)))
 }
 
 async fn ip_delete(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Path(addr): Path<String>,
-) -> AppResult<Redirect> {
+) -> AppResult<Response> {
     let Some(ip) = st.store.ip_by_addr(&addr).await? else {
         return Err(AppError::NotFound);
     };
-    st.recorder.delete_ip(ip.id).await?;
-    Ok(Redirect::to("/ips"))
+    let out = st.recorder.delete_ips(&[ip.id]).await?;
+    Ok(redirect_with_notice("/ips", &deleted_msg(out)))
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -461,11 +500,12 @@ async fn scan_delete(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Path(id): Path<i64>,
-) -> AppResult<Redirect> {
-    if !st.recorder.delete_scan(id).await? {
+) -> AppResult<Response> {
+    let out = st.recorder.delete_scan(id).await?;
+    if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
     }
-    Ok(Redirect::to("/admin/scans"))
+    Ok(redirect_with_notice("/admin/scans", &deleted_msg(out)))
 }
 
 #[derive(Template)]
@@ -503,11 +543,12 @@ async fn claim_delete(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Path(id): Path<i64>,
-) -> AppResult<Redirect> {
-    if !st.recorder.delete_claim(id).await? {
+) -> AppResult<Response> {
+    let out = st.recorder.delete_claim(id).await?;
+    if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
     }
-    Ok(Redirect::to("/admin/inbox"))
+    Ok(redirect_with_notice("/admin/inbox", &deleted_msg(out)))
 }
 
 #[derive(Template)]
@@ -518,6 +559,50 @@ struct ExportPage {
 
 async fn export_page(_u: SessionUser) -> AppResult<Html<String>> {
     render(&ExportPage { chrome: chrome() })
+}
+
+/// Enrichment results as JSON Lines: what each provider said about each
+/// IP, when, from which data version, and which node looked it up.
+async fn export_intel(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
+    let names: HashMap<Vec<u8>, String> = match st.recorder.node() {
+        Some(node) => crate::cluster::members::all(&node.store)
+            .await?
+            .into_iter()
+            .map(|m| (m.id.0.to_vec(), m.name))
+            .collect(),
+        None => HashMap::new(),
+    };
+    let mut out = String::new();
+    for (ip, provider, fetched_at, source_version, origin, data_json) in
+        st.store.intel_export(100_000).await?
+    {
+        let node = match names.get(&origin) {
+            Some(n) => n.clone(),
+            None if origin.is_empty() => "this node".to_string(),
+            None => data_encoding::HEXLOWER.encode(&origin[..origin.len().min(6)]),
+        };
+        let data: serde_json::Value =
+            serde_json::from_str(&data_json).unwrap_or(serde_json::Value::Null);
+        out.push_str(
+            &serde_json::json!({
+                "ip": ip, "provider": provider, "fetched_at": fetched_at,
+                "source_version": source_version, "node": node, "data": data,
+            })
+            .to_string(),
+        );
+        out.push('\n');
+    }
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/x-ndjson"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"peephole-enrichment.jsonl\"",
+            ),
+        ],
+        out,
+    )
+        .into_response())
 }
 
 async fn export_download(
@@ -650,52 +735,68 @@ async fn bulk_delete_requests(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     body: String,
-) -> AppResult<Redirect> {
+) -> AppResult<Response> {
     let form = parse_bulk::<RequestFilter>(&body)?;
-    let n = if form.all {
+    let mut total = Deleted::default();
+    if form.all {
         // Rounds of MATCH_LIMIT until nothing matches, so "all" means all.
-        let mut total = 0u64;
         loop {
             let ids = st.store.matching_request_ids(&form.filter).await?;
             if ids.is_empty() {
                 break;
             }
-            total += st.recorder.delete_requests(&ids).await?;
-            if (ids.len() as i64) < crate::store::browse::MATCH_LIMIT {
+            let out = st.recorder.delete_requests(&ids).await?;
+            total.deleted += out.deleted;
+            total.hidden += out.hidden;
+            // Stop when a round changed nothing: what still matches cannot
+            // be removed from here.
+            if out.deleted + out.hidden == 0
+                || (ids.len() as i64) < crate::store::browse::MATCH_LIMIT
+            {
                 break;
             }
         }
-        total
     } else {
         let ids: Vec<i64> = form.ids.iter().filter_map(|v| v.parse().ok()).collect();
-        st.recorder.delete_requests(&ids).await?
-    };
-    tracing::info!(deleted = n, all = form.all, "bulk request delete");
-    Ok(Redirect::to(&format!(
-        "/requests?{}",
-        crate::admin::public::request_qs(&form.filter)
-    )))
+        total = st.recorder.delete_requests(&ids).await?;
+    }
+    tracing::info!(
+        deleted = total.deleted,
+        hidden = total.hidden,
+        all = form.all,
+        "bulk request delete"
+    );
+    Ok(redirect_with_notice(
+        &format!(
+            "/requests?{}",
+            crate::admin::public::request_qs(&form.filter)
+        ),
+        &deleted_msg(total),
+    ))
 }
 
 async fn bulk_delete_ips(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     body: String,
-) -> AppResult<Redirect> {
+) -> AppResult<Response> {
     let form = parse_bulk::<IpFilter>(&body)?;
-    let n = if form.all {
-        let mut total = 0u64;
+    let mut total = Deleted::default();
+    if form.all {
         loop {
             let ids = st.store.matching_ip_ids(&form.filter).await?;
             if ids.is_empty() {
                 break;
             }
-            total += st.recorder.delete_ips(&ids).await?;
-            if (ids.len() as i64) < crate::store::browse::MATCH_LIMIT {
+            let out = st.recorder.delete_ips(&ids).await?;
+            total.deleted += out.deleted;
+            total.hidden += out.hidden;
+            if out.deleted + out.hidden == 0
+                || (ids.len() as i64) < crate::store::browse::MATCH_LIMIT
+            {
                 break;
             }
         }
-        total
     } else {
         let mut ids = vec![];
         for addr in &form.ids {
@@ -703,11 +804,53 @@ async fn bulk_delete_ips(
                 ids.push(ip.id);
             }
         }
-        st.recorder.delete_ips(&ids).await?
-    };
-    tracing::info!(deleted = n, all = form.all, "bulk ip delete");
-    Ok(Redirect::to(&format!(
-        "/ips?{}",
-        crate::admin::public::ip_qs(&form.filter)
-    )))
+        total = st.recorder.delete_ips(&ids).await?;
+    }
+    tracing::info!(
+        deleted = total.deleted,
+        hidden = total.hidden,
+        all = form.all,
+        "bulk ip delete"
+    );
+    Ok(redirect_with_notice(
+        &format!("/ips?{}", crate::admin::public::ip_qs(&form.filter)),
+        &deleted_msg(total),
+    ))
+}
+
+#[cfg(test)]
+mod delete_notice_tests {
+    use super::*;
+
+    #[test]
+    fn notice_names_what_happened_and_fits_a_cookie() {
+        assert_eq!(
+            deleted_msg(Deleted {
+                deleted: 2,
+                hidden: 0
+            }),
+            "Deleted 2 record(s)."
+        );
+        assert!(
+            deleted_msg(Deleted {
+                deleted: 0,
+                hidden: 1
+            })
+            .starts_with("Hid 1 record(s) on this node only")
+        );
+        let r = redirect_with_notice(
+            "/requests",
+            &deleted_msg(Deleted {
+                deleted: 1,
+                hidden: 3,
+            }),
+        );
+        let c = r.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap();
+        assert!(c.starts_with("peephole_flash=Deleted+1+record"), "{c}");
+        let value = c.split(';').next().unwrap();
+        assert!(!value.contains(' '), "cookie value must be encoded: {c}");
+        assert!(c.contains("hid+3+record"), "{c}");
+    }
 }

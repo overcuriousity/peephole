@@ -9,51 +9,97 @@
 {% when None %}
 <section class="card"><h2>Standalone</h2>
   <p>This node runs on its own. To share data with other peephole deployments, add a <code>[cluster]</code> section to <code>config.toml</code> (see <code>deploy/config.example.toml</code>) and restart. Its existing history is shared with the cluster on the first start.</p></section>
+<section class="card"><h2>Runtime settings</h2>
+{% include "_node_settings.html" %}
+<p class="muted">The scan pace is set on the <a href="/admin/queue">Queue</a> page.</p></section>
 {% when Some(me) %}
 <div class="stack">
+{% if let Some(d) = detached %}<div class="banner banner-warning">{{ d }}</div>{% endif %}
 <section class="card">
-  <div class="card-head"><h2>This node · {{ me.name }}</h2><span class="muted mono">{{ me.short }}</span></div>
+  <div class="card-head"><h2>This node · {{ me.name }}</h2><span class="muted mono">{{ me.short }}</span>
+    {% if detached.is_none() %}<button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-leave">Leave cluster</button>
+    <dialog id="dlg-leave"><h3>Leave the cluster?</h3><p class="muted">This node stops syncing. Its copy of the data stays, and what it contributed stays in the cluster. Nobody else can remove a node; rejoining needs an invite.</p>
+      <form method="post" action="/admin/cluster/leave" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Leave</button></form></dialog>{% endif %}</div>
   <dl class="kv">
     <dt>Key</dt><dd class="mono break">{{ me.key }}</dd>
     <dt>Roles</dt><dd>{{ me.roles }}</dd>
     <dt>Address</dt><dd class="mono">{{ me.address }}</dd>
     <dt>Version</dt><dd class="mono">{{ me.version }}</dd>
   </dl>
+  {% include "_node_settings.html" %}
+  {% if remote_config %}
+  <h3>Config key</h3>
+  <p class="muted">Whoever holds this key can change this node's scan pace, rescan cooldown and roles from their own node. Rotating it withdraws that from everyone.</p>
+  {% if let Some(k) = config_key %}<details><summary>Show key</summary><pre class="panel mono break" data-copy>{{ k }}</pre></details>{% endif %}
+  <form method="post" action="/admin/cluster/config-key/rotate"><button class="btn btn-sm btn-danger" type="submit">Rotate key</button></form>
+  {% if !audit.is_empty() %}
+  <div class="table-wrap"><table><thead><tr><th>When (UTC)</th><th>By</th><th>Change</th></tr></thead>
+    <tbody>{% for a in audit %}<tr><td class="ts">{{ a.at }}</td><td>{{ a.by }}</td><td class="mono">{{ a.changes }}</td></tr>{% endfor %}</tbody></table></div>
+  {% endif %}
+  {% else %}
+  <p class="muted">Remote configuration: <b>locked</b>. Only this page, the CLI and the config file change this node's settings. To let others do it, set <code>remote_config = true</code> under <code>[cluster]</code>.</p>
+  {% endif %}
 </section>
 {% if let Some(t) = invite %}
 <section class="card"><h2>Invite</h2>
-  <p>Shown once. On the new node run <code>peephole cluster join &lt;token&gt;</code> or paste it on that node's Cluster page. Valid for one join.</p>
+  <p>Shown once. On a new node run <code>peephole cluster join &lt;token&gt;</code> or paste it on that node's Cluster page. It can be used again until it expires, reaches its use limit or is revoked.</p>
   <pre class="panel mono break" data-copy>{{ t }}</pre></section>
 {% endif %}
 <section class="card">
-  <div class="card-head"><h2>Members</h2>
-    <form method="post" action="/admin/cluster/invite" class="row"><label class="muted">valid <input type="number" name="ttl_hours" min="1" max="720" value="{{ invite_ttl }}" size="3"> h</label><button class="btn btn-primary btn-sm" type="submit">Create invite</button></form></div>
+  <div class="card-head"><h2>Members</h2></div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Node</th><th>Roles</th><th>Address</th><th>Seen</th><th>Version</th><th>Replication</th><th>Scans</th><th></th></tr></thead>
+    <thead><tr><th>Node</th><th>Roles</th><th>Address</th><th>Seen</th><th>Version</th><th>Replication</th><th>Scans</th><th>Settings</th><th></th></tr></thead>
     <tbody>
     {% for m in members %}
       <tr{% if !m.active %} class="muted"{% endif %}>
-        <td><b>{{ m.name }}</b> <span class="mono muted">{{ m.short }}</span>{% if !m.active %} <span class="badge badge-status" data-status="failed">revoked</span>{% endif %}
+        <td><b>{{ m.name }}</b> <span class="mono muted">{{ m.short }}</span>{% if !m.active %} <span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% endif %}{% if m.blocked %} <span class="badge badge-status" data-status="failed">blocked</span>{% endif %}
           {% if m.incompatible %}<br><span class="badge badge-status" data-status="failed">incompatible version</span>{% endif %}
           {% if let Some(s) = m.skew %}<br><span class="badge badge-status" data-status="running" title="Run NTP on every node: scan cooldowns compare timestamps from different nodes.">clock {{ s }}</span>{% endif %}
           {% if let Some(e) = m.error %}<br><span class="muted mono small">{{ e }}</span>{% endif %}</td>
-        <td>{{ m.roles }}</td>
+        <td>{{ m.roles }}{% if !m.providers.is_empty() %}<br><span class="muted small">looks up: {{ m.providers }}</span>{% endif %}</td>
         <td class="mono">{{ m.address }}</td>
         <td><span class="badge badge-status" data-status="{% if m.live %}done{% else %}queued{% endif %}">{{ m.last_seen }}</span></td>
         <td class="mono">{{ m.version }}</td>
         <td>{{ m.lag }}</td>
         <td>{% if m.scanner %}{{ m.active_scans }} running{% endif %}</td>
-        <td>{% if m.active %}
-          <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-rev-{{ loop.index }}">Revoke</button>
-          <dialog id="dlg-rev-{{ loop.index }}"><h3>Revoke {{ m.name }}?</h3><p class="muted">Every node refuses it from now on. Its data stays. Rejoining needs a new invite.</p>
-            <form method="post" action="/admin/cluster/revoke" class="actions"><input type="hidden" name="key" value="{{ m.key }}">
-              <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Revoke</button></form></dialog>
+        <td>{% if m.key_held %}<a class="btn btn-sm" href="/admin/cluster/node/{{ m.key }}">Configure</a>{% else if m.remote_config %}<span class="muted">open for config key holders</span>{% else %}<span class="muted">locked</span>{% endif %}</td>
+        <td>{% if m.blocked %}
+          <form method="post" action="/admin/cluster/unblock"><input type="hidden" name="key" value="{{ m.key }}"><button class="btn btn-sm" type="submit">Unblock</button></form>
+        {% else %}
+          <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-block-{{ loop.index }}">Block</button>
+          <dialog id="dlg-block-{{ loop.index }}"><h3>Block {{ m.name }}?</h3><p class="muted">This node stops talking to it and shows none of its records. Nothing changes for other nodes: nobody can remove a member from the cluster. You can unblock it later.</p>
+            <form method="post" action="/admin/cluster/block" class="actions"><input type="hidden" name="key" value="{{ m.key }}">
+              <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Block</button></form></dialog>
         {% endif %}</td>
       </tr>
     {% endfor %}
-    {% if members.is_empty() %}<tr><td colspan="8" class="empty">No other members yet. Create an invite, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}
+    {% if members.is_empty() %}<tr><td colspan="9" class="empty">No other members yet. Create an invite, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}
     </tbody>
   </table></div>
+</section>
+<section class="card">
+  <div class="card-head"><h2>Invites</h2><span class="muted">created on this node</span></div>
+  <div class="banner banner-warning">Whoever holds a usable invite can join, and nobody can remove a member afterwards: other nodes can only block it for themselves. Set a use limit or an expiry when you hand an invite to more than one person.</div>
+  <form method="post" action="/admin/cluster/invite" class="filters">
+    <label>For <input name="label" maxlength="64" placeholder="peer group"></label>
+    <label>Expires after <input type="number" name="ttl_hours" min="1" max="8760" placeholder="never" size="6"> h</label>
+    <label>Use limit <input type="number" name="max_uses" min="1" max="10000" placeholder="none" size="6"></label>
+    <button class="btn btn-primary" type="submit">Create invite</button></form>
+  {% if !invites.is_empty() %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>For</th><th>State</th><th>Uses</th><th>Expires (UTC)</th><th>Created (UTC)</th><th>Joined</th><th></th></tr></thead>
+    <tbody>{% for i in invites %}<tr{% if !i.usable %} class="muted"{% endif %}>
+      <td>{{ i.label }}</td>
+      <td><span class="badge badge-status" data-status="{% if i.usable %}done{% else %}failed{% endif %}">{{ i.state }}</span></td>
+      <td>{{ i.uses }}</td><td class="ts">{{ i.expires }}</td><td class="ts">{{ i.created_at }}</td><td>{{ i.joined }}</td>
+      <td>{% if i.usable %}<form method="post" action="/admin/cluster/invite/revoke"><input type="hidden" name="id" value="{{ i.id }}"><button class="btn btn-sm btn-danger" type="submit">Revoke invite</button></form>{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>{% endif %}
+</section>
+<section class="card">
+  <div class="card-head"><h2>Configure another node</h2></div>
+  <p class="muted">Paste a config key its operator gave you. The key says which node it belongs to.</p>
+  <form method="post" action="/admin/cluster/config-key/add" class="filters"><label>Config key <input name="key" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Add key</button></form>
 </section>
 <section class="card">
   <div class="card-head"><h2>Scanner pace</h2><span class="muted">each scanner runs its own pace; the queue is shared</span></div>
@@ -67,20 +113,19 @@
   <p class="muted">0 workers or 0 scans per hour pauses a scanner. Values apply within seconds and persist on the scanner.</p>
 </section>
 <section class="card">
-  <div class="card-head"><h2>Shared intel</h2><span class="muted">fetched by one node, copied by hash</span></div>
+  <div class="card-head"><h2>Shared intel</h2><span class="muted">the Tor exit list: fetched by one node, copied by hash</span></div>
   {% if intel.is_empty() %}<p class="muted">Nothing announced yet.</p>{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>File</th><th>Version</th><th>Size</th><th>Fetched (UTC)</th><th>By</th><th>Here</th></tr></thead>
     <tbody>{% for i in intel %}<tr><td class="mono">{{ i.kind }}</td><td class="mono">{{ i.sha }}</td><td>{{ i.size }}</td><td class="ts">{{ i.fetched_at }}</td><td>{{ i.by }}</td>
       <td>{% if i.local %}<span class="badge badge-status" data-status="done">current</span>{% else %}<span class="badge badge-status" data-status="queued">copying</span>{% endif %}</td></tr>{% endfor %}</tbody>
   </table></div>{% endif %}
+  <p class="muted">GeoIP databases are not shared. A node that has them looks up the IPs other nodes recorded and shares the results.</p>
 </section>
-{% if can_join %}
-<section class="card"><h2>Join a cluster</h2>
+<section class="card"><h2>Join or rejoin a cluster</h2>
   <p class="muted">Paste an invite created on a member. This node's data is shared with the cluster, and the cluster's with it.</p>
   <form method="post" action="/admin/cluster/join" class="filters"><label>Invite token <input name="token" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Join</button></form>
 </section>
-{% endif %}
 </div>
 {% endmatch %}
 {% endblock %}

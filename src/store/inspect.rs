@@ -104,7 +104,24 @@ fn zstd_decode_capped(data: &[u8], limit: u64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// `(ip, provider, fetched_at, source_version, origin, data_json)`.
+pub type IntelRow = (String, String, String, Option<String>, Vec<u8>, String);
+
 impl Store {
+    /// Enrichment results with the node that looked them up, newest first.
+    /// Only IPs that still have a row (results outlive deleted IPs).
+    pub async fn intel_export(&self, limit: i64) -> Result<Vec<IntelRow>> {
+        Ok(sqlx::query_as(
+            "SELECT ip, provider, fetched_at, source_version, origin, data_json
+             FROM ip_intel
+             WHERE EXISTS (SELECT 1 FROM ips WHERE ips.ip = ip_intel.ip)
+             ORDER BY fetched_at DESC, ip LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn scans_for_ip(&self, ip_id: i64) -> Result<Vec<ScanSummary>> {
         let sql = format!("{SCAN_SELECT} WHERE s.ip_id = ? ORDER BY s.id DESC");
         Ok(

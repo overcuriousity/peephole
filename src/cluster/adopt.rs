@@ -2,15 +2,14 @@
 //! are signed into its log on the first start in distributed mode, so the
 //! cluster backfills them like any other data.
 use super::Node;
-use super::record::{FpClaimRec, IpEnrichRec, JobStatusRec, Record, ScanJobRec};
+use super::record::{FpClaimRec, IpIntelRec, JobStatusRec, Record, ScanJobRec};
 use super::repl;
 use crate::store::data;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use sqlx::SqliteConnection;
 use tracing::info;
 
 const BATCH: i64 = 500;
-const IPS_ADOPTED: &str = "cluster.ips_adopted";
 
 /// The record a standalone row would have been written as.
 async fn record_for(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Result<Option<Record>> {
@@ -86,10 +85,53 @@ async fn job_status_for(conn: &mut SqliteConnection, uid: &str) -> Result<Option
     })))
 }
 
+/// Give standalone rows uids that carry this node's prefix, as every record
+/// in a cluster must (see `NodeId::uid_prefix`). References between rows
+/// follow. Idempotent: rows that were already renamed are left alone.
+async fn bind_uids(node: &Node) -> Result<()> {
+    let p = node.id().uid_prefix();
+    let _g = node.apply_lock.lock().await;
+    let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    // References first, while the parents still carry their old uids.
+    for (child, col, parent) in [
+        ("fp_claims", "request_uid", "requests"),
+        ("fingerprints", "request_uid", "requests"),
+        ("scans", "job_uid", "scan_jobs"),
+    ] {
+        let sql = format!(
+            "UPDATE {child} SET {col} = ?1 || {col} WHERE {col} IN
+               (SELECT uid FROM {parent} WHERE origin IS NULL AND uid NOT LIKE ?1 || '%')"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&p)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for table in [
+        "requests",
+        "fp_claims",
+        "fingerprints",
+        "scan_jobs",
+        "scans",
+    ] {
+        let sql = format!(
+            "UPDATE {table} SET uid = ?1 || uid
+             WHERE origin IS NULL AND uid IS NOT NULL AND uid NOT LIKE ?1 || '%'"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&p)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Adopt all standalone rows; returns how many records were logged.
 pub async fn adopt_history(node: &Node) -> Result<u64> {
     let me = node.id().0.to_vec();
     let mut total = 0u64;
+    bind_uids(node).await?;
     // Parents before children, so receivers can link them.
     for (table, kind) in [
         ("requests", "request"),
@@ -148,7 +190,7 @@ pub async fn adopt_history(node: &Node) -> Result<u64> {
             tx.commit().await?;
         }
     }
-    total += adopt_ip_facts(node).await?;
+    total += adopt_intel(node).await?;
     if total > 0 {
         info!(
             records = total,
@@ -159,62 +201,57 @@ pub async fn adopt_history(node: &Node) -> Result<u64> {
     Ok(total)
 }
 
-/// GeoIP / Tor facts of every IP, once.
-async fn adopt_ip_facts(node: &Node) -> Result<u64> {
-    if node.store.setting_get(IPS_ADOPTED).await?.is_some() {
-        return Ok(0);
-    }
+/// Enrichment results recorded while standalone (origin empty) become this
+/// node's results in the log.
+async fn adopt_intel(node: &Node) -> Result<u64> {
+    let me = node.id().0.to_vec();
     let mut total = 0;
-    let mut after = 0i64;
     loop {
         let _g = node.apply_lock.lock().await;
         let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        type Row = (
-            i64,
-            String,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            bool,
-        );
+        type Row = (String, String, String, Option<String>, String);
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT id, ip, country, asn, asn_org, is_tor_exit FROM ips
-             WHERE id > ? AND (country IS NOT NULL OR asn IS NOT NULL OR is_tor_exit = 1)
-             ORDER BY id LIMIT ?",
+            "SELECT ip, provider, fetched_at, source_version, data_json FROM ip_intel
+             WHERE origin = x'' LIMIT ?",
         )
-        .bind(after)
         .bind(BATCH)
         .fetch_all(&mut *tx)
         .await?;
-        let Some(last) = rows.last().map(|r| r.0) else {
+        if rows.is_empty() {
             break;
-        };
-        for (id, ip, country, asn, asn_org, tor) in rows {
+        }
+        for (ip, provider, fetched_at, source_version, data_json) in rows {
             let e = repl::append_existing(
                 node,
                 &mut tx,
-                &Record::IpEnrich(IpEnrichRec {
-                    ip,
-                    country,
-                    asn,
-                    asn_org,
-                    tor,
+                &Record::IpIntel(IpIntelRec {
+                    ip: ip.clone(),
+                    provider: provider.clone(),
+                    fetched_at,
+                    source_version,
+                    data_json,
                 }),
             )
             .await?;
-            sqlx::query("UPDATE ips SET geo_hlc = ? WHERE id = ?")
-                .bind(e.hlc as i64)
-                .bind(id)
+            // Our own result under our key replaces the standalone row.
+            sqlx::query("DELETE FROM ip_intel WHERE ip = ? AND provider = ? AND origin = ?")
+                .bind(&ip)
+                .bind(&provider)
+                .bind(&me)
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query(
+                "UPDATE ip_intel SET origin = ?, hlc = ? WHERE ip = ? AND provider = ? AND origin = x''",
+            )
+            .bind(&me)
+            .bind(e.hlc as i64)
+            .bind(&ip)
+            .bind(&provider)
+            .execute(&mut *tx)
+            .await?;
             total += 1;
         }
         tx.commit().await?;
-        after = last;
     }
-    node.store
-        .setting_set(IPS_ADOPTED, "1")
-        .await
-        .context("marking ip facts adopted")?;
     Ok(total)
 }

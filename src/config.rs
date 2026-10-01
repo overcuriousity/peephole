@@ -45,6 +45,11 @@ pub struct ClusterConfig {
     /// Scan lease length; renewed while nmap runs.
     #[serde(default = "default_lease_secs")]
     pub lease_secs: u64,
+    /// Let holders of this node's config key change its runtime settings
+    /// (scan pace, rescan cooldown, roles). Default: only the local admin
+    /// interface, the CLI and this file can.
+    #[serde(default)]
+    pub remote_config: bool,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
 }

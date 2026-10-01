@@ -31,19 +31,36 @@ pub fn nmap_argv(level: u8, target: &IpAddr, cfg: &Config) -> Vec<String> {
     argv
 }
 
-/// Local, config-only refusal applied before nmap runs, in addition to the
-/// cluster [`Safety`] set: never scan a non-global address or anything in
-/// `never_scan`. Catches jobs that were queued before an operator edited
-/// `never_scan`, requeued orphans, and admin-requeued failed jobs.
-fn locally_refused(ip: &IpAddr, never: &[ipnet::IpNet]) -> Option<String> {
+/// Why this scanner will not run a job.
+#[derive(Debug, PartialEq)]
+enum Refusal {
+    /// Nobody may scan it (non-global address, a cluster member's address).
+    Never(String),
+    /// This scanner's own `never_scan` covers it; another scanner may take it.
+    Mine(String),
+}
+
+impl Refusal {
+    fn reason(&self) -> &str {
+        match self {
+            Refusal::Never(w) | Refusal::Mine(w) => w,
+        }
+    }
+}
+
+/// Config-only refusal applied before nmap runs: never scan a non-global
+/// address, and leave anything in this node's `never_scan` to others.
+/// Catches jobs that were queued before an operator edited `never_scan`,
+/// requeued orphans, and admin-requeued failed jobs.
+fn locally_refused(ip: &IpAddr, never: &[ipnet::IpNet]) -> Option<Refusal> {
     if !crate::net::is_scannable_target(*ip) {
-        return Some("non-global address".into());
+        return Some(Refusal::Never("non-global address".into()));
     }
     let canon = crate::net::canonical(*ip);
     never
         .iter()
         .find(|n| n.contains(&canon))
-        .map(|n| format!("never_scan {n}"))
+        .map(|n| Refusal::Mine(format!("never_scan {n}")))
 }
 
 /// A scan to run, and who to report it to.
@@ -87,13 +104,11 @@ enum Outcome {
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
 /// Skip an arbiter that did not answer for this long.
 const ARBITER_BACKOFF: Duration = Duration::from_secs(30);
-/// Rebuild the never-scan set this often (member list, DNS).
+/// Rebuild the member-address set this often (member list, DNS).
 const SAFETY_REFRESH: Duration = Duration::from_secs(300);
 
-/// Targets this scanner refuses: its own never_scan, every member's, and
-/// the addresses of all cluster members.
+/// Targets no scanner touches: the addresses of all cluster members.
 struct Safety {
-    nets: Vec<ipnet::IpNet>,
     addrs: std::collections::HashSet<IpAddr>,
     built: Option<std::time::Instant>,
 }
@@ -101,28 +116,19 @@ struct Safety {
 impl Safety {
     fn new() -> Self {
         Self {
-            nets: vec![],
             addrs: Default::default(),
             built: None,
         }
     }
 
-    async fn refresh(&mut self, node: &Node, own: &[ipnet::IpNet]) {
+    async fn refresh(&mut self, node: &Node) {
         if self.built.is_some_and(|t| t.elapsed() < SAFETY_REFRESH) {
             return;
         }
-        let mut nets = own.to_vec();
         let mut addrs = std::collections::HashSet::new();
         let mut hosts: Vec<String> = node.dial_targets().into_iter().map(|t| t.2).collect();
         if let Ok(rows) = crate::cluster::members::all(&node.store).await {
-            for m in rows {
-                nets.extend(
-                    m.never_scan
-                        .iter()
-                        .filter_map(|n| n.parse::<ipnet::IpNet>().ok()),
-                );
-                hosts.extend(m.address);
-            }
+            hosts.extend(rows.into_iter().filter_map(|m| m.address));
         }
         hosts.extend(node.cfg.advertise.clone());
         for h in hosts {
@@ -132,19 +138,14 @@ impl Safety {
                 addrs.extend(it.map(|sa| sa.ip()));
             }
         }
-        self.nets = nets;
         self.addrs = addrs;
         self.built = Some(std::time::Instant::now());
     }
 
     fn refuses(&self, ip: &IpAddr) -> Option<String> {
-        if self.addrs.contains(ip) {
-            return Some("cluster member address".into());
-        }
-        self.nets
-            .iter()
-            .find(|n| n.contains(ip))
-            .map(|n| format!("never_scan {n}"))
+        self.addrs
+            .contains(ip)
+            .then(|| "cluster member address".to_string())
     }
 }
 
@@ -152,6 +153,7 @@ impl Safety {
 struct Source {
     rec: Recorder,
     cfg: Config,
+    pace: pace::SharedPace,
     safety: tokio::sync::Mutex<Safety>,
     unreachable: std::sync::Mutex<std::collections::HashMap<NodeId, std::time::Instant>>,
 }
@@ -187,9 +189,9 @@ impl Source {
             // Re-check never_scan / non-global here too: the job may have been
             // queued before an operator edited never_scan, or requeued on
             // restart (standalone has no cluster Safety pre-flight otherwise).
-            if let Some(why) = locally_refused(&ip, &self.cfg.scan.never_scan) {
-                info!(target = %ip, %why, "scan refused");
-                let _ = self.rec.finish_job(job.id, None, Some(why.as_str())).await;
+            if let Some(r) = locally_refused(&ip, &self.cfg.scan.never_scan) {
+                info!(target = %ip, why = r.reason(), "scan refused");
+                let _ = self.rec.finish_job(job.id, None, Some(r.reason())).await;
                 return Box::pin(self.acquire()).await;
             }
             return Ok(Some(Job::Local {
@@ -210,6 +212,10 @@ impl Source {
             let Ok(arbiter) = NodeId::from_slice(&a) else {
                 continue;
             };
+            // No scan work for or from a peer this node blocked.
+            if node.is_blocked(&arbiter) {
+                continue;
+            }
             if self
                 .unreachable
                 .lock()
@@ -244,20 +250,29 @@ impl Source {
                 continue;
             };
             // Pre-flight: refused targets and duplicates never reach nmap.
-            // Non-global / never_scan first, then the cluster member set.
             let refused = match locally_refused(&ip, &self.cfg.scan.never_scan) {
                 some @ Some(_) => some,
                 None => {
                     let mut s = self.safety.lock().await;
-                    s.refresh(node, &self.cfg.scan.never_scan).await;
-                    s.refuses(&ip)
+                    s.refresh(node).await;
+                    s.refuses(&ip).map(Refusal::Never)
                 }
             };
-            if let Some(why) = refused {
-                info!(target = %ip, %why, "scan refused");
-                self.report(node, arbiter, &g.job_uid, "refused", Some(why))
-                    .await;
-                continue;
+            match refused {
+                Some(Refusal::Never(why)) => {
+                    info!(target = %ip, %why, "scan refused");
+                    self.report(node, arbiter, &g.job_uid, "refused", Some(why))
+                        .await;
+                    continue;
+                }
+                // Our own never_scan: hand the job back for another scanner.
+                Some(Refusal::Mine(why)) => {
+                    info!(target = %ip, %why, "scan declined");
+                    self.report(node, arbiter, &g.job_uid, "declined", Some(why))
+                        .await;
+                    continue;
+                }
+                None => {}
             }
             if self.duplicate(&g.job_uid, &g.ip, g.level).await? {
                 self.report(node, arbiter, &g.job_uid, "superseded", None)
@@ -288,7 +303,7 @@ impl Source {
         .bind(ip)
         .bind(uid)
         .bind(level)
-        .bind(format!("-{} hours", self.cfg.scan.rescan_cooldown_hours))
+        .bind(format!("-{} hours", self.pace.cooldown_hours()))
         .fetch_one(&self.rec.store().pool)
         .await?;
         Ok(n > 0)
@@ -484,6 +499,7 @@ pub async fn run_workers(
     let source = Arc::new(Source {
         rec: rec.clone(),
         cfg: cfg.clone(),
+        pace: pace.clone(),
         safety: tokio::sync::Mutex::new(Safety::new()),
         unreachable: Default::default(),
     });
@@ -614,6 +630,19 @@ license_key = "k"
         let argv = nmap_argv(2, &mapped, &cfg);
         assert!(!argv.contains(&"-6".to_string()), "{argv:?}");
         assert_eq!(argv.last().unwrap(), "203.0.113.9");
+    }
+
+    #[test]
+    fn own_never_scan_is_a_refusal_for_this_scanner_only() {
+        let never: Vec<ipnet::IpNet> = vec!["203.0.113.0/24".parse().unwrap()];
+        assert_eq!(
+            locally_refused(&"203.0.113.9".parse().unwrap(), &never),
+            Some(Refusal::Mine("never_scan 203.0.113.0/24".into()))
+        );
+        assert_eq!(
+            locally_refused(&"10.0.0.1".parse().unwrap(), &never),
+            Some(Refusal::Never("non-global address".into()))
+        );
     }
 
     #[test]

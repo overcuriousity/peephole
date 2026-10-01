@@ -8,6 +8,7 @@
 use super::Node;
 use super::identity::NodeId;
 use super::record::{ROW_BACKED, Record, WireEntry};
+use super::sync::Batch;
 use crate::store::data::{self, Ctx, Effect};
 use anyhow::Result;
 use sqlx::SqliteConnection;
@@ -94,7 +95,7 @@ pub async fn entries_after(
     wants: &[(NodeId, u64)],
     max_entries: usize,
     max_bytes: usize,
-) -> Result<Vec<WireEntry>> {
+) -> Result<Batch> {
     let mut conn = store.pool.acquire().await?;
     let mut out: Vec<WireEntry> = vec![];
     let mut bytes = 0usize;
@@ -161,7 +162,97 @@ pub async fn entries_after(
             out.push(e);
         }
     }
-    Ok(out)
+    // Erased entries travel with the tombstone that erased them.
+    let mut proofs = vec![];
+    let mut seen = std::collections::HashSet::new();
+    for e in &out {
+        if e.payload.is_some() {
+            continue;
+        }
+        let Some(tomb) = &e.erased_by else { continue };
+        if seen.insert((e.origin, tomb.clone()))
+            && let Some(p) = held_proof(&mut conn, &e.origin, tomb).await?
+        {
+            proofs.push(p);
+        }
+    }
+    Ok(Batch {
+        entries: out,
+        proofs,
+    })
+}
+
+/// The tombstone `tomb_uid` of `origin` as we hold it: in the log, or
+/// stored as a proof ahead of its arrival there.
+async fn held_proof(
+    conn: &mut SqliteConnection,
+    origin: &NodeId,
+    tomb_uid: &str,
+) -> Result<Option<WireEntry>> {
+    let row: Option<LogRow> = sqlx::query_as(
+        "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by FROM repl_log
+         WHERE origin = ? AND kind = 'tombstone' AND uid = ? AND payload IS NOT NULL",
+    )
+    .bind(&origin.0[..])
+    .bind(tomb_uid)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(r) = row {
+        return Ok(Some(from_row(r)?));
+    }
+    let blob: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT entry FROM tomb_proofs WHERE origin = ? AND tomb_uid = ?")
+            .bind(&origin.0[..])
+            .bind(tomb_uid)
+            .fetch_optional(&mut *conn)
+            .await?;
+    Ok(match blob {
+        Some(b) => Some(super::rpc::cbor::decode(&b)?),
+        None => None,
+    })
+}
+
+/// Whether `proof` is a tombstone, signed by the stub's origin, that names
+/// exactly this entry: its uid at its position in the origin's log. The
+/// stub itself is unsigned, so nothing else in it is taken on trust.
+fn proves(proof: &WireEntry, e: &WireEntry) -> bool {
+    let (Some(uid), Some(tomb)) = (&e.uid, &e.erased_by) else {
+        return false;
+    };
+    proof.origin == e.origin
+        && proof.kind == "tombstone"
+        && proof.uid.as_deref() == Some(tomb.as_str())
+        && e.seq < proof.seq
+        && uid.starts_with(&e.origin.uid_prefix())
+        && proof.verify()
+        && matches!(proof.record(), Some(Record::Tombstone(t))
+            if t.uids.len() == t.seqs.len()
+                && t.uids.iter().zip(&t.seqs).any(|(u, s)| u == uid && *s == e.seq))
+}
+
+/// Check an erased stub against the batch's proofs and the tombstones we
+/// hold. A proof that is new to us is stored so we can relay the erasure.
+async fn erasure_proven(
+    conn: &mut SqliteConnection,
+    proofs: &[WireEntry],
+    e: &WireEntry,
+) -> Result<bool> {
+    let Some(tomb) = &e.erased_by else {
+        return Ok(false);
+    };
+    if let Some(held) = held_proof(conn, &e.origin, tomb).await? {
+        return Ok(proves(&held, e));
+    }
+    let Some(p) = proofs.iter().find(|p| proves(p, e)) else {
+        return Ok(false);
+    };
+    sqlx::query("INSERT OR IGNORE INTO tomb_proofs (origin, tomb_uid, entry) VALUES (?, ?, ?)")
+        .bind(&e.origin.0[..])
+        .bind(tomb)
+        .bind(super::rpc::cbor::encode(p)?)
+        .execute(&mut *conn)
+        .await?;
+    Ok(true)
 }
 
 /// Raise the held head of `origin` to `seq` (entries never go away, so
@@ -198,19 +289,18 @@ async fn insert_log(conn: &mut SqliteConnection, e: &WireEntry, applied: bool) -
     Ok(())
 }
 
-/// Whether records from `origin` are accepted: this node, or an admitted
-/// member that has not been revoked since.
+/// Whether records from `origin` are accepted: this node, or any node that
+/// was ever admitted. Leaving or being pruned ends a node's access, not the
+/// validity of what it recorded.
 pub async fn trusted(node: &Node, conn: &mut SqliteConnection, origin: &NodeId) -> Result<bool> {
     if *origin == node.id() {
         return Ok(true);
     }
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM members WHERE id = ? AND admitted_hlc > 0
-           AND (revoked_hlc IS NULL OR admitted_hlc > revoked_hlc)",
-    )
-    .bind(&origin.0[..])
-    .fetch_one(&mut *conn)
-    .await?;
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM members WHERE id = ? AND admitted_hlc > 0")
+            .bind(&origin.0[..])
+            .fetch_one(&mut *conn)
+            .await?;
     Ok(n > 0)
 }
 
@@ -227,6 +317,13 @@ pub async fn append_in_tx(
         .max(pending_head(conn, &me).await?)
         + 1;
     let e = WireEntry::sign(&node.identity, seq, node.hlc.now(), record)?;
+    // Peers drop an entry whose uid is not bound to its origin, and with it
+    // everything after it in our log: never write one.
+    if let Some(uid) = &e.uid
+        && !uid.starts_with(&me.uid_prefix())
+    {
+        anyhow::bail!("record uid `{uid}` does not carry this node's prefix");
+    }
     insert_log(conn, &e, true).await?;
     let settled = apply_record(node, conn, &e, record).await?;
     Ok((e, settled.membership))
@@ -282,7 +379,8 @@ pub async fn append(node: &Node, records: &[Record]) -> Result<Vec<WireEntry>> {
 }
 
 /// Apply entries received from a peer (any origin).
-pub async fn apply_batch(node: &Node, entries: Vec<WireEntry>) -> Result<Applied> {
+pub async fn apply_batch(node: &Node, batch: impl Into<Batch>) -> Result<Applied> {
+    let Batch { entries, proofs } = batch.into();
     let mut st = Applied::default();
     if entries.is_empty() {
         return Ok(st);
@@ -290,7 +388,7 @@ pub async fn apply_batch(node: &Node, entries: Vec<WireEntry>) -> Result<Applied
     let guard = node.apply_lock.lock().await;
     let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     for e in entries {
-        apply_one(node, &mut tx, e, &mut st).await?;
+        apply_one(node, &mut tx, e, &proofs, &mut st).await?;
     }
     if st.applied > 0 {
         drain_pending(node, &mut tx, &mut st).await?;
@@ -312,6 +410,7 @@ async fn apply_one(
     node: &Node,
     conn: &mut SqliteConnection,
     e: WireEntry,
+    proofs: &[WireEntry],
     st: &mut Applied,
 ) -> Result<()> {
     let have = log_head(conn, &e.origin).await?;
@@ -325,7 +424,16 @@ async fn apply_one(
         return Ok(());
     }
     if e.payload.is_none() {
-        return apply_stub(node, conn, e, held > have, st).await;
+        return apply_stub(node, conn, e, held > have, proofs, st).await;
+    }
+    // A uid must carry its origin's prefix: otherwise a node could create a
+    // record under another node's uid and shadow or delete the original.
+    if let Some(uid) = &e.uid
+        && !uid.starts_with(&e.origin.uid_prefix())
+    {
+        warn!(origin = %e.origin.short(), seq = e.seq, "entry whose uid is not bound to its origin dropped");
+        st.rejected += 1;
+        return Ok(());
     }
     // Verify before parking too, so junk never takes up space or blocks
     // the real entry at that position.
@@ -360,23 +468,20 @@ async fn park(conn: &mut SqliteConnection, e: &WireEntry) -> Result<()> {
 
 /// An entry its origin deleted (payload erased, `erased_by` naming the
 /// tombstone). The tombstone sits *later* in the same origin's in-order
-/// stream, so requiring it first would stall the origin forever; instead a
-/// stub from a trusted origin is applied immediately (remembering the uid as
-/// deleted), and one from an untrusted/not-yet-trusted origin — or behind a
-/// gap — is parked for a later drain. NOTE: erased stubs carry no signature
-/// (the payload, and thus the signature, were dropped on erasure), so a
-/// trusted relaying member could forge one; this matches the existing threat
-/// model (any member may delete anything) but a future protocol revision
-/// should sign stubs at the origin.
+/// stream, so the stub cannot wait for it; instead it must come with that
+/// tombstone as proof: signed by the stub's origin and listing its uid. A
+/// stub without one is rejected, so a relay cannot make this node drop
+/// records their origin never deleted.
 async fn apply_stub(
     node: &Node,
     conn: &mut SqliteConnection,
     e: WireEntry,
     blocked: bool,
+    proofs: &[WireEntry],
     st: &mut Applied,
 ) -> Result<()> {
-    if e.erased_by.is_none() {
-        // A payload-less entry that is not an erased stub is malformed.
+    if !erasure_proven(conn, proofs, &e).await? {
+        warn!(origin = %e.origin.short(), seq = e.seq, "erased entry without a valid tombstone dropped");
         st.rejected += 1;
         return Ok(());
     }
@@ -555,6 +660,51 @@ async fn retry_deferred(node: &Node, conn: &mut SqliteConnection, st: &mut Appli
     }
 }
 
+/// Entries replayed per transaction by [`rematerialize`], so the write lock
+/// is never held for long.
+const REPLAY_BATCH: usize = 1000;
+
+/// Apply log entries that are held with their payload but have no row:
+/// after an unblock, everything the block kept out of the tables. Records an
+/// admin hid stay hidden. Returns how many entries were looked at.
+pub async fn rematerialize(node: &Node) -> Result<usize> {
+    // Parents first; job state after the jobs it refers to. Only the keys
+    // are collected up front; the entries are loaded batch by batch.
+    let keys: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT origin, seq FROM repl_log
+         WHERE payload IS NOT NULL
+           AND kind IN ('request','scan_job','job_adopt','job_status','fp_claim',
+                        'fingerprint','scan_result','ip_intel')
+         ORDER BY CASE kind WHEN 'request' THEN 0 WHEN 'scan_job' THEN 1
+                            WHEN 'job_adopt' THEN 2 WHEN 'job_status' THEN 3 ELSE 4 END, hlc",
+    )
+    .fetch_all(&node.store.pool)
+    .await?;
+    for batch in keys.chunks(REPLAY_BATCH) {
+        let _g = node.apply_lock.lock().await;
+        let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        for (origin, seq) in batch {
+            let row: Option<LogRow> = sqlx::query_as(
+                "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by FROM repl_log
+                 WHERE origin = ? AND seq = ?",
+            )
+            .bind(origin)
+            .bind(seq)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(e) = row.map(from_row).transpose()? else {
+                continue;
+            };
+            if let Some(rec) = e.record() {
+                apply_record(node, &mut tx, &e, &rec).await?;
+            }
+        }
+        tx.commit().await?;
+    }
+    node.notify_changed();
+    Ok(keys.len())
+}
+
 /// What applying a record did, beyond its table effects.
 #[derive(Default, Clone, Copy)]
 struct Settled {
@@ -638,13 +788,12 @@ mod tests {
                 key_path: None,
                 takeover_hours: 6.0,
                 lease_secs: 120,
+                remote_config: false,
                 peers: vec![],
             },
             roles: Default::default(),
-            never_scan: vec![],
             store: store.clone(),
             proto: (1, 1),
-            has_maxmind: false,
             data_dir: dir.path().to_path_buf(),
         })
         .await
@@ -657,9 +806,9 @@ mod tests {
                 name: "o".into(),
                 address: None,
                 roles: vec![],
-                never_scan: vec![],
                 proto_min: 1,
                 proto_max: 1,
+                remote_config: false,
             })
         };
         // A parked entry from an unknown origin counts as held.

@@ -209,4 +209,82 @@ advertise = "scanner-1.example:7443"
         "{members}"
     );
     assert!(members.contains("roles=scanner"), "{members}");
+    // The config key exists only with remote configuration switched on.
+    let out = bin()
+        .args(["cluster", "config-key", "show"])
+        .arg(cfg.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "locked node has no usable key");
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        text.replace(
+            "node_name = \"scanner-1\"",
+            "node_name = \"scanner-1\"\nremote_config = true",
+        ),
+    )
+    .unwrap();
+    let shown = run(&["config-key", "show"]);
+    assert!(shown.starts_with("peephole-cfg1:"), "{shown}");
+    let rotated = run(&["config-key", "rotate"]);
+    assert!(
+        rotated.starts_with("peephole-cfg1:") && rotated != shown,
+        "{rotated}"
+    );
+    assert_eq!(run(&["config-key", "show"]), rotated);
+}
+
+#[test]
+fn settings_are_shown_set_and_reset_from_the_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("c.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"
+trap_listen = "127.0.0.1:1"
+rules_dir = "rules"
+database_path = "{d}/t.db"
+data_dir = "{d}"
+[roles]
+scanner = false
+web = false
+"#,
+            d = dir.path().display()
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        bin()
+            .arg("settings")
+            .args(args)
+            .arg(cfg.to_str().unwrap())
+            .output()
+            .unwrap()
+    };
+    let text = |o: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+    let out = run(&["set", "scan.rescan_cooldown_hours", "48"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let shown = text(&run(&["show"]));
+    assert!(
+        shown.contains("scan.rescan_cooldown_hours")
+            && shown.contains("48")
+            && shown.contains("override"),
+        "{shown}"
+    );
+    // The only role cannot be switched off; an unknown key is refused.
+    let out = run(&["set", "roles.listener", "false"]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("at least one role"), "{}", text(&out));
+    assert!(!run(&["set", "scan.level_argv", "x"]).status.success());
+    let out = run(&["reset", "scan.rescan_cooldown_hours"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!text(&run(&["show"])).contains("override"));
 }

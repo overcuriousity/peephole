@@ -2,7 +2,6 @@
 //! directly, so they work on headless nodes and while the daemon runs; the
 //! daemon picks up their changes within a few seconds.
 use super::identity::{Identity, NodeId};
-use super::record::Record;
 use super::{Node, NodeParams, invite, members, repl};
 use crate::config::Config;
 use crate::store::Store;
@@ -11,11 +10,18 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub const USAGE: &str = "usage: peephole cluster id [CONFIG]
-       peephole cluster invite [--ttl HOURS] [CONFIG]
+       peephole cluster invite [--label TEXT] [--ttl HOURS] [--uses N] [CONFIG]
+       peephole cluster invites [CONFIG]
+       peephole cluster invite-revoke ID [CONFIG]
        peephole cluster join TOKEN [CONFIG]
        peephole cluster members [CONFIG]
        peephole cluster status [CONFIG]
-       peephole cluster revoke NODE [CONFIG]   (NODE: name, fingerprint or ed25519:… key)";
+       peephole cluster config-key show|rotate [CONFIG]
+       peephole cluster config-key add KEY [CONFIG]
+       peephole cluster config-key forget NODE [CONFIG]
+       peephole cluster block NODE [CONFIG]     (NODE: name, fingerprint or ed25519:… key)
+       peephole cluster unblock NODE [CONFIG]
+       peephole cluster leave [CONFIG]";
 
 /// `--name value` pairs.
 type Flags = Vec<(String, String)>;
@@ -92,17 +98,67 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             eprintln!("fingerprint {}", id.id.short());
         }
         Some("invite") => {
-            reject_unknown_flags(&flags, &["ttl"])?;
-            let ttl = match flags.iter().find(|(k, _)| k == "ttl") {
-                Some((_, v)) => v.parse().context("--ttl: hours")?,
-                None => invite::DEFAULT_TTL_HOURS,
+            reject_unknown_flags(&flags, &["label", "ttl", "uses"])?;
+            let flag = |name: &str| {
+                flags
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_str())
+            };
+            let opts = invite::InviteOpts {
+                label: flag("label").unwrap_or_default().to_string(),
+                ttl_hours: flag("ttl")
+                    .map(|v| v.parse().context("--ttl: hours"))
+                    .transpose()?,
+                max_uses: flag("uses")
+                    .map(|v| v.parse().context("--uses: a number"))
+                    .transpose()?,
             };
             let (_, node) = open(cfg_at(1)).await?;
-            let token = invite::create(&node, ttl).await?;
+            let token = invite::create(&node, &opts).await?;
             println!("{token}");
             eprintln!(
-                "one-time invite, valid {ttl}h. On the new node: peephole cluster join <token>"
+                "reusable invite. Whoever holds it can join, and a member cannot be removed \
+                 afterwards, only blocked node by node. Limit it with --uses or --ttl; \
+                 revoke it with: peephole cluster invite-revoke <id> (see: peephole cluster invites)"
             );
+        }
+        Some("invites") => {
+            reject_unknown_flags(&flags, &[])?;
+            let cfg = Config::load(Path::new(cfg_at(1)))?;
+            let store = Store::connect(&cfg.database_path).await?;
+            for i in invite::list(&store).await? {
+                println!(
+                    "{:<4} {:<8} uses {}{}  expires {}  created {}  {}",
+                    i.id,
+                    if i.usable {
+                        "usable"
+                    } else if i.revoked {
+                        "revoked"
+                    } else {
+                        "closed"
+                    },
+                    i.uses,
+                    i.max_uses.map(|m| format!("/{m}")).unwrap_or_default(),
+                    i.expires_at.as_deref().unwrap_or("never"),
+                    i.created_at,
+                    i.label
+                );
+                for n in i.joined {
+                    println!("       joined: {}", n.short());
+                }
+            }
+        }
+        Some("invite-revoke") => {
+            reject_unknown_flags(&flags, &[])?;
+            let id: i64 = pos.get(1).context(USAGE)?.parse().context("invite id")?;
+            let cfg = Config::load(Path::new(cfg_at(2)))?;
+            let store = Store::connect(&cfg.database_path).await?;
+            if invite::revoke(&store, id).await? {
+                println!("invite {id} revoked; members that joined with it stay");
+            } else {
+                bail!("no usable invite {id}");
+            }
         }
         Some("join") => {
             reject_unknown_flags(&flags, &[])?;
@@ -133,20 +189,29 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 sqlx::query_as("SELECT id, last_ok, last_error FROM peer_contact")
                     .fetch_all(&store.pool)
                     .await?;
+            let blocked = super::block::list(&store).await?;
+            if let Some(d) = crate::cluster::Detached::read(&store).await? {
+                println!("{}", d.label());
+            }
             for m in rows {
                 let me = if Some(m.id) == my_id {
                     " (this node)"
                 } else {
                     ""
                 };
-                let state = if m.active { "active" } else { "revoked" };
+                let state = m.standing.label();
                 println!(
-                    "{:<20} {}  {:<8} {:<28} roles={}{}",
+                    "{:<20} {}  {:<12} {:<28} roles={}{}{}",
                     m.name,
                     m.id.short(),
                     state,
                     m.address.as_deref().unwrap_or("(outbound-only)"),
                     m.roles.join(","),
+                    if blocked.contains(&m.id) {
+                        " blocked"
+                    } else {
+                        ""
+                    },
                     me
                 );
                 if status {
@@ -161,17 +226,80 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 }
             }
         }
-        Some("revoke") => {
+        Some(cmd @ ("block" | "unblock")) => {
             reject_unknown_flags(&flags, &[])?;
             let who = pos.get(1).context(USAGE)?;
             let (_, node) = open(cfg_at(2)).await?;
-            let rows = members::all(&node.store).await?;
-            let id = resolve(&rows, who)?;
-            if id == node.id() {
-                bail!("a node cannot revoke itself; revoke it from another member");
+            let id = resolve(&members::all(&node.store).await?, who)?;
+            if cmd == "block" {
+                let n = super::block::block(&node, id).await?;
+                println!(
+                    "blocked {}: this node no longer talks to it and shows none of its records \
+                     ({n} taken out of view). Other nodes are unaffected.",
+                    id.short()
+                );
+            } else if super::block::unblock(&node, id).await? {
+                println!("unblocked {}; its records are back", id.short());
+            } else {
+                println!("{} was not blocked", id.short());
             }
-            repl::append(&node, &[Record::MemberRevoke { id }]).await?;
-            println!("revoked {}; the cluster refuses it from now on", id.short());
+        }
+        Some("config-key") => {
+            reject_unknown_flags(&flags, &[])?;
+            let sub = pos.get(1).map(String::as_str);
+            let takes_arg = matches!(sub, Some("add" | "forget"));
+            let cfg = Config::load(Path::new(cfg_at(if takes_arg { 3 } else { 2 })))?;
+            let Some(c) = &cfg.cluster else {
+                bail!("config has no [cluster] section");
+            };
+            let store = Store::connect(&cfg.database_path).await?;
+            let me = Identity::load_or_create(&cfg.node_key_path())?.id;
+            match sub {
+                Some("show" | "rotate") => {
+                    if !c.remote_config {
+                        bail!(
+                            "remote configuration is off (cluster.remote_config = false): \
+                             this node has no usable config key"
+                        );
+                    }
+                    let key = if sub == Some("rotate") {
+                        super::confkey::rotate(&store, me).await?
+                    } else {
+                        super::confkey::ensure(&store, me).await?
+                    };
+                    println!("{}", key.encode());
+                    eprintln!(
+                        "whoever holds this key can change this node's scan pace, rescan \
+                         cooldown and roles. `peephole cluster config-key rotate` withdraws it \
+                         from everyone."
+                    );
+                }
+                Some("add") => {
+                    let id = super::confkey::add(&store, me, pos.get(2).context(USAGE)?).await?;
+                    println!(
+                        "config key for {} stored; configure it on Admin → Cluster",
+                        id.short()
+                    );
+                }
+                Some("forget") => {
+                    let id = resolve(&members::all(&store).await?, pos.get(2).context(USAGE)?)?;
+                    if super::confkey::forget(&store, &id).await? {
+                        println!("config key for {} forgotten", id.short());
+                    } else {
+                        println!("no config key held for {}", id.short());
+                    }
+                }
+                _ => bail!("{USAGE}"),
+            }
+        }
+        Some("leave") => {
+            reject_unknown_flags(&flags, &[])?;
+            let (_, node) = open(cfg_at(1)).await?;
+            let told = super::leave(&node).await?;
+            println!(
+                "left the cluster ({told} peer(s) told). This node keeps its data and no \
+                 longer syncs; rejoin with: peephole cluster join <token>"
+            );
         }
         _ => bail!("{USAGE}"),
     }

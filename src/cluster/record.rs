@@ -17,10 +17,11 @@ pub struct MemberInfo {
     /// `host:port` others dial; None for outbound-only nodes.
     pub address: Option<String>,
     pub roles: Vec<String>,
-    /// CIDRs this node never scans; every scanner honours them.
-    pub never_scan: Vec<String>,
     pub proto_min: u32,
     pub proto_max: u32,
+    /// Whether the node lets config key holders change its runtime settings.
+    #[serde(default)]
+    pub remote_config: bool,
 }
 
 /// A request caught by a trap listener. Timestamps everywhere are UTC
@@ -43,14 +44,18 @@ pub struct RequestRec {
     pub page_token: Option<String>,
 }
 
-/// GeoIP / Tor facts about an IP (last write wins by HLC).
+/// One provider's result for an IP (per origin, newest wins by HLC).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct IpEnrichRec {
+pub struct IpIntelRec {
     pub ip: String,
-    pub country: Option<String>,
-    pub asn: Option<i64>,
-    pub asn_org: Option<String>,
-    pub tor: bool,
+    /// `maxmind-geolite2`, `tor-exits`; later `shodan`, `abuseipdb`.
+    pub provider: String,
+    pub fetched_at: String,
+    /// Version of the provider's data, if it has one (database build date).
+    pub source_version: Option<String>,
+    /// Provider-specific fields as a JSON object. `{}`: the provider was
+    /// asked and knows nothing.
+    pub data_json: String,
 }
 
 /// "I landed here by accident" claim.
@@ -143,37 +148,27 @@ pub struct ScanResultRec {
 /// A new version of a shared intel file, fetched by the origin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntelManifestRec {
-    /// `geolite2-city`, `geolite2-asn` or `tor-exits`.
+    /// Only `tor-exits`; other kinds (old `geolite2-*` announcements) are
+    /// ignored.
     pub kind: String,
     pub sha256: String,
     pub size: u64,
     pub fetched_at: String,
 }
 
-/// What a tombstone deletes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "t", rename_all = "snake_case")]
-pub enum TombTarget {
-    /// These requests with their claims and fingerprints.
-    Requests {
-        uids: Vec<String>,
-    },
-    /// Everything about an IP recorded up to the tombstone's HLC.
-    Ip {
-        ip: String,
-    },
-    Scan {
-        uid: String,
-    },
-    Claim {
-        uid: String,
-    },
-}
-
+/// A delete by the node that created the listed records. Wherever it is
+/// applied, it only affects entries of the tombstone's own origin; uids of
+/// other nodes' records in the list are ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TombstoneRec {
     pub uid: String,
-    pub target: TombTarget,
+    pub uids: Vec<String>,
+    /// Position of each listed record in the origin's log (`seqs[i]` belongs
+    /// to `uids[i]`). An erased entry is only accepted at a position its
+    /// tombstone names, so a relay cannot pass off another entry as erased.
+    /// Empty on a standalone node, which has no log.
+    #[serde(default)]
+    pub seqs: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -188,7 +183,7 @@ pub enum Record {
         id: NodeId,
     },
     Request(RequestRec),
-    IpEnrich(IpEnrichRec),
+    IpIntel(IpIntelRec),
     FpClaim(FpClaimRec),
     Fingerprint(FingerprintRec),
     ScanJob(ScanJobRec),
@@ -210,7 +205,7 @@ impl Record {
             Record::MemberUpdate(_) => "member_update",
             Record::MemberRevoke { .. } => "member_revoke",
             Record::Request(_) => "request",
-            Record::IpEnrich(_) => "ip_enrich",
+            Record::IpIntel(_) => "ip_intel",
             Record::FpClaim(_) => "fp_claim",
             Record::Fingerprint(_) => "fingerprint",
             Record::ScanJob(_) => "scan_job",
@@ -341,9 +336,9 @@ mod tests {
             name: "n".into(),
             address: Some("h:1".into()),
             roles: vec!["listener".into()],
-            never_scan: vec![],
             proto_min: 1,
             proto_max: 1,
+            remote_config: false,
         }
     }
 

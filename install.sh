@@ -4,11 +4,18 @@
 #
 # Re-running upgrades an existing installation. Environment overrides:
 #   MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY, PEEPHOLE_DOMAIN, PEEPHOLE_TRUSTED_PROXIES  (first install)
-#   PEEPHOLE_ROLES     comma-separated subset of listener,scanner,web (default: all three)
-#   PEEPHOLE_CLUSTER_NAME      enables distributed mode with this node name (first install)
-#   PEEPHOLE_CLUSTER_LISTEN    RPC listener (default 0.0.0.0:7443)
+#   PEEPHOLE_LOCAL_PROXY=1|0  a reverse proxy on this machine fronts the trap (first install);
+#                      when 1, PEEPHOLE_TRUSTED_PROXIES is ignored and loopback is trusted instead
+#   PEEPHOLE_TTY       read the wizard's answers from this file instead of the terminal (tests)
+#   PEEPHOLE_ROLES     comma-separated subset of listener,scanner,web (asked when a terminal is
+#                      present; all three when there is none)
+#   PEEPHOLE_CLUSTER=1|0       take part in a cluster (a preset PEEPHOLE_CLUSTER_NAME implies 1)
+#   PEEPHOLE_CLUSTER_NAME      this node's name in the cluster (first install)
+#   PEEPHOLE_CLUSTER_LISTEN    RPC listener (the prompt offers 0.0.0.0:7443; required in an
+#                              unattended cluster install)
 #   PEEPHOLE_CLUSTER_ADVERTISE host:port peers dial (omit for an outbound-only node)
 #   PEEPHOLE_JOIN_TOKEN        invite from an existing member; joined before the first start
+#   PEEPHOLE_REMOTE_CONFIG=1|0 let holders of this node's config key change its settings (cluster only)
 #   PEEPHOLE_FORCE=1   reinstall even when the installed version matches
 #   BASE_URL           alternative download base (tests, mirrors)
 #
@@ -50,39 +57,65 @@ if [ "${PEEPHOLE_ALLOW_NO_SYSTEMD:-0}" != "1" ] && [ "$(cat /proc/1/comm 2>/dev/
 fi
 [ "$(uname -m)" = "x86_64" ] || die "only x86_64 builds are published; build from source on $(uname -m) (see README)"
 
-# Interactive only if a terminal can actually be opened (in containers
-# /dev/tty may exist without one).
-if { exec 3</dev/tty; } 2>/dev/null; then INTERACTIVE=1; exec 3<&-; else INTERACTIVE=0; fi
-
-prompt() {
-    # prompt <varname> <message> [default]
-    local var="$1" msg="$2" default="${3:-}" value
-    if [ -n "${!var:-}" ]; then return 0; fi
-    [ "$INTERACTIVE" -eq 1 ] || die "missing required setting: ${var} (set it as an environment variable for non-interactive installs)"
-    if [ -n "$default" ]; then printf '%s [%s]: ' "$msg" "$default" > /dev/tty; else printf '%s: ' "$msg" > /dev/tty; fi
-    read -r value < /dev/tty
-    [ -n "$value" ] || value="$default"
-    [ -n "$value" ] || die "no value provided for ${var}"
-    printf -v "$var" '%s' "$value"
-}
-
-# Like prompt, but an empty answer (or a non-interactive install without the
-# variable) leaves it empty.
-prompt_optional() {
-    local var="$1" msg="$2" value
-    if [ -n "${!var:-}" ] || [ "$INTERACTIVE" -ne 1 ]; then return 0; fi
-    printf '%s (empty to skip): ' "$msg" > /dev/tty
-    read -r value < /dev/tty
-    printf -v "$var" '%s' "$value"
-}
-
-has_role() { [[ ",${PEEPHOLE_ROLES}," == *",$1,"* ]]; }
+# Questions are read from the terminal, or from the file PEEPHOLE_TTY names
+# (tests). One descriptor stays open so answers are consumed in order.
+# Interactive only if it can actually be opened (in containers /dev/tty may
+# exist without a terminal behind it).
+TTY_IN="${PEEPHOLE_TTY:-/dev/tty}"
+if { exec 3<"$TTY_IN"; } 2>/dev/null; then INTERACTIVE=1; else INTERACTIVE=0; fi
+# Prompts go to the terminal; when answers come from a file, to stderr.
+say() { if [ -z "${PEEPHOLE_TTY:-}" ] && [ "$INTERACTIVE" -eq 1 ]; then printf '%s' "$*" > /dev/tty; else printf '%s' "$*" >&2; fi; }
 
 toml_safe() {
     if [[ "$1" == *[\"\\]* ]] || [[ "$1" == *$'\n'* ]]; then
         die "value contains characters that are not allowed (quote, backslash, newline): $1"
     fi
 }
+
+prompt() {
+    # prompt <varname> <message> [default]: a required value.
+    local var="$1" msg="$2" default="${3:-}" value=""
+    if [ -n "${!var:-}" ]; then return 0; fi
+    [ "$INTERACTIVE" -eq 1 ] || die "missing required setting: ${var} (set it as an environment variable for non-interactive installs)"
+    if [ -n "$default" ]; then say "${msg} [${default}]: "; else say "${msg}: "; fi
+    read -r value <&3 || true
+    [ -n "$value" ] || value="$default"
+    [ -n "$value" ] || die "no value provided for ${var}"
+    toml_safe "$value"
+    printf -v "$var" '%s' "$value"
+}
+
+# Like prompt, but an empty answer (or a non-interactive install without the
+# variable) leaves it empty.
+prompt_optional() {
+    local var="$1" msg="$2" value=""
+    if [ -n "${!var:-}" ] || [ "$INTERACTIVE" -ne 1 ]; then return 0; fi
+    say "${msg} (empty to skip): "
+    read -r value <&3 || true
+    toml_safe "$value"
+    printf -v "$var" '%s' "$value"
+}
+
+# ask_yn <varname> <question> <default y|n>: sets the variable to 1 or 0.
+# A preset value (1/0/y/n/yes/no) is kept; without a terminal the default is
+# taken.
+ask_yn() {
+    local var="$1" msg="$2" default="$3" value="${!1:-}"
+    if [ -z "$value" ]; then
+        if [ "$INTERACTIVE" -eq 1 ]; then
+            if [ "$default" = y ]; then say "${msg} [Y/n]: "; else say "${msg} [y/N]: "; fi
+            read -r value <&3 || true
+        fi
+        [ -n "$value" ] || value="$default"
+    fi
+    case "$value" in
+        1|y|Y|yes|Yes|YES) printf -v "$var" '1' ;;
+        0|n|N|no|No|NO) printf -v "$var" '0' ;;
+        *) die "${var}: answer yes or no (got '${value}')" ;;
+    esac
+}
+
+has_role() { [[ ",${PEEPHOLE_ROLES}," == *",$1,"* ]]; }
 
 # --- prerequisites (only what is missing) ------------------------------------
 if [ "${PEEPHOLE_SKIP_APT:-0}" != "1" ]; then
@@ -133,6 +166,77 @@ if [ "$upgrade" -eq 1 ]; then
     fi
 fi
 
+# --- questions (first install only; nothing is written before they are done) --
+if [ "$upgrade" -ne 1 ]; then
+    ROLE_TRAP=""; ROLE_SCANNER=""; ROLE_WEB=""
+    if [ -z "${PEEPHOLE_ROLES:-}" ]; then
+        if [ "$INTERACTIVE" -eq 1 ]; then
+            say $'\nWhat should this node do? Any combination works; a cluster shares the work.\n'
+            ask_yn ROLE_TRAP "Run a trap (catch and record requests that reach no real site)?" y
+            ask_yn ROLE_SCANNER "Run the scanner (nmap counter-scans, from this machine's address)?" y
+            ask_yn ROLE_WEB "Have the web interface (public wall of shame and admin area)?" y
+            PEEPHOLE_ROLES=""
+            [ "$ROLE_TRAP" = 1 ] && PEEPHOLE_ROLES="listener"
+            [ "$ROLE_SCANNER" = 1 ] && PEEPHOLE_ROLES="${PEEPHOLE_ROLES:+$PEEPHOLE_ROLES,}scanner"
+            [ "$ROLE_WEB" = 1 ] && PEEPHOLE_ROLES="${PEEPHOLE_ROLES:+$PEEPHOLE_ROLES,}web"
+        else
+            PEEPHOLE_ROLES="listener,scanner,web"
+        fi
+    fi
+    PEEPHOLE_ROLES="$(printf '%s' "$PEEPHOLE_ROLES" | tr -d ' ')"
+    for r in $(printf '%s' "$PEEPHOLE_ROLES" | tr ',' ' '); do
+        case "$r" in listener|scanner|web) ;; *) die "unknown role '$r' in PEEPHOLE_ROLES (listener, scanner, web)";; esac
+    done
+    has_role listener || has_role scanner || has_role web || die "enable at least one of trap, scanner and web interface"
+    TRAP_LISTEN="0.0.0.0:8080"
+    if has_role listener; then
+        ask_yn PEEPHOLE_LOCAL_PROXY "Is a reverse proxy on this machine (nginx) in front of the trap?" n
+        if [ "$PEEPHOLE_LOCAL_PROXY" = 1 ]; then
+            TRAP_LISTEN="127.0.0.1:8080"
+            if [ -n "${PEEPHOLE_TRUSTED_PROXIES:-}" ] && [ "$PEEPHOLE_TRUSTED_PROXIES" != "127.0.0.1/32,::1/128" ]; then
+                warn "PEEPHOLE_TRUSTED_PROXIES is ignored: with a proxy on this machine only loopback is trusted"
+            fi
+            PEEPHOLE_TRUSTED_PROXIES="127.0.0.1/32,::1/128"
+        else
+            prompt PEEPHOLE_TRUSTED_PROXIES "Trusted proxy CIDRs, comma-separated (X-Forwarded-For is trusted from these)" "10.0.0.0/8"
+        fi
+    fi
+    if has_role web; then
+        prompt PEEPHOLE_DOMAIN "Public domain of the admin dashboard (WebAuthn relying party)"
+    fi
+    # A preset node name means "yes" (unattended installs from before this
+    # question existed).
+    [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ] && PEEPHOLE_CLUSTER="${PEEPHOLE_CLUSTER:-1}"
+    if [ "$INTERACTIVE" -eq 1 ] && [ -z "${PEEPHOLE_CLUSTER:-}" ]; then
+        say $'\nA cluster shares requests, the scan queue and results between nodes of different operators.\n'
+    fi
+    ask_yn PEEPHOLE_CLUSTER "Take part in a cluster (join one now or later, or start one)?" n
+    if [ "$PEEPHOLE_CLUSTER" = 1 ]; then
+        prompt PEEPHOLE_CLUSTER_NAME "This node's name (other operators see it in their admin area)"
+        prompt PEEPHOLE_CLUSTER_LISTEN "Cluster RPC listener" "0.0.0.0:7443"
+        prompt_optional PEEPHOLE_CLUSTER_ADVERTISE "Address other nodes dial (host:port; empty for an outbound-only node)"
+        prompt_optional PEEPHOLE_JOIN_TOKEN "Invite token from a member (empty to start a new cluster or join later)"
+        if [ "$INTERACTIVE" -eq 1 ] && [ -z "${PEEPHOLE_REMOTE_CONFIG:-}" ]; then
+            say $'\nRemote configuration: this node gets a config key. Whoever you give it to can change\nthis node\'s scan pace, rescan cooldown and roles from their own node. You can rotate the key at any time.\n'
+        fi
+        ask_yn PEEPHOLE_REMOTE_CONFIG "Allow holders of this node's config key to change its settings?" n
+        toml_safe "$PEEPHOLE_CLUSTER_NAME"; toml_safe "$PEEPHOLE_CLUSTER_LISTEN"
+        toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"; toml_safe "${PEEPHOLE_JOIN_TOKEN:-}"
+    fi
+    prompt_optional MAXMIND_ACCOUNT_ID "MaxMind GeoLite2 account ID (https://www.maxmind.com/en/accounts/current/license-key; optional: in a cluster the lookups of a member with credentials are shared, the databases are not)"
+    if [ -n "${MAXMIND_ACCOUNT_ID:-}" ]; then
+        prompt MAXMIND_LICENSE_KEY "MaxMind GeoLite2 license key"
+    else
+        warn "no MaxMind credentials: this node cannot look up GeoIP data; it shows what other cluster members look up, if any can"
+    fi
+    # Values that arrived preset from the environment were not checked by a prompt.
+    toml_safe "${PEEPHOLE_DOMAIN:-}"; toml_safe "${PEEPHOLE_TRUSTED_PROXIES:-}"
+    toml_safe "${PEEPHOLE_CLUSTER_NAME:-}"; toml_safe "${PEEPHOLE_CLUSTER_LISTEN:-}"; toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"
+    toml_safe "${MAXMIND_ACCOUNT_ID:-}"; toml_safe "${MAXMIND_LICENSE_KEY:-}"
+fi
+# The wizard is done (or was skipped on an upgrade); closing an fd that was never opened is harmless.
+exec 3<&-
+
 # --- install files -----------------------------------------------------------
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "${CONFIG_DIR}/rules"
 info "Installing binary to ${INSTALL_BIN}"
@@ -166,47 +270,24 @@ for rule in "${src}/rules/"*.toml; do
 done
 mv -f "$new_manifest" "$RULES_MANIFEST"
 
-install -m 0644 "${src}/deploy/nginx.example.conf" "${CONFIG_DIR}/nginx.example.conf"
-
 # --- configuration (first install only) --------------------------------------
+CONFIG_KEY=""
 if [ "$upgrade" -eq 1 ]; then
     info "Existing config at ${CONFIG_FILE} left untouched"
 else
     info "Configuring peephole"
-    PEEPHOLE_ROLES="${PEEPHOLE_ROLES:-listener,scanner,web}"
-    PEEPHOLE_ROLES="$(printf '%s' "$PEEPHOLE_ROLES" | tr -d ' ')"
-    for r in $(printf '%s' "$PEEPHOLE_ROLES" | tr ',' ' '); do
-        case "$r" in listener|scanner|web) ;; *) die "unknown role '$r' in PEEPHOLE_ROLES (listener, scanner, web)";; esac
-    done
-    prompt_optional MAXMIND_ACCOUNT_ID "MaxMind GeoLite2 account ID (https://www.maxmind.com/en/accounts/current/license-key; in a cluster one member with a key is enough)"
-    if [ -n "${MAXMIND_ACCOUNT_ID:-}" ]; then
-        prompt MAXMIND_LICENSE_KEY "MaxMind GeoLite2 license key"
-    else
-        warn "no MaxMind credentials: GeoIP enrichment is off unless a cluster member shares its databases"
-    fi
-    if has_role web; then
-        prompt PEEPHOLE_DOMAIN "Public domain of the admin dashboard (WebAuthn relying party)"
-        toml_safe "$PEEPHOLE_DOMAIN"
-    fi
-    if has_role listener; then
-        prompt PEEPHOLE_TRUSTED_PROXIES "Trusted proxy CIDRs, comma-separated (X-Forwarded-For is trusted from these)" "10.0.0.0/8"
-    fi
-    prompt_optional PEEPHOLE_CLUSTER_NAME "Distributed mode: this node's name"
-    if [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ]; then
-        prompt PEEPHOLE_CLUSTER_LISTEN "Cluster RPC listener" "0.0.0.0:7443"
-        prompt_optional PEEPHOLE_CLUSTER_ADVERTISE "Address other nodes dial (host:port; empty for an outbound-only node)"
-        toml_safe "$PEEPHOLE_CLUSTER_NAME"; toml_safe "$PEEPHOLE_CLUSTER_LISTEN"; toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"
-    fi
-    toml_safe "${MAXMIND_ACCOUNT_ID:-}"; toml_safe "${MAXMIND_LICENSE_KEY:-}"
     proxies_toml="$(printf '%s' "${PEEPHOLE_TRUSTED_PROXIES:-}" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | sed '/^$/d' | sed 's/.*/"&"/' | paste -sd',' -)"
     role() { if has_role "$1"; then echo true; else echo false; fi; }
+    # Written beside the download and checked first: a value the binary
+    # rejects leaves no config behind, so a re-run asks again.
+    new_config="${tmpdir}/config.toml"
     {
         echo "# peephole configuration — generated by install.sh"
         echo "# Full reference: https://github.com/${REPO}/blob/master/deploy/config.example.toml"
         if has_role listener; then
             echo
-            echo "# Trap listener: HAProxy routes fallback (nonexistent-route) traffic here directly."
-            echo 'trap_listen = "0.0.0.0:8080"'
+            echo "# Trap listener: your reverse proxy sends requests that match no real site here."
+            echo "trap_listen = \"${TRAP_LISTEN}\""
             echo "rules_dir = \"${CONFIG_DIR}/rules\""
             echo "# Proxies whose X-Forwarded-For header is trusted for the real client IP."
             echo "trusted_proxies = [${proxies_toml}]"
@@ -250,11 +331,11 @@ max_workers = 2            # concurrent nmap subprocesses
 timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admin queue page)
 rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
 max_scans_per_hour = 30    # rate cap of this scanner; excess jobs stay queued
-retention_days = 90        # delete requests and scan results older than this; 0 = keep forever
+retention_days = 90        # standalone only: delete older requests and scans; 0 = keep forever (ignored in a cluster)
 # Non-global addresses (loopback, private, link-local, …) are never scanned.
-never_scan = ["192.168.0.0/16"] # extra CIDRs never counter-scanned (own infra, monitoring)
+never_scan = ["192.168.0.0/16"] # extra CIDRs this node's scanner never scans (own infra, monitoring)
 CONFIG
-        if [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ]; then
+        if [ "${PEEPHOLE_CLUSTER:-0}" = 1 ]; then
             cat <<CONFIG
 
 [cluster]
@@ -266,12 +347,130 @@ CONFIG
             else
                 echo "# No advertise address: outbound-only (this node dials its peers)."
             fi
+            if [ "$PEEPHOLE_REMOTE_CONFIG" = 1 ]; then
+                echo "remote_config = true   # holders of this node's config key may change pace, cooldown and roles"
+            else
+                echo "remote_config = false  # only this node's admin interface, CLI and this file change its settings"
+            fi
         fi
-    } > "$CONFIG_FILE"
-    chmod 0600 "$CONFIG_FILE"
+    } > "$new_config"
+    "$INSTALL_BIN" check-config "$new_config" \
+        || die "generated config failed validation; nothing was written to ${CONFIG_FILE}. Re-run the installer to answer again."
+    install -m 0600 "$new_config" "$CONFIG_FILE"
     info "Wrote ${CONFIG_FILE} (mode 0600 — may contain your MaxMind license key)"
-    "$INSTALL_BIN" check-config "$CONFIG_FILE" || die "generated config failed validation"
-    if [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ]; then
+    # A reverse-proxy example that fits this node: only the roles it runs,
+    # with its domain and listen addresses filled in.
+    NGINX_EXAMPLE="${CONFIG_DIR}/nginx.example.conf"
+    if has_role web || has_role listener; then
+        {
+            echo "# nginx in front of peephole — generated by install.sh for this node."
+            echo "# Copy to /etc/nginx/sites-available/peephole, enable it and reload nginx;"
+            echo "# install.sh printed the steps. peephole does not touch nginx itself."
+            if has_role web; then
+                echo "# Get the admin site's certificate first (certbot certonly --nginx), while"
+                echo "# the distribution's default site still serves port 80."
+            fi
+            if has_role listener; then
+                echo "# The catch-all trap below is the default_server for port 80. The"
+                echo "# distribution's default site (/etc/nginx/sites-enabled/default) claims it"
+                echo "# too, and nginx refuses two (\"duplicate default server\"): remove that site."
+            fi
+            if has_role web; then
+                cat <<NGINX
+
+# --- Admin area and wall of shame (TLS) --------------------------------------
+server {
+    # Works on every nginx; 1.25.1+ warns it is deprecated. There, "listen 443 ssl;"
+    # plus "http2 on;" is the newer form.
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${PEEPHOLE_DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${PEEPHOLE_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${PEEPHOLE_DOMAIN}/privkey.pem;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # Server-Sent Events for the live scan queue: no buffering, long timeout.
+    location /admin/api/queue {
+        proxy_pass http://127.0.0.1:8443;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8443;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${PEEPHOLE_DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
+NGINX
+            fi
+            if has_role listener; then
+                trap_port="${TRAP_LISTEN##*:}"
+                cat <<NGINX
+
+# --- Catch-all trap ----------------------------------------------------------
+# Every request for a host name no other server block claims lands here.
+# X-Forwarded-For is set to the real peer address (never appended to what
+# the client sent), and peephole trusts it only from the proxies in
+# trusted_proxies.
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location / {
+        proxy_pass http://127.0.0.1:${trap_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+    }
+}
+
+# To also trap HTTPS probes, give the catch-all a self-signed certificate
+# (scanners do not check it):
+#   openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj /CN=localhost \\
+#     -keyout /etc/ssl/private/peephole-trap.key -out /etc/ssl/certs/peephole-trap.crt
+# server {
+#     listen 443 ssl default_server;
+#     listen [::]:443 ssl default_server;
+#     server_name _;
+#     ssl_certificate     /etc/ssl/certs/peephole-trap.crt;
+#     ssl_certificate_key /etc/ssl/private/peephole-trap.key;
+#     location / {
+#         proxy_pass http://127.0.0.1:${trap_port};
+#         proxy_http_version 1.1;
+#         proxy_set_header Host \$host;
+#         proxy_set_header X-Forwarded-For \$remote_addr;
+#     }
+# }
+NGINX
+                if [ "${PEEPHOLE_LOCAL_PROXY:-0}" != 1 ]; then
+                    echo
+                    echo "# Note: the trap listens on ${TRAP_LISTEN} and trusts X-Forwarded-For only from"
+                    echo "# ${PEEPHOLE_TRUSTED_PROXIES}. For an nginx on this machine set"
+                    echo "# trap_listen = \"127.0.0.1:8080\" and trusted_proxies = [\"127.0.0.1/32\", \"::1/128\"]."
+                fi
+            fi
+        } > "$NGINX_EXAMPLE"
+        chmod 0644 "$NGINX_EXAMPLE"
+        info "Wrote ${NGINX_EXAMPLE} (reverse-proxy example for this node)"
+    fi
+    if [ "${PEEPHOLE_CLUSTER:-0}" = 1 ]; then
         info "Node key: $("$INSTALL_BIN" cluster id "$CONFIG_FILE" 2>/dev/null)"
         if [ -n "${PEEPHOLE_JOIN_TOKEN:-}" ]; then
             if "$INSTALL_BIN" cluster join "$PEEPHOLE_JOIN_TOKEN" "$CONFIG_FILE"; then
@@ -279,6 +478,9 @@ CONFIG
             else
                 warn "joining the cluster failed; retry with: peephole cluster join <token>"
             fi
+        fi
+        if [ "$PEEPHOLE_REMOTE_CONFIG" = 1 ]; then
+            CONFIG_KEY="$("$INSTALL_BIN" cluster config-key show "$CONFIG_FILE" 2>/dev/null || true)"
         fi
     fi
 fi
@@ -338,20 +540,42 @@ peephole ${new_version} is installed and running.
   service status : systemctl status peephole
   logs           : journalctl -u peephole -f
   config         : ${CONFIG_FILE}
-  nginx example  : ${CONFIG_DIR}/nginx.example.conf  (SSE needs proxy_buffering off — see file)
 
 Next steps:
 DONE
-if [ -n "$(sed -n 's/^trap_listen *= *"\([^"]*\)".*/\1/p' "$CONFIG_FILE")" ]; then
-    echo "  - Route fallback traffic from HAProxy to the trap listener (0.0.0.0:8080)."
+trap_listen="$(sed -n 's/^trap_listen *= *"\([^"]*\)".*/\1/p' "$CONFIG_FILE")"
+if [ -e "${CONFIG_DIR}/nginx.example.conf" ]; then
+    echo "  - Reverse proxy: an nginx example for this node is in ${CONFIG_DIR}/nginx.example.conf."
+    echo "    With nginx installed, in this order:"
+    if [ -n "$admin_listen" ]; then
+        echo "      certbot certonly --nginx -d ${PEEPHOLE_DOMAIN:-<your-domain>}"
+        echo "        (the admin site's certificate, while the default site still serves port 80)"
+    fi
+    if [ -n "$trap_listen" ]; then
+        echo "      rm /etc/nginx/sites-enabled/default"
+        echo "        (the distribution's default site also claims default_server, which the trap catch-all needs)"
+    fi
+    echo "      cp ${CONFIG_DIR}/nginx.example.conf /etc/nginx/sites-available/peephole"
+    echo "      ln -s ../sites-available/peephole /etc/nginx/sites-enabled/peephole"
+    echo "      nginx -t && systemctl reload nginx"
+fi
+if [ -n "$trap_listen" ]; then
+    echo "  - Send requests that match no real site to the trap listener (${trap_listen}); see the nginx example."
 fi
 if grep -q '^\[cluster\]' "$CONFIG_FILE"; then
-    echo "  - Distributed mode: open the cluster RPC port to the other nodes only."
+    echo "  - Cluster: open the RPC port to the other nodes only."
     echo "    Node key: $("$INSTALL_BIN" cluster id "$CONFIG_FILE" 2>/dev/null)"
     if grep -q '^advertise' "$CONFIG_FILE"; then
-        echo "    Add members with 'peephole cluster invite' here and 'peephole cluster join <token>' there."
-    else
-        echo "    Outbound-only: join a reachable member with 'peephole cluster join <token>' (invite created there)."
+        echo "    Invite others with 'peephole cluster invite' (the invite is reusable; limit it with --uses or --ttl)."
+    fi
+    echo "    Join a cluster with 'peephole cluster join <token>'; leave with 'peephole cluster leave'."
+    if [ -n "$CONFIG_KEY" ]; then
+        echo "    Config key (give it only to operators who may change this node's pace, cooldown and roles):"
+        echo "      $CONFIG_KEY"
+        echo "    Withdraw it from everyone with 'peephole cluster config-key rotate'."
+    elif grep -q '^remote_config = true' "$CONFIG_FILE"; then
+        echo "    Config key: print it with 'peephole cluster config-key show' (give it only to operators"
+        echo "    who may change this node's pace, cooldown and roles)."
     fi
 fi
 if [ -n "$admin_listen" ]; then

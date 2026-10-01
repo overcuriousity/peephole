@@ -21,6 +21,11 @@ pub struct AdminState {
     pub notifier: crate::events::Notifier,
     pub stats_cache: crate::store::stats::StatsCache,
     pub pace: crate::scan::pace::SharedPace,
+    /// Runtime settings (pace, cooldown, roles) and their one write path.
+    pub settings: crate::settings::Settings,
+    /// Set to `true` when the web role is switched off: long-lived
+    /// responses (the live queue) end, so the listener can stop.
+    pub closing: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl AdminState {
@@ -32,16 +37,32 @@ impl AdminState {
     ) -> Self {
         Self {
             recorder: store.local(),
+            settings: crate::settings::Settings::with_pace(store.clone(), &cfg, pace.clone()),
             store,
             cfg,
             notifier,
             stats_cache: crate::store::stats::StatsCache::new(),
             pace,
+            closing: None,
         }
     }
     /// Route writes through `recorder` (a cluster node's log).
     pub fn with_recorder(mut self, recorder: crate::store::recorder::Recorder) -> Self {
         self.recorder = recorder;
+        self
+    }
+
+    /// Use the process-wide runtime settings (so UI changes reach the trap,
+    /// the scan workers and the role supervisor).
+    pub fn with_settings(mut self, settings: crate::settings::Settings) -> Self {
+        self.pace = settings.pace.clone();
+        self.settings = settings;
+        self
+    }
+
+    /// End long-lived responses once `closing` turns `true`.
+    pub fn with_closing(mut self, closing: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.closing = Some(closing);
         self
     }
 

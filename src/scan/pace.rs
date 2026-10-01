@@ -26,9 +26,9 @@ pub const MAX_TIMEOUT: u64 = 4 * 3600;
 /// Share of finished scans that may time out before a longer limit is advised.
 const TIMEOUT_SHARE: f64 = 0.10;
 
-const KEY_WORKERS: &str = "scan.max_workers";
-const KEY_PER_HOUR: &str = "scan.max_scans_per_hour";
-const KEY_TIMEOUT: &str = "scan.timeout_secs";
+pub const KEY_WORKERS: &str = "scan.max_workers";
+pub const KEY_PER_HOUR: &str = "scan.max_scans_per_hour";
+pub const KEY_TIMEOUT: &str = "scan.timeout_secs";
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct Pace {
@@ -77,13 +77,31 @@ impl Pace {
     }
 }
 
-/// Shared between the admin UI (writer) and the scan workers (reader).
+/// Shared between the admin UI (writer) and the scan workers (reader): the
+/// scan pace, and the rescan cooldown that trap and scanners apply.
 #[derive(Clone)]
-pub struct SharedPace(Arc<RwLock<Pace>>);
+pub struct SharedPace(Arc<RwLock<Pace>>, Arc<std::sync::atomic::AtomicI64>);
 
 impl SharedPace {
     pub fn new(p: Pace) -> Self {
-        Self(Arc::new(RwLock::new(p)))
+        Self(
+            Arc::new(RwLock::new(p)),
+            Arc::new(std::sync::atomic::AtomicI64::new(24)),
+        )
+    }
+
+    /// Hours within which an IP is not scanned again at the same level.
+    pub fn cooldown_hours(&self) -> i64 {
+        self.1.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_cooldown_hours(&self, h: i64) {
+        self.1.store(h, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Replace the pace in memory (persisting is the caller's business).
+    pub fn replace(&self, p: Pace) {
+        *self.0.write().unwrap() = p;
     }
 
     /// Config defaults overridden by whatever the admin saved earlier.
@@ -113,7 +131,9 @@ impl SharedPace {
         if p.validate().is_err() {
             p = Pace::from_config(c);
         }
-        Ok(Self::new(p))
+        let s = Self::new(p);
+        s.set_cooldown_hours(c.rescan_cooldown_hours);
+        Ok(s)
     }
 
     pub fn get(&self) -> Pace {
@@ -247,68 +267,6 @@ pub fn recommend(m: &QueueMetrics, current: Pace) -> Recommendation {
             max_scans_per_hour: per_hour,
             timeout_secs,
         },
-    }
-}
-
-/// Answer pace changes sent by web nodes (scanner nodes in a cluster).
-pub fn serve_remote(node: &Arc<crate::cluster::Node>, pace: SharedPace) {
-    use crate::cluster::msg::Msg;
-    let store = node.store.clone();
-    let weak = Arc::downgrade(node);
-    node.on_message(Arc::new(move |from, msg| {
-        let (pace, store, weak) = (pace.clone(), store.clone(), weak.clone());
-        Box::pin(async move {
-            let Msg::SetPace { pace: p } = msg else {
-                return None;
-            };
-            let new = Pace {
-                max_workers: p.max_workers as usize,
-                max_scans_per_hour: p.max_scans_per_hour,
-                timeout_secs: p.timeout_secs,
-            };
-            let error = match pace.set(&store, new).await {
-                Ok(Ok(())) => {
-                    tracing::info!(by = %from.short(), ?new, "scan pace changed remotely");
-                    if let Some(node) = weak.upgrade() {
-                        node.status.local.lock().unwrap().pace = Some(p);
-                        node.publish_status();
-                    }
-                    None
-                }
-                Ok(Err(e)) => Some(e),
-                Err(e) => Some(format!("{e:#}")),
-            };
-            Some(Msg::SetPaceReply { error })
-        })
-    }));
-}
-
-/// Change the pace of scanner `target` from this node.
-pub async fn set_remote(
-    node: &Arc<crate::cluster::Node>,
-    target: crate::cluster::identity::NodeId,
-    p: Pace,
-) -> Result<Result<(), String>> {
-    use crate::cluster::msg::Msg;
-    if let Err(e) = p.validate() {
-        return Ok(Err(e));
-    }
-    let pace = crate::cluster::status::PaceInfo {
-        max_workers: p.max_workers as u32,
-        max_scans_per_hour: p.max_scans_per_hour,
-        timeout_secs: p.timeout_secs,
-    };
-    match node
-        .request(
-            target,
-            Msg::SetPace { pace },
-            std::time::Duration::from_secs(15),
-        )
-        .await?
-    {
-        Msg::SetPaceReply { error: None } => Ok(Ok(())),
-        Msg::SetPaceReply { error: Some(e) } => Ok(Err(e)),
-        other => anyhow::bail!("unexpected answer {other:?}"),
     }
 }
 

@@ -28,6 +28,18 @@
   document.querySelectorAll("dialog [data-close]").forEach(function (b) {
     b.addEventListener("click", function () { b.closest("dialog").close(); });
   });
+  // One-shot notice the server set after an action; shown once, then cleared.
+  var fm = document.cookie.match(/(?:^|; )peephole_flash=([^;]*)/);
+  if (fm) {
+    document.cookie = "peephole_flash=; Path=/; Max-Age=0; SameSite=Strict";
+    var main = document.querySelector("main");
+    if (main) {
+      var note = document.createElement("div");
+      note.className = "banner banner-success";
+      try { note.textContent = decodeURIComponent(fm[1].replace(/\+/g, " ")); } catch (e) { note.textContent = ""; }
+      if (note.textContent) main.insertBefore(note, main.firstChild);
+    }
+  }
   // WebAuthn ceremonies (moved out of inline scripts for CSP).
   function b64uToBuf(s) { return Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), function (c) { return c.charCodeAt(0); }).buffer; }
   function bufToB64u(b) { return btoa(String.fromCharCode.apply(null, new Uint8Array(b))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }

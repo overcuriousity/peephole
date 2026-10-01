@@ -1,0 +1,28 @@
+{% extends "layout.html" %}
+{% block title %}peephole — {{ name }}{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>{{ name }} <span class="mono muted">{{ short }}</span></h1><p class="muted">Runtime settings of another node, changed with its config key.</p></div>
+  <nav class="seg"><a href="/admin/cluster">Cluster</a></nav></div>
+{% if let Some(n) = notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
+{% if let Some(e) = error %}<div class="banner banner-warning">{{ e }}</div>{% endif %}
+{% if let Some(s) = state %}
+{% if !s.open %}<div class="banner banner-warning">This node is locked: its operator has not switched remote configuration on, so a config key does nothing here.</div>{% endif %}
+{% if !key_held %}<div class="banner banner-warning">You hold no config key for this node. Ask its operator for one and add it on the Cluster page.</div>{% endif %}
+<section class="card">
+  <div class="card-head"><h2>Settings</h2><span class="muted">version {{ s.version }}</span></div>
+  <form method="post" action="/admin/cluster/node/{{ key }}" class="filters">
+    <input type="hidden" name="base_version" value="{{ s.version }}">
+    <label>Workers <input type="number" name="max_workers" min="0" max="16" value="{{ s.pace.max_workers }}" required></label>
+    <label>Scans per hour <input type="number" name="max_scans_per_hour" min="0" max="3600" value="{{ s.pace.max_scans_per_hour }}" required></label>
+    <label>Timeout (min) <input type="number" name="timeout_minutes" min="1" max="240" step="any" value="{{ timeout_min }}" required></label>
+    <label>Rescan cooldown (h) <input type="number" name="cooldown_hours" min="0" max="8760" value="{{ s.cooldown_hours }}" required></label>
+    <label><input type="checkbox" name="listener"{% if has.0 %} checked{% endif %}> Trap</label>
+    <label><input type="checkbox" name="scanner"{% if has.1 %} checked{% endif %}> Scanner</label>
+    <label><input type="checkbox" name="web"{% if has.2 %} checked{% endif %}> Web interface</label>
+    <button class="btn btn-primary" type="submit"{% if !s.open || !key_held %} disabled{% endif %}>Save</button>
+  </form>
+  {% if let Some(r) = rec %}<p class="muted">Recommended pace from this node's queue: {{ r.0 }} workers, {{ r.1 }} scans per hour, {{ r.2 }} min timeout.</p>{% endif %}
+  <p class="muted">Switching a role on needs its settings in that node's config file. Switching the web interface off removes that node's own admin pages; its operator restores them with <code>peephole settings reset roles.web</code>.</p>
+</section>
+{% endif %}
+{% endblock %}

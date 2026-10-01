@@ -44,7 +44,9 @@ pub struct Heartbeat {
     pub version: String,
     pub pace: Option<PaceInfo>,
     pub active_scans: u32,
-    pub has_maxmind: bool,
+    /// Enrichment providers this node can query right now.
+    #[serde(default)]
+    pub providers: Vec<String>,
     /// Highest sequence in the node's own log (replication lag).
     #[serde(default)]
     pub own_seq: u64,
@@ -205,11 +207,16 @@ impl Node {
             node: self.id(),
             at_ms: self.status.next_at(),
             neighbours: self.status.neighbours(),
-            roles: self.roles.names().into_iter().map(str::to_string).collect(),
+            roles: self
+                .roles()
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             version: crate::VERSION.to_string(),
             pace: local.pace,
             active_scans: local.active_scans,
-            has_maxmind: self.has_maxmind,
+            providers: self.providers(),
             own_seq: self.own_head.load(std::sync::atomic::Ordering::Relaxed),
         };
         let Ok(body) = super::rpc::cbor::encode(&hb) else {
@@ -278,7 +285,7 @@ mod tests {
             version: "x".into(),
             pace: None,
             active_scans: 0,
-            has_maxmind: false,
+            providers: vec![],
             own_seq: 0,
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();

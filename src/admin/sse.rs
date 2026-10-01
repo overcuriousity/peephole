@@ -34,6 +34,16 @@ async fn snapshot_or_comment(state: &AdminState) -> Event {
     }
 }
 
+/// Resolves once the web role is told to stop (never without a signal).
+async fn closing(state: &AdminState) {
+    match state.closing.clone() {
+        Some(mut rx) => {
+            let _ = rx.wait_for(|v| *v).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 /// Forced-resync / session-recheck cadence.
 const SNAPSHOT_EVERY: Duration = Duration::from_secs(30);
 
@@ -87,6 +97,8 @@ fn async_stream(
                     Err(RecvError::Lagged(_)) => snapshot_or_comment(&st.state).await,
                     Err(RecvError::Closed) => return None,
                 },
+                // The web role is being switched off.
+                _ = closing(&st.state) => return None,
                 _ = tokio::time::sleep_until(st.next_snapshot) => {
                     st.next_snapshot = tokio::time::Instant::now() + SNAPSHOT_EVERY;
                     // Re-check the session so a logout or expiry ends the stream

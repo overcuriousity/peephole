@@ -30,9 +30,16 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Some("settings") => {
+            if let Err(e) = peephole::settings_cli::run(&args[1..], DEFAULT_CONFIG).await {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some("--help") | Some("-h") => {
             println!(
-                "usage: peephole [CONFIG]\n       peephole check-config [CONFIG]\n       peephole cluster (id|invite|join|members|status|revoke) …\n       peephole --version"
+                "usage: peephole [CONFIG]\n       peephole check-config [CONFIG]\n       peephole cluster (id|invite|invites|invite-revoke|join|members|status|config-key|block|unblock|leave) …\n       peephole settings (show|set|reset) …\n       peephole --version"
             );
             return Ok(());
         }

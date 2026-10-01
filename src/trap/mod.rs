@@ -42,6 +42,8 @@ pub struct TrapState {
     pub notifier: crate::events::Notifier,
     /// Per-IP rate limiter for `/collect` and `/claim`.
     pub helper_rate: RateLimiter,
+    /// Runtime scan settings; the trap reads the rescan cooldown from it.
+    pub pace: crate::scan::pace::SharedPace,
 }
 
 /// Minimal fixed-window rate limiter. Bounded in size so an attacker rotating
@@ -77,7 +79,11 @@ impl TrapState {
     pub fn for_test(store: Store, cfg: Config) -> Self {
         let classifier =
             Classifier::from_dir(cfg.rules_dir.as_ref().expect("rules_dir")).expect("rules");
+        let pace =
+            crate::scan::pace::SharedPace::new(crate::scan::pace::Pace::from_config(&cfg.scan));
+        pace.set_cooldown_hours(cfg.scan.rescan_cooldown_hours);
         Self {
+            pace,
             recorder: store.local(),
             store,
             cfg,
@@ -157,24 +163,45 @@ async fn record_and_respond(
 ) -> Result<Recorded> {
     let ip_row = state.store.upsert_ip(ip).await?;
 
-    // Enrichment (every IP, every request — spec §4). Written only when it
-    // changes, so a cluster does not replicate one record per request.
-    let geo_hit = state.geo.read().unwrap().as_ref().map(|g| g.lookup(&ip));
-    let is_tor = state.tor.read().unwrap().contains(&ip);
-    if geo_hit.is_some() || is_tor {
-        let g = geo_hit.unwrap_or_else(|| crate::intel::geo::Geo {
-            country: ip_row.country.clone(),
-            asn: ip_row.asn.map(|a| a as u32),
-            asn_org: ip_row.asn_org.clone(),
-        });
+    // Enrichment (every IP, every request — spec §4): what this node can
+    // look up itself. Written only when it changes. IPs this node cannot
+    // look up are filled in by a node that can (intel::enrich_once).
+    let geo_hit = state
+        .geo
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|g| (g.lookup(&ip), g.build_date()));
+    if let Some((g, version)) = geo_hit {
         state
             .recorder
-            .enrich_ip(
-                ip_row.id,
-                g.country.as_deref(),
-                g.asn,
-                g.asn_org.as_deref(),
-                ip_row.is_tor_exit || is_tor,
+            .record_intel(
+                &ip_row.ip,
+                crate::intel::MAXMIND,
+                version.as_deref(),
+                crate::store::recorder::Recorder::geo_data(
+                    g.country.as_deref(),
+                    g.asn,
+                    g.asn_org.as_deref(),
+                ),
+            )
+            .await?;
+    }
+    // With a Tor list loaded, every IP gets a result (false included); with
+    // none, this node has nothing to say.
+    let tor_hit = {
+        let tor = state.tor.read().unwrap();
+        (!tor.is_empty()).then(|| tor.contains(&ip))
+    };
+    let is_tor = tor_hit == Some(true);
+    if let Some(exit) = tor_hit {
+        state
+            .recorder
+            .record_intel(
+                &ip_row.ip,
+                crate::intel::TOR,
+                None,
+                serde_json::json!({ "exit": exit }),
             )
             .await?;
     }
@@ -220,18 +247,18 @@ async fn record_and_respond(
     // internal network or a link-local metadata endpoint. never_scan is checked
     // on the canonical address so IPv4-mapped IPv6 cannot slip past IPv4 CIDRs.
     let canon = crate::net::canonical(ip);
-    let allowlisted = state.cfg.scan.never_scan.iter().any(|n| n.contains(&canon));
+    // never_scan is the business of this node's own scanner. Standalone
+    // that is the only scanner, so the job is not queued at all; in a
+    // cluster another scanner may take it.
+    let allowlisted = state.recorder.node().is_none()
+        && state.cfg.scan.never_scan.iter().any(|n| n.contains(&canon));
     if verdict.scan_level > 0
         && !is_tor
         && !allowlisted
         && crate::net::is_scannable_target(ip)
         && let crate::store::scans::EnqueueOutcome::Queued(job_id) = state
             .recorder
-            .enqueue_scan(
-                ip_row.id,
-                verdict.scan_level,
-                state.cfg.scan.rescan_cooldown_hours,
-            )
+            .enqueue_scan(ip_row.id, verdict.scan_level, state.pace.cooldown_hours())
             .await?
         && let Ok(Some(job)) = state.store.queue_job(job_id).await
     {
@@ -415,12 +442,16 @@ async fn collect_handler(
         if tells.webdriver || tells.inhuman_fill {
             let canon = crate::net::canonical(ip);
             let is_tor = state.tor.read().unwrap().contains(&ip);
-            let allowlisted = state.cfg.scan.never_scan.iter().any(|n| n.contains(&canon));
+            // never_scan is the business of this node's own scanner. Standalone
+            // that is the only scanner, so the job is not queued at all; in a
+            // cluster another scanner may take it.
+            let allowlisted = state.recorder.node().is_none()
+                && state.cfg.scan.never_scan.iter().any(|n| n.contains(&canon));
             if !is_tor && !allowlisted && crate::net::is_scannable_target(ip) {
                 let level = if tells.inhuman_fill { 3 } else { 2 };
                 if let Ok(crate::store::scans::EnqueueOutcome::Queued(job_id)) = state
                     .recorder
-                    .enqueue_scan(ip_id, level, state.cfg.scan.rescan_cooldown_hours)
+                    .enqueue_scan(ip_id, level, state.pace.cooldown_hours())
                     .await
                     && let Ok(Some(job)) = state.store.queue_job(job_id).await
                 {

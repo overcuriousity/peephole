@@ -8,11 +8,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    // Tests run in parallel: the OS may hand the same ephemeral port to two
+    // of them once the probe socket is closed, so never give one out twice.
+    static TAKEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut taken = TAKEN.lock().unwrap();
+        if !taken.contains(&port) {
+            taken.push(port);
+            return port;
+        }
+    }
 }
 
 /// Public facts about a test node: what its peers put in their config.
@@ -44,6 +54,7 @@ struct TestNode {
     dir: tempfile::TempDir,
     _stop: tokio::sync::watch::Sender<bool>,
     pace: peephole::scan::pace::SharedPace,
+    settings: peephole::settings::Settings,
     workers: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -73,6 +84,8 @@ struct Opts {
     /// Run scan workers with this fake nmap.
     scanner: Option<std::path::PathBuf>,
     workers: usize,
+    /// Let config key holders change this node's settings.
+    remote_config: bool,
 }
 
 const DEFAULT: Opts = Opts {
@@ -83,6 +96,7 @@ const DEFAULT: Opts = Opts {
     never_scan: vec![],
     scanner: None,
     workers: 1,
+    remote_config: false,
 };
 
 async fn boot(identity: Identity, me: &Addr, peers: &[&Addr], o: Opts) -> TestNode {
@@ -106,6 +120,7 @@ async fn boot_in(
         key_path: None,
         takeover_hours: o.takeover_hours,
         lease_secs: o.lease_secs,
+        remote_config: o.remote_config,
         peers: peers
             .iter()
             .map(|p| PeerConfig {
@@ -124,13 +139,11 @@ async fn boot_in(
         identity,
         cluster,
         roles,
-        never_scan: o.never_scan.clone(),
         store,
         proto: o.proto.unwrap_or((
             cluster::rpc::proto::PROTO_MIN,
             cluster::rpc::proto::PROTO_VERSION,
         )),
-        has_maxmind: false,
         data_dir: dir.path().to_path_buf(),
     })
     .await
@@ -145,8 +158,18 @@ async fn boot_in(
         max_scans_per_hour: 3600,
         timeout_secs: 60,
     });
+    let settings = peephole::settings::Settings::with_pace(
+        node.store.clone(),
+        &scan_config(&o.never_scan),
+        pace.clone(),
+    );
+    if o.remote_config {
+        cluster::confkey::ensure(&node.store, node.id())
+            .await
+            .unwrap();
+    }
+    cluster::confkey::serve(&node, settings.clone());
     let workers = o.scanner.as_ref().map(|nmap| {
-        peephole::scan::pace::serve_remote(&node, pace.clone());
         tokio::spawn(peephole::scan::arbiter::takeover_loop(
             node.clone(),
             rx.clone(),
@@ -166,6 +189,7 @@ async fn boot_in(
         dir,
         _stop: tx,
         pace,
+        settings,
         workers,
     }
 }
@@ -288,7 +312,7 @@ async fn invited_member_propagates_cluster_wide() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     let nc = boot(ic, &c, &[], DEFAULT).await;
-    let token = invite::create(&nb, 1).await.unwrap();
+    let token = invite::create(&nb, &Default::default()).await.unwrap();
     let inviter = invite::join(&nc, &token).await.unwrap();
     assert_eq!(inviter.id, b.id);
     eventually("a admits c", || knows(&na, c.id, true)).await;
@@ -319,7 +343,7 @@ async fn outbound_only_member_syncs_both_ways() {
         },
     )
     .await;
-    let token = invite::create(&nb, 1).await.unwrap();
+    let token = invite::create(&nb, &Default::default()).await.unwrap();
     invite::join(&nc, &token).await.unwrap();
     eventually("a has c's self-description", || async {
         members::all(&na.store)
@@ -331,7 +355,15 @@ async fn outbound_only_member_syncs_both_ways() {
     .await;
     // A new record on A reaches outbound-only C promptly (long-poll).
     let (_, d) = new_node("d");
-    let rec = Record::MemberRevoke { id: d.id };
+    let rec = Record::MemberAdd(peephole::cluster::record::MemberInfo {
+        id: d.id,
+        name: "d".into(),
+        address: None,
+        roles: vec![],
+        proto_min: 0,
+        proto_max: 0,
+        remote_config: false,
+    });
     repl::append(&na, &[rec]).await.unwrap();
     eventually("c sees a's newest record", || async {
         members::all(&nc.store)
@@ -344,72 +376,498 @@ async fn outbound_only_member_syncs_both_ways() {
 }
 
 #[tokio::test]
-async fn invites_are_single_use_and_expire() {
-    let (ib, b) = new_node("b");
-    let (ic, c) = new_node("c");
-    let (id_, d) = new_node("d");
-    let nb = boot(ib, &b, &[], DEFAULT).await;
-    let nc = boot(ic, &c, &[], DEFAULT).await;
-    let nd = boot(id_, &d, &[], DEFAULT).await;
-    let token = invite::create(&nb, 1).await.unwrap();
-    invite::join(&nc, &token).await.unwrap();
-    let e = invite::join(&nd, &token).await.unwrap_err();
-    assert!(
-        format!("{e:#}").contains("invalid, used or expired"),
-        "{e:#}"
+async fn invites_are_reusable_until_limited_expired_or_revoked() {
+    use invite::InviteOpts;
+    let boot1 = |name: &'static str| async move {
+        let (i, a) = new_node(name);
+        boot(i, &a, &[], DEFAULT).await
+    };
+    let nb = boot1("b").await;
+    let (nc, nd, ne, nf, ng) = (
+        boot1("c").await,
+        boot1("d").await,
+        boot1("e").await,
+        boot1("f").await,
+        boot1("g").await,
     );
+    let refused = |e: anyhow::Error| {
+        let m = format!("{e:#}");
+        assert!(m.contains("invalid, revoked, exhausted or expired"), "{m}");
+    };
 
-    let token = invite::create(&nb, 1).await.unwrap();
+    // One invite, handed to a peer group, redeemed one by one.
+    let token = invite::create(
+        &nb,
+        &InviteOpts {
+            label: "peer group".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    invite::join(&nc, &token).await.unwrap();
+    invite::join(&nd, &token).await.unwrap();
+    let rows = invite::list(&nb.store).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label, "peer group");
+    assert_eq!((rows[0].uses, rows[0].usable), (2, true));
+    assert_eq!(rows[0].joined.len(), 2);
+    assert!(rows[0].joined.contains(&nc.id()) && rows[0].joined.contains(&nd.id()));
+
+    // Revoked: no further joins; revoking twice reports nothing to do.
+    assert!(invite::revoke(&nb.store, rows[0].id).await.unwrap());
+    assert!(!invite::revoke(&nb.store, rows[0].id).await.unwrap());
+    refused(invite::join(&ne, &token).await.unwrap_err());
+
+    // Use limit.
+    let token = invite::create(
+        &nb,
+        &InviteOpts {
+            max_uses: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    invite::join(&ne, &token).await.unwrap();
+    refused(invite::join(&nf, &token).await.unwrap_err());
+
+    // Expiry.
+    let token = invite::create(
+        &nb,
+        &InviteOpts {
+            ttl_hours: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     sqlx::query(
-        "UPDATE invites SET expires_at = datetime('now','-1 minute') WHERE used_at IS NULL",
+        "UPDATE invites SET expires_at = datetime('now','-1 minute')
+         WHERE id = (SELECT MAX(id) FROM invites)",
     )
     .execute(&nb.store.pool)
     .await
     .unwrap();
-    let e = invite::join(&nd, &token).await.unwrap_err();
-    assert!(
-        format!("{e:#}").contains("invalid, used or expired"),
-        "{e:#}"
-    );
-    assert!(!knows(&nb, d.id, true).await);
-    // A node that already joined a cluster refuses a second one.
-    let token = invite::create(&nd, 1).await.unwrap();
+    refused(invite::join(&nf, &token).await.unwrap_err());
+    assert!(!knows(&nb, nf.id(), true).await);
+
+    // A member of one cluster refuses an invite into an unrelated one.
+    let token = invite::create(&ng, &InviteOpts::default()).await.unwrap();
     let e = invite::join(&nc, &token).await.unwrap_err();
     assert!(format!("{e:#}").contains("already belongs"), "{e:#}");
+
+    // Nonsense options are refused.
+    for bad in [
+        InviteOpts {
+            ttl_hours: Some(0),
+            ..Default::default()
+        },
+        InviteOpts {
+            max_uses: Some(0),
+            ..Default::default()
+        },
+    ] {
+        assert!(invite::create(&nb, &bad).await.is_err());
+    }
 }
 
+/// Nobody can remove another node; a node removes itself by leaving, and
+/// comes back with an invite.
 #[tokio::test]
-async fn revocation_spreads_and_locks_the_node_out() {
+async fn only_a_node_itself_can_leave() {
     let (ia, a) = new_node("a");
     let (ib, b) = new_node("b");
     let (ic, c) = new_node("c");
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     let nc = boot(ic, &c, &[], DEFAULT).await;
-    let token = invite::create(&nb, 1).await.unwrap();
+    let token = invite::create(&nb, &Default::default()).await.unwrap();
     invite::join(&nc, &token).await.unwrap();
     eventually("a admits c", || knows(&na, c.id, true)).await;
+
+    // B tries to revoke C: every node ignores it.
     repl::append(&nb, &[Record::MemberRevoke { id: c.id }])
         .await
         .unwrap();
-    eventually("a revokes c", || knows(&na, c.id, false)).await;
-    assert!(!na.is_member(&c.id));
+    eventually("a holds b's newest entry", || async {
+        let on_a = repl::heads(&na.store).await.unwrap();
+        let on_b = repl::heads(&nb.store).await.unwrap();
+        repl::head_in(&on_a, &b.id) == repl::head_in(&on_b, &b.id)
+    })
+    .await;
+    assert!(knows(&na, c.id, true).await && knows(&nb, c.id, true).await);
+    assert!(nc.hello(a.id, &a.address()).await.is_ok());
+
+    // C leaves by itself.
+    let told = cluster::leave(&nc).await.unwrap();
+    assert!(told >= 1, "at least the inviter heard it");
+    assert_eq!(nc.detached(), Some(cluster::Detached::Left));
+    assert!(
+        nc.dial_targets().is_empty(),
+        "a node that left stops dialling"
+    );
+    eventually("a sees c gone", || knows(&na, c.id, false)).await;
     let e = nc.hello(a.id, &a.address()).await.unwrap_err();
     assert!(format!("{e:#}").contains("not a cluster member"), "{e:#}");
-    // C cannot re-admit itself.
-    repl::append(
-        &nc,
-        &[Record::MemberUpdate(
-            peephole::cluster::record::MemberInfo {
-                name: "c-again".into(),
-                ..nc.self_info()
-            },
-        )],
+
+    // Rejoining takes an invite.
+    let token = invite::create(&na, &Default::default()).await.unwrap();
+    invite::join(&nc, &token).await.unwrap();
+    assert_eq!(nc.detached(), None);
+    eventually("a re-admits c", || knows(&na, c.id, true)).await;
+}
+
+/// Leaving with nobody reachable still detaches the node.
+#[tokio::test]
+async fn leaving_without_reachable_peers_still_detaches() {
+    let (_, a) = new_node("a");
+    let (x, _dx) = offline_node(&[&a]).await;
+    assert_eq!(cluster::leave(&x).await.unwrap(), 0);
+    assert_eq!(x.detached(), Some(cluster::Detached::Left));
+}
+
+/// What a member recorded stays acceptable after it left: a node that
+/// syncs later still applies all of it.
+#[tokio::test]
+async fn entries_of_a_departed_member_still_apply() {
+    let a_id = Identity::generate().unwrap();
+    let a = Addr {
+        name: "a",
+        id: a_id.id,
+        port: 1,
+    };
+    let (x, _dx) = offline_node(&[&a]).await;
+    let info = |name: &str| peephole::cluster::record::MemberInfo {
+        id: a_id.id,
+        name: name.into(),
+        address: None,
+        roles: vec![],
+        proto_min: 2,
+        proto_max: 2,
+        remote_config: false,
+    };
+    let entries = vec![
+        WireEntry::sign(&a_id, 1, 10, &Record::MemberUpdate(info("a"))).unwrap(),
+        WireEntry::sign(&a_id, 2, 20, &Record::MemberRevoke { id: a_id.id }).unwrap(),
+        WireEntry::sign(&a_id, 3, 30, &Record::MemberUpdate(info("late"))).unwrap(),
+    ];
+    let st = repl::apply_batch(&x, entries).await.unwrap();
+    assert_eq!((st.applied, st.parked), (3, 0), "{st:?}");
+    let rows = members::all(&x.store).await.unwrap();
+    let row = rows.iter().find(|m| m.id == a_id.id).unwrap();
+    assert_eq!(row.name, "late");
+}
+
+/// An HLC `days` in the past (`n` keeps values distinct).
+fn hlc_days_ago(days: u64, n: u64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    ((now - days * 24 * 3600 * 1000) << 16) + n
+}
+
+#[tokio::test]
+async fn members_silent_for_30_days_are_pruned_and_revive_with_a_sign_of_life() {
+    let a_id = Identity::generate().unwrap();
+    let b_id = Identity::generate().unwrap();
+    let a = Addr {
+        name: "a",
+        id: a_id.id,
+        port: 1,
+    };
+    let (x, _dx) = offline_node(&[&a]).await;
+    let info = |id: &Identity| peephole::cluster::record::MemberInfo {
+        id: id.id,
+        name: "b".into(),
+        address: Some("127.0.0.1:2".into()),
+        roles: vec![],
+        proto_min: 2,
+        proto_max: 2,
+        remote_config: false,
+    };
+    // A admitted B 40 days ago; B described itself then and went silent.
+    let st = repl::apply_batch(
+        &x,
+        vec![
+            WireEntry::sign(
+                &a_id,
+                1,
+                hlc_days_ago(40, 1),
+                &Record::MemberAdd(info(&b_id)),
+            )
+            .unwrap(),
+            WireEntry::sign(
+                &b_id,
+                1,
+                hlc_days_ago(40, 2),
+                &Record::MemberUpdate(info(&b_id)),
+            )
+            .unwrap(),
+        ],
     )
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(knows(&na, c.id, false).await);
+    assert_eq!(
+        st.applied, 2,
+        "a pruned member's records are still applied: {st:?}"
+    );
+    let row = |rows: Vec<members::MemberRow>| rows.into_iter().find(|m| m.id == b_id.id).unwrap();
+    let b = row(members::all(&x.store).await.unwrap());
+    assert_eq!(b.standing, members::Standing::Pruned);
+    assert!(!b.active && !x.is_member(&b_id.id));
+    assert_eq!(x.standing_of(&b_id.id), Some(members::Standing::Pruned));
+    assert!(x.dial_targets().iter().all(|t| t.0 != b_id.id));
+    // A fresh entry signed by B, relayed by anyone, revives it.
+    repl::apply_batch(
+        &x,
+        vec![
+            WireEntry::sign(
+                &b_id,
+                2,
+                hlc_days_ago(0, 3),
+                &Record::MemberUpdate(info(&b_id)),
+            )
+            .unwrap(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(row(members::all(&x.store).await.unwrap()).active);
+    assert!(x.is_member(&b_id.id));
+}
+
+#[tokio::test]
+async fn a_running_node_leaves_a_sign_of_life_once_a_day() {
+    let (_, a) = new_node("a");
+    let (x, _dx) = offline_node(&[&a]).await;
+    assert!(
+        !x.keepalive().await.unwrap(),
+        "fresh entries: nothing to do"
+    );
+    sqlx::query("UPDATE repl_log SET hlc = ? WHERE origin = ?")
+        .bind(hlc_days_ago(2, 0) as i64)
+        .bind(&x.id().0[..])
+        .execute(&x.store.pool)
+        .await
+        .unwrap();
+    assert!(x.keepalive().await.unwrap());
+    assert!(!x.keepalive().await.unwrap());
+}
+
+/// A node that was offline longer than the prune window knows it was
+/// dropped, instead of judging everyone else by its outdated log.
+#[tokio::test]
+async fn a_node_offline_for_over_30_days_starts_detached() {
+    let (_, a) = new_node("a");
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("node.key");
+    Identity::load_or_create(&key).unwrap();
+    let open = || async {
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        Node::open(NodeParams {
+            identity: Identity::load(&key).unwrap(),
+            cluster: ClusterConfig {
+                node_name: "x".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                peers: vec![PeerConfig {
+                    name: "a".into(),
+                    address: a.address(),
+                    public_key: a.id.to_string(),
+                }],
+            },
+            roles: Roles::default(),
+            store,
+            proto: (2, 2),
+            data_dir: dir.path().to_path_buf(),
+        })
+        .await
+        .unwrap()
+    };
+    let x = open().await;
+    x.bootstrap().await.unwrap();
+    assert_eq!(x.detached(), None);
+    sqlx::query("UPDATE repl_log SET hlc = ? WHERE origin = ?")
+        .bind(hlc_days_ago(31, 0) as i64)
+        .bind(&x.id().0[..])
+        .execute(&x.store.pool)
+        .await
+        .unwrap();
+    drop(x);
+    let x = open().await;
+    assert_eq!(x.detached(), Some(cluster::Detached::Pruned));
+}
+
+/// A record's uid is bound to the node that created it. Nobody can create
+/// a record under another node's uid, so nobody can delete or shadow it.
+#[tokio::test]
+async fn a_uid_not_bound_to_its_origin_is_rejected() {
+    let (a_id, b_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+    let (a, b) = (
+        Addr {
+            name: "a",
+            id: a_id.id,
+            port: 1,
+        },
+        Addr {
+            name: "b",
+            id: b_id.id,
+            port: 2,
+        },
+    );
+    let (x, _dx) = offline_node(&[&a, &b]).await;
+    let request = |uid: String| {
+        Record::Request(peephole::cluster::record::RequestRec {
+            uid,
+            ts: "2026-01-01 00:00:00".into(),
+            ip: "203.0.113.80".into(),
+            method: "GET".into(),
+            path: "/x".into(),
+            query: None,
+            headers_json: "[]".into(),
+            body: None,
+            labels_json: "[]".into(),
+            severity: 1,
+            scan_level: 0,
+            is_fp_claim: false,
+            page_token: None,
+        })
+    };
+    let a_uid = format!("{}one", a_id.id.uid_prefix());
+    let st = repl::apply_batch(
+        &x,
+        vec![WireEntry::sign(&a_id, 1, hlc_days_ago(0, 1), &request(a_uid.clone())).unwrap()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(st.applied, 1, "{st:?}");
+    // B signs a record under A's uid, then one under an unbound uid.
+    for uid in [a_uid, "plain".to_string()] {
+        let st = repl::apply_batch(
+            &x,
+            vec![WireEntry::sign(&b_id, 1, hlc_days_ago(0, 2), &request(uid)).unwrap()],
+        )
+        .await
+        .unwrap();
+        assert_eq!((st.applied, st.rejected), (0, 1), "{st:?}");
+    }
+    assert_eq!(head_of(&x, b_id.id).await, 0);
+    assert_eq!(count(&x, "SELECT COUNT(*) FROM requests").await, 1);
+}
+
+/// A sponsor cannot keep a node from leaving by dating its admission into
+/// the future.
+#[tokio::test]
+async fn a_future_dated_admission_cannot_keep_a_node_from_leaving() {
+    let (a_id, w_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+    let a = Addr {
+        name: "a",
+        id: a_id.id,
+        port: 1,
+    };
+    let (x, _dx) = offline_node(&[&a]).await;
+    let info = peephole::cluster::record::MemberInfo {
+        id: w_id.id,
+        name: "w".into(),
+        address: None,
+        roles: vec![],
+        proto_min: 2,
+        proto_max: 2,
+        remote_config: false,
+    };
+    let far = hlc_days_ago(0, 1) + ((400u64 * 24 * 3600 * 1000) << 16);
+    repl::apply_batch(
+        &x,
+        vec![WireEntry::sign(&a_id, 1, far, &Record::MemberAdd(info.clone())).unwrap()],
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    repl::apply_batch(
+        &x,
+        vec![
+            WireEntry::sign(&w_id, 1, hlc_days_ago(0, 2), &Record::MemberUpdate(info)).unwrap(),
+            WireEntry::sign(
+                &w_id,
+                2,
+                hlc_days_ago(0, 3),
+                &Record::MemberRevoke { id: w_id.id },
+            )
+            .unwrap(),
+        ],
+    )
+    .await
+    .unwrap();
+    let rows = members::all(&x.store).await.unwrap();
+    let w = rows.iter().find(|m| m.id == w_id.id).unwrap();
+    assert_eq!(w.standing, members::Standing::Left);
+}
+
+/// A node that kept running but was cut off for 30 days keeps probing the
+/// members it believes pruned, and learns from them that it is the one
+/// that was pruned.
+#[tokio::test]
+async fn a_node_cut_off_for_30_days_learns_it_was_pruned() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    eventually("everyone knows everyone", || async {
+        knows(&na, c.id, true).await
+            && knows(&nb, c.id, true).await
+            && knows(&nc, a.id, true).await
+            && knows(&nc, b.id, true).await
+    })
+    .await;
+    // Let every log reach every node first, so no late admission arrives
+    // after the clocks are turned back below.
+    eventually("logs converged", || async {
+        let mut same = true;
+        for origin in [a.id, b.id, c.id] {
+            let h = head_of(&na, origin).await;
+            same &= h > 0 && h == head_of(&nb, origin).await && h == head_of(&nc, origin).await;
+        }
+        same
+    })
+    .await;
+    // 40 days without contact, as each side sees the other.
+    let forget = |n: &TestNode, who: NodeId| {
+        let pool = n.store.pool.clone();
+        async move {
+            let old = hlc_days_ago(40, 0) as i64;
+            sqlx::query("UPDATE repl_log SET hlc = ? WHERE origin = ?")
+                .bind(old)
+                .bind(&who.0[..])
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE members SET admitted_hlc = ? WHERE id = ?")
+                .bind(old)
+                .bind(&who.0[..])
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    forget(&na, c.id).await;
+    forget(&nb, c.id).await;
+    forget(&nc, a.id).await;
+    forget(&nc, b.id).await;
+    eventually_for(
+        Duration::from_secs(90),
+        "c learns it was pruned",
+        || async { nc.detached() == Some(cluster::Detached::Pruned) },
+    )
+    .await;
+    assert_eq!(na.detached(), None);
 }
 
 /// Entries are applied only with a valid origin signature, and entries
@@ -429,6 +887,7 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
             key_path: None,
             takeover_hours: 6.0,
             lease_secs: 120,
+            remote_config: false,
             peers: vec![PeerConfig {
                 name: "a".into(),
                 address: "127.0.0.1:1".into(),
@@ -436,10 +895,8 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
             }],
         },
         roles: Roles::default(),
-        never_scan: vec![],
         store,
         proto: (1, 1),
-        has_maxmind: false,
         data_dir: dir.path().to_path_buf(),
     })
     .await
@@ -451,9 +908,9 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
         name: name.into(),
         address: None,
         roles: vec![],
-        never_scan: vec![],
         proto_min: 1,
         proto_max: 1,
+        remote_config: false,
     };
     // Forgery: b signs an entry claiming to come from a.
     let mut forged =
@@ -463,17 +920,35 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
     assert_eq!((st.applied, st.rejected), (0, 1));
 
     // b is unknown: its own (valid) entry is parked...
-    let b1 = WireEntry::sign(&b_id, 1, 10, &Record::MemberUpdate(info(&b_id, "b"))).unwrap();
+    let b1 = WireEntry::sign(
+        &b_id,
+        1,
+        hlc_days_ago(0, 10),
+        &Record::MemberUpdate(info(&b_id, "b")),
+    )
+    .unwrap();
     let st = repl::apply_batch(&node, vec![b1]).await.unwrap();
     assert_eq!((st.applied, st.parked), (0, 1));
     // ...a gap is rejected...
-    let b3 = WireEntry::sign(&b_id, 3, 12, &Record::MemberUpdate(info(&b_id, "b3"))).unwrap();
+    let b3 = WireEntry::sign(
+        &b_id,
+        3,
+        hlc_days_ago(0, 12),
+        &Record::MemberUpdate(info(&b_id, "b3")),
+    )
+    .unwrap();
     assert_eq!(
         repl::apply_batch(&node, vec![b3]).await.unwrap().rejected,
         1
     );
     // ...and once trusted a admits b, the parked entry applies.
-    let a1 = WireEntry::sign(&a_id, 1, 20, &Record::MemberAdd(info(&b_id, "b-by-a"))).unwrap();
+    let a1 = WireEntry::sign(
+        &a_id,
+        1,
+        hlc_days_ago(0, 20),
+        &Record::MemberAdd(info(&b_id, "b-by-a")),
+    )
+    .unwrap();
     let st = repl::apply_batch(&node, vec![a1]).await.unwrap();
     assert_eq!(st.applied, 2, "{st:?}");
     let rows = members::all(&node.store).await.unwrap();
@@ -533,9 +1008,12 @@ async fn data_replicates_cluster_wide() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     let nc = boot(ic, &c, &[], DEFAULT).await;
-    invite::join(&nc, &invite::create(&nb, 1).await.unwrap())
-        .await
-        .unwrap();
+    invite::join(
+        &nc,
+        &invite::create(&nb, &Default::default()).await.unwrap(),
+    )
+    .await
+    .unwrap();
 
     let r = rec(&na);
     let ip = na
@@ -543,9 +1021,10 @@ async fn data_replicates_cluster_wide() {
         .upsert_ip("198.51.100.77".parse().unwrap())
         .await
         .unwrap();
-    r.enrich_ip(ip.id, Some("DE"), Some(64500), Some("Example AS"), true)
+    r.record_geo(ip.id, None, Some("DE"), Some(64500), Some("Example AS"))
         .await
         .unwrap();
+    r.record_tor(ip.id, true).await.unwrap();
     let req = r
         .insert_request(&new_request(ip.id, "/login"))
         .await
@@ -622,6 +1101,7 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
             key_path: None,
             takeover_hours: 6.0,
             lease_secs: 120,
+            remote_config: false,
             peers: peers
                 .iter()
                 .map(|p| PeerConfig {
@@ -632,10 +1112,8 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
                 .collect(),
         },
         roles: Roles::default(),
-        never_scan: vec![],
         store,
         proto: (1, 1),
-        has_maxmind: false,
         data_dir: dir.path().to_path_buf(),
     })
     .await
@@ -644,21 +1122,47 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
     (node, dir)
 }
 
-async fn log_of(n: &Node, origin: NodeId) -> Vec<WireEntry> {
+async fn batch_of(n: &Node, origin: NodeId) -> peephole::cluster::sync::Batch {
     repl::entries_after(&n.store, &[(origin, 0)], 10_000, usize::MAX)
         .await
         .unwrap()
 }
 
+/// How far `n` holds `origin`'s log.
+async fn head_of(n: &Node, origin: NodeId) -> u64 {
+    repl::head_in(&repl::heads(&n.store).await.unwrap(), &origin)
+}
+
+async fn request_uid(n: &Node, path: &str) -> String {
+    sqlx::query_scalar("SELECT uid FROM requests WHERE path = ?")
+        .bind(path)
+        .fetch_one(&n.store.pool)
+        .await
+        .unwrap()
+}
+
+/// Request paths in `n`'s tables, sorted.
+async fn paths(n: &Node) -> Vec<String> {
+    let mut p: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
+        .fetch_all(&n.store.pool)
+        .await
+        .unwrap();
+    p.sort();
+    p
+}
+
+/// An erased entry is accepted only with the origin's own tombstone: a
+/// relay cannot make other nodes drop somebody's records.
 #[tokio::test]
-async fn deletes_propagate_and_stay_deleted() {
+async fn erased_stubs_need_the_origins_tombstone() {
+    use peephole::cluster::sync::Batch;
     let (ia, a) = new_node("a");
     let (ib, b) = new_node("b");
     let na = boot(ia, &a, &[&b], DEFAULT).await;
-    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
     let ip = na
         .store
-        .upsert_ip("203.0.113.66".parse().unwrap())
+        .upsert_ip("203.0.113.70".parse().unwrap())
         .await
         .unwrap();
     let r1 = rec(&na)
@@ -669,82 +1173,367 @@ async fn deletes_propagate_and_stay_deleted() {
         .insert_request(&new_request(ip.id, "/two"))
         .await
         .unwrap();
-    rec(&na)
-        .insert_fp_claim(ip.id, r1, None, "ua")
+    let (one, two) = (
+        request_uid(&na, "/one").await,
+        request_uid(&na, "/two").await,
+    );
+    let before = batch_of(&na, a.id).await;
+    assert!(before.proofs.is_empty());
+    rec(&na).delete_request(r1).await.unwrap();
+    let after = batch_of(&na, a.id).await;
+    assert_eq!(after.proofs.len(), 1, "the stub travels with its tombstone");
+    let tomb = after.proofs[0].uid.clone().unwrap();
+    let a_head = head_of(&na, a.id).await;
+    let strip = |batch: &mut Batch, uid: &str, by: Option<String>| {
+        let e = batch
+            .entries
+            .iter_mut()
+            .find(|e| e.uid.as_deref() == Some(uid))
+            .unwrap();
+        e.payload = None;
+        e.sig = None;
+        e.erased_by = by;
+    };
+
+    // A relay strips /two and claims A's tombstone erased it.
+    let (x, _dx) = offline_node(&[&a, &b]).await;
+    let mut forged = Batch {
+        entries: before.entries.clone(),
+        proofs: after.proofs.clone(),
+    };
+    strip(&mut forged, &two, Some(tomb.clone()));
+    let st = repl::apply_batch(&x, forged).await.unwrap();
+    assert!(st.rejected >= 1, "{st:?}");
+    assert!(
+        head_of(&x, a.id).await < a_head,
+        "the stream stops at the forgery"
+    );
+    assert_eq!(
+        count(&x, "SELECT COUNT(*) FROM requests WHERE path = '/two'").await,
+        0
+    );
+    // The honest stream still applies afterwards.
+    let st = repl::apply_batch(&x, batch_of(&na, a.id).await)
         .await
         .unwrap();
-    eventually("b has both", || async {
-        count(&nb, "SELECT COUNT(*) FROM fp_claims").await == 1
-            && count(&nb, "SELECT COUNT(*) FROM requests").await == 2
+    assert_eq!(st.rejected, 0, "{st:?}");
+    assert_eq!(head_of(&x, a.id).await, a_head);
+    assert_eq!(paths(&x).await, ["/two"]);
+    // X can pass the erasure on with its proof.
+    assert_eq!(batch_of(&x, a.id).await.proofs.len(), 1);
+
+    // A relay relabels the live /two entry as the erased /one: the proof
+    // names /one's own position in A's log, so it does not cover this one.
+    let (w, _dw) = offline_node(&[&a, &b]).await;
+    let mut relabel = Batch {
+        entries: after.entries.clone(),
+        proofs: after.proofs.clone(),
+    };
+    let e = relabel
+        .entries
+        .iter_mut()
+        .find(|e| e.uid.as_deref() == Some(two.as_str()))
+        .unwrap();
+    e.payload = None;
+    e.sig = None;
+    e.uid = Some(one.clone());
+    e.erased_by = Some(tomb.clone());
+    let st = repl::apply_batch(&w, relabel).await.unwrap();
+    assert!(st.rejected >= 1, "relabelled entry: {st:?}");
+    assert!(head_of(&w, a.id).await < a_head);
+
+    // No proof, a proof from another origin, a stub without a uid: rejected.
+    let stub_only = Batch {
+        entries: after.entries.clone(),
+        proofs: vec![],
+    };
+    let other = Identity::generate().unwrap();
+    let wrong_origin = Batch {
+        entries: after.entries.clone(),
+        proofs: vec![
+            WireEntry::sign(
+                &other,
+                1,
+                1,
+                &Record::Tombstone(peephole::cluster::record::TombstoneRec {
+                    uid: tomb.clone(),
+                    uids: vec![one.clone()],
+                    seqs: vec![1],
+                }),
+            )
+            .unwrap(),
+        ],
+    };
+    let mut no_uid = Batch {
+        entries: after.entries.clone(),
+        proofs: after.proofs.clone(),
+    };
+    no_uid
+        .entries
+        .iter_mut()
+        .find(|e| e.payload.is_none())
+        .unwrap()
+        .uid = None;
+    for (what, bad) in [
+        ("no proof", stub_only),
+        ("foreign proof", wrong_origin),
+        ("stub without uid", no_uid),
+    ] {
+        let (y, _dy) = offline_node(&[&a, &b]).await;
+        let st = repl::apply_batch(&y, bad).await.unwrap();
+        assert!(st.rejected >= 1, "{what}: {st:?}");
+        assert!(head_of(&y, a.id).await < a_head, "{what}");
+    }
+}
+
+#[tokio::test]
+async fn deletes_reach_only_the_deleters_own_records() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let ip_a = na
+        .store
+        .upsert_ip("203.0.113.66".parse().unwrap())
+        .await
+        .unwrap();
+    let r1 = rec(&na)
+        .insert_request(&new_request(ip_a.id, "/one"))
+        .await
+        .unwrap();
+    rec(&na)
+        .insert_request(&new_request(ip_a.id, "/two"))
+        .await
+        .unwrap();
+    rec(&na)
+        .insert_fp_claim(ip_a.id, r1, None, "ua")
+        .await
+        .unwrap();
+    let ip_b = nb
+        .store
+        .upsert_ip("203.0.113.66".parse().unwrap())
+        .await
+        .unwrap();
+    rec(&nb)
+        .insert_request(&new_request(ip_b.id, "/three"))
+        .await
+        .unwrap();
+    eventually("both have three requests", || async {
+        count(&na, "SELECT COUNT(*) FROM requests").await == 3
+            && count(&nb, "SELECT COUNT(*) FROM requests").await == 3
     })
     .await;
-    // A's stream as an offline node would have it before the delete.
-    let a_before = log_of(&na, a.id).await;
+    eventually("b has the claim", || async {
+        count(&nb, "SELECT COUNT(*) FROM fp_claims").await == 1
+    })
+    .await;
 
-    // Delete /one on B (with its claim): gone on A too.
+    // B cannot delete A's request for the cluster: it only hides it locally.
     let one_on_b: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/one'")
         .fetch_one(&nb.store.pool)
         .await
         .unwrap();
-    assert!(rec(&nb).delete_request(one_on_b).await.unwrap());
-    eventually("a deleted /one", || async {
-        count(&na, "SELECT COUNT(*) FROM requests").await == 1
-    })
-    .await;
-    assert_eq!(count(&na, "SELECT COUNT(*) FROM fp_claims").await, 0);
-    assert_eq!(
+    let out = rec(&nb).delete_request(one_on_b).await.unwrap();
+    assert_eq!((out.deleted, out.hidden), (0, 1));
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM requests").await, 2);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(count(&na, "SELECT COUNT(*) FROM requests").await, 3);
+
+    // A deletes its own: gone everywhere, with its claim, and erased from
+    // every log, also where it was only hidden.
+    let out = rec(&na).delete_request(r1).await.unwrap();
+    assert_eq!(out.deleted, 1);
+    eventually("b erased /one and its claim from its log", || async {
         count(
-            &na,
-            "SELECT COUNT(*) FROM repl_log WHERE erased_by IS NOT NULL"
+            &nb,
+            "SELECT COUNT(*) FROM repl_log WHERE erased_by IS NOT NULL",
         )
-        .await,
-        2,
-        "request and claim payloads are erased from the log"
-    );
-    let b_stream = log_of(&nb, b.id).await;
-    let a_after = log_of(&na, a.id).await;
-
-    // Late arrival: X sees the tombstone first, then A's old entries with
-    // full payloads. /one must not come back.
-    let (x, _dx) = offline_node(&[&a, &b]).await;
-    repl::apply_batch(&x, b_stream.clone()).await.unwrap();
-    repl::apply_batch(&x, a_before).await.unwrap();
-    let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
-        .fetch_all(&x.store.pool)
         .await
-        .unwrap();
-    assert_eq!(paths, ["/two"]);
-    assert_eq!(count(&x, "SELECT COUNT(*) FROM fp_claims").await, 0);
-
-    // Erased stubs from a trusted origin are accepted immediately: the
-    // tombstone that erased them comes *later* in the same in-order stream, so
-    // waiting for it would stall the origin forever. Applying A's stream alone
-    // (without B's tombstone yet) must converge to A's head and keep /one
-    // deleted, not reject-and-stall.
-    let (y, _dy) = offline_node(&[&a, &b]).await;
-    let st = repl::apply_batch(&y, a_after.clone()).await.unwrap();
-    assert_eq!(st.rejected, 0, "stub must not stall the stream: {st:?}");
-    assert_eq!(
-        repl::head_in(&repl::heads(&y.store).await.unwrap(), &a.id),
-        repl::head_in(&repl::heads(&na.store).await.unwrap(), &a.id),
-        "A's log fully applied, no stall at the erased stub"
-    );
-    // Re-applying B's stream and A's stream stays idempotent and deleted.
-    repl::apply_batch(&y, b_stream).await.unwrap();
-    repl::apply_batch(&y, a_after).await.unwrap();
-    let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
-        .fetch_all(&y.store.pool)
-        .await
-        .unwrap();
-    assert_eq!(paths, ["/two"]);
-
-    // Deleting the IP on A clears it everywhere.
-    assert!(rec(&na).delete_ip(ip.id).await.unwrap());
-    eventually("b dropped the ip", || async {
-        count(&nb, "SELECT COUNT(*) FROM ips").await == 0
+            == 2
     })
     .await;
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM fp_claims").await, 0);
+
+    // Deleting the IP on A removes what A recorded everywhere. B's request
+    // for that IP stays in the cluster; A only hides it for itself.
+    let out = rec(&na).delete_ips(&[ip_a.id]).await.unwrap();
+    assert_eq!((out.deleted, out.hidden), (1, 1));
+    assert_eq!(count(&na, "SELECT COUNT(*) FROM requests").await, 0);
+    assert_eq!(count(&na, "SELECT COUNT(*) FROM ips").await, 0);
+    eventually("only b's request is left on b", || async {
+        paths(&nb).await == ["/three"]
+    })
+    .await;
+
+    // B deletes the IP: now it is gone on both.
+    assert!(rec(&nb).delete_ip(ip_b.id).await.unwrap());
+    eventually("ip gone everywhere", || async {
+        count(&na, "SELECT COUNT(*) FROM ips").await == 0
+            && count(&nb, "SELECT COUNT(*) FROM ips").await == 0
+    })
+    .await;
+}
+
+/// Deleting another node's record hides it here and nowhere else, and this
+/// node keeps relaying it.
+#[tokio::test]
+async fn foreign_delete_hides_locally_and_keeps_relaying() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let ip = na
+        .store
+        .upsert_ip("203.0.113.71".parse().unwrap())
+        .await
+        .unwrap();
+    let mut first = None;
+    for path in ["/one", "/two"] {
+        let id = rec(&na)
+            .insert_request(&new_request(ip.id, path))
+            .await
+            .unwrap();
+        first.get_or_insert(id);
+    }
+    // /one comes with a browser fingerprint.
+    rec(&na)
+        .insert_fingerprint(first, ip.id, "fp1", Some("v1"), "{}", "{}", b"events")
+        .await
+        .unwrap();
+    eventually("b has both, and the fingerprint", || async {
+        count(&nb, "SELECT COUNT(*) FROM requests").await == 2
+            && count(&nb, "SELECT COUNT(*) FROM fingerprints").await == 1
+    })
+    .await;
+    let one_on_b: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/one'")
+        .fetch_one(&nb.store.pool)
+        .await
+        .unwrap();
+    let out = rec(&nb).delete_request(one_on_b).await.unwrap();
+    assert_eq!((out.deleted, out.hidden), (0, 1));
+    assert_eq!(
+        count(&nb, "SELECT COUNT(*) FROM fingerprints").await,
+        0,
+        "the hidden request's fingerprint is hidden with it"
+    );
+    // Repeating it finds nothing and fails nothing.
+    let again = rec(&nb).delete_request(one_on_b).await.unwrap();
+    assert_eq!((again.deleted, again.hidden), (0, 0));
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM requests").await, 1);
+    assert_eq!(count(&na, "SELECT COUNT(*) FROM requests").await, 2);
+
+    // A node fed only from B's copy still gets all of A's records, signed.
+    let from_b = batch_of(&nb, a.id).await;
+    assert!(from_b.proofs.is_empty());
+    assert!(from_b.entries.iter().all(|e| e.verify()), "payloads intact");
+    let (x, _dx) = offline_node(&[&a, &b]).await;
+    repl::apply_batch(&x, from_b).await.unwrap();
+    assert_eq!(count(&x, "SELECT COUNT(*) FROM requests").await, 2);
+
+    // Hidden stays hidden, also across a re-application of the log.
+    repl::rematerialize(&nb).await.unwrap();
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM requests").await, 1);
+}
+
+/// Record a request for `ip` on `n`.
+async fn record(n: &TestNode, ip: &str, path: &str) {
+    let row = n.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+    rec(n)
+        .insert_request(&new_request(row.id, path))
+        .await
+        .unwrap();
+}
+
+/// Blocking a peer takes its records out of this node's view, keeps them
+/// flowing to others, and is undone by unblocking.
+#[tokio::test]
+async fn blocking_a_peer_hides_its_records_until_unblocked() {
+    use peephole::cluster::block;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    record(&na, "203.0.113.72", "/a1").await;
+    record(&nb, "203.0.113.73", "/b1").await;
+    eventually("everyone has both", || async {
+        count(&na, "SELECT COUNT(*) FROM requests").await == 2
+            && count(&nb, "SELECT COUNT(*) FROM requests").await == 2
+            && count(&nc, "SELECT COUNT(*) FROM requests").await == 2
+    })
+    .await;
+
+    assert!(block::block(&nb, nb.id()).await.is_err(), "not oneself");
+    assert_eq!(block::block(&nb, a.id).await.unwrap(), 1);
+    assert_eq!(
+        block::block(&nb, a.id).await.unwrap(),
+        0,
+        "repeat is harmless"
+    );
+    assert!(nb.is_blocked(&a.id));
+    assert!(nb.dial_targets().iter().all(|t| t.0 != a.id));
+    assert_eq!(paths(&nb).await, ["/b1"]);
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM ips").await, 1);
+    let e = na.hello(b.id, &b.address()).await.unwrap_err();
+    assert!(format!("{e:#}").contains("blocked"), "{e:#}");
+
+    // A keeps recording. B receives it through C, stores it for relaying,
+    // and does not show it.
+    record(&na, "203.0.113.72", "/a2").await;
+    eventually("b holds a's stream via c", || async {
+        head_of(&nb, a.id).await == head_of(&na, a.id).await
+    })
+    .await;
+    assert_eq!(paths(&nb).await, ["/b1"]);
+    assert_eq!(paths(&nc).await, ["/a1", "/a2", "/b1"]);
+    assert!(
+        batch_of(&nb, a.id).await.entries.iter().all(|e| e.verify()),
+        "b can still relay a's records"
+    );
+
+    assert!(block::unblock(&nb, a.id).await.unwrap());
+    assert!(
+        !block::unblock(&nb, a.id).await.unwrap(),
+        "repeat is harmless"
+    );
+    assert_eq!(paths(&nb).await, ["/a1", "/a2", "/b1"]);
+    assert!(!nb.is_blocked(&a.id));
+}
+
+/// The admin is told what a delete did: cluster-wide or local only.
+#[tokio::test]
+async fn admin_delete_reports_hidden_records() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let ip = na
+        .store
+        .upsert_ip("203.0.113.74".parse().unwrap())
+        .await
+        .unwrap();
+    rec(&na)
+        .insert_request(&new_request(ip.id, "/one"))
+        .await
+        .unwrap();
+    eventually("b has it", || async {
+        count(&nb, "SELECT COUNT(*) FROM requests").await == 1
+    })
+    .await;
+    let id: i64 = sqlx::query_scalar("SELECT id FROM requests")
+        .fetch_one(&nb.store.pool)
+        .await
+        .unwrap();
+    let (admin, base) = admin_on(&nb).await;
+    let r = admin
+        .post(format!("{base}/admin/requests/{id}/delete"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
     assert_eq!(count(&nb, "SELECT COUNT(*) FROM requests").await, 0);
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM hidden").await, 1);
 }
 
 /// A standalone install that switches to distributed mode brings its
@@ -1048,54 +1837,80 @@ async fn silent_arbiters_queue_is_taken_over() {
     .await;
 }
 
-/// Any member's never_scan protects a target cluster-wide: the scanner
-/// refuses it without running nmap.
+async fn knows_scanner(n: &Node, id: NodeId) -> bool {
+    members::all(&n.store)
+        .await
+        .unwrap()
+        .iter()
+        .any(|m| m.id == id && m.roles.iter().any(|r| r == "scanner"))
+}
+
+/// never_scan is local: B leaves the target alone, C scans it.
 #[tokio::test]
-async fn never_scan_of_any_member_is_honoured() {
-    let tools = tempfile::tempdir().unwrap();
-    let nmap = fake_nmap(tools.path(), 0.1);
+async fn never_scan_is_local_to_its_scanner() {
+    let (tools_b, tools_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (ia, a) = new_node("a");
     let (ib, b) = new_node("b");
     let (ic, c) = new_node("c");
     let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let _nb = boot(
+        ib,
+        &b,
+        &[&a, &c],
+        Opts {
+            never_scan: vec!["192.0.2.0/24".into()],
+            scanner: Some(fake_nmap(tools_b.path(), 0.1)),
+            ..DEFAULT
+        },
+    )
+    .await;
     let _nc = boot(
         ic,
         &c,
         &[&a, &b],
         Opts {
-            never_scan: vec!["192.0.2.0/24".into()],
+            scanner: Some(fake_nmap(tools_c.path(), 0.1)),
             ..DEFAULT
         },
     )
     .await;
-    eventually("a knows c's never_scan", || async {
-        members::all(&na.store)
-            .await
-            .unwrap()
-            .iter()
-            .any(|m| m.id == c.id && !m.never_scan.is_empty())
-    })
-    .await;
-    let nb = boot(
-        ib,
-        &b,
-        &[&a, &c],
-        Opts {
-            scanner: Some(nmap),
-            ..DEFAULT
-        },
-    )
-    .await;
-    eventually("b knows c's never_scan", || async {
-        members::all(&nb.store)
-            .await
-            .unwrap()
-            .iter()
-            .any(|m| m.id == c.id && !m.never_scan.is_empty())
+    eventually("a knows both scanners", || async {
+        knows_scanner(&na, b.id).await && knows_scanner(&na, c.id).await
     })
     .await;
     enqueue(&na, "192.0.2.10", 2).await;
-    eventually("job refused", || async {
+    eventually_for(Duration::from_secs(30), "c scanned it", || async {
+        scans_by(&na, c.id).await == 1
+    })
+    .await;
+    assert!(
+        !tools_b.path().join("targets.log").exists(),
+        "b's nmap must not run"
+    );
+}
+
+/// When every scanner declines, the job ends as refused instead of
+/// circling in the queue.
+#[tokio::test]
+async fn job_declined_by_every_scanner_is_refused() {
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(
+        ib,
+        &b,
+        &[&a],
+        Opts {
+            never_scan: vec!["192.0.2.0/24".into()],
+            scanner: Some(fake_nmap(tools.path(), 0.1)),
+            ..DEFAULT
+        },
+    )
+    .await;
+    eventually("a knows the scanner", || knows_scanner(&na, b.id)).await;
+    enqueue(&na, "192.0.2.10", 2).await;
+    eventually_for(Duration::from_secs(30), "job refused", || async {
         count(
             &na,
             "SELECT COUNT(*) FROM scan_jobs WHERE status = 'refused'",
@@ -1128,7 +1943,7 @@ async fn duplicate_jobs_are_superseded() {
     rec(&nb)
         .write(vec![Record::ScanJob(
             peephole::cluster::record::ScanJobRec {
-                uid: "dup-job".into(),
+                uid: format!("{}dup-job", b.id.uid_prefix()),
                 ip: ip.into(),
                 level: 2,
                 queued_at: peephole::store::data::now_ts(),
@@ -1184,9 +1999,12 @@ async fn outbound_only_scanner_drains_the_queue() {
         },
     )
     .await;
-    invite::join(&nc, &invite::create(&na, 1).await.unwrap())
-        .await
-        .unwrap();
+    invite::join(
+        &nc,
+        &invite::create(&na, &Default::default()).await.unwrap(),
+    )
+    .await
+    .unwrap();
     enqueue(&na, "203.0.113.90", 2).await;
     eventually_for(Duration::from_secs(20), "c scanned a's job", || async {
         scans_by(&na, c.id).await == 1
@@ -1194,75 +2012,191 @@ async fn outbound_only_scanner_drains_the_queue() {
     .await;
 }
 
-/// A web node changes a headless scanner's pace; it is applied, persisted
-/// there and visible in the scanner's heartbeat.
+/// A config key holder changes another node's settings; nobody else can.
 #[tokio::test]
-async fn pace_is_set_remotely() {
-    let tools = tempfile::tempdir().unwrap();
-    let nmap = fake_nmap(tools.path(), 0.1);
-    let (ia, a) = new_node("a");
-    let (ic, c) = new_node("c");
-    let na = boot(ia, &a, &[&c], DEFAULT).await;
-    let nc = boot(
-        ic,
-        &c,
-        &[&a],
-        Opts {
-            scanner: Some(nmap),
-            ..DEFAULT
-        },
-    )
-    .await;
-    let new = peephole::scan::pace::Pace {
-        max_workers: 3,
-        max_scans_per_hour: 42,
-        timeout_secs: 600,
-    };
-    peephole::scan::pace::set_remote(&na.node, c.id, new)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(nc.pace.get(), new);
-    let saved = nc
-        .store
-        .setting_get("scan.max_scans_per_hour")
-        .await
-        .unwrap();
-    assert_eq!(saved.as_deref(), Some("42"));
-    // Invalid values are refused by the scanner, which keeps its pace.
-    let bad = peephole::scan::pace::Pace {
-        max_workers: 999,
-        ..new
-    };
-    assert!(
-        peephole::scan::pace::set_remote(&na.node, c.id, bad)
-            .await
-            .unwrap()
-            .is_err()
-    );
-    assert_eq!(nc.pace.get(), new);
-    eventually_for(Duration::from_secs(40), "a sees c's new pace", || async {
-        na.status
-            .known(&c.id)
-            .and_then(|k| k.hb.pace)
-            .is_some_and(|p| p.max_scans_per_hour == 42)
-    })
-    .await;
-}
-
-// --------------------------------------------------------------- intel
-
-use peephole::intel::share;
-
-/// A fetches the GeoLite2 databases; B copies them by hash from A, C from
-/// whichever peer still holds that exact version.
-#[tokio::test]
-async fn intel_files_are_shared_by_hash() {
+async fn config_key_holders_change_a_nodes_settings() {
+    use peephole::cluster::confkey;
+    use peephole::settings::Changes;
     let (ia, a) = new_node("a");
     let (ib, b) = new_node("b");
     let (ic, c) = new_node("c");
     let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
-    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a, &c],
+        Opts {
+            remote_config: true,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    eventually("a sees that b is open", || async {
+        members::all(&na.store)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == b.id && m.remote_config)
+    })
+    .await;
+
+    // Anyone may look.
+    let state = confkey::get(&na.node, b.id).await.unwrap();
+    assert!(state.open);
+    assert_eq!(state.version, 0);
+    let faster = Changes {
+        max_scans_per_hour: Some(77),
+        ..Default::default()
+    };
+
+    // Without the key: refused, before any message is sent.
+    let e = confkey::set(&na.node, b.id, 0, &faster)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("no config key"), "{e}");
+
+    // B's operator hands A the key.
+    let key = confkey::own(&nb.store, b.id).await.unwrap().unwrap();
+    assert_eq!(
+        confkey::add(&na.store, a.id, &key.encode()).await.unwrap(),
+        b.id
+    );
+    assert_eq!(
+        confkey::set(&na.node, b.id, 0, &faster).await.unwrap(),
+        Ok(1)
+    );
+    assert_eq!(nb.pace.get().max_scans_per_hour, 77);
+    let audit = nb.settings.audit(10).await.unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].by, Some(a.id));
+
+    // A stale version (a second editor, or a replay) changes nothing.
+    let e = confkey::set(&na.node, b.id, 0, &faster)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("changed meanwhile"), "{e}");
+
+    // Invalid values are refused by the same rules as locally.
+    let e = confkey::set(
+        &na.node,
+        b.id,
+        1,
+        &Changes {
+            listener: Some(false),
+            scanner: Some(false),
+            web: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(e.contains("at least one role"), "{e}");
+
+    // C holds a wrong key for B.
+    let wrong = confkey::ConfigKey {
+        id: b.id,
+        key: [0u8; 32],
+    };
+    confkey::add(&nc.store, c.id, &wrong.encode())
+        .await
+        .unwrap();
+    let e = confkey::set(&nc.node, b.id, 1, &faster)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("not accepted"), "{e}");
+
+    // Rotation cuts A off.
+    confkey::rotate(&nb.store, b.id).await.unwrap();
+    let e = confkey::set(&na.node, b.id, 1, &faster)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("not accepted"), "{e}");
+    assert_eq!(nb.settings.snapshot().version, 1);
+
+    // A locked node refuses even a correct key.
+    confkey::ensure(&na.store, a.id).await.unwrap();
+    let a_key = confkey::own(&na.store, a.id).await.unwrap().unwrap();
+    confkey::add(&nb.store, b.id, &a_key.encode())
+        .await
+        .unwrap();
+    assert!(!confkey::get(&nb.node, a.id).await.unwrap().open);
+    let e = confkey::set(&nb.node, a.id, 0, &faster)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("switched off"), "{e}");
+}
+
+use peephole::intel::share;
+
+/// The Tor exit list is shared as a file; GeoLite2 databases are not.
+#[tokio::test]
+async fn only_the_tor_list_is_shared_as_a_file() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    std::fs::write(na.dir.path().join("tor-exit.txt"), "192.0.2.1\n192.0.2.2\n").unwrap();
+    std::fs::copy(
+        "tests/fixtures/GeoLite2-City-Test.mmdb",
+        na.dir.path().join("GeoLite2-City.mmdb"),
+    )
+    .unwrap();
+    share::publish(&na, na.dir.path(), &[share::TOR])
+        .await
+        .unwrap();
+    assert!(
+        share::publish(&na, na.dir.path(), &["geolite2-city"])
+            .await
+            .is_err(),
+        "a database is never announced"
+    );
+    eventually("b knows the manifest", || async {
+        share::manifests(&nb.store).await.unwrap().len() == 1
+    })
+    .await;
+    assert_eq!(
+        share::sync_files(&nb, nb.dir.path()).await.unwrap(),
+        [share::TOR]
+    );
+    assert!(nb.dir.path().join("tor-exit.txt").exists());
+    assert!(!nb.dir.path().join("GeoLite2-City.mmdb").exists());
+    // A manifest for a database, written by a peer on its own, is ignored.
+    repl::append(
+        &na,
+        &[Record::IntelManifest(
+            peephole::cluster::record::IntelManifestRec {
+                kind: "geolite2-city".into(),
+                sha256: "00".into(),
+                size: 1,
+                fetched_at: peephole::store::data::now_ts(),
+            },
+        )],
+    )
+    .await
+    .unwrap();
+    eventually("b holds a's newest entry", || async {
+        head_of(&nb, a.id).await == head_of(&na, a.id).await
+    })
+    .await;
+    assert_eq!(share::manifests(&nb.store).await.unwrap().len(), 1);
+}
+
+/// A node without the databases gets GeoIP facts from one that has them;
+/// the database itself does not travel.
+#[tokio::test]
+async fn geo_results_come_from_a_node_that_has_the_database() {
+    use peephole::intel::provider::MaxMind;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
     for f in ["GeoLite2-City", "GeoLite2-ASN"] {
         std::fs::copy(
             format!("tests/fixtures/{f}-Test.mmdb"),
@@ -1270,44 +2204,97 @@ async fn intel_files_are_shared_by_hash() {
         )
         .unwrap();
     }
-    share::publish(&na, na.dir.path(), &[share::CITY, share::ASN])
-        .await
-        .unwrap();
-    eventually("b knows the manifests", || async {
-        share::manifests(&nb.store).await.unwrap().len() == 2
+    let geo: peephole::intel::SharedGeo = Default::default();
+    *geo.write().unwrap() = Some(peephole::intel::geo::GeoIp::load(na.dir.path()).unwrap());
+    let providers: peephole::intel::Providers = vec![Arc::new(MaxMind(geo))];
+    // B, which cannot look anything up, records a request.
+    record(&nb, "2.125.160.216", "/x").await;
+    let nothing: peephole::intel::Providers = vec![Arc::new(MaxMind(Default::default()))];
+    assert_eq!(
+        peephole::intel::enrich_once(&rec(&nb), &nothing)
+            .await
+            .unwrap(),
+        0
+    );
+    eventually("a has b's request", || async {
+        count(&na, "SELECT COUNT(*) FROM requests").await == 1
     })
     .await;
-    let mut got = share::sync_files(&nb, nb.dir.path()).await.unwrap();
-    got.sort();
-    assert_eq!(got, [share::ASN, share::CITY]);
-    let g = peephole::intel::geo::GeoIp::load(nb.dir.path()).unwrap();
     assert_eq!(
-        g.lookup(&"2.125.160.216".parse().unwrap())
-            .country
-            .as_deref(),
-        Some("GB")
+        peephole::intel::enrich_once(&rec(&na), &providers)
+            .await
+            .unwrap(),
+        1
     );
-    assert!(
-        share::sync_files(&nb, nb.dir.path())
+    assert_eq!(na.providers(), [peephole::intel::MAXMIND]);
+    eventually("b shows the country", || async {
+        sqlx::query_scalar::<_, Option<String>>("SELECT country FROM ips")
+            .fetch_one(&nb.store.pool)
             .await
             .unwrap()
-            .is_empty()
-    );
-
-    // A's copy changes without a new announcement: A no longer serves it,
-    // B still does.
-    std::fs::write(na.dir.path().join("GeoLite2-City.mmdb"), b"tampered").unwrap();
-    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
-    eventually("c knows the manifests", || async {
-        share::manifests(&nc.store).await.unwrap().len() == 2
+            .as_deref()
+            == Some("GB")
     })
     .await;
-    eventually("c knows b", || async { nc.status.reached_recently(&b.id) }).await;
-    let got = share::sync_files(&nc, nc.dir.path()).await.unwrap();
-    assert_eq!(got.len(), 2, "{got:?}");
-    let (sha, _) = share::file_hash(&nc.dir.path().join("GeoLite2-City.mmdb")).unwrap();
-    let (want, _) = share::file_hash(&nb.dir.path().join("GeoLite2-City.mmdb")).unwrap();
-    assert_eq!(sha, want);
+    assert!(!nb.dir.path().join("GeoLite2-City.mmdb").exists());
+    // Asked once: a second pass has nothing to do.
+    assert_eq!(
+        peephole::intel::enrich_once(&rec(&na), &providers)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+/// A peer this node blocked does not take a turn in the lookup order.
+#[tokio::test]
+async fn a_blocked_peer_does_not_hold_up_enrichment() {
+    use peephole::cluster::block;
+    use peephole::intel::provider::MaxMind;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    for f in ["GeoLite2-City", "GeoLite2-ASN"] {
+        std::fs::copy(
+            format!("tests/fixtures/{f}-Test.mmdb"),
+            na.dir.path().join(format!("{f}.mmdb")),
+        )
+        .unwrap();
+    }
+    let geo: peephole::intel::SharedGeo = Default::default();
+    *geo.write().unwrap() = Some(peephole::intel::geo::GeoIp::load(na.dir.path()).unwrap());
+    let providers: peephole::intel::Providers = vec![Arc::new(MaxMind(geo))];
+    // Both can look up; the lower key goes first.
+    let (first, second) = if a.id < b.id { (&na, &nb) } else { (&nb, &na) };
+    assert_eq!(
+        peephole::intel::enrich_once(&rec(first), &providers)
+            .await
+            .unwrap(),
+        0
+    );
+    eventually("second knows first can look up", || async {
+        second
+            .status
+            .known(&first.id())
+            .is_some_and(|k| k.hb.providers == [peephole::intel::MAXMIND])
+    })
+    .await;
+    record(second, "2.125.160.216", "/x").await;
+    assert_eq!(
+        peephole::intel::enrich_once(&rec(second), &providers)
+            .await
+            .unwrap(),
+        0,
+        "first's turn"
+    );
+    block::block(second, first.id()).await.unwrap();
+    assert_eq!(
+        peephole::intel::enrich_once(&rec(second), &providers)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 // ---------------------------------------------------------------- admin UI
@@ -1341,7 +2328,8 @@ secure_cookies = false
             peephole::events::Notifier::new(),
             n.pace.clone(),
         )
-        .with_recorder(Recorder::Cluster(n.node.clone())),
+        .with_recorder(Recorder::Cluster(n.node.clone()))
+        .with_settings(n.settings.clone()),
     );
     let app = peephole::admin::full_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1456,7 +2444,11 @@ async fn admin_cluster_page_and_private_attribution() {
         .await
         .unwrap();
     assert!(r.status().is_success());
-    assert_eq!(nb.pace.get().max_scans_per_hour, 77);
+    assert_ne!(
+        nb.pace.get().max_scans_per_hour,
+        77,
+        "no config key: the pace of another node cannot be changed"
+    );
     // Invites are shown once.
     let r = admin
         .post(format!("{base}/admin/cluster/invite"))
@@ -1480,15 +2472,16 @@ async fn admin_cluster_page_and_private_attribution() {
     );
     let none = text(&admin, format!("{base}/requests?node=sensor-charlie")).await;
     assert!(!none.contains("/admin.php"), "node filter");
-    // Revoke from the UI.
+    // Removing another node is not offered.
     let r = admin
         .post(format!("{base}/admin/cluster/revoke"))
         .form(&[("key", c.id.to_string())])
         .send()
         .await
         .unwrap();
-    assert!(r.status().is_success());
-    assert!(knows(&na, c.id, false).await);
+    assert!(!r.status().is_success(), "revoke route is gone");
+    assert!(knows(&na, c.id, true).await);
+    assert!(page.contains("Leave cluster"), "leave button");
 
     // Nothing about the cluster leaks to the public.
     let public = reqwest::Client::new();
@@ -1524,4 +2517,299 @@ async fn admin_cluster_page_and_private_attribution() {
         assert_eq!(resp.status(), 303, "{path} should require a session");
         assert_eq!(resp.headers().get("location").unwrap(), "/login", "{path}");
     }
+}
+
+/// The admin of A configures B through the UI once B's key is added.
+#[tokio::test]
+async fn admin_configures_another_node_with_its_key() {
+    use peephole::cluster::confkey;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a],
+        Opts {
+            remote_config: true,
+            ..DEFAULT
+        },
+    )
+    .await;
+    eventually("a sees that b is open", || async {
+        members::all(&na.store)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == b.id && m.remote_config)
+    })
+    .await;
+    let (admin, base) = admin_on(&na).await;
+    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    assert!(
+        page.contains("open for config key holders"),
+        "b is shown as open"
+    );
+    assert!(page.contains("locked"), "a itself is locked");
+    assert!(
+        !page.contains("peephole-cfg1:"),
+        "a locked node shows no key"
+    );
+
+    // Add B's key, then change B from A's node page.
+    let key = confkey::own(&nb.store, b.id).await.unwrap().unwrap();
+    let r = admin
+        .post(format!("{base}/admin/cluster/config-key/add"))
+        .form(&[("key", key.encode())])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let node_page = text(&admin, format!("{base}/admin/cluster/node/{}", b.id)).await;
+    assert!(node_page.contains("node-bravo"));
+    assert!(
+        node_page.contains("name=\"base_version\" value=\"0\""),
+        "{node_page}"
+    );
+    let r = admin
+        .post(format!("{base}/admin/cluster/node/{}", b.id))
+        .form(&[
+            ("base_version", "0"),
+            ("max_workers", "3"),
+            ("max_scans_per_hour", "55"),
+            ("timeout_minutes", "20"),
+            ("cooldown_hours", "12"),
+            ("listener", "on"),
+            ("web", "on"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let s = nb.settings.snapshot();
+    assert_eq!((s.pace.max_workers, s.pace.max_scans_per_hour), (3, 55));
+    assert_eq!(s.pace.timeout_secs, 1200);
+    assert_eq!(s.cooldown_hours, 12);
+    assert!(
+        s.roles.listener && s.roles.web && !s.roles.scanner,
+        "unchecked role is off"
+    );
+
+    // The pace row cannot change B behind the version check.
+    let r = admin
+        .post(format!("{base}/admin/cluster/pace"))
+        .form(&[
+            ("key", b.id.to_string()),
+            ("max_workers", "1".into()),
+            ("max_scans_per_hour", "11".into()),
+            ("timeout_minutes", "5".into()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(nb.settings.snapshot().pace.max_scans_per_hour, 55);
+
+    // This node's own settings from its own page, which carries the version
+    // it showed.
+    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    let shown = na.settings.snapshot().version;
+    assert!(
+        page.contains(&format!("name=\"base_version\" value=\"{shown}\"")),
+        "own form carries the version"
+    );
+    let own = |base_version: u64, cooldown: &'static str| {
+        admin
+            .post(format!("{base}/admin/cluster/settings"))
+            .form(&[
+                ("base_version", base_version.to_string()),
+                ("cooldown_hours", cooldown.into()),
+                ("listener", "on".into()),
+                ("scanner", "on".into()),
+                ("web", "on".into()),
+            ])
+            .send()
+    };
+    assert!(own(shown, "6").await.unwrap().status().is_success());
+    assert_eq!(na.settings.snapshot().cooldown_hours, 6);
+    // A change made elsewhere after the page was loaded is not overwritten.
+    na.settings
+        .apply(
+            &peephole::settings::Changes {
+                scanner: Some(false),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(own(shown + 1, "7").await.unwrap().status().is_success());
+    let s = na.settings.snapshot();
+    assert!(
+        !s.roles.scanner,
+        "a stale form does not switch the scanner back on"
+    );
+    assert_eq!(s.cooldown_hours, 6);
+}
+
+/// Enrichment results replicate with their origin; a blocked peer's results
+/// stop counting and come back on unblock.
+#[tokio::test]
+async fn enrichment_results_replicate_and_follow_blocks() {
+    use peephole::cluster::block;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    record(&nb, "203.0.113.90", "/x").await;
+    rec(&na)
+        .record_intel(
+            "203.0.113.90",
+            peephole::intel::MAXMIND,
+            Some("2026-09-30"),
+            serde_json::json!({"country": "NL", "asn": 1}),
+        )
+        .await
+        .unwrap();
+    let country = |n: &TestNode| {
+        let pool = n.store.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT country FROM ips WHERE ip = '203.0.113.90'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .flatten()
+        }
+    };
+    eventually("b shows a's result", || async {
+        country(&nb).await.as_deref() == Some("NL")
+    })
+    .await;
+    let origin: Vec<u8> = sqlx::query_scalar("SELECT origin FROM ip_intel")
+        .fetch_one(&nb.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(origin, a.id.0.to_vec(), "provenance is kept");
+    // The same result again writes nothing.
+    let head = head_of(&na, a.id).await;
+    rec(&na)
+        .record_intel(
+            "203.0.113.90",
+            peephole::intel::MAXMIND,
+            Some("2026-09-30"),
+            serde_json::json!({"country": "NL", "asn": 1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head_of(&na, a.id).await, head);
+
+    block::block(&nb, a.id).await.unwrap();
+    assert_eq!(
+        country(&nb).await,
+        None,
+        "a blocked peer's results do not count"
+    );
+    block::unblock(&nb, a.id).await.unwrap();
+    assert_eq!(country(&nb).await.as_deref(), Some("NL"));
+}
+
+/// A node that consulted only GeoIP writes no Tor result of its own and
+/// leaves another node's Tor result alone.
+#[tokio::test]
+async fn a_geo_only_write_leaves_tor_alone() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    record(&nb, "203.0.113.91", "/x").await;
+    rec(&na)
+        .record_intel(
+            "203.0.113.91",
+            peephole::intel::TOR,
+            None,
+            serde_json::json!({"exit": true}),
+        )
+        .await
+        .unwrap();
+    let tor = |n: &TestNode| {
+        let pool = n.store.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>("SELECT is_tor_exit FROM ips WHERE ip = '203.0.113.91'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    eventually("b shows a's tor result", || async { tor(&nb).await }).await;
+    let ip_id: i64 = sqlx::query_scalar("SELECT id FROM ips WHERE ip = '203.0.113.91'")
+        .fetch_one(&nb.store.pool)
+        .await
+        .unwrap();
+    rec(&nb)
+        .record_geo(ip_id, Some("2026-09-30"), Some("NL"), Some(1), None)
+        .await
+        .unwrap();
+    let mine: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ip_intel WHERE provider = 'tor-exits' AND origin = ?",
+    )
+    .bind(&b.id.0[..])
+    .fetch_one(&nb.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(mine, 0, "no Tor row of its own");
+    assert!(tor(&nb).await, "a's Tor result still shows");
+}
+
+/// Enrichment results can be exported with their provenance.
+#[tokio::test]
+async fn enrichment_results_are_exported_with_provenance() {
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    record(&nb, "203.0.113.91", "/x").await;
+    rec(&nb)
+        .record_intel(
+            "203.0.113.91",
+            peephole::intel::MAXMIND,
+            Some("2026-09-30"),
+            serde_json::json!({"country": "NL"}),
+        )
+        .await
+        .unwrap();
+    eventually("a has the result", || async {
+        count(&na, "SELECT COUNT(*) FROM ip_intel").await == 1
+    })
+    .await;
+    // A result whose IP has no row any more is not exported.
+    sqlx::query(
+        "INSERT INTO ip_intel (ip, provider, origin, hlc, fetched_at, source_version, data_json)
+         VALUES ('198.51.100.7', 'maxmind-geolite2', x'', 0, '2026-01-01T00:00:00Z', NULL, '{}')",
+    )
+    .execute(&na.store.pool)
+    .await
+    .unwrap();
+    let (admin, base) = admin_on(&na).await;
+    let body = text(&admin, format!("{base}/admin/export/intel")).await;
+    assert_eq!(body.lines().count(), 1, "{body}");
+    let line: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+    assert_eq!(line["ip"], "203.0.113.91");
+    assert_eq!(line["provider"], "maxmind-geolite2");
+    assert_eq!(line["source_version"], "2026-09-30");
+    assert_eq!(line["node"], "node-bravo");
+    assert_eq!(line["data"]["country"], "NL");
+    // Not public.
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let r = anon
+        .get(format!("{base}/admin/export/intel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 303);
 }

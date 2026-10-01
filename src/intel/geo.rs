@@ -39,6 +39,13 @@ impl GeoIp {
         Ok(Self { city, asn })
     }
 
+    /// Build date of the city database (`YYYY-MM-DD`), as the version of
+    /// the data a lookup came from.
+    pub fn build_date(&self) -> Option<String> {
+        chrono::DateTime::from_timestamp(self.city.metadata().build_epoch as i64, 0)
+            .map(|t| t.format("%Y-%m-%d").to_string())
+    }
+
     pub fn lookup(&self, ip: &IpAddr) -> Geo {
         let mut g = Geo::default();
         // maxminddb 0.32: lookup yields a LookupResult; decode the record.
@@ -91,18 +98,14 @@ impl GeoIp {
 pub async fn backfill_iso_codes(
     rec: &crate::store::recorder::Recorder,
     updates: Vec<(i64, Geo)>,
+    version: Option<&str>,
 ) -> Result<usize> {
     let mut n = 0;
     for (id, g) in updates {
         let Some(code) = g.country.as_deref() else {
             continue;
         };
-        let tor: bool = sqlx::query_scalar("SELECT is_tor_exit FROM ips WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&rec.store().pool)
-            .await?
-            .unwrap_or(false);
-        rec.enrich_ip(id, Some(code), g.asn, g.asn_org.as_deref(), tor)
+        rec.record_geo(id, version, Some(code), g.asn, g.asn_org.as_deref())
             .await?;
         n += 1;
     }
@@ -226,9 +229,13 @@ mod tests {
 
         let rows = store.ips_with_legacy_country().await.unwrap();
         assert_eq!(rows.len(), 1);
-        let n = backfill_iso_codes(&store.local(), geo.relookup(&rows))
-            .await
-            .unwrap();
+        let n = backfill_iso_codes(
+            &store.local(),
+            geo.relookup(&rows),
+            geo.build_date().as_deref(),
+        )
+        .await
+        .unwrap();
         assert_eq!(n, 1);
         let gb = store.ip_by_id(gb.id).await.unwrap().unwrap();
         assert_eq!(gb.country.as_deref(), Some("GB"));

@@ -8,6 +8,8 @@ pub mod fingerprint;
 pub mod intel;
 pub mod net;
 pub mod scan;
+pub mod settings;
+pub mod settings_cli;
 pub mod store;
 pub mod trap;
 
@@ -65,6 +67,16 @@ pub async fn check_config(
             )),
             Err(e) => return Err(e.context("node key")),
         }
+        summary.push_str(if cfg.cluster.as_ref().is_some_and(|c| c.remote_config) {
+            "\nremote config: on (config key holders may change runtime settings)"
+        } else {
+            "\nremote config: off"
+        });
+        if cfg.scan.retention_days > 0 {
+            summary.push_str(
+                "\nnote: scan.retention_days is ignored in a cluster (the shared dataset is persistent)",
+            );
+        }
     }
     for n in notes {
         summary.push('\n');
@@ -73,14 +85,27 @@ pub async fn check_config(
     Ok((cfg, classifier, summary))
 }
 
+/// Whether old records are deleted by age. Only on a standalone node: a
+/// cluster's dataset is persistent, and nothing in it is erased by age.
+pub fn retention_applies(cfg: &config::Config) -> bool {
+    cfg.cluster.is_none() && cfg.scan.retention_days > 0
+}
+
+/// Whether this node loads the GeoLite2 databases in its data dir. A cluster
+/// node needs its own `[maxmind]` credentials: files copied from peers by
+/// older builds are not used, so nobody serves a frozen copy.
+pub fn geolite_loads(cfg: &config::Config) -> bool {
+    cfg.cluster.is_none() || cfg.maxmind.is_some()
+}
+
 pub async fn run(config_path: PathBuf) -> Result<()> {
     // Startup validation (spec §12).
-    let (cfg, classifier, summary) = check_config(&config_path).await?;
+    let (cfg, _, summary) = check_config(&config_path).await?;
     info!(version = VERSION, "{summary}");
     std::fs::create_dir_all(&cfg.data_dir)?;
     let store = store::Store::connect(&cfg.database_path).await?;
 
-    let geo = Arc::new(RwLock::new(
+    let geo = Arc::new(RwLock::new(if geolite_loads(&cfg) {
         intel::geo::GeoIp::load(&cfg.data_dir)
             .map(Some)
             .unwrap_or_else(|e| {
@@ -89,8 +114,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     "maxmind dbs not loaded yet; geo enrichment deferred to scheduler"
                 );
                 None
-            }),
-    ));
+            })
+    } else {
+        info!(
+            "GeoLite2 databases are not shared any more; configure [maxmind] to look up \
+             GeoIP data on this node"
+        );
+        None
+    }));
     let tor = Arc::new(RwLock::new(
         intel::tor::TorExitList::load(&cfg.data_dir).unwrap_or_default(),
     ));
@@ -123,32 +154,51 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         shutdown_rx.clone(),
     ));
 
-    // Retention: prune requests and scan results older than the configured
-    // window so the database does not grow without bound.
-    tokio::spawn(run_retention(
+    // Results for IPs this or other nodes recorded without them.
+    tokio::spawn(intel::enrich_loop(
         recorder.clone(),
-        cfg.scan.retention_days,
+        vec![Arc::new(intel::provider::MaxMind(geo.clone()))],
         shutdown_rx.clone(),
     ));
+
+    // Retention (standalone only): prune requests and scan results older
+    // than the configured window so the database does not grow without bound.
+    if retention_applies(&cfg) {
+        tokio::spawn(run_retention(
+            recorder.clone(),
+            cfg.scan.retention_days,
+            shutdown_rx.clone(),
+        ));
+    }
 
     // Queue change notifications: trap + workers publish, admin SSE subscribes.
     let notifier = events::Notifier::new();
 
-    // Scan pace: config defaults, overridden from the admin queue page.
-    let pace = scan::pace::SharedPace::load(&store, &cfg.scan).await?;
+    // Runtime settings: config defaults, overridden from the admin UI, the
+    // CLI or a config key holder.
+    let nmap_ok = tokio::process::Command::new(nmap_path())
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|o| o.status.success());
+    let settings =
+        settings::Settings::load(&store, &cfg, settings::Prereqs::from_config(&cfg, nmap_ok))
+            .await?;
 
     // Distributed mode: job arbiter (answers scanners' claims), remote pace
     // changes and takeover of silent arbiters' queues (scanners), then the
     // RPC listener and sync loops.
     if let Some(node) = &node {
         scan::arbiter::Arbiter::start(node.clone(), shutdown_rx.clone()).await?;
-        if cfg.roles.scanner {
-            scan::pace::serve_remote(node, pace.clone());
-            tokio::spawn(scan::arbiter::takeover_loop(
-                node.clone(),
-                shutdown_rx.clone(),
-            ));
+        if cfg.cluster.as_ref().is_some_and(|c| c.remote_config) {
+            cluster::confkey::ensure(&store, node.id()).await?;
         }
+        cluster::confkey::serve(node, settings.clone());
+        // Does nothing unless this node currently scans.
+        tokio::spawn(scan::arbiter::takeover_loop(
+            node.clone(),
+            shutdown_rx.clone(),
+        ));
         cluster::start(node.clone(), shutdown_rx.clone()).await?;
         tokio::spawn(forward_job_events(
             node.clone(),
@@ -157,69 +207,311 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         ));
     }
 
-    // Scan worker pool.
-    if cfg.roles.scanner {
-        tokio::spawn(scan::run_workers(
-            recorder.clone(),
-            cfg.clone(),
-            pace.clone(),
-            PathBuf::from(nmap_path()),
-            shutdown_rx.clone(),
-            notifier.clone(),
-        ));
+    // Roles run under a supervisor that starts and stops them when the
+    // effective roles change (admin UI, CLI, or a config key holder).
+    let roles = RoleRunner {
+        cfg: cfg.clone(),
+        store: store.clone(),
+        recorder: recorder.clone(),
+        geo,
+        tor,
+        notifier,
+        settings: settings.clone(),
+        node: node.clone(),
+    };
+    // At startup a role that cannot start is fatal, as it always was (the
+    // installer's health check relies on it); later changes are retried.
+    let mut running = Running3::default();
+    roles.reconcile(&mut running, true).await?;
+    info!(roles = %settings.roles().names().join(","), "peephole up");
+    let supervisor = tokio::spawn(roles.supervise(running, shutdown_rx.clone()));
+    shutdown_signal().await;
+    info!("shutting down");
+    let _ = shutdown_tx.send(true);
+    let _ = supervisor.await;
+    Ok(())
+}
+
+/// How often the daemon re-reads settings another process (the CLI) may
+/// have written, and retries a role that failed to start.
+pub const SETTINGS_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a stopping web interface may finish open requests before its
+/// listener task is dropped.
+const WEB_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long shutdown waits for the roles to stop (scans to finish) before it
+/// abandons them; interrupted scans are requeued as after a crash.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Longest wait between attempts to start a role that keeps failing.
+const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A running role: send `true` to make it stop; the task ends by itself.
+struct Running {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Running {
+    /// Ask the role to stop, without waiting for it.
+    fn signal(self) -> tokio::task::JoinHandle<()> {
+        let _ = self.stop.send(true);
+        self.task
+    }
+}
+
+/// One role's state in the supervisor.
+#[derive(Default)]
+struct Slot {
+    running: Option<Running>,
+    /// The previous instance, asked to stop and still finishing (a scanner
+    /// lets its scans end). The role is not started again until it is gone:
+    /// a fresh scanner would requeue the jobs it is still running.
+    stopping: Option<tokio::task::JoinHandle<()>>,
+    /// Failed starts in a row, and when to try again.
+    failures: u32,
+    next_try: Option<tokio::time::Instant>,
+}
+
+/// The three roles: trap, scanner, web.
+#[derive(Default)]
+struct Running3 {
+    trap: Slot,
+    scanner: Slot,
+    web: Slot,
+}
+
+/// Everything needed to start any role.
+struct RoleRunner {
+    cfg: config::Config,
+    store: store::Store,
+    recorder: store::recorder::Recorder,
+    geo: intel::SharedGeo,
+    tor: intel::SharedTor,
+    notifier: events::Notifier,
+    settings: settings::Settings,
+    node: Option<Arc<cluster::Node>>,
+}
+
+impl RoleRunner {
+    /// Make the running roles equal to the effective ones. Never waits for a
+    /// role to stop. `startup`: a role the config file enables that cannot
+    /// start is an error (the installer's health check relies on it); every
+    /// other failure is logged and retried with a growing delay.
+    async fn reconcile(&self, r: &mut Running3, startup: bool) -> Result<()> {
+        let want = self.settings.roles();
+        let now = tokio::time::Instant::now();
+        for (slot, want, from_file, name, key) in [
+            (
+                &mut r.trap,
+                want.listener,
+                self.cfg.roles.listener,
+                "trap",
+                "roles.listener",
+            ),
+            (
+                &mut r.scanner,
+                want.scanner,
+                self.cfg.roles.scanner,
+                "scanner",
+                "roles.scanner",
+            ),
+            (&mut r.web, want.web, self.cfg.roles.web, "web", "roles.web"),
+        ] {
+            if slot.stopping.as_ref().is_some_and(|t| t.is_finished()) {
+                slot.stopping = None;
+                info!(role = name, "role stopped");
+            }
+            // A task that ended by itself (listener error) is started afresh.
+            if slot.running.as_ref().is_some_and(|x| x.task.is_finished()) {
+                slot.running = None;
+            }
+            if !want {
+                slot.failures = 0;
+                slot.next_try = None;
+                if let Some(x) = slot.running.take() {
+                    info!(role = name, "role stopping");
+                    slot.stopping = Some(x.signal());
+                }
+                continue;
+            }
+            if slot.running.is_some()
+                || slot.stopping.is_some()
+                || slot.next_try.is_some_and(|t| t > now)
+            {
+                continue;
+            }
+            let started = match name {
+                "trap" => self.start_trap().await,
+                "scanner" => self.start_scanner().await,
+                _ => self.start_web().await,
+            };
+            match started {
+                Ok(x) => {
+                    info!(role = name, "role started");
+                    slot.running = Some(x);
+                    slot.failures = 0;
+                    slot.next_try = None;
+                }
+                Err(e) if startup && from_file => {
+                    return Err(e.context(format!("starting {name}")));
+                }
+                Err(e) => {
+                    slot.failures += 1;
+                    let wait =
+                        (SETTINGS_TICK * 2u32.saturating_pow(slot.failures - 1)).min(RETRY_MAX);
+                    slot.next_try = Some(now + wait);
+                    let why = if from_file {
+                        String::new()
+                    } else {
+                        format!(
+                            " (switched on by a runtime setting; `peephole settings reset {key}` undoes that)"
+                        )
+                    };
+                    warn!(
+                        role = name,
+                        error = %format!("{e:#}"),
+                        retry_in_secs = wait.as_secs(),
+                        "role could not start{why}"
+                    );
+                }
+            }
+        }
+        // Tell the cluster what this node actually runs.
+        if let Some(node) = &self.node {
+            let running = config::Roles {
+                listener: r.trap.running.is_some(),
+                scanner: r.scanner.running.is_some(),
+                web: r.web.running.is_some(),
+            };
+            if let Err(e) = node.set_roles(running).await {
+                warn!(?e, "publishing the new roles failed");
+            }
+        }
+        Ok(())
     }
 
-    let mut servers = tokio::task::JoinSet::new();
-    if let (true, Some(addr), Some(classifier)) = (cfg.roles.listener, cfg.trap_listen, classifier)
-    {
-        let trap_app = trap::router(Arc::new(trap::TrapState {
-            store: store.clone(),
-            recorder: recorder.clone(),
-            cfg: cfg.clone(),
+    /// Keep the running roles equal to the effective ones until shutdown,
+    /// then stop them all, waiting at most [`SHUTDOWN_GRACE`].
+    async fn supervise(
+        self,
+        mut running: Running3,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut changes = self.settings.subscribe();
+        loop {
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = tokio::time::sleep(SETTINGS_TICK) => {
+                    if let Err(e) = self.settings.reload().await {
+                        warn!(?e, "reloading settings failed");
+                    }
+                }
+                _ = shutdown.changed() => break,
+            }
+            let _ = self.reconcile(&mut running, false).await;
+        }
+        let mut tasks = vec![];
+        for slot in [running.trap, running.scanner, running.web] {
+            tasks.extend(slot.running.map(Running::signal));
+            tasks.extend(slot.stopping);
+        }
+        let aborts: Vec<_> = tasks.iter().map(|t| t.abort_handle()).collect();
+        if tokio::time::timeout(SHUTDOWN_GRACE, futures::future::join_all(tasks))
+            .await
+            .is_err()
+        {
+            warn!("roles did not stop in time; running scans are interrupted and requeued");
+            for a in aborts {
+                a.abort();
+            }
+        }
+    }
+
+    async fn start_trap(&self) -> Result<Running> {
+        let (Some(addr), Some(dir)) = (self.cfg.trap_listen, &self.cfg.rules_dir) else {
+            anyhow::bail!("trap_listen and rules_dir are required");
+        };
+        // Loaded on every start, so edited rules apply when the role is
+        // switched off and on.
+        let classifier = classify::Classifier::from_dir(dir).context("loading rules")?;
+        let app = trap::router(Arc::new(trap::TrapState {
+            store: self.store.clone(),
+            recorder: self.recorder.clone(),
+            cfg: self.cfg.clone(),
             classifier,
-            geo: geo.clone(),
-            tor: tor.clone(),
-            notifier: notifier.clone(),
+            geo: self.geo.clone(),
+            tor: self.tor.clone(),
+            notifier: self.notifier.clone(),
             helper_rate: Default::default(),
+            pace: self.settings.pace.clone(),
         }));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding trap listener {addr}"))?;
         info!(%addr, "trap listener up");
-        let trap_shutdown = shutdown_rx.clone();
-        servers.spawn(async move {
-            serve_trap(listener, trap_app, trap_shutdown).await;
-            Ok::<(), std::io::Error>(())
-        });
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        Ok(Running {
+            stop,
+            task: tokio::spawn(serve_trap(listener, app, rx)),
+        })
     }
-    if let (true, Some(addr)) = (cfg.roles.web, cfg.admin_listen) {
+
+    async fn start_scanner(&self) -> Result<Running> {
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        Ok(Running {
+            stop,
+            task: tokio::spawn(scan::run_workers(
+                self.recorder.clone(),
+                self.cfg.clone(),
+                self.settings.pace.clone(),
+                PathBuf::from(nmap_path()),
+                rx,
+                self.notifier.clone(),
+            )),
+        })
+    }
+
+    async fn start_web(&self) -> Result<Running> {
+        let Some(addr) = self.cfg.admin_listen else {
+            anyhow::bail!("admin_listen is required");
+        };
         // First-run admin setup token (spec §8.4).
-        let _ = admin::auth::ensure_setup_token(&store, &cfg.data_dir).await;
-        let admin_app = admin::full_router(Arc::new(
-            admin::AdminState::new(store.clone(), cfg.clone(), notifier, pace)
-                .with_recorder(recorder.clone()),
+        let _ = admin::auth::ensure_setup_token(&self.store, &self.cfg.data_dir).await;
+        let (stop, mut rx) = tokio::sync::watch::channel(false);
+        let app = admin::full_router(Arc::new(
+            admin::AdminState::new(
+                self.store.clone(),
+                self.cfg.clone(),
+                self.notifier.clone(),
+                self.settings.pace.clone(),
+            )
+            .with_recorder(self.recorder.clone())
+            .with_settings(self.settings.clone())
+            .with_closing(rx.clone()),
         ));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding admin listener {addr}"))?;
         info!(%addr, "admin listener up");
-        servers.spawn(async move { axum::serve(listener, admin_app).await });
+        Ok(Running {
+            stop,
+            task: tokio::spawn(async move {
+                let mut grace = rx.clone();
+                let served = axum::serve(listener, app).with_graceful_shutdown(async move {
+                    let _ = rx.wait_for(|v| *v).await;
+                });
+                tokio::select! {
+                    r = served => if let Err(e) = r {
+                        warn!(?e, "admin listener stopped");
+                    },
+                    _ = async {
+                        let _ = grace.wait_for(|v| *v).await;
+                        tokio::time::sleep(WEB_GRACE).await;
+                    } => warn!("admin listener stopped with requests still open"),
+                }
+            }),
+        })
     }
-    info!(roles = %cfg.roles.names().join(","), "peephole up");
-
-    // A scanner-only node serves nothing; it runs until interrupted.
-    let served = async {
-        match servers.join_next().await {
-            Some(r) => r.map_err(anyhow::Error::from)?.map_err(anyhow::Error::from),
-            None => std::future::pending().await,
-        }
-    };
-    tokio::select! {
-        r = served => { r?; }
-        _ = shutdown_signal() => { info!("shutting down"); }
-    }
-    let _ = shutdown_tx.send(true);
-    Ok(())
 }
 
 /// Resolve on Ctrl-C or SIGTERM. systemd stops the service with SIGTERM, so
@@ -382,5 +674,35 @@ async fn forward_job_events(
                 notifier.publish(j);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(extra: &str) -> config::Config {
+        toml::from_str(&format!(
+            "database_path = \"/x\"\ndata_dir = \"/x\"\n[roles]\nlistener = false\nweb = false\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn retention_only_applies_to_standalone_nodes() {
+        assert!(retention_applies(&cfg("")));
+        assert!(!retention_applies(&cfg("[scan]\nretention_days = 0\n")));
+        assert!(!retention_applies(&cfg(
+            "[cluster]\nnode_name = \"n\"\nlisten = \"127.0.0.1:7443\"\n"
+        )));
+    }
+
+    #[test]
+    fn a_cluster_node_loads_geolite2_only_with_its_own_credentials() {
+        let cluster = "[cluster]\nnode_name = \"n\"\nlisten = \"127.0.0.1:7443\"\n";
+        let maxmind = "[maxmind]\naccount_id = \"1\"\nlicense_key = \"k\"\n";
+        assert!(geolite_loads(&cfg("")));
+        assert!(!geolite_loads(&cfg(cluster)));
+        assert!(geolite_loads(&cfg(&format!("{maxmind}{cluster}"))));
     }
 }

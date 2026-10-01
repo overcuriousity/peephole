@@ -2,9 +2,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Highest protocol version this build speaks.
-pub const PROTO_VERSION: u32 = 1;
-/// Lowest protocol version this build still speaks.
-pub const PROTO_MIN: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
+/// Lowest protocol version this build still speaks. Version 1 let any
+/// member revoke others and delete their records; it is not spoken.
+pub const PROTO_MIN: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Hello {

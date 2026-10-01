@@ -66,12 +66,19 @@ pub enum Msg {
     RequeueReply {
         n: u64,
     },
-    /// Admin → scanner: change its scan pace (persisted there).
-    SetPace {
-        pace: super::status::PaceInfo,
+    /// Any member → node: what are your runtime settings?
+    ConfigGet,
+    ConfigState(super::confkey::State),
+    /// Config key holder → node: change your settings. `mac` proves the
+    /// sender holds the node's config key without sending it.
+    ConfigSet {
+        base_version: u64,
+        changes: crate::settings::Changes,
+        mac: serde_bytes::ByteBuf,
     },
-    /// `error` is None on success.
-    SetPaceReply {
+    /// `version` is the new settings version on success.
+    ConfigSetReply {
+        version: Option<u64>,
         error: Option<String>,
     },
 }
@@ -277,6 +284,9 @@ impl Node {
     }
 
     async fn deliver(self: &Arc<Self>, b: Body) {
+        if self.is_blocked(&b.from) {
+            return debug!(from = %b.from.short(), "message from a blocked peer dropped");
+        }
         if !self.is_member(&b.from) {
             return debug!(from = %b.from.short(), "message from non-member dropped");
         }

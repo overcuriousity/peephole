@@ -8,8 +8,8 @@ use super::scans::{EnqueueOutcome, ScanJobRow};
 use crate::cluster::Node;
 use crate::cluster::hlc::Hlc;
 use crate::cluster::record::{
-    FingerprintRec, FpClaimRec, IpEnrichRec, JobStatusRec, PortRec, Record, RequestRec, ScanJobRec,
-    ScanResultRec, TombTarget, TombstoneRec,
+    FingerprintRec, FpClaimRec, IpIntelRec, JobStatusRec, PortRec, Record, RequestRec, ScanJobRec,
+    ScanResultRec, TombstoneRec,
 };
 use crate::scan::nmap_xml::ScanResult;
 use anyhow::{Context, Result};
@@ -26,6 +26,14 @@ pub enum Recorder {
 
 /// Rows per tombstone record in bulk deletes.
 const TOMB_CHUNK: usize = 500;
+
+/// `v` with the null-valued keys of an object removed.
+fn without_nulls(mut v: serde_json::Value) -> serde_json::Value {
+    if let Some(m) = v.as_object_mut() {
+        m.retain(|_, x| !x.is_null());
+    }
+    v
+}
 
 impl Recorder {
     pub fn store(&self) -> &Store {
@@ -48,6 +56,15 @@ impl Recorder {
         match self {
             Recorder::Local(_) => None,
             Recorder::Cluster(n) => Some(n.id()),
+        }
+    }
+
+    /// A fresh uid. In a cluster it carries this node's prefix, which binds
+    /// the record to its origin (see `NodeId::uid_prefix`).
+    fn uid(&self) -> String {
+        match self {
+            Recorder::Local(_) => new_uid(),
+            Recorder::Cluster(n) => format!("{}{}", n.id().uid_prefix(), new_uid()),
         }
     }
 
@@ -108,7 +125,7 @@ impl Recorder {
 
     /// Record a request from the IP `n.ip_id`. Returns the request id.
     pub async fn insert_request(&self, n: &NewRequest) -> Result<i64> {
-        let uid = new_uid();
+        let uid = self.uid();
         self.write(vec![Record::Request(RequestRec {
             uid: uid.clone(),
             ts: now_ts(),
@@ -128,35 +145,104 @@ impl Recorder {
         self.id_by_uid("requests", &uid).await
     }
 
-    /// Set GeoIP / Tor facts for an IP, writing only if they changed.
-    pub async fn enrich_ip(
+    /// Record one provider's result for an IP. Nothing is written when this
+    /// node's last result for it says the same, so a cluster does not
+    /// replicate one record per request.
+    pub async fn record_intel(
         &self,
-        ip_id: i64,
+        ip: &str,
+        provider: &str,
+        source_version: Option<&str>,
+        data: serde_json::Value,
+    ) -> Result<()> {
+        let mine = self.node_id().map(|id| id.0.to_vec()).unwrap_or_default();
+        let last: Option<String> = sqlx::query_scalar(
+            "SELECT data_json FROM ip_intel WHERE ip = ? AND provider = ? AND origin = ?",
+        )
+        .bind(ip)
+        .bind(provider)
+        .bind(mine)
+        .fetch_optional(&self.store().pool)
+        .await?;
+        // Compared as JSON without null fields: rows from the migration
+        // differ in key order and carry explicit nulls for unknown fields.
+        let same = last
+            .and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+            .is_some_and(|l| without_nulls(l) == without_nulls(data.clone()));
+        if same {
+            return Ok(());
+        }
+        self.write(vec![Record::IpIntel(IpIntelRec {
+            ip: ip.to_string(),
+            provider: provider.to_string(),
+            fetched_at: now_ts(),
+            source_version: source_version.map(str::to_string),
+            data_json: data.to_string(),
+        })])
+        .await
+    }
+
+    /// GeoIP facts as a MaxMind result (fields that are unknown are left out).
+    pub fn geo_data(
         country: Option<&str>,
         asn: Option<u32>,
         asn_org: Option<&str>,
-        tor: bool,
+    ) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        if let Some(c) = country {
+            m.insert("country".into(), c.into());
+        }
+        if let Some(a) = asn {
+            m.insert("asn".into(), a.into());
+        }
+        if let Some(o) = asn_org {
+            m.insert("asn_org".into(), o.into());
+        }
+        serde_json::Value::Object(m)
+    }
+
+    /// Record this node's MaxMind result for an IP. Only the provider that
+    /// was consulted is written; other providers' results are not touched.
+    pub async fn record_geo(
+        &self,
+        ip_id: i64,
+        source_version: Option<&str>,
+        country: Option<&str>,
+        asn: Option<u32>,
+        asn_org: Option<&str>,
     ) -> Result<()> {
-        let cur: Option<data::IpFacts<String>> =
-            sqlx::query_as("SELECT ip, country, asn, asn_org, is_tor_exit FROM ips WHERE id = ?")
-                .bind(ip_id)
-                .fetch_optional(&self.store().pool)
-                .await?;
-        let Some((ip, c, a, o, t)) = cur else {
+        let Some(ip) = self.find_ip(ip_id).await? else {
             return Ok(());
         };
-        let asn = asn.map(i64::from);
-        if c.as_deref() == country && a == asn && o.as_deref() == asn_org && t == tor {
-            return Ok(());
-        }
-        self.write(vec![Record::IpEnrich(IpEnrichRec {
-            ip,
-            country: country.map(str::to_string),
-            asn,
-            asn_org: asn_org.map(str::to_string),
-            tor,
-        })])
+        self.record_intel(
+            &ip,
+            crate::intel::MAXMIND,
+            source_version,
+            Self::geo_data(country, asn, asn_org),
+        )
         .await
+    }
+
+    /// Record this node's Tor exit list result for an IP.
+    pub async fn record_tor(&self, ip_id: i64, exit: bool) -> Result<()> {
+        let Some(ip) = self.find_ip(ip_id).await? else {
+            return Ok(());
+        };
+        self.record_intel(
+            &ip,
+            crate::intel::TOR,
+            None,
+            serde_json::json!({ "exit": exit }),
+        )
+        .await
+    }
+
+    /// The IP's text, None when the row does not exist.
+    async fn find_ip(&self, ip_id: i64) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT ip FROM ips WHERE id = ?")
+            .bind(ip_id)
+            .fetch_optional(&self.store().pool)
+            .await?)
     }
 
     pub async fn insert_fp_claim(
@@ -171,7 +257,7 @@ impl Recorder {
             .await?
             .context("claim for an unknown request")?;
         self.write(vec![Record::FpClaim(FpClaimRec {
-            uid: new_uid(),
+            uid: self.uid(),
             request_uid,
             ip: self.ip_of(ip_id).await?,
             ts: now_ts(),
@@ -196,7 +282,7 @@ impl Recorder {
             Some(id) => self.uid_by_id("requests", id).await?,
             None => None,
         };
-        let uid = new_uid();
+        let uid = self.uid();
         self.write(vec![Record::Fingerprint(FingerprintRec {
             uid: uid.clone(),
             request_uid,
@@ -284,7 +370,7 @@ impl Recorder {
                 }
             }
         }
-        let uid = new_uid();
+        let uid = self.uid();
         self.write(vec![Record::ScanJob(ScanJobRec {
             uid: uid.clone(),
             ip: self.ip_of(ip_id).await?,
@@ -376,7 +462,7 @@ impl Recorder {
         let mut records = vec![];
         if let Some(res) = result {
             records.push(Record::ScanResult(ScanResultRec {
-                uid: new_uid(),
+                uid: self.uid(),
                 job_uid: uid.clone(),
                 ip,
                 level,
@@ -425,7 +511,7 @@ impl Recorder {
         res: &ScanResult,
     ) -> Result<()> {
         self.write(vec![Record::ScanResult(ScanResultRec {
-            uid: new_uid(),
+            uid: self.uid(),
             job_uid: job_uid.to_string(),
             ip: ip.to_string(),
             level,
@@ -548,82 +634,189 @@ impl Recorder {
         .await
     }
 
-    fn tomb(target: TombTarget) -> Record {
-        Record::Tombstone(TombstoneRec {
-            uid: new_uid(),
-            target,
-        })
-    }
-
-    pub async fn delete_request(&self, id: i64) -> Result<bool> {
-        let Some(uid) = self.uid_by_id("requests", id).await? else {
-            return Ok(false);
+    /// Uids of `table` rows whose `col` is one of `keys`, split into what
+    /// this node originated and what other nodes did. Only the former can be
+    /// deleted cluster-wide.
+    async fn split(
+        &self,
+        table: &'static str,
+        col: &'static str,
+        keys: Keys<'_>,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let me = self.node_id().map(|id| id.0.to_vec());
+        let n = match keys {
+            Keys::Ids(k) => k.len(),
+            Keys::Uids(k) => k.len(),
         };
-        self.write(vec![Self::tomb(TombTarget::Requests { uids: vec![uid] })])
-            .await?;
-        Ok(true)
-    }
-
-    /// Delete many requests (and their claims/fingerprints) atomically.
-    pub async fn delete_requests(&self, ids: &[i64]) -> Result<u64> {
-        let mut uids = vec![];
-        for id in ids {
-            if let Some(u) = self.uid_by_id("requests", *id).await? {
-                uids.push(u);
+        let (mut own, mut other) = (vec![], vec![]);
+        for start in (0..n).step_by(400) {
+            let end = (start + 400).min(n);
+            let sql = format!(
+                "SELECT uid, origin FROM {table} WHERE uid IS NOT NULL AND {col} IN ({})",
+                vec!["?"; end - start].join(",")
+            );
+            let mut q = sqlx::query_as::<_, (String, Option<Vec<u8>>)>(sqlx::AssertSqlSafe(sql));
+            match keys {
+                Keys::Ids(k) => {
+                    for v in &k[start..end] {
+                        q = q.bind(*v);
+                    }
+                }
+                Keys::Uids(k) => {
+                    for v in &k[start..end] {
+                        q = q.bind(v.as_str());
+                    }
+                }
+            }
+            for (uid, origin) in q.fetch_all(&self.store().pool).await? {
+                if origin == me {
+                    own.push(uid);
+                } else {
+                    other.push(uid);
+                }
             }
         }
-        let n = uids.len() as u64;
-        let records: Vec<_> = uids
-            .chunks(TOMB_CHUNK)
-            .map(|c| Self::tomb(TombTarget::Requests { uids: c.to_vec() }))
-            .collect();
+        Ok((own, other))
+    }
+
+    /// Delete records this node originated, everywhere.
+    async fn bury(&self, uids: Vec<String>) -> Result<()> {
+        let mut records = vec![];
+        for c in uids.chunks(TOMB_CHUNK) {
+            let (uids, seqs) = match self {
+                Recorder::Local(_) => (c.to_vec(), vec![]),
+                // Where each record sits in our log: receivers accept an
+                // erased entry only at a position its tombstone names.
+                Recorder::Cluster(n) => {
+                    let sql = format!(
+                        "SELECT uid, seq FROM repl_log
+                         WHERE +origin = ? AND kind != 'tombstone' AND uid IN ({})",
+                        vec!["?"; c.len()].join(",")
+                    );
+                    let mut q = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql))
+                        .bind(n.id().0.to_vec());
+                    for u in c {
+                        q = q.bind(u.as_str());
+                    }
+                    q.fetch_all(&n.store.pool)
+                        .await?
+                        .into_iter()
+                        .map(|(uid, seq)| (uid, seq as u64))
+                        .unzip()
+                }
+            };
+            if uids.is_empty() {
+                continue;
+            }
+            records.push(Record::Tombstone(TombstoneRec {
+                uid: self.uid(),
+                uids,
+                seqs,
+            }));
+        }
         if !records.is_empty() {
             self.write(records).await?;
         }
-        Ok(n)
+        Ok(())
     }
 
+    /// Records other nodes originated cannot be deleted from here: they are
+    /// hidden on this node only.
+    async fn hide(&self, uids: Vec<String>) -> Result<u64> {
+        let Recorder::Cluster(n) = self else {
+            return Ok(0);
+        };
+        if uids.is_empty() {
+            return Ok(0);
+        }
+        let _g = n.apply_lock.lock().await;
+        let mut tx = n.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let hidden = data::hide(&mut tx, &uids).await?;
+        tx.commit().await?;
+        Ok(hidden)
+    }
+
+    pub async fn delete_request(&self, id: i64) -> Result<Deleted> {
+        self.delete_requests(&[id]).await
+    }
+
+    /// Delete requests. Ours go cluster-wide, together with our claims and
+    /// fingerprints on them.
+    pub async fn delete_requests(&self, ids: &[i64]) -> Result<Deleted> {
+        let (reqs, foreign) = self.split("requests", "id", Keys::Ids(ids)).await?;
+        // Claims and fingerprints go with their request: ours are deleted
+        // cluster-wide, other nodes' are hidden here.
+        let all: Vec<String> = [&reqs[..], &foreign[..]].concat();
+        let (claims, their_claims) = self
+            .split("fp_claims", "request_uid", Keys::Uids(&all))
+            .await?;
+        let (fps, their_fps) = self
+            .split("fingerprints", "request_uid", Keys::Uids(&all))
+            .await?;
+        let (deleted, hidden) = (reqs.len() as u64, foreign.len() as u64);
+        self.bury([reqs, claims, fps].concat()).await?;
+        // Children first: hiding a request unlinks its fingerprints.
+        self.hide([their_fps, their_claims, foreign].concat())
+            .await?;
+        Ok(Deleted { deleted, hidden })
+    }
+
+    /// Whether the IP existed. Everything this node recorded about it is
+    /// deleted cluster-wide.
     pub async fn delete_ip(&self, ip_id: i64) -> Result<bool> {
-        Ok(self.delete_ips(&[ip_id]).await? == 1)
+        let existed = self.ip_of(ip_id).await.is_ok();
+        self.delete_ips(&[ip_id]).await?;
+        Ok(existed)
     }
 
-    /// Delete IPs with everything hanging off them, atomically.
-    pub async fn delete_ips(&self, ids: &[i64]) -> Result<u64> {
-        let mut records = vec![];
+    /// Delete everything about these IPs, as far as this node recorded it.
+    pub async fn delete_ips(&self, ids: &[i64]) -> Result<Deleted> {
+        let (mut own, mut foreign) = (vec![], vec![]);
+        for table in [
+            "requests",
+            "fp_claims",
+            "fingerprints",
+            "scan_jobs",
+            "scans",
+        ] {
+            let (o, f) = self.split(table, "ip_id", Keys::Ids(ids)).await?;
+            own.extend(o);
+            foreign.extend(f);
+        }
+        let deleted = own.len() as u64;
+        self.bury(own).await?;
+        let hidden = self.hide(foreign).await?;
+        // An IP without any record left (or that never had one) goes too.
+        let mut conn = self.store().pool.acquire().await?;
         for id in ids {
-            if let Ok(ip) = self.ip_of(*id).await {
-                records.push(Self::tomb(TombTarget::Ip { ip }));
-            }
+            data::drop_orphan_ip(&mut conn, *id).await?;
         }
-        let n = records.len() as u64;
-        if n > 0 {
-            self.write(records).await?;
-        }
-        Ok(n)
+        Ok(Deleted { deleted, hidden })
     }
 
-    pub async fn delete_scan(&self, id: i64) -> Result<bool> {
-        let Some(uid) = self.uid_by_id("scans", id).await? else {
-            return Ok(false);
-        };
-        self.write(vec![Self::tomb(TombTarget::Scan { uid })])
-            .await?;
-        Ok(true)
+    pub async fn delete_scan(&self, id: i64) -> Result<Deleted> {
+        let (own, foreign) = self.split("scans", "id", Keys::Ids(&[id])).await?;
+        let deleted = own.len() as u64;
+        self.bury(own).await?;
+        Ok(Deleted {
+            deleted,
+            hidden: self.hide(foreign).await?,
+        })
     }
 
-    pub async fn delete_claim(&self, id: i64) -> Result<bool> {
-        let Some(uid) = self.uid_by_id("fp_claims", id).await? else {
-            return Ok(false);
-        };
-        self.write(vec![Self::tomb(TombTarget::Claim { uid })])
-            .await?;
-        Ok(true)
+    pub async fn delete_claim(&self, id: i64) -> Result<Deleted> {
+        let (own, foreign) = self.split("fp_claims", "id", Keys::Ids(&[id])).await?;
+        let deleted = own.len() as u64;
+        self.bury(own).await?;
+        Ok(Deleted {
+            deleted,
+            hidden: self.hide(foreign).await?,
+        })
     }
 
-    /// Retention: tombstone requests (with their claims/fingerprints) and scan
-    /// results older than `days`. Bounded per call so a huge backlog is drained
-    /// over several daily runs rather than one enormous transaction. Returns
-    /// (requests, scans) removed. Deletes propagate in a cluster via tombstones.
+    /// Retention (standalone nodes): delete requests, with their claims and
+    /// fingerprints, and scan results older than `days`. Bounded per call so
+    /// a huge backlog drains over several runs. Returns (requests, scans).
     pub async fn prune_older_than(&self, days: u32) -> Result<(u64, u64)> {
         if days == 0 {
             return Ok((0, 0));
@@ -638,8 +831,7 @@ impl Recorder {
         .bind(BATCH)
         .fetch_all(pool)
         .await?;
-        let reqs = self.delete_requests(&req_ids).await?;
-
+        let reqs = self.delete_requests(&req_ids).await?.deleted;
         let scan_uids: Vec<String> = sqlx::query_scalar(
             "SELECT uid FROM scans
              WHERE COALESCE(finished_at, started_at) < datetime('now', ?)
@@ -650,13 +842,23 @@ impl Recorder {
         .fetch_all(pool)
         .await?;
         let scans = scan_uids.len() as u64;
-        let records: Vec<_> = scan_uids
-            .into_iter()
-            .map(|uid| Self::tomb(TombTarget::Scan { uid }))
-            .collect();
-        for chunk in records.chunks(TOMB_CHUNK) {
-            self.write(chunk.to_vec()).await?;
-        }
+        self.bury(scan_uids).await?;
         Ok((reqs, scans))
     }
+}
+
+/// Row keys for [`Recorder::split`].
+#[derive(Clone, Copy)]
+enum Keys<'a> {
+    Ids(&'a [i64]),
+    Uids(&'a [String]),
+}
+
+/// What a delete did, counted in the records that were asked for.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Deleted {
+    /// Records this node originated: deleted on every node.
+    pub deleted: u64,
+    /// Records other nodes originated: hidden on this node only.
+    pub hidden: u64,
 }
