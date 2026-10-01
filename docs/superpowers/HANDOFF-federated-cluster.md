@@ -13,7 +13,7 @@ and one fix pass.
 | 1 Membership and deletes | §3, §4, §8 | `plans/2026-10-01-federated-cluster-1-membership-deletes.md` | Done, reviewed (`f4c1730`) |
 | 2 Config key, runtime settings, live roles | §5 | `plans/2026-10-01-federated-cluster-2-config-key.md` | Done, reviewed; fixes in `636e3be` |
 | 3 Enrichment as results | §6 | `plans/2026-10-01-federated-cluster-3-enrichment.md` | Done, reviewed (`5ff5e1b`..`fab9b6f`) |
-| 4 Installer wizard | §7 | `plans/2026-10-01-federated-cluster-4-installer.md` | Done, reviewed (`483b53d`..) |
+| 4 Installer wizard | §7 | `plans/2026-10-01-federated-cluster-4-installer.md` | Done, reviewed (`483b53d`..`cf784b4`) |
 
 Checks: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
 `cargo test`; the installer smoke test runs locally in
@@ -63,9 +63,17 @@ shellcheck via `docker.io/koalaman/shellcheck:stable` (see part 4's plan).
 - The MaxMind question is asked last (spec §7.1 order).
 - The smoke test's `cluster members` assertion was replaced (it failed on
   master CI too): the command is read-only and empty before the daemon runs.
+- From the whole-part review: the config is generated into a temporary
+  file and validated before it is installed, so a bad answer leaves no
+  config behind and a re-run asks again; the printed nginx steps are in an
+  order that works on stock Debian/Ubuntu nginx (certificate first, default
+  site removed, then enable); `listen 443 ssl http2` for nginx < 1.25.1.
 - Deferred: a typo at a yes/no prompt aborts instead of re-asking (nothing
   is written); the generated nginx example has no `default_server` on 443
-  unless the commented HTTPS catch-all is enabled.
+  unless the commented HTTPS catch-all is enabled; upgraded nodes keep their
+  old nginx example (the README shows the new catch-all); the catch-all
+  proxies to 127.0.0.1 even when the trap listens on all interfaces behind
+  a remote proxy (the example's trailing note says so).
 
 ## Things the plans do not say
 
