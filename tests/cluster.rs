@@ -340,7 +340,14 @@ async fn outbound_only_member_syncs_both_ways() {
     .await;
     // A new record on A reaches outbound-only C promptly (long-poll).
     let (_, d) = new_node("d");
-    let rec = Record::MemberRevoke { id: d.id };
+    let rec = Record::MemberAdd(peephole::cluster::record::MemberInfo {
+        id: d.id,
+        name: "d".into(),
+        address: None,
+        roles: vec![],
+        proto_min: 0,
+        proto_max: 0,
+    });
     repl::append(&na, &[rec]).await.unwrap();
     eventually("c sees a's newest record", || async {
         members::all(&nc.store)
@@ -387,8 +394,10 @@ async fn invites_are_single_use_and_expire() {
     assert!(format!("{e:#}").contains("already belongs"), "{e:#}");
 }
 
+/// Nobody can remove another node; a node removes itself by leaving, and
+/// comes back with an invite.
 #[tokio::test]
-async fn revocation_spreads_and_locks_the_node_out() {
+async fn only_a_node_itself_can_leave() {
     let (ia, a) = new_node("a");
     let (ib, b) = new_node("b");
     let (ic, c) = new_node("c");
@@ -398,27 +407,77 @@ async fn revocation_spreads_and_locks_the_node_out() {
     let token = invite::create(&nb, 1).await.unwrap();
     invite::join(&nc, &token).await.unwrap();
     eventually("a admits c", || knows(&na, c.id, true)).await;
+
+    // B tries to revoke C: every node ignores it.
     repl::append(&nb, &[Record::MemberRevoke { id: c.id }])
         .await
         .unwrap();
-    eventually("a revokes c", || knows(&na, c.id, false)).await;
-    assert!(!na.is_member(&c.id));
+    eventually("a holds b's newest entry", || async {
+        let on_a = repl::heads(&na.store).await.unwrap();
+        let on_b = repl::heads(&nb.store).await.unwrap();
+        repl::head_in(&on_a, &b.id) == repl::head_in(&on_b, &b.id)
+    })
+    .await;
+    assert!(knows(&na, c.id, true).await && knows(&nb, c.id, true).await);
+    assert!(nc.hello(a.id, &a.address()).await.is_ok());
+
+    // C leaves by itself.
+    let told = cluster::leave(&nc).await.unwrap();
+    assert!(told >= 1, "at least the inviter heard it");
+    assert_eq!(nc.detached(), Some(cluster::Detached::Left));
+    assert!(
+        nc.dial_targets().is_empty(),
+        "a node that left stops dialling"
+    );
+    eventually("a sees c gone", || knows(&na, c.id, false)).await;
     let e = nc.hello(a.id, &a.address()).await.unwrap_err();
     assert!(format!("{e:#}").contains("not a cluster member"), "{e:#}");
-    // C cannot re-admit itself.
-    repl::append(
-        &nc,
-        &[Record::MemberUpdate(
-            peephole::cluster::record::MemberInfo {
-                name: "c-again".into(),
-                ..nc.self_info()
-            },
-        )],
-    )
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(knows(&na, c.id, false).await);
+
+    // Rejoining takes an invite.
+    let token = invite::create(&na, 1).await.unwrap();
+    invite::join(&nc, &token).await.unwrap();
+    assert_eq!(nc.detached(), None);
+    eventually("a re-admits c", || knows(&na, c.id, true)).await;
+}
+
+/// Leaving with nobody reachable still detaches the node.
+#[tokio::test]
+async fn leaving_without_reachable_peers_still_detaches() {
+    let (_, a) = new_node("a");
+    let (x, _dx) = offline_node(&[&a]).await;
+    assert_eq!(cluster::leave(&x).await.unwrap(), 0);
+    assert_eq!(x.detached(), Some(cluster::Detached::Left));
+}
+
+/// What a member recorded stays acceptable after it left: a node that
+/// syncs later still applies all of it.
+#[tokio::test]
+async fn entries_of_a_departed_member_still_apply() {
+    let a_id = Identity::generate().unwrap();
+    let a = Addr {
+        name: "a",
+        id: a_id.id,
+        port: 1,
+    };
+    let (x, _dx) = offline_node(&[&a]).await;
+    let info = |name: &str| peephole::cluster::record::MemberInfo {
+        id: a_id.id,
+        name: name.into(),
+        address: None,
+        roles: vec![],
+        proto_min: 2,
+        proto_max: 2,
+    };
+    let entries = vec![
+        WireEntry::sign(&a_id, 1, 10, &Record::MemberUpdate(info("a"))).unwrap(),
+        WireEntry::sign(&a_id, 2, 20, &Record::MemberRevoke { id: a_id.id }).unwrap(),
+        WireEntry::sign(&a_id, 3, 30, &Record::MemberUpdate(info("late"))).unwrap(),
+    ];
+    let st = repl::apply_batch(&x, entries).await.unwrap();
+    assert_eq!((st.applied, st.parked), (3, 0), "{st:?}");
+    let rows = members::all(&x.store).await.unwrap();
+    let row = rows.iter().find(|m| m.id == a_id.id).unwrap();
+    assert_eq!(row.name, "late");
 }
 
 /// Entries are applied only with a valid origin signature, and entries
@@ -1512,15 +1571,16 @@ async fn admin_cluster_page_and_private_attribution() {
     );
     let none = text(&admin, format!("{base}/requests?node=sensor-charlie")).await;
     assert!(!none.contains("/admin.php"), "node filter");
-    // Revoke from the UI.
+    // Removing another node is not offered.
     let r = admin
         .post(format!("{base}/admin/cluster/revoke"))
         .form(&[("key", c.id.to_string())])
         .send()
         .await
         .unwrap();
-    assert!(r.status().is_success());
-    assert!(knows(&na, c.id, false).await);
+    assert!(!r.status().is_success(), "revoke route is gone");
+    assert!(knows(&na, c.id, true).await);
+    assert!(page.contains("Leave cluster"), "leave button");
 
     // Nothing about the cluster leaks to the public.
     let public = reqwest::Client::new();

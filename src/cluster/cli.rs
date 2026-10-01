@@ -1,8 +1,7 @@
 //! `peephole cluster …` subcommands. They open the node's database
 //! directly, so they work on headless nodes and while the daemon runs; the
 //! daemon picks up their changes within a few seconds.
-use super::identity::{Identity, NodeId};
-use super::record::Record;
+use super::identity::Identity;
 use super::{Node, NodeParams, invite, members, repl};
 use crate::config::Config;
 use crate::store::Store;
@@ -15,7 +14,7 @@ pub const USAGE: &str = "usage: peephole cluster id [CONFIG]
        peephole cluster join TOKEN [CONFIG]
        peephole cluster members [CONFIG]
        peephole cluster status [CONFIG]
-       peephole cluster revoke NODE [CONFIG]   (NODE: name, fingerprint or ed25519:… key)";
+       peephole cluster leave [CONFIG]";
 
 /// `--name value` pairs.
 type Flags = Vec<(String, String)>;
@@ -58,22 +57,6 @@ async fn open(config: &str) -> Result<(Config, Arc<Node>)> {
     // Make sure our own description exists before acting for the cluster.
     node.bootstrap().await?;
     Ok((cfg, node))
-}
-
-/// Find a member by name, short fingerprint or full key.
-fn resolve(rows: &[members::MemberRow], who: &str) -> Result<NodeId> {
-    if let Ok(id) = NodeId::parse(who) {
-        return Ok(id);
-    }
-    let hits: Vec<_> = rows
-        .iter()
-        .filter(|m| m.name == who || m.id.short() == who)
-        .collect();
-    match hits.as_slice() {
-        [one] => Ok(one.id),
-        [] => bail!("no member named `{who}`"),
-        _ => bail!("`{who}` is ambiguous; use the full key"),
-    }
 }
 
 /// Run a `cluster` subcommand; `args` excludes `cluster` itself.
@@ -139,7 +122,7 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 } else {
                     ""
                 };
-                let state = if m.active { "active" } else { "revoked" };
+                let state = if m.active { "active" } else { "left" };
                 println!(
                     "{:<20} {}  {:<8} {:<28} roles={}{}",
                     m.name,
@@ -161,17 +144,14 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 }
             }
         }
-        Some("revoke") => {
+        Some("leave") => {
             reject_unknown_flags(&flags, &[])?;
-            let who = pos.get(1).context(USAGE)?;
-            let (_, node) = open(cfg_at(2)).await?;
-            let rows = members::all(&node.store).await?;
-            let id = resolve(&rows, who)?;
-            if id == node.id() {
-                bail!("a node cannot revoke itself; revoke it from another member");
-            }
-            repl::append(&node, &[Record::MemberRevoke { id }]).await?;
-            println!("revoked {}; the cluster refuses it from now on", id.short());
+            let (_, node) = open(cfg_at(1)).await?;
+            let told = super::leave(&node).await?;
+            println!(
+                "left the cluster ({told} peer(s) told). This node keeps its data and no \
+                 longer syncs; rejoin with: peephole cluster join <token>"
+            );
         }
         _ => bail!("{USAGE}"),
     }

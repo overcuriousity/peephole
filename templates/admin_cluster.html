@@ -11,8 +11,12 @@
   <p>This node runs on its own. To share data with other peephole deployments, add a <code>[cluster]</code> section to <code>config.toml</code> (see <code>deploy/config.example.toml</code>) and restart. Its existing history is shared with the cluster on the first start.</p></section>
 {% when Some(me) %}
 <div class="stack">
+{% if let Some(d) = detached %}<div class="banner banner-warning">{{ d }}</div>{% endif %}
 <section class="card">
-  <div class="card-head"><h2>This node · {{ me.name }}</h2><span class="muted mono">{{ me.short }}</span></div>
+  <div class="card-head"><h2>This node · {{ me.name }}</h2><span class="muted mono">{{ me.short }}</span>
+    {% if detached.is_none() %}<button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-leave">Leave cluster</button>
+    <dialog id="dlg-leave"><h3>Leave the cluster?</h3><p class="muted">This node stops syncing. Its copy of the data stays, and what it contributed stays in the cluster. Nobody else can remove a node; rejoining needs an invite.</p>
+      <form method="post" action="/admin/cluster/leave" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Leave</button></form></dialog>{% endif %}</div>
   <dl class="kv">
     <dt>Key</dt><dd class="mono break">{{ me.key }}</dd>
     <dt>Roles</dt><dd>{{ me.roles }}</dd>
@@ -33,7 +37,7 @@
     <tbody>
     {% for m in members %}
       <tr{% if !m.active %} class="muted"{% endif %}>
-        <td><b>{{ m.name }}</b> <span class="mono muted">{{ m.short }}</span>{% if !m.active %} <span class="badge badge-status" data-status="failed">revoked</span>{% endif %}
+        <td><b>{{ m.name }}</b> <span class="mono muted">{{ m.short }}</span>{% if !m.active %} <span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% endif %}
           {% if m.incompatible %}<br><span class="badge badge-status" data-status="failed">incompatible version</span>{% endif %}
           {% if let Some(s) = m.skew %}<br><span class="badge badge-status" data-status="running" title="Run NTP on every node: scan cooldowns compare timestamps from different nodes.">clock {{ s }}</span>{% endif %}
           {% if let Some(e) = m.error %}<br><span class="muted mono small">{{ e }}</span>{% endif %}</td>
@@ -43,12 +47,7 @@
         <td class="mono">{{ m.version }}</td>
         <td>{{ m.lag }}</td>
         <td>{% if m.scanner %}{{ m.active_scans }} running{% endif %}</td>
-        <td>{% if m.active %}
-          <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-rev-{{ loop.index }}">Revoke</button>
-          <dialog id="dlg-rev-{{ loop.index }}"><h3>Revoke {{ m.name }}?</h3><p class="muted">Every node refuses it from now on. Its data stays. Rejoining needs a new invite.</p>
-            <form method="post" action="/admin/cluster/revoke" class="actions"><input type="hidden" name="key" value="{{ m.key }}">
-              <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Revoke</button></form></dialog>
-        {% endif %}</td>
+        <td></td>
       </tr>
     {% endfor %}
     {% if members.is_empty() %}<tr><td colspan="8" class="empty">No other members yet. Create an invite, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}
@@ -75,12 +74,10 @@
       <td>{% if i.local %}<span class="badge badge-status" data-status="done">current</span>{% else %}<span class="badge badge-status" data-status="queued">copying</span>{% endif %}</td></tr>{% endfor %}</tbody>
   </table></div>{% endif %}
 </section>
-{% if can_join %}
-<section class="card"><h2>Join a cluster</h2>
+<section class="card"><h2>Join or rejoin a cluster</h2>
   <p class="muted">Paste an invite created on a member. This node's data is shared with the cluster, and the cluster's with it.</p>
   <form method="post" action="/admin/cluster/join" class="filters"><label>Invite token <input name="token" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Join</button></form>
 </section>
-{% endif %}
 </div>
 {% endmatch %}
 {% endblock %}

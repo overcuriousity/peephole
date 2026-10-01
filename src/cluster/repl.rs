@@ -198,19 +198,18 @@ async fn insert_log(conn: &mut SqliteConnection, e: &WireEntry, applied: bool) -
     Ok(())
 }
 
-/// Whether records from `origin` are accepted: this node, or an admitted
-/// member that has not been revoked since.
+/// Whether records from `origin` are accepted: this node, or any node that
+/// was ever admitted. Leaving or being pruned ends a node's access, not the
+/// validity of what it recorded.
 pub async fn trusted(node: &Node, conn: &mut SqliteConnection, origin: &NodeId) -> Result<bool> {
     if *origin == node.id() {
         return Ok(true);
     }
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM members WHERE id = ? AND admitted_hlc > 0
-           AND (revoked_hlc IS NULL OR admitted_hlc > revoked_hlc)",
-    )
-    .bind(&origin.0[..])
-    .fetch_one(&mut *conn)
-    .await?;
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM members WHERE id = ? AND admitted_hlc > 0")
+            .bind(&origin.0[..])
+            .fetch_one(&mut *conn)
+            .await?;
     Ok(n > 0)
 }
 

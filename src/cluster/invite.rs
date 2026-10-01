@@ -99,7 +99,13 @@ pub async fn join(node: &Node, token: &str) -> Result<MemberInfo> {
         .values()
         .filter(|m| m.id != node.id())
         .count();
-    if others > 0 {
+    // A node in a cluster may only rejoin that same cluster; a detached one
+    // may join anywhere, like a standalone node.
+    let known = super::members::all(&node.store)
+        .await?
+        .iter()
+        .any(|m| m.id == t.id);
+    if others > 0 && !known && node.detached().is_none() {
         bail!("this node already belongs to a cluster ({others} other member(s))");
     }
     let req = JoinReq {
@@ -121,6 +127,8 @@ pub async fn join(node: &Node, token: &str) -> Result<MemberInfo> {
                     info.address = Some(addr.clone());
                 }
                 repl::append(node, &[Record::MemberAdd(info.clone())]).await?;
+                super::set_detached(&node.store, None).await?;
+                node.reload_members().await?;
                 return Ok(info);
             }
             Err(e) => last_err = Some(e.context(format!("joining via {addr}"))),

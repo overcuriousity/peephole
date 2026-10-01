@@ -4,7 +4,8 @@
 //!   node's description only until the node describes itself.
 //! - `member_update` (by the node itself) sets its description, last write
 //!   wins by HLC; it can never admit or re-admit.
-//! - `member_revoke` (by any member) revokes; a later add re-admits.
+//! - `member_revoke` is honoured only from the node it names: that is how
+//!   a node leaves. Nobody can remove another node. A later add re-admits.
 use super::Node;
 use super::identity::NodeId;
 use super::record::{MemberInfo, Record, WireEntry};
@@ -166,16 +167,13 @@ pub async fn apply(
             }
         }
         Record::MemberRevoke { id } => {
-            if get(conn, id).await?.is_none() {
-                let placeholder = MemberInfo {
-                    id: *id,
-                    name: "(revoked)".into(),
-                    address: None,
-                    roles: vec![],
-                    proto_min: 0,
-                    proto_max: 0,
-                };
-                insert(conn, &placeholder, &e.origin, 0, 0).await?;
+            if *id != e.origin {
+                warn!(
+                    origin = %e.origin.short(),
+                    target = %id.short(),
+                    "ignored member_revoke for another node: a node can only remove itself"
+                );
+                return Ok(true);
             }
             sqlx::query(
                 "UPDATE members SET revoked_hlc = MAX(COALESCE(revoked_hlc, 0), ?), revoked_by = ?
@@ -186,7 +184,7 @@ pub async fn apply(
             .bind(&id.0[..])
             .execute(&mut *conn)
             .await?;
-            info!(id = %id.short(), by = %e.origin.short(), "member revoked");
+            info!(id = %id.short(), "member left the cluster");
         }
         _ => return Ok(false),
     }

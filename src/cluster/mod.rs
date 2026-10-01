@@ -59,6 +59,93 @@ impl NodeParams {
     }
 }
 
+/// Why this node no longer takes part in its cluster. It keeps its copy of
+/// the data and what it contributed stays in the cluster.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Detached {
+    /// It left (`peephole cluster leave`).
+    Left,
+    /// It was offline for longer than the prune window.
+    Pruned,
+}
+
+const DETACHED_KEY: &str = "cluster.detached";
+
+impl Detached {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Detached::Left => "left",
+            Detached::Pruned => "pruned",
+        }
+    }
+
+    /// What the admin UI and CLI say about it.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Detached::Left => {
+                "This node left its cluster and no longer syncs. Rejoin with an invite."
+            }
+            Detached::Pruned => {
+                "This node was silent for more than 30 days and has been pruned from its cluster. Rejoin with an invite."
+            }
+        }
+    }
+}
+
+async fn read_detached(store: &Store) -> Result<Option<Detached>> {
+    let v: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(DETACHED_KEY)
+        .fetch_optional(&store.pool)
+        .await?;
+    Ok(match v.as_deref() {
+        Some("left") => Some(Detached::Left),
+        Some("pruned") => Some(Detached::Pruned),
+        _ => None,
+    })
+}
+
+/// Persist (or clear) the detached state; the daemon picks it up within
+/// seconds, also when the CLI wrote it.
+pub async fn set_detached(store: &Store, d: Option<Detached>) -> Result<()> {
+    match d {
+        Some(d) => {
+            sqlx::query(
+                "INSERT INTO settings (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(DETACHED_KEY)
+            .bind(d.as_str())
+            .execute(&store.pool)
+            .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM settings WHERE key = ?")
+                .bind(DETACHED_KEY)
+                .execute(&store.pool)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Leave the cluster: announce it, hand the announcement to every peer we
+/// can reach, then stop syncing. Returns how many peers were told.
+pub async fn leave(node: &Node) -> Result<usize> {
+    repl::append(node, &[Record::MemberRevoke { id: node.id() }]).await?;
+    let mut told = 0;
+    for (peer, _, addr) in node.dial_targets() {
+        if sync::reconcile(node, peer, &addr, false).await.is_ok() {
+            told += 1;
+        }
+    }
+    if told == 0 {
+        warn!("left the cluster without reaching a peer; it will prune this node after 30 days");
+    }
+    set_detached(&node.store, Some(Detached::Left)).await?;
+    node.reload_members().await?;
+    Ok(told)
+}
+
 /// Last contact with a peer, for logs and the admin UI.
 #[derive(Debug, Clone, Default)]
 pub struct PeerStatus {
@@ -77,6 +164,8 @@ pub struct Node {
     pub hlc: hlc::Hlc,
     /// Active members (including this node), refreshed from the database.
     members: RwLock<Arc<HashMap<NodeId, MemberRow>>>,
+    /// Set while this node is out of its cluster (left or pruned).
+    detached: RwLock<Option<Detached>>,
     /// Addresses from `[[cluster.peers]]`, preferred over published ones.
     address_override: HashMap<NodeId, String>,
     clients: Mutex<HashMap<NodeId, reqwest::Client>>,
@@ -116,6 +205,7 @@ impl Node {
             store: p.store,
             hlc: hlc::Hlc::new(),
             members: RwLock::new(Arc::new(HashMap::new())),
+            detached: RwLock::new(None),
             address_override,
             clients: Mutex::new(HashMap::new()),
             peer_status: RwLock::new(HashMap::new()),
@@ -202,8 +292,13 @@ impl Node {
         Ok(())
     }
 
+    pub fn detached(&self) -> Option<Detached> {
+        *self.detached.read().unwrap()
+    }
+
     pub async fn reload_members(&self) -> Result<()> {
         let rows = members::all(&self.store).await?;
+        let detached = read_detached(&self.store).await?;
         let map: HashMap<_, _> = rows
             .into_iter()
             .filter(|m| m.active || m.id == self.identity.id)
@@ -211,6 +306,7 @@ impl Node {
             .collect();
         let before = self.dial_targets();
         *self.members.write().unwrap() = Arc::new(map);
+        *self.detached.write().unwrap() = detached;
         if self.dial_targets() != before {
             self.members_changed.notify_one();
         }
@@ -226,8 +322,12 @@ impl Node {
         self.members.read().unwrap().clone()
     }
 
-    /// Active members we can dial: `(id, name, address)`.
+    /// Active members we can dial: `(id, name, address)`. None while this
+    /// node is detached from its cluster.
     pub fn dial_targets(&self) -> Vec<(NodeId, String, String)> {
+        if self.detached().is_some() {
+            return vec![];
+        }
         let mut v: Vec<_> = self
             .members()
             .values()

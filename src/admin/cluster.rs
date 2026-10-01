@@ -5,7 +5,6 @@ use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
 use crate::cluster::identity::NodeId;
-use crate::cluster::record::Record;
 use crate::cluster::status::PaceInfo;
 use crate::cluster::{Node, invite, members, repl};
 use crate::scan::pace::Pace;
@@ -23,7 +22,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/cluster", get(page))
         .route("/admin/cluster/invite", post(create_invite))
         .route("/admin/cluster/join", post(join))
-        .route("/admin/cluster/revoke", post(revoke))
+        .route("/admin/cluster/leave", post(leave))
         .route("/admin/cluster/pace", post(set_pace))
 }
 
@@ -35,6 +34,8 @@ pub struct MemberView {
     pub roles: String,
     pub address: String,
     pub active: bool,
+    /// The member's standing in words (badge on inactive members).
+    pub state: &'static str,
     pub is_self: bool,
     pub version: String,
     pub last_seen: String,
@@ -84,7 +85,8 @@ struct ClusterPage {
     me: Option<MemberView>,
     members: Vec<MemberView>,
     intel: Vec<IntelView>,
-    can_join: bool,
+    /// Why this node is out of its cluster, if it is.
+    detached: Option<&'static str>,
     invite: Option<String>,
     invite_ttl: u64,
     notice: Option<String>,
@@ -152,6 +154,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
                 .clone()
                 .unwrap_or_else(|| "outbound-only".to_string()),
             active: m.active,
+            state: if m.active { "active" } else { "left" },
             is_self,
             version: hb.map(|h| h.version.clone()).unwrap_or_else(|| {
                 if is_self {
@@ -192,6 +195,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
         roles: node.roles.names().join(", "),
         address: node.cfg.advertise.clone().unwrap_or_default(),
         active: true,
+        state: "active",
         is_self: true,
         version: crate::VERSION.into(),
         last_seen: "this node".into(),
@@ -254,7 +258,7 @@ async fn render_page(
             me: None,
             members: vec![],
             intel: vec![],
-            can_join: false,
+            detached: None,
             invite: None,
             invite_ttl: invite::DEFAULT_TTL_HOURS,
             notice: None,
@@ -264,7 +268,7 @@ async fn render_page(
     let (me, members) = views(node).await?;
     render(&ClusterPage {
         chrome: Chrome::new(true, "admin"),
-        can_join: members.iter().all(|m| !m.active),
+        detached: node.detached().map(|d| d.label()),
         me: Some(me),
         members,
         intel: intel(node).await?,
@@ -343,35 +347,17 @@ async fn join(
     })
 }
 
-#[derive(serde::Deserialize)]
-struct RevokeForm {
-    key: String,
-}
-
-async fn revoke(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Form(f): Form<RevokeForm>,
-) -> AppResult<Redirect> {
+async fn leave(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Redirect> {
     let node = node(&st)?;
-    let Ok(id) = NodeId::parse(&f.key) else {
-        return Ok(back(None, Some("unknown node".into())));
-    };
-    if id == node.id() {
-        return Ok(back(
+    Ok(match crate::cluster::leave(node).await {
+        Ok(told) => back(
+            Some(format!(
+                "This node left the cluster ({told} peer(s) told). Its data stays here; it no longer syncs."
+            )),
             None,
-            Some("A node cannot revoke itself; revoke it from another member.".into()),
-        ));
-    }
-    repl::append(node, &[Record::MemberRevoke { id }]).await?;
-    tracing::info!(id = %id.short(), "member revoked from the admin UI");
-    Ok(back(
-        Some(format!(
-            "Revoked {}. The cluster refuses it from now on.",
-            id.short()
-        )),
-        None,
-    ))
+        ),
+        Err(e) => back(None, Some(format!("Leaving failed: {e:#}"))),
+    })
 }
 
 #[derive(serde::Deserialize)]
