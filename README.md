@@ -30,11 +30,29 @@ The installer:
 - downloads and checksum-verifies the latest build,
 - installs the binary to `/usr/local/bin/peephole` and the default signature
   rules to `/etc/peephole/rules`,
-- asks for your **MaxMind GeoLite2 account ID and license key**
-  (get them at <https://www.maxmind.com/en/accounts/current/license-key>;
-  optional: in a cluster another member's lookups are used when you have none),
-  the public domain of the admin dashboard, and your trusted proxy CIDRs,
-- writes `/etc/peephole/config.toml` and installs + starts a systemd service.
+- asks what this node should do:
+  - run a **trap** (record requests that reach no real site), the
+    **scanner** (nmap counter-scans), the **web interface** (wall of shame
+    and admin area), in any combination,
+  - whether a reverse proxy on the same machine fronts the trap, and
+    otherwise which proxy addresses to trust,
+  - the public domain of the admin area (with the web interface),
+  - whether to take part in a **cluster**: node name, addresses, an invite
+    token if you have one, and whether holders of this node's **config key**
+    may change its settings,
+  - optional **MaxMind GeoLite2** credentials
+    (<https://www.maxmind.com/en/accounts/current/license-key>),
+- writes `/etc/peephole/config.toml` and an nginx example that fits the
+  answers to `/etc/peephole/nginx.example.conf`, and installs and starts a
+  systemd service.
+
+It does not install or change nginx. The example has a TLS server block for
+the admin area (the live scan queue needs `proxy_buffering off` on
+`/admin/api/queue`, which the example sets) and a catch-all `default_server`
+that sends everything no real site claims to the trap. The catch-all sets
+`X-Forwarded-For` to the real peer address, so a client cannot spoof it. If
+you front peephole with HAProxy instead, route its fallback backend to the
+trap listener and list the proxy in `trusted_proxies`.
 
 Non-interactive installs can pass the answers as environment variables:
 
@@ -44,17 +62,16 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
        PEEPHOLE_DOMAIN=peephole.example.net bash
 ```
 
+Every question has a variable (`PEEPHOLE_ROLES`, `PEEPHOLE_LOCAL_PROXY`,
+`PEEPHOLE_CLUSTER`, `PEEPHOLE_CLUSTER_NAME`, `PEEPHOLE_JOIN_TOKEN`,
+`PEEPHOLE_REMOTE_CONFIG`, …; see the head of `install.sh`).
+
 Re-running the installer upgrades in place: it skips when the installed
 version already matches, validates your existing config with the new binary
 before restarting, waits for `/healthz`, and rolls back to the previous
 binary if the service does not come up. Shipped rule files are treated like
 conffiles — a rule you edited is kept and the new upstream version is placed
-beside it as `<name>.toml.new`. Your config is never rewritten.
-
-The installer also drops `deploy/nginx.example.conf` into `/etc/peephole/`.
-Use it as the basis for the TLS vhost: the live scan queue is streamed over
-Server-Sent Events, which needs `proxy_buffering off` on `/admin/api/queue`
-or the queue never updates behind nginx.
+beside it as `<name>.toml.new`. Your config and nginx example are never rewritten.
 
 Published binaries are built on Ubuntu 22.04 and run on Debian 12 / Ubuntu
 22.04 or newer (glibc ≥ 2.35).

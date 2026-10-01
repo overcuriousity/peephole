@@ -51,6 +51,8 @@ test -f /etc/peephole/rules/sqli.toml
 test -f /etc/peephole/nginx.example.conf
 test -f /var/lib/peephole/.installed-rules.sha256
 grep -q 'peephole.test' /etc/peephole/config.toml
+grep -q 'server_name peephole.test;' /etc/peephole/nginx.example.conf
+grep -q 'default_server' /etc/peephole/nginx.example.conf
 grep -q 'systemctl enable --now peephole' /tmp/systemctl.log
 
 echo "== re-run is a no-op"
@@ -63,7 +65,9 @@ printf 'test2 2026-01-02T00:00:00Z\n' > "/tmp/$ASSET/VERSION"
 echo '# upstream change' >> "/tmp/$ASSET/rules/xss.toml"
 echo '# upstream change' >> "/tmp/$ASSET/rules/sqli.toml"
 ( cd /tmp && tar -czf "srv/$ASSET.tar.gz" "$ASSET" && cd srv && sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256" )
+echo '# operator note' >> /etc/peephole/nginx.example.conf
 PEEPHOLE_FORCE=1 bash install.sh
+grep -q '# operator note' /etc/peephole/nginx.example.conf
 grep -q '# operator edit' /etc/peephole/rules/sqli.toml
 test -f /etc/peephole/rules/sqli.toml.new
 grep -q '# upstream change' /etc/peephole/rules/xss.toml
@@ -83,6 +87,7 @@ if grep -q 'webauthn\|maxmind\|trap_listen\|admin_listen' /etc/peephole/config.t
     echo "headless config has role-specific settings"; exit 1
 fi
 grep -q 'ed25519:' /tmp/headless.log
+test ! -e /etc/peephole/nginx.example.conf
 /usr/local/bin/peephole check-config /etc/peephole/config.toml
 # The node lists itself once the daemon has run (`cluster members` is read-only
 # and systemd is stubbed here); the config names it.
@@ -108,6 +113,14 @@ if grep -q 'webauthn\|maxmind\|\[cluster\]\|admin_listen' /etc/peephole/config.t
     echo "trap-only config has other roles' settings"; cat /etc/peephole/config.toml; exit 1
 fi
 /usr/local/bin/peephole check-config /etc/peephole/config.toml
+grep -q 'trap listener (127.0.0.1:8080)' /tmp/wizard1.log
+grep -q 'default_server' /etc/peephole/nginx.example.conf
+grep -q 'proxy_pass http://127.0.0.1:8080' /etc/peephole/nginx.example.conf
+# shellcheck disable=SC2016  # the dollar sign is literal nginx syntax
+grep -qF 'X-Forwarded-For $remote_addr' /etc/peephole/nginx.example.conf
+if grep -q 'server_name peephole\|8443\|proxy_add_x_forwarded_for' /etc/peephole/nginx.example.conf; then
+    echo "trap-only nginx example has an admin block or a spoofable header"; exit 1
+fi
 
 echo "== wizard: no role at all is refused before anything is written"
 reset_install
