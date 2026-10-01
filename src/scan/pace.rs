@@ -26,9 +26,9 @@ pub const MAX_TIMEOUT: u64 = 4 * 3600;
 /// Share of finished scans that may time out before a longer limit is advised.
 const TIMEOUT_SHARE: f64 = 0.10;
 
-const KEY_WORKERS: &str = "scan.max_workers";
-const KEY_PER_HOUR: &str = "scan.max_scans_per_hour";
-const KEY_TIMEOUT: &str = "scan.timeout_secs";
+pub const KEY_WORKERS: &str = "scan.max_workers";
+pub const KEY_PER_HOUR: &str = "scan.max_scans_per_hour";
+pub const KEY_TIMEOUT: &str = "scan.timeout_secs";
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct Pace {
@@ -77,13 +77,31 @@ impl Pace {
     }
 }
 
-/// Shared between the admin UI (writer) and the scan workers (reader).
+/// Shared between the admin UI (writer) and the scan workers (reader): the
+/// scan pace, and the rescan cooldown that trap and scanners apply.
 #[derive(Clone)]
-pub struct SharedPace(Arc<RwLock<Pace>>);
+pub struct SharedPace(Arc<RwLock<Pace>>, Arc<std::sync::atomic::AtomicI64>);
 
 impl SharedPace {
     pub fn new(p: Pace) -> Self {
-        Self(Arc::new(RwLock::new(p)))
+        Self(
+            Arc::new(RwLock::new(p)),
+            Arc::new(std::sync::atomic::AtomicI64::new(24)),
+        )
+    }
+
+    /// Hours within which an IP is not scanned again at the same level.
+    pub fn cooldown_hours(&self) -> i64 {
+        self.1.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_cooldown_hours(&self, h: i64) {
+        self.1.store(h, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Replace the pace in memory (persisting is the caller's business).
+    pub fn replace(&self, p: Pace) {
+        *self.0.write().unwrap() = p;
     }
 
     /// Config defaults overridden by whatever the admin saved earlier.
@@ -113,7 +131,9 @@ impl SharedPace {
         if p.validate().is_err() {
             p = Pace::from_config(c);
         }
-        Ok(Self::new(p))
+        let s = Self::new(p);
+        s.set_cooldown_hours(c.rescan_cooldown_hours);
+        Ok(s)
     }
 
     pub fn get(&self) -> Pace {

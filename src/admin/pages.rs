@@ -321,7 +321,19 @@ async fn queue_pace(
             timeout_secs: t,
         });
     let outcome = match parsed {
-        Some(p) => st.pace.set(&st.store, p).await?,
+        Some(p) => st
+            .settings
+            .apply(
+                &crate::settings::Changes {
+                    max_workers: Some(p.max_workers as u32),
+                    max_scans_per_hour: Some(p.max_scans_per_hour),
+                    timeout_secs: Some(p.timeout_secs),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?
+            .map(|_| ()),
         None => Err("workers, scans per hour and timeout must be numbers".into()),
     };
     match outcome {

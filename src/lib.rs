@@ -8,6 +8,7 @@ pub mod fingerprint;
 pub mod intel;
 pub mod net;
 pub mod scan;
+pub mod settings;
 pub mod store;
 pub mod trap;
 
@@ -147,8 +148,17 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // Queue change notifications: trap + workers publish, admin SSE subscribes.
     let notifier = events::Notifier::new();
 
-    // Scan pace: config defaults, overridden from the admin queue page.
-    let pace = scan::pace::SharedPace::load(&store, &cfg.scan).await?;
+    // Runtime settings: config defaults, overridden from the admin UI, the
+    // CLI or a config key holder.
+    let nmap_ok = tokio::process::Command::new(nmap_path())
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|o| o.status.success());
+    let settings =
+        settings::Settings::load(&store, &cfg, settings::Prereqs::from_config(&cfg, nmap_ok))
+            .await?;
+    let pace = settings.pace.clone();
 
     // Distributed mode: job arbiter (answers scanners' claims), remote pace
     // changes and takeover of silent arbiters' queues (scanners), then the
@@ -194,6 +204,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             tor: tor.clone(),
             notifier: notifier.clone(),
             helper_rate: Default::default(),
+            pace: pace.clone(),
         }));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -210,7 +221,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         let _ = admin::auth::ensure_setup_token(&store, &cfg.data_dir).await;
         let admin_app = admin::full_router(Arc::new(
             admin::AdminState::new(store.clone(), cfg.clone(), notifier, pace)
-                .with_recorder(recorder.clone()),
+                .with_recorder(recorder.clone())
+                .with_settings(settings.clone()),
         ));
         let listener = tokio::net::TcpListener::bind(addr)
             .await

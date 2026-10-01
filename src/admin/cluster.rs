@@ -525,7 +525,19 @@ async fn set_pace(
         return Ok(back(None, Some("unknown node".into())));
     };
     let outcome = if id == node.id() {
-        let r = st.pace.set(&st.store, p).await?;
+        let r = st
+            .settings
+            .apply(
+                &crate::settings::Changes {
+                    max_workers: Some(w as u32),
+                    max_scans_per_hour: Some(h),
+                    timeout_secs: Some(p.timeout_secs),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?
+            .map(|_| ());
         if r.is_ok() {
             node.status.local.lock().unwrap().pace = Some(PaceInfo {
                 max_workers: w as u32,

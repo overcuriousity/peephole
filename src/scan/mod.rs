@@ -153,6 +153,7 @@ impl Safety {
 struct Source {
     rec: Recorder,
     cfg: Config,
+    pace: pace::SharedPace,
     safety: tokio::sync::Mutex<Safety>,
     unreachable: std::sync::Mutex<std::collections::HashMap<NodeId, std::time::Instant>>,
 }
@@ -302,7 +303,7 @@ impl Source {
         .bind(ip)
         .bind(uid)
         .bind(level)
-        .bind(format!("-{} hours", self.cfg.scan.rescan_cooldown_hours))
+        .bind(format!("-{} hours", self.pace.cooldown_hours()))
         .fetch_one(&self.rec.store().pool)
         .await?;
         Ok(n > 0)
@@ -498,6 +499,7 @@ pub async fn run_workers(
     let source = Arc::new(Source {
         rec: rec.clone(),
         cfg: cfg.clone(),
+        pace: pace.clone(),
         safety: tokio::sync::Mutex::new(Safety::new()),
         unreachable: Default::default(),
     });

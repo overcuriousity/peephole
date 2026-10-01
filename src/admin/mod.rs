@@ -21,6 +21,8 @@ pub struct AdminState {
     pub notifier: crate::events::Notifier,
     pub stats_cache: crate::store::stats::StatsCache,
     pub pace: crate::scan::pace::SharedPace,
+    /// Runtime settings (pace, cooldown, roles) and their one write path.
+    pub settings: crate::settings::Settings,
 }
 
 impl AdminState {
@@ -32,6 +34,7 @@ impl AdminState {
     ) -> Self {
         Self {
             recorder: store.local(),
+            settings: crate::settings::Settings::with_pace(store.clone(), &cfg, pace.clone()),
             store,
             cfg,
             notifier,
@@ -42,6 +45,14 @@ impl AdminState {
     /// Route writes through `recorder` (a cluster node's log).
     pub fn with_recorder(mut self, recorder: crate::store::recorder::Recorder) -> Self {
         self.recorder = recorder;
+        self
+    }
+
+    /// Use the process-wide runtime settings (so UI changes reach the trap,
+    /// the scan workers and the role supervisor).
+    pub fn with_settings(mut self, settings: crate::settings::Settings) -> Self {
+        self.pace = settings.pace.clone();
+        self.settings = settings;
         self
     }
 

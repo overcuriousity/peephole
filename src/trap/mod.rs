@@ -42,6 +42,8 @@ pub struct TrapState {
     pub notifier: crate::events::Notifier,
     /// Per-IP rate limiter for `/collect` and `/claim`.
     pub helper_rate: RateLimiter,
+    /// Runtime scan settings; the trap reads the rescan cooldown from it.
+    pub pace: crate::scan::pace::SharedPace,
 }
 
 /// Minimal fixed-window rate limiter. Bounded in size so an attacker rotating
@@ -77,7 +79,11 @@ impl TrapState {
     pub fn for_test(store: Store, cfg: Config) -> Self {
         let classifier =
             Classifier::from_dir(cfg.rules_dir.as_ref().expect("rules_dir")).expect("rules");
+        let pace =
+            crate::scan::pace::SharedPace::new(crate::scan::pace::Pace::from_config(&cfg.scan));
+        pace.set_cooldown_hours(cfg.scan.rescan_cooldown_hours);
         Self {
+            pace,
             recorder: store.local(),
             store,
             cfg,
@@ -231,11 +237,7 @@ async fn record_and_respond(
         && crate::net::is_scannable_target(ip)
         && let crate::store::scans::EnqueueOutcome::Queued(job_id) = state
             .recorder
-            .enqueue_scan(
-                ip_row.id,
-                verdict.scan_level,
-                state.cfg.scan.rescan_cooldown_hours,
-            )
+            .enqueue_scan(ip_row.id, verdict.scan_level, state.pace.cooldown_hours())
             .await?
         && let Ok(Some(job)) = state.store.queue_job(job_id).await
     {
@@ -428,7 +430,7 @@ async fn collect_handler(
                 let level = if tells.inhuman_fill { 3 } else { 2 };
                 if let Ok(crate::store::scans::EnqueueOutcome::Queued(job_id)) = state
                     .recorder
-                    .enqueue_scan(ip_id, level, state.cfg.scan.rescan_cooldown_hours)
+                    .enqueue_scan(ip_id, level, state.pace.cooldown_hours())
                     .await
                     && let Ok(Some(job)) = state.store.queue_job(job_id).await
                 {
