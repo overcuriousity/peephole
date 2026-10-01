@@ -25,6 +25,11 @@ td.ts { white-space: nowrap; color: var(--color-fg-secondary); font-family: var(
 .badge-status[data-status="running"] { background: var(--color-warning-dim); color: var(--color-warning); }
 .badge-status[data-status="done"] { background: var(--color-success-dim); color: var(--color-success); }
 .badge-status[data-status="failed"] { background: var(--color-danger-dim); color: var(--color-danger); }
+.badge-status[data-status="refused"] { background: var(--color-danger-dim); color: var(--color-danger); }
+.badge-status[data-status="superseded"] { background: var(--color-bg-active); color: var(--color-fg-muted); }
+.node-via { color: var(--color-fg-muted); font-size: var(--text-xs); }
+.break { word-break: break-all; white-space: pre-wrap; }
+.small { font-size: var(--text-xs); }
 .sev { display: inline-block; min-width: 1.6rem; text-align: center; padding: 0.05rem 0.4rem; border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: var(--text-xs); font-weight: 500; }
 .sev-0 { background: var(--sev-0-dim); color: var(--sev-0); }
 .sev-1 { background: var(--sev-1-dim); color: var(--sev-1); }

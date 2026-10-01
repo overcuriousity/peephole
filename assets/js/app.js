@@ -106,6 +106,7 @@
       tr.appendChild(cell("ts", esc(j.queued_at)));
       tr.appendChild(cell("ts", esc(j.finished_at)));
       tr.appendChild(cell("mono", esc(j.error)));
+      tr.appendChild(cell("muted", esc(j.scanner) + (j.arbiter ? '<span class="node-via"> via ' + esc(j.arbiter) + "</span>" : "")));
       return tr;
     };
     // The page's status/level filter applies to live rows too.

@@ -45,6 +45,9 @@ pub struct Heartbeat {
     pub pace: Option<PaceInfo>,
     pub active_scans: u32,
     pub has_maxmind: bool,
+    /// Highest sequence in the node's own log (replication lag).
+    #[serde(default)]
+    pub own_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +210,7 @@ impl Node {
             pace: local.pace,
             active_scans: local.active_scans,
             has_maxmind: self.has_maxmind,
+            own_seq: self.own_head.load(std::sync::atomic::Ordering::Relaxed),
         };
         let Ok(body) = super::rpc::cbor::encode(&hb) else {
             return;
@@ -275,6 +279,7 @@ mod tests {
             pace: None,
             active_scans: 0,
             has_maxmind: false,
+            own_seq: 0,
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = a.sign(&SignedHeartbeat::signing(&body));

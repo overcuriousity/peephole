@@ -146,6 +146,7 @@ async fn boot_in(
         timeout_secs: 60,
     });
     let workers = o.scanner.as_ref().map(|nmap| {
+        peephole::scan::pace::serve_remote(&node, pace.clone());
         tokio::spawn(peephole::scan::arbiter::takeover_loop(
             node.clone(),
             rx.clone(),
@@ -1206,7 +1207,6 @@ async fn pace_is_set_remotely() {
         },
     )
     .await;
-    peephole::scan::pace::serve_remote(&nc.node, nc.pace.clone());
     let new = peephole::scan::pace::Pace {
         max_workers: 3,
         max_scans_per_hour: 42,
@@ -1302,4 +1302,221 @@ async fn intel_files_are_shared_by_hash() {
     let (sha, _) = share::file_hash(&nc.dir.path().join("GeoLite2-City.mmdb")).unwrap();
     let (want, _) = share::file_hash(&nb.dir.path().join("GeoLite2-City.mmdb")).unwrap();
     assert_eq!(sha, want);
+}
+
+// ---------------------------------------------------------------- admin UI
+
+/// The admin router of `n` (cluster recorder) on an ephemeral port, with an
+/// enrolled soft passkey. Returns the logged-in client and base URL.
+async fn admin_on(n: &TestNode) -> (reqwest::Client, String) {
+    use webauthn_authenticator_rs::AuthenticatorBackend;
+    use webauthn_authenticator_rs::prelude::Url;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+    let cfg: peephole::config::Config = toml::from_str(
+        r#"
+database_path = "/x"
+data_dir = "/x"
+[webauthn]
+rp_id = "localhost"
+origin = "https://localhost"
+rp_name = "t"
+secure_cookies = false
+"#,
+    )
+    .unwrap();
+    let token = peephole::admin::auth::ensure_setup_token(&n.store, n.dir.path())
+        .await
+        .unwrap()
+        .expect("setup token");
+    let state = Arc::new(
+        peephole::admin::AdminState::new(
+            n.store.clone(),
+            cfg,
+            peephole::events::Notifier::new(),
+            n.pace.clone(),
+        )
+        .with_recorder(Recorder::Cluster(n.node.clone())),
+    );
+    let app = peephole::admin::full_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let mut soft = SoftPasskey::new(true);
+    let cco: serde_json::Value = client
+        .post(format!("{base}/enroll/start"))
+        .json(&serde_json::json!({"setup_token": token, "label": "k"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let options: webauthn_rs_proto::PublicKeyCredentialCreationOptions =
+        serde_json::from_value(cco["publicKey"].clone()).unwrap();
+    let cred = soft
+        .perform_register(Url::parse("https://localhost").unwrap(), options, 60_000)
+        .unwrap();
+    let r = client
+        .post(format!("{base}/enroll/finish"))
+        .json(&serde_json::json!({"credential": cred}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    (client, base)
+}
+
+async fn text(c: &reqwest::Client, url: String) -> String {
+    let r = c.get(&url).send().await.unwrap();
+    assert!(r.status().is_success(), "{url}: {}", r.status());
+    r.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn admin_cluster_page_and_private_attribution() {
+    let tools = tempfile::tempdir().unwrap();
+    let nmap = fake_nmap(tools.path(), 0.1);
+    let (ia, a) = new_node("sensor-alpha");
+    let (ib, b) = new_node("sensor-bravo");
+    let (ic, c) = new_node("sensor-charlie");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a, &c],
+        Opts {
+            scanner: Some(nmap),
+            ..DEFAULT
+        },
+    )
+    .await;
+    let _nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    // A records a request and queues a scan; B scans it.
+    let mut job_events = na.job_events.subscribe();
+    let ip = na
+        .store
+        .upsert_ip("198.51.100.150".parse().unwrap())
+        .await
+        .unwrap();
+    rec(&na)
+        .insert_request(&new_request(ip.id, "/admin.php"))
+        .await
+        .unwrap();
+    rec(&na).enqueue_scan(ip.id, 2, 24).await.unwrap();
+    eventually_for(Duration::from_secs(20), "b scanned", || async {
+        scans_by(&na, b.id).await == 1 && count(&na, "SELECT COUNT(*) FROM scans").await == 1
+    })
+    .await;
+    // The live queue hears about the job's changes, including B's remote
+    // progress applied on A.
+    let mut seen = 0;
+    while job_events.try_recv().is_ok() {
+        seen += 1;
+    }
+    assert!(seen >= 3, "queued, running, done: {seen}");
+    eventually_for(
+        Duration::from_secs(40),
+        "a has b's heartbeat with pace",
+        || async { na.status.known(&b.id).is_some_and(|k| k.hb.pace.is_some()) },
+    )
+    .await;
+
+    let (admin, base) = admin_on(&na).await;
+    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    for want in [
+        "sensor-alpha",
+        "sensor-bravo",
+        "sensor-charlie",
+        &b.id.short(),
+        "Scanner pace",
+    ] {
+        assert!(page.contains(want), "cluster page lacks {want}");
+    }
+    // Remote pace from the UI.
+    let r = admin
+        .post(format!("{base}/admin/cluster/pace"))
+        .form(&[
+            ("key", b.id.to_string()),
+            ("max_workers", "2".into()),
+            ("max_scans_per_hour", "77".into()),
+            ("timeout_minutes", "15".into()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(nb.pace.get().max_scans_per_hour, 77);
+    // Invites are shown once.
+    let r = admin
+        .post(format!("{base}/admin/cluster/invite"))
+        .form(&[("ttl_hours", "2")])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.text().await.unwrap().contains("peephole1:"));
+    // Attribution on admin views.
+    let queue = text(&admin, format!("{base}/admin/queue")).await;
+    assert!(
+        queue.contains("sensor-bravo") && queue.contains("via sensor-alpha"),
+        "queue"
+    );
+    let scans = text(&admin, format!("{base}/admin/scans")).await;
+    assert!(scans.contains("sensor-bravo"), "scans");
+    let reqs = text(&admin, format!("{base}/requests?node=sensor-alpha")).await;
+    assert!(
+        reqs.contains("/admin.php") && reqs.contains("<th>Node</th>"),
+        "requests"
+    );
+    let none = text(&admin, format!("{base}/requests?node=sensor-charlie")).await;
+    assert!(!none.contains("/admin.php"), "node filter");
+    // Revoke from the UI.
+    let r = admin
+        .post(format!("{base}/admin/cluster/revoke"))
+        .form(&[("key", c.id.to_string())])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert!(knows(&na, c.id, false).await);
+
+    // Nothing about the cluster leaks to the public.
+    let public = reqwest::Client::new();
+    let secrets = [
+        "sensor-alpha".to_string(),
+        "sensor-bravo".into(),
+        "sensor-charlie".into(),
+        a.id.short(),
+        b.id.short(),
+        a.id.to_string(),
+        b.id.to_string(),
+    ];
+    for path in [
+        "/".to_string(),
+        "/ips".into(),
+        "/requests".into(),
+        "/requests?node=sensor-alpha".into(),
+        "/ip/198.51.100.150".into(),
+        "/api/stats".into(),
+        "/api/map".into(),
+        "/api/countries".into(),
+    ] {
+        let body = text(&public, format!("{base}{path}")).await;
+        for s in &secrets {
+            assert!(!body.contains(s.as_str()), "{path} leaks {s}");
+        }
+    }
+    // The public node filter is ignored, not an oracle.
+    let filtered = text(&public, format!("{base}/requests?node=sensor-charlie")).await;
+    assert!(filtered.contains("/admin.php"));
+    let admin_only = public
+        .get(format!("{base}/admin/cluster"))
+        .send()
+        .await
+        .unwrap();
+    assert!(admin_only.url().path().starts_with("/login") || !admin_only.status().is_success());
 }

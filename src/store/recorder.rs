@@ -35,6 +35,14 @@ impl Recorder {
         }
     }
 
+    /// The cluster node, in distributed mode.
+    pub fn node(&self) -> Option<&Arc<Node>> {
+        match self {
+            Recorder::Local(_) => None,
+            Recorder::Cluster(n) => Some(n),
+        }
+    }
+
     /// This node's key in a cluster.
     pub fn node_id(&self) -> Option<crate::cluster::identity::NodeId> {
         match self {

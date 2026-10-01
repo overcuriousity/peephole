@@ -1747,3 +1747,50 @@ async fn query_strings_are_admin_only() {
         "admin search and view include the query"
     );
 }
+
+#[tokio::test]
+async fn cluster_page_explains_standalone_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("c.toml"),
+        format!(
+            r#"
+trap_listen = "127.0.0.1:0"
+admin_listen = "127.0.0.1:0"
+database_path = "{d}/t.db"
+data_dir = "{d}"
+rules_dir = "rules"
+[webauthn]
+rp_id = "localhost"
+origin = "https://localhost"
+rp_name = "t"
+secure_cookies = false
+"#,
+            d = dir.path().display()
+        ),
+    )
+    .unwrap();
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let store = Store::connect(&cfg.database_path).await.unwrap();
+    let (c, base) = enrolled_admin_client(store, cfg).await;
+    let body = c
+        .get(format!("{base}/admin/cluster"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("Standalone") && body.contains("[cluster]"),
+        "{body}"
+    );
+    // Cluster actions need distributed mode.
+    let r = c
+        .post(format!("{base}/admin/cluster/invite"))
+        .form(&[("ttl_hours", "1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+}

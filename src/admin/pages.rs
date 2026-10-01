@@ -45,6 +45,16 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/keys/delete", post(key_delete))
 }
 
+/// Job states the queue filter offers.
+const STATUSES: [&str; 6] = [
+    "queued",
+    "running",
+    "done",
+    "failed",
+    "superseded",
+    "refused",
+];
+
 fn chrome() -> Chrome {
     Chrome::new(true, "admin")
 }
@@ -103,7 +113,7 @@ struct QueuePage {
     chrome: Chrome,
     jobs: Vec<QueueJob>,
     f: QueueFilter,
-    statuses: [&'static str; 4],
+    statuses: [&'static str; 6],
     pace: PaceView,
 }
 
@@ -137,6 +147,9 @@ struct PaceView {
     timeouts_high: bool,
     notice: Option<String>,
     error: Option<String>,
+    /// Distributed mode on a node without the scanner role: its own pace
+    /// does nothing; scanners are paced on the Cluster page.
+    not_scanning: bool,
 }
 
 /// Seconds as minutes for the form: "15", or "1.5" when not whole.
@@ -223,6 +236,7 @@ async fn pace_view(
         timeouts_high: r.pace.timeout_secs > current.timeout_secs,
         notice,
         error,
+        not_scanning: st.recorder.node().is_some() && !st.cfg.roles.scanner,
     })
 }
 
@@ -258,7 +272,7 @@ async fn queue(
         chrome: chrome(),
         jobs,
         f,
-        statuses: ["queued", "running", "done", "failed"],
+        statuses: STATUSES,
         pace,
     })
 }
@@ -317,7 +331,7 @@ async fn queue_pace(
                 chrome: chrome(),
                 jobs: st.store.queue_snapshot(500).await?,
                 f: QueueFilter::default(),
-                statuses: ["queued", "running", "done", "failed"],
+                statuses: STATUSES,
                 pace,
             })?;
             Ok((StatusCode::BAD_REQUEST, body).into_response())

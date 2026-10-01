@@ -2,7 +2,7 @@
 {% block title %}peephole — admin{% endblock %}
 {% block content %}
 <div class="page-head"><div><h1>Admin</h1><p class="muted">Operational view. Everything on this page is private.</p></div>
-  <nav class="seg"><a href="/admin/queue">Queue</a><a href="/admin/scans">Scans</a><a href="/admin/fingerprints">Fingerprints</a><a href="/admin/inbox">Inbox</a><a href="/admin/export">Export</a><a href="/admin/keys">Keys</a></nav>
+  <nav class="seg"><a href="/admin/queue">Queue</a><a href="/admin/scans">Scans</a><a href="/admin/fingerprints">Fingerprints</a><a href="/admin/inbox">Inbox</a><a href="/admin/export">Export</a><a href="/admin/keys">Keys</a><a href="/admin/cluster">Cluster</a></nav>
 </div>
 {% if stale %}<div class="banner banner-warning">Intel data (Tor exit list / GeoIP) is missing or older than 48 hours.</div>{% endif %}
 <div class="tiles">
@@ -17,9 +17,9 @@
   <section class="card">
     <div class="card-head"><h2>Scan queue</h2><span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></div>
     <div class="table-wrap"><table data-queue data-src="/admin/api/queue" data-limit="25">
-      <thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Status</th><th>Queued</th><th>Finished</th><th>Error</th></tr></thead>
+      <thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Status</th><th>Queued</th><th>Finished</th><th>Error</th><th>Node</th></tr></thead>
       <tbody>{% for j in jobs %}{% include "_queue_row.html" %}{% endfor %}
-      {% if jobs.is_empty() %}<tr data-empty><td colspan="7" class="empty">Queue empty.</td></tr>{% endif %}</tbody>
+      {% if jobs.is_empty() %}<tr data-empty><td colspan="8" class="empty">Queue empty.</td></tr>{% endif %}</tbody>
     </table></div>
   </section>
   <section class="card">

@@ -171,8 +171,10 @@ impl Store {
     }
 }
 
-const QUEUE_JOB_SQL: &str =
-    "SELECT j.id, i.ip, j.level, j.status, j.queued_at, j.started_at, j.finished_at, j.error
+pub(crate) const QUEUE_JOB_SQL: &str =
+    "SELECT j.id, i.ip, j.level, j.status, j.queued_at, j.started_at, j.finished_at, j.error,
+            (SELECT name FROM members m WHERE m.id = j.scanner) AS scanner,
+            (SELECT name FROM members m WHERE m.id = j.arbiter) AS arbiter
      FROM scan_jobs j JOIN ips i ON j.ip_id = i.id";
 
 impl Store {

@@ -92,6 +92,8 @@ pub struct RequestFilter {
     pub asn: Option<i64>,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// Admin only: the cluster node that recorded the request (its name).
+    pub node: Option<String>,
     #[serde(default, deserialize_with = "lenient_i64")]
     pub page: Option<i64>,
 }
@@ -109,6 +111,8 @@ pub struct RequestListRow {
     pub labels_json: String,
     pub country: Option<String>,
     pub is_tor: bool,
+    /// Admin only: the cluster node that recorded it.
+    pub node: Option<String>,
 }
 
 impl RequestListRow {
@@ -205,14 +209,23 @@ impl Audience {
             Self::Public => "NULL",
         }
     }
+    /// Which node recorded a request: admin only (node names would map
+    /// out the sensor network).
+    fn node_col(self) -> &'static str {
+        match self {
+            Self::Admin => "(SELECT name FROM members m WHERE m.id = r.origin)",
+            Self::Public => "NULL",
+        }
+    }
 }
 
 fn request_row_select(a: Audience) -> String {
     format!(
         "SELECT r.id, r.ts, r.ip_id, i.ip, r.method, r.path, {} AS query,
-                r.severity, r.labels_json, i.country, i.is_tor_exit AS is_tor
+                r.severity, r.labels_json, i.country, i.is_tor_exit AS is_tor, {} AS node
          FROM requests r JOIN ips i ON r.ip_id = i.id",
-        a.query_col()
+        a.query_col(),
+        a.node_col()
     )
 }
 
@@ -327,6 +340,12 @@ fn request_filter_sql(f: &RequestFilter, a: Audience) -> (String, Vec<String>) {
     if let Some(v) = nonempty(&f.country) {
         sql.push_str(" AND i.country = ?");
         binds.push(v.to_ascii_uppercase());
+    }
+    if a == Audience::Admin
+        && let Some(v) = nonempty(&f.node)
+    {
+        sql.push_str(" AND r.origin IN (SELECT id FROM members WHERE name = ?)");
+        binds.push(v);
     }
     if let Some(v) = f.asn {
         sql.push_str(" AND i.asn = ?");

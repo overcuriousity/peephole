@@ -98,6 +98,10 @@ pub struct Node {
     pub status: status::Status,
     pub msg: msg::Messaging,
     pub started: std::time::Instant,
+    /// Uids of scan jobs whose row changed (any origin), for the live queue.
+    pub job_events: tokio::sync::broadcast::Sender<String>,
+    /// Highest sequence this node has written to its own log.
+    pub own_head: std::sync::atomic::AtomicU64,
 }
 
 impl Node {
@@ -129,6 +133,8 @@ impl Node {
             status: Default::default(),
             msg: Default::default(),
             started: std::time::Instant::now(),
+            job_events: tokio::sync::broadcast::channel(256).0,
+            own_head: Default::default(),
         });
         // Our clock must not run behind anything already in the log.
         let max_hlc: Option<i64> = sqlx::query_scalar("SELECT MAX(hlc) FROM repl_log")
@@ -459,6 +465,12 @@ pub async fn start(
 /// Refresh our heartbeat periodically; gossip carries it to the cluster.
 async fn heartbeat_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     loop {
+        if let Ok(h) = repl::heads(&node.store).await {
+            node.own_head.store(
+                repl::head_in(&h, &node.id()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         node.refresh_heartbeat();
         tokio::select! {
             _ = tokio::time::sleep(status::HEARTBEAT_EVERY) => {}

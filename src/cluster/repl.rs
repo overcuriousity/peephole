@@ -256,6 +256,13 @@ pub async fn append(node: &Node, records: &[Record]) -> Result<Vec<WireEntry>> {
     }
     tx.commit().await?;
     drop(_g);
+    if let Some(last) = out.last() {
+        node.own_head
+            .fetch_max(last.seq, std::sync::atomic::Ordering::Relaxed);
+    }
+    for (e, r) in out.iter().zip(records) {
+        announce_job(node, &e.kind, r);
+    }
     if members {
         node.reload_members().await?;
     }
@@ -365,6 +372,19 @@ async fn apply_stub(
     Ok(())
 }
 
+/// Tell the live queue about scan jobs a record touched.
+fn announce_job(node: &Node, _kind: &str, r: &Record) {
+    let uids: Vec<&String> = match r {
+        Record::ScanJob(j) => vec![&j.uid],
+        Record::JobStatus(s) => vec![&s.job_uid],
+        Record::JobAdopt(a) => a.job_uids.iter().collect(),
+        _ => return,
+    };
+    for u in uids {
+        let _ = node.job_events.send(u.clone());
+    }
+}
+
 async fn apply_verified(
     node: &Node,
     conn: &mut SqliteConnection,
@@ -375,6 +395,8 @@ async fn apply_verified(
     insert_log(conn, &e, record.is_some()).await?;
     if let Some(r) = &record {
         st.membership_changed |= apply_record(node, conn, &e, r).await?;
+        // Sent before commit; listeners re-read the row after a moment.
+        announce_job(node, &e.kind, r);
     }
     node.hlc.observe(e.hlc);
     st.applied += 1;

@@ -141,6 +141,11 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             ));
         }
         cluster::start(node.clone(), shutdown_rx.clone()).await?;
+        tokio::spawn(forward_job_events(
+            node.clone(),
+            notifier.clone(),
+            shutdown_rx.clone(),
+        ));
     }
 
     // Scan worker pool.
@@ -207,4 +212,43 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     }
     let _ = shutdown_tx.send(true);
     Ok(())
+}
+
+/// Push scan jobs changed anywhere in the cluster to the live queue.
+async fn forward_job_events(
+    node: Arc<cluster::Node>,
+    notifier: events::Notifier,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut rx = node.job_events.subscribe();
+    loop {
+        let uid = tokio::select! {
+            r = rx.recv() => match r {
+                Ok(u) => u,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            },
+            _ = shutdown.changed() => break,
+        };
+        // Remote batches announce before they commit: wait a moment, and
+        // take everything else that arrived meanwhile in the same pass.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut uids = std::collections::BTreeSet::from([uid]);
+        while let Ok(u) = rx.try_recv() {
+            uids.insert(u);
+        }
+        for uid in uids {
+            let id: Option<i64> = sqlx::query_scalar("SELECT id FROM scan_jobs WHERE uid = ?")
+                .bind(&uid)
+                .fetch_optional(&node.store.pool)
+                .await
+                .ok()
+                .flatten();
+            if let Some(id) = id
+                && let Ok(Some(j)) = node.store.queue_job(id).await
+            {
+                notifier.publish(j);
+            }
+        }
+    }
 }
