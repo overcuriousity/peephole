@@ -92,6 +92,13 @@ impl Detached {
     }
 }
 
+impl Detached {
+    /// The persisted state (CLI; the daemon caches it in [`Node::detached`]).
+    pub async fn read(store: &Store) -> Result<Option<Detached>> {
+        read_detached(store).await
+    }
+}
+
 async fn read_detached(store: &Store) -> Result<Option<Detached>> {
     let v: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
         .bind(DETACHED_KEY)
@@ -166,6 +173,8 @@ pub struct Node {
     members: RwLock<Arc<HashMap<NodeId, MemberRow>>>,
     /// Set while this node is out of its cluster (left or pruned).
     detached: RwLock<Option<Detached>>,
+    /// The standing of every known node, members or not.
+    standings: RwLock<Arc<HashMap<NodeId, members::Standing>>>,
     /// Addresses from `[[cluster.peers]]`, preferred over published ones.
     address_override: HashMap<NodeId, String>,
     clients: Mutex<HashMap<NodeId, reqwest::Client>>,
@@ -206,6 +215,7 @@ impl Node {
             hlc: hlc::Hlc::new(),
             members: RwLock::new(Arc::new(HashMap::new())),
             detached: RwLock::new(None),
+            standings: RwLock::new(Arc::new(HashMap::new())),
             address_override,
             clients: Mutex::new(HashMap::new()),
             peer_status: RwLock::new(HashMap::new()),
@@ -227,6 +237,19 @@ impl Node {
             .await?;
         node.hlc.observe(max_hlc.unwrap_or(0) as u64);
         node.reload_members().await?;
+        // Offline for longer than the prune window: the cluster dropped us,
+        // and our log is too old to judge anyone else by.
+        if node.detached().is_none()
+            && let Some(last) = node.own_last_hlc().await?
+            && hlc::wall_ms().saturating_sub(hlc::physical_ms(last)) > members::PRUNE_AFTER_MS
+            && node.standings.read().unwrap().len() > 1
+        {
+            warn!(
+                "no entry of our own for over 30 days: pruned from the cluster; rejoin with an invite"
+            );
+            set_detached(&node.store, Some(Detached::Pruned)).await?;
+            node.reload_members().await?;
+        }
         let n = repl::apply_unknown_kinds(&node).await?;
         if n > 0 {
             info!(n, "applied log entries from a newer protocol");
@@ -296,9 +319,41 @@ impl Node {
         *self.detached.read().unwrap()
     }
 
+    /// The standing of any known node, member or not.
+    pub fn standing_of(&self, id: &NodeId) -> Option<members::Standing> {
+        self.standings.read().unwrap().get(id).copied()
+    }
+
+    /// HLC of the newest entry this node wrote, if any.
+    async fn own_last_hlc(&self) -> Result<Option<u64>> {
+        let h: Option<i64> = sqlx::query_scalar(
+            "SELECT hlc FROM repl_log WHERE origin = ? ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&self.id().0[..])
+        .fetch_optional(&self.store.pool)
+        .await?;
+        Ok(h.map(|h| h as u64))
+    }
+
+    /// Write a sign of life when this node has been quiet for a day, so the
+    /// cluster does not prune a node that merely has nothing to record.
+    /// Returns whether an entry was written.
+    pub async fn keepalive(&self) -> Result<bool> {
+        if self.detached().is_some() {
+            return Ok(false);
+        }
+        let last = self.own_last_hlc().await?.map_or(0, hlc::physical_ms);
+        if hlc::wall_ms().saturating_sub(last) < members::KEEPALIVE_MS {
+            return Ok(false);
+        }
+        repl::append(self, &[Record::MemberUpdate(self.self_info())]).await?;
+        Ok(true)
+    }
+
     pub async fn reload_members(&self) -> Result<()> {
         let rows = members::all(&self.store).await?;
         let detached = read_detached(&self.store).await?;
+        let standings: HashMap<_, _> = rows.iter().map(|m| (m.id, m.standing)).collect();
         let map: HashMap<_, _> = rows
             .into_iter()
             .filter(|m| m.active || m.id == self.identity.id)
@@ -307,6 +362,7 @@ impl Node {
         let before = self.dial_targets();
         *self.members.write().unwrap() = Arc::new(map);
         *self.detached.write().unwrap() = detached;
+        *self.standings.write().unwrap() = Arc::new(standings);
         if self.dial_targets() != before {
             self.members_changed.notify_one();
         }
@@ -564,6 +620,9 @@ async fn heartbeat_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Recei
             );
         }
         node.refresh_heartbeat();
+        if let Err(e) = node.keepalive().await {
+            warn!(?e, "keepalive failed");
+        }
         tokio::select! {
             _ = tokio::time::sleep(status::HEARTBEAT_EVERY) => {}
             _ = shutdown.changed() => break,

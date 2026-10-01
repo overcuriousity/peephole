@@ -116,15 +116,18 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 sqlx::query_as("SELECT id, last_ok, last_error FROM peer_contact")
                     .fetch_all(&store.pool)
                     .await?;
+            if let Some(d) = crate::cluster::Detached::read(&store).await? {
+                println!("{}", d.label());
+            }
             for m in rows {
                 let me = if Some(m.id) == my_id {
                     " (this node)"
                 } else {
                     ""
                 };
-                let state = if m.active { "active" } else { "left" };
+                let state = m.standing.label();
                 println!(
-                    "{:<20} {}  {:<8} {:<28} roles={}{}",
+                    "{:<20} {}  {:<12} {:<28} roles={}{}",
                     m.name,
                     m.id.short(),
                     state,

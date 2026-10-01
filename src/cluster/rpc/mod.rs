@@ -196,8 +196,14 @@ async fn require_member(
         node.status.touch_inbound(peer);
         next.run(req).await
     } else {
-        tracing::debug!(peer = %peer.short(), "rpc from non-member refused");
-        (StatusCode::FORBIDDEN, "not a cluster member").into_response()
+        let why = match node.standing_of(&peer) {
+            Some(crate::cluster::members::Standing::Pruned) => {
+                "pruned: no sign of life for 30 days; rejoin with an invite"
+            }
+            _ => "not a cluster member",
+        };
+        tracing::debug!(peer = %peer.short(), why, "rpc refused");
+        (StatusCode::FORBIDDEN, why).into_response()
     }
 }
 

@@ -480,6 +480,150 @@ async fn entries_of_a_departed_member_still_apply() {
     assert_eq!(row.name, "late");
 }
 
+/// An HLC `days` in the past (`n` keeps values distinct).
+fn hlc_days_ago(days: u64, n: u64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    ((now - days * 24 * 3600 * 1000) << 16) + n
+}
+
+#[tokio::test]
+async fn members_silent_for_30_days_are_pruned_and_revive_with_a_sign_of_life() {
+    let a_id = Identity::generate().unwrap();
+    let b_id = Identity::generate().unwrap();
+    let a = Addr {
+        name: "a",
+        id: a_id.id,
+        port: 1,
+    };
+    let (x, _dx) = offline_node(&[&a]).await;
+    let info = |id: &Identity| peephole::cluster::record::MemberInfo {
+        id: id.id,
+        name: "b".into(),
+        address: Some("127.0.0.1:2".into()),
+        roles: vec![],
+        proto_min: 2,
+        proto_max: 2,
+    };
+    // A admitted B 40 days ago; B described itself then and went silent.
+    let st = repl::apply_batch(
+        &x,
+        vec![
+            WireEntry::sign(
+                &a_id,
+                1,
+                hlc_days_ago(40, 1),
+                &Record::MemberAdd(info(&b_id)),
+            )
+            .unwrap(),
+            WireEntry::sign(
+                &b_id,
+                1,
+                hlc_days_ago(40, 2),
+                &Record::MemberUpdate(info(&b_id)),
+            )
+            .unwrap(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        st.applied, 2,
+        "a pruned member's records are still applied: {st:?}"
+    );
+    let row = |rows: Vec<members::MemberRow>| rows.into_iter().find(|m| m.id == b_id.id).unwrap();
+    let b = row(members::all(&x.store).await.unwrap());
+    assert_eq!(b.standing, members::Standing::Pruned);
+    assert!(!b.active && !x.is_member(&b_id.id));
+    assert_eq!(x.standing_of(&b_id.id), Some(members::Standing::Pruned));
+    assert!(x.dial_targets().iter().all(|t| t.0 != b_id.id));
+    // A fresh entry signed by B, relayed by anyone, revives it.
+    repl::apply_batch(
+        &x,
+        vec![
+            WireEntry::sign(
+                &b_id,
+                2,
+                hlc_days_ago(0, 3),
+                &Record::MemberUpdate(info(&b_id)),
+            )
+            .unwrap(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(row(members::all(&x.store).await.unwrap()).active);
+    assert!(x.is_member(&b_id.id));
+}
+
+#[tokio::test]
+async fn a_running_node_leaves_a_sign_of_life_once_a_day() {
+    let (_, a) = new_node("a");
+    let (x, _dx) = offline_node(&[&a]).await;
+    assert!(
+        !x.keepalive().await.unwrap(),
+        "fresh entries: nothing to do"
+    );
+    sqlx::query("UPDATE repl_log SET hlc = ? WHERE origin = ?")
+        .bind(hlc_days_ago(2, 0) as i64)
+        .bind(&x.id().0[..])
+        .execute(&x.store.pool)
+        .await
+        .unwrap();
+    assert!(x.keepalive().await.unwrap());
+    assert!(!x.keepalive().await.unwrap());
+}
+
+/// A node that was offline longer than the prune window knows it was
+/// dropped, instead of judging everyone else by its outdated log.
+#[tokio::test]
+async fn a_node_offline_for_over_30_days_starts_detached() {
+    let (_, a) = new_node("a");
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("node.key");
+    Identity::load_or_create(&key).unwrap();
+    let open = || async {
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        Node::open(NodeParams {
+            identity: Identity::load(&key).unwrap(),
+            cluster: ClusterConfig {
+                node_name: "x".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                peers: vec![PeerConfig {
+                    name: "a".into(),
+                    address: a.address(),
+                    public_key: a.id.to_string(),
+                }],
+            },
+            roles: Roles::default(),
+            store,
+            proto: (2, 2),
+            has_maxmind: false,
+            data_dir: dir.path().to_path_buf(),
+        })
+        .await
+        .unwrap()
+    };
+    let x = open().await;
+    x.bootstrap().await.unwrap();
+    assert_eq!(x.detached(), None);
+    sqlx::query("UPDATE repl_log SET hlc = ? WHERE origin = ?")
+        .bind(hlc_days_ago(31, 0) as i64)
+        .bind(&x.id().0[..])
+        .execute(&x.store.pool)
+        .await
+        .unwrap();
+    drop(x);
+    let x = open().await;
+    assert_eq!(x.detached(), Some(cluster::Detached::Pruned));
+}
+
 /// Entries are applied only with a valid origin signature, and entries
 /// from a not-yet-trusted origin wait until it is admitted.
 #[tokio::test]
@@ -529,17 +673,35 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
     assert_eq!((st.applied, st.rejected), (0, 1));
 
     // b is unknown: its own (valid) entry is parked...
-    let b1 = WireEntry::sign(&b_id, 1, 10, &Record::MemberUpdate(info(&b_id, "b"))).unwrap();
+    let b1 = WireEntry::sign(
+        &b_id,
+        1,
+        hlc_days_ago(0, 10),
+        &Record::MemberUpdate(info(&b_id, "b")),
+    )
+    .unwrap();
     let st = repl::apply_batch(&node, vec![b1]).await.unwrap();
     assert_eq!((st.applied, st.parked), (0, 1));
     // ...a gap is rejected...
-    let b3 = WireEntry::sign(&b_id, 3, 12, &Record::MemberUpdate(info(&b_id, "b3"))).unwrap();
+    let b3 = WireEntry::sign(
+        &b_id,
+        3,
+        hlc_days_ago(0, 12),
+        &Record::MemberUpdate(info(&b_id, "b3")),
+    )
+    .unwrap();
     assert_eq!(
         repl::apply_batch(&node, vec![b3]).await.unwrap().rejected,
         1
     );
     // ...and once trusted a admits b, the parked entry applies.
-    let a1 = WireEntry::sign(&a_id, 1, 20, &Record::MemberAdd(info(&b_id, "b-by-a"))).unwrap();
+    let a1 = WireEntry::sign(
+        &a_id,
+        1,
+        hlc_days_ago(0, 20),
+        &Record::MemberAdd(info(&b_id, "b-by-a")),
+    )
+    .unwrap();
     let st = repl::apply_batch(&node, vec![a1]).await.unwrap();
     assert_eq!(st.applied, 2, "{st:?}");
     let rows = members::all(&node.store).await.unwrap();

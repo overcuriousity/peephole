@@ -154,7 +154,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
                 .clone()
                 .unwrap_or_else(|| "outbound-only".to_string()),
             active: m.active,
-            state: if m.active { "active" } else { "left" },
+            state: m.standing.label(),
             is_self,
             version: hb.map(|h| h.version.clone()).unwrap_or_else(|| {
                 if is_self {
