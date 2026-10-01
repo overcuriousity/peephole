@@ -81,6 +81,27 @@ impl Store {
             .await
     }
 
+    /// IPs first seen at least `older_than_secs` ago that have no result
+    /// from `provider`, oldest first.
+    pub async fn ips_missing_intel(
+        &self,
+        provider: &str,
+        older_than_secs: i64,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT i.ip FROM ips i
+             WHERE i.first_seen <= datetime('now', ?)
+               AND NOT EXISTS (SELECT 1 FROM ip_intel t WHERE t.ip = i.ip AND t.provider = ?)
+             ORDER BY i.id LIMIT ?",
+        )
+        .bind(format!("-{older_than_secs} seconds"))
+        .bind(provider)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// `(id, ip, country)` for IPs whose country is not an ISO alpha-2 code.
     pub async fn ips_with_legacy_country(&self) -> Result<Vec<(i64, String, String)>> {
         Ok(sqlx::query_as(

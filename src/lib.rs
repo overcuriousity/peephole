@@ -141,6 +141,13 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         shutdown_rx.clone(),
     ));
 
+    // Results for IPs this or other nodes recorded without them.
+    tokio::spawn(intel::enrich_loop(
+        recorder.clone(),
+        vec![Arc::new(intel::provider::MaxMind(geo.clone()))],
+        shutdown_rx.clone(),
+    ));
+
     // Retention (standalone only): prune requests and scan results older
     // than the configured window so the database does not grow without bound.
     if retention_applies(&cfg) {

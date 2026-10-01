@@ -36,8 +36,6 @@ pub struct NodeParams {
     pub store: Store,
     /// Supported protocol range; constants except in interop tests.
     pub proto: (u32, u32),
-    /// This node has MaxMind credentials (published in heartbeats).
-    pub has_maxmind: bool,
     /// Where shared intel files live (served to peers).
     pub data_dir: std::path::PathBuf,
 }
@@ -55,7 +53,6 @@ impl NodeParams {
             roles: cfg.roles,
             store,
             proto: (proto::PROTO_MIN, proto::PROTO_VERSION),
-            has_maxmind: cfg.maxmind.is_some(),
             data_dir: cfg.data_dir.clone(),
         })
     }
@@ -193,7 +190,8 @@ pub struct Node {
     join_attempts: Mutex<std::collections::VecDeque<std::time::Instant>>,
     /// Wakes the sync supervisor when the set of dialable members changes.
     pub members_changed: tokio::sync::Notify,
-    pub has_maxmind: bool,
+    /// Enrichment providers this node can query right now (heartbeats).
+    providers: RwLock<Vec<String>>,
     pub data_dir: std::path::PathBuf,
     /// Contacts and heartbeats (ephemeral).
     pub status: status::Status,
@@ -232,7 +230,7 @@ impl Node {
             changed: tokio::sync::watch::channel(0).0,
             join_attempts: Mutex::new(Default::default()),
             members_changed: tokio::sync::Notify::new(),
-            has_maxmind: p.has_maxmind,
+            providers: RwLock::new(vec![]),
             data_dir: p.data_dir,
             status: Default::default(),
             msg: Default::default(),
@@ -350,6 +348,18 @@ impl Node {
             repl::append(self, &records).await?;
         }
         Ok(())
+    }
+
+    /// Enrichment providers this node can query right now.
+    pub fn providers(&self) -> Vec<String> {
+        self.providers.read().unwrap().clone()
+    }
+
+    pub fn set_providers(&self, p: Vec<String>) {
+        if *self.providers.read().unwrap() != p {
+            *self.providers.write().unwrap() = p;
+            self.publish_status();
+        }
     }
 
     pub fn detached(&self) -> Option<Detached> {

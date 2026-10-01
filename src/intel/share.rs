@@ -1,7 +1,9 @@
-//! Intel sharing in a cluster: one node fetches the GeoLite2 databases
-//! (only key holders) and the Tor exit list, announces each file version
-//! with a signed manifest, and every other node copies the file from any
-//! peer that holds that exact version (verified by SHA-256).
+//! Intel sharing in a cluster: one node fetches the Tor exit list,
+//! announces each file version with a signed manifest, and every other node
+//! copies the file from any peer that holds that exact version (verified by
+//! SHA-256). GeoLite2 databases are never shared: their licence does not
+//! allow redistribution; nodes share lookup results instead (see
+//! `intel::provider`).
 //!
 //! Who fetches: each node ranks itself among the live eligible members
 //! (dialable ones first, then by key); the node at rank `r` fetches once
@@ -10,7 +12,6 @@
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{IntelManifestRec, Record};
-use crate::store::recorder::Recorder;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -21,24 +22,20 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use tracing::{info, warn};
 
-pub const CITY: &str = "geolite2-city";
-pub const ASN: &str = "geolite2-asn";
 pub const TOR: &str = "tor-exits";
-pub const KINDS: [&str; 3] = [CITY, ASN, TOR];
+pub const KINDS: [&str; 1] = [TOR];
 
 /// Bytes per chunk request.
 pub const CHUNK: u64 = 4 * 1024 * 1024;
 
-/// Largest intel file we will copy from a peer. GeoLite2-City is well under
-/// this; the cap stops a member's manifest from naming an absurd size that
-/// would pre-allocate (and abort) every node. Peers are authenticated, so this
+/// Largest intel file we will copy from a peer. The Tor exit list is well
+/// under this; the cap stops a member's manifest from naming an absurd size
+/// that would pre-allocate (and abort) every node. Peers are authenticated, so this
 /// is defence in depth.
 pub const MAX_INTEL_SIZE: u64 = 256 * 1024 * 1024;
 
 pub fn file_name(kind: &str) -> Option<&'static str> {
     match kind {
-        CITY => Some("GeoLite2-City.mmdb"),
-        ASN => Some("GeoLite2-ASN.mmdb"),
         TOR => Some("tor-exit.txt"),
         _ => None,
     }
@@ -258,42 +255,6 @@ pub async fn sync_files(node: &Node, data_dir: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(changed)
-}
-
-/// Enrich IPs that have no GeoIP data yet (they were recorded by nodes
-/// without the databases). Only the node that fetched the current
-/// databases does this, so the cluster writes each fact once.
-pub async fn backfill_missing_geo(rec: &Recorder, geo: &super::SharedGeo) -> Result<usize> {
-    let rows: Vec<(i64, String)> =
-        sqlx::query_as("SELECT id, ip FROM ips WHERE country IS NULL AND asn IS NULL LIMIT 5000")
-            .fetch_all(&rec.store().pool)
-            .await?;
-    let (updates, version): (Vec<_>, _) = {
-        let guard = geo.read().unwrap();
-        let Some(g) = guard.as_ref() else {
-            return Ok(0);
-        };
-        let updates = rows
-            .into_iter()
-            .filter_map(|(id, ip)| {
-                let hit = g.lookup(&ip.parse().ok()?);
-                (hit.country.is_some() || hit.asn.is_some()).then_some((id, hit))
-            })
-            .collect();
-        (updates, g.build_date())
-    };
-    let n = updates.len();
-    for (id, g) in updates {
-        rec.record_geo(
-            id,
-            version.as_deref(),
-            g.country.as_deref(),
-            g.asn,
-            g.asn_org.as_deref(),
-        )
-        .await?;
-    }
-    Ok(n)
 }
 
 #[cfg(test)]

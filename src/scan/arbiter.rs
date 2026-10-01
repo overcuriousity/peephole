@@ -553,7 +553,6 @@ mod tests {
             roles: Default::default(),
             store: store.clone(),
             proto: (2, 2),
-            has_maxmind: false,
             data_dir: dir.path().to_path_buf(),
         })
         .await

@@ -1,4 +1,5 @@
 pub mod geo;
+pub mod provider;
 pub mod share;
 pub mod tor;
 
@@ -43,6 +44,82 @@ pub async fn backfill_geo(rec: &Recorder, geo: &RwLock<Option<geo::GeoIp>>) {
     }
 }
 
+/// The providers a node was started with.
+pub type Providers = Vec<Arc<dyn provider::Provider>>;
+
+/// IPs looked up per provider and pass.
+const ENRICH_BATCH: i64 = 500;
+/// How often the enrichment loop runs.
+const ENRICH_TICK: Duration = Duration::from_secs(60);
+
+/// One pass: for every provider this node can serve, look up IPs that have
+/// no result from it yet and record what it says. In a cluster the able
+/// nodes take turns by rank (see [`provider::step_in_secs`]). Returns how
+/// many results were written.
+pub async fn enrich_once(rec: &Recorder, providers: &Providers) -> anyhow::Result<usize> {
+    let ready: Vec<_> = providers.iter().filter(|p| p.ready()).collect();
+    if let Some(node) = rec.node() {
+        node.set_providers(ready.iter().map(|p| p.name().to_string()).collect());
+    }
+    let mut written = 0;
+    for p in ready {
+        let rank = match rec.node() {
+            None => 0,
+            Some(node) => {
+                let me = node.id();
+                let members = node.members();
+                let able: Vec<_> = node
+                    .live_members(LIVE_WINDOW)
+                    .into_iter()
+                    .filter(|id| {
+                        *id == me
+                            || node
+                                .status
+                                .known(id)
+                                .is_some_and(|k| k.hb.providers.iter().any(|n| n == p.name()))
+                    })
+                    .map(|id| (id, members.get(&id).is_some_and(|m| m.address.is_some())))
+                    .collect();
+                share::rank(me, &able).unwrap_or(0)
+            }
+        };
+        let ips = rec
+            .store()
+            .ips_missing_intel(p.name(), provider::step_in_secs(rank), ENRICH_BATCH)
+            .await?;
+        if ips.is_empty() {
+            continue;
+        }
+        for f in p.lookup(&ips).await {
+            rec.record_intel(&f.ip, p.name(), f.source_version.as_deref(), f.data)
+                .await?;
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// Keep filling in results for IPs that lack them, until shutdown.
+pub async fn enrich_loop(
+    rec: Recorder,
+    providers: Providers,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut wait = Duration::from_secs(5);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = shutdown.changed() => break,
+        }
+        wait = ENRICH_TICK;
+        match enrich_once(&rec, &providers).await {
+            Ok(0) => {}
+            Ok(n) => info!(n, "enrichment: results recorded"),
+            Err(e) => warn!(?e, "enrichment pass failed"),
+        }
+    }
+}
+
 async fn is_stale(store: &Store, key: &str) -> bool {
     match store.intel_get(key).await {
         // Stale once ~23h old. The scheduler sleeps 24h + up to 1h of jitter,
@@ -52,6 +129,35 @@ async fn is_stale(store: &Store, key: &str) -> bool {
             .map(|t| chrono::Utc::now().signed_duration_since(t) >= chrono::Duration::hours(23))
             .unwrap_or(true),
         _ => true,
+    }
+}
+
+/// Download the GeoLite2 databases when they are missing or stale (needs
+/// `[maxmind]` credentials) and load them. They stay on this node.
+async fn refresh_maxmind(store: &Store, rec: &Recorder, cfg: &Config, geo: &SharedGeo) {
+    let geo_missing = geo.read().unwrap().is_none();
+    if let Some(mm) = &cfg.maxmind
+        && (geo_missing || is_stale(store, "maxmind_last_fetch").await)
+    {
+        match geo::download(&cfg.data_dir, &mm.account_id, &mm.license_key).await {
+            Ok(()) => {
+                info!("maxmind databases refreshed");
+                match geo::GeoIp::load(&cfg.data_dir) {
+                    Ok(g) => {
+                        *geo.write().unwrap() = Some(g);
+                        backfill_geo(rec, geo).await;
+                        // Record success only after the new databases load,
+                        // so a bad download is retried on the next tick
+                        // rather than waiting out the full day.
+                        let _ = store
+                            .intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339())
+                            .await;
+                    }
+                    Err(e) => warn!(?e, "maxmind reload failed; will retry"),
+                }
+            }
+            Err(e) => warn!(?e, "maxmind download failed; keeping previous"),
+        }
     }
 }
 
@@ -90,30 +196,7 @@ pub async fn run_scheduler(
                 Err(e) => warn!(?e, "tor exit list refresh failed; keeping previous"),
             }
         }
-        let geo_missing = geo.read().unwrap().is_none();
-        if let Some(mm) = &cfg.maxmind
-            && (geo_missing || is_stale(&store, "maxmind_last_fetch").await)
-        {
-            match geo::download(&cfg.data_dir, &mm.account_id, &mm.license_key).await {
-                Ok(()) => {
-                    info!("maxmind databases refreshed");
-                    match geo::GeoIp::load(&cfg.data_dir) {
-                        Ok(g) => {
-                            *geo.write().unwrap() = Some(g);
-                            backfill_geo(&rec, &geo).await;
-                            // Record success only after the new databases load,
-                            // so a bad download is retried on the next tick
-                            // rather than waiting out the full day.
-                            let _ = store
-                                .intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339())
-                                .await;
-                        }
-                        Err(e) => warn!(?e, "maxmind reload failed; will retry"),
-                    }
-                }
-                Err(e) => warn!(?e, "maxmind download failed; keeping previous"),
-            }
-        }
+        refresh_maxmind(&store, &rec, &cfg, &geo).await;
         first = false;
         // 24h ± up to 1h deterministic-ish jitter from nanos.
         let jitter =
@@ -135,14 +218,10 @@ const ELECTION_GRACE: Duration = Duration::from_secs(90);
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(3600);
 /// Heartbeats this recent count a member as alive for the fetch order.
 const LIVE_WINDOW: Duration = Duration::from_secs(45);
+/// How often a cluster node checks whether its GeoLite2 databases are stale.
+const MAXMIND_CHECK: Duration = Duration::from_secs(3600);
 
-fn reload(kinds: &[String], cfg: &Config, geo: &SharedGeo, tor: &SharedTor) {
-    if kinds.iter().any(|k| k == share::CITY || k == share::ASN) {
-        match geo::GeoIp::load(&cfg.data_dir) {
-            Ok(g) => *geo.write().unwrap() = Some(g),
-            Err(e) => warn!(?e, "maxmind reload failed"),
-        }
-    }
+fn reload(kinds: &[String], cfg: &Config, tor: &SharedTor) {
     if kinds.iter().any(|k| k == share::TOR) {
         match tor::TorExitList::load(&cfg.data_dir) {
             Ok(l) => *tor.write().unwrap() = l,
@@ -151,8 +230,9 @@ fn reload(kinds: &[String], cfg: &Config, geo: &SharedGeo, tor: &SharedTor) {
     }
 }
 
-/// Distributed mode: copy newer intel from the cluster, fetch it ourselves
-/// when it is our turn (see [`share`]), and fill in missing GeoIP data.
+/// Distributed mode: copy the newer Tor exit list from the cluster, fetch it
+/// ourselves when it is our turn (see [`share`]), and keep this node's own
+/// GeoLite2 databases fresh.
 async fn run_cluster(
     node: std::sync::Arc<crate::cluster::Node>,
     rec: Recorder,
@@ -165,6 +245,7 @@ async fn run_cluster(
     let mut changes = node.subscribe_changes();
     let mut failed: std::collections::HashMap<&'static str, std::time::Instant> =
         Default::default();
+    let mut last_maxmind: Option<std::time::Instant> = None;
     let recently_failed = |f: &std::collections::HashMap<&str, std::time::Instant>, k: &str| {
         f.get(k).is_some_and(|t| t.elapsed() < RETRY_AFTER_FAILURE)
     };
@@ -172,8 +253,7 @@ async fn run_cluster(
         changes.borrow_and_update();
         match share::sync_files(&node, &cfg.data_dir).await {
             Ok(kinds) if !kinds.is_empty() => {
-                reload(&kinds, &cfg, &geo, &tor);
-                backfill_geo(&rec, &geo).await;
+                reload(&kinds, &cfg, &tor);
             }
             Ok(_) => {}
             Err(e) => warn!(?e, "intel sync failed"),
@@ -193,7 +273,7 @@ async fn run_cluster(
                 match tor::TorExitList::refresh(&cfg.data_dir).await {
                     Ok(n) => {
                         info!(n, "tor exit list refreshed for the cluster");
-                        reload(&[share::TOR.to_string()], &cfg, &geo, &tor);
+                        reload(&[share::TOR.to_string()], &cfg, &tor);
                         if let Err(e) = share::publish(&node, &cfg.data_dir, &[share::TOR]).await {
                             warn!(?e, "announcing tor exit list failed");
                         }
@@ -204,46 +284,11 @@ async fn run_cluster(
                     }
                 }
             }
-            if let Some(mm) = &cfg.maxmind {
-                let key_holders: Vec<_> = all
-                    .iter()
-                    .copied()
-                    .filter(|(id, _)| {
-                        *id == me || node.status.known(id).is_some_and(|k| k.hb.has_maxmind)
-                    })
-                    .collect();
-                let geo_age = age(share::CITY).max(age(share::ASN));
-                if share::rank(me, &key_holders).is_some_and(|r| share::due(r, geo_age))
-                    && !recently_failed(&failed, share::CITY)
-                {
-                    match geo::download(&cfg.data_dir, &mm.account_id, &mm.license_key).await {
-                        Ok(()) => {
-                            info!("maxmind databases refreshed for the cluster");
-                            reload(&[share::CITY.to_string()], &cfg, &geo, &tor);
-                            if let Err(e) =
-                                share::publish(&node, &cfg.data_dir, &[share::CITY, share::ASN])
-                                    .await
-                            {
-                                warn!(?e, "announcing maxmind databases failed");
-                            }
-                            backfill_geo(&rec, &geo).await;
-                        }
-                        Err(e) => {
-                            warn!(?e, "maxmind download failed");
-                            failed.insert(share::CITY, std::time::Instant::now());
-                        }
-                    }
-                }
-            }
         }
-        // The fetcher of the current databases fills in IPs recorded
-        // without GeoIP data, once for the whole cluster.
-        if manifests.get(share::CITY).and_then(|m| m.origin) == Some(me) {
-            match share::backfill_missing_geo(&rec, &geo).await {
-                Ok(0) => {}
-                Ok(n) => info!(n, "geo backfill: enriched IPs recorded without GeoIP"),
-                Err(e) => warn!(?e, "geo backfill failed"),
-            }
+        // Every node with credentials keeps its own databases fresh.
+        if last_maxmind.is_none_or(|t| t.elapsed() > MAXMIND_CHECK) {
+            last_maxmind = Some(std::time::Instant::now());
+            refresh_maxmind(&node.store, &rec, &cfg, &geo).await;
         }
         tokio::select! {
             _ = tokio::time::sleep(INTEL_TICK) => {}

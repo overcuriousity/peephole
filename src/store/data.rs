@@ -537,6 +537,10 @@ async fn intel_manifest(
     ctx: Ctx<'_>,
     m: &IntelManifestRec,
 ) -> Result<Effect> {
+    // Only the public Tor exit list is shared as a file.
+    if crate::intel::share::file_name(&m.kind).is_none() {
+        return Ok(Effect::Ignored);
+    }
     sqlx::query(
         "INSERT INTO intel_files (kind, sha256, size, fetched_at, origin, hlc) VALUES (?,?,?,?,?,?)
          ON CONFLICT(kind) DO UPDATE SET sha256 = excluded.sha256, size = excluded.size,

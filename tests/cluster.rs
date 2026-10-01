@@ -144,7 +144,6 @@ async fn boot_in(
             cluster::rpc::proto::PROTO_MIN,
             cluster::rpc::proto::PROTO_VERSION,
         )),
-        has_maxmind: false,
         data_dir: dir.path().to_path_buf(),
     })
     .await
@@ -686,7 +685,6 @@ async fn a_node_offline_for_over_30_days_starts_detached() {
             roles: Roles::default(),
             store,
             proto: (2, 2),
-            has_maxmind: false,
             data_dir: dir.path().to_path_buf(),
         })
         .await
@@ -899,7 +897,6 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
         roles: Roles::default(),
         store,
         proto: (1, 1),
-        has_maxmind: false,
         data_dir: dir.path().to_path_buf(),
     })
     .await
@@ -1117,7 +1114,6 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
         roles: Roles::default(),
         store,
         proto: (1, 1),
-        has_maxmind: false,
         data_dir: dir.path().to_path_buf(),
     })
     .await
@@ -2139,15 +2135,68 @@ async fn config_key_holders_change_a_nodes_settings() {
 
 use peephole::intel::share;
 
-/// A fetches the GeoLite2 databases; B copies them by hash from A, C from
-/// whichever peer still holds that exact version.
+/// The Tor exit list is shared as a file; GeoLite2 databases are not.
 #[tokio::test]
-async fn intel_files_are_shared_by_hash() {
+async fn only_the_tor_list_is_shared_as_a_file() {
     let (ia, a) = new_node("a");
     let (ib, b) = new_node("b");
-    let (ic, c) = new_node("c");
-    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
-    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    std::fs::write(na.dir.path().join("tor-exit.txt"), "192.0.2.1\n192.0.2.2\n").unwrap();
+    std::fs::copy(
+        "tests/fixtures/GeoLite2-City-Test.mmdb",
+        na.dir.path().join("GeoLite2-City.mmdb"),
+    )
+    .unwrap();
+    share::publish(&na, na.dir.path(), &[share::TOR])
+        .await
+        .unwrap();
+    assert!(
+        share::publish(&na, na.dir.path(), &["geolite2-city"])
+            .await
+            .is_err(),
+        "a database is never announced"
+    );
+    eventually("b knows the manifest", || async {
+        share::manifests(&nb.store).await.unwrap().len() == 1
+    })
+    .await;
+    assert_eq!(
+        share::sync_files(&nb, nb.dir.path()).await.unwrap(),
+        [share::TOR]
+    );
+    assert!(nb.dir.path().join("tor-exit.txt").exists());
+    assert!(!nb.dir.path().join("GeoLite2-City.mmdb").exists());
+    // A manifest for a database, written by a peer on its own, is ignored.
+    repl::append(
+        &na,
+        &[Record::IntelManifest(
+            peephole::cluster::record::IntelManifestRec {
+                kind: "geolite2-city".into(),
+                sha256: "00".into(),
+                size: 1,
+                fetched_at: peephole::store::data::now_ts(),
+            },
+        )],
+    )
+    .await
+    .unwrap();
+    eventually("b holds a's newest entry", || async {
+        head_of(&nb, a.id).await == head_of(&na, a.id).await
+    })
+    .await;
+    assert_eq!(share::manifests(&nb.store).await.unwrap().len(), 1);
+}
+
+/// A node without the databases gets GeoIP facts from one that has them;
+/// the database itself does not travel.
+#[tokio::test]
+async fn geo_results_come_from_a_node_that_has_the_database() {
+    use peephole::intel::provider::MaxMind;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
     for f in ["GeoLite2-City", "GeoLite2-ASN"] {
         std::fs::copy(
             format!("tests/fixtures/{f}-Test.mmdb"),
@@ -2155,44 +2204,46 @@ async fn intel_files_are_shared_by_hash() {
         )
         .unwrap();
     }
-    share::publish(&na, na.dir.path(), &[share::CITY, share::ASN])
-        .await
-        .unwrap();
-    eventually("b knows the manifests", || async {
-        share::manifests(&nb.store).await.unwrap().len() == 2
+    let geo: peephole::intel::SharedGeo = Default::default();
+    *geo.write().unwrap() = Some(peephole::intel::geo::GeoIp::load(na.dir.path()).unwrap());
+    let providers: peephole::intel::Providers = vec![Arc::new(MaxMind(geo))];
+    // B, which cannot look anything up, records a request.
+    record(&nb, "2.125.160.216", "/x").await;
+    let nothing: peephole::intel::Providers = vec![Arc::new(MaxMind(Default::default()))];
+    assert_eq!(
+        peephole::intel::enrich_once(&rec(&nb), &nothing)
+            .await
+            .unwrap(),
+        0
+    );
+    eventually("a has b's request", || async {
+        count(&na, "SELECT COUNT(*) FROM requests").await == 1
     })
     .await;
-    let mut got = share::sync_files(&nb, nb.dir.path()).await.unwrap();
-    got.sort();
-    assert_eq!(got, [share::ASN, share::CITY]);
-    let g = peephole::intel::geo::GeoIp::load(nb.dir.path()).unwrap();
     assert_eq!(
-        g.lookup(&"2.125.160.216".parse().unwrap())
-            .country
-            .as_deref(),
-        Some("GB")
+        peephole::intel::enrich_once(&rec(&na), &providers)
+            .await
+            .unwrap(),
+        1
     );
-    assert!(
-        share::sync_files(&nb, nb.dir.path())
+    assert_eq!(na.providers(), [peephole::intel::MAXMIND]);
+    eventually("b shows the country", || async {
+        sqlx::query_scalar::<_, Option<String>>("SELECT country FROM ips")
+            .fetch_one(&nb.store.pool)
             .await
             .unwrap()
-            .is_empty()
-    );
-
-    // A's copy changes without a new announcement: A no longer serves it,
-    // B still does.
-    std::fs::write(na.dir.path().join("GeoLite2-City.mmdb"), b"tampered").unwrap();
-    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
-    eventually("c knows the manifests", || async {
-        share::manifests(&nc.store).await.unwrap().len() == 2
+            .as_deref()
+            == Some("GB")
     })
     .await;
-    eventually("c knows b", || async { nc.status.reached_recently(&b.id) }).await;
-    let got = share::sync_files(&nc, nc.dir.path()).await.unwrap();
-    assert_eq!(got.len(), 2, "{got:?}");
-    let (sha, _) = share::file_hash(&nc.dir.path().join("GeoLite2-City.mmdb")).unwrap();
-    let (want, _) = share::file_hash(&nb.dir.path().join("GeoLite2-City.mmdb")).unwrap();
-    assert_eq!(sha, want);
+    assert!(!nb.dir.path().join("GeoLite2-City.mmdb").exists());
+    // Asked once: a second pass has nothing to do.
+    assert_eq!(
+        peephole::intel::enrich_once(&rec(&na), &providers)
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 // ---------------------------------------------------------------- admin UI
