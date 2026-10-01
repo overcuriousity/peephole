@@ -24,6 +24,11 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/cluster/invite/revoke", post(revoke_invite))
         .route("/admin/cluster/join", post(join))
         .route("/admin/cluster/leave", post(leave))
+        .route("/admin/cluster/settings", post(set_own))
+        .route("/admin/cluster/config-key/rotate", post(rotate_key))
+        .route("/admin/cluster/config-key/add", post(add_key))
+        .route("/admin/cluster/config-key/forget", post(forget_key))
+        .route("/admin/cluster/node/{key}", get(node_page).post(node_set))
         .route("/admin/cluster/block", post(block))
         .route("/admin/cluster/unblock", post(unblock))
         .route("/admin/cluster/pace", post(set_pace))
@@ -41,6 +46,10 @@ pub struct MemberView {
     pub state: &'static str,
     /// This node blocked it (local decision).
     pub blocked: bool,
+    /// It lets config key holders change its runtime settings.
+    pub remote_config: bool,
+    /// This node holds its config key.
+    pub key_held: bool,
     pub is_self: bool,
     pub version: String,
     pub last_seen: String,
@@ -94,8 +103,51 @@ struct ClusterPage {
     detached: Option<&'static str>,
     invite: Option<String>,
     invites: Vec<InviteView>,
+    /// This node's config key, shown only when remote configuration is on.
+    config_key: Option<String>,
+    remote_config: bool,
+    /// This node's runtime settings and why a role cannot be switched on.
+    settings: SettingsView,
+    audit: Vec<AuditView>,
     notice: Option<String>,
     error: Option<String>,
+}
+
+/// This node's runtime settings as its own page shows them.
+pub struct SettingsView {
+    pub version: u64,
+    pub cooldown_hours: i64,
+    pub listener: bool,
+    pub scanner: bool,
+    pub web: bool,
+    /// Why a role that is off cannot be switched on here ("" = it can).
+    pub listener_missing: String,
+    pub scanner_missing: String,
+    pub web_missing: String,
+}
+
+impl SettingsView {
+    fn of(st: &AdminState) -> Self {
+        let s = st.settings.snapshot();
+        let p = st.settings.prereqs();
+        Self {
+            version: s.version,
+            cooldown_hours: s.cooldown_hours,
+            listener: s.roles.listener,
+            scanner: s.roles.scanner,
+            web: s.roles.web,
+            listener_missing: p.listener.clone().unwrap_or_default(),
+            scanner_missing: p.scanner.clone().unwrap_or_default(),
+            web_missing: p.web.clone().unwrap_or_default(),
+        }
+    }
+}
+
+/// One settings change made by another node.
+pub struct AuditView {
+    pub at: String,
+    pub by: String,
+    pub changes: String,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -122,6 +174,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
     let heads = repl::heads(&node.store).await?;
     let statuses = node.peer_status.read().unwrap().clone();
     let me = node.id();
+    let keys = crate::cluster::confkey::held(&node.store).await?;
     let mut out = vec![];
     let mut mine = None;
     for m in rows {
@@ -161,6 +214,8 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
             active: m.active,
             state: m.standing.label(),
             blocked: node.is_blocked(&m.id),
+            remote_config: m.remote_config,
+            key_held: keys.contains(&m.id),
             is_self,
             version: hb.map(|h| h.version.clone()).unwrap_or_else(|| {
                 if is_self {
@@ -203,6 +258,8 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
         active: true,
         state: "active",
         blocked: false,
+        remote_config: node.cfg.remote_config,
+        key_held: false,
         is_self: true,
         version: crate::VERSION.into(),
         last_seen: "this node".into(),
@@ -316,9 +373,41 @@ async fn render_page(
             detached: None,
             invite: None,
             invites: vec![],
-            notice: None,
-            error: None,
+            config_key: None,
+            remote_config: false,
+            settings: SettingsView::of(st),
+            audit: vec![],
+            notice: flash.notice,
+            error: flash.error,
         });
+    };
+    let names: std::collections::HashMap<NodeId, String> = members::all(&node.store)
+        .await?
+        .into_iter()
+        .map(|m| (m.id, m.name))
+        .collect();
+    let audit = st
+        .settings
+        .audit(20)
+        .await?
+        .into_iter()
+        .map(|a| AuditView {
+            at: a.at,
+            by: match a.by {
+                Some(id) => names.get(&id).cloned().unwrap_or_else(|| id.short()),
+                None => "this node".into(),
+            },
+            changes: a.changes,
+        })
+        .collect();
+    let config_key = if node.cfg.remote_config {
+        Some(
+            crate::cluster::confkey::ensure(&node.store, node.id())
+                .await?
+                .encode(),
+        )
+    } else {
+        None
     };
     let (me, members) = views(node).await?;
     render(&ClusterPage {
@@ -329,6 +418,10 @@ async fn render_page(
         intel: intel(node).await?,
         invite,
         invites: invites(node).await?,
+        config_key,
+        remote_config: node.cfg.remote_config,
+        settings: SettingsView::of(st),
+        audit,
         notice: flash.notice,
         error: flash.error,
     })
@@ -489,6 +582,227 @@ async fn unblock(
     } else {
         back(None, Some("That node was not blocked.".into()))
     })
+}
+
+/// The settings form. A checkbox that is not ticked is not sent, so the
+/// role fields always describe the wanted state in full.
+#[derive(serde::Deserialize)]
+struct SettingsForm {
+    base_version: Option<u64>,
+    max_workers: Option<String>,
+    max_scans_per_hour: Option<String>,
+    timeout_minutes: Option<String>,
+    cooldown_hours: Option<String>,
+    listener: Option<String>,
+    scanner: Option<String>,
+    web: Option<String>,
+}
+
+impl SettingsForm {
+    fn changes(&self) -> Result<crate::settings::Changes, String> {
+        fn num<T: std::str::FromStr>(v: &Option<String>, what: &str) -> Result<Option<T>, String> {
+            match v.as_deref().map(str::trim) {
+                None | Some("") => Ok(None),
+                Some(s) => s
+                    .parse()
+                    .map(Some)
+                    .map_err(|_| format!("{what} must be a number")),
+            }
+        }
+        let timeout_secs = match num::<f64>(&self.timeout_minutes, "timeout")? {
+            Some(m) if !m.is_finite() || m <= 0.0 => return Err("timeout must be positive".into()),
+            Some(m) => Some((m * 60.0).round() as u64),
+            None => None,
+        };
+        Ok(crate::settings::Changes {
+            max_workers: num(&self.max_workers, "workers")?,
+            max_scans_per_hour: num(&self.max_scans_per_hour, "scans per hour")?,
+            timeout_secs,
+            cooldown_hours: num(&self.cooldown_hours, "cooldown")?,
+            listener: Some(self.listener.is_some()),
+            scanner: Some(self.scanner.is_some()),
+            web: Some(self.web.is_some()),
+        })
+    }
+}
+
+async fn set_own(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Form(f): Form<SettingsForm>,
+) -> AppResult<Redirect> {
+    let changes = match f.changes() {
+        Ok(c) => c,
+        Err(e) => return Ok(back(None, Some(e))),
+    };
+    Ok(match st.settings.apply(&changes, None).await? {
+        Ok(_) => back(
+            Some("Settings saved. Roles switch within seconds.".into()),
+            None,
+        ),
+        Err(e) => back(None, Some(format!("Settings not saved: {e}"))),
+    })
+}
+
+async fn rotate_key(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Redirect> {
+    let node = node(&st)?;
+    if !node.cfg.remote_config {
+        return Ok(back(
+            None,
+            Some("Remote configuration is off on this node; there is no key to rotate.".into()),
+        ));
+    }
+    crate::cluster::confkey::rotate(&node.store, node.id()).await?;
+    Ok(back(
+        Some(
+            "Config key rotated. Everyone who held the old key can no longer configure this node."
+                .into(),
+        ),
+        None,
+    ))
+}
+
+async fn add_key(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Form(f): Form<KeyForm>,
+) -> AppResult<Redirect> {
+    let node = node(&st)?;
+    Ok(
+        match crate::cluster::confkey::add(&node.store, node.id(), &f.key).await {
+            Ok(id) => Redirect::to(&format!("/admin/cluster/node/{id}")),
+            Err(e) => back(None, Some(format!("{e:#}"))),
+        },
+    )
+}
+
+async fn forget_key(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Form(f): Form<KeyForm>,
+) -> AppResult<Redirect> {
+    let node = node(&st)?;
+    let Ok(id) = NodeId::parse(&f.key) else {
+        return Ok(back(None, Some("unknown node".into())));
+    };
+    crate::cluster::confkey::forget(&node.store, &id).await?;
+    Ok(back(
+        Some(format!("Config key for {} forgotten.", id.short())),
+        None,
+    ))
+}
+
+#[derive(Template)]
+#[template(path = "admin_cluster_node.html")]
+struct NodePage {
+    chrome: Chrome,
+    key: String,
+    name: String,
+    short: String,
+    /// None: the node did not answer.
+    state: Option<crate::cluster::confkey::State>,
+    timeout_min: String,
+    rec: Option<(u32, i64, String)>,
+    key_held: bool,
+    has: (bool, bool, bool),
+    notice: Option<String>,
+    error: Option<String>,
+}
+
+async fn node_view(st: &AdminState, key: &str, flash: Flash) -> AppResult<Html<String>> {
+    let node = node(st)?;
+    let Ok(id) = NodeId::parse(key) else {
+        return Err(AppError::NotFound);
+    };
+    let Some(m) = members::all(&node.store)
+        .await?
+        .into_iter()
+        .find(|m| m.id == id)
+    else {
+        return Err(AppError::NotFound);
+    };
+    let (state, error) = match crate::cluster::confkey::get(node, id).await {
+        Ok(s) => (Some(s), flash.error),
+        Err(e) => (None, Some(format!("{} did not answer: {e:#}", m.name))),
+    };
+    let minutes = |secs: u64| {
+        if secs.is_multiple_of(60) {
+            (secs / 60).to_string()
+        } else {
+            format!("{:.1}", secs as f64 / 60.0)
+        }
+    };
+    let has = |s: &crate::cluster::confkey::State, r: &str| s.roles.iter().any(|x| x == r);
+    render(&NodePage {
+        chrome: Chrome::new(true, "admin"),
+        key: id.to_string(),
+        name: m.name,
+        short: id.short(),
+        timeout_min: state
+            .as_ref()
+            .map(|s| minutes(s.pace.timeout_secs))
+            .unwrap_or_default(),
+        rec: state
+            .as_ref()
+            .and_then(|s| s.recommended)
+            .map(|p| (p.max_workers, p.max_scans_per_hour, minutes(p.timeout_secs))),
+        has: state
+            .as_ref()
+            .map(|s| (has(s, "listener"), has(s, "scanner"), has(s, "web")))
+            .unwrap_or_default(),
+        key_held: crate::cluster::confkey::held(&node.store)
+            .await?
+            .contains(&id),
+        state,
+        notice: flash.notice,
+        error,
+    })
+}
+
+async fn node_page(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+    Query(flash): Query<Flash>,
+) -> AppResult<Html<String>> {
+    node_view(&st, &key, flash).await
+}
+
+async fn node_set(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+    Form(f): Form<SettingsForm>,
+) -> AppResult<Html<String>> {
+    let node = node(&st)?;
+    let Ok(id) = NodeId::parse(&key) else {
+        return Err(AppError::NotFound);
+    };
+    let flash = match (f.changes(), f.base_version) {
+        (Err(e), _) => Flash {
+            notice: None,
+            error: Some(e),
+        },
+        (_, None) => Flash {
+            notice: None,
+            error: Some("reload the page and try again".into()),
+        },
+        (Ok(c), Some(base)) => match crate::cluster::confkey::set(node, id, base, &c).await {
+            Ok(Ok(_)) => Flash {
+                notice: Some("Saved. Roles switch within seconds.".into()),
+                error: None,
+            },
+            Ok(Err(e)) => Flash {
+                notice: None,
+                error: Some(format!("Not saved: {e}")),
+            },
+            Err(e) => Flash {
+                notice: None,
+                error: Some(format!("Not saved: {e:#}")),
+            },
+        },
+    };
+    node_view(&st, &key, flash).await
 }
 
 #[derive(serde::Deserialize)]

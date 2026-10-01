@@ -1,10 +1,15 @@
 <tr>
   <td><b>{{ m.name }}</b> <span class="mono muted">{{ m.short }}</span>
-    <form id="pace-{{ m.short }}" method="post" action="/admin/cluster/pace"><input type="hidden" name="key" value="{{ m.key }}"></form></td>
+    {% if m.is_self %}<form id="pace-{{ m.short }}" method="post" action="/admin/cluster/pace"><input type="hidden" name="key" value="{{ m.key }}"></form>{% endif %}</td>
   {% match m.pace %}{% when Some(p) %}
+  {% if m.is_self %}
   <td><input form="pace-{{ m.short }}" type="number" name="max_workers" min="0" max="16" value="{{ p.max_workers }}" size="3" required></td>
   <td><input form="pace-{{ m.short }}" type="number" name="max_scans_per_hour" min="0" max="3600" value="{{ p.max_scans_per_hour }}" size="5" required></td>
   <td><input form="pace-{{ m.short }}" type="number" name="timeout_minutes" min="1" max="240" step="any" value="{{ m.timeout_min }}" size="4" required></td>
   <td><button form="pace-{{ m.short }}" class="btn btn-sm" type="submit">Save</button></td>
+  {% else %}
+  <td>{{ p.max_workers }}</td><td>{{ p.max_scans_per_hour }}</td><td>{{ m.timeout_min }}</td>
+  <td>{% if m.key_held %}<a class="btn btn-sm" href="/admin/cluster/node/{{ m.key }}">Configure</a>{% endif %}</td>
+  {% endif %}
   {% when None %}<td colspan="4" class="muted">pace not reported yet</td>{% endmatch %}
 </tr>

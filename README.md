@@ -95,7 +95,88 @@ Both sites follow the system light/dark preference (with a manual toggle),
 ship their fonts, scripts and map inside the binary, and make no external
 requests.
 
-## Distributed mode` up to (not including) `## Configuration` with:
+## Distributed mode
+
+Several deployments can form a cluster that shares one dataset: every
+request, the scan queue, scan results and the Tor intel. The operators do
+not need to know or trust each other. Each node runs any combination of
+three roles, set in `[roles]`:
+
+| Role | Does | Needs |
+|---|---|---|
+| `listener` | the trap: records and classifies requests, queues scans | `trap_listen`, `rules_dir` |
+| `scanner` | runs nmap for jobs from any trap | nmap |
+| `web` | wall of shame and admin area | `admin_listen`, `[webauthn]` |
+
+Every node keeps a full copy of the dataset, so any web node shows the
+whole cluster. Scanners take jobs from any trap; jobs go to the scanner
+with the fewest recent scans.
+
+Enable it with a `[cluster]` section (see the example config), then add
+nodes:
+
+```sh
+peephole cluster id                       # this node's key
+peephole cluster invite --label friends   # on a member: a reusable invite
+peephole cluster invites                  # list them; invite-revoke <id> closes one
+peephole cluster join <token>             # on the new node; or Admin → Cluster
+peephole cluster members                  # who is in, and their standing
+peephole cluster block <node>             # this node ignores a peer (unblock undoes it)
+peephole cluster leave                    # this node leaves; it keeps its data
+```
+
+Nodes talk HTTP/2 over mutual TLS with pinned Ed25519 keys on
+`cluster.listen` (default port 7443). A node without `advertise` is
+outbound-only: it dials its peers and still syncs both ways. Peers can also
+be listed under `[[cluster.peers]]` with their key.
+
+How trust works:
+
+- **Nobody can remove a node.** A node leaves by itself. A member that
+  shows no sign of life for 30 days is pruned by every node on its own and
+  rejoins with an invite.
+- **An invite is reusable** until it expires, reaches its use limit or is
+  revoked. Whoever holds a usable invite can join and cannot be removed
+  afterwards, so limit invites you hand to more than one person.
+- **Blocking is local.** A node that blocks a peer stops talking to it and
+  shows none of its records. It still stores and relays them, so other
+  nodes are unaffected.
+- **Deletes reach your own records only.** Deleting something your node
+  recorded removes it on every node. Deleting something another node
+  recorded hides it on your node only.
+- **The dataset is persistent.** What a node contributed stays when it
+  leaves or is pruned. `scan.retention_days` applies to standalone nodes
+  only; a cluster node's database grows with the cluster.
+
+Changing another node's settings:
+
+- A node's scan pace, rescan cooldown and roles are runtime settings. Its
+  own admin (Cluster page, or `peephole settings set|reset|show`) can always
+  change them, and roles switch without a restart.
+- With `remote_config = true` under `[cluster]`, the node has a **config
+  key** (`peephole cluster config-key show`). Whoever holds it can change
+  those settings from their own node: paste the key on their Cluster page,
+  or `peephole cluster config-key add <key>`.
+- `peephole cluster config-key rotate` replaces the key and withdraws the
+  permission from everyone at once. The node lists who changed what.
+- Nothing else is changeable from outside: addresses, paths, WebAuthn, API
+  keys, `never_scan`, nmap arguments and `remote_config` itself stay in the
+  config file.
+
+Things to know:
+
+- Counter-scans come from the scanner node's address, not the trap's. Abuse
+  reports go to that node's hosting provider.
+- `scan.never_scan` protects what you do not want your own scanner to
+  touch. It applies only on the node that sets it; other scanners may still
+  scan those addresses. Scanners never scan the addresses of cluster
+  members.
+- Every member sees everything the cluster records, including raw requests
+  and false-positive claims with their optional contact address.
+- Run NTP on every node: cooldowns and the 30-day prune compare timestamps
+  written by different nodes. The Cluster page flags clock differences.
+- A standalone node that joins brings its history with it.
+- Node names and keys appear only in the admin area, never on public pages.
 
 ## Configuration
 

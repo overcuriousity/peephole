@@ -2225,7 +2225,8 @@ secure_cookies = false
             peephole::events::Notifier::new(),
             n.pace.clone(),
         )
-        .with_recorder(Recorder::Cluster(n.node.clone())),
+        .with_recorder(Recorder::Cluster(n.node.clone()))
+        .with_settings(n.settings.clone()),
     );
     let app = peephole::admin::full_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2413,4 +2414,96 @@ async fn admin_cluster_page_and_private_attribution() {
         assert_eq!(resp.status(), 303, "{path} should require a session");
         assert_eq!(resp.headers().get("location").unwrap(), "/login", "{path}");
     }
+}
+
+/// The admin of A configures B through the UI once B's key is added.
+#[tokio::test]
+async fn admin_configures_another_node_with_its_key() {
+    use peephole::cluster::confkey;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a],
+        Opts {
+            remote_config: true,
+            ..DEFAULT
+        },
+    )
+    .await;
+    eventually("a sees that b is open", || async {
+        members::all(&na.store)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == b.id && m.remote_config)
+    })
+    .await;
+    let (admin, base) = admin_on(&na).await;
+    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    assert!(
+        page.contains("open for config key holders"),
+        "b is shown as open"
+    );
+    assert!(page.contains("locked"), "a itself is locked");
+    assert!(
+        !page.contains("peephole-cfg1:"),
+        "a locked node shows no key"
+    );
+
+    // Add B's key, then change B from A's node page.
+    let key = confkey::own(&nb.store, b.id).await.unwrap().unwrap();
+    let r = admin
+        .post(format!("{base}/admin/cluster/config-key/add"))
+        .form(&[("key", key.encode())])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let node_page = text(&admin, format!("{base}/admin/cluster/node/{}", b.id)).await;
+    assert!(node_page.contains("node-bravo"));
+    assert!(
+        node_page.contains("name=\"base_version\" value=\"0\""),
+        "{node_page}"
+    );
+    let r = admin
+        .post(format!("{base}/admin/cluster/node/{}", b.id))
+        .form(&[
+            ("base_version", "0"),
+            ("max_workers", "3"),
+            ("max_scans_per_hour", "55"),
+            ("timeout_minutes", "20"),
+            ("cooldown_hours", "12"),
+            ("listener", "on"),
+            ("web", "on"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let s = nb.settings.snapshot();
+    assert_eq!((s.pace.max_workers, s.pace.max_scans_per_hour), (3, 55));
+    assert_eq!(s.pace.timeout_secs, 1200);
+    assert_eq!(s.cooldown_hours, 12);
+    assert!(
+        s.roles.listener && s.roles.web && !s.roles.scanner,
+        "unchecked role is off"
+    );
+
+    // This node's own settings from its own page.
+    let r = admin
+        .post(format!("{base}/admin/cluster/settings"))
+        .form(&[
+            ("cooldown_hours", "6"),
+            ("listener", "on"),
+            ("scanner", "on"),
+            ("web", "on"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(na.settings.snapshot().cooldown_hours, 6);
 }

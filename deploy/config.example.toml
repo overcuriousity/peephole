@@ -69,6 +69,8 @@ never_scan = ["192.168.0.0/16"] # extra CIDRs this node's scanner never scans (o
 # advertise = "a.example.net:7443"  # how peers reach us; omit if outbound-only
 # takeover_hours = 6                # adopt an unreachable node's queued jobs after
 # lease_secs     = 120              # scan lease, renewed while nmap runs
+# remote_config  = false            # true: holders of this node's config key may change its
+#                                   # scan pace, rescan cooldown and roles (peephole cluster config-key show)
 #
 # [[cluster.peers]]
 # name = "server-b"

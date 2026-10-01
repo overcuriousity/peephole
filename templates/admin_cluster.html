@@ -9,6 +9,9 @@
 {% when None %}
 <section class="card"><h2>Standalone</h2>
   <p>This node runs on its own. To share data with other peephole deployments, add a <code>[cluster]</code> section to <code>config.toml</code> (see <code>deploy/config.example.toml</code>) and restart. Its existing history is shared with the cluster on the first start.</p></section>
+<section class="card"><h2>Runtime settings</h2>
+{% include "_node_settings.html" %}
+<p class="muted">The scan pace is set on the <a href="/admin/queue">Queue</a> page.</p></section>
 {% when Some(me) %}
 <div class="stack">
 {% if let Some(d) = detached %}<div class="banner banner-warning">{{ d }}</div>{% endif %}
@@ -23,6 +26,19 @@
     <dt>Address</dt><dd class="mono">{{ me.address }}</dd>
     <dt>Version</dt><dd class="mono">{{ me.version }}</dd>
   </dl>
+  {% include "_node_settings.html" %}
+  {% if remote_config %}
+  <h3>Config key</h3>
+  <p class="muted">Whoever holds this key can change this node's scan pace, rescan cooldown and roles from their own node. Rotating it withdraws that from everyone.</p>
+  {% if let Some(k) = config_key %}<details><summary>Show key</summary><pre class="panel mono break" data-copy>{{ k }}</pre></details>{% endif %}
+  <form method="post" action="/admin/cluster/config-key/rotate"><button class="btn btn-sm btn-danger" type="submit">Rotate key</button></form>
+  {% if !audit.is_empty() %}
+  <div class="table-wrap"><table><thead><tr><th>When (UTC)</th><th>By</th><th>Change</th></tr></thead>
+    <tbody>{% for a in audit %}<tr><td class="ts">{{ a.at }}</td><td>{{ a.by }}</td><td class="mono">{{ a.changes }}</td></tr>{% endfor %}</tbody></table></div>
+  {% endif %}
+  {% else %}
+  <p class="muted">Remote configuration: <b>locked</b>. Only this page, the CLI and the config file change this node's settings. To let others do it, set <code>remote_config = true</code> under <code>[cluster]</code>.</p>
+  {% endif %}
 </section>
 {% if let Some(t) = invite %}
 <section class="card"><h2>Invite</h2>
@@ -32,7 +48,7 @@
 <section class="card">
   <div class="card-head"><h2>Members</h2></div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Node</th><th>Roles</th><th>Address</th><th>Seen</th><th>Version</th><th>Replication</th><th>Scans</th><th></th></tr></thead>
+    <thead><tr><th>Node</th><th>Roles</th><th>Address</th><th>Seen</th><th>Version</th><th>Replication</th><th>Scans</th><th>Settings</th><th></th></tr></thead>
     <tbody>
     {% for m in members %}
       <tr{% if !m.active %} class="muted"{% endif %}>
@@ -46,6 +62,7 @@
         <td class="mono">{{ m.version }}</td>
         <td>{{ m.lag }}</td>
         <td>{% if m.scanner %}{{ m.active_scans }} running{% endif %}</td>
+        <td>{% if m.key_held %}<a class="btn btn-sm" href="/admin/cluster/node/{{ m.key }}">Configure</a>{% else if m.remote_config %}<span class="muted">open for config key holders</span>{% else %}<span class="muted">locked</span>{% endif %}</td>
         <td>{% if m.blocked %}
           <form method="post" action="/admin/cluster/unblock"><input type="hidden" name="key" value="{{ m.key }}"><button class="btn btn-sm" type="submit">Unblock</button></form>
         {% else %}
@@ -56,7 +73,7 @@
         {% endif %}</td>
       </tr>
     {% endfor %}
-    {% if members.is_empty() %}<tr><td colspan="8" class="empty">No other members yet. Create an invite, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}
+    {% if members.is_empty() %}<tr><td colspan="9" class="empty">No other members yet. Create an invite, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}
     </tbody>
   </table></div>
 </section>
@@ -78,6 +95,11 @@
       <td>{% if i.usable %}<form method="post" action="/admin/cluster/invite/revoke"><input type="hidden" name="id" value="{{ i.id }}"><button class="btn btn-sm btn-danger" type="submit">Revoke invite</button></form>{% endif %}</td>
     </tr>{% endfor %}</tbody>
   </table></div>{% endif %}
+</section>
+<section class="card">
+  <div class="card-head"><h2>Configure another node</h2></div>
+  <p class="muted">Paste a config key its operator gave you. The key says which node it belongs to.</p>
+  <form method="post" action="/admin/cluster/config-key/add" class="filters"><label>Config key <input name="key" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Add key</button></form>
 </section>
 <section class="card">
   <div class="card-head"><h2>Scanner pace</h2><span class="muted">each scanner runs its own pace; the queue is shared</span></div>
