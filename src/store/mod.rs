@@ -331,6 +331,76 @@ mod tests {
         assert_eq!(s.setting_get("k").await.unwrap().as_deref(), Some("v"));
     }
 
+    /// 0017 keeps the facts already shown as this node's results.
+    #[tokio::test]
+    async fn migration_0017_keeps_existing_facts_as_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let opts = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+            migrate(&pool, &MIGRATIONS[..16]).await.unwrap();
+            sqlx::query(
+                "INSERT INTO ips (ip, first_seen, last_seen, country, asn, asn_org, is_tor_exit)
+                 VALUES ('203.0.113.7', '2026-01-01 00:00:00', '2026-01-02 00:00:00',
+                         'DE', 3320, 'DTAG', 1),
+                        ('203.0.113.8', '2026-01-01 00:00:00', '2026-01-02 00:00:00',
+                         NULL, NULL, NULL, 0)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let s = Store::connect(&path).await.unwrap();
+        let rows: Vec<(String, String, Vec<u8>, i64, String)> = sqlx::query_as(
+            "SELECT ip, provider, origin, hlc, data_json FROM ip_intel ORDER BY provider",
+        )
+        .fetch_all(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let (ip, provider, origin, hlc, data) = &rows[0];
+        assert_eq!(
+            (ip.as_str(), provider.as_str()),
+            ("203.0.113.7", "maxmind-geolite2")
+        );
+        assert!(origin.is_empty());
+        assert_eq!(*hlc, 0);
+        let data: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(data["country"], "DE");
+        assert_eq!(data["asn"], 3320);
+        assert_eq!(data["asn_org"], "DTAG");
+        let (ip, provider, origin, _, data) = &rows[1];
+        assert_eq!(
+            (ip.as_str(), provider.as_str()),
+            ("203.0.113.7", "tor-exits")
+        );
+        assert!(origin.is_empty());
+        assert_eq!(data, r#"{"exit":true}"#);
+        type View = (String, Option<String>, Option<i64>, Option<String>, bool);
+        let view: Vec<View> =
+            sqlx::query_as("SELECT ip, country, asn, asn_org, is_tor_exit FROM ips ORDER BY ip")
+                .fetch_all(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            view,
+            [
+                (
+                    "203.0.113.7".into(),
+                    Some("DE".into()),
+                    Some(3320),
+                    Some("DTAG".into()),
+                    true
+                ),
+                ("203.0.113.8".into(), None, None, None, false),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn failed_migration_rolls_back_and_keeps_version() {
         // A migration file may carry comments containing semicolons.
