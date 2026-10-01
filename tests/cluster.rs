@@ -297,7 +297,7 @@ async fn invited_member_propagates_cluster_wide() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     let nc = boot(ic, &c, &[], DEFAULT).await;
-    let token = invite::create(&nb, 1).await.unwrap();
+    let token = invite::create(&nb, &Default::default()).await.unwrap();
     let inviter = invite::join(&nc, &token).await.unwrap();
     assert_eq!(inviter.id, b.id);
     eventually("a admits c", || knows(&na, c.id, true)).await;
@@ -328,7 +328,7 @@ async fn outbound_only_member_syncs_both_ways() {
         },
     )
     .await;
-    let token = invite::create(&nb, 1).await.unwrap();
+    let token = invite::create(&nb, &Default::default()).await.unwrap();
     invite::join(&nc, &token).await.unwrap();
     eventually("a has c's self-description", || async {
         members::all(&na.store)
@@ -360,38 +360,100 @@ async fn outbound_only_member_syncs_both_ways() {
 }
 
 #[tokio::test]
-async fn invites_are_single_use_and_expire() {
-    let (ib, b) = new_node("b");
-    let (ic, c) = new_node("c");
-    let (id_, d) = new_node("d");
-    let nb = boot(ib, &b, &[], DEFAULT).await;
-    let nc = boot(ic, &c, &[], DEFAULT).await;
-    let nd = boot(id_, &d, &[], DEFAULT).await;
-    let token = invite::create(&nb, 1).await.unwrap();
-    invite::join(&nc, &token).await.unwrap();
-    let e = invite::join(&nd, &token).await.unwrap_err();
-    assert!(
-        format!("{e:#}").contains("invalid, used or expired"),
-        "{e:#}"
+async fn invites_are_reusable_until_limited_expired_or_revoked() {
+    use invite::InviteOpts;
+    let boot1 = |name: &'static str| async move {
+        let (i, a) = new_node(name);
+        boot(i, &a, &[], DEFAULT).await
+    };
+    let nb = boot1("b").await;
+    let (nc, nd, ne, nf, ng) = (
+        boot1("c").await,
+        boot1("d").await,
+        boot1("e").await,
+        boot1("f").await,
+        boot1("g").await,
     );
+    let refused = |e: anyhow::Error| {
+        let m = format!("{e:#}");
+        assert!(m.contains("invalid, revoked, exhausted or expired"), "{m}");
+    };
 
-    let token = invite::create(&nb, 1).await.unwrap();
+    // One invite, handed to a peer group, redeemed one by one.
+    let token = invite::create(
+        &nb,
+        &InviteOpts {
+            label: "peer group".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    invite::join(&nc, &token).await.unwrap();
+    invite::join(&nd, &token).await.unwrap();
+    let rows = invite::list(&nb.store).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label, "peer group");
+    assert_eq!((rows[0].uses, rows[0].usable), (2, true));
+    assert_eq!(rows[0].joined.len(), 2);
+    assert!(rows[0].joined.contains(&nc.id()) && rows[0].joined.contains(&nd.id()));
+
+    // Revoked: no further joins; revoking twice reports nothing to do.
+    assert!(invite::revoke(&nb.store, rows[0].id).await.unwrap());
+    assert!(!invite::revoke(&nb.store, rows[0].id).await.unwrap());
+    refused(invite::join(&ne, &token).await.unwrap_err());
+
+    // Use limit.
+    let token = invite::create(
+        &nb,
+        &InviteOpts {
+            max_uses: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    invite::join(&ne, &token).await.unwrap();
+    refused(invite::join(&nf, &token).await.unwrap_err());
+
+    // Expiry.
+    let token = invite::create(
+        &nb,
+        &InviteOpts {
+            ttl_hours: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     sqlx::query(
-        "UPDATE invites SET expires_at = datetime('now','-1 minute') WHERE used_at IS NULL",
+        "UPDATE invites SET expires_at = datetime('now','-1 minute')
+         WHERE id = (SELECT MAX(id) FROM invites)",
     )
     .execute(&nb.store.pool)
     .await
     .unwrap();
-    let e = invite::join(&nd, &token).await.unwrap_err();
-    assert!(
-        format!("{e:#}").contains("invalid, used or expired"),
-        "{e:#}"
-    );
-    assert!(!knows(&nb, d.id, true).await);
-    // A node that already joined a cluster refuses a second one.
-    let token = invite::create(&nd, 1).await.unwrap();
+    refused(invite::join(&nf, &token).await.unwrap_err());
+    assert!(!knows(&nb, nf.id(), true).await);
+
+    // A member of one cluster refuses an invite into an unrelated one.
+    let token = invite::create(&ng, &InviteOpts::default()).await.unwrap();
     let e = invite::join(&nc, &token).await.unwrap_err();
     assert!(format!("{e:#}").contains("already belongs"), "{e:#}");
+
+    // Nonsense options are refused.
+    for bad in [
+        InviteOpts {
+            ttl_hours: Some(0),
+            ..Default::default()
+        },
+        InviteOpts {
+            max_uses: Some(0),
+            ..Default::default()
+        },
+    ] {
+        assert!(invite::create(&nb, &bad).await.is_err());
+    }
 }
 
 /// Nobody can remove another node; a node removes itself by leaving, and
@@ -404,7 +466,7 @@ async fn only_a_node_itself_can_leave() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     let nc = boot(ic, &c, &[], DEFAULT).await;
-    let token = invite::create(&nb, 1).await.unwrap();
+    let token = invite::create(&nb, &Default::default()).await.unwrap();
     invite::join(&nc, &token).await.unwrap();
     eventually("a admits c", || knows(&na, c.id, true)).await;
 
@@ -434,7 +496,7 @@ async fn only_a_node_itself_can_leave() {
     assert!(format!("{e:#}").contains("not a cluster member"), "{e:#}");
 
     // Rejoining takes an invite.
-    let token = invite::create(&na, 1).await.unwrap();
+    let token = invite::create(&na, &Default::default()).await.unwrap();
     invite::join(&nc, &token).await.unwrap();
     assert_eq!(nc.detached(), None);
     eventually("a re-admits c", || knows(&na, c.id, true)).await;
@@ -761,9 +823,12 @@ async fn data_replicates_cluster_wide() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     let nc = boot(ic, &c, &[], DEFAULT).await;
-    invite::join(&nc, &invite::create(&nb, 1).await.unwrap())
-        .await
-        .unwrap();
+    invite::join(
+        &nc,
+        &invite::create(&nb, &Default::default()).await.unwrap(),
+    )
+    .await
+    .unwrap();
 
     let r = rec(&na);
     let ip = na
@@ -1437,9 +1502,12 @@ async fn outbound_only_scanner_drains_the_queue() {
         },
     )
     .await;
-    invite::join(&nc, &invite::create(&na, 1).await.unwrap())
-        .await
-        .unwrap();
+    invite::join(
+        &nc,
+        &invite::create(&na, &Default::default()).await.unwrap(),
+    )
+    .await
+    .unwrap();
     enqueue(&na, "203.0.113.90", 2).await;
     eventually_for(Duration::from_secs(20), "c scanned a's job", || async {
         scans_by(&na, c.id).await == 1

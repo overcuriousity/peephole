@@ -10,7 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub const USAGE: &str = "usage: peephole cluster id [CONFIG]
-       peephole cluster invite [--ttl HOURS] [CONFIG]
+       peephole cluster invite [--label TEXT] [--ttl HOURS] [--uses N] [CONFIG]
+       peephole cluster invites [CONFIG]
+       peephole cluster invite-revoke ID [CONFIG]
        peephole cluster join TOKEN [CONFIG]
        peephole cluster members [CONFIG]
        peephole cluster status [CONFIG]
@@ -75,17 +77,67 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             eprintln!("fingerprint {}", id.id.short());
         }
         Some("invite") => {
-            reject_unknown_flags(&flags, &["ttl"])?;
-            let ttl = match flags.iter().find(|(k, _)| k == "ttl") {
-                Some((_, v)) => v.parse().context("--ttl: hours")?,
-                None => invite::DEFAULT_TTL_HOURS,
+            reject_unknown_flags(&flags, &["label", "ttl", "uses"])?;
+            let flag = |name: &str| {
+                flags
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_str())
+            };
+            let opts = invite::InviteOpts {
+                label: flag("label").unwrap_or_default().to_string(),
+                ttl_hours: flag("ttl")
+                    .map(|v| v.parse().context("--ttl: hours"))
+                    .transpose()?,
+                max_uses: flag("uses")
+                    .map(|v| v.parse().context("--uses: a number"))
+                    .transpose()?,
             };
             let (_, node) = open(cfg_at(1)).await?;
-            let token = invite::create(&node, ttl).await?;
+            let token = invite::create(&node, &opts).await?;
             println!("{token}");
             eprintln!(
-                "one-time invite, valid {ttl}h. On the new node: peephole cluster join <token>"
+                "reusable invite. Whoever holds it can join, and a member cannot be removed \
+                 afterwards, only blocked node by node. Limit it with --uses or --ttl; \
+                 revoke it with: peephole cluster invite-revoke <id> (see: peephole cluster invites)"
             );
+        }
+        Some("invites") => {
+            reject_unknown_flags(&flags, &[])?;
+            let cfg = Config::load(Path::new(cfg_at(1)))?;
+            let store = Store::connect(&cfg.database_path).await?;
+            for i in invite::list(&store).await? {
+                println!(
+                    "{:<4} {:<8} uses {}{}  expires {}  created {}  {}",
+                    i.id,
+                    if i.usable {
+                        "usable"
+                    } else if i.revoked {
+                        "revoked"
+                    } else {
+                        "closed"
+                    },
+                    i.uses,
+                    i.max_uses.map(|m| format!("/{m}")).unwrap_or_default(),
+                    i.expires_at.as_deref().unwrap_or("never"),
+                    i.created_at,
+                    i.label
+                );
+                for n in i.joined {
+                    println!("       joined: {}", n.short());
+                }
+            }
+        }
+        Some("invite-revoke") => {
+            reject_unknown_flags(&flags, &[])?;
+            let id: i64 = pos.get(1).context(USAGE)?.parse().context("invite id")?;
+            let cfg = Config::load(Path::new(cfg_at(2)))?;
+            let store = Store::connect(&cfg.database_path).await?;
+            if invite::revoke(&store, id).await? {
+                println!("invite {id} revoked; members that joined with it stay");
+            } else {
+                bail!("no usable invite {id}");
+            }
         }
         Some("join") => {
             reject_unknown_flags(&flags, &[])?;

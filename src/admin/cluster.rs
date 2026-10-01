@@ -21,6 +21,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/admin/cluster", get(page))
         .route("/admin/cluster/invite", post(create_invite))
+        .route("/admin/cluster/invite/revoke", post(revoke_invite))
         .route("/admin/cluster/join", post(join))
         .route("/admin/cluster/leave", post(leave))
         .route("/admin/cluster/pace", post(set_pace))
@@ -88,7 +89,7 @@ struct ClusterPage {
     /// Why this node is out of its cluster, if it is.
     detached: Option<&'static str>,
     invite: Option<String>,
-    invite_ttl: u64,
+    invites: Vec<InviteView>,
     notice: Option<String>,
     error: Option<String>,
 }
@@ -247,6 +248,54 @@ async fn intel(node: &Node) -> AppResult<Vec<IntelView>> {
     Ok(v)
 }
 
+/// One invite as the page lists it.
+pub struct InviteView {
+    pub id: i64,
+    pub label: String,
+    pub created_at: String,
+    pub expires: String,
+    pub uses: String,
+    pub state: &'static str,
+    pub usable: bool,
+    pub joined: String,
+}
+
+async fn invites(node: &Node) -> AppResult<Vec<InviteView>> {
+    let names: std::collections::HashMap<NodeId, String> = members::all(&node.store)
+        .await?
+        .into_iter()
+        .map(|m| (m.id, m.name))
+        .collect();
+    Ok(invite::list(&node.store)
+        .await?
+        .into_iter()
+        .map(|i| InviteView {
+            id: i.id,
+            label: i.label,
+            created_at: i.created_at,
+            expires: i.expires_at.unwrap_or_else(|| "never".into()),
+            uses: match i.max_uses {
+                Some(m) => format!("{} of {m}", i.uses),
+                None => i.uses.to_string(),
+            },
+            state: if i.usable {
+                "usable"
+            } else if i.revoked {
+                "revoked"
+            } else {
+                "closed"
+            },
+            usable: i.usable,
+            joined: i
+                .joined
+                .iter()
+                .map(|n| names.get(n).cloned().unwrap_or_else(|| n.short()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
+        .collect())
+}
+
 async fn render_page(
     st: &AdminState,
     invite: Option<String>,
@@ -260,7 +309,7 @@ async fn render_page(
             intel: vec![],
             detached: None,
             invite: None,
-            invite_ttl: invite::DEFAULT_TTL_HOURS,
+            invites: vec![],
             notice: None,
             error: None,
         });
@@ -273,7 +322,7 @@ async fn render_page(
         members,
         intel: intel(node).await?,
         invite,
-        invite_ttl: invite::DEFAULT_TTL_HOURS,
+        invites: invites(node).await?,
         notice: flash.notice,
         error: flash.error,
     })
@@ -300,7 +349,9 @@ fn back(notice: Option<String>, error: Option<String>) -> Redirect {
 
 #[derive(serde::Deserialize)]
 struct InviteForm {
+    label: Option<String>,
     ttl_hours: Option<String>,
+    max_uses: Option<String>,
 }
 
 /// Create an invite and show it once (never stored in clear).
@@ -311,17 +362,46 @@ async fn create_invite(
 ) -> AppResult<axum::response::Response> {
     use axum::response::IntoResponse;
     let node = node(&st)?;
-    let ttl = f
-        .ttl_hours
-        .as_deref()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(invite::DEFAULT_TTL_HOURS);
-    match invite::create(node, ttl).await {
+    // Empty fields mean "no limit"; anything else must be a number.
+    let number = |v: &Option<String>| match v.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) => s.parse::<u64>().map(Some).map_err(|_| ()),
+    };
+    let (Ok(ttl), Ok(uses)) = (number(&f.ttl_hours), number(&f.max_uses)) else {
+        return Ok(back(None, Some("expiry and use limit must be numbers".into())).into_response());
+    };
+    let opts = invite::InviteOpts {
+        label: f.label.unwrap_or_default(),
+        ttl_hours: ttl,
+        max_uses: uses.map(|n| n.min(u32::MAX as u64) as u32),
+    };
+    match invite::create(node, &opts).await {
         Ok(token) => Ok(render_page(&st, Some(token), Flash::default())
             .await?
             .into_response()),
         Err(e) => Ok(back(None, Some(format!("{e:#}"))).into_response()),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct InviteRevokeForm {
+    id: i64,
+}
+
+async fn revoke_invite(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Form(f): Form<InviteRevokeForm>,
+) -> AppResult<Redirect> {
+    let node = node(&st)?;
+    Ok(if invite::revoke(&node.store, f.id).await? {
+        back(
+            Some("Invite revoked. Members that joined with it stay.".into()),
+            None,
+        )
+    } else {
+        back(None, Some("No usable invite with that id.".into()))
+    })
 }
 
 #[derive(serde::Deserialize)]
