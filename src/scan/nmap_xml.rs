@@ -49,7 +49,7 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
                         for a in e.attributes().flatten() {
                             match a.key.as_ref() {
                                 "portid" => port = a.value.parse().unwrap_or(0),
-                                "protocol" => proto = a.value.clone().into_owned(),
+                                "protocol" => proto = unescape_attr(&a),
                                 _ => {}
                             }
                         }
@@ -66,7 +66,7 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
                         if let Some(p) = cur.as_mut() {
                             for a in e.attributes().flatten() {
                                 if a.key.as_ref() == "state" {
-                                    p.state = a.value.clone().into_owned();
+                                    p.state = unescape_attr(&a);
                                 }
                             }
                         }
@@ -75,9 +75,9 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
                         if let Some(p) = cur.as_mut() {
                             for a in e.attributes().flatten() {
                                 match a.key.as_ref() {
-                                    "name" => p.service = Some(a.value.clone().into_owned()),
-                                    "product" => p.product = Some(a.value.clone().into_owned()),
-                                    "version" => p.version = Some(a.value.clone().into_owned()),
+                                    "name" => p.service = Some(unescape_attr(&a)),
+                                    "product" => p.product = Some(unescape_attr(&a)),
+                                    "version" => p.version = Some(unescape_attr(&a)),
                                     _ => {}
                                 }
                             }
@@ -86,7 +86,7 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
                     "osmatch" if os_guess.is_none() => {
                         for a in e.attributes().flatten() {
                             if a.key.as_ref() == "name" {
-                                os_guess = Some(a.value.clone().into_owned());
+                                os_guess = Some(unescape_attr(&a));
                             }
                         }
                     }
@@ -117,6 +117,18 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
         ports,
         raw_xml: xml.to_vec(),
     })
+}
+
+/// Decoded attribute value. nmap -sV banners (attacker-influenced) can contain
+/// `&`, `<`, `"`, which arrive XML-escaped; store them decoded so the admin
+/// view and CSV/Parquet exports do not show `&amp;` etc.
+fn unescape_attr(a: &quick_xml::events::attributes::Attribute) -> String {
+    // normalized_value() requires quick-xml's private XmlVersion enum, so the
+    // public entry point is unescape_value() (deprecated only as an alias).
+    #[allow(deprecated)]
+    a.unescape_value()
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| a.value.clone().into_owned())
 }
 
 #[cfg(test)]

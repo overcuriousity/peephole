@@ -15,11 +15,35 @@ use tracing::{debug, info, warn};
 
 /// nmap argv (after the binary name) for a level and target (spec §5).
 pub fn nmap_argv(level: u8, target: &IpAddr, cfg: &Config) -> Vec<String> {
+    // Collapse IPv4-mapped IPv6 to IPv4 so a `::ffff:a.b.c.d` target is scanned
+    // as the v4 address (and matched by v4 guards) rather than handed to nmap
+    // as an IPv6 literal.
+    let target = crate::net::canonical(*target);
     let mut argv = cfg.default_level_argv(level);
+    // nmap treats a bare IPv6 literal as a hostname unless -6 is given, so
+    // every IPv6 scan would otherwise fail with "host down".
+    if target.is_ipv6() {
+        argv.push("-6".into());
+    }
     argv.push("-oX".into());
     argv.push("-".into());
     argv.push(target.to_string());
     argv
+}
+
+/// Local, config-only refusal applied before nmap runs, in addition to the
+/// cluster [`Safety`] set: never scan a non-global address or anything in
+/// `never_scan`. Catches jobs that were queued before an operator edited
+/// `never_scan`, requeued orphans, and admin-requeued failed jobs.
+fn locally_refused(ip: &IpAddr, never: &[ipnet::IpNet]) -> Option<String> {
+    if !crate::net::is_scannable_target(*ip) {
+        return Some("non-global address".into());
+    }
+    let canon = crate::net::canonical(*ip);
+    never
+        .iter()
+        .find(|n| n.contains(&canon))
+        .map(|n| format!("never_scan {n}"))
 }
 
 /// A scan to run, and who to report it to.
@@ -146,18 +170,28 @@ impl Source {
             let Some(job) = self.rec.next_queued_job().await? else {
                 return Ok(None);
             };
-            let ip: String = sqlx::query_scalar("SELECT ip FROM ips WHERE id=?")
+            // Distinguish "IP row gone" (fail the job) from a transient DB
+            // error (leave the job for a later pass instead of failing it).
+            let ip: Option<String> = sqlx::query_scalar("SELECT ip FROM ips WHERE id=?")
                 .bind(job.ip_id)
-                .fetch_one(&self.rec.store().pool)
-                .await
-                .unwrap_or_default();
-            let Ok(ip) = ip.parse::<IpAddr>() else {
+                .fetch_optional(&self.rec.store().pool)
+                .await?;
+            let parsed = ip.as_deref().and_then(|s| s.parse::<IpAddr>().ok());
+            let Some(ip) = parsed else {
                 let _ = self
                     .rec
                     .finish_job(job.id, None, Some("invalid target"))
                     .await;
                 return Box::pin(self.acquire()).await;
             };
+            // Re-check never_scan / non-global here too: the job may have been
+            // queued before an operator edited never_scan, or requeued on
+            // restart (standalone has no cluster Safety pre-flight otherwise).
+            if let Some(why) = locally_refused(&ip, &self.cfg.scan.never_scan) {
+                info!(target = %ip, %why, "scan refused");
+                let _ = self.rec.finish_job(job.id, None, Some(why.as_str())).await;
+                return Box::pin(self.acquire()).await;
+            }
             return Ok(Some(Job::Local {
                 id: job.id,
                 ip,
@@ -210,10 +244,14 @@ impl Source {
                 continue;
             };
             // Pre-flight: refused targets and duplicates never reach nmap.
-            let refused = {
-                let mut s = self.safety.lock().await;
-                s.refresh(node, &self.cfg.scan.never_scan).await;
-                s.refuses(&ip)
+            // Non-global / never_scan first, then the cluster member set.
+            let refused = match locally_refused(&ip, &self.cfg.scan.never_scan) {
+                some @ Some(_) => some,
+                None => {
+                    let mut s = self.safety.lock().await;
+                    s.refresh(node, &self.cfg.scan.never_scan).await;
+                    s.refuses(&ip)
+                }
             };
             if let Some(why) = refused {
                 info!(target = %ip, %why, "scan refused");
@@ -364,14 +402,24 @@ async fn run_scan(
             .args(&argv)
             .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            // Capture stderr so a failure says *why* ("requires root privileges",
+            // "Failed to resolve", …) instead of a bare exit code.
+            .stderr(std::process::Stdio::piped())
             .output();
         match tokio::time::timeout(timeout, out).await {
             Ok(Ok(out)) if out.status.success() => match nmap_xml::parse_nmap_xml(&out.stdout) {
                 Ok(res) => Outcome::Done(res),
                 Err(e) => Outcome::Failed(e.to_string()),
             },
-            Ok(Ok(out)) => Outcome::Failed(format!("exit {:?}", out.status.code())),
+            Ok(Ok(out)) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let detail = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                Outcome::Failed(if detail.is_empty() {
+                    format!("exit {:?}", out.status.code())
+                } else {
+                    format!("exit {:?}: {}", out.status.code(), detail.trim())
+                })
+            }
             Ok(Err(e)) => Outcome::Failed(e.to_string()),
             Err(_) => Outcome::Failed("timeout".into()),
         }
@@ -551,6 +599,66 @@ license_key = "k"
         assert_eq!(argv.last().unwrap(), "203.0.113.9");
         assert!(argv.windows(2).any(|w| w == ["-oX", "-"]));
         assert!(argv.contains(&"-sV".to_string()));
+    }
+
+    #[test]
+    fn ipv6_target_gets_dash6_and_mapped_v4_is_canonicalised() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let v6: IpAddr = "2001:db8::5".parse().unwrap();
+        let argv = nmap_argv(2, &v6, &cfg);
+        assert!(argv.contains(&"-6".to_string()), "{argv:?}");
+        assert_eq!(argv.last().unwrap(), "2001:db8::5");
+        // IPv4-mapped IPv6 is scanned as the v4 address, with no -6.
+        let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+        let argv = nmap_argv(2, &mapped, &cfg);
+        assert!(!argv.contains(&"-6".to_string()), "{argv:?}");
+        assert_eq!(argv.last().unwrap(), "203.0.113.9");
+    }
+
+    #[test]
+    fn non_global_targets_are_locally_refused() {
+        let never: Vec<ipnet::IpNet> = vec![];
+        assert!(locally_refused(&"127.0.0.1".parse().unwrap(), &never).is_some());
+        assert!(locally_refused(&"10.0.0.1".parse().unwrap(), &never).is_some());
+        assert!(locally_refused(&"169.254.169.254".parse().unwrap(), &never).is_some());
+        assert!(locally_refused(&"203.0.113.9".parse().unwrap(), &never).is_none());
+        let never = vec!["203.0.113.0/24".parse().unwrap()];
+        assert!(locally_refused(&"203.0.113.9".parse().unwrap(), &never).is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_lower_level_job_is_upgraded_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = store
+            .upsert_ip("198.51.100.2".parse().unwrap())
+            .await
+            .unwrap();
+        // A level-1 probe queues a job; a level-4 exploit arrives before it runs.
+        assert!(matches!(
+            store.enqueue_scan(ip.id, 1, 24).await.unwrap(),
+            crate::store::scans::EnqueueOutcome::Queued(_)
+        ));
+        assert!(matches!(
+            store.enqueue_scan(ip.id, 4, 24).await.unwrap(),
+            crate::store::scans::EnqueueOutcome::Queued(_)
+        ));
+        // Still one queued job, now at the higher level.
+        let (n, level): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(level) FROM scan_jobs WHERE ip_id = ? AND status='queued'",
+        )
+        .bind(ip.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "no duplicate job");
+        assert_eq!(level, 4, "level raised to the higher request");
+        // A later equal-or-lower request is still suppressed.
+        assert!(matches!(
+            store.enqueue_scan(ip.id, 2, 24).await.unwrap(),
+            crate::store::scans::EnqueueOutcome::Cooldown
+        ));
     }
 
     #[tokio::test]

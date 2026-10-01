@@ -238,14 +238,51 @@ impl Recorder {
         {
             return Ok(EnqueueOutcome::Cooldown);
         }
-        let pending: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM scan_jobs WHERE ip_id = ? AND status IN ('queued','running')",
+        // A job for this IP is already queued or running. Rather than drop a
+        // higher-severity request (which would leave the IP under-scanned until
+        // the cooldown lapses), raise the level it will be scanned at.
+        let max_pending: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(level) FROM scan_jobs WHERE ip_id = ? AND status IN ('queued','running')",
         )
         .bind(ip_id)
         .fetch_one(pool)
         .await?;
-        if pending > 0 {
-            return Ok(EnqueueOutcome::Cooldown);
+        if let Some(max_pending) = max_pending {
+            if (level as i64) <= max_pending {
+                // An equal or higher-scope scan is already pending.
+                return Ok(EnqueueOutcome::Cooldown);
+            }
+            match self {
+                Recorder::Local(_) => {
+                    // Upgrade the queued job in place.
+                    let r = sqlx::query(
+                        "UPDATE scan_jobs SET level = ?
+                         WHERE ip_id = ? AND status = 'queued' AND level < ?",
+                    )
+                    .bind(level as i64)
+                    .bind(ip_id)
+                    .bind(level as i64)
+                    .execute(pool)
+                    .await?;
+                    if r.rows_affected() > 0 {
+                        let id: i64 = sqlx::query_scalar(
+                            "SELECT id FROM scan_jobs WHERE ip_id = ? AND status = 'queued'
+                             ORDER BY level DESC LIMIT 1",
+                        )
+                        .bind(ip_id)
+                        .fetch_one(pool)
+                        .await?;
+                        return Ok(EnqueueOutcome::Queued(id));
+                    }
+                    // Only a running job covers it; let it finish, then cooldown.
+                    return Ok(EnqueueOutcome::Cooldown);
+                }
+                Recorder::Cluster(_) => {
+                    // Queue a fresh higher-level job; the arbiter runs it first
+                    // (ORDER BY level DESC) and the lower one is superseded by
+                    // the scanner's duplicate check once the higher completes.
+                }
+            }
         }
         let uid = new_uid();
         self.write(vec![Record::ScanJob(ScanJobRec {
