@@ -96,6 +96,7 @@ impl Manifest {
     }
 }
 
+/// Announced files of kinds this version knows; old `geolite2-*` rows are left out.
 pub async fn manifests(store: &crate::store::Store) -> Result<HashMap<String, Manifest>> {
     type Row = (String, String, i64, String, Option<Vec<u8>>);
     let rows: Vec<Row> =
@@ -104,6 +105,7 @@ pub async fn manifests(store: &crate::store::Store) -> Result<HashMap<String, Ma
             .await?;
     Ok(rows
         .into_iter()
+        .filter(|(kind, ..)| file_name(kind).is_some())
         .map(|(kind, sha256, size, fetched_at, origin)| {
             (
                 kind.clone(),
