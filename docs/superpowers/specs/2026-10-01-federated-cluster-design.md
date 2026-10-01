@@ -1,7 +1,7 @@
 # peephole — federated cluster
 
 Date: 2026-10-01
-Status: design agreed in brainstorming; awaiting user review of this document
+Status: approved by user (brainstorming complete)
 Builds on: the distributed mode in `src/cluster` (signed replicated log,
 pinned-key mTLS RPC, invites, shared scan queue, intel sharing). Where this
 document conflicts with the "Distributed mode" section of the README or with
@@ -42,6 +42,13 @@ Success means:
   node originated. Deleting a foreign record hides it locally.
 - **Reads and the scan queue stay shared.** Every member sees the whole
   dataset; scanners take jobs from any trap.
+- **The dataset is persistent.** What a node contributed stays in the
+  cluster when the node leaves or is pruned, and no automatic retention
+  erases shared data.
+- **`never_scan` is local.** It applies only to the scanner of the node it
+  is configured on.
+- **No legacy.** There are no deployments to protect; nothing below keeps
+  compatibility with the current protocol or data.
 - **Config key.** Each node has one key. Holding it grants the right to
   change that node's allow-listed runtime settings. The grant is persistent
   until the owner rotates the key, which cuts off all holders.
@@ -107,8 +114,7 @@ and is never replicated. While a peer is blocked, this node:
 - still stores and relays its log entries, so other nodes are unaffected,
 - hides every record it originated from views, statistics and exports,
 - ignores its enrichment results,
-- does not claim its scan jobs and refuses its claims,
-- still honours its `never_scan` list.
+- does not claim its scan jobs and refuses its claims.
 
 Unblocking reverses all of it.
 
@@ -153,19 +159,24 @@ deleted cluster-wide and how many were hidden locally.
 
 ### 4.3 Retention
 
-`scan.retention_days` keeps working through tombstones, so under 4.1 it
-erases the node's **own** old records, cluster-wide. Foreign records live as
-long as their originating node keeps them.
+The shared dataset is persistent, so in a cluster nothing is erased by age:
+`scan.retention_days` applies to standalone nodes only. A node with
+`[cluster]` ignores it, and `check-config` says so. A cluster node's
+database grows with the cluster's activity; the remedy against a flooding
+peer is the local block.
 
-Two consequences, accepted for now:
+Bounding a node's disk use by dropping old history locally would need log
+compaction (a node could no longer serve the entries it dropped). That is a
+separate future project.
 
-- A node's disk use is bounded by every member's retention, not only its
-  own. The remedy against a flooding peer is the local block.
-- A short retention removes that node's contributions from everybody's copy
-  of the research dataset.
+### 4.4 `never_scan`
 
-Dropping foreign history locally would need log compaction (a node could no
-longer serve the entries it dropped). That is a separate future project.
+`scan.never_scan` protects what the operator of a scanner does not want
+that scanner to touch. It applies only on the node whose TOML sets it, and
+only matters while that node's scanner role is on. It is no longer published
+in member info, and scanners no longer honour other members' lists. A
+scanner whose own list covers a job's target reports the job back as refused
+for itself, and the arbiter offers it to another scanner.
 
 ## 5. Config key and remote settings
 
@@ -219,15 +230,12 @@ They will require the key.
 |---|---|
 | Scan pace: workers, scans per hour, timeout | yes, within the existing limits |
 | Rescan cooldown | yes |
-| Extra `never_scan` entries | add and remove extras; TOML entries cannot be removed |
 | Roles `listener`, `scanner`, `web` | yes, see 5.5 |
 
 Not remotely changeable: listen and advertise addresses, paths, `[webauthn]`,
 API keys, `scan.level_argv` (control over nmap arguments on a root scanner is
-remote code execution), `trusted_proxies`, `remote_config` itself, and
-**`retention_days`**. Retention was on the list agreed in brainstorming; it
-is excluded here because under section 4.3 lowering it irreversibly erases
-the node's contributions for everyone. The owner changes it locally.
+remote code execution), `scan.never_scan` (section 4.4), `trusted_proxies`,
+`remote_config` itself, and `retention_days` (standalone only, section 4.3).
 
 Remote and local-UI changes are overrides in the existing `settings` table on
 top of the TOML defaults, as scan pace is today. `peephole settings show`
@@ -261,8 +269,7 @@ Rules:
 GeoLite2 files leave file sharing: the kinds `geolite2-city` and
 `geolite2-asn` are no longer announced, served or copied, and old manifests
 for them are ignored. Every node with `[maxmind]` credentials downloads for
-itself, daily, as a standalone node does. On upgrade, a node without
-credentials deletes GeoLite2 files it copied from peers earlier.
+itself, daily, as a standalone node does.
 
 The Tor exit list stays as it is: one elected node fetches, the others copy.
 
@@ -287,8 +294,7 @@ keeping provenance for the research dataset and letting a local block drop
 one node's results without losing the others'. The existing `ips` columns
 (country, ASN, organisation, Tor flag) remain as the current view, taken from
 the newest result of a non-blocked origin. Exports gain the `ip_intel` rows.
-Existing `ip_enrich` records keep applying and are read as results of the
-node that wrote them.
+`ip_intel` replaces the `ip_enrich` record kind.
 
 ### 6.3 Who looks up
 
@@ -348,19 +354,19 @@ the README remains as the alternative.
 
 ## 8. Compatibility
 
-- The cluster protocol version is raised and the minimum with it: scoped
-  deletes and self-only revocation must be enforced by every node, so nodes
-  on the old protocol are refused at `hello` until upgraded.
-- Membership already materialised stays as it is. A node that replays the
-  log from scratch ignores old third-party revocations.
-- `invites` rows from before stay valid as single-use invites.
-- Configs without `cluster.remote_config` load with it off; `check-config`
-  notes the new key.
+None is kept. The cluster protocol version and its minimum are raised, so
+nodes on the old protocol are refused at `hello`. Record kinds, message
+types and tables change in place (`member_revoke` semantics, `SetPace`,
+`ip_enrich`, the `invites` columns, `never_scan` in member info) without
+migration paths for existing clusters. Standalone databases still migrate
+forward through the numbered schema migrations.
 
 ## 9. Known consequences
 
 - The trust model is open by design. A member can flood the dataset with
   junk; the remedies are per-node blocks, not removal.
+- A scanner honours only its own `never_scan`. An operator who wants an
+  address range left alone by the whole cluster has no setting for that.
 - False-positive claims, including an optional contact e-mail, replicate to
   every member as they do today. In a federation that means to operators the
   claimant never dealt with. Unchanged here; worth a later decision.
@@ -371,8 +377,9 @@ the README remains as the alternative.
 
 - Unit: revocation by a third party is ignored, self-revocation applies;
   staleness from log evidence, including re-admission and the self-pruned
-  start; tombstone scoping per origin for each target type; MAC and version
-  checks of `ConfigSet`; settings validation and TOML-floor rules; provider
+  start; tombstone scoping per origin for each target type; retention off in
+  a cluster; a scanner refusing a job for itself by its own `never_scan`;
+  MAC and version checks of `ConfigSet`; settings validation; provider
   ranking and the delayed step-in.
 - Cluster integration (`tests/cluster.rs`, `tests/cluster_e2e.rs`): three
   nodes; a foreign delete hides locally and leaves the other nodes intact;
