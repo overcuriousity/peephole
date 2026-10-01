@@ -142,7 +142,10 @@ pub struct Messaging {
     seen: Mutex<HashMap<String, Instant>>,
     outbox: Mutex<HashMap<NodeId, VecDeque<(Envelope, Instant)>>>,
     pub outbox_changed: tokio::sync::Notify,
-    replies: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Msg>>>,
+    /// request id -> (expected responder, reply channel). The responder is
+    /// checked so a relaying member that merely saw the id cannot forge the
+    /// answer in the real destination's place.
+    replies: Mutex<HashMap<String, (NodeId, tokio::sync::oneshot::Sender<Msg>)>>,
     handlers: Mutex<Vec<Handler>>,
 }
 
@@ -162,7 +165,11 @@ impl Node {
     pub async fn request(self: &Arc<Self>, to: NodeId, msg: Msg, timeout: Duration) -> Result<Msg> {
         let (id, env) = Envelope::seal(self, to, None, msg)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.msg.replies.lock().unwrap().insert(id.clone(), tx);
+        self.msg
+            .replies
+            .lock()
+            .unwrap()
+            .insert(id.clone(), (to, tx));
         let sent = self.route(env).await;
         let out = match sent {
             Ok(()) => tokio::time::timeout(timeout, rx)
@@ -285,8 +292,17 @@ impl Node {
             }
         }
         if let Some(rid) = &b.in_reply_to {
-            if let Some(tx) = self.msg.replies.lock().unwrap().remove(rid) {
-                let _ = tx.send(b.msg);
+            let mut replies = self.msg.replies.lock().unwrap();
+            // Only accept the reply from the node we actually asked; a relay
+            // that saw the id must not be able to answer in its place.
+            if let Some((expected, _)) = replies.get(rid) {
+                if *expected == b.from {
+                    if let Some((_, tx)) = replies.remove(rid) {
+                        let _ = tx.send(b.msg);
+                    }
+                } else {
+                    debug!(from = %b.from.short(), "reply from unexpected responder dropped");
+                }
             }
             return;
         }

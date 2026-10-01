@@ -29,6 +29,12 @@ pub const KINDS: [&str; 3] = [CITY, ASN, TOR];
 /// Bytes per chunk request.
 pub const CHUNK: u64 = 4 * 1024 * 1024;
 
+/// Largest intel file we will copy from a peer. GeoLite2-City is well under
+/// this; the cap stops a member's manifest from naming an absurd size that
+/// would pre-allocate (and abort) every node. Peers are authenticated, so this
+/// is defence in depth.
+pub const MAX_INTEL_SIZE: u64 = 256 * 1024 * 1024;
+
 pub fn file_name(kind: &str) -> Option<&'static str> {
     match kind {
         CITY => Some("GeoLite2-City.mmdb"),
@@ -183,6 +189,11 @@ pub fn read_chunk(data_dir: &Path, req: &ChunkReq) -> Result<Option<Vec<u8>>> {
 /// atomically only if size and hash match.
 async fn download(node: &Node, data_dir: &Path, m: &Manifest) -> Result<()> {
     let name = file_name(&m.kind).context("unknown intel kind")?;
+    anyhow::ensure!(
+        m.size <= MAX_INTEL_SIZE,
+        "{name}: announced size {} exceeds the {MAX_INTEL_SIZE}-byte cap",
+        m.size
+    );
     let mut peers = node.dial_targets();
     // The fetcher first: it certainly holds the file.
     peers.sort_by_key(|(id, _, _)| Some(*id) != m.origin);

@@ -34,12 +34,18 @@ async fn snapshot_or_comment(state: &AdminState) -> Event {
     }
 }
 
+/// Forced-resync / session-recheck cadence.
+const SNAPSHOT_EVERY: Duration = Duration::from_secs(30);
+
 pub async fn queue_stream(
     _u: SessionUser,
+    jar: axum_extra::extract::CookieJar,
     State(state): State<Arc<AdminState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.notifier.subscribe();
-    Sse::new(async_stream(state, rx)).keep_alive(
+    // The session id, so the long-lived stream can notice logout/expiry.
+    let session = jar.get("peephole_session").map(|c| c.value().to_string());
+    Sse::new(async_stream(state, rx, session)).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keepalive"),
@@ -49,17 +55,24 @@ pub async fn queue_stream(
 fn async_stream(
     state: Arc<AdminState>,
     rx: tokio::sync::broadcast::Receiver<QueueJob>,
+    session: Option<String>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     struct St {
         state: Arc<AdminState>,
         rx: tokio::sync::broadcast::Receiver<QueueJob>,
+        session: Option<String>,
         first: bool,
+        // Next forced snapshot, independent of job traffic (a steady stream of
+        // jobs must not keep resetting it, or a client never resyncs).
+        next_snapshot: tokio::time::Instant,
     }
     futures::stream::unfold(
         St {
             state,
             rx,
+            session,
             first: true,
+            next_snapshot: tokio::time::Instant::now() + SNAPSHOT_EVERY,
         },
         |mut st| async move {
             if st.first {
@@ -74,7 +87,17 @@ fn async_stream(
                     Err(RecvError::Lagged(_)) => snapshot_or_comment(&st.state).await,
                     Err(RecvError::Closed) => return None,
                 },
-                _ = tokio::time::sleep(Duration::from_secs(30)) => snapshot_or_comment(&st.state).await,
+                _ = tokio::time::sleep_until(st.next_snapshot) => {
+                    st.next_snapshot = tokio::time::Instant::now() + SNAPSHOT_EVERY;
+                    // Re-check the session so a logout or expiry ends the stream
+                    // instead of streaming queue data to a dead session.
+                    if let Some(id) = &st.session
+                        && !st.state.store.validate_session(id).await.unwrap_or(false)
+                    {
+                        return None;
+                    }
+                    snapshot_or_comment(&st.state).await
+                }
             };
             Some((Ok(ev), st))
         },
@@ -115,7 +138,7 @@ license_key = "k"
         store.pool.close().await; // every query now fails
         let state = Arc::new(AdminState::public_only(store, cfg));
         let rx = state.notifier.subscribe();
-        let mut stream = Box::pin(async_stream(state, rx));
+        let mut stream = Box::pin(async_stream(state, rx, None));
         let first = stream.next().await.unwrap().unwrap();
         let dbg = format!("{first:?}");
         assert!(!dbg.contains("event: snapshot"), "{dbg}");

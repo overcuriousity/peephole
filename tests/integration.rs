@@ -48,7 +48,12 @@ license_key = "k"
 #[tokio::test]
 async fn probe_request_is_logged_and_serves_trap_page() {
     let (base, store, _dir) = spawn_trap().await;
-    let resp = reqwest::get(format!("{base}/definitely-not-a-route"))
+    // Present a public source IP via XFF (127.0.0.1 is the trusted proxy);
+    // loopback and other non-global addresses are never counter-scanned.
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/definitely-not-a-route"))
+        .header("x-forwarded-for", "203.0.113.1")
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
@@ -81,6 +86,7 @@ async fn sqli_request_queues_level_4() {
     let client = reqwest::Client::new();
     let _ = client
         .get(format!("{base}/login?u=admin'%20OR%20'1'='1"))
+        .header("x-forwarded-for", "203.0.113.5")
         .send()
         .await
         .unwrap();
@@ -100,10 +106,16 @@ async fn sqli_request_queues_level_4() {
 async fn fp_claim_is_stored_and_scan_still_proceeds() {
     let (base, store, _dir) = spawn_trap().await;
     let client = reqwest::Client::new();
-    // First a probe to create the IP + a scan job.
-    let _ = client.get(format!("{base}/oops")).send().await.unwrap();
+    // First a probe to create the IP + a scan job (public IP via XFF).
+    let _ = client
+        .get(format!("{base}/oops"))
+        .header("x-forwarded-for", "203.0.113.5")
+        .send()
+        .await
+        .unwrap();
     let resp = client
         .post(format!("{base}/claim"))
+        .header("x-forwarded-for", "203.0.113.5")
         .header("user-agent", "Mozilla/5.0")
         .form(&[("email", "human@example.org")])
         .send()
@@ -343,7 +355,12 @@ async fn read_sse_until(resp: reqwest::Response, needle: &str, secs: u64) -> Str
 #[tokio::test]
 async fn queue_sse_requires_session_and_streams_snapshot_then_jobs() {
     let (trap_base, store, dir) = spawn_trap().await;
-    let _ = reqwest::get(format!("{trap_base}/probe")).await.unwrap();
+    let _ = reqwest::Client::new()
+        .get(format!("{trap_base}/probe"))
+        .header("x-forwarded-for", "203.0.113.5")
+        .send()
+        .await
+        .unwrap();
     // Unauthenticated → redirect to /login.
     let admin_base = spawn_admin_with(store.clone(), dir.path()).await;
     let resp = reqwest::Client::builder()
@@ -915,7 +932,7 @@ account_id = "1"
 license_key = "k"
 [scan]
 max_workers = 1
-timeout_secs = 5
+timeout_secs = 60
 rescan_cooldown_hours = 24
 max_scans_per_hour = 100
 "#,
@@ -936,6 +953,7 @@ max_scans_per_hour = 100
     let client = reqwest::Client::new();
     let resp = client
         .get("http://127.0.0.1:18080/bot-traffic")
+        .header("x-forwarded-for", "203.0.113.7")
         .send()
         .await
         .unwrap();

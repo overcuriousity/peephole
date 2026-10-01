@@ -31,7 +31,16 @@ impl TorExitList {
 
     /// Download a fresh list; on failure the old file is left untouched.
     pub async fn refresh(data_dir: &Path) -> Result<u64> {
-        let body = reqwest::get(TOR_EXIT_URL)
+        // Connect and overall timeouts: a hung connection must not stall the
+        // intel scheduler (which also drives the MaxMind refresh) indefinitely.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .context("building tor http client")?;
+        let body = client
+            .get(TOR_EXIT_URL)
+            .send()
             .await?
             .error_for_status()?
             .text()

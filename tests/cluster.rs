@@ -716,16 +716,22 @@ async fn deletes_propagate_and_stay_deleted() {
     assert_eq!(paths, ["/two"]);
     assert_eq!(count(&x, "SELECT COUNT(*) FROM fp_claims").await, 0);
 
-    // Erased stubs: accepted only once the tombstone is known.
+    // Erased stubs from a trusted origin are accepted immediately: the
+    // tombstone that erased them comes *later* in the same in-order stream, so
+    // waiting for it would stall the origin forever. Applying A's stream alone
+    // (without B's tombstone yet) must converge to A's head and keep /one
+    // deleted, not reject-and-stall.
     let (y, _dy) = offline_node(&[&a, &b]).await;
     let st = repl::apply_batch(&y, a_after.clone()).await.unwrap();
-    assert!(st.rejected > 0, "{st:?}");
-    repl::apply_batch(&y, b_stream).await.unwrap();
-    repl::apply_batch(&y, a_after).await.unwrap();
+    assert_eq!(st.rejected, 0, "stub must not stall the stream: {st:?}");
     assert_eq!(
         repl::head_in(&repl::heads(&y.store).await.unwrap(), &a.id),
-        repl::head_in(&repl::heads(&na.store).await.unwrap(), &a.id)
+        repl::head_in(&repl::heads(&na.store).await.unwrap(), &a.id),
+        "A's log fully applied, no stall at the erased stub"
     );
+    // Re-applying B's stream and A's stream stays idempotent and deleted.
+    repl::apply_batch(&y, b_stream).await.unwrap();
+    repl::apply_batch(&y, a_after).await.unwrap();
     let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
         .fetch_all(&y.store.pool)
         .await

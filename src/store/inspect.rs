@@ -68,6 +68,9 @@ pub struct RequestDetail {
     pub ip: String,
     pub headers: Vec<(String, String)>,
     pub body_text: String,
+    /// Base64 of the raw (shown) body bytes, for an accurate hex view — the
+    /// lossy `body_text` and HTML newline normalisation corrupt binary bytes.
+    pub body_b64: String,
     pub body_len: usize,
     pub body_truncated: bool,
     pub fingerprint: Option<FpSummary>,
@@ -84,6 +87,22 @@ const SCAN_SELECT: &str =
 const CLAIM_SELECT: &str = "SELECT c.id, c.ts, i.ip, c.contact_email, c.user_agent FROM fp_claims c JOIN ips i ON c.ip_id = i.id";
 
 const BODY_LIMIT: usize = 16 * 1024;
+/// Upper bound on a decompressed scan's raw nmap XML.
+const MAX_RAW_XML: u64 = 64 * 1024 * 1024;
+
+/// Decompress zstd data, refusing output larger than `limit` (bomb guard).
+fn zstd_decode_capped(data: &[u8], limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut dec = zstd::stream::Decoder::new(data)?;
+    let mut out = Vec::new();
+    // Read one byte past the limit to detect overflow.
+    let n = dec.by_ref().take(limit + 1).read_to_end(&mut out)?;
+    anyhow::ensure!(
+        n as u64 <= limit,
+        "decompressed scan XML exceeds {limit} bytes"
+    );
+    Ok(out)
+}
 
 impl Store {
     pub async fn scans_for_ip(&self, ip_id: i64) -> Result<Vec<ScanSummary>> {
@@ -136,7 +155,10 @@ impl Store {
                 .fetch_optional(&self.pool)
                 .await?;
         match blob.flatten() {
-            Some(b) => Ok(Some(zstd::decode_all(b.as_slice())?)),
+            // Cap the decompressed size: raw_xml can arrive from any cluster
+            // member, so a decompression bomb must not exhaust memory when an
+            // admin opens the scan.
+            Some(b) => Ok(Some(zstd_decode_capped(&b, MAX_RAW_XML)?)),
             None => Ok(None),
         }
     }
@@ -252,7 +274,9 @@ impl Store {
         let body = row.body.clone().unwrap_or_default();
         let body_len = body.len();
         let body_truncated = body_len > BODY_LIMIT;
-        let body_text = String::from_utf8_lossy(&body[..body_len.min(BODY_LIMIT)]).into_owned();
+        let shown = &body[..body_len.min(BODY_LIMIT)];
+        let body_text = String::from_utf8_lossy(shown).into_owned();
+        let body_b64 = data_encoding::BASE64.encode(shown);
         let fp: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT fp_hash, visitor_id FROM fingerprints WHERE request_id = ? ORDER BY id DESC LIMIT 1",
         )
@@ -280,6 +304,7 @@ impl Store {
             ip,
             headers,
             body_text,
+            body_b64,
             body_len,
             body_truncated,
             fingerprint,

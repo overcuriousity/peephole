@@ -1,11 +1,14 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-/// Stable attributes that define a browser fingerprint (spec §8.2).
+/// Stable attributes that define a browser fingerprint (spec §8.2). These are
+/// the exact keys the collector sends; a mismatch (e.g. hashing `fonts_hash`
+/// when the collector sends `fonts_count`) silently drops that signal from the
+/// fingerprint.
 const STABLE_KEYS: [&str; 7] = [
     "canvas",
     "webgl_renderer",
-    "fonts_hash",
+    "fonts_count",
     "audio",
     "screen",
     "timezone",
@@ -17,13 +20,13 @@ pub fn fp_hash(attrs: &Value) -> String {
     for key in STABLE_KEYS {
         h.update(key.as_bytes());
         h.update(b"=");
-        h.update(
-            attrs
-                .get(key)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .as_bytes(),
-        );
+        // Strings contribute their text; non-strings (e.g. the numeric
+        // fonts_count) their JSON form, so every declared key is included.
+        match attrs.get(key) {
+            Some(Value::String(s)) => h.update(s.as_bytes()),
+            Some(other) => h.update(other.to_string().as_bytes()),
+            None => {}
+        }
         h.update(b";");
     }
     data_encoding::HEXLOWER.encode(&h.finalize())
@@ -120,14 +123,15 @@ mod tests {
 
     #[test]
     fn fp_hash_is_stable_and_sensitive() {
-        let a = json!({"canvas":"abc","webgl_renderer":"Mesa Intel","fonts_hash":"f1","audio":"0.42","screen":"1920x1080x24","timezone":"Europe/Berlin","platform":"Linux x86_64","unstable_noise":"xyz"});
-        let b = json!({"canvas":"abc","webgl_renderer":"Mesa Intel","fonts_hash":"f1","audio":"0.42","screen":"1920x1080x24","timezone":"Europe/Berlin","platform":"Linux x86_64","unstable_noise":"DIFFERENT"});
+        let a = json!({"canvas":"abc","webgl_renderer":"Mesa Intel","fonts_count":12,"audio":"0.42","screen":"1920x1080x24","timezone":"Europe/Berlin","platform":"Linux x86_64","unstable_noise":"xyz"});
+        let b = json!({"canvas":"abc","webgl_renderer":"Mesa Intel","fonts_count":12,"audio":"0.42","screen":"1920x1080x24","timezone":"Europe/Berlin","platform":"Linux x86_64","unstable_noise":"DIFFERENT"});
         assert_eq!(
             fp_hash(&a),
             fp_hash(&b),
             "unstable fields must not affect hash"
         );
-        let c = json!({"canvas":"def","webgl_renderer":"Mesa Intel","fonts_hash":"f1","audio":"0.42","screen":"1920x1080x24","timezone":"Europe/Berlin","platform":"Linux x86_64"});
+        // The numeric fonts_count is part of the fingerprint.
+        let c = json!({"canvas":"abc","webgl_renderer":"Mesa Intel","fonts_count":9,"audio":"0.42","screen":"1920x1080x24","timezone":"Europe/Berlin","platform":"Linux x86_64"});
         assert_ne!(fp_hash(&a), fp_hash(&c));
     }
 

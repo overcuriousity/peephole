@@ -238,14 +238,51 @@ impl Recorder {
         {
             return Ok(EnqueueOutcome::Cooldown);
         }
-        let pending: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM scan_jobs WHERE ip_id = ? AND status IN ('queued','running')",
+        // A job for this IP is already queued or running. Rather than drop a
+        // higher-severity request (which would leave the IP under-scanned until
+        // the cooldown lapses), raise the level it will be scanned at.
+        let max_pending: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(level) FROM scan_jobs WHERE ip_id = ? AND status IN ('queued','running')",
         )
         .bind(ip_id)
         .fetch_one(pool)
         .await?;
-        if pending > 0 {
-            return Ok(EnqueueOutcome::Cooldown);
+        if let Some(max_pending) = max_pending {
+            if (level as i64) <= max_pending {
+                // An equal or higher-scope scan is already pending.
+                return Ok(EnqueueOutcome::Cooldown);
+            }
+            match self {
+                Recorder::Local(_) => {
+                    // Upgrade the queued job in place.
+                    let r = sqlx::query(
+                        "UPDATE scan_jobs SET level = ?
+                         WHERE ip_id = ? AND status = 'queued' AND level < ?",
+                    )
+                    .bind(level as i64)
+                    .bind(ip_id)
+                    .bind(level as i64)
+                    .execute(pool)
+                    .await?;
+                    if r.rows_affected() > 0 {
+                        let id: i64 = sqlx::query_scalar(
+                            "SELECT id FROM scan_jobs WHERE ip_id = ? AND status = 'queued'
+                             ORDER BY level DESC LIMIT 1",
+                        )
+                        .bind(ip_id)
+                        .fetch_one(pool)
+                        .await?;
+                        return Ok(EnqueueOutcome::Queued(id));
+                    }
+                    // Only a running job covers it; let it finish, then cooldown.
+                    return Ok(EnqueueOutcome::Cooldown);
+                }
+                Recorder::Cluster(_) => {
+                    // Queue a fresh higher-level job; the arbiter runs it first
+                    // (ORDER BY level DESC) and the lower one is superseded by
+                    // the scanner's duplicate check once the higher completes.
+                }
+            }
         }
         let uid = new_uid();
         self.write(vec![Record::ScanJob(ScanJobRec {
@@ -581,5 +618,45 @@ impl Recorder {
         self.write(vec![Self::tomb(TombTarget::Claim { uid })])
             .await?;
         Ok(true)
+    }
+
+    /// Retention: tombstone requests (with their claims/fingerprints) and scan
+    /// results older than `days`. Bounded per call so a huge backlog is drained
+    /// over several daily runs rather than one enormous transaction. Returns
+    /// (requests, scans) removed. Deletes propagate in a cluster via tombstones.
+    pub async fn prune_older_than(&self, days: u32) -> Result<(u64, u64)> {
+        if days == 0 {
+            return Ok((0, 0));
+        }
+        const BATCH: i64 = 20_000;
+        let pool = &self.store().pool;
+        let cutoff = format!("-{days} days");
+        let req_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM requests WHERE ts < datetime('now', ?) ORDER BY id LIMIT ?",
+        )
+        .bind(&cutoff)
+        .bind(BATCH)
+        .fetch_all(pool)
+        .await?;
+        let reqs = self.delete_requests(&req_ids).await?;
+
+        let scan_uids: Vec<String> = sqlx::query_scalar(
+            "SELECT uid FROM scans
+             WHERE COALESCE(finished_at, started_at) < datetime('now', ?)
+             ORDER BY id LIMIT ?",
+        )
+        .bind(&cutoff)
+        .bind(BATCH)
+        .fetch_all(pool)
+        .await?;
+        let scans = scan_uids.len() as u64;
+        let records: Vec<_> = scan_uids
+            .into_iter()
+            .map(|uid| Self::tomb(TombTarget::Scan { uid }))
+            .collect();
+        for chunk in records.chunks(TOMB_CHUNK) {
+            self.write(chunk.to_vec()).await?;
+        }
+        Ok((reqs, scans))
     }
 }

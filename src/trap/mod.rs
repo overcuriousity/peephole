@@ -15,10 +15,21 @@ use axum::{
     routing::{any, get, post},
 };
 use ipnet::IpNet;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 const COLLECTOR_JS: &str = include_str!("../fingerprint/collector.js");
+
+/// Largest request body the public trap will read. Real exploit payloads are
+/// tiny; a cap keeps a flood of multi-megabyte POSTs from exhausting memory
+/// (every body is held whole and replicated to every cluster node).
+const MAX_BODY: usize = 64 * 1024;
+
+/// Fixed-window per-IP limit for the unauthenticated helper endpoints.
+const HELPER_LIMIT: u32 = 30;
+const HELPER_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub struct TrapState {
     pub store: Store,
@@ -29,6 +40,37 @@ pub struct TrapState {
     pub geo: Arc<RwLock<Option<GeoIp>>>,
     pub tor: Arc<RwLock<TorExitList>>,
     pub notifier: crate::events::Notifier,
+    /// Per-IP rate limiter for `/collect` and `/claim`.
+    pub helper_rate: RateLimiter,
+}
+
+/// Minimal fixed-window rate limiter. Bounded in size so an attacker rotating
+/// source addresses cannot grow it without limit.
+#[derive(Default)]
+pub struct RateLimiter {
+    windows: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+}
+
+impl RateLimiter {
+    const MAX_TRACKED: usize = 100_000;
+
+    /// Returns true if this hit is allowed (under the limit for its window).
+    fn allow(&self, ip: IpAddr, limit: u32, window: std::time::Duration) -> bool {
+        let now = Instant::now();
+        let mut map = self.windows.lock().unwrap();
+        if map.len() > Self::MAX_TRACKED {
+            map.retain(|_, (start, _)| now.duration_since(*start) < window);
+            if map.len() > Self::MAX_TRACKED {
+                map.clear();
+            }
+        }
+        let e = map.entry(ip).or_insert((now, 0));
+        if now.duration_since(e.0) >= window {
+            *e = (now, 0);
+        }
+        e.1 += 1;
+        e.1 <= limit
+    }
 }
 
 impl TrapState {
@@ -43,6 +85,7 @@ impl TrapState {
             geo: Arc::new(RwLock::new(None)),
             tor: Arc::new(RwLock::new(TorExitList::default())),
             notifier: Default::default(),
+            helper_rate: RateLimiter::default(),
         }
     }
 }
@@ -54,20 +97,54 @@ pub fn router(state: Arc<TrapState>) -> Router {
         .route("/panel", get(panel_handler))
         .route("/collect.js", get(collector_js))
         .fallback(any(trap_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
 }
 
-/// Source IP: rightmost X-Forwarded-For entry when the peer is a trusted proxy.
+/// Source IP from `X-Forwarded-For`, trusting only hops we control.
+///
+/// `X-Forwarded-For` is `client, proxy1, proxy2, …` with each proxy appending
+/// the address it received the connection from. Only entries written by a
+/// trusted proxy can be believed, so we start at the direct peer and walk the
+/// header right-to-left, stepping over each hop that is itself trusted; the
+/// first address that is not a trusted proxy is the real client. Taking the
+/// first (leftmost) entry, or a single fixed position, lets a client forge its
+/// address — HAProxy's `option forwardfor` appends rather than replaces, so a
+/// client-supplied entry survives. Addresses are canonicalised so an
+/// IPv4-mapped IPv6 hop matches IPv4 trust CIDRs. All `x-forwarded-for` header
+/// lines are considered, newest last, and values are parsed from raw bytes so
+/// a non-ASCII byte cannot blank the header and pin everything on the proxy.
 pub fn client_ip(headers: &HeaderMap, fallback: IpAddr, trusted: &[IpNet]) -> IpAddr {
-    if !trusted.iter().any(|n| n.contains(&fallback)) {
+    let fallback = crate::net::canonical(fallback);
+    let is_trusted = |ip: &IpAddr| {
+        trusted
+            .iter()
+            .any(|n| n.contains(&crate::net::canonical(*ip)))
+    };
+    if !is_trusted(&fallback) {
+        // The direct peer is not a trusted proxy: believe only the peer.
         return fallback;
     }
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next_back())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(fallback)
+    // Flatten every XFF entry across all header lines, left to right.
+    let entries: Vec<IpAddr> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .flat_map(|v| {
+            String::from_utf8_lossy(v.as_bytes())
+                .split(',')
+                .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    // Walk right to left, skipping trusted hops; the first untrusted one wins.
+    for ip in entries.iter().rev() {
+        let ip = crate::net::canonical(*ip);
+        if !is_trusted(&ip) {
+            return ip;
+        }
+    }
+    // Every entry (and the peer) is trusted, or there were none: use the peer.
+    fallback
 }
 
 async fn record_and_respond(
@@ -102,10 +179,21 @@ async fn record_and_respond(
             .await?;
     }
 
-    let history = state.store.ip_history(ip_row.id).await.unwrap_or_default();
-    let verdict = state
-        .classifier
-        .classify(view, &history, &BotTells::default());
+    // A false-positive claim is the visitor saying "I'm not a scanner"; it must
+    // not be classified as hostile or trigger a counter-scan (otherwise the
+    // POST alone scores form-interaction and escalates the claimant).
+    let verdict = if is_fp_claim {
+        crate::classify::Verdict {
+            severity: 0,
+            scan_level: 0,
+            labels: vec!["fp-claim".into()],
+        }
+    } else {
+        let history = state.store.ip_history(ip_row.id).await.unwrap_or_default();
+        state
+            .classifier
+            .classify(view, &history, &BotTells::default())
+    };
     let labels_json = serde_json::to_string(&verdict.labels)?;
     let page_token = uuid::Uuid::new_v4().to_string();
 
@@ -126,11 +214,17 @@ async fn record_and_respond(
         })
         .await?;
 
-    // Enqueue counter-scan unless tor / allowlisted / level 0 (spec §4-5).
-    let allowlisted = state.cfg.scan.never_scan.iter().any(|n| n.contains(&ip));
+    // Enqueue counter-scan unless tor / allowlisted / non-global / level 0
+    // (spec §4-5). The non-global guard is absolute: a spoofed X-Forwarded-For
+    // or a misconfigured never_scan must never aim nmap at loopback, the
+    // internal network or a link-local metadata endpoint. never_scan is checked
+    // on the canonical address so IPv4-mapped IPv6 cannot slip past IPv4 CIDRs.
+    let canon = crate::net::canonical(ip);
+    let allowlisted = state.cfg.scan.never_scan.iter().any(|n| n.contains(&canon));
     if verdict.scan_level > 0
         && !is_tor
         && !allowlisted
+        && crate::net::is_scannable_target(ip)
         && let crate::store::scans::EnqueueOutcome::Queued(job_id) = state
             .recorder
             .enqueue_scan(
@@ -159,8 +253,16 @@ struct Recorded {
 }
 
 fn header_pairs(h: &HeaderMap) -> Vec<(String, String)> {
+    // Lossy decode rather than dropping the value: a header carrying a byte
+    // >=0x80 (a UTF-8 exploit payload, or a sloppy scanner User-Agent) is
+    // evidence; blanking it would hide it from the classifier and the admin.
     h.iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
         .collect()
 }
 
@@ -180,12 +282,17 @@ async fn trap_handler(
         headers: header_pairs(&headers),
         body: if body.is_empty() { None } else { Some(&body) },
     };
+    let stored_body = if body.is_empty() {
+        None
+    } else {
+        Some(body.clone())
+    };
     match record_and_respond(
         &state,
         ip,
         &view,
         &header_pairs(&headers),
-        Some(body.clone()),
+        stored_body,
         false,
     )
     .await
@@ -211,6 +318,9 @@ async fn claim_handler(
     Form(form): Form<ClaimForm>,
 ) -> impl IntoResponse {
     let ip = client_ip(&headers, peer.ip(), &state.cfg.trusted_proxies);
+    if !state.helper_rate.allow(ip, HELPER_LIMIT, HELPER_WINDOW) {
+        return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
+    }
     let ua = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -255,6 +365,9 @@ async fn collect_handler(
     axum::Json(payload): axum::Json<CollectPayload>,
 ) -> impl IntoResponse {
     let ip = client_ip(&headers, peer.ip(), &state.cfg.trusted_proxies);
+    if !state.helper_rate.allow(ip, HELPER_LIMIT, HELPER_WINDOW) {
+        return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
+    }
     if let Ok(ip_row) = state.store.upsert_ip(ip).await {
         // Attribute the fingerprint to the page view that issued the token;
         // fall back to the connection IP for unknown tokens.
@@ -292,8 +405,31 @@ async fn collect_handler(
                 events.as_bytes(),
             )
             .await;
+
+        // The fingerprint arrives after the page view that triggered it, so it
+        // cannot influence that request's own verdict. When it reveals a bot
+        // (navigator.webdriver, or a form filled inhumanly fast with no mouse
+        // movement), escalate a counter-scan now — subject to the same tor /
+        // never_scan / non-global guards as the request path.
+        let tells = crate::fingerprint::bot_tells(&payload.attrs, &payload.behavior);
+        if tells.webdriver || tells.inhuman_fill {
+            let canon = crate::net::canonical(ip);
+            let is_tor = state.tor.read().unwrap().contains(&ip);
+            let allowlisted = state.cfg.scan.never_scan.iter().any(|n| n.contains(&canon));
+            if !is_tor && !allowlisted && crate::net::is_scannable_target(ip) {
+                let level = if tells.inhuman_fill { 3 } else { 2 };
+                if let Ok(crate::store::scans::EnqueueOutcome::Queued(job_id)) = state
+                    .recorder
+                    .enqueue_scan(ip_id, level, state.cfg.scan.rescan_cooldown_hours)
+                    .await
+                    && let Ok(Some(job)) = state.store.queue_job(job_id).await
+                {
+                    state.notifier.publish(job);
+                }
+            }
+        }
     }
-    axum::Json(serde_json::json!({"ok": true})) // opaque ack (spec §8.3)
+    axum::Json(serde_json::json!({"ok": true})).into_response() // opaque ack (spec §8.3)
 }
 
 async fn panel_handler(
@@ -382,4 +518,93 @@ fn escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hm(entries: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for e in entries {
+            h.append(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_str(e).unwrap(),
+            );
+        }
+        h
+    }
+    fn trusted() -> Vec<IpNet> {
+        vec![
+            "10.0.0.0/8".parse().unwrap(),
+            "127.0.0.1/32".parse().unwrap(),
+        ]
+    }
+
+    #[test]
+    fn untrusted_peer_is_believed_over_any_xff() {
+        // A direct (untrusted) client cannot forge its address via XFF.
+        let ip = client_ip(&hm(&["1.2.3.4"]), "8.8.8.8".parse().unwrap(), &trusted());
+        assert_eq!(ip, "8.8.8.8".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn rightmost_untrusted_entry_wins() {
+        // peer is the trusted proxy; the proxy appended the real client last.
+        // A client-forged "9.9.9.9" earlier in the list must be ignored.
+        let ip = client_ip(
+            &hm(&["9.9.9.9", "203.0.113.9"]),
+            "10.0.0.1".parse().unwrap(),
+            &trusted(),
+        );
+        assert_eq!(ip, "203.0.113.9".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn trusted_hops_are_skipped() {
+        // Two trusted proxies in the chain; the client is the first untrusted
+        // entry walking right to left.
+        let ip = client_ip(
+            &hm(&["203.0.113.9", "10.0.0.2"]),
+            "10.0.0.1".parse().unwrap(),
+            &trusted(),
+        );
+        assert_eq!(ip, "203.0.113.9".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn multiple_header_lines_are_joined_newest_last() {
+        // HAProxy/nginx may emit several XFF lines; the last entry overall wins.
+        let ip = client_ip(
+            &hm(&["9.9.9.9", "203.0.113.42"]),
+            "10.0.0.1".parse().unwrap(),
+            &trusted(),
+        );
+        assert_eq!(ip, "203.0.113.42".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn non_ascii_xff_does_not_pin_on_proxy() {
+        // A garbage byte must not blank the header and pin everything on the
+        // proxy; the valid trailing entry is still used.
+        let mut h = HeaderMap::new();
+        h.append(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_bytes(b"\xff, 203.0.113.1").unwrap(),
+        );
+        let ip = client_ip(&h, "10.0.0.1".parse().unwrap(), &trusted());
+        assert_eq!(ip, "203.0.113.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn mapped_v4_proxy_is_recognised_as_trusted() {
+        // An IPv4-mapped IPv6 proxy address is canonicalised before the trust
+        // check, so XFF from it is honoured.
+        let ip = client_ip(
+            &hm(&["203.0.113.1"]),
+            "::ffff:10.0.0.1".parse().unwrap(),
+            &trusted(),
+        );
+        assert_eq!(ip, "203.0.113.1".parse::<IpAddr>().unwrap());
+    }
 }

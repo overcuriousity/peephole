@@ -26,6 +26,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0004_scan_arbiter.sql"),
     include_str!("migrations/0005_intel_files.sql"),
     include_str!("migrations/0006_repl_heads.sql"),
+    include_str!("migrations/0007_webauthn_states.sql"),
+    include_str!("migrations/0008_indexes.sql"),
 ];
 
 #[derive(Clone)]
@@ -39,6 +41,10 @@ impl Store {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            // NORMAL is durable under WAL (only a crash mid-checkpoint can lose
+            // the last transactions) and much cheaper than the FULL default,
+            // which fsyncs on every commit and throttles the inline write path.
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(10))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
@@ -199,8 +205,13 @@ impl Store {
             binds.push(v.clone());
         }
         if let Some(v) = &f.label {
-            sql.push_str(" AND r.labels_json LIKE ?");
-            binds.push(format!("%\"{v}\"%"));
+            // Exact label match via json_each, matching the admin search
+            // (a LIKE on the raw JSON would treat %/_ as wildcards and could
+            // match a label as a substring of another).
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM json_each(r.labels_json) je WHERE je.value = ?)",
+            );
+            binds.push(v.clone());
         }
         if let Some(v) = &f.min_severity {
             sql.push_str(" AND r.severity >= ?");

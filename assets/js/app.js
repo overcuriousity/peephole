@@ -76,7 +76,19 @@
     b.addEventListener("click", function () {
       on = !on;
       if (on && hex === null) {
-        var bytes = new TextEncoder().encode(text), lines = [];
+        // Decode the raw bytes from base64 so binary payloads and CR/LF show
+        // correctly; the data-text attribute is lossy UTF-8 with normalised
+        // newlines. Fall back to the text encoding if base64 is absent.
+        var bytes;
+        var b64 = pre.getAttribute("data-b64");
+        if (b64 != null) {
+          var bin = atob(b64);
+          bytes = new Uint8Array(bin.length);
+          for (var k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+        } else {
+          bytes = new TextEncoder().encode(text);
+        }
+        var lines = [];
         for (var i = 0; i < bytes.length; i += 16) {
           var chunk = Array.prototype.slice.call(bytes, i, i + 16);
           lines.push(i.toString(16).padStart(8, "0") + "  " + chunk.map(function (x) { return x.toString(16).padStart(2, "0"); }).join(" ").padEnd(48) + "  " +
@@ -112,23 +124,46 @@
     // The page's status/level filter applies to live rows too.
     var fStatus = qt.getAttribute("data-filter-status") || "", fLevel = qt.getAttribute("data-filter-level") || "";
     var matches = function (j) { return (!fStatus || j.status === fStatus) && (!fLevel || String(j.level) === fLevel); };
+    var COLS = 8;
     var apply = function (j) {
       var existing = tbody.querySelector('[data-job="' + j.id + '"]');
       if (!matches(j)) { if (existing) existing.remove(); return; }
       var empty = tbody.querySelector("[data-empty]"); if (empty) empty.remove();
       var fresh = row(j);
-      if (existing) tbody.replaceChild(fresh, existing); else tbody.insertBefore(fresh, tbody.firstChild);
+      if (existing) {
+        // Update in place; the row keeps its position (rows are id-ordered).
+        tbody.replaceChild(fresh, existing);
+      } else {
+        // Insert in descending-id order (newest first), matching the snapshot,
+        // so an update for an older job does not jump to the top.
+        var before = null, jid = Number(j.id);
+        var rows = tbody.querySelectorAll("[data-job]");
+        for (var i = 0; i < rows.length; i++) {
+          if (Number(rows[i].getAttribute("data-job")) < jid) { before = rows[i]; break; }
+        }
+        tbody.insertBefore(fresh, before);
+      }
       while (tbody.children.length > limit) tbody.removeChild(tbody.lastChild);
     };
     var snapshot = function (jobs) {
       tbody.innerHTML = "";
       jobs = jobs.filter(matches);
       jobs.slice(0, limit).forEach(function (j) { tbody.appendChild(row(j)); });
-      if (!jobs.length) { var tr = document.createElement("tr"); tr.setAttribute("data-empty", ""); var td = cell("empty", "Queue empty."); td.setAttribute("colspan", "7"); tr.appendChild(td); tbody.appendChild(tr); }
+      if (!jobs.length) { var tr = document.createElement("tr"); tr.setAttribute("data-empty", ""); var td = cell("empty", "Queue empty."); td.setAttribute("colspan", String(COLS)); tr.appendChild(td); tbody.appendChild(tr); }
     };
     var es = new EventSource(qt.getAttribute("data-src"));
     es.addEventListener("open", function () { setLive("open", "live"); });
-    es.addEventListener("error", function () { setLive("reconnecting", "reconnecting…"); });
+    es.addEventListener("error", function () {
+      // A permanently closed stream (session ended → the reconnect is
+      // redirected to /login and is not an event stream) stays stuck on
+      // "reconnecting". Surface it instead, and reload so the redirect lands.
+      if (es.readyState === EventSource.CLOSED) {
+        setLive("closed", "disconnected");
+        setTimeout(function () { location.reload(); }, 2000);
+      } else {
+        setLive("reconnecting", "reconnecting…");
+      }
+    });
     es.addEventListener("snapshot", function (ev) { try { snapshot(JSON.parse(ev.data)); } catch (e) {} });
     es.addEventListener("job", function (ev) { try { apply(JSON.parse(ev.data)); } catch (e) {} });
   }

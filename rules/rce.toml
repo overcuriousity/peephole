@@ -1,9 +1,29 @@
-[[rule]]
-label = "rce"
-weight = 4
-target_regex = ";\\s*(id|whoami|cat\\s+/etc)|\\|\\s*(nc|curl|wget)\\s|\\$\\(.*\\)|`.*`|/bin/(sh|bash)|cmd\\.exe|powershell"
+# Remote code execution and command injection. Runs against raw and decoded
+# forms, and the header rule inspects every request header.
 
 [[rule]]
 label = "rce"
 weight = 4
-body_regex = "/bin/(sh|bash)|cmd\\.exe|powershell|\\|\\s*(nc|curl|wget)\\s"
+# Command separators and tooling. \b after id/whoami so "id" does not match
+# "idx=". $(...) and `...` command substitution, pipes into nc/curl/wget,
+# shells and Windows interpreters.
+target_regex = ";\\s*(id|whoami|uname|cat\\s+/etc)\\b|\\|\\s*(nc|curl|wget)\\s|\\$\\(.*\\)|`.*`|/bin/(sh|bash)|cmd\\.exe|powershell"
+
+[[rule]]
+label = "rce"
+weight = 4
+body_regex = "/bin/(sh|bash)|cmd\\.exe|powershell|\\|\\s*(nc|curl|wget)\\s|;\\s*(id|whoami|uname)\\b"
+
+[[rule]]
+label = "rce"
+weight = 4
+# Shellshock — () { :;}; — in any header (classically User-Agent/Referer),
+# and Log4Shell ${jndi:...} JNDI lookups (also ${lower:...}/${env:...}
+# obfuscation) in any header.
+header_regex = "\\(\\s*\\)\\s*\\{|\\$\\{jndi:|\\$\\{(lower|upper|env|sys|date):"
+
+[[rule]]
+label = "rce"
+weight = 4
+# Log4Shell / template-injection lookups in the URL or body too.
+target_regex = "\\$\\{jndi:|\\$\\{(lower|upper|env|sys):"

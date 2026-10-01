@@ -25,6 +25,17 @@ pub struct ExportRow {
     pub is_tor: bool,
 }
 
+/// Neutralise spreadsheet formula injection: a cell that a spreadsheet would
+/// evaluate because it starts with = + - @ (or a leading tab/CR that some
+/// apps strip first) is prefixed with a single quote. Attacker-controlled
+/// fields (path, query, method, ASN org) can otherwise execute on open.
+fn csv_safe(s: &str) -> std::borrow::Cow<'_, str> {
+    match s.chars().next() {
+        Some('=' | '+' | '-' | '@' | '\t' | '\r') => std::borrow::Cow::Owned(format!("'{s}")),
+        _ => std::borrow::Cow::Borrowed(s),
+    }
+}
+
 pub fn requests_csv(rows: &[ExportRow]) -> String {
     // Header unquoted; data rows fully quoted (fields like joined labels are
     // always delimited, keeping downstream parsing unambiguous).
@@ -37,17 +48,17 @@ pub fn requests_csv(rows: &[ExportRow]) -> String {
         .from_writer(vec![]);
     for r in rows {
         w.write_record([
-            r.ts.as_str(),
-            r.ip.as_str(),
-            r.method.as_str(),
-            r.path.as_str(),
-            r.query.as_deref().unwrap_or(""),
+            csv_safe(&r.ts).as_ref(),
+            csv_safe(&r.ip).as_ref(),
+            csv_safe(&r.method).as_ref(),
+            csv_safe(&r.path).as_ref(),
+            csv_safe(r.query.as_deref().unwrap_or("")).as_ref(),
             &r.severity.to_string(),
             &r.scan_level.to_string(),
-            &r.labels.join(";"),
-            r.country.as_deref().unwrap_or(""),
+            csv_safe(&r.labels.join(";")).as_ref(),
+            csv_safe(r.country.as_deref().unwrap_or("")).as_ref(),
             &r.asn.map(|a| a.to_string()).unwrap_or_default(),
-            r.asn_org.as_deref().unwrap_or(""),
+            csv_safe(r.asn_org.as_deref().unwrap_or("")).as_ref(),
             if r.is_tor { "1" } else { "0" },
         ])
         .unwrap();
@@ -60,13 +71,20 @@ pub fn requests_csv(rows: &[ExportRow]) -> String {
 pub fn requests_timesketch(rows: &[ExportRow]) -> String {
     let mut out = String::new();
     for r in rows {
+        // Stored timestamps are "YYYY-MM-DD HH:MM:SS" (UTC); emit RFC 3339 so
+        // Timesketch parses them unambiguously.
+        let full_path = match &r.query {
+            Some(q) if !q.is_empty() => format!("{}?{}", r.path, q),
+            _ => r.path.clone(),
+        };
         let v = serde_json::json!({
-            "datetime": r.ts,
+            "datetime": iso8601(&r.ts),
             "timestamp_desc": "HTTP request logged",
-            "message": format!("{} {} {} (severity {}, labels: {})", r.ip, r.method, r.path, r.severity, r.labels.join(",")),
+            "message": format!("{} {} {} (severity {}, labels: {})", r.ip, r.method, full_path, r.severity, r.labels.join(",")),
             "source_ip": r.ip,
             "method": r.method,
             "path": r.path,
+            "query": r.query,
             "severity": r.severity,
             "scan_level": r.scan_level,
             "labels": r.labels,
@@ -79,6 +97,18 @@ pub fn requests_timesketch(rows: &[ExportRow]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Convert a stored "YYYY-MM-DD HH:MM:SS" UTC timestamp to RFC 3339. Values
+/// already carrying a `T`/timezone (or unparseable) pass through unchanged.
+fn iso8601(ts: &str) -> String {
+    if ts.contains('T') {
+        return ts.to_string();
+    }
+    match chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S") {
+        Ok(dt) => dt.and_utc().to_rfc3339(),
+        Err(_) => ts.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -113,11 +143,27 @@ mod tests {
     }
 
     #[test]
+    fn csv_neutralises_formula_injection() {
+        let mut r = row();
+        r.query = Some("=HYPERLINK(\"http://evil\")".into());
+        r.method = "-2+3".into();
+        let csv = requests_csv(&[r]);
+        // The dangerous cells are prefixed with a single quote.
+        assert!(csv.contains("\"'=HYPERLINK"), "{csv}");
+        assert!(csv.contains("\"'-2+3\""), "{csv}");
+    }
+
+    #[test]
     fn timesketch_lines_have_required_fields() {
-        let out = requests_timesketch(&[row()]);
+        let mut r = row();
+        r.ts = "2026-09-29 12:00:00".into();
+        r.query = Some("id=1".into());
+        let out = requests_timesketch(&[r]);
         let v: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
-        assert_eq!(v["datetime"], "2026-09-29T12:00:00Z");
-        assert!(v["message"].as_str().unwrap().contains("/.env"));
+        // "YYYY-MM-DD HH:MM:SS" is emitted as RFC 3339.
+        assert_eq!(v["datetime"], "2026-09-29T12:00:00+00:00");
+        assert!(v["message"].as_str().unwrap().contains("/.env?id=1"));
+        assert_eq!(v["query"], "id=1");
         assert_eq!(v["timestamp_desc"], "HTTP request logged");
         assert_eq!(v["source_ip"], "203.0.113.5");
     }

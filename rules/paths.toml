@@ -1,14 +1,17 @@
-[[rule]]
-label = "sensitive-path"
-weight = 2
-path_exact = "/.env"
+# Sensitive files and admin surfaces. Matching is case-insensitive and runs
+# against both the raw and the percent-decoded path+query, so encoded probes
+# are caught too.
 
 [[rule]]
 label = "sensitive-path"
 weight = 2
-path_exact = "/.git/config"
+# Dotfiles and secrets: /.env (+ .env.bak, /api/.env), /.git/*, SSH/AWS keys,
+# .htpasswd/.htaccess. Anchored at a path segment boundary.
+target_regex = "(^|/)\\.(env|git|aws|ssh|svn|hg|htpasswd|htaccess|ds_store|bash_history|npmrc)(/|\\.|$)"
 
 [[rule]]
 label = "sensitive-path"
 weight = 2
-target_regex = "/wp-(login|admin|content|includes)|/phpmyadmin|/\\.well-known/|/xmlrpc\\.php|/cgi-bin/"
+# Common admin / CMS probes. /.well-known/ is intentionally omitted: ACME
+# challenges, security.txt and Chrome's traffic-advice are legitimate.
+target_regex = "/wp-(login|admin|content|includes)|/phpmyadmin|/xmlrpc\\.php|/cgi-bin/|/administrator/|/actuator/|/wp-config\\.php"

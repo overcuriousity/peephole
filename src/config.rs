@@ -135,9 +135,14 @@ pub struct ScanConfig {
     pub rescan_cooldown_hours: i64,
     #[serde(default = "default_rate")]
     pub max_scans_per_hour: i64,
+    /// Delete requests and scan results older than this many days. Default 90;
+    /// 0 disables pruning (keep forever). Bounds unbounded database growth.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
     #[serde(default)]
     pub never_scan: Vec<IpNet>,
-    /// Optional per-level argv overrides; `{target}` is replaced with the IP.
+    /// Optional per-level argv overrides. The target IP is appended as the
+    /// final argument (there is no `{target}` placeholder).
     #[serde(default)]
     pub level_argv: std::collections::HashMap<u8, Vec<String>>,
 }
@@ -155,6 +160,9 @@ fn default_cooldown() -> i64 {
 fn default_rate() -> i64 {
     30
 }
+fn default_retention_days() -> u32 {
+    90
+}
 
 impl Default for ScanConfig {
     fn default() -> Self {
@@ -163,6 +171,7 @@ impl Default for ScanConfig {
             timeout_secs: default_timeout(),
             rescan_cooldown_hours: default_cooldown(),
             max_scans_per_hour: default_rate(),
+            retention_days: default_retention_days(),
             never_scan: vec![],
             level_argv: Default::default(),
         }
@@ -181,6 +190,7 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("scan", "timeout_secs", "1800"),
     ("scan", "rescan_cooldown_hours", "24"),
     ("scan", "max_scans_per_hour", "30"),
+    ("scan", "retention_days", "90"),
     ("scan", "never_scan", "[]"),
 ];
 
@@ -271,15 +281,50 @@ impl Config {
         {
             bail!("[maxmind] needs both account_id and license_key (or omit the section)");
         }
+        // [scan]: reject values that are accepted by serde but break scanning
+        // (e.g. a 5s timeout fails every scan; a negative cooldown builds a
+        // NULL datetime that silently disables the cooldown).
+        // Bounds mirror the runtime pace limits (scan::pace) so the config
+        // defaults are always a valid pace.
+        let s = &self.scan;
+        if !(1..=crate::scan::pace::MAX_WORKERS).contains(&s.max_workers) {
+            bail!(
+                "scan.max_workers must be between 1 and {}",
+                crate::scan::pace::MAX_WORKERS
+            );
+        }
+        if !(crate::scan::pace::MIN_TIMEOUT..=crate::scan::pace::MAX_TIMEOUT)
+            .contains(&s.timeout_secs)
+        {
+            bail!(
+                "scan.timeout_secs must be between {} and {}",
+                crate::scan::pace::MIN_TIMEOUT,
+                crate::scan::pace::MAX_TIMEOUT
+            );
+        }
+        if s.rescan_cooldown_hours < 0 {
+            bail!("scan.rescan_cooldown_hours must not be negative");
+        }
+        if !(1..=crate::scan::pace::MAX_PER_HOUR).contains(&s.max_scans_per_hour) {
+            bail!(
+                "scan.max_scans_per_hour must be between 1 and {}",
+                crate::scan::pace::MAX_PER_HOUR
+            );
+        }
+        for level in s.level_argv.keys() {
+            if !(1..=4).contains(level) {
+                bail!("scan.level_argv: level {level} is out of range (1..=4)");
+            }
+        }
         if let Some(c) = &self.cluster {
             if c.node_name.trim().is_empty() {
                 bail!("cluster.node_name must be set");
             }
-            if c.lease_secs < 10 {
-                bail!("cluster.lease_secs must be at least 10");
+            if !(10..=86_400).contains(&c.lease_secs) {
+                bail!("cluster.lease_secs must be between 10 and 86400");
             }
-            if c.takeover_hours.is_nan() || c.takeover_hours <= 0.0 {
-                bail!("cluster.takeover_hours must be positive");
+            if !c.takeover_hours.is_finite() || c.takeover_hours <= 0.0 {
+                bail!("cluster.takeover_hours must be a positive, finite number");
             }
             for p in &c.peers {
                 crate::cluster::identity::NodeId::parse(&p.public_key)

@@ -41,8 +41,11 @@ pub async fn backfill_geo(rec: &Recorder, geo: &RwLock<Option<geo::GeoIp>>) {
 
 async fn is_stale(store: &Store, key: &str) -> bool {
     match store.intel_get(key).await {
+        // Stale once ~23h old. The scheduler sleeps 24h + up to 1h of jitter,
+        // so a `> 24h` test (with truncating num_hours) would read 24 and skip
+        // the refresh every other cycle, stretching "daily" to ~48h.
         Ok(Some(v)) => chrono::DateTime::parse_from_rfc3339(&v)
-            .map(|t| chrono::Utc::now().signed_duration_since(t).num_hours() > 24)
+            .map(|t| chrono::Utc::now().signed_duration_since(t) >= chrono::Duration::hours(23))
             .unwrap_or(true),
         _ => true,
     }
@@ -94,12 +97,15 @@ pub async fn run_scheduler(
                         Ok(g) => {
                             *geo.write().unwrap() = Some(g);
                             backfill_geo(&rec, &geo).await;
+                            // Record success only after the new databases load,
+                            // so a bad download is retried on the next tick
+                            // rather than waiting out the full day.
+                            let _ = store
+                                .intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339())
+                                .await;
                         }
-                        Err(e) => warn!(?e, "maxmind reload failed"),
+                        Err(e) => warn!(?e, "maxmind reload failed; will retry"),
                     }
-                    let _ = store
-                        .intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339())
-                        .await;
                 }
                 Err(e) => warn!(?e, "maxmind download failed; keeping previous"),
             }
