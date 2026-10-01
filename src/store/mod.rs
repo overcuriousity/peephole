@@ -11,7 +11,12 @@ use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::path::Path;
 
-const MIGRATIONS: &str = include_str!("schema.sql");
+/// Schema migrations, applied in order. `PRAGMA user_version` records how
+/// many have run. Append new files only; never edit a shipped one. Each file
+/// is split on `;`, so statements must not contain semicolons themselves.
+/// 0001 is idempotent (`IF NOT EXISTS`) so databases from before versioning
+/// (user_version 0, tables present) pass through it unharmed.
+const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_initial.sql")];
 
 #[derive(Clone)]
 pub struct Store {
@@ -24,24 +29,77 @@ impl Store {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(10))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
             .connect_with(opts)
             .await
             .context("opening sqlite")?;
-        for stmt in MIGRATIONS
-            .split(';')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            sqlx::query(sqlx::AssertSqlSafe(stmt))
-                .execute(&pool)
-                .await
-                .context("migration")?;
-        }
+        migrate(&pool, MIGRATIONS).await?;
         Ok(Self { pool })
     }
+
+    /// Schema version of the open database.
+    pub async fn schema_version(&self) -> anyhow::Result<i64> {
+        Ok(sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+}
+
+/// Apply pending migrations, each in its own write transaction so a second
+/// process (the CLI) racing the daemon cannot apply one twice.
+async fn migrate(pool: &sqlx::SqlitePool, migrations: &[&str]) -> anyhow::Result<()> {
+    let mut conn = pool.acquire().await?;
+    for (i, sql) in migrations.iter().enumerate() {
+        let target = i as i64 + 1;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let applied = async {
+            let current: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *conn)
+                .await?;
+            if current >= target {
+                return Ok(());
+            }
+            for stmt in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                sqlx::query(sqlx::AssertSqlSafe(stmt))
+                    .execute(&mut *conn)
+                    .await
+                    .with_context(|| format!("migration {target}"))?;
+            }
+            // PRAGMA takes no bind parameters; target is our own integer.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA user_version = {target}"
+            )))
+            .execute(&mut *conn)
+            .await?;
+            anyhow::Ok(())
+        }
+        .await;
+        match applied {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(e);
+            }
+        }
+    }
+    let current: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *conn)
+        .await?;
+    if current > migrations.len() as i64 {
+        // A newer build migrated this database (e.g. before an installer
+        // rollback). Migrations are additive, so keep going.
+        tracing::warn!(
+            schema = current,
+            known = migrations.len(),
+            "database schema is newer than this build"
+        );
+    }
+    Ok(())
 }
 
 impl Store {
@@ -175,5 +233,69 @@ impl Store {
                 },
             )
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fresh_database_reaches_latest_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        assert_eq!(s.schema_version().await.unwrap(), MIGRATIONS.len() as i64);
+        // Reconnecting is a no-op.
+        drop(s);
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        assert_eq!(s.schema_version().await.unwrap(), MIGRATIONS.len() as i64);
+    }
+
+    /// Databases created before versioning have the tables but user_version 0.
+    #[tokio::test]
+    async fn pre_versioning_database_is_adopted_with_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let opts = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+            for stmt in MIGRATIONS[0]
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                sqlx::query(sqlx::AssertSqlSafe(stmt))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            sqlx::query("INSERT INTO settings (key, value) VALUES ('k','v')")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+        let s = Store::connect(&path).await.unwrap();
+        assert_eq!(s.schema_version().await.unwrap(), MIGRATIONS.len() as i64);
+        assert_eq!(s.setting_get("k").await.unwrap().as_deref(), Some("v"));
+    }
+
+    #[tokio::test]
+    async fn failed_migration_rolls_back_and_keeps_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let bad = [
+            MIGRATIONS[0],
+            "CREATE TABLE t2 (x INTEGER); SELECT * FROM missing",
+        ];
+        assert!(migrate(&s.pool, &bad).await.is_err());
+        assert_eq!(s.schema_version().await.unwrap(), 1);
+        let t2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 't2'")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(t2, 0, "partial migration must not persist");
     }
 }

@@ -955,6 +955,65 @@ max_scans_per_hour = 100
     handle.abort();
 }
 
+/// A free localhost port (bound, then released for the code under test).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// `web = false`: the trap serves, the admin listener is never bound.
+#[tokio::test]
+async fn run_without_web_role_binds_no_admin_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    let (trap, admin) = (free_port(), free_port());
+    let cfg_text = format!(
+        r#"
+trap_listen = "127.0.0.1:{trap}"
+admin_listen = "127.0.0.1:{admin}"
+database_path = "{db}"
+data_dir = "{d}"
+rules_dir = "rules"
+[roles]
+scanner = false
+web = false
+"#,
+        db = dir.path().join("t.db").display(),
+        d = dir.path().display()
+    );
+    let cfg_path = dir.path().join("c.toml");
+    std::fs::write(&cfg_path, &cfg_text).unwrap();
+    let handle = tokio::spawn(peephole::run(cfg_path));
+    let client = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let resp = loop {
+        match client
+            .get(format!("http://127.0.0.1:{trap}/probe"))
+            .send()
+            .await
+        {
+            Ok(r) => break r,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await
+            }
+            Err(e) => panic!("trap never came up: {e}"),
+        }
+    };
+    assert_eq!(resp.status(), 404);
+    assert!(
+        client
+            .get(format!("http://127.0.0.1:{admin}/"))
+            .send()
+            .await
+            .is_err(),
+        "admin listener must not be bound without the web role"
+    );
+    assert!(!handle.is_finished());
+    handle.abort();
+}
+
 fn fake_nmap(dir: &std::path::Path) -> String {
     let fake = dir.join("fake-nmap");
     std::fs::write(&fake, "#!/bin/sh\ncat \"$(dirname \"$0\")/nmap.xml\"\n").unwrap();

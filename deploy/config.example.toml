@@ -1,6 +1,12 @@
 # peephole configuration
 # Copy to /etc/peephole/config.toml and edit.
 
+# What this deployment does. All three are on when the section is absent.
+# [roles]
+# listener = true   # trap listener (needs trap_listen, rules_dir)
+# scanner  = true   # nmap counter-scans (needs nmap)
+# web      = true   # wall of shame + admin area (needs admin_listen, [webauthn])
+
 # Trap listener: HAProxy routes fallback (nonexistent-route) traffic here directly.
 trap_listen = "0.0.0.0:8080"
 # Admin listener: nginx terminates TLS in front of this.
@@ -26,6 +32,7 @@ rp_name = "peephole"
 secure_cookies = true
 
 [maxmind]
+# Optional. Without it GeoIP enrichment is off.
 # GeoLite2 account credentials (https://www.maxmind.com/en/accounts/current/license-key).
 account_id = "123456"
 license_key = "testkey"

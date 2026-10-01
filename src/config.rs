@@ -6,17 +6,62 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    pub trap_listen: SocketAddr,
-    pub admin_listen: SocketAddr,
+    #[serde(default)]
+    pub roles: Roles,
+    /// Required with the listener role.
+    pub trap_listen: Option<SocketAddr>,
+    /// Required with the web role.
+    pub admin_listen: Option<SocketAddr>,
     pub database_path: PathBuf,
     pub data_dir: PathBuf,
-    pub rules_dir: PathBuf,
+    /// Required with the listener role.
+    pub rules_dir: Option<PathBuf>,
     #[serde(default)]
     pub trusted_proxies: Vec<IpNet>,
-    pub webauthn: WebauthnConfig,
-    pub maxmind: MaxmindConfig,
+    /// Required with the web role.
+    pub webauthn: Option<WebauthnConfig>,
+    /// Optional: without credentials GeoIP enrichment is unavailable.
+    pub maxmind: Option<MaxmindConfig>,
     #[serde(default)]
     pub scan: ScanConfig,
+}
+
+/// What this deployment does. All on by default (a single standalone node).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+pub struct Roles {
+    /// Trap listener: records and classifies requests, enqueues scans.
+    #[serde(default = "default_true")]
+    pub listener: bool,
+    /// nmap workers that run counter-scans.
+    #[serde(default = "default_true")]
+    pub scanner: bool,
+    /// Public wall of shame and the FIDO2 admin area.
+    #[serde(default = "default_true")]
+    pub web: bool,
+}
+
+impl Default for Roles {
+    fn default() -> Self {
+        Self {
+            listener: true,
+            scanner: true,
+            web: true,
+        }
+    }
+}
+
+impl Roles {
+    /// Enabled roles in a fixed order, for logs and summaries.
+    pub fn names(&self) -> Vec<&'static str> {
+        [
+            (self.listener, "listener"),
+            (self.scanner, "scanner"),
+            (self.web, "web"),
+        ]
+        .into_iter()
+        .filter_map(|(on, n)| on.then_some(n))
+        .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,6 +132,9 @@ impl Default for ScanConfig {
 /// Optional settings and their defaults, so `check-config` can point out
 /// keys an older config predates. (`table`, `key`, `default`)
 const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
+    ("roles", "listener", "true"),
+    ("roles", "scanner", "true"),
+    ("roles", "web", "true"),
     ("", "trusted_proxies", "[]"),
     ("webauthn", "secure_cookies", "true"),
     ("scan", "max_workers", "2"),
@@ -95,6 +143,9 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("scan", "max_scans_per_hour", "30"),
     ("scan", "never_scan", "[]"),
 ];
+
+/// Sections that are required when their role is on and unused otherwise.
+const REQUIRED_BY_ROLE: &[&str] = &["webauthn"];
 
 /// One human-readable note per optional key the file does not set.
 /// Unparsable files yield no notes; `load` reports those errors.
@@ -113,6 +164,9 @@ pub fn optional_key_notes(path: &Path) -> Vec<String> {
         } else {
             match doc.get(*table) {
                 Some(t) => t.get(*key).is_some(),
+                // A missing role-specific section is a load error (or the
+                // role is off), not a defaults note.
+                None if REQUIRED_BY_ROLE.contains(table) => continue,
                 None => {
                     missing_tables.insert(*table);
                     continue;
@@ -143,10 +197,49 @@ impl Config {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let cfg: Config = toml::from_str(&text).context("parsing config.toml")?;
-        if cfg.webauthn.rp_id.is_empty() || cfg.webauthn.origin.starts_with("http://") {
-            bail!("webauthn.rp_id must be set and origin must be https");
-        }
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Role-dependent requirements that serde cannot express.
+    fn validate(&self) -> anyhow::Result<()> {
+        let r = self.roles;
+        if !(r.listener || r.scanner || r.web) {
+            bail!("[roles]: enable at least one of listener, scanner, web");
+        }
+        if r.listener {
+            if self.trap_listen.is_none() {
+                bail!("trap_listen is required with roles.listener");
+            }
+            if self.rules_dir.is_none() {
+                bail!("rules_dir is required with roles.listener");
+            }
+        }
+        if r.web {
+            if self.admin_listen.is_none() {
+                bail!("admin_listen is required with roles.web");
+            }
+            let Some(w) = &self.webauthn else {
+                bail!("[webauthn] is required with roles.web");
+            };
+            if w.rp_id.is_empty() || w.origin.starts_with("http://") {
+                bail!("webauthn.rp_id must be set and origin must be https");
+            }
+        }
+        if let Some(m) = &self.maxmind
+            && (m.account_id.is_empty() || m.license_key.is_empty())
+        {
+            bail!("[maxmind] needs both account_id and license_key (or omit the section)");
+        }
+        Ok(())
+    }
+
+    /// The `[webauthn]` section. Only call with the web role on:
+    /// [`Config::load`] guarantees it is present then.
+    pub fn webauthn(&self) -> &WebauthnConfig {
+        self.webauthn
+            .as_ref()
+            .expect("[webauthn] is validated by Config::load when roles.web is on")
     }
 
     /// Default nmap arguments per scan level (spec §5), without the target.
@@ -237,8 +330,9 @@ never_scan = ["192.168.0.0/16"]
         )
         .unwrap();
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.trap_listen.to_string(), "0.0.0.0:8080");
-        assert_eq!(cfg.webauthn.rp_id, "peephole.example.net");
+        assert_eq!(cfg.trap_listen.unwrap().to_string(), "0.0.0.0:8080");
+        assert_eq!(cfg.webauthn().rp_id, "peephole.example.net");
+        assert_eq!(cfg.roles, Roles::default(), "no [roles] means all on");
         assert_eq!(cfg.scan.max_workers, 2);
         assert_eq!(cfg.scan.never_scan.len(), 1);
         assert!(cfg.default_level_argv(4).iter().any(|a| a == "-sS"));
@@ -266,5 +360,83 @@ license_key = "k"
         .unwrap();
         assert!(Config::load(&path).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn parse(text: &str) -> anyhow::Result<Config> {
+        let cfg: Config = toml::from_str(text)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    const BASE: &str = r#"
+database_path = "/tmp/x.db"
+data_dir = "/tmp"
+"#;
+
+    #[test]
+    fn scanner_only_needs_no_listener_web_or_maxmind() {
+        let cfg = parse(&format!("{BASE}[roles]\nlistener = false\nweb = false\n")).unwrap();
+        assert_eq!(cfg.roles.names(), ["scanner"]);
+        assert!(cfg.maxmind.is_none() && cfg.webauthn.is_none());
+    }
+
+    #[test]
+    fn each_role_requires_its_settings() {
+        // listener without trap_listen / rules_dir
+        let e = parse(&format!(
+            "{BASE}rules_dir = \"r\"\n[roles]\nscanner = false\nweb = false\n"
+        ))
+        .unwrap_err();
+        assert!(e.to_string().contains("trap_listen"), "{e}");
+        let e = parse(&format!(
+            "trap_listen = \"0.0.0.0:1\"\n{BASE}[roles]\nscanner = false\nweb = false\n"
+        ))
+        .unwrap_err();
+        assert!(e.to_string().contains("rules_dir"), "{e}");
+        // web without admin_listen / [webauthn]
+        let e = parse(&format!(
+            "{BASE}[roles]\nlistener = false\nscanner = false\n"
+        ))
+        .unwrap_err();
+        assert!(e.to_string().contains("admin_listen"), "{e}");
+        let e = parse(&format!(
+            "admin_listen = \"127.0.0.1:1\"\n{BASE}[roles]\nlistener = false\nscanner = false\n"
+        ))
+        .unwrap_err();
+        assert!(e.to_string().contains("[webauthn]"), "{e}");
+        // listener-only with what it needs
+        let cfg = parse(&format!(
+            "trap_listen = \"0.0.0.0:1\"\nrules_dir = \"r\"\n{BASE}[roles]\nscanner = false\nweb = false\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.roles.names(), ["listener"]);
+    }
+
+    #[test]
+    fn no_roles_is_rejected() {
+        let e = parse(&format!(
+            "{BASE}[roles]\nlistener = false\nscanner = false\nweb = false\n"
+        ))
+        .unwrap_err();
+        assert!(e.to_string().contains("at least one"), "{e}");
+    }
+
+    #[test]
+    fn empty_maxmind_credentials_are_rejected() {
+        let e = parse(&format!(
+            "{BASE}[roles]\nlistener = false\nweb = false\n[maxmind]\naccount_id = \"\"\nlicense_key = \"k\"\n"
+        ))
+        .unwrap_err();
+        assert!(e.to_string().contains("maxmind"), "{e}");
+    }
+
+    #[test]
+    fn notes_skip_webauthn_when_section_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, format!("{BASE}[roles]\nweb = false\n")).unwrap();
+        let notes = optional_key_notes(&path).join("\n");
+        assert!(!notes.contains("webauthn"), "{notes}");
+        assert!(notes.contains("roles.listener"), "{notes}");
     }
 }

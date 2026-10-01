@@ -31,7 +31,8 @@ pub struct TrapState {
 
 impl TrapState {
     pub fn for_test(store: Store, cfg: Config) -> Self {
-        let classifier = Classifier::from_dir(&cfg.rules_dir).expect("rules");
+        let classifier =
+            Classifier::from_dir(cfg.rules_dir.as_ref().expect("rules_dir")).expect("rules");
         Self {
             store,
             cfg,

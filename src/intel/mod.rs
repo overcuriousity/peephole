@@ -56,6 +56,9 @@ pub async fn run_scheduler(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     backfill_geo(&store, &geo).await;
+    if cfg.maxmind.is_none() && geo.read().unwrap().is_none() {
+        warn!("no [maxmind] credentials and no GeoLite2 databases: GeoIP enrichment is off");
+    }
     let mut first = true;
     loop {
         if first || is_stale(&store, "tor_last_fetch").await {
@@ -74,14 +77,10 @@ pub async fn run_scheduler(
             }
         }
         let geo_missing = geo.read().unwrap().is_none();
-        if geo_missing || is_stale(&store, "maxmind_last_fetch").await {
-            match geo::download(
-                &cfg.data_dir,
-                &cfg.maxmind.account_id,
-                &cfg.maxmind.license_key,
-            )
-            .await
-            {
+        if let Some(mm) = &cfg.maxmind
+            && (geo_missing || is_stale(&store, "maxmind_last_fetch").await)
+        {
+            match geo::download(&cfg.data_dir, &mm.account_id, &mm.license_key).await {
                 Ok(()) => {
                     info!("maxmind databases refreshed");
                     match geo::GeoIp::load(&cfg.data_dir) {

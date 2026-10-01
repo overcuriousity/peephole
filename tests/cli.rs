@@ -88,3 +88,40 @@ license_key = "k"
         .unwrap();
     assert!(!out.status.success());
 }
+
+/// Nodes without the scanner role don't need nmap, and nodes without the
+/// web role need no [webauthn]; neither needs [maxmind].
+#[test]
+fn check_config_listener_only_needs_no_nmap_or_webauthn() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("c.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"
+trap_listen = "127.0.0.1:0"
+database_path = "{d}/t.db"
+data_dir = "{d}"
+rules_dir = "rules"
+[roles]
+scanner = false
+web = false
+"#,
+            d = dir.path().display()
+        ),
+    )
+    .unwrap();
+    let out = bin()
+        .env("PEEPHOLE_NMAP_PATH", "/nonexistent/nmap")
+        .args(["check-config", cfg.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("roles: listener"), "{stdout}");
+    assert!(!stdout.contains("webauthn"), "{stdout}");
+}
