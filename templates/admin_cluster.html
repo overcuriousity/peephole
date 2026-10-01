@@ -35,6 +35,7 @@
       <tr{% if !m.active %} class="muted"{% endif %}>
         <td><b>{{ m.name }}</b> <span class="mono muted">{{ m.short }}</span>{% if !m.active %} <span class="badge badge-status" data-status="failed">revoked</span>{% endif %}
           {% if m.incompatible %}<br><span class="badge badge-status" data-status="failed">incompatible version</span>{% endif %}
+          {% if let Some(s) = m.skew %}<br><span class="badge badge-status" data-status="running" title="Run NTP on every node: scan cooldowns compare timestamps from different nodes.">clock {{ s }}</span>{% endif %}
           {% if let Some(e) = m.error %}<br><span class="muted mono small">{{ e }}</span>{% endif %}</td>
         <td>{{ m.roles }}</td>
         <td class="mono">{{ m.address }}</td>

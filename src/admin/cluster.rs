@@ -46,6 +46,25 @@ pub struct MemberView {
     pub lag: String,
     pub error: Option<String>,
     pub incompatible: bool,
+    /// Clock difference worth a warning (cooldowns compare timestamps
+    /// written by different nodes), e.g. "+3.5 min".
+    pub skew: Option<String>,
+}
+
+/// A fresh heartbeat's creation time against our clock at receipt. Gossip
+/// delay makes peers look behind by up to ~40 s, so only larger gaps count.
+fn clock_skew(k: &crate::cluster::status::Known) -> Option<String> {
+    const WARN_MS: i64 = 120_000;
+    if k.advanced.elapsed() > std::time::Duration::from_secs(20) {
+        return None;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    let received_ms = now_ms - k.advanced.elapsed().as_millis() as i64;
+    let skew = k.hb.at_ms as i64 - received_ms;
+    (skew.abs() > WARN_MS).then(|| format!("{:+.1} min", skew as f64 / 60_000.0))
 }
 
 pub struct IntelView {
@@ -158,6 +177,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
                 .as_deref()
                 .is_some_and(|e| e.contains("incompatible protocol")),
             error,
+            skew: known.as_ref().and_then(clock_skew),
         };
         if is_self {
             mine = Some(v);
@@ -183,6 +203,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
         lag: "—".into(),
         error: None,
         incompatible: false,
+        skew: None,
     });
     Ok((mine, out))
 }

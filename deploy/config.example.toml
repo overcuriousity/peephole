@@ -49,9 +49,11 @@ never_scan = ["192.168.0.0/16"] # CIDRs never counter-scanned (own infra, monito
 # [scan.level_argv]
 # 2 = ["-Pn", "-sS", "-sV", "-T3", "--top-ports", "2000"]
 
-# Distributed mode: share requests, scan queue and results with other nodes.
-# Absent: standalone. The node key is created on first start; print it with
-# `peephole cluster id`.
+# Distributed mode: share requests, scan queue, results and intel with other
+# nodes (README: Distributed mode). Absent: standalone. The node key is
+# created on first start; print it with `peephole cluster id`. Add nodes with
+# `peephole cluster invite` / `peephole cluster join <token>` or list them
+# below. Open `listen` to the other nodes only.
 # [cluster]
 # node_name = "server-a"            # shown in the admin UI only
 # listen    = "0.0.0.0:7443"        # RPC listener (mutual TLS, pinned keys)
