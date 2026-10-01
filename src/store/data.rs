@@ -8,8 +8,8 @@
 //! already deleted are dropped instead of resurrecting it.
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{
-    FingerprintRec, FpClaimRec, IpEnrichRec, JobStatusRec, PortRec, Record, RequestRec, ScanJobRec,
-    ScanResultRec, TombTarget, TombstoneRec,
+    FingerprintRec, FpClaimRec, IpEnrichRec, JobAdoptRec, JobStatusRec, PortRec, Record,
+    RequestRec, ScanJobRec, ScanResultRec, TombTarget, TombstoneRec,
 };
 use anyhow::Result;
 use sqlx::SqliteConnection;
@@ -54,6 +54,7 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
         Record::Fingerprint(r) => fingerprint(conn, ctx, r).await,
         Record::ScanJob(r) => scan_job(conn, ctx, r).await,
         Record::JobStatus(r) => job_status(conn, ctx, r).await,
+        Record::JobAdopt(r) => job_adopt(conn, ctx, r).await,
         Record::ScanResult(r) => scan_result(conn, ctx, r).await,
         Record::Tombstone(t) => tombstone(conn, ctx, t).await,
         Record::MemberAdd(_) | Record::MemberUpdate(_) | Record::MemberRevoke { .. } => {
@@ -319,10 +320,11 @@ async fn scan_job(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &ScanJobRec) -> 
     }
     let ip_id = ensure_ip(conn, &r.ip, None).await?;
     sqlx::query(
-        "INSERT OR IGNORE INTO scan_jobs (uid, origin, hlc, ip_id, level, status, queued_at)
-         VALUES (?,?,?,?,?,'queued',?)",
+        "INSERT OR IGNORE INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at)
+         VALUES (?,?,?,?,?,?,'queued',?)",
     )
     .bind(&r.uid)
+    .bind(ctx.origin_bytes())
     .bind(ctx.origin_bytes())
     .bind(ctx.hlc as i64)
     .bind(ip_id)
@@ -335,7 +337,7 @@ async fn scan_job(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &ScanJobRec) -> 
 
 async fn job_status(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &JobStatusRec) -> Result<Effect> {
     let arbiter: Option<Option<Vec<u8>>> =
-        sqlx::query_scalar("SELECT origin FROM scan_jobs WHERE uid = ?")
+        sqlx::query_scalar("SELECT arbiter FROM scan_jobs WHERE uid = ?")
             .bind(&r.job_uid)
             .fetch_optional(&mut *conn)
             .await?;
@@ -346,12 +348,12 @@ async fn job_status(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &JobStatusRec)
     if let Some(o) = ctx.origin
         && arbiter.as_deref() != Some(&o.0[..])
     {
-        tracing::warn!(job = %r.job_uid, by = %o.short(), "job status from a non-arbiter ignored");
+        tracing::debug!(job = %r.job_uid, by = %o.short(), "job status from a non-arbiter ignored");
         return Ok(Effect::Ignored);
     }
     sqlx::query(
         "UPDATE scan_jobs SET status = ?, started_at = ?, finished_at = ?, error = ?, attempts = ?,
-           status_hlc = ?
+           scanner = ?, status_hlc = ?
          WHERE uid = ? AND status_hlc < ?",
     )
     .bind(&r.status)
@@ -359,11 +361,35 @@ async fn job_status(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &JobStatusRec)
     .bind(&r.finished_at)
     .bind(&r.error)
     .bind(r.attempts)
+    .bind(r.scanner.map(|s| s.0.to_vec()))
     .bind(ctx.hlc as i64)
     .bind(&r.job_uid)
     .bind(ctx.hlc as i64)
     .execute(&mut *conn)
     .await?;
+    Ok(Effect::Applied)
+}
+
+/// Take over queued jobs from `r.from`. Order-independent: a job moves to
+/// the adopter if `from` still arbitrates it, or if another node adopted it
+/// from `from` but has a higher key than this adopter.
+async fn job_adopt(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &JobAdoptRec) -> Result<Effect> {
+    let Some(adopter) = ctx.origin else {
+        return Ok(Effect::Ignored);
+    };
+    let (from, me) = (r.from.0.to_vec(), adopter.0.to_vec());
+    for uid in &r.job_uids {
+        sqlx::query(
+            "UPDATE scan_jobs SET arbiter = ?1, adopted_from = ?2
+             WHERE uid = ?3 AND status = 'queued'
+               AND (arbiter = ?2 OR (adopted_from = ?2 AND arbiter > ?1))",
+        )
+        .bind(&me)
+        .bind(&from)
+        .bind(uid)
+        .execute(&mut *conn)
+        .await?;
+    }
     Ok(Effect::Applied)
 }
 

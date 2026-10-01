@@ -35,11 +35,19 @@ impl Recorder {
         }
     }
 
+    /// This node's key in a cluster.
+    pub fn node_id(&self) -> Option<crate::cluster::identity::NodeId> {
+        match self {
+            Recorder::Local(_) => None,
+            Recorder::Cluster(n) => Some(n.id()),
+        }
+    }
+
     /// SQL condition selecting jobs this node arbitrates, plus its bind.
     fn own_jobs(&self) -> (&'static str, Option<Vec<u8>>) {
         match self {
-            Recorder::Local(_) => ("origin IS NULL", None),
-            Recorder::Cluster(n) => ("origin = ?", Some(n.id().0.to_vec())),
+            Recorder::Local(_) => ("arbiter IS NULL", None),
+            Recorder::Cluster(n) => ("arbiter = ?", Some(n.id().0.to_vec())),
         }
     }
 
@@ -247,7 +255,10 @@ impl Recorder {
     /// Jobs this node started in the last hour, whatever their outcome: the
     /// rate cap limits nmap launches, so failed and running scans count too.
     pub async fn jobs_started_last_hour(&self) -> Result<i64> {
-        let (cond, bind) = self.own_jobs();
+        let (cond, bind) = match self {
+            Recorder::Local(_) => ("arbiter IS NULL", None),
+            Recorder::Cluster(n) => ("scanner = ?", Some(n.id().0.to_vec())),
+        };
         let sql = format!(
             "SELECT COUNT(*) FROM scan_jobs WHERE started_at > datetime('now','-1 hour') AND {cond}"
         );
@@ -291,6 +302,7 @@ impl Recorder {
                 finished_at: None,
                 error: None,
                 attempts: job.attempts + 1,
+                scanner: self.node_id(),
             },
         )
         .await?;
@@ -352,8 +364,75 @@ impl Recorder {
                 error.map(str::to_string)
             },
             attempts,
+            scanner: self.node_id(),
         }));
         self.write(records).await
+    }
+
+    /// Store the result of a scan this node ran for another arbiter's job
+    /// (the arbiter records the job's state).
+    pub async fn record_scan_result(
+        &self,
+        job_uid: &str,
+        ip: &str,
+        level: i64,
+        started_at: &str,
+        res: &ScanResult,
+    ) -> Result<()> {
+        self.write(vec![Record::ScanResult(ScanResultRec {
+            uid: new_uid(),
+            job_uid: job_uid.to_string(),
+            ip: ip.to_string(),
+            level,
+            started_at: started_at.to_string(),
+            finished_at: Some(now_ts()),
+            os_guess: res.os_guess.clone(),
+            raw_xml: Some(zstd::encode_all(res.raw_xml.as_slice(), 3)?),
+            ports: res
+                .ports
+                .iter()
+                .map(|p| PortRec {
+                    port: p.port as i64,
+                    proto: p.proto.clone(),
+                    state: p.state.clone(),
+                    service: p.service.clone(),
+                    product: p.product.clone(),
+                    version: p.version.clone(),
+                })
+                .collect(),
+        })])
+        .await
+    }
+
+    /// Requeue failed jobs on every arbiter: ours directly, the others'
+    /// by asking them. Returns how many were requeued (as far as known).
+    pub async fn requeue_failed_everywhere(&self, days: i64) -> Result<u64> {
+        let mut n = self.requeue_failed_jobs(days).await?;
+        if let Recorder::Cluster(node) = self {
+            let others: Vec<_> = node
+                .members()
+                .keys()
+                .copied()
+                .filter(|id| *id != node.id())
+                .collect();
+            let asks = others.into_iter().map(|id| {
+                let node = node.clone();
+                async move {
+                    node.request(
+                        id,
+                        crate::cluster::msg::Msg::RequeueFailed { days },
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                }
+            });
+            for r in futures::future::join_all(asks).await {
+                if let Ok(crate::cluster::msg::Msg::RequeueReply { n: m }) = r {
+                    n += m;
+                }
+            }
+        }
+        Ok(n)
     }
 
     /// Requeue the jobs selected by `sql` (uid, started_at kept or not).
@@ -379,6 +458,7 @@ impl Recorder {
                     finished_at: if clear { None } else { finished_at },
                     error: if clear { None } else { error },
                     attempts,
+                    scanner: None,
                 })
             })
             .collect::<Vec<_>>();

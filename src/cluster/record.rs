@@ -90,6 +90,8 @@ pub struct ScanJobRec {
 }
 
 /// A job's state (last write wins by HLC; only the arbiter writes it).
+/// Statuses: queued, running, done, failed, superseded (a scan of the IP
+/// at this level or higher already exists), refused (never_scan).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobStatusRec {
     pub job_uid: String,
@@ -98,6 +100,18 @@ pub struct JobStatusRec {
     pub finished_at: Option<String>,
     pub error: Option<String>,
     pub attempts: i64,
+    /// The node running (or that ran) the scan.
+    #[serde(default)]
+    pub scanner: Option<NodeId>,
+}
+
+/// Queued jobs taken over from an arbiter that has been unreachable for
+/// `cluster.takeover_hours`; the origin becomes their arbiter. When two
+/// nodes adopt the same job, the lowest node key wins everywhere.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobAdoptRec {
+    pub from: NodeId,
+    pub job_uids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -169,6 +183,7 @@ pub enum Record {
     Fingerprint(FingerprintRec),
     ScanJob(ScanJobRec),
     JobStatus(JobStatusRec),
+    JobAdopt(JobAdoptRec),
     ScanResult(ScanResultRec),
     Tombstone(TombstoneRec),
 }
@@ -189,6 +204,7 @@ impl Record {
             Record::Fingerprint(_) => "fingerprint",
             Record::ScanJob(_) => "scan_job",
             Record::JobStatus(_) => "job_status",
+            Record::JobAdopt(_) => "job_adopt",
             Record::ScanResult(_) => "scan_result",
             Record::Tombstone(_) => "tombstone",
         }

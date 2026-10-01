@@ -6,9 +6,11 @@ pub mod hlc;
 pub mod identity;
 pub mod invite;
 pub mod members;
+pub mod msg;
 pub mod record;
 pub mod repl;
 pub mod rpc;
+pub mod status;
 pub mod sync;
 pub mod tls;
 
@@ -34,6 +36,8 @@ pub struct NodeParams {
     pub store: Store,
     /// Supported protocol range; constants except in interop tests.
     pub proto: (u32, u32),
+    /// This node has MaxMind credentials (published in heartbeats).
+    pub has_maxmind: bool,
 }
 
 impl NodeParams {
@@ -50,6 +54,7 @@ impl NodeParams {
             never_scan: cfg.scan.never_scan.iter().map(|n| n.to_string()).collect(),
             store,
             proto: (proto::PROTO_MIN, proto::PROTO_VERSION),
+            has_maxmind: cfg.maxmind.is_some(),
         })
     }
 }
@@ -76,7 +81,7 @@ pub struct Node {
     /// Addresses from `[[cluster.peers]]`, preferred over published ones.
     address_override: HashMap<NodeId, String>,
     clients: Mutex<HashMap<NodeId, reqwest::Client>>,
-    pub status: RwLock<HashMap<NodeId, PeerStatus>>,
+    pub peer_status: RwLock<HashMap<NodeId, PeerStatus>>,
     /// Serializes log writes (local appends and remote batches).
     pub apply_lock: tokio::sync::Mutex<()>,
     /// Bumped whenever the log grows; wakes sync loops and long-polls.
@@ -84,6 +89,11 @@ pub struct Node {
     join_attempts: Mutex<std::collections::VecDeque<std::time::Instant>>,
     /// Wakes the sync supervisor when the set of dialable members changes.
     pub members_changed: tokio::sync::Notify,
+    pub has_maxmind: bool,
+    /// Contacts and heartbeats (ephemeral).
+    pub status: status::Status,
+    pub msg: msg::Messaging,
+    pub started: std::time::Instant,
 }
 
 impl Node {
@@ -105,11 +115,15 @@ impl Node {
             members: RwLock::new(Arc::new(HashMap::new())),
             address_override,
             clients: Mutex::new(HashMap::new()),
-            status: RwLock::new(HashMap::new()),
+            peer_status: RwLock::new(HashMap::new()),
             apply_lock: tokio::sync::Mutex::new(()),
             changed: tokio::sync::watch::channel(0).0,
             join_attempts: Mutex::new(Default::default()),
             members_changed: tokio::sync::Notify::new(),
+            has_maxmind: p.has_maxmind,
+            status: Default::default(),
+            msg: Default::default(),
+            started: std::time::Instant::now(),
         });
         // Our clock must not run behind anything already in the log.
         let max_hlc: Option<i64> = sqlx::query_scalar("SELECT MAX(hlc) FROM repl_log")
@@ -350,7 +364,10 @@ impl Node {
     /// Remember the outcome of contacting a peer (memory + database).
     pub async fn record_status(&self, peer: NodeId, name: &str, r: Result<Option<Hello>, String>) {
         let changed = {
-            let mut all = self.status.write().unwrap();
+            if r.is_ok() {
+                self.status.touch_outbound(peer);
+            }
+            let mut all = self.peer_status.write().unwrap();
             let st = all.entry(peer).or_default();
             match r {
                 Ok(h) => {
@@ -380,7 +397,7 @@ impl Node {
         };
         if changed {
             let st = self
-                .status
+                .peer_status
                 .read()
                 .unwrap()
                 .get(&peer)
@@ -429,6 +446,18 @@ pub async fn start(
         rpc::router(node.clone()),
         shutdown.clone(),
     ));
+    tokio::spawn(heartbeat_loop(node.clone(), shutdown.clone()));
     tokio::spawn(sync::supervise(node, shutdown));
     Ok(addr)
+}
+
+/// Refresh our heartbeat periodically; gossip carries it to the cluster.
+async fn heartbeat_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        node.refresh_heartbeat();
+        tokio::select! {
+            _ = tokio::time::sleep(status::HEARTBEAT_EVERY) => {}
+            _ = shutdown.changed() => break,
+        }
+    }
 }

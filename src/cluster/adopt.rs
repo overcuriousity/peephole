@@ -82,6 +82,7 @@ async fn job_status_for(conn: &mut SqliteConnection, uid: &str) -> Result<Option
         finished_at: r.2,
         error: r.3,
         attempts: r.4,
+        scanner: None,
     })))
 }
 
@@ -120,7 +121,12 @@ pub async fn adopt_history(node: &Node) -> Result<u64> {
                     // keep it local, but do not look at it again.
                     None => 0,
                 };
-                let sql = format!("UPDATE {table} SET origin = ?, hlc = ? WHERE uid = ?");
+                let sql = if table == "scan_jobs" {
+                    "UPDATE scan_jobs SET origin = ?1, arbiter = ?1, hlc = ?2 WHERE uid = ?3"
+                        .to_string()
+                } else {
+                    format!("UPDATE {table} SET origin = ?1, hlc = ?2 WHERE uid = ?3")
+                };
                 sqlx::query(sqlx::AssertSqlSafe(sql))
                     .bind(&me)
                     .bind(hlc as i64)

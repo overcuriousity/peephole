@@ -268,7 +268,7 @@ async fn queue_retry_failed(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
 ) -> AppResult<Redirect> {
-    let n = st.recorder.requeue_failed_jobs(7).await?;
+    let n = st.recorder.requeue_failed_everywhere(7).await?;
     tracing::info!(requeued = n, "retry failed scans");
     Ok(Redirect::to(&format!("/admin/queue?retried={n}")))
 }

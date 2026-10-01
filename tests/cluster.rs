@@ -43,6 +43,16 @@ struct TestNode {
     node: Arc<Node>,
     _dir: tempfile::TempDir,
     _stop: tokio::sync::watch::Sender<bool>,
+    pace: peephole::scan::pace::SharedPace,
+    workers: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for TestNode {
+    fn drop(&mut self) {
+        if let Some(w) = self.workers.take() {
+            w.abort();
+        }
+    }
 }
 
 impl std::ops::Deref for TestNode {
@@ -52,15 +62,27 @@ impl std::ops::Deref for TestNode {
     }
 }
 
+#[derive(Clone)]
 struct Opts {
     proto: Option<(u32, u32)>,
     /// false: outbound-only (no advertise address).
     advertise: bool,
+    lease_secs: u64,
+    takeover_hours: f64,
+    never_scan: Vec<String>,
+    /// Run scan workers with this fake nmap.
+    scanner: Option<std::path::PathBuf>,
+    workers: usize,
 }
 
 const DEFAULT: Opts = Opts {
     proto: None,
     advertise: true,
+    lease_secs: 120,
+    takeover_hours: 6.0,
+    never_scan: vec![],
+    scanner: None,
+    workers: 1,
 };
 
 async fn boot(identity: Identity, me: &Addr, peers: &[&Addr], o: Opts) -> TestNode {
@@ -82,8 +104,8 @@ async fn boot_in(
         listen: me.address().parse().unwrap(),
         advertise: o.advertise.then(|| me.address()),
         key_path: None,
-        takeover_hours: 6,
-        lease_secs: 120,
+        takeover_hours: o.takeover_hours,
+        lease_secs: o.lease_secs,
         peers: peers
             .iter()
             .map(|p| PeerConfig {
@@ -93,27 +115,70 @@ async fn boot_in(
             })
             .collect(),
     };
+    let roles = Roles {
+        listener: true,
+        scanner: o.scanner.is_some(),
+        web: false,
+    };
     let node = Node::open(NodeParams {
         identity,
         cluster,
-        roles: Roles::default(),
-        never_scan: vec![],
+        roles,
+        never_scan: o.never_scan.clone(),
         store,
         proto: o.proto.unwrap_or((
             cluster::rpc::proto::PROTO_MIN,
             cluster::rpc::proto::PROTO_VERSION,
         )),
+        has_maxmind: false,
     })
     .await
     .unwrap();
     cluster::adopt::adopt_history(&node).await.unwrap();
     let (tx, rx) = tokio::sync::watch::channel(false);
+    peephole::scan::arbiter::Arbiter::start(node.clone(), rx.clone())
+        .await
+        .unwrap();
+    let pace = peephole::scan::pace::SharedPace::new(peephole::scan::pace::Pace {
+        max_workers: o.workers,
+        max_scans_per_hour: 3600,
+        timeout_secs: 60,
+    });
+    let workers = o.scanner.as_ref().map(|nmap| {
+        tokio::spawn(peephole::scan::arbiter::takeover_loop(
+            node.clone(),
+            rx.clone(),
+        ));
+        tokio::spawn(peephole::scan::run_workers(
+            peephole::store::recorder::Recorder::Cluster(node.clone()),
+            scan_config(&o.never_scan),
+            pace.clone(),
+            nmap.clone(),
+            rx.clone(),
+            peephole::events::Notifier::new(),
+        ))
+    });
     cluster::start(node.clone(), rx).await.unwrap();
     TestNode {
         node,
         _dir: dir,
         _stop: tx,
+        pace,
+        workers,
     }
+}
+
+/// Config for the scan workers (argv presets, never_scan, cooldown).
+fn scan_config(never_scan: &[String]) -> peephole::config::Config {
+    let list = never_scan
+        .iter()
+        .map(|n| format!("\"{n}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    toml::from_str(&format!(
+        "database_path = \"/x\"\ndata_dir = \"/x\"\n[scan]\nnever_scan = [{list}]\n"
+    ))
+    .unwrap()
 }
 
 /// Poll `f` until it holds or 15 s pass.
@@ -151,7 +216,7 @@ async fn members_greet_each_other_over_pinned_mtls() {
             .await
             .unwrap()
             .iter()
-            .any(|m| m.id == b.id && m.info_hlc > 0 && m.roles.len() == 3)
+            .any(|m| m.id == b.id && m.info_hlc > 0 && m.roles == ["listener"])
     })
     .await;
 }
@@ -360,7 +425,7 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
             listen: "127.0.0.1:0".parse().unwrap(),
             advertise: None,
             key_path: None,
-            takeover_hours: 6,
+            takeover_hours: 6.0,
             lease_secs: 120,
             peers: vec![PeerConfig {
                 name: "a".into(),
@@ -372,6 +437,7 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
         never_scan: vec![],
         store,
         proto: (1, 1),
+        has_maxmind: false,
     })
     .await
     .unwrap();
@@ -551,7 +617,7 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
             listen: "127.0.0.1:0".parse().unwrap(),
             advertise: None,
             key_path: None,
-            takeover_hours: 6,
+            takeover_hours: 6.0,
             lease_secs: 120,
             peers: peers
                 .iter()
@@ -566,6 +632,7 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
         never_scan: vec![],
         store,
         proto: (1, 1),
+        has_maxmind: false,
     })
     .await
     .unwrap();
@@ -752,6 +819,7 @@ async fn job_status_from_a_non_arbiter_is_ignored() {
             finished_at: None,
             error: None,
             attempts: 9,
+            scanner: None,
         })],
     )
     .await
@@ -763,4 +831,355 @@ async fn job_status_from_a_non_arbiter_is_ignored() {
             1
         );
     }
+}
+
+// ---------------------------------------------------------- scan queue
+
+/// A fake nmap that prints the fixture after `secs`, and logs each target.
+fn fake_nmap(dir: &std::path::Path, secs: f64) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let xml = dir.join("nmap.xml");
+    std::fs::copy("tests/fixtures/nmap-basic.xml", &xml).unwrap();
+    let log = dir.join("targets.log");
+    let p = dir.join(format!("fake-nmap-{secs}"));
+    std::fs::write(
+        &p,
+        format!(
+            "#!/bin/sh\nfor a; do t=$a; done\necho $t >> {log}\nsleep {secs}\ncat {xml}\n",
+            log = log.display(),
+            xml = xml.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+async fn enqueue(n: &TestNode, ip: &str, level: u8) {
+    let row = n.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+    let out = rec(n).enqueue_scan(row.id, level, 24).await.unwrap();
+    assert!(
+        matches!(out, peephole::store::scans::EnqueueOutcome::Queued(_)),
+        "{out:?}"
+    );
+}
+
+async fn scans_by(n: &Node, scanner: NodeId) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE status = 'done' AND scanner = ?")
+        .bind(&scanner.0[..])
+        .fetch_one(&n.store.pool)
+        .await
+        .unwrap()
+}
+
+/// A listener without a scanner fills the queue; two scanners drain it
+/// and share it about evenly.
+#[tokio::test]
+async fn scanners_share_a_listeners_queue() {
+    let tools = tempfile::tempdir().unwrap();
+    let nmap = fake_nmap(tools.path(), 0.5);
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let scan = Opts {
+        scanner: Some(nmap),
+        ..DEFAULT
+    };
+    let _nb = boot(ib, &b, &[&a, &c], scan.clone()).await;
+    let _nc = boot(ic, &c, &[&a, &b], scan).await;
+    for i in 0..6 {
+        enqueue(&na, &format!("198.51.100.{}", 10 + i), 2).await;
+    }
+    eventually_for(Duration::from_secs(40), "all six scanned", || async {
+        count(&na, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 6
+    })
+    .await;
+    let (by_b, by_c) = (scans_by(&na, b.id).await, scans_by(&na, c.id).await);
+    assert_eq!(by_b + by_c, 6);
+    assert!(by_b >= 2 && by_c >= 2, "uneven: b={by_b} c={by_c}");
+    // Results come from the scanners, attributed to them.
+    eventually("a has all results", || async {
+        count(&na, "SELECT COUNT(*) FROM scans").await == 6
+    })
+    .await;
+    let origins: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT origin) FROM scans")
+        .fetch_one(&na.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(origins, 2);
+}
+
+/// Poll `f` until it holds or `limit` passes.
+async fn eventually_for<F, Fut>(limit: Duration, what: &str, mut f: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + limit;
+    while !f().await {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A scanner that dies mid-scan stops renewing; the lease expires and
+/// another scanner finishes the job.
+#[tokio::test]
+async fn expired_lease_moves_the_job_to_another_scanner() {
+    let tools = tempfile::tempdir().unwrap();
+    let hang = fake_nmap(tools.path(), 60.0);
+    let quick = fake_nmap(tools.path(), 0.2);
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(
+        ia,
+        &a,
+        &[&b, &c],
+        Opts {
+            lease_secs: 2,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let mut nb = boot(
+        ib,
+        &b,
+        &[&a, &c],
+        Opts {
+            scanner: Some(hang),
+            ..DEFAULT
+        },
+    )
+    .await;
+    enqueue(&na, "203.0.113.50", 2).await;
+    eventually("b runs the job", || async {
+        count(
+            &na,
+            "SELECT COUNT(*) FROM scan_jobs WHERE status = 'running'",
+        )
+        .await
+            == 1
+    })
+    .await;
+    // B's scanner dies (nmap is killed with it).
+    nb.workers.take().unwrap().abort();
+    let _nc = boot(
+        ic,
+        &c,
+        &[&a, &b],
+        Opts {
+            scanner: Some(quick),
+            ..DEFAULT
+        },
+    )
+    .await;
+    eventually_for(Duration::from_secs(20), "c finished it", || async {
+        scans_by(&na, c.id).await == 1
+    })
+    .await;
+    let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM scan_jobs")
+        .fetch_one(&na.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(attempts, 2);
+}
+
+/// Queued jobs of an arbiter that went silent are adopted and scanned.
+#[tokio::test]
+async fn silent_arbiters_queue_is_taken_over() {
+    let tools = tempfile::tempdir().unwrap();
+    let nmap = fake_nmap(tools.path(), 0.2);
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a],
+        Opts {
+            scanner: Some(nmap),
+            workers: 0, // paused: nothing is claimed while A is up
+            takeover_hours: 3.0 / 3600.0,
+            ..DEFAULT
+        },
+    )
+    .await;
+    enqueue(&na, "203.0.113.70", 3).await;
+    eventually("b sees a's job and heartbeat", || async {
+        count(&nb, "SELECT COUNT(*) FROM scan_jobs").await == 1 && nb.status.known(&a.id).is_some()
+    })
+    .await;
+    drop(na); // A goes silent
+    eventually_for(Duration::from_secs(20), "b adopted the job", || async {
+        let arb: Option<Vec<u8>> = sqlx::query_scalar("SELECT arbiter FROM scan_jobs")
+            .fetch_one(&nb.store.pool)
+            .await
+            .unwrap();
+        arb == Some(b.id.0.to_vec())
+    })
+    .await;
+    nb.pace
+        .set(
+            &nb.store,
+            peephole::scan::pace::Pace {
+                max_workers: 1,
+                max_scans_per_hour: 3600,
+                timeout_secs: 60,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    eventually_for(Duration::from_secs(20), "b scanned it", || async {
+        scans_by(&nb, b.id).await == 1
+    })
+    .await;
+}
+
+/// Any member's never_scan protects a target cluster-wide: the scanner
+/// refuses it without running nmap.
+#[tokio::test]
+async fn never_scan_of_any_member_is_honoured() {
+    let tools = tempfile::tempdir().unwrap();
+    let nmap = fake_nmap(tools.path(), 0.1);
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let _nc = boot(
+        ic,
+        &c,
+        &[&a, &b],
+        Opts {
+            never_scan: vec!["192.0.2.0/24".into()],
+            ..DEFAULT
+        },
+    )
+    .await;
+    eventually("a knows c's never_scan", || async {
+        members::all(&na.store)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == c.id && !m.never_scan.is_empty())
+    })
+    .await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a, &c],
+        Opts {
+            scanner: Some(nmap),
+            ..DEFAULT
+        },
+    )
+    .await;
+    eventually("b knows c's never_scan", || async {
+        members::all(&nb.store)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == c.id && !m.never_scan.is_empty())
+    })
+    .await;
+    enqueue(&na, "192.0.2.10", 2).await;
+    eventually("job refused", || async {
+        count(
+            &na,
+            "SELECT COUNT(*) FROM scan_jobs WHERE status = 'refused'",
+        )
+        .await
+            == 1
+    })
+    .await;
+    assert!(
+        !tools.path().join("targets.log").exists(),
+        "nmap must not run"
+    );
+}
+
+/// Two listeners queue the same IP before they hear of each other's job:
+/// one scan runs, the other job is superseded.
+#[tokio::test]
+async fn duplicate_jobs_are_superseded() {
+    let tools = tempfile::tempdir().unwrap();
+    let nmap = fake_nmap(tools.path(), 0.5);
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let ip = "198.51.100.200";
+    enqueue(&na, ip, 2).await;
+    // B queues the same IP as if it had not seen A's job yet.
+    nb.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+    rec(&nb)
+        .write(vec![Record::ScanJob(
+            peephole::cluster::record::ScanJobRec {
+                uid: "dup-job".into(),
+                ip: ip.into(),
+                level: 2,
+                queued_at: peephole::store::data::now_ts(),
+            },
+        )])
+        .await
+        .unwrap();
+    let _nc = boot(
+        ic,
+        &c,
+        &[&a, &b],
+        Opts {
+            scanner: Some(nmap),
+            ..DEFAULT
+        },
+    )
+    .await;
+    eventually_for(
+        Duration::from_secs(20),
+        "one done, one superseded",
+        || async {
+            count(&na, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 1
+                && count(
+                    &na,
+                    "SELECT COUNT(*) FROM scan_jobs WHERE status = 'superseded'",
+                )
+                .await
+                    == 1
+        },
+    )
+    .await;
+    let runs = std::fs::read_to_string(tools.path().join("targets.log")).unwrap();
+    assert_eq!(runs.lines().count(), 1, "{runs}");
+}
+
+/// A scanner nobody can dial still gets jobs and reports back (answers
+/// travel through the arbiter's outbox it long-polls).
+#[tokio::test]
+async fn outbound_only_scanner_drains_the_queue() {
+    let tools = tempfile::tempdir().unwrap();
+    let nmap = fake_nmap(tools.path(), 0.1);
+    let (ia, a) = new_node("a");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[], DEFAULT).await;
+    let nc = boot(
+        ic,
+        &c,
+        &[],
+        Opts {
+            advertise: false,
+            scanner: Some(nmap),
+            ..DEFAULT
+        },
+    )
+    .await;
+    invite::join(&nc, &invite::create(&na, 1).await.unwrap())
+        .await
+        .unwrap();
+    enqueue(&na, "203.0.113.90", 2).await;
+    eventually_for(Duration::from_secs(20), "c scanned a's job", || async {
+        scans_by(&na, c.id).await == 1
+    })
+    .await;
 }

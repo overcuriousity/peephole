@@ -5,7 +5,9 @@ pub mod server;
 
 use super::Node;
 use super::invite::{self, JoinReq};
+use super::msg::Envelope;
 use super::repl;
+use super::status::SignedHeartbeat;
 use super::sync::{BATCH_BYTES, BATCH_ENTRIES, PullReq, PushReq, WAIT_SECS, WaitReq};
 use axum::extract::{Extension, Request, State};
 use axum::http::StatusCode;
@@ -27,6 +29,9 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/rpc/v1/pull", post(pull))
         .route("/rpc/v1/push", post(push))
         .route("/rpc/v1/wait", post(wait))
+        .route("/rpc/v1/gossip", post(gossip))
+        .route("/rpc/v1/msg", post(message))
+        .route("/rpc/v1/inbox", post(inbox))
         .route_layer(axum::middleware::from_fn_with_state(
             node.clone(),
             require_member,
@@ -87,6 +92,35 @@ async fn push(
     }
 }
 
+/// Exchange heartbeats: take theirs, answer with everything we know.
+async fn gossip(
+    State(node): State<Arc<Node>>,
+    Cbor(theirs): Cbor<Vec<SignedHeartbeat>>,
+) -> Response {
+    node.merge_heartbeats(theirs);
+    Cbor(node.status.all_signed()).into_response()
+}
+
+/// A directed message to deliver here or pass on. Routed in the
+/// background; the caller only learns it was accepted.
+async fn message(State(node): State<Arc<Node>>, Cbor(mut env): Cbor<Envelope>) -> Response {
+    env.hops = env.hops.saturating_add(1);
+    if let Err(e) = env.open() {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    tokio::spawn(async move {
+        if let Err(e) = node.route(env).await {
+            tracing::debug!(?e, "message not routed");
+        }
+    });
+    Cbor(true).into_response()
+}
+
+/// Long-poll for messages waiting for the caller.
+async fn inbox(State(node): State<Arc<Node>>, Extension(Peer(peer)): Extension<Peer>) -> Response {
+    Cbor(node.take_inbox(peer).await).into_response()
+}
+
 /// Long-poll: answer as soon as we hold something the caller lacks.
 async fn wait(State(node): State<Arc<Node>>, Cbor(req): Cbor<WaitReq>) -> Response {
     let mut changes = node.subscribe_changes();
@@ -136,6 +170,7 @@ async fn require_member(
     next: Next,
 ) -> Response {
     if node.is_member(&peer) {
+        node.status.touch_inbound(peer);
         next.run(req).await
     } else {
         tracing::debug!(peer = %peer.short(), "rpc from non-member refused");

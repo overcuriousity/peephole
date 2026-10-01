@@ -41,7 +41,7 @@ pub struct ClusterConfig {
     pub key_path: Option<PathBuf>,
     /// Adopt an unreachable origin's queued jobs after this many hours.
     #[serde(default = "default_takeover_hours")]
-    pub takeover_hours: u64,
+    pub takeover_hours: f64,
     /// Scan lease length; renewed while nmap runs.
     #[serde(default = "default_lease_secs")]
     pub lease_secs: u64,
@@ -49,8 +49,8 @@ pub struct ClusterConfig {
     pub peers: Vec<PeerConfig>,
 }
 
-fn default_takeover_hours() -> u64 {
-    6
+fn default_takeover_hours() -> f64 {
+    6.0
 }
 fn default_lease_secs() -> u64 {
     120
@@ -278,6 +278,9 @@ impl Config {
             if c.lease_secs < 10 {
                 bail!("cluster.lease_secs must be at least 10");
             }
+            if c.takeover_hours.is_nan() || c.takeover_hours <= 0.0 {
+                bail!("cluster.takeover_hours must be positive");
+            }
             for p in &c.peers {
                 crate::cluster::identity::NodeId::parse(&p.public_key)
                     .with_context(|| format!("cluster.peers `{}`: public_key", p.name))?;
@@ -501,5 +504,16 @@ data_dir = "/tmp"
         let notes = optional_key_notes(&path).join("\n");
         assert!(!notes.contains("webauthn"), "{notes}");
         assert!(notes.contains("roles.listener"), "{notes}");
+    }
+
+    #[test]
+    fn cluster_section_parses_with_integer_hours() {
+        let cfg = parse(&format!(
+            "{BASE}[roles]\nlistener = false\nweb = false\n[cluster]\nnode_name = \"n\"\nlisten = \"0.0.0.0:7443\"\ntakeover_hours = 2\n"
+        ))
+        .unwrap();
+        let c = cfg.cluster.unwrap();
+        assert_eq!(c.takeover_hours, 2.0);
+        assert_eq!(c.lease_secs, 120);
     }
 }

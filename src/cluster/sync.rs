@@ -68,13 +68,14 @@ pub async fn supervise(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiv
         });
         for (id, name, addr) in targets {
             loops.entry(id).or_insert_with(|| {
-                let h = tokio::spawn(peer_loop(
-                    node.clone(),
-                    id,
-                    name,
-                    addr.clone(),
-                    shutdown.clone(),
-                ));
+                let sync = peer_loop(node.clone(), id, name, addr.clone(), shutdown.clone());
+                let inbox = super::msg::inbox_loop(node.clone(), id, addr.clone());
+                let h = tokio::spawn(async move {
+                    tokio::select! {
+                        _ = sync => {}
+                        _ = inbox => {}
+                    }
+                });
                 (addr, h)
             });
         }
@@ -148,6 +149,10 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
     }
     let ours = repl::heads(&node.store).await?;
     let theirs: Heads = node.call(peer, addr, "/rpc/v1/heads", &ours).await?;
+    let gossip: Vec<super::status::SignedHeartbeat> = node
+        .call(peer, addr, "/rpc/v1/gossip", &node.status.all_signed())
+        .await?;
+    node.merge_heartbeats(gossip);
     // Pull what we lack.
     loop {
         let ours = repl::heads(&node.store).await?;
