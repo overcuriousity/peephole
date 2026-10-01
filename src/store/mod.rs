@@ -33,6 +33,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0011_scoped_tombstones.sql"),
     include_str!("migrations/0012_tomb_proofs.sql"),
     include_str!("migrations/0013_hide_block.sql"),
+    include_str!("migrations/0014_origin_indexes.sql"),
 ];
 
 #[derive(Clone)]

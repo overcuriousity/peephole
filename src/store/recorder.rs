@@ -51,6 +51,15 @@ impl Recorder {
         }
     }
 
+    /// A fresh uid. In a cluster it carries this node's prefix, which binds
+    /// the record to its origin (see `NodeId::uid_prefix`).
+    fn uid(&self) -> String {
+        match self {
+            Recorder::Local(_) => new_uid(),
+            Recorder::Cluster(n) => format!("{}{}", n.id().uid_prefix(), new_uid()),
+        }
+    }
+
     /// SQL condition selecting jobs this node arbitrates, plus its bind.
     fn own_jobs(&self) -> (&'static str, Option<Vec<u8>>) {
         match self {
@@ -108,7 +117,7 @@ impl Recorder {
 
     /// Record a request from the IP `n.ip_id`. Returns the request id.
     pub async fn insert_request(&self, n: &NewRequest) -> Result<i64> {
-        let uid = new_uid();
+        let uid = self.uid();
         self.write(vec![Record::Request(RequestRec {
             uid: uid.clone(),
             ts: now_ts(),
@@ -171,7 +180,7 @@ impl Recorder {
             .await?
             .context("claim for an unknown request")?;
         self.write(vec![Record::FpClaim(FpClaimRec {
-            uid: new_uid(),
+            uid: self.uid(),
             request_uid,
             ip: self.ip_of(ip_id).await?,
             ts: now_ts(),
@@ -196,7 +205,7 @@ impl Recorder {
             Some(id) => self.uid_by_id("requests", id).await?,
             None => None,
         };
-        let uid = new_uid();
+        let uid = self.uid();
         self.write(vec![Record::Fingerprint(FingerprintRec {
             uid: uid.clone(),
             request_uid,
@@ -284,7 +293,7 @@ impl Recorder {
                 }
             }
         }
-        let uid = new_uid();
+        let uid = self.uid();
         self.write(vec![Record::ScanJob(ScanJobRec {
             uid: uid.clone(),
             ip: self.ip_of(ip_id).await?,
@@ -376,7 +385,7 @@ impl Recorder {
         let mut records = vec![];
         if let Some(res) = result {
             records.push(Record::ScanResult(ScanResultRec {
-                uid: new_uid(),
+                uid: self.uid(),
                 job_uid: uid.clone(),
                 ip,
                 level,
@@ -425,7 +434,7 @@ impl Recorder {
         res: &ScanResult,
     ) -> Result<()> {
         self.write(vec![Record::ScanResult(ScanResultRec {
-            uid: new_uid(),
+            uid: self.uid(),
             job_uid: job_uid.to_string(),
             ip: ip.to_string(),
             level,
@@ -595,15 +604,39 @@ impl Recorder {
 
     /// Delete records this node originated, everywhere.
     async fn bury(&self, uids: Vec<String>) -> Result<()> {
-        let records: Vec<_> = uids
-            .chunks(TOMB_CHUNK)
-            .map(|c| {
-                Record::Tombstone(TombstoneRec {
-                    uid: new_uid(),
-                    uids: c.to_vec(),
-                })
-            })
-            .collect();
+        let mut records = vec![];
+        for c in uids.chunks(TOMB_CHUNK) {
+            let (uids, seqs) = match self {
+                Recorder::Local(_) => (c.to_vec(), vec![]),
+                // Where each record sits in our log: receivers accept an
+                // erased entry only at a position its tombstone names.
+                Recorder::Cluster(n) => {
+                    let sql = format!(
+                        "SELECT uid, seq FROM repl_log
+                         WHERE +origin = ? AND kind != 'tombstone' AND uid IN ({})",
+                        vec!["?"; c.len()].join(",")
+                    );
+                    let mut q = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql))
+                        .bind(n.id().0.to_vec());
+                    for u in c {
+                        q = q.bind(u.as_str());
+                    }
+                    q.fetch_all(&n.store.pool)
+                        .await?
+                        .into_iter()
+                        .map(|(uid, seq)| (uid, seq as u64))
+                        .unzip()
+                }
+            };
+            if uids.is_empty() {
+                continue;
+            }
+            records.push(Record::Tombstone(TombstoneRec {
+                uid: self.uid(),
+                uids,
+                seqs,
+            }));
+        }
         if !records.is_empty() {
             self.write(records).await?;
         }
@@ -634,18 +667,21 @@ impl Recorder {
     /// fingerprints on them.
     pub async fn delete_requests(&self, ids: &[i64]) -> Result<Deleted> {
         let (reqs, foreign) = self.split("requests", "id", Keys::Ids(ids)).await?;
-        let (claims, _) = self
-            .split("fp_claims", "request_uid", Keys::Uids(&reqs))
+        // Claims and fingerprints go with their request: ours are deleted
+        // cluster-wide, other nodes' are hidden here.
+        let all: Vec<String> = [&reqs[..], &foreign[..]].concat();
+        let (claims, their_claims) = self
+            .split("fp_claims", "request_uid", Keys::Uids(&all))
             .await?;
-        let (fps, _) = self
-            .split("fingerprints", "request_uid", Keys::Uids(&reqs))
+        let (fps, their_fps) = self
+            .split("fingerprints", "request_uid", Keys::Uids(&all))
             .await?;
-        let deleted = reqs.len() as u64;
+        let (deleted, hidden) = (reqs.len() as u64, foreign.len() as u64);
         self.bury([reqs, claims, fps].concat()).await?;
-        Ok(Deleted {
-            deleted,
-            hidden: self.hide(foreign).await?,
-        })
+        // Children first: hiding a request unlinks its fingerprints.
+        self.hide([their_fps, their_claims, foreign].concat())
+            .await?;
+        Ok(Deleted { deleted, hidden })
     }
 
     /// Whether the IP existed. Everything this node recorded about it is

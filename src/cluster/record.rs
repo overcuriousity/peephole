@@ -155,6 +155,12 @@ pub struct IntelManifestRec {
 pub struct TombstoneRec {
     pub uid: String,
     pub uids: Vec<String>,
+    /// Position of each listed record in the origin's log (`seqs[i]` belongs
+    /// to `uids[i]`). An erased entry is only accepted at a position its
+    /// tombstone names, so a relay cannot pass off another entry as erased.
+    /// Empty on a standalone node, which has no log.
+    #[serde(default)]
+    pub seqs: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

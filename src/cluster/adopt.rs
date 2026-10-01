@@ -86,10 +86,53 @@ async fn job_status_for(conn: &mut SqliteConnection, uid: &str) -> Result<Option
     })))
 }
 
+/// Give standalone rows uids that carry this node's prefix, as every record
+/// in a cluster must (see `NodeId::uid_prefix`). References between rows
+/// follow. Idempotent: rows that were already renamed are left alone.
+async fn bind_uids(node: &Node) -> Result<()> {
+    let p = node.id().uid_prefix();
+    let _g = node.apply_lock.lock().await;
+    let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    // References first, while the parents still carry their old uids.
+    for (child, col, parent) in [
+        ("fp_claims", "request_uid", "requests"),
+        ("fingerprints", "request_uid", "requests"),
+        ("scans", "job_uid", "scan_jobs"),
+    ] {
+        let sql = format!(
+            "UPDATE {child} SET {col} = ?1 || {col} WHERE {col} IN
+               (SELECT uid FROM {parent} WHERE origin IS NULL AND uid NOT LIKE ?1 || '%')"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&p)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for table in [
+        "requests",
+        "fp_claims",
+        "fingerprints",
+        "scan_jobs",
+        "scans",
+    ] {
+        let sql = format!(
+            "UPDATE {table} SET uid = ?1 || uid
+             WHERE origin IS NULL AND uid IS NOT NULL AND uid NOT LIKE ?1 || '%'"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&p)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Adopt all standalone rows; returns how many records were logged.
 pub async fn adopt_history(node: &Node) -> Result<u64> {
     let me = node.id().0.to_vec();
     let mut total = 0u64;
+    bind_uids(node).await?;
     // Parents before children, so receivers can link them.
     for (table, kind) in [
         ("requests", "request"),

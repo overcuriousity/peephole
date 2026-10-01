@@ -15,19 +15,23 @@ pub async fn list(store: &crate::store::Store) -> Result<Vec<NodeId>> {
     rows.iter().map(|r| NodeId::from_slice(r)).collect()
 }
 
+/// Rows taken out of the tables per transaction, so the write lock is
+/// never held for long (blocking a flooding peer is exactly when this is
+/// large).
+const BATCH: usize = 500;
+
 /// Block `id`. Returns how many of its records left the tables.
 pub async fn block(node: &Node, id: NodeId) -> Result<u64> {
     if id == node.id() {
         bail!("a node cannot block itself");
     }
-    let guard = node.apply_lock.lock().await;
-    let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    // From here on its new records stay out of the tables.
     sqlx::query("INSERT OR IGNORE INTO blocked_peers (id, blocked_at) VALUES (?, datetime('now'))")
         .bind(&id.0[..])
-        .execute(&mut *tx)
+        .execute(&node.store.pool)
         .await?;
+    node.reload_members().await?;
     let mut n = 0;
-    let mut ips = std::collections::BTreeSet::new();
     // Children before parents, so each row is counted once.
     for (table, kind) in [
         ("scans", "scan_result"),
@@ -39,21 +43,24 @@ pub async fn block(node: &Node, id: NodeId) -> Result<u64> {
         let sql = format!("SELECT uid FROM {table} WHERE origin = ? AND uid IS NOT NULL");
         let uids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .bind(&id.0[..])
-            .fetch_all(&mut *tx)
+            .fetch_all(&node.store.pool)
             .await?;
-        for uid in uids {
-            if let Some(ip) = data::unmaterialize(&mut tx, kind, &uid).await? {
-                ips.insert(ip);
-                n += 1;
+        for chunk in uids.chunks(BATCH) {
+            let _g = node.apply_lock.lock().await;
+            let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let mut ips = std::collections::BTreeSet::new();
+            for uid in chunk {
+                if let Some(ip) = data::unmaterialize(&mut tx, kind, uid).await? {
+                    ips.insert(ip);
+                    n += 1;
+                }
             }
+            for ip in ips {
+                data::drop_orphan_ip(&mut tx, ip).await?;
+            }
+            tx.commit().await?;
         }
     }
-    for ip in ips {
-        data::drop_orphan_ip(&mut tx, ip).await?;
-    }
-    tx.commit().await?;
-    drop(guard);
-    node.reload_members().await?;
     tracing::info!(id = %id.short(), records = n, "peer blocked");
     Ok(n)
 }

@@ -622,24 +622,16 @@ async fn uids_where(
 /// deleted request, a scan of a deleted job) are not this origin's to erase:
 /// they leave the tables, because their parent is gone, and stay in the log.
 async fn tombstone(conn: &mut SqliteConnection, ctx: Ctx<'_>, t: &TombstoneRec) -> Result<Effect> {
-    // In a cluster the log says who created what; a standalone node created
-    // everything it holds.
+    // Uids carry their origin's prefix, so a tombstone can only name
+    // records its own origin created. A standalone node created everything.
     let own: Vec<String> = match ctx.origin {
         Some(o) => {
-            let mut v = vec![];
-            for chunk in t.uids.chunks(400) {
-                let sql = format!(
-                    "SELECT uid FROM repl_log WHERE origin = ? AND kind != 'tombstone' AND uid IN ({})",
-                    placeholders(chunk.len())
-                );
-                let mut q =
-                    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(&o.0[..]);
-                for uid in chunk {
-                    q = q.bind(uid);
-                }
-                v.extend(q.fetch_all(&mut *conn).await?);
-            }
-            v
+            let prefix = o.uid_prefix();
+            t.uids
+                .iter()
+                .filter(|u| u.starts_with(&prefix))
+                .cloned()
+                .collect()
         }
         None => t.uids.clone(),
     };
@@ -1020,7 +1012,11 @@ mod tests {
             Identity::generate().unwrap().id,
             Identity::generate().unwrap().id,
         );
-        for (origin, uid, seq) in [(&a, "req-a", 1), (&b, "req-b", 1)] {
+        let (ua, ub) = (
+            format!("{}req", a.uid_prefix()),
+            format!("{}req", b.uid_prefix()),
+        );
+        for (origin, uid, seq) in [(&a, ua.as_str(), 1), (&b, ub.as_str(), 1)] {
             let ctx = Ctx {
                 origin: Some(origin),
                 hlc: 10,
@@ -1034,7 +1030,8 @@ mod tests {
         // B lists both; only its own goes.
         let t = Record::Tombstone(TombstoneRec {
             uid: "tomb-1".into(),
-            uids: vec!["req-a".into(), "req-b".into()],
+            uids: vec![ua.clone(), ub.clone()],
+            seqs: vec![],
         });
         let ctx = Ctx {
             origin: Some(&b),
@@ -1045,11 +1042,11 @@ mod tests {
             .fetch_all(&mut *conn)
             .await
             .unwrap();
-        assert_eq!(left, ["req-a"]);
+        assert_eq!(left, std::slice::from_ref(&ua));
         assert_eq!(
             count(
                 &mut conn,
-                "SELECT COUNT(*) FROM tombstoned WHERE uid = 'req-a'"
+                &format!("SELECT COUNT(*) FROM tombstoned WHERE uid = '{ua}'")
             )
             .await,
             0
@@ -1057,7 +1054,9 @@ mod tests {
         assert_eq!(
             count(
                 &mut conn,
-                "SELECT COUNT(*) FROM repl_log WHERE uid = 'req-a' AND erased_by IS NOT NULL"
+                &format!(
+                    "SELECT COUNT(*) FROM repl_log WHERE uid = '{ua}' AND erased_by IS NOT NULL"
+                )
             )
             .await,
             0
@@ -1065,7 +1064,9 @@ mod tests {
         assert_eq!(
             count(
                 &mut conn,
-                "SELECT COUNT(*) FROM repl_log WHERE uid = 'req-b' AND erased_by = 'tomb-1'"
+                &format!(
+                    "SELECT COUNT(*) FROM repl_log WHERE uid = '{ub}' AND erased_by = 'tomb-1'"
+                )
             )
             .await,
             1
@@ -1134,6 +1135,7 @@ mod tests {
         let t = Record::Tombstone(TombstoneRec {
             uid: "tomb".into(),
             uids: vec!["req".into(), "job".into()],
+            seqs: vec![],
         });
         assert_eq!(apply(&mut conn, ctx(5), &t).await.unwrap(), Effect::Applied);
         for table in ["requests", "fp_claims", "scan_jobs", "scans", "ips"] {

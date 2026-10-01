@@ -137,7 +137,19 @@ async fn peer_loop(
                 stuck_backoff = Duration::from_secs(1);
             }
             Err(e) => {
-                node.record_status(peer, &name, Err(format!("{e:#}"))).await;
+                let msg = format!("{e:#}");
+                // We thought everyone else was gone; a peer says it is us.
+                if node.isolated() && msg.contains("pruned: no sign of life") {
+                    tracing::warn!(peer = %name, "the cluster pruned this node; rejoin with an invite");
+                    if super::set_detached(&node.store, Some(super::Detached::Pruned))
+                        .await
+                        .is_ok()
+                    {
+                        let _ = node.reload_members().await;
+                    }
+                    return;
+                }
+                node.record_status(peer, &name, Err(msg)).await;
                 last_hello = None;
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}

@@ -42,7 +42,7 @@
 | `src/cluster/msg.rs`, `src/cluster/record.rs`, `src/cluster/members.rs`, `src/config.rs` | modify | new messages; `remote_config` flag |
 | `src/cluster/cli.rs`, `src/main.rs` | modify | `config-key …`, `settings …` |
 | `src/admin/cluster.rs`, `src/admin/pages.rs`, `src/admin/mod.rs`, templates | modify | settings forms, config key card, node page |
-| `src/store/migrations/0014_config_audit.sql`, `0015_config_keys.sql` | create | audit list; held keys; `members.remote_config` |
+| `src/store/migrations/0015_config_audit.sql`, `0016_config_keys.sql` | create | audit list; held keys; `members.remote_config` |
 | `tests/roles_e2e.rs` | create | live role toggle on a real `peephole::run` |
 | `tests/cluster.rs` | modify | remote configuration tests |
 
@@ -51,7 +51,7 @@
 ### Task 1: The `Settings` handle
 
 **Files:**
-- Create: `src/settings.rs`, `src/store/migrations/0014_config_audit.sql`
+- Create: `src/settings.rs`, `src/store/migrations/0015_config_audit.sql`
 - Modify: `src/lib.rs`, `src/store/mod.rs`, `src/scan/pace.rs`, `src/scan/mod.rs`, `src/trap/mod.rs`, `src/admin/mod.rs`, `src/admin/pages.rs`, `src/admin/cluster.rs`
 - Test: `src/settings.rs` (unit)
 
@@ -357,7 +357,7 @@ mod tests {
 Run: `cargo test --lib settings::`
 Expected: compile errors (`Changes`, `Settings` … not found).
 
-- [ ] **Step 3: Schema.** Create `src/store/migrations/0014_config_audit.sql` and append it to `MIGRATIONS`:
+- [ ] **Step 3: Schema.** Create `src/store/migrations/0015_config_audit.sql` and append it to `MIGRATIONS`:
 
 ```sql
 -- Local list of settings changes made by other nodes (config key holders).
@@ -1355,7 +1355,7 @@ git commit -m "feat(roles): roles start and stop at runtime; peephole settings c
 ### Task 3: The config key
 
 **Files:**
-- Create: `src/cluster/confkey.rs`, `src/store/migrations/0015_config_keys.sql`
+- Create: `src/cluster/confkey.rs`, `src/store/migrations/0016_config_keys.sql`
 - Modify: `src/store/mod.rs`, `src/config.rs`, `src/cluster/mod.rs`, `src/cluster/record.rs`, `src/cluster/members.rs`, `src/cluster/msg.rs`, `src/scan/pace.rs`, `src/lib.rs`, `src/admin/cluster.rs`, `tests/cluster.rs`
 - Test: `src/cluster/confkey.rs` (unit), `tests/cluster.rs`
 
@@ -1467,7 +1467,7 @@ mod tests {
 Run: `cargo test --lib confkey::`
 Expected: compile errors.
 
-- [ ] **Step 3: Schema and config flag.** Create `src/store/migrations/0015_config_keys.sql`, append it to `MIGRATIONS`:
+- [ ] **Step 3: Schema and config flag.** Create `src/store/migrations/0016_config_keys.sql`, append it to `MIGRATIONS`:
 
 ```sql
 -- Config keys other operators gave to this node (local, never replicated).

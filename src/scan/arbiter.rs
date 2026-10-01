@@ -190,20 +190,24 @@ impl Arbiter {
     /// Take our next queued job for `scanner` and mark it running.
     async fn next_job(&self, scanner: NodeId) -> Result<Option<Grant>> {
         let me = self.node.id();
-        let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        // Not a job this scanner already handed back.
+        let declined: Vec<String> = {
+            let d = self.declined.lock().unwrap();
+            d.iter()
+                .filter(|(_, by)| by.contains(&scanner))
+                .map(|(uid, _)| uid.clone())
+                .collect()
+        };
+        let row: Option<(String, String, i64, i64)> = sqlx::query_as(
             "SELECT j.uid, i.ip, j.level, j.attempts FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
              WHERE j.status = 'queued' AND j.arbiter = ?
-             ORDER BY j.level DESC, j.queued_at ASC LIMIT 50",
+               AND j.uid NOT IN (SELECT value FROM json_each(?))
+             ORDER BY j.level DESC, j.queued_at ASC LIMIT 1",
         )
         .bind(&me.0[..])
-        .fetch_all(&self.node.store.pool)
+        .bind(serde_json::to_string(&declined)?)
+        .fetch_optional(&self.node.store.pool)
         .await?;
-        // Not a job this scanner already handed back.
-        let row = {
-            let declined = self.declined.lock().unwrap();
-            rows.into_iter()
-                .find(|(uid, ..)| !declined.get(uid).is_some_and(|s| s.contains(&scanner)))
-        };
         let Some((uid, ip, level, attempts)) = row else {
             return Ok(None);
         };
@@ -318,34 +322,71 @@ impl Arbiter {
         true
     }
 
-    /// Members currently running the scanner role (this node included).
+    /// Scanners that could still take a job: members with the scanner role
+    /// that this node does not block and has heard from recently (or has not
+    /// had the chance to hear from yet), this node included.
     fn scanners(&self) -> Vec<NodeId> {
+        let me = self.node.id();
         let mut v: Vec<NodeId> = self
             .node
             .members()
             .values()
             .filter(|m| m.roles.iter().any(|r| r == "scanner"))
             .map(|m| m.id)
+            .filter(|id| {
+                *id == me
+                    || (!self.node.is_blocked(id) && self.node.silent_for(id) < SCANNER_PRESENT)
+            })
             .collect();
-        if self.node.roles.scanner && !v.contains(&self.node.id()) {
-            v.push(self.node.id());
+        if self.node.roles.scanner && !v.contains(&me) {
+            v.push(me);
         }
         v
+    }
+
+    /// Whether every scanner that could take `uid` has declined it.
+    fn all_declined(&self, uid: &str) -> bool {
+        let d = self.declined.lock().unwrap();
+        d.get(uid)
+            .is_some_and(|by| self.scanners().iter().all(|s| by.contains(s)))
+    }
+
+    /// Declined jobs wait for another scanner. When the scanners that have
+    /// not declined a job are gone, nobody is left to take it: refuse it.
+    /// Entries of jobs that are no longer queued here are dropped.
+    async fn recheck_declined(&self) -> Result<()> {
+        let uids: Vec<String> = self.declined.lock().unwrap().keys().cloned().collect();
+        for uid in uids {
+            let queued = matches!(self.job(&uid).await?, Some((st, ..)) if st == "queued");
+            if !queued {
+                self.declined.lock().unwrap().remove(&uid);
+            } else if self.all_declined(&uid) {
+                self.declined.lock().unwrap().remove(&uid);
+                self.set_state(
+                    &uid,
+                    "refused",
+                    Some("declined by every scanner (never_scan)".into()),
+                    Some(now_ts()),
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     /// A scanner handed the job back. It returns to the queue for the other
     /// scanners; once every scanner has declined, it is refused for good.
     async fn decline(&self, scanner: NodeId, uid: &str, why: Option<String>) -> bool {
-        let everyone = {
-            let mut d = self.declined.lock().unwrap();
-            let set = d.entry(uid.to_string()).or_default();
-            set.insert(scanner);
-            let all = self.scanners().iter().all(|s| set.contains(s));
-            if all {
-                d.remove(uid);
-            }
-            all
-        };
+        self.declined
+            .lock()
+            .unwrap()
+            .entry(uid.to_string())
+            .or_default()
+            .insert(scanner);
+        let everyone = self.all_declined(uid);
+        if everyone {
+            self.declined.lock().unwrap().remove(uid);
+        }
         let r = if everyone {
             let why = format!(
                 "declined by every scanner ({})",
@@ -379,6 +420,7 @@ impl Arbiter {
             }
             gone
         };
+        self.recheck_declined().await?;
         if expired.is_empty() {
             return Ok(());
         }
@@ -399,6 +441,10 @@ impl Arbiter {
         Ok(())
     }
 }
+
+/// A scanner silent for longer than this no longer counts as someone who
+/// could still take a declined job.
+const SCANNER_PRESENT: Duration = Duration::from_secs(300);
 
 /// Heartbeats this recent count a scanner as alive for takeover decisions.
 const LIVE_WINDOW: Duration = Duration::from_secs(45);
@@ -478,4 +524,66 @@ async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Re
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::identity::Identity;
+
+    /// Jobs a scanner handed back must not hide the jobs behind them.
+    #[tokio::test]
+    async fn declined_jobs_do_not_starve_a_scanner() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let node = Node::open(crate::cluster::NodeParams {
+            identity: Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store: store.clone(),
+            proto: (2, 2),
+            has_maxmind: false,
+            data_dir: dir.path().to_path_buf(),
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let arbiter = Arbiter::start(node.clone(), rx).await.unwrap();
+        let rec = Recorder::Cluster(node.clone());
+        // 60 urgent jobs the scanner declined, then one it can run.
+        for i in 0..61u8 {
+            let ip = store
+                .upsert_ip(format!("203.0.113.{}", i + 1).parse().unwrap())
+                .await
+                .unwrap();
+            rec.enqueue_scan(ip.id, if i < 60 { 3 } else { 1 }, 24)
+                .await
+                .unwrap();
+        }
+        let scanner = Identity::generate().unwrap().id;
+        let urgent: Vec<String> = sqlx::query_scalar("SELECT uid FROM scan_jobs WHERE level = 3")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(urgent.len(), 60);
+        {
+            let mut d = arbiter.declined.lock().unwrap();
+            for uid in urgent {
+                d.entry(uid).or_default().insert(scanner);
+            }
+        }
+        let grant = arbiter.next_job(scanner).await.unwrap();
+        assert_eq!(grant.map(|g| g.level), Some(1));
+    }
 }

@@ -33,6 +33,13 @@ impl NodeId {
 
     /// Short, stable label for logs and the admin UI (12 hex chars of the
     /// key's SHA-256). Not unique enough to authenticate anything.
+    /// Prefix of every uid this node creates. It binds a record's uid to
+    /// its origin: no other node can create a record under the same uid, so
+    /// nobody can shadow or delete it.
+    pub fn uid_prefix(&self) -> String {
+        format!("{}-", data_encoding::HEXLOWER.encode(&self.0[..12]))
+    }
+
     pub fn short(&self) -> String {
         use sha2::Digest;
         data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(self.0)[..6])

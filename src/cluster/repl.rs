@@ -212,13 +212,22 @@ async fn held_proof(
     })
 }
 
-/// Whether `proof` is a tombstone signed by `origin` that lists `uid`.
-fn proves(proof: &WireEntry, origin: &NodeId, tomb_uid: &str, uid: &str) -> bool {
-    proof.origin == *origin
+/// Whether `proof` is a tombstone, signed by the stub's origin, that names
+/// exactly this entry: its uid at its position in the origin's log. The
+/// stub itself is unsigned, so nothing else in it is taken on trust.
+fn proves(proof: &WireEntry, e: &WireEntry) -> bool {
+    let (Some(uid), Some(tomb)) = (&e.uid, &e.erased_by) else {
+        return false;
+    };
+    proof.origin == e.origin
         && proof.kind == "tombstone"
-        && proof.uid.as_deref() == Some(tomb_uid)
+        && proof.uid.as_deref() == Some(tomb.as_str())
+        && e.seq < proof.seq
+        && uid.starts_with(&e.origin.uid_prefix())
         && proof.verify()
-        && matches!(proof.record(), Some(Record::Tombstone(t)) if t.uids.iter().any(|u| u == uid))
+        && matches!(proof.record(), Some(Record::Tombstone(t))
+            if t.uids.len() == t.seqs.len()
+                && t.uids.iter().zip(&t.seqs).any(|(u, s)| u == uid && *s == e.seq))
 }
 
 /// Check an erased stub against the batch's proofs and the tombstones we
@@ -228,13 +237,13 @@ async fn erasure_proven(
     proofs: &[WireEntry],
     e: &WireEntry,
 ) -> Result<bool> {
-    let (Some(uid), Some(tomb)) = (&e.uid, &e.erased_by) else {
+    let Some(tomb) = &e.erased_by else {
         return Ok(false);
     };
     if let Some(held) = held_proof(conn, &e.origin, tomb).await? {
-        return Ok(proves(&held, &e.origin, tomb, uid));
+        return Ok(proves(&held, e));
     }
-    let Some(p) = proofs.iter().find(|p| proves(p, &e.origin, tomb, uid)) else {
+    let Some(p) = proofs.iter().find(|p| proves(p, e)) else {
         return Ok(false);
     };
     sqlx::query("INSERT OR IGNORE INTO tomb_proofs (origin, tomb_uid, entry) VALUES (?, ?, ?)")
@@ -308,6 +317,13 @@ pub async fn append_in_tx(
         .max(pending_head(conn, &me).await?)
         + 1;
     let e = WireEntry::sign(&node.identity, seq, node.hlc.now(), record)?;
+    // Peers drop an entry whose uid is not bound to its origin, and with it
+    // everything after it in our log: never write one.
+    if let Some(uid) = &e.uid
+        && !uid.starts_with(&me.uid_prefix())
+    {
+        anyhow::bail!("record uid `{uid}` does not carry this node's prefix");
+    }
     insert_log(conn, &e, true).await?;
     let settled = apply_record(node, conn, &e, record).await?;
     Ok((e, settled.membership))
@@ -409,6 +425,15 @@ async fn apply_one(
     }
     if e.payload.is_none() {
         return apply_stub(node, conn, e, held > have, proofs, st).await;
+    }
+    // A uid must carry its origin's prefix: otherwise a node could create a
+    // record under another node's uid and shadow or delete the original.
+    if let Some(uid) = &e.uid
+        && !uid.starts_with(&e.origin.uid_prefix())
+    {
+        warn!(origin = %e.origin.short(), seq = e.seq, "entry whose uid is not bound to its origin dropped");
+        st.rejected += 1;
+        return Ok(());
     }
     // Verify before parking too, so junk never takes up space or blocks
     // the real entry at that position.
@@ -635,34 +660,49 @@ async fn retry_deferred(node: &Node, conn: &mut SqliteConnection, st: &mut Appli
     }
 }
 
+/// Entries replayed per transaction by [`rematerialize`], so the write lock
+/// is never held for long.
+const REPLAY_BATCH: usize = 1000;
+
 /// Apply log entries that are held with their payload but have no row:
 /// after an unblock, everything the block kept out of the tables. Records an
 /// admin hid stay hidden. Returns how many entries were looked at.
 pub async fn rematerialize(node: &Node) -> Result<usize> {
-    let _g = node.apply_lock.lock().await;
-    let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-    // Parents first; job state after the jobs it refers to.
-    let rows: Vec<LogRow> = sqlx::query_as(
-        "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by FROM repl_log
+    // Parents first; job state after the jobs it refers to. Only the keys
+    // are collected up front; the entries are loaded batch by batch.
+    let keys: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT origin, seq FROM repl_log
          WHERE payload IS NOT NULL
            AND kind IN ('request','scan_job','job_adopt','job_status','fp_claim',
                         'fingerprint','scan_result','ip_enrich')
          ORDER BY CASE kind WHEN 'request' THEN 0 WHEN 'scan_job' THEN 1
                             WHEN 'job_adopt' THEN 2 WHEN 'job_status' THEN 3 ELSE 4 END, hlc",
     )
-    .fetch_all(&mut *tx)
+    .fetch_all(&node.store.pool)
     .await?;
-    let n = rows.len();
-    for r in rows {
-        let e = from_row(r)?;
-        if let Some(rec) = e.record() {
-            apply_record(node, &mut tx, &e, &rec).await?;
+    for batch in keys.chunks(REPLAY_BATCH) {
+        let _g = node.apply_lock.lock().await;
+        let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        for (origin, seq) in batch {
+            let row: Option<LogRow> = sqlx::query_as(
+                "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by FROM repl_log
+                 WHERE origin = ? AND seq = ?",
+            )
+            .bind(origin)
+            .bind(seq)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(e) = row.map(from_row).transpose()? else {
+                continue;
+            };
+            if let Some(rec) = e.record() {
+                apply_record(node, &mut tx, &e, &rec).await?;
+            }
         }
+        tx.commit().await?;
     }
-    tx.commit().await?;
-    drop(_g);
     node.notify_changed();
-    Ok(n)
+    Ok(keys.len())
 }
 
 /// What applying a record did, beyond its table effects.

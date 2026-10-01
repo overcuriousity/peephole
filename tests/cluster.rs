@@ -686,6 +686,171 @@ async fn a_node_offline_for_over_30_days_starts_detached() {
     assert_eq!(x.detached(), Some(cluster::Detached::Pruned));
 }
 
+/// A record's uid is bound to the node that created it. Nobody can create
+/// a record under another node's uid, so nobody can delete or shadow it.
+#[tokio::test]
+async fn a_uid_not_bound_to_its_origin_is_rejected() {
+    let (a_id, b_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+    let (a, b) = (
+        Addr {
+            name: "a",
+            id: a_id.id,
+            port: 1,
+        },
+        Addr {
+            name: "b",
+            id: b_id.id,
+            port: 2,
+        },
+    );
+    let (x, _dx) = offline_node(&[&a, &b]).await;
+    let request = |uid: String| {
+        Record::Request(peephole::cluster::record::RequestRec {
+            uid,
+            ts: "2026-01-01 00:00:00".into(),
+            ip: "203.0.113.80".into(),
+            method: "GET".into(),
+            path: "/x".into(),
+            query: None,
+            headers_json: "[]".into(),
+            body: None,
+            labels_json: "[]".into(),
+            severity: 1,
+            scan_level: 0,
+            is_fp_claim: false,
+            page_token: None,
+        })
+    };
+    let a_uid = format!("{}one", a_id.id.uid_prefix());
+    let st = repl::apply_batch(
+        &x,
+        vec![WireEntry::sign(&a_id, 1, hlc_days_ago(0, 1), &request(a_uid.clone())).unwrap()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(st.applied, 1, "{st:?}");
+    // B signs a record under A's uid, then one under an unbound uid.
+    for uid in [a_uid, "plain".to_string()] {
+        let st = repl::apply_batch(
+            &x,
+            vec![WireEntry::sign(&b_id, 1, hlc_days_ago(0, 2), &request(uid)).unwrap()],
+        )
+        .await
+        .unwrap();
+        assert_eq!((st.applied, st.rejected), (0, 1), "{st:?}");
+    }
+    assert_eq!(head_of(&x, b_id.id).await, 0);
+    assert_eq!(count(&x, "SELECT COUNT(*) FROM requests").await, 1);
+}
+
+/// A sponsor cannot keep a node from leaving by dating its admission into
+/// the future.
+#[tokio::test]
+async fn a_future_dated_admission_cannot_keep_a_node_from_leaving() {
+    let (a_id, w_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+    let a = Addr {
+        name: "a",
+        id: a_id.id,
+        port: 1,
+    };
+    let (x, _dx) = offline_node(&[&a]).await;
+    let info = peephole::cluster::record::MemberInfo {
+        id: w_id.id,
+        name: "w".into(),
+        address: None,
+        roles: vec![],
+        proto_min: 2,
+        proto_max: 2,
+    };
+    let far = hlc_days_ago(0, 1) + ((400u64 * 24 * 3600 * 1000) << 16);
+    repl::apply_batch(
+        &x,
+        vec![WireEntry::sign(&a_id, 1, far, &Record::MemberAdd(info.clone())).unwrap()],
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    repl::apply_batch(
+        &x,
+        vec![
+            WireEntry::sign(&w_id, 1, hlc_days_ago(0, 2), &Record::MemberUpdate(info)).unwrap(),
+            WireEntry::sign(
+                &w_id,
+                2,
+                hlc_days_ago(0, 3),
+                &Record::MemberRevoke { id: w_id.id },
+            )
+            .unwrap(),
+        ],
+    )
+    .await
+    .unwrap();
+    let rows = members::all(&x.store).await.unwrap();
+    let w = rows.iter().find(|m| m.id == w_id.id).unwrap();
+    assert_eq!(w.standing, members::Standing::Left);
+}
+
+/// A node that kept running but was cut off for 30 days keeps probing the
+/// members it believes pruned, and learns from them that it is the one
+/// that was pruned.
+#[tokio::test]
+async fn a_node_cut_off_for_30_days_learns_it_was_pruned() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    eventually("everyone knows everyone", || async {
+        knows(&na, c.id, true).await
+            && knows(&nb, c.id, true).await
+            && knows(&nc, a.id, true).await
+            && knows(&nc, b.id, true).await
+    })
+    .await;
+    // Let every log reach every node first, so no late admission arrives
+    // after the clocks are turned back below.
+    eventually("logs converged", || async {
+        let mut same = true;
+        for origin in [a.id, b.id, c.id] {
+            let h = head_of(&na, origin).await;
+            same &= h > 0 && h == head_of(&nb, origin).await && h == head_of(&nc, origin).await;
+        }
+        same
+    })
+    .await;
+    // 40 days without contact, as each side sees the other.
+    let forget = |n: &TestNode, who: NodeId| {
+        let pool = n.store.pool.clone();
+        async move {
+            let old = hlc_days_ago(40, 0) as i64;
+            sqlx::query("UPDATE repl_log SET hlc = ? WHERE origin = ?")
+                .bind(old)
+                .bind(&who.0[..])
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE members SET admitted_hlc = ? WHERE id = ?")
+                .bind(old)
+                .bind(&who.0[..])
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    forget(&na, c.id).await;
+    forget(&nb, c.id).await;
+    forget(&nc, a.id).await;
+    forget(&nc, b.id).await;
+    eventually_for(
+        Duration::from_secs(90),
+        "c learns it was pruned",
+        || async { nc.detached() == Some(cluster::Detached::Pruned) },
+    )
+    .await;
+    assert_eq!(na.detached(), None);
+}
+
 /// Entries are applied only with a valid origin signature, and entries
 /// from a not-yet-trusted origin wait until it is admitted.
 #[tokio::test]
@@ -1036,6 +1201,26 @@ async fn erased_stubs_need_the_origins_tombstone() {
     // X can pass the erasure on with its proof.
     assert_eq!(batch_of(&x, a.id).await.proofs.len(), 1);
 
+    // A relay relabels the live /two entry as the erased /one: the proof
+    // names /one's own position in A's log, so it does not cover this one.
+    let (w, _dw) = offline_node(&[&a, &b]).await;
+    let mut relabel = Batch {
+        entries: after.entries.clone(),
+        proofs: after.proofs.clone(),
+    };
+    let e = relabel
+        .entries
+        .iter_mut()
+        .find(|e| e.uid.as_deref() == Some(two.as_str()))
+        .unwrap();
+    e.payload = None;
+    e.sig = None;
+    e.uid = Some(one.clone());
+    e.erased_by = Some(tomb.clone());
+    let st = repl::apply_batch(&w, relabel).await.unwrap();
+    assert!(st.rejected >= 1, "relabelled entry: {st:?}");
+    assert!(head_of(&w, a.id).await < a_head);
+
     // No proof, a proof from another origin, a stub without a uid: rejected.
     let stub_only = Batch {
         entries: after.entries.clone(),
@@ -1052,6 +1237,7 @@ async fn erased_stubs_need_the_origins_tombstone() {
                 &Record::Tombstone(peephole::cluster::record::TombstoneRec {
                     uid: tomb.clone(),
                     uids: vec![one.clone()],
+                    seqs: vec![1],
                 }),
             )
             .unwrap(),
@@ -1180,14 +1366,22 @@ async fn foreign_delete_hides_locally_and_keeps_relaying() {
         .upsert_ip("203.0.113.71".parse().unwrap())
         .await
         .unwrap();
+    let mut first = None;
     for path in ["/one", "/two"] {
-        rec(&na)
+        let id = rec(&na)
             .insert_request(&new_request(ip.id, path))
             .await
             .unwrap();
+        first.get_or_insert(id);
     }
-    eventually("b has both", || async {
+    // /one comes with a browser fingerprint.
+    rec(&na)
+        .insert_fingerprint(first, ip.id, "fp1", Some("v1"), "{}", "{}", b"events")
+        .await
+        .unwrap();
+    eventually("b has both, and the fingerprint", || async {
         count(&nb, "SELECT COUNT(*) FROM requests").await == 2
+            && count(&nb, "SELECT COUNT(*) FROM fingerprints").await == 1
     })
     .await;
     let one_on_b: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/one'")
@@ -1196,6 +1390,11 @@ async fn foreign_delete_hides_locally_and_keeps_relaying() {
         .unwrap();
     let out = rec(&nb).delete_request(one_on_b).await.unwrap();
     assert_eq!((out.deleted, out.hidden), (0, 1));
+    assert_eq!(
+        count(&nb, "SELECT COUNT(*) FROM fingerprints").await,
+        0,
+        "the hidden request's fingerprint is hidden with it"
+    );
     // Repeating it finds nothing and fails nothing.
     let again = rec(&nb).delete_request(one_on_b).await.unwrap();
     assert_eq!((again.deleted, again.hidden), (0, 0));
@@ -1723,7 +1922,7 @@ async fn duplicate_jobs_are_superseded() {
     rec(&nb)
         .write(vec![Record::ScanJob(
             peephole::cluster::record::ScanJobRec {
-                uid: "dup-job".into(),
+                uid: format!("{}dup-job", b.id.uid_prefix()),
                 ip: ip.into(),
                 level: 2,
                 queued_at: peephole::store::data::now_ts(),

@@ -174,6 +174,9 @@ pub struct Node {
     members: RwLock<Arc<HashMap<NodeId, MemberRow>>>,
     /// Set while this node is out of its cluster (left or pruned).
     detached: RwLock<Option<Detached>>,
+    /// Every other member looks pruned to us: more likely we are the one
+    /// that was cut off. They are then still dialled, to find out.
+    isolated: std::sync::atomic::AtomicBool,
     /// Peers this node blocked (a local decision, see [`block`]).
     blocked: RwLock<Arc<std::collections::HashSet<NodeId>>>,
     /// The standing of every known node, members or not.
@@ -218,6 +221,7 @@ impl Node {
             hlc: hlc::Hlc::new(),
             members: RwLock::new(Arc::new(HashMap::new())),
             detached: RwLock::new(None),
+            isolated: Default::default(),
             blocked: RwLock::new(Arc::new(Default::default())),
             standings: RwLock::new(Arc::new(HashMap::new())),
             address_override,
@@ -323,6 +327,11 @@ impl Node {
         *self.detached.read().unwrap()
     }
 
+    /// Whether every other member looks pruned from here (see `isolated`).
+    pub fn isolated(&self) -> bool {
+        self.isolated.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Whether this node blocked `id` (a local decision, see [`block`]).
     pub fn is_blocked(&self, id: &NodeId) -> bool {
         self.blocked.read().unwrap().contains(id)
@@ -365,9 +374,24 @@ impl Node {
         let blocked: std::collections::HashSet<NodeId> =
             block::list(&self.store).await?.into_iter().collect();
         let standings: HashMap<_, _> = rows.iter().map(|m| (m.id, m.standing)).collect();
+        // When nobody else is active but some were pruned, we were probably
+        // the one out of touch: keep treating them as members, so contact
+        // can resume or they can tell us that we were pruned.
+        let me = self.identity.id;
+        let others = |s: members::Standing| {
+            rows.iter()
+                .filter(|m| m.id != me && m.standing == s)
+                .count()
+        };
+        let isolated =
+            others(members::Standing::Active) == 0 && others(members::Standing::Pruned) > 0;
+        self.isolated
+            .store(isolated, std::sync::atomic::Ordering::Relaxed);
         let map: HashMap<_, _> = rows
             .into_iter()
-            .filter(|m| m.active || m.id == self.identity.id)
+            .filter(|m| {
+                m.active || m.id == me || (isolated && m.standing == members::Standing::Pruned)
+            })
             .map(|m| (m.id, m))
             .collect();
         let before = self.dial_targets();

@@ -95,9 +95,16 @@ member counts, which is what "not seen by anybody" means.
 To make an idle node visible, every running node appends a `member_update`
 for itself whenever its newest own entry is older than 24 hours.
 
+An admission dated into the future counts from the moment it is applied, so
+a sponsor cannot outrank a node's later decision to leave.
+
 A pruned member is inactive: not dialled, refused on RPC with a distinct
 "pruned" error, shown as pruned in the UI and CLI. Its records stay in the
 dataset. It rejoins with an invite (`member_add` renews the evidence).
+
+A node that kept running but could reach nobody sees every other member as
+pruned. It keeps dialling them, and detaches as pruned when one of them
+answers that it was the one pruned.
 
 A node that starts and finds its own newest entry older than 30 days treats
 itself as pruned: it does not judge other members by its outdated log, shows
@@ -142,19 +149,25 @@ invite UI says so, and suggests a use limit or expiry.
 
 ### 4.1 Cluster-wide effect
 
-A tombstone lists the uids it deletes and erases only entries whose origin
-equals the tombstone's origin; uids of other nodes' records in the list are
-ignored. The deleting node resolves "everything about this IP" into the uids
-of its own records before it writes the tombstone.
+Every record's uid carries a prefix derived from its origin's key, and a
+node drops any entry whose uid does not carry its origin's prefix. So no
+node can create a record under another node's uid, and a uid always names
+one record of one origin.
+
+A tombstone lists the uids it deletes, and for each its position in the
+origin's log. It erases only entries of its own origin; uids of other
+nodes' records in the list are ignored. The deleting node resolves
+"everything about this IP" into the uids of its own records before it writes
+the tombstone.
 
 Records of other nodes that depend on a deleted one (a claim on a deleted
 request, a scan result of a deleted job) are not erased: they leave the
 tables on every node, because their parent is gone, and stay in the log.
 
 An erased entry travels as a stub without payload. A node accepts a stub
-only together with the signed tombstone, by the same origin, that lists its
-uid. Without this a relaying member could make other nodes drop records
-their origin never deleted.
+only together with the signed tombstone, by the same origin, that names
+that uid at that log position. Without this a relaying member could make
+other nodes drop records their origin never deleted.
 
 ### 4.2 Local hide
 

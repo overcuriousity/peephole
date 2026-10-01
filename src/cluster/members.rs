@@ -64,6 +64,13 @@ pub fn standing(
     }
 }
 
+/// An admission time no later than now. A sponsor's timestamp from the
+/// future must not outrank what the admitted node decides later (leaving),
+/// nor count as a sign of life that has not happened yet.
+fn not_future(hlc: u64) -> u64 {
+    hlc.min((super::hlc::wall_ms() << 16) | 0xffff)
+}
+
 /// A member row as the UI and CLI show it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MemberRow {
@@ -99,7 +106,8 @@ type Row = (
 
 const SELECT: &str = "SELECT id, name, address, roles_json, proto_min, proto_max,
                              sponsor, info_hlc, admitted_hlc, revoked_hlc,
-                             (SELECT l.hlc FROM repl_log l WHERE l.origin = members.id
+                             (SELECT l.hlc FROM repl_log l
+                              WHERE l.origin = members.id AND l.sig IS NOT NULL
                               ORDER BY l.seq DESC LIMIT 1)
                       FROM members";
 
@@ -198,16 +206,17 @@ pub async fn apply(
                 warn!(origin = %e.origin.short(), "ignored self-sponsored member_add");
                 return Ok(true);
             }
+            let at = not_future(e.hlc);
             match get(conn, &info.id).await? {
                 None => {
-                    insert(conn, info, &e.origin, 0, e.hlc).await?;
+                    insert(conn, info, &e.origin, 0, at).await?;
                     info!(member = %info.name, id = %info.id.short(), by = %e.origin.short(), "member admitted");
                 }
                 Some(m) => {
                     sqlx::query(
                         "UPDATE members SET admitted_hlc = MAX(admitted_hlc, ?) WHERE id = ?",
                     )
-                    .bind(e.hlc as i64)
+                    .bind(at as i64)
                     .bind(&info.id.0[..])
                     .execute(&mut *conn)
                     .await?;
