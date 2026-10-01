@@ -51,7 +51,9 @@ pub struct RequestRow {
 impl Store {
     pub async fn upsert_ip(&self, ip: IpAddr) -> Result<IpRow> {
         let s = ip.to_string();
-        let mut conn = self.pool.acquire().await?;
+        // One transaction: a result applied between the insert and the
+        // refresh would otherwise be overwritten by a stale view.
+        let mut conn = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let created = sqlx::query(
             "INSERT OR IGNORE INTO ips (ip, first_seen, last_seen)
              VALUES (?, datetime('now'), datetime('now'))",
@@ -70,10 +72,12 @@ impl Store {
                 .execute(&mut *conn)
                 .await?;
         }
-        Ok(sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE ip = ?")
+        let row = sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE ip = ?")
             .bind(&s)
             .fetch_one(&mut *conn)
-            .await?)
+            .await?;
+        conn.commit().await?;
+        Ok(row)
     }
 
     pub async fn ip_by_id(&self, id: i64) -> Result<Option<IpRow>> {
