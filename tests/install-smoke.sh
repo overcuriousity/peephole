@@ -84,5 +84,7 @@ if grep -q 'webauthn\|maxmind\|trap_listen\|admin_listen' /etc/peephole/config.t
 fi
 grep -q 'ed25519:' /tmp/headless.log
 /usr/local/bin/peephole check-config /etc/peephole/config.toml
-/usr/local/bin/peephole cluster members /etc/peephole/config.toml | grep -q 'scanner-1'
+# The node lists itself once the daemon has run (`cluster members` is read-only
+# and systemd is stubbed here); the config names it.
+grep -q '^node_name = "scanner-1"' /etc/peephole/config.toml
 echo "== ok"
