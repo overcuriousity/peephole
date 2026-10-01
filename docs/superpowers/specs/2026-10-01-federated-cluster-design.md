@@ -142,10 +142,19 @@ invite UI says so, and suggests a use limit or expiry.
 
 ### 4.1 Cluster-wide effect
 
-A tombstone erases only entries whose origin equals the tombstone's origin.
-This is checked when a tombstone is applied and when a later entry is tested
-against earlier tombstones. For the `Ip` target ("everything about this IP up
-to now") it means: everything this origin recorded about the IP.
+A tombstone lists the uids it deletes and erases only entries whose origin
+equals the tombstone's origin; uids of other nodes' records in the list are
+ignored. The deleting node resolves "everything about this IP" into the uids
+of its own records before it writes the tombstone.
+
+Records of other nodes that depend on a deleted one (a claim on a deleted
+request, a scan result of a deleted job) are not erased: they leave the
+tables on every node, because their parent is gone, and stay in the log.
+
+An erased entry travels as a stub without payload. A node accepts a stub
+only together with the signed tombstone, by the same origin, that lists its
+uid. Without this a relaying member could make other nodes drop records
+their origin never deleted.
 
 ### 4.2 Local hide
 
