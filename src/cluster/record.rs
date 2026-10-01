@@ -140,6 +140,16 @@ pub struct ScanResultRec {
     pub ports: Vec<PortRec>,
 }
 
+/// A new version of a shared intel file, fetched by the origin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntelManifestRec {
+    /// `geolite2-city`, `geolite2-asn` or `tor-exits`.
+    pub kind: String,
+    pub sha256: String,
+    pub size: u64,
+    pub fetched_at: String,
+}
+
 /// What a tombstone deletes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -186,6 +196,7 @@ pub enum Record {
     JobAdopt(JobAdoptRec),
     ScanResult(ScanResultRec),
     Tombstone(TombstoneRec),
+    IntelManifest(IntelManifestRec),
 }
 
 /// Kinds whose payload is not stored in the log but rebuilt from their row
@@ -207,6 +218,7 @@ impl Record {
             Record::JobAdopt(_) => "job_adopt",
             Record::ScanResult(_) => "scan_result",
             Record::Tombstone(_) => "tombstone",
+            Record::IntelManifest(_) => "intel_manifest",
         }
     }
 

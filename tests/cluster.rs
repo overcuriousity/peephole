@@ -41,7 +41,7 @@ fn new_node(name: &'static str) -> (Identity, Addr) {
 
 struct TestNode {
     node: Arc<Node>,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     _stop: tokio::sync::watch::Sender<bool>,
     pace: peephole::scan::pace::SharedPace,
     workers: Option<tokio::task::JoinHandle<()>>,
@@ -131,6 +131,7 @@ async fn boot_in(
             cluster::rpc::proto::PROTO_VERSION,
         )),
         has_maxmind: false,
+        data_dir: dir.path().to_path_buf(),
     })
     .await
     .unwrap();
@@ -161,7 +162,7 @@ async fn boot_in(
     cluster::start(node.clone(), rx).await.unwrap();
     TestNode {
         node,
-        _dir: dir,
+        dir,
         _stop: tx,
         pace,
         workers,
@@ -438,6 +439,7 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
         store,
         proto: (1, 1),
         has_maxmind: false,
+        data_dir: dir.path().to_path_buf(),
     })
     .await
     .unwrap();
@@ -633,6 +635,7 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
         store,
         proto: (1, 1),
         has_maxmind: false,
+        data_dir: dir.path().to_path_buf(),
     })
     .await
     .unwrap();
@@ -1239,4 +1242,64 @@ async fn pace_is_set_remotely() {
             .is_some_and(|p| p.max_scans_per_hour == 42)
     })
     .await;
+}
+
+// --------------------------------------------------------------- intel
+
+use peephole::intel::share;
+
+/// A fetches the GeoLite2 databases; B copies them by hash from A, C from
+/// whichever peer still holds that exact version.
+#[tokio::test]
+async fn intel_files_are_shared_by_hash() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    for f in ["GeoLite2-City", "GeoLite2-ASN"] {
+        std::fs::copy(
+            format!("tests/fixtures/{f}-Test.mmdb"),
+            na.dir.path().join(format!("{f}.mmdb")),
+        )
+        .unwrap();
+    }
+    share::publish(&na, na.dir.path(), &[share::CITY, share::ASN])
+        .await
+        .unwrap();
+    eventually("b knows the manifests", || async {
+        share::manifests(&nb.store).await.unwrap().len() == 2
+    })
+    .await;
+    let mut got = share::sync_files(&nb, nb.dir.path()).await.unwrap();
+    got.sort();
+    assert_eq!(got, [share::ASN, share::CITY]);
+    let g = peephole::intel::geo::GeoIp::load(nb.dir.path()).unwrap();
+    assert_eq!(
+        g.lookup(&"2.125.160.216".parse().unwrap())
+            .country
+            .as_deref(),
+        Some("GB")
+    );
+    assert!(
+        share::sync_files(&nb, nb.dir.path())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A's copy changes without a new announcement: A no longer serves it,
+    // B still does.
+    std::fs::write(na.dir.path().join("GeoLite2-City.mmdb"), b"tampered").unwrap();
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    eventually("c knows the manifests", || async {
+        share::manifests(&nc.store).await.unwrap().len() == 2
+    })
+    .await;
+    eventually("c knows b", || async { nc.status.reached_recently(&b.id) }).await;
+    let got = share::sync_files(&nc, nc.dir.path()).await.unwrap();
+    assert_eq!(got.len(), 2, "{got:?}");
+    let (sha, _) = share::file_hash(&nc.dir.path().join("GeoLite2-City.mmdb")).unwrap();
+    let (want, _) = share::file_hash(&nb.dir.path().join("GeoLite2-City.mmdb")).unwrap();
+    assert_eq!(sha, want);
 }

@@ -38,6 +38,8 @@ pub struct NodeParams {
     pub proto: (u32, u32),
     /// This node has MaxMind credentials (published in heartbeats).
     pub has_maxmind: bool,
+    /// Where shared intel files live (served to peers).
+    pub data_dir: std::path::PathBuf,
 }
 
 impl NodeParams {
@@ -55,6 +57,7 @@ impl NodeParams {
             store,
             proto: (proto::PROTO_MIN, proto::PROTO_VERSION),
             has_maxmind: cfg.maxmind.is_some(),
+            data_dir: cfg.data_dir.clone(),
         })
     }
 }
@@ -90,6 +93,7 @@ pub struct Node {
     /// Wakes the sync supervisor when the set of dialable members changes.
     pub members_changed: tokio::sync::Notify,
     pub has_maxmind: bool,
+    pub data_dir: std::path::PathBuf,
     /// Contacts and heartbeats (ephemeral).
     pub status: status::Status,
     pub msg: msg::Messaging,
@@ -121,6 +125,7 @@ impl Node {
             join_attempts: Mutex::new(Default::default()),
             members_changed: tokio::sync::Notify::new(),
             has_maxmind: p.has_maxmind,
+            data_dir: p.data_dir,
             status: Default::default(),
             msg: Default::default(),
             started: std::time::Instant::now(),

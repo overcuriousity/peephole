@@ -8,8 +8,8 @@
 //! already deleted are dropped instead of resurrecting it.
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{
-    FingerprintRec, FpClaimRec, IpEnrichRec, JobAdoptRec, JobStatusRec, PortRec, Record,
-    RequestRec, ScanJobRec, ScanResultRec, TombTarget, TombstoneRec,
+    FingerprintRec, FpClaimRec, IntelManifestRec, IpEnrichRec, JobAdoptRec, JobStatusRec, PortRec,
+    Record, RequestRec, ScanJobRec, ScanResultRec, TombTarget, TombstoneRec,
 };
 use anyhow::Result;
 use sqlx::SqliteConnection;
@@ -57,6 +57,7 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
         Record::JobAdopt(r) => job_adopt(conn, ctx, r).await,
         Record::ScanResult(r) => scan_result(conn, ctx, r).await,
         Record::Tombstone(t) => tombstone(conn, ctx, t).await,
+        Record::IntelManifest(m) => intel_manifest(conn, ctx, m).await,
         Record::MemberAdd(_) | Record::MemberUpdate(_) | Record::MemberRevoke { .. } => {
             Ok(Effect::Ignored)
         }
@@ -445,6 +446,29 @@ async fn scan_result(
             .await?;
         }
     }
+    Ok(Effect::Applied)
+}
+
+/// The newest announced version of an intel file wins (by HLC).
+async fn intel_manifest(
+    conn: &mut SqliteConnection,
+    ctx: Ctx<'_>,
+    m: &IntelManifestRec,
+) -> Result<Effect> {
+    sqlx::query(
+        "INSERT INTO intel_files (kind, sha256, size, fetched_at, origin, hlc) VALUES (?,?,?,?,?,?)
+         ON CONFLICT(kind) DO UPDATE SET sha256 = excluded.sha256, size = excluded.size,
+           fetched_at = excluded.fetched_at, origin = excluded.origin, hlc = excluded.hlc
+         WHERE excluded.hlc > intel_files.hlc",
+    )
+    .bind(&m.kind)
+    .bind(&m.sha256)
+    .bind(m.size as i64)
+    .bind(&m.fetched_at)
+    .bind(ctx.origin_bytes())
+    .bind(ctx.hlc as i64)
+    .execute(&mut *conn)
+    .await?;
     Ok(Effect::Applied)
 }
 

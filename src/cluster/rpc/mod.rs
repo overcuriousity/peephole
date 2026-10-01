@@ -32,6 +32,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/rpc/v1/gossip", post(gossip))
         .route("/rpc/v1/msg", post(message))
         .route("/rpc/v1/inbox", post(inbox))
+        .route("/rpc/v1/intel", post(intel_chunk))
         .route_layer(axum::middleware::from_fn_with_state(
             node.clone(),
             require_member,
@@ -114,6 +115,24 @@ async fn message(State(node): State<Arc<Node>>, Cbor(mut env): Cbor<Envelope>) -
         }
     });
     Cbor(true).into_response()
+}
+
+/// A chunk of a shared intel file (raw bytes), if we hold that version.
+async fn intel_chunk(
+    State(node): State<Arc<Node>>,
+    Cbor(req): Cbor<crate::intel::share::ChunkReq>,
+) -> Response {
+    let dir = node.data_dir.clone();
+    match tokio::task::spawn_blocking(move || crate::intel::share::read_chunk(&dir, &req)).await {
+        Ok(Ok(Some(bytes))) => (
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "version not held here").into_response(),
+        Ok(Err(e)) => internal(e),
+        Err(e) => internal(e.into()),
+    }
 }
 
 /// Long-poll for messages waiting for the caller.
