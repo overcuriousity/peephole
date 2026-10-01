@@ -27,13 +27,9 @@ pub struct Applied {
 }
 
 pub async fn heads(store: &crate::store::Store) -> Result<Heads> {
-    let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-        "SELECT origin, MAX(seq) FROM (
-           SELECT origin, seq FROM repl_log UNION ALL SELECT origin, seq FROM repl_pending
-         ) GROUP BY origin",
-    )
-    .fetch_all(&store.pool)
-    .await?;
+    let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as("SELECT origin, seq FROM repl_heads")
+        .fetch_all(&store.pool)
+        .await?;
     rows.into_iter()
         .map(|(o, s)| Ok((NodeId::from_slice(&o)?, s as u64)))
         .collect()
@@ -168,7 +164,22 @@ pub async fn entries_after(
     Ok(out)
 }
 
+/// Raise the held head of `origin` to `seq` (entries never go away, so
+/// heads only grow).
+async fn bump_head(conn: &mut SqliteConnection, origin: &NodeId, seq: u64) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO repl_heads (origin, seq) VALUES (?, ?)
+         ON CONFLICT(origin) DO UPDATE SET seq = MAX(seq, excluded.seq)",
+    )
+    .bind(&origin.0[..])
+    .bind(seq as i64)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 async fn insert_log(conn: &mut SqliteConnection, e: &WireEntry, applied: bool) -> Result<()> {
+    bump_head(conn, &e.origin, e.seq).await?;
     sqlx::query(
         "INSERT INTO repl_log (origin, seq, hlc, kind, uid, payload, sig, erased_by, applied, received_at)
          VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))",
@@ -330,6 +341,7 @@ async fn apply_one(
         .bind(super::rpc::cbor::encode(&e)?)
         .execute(&mut *conn)
         .await?;
+        bump_head(conn, &e.origin, e.seq).await?;
         st.parked += 1;
         return Ok(());
     }
@@ -513,4 +525,68 @@ async fn apply_record(
         _ => {}
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The heads table must agree with what the log and parked entries hold.
+    #[tokio::test]
+    async fn heads_table_matches_held_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let node = super::super::Node::open(super::super::NodeParams {
+            identity: super::super::identity::Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            never_scan: vec![],
+            store: store.clone(),
+            proto: (1, 1),
+            has_maxmind: false,
+            data_dir: dir.path().to_path_buf(),
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        let other = super::super::identity::Identity::generate().unwrap();
+        let rec = |id: &super::super::identity::Identity| {
+            super::Record::MemberUpdate(super::super::record::MemberInfo {
+                id: id.id,
+                name: "o".into(),
+                address: None,
+                roles: vec![],
+                never_scan: vec![],
+                proto_min: 1,
+                proto_max: 1,
+            })
+        };
+        // A parked entry from an unknown origin counts as held.
+        let e = super::WireEntry::sign(&other, 1, 5, &rec(&other)).unwrap();
+        super::apply_batch(&node, vec![e]).await.unwrap();
+        let h = super::heads(&store).await.unwrap();
+        assert_eq!(super::head_in(&h, &other.id), 1);
+        assert_eq!(super::head_in(&h, &node.id()), 1);
+        let scanned: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT origin, MAX(seq) FROM (SELECT origin, seq FROM repl_log
+             UNION ALL SELECT origin, seq FROM repl_pending) GROUP BY origin ORDER BY origin",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        let table: Vec<(Vec<u8>, i64)> =
+            sqlx::query_as("SELECT origin, seq FROM repl_heads ORDER BY origin")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(scanned, table);
+    }
 }
