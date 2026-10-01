@@ -6,6 +6,7 @@ pub mod events;
 pub mod export;
 pub mod fingerprint;
 pub mod intel;
+pub mod net;
 pub mod scan;
 pub mod store;
 pub mod trap;
@@ -171,17 +172,16 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             geo: geo.clone(),
             tor: tor.clone(),
             notifier: notifier.clone(),
+            helper_rate: Default::default(),
         }));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding trap listener {addr}"))?;
         info!(%addr, "trap listener up");
+        let trap_shutdown = shutdown_rx.clone();
         servers.spawn(async move {
-            axum::serve(
-                listener,
-                trap_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .await
+            serve_trap(listener, trap_app, trap_shutdown).await;
+            Ok::<(), std::io::Error>(())
         });
     }
     if let (true, Some(addr)) = (cfg.roles.web, cfg.admin_listen) {
@@ -212,6 +212,66 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     }
     let _ = shutdown_tx.send(true);
     Ok(())
+}
+
+/// Serve the public trap listener with slowloris protection: a per-connection
+/// header-read timeout and overall deadline (hyper on its own disables its
+/// default header timeout when no timer is installed), plus a cap on concurrent
+/// connections that sheds load rather than exhausting file descriptors/tasks.
+/// The direct peer address is injected as `ConnectInfo` for the handlers.
+async fn serve_trap(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::server::conn::auto;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    // Bound simultaneous connections; excess are dropped (load shedding).
+    const MAX_CONNS: usize = 2048;
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
+    loop {
+        let (stream, peer) = tokio::select! {
+            r = listener.accept() => match r {
+                Ok(v) => v,
+                Err(e) => { warn!(?e, "trap accept failed"); continue; }
+            },
+            _ = shutdown.changed() => break,
+        };
+        let Ok(permit) = sem.clone().try_acquire_owned() else {
+            // At the connection cap: drop this one instead of piling up.
+            continue;
+        };
+        let app = app.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let service =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let app = app.clone();
+                    async move {
+                        let (mut parts, body) = req.into_parts();
+                        parts.extensions.insert(axum::extract::ConnectInfo(peer));
+                        let req = hyper::Request::from_parts(parts, axum::body::Body::new(body));
+                        app.oneshot(req).await
+                    }
+                });
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(Duration::from_secs(15));
+            let io = TokioIo::new(stream);
+            // Overall per-connection deadline bounds slow bodies and keep-alive
+            // trickling as well as slow headers.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(120),
+                builder.serve_connection_with_upgrades(io, service),
+            )
+            .await;
+        });
+    }
 }
 
 /// Push scan jobs changed anywhere in the cluster to the live queue.

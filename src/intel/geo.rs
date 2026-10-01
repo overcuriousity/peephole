@@ -110,12 +110,23 @@ pub async fn backfill_iso_codes(
 }
 
 /// Download GeoLite2-City and GeoLite2-ASN into `data_dir` (spec §9).
+///
+/// The HTTP client has connect and overall timeouts so one hung TLS
+/// connection cannot stall the whole intel scheduler forever. The archive is
+/// decompressed and the database validated (opened as an mmdb) in a temp file
+/// *before* it replaces the working copy, so a truncated or corrupt download
+/// never overwrites a good database. The blocking gunzip/untar/write runs on a
+/// blocking thread.
 pub async fn download(data_dir: &Path, account_id: &str, license_key: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .context("building maxmind http client")?;
     for edition in ["GeoLite2-City", "GeoLite2-ASN"] {
         let url = format!(
             "https://download.maxmind.com/geoip/databases/{edition}/download?suffix=tar.gz"
         );
-        let client = reqwest::Client::new();
         let bytes = client
             .get(&url)
             .basic_auth(account_id, Some(license_key))
@@ -124,22 +135,40 @@ pub async fn download(data_dir: &Path, account_id: &str, license_key: &str) -> R
             .error_for_status()?
             .bytes()
             .await?;
-        let tar = flate2::read::GzDecoder::new(&bytes[..]);
-        let mut archive = tar::Archive::new(tar);
-        let mut found = false;
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let path = entry.path()?.to_path_buf();
-            if path.extension().is_some_and(|e| e == "mmdb") {
-                let tmp = data_dir.join(format!("{edition}.mmdb.tmp"));
-                let mut out = std::fs::File::create(&tmp)?;
-                std::io::copy(&mut entry, &mut out)?;
-                std::fs::rename(&tmp, data_dir.join(format!("{edition}.mmdb")))?;
-                found = true;
-            }
-        }
-        anyhow::ensure!(found, "no .mmdb in {edition} archive");
+        let data_dir = data_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || extract_and_install(&data_dir, edition, &bytes))
+            .await
+            .context("maxmind extract task")??;
     }
+    Ok(())
+}
+
+/// Decompress one edition's archive to a temp file, verify it parses as an
+/// mmdb, then atomically move it into place.
+fn extract_and_install(data_dir: &Path, edition: &str, bytes: &[u8]) -> Result<()> {
+    let tar = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(tar);
+    let tmp = data_dir.join(format!("{edition}.mmdb.tmp"));
+    let mut found = false;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_path_buf();
+        if path.extension().is_some_and(|e| e == "mmdb") {
+            let mut out = std::fs::File::create(&tmp)?;
+            std::io::copy(&mut entry, &mut out)?;
+            found = true;
+        }
+    }
+    if !found {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("no .mmdb in {edition} archive");
+    }
+    // Validate before replacing the working copy.
+    if let Err(e) = Reader::open_readfile(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(e).context(format!("{edition}: downloaded mmdb is invalid")));
+    }
+    std::fs::rename(&tmp, data_dir.join(format!("{edition}.mmdb")))?;
     Ok(())
 }
 

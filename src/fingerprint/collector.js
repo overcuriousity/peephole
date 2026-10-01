@@ -3,8 +3,9 @@
   "use strict";
   var TOKEN = window.PEEPHOLE_TOKEN || "";
   var behavior = { mouse_events: 0, mouse_dist: 0, clicks: 0, scrolls: 0,
-                   keys: [], fill_seconds: null, events: [] };
+                   keys: [], fill_seconds: null };
   var lastX = null, lastY = null, firstFocus = null, submitTime = null;
+  var attrs = null; // captured once, reused by the final behavior beacon
 
   function on(ev, fn) { try { window.addEventListener(ev, fn, { passive: true }); } catch (e) {} }
   on("mousemove", function (e) {
@@ -116,10 +117,21 @@
     };
   }
 
+  function postCollect() {
+    var payload = JSON.stringify({ token: TOKEN, attrs: attrs, behavior: behavior });
+    var sent = false;
+    try { sent = navigator.sendBeacon("/collect",
+      new Blob([payload], { type: "application/json" })); } catch (e) {}
+    if (!sent) {
+      try { fetch("/collect", { method: "POST", headers: { "content-type": "application/json" },
+        body: payload, keepalive: true }); } catch (e) {}
+    }
+  }
+
   function collect() {
     var gl = webglInfo();
     audioFp(function (audio) {
-      var attrs = {
+      attrs = {
         ua: navigator.userAgent,
         platform: navigator.platform,
         languages: navigator.languages || [navigator.language],
@@ -143,19 +155,29 @@
         math_tan: Math.tan(-1e300),
         error_stack: (function () { try { null.x(); } catch (e) { return (e.stack || "").split("\n").length; } })()
       };
-      delete behavior.events; // compact: summary only on first post
-      var payload = JSON.stringify({ token: TOKEN, attrs: attrs, behavior: behavior });
-      var sent = false;
-      try { sent = navigator.sendBeacon("/collect",
-        new Blob([payload], { type: "application/json" })); } catch (e) {}
-      if (!sent) {
-        try { fetch("/collect", { method: "POST", headers: { "content-type": "application/json" },
-          body: payload, keepalive: true }); } catch (e) {}
-      }
+      // First post: attributes are ready and the panel can render. Behavior
+      // counters are still near zero this early.
+      postCollect();
       // Panel refresh (human display) — after a short behavior window.
       setTimeout(refreshPanel, 4000);
     });
   }
+
+  // Send a final beacon with the accumulated behavior (mouse movement, fill
+  // time, clicks) when the page is hidden or unloaded. Without this the only
+  // post happens at load, before any interaction, so fill_seconds stays null
+  // and the automation/inhuman-behavior signals never see real data. Guarded
+  // so it fires at most once.
+  var finalSent = false;
+  function sendFinal() {
+    if (finalSent || attrs === null) return;
+    finalSent = true;
+    postCollect();
+  }
+  on("pagehide", sendFinal);
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "hidden") sendFinal();
+  });
 
   // 202 = fingerprint not stored yet (beacon still in flight): show the
   // interim status and poll again with backoff, up to ~1 minute in total.
