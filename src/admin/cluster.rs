@@ -24,6 +24,8 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/cluster/invite/revoke", post(revoke_invite))
         .route("/admin/cluster/join", post(join))
         .route("/admin/cluster/leave", post(leave))
+        .route("/admin/cluster/block", post(block))
+        .route("/admin/cluster/unblock", post(unblock))
         .route("/admin/cluster/pace", post(set_pace))
 }
 
@@ -37,6 +39,8 @@ pub struct MemberView {
     pub active: bool,
     /// The member's standing in words (badge on inactive members).
     pub state: &'static str,
+    /// This node blocked it (local decision).
+    pub blocked: bool,
     pub is_self: bool,
     pub version: String,
     pub last_seen: String,
@@ -156,6 +160,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
                 .unwrap_or_else(|| "outbound-only".to_string()),
             active: m.active,
             state: m.standing.label(),
+            blocked: node.is_blocked(&m.id),
             is_self,
             version: hb.map(|h| h.version.clone()).unwrap_or_else(|| {
                 if is_self {
@@ -197,6 +202,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
         address: node.cfg.advertise.clone().unwrap_or_default(),
         active: true,
         state: "active",
+        blocked: false,
         is_self: true,
         version: crate::VERSION.into(),
         last_seen: "this node".into(),
@@ -437,6 +443,51 @@ async fn leave(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<
             None,
         ),
         Err(e) => back(None, Some(format!("Leaving failed: {e:#}"))),
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct KeyForm {
+    key: String,
+}
+
+async fn block(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Form(f): Form<KeyForm>,
+) -> AppResult<Redirect> {
+    let node = node(&st)?;
+    let Ok(id) = NodeId::parse(&f.key) else {
+        return Ok(back(None, Some("unknown node".into())));
+    };
+    Ok(match crate::cluster::block::block(node, id).await {
+        Ok(n) => back(
+            Some(format!(
+                "Blocked {}. This node no longer talks to it and shows none of its records ({n} taken out of view). Other nodes are unaffected.",
+                id.short()
+            )),
+            None,
+        ),
+        Err(e) => back(None, Some(format!("{e:#}"))),
+    })
+}
+
+async fn unblock(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Form(f): Form<KeyForm>,
+) -> AppResult<Redirect> {
+    let node = node(&st)?;
+    let Ok(id) = NodeId::parse(&f.key) else {
+        return Ok(back(None, Some("unknown node".into())));
+    };
+    Ok(if crate::cluster::block::unblock(node, id).await? {
+        back(
+            Some(format!("Unblocked {}. Its records are back.", id.short())),
+            None,
+        )
+    } else {
+        back(None, Some("That node was not blocked.".into()))
     })
 }
 

@@ -192,6 +192,9 @@ async fn require_member(
     req: Request,
     next: Next,
 ) -> Response {
+    if node.is_blocked(&peer) {
+        return (StatusCode::FORBIDDEN, "blocked by this node").into_response();
+    }
     if node.is_member(&peer) {
         node.status.touch_inbound(peer);
         next.run(req).await

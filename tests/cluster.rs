@@ -1121,49 +1121,42 @@ async fn deletes_reach_only_the_deleters_own_records() {
     })
     .await;
 
-    // B cannot delete A's request for the cluster.
+    // B cannot delete A's request for the cluster: it only hides it locally.
     let one_on_b: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/one'")
         .fetch_one(&nb.store.pool)
         .await
         .unwrap();
-    assert_eq!(rec(&nb).delete_request(one_on_b).await.unwrap().deleted, 0);
+    let out = rec(&nb).delete_request(one_on_b).await.unwrap();
+    assert_eq!((out.deleted, out.hidden), (0, 1));
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM requests").await, 2);
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(count(&na, "SELECT COUNT(*) FROM requests").await, 3);
 
     // A deletes its own: gone everywhere, with its claim, and erased from
-    // the log.
+    // every log, also where it was only hidden.
     let out = rec(&na).delete_request(r1).await.unwrap();
     assert_eq!(out.deleted, 1);
-    eventually("b dropped /one", || async {
-        count(&nb, "SELECT COUNT(*) FROM requests WHERE path = '/one'").await == 0
+    eventually("b erased /one and its claim from its log", || async {
+        count(
+            &nb,
+            "SELECT COUNT(*) FROM repl_log WHERE erased_by IS NOT NULL",
+        )
+        .await
+            == 2
     })
     .await;
     assert_eq!(count(&nb, "SELECT COUNT(*) FROM fp_claims").await, 0);
-    assert_eq!(
-        count(
-            &nb,
-            "SELECT COUNT(*) FROM repl_log WHERE erased_by IS NOT NULL"
-        )
-        .await,
-        2,
-        "request and claim payloads are erased from the log"
-    );
 
-    // Deleting the IP on A removes what A recorded; B's request stays.
-    assert!(rec(&na).delete_ip(ip_a.id).await.unwrap());
+    // Deleting the IP on A removes what A recorded everywhere. B's request
+    // for that IP stays in the cluster; A only hides it for itself.
+    let out = rec(&na).delete_ips(&[ip_a.id]).await.unwrap();
+    assert_eq!((out.deleted, out.hidden), (1, 1));
+    assert_eq!(count(&na, "SELECT COUNT(*) FROM requests").await, 0);
+    assert_eq!(count(&na, "SELECT COUNT(*) FROM ips").await, 0);
     eventually("only b's request is left on b", || async {
-        let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
-            .fetch_all(&nb.store.pool)
-            .await
-            .unwrap();
-        paths == ["/three"]
+        paths(&nb).await == ["/three"]
     })
     .await;
-    eventually("and on a", || async {
-        count(&na, "SELECT COUNT(*) FROM requests").await == 1
-    })
-    .await;
-    assert_eq!(count(&na, "SELECT COUNT(*) FROM ips").await, 1);
 
     // B deletes the IP: now it is gone on both.
     assert!(rec(&nb).delete_ip(ip_b.id).await.unwrap());
@@ -1172,6 +1165,155 @@ async fn deletes_reach_only_the_deleters_own_records() {
             && count(&nb, "SELECT COUNT(*) FROM ips").await == 0
     })
     .await;
+}
+
+/// Deleting another node's record hides it here and nowhere else, and this
+/// node keeps relaying it.
+#[tokio::test]
+async fn foreign_delete_hides_locally_and_keeps_relaying() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let ip = na
+        .store
+        .upsert_ip("203.0.113.71".parse().unwrap())
+        .await
+        .unwrap();
+    for path in ["/one", "/two"] {
+        rec(&na)
+            .insert_request(&new_request(ip.id, path))
+            .await
+            .unwrap();
+    }
+    eventually("b has both", || async {
+        count(&nb, "SELECT COUNT(*) FROM requests").await == 2
+    })
+    .await;
+    let one_on_b: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/one'")
+        .fetch_one(&nb.store.pool)
+        .await
+        .unwrap();
+    let out = rec(&nb).delete_request(one_on_b).await.unwrap();
+    assert_eq!((out.deleted, out.hidden), (0, 1));
+    // Repeating it finds nothing and fails nothing.
+    let again = rec(&nb).delete_request(one_on_b).await.unwrap();
+    assert_eq!((again.deleted, again.hidden), (0, 0));
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM requests").await, 1);
+    assert_eq!(count(&na, "SELECT COUNT(*) FROM requests").await, 2);
+
+    // A node fed only from B's copy still gets all of A's records, signed.
+    let from_b = batch_of(&nb, a.id).await;
+    assert!(from_b.proofs.is_empty());
+    assert!(from_b.entries.iter().all(|e| e.verify()), "payloads intact");
+    let (x, _dx) = offline_node(&[&a, &b]).await;
+    repl::apply_batch(&x, from_b).await.unwrap();
+    assert_eq!(count(&x, "SELECT COUNT(*) FROM requests").await, 2);
+
+    // Hidden stays hidden, also across a re-application of the log.
+    repl::rematerialize(&nb).await.unwrap();
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM requests").await, 1);
+}
+
+/// Record a request for `ip` on `n`.
+async fn record(n: &TestNode, ip: &str, path: &str) {
+    let row = n.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+    rec(n)
+        .insert_request(&new_request(row.id, path))
+        .await
+        .unwrap();
+}
+
+/// Blocking a peer takes its records out of this node's view, keeps them
+/// flowing to others, and is undone by unblocking.
+#[tokio::test]
+async fn blocking_a_peer_hides_its_records_until_unblocked() {
+    use peephole::cluster::block;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    record(&na, "203.0.113.72", "/a1").await;
+    record(&nb, "203.0.113.73", "/b1").await;
+    eventually("everyone has both", || async {
+        count(&na, "SELECT COUNT(*) FROM requests").await == 2
+            && count(&nb, "SELECT COUNT(*) FROM requests").await == 2
+            && count(&nc, "SELECT COUNT(*) FROM requests").await == 2
+    })
+    .await;
+
+    assert!(block::block(&nb, nb.id()).await.is_err(), "not oneself");
+    assert_eq!(block::block(&nb, a.id).await.unwrap(), 1);
+    assert_eq!(
+        block::block(&nb, a.id).await.unwrap(),
+        0,
+        "repeat is harmless"
+    );
+    assert!(nb.is_blocked(&a.id));
+    assert!(nb.dial_targets().iter().all(|t| t.0 != a.id));
+    assert_eq!(paths(&nb).await, ["/b1"]);
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM ips").await, 1);
+    let e = na.hello(b.id, &b.address()).await.unwrap_err();
+    assert!(format!("{e:#}").contains("blocked"), "{e:#}");
+
+    // A keeps recording. B receives it through C, stores it for relaying,
+    // and does not show it.
+    record(&na, "203.0.113.72", "/a2").await;
+    eventually("b holds a's stream via c", || async {
+        head_of(&nb, a.id).await == head_of(&na, a.id).await
+    })
+    .await;
+    assert_eq!(paths(&nb).await, ["/b1"]);
+    assert_eq!(paths(&nc).await, ["/a1", "/a2", "/b1"]);
+    assert!(
+        batch_of(&nb, a.id).await.entries.iter().all(|e| e.verify()),
+        "b can still relay a's records"
+    );
+
+    assert!(block::unblock(&nb, a.id).await.unwrap());
+    assert!(
+        !block::unblock(&nb, a.id).await.unwrap(),
+        "repeat is harmless"
+    );
+    assert_eq!(paths(&nb).await, ["/a1", "/a2", "/b1"]);
+    assert!(!nb.is_blocked(&a.id));
+}
+
+/// The admin is told what a delete did: cluster-wide or local only.
+#[tokio::test]
+async fn admin_delete_reports_hidden_records() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let ip = na
+        .store
+        .upsert_ip("203.0.113.74".parse().unwrap())
+        .await
+        .unwrap();
+    rec(&na)
+        .insert_request(&new_request(ip.id, "/one"))
+        .await
+        .unwrap();
+    eventually("b has it", || async {
+        count(&nb, "SELECT COUNT(*) FROM requests").await == 1
+    })
+    .await;
+    let id: i64 = sqlx::query_scalar("SELECT id FROM requests")
+        .fetch_one(&nb.store.pool)
+        .await
+        .unwrap();
+    let (admin, base) = admin_on(&nb).await;
+    let r = admin
+        .post(format!("{base}/admin/requests/{id}/delete"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM requests").await, 0);
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM hidden").await, 1);
 }
 
 /// A standalone install that switches to distributed mode brings its

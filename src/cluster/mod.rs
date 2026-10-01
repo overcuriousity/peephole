@@ -1,6 +1,7 @@
 //! Distributed mode: node identity, pinned-key mTLS RPC, replicated log,
 //! membership.
 pub mod adopt;
+pub mod block;
 pub mod cli;
 pub mod hlc;
 pub mod identity;
@@ -173,6 +174,8 @@ pub struct Node {
     members: RwLock<Arc<HashMap<NodeId, MemberRow>>>,
     /// Set while this node is out of its cluster (left or pruned).
     detached: RwLock<Option<Detached>>,
+    /// Peers this node blocked (a local decision, see [`block`]).
+    blocked: RwLock<Arc<std::collections::HashSet<NodeId>>>,
     /// The standing of every known node, members or not.
     standings: RwLock<Arc<HashMap<NodeId, members::Standing>>>,
     /// Addresses from `[[cluster.peers]]`, preferred over published ones.
@@ -215,6 +218,7 @@ impl Node {
             hlc: hlc::Hlc::new(),
             members: RwLock::new(Arc::new(HashMap::new())),
             detached: RwLock::new(None),
+            blocked: RwLock::new(Arc::new(Default::default())),
             standings: RwLock::new(Arc::new(HashMap::new())),
             address_override,
             clients: Mutex::new(HashMap::new()),
@@ -319,6 +323,11 @@ impl Node {
         *self.detached.read().unwrap()
     }
 
+    /// Whether this node blocked `id` (a local decision, see [`block`]).
+    pub fn is_blocked(&self, id: &NodeId) -> bool {
+        self.blocked.read().unwrap().contains(id)
+    }
+
     /// The standing of any known node, member or not.
     pub fn standing_of(&self, id: &NodeId) -> Option<members::Standing> {
         self.standings.read().unwrap().get(id).copied()
@@ -353,6 +362,8 @@ impl Node {
     pub async fn reload_members(&self) -> Result<()> {
         let rows = members::all(&self.store).await?;
         let detached = read_detached(&self.store).await?;
+        let blocked: std::collections::HashSet<NodeId> =
+            block::list(&self.store).await?.into_iter().collect();
         let standings: HashMap<_, _> = rows.iter().map(|m| (m.id, m.standing)).collect();
         let map: HashMap<_, _> = rows
             .into_iter()
@@ -362,6 +373,7 @@ impl Node {
         let before = self.dial_targets();
         *self.members.write().unwrap() = Arc::new(map);
         *self.detached.write().unwrap() = detached;
+        *self.blocked.write().unwrap() = Arc::new(blocked);
         *self.standings.write().unwrap() = Arc::new(standings);
         if self.dial_targets() != before {
             self.members_changed.notify_one();
@@ -387,7 +399,7 @@ impl Node {
         let mut v: Vec<_> = self
             .members()
             .values()
-            .filter(|m| m.id != self.id())
+            .filter(|m| m.id != self.id() && !self.is_blocked(&m.id))
             .filter_map(|m| {
                 let addr = self
                     .address_override

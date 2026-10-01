@@ -277,6 +277,9 @@ impl Node {
     }
 
     async fn deliver(self: &Arc<Self>, b: Body) {
+        if self.is_blocked(&b.from) {
+            return debug!(from = %b.from.short(), "message from a blocked peer dropped");
+        }
         if !self.is_member(&b.from) {
             return debug!(from = %b.from.short(), "message from non-member dropped");
         }

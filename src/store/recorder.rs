@@ -610,9 +610,20 @@ impl Recorder {
         Ok(())
     }
 
-    /// Records other nodes originated cannot be deleted from here.
-    async fn hide(&self, _uids: Vec<String>) -> Result<u64> {
-        Ok(0)
+    /// Records other nodes originated cannot be deleted from here: they are
+    /// hidden on this node only.
+    async fn hide(&self, uids: Vec<String>) -> Result<u64> {
+        let Recorder::Cluster(n) = self else {
+            return Ok(0);
+        };
+        if uids.is_empty() {
+            return Ok(0);
+        }
+        let _g = n.apply_lock.lock().await;
+        let mut tx = n.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let hidden = data::hide(&mut tx, &uids).await?;
+        tx.commit().await?;
+        Ok(hidden)
     }
 
     pub async fn delete_request(&self, id: i64) -> Result<Deleted> {

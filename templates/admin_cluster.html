@@ -36,7 +36,7 @@
     <tbody>
     {% for m in members %}
       <tr{% if !m.active %} class="muted"{% endif %}>
-        <td><b>{{ m.name }}</b> <span class="mono muted">{{ m.short }}</span>{% if !m.active %} <span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% endif %}
+        <td><b>{{ m.name }}</b> <span class="mono muted">{{ m.short }}</span>{% if !m.active %} <span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% endif %}{% if m.blocked %} <span class="badge badge-status" data-status="failed">blocked</span>{% endif %}
           {% if m.incompatible %}<br><span class="badge badge-status" data-status="failed">incompatible version</span>{% endif %}
           {% if let Some(s) = m.skew %}<br><span class="badge badge-status" data-status="running" title="Run NTP on every node: scan cooldowns compare timestamps from different nodes.">clock {{ s }}</span>{% endif %}
           {% if let Some(e) = m.error %}<br><span class="muted mono small">{{ e }}</span>{% endif %}</td>
@@ -46,7 +46,14 @@
         <td class="mono">{{ m.version }}</td>
         <td>{{ m.lag }}</td>
         <td>{% if m.scanner %}{{ m.active_scans }} running{% endif %}</td>
-        <td></td>
+        <td>{% if m.blocked %}
+          <form method="post" action="/admin/cluster/unblock"><input type="hidden" name="key" value="{{ m.key }}"><button class="btn btn-sm" type="submit">Unblock</button></form>
+        {% else %}
+          <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-block-{{ loop.index }}">Block</button>
+          <dialog id="dlg-block-{{ loop.index }}"><h3>Block {{ m.name }}?</h3><p class="muted">This node stops talking to it and shows none of its records. Nothing changes for other nodes: nobody can remove a member from the cluster. You can unblock it later.</p>
+            <form method="post" action="/admin/cluster/block" class="actions"><input type="hidden" name="key" value="{{ m.key }}">
+              <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Block</button></form></dialog>
+        {% endif %}</td>
       </tr>
     {% endfor %}
     {% if members.is_empty() %}<tr><td colspan="8" class="empty">No other members yet. Create an invite, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}

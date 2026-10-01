@@ -61,6 +61,17 @@ pub fn new_uid() -> String {
 }
 
 pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Result<Effect> {
+    // Hides and blocks only exist in a cluster.
+    if ctx.origin.is_some() && CONTENT_KINDS.contains(&r.kind()) {
+        if origin_blocked(conn, ctx.origin).await? {
+            return Ok(Effect::Ignored);
+        }
+        if let Some(uid) = r.uid()
+            && suppressed(conn, &uid).await?
+        {
+            return Ok(Effect::Ignored);
+        }
+    }
     match r {
         Record::Request(r) => request(conn, ctx, r).await,
         Record::IpEnrich(r) => ip_enrich(conn, ctx, r).await,
@@ -76,6 +87,70 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
             Ok(Effect::Ignored)
         }
     }
+}
+
+/// Record kinds a local hide or block keeps out of the tables. Membership,
+/// tombstones and scan-job state still apply, so the cluster stays in step.
+const CONTENT_KINDS: [&str; 6] = [
+    "request",
+    "fingerprint",
+    "fp_claim",
+    "scan_job",
+    "scan_result",
+    "ip_enrich",
+];
+
+async fn origin_blocked(conn: &mut SqliteConnection, origin: Option<&NodeId>) -> Result<bool> {
+    let Some(o) = origin else { return Ok(false) };
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blocked_peers WHERE id = ?")
+        .bind(&o.0[..])
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(n > 0)
+}
+
+/// Whether `uid` is kept out of the tables locally: hidden by an admin, or
+/// created by a blocked node.
+async fn suppressed(conn: &mut SqliteConnection, uid: &str) -> Result<bool> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM hidden WHERE uid = ?1)
+             OR EXISTS(SELECT 1 FROM repl_log l JOIN blocked_peers b ON b.id = l.origin
+                       WHERE l.uid = ?1)",
+    )
+    .bind(uid)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(n > 0)
+}
+
+/// Whether a parent row that is missing is gone for good (deleted, hidden or
+/// blocked) rather than not replicated yet.
+async fn gone(conn: &mut SqliteConnection, uid: &str) -> Result<bool> {
+    Ok(is_tombstoned(conn, uid).await? || suppressed(conn, uid).await?)
+}
+
+/// Local delete of records other nodes created: they leave this node's
+/// tables for good and stay in its log. Returns how many were hidden.
+pub async fn hide(conn: &mut SqliteConnection, uids: &[String]) -> Result<u64> {
+    let mut n = 0;
+    for uid in uids {
+        let kind: Option<String> = sqlx::query_scalar(
+            "SELECT kind FROM repl_log WHERE uid = ? AND kind != 'tombstone' LIMIT 1",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(kind) = kind else { continue };
+        sqlx::query("INSERT OR IGNORE INTO hidden (uid, hidden_at) VALUES (?, datetime('now'))")
+            .bind(uid)
+            .execute(&mut *conn)
+            .await?;
+        if let Some(ip_id) = unmaterialize(conn, &kind, uid).await? {
+            drop_orphan_ip(conn, ip_id).await?;
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// The tombstone that already deleted this record, if any.
@@ -332,9 +407,10 @@ async fn job_status(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &JobStatusRec)
             .fetch_optional(&mut *conn)
             .await?;
     let Some(arbiter) = arbiter else {
-        // No such job: deleted → drop; otherwise it has not replicated here
-        // yet → defer so the status is applied once the job arrives.
-        return Ok(if is_tombstoned(conn, &r.job_uid).await? {
+        // No such job: deleted, hidden or blocked → drop; otherwise it has
+        // not replicated here yet → defer so the status is applied once the
+        // job arrives.
+        return Ok(if gone(conn, &r.job_uid).await? {
             Effect::Ignored
         } else {
             Effect::Deferred
@@ -411,8 +487,9 @@ async fn scan_result(
         .await?;
     let Some(job_id) = job_id else {
         // The scan job has not replicated here yet (cross-origin ordering):
-        // defer so the result is stored once it does, unless it was deleted.
-        return Ok(if is_tombstoned(conn, &r.job_uid).await? {
+        // defer so the result is stored once it does, unless the job is gone
+        // for good (deleted, hidden or blocked).
+        return Ok(if gone(conn, &r.job_uid).await? {
             Effect::Ignored
         } else {
             Effect::Deferred

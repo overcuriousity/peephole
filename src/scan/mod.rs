@@ -211,6 +211,10 @@ impl Source {
             let Ok(arbiter) = NodeId::from_slice(&a) else {
                 continue;
             };
+            // No scan work for or from a peer this node blocked.
+            if node.is_blocked(&arbiter) {
+                continue;
+            }
             if self
                 .unreachable
                 .lock()

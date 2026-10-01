@@ -1,7 +1,7 @@
 //! `peephole cluster …` subcommands. They open the node's database
 //! directly, so they work on headless nodes and while the daemon runs; the
 //! daemon picks up their changes within a few seconds.
-use super::identity::Identity;
+use super::identity::{Identity, NodeId};
 use super::{Node, NodeParams, invite, members, repl};
 use crate::config::Config;
 use crate::store::Store;
@@ -16,6 +16,8 @@ pub const USAGE: &str = "usage: peephole cluster id [CONFIG]
        peephole cluster join TOKEN [CONFIG]
        peephole cluster members [CONFIG]
        peephole cluster status [CONFIG]
+       peephole cluster block NODE [CONFIG]     (NODE: name, fingerprint or ed25519:… key)
+       peephole cluster unblock NODE [CONFIG]
        peephole cluster leave [CONFIG]";
 
 /// `--name value` pairs.
@@ -59,6 +61,22 @@ async fn open(config: &str) -> Result<(Config, Arc<Node>)> {
     // Make sure our own description exists before acting for the cluster.
     node.bootstrap().await?;
     Ok((cfg, node))
+}
+
+/// Find a member by name, short fingerprint or full key.
+fn resolve(rows: &[members::MemberRow], who: &str) -> Result<NodeId> {
+    if let Ok(id) = NodeId::parse(who) {
+        return Ok(id);
+    }
+    let hits: Vec<_> = rows
+        .iter()
+        .filter(|m| m.name == who || m.id.short() == who)
+        .collect();
+    match hits.as_slice() {
+        [one] => Ok(one.id),
+        [] => bail!("no member named `{who}`"),
+        _ => bail!("`{who}` is ambiguous; use the full key"),
+    }
 }
 
 /// Run a `cluster` subcommand; `args` excludes `cluster` itself.
@@ -168,6 +186,7 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 sqlx::query_as("SELECT id, last_ok, last_error FROM peer_contact")
                     .fetch_all(&store.pool)
                     .await?;
+            let blocked = super::block::list(&store).await?;
             if let Some(d) = crate::cluster::Detached::read(&store).await? {
                 println!("{}", d.label());
             }
@@ -179,12 +198,17 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 };
                 let state = m.standing.label();
                 println!(
-                    "{:<20} {}  {:<12} {:<28} roles={}{}",
+                    "{:<20} {}  {:<12} {:<28} roles={}{}{}",
                     m.name,
                     m.id.short(),
                     state,
                     m.address.as_deref().unwrap_or("(outbound-only)"),
                     m.roles.join(","),
+                    if blocked.contains(&m.id) {
+                        " blocked"
+                    } else {
+                        ""
+                    },
                     me
                 );
                 if status {
@@ -197,6 +221,24 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                         }
                     }
                 }
+            }
+        }
+        Some(cmd @ ("block" | "unblock")) => {
+            reject_unknown_flags(&flags, &[])?;
+            let who = pos.get(1).context(USAGE)?;
+            let (_, node) = open(cfg_at(2)).await?;
+            let id = resolve(&members::all(&node.store).await?, who)?;
+            if cmd == "block" {
+                let n = super::block::block(&node, id).await?;
+                println!(
+                    "blocked {}: this node no longer talks to it and shows none of its records \
+                     ({n} taken out of view). Other nodes are unaffected.",
+                    id.short()
+                );
+            } else if super::block::unblock(&node, id).await? {
+                println!("unblocked {}; its records are back", id.short());
+            } else {
+                println!("{} was not blocked", id.short());
             }
         }
         Some("leave") => {

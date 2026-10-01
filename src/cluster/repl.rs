@@ -635,6 +635,36 @@ async fn retry_deferred(node: &Node, conn: &mut SqliteConnection, st: &mut Appli
     }
 }
 
+/// Apply log entries that are held with their payload but have no row:
+/// after an unblock, everything the block kept out of the tables. Records an
+/// admin hid stay hidden. Returns how many entries were looked at.
+pub async fn rematerialize(node: &Node) -> Result<usize> {
+    let _g = node.apply_lock.lock().await;
+    let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    // Parents first; job state after the jobs it refers to.
+    let rows: Vec<LogRow> = sqlx::query_as(
+        "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by FROM repl_log
+         WHERE payload IS NOT NULL
+           AND kind IN ('request','scan_job','job_adopt','job_status','fp_claim',
+                        'fingerprint','scan_result','ip_enrich')
+         ORDER BY CASE kind WHEN 'request' THEN 0 WHEN 'scan_job' THEN 1
+                            WHEN 'job_adopt' THEN 2 WHEN 'job_status' THEN 3 ELSE 4 END, hlc",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let n = rows.len();
+    for r in rows {
+        let e = from_row(r)?;
+        if let Some(rec) = e.record() {
+            apply_record(node, &mut tx, &e, &rec).await?;
+        }
+    }
+    tx.commit().await?;
+    drop(_g);
+    node.notify_changed();
+    Ok(n)
+}
+
 /// What applying a record did, beyond its table effects.
 #[derive(Default, Clone, Copy)]
 struct Settled {
