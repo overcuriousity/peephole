@@ -114,7 +114,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
 
     // Distributed mode: RPC listener and peer loops.
     if cfg.cluster.is_some() {
-        let node = cluster::Node::from_config(&cfg)?;
+        let node =
+            cluster::Node::open(cluster::NodeParams::from_config(&cfg, store.clone())?).await?;
         cluster::start(node, shutdown_rx.clone()).await?;
     }
 

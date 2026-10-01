@@ -2348,6 +2348,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde",
+ "serde_bytes",
  "serde_json",
  "serde_urlencoded",
  "sha2 0.11.0",

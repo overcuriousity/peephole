@@ -12,11 +12,15 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::path::Path;
 
 /// Schema migrations, applied in order. `PRAGMA user_version` records how
-/// many have run. Append new files only; never edit a shipped one. Each file
-/// is split on `;`, so statements must not contain semicolons themselves.
+/// many have run. Append new files only; never edit a shipped one. `--`
+/// comments are stripped, then each file is split on `;`, so statements
+/// must not contain semicolons themselves (no string literals with `;`).
 /// 0001 is idempotent (`IF NOT EXISTS`) so databases from before versioning
 /// (user_version 0, tables present) pass through it unharmed.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_initial.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_initial.sql"),
+    include_str!("migrations/0002_replication.sql"),
+];
 
 #[derive(Clone)]
 pub struct Store {
@@ -48,6 +52,20 @@ impl Store {
     }
 }
 
+/// Statements of a migration file: `--` comments removed, split on `;`.
+fn statements(sql: &str) -> Vec<String> {
+    let code: String = sql
+        .lines()
+        .map(|l| l.split_once("--").map_or(l, |(code, _)| code))
+        .collect::<Vec<_>>()
+        .join("\n");
+    code.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Apply pending migrations, each in its own write transaction so a second
 /// process (the CLI) racing the daemon cannot apply one twice.
 async fn migrate(pool: &sqlx::SqlitePool, migrations: &[&str]) -> anyhow::Result<()> {
@@ -62,7 +80,7 @@ async fn migrate(pool: &sqlx::SqlitePool, migrations: &[&str]) -> anyhow::Result
             if current >= target {
                 return Ok(());
             }
-            for stmt in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            for stmt in statements(sql) {
                 sqlx::query(sqlx::AssertSqlSafe(stmt))
                     .execute(&mut *conn)
                     .await
@@ -284,14 +302,14 @@ mod tests {
 
     #[tokio::test]
     async fn failed_migration_rolls_back_and_keeps_version() {
+        // A migration file may carry comments containing semicolons.
+        assert_eq!(statements("-- a; b\nSELECT 1; -- c;\nSELECT 2").len(), 2);
         let dir = tempfile::tempdir().unwrap();
         let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
-        let bad = [
-            MIGRATIONS[0],
-            "CREATE TABLE t2 (x INTEGER); SELECT * FROM missing",
-        ];
+        let mut bad = MIGRATIONS.to_vec();
+        bad.push("CREATE TABLE t2 (x INTEGER); SELECT * FROM missing");
         assert!(migrate(&s.pool, &bad).await.is_err());
-        assert_eq!(s.schema_version().await.unwrap(), 1);
+        assert_eq!(s.schema_version().await.unwrap(), MIGRATIONS.len() as i64);
         let t2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 't2'")
             .fetch_one(&s.pool)
             .await

@@ -164,3 +164,49 @@ listen = "127.0.0.1:0"
     assert_eq!(first, id(), "key is created once, then reused");
     assert!(dir.path().join("node.key").exists());
 }
+
+#[test]
+fn cluster_invite_and_members_work_headless() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("c.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"
+database_path = "{d}/t.db"
+data_dir = "{d}"
+[roles]
+listener = false
+web = false
+[cluster]
+node_name = "scanner-1"
+listen = "127.0.0.1:0"
+advertise = "scanner-1.example:7443"
+"#,
+            d = dir.path().display()
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let out = bin()
+            .arg("cluster")
+            .args(args)
+            .arg(cfg.to_str().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let token = run(&["invite", "--ttl", "2"]);
+    assert!(token.starts_with("peephole1:"), "{token}");
+    let members = run(&["members"]);
+    assert!(
+        members.contains("scanner-1") && members.contains("(this node)"),
+        "{members}"
+    );
+    assert!(members.contains("roles=scanner"), "{members}");
+}

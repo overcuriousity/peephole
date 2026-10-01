@@ -4,6 +4,9 @@ pub mod proto;
 pub mod server;
 
 use super::Node;
+use super::invite::{self, JoinReq};
+use super::repl;
+use super::sync::{BATCH_BYTES, BATCH_ENTRIES, PullReq, PushReq, WAIT_SECS, WaitReq};
 use axum::extract::{Extension, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -20,13 +23,109 @@ const BODY_LIMIT: usize = 64 * 1024 * 1024;
 pub fn router(node: Arc<Node>) -> Router {
     let members_only = Router::new()
         .route("/rpc/v1/hello", post(hello))
+        .route("/rpc/v1/heads", post(heads))
+        .route("/rpc/v1/pull", post(pull))
+        .route("/rpc/v1/push", post(push))
+        .route("/rpc/v1/wait", post(wait))
         .route_layer(axum::middleware::from_fn_with_state(
             node.clone(),
             require_member,
         ));
+    // The only route open to keys that are not members yet.
+    let open = Router::new().route("/rpc/v1/join", post(join));
     members_only
+        .merge(open)
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(node)
+}
+
+fn internal(e: anyhow::Error) -> Response {
+    tracing::warn!(error = %format!("{e:#}"), "rpc handler failed");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+}
+
+async fn heads(State(node): State<Arc<Node>>) -> Response {
+    match repl::heads(&node.store).await {
+        Ok(h) => Cbor(h).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+async fn pull(State(node): State<Arc<Node>>, Cbor(req): Cbor<PullReq>) -> Response {
+    match repl::entries_after(
+        &node.store,
+        &req.wants,
+        req.max_entries.clamp(1, 5 * BATCH_ENTRIES),
+        req.max_bytes.clamp(1, 4 * BATCH_BYTES),
+    )
+    .await
+    {
+        Ok(v) => Cbor(v).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+async fn push(
+    State(node): State<Arc<Node>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Cbor(req): Cbor<PushReq>,
+) -> Response {
+    if req.entries.len() > 5 * BATCH_ENTRIES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "too many entries").into_response();
+    }
+    match repl::apply_batch(&node, req.entries).await {
+        Ok(st) => {
+            if st.rejected > 0 {
+                tracing::debug!(peer = %peer.short(), ?st, "push had rejected entries");
+            }
+            match repl::heads(&node.store).await {
+                Ok(h) => Cbor(h).into_response(),
+                Err(e) => internal(e),
+            }
+        }
+        Err(e) => internal(e),
+    }
+}
+
+/// Long-poll: answer as soon as we hold something the caller lacks.
+async fn wait(State(node): State<Arc<Node>>, Cbor(req): Cbor<WaitReq>) -> Response {
+    let mut changes = node.subscribe_changes();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(WAIT_SECS);
+    loop {
+        changes.borrow_and_update();
+        let ours = match repl::heads(&node.store).await {
+            Ok(h) => h,
+            Err(e) => return internal(e),
+        };
+        if repl::ahead_of(&ours, &req.heads) {
+            return Cbor(ours).into_response();
+        }
+        tokio::select! {
+            _ = changes.changed() => {}
+            _ = tokio::time::sleep_until(deadline) => return Cbor(ours).into_response(),
+        }
+    }
+}
+
+async fn join(
+    State(node): State<Arc<Node>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Cbor(req): Cbor<JoinReq>,
+) -> Response {
+    if !node.join_allowed() {
+        return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
+    }
+    match invite::redeem(&node, peer, req).await {
+        Ok(resp) => Cbor(resp).into_response(),
+        Err((code, msg)) => {
+            tracing::info!(peer = %peer.short(), %msg, "join refused");
+            (
+                StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+                msg,
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Only cluster members may call; unknown keys get 403.

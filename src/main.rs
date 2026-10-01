@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some("--help") | Some("-h") => {
             println!(
-                "usage: peephole [CONFIG]\n       peephole check-config [CONFIG]\n       peephole cluster id [CONFIG]\n       peephole --version"
+                "usage: peephole [CONFIG]\n       peephole check-config [CONFIG]\n       peephole cluster (id|invite|join|members|status|revoke) …\n       peephole --version"
             );
             return Ok(());
         }
