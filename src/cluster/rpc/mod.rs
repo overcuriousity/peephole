@@ -8,7 +8,7 @@ use super::invite::{self, JoinReq};
 use super::msg::Envelope;
 use super::repl;
 use super::status::SignedHeartbeat;
-use super::sync::{BATCH_BYTES, BATCH_ENTRIES, PullReq, PushReq, WAIT_SECS, WaitReq};
+use super::sync::{BATCH_BYTES, BATCH_ENTRIES, Batch, PullReq, WAIT_SECS, WaitReq};
 use axum::extract::{Extension, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -78,12 +78,12 @@ async fn pull(State(node): State<Arc<Node>>, Cbor(req): Cbor<PullReq>) -> Respon
 async fn push(
     State(node): State<Arc<Node>>,
     Extension(Peer(peer)): Extension<Peer>,
-    Cbor(req): Cbor<PushReq>,
+    Cbor(batch): Cbor<Batch>,
 ) -> Response {
-    if req.entries.len() > 5 * BATCH_ENTRIES {
+    if batch.entries.len() > 5 * BATCH_ENTRIES || batch.proofs.len() > 5 * BATCH_ENTRIES {
         return (StatusCode::PAYLOAD_TOO_LARGE, "too many entries").into_response();
     }
-    match repl::apply_batch(&node, req.entries).await {
+    match repl::apply_batch(&node, batch).await {
         Ok(st) => {
             if st.rejected > 0 {
                 tracing::debug!(peer = %peer.short(), ?st, "push had rejected entries");

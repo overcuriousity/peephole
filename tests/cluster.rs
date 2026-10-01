@@ -936,6 +936,149 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
     (node, dir)
 }
 
+async fn batch_of(n: &Node, origin: NodeId) -> peephole::cluster::sync::Batch {
+    repl::entries_after(&n.store, &[(origin, 0)], 10_000, usize::MAX)
+        .await
+        .unwrap()
+}
+
+/// How far `n` holds `origin`'s log.
+async fn head_of(n: &Node, origin: NodeId) -> u64 {
+    repl::head_in(&repl::heads(&n.store).await.unwrap(), &origin)
+}
+
+async fn request_uid(n: &Node, path: &str) -> String {
+    sqlx::query_scalar("SELECT uid FROM requests WHERE path = ?")
+        .bind(path)
+        .fetch_one(&n.store.pool)
+        .await
+        .unwrap()
+}
+
+/// Request paths in `n`'s tables, sorted.
+async fn paths(n: &Node) -> Vec<String> {
+    let mut p: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
+        .fetch_all(&n.store.pool)
+        .await
+        .unwrap();
+    p.sort();
+    p
+}
+
+/// An erased entry is accepted only with the origin's own tombstone: a
+/// relay cannot make other nodes drop somebody's records.
+#[tokio::test]
+async fn erased_stubs_need_the_origins_tombstone() {
+    use peephole::cluster::sync::Batch;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let ip = na
+        .store
+        .upsert_ip("203.0.113.70".parse().unwrap())
+        .await
+        .unwrap();
+    let r1 = rec(&na)
+        .insert_request(&new_request(ip.id, "/one"))
+        .await
+        .unwrap();
+    rec(&na)
+        .insert_request(&new_request(ip.id, "/two"))
+        .await
+        .unwrap();
+    let (one, two) = (
+        request_uid(&na, "/one").await,
+        request_uid(&na, "/two").await,
+    );
+    let before = batch_of(&na, a.id).await;
+    assert!(before.proofs.is_empty());
+    rec(&na).delete_request(r1).await.unwrap();
+    let after = batch_of(&na, a.id).await;
+    assert_eq!(after.proofs.len(), 1, "the stub travels with its tombstone");
+    let tomb = after.proofs[0].uid.clone().unwrap();
+    let a_head = head_of(&na, a.id).await;
+    let strip = |batch: &mut Batch, uid: &str, by: Option<String>| {
+        let e = batch
+            .entries
+            .iter_mut()
+            .find(|e| e.uid.as_deref() == Some(uid))
+            .unwrap();
+        e.payload = None;
+        e.sig = None;
+        e.erased_by = by;
+    };
+
+    // A relay strips /two and claims A's tombstone erased it.
+    let (x, _dx) = offline_node(&[&a, &b]).await;
+    let mut forged = Batch {
+        entries: before.entries.clone(),
+        proofs: after.proofs.clone(),
+    };
+    strip(&mut forged, &two, Some(tomb.clone()));
+    let st = repl::apply_batch(&x, forged).await.unwrap();
+    assert!(st.rejected >= 1, "{st:?}");
+    assert!(
+        head_of(&x, a.id).await < a_head,
+        "the stream stops at the forgery"
+    );
+    assert_eq!(
+        count(&x, "SELECT COUNT(*) FROM requests WHERE path = '/two'").await,
+        0
+    );
+    // The honest stream still applies afterwards.
+    let st = repl::apply_batch(&x, batch_of(&na, a.id).await)
+        .await
+        .unwrap();
+    assert_eq!(st.rejected, 0, "{st:?}");
+    assert_eq!(head_of(&x, a.id).await, a_head);
+    assert_eq!(paths(&x).await, ["/two"]);
+    // X can pass the erasure on with its proof.
+    assert_eq!(batch_of(&x, a.id).await.proofs.len(), 1);
+
+    // No proof, a proof from another origin, a stub without a uid: rejected.
+    let stub_only = Batch {
+        entries: after.entries.clone(),
+        proofs: vec![],
+    };
+    let other = Identity::generate().unwrap();
+    let wrong_origin = Batch {
+        entries: after.entries.clone(),
+        proofs: vec![
+            WireEntry::sign(
+                &other,
+                1,
+                1,
+                &Record::Tombstone(peephole::cluster::record::TombstoneRec {
+                    uid: tomb.clone(),
+                    uids: vec![one.clone()],
+                }),
+            )
+            .unwrap(),
+        ],
+    };
+    let mut no_uid = Batch {
+        entries: after.entries.clone(),
+        proofs: after.proofs.clone(),
+    };
+    no_uid
+        .entries
+        .iter_mut()
+        .find(|e| e.payload.is_none())
+        .unwrap()
+        .uid = None;
+    for (what, bad) in [
+        ("no proof", stub_only),
+        ("foreign proof", wrong_origin),
+        ("stub without uid", no_uid),
+    ] {
+        let (y, _dy) = offline_node(&[&a, &b]).await;
+        let st = repl::apply_batch(&y, bad).await.unwrap();
+        assert!(st.rejected >= 1, "{what}: {st:?}");
+        assert!(head_of(&y, a.id).await < a_head, "{what}");
+    }
+}
+
 #[tokio::test]
 async fn deletes_reach_only_the_deleters_own_records() {
     let (ia, a) = new_node("a");

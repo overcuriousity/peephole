@@ -32,9 +32,21 @@ pub struct PullReq {
     pub max_bytes: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PushReq {
+/// Log entries, plus the signed tombstones that justify the erased ones
+/// among them. A receiver accepts an erased entry only with such a proof.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Batch {
     pub entries: Vec<WireEntry>,
+    pub proofs: Vec<WireEntry>,
+}
+
+impl From<Vec<WireEntry>> for Batch {
+    fn from(entries: Vec<WireEntry>) -> Self {
+        Self {
+            entries,
+            proofs: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -182,7 +194,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         if wants.is_empty() {
             break;
         }
-        let entries: Vec<WireEntry> = node
+        let batch: Batch = node
             .call(
                 peer,
                 addr,
@@ -194,10 +206,10 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
                 },
             )
             .await?;
-        if entries.is_empty() {
+        if batch.entries.is_empty() {
             break;
         }
-        let st = repl::apply_batch(node, entries).await?;
+        let st = repl::apply_batch(node, batch).await?;
         if st.applied + st.parked == 0 {
             // The peer has entries we cannot make progress on; stop pulling and
             // signal the caller to back off rather than spin.
@@ -217,13 +229,11 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         if wants.is_empty() {
             break;
         }
-        let entries = repl::entries_after(&node.store, &wants, BATCH_ENTRIES, BATCH_BYTES).await?;
-        if entries.is_empty() {
+        let batch = repl::entries_after(&node.store, &wants, BATCH_ENTRIES, BATCH_BYTES).await?;
+        if batch.entries.is_empty() {
             break;
         }
-        let after: Heads = node
-            .call(peer, addr, "/rpc/v1/push", &PushReq { entries })
-            .await?;
+        let after: Heads = node.call(peer, addr, "/rpc/v1/push", &batch).await?;
         if !repl::ahead_of(&after, &theirs) {
             break; // they accepted nothing (e.g. a gap on their side)
         }
