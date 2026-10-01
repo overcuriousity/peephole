@@ -4,29 +4,68 @@ Written 2026-10-01, when the session that did the work below was ended on reques
 
 ## Where things stand
 
-Branch `federated-cluster` (local only, never pushed), 20 commits ahead of `master`. Working tree clean after the commit that adds this file.
+Updated 2026-10-01 after parts 2–4 were reviewed and finished. All four parts
+are implemented, each task reviewed, each part closed by a whole-part review
+and one fix pass.
 
 | Part | Spec | Plan | State |
 |---|---|---|---|
-| 1 Membership and deletes | §3, §4, §8 | `plans/2026-10-01-federated-cluster-1-membership-deletes.md` | Implemented, reviewed, review findings fixed (`f4c1730`) |
-| 2 Config key, runtime settings, live roles | §5 | `plans/2026-10-01-federated-cluster-2-config-key.md` | Implemented (`139847f`..`5b0e754`). **Not reviewed**: the reviewer was stopped before it reported |
-| 3 Enrichment as results | §6 | `plans/2026-10-01-federated-cluster-3-enrichment.md` | Plan written, nothing implemented |
-| 4 Installer wizard | §7 | `plans/2026-10-01-federated-cluster-4-installer.md` | Plan written, nothing implemented |
+| 1 Membership and deletes | §3, §4, §8 | `plans/2026-10-01-federated-cluster-1-membership-deletes.md` | Done, reviewed (`f4c1730`) |
+| 2 Config key, runtime settings, live roles | §5 | `plans/2026-10-01-federated-cluster-2-config-key.md` | Done, reviewed; fixes in `636e3be` |
+| 3 Enrichment as results | §6 | `plans/2026-10-01-federated-cluster-3-enrichment.md` | Done, reviewed (`5ff5e1b`..`fab9b6f`) |
+| 4 Installer wizard | §7 | `plans/2026-10-01-federated-cluster-4-installer.md` | Done, reviewed (`483b53d`..) |
 
-Spec: `specs/2026-10-01-federated-cluster-design.md` (kept in step with the code up to part 2).
+Checks: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test`; the installer smoke test runs locally in
+`docker.io/library/ubuntu:26.04` (same glibc as a Fedora 44 host) and
+shellcheck via `docker.io/koalaman/shellcheck:stable` (see part 4's plan).
 
-At `5b0e754`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` all passed (136 lib, 6 CLI, 36 cluster, 1 cluster e2e, 26 integration, 1 roles e2e). The two commits after it only add plan documents.
+## Decisions taken after the first handoff
 
-## What to do next, in order
+### Part 2 review
+- The role supervisor never waits for a stopping role: it signals it and
+  reaps it later; the web role gets 5 s for open requests and the live queue
+  stream ends on the stop signal; a role is not restarted while its previous
+  instance still runs (a fresh scanner would requeue the old one's jobs);
+  shutdown waits at most 10 s. Failed starts back off up to 5 min. At
+  startup only roles the config file enables are fatal, so a remote override
+  cannot crash-loop a node.
+- The own-node settings form carries its version; the pace row only changes
+  this node; `reload` holds the writers' lock.
+- Deferred (minor): a pasted config key is not verified until first use;
+  `settings show` labels an override equal to the file value as "config
+  file"; invalid stored overrides fall back to defaults in memory only.
 
-1. **Review part 2** before building on it. Range `f4c1730..5b0e754`. The plan's "Review Focus" lists five cases to check. Points worth a hard look:
-   - the MAC over a `ConfigSet` (`src/cluster/confkey.rs`: `mac_input`, the verify in `serve`), replay and the version compare-and-set;
-   - `Settings::write` / `stored` / `reset` / `reload` with the daemon and the CLI as two processes on one SQLite file (`write` opens `BEGIN IMMEDIATE` and reads through the pool on another connection);
-   - the role supervisor in `src/lib.rs` (`RoleRunner`): strict first pass, retries, shutdown, switching `web` off from the web UI;
-   - where the config key is stored and shown.
-2. **Implement part 3**, then **part 4**, from their plans. Both plans were written before part 2 was reviewed; adjust them if the review changes interfaces.
-3. Each part ends with a whole-branch review and one fix pass (the workflow used so far: superpowers `executing-plans`, test first, one commit per task).
-4. Only then decide about merging. Nothing has been pushed and no PR exists.
+### Part 3
+- R1: deleting an IP removes its `ip_intel` rows and the intel export lists
+  only IPs that still exist. The `ip_intel` log entries stay (they have no
+  uid, so no tombstone names them). Cost: an IP's country/ASN/Tor facts stay
+  in the replicated log after a delete; fixing it means giving `IpIntelRec`
+  a uid.
+- R2: every code path records only the provider it consulted; nothing
+  republishes the displayed (possibly foreign) facts under its own origin.
+- R3: the trap records `{"exit": true|false}` for every IP once a Tor list
+  is loaded.
+- R5 (from the whole-part review): fixed trap-created IPs not showing early
+  results, junk IPs starving fill-in, credential-less cluster nodes loading
+  copied GeoLite2 files, null-key dedupe, unknown providers (ignored on
+  apply), blocked peers in the ranking, the export cap (100 000), and a
+  migration-0017 test. Deferred: a member can pin "newest" with a
+  future-dated entry (remedy: block); able nodes all rank 0 until heartbeats
+  carry providers, and backlogs make every rank step in (duplicate MaxMind
+  lookups; must be solved before any quota-bound provider); adopted
+  standalone results get a fresh HLC and outrank newer ones;
+  `ips_missing_intel` scans `ips` each minute; results from providers a node
+  does not know are dropped, so a later version only sees them after a
+  rematerialize.
+
+### Part 4
+- The MaxMind question is asked last (spec §7.1 order).
+- The smoke test's `cluster members` assertion was replaced (it failed on
+  master CI too): the command is read-only and empty before the daemon runs.
+- Deferred: a typo at a yes/no prompt aborts instead of re-asking (nothing
+  is written); the generated nginx example has no `default_server` on 443
+  unless the commented HTTPS catch-all is enabled.
 
 ## Things the plans do not say
 
@@ -37,7 +76,6 @@ At `5b0e754`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` a
 - **Tombstones** carry `uids` and parallel `seqs` (log positions); an erased stub is only accepted at a named position. `TombstoneRec` literals in tests need `seqs`.
 - **Part 3 removes `has_maxmind`** from `NodeParams`; several test literals carry it (`src/cluster/repl.rs`, `src/scan/arbiter.rs`, `tests/cluster.rs`).
 - **Part 4's smoke test** runs in a container. The host is Fedora (glibc 2.43), newer than CI's `ubuntu:24.04`, so a locally built binary does not run in that image. `podman` and `docker` are installed; the plan suggests `ubuntu:26.04`, untested. `shellcheck` is not installed locally.
-- The executing-plans ledger for part 2 is in `.superpowers/sdd/2026-10-01-federated-cluster-2-config-key/progress.md` (git-ignored). Its content is reproduced below; the directory can be deleted.
 
 ## Decisions taken on the user's behalf
 
