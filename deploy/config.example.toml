@@ -48,3 +48,18 @@ never_scan = ["192.168.0.0/16"] # CIDRs never counter-scanned (own infra, monito
 # appended as the final argument. Example:
 # [scan.level_argv]
 # 2 = ["-Pn", "-sS", "-sV", "-T3", "--top-ports", "2000"]
+
+# Distributed mode: share requests, scan queue and results with other nodes.
+# Absent: standalone. The node key is created on first start; print it with
+# `peephole cluster id`.
+# [cluster]
+# node_name = "server-a"            # shown in the admin UI only
+# listen    = "0.0.0.0:7443"        # RPC listener (mutual TLS, pinned keys)
+# advertise = "a.example.net:7443"  # how peers reach us; omit if outbound-only
+# takeover_hours = 6                # adopt an unreachable node's queued jobs after
+# lease_secs     = 120              # scan lease, renewed while nmap runs
+#
+# [[cluster.peers]]
+# name = "server-b"
+# address = "b.example.net:7443"
+# public_key = "ed25519:..."

@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod classify;
+pub mod cluster;
 pub mod config;
 pub mod events;
 pub mod export;
@@ -53,6 +54,17 @@ pub async fn check_config(
             .to_string();
         summary.push_str(&format!(", {nmap_line}"));
     }
+    if cfg.cluster.is_some() {
+        let path = cfg.node_key_path();
+        match cluster::identity::Identity::load(&path) {
+            Ok(id) => summary.push_str(&format!("\nnode key {}", id.id)),
+            Err(_) if !path.exists() => summary.push_str(&format!(
+                "\nnote: node key {} will be created on first start",
+                path.display()
+            )),
+            Err(e) => return Err(e.context("node key")),
+        }
+    }
     for n in notes {
         summary.push('\n');
         summary.push_str(&n);
@@ -99,6 +111,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
 
     // Scan pace: config defaults, overridden from the admin queue page.
     let pace = scan::pace::SharedPace::load(&store, &cfg.scan).await?;
+
+    // Distributed mode: RPC listener and peer loops.
+    if cfg.cluster.is_some() {
+        let node = cluster::Node::from_config(&cfg)?;
+        cluster::start(node, shutdown_rx.clone()).await?;
+    }
 
     // Scan worker pool.
     if cfg.roles.scanner {

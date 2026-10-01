@@ -24,6 +24,46 @@ pub struct Config {
     pub maxmind: Option<MaxmindConfig>,
     #[serde(default)]
     pub scan: ScanConfig,
+    /// Distributed mode. Absent: standalone, no RPC listener.
+    pub cluster: Option<ClusterConfig>,
+}
+
+/// `[cluster]`: this node's RPC endpoint and its bootstrap peers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClusterConfig {
+    /// Label shown in the admin UI (never on public pages).
+    pub node_name: String,
+    /// RPC listener (mutual TLS with pinned node keys).
+    pub listen: SocketAddr,
+    /// `host:port` other nodes dial. Absent: outbound-only node.
+    pub advertise: Option<String>,
+    /// Node key; generated on first start. Default: `<data_dir>/node.key`.
+    pub key_path: Option<PathBuf>,
+    /// Adopt an unreachable origin's queued jobs after this many hours.
+    #[serde(default = "default_takeover_hours")]
+    pub takeover_hours: u64,
+    /// Scan lease length; renewed while nmap runs.
+    #[serde(default = "default_lease_secs")]
+    pub lease_secs: u64,
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
+}
+
+fn default_takeover_hours() -> u64 {
+    6
+}
+fn default_lease_secs() -> u64 {
+    120
+}
+
+/// `[[cluster.peers]]`: a node this one vouches for and dials.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PeerConfig {
+    pub name: String,
+    /// `host:port` of the peer's RPC listener.
+    pub address: String,
+    /// `ed25519:<base64url>` as printed by `peephole cluster id`.
+    pub public_key: String,
 }
 
 /// What this deployment does. All on by default (a single standalone node).
@@ -231,7 +271,30 @@ impl Config {
         {
             bail!("[maxmind] needs both account_id and license_key (or omit the section)");
         }
+        if let Some(c) = &self.cluster {
+            if c.node_name.trim().is_empty() {
+                bail!("cluster.node_name must be set");
+            }
+            if c.lease_secs < 10 {
+                bail!("cluster.lease_secs must be at least 10");
+            }
+            for p in &c.peers {
+                crate::cluster::identity::NodeId::parse(&p.public_key)
+                    .with_context(|| format!("cluster.peers `{}`: public_key", p.name))?;
+                if !p.address.contains(':') {
+                    bail!("cluster.peers `{}`: address must be host:port", p.name);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Path of this node's private key (distributed mode).
+    pub fn node_key_path(&self) -> PathBuf {
+        self.cluster
+            .as_ref()
+            .and_then(|c| c.key_path.clone())
+            .unwrap_or_else(|| self.data_dir.join("node.key"))
     }
 
     /// The `[webauthn]` section. Only call with the web role on:

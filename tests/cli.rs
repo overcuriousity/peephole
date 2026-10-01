@@ -125,3 +125,42 @@ web = false
     assert!(stdout.contains("roles: listener"), "{stdout}");
     assert!(!stdout.contains("webauthn"), "{stdout}");
 }
+
+#[test]
+fn cluster_id_creates_key_once_and_prints_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("c.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"
+database_path = "{d}/t.db"
+data_dir = "{d}"
+[roles]
+listener = false
+web = false
+[cluster]
+node_name = "n1"
+listen = "127.0.0.1:0"
+"#,
+            d = dir.path().display()
+        ),
+    )
+    .unwrap();
+    let id = || {
+        let out = bin()
+            .args(["cluster", "id", cfg.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let first = id();
+    assert!(first.starts_with("ed25519:"), "{first}");
+    assert_eq!(first, id(), "key is created once, then reused");
+    assert!(dir.path().join("node.key").exists());
+}
