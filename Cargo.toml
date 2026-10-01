@@ -51,6 +51,10 @@ tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+# danger-allow-state-serialisation lets us persist ceremony state. It is held
+# server-side (webauthn_states table), keyed by a random id, single-use and
+# short-lived — the client only ever sees the id, never the challenge or the
+# credential list — so the "attacker controls the state" risk does not apply.
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 x509-parser = "0.16"
 zstd = "0.14"

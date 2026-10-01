@@ -92,6 +92,19 @@ fn session_cookie(
         .build()
 }
 
+/// Cookie carrying only the random id of a server-side ceremony state.
+fn ceremony_cookie(
+    cfg: &crate::config::Config,
+    id: String,
+) -> axum_extra::extract::cookie::Cookie<'static> {
+    axum_extra::extract::cookie::Cookie::build(("wa_sid", id))
+        .path("/")
+        .http_only(true)
+        .secure(cfg.webauthn().secure_cookies)
+        .same_site(axum_extra::extract::cookie::SameSite::Strict)
+        .build()
+}
+
 #[derive(askama::Template)]
 #[template(path = "login.html")]
 struct LoginPage {
@@ -171,25 +184,28 @@ async fn enroll_start(
     ) {
         Ok((ccr, state_reg)) => {
             let label = body.label.clone().unwrap_or_default();
-            let jar = jar
-                .add(
-                    axum_extra::extract::cookie::Cookie::build((
-                        "wa_reg",
-                        serde_json::to_string(&state_reg).unwrap(),
-                    ))
-                    .path("/")
-                    .http_only(true)
-                    .same_site(axum_extra::extract::cookie::SameSite::Strict),
-                )
-                .add(
-                    axum_extra::extract::cookie::Cookie::build(("wa_label", label))
-                        .path("/")
-                        .http_only(true)
-                        .same_site(axum_extra::extract::cookie::SameSite::Strict),
-                );
+            // The ceremony state (challenge + exclude list) lives server-side.
+            // The client only receives a random id, so it cannot substitute a
+            // challenge or credential it controls.
+            let state_json = serde_json::to_string(&state_reg).unwrap();
+            let sid = match state
+                .store
+                .put_webauthn_state("reg", &state_json, Some(&label))
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(?e, "could not store enrollment state");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+                }
+            };
+            let jar = jar.add(ceremony_cookie(&state.cfg, sid));
             (jar, Json(serde_json::json!({"publicKey": ccr.public_key}))).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::warn!(?e, "start_passkey_registration failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
     }
 }
 
@@ -203,20 +219,40 @@ async fn enroll_finish(
     jar: axum_extra::extract::CookieJar,
     Json(body): Json<EnrollFinish>,
 ) -> Response {
-    let Some(cookie) = jar.get("wa_reg") else {
+    let Some(cookie) = jar.get("wa_sid") else {
         return (StatusCode::BAD_REQUEST, "no enrollment in progress").into_response();
     };
-    let Ok(reg_state) = serde_json::from_str::<PasskeyRegistration>(cookie.value()) else {
-        return (StatusCode::BAD_REQUEST, "corrupt enrollment state").into_response();
+    // Consume the server-side state (single-use). A forged or replayed id finds nothing.
+    let taken = state.store.take_webauthn_state(cookie.value(), "reg").await;
+    let clear = |jar: axum_extra::extract::CookieJar| {
+        jar.remove(axum_extra::extract::cookie::Cookie::from("wa_sid"))
     };
+    let Ok(Some((state_json, label))) = taken else {
+        return (
+            StatusCode::BAD_REQUEST,
+            clear(jar),
+            "no enrollment in progress",
+        )
+            .into_response();
+    };
+    let Ok(reg_state) = serde_json::from_str::<PasskeyRegistration>(&state_json) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            clear(jar),
+            "corrupt enrollment state",
+        )
+            .into_response();
+    };
+    let label = label
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
     let wa = match webauthn_for(&state.cfg) {
         Ok(w) => w,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::warn!(?e, "webauthn build failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
     };
-    let label = jar
-        .get("wa_label")
-        .map(|c| c.value().trim().to_string())
-        .filter(|l| !l.is_empty());
     match wa.finish_passkey_registration(&body.credential, &reg_state) {
         Ok(passkey) => {
             let json = serde_json::to_string(&passkey).unwrap();
@@ -237,17 +273,21 @@ async fn enroll_finish(
                 .await;
             // Establish session directly after first enrollment.
             match state.store.create_session().await {
-                Ok(id) => {
-                    let jar = jar
-                        .add(session_cookie(&state.cfg, id))
-                        .remove(axum_extra::extract::cookie::Cookie::from("wa_reg"))
-                        .remove(axum_extra::extract::cookie::Cookie::from("wa_label"));
-                    (jar, StatusCode::OK).into_response()
+                Ok(id) => (
+                    clear(jar.add(session_cookie(&state.cfg, id))),
+                    StatusCode::OK,
+                )
+                    .into_response(),
+                Err(e) => {
+                    tracing::warn!(?e, "could not create session after enrollment");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
                 }
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }
         }
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::info!(?e, "passkey registration rejected");
+            (StatusCode::BAD_REQUEST, "registration failed").into_response()
+        }
     }
 }
 
@@ -265,22 +305,34 @@ async fn login_start(
     }
     let wa = match webauthn_for(&state.cfg) {
         Ok(w) => w,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::warn!(?e, "webauthn build failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
     };
     match wa.start_passkey_authentication(&passkeys) {
         Ok((rcr, auth_state)) => {
-            let jar = jar.add(
-                axum_extra::extract::cookie::Cookie::build((
-                    "wa_auth",
-                    serde_json::to_string(&auth_state).unwrap(),
-                ))
-                .path("/")
-                .http_only(true)
-                .same_site(axum_extra::extract::cookie::SameSite::Strict),
-            );
+            // Server-side state: the allowed-credential list and challenge stay
+            // here, so a client cannot present a key and challenge it controls.
+            let state_json = serde_json::to_string(&auth_state).unwrap();
+            let sid = match state
+                .store
+                .put_webauthn_state("auth", &state_json, None)
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(?e, "could not store auth state");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+                }
+            };
+            let jar = jar.add(ceremony_cookie(&state.cfg, sid));
             (jar, Json(serde_json::json!({"publicKey": rcr.public_key}))).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::warn!(?e, "start_passkey_authentication failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
     }
 }
 
@@ -294,27 +346,69 @@ async fn login_finish(
     jar: axum_extra::extract::CookieJar,
     Json(body): Json<LoginFinish>,
 ) -> Response {
-    let Some(cookie) = jar.get("wa_auth") else {
+    let Some(cookie) = jar.get("wa_sid") else {
         return (StatusCode::BAD_REQUEST, "no login in progress").into_response();
     };
-    let Ok(auth_state) = serde_json::from_str::<PasskeyAuthentication>(cookie.value()) else {
-        return (StatusCode::BAD_REQUEST, "corrupt auth state").into_response();
+    let clear = |jar: axum_extra::extract::CookieJar| {
+        jar.remove(axum_extra::extract::cookie::Cookie::from("wa_sid"))
+    };
+    // Consume the server-side state (single-use), so a captured assertion plus
+    // cookie cannot be replayed.
+    let Ok(Some((state_json, _))) = state
+        .store
+        .take_webauthn_state(cookie.value(), "auth")
+        .await
+    else {
+        return (StatusCode::BAD_REQUEST, clear(jar), "no login in progress").into_response();
+    };
+    let Ok(auth_state) = serde_json::from_str::<PasskeyAuthentication>(&state_json) else {
+        return (StatusCode::BAD_REQUEST, clear(jar), "corrupt auth state").into_response();
     };
     let wa = match webauthn_for(&state.cfg) {
         Ok(w) => w,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::warn!(?e, "webauthn build failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
     };
     match wa.finish_passkey_authentication(&body.credential, &auth_state) {
-        Ok(_result) => match state.store.create_session().await {
-            Ok(id) => {
-                let jar = jar
-                    .add(session_cookie(&state.cfg, id))
-                    .remove(axum_extra::extract::cookie::Cookie::from("wa_auth"));
-                (jar, StatusCode::OK).into_response()
+        Ok(result) => {
+            // Persist the updated sign counter / backup state for the key used.
+            if result.needs_update()
+                && let Ok(creds) = state.store.load_credentials().await
+            {
+                for (cred_id, j) in creds {
+                    if let Ok(mut pk) = serde_json::from_str::<Passkey>(&j)
+                        && pk.update_credential(&result) == Some(true)
+                    {
+                        if let Ok(updated) = serde_json::to_string(&pk) {
+                            let _ = state.store.update_credential(&cred_id, &updated).await;
+                        }
+                        break;
+                    }
+                }
             }
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
-        Err(e) => (StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
+            match state.store.create_session().await {
+                Ok(id) => (
+                    clear(jar.add(session_cookie(&state.cfg, id))),
+                    StatusCode::OK,
+                )
+                    .into_response(),
+                Err(e) => {
+                    tracing::warn!(?e, "could not create session");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+                }
+            }
+        }
+        Err(e) => {
+            tracing::info!(?e, "passkey authentication rejected");
+            (
+                StatusCode::UNAUTHORIZED,
+                clear(jar),
+                "authentication failed",
+            )
+                .into_response()
+        }
     }
 }
 
