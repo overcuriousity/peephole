@@ -35,6 +35,8 @@ pub struct Arbiter {
     lease: Duration,
     leases: Mutex<HashMap<String, Lease>>,
     waiting: Mutex<Vec<Waiter>>,
+    /// Scanners that handed a job back because their own never_scan covers it.
+    declined: Mutex<HashMap<String, std::collections::HashSet<NodeId>>>,
     /// Serializes hand-outs and state writes.
     assign: tokio::sync::Mutex<()>,
 }
@@ -54,6 +56,7 @@ impl Arbiter {
             node: node.clone(),
             leases: Mutex::new(HashMap::new()),
             waiting: Mutex::new(vec![]),
+            declined: Mutex::new(HashMap::new()),
             assign: tokio::sync::Mutex::new(()),
         });
         a.recover().await?;
@@ -187,14 +190,20 @@ impl Arbiter {
     /// Take our next queued job for `scanner` and mark it running.
     async fn next_job(&self, scanner: NodeId) -> Result<Option<Grant>> {
         let me = self.node.id();
-        let row: Option<(String, String, i64, i64)> = sqlx::query_as(
+        let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
             "SELECT j.uid, i.ip, j.level, j.attempts FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
              WHERE j.status = 'queued' AND j.arbiter = ?
-             ORDER BY j.level DESC, j.queued_at ASC LIMIT 1",
+             ORDER BY j.level DESC, j.queued_at ASC LIMIT 50",
         )
         .bind(&me.0[..])
-        .fetch_optional(&self.node.store.pool)
+        .fetch_all(&self.node.store.pool)
         .await?;
+        // Not a job this scanner already handed back.
+        let row = {
+            let declined = self.declined.lock().unwrap();
+            rows.into_iter()
+                .find(|(uid, ..)| !declined.get(uid).is_some_and(|s| s.contains(&scanner)))
+        };
         let Some((uid, ip, level, attempts)) = row else {
             return Ok(None);
         };
@@ -282,7 +291,7 @@ impl Arbiter {
         status: &str,
         error: Option<String>,
     ) -> bool {
-        if !["done", "failed", "superseded", "refused"].contains(&status) {
+        if !["done", "failed", "superseded", "refused", "declined"].contains(&status) {
             return false;
         }
         let _g = self.assign.lock().await;
@@ -298,8 +307,57 @@ impl Arbiter {
             return false;
         }
         self.leases.lock().unwrap().remove(uid);
+        if status == "declined" {
+            return self.decline(scanner, uid, error).await;
+        }
+        self.declined.lock().unwrap().remove(uid);
         if let Err(e) = self.set_state(uid, status, error, Some(now_ts())).await {
             warn!(?e, job = %uid, "recording job outcome failed");
+            return false;
+        }
+        true
+    }
+
+    /// Members currently running the scanner role (this node included).
+    fn scanners(&self) -> Vec<NodeId> {
+        let mut v: Vec<NodeId> = self
+            .node
+            .members()
+            .values()
+            .filter(|m| m.roles.iter().any(|r| r == "scanner"))
+            .map(|m| m.id)
+            .collect();
+        if self.node.roles.scanner && !v.contains(&self.node.id()) {
+            v.push(self.node.id());
+        }
+        v
+    }
+
+    /// A scanner handed the job back. It returns to the queue for the other
+    /// scanners; once every scanner has declined, it is refused for good.
+    async fn decline(&self, scanner: NodeId, uid: &str, why: Option<String>) -> bool {
+        let everyone = {
+            let mut d = self.declined.lock().unwrap();
+            let set = d.entry(uid.to_string()).or_default();
+            set.insert(scanner);
+            let all = self.scanners().iter().all(|s| set.contains(s));
+            if all {
+                d.remove(uid);
+            }
+            all
+        };
+        let r = if everyone {
+            let why = format!(
+                "declined by every scanner ({})",
+                why.unwrap_or_else(|| "never_scan".into())
+            );
+            self.set_state(uid, "refused", Some(why), Some(now_ts()))
+                .await
+        } else {
+            self.set_state(uid, "queued", None, None).await
+        };
+        if let Err(e) = r {
+            warn!(?e, job = %uid, "recording a declined job failed");
             return false;
         }
         true

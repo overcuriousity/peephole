@@ -28,6 +28,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0006_repl_heads.sql"),
     include_str!("migrations/0007_webauthn_states.sql"),
     include_str!("migrations/0008_indexes.sql"),
+    include_str!("migrations/0009_member_info.sql"),
 ];
 
 #[derive(Clone)]

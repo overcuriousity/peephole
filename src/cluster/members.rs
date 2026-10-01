@@ -19,7 +19,6 @@ pub struct MemberRow {
     pub name: String,
     pub address: Option<String>,
     pub roles: Vec<String>,
-    pub never_scan: Vec<String>,
     pub proto_min: u32,
     pub proto_max: u32,
     pub sponsor: NodeId,
@@ -33,7 +32,6 @@ type Row = (
     String,
     Option<String>,
     String,
-    String,
     i64,
     i64,
     Vec<u8>,
@@ -42,22 +40,21 @@ type Row = (
     Option<i64>,
 );
 
-const SELECT: &str = "SELECT id, name, address, roles_json, never_scan_json, proto_min, proto_max,
+const SELECT: &str = "SELECT id, name, address, roles_json, proto_min, proto_max,
                              sponsor, info_hlc, admitted_hlc, revoked_hlc FROM members";
 
 fn from_row(r: Row) -> Result<MemberRow> {
-    let admitted = r.9;
+    let admitted = r.8;
     Ok(MemberRow {
         id: NodeId::from_slice(&r.0)?,
         name: r.1,
         address: r.2,
         roles: serde_json::from_str(&r.3).unwrap_or_default(),
-        never_scan: serde_json::from_str(&r.4).unwrap_or_default(),
-        proto_min: r.5 as u32,
-        proto_max: r.6 as u32,
-        sponsor: NodeId::from_slice(&r.7)?,
-        info_hlc: r.8 as u64,
-        active: admitted > 0 && r.10.is_none_or(|rev| admitted > rev),
+        proto_min: r.4 as u32,
+        proto_max: r.5 as u32,
+        sponsor: NodeId::from_slice(&r.6)?,
+        info_hlc: r.7 as u64,
+        active: admitted > 0 && r.9.is_none_or(|rev| admitted > rev),
     })
 }
 
@@ -79,13 +76,12 @@ async fn get(conn: &mut SqliteConnection, id: &NodeId) -> Result<Option<MemberRo
 
 async fn write_info(conn: &mut SqliteConnection, info: &MemberInfo, info_hlc: u64) -> Result<()> {
     sqlx::query(
-        "UPDATE members SET name = ?, address = ?, roles_json = ?, never_scan_json = ?,
+        "UPDATE members SET name = ?, address = ?, roles_json = ?,
                 proto_min = ?, proto_max = ?, info_hlc = ? WHERE id = ?",
     )
     .bind(&info.name)
     .bind(&info.address)
     .bind(serde_json::to_string(&info.roles)?)
-    .bind(serde_json::to_string(&info.never_scan)?)
     .bind(info.proto_min as i64)
     .bind(info.proto_max as i64)
     .bind(info_hlc as i64)
@@ -103,15 +99,14 @@ async fn insert(
     admitted_hlc: u64,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO members (id, name, address, roles_json, never_scan_json, proto_min, proto_max,
+        "INSERT INTO members (id, name, address, roles_json, proto_min, proto_max,
                               sponsor, info_hlc, admitted_hlc)
-         VALUES (?,?,?,?,?,?,?,?,?,?)",
+         VALUES (?,?,?,?,?,?,?,?,?)",
     )
     .bind(&info.id.0[..])
     .bind(&info.name)
     .bind(&info.address)
     .bind(serde_json::to_string(&info.roles)?)
-    .bind(serde_json::to_string(&info.never_scan)?)
     .bind(info.proto_min as i64)
     .bind(info.proto_max as i64)
     .bind(&sponsor.0[..])
@@ -177,7 +172,6 @@ pub async fn apply(
                     name: "(revoked)".into(),
                     address: None,
                     roles: vec![],
-                    never_scan: vec![],
                     proto_min: 0,
                     proto_max: 0,
                 };

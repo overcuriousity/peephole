@@ -220,7 +220,11 @@ async fn record_and_respond(
     // internal network or a link-local metadata endpoint. never_scan is checked
     // on the canonical address so IPv4-mapped IPv6 cannot slip past IPv4 CIDRs.
     let canon = crate::net::canonical(ip);
-    let allowlisted = state.cfg.scan.never_scan.iter().any(|n| n.contains(&canon));
+    // never_scan is the business of this node's own scanner. Standalone
+    // that is the only scanner, so the job is not queued at all; in a
+    // cluster another scanner may take it.
+    let allowlisted = state.recorder.node().is_none()
+        && state.cfg.scan.never_scan.iter().any(|n| n.contains(&canon));
     if verdict.scan_level > 0
         && !is_tor
         && !allowlisted
@@ -415,7 +419,11 @@ async fn collect_handler(
         if tells.webdriver || tells.inhuman_fill {
             let canon = crate::net::canonical(ip);
             let is_tor = state.tor.read().unwrap().contains(&ip);
-            let allowlisted = state.cfg.scan.never_scan.iter().any(|n| n.contains(&canon));
+            // never_scan is the business of this node's own scanner. Standalone
+            // that is the only scanner, so the job is not queued at all; in a
+            // cluster another scanner may take it.
+            let allowlisted = state.recorder.node().is_none()
+                && state.cfg.scan.never_scan.iter().any(|n| n.contains(&canon));
             if !is_tor && !allowlisted && crate::net::is_scannable_target(ip) {
                 let level = if tells.inhuman_fill { 3 } else { 2 };
                 if let Ok(crate::store::scans::EnqueueOutcome::Queued(job_id)) = state

@@ -31,8 +31,6 @@ pub struct NodeParams {
     pub identity: Identity,
     pub cluster: ClusterConfig,
     pub roles: Roles,
-    /// This node's `scan.never_scan`, published to the cluster.
-    pub never_scan: Vec<String>,
     pub store: Store,
     /// Supported protocol range; constants except in interop tests.
     pub proto: (u32, u32),
@@ -53,7 +51,6 @@ impl NodeParams {
             identity: Identity::load_or_create(&cfg.node_key_path())?,
             cluster,
             roles: cfg.roles,
-            never_scan: cfg.scan.never_scan.iter().map(|n| n.to_string()).collect(),
             store,
             proto: (proto::PROTO_MIN, proto::PROTO_VERSION),
             has_maxmind: cfg.maxmind.is_some(),
@@ -75,7 +72,6 @@ pub struct Node {
     pub cert: tls::NodeCert,
     pub cfg: ClusterConfig,
     pub roles: Roles,
-    pub never_scan: Vec<String>,
     pub proto: (u32, u32),
     pub store: Store,
     pub hlc: hlc::Hlc,
@@ -116,7 +112,6 @@ impl Node {
             cert,
             cfg: p.cluster,
             roles: p.roles,
-            never_scan: p.never_scan,
             proto: p.proto,
             store: p.store,
             hlc: hlc::Hlc::new(),
@@ -160,7 +155,6 @@ impl Node {
             name: self.cfg.node_name.clone(),
             address: self.cfg.advertise.clone(),
             roles: self.roles.names().into_iter().map(str::to_string).collect(),
-            never_scan: self.never_scan.clone(),
             proto_min: self.proto.0,
             proto_max: self.proto.1,
         }
@@ -178,7 +172,6 @@ impl Node {
                 && m.name == mine.name
                 && m.address == mine.address
                 && m.roles == mine.roles
-                && m.never_scan == mine.never_scan
                 && (m.proto_min, m.proto_max) == (mine.proto_min, mine.proto_max)
         });
         let mut records = vec![];
@@ -193,7 +186,6 @@ impl Node {
                     name: p.name.clone(),
                     address: Some(p.address.clone()),
                     roles: vec![],
-                    never_scan: vec![],
                     proto_min: 0,
                     proto_max: 0,
                 })),

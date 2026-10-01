@@ -134,7 +134,6 @@ async fn boot_in(
         identity,
         cluster,
         roles,
-        never_scan: o.never_scan.clone(),
         store,
         proto: o.proto.unwrap_or((
             cluster::rpc::proto::PROTO_MIN,
@@ -446,7 +445,6 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
             }],
         },
         roles: Roles::default(),
-        never_scan: vec![],
         store,
         proto: (1, 1),
         has_maxmind: false,
@@ -461,7 +459,6 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
         name: name.into(),
         address: None,
         roles: vec![],
-        never_scan: vec![],
         proto_min: 1,
         proto_max: 1,
     };
@@ -642,7 +639,6 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
                 .collect(),
         },
         roles: Roles::default(),
-        never_scan: vec![],
         store,
         proto: (1, 1),
         has_maxmind: false,
@@ -1058,54 +1054,80 @@ async fn silent_arbiters_queue_is_taken_over() {
     .await;
 }
 
-/// Any member's never_scan protects a target cluster-wide: the scanner
-/// refuses it without running nmap.
+async fn knows_scanner(n: &Node, id: NodeId) -> bool {
+    members::all(&n.store)
+        .await
+        .unwrap()
+        .iter()
+        .any(|m| m.id == id && m.roles.iter().any(|r| r == "scanner"))
+}
+
+/// never_scan is local: B leaves the target alone, C scans it.
 #[tokio::test]
-async fn never_scan_of_any_member_is_honoured() {
-    let tools = tempfile::tempdir().unwrap();
-    let nmap = fake_nmap(tools.path(), 0.1);
+async fn never_scan_is_local_to_its_scanner() {
+    let (tools_b, tools_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (ia, a) = new_node("a");
     let (ib, b) = new_node("b");
     let (ic, c) = new_node("c");
     let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let _nb = boot(
+        ib,
+        &b,
+        &[&a, &c],
+        Opts {
+            never_scan: vec!["192.0.2.0/24".into()],
+            scanner: Some(fake_nmap(tools_b.path(), 0.1)),
+            ..DEFAULT
+        },
+    )
+    .await;
     let _nc = boot(
         ic,
         &c,
         &[&a, &b],
         Opts {
-            never_scan: vec!["192.0.2.0/24".into()],
+            scanner: Some(fake_nmap(tools_c.path(), 0.1)),
             ..DEFAULT
         },
     )
     .await;
-    eventually("a knows c's never_scan", || async {
-        members::all(&na.store)
-            .await
-            .unwrap()
-            .iter()
-            .any(|m| m.id == c.id && !m.never_scan.is_empty())
-    })
-    .await;
-    let nb = boot(
-        ib,
-        &b,
-        &[&a, &c],
-        Opts {
-            scanner: Some(nmap),
-            ..DEFAULT
-        },
-    )
-    .await;
-    eventually("b knows c's never_scan", || async {
-        members::all(&nb.store)
-            .await
-            .unwrap()
-            .iter()
-            .any(|m| m.id == c.id && !m.never_scan.is_empty())
+    eventually("a knows both scanners", || async {
+        knows_scanner(&na, b.id).await && knows_scanner(&na, c.id).await
     })
     .await;
     enqueue(&na, "192.0.2.10", 2).await;
-    eventually("job refused", || async {
+    eventually_for(Duration::from_secs(30), "c scanned it", || async {
+        scans_by(&na, c.id).await == 1
+    })
+    .await;
+    assert!(
+        !tools_b.path().join("targets.log").exists(),
+        "b's nmap must not run"
+    );
+}
+
+/// When every scanner declines, the job ends as refused instead of
+/// circling in the queue.
+#[tokio::test]
+async fn job_declined_by_every_scanner_is_refused() {
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(
+        ib,
+        &b,
+        &[&a],
+        Opts {
+            never_scan: vec!["192.0.2.0/24".into()],
+            scanner: Some(fake_nmap(tools.path(), 0.1)),
+            ..DEFAULT
+        },
+    )
+    .await;
+    eventually("a knows the scanner", || knows_scanner(&na, b.id)).await;
+    enqueue(&na, "192.0.2.10", 2).await;
+    eventually_for(Duration::from_secs(30), "job refused", || async {
         count(
             &na,
             "SELECT COUNT(*) FROM scan_jobs WHERE status = 'refused'",

@@ -641,7 +641,6 @@ mod tests {
                 peers: vec![],
             },
             roles: Default::default(),
-            never_scan: vec![],
             store: store.clone(),
             proto: (1, 1),
             has_maxmind: false,
@@ -657,7 +656,6 @@ mod tests {
                 name: "o".into(),
                 address: None,
                 roles: vec![],
-                never_scan: vec![],
                 proto_min: 1,
                 proto_max: 1,
             })

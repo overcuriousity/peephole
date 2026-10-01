@@ -17,8 +17,6 @@ pub struct MemberInfo {
     /// `host:port` others dial; None for outbound-only nodes.
     pub address: Option<String>,
     pub roles: Vec<String>,
-    /// CIDRs this node never scans; every scanner honours them.
-    pub never_scan: Vec<String>,
     pub proto_min: u32,
     pub proto_max: u32,
 }
@@ -341,7 +339,6 @@ mod tests {
             name: "n".into(),
             address: Some("h:1".into()),
             roles: vec!["listener".into()],
-            never_scan: vec![],
             proto_min: 1,
             proto_max: 1,
         }
