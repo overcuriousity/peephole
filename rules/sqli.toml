@@ -1,3 +1,6 @@
+# SQL injection. Matched against raw and percent-decoded text, so encoded
+# payloads (%27%20OR, UNION%09SELECT via + / %xx) are caught.
+
 [[rule]]
 label = "sqli"
 weight = 4
@@ -6,4 +9,6 @@ target_regex = "('|%27)(\\s|%20|\\+)*(or|and)(\\s|%20|\\+)+('|%27)?[0-9'=%20\\+]
 [[rule]]
 label = "sqli"
 weight = 4
-body_regex = "('|%27)(\\s|%20|\\+)*(or|and)(\\s|%20|\\+)+|union(\\s|%20|\\+)+select|sleep\\s*\\("
+# Body form: the boolean-logic clause must be followed by a quote, digit or
+# paren, so ordinary English such as "users' and admins" does not match.
+body_regex = "('|%27)\\s*(or|and)\\s+('|\"|[0-9(])|union\\s+select|sleep\\s*\\(|benchmark\\s*\\(|information_schema"

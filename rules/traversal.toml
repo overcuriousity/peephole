@@ -1,4 +1,8 @@
+# Path traversal. Decoding (two passes) turns ..%2f, ..%5c and double-encoded
+# %252e%252e into ../ / ..\ / .. before matching, and the raw alternatives
+# below catch the encoded forms directly too.
+
 [[rule]]
 label = "path-traversal"
 weight = 4
-target_regex = "\\.\\./|\\.\\.%2f|%2e%2e|/etc/passwd|/proc/self|win.ini"
+target_regex = "\\.\\.(/|\\\\|%2f|%5c)|%2e%2e|\\.\\.(\\\\|/)|/etc/passwd|/proc/self|win\\.ini|boot\\.ini"
