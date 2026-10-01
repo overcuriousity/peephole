@@ -8,11 +8,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    // Tests run in parallel: the OS may hand the same ephemeral port to two
+    // of them once the probe socket is closed, so never give one out twice.
+    static TAKEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut taken = TAKEN.lock().unwrap();
+        if !taken.contains(&port) {
+            taken.push(port);
+            return port;
+        }
+    }
 }
 
 /// Public facts about a test node: what its peers put in their config.
