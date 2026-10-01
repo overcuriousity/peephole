@@ -91,6 +91,13 @@ pub fn retention_applies(cfg: &config::Config) -> bool {
     cfg.cluster.is_none() && cfg.scan.retention_days > 0
 }
 
+/// Whether this node loads the GeoLite2 databases in its data dir. A cluster
+/// node needs its own `[maxmind]` credentials: files copied from peers by
+/// older builds are not used, so nobody serves a frozen copy.
+pub fn geolite_loads(cfg: &config::Config) -> bool {
+    cfg.cluster.is_none() || cfg.maxmind.is_some()
+}
+
 pub async fn run(config_path: PathBuf) -> Result<()> {
     // Startup validation (spec §12).
     let (cfg, _, summary) = check_config(&config_path).await?;
@@ -98,7 +105,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let store = store::Store::connect(&cfg.database_path).await?;
 
-    let geo = Arc::new(RwLock::new(
+    let geo = Arc::new(RwLock::new(if geolite_loads(&cfg) {
         intel::geo::GeoIp::load(&cfg.data_dir)
             .map(Some)
             .unwrap_or_else(|e| {
@@ -107,8 +114,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     "maxmind dbs not loaded yet; geo enrichment deferred to scheduler"
                 );
                 None
-            }),
-    ));
+            })
+    } else {
+        info!(
+            "GeoLite2 databases are not shared any more; configure [maxmind] to look up \
+             GeoIP data on this node"
+        );
+        None
+    }));
     let tor = Arc::new(RwLock::new(
         intel::tor::TorExitList::load(&cfg.data_dir).unwrap_or_default(),
     ));
@@ -682,5 +695,14 @@ mod tests {
         assert!(!retention_applies(&cfg(
             "[cluster]\nnode_name = \"n\"\nlisten = \"127.0.0.1:7443\"\n"
         )));
+    }
+
+    #[test]
+    fn a_cluster_node_loads_geolite2_only_with_its_own_credentials() {
+        let cluster = "[cluster]\nnode_name = \"n\"\nlisten = \"127.0.0.1:7443\"\n";
+        let maxmind = "[maxmind]\naccount_id = \"1\"\nlicense_key = \"k\"\n";
+        assert!(geolite_loads(&cfg("")));
+        assert!(!geolite_loads(&cfg(cluster)));
+        assert!(geolite_loads(&cfg(&format!("{maxmind}{cluster}"))));
     }
 }

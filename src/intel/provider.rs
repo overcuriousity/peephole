@@ -52,10 +52,11 @@ impl Provider for MaxMind {
             };
             let version = g.build_date();
             ips.iter()
-                .filter_map(|ip| {
-                    let addr = ip.parse().ok()?;
-                    let hit = g.lookup(&addr);
-                    Some(Finding {
+                .map(|ip| {
+                    // Not an address: answered with nothing known, so it is
+                    // not asked again (and does not hold up the IPs behind it).
+                    let hit = ip.parse().map(|a| g.lookup(&a)).unwrap_or_default();
+                    Finding {
                         ip: ip.clone(),
                         source_version: version.clone(),
                         data: crate::store::recorder::Recorder::geo_data(
@@ -63,7 +64,7 @@ impl Provider for MaxMind {
                             hit.asn,
                             hit.asn_org.as_deref(),
                         ),
-                    })
+                    }
                 })
                 .collect()
         })
@@ -101,9 +102,11 @@ mod tests {
         let found = p
             .lookup(&["2.125.160.216".into(), "203.0.113.1".into(), "junk".into()])
             .await;
-        assert_eq!(found.len(), 2, "one finding per valid IP, known or not");
+        assert_eq!(found.len(), 3, "one finding per IP, known, unknown or junk");
         assert_eq!(found[0].data["country"], "GB");
         assert!(found[0].source_version.is_some());
         assert_eq!(found[1].data, serde_json::json!({}));
+        assert_eq!(found[2].ip, "junk");
+        assert_eq!(found[2].data, serde_json::json!({}));
     }
 }

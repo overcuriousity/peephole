@@ -51,13 +51,28 @@ pub struct RequestRow {
 impl Store {
     pub async fn upsert_ip(&self, ip: IpAddr) -> Result<IpRow> {
         let s = ip.to_string();
-        sqlx::query(
-            "INSERT INTO ips (ip, first_seen, last_seen) VALUES (?, datetime('now'), datetime('now'))
-             ON CONFLICT(ip) DO UPDATE SET last_seen = datetime('now')",
-        ).bind(&s).execute(&self.pool).await?;
+        let mut conn = self.pool.acquire().await?;
+        let created = sqlx::query(
+            "INSERT OR IGNORE INTO ips (ip, first_seen, last_seen)
+             VALUES (?, datetime('now'), datetime('now'))",
+        )
+        .bind(&s)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected()
+            == 1;
+        if created {
+            // Results may have arrived before the IP did.
+            super::data::refresh_ip_view(&mut conn, &s).await?;
+        } else {
+            sqlx::query("UPDATE ips SET last_seen = datetime('now') WHERE ip = ?")
+                .bind(&s)
+                .execute(&mut *conn)
+                .await?;
+        }
         Ok(sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE ip = ?")
             .bind(&s)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *conn)
             .await?)
     }
 
@@ -164,6 +179,63 @@ mod tests {
         assert_eq!(a.id, b.id);
         assert_eq!(a.ip, "203.0.113.7");
         assert!(!a.is_tor_exit);
+    }
+
+    #[tokio::test]
+    async fn a_result_stored_before_the_ip_shows_once_the_trap_sees_it() {
+        let s = test_store().await;
+        s.local()
+            .record_intel(
+                "203.0.113.8",
+                crate::intel::MAXMIND,
+                None,
+                serde_json::json!({"country": "NL"}),
+            )
+            .await
+            .unwrap();
+        let ip = s.upsert_ip("203.0.113.8".parse().unwrap()).await.unwrap();
+        assert_eq!(ip.country.as_deref(), Some("NL"));
+        s.insert_request(&NewRequest {
+            ip_id: ip.id,
+            method: "GET".into(),
+            path: "/".into(),
+            query: None,
+            headers_json: "[]".into(),
+            body: None,
+            labels_json: "[]".into(),
+            severity: 0,
+            scan_level: 0,
+            is_fp_claim: false,
+            page_token: None,
+        })
+        .await
+        .unwrap();
+        let row = s.ip_by_id(ip.id).await.unwrap().unwrap();
+        assert_eq!(row.country.as_deref(), Some("NL"));
+    }
+
+    #[tokio::test]
+    async fn a_migrated_result_that_says_the_same_is_not_written_again() {
+        let s = test_store().await;
+        let ip = s.upsert_ip("203.0.113.9".parse().unwrap()).await.unwrap();
+        // As migration 0017 leaves it: explicit nulls, hlc 0.
+        sqlx::query(
+            "INSERT INTO ip_intel (ip, provider, origin, hlc, fetched_at, source_version, data_json)
+             VALUES ('203.0.113.9', 'maxmind-geolite2', x'', 0, '2026-01-01 00:00:00', NULL,
+                     '{\"country\":\"DE\",\"asn\":null,\"asn_org\":null}')",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        s.set_ip_geo(ip.id, Some("DE"), None, None).await.unwrap();
+        let hlc: i64 = sqlx::query_scalar("SELECT hlc FROM ip_intel")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(hlc, 0, "same facts: nothing written");
+        s.set_ip_geo(ip.id, Some("NL"), None, None).await.unwrap();
+        let row = s.ip_by_id(ip.id).await.unwrap().unwrap();
+        assert_eq!(row.country.as_deref(), Some("NL"));
     }
 
     #[tokio::test]

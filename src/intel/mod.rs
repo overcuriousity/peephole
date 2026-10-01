@@ -71,6 +71,7 @@ pub async fn enrich_once(rec: &Recorder, providers: &Providers) -> anyhow::Resul
                 let able: Vec<_> = node
                     .live_members(LIVE_WINDOW)
                     .into_iter()
+                    .filter(|id| *id == me || !node.is_blocked(id))
                     .filter(|id| {
                         *id == me
                             || node

@@ -27,6 +27,14 @@ pub enum Recorder {
 /// Rows per tombstone record in bulk deletes.
 const TOMB_CHUNK: usize = 500;
 
+/// `v` with the null-valued keys of an object removed.
+fn without_nulls(mut v: serde_json::Value) -> serde_json::Value {
+    if let Some(m) = v.as_object_mut() {
+        m.retain(|_, x| !x.is_null());
+    }
+    v
+}
+
 impl Recorder {
     pub fn store(&self) -> &Store {
         match self {
@@ -156,11 +164,11 @@ impl Recorder {
         .bind(mine)
         .fetch_optional(&self.store().pool)
         .await?;
-        // Compared as JSON: rows from the migration differ in key order and
-        // explicit nulls.
+        // Compared as JSON without null fields: rows from the migration
+        // differ in key order and carry explicit nulls for unknown fields.
         let same = last
             .and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
-            .is_some_and(|l| l == data);
+            .is_some_and(|l| without_nulls(l) == without_nulls(data.clone()));
         if same {
             return Ok(());
         }

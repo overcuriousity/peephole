@@ -574,7 +574,7 @@ async fn export_intel(_u: SessionUser, State(st): State<Arc<AdminState>>) -> App
     };
     let mut out = String::new();
     for (ip, provider, fetched_at, source_version, origin, data_json) in
-        st.store.intel_export(1_000_000).await?
+        st.store.intel_export(100_000).await?
     {
         let node = match names.get(&origin) {
             Some(n) => n.clone(),

@@ -2246,6 +2246,57 @@ async fn geo_results_come_from_a_node_that_has_the_database() {
     );
 }
 
+/// A peer this node blocked does not take a turn in the lookup order.
+#[tokio::test]
+async fn a_blocked_peer_does_not_hold_up_enrichment() {
+    use peephole::cluster::block;
+    use peephole::intel::provider::MaxMind;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    for f in ["GeoLite2-City", "GeoLite2-ASN"] {
+        std::fs::copy(
+            format!("tests/fixtures/{f}-Test.mmdb"),
+            na.dir.path().join(format!("{f}.mmdb")),
+        )
+        .unwrap();
+    }
+    let geo: peephole::intel::SharedGeo = Default::default();
+    *geo.write().unwrap() = Some(peephole::intel::geo::GeoIp::load(na.dir.path()).unwrap());
+    let providers: peephole::intel::Providers = vec![Arc::new(MaxMind(geo))];
+    // Both can look up; the lower key goes first.
+    let (first, second) = if a.id < b.id { (&na, &nb) } else { (&nb, &na) };
+    assert_eq!(
+        peephole::intel::enrich_once(&rec(first), &providers)
+            .await
+            .unwrap(),
+        0
+    );
+    eventually("second knows first can look up", || async {
+        second
+            .status
+            .known(&first.id())
+            .is_some_and(|k| k.hb.providers == [peephole::intel::MAXMIND])
+    })
+    .await;
+    record(second, "2.125.160.216", "/x").await;
+    assert_eq!(
+        peephole::intel::enrich_once(&rec(second), &providers)
+            .await
+            .unwrap(),
+        0,
+        "first's turn"
+    );
+    block::block(second, first.id()).await.unwrap();
+    assert_eq!(
+        peephole::intel::enrich_once(&rec(second), &providers)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
 // ---------------------------------------------------------------- admin UI
 
 /// The admin router of `n` (cluster recorder) on an ephemeral port, with an

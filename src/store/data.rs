@@ -212,6 +212,10 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
     }
+    // A request always comes from an address; anything else is junk.
+    if r.ip.parse::<std::net::IpAddr>().is_err() {
+        return Ok(Effect::Ignored);
+    }
     let ip_id = ensure_ip(conn, &r.ip, Some(&r.ts)).await?;
     sqlx::query(
         "INSERT OR IGNORE INTO requests (uid, origin, hlc, ts, ip_id, method, path, query,
@@ -241,6 +245,10 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
 /// Store one provider's result for an IP (per origin, newest wins) and
 /// bring the IP's shown facts up to date.
 async fn ip_intel(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpIntelRec) -> Result<Effect> {
+    // Only providers this version knows, so nobody pre-fills others.
+    if ![crate::intel::MAXMIND, crate::intel::TOR].contains(&r.provider.as_str()) {
+        return Ok(Effect::Ignored);
+    }
     sqlx::query(
         "INSERT INTO ip_intel (ip, provider, origin, hlc, fetched_at, source_version, data_json)
          VALUES (?,?,?,?,?,?,?)
@@ -1395,5 +1403,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(eff, Effect::Applied);
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_ip_is_not_an_address_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let Record::Request(mut r) = request(&format!("{}r", a.uid_prefix()), "/x") else {
+            unreachable!()
+        };
+        r.ip = "x".into();
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let eff = apply(&mut conn, ctx, &Record::Request(r)).await.unwrap();
+        assert_eq!(eff, Effect::Ignored);
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ips").await, 0);
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM requests").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_result_from_an_unknown_provider_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let eff = apply(
+            &mut conn,
+            ctx,
+            &intel("203.0.113.7", "made-up", r#"{"country":"NL"}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(eff, Effect::Ignored);
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ip_intel").await, 0);
     }
 }
