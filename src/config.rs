@@ -310,24 +310,53 @@ impl Config {
 
     /// Default nmap arguments per scan level (spec §5), without the target.
     /// Operator overrides come from `scan.level_argv`.
+    ///
+    /// Non-intrusive by design: no `-A`, no intrusive NSE scripts, and timing
+    /// capped at `-T3`. Severity escalates by *scope* — more ports, service
+    /// (`-sV`) and OS (`-O`) detection, then discovery/safe scripts — not by
+    /// speed or aggressiveness, so a higher level maps to a more thorough but
+    /// still defensible scan.
+    ///
+    /// `-Pn`: the target just connected to us, so it is up; nmap's own
+    /// discovery probes are often filtered and would report it down. The
+    /// full-range level caps retransmissions so filtered ports don't stretch
+    /// a scan past the timeout.
     pub fn default_level_argv(&self, level: u8) -> Vec<String> {
         if let Some(custom) = self.scan.level_argv.get(&level) {
             return custom.clone();
         }
-        // -Pn: the target just connected to us, so it is up; nmap's own
-        // discovery probes are often filtered and would report it down.
-        // Full-range levels cap retransmissions so filtered ports don't
-        // stretch a scan past the timeout.
-        match level {
-            1 => "-Pn -sS -T2 --top-ports 100",
-            2 => "-Pn -sS -sV -T3 --top-ports 1000",
-            3 => "-Pn -sS -sV -O -T4 --max-retries 2 -p- --script=default",
-            4 => "-Pn -sS -sV -O -A -T4 --max-retries 2 -p- --script=default,intrusive",
-            _ => "",
-        }
-        .split_whitespace()
-        .map(str::to_string)
-        .collect()
+        // One NSE argument; it contains spaces, so argv is built element by
+        // element rather than split from a string.
+        const SCRIPTS: &str = "(discovery or safe) and not intrusive";
+        let argv: &[&str] = match level {
+            1 => &["-Pn", "-sS", "-T2", "--top-ports", "100"],
+            2 => &["-Pn", "-sS", "-sV", "-T3", "--top-ports", "1000"],
+            3 => &[
+                "-Pn",
+                "-sS",
+                "-sV",
+                "-O",
+                "-T3",
+                "--top-ports",
+                "1000",
+                "--script",
+                SCRIPTS,
+            ],
+            4 => &[
+                "-Pn",
+                "-sS",
+                "-sV",
+                "-O",
+                "-T3",
+                "-p-",
+                "--max-retries",
+                "2",
+                "--script",
+                SCRIPTS,
+            ],
+            _ => &[],
+        };
+        argv.iter().map(|s| s.to_string()).collect()
     }
 }
 
@@ -360,6 +389,52 @@ license_key = "k"
             let argv = cfg.default_level_argv(level);
             assert!(argv.iter().any(|a| a == "-Pn"), "level {level}: {argv:?}");
         }
+    }
+
+    /// Scans stay non-intrusive: no -A, no intrusive NSE category, timing
+    /// never above -T3; the script selector is one argv element (it contains
+    /// spaces), and scope grows with the level.
+    #[test]
+    fn default_presets_are_non_intrusive() {
+        let cfg: Config = toml::from_str(
+            r#"
+trap_listen = "0.0.0.0:8080"
+admin_listen = "127.0.0.1:8443"
+database_path = "/tmp/x.db"
+data_dir = "/tmp"
+rules_dir = "rules"
+[webauthn]
+rp_id = "x.example"
+origin = "https://x.example"
+rp_name = "x"
+"#,
+        )
+        .unwrap();
+        for level in 1..=4 {
+            let argv = cfg.default_level_argv(level);
+            assert!(!argv.iter().any(|a| a == "-A"), "level {level} has -A");
+            assert!(
+                !argv.iter().any(|a| a == "-T4" || a == "-T5"),
+                "level {level} timing too fast: {argv:?}"
+            );
+            // Scripts, when present, are one argv element that excludes the
+            // intrusive category.
+            if let Some(i) = argv.iter().position(|a| a == "--script") {
+                let expr = &argv[i + 1];
+                assert!(expr.contains("not intrusive"), "level {level}: {expr}");
+                assert!(expr.contains(' '), "selector must be one argv element");
+            } else {
+                assert!(
+                    !argv.iter().any(|a| a.contains("intrusive")),
+                    "level {level} enables intrusive scripts: {argv:?}"
+                );
+            }
+        }
+        // Only the top two levels do OS detection; only level 4 scans all ports.
+        assert!(!cfg.default_level_argv(2).iter().any(|a| a == "-O"));
+        assert!(cfg.default_level_argv(3).iter().any(|a| a == "-O"));
+        assert!(!cfg.default_level_argv(3).iter().any(|a| a == "-p-"));
+        assert!(cfg.default_level_argv(4).iter().any(|a| a == "-p-"));
     }
 
     #[test]

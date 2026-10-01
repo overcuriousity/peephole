@@ -1498,8 +1498,6 @@ async fn admin_cluster_page_and_private_attribution() {
     for path in [
         "/".to_string(),
         "/ips".into(),
-        "/requests".into(),
-        "/requests?node=sensor-alpha".into(),
         "/ip/198.51.100.150".into(),
         "/api/stats".into(),
         "/api/map".into(),
@@ -1510,13 +1508,14 @@ async fn admin_cluster_page_and_private_attribution() {
             assert!(!body.contains(s.as_str()), "{path} leaks {s}");
         }
     }
-    // The public node filter is ignored, not an oracle.
-    let filtered = text(&public, format!("{base}/requests?node=sensor-charlie")).await;
-    assert!(filtered.contains("/admin.php"));
-    let admin_only = public
-        .get(format!("{base}/admin/cluster"))
-        .send()
-        .await
+    // Request search (and its node filter) is admin-only.
+    let noredir = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
         .unwrap();
-    assert!(admin_only.url().path().starts_with("/login") || !admin_only.status().is_success());
+    for path in ["/requests", "/requests?node=sensor-alpha", "/admin/cluster"] {
+        let resp = noredir.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), 303, "{path} should require a session");
+        assert_eq!(resp.headers().get("location").unwrap(), "/login", "{path}");
+    }
 }

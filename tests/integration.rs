@@ -292,9 +292,18 @@ async fn wall_shows_aggregates_not_payloads() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let html = resp.text().await.unwrap();
+    // The IP is named (wall of shame) but no request rows are shown: the
+    // public wall has no "Recent activity" table, so request paths stay out.
     assert!(html.contains("203.0.113.99"));
-    assert!(html.contains("/wp-login.php"));
     assert!(html.contains("href=\"/ip/203.0.113.99\""));
+    assert!(
+        !html.contains("/wp-login.php"),
+        "public wall must not list request paths"
+    );
+    assert!(
+        !html.contains("Recent activity"),
+        "public wall has no recent-activity table"
+    );
     assert!(html.contains("Last 7 days"));
     assert!(html.contains("data-range=\"7d\""));
     assert!(html.contains("id=\"map\""));
@@ -404,6 +413,10 @@ async fn admin_routes_redirect_without_session() {
         "/admin/export",
         "/admin/export/download?format=csv",
         "/admin/keys",
+        // Request rows identify individual clients, so request search is
+        // admin-only.
+        "/requests",
+        "/requests?path=/x",
     ] {
         let resp = client.get(format!("{base}{path}")).send().await.unwrap();
         assert_eq!(resp.status(), 303, "{path}");
@@ -420,7 +433,7 @@ async fn admin_routes_redirect_without_session() {
         assert_eq!(resp.status(), 303, "{path}");
     }
     // Public routes stay public.
-    for path in ["/", "/login", "/ips", "/requests"] {
+    for path in ["/", "/login", "/ips"] {
         let resp = client.get(format!("{base}{path}")).send().await.unwrap();
         assert_eq!(resp.status(), 200, "{path}");
     }
@@ -1140,7 +1153,7 @@ async fn stats_and_map_json_by_range() {
 }
 
 #[tokio::test]
-async fn public_ip_page_shows_requests_but_hides_admin_data() {
+async fn public_ip_page_shows_aggregates_but_hides_requests_and_admin_data() {
     let (trap_base, store, dir) = spawn_trap().await;
     let c = reqwest::Client::new();
     let _ = c
@@ -1200,9 +1213,10 @@ async fn public_ip_page_shows_requests_but_hides_admin_data() {
         .await
         .unwrap();
     assert!(html.contains("203.0.113.42"));
-    assert!(html.contains("/wp-login.php"));
     assert!(html.contains("data-sparkline=\"["));
     for marker in [
+        // Per-request rows (path included) are admin-only now.
+        "/wp-login.php",
         "HEADER-MARKER",
         "claimant@example.org",
         "FPHASHMARKER",
@@ -1253,6 +1267,7 @@ async fn public_ip_page_shows_requests_but_hides_admin_data() {
         .await
         .unwrap();
     for marker in [
+        "/wp-login.php",
         "claimant@example.org",
         "FPHASHMARKER",
         "OSGUESSMARKER",
@@ -1266,7 +1281,7 @@ async fn public_ip_page_shows_requests_but_hides_admin_data() {
 }
 
 #[tokio::test]
-async fn public_directory_and_request_search() {
+async fn public_directory_is_public_but_request_search_is_admin() {
     let (trap_base, store, dir) = spawn_trap().await;
     let c = reqwest::Client::new();
     for (ip, path) in [
@@ -1282,7 +1297,8 @@ async fn public_directory_and_request_search() {
             .await
             .unwrap();
     }
-    let base = spawn_admin_with(store, dir.path()).await;
+    let base = spawn_admin_with(store.clone(), dir.path()).await;
+    // The IP directory stays public (named-and-shamed).
     let html = reqwest::get(format!("{base}/ips"))
         .await
         .unwrap()
@@ -1306,24 +1322,31 @@ async fn public_directory_and_request_search() {
         .await
         .unwrap();
     assert!(html.contains("No IPs match"));
-    let html = reqwest::get(format!("{base}/requests?path=/c"))
+    // Request search is admin-only: anonymous is redirected to /login.
+    let noredir = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let resp = noredir
+        .get(format!("{base}/requests?path=/c"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(resp.headers().get("location").unwrap(), "/login");
+    // With a session the search works and links to request detail.
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, abase) = enrolled_admin_client(store, cfg).await;
+    let html = client
+        .get(format!("{abase}/requests?path=/c"))
+        .send()
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
     assert!(html.contains("/c") && !html.contains(">/a<"));
-    assert!(
-        !html.contains("href=\"/admin/requests/"),
-        "no detail links for anonymous users"
-    );
-    let html = reqwest::get(format!("{base}/requests?page=abc"))
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(html.contains("/a"), "bad page falls back to page 1");
+    assert!(html.contains("href=\"/admin/requests/"));
 }
 
 #[tokio::test]
@@ -1412,16 +1435,12 @@ async fn bulk_delete_checked_and_filtered() {
             .unwrap();
         assert_eq!(resp.status(), 303, "{p}");
     }
-    let html = reqwest::get(format!("{base}/requests?path=/keep"))
-        .await
-        .unwrap()
-        .text()
+    let resp = anon
+        .get(format!("{base}/requests?path=/keep"))
+        .send()
         .await
         .unwrap();
-    assert!(
-        !html.contains("name=\"ids\""),
-        "no checkboxes for anonymous users"
-    );
+    assert_eq!(resp.status(), 303, "request search is admin-only");
 
     let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
     let (client, abase) = enrolled_admin_client(store.clone(), cfg).await;
@@ -1704,32 +1723,32 @@ async fn query_strings_are_admin_only() {
         .unwrap();
     let base = spawn_admin_with(store.clone(), dir.path()).await;
     let get = |url: String| async move { reqwest::get(url).await.unwrap().text().await.unwrap() };
+    // No public surface shows the query string — nor, now, request paths or
+    // the per-request rows that carried them.
     for url in [
-        format!("{base}/requests"),
-        format!("{base}/requests?ip=203.0.113.200"),
         format!("{base}/ip/203.0.113.200"),
+        format!("{base}/ips"),
         format!("{base}/"),
         format!("{base}/api/stats?range=24h"),
     ] {
         let body = get(url.clone()).await;
         assert!(!body.contains("SECRET"), "{url} leaks the query string");
-    }
-    let listed = get(format!("{base}/requests?ip=203.0.113.200")).await;
-    assert!(listed.contains("/api/v1/usres"), "path stays public");
-
-    // No search oracle over hidden query strings.
-    for probe in ["sk_live_51H8", "SECRET", "api_key"] {
-        let body = get(format!("{base}/requests?path={probe}")).await;
         assert!(
-            !body.contains("203.0.113.200"),
-            "public search for {probe} reveals the request"
+            !body.contains("/api/v1/usres"),
+            "{url} leaks the request path"
         );
     }
-    let body = get(format!("{base}/requests?path=usres")).await;
-    assert!(
-        body.contains("203.0.113.200"),
-        "public path search still works"
-    );
+    // Request search is admin-only, so there is no public oracle at all.
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let resp = anon
+        .get(format!("{base}/requests?path=usres"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303, "request search is admin-only");
 
     // Admins see and search the query string.
     let cfg = Config::load(&dir.path().join("c.toml")).unwrap();

@@ -72,19 +72,24 @@ internet ──► nginx (TLS) ──► peephole admin listener  127.0.0.1:8443
   requests with the signature rules in `/etc/peephole/rules`, enriches with
   MaxMind GeoLite2 + Tor exit list, queues counter-scans.
 - **Scanner** — rate-limited nmap counter-scans of caught scanners
-  (configurable levels, cooldowns, and never-scan CIDRs).
+  (configurable levels, cooldowns, and never-scan CIDRs). Scans are
+  non-intrusive by design: no `-A`, no intrusive NSE scripts, timing capped
+  at `-T3`. Severity escalates by *scope* (more ports, `-sV`, `-O`, then
+  discovery/safe scripts), not by speed.
 - **Wall of shame** (public, no login) — aggregate statistics per time range,
-  a choropleth map, a searchable IP directory (exact / prefix / CIDR), per-IP
-  request history and request search. No query strings, payloads, headers,
-  fingerprints or scan results are ever public: a legitimate client that
-  mistypes an API URL would otherwise publish its credentials. Credentials
-  embedded in the URL path itself are still shown.
-- **Admin area** (FIDO2 only, no passwords, under `/admin`) — live scan queue
-  over Server-Sent Events, counter-scan results with ports and raw nmap XML,
-  raw request headers and bodies, fingerprint correlation across IPs, the
-  false-positive inbox, exports (CSV, Timesketch JSONL, Parquet), key
-  management, and deletion of records (single, checked, or everything
-  matching a filter).
+  a choropleth map, top attacking IPs and networks, and a searchable IP
+  directory (exact / prefix / CIDR) with per-IP geo, counts and max severity.
+  Individual request rows are never public: no request paths, query strings,
+  payloads, headers, fingerprints or scan results. The public side names the
+  IPs it shames but not what each one requested; `/api/stats` carries only
+  aggregates.
+- **Admin area** (FIDO2 only, no passwords, under `/admin`) — everything the
+  public side withholds: the full request search and per-IP request history,
+  the live scan queue over Server-Sent Events, counter-scan results with
+  ports and raw nmap XML, raw request headers and bodies, fingerprint
+  correlation across IPs, the false-positive inbox, exports (CSV, Timesketch
+  JSONL, Parquet), key management, and deletion of records (single, checked,
+  or everything matching a filter).
 
 Both sites follow the system light/dark preference (with a manual toggle),
 ship their fonts, scripts and map inside the binary, and make no external

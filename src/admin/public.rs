@@ -1,4 +1,5 @@
 //! Unauthenticated pages. Never load admin-only data here.
+use crate::admin::auth::SessionUser;
 use crate::admin::countries;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
@@ -222,32 +223,23 @@ struct RequestsPage {
     nodes: Vec<String>,
 }
 
+/// Admin-only: request rows (timestamp, method, path, severity, labels)
+/// identify individual clients, so the public side never lists them.
 async fn requests(
-    MaybeUser(authed): MaybeUser,
+    _u: SessionUser,
     State(state): State<Arc<AdminState>>,
     Query(f): Query<RequestFilter>,
 ) -> AppResult<Html<String>> {
-    let page = state
-        .store
-        .search_requests(&f, Audience::of(authed))
-        .await?;
-    let bulk_total = if authed {
-        Some(state.store.count_requests(&f).await?)
-    } else {
-        None
-    };
+    let page = state.store.search_requests(&f, Audience::Admin).await?;
+    let bulk_total = Some(state.store.count_requests(&f).await?);
     let qs = request_qs(&f);
-    let nodes = if authed {
-        crate::cluster::members::all(&state.store)
-            .await?
-            .into_iter()
-            .map(|m| m.name)
-            .collect()
-    } else {
-        vec![]
-    };
+    let nodes = crate::cluster::members::all(&state.store)
+        .await?
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
     render(&RequestsPage {
-        chrome: Chrome::new(authed, "requests"),
+        chrome: Chrome::new(true, "requests"),
         f,
         page,
         qs,
@@ -296,10 +288,21 @@ async fn ip_page(
     let Some(ov) = state.store.ip_overview(ip.id).await? else {
         return Err(AppError::NotFound);
     };
-    let page = state
-        .store
-        .requests_for_ip(ip.id, page_num(q.page), Audience::of(authed))
-        .await?;
+    // Per-request rows are admin-only; the public page shows only the IP's
+    // aggregates (geo, counts, max severity, labels). Not even queried for
+    // the public.
+    let page = if authed {
+        state
+            .store
+            .requests_for_ip(ip.id, page_num(q.page), Audience::Admin)
+            .await?
+    } else {
+        Page {
+            items: vec![],
+            page: 1,
+            has_next: false,
+        }
+    };
     // Admin-only data is only *queried* with a session (spec §5).
     let admin = if authed {
         let mut scans = vec![];
