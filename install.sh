@@ -178,11 +178,11 @@ else
     for r in $(printf '%s' "$PEEPHOLE_ROLES" | tr ',' ' '); do
         case "$r" in listener|scanner|web) ;; *) die "unknown role '$r' in PEEPHOLE_ROLES (listener, scanner, web)";; esac
     done
-    prompt_optional MAXMIND_ACCOUNT_ID "MaxMind GeoLite2 account ID (https://www.maxmind.com/en/accounts/current/license-key; in a cluster one member with a key is enough)"
+    prompt_optional MAXMIND_ACCOUNT_ID "MaxMind GeoLite2 account ID (https://www.maxmind.com/en/accounts/current/license-key; optional: in a cluster the lookups of a member with credentials are shared, the databases are not)"
     if [ -n "${MAXMIND_ACCOUNT_ID:-}" ]; then
         prompt MAXMIND_LICENSE_KEY "MaxMind GeoLite2 license key"
     else
-        warn "no MaxMind credentials: GeoIP enrichment is off unless a cluster member shares its databases"
+        warn "no MaxMind credentials: this node cannot look up GeoIP data; it shows what other cluster members look up, if any can"
     fi
     if has_role web; then
         prompt PEEPHOLE_DOMAIN "Public domain of the admin dashboard (WebAuthn relying party)"

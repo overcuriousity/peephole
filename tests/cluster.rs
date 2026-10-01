@@ -2711,3 +2711,54 @@ async fn a_geo_only_write_leaves_tor_alone() {
     assert_eq!(mine, 0, "no Tor row of its own");
     assert!(tor(&nb).await, "a's Tor result still shows");
 }
+
+/// Enrichment results can be exported with their provenance.
+#[tokio::test]
+async fn enrichment_results_are_exported_with_provenance() {
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    record(&nb, "203.0.113.91", "/x").await;
+    rec(&nb)
+        .record_intel(
+            "203.0.113.91",
+            peephole::intel::MAXMIND,
+            Some("2026-09-30"),
+            serde_json::json!({"country": "NL"}),
+        )
+        .await
+        .unwrap();
+    eventually("a has the result", || async {
+        count(&na, "SELECT COUNT(*) FROM ip_intel").await == 1
+    })
+    .await;
+    // A result whose IP has no row any more is not exported.
+    sqlx::query(
+        "INSERT INTO ip_intel (ip, provider, origin, hlc, fetched_at, source_version, data_json)
+         VALUES ('198.51.100.7', 'maxmind-geolite2', x'', 0, '2026-01-01T00:00:00Z', NULL, '{}')",
+    )
+    .execute(&na.store.pool)
+    .await
+    .unwrap();
+    let (admin, base) = admin_on(&na).await;
+    let body = text(&admin, format!("{base}/admin/export/intel")).await;
+    assert_eq!(body.lines().count(), 1, "{body}");
+    let line: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+    assert_eq!(line["ip"], "203.0.113.91");
+    assert_eq!(line["provider"], "maxmind-geolite2");
+    assert_eq!(line["source_version"], "2026-09-30");
+    assert_eq!(line["node"], "node-bravo");
+    assert_eq!(line["data"]["country"], "NL");
+    // Not public.
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let r = anon
+        .get(format!("{base}/admin/export/intel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 303);
+}

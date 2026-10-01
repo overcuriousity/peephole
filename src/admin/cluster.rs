@@ -39,6 +39,8 @@ pub struct MemberView {
     pub short: String,
     pub name: String,
     pub roles: String,
+    /// Enrichment providers it can look up, comma separated.
+    pub providers: String,
     pub address: String,
     pub active: bool,
     /// The member's standing in words (badge on inactive members).
@@ -206,6 +208,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
             short: m.id.short(),
             name: m.name.clone(),
             roles: m.roles.join(", "),
+            providers: hb.map(|h| h.providers.join(", ")).unwrap_or_default(),
             address: m
                 .address
                 .clone()
@@ -253,6 +256,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
         short: me.short(),
         name: node.cfg.node_name.clone(),
         roles: node.roles().names().join(", "),
+        providers: node.providers().join(", "),
         address: node.cfg.advertise.clone().unwrap_or_default(),
         active: true,
         state: "active",

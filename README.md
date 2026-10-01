@@ -31,7 +31,8 @@ The installer:
 - installs the binary to `/usr/local/bin/peephole` and the default signature
   rules to `/etc/peephole/rules`,
 - asks for your **MaxMind GeoLite2 account ID and license key**
-  (get them at <https://www.maxmind.com/en/accounts/current/license-key>),
+  (get them at <https://www.maxmind.com/en/accounts/current/license-key>;
+  optional: in a cluster another member's lookups are used when you have none),
   the public domain of the admin dashboard, and your trusted proxy CIDRs,
 - writes `/etc/peephole/config.toml` and installs + starts a systemd service.
 
@@ -98,9 +99,9 @@ requests.
 ## Distributed mode
 
 Several deployments can form a cluster that shares one dataset: every
-request, the scan queue, scan results and the Tor intel. The operators do
-not need to know or trust each other. Each node runs any combination of
-three roles, set in `[roles]`:
+request, the scan queue, scan results and what is known about each IP. The
+operators do not need to know or trust each other. Each node runs any
+combination of three roles, set in `[roles]`:
 
 | Role | Does | Needs |
 |---|---|---|
@@ -177,6 +178,12 @@ Things to know:
   written by different nodes. The Cluster page flags clock differences.
 - A standalone node that joins brings its history with it.
 - Node names and keys appear only in the admin area, never on public pages.
+- GeoIP: a node with MaxMind credentials downloads the GeoLite2 databases
+  for itself. The databases are never passed on. That node looks up the IPs
+  the other nodes recorded and shares the results, so one member with
+  credentials is enough; without any, the dataset has no GeoIP data. The Tor
+  exit list is public and is fetched by one node for all. Every result
+  records which provider and which node it came from (Admin → Export).
 
 ## Configuration
 

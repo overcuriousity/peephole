@@ -42,6 +42,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/claims/{id}/delete", post(claim_delete))
         .route("/admin/export", get(export_page))
         .route("/admin/export/download", get(export_download))
+        .route("/admin/export/intel", get(export_intel))
         .route("/admin/keys", get(keys))
         .route("/admin/keys/delete", post(key_delete))
 }
@@ -558,6 +559,50 @@ struct ExportPage {
 
 async fn export_page(_u: SessionUser) -> AppResult<Html<String>> {
     render(&ExportPage { chrome: chrome() })
+}
+
+/// Enrichment results as JSON Lines: what each provider said about each
+/// IP, when, from which data version, and which node looked it up.
+async fn export_intel(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
+    let names: HashMap<Vec<u8>, String> = match st.recorder.node() {
+        Some(node) => crate::cluster::members::all(&node.store)
+            .await?
+            .into_iter()
+            .map(|m| (m.id.0.to_vec(), m.name))
+            .collect(),
+        None => HashMap::new(),
+    };
+    let mut out = String::new();
+    for (ip, provider, fetched_at, source_version, origin, data_json) in
+        st.store.intel_export(1_000_000).await?
+    {
+        let node = match names.get(&origin) {
+            Some(n) => n.clone(),
+            None if origin.is_empty() => "this node".to_string(),
+            None => data_encoding::HEXLOWER.encode(&origin[..origin.len().min(6)]),
+        };
+        let data: serde_json::Value =
+            serde_json::from_str(&data_json).unwrap_or(serde_json::Value::Null);
+        out.push_str(
+            &serde_json::json!({
+                "ip": ip, "provider": provider, "fetched_at": fetched_at,
+                "source_version": source_version, "node": node, "data": data,
+            })
+            .to_string(),
+        );
+        out.push('\n');
+    }
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/x-ndjson"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"peephole-enrichment.jsonl\"",
+            ),
+        ],
+        out,
+    )
+        .into_response())
 }
 
 async fn export_download(

@@ -56,7 +56,7 @@
           {% if m.incompatible %}<br><span class="badge badge-status" data-status="failed">incompatible version</span>{% endif %}
           {% if let Some(s) = m.skew %}<br><span class="badge badge-status" data-status="running" title="Run NTP on every node: scan cooldowns compare timestamps from different nodes.">clock {{ s }}</span>{% endif %}
           {% if let Some(e) = m.error %}<br><span class="muted mono small">{{ e }}</span>{% endif %}</td>
-        <td>{{ m.roles }}</td>
+        <td>{{ m.roles }}{% if !m.providers.is_empty() %}<br><span class="muted small">looks up: {{ m.providers }}</span>{% endif %}</td>
         <td class="mono">{{ m.address }}</td>
         <td><span class="badge badge-status" data-status="{% if m.live %}done{% else %}queued{% endif %}">{{ m.last_seen }}</span></td>
         <td class="mono">{{ m.version }}</td>
@@ -113,13 +113,14 @@
   <p class="muted">0 workers or 0 scans per hour pauses a scanner. Values apply within seconds and persist on the scanner.</p>
 </section>
 <section class="card">
-  <div class="card-head"><h2>Shared intel</h2><span class="muted">fetched by one node, copied by hash</span></div>
+  <div class="card-head"><h2>Shared intel</h2><span class="muted">the Tor exit list: fetched by one node, copied by hash</span></div>
   {% if intel.is_empty() %}<p class="muted">Nothing announced yet.</p>{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>File</th><th>Version</th><th>Size</th><th>Fetched (UTC)</th><th>By</th><th>Here</th></tr></thead>
     <tbody>{% for i in intel %}<tr><td class="mono">{{ i.kind }}</td><td class="mono">{{ i.sha }}</td><td>{{ i.size }}</td><td class="ts">{{ i.fetched_at }}</td><td>{{ i.by }}</td>
       <td>{% if i.local %}<span class="badge badge-status" data-status="done">current</span>{% else %}<span class="badge badge-status" data-status="queued">copying</span>{% endif %}</td></tr>{% endfor %}</tbody>
   </table></div>{% endif %}
+  <p class="muted">GeoIP databases are not shared. A node that has them looks up the IPs other nodes recorded and shares the results.</p>
 </section>
 <section class="card"><h2>Join or rejoin a cluster</h2>
   <p class="muted">Paste an invite created on a member. This node's data is shared with the cluster, and the cluster's with it.</p>

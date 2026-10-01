@@ -32,7 +32,7 @@ rp_name = "peephole"
 secure_cookies = true
 
 [maxmind]
-# Optional. Without it GeoIP enrichment is off.
+# Optional. Without credentials this node cannot look up GeoIP data itself; in a cluster it then shows what other members looked up. The databases stay on the node that downloaded them.
 # GeoLite2 account credentials (https://www.maxmind.com/en/accounts/current/license-key).
 account_id = "123456"
 license_key = "testkey"

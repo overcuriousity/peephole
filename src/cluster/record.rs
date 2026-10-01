@@ -148,7 +148,8 @@ pub struct ScanResultRec {
 /// A new version of a shared intel file, fetched by the origin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntelManifestRec {
-    /// `geolite2-city`, `geolite2-asn` or `tor-exits`.
+    /// Only `tor-exits`; other kinds (old `geolite2-*` announcements) are
+    /// ignored.
     pub kind: String,
     pub sha256: String,
     pub size: u64,
