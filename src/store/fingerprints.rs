@@ -13,15 +13,17 @@ impl Store {
         behavior_summary_json: &str,
         event_blob: &[u8],
     ) -> Result<i64> {
-        let compressed = zstd::encode_all(event_blob, 3)?;
-        let r = sqlx::query(
-            "INSERT INTO fingerprints (request_id, ip_id, ts, fp_hash, visitor_id, attributes_json, behavior_summary_json, event_blob)
-             VALUES (?,?,datetime('now'),?,?,?,?,?)",
-        )
-        .bind(request_id).bind(ip_id).bind(fp_hash).bind(visitor_id)
-        .bind(attributes_json).bind(behavior_summary_json).bind(&compressed)
-        .execute(&self.pool).await?;
-        Ok(r.last_insert_rowid())
+        self.local()
+            .insert_fingerprint(
+                request_id,
+                ip_id,
+                fp_hash,
+                visitor_id,
+                attributes_json,
+                behavior_summary_json,
+                event_blob,
+            )
+            .await
     }
 
     /// Distinct *other* IPs sharing this fingerprint (spec §8.2 correlation).

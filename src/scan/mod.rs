@@ -2,7 +2,7 @@ pub mod nmap_xml;
 pub mod pace;
 
 use crate::config::Config;
-use crate::store::Store;
+use crate::store::recorder::Recorder;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,14 +18,15 @@ pub fn nmap_argv(level: u8, target: &IpAddr, cfg: &Config) -> Vec<String> {
 }
 
 pub async fn run_workers(
-    store: Store,
+    rec: Recorder,
     cfg: Config,
     pace: pace::SharedPace,
     nmap_path: PathBuf,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     notifier: crate::events::Notifier,
 ) {
-    match store.requeue_orphaned_jobs().await {
+    let store = rec.store().clone();
+    match rec.requeue_orphaned_jobs().await {
         Ok(0) => {}
         Ok(n) => info!(jobs = n, "requeued scans interrupted by the last shutdown"),
         Err(e) => warn!(?e, "could not requeue interrupted scans"),
@@ -47,7 +48,7 @@ pub async fn run_workers(
                 break;
             }
             // Global rate cap (spec §5), also across restarts.
-            match store.jobs_started_last_hour().await {
+            match rec.jobs_started_last_hour().await {
                 Ok(n) if n >= p.max_scans_per_hour => break,
                 Err(e) => {
                     warn!(?e, "rate cap check failed");
@@ -55,7 +56,7 @@ pub async fn run_workers(
                 }
                 _ => {}
             }
-            match store.next_queued_job().await {
+            match rec.next_queued_job().await {
                 Ok(Some(job)) => {
                     let ip: String = sqlx::query_scalar("SELECT ip FROM ips WHERE id=?")
                         .bind(job.ip_id)
@@ -63,7 +64,7 @@ pub async fn run_workers(
                         .await
                         .unwrap_or_default();
                     let Ok(target) = ip.parse::<IpAddr>() else {
-                        let _ = store.finish_job(job.id, None, Some("invalid target")).await;
+                        let _ = rec.finish_job(job.id, None, Some("invalid target")).await;
                         continue;
                     };
                     if let Ok(Some(j)) = store.queue_job(job.id).await {
@@ -72,6 +73,7 @@ pub async fn run_workers(
                     last_start = Some(tokio::time::Instant::now());
                     let argv = nmap_argv(job.level as u8, &target, &cfg);
                     let store2 = store.clone();
+                    let rec2 = rec.clone();
                     let notifier2 = notifier.clone();
                     let nmap = nmap_path.clone();
                     let timeout = Duration::from_secs(p.timeout_secs);
@@ -89,7 +91,7 @@ pub async fn run_workers(
                                 match nmap_xml::parse_nmap_xml(&out.stdout) {
                                     Ok(res) => {
                                         if let Err(e) =
-                                            store2.finish_job(job.id, Some(&res), None).await
+                                            rec2.finish_job(job.id, Some(&res), None).await
                                         {
                                             warn!(
                                                 job = job.id,
@@ -100,7 +102,7 @@ pub async fn run_workers(
                                         info!(target = %target, level = job.level, "scan done");
                                     }
                                     Err(e) => {
-                                        if let Err(e2) = store2
+                                        if let Err(e2) = rec2
                                             .finish_job(job.id, None, Some(&e.to_string()))
                                             .await
                                         {
@@ -114,7 +116,7 @@ pub async fn run_workers(
                                 }
                             }
                             Ok(Ok(out)) => {
-                                if let Err(e) = store2
+                                if let Err(e) = rec2
                                     .finish_job(
                                         job.id,
                                         None,
@@ -127,14 +129,13 @@ pub async fn run_workers(
                             }
                             Ok(Err(e)) => {
                                 if let Err(e2) =
-                                    store2.finish_job(job.id, None, Some(&e.to_string())).await
+                                    rec2.finish_job(job.id, None, Some(&e.to_string())).await
                                 {
                                     warn!(job = job.id, ?e2, "could not record scan failure");
                                 }
                             }
                             Err(_) => {
-                                if let Err(e) =
-                                    store2.finish_job(job.id, None, Some("timeout")).await
+                                if let Err(e) = rec2.finish_job(job.id, None, Some("timeout")).await
                                 {
                                     warn!(job = job.id, ?e, "could not record scan timeout");
                                 }
@@ -295,7 +296,7 @@ license_key = "k"
             timeout_secs: 60,
         });
         let pool = tokio::spawn(run_workers(
-            store.clone(),
+            store.local(),
             cfg,
             p,
             fake,
@@ -340,7 +341,7 @@ license_key = "k"
         });
         let (tx, rx) = tokio::sync::watch::channel(false);
         let pool = tokio::spawn(run_workers(
-            store.clone(),
+            store.local(),
             cfg,
             p,
             fake,
@@ -401,7 +402,7 @@ license_key = "k"
         let (tx, rx) = tokio::sync::watch::channel(false);
         let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
         let pool = tokio::spawn(run_workers(
-            store.clone(),
+            store.local(),
             cfg,
             p,
             fake.clone(),

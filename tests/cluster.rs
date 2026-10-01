@@ -64,7 +64,18 @@ const DEFAULT: Opts = Opts {
 };
 
 async fn boot(identity: Identity, me: &Addr, peers: &[&Addr], o: Opts) -> TestNode {
-    let dir = tempfile::tempdir().unwrap();
+    boot_in(tempfile::tempdir().unwrap(), identity, me, peers, o).await
+}
+
+/// Like [`boot`], on an existing data dir (standalone history is adopted,
+/// as `peephole::run` does).
+async fn boot_in(
+    dir: tempfile::TempDir,
+    identity: Identity,
+    me: &Addr,
+    peers: &[&Addr],
+    o: Opts,
+) -> TestNode {
     let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
     let cluster = ClusterConfig {
         node_name: me.name.into(),
@@ -95,6 +106,7 @@ async fn boot(identity: Identity, me: &Addr, peers: &[&Addr], o: Opts) -> TestNo
     })
     .await
     .unwrap();
+    cluster::adopt::adopt_history(&node).await.unwrap();
     let (tx, rx) = tokio::sync::watch::channel(false);
     cluster::start(node.clone(), rx).await.unwrap();
     TestNode {
@@ -401,4 +413,354 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
     assert_eq!(b.name, "b", "self-description wins over the sponsor's");
     let heads = repl::heads(&node.store).await.unwrap();
     assert_eq!(repl::head_in(&heads, &b_id.id), 1);
+}
+
+// ---------------------------------------------------------------- data
+
+use peephole::store::recorder::Recorder;
+use peephole::store::requests::NewRequest;
+
+fn rec(n: &TestNode) -> Recorder {
+    Recorder::Cluster(n.node.clone())
+}
+
+fn new_request(ip_id: i64, path: &str) -> NewRequest {
+    NewRequest {
+        ip_id,
+        method: "POST".into(),
+        path: path.into(),
+        query: Some("q=1".into()),
+        headers_json: r#"[["user-agent","sqlmap/1.7"]]"#.into(),
+        body: Some(b"user=admin&pass=' OR 1=1--".to_vec()),
+        labels_json: r#"["sqli"]"#.into(),
+        severity: 4,
+        scan_level: 3,
+        is_fp_claim: false,
+        page_token: Some("tok-1".into()),
+    }
+}
+
+async fn count(n: &Node, sql: &str) -> i64 {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .fetch_one(&n.store.pool)
+        .await
+        .unwrap()
+}
+
+fn fixture_scan() -> peephole::scan::nmap_xml::ScanResult {
+    peephole::scan::nmap_xml::parse_nmap_xml(
+        &std::fs::read("tests/fixtures/nmap-basic.xml").unwrap(),
+    )
+    .unwrap()
+}
+
+/// Everything recorded on A reaches C (which joined via B), byte for byte;
+/// large records travel without being stored twice.
+#[tokio::test]
+async fn data_replicates_cluster_wide() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let nc = boot(ic, &c, &[], DEFAULT).await;
+    invite::join(&nc, &invite::create(&nb, 1).await.unwrap())
+        .await
+        .unwrap();
+
+    let r = rec(&na);
+    let ip = na
+        .store
+        .upsert_ip("198.51.100.77".parse().unwrap())
+        .await
+        .unwrap();
+    r.enrich_ip(ip.id, Some("DE"), Some(64500), Some("Example AS"), true)
+        .await
+        .unwrap();
+    let req = r
+        .insert_request(&new_request(ip.id, "/login"))
+        .await
+        .unwrap();
+    r.insert_fp_claim(ip.id, req, Some("me@example.org"), "Mozilla")
+        .await
+        .unwrap();
+    r.insert_fingerprint(Some(req), ip.id, "fp1", Some("v1"), "{}", "{}", b"events")
+        .await
+        .unwrap();
+    let job = match r.enqueue_scan(ip.id, 3, 24).await.unwrap() {
+        peephole::store::scans::EnqueueOutcome::Queued(j) => j,
+        o => panic!("{o:?}"),
+    };
+    assert_eq!(r.next_queued_job().await.unwrap().unwrap().id, job);
+    r.finish_job(job, Some(&fixture_scan()), None)
+        .await
+        .unwrap();
+
+    eventually("c has the scan", || async {
+        count(&nc, "SELECT COUNT(*) FROM ports").await == 3
+    })
+    .await;
+    let row: (String, Vec<u8>, String, Option<String>, i64) = sqlx::query_as(
+        "SELECT r.path, r.body, i.ip, i.country, i.is_tor_exit
+         FROM requests r JOIN ips i ON i.id = r.ip_id",
+    )
+    .fetch_one(&nc.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "/login");
+    assert_eq!(row.1, b"user=admin&pass=' OR 1=1--");
+    assert_eq!(row.2, "198.51.100.77");
+    assert_eq!(row.3.as_deref(), Some("DE"));
+    assert_eq!(row.4, 1);
+    assert_eq!(count(&nc, "SELECT COUNT(*) FROM fp_claims").await, 1);
+    assert_eq!(count(&nc, "SELECT COUNT(*) FROM fingerprints").await, 1);
+    assert_eq!(
+        count(&nc, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await,
+        1
+    );
+    for n in [&na, &nc] {
+        assert_eq!(
+            count(
+                n,
+                "SELECT COUNT(*) FROM repl_log
+                 WHERE kind IN ('request','fingerprint','scan_result') AND payload IS NOT NULL"
+            )
+            .await,
+            0,
+            "row-backed payloads are rebuilt, not stored"
+        );
+    }
+    // C's copy is attributed to A.
+    let origin: Vec<u8> = sqlx::query_scalar("SELECT origin FROM requests")
+        .fetch_one(&nc.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(origin, a.id.0.to_vec());
+    // C does not scan A's jobs (A arbitrates them).
+    assert!(rec(&nc).next_queued_job().await.unwrap().is_none());
+}
+
+/// A node with the given trusted peers that never touches the network.
+async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+    let node = Node::open(NodeParams {
+        identity: Identity::generate().unwrap(),
+        cluster: ClusterConfig {
+            node_name: "offline".into(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            advertise: None,
+            key_path: None,
+            takeover_hours: 6,
+            lease_secs: 120,
+            peers: peers
+                .iter()
+                .map(|p| PeerConfig {
+                    name: p.name.into(),
+                    address: p.address(),
+                    public_key: p.id.to_string(),
+                })
+                .collect(),
+        },
+        roles: Roles::default(),
+        never_scan: vec![],
+        store,
+        proto: (1, 1),
+    })
+    .await
+    .unwrap();
+    node.bootstrap().await.unwrap();
+    (node, dir)
+}
+
+async fn log_of(n: &Node, origin: NodeId) -> Vec<WireEntry> {
+    repl::entries_after(&n.store, &[(origin, 0)], 10_000, usize::MAX)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn deletes_propagate_and_stay_deleted() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let ip = na
+        .store
+        .upsert_ip("203.0.113.66".parse().unwrap())
+        .await
+        .unwrap();
+    let r1 = rec(&na)
+        .insert_request(&new_request(ip.id, "/one"))
+        .await
+        .unwrap();
+    rec(&na)
+        .insert_request(&new_request(ip.id, "/two"))
+        .await
+        .unwrap();
+    rec(&na)
+        .insert_fp_claim(ip.id, r1, None, "ua")
+        .await
+        .unwrap();
+    eventually("b has both", || async {
+        count(&nb, "SELECT COUNT(*) FROM fp_claims").await == 1
+            && count(&nb, "SELECT COUNT(*) FROM requests").await == 2
+    })
+    .await;
+    // A's stream as an offline node would have it before the delete.
+    let a_before = log_of(&na, a.id).await;
+
+    // Delete /one on B (with its claim): gone on A too.
+    let one_on_b: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/one'")
+        .fetch_one(&nb.store.pool)
+        .await
+        .unwrap();
+    assert!(rec(&nb).delete_request(one_on_b).await.unwrap());
+    eventually("a deleted /one", || async {
+        count(&na, "SELECT COUNT(*) FROM requests").await == 1
+    })
+    .await;
+    assert_eq!(count(&na, "SELECT COUNT(*) FROM fp_claims").await, 0);
+    assert_eq!(
+        count(
+            &na,
+            "SELECT COUNT(*) FROM repl_log WHERE erased_by IS NOT NULL"
+        )
+        .await,
+        2,
+        "request and claim payloads are erased from the log"
+    );
+    let b_stream = log_of(&nb, b.id).await;
+    let a_after = log_of(&na, a.id).await;
+
+    // Late arrival: X sees the tombstone first, then A's old entries with
+    // full payloads. /one must not come back.
+    let (x, _dx) = offline_node(&[&a, &b]).await;
+    repl::apply_batch(&x, b_stream.clone()).await.unwrap();
+    repl::apply_batch(&x, a_before).await.unwrap();
+    let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
+        .fetch_all(&x.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(paths, ["/two"]);
+    assert_eq!(count(&x, "SELECT COUNT(*) FROM fp_claims").await, 0);
+
+    // Erased stubs: accepted only once the tombstone is known.
+    let (y, _dy) = offline_node(&[&a, &b]).await;
+    let st = repl::apply_batch(&y, a_after.clone()).await.unwrap();
+    assert!(st.rejected > 0, "{st:?}");
+    repl::apply_batch(&y, b_stream).await.unwrap();
+    repl::apply_batch(&y, a_after).await.unwrap();
+    assert_eq!(
+        repl::head_in(&repl::heads(&y.store).await.unwrap(), &a.id),
+        repl::head_in(&repl::heads(&na.store).await.unwrap(), &a.id)
+    );
+    let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
+        .fetch_all(&y.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(paths, ["/two"]);
+
+    // Deleting the IP on A clears it everywhere.
+    assert!(rec(&na).delete_ip(ip.id).await.unwrap());
+    eventually("b dropped the ip", || async {
+        count(&nb, "SELECT COUNT(*) FROM ips").await == 0
+    })
+    .await;
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM requests").await, 0);
+}
+
+/// A standalone install that switches to distributed mode brings its
+/// history along; a new member backfills all of it.
+#[tokio::test]
+async fn standalone_history_is_adopted_and_backfilled() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = s.upsert_ip("192.0.2.200".parse().unwrap()).await.unwrap();
+        s.set_ip_geo(ip.id, Some("NL"), Some(1), Some("x"))
+            .await
+            .unwrap();
+        for i in 0..150 {
+            s.insert_request(&new_request(ip.id, &format!("/p{i}")))
+                .await
+                .unwrap();
+        }
+        let job = match s.enqueue_scan(ip.id, 2, 24).await.unwrap() {
+            peephole::store::scans::EnqueueOutcome::Queued(j) => j,
+            o => panic!("{o:?}"),
+        };
+        s.next_queued_job().await.unwrap();
+        s.finish_job(job, Some(&fixture_scan()), None)
+            .await
+            .unwrap();
+        s.pool.close().await;
+    }
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot_in(dir, ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    eventually("b backfilled everything", || async {
+        count(&nb, "SELECT COUNT(*) FROM requests").await == 150
+            && count(&nb, "SELECT COUNT(*) FROM ports").await == 3
+    })
+    .await;
+    assert_eq!(
+        count(&nb, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await,
+        1
+    );
+    let country: Option<String> = sqlx::query_scalar("SELECT country FROM ips")
+        .fetch_one(&nb.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(country.as_deref(), Some("NL"));
+    assert_eq!(
+        count(&na, "SELECT COUNT(*) FROM requests WHERE origin IS NULL").await,
+        0
+    );
+    // A restart adopts nothing twice.
+    assert_eq!(cluster::adopt::adopt_history(&na).await.unwrap(), 0);
+}
+
+/// Only a job's arbiter may change its state.
+#[tokio::test]
+async fn job_status_from_a_non_arbiter_is_ignored() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let ip = na
+        .store
+        .upsert_ip("203.0.113.9".parse().unwrap())
+        .await
+        .unwrap();
+    rec(&na).enqueue_scan(ip.id, 2, 24).await.unwrap();
+    eventually("b has the job", || async {
+        count(&nb, "SELECT COUNT(*) FROM scan_jobs").await == 1
+    })
+    .await;
+    let uid: String = sqlx::query_scalar("SELECT uid FROM scan_jobs")
+        .fetch_one(&nb.store.pool)
+        .await
+        .unwrap();
+    repl::append(
+        &nb,
+        &[Record::JobStatus(peephole::cluster::record::JobStatusRec {
+            job_uid: uid,
+            status: "done".into(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            attempts: 9,
+        })],
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for n in [&na, &nb] {
+        assert_eq!(
+            count(n, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'queued'").await,
+            1
+        );
+    }
 }

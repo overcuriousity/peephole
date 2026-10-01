@@ -1,5 +1,6 @@
 //! Distributed mode: node identity, pinned-key mTLS RPC, replicated log,
 //! membership.
+pub mod adopt;
 pub mod cli;
 pub mod hlc;
 pub mod identity;

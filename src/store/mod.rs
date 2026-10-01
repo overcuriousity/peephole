@@ -1,8 +1,10 @@
 pub mod auth;
 pub mod browse;
+pub mod data;
 pub mod delete;
 pub mod fingerprints;
 pub mod inspect;
+pub mod recorder;
 pub mod requests;
 pub mod scans;
 pub mod stats;
@@ -20,6 +22,7 @@ use std::path::Path;
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_initial.sql"),
     include_str!("migrations/0002_replication.sql"),
+    include_str!("migrations/0003_replicated_rows.sql"),
 ];
 
 #[derive(Clone)]
@@ -42,6 +45,11 @@ impl Store {
             .context("opening sqlite")?;
         migrate(&pool, MIGRATIONS).await?;
         Ok(Self { pool })
+    }
+
+    /// Writes as a standalone node (applied directly, not replicated).
+    pub fn local(&self) -> recorder::Recorder {
+        recorder::Recorder::Local(self.clone())
     }
 
     /// Schema version of the open database.

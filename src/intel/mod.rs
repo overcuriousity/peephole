@@ -3,6 +3,7 @@ pub mod tor;
 
 use crate::config::Config;
 use crate::store::Store;
+use crate::store::recorder::Recorder;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -13,7 +14,8 @@ pub type SharedGeo = Arc<RwLock<Option<geo::GeoIp>>>;
 pub type SharedTor = Arc<RwLock<tor::TorExitList>>;
 
 /// Rewrite country names left by older builds to ISO codes (needs the MaxMind DBs).
-pub async fn backfill_geo(store: &Store, geo: &RwLock<Option<geo::GeoIp>>) {
+pub async fn backfill_geo(rec: &Recorder, geo: &RwLock<Option<geo::GeoIp>>) {
+    let store = rec.store();
     let rows = match store.ips_with_legacy_country().await {
         Ok(r) if !r.is_empty() => r,
         Ok(_) => return,
@@ -26,7 +28,7 @@ pub async fn backfill_geo(store: &Store, geo: &RwLock<Option<geo::GeoIp>>) {
             None => return,
         }
     };
-    match geo::backfill_iso_codes(store, updates).await {
+    match geo::backfill_iso_codes(rec, updates).await {
         Ok(n) => info!(
             fixed = n,
             pending = rows.len(),
@@ -49,13 +51,14 @@ async fn is_stale(store: &Store, key: &str) -> bool {
 /// or not loaded, to spare its download quota), then every 24h ± jitter.
 /// Each successful fetch is loaded into the shared state the trap reads.
 pub async fn run_scheduler(
-    store: Store,
+    rec: Recorder,
     cfg: Config,
     geo: SharedGeo,
     tor: SharedTor,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    backfill_geo(&store, &geo).await;
+    let store = rec.store().clone();
+    backfill_geo(&rec, &geo).await;
     if cfg.maxmind.is_none() && geo.read().unwrap().is_none() {
         warn!("no [maxmind] credentials and no GeoLite2 databases: GeoIP enrichment is off");
     }
@@ -86,7 +89,7 @@ pub async fn run_scheduler(
                     match geo::GeoIp::load(&cfg.data_dir) {
                         Ok(g) => {
                             *geo.write().unwrap() = Some(g);
-                            backfill_geo(&store, &geo).await;
+                            backfill_geo(&rec, &geo).await;
                         }
                         Err(e) => warn!(?e, "maxmind reload failed"),
                     }

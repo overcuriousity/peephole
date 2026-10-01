@@ -268,7 +268,7 @@ async fn queue_retry_failed(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
 ) -> AppResult<Redirect> {
-    let n = st.store.requeue_failed_jobs(7).await?;
+    let n = st.recorder.requeue_failed_jobs(7).await?;
     tracing::info!(requeued = n, "retry failed scans");
     Ok(Redirect::to(&format!("/admin/queue?retried={n}")))
 }
@@ -354,7 +354,7 @@ async fn request_delete(
     State(st): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> AppResult<Redirect> {
-    if !st.store.delete_request(id).await? {
+    if !st.recorder.delete_request(id).await? {
         return Err(AppError::NotFound);
     }
     Ok(Redirect::to("/requests"))
@@ -368,7 +368,7 @@ async fn ip_delete(
     let Some(ip) = st.store.ip_by_addr(&addr).await? else {
         return Err(AppError::NotFound);
     };
-    st.store.delete_ip(ip.id).await?;
+    st.recorder.delete_ip(ip.id).await?;
     Ok(Redirect::to("/ips"))
 }
 
@@ -448,7 +448,7 @@ async fn scan_delete(
     State(st): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> AppResult<Redirect> {
-    if !st.store.delete_scan(id).await? {
+    if !st.recorder.delete_scan(id).await? {
         return Err(AppError::NotFound);
     }
     Ok(Redirect::to("/admin/scans"))
@@ -490,7 +490,7 @@ async fn claim_delete(
     State(st): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> AppResult<Redirect> {
-    if !st.store.delete_claim(id).await? {
+    if !st.recorder.delete_claim(id).await? {
         return Err(AppError::NotFound);
     }
     Ok(Redirect::to("/admin/inbox"))
@@ -652,7 +652,7 @@ async fn bulk_delete_requests(
             if ids.is_empty() {
                 break;
             }
-            total += st.store.delete_requests(&ids).await?;
+            total += st.recorder.delete_requests(&ids).await?;
             if (ids.len() as i64) < crate::store::browse::MATCH_LIMIT {
                 break;
             }
@@ -660,7 +660,7 @@ async fn bulk_delete_requests(
         total
     } else {
         let ids: Vec<i64> = form.ids.iter().filter_map(|v| v.parse().ok()).collect();
-        st.store.delete_requests(&ids).await?
+        st.recorder.delete_requests(&ids).await?
     };
     tracing::info!(deleted = n, all = form.all, "bulk request delete");
     Ok(Redirect::to(&format!(
@@ -682,7 +682,7 @@ async fn bulk_delete_ips(
             if ids.is_empty() {
                 break;
             }
-            total += st.store.delete_ips(&ids).await?;
+            total += st.recorder.delete_ips(&ids).await?;
             if (ids.len() as i64) < crate::store::browse::MATCH_LIMIT {
                 break;
             }
@@ -695,7 +695,7 @@ async fn bulk_delete_ips(
                 ids.push(ip.id);
             }
         }
-        st.store.delete_ips(&ids).await?
+        st.recorder.delete_ips(&ids).await?
     };
     tracing::info!(deleted = n, all = form.all, "bulk ip delete");
     Ok(Redirect::to(&format!(

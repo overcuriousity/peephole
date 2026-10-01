@@ -3,8 +3,6 @@ use maxminddb::Reader;
 use std::net::IpAddr;
 use std::path::Path;
 
-use crate::store::Store;
-
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Geo {
     /// ISO 3166-1 alpha-2 code, e.g. "DE".
@@ -90,14 +88,21 @@ impl GeoIp {
 /// Older builds stored the English country name instead of the ISO code,
 /// which left the choropleth empty. Rewrite those rows; returns how many
 /// were fixed. Rows that cannot be resolved are left untouched.
-pub async fn backfill_iso_codes(store: &Store, updates: Vec<(i64, Geo)>) -> Result<usize> {
+pub async fn backfill_iso_codes(
+    rec: &crate::store::recorder::Recorder,
+    updates: Vec<(i64, Geo)>,
+) -> Result<usize> {
     let mut n = 0;
     for (id, g) in updates {
         let Some(code) = g.country.as_deref() else {
             continue;
         };
-        store
-            .set_ip_geo(id, Some(code), g.asn, g.asn_org.as_deref())
+        let tor: bool = sqlx::query_scalar("SELECT is_tor_exit FROM ips WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&rec.store().pool)
+            .await?
+            .unwrap_or(false);
+        rec.enrich_ip(id, Some(code), g.asn, g.asn_org.as_deref(), tor)
             .await?;
         n += 1;
     }
@@ -192,7 +197,7 @@ mod tests {
 
         let rows = store.ips_with_legacy_country().await.unwrap();
         assert_eq!(rows.len(), 1);
-        let n = backfill_iso_codes(&store, geo.relookup(&rows))
+        let n = backfill_iso_codes(&store.local(), geo.relookup(&rows))
             .await
             .unwrap();
         assert_eq!(n, 1);

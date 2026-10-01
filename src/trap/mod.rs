@@ -22,6 +22,8 @@ const COLLECTOR_JS: &str = include_str!("../fingerprint/collector.js");
 
 pub struct TrapState {
     pub store: Store,
+    /// Writes; replicated in a cluster.
+    pub recorder: crate::store::recorder::Recorder,
     pub cfg: Config,
     pub classifier: Classifier,
     pub geo: Arc<RwLock<Option<GeoIp>>>,
@@ -34,6 +36,7 @@ impl TrapState {
         let classifier =
             Classifier::from_dir(cfg.rules_dir.as_ref().expect("rules_dir")).expect("rules");
         Self {
+            recorder: store.local(),
             store,
             cfg,
             classifier,
@@ -77,16 +80,26 @@ async fn record_and_respond(
 ) -> Result<Recorded> {
     let ip_row = state.store.upsert_ip(ip).await?;
 
-    // Enrichment (every IP, every request — spec §4).
+    // Enrichment (every IP, every request — spec §4). Written only when it
+    // changes, so a cluster does not replicate one record per request.
     let geo_hit = state.geo.read().unwrap().as_ref().map(|g| g.lookup(&ip));
-    if let Some(g) = geo_hit {
+    let is_tor = state.tor.read().unwrap().contains(&ip);
+    if geo_hit.is_some() || is_tor {
+        let g = geo_hit.unwrap_or_else(|| crate::intel::geo::Geo {
+            country: ip_row.country.clone(),
+            asn: ip_row.asn.map(|a| a as u32),
+            asn_org: ip_row.asn_org.clone(),
+        });
         state
-            .store
-            .set_ip_geo(ip_row.id, g.country.as_deref(), g.asn, g.asn_org.as_deref())
+            .recorder
+            .enrich_ip(
+                ip_row.id,
+                g.country.as_deref(),
+                g.asn,
+                g.asn_org.as_deref(),
+                ip_row.is_tor_exit || is_tor,
+            )
             .await?;
-    }
-    if state.tor.read().unwrap().contains(&ip) {
-        state.store.set_ip_tor(ip_row.id, true).await?;
     }
 
     let history = state.store.ip_history(ip_row.id).await.unwrap_or_default();
@@ -97,7 +110,7 @@ async fn record_and_respond(
     let page_token = uuid::Uuid::new_v4().to_string();
 
     let request_id = state
-        .store
+        .recorder
         .insert_request(&NewRequest {
             ip_id: ip_row.id,
             method: view.method.to_string(),
@@ -114,13 +127,12 @@ async fn record_and_respond(
         .await?;
 
     // Enqueue counter-scan unless tor / allowlisted / level 0 (spec §4-5).
-    let is_tor = state.tor.read().unwrap().contains(&ip);
     let allowlisted = state.cfg.scan.never_scan.iter().any(|n| n.contains(&ip));
     if verdict.scan_level > 0
         && !is_tor
         && !allowlisted
         && let crate::store::scans::EnqueueOutcome::Queued(job_id) = state
-            .store
+            .recorder
             .enqueue_scan(
                 ip_row.id,
                 verdict.scan_level,
@@ -215,7 +227,7 @@ async fn claim_handler(
     if let Ok(rec) = record_and_respond(&state, ip, &view, &raw, None, true).await {
         let email = form.email.filter(|e| !e.trim().is_empty());
         let _ = state
-            .store
+            .recorder
             .insert_fp_claim(rec.ip_id, rec.request_id, email.as_deref(), &ua)
             .await;
     }
@@ -269,7 +281,7 @@ async fn collect_handler(
             .map(|e| e.to_string())
             .unwrap_or_default();
         let _ = state
-            .store
+            .recorder
             .insert_fingerprint(
                 request_id,
                 ip_id,

@@ -96,10 +96,26 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Distributed mode: open the node (adopting standalone history into the
+    // log) before anything writes, so every write is replicated.
+    let node = match cfg.cluster {
+        Some(_) => {
+            let node =
+                cluster::Node::open(cluster::NodeParams::from_config(&cfg, store.clone())?).await?;
+            cluster::adopt::adopt_history(&node).await?;
+            Some(node)
+        }
+        None => None,
+    };
+    let recorder = match &node {
+        Some(n) => store::recorder::Recorder::Cluster(n.clone()),
+        None => store.local(),
+    };
+
     // Daily intel: the scheduler refreshes the files and swaps the shared
     // state after each successful fetch, so the trap sees fresh data.
     tokio::spawn(intel::run_scheduler(
-        store.clone(),
+        recorder.clone(),
         cfg.clone(),
         geo.clone(),
         tor.clone(),
@@ -122,7 +138,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // Scan worker pool.
     if cfg.roles.scanner {
         tokio::spawn(scan::run_workers(
-            store.clone(),
+            recorder.clone(),
             cfg.clone(),
             pace.clone(),
             PathBuf::from(nmap_path()),
@@ -136,6 +152,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     {
         let trap_app = trap::router(Arc::new(trap::TrapState {
             store: store.clone(),
+            recorder: recorder.clone(),
             cfg: cfg.clone(),
             classifier,
             geo: geo.clone(),
@@ -157,12 +174,10 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     if let (true, Some(addr)) = (cfg.roles.web, cfg.admin_listen) {
         // First-run admin setup token (spec §8.4).
         let _ = admin::auth::ensure_setup_token(&store, &cfg.data_dir).await;
-        let admin_app = admin::full_router(Arc::new(admin::AdminState::new(
-            store.clone(),
-            cfg.clone(),
-            notifier,
-            pace,
-        )));
+        let admin_app = admin::full_router(Arc::new(
+            admin::AdminState::new(store.clone(), cfg.clone(), notifier, pace)
+                .with_recorder(recorder.clone()),
+        ));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding admin listener {addr}"))?;

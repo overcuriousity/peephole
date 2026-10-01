@@ -23,6 +23,135 @@ pub struct MemberInfo {
     pub proto_max: u32,
 }
 
+/// A request caught by a trap listener. Timestamps everywhere are UTC
+/// `YYYY-MM-DD HH:MM:SS`, as the rows store them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestRec {
+    pub uid: String,
+    pub ts: String,
+    pub ip: String,
+    pub method: String,
+    pub path: String,
+    pub query: Option<String>,
+    pub headers_json: String,
+    #[serde(with = "serde_bytes")]
+    pub body: Option<Vec<u8>>,
+    pub labels_json: String,
+    pub severity: i64,
+    pub scan_level: i64,
+    pub is_fp_claim: bool,
+    pub page_token: Option<String>,
+}
+
+/// GeoIP / Tor facts about an IP (last write wins by HLC).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpEnrichRec {
+    pub ip: String,
+    pub country: Option<String>,
+    pub asn: Option<i64>,
+    pub asn_org: Option<String>,
+    pub tor: bool,
+}
+
+/// "I landed here by accident" claim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FpClaimRec {
+    pub uid: String,
+    pub request_uid: String,
+    pub ip: String,
+    pub ts: String,
+    pub contact_email: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+/// Browser fingerprint from the trap page's collector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FingerprintRec {
+    pub uid: String,
+    pub request_uid: Option<String>,
+    pub ip: String,
+    pub ts: String,
+    pub fp_hash: Option<String>,
+    pub visitor_id: Option<String>,
+    pub attributes_json: Option<String>,
+    pub behavior_summary_json: Option<String>,
+    /// zstd-compressed, as stored.
+    #[serde(with = "serde_bytes")]
+    pub event_blob: Option<Vec<u8>>,
+}
+
+/// A queued counter-scan. The origin arbitrates the job.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanJobRec {
+    pub uid: String,
+    pub ip: String,
+    pub level: i64,
+    pub queued_at: String,
+}
+
+/// A job's state (last write wins by HLC; only the arbiter writes it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobStatusRec {
+    pub job_uid: String,
+    pub status: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+    pub attempts: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortRec {
+    pub port: i64,
+    pub proto: String,
+    pub state: String,
+    pub service: Option<String>,
+    pub product: Option<String>,
+    pub version: Option<String>,
+}
+
+/// A finished counter-scan with its ports.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanResultRec {
+    pub uid: String,
+    pub job_uid: String,
+    pub ip: String,
+    pub level: i64,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub os_guess: Option<String>,
+    /// zstd-compressed nmap XML, as stored.
+    #[serde(with = "serde_bytes")]
+    pub raw_xml: Option<Vec<u8>>,
+    pub ports: Vec<PortRec>,
+}
+
+/// What a tombstone deletes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum TombTarget {
+    /// These requests with their claims and fingerprints.
+    Requests {
+        uids: Vec<String>,
+    },
+    /// Everything about an IP recorded up to the tombstone's HLC.
+    Ip {
+        ip: String,
+    },
+    Scan {
+        uid: String,
+    },
+    Claim {
+        uid: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TombstoneRec {
+    pub uid: String,
+    pub target: TombTarget,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "k", rename_all = "snake_case")]
 pub enum Record {
@@ -31,8 +160,22 @@ pub enum Record {
     /// A node describes itself; origin must equal `id`.
     MemberUpdate(MemberInfo),
     /// The origin revokes a node cluster-wide.
-    MemberRevoke { id: NodeId },
+    MemberRevoke {
+        id: NodeId,
+    },
+    Request(RequestRec),
+    IpEnrich(IpEnrichRec),
+    FpClaim(FpClaimRec),
+    Fingerprint(FingerprintRec),
+    ScanJob(ScanJobRec),
+    JobStatus(JobStatusRec),
+    ScanResult(ScanResultRec),
+    Tombstone(TombstoneRec),
 }
+
+/// Kinds whose payload is not stored in the log but rebuilt from their row
+/// (they are large); see `store::data::rebuild`.
+pub const ROW_BACKED: &[&str] = &["request", "fingerprint", "scan_result"];
 
 impl Record {
     pub fn kind(&self) -> &'static str {
@@ -40,12 +183,29 @@ impl Record {
             Record::MemberAdd(_) => "member_add",
             Record::MemberUpdate(_) => "member_update",
             Record::MemberRevoke { .. } => "member_revoke",
+            Record::Request(_) => "request",
+            Record::IpEnrich(_) => "ip_enrich",
+            Record::FpClaim(_) => "fp_claim",
+            Record::Fingerprint(_) => "fingerprint",
+            Record::ScanJob(_) => "scan_job",
+            Record::JobStatus(_) => "job_status",
+            Record::ScanResult(_) => "scan_result",
+            Record::Tombstone(_) => "tombstone",
         }
     }
 
-    /// Subject uid for row-backed records (tombstone targets); none yet.
+    /// The uid of the row this record creates; tombstones erase log
+    /// entries by it.
     pub fn uid(&self) -> Option<String> {
-        None
+        match self {
+            Record::Request(r) => Some(r.uid.clone()),
+            Record::FpClaim(r) => Some(r.uid.clone()),
+            Record::Fingerprint(r) => Some(r.uid.clone()),
+            Record::ScanJob(r) => Some(r.uid.clone()),
+            Record::ScanResult(r) => Some(r.uid.clone()),
+            Record::Tombstone(r) => Some(r.uid.clone()),
+            _ => None,
+        }
     }
 }
 

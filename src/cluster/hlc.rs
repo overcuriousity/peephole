@@ -23,7 +23,7 @@ pub fn physical_ms(hlc: u64) -> u64 {
 }
 
 impl Hlc {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             last: Mutex::new(0),
         }

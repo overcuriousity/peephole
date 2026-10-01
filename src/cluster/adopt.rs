@@ -1,0 +1,214 @@
+//! History adoption: rows a node recorded while standalone (origin NULL)
+//! are signed into its log on the first start in distributed mode, so the
+//! cluster backfills them like any other data.
+use super::Node;
+use super::record::{FpClaimRec, IpEnrichRec, JobStatusRec, Record, ScanJobRec};
+use super::repl;
+use crate::store::data;
+use anyhow::{Context, Result};
+use sqlx::SqliteConnection;
+use tracing::info;
+
+const BATCH: i64 = 500;
+const IPS_ADOPTED: &str = "cluster.ips_adopted";
+
+/// The record a standalone row would have been written as.
+async fn record_for(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Result<Option<Record>> {
+    Ok(match kind {
+        "request" | "fingerprint" | "scan_result" => data::rebuild(conn, kind, uid).await?,
+        "fp_claim" => {
+            type Row = (
+                Option<String>,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            );
+            let r: Option<Row> = sqlx::query_as(
+                "SELECT c.request_uid, i.ip, c.ts, c.contact_email, c.user_agent
+                 FROM fp_claims c JOIN ips i ON i.id = c.ip_id WHERE c.uid = ?",
+            )
+            .bind(uid)
+            .fetch_optional(&mut *conn)
+            .await?;
+            r.and_then(|r| {
+                Some(Record::FpClaim(FpClaimRec {
+                    uid: uid.to_string(),
+                    request_uid: r.0?,
+                    ip: r.1,
+                    ts: r.2,
+                    contact_email: r.3,
+                    user_agent: r.4,
+                }))
+            })
+        }
+        "scan_job" => {
+            let r: Option<(String, i64, String)> = sqlx::query_as(
+                "SELECT i.ip, j.level, j.queued_at FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
+                 WHERE j.uid = ?",
+            )
+            .bind(uid)
+            .fetch_optional(&mut *conn)
+            .await?;
+            r.map(|(ip, level, queued_at)| {
+                Record::ScanJob(ScanJobRec {
+                    uid: uid.to_string(),
+                    ip,
+                    level,
+                    queued_at,
+                })
+            })
+        }
+        _ => None,
+    })
+}
+
+/// A job's current state as a record, if it ever left the queue.
+async fn job_status_for(conn: &mut SqliteConnection, uid: &str) -> Result<Option<Record>> {
+    type Row = (String, Option<String>, Option<String>, Option<String>, i64);
+    let r: Row = sqlx::query_as(
+        "SELECT status, started_at, finished_at, error, attempts FROM scan_jobs WHERE uid = ?",
+    )
+    .bind(uid)
+    .fetch_one(&mut *conn)
+    .await?;
+    if r.0 == "queued" && r.4 == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Record::JobStatus(JobStatusRec {
+        job_uid: uid.to_string(),
+        status: r.0,
+        started_at: r.1,
+        finished_at: r.2,
+        error: r.3,
+        attempts: r.4,
+    })))
+}
+
+/// Adopt all standalone rows; returns how many records were logged.
+pub async fn adopt_history(node: &Node) -> Result<u64> {
+    let me = node.id().0.to_vec();
+    let mut total = 0u64;
+    // Parents before children, so receivers can link them.
+    for (table, kind) in [
+        ("requests", "request"),
+        ("fp_claims", "fp_claim"),
+        ("fingerprints", "fingerprint"),
+        ("scan_jobs", "scan_job"),
+        ("scans", "scan_result"),
+    ] {
+        loop {
+            let _g = node.apply_lock.lock().await;
+            let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let sql = format!(
+                "SELECT uid FROM {table} WHERE origin IS NULL AND uid IS NOT NULL ORDER BY id LIMIT ?"
+            );
+            let uids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .bind(BATCH)
+                .fetch_all(&mut *tx)
+                .await?;
+            if uids.is_empty() {
+                break;
+            }
+            for uid in &uids {
+                let hlc = match record_for(&mut tx, kind, uid).await? {
+                    Some(rec) => {
+                        total += 1;
+                        repl::append_existing(node, &mut tx, &rec).await?.hlc
+                    }
+                    // Unlinkable (e.g. a claim whose request lost its uid):
+                    // keep it local, but do not look at it again.
+                    None => 0,
+                };
+                let sql = format!("UPDATE {table} SET origin = ?, hlc = ? WHERE uid = ?");
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(&me)
+                    .bind(hlc as i64)
+                    .bind(uid)
+                    .execute(&mut *tx)
+                    .await?;
+                if kind == "scan_job"
+                    && let Some(st) = job_status_for(&mut tx, uid).await?
+                {
+                    let e = repl::append_existing(node, &mut tx, &st).await?;
+                    sqlx::query("UPDATE scan_jobs SET status_hlc = ? WHERE uid = ?")
+                        .bind(e.hlc as i64)
+                        .bind(uid)
+                        .execute(&mut *tx)
+                        .await?;
+                    total += 1;
+                }
+            }
+            tx.commit().await?;
+        }
+    }
+    total += adopt_ip_facts(node).await?;
+    if total > 0 {
+        info!(
+            records = total,
+            "standalone history adopted into the cluster log"
+        );
+        node.notify_changed();
+    }
+    Ok(total)
+}
+
+/// GeoIP / Tor facts of every IP, once.
+async fn adopt_ip_facts(node: &Node) -> Result<u64> {
+    if node.store.setting_get(IPS_ADOPTED).await?.is_some() {
+        return Ok(0);
+    }
+    let mut total = 0;
+    let mut after = 0i64;
+    loop {
+        let _g = node.apply_lock.lock().await;
+        let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        type Row = (
+            i64,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            bool,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, ip, country, asn, asn_org, is_tor_exit FROM ips
+             WHERE id > ? AND (country IS NOT NULL OR asn IS NOT NULL OR is_tor_exit = 1)
+             ORDER BY id LIMIT ?",
+        )
+        .bind(after)
+        .bind(BATCH)
+        .fetch_all(&mut *tx)
+        .await?;
+        let Some(last) = rows.last().map(|r| r.0) else {
+            break;
+        };
+        for (id, ip, country, asn, asn_org, tor) in rows {
+            let e = repl::append_existing(
+                node,
+                &mut tx,
+                &Record::IpEnrich(IpEnrichRec {
+                    ip,
+                    country,
+                    asn,
+                    asn_org,
+                    tor,
+                }),
+            )
+            .await?;
+            sqlx::query("UPDATE ips SET geo_hlc = ? WHERE id = ?")
+                .bind(e.hlc as i64)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            total += 1;
+        }
+        tx.commit().await?;
+        after = last;
+    }
+    node.store
+        .setting_set(IPS_ADOPTED, "1")
+        .await
+        .context("marking ip facts adopted")?;
+    Ok(total)
+}

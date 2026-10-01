@@ -7,7 +7,8 @@
 //! simply re-sent by a later sync round.
 use super::Node;
 use super::identity::NodeId;
-use super::record::{Record, WireEntry};
+use super::record::{ROW_BACKED, Record, WireEntry};
+use crate::store::data::{self, Ctx, Effect};
 use anyhow::Result;
 use sqlx::SqliteConnection;
 use tracing::warn;
@@ -98,6 +99,7 @@ pub async fn entries_after(
     max_entries: usize,
     max_bytes: usize,
 ) -> Result<Vec<WireEntry>> {
+    let mut conn = store.pool.acquire().await?;
     let mut out: Vec<WireEntry> = vec![];
     let mut bytes = 0usize;
     let full = |out: &Vec<WireEntry>, bytes: usize| {
@@ -115,7 +117,7 @@ pub async fn entries_after(
         .bind(&origin.0[..])
         .bind(*after as i64)
         .bind((max_entries - out.len()) as i64)
-        .fetch_all(&store.pool)
+        .fetch_all(&mut *conn)
         .await?;
         let mut parked = vec![];
         if rows.len() < max_entries - out.len() {
@@ -127,7 +129,7 @@ pub async fn entries_after(
             .bind(&origin.0[..])
             .bind(*after as i64)
             .bind((max_entries - out.len()) as i64)
-            .fetch_all(&store.pool)
+            .fetch_all(&mut *conn)
             .await?;
             for b in blobs {
                 parked.push(super::rpc::cbor::decode::<WireEntry>(&b)?);
@@ -138,7 +140,20 @@ pub async fn entries_after(
             .map(from_row)
             .chain(parked.into_iter().map(Ok));
         for e in candidates {
-            let e = e?;
+            let mut e = e?;
+            if e.payload.is_none() && e.erased_by.is_none() {
+                // Row-backed: rebuild the signed payload from the row.
+                let rebuilt = match &e.uid {
+                    Some(uid) => data::rebuild(&mut conn, &e.kind, uid).await?,
+                    None => None,
+                };
+                let Some(r) = rebuilt else {
+                    warn!(origin = %e.origin.short(), seq = e.seq, kind = %e.kind,
+                          "log entry has neither payload nor row; serving stops here");
+                    break;
+                };
+                e.payload = Some(super::rpc::cbor::encode(&r)?);
+            }
             if e.seq < next {
                 continue;
             }
@@ -206,6 +221,28 @@ pub async fn append_in_tx(
     Ok((e, changed))
 }
 
+/// Log a record whose rows already exist (history adoption): sign and
+/// store it without applying it again. Row-backed kinds keep no payload.
+pub async fn append_existing(
+    node: &Node,
+    conn: &mut SqliteConnection,
+    record: &Record,
+) -> Result<WireEntry> {
+    let me = node.id();
+    let seq = log_head(conn, &me)
+        .await?
+        .max(pending_head(conn, &me).await?)
+        + 1;
+    let mut e = WireEntry::sign(&node.identity, seq, node.hlc.now(), record)?;
+    let stored_payload = e.payload.take();
+    if !ROW_BACKED.contains(&e.kind.as_str()) {
+        e.payload = stored_payload.clone();
+    }
+    insert_log(conn, &e, true).await?;
+    e.payload = stored_payload;
+    Ok(e)
+}
+
 /// Append records created by this node, atomically.
 pub async fn append(node: &Node, records: &[Record]) -> Result<Vec<WireEntry>> {
     let _g = node.apply_lock.lock().await;
@@ -267,6 +304,9 @@ async fn apply_one(
         st.rejected += 1;
         return Ok(());
     }
+    if e.payload.is_none() {
+        return apply_stub(node, conn, e, held > have, st).await;
+    }
     // Verify before parking too, so junk never takes up space or blocks
     // the real entry at that position.
     if !e.verify() {
@@ -287,6 +327,42 @@ async fn apply_one(
         return Ok(());
     }
     apply_verified(node, conn, e, st).await
+}
+
+/// An entry a tombstone erased: accepted once that tombstone is known here
+/// (its uid is then remembered as deleted). Never parked; a later round
+/// re-sends it after the tombstone has arrived.
+async fn apply_stub(
+    node: &Node,
+    conn: &mut SqliteConnection,
+    e: WireEntry,
+    blocked: bool,
+    st: &mut Applied,
+) -> Result<()> {
+    let Some(tomb) = &e.erased_by else {
+        st.rejected += 1;
+        return Ok(());
+    };
+    let known: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM repl_log WHERE kind = 'tombstone' AND uid = ?")
+            .bind(tomb)
+            .fetch_one(&mut *conn)
+            .await?;
+    if known == 0 || blocked || !trusted(node, conn, &e.origin).await? {
+        st.rejected += 1;
+        return Ok(());
+    }
+    insert_log(conn, &e, true).await?;
+    if let Some(uid) = &e.uid {
+        sqlx::query("INSERT OR IGNORE INTO tombstoned (uid, tombstone_uid) VALUES (?, ?)")
+            .bind(uid)
+            .bind(tomb)
+            .execute(&mut *conn)
+            .await?;
+    }
+    node.hlc.observe(e.hlc);
+    st.applied += 1;
+    Ok(())
 }
 
 async fn apply_verified(
@@ -369,13 +445,50 @@ pub async fn apply_unknown_kinds(node: &Node) -> Result<usize> {
     Ok(n)
 }
 
-/// Effects of one record on the materialized tables. Returns true if
-/// membership changed.
+/// Effects of one record on the materialized tables, then settle its log
+/// entry: erased if a tombstone already deleted it, payload dropped if it
+/// can be rebuilt from its row. Returns true if membership changed.
 async fn apply_record(
     node: &Node,
     conn: &mut SqliteConnection,
     e: &WireEntry,
     r: &Record,
 ) -> Result<bool> {
-    super::members::apply(node, conn, e, r).await
+    if super::members::apply(node, conn, e, r).await? {
+        return Ok(true);
+    }
+    let ctx = Ctx {
+        origin: Some(&e.origin),
+        hlc: e.hlc,
+    };
+    match data::apply(conn, ctx, r).await? {
+        Effect::Erased(t) => {
+            sqlx::query(
+                "UPDATE repl_log SET payload = NULL, sig = NULL, erased_by = ?
+                 WHERE origin = ? AND seq = ?",
+            )
+            .bind(&t)
+            .bind(&e.origin.0[..])
+            .bind(e.seq as i64)
+            .execute(&mut *conn)
+            .await?;
+        }
+        Effect::Applied if ROW_BACKED.contains(&e.kind.as_str()) => {
+            // Keep the payload unless the row reproduces it exactly.
+            if let (Some(uid), Some(payload)) = (&e.uid, &e.payload)
+                && let Some(rebuilt) = data::rebuild(conn, &e.kind, uid).await?
+                && super::rpc::cbor::encode(&rebuilt)? == *payload
+            {
+                sqlx::query("UPDATE repl_log SET payload = NULL WHERE origin = ? AND seq = ?")
+                    .bind(&e.origin.0[..])
+                    .bind(e.seq as i64)
+                    .execute(&mut *conn)
+                    .await?;
+            } else {
+                warn!(kind = %e.kind, uid = ?e.uid, "row does not reproduce its record; payload kept");
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
 }

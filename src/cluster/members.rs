@@ -194,6 +194,7 @@ pub async fn apply(
             .await?;
             info!(id = %id.short(), by = %e.origin.short(), "member revoked");
         }
+        _ => return Ok(false),
     }
     Ok(true)
 }
