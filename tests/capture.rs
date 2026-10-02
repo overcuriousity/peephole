@@ -458,3 +458,198 @@ async fn every_answered_request_is_a_row_a_light_row_or_counted() {
             .unwrap();
     assert_eq!(unrecorded, Some(light + dropped));
 }
+
+/// Accepts any server certificate (the trap's is self-signed).
+#[derive(Debug)]
+struct AnyCert;
+
+impl rustls::client::danger::ServerCertVerifier for AnyCert {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn tls_client() -> tokio_rustls::TlsConnector {
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AnyCert))
+    .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(cfg))
+}
+
+/// Both trap listeners as the binary runs them: plain and TLS, with
+/// `trusted` as trusted_proxies. Returns (plain addr, tls addr, store).
+async fn spawn_listeners(
+    trusted: &str,
+) -> (
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    Store,
+    tempfile::TempDir,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_text = format!(
+        r#"
+trap_listen = "127.0.0.1:0"
+trap_tls_listen = "127.0.0.1:0"
+database_path = "{db}"
+data_dir = "{d}"
+rules_dir = "rules"
+trusted_proxies = [{trusted}]
+[roles]
+web = false
+"#,
+        db = dir.path().join("t.db").display(),
+        d = dir.path().display()
+    );
+    let cfg_path = dir.path().join("c.toml");
+    std::fs::write(&cfg_path, cfg_text).unwrap();
+    let cfg = Config::load(&cfg_path).unwrap();
+    let store = Store::connect(&cfg.database_path).await.unwrap();
+    let trusted = Arc::new(cfg.trusted_proxies.clone());
+    let app = trap::router(Arc::new(TrapState::for_test(store.clone(), cfg)));
+    let tls = trap::listen::trap_tls_config(None, None).unwrap();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let plain = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let secure = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (pa, sa) = (plain.local_addr().unwrap(), secure.local_addr().unwrap());
+    tokio::spawn(trap::listen::serve_trap(
+        plain,
+        app.clone(),
+        None,
+        trusted.clone(),
+        rx.clone(),
+    ));
+    tokio::spawn(trap::listen::serve_trap(
+        secure,
+        app,
+        Some(tls),
+        trusted,
+        rx,
+    ));
+    (pa, sa, store, dir, stop)
+}
+
+/// Send a raw HTTP/1.1 request over `io` and read the answer to the end.
+async fn raw_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    io: &mut S,
+    head: &str,
+) -> String {
+    io.write_all(head.as_bytes()).await.unwrap();
+    let mut out = vec![];
+    let _ = io.read_to_end(&mut out).await;
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test]
+async fn https_request_records_ja4_hello_and_raw_head() {
+    let (_p, s, store, _d, _stop) = spawn_listeners("").await;
+    let tcp = tokio::net::TcpStream::connect(s).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("probe.test").unwrap();
+    let mut tls = tls_client().connect(name, tcp).await.unwrap();
+    let head = "GET /x HTTP/1.1\r\nHost: probe.test\r\nX-Mixed-Case: 1\r\n\r\n";
+    let answer = raw_request(&mut tls, head).await;
+    assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+    let (transport, via, ja4, hello, raw): (String, bool, String, Vec<u8>, Vec<u8>) =
+        sqlx::query_as(
+            "SELECT transport, via_proxy, ja4, tls_client_hello, raw_head FROM requests",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(transport, "https");
+    assert!(!via);
+    assert!(ja4.starts_with("t13d"), "{ja4}");
+    assert_eq!(hello[0], 0x16);
+    assert_eq!(raw, head.as_bytes());
+}
+
+#[tokio::test]
+async fn a_proxy_header_from_a_trusted_peer_names_the_client() {
+    let (_p, s, store, _d, _stop) = spawn_listeners(r#""127.0.0.1/32""#).await;
+    let mut tcp = tokio::net::TcpStream::connect(s).await.unwrap();
+    tcp.write_all(b"PROXY TCP4 203.0.113.9 127.0.0.1 5555 443\r\n")
+        .await
+        .unwrap();
+    let name = rustls::pki_types::ServerName::try_from("probe.test").unwrap();
+    let mut tls = tls_client().connect(name, tcp).await.unwrap();
+    raw_request(
+        &mut tls,
+        "GET /p HTTP/1.1\r\nHost: probe.test\r\nX-Forwarded-For: 198.51.100.1\r\n\r\n",
+    )
+    .await;
+    let (ip, via): (String, bool) =
+        sqlx::query_as("SELECT i.ip, r.via_proxy FROM requests r JOIN ips i ON i.id = r.ip_id")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(ip, "203.0.113.9", "the PROXY source, not X-Forwarded-For");
+    assert!(via);
+}
+
+#[tokio::test]
+async fn a_trusted_peer_without_a_proxy_header_is_dropped() {
+    let (_p, s, store, _d, _stop) = spawn_listeners(r#""127.0.0.1/32""#).await;
+    let tcp = tokio::net::TcpStream::connect(s).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("probe.test").unwrap();
+    assert!(tls_client().connect(name, tcp).await.is_err());
+    let mut garbage = tokio::net::TcpStream::connect(s).await.unwrap();
+    garbage.write_all(b"PROXY NONSENSE\r\n").await.unwrap();
+    let mut out = vec![];
+    let _ = garbage.read_to_end(&mut out).await;
+    assert!(out.is_empty());
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 0);
+}
+
+#[tokio::test]
+async fn the_plain_listener_records_the_raw_head() {
+    let (p, _s, store, _d, _stop) = spawn_listeners(r#""127.0.0.1/32""#).await;
+    let mut tcp = tokio::net::TcpStream::connect(p).await.unwrap();
+    let head =
+        "GET /a HTTP/1.1\r\nHost: x\r\nUser-AGENT: Q\r\nX-Forwarded-For: 203.0.113.5\r\n\r\n";
+    let answer = raw_request(&mut tcp, head).await;
+    assert!(
+        answer.contains("onnection: close"),
+        "one request per connection: {answer}"
+    );
+    let (transport, via, raw, ja4): (String, bool, Vec<u8>, Option<String>) =
+        sqlx::query_as("SELECT transport, via_proxy, raw_head, ja4 FROM requests")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!((transport.as_str(), via, ja4), ("http", true, None));
+    assert_eq!(raw, head.as_bytes());
+}

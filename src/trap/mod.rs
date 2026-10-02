@@ -1,6 +1,7 @@
 mod config;
 mod decoy;
 mod flood;
+pub mod listen;
 mod pages;
 pub mod proxy_proto;
 pub mod raw_head;
@@ -305,6 +306,38 @@ struct Capture<'a> {
     /// Requests from this IP answered but not recorded since its last
     /// recorded one.
     unrecorded: u64,
+    /// What the connection showed (None when served without the trap's
+    /// listeners, as in some tests).
+    conn: Option<ConnCapture>,
+}
+
+/// The connection-level part of a capture.
+struct ConnCapture {
+    transport: &'static str,
+    via_proxy: bool,
+    raw_head: Option<Vec<u8>>,
+    client_hello: Option<Vec<u8>>,
+    ja4: Option<String>,
+}
+
+impl ConnCapture {
+    fn of(meta: &listen::ConnMeta, version: Version) -> Self {
+        // HTTP/2 has no text head; for HTTP/1 the connection carries one
+        // request, so its first bytes are this request's head.
+        let raw_head = (version < Version::HTTP_2)
+            .then(|| {
+                let b = meta.head.lock().unwrap_or_else(|p| p.into_inner());
+                raw_head::head_of(&b).map(<[u8]>::to_vec)
+            })
+            .flatten();
+        Self {
+            transport: meta.transport,
+            via_proxy: meta.via_proxy,
+            raw_head,
+            client_hello: meta.client_hello.as_ref().map(|h| h.to_vec()),
+            ja4: meta.ja4.clone(),
+        }
+    }
 }
 
 /// What the trap stored for one request.
@@ -417,7 +450,11 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 answer: Some(c.answer),
                 status: Some(i64::from(c.status)),
                 unrecorded: (c.unrecorded > 0).then_some(c.unrecorded as i64),
-                ..Default::default()
+                transport: c.conn.as_ref().map(|k| k.transport.to_string()),
+                via_proxy: c.conn.as_ref().map(|k| k.via_proxy),
+                raw_head: c.conn.as_ref().and_then(|k| k.raw_head.clone()),
+                tls_client_hello: c.conn.as_ref().and_then(|k| k.client_hello.clone()),
+                ja4: c.conn.as_ref().and_then(|k| k.ja4.clone()),
             },
         )
         .await?;
@@ -555,6 +592,10 @@ async fn trap_handler(
                 answer,
                 status,
                 unrecorded,
+                conn: parts
+                    .extensions
+                    .get::<listen::ConnMeta>()
+                    .map(|m| ConnCapture::of(m, parts.version)),
             };
             if let Err(e) = record(&state, capture).await {
                 // Answer as always: an error page would tell a scanner it
@@ -586,6 +627,8 @@ pub struct ClaimForm {
 async fn claim_handler(
     State(state): State<Arc<TrapState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    version: Version,
+    meta: Option<axum::Extension<listen::ConnMeta>>,
     headers: HeaderMap,
     Form(form): Form<ClaimForm>,
 ) -> impl IntoResponse {
@@ -617,6 +660,7 @@ async fn claim_handler(
         answer: "claim".into(),
         status: 200,
         unrecorded: 0,
+        conn: meta.map(|m| ConnCapture::of(&m, version)),
     };
     if let Ok(rec) = record(&state, capture).await {
         let email = form.email.filter(|e| !e.trim().is_empty());
