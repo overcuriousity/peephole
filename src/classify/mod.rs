@@ -1568,4 +1568,153 @@ mod tests {
             v.labels
         );
     }
+
+    #[test]
+    fn api_recon_and_graphql_introspection() {
+        for p in [
+            "/graphql",
+            "/swagger/v1/swagger.json",
+            "/openapi.json",
+            "/api-docs",
+            "/redoc",
+            "/graphiql",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "api-recon"),
+                "{p}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 2, "{p}");
+        }
+        let v = classifier().classify(
+            &view(
+                "GET",
+                "/graphql",
+                Some("query={__schema{types{name}}}"),
+                "curl/8",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            v.labels.iter().any(|l| l == "graphql-introspection"),
+            "{:?}",
+            v.labels
+        );
+        assert_eq!(v.scan_level, 3);
+        let b = br#"{"query":"query IntrospectionQuery { __schema { types { name } } }"}"#;
+        let v = classifier().classify(
+            &view("POST", "/graphql", None, "curl/8", Some(b)),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            v.labels.iter().any(|l| l == "graphql-introspection"),
+            "{:?}",
+            v.labels
+        );
+    }
+
+    #[test]
+    fn default_credentials_are_a_credential_attack() {
+        for b in [
+            &b"username=admin&password=admin"[..],
+            &b"login=root&pwd=t0talc0ntr0l4%21"[..],
+            &b"user=ubnt&pass=ubnt"[..],
+        ] {
+            let v = classifier().classify(
+                &view("POST", "/login", None, "curl/8", Some(b)),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "credential-attack"),
+                "{b:?}: {:?}",
+                v.labels
+            );
+        }
+        // base64 admin:admin in an Authorization header.
+        let req = RequestView {
+            method: "GET",
+            path: "/manager/html",
+            query: None,
+            headers: vec![("authorization".into(), "Basic YWRtaW46YWRtaW4=".into())],
+            body: None,
+            proxy_target: None,
+        };
+        let v = classifier().classify(&req, &hist(1, 1), &BotTells::default());
+        assert!(
+            v.labels.iter().any(|l| l == "credential-attack"),
+            "{:?}",
+            v.labels
+        );
+        // A unique password is not a default-credential attack.
+        let v = classifier().classify(
+            &view(
+                "POST",
+                "/login",
+                None,
+                "Mozilla/5.0",
+                Some(b"username=a&password=xK9%21mQ2"),
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            !v.labels.iter().any(|l| l == "credential-attack"),
+            "{:?}",
+            v.labels
+        );
+    }
+
+    #[test]
+    fn app_probes_are_level_3() {
+        for p in [
+            "/wls-wsat/CoordinatorPortType",
+            "/console/css/",
+            "/script",
+            "/user/register?element_parents=account/mail/%23value",
+            "/index.php?option=com_users",
+            "/downloader/",
+            "/app/etc/local.xml",
+            "/setup/setupadministrator/",
+            "/app/rest/users/id:1/tokens/RPC2",
+            "/webtools/control/main",
+            "/CFIDE/administrator/",
+            "/_layouts/15/",
+            "/zimbraAdmin/",
+            "/struts/login.action",
+            "/solr/admin/cores",
+            "/geoserver/web/",
+        ] {
+            let (path, query) = p
+                .split_once('?')
+                .map(|(a, b)| (a, Some(b)))
+                .unwrap_or((p, None));
+            let v = classifier().classify(
+                &view("GET", path, query, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "app-probe"),
+                "{p}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 3, "{p}");
+        }
+        // A plural users path is not Drupal's /user/*.
+        let v = classifier().classify(
+            &view("GET", "/users/register", None, "Mozilla/5.0", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(!v.labels.iter().any(|l| l == "app-probe"), "{:?}", v.labels);
+    }
 }

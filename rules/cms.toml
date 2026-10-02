@@ -1,0 +1,15 @@
+# Application and CMS exploitation recon (A06:2021): known consoles, plugin
+# APIs and CVE-target paths. Existence probes are weight 3; the payloads
+# sent to them are caught by the rce/sqli rules at weight 4. Anchored
+# alternatives keep ordinary paths out: /users/register is not Drupal's
+# /user/register.
+
+[[rule]]
+label = "app-probe"
+weight = 3
+owasp = ["A06:2021"]
+# WebLogic, Jenkins, Drupal, Joomla, Magento, ThinkPHP, Confluence
+# (CVE-2023-22515), TeamCity (CVE-2023-42793), Apache OFBiz, ColdFusion,
+# SharePoint, Zimbra, Struts, Solr, GeoServer. The WebLogic console is
+# matched on its own subpaths only: /console/api/ is Dify (ai-infra-probe).
+target_regex = '''/(wls-wsat|uddiexplorer)(/|\?|$)|^/console(/(login|css|images|framework|console\.portal)|/?(\?|$))|^/(script|scriptText|jnlpJars|asynchPeople)(/|\?|$)|/user/(register|password|login)(\?|$)|option=com_|/com_(users|content|config|installer)(/|\?|$)|/(downloader|magmi)(/|\?|$)|/app/etc/local\.xml|invokefunction|^/(setup/setupadministrator|json/setup-restore)(/|\?|$)|^/app/rest/|/webtools/control(/|\?|$)|^/CFIDE/|/_layouts/|/zimbraAdmin(/|\?|$)|\.(action|do)(\?|$)|^/(solr|geoserver)(/|\?|$)'''
