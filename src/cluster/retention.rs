@@ -36,7 +36,7 @@ pub async fn run(node: &Arc<Node>, days: u32) -> Result<u64> {
              AND uid IS NOT NULL ORDER BY id LIMIT ?",
             "SELECT uid FROM skipped_batches WHERE origin = ?
              AND last_ms < CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000
-             AND uid IS NOT NULL ORDER BY id LIMIT ?",
+             AND uid IS NOT NULL ORDER BY last_ms LIMIT ?",
         ] {
             let found: Vec<String> = sqlx::query_scalar(sql)
                 .bind(&me)
