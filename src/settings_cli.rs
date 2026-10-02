@@ -21,13 +21,11 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
         async move {
             let cfg = Config::load(Path::new(&path))?;
             let store = Store::connect(&cfg.database_path).await?;
-            let nmap_ok = tokio::process::Command::new(
-                std::env::var("PEEPHOLE_NMAP_PATH").unwrap_or_else(|_| "nmap".into()),
-            )
-            .arg("--version")
-            .output()
-            .await
-            .is_ok_and(|o| o.status.success());
+            let nmap_ok = tokio::process::Command::new(cfg.scan.nmap())
+                .arg("--version")
+                .output()
+                .await
+                .is_ok_and(|o| o.status.success());
             let s = Settings::load(&store, &cfg, Prereqs::from_config(&cfg, nmap_ok)).await?;
             anyhow::Ok((cfg, s))
         }
