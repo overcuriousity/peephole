@@ -1,13 +1,14 @@
 # Sensitive files and admin surfaces. Matching is case-insensitive and runs
 # against both the raw and the percent-decoded path+query, so encoded probes
-# are caught too.
+# are caught too. The target is `path?query`: a segment anchor must accept
+# `?` as well as `/` and the end, or `/.env?x=1` slips through.
 
 [[rule]]
 label = "sensitive-path"
 weight = 2
 # Dotfiles and secrets: /.env (+ .env.bak, /api/.env), /.git/*, SSH/AWS keys,
-# .htpasswd/.htaccess. Anchored at a path segment boundary.
-target_regex = "(^|/)\\.(env|git|aws|ssh|svn|hg|htpasswd|htaccess|ds_store|bash_history|npmrc)(/|\\.|$)"
+# .htpasswd/.htaccess, editor settings. Anchored at a path segment boundary.
+target_regex = "(^|/)\\.(env|git|aws|ssh|svn|hg|htpasswd|htaccess|ds_store|bash_history|npmrc|vscode|idea)(/|\\.|\\?|$)"
 
 [[rule]]
 label = "sensitive-path"
@@ -15,3 +16,10 @@ weight = 2
 # Common admin / CMS probes. /.well-known/ is intentionally omitted: ACME
 # challenges, security.txt and Chrome's traffic-advice are legitimate.
 target_regex = "/wp-(login|admin|content|includes)|/phpmyadmin|/xmlrpc\\.php|/cgi-bin/|/administrator/|/actuator/|/wp-config\\.php"
+
+[[rule]]
+label = "sensitive-path"
+weight = 2
+# Server status and debug pages: Apache mod_status/mod_info, phpinfo(),
+# the Tomcat manager.
+target_regex = "/server-(status|info)(/|\\?|$)|/(phpinfo|php_info|info)\\.php(/|\\?|$)|/phpinfo(/|\\?|$)|/(host-)?manager/(html|text|status)(/|\\?|$)"

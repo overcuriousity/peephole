@@ -1,4 +1,9 @@
+mod config;
+mod decoy;
+mod flood;
 mod pages;
+
+pub use config::TrapConfig;
 
 use crate::classify::{BotTells, Classifier, RequestView};
 use crate::config::Config;
@@ -8,24 +13,31 @@ use crate::store::{Store, requests::NewRequest};
 use anyhow::Result;
 use axum::{
     Router,
-    body::Bytes,
-    extract::{ConnectInfo, Form, State},
-    http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse},
+    extract::{ConnectInfo, Form, Request, State},
+    http::{HeaderMap, StatusCode, Version, header},
+    response::{Html, IntoResponse, Response},
     routing::{any, get, post},
 };
+use futures::StreamExt;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 const COLLECTOR_JS: &str = include_str!("../fingerprint/collector.js");
 
-/// Largest request body the public trap will read. Real exploit payloads are
-/// tiny; a cap keeps a flood of multi-megabyte POSTs from exhausting memory
-/// (every body is held whole and replicated to every cluster node).
+/// Largest request body the trap stores. Real exploit payloads are tiny;
+/// a cap keeps a flood of multi-megabyte POSTs from exhausting memory (every
+/// body is held whole and replicated to every cluster node). A longer body
+/// is cut, not refused: the request is still recorded and answered.
 const MAX_BODY: usize = 64 * 1024;
+/// Past `MAX_BODY` the rest of a body is read and counted, not kept, up to
+/// this many bytes in all; then reading stops.
+const MAX_BODY_DRAIN: u64 = 1024 * 1024;
+/// How long the trap waits for a body.
+const BODY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Fixed-window per-IP limit for the unauthenticated helper endpoints.
 const HELPER_LIMIT: u32 = 30;
@@ -44,6 +56,17 @@ pub struct TrapState {
     pub helper_rate: RateLimiter,
     /// Runtime scan settings; the trap reads the rescan cooldown from it.
     pub pace: crate::scan::pace::SharedPace,
+    /// Flood protection for the recording path.
+    pub guards: Guards,
+}
+
+/// In-memory state that keeps floods off the database.
+#[derive(Default)]
+pub struct Guards {
+    /// Which requests are recorded in full (`[trap]` record_rate).
+    flood: flood::FloodGate,
+    /// Intel results recorded moments ago.
+    intel: flood::IntelCache,
 }
 
 /// Minimal fixed-window rate limiter. Bounded in size so an attacker rotating
@@ -98,19 +121,37 @@ impl TrapState {
             tor: Arc::new(RwLock::new(TorExitList::default())),
             notifier: Default::default(),
             helper_rate: RateLimiter::default(),
+            guards: Guards::default(),
         }
     }
 }
 
+/// The trap's routes. The helper endpoints the trap page uses sit under
+/// `trap.helper_prefix`; everything else is the trap.
 pub fn router(state: Arc<TrapState>) -> Router {
+    let p = state.cfg.trap.helper_prefix.clone();
     Router::new()
-        .route("/claim", post(claim_handler))
-        .route("/collect", post(collect_handler))
-        .route("/panel", get(panel_handler))
-        .route("/collect.js", get(collector_js))
+        .route(&format!("{p}/claim"), post(claim_handler))
+        .route(&format!("{p}/collect"), post(collect_handler))
+        .route(&format!("{p}/panel"), get(panel_handler))
+        .route(&format!("{p}/collect.js"), get(collector_js))
         .fallback(any(trap_handler))
+        // Limits the helpers' Form/Json bodies; the trap reads its own.
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
+}
+
+/// One `X-Forwarded-For` entry: an address, optionally with a port
+/// (`203.0.113.9:4711`, `[2001:db8::1]:4711`, `[2001:db8::1]`).
+fn parse_xff_entry(s: &str) -> Option<IpAddr> {
+    s.parse::<IpAddr>()
+        .ok()
+        .or_else(|| s.parse::<SocketAddr>().ok().map(|a| a.ip()))
+        .or_else(|| {
+            s.strip_prefix('[')
+                .and_then(|r| r.strip_suffix(']'))
+                .and_then(|r| r.parse::<IpAddr>().ok())
+        })
 }
 
 /// Source IP from `X-Forwarded-For`, trusting only hops we control.
@@ -126,6 +167,11 @@ pub fn router(state: Arc<TrapState>) -> Router {
 /// IPv4-mapped IPv6 hop matches IPv4 trust CIDRs. All `x-forwarded-for` header
 /// lines are considered, newest last, and values are parsed from raw bytes so
 /// a non-ASCII byte cannot blank the header and pin everything on the proxy.
+///
+/// Entries may carry a port (`ip:port`, `[v6]:port`). An entry that is not
+/// an address at all stops the walk at the last trusted hop (fail closed):
+/// skipping it would let a forged entry further left stand in for the one a
+/// trusted proxy wrote. Empty entries (`a,,b`) are skipped.
 pub fn client_ip(headers: &HeaderMap, fallback: IpAddr, trusted: &[IpNet]) -> IpAddr {
     let fallback = crate::net::canonical(fallback);
     let is_trusted = |ip: &IpAddr| {
@@ -137,37 +183,109 @@ pub fn client_ip(headers: &HeaderMap, fallback: IpAddr, trusted: &[IpNet]) -> Ip
         // The direct peer is not a trusted proxy: believe only the peer.
         return fallback;
     }
-    // Flatten every XFF entry across all header lines, left to right.
-    let entries: Vec<IpAddr> = headers
+    // Every XFF entry across all header lines, left to right.
+    let entries: Vec<String> = headers
         .get_all("x-forwarded-for")
         .iter()
         .flat_map(|v| {
             String::from_utf8_lossy(v.as_bytes())
                 .split(',')
-                .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
         })
         .collect();
     // Walk right to left, skipping trusted hops; the first untrusted one wins.
-    for ip in entries.iter().rev() {
-        let ip = crate::net::canonical(*ip);
+    let mut last_trusted = fallback;
+    for e in entries.iter().rev() {
+        let Some(ip) = parse_xff_entry(e) else {
+            return last_trusted;
+        };
+        let ip = crate::net::canonical(ip);
         if !is_trusted(&ip) {
             return ip;
         }
+        last_trusted = ip;
     }
     // Every entry (and the peer) is trusted, or there were none: use the peer.
     fallback
 }
 
-async fn record_and_respond(
+/// The body as far as the trap keeps it: at most `MAX_BODY` bytes, plus,
+/// when that is not the whole body, the number of bytes received before
+/// reading stopped (cut at the cap, drained up to `MAX_BODY_DRAIN`, timed out
+/// or broken off).
+async fn read_body(body: axum::body::Body) -> (Vec<u8>, Option<u64>) {
+    let mut stream = body.into_data_stream();
+    let mut kept: Vec<u8> = Vec::new();
+    let mut seen: u64 = 0;
+    let mut complete = false;
+    let deadline = tokio::time::sleep(BODY_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            next = stream.next() => match next {
+                Some(Ok(chunk)) => {
+                    seen += chunk.len() as u64;
+                    let room = MAX_BODY.saturating_sub(kept.len());
+                    kept.extend_from_slice(&chunk[..room.min(chunk.len())]);
+                    if seen >= MAX_BODY_DRAIN {
+                        break;
+                    }
+                }
+                Some(Err(_)) => break,
+                None => {
+                    complete = true;
+                    break;
+                }
+            },
+            _ = &mut deadline => break,
+        }
+    }
+    let whole = complete && seen == kept.len() as u64;
+    (kept, (!whole).then_some(seen))
+}
+
+/// What the trap stores for one request besides the verdict.
+struct Capture<'a> {
+    ip: IpAddr,
+    view: RequestView<'a>,
+    /// Headers as stored (with the trap's `:`-pseudo-headers).
+    raw_headers: &'a [(String, String)],
+    /// The body as received (not decompressed).
+    body: Option<Vec<u8>>,
+    is_fp_claim: bool,
+    page_token: String,
+}
+
+/// What the trap stored for one request.
+struct Recorded {
+    request_id: i64,
+    ip_id: i64,
+}
+
+/// Record this node's intel result unless it was recorded moments ago.
+async fn record_intel(
     state: &TrapState,
     ip: IpAddr,
-    view: &RequestView<'_>,
-    raw_headers: &[(String, String)],
-    body: Option<Bytes>,
-    is_fp_claim: bool,
-) -> Result<Recorded> {
-    let ip_row = state.store.upsert_ip(ip).await?;
+    provider: &'static str,
+    version: Option<&str>,
+    data: serde_json::Value,
+) -> Result<()> {
+    if state.guards.intel.is_current(ip, provider, &data) {
+        return Ok(());
+    }
+    state
+        .recorder
+        .record_intel(&ip.to_string(), provider, version, data.clone())
+        .await?;
+    state.guards.intel.put(ip, provider, data);
+    Ok(())
+}
+
+async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
+    let ip = c.ip;
+    let ip_s = ip.to_string();
 
     // Enrichment (every IP, every request — spec §4): what this node can
     // look up itself. Written only when it changes. IPs this node cannot
@@ -179,19 +297,18 @@ async fn record_and_respond(
         .as_ref()
         .map(|g| (g.lookup(&ip), g.build_date()));
     if let Some((g, version)) = geo_hit {
-        state
-            .recorder
-            .record_intel(
-                &ip_row.ip,
-                crate::intel::MAXMIND,
-                version.as_deref(),
-                crate::store::recorder::Recorder::geo_data(
-                    g.country.as_deref(),
-                    g.asn,
-                    g.asn_org.as_deref(),
-                ),
-            )
-            .await?;
+        record_intel(
+            state,
+            ip,
+            crate::intel::MAXMIND,
+            version.as_deref(),
+            crate::store::recorder::Recorder::geo_data(
+                g.country.as_deref(),
+                g.asn,
+                g.asn_org.as_deref(),
+            ),
+        )
+        .await?;
     }
     // With a Tor list loaded, every IP gets a result (false included); with
     // none, this node has nothing to say.
@@ -201,88 +318,90 @@ async fn record_and_respond(
     };
     let is_tor = tor_hit == Some(true);
     if let Some(exit) = tor_hit {
-        state
-            .recorder
-            .record_intel(
-                &ip_row.ip,
-                crate::intel::TOR,
-                None,
-                serde_json::json!({ "exit": exit }),
-            )
-            .await?;
+        record_intel(
+            state,
+            ip,
+            crate::intel::TOR,
+            None,
+            serde_json::json!({ "exit": exit }),
+        )
+        .await?;
     }
 
     // A false-positive claim is the visitor saying "I'm not a scanner"; it must
     // not be classified as hostile or trigger a counter-scan (otherwise the
     // POST alone scores form-interaction and escalates the claimant).
-    let verdict = if is_fp_claim {
+    let verdict = if c.is_fp_claim {
         crate::classify::Verdict {
             severity: 0,
             scan_level: 0,
             labels: vec!["fp-claim".into()],
         }
     } else {
-        let history = state.store.ip_history(ip_row.id).await.unwrap_or_default();
+        let history = state
+            .store
+            .ip_history(&ip_s, c.view.path)
+            .await
+            .unwrap_or_default();
         state
             .classifier
-            .classify(view, &history, &BotTells::default())
+            .classify(&c.view, &history, &BotTells::default())
     };
-    let labels_json = serde_json::to_string(&verdict.labels)?;
-    let page_token = uuid::Uuid::new_v4().to_string();
 
-    let request_id = state
+    // Creates the IP's row too: one write transaction.
+    let (request_id, ip_id) = state
         .recorder
-        .insert_request(&NewRequest {
-            ip_id: ip_row.id,
-            method: view.method.to_string(),
-            path: view.path.to_string(),
-            query: view.query.map(str::to_string),
-            headers_json: serde_json::to_string(raw_headers)?,
-            body: body.map(|b| b.to_vec()),
-            labels_json,
-            severity: verdict.severity as i64,
-            scan_level: verdict.scan_level as i64,
-            is_fp_claim,
-            page_token: Some(page_token.clone()),
-        })
+        .insert_request_from(
+            &ip_s,
+            &NewRequest {
+                ip_id: 0,
+                method: c.view.method.to_string(),
+                path: c.view.path.to_string(),
+                query: c.view.query.map(str::to_string),
+                headers_json: serde_json::to_string(c.raw_headers)?,
+                body: c.body,
+                labels_json: serde_json::to_string(&verdict.labels)?,
+                severity: verdict.severity as i64,
+                scan_level: verdict.scan_level as i64,
+                is_fp_claim: c.is_fp_claim,
+                page_token: Some(c.page_token),
+            },
+        )
         .await?;
 
     // Enqueue counter-scan unless tor / allowlisted / non-global / level 0
-    // (spec §4-5). The non-global guard is absolute: a spoofed X-Forwarded-For
-    // or a misconfigured never_scan must never aim nmap at loopback, the
-    // internal network or a link-local metadata endpoint. never_scan is checked
-    // on the canonical address so IPv4-mapped IPv6 cannot slip past IPv4 CIDRs.
+    // (spec §4-5).
+    if verdict.scan_level > 0 && !is_tor && may_scan(state, ip) {
+        enqueue(state, ip_id, verdict.scan_level).await?;
+    }
+    Ok(Recorded { request_id, ip_id })
+}
+
+/// Whether this trap may queue a counter-scan of `ip` (Tor is checked by the
+/// caller). The non-global guard is absolute: a spoofed X-Forwarded-For or a
+/// misconfigured never_scan must never aim nmap at loopback, the internal
+/// network or a link-local metadata endpoint. never_scan is checked on the
+/// canonical address so IPv4-mapped IPv6 cannot slip past IPv4 CIDRs.
+fn may_scan(state: &TrapState, ip: IpAddr) -> bool {
     let canon = crate::net::canonical(ip);
     // never_scan is the business of this node's own scanner. Standalone
     // that is the only scanner, so the job is not queued at all; in a
     // cluster another scanner may take it.
     let allowlisted = state.recorder.node().is_none()
         && state.cfg.scan.never_scan.iter().any(|n| n.contains(&canon));
-    if verdict.scan_level > 0
-        && !is_tor
-        && !allowlisted
-        && crate::net::is_scannable_target(ip)
-        && let crate::store::scans::EnqueueOutcome::Queued(job_id) = state
-            .recorder
-            .enqueue_scan_with(ip_row.id, verdict.scan_level, &state.enqueue_policy())
-            .await?
+    !allowlisted && crate::net::is_scannable_target(ip)
+}
+
+async fn enqueue(state: &TrapState, ip_id: i64, level: u8) -> Result<()> {
+    if let crate::store::scans::EnqueueOutcome::Queued(job_id) = state
+        .recorder
+        .enqueue_scan_with(ip_id, level, &state.enqueue_policy())
+        .await?
         && let Ok(Some(job)) = state.store.queue_job(job_id).await
     {
         state.notifier.publish(job);
     }
-    Ok(Recorded {
-        request_id,
-        ip_id: ip_row.id,
-        page_token,
-    })
-}
-
-/// What the trap stored for one request.
-struct Recorded {
-    request_id: i64,
-    ip_id: i64,
-    /// Rendered into the trap page so `/collect` can link the fingerprint.
-    page_token: String,
+    Ok(())
 }
 
 fn header_pairs(h: &HeaderMap) -> Vec<(String, String)> {
@@ -299,44 +418,88 @@ fn header_pairs(h: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Every request no other route takes: recorded (unless this IP is over its
+/// recording rate), classified, and answered with the trap page (or a decoy).
+///
+/// Besides the headers as sent, the stored header list carries what the
+/// trap observed, as pseudo-headers (names starting with `:` cannot be sent
+/// by a client): `:version` (HTTP version on this connection; behind a
+/// proxy, the proxy's), `:authority` (the host of an absolute-form target
+/// such as an open-proxy probe, or HTTP/2's authority), `:body-truncated`
+/// (bytes received when the stored body is not the whole body; the declared
+/// length is in `content-length`) and `:unrecorded` (requests from this IP
+/// answered but not recorded since its previous recorded one).
 async fn trap_handler(
     State(state): State<Arc<TrapState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    uri: axum::http::Uri,
-    method: axum::http::Method,
-    body: Bytes,
-) -> impl IntoResponse {
-    let ip = client_ip(&headers, peer.ip(), &state.cfg.trusted_proxies);
-    let view = RequestView {
-        method: method.as_str(),
-        path: uri.path(),
-        query: uri.query(),
-        headers: header_pairs(&headers),
-        body: if body.is_empty() { None } else { Some(&body) },
-    };
-    let stored_body = if body.is_empty() {
-        None
-    } else {
-        Some(body.clone())
-    };
-    match record_and_respond(
-        &state,
-        ip,
-        &view,
-        &header_pairs(&headers),
-        stored_body,
-        false,
-    )
-    .await
-    {
-        Ok(rec) => (
-            StatusCode::NOT_FOUND,
-            Html(pages::trap_page(&rec.page_token)),
-        )
-            .into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response(),
+    req: Request,
+) -> Response {
+    let (parts, body) = req.into_parts();
+    let ip = client_ip(&parts.headers, peer.ip(), &state.cfg.trusted_proxies);
+    let (body, received) = read_body(body).await;
+    let page_token = uuid::Uuid::new_v4().to_string();
+    let method = parts.method.as_str();
+    let path = parts.uri.path();
+
+    match state.guards.flood.admit(ip, &state.cfg.trap) {
+        flood::Admission::Skip => {
+            debug!(%ip, "trap: over the recording rate; answered, not recorded");
+        }
+        flood::Admission::Record { unrecorded } => {
+            let mut raw = vec![(":version".to_string(), format!("{:?}", parts.version))];
+            let authority = parts.uri.authority().map(|a| a.as_str());
+            if let Some(a) = authority {
+                raw.push((":authority".into(), a.to_string()));
+            }
+            if let Some(n) = received {
+                raw.push((":body-truncated".into(), n.to_string()));
+            }
+            if unrecorded > 0 {
+                raw.push((":unrecorded".into(), unrecorded.to_string()));
+            }
+            raw.extend(header_pairs(&parts.headers));
+            // HTTP/2 always names the authority; in HTTP/1 only a client
+            // that takes us for a forward proxy does.
+            let proxy_target = authority.filter(|_| parts.version < Version::HTTP_2);
+            let classified = crate::classify::decoded_body(&raw, &body);
+            let view = RequestView {
+                method,
+                path,
+                query: parts.uri.query(),
+                headers: raw.clone(),
+                body: (!classified.is_empty()).then_some(&classified[..]),
+                proxy_target,
+            };
+            let capture = Capture {
+                ip,
+                view,
+                raw_headers: &raw,
+                body: (!body.is_empty()).then(|| body.clone()),
+                is_fp_claim: false,
+                page_token: page_token.clone(),
+            };
+            if let Err(e) = record(&state, capture).await {
+                // Answer as always: an error page would tell a scanner it
+                // found something other than a missing route.
+                warn!(%ip, error = %e, "trap: recording the request failed");
+            }
+        }
     }
+    if state.cfg.trap.decoys
+        && let Some(d) = decoy::decoy(method, path, &page_token.replace('-', "")[..12])
+    {
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, d.content_type)],
+            d.body,
+        )
+            .into_response();
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Html(pages::trap_page(&page_token, &state.cfg.trap.helper_prefix)),
+    )
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -360,14 +523,23 @@ async fn claim_handler(
         .unwrap_or("")
         .to_string();
     let raw = header_pairs(&headers);
-    let view = RequestView {
-        method: "POST",
-        path: "/claim",
-        query: None,
-        headers: raw.clone(),
+    let path = format!("{}/claim", state.cfg.trap.helper_prefix);
+    let capture = Capture {
+        ip,
+        view: RequestView {
+            method: "POST",
+            path: &path,
+            query: None,
+            headers: raw.clone(),
+            body: None,
+            proxy_target: None,
+        },
+        raw_headers: &raw,
         body: None,
+        is_fp_claim: true,
+        page_token: uuid::Uuid::new_v4().to_string(),
     };
-    if let Ok(rec) = record_and_respond(&state, ip, &view, &raw, None, true).await {
+    if let Ok(rec) = record(&state, capture).await {
         let email = form.email.filter(|e| !e.trim().is_empty());
         let _ = state
             .recorder
@@ -404,16 +576,17 @@ async fn collect_handler(
     if let Ok(ip_row) = state.store.upsert_ip(ip).await {
         // Attribute the fingerprint to the page view that issued the token;
         // fall back to the connection IP for unknown tokens.
-        let req: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT id, ip_id FROM requests WHERE page_token = ? ORDER BY id DESC LIMIT 1",
+        let req: Option<(i64, i64, String)> = sqlx::query_as(
+            "SELECT r.id, r.ip_id, i.ip FROM requests r JOIN ips i ON i.id = r.ip_id
+             WHERE r.page_token = ? ORDER BY r.id DESC LIMIT 1",
         )
         .bind(&payload.token)
         .fetch_optional(&state.store.pool)
         .await
         .unwrap_or(None);
-        let (request_id, ip_id) = match req {
-            Some((rid, iid)) => (Some(rid), iid),
-            None => (None, ip_row.id),
+        let (request_id, ip_id, page_ip) = match req {
+            Some((rid, iid, page_ip)) => (Some(rid), iid, page_ip.parse::<IpAddr>().ok()),
+            None => (None, ip_row.id, Some(ip)),
         };
         let hash = crate::fingerprint::fp_hash(&payload.attrs);
         let visitor = payload
@@ -442,28 +615,20 @@ async fn collect_handler(
         // The fingerprint arrives after the page view that triggered it, so it
         // cannot influence that request's own verdict. When it reveals a bot
         // (navigator.webdriver, or a form filled inhumanly fast with no mouse
-        // movement), escalate a counter-scan now — subject to the same tor /
-        // never_scan / non-global guards as the request path.
+        // movement), escalate a counter-scan now — of the address the page
+        // was served to, subject to the same tor / never_scan / non-global
+        // guards as the request path. Bot evidence posted from another
+        // address than the page's is stored but escalates nothing: it is not
+        // tied to one address, and a token alone must not aim a scan.
         let tells = crate::fingerprint::bot_tells(&payload.attrs, &payload.behavior);
-        if tells.webdriver || tells.inhuman_fill {
-            let canon = crate::net::canonical(ip);
-            let is_tor = state.tor.read().unwrap().contains(&ip);
-            // never_scan is the business of this node's own scanner. Standalone
-            // that is the only scanner, so the job is not queued at all; in a
-            // cluster another scanner may take it.
-            let allowlisted = state.recorder.node().is_none()
-                && state.cfg.scan.never_scan.iter().any(|n| n.contains(&canon));
-            if !is_tor && !allowlisted && crate::net::is_scannable_target(ip) {
-                let level = if tells.inhuman_fill { 3 } else { 2 };
-                if let Ok(crate::store::scans::EnqueueOutcome::Queued(job_id)) = state
-                    .recorder
-                    .enqueue_scan_with(ip_id, level, &state.enqueue_policy())
-                    .await
-                    && let Ok(Some(job)) = state.store.queue_job(job_id).await
-                {
-                    state.notifier.publish(job);
-                }
-            }
+        if (tells.webdriver || tells.inhuman_fill)
+            && let Some(target) = page_ip.map(crate::net::canonical)
+            && target == crate::net::canonical(ip)
+            && !state.tor.read().unwrap().contains(&target)
+            && may_scan(&state, target)
+        {
+            let level = if tells.inhuman_fill { 3 } else { 2 };
+            let _ = enqueue(&state, ip_id, level).await;
         }
     }
     axum::Json(serde_json::json!({"ok": true})).into_response() // opaque ack (spec §8.3)
@@ -631,6 +796,40 @@ mod tests {
         );
         let ip = client_ip(&h, "10.0.0.1".parse().unwrap(), &trusted());
         assert_eq!(ip, "203.0.113.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn entries_with_ports_are_parsed() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        for (xff, want) in [
+            ("203.0.113.9:4711", "203.0.113.9"),
+            ("[2001:db8::1]:4711", "2001:db8::1"),
+            ("[2001:db8::1]", "2001:db8::1"),
+            ("2001:db8::1", "2001:db8::1"),
+        ] {
+            // A forged entry on the left must not win over the proxy's.
+            let ip = client_ip(&hm(&["6.6.6.6", xff]), peer, &trusted());
+            assert_eq!(ip, want.parse::<IpAddr>().unwrap(), "{xff}");
+        }
+        // A trusted hop written with a port is still skipped.
+        let ip = client_ip(&hm(&["203.0.113.9", "10.0.0.2:80"]), peer, &trusted());
+        assert_eq!(ip, "203.0.113.9".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn unparsable_entry_stops_the_walk_at_the_last_trusted_hop() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        // Skipping "garbage" would let the forged 6.6.6.6 win.
+        let ip = client_ip(&hm(&["6.6.6.6", "garbage", "10.0.0.2"]), peer, &trusted());
+        assert_eq!(ip, "10.0.0.2".parse::<IpAddr>().unwrap());
+        // Unparsable as the rightmost entry: the peer.
+        let ip = client_ip(&hm(&["6.6.6.6, unknown"]), peer, &trusted());
+        assert_eq!(ip, peer);
+        let ip = client_ip(&hm(&["6.6.6.6", "203.0.113.9:x"]), peer, &trusted());
+        assert_eq!(ip, peer);
+        // Empty entries are not addresses a proxy wrote; they are skipped.
+        let ip = client_ip(&hm(&["6.6.6.6,, 203.0.113.9,"]), peer, &trusted());
+        assert_eq!(ip, "203.0.113.9".parse::<IpAddr>().unwrap());
     }
 
     #[test]

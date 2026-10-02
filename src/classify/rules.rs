@@ -26,6 +26,10 @@ pub struct Rule {
     pub header_regex: Option<String>,
     /// Exact path match (e.g. "/.env").
     pub path_exact: Option<String>,
+    /// HTTP methods, exact and case-sensitive as sent (e.g. `["PUT"]`). With
+    /// other matchers the rule only fires for these methods; on its own it
+    /// fires on the method alone.
+    pub methods: Option<Vec<String>>,
 }
 
 impl Rule {
@@ -38,8 +42,23 @@ impl Rule {
             && self.ua_regex.is_none()
             && self.header_regex.is_none()
             && self.path_exact.is_none()
+            && self.methods.is_none()
         {
             anyhow::bail!("rule `{}` has no matcher", self.label);
+        }
+        if let Some(m) = &self.methods {
+            // A method is an HTTP token; an empty list would never match.
+            let token = |s: &str| {
+                !s.is_empty()
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+            };
+            if m.is_empty() || !m.iter().all(|s| token(s)) {
+                anyhow::bail!(
+                    "rule `{}` has an empty or invalid `methods` list",
+                    self.label
+                );
+            }
         }
         if !(1..=4).contains(&self.weight) {
             anyhow::bail!(
@@ -99,6 +118,17 @@ mod tests {
         assert!(one("[[rule]]\nlabel=\"x\"\nweight=0\ntarget_regex=\"a\"\n").is_err());
         assert!(one("[[rule]]\nlabel=\"x\"\nweight=5\ntarget_regex=\"a\"\n").is_err());
         assert!(one("[[rule]]\nlabel=\"x\"\nweight=3\ntarget_regex=\"a\"\n").is_ok());
+    }
+
+    #[test]
+    fn methods_are_validated() {
+        assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\nmethods=[\"PUT\"]\n").is_ok());
+        assert!(
+            one("[[rule]]\nlabel=\"x\"\nweight=2\nmethods=[\"PUT\"]\ntarget_regex=\"a\"\n").is_ok()
+        );
+        assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\nmethods=[]\n").is_err());
+        assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\nmethods=[\"P T\"]\n").is_err());
+        assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\nmethod_regex=\"P\"\n").is_err());
     }
 
     #[test]

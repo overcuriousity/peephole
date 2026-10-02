@@ -22,6 +22,16 @@ rules_dir = "/etc/peephole/rules"
 # Proxies whose X-Forwarded-For header is trusted for the real client IP.
 trusted_proxies = ["10.0.0.0/8"]
 
+# Trap listener behaviour. All optional; the defaults are shown.
+# [trap]
+# record_rate  = 10    # requests/second one IP may have recorded in full; 0 = no limit
+# record_burst = 100   # ...after a burst of this many
+# sample_every = 20    # over the limit: record 1 in N (it carries an ":unrecorded" count); the rest are answered only
+# decoys = false       # true: answer /.env, /.git/config, /wp-login.php, phpinfo with fake content
+#                      # (status 200, canary credentials naming the request) to capture the follow-up
+# helper_prefix = ""   # path prefix for /claim, /collect, /panel, /collect.js (e.g. "/_a7f3"), so the
+#                      # trap page's helpers do not give peephole away on every vhost
+
 [webauthn]
 # Public domain the dashboard is reached at through nginx (FIDO2 relying party).
 rp_id = "peephole.example.net"

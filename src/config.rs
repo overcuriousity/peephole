@@ -26,6 +26,9 @@ pub struct Config {
     pub scan: ScanConfig,
     /// Distributed mode. Absent: standalone, no RPC listener.
     pub cluster: Option<ClusterConfig>,
+    /// How the trap listener records and answers.
+    #[serde(default)]
+    pub trap: crate::trap::TrapConfig,
 }
 
 /// `[cluster]`: this node's RPC endpoint and its bootstrap peers.
@@ -364,6 +367,7 @@ impl Config {
 
     /// Role-dependent requirements that serde cannot express.
     fn validate(&self) -> anyhow::Result<()> {
+        self.trap.validate()?;
         let r = self.roles;
         if !(r.listener || r.scanner || r.web) {
             bail!("[roles]: enable at least one of listener, scanner, web");

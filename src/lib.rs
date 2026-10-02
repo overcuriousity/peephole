@@ -445,6 +445,7 @@ impl RoleRunner {
             notifier: self.notifier.clone(),
             helper_rate: Default::default(),
             pace: self.settings.pace.clone(),
+            guards: Default::default(),
         }));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -623,10 +624,23 @@ async fn serve_trap(
                     }
                 });
             let mut builder = auto::Builder::new(TokioExecutor::new());
+            // Request heads must fit in 64 KiB (hyper's default allows
+            // ~400 KB) and 100 headers; HTTP/2 gets the same bounds plus a
+            // cap on parallel streams and an idle ping deadline.
             builder
                 .http1()
                 .timer(TokioTimer::new())
-                .header_read_timeout(Duration::from_secs(15));
+                .header_read_timeout(Duration::from_secs(15))
+                .max_buf_size(64 * 1024)
+                .max_headers(100);
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .max_concurrent_streams(32)
+                .max_header_list_size(64 * 1024)
+                .max_pending_accept_reset_streams(16)
+                .keep_alive_interval(Duration::from_secs(30))
+                .keep_alive_timeout(Duration::from_secs(15));
             let io = TokioIo::new(stream);
             // Overall per-connection deadline bounds slow bodies and keep-alive
             // trickling as well as slow headers.
