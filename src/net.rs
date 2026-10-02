@@ -37,6 +37,8 @@ pub fn is_scannable_target(ip: IpAddr) -> bool {
 fn is_global_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     !(ip.is_unspecified()
+        // "this network" 0.0.0.0/8 (RFC 1122): never a destination
+        || o[0] == 0
         || ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
@@ -46,21 +48,54 @@ fn is_global_v4(ip: Ipv4Addr) -> bool {
         || (o[0] == 100 && (o[1] & 0xc0) == 0x40)
         // IETF protocol assignments 192.0.0.0/24
         || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        // deprecated 6to4 relay anycast 192.88.99.0/24 (RFC 7526)
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
         // benchmarking 198.18.0.0/15
         || (o[0] == 198 && (o[1] & 0xfe) == 18)
         // reserved 240.0.0.0/4 (excluding 255.255.255.255, already broadcast)
         || o[0] >= 240)
 }
 
+/// The IPv4 address embedded in `seg[at]` and `seg[at + 1]`.
+fn v4_at(seg: &[u16; 8], at: usize) -> Ipv4Addr {
+    let (hi, lo) = (seg[at], seg[at + 1]);
+    Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
+}
+
 fn is_global_v6(ip: Ipv6Addr) -> bool {
     let seg = ip.segments();
+    // Forms that embed an IPv4 address are only as global as that address:
+    // the NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) and 6to4
+    // 2002::/16 (RFC 3056). `64:ff9b::127.0.0.1` must not reach loopback
+    // through a NAT64 gateway on the scanner's network.
+    if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return is_global_v4(v4_at(&seg, 6));
+    }
+    if seg[0] == 0x2002 {
+        return is_global_v4(v4_at(&seg, 1));
+    }
     !(ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_multicast()
+        // IPv4-compatible ::a.b.c.d (deprecated, RFC 4291 §2.5.5.1); the
+        // whole ::/96, so :: and ::1 too.
+        || seg[..6] == [0; 6]
+        // local-use NAT64 64:ff9b:1::/48 (RFC 8215)
+        || seg[..3] == [0x64, 0xff9b, 1]
+        // discard-only 100::/64 (RFC 6666)
+        || seg[..4] == [0x100, 0, 0, 0]
+        // IETF protocol assignments 2001::/23: Teredo 2001::/32, ORCHID,
+        // AMT, AS112, ... A few sub-blocks are routable, but none is a
+        // source worth scanning, so the whole block is refused.
+        || (seg[0] == 0x2001 && seg[1] < 0x200)
+        // SRv6 SIDs 5f00::/16 (RFC 9602)
+        || seg[0] == 0x5f00
         // unique local fc00::/7
         || (seg[0] & 0xfe00) == 0xfc00
         // link-local fe80::/10
-        || (seg[0] & 0xffc0) == 0xfe80)
+        || (seg[0] & 0xffc0) == 0xfe80
+        // deprecated site-local fec0::/10
+        || (seg[0] & 0xffc0) == 0xfec0)
 }
 
 #[cfg(test)]
@@ -94,6 +129,32 @@ mod tests {
             "ff02::1",
             // IPv4-mapped private must also be refused.
             "::ffff:192.168.0.1",
+            // "this network" 0.0.0.0/8, 6to4 relay anycast
+            "0.1.2.3",
+            "192.88.99.1",
+            // NAT64 / 6to4 embedding a non-global IPv4
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::169.254.169.254",
+            "2002:7f00:1::1",
+            "2002:c0a8:101::1",
+            // local-use NAT64, whatever it embeds
+            "64:ff9b:1::808:808",
+            // IPv4-compatible, whatever it embeds
+            "::8.8.8.8",
+            "::127.0.0.1",
+            // discard-only
+            "100::1",
+            // IETF assignments, Teredo included
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:1::1",
+            "2001:1ff::1",
+            // SRv6 SIDs
+            "5f00::1",
+            // site-local
+            "fec0::1",
+            "feff::1",
         ] {
             assert!(
                 !is_scannable_target(s.parse().unwrap()),
@@ -105,7 +166,19 @@ mod tests {
     #[test]
     fn global_targets_are_allowed() {
         // Includes the TEST-NET range the tests use as a stand-in public IP.
-        for s in ["8.8.8.8", "1.1.1.1", "203.0.113.5", "2606:4700::1111"] {
+        for s in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "203.0.113.5",
+            "2606:4700::1111",
+            // the documentation prefix, a stand-in public address in tests
+            "2001:db8::5",
+            // just past 2001::/23
+            "2001:200::1",
+            // NAT64 / 6to4 embedding a global IPv4
+            "64:ff9b::8.8.8.8",
+            "2002:808:808::1",
+        ] {
             assert!(
                 is_scannable_target(s.parse().unwrap()),
                 "{s} should be allowed"
