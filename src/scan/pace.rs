@@ -274,7 +274,10 @@ pub fn others(node: &crate::cluster::Node, scan_secs: f64) -> Others {
                 timeout_secs: p.timeout_secs,
             };
             o.capacity_per_hour += capacity(p, scan_secs);
-            o.scanners += 1;
+            // A paused scanner takes no share.
+            if !p.paused() {
+                o.scanners += 1;
+            }
         }
     }
     o
@@ -284,9 +287,9 @@ pub fn others(node: &crate::cluster::Node, scan_secs: f64) -> Others {
 /// within [`DRAIN_HOURS`], never below one scan per hour and one worker.
 /// When more than [`TIMEOUT_SHARE`] of recent scans hit the limit, the
 /// timeout is raised by half (rounded up to a minute) and the worker count
-/// is sized for scans that may take that long. In a cluster, `others` is
-/// what the other scanners already cover: the recommendation is this
-/// node's share of the rest.
+/// is sized for scans that may take that long. In a cluster, capacity
+/// counts `others` too, and the recommendation is this node's even share
+/// of what the cluster needs.
 pub fn recommend(m: &QueueMetrics, current: Pace, others: Others) -> Recommendation {
     let timeout_share = if m.completed_24h > 0 {
         m.timeouts_24h as f64 / m.completed_24h as f64
@@ -316,7 +319,10 @@ pub fn recommend(m: &QueueMetrics, current: Pace, others: Others) -> Recommendat
     };
 
     let target = (arrival * HEADROOM + m.backlog as f64 / DRAIN_HOURS).ceil();
-    let target = (target - others.capacity_per_hour).ceil().max(1.0);
+    // Split evenly over the live scanners, this one included: every node
+    // gets the same share whatever the others run at now, so applying the
+    // recommendations anywhere, in any order, settles at once.
+    let target = (target / (others.scanners + 1) as f64).ceil().max(1.0);
     let workers = ((target * scan_secs / 3600.0).ceil() as usize).clamp(1, MAX_WORKERS);
     let per_hour = (target as i64).clamp(1, MAX_PER_HOUR);
     Recommendation {
@@ -369,7 +375,7 @@ mod tests {
     };
 
     #[test]
-    fn other_scanners_count_toward_capacity_and_shrink_our_share() {
+    fn other_scanners_count_toward_capacity_and_the_need_is_split_evenly() {
         let o = Others {
             capacity_per_hour: 20.0,
             scanners: 1,
@@ -380,20 +386,44 @@ mod tests {
         assert_eq!(r.capacity_per_hour, 44.0);
         assert!(r.net_growth_per_hour < 0.0);
         assert_eq!(r.scanners, 2);
-        // target 10 × 1.25 = 12.5 → 13, minus 20 elsewhere → the minimum.
-        assert_eq!(r.pace.max_scans_per_hour, 1);
+        // target 10 × 1.25 = 12.5 → 13, over two scanners → 7 each,
+        // whatever the other one runs at now.
+        assert_eq!(r.pace.max_scans_per_hour, 7);
         assert_eq!(r.pace.max_workers, 1);
-    }
-
-    #[test]
-    fn our_share_is_what_the_others_leave() {
         let o = Others {
             capacity_per_hour: 5.0,
             scanners: 1,
         };
-        // 13/h needed (see above), 5 covered elsewhere → 8 here.
-        let r = recommend(&m(0, 240, Some(300.0)), P, o);
-        assert_eq!(r.pace.max_scans_per_hour, 8);
+        assert_eq!(
+            recommend(&m(0, 240, Some(300.0)), P, o)
+                .pace
+                .max_scans_per_hour,
+            7
+        );
+    }
+
+    /// Every node applying its recommendation at once lands on the same
+    /// split: nothing swings back and forth.
+    #[test]
+    fn applying_everywhere_at_once_is_stable() {
+        let mut paces = [P, P, P];
+        for _ in 0..3 {
+            let next: Vec<Pace> = (0..3)
+                .map(|i| {
+                    let others = Others {
+                        capacity_per_hour: (0..3)
+                            .filter(|j| *j != i)
+                            .map(|j| capacity(paces[j], 300.0))
+                            .sum(),
+                        scanners: 2,
+                    };
+                    recommend(&m(0, 24 * 30, Some(300.0)), paces[i], others).pace
+                })
+                .collect();
+            paces = [next[0], next[1], next[2]];
+        }
+        // 30/h × 1.25 = 37.5 → 38, over three → 13 each, every round.
+        assert!(paces.iter().all(|p| p.max_scans_per_hour == 13));
     }
 
     #[test]

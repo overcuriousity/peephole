@@ -36,7 +36,7 @@
       <input type="hidden" name="max_scans_per_hour" value="{{ pace.rec.max_scans_per_hour }}">
       <input type="hidden" name="timeout_minutes" value="{{ pace.rec_timeout_min }}">
       <p><strong>Recommended{% if pace.cluster_note.is_some() %} for this node{% endif %}:</strong> {{ pace.rec.max_workers }} workers, {{ pace.rec.max_scans_per_hour }} scans per hour ({{ pace.rec_cadence }}), {{ pace.rec_timeout_min }} min timeout.</p>
-      <p class="muted">Covers the arrival rate with 25% headroom and clears the current backlog within a day. {% if pace.cluster_note.is_some() %}The queue is shared: what the other live scanners finish is counted first, and this node covers the rest. {% endif %}Raises the timeout by half when more than 10% of scans hit it.</p>
+      <p class="muted">Covers the arrival rate with 25% headroom and clears the current backlog within a day. {% if pace.cluster_note.is_some() %}The queue is shared: the need is split evenly over the live scanners, so each node can apply its own recommendation in any order. {% endif %}Raises the timeout by half when more than 10% of scans hit it.</p>
       {% if pace.rec_differs %}<button class="btn" type="submit">Apply recommendation</button>{% else %}<p class="muted">The current pace matches.</p>{% endif %}
     </form>
   </div>
