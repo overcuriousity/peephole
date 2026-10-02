@@ -383,9 +383,42 @@ async fn fingerprint(
     Ok(Effect::Applied)
 }
 
+/// Highest scan level (the nmap presets are 1..=4).
+pub const MAX_SCAN_LEVEL: i64 = 4;
+/// Scan jobs one origin may queue per hour (by HLC); more are not applied.
+pub const SCAN_JOBS_PER_HOUR: i64 = 2000;
+
 async fn scan_job(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &ScanJobRec) -> Result<Effect> {
     if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
+    }
+    // In a cluster a job may come from any member: only levels the scanners
+    // know and only public addresses, whatever the origin claims.
+    if let Some(o) = ctx.origin {
+        let target = r.ip.parse::<std::net::IpAddr>().ok();
+        if !(1..=MAX_SCAN_LEVEL).contains(&r.level)
+            || !target.is_some_and(crate::net::is_scannable_target)
+        {
+            tracing::warn!(origin = %o.short(), job = %r.uid, level = r.level, ip = %r.ip,
+                           "scan job with an invalid level or target ignored");
+            return Ok(Effect::Ignored);
+        }
+        // Per-origin rate, judged by the jobs' own (clamped) HLCs, so every
+        // node reaches the same verdict for the same stream.
+        let since = ctx.hlc.saturating_sub(3_600_000 << 16);
+        let recent: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_jobs WHERE origin = ? AND hlc > ? AND hlc <= ?",
+        )
+        .bind(&o.0[..])
+        .bind(crate::cluster::hlc::to_db(since))
+        .bind(crate::cluster::hlc::to_db(ctx.hlc))
+        .fetch_one(&mut *conn)
+        .await?;
+        if recent >= SCAN_JOBS_PER_HOUR {
+            tracing::warn!(origin = %o.short(), job = %r.uid,
+                           "scan job over the per-origin rate ignored");
+            return Ok(Effect::Ignored);
+        }
     }
     let ip_id = ensure_ip(conn, &r.ip, None).await?;
     sqlx::query(
