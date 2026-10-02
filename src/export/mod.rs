@@ -1198,6 +1198,31 @@ mod tests {
                 assert_eq!(r["intel"].as_array().unwrap().len(), 1, "tor only");
                 assert_eq!(r["is_tor"], false);
             }
+            if format == Format::Parquet {
+                // Compressed: read the values back rather than search bytes.
+                use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+                use arrow::array::{Array, AsArray};
+                let b = ParquetRecordBatchReaderBuilder::try_new(axum::body::Bytes::from(all))
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                let mut rows = 0;
+                for batch in b {
+                    let batch = batch.unwrap();
+                    rows += batch.num_rows();
+                    for name in ["intel", "country", "asn_org"] {
+                        let col = batch.column_by_name(name).unwrap();
+                        for v in col.as_string::<i32>().iter().flatten() {
+                            for gone in ["abuseipdb", "maxmind", "DTAG", "Germany"] {
+                                assert!(!v.contains(gone), "parquet {name} contains {gone}: {v}");
+                            }
+                        }
+                    }
+                    let asn = batch.column_by_name("asn").unwrap();
+                    assert_eq!(asn.null_count(), batch.num_rows());
+                }
+                assert_eq!(rows, 3);
+            }
         }
     }
 }
