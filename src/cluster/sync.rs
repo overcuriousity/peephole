@@ -2,6 +2,7 @@
 //! vectors, pull what we lack, push what they lack, then sleep until our
 //! log grows, theirs does (long-poll), or a timer fires.
 use super::Node;
+use super::history;
 use super::identity::NodeId;
 use super::record::WireEntry;
 use super::repl::{self, Heads};
@@ -67,6 +68,12 @@ impl From<Vec<WireEntry>> for Batch {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WaitReq {
     pub heads: Heads,
+    /// Origins the caller does not take right now (purged, over quota, …).
+    #[serde(default)]
+    pub refused: Vec<NodeId>,
+    /// The caller keeps only a window and may start an origin at a floor.
+    #[serde(default)]
+    pub windowed: bool,
 }
 
 /// Run one loop per dialable member; restart on address change, stop for
@@ -182,6 +189,12 @@ async fn peer_loop(
         }
         let wait = WaitReq {
             heads: repl::heads(&node.store).await.unwrap_or_default(),
+            refused: repl::refused_origins(&node)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            windowed: node.windowed(),
         };
         let long_poll = node.call::<_, Heads>(peer, &addr, "/rpc/v1/wait", &wait);
         tokio::select! {
@@ -207,6 +220,8 @@ fn jitter(max: Duration) -> Duration {
 /// behind), so the caller must back off instead of immediately re-polling
 /// `/wait` (which answers at once while the peer is ahead) and busy-spinning.
 pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Result<bool> {
+    node.sync_rounds
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = node
         .members()
         .get(&peer)
@@ -223,7 +238,8 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         .await?;
     node.merge_heartbeats(gossip);
     // Pull what we lack, except from origins we would refuse anyway (they
-    // must not crowd out the rest).
+    // must not crowd out the rest) and what the peer cannot serve us (its
+    // history starts past ours).
     let refused = repl::refused_origins(node).await?;
     let mut stuck = false;
     loop {
@@ -232,7 +248,9 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             .iter()
             .filter(|(o, _)| !refused.contains(o))
             .map(|(o, s)| (*o, *s, ours.get(o).copied().unwrap_or(0)))
-            .filter(|(_, s, mine)| mine < s)
+            .filter(|(o, s, mine)| {
+                mine < s && history::servable(node.peer_floor(&peer, o), *mine, node.windowed())
+            })
             .map(|(o, _, mine)| (o, mine))
             .collect();
         if wants.is_empty() {
@@ -245,13 +263,16 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
                 "/rpc/v1/pull",
                 &PullReq {
                     wants,
-                    since_hlc: 0,
+                    since_hlc: node.since_hlc(),
                     max_entries: BATCH_ENTRIES,
                     max_bytes: BATCH_BYTES,
                 },
             )
             .await?;
         if batch.entries.is_empty() {
+            // Advertised but not served (e.g. a floor not gossiped yet): back
+            // off like for entries we cannot apply.
+            stuck = true;
             break;
         }
         let st = repl::apply_batch(node, batch).await?;
@@ -262,20 +283,34 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             break;
         }
     }
-    // Push what they lack.
+    // Push what they lack and can take from us.
     let mut theirs = repl::head_map(&theirs);
+    let floors = {
+        let mut conn = node.store.pool.acquire().await?;
+        history::floors(&mut conn).await?
+    };
+    let peer_windowed = node.peer_since_hlc(&peer) > 0;
     loop {
         let ours = repl::heads(&node.store).await?;
         let wants: Vec<_> = ours
             .iter()
             .map(|(o, s)| (*o, *s, theirs.get(o).copied().unwrap_or(0)))
-            .filter(|(_, s, t)| t < s)
+            .filter(|(o, s, t)| {
+                t < s && history::servable(floors.get(o).copied().unwrap_or(1), *t, peer_windowed)
+            })
             .map(|(o, _, t)| (o, t))
             .collect();
         if wants.is_empty() {
             break;
         }
-        let batch = repl::entries_after(&node.store, &wants, 0, BATCH_ENTRIES, BATCH_BYTES).await?;
+        let batch = repl::entries_after(
+            &node.store,
+            &wants,
+            node.peer_since_hlc(&peer),
+            BATCH_ENTRIES,
+            BATCH_BYTES,
+        )
+        .await?;
         if batch.entries.is_empty() {
             break;
         }

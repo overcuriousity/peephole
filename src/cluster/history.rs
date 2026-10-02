@@ -28,6 +28,32 @@ pub type Floors = HashMap<NodeId, u64>;
 /// Entries dropped per transaction, so the write lock is never held long.
 const BATCH: i64 = 500;
 
+/// Whether a node whose history of an origin starts at `floor` can serve a
+/// receiver holding it up to `receiver_head`: the entries connect, or the
+/// receiver keeps a window and may start at the floor.
+pub fn servable(floor: u64, receiver_head: u64, receiver_windowed: bool) -> bool {
+    receiver_windowed || floor <= receiver_head + 1
+}
+
+/// Whether a `/wait` from a peer is answered at once: this node holds
+/// entries the peer lacks, of an origin it has not purged, the peer does
+/// not refuse, and it can serve the peer.
+pub fn wait_ready(
+    ours: &super::repl::Heads,
+    floors: &Floors,
+    purged: &std::collections::HashSet<NodeId>,
+    req: &super::sync::WaitReq,
+) -> bool {
+    let theirs = super::repl::head_map(&req.heads);
+    ours.iter().any(|(o, head)| {
+        let t = theirs.get(o).copied().unwrap_or(0);
+        t < *head
+            && !purged.contains(o)
+            && !req.refused.contains(o)
+            && servable(floors.get(o).copied().unwrap_or(1), t, req.windowed)
+    })
+}
+
 /// Every floor above 1.
 pub async fn floors(conn: &mut SqliteConnection) -> Result<Floors> {
     let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as("SELECT origin, seq FROM repl_floors")
@@ -244,5 +270,91 @@ async fn drop_old_intel(node: &Node, origin: &NodeId, floor: u64) -> Result<()> 
             data::refresh_ip_view(&mut tx, ip).await?;
         }
         tx.commit().await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::identity::Identity;
+    use crate::cluster::sync::WaitReq;
+    use std::collections::HashSet;
+
+    #[test]
+    fn a_floor_serves_only_receivers_that_can_take_it() {
+        // Floor 5: a receiver holding 4 (or more) connects; one holding
+        // less only if it keeps a window itself.
+        assert!(servable(1, 0, false));
+        assert!(servable(5, 4, false));
+        assert!(!servable(5, 3, false));
+        assert!(servable(5, 0, true));
+    }
+
+    /// `/wait` answers early only for news it can actually deliver: not for
+    /// origins it purged, the caller refuses, or it cannot serve the caller.
+    #[test]
+    fn wait_answers_only_for_what_it_can_serve() {
+        let (a, b) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        );
+        let ours = vec![(a, 10), (b, 3)];
+        let req = |heads: Vec<(NodeId, u64)>, refused: Vec<NodeId>, windowed| WaitReq {
+            heads,
+            refused,
+            windowed,
+        };
+        let none = Floors::new();
+        let nothing = HashSet::new();
+        // Ahead on a: ready.
+        assert!(wait_ready(
+            &ours,
+            &none,
+            &nothing,
+            &req(vec![(a, 9), (b, 3)], vec![], false)
+        ));
+        // In step: not.
+        assert!(!wait_ready(
+            &ours,
+            &none,
+            &nothing,
+            &req(vec![(a, 10), (b, 3)], vec![], false)
+        ));
+        // Purged here.
+        let purged = HashSet::from([a]);
+        assert!(!wait_ready(
+            &ours,
+            &none,
+            &purged,
+            &req(vec![(b, 3)], vec![], false)
+        ));
+        // Refused by the caller.
+        assert!(!wait_ready(
+            &ours,
+            &none,
+            &nothing,
+            &req(vec![(b, 3)], vec![a], false)
+        ));
+        // Our floor for a is past what a full caller holds; a windowed one
+        // can take it.
+        let floors = Floors::from([(a, 8)]);
+        assert!(!wait_ready(
+            &ours,
+            &floors,
+            &nothing,
+            &req(vec![(b, 3)], vec![], false)
+        ));
+        assert!(wait_ready(
+            &ours,
+            &floors,
+            &nothing,
+            &req(vec![(b, 3)], vec![], true)
+        ));
+        assert!(wait_ready(
+            &ours,
+            &floors,
+            &nothing,
+            &req(vec![(a, 7), (b, 3)], vec![], false)
+        ));
     }
 }
