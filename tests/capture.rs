@@ -713,10 +713,9 @@ async fn export_weights_sum_to_the_requests_answered() {
 /// nothing is lost across several batches.
 #[tokio::test]
 async fn a_long_flood_fills_several_batches_and_loses_nothing() {
-    let (base, store, _dir) = spawn(
-        "[trap]\nrecord_rate = 0.5\nrecord_burst = 1\nsample_every = 0\nskip_log_rate = 0\n",
-    )
-    .await;
+    let (base, store, _dir) =
+        spawn("[trap]\nrecord_rate = 0.5\nrecord_burst = 1\nsample_every = 0\nskip_log_rate = 0\n")
+            .await;
     let client = reqwest::Client::new();
     let n = 2600;
     for i in 0..n {
@@ -747,4 +746,22 @@ async fn a_long_flood_fills_several_batches_and_loses_nothing() {
     let dropped = count(&store, "SELECT SUM(dropped) FROM skipped_batches").await;
     assert_eq!((full, dropped), (2, 0));
     assert_eq!(full + light, n + 1);
+}
+
+/// A PROXY header that names no client (UNKNOWN, LOCAL) on the TLS listener
+/// is dropped: otherwise the client's own X-Forwarded-For would be believed.
+#[tokio::test]
+async fn a_proxy_header_without_a_client_is_dropped() {
+    let (_p, s, store, _d, _stop) = spawn_listeners(r#""127.0.0.1/32""#).await;
+    let mut tcp = tokio::net::TcpStream::connect(s).await.unwrap();
+    tcp.write_all(b"PROXY UNKNOWN\r\n").await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("probe.test").unwrap();
+    if let Ok(mut tls) = tls_client().connect(name, tcp).await {
+        raw_request(
+            &mut tls,
+            "GET /p HTTP/1.1\r\nHost: probe.test\r\nX-Forwarded-For: 198.51.100.1\r\n\r\n",
+        )
+        .await;
+    }
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 0);
 }

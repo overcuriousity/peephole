@@ -161,8 +161,15 @@ async fn preface(
         if expect_proxy {
             loop {
                 match proxy_proto::parse_proxy(&buf) {
-                    Proxy::Done { src: s, consumed } => {
-                        src = s;
+                    // A header that names no client (UNKNOWN, LOCAL) is
+                    // refused: the peer is a proxy, and the client's own
+                    // X-Forwarded-For would be believed in its place.
+                    Proxy::Done { src: None, .. } => return None,
+                    Proxy::Done {
+                        src: Some(s),
+                        consumed,
+                    } => {
+                        src = Some(s);
                         buf.drain(..consumed);
                         break;
                     }
