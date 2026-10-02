@@ -67,6 +67,14 @@
   --sev-3: #b31c1c; --sev-3-dim: rgba(179, 28, 28, 0.14);
   --sev-4: #7a1fa2; --sev-4-dim: rgba(122, 31, 162, 0.14);
 
+  /* Label families: recon blue, injection red, impact violet, interaction
+     orange, bot grey. Post-exploitation is a solid badge (no tokens). */
+  --cat-recon: #1d4ed8;    --cat-recon-dim: rgba(29, 78, 216, 0.12);
+  --cat-inject: #b31c1c;   --cat-inject-dim: rgba(179, 28, 28, 0.12);
+  --cat-impact: #7a1fa2;   --cat-impact-dim: rgba(122, 31, 162, 0.12);
+  --cat-interact: #b04a00; --cat-interact-dim: rgba(176, 74, 0, 0.12);
+  --cat-bot: #63656c;      --cat-bot-dim: rgba(99, 101, 108, 0.14);
+
   /* Sequential ramp for the map (accent-based, not severity). */
   --ramp-0: var(--color-bg-hover);
   --ramp-1: rgba(31, 111, 139, 0.25);
@@ -112,6 +120,12 @@
     --sev-3: #ff5c5c; --sev-3-dim: rgba(255, 92, 92, 0.16);
     --sev-4: #d17dff; --sev-4-dim: rgba(209, 125, 255, 0.16);
 
+    --cat-recon: #7aa2ff;    --cat-recon-dim: rgba(122, 162, 255, 0.15);
+    --cat-inject: #ff5c5c;   --cat-inject-dim: rgba(255, 92, 92, 0.15);
+    --cat-impact: #d17dff;   --cat-impact-dim: rgba(209, 125, 255, 0.15);
+    --cat-interact: #ff9440; --cat-interact-dim: rgba(255, 148, 64, 0.15);
+    --cat-bot: #9a9eb2;      --cat-bot-dim: rgba(154, 158, 178, 0.16);
+
     --ramp-0: #1a1e2b;
     --ramp-1: rgba(79, 209, 224, 0.22);
     --ramp-2: rgba(79, 209, 224, 0.42);
@@ -151,6 +165,11 @@
   --sev-2: #ff9440; --sev-2-dim: rgba(255, 148, 64, 0.16);
   --sev-3: #ff5c5c; --sev-3-dim: rgba(255, 92, 92, 0.16);
   --sev-4: #d17dff; --sev-4-dim: rgba(209, 125, 255, 0.16);
+  --cat-recon: #7aa2ff;    --cat-recon-dim: rgba(122, 162, 255, 0.15);
+  --cat-inject: #ff5c5c;   --cat-inject-dim: rgba(255, 92, 92, 0.15);
+  --cat-impact: #d17dff;   --cat-impact-dim: rgba(209, 125, 255, 0.15);
+  --cat-interact: #ff9440; --cat-interact-dim: rgba(255, 148, 64, 0.15);
+  --cat-bot: #9a9eb2;      --cat-bot-dim: rgba(154, 158, 178, 0.16);
   --ramp-0: #1a1e2b;
   --ramp-1: rgba(79, 209, 224, 0.22);
   --ramp-2: rgba(79, 209, 224, 0.42);

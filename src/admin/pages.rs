@@ -445,6 +445,7 @@ struct RequestPage {
     chrome: Chrome,
     d: RequestDetail,
     labels: Vec<String>,
+    owasp: Vec<String>,
 }
 
 async fn request_page(
@@ -456,10 +457,12 @@ async fn request_page(
         return Err(AppError::NotFound);
     };
     let labels = serde_json::from_str(&d.row.labels_json).unwrap_or_default();
+    let owasp = serde_json::from_str(&d.row.owasp_json).unwrap_or_default();
     render(&RequestPage {
         chrome: chrome(),
         d,
         labels,
+        owasp,
     })
 }
 
