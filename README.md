@@ -223,10 +223,13 @@ systemctl status peephole                     # service status
 journalctl -u peephole -f                     # logs (incl. FIDO2 enrollment instructions)
 peephole --version                            # installed build
 peephole check-config /etc/peephole/config.toml   # validate config, rules and nmap
+peephole admin reset-token                    # new one-time admin setup token
 ```
 
 Additional FIDO2 keys can be enrolled from **Admin → Keys** while logged in;
-the one-time setup token is only needed for the very first key.
+the one-time setup token is only needed for the very first key. If it is
+lost, or every key is, `peephole admin reset-token` issues a new one (and
+voids the old).
 
 ## Building from source
 

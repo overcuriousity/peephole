@@ -52,13 +52,26 @@ pub async fn ensure_setup_token(
     if let Some(_hash) = store.intel_get("webauthn_setup_token_hash").await? {
         return Ok(None); // token already issued; console output is the only copy
     }
+    let token = issue_setup_token(store).await?;
+    println!("{}", setup_token_notice(&token));
+    Ok(Some(token))
+}
+
+/// Store the hash of a fresh one-time setup token, replacing any earlier
+/// one (unused or consumed), and return the token. A running daemon checks
+/// the stored hash on every enrollment, so it takes effect at once.
+pub async fn issue_setup_token(store: &Store) -> Result<String> {
     let token = uuid::Uuid::new_v4().to_string();
     let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(token.as_bytes()));
     store.intel_set("webauthn_setup_token_hash", &hash).await?;
-    println!(
+    Ok(token)
+}
+
+/// How a setup token is shown; install.sh finds it by this wording.
+pub fn setup_token_notice(token: &str) -> String {
+    format!(
         "\n=== peephole admin setup ===\nOpen /enroll on the admin interface and enter this one-time token:\n\n  {token}\n"
-    );
-    Ok(Some(token))
+    )
 }
 
 fn webauthn_for(cfg: &crate::config::Config) -> Result<Webauthn> {

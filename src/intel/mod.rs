@@ -222,6 +222,60 @@ const LIVE_WINDOW: Duration = Duration::from_secs(45);
 /// How often a cluster node checks whether its GeoLite2 databases are stale.
 const MAXMIND_CHECK: Duration = Duration::from_secs(3600);
 
+/// Refresh `maxmind_cluster_seen` at most this often while it holds.
+const CLUSTER_SEEN_EVERY: Duration = Duration::from_secs(600);
+
+/// Record, for the stale-intel warning, what a cluster node actually has:
+/// the fetch time of the Tor exit list version it holds (the elected
+/// fetcher's, not the time it was copied), and, on a node without its own
+/// `[maxmind]`, when a live member last offered GeoIP lookups, whose results
+/// reach this node as records.
+pub async fn note_cluster_intel(
+    node: &crate::cluster::Node,
+    data_dir: &std::path::Path,
+    own_maxmind: bool,
+    manifests: &std::collections::HashMap<String, share::Manifest>,
+) -> anyhow::Result<()> {
+    let store = &node.store;
+    if let Some(m) = manifests.get(share::TOR)
+        && let Some(at) = m.fetched_rfc3339()
+        && let Some(name) = share::file_name(share::TOR)
+        && let path = data_dir.join(name)
+        && path.exists()
+        && share::file_hash(&path)?.0 == m.sha256
+        && store.intel_get("tor_last_fetch").await?.as_deref() != Some(at.as_str())
+    {
+        store.intel_set("tor_last_fetch", &at).await?;
+    }
+    if !own_maxmind {
+        let me = node.id();
+        let offered = node.live_members(LIVE_WINDOW).into_iter().any(|id| {
+            id != me
+                && !node.is_blocked(&id)
+                && node
+                    .status
+                    .known(&id)
+                    .is_some_and(|k| k.hb.providers.iter().any(|n| n == MAXMIND))
+        });
+        let due = match store.intel_get(MAXMIND_CLUSTER_SEEN).await? {
+            Some(v) => chrono::DateTime::parse_from_rfc3339(&v).map_or(true, |t| {
+                chrono::Utc::now().signed_duration_since(t)
+                    >= chrono::Duration::from_std(CLUSTER_SEEN_EVERY).unwrap()
+            }),
+            None => true,
+        };
+        if offered && due {
+            store
+                .intel_set(MAXMIND_CLUSTER_SEEN, &chrono::Utc::now().to_rfc3339())
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// `intel_meta` key: when a member last offered GeoIP lookups to this node.
+pub const MAXMIND_CLUSTER_SEEN: &str = "maxmind_cluster_seen";
+
 fn reload(kinds: &[String], cfg: &Config, tor: &SharedTor) {
     if kinds.iter().any(|k| k == share::TOR) {
         match tor::TorExitList::load(&cfg.data_dir) {
@@ -290,6 +344,11 @@ async fn run_cluster(
         if last_maxmind.is_none_or(|t| t.elapsed() > MAXMIND_CHECK) {
             last_maxmind = Some(std::time::Instant::now());
             refresh_maxmind(&node.store, &rec, &cfg, &geo).await;
+        }
+        if let Err(e) =
+            note_cluster_intel(&node, &cfg.data_dir, cfg.maxmind.is_some(), &manifests).await
+        {
+            warn!(?e, "recording intel freshness failed");
         }
         tokio::select! {
             _ = tokio::time::sleep(INTEL_TICK) => {}
