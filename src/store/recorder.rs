@@ -327,8 +327,12 @@ impl Recorder {
         // A job for this IP is already queued or running. Rather than drop a
         // higher-severity request (which would leave the IP under-scanned until
         // the cooldown lapses), raise the level it will be scanned at.
+        // A job "running" for longer than any scan may take is dead (its
+        // arbiter is gone or never finishes it) and shields nothing.
         let max_pending: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(level) FROM scan_jobs WHERE ip_id = ? AND status IN ('queued','running')",
+            "SELECT MAX(level) FROM scan_jobs WHERE ip_id = ? AND (status = 'queued'
+               OR (status = 'running' AND started_at > datetime('now', '-5 hours')
+                   AND started_at <= datetime('now', '+10 minutes')))",
         )
         .bind(ip_id)
         .fetch_one(pool)
