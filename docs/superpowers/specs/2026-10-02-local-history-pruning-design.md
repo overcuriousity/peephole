@@ -32,12 +32,9 @@ gets the full history as long as one full member is reachable.
   node keeps records and history from the last N days; older ones are
   deleted on this node only. Minimum 7 when set (shorter windows would cut
   into replication lag and the 7-day parking window).
-- `cluster.retention_days` is removed (code, docs, tests).
-- `scan.retention_days` is no longer read. A config that still sets it
-  loads, and `check-config` and the startup summary say: "scan.retention_days
-  is no longer used; this node keeps everything unless retention_days is
-  set" (so upgraded installs that carry the installer's old `= 90` keep
-  everything from now on, as decided).
+- `cluster.retention_days` and `scan.retention_days` are removed (code,
+  `OPTIONAL_KEYS`, docs, tests). No compatibility: existing installs are
+  removed and reinstalled, so nothing reads or warns about the old keys.
 - The installer writes `retention_days = 0` with a comment; the config
   example, README, docs/operations.md and docs/cluster.md describe it.
 
@@ -94,9 +91,9 @@ most by replication delay) stay until their entry falls out of the window.
 ### 4.3 Serving and asking
 
 - `Heads` stay as they are. Floors travel in heartbeats: new
-  `#[serde(default)] floors: Vec<(NodeId, u64)>` (only origins with a
-  floor above 1) and `#[serde(default)] retention_days: u32`. Old nodes
-  ignore both (signed bytes are relayed unchanged; precedent: `own_seq`).
+  `floors: Vec<(NodeId, u64)>` (only origins with a floor above 1) and
+  `retention_days: u32`. Every node runs this version (no mixed-version
+  clusters to support).
 - A node never asks a peer for `(origin, after)` when the peer's floor is
   above `after + 1`; those wants are skipped for that peer only.
 - `/wait` answers early only for origins it can actually serve the caller
@@ -105,8 +102,8 @@ most by replication delay) stay until their entry falls out of the window.
   re-sync without pause (an existing busy loop found while mapping the
   code; fixed here).
 - An empty pull for an origin the peer advertised but cannot serve is
-  treated as `stuck` (backoff), as a safety net for peers on older
-  versions that do not send floors.
+  treated as `stuck` (backoff), as a safety net (e.g. a floor not yet
+  gossiped).
 
 ### 4.4 Receiving
 
@@ -162,3 +159,68 @@ both old settings (rewritten for `retention_days`).
 
 - Pruning other nodes' data by any remote action.
 - A minimum number of full members per cluster (shown as a warning only).
+
+## 9. Implementation notes (code map, 2026-10-02)
+
+From a read-only survey of the replication code; line numbers as of the
+commit this spec was written on.
+
+- **Heads and contiguity.** `Heads = Vec<(NodeId, u64)>` (repl.rs:28-31),
+  stored in `repl_heads` (migration 0006), read at repl.rs:66-73. Invariant
+  comment at repl.rs:4-16 ("no prefix can be dropped" — to be rewritten for
+  floors). Receive path `apply_one` (repl.rs:544-625): purged → reject;
+  `held = max(log_head, pending_head)`; `seq <= held` duplicate;
+  `seq != held+1` gap → reject (repl.rs:590-593); quota (594-600); stubs need
+  a proof (686-704); signature/prefix checks (606-619); parking
+  (`park_or_refuse`, 629-678). `bump_head` 408-418, `reset_head` 973-990.
+  Test `heads_table_matches_held_entries` (repl.rs:1201-1260) asserts heads
+  = MAX(seq) of log ∪ pending.
+- **Readers of the newest log row (why the head entry must stay).** Own next
+  seq: repl.rs:474-477, 502-505. Member standing / last sign of life:
+  members.rs:122-128, 310-313. HLC seed: mod.rs:307. Keepalive
+  `own_last_hlc`: mod.rs:450-458.
+- **Serving.** `entries_after` (repl.rs:231-331): skips purged (250); reads
+  `seq > after ORDER BY seq`; rebuilds row-backed payloads via
+  `data::rebuild` (288-300) and stops with a warn when a row is gone
+  (294-298 — deleting a row while keeping its log entry causes this);
+  enforces contiguity (304); stubs travel with proofs (313-326,
+  `held_proof` 335-361, `proves` 366-379).
+- **Sync round.** `reconcile` (sync.rs:201-281): hello, heads, gossip
+  (heartbeats, 213-216), pull loop (220-255; empty batch ends it, `stuck`
+  only when nothing applied or parked, 245-253), push loop (257-278).
+  Backoff 139-147. `peer_loop` re-runs reconcile after `/wait`
+  (175-187). `/wait` server (rpc/mod.rs:161-179) answers at once when any
+  head is above the caller's — the busy loop with purged/refused origins.
+  `refused_origins` (repl.rs:195-225): purged, over quota, full parking.
+  RPC handlers: pull rpc/mod.rs:64-76, push 78-98.
+- **Existing "stop holding" mechanisms.** Purge: block.rs:127-180
+  (`purged_origins`, migration 0018; head deliberately not reset);
+  unblock: block.rs:184-207. Tombstones: data.rs:820-841, 878-983;
+  `tombstoned` must stay forever in a cluster. Parked expiry
+  `expire_parked` repl.rs:942-970 (hourly, mod.rs:779-782) — the only place
+  heads shrink today. Quota: `origin_usage` (migration 0018), incremented in
+  `insert_log` (repl.rs:438-447), checked by `over_quota` (179-189), never
+  decremented except by purge (block.rs:159).
+- **Old retention, to remove.** `cluster.retention_days`: config.rs:182-186,
+  src/cluster/retention.rs, scheduled in `maintenance_loop`
+  (mod.rs:768-795), startup note lib.rs:79-88, docs/cluster.md:64-69,
+  deploy/config.example.toml:172, test tests/cluster_limits.rs:660-714,
+  fixtures tests/cluster.rs:125, 684, 899, 1116; tests/cluster_limits.rs:92;
+  repl.rs:1218; scan/arbiter.rs:593; scan/mod.rs:1387.
+  `scan.retention_days`: config.rs:284-287, 430-432, 442, OPTIONAL_KEYS 464;
+  gate `retention_applies` lib.rs:97-101 (test 692-699); spawn lib.rs:175-182;
+  `run_retention` lib.rs:603-639; `Recorder::prune_older_than`
+  recorder.rs:1037-1095 (keep, under the new key); docs
+  deploy/config.example.toml:102, install.sh:787, docs/operations.md:195,
+  docs/cluster.md:65-66; tests src/store/delete.rs:261, 282-338.
+- **Heartbeat.** status.rs:37-53; signed over raw CBOR body and relayed
+  unchanged (55-75, 209-216). Not stored in the DB. Precedent for added
+  fields: `providers`, `own_seq`. Admin lag view admin/cluster.rs:178-201;
+  CLI cluster/cli.rs:204-236.
+- **Naming.** "Prune"/"pruned" already means a member silent for 30 days
+  (`Standing::Pruned`, members.rs:16-70; RPC error "pruned: no sign of
+  life", rpc/mod.rs:221-223, sync.rs:153). In code and UI, call the new
+  concept "history floor" / "keeps N days", not "pruned node".
+- **Joining.** invite.rs:163-209 (join), 263 (inviter adds joiner);
+  `sync::supervise` sync.rs:66-110 runs one peer loop per dial target
+  (mod.rs:523-542), so backfill already comes from all members in parallel.
