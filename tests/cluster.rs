@@ -3327,3 +3327,38 @@ async fn unservable_history_does_not_make_peers_spin() {
         "cluster page lacks the warning"
     );
 }
+
+/// The cluster page counts what each member contributed, by data type.
+#[tokio::test]
+async fn admin_page_shows_contributions_per_node() {
+    let (ia, a) = new_node("counter-a");
+    let na = boot(ia, &a, &[], DEFAULT).await;
+    let mut o = Writer::new();
+    repl::append(&na, &[Record::MemberAdd(o.info("writer"))])
+        .await
+        .unwrap();
+    let batch = vec![
+        o.at(0, o.request("/one")),
+        o.at(0, o.request("/two")),
+        o.at(0, o.request("/three")),
+    ];
+    repl::apply_batch(&na, batch).await.unwrap();
+    let (admin, base) = admin_on(&na).await;
+    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    let section = page
+        .split("<h2>Contributions</h2>")
+        .nth(1)
+        .expect("contributions section")
+        .split("</table>")
+        .next()
+        .unwrap();
+    let row = section
+        .split("<tr>")
+        .find(|r| r.contains("<b>writer</b>"))
+        .expect("a row for the writer");
+    assert!(
+        row.contains(r#"<td class="num">3</td>"#),
+        "writer's three requests: {row}"
+    );
+    assert!(section.contains("counter-a (this node)"), "{section}");
+}

@@ -87,6 +87,18 @@
   </table></div>
 </section>
 <section class="card">
+  <div class="card-head"><h2>Contributions</h2><span class="muted">what this node holds from each member</span></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Node</th><th class="num">Requests</th><th class="num">Flood-sampled</th><th class="num">Fingerprints</th><th class="num">Claims</th><th class="num">Scans</th><th class="num">IPs looked up</th><th class="num">Log entries</th><th class="num">Log size</th></tr></thead>
+    <tbody>{% for c in contributions %}<tr>
+      <td><b>{{ c.name }}</b> <span class="mono muted">{{ c.short }}</span></td>
+      <td class="num">{{ c.requests }}</td><td class="num">{{ c.skipped }}</td><td class="num">{{ c.fingerprints }}</td><td class="num">{{ c.claims }}</td>
+      <td class="num">{{ c.scans }}</td><td class="num">{{ c.lookups }}</td><td class="num">{{ c.log_entries }}</td><td class="num">{{ c.log_size }}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  <p class="muted">Each record counts for the node that created it. Only what this node holds is counted: not deleted records, records of members it blocked{% if me.history.starts_with("keeps") %}, or history older than it keeps{% endif %}. The dataset export has the records themselves.</p>
+</section>
+<section class="card">
   <div class="card-head"><h2>Invites</h2><span class="muted">created on this node</span></div>
   <div class="banner banner-warning">Whoever holds a usable invite can join, and nobody can remove a member afterwards: other nodes can only block it for themselves. Set a use limit or an expiry when you hand an invite to more than one person.</div>
   <form method="post" action="/admin/cluster/invite" class="filters">

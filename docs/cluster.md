@@ -62,7 +62,9 @@ be listed under `[[cluster.peers]]` with their key.
   recorded removes it on every node. Deleting something another node
   recorded hides it on your node only.
 - **The dataset is persistent.** What a node contributed stays when it
-  leaves or is pruned. By default every node keeps the whole history.
+  leaves or is pruned. By default every node keeps the whole history. The
+  Cluster page counts, per member, the requests, fingerprints, scans and
+  lookups this node holds from it; the dataset export has the records.
 - **A node may keep only a window.** With `retention_days = N` (top level,
   at least 7) a node keeps the last N days, like a pruned Bitcoin node: daily
   it drops older records *and* their log entries on this node only (no
