@@ -248,3 +248,11 @@ commit this spec was written on.
   `build`.
 - `/wait` takes the caller's refused origins and whether it is windowed
   (`WaitReq.refused`, `WaitReq.windowed`).
+- **Skipping needs proof or permission.** A windowed node starts at a
+  sender's declared start only with the signed entry right before it
+  (`Batch.bounds`) older than its window, or when its own sync round finds
+  no reachable member that keeps at least its window (then the sender's
+  floor is the best there is). A start pushed to it is never enough.
+- **Own records stay until replicated.** A windowed node never drops its
+  own entries past the furthest a peer is known to hold them, so a node cut
+  off for longer than its window does not delete the only copy.
