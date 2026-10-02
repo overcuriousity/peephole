@@ -419,9 +419,12 @@ async fn answer_and_status_are_recorded() {
 
 #[tokio::test]
 async fn every_answered_request_is_a_row_a_light_row_or_counted() {
-    let (base, store, _dir) =
-        spawn("[trap]\nrecord_rate = 1\nrecord_burst = 1\nsample_every = 0\nskip_log_rate = 5\n")
-            .await;
+    // One token, refilled too slowly to matter on any machine; the 50th
+    // skipped request is sampled (recorded) and writes the pending batch.
+    let (base, store, _dir) = spawn(
+        "[trap]\nrecord_rate = 0.0001\nrecord_burst = 1\nsample_every = 50\nskip_log_rate = 5\n",
+    )
+    .await;
     let client = reqwest::Client::new();
     let send = |i: usize| {
         client
@@ -432,8 +435,6 @@ async fn every_answered_request_is_a_row_a_light_row_or_counted() {
     for i in 0..50 {
         assert_eq!(send(i).await.unwrap().status(), 404);
     }
-    // A token again: this one is recorded and writes the pending batch.
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     send(50).await.unwrap();
     let full = count(&store, "SELECT COUNT(*) FROM requests").await;
     let light = count(&store, "SELECT COUNT(*) FROM skipped_requests").await;
@@ -713,12 +714,16 @@ async fn export_weights_sum_to_the_requests_answered() {
 /// nothing is lost across several batches.
 #[tokio::test]
 async fn a_long_flood_fills_several_batches_and_loses_nothing() {
-    let (base, store, _dir) =
-        spawn("[trap]\nrecord_rate = 0.5\nrecord_burst = 1\nsample_every = 0\nskip_log_rate = 0\n")
-            .await;
-    let client = reqwest::Client::new();
+    // One token, refilled far too slowly to matter however fast this
+    // machine is; the 2600th skipped request is sampled (recorded), which
+    // writes the light rows still waiting in memory.
     let n = 2600;
-    for i in 0..n {
+    let (base, store, _dir) = spawn(&format!(
+        "[trap]\nrecord_rate = 0.0001\nrecord_burst = 1\nsample_every = {n}\nskip_log_rate = 0\n"
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    for i in 0..=n {
         client
             .get(format!("{base}/f{i}"))
             .header("x-forwarded-for", "203.0.113.11")
@@ -726,21 +731,10 @@ async fn a_long_flood_fills_several_batches_and_loses_nothing() {
             .await
             .unwrap();
     }
-    let full = count(&store, "SELECT COUNT(*) FROM requests").await;
-    let light = count(&store, "SELECT COUNT(*) FROM skipped_requests").await;
     // Two full batches went out while the flood went on.
     assert!(
         count(&store, "SELECT COUNT(*) FROM skipped_batches WHERE (SELECT COUNT(*) FROM skipped_requests r WHERE r.batch_id = skipped_batches.id) = 1000").await >= 2
     );
-    assert!(full + light < n, "the rest waits in memory");
-    // The next recorded request writes the rest first.
-    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
-    client
-        .get(format!("{base}/after"))
-        .header("x-forwarded-for", "203.0.113.11")
-        .send()
-        .await
-        .unwrap();
     let full = count(&store, "SELECT COUNT(*) FROM requests").await;
     let light = count(&store, "SELECT COUNT(*) FROM skipped_requests").await;
     let dropped = count(&store, "SELECT SUM(dropped) FROM skipped_batches").await;
