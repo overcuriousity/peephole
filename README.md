@@ -22,9 +22,12 @@ nmap.
 - **Trap** — records every request that reaches no real site, with headers
   and body, the raw request head as received, how it was answered and, over
   HTTPS, the raw TLS ClientHello and its JA4 fingerprint; and classifies it
-  against editable TOML signature rules (`sqli`, `rce`, `traversal`, scanner
-  user agents, …) into a severity 0–4. Floods are sampled, but every
-  request still leaves at least a light row (time, method, path) or a count.
+  against editable TOML signature rules — sixteen families from `sqli`,
+  `rce` and path traversal to SSRF, webshells, deserialization and
+  AI-infrastructure probes, each tagged with its OWASP reference (Top 10
+  2021 class or Automated Threat) — into a severity 0–4. Floods are
+  sampled, but every request still leaves at least a light row (time,
+  method, path) or a count.
 - **Enrichment** — MaxMind GeoLite2 country and ASN, the Tor exit list, and
   optionally AbuseIPDB, Shodan, Shodan InternetDB and GreyNoise, each within
   its own rate budget, refreshed when an IP returns.

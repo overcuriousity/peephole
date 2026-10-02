@@ -48,7 +48,7 @@ impl Origin {
     }
 
     fn request(&self, name: &str) -> Record {
-        Record::Request(RequestRec {
+        Record::Request(Box::new(RequestRec {
             uid: self.uid(name),
             ts: "2026-10-01 00:00:00".into(),
             ip: "203.0.113.20".into(),
@@ -58,7 +58,7 @@ impl Origin {
             labels_json: "[]".into(),
             severity: 1,
             ..Default::default()
-        })
+        }))
     }
 
     fn describe(&self, name: &str) -> Record {

@@ -1,0 +1,48 @@
+# AI infrastructure and the Model Context Protocol — conservative by design:
+# paths and wire methods only. No prompt-injection content matching, and no
+# AI-crawler User-Agents (those belong to the verified-crawler module).
+# Probing what a server runs is recon (weight 2, OAT-004); speaking MCP to
+# it is interaction (weight 3); driving its tools at files or internal
+# addresses is exploitation (weight 4, A01:2021).
+
+[[rule]]
+label = "ai-infra-probe"
+weight = 2
+owasp = ["OAT-004"]
+# LLM serving APIs: OpenAI-compatible /v1/*, Ollama /api/*. Anchored at the
+# root. /api/tags also names a blog taxonomy endpoint — accepted as the
+# family's one naming-collision risk (a wrong label, nothing more).
+target_regex = '''^/v1/(models|chat/completions|completions|embeddings|moderations|images|audio|responses|messages)(/|\?|$)|^/api/(tags|generate|chat|show|ps|version|embeddings|embed|pull|create|delete|copy|blobs)(/|\?|$)|^/(ollama|openai)(/|\?|$)|^/\.well-known/ai-plugin\.json'''
+
+[[rule]]
+label = "ai-infra-probe"
+weight = 2
+owasp = ["OAT-004"]
+# Notebooks, UIs and MLOps: Jupyter, Gradio, MLflow, LiteLLM-style proxies,
+# Open WebUI, Flowise, Dify, n8n.
+target_regex = '''^/(tree|notebooks|terminals|lab|hub)(/|\?|$)|^/api/(terminals|kernels|sessions|contents|kernelspecs)(/|\?|$)|/gradio_api(/|\?|$)|/queue/join|^/api/2\.0/(mlflow|preview)/|/(litellm|one-api|new-api)(/|\?|$)|^/api/v1/(auths|chatflows|assistants)(/|\?|$)|^/console/api/|^/rest/(workflows|credentials)(/|\?|$)'''
+
+[[rule]]
+label = "ai-infra-probe"
+weight = 2
+owasp = ["OAT-004"]
+# Vector databases (Chroma, Qdrant, Weaviate) and model artifacts.
+target_regex = '''^/api/v[12]/(collections|heartbeat|tenants|databases)(/|\?|$)|^/collections(/|\?|$)|^/(v1/)?(schema|objects|meta)(/|\?|$)|\.(gguf|safetensors|ckpt|onnx|tflite|pth|h5|pkl)(\?|$)|/(pytorch_model|model)\.(json|safetensors|pkl)(\?|$)'''
+
+[[rule]]
+label = "mcp-probe"
+weight = 3
+owasp = ["OAT-004"]
+# MCP endpoint discovery and the JSON-RPC methods an MCP client speaks.
+# tools/list enumerates what the server offers.
+target_regex = '''^/(mcp|sse|messages)(/|\?|$)|^/\.well-known/mcp(/|\?|$)'''
+body_regex = '''"method"\s*:\s*"(initialize|notifications/initialized|tools/list|tools/call|resources/list|resources/read|prompts/list|prompts/get|ping)"'''
+
+[[rule]]
+label = "mcp-abuse"
+weight = 4
+owasp = ["A01:2021"]
+# MCP tool/resource abuse: reading files or internal addresses through the
+# server — resources/read with a file:// URI, tool calls aimed at loopback
+# or the cloud metadata address.
+body_regex = '''"(resources/read|tools/call)"[^}]{0,4096}(file://|127\.0\.0\.1|localhost|169\.254\.)|"(uri|url|path|file|filename)"\s*:\s*"(file://|/etc/|/proc/|\.\./)'''

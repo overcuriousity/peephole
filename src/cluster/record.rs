@@ -74,6 +74,11 @@ pub struct RequestRec {
     /// left out when unset, like every field added later.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub build: String,
+    /// OWASP tags of the hit rules, as a JSON array; absent for records
+    /// written before the field existed and for requests with no tags
+    /// (both stored as `[]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owasp_json: Option<String>,
 }
 
 /// One request the flood gate answered without recording it in full.
@@ -253,7 +258,7 @@ pub enum Record {
     MemberRevoke {
         id: NodeId,
     },
-    Request(RequestRec),
+    Request(Box<RequestRec>),
     IpIntel(IpIntelRec),
     FpClaim(FpClaimRec),
     Fingerprint(FingerprintRec),
@@ -410,7 +415,7 @@ mod tests {
     fn an_unset_build_is_left_out_of_the_encoding() {
         let enc = |r: &Record| crate::cluster::rpc::cbor::encode(r).unwrap();
         let has_build = |b: Vec<u8>| b.windows(5).any(|w| w == b"build");
-        assert!(!has_build(enc(&Record::Request(RequestRec::default()))));
+        assert!(!has_build(enc(&Record::Request(Box::default()))));
         let skip = SkipBatchRec {
             uid: "u".into(),
             ip: "203.0.113.1".into(),
@@ -424,6 +429,34 @@ mod tests {
             ..skip
         };
         assert!(has_build(enc(&Record::SkipBatch(set))));
+    }
+
+    #[test]
+    fn a_request_record_without_owasp_rebuilds_byte_for_byte() {
+        let rec = Record::Request(Box::new(RequestRec {
+            uid: "u".into(),
+            ts: "2026-10-02 00:00:00".into(),
+            ip: "198.51.100.1".into(),
+            method: "GET".into(),
+            path: "/".into(),
+            query: None,
+            headers_json: "[]".into(),
+            body: None,
+            labels_json: "[]".into(),
+            severity: 0,
+            scan_level: 0,
+            is_fp_claim: false,
+            page_token: None,
+            ..Default::default()
+        }));
+        let bytes = super::super::rpc::cbor::encode(&rec).unwrap();
+        assert!(
+            !bytes.windows(10).any(|w| w == b"owasp_json"),
+            "None must be left out of the encoding"
+        );
+        let back: Record = super::super::rpc::cbor::decode(&bytes).unwrap();
+        assert_eq!(back, rec);
+        assert_eq!(super::super::rpc::cbor::encode(&back).unwrap(), bytes);
     }
 
     fn info(id: NodeId) -> MemberInfo {

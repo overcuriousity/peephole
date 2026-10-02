@@ -458,6 +458,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
             severity: 0,
             scan_level: 0,
             labels: vec!["fp-claim".into()],
+            owasp: vec![],
         }
     } else {
         let history = state
@@ -483,6 +484,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 headers_json: serde_json::to_string(c.raw_headers)?,
                 body: c.body,
                 labels_json: serde_json::to_string(&verdict.labels)?,
+                owasp_json: Some(serde_json::to_string(&verdict.owasp)?),
                 severity: verdict.severity as i64,
                 scan_level: verdict.scan_level as i64,
                 is_fp_claim: c.is_fp_claim,

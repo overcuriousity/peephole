@@ -1,0 +1,39 @@
+# Injection families beyond SQLi and XSS (all A03:2021). Weight 4 for clear
+# payloads, 3 for the CRLF probe (it needs an application bug to become an
+# exploit).
+
+[[rule]]
+label = "ssti"
+weight = 4
+owasp = ["A03:2021"]
+# Server-side template injection: arithmetic or object walks inside the
+# markers of the major engines — Jinja2/Twig {{ }}, FreeMarker/Mako ${ },
+# Spring/EL #{ }, ERB <%= %>. ${…} overlaps the Log4Shell rules on purpose;
+# both labels firing is correct.
+target_regex = '''\{\{[^}]{0,64}(\*|\bconfig\b|\bself\b|__|\brequest\b|cycler|joiner|namespace|lipsum)|\$\{\s*[0-9]+\s*[*+\-/]|#\{\s*[0-9]+\s*[*+\-/]|<%=\s*[0-9]+\s*[*+\-/]'''
+body_regex = '''\{\{[^}]{0,64}(\*|\bconfig\b|\bself\b|__|\brequest\b|cycler|joiner|namespace|lipsum)|\$\{\s*[0-9]+\s*[*+\-/]|#\{\s*[0-9]+\s*[*+\-/]|<%=\s*[0-9]+\s*[*+\-/]'''
+
+[[rule]]
+label = "nosqli"
+weight = 4
+owasp = ["A03:2021"]
+# MongoDB-style operator injection: ?user[$ne]=1 in a query string, and
+# {"$gt": …} / $where in JSON bodies.
+target_regex = '''\[\$(ne|eq|gte?|lte?|in|nin|regex|where|exists|or|and|not)\]\s*=|\$(where|regex)\s*[=:]'''
+body_regex = '''["']?\$(ne|eq|gte?|lte?|in|nin|regex|where|exists)["']?\s*:|\$where\s*[:=]|\|\|\s*1\s*==\s*1'''
+
+[[rule]]
+label = "xxe"
+weight = 4
+owasp = ["A03:2021"]
+# XML external entities: a DOCTYPE declaring entities, SYSTEM/PUBLIC
+# identifiers pointing at files or URLs, parameter entities.
+body_regex = '''<!doctype[^>]{0,512}\[|<!entity[^>]{0,512}(system|public)|\b(system|public)\s+["'](file|php|expect|https?|ftp):'''
+
+[[rule]]
+label = "crlf-injection"
+weight = 3
+owasp = ["A03:2021"]
+# Encoded or literal CR/LF in the request target: response splitting and
+# log-injection probes. %0a alone counts too — it has no place in a URL.
+target_regex = "%0d%0a|%0a%0d|%0d|%0a|\\r\\n"

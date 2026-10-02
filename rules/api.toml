@@ -1,0 +1,18 @@
+# API discovery (OAT-004). Asking what the API looks like is recon (weight
+# 2); pulling the GraphQL schema is interaction that maps every type and
+# field (weight 3).
+
+[[rule]]
+label = "api-recon"
+weight = 2
+owasp = ["OAT-004"]
+# Schema and documentation endpoints: GraphQL, Swagger/OpenAPI, the common
+# documentation UIs.
+target_regex = '''/graphql(/|\?|$)|/(swagger|openapi)[^/\s]{0,32}\.(json|ya?ml)|/(swagger-ui|api-docs|v[23]/api-docs|redoc|rapidoc|graphql-playground|graphiql|altair)(/|\?|$)'''
+
+[[rule]]
+label = "graphql-introspection"
+weight = 3
+owasp = ["OAT-004"]
+target_regex = '''__schema|__type\b|IntrospectionQuery|query\s*[=:]?\s*\{\s*__'''
+body_regex = '''__schema|__type\b|IntrospectionQuery'''

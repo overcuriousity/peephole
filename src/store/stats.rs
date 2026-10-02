@@ -92,6 +92,7 @@ pub struct RecentRequest {
     pub path: String,
     pub severity: i64,
     pub labels: Vec<String>,
+    pub owasp: Vec<String>,
     pub country: Option<String>,
     pub is_tor: bool,
 }
@@ -156,6 +157,7 @@ type RecentTuple = (
     String,
     String,
     i64,
+    String,
     String,
     Option<String>,
     bool,
@@ -373,8 +375,8 @@ impl Store {
         .fetch_all(&self.read)
         .await?;
         let sql = format!(
-            "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, i.country,
-                    i.is_tor_exit
+            "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, r.owasp_json,
+                    i.country, i.is_tor_exit
              FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w}
              ORDER BY r.id DESC LIMIT 50"
         );
@@ -387,16 +389,19 @@ impl Store {
         let recent = recent_rows
             .into_iter()
             .map(
-                |(id, ts, ip, method, path, severity, labels, country, is_tor)| RecentRequest {
-                    id,
-                    ts,
-                    ip,
-                    method,
-                    path,
-                    severity,
-                    labels: serde_json::from_str(&labels).unwrap_or_default(),
-                    country,
-                    is_tor,
+                |(id, ts, ip, method, path, severity, labels, owasp, country, is_tor)| {
+                    RecentRequest {
+                        id,
+                        ts,
+                        ip,
+                        method,
+                        path,
+                        severity,
+                        labels: serde_json::from_str(&labels).unwrap_or_default(),
+                        owasp: serde_json::from_str(&owasp).unwrap_or_default(),
+                        country,
+                        is_tor,
+                    }
                 },
             )
             .collect();
@@ -768,6 +773,7 @@ mod tests {
             headers_json: "[]".into(),
             body: None,
             labels_json: r#"["sensitive-path"]"#.into(),
+            owasp_json: Some(r#"["OAT-018"]"#.into()),
             severity: sev,
             scan_level: 1,
             is_fp_claim: false,
@@ -825,6 +831,7 @@ mod tests {
         assert_eq!(h24.top_labels[0].count, 3);
         assert_eq!(h24.recent.len(), 3);
         assert_eq!(h24.recent[0].labels, vec!["sensitive-path".to_string()]);
+        assert_eq!(h24.recent[0].owasp, vec!["OAT-018".to_string()]);
         let d7 = s.stats(Range::D7).await.unwrap();
         assert_eq!(d7.total_requests, 4);
         assert!(d7.timeline.iter().map(|b| b.count).sum::<i64>() == 4);

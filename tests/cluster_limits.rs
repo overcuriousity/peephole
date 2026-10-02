@@ -136,7 +136,7 @@ fn job(o: &Origin, uid: &str, ip: &str, level: i64) -> Record {
 }
 
 fn request(o: &Origin, uid: &str) -> Record {
-    Record::Request(RequestRec {
+    Record::Request(Box::new(RequestRec {
         uid: o.uid(uid),
         ts: "2026-10-01 00:00:00".into(),
         ip: "203.0.113.20".into(),
@@ -151,7 +151,7 @@ fn request(o: &Origin, uid: &str) -> Record {
         is_fp_claim: false,
         page_token: None,
         ..Default::default()
-    })
+    }))
 }
 
 async fn arbiter_of(n: &Node, uid: &str) -> Option<Vec<u8>> {
