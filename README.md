@@ -20,8 +20,11 @@ nmap.
 ## Features
 
 - **Trap** — records every request that reaches no real site, with headers
-  and body, and classifies it against editable TOML signature rules
-  (`sqli`, `rce`, `traversal`, scanner user agents, …) into a severity 0–4.
+  and body, the raw request head as received, how it was answered and, over
+  HTTPS, the raw TLS ClientHello and its JA4 fingerprint; and classifies it
+  against editable TOML signature rules (`sqli`, `rce`, `traversal`, scanner
+  user agents, …) into a severity 0–4. Floods are sampled, but every
+  request still leaves at least a light row (time, method, path) or a count.
 - **Enrichment** — MaxMind GeoLite2 country and ASN, the Tor exit list, and
   optionally AbuseIPDB, Shodan, Shodan InternetDB and GreyNoise, each within
   its own rate budget, refreshed when an IP returns.
@@ -38,7 +41,10 @@ nmap.
 - **Admin area** (FIDO2 security keys only, no passwords) — request search
   and inspection, per-IP pages with every enrichment result and counter-scan,
   the live scan queue, browser-fingerprint correlation across IPs, the
-  false-positive inbox, exports (CSV, Timesketch JSONL, Parquet) and deletion.
+  false-positive inbox, deletion, and the dataset export: every request with
+  everything known about it and its IP (enrichment history, scans,
+  fingerprints) as typed Parquet, CSV or Timesketch JSONL, optionally
+  without the results whose terms forbid passing them on.
 - **Cluster** — several operators can share one dataset over mutual TLS:
   requests, the scan queue, results and lookups. Each node runs any mix of
   trap, scanner and web roles and decides for itself whom it trusts. See
@@ -71,12 +77,17 @@ building from source and releases — are in
 ## How it fits
 
 ```
-internet ──► nginx / HAProxy ──► (real sites)
+internet ──► nginx ──────────► (real sites)
                 │
-                ├─ no matching site ──► peephole trap      127.0.0.1:8080
-                └─ admin domain (TLS) ─► peephole web      127.0.0.1:8443
+                ├─ :80, no matching site ──► peephole trap      127.0.0.1:8080
+                ├─ :443, any other name ──► peephole trap TLS  127.0.0.1:8081
+                │   (passed through untouched, PROXY protocol header)
+                └─ :443, admin domain ────► nginx TLS ──► peephole web 127.0.0.1:8443
                                          peephole scanner ──► nmap ──► the source
 ```
+
+On port 443 nginx routes by server name without decrypting, so the trap
+terminates TLS itself and keeps the raw ClientHello and its JA4 fingerprint.
 
 Configuration lives in `/etc/peephole/config.toml`
 ([annotated reference](deploy/config.example.toml)); signature rules are TOML

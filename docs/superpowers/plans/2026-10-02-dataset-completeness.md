@@ -16,7 +16,7 @@
 - Timestamps stored as UTC `YYYY-MM-DD HH:MM:SS`; skipped rows store `ts_ms` (i64 Unix ms).
 - Raw head cap 64 KiB; ClientHello cap 16 KiB / 10 s; light-row path cut at 1 KiB; batch flush at 10 s or 1000 rows; `trap.skip_log_rate` default 100.
 - Default `trap_tls_listen` in installer/examples: `127.0.0.1:8081`; nginx admin TLS server moves to `127.0.0.1:8444`.
-- HAProxy is mentioned nowhere (docs, comments, config examples).
+- No proxy product other than nginx is named (docs, comments, config examples).
 - Claim e-mails and claim text are never exported.
 - Next migration number: `0022`.
 - Before every commit: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test` for the touched tests.
@@ -466,8 +466,8 @@ Delete the tests of the removed intel export; `GET /admin/export/intel` now 404s
 **Files:**
 - Modify: `install.sh` (`nginx_example` → two outputs: http sites and the stream config; nginx setup installs `libnginx-mod-stream` when `apt-cache show` has it, writes `/etc/nginx/peephole-stream.conf`, appends `include /etc/nginx/peephole-stream.conf;` to `/etc/nginx/nginx.conf` once (grep -q first), sets `trap_tls_listen = "127.0.0.1:8081"` for local-proxy nodes and `0.0.0.0:443`-style direct listening only when the operator says there is no proxy)
 - Modify: `deploy/nginx.example.conf` (regenerated), new `deploy/nginx-stream.example.conf`
-- Modify: `deploy/config.example.toml` (TLS listener keys; drop HAProxy wording)
-- Modify: `README.md` ("How it fits" diagram: `internet ──► reverse proxy (nginx)`; feature bullet for JA4/raw heads/light rows/export), `docs/operations.md` (stream setup, manual steps, remove HAProxy paragraph → "Behind any other reverse proxy: forward unknown TLS names untouched to `trap_tls_listen` with the PROXY protocol, and list it in `trusted_proxies`"), `src/trap/mod.rs:165,779` comments (say "a proxy that appends")
+- Modify: `deploy/config.example.toml` (TLS listener keys; drop the other proxy product's name)
+- Modify: `README.md` ("How it fits" diagram: `internet ──► reverse proxy (nginx)`; feature bullet for JA4/raw heads/light rows/export), `docs/operations.md` (stream setup, manual steps, replace the other-proxy paragraph → "Behind any other reverse proxy: forward unknown TLS names untouched to `trap_tls_listen` with the PROXY protocol, and list it in `trusted_proxies`"), `src/trap/mod.rs:165,779` comments (say "a proxy that appends")
 - Test: `tests/deploy-check.sh` (example equality), `tests/install-smoke.sh` (nginx -t with stream)
 
 Stream config (listener+web node):
@@ -497,7 +497,7 @@ Admin server block: `listen 127.0.0.1:8444 ssl proxy_protocol; http2 on;` (with 
 - [ ] **Step 1:** Update `tests/deploy-check.sh` expectations first (stream example equals `install.sh --nginx-stream-example` output) → fails.
 - [ ] **Step 2:** Implement installer and examples; `shellcheck install.sh` (via the container per memory `installer-smoke-local`).
 - [ ] **Step 3:** Run `tests/deploy-check.sh` and the podman smoke test (`tests/install-smoke.sh`, ubuntu:26.04) → `nginx -t` passes with the stream module.
-- [ ] **Step 4:** `grep -rni haproxy --exclude-dir=target --exclude-dir=superpowers .` → no hits.
+- [ ] **Step 4:** the product-name grep over the repo (outside target/ and older design docs) → no hits.
 - [ ] **Step 5: Commit** `feat(install): pass TLS through to the trap; docs`.
 
 ---

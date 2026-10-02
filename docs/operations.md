@@ -57,12 +57,40 @@ The generated example has:
 - a TLS server block for the admin area (the live scan queue needs
   `proxy_buffering off` on `/admin/api/queue`, which the example sets;
   `/login` and `/enroll` are rate limited);
-- a 443 `default_server` that refuses TLS for every other name
-  (`ssl_reject_handshake`, nginx ≥ 1.19.4), so the admin certificate is never
-  shown to scanners (the example shows how to trap HTTPS instead);
 - a catch-all `default_server` on port 80 that sends everything no real site
   claims to the trap. It sets `X-Forwarded-For` to the real peer address, so a
   client cannot spoof it.
+
+With a trap on the machine, a second file, `nginx-stream.example.conf`,
+takes port 443 at the TCP level (nginx's `stream` module, `ssl_preread`):
+
+- the admin domain goes to nginx's own TLS server for the admin area, now on
+  `127.0.0.1:8444` with `proxy_protocol` (the client address is restored
+  with `real_ip_header proxy_protocol`);
+- every other name, and connections without one, go untouched to the trap's
+  TLS listener (`trap_tls_listen`, `127.0.0.1:8081`) with a PROXY protocol
+  header. peephole terminates TLS itself (a self-signed certificate unless
+  `trap_tls_cert`/`trap_tls_key` are set; scanners do not check it), so it
+  keeps the raw ClientHello and its JA4 fingerprint, and the admin
+  certificate is never shown to scanners.
+
+The stream config belongs in nginx's main context, outside `http {}`: the
+installer writes it to `/etc/nginx/peephole-stream.conf` and adds an
+`include` line for it to `/etc/nginx/nginx.conf`. It needs the stream module
+(Debian/Ubuntu: `libnginx-mod-stream`, installed with the automatic setup).
+Without a trap, port 443 stays a plain TLS server that refuses unknown names
+(`ssl_reject_handshake`, nginx ≥ 1.19.4).
+
+Both trap listeners answer one request per HTTP/1 connection and keep the
+request head as received (header case and order). Behind nginx on port 80
+that head is nginx's rewrite; on port 443 it is the client's.
+
+Installs from before the TLS listener keep their config on upgrade, and so
+the old 443 setup. To trap HTTPS there, add `trap_tls_listen =
+"127.0.0.1:8081"` to `/etc/peephole/config.toml`, generate the two examples
+(`PEEPHOLE_ROLES=… PEEPHOLE_DOMAIN=… bash install.sh --nginx-example` and
+`--nginx-stream-example`), put them in place as in the manual steps below and
+restart peephole.
 
 **Automatic setup** (opt-in: answer yes, or `PEEPHOLE_NGINX=1`). Offered for
 the web role and for a trap behind a proxy on the same machine. After
@@ -70,12 +98,12 @@ peephole is up, the installer installs nginx (and certbot with the web
 role), gets a Let's Encrypt certificate for the admin domain (its DNS must
 point at the machine and port 80 must be reachable; `PEEPHOLE_ACME_EMAIL`
 sets the contact address), disables the distribution's default site (only
-if it is the stock link), enables `/etc/nginx/sites-available/peephole`,
-checks it with `nginx -t` and reloads. On a machine without IPv6 the `[::]`
+if it is the stock link), enables `/etc/nginx/sites-available/peephole` and,
+with a trap, the stream config, checks it with `nginx -t` and reloads. On a machine without IPv6 the `[::]`
 listeners are left out. If a step fails, the installer puts back what it
 changed and prints the manual steps; the peephole install itself still
-succeeds. An existing `/etc/nginx/sites-available/peephole` is never
-overwritten. Certificates renew through certbot's systemd timer.
+succeeds. An existing `/etc/nginx/sites-available/peephole` or
+`/etc/nginx/peephole-stream.conf` is never overwritten. Certificates renew through certbot's systemd timer.
 
 **Manual setup**, in the order that works on a stock Debian/Ubuntu nginx:
 
@@ -84,12 +112,18 @@ certbot certonly --nginx -d peephole.example.net   # while the default site stil
 rm /etc/nginx/sites-enabled/default                # it also claims default_server
 cp /etc/peephole/nginx.example.conf /etc/nginx/sites-available/peephole
 ln -s ../sites-available/peephole /etc/nginx/sites-enabled/peephole
+apt-get install libnginx-mod-stream                # with a trap: the stream module
+cp /etc/peephole/nginx-stream.example.conf /etc/nginx/peephole-stream.conf
+echo 'include /etc/nginx/peephole-stream.conf;' >> /etc/nginx/nginx.conf
 nginx -t && systemctl reload nginx
 ```
 
-With HAProxy in front instead, route its fallback backend to the trap
-listener and list the proxy in `trusted_proxies`. Behind any proxy, set
-`X-Forwarded-For` to the peer address in the admin site's locations: the
+Behind any other reverse proxy: send plain HTTP that matches no real site to
+`trap_listen` with `X-Forwarded-For` set to the peer address, forward TLS for
+unknown names untouched (TCP) to `trap_tls_listen` with a PROXY protocol
+header (v1 or v2), and list the proxy in `trusted_proxies`. A trusted peer
+that connects to `trap_tls_listen` without a PROXY header is dropped. In the
+admin site's locations, set `X-Forwarded-For` to the peer address: the
 per-client rate limits key on it and are off without it.
 
 ## Upgrades

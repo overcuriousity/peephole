@@ -124,7 +124,7 @@ The `ssl_reject_handshake` default server and the commented "self-signed
 trap on 443" alternative are removed: unknown names now reach the trap.
 
 Docs (README, `docs/operations.md`, `deploy/config.example.toml`, code
-comments) describe nginx or "a reverse proxy"; HAProxy is mentioned nowhere.
+comments) describe nginx or "a reverse proxy"; no other proxy product is named.
 
 ## 5. Export
 

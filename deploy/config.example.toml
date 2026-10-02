@@ -7,8 +7,15 @@
 # scanner  = true   # nmap counter-scans (needs nmap)
 # web      = true   # wall of shame + admin area (needs admin_listen, [webauthn])
 
-# Trap listener: HAProxy routes fallback (nonexistent-route) traffic here directly.
+# Trap listener: your reverse proxy sends requests that match no real site here.
 trap_listen = "0.0.0.0:8080"
+# Optional TLS trap listener: peephole terminates TLS itself and keeps the
+# handshake (raw ClientHello, JA4). The proxy forwards TLS for unknown names
+# untouched (nginx: stream + ssl_preread); a peer in trusted_proxies must
+# start each connection with a PROXY protocol header (v1 or v2).
+# trap_tls_listen = "127.0.0.1:8081"
+# trap_tls_cert = "/etc/peephole/trap.crt"   # PEM; without cert and key a
+# trap_tls_key  = "/etc/peephole/trap.key"   # self-signed one is made at start
 # Admin listener: nginx terminates TLS in front of this.
 admin_listen = "127.0.0.1:8443"
 

@@ -206,8 +206,8 @@ fn parse_xff_entry(s: &str) -> Option<IpAddr> {
 /// header right-to-left, stepping over each hop that is itself trusted; the
 /// first address that is not a trusted proxy is the real client. Taking the
 /// first (leftmost) entry, or a single fixed position, lets a client forge its
-/// address — HAProxy's `option forwardfor` appends rather than replaces, so a
-/// client-supplied entry survives. Addresses are canonicalised so an
+/// address — a proxy that appends rather than replaces keeps a
+/// client-supplied entry. Addresses are canonicalised so an
 /// IPv4-mapped IPv6 hop matches IPv4 trust CIDRs. All `x-forwarded-for` header
 /// lines are considered, newest last, and values are parsed from raw bytes so
 /// a non-ASCII byte cannot blank the header and pin everything on the proxy.
@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn multiple_header_lines_are_joined_newest_last() {
-        // HAProxy/nginx may emit several XFF lines; the last entry overall wins.
+        // A proxy may emit several XFF lines; the last entry overall wins.
         let ip = client_ip(
             &hm(&["9.9.9.9", "203.0.113.42"]),
             "10.0.0.1".parse().unwrap(),
