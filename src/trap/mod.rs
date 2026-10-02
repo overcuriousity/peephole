@@ -216,7 +216,11 @@ async fn record_and_respond(
             labels: vec!["fp-claim".into()],
         }
     } else {
-        let history = state.store.ip_history(ip_row.id).await.unwrap_or_default();
+        let history = state
+            .store
+            .ip_history(&ip_row.ip, view.path)
+            .await
+            .unwrap_or_default();
         state
             .classifier
             .classify(view, &history, &BotTells::default())
@@ -308,6 +312,7 @@ async fn trap_handler(
         query: uri.query(),
         headers: header_pairs(&headers),
         body: if body.is_empty() { None } else { Some(&body) },
+        proxy_target: None,
     };
     let stored_body = if body.is_empty() {
         None
@@ -360,6 +365,7 @@ async fn claim_handler(
         query: None,
         headers: raw.clone(),
         body: None,
+        proxy_target: None,
     };
     if let Ok(rec) = record_and_respond(&state, ip, &view, &raw, None, true).await {
         let email = form.email.filter(|e| !e.trim().is_empty());

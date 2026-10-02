@@ -168,24 +168,26 @@ impl Store {
         Ok(())
     }
 
-    pub async fn ip_history(&self, ip_id: i64) -> anyhow::Result<crate::classify::IpHistory> {
-        let (paths, reqs): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(DISTINCT path), COUNT(*) FROM requests
-             WHERE ip_id = ? AND ts > datetime('now','-1 hour')",
+    /// What `ip` did in the last hour, counting the request to `path` that
+    /// is being classified (it is stored with its verdict, so afterwards).
+    /// The IP need not have a row yet.
+    pub async fn ip_history(
+        &self,
+        ip: &str,
+        path: &str,
+    ) -> anyhow::Result<crate::classify::IpHistory> {
+        let (paths, reqs, seen): (i64, i64, bool) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT r.path), COUNT(*), COALESCE(MAX(r.path = ?2), 0)
+             FROM requests r JOIN ips i ON i.id = r.ip_id
+             WHERE i.ip = ?1 AND r.ts > datetime('now','-1 hour')",
         )
-        .bind(ip_id)
+        .bind(ip)
+        .bind(path)
         .fetch_one(&self.pool)
         .await?;
-        let last_level: Option<i64> = sqlx::query_scalar(
-            "SELECT level FROM scans WHERE ip_id = ? ORDER BY finished_at DESC LIMIT 1",
-        )
-        .bind(ip_id)
-        .fetch_optional(&self.pool)
-        .await?;
         Ok(crate::classify::IpHistory {
-            distinct_paths_1h: paths as u32,
-            requests_1h: reqs as u32,
-            last_scan_level: last_level.unwrap_or(0) as u8,
+            distinct_paths_1h: (paths + i64::from(!seen)) as u32,
+            requests_1h: (reqs + 1) as u32,
         })
     }
 }
