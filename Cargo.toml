@@ -2,6 +2,8 @@
 name = "peephole"
 version = "0.1.0"
 edition = "2024"
+# Oldest toolchain that builds this crate (sqlx 0.9 needs 1.94); CI checks it.
+rust-version = "1.94"
 build = "build.rs"
 
 [lib]
@@ -14,7 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-arc-swap = "1.9.2"
 arrow = "60"
 askama = "0.16"
 aws-lc-rs = "1"
@@ -30,7 +31,8 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "http1", "http2", "tokio", "service"] }
 ipnet = { version = "2", features = ["serde"] }
 maxminddb = "0.32"
-parquet = "60"
+# Only the Arrow writer/reader; the export is uncompressed, so no codecs.
+parquet = { version = "60", default-features = false, features = ["arrow"] }
 quick-xml = "0.42"
 rand = "0.10"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
@@ -61,7 +63,13 @@ zstd = "0.14"
 
 [dev-dependencies]
 bytes = "1"
-serde_urlencoded = "0.7"
 tempfile = "3"
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
 webauthn-rs-proto = "0.5"
+
+[profile.release]
+# Smaller, faster release binary. panic stays "unwind": a panicking request
+# task must not take the whole daemon down.
+lto = "thin"
+codegen-units = 1
+strip = true
