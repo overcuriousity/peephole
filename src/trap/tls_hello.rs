@@ -406,6 +406,28 @@ mod tests {
         assert!(ja4(&h).ends_with(&sha12("000a")));
     }
 
+    /// Real ClientHellos against the JA4 Wireshark computes for them
+    /// (tests/fixtures/ja4/README.md).
+    #[test]
+    fn ja4_matches_wireshark_on_real_hellos() {
+        for (raw, expected) in [
+            (
+                &include_bytes!("../../tests/fixtures/ja4/curl-tls13.bin")[..],
+                "t13d3013h2_1d37bd780c83_8537cf56674e",
+            ),
+            (
+                &include_bytes!("../../tests/fixtures/ja4/openssl-tls12.bin")[..],
+                "t12i2708h1_a2460661a67a_36cef8aed422",
+            ),
+        ] {
+            let Hello::Done { hello, consumed } = parse_client_hello(raw) else {
+                panic!("not parsed")
+            };
+            assert_eq!(consumed, raw.len());
+            assert_eq!(ja4(&hello), expected);
+        }
+    }
+
     #[test]
     fn mutations_never_panic() {
         let raw = build_hello();
