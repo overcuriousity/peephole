@@ -255,6 +255,29 @@ mod tests {
         assert!(!s.delete_claim(cid).await.unwrap());
     }
 
+    /// Retention finds old light-row batches by index, standalone and per
+    /// origin, not by scanning the table.
+    #[tokio::test]
+    async fn retention_of_light_rows_uses_an_index() {
+        let (s, _a, _b) = seeded().await;
+        for sql in [
+            "EXPLAIN QUERY PLAN SELECT uid FROM skipped_batches
+             WHERE last_ms < 5 ORDER BY last_ms LIMIT 10",
+            "EXPLAIN QUERY PLAN SELECT uid FROM skipped_batches WHERE origin = x'00'
+             AND last_ms < 5 AND uid IS NOT NULL ORDER BY last_ms LIMIT 10",
+        ] {
+            let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .fetch_all(&s.pool)
+                .await
+                .unwrap();
+            let text: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+            assert!(
+                text.iter().any(|t| t.contains("last_ms")),
+                "{sql}: {text:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn retention_prunes_old_requests_and_scans() {
         let (s, _a, _b) = seeded().await;

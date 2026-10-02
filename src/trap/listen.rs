@@ -179,8 +179,9 @@ async fn preface(
                 }
             }
         }
+        let mut hello = tls_hello::HelloParser::default();
         loop {
-            match tls_hello::parse_client_hello(&buf) {
+            match hello.advance(&buf) {
                 Hello::Done { hello, .. } => {
                     return Some((
                         Replay {

@@ -1066,7 +1066,7 @@ impl Recorder {
         let skip_uids: Vec<String> = sqlx::query_scalar(
             "SELECT uid FROM skipped_batches
              WHERE last_ms < CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000
-             ORDER BY id LIMIT ?",
+             ORDER BY last_ms LIMIT ?",
         )
         .bind(&cutoff)
         .bind(BATCH)

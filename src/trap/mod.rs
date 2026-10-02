@@ -74,6 +74,30 @@ pub struct Guards {
     intel: flood::IntelCache,
     /// Light rows of the requests the flood gate skips.
     pub skips: skiplog::SkipLog,
+    /// Trap requests being handled right now.
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Guards {
+    /// Count a request as in flight until the returned guard is dropped.
+    pub fn enter(&self) -> InFlight {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        InFlight(self.in_flight.clone())
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A trap request in progress (see [`Guards::enter`]).
+pub struct InFlight(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Write a batch of light rows; a failure is logged, the requests were
@@ -89,6 +113,9 @@ async fn write_skips(state: &TrapState, b: skiplog::Batch) {
     }
 }
 
+/// Longest a stopping trap waits for requests in progress to finish.
+const STOP_GRACE: Duration = Duration::from_secs(30);
+
 /// Write the light rows that have waited long enough, every few seconds,
 /// until `shutdown`.
 pub async fn flush_skips(state: Arc<TrapState>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -96,7 +123,20 @@ pub async fn flush_skips(state: Arc<TrapState>, mut shutdown: tokio::sync::watch
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
             _ = shutdown.changed() => {
-                // Nothing buffered is lost on a clean stop.
+                // Nothing buffered is lost on a clean stop: requests still
+                // being handled may note light rows, so wait for them (at
+                // most as long as a connection may last), writing as they
+                // come, then write the rest.
+                let until = Instant::now() + STOP_GRACE;
+                loop {
+                    for b in state.guards.skips.take_older(Duration::ZERO, Instant::now()) {
+                        write_skips(&state, b).await;
+                    }
+                    if state.guards.in_flight() == 0 || Instant::now() >= until {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
                 for b in state.guards.skips.take_older(Duration::ZERO, Instant::now()) {
                     write_skips(&state, b).await;
                 }
@@ -524,6 +564,7 @@ async fn trap_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Response {
+    let _in_flight = state.guards.enter();
     let (parts, body) = req.into_parts();
     let ip = client_ip(&parts.headers, peer.ip(), &state.cfg.trusted_proxies);
     let (body, received) = read_body(body).await;

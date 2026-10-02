@@ -1169,6 +1169,54 @@ mod tests {
         );
     }
 
+    /// From/to bound light rows to the second, inclusively, as they bound
+    /// recorded requests.
+    #[tokio::test]
+    async fn time_filters_bound_light_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let t = |hms: &str| {
+            chrono::NaiveDateTime::parse_from_str(&format!("2026-05-01 {hms}"), "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        };
+        let light = |ts_ms, path: &str| crate::cluster::record::SkipRow {
+            ts_ms,
+            method: "GET".into(),
+            path: path.into(),
+        };
+        s.local()
+            .insert_skip_batch(
+                "203.0.113.5",
+                0,
+                vec![
+                    light(t("10:00:00") - 1, "/before"),
+                    light(t("10:00:00"), "/from"),
+                    light(t("10:00:05") + 999, "/to"),
+                    light(t("10:00:06"), "/after"),
+                ],
+            )
+            .await
+            .unwrap();
+        let f = ExportFilter {
+            from: Some("2026-05-01 10:00:00".into()),
+            to: Some("2026-05-01 10:00:05".into()),
+            ..Default::default()
+        };
+        let out = text(&collect(&s, f, Format::Jsonl).await);
+        let paths: Vec<String> = out
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["path"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(paths, ["/from", "/to"]);
+    }
+
     #[tokio::test]
     async fn a_label_filter_leaves_out_light_rows() {
         let (s, _d) = rich().await;

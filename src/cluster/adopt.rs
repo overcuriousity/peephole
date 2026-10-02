@@ -14,7 +14,9 @@ const BATCH: i64 = 500;
 /// The record a standalone row would have been written as.
 async fn record_for(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Result<Option<Record>> {
     Ok(match kind {
-        "request" | "fingerprint" | "scan_result" => data::rebuild(conn, kind, uid).await?,
+        "request" | "fingerprint" | "scan_result" | "skip_batch" => {
+            data::rebuild(conn, kind, uid).await?
+        }
         "fp_claim" => {
             type Row = (
                 Option<String>,
@@ -113,6 +115,7 @@ async fn bind_uids(node: &Node) -> Result<()> {
         "fingerprints",
         "scan_jobs",
         "scans",
+        "skipped_batches",
     ] {
         let sql = format!(
             "UPDATE {table} SET uid = ?1 || uid
@@ -139,6 +142,7 @@ pub async fn adopt_history(node: &Node) -> Result<u64> {
         ("fingerprints", "fingerprint"),
         ("scan_jobs", "scan_job"),
         ("scans", "scan_result"),
+        ("skipped_batches", "skip_batch"),
     ] {
         loop {
             let _g = node.apply_lock.lock().await;
