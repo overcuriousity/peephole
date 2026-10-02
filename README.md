@@ -11,7 +11,6 @@ Requests are classified against TOML signature rules, enriched with GeoIP and
 Tor-exit intelligence, and the interesting ones get **scanned back** with nmap.
 
 [![CI](https://github.com/overcuriousity/peephole/actions/workflows/ci.yml/badge.svg)](https://github.com/overcuriousity/peephole/actions/workflows/ci.yml)
-[![Release](https://github.com/overcuriousity/peephole/actions/workflows/release.yml/badge.svg)](https://github.com/overcuriousity/peephole/actions/workflows/release.yml)
 
 **Think twice before deploying this!**
 While I find it ethically ok to scan anybody who scans you, be aware that this procedure might be illegal in some jusrisdictions, and may get your ip-address flagged for abuse. Deploy mindfully!
@@ -24,10 +23,21 @@ One line, on a fresh Debian/Ubuntu machine:
 curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/install.sh | sudo bash
 ```
 
+That installs the rolling build of `master`. A versioned release is
+immutable; install one with the installer from the same tag:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/v0.1.0/install.sh | \
+  sudo PEEPHOLE_VERSION=v0.1.0 bash
+```
+
 The installer:
 
 - installs prerequisites (`nmap`, `curl`, `ca-certificates`, `sqlite3`),
-- downloads and checksum-verifies the latest build,
+- downloads the build for the machine (x86_64 or aarch64) and verifies its
+  checksum; with the GitHub CLI (`gh`) installed it also verifies the
+  build's provenance attestation (`PEEPHOLE_VERIFY=1` makes that required,
+  `0` skips it), and prints the commit the binary was built from,
 - installs the binary to `/usr/local/bin/peephole` and the default signature
   rules to `/etc/peephole/rules`,
 - asks what this node should do:
@@ -48,8 +58,12 @@ The installer:
 
 It does not install or change nginx. The example has a TLS server block for
 the admin area (the live scan queue needs `proxy_buffering off` on
-`/admin/api/queue`, which the example sets) and a catch-all `default_server`
-that sends everything no real site claims to the trap. The catch-all sets
+`/admin/api/queue`, which the example sets; `/login` and `/enroll` are rate
+limited), a 443 `default_server` that refuses TLS for every other name
+(`ssl_reject_handshake`, nginx ≥ 1.19.4, so the admin certificate is never
+shown to scanners; the example shows how to trap HTTPS instead), and a
+catch-all `default_server` on port 80 that sends everything no real site
+claims to the trap. The catch-all sets
 `X-Forwarded-For` to the real peer address, so a client cannot spoof it. The
 installer prints the nginx steps in the order that works on a stock
 Debian/Ubuntu nginx: get the admin site's certificate
@@ -72,14 +86,20 @@ Every question has a variable (`PEEPHOLE_ROLES`, `PEEPHOLE_LOCAL_PROXY`,
 `PEEPHOLE_REMOTE_CONFIG`, …; see the head of `install.sh`).
 
 Re-running the installer upgrades in place: it skips when the installed
-version already matches, validates your existing config with the new binary
-before restarting, waits for `/healthz`, and rolls back to the previous
-binary if the service does not come up. Shipped rule files are treated like
-conffiles — a rule you edited is kept and the new upstream version is placed
-beside it as `<name>.toml.new`. Your config and nginx example are never rewritten.
+version already matches, validates your existing config with the new binary,
+backs up the database (`/var/lib/peephole/backup-<time>.db`, the two newest
+are kept), restarts, waits for `/healthz` (or for systemd to report the
+service up), and if the new version does not come up rolls back the binary,
+the rules, the unit and — when the new version changed its schema — the
+database, then checks the old version is running again. Shipped rule files
+and the systemd unit are treated like conffiles: a file you edited is kept
+and the new upstream version is placed beside it as `<name>.new`. Keep your
+own service settings (sandboxing, limits) in a drop-in
+(`systemctl edit peephole`), which upgrades never touch. Your config and
+nginx example are never rewritten.
 
-Published binaries are built on Ubuntu 22.04 and run on Debian 12 / Ubuntu
-22.04 or newer (glibc ≥ 2.35).
+Published binaries (x86_64 and aarch64) are built on Ubuntu 22.04 and run on
+Debian 12 / Ubuntu 22.04 or newer (glibc ≥ 2.35).
 
 ## Architecture
 
@@ -221,7 +241,8 @@ them without recompiling; see [`rules/`](rules/) for the shipped defaults.
 ```sh
 systemctl status peephole                     # service status
 journalctl -u peephole -f                     # logs (incl. FIDO2 enrollment instructions)
-peephole --version                            # installed build
+peephole --version                            # installed build and its commit
+peephole --help                               # commands and arguments
 peephole check-config /etc/peephole/config.toml   # validate config, rules and nmap
 ```
 
@@ -230,7 +251,8 @@ the one-time setup token is only needed for the very first key.
 
 ## Building from source
 
-Requires stable Rust. The test suite and release build:
+Requires Rust 1.94 or newer (`rust-version` in `Cargo.toml`). The test
+suite and release build:
 
 ```sh
 cargo test
@@ -240,9 +262,15 @@ cargo build --release
 The world map served on the wall of shame is a generated asset; see
 [`assets/README.md`](assets/README.md) for provenance and how to regenerate it.
 
-Every push to `master` runs CI (fmt, clippy, tests, an installer smoke test
-in a container) and publishes a fresh binary to the rolling
-[`latest` prerelease](https://github.com/overcuriousity/peephole/releases/tag/latest).
+Every push to `master` runs CI (fmt, clippy, tests, cargo-deny, the MSRV
+build, release builds for x86_64 and aarch64, an installer smoke test in a
+container); only when all of it passes are the binaries attested and
+published to the rolling
+[`latest` prerelease](https://github.com/overcuriousity/peephole/releases/tag/latest),
+whose files are replaced in place. Pushing a tag `v<version>` publishes an
+immutable release the same way; the tag must equal the `version` in
+`Cargo.toml` (`v0.1.0` for `0.1.0`), which CI checks. Verify a download with
+`gh attestation verify <tarball> --repo overcuriousity/peephole`.
 
 ## License
 
