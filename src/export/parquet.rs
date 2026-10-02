@@ -71,6 +71,11 @@ fn schema() -> SchemaRef {
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             false,
         ),
+        Field::new(
+            "owasp",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        ),
         i("severity", true),
         i("scan_level", true),
         flag("fp_claim", false),
@@ -144,6 +149,13 @@ fn batch(schema: SchemaRef, rows: &[ExportRow]) -> Result<RecordBatch> {
         }
         labels.append(true);
     }
+    let mut owasp = ListBuilder::new(StringBuilder::new());
+    for r in rows {
+        for t in &r.owasp {
+            owasp.values().append_value(t);
+        }
+        owasp.append(true);
+    }
     let json = |f: fn(&ExportRow) -> &str| -> ArrayRef {
         let mut b = StringBuilder::new();
         for r in rows {
@@ -179,6 +191,7 @@ fn batch(schema: SchemaRef, rows: &[ExportRow]) -> Result<RecordBatch> {
         ints(rows.iter().map(|r| Some(r.unrecorded))),
         ints(rows.iter().map(|r| Some(r.weight))),
         Arc::new(labels.finish()),
+        Arc::new(owasp.finish()),
         ints(rows.iter().map(|r| r.severity)),
         ints(rows.iter().map(|r| r.scan_level)),
         bools(rows.iter().map(|r| Some(r.fp_claim))),

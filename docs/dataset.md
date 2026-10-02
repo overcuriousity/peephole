@@ -98,7 +98,8 @@ shipped rules) classified a row.
 
 | Column | Type | Meaning |
 |---|---|---|
-| `labels` | list of string | Rule labels that matched (`sqli`, `rce`, `path-traversal`, `sensitive-path`, `scanner-ua`, `xss`, `iot-probe`, `appliance-probe`, or whatever the operator's rules name) |
+| `labels` | list of string | Labels that matched: rule labels (`sqli`, `rce`, `path-traversal`, `ssrf`, `webshell`, `scanner-ua`, `ai-infra-probe`, … one family per file in `rules/`) and behavioural labels from code (`probe`, `path-scanner`, `form-interaction`, …); see the taxonomy in [operations.md](operations.md#classification-taxonomy) |
+| `owasp` | list of string | OWASP tags of the matching rules: a Top 10 2021 class (`A03:2021`) for payload families, an Automated Threat (`OAT-014`) for scanning behaviour. Behavioural labels carry none |
 | `severity` | int? | 0 (noise) to 4 (exploit attempt); the highest of the matching rules. Null on light rows |
 | `scan_level` | int? | Counter-scan level this request earned (0: none, 1 to 4) |
 | `fp_claim` | bool | The address filed a false-positive claim at some point (claim texts and e-mail addresses are never exported) |
