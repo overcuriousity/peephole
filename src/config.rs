@@ -169,6 +169,10 @@ pub struct ScanConfig {
     pub max_workers: usize,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Level 4 (every port, -sV -O, scripts) runs this many times
+    /// `timeout_secs`, capped at 12 h.
+    #[serde(default = "default_level4_timeout_factor")]
+    pub level4_timeout_factor: u32,
     #[serde(default = "default_cooldown")]
     pub rescan_cooldown_hours: i64,
     #[serde(default = "default_rate")]
@@ -305,6 +309,10 @@ fn default_nmap_path() -> String {
 fn default_workers() -> usize {
     2
 }
+fn default_level4_timeout_factor() -> u32 {
+    4
+}
+
 fn default_timeout() -> u64 {
     // Full-range levels (-p- -sV -O) on filtered hosts need well over 15 min.
     1800
@@ -324,6 +332,7 @@ impl Default for ScanConfig {
         Self {
             max_workers: default_workers(),
             timeout_secs: default_timeout(),
+            level4_timeout_factor: default_level4_timeout_factor(),
             rescan_cooldown_hours: default_cooldown(),
             max_scans_per_hour: default_rate(),
             retention_days: default_retention_days(),
@@ -345,6 +354,7 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("webauthn", "secure_cookies", "true"),
     ("scan", "max_workers", "2"),
     ("scan", "timeout_secs", "1800"),
+    ("scan", "level4_timeout_factor", "4"),
     ("scan", "rescan_cooldown_hours", "24"),
     ("scan", "max_scans_per_hour", "30"),
     ("scan", "retention_days", "90"),
@@ -465,6 +475,12 @@ impl Config {
                 "scan.timeout_secs must be between {} and {}",
                 crate::scan::pace::MIN_TIMEOUT,
                 crate::scan::pace::MAX_TIMEOUT
+            );
+        }
+        if !(1..=crate::scan::pace::MAX_LEVEL4_FACTOR).contains(&s.level4_timeout_factor) {
+            bail!(
+                "scan.level4_timeout_factor must be between 1 and {}",
+                crate::scan::pace::MAX_LEVEL4_FACTOR
             );
         }
         if s.rescan_cooldown_hours < 0 {

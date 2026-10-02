@@ -479,13 +479,14 @@ impl Source {
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
              WHERE i.ip = ? AND j.uid != ? AND j.level >= ?
-               AND ((j.status = 'running' AND j.started_at > datetime('now', '-5 hours')
+               AND ((j.status = 'running' AND j.started_at > datetime('now', ?)
                      AND j.started_at <= datetime('now', '+10 minutes'))
                     OR (j.status = 'done' AND j.finished_at > datetime('now', ?)))",
         )
         .bind(ip)
         .bind(uid)
         .bind(level)
+        .bind(format!("-{} hours", pace::STALE_RUNNING_HOURS))
         .bind(format!("-{} hours", self.pace.cooldown_hours()))
         .fetch_one(&self.rec.store().pool)
         .await?;
@@ -776,11 +777,16 @@ pub async fn run_workers(
                 notifier.publish(j);
             }
             last_start = Some(tokio::time::Instant::now());
-            let argv = nmap_argv(job.level(), &job.ip(), &cfg, p.timeout_secs);
+            let limit = pace::level_timeout_secs(
+                p.timeout_secs,
+                job.level(),
+                cfg.scan.level4_timeout_factor,
+            );
+            let argv = nmap_argv(job.level(), &job.ip(), &cfg, limit);
             let source2 = source.clone();
             let notifier2 = notifier.clone();
             let nmap = nmap_path.clone();
-            let timeout = Duration::from_secs(p.timeout_secs);
+            let timeout = Duration::from_secs(limit);
             joinset.spawn(async move {
                 let outcome = match argv {
                     Some(argv) => run_scan(&source2, &job, argv, nmap, timeout).await,

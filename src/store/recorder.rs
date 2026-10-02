@@ -374,10 +374,11 @@ impl Recorder {
         // arbiter is gone or never finishes it) and shields nothing.
         let max_pending: Option<i64> = sqlx::query_scalar(
             "SELECT MAX(level) FROM scan_jobs WHERE ip_id = ? AND (status = 'queued'
-               OR (status = 'running' AND started_at > datetime('now', '-5 hours')
+               OR (status = 'running' AND started_at > datetime('now', ?)
                    AND started_at <= datetime('now', '+10 minutes')))",
         )
         .bind(ip_id)
+        .bind(format!("-{} hours", crate::scan::pace::STALE_RUNNING_HOURS))
         .fetch_one(pool)
         .await?;
         if let Some(max_pending) = max_pending {

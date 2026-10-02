@@ -642,6 +642,7 @@ CONFIG
 [scan]
 max_workers = 2            # concurrent nmap subprocesses
 timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admin queue page)
+level4_timeout_factor = 4  # level 4 (all ports, -sV -O, scripts) gets this many times timeout_secs, at most 12 h
 rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
 max_scans_per_hour = 30    # rate cap of this scanner; excess jobs stay queued
 retention_days = 90        # standalone only: delete older requests and scans; 0 = keep forever (ignored in a cluster)

@@ -534,12 +534,19 @@ async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Re
             .fetch_all(&node.store.pool)
             .await?
         } else if lowest && idle {
+            // A running job of a live arbiter may be a long level-4 scan
+            // whose lease is renewed without touching the job row: take it
+            // only once no scan can still be running.
             sqlx::query_scalar(
-                "SELECT uid FROM scan_jobs WHERE status IN ('queued','running') AND arbiter = ?
-                   AND MAX(COALESCE(hlc, 0), status_hlc) < ? LIMIT 500",
+                "SELECT uid FROM scan_jobs WHERE arbiter = ?
+                   AND MAX(COALESCE(hlc, 0), status_hlc) < ?
+                   AND (status = 'queued' OR (status = 'running'
+                        AND (started_at IS NULL OR started_at < datetime('now', ?))))
+                 LIMIT 500",
             )
             .bind(&a)
             .bind(stale_before)
+            .bind(format!("-{} hours", crate::scan::pace::STALE_RUNNING_HOURS))
             .fetch_all(&node.store.pool)
             .await?
         } else {

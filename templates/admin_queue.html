@@ -28,7 +28,7 @@
       <label>Scans per hour <input type="number" name="max_scans_per_hour" min="0" max="{{ pace.max_per_hour }}" value="{{ pace.current.max_scans_per_hour }}" required></label>
       <label>Timeout (min) <input type="number" name="timeout_minutes" min="{{ pace.min_timeout_min }}" max="{{ pace.max_timeout_min }}" step="any" value="{{ pace.timeout_min }}" required></label>
       <button class="btn btn-primary" type="submit">Save pace</button>
-      <p class="muted pace-note">0 workers or 0 scans per hour pauses scanning. Starts are spaced evenly over the hour. nmap is killed when it exceeds the timeout.</p>
+      <p class="muted pace-note">0 workers or 0 scans per hour pauses scanning. Starts are spaced evenly over the hour. nmap is killed when it exceeds the timeout; level-4 scans (every port) get {{ pace.level4_timeout_min }} min (<code>scan.level4_timeout_factor</code>).</p>
     </form>
     <form class="pace-rec" method="post" action="/admin/queue/pace">
       <input type="hidden" name="max_workers" value="{{ pace.rec.max_workers }}">

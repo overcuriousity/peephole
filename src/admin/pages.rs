@@ -144,6 +144,8 @@ struct PaceView {
     rec_timeout_min: String,
     min_timeout_min: u64,
     max_timeout_min: u64,
+    /// Level-4 limit at the current timeout, e.g. "120".
+    level4_timeout_min: String,
     /// Share of last-24h jobs that hit the timeout, e.g. "25%".
     timeout_share: String,
     timeouts_high: bool,
@@ -234,6 +236,11 @@ async fn pace_view(
         rec_timeout_min: minutes(r.pace.timeout_secs),
         min_timeout_min: pace::MIN_TIMEOUT / 60,
         max_timeout_min: pace::MAX_TIMEOUT / 60,
+        level4_timeout_min: minutes(pace::level_timeout_secs(
+            current.timeout_secs,
+            4,
+            st.cfg.scan.level4_timeout_factor,
+        )),
         timeout_share: format!("{:.0}%", r.timeout_share * 100.0),
         timeouts_high: r.pace.timeout_secs > current.timeout_secs,
         notice,

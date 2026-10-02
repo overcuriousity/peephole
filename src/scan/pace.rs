@@ -23,6 +23,28 @@ const DRAIN_HOURS: f64 = 24.0;
 /// Per-scan wall-clock limit bounds settable from the admin UI.
 pub const MIN_TIMEOUT: u64 = 60;
 pub const MAX_TIMEOUT: u64 = 4 * 3600;
+/// Longest any one scan may run: the level-4 limit is capped here.
+pub const MAX_RUN_SECS: u64 = 12 * 3600;
+/// A job marked running for longer than this is dead (no scan runs past
+/// [`MAX_RUN_SECS`]): it neither shields its IP nor blocks a takeover.
+pub const STALE_RUNNING_HOURS: u64 = MAX_RUN_SECS / 3600 + 1;
+/// Bounds of `scan.level4_timeout_factor`.
+pub const MAX_LEVEL4_FACTOR: u32 = 12;
+
+/// Wall-clock limit of one scan at `level`. Level 4 scans every port with
+/// version, OS and script detection and needs far longer than the others,
+/// so it gets `level4_factor` times the base limit, capped at
+/// [`MAX_RUN_SECS`].
+pub fn level_timeout_secs(base: u64, level: u8, level4_factor: u32) -> u64 {
+    if level >= 4 {
+        base.saturating_mul(level4_factor.max(1) as u64)
+            .min(MAX_RUN_SECS)
+            .max(base)
+    } else {
+        base
+    }
+}
+
 /// Share of finished scans that may time out before a longer limit is advised.
 const TIMEOUT_SHARE: f64 = 0.10;
 
@@ -273,6 +295,18 @@ pub fn recommend(m: &QueueMetrics, current: Pace) -> Recommendation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn level_four_gets_its_own_limit() {
+        assert_eq!(level_timeout_secs(1800, 1, 4), 1800);
+        assert_eq!(level_timeout_secs(1800, 3, 4), 1800);
+        assert_eq!(level_timeout_secs(1800, 4, 4), 7200);
+        assert_eq!(level_timeout_secs(1800, 4, 1), 1800);
+        // Capped, and never below the base limit.
+        assert_eq!(level_timeout_secs(MAX_TIMEOUT, 4, 12), MAX_RUN_SECS);
+        assert_eq!(level_timeout_secs(1800, 4, 0), 1800);
+        const { assert!(STALE_RUNNING_HOURS * 3600 > MAX_RUN_SECS) };
+    }
 
     fn m(backlog: i64, arrivals_24h: i64, scan_secs: Option<f64>) -> QueueMetrics {
         QueueMetrics {

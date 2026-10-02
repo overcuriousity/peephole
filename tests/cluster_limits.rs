@@ -329,7 +329,17 @@ async fn dead_running_jobs_do_not_shield_their_ip() {
         rec.enqueue_scan(ip.id, 1, 24).await.unwrap(),
         EnqueueOutcome::Cooldown
     ));
+    // A level-4 scan may run for hours: still shielding after 6 h.
     sqlx::query("UPDATE scan_jobs SET started_at = datetime('now', '-6 hours')")
+        .execute(&x.store.pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        rec.enqueue_scan(ip.id, 1, 24).await.unwrap(),
+        EnqueueOutcome::Cooldown
+    ));
+    // Longer than any scan may run: dead.
+    sqlx::query("UPDATE scan_jobs SET started_at = datetime('now', '-14 hours')")
         .execute(&x.store.pool)
         .await
         .unwrap();
