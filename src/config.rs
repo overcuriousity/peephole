@@ -26,6 +26,24 @@ pub struct Config {
     pub scan: ScanConfig,
     /// Distributed mode. Absent: standalone, no RPC listener.
     pub cluster: Option<ClusterConfig>,
+    /// What the public (anonymous) pages show.
+    #[serde(default)]
+    pub public: PublicConfig,
+}
+
+/// `[public]`: what anonymous visitors see.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicConfig {
+    /// Rule labels (coarse categories of what an IP requested) on public
+    /// pages: per-IP label chips, the label filter and the label chart.
+    #[serde(default = "default_true")]
+    pub show_labels: bool,
+}
+
+impl Default for PublicConfig {
+    fn default() -> Self {
+        Self { show_labels: true }
+    }
 }
 
 /// `[cluster]`: this node's RPC endpoint and its bootstrap peers.
@@ -197,6 +215,7 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("scan", "max_scans_per_hour", "30"),
     ("scan", "retention_days", "90"),
     ("scan", "never_scan", "[]"),
+    ("public", "show_labels", "true"),
 ];
 
 /// Sections that are required when their role is on and unused otherwise.

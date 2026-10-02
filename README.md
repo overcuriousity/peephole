@@ -105,7 +105,11 @@ internet ──► nginx (TLS) ──► peephole admin listener  127.0.0.1:8443
   Individual request rows are never public: no request paths, query strings,
   payloads, headers, fingerprints or scan results. The public side names the
   IPs it shames but not what each one requested; `/api/stats` carries only
-  aggregates.
+  aggregates. The coarse rule categories an IP's requests matched (labels
+  such as `sensitive-path` or `sqli`) are public unless
+  `[public] show_labels = false` hides them (per-IP chips, the label filter
+  and the label chart). Anonymous visitors are rate limited per address and
+  see cached pages.
 - **Admin area** (FIDO2 only, no passwords, under `/admin`) — everything the
   public side withholds: the full request search and per-IP request history,
   the live scan queue over Server-Sent Events, counter-scan results with

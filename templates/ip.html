@@ -22,7 +22,7 @@
   <section class="card">
     <div class="card-head"><h2>Last 24 hours</h2><span class="muted">requests per hour</span></div>
     <div class="sparkline" data-sparkline="{{ sparkline_json }}"></div>
-    {% if !ov.labels.is_empty() %}<div class="chips">{% for l in ov.labels %}<span class="badge badge-label">{{ l.name }} <span class="muted">×{{ l.count }}</span></span>{% endfor %}</div>{% endif %}
+    {% if labels && !ov.labels.is_empty() %}<div class="chips">{% for l in ov.labels %}<span class="badge badge-label">{{ l.name }} <span class="muted">×{{ l.count }}</span></span>{% endfor %}</div>{% endif %}
   </section>
 
   {% if let Some(adm) = admin %}

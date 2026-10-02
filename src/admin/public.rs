@@ -57,6 +57,13 @@ struct WallPage {
     range: Range,
     stats: Arc<Stats>,
     stale: bool,
+    /// Show rule labels (always with a session; `[public] show_labels`).
+    labels: bool,
+}
+
+/// Whether this viewer sees rule labels.
+fn labels_shown(state: &AdminState, authed: bool) -> bool {
+    authed || state.cfg.public.show_labels
 }
 
 async fn wall(
@@ -72,19 +79,25 @@ async fn wall(
         range,
         stats,
         stale,
+        labels: labels_shown(&state, authed),
     })
 }
 
 async fn stats_json(
+    MaybeUser(authed): MaybeUser,
     State(state): State<Arc<AdminState>>,
     Query(q): Query<RangeQuery>,
 ) -> AppResult<Json<Arc<Stats>>> {
-    Ok(Json(
-        state
-            .stats_cache
-            .stats(&state.store, Range::parse(q.range.as_deref()))
-            .await?,
-    ))
+    let stats = state
+        .stats_cache
+        .stats(&state.store, Range::parse(q.range.as_deref()))
+        .await?;
+    if labels_shown(&state, authed) {
+        return Ok(Json(stats));
+    }
+    let mut hidden = (*stats).clone();
+    hidden.top_labels.clear();
+    Ok(Json(Arc::new(hidden)))
 }
 
 async fn map_json(
@@ -155,6 +168,7 @@ struct IpsPage {
     qs: String,
     /// Rows matching the filter across all pages; `Some` only with a session.
     bulk_total: Option<i64>,
+    labels: bool,
 }
 
 /// Deepest IP-directory page anonymous visitors can open; with a session
@@ -166,7 +180,8 @@ const PUBLIC_MAX_INPUT: usize = 64;
 
 /// An anonymous visitor's IP filter, normalised so equivalent queries share
 /// one cache entry and bounded so it cannot ask for arbitrarily deep pages.
-pub(crate) fn public_ip_filter(f: &IpFilter) -> IpFilter {
+/// Filters the visitor may not use (labels, when hidden) are dropped.
+pub(crate) fn public_ip_filter(f: &IpFilter, show_labels: bool) -> IpFilter {
     let text = |v: &Option<String>| {
         v.as_deref()
             .map(str::trim)
@@ -188,7 +203,7 @@ pub(crate) fn public_ip_filter(f: &IpFilter) -> IpFilter {
             .filter(|c| c.len() == 2)
             .map(|c| c.to_ascii_uppercase()),
         asn: f.asn.filter(|a| (0..=u32::MAX as i64).contains(a)),
-        label: text(&f.label),
+        label: if show_labels { text(&f.label) } else { None },
         min_severity: f.min_severity.filter(|s| (1..=4).contains(s)),
         tor: f.tor.clone().filter(|t| t == "1"),
         sort: f.sort.clone().filter(|s| s == "recent"),
@@ -235,7 +250,7 @@ async fn ips(
         let total = state.store.count_ips(&f).await?;
         (f, page, Some(total))
     } else {
-        let f = public_ip_filter(&f);
+        let f = public_ip_filter(&f, state.cfg.public.show_labels);
         let key = format!("{}page={}", ip_qs(&f), page_num(f.page));
         let mut page = state.stats_cache.ips(&state.store, &f, key).await?;
         if page.has_next && i64::from(page.page) >= PUBLIC_MAX_PAGE {
@@ -251,6 +266,7 @@ async fn ips(
         f,
         page,
         bulk_total,
+        labels: labels_shown(&state, authed),
     })
 }
 
@@ -312,6 +328,7 @@ struct IpPage {
     sparkline_json: String,
     page: Page<RequestListRow>,
     admin: Option<IpAdminData>,
+    labels: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -380,5 +397,144 @@ async fn ip_page(
         sparkline_json,
         page,
         admin,
+        labels: labels_shown(&state, authed),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[test]
+    fn anonymous_filters_are_normalised_and_bounded() {
+        let f: IpFilter = serde_urlencoded::from_str(
+            "q=+203.0.113.77/24+&country=de&label=wp&min_severity=9&tor=yes&sort=x&page=999",
+        )
+        .unwrap();
+        let p = public_ip_filter(&f, true);
+        assert_eq!(p.q.as_deref(), Some("203.0.113.0/24"));
+        assert_eq!(p.country.as_deref(), Some("DE"));
+        assert_eq!(p.label.as_deref(), Some("wp"));
+        assert_eq!(p.min_severity, None);
+        assert_eq!((p.tor, p.sort), (None, None));
+        assert_eq!(p.page, Some(PUBLIC_MAX_PAGE));
+        // Equivalent spellings share one cache key.
+        let a = public_ip_filter(
+            &IpFilter {
+                q: Some("2001:DB8:0::1".into()),
+                ..Default::default()
+            },
+            true,
+        );
+        let b = public_ip_filter(
+            &IpFilter {
+                q: Some("2001:db8::1".into()),
+                ..Default::default()
+            },
+            true,
+        );
+        assert_eq!(ip_qs(&a), ip_qs(&b));
+        assert_eq!(public_ip_filter(&f, false).label, None, "labels hidden");
+    }
+
+    async fn app(show_labels: bool) -> (axum::Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: crate::config::Config = toml::from_str(&format!(
+            r#"
+admin_listen = "127.0.0.1:1"
+database_path = "{db}"
+data_dir = "{d}"
+[roles]
+listener = false
+scanner = false
+[webauthn]
+rp_id = "localhost"
+origin = "https://localhost"
+rp_name = "t"
+secure_cookies = false
+[public]
+show_labels = {show_labels}
+"#,
+            db = dir.path().join("t.db").display(),
+            d = dir.path().display()
+        ))
+        .unwrap();
+        let store = crate::store::Store::connect(&cfg.database_path)
+            .await
+            .unwrap();
+        let ip = store
+            .upsert_ip("203.0.113.9".parse().unwrap())
+            .await
+            .unwrap();
+        store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/x".into(),
+                query: None,
+                headers_json: "[]".into(),
+                body: None,
+                labels_json: r#"["secret-category"]"#.into(),
+                severity: 2,
+                scan_level: 0,
+                is_fp_claim: false,
+                page_token: None,
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(AdminState::public_only(store, cfg));
+        (crate::admin::full_router(state), dir)
+    }
+
+    async fn get(app: &axum::Router, path: &str) -> String {
+        let r = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(path)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{path}");
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&b).into_owned()
+    }
+
+    #[tokio::test]
+    async fn labels_can_be_kept_off_the_public_pages() {
+        let (shown, _d1) = app(true).await;
+        assert!(
+            get(&shown, "/ip/203.0.113.9")
+                .await
+                .contains("secret-category")
+        );
+        assert!(get(&shown, "/ips").await.contains("name=\"label\""));
+        assert!(
+            get(&shown, "/api/stats?range=all")
+                .await
+                .contains("secret-category")
+        );
+        assert!(get(&shown, "/").await.contains("Top labels"));
+
+        let (hidden, _d2) = app(false).await;
+        assert!(
+            !get(&hidden, "/ip/203.0.113.9")
+                .await
+                .contains("secret-category")
+        );
+        assert!(!get(&hidden, "/ips").await.contains("name=\"label\""));
+        assert!(
+            !get(&hidden, "/api/stats?range=all")
+                .await
+                .contains("secret-category")
+        );
+        assert!(!get(&hidden, "/").await.contains("Top labels"));
+        // The filter cannot be used to probe: it is ignored.
+        let html = get(&hidden, "/ips?label=no-such-label").await;
+        assert!(html.contains("203.0.113.9"), "label filter ignored");
+    }
 }
