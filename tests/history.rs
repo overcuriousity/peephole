@@ -302,3 +302,126 @@ async fn a_full_node_serves_a_window_on_request() {
     // Already past the window start: nothing changes.
     assert_eq!(serve(&f, a.key(), 5, week).await, (vec![6], vec![]));
 }
+
+/// x keeps a week of a's history (floor 5); returns it with a's origin.
+async fn windowed_holder() -> (Origin, Arc<Node>, tempfile::TempDir) {
+    let mut a = Origin::new();
+    let (x, d) = offline(&[&a], 7).await;
+    apply(&x, old_and_new(&mut a)).await;
+    history::prune(&x).await.unwrap();
+    (a, x, d)
+}
+
+async fn batch_from(n: &Node, origin: NodeId, after: u64) -> peephole::cluster::sync::Batch {
+    repl::entries_after(&n.store, &[(origin, after)], 0, 1000, usize::MAX)
+        .await
+        .unwrap()
+}
+
+/// A node keeping a window takes an origin's history from a peer's floor,
+/// membership included.
+#[tokio::test]
+async fn a_windowed_node_starts_at_a_peer_floor() {
+    let (a, x, _d) = windowed_holder().await;
+    let (w, _e) = offline(&[&a], 7).await;
+    let st = repl::apply_batch(&w, batch_from(&x, a.key(), 0).await)
+        .await
+        .unwrap();
+    assert_eq!((st.applied, st.rejected), (3, 0), "{st:?}");
+    assert_eq!(held(&w, a.key()).await, [1, 5, 6]);
+    assert_eq!(floor(&w, a.key()).await, 5);
+    assert_eq!(count(&w, "SELECT COUNT(*) FROM requests").await, 2);
+    assert_eq!(
+        count(&w, "SELECT COUNT(*) FROM members WHERE name = 'alpha'").await,
+        1
+    );
+    // Offered again: nothing new.
+    let st = repl::apply_batch(&w, batch_from(&x, a.key(), 0).await)
+        .await
+        .unwrap();
+    assert_eq!(st.applied, 0);
+}
+
+/// A node that keeps everything never skips history, also one that once
+/// kept a window (it keeps its floor and waits for a full member).
+#[tokio::test]
+async fn a_full_node_rejects_a_jump() {
+    let (mut a, x, _d) = windowed_holder().await;
+    let (f, _e) = offline(&[&a], 0).await;
+    // Only what follows on from what it holds (seq 1 does).
+    let st = repl::apply_batch(&f, batch_from(&x, a.key(), 0).await)
+        .await
+        .unwrap();
+    assert_eq!((st.applied, st.rejected), (1, 2), "{st:?}");
+    assert_eq!(held(&f, a.key()).await, [1]);
+    // Holding 1..=2, offered 5.. : still a gap.
+    a.seq = 1;
+    let second = old_and_new(&mut a).into_iter().take(1).collect();
+    apply(&f, second).await;
+    let st = repl::apply_batch(&f, batch_from(&x, a.key(), 2).await)
+        .await
+        .unwrap();
+    assert_eq!(st.applied, 0, "{st:?}");
+    assert_eq!(held(&f, a.key()).await, [1, 2]);
+    assert_eq!(floor(&f, a.key()).await, 1);
+}
+
+/// A windowed node that fell behind every peer's floor (offline for longer
+/// than the window) moves its floor up instead of stalling; the history
+/// below goes with the next prune.
+#[tokio::test]
+async fn a_windowed_node_jumps_to_a_peer_floor() {
+    let (mut a, x, _d) = windowed_holder().await;
+    let (w, _e) = offline(&[&a], 7).await;
+    a.seq = 0;
+    let first = old_and_new(&mut a).into_iter().take(2).collect();
+    apply(&w, first).await;
+    let st = repl::apply_batch(&w, batch_from(&x, a.key(), 2).await)
+        .await
+        .unwrap();
+    assert_eq!(st.applied, 2, "{st:?}");
+    assert_eq!(floor(&w, a.key()).await, 5);
+    assert_eq!(held(&w, a.key()).await, [1, 2, 5, 6]);
+    history::prune(&w).await.unwrap();
+    assert_eq!(held(&w, a.key()).await, [1, 5, 6]);
+    assert_eq!(
+        count(&w, "SELECT COUNT(*) FROM requests WHERE path = '/r1'").await,
+        0
+    );
+}
+
+/// Whether a sponsor was silent for 30 days before an admission cannot be
+/// judged across a gap in its history: the admission stands.
+#[tokio::test]
+async fn an_admission_after_a_gap_in_the_sponsors_history_counts() {
+    let (mut a, mut b, c) = (Origin::new(), Origin::new(), Origin::new());
+    let (w, _d) = offline(&[&b], 7).await;
+    let admit = |o: &Origin| {
+        Record::MemberAdd(MemberInfo {
+            id: o.key(),
+            name: "m".into(),
+            address: None,
+            roles: vec![],
+            proto_min: 2,
+            proto_max: 2,
+            remote_config: false,
+        })
+    };
+    // b admitted a 100 days ago; a's history up to seq 4 is not held.
+    let b1 = b.at(days_ago(100, 1), admit(&a));
+    a.seq = 4;
+    let a5 = a.at(days_ago(1, 2), admit(&c));
+    let batch = peephole::cluster::sync::Batch {
+        entries: vec![b1, a5],
+        proofs: vec![],
+        floors: vec![(a.key(), 5)],
+    };
+    let st = repl::apply_batch(&w, batch).await.unwrap();
+    assert_eq!(st.applied, 2, "{st:?}");
+    let admitted: i64 = sqlx::query_scalar("SELECT admitted_hlc FROM members WHERE id = ?")
+        .bind(&c.key().0[..])
+        .fetch_one(&w.store.pool)
+        .await
+        .unwrap();
+    assert!(admitted > 0);
+}

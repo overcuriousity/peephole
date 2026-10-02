@@ -579,8 +579,9 @@ pub async fn apply_batch(node: &Node, batch: impl Into<Batch>) -> Result<Applied
     let Batch {
         entries,
         proofs,
-        floors: _,
+        floors,
     } = batch.into();
+    let floors: HeadMap = floors.into_iter().collect();
     let mut st = Applied::default();
     if entries.is_empty() {
         return Ok(st);
@@ -588,7 +589,8 @@ pub async fn apply_batch(node: &Node, batch: impl Into<Batch>) -> Result<Applied
     let guard = node.apply_lock.lock().await;
     let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     for e in entries {
-        apply_one(node, &mut tx, e, &proofs, &mut st).await?;
+        let start = floors.get(&e.origin).copied();
+        apply_one(node, &mut tx, e, &proofs, start, &mut st).await?;
     }
     if st.applied > 0 {
         drain_pending(node, &mut tx, &mut st).await?;
@@ -607,11 +609,21 @@ pub async fn apply_batch(node: &Node, batch: impl Into<Batch>) -> Result<Applied
     Ok(st)
 }
 
+/// The highest sequence of `origin` below which nothing is missing here:
+/// the log head, or just below the floor when the floor lies past it.
+async fn complete_to(conn: &mut SqliteConnection, origin: &NodeId) -> Result<u64> {
+    let floor = super::history::floor_of(conn, origin).await?;
+    Ok(log_head(conn, origin).await?.max(floor - 1))
+}
+
+/// `start`: where the sender's full history of this origin begins, when it
+/// begins past what was asked for (see [`entries_after`]).
 async fn apply_one(
     node: &Node,
     conn: &mut SqliteConnection,
     e: WireEntry,
     proofs: &[WireEntry],
+    start: Option<u64>,
     st: &mut Applied,
 ) -> Result<()> {
     // Purged here: neither stored nor relayed any more.
@@ -619,8 +631,35 @@ async fn apply_one(
         st.rejected += 1;
         return Ok(());
     }
-    let have = log_head(conn, &e.origin).await?;
-    let held = have.max(pending_head(conn, &e.origin).await?);
+    let mut have = complete_to(conn, &e.origin).await?;
+    let mut held = have.max(pending_head(conn, &e.origin).await?);
+    // The sender's history starts past ours: a node that keeps only a window
+    // takes the membership before that start and moves its floor up to it.
+    // A node keeping everything never skips history (the gap is rejected).
+    if node.retention_days > 0
+        && let Some(start) = start.filter(|s| *s > held + 1)
+    {
+        if !trusted(node, conn, &e.origin).await? || e.seq > start {
+            st.rejected += 1;
+            return Ok(());
+        }
+        if e.seq < start {
+            return apply_membership_below(node, conn, e, st).await;
+        }
+        if !acceptable(conn, &e, proofs).await? {
+            st.rejected += 1;
+            return Ok(());
+        }
+        super::history::raise_floor(conn, &e.origin, start).await?;
+        // Parked entries before the new floor will never connect.
+        sqlx::query("DELETE FROM repl_pending WHERE origin = ? AND seq < ?")
+            .bind(&e.origin.0[..])
+            .bind(start.min(i64::MAX as u64) as i64)
+            .execute(&mut *conn)
+            .await?;
+        have = start - 1;
+        held = have;
+    }
     if e.seq <= held {
         st.duplicate += 1;
         return Ok(());
@@ -660,6 +699,42 @@ async fn apply_one(
         return park_or_refuse(conn, &e, untrusted, st).await;
     }
     apply_verified(node, conn, e, st).await
+}
+
+/// A membership entry below a sender's floor (see [`apply_one`]): taken
+/// once, signed by its origin, in log order among what is held.
+async fn apply_membership_below(
+    node: &Node,
+    conn: &mut SqliteConnection,
+    e: WireEntry,
+    st: &mut Applied,
+) -> Result<()> {
+    if !super::history::MEMBERSHIP.contains(&e.kind.as_str()) || e.payload.is_none() || !e.verify()
+    {
+        st.rejected += 1;
+        return Ok(());
+    }
+    if e.seq <= log_head(conn, &e.origin).await? {
+        st.duplicate += 1;
+        return Ok(());
+    }
+    apply_verified(node, conn, e, st).await
+}
+
+/// Whether an entry would pass the checks of the normal path: an erased stub
+/// with its proof, or a signed entry whose uid carries its origin's prefix.
+async fn acceptable(
+    conn: &mut SqliteConnection,
+    e: &WireEntry,
+    proofs: &[WireEntry],
+) -> Result<bool> {
+    if e.payload.is_none() {
+        return erasure_proven(conn, proofs, e).await;
+    }
+    Ok(e.uid
+        .as_ref()
+        .is_none_or(|uid| uid.starts_with(&e.origin.uid_prefix()))
+        && e.verify())
 }
 
 /// Park an entry, unless it comes from a node nobody admitted and that
@@ -853,7 +928,7 @@ async fn drain_pending(node: &Node, conn: &mut SqliteConnection, st: &mut Applie
                     .bind(seq)
                     .execute(&mut *conn)
                     .await?;
-                if seq as u64 != log_head(conn, &origin).await? + 1 {
+                if seq as u64 != complete_to(conn, &origin).await? + 1 {
                     continue; // already applied via another path
                 }
                 let e: WireEntry = super::rpc::cbor::decode(&blob)?;

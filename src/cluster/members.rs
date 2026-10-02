@@ -317,8 +317,19 @@ async fn may_sponsor(
         let prev = prev.map_or(0, |(h, r)| {
             super::hlc::effective(super::hlc::from_db(h), super::hlc::from_db(r.unwrap_or(0)))
         });
+        // The entry before this one is not held (history below this node's
+        // floor): silence cannot be judged across that gap.
+        let gap = e.seq > 1 && {
+            let n: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM repl_log WHERE origin = ? AND seq = ?")
+                    .bind(&sponsor.0[..])
+                    .bind((e.seq - 1).min(i64::MAX as u64) as i64)
+                    .fetch_one(&mut *conn)
+                    .await?;
+            n == 0
+        };
         let evidence = super::hlc::physical_ms(admitted.max(prev));
-        if super::hlc::physical_ms(at).saturating_sub(evidence) > PRUNE_AFTER_MS {
+        if !gap && super::hlc::physical_ms(at).saturating_sub(evidence) > PRUNE_AFTER_MS {
             warn!(sponsor = %sponsor.short(), member = %member.short(),
                   "ignored member_add by a node that was pruned");
             return Ok(false);
