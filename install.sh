@@ -74,6 +74,11 @@ nginx_stream_example() {
     echo "# Port 443 is routed by server name without decrypting (ssl_preread). The"
     echo "# trap reads the TLS handshake itself (JA4 fingerprint, raw ClientHello) and"
     echo "# learns the client's address from the PROXY protocol header."
+    echo "#"
+    echo "# Other HTTPS sites on this nginx must move behind it too: add a line"
+    echo "# \"<their name> 127.0.0.1:8444;\" to the map and change their \"listen 443 ssl\""
+    echo "# to \"listen 127.0.0.1:8444 ssl proxy_protocol;\" plus \"set_real_ip_from"
+    echo "# 127.0.0.1; real_ip_header proxy_protocol;\" (as the admin site has)."
     if has_role web; then
         cat <<NGINX
 stream {
@@ -952,6 +957,16 @@ setup_nginx() {
         warn "nginx: ${NGINX_SITE} or ${NGINX_STREAM} already exists; left alone (the steps to do it by hand follow)"
         return 1
     fi
+    if stream_trap; then
+        # Port 443 goes to the stream config; sites that listen on it
+        # themselves have to move behind it first (see the stream example).
+        local others
+        others="$(grep -lsE '^[[:space:]]*listen[[:space:]][^;#]*443' /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf || true)"
+        if [ -n "$others" ]; then
+            warn "nginx: port 443 is already used by $(printf '%s' "$others" | tr '\n' ' ')- move those sites behind the stream config first (see ${CONFIG_DIR}/nginx-stream.example.conf); left alone"
+            return 1
+        fi
+    fi
     command -v nginx >/dev/null 2>&1 || need+=(nginx)
     # The stream module, where the distribution packages it on its own.
     if stream_trap && ! dpkg -s libnginx-mod-stream >/dev/null 2>&1 \
@@ -1006,22 +1021,30 @@ setup_nginx() {
         install -m 0644 "${CONFIG_DIR}/nginx-stream.example.conf" "$NGINX_STREAM"
         [ -e /proc/net/if_inet6 ] || sed -i '/^ *listen \[::\]/d' "$NGINX_STREAM"
         if ! grep -qF "include ${NGINX_STREAM};" /etc/nginx/nginx.conf; then
-            printf '\n# peephole: port 443 by server name (see %s)\ninclude %s;\n' \
+            printf '# peephole: port 443 by server name (see %s)\ninclude %s;\n' \
                 "$NGINX_STREAM" "$NGINX_STREAM" >> /etc/nginx/nginx.conf
             stream_added=1
         fi
     fi
-    if ! out="$(nginx -t 2>&1)"; then
-        printf '%s\n' "$out" >&2
+    undo_nginx() {
         rm -f "$NGINX_LINK" "$NGINX_SITE" "$NGINX_STREAM"
         if [ "$stream_added" = 1 ]; then
             sed -i "\|^# peephole: port 443 by server name|d; \|^include ${NGINX_STREAM};|d" /etc/nginx/nginx.conf
         fi
-        [ -n "$default_target" ] && ln -s "$default_target" "$NGINX_DEFAULT"
+        if [ -n "$default_target" ]; then ln -s "$default_target" "$NGINX_DEFAULT"; fi
+    }
+    if ! out="$(nginx -t 2>&1)"; then
+        printf '%s\n' "$out" >&2
+        undo_nginx
         warn "nginx: the configuration test failed; nginx was left as it was"
         return 1
     fi
-    systemctl reload nginx || { warn "nginx: reload failed"; return 1; }
+    if ! systemctl reload nginx; then
+        undo_nginx
+        systemctl reload nginx || true
+        warn "nginx: reload failed; the changes were taken back"
+        return 1
+    fi
     info "nginx: site ${NGINX_SITE} enabled${default_target:+ (the default site was disabled)}"
     return 0
 }

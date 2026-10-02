@@ -345,6 +345,25 @@ if grep -q 'certbot certonly\|rm /etc/nginx/sites-enabled/default\|Terminate TLS
     echo "manual nginx steps printed although nginx was configured"; cat /tmp/nginx-auto.log; exit 1
 fi
 
+echo "== PEEPHOLE_NGINX=1 with another HTTPS site on this nginx: port 443 is not taken over"
+reset_install; reset_nginx
+cat > /etc/nginx/sites-available/shop <<'SITE'
+server {
+    listen 443 ssl;
+    server_name shop.test;
+    ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
+    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+}
+SITE
+ln -s ../sites-available/shop /etc/nginx/sites-enabled/shop
+PEEPHOLE_NGINX=1 PEEPHOLE_LOCAL_PROXY=1 bash install.sh > /tmp/nginx-other.log 2>&1 || { cat /tmp/nginx-other.log; exit 1; }
+grep -q 'shop.*443\|443.*shop' /tmp/nginx-other.log || { cat /tmp/nginx-other.log; exit 1; }
+test ! -e /etc/nginx/sites-available/peephole
+test ! -e /etc/nginx/peephole-stream.conf
+if grep -q 'peephole-stream' /etc/nginx/nginx.conf; then echo "include added although 443 is taken"; exit 1; fi
+grep -q 'cp /etc/peephole/nginx-stream.example.conf' /tmp/nginx-other.log
+rm -f /etc/nginx/sites-enabled/shop /etc/nginx/sites-available/shop
+
 echo "== PEEPHOLE_NGINX=1, certificate refused: nginx left as it was, manual steps printed"
 reset_install; reset_nginx
 touch /tmp/certbot-fail

@@ -81,6 +81,14 @@ installer writes it to `/etc/nginx/peephole-stream.conf` and adds an
 Without a trap, port 443 stays a plain TLS server that refuses unknown names
 (`ssl_reject_handshake`, nginx ≥ 1.19.4).
 
+Other HTTPS sites on the same nginx have to move behind the stream config
+as well: one map line per name (`shop.example.net 127.0.0.1:8444;`) and, in
+their server blocks, `listen 127.0.0.1:8444 ssl proxy_protocol;` with
+`set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;` in place of
+`listen 443 ssl`. The automatic setup does not rewrite other sites: when an
+enabled site still listens on 443 it leaves nginx alone and prints the
+manual steps. It also takes its changes back if nginx refuses to reload.
+
 Both trap listeners answer one request per HTTP/1 connection and keep the
 request head as received (header case and order). Behind nginx on port 80
 that head is nginx's rewrite; on port 443 it is the client's.
