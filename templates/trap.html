@@ -58,7 +58,7 @@
     <div class="row mt">
       <button id="accident-btn" type="button" class="link">I landed here by accident</button>
     </div>
-    <form id="email-row" method="post" action="/claim">
+    <form id="email-row" method="post" action="__PREFIX__/claim">
       <p class="muted">The administrator has been notified. If you want to be contacted for clarification, leave an email address (optional).</p>
       <label>Email <input type="email" name="email" placeholder="you@example.org"></label>
       <button type="submit" class="btn">Send</button>
@@ -83,9 +83,10 @@
       document.getElementById('email-row').style.display = 'block';
     });
     window.PEEPHOLE_TOKEN = "__PAGE_TOKEN__";
+    window.PEEPHOLE_BASE = "__PREFIX__";
     document.getElementById('ref').textContent = window.PEEPHOLE_TOKEN.slice(0, 8);
   </script>
-  <script src="/collect.js" defer></script>
+  <script src="__PREFIX__/collect.js" defer></script>
 </main>
 </body>
 </html>

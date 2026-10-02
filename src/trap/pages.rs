@@ -1,5 +1,9 @@
-pub fn trap_page(token: &str) -> String {
-    include_str!("../../templates/trap.html").replace("__PAGE_TOKEN__", token)
+/// The trap page; `prefix` is where the helper endpoints live (validated
+/// by `TrapConfig`: a path without quotes or markup).
+pub fn trap_page(token: &str, prefix: &str) -> String {
+    include_str!("../../templates/trap.html")
+        .replace("__PAGE_TOKEN__", token)
+        .replace("__PREFIX__", prefix)
 }
 
 pub fn claim_confirmation() -> String {

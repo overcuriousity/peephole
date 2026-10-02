@@ -2,6 +2,8 @@
 (function () {
   "use strict";
   var TOKEN = window.PEEPHOLE_TOKEN || "";
+  // Helper endpoints may sit under a configured prefix (trap.helper_prefix).
+  var BASE = window.PEEPHOLE_BASE || "";
   var behavior = { mouse_events: 0, mouse_dist: 0, clicks: 0, scrolls: 0,
                    keys: [], fill_seconds: null };
   var lastX = null, lastY = null, firstFocus = null, submitTime = null;
@@ -120,10 +122,10 @@
   function postCollect() {
     var payload = JSON.stringify({ token: TOKEN, attrs: attrs, behavior: behavior });
     var sent = false;
-    try { sent = navigator.sendBeacon("/collect",
+    try { sent = navigator.sendBeacon(BASE + "/collect",
       new Blob([payload], { type: "application/json" })); } catch (e) {}
     if (!sent) {
-      try { fetch("/collect", { method: "POST", headers: { "content-type": "application/json" },
+      try { fetch(BASE + "/collect", { method: "POST", headers: { "content-type": "application/json" },
         body: payload, keepalive: true }); } catch (e) {}
     }
   }
@@ -184,7 +186,7 @@
   var panelTries = 0;
   function refreshPanel() {
     try {
-      fetch("/panel?token=" + encodeURIComponent(TOKEN))
+      fetch(BASE + "/panel?token=" + encodeURIComponent(TOKEN))
         .then(function (r) {
           if (r.status === 202 && ++panelTries < 8) setTimeout(refreshPanel, 1500 * panelTries);
           return r.ok ? r.text() : "";

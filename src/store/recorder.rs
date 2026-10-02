@@ -125,11 +125,19 @@ impl Recorder {
 
     /// Record a request from the IP `n.ip_id`. Returns the request id.
     pub async fn insert_request(&self, n: &NewRequest) -> Result<i64> {
+        let ip = self.ip_of(n.ip_id).await?;
+        Ok(self.insert_request_from(&ip, n).await?.0)
+    }
+
+    /// Record a request from `ip`, creating the IP's row if it has none
+    /// (the trap's path: one write transaction, no separate IP upsert).
+    /// `n.ip_id` is not used. Returns the request's and the IP's row ids.
+    pub async fn insert_request_from(&self, ip: &str, n: &NewRequest) -> Result<(i64, i64)> {
         let uid = self.uid();
         self.write(vec![Record::Request(RequestRec {
             uid: uid.clone(),
             ts: now_ts(),
-            ip: self.ip_of(n.ip_id).await?,
+            ip: ip.to_string(),
             method: n.method.clone(),
             path: n.path.clone(),
             query: n.query.clone(),
@@ -142,7 +150,11 @@ impl Recorder {
             page_token: n.page_token.clone(),
         })])
         .await?;
-        self.id_by_uid("requests", &uid).await
+        sqlx::query_as("SELECT id, ip_id FROM requests WHERE uid = ?")
+            .bind(&uid)
+            .fetch_optional(&self.store().pool)
+            .await?
+            .with_context(|| format!("requests {uid} was not stored"))
     }
 
     /// Record one provider's result for an IP. Nothing is written when this
