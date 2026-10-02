@@ -1470,4 +1470,102 @@ mod tests {
             v.labels
         );
     }
+
+    #[test]
+    fn ai_infrastructure_probes_are_level_2() {
+        for p in [
+            "/v1/models",
+            "/v1/chat/completions",
+            "/api/generate",
+            "/api/tags",
+            "/api/chat",
+            "/tree",
+            "/api/terminals",
+            "/gradio_api/info",
+            "/api/2.0/mlflow/experiments/list",
+            "/.well-known/ai-plugin.json",
+            "/model.safetensors",
+            "/collections",
+            "/v1/schema",
+            "/api/v1/chatflows",
+            "/console/api/setup",
+            "/rest/credentials",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "ai-infra-probe"),
+                "{p}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 2, "{p}");
+        }
+    }
+
+    #[test]
+    fn mcp_probes_are_level_3_and_abuse_is_level_4() {
+        let v = classifier().classify(
+            &view("GET", "/mcp", None, "curl/8", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.iter().any(|l| l == "mcp-probe"), "{:?}", v.labels);
+        assert_eq!(v.scan_level, 3);
+        let b = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let v = classifier().classify(
+            &view("POST", "/mcp", None, "curl/8", Some(b)),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.iter().any(|l| l == "mcp-probe"), "{:?}", v.labels);
+        let b = br#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"file:///etc/passwd"}}"#;
+        let v = classifier().classify(
+            &view("POST", "/mcp", None, "curl/8", Some(b)),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.iter().any(|l| l == "mcp-abuse"), "{:?}", v.labels);
+        assert_eq!(v.scan_level, 4);
+    }
+
+    #[test]
+    fn cloud_control_plane_probes_are_level_3() {
+        for p in [
+            "/api/v1/namespaces",
+            "/api/v1/pods",
+            "/api/v1/secrets",
+            "/_ping",
+            "/v1.24/containers/json",
+            "/v1/agent/self",
+            "/v1/sys/seal-status",
+            "/v2/keys/",
+            "/config_dump",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "cloud-infra-probe"),
+                "{p}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 3, "{p}");
+        }
+        // A generic application API is not the Kubernetes API.
+        let v = classifier().classify(
+            &view("GET", "/api/v1/users", None, "Mozilla/5.0", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            !v.labels.iter().any(|l| l == "cloud-infra-probe"),
+            "{:?}",
+            v.labels
+        );
+    }
 }
