@@ -32,15 +32,9 @@ impl FromRequestParts<Arc<AdminState>> for MaybeUser {
         let jar = axum_extra::extract::CookieJar::from_request_parts(parts, state)
             .await
             .unwrap_or_else(|_| axum_extra::extract::CookieJar::new());
-        let ok = match jar.get("peephole_session") {
-            Some(c) => state
-                .store
-                .validate_session(c.value())
-                .await
-                .unwrap_or(false),
-            None => false,
-        };
-        Ok(MaybeUser(ok))
+        Ok(MaybeUser(
+            crate::admin::auth::session_valid(state, &jar).await,
+        ))
     }
 }
 

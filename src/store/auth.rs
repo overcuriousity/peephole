@@ -33,41 +33,88 @@ impl Store {
     }
 
     pub async fn delete_credential(&self, cred_id: &[u8]) -> Result<()> {
-        sqlx::query("DELETE FROM credentials WHERE cred_id = ?")
-            .bind(cred_id)
-            .execute(&self.pool)
-            .await?;
+        let mut tx = self.pool.begin().await?;
+        for sql in [
+            "DELETE FROM credentials WHERE cred_id = ?",
+            "DELETE FROM sessions WHERE cred_id = ?",
+        ] {
+            sqlx::query(sql).bind(cred_id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
     /// Delete a key only while at least one other remains, atomically, so two
     /// concurrent deletes cannot both pass a "more than one key" check and
     /// leave the admin locked out. Returns whether a row was deleted.
+    /// Sessions signed in with the key end with it.
     pub async fn delete_credential_keeping_last(&self, cred_id: &[u8]) -> Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let r = sqlx::query(
             "DELETE FROM credentials
              WHERE cred_id = ? AND (SELECT COUNT(*) FROM credentials) > 1",
         )
         .bind(cred_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(r.rows_affected() > 0)
+        let deleted = r.rows_affected() > 0;
+        if deleted {
+            sqlx::query("DELETE FROM sessions WHERE cred_id = ?")
+                .bind(cred_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(deleted)
     }
 
+    /// A session not bound to a key (tests and tooling).
     pub async fn create_session(&self) -> Result<String> {
+        self.create_session_for(None, None).await
+    }
+
+    /// Start a session for the key `cred_id` (deleting the key ends it) and
+    /// end `replacing`, the session the browser held before, if any. Returns
+    /// the token for the cookie; only its SHA-256 is stored.
+    pub async fn create_session_for(
+        &self,
+        cred_id: Option<&[u8]>,
+        replacing: Option<&str>,
+    ) -> Result<String> {
         // Opportunistic cleanup of stale rows; cheap and keeps the tables bounded.
         let _ = self.prune_expired_auth().await;
-        let id = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO sessions (id, created_at, expires_at) VALUES (?,datetime('now'),datetime('now','+12 hours'))")
-            .bind(&id).execute(&self.pool).await?;
-        Ok(id)
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let mut tx = self.pool.begin().await?;
+        if let Some(old) = replacing {
+            sqlx::query("DELETE FROM sessions WHERE id_hash = ?")
+                .bind(token_hash(old))
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO sessions (id_hash, cred_id, created_at, last_seen, expires_at)
+             VALUES (?, ?, datetime('now'), datetime('now'), datetime('now', '+{SESSION_HOURS} hours'))"
+        )))
+        .bind(token_hash(&token))
+        .bind(cred_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(token)
     }
 
-    /// Delete expired sessions and WebAuthn ceremony states.
+    /// Delete expired sessions (absolute or idle) and WebAuthn ceremony states.
     pub async fn prune_expired_auth(&self) -> Result<()> {
-        sqlx::query("DELETE FROM sessions WHERE expires_at <= datetime('now')")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM sessions WHERE expires_at <= datetime('now')
+                OR last_seen <= datetime('now', '-{SESSION_IDLE_MINUTES} minutes')"
+        )))
+        .execute(&self.pool)
+        .await?;
         sqlx::query("DELETE FROM webauthn_states WHERE expires_at <= datetime('now')")
             .execute(&self.pool)
             .await?;
@@ -76,24 +123,31 @@ impl Store {
 
     /// Store a WebAuthn ceremony state server-side and return its random id.
     /// The id is all the client ever holds; it cannot see or alter the state.
+    /// `None` when [`MAX_OPEN_CEREMONIES`] are already open: anonymous
+    /// clients start these, so their number is bounded.
     pub async fn put_webauthn_state(
         &self,
         kind: &str,
         state_json: &str,
         label: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
         let id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
+        let stored = sqlx::query(
             "INSERT INTO webauthn_states (id, kind, state_json, label, created_at, expires_at)
-             VALUES (?,?,?,?,datetime('now'),datetime('now','+10 minutes'))",
+             SELECT ?, ?, ?, ?, datetime('now'), datetime('now','+10 minutes')
+             WHERE (SELECT COUNT(*) FROM webauthn_states
+                    WHERE expires_at > datetime('now')) < ?",
         )
         .bind(&id)
         .bind(kind)
         .bind(state_json)
         .bind(label)
+        .bind(MAX_OPEN_CEREMONIES)
         .execute(&self.pool)
-        .await?;
-        Ok(id)
+        .await?
+        .rows_affected()
+            == 1;
+        Ok(stored.then_some(id))
     }
 
     /// Consume a ceremony state: returns `(state_json, label)` and deletes the
@@ -115,23 +169,130 @@ impl Store {
         .await?)
     }
 
-    pub async fn validate_session(&self, id: &str) -> Result<bool> {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sessions WHERE id = ? AND expires_at > datetime('now')",
-        )
-        .bind(id)
-        .fetch_one(&self.pool)
+    /// Whether `token` is a live session: within its absolute lifetime and
+    /// used within the idle timeout. Use slides the idle timeout (at most
+    /// one write a minute per session).
+    pub async fn validate_session(&self, token: &str) -> Result<bool> {
+        let hash = token_hash(token);
+        let row: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT last_seen < datetime('now', '-60 seconds') FROM sessions
+             WHERE id_hash = ? AND expires_at > datetime('now')
+               AND last_seen > datetime('now', '-{SESSION_IDLE_MINUTES} minutes')"
+        )))
+        .bind(&hash)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(n == 1)
+        let Some(touch) = row else {
+            return Ok(false);
+        };
+        if touch == 1 {
+            sqlx::query("UPDATE sessions SET last_seen = datetime('now') WHERE id_hash = ?")
+                .bind(&hash)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(true)
     }
 
-    pub async fn destroy_session(&self, id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM sessions WHERE id = ?")
-            .bind(id)
+    pub async fn destroy_session(&self, token: &str) -> Result<()> {
+        sqlx::query("DELETE FROM sessions WHERE id_hash = ?")
+            .bind(token_hash(token))
             .execute(&self.pool)
             .await?;
         Ok(())
     }
+
+    /// Whether the admin setup token `token` is the current one and unexpired.
+    pub async fn setup_token_valid(&self, token: &str) -> Result<bool> {
+        let (Some(hash), Some(expires)) = (
+            self.intel_get(SETUP_TOKEN_HASH).await?,
+            self.intel_get(SETUP_TOKEN_EXPIRES).await?,
+        ) else {
+            return Ok(false);
+        };
+        let live =
+            chrono::DateTime::parse_from_rfc3339(&expires).is_ok_and(|t| t > chrono::Utc::now());
+        Ok(live && hash == token_hash(token))
+    }
+
+    /// Issue a fresh setup token (replacing any earlier one), valid for
+    /// [`SETUP_TOKEN_HOURS`]. Returns the token; only its hash is stored.
+    pub async fn issue_setup_token(&self) -> Result<String> {
+        let token = uuid::Uuid::new_v4().to_string();
+        let expires = chrono::Utc::now() + chrono::Duration::hours(SETUP_TOKEN_HOURS);
+        let mut tx = self.pool.begin().await?;
+        for (k, v) in [
+            (SETUP_TOKEN_HASH, token_hash(&token)),
+            (SETUP_TOKEN_EXPIRES, expires.to_rfc3339()),
+        ] {
+            sqlx::query(
+                "INSERT INTO intel_meta (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(k)
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(token)
+    }
+
+    /// Mark the setup token used (the first key is enrolled).
+    pub async fn consume_setup_token(&self) -> Result<()> {
+        self.intel_set(SETUP_TOKEN_HASH, "consumed").await
+    }
+
+    /// The setup token's state, for deciding whether to issue a new one.
+    pub async fn setup_token_state(&self) -> Result<SetupToken> {
+        let hash = self.intel_get(SETUP_TOKEN_HASH).await?;
+        let expires = self.intel_get(SETUP_TOKEN_EXPIRES).await?;
+        Ok(match (hash.as_deref(), expires) {
+            (None, _) | (Some("consumed"), _) => SetupToken::None,
+            (Some(_), None) => SetupToken::Legacy,
+            (Some(_), Some(e)) => match chrono::DateTime::parse_from_rfc3339(&e) {
+                Ok(t) if t > chrono::Utc::now() => SetupToken::Live,
+                _ => SetupToken::Expired,
+            },
+        })
+    }
+
+    /// Give a token issued before tokens expired a lifetime from now.
+    pub async fn date_legacy_setup_token(&self) -> Result<()> {
+        let expires = chrono::Utc::now() + chrono::Duration::hours(SETUP_TOKEN_HOURS);
+        self.intel_set(SETUP_TOKEN_EXPIRES, &expires.to_rfc3339())
+            .await
+    }
+}
+
+/// Absolute session lifetime.
+pub const SESSION_HOURS: i64 = 12;
+/// Sessions end after this long without a request.
+pub const SESSION_IDLE_MINUTES: i64 = 60;
+/// Open (unexpired) WebAuthn ceremonies at most; more are refused.
+pub const MAX_OPEN_CEREMONIES: i64 = 256;
+/// Lifetime of the first-run setup token.
+pub const SETUP_TOKEN_HOURS: i64 = 24;
+const SETUP_TOKEN_HASH: &str = "webauthn_setup_token_hash";
+const SETUP_TOKEN_EXPIRES: &str = "webauthn_setup_token_expires";
+
+/// The first-run setup token, as far as the database knows.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetupToken {
+    /// None issued, or the one issued was used.
+    None,
+    /// Issued and still valid.
+    Live,
+    /// Issued and expired.
+    Expired,
+    /// Issued by a build without expiry.
+    Legacy,
+}
+
+/// What is stored for a session or setup token: hex SHA-256.
+pub fn token_hash(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    data_encoding::HEXLOWER.encode(&Sha256::digest(token.as_bytes()))
 }
 
 #[cfg(test)]
@@ -162,6 +323,7 @@ mod tests {
         let id = s
             .put_webauthn_state("auth", r#"{"x":1}"#, None)
             .await
+            .unwrap()
             .unwrap();
         // Wrong kind never matches.
         assert!(s.take_webauthn_state(&id, "reg").await.unwrap().is_none());
@@ -197,7 +359,133 @@ mod tests {
         let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
         let id = s.create_session().await.unwrap();
         assert!(s.validate_session(&id).await.unwrap());
+        // Only a hash of the token is stored.
+        let stored: String = sqlx::query_scalar("SELECT id_hash FROM sessions")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_ne!(stored, id);
+        assert_eq!(stored, super::token_hash(&id));
         s.destroy_session(&id).await.unwrap();
         assert!(!s.validate_session(&id).await.unwrap());
+    }
+
+    async fn set_last_seen(s: &Store, modifier: &str) {
+        sqlx::query("UPDATE sessions SET last_seen = datetime('now', ?)")
+            .bind(modifier)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_sessions_expire_and_use_slides_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let id = s.create_session().await.unwrap();
+        set_last_seen(&s, "-50 minutes").await;
+        assert!(s.validate_session(&id).await.unwrap(), "within idle window");
+        // Validation moved last_seen to now.
+        let fresh: i64 =
+            sqlx::query_scalar("SELECT last_seen > datetime('now', '-1 minute') FROM sessions")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(fresh, 1);
+        set_last_seen(&s, "-61 minutes").await;
+        assert!(!s.validate_session(&id).await.unwrap(), "idle too long");
+        // The absolute lifetime still applies to a busy session.
+        let id = s.create_session().await.unwrap();
+        sqlx::query("UPDATE sessions SET expires_at = datetime('now', '-1 second')")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert!(!s.validate_session(&id).await.unwrap());
+        s.prune_expired_auth().await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_login_replaces_the_old_session_and_key_deletion_ends_its_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        s.save_credential(b"a", "{}", None).await.unwrap();
+        s.save_credential(b"b", "{}", None).await.unwrap();
+        let first = s.create_session_for(Some(b"a"), None).await.unwrap();
+        let second = s
+            .create_session_for(Some(b"a"), Some(&first))
+            .await
+            .unwrap();
+        assert!(!s.validate_session(&first).await.unwrap(), "replaced");
+        assert!(s.validate_session(&second).await.unwrap());
+        let with_b = s.create_session_for(Some(b"b"), None).await.unwrap();
+        assert!(s.delete_credential_keeping_last(b"a").await.unwrap());
+        assert!(!s.validate_session(&second).await.unwrap(), "key deleted");
+        assert!(s.validate_session(&with_b).await.unwrap(), "other key");
+    }
+
+    #[tokio::test]
+    async fn open_ceremonies_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        for _ in 0..super::MAX_OPEN_CEREMONIES {
+            assert!(
+                s.put_webauthn_state("auth", "{}", None)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            s.put_webauthn_state("auth", "{}", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Expired ones do not count.
+        sqlx::query(
+            "UPDATE webauthn_states SET expires_at = datetime('now', '-1 second')
+             WHERE rowid IN (SELECT rowid FROM webauthn_states LIMIT 1)",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        assert!(
+            s.put_webauthn_state("auth", "{}", None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_tokens_expire() {
+        use super::SetupToken;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        assert_eq!(s.setup_token_state().await.unwrap(), SetupToken::None);
+        let t = s.issue_setup_token().await.unwrap();
+        assert_eq!(s.setup_token_state().await.unwrap(), SetupToken::Live);
+        assert!(s.setup_token_valid(&t).await.unwrap());
+        assert!(!s.setup_token_valid("other").await.unwrap());
+        s.intel_set(
+            "webauthn_setup_token_expires",
+            &(chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.setup_token_state().await.unwrap(), SetupToken::Expired);
+        assert!(!s.setup_token_valid(&t).await.unwrap());
+        // A new one replaces it.
+        let t2 = s.issue_setup_token().await.unwrap();
+        assert!(s.setup_token_valid(&t2).await.unwrap());
+        assert!(!s.setup_token_valid(&t).await.unwrap());
+        s.consume_setup_token().await.unwrap();
+        assert!(!s.setup_token_valid(&t2).await.unwrap());
+        assert_eq!(s.setup_token_state().await.unwrap(), SetupToken::None);
     }
 }
