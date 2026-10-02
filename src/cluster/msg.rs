@@ -20,8 +20,17 @@ const MSG_DOMAIN: &[u8] = b"peephole-msg-v1\0";
 const MAX_HOPS: u8 = 8;
 /// Messages older than this are refused (replay window).
 const MAX_AGE: Duration = Duration::from_secs(600);
+/// Messages dated further ahead than this are refused: they would outlive
+/// the duplicate filter and could be replayed after it forgot them.
+const MAX_AHEAD: Duration = Duration::from_secs(300);
 /// Undelivered outbox messages are dropped after this.
 const OUTBOX_TTL: Duration = Duration::from_secs(120);
+/// Messages waiting in one peer's outbox; older ones are dropped first.
+const MAX_OUTBOX: usize = 256;
+/// Messages being routed at once; more are refused (the sender retries).
+pub const MAX_ROUTING: usize = 256;
+/// A heartbeat listing more neighbours than this contributes none.
+const MAX_NEIGHBOURS: usize = 256;
 /// How long a peer's inbox long-poll is held open.
 pub const INBOX_WAIT: Duration = Duration::from_secs(25);
 
@@ -140,6 +149,16 @@ impl Envelope {
     }
 }
 
+impl Body {
+    /// Within the replay window: not older than [`MAX_AGE`], not dated
+    /// more than [`MAX_AHEAD`] into the future.
+    pub fn fresh(&self) -> bool {
+        let now = now_ms();
+        self.created_ms <= now + MAX_AHEAD.as_millis() as u64
+            && now.saturating_sub(self.created_ms) <= MAX_AGE.as_millis() as u64
+    }
+}
+
 /// Handles requests addressed to this node; the answer goes back to the
 /// sender. Registered once by the subsystems (arbiter, pace).
 pub type Handler = Arc<dyn Fn(NodeId, Msg) -> BoxFuture<'static, Option<Msg>> + Send + Sync>;
@@ -177,12 +196,24 @@ impl Node {
             .lock()
             .unwrap()
             .insert(id.clone(), (to, tx));
-        let sent = self.route(env).await;
-        let out = match sent {
-            Ok(()) => tokio::time::timeout(timeout, rx)
-                .await
-                .map_err(|_| anyhow::anyhow!("no answer from {} within {timeout:?}", to.short()))
-                .and_then(|r| r.map_err(|_| anyhow::anyhow!("request dropped"))),
+        let mut rx = rx;
+        let no_answer = || anyhow::anyhow!("no answer from {} within {timeout:?}", to.short());
+        let out = match self.route_avoiding(env.clone(), vec![]).await {
+            Ok(hop) => match tokio::time::timeout(timeout / 2, &mut rx).await {
+                Ok(r) => r.map_err(|_| anyhow::anyhow!("request dropped")),
+                Err(_) => {
+                    // No answer yet: send it once more around the first hop
+                    // used, in case that relay drops it. The id stays the
+                    // same, so the destination handles it only once.
+                    if let Some(h) = hop {
+                        let _ = self.route_avoiding(env, vec![h]).await;
+                    }
+                    tokio::time::timeout(timeout - timeout / 2, rx)
+                        .await
+                        .map_err(|_| no_answer())
+                        .and_then(|r| r.map_err(|_| anyhow::anyhow!("request dropped")))
+                }
+            },
             Err(e) => Err(e),
         };
         self.msg.replies.lock().unwrap().remove(&id);
@@ -192,19 +223,30 @@ impl Node {
     /// Send or forward a message one step towards its destination.
     pub fn route(self: &Arc<Self>, env: Envelope) -> BoxFuture<'static, Result<()>> {
         let node = self.clone();
+        Box::pin(async move { node.route_avoiding(env, vec![]).await.map(|_| ()) })
+    }
+
+    /// Like [`Node::route`], never via the first hops in `avoid`. Returns the
+    /// first hop used (None: delivered here).
+    pub fn route_avoiding(
+        self: &Arc<Self>,
+        env: Envelope,
+        avoid: Vec<NodeId>,
+    ) -> BoxFuture<'static, Result<Option<NodeId>>> {
+        let node = self.clone();
         Box::pin(async move {
             let body = env.open()?;
             if body.to == node.id() {
                 node.deliver(body).await;
-                return Ok(());
+                return Ok(None);
             }
             if env.hops >= MAX_HOPS {
                 bail!("message to {} exceeded {MAX_HOPS} hops", body.to.short());
             }
-            match node.next_hop(&body.to) {
+            match node.next_hop(&body.to, &avoid) {
                 Some(Hop::Dial(peer, addr)) => {
                     let _: bool = node.call(peer, &addr, "/rpc/v1/msg", &env).await?;
-                    Ok(())
+                    Ok(Some(peer))
                 }
                 Some(Hop::Outbox(peer)) => {
                     let mut all = node.msg.outbox.lock().unwrap();
@@ -213,47 +255,86 @@ impl Node {
                         q.retain(|(_, t)| t.elapsed() < OUTBOX_TTL);
                     }
                     all.retain(|_, q| !q.is_empty());
-                    all.entry(peer)
-                        .or_default()
-                        .push_back((env, Instant::now()));
+                    let q = all.entry(peer).or_default();
+                    while q.len() >= MAX_OUTBOX {
+                        q.pop_front();
+                    }
+                    q.push_back((env, Instant::now()));
                     drop(all);
                     node.msg.outbox_changed.notify_waiters();
-                    Ok(())
+                    Ok(Some(peer))
                 }
                 None => bail!("no route to {}", body.to.short()),
             }
         })
     }
 
-    fn next_hop(&self, to: &NodeId) -> Option<Hop> {
+    /// Whether dialling `id` failed last time (it is retried by its sync
+    /// loop with backoff, not by every message).
+    fn dial_failing(&self, id: &NodeId) -> bool {
+        self.peer_status
+            .read()
+            .unwrap()
+            .get(id)
+            .is_some_and(|s| s.last_error.is_some())
+    }
+
+    fn next_hop(&self, to: &NodeId, avoid: &[NodeId]) -> Option<Hop> {
         let dial: HashMap<NodeId, String> = self
             .dial_targets()
             .into_iter()
+            .filter(|(id, _, _)| !avoid.contains(id))
             .map(|(id, _, addr)| (id, addr))
             .collect();
         let via = |id: &NodeId, fresh_only: bool| -> Option<Hop> {
+            if avoid.contains(id) {
+                return None;
+            }
             if let Some(addr) = dial.get(id)
-                && (!fresh_only || self.status.reached_recently(id))
+                && (if fresh_only {
+                    self.status.reached_recently(id)
+                } else {
+                    !self.dial_failing(id)
+                })
             {
                 return Some(Hop::Dial(*id, addr.clone()));
             }
             self.status.polled_recently(id).then_some(Hop::Outbox(*id))
         };
+        // Direct delivery first.
         if let Some(h) = via(to, true) {
             return Some(h);
         }
         // Shortest path over the neighbour graph; first hop must be ours.
+        // Heartbeats are self-asserted: only members count, a node listing
+        // too many neighbours contributes none, and an edge between two
+        // other nodes counts only if both list it, so no node can make
+        // itself everybody's relay by claiming to be.
+        let members = self.members();
+        let mut claimed: HashSet<(NodeId, NodeId)> = HashSet::new();
+        for k in self.status.heartbeats.lock().unwrap().values() {
+            if k.hb.neighbours.len() > MAX_NEIGHBOURS || !members.contains_key(&k.hb.node) {
+                continue;
+            }
+            for n in &k.hb.neighbours {
+                if members.contains_key(n) {
+                    claimed.insert((k.hb.node, *n));
+                }
+            }
+        }
         let mut adj: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
         let mut link = |a: NodeId, b: NodeId| {
             adj.entry(a).or_default().insert(b);
             adj.entry(b).or_default().insert(a);
         };
         for n in self.status.neighbours() {
-            link(self.id(), n);
+            if !avoid.contains(&n) {
+                link(self.id(), n);
+            }
         }
-        for k in self.status.heartbeats.lock().unwrap().values() {
-            for n in &k.hb.neighbours {
-                link(k.hb.node, *n);
+        for (a, b) in &claimed {
+            if *a != self.id() && *b != self.id() && claimed.contains(&(*b, *a)) {
+                link(*a, *b);
             }
         }
         let mut prev: HashMap<NodeId, NodeId> = HashMap::new();
@@ -290,9 +371,8 @@ impl Node {
         if !self.is_member(&b.from) {
             return debug!(from = %b.from.short(), "message from non-member dropped");
         }
-        let age = now_ms().saturating_sub(b.created_ms);
-        if age > MAX_AGE.as_millis() as u64 {
-            return debug!(from = %b.from.short(), "stale message dropped");
+        if !b.fresh() {
+            return debug!(from = %b.from.short(), "stale or future-dated message dropped");
         }
         {
             let mut seen = self.msg.seen.lock().unwrap();
@@ -369,10 +449,15 @@ pub async fn inbox_loop(node: Arc<Node>, peer: NodeId, addr: String) {
         {
             Ok(envs) => {
                 backoff = Duration::from_secs(1);
-                for mut env in envs {
+                for mut env in envs.into_iter().take(MAX_OUTBOX) {
                     env.hops = env.hops.saturating_add(1);
+                    let Ok(permit) = node.route_slots.clone().try_acquire_owned() else {
+                        debug!("too many messages in flight; inbox message dropped");
+                        continue;
+                    };
                     let n = node.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = n.route(env).await {
                             debug!(?e, "inbox message not routed");
                         }
@@ -384,5 +469,31 @@ pub async fn inbox_loop(node: Arc<Node>, peer: NodeId, addr: String) {
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_from_the_future_are_not_fresh() {
+        let id = crate::cluster::identity::Identity::generate().unwrap().id;
+        let at = |created_ms| Body {
+            id: "x".into(),
+            from: id,
+            to: id,
+            created_ms,
+            in_reply_to: None,
+            msg: Msg::Claim,
+        };
+        let now = now_ms();
+        assert!(at(now).fresh());
+        assert!(at(now + 60_000).fresh(), "small clock skew is fine");
+        assert!(
+            !at(now + 3_600_000).fresh(),
+            "would outlive the replay filter"
+        );
+        assert!(!at(now - 3_600_000).fresh());
     }
 }

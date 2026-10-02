@@ -153,6 +153,64 @@ pub async fn leave(node: &Node) -> Result<usize> {
     Ok(told)
 }
 
+/// Largest RPC reply this node reads (the server's body limit plus room for
+/// a batch at its byte budget).
+pub const MAX_REPLY: usize = 80 * 1024 * 1024;
+
+/// Join attempts in the last minute, per source.
+#[derive(Default)]
+pub struct JoinAttempts {
+    all: std::collections::VecDeque<std::time::Instant>,
+    by_source: HashMap<String, std::collections::VecDeque<std::time::Instant>>,
+}
+
+impl JoinAttempts {
+    /// Per address (IPv6: per /64) and per key a few attempts a minute; 60
+    /// a minute in total.
+    const PER_ADDRESS: usize = 10;
+    const PER_KEY: usize = 5;
+    const TOTAL: usize = 60;
+
+    fn allow(&mut self, peer: NodeId, ip: std::net::IpAddr, now: std::time::Instant) -> bool {
+        let fresh = |q: &mut std::collections::VecDeque<std::time::Instant>| {
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(60))
+            {
+                q.pop_front();
+            }
+        };
+        fresh(&mut self.all);
+        self.by_source.retain(|_, q| {
+            fresh(q);
+            !q.is_empty()
+        });
+        let net = match crate::net::canonical(ip) {
+            std::net::IpAddr::V6(v6) => {
+                let s = v6.segments();
+                format!("ip:{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+            v4 => format!("ip:{v4}"),
+        };
+        let sources = [
+            (net, Self::PER_ADDRESS),
+            (format!("key:{peer}"), Self::PER_KEY),
+        ];
+        if self.all.len() >= Self::TOTAL
+            || sources
+                .iter()
+                .any(|(k, limit)| self.by_source.get(k).is_some_and(|q| q.len() >= *limit))
+        {
+            return false;
+        }
+        self.all.push_back(now);
+        for (k, _) in sources {
+            self.by_source.entry(k).or_default().push_back(now);
+        }
+        true
+    }
+}
+
 /// Last contact with a peer, for logs and the admin UI.
 #[derive(Debug, Clone, Default)]
 pub struct PeerStatus {
@@ -188,9 +246,11 @@ pub struct Node {
     pub apply_lock: tokio::sync::Mutex<()>,
     /// Bumped whenever the log grows; wakes sync loops and long-polls.
     changed: tokio::sync::watch::Sender<u64>,
-    join_attempts: Mutex<std::collections::VecDeque<std::time::Instant>>,
+    join_attempts: Mutex<JoinAttempts>,
     /// Sync exchanges running at once (see `sync::MAX_CONCURRENT_SYNCS`).
     pub sync_slots: tokio::sync::Semaphore,
+    /// Directed messages being routed at once (see `msg`).
+    pub route_slots: Arc<tokio::sync::Semaphore>,
     /// Wakes the sync supervisor when the set of dialable members changes.
     pub members_changed: tokio::sync::Notify,
     /// Enrichment providers this node can query right now (heartbeats).
@@ -233,6 +293,7 @@ impl Node {
             changed: tokio::sync::watch::channel(0).0,
             join_attempts: Mutex::new(Default::default()),
             sync_slots: tokio::sync::Semaphore::new(sync::MAX_CONCURRENT_SYNCS),
+            route_slots: Arc::new(tokio::sync::Semaphore::new(msg::MAX_ROUTING)),
             members_changed: tokio::sync::Notify::new(),
             providers: RwLock::new(vec![]),
             data_dir: p.data_dir,
@@ -488,22 +549,16 @@ impl Node {
         self.changed.subscribe()
     }
 
-    /// Allow at most 10 join attempts per minute (invite secrets are 256-bit,
-    /// this only keeps junk traffic cheap).
-    pub fn join_allowed(&self) -> bool {
-        let mut q = self.join_attempts.lock().unwrap();
-        let now = std::time::Instant::now();
-        while q
-            .front()
-            .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(60))
-        {
-            q.pop_front();
-        }
-        if q.len() >= 10 {
-            return false;
-        }
-        q.push_back(now);
-        true
+    /// Whether a join attempt from `peer` at `ip` may proceed. Invite
+    /// secrets are 256-bit; the limits only keep junk traffic cheap. They
+    /// apply per address (an IPv6 /64 counts as one) and per key, plus a
+    /// generous global cap, so one source cannot use up everybody's
+    /// attempts.
+    pub fn join_allowed(&self, peer: NodeId, ip: std::net::IpAddr) -> bool {
+        self.join_attempts
+            .lock()
+            .unwrap()
+            .allow(peer, ip, std::time::Instant::now())
     }
 
     pub fn local_hello(&self) -> Hello {
@@ -540,7 +595,8 @@ impl Node {
         Ok(c)
     }
 
-    /// POST a CBOR body; returns the status and raw reply.
+    /// POST a CBOR body; returns the status and raw reply. Replies larger
+    /// than [`MAX_REPLY`] are refused, whatever the peer sends.
     pub async fn call_raw<Req: serde::Serialize>(
         &self,
         peer: NodeId,
@@ -548,7 +604,7 @@ impl Node {
         path: &str,
         body: &Req,
     ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
-        let resp = self
+        let mut resp = self
             .client_for(peer)?
             .post(format!("https://{address}{path}"))
             .header(reqwest::header::CONTENT_TYPE, rpc::cbor::CONTENT_TYPE)
@@ -556,7 +612,17 @@ impl Node {
             .send()
             .await?;
         let status = resp.status();
-        Ok((status, resp.bytes().await?.to_vec()))
+        if resp.content_length().is_some_and(|n| n > MAX_REPLY as u64) {
+            bail!("{path}: reply larger than {MAX_REPLY} bytes");
+        }
+        let mut out = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if out.len() + chunk.len() > MAX_REPLY {
+                bail!("{path}: reply larger than {MAX_REPLY} bytes");
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok((status, out))
     }
 
     /// POST a CBOR body and decode a successful reply; errors carry the
@@ -687,6 +753,7 @@ pub async fn start(
         listener,
         tls,
         rpc::router(node.clone()),
+        node.clone(),
         shutdown.clone(),
     ));
     tokio::spawn(heartbeat_loop(node.clone(), shutdown.clone()));
@@ -744,5 +811,39 @@ async fn heartbeat_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Recei
             _ = tokio::time::sleep(status::HEARTBEAT_EVERY) => {}
             _ = shutdown.changed() => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_attempts_are_limited_per_source_not_globally_first() {
+        let mut j = JoinAttempts::default();
+        let now = std::time::Instant::now();
+        let key = |_| identity::Identity::generate().unwrap().id;
+        let ip: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        // One address, fresh keys each time: limited per address.
+        for i in 0..JoinAttempts::PER_ADDRESS {
+            assert!(j.allow(key(i), ip, now));
+        }
+        assert!(!j.allow(key(0), ip, now));
+        // Another address is unaffected; one key is limited on its own.
+        let k = key(0);
+        for i in 0..JoinAttempts::PER_KEY {
+            let other: std::net::IpAddr = format!("203.0.113.{}", i + 1).parse().unwrap();
+            assert!(j.allow(k, other, now));
+        }
+        assert!(!j.allow(k, "192.0.2.1".parse().unwrap(), now));
+        // A whole IPv6 /64 counts as one address.
+        let a: std::net::IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: std::net::IpAddr = "2001:db8:1:2::ffff".parse().unwrap();
+        for _ in 0..JoinAttempts::PER_ADDRESS {
+            assert!(j.allow(key(0), a, now));
+        }
+        assert!(!j.allow(key(0), b, now));
+        // A minute later all is forgotten.
+        assert!(j.allow(key(0), ip, now + Duration::from_secs(61)));
     }
 }
