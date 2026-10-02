@@ -8,6 +8,7 @@ pub mod fingerprint;
 pub mod intel;
 pub mod net;
 pub mod scan;
+pub mod sd_notify;
 pub mod settings;
 pub mod settings_cli;
 pub mod store;
@@ -20,10 +21,8 @@ use tracing::{info, warn};
 
 /// Build version, baked in by `build.rs` from `PEEPHOLE_VERSION` ("dev" locally).
 pub const VERSION: &str = env!("PEEPHOLE_VERSION");
-
-fn nmap_path() -> String {
-    std::env::var("PEEPHOLE_NMAP_PATH").unwrap_or_else(|_| "nmap".into())
-}
+/// Commit the binary was built from (12 hex digits, or "unknown"), from `build.rs`.
+pub const COMMIT: &str = env!("PEEPHOLE_COMMIT");
 
 /// Startup validation shared by `run` and `check-config`: config parses and
 /// is sane, rules load (listener), nmap is executable (scanner). Returns the
@@ -43,7 +42,7 @@ pub async fn check_config(
         _ => None,
     };
     if cfg.roles.scanner {
-        let nmap = nmap_path();
+        let nmap = cfg.scan.nmap();
         let out = tokio::process::Command::new(&nmap)
             .arg("--version")
             .output()
@@ -177,7 +176,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
 
     // Runtime settings: config defaults, overridden from the admin UI, the
     // CLI or a config key holder.
-    let nmap_ok = tokio::process::Command::new(nmap_path())
+    let nmap_ok = tokio::process::Command::new(cfg.scan.nmap())
         .arg("--version")
         .output()
         .await
@@ -225,6 +224,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let mut running = Running3::default();
     roles.reconcile(&mut running, true).await?;
     info!(roles = %settings.roles().names().join(","), "peephole up");
+    // Listeners are bound: `systemctl start` (Type=notify) returns now.
+    sd_notify::ready();
     let supervisor = tokio::spawn(roles.supervise(running, shutdown_rx.clone()));
     shutdown_signal().await;
     info!("shutting down");
@@ -466,7 +467,7 @@ impl RoleRunner {
                 self.recorder.clone(),
                 self.cfg.clone(),
                 self.settings.pace.clone(),
-                PathBuf::from(nmap_path()),
+                PathBuf::from(self.cfg.scan.nmap()),
                 rx,
                 self.notifier.clone(),
             )),

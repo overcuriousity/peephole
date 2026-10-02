@@ -1,13 +1,60 @@
 //! Concatenates the CSS layers into one embedded stylesheet, stamps the
-//! asset URLs with a content hash, and bakes the release version in.
+//! asset URLs with a content hash, and bakes the release version and the
+//! source commit in.
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     build_stylesheet();
     stamp_assets();
+    // The build's name: the commit for rolling builds, the tag for versioned
+    // releases (both set by CI), "dev" otherwise.
     println!("cargo:rerun-if-env-changed=PEEPHOLE_VERSION");
     let version = std::env::var("PEEPHOLE_VERSION").unwrap_or_else(|_| "dev".into());
     println!("cargo:rustc-env=PEEPHOLE_VERSION={version}");
+    println!("cargo:rustc-env=PEEPHOLE_COMMIT={}", commit());
+}
+
+/// The commit the binary is built from (12 hex digits): `PEEPHOLE_COMMIT`,
+/// else `GITHUB_SHA` (CI), else `git rev-parse HEAD`, else "unknown" (a
+/// source tree without git).
+fn commit() -> String {
+    println!("cargo:rerun-if-env-changed=PEEPHOLE_COMMIT");
+    println!("cargo:rerun-if-env-changed=GITHUB_SHA");
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git").args(args).output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let full = std::env::var("PEEPHOLE_COMMIT")
+        .ok()
+        .or_else(|| std::env::var("GITHUB_SHA").ok())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            // Rebuild when HEAD moves (a commit, a checkout): the reflog grows
+            // with every move, the branch ref may be packed. Only existing
+            // files: cargo reruns the script every time for a missing one.
+            let mut watch = vec![
+                "HEAD".to_string(),
+                "logs/HEAD".to_string(),
+                "packed-refs".to_string(),
+            ];
+            watch.extend(git(&["symbolic-ref", "-q", "HEAD"]));
+            for p in &watch {
+                if let Some(path) = git(&["rev-parse", "--git-path", p])
+                    && Path::new(&path).exists()
+                {
+                    println!("cargo:rerun-if-changed={path}");
+                }
+            }
+            git(&["rev-parse", "HEAD"])
+        });
+    match full {
+        Some(s) if s.chars().all(|c| c.is_ascii_hexdigit()) => s.chars().take(12).collect(),
+        _ => "unknown".into(),
+    }
 }
 
 /// `assets/app.css` = `assets/css/*.css` in filename order (numeric prefixes

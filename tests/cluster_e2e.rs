@@ -60,10 +60,7 @@ async fn listener_and_headless_scanner_share_everything() {
         .try_init();
     let a_dir = tempfile::tempdir().unwrap();
     let b_dir = tempfile::tempdir().unwrap();
-    // SAFETY: this test binary has a single test; set before run() reads it.
-    unsafe {
-        std::env::set_var("PEEPHOLE_NMAP_PATH", fake_nmap(b_dir.path()));
-    }
+    let nmap = fake_nmap(b_dir.path());
     let a_key = Identity::load_or_create(&a_dir.path().join("node.key")).unwrap();
     let b_key = Identity::load_or_create(&b_dir.path().join("node.key")).unwrap();
     let (trap, admin, a_rpc, b_rpc) = (free_port(), free_port(), free_port(), free_port());
@@ -115,6 +112,7 @@ max_scans_per_hour = 600
 # No Tor list and no DNS in tests.
 tor_unknown = "scan"
 verify_crawlers = false
+nmap_path = "{nmap}"
 [cluster]
 node_name = "scanner-b"
 listen = "127.0.0.1:{b_rpc}"
@@ -125,7 +123,8 @@ address = "127.0.0.1:{a_rpc}"
 public_key = "{a}"
 "#,
             d = b_dir.path().display(),
-            a = a_key.id
+            a = a_key.id,
+            nmap = nmap.display(),
         ),
     )
     .unwrap();

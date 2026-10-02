@@ -928,10 +928,11 @@ async fn export_download_requires_auth_and_filters() {
 async fn full_stack_smoke() {
     // Start the real run() against a temp config with ephemeral ports.
     let dir = tempfile::tempdir().unwrap();
+    let (trap, admin) = (free_port(), free_port());
     let cfg_text = format!(
         r#"
-trap_listen = "127.0.0.1:18080"
-admin_listen = "127.0.0.1:18443"
+trap_listen = "127.0.0.1:{trap}"
+admin_listen = "127.0.0.1:{admin}"
 database_path = "{db}"
 data_dir = "{d}"
 rules_dir = "rules"
@@ -952,31 +953,43 @@ max_scans_per_hour = 100
 # No Tor list and no DNS in tests.
 tor_unknown = "scan"
 verify_crawlers = false
+# The fake nmap, so the smoke test needs no privileges.
+nmap_path = "{nmap}"
 "#,
         db = dir.path().join("t.db").display(),
-        d = dir.path().display()
+        d = dir.path().display(),
+        nmap = fake_nmap(dir.path()),
     );
     let cfg_path = dir.path().join("c.toml");
     std::fs::write(&cfg_path, &cfg_text).unwrap();
-    // Point the scan pool at the fake nmap so the smoke test needs no privileges.
-    // SAFETY: test-only; PEEPHOLE_NMAP_PATH is read once by run() below and no
-    // other test in this binary touches the environment.
-    unsafe {
-        std::env::set_var("PEEPHOLE_NMAP_PATH", fake_nmap(dir.path()));
-    }
     let handle = tokio::spawn(peephole::run(cfg_path.clone()));
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
     let client = reqwest::Client::new();
+    // Readiness: the trap starts before the web role, so once the admin
+    // listener answers both are up.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while client
+        .get(format!("http://127.0.0.1:{admin}/healthz"))
+        .send()
+        .await
+        .is_err()
+    {
+        assert!(!handle.is_finished(), "run() exited during startup");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "listeners never came up"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let resp = client
-        .get("http://127.0.0.1:18080/bot-traffic")
+        .get(format!("http://127.0.0.1:{trap}/bot-traffic"))
         .header("x-forwarded-for", "203.0.113.7")
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
     let resp = client
-        .get("http://127.0.0.1:18443/api/stats")
+        .get(format!("http://127.0.0.1:{admin}/api/stats"))
         .send()
         .await
         .unwrap();

@@ -153,6 +153,10 @@ pub struct ScanConfig {
     /// final argument (there is no `{target}` placeholder).
     #[serde(default)]
     pub level_argv: std::collections::HashMap<u8, Vec<String>>,
+    /// The nmap program, looked up in PATH unless it contains a slash.
+    /// `PEEPHOLE_NMAP_PATH` in the environment overrides it; see [`ScanConfig::nmap`].
+    #[serde(default = "default_nmap_path")]
+    pub nmap_path: String,
     /// Scan safety knobs (see [`ScanSafety`]); flattened into `[scan]`.
     #[serde(flatten)]
     pub safety: ScanSafety,
@@ -254,6 +258,20 @@ impl Default for ScanSafety {
     }
 }
 
+impl ScanConfig {
+    /// The nmap program to run: `PEEPHOLE_NMAP_PATH` if set, else `nmap_path`.
+    pub fn nmap(&self) -> String {
+        std::env::var("PEEPHOLE_NMAP_PATH")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| self.nmap_path.clone())
+    }
+}
+
+fn default_nmap_path() -> String {
+    "nmap".into()
+}
+
 fn default_workers() -> usize {
     2
 }
@@ -282,6 +300,7 @@ impl Default for ScanConfig {
             never_scan: vec![],
             level_argv: Default::default(),
             safety: ScanSafety::default(),
+            nmap_path: default_nmap_path(),
         }
     }
 }

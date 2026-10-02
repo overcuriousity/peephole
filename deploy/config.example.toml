@@ -53,11 +53,15 @@ timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admi
 rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
 max_scans_per_hour = 30    # global rate cap; excess jobs stay queued
 retention_days = 90        # standalone only: delete requests and scan results older than this; 0 = keep forever. Ignored in a cluster.
-never_scan = ["192.168.0.0/16"] # extra CIDRs this node's scanner never scans (own infra, monitoring); other cluster scanners are not bound by it
+never_scan = [] # extra CIDRs this node's scanner never scans (own infra, monitoring); other cluster scanners are not bound by it
 # Non-global addresses (loopback, private, CGNAT, link-local, multicast,
 # reserved, NAT64/6to4 forms of those) and this node's own addresses are
 # never counter-scanned regardless of never_scan. Behind 1:1 NAT, add the
 # public address to never_scan.
+#
+# List public ranges only, e.g. your servers and monitoring:
+# never_scan = ["203.0.113.0/24", "2001:db8::/32"]
+# nmap_path = "nmap"       # the nmap program (PATH lookup); PEEPHOLE_NMAP_PATH overrides it
 #
 # Bystanders: one request is easily caused by a link preview, URL scanner or
 # crawler fetching a trap URL, so it earns at most this level until the IP
