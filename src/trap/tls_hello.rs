@@ -33,49 +33,69 @@ pub enum Hello {
 /// Parse a ClientHello from the start of a TCP stream, reassembling the
 /// handshake message across TLS records.
 pub fn parse_client_hello(buf: &[u8]) -> Hello {
-    let mut msg: Vec<u8> = vec![];
-    let mut pos = 0;
-    loop {
-        if pos > MAX_HELLO {
-            return Hello::Invalid;
-        }
-        // Enough of the message to know its length?
-        if msg.len() >= 4 {
-            if msg[0] != 1 {
+    HelloParser::default().advance(buf)
+}
+
+/// A ClientHello parse that resumes where it stopped: each call gets the
+/// whole stream so far, and records already taken are not read again, so
+/// a client trickling bytes costs linear work, not quadratic.
+#[derive(Default)]
+pub struct HelloParser {
+    /// The handshake message so far.
+    msg: Vec<u8>,
+    /// End of the records taken so far.
+    pos: usize,
+    /// Fragment bytes copied into `msg` (tests).
+    pub copied: usize,
+}
+
+impl HelloParser {
+    pub fn advance(&mut self, buf: &[u8]) -> Hello {
+        loop {
+            if self.pos > MAX_HELLO {
                 return Hello::Invalid;
             }
-            let len = u32::from_be_bytes([0, msg[1], msg[2], msg[3]]) as usize;
-            if len > MAX_HELLO {
-                return Hello::Invalid;
-            }
-            if msg.len() >= 4 + len {
-                return match parse_body(&msg[4..4 + len]) {
-                    Some(mut hello) => {
-                        hello.raw = buf[..pos].to_vec();
-                        Hello::Done {
-                            hello,
-                            consumed: pos,
+            // Enough of the message to know its length?
+            if self.msg.len() >= 4 {
+                let msg = &self.msg;
+                if msg[0] != 1 {
+                    return Hello::Invalid;
+                }
+                let len = u32::from_be_bytes([0, msg[1], msg[2], msg[3]]) as usize;
+                if len > MAX_HELLO {
+                    return Hello::Invalid;
+                }
+                if msg.len() >= 4 + len {
+                    return match parse_body(&msg[4..4 + len]) {
+                        Some(mut hello) => {
+                            hello.raw = buf[..self.pos].to_vec();
+                            Hello::Done {
+                                hello,
+                                consumed: self.pos,
+                            }
                         }
-                    }
-                    None => Hello::Invalid,
-                };
+                        None => Hello::Invalid,
+                    };
+                }
             }
+            let pos = self.pos;
+            let Some(head) = buf.get(pos..pos + 5) else {
+                return check_partial(&buf[pos.min(buf.len())..]);
+            };
+            if head[0] != 0x16 || head[1] != 3 {
+                return Hello::Invalid;
+            }
+            let len = u16::from_be_bytes([head[3], head[4]]) as usize;
+            if len == 0 || len > 16384 + 2048 {
+                return Hello::Invalid;
+            }
+            let Some(frag) = buf.get(pos + 5..pos + 5 + len) else {
+                return Hello::Incomplete;
+            };
+            self.msg.extend_from_slice(frag);
+            self.copied += frag.len();
+            self.pos = pos + 5 + len;
         }
-        let Some(head) = buf.get(pos..pos + 5) else {
-            return check_partial(&buf[pos..]);
-        };
-        if head[0] != 0x16 || head[1] != 3 {
-            return Hello::Invalid;
-        }
-        let len = u16::from_be_bytes([head[3], head[4]]) as usize;
-        if len == 0 || len > 16384 + 2048 {
-            return Hello::Invalid;
-        }
-        let Some(frag) = buf.get(pos + 5..pos + 5 + len) else {
-            return Hello::Incomplete;
-        };
-        msg.extend_from_slice(frag);
-        pos += 5 + len;
     }
 }
 
@@ -374,6 +394,33 @@ mod tests {
             panic!()
         };
         assert_eq!(consumed, n);
+    }
+
+    /// Fed a growing buffer a byte at a time, the parser copies every
+    /// record once instead of starting over on each new byte.
+    #[test]
+    fn feeding_byte_by_byte_copies_each_record_once() {
+        let msg = hello_msg(&[b"h2"]);
+        let mut raw = vec![];
+        for chunk in msg.chunks(7) {
+            raw.extend(record(chunk));
+        }
+        let mut p = HelloParser::default();
+        let mut done = None;
+        for n in 1..=raw.len() {
+            match p.advance(&raw[..n]) {
+                Hello::Incomplete => {}
+                Hello::Done { hello, consumed } => {
+                    done = Some((hello, consumed));
+                    break;
+                }
+                Hello::Invalid => panic!("invalid at {n}"),
+            }
+        }
+        let (hello, consumed) = done.unwrap();
+        assert_eq!(consumed, raw.len());
+        assert_eq!(hello.raw, raw);
+        assert_eq!(p.copied, msg.len(), "each fragment copied once");
     }
 
     #[test]
