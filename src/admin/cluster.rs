@@ -118,6 +118,7 @@ struct ClusterPage {
     audit: Vec<AuditView>,
     /// Members whose older history no reachable peer can give this node.
     unserved: Option<String>,
+    contributions: Vec<ContribView>,
     notice: Option<String>,
     error: Option<String>,
 }
@@ -358,11 +359,7 @@ async fn intel(node: &Node) -> AppResult<Vec<IntelView>> {
                 .is_some_and(|(h, _)| h == m.sha256);
             IntelView {
                 sha: m.sha256.chars().take(12).collect(),
-                size: match m.size {
-                    s if s >= 1_000_000 => format!("{:.1} MB", s as f64 / 1e6),
-                    s if s >= 1_000 => format!("{:.1} kB", s as f64 / 1e3),
-                    s => format!("{s} B"),
-                },
+                size: size(m.size as i64),
                 fetched_at: m.fetched_at.clone(),
                 by: m
                     .origin
@@ -375,6 +372,126 @@ async fn intel(node: &Node) -> AppResult<Vec<IntelView>> {
         .collect();
     v.sort_by(|a, b| a.kind.cmp(&b.kind));
     Ok(v)
+}
+
+/// What one node contributed, as far as this node holds it.
+pub struct ContribView {
+    pub name: String,
+    pub short: String,
+    pub requests: i64,
+    /// Light rows the flood gate kept instead of full requests, plus the
+    /// requests past a batch's cap that were only counted.
+    pub skipped: i64,
+    pub fingerprints: i64,
+    pub claims: i64,
+    pub scans: i64,
+    /// IPs it looked up with an enrichment provider.
+    pub lookups: i64,
+    pub log_entries: i64,
+    pub log_size: String,
+}
+
+fn size(s: i64) -> String {
+    match s {
+        s if s >= 1_000_000 => format!("{:.1} MB", s as f64 / 1e6),
+        s if s >= 1_000 => format!("{:.1} kB", s as f64 / 1e3),
+        s => format!("{s} B"),
+    }
+}
+
+/// Rows per origin in each replicated table, plus the log entries held.
+/// Every member gets a row, contributors or not; rows not yet shared
+/// (created before this node joined) come last as "not shared yet".
+async fn contributions(node: &Node) -> AppResult<Vec<ContribView>> {
+    use std::collections::HashMap;
+    type Counts = HashMap<Vec<u8>, i64>;
+    async fn by_origin(node: &Node, sql: &'static str) -> AppResult<Counts> {
+        let rows: Vec<(Option<Vec<u8>>, i64)> =
+            sqlx::query_as(sql).fetch_all(&node.store.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(o, n)| (o.unwrap_or_default(), n))
+            .collect())
+    }
+    let requests = by_origin(
+        node,
+        "SELECT origin, COUNT(*) FROM requests GROUP BY origin",
+    )
+    .await?;
+    let skipped = by_origin(
+        node,
+        "SELECT origin, SUM(n) FROM (
+           SELECT b.origin, b.dropped
+             + (SELECT COUNT(*) FROM skipped_requests r WHERE r.batch_id = b.id) AS n
+           FROM skipped_batches b)
+         GROUP BY origin",
+    )
+    .await?;
+    let fingerprints = by_origin(
+        node,
+        "SELECT origin, COUNT(*) FROM fingerprints GROUP BY origin",
+    )
+    .await?;
+    let claims = by_origin(
+        node,
+        "SELECT origin, COUNT(*) FROM fp_claims GROUP BY origin",
+    )
+    .await?;
+    let scans = by_origin(node, "SELECT origin, COUNT(*) FROM scans GROUP BY origin").await?;
+    let lookups = by_origin(
+        node,
+        "SELECT origin, COUNT(DISTINCT ip) FROM ip_intel GROUP BY origin",
+    )
+    .await?;
+    let usage: HashMap<Vec<u8>, (i64, i64)> =
+        sqlx::query_as::<_, (Vec<u8>, i64, i64)>("SELECT origin, entries, bytes FROM origin_usage")
+            .fetch_all(&node.store.pool)
+            .await?
+            .into_iter()
+            .map(|(o, e, b)| (o, (e, b)))
+            .collect();
+    let row = |key: &[u8], name: String, short: String| {
+        let get = |m: &Counts| m.get(key).copied().unwrap_or(0);
+        let (log_entries, bytes) = usage.get(key).copied().unwrap_or((0, 0));
+        ContribView {
+            name,
+            short,
+            requests: get(&requests),
+            skipped: get(&skipped),
+            fingerprints: get(&fingerprints),
+            claims: get(&claims),
+            scans: get(&scans),
+            lookups: get(&lookups),
+            log_entries,
+            log_size: size(bytes),
+        }
+    };
+    let me = node.id();
+    let mut out: Vec<ContribView> = members::all(&node.store)
+        .await?
+        .into_iter()
+        .map(|m| {
+            let name = if m.id == me {
+                format!("{} (this node)", m.name)
+            } else {
+                m.name
+            };
+            row(&m.id.0[..], name, m.id.short())
+        })
+        .collect();
+    out.sort_by_key(|c| std::cmp::Reverse(c.requests));
+    let unshared = row(&[], "not shared yet".into(), String::new());
+    if unshared.requests
+        + unshared.skipped
+        + unshared.fingerprints
+        + unshared.claims
+        + unshared.scans
+        + unshared.lookups
+        > 0
+    {
+        out.push(unshared);
+    }
+    Ok(out)
 }
 
 /// One invite as the page lists it.
@@ -444,6 +561,7 @@ async fn render_page(
             settings: SettingsView::of(st),
             audit: vec![],
             unserved: None,
+            contributions: vec![],
             notice: flash.notice,
             error: flash.error,
         });
@@ -490,6 +608,7 @@ async fn render_page(
         settings: SettingsView::of(st),
         audit,
         unserved: unserved(node).await?,
+        contributions: contributions(node).await?,
         notice: flash.notice,
         error: flash.error,
     })
