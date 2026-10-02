@@ -2250,6 +2250,7 @@ dependencies = [
  "num-traits",
  "seq-macro",
  "twox-hash",
+ "zstd",
 ]
 
 [[package]]

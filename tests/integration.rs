@@ -898,6 +898,29 @@ async fn export_download_requires_auth_and_filters() {
     assert_eq!(resp.status(), 200);
     assert!(resp.bytes().await.unwrap().len() > 100);
 
+    let resp = client
+        .get(format!(
+            "{base}/admin/export/download?format=csv&mode=redistributable"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .get(format!(
+            "{base}/admin/export/download?format=csv&mode=everything"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let resp = client
+        .get(format!("{base}/admin/export/intel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "the separate enrichment export is gone");
+
     // The export form submits every field, blank ones included.
     let body = client
         .get(format!(

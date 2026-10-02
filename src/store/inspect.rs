@@ -88,10 +88,10 @@ const CLAIM_SELECT: &str = "SELECT c.id, c.ts, i.ip, c.contact_email, c.user_age
 
 const BODY_LIMIT: usize = 16 * 1024;
 /// Upper bound on a decompressed scan's raw nmap XML.
-const MAX_RAW_XML: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_RAW_XML: u64 = 64 * 1024 * 1024;
 
 /// Decompress zstd data, refusing output larger than `limit` (bomb guard).
-fn zstd_decode_capped(data: &[u8], limit: u64) -> Result<Vec<u8>> {
+pub(crate) fn zstd_decode_capped(data: &[u8], limit: u64) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut dec = zstd::stream::Decoder::new(data)?;
     let mut out = Vec::new();
@@ -117,29 +117,7 @@ pub struct IpIntelRow {
 /// Lookups per provider shown on the IP page.
 pub const INTEL_HISTORY_PER_PROVIDER: i64 = 50;
 
-/// `(ip, provider, hlc, fetched_at, source_version, origin, data_json)`.
-pub type IntelLogRow = (String, String, i64, String, Option<String>, Vec<u8>, String);
-/// Where a history page ends: `(fetched_at, ip, provider, hlc)`.
-pub type IntelLogKey = (String, String, String, i64);
-
-/// `(ip, provider, fetched_at, source_version, origin, data_json)`.
-pub type IntelRow = (String, String, String, Option<String>, Vec<u8>, String);
-
 impl Store {
-    /// Enrichment results with the node that looked them up, newest first.
-    /// Only IPs that still have a row (results outlive deleted IPs).
-    pub async fn intel_export(&self, limit: i64) -> Result<Vec<IntelRow>> {
-        Ok(sqlx::query_as(
-            "SELECT ip, provider, fetched_at, source_version, origin, data_json
-             FROM ip_intel
-             WHERE EXISTS (SELECT 1 FROM ips WHERE ips.ip = ip_intel.ip)
-             ORDER BY fetched_at DESC, ip LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(&self.read)
-        .await?)
-    }
-
     /// Every provider's results for one IP from the lookup history, newest
     /// first per provider (at most [`INTEL_HISTORY_PER_PROVIDER`] each), with
     /// the cluster node that looked each one up (None standalone or for a
@@ -166,34 +144,6 @@ impl Store {
         Ok(sqlx::query_scalar(
             "SELECT tag FROM ip_intel_tags GROUP BY tag ORDER BY COUNT(*) DESC, tag LIMIT 300",
         )
-        .fetch_all(&self.read)
-        .await?)
-    }
-
-    /// Every lookup in the history, oldest first, after `after` (keyset
-    /// paging by rowid-free key: `(fetched_at, ip, provider, hlc)`), for
-    /// the full-history export. Only IPs that still have a row.
-    pub async fn intel_log_page(
-        &self,
-        after: Option<&IntelLogKey>,
-        limit: i64,
-    ) -> Result<Vec<IntelLogRow>> {
-        let (f, i, p, h) = match after {
-            Some(k) => (k.0.as_str(), k.1.as_str(), k.2.as_str(), k.3),
-            None => ("", "", "", i64::MIN),
-        };
-        Ok(sqlx::query_as(
-            "SELECT ip, provider, hlc, fetched_at, source_version, origin, data_json
-             FROM ip_intel_log t
-             WHERE (fetched_at, ip, provider, hlc) > (?, ?, ?, ?)
-               AND EXISTS (SELECT 1 FROM ips WHERE ips.ip = t.ip)
-             ORDER BY fetched_at, ip, provider, hlc LIMIT ?",
-        )
-        .bind(f)
-        .bind(i)
-        .bind(p)
-        .bind(h)
-        .bind(limit)
         .fetch_all(&self.read)
         .await?)
     }

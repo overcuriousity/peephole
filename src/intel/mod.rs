@@ -29,6 +29,9 @@ pub struct ProviderInfo {
     pub api: bool,
     /// Prefix of this provider's tags in `ip_intel_tags`.
     pub tag_prefix: &'static str,
+    /// Whether its terms allow passing its results on: only these stay in
+    /// a redistributable export.
+    pub redistributable: bool,
 }
 
 pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
@@ -38,6 +41,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         public: true,
         api: false,
         tag_prefix: "tor",
+        redistributable: true,
     },
     ProviderInfo {
         name: MAXMIND,
@@ -45,6 +49,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         public: true,
         api: false,
         tag_prefix: "maxmind",
+        redistributable: false,
     },
     ProviderInfo {
         name: ABUSEIPDB,
@@ -52,6 +57,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         public: false,
         api: true,
         tag_prefix: "abuseipdb",
+        redistributable: false,
     },
     ProviderInfo {
         name: GREYNOISE,
@@ -59,6 +65,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         public: false,
         api: true,
         tag_prefix: "greynoise",
+        redistributable: false,
     },
     ProviderInfo {
         name: SHODAN,
@@ -66,6 +73,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         public: false,
         api: true,
         tag_prefix: "shodan",
+        redistributable: false,
     },
     ProviderInfo {
         name: INTERNETDB,
@@ -73,6 +81,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         public: false,
         api: true,
         tag_prefix: "internetdb",
+        redistributable: false,
     },
 ];
 
