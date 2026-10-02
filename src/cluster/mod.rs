@@ -258,6 +258,10 @@ pub struct Node {
     pub members_changed: tokio::sync::Notify,
     /// Enrichment providers this node can query right now (heartbeats).
     providers: RwLock<Vec<String>>,
+    /// This node's provider objects, for on-demand lookups members ask for.
+    lookup_providers: std::sync::OnceLock<crate::intel::Providers>,
+    /// On-demand API lookups served per asking member: `(UTC day, count)`.
+    lookup_budget: Mutex<HashMap<NodeId, (String, u32)>>,
     pub data_dir: std::path::PathBuf,
     /// Contacts and heartbeats (ephemeral).
     pub status: status::Status,
@@ -312,6 +316,8 @@ impl Node {
             route_slots: Arc::new(tokio::sync::Semaphore::new(msg::MAX_ROUTING)),
             members_changed: tokio::sync::Notify::new(),
             providers: RwLock::new(vec![]),
+            lookup_providers: Default::default(),
+            lookup_budget: Mutex::new(HashMap::new()),
             data_dir: p.data_dir,
             status: Default::default(),
             msg: Default::default(),
@@ -434,6 +440,38 @@ impl Node {
             repl::append(self, &records).await?;
         }
         Ok(())
+    }
+
+    /// The provider objects on-demand lookups from members are served
+    /// with; set once at startup.
+    pub fn set_lookup_providers(&self, p: crate::intel::Providers) {
+        let _ = self.lookup_providers.set(p);
+    }
+
+    pub fn lookup_providers(&self) -> Option<&crate::intel::Providers> {
+        self.lookup_providers.get()
+    }
+
+    /// Take `n` of `peer`'s on-demand API lookups for today; `false` when
+    /// that would exceed [`crate::intel::lookup::PER_PEER_PER_DAY`].
+    pub fn take_lookup_budget(&self, peer: NodeId, n: u32) -> bool {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let mut all = self.lookup_budget.lock().unwrap();
+        all.retain(|_, (day, _)| *day == today);
+        let (_, used) = all.entry(peer).or_insert_with(|| (today, 0));
+        if used.saturating_add(n) > crate::intel::lookup::PER_PEER_PER_DAY {
+            return false;
+        }
+        *used += n;
+        true
+    }
+
+    /// The address this node would dial `id` at, if it has one.
+    pub fn dial_address(&self, id: &NodeId) -> Option<String> {
+        self.dial_targets()
+            .into_iter()
+            .find(|(peer, _, _)| peer == id)
+            .map(|(_, _, addr)| addr)
     }
 
     /// Enrichment providers this node can query right now.

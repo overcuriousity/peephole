@@ -7,6 +7,7 @@ usage: peephole [CONFIG]                 run the daemon (default /etc/peephole/c
        peephole check-config [CONFIG]    validate config, rules and nmap
        peephole cluster (id|invite|invites|invite-revoke|join|members|status|config-key|block|unblock|leave) …
        peephole settings (show|set|reset) …
+       peephole export [OPTIONS] [CONFIG]  the dataset as Parquet, CSV or JSON Lines (--help)
        peephole admin reset-token [CONFIG]
        peephole db vacuum [CONFIG]
        peephole --version | -V
@@ -22,6 +23,7 @@ enum Cmd {
     CheckConfig(PathBuf),
     Cluster,
     Settings,
+    Export,
     Admin,
     Db,
     Run(PathBuf),
@@ -60,6 +62,7 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         // These parse their own arguments.
         Some("cluster") => Ok(Cmd::Cluster),
         Some("settings") => Ok(Cmd::Settings),
+        Some("export") => Ok(Cmd::Export),
         Some("admin") => Ok(Cmd::Admin),
         Some("db") => Ok(Cmd::Db),
         _ => config_at(0).map(Cmd::Run),
@@ -101,6 +104,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Settings => {
             if let Err(e) = peephole::settings_cli::run(&args[1..], DEFAULT_CONFIG).await {
+                fail(e);
+            }
+        }
+        Cmd::Export => {
+            if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
+                println!("{}", peephole::export::cli::USAGE);
+            } else if let Err(e) = peephole::export::cli::run(&args[1..], DEFAULT_CONFIG).await {
                 fail(e);
             }
         }
@@ -157,6 +167,7 @@ mod tests {
         );
         assert_eq!(p(&["cluster", "anything", "goes"]), Ok(Cmd::Cluster));
         assert_eq!(p(&["settings"]), Ok(Cmd::Settings));
+        assert_eq!(p(&["export", "--format", "csv"]), Ok(Cmd::Export));
     }
 
     #[test]

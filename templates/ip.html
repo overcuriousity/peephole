@@ -21,7 +21,7 @@
 
 <div class="stack">
   <section class="card" id="intel">
-    <div class="card-head"><h2>Intelligence</h2><span class="muted">{% if admin.is_some() %}every provider, every node{% else %}enrichment results{% endif %}</span></div>
+    <div class="card-head"><h2>Intelligence</h2><span class="muted">{% if admin.is_some() %}every provider, every node · <a href="/admin/lookup?ip={{ ov.ip.ip }}">look up now</a>{% else %}enrichment results{% endif %}</span></div>
     <div class="intel-grid">
     {% for c in intel %}
       <div class="intel">

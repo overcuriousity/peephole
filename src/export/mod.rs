@@ -3,6 +3,7 @@
 //! everything peephole stored about it and its IP. CSV and JSON Lines carry
 //! the Timesketch fields; Parquet is typed. Claim e-mails and texts are
 //! never exported, only whether the IP filed a claim.
+pub mod cli;
 pub mod parquet;
 
 use crate::store::Store;
@@ -12,7 +13,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-#[derive(serde::Deserialize, Default, Clone, Debug)]
+#[derive(serde::Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct ExportFilter {
     pub from: Option<String>,
     pub to: Option<String>,
@@ -721,6 +722,22 @@ pub fn stream_requests(
     format: Format,
     opts: ExportOptions,
 ) -> impl futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static {
+    stream_requests_counted(store, f, format, opts).0
+}
+
+/// [`stream_requests`] plus a counter of the rows written so far (the CLI
+/// reports it).
+pub fn stream_requests_counted(
+    store: Store,
+    f: ExportFilter,
+    format: Format,
+    opts: ExportOptions,
+) -> (
+    impl futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let count = counter.clone();
     struct St {
         store: Store,
         f: ExportFilter,
@@ -746,58 +763,64 @@ pub fn stream_requests(
         finished: false,
         parquet: None,
     };
-    futures::stream::try_unfold(st, move |mut st| async move {
-        if st.finished {
-            return Ok(None);
-        }
-        let mut out: Vec<u8> = vec![];
-        if !st.started {
-            st.started = true;
+    let stream = futures::stream::try_unfold(st, move |mut st| {
+        let count = count.clone();
+        async move {
+            if st.finished {
+                return Ok(None);
+            }
+            let mut out: Vec<u8> = vec![];
+            if !st.started {
+                st.started = true;
+                match format {
+                    Format::Csv => out.extend_from_slice(csv_header().as_bytes()),
+                    Format::Parquet => {
+                        st.parquet =
+                            Some(parquet::ParquetStream::new(&st.f, st.opts.mode).map_err(io)?)
+                    }
+                    Format::Jsonl => {}
+                }
+            }
+            if st.pending.is_empty() && !matches!(st.phase, Phase::Done) {
+                let page = next_rows(&st.store, &st.f, &st.opts, &mut st.phase)
+                    .await
+                    .map_err(io)?;
+                st.pending.extend(page);
+            }
+            // Up to CHUNK_BYTES of rows (at least one) per piece.
+            let mut rows = vec![];
+            let mut bytes = 0;
+            while let Some(r) = st.pending.front() {
+                let n = r.size();
+                if !rows.is_empty() && bytes + n > CHUNK_BYTES {
+                    break;
+                }
+                bytes += n;
+                rows.extend(st.pending.pop_front());
+            }
+            let done = st.pending.is_empty() && matches!(st.phase, Phase::Done);
+            count.fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
             match format {
-                Format::Csv => out.extend_from_slice(csv_header().as_bytes()),
+                Format::Csv => out.extend_from_slice(csv_rows(&rows).as_bytes()),
+                Format::Jsonl => out.extend_from_slice(jsonl_rows(&rows).as_bytes()),
                 Format::Parquet => {
-                    st.parquet = Some(parquet::ParquetStream::new(&st.f, st.opts.mode).map_err(io)?)
-                }
-                Format::Jsonl => {}
-            }
-        }
-        if st.pending.is_empty() && !matches!(st.phase, Phase::Done) {
-            let page = next_rows(&st.store, &st.f, &st.opts, &mut st.phase)
-                .await
-                .map_err(io)?;
-            st.pending.extend(page);
-        }
-        // Up to CHUNK_BYTES of rows (at least one) per piece.
-        let mut rows = vec![];
-        let mut bytes = 0;
-        while let Some(r) = st.pending.front() {
-            let n = r.size();
-            if !rows.is_empty() && bytes + n > CHUNK_BYTES {
-                break;
-            }
-            bytes += n;
-            rows.extend(st.pending.pop_front());
-        }
-        let done = st.pending.is_empty() && matches!(st.phase, Phase::Done);
-        match format {
-            Format::Csv => out.extend_from_slice(csv_rows(&rows).as_bytes()),
-            Format::Jsonl => out.extend_from_slice(jsonl_rows(&rows).as_bytes()),
-            Format::Parquet => {
-                let w = st
-                    .parquet
-                    .as_mut()
-                    .ok_or_else(|| std::io::Error::other("parquet writer"))?;
-                if !rows.is_empty() {
-                    out.extend(w.write(&rows).map_err(io)?);
-                }
-                if done && let Some(w) = st.parquet.take() {
-                    out.extend(w.finish().map_err(io)?);
+                    let w = st
+                        .parquet
+                        .as_mut()
+                        .ok_or_else(|| std::io::Error::other("parquet writer"))?;
+                    if !rows.is_empty() {
+                        out.extend(w.write(&rows).map_err(io)?);
+                    }
+                    if done && let Some(w) = st.parquet.take() {
+                        out.extend(w.finish().map_err(io)?);
+                    }
                 }
             }
+            st.finished = done;
+            Ok(Some((axum::body::Bytes::from(out), st)))
         }
-        st.finished = done;
-        Ok(Some((axum::body::Bytes::from(out), st)))
-    })
+    });
+    (stream, counter)
 }
 
 #[cfg(test)]

@@ -104,7 +104,19 @@ be listed under `[[cluster.peers]]` with their key.
   job and runs it only when requests it holds back the level;
   `scan.trusted_origins` limits whose requests count.
 - Every member sees everything the cluster records, including raw requests
-  and false-positive claims with their optional contact address.
+  and false-positive claims with their optional contact address. Every
+  member can export the whole dataset (`peephole export`, or Admin →
+  Export); see [docs/dataset.md](dataset.md).
+- **On-demand lookups.** Admin → Lookup asks every provider the cluster can
+  reach about one address: this node's own databases and keys first, then
+  one live member per provider nobody here serves, over the cluster RPC.
+  Nothing is stored anywhere. A member serves at most 50 API lookups a day
+  per asking node (GeoLite2 and the Tor list are free), so curiosity cannot
+  spend the budget the automatic enrichment runs on. An outbound-only
+  member cannot be asked.
+- **The blocklist feed** of a web node (`/api/blocklist`) is drawn from
+  the whole cluster's requests and never lists a member's addresses
+  (published ones, and the ones members connect from).
 - Run NTP on every node: cooldowns and the 30-day prune compare timestamps
   written by different nodes. The Cluster page flags clock differences.
 - A standalone node that joins brings its history with it.
