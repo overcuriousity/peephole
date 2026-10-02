@@ -163,6 +163,45 @@ struct IpsPage {
     bulk_total: Option<i64>,
 }
 
+/// Deepest IP-directory page anonymous visitors can open; with a session
+/// the limit is `browse::MAX_PAGE`.
+pub const PUBLIC_MAX_PAGE: i64 = 50;
+
+/// Longest free-text filter value accepted from anonymous visitors.
+const PUBLIC_MAX_INPUT: usize = 64;
+
+/// An anonymous visitor's IP filter, normalised so equivalent queries share
+/// one cache entry and bounded so it cannot ask for arbitrarily deep pages.
+pub(crate) fn public_ip_filter(f: &IpFilter) -> IpFilter {
+    let text = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= PUBLIC_MAX_INPUT)
+            .map(str::to_string)
+    };
+    let q = text(&f.q).map(|q| {
+        if let Ok(ip) = q.parse::<std::net::IpAddr>() {
+            ip.to_string()
+        } else if let Ok(net) = q.parse::<ipnet::IpNet>() {
+            net.trunc().to_string()
+        } else {
+            q.to_ascii_lowercase()
+        }
+    });
+    IpFilter {
+        q,
+        country: text(&f.country)
+            .filter(|c| c.len() == 2)
+            .map(|c| c.to_ascii_uppercase()),
+        asn: f.asn.filter(|a| (0..=u32::MAX as i64).contains(a)),
+        label: text(&f.label),
+        min_severity: f.min_severity.filter(|s| (1..=4).contains(s)),
+        tor: f.tor.clone().filter(|t| t == "1"),
+        sort: f.sort.clone().filter(|s| s == "recent"),
+        page: Some(i64::from(page_num(f.page)).min(PUBLIC_MAX_PAGE)),
+    }
+}
+
 pub(crate) fn ip_qs(f: &IpFilter) -> String {
     qs_without_page(&[
         ("q", f.q.clone()),
@@ -195,21 +234,28 @@ async fn ips(
     State(state): State<Arc<AdminState>>,
     Query(f): Query<IpFilter>,
 ) -> AppResult<Html<String>> {
-    let qs = ip_qs(&f);
-    // Anonymous views go through the 15 s cache (spec §6.3 rationale);
-    // an admin always sees fresh rows.
-    let (page, bulk_total) = if authed {
+    // Anonymous views go through the cache (spec §6.3 rationale) with a
+    // normalised, bounded filter; an admin always sees fresh rows.
+    let (f, page, bulk_total) = if authed {
         let page = Arc::new(state.store.list_ips(&f).await?);
-        (page, Some(state.store.count_ips(&f).await?))
+        let total = state.store.count_ips(&f).await?;
+        (f, page, Some(total))
     } else {
-        let key = format!("{qs}page={}", page_num(f.page));
-        (state.stats_cache.ips(&state.store, &f, key).await?, None)
+        let f = public_ip_filter(&f);
+        let key = format!("{}page={}", ip_qs(&f), page_num(f.page));
+        let mut page = state.stats_cache.ips(&state.store, &f, key).await?;
+        if page.has_next && i64::from(page.page) >= PUBLIC_MAX_PAGE {
+            let mut last = (*page).clone();
+            last.has_next = false;
+            page = Arc::new(last);
+        }
+        (f, page, None)
     };
     render(&IpsPage {
         chrome: Chrome::new(authed, "ips"),
+        qs: ip_qs(&f),
         f,
         page,
-        qs,
         bulk_total,
     })
 }
@@ -221,7 +267,7 @@ struct RequestsPage {
     f: RequestFilter,
     page: Page<RequestListRow>,
     qs: String,
-    bulk_total: Option<i64>,
+    bulk_total: Option<crate::store::browse::Count>,
     /// Cluster member names for the admin-only node filter (empty
     /// standalone or for the public).
     nodes: Vec<String>,
@@ -268,7 +314,7 @@ pub struct IpAdminData {
 #[template(path = "ip.html")]
 struct IpPage {
     chrome: Chrome,
-    ov: IpOverview,
+    ov: Arc<IpOverview>,
     sparkline_json: String,
     page: Page<RequestListRow>,
     admin: Option<IpAdminData>,
@@ -289,7 +335,13 @@ async fn ip_page(
     let Some(ip) = state.store.ip_by_addr(&addr).await? else {
         return Err(AppError::NotFound);
     };
-    let Some(ov) = state.store.ip_overview(ip.id).await? else {
+    // Anonymous views go through the cache; an admin always reads fresh.
+    let ov = if authed {
+        state.store.ip_overview(ip.id).await?.map(Arc::new)
+    } else {
+        state.stats_cache.ip(&state.store, ip.id).await?
+    };
+    let Some(ov) = ov else {
         return Err(AppError::NotFound);
     };
     // Per-request rows are admin-only; the public page shows only the IP's
@@ -309,11 +361,16 @@ async fn ip_page(
     };
     // Admin-only data is only *queried* with a session (spec §5).
     let admin = if authed {
-        let mut scans = vec![];
-        for s in state.store.scans_for_ip(ip.id).await? {
-            let ports = state.store.ports_for_scan(s.id).await?;
-            scans.push(ScanWithPorts { s, ports });
-        }
+        let found = state.store.scans_for_ip(ip.id).await?;
+        let ids: Vec<i64> = found.iter().map(|s| s.id).collect();
+        let mut ports = state.store.ports_for_scans(&ids).await?;
+        let scans = found
+            .into_iter()
+            .map(|s| ScanWithPorts {
+                ports: ports.remove(&s.id).unwrap_or_default(),
+                s,
+            })
+            .collect();
         Some(IpAdminData {
             scans,
             fingerprints: state.store.fingerprints_for_ip(ip.id).await?,

@@ -5,7 +5,6 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum Range {
@@ -138,6 +137,18 @@ macro_rules! bind_since {
     }};
 }
 
+/// The parts of [`Stats`] that are counted per IP.
+struct IpAggregates {
+    total_requests: i64,
+    unique_ips: i64,
+    countries: i64,
+    tor_ips: i64,
+    top_ips: Vec<TopIp>,
+    top_countries: Vec<Named>,
+    top_asns: Vec<Named>,
+    top_labels: Vec<Named>,
+}
+
 type RecentTuple = (
     i64,
     String,
@@ -156,19 +167,75 @@ impl Store {
             sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql)),
             since
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&self.read)
         .await?)
     }
 
     async fn named(&self, sql: &str, since: Option<&'static str>) -> Result<Vec<Named>> {
         Ok(
             bind_since!(sqlx::query_as::<_, Named>(sqlx::AssertSqlSafe(sql)), since)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.read)
                 .await?,
         )
     }
 
-    pub async fn stats(&self, r: Range) -> Result<Stats> {
+    /// Per-IP aggregates over all time, from the `ips` read models
+    /// (`request_count`, `max_severity`, `ip_labels`) instead of every
+    /// request. IPs without requests (scan-only) are left out, as in the
+    /// ranged queries.
+    async fn all_time_ip_aggregates(&self) -> Result<IpAggregates> {
+        let (total_requests, unique_ips, countries, tor_ips): (i64, i64, i64, i64) =
+            sqlx::query_as(
+                "SELECT COALESCE(SUM(request_count), 0), COUNT(*),
+                        COUNT(DISTINCT country), COALESCE(SUM(is_tor_exit = 1), 0)
+                 FROM ips WHERE request_count > 0",
+            )
+            .fetch_one(&self.read)
+            .await?;
+        let top_ips = sqlx::query_as::<_, TopIp>(
+            "SELECT ip, request_count AS count, country, max_severity, is_tor_exit AS is_tor
+             FROM ips WHERE request_count > 0
+             ORDER BY request_count DESC, last_seen DESC LIMIT 20",
+        )
+        .fetch_all(&self.read)
+        .await?;
+        let top_countries = self
+            .named(
+                "SELECT COALESCE(country,'??') AS name, COUNT(*) AS count
+                 FROM ips WHERE request_count > 0
+                 GROUP BY country ORDER BY count DESC LIMIT 20",
+                None,
+            )
+            .await?;
+        let top_asns = self
+            .named(
+                "SELECT COALESCE(MAX(asn_org), 'AS' || asn, 'unknown') AS name, COUNT(*) AS count
+                 FROM ips WHERE request_count > 0
+                 GROUP BY asn ORDER BY count DESC LIMIT 20",
+                None,
+            )
+            .await?;
+        let top_labels = self
+            .named(
+                "SELECT label AS name, SUM(count) AS count FROM ip_labels
+                 GROUP BY label ORDER BY count DESC LIMIT 20",
+                None,
+            )
+            .await?;
+        Ok(IpAggregates {
+            total_requests,
+            unique_ips,
+            countries,
+            tor_ips,
+            top_ips,
+            top_countries,
+            top_asns,
+            top_labels,
+        })
+    }
+
+    /// Per-IP aggregates over the requests of a time range.
+    async fn ranged_ip_aggregates(&self, r: Range) -> Result<IpAggregates> {
         let (w, since) = r.ts_clause("r.ts");
         let total_requests = self
             .count_where(
@@ -200,14 +267,6 @@ impl Store {
                 since,
             )
             .await?;
-        let (ws, since_s) = r.ts_clause("s.finished_at");
-        let scans_done = self
-            .count_where(
-                &format!("SELECT COUNT(*) FROM scans s WHERE 1=1{ws}"),
-                since_s,
-            )
-            .await?;
-
         let sql = format!(
             "SELECT i.ip, COUNT(*) AS count, i.country, MAX(r.severity) AS max_severity,
                     i.is_tor_exit AS is_tor
@@ -218,7 +277,7 @@ impl Store {
             sqlx::query_as::<_, TopIp>(sqlx::AssertSqlSafe(sql.as_str())),
             since
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read)
         .await?;
         let top_countries = self
             .named(
@@ -255,6 +314,40 @@ impl Store {
                 since,
             )
             .await?;
+        Ok(IpAggregates {
+            total_requests,
+            unique_ips,
+            countries,
+            tor_ips,
+            top_ips,
+            top_countries,
+            top_asns,
+            top_labels,
+        })
+    }
+
+    pub async fn stats(&self, r: Range) -> Result<Stats> {
+        let (w, since) = r.ts_clause("r.ts");
+        let IpAggregates {
+            total_requests,
+            unique_ips,
+            countries,
+            tor_ips,
+            top_ips,
+            top_countries,
+            top_asns,
+            top_labels,
+        } = match r {
+            Range::All => self.all_time_ip_aggregates().await?,
+            _ => self.ranged_ip_aggregates(r).await?,
+        };
+        let (ws, since_s) = r.ts_clause("s.finished_at");
+        let scans_done = self
+            .count_where(
+                &format!("SELECT COUNT(*) FROM scans s WHERE 1=1{ws}"),
+                since_s,
+            )
+            .await?;
         let severity_distribution = self
             .named(
                 &format!(
@@ -277,7 +370,7 @@ impl Store {
             sqlx::query_as::<_, Bucket>(sqlx::AssertSqlSafe(sql.as_str())),
             since
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read)
         .await?;
         let sql = format!(
             "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, i.country,
@@ -289,7 +382,7 @@ impl Store {
             sqlx::query_as::<_, RecentTuple>(sqlx::AssertSqlSafe(sql.as_str())),
             since
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read)
         .await?;
         let recent = recent_rows
             .into_iter()
@@ -313,7 +406,7 @@ impl Store {
         let intel = sqlx::query_as::<_, (String, String)>(
             "SELECT key, value FROM intel_meta WHERE key IN ('tor_last_fetch','maxmind_last_fetch')",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read)
         .await?
         .into_iter()
         .collect();
@@ -338,16 +431,17 @@ impl Store {
 
     pub async fn map_counts(&self, r: Range) -> Result<MapCounts> {
         let (w, since) = r.ts_clause("r.ts");
-        let rows = self
-            .named(
-                &format!(
-                    "SELECT i.country AS name, COUNT(DISTINCT i.id) AS count
-                     FROM requests r JOIN ips i ON r.ip_id = i.id
-                     WHERE i.country IS NOT NULL{w} GROUP BY i.country"
-                ),
-                since,
-            )
-            .await?;
+        let sql = match r {
+            Range::All => "SELECT country AS name, COUNT(*) AS count FROM ips
+                 WHERE country IS NOT NULL AND request_count > 0 GROUP BY country"
+                .to_string(),
+            _ => format!(
+                "SELECT i.country AS name, COUNT(DISTINCT i.id) AS count
+                 FROM requests r JOIN ips i ON r.ip_id = i.id
+                 WHERE i.country IS NOT NULL{w} GROUP BY i.country"
+            ),
+        };
+        let rows = self.named(&sql, since).await?;
         let max = rows.iter().map(|n| n.count).max().unwrap_or(0);
         Ok(MapCounts {
             range: r.key(),
@@ -370,23 +464,181 @@ pub fn intel_stale(intel: &HashMap<String, String>) -> bool {
     stale("tor_last_fetch") || stale("maxmind_last_fetch")
 }
 
-const TTL: Duration = Duration::from_secs(15);
+/// How long a cached aggregate is fresh. Longer ranges change slowly
+/// relative to their size and cost the most to recompute.
+pub fn ttl(r: Range) -> Duration {
+    match r {
+        Range::H24 => Duration::from_secs(15),
+        Range::D7 => Duration::from_secs(60),
+        Range::D30 | Range::All => Duration::from_secs(300),
+    }
+}
+
+/// Fresh lifetime of cached IP-directory and IP pages.
+pub const PAGE_TTL: Duration = Duration::from_secs(30);
+
+/// A stale value is served (while one task refreshes it) for at most this
+/// many TTLs; older than that, callers wait for the recomputation.
+const STALE_FACTOR: u32 = 20;
 
 /// Bound on cached IP-directory pages (anonymous traffic only).
 pub const IPS_CACHE_MAX: usize = 64;
 
-type IpsPage = Arc<super::browse::Page<super::browse::IpSummary>>;
+/// Bound on cached per-IP overviews (anonymous traffic only).
+pub const IP_CACHE_MAX: usize = 256;
 
-#[derive(Default)]
+type BoxFut<V> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<V>> + Send>>;
+
+struct Entry<V> {
+    value: Option<(Instant, Arc<V>)>,
+    /// Held while the value is computed: one computation per key at a time.
+    flight: Arc<tokio::sync::Mutex<()>>,
+    /// A background refresh of a stale value is under way.
+    refreshing: bool,
+}
+
+impl<V> Entry<V> {
+    fn empty() -> Self {
+        Self {
+            value: None,
+            flight: Arc::new(tokio::sync::Mutex::new(())),
+            refreshing: false,
+        }
+    }
+}
+
+/// Keyed cache for anonymous traffic: per-key single flight, and
+/// serve-stale-while-revalidate. A fresh value is returned as is. A stale
+/// one is returned at once while a single background task recomputes it,
+/// so an expiry under load costs one query, not one per visitor. A missing
+/// (or very old) value is computed by one caller while the others for the
+/// same key wait; other keys are not held up.
+pub struct SwrCache<K, V> {
+    inner: Arc<std::sync::Mutex<HashMap<K, Entry<V>>>>,
+    max: usize,
+}
+
+impl<K, V> SwrCache<K, V>
+where
+    K: std::hash::Hash + Eq + Clone + Send + 'static,
+    V: Send + Sync + 'static,
+{
+    pub fn new(max: usize) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            max,
+        }
+    }
+
+    pub async fn get<F>(&self, key: K, ttl: Duration, compute: F) -> Result<Arc<V>>
+    where
+        F: Fn() -> BoxFut<V>,
+    {
+        let flight = {
+            let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let e = map.entry(key.clone()).or_insert_with(Entry::empty);
+            match &e.value {
+                Some((at, v)) if at.elapsed() < ttl => return Ok(v.clone()),
+                Some((at, v)) if at.elapsed() < ttl * STALE_FACTOR => {
+                    let v = v.clone();
+                    if !e.refreshing {
+                        e.refreshing = true;
+                        self.spawn_refresh(key, compute());
+                    }
+                    return Ok(v);
+                }
+                _ => e.flight.clone(),
+            }
+        };
+        let _guard = flight.lock().await;
+        // Another caller may have computed it while this one waited.
+        if let Some((at, v)) = self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .and_then(|e| e.value.clone())
+            && at.elapsed() < ttl
+        {
+            return Ok(v);
+        }
+        let fresh = Arc::new(compute().await?);
+        self.store(key, fresh.clone());
+        Ok(fresh)
+    }
+
+    fn spawn_refresh(&self, key: K, fut: BoxFut<V>) {
+        let inner = self.inner.clone();
+        let max = self.max;
+        tokio::spawn(async move {
+            let result = fut.await;
+            let mut map = inner.lock().unwrap_or_else(|p| p.into_inner());
+            match result {
+                Ok(v) => Self::insert(&mut map, max, key, Arc::new(v)),
+                Err(e) => {
+                    tracing::warn!(?e, "cache refresh failed; serving the stale value");
+                    if let Some(entry) = map.get_mut(&key) {
+                        entry.refreshing = false;
+                    }
+                }
+            }
+        });
+    }
+
+    fn store(&self, key: K, v: Arc<V>) {
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Self::insert(&mut map, self.max, key, v);
+    }
+
+    fn insert(map: &mut HashMap<K, Entry<V>>, max: usize, key: K, v: Arc<V>) {
+        let e = map.entry(key.clone()).or_insert_with(Entry::empty);
+        e.value = Some((Instant::now(), v));
+        e.refreshing = false;
+        // Bounded: drop entries without a value (a computation that failed
+        // or is still running) first, then the oldest values.
+        while map.len() > max {
+            let Some(victim) = map
+                .iter()
+                .filter(|(k, _)| **k != key)
+                .min_by_key(|(_, e)| e.value.as_ref().map(|(t, _)| *t))
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            map.remove(&victim);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+type IpsPage = super::browse::Page<super::browse::IpSummary>;
+
+/// Aggregates and pages for anonymous traffic (an admin always reads fresh).
 pub struct StatsCache {
-    stats: RwLock<HashMap<Range, (Instant, Arc<Stats>)>>,
-    map: RwLock<HashMap<Range, (Instant, Arc<MapCounts>)>>,
-    /// Keyed by the full query string (filter + page).
-    ips: RwLock<HashMap<String, (Instant, IpsPage)>>,
-    /// Single-flight guard: on a miss only one task recomputes (each of these
-    /// aggregations scans much of the table), the rest wait and read the
-    /// freshly cached value, so an expiry under load is not a stampede.
-    refresh: tokio::sync::Mutex<()>,
+    stats: SwrCache<Range, Stats>,
+    map: SwrCache<Range, MapCounts>,
+    /// Keyed by the normalised filter (query string incl. page).
+    ips: SwrCache<String, IpsPage>,
+    /// Per-IP overview, keyed by the IP's row id.
+    ip: SwrCache<i64, super::browse::IpOverview>,
+}
+
+impl Default for StatsCache {
+    fn default() -> Self {
+        Self {
+            stats: SwrCache::new(Range::ALL.len()),
+            map: SwrCache::new(Range::ALL.len()),
+            ips: SwrCache::new(IPS_CACHE_MAX),
+            ip: SwrCache::new(IP_CACHE_MAX),
+        }
+    }
 }
 
 impl StatsCache {
@@ -395,88 +647,85 @@ impl StatsCache {
     }
 
     pub async fn stats(&self, store: &Store, r: Range) -> Result<Arc<Stats>> {
-        if let Some((t, v)) = self.stats.read().await.get(&r)
-            && t.elapsed() < TTL
-        {
-            return Ok(v.clone());
-        }
-        let _flight = self.refresh.lock().await;
-        // Another task may have refreshed while we waited for the guard.
-        if let Some((t, v)) = self.stats.read().await.get(&r)
-            && t.elapsed() < TTL
-        {
-            return Ok(v.clone());
-        }
-        let fresh = Arc::new(store.stats(r).await?);
+        let store = store.clone();
         self.stats
-            .write()
+            .get(r, ttl(r), move || {
+                let store = store.clone();
+                Box::pin(async move { store.stats(r).await })
+            })
             .await
-            .insert(r, (Instant::now(), fresh.clone()));
-        Ok(fresh)
     }
 
-    /// Public IP-directory pages: the unfiltered first page is what anonymous
-    /// crawlers hit, and it aggregates the whole requests table.
+    /// Public IP-directory pages.
     pub async fn ips(
         &self,
         store: &Store,
         f: &super::browse::IpFilter,
         key: String,
-    ) -> Result<IpsPage> {
-        if let Some((t, v)) = self.ips.read().await.get(&key)
-            && t.elapsed() < TTL
-        {
-            return Ok(v.clone());
+    ) -> Result<Arc<IpsPage>> {
+        let store = store.clone();
+        let f = f.clone();
+        self.ips
+            .get(key, PAGE_TTL, move || {
+                let (store, f) = (store.clone(), f.clone());
+                Box::pin(async move { store.list_ips(&f).await })
+            })
+            .await
+    }
+
+    /// Public per-IP overview; `None` when the IP is gone.
+    pub async fn ip(
+        &self,
+        store: &Store,
+        ip_id: i64,
+    ) -> Result<Option<Arc<super::browse::IpOverview>>> {
+        let store = store.clone();
+        let got = self
+            .ip
+            .get(ip_id, PAGE_TTL, move || {
+                let store = store.clone();
+                Box::pin(async move {
+                    store
+                        .ip_overview(ip_id)
+                        .await?
+                        .ok_or_else(|| anyhow::Error::new(Gone))
+                })
+            })
+            .await;
+        match got {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.is::<Gone>() => Ok(None),
+            Err(e) => Err(e),
         }
-        let _flight = self.refresh.lock().await;
-        if let Some((t, v)) = self.ips.read().await.get(&key)
-            && t.elapsed() < TTL
-        {
-            return Ok(v.clone());
-        }
-        let fresh = Arc::new(store.list_ips(f).await?);
-        let mut w = self.ips.write().await;
-        if w.len() >= IPS_CACHE_MAX {
-            // Drop expired entries first, then the oldest, to stay bounded.
-            w.retain(|_, (t, _)| t.elapsed() < TTL);
-            if w.len() >= IPS_CACHE_MAX
-                && let Some(oldest) = w
-                    .iter()
-                    .min_by_key(|(_, (t, _))| *t)
-                    .map(|(k, _)| k.clone())
-            {
-                w.remove(&oldest);
-            }
-        }
-        w.insert(key, (Instant::now(), fresh.clone()));
-        Ok(fresh)
     }
 
     #[cfg(test)]
     pub async fn ips_len(&self) -> usize {
-        self.ips.read().await.len()
+        self.ips.len()
     }
 
     pub async fn map(&self, store: &Store, r: Range) -> Result<Arc<MapCounts>> {
-        if let Some((t, v)) = self.map.read().await.get(&r)
-            && t.elapsed() < TTL
-        {
-            return Ok(v.clone());
-        }
-        let _flight = self.refresh.lock().await;
-        if let Some((t, v)) = self.map.read().await.get(&r)
-            && t.elapsed() < TTL
-        {
-            return Ok(v.clone());
-        }
-        let fresh = Arc::new(store.map_counts(r).await?);
+        let store = store.clone();
         self.map
-            .write()
+            .get(r, ttl(r), move || {
+                let store = store.clone();
+                Box::pin(async move { store.map_counts(r).await })
+            })
             .await
-            .insert(r, (Instant::now(), fresh.clone()));
-        Ok(fresh)
     }
 }
+
+/// The cached row no longer exists.
+#[derive(Debug)]
+struct Gone;
+
+impl std::fmt::Display for Gone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("gone")
+    }
+}
+
+impl std::error::Error for Gone {}
 
 #[cfg(test)]
 mod tests {
@@ -635,6 +884,71 @@ mod tests {
             c.ips(&s, &f, format!("k{i}&")).await.unwrap();
         }
         assert!(c.ips_len().await <= IPS_CACHE_MAX);
+    }
+
+    /// A counter as the cached computation, so tests see how often it ran.
+    fn counting(
+        n: Arc<std::sync::atomic::AtomicUsize>,
+        delay: Duration,
+    ) -> impl Fn() -> BoxFut<usize> {
+        move || {
+            let n = n.clone();
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_miss_is_computed_once_for_all_waiting_callers() {
+        let c: SwrCache<u8, usize> = SwrCache::new(4);
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ttl = Duration::from_secs(60);
+        let f = counting(n.clone(), Duration::from_millis(100));
+        let (a, b, d) = tokio::join!(c.get(1, ttl, &f), c.get(1, ttl, &f), c.get(1, ttl, &f));
+        assert_eq!((*a.unwrap(), *b.unwrap(), *d.unwrap()), (1, 1, 1));
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Another key does not wait for this one's flight.
+        let other = counting(n.clone(), Duration::ZERO);
+        assert_eq!(*c.get(2, ttl, &other).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_stale_value_is_served_while_one_task_refreshes_it() {
+        let c: SwrCache<u8, usize> = SwrCache::new(4);
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ttl = Duration::from_millis(50);
+        let f = counting(n.clone(), Duration::from_millis(50));
+        assert_eq!(*c.get(1, ttl, &f).await.unwrap(), 1);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Stale: returned at once, refreshed in the background, once.
+        let started = Instant::now();
+        assert_eq!(*c.get(1, ttl, &f).await.unwrap(), 1);
+        assert_eq!(*c.get(1, ttl, &f).await.unwrap(), 1);
+        assert!(started.elapsed() < Duration::from_millis(40), "no waiting");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(*c.get(1, ttl, &f).await.unwrap(), 2);
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn all_time_stats_come_from_the_read_models() {
+        let s = seeded().await;
+        let all = s.stats(Range::All).await.unwrap();
+        assert_eq!(all.total_requests, 4);
+        assert_eq!(all.unique_ips, 2);
+        assert_eq!(all.countries, 2);
+        assert_eq!(all.tor_ips, 1);
+        let a = all.top_ips.iter().find(|t| t.ip == "203.0.113.1").unwrap();
+        assert_eq!((a.count, a.max_severity, a.is_tor), (2, 3, false));
+        let b = all.top_ips.iter().find(|t| t.ip == "198.51.100.2").unwrap();
+        assert_eq!((b.count, b.max_severity, b.is_tor), (2, 1, true));
+        assert_eq!(all.top_labels[0].name, "sensitive-path");
+        assert_eq!(all.top_labels[0].count, 3);
+        // A scan-only IP (no requests) is not counted.
+        s.upsert_ip("192.0.2.9".parse().unwrap()).await.unwrap();
+        assert_eq!(s.stats(Range::All).await.unwrap().unique_ips, 2);
     }
 
     #[test]

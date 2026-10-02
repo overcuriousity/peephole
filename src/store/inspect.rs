@@ -118,7 +118,7 @@ impl Store {
              ORDER BY fetched_at DESC, ip LIMIT ?",
         )
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read)
         .await?)
     }
 
@@ -127,7 +127,7 @@ impl Store {
         Ok(
             sqlx::query_as::<_, ScanSummary>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(ip_id)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.read)
                 .await?,
         )
     }
@@ -140,7 +140,7 @@ impl Store {
             offset(page)
         );
         let rows = sqlx::query_as::<_, ScanSummary>(sqlx::AssertSqlSafe(sql.as_str()))
-            .fetch_all(&self.pool)
+            .fetch_all(&self.read)
             .await?;
         Ok(Page::from_rows(rows, page))
     }
@@ -150,7 +150,7 @@ impl Store {
         Ok(
             sqlx::query_as::<_, ScanSummary>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.read)
                 .await?,
         )
     }
@@ -160,7 +160,7 @@ impl Store {
             "SELECT port, proto, state, service, product, version FROM ports WHERE scan_id = ? ORDER BY port",
         )
         .bind(scan_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read)
         .await?)
     }
 
@@ -169,7 +169,7 @@ impl Store {
         let blob: Option<Option<Vec<u8>>> =
             sqlx::query_scalar("SELECT raw_xml FROM scans WHERE id = ?")
                 .bind(id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.read)
                 .await?;
         match blob.flatten() {
             // Cap the decompressed size: raw_xml can arrive from any cluster
@@ -180,33 +180,90 @@ impl Store {
         }
     }
 
+    /// Ports of several scans in one query, by scan id.
+    pub async fn ports_for_scans(
+        &self,
+        scan_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<PortRow>>> {
+        let mut out: std::collections::HashMap<i64, Vec<PortRow>> = Default::default();
+        for chunk in scan_ids.chunks(400) {
+            let sql = format!(
+                "SELECT scan_id, port, proto, state, service, product, version FROM ports
+                 WHERE scan_id IN ({}) ORDER BY scan_id, port",
+                vec!["?"; chunk.len()].join(",")
+            );
+            type Row = (
+                i64,
+                i64,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            );
+            let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                q = q.bind(id);
+            }
+            for (scan_id, port, proto, state, service, product, version) in
+                q.fetch_all(&self.read).await?
+            {
+                out.entry(scan_id).or_default().push(PortRow {
+                    port,
+                    proto,
+                    state,
+                    service,
+                    product,
+                    version,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// The IP's fingerprints by hash, with how many other IPs share each
+    /// hash and the visitor ids seen with it (three queries in all).
     pub async fn fingerprints_for_ip(&self, ip_id: i64) -> Result<Vec<FpSummary>> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT fp_hash, COUNT(*) FROM fingerprints WHERE ip_id = ? AND fp_hash IS NOT NULL
              GROUP BY fp_hash ORDER BY 2 DESC",
         )
         .bind(ip_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read)
         .await?;
-        let mut out = vec![];
-        for (hash, count) in rows {
-            let other_ips = self.fingerprint_ip_count(&hash, ip_id).await?;
-            let visitor_ids: Vec<String> = sqlx::query_scalar(
-                "SELECT DISTINCT visitor_id FROM fingerprints
-                 WHERE ip_id = ? AND fp_hash = ? AND visitor_id IS NOT NULL",
-            )
-            .bind(ip_id)
-            .bind(&hash)
-            .fetch_all(&self.pool)
-            .await?;
-            out.push(FpSummary {
+        let others: std::collections::HashMap<String, i64> = sqlx::query_as(
+            "SELECT f.fp_hash, COUNT(DISTINCT f.ip_id) FROM fingerprints f
+             WHERE f.fp_hash IN (SELECT fp_hash FROM fingerprints
+                                 WHERE ip_id = ?1 AND fp_hash IS NOT NULL)
+               AND f.ip_id != ?1
+             GROUP BY f.fp_hash",
+        )
+        .bind(ip_id)
+        .fetch_all(&self.read)
+        .await?
+        .into_iter()
+        .collect();
+        let mut visitors: std::collections::HashMap<String, Vec<String>> = Default::default();
+        let pairs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT fp_hash, visitor_id FROM fingerprints
+             WHERE ip_id = ? AND fp_hash IS NOT NULL AND visitor_id IS NOT NULL
+             ORDER BY fp_hash, visitor_id",
+        )
+        .bind(ip_id)
+        .fetch_all(&self.read)
+        .await?;
+        for (hash, visitor) in pairs {
+            visitors.entry(hash).or_default().push(visitor);
+        }
+        Ok(rows
+            .into_iter()
+            .map(|(hash, count)| FpSummary {
+                other_ips: others.get(&hash).copied().unwrap_or(0),
+                visitor_ids: visitors.remove(&hash).unwrap_or_default(),
                 hash,
                 count,
-                other_ips,
-                visitor_ids,
-            });
-        }
-        Ok(out)
+            })
+            .collect())
     }
 
     /// Fingerprint hashes seen from more than one source IP.
@@ -217,7 +274,7 @@ impl Store {
              GROUP BY f.fp_hash HAVING COUNT(DISTINCT f.ip_id) > 1
              ORDER BY COUNT(DISTINCT f.ip_id) DESC LIMIT 200",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read)
         .await?;
         Ok(rows
             .into_iter()
@@ -234,7 +291,7 @@ impl Store {
         Ok(
             sqlx::query_as::<_, FpClaimRow>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(ip_id)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.read)
                 .await?,
         )
     }
@@ -243,26 +300,36 @@ impl Store {
         let sql = format!("{CLAIM_SELECT} ORDER BY c.id DESC LIMIT 500");
         Ok(
             sqlx::query_as::<_, FpClaimRow>(sqlx::AssertSqlSafe(sql.as_str()))
-                .fetch_all(&self.pool)
+                .fetch_all(&self.read)
                 .await?,
         )
     }
 
+    /// Number of false-positive claims (the inbox).
+    pub async fn inbox_count(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM fp_claims")
+            .fetch_one(&self.read)
+            .await?)
+    }
+
     pub async fn queue_summary(&self) -> Result<QueueSummary> {
-        // SUM over zero rows is NULL, hence the Options.
-        let (q, r, d, f): (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
-            "SELECT SUM(status='queued'), SUM(status='running'),
-                    SUM(status='done' AND finished_at > datetime('now','-24 hours')),
-                    SUM(status='failed' AND finished_at > datetime('now','-24 hours'))
-             FROM scan_jobs",
+        // Each count is a range of the (status, finished_at) index, not a
+        // pass over every job ever queued.
+        let (q, r, d, f): (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM scan_jobs WHERE status = 'queued'),
+                    (SELECT COUNT(*) FROM scan_jobs WHERE status = 'running'),
+                    (SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'
+                       AND finished_at > datetime('now','-24 hours')),
+                    (SELECT COUNT(*) FROM scan_jobs WHERE status = 'failed'
+                       AND finished_at > datetime('now','-24 hours'))",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&self.read)
         .await?;
         Ok(QueueSummary {
-            queued: q.unwrap_or(0),
-            running: r.unwrap_or(0),
-            done_24h: d.unwrap_or(0),
-            failed_24h: f.unwrap_or(0),
+            queued: q,
+            running: r,
+            done_24h: d,
+            failed_24h: f,
             // Same count the hourly cap uses: every nmap launch, any outcome.
             scans_last_hour: self.jobs_started_last_hour().await?,
         })
@@ -274,7 +341,7 @@ impl Store {
             super::scans::QUEUE_JOB_SQL
         )))
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read)
         .await?)
     }
 
@@ -284,7 +351,7 @@ impl Store {
         };
         let ip: String = sqlx::query_scalar("SELECT ip FROM ips WHERE id = ?")
             .bind(row.ip_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&self.read)
             .await?;
         let headers: Vec<(String, String)> =
             serde_json::from_str(&row.headers_json).unwrap_or_default();
@@ -298,7 +365,7 @@ impl Store {
             "SELECT fp_hash, visitor_id FROM fingerprints WHERE request_id = ? ORDER BY id DESC LIMIT 1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.read)
         .await?;
         let fingerprint = match fp {
             Some((hash, visitor)) => Some(FpSummary {
@@ -313,7 +380,7 @@ impl Store {
             "SELECT m.name FROM requests r JOIN members m ON m.id = r.origin WHERE r.id = ?",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.read)
         .await?;
         Ok(Some(RequestDetail {
             node,
@@ -332,7 +399,7 @@ impl Store {
         Ok(sqlx::query_as(
             "SELECT hex(cred_id), COALESCE(label,'(unnamed)'), created_at FROM credentials ORDER BY id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read)
         .await?)
     }
 }

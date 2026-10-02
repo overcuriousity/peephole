@@ -29,6 +29,9 @@ pub struct IpRow {
     pub is_tor_exit: bool,
     pub fp_claimed: bool,
     pub notes: Option<String>,
+    /// Read models kept by triggers (migration 0020).
+    pub request_count: i64,
+    pub max_severity: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -55,10 +58,11 @@ impl Store {
         // refresh would otherwise be overwritten by a stale view.
         let mut conn = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let created = sqlx::query(
-            "INSERT OR IGNORE INTO ips (ip, first_seen, last_seen)
-             VALUES (?, datetime('now'), datetime('now'))",
+            "INSERT OR IGNORE INTO ips (ip, ip_key, first_seen, last_seen)
+             VALUES (?, ?, datetime('now'), datetime('now'))",
         )
         .bind(&s)
+        .bind(super::ip_key(ip))
         .execute(&mut *conn)
         .await?
         .rows_affected()

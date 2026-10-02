@@ -196,13 +196,16 @@ async fn ensure_ip(conn: &mut SqliteConnection, ip: &str, seen: Option<&str>) ->
             }
             return Ok(id);
         }
-        None => sqlx::query("INSERT INTO ips (ip, first_seen, last_seen) VALUES (?, ?, ?)")
-            .bind(ip)
-            .bind(&ts)
-            .bind(&ts)
-            .execute(&mut *conn)
-            .await?
-            .last_insert_rowid(),
+        None => {
+            sqlx::query("INSERT INTO ips (ip, ip_key, first_seen, last_seen) VALUES (?, ?, ?, ?)")
+                .bind(ip)
+                .bind(super::ip_key_of(ip).unwrap_or_default())
+                .bind(&ts)
+                .bind(&ts)
+                .execute(&mut *conn)
+                .await?
+                .last_insert_rowid()
+        }
     };
     refresh_ip_view(conn, ip).await?;
     Ok(id)

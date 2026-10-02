@@ -68,7 +68,7 @@ struct HomePage {
     q: QueueSummary,
     workers: usize,
     cap: i64,
-    inbox: usize,
+    inbox: i64,
     jobs: Vec<QueueJob>,
     failed: Vec<QueueJob>,
     tor_fetch: String,
@@ -90,7 +90,7 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         q: st.store.queue_summary().await?,
         workers: st.pace.get().max_workers,
         cap: st.pace.get().max_scans_per_hour,
-        inbox: st.store.inbox().await?.len(),
+        inbox: st.store.inbox_count().await?,
         jobs: st.store.queue_snapshot(25).await?,
         failed: st.store.recent_failed_jobs(10).await?,
         tor_fetch: fetched("tor_last_fetch"),
@@ -739,22 +739,21 @@ async fn bulk_delete_requests(
     let form = parse_bulk::<RequestFilter>(&body)?;
     let mut total = Deleted::default();
     if form.all {
-        // Rounds of MATCH_LIMIT until nothing matches, so "all" means all.
+        // Rounds of MATCH_LIMIT, walking down the ids, so "all" means all
+        // and a row that cannot be removed from here does not end the walk.
+        let mut before = i64::MAX;
         loop {
-            let ids = st.store.matching_request_ids(&form.filter).await?;
-            if ids.is_empty() {
+            let ids = st
+                .store
+                .matching_request_ids_before(&form.filter, before)
+                .await?;
+            let Some(&last) = ids.last() else {
                 break;
-            }
+            };
             let out = st.recorder.delete_requests(&ids).await?;
             total.deleted += out.deleted;
             total.hidden += out.hidden;
-            // Stop when a round changed nothing: what still matches cannot
-            // be removed from here.
-            if out.deleted + out.hidden == 0
-                || (ids.len() as i64) < crate::store::browse::MATCH_LIMIT
-            {
-                break;
-            }
+            before = last;
         }
     } else {
         let ids: Vec<i64> = form.ids.iter().filter_map(|v| v.parse().ok()).collect();
@@ -783,19 +782,18 @@ async fn bulk_delete_ips(
     let form = parse_bulk::<IpFilter>(&body)?;
     let mut total = Deleted::default();
     if form.all {
+        // Walk up the ids: IPs without records of their own (nothing to
+        // delete or hide) no longer end the loop early.
+        let mut after = 0;
         loop {
-            let ids = st.store.matching_ip_ids(&form.filter).await?;
-            if ids.is_empty() {
+            let ids = st.store.matching_ip_ids_after(&form.filter, after).await?;
+            let Some(&last) = ids.last() else {
                 break;
-            }
+            };
             let out = st.recorder.delete_ips(&ids).await?;
             total.deleted += out.deleted;
             total.hidden += out.hidden;
-            if out.deleted + out.hidden == 0
-                || (ids.len() as i64) < crate::store::browse::MATCH_LIMIT
-            {
-                break;
-            }
+            after = last;
         }
     } else {
         let mut ids = vec![];
