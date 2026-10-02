@@ -256,10 +256,9 @@ if [ "${PEEPHOLE_ALLOW_NO_SYSTEMD:-0}" != "1" ] && [ "$(cat /proc/1/comm 2>/dev/
     die "systemd is not PID 1 (container or chroot?). The service cannot be managed here; set PEEPHOLE_ALLOW_NO_SYSTEMD=1 to install anyway."
 fi
 [ -n "$ARCH" ] || die "builds are published for x86_64 and aarch64 only; build from source on $(uname -m) (see README)"
-case "$RELEASE" in
-    latest|v[0-9]*) ;;
-    *) die "PEEPHOLE_VERSION must be a release tag such as v0.1.0 (got '${RELEASE}')" ;;
-esac
+if [ "$RELEASE" != latest ] && ! [[ "$RELEASE" =~ ^v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.]+)?$ ]]; then
+    die "PEEPHOLE_VERSION must be a release tag such as v0.1.0 (got '${RELEASE}')"
+fi
 
 # Questions are read from the terminal, or from the file PEEPHOLE_TTY names
 # (tests). One descriptor stays open so answers are consumed in order.
