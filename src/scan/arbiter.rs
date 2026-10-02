@@ -596,6 +596,7 @@ mod tests {
             store: store.clone(),
             proto: (2, 2),
             data_dir: dir.path().to_path_buf(),
+            retention_days: 0,
         })
         .await
         .unwrap();

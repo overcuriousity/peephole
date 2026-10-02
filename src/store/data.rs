@@ -1031,6 +1031,26 @@ pub(crate) async fn unmaterialize(
     kind: &str,
     uid: &str,
 ) -> Result<Option<i64>> {
+    remove_row(conn, kind, uid, true).await
+}
+
+/// Take a record out of the tables whose log entry is being dropped too
+/// (history pruning): like [`unmaterialize`], without putting its own
+/// payload back; children of other entries still keep theirs.
+pub(crate) async fn drop_row(
+    conn: &mut SqliteConnection,
+    kind: &str,
+    uid: &str,
+) -> Result<Option<i64>> {
+    remove_row(conn, kind, uid, false).await
+}
+
+async fn remove_row(
+    conn: &mut SqliteConnection,
+    kind: &str,
+    uid: &str,
+    keep_own: bool,
+) -> Result<Option<i64>> {
     let table = match kind {
         "request" => "requests",
         "fp_claim" => "fp_claims",
@@ -1048,7 +1068,9 @@ pub(crate) async fn unmaterialize(
     if ip_id.is_none() {
         return Ok(None);
     }
-    keep_payload(conn, kind, uid).await?;
+    if keep_own {
+        keep_payload(conn, kind, uid).await?;
+    }
     match kind {
         "request" => {
             sqlx::query("DELETE FROM fp_claims WHERE request_uid = ?")

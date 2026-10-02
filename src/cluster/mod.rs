@@ -4,6 +4,7 @@ pub mod adopt;
 pub mod block;
 pub mod cli;
 pub mod confkey;
+pub mod history;
 pub mod hlc;
 pub mod identity;
 pub mod invite;
@@ -38,6 +39,8 @@ pub struct NodeParams {
     pub proto: (u32, u32),
     /// Where shared intel files live (served to peers).
     pub data_dir: std::path::PathBuf,
+    /// Days of history this node keeps (top-level `retention_days`); 0: all.
+    pub retention_days: u32,
 }
 
 impl NodeParams {
@@ -54,6 +57,7 @@ impl NodeParams {
             store,
             proto: (proto::PROTO_MIN, proto::PROTO_VERSION),
             data_dir: cfg.data_dir.clone(),
+            retention_days: cfg.retention_days,
         })
     }
 }
@@ -263,6 +267,8 @@ pub struct Node {
     pub job_events: tokio::sync::broadcast::Sender<String>,
     /// Highest sequence this node has written to its own log.
     pub own_head: std::sync::atomic::AtomicU64,
+    /// Days of history this node keeps; 0: everything (see [`history`]).
+    pub retention_days: u32,
 }
 
 impl Node {
@@ -301,6 +307,7 @@ impl Node {
             started: std::time::Instant::now(),
             job_events: tokio::sync::broadcast::channel(256).0,
             own_head: Default::default(),
+            retention_days: p.retention_days,
         });
         // Our clock must not run behind anything already in the log.
         let max_hlc: Option<i64> = sqlx::query_scalar("SELECT MAX(hlc) FROM repl_log")

@@ -157,6 +157,7 @@ pub async fn purge(node: &Node, id: NodeId) -> Result<u64> {
         "DELETE FROM tomb_proofs WHERE origin = ?",
         "DELETE FROM intel_files WHERE origin = ?",
         "DELETE FROM origin_usage WHERE origin = ?",
+        "DELETE FROM repl_floors WHERE origin = ?",
     ] {
         sqlx::query(sql).bind(&id.0[..]).execute(&mut *tx).await?;
     }

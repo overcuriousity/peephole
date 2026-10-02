@@ -2,18 +2,20 @@
 //! peers and applying theirs.
 //!
 //! Invariant: for every origin the entries held (applied log + parked) are
-//! exactly `1..=head`, so a version vector of heads describes a node's state.
-//! Entries arrive in order; anything that would leave a gap is rejected and
-//! simply re-sent by a later sync round. Two local decisions bend this:
-//! parked entries of a node nobody admitted expire (its head goes back down,
-//! so they are fetched again later), and a purged origin keeps its head
-//! while its entries are gone (they are neither served nor accepted).
+//! exactly `floor..=head` (plus, below the floor, its membership entries),
+//! so a version vector of heads describes a node's state. The floor is 1 —
+//! the whole history — unless this node keeps only a window (see
+//! [`super::history`]). Entries arrive in order; anything that would leave
+//! a gap is rejected and simply re-sent by a later sync round. Local
+//! decisions bend this: parked entries of a node nobody admitted expire (its
+//! head goes back down, so they are fetched again later), a purged origin
+//! keeps its head while its entries are gone (they are neither served nor
+//! accepted), and a windowed node drops entries below its floor.
 //!
 //! Nothing else is ever removed from the log: a node that joins later
-//! fetches the whole log from any member, so no prefix can be dropped even
-//! once every known member holds it. Erased entries shrink to stubs without
-//! payload; `tombstoned` must stay too, because records of other nodes that
-//! hang off a deleted one can arrive at any time.
+//! fetches the history from members that keep it. Erased entries shrink to
+//! stubs without payload; `tombstoned` must stay too, because records of
+//! other nodes that hang off a deleted one can arrive at any time.
 use super::Node;
 use super::hlc;
 use super::identity::NodeId;
@@ -420,9 +422,11 @@ async fn bump_head(conn: &mut SqliteConnection, origin: &NodeId, seq: u64) -> Re
 /// Store a log entry. `state` is one of the `repl_log.applied` states.
 async fn insert_log(conn: &mut SqliteConnection, e: &WireEntry, state: i64) -> Result<()> {
     bump_head(conn, &e.origin, e.seq).await?;
+    let accounted = (e.payload.as_ref().map_or(0, Vec::len) + 128) as i64;
     sqlx::query(
-        "INSERT INTO repl_log (origin, seq, hlc, kind, uid, payload, sig, erased_by, applied, received_at)
-         VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))",
+        "INSERT INTO repl_log (origin, seq, hlc, kind, uid, payload, sig, erased_by, applied,
+                               received_at, accounted)
+         VALUES (?,?,?,?,?,?,?,?,?,datetime('now'),?)",
     )
     .bind(&e.origin.0[..])
     .bind(e.seq as i64)
@@ -433,6 +437,7 @@ async fn insert_log(conn: &mut SqliteConnection, e: &WireEntry, state: i64) -> R
     .bind(&e.sig)
     .bind(&e.erased_by)
     .bind(state)
+    .bind(accounted)
     .execute(&mut *conn)
     .await?;
     // What the origin costs this node (its quota); row-backed payloads are
@@ -442,7 +447,7 @@ async fn insert_log(conn: &mut SqliteConnection, e: &WireEntry, state: i64) -> R
          ON CONFLICT(origin) DO UPDATE SET bytes = bytes + excluded.bytes, entries = entries + 1",
     )
     .bind(&e.origin.0[..])
-    .bind((e.payload.as_ref().map_or(0, Vec::len) + 128) as i64)
+    .bind(accounted)
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -1221,6 +1226,7 @@ mod tests {
             store: store.clone(),
             proto: (1, 1),
             data_dir: dir.path().to_path_buf(),
+            retention_days: 0,
         })
         .await
         .unwrap();

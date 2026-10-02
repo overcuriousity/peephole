@@ -1389,6 +1389,7 @@ license_key = "k"
             store: store.clone(),
             proto: (2, 2),
             data_dir: dir.to_path_buf(),
+            retention_days: 0,
         })
         .await
         .unwrap();

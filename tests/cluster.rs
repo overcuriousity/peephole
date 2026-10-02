@@ -146,6 +146,7 @@ async fn boot_in(
             cluster::rpc::proto::PROTO_VERSION,
         )),
         data_dir: dir.path().to_path_buf(),
+        retention_days: 0,
     })
     .await
     .unwrap();
@@ -690,6 +691,7 @@ async fn a_node_offline_for_over_30_days_starts_detached() {
             store,
             proto: (2, 2),
             data_dir: dir.path().to_path_buf(),
+            retention_days: 0,
         })
         .await
         .unwrap()
@@ -904,6 +906,7 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
         store,
         proto: (1, 1),
         data_dir: dir.path().to_path_buf(),
+        retention_days: 0,
     })
     .await
     .unwrap();
@@ -1123,6 +1126,7 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
         store,
         proto: (1, 1),
         data_dir: dir.path().to_path_buf(),
+        retention_days: 0,
     })
     .await
     .unwrap();
