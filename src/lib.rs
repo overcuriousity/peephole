@@ -181,6 +181,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         ));
     }
 
+    // Housekeeping on every node: expired sessions and ceremonies, planner
+    // statistics, freed pages; local tombstones on a standalone node.
+    tokio::spawn(store::maintenance::run(
+        store.clone(),
+        cfg.cluster.is_none(),
+        shutdown_rx.clone(),
+    ));
+
     // Queue change notifications: trap + workers publish, admin SSE subscribes.
     let notifier = events::Notifier::new();
 
@@ -510,6 +518,8 @@ impl RoleRunner {
             stop,
             task: tokio::spawn(async move {
                 let mut grace = rx.clone();
+                // The peer address feeds the per-client rate limits.
+                let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
                 let served = axum::serve(listener, app).with_graceful_shutdown(async move {
                     let _ = rx.wait_for(|v| *v).await;
                 });

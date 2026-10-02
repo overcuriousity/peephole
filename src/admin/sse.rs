@@ -54,7 +54,7 @@ pub async fn queue_stream(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.notifier.subscribe();
     // The session id, so the long-lived stream can notice logout/expiry.
-    let session = jar.get("peephole_session").map(|c| c.value().to_string());
+    let session = crate::admin::auth::session_token(&state, &jar);
     Sse::new(async_stream(state, rx, session)).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))

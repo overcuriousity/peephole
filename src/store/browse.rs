@@ -170,35 +170,10 @@ pub(crate) fn like_escape(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// LIKE prefix that bounds a CIDR's candidates before exact filtering in Rust.
-fn net_like_prefix(net: &IpNet) -> String {
-    match net {
-        IpNet::V4(n) => {
-            let o = n.network().octets();
-            match n.prefix_len() {
-                0..=7 => String::new(),
-                8..=15 => format!("{}.", o[0]),
-                16..=23 => format!("{}.{}.", o[0], o[1]),
-                _ => format!("{}.{}.{}.", o[0], o[1], o[2]),
-            }
-        }
-        IpNet::V6(n) => {
-            // The first hextet is stable for /16 and longer; SQLite stores the
-            // canonical Rust `Display` form, whose first group has no leading zeros.
-            if n.prefix_len() >= 16 {
-                let s = n.network().segments();
-                format!("{:x}:", s[0])
-            } else {
-                String::new()
-            }
-        }
-    }
-}
-
 const IP_SUMMARY_SELECT: &str =
     "SELECT i.ip, i.country, i.asn, i.asn_org, i.is_tor_exit AS is_tor, i.first_seen, i.last_seen,
-            COUNT(r.id) AS request_count, COALESCE(MAX(r.severity), 0) AS max_severity
-     FROM ips i LEFT JOIN requests r ON r.ip_id = i.id";
+            i.request_count, i.max_severity
+     FROM ips i";
 
 /// Who a request listing is for. A mistyped legitimate API call lands in
 /// the trap with its credentials in the query string, so query strings are
@@ -249,17 +224,17 @@ fn nonempty(s: &Option<String>) -> Option<String> {
 }
 
 /// SQL fragments for an `IpFilter`; `None` when the query box holds garbage.
+/// Everything is answered from the `ips` row and its read models
+/// (`request_count`, `max_severity`, `ip_key`, `ip_labels`), never by
+/// aggregating requests.
 struct IpFilterSql {
     where_sql: String,
     binds: Vec<String>,
-    having: &'static str,
-    net: Option<IpNet>,
 }
 
 fn ip_filter_sql(f: &IpFilter) -> Option<IpFilterSql> {
     let mut wheres: Vec<String> = vec![];
     let mut binds: Vec<String> = vec![];
-    let mut net: Option<IpNet> = None;
     if let Some(q) = nonempty(&f.q) {
         match parse_q(&q) {
             IpQuery::Exact(ip) => {
@@ -267,16 +242,19 @@ fn ip_filter_sql(f: &IpFilter) -> Option<IpFilterSql> {
                 binds.push(ip);
             }
             IpQuery::Net(n) => {
-                let p = net_like_prefix(&n);
-                if !p.is_empty() {
-                    wheres.push("i.ip LIKE ?".into());
-                    binds.push(format!("{p}%"));
+                let (lo, hi) = super::net_key_range(&n);
+                wheres.push("i.ip_key BETWEEN ? AND ?".into());
+                binds.push(lo);
+                binds.push(hi);
+                // IPv4 keys live in ::ffff:0:0/96; an IPv6 network that
+                // covers that range still means IPv6 addresses only.
+                if n.addr().is_ipv6() {
+                    wheres.push("instr(i.ip, ':') > 0".into());
                 }
-                net = Some(n);
             }
             IpQuery::Prefix(p) => {
-                wheres.push("i.ip LIKE ?".into());
-                binds.push(format!("{p}%"));
+                wheres.push("i.ip LIKE ? ESCAPE '\\'".into());
+                binds.push(format!("{}%", like_escape(&p)));
             }
             IpQuery::Invalid => return None,
         }
@@ -293,35 +271,30 @@ fn ip_filter_sql(f: &IpFilter) -> Option<IpFilterSql> {
         wheres.push("i.is_tor_exit = 1".into());
     }
     if let Some(l) = nonempty(&f.label) {
-        wheres.push(
-            "EXISTS (SELECT 1 FROM requests rx, json_each(rx.labels_json) je \
-             WHERE rx.ip_id = i.id AND je.value = ?)"
-                .into(),
-        );
+        wheres.push("i.id IN (SELECT l.ip_id FROM ip_labels l WHERE l.label = ?)".into());
         binds.push(l);
     }
-    let having = match f.min_severity {
-        Some(m) => {
-            binds.push(m.to_string());
-            " HAVING COALESCE(MAX(r.severity),0) >= CAST(? AS INTEGER)"
-        }
-        None => "",
-    };
+    if let Some(m) = f.min_severity {
+        wheres.push("i.max_severity >= CAST(? AS INTEGER)".into());
+        binds.push(m.to_string());
+    }
     let where_sql = if wheres.is_empty() {
         String::new()
     } else {
         format!(" WHERE {}", wheres.join(" AND "))
     };
-    Some(IpFilterSql {
-        where_sql,
-        binds,
-        having,
-        net,
-    })
+    Some(IpFilterSql { where_sql, binds })
 }
 
-/// `AND …` fragments plus binds for a `RequestFilter`.
-fn request_filter_sql(f: &RequestFilter, a: Audience) -> (String, Vec<String>) {
+/// FTS5 query for a substring of the given columns (trigram tokenizer: a
+/// quoted phrase matches wherever its text occurs).
+fn fts_substring(cols: &str, v: &str) -> String {
+    format!("{cols} : \"{}\"", v.replace('"', "\"\""))
+}
+
+/// `AND …` fragments plus binds for a `RequestFilter`. `indexed`: the
+/// trigram index over path and query exists.
+fn request_filter_sql(f: &RequestFilter, a: Audience, indexed: bool) -> (String, Vec<String>) {
     let mut sql = String::new();
     let mut binds: Vec<String> = vec![];
     if let Some(v) = nonempty(&f.ip) {
@@ -329,6 +302,18 @@ fn request_filter_sql(f: &RequestFilter, a: Audience) -> (String, Vec<String>) {
         binds.push(canonical_ip(&v));
     }
     if let Some(v) = nonempty(&f.path) {
+        // The index narrows the candidates (trigrams need three or more
+        // characters); the LIKE below keeps the exact semantics.
+        if indexed && v.chars().count() >= 3 {
+            let cols = match a {
+                Audience::Admin => "{path query}",
+                Audience::Public => "path",
+            };
+            sql.push_str(
+                " AND r.id IN (SELECT rowid FROM requests_fts WHERE requests_fts MATCH ?)",
+            );
+            binds.push(fts_substring(cols, &v));
+        }
         // Escape LIKE wildcards so a path containing % or _ (both common in
         // scanner traffic, e.g. _vti_bin) matches literally — otherwise the
         // listing, its count, and "delete all matching" cover a broader set.
@@ -402,6 +387,37 @@ pub fn ts_bound(v: &str, upper: bool) -> String {
 /// Upper bound for one unpaged id lookup (bulk delete works in rounds of this size).
 pub const MATCH_LIMIT: i64 = 100_000;
 
+/// Counts stop here: past it the admin sees "N+" (counting every match of a
+/// broad filter would walk the whole table on each page view).
+pub const COUNT_CAP: i64 = 10_000;
+
+/// A row count, possibly capped at [`COUNT_CAP`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Count {
+    pub n: i64,
+    /// More rows match than `n`.
+    pub capped: bool,
+}
+
+impl std::fmt::Display for Count {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.capped {
+            write!(f, "{}+", self.n)
+        } else {
+            write!(f, "{}", self.n)
+        }
+    }
+}
+
+impl Count {
+    fn of(n: i64) -> Self {
+        Self {
+            n: n.min(COUNT_CAP),
+            capped: n > COUNT_CAP,
+        }
+    }
+}
+
 impl Store {
     pub async fn list_ips(&self, f: &IpFilter) -> Result<Page<IpSummary>> {
         let page = page_num(f.page);
@@ -415,108 +431,98 @@ impl Store {
         let order = if f.sort.as_deref() == Some("recent") {
             "i.last_seen DESC"
         } else {
-            "request_count DESC, i.last_seen DESC"
-        };
-        // CIDR: fetch candidates unpaged (bounded by the LIKE prefix), filter,
-        // then page in Rust.
-        let (limit, off) = if fs.net.is_some() {
-            (MATCH_LIMIT, 0)
-        } else {
-            (PAGE_SIZE + 1, offset(page))
+            "i.request_count DESC, i.last_seen DESC"
         };
         let sql = format!(
-            "{IP_SUMMARY_SELECT}{} GROUP BY i.id{} ORDER BY {order} LIMIT {limit} OFFSET {off}",
-            fs.where_sql, fs.having
+            "{IP_SUMMARY_SELECT}{} ORDER BY {order} LIMIT {} OFFSET {}",
+            fs.where_sql,
+            PAGE_SIZE + 1,
+            offset(page)
         );
         let mut q = sqlx::query_as::<_, IpSummary>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &fs.binds {
             q = q.bind(b);
         }
-        let mut rows = q.fetch_all(&self.pool).await?;
-        if let Some(net) = fs.net {
-            rows.retain(|r| {
-                r.ip.parse::<IpAddr>()
-                    .map(|ip| net.contains(&ip))
-                    .unwrap_or(false)
-            });
-            rows = rows
-                .into_iter()
-                .skip(offset(page) as usize)
-                .take(PAGE_SIZE as usize + 1)
-                .collect();
-        }
-        Ok(Page::from_rows(rows, page))
+        Ok(Page::from_rows(q.fetch_all(&self.read).await?, page))
     }
 
-    /// Every IP id matching the filter (unpaged; bulk delete + counts).
-    pub async fn matching_ip_ids(&self, f: &IpFilter) -> Result<Vec<i64>> {
+    /// Up to [`MATCH_LIMIT`] ids of IPs matching the filter, in id order,
+    /// above `after` (keyset paging, so bulk delete covers every match).
+    pub async fn matching_ip_ids_after(&self, f: &IpFilter, after: i64) -> Result<Vec<i64>> {
         let Some(fs) = ip_filter_sql(f) else {
             return Ok(vec![]);
         };
+        let glue = if fs.where_sql.is_empty() {
+            " WHERE"
+        } else {
+            " AND"
+        };
         let sql = format!(
-            "SELECT i.id, i.ip FROM ips i LEFT JOIN requests r ON r.ip_id = i.id{} GROUP BY i.id{} LIMIT {MATCH_LIMIT}",
-            fs.where_sql, fs.having
+            "SELECT i.id FROM ips i{}{glue} i.id > ? ORDER BY i.id LIMIT {MATCH_LIMIT}",
+            fs.where_sql
         );
-        let mut q = sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(sql.as_str()));
+        let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &fs.binds {
             q = q.bind(b);
         }
-        let rows = q.fetch_all(&self.pool).await?;
-        Ok(rows
-            .into_iter()
-            .filter(|(_, ip)| match fs.net {
-                Some(net) => ip
-                    .parse::<IpAddr>()
-                    .map(|a| net.contains(&a))
-                    .unwrap_or(false),
-                None => true,
-            })
-            .map(|(id, _)| id)
-            .collect())
+        Ok(q.bind(after).fetch_all(&self.read).await?)
     }
 
-    /// Number of IPs matching the filter (CIDR filtered in Rust, like `list_ips`).
+    /// The first [`MATCH_LIMIT`] ids of IPs matching the filter.
+    pub async fn matching_ip_ids(&self, f: &IpFilter) -> Result<Vec<i64>> {
+        self.matching_ip_ids_after(f, 0).await
+    }
+
+    /// Number of IPs matching the filter.
     pub async fn count_ips(&self, f: &IpFilter) -> Result<i64> {
         let Some(fs) = ip_filter_sql(f) else {
             return Ok(0);
         };
-        if fs.net.is_some() {
-            return Ok(self.matching_ip_ids(f).await?.len() as i64);
-        }
-        let sql = format!(
-            "SELECT COUNT(*) FROM (SELECT i.id FROM ips i LEFT JOIN requests r ON r.ip_id = i.id{} GROUP BY i.id{})",
-            fs.where_sql, fs.having
-        );
+        let sql = format!("SELECT COUNT(*) FROM ips i{}", fs.where_sql);
         let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &fs.binds {
             q = q.bind(b);
         }
-        Ok(q.fetch_one(&self.pool).await?)
+        Ok(q.fetch_one(&self.read).await?)
     }
 
-    /// Number of requests matching the filter.
-    pub async fn count_requests(&self, f: &RequestFilter) -> Result<i64> {
-        let (w, binds) = request_filter_sql(f, Audience::Admin);
-        let sql =
-            format!("SELECT COUNT(*) FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w}");
-        let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
-        for b in &binds {
-            q = q.bind(b);
-        }
-        Ok(q.fetch_one(&self.pool).await?)
-    }
-
-    /// Every request id matching the filter (unpaged; bulk delete + counts).
-    pub async fn matching_request_ids(&self, f: &RequestFilter) -> Result<Vec<i64>> {
-        let (w, binds) = request_filter_sql(f, Audience::Admin);
+    /// Number of requests matching the filter, counted up to [`COUNT_CAP`].
+    pub async fn count_requests(&self, f: &RequestFilter) -> Result<Count> {
+        let (w, binds) = request_filter_sql(f, Audience::Admin, self.search_indexed());
         let sql = format!(
-            "SELECT r.id FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w} ORDER BY r.id DESC LIMIT {MATCH_LIMIT}"
+            "SELECT COUNT(*) FROM (SELECT 1 FROM requests r JOIN ips i ON r.ip_id = i.id
+             WHERE 1=1{w} LIMIT {})",
+            COUNT_CAP + 1
         );
         let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &binds {
             q = q.bind(b);
         }
-        Ok(q.fetch_all(&self.pool).await?)
+        Ok(Count::of(q.fetch_one(&self.read).await?))
+    }
+
+    /// Up to [`MATCH_LIMIT`] ids of requests matching the filter, newest
+    /// first, below `before` (keyset paging for bulk delete).
+    pub async fn matching_request_ids_before(
+        &self,
+        f: &RequestFilter,
+        before: i64,
+    ) -> Result<Vec<i64>> {
+        let (w, binds) = request_filter_sql(f, Audience::Admin, self.search_indexed());
+        let sql = format!(
+            "SELECT r.id FROM requests r JOIN ips i ON r.ip_id = i.id WHERE r.id < ?{w}
+             ORDER BY r.id DESC LIMIT {MATCH_LIMIT}"
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str())).bind(before);
+        for b in &binds {
+            q = q.bind(b);
+        }
+        Ok(q.fetch_all(&self.read).await?)
+    }
+
+    /// The newest [`MATCH_LIMIT`] ids of requests matching the filter.
+    pub async fn matching_request_ids(&self, f: &RequestFilter) -> Result<Vec<i64>> {
+        self.matching_request_ids_before(f, i64::MAX).await
     }
 
     pub async fn ip_by_addr(&self, addr: &str) -> Result<Option<IpRow>> {
@@ -525,26 +531,26 @@ impl Store {
         };
         Ok(sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE ip = ?")
             .bind(ip.to_string())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.read)
             .await?)
     }
 
+    /// The IP's public aggregates, from its read models. Only the sparkline
+    /// reads requests, and only the last 24 hours of them.
     pub async fn ip_overview(&self, ip_id: i64) -> Result<Option<IpOverview>> {
-        let Some(ip) = self.ip_by_id(ip_id).await? else {
+        let Some(ip) = sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE id = ?")
+            .bind(ip_id)
+            .fetch_optional(&self.read)
+            .await?
+        else {
             return Ok(None);
         };
-        let (request_count, max_severity): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(MAX(severity),0) FROM requests WHERE ip_id = ?",
-        )
-        .bind(ip_id)
-        .fetch_one(&self.pool)
-        .await?;
         let labels = sqlx::query_as::<_, Named>(
-            "SELECT je.value AS name, COUNT(*) AS count FROM requests r, json_each(r.labels_json) je
-             WHERE r.ip_id = ? GROUP BY je.value ORDER BY count DESC LIMIT 20",
+            "SELECT label AS name, count FROM ip_labels WHERE ip_id = ?
+             ORDER BY count DESC, label LIMIT 20",
         )
         .bind(ip_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read)
         .await?;
         // Hours ago (0 = current hour) → count.
         let rows: Vec<(i64, i64)> = sqlx::query_as(
@@ -552,7 +558,7 @@ impl Store {
              FROM requests WHERE ip_id = ? AND ts >= datetime('now','-24 hours') GROUP BY h",
         )
         .bind(ip_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read)
         .await?;
         let mut sparkline = vec![0i64; 24];
         for (h, c) in rows {
@@ -561,9 +567,9 @@ impl Store {
             }
         }
         Ok(Some(IpOverview {
+            request_count: ip.request_count,
+            max_severity: ip.max_severity,
             ip,
-            request_count,
-            max_severity,
             labels,
             sparkline,
         }))
@@ -583,7 +589,7 @@ impl Store {
         );
         let rows = sqlx::query_as::<_, RequestListRow>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(ip_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.read)
             .await?;
         Ok(Page::from_rows(rows, page))
     }
@@ -594,7 +600,7 @@ impl Store {
         a: Audience,
     ) -> Result<Page<RequestListRow>> {
         let page = page_num(f.page);
-        let (w, binds) = request_filter_sql(f, a);
+        let (w, binds) = request_filter_sql(f, a, self.search_indexed());
         let sql = format!(
             "{} WHERE 1=1{w} ORDER BY r.id DESC LIMIT {} OFFSET {}",
             request_row_select(a),
@@ -605,7 +611,7 @@ impl Store {
         for b in &binds {
             q = q.bind(b);
         }
-        Ok(Page::from_rows(q.fetch_all(&self.pool).await?, page))
+        Ok(Page::from_rows(q.fetch_all(&self.read).await?, page))
     }
 }
 
@@ -830,5 +836,190 @@ mod tests {
         assert_eq!(p2.items.len(), 3);
         assert!(!p2.has_next);
         assert_eq!(p2.prev(), Some(1));
+    }
+
+    /// Insert `n` requests for `ip_id` in one statement (triggers run).
+    async fn bulk_requests(s: &Store, ip_id: i64, n: i64, path: &str, sev: i64, labels: &str) {
+        sqlx::query(
+            "WITH RECURSIVE k(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM k WHERE x < ?)
+             INSERT INTO requests (uid, ts, ip_id, method, path, headers_json, labels_json, severity)
+             SELECT lower(hex(randomblob(16))), datetime('now'), ?, 'GET', ?, '[]', ?, ? FROM k",
+        )
+        .bind(n)
+        .bind(ip_id)
+        .bind(path)
+        .bind(labels)
+        .bind(sev)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cidr_searches_run_in_sql_and_are_complete() {
+        let s = seeded().await;
+        // 250 addresses in one /24: more than a page, all must be found.
+        for i in 0..250u32 {
+            s.upsert_ip(format!("198.51.100.{i}").parse().unwrap())
+                .await
+                .unwrap();
+        }
+        s.upsert_ip("198.51.101.1".parse().unwrap()).await.unwrap();
+        let f = IpFilter {
+            q: Some("198.51.100.0/24".into()),
+            ..Default::default()
+        };
+        assert_eq!(s.count_ips(&f).await.unwrap(), 250);
+        let p1 = s.list_ips(&f).await.unwrap();
+        assert_eq!(p1.items.len(), 100);
+        assert!(p1.has_next);
+        let p3 = s
+            .list_ips(&IpFilter {
+                page: Some(3),
+                ..f.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(p3.items.len(), 50);
+        assert!(!p3.has_next);
+        // Keyset rounds cover every match exactly once.
+        let mut seen = vec![];
+        let mut after = 0;
+        loop {
+            let ids = s.matching_ip_ids_after(&f, after).await.unwrap();
+            let Some(&last) = ids.last() else { break };
+            seen.extend(ids);
+            after = last;
+        }
+        assert_eq!(seen.len(), 250);
+        // A /16 spans the neighbouring /24 too; a /0 everything IPv4.
+        let q = |q: &str| IpFilter {
+            q: Some(q.into()),
+            ..Default::default()
+        };
+        assert_eq!(s.count_ips(&q("198.51.0.0/16")).await.unwrap(), 251);
+        assert_eq!(s.count_ips(&q("0.0.0.0/0")).await.unwrap(), 253);
+        // IPv6 networks whose first group is zero (stored as "::…").
+        s.upsert_ip("::5".parse().unwrap()).await.unwrap();
+        s.upsert_ip("0:1::1".parse().unwrap()).await.unwrap();
+        assert_eq!(s.count_ips(&q("::/16")).await.unwrap(), 2);
+        assert_eq!(s.count_ips(&q("::/127")).await.unwrap(), 0);
+        assert_eq!(s.count_ips(&q("::4/126")).await.unwrap(), 1);
+        assert_eq!(s.count_ips(&q("2001:db8::/32")).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn per_ip_read_models_follow_inserts_and_deletes() {
+        let s = seeded().await;
+        let ip = s.ip_by_addr("203.0.113.200").await.unwrap().unwrap();
+        assert_eq!((ip.request_count, ip.max_severity), (1, 2));
+        let worst = s
+            .insert_request(&NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/x".into(),
+                query: None,
+                headers_json: "[]".into(),
+                body: None,
+                labels_json: r#"["wp","rce","rce"]"#.into(),
+                severity: 4,
+                scan_level: 0,
+                is_fp_claim: false,
+                page_token: None,
+            })
+            .await
+            .unwrap();
+        let ov = s.ip_overview(ip.id).await.unwrap().unwrap();
+        assert_eq!((ov.request_count, ov.max_severity), (2, 4));
+        let labels: Vec<(String, i64)> = ov
+            .labels
+            .iter()
+            .map(|n| (n.name.clone(), n.count))
+            .collect();
+        assert_eq!(labels, [("wp".into(), 2), ("rce".into(), 1)]);
+        // Deleting the worst request brings the maximum back down.
+        assert!(s.delete_request(worst).await.unwrap());
+        let ov = s.ip_overview(ip.id).await.unwrap().unwrap();
+        assert_eq!((ov.request_count, ov.max_severity), (1, 2));
+        let labels: Vec<String> = ov.labels.iter().map(|n| n.name.clone()).collect();
+        assert_eq!(labels, ["wp"]);
+        let label = |l: &str| IpFilter {
+            label: Some(l.into()),
+            ..Default::default()
+        };
+        assert_eq!(s.count_ips(&label("rce")).await.unwrap(), 0);
+        assert_eq!(s.count_ips(&label("wp")).await.unwrap(), 1);
+        // Requests with junk label JSON are recorded, just without labels.
+        bulk_requests(&s, ip.id, 2, "/junk", 1, "not json").await;
+        let ip = s.ip_by_addr("203.0.113.200").await.unwrap().unwrap();
+        assert_eq!(ip.request_count, 3);
+    }
+
+    #[tokio::test]
+    async fn path_search_uses_the_index_and_keeps_like_semantics() {
+        let s = seeded().await;
+        assert!(s.search_indexed());
+        let ip = s.ip_by_addr("203.0.113.1").await.unwrap().unwrap();
+        bulk_requests(&s, ip.id, 3, "/a_b%c/WP-Admin", 0, "[]").await;
+        let find = |path: &str| RequestFilter {
+            path: Some(path.into()),
+            ..Default::default()
+        };
+        let n = |f: RequestFilter| {
+            let s = s.clone();
+            async move {
+                s.search_requests(&f, Audience::Admin)
+                    .await
+                    .unwrap()
+                    .items
+                    .len()
+            }
+        };
+        assert_eq!(n(find("wp-admin")).await, 3, "case-insensitive substring");
+        assert_eq!(n(find("_b%")).await, 3, "LIKE wildcards are literal");
+        assert_eq!(n(find("a=1")).await, 5, "admin search covers queries");
+        assert_eq!(
+            s.search_requests(&find("a=1"), Audience::Public)
+                .await
+                .unwrap()
+                .items
+                .len(),
+            0,
+            "public search never matches queries"
+        );
+        assert_eq!(n(find("wp")).await, 4, "short terms scan");
+        assert_eq!(n(find("\"quoted\"")).await, 0);
+        assert_eq!(s.count_requests(&find("wp-admin")).await.unwrap().n, 3);
+    }
+
+    #[tokio::test]
+    async fn request_counts_are_capped() {
+        let s = seeded().await;
+        let ip = s.ip_by_addr("203.0.113.1").await.unwrap().unwrap();
+        bulk_requests(&s, ip.id, COUNT_CAP + 5, "/many", 0, "[]").await;
+        let c = s.count_requests(&RequestFilter::default()).await.unwrap();
+        assert_eq!(
+            c,
+            Count {
+                n: COUNT_CAP,
+                capped: true
+            }
+        );
+        assert_eq!(c.to_string(), format!("{COUNT_CAP}+"));
+        let few = s
+            .count_requests(&RequestFilter {
+                path: Some("/.env".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            few,
+            Count {
+                n: 3,
+                capped: false
+            }
+        );
+        assert_eq!(few.to_string(), "3");
     }
 }

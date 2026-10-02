@@ -31,11 +31,11 @@
       <div class="chart" id="chart-severity" data-chart="severity"></div>
       <table class="visually-hidden"><tbody>{% for n in stats.severity_distribution %}<tr><td>{{ n.name }}</td><td>{{ n.count }}</td></tr>{% endfor %}</tbody></table>
     </section>
-    <section class="card">
+    {% if labels %}<section class="card">
       <h2>Top labels</h2>
       <div class="chart" id="chart-labels" data-chart="labels"></div>
       <ol class="visually-hidden">{% for n in stats.top_labels %}<li>{{ n.name }} {{ n.count }}</li>{% endfor %}</ol>
-    </section>
+    </section>{% endif %}
     <section class="card">
       <h2>Top countries</h2>
       <div class="chart" id="chart-countries" data-chart="countries"></div>

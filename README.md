@@ -130,7 +130,11 @@ internet ──► nginx (TLS) ──► peephole admin listener  127.0.0.1:8443
   Individual request rows are never public: no request paths, query strings,
   payloads, headers, fingerprints or scan results. The public side names the
   IPs it shames but not what each one requested; `/api/stats` carries only
-  aggregates.
+  aggregates. The coarse rule categories an IP's requests matched (labels
+  such as `sensitive-path` or `sqli`) are public unless
+  `[public] show_labels = false` hides them (per-IP chips, the label filter
+  and the label chart). Anonymous visitors are rate limited per address and
+  see cached pages.
 - **Admin area** (FIDO2 only, no passwords, under `/admin`) — everything the
   public side withholds: the full request search and per-IP request history,
   the live scan queue over Server-Sent Events, counter-scan results with
@@ -269,10 +273,25 @@ journalctl -u peephole -f                     # logs (incl. FIDO2 enrollment ins
 peephole --version                            # installed build and its commit
 peephole --help                               # commands and arguments
 peephole check-config /etc/peephole/config.toml   # validate config, rules and nmap
+peephole admin setup-token                    # new setup token (only while no key is enrolled)
+peephole db vacuum                            # shrink the database file (stop the service first)
 ```
 
 Additional FIDO2 keys can be enrolled from **Admin → Keys** while logged in;
-the one-time setup token is only needed for the very first key.
+the one-time setup token is only needed for the very first key. It is valid
+for 24 hours; a restart without an enrolled key prints a new one once it has
+expired, and `peephole admin setup-token` prints one on demand. Admin
+sessions last at most 12 hours and end after an hour without use, on logout,
+on the next sign-in, or when the key they signed in with is deleted.
+
+The database maintains itself: expired sessions are removed, query
+statistics refreshed and freed pages handed back to the file system daily.
+Databases created before this release do not hand pages back until they are
+converted once with `systemctl stop peephole && peephole db vacuum &&
+systemctl start peephole` (needs free disk space of about the database's
+size). Behind nginx, set `proxy_set_header X-Forwarded-For $remote_addr;`
+in the admin site's locations: the per-client rate limits key on it and are
+off without it.
 
 ## Building from source
 

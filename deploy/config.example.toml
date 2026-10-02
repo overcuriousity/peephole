@@ -101,6 +101,11 @@ tor_wait_hours = 6
 # 2 = ["-Pn", "-sS", "-sV", "-T3", "--top-ports", "2000"]
 # 3 = ["-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000", "--script", "(discovery or safe) and not (intrusive or broadcast or external or dos)"]
 
+# What anonymous visitors of the wall of shame see.
+# [public]
+# show_labels = true   # rule labels (coarse categories of what an IP requested):
+#                      # per-IP chips, the label filter and the label chart
+
 # Distributed mode: share requests, scan queue, results and intel with other
 # nodes (README: Distributed mode). Absent: standalone. The node key is
 # created on first start; print it with `peephole cluster id`. Add nodes with

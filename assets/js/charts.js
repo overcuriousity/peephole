@@ -130,7 +130,8 @@
       fetch("/api/stats?range=" + range).then(function (r) { return r.json(); }).then(function (st) {
         timeline(document.getElementById("chart-timeline"), fillBuckets(st.timeline, range));
         hbars(document.getElementById("chart-severity"), st.severity_distribution, { label: function (i) { return "severity " + i.name; }, cls: function (i) { return "sev-bar-" + i.name; } });
-        hbars(document.getElementById("chart-labels"), st.top_labels.slice(0, 10));
+        var labelsHost = document.getElementById("chart-labels");
+        if (labelsHost) hbars(labelsHost, (st.top_labels || []).slice(0, 10));
         fetch("/api/countries").then(function (r) { return r.json(); }).then(function (names) {
           window.peephole.countryNames = names;
           hbars(document.getElementById("chart-countries"), st.top_countries.slice(0, 10), { label: function (i) { return countryName(i.name); } });

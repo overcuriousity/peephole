@@ -7,6 +7,8 @@ usage: peephole [CONFIG]                 run the daemon (default /etc/peephole/c
        peephole check-config [CONFIG]    validate config, rules and nmap
        peephole cluster (id|invite|invites|invite-revoke|join|members|status|config-key|block|unblock|leave) …
        peephole settings (show|set|reset) …
+       peephole admin setup-token [CONFIG]
+       peephole db vacuum [CONFIG]
        peephole --version | -V
        peephole --help | -h | help
 
@@ -20,6 +22,8 @@ enum Cmd {
     CheckConfig(PathBuf),
     Cluster,
     Settings,
+    Admin,
+    Db,
     Run(PathBuf),
 }
 
@@ -56,6 +60,8 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         // These parse their own arguments.
         Some("cluster") => Ok(Cmd::Cluster),
         Some("settings") => Ok(Cmd::Settings),
+        Some("admin") => Ok(Cmd::Admin),
+        Some("db") => Ok(Cmd::Db),
         _ => config_at(0).map(Cmd::Run),
     }
 }
@@ -95,6 +101,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Settings => {
             if let Err(e) = peephole::settings_cli::run(&args[1..], DEFAULT_CONFIG).await {
+                fail(e);
+            }
+        }
+        Cmd::Admin => {
+            if let Err(e) = peephole::admin::cli::run(&args[1..], DEFAULT_CONFIG).await {
+                fail(e);
+            }
+        }
+        Cmd::Db => {
+            if let Err(e) = peephole::store::cli::run(&args[1..], DEFAULT_CONFIG).await {
                 fail(e);
             }
         }

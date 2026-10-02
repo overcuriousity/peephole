@@ -236,6 +236,51 @@ advertise = "scanner-1.example:7443"
 }
 
 #[test]
+fn setup_token_and_vacuum_from_the_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("c.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"
+admin_listen = "127.0.0.1:1"
+database_path = "{d}/t.db"
+data_dir = "{d}"
+[roles]
+listener = false
+scanner = false
+[webauthn]
+rp_id = "localhost"
+origin = "https://localhost"
+rp_name = "t"
+"#,
+            d = dir.path().display()
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        bin()
+            .args(args)
+            .arg(cfg.to_str().unwrap())
+            .output()
+            .unwrap()
+    };
+    let out = run(&["admin", "setup-token"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("/enroll") && stdout.contains("24 hours"),
+        "{stdout}"
+    );
+    let out = run(&["db", "vacuum"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("done:"), "{stdout}");
+    let out = run(&["admin", "nonsense"]);
+    assert!(!out.status.success());
+}
+
+#[test]
 fn settings_are_shown_set_and_reset_from_the_shell() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("c.toml");

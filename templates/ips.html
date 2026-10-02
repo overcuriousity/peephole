@@ -6,7 +6,7 @@
   <label>Address / prefix / CIDR <input name="q" value="{{ f.q.as_deref().unwrap_or_default() }}" placeholder="203.0.113.0/24"></label>
   <label>Country <input name="country" size="3" maxlength="2" value="{{ f.country.as_deref().unwrap_or_default() }}" placeholder="DE"></label>
   <label>ASN <input name="asn" size="7" value="{% if let Some(a) = f.asn %}{{ a }}{% endif %}"></label>
-  <label>Label <input name="label" value="{{ f.label.as_deref().unwrap_or_default() }}"></label>
+  {% if labels %}<label>Label <input name="label" value="{{ f.label.as_deref().unwrap_or_default() }}"></label>{% endif %}
   <label>Min severity <select name="min_severity">
     <option value="">any</option>
     {% for s in 1..5 %}<option value="{{ s }}"{% if f.min_severity == Some(s.clone()) %} selected{% endif %}>{{ s }}+</option>{% endfor %}
