@@ -203,7 +203,13 @@ pub fn serve(node: &Arc<Node>, settings: Settings) {
                 Msg::ConfigGet => {
                     let s = settings.snapshot();
                     let recommended = match (s.roles.scanner, node.store.queue_metrics().await) {
-                        (true, Ok(m)) => Some(pace_info(crate::scan::pace::recommend(&m, s.pace).pace)),
+                        (true, Ok(m)) => {
+                            let others = crate::scan::pace::others(
+                                &node,
+                                m.avg_scan_secs.unwrap_or(crate::scan::pace::DEFAULT_SCAN_SECS),
+                            );
+                            Some(pace_info(crate::scan::pace::recommend(&m, s.pace, others).pace))
+                        }
                         _ => None,
                     };
                     Some(Msg::ConfigState(State {

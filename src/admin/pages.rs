@@ -192,6 +192,8 @@ struct PaceView {
     m: QueueMetrics,
     arrival: String,
     capacity: String,
+    /// In a cluster with other live scanners: how the capacity splits.
+    cluster_note: Option<String>,
     net: String,
     drain: String,
     cadence: String,
@@ -260,7 +262,13 @@ async fn pace_view(
 ) -> AppResult<PaceView> {
     let m = st.store.queue_metrics().await?;
     let current = st.pace.get();
-    let r = recommend(&m, current);
+    let scan_secs = m.avg_scan_secs.unwrap_or(pace::DEFAULT_SCAN_SECS);
+    let others = st
+        .recorder
+        .node()
+        .map(|n| pace::others(&n, scan_secs))
+        .unwrap_or_default();
+    let r = recommend(&m, current, others);
     Ok(PaceView {
         current,
         rec: r.pace,
@@ -269,6 +277,15 @@ async fn pace_view(
         growing: r.growing(),
         arrival: fmt_rate(r.arrival_per_hour),
         capacity: fmt_rate(r.capacity_per_hour),
+        cluster_note: (others.scanners > 0).then(|| {
+            format!(
+                "{} here + {} from {} other scanner{}",
+                fmt_rate(r.own_capacity_per_hour),
+                fmt_rate(others.capacity_per_hour),
+                others.scanners,
+                if others.scanners == 1 { "" } else { "s" }
+            )
+        }),
         net: format!(
             "{}{}",
             if r.net_growth_per_hour > 0.0 { "+" } else { "" },
