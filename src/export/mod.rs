@@ -296,6 +296,9 @@ impl ExportRow {
     }
 }
 
+/// Columns holding base64 (exempt from the CSV formula guard).
+const BLOB_COLUMNS: &[&str] = &["body", "raw_head", "tls_client_hello"];
+
 /// First line of the CSV export.
 pub fn csv_header() -> String {
     format!("{}\n", COLUMNS.join(","))
@@ -320,6 +323,8 @@ pub fn csv_rows(rows: &[ExportRow]) -> String {
                     .or(m.get(*c))
                 {
                     None | Some(Value::Null) => String::new(),
+                    // Base64 is data, not text a spreadsheet would show.
+                    Some(Value::String(s)) if BLOB_COLUMNS.contains(c) => s.clone(),
                     Some(Value::String(s)) => csv_safe(s).into_owned(),
                     Some(v @ (Value::Array(_) | Value::Object(_))) => {
                         csv_safe(&v.to_string()).into_owned()
@@ -818,6 +823,24 @@ mod tests {
         let csv = csv_rows(&[r]);
         assert!(csv.contains("\"'=HYPERLINK"), "{csv}");
         assert!(csv.contains("\"'-2+3\""), "{csv}");
+    }
+
+    /// Blobs are base64, which may start with `+`: the formula guard must
+    /// not touch them, or they no longer decode.
+    #[test]
+    fn csv_keeps_base64_intact() {
+        let mut r = row();
+        r.body = Some(vec![0xf8, 0x01]);
+        let csv = csv_rows(&[r]);
+        let rec = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(csv.as_bytes())
+            .records()
+            .next()
+            .unwrap()
+            .unwrap();
+        let body = &rec[COLUMNS.iter().position(|c| *c == "body").unwrap()];
+        assert_eq!(BASE64.decode(body.as_bytes()).unwrap(), [0xf8, 0x01]);
     }
 
     #[test]
