@@ -135,7 +135,7 @@ impl Recorder {
     /// `n.ip_id` is not used. Returns the request's and the IP's row ids.
     pub async fn insert_request_from(&self, ip: &str, n: &NewRequest) -> Result<(i64, i64)> {
         let uid = self.uid();
-        self.write(vec![Record::Request(RequestRec {
+        self.write(vec![Record::Request(Box::new(RequestRec {
             build: crate::COMMIT.into(),
             uid: uid.clone(),
             ts: now_ts(),
@@ -161,7 +161,7 @@ impl Recorder {
             raw_head: n.raw_head.clone(),
             tls_client_hello: n.tls_client_hello.clone(),
             ja4: n.ja4.clone(),
-        })])
+        }))])
         .await?;
         sqlx::query_as("SELECT id, ip_id FROM requests WHERE uid = ?")
             .bind(&uid)

@@ -1195,7 +1195,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                     .bind(uid)
                     .fetch_one(&mut *conn)
                     .await?;
-                    Some(Record::Request(RequestRec {
+                    Some(Record::Request(Box::new(RequestRec {
                         uid: r.0,
                         ts: r.1,
                         ip: r.2,
@@ -1219,7 +1219,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         tls_client_hello: x.7,
                         ja4: x.8,
                         owasp_json: Some(x.9).filter(|j| j != "[]"),
-                    }))
+                    })))
                 }
             }
         }
@@ -1340,7 +1340,7 @@ mod tests {
     use crate::cluster::record::{RequestRec, ScanJobRec, TombstoneRec};
 
     fn request(uid: &str, path: &str) -> Record {
-        Record::Request(RequestRec {
+        Record::Request(Box::new(RequestRec {
             uid: uid.into(),
             ts: now_ts(),
             ip: "203.0.113.7".into(),
@@ -1355,7 +1355,7 @@ mod tests {
             is_fp_claim: false,
             page_token: None,
             ..Default::default()
-        })
+        }))
     }
 
     /// A log row as the replication layer would hold it for an applied,

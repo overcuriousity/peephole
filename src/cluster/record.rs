@@ -258,7 +258,7 @@ pub enum Record {
     MemberRevoke {
         id: NodeId,
     },
-    Request(RequestRec),
+    Request(Box<RequestRec>),
     IpIntel(IpIntelRec),
     FpClaim(FpClaimRec),
     Fingerprint(FingerprintRec),
@@ -415,7 +415,7 @@ mod tests {
     fn an_unset_build_is_left_out_of_the_encoding() {
         let enc = |r: &Record| crate::cluster::rpc::cbor::encode(r).unwrap();
         let has_build = |b: Vec<u8>| b.windows(5).any(|w| w == b"build");
-        assert!(!has_build(enc(&Record::Request(RequestRec::default()))));
+        assert!(!has_build(enc(&Record::Request(Box::default()))));
         let skip = SkipBatchRec {
             uid: "u".into(),
             ip: "203.0.113.1".into(),
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn a_request_record_without_owasp_rebuilds_byte_for_byte() {
-        let rec = Record::Request(RequestRec {
+        let rec = Record::Request(Box::new(RequestRec {
             uid: "u".into(),
             ts: "2026-10-02 00:00:00".into(),
             ip: "198.51.100.1".into(),
@@ -448,7 +448,7 @@ mod tests {
             is_fp_claim: false,
             page_token: None,
             ..Default::default()
-        });
+        }));
         let bytes = super::super::rpc::cbor::encode(&rec).unwrap();
         assert!(
             !bytes.windows(10).any(|w| w == b"owasp_json"),
