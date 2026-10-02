@@ -17,6 +17,11 @@ use tracing::{info, warn};
 pub const PRUNE_AFTER_MS: u64 = 30 * 24 * 3600 * 1000;
 /// A running node writes at least one entry this often, so it stays visible.
 pub const KEEPALIVE_MS: u64 = 24 * 3600 * 1000;
+/// New admissions one member may make per day (by the admissions' HLCs,
+/// so every node reaches the same verdict). Keys are free: without a limit
+/// one member could flood the cluster with members.
+pub const ADMISSIONS_PER_DAY: i64 = 20;
+const DAY_MS: u64 = 24 * 3600 * 1000;
 
 /// A member's standing as this node computes it from its copy of the log.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -43,11 +48,14 @@ impl Standing {
 
 /// Signs of life are the newest entry the member signed and its latest
 /// admission. Entries are signed by their origin, so nobody can make another
-/// node look stale, and evidence relayed by any member counts.
+/// node look stale, and evidence relayed by any member counts. An entry
+/// counts at its HLC but no later than this node received it (plus the
+/// allowed clock drift): a clock running ahead buys no extra life.
 pub fn standing(
     admitted_hlc: u64,
     left_hlc: Option<u64>,
     last_entry_hlc: u64,
+    last_entry_received_ms: u64,
     now_ms: u64,
 ) -> Standing {
     if admitted_hlc == 0 {
@@ -56,7 +64,8 @@ pub fn standing(
     if left_hlc.is_some_and(|l| l >= admitted_hlc) {
         return Standing::Left;
     }
-    let evidence = super::hlc::physical_ms(admitted_hlc.max(last_entry_hlc));
+    let entry = super::hlc::effective(last_entry_hlc, last_entry_received_ms);
+    let evidence = super::hlc::physical_ms(admitted_hlc.max(entry));
     if now_ms.saturating_sub(evidence) > PRUNE_AFTER_MS {
         Standing::Pruned
     } else {
@@ -105,18 +114,30 @@ type Row = (
     Option<i64>,
     i64,
     Option<i64>,
+    Option<i64>,
 );
 
 const SELECT: &str = "SELECT id, name, address, roles_json, proto_min, proto_max,
                              sponsor, info_hlc, admitted_hlc, revoked_hlc, remote_config,
                              (SELECT l.hlc FROM repl_log l
                               WHERE l.origin = members.id AND l.sig IS NOT NULL
+                              ORDER BY l.seq DESC LIMIT 1),
+                             (SELECT CAST(strftime('%s', l.received_at) AS INTEGER) * 1000
+                              FROM repl_log l
+                              WHERE l.origin = members.id AND l.sig IS NOT NULL
                               ORDER BY l.seq DESC LIMIT 1)
                       FROM members";
 
 fn from_row(r: Row, now_ms: u64) -> Result<MemberRow> {
-    let last_entry_hlc = r.11.unwrap_or(0) as u64;
-    let standing = standing(r.8 as u64, r.9.map(|v| v as u64), last_entry_hlc, now_ms);
+    let last_entry_hlc = super::hlc::from_db(r.11.unwrap_or(0));
+    let received = super::hlc::from_db(r.12.unwrap_or(0));
+    let standing = standing(
+        super::hlc::from_db(r.8),
+        r.9.map(super::hlc::from_db),
+        last_entry_hlc,
+        received,
+        now_ms,
+    );
     Ok(MemberRow {
         id: NodeId::from_slice(&r.0)?,
         name: r.1,
@@ -199,12 +220,190 @@ async fn insert(
     Ok(())
 }
 
-/// Effects of a membership record; returns true if it was one.
+/// A member description as stored: a name of 1-64 printable characters
+/// (otherwise one derived from the key), a dialable `host:port` or none,
+/// and only role names this version knows. Every node cleans a description
+/// the same way, so a member cannot make others dial or show junk.
+pub fn sanitize(info: &MemberInfo) -> MemberInfo {
+    let name = info.name.trim();
+    let name = if valid_name(name) {
+        name.to_string()
+    } else {
+        format!("node-{}", info.id.short())
+    };
+    let mut roles: Vec<String> = vec![];
+    for r in &info.roles {
+        if ["listener", "scanner", "web"].contains(&r.as_str()) && !roles.contains(r) {
+            roles.push(r.clone());
+        }
+    }
+    MemberInfo {
+        id: info.id,
+        name,
+        address: info.address.clone().filter(|a| valid_address(a)),
+        roles,
+        proto_min: info.proto_min,
+        proto_max: info.proto_max,
+        remote_config: info.remote_config,
+    }
+}
+
+/// 1-64 characters, none of them control characters.
+pub fn valid_name(name: &str) -> bool {
+    let n = name.chars().count();
+    (1..=64).contains(&n) && !name.chars().any(char::is_control)
+}
+
+/// `host:port` with a DNS name or IP address and a non-zero port.
+pub fn valid_address(addr: &str) -> bool {
+    if addr.len() > 255 {
+        return false;
+    }
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return false;
+    };
+    if !port.parse::<u16>().is_ok_and(|p| p > 0) {
+        return false;
+    }
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.starts_with(['-', '.'])
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+/// Whether the origin of `e` may admit `member` at `at`: it has not left,
+/// was not pruned before writing this (no sign of life for the prune window
+/// before it), and stays within [`ADMISSIONS_PER_DAY`]. Each sponsor's
+/// admissions arrive in its own log order, so the verdict is the same on
+/// every node.
+async fn may_sponsor(
+    node: &Node,
+    conn: &mut SqliteConnection,
+    e: &WireEntry,
+    member: &NodeId,
+    at: u64,
+) -> Result<bool> {
+    let sponsor = e.origin;
+    if sponsor != node.id() {
+        let row: Option<(i64, Option<i64>)> =
+            sqlx::query_as("SELECT admitted_hlc, revoked_hlc FROM members WHERE id = ?")
+                .bind(&sponsor.0[..])
+                .fetch_optional(&mut *conn)
+                .await?;
+        let Some((admitted, revoked)) = row else {
+            return Ok(false);
+        };
+        let admitted = super::hlc::from_db(admitted);
+        if revoked.is_some_and(|l| super::hlc::from_db(l) >= admitted) {
+            warn!(sponsor = %sponsor.short(), member = %member.short(),
+                  "ignored member_add by a node that left");
+            return Ok(false);
+        }
+        // Its previous sign of life: the entry before this one, or its
+        // admission.
+        let prev: Option<(i64, Option<i64>)> = sqlx::query_as(
+            "SELECT hlc, CAST(strftime('%s', received_at) AS INTEGER) * 1000 FROM repl_log
+             WHERE origin = ? AND seq < ? AND sig IS NOT NULL ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&sponsor.0[..])
+        .bind(e.seq.min(i64::MAX as u64) as i64)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let prev = prev.map_or(0, |(h, r)| {
+            super::hlc::effective(super::hlc::from_db(h), super::hlc::from_db(r.unwrap_or(0)))
+        });
+        let evidence = super::hlc::physical_ms(admitted.max(prev));
+        if super::hlc::physical_ms(at).saturating_sub(evidence) > PRUNE_AFTER_MS {
+            warn!(sponsor = %sponsor.short(), member = %member.short(),
+                  "ignored member_add by a node that was pruned");
+            return Ok(false);
+        }
+    }
+    let known: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sponsorships WHERE sponsor = ? AND member = ?")
+            .bind(&sponsor.0[..])
+            .bind(&member.0[..])
+            .fetch_one(&mut *conn)
+            .await?;
+    if known > 0 {
+        return Ok(true);
+    }
+    let since = at.saturating_sub(DAY_MS << 16);
+    let recent: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sponsorships WHERE sponsor = ? AND hlc > ? AND hlc <= ?",
+    )
+    .bind(&sponsor.0[..])
+    .bind(super::hlc::to_db(since))
+    .bind(super::hlc::to_db(at))
+    .fetch_one(&mut *conn)
+    .await?;
+    if recent >= ADMISSIONS_PER_DAY {
+        warn!(sponsor = %sponsor.short(), member = %member.short(),
+              "ignored member_add over the sponsor's daily admission limit");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Whether this node may admit `member` now (checked before an invite is
+/// used up: peers would ignore an admission over the daily limit).
+pub async fn can_admit(node: &Node, member: &NodeId) -> Result<bool> {
+    let mut conn = node.store.pool.acquire().await?;
+    let probe = WireEntry {
+        origin: node.id(),
+        seq: u64::MAX,
+        hlc: node.hlc.now(),
+        kind: String::new(),
+        uid: None,
+        payload: None,
+        sig: None,
+        erased_by: None,
+    };
+    may_sponsor(node, &mut conn, &probe, member, not_future(probe.hlc)).await
+}
+
+/// The nodes `root` admitted, the nodes those admitted, and so on (not
+/// `root` itself nor `except`), for blocking a sponsor's whole subtree.
+pub async fn subtree(
+    store: &crate::store::Store,
+    root: NodeId,
+    except: NodeId,
+) -> Result<Vec<NodeId>> {
+    let mut seen = std::collections::HashSet::from([root, except]);
+    let mut queue = std::collections::VecDeque::from([root]);
+    let mut out = vec![];
+    while let Some(s) = queue.pop_front() {
+        let admitted: Vec<Vec<u8>> =
+            sqlx::query_scalar("SELECT member FROM sponsorships WHERE sponsor = ? ORDER BY hlc")
+                .bind(&s.0[..])
+                .fetch_all(&store.pool)
+                .await?;
+        for m in admitted {
+            let Ok(id) = NodeId::from_slice(&m) else {
+                continue;
+            };
+            if seen.insert(id) {
+                out.push(id);
+                queue.push_back(id);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Effects of a membership record; returns true if it was one. `at` is the
+/// record's HLC as this node orders it (never later than its receipt).
 pub async fn apply(
     node: &Node,
     conn: &mut SqliteConnection,
     e: &WireEntry,
     r: &Record,
+    at: u64,
 ) -> Result<bool> {
     match r {
         Record::MemberAdd(info) => {
@@ -212,7 +411,19 @@ pub async fn apply(
                 warn!(origin = %e.origin.short(), "ignored self-sponsored member_add");
                 return Ok(true);
             }
-            let at = not_future(e.hlc);
+            let info = &sanitize(info);
+            let at = not_future(at);
+            if !may_sponsor(node, conn, e, &info.id, at).await? {
+                return Ok(true);
+            }
+            sqlx::query(
+                "INSERT OR IGNORE INTO sponsorships (sponsor, member, hlc) VALUES (?, ?, ?)",
+            )
+            .bind(&e.origin.0[..])
+            .bind(&info.id.0[..])
+            .bind(super::hlc::to_db(at))
+            .execute(&mut *conn)
+            .await?;
             match get(conn, &info.id).await? {
                 None => {
                     insert(conn, info, &e.origin, 0, at).await?;
@@ -222,7 +433,7 @@ pub async fn apply(
                     sqlx::query(
                         "UPDATE members SET admitted_hlc = MAX(admitted_hlc, ?) WHERE id = ?",
                     )
-                    .bind(at as i64)
+                    .bind(super::hlc::to_db(at))
                     .bind(&info.id.0[..])
                     .execute(&mut *conn)
                     .await?;
@@ -237,14 +448,15 @@ pub async fn apply(
                 warn!(origin = %e.origin.short(), "ignored member_update for another node");
                 return Ok(true);
             }
+            let info = &sanitize(info);
             match get(conn, &info.id).await? {
                 // Only this node's own first description lands here: any
                 // other origin had to be admitted before its entries apply.
                 None => {
-                    let admitted = if info.id == node.id() { e.hlc } else { 0 };
-                    insert(conn, info, &e.origin, e.hlc, admitted).await?;
+                    let admitted = if info.id == node.id() { at } else { 0 };
+                    insert(conn, info, &e.origin, at, admitted).await?;
                 }
-                Some(m) if e.hlc > m.info_hlc => write_info(conn, info, e.hlc).await?,
+                Some(m) if at > m.info_hlc => write_info(conn, info, at).await?,
                 Some(_) => {}
             }
         }
@@ -261,7 +473,7 @@ pub async fn apply(
                 "UPDATE members SET revoked_hlc = MAX(COALESCE(revoked_hlc, 0), ?), revoked_by = ?
                  WHERE id = ?",
             )
-            .bind(e.hlc as i64)
+            .bind(super::hlc::to_db(not_future(at)))
             .bind(&e.origin.0[..])
             .bind(&id.0[..])
             .execute(&mut *conn)
@@ -286,31 +498,87 @@ mod tests {
     #[test]
     fn standing_follows_admission_leave_and_evidence() {
         let now = 1_000 * DAY;
-        assert_eq!(standing(0, None, hlc(now), now), Standing::NotAdmitted);
-        assert_eq!(standing(hlc(now), None, 0, now), Standing::Active);
+        assert_eq!(standing(0, None, hlc(now), now, now), Standing::NotAdmitted);
+        assert_eq!(standing(hlc(now), None, 0, 0, now), Standing::Active);
         // Left: the leave is newer than the admission; a later add re-admits.
         assert_eq!(
-            standing(hlc(now - DAY), Some(hlc(now)), hlc(now), now),
+            standing(hlc(now - DAY), Some(hlc(now)), hlc(now), now, now),
             Standing::Left
         );
         assert_eq!(
-            standing(hlc(now), Some(hlc(now - DAY)), 0, now),
+            standing(hlc(now), Some(hlc(now - DAY)), 0, 0, now),
             Standing::Active
         );
         // 31 days without an entry: pruned. Either kind of evidence revives.
         let old = hlc(now - 31 * DAY);
-        assert_eq!(standing(old, None, old, now), Standing::Pruned);
-        assert_eq!(standing(old, None, hlc(now - DAY), now), Standing::Active);
-        assert_eq!(standing(hlc(now - DAY), None, old, now), Standing::Active);
+        assert_eq!(standing(old, None, old, now, now), Standing::Pruned);
+        assert_eq!(
+            standing(old, None, hlc(now - DAY), now, now),
+            Standing::Active
+        );
+        assert_eq!(
+            standing(hlc(now - DAY), None, old, now, now),
+            Standing::Active
+        );
         // Exactly at the limit is still active.
         let edge = hlc(now - 30 * DAY);
-        assert_eq!(standing(edge, None, edge, now), Standing::Active);
+        assert_eq!(standing(edge, None, edge, now, now), Standing::Active);
+    }
+
+    /// A clock running ahead buys no extra life: an entry counts no later
+    /// than its receipt (plus the allowed drift). Before, a member whose
+    /// entries were dated 400 days ahead never looked stale.
+    #[test]
+    fn a_clock_running_ahead_counts_from_receipt() {
+        let now = 1_000 * DAY;
+        let future = hlc(now + 400 * DAY);
+        // Received just now: alive.
+        assert_eq!(
+            standing(hlc(now - 40 * DAY), None, future, now, now),
+            Standing::Active
+        );
+        // Received 31 days ago and silent since: pruned, whatever it claimed.
+        assert_eq!(
+            standing(hlc(now - 40 * DAY), None, future, now - 31 * DAY, now),
+            Standing::Pruned
+        );
     }
 
     #[test]
-    fn a_clock_running_ahead_never_looks_stale() {
-        let now = 1_000 * DAY;
-        let future = hlc(now + 400 * DAY);
-        assert_eq!(standing(future, None, future, now), Standing::Active);
+    fn member_descriptions_are_cleaned() {
+        let id = crate::cluster::identity::Identity::generate().unwrap().id;
+        let info = |name: &str, addr: Option<&str>, roles: &[&str]| MemberInfo {
+            id,
+            name: name.into(),
+            address: addr.map(str::to_string),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            proto_min: 2,
+            proto_max: 2,
+            remote_config: false,
+        };
+        let ok = sanitize(&info(
+            " a ",
+            Some("node.example:7443"),
+            &["scanner", "scanner"],
+        ));
+        assert_eq!(ok.name, "a");
+        assert_eq!(ok.address.as_deref(), Some("node.example:7443"));
+        assert_eq!(ok.roles, vec!["scanner".to_string()]);
+        assert_eq!(
+            sanitize(&info("x", Some("[2001:db8::1]:7443"), &[]))
+                .address
+                .as_deref(),
+            Some("[2001:db8::1]:7443")
+        );
+        let long = "x".repeat(65);
+        let bad = sanitize(&info(&long, Some("evil host:99999"), &["root", "web"]));
+        assert_eq!(bad.name, format!("node-{}", id.short()));
+        assert_eq!(bad.address, None);
+        assert_eq!(bad.roles, vec!["web".to_string()]);
+        for a in ["nohost", ":7443", "h:0", "h:x", "a/b:1", "-h:1", "[::zz]:1"] {
+            assert!(!valid_address(a), "{a}");
+        }
+        assert!(!valid_name("bell\u{7}"));
+        assert!(!valid_name(""));
     }
 }

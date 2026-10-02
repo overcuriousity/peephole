@@ -11,6 +11,7 @@ pub mod members;
 pub mod msg;
 pub mod record;
 pub mod repl;
+pub mod retention;
 pub mod rpc;
 pub mod status;
 pub mod sync;
@@ -188,6 +189,8 @@ pub struct Node {
     /// Bumped whenever the log grows; wakes sync loops and long-polls.
     changed: tokio::sync::watch::Sender<u64>,
     join_attempts: Mutex<std::collections::VecDeque<std::time::Instant>>,
+    /// Sync exchanges running at once (see `sync::MAX_CONCURRENT_SYNCS`).
+    pub sync_slots: tokio::sync::Semaphore,
     /// Wakes the sync supervisor when the set of dialable members changes.
     pub members_changed: tokio::sync::Notify,
     /// Enrichment providers this node can query right now (heartbeats).
@@ -229,6 +232,7 @@ impl Node {
             apply_lock: tokio::sync::Mutex::new(()),
             changed: tokio::sync::watch::channel(0).0,
             join_attempts: Mutex::new(Default::default()),
+            sync_slots: tokio::sync::Semaphore::new(sync::MAX_CONCURRENT_SYNCS),
             members_changed: tokio::sync::Notify::new(),
             providers: RwLock::new(vec![]),
             data_dir: p.data_dir,
@@ -242,7 +246,7 @@ impl Node {
         let max_hlc: Option<i64> = sqlx::query_scalar("SELECT MAX(hlc) FROM repl_log")
             .fetch_one(&node.store.pool)
             .await?;
-        node.hlc.observe(max_hlc.unwrap_or(0) as u64);
+        node.hlc.observe(hlc::from_db(max_hlc.unwrap_or(0)));
         node.reload_members().await?;
         // Offline for longer than the prune window: the cluster dropped us,
         // and our log is too old to judge anyone else by.
@@ -389,7 +393,7 @@ impl Node {
         .bind(&self.id().0[..])
         .fetch_optional(&self.store.pool)
         .await?;
-        Ok(h.map(|h| h as u64))
+        Ok(h.map(hlc::from_db))
     }
 
     /// Write a sign of life when this node has been quiet for a day, so the
@@ -686,8 +690,41 @@ pub async fn start(
         shutdown.clone(),
     ));
     tokio::spawn(heartbeat_loop(node.clone(), shutdown.clone()));
+    tokio::spawn(maintenance_loop(node.clone(), shutdown.clone()));
     tokio::spawn(sync::supervise(node, shutdown));
     Ok(addr)
+}
+
+/// Housekeeping: retry deferred entries whose time has come (every
+/// minute), expire parked entries of unknown nodes and compact (hourly),
+/// and run the opt-in retention of this node's own records (daily).
+async fn maintenance_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    let mut tick: u64 = 0;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+            _ = shutdown.changed() => break,
+        }
+        tick += 1;
+        if let Err(e) = repl::retry_due(&node).await {
+            warn!(?e, "retrying deferred entries failed");
+        }
+        if tick % 60 == 1 {
+            if let Err(e) = repl::expire_parked(&node).await {
+                warn!(?e, "expiring parked entries failed");
+            }
+            if let Err(e) = repl::compact(&node).await {
+                warn!(?e, "log compaction failed");
+            }
+        }
+        if node.cfg.retention_days > 0 && tick % (24 * 60) == 5 {
+            match retention::run(&node, node.cfg.retention_days).await {
+                Ok(n) if n > 0 => info!(records = n, "retention: deleted this node's old records"),
+                Ok(_) => {}
+                Err(e) => warn!(?e, "retention failed"),
+            }
+        }
+    }
 }
 
 /// Refresh our heartbeat periodically; gossip carries it to the cluster.

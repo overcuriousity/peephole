@@ -65,11 +65,17 @@
         <td>{% if m.key_held %}<a class="btn btn-sm" href="/admin/cluster/node/{{ m.key }}">Configure</a>{% else if m.remote_config %}<span class="muted">open for config key holders</span>{% else %}<span class="muted">locked</span>{% endif %}</td>
         <td>{% if m.blocked %}
           <form method="post" action="/admin/cluster/unblock"><input type="hidden" name="key" value="{{ m.key }}"><button class="btn btn-sm" type="submit">Unblock</button></form>
+          {% if m.purged %}<span class="muted small">purged</span>{% else %}
+          <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-purge-{{ loop.index }}">Purge</button>
+          <dialog id="dlg-purge-{{ loop.index }}"><h3>Purge {{ m.name }}?</h3><p class="muted">Deletes everything this node holds from it, including the entries a block keeps for relaying, and stops relaying it. Other nodes keep their copies. Unblocking fetches its data again.</p>
+            <form method="post" action="/admin/cluster/purge" class="actions"><input type="hidden" name="key" value="{{ m.key }}">
+              <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Purge</button></form></dialog>
+          {% endif %}
         {% else %}
           <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-block-{{ loop.index }}">Block</button>
           <dialog id="dlg-block-{{ loop.index }}"><h3>Block {{ m.name }}?</h3><p class="muted">This node stops talking to it and shows none of its records. Nothing changes for other nodes: nobody can remove a member from the cluster. You can unblock it later.</p>
             <form method="post" action="/admin/cluster/block" class="actions"><input type="hidden" name="key" value="{{ m.key }}">
-              <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Block</button></form></dialog>
+              <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit" name="subtree" value="1" title="Also block every node it admitted, and the nodes those admitted">Block with all it admitted</button><button class="btn btn-danger" type="submit">Block</button></form></dialog>
         {% endif %}</td>
       </tr>
     {% endfor %}

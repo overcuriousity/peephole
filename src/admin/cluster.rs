@@ -30,6 +30,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/cluster/node/{key}", get(node_page).post(node_set))
         .route("/admin/cluster/block", post(block))
         .route("/admin/cluster/unblock", post(unblock))
+        .route("/admin/cluster/purge", post(purge))
         .route("/admin/cluster/pace", post(set_pace))
 }
 
@@ -47,6 +48,8 @@ pub struct MemberView {
     pub state: &'static str,
     /// This node blocked it (local decision).
     pub blocked: bool,
+    /// This node deleted its data and no longer relays it.
+    pub purged: bool,
     /// It lets config key holders change its runtime settings.
     pub remote_config: bool,
     /// This node holds its config key.
@@ -172,7 +175,8 @@ fn node(st: &AdminState) -> AppResult<&Arc<Node>> {
 
 async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
     let rows = members::all(&node.store).await?;
-    let heads = repl::heads(&node.store).await?;
+    let heads = repl::head_map(&repl::heads(&node.store).await?);
+    let purged = crate::cluster::block::purged(&node.store).await?;
     let statuses = node.peer_status.read().unwrap().clone();
     let me = node.id();
     let keys = crate::cluster::confkey::held(&node.store).await?;
@@ -190,7 +194,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
             ),
             (None, _) => ("never".to_string(), false),
         };
-        let held = repl::head_in(&heads, &m.id);
+        let held = heads.get(&m.id).copied().unwrap_or(0);
         let lag = match hb {
             _ if is_self => "—".to_string(),
             Some(h) if h.own_seq <= held => "in sync".to_string(),
@@ -216,6 +220,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
             active: m.active,
             state: m.standing.label(),
             blocked: node.is_blocked(&m.id),
+            purged: purged.contains(&m.id),
             remote_config: m.remote_config,
             key_held: keys.contains(&m.id),
             is_self,
@@ -261,6 +266,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
         active: true,
         state: "active",
         blocked: false,
+        purged: false,
         remote_config: node.cfg.remote_config,
         key_held: false,
         is_self: true,
@@ -545,6 +551,8 @@ async fn leave(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<
 #[derive(serde::Deserialize)]
 struct KeyForm {
     key: String,
+    /// Block: also every node it admitted, transitively.
+    subtree: Option<String>,
 }
 
 async fn block(
@@ -556,6 +564,19 @@ async fn block(
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
     };
+    if f.subtree.is_some() {
+        return Ok(match crate::cluster::block::block_subtree(node, id).await {
+            Ok((ids, n)) => back(
+                Some(format!(
+                    "Blocked {} and the {} node(s) it admitted, directly or not ({n} records taken out of view). Other nodes are unaffected.",
+                    id.short(),
+                    ids.len() - 1
+                )),
+                None,
+            ),
+            Err(e) => back(None, Some(format!("{e:#}"))),
+        });
+    }
     Ok(match crate::cluster::block::block(node, id).await {
         Ok(n) => back(
             Some(format!(
@@ -584,6 +605,28 @@ async fn unblock(
         )
     } else {
         back(None, Some("That node was not blocked.".into()))
+    })
+}
+
+/// Delete a blocked node's data here and stop relaying it.
+async fn purge(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Form(f): Form<KeyForm>,
+) -> AppResult<Redirect> {
+    let node = node(&st)?;
+    let Ok(id) = NodeId::parse(&f.key) else {
+        return Ok(back(None, Some("unknown node".into())));
+    };
+    Ok(match crate::cluster::block::purge(node, id).await {
+        Ok(n) => back(
+            Some(format!(
+                "Purged {}: {n} log entries deleted here. Its entries are no longer accepted or relayed; unblocking fetches them again.",
+                id.short()
+            )),
+            None,
+        ),
+        Err(e) => back(None, Some(format!("{e:#}"))),
     })
 }
 

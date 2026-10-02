@@ -96,29 +96,36 @@ impl Manifest {
     }
 }
 
-/// Announced files of kinds this version knows; old `geolite2-*` rows are left out.
+/// Announced files of kinds this version knows; old `geolite2-*` rows are
+/// left out. Per kind the newest announcement (by its clamped HLC) of a
+/// node this node has not blocked, so a blocked node loses control of the
+/// shared files here.
 pub async fn manifests(store: &crate::store::Store) -> Result<HashMap<String, Manifest>> {
-    type Row = (String, String, i64, String, Option<Vec<u8>>);
-    let rows: Vec<Row> =
-        sqlx::query_as("SELECT kind, sha256, size, fetched_at, origin FROM intel_files")
-            .fetch_all(&store.pool)
-            .await?;
-    Ok(rows
-        .into_iter()
-        .filter(|(kind, ..)| file_name(kind).is_some())
-        .map(|(kind, sha256, size, fetched_at, origin)| {
-            (
-                kind.clone(),
-                Manifest {
-                    kind,
-                    sha256,
-                    size: size as u64,
-                    fetched_at,
-                    origin: origin.and_then(|o| NodeId::from_slice(&o).ok()),
-                },
-            )
-        })
-        .collect())
+    type Row = (String, String, i64, String, Vec<u8>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT kind, sha256, size, fetched_at, origin FROM intel_files
+         WHERE origin NOT IN (SELECT id FROM blocked_peers)
+         ORDER BY hlc DESC, origin DESC",
+    )
+    .fetch_all(&store.pool)
+    .await?;
+    let mut out = HashMap::new();
+    for (kind, sha256, size, fetched_at, origin) in rows {
+        if file_name(&kind).is_none() || out.contains_key(&kind) {
+            continue;
+        }
+        out.insert(
+            kind.clone(),
+            Manifest {
+                kind,
+                sha256,
+                size: size as u64,
+                fetched_at,
+                origin: NodeId::from_slice(&origin).ok(),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// Announce the local copies of `kinds` as their newest version.

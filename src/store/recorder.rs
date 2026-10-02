@@ -849,6 +849,12 @@ impl Recorder {
         self.bury(scan_uids).await?;
         Ok((reqs, scans))
     }
+
+    /// Delete records this node originated, cluster-wide (opt-in cluster
+    /// retention, see `cluster::retention`). Other nodes' uids are skipped.
+    pub async fn delete_own(&self, uids: Vec<String>) -> Result<()> {
+        self.bury(uids).await
+    }
 }
 
 /// Row keys for [`Recorder::split`].

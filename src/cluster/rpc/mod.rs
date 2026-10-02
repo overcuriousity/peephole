@@ -148,13 +148,14 @@ async fn inbox(State(node): State<Arc<Node>>, Extension(Peer(peer)): Extension<P
 async fn wait(State(node): State<Arc<Node>>, Cbor(req): Cbor<WaitReq>) -> Response {
     let mut changes = node.subscribe_changes();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(WAIT_SECS);
+    let theirs = repl::head_map(&req.heads);
     loop {
         changes.borrow_and_update();
         let ours = match repl::heads(&node.store).await {
             Ok(h) => h,
             Err(e) => return internal(e),
         };
-        if repl::ahead_of(&ours, &req.heads) {
+        if repl::ahead_of_map(&ours, &theirs) {
             return Cbor(ours).into_response();
         }
         tokio::select! {

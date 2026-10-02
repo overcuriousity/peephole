@@ -121,6 +121,8 @@ async fn boot_in(
         takeover_hours: o.takeover_hours,
         lease_secs: o.lease_secs,
         remote_config: o.remote_config,
+        origin_quota_mb: 20 * 1024,
+        retention_days: 0,
         peers: peers
             .iter()
             .map(|p| PeerConfig {
@@ -676,6 +678,8 @@ async fn a_node_offline_for_over_30_days_starts_detached() {
                 takeover_hours: 6.0,
                 lease_secs: 120,
                 remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                retention_days: 0,
                 peers: vec![PeerConfig {
                     name: "a".into(),
                     address: a.address(),
@@ -888,6 +892,8 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
             takeover_hours: 6.0,
             lease_secs: 120,
             remote_config: false,
+            origin_quota_mb: 20 * 1024,
+            retention_days: 0,
             peers: vec![PeerConfig {
                 name: "a".into(),
                 address: "127.0.0.1:1".into(),
@@ -1102,6 +1108,8 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
             takeover_hours: 6.0,
             lease_secs: 120,
             remote_config: false,
+            origin_quota_mb: 20 * 1024,
+            retention_days: 0,
             peers: peers
                 .iter()
                 .map(|p| PeerConfig {

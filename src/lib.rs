@@ -74,8 +74,18 @@ pub async fn check_config(
         });
         if cfg.scan.retention_days > 0 {
             summary.push_str(
-                "\nnote: scan.retention_days is ignored in a cluster (the shared dataset is persistent)",
+                "\nnote: scan.retention_days is ignored in a cluster (the shared dataset is persistent; cluster.retention_days opts in for this node's own records)",
             );
+        }
+        if let Some(d) = cfg
+            .cluster
+            .as_ref()
+            .map(|c| c.retention_days)
+            .filter(|d| *d > 0)
+        {
+            summary.push_str(&format!(
+                "\ncluster retention: this node deletes its own records older than {d} days, cluster-wide"
+            ));
         }
     }
     for n in notes {

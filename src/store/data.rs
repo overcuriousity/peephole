@@ -125,7 +125,7 @@ async fn suppressed(conn: &mut SqliteConnection, uid: &str) -> Result<bool> {
 
 /// Whether a parent row that is missing is gone for good (deleted, hidden or
 /// blocked) rather than not replicated yet.
-async fn gone(conn: &mut SqliteConnection, uid: &str) -> Result<bool> {
+pub(crate) async fn gone(conn: &mut SqliteConnection, uid: &str) -> Result<bool> {
     Ok(is_tombstoned(conn, uid).await? || suppressed(conn, uid).await?)
 }
 
@@ -479,35 +479,102 @@ async fn job_status(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &JobStatusRec)
     Ok(Effect::Applied)
 }
 
-/// Take over queued jobs from `r.from`. Order-independent: a job moves to
-/// the adopter if `from` still arbitrates it, or if another node adopted it
-/// from `from` but has a higher key than this adopter.
+/// Take over queued jobs from `r.from`, with no eligibility check (the
+/// cluster layer decides which jobs may move; see `cluster::repl`).
 async fn job_adopt(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &JobAdoptRec) -> Result<Effect> {
     let Some(adopter) = ctx.origin else {
         return Ok(Effect::Ignored);
     };
-    let (from, me) = (r.from.0.to_vec(), adopter.0.to_vec());
     for uid in &r.job_uids {
-        // Adopt queued jobs, and requeue a job still marked 'running' under
-        // the (silent) origin — its lease is long gone, so the adopter reruns
-        // it. The CASE reads the pre-update status. Taking over does not alter
-        // a job already done/failed.
-        sqlx::query(
-            "UPDATE scan_jobs
-               SET arbiter = ?1, adopted_from = ?2,
-                   status = CASE WHEN status = 'running' THEN 'queued' ELSE status END,
-                   started_at = CASE WHEN status = 'running' THEN NULL ELSE started_at END,
-                   scanner = CASE WHEN status = 'running' THEN NULL ELSE scanner END
-             WHERE uid = ?3 AND status IN ('queued','running')
-               AND (arbiter = ?2 OR (adopted_from = ?2 AND arbiter > ?1))",
-        )
-        .bind(&me)
-        .bind(&from)
-        .bind(uid)
-        .execute(&mut *conn)
-        .await?;
+        adopt_one(conn, adopter, &r.from, uid, ctx.hlc).await?;
     }
     Ok(Effect::Applied)
+}
+
+/// Who wins when several nodes adopt the same job: the lowest rank. A hash
+/// of the job and the adopter, so no key wins every contest and grinding a
+/// key buys nothing for jobs that do not exist yet.
+pub fn adopt_rank(job_uid: &str, adopter: &NodeId) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b"peephole-adopt-v1\0");
+    h.update(job_uid.as_bytes());
+    h.update(adopter.0);
+    h.finalize().into()
+}
+
+/// What adoption decisions need to know about a job.
+#[derive(Debug, Clone)]
+pub struct AdoptRow {
+    pub arbiter: Option<NodeId>,
+    pub adopted_from: Option<NodeId>,
+    pub status: String,
+    /// HLC of its last change: creation, status or adoption.
+    pub changed_hlc: u64,
+}
+
+pub async fn adopt_row(conn: &mut SqliteConnection, uid: &str) -> Result<Option<AdoptRow>> {
+    type Row = (Option<Vec<u8>>, Option<Vec<u8>>, String, i64);
+    let r: Option<Row> = sqlx::query_as(
+        "SELECT arbiter, adopted_from, status, MAX(COALESCE(hlc, 0), status_hlc)
+         FROM scan_jobs WHERE uid = ?",
+    )
+    .bind(uid)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(r.map(|r| AdoptRow {
+        arbiter: r.0.and_then(|b| NodeId::from_slice(&b).ok()),
+        adopted_from: r.1.and_then(|b| NodeId::from_slice(&b).ok()),
+        status: r.2,
+        changed_hlc: crate::cluster::hlc::from_db(r.3),
+    }))
+}
+
+/// Move job `uid` from `from` to `adopter` if `from` still arbitrates it,
+/// or if another node adopted it from `from` but ranks after `adopter`
+/// (order-independent). A job still marked running is requeued: its lease
+/// under the silent arbiter is long gone. Returns whether it moved.
+pub async fn adopt_one(
+    conn: &mut SqliteConnection,
+    adopter: &NodeId,
+    from: &NodeId,
+    uid: &str,
+    hlc: u64,
+) -> Result<bool> {
+    let Some(row) = adopt_row(conn, uid).await? else {
+        return Ok(false);
+    };
+    if !["queued", "running"].contains(&row.status.as_str()) {
+        return Ok(false);
+    }
+    let takes = match (row.arbiter, row.adopted_from) {
+        (Some(a), _) if a == *from => true,
+        (Some(cur), Some(f)) if f == *from && cur != *adopter => {
+            adopt_rank(uid, adopter) < adopt_rank(uid, &cur)
+        }
+        _ => false,
+    };
+    if !takes {
+        return Ok(false);
+    }
+    // The CASEs read the pre-update status. The adoption counts as a change
+    // of the job, so a fresh arbiter is not judged stale at once.
+    sqlx::query(
+        "UPDATE scan_jobs
+           SET arbiter = ?1, adopted_from = ?2,
+               status = CASE WHEN status = 'running' THEN 'queued' ELSE status END,
+               started_at = CASE WHEN status = 'running' THEN NULL ELSE started_at END,
+               scanner = CASE WHEN status = 'running' THEN NULL ELSE scanner END,
+               status_hlc = MAX(status_hlc, ?4)
+         WHERE uid = ?3",
+    )
+    .bind(&adopter.0[..])
+    .bind(&from.0[..])
+    .bind(uid)
+    .bind(crate::cluster::hlc::to_db(hlc))
+    .execute(&mut *conn)
+    .await?;
+    Ok(true)
 }
 
 async fn scan_result(
@@ -572,28 +639,43 @@ async fn scan_result(
     Ok(Effect::Applied)
 }
 
-/// The newest announced version of an intel file wins (by HLC).
+/// The newest announced version of an intel file, per origin (by HLC);
+/// `intel::share::manifests` picks the newest of the nodes not blocked.
 async fn intel_manifest(
     conn: &mut SqliteConnection,
     ctx: Ctx<'_>,
     m: &IntelManifestRec,
 ) -> Result<Effect> {
     // Only the public Tor exit list is shared as a file.
-    if crate::intel::share::file_name(&m.kind).is_none() {
+    if crate::intel::share::file_name(&m.kind).is_none()
+        || m.size > crate::intel::share::MAX_INTEL_SIZE
+    {
         return Ok(Effect::Ignored);
     }
+    // A fetch time later than the (clamped) entry is a claim nobody can
+    // check: it would make an old list look fresh and hold off refetches.
+    let entry_ts = chrono::DateTime::from_timestamp_millis(
+        crate::cluster::hlc::physical_ms(ctx.hlc).min(i64::MAX as u64) as i64,
+    )
+    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+    .unwrap_or_else(now_ts);
+    let fetched_at = match chrono::NaiveDateTime::parse_from_str(&m.fetched_at, "%Y-%m-%d %H:%M:%S")
+    {
+        Ok(_) if m.fetched_at <= entry_ts => m.fetched_at.clone(),
+        _ => entry_ts,
+    };
     sqlx::query(
-        "INSERT INTO intel_files (kind, sha256, size, fetched_at, origin, hlc) VALUES (?,?,?,?,?,?)
-         ON CONFLICT(kind) DO UPDATE SET sha256 = excluded.sha256, size = excluded.size,
-           fetched_at = excluded.fetched_at, origin = excluded.origin, hlc = excluded.hlc
+        "INSERT INTO intel_files (kind, origin, sha256, size, fetched_at, hlc) VALUES (?,?,?,?,?,?)
+         ON CONFLICT(kind, origin) DO UPDATE SET sha256 = excluded.sha256, size = excluded.size,
+           fetched_at = excluded.fetched_at, hlc = excluded.hlc
          WHERE excluded.hlc > intel_files.hlc",
     )
     .bind(&m.kind)
+    .bind(ctx.origin_bytes().unwrap_or_default())
     .bind(&m.sha256)
     .bind(m.size as i64)
-    .bind(&m.fetched_at)
-    .bind(ctx.origin_bytes())
-    .bind(ctx.hlc as i64)
+    .bind(fetched_at)
+    .bind(crate::cluster::hlc::to_db(ctx.hlc))
     .execute(&mut *conn)
     .await?;
     Ok(Effect::Applied)

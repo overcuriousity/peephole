@@ -19,19 +19,29 @@ pub const USAGE: &str = "usage: peephole cluster id [CONFIG]
        peephole cluster config-key show|rotate [CONFIG]
        peephole cluster config-key add KEY [CONFIG]
        peephole cluster config-key forget NODE [CONFIG]
-       peephole cluster block NODE [CONFIG]     (NODE: name, fingerprint or ed25519:… key)
+       peephole cluster block [--subtree] NODE [CONFIG]
+                               (NODE: name, fingerprint or ed25519:… key; --subtree also
+                                blocks every node it admitted, transitively)
        peephole cluster unblock NODE [CONFIG]
+       peephole cluster purge NODE [CONFIG]     (delete a blocked node's data here)
        peephole cluster leave [CONFIG]";
 
 /// `--name value` pairs.
 type Flags = Vec<(String, String)>;
 
-/// Split `args` into flags (`--ttl 12`) and positionals.
+/// Flags that take no value.
+const SWITCHES: &[&str] = &["subtree"];
+
+/// Split `args` into flags (`--ttl 12`, `--subtree`) and positionals.
 fn parse_args(args: &[String]) -> Result<(Flags, Vec<String>)> {
     let (mut flags, mut pos) = (vec![], vec![]);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if let Some(name) = a.strip_prefix("--") {
+            if SWITCHES.contains(&name) {
+                flags.push((name.to_string(), String::new()));
+                continue;
+            }
             let v = it
                 .next()
                 .with_context(|| format!("--{name} needs a value"))?;
@@ -227,11 +237,22 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             }
         }
         Some(cmd @ ("block" | "unblock")) => {
-            reject_unknown_flags(&flags, &[])?;
+            reject_unknown_flags(&flags, if cmd == "block" { &["subtree"] } else { &[] })?;
             let who = pos.get(1).context(USAGE)?;
             let (_, node) = open(cfg_at(2)).await?;
             let id = resolve(&members::all(&node.store).await?, who)?;
-            if cmd == "block" {
+            if cmd == "block" && flags.iter().any(|(k, _)| k == "subtree") {
+                let (ids, n) = super::block::block_subtree(&node, id).await?;
+                println!(
+                    "blocked {} and the {} node(s) it admitted, directly or not ({n} records \
+                     taken out of view). Other nodes are unaffected.",
+                    id.short(),
+                    ids.len() - 1
+                );
+                for i in &ids[1..] {
+                    println!("  also blocked {}", i.short());
+                }
+            } else if cmd == "block" {
                 let n = super::block::block(&node, id).await?;
                 println!(
                     "blocked {}: this node no longer talks to it and shows none of its records \
@@ -243,6 +264,18 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             } else {
                 println!("{} was not blocked", id.short());
             }
+        }
+        Some("purge") => {
+            reject_unknown_flags(&flags, &[])?;
+            let who = pos.get(1).context(USAGE)?;
+            let (_, node) = open(cfg_at(2)).await?;
+            let id = resolve(&members::all(&node.store).await?, who)?;
+            let n = super::block::purge(&node, id).await?;
+            println!(
+                "purged {}: {n} log entries deleted here; its entries are no longer accepted \
+                 nor relayed. Unblocking fetches them again.",
+                id.short()
+            );
         }
         Some("config-key") => {
             reject_unknown_flags(&flags, &[])?;
