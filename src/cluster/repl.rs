@@ -30,7 +30,7 @@ pub type Heads = Vec<(NodeId, u64)>;
 /// [`Heads`] for lookups.
 pub type HeadMap = HashMap<NodeId, u64>;
 
-/// `repl_log.applied` states (see migration 0022).
+/// `repl_log.applied` states (see migration 0018).
 const APPLIED: i64 = 1;
 const DEFERRED: i64 = 0;
 const UNKNOWN_KIND: i64 = 2;
