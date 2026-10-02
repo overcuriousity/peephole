@@ -65,6 +65,7 @@ async fn pull(State(node): State<Arc<Node>>, Cbor(req): Cbor<PullReq>) -> Respon
     match repl::entries_after(
         &node.store,
         &req.wants,
+        req.since_hlc,
         req.max_entries.clamp(1, 5 * BATCH_ENTRIES),
         req.max_bytes.clamp(1, 4 * BATCH_BYTES),
     )

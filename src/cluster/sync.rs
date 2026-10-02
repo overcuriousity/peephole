@@ -35,6 +35,9 @@ pub const BATCH_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PullReq {
     pub wants: Vec<(NodeId, u64)>,
+    /// The receiver keeps only history from this HLC on (0: everything).
+    #[serde(default)]
+    pub since_hlc: u64,
     pub max_entries: usize,
     pub max_bytes: usize,
 }
@@ -45,13 +48,18 @@ pub struct PullReq {
 pub struct Batch {
     pub entries: Vec<WireEntry>,
     pub proofs: Vec<WireEntry>,
+    /// Origins whose entries here start past what was asked for (the
+    /// sender's floor or the receiver's window), and where. Entries before
+    /// that start are membership entries.
+    #[serde(default)]
+    pub floors: Vec<(NodeId, u64)>,
 }
 
 impl From<Vec<WireEntry>> for Batch {
     fn from(entries: Vec<WireEntry>) -> Self {
         Self {
             entries,
-            proofs: vec![],
+            ..Default::default()
         }
     }
 }
@@ -237,6 +245,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
                 "/rpc/v1/pull",
                 &PullReq {
                     wants,
+                    since_hlc: 0,
                     max_entries: BATCH_ENTRIES,
                     max_bytes: BATCH_BYTES,
                 },
@@ -266,7 +275,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         if wants.is_empty() {
             break;
         }
-        let batch = repl::entries_after(&node.store, &wants, BATCH_ENTRIES, BATCH_BYTES).await?;
+        let batch = repl::entries_after(&node.store, &wants, 0, BATCH_ENTRIES, BATCH_BYTES).await?;
         if batch.entries.is_empty() {
             break;
         }

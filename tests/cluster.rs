@@ -1135,7 +1135,7 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
 }
 
 async fn batch_of(n: &Node, origin: NodeId) -> peephole::cluster::sync::Batch {
-    repl::entries_after(&n.store, &[(origin, 0)], 10_000, usize::MAX)
+    repl::entries_after(&n.store, &[(origin, 0)], 0, 10_000, usize::MAX)
         .await
         .unwrap()
 }
@@ -1210,6 +1210,7 @@ async fn erased_stubs_need_the_origins_tombstone() {
     // A relay strips /two and claims A's tombstone erased it.
     let (x, _dx) = offline_node(&[&a, &b]).await;
     let mut forged = Batch {
+        floors: vec![],
         entries: before.entries.clone(),
         proofs: after.proofs.clone(),
     };
@@ -1238,6 +1239,7 @@ async fn erased_stubs_need_the_origins_tombstone() {
     // names /one's own position in A's log, so it does not cover this one.
     let (w, _dw) = offline_node(&[&a, &b]).await;
     let mut relabel = Batch {
+        floors: vec![],
         entries: after.entries.clone(),
         proofs: after.proofs.clone(),
     };
@@ -1256,11 +1258,13 @@ async fn erased_stubs_need_the_origins_tombstone() {
 
     // No proof, a proof from another origin, a stub without a uid: rejected.
     let stub_only = Batch {
+        floors: vec![],
         entries: after.entries.clone(),
         proofs: vec![],
     };
     let other = Identity::generate().unwrap();
     let wrong_origin = Batch {
+        floors: vec![],
         entries: after.entries.clone(),
         proofs: vec![
             WireEntry::sign(
@@ -1277,6 +1281,7 @@ async fn erased_stubs_need_the_origins_tombstone() {
         ],
     };
     let mut no_uid = Batch {
+        floors: vec![],
         entries: after.entries.clone(),
         proofs: after.proofs.clone(),
     };

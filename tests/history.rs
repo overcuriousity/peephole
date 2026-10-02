@@ -253,3 +253,52 @@ async fn purging_an_origin_forgets_its_floor() {
     peephole::cluster::block::purge(&x, a.key()).await.unwrap();
     assert_eq!(floor(&x, a.key()).await, 1);
 }
+
+async fn serve(
+    n: &Node,
+    origin: NodeId,
+    after: u64,
+    since_hlc: u64,
+) -> (Vec<u64>, Vec<(NodeId, u64)>) {
+    let b = repl::entries_after(&n.store, &[(origin, after)], since_hlc, 1000, usize::MAX)
+        .await
+        .unwrap();
+    (b.entries.iter().map(|e| e.seq).collect(), b.floors)
+}
+
+/// A node serves from its floor, with the membership entries below it, and
+/// says where the full history it sends starts.
+#[tokio::test]
+async fn a_windowed_node_serves_from_its_floor() {
+    let mut a = Origin::new();
+    let (x, _d) = offline(&[&a], 7).await;
+    apply(&x, old_and_new(&mut a)).await;
+    history::prune(&x).await.unwrap();
+    assert_eq!(
+        serve(&x, a.key(), 0, 0).await,
+        (vec![1, 5, 6], vec![(a.key(), 5)])
+    );
+    assert_eq!(
+        serve(&x, a.key(), 2, 0).await,
+        (vec![5, 6], vec![(a.key(), 5)])
+    );
+    assert_eq!(serve(&x, a.key(), 4, 0).await, (vec![5, 6], vec![]));
+    assert_eq!(serve(&x, a.key(), 6, 0).await, (vec![], vec![]));
+}
+
+/// A node that keeps everything sends a windowed receiver only its window
+/// (and the membership before it).
+#[tokio::test]
+async fn a_full_node_serves_a_window_on_request() {
+    let mut a = Origin::new();
+    let (f, _d) = offline(&[&a], 0).await;
+    apply(&f, old_and_new(&mut a)).await;
+    let week = history::window_hlc(7, wall_ms());
+    assert_eq!(
+        serve(&f, a.key(), 0, week).await,
+        (vec![1, 5, 6], vec![(a.key(), 5)])
+    );
+    assert_eq!(serve(&f, a.key(), 0, 0).await, ((1..=6).collect(), vec![]));
+    // Already past the window start: nothing changes.
+    assert_eq!(serve(&f, a.key(), 5, week).await, (vec![6], vec![]));
+}

@@ -230,14 +230,22 @@ pub async fn refused_origins(node: &Node) -> Result<HashSet<NodeId>> {
 /// Always returns at least one entry when one is available. Each origin
 /// gets a share of the budget, so one origin the receiver refuses cannot
 /// fill every batch.
+///
+/// The history sent starts at this node's floor, or for a receiver that
+/// keeps a window (`since_hlc > 0`) at the first entry inside it, whichever
+/// is later. When that is past what was asked for, the membership entries
+/// before it go along and `floors` says where the full history starts.
 pub async fn entries_after(
     store: &crate::store::Store,
     wants: &[(NodeId, u64)],
+    since_hlc: u64,
     max_entries: usize,
     max_bytes: usize,
 ) -> Result<Batch> {
     let mut conn = store.pool.acquire().await?;
     let purged = purged_set(&mut conn).await?;
+    let floors = super::history::floors(&mut conn).await?;
+    let mut declared = vec![];
     let share = (max_entries / wants.len().max(1)).max(100).min(max_entries);
     let mut out: Vec<WireEntry> = vec![];
     let mut bytes = 0usize;
@@ -254,13 +262,23 @@ pub async fn entries_after(
         }
         let limit = share.min(max_entries - out.len());
         let mut taken = 0;
-        let mut next = *after + 1;
-        let rows: Vec<LogRow> = sqlx::query_as(
+        let mut start = (*after + 1).max(floors.get(origin).copied().unwrap_or(1));
+        if since_hlc > 0 {
+            start = start.max(super::history::cut(&mut conn, origin, start, since_hlc).await?);
+        }
+        if start > *after + 1 {
+            declared.push((*origin, start));
+        }
+        let mut next = start;
+        let rows: Vec<LogRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by FROM repl_log
-             WHERE origin = ? AND seq > ? ORDER BY seq LIMIT ?",
-        )
+             WHERE origin = ? AND seq > ? AND (seq >= ? OR kind IN {})
+             ORDER BY seq LIMIT ?",
+            super::history::MEMBERSHIP_SQL
+        )))
         .bind(&origin.0[..])
         .bind(*after as i64)
+        .bind(start.min(i64::MAX as u64) as i64)
         .bind(limit as i64)
         .fetch_all(&mut *conn)
         .await?;
@@ -273,7 +291,7 @@ pub async fn entries_after(
                 "SELECT entry FROM repl_pending WHERE origin = ? AND seq > ? ORDER BY seq LIMIT ?",
             )
             .bind(&origin.0[..])
-            .bind(*after as i64)
+            .bind((start - 1).min(i64::MAX as u64) as i64)
             .bind(limit as i64)
             .fetch_all(&mut *conn)
             .await?;
@@ -299,6 +317,16 @@ pub async fn entries_after(
                     break;
                 };
                 e.payload = Some(super::rpc::cbor::encode(&r)?);
+            }
+            // Membership below the start of the full history.
+            if e.seq < start {
+                if full(&out, bytes) || taken >= limit {
+                    break;
+                }
+                bytes += e.payload.as_ref().map_or(0, Vec::len) + 128;
+                taken += 1;
+                out.push(e);
+                continue;
             }
             if e.seq < next {
                 continue;
@@ -329,6 +357,7 @@ pub async fn entries_after(
     Ok(Batch {
         entries: out,
         proofs,
+        floors: declared,
     })
 }
 
@@ -547,7 +576,11 @@ pub async fn append(node: &Node, records: &[Record]) -> Result<Vec<WireEntry>> {
 
 /// Apply entries received from a peer (any origin).
 pub async fn apply_batch(node: &Node, batch: impl Into<Batch>) -> Result<Applied> {
-    let Batch { entries, proofs } = batch.into();
+    let Batch {
+        entries,
+        proofs,
+        floors: _,
+    } = batch.into();
     let mut st = Applied::default();
     if entries.is_empty() {
         return Ok(st);
