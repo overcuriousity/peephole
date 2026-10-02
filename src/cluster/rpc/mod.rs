@@ -197,6 +197,9 @@ async fn require_member(
     }
     if node.is_member(&peer) {
         node.status.touch_inbound(peer);
+        if let Some(server::RemoteAddr(addr)) = req.extensions().get::<server::RemoteAddr>() {
+            node.status.note_peer_ip(peer, addr.ip());
+        }
         next.run(req).await
     } else {
         let why = match node.standing_of(&peer) {

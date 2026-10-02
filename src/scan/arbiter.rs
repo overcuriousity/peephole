@@ -157,7 +157,9 @@ impl Arbiter {
 
     async fn scans_last_hour(&self, scanner: &NodeId) -> i64 {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM scan_jobs WHERE scanner = ? AND started_at > datetime('now','-1 hour')",
+            // Like the scanners' own rate count: a grant turned down ran nothing.
+            "SELECT COUNT(*) FROM scan_jobs WHERE scanner = ? AND started_at > datetime('now','-1 hour')
+               AND status NOT IN ('refused','superseded')",
         )
         .bind(&scanner.0[..])
         .fetch_one(&self.node.store.pool)

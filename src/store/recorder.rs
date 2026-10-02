@@ -11,6 +11,7 @@ use crate::cluster::record::{
     FingerprintRec, FpClaimRec, IpIntelRec, JobStatusRec, PortRec, Record, RequestRec, ScanJobRec,
     ScanResultRec, TombstoneRec,
 };
+use crate::scan::guard::{self, EnqueuePolicy};
 use crate::scan::nmap_xml::ScanResult;
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -298,19 +299,49 @@ impl Recorder {
         self.id_by_uid("fingerprints", &uid).await
     }
 
-    /// Cooldown (spec §5): a finished scan of level >= requested within the
-    /// window suppresses; a higher requested level upgrades exactly once.
-    /// Checked against every job in the (replicated) database.
+    /// [`Recorder::enqueue_scan_with`] with only the per-IP cooldown.
     pub async fn enqueue_scan(
         &self,
         ip_id: i64,
         level: u8,
         cooldown_hours: i64,
     ) -> Result<EnqueueOutcome> {
-        if level == 0 {
+        self.enqueue_scan_with(ip_id, level, &EnqueuePolicy::cooldown_only(cooldown_hours))
+            .await
+    }
+
+    /// Cooldown (spec §5): a finished scan of level >= requested within the
+    /// window suppresses; a higher requested level upgrades exactly once.
+    /// Checked against every job in the (replicated) database.
+    ///
+    /// With `policy.safety` (the trap's policy, see [`crate::scan::guard`]):
+    /// thin evidence caps the level; a new job must fit the /24-/64 and ASN
+    /// budgets; a full queue drops its oldest lowest-level job for a
+    /// higher-level one, and otherwise refuses the new one.
+    pub async fn enqueue_scan_with(
+        &self,
+        ip_id: i64,
+        level: u8,
+        policy: &EnqueuePolicy,
+    ) -> Result<EnqueueOutcome> {
+        if !(1..=4).contains(&level) {
+            if level != 0 {
+                tracing::warn!(level, "scan level out of range; not queued");
+            }
             return Ok(EnqueueOutcome::Suppressed);
         }
+        let cooldown_hours = policy.cooldown_hours;
         let pool = &self.store().pool;
+        let ip_text = self.ip_of(ip_id).await?;
+        let mut level = level;
+        if let Some(s) = &policy.safety
+            && level > s.single_request_max_level
+            && guard::evidence(pool, &ip_text, &guard::Origins::Any)
+                .await?
+                .thin(s)
+        {
+            level = s.single_request_max_level;
+        }
         let recent: Option<(i64,)> = sqlx::query_as(
             "SELECT level FROM scan_jobs WHERE ip_id = ? AND status IN ('done','failed')
              AND finished_at > datetime('now', ?) ORDER BY level DESC LIMIT 1",
@@ -370,10 +401,18 @@ impl Recorder {
                 }
             }
         }
+        if let Some(s) = &policy.safety
+            && let Some(why) = self
+                .over_budget(ip_id, &ip_text, level, s, cooldown_hours)
+                .await?
+        {
+            tracing::debug!(ip = %ip_text, why, "scan not queued");
+            return Ok(EnqueueOutcome::Throttled(why));
+        }
         let uid = self.uid();
         self.write(vec![Record::ScanJob(ScanJobRec {
             uid: uid.clone(),
-            ip: self.ip_of(ip_id).await?,
+            ip: ip_text,
             level: level as i64,
             queued_at: now_ts(),
         })])
@@ -383,15 +422,139 @@ impl Recorder {
         ))
     }
 
-    /// Jobs this node started in the last hour, whatever their outcome: the
-    /// rate cap limits nmap launches, so failed and running scans count too.
+    /// Why a new job for this IP does not fit the queue budgets, if it does
+    /// not. A full queue makes room by refusing its oldest lowest-level job
+    /// when that is below `level`.
+    async fn over_budget(
+        &self,
+        ip_id: i64,
+        ip: &str,
+        level: u8,
+        s: &crate::config::ScanSafety,
+        cooldown_hours: i64,
+    ) -> Result<Option<&'static str>> {
+        let pool = &self.store().pool;
+        if s.prefix_max_scans > 0
+            && cooldown_hours > 0
+            && guard::queued_in_network(pool, ip, cooldown_hours).await?
+                >= s.prefix_max_scans as usize
+        {
+            return Ok(Some("network budget (/24 or /64) used up"));
+        }
+        if s.asn_max_per_hour > 0 {
+            let asn: Option<i64> = sqlx::query_scalar("SELECT asn FROM ips WHERE id = ?")
+                .bind(ip_id)
+                .fetch_optional(pool)
+                .await?
+                .flatten();
+            if let Some(asn) = asn
+                && guard::queued_in_asn_last_hour(pool, asn).await? >= s.asn_max_per_hour as i64
+            {
+                return Ok(Some("hourly ASN budget used up"));
+            }
+        }
+        if s.max_queued > 0 {
+            let (cond, own) = self.own_jobs();
+            let sql = format!("SELECT COUNT(*) FROM scan_jobs WHERE status = 'queued' AND {cond}");
+            let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
+            if let Some(b) = &own {
+                q = q.bind(b.clone());
+            }
+            if q.fetch_one(pool).await? >= s.max_queued as i64 {
+                let sql = format!(
+                    "SELECT uid, attempts FROM scan_jobs WHERE status = 'queued' AND {cond}
+                       AND level < ? ORDER BY level ASC, queued_at ASC LIMIT 1"
+                );
+                let mut q = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
+                if let Some(b) = own {
+                    q = q.bind(b);
+                }
+                let Some((uid, attempts)) = q.bind(level as i64).fetch_optional(pool).await? else {
+                    return Ok(Some("scan queue full"));
+                };
+                self.write(vec![Record::JobStatus(JobStatusRec {
+                    job_uid: uid,
+                    status: "refused".into(),
+                    started_at: None,
+                    finished_at: Some(now_ts()),
+                    error: Some("dropped: scan queue full".into()),
+                    attempts,
+                    scanner: None,
+                })])
+                .await?;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Mark a queued job this node arbitrates as running (standalone
+    /// scanner). False when it is no longer queued.
+    pub async fn start_job(&self, job_id: i64) -> Result<bool> {
+        let row: Option<(Option<String>, String, i64)> =
+            sqlx::query_as("SELECT uid, status, attempts FROM scan_jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_optional(&self.store().pool)
+                .await?;
+        let Some((Some(uid), status, attempts)) = row else {
+            return Ok(false);
+        };
+        if status != "queued" {
+            return Ok(false);
+        }
+        self.status(
+            &uid.clone(),
+            JobStatusRec {
+                job_uid: uid,
+                status: "running".into(),
+                started_at: Some(now_ts()),
+                finished_at: None,
+                error: None,
+                attempts: attempts + 1,
+                scanner: self.node_id(),
+            },
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Refuse a job before it ran (standalone scanner): it never started,
+    /// so it does not count against the hourly rate.
+    pub async fn refuse_job(&self, job_id: i64, why: &str) -> Result<()> {
+        let row: Option<(Option<String>, i64)> =
+            sqlx::query_as("SELECT uid, attempts FROM scan_jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_optional(&self.store().pool)
+                .await?;
+        let Some((Some(uid), attempts)) = row else {
+            return Ok(());
+        };
+        self.status(
+            &uid.clone(),
+            JobStatusRec {
+                job_uid: uid,
+                status: "refused".into(),
+                started_at: None,
+                finished_at: Some(now_ts()),
+                error: Some(why.to_string()),
+                attempts,
+                scanner: None,
+            },
+        )
+        .await
+    }
+
+    /// Jobs this node started in the last hour: the rate cap limits nmap
+    /// launches, so failed and running scans count too. Jobs refused or
+    /// superseded before nmap ran do not (in a cluster the arbiter stamps a
+    /// start time when it grants a job the scanner then turns down).
     pub async fn jobs_started_last_hour(&self) -> Result<i64> {
         let (cond, bind) = match self {
             Recorder::Local(_) => ("arbiter IS NULL", None),
             Recorder::Cluster(n) => ("scanner = ?", Some(n.id().0.to_vec())),
         };
         let sql = format!(
-            "SELECT COUNT(*) FROM scan_jobs WHERE started_at > datetime('now','-1 hour') AND {cond}"
+            "SELECT COUNT(*) FROM scan_jobs WHERE started_at > datetime('now','-1 hour')
+               AND status NOT IN ('refused','superseded') AND {cond}"
         );
         let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(sql));
         if let Some(b) = bind {

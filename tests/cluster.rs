@@ -201,8 +201,10 @@ fn scan_config(never_scan: &[String]) -> peephole::config::Config {
         .map(|n| format!("\"{n}\""))
         .collect::<Vec<_>>()
         .join(",");
+    // No Tor list and no DNS in tests: neither check may hold scans back.
     toml::from_str(&format!(
-        "database_path = \"/x\"\ndata_dir = \"/x\"\n[scan]\nnever_scan = [{list}]\n"
+        "database_path = \"/x\"\ndata_dir = \"/x\"\n[scan]\nnever_scan = [{list}]\n\
+         tor_unknown = \"scan\"\nverify_crawlers = false\n"
     ))
     .unwrap()
 }
@@ -1656,6 +1658,14 @@ fn fake_nmap(dir: &std::path::Path, secs: f64) -> std::path::PathBuf {
 
 async fn enqueue(n: &TestNode, ip: &str, level: u8) {
     let row = n.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+    // Scanners only run jobs the IP's requests back (three, so the level
+    // is not capped as thin evidence).
+    for i in 0..3 {
+        rec(n)
+            .insert_request(&new_request(row.id, &format!("/probe{i}")))
+            .await
+            .unwrap();
+    }
     let out = rec(n).enqueue_scan(row.id, level, 24).await.unwrap();
     assert!(
         matches!(out, peephole::store::scans::EnqueueOutcome::Queued(_)),

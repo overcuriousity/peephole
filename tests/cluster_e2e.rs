@@ -112,6 +112,9 @@ web = false
 [scan]
 max_workers = 1
 max_scans_per_hour = 600
+# No Tor list and no DNS in tests.
+tor_unknown = "scan"
+verify_crawlers = false
 [cluster]
 node_name = "scanner-b"
 listen = "127.0.0.1:{b_rpc}"

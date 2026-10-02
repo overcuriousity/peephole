@@ -45,16 +45,47 @@ max_scans_per_hour = 30    # global rate cap; excess jobs stay queued
 retention_days = 90        # standalone only: delete requests and scan results older than this; 0 = keep forever. Ignored in a cluster.
 never_scan = ["192.168.0.0/16"] # extra CIDRs this node's scanner never scans (own infra, monitoring); other cluster scanners are not bound by it
 # Non-global addresses (loopback, private, CGNAT, link-local, multicast,
-# reserved) are never counter-scanned regardless of never_scan.
+# reserved, NAT64/6to4 forms of those) and this node's own addresses are
+# never counter-scanned regardless of never_scan. Behind 1:1 NAT, add the
+# public address to never_scan.
+#
+# Bystanders: one request is easily caused by a link preview, URL scanner or
+# crawler fetching a trap URL, so it earns at most this level until the IP
+# sends full_scan_min_requests requests (or two with different labels).
+single_request_max_level = 2  # 1-4; 4 disables the cap
+full_scan_min_requests = 3
+verify_crawlers = true        # skip forward-confirmed crawlers (googlebot.com, search.msn.com, ...)
+# crawler_domains = ["crawler.example.org"]  # added to the built-in list
+# never_scan_dir = "/etc/peephole/never_scan.d"  # local CIDR lists (*.txt, *.list, *.conf;
+#                               # one CIDR per line, # comments), e.g. published crawler
+#                               # ranges you download yourself; nothing is fetched
+# Queue budgets against floods (0 = no limit):
+prefix_max_scans = 4          # IPs per /24 (IPv4) or /64 (IPv6) queued per rescan cooldown
+asn_max_per_hour = 20         # jobs queued per autonomous system per hour (needs GeoLite2)
+max_queued = 5000             # queued jobs; a full queue drops its oldest lowest-level job
+#                               for a higher-level one and otherwise queues nothing new
+# Tor exits are never scanned. While no exit list has loaded (first start,
+# check.torproject.org unreachable), "defer" holds scans of IPs whose status
+# is unknown for tor_wait_hours, then refuses them; "scan" scans them anyway.
+# The exit list covers IPv4 only: Tor exits reaching the trap over IPv6 are
+# not recognised.
+tor_unknown = "defer"
+tor_wait_hours = 6
+# Distributed mode: by default a scanner runs jobs backed by any member's
+# requests. List node keys to trust only those members' traps (and this
+# node's); [] = this node's own traps only.
+# trusted_origins = ["ed25519:..."]
 
 # Default scans are non-intrusive: no -A, no intrusive NSE scripts, timing
 # capped at -T3. Severity escalates by scope (ports, -sV, -O, discovery/safe
-# scripts). Optional per-level argv overrides below; {target} is NOT used — the
-# target IP is appended as the final argument. A script selector with spaces is
-# one element. Example:
+# scripts that neither contact third parties nor broadcast). nmap gets a
+# --host-timeout just under timeout_secs and a --script-timeout. Optional
+# per-level argv overrides below; {target} is NOT used — the target IP is
+# appended as the final argument. A script selector with spaces is one
+# element. Example:
 # [scan.level_argv]
 # 2 = ["-Pn", "-sS", "-sV", "-T3", "--top-ports", "2000"]
-# 3 = ["-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000", "--script", "(discovery or safe) and not intrusive"]
+# 3 = ["-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000", "--script", "(discovery or safe) and not (intrusive or broadcast or external or dos)"]
 
 # Distributed mode: share requests, scan queue, results and intel with other
 # nodes (README: Distributed mode). Absent: standalone. The node key is

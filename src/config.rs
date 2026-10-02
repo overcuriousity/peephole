@@ -150,6 +150,105 @@ pub struct ScanConfig {
     /// final argument (there is no `{target}` placeholder).
     #[serde(default)]
     pub level_argv: std::collections::HashMap<u8, Vec<String>>,
+    /// Scan safety knobs (see [`ScanSafety`]); flattened into `[scan]`.
+    #[serde(flatten)]
+    pub safety: ScanSafety,
+}
+
+/// `[scan]` keys that keep counter-scans away from bystanders and bound
+/// how much one source can make this node scan.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScanSafety {
+    /// Highest level for an IP with thin evidence: fewer than
+    /// `full_scan_min_requests` requests and not two requests with
+    /// different labels. A link-preview bot or URL scanner fetching a
+    /// trap URL once is not scanned at level 4. 4 disables the cap.
+    #[serde(default = "default_thin_max_level")]
+    pub single_request_max_level: u8,
+    /// Requests from an IP after which its level is no longer capped.
+    #[serde(default = "default_full_scan_min_requests")]
+    pub full_scan_min_requests: u32,
+    /// IPs per /24 (IPv4) or /64 (IPv6) queued within the rescan cooldown;
+    /// further IPs of that network are not queued. 0: no limit.
+    #[serde(default = "default_prefix_max_scans")]
+    pub prefix_max_scans: u32,
+    /// Queued jobs this node keeps at most. When full, a new job evicts the
+    /// oldest queued job of a lower level, or is not queued. 0: no cap.
+    #[serde(default = "default_max_queued")]
+    pub max_queued: u32,
+    /// Jobs queued per hour for IPs of one autonomous system (needs GeoLite2
+    /// ASN data). 0: no budget.
+    #[serde(default = "default_asn_max_per_hour")]
+    pub asn_max_per_hour: u32,
+    /// Directory of local CIDR lists (`*.txt`/`*.list`/`*.conf`, one address
+    /// or CIDR per line, `#` comments) this scanner never scans, e.g. the
+    /// published ranges of search engine crawlers. Nothing is downloaded.
+    #[serde(default)]
+    pub never_scan_dir: Option<PathBuf>,
+    /// Skip IPs whose reverse DNS names a known crawler domain and resolves
+    /// back to the IP (forward-confirmed reverse DNS).
+    #[serde(default = "default_true")]
+    pub verify_crawlers: bool,
+    /// Crawler domains in addition to the built-in list.
+    #[serde(default)]
+    pub crawler_domains: Vec<String>,
+    /// Cluster: scan only jobs backed by requests recorded by these nodes
+    /// (`ed25519:...` keys) or this node. Absent: any member; `[]`: this
+    /// node's own traps only.
+    #[serde(default)]
+    pub trusted_origins: Option<Vec<String>>,
+    /// What to do with an IP whose Tor exit status is unknown because no
+    /// exit list has loaded: `defer` (wait up to `tor_wait_hours`, then
+    /// refuse) or `scan` (scan anyway, with a warning).
+    #[serde(default)]
+    pub tor_unknown: TorUnknown,
+    #[serde(default = "default_tor_wait_hours")]
+    pub tor_wait_hours: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum TorUnknown {
+    #[default]
+    Defer,
+    Scan,
+}
+
+fn default_thin_max_level() -> u8 {
+    2
+}
+fn default_full_scan_min_requests() -> u32 {
+    3
+}
+fn default_prefix_max_scans() -> u32 {
+    4
+}
+fn default_max_queued() -> u32 {
+    5000
+}
+fn default_asn_max_per_hour() -> u32 {
+    20
+}
+fn default_tor_wait_hours() -> u32 {
+    6
+}
+
+impl Default for ScanSafety {
+    fn default() -> Self {
+        Self {
+            single_request_max_level: default_thin_max_level(),
+            full_scan_min_requests: default_full_scan_min_requests(),
+            prefix_max_scans: default_prefix_max_scans(),
+            max_queued: default_max_queued(),
+            asn_max_per_hour: default_asn_max_per_hour(),
+            never_scan_dir: None,
+            verify_crawlers: true,
+            crawler_domains: vec![],
+            trusted_origins: None,
+            tor_unknown: TorUnknown::Defer,
+            tor_wait_hours: default_tor_wait_hours(),
+        }
+    }
 }
 
 fn default_workers() -> usize {
@@ -179,6 +278,7 @@ impl Default for ScanConfig {
             retention_days: default_retention_days(),
             never_scan: vec![],
             level_argv: Default::default(),
+            safety: ScanSafety::default(),
         }
     }
 }
@@ -197,6 +297,12 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("scan", "max_scans_per_hour", "30"),
     ("scan", "retention_days", "90"),
     ("scan", "never_scan", "[]"),
+    ("scan", "single_request_max_level", "2"),
+    ("scan", "prefix_max_scans", "4"),
+    ("scan", "max_queued", "5000"),
+    ("scan", "asn_max_per_hour", "20"),
+    ("scan", "verify_crawlers", "true"),
+    ("scan", "tor_unknown", "\"defer\""),
 ];
 
 /// Sections that are required when their role is on and unused otherwise.
@@ -316,10 +422,20 @@ impl Config {
                 crate::scan::pace::MAX_PER_HOUR
             );
         }
-        for level in s.level_argv.keys() {
+        for (level, argv) in &s.level_argv {
             if !(1..=4).contains(level) {
                 bail!("scan.level_argv: level {level} is out of range (1..=4)");
             }
+            if argv.is_empty() {
+                bail!("scan.level_argv: level {level} is empty (nmap would run its default scan)");
+            }
+        }
+        if !(1..=4).contains(&s.safety.single_request_max_level) {
+            bail!("scan.single_request_max_level must be between 1 and 4");
+        }
+        for o in s.safety.trusted_origins.iter().flatten() {
+            crate::cluster::identity::NodeId::parse(o)
+                .with_context(|| format!("scan.trusted_origins: `{o}`"))?;
         }
         if let Some(c) = &self.cluster {
             if c.node_name.trim().is_empty() {
@@ -371,13 +487,24 @@ impl Config {
     /// discovery probes are often filtered and would report it down. The
     /// full-range level caps retransmissions so filtered ports don't stretch
     /// a scan past the timeout.
-    pub fn default_level_argv(&self, level: u8) -> Vec<String> {
+    ///
+    /// None for a level outside 1..=4: there is no preset to fall back on,
+    /// and an empty argv would run nmap's own default scan.
+    pub fn default_level_argv(&self, level: u8) -> Option<Vec<String>> {
+        if !(1..=4).contains(&level) {
+            return None;
+        }
         if let Some(custom) = self.scan.level_argv.get(&level) {
-            return custom.clone();
+            return Some(custom.clone());
         }
         // One NSE argument; it contains spaces, so argv is built element by
-        // element rather than split from a string.
-        const SCRIPTS: &str = "(discovery or safe) and not intrusive";
+        // element rather than split from a string. `discovery` and `safe`
+        // also hold scripts that would leak the target to third parties
+        // (`external`: whois, ASN and geolocation lookups), broadcast on
+        // the scanner's own network (`broadcast` prerules), or flood
+        // (`dos`); those categories are excluded.
+        const SCRIPTS: &str =
+            "(discovery or safe) and not (intrusive or broadcast or external or dos)";
         let argv: &[&str] = match level {
             1 => &["-Pn", "-sS", "-T2", "--top-ports", "100"],
             2 => &["-Pn", "-sS", "-sV", "-T3", "--top-ports", "1000"],
@@ -404,9 +531,9 @@ impl Config {
                 "--script",
                 SCRIPTS,
             ],
-            _ => &[],
+            _ => return None,
         };
-        argv.iter().map(|s| s.to_string()).collect()
+        Some(argv.iter().map(|s| s.to_string()).collect())
     }
 }
 
@@ -436,7 +563,7 @@ license_key = "k"
         )
         .unwrap();
         for level in 1..=4 {
-            let argv = cfg.default_level_argv(level);
+            let argv = cfg.default_level_argv(level).unwrap();
             assert!(argv.iter().any(|a| a == "-Pn"), "level {level}: {argv:?}");
         }
     }
@@ -461,17 +588,24 @@ rp_name = "x"
         )
         .unwrap();
         for level in 1..=4 {
-            let argv = cfg.default_level_argv(level);
+            let argv = cfg.default_level_argv(level).unwrap();
             assert!(!argv.iter().any(|a| a == "-A"), "level {level} has -A");
             assert!(
                 !argv.iter().any(|a| a == "-T4" || a == "-T5"),
                 "level {level} timing too fast: {argv:?}"
             );
             // Scripts, when present, are one argv element that excludes the
-            // intrusive category.
+            // intrusive category and the ones that talk to third parties,
+            // broadcast on the local network, or flood.
             if let Some(i) = argv.iter().position(|a| a == "--script") {
                 let expr = &argv[i + 1];
-                assert!(expr.contains("not intrusive"), "level {level}: {expr}");
+                let (_, excluded) = expr.split_once("and not").unwrap();
+                for cat in ["intrusive", "broadcast", "external", "dos"] {
+                    assert!(
+                        excluded.contains(cat),
+                        "level {level}: {expr} lets {cat} in"
+                    );
+                }
                 assert!(expr.contains(' '), "selector must be one argv element");
             } else {
                 assert!(
@@ -481,10 +615,26 @@ rp_name = "x"
             }
         }
         // Only the top two levels do OS detection; only level 4 scans all ports.
-        assert!(!cfg.default_level_argv(2).iter().any(|a| a == "-O"));
-        assert!(cfg.default_level_argv(3).iter().any(|a| a == "-O"));
-        assert!(!cfg.default_level_argv(3).iter().any(|a| a == "-p-"));
-        assert!(cfg.default_level_argv(4).iter().any(|a| a == "-p-"));
+        let has = |level, flag| {
+            cfg.default_level_argv(level)
+                .unwrap()
+                .iter()
+                .any(|a| a == flag)
+        };
+        assert!(!has(2, "-O"));
+        assert!(has(3, "-O"));
+        assert!(!has(3, "-p-"));
+        assert!(has(4, "-p-"));
+    }
+
+    /// No level outside 1..=4 gets an argv: an empty one would run nmap's
+    /// own default scan.
+    #[test]
+    fn levels_outside_the_presets_have_no_argv() {
+        let cfg: Config = toml::from_str("database_path = \"/x\"\ndata_dir = \"/x\"\n").unwrap();
+        for level in [0, 5, 9, 255] {
+            assert_eq!(cfg.default_level_argv(level), None, "level {level}");
+        }
     }
 
     #[test]
@@ -526,7 +676,12 @@ never_scan = ["192.168.0.0/16"]
         assert_eq!(cfg.roles, Roles::default(), "no [roles] means all on");
         assert_eq!(cfg.scan.max_workers, 2);
         assert_eq!(cfg.scan.never_scan.len(), 1);
-        assert!(cfg.default_level_argv(4).iter().any(|a| a == "-sS"));
+        assert!(
+            cfg.default_level_argv(4)
+                .unwrap()
+                .iter()
+                .any(|a| a == "-sS")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -640,5 +795,72 @@ data_dir = "/tmp"
         let c = cfg.cluster.unwrap();
         assert_eq!(c.takeover_hours, 2.0);
         assert_eq!(c.lease_secs, 120);
+    }
+
+    /// The annotated example parses and states the defaults.
+    #[test]
+    fn example_config_states_the_scan_safety_defaults() {
+        let text = std::fs::read_to_string("deploy/config.example.toml").unwrap();
+        let cfg: Config = toml::from_str(&text).unwrap();
+        let (s, d) = (&cfg.scan.safety, ScanSafety::default());
+        assert_eq!(
+            (
+                s.single_request_max_level,
+                s.full_scan_min_requests,
+                s.prefix_max_scans,
+                s.max_queued,
+                s.asn_max_per_hour,
+                s.verify_crawlers,
+                s.tor_unknown,
+                s.tor_wait_hours
+            ),
+            (
+                d.single_request_max_level,
+                d.full_scan_min_requests,
+                d.prefix_max_scans,
+                d.max_queued,
+                d.asn_max_per_hour,
+                d.verify_crawlers,
+                d.tor_unknown,
+                d.tor_wait_hours
+            )
+        );
+    }
+
+    #[test]
+    fn scan_safety_keys_parse_next_to_level_argv() {
+        let cfg = parse(&format!(
+            "{BASE}[roles]\nlistener = false\nweb = false\n[scan]\n\
+             single_request_max_level = 3\nmax_queued = 10\ntor_unknown = \"scan\"\n\
+             trusted_origins = []\nnever_scan_dir = \"/etc/peephole/never_scan.d\"\n\
+             [scan.level_argv]\n1 = [\"-sS\"]\n"
+        ))
+        .unwrap();
+        let s = &cfg.scan.safety;
+        assert_eq!(s.single_request_max_level, 3);
+        assert_eq!(s.max_queued, 10);
+        assert_eq!(s.tor_unknown, TorUnknown::Scan);
+        assert_eq!(s.trusted_origins.as_deref(), Some(&[][..]));
+        assert_eq!(cfg.scan.level_argv[&1], ["-sS"]);
+        // Defaults are the safe ones.
+        let cfg = parse(&format!("{BASE}[roles]\nlistener = false\nweb = false\n")).unwrap();
+        let s = &cfg.scan.safety;
+        assert_eq!(
+            (s.single_request_max_level, s.tor_unknown, s.verify_crawlers),
+            (2, TorUnknown::Defer, true)
+        );
+        assert!(s.trusted_origins.is_none());
+        // Out of range, bad keys and empty argv are refused.
+        for bad in [
+            "single_request_max_level = 0",
+            "single_request_max_level = 5",
+            "trusted_origins = [\"nope\"]",
+            "level_argv = { 2 = [] }",
+        ] {
+            let e = parse(&format!(
+                "{BASE}[roles]\nlistener = false\nweb = false\n[scan]\n{bad}\n"
+            ));
+            assert!(e.is_err(), "{bad} accepted");
+        }
     }
 }

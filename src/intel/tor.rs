@@ -3,7 +3,27 @@ use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+/// The bulk exit list. It holds IPv4 addresses only (it is built from the
+/// exit lists TorDNSEL measures over IPv4), so a Tor exit that reaches the
+/// trap over IPv6 is not recognised as one.
 pub const TOR_EXIT_URL: &str = "https://check.torproject.org/torbulkexitlist";
+
+/// A real exit list has well over a thousand entries; fewer than this is a
+/// truncated or bogus file, whoever it came from.
+pub const MIN_EXITS: u64 = 100;
+
+/// Addresses in an exit list, or an error when it is suspiciously small.
+pub fn sane_count(body: &[u8]) -> Result<u64> {
+    let count = String::from_utf8_lossy(body)
+        .lines()
+        .filter(|l| l.trim().parse::<IpAddr>().is_ok())
+        .count() as u64;
+    anyhow::ensure!(
+        count > MIN_EXITS,
+        "tor exit list suspiciously small ({count})"
+    );
+    Ok(count)
+}
 
 #[derive(Clone, Default)]
 pub struct TorExitList {
@@ -30,6 +50,11 @@ impl TorExitList {
         self.set.is_empty()
     }
 
+    /// Addresses in the list.
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
     pub fn contains(&self, ip: &IpAddr) -> bool {
         self.set.contains(ip)
     }
@@ -51,11 +76,7 @@ impl TorExitList {
             .text()
             .await
             .context("fetching tor exit list")?;
-        let count = body
-            .lines()
-            .filter(|l| l.trim().parse::<IpAddr>().is_ok())
-            .count() as u64;
-        anyhow::ensure!(count > 100, "tor exit list suspiciously small ({count})");
+        let count = sane_count(body.as_bytes())?;
         let tmp = data_dir.join("tor-exit.txt.tmp");
         std::fs::write(&tmp, &body)?;
         std::fs::rename(&tmp, file(data_dir))?;

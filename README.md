@@ -98,7 +98,12 @@ internet ──► nginx (TLS) ──► peephole admin listener  127.0.0.1:8443
   (configurable levels, cooldowns, and never-scan CIDRs). Scans are
   non-intrusive by design: no `-A`, no intrusive NSE scripts, timing capped
   at `-T3`. Severity escalates by *scope* (more ports, `-sV`, `-O`, then
-  discovery/safe scripts), not by speed.
+  discovery/safe scripts that neither contact third parties nor
+  broadcast), not by speed. Bystanders are spared: one request earns at
+  most a light scan (a link preview or URL scanner may have fetched the
+  trap), forward-confirmed crawlers, Tor exits and this node's own
+  addresses are never scanned, and per-network, per-ASN and queue budgets
+  stop floods. The Tor exit list covers IPv4 only.
 - **Wall of shame** (public, no login) — aggregate statistics per time range,
   a choropleth map, top attacking IPs and networks, and a searchable IP
   directory (exact / prefix / CIDR) with per-IP geo, counts and max severity.
@@ -193,7 +198,10 @@ Things to know:
 - `scan.never_scan` protects what you do not want your own scanner to
   touch. It applies only on the node that sets it; other scanners may still
   scan those addresses. Scanners never scan the addresses of cluster
-  members.
+  members (published ones, and the ones members connect from).
+- A scanner checks each job an arbiter grants against its own copy of the
+  job and runs it only when requests it holds back the level;
+  `scan.trusted_origins` limits whose requests count.
 - Every member sees everything the cluster records, including raw requests
   and false-positive claims with their optional contact address.
 - Run NTP on every node: cooldowns and the 30-day prune compare timestamps

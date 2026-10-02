@@ -95,11 +95,25 @@ async fn sqli_request_queues_level_4() {
         .await
         .unwrap();
     assert_eq!(level, 4);
-    let job_level: i64 = sqlx::query_scalar("SELECT level FROM scan_jobs LIMIT 1")
-        .fetch_one(&store.pool)
-        .await
-        .unwrap();
-    assert_eq!(job_level, 4);
+    // One request is thin evidence (a link preview could cause it): the
+    // job is capped at scan.single_request_max_level (2) ...
+    let job_level = || async {
+        sqlx::query_scalar::<_, i64>("SELECT MAX(level) FROM scan_jobs")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(job_level().await, 2);
+    // ... until the IP keeps at it.
+    for _ in 0..2 {
+        let _ = client
+            .get(format!("{base}/login?u=admin'%20OR%20'1'='1"))
+            .header("x-forwarded-for", "203.0.113.5")
+            .send()
+            .await
+            .unwrap();
+    }
+    assert_eq!(job_level().await, 4);
 }
 
 #[tokio::test]
@@ -935,6 +949,9 @@ max_workers = 1
 timeout_secs = 60
 rescan_cooldown_hours = 24
 max_scans_per_hour = 100
+# No Tor list and no DNS in tests.
+tor_unknown = "scan"
+verify_crawlers = false
 "#,
         db = dir.path().join("t.db").display(),
         d = dir.path().display()

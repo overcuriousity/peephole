@@ -9,6 +9,8 @@ pub enum EnqueueOutcome {
     Queued(i64),
     Cooldown,
     Suppressed,
+    /// Not queued: a queue budget is used up (`scan::guard`).
+    Throttled(&'static str),
 }
 
 #[derive(sqlx::FromRow)]

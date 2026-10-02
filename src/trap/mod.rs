@@ -76,6 +76,12 @@ impl RateLimiter {
 }
 
 impl TrapState {
+    /// How a counter-scan is queued: the rescan cooldown and the `[scan]`
+    /// evidence cap and queue budgets (`scan::guard`).
+    fn enqueue_policy(&self) -> crate::scan::guard::EnqueuePolicy {
+        crate::scan::guard::EnqueuePolicy::new(&self.cfg.scan.safety, self.pace.cooldown_hours())
+    }
+
     pub fn for_test(store: Store, cfg: Config) -> Self {
         let classifier =
             Classifier::from_dir(cfg.rules_dir.as_ref().expect("rules_dir")).expect("rules");
@@ -258,7 +264,7 @@ async fn record_and_respond(
         && crate::net::is_scannable_target(ip)
         && let crate::store::scans::EnqueueOutcome::Queued(job_id) = state
             .recorder
-            .enqueue_scan(ip_row.id, verdict.scan_level, state.pace.cooldown_hours())
+            .enqueue_scan_with(ip_row.id, verdict.scan_level, &state.enqueue_policy())
             .await?
         && let Ok(Some(job)) = state.store.queue_job(job_id).await
     {
@@ -451,7 +457,7 @@ async fn collect_handler(
                 let level = if tells.inhuman_fill { 3 } else { 2 };
                 if let Ok(crate::store::scans::EnqueueOutcome::Queued(job_id)) = state
                     .recorder
-                    .enqueue_scan(ip_id, level, state.pace.cooldown_hours())
+                    .enqueue_scan_with(ip_id, level, &state.enqueue_policy())
                     .await
                     && let Ok(Some(job)) = state.store.queue_job(job_id).await
                 {

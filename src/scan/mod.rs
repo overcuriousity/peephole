@@ -1,25 +1,68 @@
 pub mod arbiter;
+pub mod crawler;
+pub mod guard;
 pub mod nmap_xml;
 pub mod pace;
+mod safety;
 
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
-use crate::cluster::msg::Msg;
-use crate::config::Config;
+use crate::cluster::msg::{Grant, Msg};
+use crate::config::{Config, TorUnknown};
 use crate::store::recorder::Recorder;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// Largest nmap XML kept; beyond it nmap is killed and the job fails. A
+/// full-range scan of a busy host is well under 1 MB.
+pub const MAX_STDOUT: usize = 16 * 1024 * 1024;
+/// Start of nmap's stderr kept for the error message (the rest is drained).
+const MAX_STDERR: usize = 64 * 1024;
+
+/// A scan level as stored or granted, if it is one (1..=4). Anything else is
+/// refused rather than truncated: `5 as u8`, or 260 truncated to 4, must
+/// not pick a preset.
+pub fn valid_level(level: i64) -> Option<u8> {
+    u8::try_from(level).ok().filter(|l| (1..=4).contains(l))
+}
+
+/// nmap's own per-host limit, just under the job timeout so nmap reports
+/// what it found before the worker kills it.
+fn host_timeout_secs(timeout_secs: u64) -> u64 {
+    timeout_secs
+        .saturating_sub((timeout_secs / 20).max(15))
+        .max(30)
+}
+
 /// nmap argv (after the binary name) for a level and target (spec §5).
-pub fn nmap_argv(level: u8, target: &IpAddr, cfg: &Config) -> Vec<String> {
+/// None for a level outside 1..=4.
+pub fn nmap_argv(
+    level: u8,
+    target: &IpAddr,
+    cfg: &Config,
+    timeout_secs: u64,
+) -> Option<Vec<String>> {
     // Collapse IPv4-mapped IPv6 to IPv4 so a `::ffff:a.b.c.d` target is scanned
     // as the v4 address (and matched by v4 guards) rather than handed to nmap
     // as an IPv6 literal.
     let target = crate::net::canonical(*target);
-    let mut argv = cfg.default_level_argv(level);
+    let mut argv = cfg.default_level_argv(level)?;
+    let host_timeout = host_timeout_secs(timeout_secs);
+    if !argv.iter().any(|a| a.starts_with("--host-timeout")) {
+        argv.push("--host-timeout".into());
+        argv.push(format!("{host_timeout}s"));
+    }
+    let scripts = argv
+        .iter()
+        .any(|a| a == "--script" || a.starts_with("--script=") || a == "-sC" || a == "-A");
+    if scripts && !argv.iter().any(|a| a.starts_with("--script-timeout")) {
+        argv.push("--script-timeout".into());
+        argv.push(format!("{}s", (host_timeout / 3).clamp(30, 600)));
+    }
     // nmap treats a bare IPv6 literal as a hostname unless -6 is given, so
     // every IPv6 scan would otherwise fail with "host down".
     if target.is_ipv6() {
@@ -28,22 +71,26 @@ pub fn nmap_argv(level: u8, target: &IpAddr, cfg: &Config) -> Vec<String> {
     argv.push("-oX".into());
     argv.push("-".into());
     argv.push(target.to_string());
-    argv
+    Some(argv)
 }
 
-/// Why this scanner will not run a job.
+/// Why this scanner will not run a job (now).
 #[derive(Debug, PartialEq)]
 enum Refusal {
-    /// Nobody may scan it (non-global address, a cluster member's address).
+    /// Nobody may scan it (non-global address, a cluster member's address,
+    /// a Tor exit, a verified crawler).
     Never(String),
     /// This scanner's own `never_scan` covers it; another scanner may take it.
     Mine(String),
+    /// Not now (Tor status unknown): standalone the job waits, in a
+    /// cluster it is handed back for another scanner.
+    Defer(String),
 }
 
 impl Refusal {
     fn reason(&self) -> &str {
         match self {
-            Refusal::Never(w) | Refusal::Mine(w) => w,
+            Refusal::Never(w) | Refusal::Mine(w) | Refusal::Defer(w) => w,
         }
     }
 }
@@ -104,61 +151,56 @@ enum Outcome {
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
 /// Skip an arbiter that did not answer for this long.
 const ARBITER_BACKOFF: Duration = Duration::from_secs(30);
-/// Rebuild the member-address set this often (member list, DNS).
-const SAFETY_REFRESH: Duration = Duration::from_secs(300);
+/// Standalone: a deferred job is looked at again after this long.
+const DEFER_RETRY: Duration = Duration::from_secs(60);
+/// `scan.tor_unknown = "scan"`: how often that is warned about.
+const TOR_WARN_EVERY: Duration = Duration::from_secs(600);
 
-/// Targets no scanner touches: the addresses of all cluster members.
-struct Safety {
-    addrs: std::collections::HashSet<IpAddr>,
-    built: Option<std::time::Instant>,
-}
-
-impl Safety {
-    fn new() -> Self {
-        Self {
-            addrs: Default::default(),
-            built: None,
-        }
-    }
-
-    async fn refresh(&mut self, node: &Node) {
-        if self.built.is_some_and(|t| t.elapsed() < SAFETY_REFRESH) {
-            return;
-        }
-        let mut addrs = std::collections::HashSet::new();
-        let mut hosts: Vec<String> = node.dial_targets().into_iter().map(|t| t.2).collect();
-        if let Ok(rows) = crate::cluster::members::all(&node.store).await {
-            hosts.extend(rows.into_iter().filter_map(|m| m.address));
-        }
-        hosts.extend(node.cfg.advertise.clone());
-        for h in hosts {
-            if let Ok(Ok(it)) =
-                tokio::time::timeout(Duration::from_secs(3), tokio::net::lookup_host(h)).await
-            {
-                addrs.extend(it.map(|sa| sa.ip()));
-            }
-        }
-        self.addrs = addrs;
-        self.built = Some(std::time::Instant::now());
-    }
-
-    fn refuses(&self, ip: &IpAddr) -> Option<String> {
-        self.addrs
-            .contains(ip)
-            .then(|| "cluster member address".to_string())
-    }
-}
+/// A grant this scanner turns down: the status reported to the arbiter and
+/// why.
+type Turndown = (&'static str, Option<String>);
 
 /// Where jobs come from and where outcomes go.
 struct Source {
     rec: Recorder,
     cfg: Config,
     pace: pace::SharedPace,
-    safety: tokio::sync::Mutex<Safety>,
-    unreachable: std::sync::Mutex<std::collections::HashMap<NodeId, std::time::Instant>>,
+    safety: tokio::sync::Mutex<safety::Safety>,
+    crawlers: Option<crawler::Crawlers>,
+    tor: std::sync::Mutex<guard::TorView>,
+    origins: guard::Origins,
+    /// Standalone jobs waiting (Tor status unknown), until when.
+    deferred: std::sync::Mutex<HashMap<i64, Instant>>,
+    tor_warned: std::sync::Mutex<Option<Instant>>,
+    unreachable: std::sync::Mutex<HashMap<NodeId, Instant>>,
+}
+
+/// Hours since a `YYYY-MM-DD HH:MM:SS` (UTC) time; unparsable: infinite.
+fn hours_since(ts: &str) -> f64 {
+    chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+        .map(|t| (chrono::Utc::now().naive_utc() - t).num_seconds() as f64 / 3600.0)
+        .unwrap_or(f64::INFINITY)
 }
 
 impl Source {
+    fn new(rec: Recorder, cfg: Config, pace: pace::SharedPace) -> Self {
+        let s = &cfg.scan.safety;
+        Self {
+            safety: tokio::sync::Mutex::new(safety::Safety::new(&cfg)),
+            crawlers: s
+                .verify_crawlers
+                .then(|| crawler::Crawlers::new(&s.crawler_domains)),
+            tor: std::sync::Mutex::new(guard::TorView::new(&cfg.data_dir)),
+            origins: guard::Origins::from_config(s, rec.node_id()),
+            deferred: Default::default(),
+            tor_warned: Default::default(),
+            unreachable: Default::default(),
+            rec,
+            cfg,
+            pace,
+        }
+    }
+
     fn node(&self) -> Option<&Arc<Node>> {
         match &self.rec {
             Recorder::Cluster(n) => Some(n),
@@ -166,41 +208,139 @@ impl Source {
         }
     }
 
+    /// Everything that stops this scanner from scanning `ip` (stored as
+    /// `ip_text`, queued at `queued_at`) apart from the grant itself.
+    async fn preflight(
+        &self,
+        ip: &IpAddr,
+        ip_text: &str,
+        queued_at: &str,
+    ) -> anyhow::Result<Option<Refusal>> {
+        if let Some(r) = locally_refused(ip, &self.cfg.scan.never_scan) {
+            return Ok(Some(r));
+        }
+        {
+            let mut s = self.safety.lock().await;
+            s.refresh(&self.cfg, self.node().map(|n| &**n)).await;
+            if let Some(why) = s.refuses(ip) {
+                return Ok(Some(Refusal::Never(why)));
+            }
+            if let Some(why) = s.listed(ip) {
+                return Ok(Some(Refusal::Mine(why)));
+            }
+        }
+        let local = self.tor.lock().unwrap().local(ip);
+        match guard::tor_status(&self.rec.store().pool, local, ip_text).await? {
+            guard::TorStatus::Exit => return Ok(Some(Refusal::Never("Tor exit".into()))),
+            guard::TorStatus::NotExit => {}
+            guard::TorStatus::Unknown => {
+                let s = &self.cfg.scan.safety;
+                match s.tor_unknown {
+                    TorUnknown::Defer if hours_since(queued_at) < s.tor_wait_hours as f64 => {
+                        return Ok(Some(Refusal::Defer(
+                            "Tor exit status unknown (no exit list loaded)".into(),
+                        )));
+                    }
+                    TorUnknown::Defer => {
+                        return Ok(Some(Refusal::Never(format!(
+                            "Tor exit status still unknown after {} h (no exit list loaded)",
+                            s.tor_wait_hours
+                        ))));
+                    }
+                    TorUnknown::Scan => {
+                        let mut w = self.tor_warned.lock().unwrap();
+                        if w.is_none_or(|t| t.elapsed() > TOR_WARN_EVERY) {
+                            *w = Some(Instant::now());
+                            warn!(
+                                "scanning without a Tor exit list: Tor exits may be \
+                                 counter-scanned (scan.tor_unknown = \"scan\")"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(c) = &self.crawlers
+            && let Some(name) = c.confirmed(*ip).await
+        {
+            return Ok(Some(Refusal::Never(format!("verified crawler ({name})"))));
+        }
+        Ok(None)
+    }
+
     /// Next job to run, or None when there is nothing for us.
     async fn acquire(&self) -> anyhow::Result<Option<Job>> {
-        let Some(node) = self.node() else {
-            let Some(job) = self.rec.next_queued_job().await? else {
+        match self.node() {
+            None => self.acquire_local().await,
+            Some(node) => self.acquire_granted(node).await,
+        }
+    }
+
+    /// Standalone: our queue's next job that passes the pre-flight checks.
+    /// Refused jobs never start (they do not count against the hourly
+    /// rate); deferred ones stay queued and are looked at again later.
+    async fn acquire_local(&self) -> anyhow::Result<Option<Job>> {
+        let pool = &self.rec.store().pool;
+        let mut seen: HashSet<i64> = HashSet::new();
+        loop {
+            let skip: Vec<i64> = {
+                let mut d = self.deferred.lock().unwrap();
+                let now = Instant::now();
+                d.retain(|_, until| *until > now);
+                d.keys().copied().chain(seen.iter().copied()).collect()
+            };
+            let row: Option<(i64, Option<String>, i64, String)> = sqlx::query_as(
+                "SELECT j.id, i.ip, j.level, j.queued_at FROM scan_jobs j
+                 LEFT JOIN ips i ON i.id = j.ip_id
+                 WHERE j.status = 'queued' AND j.arbiter IS NULL
+                   AND j.id NOT IN (SELECT value FROM json_each(?))
+                 ORDER BY j.level DESC, j.queued_at ASC LIMIT 1",
+            )
+            .bind(serde_json::to_string(&skip)?)
+            .fetch_optional(pool)
+            .await?;
+            let Some((id, ip_text, level, queued_at)) = row else {
                 return Ok(None);
             };
-            // Distinguish "IP row gone" (fail the job) from a transient DB
-            // error (leave the job for a later pass instead of failing it).
-            let ip: Option<String> = sqlx::query_scalar("SELECT ip FROM ips WHERE id=?")
-                .bind(job.ip_id)
-                .fetch_optional(&self.rec.store().pool)
-                .await?;
-            let parsed = ip.as_deref().and_then(|s| s.parse::<IpAddr>().ok());
-            let Some(ip) = parsed else {
-                let _ = self
-                    .rec
-                    .finish_job(job.id, None, Some("invalid target"))
-                    .await;
-                return Box::pin(self.acquire()).await;
+            seen.insert(id);
+            let target = ip_text
+                .as_deref()
+                .and_then(|t| Some((t, t.parse::<IpAddr>().ok()?)));
+            let Some((ip_text, ip)) = target else {
+                self.rec.refuse_job(id, "invalid target").await?;
+                continue;
             };
-            // Re-check never_scan / non-global here too: the job may have been
-            // queued before an operator edited never_scan, or requeued on
-            // restart (standalone has no cluster Safety pre-flight otherwise).
-            if let Some(r) = locally_refused(&ip, &self.cfg.scan.never_scan) {
-                info!(target = %ip, why = r.reason(), "scan refused");
-                let _ = self.rec.finish_job(job.id, None, Some(r.reason())).await;
-                return Box::pin(self.acquire()).await;
+            let Some(level) = valid_level(level) else {
+                warn!(job = id, level, "scan level out of range; job refused");
+                self.rec.refuse_job(id, "invalid scan level").await?;
+                continue;
+            };
+            // Re-check here: the job may have been queued before an
+            // operator edited never_scan, or before the exit list loaded.
+            match self.preflight(&ip, ip_text, &queued_at).await? {
+                Some(Refusal::Defer(why)) => {
+                    debug!(target = %ip, %why, "scan deferred");
+                    self.deferred
+                        .lock()
+                        .unwrap()
+                        .insert(id, Instant::now() + DEFER_RETRY);
+                    continue;
+                }
+                Some(r) => {
+                    info!(target = %ip, why = r.reason(), "scan refused");
+                    self.rec.refuse_job(id, r.reason()).await?;
+                    continue;
+                }
+                None => {}
             }
-            return Ok(Some(Job::Local {
-                id: job.id,
-                ip,
-                level: job.level as u8,
-            }));
-        };
-        // Arbiters with queued work, most urgent first.
+            if self.rec.start_job(id).await? {
+                return Ok(Some(Job::Local { id, ip, level }));
+            }
+        }
+    }
+
+    /// Cluster: ask the arbiters with queued work, most urgent first.
+    async fn acquire_granted(&self, node: &Arc<Node>) -> anyhow::Result<Option<Job>> {
         let arbiters: Vec<(Vec<u8>, i64, String)> = sqlx::query_as(
             "SELECT arbiter, MAX(level) AS l, MIN(queued_at) AS q FROM scan_jobs
              WHERE status = 'queued' AND arbiter IS NOT NULL
@@ -233,62 +373,104 @@ impl Source {
                     self.unreachable
                         .lock()
                         .unwrap()
-                        .insert(arbiter, std::time::Instant::now());
+                        .insert(arbiter, Instant::now());
                     None
                 }
             };
             let Some(g) = grant else { continue };
-            let Ok(ip) = g.ip.parse::<IpAddr>() else {
-                self.report(
-                    node,
-                    arbiter,
-                    &g.job_uid,
-                    "failed",
-                    Some("invalid target".into()),
-                )
-                .await;
-                continue;
-            };
-            // Pre-flight: refused targets and duplicates never reach nmap.
-            let refused = match locally_refused(&ip, &self.cfg.scan.never_scan) {
-                some @ Some(_) => some,
-                None => {
-                    let mut s = self.safety.lock().await;
-                    s.refresh(node).await;
-                    s.refuses(&ip).map(Refusal::Never)
+            match self.check_grant(arbiter, &g).await? {
+                Ok(job) => return Ok(Some(job)),
+                Err((status, why)) => {
+                    info!(job = %g.job_uid, target = %g.ip, status, why = why.as_deref().unwrap_or(""), "scan grant turned down");
+                    self.report(node, arbiter, &g.job_uid, status, why).await;
                 }
-            };
-            match refused {
-                Some(Refusal::Never(why)) => {
-                    info!(target = %ip, %why, "scan refused");
-                    self.report(node, arbiter, &g.job_uid, "refused", Some(why))
-                        .await;
-                    continue;
-                }
-                // Our own never_scan: hand the job back for another scanner.
-                Some(Refusal::Mine(why)) => {
-                    info!(target = %ip, %why, "scan declined");
-                    self.report(node, arbiter, &g.job_uid, "declined", Some(why))
-                        .await;
-                    continue;
-                }
-                None => {}
             }
-            if self.duplicate(&g.job_uid, &g.ip, g.level).await? {
-                self.report(node, arbiter, &g.job_uid, "superseded", None)
-                    .await;
-                continue;
-            }
-            return Ok(Some(Job::Granted {
-                arbiter,
-                uid: g.job_uid,
-                ip,
-                level: g.level as u8,
-                lease: Duration::from_secs(g.lease_secs),
-                started_at: crate::store::data::now_ts(),
-            }));
         }
         Ok(None)
+    }
+
+    /// A grant is the arbiter's word only: check it against this node's own
+    /// replicated copy of the job and the evidence behind it before nmap
+    /// runs. Not yet replicated, or not backed well enough here: handed
+    /// back ("declined") for another scanner; contradicting our copy:
+    /// refused.
+    async fn check_grant(
+        &self,
+        arbiter: NodeId,
+        g: &Grant,
+    ) -> anyhow::Result<Result<Job, Turndown>> {
+        let pool = &self.rec.store().pool;
+        let Some(level) = valid_level(g.level) else {
+            return Ok(Err(("refused", Some("invalid scan level".into()))));
+        };
+        let Ok(ip) = g.ip.parse::<IpAddr>() else {
+            return Ok(Err(("failed", Some("invalid target".into()))));
+        };
+        let row: Option<(String, i64, Option<Vec<u8>>, String)> = sqlx::query_as(
+            "SELECT i.ip, j.level, j.arbiter, j.queued_at FROM scan_jobs j
+             JOIN ips i ON i.id = j.ip_id WHERE j.uid = ?",
+        )
+        .bind(&g.job_uid)
+        .fetch_optional(pool)
+        .await?;
+        let Some((ip_text, job_level, job_arbiter, queued_at)) = row else {
+            return Ok(Err((
+                "declined",
+                Some("job not replicated here yet".into()),
+            )));
+        };
+        if job_arbiter.as_deref() != Some(&arbiter.0[..]) {
+            return Ok(Err((
+                "declined",
+                Some("job arbitrated by another node here".into()),
+            )));
+        }
+        let same_ip = ip_text
+            .parse::<IpAddr>()
+            .is_ok_and(|a| crate::net::canonical(a) == crate::net::canonical(ip));
+        if !same_ip || job_level != g.level {
+            warn!(job = %g.job_uid, arbiter = %arbiter.short(), granted_ip = %g.ip, granted_level = g.level,
+                  ip = %ip_text, level = job_level, "grant contradicts the replicated job");
+            return Ok(Err((
+                "refused",
+                Some("grant does not match the job".into()),
+            )));
+        }
+        let ev = guard::evidence(pool, &ip_text, &self.origins).await?;
+        let allowed = ev.allowed_level(&self.cfg.scan.safety);
+        if allowed < level {
+            let why = if ev.max_level < level {
+                format!(
+                    "no request here asks for level {level} (highest: {})",
+                    ev.max_level
+                )
+            } else {
+                format!(
+                    "level {level} needs more evidence ({} request(s); thin evidence allows {allowed})",
+                    ev.requests
+                )
+            };
+            return Ok(Err(("declined", Some(why))));
+        }
+        match self.preflight(&ip, &ip_text, &queued_at).await? {
+            Some(Refusal::Never(why)) => return Ok(Err(("refused", Some(why)))),
+            // Our own never_scan, or not now: hand it back for another scanner.
+            Some(Refusal::Mine(why)) | Some(Refusal::Defer(why)) => {
+                return Ok(Err(("declined", Some(why))));
+            }
+            None => {}
+        }
+        if self.duplicate(&g.job_uid, &g.ip, g.level).await? {
+            return Ok(Err(("superseded", None)));
+        }
+        Ok(Ok(Job::Granted {
+            arbiter,
+            uid: g.job_uid.clone(),
+            ip,
+            level,
+            lease: Duration::from_secs(g.lease_secs),
+            started_at: crate::store::data::now_ts(),
+        }))
     }
 
     /// A scan of this IP at this level or higher is running, or finished
@@ -401,6 +583,78 @@ impl Source {
     }
 }
 
+/// Run nmap and collect its output, holding at most [`MAX_STDOUT`] bytes
+/// of XML: beyond that nmap is killed and the scan fails. stderr is drained
+/// in the background, keeping only its start.
+async fn run_nmap(nmap: PathBuf, argv: &[String]) -> Outcome {
+    use tokio::io::AsyncReadExt;
+    // kill_on_drop: when the timeout (or a lost lease) drops this future,
+    // nmap must die with it, not linger behind a freed worker slot.
+    let spawned = tokio::process::Command::new(nmap)
+        .args(argv)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        // Capture stderr so a failure says *why* ("requires root privileges",
+        // "Failed to resolve", …) instead of a bare exit code.
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => return Outcome::Failed(e.to_string()),
+    };
+    let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return Outcome::Failed("nmap pipes unavailable".into());
+    };
+    let errors = tokio::spawn(async move {
+        let mut kept = Vec::new();
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = stderr.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            let room = MAX_STDERR.saturating_sub(kept.len());
+            kept.extend_from_slice(&buf[..n.min(room)]);
+        }
+        kept
+    });
+    let mut out = Vec::new();
+    if let Err(e) = stdout
+        .take(MAX_STDOUT as u64 + 1)
+        .read_to_end(&mut out)
+        .await
+    {
+        return Outcome::Failed(format!("reading nmap output: {e}"));
+    }
+    if out.len() > MAX_STDOUT {
+        let _ = child.kill().await;
+        errors.abort();
+        return Outcome::Failed(format!(
+            "nmap output exceeds {} MiB; scan stopped",
+            MAX_STDOUT / (1024 * 1024)
+        ));
+    }
+    let status = match child.wait().await {
+        Ok(s) => s,
+        Err(e) => return Outcome::Failed(e.to_string()),
+    };
+    let stderr = errors.await.unwrap_or_default();
+    if status.success() {
+        return match nmap_xml::parse_nmap_xml(&out) {
+            Ok(res) => Outcome::Done(res),
+            Err(e) => Outcome::Failed(e.to_string()),
+        };
+    }
+    let stderr = String::from_utf8_lossy(&stderr);
+    let detail = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let detail: String = detail.chars().take(500).collect();
+    Outcome::Failed(if detail.is_empty() {
+        format!("exit {:?}", status.code())
+    } else {
+        format!("exit {:?}: {}", status.code(), detail.trim())
+    })
+}
+
 /// Run nmap for `job`; in a cluster, renew the lease meanwhile and give up
 /// if the arbiter says it is no longer ours.
 async fn run_scan(
@@ -410,32 +664,9 @@ async fn run_scan(
     nmap: PathBuf,
     timeout: Duration,
 ) -> Outcome {
-    // kill_on_drop: when the timeout (or a lost lease) drops this future,
-    // nmap must die with it, not linger behind a freed worker slot.
     let run = async {
-        let out = tokio::process::Command::new(nmap)
-            .args(&argv)
-            .kill_on_drop(true)
-            .stdout(std::process::Stdio::piped())
-            // Capture stderr so a failure says *why* ("requires root privileges",
-            // "Failed to resolve", …) instead of a bare exit code.
-            .stderr(std::process::Stdio::piped())
-            .output();
-        match tokio::time::timeout(timeout, out).await {
-            Ok(Ok(out)) if out.status.success() => match nmap_xml::parse_nmap_xml(&out.stdout) {
-                Ok(res) => Outcome::Done(res),
-                Err(e) => Outcome::Failed(e.to_string()),
-            },
-            Ok(Ok(out)) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let detail = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-                Outcome::Failed(if detail.is_empty() {
-                    format!("exit {:?}", out.status.code())
-                } else {
-                    format!("exit {:?}: {}", out.status.code(), detail.trim())
-                })
-            }
-            Ok(Err(e)) => Outcome::Failed(e.to_string()),
+        match tokio::time::timeout(timeout, run_nmap(nmap, &argv)).await {
+            Ok(o) => o,
             Err(_) => Outcome::Failed("timeout".into()),
         }
     };
@@ -496,13 +727,7 @@ pub async fn run_workers(
             Err(e) => warn!(?e, "could not requeue interrupted scans"),
         }
     }
-    let source = Arc::new(Source {
-        rec: rec.clone(),
-        cfg: cfg.clone(),
-        pace: pace.clone(),
-        safety: tokio::sync::Mutex::new(Safety::new()),
-        unreachable: Default::default(),
-    });
+    let source = Arc::new(Source::new(rec.clone(), cfg.clone(), pace.clone()));
     let mut joinset = tokio::task::JoinSet::new();
     let mut last_start: Option<tokio::time::Instant> = None;
     loop {
@@ -550,13 +775,17 @@ pub async fn run_workers(
                 notifier.publish(j);
             }
             last_start = Some(tokio::time::Instant::now());
-            let argv = nmap_argv(job.level(), &job.ip(), &cfg);
+            let argv = nmap_argv(job.level(), &job.ip(), &cfg, p.timeout_secs);
             let source2 = source.clone();
             let notifier2 = notifier.clone();
             let nmap = nmap_path.clone();
             let timeout = Duration::from_secs(p.timeout_secs);
             joinset.spawn(async move {
-                let outcome = run_scan(&source2, &job, argv, nmap, timeout).await;
+                let outcome = match argv {
+                    Some(argv) => run_scan(&source2, &job, argv, nmap, timeout).await,
+                    // Unreachable: acquire only hands out levels 1..=4.
+                    None => Outcome::Failed("invalid scan level".into()),
+                };
                 if let Outcome::Done(_) = &outcome {
                     info!(target = %job.ip(), level = job.level(), "scan done");
                 }
@@ -582,7 +811,13 @@ mod tests {
     use std::io::Write;
     use std::net::IpAddr;
 
+    /// Scanner config for tests: no Tor list and no DNS here, so neither
+    /// check holds jobs back unless a test turns it on (`extra_scan`).
     fn test_config(dir: &std::path::Path) -> Config {
+        config_with(dir, "tor_unknown = \"scan\"\nverify_crawlers = false\n")
+    }
+
+    fn config_with(dir: &std::path::Path, scan: &str) -> Config {
         let toml = format!(
             r#"
 trap_listen = "0.0.0.0:8080"
@@ -597,6 +832,8 @@ rp_name = "x"
 [maxmind]
 account_id = "1"
 license_key = "k"
+[scan]
+{scan}
 "#,
             db = dir.join("t.db").display(),
             dir = dir.display()
@@ -611,7 +848,7 @@ license_key = "k"
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(dir.path());
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
-        let argv = nmap_argv(2, &ip, &cfg);
+        let argv = nmap_argv(2, &ip, &cfg, 1800).unwrap();
         assert_eq!(argv.last().unwrap(), "203.0.113.9");
         assert!(argv.windows(2).any(|w| w == ["-oX", "-"]));
         assert!(argv.contains(&"-sV".to_string()));
@@ -622,14 +859,66 @@ license_key = "k"
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(dir.path());
         let v6: IpAddr = "2001:db8::5".parse().unwrap();
-        let argv = nmap_argv(2, &v6, &cfg);
+        let argv = nmap_argv(2, &v6, &cfg, 1800).unwrap();
         assert!(argv.contains(&"-6".to_string()), "{argv:?}");
         assert_eq!(argv.last().unwrap(), "2001:db8::5");
         // IPv4-mapped IPv6 is scanned as the v4 address, with no -6.
         let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
-        let argv = nmap_argv(2, &mapped, &cfg);
+        let argv = nmap_argv(2, &mapped, &cfg, 1800).unwrap();
         assert!(!argv.contains(&"-6".to_string()), "{argv:?}");
         assert_eq!(argv.last().unwrap(), "203.0.113.9");
+    }
+
+    /// nmap gives up on the host just before the worker would kill it, and
+    /// scripts get their own limit.
+    #[test]
+    fn argv_carries_nmap_timeouts_under_the_job_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let after = |argv: &[String], flag: &str| {
+            argv.iter()
+                .position(|a| a == flag)
+                .map(|i| argv[i + 1].clone())
+        };
+        let argv = nmap_argv(4, &ip, &cfg, 1800).unwrap();
+        assert_eq!(after(&argv, "--host-timeout").as_deref(), Some("1710s"));
+        assert_eq!(after(&argv, "--script-timeout").as_deref(), Some("570s"));
+        let argv = nmap_argv(1, &ip, &cfg, 60).unwrap();
+        assert_eq!(after(&argv, "--host-timeout").as_deref(), Some("45s"));
+        assert_eq!(
+            after(&argv, "--script-timeout"),
+            None,
+            "no scripts at level 1"
+        );
+        // An operator's own --host-timeout is kept.
+        let cfg = config_with(
+            dir.path(),
+            "[scan.level_argv]\n2 = [\"-sT\", \"--host-timeout\", \"5m\"]\n",
+        );
+        let argv = nmap_argv(2, &ip, &cfg, 1800).unwrap();
+        assert_eq!(argv.iter().filter(|a| *a == "--host-timeout").count(), 1);
+    }
+
+    /// Levels are 1..=4: nothing else gets an argv, nothing is truncated.
+    #[test]
+    fn levels_outside_1_to_4_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        for l in [0u8, 5, 255] {
+            assert!(nmap_argv(l, &ip, &cfg, 1800).is_none(), "level {l}");
+        }
+        for (l, ok) in [
+            (0, None),
+            (1, Some(1)),
+            (4, Some(4)),
+            (5, None),
+            (260, None),
+            (-1, None),
+        ] {
+            assert_eq!(valid_level(l), ok, "level {l}");
+        }
     }
 
     #[test]
@@ -920,5 +1209,346 @@ license_key = "k"
         assert_eq!(ports, 3);
         let mut f = std::fs::File::create("/dev/null").unwrap();
         f.write_all(b"").unwrap(); // keeps Write import used
+    }
+
+    async fn status_of(store: &Store, ip: &str) -> (String, Option<String>, Option<String>) {
+        sqlx::query_as(
+            "SELECT j.status, j.started_at, j.error FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
+             WHERE i.ip = ?",
+        )
+        .bind(ip)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+    }
+
+    /// Regression: each refused job recursed once (Box::pin) and kept its
+    /// start time, so a run of refusals could exhaust the stack and used
+    /// up the hourly rate without a single nmap run.
+    #[tokio::test]
+    async fn refused_jobs_never_start_and_do_not_use_the_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_with(
+            dir.path(),
+            "tor_unknown = \"scan\"\nverify_crawlers = false\nnever_scan = [\"198.51.0.0/16\"]\n",
+        );
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        for i in 0..300 {
+            let ip = store
+                .upsert_ip(
+                    format!("198.51.{}.{}", i / 200, i % 200 + 1)
+                        .parse()
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            store.enqueue_scan(ip.id, 3, 24).await.unwrap();
+        }
+        let ok = store
+            .upsert_ip("203.0.113.50".parse().unwrap())
+            .await
+            .unwrap();
+        store.enqueue_scan(ok.id, 1, 24).await.unwrap();
+        let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
+        let source = Source::new(store.local(), cfg, p);
+        let job = source.acquire().await.unwrap().expect("the valid job");
+        assert_eq!(job.ip().to_string(), "203.0.113.50");
+        let (status, started, error) = status_of(&store, "198.51.0.1").await;
+        assert_eq!(status, "refused");
+        assert!(started.is_none());
+        assert!(error.unwrap().contains("never_scan"));
+        assert_eq!(store.local().jobs_started_last_hour().await.unwrap(), 1);
+        assert!(source.acquire().await.unwrap().is_none());
+    }
+
+    fn write_tor_list(dir: &std::path::Path, extra: &str) {
+        let mut list: String = (1..=150).map(|i| format!("198.18.0.{i}\n")).collect();
+        list.push_str(extra);
+        std::fs::write(dir.join("tor-exit.txt"), list).unwrap();
+    }
+
+    /// Without an exit list a job waits (default `tor_unknown = "defer"`);
+    /// once a list is there it runs, unless the IP is an exit; and after
+    /// `tor_wait_hours` without a list it is refused.
+    #[tokio::test]
+    async fn unknown_tor_status_defers_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_with(dir.path(), "verify_crawlers = false\n");
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let p = || pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
+        let a = store
+            .upsert_ip("203.0.113.60".parse().unwrap())
+            .await
+            .unwrap();
+        store.enqueue_scan(a.id, 2, 24).await.unwrap();
+        let source = Source::new(store.local(), cfg.clone(), p());
+        assert!(source.acquire().await.unwrap().is_none(), "deferred");
+        assert_eq!(status_of(&store, "203.0.113.60").await.0, "queued");
+        assert!(source.acquire().await.unwrap().is_none(), "still waiting");
+        // The list loads (a fresh scanner, so the retry delay is not waited out).
+        write_tor_list(dir.path(), "203.0.113.61\n");
+        let source = Source::new(store.local(), cfg.clone(), p());
+        let job = source
+            .acquire()
+            .await
+            .unwrap()
+            .expect("runs once the list is there");
+        assert_eq!(job.ip().to_string(), "203.0.113.60");
+        // A listed exit is refused.
+        let b = store
+            .upsert_ip("203.0.113.61".parse().unwrap())
+            .await
+            .unwrap();
+        store.enqueue_scan(b.id, 2, 24).await.unwrap();
+        assert!(source.acquire().await.unwrap().is_none());
+        let (status, _, error) = status_of(&store, "203.0.113.61").await;
+        assert_eq!(
+            (status.as_str(), error.as_deref()),
+            ("refused", Some("Tor exit"))
+        );
+        // No list, and the job has waited long enough: refused.
+        std::fs::remove_file(dir.path().join("tor-exit.txt")).unwrap();
+        let c = store
+            .upsert_ip("203.0.113.62".parse().unwrap())
+            .await
+            .unwrap();
+        store.enqueue_scan(c.id, 2, 24).await.unwrap();
+        sqlx::query("UPDATE scan_jobs SET queued_at = datetime('now', '-7 hours') WHERE ip_id = ?")
+            .bind(c.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let source = Source::new(store.local(), cfg.clone(), p());
+        assert!(source.acquire().await.unwrap().is_none());
+        let (status, _, error) = status_of(&store, "203.0.113.62").await;
+        assert_eq!(status, "refused");
+        assert!(error.unwrap().contains("still unknown"));
+    }
+
+    /// nmap output is bounded: past the cap nmap is killed and the job
+    /// fails instead of the worker buffering without limit.
+    #[tokio::test]
+    async fn oversized_nmap_output_fails_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("chatty-nmap");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nhead -c {} /dev/zero\nhead -c 200000 /dev/zero >&2\n",
+                MAX_STDOUT + 4096
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+        match run_nmap(fake, &[]).await {
+            Outcome::Failed(e) => assert!(e.contains("exceeds"), "{e}"),
+            _ => panic!("oversized output accepted"),
+        }
+        // A loud stderr alone is drained, not fatal.
+        let fake = dir.path().join("noisy-nmap");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nhead -c 2000000 /dev/zero >&2\necho 'oops' >&2\nexit 3\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+        match run_nmap(fake, &[]).await {
+            Outcome::Failed(e) => assert!(e.starts_with("exit Some(3)"), "{e}"),
+            _ => panic!("failed nmap accepted"),
+        }
+    }
+
+    /// A single-node cluster whose scanner checks grants of its own jobs.
+    async fn cluster_source(dir: &std::path::Path, scan: &str) -> (Arc<Node>, Source, Store) {
+        let store = Store::connect(&dir.join("t.db")).await.unwrap();
+        let node = Node::open(crate::cluster::NodeParams {
+            identity: crate::cluster::identity::Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store: store.clone(),
+            proto: (2, 2),
+            data_dir: dir.to_path_buf(),
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        let cfg = config_with(
+            dir,
+            &format!("tor_unknown = \"scan\"\nverify_crawlers = false\n{scan}"),
+        );
+        let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
+        let source = Source::new(Recorder::Cluster(node.clone()), cfg, p);
+        (node, source, store)
+    }
+
+    fn request(ip_id: i64, level: i64, label: &str) -> crate::store::requests::NewRequest {
+        crate::store::requests::NewRequest {
+            ip_id,
+            method: "GET".into(),
+            path: "/x".into(),
+            query: None,
+            headers_json: "[]".into(),
+            body: None,
+            labels_json: format!("[\"{label}\"]"),
+            severity: level,
+            scan_level: level,
+            is_fp_claim: false,
+            page_token: None,
+        }
+    }
+
+    async fn job_uid(store: &Store, ip_id: i64) -> String {
+        sqlx::query_scalar("SELECT uid FROM scan_jobs WHERE ip_id = ? ORDER BY id DESC LIMIT 1")
+            .bind(ip_id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+    }
+
+    fn grant(uid: &str, ip: &str, level: i64) -> Grant {
+        Grant {
+            job_uid: uid.into(),
+            ip: ip.into(),
+            level,
+            lease_secs: 60,
+        }
+    }
+
+    /// A grant is checked against the scanner's own copy of the job and
+    /// against the evidence for its level.
+    #[tokio::test]
+    async fn grants_are_checked_against_the_replicated_job_and_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, source, store) = cluster_source(dir.path(), "").await;
+        let me = node.id();
+        let rec = Recorder::Cluster(node.clone());
+        let ip = store
+            .upsert_ip("203.0.113.70".parse().unwrap())
+            .await
+            .unwrap();
+        rec.enqueue_scan(ip.id, 3, 24).await.unwrap();
+        let uid = job_uid(&store, ip.id).await;
+        let turned = |r: Result<Job, Turndown>| r.err().map(|(s, _)| s);
+        // No request asks for any scan of this IP: handed back.
+        let r = source
+            .check_grant(me, &grant(&uid, &ip.ip, 3))
+            .await
+            .unwrap();
+        assert_eq!(turned(r), Some("declined"));
+        // One request at level 3: thin evidence allows level 2 only.
+        rec.insert_request(&request(ip.id, 3, "sqli"))
+            .await
+            .unwrap();
+        let r = source
+            .check_grant(me, &grant(&uid, &ip.ip, 3))
+            .await
+            .unwrap();
+        assert_eq!(turned(r), Some("declined"));
+        // A second request with another label: enough.
+        rec.insert_request(&request(ip.id, 1, "probe"))
+            .await
+            .unwrap();
+        let r = source
+            .check_grant(me, &grant(&uid, &ip.ip, 3))
+            .await
+            .unwrap();
+        assert!(r.is_ok(), "backed grant runs");
+        // Grants that contradict the job, or are not levels.
+        for (g, want) in [
+            (grant(&uid, &ip.ip, 4), "refused"),
+            (grant(&uid, "203.0.113.71", 3), "refused"),
+            (grant(&uid, &ip.ip, 9), "refused"),
+            (grant(&uid, &ip.ip, 259), "refused"),
+            (grant(&uid, "not-an-ip", 3), "failed"),
+            (grant("unknown-job", &ip.ip, 3), "declined"),
+        ] {
+            let r = source.check_grant(me, &g).await.unwrap();
+            assert_eq!(turned(r), Some(want), "{g:?}");
+        }
+        // Granted by a node that does not arbitrate the job here.
+        let other = crate::cluster::identity::Identity::generate().unwrap().id;
+        let r = source
+            .check_grant(other, &grant(&uid, &ip.ip, 3))
+            .await
+            .unwrap();
+        assert_eq!(turned(r), Some("declined"));
+    }
+
+    /// An outbound-only member has no published address; the address it
+    /// connects from is protected all the same.
+    #[tokio::test]
+    async fn addresses_members_connect_from_are_never_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, source, store) = cluster_source(dir.path(), "").await;
+        let rec = Recorder::Cluster(node.clone());
+        let ip = store
+            .upsert_ip("203.0.113.99".parse().unwrap())
+            .await
+            .unwrap();
+        for label in ["a", "b", "c"] {
+            rec.insert_request(&request(ip.id, 2, label)).await.unwrap();
+        }
+        rec.enqueue_scan(ip.id, 2, 24).await.unwrap();
+        let uid = job_uid(&store, ip.id).await;
+        let member = crate::cluster::identity::Identity::generate().unwrap().id;
+        node.status
+            .note_peer_ip(member, "203.0.113.99".parse().unwrap());
+        let r = source
+            .check_grant(node.id(), &grant(&uid, &ip.ip, 2))
+            .await
+            .unwrap();
+        let (status, why) = r.err().unwrap();
+        assert_eq!(status, "refused");
+        assert!(why.unwrap().contains("cluster member address"));
+    }
+
+    /// `trusted_origins = []`: only requests this node recorded back a scan.
+    #[tokio::test]
+    async fn trusted_origins_limit_whose_requests_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, source, store) = cluster_source(dir.path(), "trusted_origins = []\n").await;
+        let me = node.id();
+        let rec = Recorder::Cluster(node.clone());
+        let ip = store
+            .upsert_ip("203.0.113.72".parse().unwrap())
+            .await
+            .unwrap();
+        for label in ["a", "b", "c"] {
+            rec.insert_request(&request(ip.id, 2, label)).await.unwrap();
+        }
+        rec.enqueue_scan(ip.id, 2, 24).await.unwrap();
+        let uid = job_uid(&store, ip.id).await;
+        assert!(
+            source
+                .check_grant(me, &grant(&uid, &ip.ip, 2))
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        // The same requests, as if another node had recorded them.
+        let other = crate::cluster::identity::Identity::generate().unwrap().id;
+        sqlx::query("UPDATE requests SET origin = ?")
+            .bind(&other.0[..])
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let r = source
+            .check_grant(me, &grant(&uid, &ip.ip, 2))
+            .await
+            .unwrap();
+        assert_eq!(r.err().map(|(s, _)| s), Some("declined"));
     }
 }

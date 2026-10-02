@@ -97,9 +97,40 @@ pub struct Status {
     pub contacts: Mutex<HashMap<NodeId, Contact>>,
     pub heartbeats: Mutex<HashMap<NodeId, Known>>,
     last_at: Mutex<u64>,
+    /// Source addresses members connected from (newest last), so the
+    /// scanners never scan them, outbound-only members included.
+    peer_ips: Mutex<HashMap<NodeId, Vec<std::net::IpAddr>>>,
 }
 
+/// Connection addresses remembered per member.
+const PEER_IPS_KEPT: usize = 8;
+
 impl Status {
+    /// A member's authenticated connection came from `ip`.
+    pub fn note_peer_ip(&self, peer: NodeId, ip: std::net::IpAddr) {
+        let ip = crate::net::canonical(ip);
+        let mut all = self.peer_ips.lock().unwrap();
+        let ips = all.entry(peer).or_default();
+        if ips.last() == Some(&ip) {
+            return;
+        }
+        ips.retain(|i| *i != ip);
+        ips.push(ip);
+        if ips.len() > PEER_IPS_KEPT {
+            ips.remove(0);
+        }
+    }
+
+    /// Every address a member has connected from since this node started.
+    pub fn peer_ips(&self) -> Vec<(NodeId, std::net::IpAddr)> {
+        self.peer_ips
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(id, ips)| ips.iter().map(|ip| (*id, *ip)))
+            .collect()
+    }
+
     pub fn touch_inbound(&self, peer: NodeId) {
         self.contacts
             .lock()
@@ -273,6 +304,21 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_ips_are_remembered_canonical_and_bounded() {
+        let s = Status::default();
+        let a = crate::cluster::identity::Identity::generate().unwrap().id;
+        s.note_peer_ip(a, "::ffff:203.0.113.1".parse().unwrap());
+        s.note_peer_ip(a, "203.0.113.1".parse().unwrap());
+        assert_eq!(s.peer_ips(), [(a, "203.0.113.1".parse().unwrap())]);
+        for i in 0..20 {
+            s.note_peer_ip(a, format!("198.51.100.{i}").parse().unwrap());
+        }
+        let ips = s.peer_ips();
+        assert_eq!(ips.len(), PEER_IPS_KEPT);
+        assert!(ips.contains(&(a, "198.51.100.19".parse().unwrap())));
+    }
 
     #[test]
     fn heartbeat_signature_binds_the_node() {
