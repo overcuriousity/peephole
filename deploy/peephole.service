@@ -3,12 +3,23 @@ Description=peephole — scan-the-scanners honeypot
 After=network-online.target
 Wants=network-online.target
 
+# Local changes (limits, sandboxing, environment) belong in a drop-in:
+# systemctl edit peephole. The installer never touches drop-ins; an edited
+# copy of this file is kept on upgrade and the new one is placed beside it as
+# peephole.service.new.
+
 [Service]
-Type=simple
+# peephole tells systemd once its listeners are bound (sd_notify READY=1),
+# so "systemctl start" fails if it cannot start.
+Type=notify
 User=root
 ExecStart=/usr/local/bin/peephole /etc/peephole/config.toml
 Restart=on-failure
 RestartSec=5
+# A start may migrate the database or bring a node's history into a cluster.
+TimeoutStartSec=5min
+# A scanner flood opens many connections at once; the default 1024 runs out.
+LimitNOFILE=65536
 # Runs as root by design (nmap -sS/-O). nmap is spawned with fixed argv, no shell.
 NoNewPrivileges=false
 

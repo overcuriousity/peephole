@@ -8,6 +8,7 @@ pub mod fingerprint;
 pub mod intel;
 pub mod net;
 pub mod scan;
+pub mod sd_notify;
 pub mod settings;
 pub mod settings_cli;
 pub mod store;
@@ -222,6 +223,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let mut running = Running3::default();
     roles.reconcile(&mut running, true).await?;
     info!(roles = %settings.roles().names().join(","), "peephole up");
+    // Listeners are bound: `systemctl start` (Type=notify) returns now.
+    sd_notify::ready();
     let supervisor = tokio::spawn(roles.supervise(running, shutdown_rx.clone()));
     shutdown_signal().await;
     info!("shutting down");
