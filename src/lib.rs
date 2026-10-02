@@ -71,33 +71,19 @@ pub async fn check_config(
         } else {
             "\nremote config: off"
         });
-        if cfg.scan.retention_days > 0 {
-            summary.push_str(
-                "\nnote: scan.retention_days is ignored in a cluster (the shared dataset is persistent; cluster.retention_days opts in for this node's own records)",
-            );
-        }
-        if let Some(d) = cfg
-            .cluster
-            .as_ref()
-            .map(|c| c.retention_days)
-            .filter(|d| *d > 0)
-        {
-            summary.push_str(&format!(
-                "\ncluster retention: this node deletes its own records older than {d} days, cluster-wide"
-            ));
-        }
+    }
+    if cfg.retention_days > 0 {
+        summary.push_str(&format!(
+            "\nretention: this node keeps the last {} days of records and history \
+             (other nodes keep theirs)",
+            cfg.retention_days
+        ));
     }
     for n in notes {
         summary.push('\n');
         summary.push_str(&n);
     }
     Ok((cfg, classifier, summary))
-}
-
-/// Whether old records are deleted by age. Only on a standalone node: a
-/// cluster's dataset is persistent, and nothing in it is erased by age.
-pub fn retention_applies(cfg: &config::Config) -> bool {
-    cfg.cluster.is_none() && cfg.scan.retention_days > 0
 }
 
 /// Whether this node loads the GeoLite2 databases in its data dir. A cluster
@@ -172,12 +158,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         shutdown_rx.clone(),
     ));
 
-    // Retention (standalone only): prune requests and scan results older
-    // than the configured window so the database does not grow without bound.
-    if retention_applies(&cfg) {
+    // Retention on a standalone node: delete records older than the window.
+    // A cluster node lowers its history floor instead (`cluster::history`).
+    if cfg.cluster.is_none() && cfg.retention_days > 0 {
         tokio::spawn(run_retention(
             recorder.clone(),
-            cfg.scan.retention_days,
+            cfg.retention_days,
             shutdown_rx.clone(),
         ));
     }
@@ -687,15 +673,6 @@ mod tests {
             "database_path = \"/x\"\ndata_dir = \"/x\"\n[roles]\nlistener = false\nweb = false\n{extra}"
         ))
         .unwrap()
-    }
-
-    #[test]
-    fn retention_only_applies_to_standalone_nodes() {
-        assert!(retention_applies(&cfg("")));
-        assert!(!retention_applies(&cfg("[scan]\nretention_days = 0\n")));
-        assert!(!retention_applies(&cfg(
-            "[cluster]\nnode_name = \"n\"\nlisten = \"127.0.0.1:7443\"\n"
-        )));
     }
 
     #[test]

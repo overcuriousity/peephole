@@ -89,7 +89,6 @@ async fn offline(
         lease_secs: 120,
         remote_config: false,
         origin_quota_mb: 20 * 1024,
-        retention_days: 0,
         peers: peers
             .iter()
             .enumerate()
@@ -655,66 +654,4 @@ async fn member_descriptions_are_cleaned_on_apply() {
     assert_eq!(m.name, format!("node-{}", n.id.short()));
     assert_eq!(m.address, None);
     assert_eq!(m.roles, vec!["scanner".to_string()]);
-}
-
-/// Opt-in retention deletes this node's own old records, cluster-wide,
-/// and nothing of other nodes; compaction drops redundant proofs.
-#[tokio::test]
-async fn retention_deletes_only_own_old_records() {
-    use peephole::store::recorder::Recorder;
-    let mut a = Origin::new();
-    let (x, _d) = offline(&[&a], |c| c.retention_days = 30).await;
-    apply(&x, vec![a.now(request(&a, "theirs"))]).await;
-    let ip = x
-        .store
-        .upsert_ip("203.0.113.21".parse().unwrap())
-        .await
-        .unwrap();
-    let rec = Recorder::Cluster(x.clone());
-    rec.insert_request(&peephole::store::requests::NewRequest {
-        ip_id: ip.id,
-        method: "GET".into(),
-        path: "/mine".into(),
-        query: None,
-        headers_json: "[]".into(),
-        body: None,
-        labels_json: "[]".into(),
-        severity: 1,
-        scan_level: 0,
-        is_fp_claim: false,
-        page_token: None,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    sqlx::query("UPDATE requests SET ts = datetime('now', '-40 days')")
-        .execute(&x.store.pool)
-        .await
-        .unwrap();
-    let n = peephole::cluster::retention::run(&x, 30).await.unwrap();
-    assert_eq!(n, 1);
-    let left: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
-        .fetch_all(&x.store.pool)
-        .await
-        .unwrap();
-    assert_eq!(left, vec!["/theirs".to_string()]);
-    assert_eq!(
-        count(&x, "SELECT COUNT(*) FROM repl_log WHERE kind = 'tombstone'").await,
-        1,
-        "deleted cluster-wide with a tombstone"
-    );
-
-    // A proof held for a tombstone that is in the log is redundant.
-    let tomb: (String, Vec<u8>) =
-        sqlx::query_as("SELECT uid, origin FROM repl_log WHERE kind = 'tombstone'")
-            .fetch_one(&x.store.pool)
-            .await
-            .unwrap();
-    sqlx::query("INSERT INTO tomb_proofs (origin, tomb_uid, entry) VALUES (?, ?, x'00')")
-        .bind(&tomb.1)
-        .bind(&tomb.0)
-        .execute(&x.store.pool)
-        .await
-        .unwrap();
-    assert_eq!(repl::compact(&x).await.unwrap(), 1);
 }

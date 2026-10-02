@@ -1384,7 +1384,6 @@ license_key = "k"
                 remote_config: false,
                 peers: vec![],
                 origin_quota_mb: 20 * 1024,
-                retention_days: 0,
             },
             roles: Default::default(),
             store: store.clone(),

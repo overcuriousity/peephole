@@ -590,7 +590,6 @@ mod tests {
                 lease_secs: 120,
                 remote_config: false,
                 origin_quota_mb: 20 * 1024,
-                retention_days: 0,
                 peers: vec![],
             },
             roles: Default::default(),

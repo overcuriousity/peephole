@@ -11,7 +11,6 @@ pub mod members;
 pub mod msg;
 pub mod record;
 pub mod repl;
-pub mod retention;
 pub mod rpc;
 pub mod status;
 pub mod sync;
@@ -763,8 +762,7 @@ pub async fn start(
 }
 
 /// Housekeeping: retry deferred entries whose time has come (every
-/// minute), expire parked entries of unknown nodes and compact (hourly),
-/// and run the opt-in retention of this node's own records (daily).
+/// minute), expire parked entries of unknown nodes and compact (hourly).
 async fn maintenance_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut tick: u64 = 0;
     loop {
@@ -782,13 +780,6 @@ async fn maintenance_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Rec
             }
             if let Err(e) = repl::compact(&node).await {
                 warn!(?e, "log compaction failed");
-            }
-        }
-        if node.cfg.retention_days > 0 && tick % (24 * 60) == 5 {
-            match retention::run(&node, node.cfg.retention_days).await {
-                Ok(n) if n > 0 => info!(records = n, "retention: deleted this node's old records"),
-                Ok(_) => {}
-                Err(e) => warn!(?e, "retention failed"),
             }
         }
     }
