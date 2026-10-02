@@ -2,7 +2,7 @@
 {% block title %}peephole — export{% endblock %}
 {% block content %}
 {% let sub = "export" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Export</h1><p class="muted">Every request, and every request the flood gate answered without recording it in full, with all peephole knows about it and its IP: headers, body, raw request head, TLS ClientHello and JA4, how it was answered, every enrichment lookup, counter-scans and browser fingerprints. Uncapped; filters are optional. Claim e-mails are never exported.</p></div></div>
+<div class="page-head"><div><h1>Export</h1><p class="muted">Every request, and every request the flood gate answered without recording it in full, with all peephole knows about it and its IP: headers, body, raw request head, TLS ClientHello and JA4, how it was answered, every enrichment lookup, counter-scans and browser fingerprints. Uncapped; filters are optional. Claim e-mails are never exported. The same export from the shell: <code>peephole export</code>. Column by column: <a href="https://github.com/overcuriousity/peephole/blob/master/docs/dataset.md">docs/dataset.md</a>.</p></div></div>
 <form class="filters card" method="get" action="/admin/export/download">
   <label>Format <select name="format"><option value="parquet">Parquet (typed)</option><option value="csv">CSV (Timesketch)</option><option value="jsonl">Timesketch JSONL</option></select></label>
   <label>Content <select name="mode"><option value="full">Everything</option><option value="redistributable">Redistributable: without GeoIP and API results</option></select></label>

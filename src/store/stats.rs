@@ -631,6 +631,8 @@ pub struct StatsCache {
     ips: SwrCache<String, IpsPage>,
     /// Per-IP overview, keyed by the IP's row id.
     ip: SwrCache<i64, super::browse::IpOverview>,
+    /// `/api/blocklist` bodies, keyed by their canonical parameters.
+    blocklist: SwrCache<String, String>,
 }
 
 impl Default for StatsCache {
@@ -640,6 +642,7 @@ impl Default for StatsCache {
             map: SwrCache::new(Range::ALL.len()),
             ips: SwrCache::new(IPS_CACHE_MAX),
             ip: SwrCache::new(IP_CACHE_MAX),
+            blocklist: SwrCache::new(crate::admin::blocklist::CACHE_MAX),
         }
     }
 }
@@ -700,6 +703,14 @@ impl StatsCache {
             Err(e) if e.is::<Gone>() => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// A blocklist body, recomputed by `compute` after `ttl`.
+    pub async fn blocklist<F>(&self, key: String, ttl: Duration, compute: F) -> Result<Arc<String>>
+    where
+        F: Fn() -> BoxFut<String>,
+    {
+        self.blocklist.get(key, ttl, compute).await
     }
 
     #[cfg(test)]

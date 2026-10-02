@@ -47,6 +47,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/api/stats", get(stats_json))
         .route("/api/map", get(map_json))
         .route("/api/countries", get(countries_json))
+        .route("/api/blocklist", get(crate::admin::blocklist::feed))
         .route("/healthz", get(healthz))
 }
 

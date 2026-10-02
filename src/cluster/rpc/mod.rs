@@ -37,6 +37,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/rpc/v1/msg", post(message))
         .route("/rpc/v1/inbox", post(inbox))
         .route("/rpc/v1/intel", post(intel_chunk))
+        .route("/rpc/v1/lookup", post(lookup))
         .route_layer(axum::middleware::from_fn_with_state(
             node.clone(),
             require_member,
@@ -151,6 +152,15 @@ async fn intel_chunk(
         Ok(Err(e)) => internal(e),
         Err(e) => internal(e.into()),
     }
+}
+
+/// On-demand enrichment for a member, within its daily budget here.
+async fn lookup(
+    State(node): State<Arc<Node>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Cbor(req): Cbor<crate::intel::lookup::LookupReq>,
+) -> Response {
+    Cbor(crate::intel::lookup::serve(&node, peer, &req).await).into_response()
 }
 
 /// Long-poll for messages waiting for the caller.

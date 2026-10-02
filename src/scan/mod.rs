@@ -3,7 +3,7 @@ pub mod crawler;
 pub mod guard;
 pub mod nmap_xml;
 pub mod pace;
-mod safety;
+pub mod safety;
 
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;

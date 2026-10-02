@@ -2,6 +2,7 @@ pub mod abuseipdb;
 pub mod api;
 pub mod geo;
 pub mod greynoise;
+pub mod lookup;
 pub mod provider;
 pub mod share;
 pub mod shodan;

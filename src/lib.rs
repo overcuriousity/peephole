@@ -152,6 +152,9 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
 
     // Results for IPs this or other nodes recorded without them.
     let providers = intel::providers(&cfg, &store, &geo, &tor);
+    if let Some(n) = &node {
+        n.set_lookup_providers(providers.clone());
+    }
     tokio::spawn(intel::enrich_loop(
         recorder.clone(),
         providers.clone(),

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod blocklist;
 pub mod browse;
 pub mod cli;
 pub mod data;

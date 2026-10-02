@@ -46,6 +46,24 @@ nmap.
   fingerprints) as typed Parquet, CSV or Timesketch JSONL, optionally
   without the results whose terms forbid passing them on. Every row says
   which node recorded it, by name and key, and which build it ran.
+- **Dataset** — the whole thing as typed Parquet (or CSV / Timesketch JSON
+  Lines): every request with headers, body, raw head, ClientHello and JA4,
+  rule labels and severity, every enrichment lookup, counter-scan and
+  fingerprint, plus which node and build recorded it. `peephole export`
+  streams it from any node, a web node offers it under Admin → Export, and
+  a "redistributable" mode strips the results whose terms forbid passing
+  them on. Column by column in [docs/dataset.md](docs/dataset.md): built
+  for machine learning on real scanner traffic.
+- **Blocklist feed** (public) — `GET /api/blocklist` lists the addresses
+  that sent requests of severity 3 or more in the last 24 hours (parameters
+  `hours`, `min_severity`, `networks=1` to collapse busy /24s), one per
+  line, for nginx `deny`, nftables, ipset, fail2ban or CrowdSec. In a
+  cluster it is drawn from every member's trap, so one node's catch
+  protects everybody's real sites. Tor exits, verified crawlers, cluster
+  members and the node's own networks are never listed.
+- **Lookup** (admin) — ask every provider the cluster can reach about one
+  address, now: this node's databases and keys first, then a member that
+  announces the missing provider. Shown once, never stored.
 - **Cluster** — several operators can share one dataset over mutual TLS:
   requests, the scan queue, results and lookups. Each node runs any mix of
   trap, scanner and web roles and decides for itself whom it trusts. A node
@@ -53,6 +71,15 @@ nmap.
   whole history. See [docs/cluster.md](docs/cluster.md).
 - **Self-contained** — one binary with SQLite; fonts, scripts and the map are
   built in, light and dark themes, no external requests from the web pages.
+
+## Running a node
+
+Each node earns its keep for its operator: the blocklist feed built from
+every member's trap for their own real sites, the whole dataset for their
+own analysis or research, pooled enrichment (one member's MaxMind, AbuseIPDB
+or Shodan key enriches everyone's view), and on-demand lookups of any
+address through the cluster's providers. The trap itself also keeps scanner
+noise out of the real sites' logs.
 
 ## Install
 

@@ -1,5 +1,5 @@
 <nav class="seg subnav" aria-label="Admin sections">
-  {% for (key, href, label) in [("home", "/admin", "Overview"), ("queue", "/admin/queue", "Queue"), ("scans", "/admin/scans", "Scans"), ("fingerprints", "/admin/fingerprints", "Fingerprints"), ("inbox", "/admin/inbox", "Inbox"), ("export", "/admin/export", "Export"), ("keys", "/admin/keys", "Keys"), ("cluster", "/admin/cluster", "Cluster")] %}
+  {% for (key, href, label) in [("home", "/admin", "Overview"), ("queue", "/admin/queue", "Queue"), ("scans", "/admin/scans", "Scans"), ("fingerprints", "/admin/fingerprints", "Fingerprints"), ("inbox", "/admin/inbox", "Inbox"), ("lookup", "/admin/lookup", "Lookup"), ("export", "/admin/export", "Export"), ("keys", "/admin/keys", "Keys"), ("cluster", "/admin/cluster", "Cluster")] %}
   <a href="{{ href }}"{% if *key == sub %} aria-current="page"{% endif %}>{{ label }}</a>
   {% endfor %}
 </nav>

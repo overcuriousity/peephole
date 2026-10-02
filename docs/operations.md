@@ -170,6 +170,7 @@ peephole --help                                   # commands and arguments
 peephole check-config /etc/peephole/config.toml   # validate config, rules and nmap
 peephole settings show|set|reset                  # runtime settings (pace, cooldown, roles)
 peephole admin reset-token                        # new one-time admin setup token
+peephole export -o data.parquet                   # the dataset (--format, --from, --redistributable, --help)
 peephole db vacuum                                # shrink the database file (stop the service first)
 ```
 
@@ -186,6 +187,27 @@ restart without an enrolled key prints a new one once it has expired, and
 lost, or every key is. Further keys are enrolled from **Admin → Keys**. Admin
 sessions last at most 12 hours and end after an hour without use, on logout,
 on the next sign-in, or when the key they signed in with is deleted.
+
+**Dataset.** `peephole export` writes every request with everything known
+about it and its IP as Parquet (default), CSV or Timesketch JSON Lines, to
+`-o FILE` or stdout; `--from`, `--to`, `--ip`, `--label` and
+`--min-severity` narrow it, `--redistributable` leaves out the GeoIP and
+API results whose terms forbid passing them on. It reads the database the
+running service writes, so it needs no stop. The web interface has the same
+export under **Admin → Export**. Columns, weights and the two modes:
+[docs/dataset.md](dataset.md).
+
+**Blocklist feed.** A web node serves `GET /api/blocklist` on its public
+pages: one address (or prefix) per line, requests of severity 3+ in the
+last 24 hours by default, with `?hours=`, `?min_severity=` and
+`?networks=1`. Recomputed at most once a minute. Exclusions: Tor exits,
+addresses a scanner refused as a verified crawler, cluster members'
+addresses, this node's own addresses and `scan.never_scan`. For nginx:
+
+```sh
+curl -fsS https://<your-domain>/api/blocklist | grep -v '^#' | sed 's/.*/deny &;/' > /etc/nginx/blocklist.conf \
+  && nginx -t && systemctl reload nginx
+```
 
 **Database.** It maintains itself: expired sessions are removed, query
 statistics refreshed and freed pages handed back to the file system daily.

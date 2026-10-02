@@ -1,10 +1,12 @@
 pub mod assets;
 pub mod auth;
+pub mod blocklist;
 pub mod cli;
 pub mod cluster;
 pub mod countries;
 pub mod error;
 pub mod limit;
+pub mod lookup;
 pub mod pages;
 pub mod public;
 pub mod sse;
@@ -32,6 +34,8 @@ pub struct AdminState {
     pub limits: limit::Limits,
     /// This node's enrichment providers (their budgets on the cluster page).
     pub providers: crate::intel::Providers,
+    /// Addresses the blocklist feed must leave out (members, own networks).
+    pub safety: tokio::sync::Mutex<crate::scan::safety::Safety>,
 }
 
 impl AdminState {
@@ -45,6 +49,7 @@ impl AdminState {
             recorder: store.local(),
             settings: crate::settings::Settings::with_pace(store.clone(), &cfg, pace.clone()),
             limits: limit::Limits::new(&cfg),
+            safety: tokio::sync::Mutex::new(crate::scan::safety::Safety::new(&cfg)),
             store,
             cfg,
             notifier,
@@ -101,6 +106,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(assets::router())
         .merge(auth::auth_routes())
         .merge(pages::routes())
+        .merge(lookup::routes())
         .merge(cluster::routes())
         .fallback(error::not_found)
         .layer(axum::middleware::from_fn_with_state(
