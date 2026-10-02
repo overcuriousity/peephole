@@ -44,11 +44,13 @@ nmap.
   false-positive inbox, deletion, and the dataset export: every request with
   everything known about it and its IP (enrichment history, scans,
   fingerprints) as typed Parquet, CSV or Timesketch JSONL, optionally
-  without the results whose terms forbid passing them on.
+  without the results whose terms forbid passing them on. Every row says
+  which node recorded it, by name and key, and which build it ran.
 - **Cluster** — several operators can share one dataset over mutual TLS:
   requests, the scan queue, results and lookups. Each node runs any mix of
-  trap, scanner and web roles and decides for itself whom it trusts. See
-  [docs/cluster.md](docs/cluster.md).
+  trap, scanner and web roles and decides for itself whom it trusts. A node
+  may keep only the last N days (`retention_days`) while others keep the
+  whole history. See [docs/cluster.md](docs/cluster.md).
 - **Self-contained** — one binary with SQLite; fonts, scripts and the map are
   built in, light and dark themes, no external requests from the web pages.
 

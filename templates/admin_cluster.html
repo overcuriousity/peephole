@@ -15,6 +15,7 @@
 {% when Some(me) %}
 <div class="stack">
 {% if let Some(d) = detached %}<div class="banner banner-warning">{{ d }}</div>{% endif %}
+{% if let Some(u) = unserved %}<div class="banner banner-warning">History incomplete: waiting for a full member. The members reachable now keep only part of the history of {{ u }}.</div>{% endif %}
 <section class="card">
   <div class="card-head"><h2>This node · {{ me.name }}</h2><span class="muted mono">{{ me.short }}</span>
     {% if detached.is_none() %}<button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-leave">Leave cluster</button>
@@ -25,6 +26,7 @@
     <dt>Roles</dt><dd>{{ me.roles }}</dd>
     <dt>Address</dt><dd class="mono">{{ me.address }}</dd>
     <dt>Version</dt><dd class="mono">{{ me.version }}</dd>
+    <dt>History</dt><dd>{{ me.history }}</dd>
   </dl>
   {% include "_node_settings.html" %}
   {% if remote_config %}
@@ -48,7 +50,7 @@
 <section class="card">
   <div class="card-head"><h2>Members</h2></div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Node</th><th>Roles</th><th>Address</th><th>Seen</th><th>Version</th><th>Replication</th><th>Scans</th><th>Settings</th><th></th></tr></thead>
+    <thead><tr><th>Node</th><th>Roles</th><th>Address</th><th>Seen</th><th>Version</th><th>History</th><th>Replication</th><th>Scans</th><th>Settings</th><th></th></tr></thead>
     <tbody>
     {% for m in members %}
       <tr{% if !m.active %} class="muted"{% endif %}>
@@ -60,6 +62,7 @@
         <td class="mono">{{ m.address }}</td>
         <td><span class="badge badge-status" data-status="{% if m.live %}done{% else %}queued{% endif %}">{{ m.last_seen }}</span></td>
         <td class="mono">{{ m.version }}</td>
+        <td>{{ m.history }}</td>
         <td>{{ m.lag }}</td>
         <td>{% if m.scanner %}{{ m.active_scans }} running{% endif %}</td>
         <td>{% if m.key_held %}<a class="btn btn-sm" href="/admin/cluster/node/{{ m.key }}">Configure</a>{% else if m.remote_config %}<span class="muted">open for config key holders</span>{% else %}<span class="muted">locked</span>{% endif %}</td>

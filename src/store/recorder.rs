@@ -136,6 +136,7 @@ impl Recorder {
     pub async fn insert_request_from(&self, ip: &str, n: &NewRequest) -> Result<(i64, i64)> {
         let uid = self.uid();
         self.write(vec![Record::Request(RequestRec {
+            build: crate::COMMIT.into(),
             uid: uid.clone(),
             ts: now_ts(),
             ip: ip.to_string(),
@@ -176,6 +177,7 @@ impl Recorder {
     ) -> Result<()> {
         self.write(vec![Record::SkipBatch(
             crate::cluster::record::SkipBatchRec {
+                build: crate::COMMIT.into(),
                 uid: self.uid(),
                 ip: ip.to_string(),
                 dropped,
@@ -225,6 +227,7 @@ impl Recorder {
         data: serde_json::Value,
     ) -> Result<()> {
         self.write(vec![Record::IpIntel(IpIntelRec {
+            build: crate::COMMIT.into(),
             ip: ip.to_string(),
             provider: provider.to_string(),
             fetched_at: now_ts(),
@@ -309,6 +312,7 @@ impl Recorder {
             .await?
             .context("claim for an unknown request")?;
         self.write(vec![Record::FpClaim(FpClaimRec {
+            build: crate::COMMIT.into(),
             uid: self.uid(),
             request_uid,
             ip: self.ip_of(ip_id).await?,
@@ -336,6 +340,7 @@ impl Recorder {
         };
         let uid = self.uid();
         self.write(vec![Record::Fingerprint(FingerprintRec {
+            build: crate::COMMIT.into(),
             uid: uid.clone(),
             request_uid,
             ip: self.ip_of(ip_id).await?,
@@ -681,6 +686,7 @@ impl Recorder {
         let mut records = vec![];
         if let Some(res) = result {
             records.push(Record::ScanResult(ScanResultRec {
+                build: crate::COMMIT.into(),
                 uid: self.uid(),
                 job_uid: uid.clone(),
                 ip,
@@ -730,6 +736,7 @@ impl Recorder {
         res: &ScanResult,
     ) -> Result<()> {
         self.write(vec![Record::ScanResult(ScanResultRec {
+            build: crate::COMMIT.into(),
             uid: self.uid(),
             job_uid: job_uid.to_string(),
             ip: ip.to_string(),
@@ -1091,12 +1098,6 @@ impl Recorder {
         }
         self.bury(job_uids).await?;
         Ok((reqs, scans))
-    }
-
-    /// Delete records this node originated, cluster-wide (opt-in cluster
-    /// retention, see `cluster::retention`). Other nodes' uids are skipped.
-    pub async fn delete_own(&self, uids: Vec<String>) -> Result<()> {
-        self.bury(uids).await
     }
 }
 

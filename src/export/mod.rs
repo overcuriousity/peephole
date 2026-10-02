@@ -54,6 +54,10 @@ pub struct ExportRow {
     pub kind: &'static str,
     pub uid: String,
     pub node: String,
+    /// The creating node's key (empty on a standalone node, which has none).
+    pub node_id: String,
+    /// Source commit of the binary that created the row.
+    pub build: String,
     pub ts_ms: i64,
     pub ip: String,
     pub method: String,
@@ -105,6 +109,8 @@ pub const COLUMNS: &[&str] = &[
     "kind",
     "uid",
     "node",
+    "node_id",
+    "build",
     "ts",
     "ip",
     "method",
@@ -256,6 +262,8 @@ impl ExportRow {
             "kind": self.kind,
             "uid": self.uid,
             "node": self.node,
+            "node_id": self.node_id,
+            "build": self.build,
             "ts": rfc3339(self.ts_ms),
             "ip": self.ip,
             "method": self.method,
@@ -379,6 +387,13 @@ fn node_name(names: &HashMap<Vec<u8>, String>, origin: &[u8]) -> String {
     }
 }
 
+/// The full key of the node that created a row ("" when standalone).
+fn node_id(origin: &[u8]) -> String {
+    crate::cluster::identity::NodeId::from_slice(origin)
+        .map(|id| id.to_string())
+        .unwrap_or_default()
+}
+
 /// Context-dependent columns of an IP, shared by its rows on a page.
 struct IpCols {
     intel: Arc<str>,
@@ -416,6 +431,8 @@ fn ip_cols(ip: &str, ip_id: i64, ctx: &PageContext, opts: &ExportOptions) -> IpC
                 "fetched_at": iso8601(&i.fetched_at),
                 "source_version": i.source_version,
                 "node": node_name(&opts.names, &i.origin),
+                "node_id": node_id(&i.origin),
+                "build": i.build,
                 "data": data(i),
             })
         })
@@ -464,6 +481,8 @@ fn scan_json(s: &ScanOut, ports: &[crate::store::export::PortOut], opts: &Export
         "started_at": iso8601(&s.started_at),
         "finished_at": s.finished_at.as_deref().map(iso8601),
         "node": node_name(&opts.names, s.origin.as_deref().unwrap_or_default()),
+        "node_id": node_id(s.origin.as_deref().unwrap_or_default()),
+        "build": s.build,
         "scanner": s.scanner.as_deref().map(|id| node_name(&opts.names, id)),
         "os_guess": s.os_guess,
         "ports": ports,
@@ -474,7 +493,7 @@ fn scan_json(s: &ScanOut, ports: &[crate::store::export::PortOut], opts: &Export
 /// Largest decompressed fingerprint event log exported.
 const MAX_EVENTS: u64 = 16 * 1024 * 1024;
 
-fn fingerprint_json(f: &FpOut) -> Value {
+fn fingerprint_json(f: &FpOut, opts: &ExportOptions) -> Value {
     let parse = |s: &Option<String>| {
         s.as_deref()
             .map(|s| serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.into())))
@@ -489,6 +508,9 @@ fn fingerprint_json(f: &FpOut) -> Value {
     });
     json!({
         "ts": iso8601(&f.ts),
+        "node": node_name(&opts.names, f.origin.as_deref().unwrap_or_default()),
+        "node_id": node_id(f.origin.as_deref().unwrap_or_default()),
+        "build": f.build,
         "fp_hash": f.fp_hash,
         "visitor_id": f.visitor_id,
         "attributes": parse(&f.attributes_json),
@@ -548,12 +570,18 @@ fn request_row(
         .uid
         .as_ref()
         .and_then(|u| ctx.fingerprints.get(u))
-        .map(|v| v.iter().map(fingerprint_json).collect::<Vec<_>>())
+        .map(|v| {
+            v.iter()
+                .map(|f| fingerprint_json(f, opts))
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let mut row = ExportRow {
         kind: "request",
         uid: r.uid.unwrap_or_else(|| r.id.to_string()),
         node: node_name(&opts.names, r.origin.as_deref().unwrap_or_default()),
+        node_id: node_id(r.origin.as_deref().unwrap_or_default()),
+        build: r.build,
         ts_ms: millis(&r.ts),
         ip: r.ip,
         method: r.method,
@@ -593,6 +621,8 @@ fn skipped_row(s: SkipOut, ctx: &PageContext, cols: &IpCols, opts: &ExportOption
         kind: "skipped",
         uid: format!("{}#{}", s.uid, s.rowid),
         node: node_name(&opts.names, s.origin.as_deref().unwrap_or_default()),
+        node_id: node_id(s.origin.as_deref().unwrap_or_default()),
+        build: s.build,
         ts_ms: s.ts_ms,
         ip: s.ip,
         method: s.method,

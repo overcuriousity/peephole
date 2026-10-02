@@ -590,13 +590,13 @@ mod tests {
                 lease_secs: 120,
                 remote_config: false,
                 origin_quota_mb: 20 * 1024,
-                retention_days: 0,
                 peers: vec![],
             },
             roles: Default::default(),
             store: store.clone(),
             proto: (2, 2),
             data_dir: dir.path().to_path_buf(),
+            retention_days: 0,
         })
         .await
         .unwrap();

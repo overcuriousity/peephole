@@ -62,12 +62,18 @@ be listed under `[[cluster.peers]]` with their key.
   recorded removes it on every node. Deleting something another node
   recorded hides it on your node only.
 - **The dataset is persistent.** What a node contributed stays when it
-  leaves or is pruned. `scan.retention_days` applies to standalone nodes
-  only; a cluster node's database grows with the cluster. To bound it
-  cooperatively, a node can opt in to `cluster.retention_days`: it then
-  deletes its *own* requests and scan results older than that, on every
-  node. The log itself is never compacted: a node joining later fetches it
-  in full from any member.
+  leaves or is pruned. By default every node keeps the whole history.
+- **A node may keep only a window.** With `retention_days = N` (top level,
+  at least 7) a node keeps the last N days, like a pruned Bitcoin node: daily
+  it drops older records *and* their log entries on this node only (no
+  deletes reach other nodes), keeps the newest entry of every member and all
+  membership entries, and serves only what it holds. Its heartbeat tells the
+  others where its history starts ("keeps N days" on the Cluster page), so
+  nobody asks it for more. A node joining with a window fetches only that
+  window, from any member; a node keeping everything fetches the old history
+  from members that keep everything, and waits ("History incomplete: waiting
+  for a full member") while none is reachable. Switching a window off later
+  does not bring the dropped history back.
 
 ## Changing another node's settings
 

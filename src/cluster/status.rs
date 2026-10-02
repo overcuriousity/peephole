@@ -50,6 +50,13 @@ pub struct Heartbeat {
     /// Highest sequence in the node's own log (replication lag).
     #[serde(default)]
     pub own_seq: u64,
+    /// Days of history the node keeps; 0: all of it.
+    #[serde(default)]
+    pub retention_days: u32,
+    /// Where the node's history of an origin starts, when not at 1. It
+    /// serves nothing below.
+    #[serde(default)]
+    pub floors: Vec<(NodeId, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +256,18 @@ impl Node {
             active_scans: local.active_scans,
             providers: self.providers(),
             own_seq: self.own_head.load(std::sync::atomic::Ordering::Relaxed),
+            retention_days: self.retention_days,
+            floors: {
+                let mut f: Vec<_> = self
+                    .own_floors
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|(o, s)| (*o, *s))
+                    .collect();
+                f.sort();
+                f
+            },
         };
         let Ok(body) = super::rpc::cbor::encode(&hb) else {
             return;
@@ -333,6 +352,8 @@ mod tests {
             active_scans: 0,
             providers: vec![],
             own_seq: 0,
+            retention_days: 0,
+            floors: vec![],
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = a.sign(&SignedHeartbeat::signing(&body));

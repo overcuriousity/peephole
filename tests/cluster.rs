@@ -86,6 +86,8 @@ struct Opts {
     workers: usize,
     /// Let config key holders change this node's settings.
     remote_config: bool,
+    /// Days of history kept (0: all).
+    retention_days: u32,
 }
 
 const DEFAULT: Opts = Opts {
@@ -97,6 +99,7 @@ const DEFAULT: Opts = Opts {
     scanner: None,
     workers: 1,
     remote_config: false,
+    retention_days: 0,
 };
 
 async fn boot(identity: Identity, me: &Addr, peers: &[&Addr], o: Opts) -> TestNode {
@@ -122,7 +125,6 @@ async fn boot_in(
         lease_secs: o.lease_secs,
         remote_config: o.remote_config,
         origin_quota_mb: 20 * 1024,
-        retention_days: 0,
         peers: peers
             .iter()
             .map(|p| PeerConfig {
@@ -147,6 +149,7 @@ async fn boot_in(
             cluster::rpc::proto::PROTO_VERSION,
         )),
         data_dir: dir.path().to_path_buf(),
+        retention_days: o.retention_days,
     })
     .await
     .unwrap();
@@ -681,7 +684,6 @@ async fn a_node_offline_for_over_30_days_starts_detached() {
                 lease_secs: 120,
                 remote_config: false,
                 origin_quota_mb: 20 * 1024,
-                retention_days: 0,
                 peers: vec![PeerConfig {
                     name: "a".into(),
                     address: a.address(),
@@ -692,6 +694,7 @@ async fn a_node_offline_for_over_30_days_starts_detached() {
             store,
             proto: (2, 2),
             data_dir: dir.path().to_path_buf(),
+            retention_days: 0,
         })
         .await
         .unwrap()
@@ -896,7 +899,6 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
             lease_secs: 120,
             remote_config: false,
             origin_quota_mb: 20 * 1024,
-            retention_days: 0,
             peers: vec![PeerConfig {
                 name: "a".into(),
                 address: "127.0.0.1:1".into(),
@@ -907,6 +909,7 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
         store,
         proto: (1, 1),
         data_dir: dir.path().to_path_buf(),
+        retention_days: 0,
     })
     .await
     .unwrap();
@@ -1113,7 +1116,6 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
             lease_secs: 120,
             remote_config: false,
             origin_quota_mb: 20 * 1024,
-            retention_days: 0,
             peers: peers
                 .iter()
                 .map(|p| PeerConfig {
@@ -1127,6 +1129,7 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
         store,
         proto: (1, 1),
         data_dir: dir.path().to_path_buf(),
+        retention_days: 0,
     })
     .await
     .unwrap();
@@ -1135,7 +1138,7 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
 }
 
 async fn batch_of(n: &Node, origin: NodeId) -> peephole::cluster::sync::Batch {
-    repl::entries_after(&n.store, &[(origin, 0)], 10_000, usize::MAX)
+    repl::entries_after(&n.store, &[(origin, 0)], 0, 10_000, usize::MAX)
         .await
         .unwrap()
 }
@@ -1210,6 +1213,8 @@ async fn erased_stubs_need_the_origins_tombstone() {
     // A relay strips /two and claims A's tombstone erased it.
     let (x, _dx) = offline_node(&[&a, &b]).await;
     let mut forged = Batch {
+        bounds: vec![],
+        floors: vec![],
         entries: before.entries.clone(),
         proofs: after.proofs.clone(),
     };
@@ -1238,6 +1243,8 @@ async fn erased_stubs_need_the_origins_tombstone() {
     // names /one's own position in A's log, so it does not cover this one.
     let (w, _dw) = offline_node(&[&a, &b]).await;
     let mut relabel = Batch {
+        bounds: vec![],
+        floors: vec![],
         entries: after.entries.clone(),
         proofs: after.proofs.clone(),
     };
@@ -1256,11 +1263,15 @@ async fn erased_stubs_need_the_origins_tombstone() {
 
     // No proof, a proof from another origin, a stub without a uid: rejected.
     let stub_only = Batch {
+        bounds: vec![],
+        floors: vec![],
         entries: after.entries.clone(),
         proofs: vec![],
     };
     let other = Identity::generate().unwrap();
     let wrong_origin = Batch {
+        bounds: vec![],
+        floors: vec![],
         entries: after.entries.clone(),
         proofs: vec![
             WireEntry::sign(
@@ -1277,6 +1288,8 @@ async fn erased_stubs_need_the_origins_tombstone() {
         ],
     };
     let mut no_uid = Batch {
+        bounds: vec![],
+        floors: vec![],
         entries: after.entries.clone(),
         proofs: after.proofs.clone(),
     };
@@ -3037,6 +3050,9 @@ async fn enrichment_results_are_exported_with_provenance() {
     let row: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
     assert_eq!(row["ip"], "203.0.113.91");
     assert_eq!(row["node"], "node-bravo");
+    // Full provenance: the creating node's key and the build it ran.
+    assert_eq!(row["node_id"], b.id.to_string());
+    assert_eq!(row["build"], peephole::COMMIT);
     let geo = row["intel"]
         .as_array()
         .unwrap()
@@ -3045,6 +3061,8 @@ async fn enrichment_results_are_exported_with_provenance() {
         .unwrap();
     assert_eq!(geo["source_version"], "2026-09-30");
     assert_eq!(geo["node"], "node-bravo");
+    assert_eq!(geo["node_id"], b.id.to_string());
+    assert_eq!(geo["build"], peephole::COMMIT);
     assert_eq!(geo["data"]["country"], "NL");
     assert!(
         !body.contains("198.51.100.7"),
@@ -3061,4 +3079,251 @@ async fn enrichment_results_are_exported_with_provenance() {
         .await
         .unwrap();
     assert_eq!(r.status(), 303);
+}
+
+/// A node outside the test cluster, signing entries by hand (admitted by a
+/// member, never dialled: it has no address).
+struct Writer {
+    id: Identity,
+    seq: u64,
+}
+
+impl Writer {
+    fn new() -> Self {
+        Self {
+            id: Identity::generate().unwrap(),
+            seq: 0,
+        }
+    }
+
+    fn at(&mut self, days_ago: u64, r: Record) -> WireEntry {
+        self.seq += 1;
+        WireEntry::sign(&self.id, self.seq, hlc_days_ago(days_ago, self.seq), &r).unwrap()
+    }
+
+    fn info(&self, name: &str) -> peephole::cluster::record::MemberInfo {
+        peephole::cluster::record::MemberInfo {
+            id: self.id.id,
+            name: name.into(),
+            address: None,
+            roles: vec![],
+            proto_min: cluster::rpc::proto::PROTO_MIN,
+            proto_max: cluster::rpc::proto::PROTO_VERSION,
+            remote_config: false,
+        }
+    }
+
+    fn request(&self, path: &str) -> Record {
+        Record::Request(peephole::cluster::record::RequestRec {
+            uid: format!(
+                "{}{}",
+                self.id.id.uid_prefix(),
+                path.trim_start_matches('/')
+            ),
+            ts: "2026-09-01 00:00:00".into(),
+            ip: "203.0.113.66".into(),
+            method: "GET".into(),
+            path: path.into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            severity: 1,
+            ..Default::default()
+        })
+    }
+
+    /// A description, two records far outside a week and one inside.
+    fn history(&mut self) -> Vec<WireEntry> {
+        vec![
+            self.at(40, Record::MemberUpdate(self.info("writer"))),
+            self.at(40, self.request("/old1")),
+            self.at(30, self.request("/old2")),
+            self.at(0, self.request("/new1")),
+        ]
+    }
+}
+
+/// `o`'s sequences held by `n`.
+async fn seqs_of(n: &Node, o: NodeId) -> Vec<i64> {
+    sqlx::query_scalar("SELECT seq FROM repl_log WHERE origin = ? ORDER BY seq")
+        .bind(&o.0[..])
+        .fetch_all(&n.store.pool)
+        .await
+        .unwrap()
+}
+
+/// Sync rounds all of `nodes` run over a few quiet seconds. A loop that
+/// re-syncs without pause runs hundreds, even on a slow machine.
+async fn quiet_rounds(nodes: &[&Node]) -> u64 {
+    let total = || {
+        nodes
+            .iter()
+            .map(|n| n.sync_rounds.load(std::sync::atomic::Ordering::Relaxed))
+            .sum::<u64>()
+    };
+    let before = total();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    total() - before
+}
+
+/// One node keeps a week: old history leaves it and only it, new records
+/// keep reaching it, a node joining later with the full history gets it
+/// from the full members, one joining with a window gets only its window,
+/// and nobody re-syncs without pause.
+#[tokio::test]
+async fn a_history_floor_is_local() {
+    let (ia, a) = new_node("full-a");
+    let (ib, b) = new_node("full-b");
+    let (ip, p) = new_node("window-p");
+    let week = Opts {
+        retention_days: 7,
+        ..DEFAULT
+    };
+    let na = boot(ia, &a, &[&b, &p], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &p], DEFAULT).await;
+    let np = boot(ip, &p, &[&a, &b], week.clone()).await;
+    let mut o = Writer::new();
+    repl::append(&na, &[Record::MemberAdd(o.info("writer"))])
+        .await
+        .unwrap();
+    let st = repl::apply_batch(&na, o.history()).await.unwrap();
+    assert_eq!(st.applied, 4, "{st:?}");
+    eventually("b has o's history", || async {
+        seqs_of(&nb, o.id.id).await.len() == 4
+    })
+    .await;
+    // p asks only for its window (and the membership before it).
+    eventually("p has o's window", || async {
+        seqs_of(&np, o.id.id).await == [1, 4]
+    })
+    .await;
+    assert_eq!(cluster::history::prune(&np).await.unwrap(), 0);
+    assert_eq!(paths(&np).await, ["/new1"]);
+    assert_eq!(paths(&nb).await, ["/new1", "/old1", "/old2"]);
+    // New records keep coming.
+    let late = o.at(0, o.request("/new2"));
+    repl::apply_batch(&na, vec![late]).await.unwrap();
+    eventually("p gets new records", || async {
+        paths(&np).await == ["/new1", "/new2"]
+    })
+    .await;
+    // The others learn where p's history starts.
+    np.reload_floors().await.unwrap();
+    np.publish_status();
+    eventually("a knows p's floor", || async {
+        na.peer_floor(&p.id, &o.id.id) == 4
+    })
+    .await;
+
+    // A node keeping everything joins through p: the history comes from
+    // the full members.
+    let (i_f, f) = new_node("full-f");
+    let nf = boot(i_f, &f, &[], DEFAULT).await;
+    invite::join(
+        &nf,
+        &invite::create(&np, &Default::default()).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    eventually("f backfills everything", || async {
+        seqs_of(&nf, o.id.id).await == [1, 2, 3, 4, 5]
+    })
+    .await;
+    // A node keeping a week joins: only its window, and the membership.
+    let (iw, w) = new_node("window-w");
+    let nw = boot(iw, &w, &[], week).await;
+    invite::join(
+        &nw,
+        &invite::create(&na, &Default::default()).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    eventually("w gets its window", || async {
+        paths(&nw).await == ["/new1", "/new2"]
+    })
+    .await;
+    assert_eq!(seqs_of(&nw, o.id.id).await, [1, 4, 5]);
+    assert!(
+        members::all(&nw.store)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == o.id.id && m.name == "writer")
+    );
+
+    let rounds = quiet_rounds(&[&na, &nb, &np, &nf, &nw]).await;
+    assert!(rounds <= 30, "{rounds} sync rounds in 3 s");
+
+    // The admin page says who keeps what.
+    let (admin, base) = admin_on(&na).await;
+    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    for want in ["keeps 7 days", "full history"] {
+        assert!(page.contains(want), "cluster page lacks {want}");
+    }
+}
+
+/// A node keeping everything whose only reachable peer keeps a window, and
+/// a node that purged an origin its peer still has: neither re-syncs
+/// without pause, and the first says it waits for a full member.
+#[tokio::test]
+async fn unservable_history_does_not_make_peers_spin() {
+    let (ia, a) = new_node("full-a");
+    let (ip, p) = new_node("window-p");
+    let na = boot(ia, &a, &[&p], DEFAULT).await;
+    let np = boot(
+        ip,
+        &p,
+        &[&a],
+        Opts {
+            retention_days: 7,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let mut o = Writer::new();
+    repl::append(&na, &[Record::MemberAdd(o.info("writer"))])
+        .await
+        .unwrap();
+    repl::apply_batch(&na, o.history()).await.unwrap();
+    eventually("p has o's window", || async {
+        seqs_of(&np, o.id.id).await == [1, 4]
+    })
+    .await;
+    np.reload_floors().await.unwrap();
+    np.publish_status();
+
+    // a purges o while p still has it, and gets ahead: p's next entry of o.
+    peephole::cluster::block::block(&na, o.id.id).await.unwrap();
+    peephole::cluster::block::purge(&na, o.id.id).await.unwrap();
+    repl::apply_batch(&np, vec![o.at(0, o.request("/new2"))])
+        .await
+        .unwrap();
+    let rounds = quiet_rounds(&[&na, &np]).await;
+    assert!(
+        rounds <= 15,
+        "{rounds} sync rounds in 3 s with a purged origin"
+    );
+
+    // A full node joins while only p is up.
+    drop(na);
+    let (i_f, f) = new_node("full-f");
+    let nf = boot(i_f, &f, &[], DEFAULT).await;
+    invite::join(
+        &nf,
+        &invite::create(&np, &Default::default()).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    eventually("f knows p's floor", || async {
+        nf.peer_floor(&p.id, &o.id.id) == 4
+    })
+    .await;
+    let rounds = quiet_rounds(&[&nf, &np]).await;
+    assert!(rounds <= 15, "{rounds} sync rounds in 3 s next to a window");
+    assert!(seqs_of(&nf, o.id.id).await.is_empty() || seqs_of(&nf, o.id.id).await == [1]);
+    let (admin, base) = admin_on(&nf).await;
+    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    assert!(
+        page.contains("waiting for a full member"),
+        "cluster page lacks the warning"
+    );
 }

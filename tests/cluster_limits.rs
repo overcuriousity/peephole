@@ -89,7 +89,6 @@ async fn offline(
         lease_secs: 120,
         remote_config: false,
         origin_quota_mb: 20 * 1024,
-        retention_days: 0,
         peers: peers
             .iter()
             .enumerate()
@@ -108,6 +107,7 @@ async fn offline(
         store,
         proto: (2, 2),
         data_dir: dir.path().to_path_buf(),
+        retention_days: 0,
     })
     .await
     .unwrap();
@@ -272,15 +272,15 @@ async fn job_takeovers_are_judged_locally() {
     apply(&x, vec![by_b.clone()]).await;
     apply(&x, vec![by_c.clone()]).await;
     // Y gets the same history in the other order.
-    let a_log = repl::entries_after(&x.store, &[(a.key(), 0)], 100, usize::MAX)
+    let a_log = repl::entries_after(&x.store, &[(a.key(), 0)], 0, 100, usize::MAX)
         .await
         .unwrap();
     apply(&y, a_log.entries).await;
-    let c_log = repl::entries_after(&x.store, &[(c.key(), 0)], 100, usize::MAX)
+    let c_log = repl::entries_after(&x.store, &[(c.key(), 0)], 0, 100, usize::MAX)
         .await
         .unwrap();
     apply(&y, c_log.entries).await;
-    let b_log = repl::entries_after(&x.store, &[(b.key(), 0)], 100, usize::MAX)
+    let b_log = repl::entries_after(&x.store, &[(b.key(), 0)], 0, 100, usize::MAX)
         .await
         .unwrap();
     apply(&y, b_log.entries).await;
@@ -418,7 +418,7 @@ async fn parking_for_unknown_nodes_is_bounded_and_expires() {
     let cap = repl::PARK_UNTRUSTED_ENTRIES as usize;
     assert_eq!((st.parked, st.rejected), (cap, 150 - cap), "{st:?}");
     assert!(repl::refused_origins(&x).await.unwrap().contains(&u.key()));
-    let relayed = repl::entries_after(&x.store, &[(u.key(), 0)], 10_000, usize::MAX)
+    let relayed = repl::entries_after(&x.store, &[(u.key(), 0)], 0, 10_000, usize::MAX)
         .await
         .unwrap();
     assert_eq!(relayed.entries.len(), cap);
@@ -468,7 +468,7 @@ async fn quota_and_purge() {
     let st = apply(&x, vec![a.now(request(&a, "r3"))]).await;
     assert_eq!(st.rejected, 1);
     assert!(
-        repl::entries_after(&x.store, &[(a.key(), 0)], 100, usize::MAX)
+        repl::entries_after(&x.store, &[(a.key(), 0)], 0, 100, usize::MAX)
             .await
             .unwrap()
             .entries
@@ -567,6 +567,7 @@ async fn future_dated_entries_are_ordered_by_their_receipt() {
             a.at(
                 far,
                 Record::IpIntel(IpIntelRec {
+                    build: String::new(),
                     ip: "203.0.113.20".into(),
                     provider: "tor-exits".into(),
                     fetched_at: "2026-10-01 00:00:00".into(),
@@ -655,66 +656,4 @@ async fn member_descriptions_are_cleaned_on_apply() {
     assert_eq!(m.name, format!("node-{}", n.id.short()));
     assert_eq!(m.address, None);
     assert_eq!(m.roles, vec!["scanner".to_string()]);
-}
-
-/// Opt-in retention deletes this node's own old records, cluster-wide,
-/// and nothing of other nodes; compaction drops redundant proofs.
-#[tokio::test]
-async fn retention_deletes_only_own_old_records() {
-    use peephole::store::recorder::Recorder;
-    let mut a = Origin::new();
-    let (x, _d) = offline(&[&a], |c| c.retention_days = 30).await;
-    apply(&x, vec![a.now(request(&a, "theirs"))]).await;
-    let ip = x
-        .store
-        .upsert_ip("203.0.113.21".parse().unwrap())
-        .await
-        .unwrap();
-    let rec = Recorder::Cluster(x.clone());
-    rec.insert_request(&peephole::store::requests::NewRequest {
-        ip_id: ip.id,
-        method: "GET".into(),
-        path: "/mine".into(),
-        query: None,
-        headers_json: "[]".into(),
-        body: None,
-        labels_json: "[]".into(),
-        severity: 1,
-        scan_level: 0,
-        is_fp_claim: false,
-        page_token: None,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    sqlx::query("UPDATE requests SET ts = datetime('now', '-40 days')")
-        .execute(&x.store.pool)
-        .await
-        .unwrap();
-    let n = peephole::cluster::retention::run(&x, 30).await.unwrap();
-    assert_eq!(n, 1);
-    let left: Vec<String> = sqlx::query_scalar("SELECT path FROM requests")
-        .fetch_all(&x.store.pool)
-        .await
-        .unwrap();
-    assert_eq!(left, vec!["/theirs".to_string()]);
-    assert_eq!(
-        count(&x, "SELECT COUNT(*) FROM repl_log WHERE kind = 'tombstone'").await,
-        1,
-        "deleted cluster-wide with a tombstone"
-    );
-
-    // A proof held for a tombstone that is in the log is redundant.
-    let tomb: (String, Vec<u8>) =
-        sqlx::query_as("SELECT uid, origin FROM repl_log WHERE kind = 'tombstone'")
-            .fetch_one(&x.store.pool)
-            .await
-            .unwrap();
-    sqlx::query("INSERT INTO tomb_proofs (origin, tomb_uid, entry) VALUES (?, ?, x'00')")
-        .bind(&tomb.1)
-        .bind(&tomb.0)
-        .execute(&x.store.pool)
-        .await
-        .unwrap();
-    assert_eq!(repl::compact(&x).await.unwrap(), 1);
 }

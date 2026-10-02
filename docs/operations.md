@@ -191,8 +191,10 @@ on the next sign-in, or when the key they signed in with is deleted.
 statistics refreshed and freed pages handed back to the file system daily.
 Databases created before that feature hand pages back only after a one-time
 `systemctl stop peephole && peephole db vacuum && systemctl start peephole`
-(needs free disk space of about the database's size). Standalone nodes delete
-requests and scan results older than `scan.retention_days` (default 90).
+(needs free disk space of about the database's size). Everything is kept by
+default; `retention_days = N` (top level, at least 7) keeps only the last N
+days on this node: a standalone node deletes older requests and scan results,
+a cluster node drops its old copies and history (see docs/cluster.md).
 
 ## Building and releases
 

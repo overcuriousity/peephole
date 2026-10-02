@@ -31,6 +31,8 @@ fn schema() -> SchemaRef {
         s("kind", false),
         s("uid", false),
         s("node", false),
+        s("node_id", false),
+        s("build", false),
         Field::new(
             "ts",
             DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
@@ -153,6 +155,8 @@ fn batch(schema: SchemaRef, rows: &[ExportRow]) -> Result<RecordBatch> {
         strs(rows.iter().map(|r| Some(r.kind))),
         strs(rows.iter().map(|r| Some(r.uid.as_str()))),
         strs(rows.iter().map(|r| Some(r.node.as_str()))),
+        strs(rows.iter().map(|r| Some(r.node_id.as_str()))),
+        strs(rows.iter().map(|r| Some(r.build.as_str()))),
         Arc::new(ts.finish()),
         strs(rows.iter().map(|r| Some(r.ip.as_str()))),
         strs(rows.iter().map(|r| Some(r.method.as_str()))),

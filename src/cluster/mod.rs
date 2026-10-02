@@ -4,6 +4,7 @@ pub mod adopt;
 pub mod block;
 pub mod cli;
 pub mod confkey;
+pub mod history;
 pub mod hlc;
 pub mod identity;
 pub mod invite;
@@ -11,7 +12,6 @@ pub mod members;
 pub mod msg;
 pub mod record;
 pub mod repl;
-pub mod retention;
 pub mod rpc;
 pub mod status;
 pub mod sync;
@@ -39,6 +39,8 @@ pub struct NodeParams {
     pub proto: (u32, u32),
     /// Where shared intel files live (served to peers).
     pub data_dir: std::path::PathBuf,
+    /// Days of history this node keeps (top-level `retention_days`); 0: all.
+    pub retention_days: u32,
 }
 
 impl NodeParams {
@@ -55,6 +57,7 @@ impl NodeParams {
             store,
             proto: (proto::PROTO_MIN, proto::PROTO_VERSION),
             data_dir: cfg.data_dir.clone(),
+            retention_days: cfg.retention_days,
         })
     }
 }
@@ -264,6 +267,19 @@ pub struct Node {
     pub job_events: tokio::sync::broadcast::Sender<String>,
     /// Highest sequence this node has written to its own log.
     pub own_head: std::sync::atomic::AtomicU64,
+    /// Days of history this node keeps; 0: everything (see [`history`]).
+    pub retention_days: u32,
+    /// This node's floors above 1, as last read (for heartbeats).
+    pub own_floors: RwLock<history::Floors>,
+    /// Sync rounds run, with any peer (status and tests).
+    pub sync_rounds: std::sync::atomic::AtomicU64,
+    /// The furthest any peer is known to hold this node's own log (from
+    /// sync rounds since start). A windowed node never drops its own
+    /// entries beyond it: they may be the only copy.
+    pub own_acked: std::sync::atomic::AtomicU64,
+    /// Per peer: origins we lack that its history does not reach back to,
+    /// as of the last round (a full node waits for a full member).
+    pub unserved: Mutex<HashMap<NodeId, Vec<NodeId>>>,
 }
 
 impl Node {
@@ -302,6 +318,11 @@ impl Node {
             started: std::time::Instant::now(),
             job_events: tokio::sync::broadcast::channel(256).0,
             own_head: Default::default(),
+            retention_days: p.retention_days,
+            own_floors: Default::default(),
+            sync_rounds: Default::default(),
+            unserved: Default::default(),
+            own_acked: Default::default(),
         });
         // Our clock must not run behind anything already in the log.
         let max_hlc: Option<i64> = sqlx::query_scalar("SELECT MAX(hlc) FROM repl_log")
@@ -444,6 +465,76 @@ impl Node {
     /// The standing of any known node, member or not.
     pub fn standing_of(&self, id: &NodeId) -> Option<members::Standing> {
         self.standings.read().unwrap().get(id).copied()
+    }
+
+    /// Whether this node keeps only a window of the history.
+    pub fn windowed(&self) -> bool {
+        self.retention_days > 0
+    }
+
+    /// Where this node's window starts (HLC); 0 when it keeps everything.
+    pub fn since_hlc(&self) -> u64 {
+        match self.retention_days {
+            0 => 0,
+            d => history::window_hlc(d, hlc::wall_ms()),
+        }
+    }
+
+    /// Where `peer`'s history of `origin` starts, as its heartbeat says
+    /// (1 when it has not said otherwise).
+    pub fn peer_floor(&self, peer: &NodeId, origin: &NodeId) -> u64 {
+        self.status
+            .known(peer)
+            .and_then(|k| k.hb.floors.iter().find(|(o, _)| o == origin).map(|f| f.1))
+            .unwrap_or(1)
+    }
+
+    /// Where `peer`'s window starts (HLC); 0 when it keeps everything or has
+    /// not said.
+    pub fn peer_since_hlc(&self, peer: &NodeId) -> u64 {
+        match self.status.known(peer).map_or(0, |k| k.hb.retention_days) {
+            0 => 0,
+            d => history::window_hlc(d, hlc::wall_ms()),
+        }
+    }
+
+    /// Origins this node lacks history of that no peer it reached could
+    /// serve (only a node keeping everything can be in this state).
+    pub fn unserved_origins(&self) -> Vec<NodeId> {
+        let mut v: Vec<NodeId> = self
+            .unserved
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// Whether a member other than `peer` that keeps at least this node's
+    /// window (or everything) was heard from recently: a windowed node then
+    /// fetches from it rather than start at `peer`'s floor.
+    pub fn keeps_more_elsewhere(&self, peer: &NodeId) -> bool {
+        let mine = self.retention_days;
+        self.members().keys().any(|id| {
+            *id != self.id()
+                && id != peer
+                && self.status.known(id).is_some_and(|k| {
+                    k.advanced.elapsed() < status::NEIGHBOUR_WINDOW
+                        && (k.hb.retention_days == 0 || k.hb.retention_days >= mine)
+                })
+        })
+    }
+
+    /// Re-read this node's floors (after a prune, for the heartbeat).
+    pub async fn reload_floors(&self) -> Result<()> {
+        let mut conn = self.store.pool.acquire().await?;
+        let f = history::floors(&mut conn).await?;
+        *self.own_floors.write().unwrap() = f;
+        Ok(())
     }
 
     /// HLC of the newest entry this node wrote, if any.
@@ -764,7 +855,7 @@ pub async fn start(
 
 /// Housekeeping: retry deferred entries whose time has come (every
 /// minute), expire parked entries of unknown nodes and compact (hourly),
-/// and run the opt-in retention of this node's own records (daily).
+/// drop history outside this node's window (daily).
 async fn maintenance_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut tick: u64 = 0;
     loop {
@@ -784,11 +875,14 @@ async fn maintenance_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Rec
                 warn!(?e, "log compaction failed");
             }
         }
-        if node.cfg.retention_days > 0 && tick % (24 * 60) == 5 {
-            match retention::run(&node, node.cfg.retention_days).await {
-                Ok(n) if n > 0 => info!(records = n, "retention: deleted this node's old records"),
-                Ok(_) => {}
-                Err(e) => warn!(?e, "retention failed"),
+        // Five minutes after start, then daily: drop history outside this
+        // node's window (a no-op when it keeps everything).
+        if node.windowed() && tick % (24 * 60) == 5 {
+            if let Err(e) = history::prune(&node).await {
+                warn!(?e, "dropping old history failed");
+            }
+            if let Err(e) = node.reload_floors().await {
+                warn!(?e, "reading history floors failed");
             }
         }
     }
@@ -802,6 +896,9 @@ async fn heartbeat_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Recei
                 repl::head_in(&h, &node.id()),
                 std::sync::atomic::Ordering::Relaxed,
             );
+        }
+        if let Err(e) = node.reload_floors().await {
+            warn!(?e, "reading history floors failed");
         }
         node.refresh_heartbeat();
         if let Err(e) = node.keepalive().await {

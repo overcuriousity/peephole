@@ -63,6 +63,9 @@ pub struct MemberView {
     pub timeout_min: String,
     pub active_scans: u32,
     pub lag: String,
+    /// "full history", "keeps N days" (this node: and where its history
+    /// starts), "?" when unknown.
+    pub history: String,
     pub error: Option<String>,
     pub incompatible: bool,
     /// Clock difference worth a warning (cooldowns compare timestamps
@@ -113,6 +116,8 @@ struct ClusterPage {
     /// This node's runtime settings and why a role cannot be switched on.
     settings: SettingsView,
     audit: Vec<AuditView>,
+    /// Members whose older history no reachable peer can give this node.
+    unserved: Option<String>,
     notice: Option<String>,
     error: Option<String>,
 }
@@ -244,6 +249,15 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
                 hb.map_or(0, |h| h.active_scans)
             },
             lag,
+            history: if is_self {
+                own_history(node).await?
+            } else {
+                match hb.map(|h| h.retention_days) {
+                    Some(0) => "full history".into(),
+                    Some(d) => format!("keeps {d} days"),
+                    None => "?".into(),
+                }
+            },
             incompatible: error
                 .as_deref()
                 .is_some_and(|e| e.contains("incompatible protocol")),
@@ -256,6 +270,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
             out.push(v);
         }
     }
+    let own = own_history(node).await?;
     let mine = mine.unwrap_or_else(|| MemberView {
         key: me.to_string(),
         short: me.short(),
@@ -278,11 +293,53 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
         timeout_min: String::new(),
         active_scans: 0,
         lag: "—".into(),
+        history: own,
         error: None,
         incompatible: false,
         skew: None,
     });
     Ok((mine, out))
+}
+
+/// How much history this node keeps, and from when it holds it.
+async fn own_history(node: &Node) -> AppResult<String> {
+    if !node.windowed() {
+        return Ok("full history".into());
+    }
+    let oldest: Option<i64> = sqlx::query_scalar(
+        "SELECT MIN(l.hlc) FROM repl_floors f
+         JOIN repl_log l ON l.origin = f.origin AND l.seq = f.seq",
+    )
+    .fetch_one(&node.store.pool)
+    .await?;
+    let from = oldest
+        .and_then(|h| {
+            chrono::DateTime::from_timestamp_millis(crate::cluster::hlc::physical_ms(
+                crate::cluster::hlc::from_db(h),
+            ) as i64)
+        })
+        .map(|t| format!(" (history from {})", t.format("%Y-%m-%d")))
+        .unwrap_or_default();
+    Ok(format!("keeps {} days{from}", node.retention_days))
+}
+
+/// Origins whose history this node waits for, by name.
+async fn unserved(node: &Node) -> AppResult<Option<String>> {
+    let ids = node.unserved_origins();
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let names: std::collections::HashMap<NodeId, String> = members::all(&node.store)
+        .await?
+        .into_iter()
+        .map(|m| (m.id, m.name))
+        .collect();
+    Ok(Some(
+        ids.iter()
+            .map(|id| names.get(id).cloned().unwrap_or_else(|| id.short()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    ))
 }
 
 async fn intel(node: &Node) -> AppResult<Vec<IntelView>> {
@@ -386,6 +443,7 @@ async fn render_page(
             remote_config: false,
             settings: SettingsView::of(st),
             audit: vec![],
+            unserved: None,
             notice: flash.notice,
             error: flash.error,
         });
@@ -431,6 +489,7 @@ async fn render_page(
         remote_config: node.cfg.remote_config,
         settings: SettingsView::of(st),
         audit,
+        unserved: unserved(node).await?,
         notice: flash.notice,
         error: flash.error,
     })

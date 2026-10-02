@@ -65,6 +65,7 @@ async fn pull(State(node): State<Arc<Node>>, Cbor(req): Cbor<PullReq>) -> Respon
     match repl::entries_after(
         &node.store,
         &req.wants,
+        req.since_hlc,
         req.max_entries.clamp(1, 5 * BATCH_ENTRIES),
         req.max_bytes.clamp(1, 4 * BATCH_BYTES),
     )
@@ -161,15 +162,27 @@ async fn inbox(State(node): State<Arc<Node>>, Extension(Peer(peer)): Extension<P
 async fn wait(State(node): State<Arc<Node>>, Cbor(req): Cbor<WaitReq>) -> Response {
     let mut changes = node.subscribe_changes();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(WAIT_SECS);
-    let theirs = repl::head_map(&req.heads);
     loop {
         changes.borrow_and_update();
         let ours = match repl::heads(&node.store).await {
             Ok(h) => h,
             Err(e) => return internal(e),
         };
-        if repl::ahead_of_map(&ours, &theirs) {
-            return Cbor(ours).into_response();
+        let ready = async {
+            let purged = super::block::purged(&node.store).await?;
+            let mut conn = node.store.pool.acquire().await?;
+            let floors = super::history::floors(&mut conn).await?;
+            anyhow::Ok(super::history::wait_ready(
+                &ours,
+                &floors,
+                &purged.into_iter().collect(),
+                &req,
+            ))
+        };
+        match ready.await {
+            Ok(true) => return Cbor(ours).into_response(),
+            Ok(false) => {}
+            Err(e) => return internal(e),
         }
         tokio::select! {
             _ = changes.changed() => {}

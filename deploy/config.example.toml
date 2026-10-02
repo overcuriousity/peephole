@@ -23,6 +23,12 @@ admin_listen = "127.0.0.1:8443"
 database_path = "/var/lib/peephole/peephole.db"
 data_dir = "/var/lib/peephole"
 
+# Keep records and history of the last N days on this node only; 0 (default)
+# keeps everything. At least 7. In a cluster the other nodes keep theirs: this
+# node drops its old copies and log entries and serves only what it holds,
+# members keeping everything serve the rest (see docs/cluster.md).
+# retention_days = 0
+
 # Directory with TOML signature rules (ships with defaults; editable without recompile).
 rules_dir = "/etc/peephole/rules"
 
@@ -99,7 +105,6 @@ timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admi
 level4_timeout_factor = 4  # level 4 (all ports, -sV -O, scripts) gets this many times timeout_secs, at most 12 h
 rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
 max_scans_per_hour = 30    # global rate cap; excess jobs stay queued
-retention_days = 90        # standalone only: delete requests and scan results older than this; 0 = keep forever. Ignored in a cluster.
 never_scan = [] # extra CIDRs this node's scanner never scans (own infra, monitoring); other cluster scanners are not bound by it
 # Non-global addresses (loopback, private, CGNAT, link-local, multicast,
 # reserved, NAT64/6to4 forms of those) and this node's own addresses are
@@ -169,7 +174,6 @@ tor_wait_hours = 6
 # remote_config  = false            # true: holders of this node's config key may change its
 #                                   # scan pace, rescan cooldown and roles (peephole cluster config-key show)
 # origin_quota_mb = 20480           # stop storing a member's entries beyond this (0 = no limit)
-# retention_days  = 0               # opt-in: delete this node's own records older than this, cluster-wide
 #
 # [[cluster.peers]]
 # name = "server-b"

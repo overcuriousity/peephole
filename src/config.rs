@@ -48,6 +48,11 @@ pub struct Config {
     pub shodan: Option<ShodanConfig>,
     pub internetdb: Option<InternetDbConfig>,
     pub greynoise: Option<GreyNoiseConfig>,
+    /// Keep records and replication history of the last this many days on
+    /// this node only; other nodes keep theirs. 0 (default): keep everything.
+    /// At least 7 when set.
+    #[serde(default)]
+    pub retention_days: u32,
 }
 
 /// `[enrichment]`: shared by the API providers.
@@ -179,11 +184,6 @@ pub struct ClusterConfig {
     /// (this node's own entries are exempt). 0: no limit.
     #[serde(default = "default_origin_quota_mb")]
     pub origin_quota_mb: u64,
-    /// Opt-in: delete this node's own requests and scan results older than
-    /// this many days, cluster-wide (records of other nodes are untouched).
-    /// 0 (default): the shared dataset is kept.
-    #[serde(default)]
-    pub retention_days: u32,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
 }
@@ -281,10 +281,6 @@ pub struct ScanConfig {
     pub rescan_cooldown_hours: i64,
     #[serde(default = "default_rate")]
     pub max_scans_per_hour: i64,
-    /// Delete requests and scan results older than this many days. Default 90;
-    /// 0 disables pruning (keep forever). Bounds unbounded database growth.
-    #[serde(default = "default_retention_days")]
-    pub retention_days: u32,
     #[serde(default)]
     pub never_scan: Vec<IpNet>,
     /// Optional per-level argv overrides. The target IP is appended as the
@@ -427,9 +423,6 @@ fn default_cooldown() -> i64 {
 fn default_rate() -> i64 {
     30
 }
-fn default_retention_days() -> u32 {
-    90
-}
 
 impl Default for ScanConfig {
     fn default() -> Self {
@@ -439,7 +432,6 @@ impl Default for ScanConfig {
             level4_timeout_factor: default_level4_timeout_factor(),
             rescan_cooldown_hours: default_cooldown(),
             max_scans_per_hour: default_rate(),
-            retention_days: default_retention_days(),
             never_scan: vec![],
             level_argv: Default::default(),
             safety: ScanSafety::default(),
@@ -455,13 +447,13 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("roles", "scanner", "true"),
     ("roles", "web", "true"),
     ("", "trusted_proxies", "[]"),
+    ("", "retention_days", "0"),
     ("webauthn", "secure_cookies", "true"),
     ("scan", "max_workers", "2"),
     ("scan", "timeout_secs", "1800"),
     ("scan", "level4_timeout_factor", "4"),
     ("scan", "rescan_cooldown_hours", "24"),
     ("scan", "max_scans_per_hour", "30"),
-    ("scan", "retention_days", "90"),
     ("scan", "never_scan", "[]"),
     ("scan", "single_request_max_level", "2"),
     ("scan", "prefix_max_scans", "4"),
@@ -532,6 +524,9 @@ impl Config {
     /// Role-dependent requirements that serde cannot express.
     fn validate(&self) -> anyhow::Result<()> {
         self.trap.validate()?;
+        if (1..7).contains(&self.retention_days) {
+            bail!("retention_days must be 0 (keep everything) or at least 7");
+        }
         let r = self.roles;
         if !(r.listener || r.scanner || r.web) {
             bail!("[roles]: enable at least one of listener, scanner, web");
@@ -984,6 +979,33 @@ data_dir = "/tmp"
         ))
         .unwrap();
         assert_eq!(cfg.roles.names(), ["listener"]);
+    }
+
+    /// Keep everything unless asked; a window shorter than a week would cut
+    /// into replication lag.
+    #[test]
+    fn retention_defaults_to_keep_everything_and_is_at_least_a_week() {
+        let roles = "[roles]\nlistener = false\nweb = false\n";
+        assert_eq!(parse(&format!("{BASE}{roles}")).unwrap().retention_days, 0);
+        for days in [1, 6] {
+            let e = parse(&format!("retention_days = {days}\n{BASE}{roles}")).unwrap_err();
+            assert!(e.to_string().contains("at least 7"), "{e}");
+        }
+        let cfg = parse(&format!("retention_days = 7\n{BASE}{roles}")).unwrap();
+        assert_eq!(cfg.retention_days, 7);
+    }
+
+    #[test]
+    fn retention_is_listed_among_the_optional_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, BASE).unwrap();
+        let notes = optional_key_notes(&path).join("\n");
+        assert!(
+            notes.contains("`retention_days` not set (default 0)"),
+            "{notes}"
+        );
+        assert!(!notes.contains("scan.retention_days"), "{notes}");
     }
 
     #[test]

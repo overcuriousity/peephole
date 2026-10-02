@@ -1384,12 +1384,12 @@ license_key = "k"
                 remote_config: false,
                 peers: vec![],
                 origin_quota_mb: 20 * 1024,
-                retention_days: 0,
             },
             roles: Default::default(),
             store: store.clone(),
             proto: (2, 2),
             data_dir: dir.to_path_buf(),
+            retention_days: 0,
         })
         .await
         .unwrap();

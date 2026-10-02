@@ -717,6 +717,9 @@ else
 
 database_path = "${DATA_DIR}/peephole.db"
 data_dir = "${DATA_DIR}"
+# Keep records and history of the last N days on this node only (at least 7);
+# 0 = keep everything. In a cluster, other nodes keep theirs.
+retention_days = 0
 
 [roles]
 listener = $(role listener)
@@ -784,7 +787,6 @@ timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admi
 level4_timeout_factor = 4  # level 4 (all ports, -sV -O, scripts) gets this many times timeout_secs, at most 12 h
 rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
 max_scans_per_hour = 30    # rate cap of this scanner; excess jobs stay queued
-retention_days = 90        # standalone only: delete older requests and scans; 0 = keep forever (ignored in a cluster)
 # Non-global addresses (loopback, private, link-local, …) are never scanned,
 # so list public ranges only: your own servers, monitoring, upstream, e.g.
 # never_scan = ["203.0.113.0/24", "2001:db8::/32"]
