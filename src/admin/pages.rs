@@ -573,9 +573,11 @@ async fn export_intel(_u: SessionUser, State(st): State<Arc<AdminState>>) -> App
         None => HashMap::new(),
     };
     let mut out = String::new();
-    for (ip, provider, fetched_at, source_version, origin, data_json) in
-        st.store.intel_export(100_000).await?
-    {
+    let mut rows = st.store.intel_export(INTEL_EXPORT_CAP + 1).await?;
+    // Capped: say so (header and a last line) rather than cut silently.
+    let truncated = rows.len() as i64 > INTEL_EXPORT_CAP;
+    rows.truncate(INTEL_EXPORT_CAP as usize);
+    for (ip, provider, fetched_at, source_version, origin, data_json) in rows {
         let node = match names.get(&origin) {
             Some(n) => n.clone(),
             None if origin.is_empty() => "this node".to_string(),
@@ -592,7 +594,11 @@ async fn export_intel(_u: SessionUser, State(st): State<Arc<AdminState>>) -> App
         );
         out.push('\n');
     }
-    Ok((
+    if truncated {
+        let marker = serde_json::json!({"truncated": true, "limit": INTEL_EXPORT_CAP});
+        out.push_str(&format!("{marker}\n"));
+    }
+    let mut res = (
         [
             (axum::http::header::CONTENT_TYPE, "application/x-ndjson"),
             (
@@ -602,8 +608,19 @@ async fn export_intel(_u: SessionUser, State(st): State<Arc<AdminState>>) -> App
         ],
         out,
     )
-        .into_response())
+        .into_response();
+    if truncated {
+        res.headers_mut().insert(
+            "x-peephole-truncated",
+            axum::http::HeaderValue::from(INTEL_EXPORT_CAP),
+        );
+    }
+    Ok(res)
 }
+
+/// Newest enrichment results in one intel export (one row per IP, provider
+/// and node, so this is far beyond a typical node's IP count).
+const INTEL_EXPORT_CAP: i64 = 100_000;
 
 async fn export_download(
     _u: SessionUser,
@@ -619,30 +636,22 @@ async fn export_download(
         label: field("label").map(str::to_string),
         min_severity: field("min_severity").and_then(|s| s.parse().ok()),
     };
-    let rows = match state.store.export_requests(&filter).await {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    let (body, ext, mime) = match q.get("format").map(String::as_str) {
-        Some("csv") => (
-            crate::export::requests_csv(&rows).into_bytes(),
-            "csv",
-            "text/csv".to_string(),
-        ),
-        Some("jsonl") => (
-            crate::export::requests_timesketch(&rows).into_bytes(),
-            "jsonl",
-            "application/x-ndjson".to_string(),
-        ),
-        Some("parquet") => match crate::export::parquet::requests_parquet(&rows) {
-            Ok(b) => (b, "parquet", "application/octet-stream".to_string()),
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
+    use crate::export::Format;
+    let (format, ext, mime) = match q.get("format").map(String::as_str) {
+        Some("csv") => (Format::Csv, "csv", "text/csv"),
+        Some("jsonl") => (Format::Jsonl, "jsonl", "application/x-ndjson"),
+        Some("parquet") => (Format::Parquet, "parquet", "application/octet-stream"),
         _ => return (StatusCode::BAD_REQUEST, "format must be csv|jsonl|parquet").into_response(),
     };
+    // Streamed, uncapped: rows are read and written page by page.
+    let body = axum::body::Body::from_stream(crate::export::stream_requests(
+        state.store.clone(),
+        filter,
+        format,
+    ));
     (
         [
-            (header::CONTENT_TYPE, mime),
+            (header::CONTENT_TYPE, mime.to_string()),
             (
                 header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"peephole-export.{ext}\""),

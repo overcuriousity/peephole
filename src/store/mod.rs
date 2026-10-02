@@ -399,68 +399,82 @@ impl Store {
     }
 }
 
+/// Position after the last exported row: `(ts, id)`.
+pub type ExportCursor = (String, i64);
+
 impl Store {
-    pub async fn export_requests(
+    /// One page of the export: up to `limit` requests matching `f` after
+    /// `after`, oldest first (by `ts`, then id). Keyset paging: each page is
+    /// a short read, so an export of any size never holds one long read
+    /// transaction (which would stop WAL checkpoints) or the whole result
+    /// in memory.
+    pub async fn export_page(
         &self,
         f: &crate::export::ExportFilter,
-    ) -> anyhow::Result<Vec<crate::export::ExportRow>> {
+        after: Option<&ExportCursor>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(crate::export::ExportRow, ExportCursor)>> {
         let mut sql = String::from(
-            "SELECT r.ts, i.ip, r.method, r.path, r.query, r.severity, r.scan_level,
+            "SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.severity, r.scan_level,
                     r.labels_json, i.country, i.asn, i.asn_org, i.is_tor_exit
              FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1",
         );
-        let mut binds: Vec<String> = vec![];
-        if let Some(v) = &f.from {
+        if after.is_some() {
+            // A row value, so the (ts, rowid) index serves the range.
+            sql.push_str(" AND (r.ts, r.id) > (?, ?)");
+        }
+        if f.from.is_some() {
             sql.push_str(" AND r.ts >= ?");
-            binds.push(v.clone());
         }
-        if let Some(v) = &f.to {
+        if f.to.is_some() {
             sql.push_str(" AND r.ts <= ?");
-            binds.push(v.clone());
         }
-        if let Some(v) = &f.ip {
+        if f.ip.is_some() {
             sql.push_str(" AND i.ip = ?");
-            binds.push(v.clone());
         }
-        if let Some(v) = &f.label {
+        if f.label.is_some() {
             // Exact label match via json_each, matching the admin search
             // (a LIKE on the raw JSON would treat %/_ as wildcards and could
             // match a label as a substring of another).
             sql.push_str(
                 " AND EXISTS (SELECT 1 FROM json_each(r.labels_json) je WHERE je.value = ?)",
             );
-            binds.push(v.clone());
         }
-        if let Some(v) = &f.min_severity {
+        if f.min_severity.is_some() {
             sql.push_str(" AND r.severity >= ?");
-            binds.push(v.to_string());
         }
-        sql.push_str(" ORDER BY r.ts ASC LIMIT 100000");
-        let mut q = sqlx::query_as::<
-            _,
-            (
-                String,
-                String,
-                String,
-                String,
-                Option<String>,
-                i64,
-                i64,
-                String,
-                Option<String>,
-                Option<i64>,
-                Option<String>,
-                bool,
-            ),
-        >(sqlx::AssertSqlSafe(sql.as_str()));
-        for b in binds {
-            q = q.bind(b);
+        sql.push_str(" ORDER BY r.ts, r.id LIMIT ?");
+        type Row = (
+            i64,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            bool,
+        );
+        let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()));
+        if let Some((ts, id)) = after {
+            q = q.bind(ts).bind(id);
         }
-        let rows = q.fetch_all(&self.pool).await?;
+        for v in [&f.from, &f.to, &f.ip, &f.label].into_iter().flatten() {
+            q = q.bind(v);
+        }
+        if let Some(v) = f.min_severity {
+            q = q.bind(v);
+        }
+        let rows = q.bind(limit).fetch_all(&self.read).await?;
         Ok(rows
             .into_iter()
             .map(
                 |(
+                    id,
                     ts,
                     ip,
                     method,
@@ -474,23 +488,44 @@ impl Store {
                     asn_org,
                     is_tor,
                 )| {
-                    crate::export::ExportRow {
-                        ts,
-                        ip,
-                        method,
-                        path,
-                        query,
-                        severity,
-                        scan_level,
-                        labels: serde_json::from_str(&labels_json).unwrap_or_default(),
-                        country,
-                        asn,
-                        asn_org,
-                        is_tor,
-                    }
+                    let cursor = (ts.clone(), id);
+                    (
+                        crate::export::ExportRow {
+                            ts,
+                            ip,
+                            method,
+                            path,
+                            query,
+                            severity,
+                            scan_level,
+                            labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+                            country,
+                            asn,
+                            asn_org,
+                            is_tor,
+                        },
+                        cursor,
+                    )
                 },
             )
             .collect())
+    }
+
+    /// Every request matching `f`, oldest first (tests and small exports).
+    pub async fn export_requests(
+        &self,
+        f: &crate::export::ExportFilter,
+    ) -> anyhow::Result<Vec<crate::export::ExportRow>> {
+        let mut out = vec![];
+        let mut after = None;
+        loop {
+            let page = self.export_page(f, after.as_ref(), 10_000).await?;
+            let Some((_, last)) = page.last() else {
+                return Ok(out);
+            };
+            after = Some(last.clone());
+            out.extend(page.into_iter().map(|(r, _)| r));
+        }
     }
 }
 
