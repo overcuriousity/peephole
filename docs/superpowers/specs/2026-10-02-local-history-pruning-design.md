@@ -224,3 +224,27 @@ commit this spec was written on.
 - **Joining.** invite.rs:163-209 (join), 263 (inviter adds joiner);
   `sync::supervise` sync.rs:66-110 runs one peer loop per dial target
   (mod.rs:523-542), so backfill already comes from all members in parallel.
+
+## 10. Amendments during implementation (2026-10-02)
+
+- **Membership entries are kept below the floor** (instead of §4.2's "only
+  the log entry goes"). A node joining with a window would otherwise never
+  see the admissions of members whose history starts before its window, so
+  it could never trust (and apply) their entries. They are few and small.
+  A floor therefore means "everything from here on is held; below it,
+  membership only".
+- **Serving a window.** `PullReq.since_hlc` carries a windowed receiver's
+  window; the sender starts at `max(after + 1, its floor, the window)`,
+  sends the membership entries before that start, and names the start in
+  `Batch.floors`. Only a windowed receiver accepts such a start (it raises
+  its floor to it, also when it fell behind every peer's floor); a node
+  keeping everything rejects the gap.
+- **Admissions across a gap.** Whether a sponsor was silent for 30 days
+  before an admission cannot be judged when the entry right before it is not
+  held; that one check is skipped then.
+- **Provenance** (added by the user): requests, light rows, claims,
+  fingerprints, scan results and enrichment results carry `build` (the
+  commit of the binary that created them); the export adds `node_id` and
+  `build`.
+- `/wait` takes the caller's refused origins and whether it is windowed
+  (`WaitReq.refused`, `WaitReq.windowed`).

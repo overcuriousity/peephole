@@ -96,6 +96,8 @@ test -f /etc/peephole/config.example.toml
 [ "$(stat -c %a /etc/peephole)" = 750 ] && [ "$(stat -c %a /var/lib/peephole)" = 700 ]
 [ "$(stat -c %a /etc/peephole/config.toml)" = 600 ]
 grep -q '^never_scan = \[\]' /etc/peephole/config.toml
+# Top level (before the first table), keep everything by default.
+[ "$(grep -m1 -n -E '^(retention_days = 0|\[)' /etc/peephole/config.toml)" = "$(grep -n '^retention_days = 0' /etc/peephole/config.toml)" ]
 grep -q 'commit 0123456789ab' /tmp/fresh.log
 grep -q 'peephole.test' /etc/peephole/config.toml
 grep -q 'server_name peephole.test;' /etc/peephole/nginx.example.conf
