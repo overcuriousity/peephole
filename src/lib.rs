@@ -20,6 +20,8 @@ use tracing::{info, warn};
 
 /// Build version, baked in by `build.rs` from `PEEPHOLE_VERSION` ("dev" locally).
 pub const VERSION: &str = env!("PEEPHOLE_VERSION");
+/// Commit the binary was built from (12 hex digits, or "unknown"), from `build.rs`.
+pub const COMMIT: &str = env!("PEEPHOLE_COMMIT");
 
 /// Startup validation shared by `run` and `check-config`: config parses and
 /// is sane, rules load (listener), nmap is executable (scanner). Returns the
