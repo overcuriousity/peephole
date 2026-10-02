@@ -273,14 +273,15 @@ journalctl -u peephole -f                     # logs (incl. FIDO2 enrollment ins
 peephole --version                            # installed build and its commit
 peephole --help                               # commands and arguments
 peephole check-config /etc/peephole/config.toml   # validate config, rules and nmap
-peephole admin setup-token                    # new setup token (only while no key is enrolled)
+peephole admin reset-token                    # new one-time admin setup token
 peephole db vacuum                            # shrink the database file (stop the service first)
 ```
 
 Additional FIDO2 keys can be enrolled from **Admin → Keys** while logged in;
 the one-time setup token is only needed for the very first key. It is valid
 for 24 hours; a restart without an enrolled key prints a new one once it has
-expired, and `peephole admin setup-token` prints one on demand. Admin
+expired. If it is lost, or every key is, `peephole admin reset-token`
+issues a new one (and voids the old). Admin
 sessions last at most 12 hours and end after an hour without use, on logout,
 on the next sign-in, or when the key they signed in with is deleted.
 

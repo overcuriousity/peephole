@@ -404,7 +404,8 @@ impl Store {
         // table, which also holds webauthn_setup_token_hash. `intel` is
         // serialized into the public /api/stats response.
         let intel = sqlx::query_as::<_, (String, String)>(
-            "SELECT key, value FROM intel_meta WHERE key IN ('tor_last_fetch','maxmind_last_fetch')",
+            "SELECT key, value FROM intel_meta
+             WHERE key IN ('tor_last_fetch','maxmind_last_fetch','maxmind_cluster_seen')",
         )
         .fetch_all(&self.read)
         .await?
@@ -453,6 +454,8 @@ impl Store {
 }
 
 /// Warn when Tor/MaxMind data is missing or older than 48h (original spec §9).
+/// GeoIP counts as current on a cluster node without its own databases while
+/// a member offers lookups (`maxmind_cluster_seen`).
 pub fn intel_stale(intel: &HashMap<String, String>) -> bool {
     let stale = |key: &str| {
         intel
@@ -461,7 +464,7 @@ pub fn intel_stale(intel: &HashMap<String, String>) -> bool {
             .map(|t| chrono::Utc::now().signed_duration_since(t).num_hours() > 48)
             .unwrap_or(true)
     };
-    stale("tor_last_fetch") || stale("maxmind_last_fetch")
+    stale("tor_last_fetch") || (stale("maxmind_last_fetch") && stale("maxmind_cluster_seen"))
 }
 
 /// How long a cached aggregate is fresh. Longer ranges change slowly
@@ -962,6 +965,14 @@ mod tests {
         );
         assert!(intel_stale(&m));
         m.insert("maxmind_last_fetch".into(), chrono::Utc::now().to_rfc3339());
+        assert!(!intel_stale(&m));
+        // A cluster node without its own databases: a member's lookups count.
+        m.remove("maxmind_last_fetch");
+        assert!(intel_stale(&m));
+        m.insert(
+            "maxmind_cluster_seen".into(),
+            chrono::Utc::now().to_rfc3339(),
+        );
         assert!(!intel_stale(&m));
     }
 }

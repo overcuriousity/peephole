@@ -94,6 +94,13 @@ impl Manifest {
             .map(|t| (chrono::Utc::now().naive_utc() - t).num_seconds() as f64 / 3600.0)
             .unwrap_or(f64::INFINITY)
     }
+
+    /// The fetch time as RFC 3339 (stored as UTC without a zone).
+    pub fn fetched_rfc3339(&self) -> Option<String> {
+        chrono::NaiveDateTime::parse_from_str(&self.fetched_at, "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|t| t.and_utc().to_rfc3339())
+    }
 }
 
 /// Announced files of kinds this version knows; old `geolite2-*` rows are

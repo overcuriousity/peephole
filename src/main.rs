@@ -7,7 +7,7 @@ usage: peephole [CONFIG]                 run the daemon (default /etc/peephole/c
        peephole check-config [CONFIG]    validate config, rules and nmap
        peephole cluster (id|invite|invites|invite-revoke|join|members|status|config-key|block|unblock|leave) …
        peephole settings (show|set|reset) …
-       peephole admin setup-token [CONFIG]
+       peephole admin reset-token [CONFIG]
        peephole db vacuum [CONFIG]
        peephole --version | -V
        peephole --help | -h | help

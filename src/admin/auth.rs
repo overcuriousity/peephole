@@ -71,7 +71,7 @@ pub async fn session_valid(state: &AdminState, jar: &CookieJar) -> bool {
 
 /// First-run setup token (spec §8.4): printed to stdout, only its hash
 /// stored. Valid for 24 hours; while no key is enrolled, a start after it
-/// expired (or was used up) prints a new one. `peephole admin setup-token`
+/// expired (or was used up) prints a new one. `peephole admin reset-token`
 /// issues one on demand.
 pub async fn ensure_setup_token(
     store: &Store,
@@ -90,7 +90,7 @@ pub async fn ensure_setup_token(
             tracing::info!(
                 hours = crate::store::auth::SETUP_TOKEN_HOURS,
                 "the admin setup token printed earlier now expires; \
-                 `peephole admin setup-token` prints a new one"
+                 `peephole admin reset-token` prints a new one"
             );
             Ok(None)
         }

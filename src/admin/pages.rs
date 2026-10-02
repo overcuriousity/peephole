@@ -94,7 +94,15 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         jobs: st.store.queue_snapshot(25).await?,
         failed: st.store.recent_failed_jobs(10).await?,
         tor_fetch: fetched("tor_last_fetch"),
-        maxmind_fetch: fetched("maxmind_last_fetch"),
+        maxmind_fetch: match (
+            intel.get("maxmind_last_fetch"),
+            intel.get(crate::intel::MAXMIND_CLUSTER_SEEN),
+        ) {
+            (None, Some(seen)) => {
+                format!("not on this node; lookups shared by a cluster member (seen {seen})")
+            }
+            _ => fetched("maxmind_last_fetch"),
+        },
         stale,
     })
 }

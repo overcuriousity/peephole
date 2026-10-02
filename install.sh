@@ -857,6 +857,7 @@ if [ -n "$admin_listen" ]; then
         printf '    one-time setup token: %s\n' "$token"
     else
         printf '    the one-time setup token is in the service log: journalctl -u peephole | grep -A2 token\n'
+        printf '    (or issue a new one: peephole admin reset-token)\n'
     fi
 fi
 }

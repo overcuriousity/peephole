@@ -2185,6 +2185,15 @@ async fn only_the_tor_list_is_shared_as_a_file() {
     );
     assert!(nb.dir.path().join("tor-exit.txt").exists());
     assert!(!nb.dir.path().join("GeoLite2-City.mmdb").exists());
+    // The copy carries the fetcher's time, which the stale-intel warning reads.
+    let m = share::manifests(&nb.store).await.unwrap();
+    peephole::intel::note_cluster_intel(&nb, nb.dir.path(), true, &m)
+        .await
+        .unwrap();
+    assert_eq!(
+        nb.store.intel_get("tor_last_fetch").await.unwrap(),
+        m[share::TOR].fetched_rfc3339()
+    );
     // A manifest for a database, written by a peer on its own, is ignored.
     repl::append(
         &na,

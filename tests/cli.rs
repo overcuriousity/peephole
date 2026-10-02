@@ -265,7 +265,7 @@ rp_name = "t"
             .output()
             .unwrap()
     };
-    let out = run(&["admin", "setup-token"]);
+    let out = run(&["admin", "reset-token"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}");
     assert!(
@@ -332,4 +332,76 @@ web = false
     let out = run(&["reset", "scan.rescan_cooldown_hours"]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(!text(&run(&["show"])).contains("override"));
+}
+
+#[test]
+fn admin_reset_token_replaces_the_setup_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |web: bool| {
+        let cfg = dir.path().join(format!("c{web}.toml"));
+        std::fs::write(
+            &cfg,
+            format!(
+                r#"
+trap_listen = "127.0.0.1:1"
+admin_listen = "127.0.0.1:2"
+rules_dir = "rules"
+database_path = "{d}/t.db"
+data_dir = "{d}"
+[roles]
+scanner = false
+web = {web}
+[webauthn]
+rp_id = "peephole.example.net"
+origin = "https://peephole.example.net"
+rp_name = "peephole"
+"#,
+                d = dir.path().display()
+            ),
+        )
+        .unwrap();
+        cfg
+    };
+    let cfg = write(true);
+    let reset = |cfg: &std::path::Path| {
+        bin()
+            .args(["admin", "reset-token"])
+            .arg(cfg)
+            .output()
+            .unwrap()
+    };
+    let token = |o: &std::process::Output| {
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(out.contains("enter this one-time token"), "{out}");
+        out.split_whitespace()
+            .find(|w| w.len() == 36 && w.matches('-').count() == 4)
+            .unwrap_or_else(|| panic!("no token in {out}"))
+            .to_string()
+    };
+    let first = token(&reset(&cfg));
+    let second = token(&reset(&cfg));
+    assert_ne!(first, second);
+    // Only the newest token is valid.
+    let stored = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let store = peephole::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        store
+            .intel_get("webauthn_setup_token_hash")
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    use sha2::Digest;
+    let hash = |t: &str| data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(t.as_bytes()));
+    assert_eq!(stored, hash(&second));
+    // A node without the web interface has no use for one.
+    let out = reset(&write(false));
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no web interface"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
