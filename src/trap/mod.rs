@@ -365,6 +365,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 scan_level: verdict.scan_level as i64,
                 is_fp_claim: c.is_fp_claim,
                 page_token: Some(c.page_token),
+                ..Default::default()
             },
         )
         .await?;

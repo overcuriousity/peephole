@@ -743,6 +743,7 @@ async fn a_uid_not_bound_to_its_origin_is_rejected() {
             scan_level: 0,
             is_fp_claim: false,
             page_token: None,
+            ..Default::default()
         })
     };
     let a_uid = format!("{}one", a_id.id.uid_prefix());
@@ -989,6 +990,7 @@ fn new_request(ip_id: i64, path: &str) -> NewRequest {
         scan_level: 3,
         is_fp_claim: false,
         page_token: Some("tok-1".into()),
+        ..Default::default()
     }
 }
 

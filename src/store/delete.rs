@@ -63,7 +63,20 @@ mod tests {
                     scan_level: 1,
                     is_fp_claim: false,
                     page_token: None,
+                    ..Default::default()
                 })
+                .await
+                .unwrap();
+            s.local()
+                .insert_skip_batch(
+                    ip,
+                    2,
+                    vec![crate::cluster::record::SkipRow {
+                        ts_ms: chrono::Utc::now().timestamp_millis(),
+                        method: "GET".into(),
+                        path: "/y".into(),
+                    }],
+                )
                 .await
                 .unwrap();
             s.insert_fp_claim(row.id, rid, Some("a@b.c"), "UA")
@@ -120,6 +133,7 @@ mod tests {
             "fingerprints",
             "scan_jobs",
             "scans",
+            "skipped_batches",
         ] {
             assert_eq!(count(&s, t, "ip_id", a).await, 0, "{t}");
             assert_eq!(count(&s, t, "ip_id", b).await, 1, "{t} neighbour");
@@ -169,6 +183,7 @@ mod tests {
             scan_level: 1,
             is_fp_claim: false,
             page_token: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -256,9 +271,13 @@ mod tests {
             .execute(&s.pool)
             .await
             .unwrap();
+        sqlx::query("UPDATE skipped_batches SET first_ms = 0, last_ms = 0")
+            .execute(&s.pool)
+            .await
+            .unwrap();
         let (reqs, scans) = s.local().prune_older_than(90).await.unwrap();
         // Finished jobs go too, and with them the last rows of both IPs.
-        for table in ["scan_jobs", "ips"] {
+        for table in ["scan_jobs", "skipped_batches", "skipped_requests", "ips"] {
             let n: i64 =
                 sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
                     .fetch_one(&s.pool)

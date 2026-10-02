@@ -775,6 +775,7 @@ show_labels = {show_labels}
                 scan_level: 0,
                 is_fp_claim: false,
                 page_token: None,
+                ..Default::default()
             })
             .await
             .unwrap();

@@ -149,6 +149,14 @@ impl Recorder {
             scan_level: n.scan_level,
             is_fp_claim: n.is_fp_claim,
             page_token: n.page_token.clone(),
+            answer: n.answer.clone(),
+            status: n.status,
+            unrecorded: n.unrecorded,
+            transport: n.transport.clone(),
+            via_proxy: n.via_proxy,
+            raw_head: n.raw_head.clone(),
+            tls_client_hello: n.tls_client_hello.clone(),
+            ja4: n.ja4.clone(),
         })])
         .await?;
         sqlx::query_as("SELECT id, ip_id FROM requests WHERE uid = ?")
@@ -156,6 +164,25 @@ impl Recorder {
             .fetch_optional(&self.store().pool)
             .await?
             .with_context(|| format!("requests {uid} was not stored"))
+    }
+
+    /// Record requests from `ip` that the flood gate answered without
+    /// recording them in full, as one batch.
+    pub async fn insert_skip_batch(
+        &self,
+        ip: &str,
+        dropped: i64,
+        rows: Vec<crate::cluster::record::SkipRow>,
+    ) -> Result<()> {
+        self.write(vec![Record::SkipBatch(
+            crate::cluster::record::SkipBatchRec {
+                uid: self.uid(),
+                ip: ip.to_string(),
+                dropped,
+                rows,
+            },
+        )])
+        .await
     }
 
     /// Record one provider's result for an IP. Nothing is written when this
@@ -970,6 +997,7 @@ impl Recorder {
             "fingerprints",
             "scan_jobs",
             "scans",
+            "skipped_batches",
         ] {
             let (o, f) = self.split(table, "ip_id", Keys::Ids(ids)).await?;
             own.extend(o);
@@ -1035,6 +1063,16 @@ impl Recorder {
         .await?;
         let scans = scan_uids.len() as u64;
         self.bury(scan_uids).await?;
+        let skip_uids: Vec<String> = sqlx::query_scalar(
+            "SELECT uid FROM skipped_batches
+             WHERE last_ms < CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000
+             ORDER BY id LIMIT ?",
+        )
+        .bind(&cutoff)
+        .bind(BATCH)
+        .fetch_all(pool)
+        .await?;
+        self.bury(skip_uids).await?;
         // Finished jobs without a scan left: otherwise they (and their IP
         // rows, which a job keeps alive) would stay forever.
         let job_uids: Vec<String> = sqlx::query_scalar(

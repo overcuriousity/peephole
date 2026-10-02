@@ -1453,6 +1453,7 @@ async fn bulk_delete_checked_and_filtered() {
                 scan_level: 0,
                 is_fp_claim: false,
                 page_token: None,
+                ..Default::default()
             })
             .await
             .unwrap();

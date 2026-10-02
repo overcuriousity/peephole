@@ -761,6 +761,7 @@ mod tests {
             scan_level: 1,
             is_fp_claim: false,
             page_token: None,
+            ..Default::default()
         };
         s.insert_request(&req(a.id, "/.env", 3)).await.unwrap();
         s.insert_request(&req(a.id, "/wp-login.php", 2))
@@ -851,6 +852,7 @@ mod tests {
             scan_level: 0,
             is_fp_claim: false,
             page_token: None,
+            ..Default::default()
         })
         .await
         .unwrap();

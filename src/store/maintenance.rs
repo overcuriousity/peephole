@@ -196,6 +196,7 @@ mod tests {
             scan_level: 0,
             is_fp_claim: false,
             page_token: None,
+            ..Default::default()
         }
     }
 

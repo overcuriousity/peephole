@@ -26,7 +26,11 @@ pub struct MemberInfo {
 
 /// A request caught by a trap listener. Timestamps everywhere are UTC
 /// `YYYY-MM-DD HH:MM:SS`, as the rows store them.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Fields added later are optional and left out of the encoding when
+/// unset, so a record signed before they existed rebuilds from its row
+/// byte for byte.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RequestRec {
     pub uid: String,
     pub ts: String,
@@ -42,6 +46,49 @@ pub struct RequestRec {
     pub scan_level: i64,
     pub is_fp_claim: bool,
     pub page_token: Option<String>,
+    /// How the trap answered: `not-found`, `decoy:<name>`, `claim`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    /// HTTP status sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<i64>,
+    /// Requests from this IP answered but not recorded in full since its
+    /// previous recorded one (flood sampling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrecorded: Option<i64>,
+    /// `http` or `https`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// The connection came from a trusted proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_proxy: Option<bool>,
+    /// The HTTP/1 request head as received (after TLS), through the blank line.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub raw_head: Option<Vec<u8>>,
+    /// The TLS records that carried the ClientHello, as sent.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub tls_client_hello: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja4: Option<String>,
+}
+
+/// One request the flood gate answered without recording it in full.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkipRow {
+    /// Unix time in milliseconds.
+    pub ts_ms: i64,
+    pub method: String,
+    pub path: String,
+}
+
+/// Skipped requests of one IP, sent together. `dropped`: requests past
+/// the light-row rate that were only counted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkipBatchRec {
+    pub uid: String,
+    pub ip: String,
+    pub dropped: i64,
+    pub rows: Vec<SkipRow>,
 }
 
 /// One provider's result for an IP (per origin, newest wins by HLC).
@@ -192,6 +239,7 @@ pub enum Record {
     ScanResult(ScanResultRec),
     Tombstone(TombstoneRec),
     IntelManifest(IntelManifestRec),
+    SkipBatch(SkipBatchRec),
 }
 
 /// Kinds whose payload is not stored in the log but rebuilt from their row
@@ -214,6 +262,7 @@ impl Record {
             Record::ScanResult(_) => "scan_result",
             Record::Tombstone(_) => "tombstone",
             Record::IntelManifest(_) => "intel_manifest",
+            Record::SkipBatch(_) => "skip_batch",
         }
     }
 
@@ -227,6 +276,7 @@ impl Record {
             Record::ScanJob(r) => Some(r.uid.clone()),
             Record::ScanResult(r) => Some(r.uid.clone()),
             Record::Tombstone(r) => Some(r.uid.clone()),
+            Record::SkipBatch(r) => Some(r.uid.clone()),
             _ => None,
         }
     }

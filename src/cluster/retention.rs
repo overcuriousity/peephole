@@ -1,8 +1,8 @@
 //! Opt-in retention in a cluster (`cluster.retention_days`, off by
 //! default). The shared dataset is persistent and nobody can delete another
 //! node's records, so a cluster can only be bounded cooperatively: a node
-//! that opts in deletes its *own* requests, claims, fingerprints and scan
-//! results older than N days, cluster-wide, with the ordinary signed
+//! that opts in deletes its *own* requests, skipped-request batches,
+//! claims, fingerprints and scan results older than N days, cluster-wide, with the ordinary signed
 //! tombstones of its origin. Records of other nodes are never touched.
 use super::Node;
 use crate::store::recorder::Recorder;
@@ -33,6 +33,9 @@ pub async fn run(node: &Arc<Node>, days: u32) -> Result<u64> {
              AND uid IS NOT NULL ORDER BY id LIMIT ?",
             "SELECT uid FROM scans WHERE origin = ?
              AND COALESCE(finished_at, started_at) < datetime('now', ?)
+             AND uid IS NOT NULL ORDER BY id LIMIT ?",
+            "SELECT uid FROM skipped_batches WHERE origin = ?
+             AND last_ms < CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000
              AND uid IS NOT NULL ORDER BY id LIMIT ?",
         ] {
             let found: Vec<String> = sqlx::query_scalar(sql)

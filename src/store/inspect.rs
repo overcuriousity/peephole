@@ -524,6 +524,7 @@ mod tests {
                 scan_level: 3,
                 is_fp_claim: false,
                 page_token: Some("tok".into()),
+                ..Default::default()
             })
             .await
             .unwrap();

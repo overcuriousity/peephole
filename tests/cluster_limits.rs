@@ -150,6 +150,7 @@ fn request(o: &Origin, uid: &str) -> Record {
         scan_level: 0,
         is_fp_claim: false,
         page_token: None,
+        ..Default::default()
     })
 }
 
@@ -682,6 +683,7 @@ async fn retention_deletes_only_own_old_records() {
         scan_level: 0,
         is_fp_claim: false,
         page_token: None,
+        ..Default::default()
     })
     .await
     .unwrap();
