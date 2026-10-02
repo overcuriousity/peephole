@@ -5,7 +5,8 @@
 # - nginx accepts the example for every role combination (when nginx is
 #   installed; the certificates are swapped for a throwaway self-signed one);
 # - systemd-analyze accepts the unit (when available).
-# Needs no root. Usage: tests/deploy-check.sh
+# Installs nothing. nginx -t opens the listen sockets (80, 443), so run it as
+# root (CI: sudo). Usage: tests/deploy-check.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 work="$(mktemp -d)"
