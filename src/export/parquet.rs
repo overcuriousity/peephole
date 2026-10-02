@@ -142,10 +142,10 @@ fn batch(schema: SchemaRef, rows: &[ExportRow]) -> Result<RecordBatch> {
         }
         labels.append(true);
     }
-    let json = |f: fn(&ExportRow) -> &serde_json::Value| -> ArrayRef {
+    let json = |f: fn(&ExportRow) -> &str| -> ArrayRef {
         let mut b = StringBuilder::new();
         for r in rows {
-            b.append_value(f(r).to_string());
+            b.append_value(f(r));
         }
         Arc::new(b.finish())
     };

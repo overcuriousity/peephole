@@ -9,7 +9,8 @@ use crate::store::Store;
 use crate::store::export::{FpOut, IntelOut, PageContext, ReqRow, ScanOut, SkipOut};
 use data_encoding::BASE64;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 #[derive(serde::Deserialize, Default, Clone, Debug)]
 pub struct ExportFilter {
@@ -92,9 +93,11 @@ pub struct ExportRow {
     pub asn: Option<i64>,
     pub asn_org: Option<String>,
     pub is_tor: Option<bool>,
-    pub intel: Value,
-    pub scans: Value,
-    pub fingerprints: Value,
+    /// JSON text, shared by every row of the IP on a page (it can be
+    /// large: nmap XML) rather than copied.
+    pub intel: Arc<str>,
+    pub scans: Arc<str>,
+    pub fingerprints: Arc<str>,
 }
 
 /// Columns of the text exports, in order.
@@ -213,7 +216,36 @@ impl ExportRow {
         )
     }
 
-    /// The row as JSON, keyed by [`COLUMNS`]; blobs in base64.
+    /// Bytes this row adds to an export, roughly.
+    fn size(&self) -> usize {
+        512 + self.intel.len()
+            + self.scans.len()
+            + self.fingerprints.len()
+            + self.path.len()
+            + self.query.as_ref().map_or(0, String::len)
+            + self
+                .headers
+                .iter()
+                .map(|(n, v)| n.len() + v.len() + 8)
+                .sum::<usize>()
+            + [&self.body, &self.raw_head, &self.tls_client_hello]
+                .iter()
+                .map(|b| b.as_ref().map_or(0, |b| b.len() * 4 / 3))
+                .sum::<usize>()
+    }
+
+    /// The per-IP JSON columns, as stored text.
+    fn json_text(&self, column: &str) -> Option<&str> {
+        match column {
+            "intel" => Some(&self.intel),
+            "scans" => Some(&self.scans),
+            "fingerprints" => Some(&self.fingerprints),
+            _ => None,
+        }
+    }
+
+    /// The row as JSON, keyed by [`COLUMNS`]; blobs in base64. The JSON
+    /// text columns (`intel`, `scans`, `fingerprints`) are not in it.
     pub fn to_json(&self) -> serde_json::Map<String, Value> {
         let headers: Vec<[&str; 2]> = self
             .headers
@@ -253,9 +285,6 @@ impl ExportRow {
             "asn": self.asn,
             "asn_org": self.asn_org,
             "is_tor": self.is_tor,
-            "intel": self.intel,
-            "scans": self.scans,
-            "fingerprints": self.fingerprints,
             "message": self.message(),
             "datetime": rfc3339(self.ts_ms),
             "timestamp_desc": self.timestamp_desc(),
@@ -283,13 +312,20 @@ pub fn csv_rows(rows: &[ExportRow]) -> String {
         let m = r.to_json();
         let cells: Vec<String> = COLUMNS
             .iter()
-            .map(|c| match m.get(*c) {
-                None | Some(Value::Null) => String::new(),
-                Some(Value::String(s)) => csv_safe(s).into_owned(),
-                Some(v @ (Value::Array(_) | Value::Object(_))) => {
-                    csv_safe(&v.to_string()).into_owned()
+            .map(|c| {
+                match r
+                    .json_text(c)
+                    .map(|t| Value::String(t.to_string()))
+                    .as_ref()
+                    .or(m.get(*c))
+                {
+                    None | Some(Value::Null) => String::new(),
+                    Some(Value::String(s)) => csv_safe(s).into_owned(),
+                    Some(v @ (Value::Array(_) | Value::Object(_))) => {
+                        csv_safe(&v.to_string()).into_owned()
+                    }
+                    Some(v) => v.to_string(),
                 }
-                Some(v) => v.to_string(),
             })
             .collect();
         w.write_record(&cells).expect("writing to memory");
@@ -301,8 +337,14 @@ pub fn csv_rows(rows: &[ExportRow]) -> String {
 pub fn jsonl_rows(rows: &[ExportRow]) -> String {
     let mut out = String::new();
     for r in rows {
-        out.push_str(&Value::Object(r.to_json()).to_string());
-        out.push('\n');
+        // The JSON text columns go in as they are, not parsed again.
+        let small = Value::Object(r.to_json()).to_string();
+        out.push_str(&small[..small.len() - 1]);
+        for c in ["intel", "scans", "fingerprints"] {
+            out.push_str(&format!(",\"{c}\":"));
+            out.push_str(r.json_text(c).unwrap_or("null"));
+        }
+        out.push_str("}\n");
     }
     out
 }
@@ -319,6 +361,11 @@ pub enum Format {
 /// Parquet row group): bounds the memory an export of any size needs.
 pub const STREAM_PAGE: i64 = 5_000;
 
+/// Most bytes of rows (estimated) written out in one piece, and per Parquet
+/// row group: per-IP data such as nmap XML repeats on each of the IP's rows,
+/// so a page of rows alone does not bound memory.
+pub const CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
 fn node_name(names: &HashMap<Vec<u8>, String>, origin: &[u8]) -> String {
     match names.get(origin) {
         Some(n) => n.clone(),
@@ -329,8 +376,8 @@ fn node_name(names: &HashMap<Vec<u8>, String>, origin: &[u8]) -> String {
 
 /// Context-dependent columns of an IP, shared by its rows on a page.
 struct IpCols {
-    intel: Value,
-    scans: Value,
+    intel: Arc<str>,
+    scans: Arc<str>,
     /// GeoLite2 and Tor results with their times, oldest first.
     geo: Vec<(i64, Value)>,
     tor: Vec<(i64, bool)>,
@@ -393,8 +440,8 @@ fn ip_cols(ip: &str, ip_id: i64, ctx: &PageContext, opts: &ExportOptions) -> IpC
         })
         .unwrap_or_default();
     IpCols {
-        intel: Value::Array(intel),
-        scans: Value::Array(scans),
+        intel: Value::Array(intel).to_string().into(),
+        scans: Value::Array(scans).to_string().into(),
         geo,
         tor,
     }
@@ -528,7 +575,7 @@ fn request_row(
         labels: serde_json::from_str(&r.labels_json).unwrap_or_default(),
         severity: Some(r.severity),
         scan_level: Some(r.scan_level),
-        fingerprints: Value::Array(fingerprints),
+        fingerprints: Value::Array(fingerprints).to_string().into(),
         ..Default::default()
     };
     fill_ip(&mut row, cols, r.ip_id, ctx, opts);
@@ -547,7 +594,7 @@ fn skipped_row(s: SkipOut, ctx: &PageContext, cols: &IpCols, opts: &ExportOption
         path: s.path,
         unrecorded,
         weight: unrecorded + 1,
-        fingerprints: Value::Array(vec![]),
+        fingerprints: "[]".into(),
         ..Default::default()
     };
     fill_ip(&mut row, cols, s.ip_id, ctx, opts);
@@ -640,6 +687,8 @@ pub fn stream_requests(
         f: ExportFilter,
         opts: ExportOptions,
         phase: Phase,
+        /// Rows read but not written yet.
+        pending: VecDeque<ExportRow>,
         started: bool,
         finished: bool,
         parquet: Option<parquet::ParquetStream>,
@@ -653,6 +702,7 @@ pub fn stream_requests(
         f,
         opts,
         phase: Phase::Requests(None),
+        pending: VecDeque::new(),
         started: false,
         finished: false,
         parquet: None,
@@ -672,10 +722,24 @@ pub fn stream_requests(
                 Format::Jsonl => {}
             }
         }
-        let rows = next_rows(&st.store, &st.f, &st.opts, &mut st.phase)
-            .await
-            .map_err(io)?;
-        let done = matches!(st.phase, Phase::Done);
+        if st.pending.is_empty() && !matches!(st.phase, Phase::Done) {
+            let page = next_rows(&st.store, &st.f, &st.opts, &mut st.phase)
+                .await
+                .map_err(io)?;
+            st.pending.extend(page);
+        }
+        // Up to CHUNK_BYTES of rows (at least one) per piece.
+        let mut rows = vec![];
+        let mut bytes = 0;
+        while let Some(r) = st.pending.front() {
+            let n = r.size();
+            if !rows.is_empty() && bytes + n > CHUNK_BYTES {
+                break;
+            }
+            bytes += n;
+            rows.extend(st.pending.pop_front());
+        }
+        let done = st.pending.is_empty() && matches!(st.phase, Phase::Done);
         match format {
             Format::Csv => out.extend_from_slice(csv_rows(&rows).as_bytes()),
             Format::Jsonl => out.extend_from_slice(jsonl_rows(&rows).as_bytes()),
@@ -723,6 +787,9 @@ mod tests {
             asn_org: Some("DTAG".into()),
             is_tor: Some(false),
             body: Some(b"a=1".to_vec()),
+            intel: "[]".into(),
+            scans: "[]".into(),
+            fingerprints: "[]".into(),
             ..Default::default()
         }
     }
@@ -1023,6 +1090,60 @@ mod tests {
         ));
         let rows: usize = b.build().unwrap().map(|b| b.unwrap().num_rows()).sum();
         assert_eq!(rows, 3);
+    }
+
+    /// Large per-IP data (an nmap XML) repeated on many rows: the export
+    /// goes out in chunks of bounded size, not a page at a time.
+    #[tokio::test]
+    async fn chunks_stay_bounded_with_large_per_ip_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let row = s.upsert_ip("203.0.113.6".parse().unwrap()).await.unwrap();
+        let job = match s.enqueue_scan(row.id, 2, 24).await.unwrap() {
+            crate::store::scans::EnqueueOutcome::Queued(j) => j,
+            o => panic!("{o:?}"),
+        };
+        s.next_queued_job().await.unwrap();
+        let xml = format!("<nmaprun>{}</nmaprun>", "<host/>".repeat(30_000));
+        s.finish_job(
+            job,
+            Some(&crate::scan::nmap_xml::ScanResult {
+                os_guess: None,
+                raw_xml: xml.into_bytes(),
+                ports: vec![],
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE k(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM k WHERE x < 200)
+             INSERT INTO requests (uid, ts, ip_id, method, path, headers_json, labels_json)
+             SELECT 'u' || x, datetime('2026-01-01', '+' || x || ' seconds'), ?, 'GET', '/', '[]', '[]'
+             FROM k",
+        )
+        .bind(row.id)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        for format in [Format::Csv, Format::Jsonl] {
+            let parts = collect(&s, ExportFilter::default(), format).await;
+            let total: usize = parts.iter().map(|b| b.len()).sum();
+            let largest = parts.iter().map(|b| b.len()).max().unwrap();
+            assert!(total > 30 * 1024 * 1024, "{format:?}: {total}");
+            assert!(
+                largest < CHUNK_BYTES + 1024 * 1024,
+                "{format:?}: a {largest}-byte chunk"
+            );
+        }
+        use ::parquet::file::reader::{FileReader, SerializedFileReader};
+        let pq = collect(&s, ExportFilter::default(), Format::Parquet).await;
+        let reader = SerializedFileReader::new(axum::body::Bytes::from(pq.concat())).unwrap();
+        assert_eq!(reader.metadata().file_metadata().num_rows(), 200);
+        assert!(
+            reader.metadata().num_row_groups() > 1,
+            "row groups bounded by size"
+        );
     }
 
     #[tokio::test]
