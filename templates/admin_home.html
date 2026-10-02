@@ -1,8 +1,8 @@
 {% extends "layout.html" %}
 {% block title %}peephole — admin{% endblock %}
 {% block content %}
+{% let sub = "home" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Admin</h1><p class="muted">Operational view. Everything on this page is private.</p></div>
-  <nav class="seg"><a href="/admin/queue">Queue</a><a href="/admin/scans">Scans</a><a href="/admin/fingerprints">Fingerprints</a><a href="/admin/inbox">Inbox</a><a href="/admin/export">Export</a><a href="/admin/keys">Keys</a><a href="/admin/cluster">Cluster</a></nav>
 </div>
 {% if stale %}<div class="banner banner-warning">Intel data (Tor exit list / GeoIP) is missing or older than 48 hours.</div>{% endif %}
 <div class="tiles">

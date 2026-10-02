@@ -61,7 +61,7 @@ input:focus, select:focus { border-color: var(--color-accent); outline: none; bo
 .seg a { padding: 0.3rem 0.7rem; font-size: var(--text-xs); color: var(--color-fg-secondary); border-right: 1px solid var(--color-border); }
 .seg a:last-child { border-right: 0; }
 .seg a:hover { background: var(--color-bg-hover); text-decoration: none; }
-.seg a[aria-current="true"] { background: var(--color-accent); color: var(--color-accent-fg); }
+.seg a[aria-current="true"], .seg a[aria-current="page"] { background: var(--color-accent); color: var(--color-accent-fg); }
 
 .pagination { display: flex; justify-content: space-between; align-items: center; margin-top: 0.75rem; color: var(--color-fg-muted); font-size: var(--text-sm); }
 
@@ -85,7 +85,19 @@ dialog .actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-
 pre.panel { background: var(--color-bg-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: 0.75rem 1rem; overflow: auto; font-size: var(--text-xs); max-height: 32rem; white-space: pre-wrap; word-break: break-all; }
 .ip-head { align-items: center; }
 .ip-head h1 { font-family: var(--font-mono); font-size: var(--text-3xl); letter-spacing: 0; }
-.ip-head .tiles { margin-bottom: 0; grid-template-columns: repeat(2, minmax(9rem, 1fr)); }
+.ip-head .tiles { margin-bottom: 0; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); min-width: min(100%, 20rem); }
+.kv dd.plain { font-family: inherit; word-break: normal; }
+.intel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1rem; }
+.intel { border: 1px solid var(--color-border-subtle); border-radius: var(--radius-md); padding: 0.75rem 1rem; min-width: 0; }
+.intel h3 { margin: 0 0 0.5rem; font-size: var(--text-sm); }
+.intel p { margin: 0; }
+.intel .intel-src { margin-top: 0.5rem; }
+.intel details { margin-top: 0.5rem; }
+.intel details .kv { margin-top: 0.5rem; }
+.ip-scans h3 { margin: 1.25rem 0 0.5rem; font-size: var(--text-sm); }
+.ip-scans .card-head + h3 { margin-top: 0; }
+.subnav { display: flex; width: fit-content; max-width: 100%; overflow-x: auto; margin-bottom: 1.25rem; }
+.subnav a { white-space: nowrap; }
 .ip-head .tile .value .sev { font-size: var(--text-lg); vertical-align: middle; }
 .meta { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; color: var(--color-fg-secondary); font-size: var(--text-sm); }
 .danger-zone { border-color: var(--color-danger); }

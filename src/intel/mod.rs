@@ -7,6 +7,34 @@ pub mod tor;
 pub const MAXMIND: &str = "maxmind-geolite2";
 pub const TOR: &str = "tor-exits";
 
+/// A provider this version knows: results from others are not accepted.
+pub struct ProviderInfo {
+    pub name: &'static str,
+    /// Shown on the IP page.
+    pub label: &'static str,
+    /// Whether anonymous visitors see its results. Only for facts the public
+    /// pages already show (country, ASN, Tor flag); a provider that reports
+    /// open ports or abuse reports stays admin-only.
+    pub public: bool,
+}
+
+pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
+    ProviderInfo {
+        name: TOR,
+        label: "Tor exit list",
+        public: true,
+    },
+    ProviderInfo {
+        name: MAXMIND,
+        label: "MaxMind GeoLite2",
+        public: true,
+    },
+];
+
+pub fn provider_info(name: &str) -> Option<&'static ProviderInfo> {
+    KNOWN_PROVIDERS.iter().find(|p| p.name == name)
+}
+
 use crate::config::Config;
 use crate::store::Store;
 use crate::store::recorder::Recorder;

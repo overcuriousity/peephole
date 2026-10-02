@@ -7,7 +7,7 @@ use crate::admin::{AdminState, RangeQuery};
 use crate::store::browse::{
     Audience, IpFilter, IpOverview, IpSummary, Page, RequestFilter, RequestListRow, page_num,
 };
-use crate::store::inspect::{FpClaimRow, FpSummary, PortRow, ScanSummary};
+use crate::store::inspect::{FpClaimRow, FpSummary, IpIntelRow, PortRow, ScanSummary};
 use crate::store::stats::{MapCounts, Range, Stats, intel_stale};
 use askama::Template;
 use axum::{
@@ -313,8 +313,152 @@ pub struct ScanWithPorts {
     pub ports: Vec<PortRow>,
 }
 
+/// One fact a provider reported, ready to show.
+pub struct IntelFact {
+    pub label: String,
+    pub value: String,
+    pub mono: bool,
+}
+
+/// One node's result from one provider.
+pub struct IntelResult {
+    pub facts: Vec<IntelFact>,
+    pub fetched_at: String,
+    pub source_version: Option<String>,
+    /// Admin only: the node that looked it up.
+    pub node: Option<String>,
+}
+
+/// A provider's card on the IP page: its newest result, and (admin only)
+/// the other nodes' results.
+pub struct IntelCard {
+    pub label: &'static str,
+    pub name: String,
+    pub newest: Option<IntelResult>,
+    pub others: Vec<IntelResult>,
+}
+
+fn fact(label: &str, value: impl Into<String>, mono: bool) -> IntelFact {
+    IntelFact {
+        label: label.to_string(),
+        value: value.into(),
+        mono,
+    }
+}
+
+/// A provider's data as labelled facts. Known fields get a readable form;
+/// anything else is listed under its own key, so a new provider shows up
+/// without template changes.
+fn intel_facts(provider: &str, data: &serde_json::Value) -> Vec<IntelFact> {
+    let Some(obj) = data.as_object() else {
+        return vec![fact("Data", data.to_string(), true)];
+    };
+    // Known fields first, in reading order; the map itself is sorted by key.
+    const ORDER: [&str; 4] = ["exit", "country", "asn", "asn_org"];
+    let mut fields: Vec<(&String, &serde_json::Value)> = obj.iter().collect();
+    fields.sort_by_key(|(k, _)| ORDER.iter().position(|o| o == k).unwrap_or(ORDER.len()));
+    let mut out = Vec::new();
+    let mut rest: Vec<(&String, &serde_json::Value)> = Vec::new();
+    for (k, v) in fields {
+        match (provider, k.as_str()) {
+            (crate::intel::TOR, "exit") => out.push(fact(
+                "Exit node",
+                match v.as_bool() {
+                    Some(true) => "listed",
+                    Some(false) => "not listed",
+                    None => "unknown",
+                },
+                false,
+            )),
+            (crate::intel::MAXMIND, "country") => {
+                if let Some(c) = v.as_str() {
+                    out.push(fact(
+                        "Country",
+                        format!(
+                            "{} {} ({c})",
+                            countries::flag(c),
+                            countries::country_name(c)
+                        ),
+                        false,
+                    ));
+                }
+            }
+            (crate::intel::MAXMIND, "asn") => out.push(fact("ASN", format!("AS{v}"), true)),
+            (crate::intel::MAXMIND, "asn_org") => {
+                out.push(fact("Organisation", v.as_str().unwrap_or_default(), false))
+            }
+            _ if v.is_null() => {}
+            _ => rest.push((k, v)),
+        }
+    }
+    for (k, v) in rest {
+        let value = match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        out.push(fact(k, value, !v.is_string()));
+    }
+    if out.is_empty() {
+        out.push(fact("Result", "nothing known about this address", false));
+    }
+    out
+}
+
+/// Cards for the IP page. Anonymous visitors see only public providers and
+/// no node names; an admin sees every provider and every node's result.
+/// A known provider without a result still gets a card, saying so.
+pub fn intel_cards(rows: Vec<IpIntelRow>, admin: bool) -> Vec<IntelCard> {
+    let mut by_provider: Vec<(String, Vec<IpIntelRow>)> = Vec::new();
+    for r in rows {
+        match by_provider.iter_mut().find(|(p, _)| *p == r.provider) {
+            Some((_, v)) => v.push(r),
+            None => by_provider.push((r.provider.clone(), vec![r])),
+        }
+    }
+    let mut names: Vec<(&'static str, String)> = crate::intel::KNOWN_PROVIDERS
+        .iter()
+        .filter(|p| admin || p.public)
+        .map(|p| (p.label, p.name.to_string()))
+        .collect();
+    if admin {
+        for (p, _) in &by_provider {
+            if crate::intel::provider_info(p).is_none() {
+                names.push(("Other provider", p.clone()));
+            }
+        }
+    }
+    names
+        .into_iter()
+        .map(|(label, name)| {
+            let rows = by_provider
+                .iter()
+                .find(|(p, _)| *p == name)
+                .map(|(_, v)| v.as_slice())
+                .unwrap_or_default();
+            let mut results = rows.iter().map(|r| {
+                let data = serde_json::from_str(&r.data_json).unwrap_or(serde_json::Value::Null);
+                IntelResult {
+                    facts: intel_facts(&name, &data),
+                    fetched_at: r.fetched_at.clone(),
+                    source_version: r.source_version.clone(),
+                    node: if admin { r.node.clone() } else { None },
+                }
+            });
+            let newest = results.next();
+            let others = if admin { results.collect() } else { vec![] };
+            IntelCard {
+                label,
+                name,
+                newest,
+                others,
+            }
+        })
+        .collect()
+}
+
 /// Admin-only sections of the IP page. Loaded only with a session.
 pub struct IpAdminData {
+    pub jobs: Vec<crate::events::QueueJob>,
     pub scans: Vec<ScanWithPorts>,
     pub fingerprints: Vec<FpSummary>,
     pub claims: Vec<FpClaimRow>,
@@ -327,6 +471,7 @@ struct IpPage {
     ov: Arc<IpOverview>,
     sparkline_json: String,
     page: Page<RequestListRow>,
+    intel: Vec<IntelCard>,
     admin: Option<IpAdminData>,
     labels: bool,
 }
@@ -383,6 +528,7 @@ async fn ip_page(
             })
             .collect();
         Some(IpAdminData {
+            jobs: state.store.jobs_for_ip(ip.id, 20).await?,
             scans,
             fingerprints: state.store.fingerprints_for_ip(ip.id).await?,
             claims: state.store.claims_for_ip(ip.id).await?,
@@ -390,12 +536,14 @@ async fn ip_page(
     } else {
         None
     };
+    let intel = intel_cards(state.store.intel_for_ip(&ip.ip).await?, authed);
     let sparkline_json = serde_json::to_string(&ov.sparkline).unwrap_or_else(|_| "[]".into());
     render(&IpPage {
         chrome: Chrome::new(authed, "ips"),
         ov,
         sparkline_json,
         page,
+        intel,
         admin,
         labels: labels_shown(&state, authed),
     })
@@ -536,5 +684,64 @@ show_labels = {show_labels}
         // The filter cannot be used to probe: it is ignored.
         let html = get(&hidden, "/ips?label=no-such-label").await;
         assert!(html.contains("203.0.113.9"), "label filter ignored");
+    }
+
+    #[tokio::test]
+    async fn ip_page_lists_every_public_provider_with_or_without_a_result() {
+        let (app, _d) = app(true).await;
+        let html = get(&app, "/ip/203.0.113.9").await;
+        assert!(html.contains("Tor exit list") && html.contains("MaxMind GeoLite2"));
+        assert_eq!(html.matches("No result yet").count(), 2);
+    }
+
+    fn row(provider: &str, data: &str, node: Option<&str>) -> IpIntelRow {
+        IpIntelRow {
+            provider: provider.into(),
+            fetched_at: "2026-10-01T00:00:00Z".into(),
+            source_version: None,
+            data_json: data.into(),
+            node: node.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn intel_cards_hide_nodes_and_unknown_providers_from_the_public() {
+        let rows = || {
+            vec![
+                row(crate::intel::TOR, r#"{"exit":false}"#, Some("a")),
+                row(crate::intel::TOR, r#"{"exit":true}"#, Some("b")),
+                row(
+                    crate::intel::MAXMIND,
+                    r#"{"country":"DE","asn":64500,"asn_org":"Ex"}"#,
+                    None,
+                ),
+                row("shodan", r#"{"ports":[22,80]}"#, Some("a")),
+            ]
+        };
+        let public = intel_cards(rows(), false);
+        assert_eq!(public.len(), 2);
+        let tor = &public[0];
+        let newest = tor.newest.as_ref().unwrap();
+        assert_eq!(newest.facts[0].value, "not listed");
+        assert_eq!(newest.node, None);
+        assert!(tor.others.is_empty());
+        let geo = public[1].newest.as_ref().unwrap();
+        let labels: Vec<_> = geo.facts.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(labels, ["Country", "ASN", "Organisation"]);
+        assert!(geo.facts.iter().any(|f| f.value == "AS64500"));
+
+        let admin = intel_cards(rows(), true);
+        assert_eq!(admin.len(), 3);
+        assert_eq!(admin[0].newest.as_ref().unwrap().node.as_deref(), Some("a"));
+        assert_eq!(admin[0].others.len(), 1);
+        assert_eq!(admin[2].name, "shodan");
+        assert_eq!(admin[2].newest.as_ref().unwrap().facts[0].value, "[22,80]");
+    }
+
+    #[test]
+    fn an_empty_result_says_nothing_is_known() {
+        let f = intel_facts(crate::intel::MAXMIND, &serde_json::json!({}));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].label, "Result");
     }
 }

@@ -249,7 +249,7 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
 /// bring the IP's shown facts up to date.
 async fn ip_intel(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpIntelRec) -> Result<Effect> {
     // Only providers this version knows, so nobody pre-fills others.
-    if ![crate::intel::MAXMIND, crate::intel::TOR].contains(&r.provider.as_str()) {
+    if crate::intel::provider_info(&r.provider).is_none() {
         return Ok(Effect::Ignored);
     }
     sqlx::query(

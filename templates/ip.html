@@ -6,8 +6,8 @@
   <div>
     <h1>{{ ov.ip.ip }}{% if ov.ip.is_tor_exit %} <span class="badge badge-tor">tor exit</span>{% endif %}</h1>
     <div class="meta">
-      {% if let Some(c) = ov.ip.country %}<span>{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}</span>{% endif %}
-      {% if let Some(o) = ov.ip.asn_org %}<span>{{ o }}{% if let Some(a) = ov.ip.asn %} <span class="mono muted">AS{{ a }}</span>{% endif %}</span>{% endif %}
+      {% if let Some(c) = ov.ip.country %}<a href="/ips?country={{ c }}">{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}</a>{% else %}<span class="muted">country unknown</span>{% endif %}
+      {% if let Some(a) = ov.ip.asn %}<a href="/ips?asn={{ a }}">{{ ov.ip.asn_org.as_deref().unwrap_or("") }} <span class="mono muted">AS{{ a }}</span></a>{% else %}<span class="muted">ASN unknown</span>{% endif %}
       <span>first seen <span class="mono">{{ ov.ip.first_seen }}</span></span>
       <span>last seen <span class="mono">{{ ov.ip.last_seen }}</span></span>
     </div>
@@ -15,10 +15,56 @@
   <div class="tiles">
     <div class="tile"><span class="label">Requests</span><div class="value">{{ ov.request_count }}</div></div>
     <div class="tile"><span class="label">Max severity</span><div class="value">{% let sev = ov.max_severity %}{% include "_severity.html" %}</div></div>
+    {% if let Some(adm) = admin %}<div class="tile"><span class="label">Open ports</span><div class="value">{% if let Some(sc) = adm.scans.first() %}{{ sc.s.open_ports }}{% else %}—{% endif %}</div><div class="hint">{% if let Some(sc) = adm.scans.first() %}newest scan, level {{ sc.s.level }}{% else %}not scanned{% endif %}</div></div>{% endif %}
   </div>
 </div>
 
 <div class="stack">
+  <section class="card" id="intel">
+    <div class="card-head"><h2>Intelligence</h2><span class="muted">{% if admin.is_some() %}every provider, every node{% else %}enrichment results{% endif %}</span></div>
+    <div class="intel-grid">
+    {% for c in intel %}
+      <div class="intel">
+        <h3>{{ c.label }} <span class="mono muted small">{{ c.name }}</span></h3>
+        {% match c.newest %}
+        {% when Some(r) %}
+          <dl class="kv">{% for f in r.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
+          <p class="muted small intel-src">checked <span class="mono">{{ r.fetched_at }}</span>{% if let Some(v) = r.source_version %} · data <span class="mono">{{ v }}</span>{% endif %}{% if let Some(n) = r.node %} · by {{ n }}{% endif %}</p>
+          {% if !c.others.is_empty() %}
+          <details class="small"><summary>{{ c.others.len() }} older or other-node result{% if c.others.len() != 1 %}s{% endif %}</summary>
+            {% for o in c.others %}
+            <dl class="kv">{% for f in o.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
+            <p class="muted small intel-src"><span class="mono">{{ o.fetched_at }}</span>{% if let Some(v) = o.source_version %} · data <span class="mono">{{ v }}</span>{% endif %}{% if let Some(n) = o.node %} · by {{ n }}{% endif %}</p>
+            {% endfor %}
+          </details>
+          {% endif %}
+        {% when None %}
+          <p class="muted">No result yet. Nothing has looked this address up with this provider (its database or API key may not be configured on any node).</p>
+        {% endmatch %}
+      </div>
+    {% endfor %}
+    </div>
+  </section>
+
+  {% if let Some(adm) = admin %}
+  <section class="card ip-scans" id="scans">
+    <div class="card-head"><h2>Counter-scans</h2><span class="muted">admin only</span></div>
+    {% if !adm.jobs.is_empty() %}
+    <h3>Jobs</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Job</th><th>IP</th><th>Level</th><th>Status</th><th>Queued</th><th>Finished</th><th>Error</th><th>Node</th></tr></thead>
+      <tbody>{% for j in adm.jobs %}{% include "_queue_row.html" %}{% endfor %}</tbody>
+    </table></div>
+    {% endif %}
+    {% if adm.scans.is_empty() %}<p class="muted">{% if adm.jobs.is_empty() %}Never queued for a counter-scan.{% else %}No completed scan yet.{% endif %}</p>{% endif %}
+    {% for sc in adm.scans %}
+      <h3>Level {{ sc.s.level }} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {{ sc.s.os_guess.as_deref().unwrap_or("OS unknown") }} · {{ sc.s.open_ports }} open
+        {% if let Some(n) = sc.s.node %}· <span class="muted">{{ n }}</span> {% endif %}· <a href="/admin/scans/{{ sc.s.id }}">details</a> · <a href="/admin/scans/{{ sc.s.id }}/xml">raw XML</a></h3>
+      {% let ports = sc.ports %}{% include "_ports.html" %}
+    {% endfor %}
+  </section>
+  {% endif %}
+
   <section class="card">
     <div class="card-head"><h2>Last 24 hours</h2><span class="muted">requests per hour</span></div>
     <div class="sparkline" data-sparkline="{{ sparkline_json }}"></div>
@@ -26,16 +72,6 @@
   </section>
 
   {% if let Some(adm) = admin %}
-  <section class="card">
-    <div class="card-head"><h2>Counter-scans</h2><span class="muted">admin only</span></div>
-    {% if adm.scans.is_empty() %}<p class="muted">No completed scans.</p>{% endif %}
-    {% for sc in adm.scans %}
-      <h3>Level {{ sc.s.level }} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {{ sc.s.os_guess.as_deref().unwrap_or("OS unknown") }}
-        · <a href="/admin/scans/{{ sc.s.id }}">details</a> · <a href="/admin/scans/{{ sc.s.id }}/xml">raw XML</a></h3>
-      {% let ports = sc.ports %}{% include "_ports.html" %}
-    {% endfor %}
-  </section>
-
   <section class="card">
     <div class="card-head"><h2>Fingerprints</h2><span class="muted">admin only</span></div>
     {% if adm.fingerprints.is_empty() %}<p class="muted">No browser fingerprints collected.</p>{% endif %}

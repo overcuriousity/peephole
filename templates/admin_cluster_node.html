@@ -1,8 +1,8 @@
 {% extends "layout.html" %}
 {% block title %}peephole — {{ name }}{% endblock %}
 {% block content %}
-<div class="page-head"><div><h1>{{ name }} <span class="mono muted">{{ short }}</span></h1><p class="muted">Runtime settings of another node, changed with its config key.</p></div>
-  <nav class="seg"><a href="/admin/cluster">Cluster</a></nav></div>
+{% let sub = "cluster" %}{% include "_admin_nav.html" %}
+<div class="page-head"><div><h1>{{ name }} <span class="mono muted">{{ short }}</span></h1><p class="muted">Runtime settings of another node, changed with its config key.</p></div></div>
 {% if let Some(n) = notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
 {% if let Some(e) = error %}<div class="banner banner-warning">{{ e }}</div>{% endif %}
 {% if let Some(s) = state %}
