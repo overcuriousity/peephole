@@ -53,6 +53,7 @@ pub fn label_class<S: AsRef<str>>(label: S) -> &'static str {
         "form-interaction" | "write-method" | "credential-attack" => "badge-cat-interact",
         "webshell" | "mcp-abuse" => "badge-cat-postex",
         "automation" | "inhuman-behavior" | "proxy-probe" | "unusual-method" => "badge-cat-bot",
+        "scanner-ua" | "research-scanner" => "badge-cat-recon",
         _ if l.ends_with("-probe") => "badge-cat-recon",
         _ => "",
     }

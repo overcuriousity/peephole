@@ -5,4 +5,5 @@
 [[rule]]
 label = "path-traversal"
 weight = 4
-target_regex = "\\.\\.(/|\\\\|%2f|%5c)|%2e%2e|\\.\\.(\\\\|/)|/etc/passwd|/proc/self|win\\.ini|boot\\.ini"
+owasp = ["A01:2021"]
+target_regex = "\\.\\.(/|\\\\|%2f|%5c)|%2e%2e|\\.\\.(\\\\|/)|\\.\\.;|(php|expect|phar|zip)://|/etc/passwd|/etc/(shadow|issue)|/proc/self|/proc/(version|cpuinfo)|win\\.ini|boot\\.ini"
