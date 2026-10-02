@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS requests (
   id INTEGER PRIMARY KEY, ts TEXT NOT NULL, ip_id INTEGER NOT NULL REFERENCES ips(id),
   method TEXT NOT NULL, path TEXT NOT NULL, query TEXT,
   headers_json TEXT NOT NULL, body BLOB,
-  labels_json TEXT NOT NULL DEFAULT '[]', severity INTEGER NOT NULL DEFAULT 0,
+  labels_json TEXT NOT NULL DEFAULT '[]',
+  owasp_json TEXT NOT NULL DEFAULT '[]', severity INTEGER NOT NULL DEFAULT 0,
   scan_level INTEGER NOT NULL DEFAULT 0, is_fp_claim INTEGER NOT NULL DEFAULT 0,
   page_token TEXT
 );

@@ -25,6 +25,8 @@ pub struct NewRequest {
     pub raw_head: Option<Vec<u8>>,
     pub tls_client_hello: Option<Vec<u8>>,
     pub ja4: Option<String>,
+    /// JSON array of OWASP tags from the verdict; None stores `'[]'`.
+    pub owasp_json: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -55,6 +57,7 @@ pub struct RequestRow {
     pub headers_json: String,
     pub body: Option<Vec<u8>>,
     pub labels_json: String,
+    pub owasp_json: String,
     pub severity: i64,
     pub scan_level: i64,
     pub is_fp_claim: bool,
@@ -532,6 +535,7 @@ mod tests {
                 headers_json: r#"[["user-agent","sqlmap/1.7"]]"#.into(),
                 body: None,
                 labels_json: r#"["scanner-ua","sensitive-path"]"#.into(),
+                owasp_json: Some(r#"["A03:2021"]"#.into()),
                 severity: 3,
                 scan_level: 2,
                 is_fp_claim: false,
@@ -543,6 +547,26 @@ mod tests {
         let row = s.request_by_id(id).await.unwrap().unwrap();
         assert_eq!(row.path, "/wp-login.php");
         assert_eq!(row.severity, 3);
+        assert_eq!(row.owasp_json, r#"["A03:2021"]"#);
+    }
+
+    #[tokio::test]
+    async fn owasp_json_defaults_to_an_empty_array() {
+        let s = test_store().await;
+        let ip = s.upsert_ip("198.51.100.11".parse().unwrap()).await.unwrap();
+        let id = s
+            .insert_request(&NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let row = s.request_by_id(id).await.unwrap().unwrap();
+        assert_eq!(row.owasp_json, "[]");
     }
 
     #[tokio::test]

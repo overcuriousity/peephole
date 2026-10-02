@@ -146,6 +146,9 @@ impl Recorder {
             headers_json: n.headers_json.clone(),
             body: n.body.clone(),
             labels_json: n.labels_json.clone(),
+            // `[]` and absent are one stored value; sign the absent form so
+            // the record rebuilds from its row byte for byte.
+            owasp_json: n.owasp_json.clone().filter(|j| j != "[]"),
             severity: n.severity,
             scan_level: n.scan_level,
             is_fp_claim: n.is_fp_claim,

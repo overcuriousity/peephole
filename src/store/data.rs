@@ -224,9 +224,10 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     let ip_id = ensure_ip(conn, &r.ip, Some(&r.ts)).await?;
     sqlx::query(
         "INSERT OR IGNORE INTO requests (uid, origin, hlc, ts, ip_id, method, path, query,
-           headers_json, body, labels_json, severity, scan_level, is_fp_claim, page_token,
-           answer, status, unrecorded, transport, via_proxy, raw_head, tls_client_hello, ja4, build)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           headers_json, body, labels_json, owasp_json, severity, scan_level, is_fp_claim,
+           page_token, answer, status, unrecorded, transport, via_proxy, raw_head,
+           tls_client_hello, ja4, build)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -239,6 +240,7 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(&r.headers_json)
     .bind(&r.body)
     .bind(&r.labels_json)
+    .bind(r.owasp_json.as_deref().unwrap_or("[]"))
     .bind(r.severity)
     .bind(r.scan_level)
     .bind(r.is_fp_claim)
@@ -1120,7 +1122,7 @@ async fn remove_row(
 /// Rebuild a row-backed record from its row, byte-for-byte as it was
 /// signed. None if the row is gone.
 pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Result<Option<Record>> {
-    // The columns added with the dataset fields (migration 0022).
+    // The columns added later (dataset fields, build, owasp_json).
     type ReqExtra = (
         String,
         Option<String>,
@@ -1131,6 +1133,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
         Option<Vec<u8>>,
         Option<Vec<u8>>,
         Option<String>,
+        String,
     );
     type Req = (
         String,
@@ -1186,7 +1189,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                 Some(r) => {
                     let x: ReqExtra = sqlx::query_as(
                         "SELECT build, answer, status, unrecorded, transport, via_proxy, raw_head,
-                                tls_client_hello, ja4
+                                tls_client_hello, ja4, owasp_json
                          FROM requests WHERE uid = ?",
                     )
                     .bind(uid)
@@ -1215,6 +1218,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         raw_head: x.6,
                         tls_client_hello: x.7,
                         ja4: x.8,
+                        owasp_json: Some(x.9).filter(|j| j != "[]"),
                     }))
                 }
             }
@@ -1790,6 +1794,7 @@ mod tests {
         r.raw_head = Some(b"GET /new HTTP/1.1\r\n\r\n".to_vec());
         r.tls_client_hello = Some(vec![0x16, 3, 1, 0, 0]);
         r.ja4 = Some("t13d0305h2_aaaaaaaaaaaa_bbbbbbbbbbbb".into());
+        r.owasp_json = Some(r#"["A03:2021"]"#.into());
         let new = Record::Request(r);
         for rec in [old, new] {
             assert_eq!(apply(&mut conn, ctx, &rec).await.unwrap(), Effect::Applied);
