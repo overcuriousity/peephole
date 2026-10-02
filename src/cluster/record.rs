@@ -244,7 +244,7 @@ pub enum Record {
 
 /// Kinds whose payload is not stored in the log but rebuilt from their row
 /// (they are large); see `store::data::rebuild`.
-pub const ROW_BACKED: &[&str] = &["request", "fingerprint", "scan_result"];
+pub const ROW_BACKED: &[&str] = &["request", "fingerprint", "scan_result", "skip_batch"];
 
 impl Record {
     pub fn kind(&self) -> &'static str {

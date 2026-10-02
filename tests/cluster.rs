@@ -1469,15 +1469,33 @@ async fn blocking_a_peer_hides_its_records_until_unblocked() {
     let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
     record(&na, "203.0.113.72", "/a1").await;
     record(&nb, "203.0.113.73", "/b1").await;
+    rec(&na)
+        .insert_skip_batch(
+            "203.0.113.72",
+            1,
+            vec![peephole::cluster::record::SkipRow {
+                ts_ms: 1,
+                method: "GET".into(),
+                path: "/a0".into(),
+            }],
+        )
+        .await
+        .unwrap();
     eventually("everyone has both", || async {
         count(&na, "SELECT COUNT(*) FROM requests").await == 2
             && count(&nb, "SELECT COUNT(*) FROM requests").await == 2
             && count(&nc, "SELECT COUNT(*) FROM requests").await == 2
+            && count(&nb, "SELECT COUNT(*) FROM skipped_requests").await == 1
     })
     .await;
 
     assert!(block::block(&nb, nb.id()).await.is_err(), "not oneself");
-    assert_eq!(block::block(&nb, a.id).await.unwrap(), 1);
+    assert_eq!(
+        block::block(&nb, a.id).await.unwrap(),
+        2,
+        "its request and light rows"
+    );
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM skipped_batches").await, 0);
     assert_eq!(
         block::block(&nb, a.id).await.unwrap(),
         0,
@@ -1510,6 +1528,7 @@ async fn blocking_a_peer_hides_its_records_until_unblocked() {
         "repeat is harmless"
     );
     assert_eq!(paths(&nb).await, ["/a1", "/a2", "/b1"]);
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM skipped_requests").await, 1);
     assert!(!nb.is_blocked(&a.id));
 }
 
@@ -1576,6 +1595,15 @@ async fn standalone_history_is_adopted_and_backfilled() {
                 .await
                 .unwrap();
         }
+        let light = |path: &str| peephole::cluster::record::SkipRow {
+            ts_ms: 1,
+            method: "GET".into(),
+            path: path.into(),
+        };
+        s.local()
+            .insert_skip_batch("192.0.2.200", 3, vec![light("/s1"), light("/s2")])
+            .await
+            .unwrap();
         let job = match s.enqueue_scan(ip.id, 2, 24).await.unwrap() {
             peephole::store::scans::EnqueueOutcome::Queued(j) => j,
             o => panic!("{o:?}"),
@@ -1592,6 +1620,7 @@ async fn standalone_history_is_adopted_and_backfilled() {
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     eventually("b backfilled everything", || async {
         count(&nb, "SELECT COUNT(*) FROM requests").await == 150
+            && count(&nb, "SELECT COUNT(*) FROM skipped_requests").await == 2
             && count(&nb, "SELECT COUNT(*) FROM ports").await == 3
             && count(
                 &nb,

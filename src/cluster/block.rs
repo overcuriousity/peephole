@@ -48,6 +48,7 @@ pub async fn block(node: &Node, id: NodeId) -> Result<u64> {
         ("fingerprints", "fingerprint"),
         ("scan_jobs", "scan_job"),
         ("requests", "request"),
+        ("skipped_batches", "skip_batch"),
     ] {
         let sql = format!("SELECT uid FROM {table} WHERE origin = ? AND uid IS NOT NULL");
         let uids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))

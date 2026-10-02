@@ -258,6 +258,9 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
 
 /// Most light rows one batch may carry, and the longest path kept.
 pub const SKIP_BATCH_MAX: usize = 1000;
+/// Most counted drops one batch may claim (far beyond any real flood in
+/// the seconds a batch covers; keeps sums and weights from overflowing).
+pub const SKIP_DROPPED_MAX: i64 = 1_000_000_000;
 pub const SKIP_PATH_MAX: usize = 1024;
 
 /// `s` cut to at most `max` bytes, on a character boundary.
@@ -276,7 +279,10 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
     if let Some(t) = erased_by(conn, &b.uid).await? {
         return Ok(Effect::Erased(t));
     }
-    if b.ip.parse::<std::net::IpAddr>().is_err() || b.rows.len() > SKIP_BATCH_MAX || b.dropped < 0 {
+    if b.ip.parse::<std::net::IpAddr>().is_err()
+        || b.rows.len() > SKIP_BATCH_MAX
+        || !(0..=SKIP_DROPPED_MAX).contains(&b.dropped)
+    {
         return Ok(Effect::Ignored);
     }
     let first = b.rows.iter().map(|r| r.ts_ms).min().unwrap_or(0);
@@ -1178,6 +1184,40 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                 }
             }
         }
+        "skip_batch" => {
+            let b: Option<(i64, String, i64)> = sqlx::query_as(
+                "SELECT b.id, i.ip, b.dropped FROM skipped_batches b JOIN ips i ON i.id = b.ip_id
+                 WHERE b.uid = ?",
+            )
+            .bind(uid)
+            .fetch_optional(&mut *conn)
+            .await?;
+            match b {
+                None => None,
+                Some((id, ip, dropped)) => {
+                    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+                        "SELECT ts_ms, method, path FROM skipped_requests
+                         WHERE batch_id = ? ORDER BY rowid",
+                    )
+                    .bind(id)
+                    .fetch_all(&mut *conn)
+                    .await?;
+                    Some(Record::SkipBatch(SkipBatchRec {
+                        uid: uid.to_string(),
+                        ip,
+                        dropped,
+                        rows: rows
+                            .into_iter()
+                            .map(|(ts_ms, method, path)| crate::cluster::record::SkipRow {
+                                ts_ms,
+                                method,
+                                path,
+                            })
+                            .collect(),
+                    }))
+                }
+            }
+        }
         "fingerprint" => {
             let r: Option<Fp> = sqlx::query_as(
                 "SELECT f.uid, f.request_uid, i.ip, f.ts, f.fp_hash, f.visitor_id,
@@ -1784,6 +1824,61 @@ mod tests {
             0
         );
         assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ips").await, 0);
+    }
+
+    /// Light-row batches are row-backed: the rows rebuild the record byte
+    /// for byte, so the log need not keep a second copy.
+    #[tokio::test]
+    async fn skip_batch_rebuilds_from_its_rows() {
+        assert!(ROW_BACKED.contains(&"skip_batch"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let row = |ts_ms, path: &str| SkipRow {
+            ts_ms,
+            method: "GET".into(),
+            path: path.into(),
+        };
+        // Out of time order on purpose: the order sent is kept.
+        let b = Record::SkipBatch(SkipBatchRec {
+            uid: format!("{}skip", a.uid_prefix()),
+            ip: "203.0.113.7".into(),
+            dropped: 2,
+            rows: vec![row(2000, "/b"), row(1000, "/a"), row(1000, "/a")],
+        });
+        assert_eq!(apply(&mut conn, ctx, &b).await.unwrap(), Effect::Applied);
+        let rebuilt = rebuild(&mut conn, "skip_batch", &b.uid().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::cluster::rpc::cbor::encode(&rebuilt).unwrap(),
+            crate::cluster::rpc::cbor::encode(&b).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skip_batch_with_an_absurd_drop_count_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let b = Record::SkipBatch(SkipBatchRec {
+            uid: format!("{}huge", a.uid_prefix()),
+            ip: "203.0.113.7".into(),
+            dropped: i64::MAX,
+            rows: vec![],
+        });
+        assert_eq!(apply(&mut conn, ctx, &b).await.unwrap(), Effect::Ignored);
     }
 
     #[tokio::test]
