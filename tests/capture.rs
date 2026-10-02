@@ -765,3 +765,42 @@ async fn a_proxy_header_without_a_client_is_dropped() {
     }
     assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 0);
 }
+
+/// Light rows noted by requests still in progress when the trap stops are
+/// written before the flusher ends.
+#[tokio::test]
+async fn light_rows_of_requests_in_flight_at_shutdown_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("c.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "trap_listen = \"127.0.0.1:0\"\ndatabase_path = \"{}\"\ndata_dir = \"{}\"\nrules_dir = \"rules\"\n[roles]\nweb = false\n",
+            dir.path().join("t.db").display(),
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    let cfg = Config::load(&cfg_path).unwrap();
+    let store = Store::connect(&cfg.database_path).await.unwrap();
+    let state = Arc::new(TrapState::for_test(store.clone(), cfg));
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let flusher = tokio::spawn(trap::flush_skips(state.clone(), rx));
+    let in_flight = state.guards.enter();
+    stop.send(true).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    state.guards.skips.note(
+        "203.0.113.20".parse().unwrap(),
+        chrono::Utc::now().timestamp_millis(),
+        "GET",
+        "/late",
+        0,
+        std::time::Instant::now(),
+    );
+    drop(in_flight);
+    flusher.await.unwrap();
+    assert_eq!(
+        count(&store, "SELECT COUNT(*) FROM skipped_requests").await,
+        1
+    );
+}
