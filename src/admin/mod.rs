@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod auth;
+pub mod cli;
 pub mod cluster;
 pub mod countries;
 pub mod error;

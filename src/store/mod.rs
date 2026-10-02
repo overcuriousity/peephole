@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod browse;
+pub mod cli;
 pub mod data;
 pub mod delete;
 pub mod fingerprints;
