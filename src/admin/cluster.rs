@@ -470,18 +470,16 @@ async fn create_invite(
 ) -> AppResult<axum::response::Response> {
     use axum::response::IntoResponse;
     let node = node(&st)?;
-    // Empty fields mean "no limit"; anything else must be a number.
-    let number = |v: &Option<String>| match v.as_deref().map(str::trim) {
-        None | Some("") => Ok(None),
-        Some(s) => s.parse::<u64>().map(Some).map_err(|_| ()),
-    };
-    let (Ok(ttl), Ok(uses)) = (number(&f.ttl_hours), number(&f.max_uses)) else {
+    // Empty fields mean the defaults (a week, 10 uses); 0 means no limit.
+    let Ok((ttl_hours, max_uses)) =
+        invite::InviteOpts::parse_limits(f.ttl_hours.as_deref(), f.max_uses.as_deref())
+    else {
         return Ok(back(None, Some("expiry and use limit must be numbers".into())).into_response());
     };
     let opts = invite::InviteOpts {
         label: f.label.unwrap_or_default(),
-        ttl_hours: ttl,
-        max_uses: uses.map(|n| n.min(u32::MAX as u64) as u32),
+        ttl_hours,
+        max_uses,
     };
     match invite::create(node, &opts).await {
         Ok(token) => Ok(render_page(&st, Some(token), Flash::default())

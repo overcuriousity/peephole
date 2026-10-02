@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub const USAGE: &str = "usage: peephole cluster id [CONFIG]
        peephole cluster invite [--label TEXT] [--ttl HOURS] [--uses N] [CONFIG]
+                               (default: expires after 168 h, 10 uses; 0 lifts a limit)
        peephole cluster invites [CONFIG]
        peephole cluster invite-revoke ID [CONFIG]
        peephole cluster join TOKEN [CONFIG]
@@ -115,22 +116,28 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                     .find(|(k, _)| k == name)
                     .map(|(_, v)| v.as_str())
             };
+            let (ttl_hours, max_uses) =
+                invite::InviteOpts::parse_limits(flag("ttl"), flag("uses"))?;
             let opts = invite::InviteOpts {
                 label: flag("label").unwrap_or_default().to_string(),
-                ttl_hours: flag("ttl")
-                    .map(|v| v.parse().context("--ttl: hours"))
-                    .transpose()?,
-                max_uses: flag("uses")
-                    .map(|v| v.parse().context("--uses: a number"))
-                    .transpose()?,
+                ttl_hours,
+                max_uses,
             };
             let (_, node) = open(cfg_at(1)).await?;
             let token = invite::create(&node, &opts).await?;
             println!("{token}");
+            let limits = format!(
+                "expires {}, {}",
+                opts.ttl_hours
+                    .map_or("never".to_string(), |h| format!("after {h} h")),
+                opts.max_uses
+                    .map_or("no use limit".to_string(), |n| format!("at most {n} uses"))
+            );
             eprintln!(
-                "reusable invite. Whoever holds it can join, and a member cannot be removed \
-                 afterwards, only blocked node by node. Limit it with --uses or --ttl; \
-                 revoke it with: peephole cluster invite-revoke <id> (see: peephole cluster invites)"
+                "reusable invite ({limits}). Whoever holds it can join, and a member cannot be \
+                 removed afterwards, only blocked node by node. Change the limits with --uses \
+                 or --ttl (0 lifts one); revoke it with: peephole cluster invite-revoke <id> \
+                 (see: peephole cluster invites)"
             );
         }
         Some("invites") => {

@@ -56,13 +56,60 @@ pub fn parse(token: &str) -> Result<Token> {
     Ok(t)
 }
 
-/// How an invite is limited. The default has no expiry and no use limit.
-#[derive(Debug, Clone, Default)]
+/// Default lifetime of an invite: a week.
+pub const DEFAULT_TTL_HOURS: u64 = 7 * 24;
+/// Default use limit of an invite.
+pub const DEFAULT_MAX_USES: u32 = 10;
+
+/// How an invite is limited. By default it expires after
+/// [`DEFAULT_TTL_HOURS`] and admits at most [`DEFAULT_MAX_USES`] nodes;
+/// `None` lifts a limit (explicitly: `--ttl 0`, `--uses 0`).
+#[derive(Debug, Clone)]
 pub struct InviteOpts {
     /// Shown in the invite list (who it was given to).
     pub label: String,
     pub ttl_hours: Option<u64>,
     pub max_uses: Option<u32>,
+}
+
+impl Default for InviteOpts {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            ttl_hours: Some(DEFAULT_TTL_HOURS),
+            max_uses: Some(DEFAULT_MAX_USES),
+        }
+    }
+}
+
+impl InviteOpts {
+    /// Limits as typed by an operator: absent or empty means the default,
+    /// `0` (or `never`/`none`) means no limit.
+    pub fn parse_limits(
+        ttl: Option<&str>,
+        uses: Option<&str>,
+    ) -> Result<(Option<u64>, Option<u32>)> {
+        fn limit<T: std::str::FromStr + PartialEq + Default>(
+            v: Option<&str>,
+            default: T,
+            what: &str,
+        ) -> Result<Option<T>> {
+            match v.map(str::trim) {
+                None | Some("") => Ok(Some(default)),
+                Some("never" | "none" | "unlimited") => Ok(None),
+                Some(s) => {
+                    let n: T = s
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{what} must be a number"))?;
+                    Ok((n != T::default()).then_some(n))
+                }
+            }
+        }
+        Ok((
+            limit(ttl, DEFAULT_TTL_HOURS, "the invite lifetime")?,
+            limit(uses, DEFAULT_MAX_USES, "the invite use limit")?,
+        ))
+    }
 }
 
 /// Create an invite; returns the token (shown once).
@@ -167,11 +214,29 @@ pub async fn redeem(node: &Node, peer: NodeId, req: JoinReq) -> Result<JoinResp,
     if req.info.id != peer {
         return Err((400, "member info does not match the TLS key".into()));
     }
-    let name = req.info.name.trim();
-    if name.is_empty() || name.len() > 64 {
-        return Err((400, "node name must be 1-64 characters".into()));
+    if !super::members::valid_name(req.info.name.trim()) {
+        return Err((400, "node name must be 1-64 printable characters".into()));
+    }
+    if req
+        .info
+        .address
+        .as_deref()
+        .is_some_and(|a| !super::members::valid_address(a))
+    {
+        return Err((400, "address must be host:port".into()));
     }
     let internal = |e: anyhow::Error| (500, format!("{e:#}"));
+    // Peers ignore admissions over the daily limit; do not use up the
+    // invite for one.
+    if !super::members::can_admit(node, &peer)
+        .await
+        .map_err(internal)?
+    {
+        return Err((
+            429,
+            "this node admitted too many members today; try again tomorrow".into(),
+        ));
+    }
     // One statement, so concurrent joins cannot exceed the use limit.
     let invite: Option<i64> = sqlx::query_scalar(
         "UPDATE invites SET uses = uses + 1
@@ -276,4 +341,30 @@ pub async fn revoke(store: &crate::store::Store, id: i64) -> Result<bool> {
     .await?
     .rows_affected();
     Ok(n == 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invites_are_limited_unless_told_otherwise() {
+        let d = InviteOpts::default();
+        assert_eq!(
+            (d.ttl_hours, d.max_uses),
+            (Some(DEFAULT_TTL_HOURS), Some(DEFAULT_MAX_USES))
+        );
+        let p = InviteOpts::parse_limits;
+        assert_eq!(
+            p(None, None).unwrap(),
+            (Some(DEFAULT_TTL_HOURS), Some(DEFAULT_MAX_USES))
+        );
+        assert_eq!(
+            p(Some(""), Some(" ")).unwrap(),
+            (Some(DEFAULT_TTL_HOURS), Some(DEFAULT_MAX_USES))
+        );
+        assert_eq!(p(Some("0"), Some("0")).unwrap(), (None, None));
+        assert_eq!(p(Some("never"), Some("3")).unwrap(), (None, Some(3)));
+        assert!(p(Some("soon"), None).is_err());
+    }
 }

@@ -140,11 +140,13 @@ nodes:
 
 ```sh
 peephole cluster id                       # this node's key
-peephole cluster invite --label friends   # on a member: a reusable invite
+peephole cluster invite --label friends   # on a member: a reusable invite (a week, 10 uses)
 peephole cluster invites                  # list them; invite-revoke <id> closes one
 peephole cluster join <token>             # on the new node; or Admin → Cluster
 peephole cluster members                  # who is in, and their standing
 peephole cluster block <node>             # this node ignores a peer (unblock undoes it)
+peephole cluster block --subtree <node>   # ... and every node it admitted, transitively
+peephole cluster purge <node>             # delete a blocked peer's data here, stop relaying it
 peephole cluster leave                    # this node leaves; it keeps its data
 ```
 
@@ -159,17 +161,32 @@ How trust works:
   shows no sign of life for 30 days is pruned by every node on its own and
   rejoins with an invite.
 - **An invite is reusable** until it expires, reaches its use limit or is
-  revoked. Whoever holds a usable invite can join and cannot be removed
-  afterwards, so limit invites you hand to more than one person.
+  revoked: by default after a week or 10 uses (`--ttl 0` / `--uses 0`
+  lift a limit). Whoever holds a usable invite can join and cannot be
+  removed afterwards. A member admits at most 20 new nodes a day; a node
+  that left admits nobody.
 - **Blocking is local.** A node that blocks a peer stops talking to it and
   shows none of its records. It still stores and relays them, so other
-  nodes are unaffected.
+  nodes are unaffected. `--subtree` (or "Block with all it admitted" on
+  the Cluster page) also blocks every node it admitted. Purging a blocked
+  peer deletes what this node holds of it and stops relaying it.
+- **Each node judges for itself.** Timestamps from the future count as of
+  receipt; scan jobs must name a public address and a known level, at most
+  2000 per member and hour; a member's jobs move to another arbiter only
+  once this node, too, sees the arbiter silent (or the job untouched) for
+  `takeover_hours`. Entries of a node nobody admitted are parked only up to
+  100 per node and dropped after a week. `cluster.origin_quota_mb`
+  (default 20 GiB) caps what one member's entries may take on this node.
 - **Deletes reach your own records only.** Deleting something your node
   recorded removes it on every node. Deleting something another node
   recorded hides it on your node only.
 - **The dataset is persistent.** What a node contributed stays when it
   leaves or is pruned. `scan.retention_days` applies to standalone nodes
-  only; a cluster node's database grows with the cluster.
+  only; a cluster node's database grows with the cluster. To bound it
+  cooperatively, a node can opt in to `cluster.retention_days`: it then
+  deletes its *own* requests and scan results older than that, on every
+  node. The log itself is never compacted: a node joining later fetches it
+  in full from any member.
 
 Changing another node's settings:
 
