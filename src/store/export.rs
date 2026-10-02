@@ -21,6 +21,7 @@ pub struct ReqRow {
     pub headers_json: String,
     pub body: Option<Vec<u8>>,
     pub labels_json: String,
+    pub owasp_json: String,
     pub severity: i64,
     pub scan_level: i64,
     pub answer: Option<String>,
@@ -131,7 +132,7 @@ impl Store {
     ) -> Result<Vec<ReqRow>> {
         let mut sql = String::from(
             "SELECT r.id, r.uid, r.origin, r.ts, r.ip_id, i.ip, r.method, r.path, r.query,
-                    r.headers_json, r.body, r.labels_json, r.severity, r.scan_level, r.answer,
+                    r.headers_json, r.body, r.labels_json, r.owasp_json, r.severity, r.scan_level, r.answer,
                     r.status, r.unrecorded, r.transport, r.via_proxy, r.raw_head,
                     r.tls_client_hello, r.ja4, r.build
              FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1",

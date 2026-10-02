@@ -90,6 +90,7 @@ pub struct ExportRow {
     /// rows existed always carry theirs.
     pub weight: i64,
     pub labels: Vec<String>,
+    pub owasp: Vec<String>,
     pub severity: Option<i64>,
     pub scan_level: Option<i64>,
     pub fp_claim: bool,
@@ -133,6 +134,7 @@ pub const COLUMNS: &[&str] = &[
     "unrecorded",
     "weight",
     "labels",
+    "owasp",
     "severity",
     "scan_level",
     "fp_claim",
@@ -286,6 +288,7 @@ impl ExportRow {
             "unrecorded": self.unrecorded,
             "weight": self.weight,
             "labels": self.labels,
+            "owasp": self.owasp,
             "severity": self.severity,
             "scan_level": self.scan_level,
             "fp_claim": self.fp_claim,
@@ -606,6 +609,7 @@ fn request_row(
         unrecorded,
         weight,
         labels: serde_json::from_str(&r.labels_json).unwrap_or_default(),
+        owasp: serde_json::from_str(&r.owasp_json).unwrap_or_default(),
         severity: Some(r.severity),
         scan_level: Some(r.scan_level),
         fingerprints: Value::Array(fingerprints).to_string().into(),
@@ -814,6 +818,7 @@ mod tests {
             query: None,
             headers: vec![("User-Agent".into(), "curl".into())],
             labels: vec!["sensitive-path".into()],
+            owasp: vec!["OAT-018".into()],
             severity: Some(2),
             scan_level: Some(2),
             weight: 1,
@@ -885,6 +890,13 @@ mod tests {
         assert_eq!(v["headers"][0][0], "User-Agent");
         assert_eq!(v["body"], "YT0x");
         assert_eq!(v["labels"][0], "sensitive-path");
+        assert_eq!(v["owasp"][0], "OAT-018");
+    }
+
+    #[test]
+    fn csv_has_an_owasp_column_after_labels() {
+        let header = csv_header();
+        assert!(header.contains(",owasp,severity,"), "{header}");
     }
 
     async fn collect(s: &Store, f: ExportFilter, format: Format) -> Vec<axum::body::Bytes> {
