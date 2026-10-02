@@ -1213,6 +1213,7 @@ async fn erased_stubs_need_the_origins_tombstone() {
     // A relay strips /two and claims A's tombstone erased it.
     let (x, _dx) = offline_node(&[&a, &b]).await;
     let mut forged = Batch {
+        bounds: vec![],
         floors: vec![],
         entries: before.entries.clone(),
         proofs: after.proofs.clone(),
@@ -1242,6 +1243,7 @@ async fn erased_stubs_need_the_origins_tombstone() {
     // names /one's own position in A's log, so it does not cover this one.
     let (w, _dw) = offline_node(&[&a, &b]).await;
     let mut relabel = Batch {
+        bounds: vec![],
         floors: vec![],
         entries: after.entries.clone(),
         proofs: after.proofs.clone(),
@@ -1261,12 +1263,14 @@ async fn erased_stubs_need_the_origins_tombstone() {
 
     // No proof, a proof from another origin, a stub without a uid: rejected.
     let stub_only = Batch {
+        bounds: vec![],
         floors: vec![],
         entries: after.entries.clone(),
         proofs: vec![],
     };
     let other = Identity::generate().unwrap();
     let wrong_origin = Batch {
+        bounds: vec![],
         floors: vec![],
         entries: after.entries.clone(),
         proofs: vec![
@@ -1284,6 +1288,7 @@ async fn erased_stubs_need_the_origins_tombstone() {
         ],
     };
     let mut no_uid = Batch {
+        bounds: vec![],
         floors: vec![],
         entries: after.entries.clone(),
         proofs: after.proofs.clone(),

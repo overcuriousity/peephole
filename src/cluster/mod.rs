@@ -273,6 +273,10 @@ pub struct Node {
     pub own_floors: RwLock<history::Floors>,
     /// Sync rounds run, with any peer (status and tests).
     pub sync_rounds: std::sync::atomic::AtomicU64,
+    /// The furthest any peer is known to hold this node's own log (from
+    /// sync rounds since start). A windowed node never drops its own
+    /// entries beyond it: they may be the only copy.
+    pub own_acked: std::sync::atomic::AtomicU64,
     /// Per peer: origins we lack that its history does not reach back to,
     /// as of the last round (a full node waits for a full member).
     pub unserved: Mutex<HashMap<NodeId, Vec<NodeId>>>,
@@ -318,6 +322,7 @@ impl Node {
             own_floors: Default::default(),
             sync_rounds: Default::default(),
             unserved: Default::default(),
+            own_acked: Default::default(),
         });
         // Our clock must not run behind anything already in the log.
         let max_hlc: Option<i64> = sqlx::query_scalar("SELECT MAX(hlc) FROM repl_log")
@@ -507,6 +512,21 @@ impl Node {
         v.sort();
         v.dedup();
         v
+    }
+
+    /// Whether a member other than `peer` that keeps at least this node's
+    /// window (or everything) was heard from recently: a windowed node then
+    /// fetches from it rather than start at `peer`'s floor.
+    pub fn keeps_more_elsewhere(&self, peer: &NodeId) -> bool {
+        let mine = self.retention_days;
+        self.members().keys().any(|id| {
+            *id != self.id()
+                && id != peer
+                && self.status.known(id).is_some_and(|k| {
+                    k.advanced.elapsed() < status::NEIGHBOUR_WINDOW
+                        && (k.hb.retention_days == 0 || k.hb.retention_days >= mine)
+                })
+        })
     }
 
     /// Re-read this node's floors (after a prune, for the heartbeat).

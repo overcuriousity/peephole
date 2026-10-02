@@ -324,7 +324,7 @@ async fn batch_from(n: &Node, origin: NodeId, after: u64) -> peephole::cluster::
 async fn a_windowed_node_starts_at_a_peer_floor() {
     let (a, x, _d) = windowed_holder().await;
     let (w, _e) = offline(&[&a], 7).await;
-    let st = repl::apply_batch(&w, batch_from(&x, a.key(), 0).await)
+    let st = repl::apply_batch_with(&w, batch_from(&x, a.key(), 0).await, true)
         .await
         .unwrap();
     assert_eq!((st.applied, st.rejected), (3, 0), "{st:?}");
@@ -336,7 +336,7 @@ async fn a_windowed_node_starts_at_a_peer_floor() {
         1
     );
     // Offered again: nothing new.
-    let st = repl::apply_batch(&w, batch_from(&x, a.key(), 0).await)
+    let st = repl::apply_batch_with(&w, batch_from(&x, a.key(), 0).await, true)
         .await
         .unwrap();
     assert_eq!(st.applied, 0);
@@ -376,7 +376,7 @@ async fn a_windowed_node_jumps_to_a_peer_floor() {
     a.seq = 0;
     let first = old_and_new(&mut a).into_iter().take(2).collect();
     apply(&w, first).await;
-    let st = repl::apply_batch(&w, batch_from(&x, a.key(), 2).await)
+    let st = repl::apply_batch_with(&w, batch_from(&x, a.key(), 2).await, true)
         .await
         .unwrap();
     assert_eq!(st.applied, 2, "{st:?}");
@@ -415,8 +415,9 @@ async fn an_admission_after_a_gap_in_the_sponsors_history_counts() {
         entries: vec![b1, a5],
         proofs: vec![],
         floors: vec![(a.key(), 5)],
+        bounds: vec![],
     };
-    let st = repl::apply_batch(&w, batch).await.unwrap();
+    let st = repl::apply_batch_with(&w, batch, true).await.unwrap();
     assert_eq!(st.applied, 2, "{st:?}");
     let admitted: i64 = sqlx::query_scalar("SELECT admitted_hlc FROM members WHERE id = ?")
         .bind(&c.key().0[..])
@@ -424,4 +425,97 @@ async fn an_admission_after_a_gap_in_the_sponsors_history_counts() {
         .await
         .unwrap();
     assert!(admitted > 0);
+}
+
+/// A batch cut short after the membership below a sender's start still
+/// moves the floor (and the head) to that start, so what follows connects
+/// there and nothing in between is taken as held.
+#[tokio::test]
+async fn the_floor_moves_before_the_membership_below_it() {
+    let (a, x, _d) = windowed_holder().await;
+    let (w, _e) = offline(&[&a], 7).await;
+    let cut_short = repl::entries_after(&x.store, &[(a.key(), 0)], 0, 1, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(cut_short.entries.len(), 1);
+    repl::apply_batch_with(&w, cut_short, true).await.unwrap();
+    assert_eq!(floor(&w, a.key()).await, 5);
+    // The rest connects (asked for after what is held).
+    let st = repl::apply_batch_with(&w, batch_from(&x, a.key(), 1).await, true)
+        .await
+        .unwrap();
+    assert_eq!(st.applied, 2, "{st:?}");
+}
+
+/// A windowed node skips history only on proof that what it skips is
+/// older than its window (the signed entry right before the start), or
+/// when its own sync round allows it (no peer keeping more is reachable).
+/// A declared start alone — e.g. pushed by a member — is not enough.
+#[tokio::test]
+async fn a_jump_needs_proof_or_permission() {
+    let (a, x, _d) = windowed_holder().await;
+    let (w, _e) = offline(&[&a], 7).await;
+    // Only what connects (seq 1); nothing is skipped.
+    let st = repl::apply_batch(&w, batch_from(&x, a.key(), 0).await)
+        .await
+        .unwrap();
+    assert_eq!((st.applied, st.rejected), (1, 2), "{st:?}");
+    assert_eq!(held(&w, a.key()).await, [1]);
+    assert_eq!(floor(&w, a.key()).await, 1);
+    // From a node holding everything, the window comes with its proof.
+    let mut a = a;
+    a.seq = 0;
+    let (f, _g) = offline(&[&a], 0).await;
+    apply(&f, old_and_new(&mut a)).await;
+    let week = history::window_hlc(7, wall_ms());
+    let proven = repl::entries_after(&f.store, &[(a.key(), 0)], week, 1000, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(proven.bounds.len(), 1);
+    let st = repl::apply_batch(&w, proven).await.unwrap();
+    assert_eq!(st.applied, 2, "{st:?}");
+    assert_eq!(held(&w, a.key()).await, [1, 5, 6]);
+}
+
+/// A windowed node cut off from every peer keeps its own records, however
+/// old, until a peer is known to hold them: they may be the only copy.
+#[tokio::test]
+async fn own_history_stays_until_a_peer_holds_it() {
+    let a = Origin::new();
+    let (x, _d) = offline(&[&a], 7).await;
+    let me = x.id();
+    let r = peephole::store::recorder::Recorder::Cluster(x.clone());
+    let ip = x
+        .store
+        .upsert_ip("203.0.113.9".parse().unwrap())
+        .await
+        .unwrap();
+    for path in ["/mine1", "/mine2"] {
+        r.insert_request(&peephole::store::requests::NewRequest {
+            ip_id: ip.id,
+            method: "GET".into(),
+            path: path.into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    // Age everything of ours past the window.
+    sqlx::query("UPDATE repl_log SET hlc = ? WHERE origin = ?")
+        .bind(days_ago(40, 0) as i64)
+        .bind(&me.0[..])
+        .execute(&x.store.pool)
+        .await
+        .unwrap();
+    let head = held(&x, me).await.last().copied().unwrap() as u64;
+    assert_eq!(history::prune(&x).await.unwrap(), 0);
+    assert_eq!(count(&x, "SELECT COUNT(*) FROM requests").await, 2);
+    // A peer holds all but our newest entry.
+    x.own_acked
+        .store(head - 1, std::sync::atomic::Ordering::Relaxed);
+    assert!(history::prune(&x).await.unwrap() > 0);
+    assert_eq!(floor(&x, me).await, head);
+    assert_eq!(count(&x, "SELECT COUNT(*) FROM requests").await, 1);
 }

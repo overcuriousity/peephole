@@ -54,6 +54,11 @@ pub struct Batch {
     /// that start are membership entries.
     #[serde(default)]
     pub floors: Vec<(NodeId, u64)>,
+    /// For a start in `floors`, the signed entry right before it when the
+    /// sender holds it: proof that what the receiver skips is as old as it
+    /// is (older than its window).
+    #[serde(default)]
+    pub bounds: Vec<WireEntry>,
 }
 
 impl From<Vec<WireEntry>> for Batch {
@@ -208,6 +213,14 @@ async fn peer_loop(
     }
 }
 
+/// A peer holds our own log this far.
+fn note_own_acked(node: &Node, theirs: &Heads) {
+    node.own_acked.fetch_max(
+        repl::head_in(theirs, &node.id()),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// A random duration below `max`.
 fn jitter(max: Duration) -> Duration {
     let mut b = [0u8; 4];
@@ -233,6 +246,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
     }
     let ours = repl::heads(&node.store).await?;
     let theirs: Heads = node.call(peer, addr, "/rpc/v1/heads", &ours).await?;
+    note_own_acked(node, &theirs);
     let gossip: Vec<super::status::SignedHeartbeat> = node
         .call(peer, addr, "/rpc/v1/gossip", &node.status.all_signed())
         .await?;
@@ -241,6 +255,10 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
     // must not crowd out the rest) and what the peer cannot serve us (its
     // history starts past ours).
     let refused = repl::refused_origins(node).await?;
+    // A windowed node starts at this peer's floor only when no member that
+    // keeps more is reachable; otherwise it waits for that one.
+    let skip_ok = !node.keeps_more_elsewhere(&peer);
+    let take_floor = node.windowed() && skip_ok;
     let unserved: Vec<NodeId> = {
         let ours = repl::head_map(&repl::heads(&node.store).await?);
         theirs
@@ -249,7 +267,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
                 let mine = ours.get(o).copied().unwrap_or(0);
                 !refused.contains(o)
                     && mine < *s
-                    && !history::servable(node.peer_floor(&peer, o), mine, node.windowed())
+                    && !history::servable(node.peer_floor(&peer, o), mine, take_floor)
             })
             .map(|(o, _)| *o)
             .collect()
@@ -263,7 +281,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             .filter(|(o, _)| !refused.contains(o))
             .map(|(o, s)| (*o, *s, ours.get(o).copied().unwrap_or(0)))
             .filter(|(o, s, mine)| {
-                mine < s && history::servable(node.peer_floor(&peer, o), *mine, node.windowed())
+                mine < s && history::servable(node.peer_floor(&peer, o), *mine, take_floor)
             })
             .map(|(o, _, mine)| (o, mine))
             .collect();
@@ -289,7 +307,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             stuck = true;
             break;
         }
-        let st = repl::apply_batch(node, batch).await?;
+        let st = repl::apply_batch_with(node, batch, skip_ok).await?;
         if st.applied + st.parked == 0 {
             // The peer has entries we cannot make progress on; stop pulling and
             // signal the caller to back off rather than spin.
@@ -332,6 +350,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         if !repl::ahead_of_map(&after, &theirs) {
             break; // they accepted nothing (e.g. a gap on their side)
         }
+        note_own_acked(node, &after);
         theirs = repl::head_map(&after);
     }
     node.record_status(peer, &name, Ok(None)).await;

@@ -246,6 +246,7 @@ pub async fn entries_after(
     let purged = purged_set(&mut conn).await?;
     let floors = super::history::floors(&mut conn).await?;
     let mut declared = vec![];
+    let mut bounds = vec![];
     let share = (max_entries / wants.len().max(1)).max(100).min(max_entries);
     let mut out: Vec<WireEntry> = vec![];
     let mut bytes = 0usize;
@@ -268,6 +269,9 @@ pub async fn entries_after(
         }
         if start > *after + 1 {
             declared.push((*origin, start));
+            if let Some(b) = signed_entry(&mut conn, origin, start - 1).await? {
+                bounds.push(b);
+            }
         }
         let mut next = start;
         let rows: Vec<LogRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -358,7 +362,37 @@ pub async fn entries_after(
         entries: out,
         proofs,
         floors: declared,
+        bounds,
     })
+}
+
+/// `origin`'s entry `seq` with its signed payload (rebuilt from its row if
+/// need be); None if it is not held or erased.
+async fn signed_entry(
+    conn: &mut SqliteConnection,
+    origin: &NodeId,
+    seq: u64,
+) -> Result<Option<WireEntry>> {
+    let row: Option<LogRow> = sqlx::query_as(
+        "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by FROM repl_log
+         WHERE origin = ? AND seq = ? AND sig IS NOT NULL",
+    )
+    .bind(&origin.0[..])
+    .bind(seq.min(i64::MAX as u64) as i64)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(mut e) = row.map(from_row).transpose()? else {
+        return Ok(None);
+    };
+    if e.payload.is_none() {
+        let rebuilt = match &e.uid {
+            Some(uid) => data::rebuild(conn, &e.kind, uid).await?,
+            None => None,
+        };
+        let Some(r) = rebuilt else { return Ok(None) };
+        e.payload = Some(super::rpc::cbor::encode(&r)?);
+    }
+    Ok(Some(e))
 }
 
 /// The tombstone `tomb_uid` of `origin` as we hold it: in the log, or
@@ -574,14 +608,38 @@ pub async fn append(node: &Node, records: &[Record]) -> Result<Vec<WireEntry>> {
     Ok(out)
 }
 
-/// Apply entries received from a peer (any origin).
+/// Apply entries received from a peer (any origin). A windowed node skips
+/// history only with proof (see [`apply_batch_with`]).
 pub async fn apply_batch(node: &Node, batch: impl Into<Batch>) -> Result<Applied> {
+    apply_batch_with(node, batch, false).await
+}
+
+/// Apply entries received from a peer. `skip_ok`: this node's own sync
+/// round found no reachable peer that keeps more history than the sender,
+/// so a windowed node may start at the sender's floor without proof that
+/// what it skips is older than its window.
+pub async fn apply_batch_with(
+    node: &Node,
+    batch: impl Into<Batch>,
+    skip_ok: bool,
+) -> Result<Applied> {
     let Batch {
         entries,
         proofs,
         floors,
+        bounds,
     } = batch.into();
-    let floors: HeadMap = floors.into_iter().collect();
+    // Where each origin may start here, if past what is held.
+    let since = node.since_hlc();
+    let floors: HeadMap = floors
+        .into_iter()
+        .filter(|(o, start)| {
+            skip_ok
+                || bounds
+                    .iter()
+                    .any(|b| b.origin == *o && b.seq + 1 == *start && b.hlc < since && b.verify())
+        })
+        .collect();
     let mut st = Applied::default();
     if entries.is_empty() {
         return Ok(st);
@@ -639,17 +697,21 @@ async fn apply_one(
     if node.retention_days > 0
         && let Some(start) = start.filter(|s| *s > held + 1)
     {
-        if !trusted(node, conn, &e.origin).await? || e.seq > start {
+        let valid = if e.seq < start {
+            super::history::MEMBERSHIP.contains(&e.kind.as_str())
+                && e.payload.is_some()
+                && e.verify()
+        } else {
+            e.seq == start && acceptable(conn, &e, proofs).await?
+        };
+        if !valid || !trusted(node, conn, &e.origin).await? {
             st.rejected += 1;
             return Ok(());
         }
-        if e.seq < start {
-            return apply_membership_below(node, conn, e, st).await;
-        }
-        if !acceptable(conn, &e, proofs).await? {
-            st.rejected += 1;
-            return Ok(());
-        }
+        // The floor moves first, so whatever arrives next connects at the
+        // start, also when this batch ends before it. The head stays at what
+        // is held: membership entries a cut-short batch did not carry are
+        // asked for again.
         super::history::raise_floor(conn, &e.origin, start).await?;
         // Parked entries before the new floor will never connect.
         sqlx::query("DELETE FROM repl_pending WHERE origin = ? AND seq < ?")
@@ -657,8 +719,14 @@ async fn apply_one(
             .bind(start.min(i64::MAX as u64) as i64)
             .execute(&mut *conn)
             .await?;
+        if e.seq < start {
+            return apply_membership_below(node, conn, e, st).await;
+        }
         have = start - 1;
         held = have;
+    } else if node.retention_days > 0 && start.is_some_and(|s| e.seq < s) {
+        // Membership below a start this node already moved to.
+        return apply_membership_below(node, conn, e, st).await;
     }
     if e.seq <= held {
         st.duplicate += 1;

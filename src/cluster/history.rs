@@ -149,7 +149,13 @@ pub async fn prune(node: &Node) -> Result<u64> {
 async fn prune_origin(node: &Node, origin: &NodeId, since: u64) -> Result<u64> {
     let mut conn = node.store.pool.acquire().await?;
     let floor = floor_of(&mut conn, origin).await?;
-    let new_floor = cut(&mut conn, origin, floor, since).await?.max(floor);
+    let mut new_floor = cut(&mut conn, origin, floor, since).await?;
+    if *origin == node.id() {
+        // Our own entries go only once a peer is known to hold them.
+        let acked = node.own_acked.load(std::sync::atomic::Ordering::Relaxed);
+        new_floor = new_floor.min(acked + 1);
+    }
+    let new_floor = new_floor.max(floor);
     drop(conn);
     let mut n = 0;
     loop {

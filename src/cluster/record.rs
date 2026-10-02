@@ -70,8 +70,9 @@ pub struct RequestRec {
     pub tls_client_hello: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ja4: Option<String>,
-    /// Source commit of the binary that created the record (provenance).
-    #[serde(default)]
+    /// Source commit of the binary that created the record (provenance);
+    /// left out when unset, like every field added later.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub build: String,
 }
 
@@ -92,8 +93,9 @@ pub struct SkipBatchRec {
     pub ip: String,
     pub dropped: i64,
     pub rows: Vec<SkipRow>,
-    /// Source commit of the binary that created the record (provenance).
-    #[serde(default)]
+    /// Source commit of the binary that created the record (provenance);
+    /// left out when unset, like every field added later.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub build: String,
 }
 
@@ -109,8 +111,9 @@ pub struct IpIntelRec {
     /// Provider-specific fields as a JSON object. `{}`: the provider was
     /// asked and knows nothing.
     pub data_json: String,
-    /// Source commit of the binary that created the record (provenance).
-    #[serde(default)]
+    /// Source commit of the binary that created the record (provenance);
+    /// left out when unset, like every field added later.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub build: String,
 }
 
@@ -123,8 +126,9 @@ pub struct FpClaimRec {
     pub ts: String,
     pub contact_email: Option<String>,
     pub user_agent: Option<String>,
-    /// Source commit of the binary that created the record (provenance).
-    #[serde(default)]
+    /// Source commit of the binary that created the record (provenance);
+    /// left out when unset, like every field added later.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub build: String,
 }
 
@@ -142,8 +146,9 @@ pub struct FingerprintRec {
     /// zstd-compressed, as stored.
     #[serde(with = "serde_bytes")]
     pub event_blob: Option<Vec<u8>>,
-    /// Source commit of the binary that created the record (provenance).
-    #[serde(default)]
+    /// Source commit of the binary that created the record (provenance);
+    /// left out when unset, like every field added later.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub build: String,
 }
 
@@ -205,8 +210,9 @@ pub struct ScanResultRec {
     #[serde(with = "serde_bytes")]
     pub raw_xml: Option<Vec<u8>>,
     pub ports: Vec<PortRec>,
-    /// Source commit of the binary that created the record (provenance).
-    #[serde(default)]
+    /// Source commit of the binary that created the record (provenance);
+    /// left out when unset, like every field added later.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub build: String,
 }
 
@@ -397,6 +403,28 @@ impl WireEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A record signed before `build` existed encodes without it, so it
+    /// still rebuilds byte for byte from its row.
+    #[test]
+    fn an_unset_build_is_left_out_of_the_encoding() {
+        let enc = |r: &Record| crate::cluster::rpc::cbor::encode(r).unwrap();
+        let has_build = |b: Vec<u8>| b.windows(5).any(|w| w == b"build");
+        assert!(!has_build(enc(&Record::Request(RequestRec::default()))));
+        let skip = SkipBatchRec {
+            uid: "u".into(),
+            ip: "203.0.113.1".into(),
+            dropped: 0,
+            rows: vec![],
+            build: String::new(),
+        };
+        assert!(!has_build(enc(&Record::SkipBatch(skip.clone()))));
+        let set = SkipBatchRec {
+            build: "0123456789ab".into(),
+            ..skip
+        };
+        assert!(has_build(enc(&Record::SkipBatch(set))));
+    }
 
     fn info(id: NodeId) -> MemberInfo {
         MemberInfo {
