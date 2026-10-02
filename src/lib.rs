@@ -497,6 +497,8 @@ impl RoleRunner {
             stop,
             task: tokio::spawn(async move {
                 let mut grace = rx.clone();
+                // The peer address feeds the per-client rate limits.
+                let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
                 let served = axum::serve(listener, app).with_graceful_shutdown(async move {
                     let _ = rx.wait_for(|v| *v).await;
                 });

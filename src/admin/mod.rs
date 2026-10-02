@@ -3,6 +3,7 @@ pub mod auth;
 pub mod cluster;
 pub mod countries;
 pub mod error;
+pub mod limit;
 pub mod pages;
 pub mod public;
 pub mod sse;
@@ -26,6 +27,8 @@ pub struct AdminState {
     /// Set to `true` when the web role is switched off: long-lived
     /// responses (the live queue) end, so the listener can stop.
     pub closing: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Per-client rate limits (public pages, sign-in ceremonies).
+    pub limits: limit::Limits,
 }
 
 impl AdminState {
@@ -38,6 +41,7 @@ impl AdminState {
         Self {
             recorder: store.local(),
             settings: crate::settings::Settings::with_pace(store.clone(), &cfg, pace.clone()),
+            limits: limit::Limits::new(&cfg),
             store,
             cfg,
             notifier,
@@ -89,6 +93,10 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(pages::routes())
         .merge(cluster::routes())
         .fallback(error::not_found)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            limit::enforce,
+        ))
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
