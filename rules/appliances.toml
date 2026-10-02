@@ -6,6 +6,7 @@
 [[rule]]
 label = "appliance-probe"
 weight = 3
+owasp = ["OAT-014"]
 # Fortinet FortiGate SSL VPN (/remote/fgt_lang, /remote/logincheck), Ivanti /
 # Pulse Connect Secure (/dana-na/, the TOTP backup-code and license APIs),
 # Palo Alto GlobalProtect, Cisco ASA (/+CSCOE+/), Citrix ADC/Gateway
@@ -15,6 +16,7 @@ target_regex = '''/remote/(fgt_lang|logincheck|login|info)(/|\?|$)|/dana-(na|ws|
 [[rule]]
 label = "appliance-probe"
 weight = 3
+owasp = ["OAT-014"]
 # Microsoft Exchange (ProxyLogon/ProxyShell recon): Autodiscover, OWA, ECP,
 # EWS, MAPI at the root of the site.
 target_regex = '''^/(autodiscover/|owa(/|\?|$)|ecp/|ews/|mapi/)'''
@@ -22,6 +24,7 @@ target_regex = '''^/(autodiscover/|owa(/|\?|$)|ecp/|ews/|mapi/)'''
 [[rule]]
 label = "iot-probe"
 weight = 3
+owasp = ["OAT-014"]
 # Consumer routers and modems (Mirai-style botnets): D-Link HNAP, Boa web
 # server forms, GPON ONT forms.
-target_regex = '''/hnap1(/|\?|$)|/boaform/|/gponform/'''
+target_regex = '''/hnap1(/|\?|$)|/boaform/|/gponform/|/picsdesc\.xml|/ctrlt/DeviceUpgrade|/setup\.cgi(/|\?|$)|/tmUnblock\.cgi|/JNAP/|/SDK/webLanguage|/doc/page/login|/RPC2_Login|/current_config(/|\?|$)'''

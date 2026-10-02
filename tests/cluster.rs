@@ -732,7 +732,7 @@ async fn a_uid_not_bound_to_its_origin_is_rejected() {
     );
     let (x, _dx) = offline_node(&[&a, &b]).await;
     let request = |uid: String| {
-        Record::Request(peephole::cluster::record::RequestRec {
+        Record::Request(Box::new(peephole::cluster::record::RequestRec {
             uid,
             ts: "2026-01-01 00:00:00".into(),
             ip: "203.0.113.80".into(),
@@ -747,7 +747,7 @@ async fn a_uid_not_bound_to_its_origin_is_rejected() {
             is_fp_claim: false,
             page_token: None,
             ..Default::default()
-        })
+        }))
     };
     let a_uid = format!("{}one", a_id.id.uid_prefix());
     let st = repl::apply_batch(
@@ -3114,7 +3114,7 @@ impl Writer {
     }
 
     fn request(&self, path: &str) -> Record {
-        Record::Request(peephole::cluster::record::RequestRec {
+        Record::Request(Box::new(peephole::cluster::record::RequestRec {
             uid: format!(
                 "{}{}",
                 self.id.id.uid_prefix(),
@@ -3128,7 +3128,7 @@ impl Writer {
             labels_json: "[]".into(),
             severity: 1,
             ..Default::default()
-        })
+        }))
     }
 
     /// A description, two records far outside a week and one inside.

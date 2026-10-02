@@ -1,8 +1,9 @@
 [[rule]]
 label = "xss"
 weight = 3
-target_regex = "<script|%3Cscript|javascript:|onerror\\s*=|onload\\s*="
+owasp = ["A03:2021"]
+target_regex = "<script|%3Cscript|javascript:|onerror\\s*=|onload\\s*=|<svg|<img[\\s/]|<iframe|alert\\s*\\(|confirm\\s*\\(|prompt\\s*\\(|document\\.(cookie|location)|fromCharCode"
 # In a body (form fields, JSON) prose can mention "javascript: the good
 # parts", so the scheme needs a payload right after it and event handlers
 # must sit inside a tag.
-body_regex = '''<script|javascript:[^\s]|<[a-z][^>]*\son(error|load|mouseover|focus|toggle)\s*='''
+body_regex = '''<script|<svg|javascript:[^\s]|<[a-z][^>]*\son(error|load|mouseover|focus|toggle|click|pointerover|animationstart)\s*='''

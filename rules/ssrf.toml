@@ -1,0 +1,20 @@
+# Server-side request forgery (A10:2021). Matched raw and percent-decoded,
+# so encoded targets (%3a%2f%2f, %31%32%37…) are caught. Weight 4: asking a
+# server to fetch cloud metadata or an internal address is the exploit.
+
+[[rule]]
+label = "ssrf"
+weight = 4
+owasp = ["A10:2021"]
+# Cloud metadata and link-local services, anywhere in the target: AWS,
+# GCP, the ECS task-credentials endpoint, Alibaba Cloud.
+target_regex = '''169\.254\.(169\.254|170\.2)|metadata\.google\.internal|100\.100\.100\.200|\[fd00:ec2::254\]|instance-data(/|\?|$)'''
+
+[[rule]]
+label = "ssrf"
+weight = 4
+owasp = ["A10:2021"]
+# URL-ish parameters aimed at loopback or private space, including decimal
+# and hex IP forms (2130706433, 0x7f000001, 0177.0.0.1). The parameter name
+# anchors the match, so /blog/192.168.1.1-release does not fire.
+target_regex = '''[?&](url|uri|link|target|dest|destination|redirect|next|callback|feed|host|site|src|source|proxy|image|img|load|fetch|domain|endpoint|webhook|data|path|page|view|file|ref|return|goto|to|u|href)=[^&]{0,2000}(localhost|127\.0\.0\.1|127\.[0-9]|0\.0\.0\.0|0x7f|2130706433|0177\.|10\.[0-9]|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|\[::1\]|169\.254\.)'''

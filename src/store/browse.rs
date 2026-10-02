@@ -124,6 +124,7 @@ pub struct RequestListRow {
     pub query: Option<String>,
     pub severity: i64,
     pub labels_json: String,
+    pub owasp_json: String,
     pub country: Option<String>,
     pub is_tor: bool,
     /// Admin only: the cluster node that recorded it.
@@ -133,6 +134,9 @@ pub struct RequestListRow {
 impl RequestListRow {
     pub fn labels(&self) -> Vec<String> {
         serde_json::from_str(&self.labels_json).unwrap_or_default()
+    }
+    pub fn owasp(&self) -> Vec<String> {
+        serde_json::from_str(&self.owasp_json).unwrap_or_default()
     }
 }
 
@@ -220,7 +224,7 @@ impl Audience {
 fn request_row_select(a: Audience) -> String {
     format!(
         "SELECT r.id, r.ts, r.ip_id, i.ip, r.method, r.path, {} AS query,
-                r.severity, r.labels_json, i.country, i.is_tor_exit AS is_tor, {} AS node
+                r.severity, r.labels_json, r.owasp_json, i.country, i.is_tor_exit AS is_tor, {} AS node
          FROM requests r JOIN ips i ON r.ip_id = i.id",
         a.query_col(),
         a.node_col()
@@ -728,6 +732,34 @@ mod tests {
         assert_eq!(page_num(Some(0)), 1);
         assert_eq!(page_num(Some(-5)), 1);
         assert_eq!(page_num(Some(7)), 7);
+    }
+
+    #[tokio::test]
+    async fn list_rows_expose_owasp_tags() {
+        let s = seeded().await;
+        let ip = s.upsert_ip("198.51.100.30".parse().unwrap()).await.unwrap();
+        s.insert_request(&NewRequest {
+            ip_id: ip.id,
+            method: "GET".into(),
+            path: "/login".into(),
+            query: None,
+            headers_json: "[]".into(),
+            body: None,
+            labels_json: r#"["sqli"]"#.into(),
+            owasp_json: Some(r#"["A03:2021"]"#.into()),
+            severity: 4,
+            scan_level: 4,
+            is_fp_claim: false,
+            page_token: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let page = s
+            .search_requests(&RequestFilter::default(), Audience::Admin)
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].owasp(), vec!["A03:2021".to_string()]);
     }
 
     #[tokio::test]

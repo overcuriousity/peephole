@@ -1,0 +1,19 @@
+# Credential attacks (OAT-008, A07:2021): default and botnet credential
+# pairs. Weight 3 — like any form interaction, but the defaults make the
+# intent unambiguous. A unique password is not matched.
+
+[[rule]]
+label = "credential-attack"
+weight = 3
+owasp = ["OAT-008", "A07:2021"]
+# Default and Mirai/IoT credential pairs in a form body (user field first,
+# the common order). t0talc0ntr0l4! and antslq are Mirai's telnet defaults.
+body_regex = '''(user(name)?|login|uname|uid)=[^&]{0,64}&(pass(word)?|pwd)=(admin|root|password|password1|1234|12345|123456|12345678|admin123|ubnt|default|changeme|t0talc0ntr0l4!|antslq|xc3511|vizxv|toor)(&|$)'''
+
+[[rule]]
+label = "credential-attack"
+weight = 3
+owasp = ["OAT-008", "A07:2021"]
+# HTTP Basic with the classic defaults, base64: admin:admin, root:root,
+# admin:password.
+header_regex = '''authorization:\s*basic\s+(YWRtaW46YWRtaW4=|cm9vdDpyb290|YWRtaW46cGFzc3dvcmQ=)'''

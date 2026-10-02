@@ -1,0 +1,12 @@
+# Cloud and container control planes (A05:2021): an exposed orchestrator
+# API is a critical misconfiguration, and probing for one is targeted, so
+# these are weight 3. Alternatives are anchored and specific — /api/v1/users
+# is an application API, not the Kubernetes API.
+
+[[rule]]
+label = "cloud-infra-probe"
+weight = 3
+owasp = ["A05:2021"]
+# Kubernetes (juicy objects at the root), Docker Engine, Consul, Vault,
+# etcd, Envoy admin.
+target_regex = '''^/api/v1/(namespaces|pods|nodes|secrets|serviceaccounts|configmaps|persistentvolumeclaims)(/|\?|$)|^/apis/(apps|rbac\.authorization\.k8s\.io|batch|networking\.k8s\.io)(/|\?|$)|^/(_ping|v1\.[0-9]{1,2}/(containers|images|info|version|networks|volumes|exec))(/|\?|$)|^/v1/(agent|catalog|kv|acl)(/|\?|$)|^/v1/sys/(health|seal-status|mounts|auth)(/|\?|$)|^/v[23]/(keys|kv|auth)(/|\?|$)|^/(config_dump|clusters|listeners|server_info)(/|\?|$)'''

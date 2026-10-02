@@ -10,14 +10,16 @@
 [[rule]]
 label = "rce"
 weight = 4
+owasp = ["A03:2021"]
 # Command separators and tooling. \b after id/whoami so "id" does not match
 # "idx=". $(...) and `...` command substitution, pipes into nc/curl/wget,
 # shells and Windows interpreters.
-target_regex = ''';\s*(id|whoami|uname|cat\s+/etc)\b|\|\s*(nc|curl|wget)\s|\$\(.*\)|`.*`|(^|[;|&$(`='"\s]|\.\.)\s*/bin/(ba|da|z)?sh\b|(^|[;|&$(`='"\s\\/])(cmd(\.exe)?\s+/[ck]\b|cmd\.exe\b|powershell(\.exe\b|\s+[-/]\w))'''
+target_regex = ''';\s*(id|whoami|uname|wget|curl|busybox|chmod|tftp|cat\s+/etc)\b|\|\s*(nc|curl|wget)\s|\$\(.*\)|`.*`|(^|[;|&$(`='"\s]|\.\.)\s*/bin/(ba|da|z)?sh\b|(^|[;|&$(`='"\s\\/])(cmd(\.exe)?\s+/[ck]\b|cmd\.exe\b|powershell(\.exe\b|\s+[-/]\w))'''
 
 [[rule]]
 label = "rce"
 weight = 4
+owasp = ["A03:2021"]
 # The same in a body, plus the dropper chains IoT botnets post
 # (`cd /tmp; wget …`, `$(busybox …)`).
 body_regex = '''(^|[;|&$(`='"\s]|\.\.)\s*/bin/(ba|da|z)?sh\b|(^|[;|&$(`='"\s\\/])(cmd(\.exe)?\s+/[ck]\b|cmd\.exe\b|powershell(\.exe\b|\s+[-/]\w))|\|\s*(nc|curl|wget|sh|bash)\b|;\s*(id|whoami|uname|wget|curl|busybox|chmod|tftp)\b|[`(]\s*(busybox|wget|curl|tftp|chmod)\s'''
@@ -25,12 +27,14 @@ body_regex = '''(^|[;|&$(`='"\s]|\.\.)\s*/bin/(ba|da|z)?sh\b|(^|[;|&$(`='"\s\\/]
 [[rule]]
 label = "rce"
 weight = 4
+owasp = ["A03:2021"]
 # Shellshock — () { :;}; — in any header (classically User-Agent/Referer).
 header_regex = "\\(\\s*\\)\\s*\\{"
 
 [[rule]]
 label = "rce"
 weight = 4
+owasp = ["A03:2021"]
 # Log4Shell: ${jndi:…} lookups and their obfuscations in any header, the
 # URL or the body: other lookups (${lower:j}, ${env:X:-j}, ${::-j}) and any
 # lookup nested inside another (${${::-j}${::-n}di:…, ${jn${lower:d}i:…).
@@ -41,6 +45,7 @@ body_regex = '''\$\{\s*jndi\s*:|\$\{\s*(lower|upper|env|sys|date|java|main|base6
 [[rule]]
 label = "rce"
 weight = 4
+owasp = ["A03:2021"]
 # Expression-language injection: OGNL (Struts2 %{(#…)}, Confluence
 # ${(#…)}), Spring SpEL T(java.lang.Runtime), in any part of the request.
 target_regex = '''[%$]\{\s*\(?\s*#|#_memberaccess|@java\.lang\.(runtime|processbuilder)@|ognl\.ognlcontext|T\s*\(\s*java\.lang\.(runtime|processbuilder)'''
@@ -50,12 +55,14 @@ header_regex = '''[%$]\{\s*\(?\s*#|#_memberaccess|@java\.lang\.(runtime|processb
 [[rule]]
 label = "rce"
 weight = 4
+owasp = ["A03:2021"]
 # Spring Cloud Function (CVE-2022-22963): SpEL in a routing header.
 header_regex = '''(^|\n)spring\.cloud\.function\.routing-expression\s*:'''
 
 [[rule]]
 label = "rce"
 weight = 4
+owasp = ["A03:2021"]
 # Spring4Shell (CVE-2022-22965): class loader properties bound from a form.
 target_regex = '''\bclass(\.|\[)module(\.|\]\[)classloader'''
 body_regex = '''\bclass(\.|\[)module(\.|\]\[)classloader'''
@@ -63,6 +70,7 @@ body_regex = '''\bclass(\.|\[)module(\.|\]\[)classloader'''
 [[rule]]
 label = "rce"
 weight = 4
+owasp = ["A03:2021"]
 # Known code-execution endpoints: PHPUnit eval-stdin.php (CVE-2017-9841),
 # Laravel Ignition (CVE-2021-3129), F5 BIG-IP iControl bash
 # (CVE-2022-1388) and TMUI traversal (CVE-2020-5902), GPON and Boa router

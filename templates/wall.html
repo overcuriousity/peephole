@@ -92,7 +92,7 @@
           <td class="mono">{{ r.method }}</td>
           <td class="path">{{ r.path }}</td>
           <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
-          <td><span class="chips">{% for l in r.labels %}<span class="badge badge-label">{{ l }}</span>{% endfor %}</span></td>
+          <td><span class="chips">{% for l in r.labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>
         </tr>
       {% endfor %}
       {% if stats.recent.is_empty() %}<tr><td colspan="6" class="empty">Nothing yet.</td></tr>{% endif %}

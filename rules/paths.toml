@@ -6,6 +6,7 @@
 [[rule]]
 label = "sensitive-path"
 weight = 2
+owasp = ["OAT-018"]
 # Dotfiles and secrets: /.env (+ .env.bak, /api/.env), /.git/*, SSH/AWS keys,
 # .htpasswd/.htaccess, editor settings. Anchored at a path segment boundary.
 target_regex = "(^|/)\\.(env|git|aws|ssh|svn|hg|htpasswd|htaccess|ds_store|bash_history|npmrc|vscode|idea)(/|\\.|\\?|$)"
@@ -13,6 +14,7 @@ target_regex = "(^|/)\\.(env|git|aws|ssh|svn|hg|htpasswd|htaccess|ds_store|bash_
 [[rule]]
 label = "sensitive-path"
 weight = 2
+owasp = ["OAT-018"]
 # Common admin / CMS probes. /.well-known/ is intentionally omitted: ACME
 # challenges, security.txt and Chrome's traffic-advice are legitimate.
 target_regex = "/wp-(login|admin|content|includes)|/phpmyadmin|/xmlrpc\\.php|/cgi-bin/|/administrator/|/actuator/|/wp-config\\.php"
@@ -20,6 +22,23 @@ target_regex = "/wp-(login|admin|content|includes)|/phpmyadmin|/xmlrpc\\.php|/cg
 [[rule]]
 label = "sensitive-path"
 weight = 2
+owasp = ["OAT-018"]
 # Server status and debug pages: Apache mod_status/mod_info, phpinfo(),
 # the Tomcat manager.
 target_regex = "/server-(status|info)(/|\\?|$)|/(phpinfo|php_info|info)\\.php(/|\\?|$)|/phpinfo(/|\\?|$)|/(host-)?manager/(html|text|status)(/|\\?|$)"
+
+[[rule]]
+label = "sensitive-path"
+weight = 2
+owasp = ["OAT-018"]
+# Backup and dump files: database exports, site archives, one-shot names
+# (/1.zip) scanners spray for.
+target_regex = "/(backup|db|database|dump|mysql|www|wwwroot|site|website|web|htdocs|public_html|old|bak|1)(\\.(sql|zip|tar|tar\\.gz|tgz|7z|rar|bak|old))+(/|\\?|$)"
+
+[[rule]]
+label = "sensitive-path"
+weight = 2
+owasp = ["OAT-018"]
+# Framework debug surfaces and deployment secrets: Symfony, Laravel, Yii,
+# ASP.NET error logs, Go expvar, Terraform and Kubernetes state, SSH keys.
+target_regex = "/(_profiler|telescope|horizon)(/|\\?|$)|/app_dev\\.php|/(elmah|trace)\\.axd|/debug/(vars|default|toolbar)(/|\\?|$)|/web\\.config(/|\\?|$)|/composer\\.(json|lock)(/|\\?|$)|/\\.terraform(/|\\?|$)|/terraform\\.tfstate|/\\.kube/config|/id_(rsa|dsa|ecdsa|ed25519)(/|\\.|\\?|$)|/(server|private)\\.key(/|\\?|$)|/\\.(pgpass|netrc)(/|\\?|$)"
