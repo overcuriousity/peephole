@@ -104,6 +104,16 @@ fn zstd_decode_capped(data: &[u8], limit: u64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// One provider result for one IP, as the IP page shows it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct IpIntelRow {
+    pub provider: String,
+    pub fetched_at: String,
+    pub source_version: Option<String>,
+    pub data_json: String,
+    pub node: Option<String>,
+}
+
 /// `(ip, provider, fetched_at, source_version, origin, data_json)`.
 pub type IntelRow = (String, String, String, Option<String>, Vec<u8>, String);
 
@@ -120,6 +130,39 @@ impl Store {
         .bind(limit)
         .fetch_all(&self.read)
         .await?)
+    }
+
+    /// Every provider's results for one IP, newest first per provider, with
+    /// the cluster node that looked each one up (None standalone or for a
+    /// node no longer in `members`).
+    pub async fn intel_for_ip(&self, ip: &str) -> Result<Vec<IpIntelRow>> {
+        Ok(sqlx::query_as::<_, IpIntelRow>(
+            "SELECT t.provider, t.fetched_at, t.source_version, t.data_json,
+                    (SELECT name FROM members m WHERE m.id = t.origin) AS node
+             FROM ip_intel t WHERE t.ip = ?
+             ORDER BY t.provider, t.hlc DESC, t.origin DESC",
+        )
+        .bind(ip)
+        .fetch_all(&self.read)
+        .await?)
+    }
+
+    /// Scan jobs for one IP in any state, newest first.
+    pub async fn jobs_for_ip(
+        &self,
+        ip_id: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::events::QueueJob>> {
+        Ok(
+            sqlx::query_as::<_, crate::events::QueueJob>(sqlx::AssertSqlSafe(format!(
+                "{} WHERE j.ip_id = ? ORDER BY j.id DESC LIMIT ?",
+                crate::store::scans::QUEUE_JOB_SQL
+            )))
+            .bind(ip_id)
+            .bind(limit)
+            .fetch_all(&self.read)
+            .await?,
+        )
     }
 
     pub async fn scans_for_ip(&self, ip_id: i64) -> Result<Vec<ScanSummary>> {

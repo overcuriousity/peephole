@@ -1,6 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — fingerprints{% endblock %}
 {% block content %}
+{% let sub = "fingerprints" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Fingerprint clusters</h1><p class="muted">Browser fingerprints seen from more than one source IP — the same operator hopping addresses.</p></div></div>
 <div class="stack">
 {% for c in clusters %}

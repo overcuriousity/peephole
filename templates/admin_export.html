@@ -1,6 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — export{% endblock %}
 {% block content %}
+{% let sub = "export" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Export requests</h1><p class="muted">CSV, Timesketch JSONL or Parquet. Filters are optional; up to 100 000 rows.</p></div></div>
 <form class="filters card" method="get" action="/admin/export/download">
   <label>Format <select name="format"><option value="csv">CSV</option><option value="jsonl">Timesketch JSONL</option><option value="parquet">Parquet</option></select></label>

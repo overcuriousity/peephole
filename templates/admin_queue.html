@@ -1,6 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — scan queue{% endblock %}
 {% block content %}
+{% let sub = "queue" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Scan queue</h1><p class="muted">Every job, live. Filters apply to live updates too.</p></div>
   <span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></div>
 {% if let Some(n) = pace.notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}

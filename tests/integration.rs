@@ -1273,10 +1273,12 @@ async fn public_ip_page_shows_aggregates_but_hides_requests_and_admin_data() {
         "SERVICEMARKER",
         "31337",
         "Counter-scans",
+        "Jobs",
         "Delete",
     ] {
         assert!(!html.contains(marker), "public page leaked {marker}");
     }
+    assert!(html.contains("Intelligence") && html.contains("MaxMind GeoLite2"));
     assert_eq!(
         reqwest::get(format!("{base}/ip/hello"))
             .await
@@ -1322,6 +1324,8 @@ async fn public_ip_page_shows_aggregates_but_hides_requests_and_admin_data() {
         "SERVICEMARKER",
         "31337",
         "Counter-scans",
+        "Jobs",
+        "Intelligence",
         "Delete this IP",
     ] {
         assert!(html.contains(marker), "admin page missing {marker}");

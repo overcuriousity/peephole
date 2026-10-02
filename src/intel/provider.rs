@@ -2,7 +2,7 @@
 //! able to query: it needs a local database or an API key, and those stay on
 //! the node. What a provider finds out about an IP is shared with the
 //! cluster as an `ip_intel` record.
-use super::SharedGeo;
+use super::{SharedGeo, SharedTor};
 use futures::future::BoxFuture;
 
 /// What a provider says about one IP.
@@ -71,6 +71,38 @@ impl Provider for MaxMind {
     }
 }
 
+/// The Tor exit list: whether an IP is listed, once a list is loaded. Fills
+/// in IPs recorded before the list was loaded or by a node without one.
+pub struct TorExits(pub SharedTor);
+
+impl Provider for TorExits {
+    fn name(&self) -> &'static str {
+        super::TOR
+    }
+
+    fn ready(&self) -> bool {
+        !self.0.read().unwrap().is_empty()
+    }
+
+    fn lookup<'a>(&'a self, ips: &'a [String]) -> BoxFuture<'a, Vec<Finding>> {
+        Box::pin(async move {
+            let list = self.0.read().unwrap();
+            if list.is_empty() {
+                return vec![];
+            }
+            ips.iter()
+                .map(|ip| Finding {
+                    ip: ip.clone(),
+                    source_version: None,
+                    data: serde_json::json!({
+                        "exit": ip.parse().is_ok_and(|a| list.contains(&a)),
+                    }),
+                })
+                .collect()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +140,23 @@ mod tests {
         assert_eq!(found[1].data, serde_json::json!({}));
         assert_eq!(found[2].ip, "junk");
         assert_eq!(found[2].data, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn tor_answers_for_every_ip_once_a_list_is_loaded() {
+        let shared: SharedTor = Default::default();
+        let p = TorExits(shared.clone());
+        assert_eq!(p.name(), crate::intel::TOR);
+        assert!(!p.ready());
+        assert!(p.lookup(&["198.51.100.1".into()]).await.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tor-exit.txt"), "198.51.100.1\n").unwrap();
+        *shared.write().unwrap() = crate::intel::tor::TorExitList::load(dir.path()).unwrap();
+        assert!(p.ready());
+        let found = p
+            .lookup(&["198.51.100.1".into(), "198.51.100.2".into(), "junk".into()])
+            .await;
+        let exits: Vec<_> = found.iter().map(|f| f.data["exit"].clone()).collect();
+        assert_eq!(exits, [true, false, false]);
     }
 }

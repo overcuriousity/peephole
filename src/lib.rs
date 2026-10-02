@@ -167,7 +167,10 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // Results for IPs this or other nodes recorded without them.
     tokio::spawn(intel::enrich_loop(
         recorder.clone(),
-        vec![Arc::new(intel::provider::MaxMind(geo.clone()))],
+        vec![
+            Arc::new(intel::provider::MaxMind(geo.clone())),
+            Arc::new(intel::provider::TorExits(tor.clone())),
+        ],
         shutdown_rx.clone(),
     ));
 

@@ -1,6 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — scan #{{ s.id }}{% endblock %}
 {% block content %}
+{% let sub = "scans" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div>
   <h1>Scan #{{ s.id }} · <a class="mono" href="/ip/{{ s.ip }}">{{ s.ip }}</a></h1>
   <div class="meta"><span>level {{ s.level }}</span><span>started <span class="mono">{{ s.started_at }}</span></span>
