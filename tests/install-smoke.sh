@@ -196,8 +196,9 @@ reset_install() {
 
 echo "== wizard: trap only, behind a local nginx (answers typed at the prompts)"
 reset_install
-# trap? yes · scanner? no · web? no · local proxy? yes · cluster? no · MaxMind: skip
-printf 'y\nn\nn\ny\n\n\n' > /tmp/answers
+# trap? yes · scanner? no · web? no · local proxy? yes · cluster? no · MaxMind: skip ·
+# AbuseIPDB key · Shodan: skip · GreyNoise: skip · InternetDB? no
+printf 'y\nn\nn\ny\n\n\nabuse-key-1\n\n\nn\n' > /tmp/answers
 # PEEPHOLE_TRUSTED_PROXIES stays preset (10.0.0.0/8): the local proxy answer replaces it, with a warning.
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard1.log 2>&1 || { cat /tmp/wizard1.log; exit 1; }
@@ -209,6 +210,10 @@ grep -q '^trap_listen = "127.0.0.1:8080"' /etc/peephole/config.toml
 grep -q '^trusted_proxies = \["127.0.0.1/32","::1/128"\]' /etc/peephole/config.toml
 if grep -q 'webauthn\|maxmind\|\[cluster\]\|admin_listen' /etc/peephole/config.toml; then
     echo "trap-only config has other roles' settings"; cat /etc/peephole/config.toml; exit 1
+fi
+grep -q '^api_key = "abuse-key-1"' /etc/peephole/config.toml
+if grep -q '\[shodan\]\|\[greynoise\]\|\[internetdb\]' /etc/peephole/config.toml; then
+    echo "skipped enrichment APIs were configured"; cat /etc/peephole/config.toml; exit 1
 fi
 /usr/local/bin/peephole check-config /etc/peephole/config.toml
 grep -q 'trap listener (127.0.0.1:8080)' /tmp/wizard1.log
@@ -275,6 +280,8 @@ grep -q '^node_name = "scanner-9"' /etc/peephole/config.toml
 grep -q '^listen = "0.0.0.0:7443"' /etc/peephole/config.toml
 grep -q '^advertise = "scan9.example:7443"' /etc/peephole/config.toml
 grep -q '^remote_config = true' /etc/peephole/config.toml
+# The InternetDB question was not answered: its default (yes) applies.
+grep -q '^\[internetdb\]' /etc/peephole/config.toml
 grep -q 'peephole-cfg1:' /tmp/wizard4.log
 grep -q 'ed25519:' /tmp/wizard4.log
 /usr/local/bin/peephole check-config /etc/peephole/config.toml | grep -q 'remote config: on'
@@ -287,5 +294,7 @@ env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     bash install.sh > /tmp/badjoin.log 2>&1 || { cat /tmp/badjoin.log; exit 1; }
 grep -q 'joining the cluster failed' /tmp/badjoin.log
 grep -q '^remote_config = false' /etc/peephole/config.toml
+# Without a terminal no third-party API is used unless asked for.
+if grep -q '\[internetdb\]' /etc/peephole/config.toml; then echo "unattended install enabled InternetDB"; exit 1; fi
 if grep -q 'peephole-cfg1:' /tmp/badjoin.log; then echo "locked node printed a config key"; exit 1; fi
 echo "== ok"

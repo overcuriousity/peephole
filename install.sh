@@ -9,6 +9,9 @@
 #   PEEPHOLE_VERIFY=1|0  1: require a verified GitHub build provenance attestation (needs the gh CLI);
 #                      0: skip it; unset: verify when gh is installed, warn if that fails
 #   MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY, PEEPHOLE_DOMAIN, PEEPHOLE_TRUSTED_PROXIES  (first install)
+#   ABUSEIPDB_API_KEY, SHODAN_API_KEY, GREYNOISE_API_KEY  optional enrichment APIs (first install)
+#   PEEPHOLE_INTERNETDB=1|0    use Shodan InternetDB, no key, non-commercial use only (first
+#                              install; asked with default yes, off without a terminal)
 #   PEEPHOLE_LOCAL_PROXY=1|0  a reverse proxy on this machine fronts the trap (first install);
 #                      when 1, PEEPHOLE_TRUSTED_PROXIES is ignored and loopback is trusted instead
 #   PEEPHOLE_TTY       read the wizard's answers from this file instead of the terminal (tests)
@@ -487,10 +490,18 @@ if [ "$upgrade" -ne 1 ]; then
     else
         warn "no MaxMind credentials: this node cannot look up GeoIP data; it shows what other cluster members look up, if any can"
     fi
+    if [ "$INTERACTIVE" -eq 1 ]; then
+        say $'\nOptional threat-intel APIs. Every one is optional: leave it empty to skip it. Keys stay on this\nnode; in a cluster the lookup results are shared, so one key serves every member.\n'
+    fi
+    prompt_optional ABUSEIPDB_API_KEY "AbuseIPDB API key (https://www.abuseipdb.com/account/api; abuse reports per IP, free plan 1000 checks/day)"
+    prompt_optional SHODAN_API_KEY "Shodan API key (https://account.shodan.io; open ports, services and CVEs; host lookups need a membership or paid plan)"
+    prompt_optional GREYNOISE_API_KEY "GreyNoise Community API key (https://viz.greynoise.io/account/api-key; mass-scanner or benign; free keys need a business email, 50 lookups/week)"
+    ask_yn PEEPHOLE_INTERNETDB "Use Shodan InternetDB (no key; ports, tags and CVEs, weekly data; free for non-commercial use only)?" "$([ "$INTERACTIVE" -eq 1 ] && echo y || echo n)"
     # Values that arrived preset from the environment were not checked by a prompt.
     toml_safe "${PEEPHOLE_DOMAIN:-}"; toml_safe "${PEEPHOLE_TRUSTED_PROXIES:-}"
     toml_safe "${PEEPHOLE_CLUSTER_NAME:-}"; toml_safe "${PEEPHOLE_CLUSTER_LISTEN:-}"; toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"
     toml_safe "${MAXMIND_ACCOUNT_ID:-}"; toml_safe "${MAXMIND_LICENSE_KEY:-}"
+    toml_safe "${ABUSEIPDB_API_KEY:-}"; toml_safe "${SHODAN_API_KEY:-}"; toml_safe "${GREYNOISE_API_KEY:-}"
 fi
 # The wizard is done (or was skipped on an upgrade); closing an fd that was never opened is harmless.
 exec 3<&-
@@ -639,6 +650,42 @@ CONFIG
         fi
         cat <<CONFIG
 
+[enrichment]
+# API providers look an IP up once; when it comes back, again after N days,
+# then 1.5 N, 2.25 N, … since the last lookup. 0 = never again.
+refresh_after_days = 30
+CONFIG
+        if [ -n "${ABUSEIPDB_API_KEY:-}" ]; then
+            cat <<CONFIG
+
+[abuseipdb]
+api_key = "${ABUSEIPDB_API_KEY}"
+daily_limit = 1000          # checks per UTC day (free plan: 1000)
+CONFIG
+        fi
+        if [ -n "${SHODAN_API_KEY:-}" ]; then
+            cat <<CONFIG
+
+[shodan]
+api_key = "${SHODAN_API_KEY}"   # host lookups need a membership or paid plan
+CONFIG
+        fi
+        if [ -n "${GREYNOISE_API_KEY:-}" ]; then
+            cat <<CONFIG
+
+[greynoise]
+api_key = "${GREYNOISE_API_KEY}"   # free plan: 50 lookups per week
+CONFIG
+        fi
+        if [ "${PEEPHOLE_INTERNETDB:-0}" = 1 ]; then
+            cat <<CONFIG
+
+[internetdb]
+enabled = true              # Shodan InternetDB: no key, free for non-commercial use only
+CONFIG
+        fi
+        cat <<CONFIG
+
 [scan]
 max_workers = 2            # concurrent nmap subprocesses
 timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admin queue page)
@@ -673,7 +720,7 @@ CONFIG
     "$INSTALL_BIN" check-config "$new_config" \
         || die "generated config failed validation; nothing was written to ${CONFIG_FILE}. Re-run the installer to answer again."
     install -m 0600 "$new_config" "$CONFIG_FILE"
-    info "Wrote ${CONFIG_FILE} (mode 0600 — may contain your MaxMind license key)"
+    info "Wrote ${CONFIG_FILE} (mode 0600 — may contain your MaxMind and API keys)"
     # A reverse-proxy example that fits this node (see nginx_example).
     NGINX_EXAMPLE="${CONFIG_DIR}/nginx.example.conf"
     if has_role web || has_role listener; then

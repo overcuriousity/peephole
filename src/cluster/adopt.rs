@@ -202,17 +202,18 @@ pub async fn adopt_history(node: &Node) -> Result<u64> {
 }
 
 /// Enrichment results recorded while standalone (origin empty) become this
-/// node's results in the log.
+/// node's results in the log: the whole lookup history, oldest first, so
+/// the cluster gets every lookup and not only the newest.
 async fn adopt_intel(node: &Node) -> Result<u64> {
     let me = node.id().0.to_vec();
     let mut total = 0;
     loop {
         let _g = node.apply_lock.lock().await;
         let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        type Row = (String, String, String, Option<String>, String);
+        type Row = (String, String, i64, String, Option<String>, String);
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT ip, provider, fetched_at, source_version, data_json FROM ip_intel
-             WHERE origin = x'' LIMIT ?",
+            "SELECT ip, provider, hlc, fetched_at, source_version, data_json FROM ip_intel_log
+             WHERE origin = x'' ORDER BY hlc, ip, provider LIMIT ?",
         )
         .bind(BATCH)
         .fetch_all(&mut *tx)
@@ -220,7 +221,7 @@ async fn adopt_intel(node: &Node) -> Result<u64> {
         if rows.is_empty() {
             break;
         }
-        for (ip, provider, fetched_at, source_version, data_json) in rows {
+        for (ip, provider, hlc, fetched_at, source_version, data_json) in rows {
             let e = repl::append_existing(
                 node,
                 &mut tx,
@@ -233,25 +234,42 @@ async fn adopt_intel(node: &Node) -> Result<u64> {
                 }),
             )
             .await?;
-            // Our own result under our key replaces the standalone row.
-            sqlx::query("DELETE FROM ip_intel WHERE ip = ? AND provider = ? AND origin = ?")
-                .bind(&ip)
-                .bind(&provider)
-                .bind(&me)
-                .execute(&mut *tx)
-                .await?;
             sqlx::query(
-                "UPDATE ip_intel SET origin = ?, hlc = ? WHERE ip = ? AND provider = ? AND origin = x''",
+                "UPDATE ip_intel_log SET origin = ?, hlc = ?
+                 WHERE ip = ? AND provider = ? AND origin = x'' AND hlc = ?",
             )
             .bind(&me)
             .bind(e.hlc as i64)
             .bind(&ip)
             .bind(&provider)
+            .bind(hlc)
             .execute(&mut *tx)
             .await?;
             total += 1;
         }
         tx.commit().await?;
     }
+    // The newest standalone result per (ip, provider) is now ours, at the
+    // HLC its log entry got; a result of ours recorded since joining is newer.
+    let _g = node.apply_lock.lock().await;
+    let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query(
+        "DELETE FROM ip_intel WHERE origin = x'' AND EXISTS (
+           SELECT 1 FROM ip_intel m WHERE m.ip = ip_intel.ip
+             AND m.provider = ip_intel.provider AND m.origin = ?1)",
+    )
+    .bind(&me)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ip_intel SET origin = ?1, hlc = COALESCE((
+           SELECT MAX(l.hlc) FROM ip_intel_log l WHERE l.ip = ip_intel.ip
+             AND l.provider = ip_intel.provider AND l.origin = ?1), hlc)
+         WHERE origin = x''",
+    )
+    .bind(&me)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(total)
 }

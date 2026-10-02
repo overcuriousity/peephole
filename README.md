@@ -52,6 +52,8 @@ The installer:
     may change its settings,
   - optional **MaxMind GeoLite2** credentials
     (<https://www.maxmind.com/en/accounts/current/license-key>),
+  - optional API keys for **AbuseIPDB**, **Shodan** and **GreyNoise**, and
+    whether to use **Shodan InternetDB** (no key, non-commercial use only),
 - writes `/etc/peephole/config.toml` and an nginx example that fits the
   answers to `/etc/peephole/nginx.example.conf`, and installs and starts a
   systemd service.
@@ -255,6 +257,17 @@ Things to know:
   credentials is enough; without any, the dataset has no GeoIP data. The Tor
   exit list is public and is fetched by one node for all. Every result
   records which provider and which node it came from (Admin → Export).
+- Threat-intel APIs (AbuseIPDB, Shodan, Shodan InternetDB, GreyNoise
+  Community) work the same way. Every node with a key announces it. One of
+  them looks each IP up, newest IPs first, within its own daily or weekly
+  budget. The result, with its UTC time, is shared with every member. A node
+  whose budget is spent, or whose key is rejected, stops announcing the
+  provider, and another node with a key takes over. An IP is looked up again
+  only when it comes back, after 30 days, then 45, 67.5, …
+  (`[enrichment] refresh_after_days`). Every lookup is kept in a history
+  (Admin → Export → full lookup history). The results are admin-only: the
+  IP page shows them, and the IP list filters by abuse score, provider tag
+  and "looked up / not yet".
 
 ## Configuration
 

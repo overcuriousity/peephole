@@ -165,12 +165,10 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     ));
 
     // Results for IPs this or other nodes recorded without them.
+    let providers = intel::providers(&cfg, &store, &geo, &tor);
     tokio::spawn(intel::enrich_loop(
         recorder.clone(),
-        vec![
-            Arc::new(intel::provider::MaxMind(geo.clone())),
-            Arc::new(intel::provider::TorExits(tor.clone())),
-        ],
+        providers.clone(),
         shutdown_rx.clone(),
     ));
 
@@ -239,6 +237,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         notifier,
         settings: settings.clone(),
         node: node.clone(),
+        providers,
     };
     // At startup a role that cannot start is fatal, as it always was (the
     // installer's health check relies on it); later changes are retried.
@@ -313,6 +312,7 @@ struct RoleRunner {
     notifier: events::Notifier,
     settings: settings::Settings,
     node: Option<Arc<cluster::Node>>,
+    providers: intel::Providers,
 }
 
 impl RoleRunner {
@@ -511,6 +511,7 @@ impl RoleRunner {
             )
             .with_recorder(self.recorder.clone())
             .with_settings(self.settings.clone())
+            .with_providers(self.providers.clone())
             .with_closing(rx.clone()),
         ));
         let listener = tokio::net::TcpListener::bind(addr)

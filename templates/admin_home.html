@@ -34,6 +34,7 @@
     <dl class="kv">
       <dt>Tor exit list</dt><dd>{{ tor_fetch }}</dd>
       <dt>MaxMind GeoLite2</dt><dd>{{ maxmind_fetch }}</dd>
+      {% for (label, state) in api %}<dt>{{ label }}</dt><dd>{{ state }}</dd>{% endfor %}
     </dl>
   </section>
 </div>

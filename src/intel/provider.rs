@@ -23,6 +23,28 @@ pub trait Provider: Send + Sync {
     /// One finding per IP that was asked, also when nothing is known, so
     /// the IP is not asked again.
     fn lookup<'a>(&'a self, ips: &'a [String]) -> BoxFuture<'a, Vec<Finding>>;
+    /// Whether IPv6 addresses are asked at all.
+    fn ipv6(&self) -> bool {
+        true
+    }
+    /// IPs asked per pass.
+    fn batch(&self) -> i64 {
+        500
+    }
+    /// For API providers: an IP with `k` results is asked again when it is
+    /// seen `N × 1.5^(k−1)` days after the newest one (N = this; 0 = never).
+    /// Local databases answer once per IP and never refresh (0).
+    fn refresh_after_days(&self) -> f64 {
+        0.0
+    }
+    /// IPs not to offer this provider (not public, or refused recently).
+    fn skip_list(&self) -> Vec<String> {
+        vec![]
+    }
+    /// Budget and pause state for the admin page; None when there is none.
+    fn status(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Seconds after an IP was first seen before the node at `rank` among the

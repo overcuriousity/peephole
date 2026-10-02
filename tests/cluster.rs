@@ -1557,6 +1557,18 @@ async fn standalone_history_is_adopted_and_backfilled() {
         s.set_ip_geo(ip.id, Some("NL"), Some(1), Some("x"))
             .await
             .unwrap();
+        // Two API lookups while standalone: both are history.
+        for score in [10, 20] {
+            s.local()
+                .record_lookup(
+                    "192.0.2.200",
+                    peephole::intel::ABUSEIPDB,
+                    None,
+                    serde_json::json!({ "score": score }),
+                )
+                .await
+                .unwrap();
+        }
         for i in 0..150 {
             s.insert_request(&new_request(ip.id, &format!("/p{i}")))
                 .await
@@ -1579,8 +1591,25 @@ async fn standalone_history_is_adopted_and_backfilled() {
     eventually("b backfilled everything", || async {
         count(&nb, "SELECT COUNT(*) FROM requests").await == 150
             && count(&nb, "SELECT COUNT(*) FROM ports").await == 3
+            && count(
+                &nb,
+                "SELECT COUNT(*) FROM ip_intel_log WHERE provider = 'abuseipdb'",
+            )
+            .await
+                == 2
     })
     .await;
+    assert_eq!(
+        count(&na, "SELECT COUNT(*) FROM ip_intel_log WHERE origin = x''").await
+            + count(&na, "SELECT COUNT(*) FROM ip_intel WHERE origin = x''").await,
+        0,
+        "every standalone result is now a's"
+    );
+    let score: Option<i64> = sqlx::query_scalar("SELECT abuse_score FROM ips")
+        .fetch_one(&nb.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(score, Some(20), "the newest lookup wins");
     assert_eq!(
         count(&nb, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await,
         1
@@ -2813,6 +2842,80 @@ async fn enrichment_results_replicate_and_follow_blocks() {
     );
     block::unblock(&nb, a.id).await.unwrap();
     assert_eq!(country(&nb).await.as_deref(), Some("NL"));
+}
+
+/// API lookups are each kept: the history replicates, follows blocks, and
+/// exports with UTC times; the admin-only score never reaches public pages.
+#[tokio::test]
+async fn api_lookup_history_replicates_and_follows_blocks() {
+    use peephole::cluster::block;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    record(&nb, "203.0.113.92", "/x").await;
+    for _ in 0..2 {
+        rec(&na)
+            .record_lookup(
+                "203.0.113.92",
+                peephole::intel::ABUSEIPDB,
+                None,
+                serde_json::json!({"score": 77, "categories": ["SSH"]}),
+            )
+            .await
+            .unwrap();
+    }
+    let history = "SELECT COUNT(*) FROM ip_intel_log WHERE ip = '203.0.113.92'";
+    eventually("b has both lookups", || async {
+        count(&nb, history).await == 2
+    })
+    .await;
+    let score = |n: &TestNode| {
+        let pool = n.store.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT abuse_score FROM ips WHERE ip = '203.0.113.92'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(score(&nb).await, Some(77));
+    let (admin, base) = admin_on(&nb).await;
+    let body = text(&admin, format!("{base}/admin/export/intel?history=1")).await;
+    let lines: Vec<serde_json::Value> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "{body}");
+    assert_eq!(lines[0]["node"], "node-alpha");
+    assert!(
+        lines[0]["fetched_at"].as_str().unwrap().ends_with("+00:00"),
+        "{body}"
+    );
+    let html = text(&admin, format!("{base}/ips?tag=abuseipdb:SSH&min_abuse=50")).await;
+    assert!(html.contains("203.0.113.92"));
+    let anon = reqwest::Client::new();
+    let public = anon
+        .get(format!("{base}/ip/203.0.113.92"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !public.contains("AbuseIPDB"),
+        "admin-only provider on a public page"
+    );
+
+    block::block(&nb, a.id).await.unwrap();
+    assert_eq!(count(&nb, history).await, 0, "a blocked peer's lookups go");
+    assert_eq!(score(&nb).await, None);
+    block::unblock(&nb, a.id).await.unwrap();
+    assert_eq!(count(&nb, history).await, 2);
+    assert_eq!(score(&nb).await, Some(77));
 }
 
 /// A node that consulted only GeoIP writes no Tor result of its own and

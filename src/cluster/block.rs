@@ -75,7 +75,7 @@ pub async fn block(node: &Node, id: NodeId) -> Result<u64> {
         let _g = node.apply_lock.lock().await;
         let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
         let ips: Vec<String> =
-            sqlx::query_scalar("SELECT DISTINCT ip FROM ip_intel WHERE origin = ? LIMIT ?")
+            sqlx::query_scalar("SELECT DISTINCT ip FROM ip_intel_log WHERE origin = ? LIMIT ?")
                 .bind(&id.0[..])
                 .bind(BATCH as i64)
                 .fetch_all(&mut *tx)
@@ -84,11 +84,16 @@ pub async fn block(node: &Node, id: NodeId) -> Result<u64> {
             break;
         }
         for ip in &ips {
-            sqlx::query("DELETE FROM ip_intel WHERE origin = ? AND ip = ?")
-                .bind(&id.0[..])
-                .bind(ip)
-                .execute(&mut *tx)
-                .await?;
+            for sql in [
+                "DELETE FROM ip_intel WHERE origin = ? AND ip = ?",
+                "DELETE FROM ip_intel_log WHERE origin = ? AND ip = ?",
+            ] {
+                sqlx::query(sql)
+                    .bind(&id.0[..])
+                    .bind(ip)
+                    .execute(&mut *tx)
+                    .await?;
+            }
             data::refresh_ip_view(&mut tx, ip).await?;
         }
         tx.commit().await?;
@@ -154,14 +159,17 @@ pub async fn purge(node: &Node, id: NodeId) -> Result<u64> {
     ] {
         sqlx::query(sql).bind(&id.0[..]).execute(&mut *tx).await?;
     }
-    let ips: Vec<String> = sqlx::query_scalar("SELECT DISTINCT ip FROM ip_intel WHERE origin = ?")
-        .bind(&id.0[..])
-        .fetch_all(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM ip_intel WHERE origin = ?")
-        .bind(&id.0[..])
-        .execute(&mut *tx)
-        .await?;
+    let ips: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT ip FROM ip_intel_log WHERE origin = ?")
+            .bind(&id.0[..])
+            .fetch_all(&mut *tx)
+            .await?;
+    for sql in [
+        "DELETE FROM ip_intel WHERE origin = ?",
+        "DELETE FROM ip_intel_log WHERE origin = ?",
+    ] {
+        sqlx::query(sql).bind(&id.0[..]).execute(&mut *tx).await?;
+    }
     for ip in &ips {
         data::refresh_ip_view(&mut tx, ip).await?;
     }

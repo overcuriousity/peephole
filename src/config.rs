@@ -32,6 +32,102 @@ pub struct Config {
     /// What the public (anonymous) pages show.
     #[serde(default)]
     pub public: PublicConfig,
+    /// When API providers look an IP up again.
+    #[serde(default)]
+    pub enrichment: EnrichmentConfig,
+    /// Optional API providers; a missing section means the provider is off.
+    pub abuseipdb: Option<AbuseIpDbConfig>,
+    pub shodan: Option<ShodanConfig>,
+    pub internetdb: Option<InternetDbConfig>,
+    pub greynoise: Option<GreyNoiseConfig>,
+}
+
+/// `[enrichment]`: shared by the API providers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnrichmentConfig {
+    /// An IP with `k` results from a provider is looked up again when it is
+    /// seen `N × 1.5^(k−1)` days after the newest one (N = this); 0 never.
+    #[serde(default = "default_refresh_days")]
+    pub refresh_after_days: f64,
+}
+
+fn default_refresh_days() -> f64 {
+    30.0
+}
+
+impl Default for EnrichmentConfig {
+    fn default() -> Self {
+        Self {
+            refresh_after_days: default_refresh_days(),
+        }
+    }
+}
+
+/// `[abuseipdb]`: abuse reports per IP (API key required).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AbuseIpDbConfig {
+    pub api_key: String,
+    /// Checks per UTC day (the free plan allows 1000).
+    #[serde(default = "default_abuseipdb_daily")]
+    pub daily_limit: u64,
+    /// Reports older than this are not counted (1–365).
+    #[serde(default = "default_abuseipdb_age")]
+    pub max_age_days: u32,
+}
+
+fn default_abuseipdb_daily() -> u64 {
+    1000
+}
+
+fn default_abuseipdb_age() -> u32 {
+    90
+}
+
+/// `[shodan]`: host lookups (a key whose plan includes them, e.g. a
+/// membership).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShodanConfig {
+    pub api_key: String,
+    /// Lookups per UTC day; 0 = no local cap (Shodan paces at 1/s).
+    #[serde(default)]
+    pub daily_limit: u64,
+}
+
+/// `[internetdb]`: Shodan InternetDB, no key, free for non-commercial use.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InternetDbConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Lookups per UTC day; 0 = no local cap.
+    #[serde(default)]
+    pub daily_limit: u64,
+}
+
+/// `[greynoise]`: GreyNoise Community. The key is optional; without one
+/// the allowance is far smaller.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GreyNoiseConfig {
+    #[serde(default)]
+    pub api_key: String,
+    /// Default: 10 without a key, none with one.
+    pub daily_limit: Option<u64>,
+    /// Default: 50 with a key (the free plan), none without.
+    pub weekly_limit: Option<u64>,
+}
+
+impl GreyNoiseConfig {
+    /// The budgets this node keeps to: what is configured, else the free
+    /// plan's (with a key 50 a week, without 10 a day).
+    pub fn limits(&self) -> Vec<crate::intel::api::Limit> {
+        use crate::intel::api::{Limit, Period};
+        let keyed = !self.api_key.trim().is_empty();
+        let daily = self.daily_limit.or((!keyed).then_some(10));
+        let weekly = self.weekly_limit.or(keyed.then_some(50));
+        [(Period::Day, daily), (Period::Week, weekly)]
+            .into_iter()
+            .filter_map(|(period, max)| max.filter(|m| *m > 0).map(|max| Limit { period, max }))
+            .collect()
+    }
 }
 
 /// `[public]`: what anonymous visitors see.
@@ -455,6 +551,42 @@ impl Config {
             && (m.account_id.is_empty() || m.license_key.is_empty())
         {
             bail!("[maxmind] needs both account_id and license_key (or omit the section)");
+        }
+        let e = self.enrichment.refresh_after_days;
+        if !(e == 0.0 || (1.0..=3650.0).contains(&e)) {
+            bail!("enrichment.refresh_after_days must be 0 (never) or between 1 and 3650");
+        }
+        if let Some(a) = &self.abuseipdb {
+            if a.api_key.trim().is_empty() {
+                bail!("[abuseipdb] needs api_key (or omit the section)");
+            }
+            if !(1..=365).contains(&a.max_age_days) {
+                bail!("abuseipdb.max_age_days must be between 1 and 365");
+            }
+            if a.daily_limit == 0 {
+                bail!("abuseipdb.daily_limit must be at least 1");
+            }
+        }
+        if let Some(s) = &self.shodan
+            && s.api_key.trim().is_empty()
+        {
+            bail!("[shodan] needs api_key (or omit the section)");
+        }
+        for (name, key) in [
+            (
+                "abuseipdb",
+                self.abuseipdb.as_ref().map(|a| a.api_key.as_str()),
+            ),
+            ("shodan", self.shodan.as_ref().map(|s| s.api_key.as_str())),
+            (
+                "greynoise",
+                self.greynoise.as_ref().map(|g| g.api_key.as_str()),
+            ),
+        ] {
+            // Keys go into headers and URLs.
+            if key.is_some_and(|k| k.chars().any(|c| !c.is_ascii_graphic())) {
+                bail!("{name}.api_key may only contain printable ASCII without spaces");
+            }
         }
         // [scan]: reject values that are accepted by serde but break scanning
         // (e.g. a 5s timeout fails every scan; a negative cooldown builds a
@@ -932,5 +1064,64 @@ data_dir = "/tmp"
             ));
             assert!(e.is_err(), "{bad} accepted");
         }
+    }
+
+    #[test]
+    fn api_providers_are_off_unless_configured() {
+        let cfg = parse(&format!("{BASE}[roles]\nlistener = false\nweb = false\n")).unwrap();
+        assert!(cfg.abuseipdb.is_none() && cfg.shodan.is_none());
+        assert!(cfg.internetdb.is_none() && cfg.greynoise.is_none());
+        assert_eq!(cfg.enrichment.refresh_after_days, 30.0);
+    }
+
+    #[test]
+    fn api_provider_sections_are_checked() {
+        let with = |extra: &str| {
+            parse(&format!(
+                "{BASE}[roles]\nlistener = false\nweb = false\n{extra}"
+            ))
+        };
+        let a = with("[abuseipdb]\napi_key = \"abc\"\n").unwrap();
+        let a = a.abuseipdb.unwrap();
+        assert_eq!((a.daily_limit, a.max_age_days), (1000, 90));
+        for bad in [
+            "[abuseipdb]\napi_key = \"\"\n",
+            "[abuseipdb]\napi_key = \"k\"\nmax_age_days = 0\n",
+            "[shodan]\napi_key = \" \"\n",
+            "[shodan]\napi_key = \"a b\"\n",
+            "[enrichment]\nrefresh_after_days = 0.5\n",
+        ] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
+        assert!(with("[enrichment]\nrefresh_after_days = 0\n").is_ok());
+        let i = with("[internetdb]\nenabled = true\n").unwrap();
+        assert!(i.internetdb.unwrap().enabled);
+    }
+
+    #[test]
+    fn greynoise_budgets_follow_the_free_plan_unless_set() {
+        use crate::intel::api::{Limit, Period};
+        let g = |toml: &str| -> GreyNoiseConfig { toml::from_str(toml).unwrap() };
+        assert_eq!(
+            g("").limits(),
+            [Limit {
+                period: Period::Day,
+                max: 10
+            }]
+        );
+        assert_eq!(
+            g("api_key = \"k\"").limits(),
+            [Limit {
+                period: Period::Week,
+                max: 50
+            }]
+        );
+        assert_eq!(
+            g("api_key = \"k\"\ndaily_limit = 20\nweekly_limit = 0").limits(),
+            [Limit {
+                period: Period::Day,
+                max: 20
+            }]
+        );
     }
 }

@@ -185,6 +185,18 @@ impl Recorder {
         if same {
             return Ok(());
         }
+        self.record_lookup(ip, provider, source_version, data).await
+    }
+
+    /// Record one lookup's result, also when it says the same as the last
+    /// one: API lookups are the history of the research dataset.
+    pub async fn record_lookup(
+        &self,
+        ip: &str,
+        provider: &str,
+        source_version: Option<&str>,
+        data: serde_json::Value,
+    ) -> Result<()> {
         self.write(vec![Record::IpIntel(IpIntelRec {
             ip: ip.to_string(),
             provider: provider.to_string(),
