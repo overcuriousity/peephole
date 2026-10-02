@@ -2,7 +2,10 @@ mod config;
 mod decoy;
 mod flood;
 mod pages;
+pub mod proxy_proto;
+pub mod raw_head;
 pub mod skiplog;
+pub mod tls_hello;
 
 pub use config::TrapConfig;
 
