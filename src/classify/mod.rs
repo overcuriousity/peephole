@@ -373,7 +373,13 @@ mod tests {
     #[test]
     fn hit_rules_contribute_owasp_tags() {
         let v = classifier().classify(
-            &view("GET", "/login", Some("id=1%27%20OR%201%3D1--"), "curl/8", None),
+            &view(
+                "GET",
+                "/login",
+                Some("id=1%27%20OR%201%3D1--"),
+                "curl/8",
+                None,
+            ),
             &hist(1, 1),
             &BotTells::default(),
         );

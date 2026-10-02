@@ -156,8 +156,14 @@ mod tests {
         assert!(
             one("[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\nowasp=[\"A03:2021\",\"OAT-014\"]\n").is_ok()
         );
-        assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\nowasp=[\"A13:2021\"]\n").is_err());
-        assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\nowasp=[\"T1190\"]\n").is_err());
+        assert!(
+            one("[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\nowasp=[\"A13:2021\"]\n")
+                .is_err()
+        );
+        assert!(
+            one("[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\nowasp=[\"T1190\"]\n")
+                .is_err()
+        );
         // Absent stays legal for operator rules.
         assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\n").is_ok());
     }
