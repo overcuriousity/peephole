@@ -1208,4 +1208,149 @@ mod tests {
         assert!(v.labels.contains(&"scanner-ua".to_string()));
         assert!(!v.labels.contains(&"research-scanner".to_string()));
     }
+
+    #[test]
+    fn ssrf_to_cloud_metadata_is_level_4() {
+        for q in [
+            "url=http://169.254.169.254/latest/meta-data/",
+            "u=http%3a%2f%2fmetadata.google.internal%2f",
+            "next=http://169.254.170.2/v2/credentials",
+            "feed=http://100.100.100.200/latest/meta-data/",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/fetch", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(v.labels.iter().any(|l| l == "ssrf"), "{q}: {:?}", v.labels);
+            assert_eq!(v.scan_level, 4);
+        }
+    }
+
+    #[test]
+    fn ssrf_params_to_internal_hosts_but_not_plain_paths() {
+        for q in [
+            "url=http://127.0.0.1:8080/",
+            "callback=http://192.168.1.1/",
+            "webhook=http://2130706433/",
+            "u=http://0x7f000001/",
+            "image=http://10.0.0.4/x",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/proxy", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(v.labels.iter().any(|l| l == "ssrf"), "{q}: {:?}", v.labels);
+        }
+        // A private IP in a path, or in an unrelated parameter, is not SSRF.
+        for (p, q) in [
+            ("/blog/192.168.1.1-release", None),
+            ("/fetch", Some("name=127.0.0.1")),
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, q, "Mozilla/5.0", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                !v.labels.iter().any(|l| l == "ssrf"),
+                "{p} {q:?}: {:?}",
+                v.labels
+            );
+        }
+    }
+
+    #[test]
+    fn ssti_probes_are_level_4() {
+        for q in [
+            "q={{7*7}}",
+            "q=%7b%7bconfig%7d%7d",
+            "q=${7*7}",
+            "q=<%=7*7%>",
+            "q={{request.application.__globals__}}",
+        ] {
+            let v = classifier().classify(
+                &view("GET", "/search", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(v.labels.iter().any(|l| l == "ssti"), "{q}: {:?}", v.labels);
+            assert_eq!(v.scan_level, 4);
+        }
+    }
+
+    #[test]
+    fn nosqli_operators_are_caught() {
+        for q in ["user[$ne]=1", "user[$gt]="] {
+            let v = classifier().classify(
+                &view("GET", "/login", Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "nosqli"),
+                "{q}: {:?}",
+                v.labels
+            );
+        }
+        for b in [
+            &b"{\"$where\": \"1==1\"}"[..],
+            &b"{\"user\": {\"$gt\": \"\"}}"[..],
+        ] {
+            let v = classifier().classify(
+                &view("POST", "/login", None, "curl/8", Some(b)),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "nosqli"),
+                "{b:?}: {:?}",
+                v.labels
+            );
+        }
+    }
+
+    #[test]
+    fn xxe_in_a_body_is_caught() {
+        let b = br#"<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]><r>&x;</r>"#;
+        let v = classifier().classify(
+            &view("POST", "/xml", None, "curl/8", Some(b)),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.iter().any(|l| l == "xxe"), "{:?}", v.labels);
+        assert_eq!(v.scan_level, 4);
+    }
+
+    #[test]
+    fn crlf_in_the_target_is_caught() {
+        let v = classifier().classify(
+            &view(
+                "GET",
+                "/redir",
+                Some("next=a%0d%0aSet-Cookie:%20x"),
+                "curl/8",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            v.labels.iter().any(|l| l == "crlf-injection"),
+            "{:?}",
+            v.labels
+        );
+        assert_eq!(v.scan_level, 3);
+        let plain = classifier().classify(
+            &view("GET", "/redir", Some("next=/home"), "Mozilla/5.0", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            !plain.labels.iter().any(|l| l == "crlf-injection"),
+            "{:?}",
+            plain.labels
+        );
+    }
 }
