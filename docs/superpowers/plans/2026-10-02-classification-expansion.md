@@ -1639,3 +1639,38 @@ Expected: all green — including `tests/capture.rs`, `tests/integration.rs`, `t
 git add src/classify/rules.rs README.md docs/operations.md
 git commit -m "docs: classification taxonomy, shipped-rule owasp meta-test"
 ```
+
+---
+
+## Corrections found during execution (2026-10-03)
+
+The plan was executed as written except for these fixes; the code is the
+reference where it differs from the steps above.
+
+- **Test commands.** `cargo test` takes one name filter, so commands such as
+  `cargo test store::requests cluster::record` are invalid; run one filter
+  (e.g. `cargo test owasp`) or the whole suite.
+- **Task 2 — rebuild.** `store::data::rebuild` recreates signed request
+  records from their row and was not in the plan; without reading
+  `owasp_json` back, every tagged record would replicate with a broken
+  signature. It now selects `owasp_json` and maps `'[]'` to `None`, and the
+  recorder signs the absent form (`"[]"` → `None`), since the column stores
+  `'[]'` for both. `request_rebuild_reproduces_old_and_new_records` covers a
+  tagged record. `owasp_json` is appended after `build`, the field added
+  since the plan was written.
+- **Task 2 — clippy.** The new field put `Record::Request` over clippy's
+  `large_enum_variant` limit; the variant is now `Request(Box<RequestRec>)`
+  (serde encodes a Box transparently, so the wire bytes are unchanged).
+- **Task 4.** `label_class` checks the explicit map before the `-probe`
+  suffix rule; in the plan's order the `proxy-probe` → bot arm was
+  unreachable. `templates/ip.html` renders request labels too and got the
+  same colours and OWASP badges.
+- **Task 5.** The scanners split moves Censys/Expanse/LeakIX to
+  `research-scanner`, so `new_scanner_user_agents_are_recognised` was
+  updated to expect the new label for them.
+- **Task 9.** `^/console(/|\?|$)` in `cms.toml` also matched Dify's
+  `/console/api/` and raised that `ai-infra-probe` to level 3; the WebLogic
+  alternative is narrowed to its own subpaths.
+- **Task 10.** The rule count is 42, not 38. The taxonomy table also lists
+  the behavioural labels the plan left out (`proxy-probe`, `unusual-method`,
+  `automation`, `inhuman-behavior`).
