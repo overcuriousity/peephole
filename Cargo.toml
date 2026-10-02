@@ -38,7 +38,7 @@ quick-xml = "0.42"
 rand = "0.10"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 regex = "1"
-reqwest = { version = "0.13", features = ["rustls", "gzip", "json", "cookies", "form"] }
+reqwest = { version = "0.13", features = ["rustls", "gzip", "json", "cookies", "form", "query"] }
 rustls = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11.19"

@@ -249,9 +249,26 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
 /// bring the IP's shown facts up to date.
 async fn ip_intel(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpIntelRec) -> Result<Effect> {
     // Only providers this version knows, so nobody pre-fills others.
-    if crate::intel::provider_info(&r.provider).is_none() {
+    if crate::intel::provider_info(&r.provider).is_none()
+        || r.data_json.len() > crate::intel::MAX_PEER_DATA_BYTES
+    {
         return Ok(Effect::Ignored);
     }
+    // The lookup history keeps every result, also the ones replaced below.
+    sqlx::query(
+        "INSERT OR IGNORE INTO ip_intel_log
+           (ip, provider, origin, hlc, fetched_at, source_version, data_json)
+         VALUES (?,?,?,?,?,?,?)",
+    )
+    .bind(&r.ip)
+    .bind(&r.provider)
+    .bind(ctx.origin_bytes().unwrap_or_default())
+    .bind(ctx.hlc as i64)
+    .bind(&r.fetched_at)
+    .bind(&r.source_version)
+    .bind(&r.data_json)
+    .execute(&mut *conn)
+    .await?;
     sqlx::query(
         "INSERT INTO ip_intel (ip, provider, origin, hlc, fetched_at, source_version, data_json)
          VALUES (?,?,?,?,?,?,?)
@@ -309,6 +326,41 @@ pub(crate) async fn refresh_ip_view(conn: &mut SqliteConnection, ip: &str) -> Re
         .bind(ip)
         .execute(&mut *conn)
         .await?;
+    let abuse = newest_intel(conn, ip, crate::intel::ABUSEIPDB).await?;
+    sqlx::query("UPDATE ips SET abuse_score = ? WHERE ip = ?")
+        .bind(
+            abuse
+                .as_ref()
+                .and_then(|a| a.get("score"))
+                .and_then(|v| v.as_i64()),
+        )
+        .bind(ip)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM ip_intel_tags WHERE ip = ?")
+        .bind(ip)
+        .execute(&mut *conn)
+        .await?;
+    // Tags only for an IP that has a row; it gets them when it is created.
+    let known: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ips WHERE ip = ?)")
+        .bind(ip)
+        .fetch_one(&mut *conn)
+        .await?;
+    for p in crate::intel::KNOWN_PROVIDERS
+        .iter()
+        .filter(|p| p.api && known)
+    {
+        let Some(data) = newest_intel(conn, ip, p.name).await? else {
+            continue;
+        };
+        for tag in crate::intel::tags(p.name, &data) {
+            sqlx::query("INSERT OR IGNORE INTO ip_intel_tags (ip, tag) VALUES (?, ?)")
+                .bind(ip)
+                .bind(format!("{}:{tag}", p.tag_prefix))
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -849,10 +901,16 @@ pub(crate) async fn drop_orphan_ip(conn: &mut SqliteConnection, ip_id: i64) -> R
     if dropped > 0
         && let Some(ip) = ip
     {
-        sqlx::query("DELETE FROM ip_intel WHERE ip = ?")
-            .bind(ip)
-            .execute(&mut *conn)
-            .await?;
+        for sql in [
+            "DELETE FROM ip_intel WHERE ip = ?",
+            "DELETE FROM ip_intel_log WHERE ip = ?",
+            "DELETE FROM ip_intel_tags WHERE ip = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(ip.as_str())
+                .execute(&mut *conn)
+                .await?;
+        }
     }
     Ok(())
 }

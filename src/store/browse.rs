@@ -67,6 +67,15 @@ pub struct IpFilter {
     pub sort: Option<String>,
     #[serde(default, deserialize_with = "lenient_i64")]
     pub page: Option<i64>,
+    /// Admin only (the public filter drops these): minimum AbuseIPDB score.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub min_abuse: Option<i64>,
+    /// Admin only: a provider tag (`shodan:vpn`, `greynoise:malicious`, …).
+    pub tag: Option<String>,
+    /// Admin only: has a result from this provider.
+    pub intel: Option<String>,
+    /// Admin only: has no result from this provider.
+    pub nointel: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -80,6 +89,8 @@ pub struct IpSummary {
     pub last_seen: String,
     pub request_count: i64,
     pub max_severity: i64,
+    /// Newest AbuseIPDB score (admin pages only show it).
+    pub abuse_score: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -172,7 +183,7 @@ pub(crate) fn like_escape(s: &str) -> String {
 
 const IP_SUMMARY_SELECT: &str =
     "SELECT i.ip, i.country, i.asn, i.asn_org, i.is_tor_exit AS is_tor, i.first_seen, i.last_seen,
-            i.request_count, i.max_severity
+            i.request_count, i.max_severity, i.abuse_score
      FROM ips i";
 
 /// Who a request listing is for. A mistyped legitimate API call lands in
@@ -277,6 +288,25 @@ fn ip_filter_sql(f: &IpFilter) -> Option<IpFilterSql> {
     if let Some(m) = f.min_severity {
         wheres.push("i.max_severity >= CAST(? AS INTEGER)".into());
         binds.push(m.to_string());
+    }
+    if let Some(m) = f.min_abuse {
+        wheres.push("i.abuse_score >= CAST(? AS INTEGER)".into());
+        binds.push(m.to_string());
+    }
+    if let Some(t) = nonempty(&f.tag) {
+        wheres.push("i.ip IN (SELECT t.ip FROM ip_intel_tags t WHERE t.tag = ?)".into());
+        binds.push(t);
+    }
+    if let Some(p) = nonempty(&f.intel) {
+        wheres
+            .push("EXISTS (SELECT 1 FROM ip_intel x WHERE x.provider = ? AND x.ip = i.ip)".into());
+        binds.push(p);
+    }
+    if let Some(p) = nonempty(&f.nointel) {
+        wheres.push(
+            "NOT EXISTS (SELECT 1 FROM ip_intel x WHERE x.provider = ? AND x.ip = i.ip)".into(),
+        );
+        binds.push(p);
     }
     let where_sql = if wheres.is_empty() {
         String::new()
@@ -428,10 +458,10 @@ impl Store {
                 has_next: false,
             });
         };
-        let order = if f.sort.as_deref() == Some("recent") {
-            "i.last_seen DESC"
-        } else {
-            "i.request_count DESC, i.last_seen DESC"
+        let order = match f.sort.as_deref() {
+            Some("recent") => "i.last_seen DESC",
+            Some("abuse") => "i.abuse_score IS NULL, i.abuse_score DESC, i.last_seen DESC",
+            _ => "i.request_count DESC, i.last_seen DESC",
         };
         let sql = format!(
             "{IP_SUMMARY_SELECT}{} ORDER BY {order} LIMIT {} OFFSET {}",

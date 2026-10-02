@@ -5,3 +5,7 @@
 <input type="hidden" name="label" value="{{ f.label.as_deref().unwrap_or_default() }}">
 <input type="hidden" name="min_severity" value="{% if let Some(v) = f.min_severity %}{{ v }}{% endif %}">
 <input type="hidden" name="tor" value="{{ f.tor.as_deref().unwrap_or_default() }}">
+<input type="hidden" name="min_abuse" value="{% if let Some(v) = f.min_abuse %}{{ v }}{% endif %}">
+<input type="hidden" name="tag" value="{{ f.tag.as_deref().unwrap_or_default() }}">
+<input type="hidden" name="intel" value="{{ f.intel.as_deref().unwrap_or_default() }}">
+<input type="hidden" name="nointel" value="{{ f.nointel.as_deref().unwrap_or_default() }}">

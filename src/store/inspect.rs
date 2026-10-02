@@ -114,6 +114,14 @@ pub struct IpIntelRow {
     pub node: Option<String>,
 }
 
+/// Lookups per provider shown on the IP page.
+pub const INTEL_HISTORY_PER_PROVIDER: i64 = 50;
+
+/// `(ip, provider, hlc, fetched_at, source_version, origin, data_json)`.
+pub type IntelLogRow = (String, String, i64, String, Option<String>, Vec<u8>, String);
+/// Where a history page ends: `(fetched_at, ip, provider, hlc)`.
+pub type IntelLogKey = (String, String, String, i64);
+
 /// `(ip, provider, fetched_at, source_version, origin, data_json)`.
 pub type IntelRow = (String, String, String, Option<String>, Vec<u8>, String);
 
@@ -132,17 +140,60 @@ impl Store {
         .await?)
     }
 
-    /// Every provider's results for one IP, newest first per provider, with
+    /// Every provider's results for one IP from the lookup history, newest
+    /// first per provider (at most [`INTEL_HISTORY_PER_PROVIDER`] each), with
     /// the cluster node that looked each one up (None standalone or for a
     /// node no longer in `members`).
     pub async fn intel_for_ip(&self, ip: &str) -> Result<Vec<IpIntelRow>> {
         Ok(sqlx::query_as::<_, IpIntelRow>(
-            "SELECT t.provider, t.fetched_at, t.source_version, t.data_json,
-                    (SELECT name FROM members m WHERE m.id = t.origin) AS node
-             FROM ip_intel t WHERE t.ip = ?
-             ORDER BY t.provider, t.hlc DESC, t.origin DESC",
+            "SELECT provider, fetched_at, source_version, data_json, node FROM (
+               SELECT t.provider, t.fetched_at, t.source_version, t.data_json, t.hlc, t.origin,
+                      (SELECT name FROM members m WHERE m.id = t.origin) AS node,
+                      row_number() OVER (PARTITION BY t.provider
+                                         ORDER BY t.hlc DESC, t.origin DESC) AS n
+               FROM ip_intel_log t WHERE t.ip = ?)
+             WHERE n <= ?
+             ORDER BY provider, hlc DESC, origin DESC",
         )
         .bind(ip)
+        .bind(INTEL_HISTORY_PER_PROVIDER)
+        .fetch_all(&self.read)
+        .await?)
+    }
+
+    /// Provider tags present on any IP, most common first (admin filter).
+    pub async fn intel_tags(&self) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT tag FROM ip_intel_tags GROUP BY tag ORDER BY COUNT(*) DESC, tag LIMIT 300",
+        )
+        .fetch_all(&self.read)
+        .await?)
+    }
+
+    /// Every lookup in the history, oldest first, after `after` (keyset
+    /// paging by rowid-free key: `(fetched_at, ip, provider, hlc)`), for
+    /// the full-history export. Only IPs that still have a row.
+    pub async fn intel_log_page(
+        &self,
+        after: Option<&IntelLogKey>,
+        limit: i64,
+    ) -> Result<Vec<IntelLogRow>> {
+        let (f, i, p, h) = match after {
+            Some(k) => (k.0.as_str(), k.1.as_str(), k.2.as_str(), k.3),
+            None => ("", "", "", i64::MIN),
+        };
+        Ok(sqlx::query_as(
+            "SELECT ip, provider, hlc, fetched_at, source_version, origin, data_json
+             FROM ip_intel_log t
+             WHERE (fetched_at, ip, provider, hlc) > (?, ?, ?, ?)
+               AND EXISTS (SELECT 1 FROM ips WHERE ips.ip = t.ip)
+             ORDER BY fetched_at, ip, provider, hlc LIMIT ?",
+        )
+        .bind(f)
+        .bind(i)
+        .bind(p)
+        .bind(h)
+        .bind(limit)
         .fetch_all(&self.read)
         .await?)
     }

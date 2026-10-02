@@ -74,6 +74,8 @@ struct HomePage {
     tor_fetch: String,
     maxmind_fetch: String,
     stale: bool,
+    /// `(label, state)` per API provider.
+    api: Vec<(&'static str, String)>,
 }
 
 async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
@@ -104,7 +106,60 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             _ => fetched("maxmind_last_fetch"),
         },
         stale,
+        api: api_provider_states(&st).await?,
     })
+}
+
+/// Each API provider's state as this node sees it: its own budget and
+/// pause, or whether a cluster member serves it; and how many lookups the
+/// dataset holds.
+async fn api_provider_states(st: &AdminState) -> anyhow::Result<Vec<(&'static str, String)>> {
+    let counts: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
+        "SELECT provider, COUNT(*) FROM ip_intel_log GROUP BY provider",
+    )
+    .fetch_all(&st.store.read)
+    .await?
+    .into_iter()
+    .collect();
+    let served_elsewhere = |name: &str| {
+        st.recorder.node().is_some_and(|node| {
+            let me = node.id();
+            node.live_members(std::time::Duration::from_secs(45))
+                .into_iter()
+                .any(|id| {
+                    id != me
+                        && node
+                            .status
+                            .known(&id)
+                            .is_some_and(|k| k.hb.providers.iter().any(|n| n == name))
+                })
+        })
+    };
+    Ok(crate::intel::KNOWN_PROVIDERS
+        .iter()
+        .filter(|p| p.api)
+        .map(|p| {
+            let here = st.providers.iter().find(|x| x.name() == p.name);
+            let mut state = match here {
+                Some(x) => {
+                    let s = x.status().unwrap_or_default();
+                    if x.ready() {
+                        format!("active · {s}")
+                    } else {
+                        format!("waiting · {s}")
+                    }
+                }
+                None if served_elsewhere(p.name) => {
+                    "not on this node; looked up by a cluster member".to_string()
+                }
+                None => "not configured".to_string(),
+            };
+            if let Some(n) = counts.get(p.name) {
+                state.push_str(&format!(" · {n} lookups recorded"));
+            }
+            (p.label, state)
+        })
+        .collect())
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -578,7 +633,12 @@ async fn export_page(_u: SessionUser) -> AppResult<Html<String>> {
 
 /// Enrichment results as JSON Lines: what each provider said about each
 /// IP, when, from which data version, and which node looked it up.
-async fn export_intel(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
+/// With `history=1`: every lookup ever recorded, streamed and uncapped.
+async fn export_intel(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> AppResult<Response> {
     let names: HashMap<Vec<u8>, String> = match st.recorder.node() {
         Some(node) => crate::cluster::members::all(&node.store)
             .await?
@@ -587,6 +647,23 @@ async fn export_intel(_u: SessionUser, State(st): State<Arc<AdminState>>) -> App
             .collect(),
         None => HashMap::new(),
     };
+    if q.get("history").map(String::as_str) == Some("1") {
+        let body = axum::body::Body::from_stream(crate::export::stream_intel_history(
+            st.store.clone(),
+            names,
+        ));
+        return Ok((
+            [
+                (axum::http::header::CONTENT_TYPE, "application/x-ndjson"),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"peephole-enrichment-history.jsonl\"",
+                ),
+            ],
+            body,
+        )
+            .into_response());
+    }
     let mut out = String::new();
     let mut rows = st.store.intel_export(INTEL_EXPORT_CAP + 1).await?;
     // Capped: say so (header and a last line) rather than cut silently.

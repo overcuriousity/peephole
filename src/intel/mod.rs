@@ -1,11 +1,19 @@
+pub mod abuseipdb;
+pub mod api;
 pub mod geo;
+pub mod greynoise;
 pub mod provider;
 pub mod share;
+pub mod shodan;
 pub mod tor;
 
 /// Provider names in `ip_intel` records.
 pub const MAXMIND: &str = "maxmind-geolite2";
 pub const TOR: &str = "tor-exits";
+pub const ABUSEIPDB: &str = "abuseipdb";
+pub const SHODAN: &str = "shodan";
+pub const INTERNETDB: &str = "shodan-internetdb";
+pub const GREYNOISE: &str = "greynoise-community";
 
 /// A provider this version knows: results from others are not accepted.
 pub struct ProviderInfo {
@@ -16,6 +24,11 @@ pub struct ProviderInfo {
     /// pages already show (country, ASN, Tor flag); a provider that reports
     /// open ports or abuse reports stays admin-only.
     pub public: bool,
+    /// Looked up through a third-party API: every lookup is recorded (no
+    /// "same as last time" skip), and results come back on refresh.
+    pub api: bool,
+    /// Prefix of this provider's tags in `ip_intel_tags`.
+    pub tag_prefix: &'static str,
 }
 
 pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
@@ -23,16 +36,63 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         name: TOR,
         label: "Tor exit list",
         public: true,
+        api: false,
+        tag_prefix: "tor",
     },
     ProviderInfo {
         name: MAXMIND,
         label: "MaxMind GeoLite2",
         public: true,
+        api: false,
+        tag_prefix: "maxmind",
+    },
+    ProviderInfo {
+        name: ABUSEIPDB,
+        label: "AbuseIPDB",
+        public: false,
+        api: true,
+        tag_prefix: "abuseipdb",
+    },
+    ProviderInfo {
+        name: GREYNOISE,
+        label: "GreyNoise Community",
+        public: false,
+        api: true,
+        tag_prefix: "greynoise",
+    },
+    ProviderInfo {
+        name: SHODAN,
+        label: "Shodan",
+        public: false,
+        api: true,
+        tag_prefix: "shodan",
+    },
+    ProviderInfo {
+        name: INTERNETDB,
+        label: "Shodan InternetDB",
+        public: false,
+        api: true,
+        tag_prefix: "internetdb",
     },
 ];
 
+/// Largest `data_json` accepted from a peer; a node writes at most
+/// [`api::MAX_DATA_BYTES`].
+pub const MAX_PEER_DATA_BYTES: usize = 32 * 1024;
+
 pub fn provider_info(name: &str) -> Option<&'static ProviderInfo> {
     KNOWN_PROVIDERS.iter().find(|p| p.name == name)
+}
+
+/// Tags of one result, for filtering the admin IP list (stored with the
+/// provider's [`ProviderInfo::tag_prefix`]).
+pub fn tags(provider: &str, data: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    match provider {
+        ABUSEIPDB => abuseipdb::tags(data),
+        SHODAN | INTERNETDB => shodan::tags(data),
+        GREYNOISE => greynoise::tags(data),
+        _ => vec![],
+    }
 }
 
 use crate::config::Config;
@@ -75,63 +135,229 @@ pub async fn backfill_geo(rec: &Recorder, geo: &RwLock<Option<geo::GeoIp>>) {
 /// The providers a node was started with.
 pub type Providers = Vec<Arc<dyn provider::Provider>>;
 
-/// IPs looked up per provider and pass.
-const ENRICH_BATCH: i64 = 500;
+/// The providers this node can run: the local databases always, the API
+/// providers that have a config section (and, for InternetDB, `enabled`).
+pub fn providers(cfg: &Config, store: &Store, geo: &SharedGeo, tor: &SharedTor) -> Providers {
+    use api::{ApiProvider, Limit, Period};
+    let daily = |max: u64| -> Vec<Limit> {
+        (max > 0)
+            .then_some(Limit {
+                period: Period::Day,
+                max,
+            })
+            .into_iter()
+            .collect()
+    };
+    let refresh = cfg.enrichment.refresh_after_days;
+    let mut out: Providers = vec![
+        Arc::new(provider::MaxMind(geo.clone())),
+        Arc::new(provider::TorExits(tor.clone())),
+    ];
+    if let Some(a) = &cfg.abuseipdb {
+        out.push(Arc::new(ApiProvider::new(
+            abuseipdb::AbuseIpDb {
+                base: abuseipdb::BASE.into(),
+                key: a.api_key.trim().into(),
+                max_age_days: a.max_age_days,
+            },
+            store.clone(),
+            daily(a.daily_limit),
+            refresh,
+        )));
+    }
+    if let Some(s) = &cfg.shodan {
+        out.push(Arc::new(ApiProvider::new(
+            shodan::ShodanHost {
+                base: shodan::HOST_BASE.into(),
+                key: s.api_key.trim().into(),
+            },
+            store.clone(),
+            daily(s.daily_limit),
+            refresh,
+        )));
+    }
+    if let Some(i) = cfg.internetdb.as_ref().filter(|i| i.enabled) {
+        out.push(Arc::new(ApiProvider::new(
+            shodan::InternetDb {
+                base: shodan::INTERNETDB_BASE.into(),
+            },
+            store.clone(),
+            daily(i.daily_limit),
+            refresh,
+        )));
+    }
+    if let Some(g) = &cfg.greynoise {
+        let key = g.api_key.trim();
+        out.push(Arc::new(ApiProvider::new(
+            greynoise::GreyNoise {
+                base: greynoise::BASE.into(),
+                key: (!key.is_empty()).then(|| key.to_string()),
+            },
+            store.clone(),
+            g.limits(),
+            refresh,
+        )));
+    }
+    let api: Vec<&str> = out.iter().skip(2).map(|p| p.name()).collect();
+    if !api.is_empty() {
+        info!(providers = ?api, "API enrichment providers configured");
+    }
+    out
+}
+
 /// How often the enrichment loop runs.
 const ENRICH_TICK: Duration = Duration::from_secs(60);
 
 /// One pass: for every provider this node can serve, look up IPs that have
-/// no result from it yet and record what it says. In a cluster the able
-/// nodes take turns by rank (see [`provider::step_in_secs`]). Returns how
-/// many results were written.
+/// no result from it yet (or, for API providers, are due again) and record
+/// what it says. In a cluster the able nodes take turns by rank (see
+/// [`provider::step_in_secs`]). Returns how many results were written.
 pub async fn enrich_once(rec: &Recorder, providers: &Providers) -> anyhow::Result<usize> {
-    let ready: Vec<_> = providers.iter().filter(|p| p.ready()).collect();
-    if let Some(node) = rec.node() {
-        node.set_providers(ready.iter().map(|p| p.name().to_string()).collect());
-    }
+    announce(rec, providers);
     let mut written = 0;
-    for p in ready {
-        let rank = match rec.node() {
-            None => 0,
-            Some(node) => {
-                let me = node.id();
-                let members = node.members();
-                let able: Vec<_> = node
-                    .live_members(LIVE_WINDOW)
-                    .into_iter()
-                    .filter(|id| *id == me || !node.is_blocked(id))
-                    .filter(|id| {
-                        *id == me
-                            || node
-                                .status
-                                .known(id)
-                                .is_some_and(|k| k.hb.providers.iter().any(|n| n == p.name()))
-                    })
-                    .map(|id| (id, members.get(&id).is_some_and(|m| m.address.is_some())))
-                    .collect();
-                share::rank(me, &able).unwrap_or(0)
-            }
-        };
-        let ips = rec
-            .store()
-            .ips_missing_intel(p.name(), provider::step_in_secs(rank), ENRICH_BATCH)
-            .await?;
-        if ips.is_empty() {
-            continue;
-        }
-        for f in p.lookup(&ips).await {
-            rec.record_intel(&f.ip, p.name(), f.source_version.as_deref(), f.data)
-                .await?;
-            written += 1;
-        }
+    for p in providers.iter().filter(|p| p.ready()) {
+        written += enrich_provider(rec, p.as_ref(), providers).await?;
     }
     Ok(written)
 }
 
-/// Keep filling in results for IPs that lack them, until shutdown.
+/// Announce the providers this node can serve right now (heartbeats).
+fn announce(rec: &Recorder, providers: &Providers) {
+    if let Some(node) = rec.node() {
+        node.set_providers(
+            providers
+                .iter()
+                .filter(|p| p.ready())
+                .map(|p| p.name().to_string())
+                .collect(),
+        );
+    }
+}
+
+/// Whether a live, unblocked member (this node included) serves `name`.
+fn served_in_cluster(rec: &Recorder, providers: &Providers, name: &str) -> bool {
+    if providers.iter().any(|p| p.name() == name && p.ready()) {
+        return true;
+    }
+    rec.node().is_some_and(|node| {
+        let me = node.id();
+        node.live_members(LIVE_WINDOW).into_iter().any(|id| {
+            id != me
+                && !node.is_blocked(&id)
+                && node
+                    .status
+                    .known(&id)
+                    .is_some_and(|k| k.hb.providers.iter().any(|n| n == name))
+        })
+    })
+}
+
+/// This node's place among the live members that serve `name` (0 standalone).
+fn rank_for(rec: &Recorder, name: &str) -> usize {
+    let Some(node) = rec.node() else { return 0 };
+    let me = node.id();
+    let members = node.members();
+    let able: Vec<_> = node
+        .live_members(LIVE_WINDOW)
+        .into_iter()
+        .filter(|id| *id == me || !node.is_blocked(id))
+        .filter(|id| {
+            *id == me
+                || node
+                    .status
+                    .known(id)
+                    .is_some_and(|k| k.hb.providers.iter().any(|n| n == name))
+        })
+        .map(|id| (id, members.get(&id).is_some_and(|m| m.address.is_some())))
+        .collect();
+    share::rank(me, &able).unwrap_or(0)
+}
+
+/// Extra wait before InternetDB takes an IP while Shodan is served, so the
+/// full host lookup gets it first.
+const INTERNETDB_DEFER_SECS: i64 = 900;
+
+/// One batch for one provider; returns how many results were written.
+async fn enrich_provider(
+    rec: &Recorder,
+    p: &dyn provider::Provider,
+    all: &Providers,
+) -> anyhow::Result<usize> {
+    let step = provider::step_in_secs(rank_for(rec, p.name()));
+    let info = provider_info(p.name());
+    let ips = if info.is_some_and(|i| i.api) {
+        let mut step = step;
+        let covered_by = (p.name() == INTERNETDB).then_some(SHODAN);
+        if covered_by.is_some() && served_in_cluster(rec, all, SHODAN) {
+            step += INTERNETDB_DEFER_SECS;
+        }
+        let skip = p.skip_list();
+        rec.store()
+            .intel_candidates(&crate::store::requests::IntelCandidates {
+                provider: p.name(),
+                step_secs: step,
+                refresh_after_days: p.refresh_after_days(),
+                ipv6: p.ipv6(),
+                skip: &skip,
+                covered_by,
+                limit: p.batch(),
+            })
+            .await?
+    } else {
+        rec.store()
+            .ips_missing_intel(p.name(), step, p.batch())
+            .await?
+    };
+    if ips.is_empty() {
+        return Ok(0);
+    }
+    let api = info.is_some_and(|i| i.api);
+    let mut written = 0;
+    for f in p.lookup(&ips).await {
+        if api {
+            rec.record_lookup(&f.ip, p.name(), f.source_version.as_deref(), f.data)
+                .await?;
+        } else {
+            rec.record_intel(&f.ip, p.name(), f.source_version.as_deref(), f.data)
+                .await?;
+        }
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// How often the announced provider list is refreshed.
+const ANNOUNCE_TICK: Duration = Duration::from_secs(10);
+
+/// Keep filling in results for IPs that lack them, until shutdown: one task
+/// per provider, so a slow API never holds up the others.
 pub async fn enrich_loop(
     rec: Recorder,
     providers: Providers,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    for p in &providers {
+        tokio::spawn(provider_loop(
+            rec.clone(),
+            p.clone(),
+            providers.clone(),
+            shutdown.clone(),
+        ));
+    }
+    let mut shutdown = shutdown;
+    loop {
+        announce(&rec, &providers);
+        tokio::select! {
+            _ = tokio::time::sleep(ANNOUNCE_TICK) => {}
+            _ = shutdown.changed() => break,
+        }
+    }
+}
+
+async fn provider_loop(
+    rec: Recorder,
+    p: Arc<dyn provider::Provider>,
+    all: Providers,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut wait = Duration::from_secs(5);
@@ -141,10 +367,19 @@ pub async fn enrich_loop(
             _ = shutdown.changed() => break,
         }
         wait = ENRICH_TICK;
-        match enrich_once(&rec, &providers).await {
+        if !p.ready() {
+            continue;
+        }
+        match enrich_provider(&rec, p.as_ref(), &all).await {
             Ok(0) => {}
-            Ok(n) => info!(n, "enrichment: results recorded"),
-            Err(e) => warn!(?e, "enrichment pass failed"),
+            Ok(n) => {
+                info!(provider = p.name(), n, "enrichment: results recorded");
+                // A full batch: more are probably waiting.
+                if n as i64 >= p.batch() {
+                    wait = Duration::from_secs(1);
+                }
+            }
+            Err(e) => warn!(provider = p.name(), ?e, "enrichment pass failed"),
         }
     }
 }

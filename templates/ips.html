@@ -12,9 +12,17 @@
     {% for s in 1..5 %}<option value="{{ s }}"{% if f.min_severity == Some(s.clone()) %} selected{% endif %}>{{ s }}+</option>{% endfor %}
   </select></label>
   <label>Tor <select name="tor"><option value="">any</option><option value="1"{% if f.tor.as_deref() == Some("1") %} selected{% endif %}>exits only</option></select></label>
+  {% if chrome.authed %}
+  <label>Min abuse score <input name="min_abuse" type="number" min="0" max="100" size="4" value="{% if let Some(a) = f.min_abuse %}{{ a }}{% endif %}"></label>
+  <label>Intel tag <input name="tag" list="intel-tags" value="{{ f.tag.as_deref().unwrap_or_default() }}" placeholder="greynoise:malicious"></label>
+  <datalist id="intel-tags">{% for t in tags %}<option value="{{ t }}">{% endfor %}</datalist>
+  <label>Looked up by <select name="intel"><option value="">any</option>{% for (n, l) in api_providers %}<option value="{{ n }}"{% if f.intel.as_deref() == Some(n) %} selected{% endif %}>{{ l }}</option>{% endfor %}</select></label>
+  <label>Not yet by <select name="nointel"><option value="">any</option>{% for (n, l) in api_providers %}<option value="{{ n }}"{% if f.nointel.as_deref() == Some(n) %} selected{% endif %}>{{ l }}</option>{% endfor %}</select></label>
+  {% endif %}
   <label>Sort <select name="sort">
-    <option value="count"{% if f.sort.as_deref() != Some("recent") %} selected{% endif %}>most requests</option>
+    <option value="count"{% if f.sort.as_deref() != Some("recent") && f.sort.as_deref() != Some("abuse") %} selected{% endif %}>most requests</option>
     <option value="recent"{% if f.sort.as_deref() == Some("recent") %} selected{% endif %}>last seen</option>
+    {% if chrome.authed %}<option value="abuse"{% if f.sort.as_deref() == Some("abuse") %} selected{% endif %}>abuse score</option>{% endif %}
   </select></label>
   <button class="btn btn-primary" type="submit">Filter</button>
 </form>
@@ -37,7 +45,7 @@
 {% include "_ip_filter_hidden.html" %}
 {% endif %}
 <div class="table-wrap"><table>
-  <thead><tr>{% if chrome.authed %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>IP</th><th>Country</th><th>Network</th><th class="num">Requests</th><th>Max sev</th><th>First seen</th><th>Last seen</th></tr></thead>
+  <thead><tr>{% if chrome.authed %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>IP</th><th>Country</th><th>Network</th><th class="num">Requests</th><th>Max sev</th>{% if chrome.authed %}<th class="num">Abuse</th>{% endif %}<th>First seen</th><th>Last seen</th></tr></thead>
   <tbody>
   {% for i in page.items %}
     <tr>
@@ -47,11 +55,12 @@
       <td>{% if let Some(o) = i.asn_org %}{{ o }}{% if let Some(a) = i.asn %} <span class="muted mono">AS{{ a }}</span>{% endif %}{% else %}<span class="muted">—</span>{% endif %}</td>
       <td class="num">{{ i.request_count }}</td>
       <td>{% let sev = i.max_severity %}{% include "_severity.html" %}</td>
+      {% if chrome.authed %}<td class="num mono">{% if let Some(a) = i.abuse_score %}{{ a }}{% else %}<span class="muted">—</span>{% endif %}</td>{% endif %}
       <td class="ts">{{ i.first_seen }}</td>
       <td class="ts">{{ i.last_seen }}</td>
     </tr>
   {% endfor %}
-  {% if page.items.is_empty() %}<tr><td colspan="8" class="empty">No IPs match.</td></tr>{% endif %}
+  {% if page.items.is_empty() %}<tr><td colspan="9" class="empty">No IPs match.</td></tr>{% endif %}
   </tbody>
 </table></div>
 {% if chrome.authed %}</form>{% endif %}

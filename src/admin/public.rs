@@ -169,6 +169,9 @@ struct IpsPage {
     /// Rows matching the filter across all pages; `Some` only with a session.
     bulk_total: Option<i64>,
     labels: bool,
+    /// Admin only: provider tags to filter by, and the API providers.
+    tags: Vec<String>,
+    api_providers: Vec<(&'static str, &'static str)>,
 }
 
 /// Deepest IP-directory page anonymous visitors can open; with a session
@@ -208,6 +211,11 @@ pub(crate) fn public_ip_filter(f: &IpFilter, show_labels: bool) -> IpFilter {
         tor: f.tor.clone().filter(|t| t == "1"),
         sort: f.sort.clone().filter(|s| s == "recent"),
         page: Some(i64::from(page_num(f.page)).min(PUBLIC_MAX_PAGE)),
+        // Admin-only providers: never filtered on for the public.
+        min_abuse: None,
+        tag: None,
+        intel: None,
+        nointel: None,
     }
 }
 
@@ -220,6 +228,10 @@ pub(crate) fn ip_qs(f: &IpFilter) -> String {
         ("min_severity", f.min_severity.map(|a| a.to_string())),
         ("tor", f.tor.clone()),
         ("sort", f.sort.clone()),
+        ("min_abuse", f.min_abuse.map(|a| a.to_string())),
+        ("tag", f.tag.clone()),
+        ("intel", f.intel.clone()),
+        ("nointel", f.nointel.clone()),
     ])
 }
 
@@ -252,13 +264,27 @@ async fn ips(
     } else {
         let f = public_ip_filter(&f, state.cfg.public.show_labels);
         let key = format!("{}page={}", ip_qs(&f), page_num(f.page));
-        let mut page = state.stats_cache.ips(&state.store, &f, key).await?;
-        if page.has_next && i64::from(page.page) >= PUBLIC_MAX_PAGE {
-            let mut last = (*page).clone();
-            last.has_next = false;
-            page = Arc::new(last);
+        let cached = state.stats_cache.ips(&state.store, &f, key).await?;
+        // AbuseIPDB is admin-only: its score never reaches a public page.
+        let mut page = (*cached).clone();
+        for i in &mut page.items {
+            i.abuse_score = None;
         }
+        if page.has_next && i64::from(page.page) >= PUBLIC_MAX_PAGE {
+            page.has_next = false;
+        }
+        let page = Arc::new(page);
         (f, page, None)
+    };
+    let (tags, api_providers) = if authed {
+        let providers = crate::intel::KNOWN_PROVIDERS
+            .iter()
+            .filter(|p| p.api)
+            .map(|p| (p.name, p.label))
+            .collect();
+        (state.store.intel_tags().await?, providers)
+    } else {
+        (vec![], vec![])
     };
     render(&IpsPage {
         chrome: Chrome::new(authed, "ips"),
@@ -267,6 +293,8 @@ async fn ips(
         page,
         bulk_total,
         labels: labels_shown(&state, authed),
+        tags,
+        api_providers,
     })
 }
 
@@ -353,6 +381,9 @@ fn intel_facts(provider: &str, data: &serde_json::Value) -> Vec<IntelFact> {
     let Some(obj) = data.as_object() else {
         return vec![fact("Data", data.to_string(), true)];
     };
+    if let Some(fields) = api_fields(provider) {
+        return api_facts(fields, obj);
+    }
     // Known fields first, in reading order; the map itself is sorted by key.
     const ORDER: [&str; 4] = ["exit", "country", "asn", "asn_org"];
     let mut fields: Vec<(&String, &serde_json::Value)> = obj.iter().collect();
@@ -397,6 +428,122 @@ fn intel_facts(provider: &str, data: &serde_json::Value) -> Vec<IntelFact> {
             other => other.to_string(),
         };
         out.push(fact(k, value, !v.is_string()));
+    }
+    if out.is_empty() {
+        out.push(fact("Result", "nothing known about this address", false));
+    }
+    out
+}
+
+/// `(key, label, monospaced)` of an API provider's fields, in reading order.
+type Fields = &'static [(&'static str, &'static str, bool)];
+
+fn api_fields(provider: &str) -> Option<Fields> {
+    use crate::intel::{ABUSEIPDB, GREYNOISE, INTERNETDB, SHODAN};
+    Some(match provider {
+        ABUSEIPDB => &[
+            ("score", "Abuse score", true),
+            ("reports", "Reports", true),
+            ("reporters", "Reporters", true),
+            ("last_reported_at", "Last reported", true),
+            ("categories", "Categories", false),
+            ("usage_type", "Usage type", false),
+            ("isp", "ISP", false),
+            ("domain", "Domain", true),
+            ("hostnames", "Hostnames", true),
+            ("whitelisted", "Whitelisted", false),
+            ("tor", "Tor", false),
+        ],
+        SHODAN => &[
+            ("ports", "Open ports", true),
+            ("services", "Services", true),
+            ("os", "OS", false),
+            ("org", "Organisation", false),
+            ("isp", "ISP", false),
+            ("asn", "ASN", true),
+            ("hostnames", "Hostnames", true),
+            ("domains", "Domains", true),
+            ("tags", "Tags", false),
+            ("vulns", "CVEs", true),
+            ("last_update", "Last crawled", true),
+        ],
+        INTERNETDB => &[
+            ("ports", "Open ports", true),
+            ("cpes", "CPEs", true),
+            ("hostnames", "Hostnames", true),
+            ("tags", "Tags", false),
+            ("vulns", "CVEs", true),
+        ],
+        GREYNOISE => &[
+            ("classification", "Classification", false),
+            ("noise", "Mass-scanning", false),
+            ("riot", "Known benign service", false),
+            ("name", "Actor / provider", false),
+            ("last_seen", "Last seen scanning", true),
+        ],
+        _ => return None,
+    })
+}
+
+/// One value as text: lists comma-separated, Shodan services as
+/// `port/transport product version`, flags as yes/no.
+fn fact_text(key: &str, v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => if *b { "yes" } else { "no" }.to_string(),
+        Value::Array(items) if key == "services" => items
+            .iter()
+            .map(|s| {
+                let mut out = format!(
+                    "{}/{}",
+                    s.get("port").map_or("?".into(), |p| p.to_string()),
+                    s.get("transport").and_then(|t| t.as_str()).unwrap_or("tcp")
+                );
+                for k in ["product", "version"] {
+                    if let Some(x) = s.get(k).and_then(|x| x.as_str()) {
+                        out.push(' ');
+                        out.push_str(x);
+                    }
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .join(" · "),
+        Value::Array(items) => items
+            .iter()
+            .map(|x| match x {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    }
+}
+
+fn api_facts(fields: Fields, obj: &serde_json::Map<String, serde_json::Value>) -> Vec<IntelFact> {
+    let mut out: Vec<IntelFact> = fields
+        .iter()
+        .filter_map(|(k, label, mono)| {
+            let v = obj.get(*k).filter(|v| !v.is_null())?;
+            let mut text = fact_text(k, v);
+            if *k == "score" {
+                text.push_str(" / 100");
+            }
+            if *k == "vulns"
+                && let Some(n) = v.as_array().map(Vec::len).filter(|n| *n > 1)
+            {
+                text = format!("{n}: {text}");
+            }
+            Some(fact(label, text, *mono))
+        })
+        .collect();
+    // Fields this version does not know yet (a newer node's), as they are.
+    for (k, v) in obj {
+        if !v.is_null() && !fields.iter().any(|(f, _, _)| f == k) {
+            out.push(fact(k, fact_text(k, v), !v.is_string()));
+        }
     }
     if out.is_empty() {
         out.push(fact("Result", "nothing known about this address", false));
@@ -731,11 +878,48 @@ show_labels = {show_labels}
         assert!(geo.facts.iter().any(|f| f.value == "AS64500"));
 
         let admin = intel_cards(rows(), true);
-        assert_eq!(admin.len(), 3);
+        assert_eq!(admin.len(), crate::intel::KNOWN_PROVIDERS.len());
         assert_eq!(admin[0].newest.as_ref().unwrap().node.as_deref(), Some("a"));
         assert_eq!(admin[0].others.len(), 1);
-        assert_eq!(admin[2].name, "shodan");
-        assert_eq!(admin[2].newest.as_ref().unwrap().facts[0].value, "[22,80]");
+        let shodan = admin.iter().find(|c| c.name == "shodan").unwrap();
+        assert_eq!(shodan.label, "Shodan");
+        assert_eq!(shodan.newest.as_ref().unwrap().facts[0].value, "22, 80");
+        let row = |p: &str| row(p, r#"{"ports":[22]}"#, None);
+        let cards = intel_cards(vec![row("not-a-provider")], true);
+        assert!(cards.iter().any(|c| c.label == "Other provider"));
+    }
+
+    #[test]
+    fn api_results_read_as_facts() {
+        let f = intel_facts(
+            crate::intel::ABUSEIPDB,
+            &serde_json::json!({"score": 87, "reports": 41, "categories": ["SSH", "Port Scan"],
+                                "whitelisted": false, "future_field": 1}),
+        );
+        let got: Vec<_> = f
+            .iter()
+            .map(|f| (f.label.as_str(), f.value.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Abuse score", "87 / 100"),
+                ("Reports", "41"),
+                ("Categories", "SSH, Port Scan"),
+                ("Whitelisted", "no"),
+                ("future_field", "1"),
+            ]
+        );
+        let f = intel_facts(
+            crate::intel::SHODAN,
+            &serde_json::json!({"services": [{"port": 22, "transport": "tcp", "product": "OpenSSH",
+                                              "version": "8.9p1"}, {"port": 443}],
+                                "vulns": ["CVE-1", "CVE-2"]}),
+        );
+        assert_eq!(f[0].value, "22/tcp OpenSSH 8.9p1 · 443/tcp");
+        assert_eq!(f[1].value, "2: CVE-1, CVE-2");
+        let f = intel_facts(crate::intel::GREYNOISE, &serde_json::json!({}));
+        assert_eq!(f[0].label, "Result");
     }
 
     #[test]

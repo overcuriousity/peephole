@@ -30,6 +30,8 @@ pub struct AdminState {
     pub closing: Option<tokio::sync::watch::Receiver<bool>>,
     /// Per-client rate limits (public pages, sign-in ceremonies).
     pub limits: limit::Limits,
+    /// This node's enrichment providers (their budgets on the cluster page).
+    pub providers: crate::intel::Providers,
 }
 
 impl AdminState {
@@ -49,7 +51,14 @@ impl AdminState {
             stats_cache: crate::store::stats::StatsCache::new(),
             pace,
             closing: None,
+            providers: vec![],
         }
+    }
+
+    /// The enrichment providers this node runs.
+    pub fn with_providers(mut self, providers: crate::intel::Providers) -> Self {
+        self.providers = providers;
+        self
     }
     /// Route writes through `recorder` (a cluster node's log).
     pub fn with_recorder(mut self, recorder: crate::store::recorder::Recorder) -> Self {

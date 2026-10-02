@@ -47,6 +47,44 @@ secure_cookies = true
 account_id = "123456"
 license_key = "testkey"
 
+# --- Optional threat-intel APIs --------------------------------------------
+# Each provider is off unless its section is present. Keys stay on this node;
+# in a cluster the lookup results are shared, so one member with a key serves
+# all. Every IP is looked up once by one node; results appear only in the
+# admin area (IP page, IP list filters, Admin -> Export).
+
+[enrichment]
+# When an IP that was looked up comes back, it is looked up again after N days
+# since the last lookup, then 1.5 N, 2.25 N, ... An IP that never comes back
+# is never looked up again. 0 = never again.
+refresh_after_days = 30
+
+# [abuseipdb]
+# # Abuse reports per IP (https://www.abuseipdb.com/account/api).
+# api_key = "..."
+# daily_limit = 1000        # checks per UTC day (free plan: 1000)
+# max_age_days = 90         # count reports from the last N days (1-365)
+
+# [shodan]
+# # Open ports, services, OS and CVEs (https://account.shodan.io). Host
+# # lookups need a membership or a paid plan; Shodan allows 1 request/s.
+# api_key = "..."
+# daily_limit = 0           # lookups per UTC day; 0 = no local cap
+
+# [internetdb]
+# # Shodan InternetDB: ports, tags and CVEs from weekly data, IPv4 only, no
+# # key. Free for non-commercial use only. Skips IPs Shodan already answered.
+# enabled = true
+# daily_limit = 0           # 0 = no local cap
+
+# [greynoise]
+# # GreyNoise Community: mass scanner or known benign service
+# # (https://viz.greynoise.io/account/api-key; free keys need a business
+# # email). Without a key: 10 lookups per day; with a free key: 50 per week.
+# api_key = ""
+# daily_limit = 10          # override the defaults above
+# weekly_limit = 50
+
 [scan]
 max_workers = 2            # concurrent nmap subprocesses
 timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admin queue page)
@@ -108,7 +146,7 @@ tor_wait_hours = 6
 #                      # per-IP chips, the label filter and the label chart
 
 # Distributed mode: share requests, scan queue, results and intel with other
-# nodes (README: Distributed mode). Absent: standalone. The node key is
+# nodes (docs/cluster.md). Absent: standalone. The node key is
 # created on first start; print it with `peephole cluster id`. Add nodes with
 # the reusable invite from `peephole cluster invite` and
 # `peephole cluster join <token>`, or list them below. Nobody can remove a

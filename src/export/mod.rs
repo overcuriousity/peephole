@@ -193,6 +193,62 @@ pub fn stream_requests(
     })
 }
 
+/// Every enrichment lookup in the history, oldest first, as JSON Lines:
+/// provider, IP, UTC time of the lookup, data version, the node that looked
+/// it up (`names` maps node ids to names) and its result. Uncapped, read
+/// page by page like [`stream_requests`].
+pub fn stream_intel_history(
+    store: crate::store::Store,
+    names: std::collections::HashMap<Vec<u8>, String>,
+) -> impl futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static {
+    struct St {
+        store: crate::store::Store,
+        names: std::collections::HashMap<Vec<u8>, String>,
+        after: Option<crate::store::inspect::IntelLogKey>,
+        done: bool,
+    }
+    let st = St {
+        store,
+        names,
+        after: None,
+        done: false,
+    };
+    futures::stream::try_unfold(st, move |mut st| async move {
+        if st.done {
+            return Ok(None);
+        }
+        let page = st
+            .store
+            .intel_log_page(st.after.as_ref(), STREAM_PAGE)
+            .await
+            .map_err(|e| {
+                tracing::warn!(?e, "intel history export failed");
+                std::io::Error::other(e.to_string())
+            })?;
+        st.done = (page.len() as i64) < STREAM_PAGE;
+        let mut out = String::new();
+        for (ip, provider, hlc, fetched_at, source_version, origin, data_json) in &page {
+            let node = match st.names.get(origin) {
+                Some(n) => n.clone(),
+                None if origin.is_empty() => "this node".to_string(),
+                None => data_encoding::HEXLOWER.encode(&origin[..origin.len().min(6)]),
+            };
+            let data: serde_json::Value =
+                serde_json::from_str(data_json).unwrap_or(serde_json::Value::Null);
+            out.push_str(
+                &serde_json::json!({
+                    "ip": ip, "provider": provider, "fetched_at": iso8601(fetched_at),
+                    "source_version": source_version, "node": node, "data": data,
+                })
+                .to_string(),
+            );
+            out.push('\n');
+            st.after = Some((fetched_at.clone(), ip.clone(), provider.clone(), *hlc));
+        }
+        Ok(Some((axum::body::Bytes::from(out), st)))
+    })
+}
+
 /// Convert a stored "YYYY-MM-DD HH:MM:SS" UTC timestamp to RFC 3339. Values
 /// already carrying a `T`/timezone (or unparseable) pass through unchanged.
 fn iso8601(ts: &str) -> String {
