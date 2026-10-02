@@ -687,6 +687,10 @@ async fn admin_pages_and_deletes_with_session() {
             && html.contains("x-forwarded-for")
             && html.contains("form-interaction")
     );
+    assert!(
+        html.contains("answered not-found (404)"),
+        "how it was answered"
+    );
 
     let html = get("/admin/scans").await.unwrap().text().await.unwrap();
     assert!(html.contains("203.0.113.78"));

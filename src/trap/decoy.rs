@@ -8,6 +8,8 @@
 
 /// A decoy answer, served with status 200.
 pub struct Decoy {
+    /// Which decoy, as recorded in the request's `answer` (`decoy:<name>`).
+    pub name: &'static str,
     pub content_type: &'static str,
     pub body: String,
 }
@@ -16,30 +18,40 @@ pub struct Decoy {
 /// `canary` is the request's reference (short, hex).
 pub fn decoy(method: &str, path: &str, canary: &str) -> Option<Decoy> {
     let get = matches!(method, "GET" | "HEAD");
-    let text = |body: String| {
+    let text = |name, body: String| {
         Some(Decoy {
+            name,
             content_type: "text/plain; charset=utf-8",
             body,
         })
     };
-    let html = |body: String| {
+    let html = |name, body: String| {
         Some(Decoy {
+            name,
             content_type: "text/html; charset=UTF-8",
             body,
         })
     };
     let file = path.rsplit('/').next().unwrap_or("");
     if get && file == ".env" {
-        return text(dotenv(canary));
+        return text("dotenv", dotenv(canary));
     }
     if get && path.ends_with("/.git/config") {
-        return text(git_config(canary));
+        return text("git-config", git_config(canary));
     }
     if get && path.ends_with("/.git/HEAD") {
-        return text("ref: refs/heads/main\n".into());
+        return text("git-head", "ref: refs/heads/main\n".into());
     }
     if file == "wp-login.php" && matches!(method, "GET" | "HEAD" | "POST") {
-        return html(wp_login(method == "POST"));
+        let failed = method == "POST";
+        return html(
+            if failed {
+                "wp-login-failed"
+            } else {
+                "wp-login"
+            },
+            wp_login(failed),
+        );
     }
     if get
         && matches!(
@@ -47,7 +59,7 @@ pub fn decoy(method: &str, path: &str, canary: &str) -> Option<Decoy> {
             "phpinfo.php" | "info.php" | "php_info.php" | "phpinfo"
         )
     {
-        return html(phpinfo());
+        return html("phpinfo", phpinfo());
     }
     None
 }

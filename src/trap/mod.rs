@@ -256,6 +256,12 @@ struct Capture<'a> {
     body: Option<Vec<u8>>,
     is_fp_claim: bool,
     page_token: String,
+    /// How the request is answered: `not-found`, `decoy:<name>`, `claim`.
+    answer: String,
+    status: u16,
+    /// Requests from this IP answered but not recorded since its last
+    /// recorded one.
+    unrecorded: u64,
 }
 
 /// What the trap stored for one request.
@@ -365,6 +371,9 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 scan_level: verdict.scan_level as i64,
                 is_fp_claim: c.is_fp_claim,
                 page_token: Some(c.page_token),
+                answer: Some(c.answer),
+                status: Some(i64::from(c.status)),
+                unrecorded: (c.unrecorded > 0).then_some(c.unrecorded as i64),
                 ..Default::default()
             },
         )
@@ -428,8 +437,8 @@ fn header_pairs(h: &HeaderMap) -> Vec<(String, String)> {
 /// proxy, the proxy's), `:authority` (the host of an absolute-form target
 /// such as an open-proxy probe, or HTTP/2's authority), `:body-truncated`
 /// (bytes received when the stored body is not the whole body; the declared
-/// length is in `content-length`) and `:unrecorded` (requests from this IP
-/// answered but not recorded since its previous recorded one).
+/// length is in `content-length`). Rows recorded before the `unrecorded`
+/// column existed carry that count as `:unrecorded`.
 async fn trap_handler(
     State(state): State<Arc<TrapState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -441,6 +450,16 @@ async fn trap_handler(
     let page_token = uuid::Uuid::new_v4().to_string();
     let method = parts.method.as_str();
     let path = parts.uri.path();
+    // Decided before recording, so the row says what was sent.
+    let decoy = if state.cfg.trap.decoys {
+        decoy::decoy(method, path, &page_token.replace('-', "")[..12])
+    } else {
+        None
+    };
+    let (answer, status) = match &decoy {
+        Some(d) => (format!("decoy:{}", d.name), 200),
+        None => ("not-found".to_string(), 404),
+    };
 
     match state.guards.flood.admit(ip, &state.cfg.trap) {
         flood::Admission::Skip => {
@@ -454,9 +473,6 @@ async fn trap_handler(
             }
             if let Some(n) = received {
                 raw.push((":body-truncated".into(), n.to_string()));
-            }
-            if unrecorded > 0 {
-                raw.push((":unrecorded".into(), unrecorded.to_string()));
             }
             raw.extend(header_pairs(&parts.headers));
             // HTTP/2 always names the authority; in HTTP/1 only a client
@@ -478,6 +494,9 @@ async fn trap_handler(
                 body: (!body.is_empty()).then(|| body.clone()),
                 is_fp_claim: false,
                 page_token: page_token.clone(),
+                answer,
+                status,
+                unrecorded,
             };
             if let Err(e) = record(&state, capture).await {
                 // Answer as always: an error page would tell a scanner it
@@ -486,9 +505,7 @@ async fn trap_handler(
             }
         }
     }
-    if state.cfg.trap.decoys
-        && let Some(d) = decoy::decoy(method, path, &page_token.replace('-', "")[..12])
-    {
+    if let Some(d) = decoy {
         return (
             StatusCode::OK,
             [(header::CONTENT_TYPE, d.content_type)],
@@ -539,6 +556,9 @@ async fn claim_handler(
         body: None,
         is_fp_claim: true,
         page_token: uuid::Uuid::new_v4().to_string(),
+        answer: "claim".into(),
+        status: 200,
+        unrecorded: 0,
     };
     if let Ok(rec) = record(&state, capture).await {
         let email = form.email.filter(|e| !e.trim().is_empty());

@@ -14,7 +14,7 @@ pub struct TrapConfig {
     #[serde(default = "default_record_burst")]
     pub record_burst: u32,
     /// Over the limit, record one request in this many. The recorded one
-    /// carries the number of requests left out before it (`:unrecorded`).
+    /// carries the number of requests left out before it (`unrecorded`).
     /// 0: record none over the limit (the count goes on the next recorded
     /// request).
     #[serde(default = "default_sample_every")]

@@ -59,6 +59,12 @@ pub struct RequestRow {
     pub scan_level: i64,
     pub is_fp_claim: bool,
     pub page_token: Option<String>,
+    pub answer: Option<String>,
+    pub status: Option<i64>,
+    pub unrecorded: Option<i64>,
+    pub transport: Option<String>,
+    pub via_proxy: Option<bool>,
+    pub ja4: Option<String>,
 }
 
 /// Distinct refresh intervals; later lookups reuse the last one (over

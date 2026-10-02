@@ -164,8 +164,18 @@ async fn a_flood_from_one_ip_is_answered_but_sampled() {
     }
     // 3 within the burst, then 1 in 5 of the 10 over it.
     assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 5);
+    let n: Option<i64> =
+        sqlx::query_scalar("SELECT unrecorded FROM requests ORDER BY id DESC LIMIT 1")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(n, Some(4));
     let h = last_headers(&store).await;
-    assert_eq!(header(&h, ":unrecorded"), Some("4"));
+    assert_eq!(
+        header(&h, ":unrecorded"),
+        None,
+        "a column now, not a header"
+    );
     // Another address is not held back by it.
     client
         .get(format!("{base}/other"))
@@ -369,4 +379,40 @@ async fn a_failed_write_still_gets_the_trap_page() {
             .contains("route which does not exist")
     );
     assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 0);
+}
+
+#[tokio::test]
+async fn answer_and_status_are_recorded() {
+    let (base, store, _dir) = spawn("[trap]\ndecoys = true\n").await;
+    let client = reqwest::Client::new();
+    for p in ["/.env", "/nothing", "/wp-login.php"] {
+        client.get(format!("{base}{p}")).send().await.unwrap();
+    }
+    client
+        .post(format!("{base}/wp-login.php"))
+        .form(&[("log", "a"), ("pwd", "b")])
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/claim"))
+        .form(&[("email", "")])
+        .send()
+        .await
+        .unwrap();
+    let rows: Vec<(Option<String>, Option<i64>)> =
+        sqlx::query_as("SELECT answer, status FROM requests ORDER BY id")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (Some("decoy:dotenv".into()), Some(200)),
+            (Some("not-found".into()), Some(404)),
+            (Some("decoy:wp-login".into()), Some(200)),
+            (Some("decoy:wp-login-failed".into()), Some(200)),
+            (Some("claim".into()), Some(200)),
+        ]
+    );
 }
