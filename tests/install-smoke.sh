@@ -286,6 +286,65 @@ grep -q 'peephole-cfg1:' /tmp/wizard4.log
 grep -q 'ed25519:' /tmp/wizard4.log
 /usr/local/bin/peephole check-config /etc/peephole/config.toml | grep -q 'remote config: on'
 
+# certbot stand-in: records its arguments and writes a self-signed
+# certificate where Let's Encrypt would; /tmp/certbot-fail makes it fail.
+cat > /tmp/bin/certbot <<'STUB'
+#!/bin/sh
+echo "certbot $*" >> /tmp/certbot.log
+[ -e /tmp/certbot-fail ] && exit 1
+d=""
+while [ $# -gt 0 ]; do [ "$1" = -d ] && d="$2"; shift; done
+mkdir -p "/etc/letsencrypt/live/$d"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=$d" \
+    -keyout "/etc/letsencrypt/live/$d/privkey.pem" -out "/etc/letsencrypt/live/$d/fullchain.pem" >/dev/null 2>&1
+STUB
+chmod +x /tmp/bin/certbot
+reset_nginx() {
+    rm -rf /etc/nginx/sites-available/peephole /etc/nginx/sites-enabled/peephole /etc/letsencrypt /tmp/certbot.log /tmp/certbot-fail
+    [ -e /etc/nginx/sites-enabled/default ] || ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+}
+
+echo "== PEEPHOLE_NGINX=1: certificate, default site out, site in, nginx -t, reload"
+reset_install; reset_nginx
+PEEPHOLE_NGINX=1 PEEPHOLE_LOCAL_PROXY=1 bash install.sh > /tmp/nginx-auto.log 2>&1 || { cat /tmp/nginx-auto.log; exit 1; }
+grep -q -- '-d peephole.test' /tmp/certbot.log
+grep -q -- '--register-unsafely-without-email' /tmp/certbot.log
+grep -q -- '--deploy-hook systemctl reload nginx' /tmp/certbot.log
+test -f /etc/nginx/sites-available/peephole
+[ "$(readlink /etc/nginx/sites-enabled/peephole)" = ../sites-available/peephole ]
+test ! -e /etc/nginx/sites-enabled/default
+grep -q 'server_name peephole.test;' /etc/nginx/sites-available/peephole
+if [ ! -e /proc/net/if_inet6 ] && grep -q 'listen \[::\]' /etc/nginx/sites-available/peephole; then
+    echo "IPv6 listeners kept on a machine without IPv6"; exit 1
+fi
+nginx -t -q
+grep -q 'systemctl reload nginx' /tmp/systemctl.log
+grep -q 'nginx is configured' /tmp/nginx-auto.log
+if grep -q 'certbot certonly\|rm /etc/nginx/sites-enabled/default\|Terminate TLS' /tmp/nginx-auto.log; then
+    echo "manual nginx steps printed although nginx was configured"; cat /tmp/nginx-auto.log; exit 1
+fi
+
+echo "== PEEPHOLE_NGINX=1, certificate refused: nginx left as it was, manual steps printed"
+reset_install; reset_nginx
+touch /tmp/certbot-fail
+PEEPHOLE_NGINX=1 PEEPHOLE_LOCAL_PROXY=1 PEEPHOLE_ACME_EMAIL=ops@peephole.test \
+    bash install.sh > /tmp/nginx-fail.log 2>&1 || { cat /tmp/nginx-fail.log; exit 1; }
+grep -q -- '-m ops@peephole.test' /tmp/certbot.log
+grep -q 'no certificate for peephole.test' /tmp/nginx-fail.log
+test ! -e /etc/nginx/sites-available/peephole
+test -L /etc/nginx/sites-enabled/default
+steps_in_order /tmp/nginx-fail.log 'certbot certonly --nginx -d peephole.test' 'rm /etc/nginx/sites-enabled/default' \
+    'cp /etc/peephole/nginx.example.conf' 'nginx -t && systemctl reload nginx'
+
+echo "== PEEPHOLE_NGINX=1 for a trap that trusts a remote proxy is refused before anything is written"
+reset_install; reset_nginx
+if PEEPHOLE_NGINX=1 PEEPHOLE_LOCAL_PROXY=0 PEEPHOLE_ROLES=listener bash install.sh > /tmp/nginx-refused.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q 'PEEPHOLE_NGINX=1 needs' /tmp/nginx-refused.log
+test ! -e /usr/local/bin/peephole
+reset_nginx
+
 echo "== unattended: a bad join token does not fail the install"
 reset_install
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \

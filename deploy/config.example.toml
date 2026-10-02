@@ -146,7 +146,7 @@ tor_wait_hours = 6
 #                      # per-IP chips, the label filter and the label chart
 
 # Distributed mode: share requests, scan queue, results and intel with other
-# nodes (README: Distributed mode). Absent: standalone. The node key is
+# nodes (docs/cluster.md). Absent: standalone. The node key is
 # created on first start; print it with `peephole cluster id`. Add nodes with
 # the reusable invite from `peephole cluster invite` and
 # `peephole cluster join <token>`, or list them below. Nobody can remove a
