@@ -30,13 +30,26 @@ struct AsnRecord {
     autonomous_system_organization: Option<String>,
 }
 
+/// The GeoLite2 editions a node downloads.
+pub const EDITIONS: [&str; 2] = ["GeoLite2-City", "GeoLite2-ASN"];
+
 impl GeoIp {
+    /// Read both databases into memory. Blocking (tens of MB of file I/O):
+    /// from async code use [`GeoIp::load_blocking`].
     pub fn load(data_dir: &Path) -> Result<Self> {
         let city = Reader::open_readfile(data_dir.join("GeoLite2-City.mmdb"))
             .context("opening city mmdb")?;
         let asn = Reader::open_readfile(data_dir.join("GeoLite2-ASN.mmdb"))
             .context("opening asn mmdb")?;
         Ok(Self { city, asn })
+    }
+
+    /// [`GeoIp::load`] on a blocking thread, off the async workers.
+    pub async fn load_blocking(data_dir: &Path) -> Result<Self> {
+        let dir = data_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::load(&dir))
+            .await
+            .context("maxmind load task")?
     }
 
     /// Build date of the city database (`YYYY-MM-DD`), as the version of
@@ -121,28 +134,52 @@ pub async fn backfill_iso_codes(
 /// never overwrites a good database. The blocking gunzip/untar/write runs on a
 /// blocking thread.
 pub async fn download(data_dir: &Path, account_id: &str, license_key: &str) -> Result<()> {
-    let client = reqwest::Client::builder()
+    let client = client()?;
+    for edition in EDITIONS {
+        download_with(&client, data_dir, edition, account_id, license_key).await?;
+    }
+    Ok(())
+}
+
+/// Download one edition (see [`download`]).
+pub async fn download_edition(
+    data_dir: &Path,
+    edition: &'static str,
+    account_id: &str,
+    license_key: &str,
+) -> Result<()> {
+    download_with(&client()?, data_dir, edition, account_id, license_key).await
+}
+
+fn client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(120))
         .build()
-        .context("building maxmind http client")?;
-    for edition in ["GeoLite2-City", "GeoLite2-ASN"] {
-        let url = format!(
-            "https://download.maxmind.com/geoip/databases/{edition}/download?suffix=tar.gz"
-        );
-        let bytes = client
-            .get(&url)
-            .basic_auth(account_id, Some(license_key))
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
-        let data_dir = data_dir.to_path_buf();
-        tokio::task::spawn_blocking(move || extract_and_install(&data_dir, edition, &bytes))
-            .await
-            .context("maxmind extract task")??;
-    }
+        .context("building maxmind http client")
+}
+
+async fn download_with(
+    client: &reqwest::Client,
+    data_dir: &Path,
+    edition: &'static str,
+    account_id: &str,
+    license_key: &str,
+) -> Result<()> {
+    let url =
+        format!("https://download.maxmind.com/geoip/databases/{edition}/download?suffix=tar.gz");
+    let bytes = client
+        .get(&url)
+        .basic_auth(account_id, Some(license_key))
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    let data_dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || extract_and_install(&data_dir, edition, &bytes))
+        .await
+        .context("maxmind extract task")??;
     Ok(())
 }
 

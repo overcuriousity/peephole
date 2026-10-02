@@ -12,7 +12,7 @@ use crate::store::Store;
 use crate::store::recorder::Recorder;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// GeoIP readers shared with the trap; None until the MaxMind DBs exist.
 pub type SharedGeo = Arc<RwLock<Option<geo::GeoIp>>>;
@@ -121,50 +121,152 @@ pub async fn enrich_loop(
     }
 }
 
-async fn is_stale(store: &Store, key: &str) -> bool {
-    match store.intel_get(key).await {
+fn is_stale_at(value: Option<&str>) -> bool {
+    match value {
         // Stale once ~23h old. The scheduler sleeps 24h + up to 1h of jitter,
         // so a `> 24h` test (with truncating num_hours) would read 24 and skip
         // the refresh every other cycle, stretching "daily" to ~48h.
-        Ok(Some(v)) => chrono::DateTime::parse_from_rfc3339(&v)
+        Some(v) => chrono::DateTime::parse_from_rfc3339(v)
             .map(|t| chrono::Utc::now().signed_duration_since(t) >= chrono::Duration::hours(23))
             .unwrap_or(true),
-        _ => true,
+        None => true,
     }
 }
 
-/// Download the GeoLite2 databases when they are missing or stale (needs
-/// `[maxmind]` credentials) and load them. They stay on this node.
-async fn refresh_maxmind(store: &Store, rec: &Recorder, cfg: &Config, geo: &SharedGeo) {
-    let geo_missing = geo.read().unwrap().is_none();
-    if let Some(mm) = &cfg.maxmind
-        && (geo_missing || is_stale(store, "maxmind_last_fetch").await)
-    {
-        match geo::download(&cfg.data_dir, &mm.account_id, &mm.license_key).await {
-            Ok(()) => {
-                info!("maxmind databases refreshed");
-                match geo::GeoIp::load(&cfg.data_dir) {
-                    Ok(g) => {
-                        *geo.write().unwrap() = Some(g);
-                        backfill_geo(rec, geo).await;
-                        // Record success only after the new databases load,
-                        // so a bad download is retried on the next tick
-                        // rather than waiting out the full day.
-                        let _ = store
-                            .intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339())
-                            .await;
-                    }
-                    Err(e) => warn!(?e, "maxmind reload failed; will retry"),
-                }
-            }
-            Err(e) => warn!(?e, "maxmind download failed; keeping previous"),
+/// Retry delays after failed fetches: doubling from `first` up to `max`.
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    first: Duration,
+    max: Duration,
+    failures: u32,
+}
+
+impl Backoff {
+    const fn new(first: Duration, max: Duration) -> Self {
+        Self {
+            first,
+            max,
+            failures: 0,
         }
     }
+
+    /// Count a failure; returns how long to wait before the next attempt.
+    fn fail(&mut self) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let factor = 1u32 << (self.failures - 1).min(16);
+        self.first.saturating_mul(factor).min(self.max)
+    }
+
+    fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
+
+/// Tor exit list: retried from 1 min, doubling up to 1 h, until it loads.
+const TOR_BACKOFF: Backoff = Backoff::new(Duration::from_secs(60), Duration::from_secs(3600));
+/// GeoLite2: from 5 min up to 2 h, so a failing download stays well under
+/// MaxMind's daily download limit.
+const MAXMIND_BACKOFF: Backoff =
+    Backoff::new(Duration::from_secs(300), Duration::from_secs(2 * 3600));
+/// How often a node checks whether its GeoLite2 databases are stale.
+const MAXMIND_CHECK: Duration = Duration::from_secs(3600);
+
+/// `intel_meta` key recording one edition's last successful download.
+fn edition_key(edition: &str) -> String {
+    format!("maxmind_last_fetch:{edition}")
+}
+
+/// Download the GeoLite2 databases that are missing or stale (needs
+/// `[maxmind]` credentials) and load them; they stay on this node. Each
+/// database keeps its own fetch time, so when one download fails the other
+/// is not fetched again (MaxMind counts every download against a daily
+/// limit). Errors when a download or the reload failed.
+async fn refresh_maxmind(
+    store: &Store,
+    rec: &Recorder,
+    cfg: &Config,
+    geo: &SharedGeo,
+) -> anyhow::Result<()> {
+    let Some(mm) = &cfg.maxmind else {
+        return Ok(());
+    };
+    // Builds before per-database keys recorded one time for both.
+    let legacy = store.intel_get("maxmind_last_fetch").await?;
+    let mut fetched = 0;
+    let mut failed = None;
+    for edition in geo::EDITIONS {
+        let file = cfg.data_dir.join(format!("{edition}.mmdb"));
+        let last = store
+            .intel_get(&edition_key(edition))
+            .await?
+            .or(legacy.clone());
+        if file.exists() && !is_stale_at(last.as_deref()) {
+            continue;
+        }
+        match geo::download_edition(&cfg.data_dir, edition, &mm.account_id, &mm.license_key).await {
+            Ok(()) => {
+                fetched += 1;
+                store
+                    .intel_set(&edition_key(edition), &chrono::Utc::now().to_rfc3339())
+                    .await?;
+            }
+            Err(e) => {
+                warn!(edition, error = %format!("{e:#}"), "maxmind download failed; keeping previous");
+                failed = Some(e);
+            }
+        }
+    }
+    let loaded = geo.read().unwrap().is_some();
+    if fetched > 0 || !loaded {
+        match geo::GeoIp::load_blocking(&cfg.data_dir).await {
+            Ok(g) => {
+                *geo.write().unwrap() = Some(g);
+                if fetched > 0 {
+                    info!(databases = fetched, "maxmind databases refreshed");
+                }
+                backfill_geo(rec, geo).await;
+            }
+            // Both files are needed; a first install whose ASN download
+            // failed has nothing to load yet.
+            Err(e) if failed.is_some() => debug!(?e, "maxmind databases not loadable yet"),
+            Err(e) => return Err(e.context("maxmind reload")),
+        }
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    if fetched > 0 {
+        // Both databases are current: what the admin pages show.
+        let _ = store
+            .intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339())
+            .await;
+    }
+    Ok(())
+}
+
+/// Warn, at most hourly, while no Tor exit list is loaded: Tor exits cannot
+/// be told apart from scanners then (see `scan.tor_unknown`).
+fn warn_without_tor_list(tor: &SharedTor, cfg: &Config, last: &mut Option<std::time::Instant>) {
+    if !tor.read().unwrap().is_empty() {
+        return;
+    }
+    if last.is_some_and(|t| t.elapsed() < Duration::from_secs(3600)) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    let effect = match cfg.scan.safety.tor_unknown {
+        crate::config::TorUnknown::Defer => "scans of IPs with an unknown Tor status are deferred",
+        crate::config::TorUnknown::Scan => {
+            "Tor exits may be counter-scanned (scan.tor_unknown = \"scan\")"
+        }
+    };
+    warn!("no Tor exit list loaded yet: {effect}");
 }
 
 /// Daily intel refresh (spec §9): at startup (Tor always, MaxMind when stale
 /// or not loaded, to spare its download quota), then every 24h ± jitter.
-/// Each successful fetch is loaded into the shared state the trap reads.
+/// Failed fetches are retried with backoff until they succeed. Each
+/// successful fetch is loaded into the shared state the trap reads.
 pub async fn run_scheduler(
     rec: Recorder,
     cfg: Config,
@@ -180,9 +282,13 @@ pub async fn run_scheduler(
     if cfg.maxmind.is_none() && geo.read().unwrap().is_none() {
         warn!("no [maxmind] credentials and no GeoLite2 databases: GeoIP enrichment is off");
     }
-    let mut first = true;
+    let now = tokio::time::Instant::now();
+    let (mut tor_next, mut mm_next) = (now, now);
+    let (mut tor_backoff, mut mm_backoff) = (TOR_BACKOFF, MAXMIND_BACKOFF);
+    let mut warned = None;
     loop {
-        if first || is_stale(&store, "tor_last_fetch").await {
+        let now = tokio::time::Instant::now();
+        if now >= tor_next {
             match tor::TorExitList::refresh(&cfg.data_dir).await {
                 Ok(n) => {
                     info!(n, "tor exit list refreshed");
@@ -193,17 +299,36 @@ pub async fn run_scheduler(
                     let _ = store
                         .intel_set("tor_last_fetch", &chrono::Utc::now().to_rfc3339())
                         .await;
+                    tor_backoff.reset();
+                    // 24h ± up to 1h deterministic-ish jitter from nanos.
+                    let jitter = Duration::from_secs(
+                        (chrono::Utc::now().timestamp_subsec_nanos() as u64) % 3600,
+                    );
+                    tor_next = now + Duration::from_secs(24 * 3600) + jitter;
                 }
-                Err(e) => warn!(?e, "tor exit list refresh failed; keeping previous"),
+                Err(e) => {
+                    let wait = tor_backoff.fail();
+                    warn!(error = %format!("{e:#}"), retry_in_secs = wait.as_secs(), "tor exit list refresh failed; keeping previous");
+                    tor_next = now + wait;
+                }
+            }
+            warn_without_tor_list(&tor, &cfg, &mut warned);
+        }
+        if now >= mm_next {
+            match refresh_maxmind(&store, &rec, &cfg, &geo).await {
+                Ok(()) => {
+                    mm_backoff.reset();
+                    mm_next = now + MAXMIND_CHECK;
+                }
+                Err(e) => {
+                    let wait = mm_backoff.fail();
+                    warn!(error = %format!("{e:#}"), retry_in_secs = wait.as_secs(), "maxmind refresh failed");
+                    mm_next = now + wait;
+                }
             }
         }
-        refresh_maxmind(&store, &rec, &cfg, &geo).await;
-        first = false;
-        // 24h ± up to 1h deterministic-ish jitter from nanos.
-        let jitter =
-            Duration::from_secs((chrono::Utc::now().timestamp_subsec_nanos() as u64) % 3600);
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(24 * 3600) + jitter) => {}
+            _ = tokio::time::sleep_until(tor_next.min(mm_next)) => {}
             _ = shutdown.changed() => { break; }
         }
     }
@@ -215,12 +340,8 @@ const INTEL_TICK: Duration = Duration::from_secs(60);
 const INTEL_MIN_GAP: Duration = Duration::from_secs(5);
 /// Wait for heartbeats before deciding who fetches.
 const ELECTION_GRACE: Duration = Duration::from_secs(90);
-/// After a failed download, leave the quota alone this long.
-const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(3600);
 /// Heartbeats this recent count a member as alive for the fetch order.
 const LIVE_WINDOW: Duration = Duration::from_secs(45);
-/// How often a cluster node checks whether its GeoLite2 databases are stale.
-const MAXMIND_CHECK: Duration = Duration::from_secs(3600);
 
 fn reload(kinds: &[String], cfg: &Config, tor: &SharedTor) {
     if kinds.iter().any(|k| k == share::TOR) {
@@ -244,12 +365,10 @@ async fn run_cluster(
 ) {
     let me = node.id();
     let mut changes = node.subscribe_changes();
-    let mut failed: std::collections::HashMap<&'static str, std::time::Instant> =
-        Default::default();
-    let mut last_maxmind: Option<std::time::Instant> = None;
-    let recently_failed = |f: &std::collections::HashMap<&str, std::time::Instant>, k: &str| {
-        f.get(k).is_some_and(|t| t.elapsed() < RETRY_AFTER_FAILURE)
-    };
+    let now = std::time::Instant::now();
+    let (mut tor_next, mut mm_next) = (now, now);
+    let (mut tor_backoff, mut mm_backoff) = (TOR_BACKOFF, MAXMIND_BACKOFF);
+    let mut warned = None;
     loop {
         changes.borrow_and_update();
         match share::sync_files(&node, &cfg.data_dir).await {
@@ -269,32 +388,76 @@ async fn run_cluster(
             };
             let all: Vec<_> = live.iter().map(|id| (*id, dialable(id))).collect();
             if share::rank(me, &all).is_some_and(|r| share::due(r, age(share::TOR)))
-                && !recently_failed(&failed, share::TOR)
+                && std::time::Instant::now() >= tor_next
             {
                 match tor::TorExitList::refresh(&cfg.data_dir).await {
                     Ok(n) => {
                         info!(n, "tor exit list refreshed for the cluster");
+                        tor_backoff.reset();
                         reload(&[share::TOR.to_string()], &cfg, &tor);
                         if let Err(e) = share::publish(&node, &cfg.data_dir, &[share::TOR]).await {
                             warn!(?e, "announcing tor exit list failed");
                         }
                     }
                     Err(e) => {
-                        warn!(?e, "tor exit list refresh failed");
-                        failed.insert(share::TOR, std::time::Instant::now());
+                        let wait = tor_backoff.fail();
+                        warn!(error = %format!("{e:#}"), retry_in_secs = wait.as_secs(), "tor exit list refresh failed");
+                        tor_next = std::time::Instant::now() + wait;
                     }
                 }
             }
         }
+        warn_without_tor_list(&tor, &cfg, &mut warned);
         // Every node with credentials keeps its own databases fresh.
-        if last_maxmind.is_none_or(|t| t.elapsed() > MAXMIND_CHECK) {
-            last_maxmind = Some(std::time::Instant::now());
-            refresh_maxmind(&node.store, &rec, &cfg, &geo).await;
+        if std::time::Instant::now() >= mm_next {
+            match refresh_maxmind(&node.store, &rec, &cfg, &geo).await {
+                Ok(()) => {
+                    mm_backoff.reset();
+                    mm_next = std::time::Instant::now() + MAXMIND_CHECK;
+                }
+                Err(e) => {
+                    let wait = mm_backoff.fail();
+                    warn!(error = %format!("{e:#}"), retry_in_secs = wait.as_secs(), "maxmind refresh failed");
+                    mm_next = std::time::Instant::now() + wait;
+                }
+            }
         }
         tokio::select! {
             _ = tokio::time::sleep(INTEL_TICK) => {}
             _ = changes.changed() => tokio::time::sleep(INTEL_MIN_GAP).await,
             _ = shutdown.changed() => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_up_to_its_cap_and_resets() {
+        let mut b = TOR_BACKOFF;
+        let waits: Vec<u64> = (0..9).map(|_| b.fail().as_secs()).collect();
+        assert_eq!(waits, [60, 120, 240, 480, 960, 1920, 3600, 3600, 3600]);
+        b.reset();
+        assert_eq!(b.fail().as_secs(), 60);
+        let mut m = MAXMIND_BACKOFF;
+        let waits: Vec<u64> = (0..6).map(|_| m.fail().as_secs()).collect();
+        assert_eq!(waits, [300, 600, 1200, 2400, 4800, 7200]);
+        // Far past the cap nothing overflows.
+        for _ in 0..100 {
+            m.fail();
+        }
+        assert_eq!(m.fail().as_secs(), 7200);
+    }
+
+    #[test]
+    fn staleness_is_per_timestamp() {
+        assert!(is_stale_at(None));
+        assert!(is_stale_at(Some("garbage")));
+        let fresh = chrono::Utc::now().to_rfc3339();
+        assert!(!is_stale_at(Some(&fresh)));
+        let old = (chrono::Utc::now() - chrono::Duration::hours(30)).to_rfc3339();
+        assert!(is_stale_at(Some(&old)));
     }
 }

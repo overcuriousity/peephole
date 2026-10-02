@@ -2152,7 +2152,7 @@ async fn only_the_tor_list_is_shared_as_a_file() {
     let (ib, b) = new_node("b");
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
-    std::fs::write(na.dir.path().join("tor-exit.txt"), "192.0.2.1\n192.0.2.2\n").unwrap();
+    std::fs::write(na.dir.path().join("tor-exit.txt"), tor_list(200)).unwrap();
     std::fs::copy(
         "tests/fixtures/GeoLite2-City-Test.mmdb",
         na.dir.path().join("GeoLite2-City.mmdb"),
@@ -2196,6 +2196,78 @@ async fn only_the_tor_list_is_shared_as_a_file() {
     })
     .await;
     assert_eq!(share::manifests(&nb.store).await.unwrap().len(), 1);
+}
+
+/// An exit list with `n` addresses.
+fn tor_list(n: u32) -> String {
+    (0..n)
+        .map(|i| format!("198.18.{}.{}\n", i / 250, i % 250 + 1))
+        .collect()
+}
+
+/// A peer's exit list passes the same sanity check as a downloaded one,
+/// and an announcement older than three days is not copied.
+#[tokio::test]
+async fn a_tiny_or_stale_tor_list_is_not_copied_from_a_peer() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let good = tor_list(200);
+    std::fs::write(nb.dir.path().join("tor-exit.txt"), &good).unwrap();
+    // Tiny list, freshly announced: hash matches, content does not pass.
+    std::fs::write(na.dir.path().join("tor-exit.txt"), "192.0.2.1\n192.0.2.2\n").unwrap();
+    share::publish(&na, na.dir.path(), &[share::TOR])
+        .await
+        .unwrap();
+    eventually("b knows the manifest", || async {
+        share::manifests(&nb.store).await.unwrap().len() == 1
+    })
+    .await;
+    assert!(
+        share::sync_files(&nb, nb.dir.path())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        std::fs::read_to_string(nb.dir.path().join("tor-exit.txt")).unwrap(),
+        good,
+        "b keeps its own list"
+    );
+    // A big list announced as fetched four days ago.
+    std::fs::write(na.dir.path().join("tor-exit.txt"), tor_list(300)).unwrap();
+    let (sha256, size) = share::file_hash(&na.dir.path().join("tor-exit.txt")).unwrap();
+    let old = (chrono::Utc::now() - chrono::Duration::days(4))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    repl::append(
+        &na,
+        &[Record::IntelManifest(
+            peephole::cluster::record::IntelManifestRec {
+                kind: share::TOR.into(),
+                sha256: sha256.clone(),
+                size,
+                fetched_at: old,
+            },
+        )],
+    )
+    .await
+    .unwrap();
+    eventually("b knows the old manifest", || async {
+        share::manifests(&nb.store).await.unwrap()[share::TOR].sha256 == sha256
+    })
+    .await;
+    assert!(
+        share::sync_files(&nb, nb.dir.path())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        std::fs::read_to_string(nb.dir.path().join("tor-exit.txt")).unwrap(),
+        good
+    );
 }
 
 /// A node without the databases gets GeoIP facts from one that has them;

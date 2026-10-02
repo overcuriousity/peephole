@@ -106,7 +106,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let store = store::Store::connect(&cfg.database_path).await?;
 
     let geo = Arc::new(RwLock::new(if geolite_loads(&cfg) {
-        intel::geo::GeoIp::load(&cfg.data_dir)
+        intel::geo::GeoIp::load_blocking(&cfg.data_dir)
+            .await
             .map(Some)
             .unwrap_or_else(|e| {
                 warn!(

@@ -229,11 +229,43 @@ async fn download(node: &Node, data_dir: &Path, m: &Manifest) -> Result<()> {
             ));
             continue;
         }
+        // The hash only proves the copy matches what its fetcher announced;
+        // hold a peer's list to the same sanity check as our own download,
+        // so a truncated or bogus list cannot replace a good one.
+        if m.kind == TOR
+            && let Err(e) = crate::intel::tor::sane_count(&out)
+        {
+            bail!(
+                "{name} announced by {}: {e}",
+                m.origin.map_or("?".into(), |o| o.short())
+            );
+        }
         std::fs::write(&tmp, &out)?;
         std::fs::rename(&tmp, data_dir.join(name))?;
         return Ok(());
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no peer to copy {name} from")))
+}
+
+/// Oldest announced file a node copies: an exit list that old misses the
+/// exits of the last days, and replacing a fresher local copy with it (or
+/// trusting it at all) would make Tor exits look like ordinary scanners.
+pub const MAX_COPY_AGE_HOURS: f64 = 72.0;
+/// Clock skew tolerated on an announcement's fetch time.
+const MAX_FUTURE_HOURS: f64 = 1.0;
+
+/// Whether an announced version is recent enough to copy.
+fn fresh_enough(m: &Manifest) -> Result<(), String> {
+    let age = m.age_hours();
+    if age > MAX_COPY_AGE_HOURS {
+        return Err(format!(
+            "fetched {age:.0} h ago (limit {MAX_COPY_AGE_HOURS} h)"
+        ));
+    }
+    if age < -MAX_FUTURE_HOURS {
+        return Err(format!("fetch time {} is in the future", m.fetched_at));
+    }
+    Ok(())
 }
 
 /// Bring local copies up to the announced versions; returns the kinds
@@ -246,6 +278,10 @@ pub async fn sync_files(node: &Node, data_dir: &Path) -> Result<Vec<String>> {
         };
         let path = data_dir.join(name);
         if path.exists() && file_hash(&path)?.0 == m.sha256 {
+            continue;
+        }
+        if let Err(why) = fresh_enough(&m) {
+            warn!(%kind, sha = %&m.sha256[..12.min(m.sha256.len())], %why, "announced intel file not copied");
             continue;
         }
         match download(node, data_dir, &m).await {
