@@ -266,7 +266,7 @@ async fn pace_view(
     let others = st
         .recorder
         .node()
-        .map(|n| pace::others(&n, scan_secs))
+        .map(|n| pace::others(n, scan_secs))
         .unwrap_or_default();
     let r = recommend(&m, current, others);
     Ok(PaceView {
