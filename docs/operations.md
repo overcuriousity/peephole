@@ -218,3 +218,34 @@ whose files are replaced in place. Pushing a tag `v<version>` publishes an
 immutable release the same way; the tag must equal the `version` in
 `Cargo.toml` (`v0.1.0` for `0.1.0`), which CI checks. Verify a download with
 `gh attestation verify <tarball> --repo overcuriousity/peephole`.
+
+## Classification taxonomy
+
+Rules live in `rules/*.toml`, one file per family; each rule has a weight,
+a label and an `owasp` tag. The weight (1–4) is the request's severity and
+drives the counter-scan level:
+
+| Weight | Meaning | Labels |
+|---|---|---|
+| 1 | single weak tell | `probe` (behavioural floor) |
+| 2 | automated reconnaissance | `scanner-ua`, `research-scanner`, `sensitive-path`, `path-scanner`, `ai-infra-probe`, `api-recon`, `proxy-probe`, `unusual-method`, `automation` |
+| 3 | exploit-adjacent | `form-interaction`, `write-method`, `xss`, `crlf-injection`, `webshell-probe`, `app-probe`, `cloud-infra-probe`, `credential-attack`, `mcp-probe`, `graphql-introspection`, `appliance-probe`, `iot-probe`, `inhuman-behavior` |
+| 4 | unambiguous exploit / post-exploitation | `sqli`, `rce`, `path-traversal`, `ssrf`, `ssti`, `nosqli`, `xxe`, `deserialization`, `webshell`, `mcp-abuse` |
+
+The `owasp` tag is a Top-10 2021 class (`A03:2021`) for payload families or
+an Automated Threat (`OAT-014`) for scanning behaviour. Tags are stored on
+the request row (`owasp_json`), shown as badges next to the labels in the
+web UI, and included in exports. A typo'd tag fails `check-config`.
+Behavioural labels (`probe`, `path-scanner`, `form-interaction`, …) come
+from code, not rule files, and carry no tag.
+
+Label badge colours follow the family: blue = reconnaissance (any
+`*-probe` label, plus `scanner-ua`/`research-scanner`), red = injection,
+violet = execution/impact, orange = interaction, solid = post-exploitation,
+grey = automation tells (including `proxy-probe`), neutral accent =
+everything else. New labels need no UI work: a `something-probe` label is
+blue automatically, everything unknown is neutral.
+
+Weight rationale when adding rules: would you counter-scan a source that
+did *only* this? Recon gets 2, anything that touches an exploit gets 4
+only when the payload itself is unambiguous.

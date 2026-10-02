@@ -173,4 +173,17 @@ mod tests {
         let rules = load_dir(std::path::Path::new("rules")).unwrap();
         assert!(!rules.is_empty());
     }
+
+    #[test]
+    fn shipped_rules_all_carry_owasp_tags() {
+        let rules = load_dir(std::path::Path::new("rules")).unwrap();
+        assert!(rules.len() >= 30, "rule-count sanity: {}", rules.len());
+        for r in &rules {
+            assert!(
+                r.owasp.as_ref().is_some_and(|t| !t.is_empty()),
+                "rule `{}` has no owasp tag",
+                r.label
+            );
+        }
+    }
 }
