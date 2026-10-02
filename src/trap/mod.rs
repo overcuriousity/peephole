@@ -458,6 +458,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
             severity: 0,
             scan_level: 0,
             labels: vec!["fp-claim".into()],
+            owasp: vec![],
         }
     } else {
         let history = state

@@ -30,6 +30,10 @@ pub struct Rule {
     /// other matchers the rule only fires for these methods; on its own it
     /// fires on the method alone.
     pub methods: Option<Vec<String>>,
+    /// OWASP references for the family: Top-10 2021 classes (`A03:2021`)
+    /// and/or Automated Threats (`OAT-014`). Optional; all shipped rules
+    /// carry it (a meta-test enforces that).
+    pub owasp: Option<Vec<String>>,
 }
 
 impl Rule {
@@ -66,6 +70,22 @@ impl Rule {
                 self.label,
                 self.weight
             );
+        }
+        for tag in self.owasp.iter().flatten() {
+            let top10 = tag
+                .strip_prefix('A')
+                .and_then(|r| r.strip_suffix(":2021"))
+                .is_some_and(|n| {
+                    n.len() == 2
+                        && n.bytes().all(|b| b.is_ascii_digit())
+                        && ("01"..="10").contains(&n)
+                });
+            let oat = tag
+                .strip_prefix("OAT-0")
+                .is_some_and(|n| n.len() == 2 && n.bytes().all(|b| b.is_ascii_digit()));
+            if !top10 && !oat {
+                anyhow::bail!("rule `{}` has an invalid owasp tag `{tag}`", self.label);
+            }
         }
         Ok(())
     }
@@ -129,6 +149,17 @@ mod tests {
         assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\nmethods=[]\n").is_err());
         assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\nmethods=[\"P T\"]\n").is_err());
         assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\nmethod_regex=\"P\"\n").is_err());
+    }
+
+    #[test]
+    fn owasp_tags_are_validated() {
+        assert!(
+            one("[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\nowasp=[\"A03:2021\",\"OAT-014\"]\n").is_ok()
+        );
+        assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\nowasp=[\"A13:2021\"]\n").is_err());
+        assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\nowasp=[\"T1190\"]\n").is_err());
+        // Absent stays legal for operator rules.
+        assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\n").is_ok());
     }
 
     #[test]

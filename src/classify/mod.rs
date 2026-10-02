@@ -36,6 +36,7 @@ pub struct Verdict {
     pub severity: u8,
     pub scan_level: u8,
     pub labels: Vec<String>,
+    pub owasp: Vec<String>,
 }
 
 struct CompiledRule {
@@ -48,6 +49,7 @@ struct CompiledRule {
     ua: Option<Regex>,
     header: Option<Regex>,
     path_exact: Option<String>,
+    owasp: Vec<String>,
 }
 
 /// Decode a request target or body for matching: up to two passes of
@@ -205,6 +207,7 @@ impl Classifier {
                     ua: r.ua_regex.as_deref().map(compile_ci).transpose()?,
                     header: r.header_regex.as_deref().map(compile_ci).transpose()?,
                     path_exact: r.path_exact,
+                    owasp: r.owasp.unwrap_or_default(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -213,6 +216,7 @@ impl Classifier {
 
     pub fn classify(&self, req: &RequestView, hist: &IpHistory, bot: &BotTells) -> Verdict {
         let mut labels: Vec<String> = vec![];
+        let mut owasp: Vec<String> = vec![];
         let mut weight: u8 = 0;
 
         let target = match req.query {
@@ -269,6 +273,7 @@ impl Classifier {
                 });
             if hit {
                 labels.push(r.label.clone());
+                owasp.extend(r.owasp.iter().cloned());
                 weight = weight.max(r.weight);
             }
         }
@@ -319,11 +324,14 @@ impl Classifier {
 
         labels.sort();
         labels.dedup();
+        owasp.sort();
+        owasp.dedup();
         let scan_level = weight.min(4);
         Verdict {
             severity: weight,
             scan_level,
             labels,
+            owasp,
         }
     }
 }
@@ -360,6 +368,24 @@ mod tests {
             distinct_paths_1h: paths,
             requests_1h: reqs,
         }
+    }
+
+    #[test]
+    fn hit_rules_contribute_owasp_tags() {
+        let v = classifier().classify(
+            &view("GET", "/login", Some("id=1%27%20OR%201%3D1--"), "curl/8", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(v.labels.iter().any(|l| l == "sqli"), "{:?}", v.labels);
+        assert_eq!(v.owasp, vec!["A03:2021".to_string()]);
+        // A request hitting no signature rule has no tags.
+        let plain = classifier().classify(
+            &view("GET", "/nonexistent", None, "Mozilla/5.0", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(plain.owasp.is_empty(), "{:?}", plain.owasp);
     }
 
     #[test]
