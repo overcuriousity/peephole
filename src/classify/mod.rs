@@ -1353,4 +1353,121 @@ mod tests {
             plain.labels
         );
     }
+
+    #[test]
+    fn webshell_probes_are_level_3_and_interaction_is_level_4() {
+        for p in [
+            "/shell.php",
+            "/alfa.php",
+            "/wso.php",
+            "/c99.php",
+            "/x.php",
+            "/1.php",
+            "/wp-content/uploads/evil.php",
+            "/.well-known/shell.phtml",
+            "/images/cmd.php",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "webshell-probe"),
+                "{p}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 3, "{p}");
+        }
+        for (p, q) in [("/shell.php", "cmd=id"), ("/index.php", "z0=aWQ9")] {
+            let v = classifier().classify(
+                &view("GET", p, Some(q), "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "webshell"),
+                "{p}?{q}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 4, "{p}?{q}");
+        }
+        // A generic script with a generic parameter is not a webshell.
+        let v = classifier().classify(
+            &view(
+                "GET",
+                "/index.php",
+                Some("action=edit"),
+                "Mozilla/5.0",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(!v.labels.iter().any(|l| l == "webshell"), "{:?}", v.labels);
+    }
+
+    #[test]
+    fn deserialization_markers_are_level_4() {
+        let v = classifier().classify(
+            &view(
+                "GET",
+                "/api",
+                Some("data=rO0ABXNyABNqYXZhLnV0aWwuQXJyYXlMaXN0"),
+                "curl/8",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            v.labels.iter().any(|l| l == "deserialization"),
+            "{:?}",
+            v.labels
+        );
+        let v = classifier().classify(
+            &view("GET", "/api", Some("payload=aced0005sr"), "curl/8", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            v.labels.iter().any(|l| l == "deserialization"),
+            "{:?}",
+            v.labels
+        );
+        for b in [
+            &br#"O:8:"stdClass":1:{s:3:"cmd";s:2:"id";}"#[..],
+            &br#"{"rce":"_$$ND_FUNC$$_function(){return 1}"}"#[..],
+        ] {
+            let v = classifier().classify(
+                &view("POST", "/api", None, "curl/8", Some(b)),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "deserialization"),
+                "{b:?}: {:?}",
+                v.labels
+            );
+        }
+        // Accepted magic-bytes cost: a word containing rO0AB trips the Java
+        // signature. Pinned as a positive assertion so any future tightening
+        // is a deliberate act, not an accident.
+        let v = classifier().classify(
+            &view(
+                "GET",
+                "/order",
+                Some("status=rO0ABort"),
+                "Mozilla/5.0",
+                None,
+            ),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            v.labels.iter().any(|l| l == "deserialization"),
+            "{:?}",
+            v.labels
+        );
+    }
 }
