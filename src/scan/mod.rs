@@ -479,7 +479,8 @@ impl Source {
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
              WHERE i.ip = ? AND j.uid != ? AND j.level >= ?
-               AND (j.status = 'running'
+               AND ((j.status = 'running' AND j.started_at > datetime('now', '-5 hours')
+                     AND j.started_at <= datetime('now', '+10 minutes'))
                     OR (j.status = 'done' AND j.finished_at > datetime('now', ?)))",
         )
         .bind(ip)

@@ -116,6 +116,8 @@ tor_wait_hours = 6
 # lease_secs     = 120              # scan lease, renewed while nmap runs
 # remote_config  = false            # true: holders of this node's config key may change its
 #                                   # scan pace, rescan cooldown and roles (peephole cluster config-key show)
+# origin_quota_mb = 20480           # stop storing a member's entries beyond this (0 = no limit)
+# retention_days  = 0               # opt-in: delete this node's own records older than this, cluster-wide
 #
 # [[cluster.peers]]
 # name = "server-b"

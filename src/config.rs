@@ -53,6 +53,15 @@ pub struct ClusterConfig {
     /// interface, the CLI and this file can.
     #[serde(default)]
     pub remote_config: bool,
+    /// Stop storing a member's entries once they take this many MiB here
+    /// (this node's own entries are exempt). 0: no limit.
+    #[serde(default = "default_origin_quota_mb")]
+    pub origin_quota_mb: u64,
+    /// Opt-in: delete this node's own requests and scan results older than
+    /// this many days, cluster-wide (records of other nodes are untouched).
+    /// 0 (default): the shared dataset is kept.
+    #[serde(default)]
+    pub retention_days: u32,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
 }
@@ -62,6 +71,9 @@ fn default_takeover_hours() -> f64 {
 }
 fn default_lease_secs() -> u64 {
     120
+}
+fn default_origin_quota_mb() -> u64 {
+    20 * 1024
 }
 
 /// `[[cluster.peers]]`: a node this one vouches for and dials.

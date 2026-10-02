@@ -30,6 +30,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/cluster/node/{key}", get(node_page).post(node_set))
         .route("/admin/cluster/block", post(block))
         .route("/admin/cluster/unblock", post(unblock))
+        .route("/admin/cluster/purge", post(purge))
         .route("/admin/cluster/pace", post(set_pace))
 }
 
@@ -47,6 +48,8 @@ pub struct MemberView {
     pub state: &'static str,
     /// This node blocked it (local decision).
     pub blocked: bool,
+    /// This node deleted its data and no longer relays it.
+    pub purged: bool,
     /// It lets config key holders change its runtime settings.
     pub remote_config: bool,
     /// This node holds its config key.
@@ -172,7 +175,8 @@ fn node(st: &AdminState) -> AppResult<&Arc<Node>> {
 
 async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
     let rows = members::all(&node.store).await?;
-    let heads = repl::heads(&node.store).await?;
+    let heads = repl::head_map(&repl::heads(&node.store).await?);
+    let purged = crate::cluster::block::purged(&node.store).await?;
     let statuses = node.peer_status.read().unwrap().clone();
     let me = node.id();
     let keys = crate::cluster::confkey::held(&node.store).await?;
@@ -190,7 +194,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
             ),
             (None, _) => ("never".to_string(), false),
         };
-        let held = repl::head_in(&heads, &m.id);
+        let held = heads.get(&m.id).copied().unwrap_or(0);
         let lag = match hb {
             _ if is_self => "—".to_string(),
             Some(h) if h.own_seq <= held => "in sync".to_string(),
@@ -216,6 +220,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
             active: m.active,
             state: m.standing.label(),
             blocked: node.is_blocked(&m.id),
+            purged: purged.contains(&m.id),
             remote_config: m.remote_config,
             key_held: keys.contains(&m.id),
             is_self,
@@ -261,6 +266,7 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
         active: true,
         state: "active",
         blocked: false,
+        purged: false,
         remote_config: node.cfg.remote_config,
         key_held: false,
         is_self: true,
@@ -464,18 +470,16 @@ async fn create_invite(
 ) -> AppResult<axum::response::Response> {
     use axum::response::IntoResponse;
     let node = node(&st)?;
-    // Empty fields mean "no limit"; anything else must be a number.
-    let number = |v: &Option<String>| match v.as_deref().map(str::trim) {
-        None | Some("") => Ok(None),
-        Some(s) => s.parse::<u64>().map(Some).map_err(|_| ()),
-    };
-    let (Ok(ttl), Ok(uses)) = (number(&f.ttl_hours), number(&f.max_uses)) else {
+    // Empty fields mean the defaults (a week, 10 uses); 0 means no limit.
+    let Ok((ttl_hours, max_uses)) =
+        invite::InviteOpts::parse_limits(f.ttl_hours.as_deref(), f.max_uses.as_deref())
+    else {
         return Ok(back(None, Some("expiry and use limit must be numbers".into())).into_response());
     };
     let opts = invite::InviteOpts {
         label: f.label.unwrap_or_default(),
-        ttl_hours: ttl,
-        max_uses: uses.map(|n| n.min(u32::MAX as u64) as u32),
+        ttl_hours,
+        max_uses,
     };
     match invite::create(node, &opts).await {
         Ok(token) => Ok(render_page(&st, Some(token), Flash::default())
@@ -545,6 +549,8 @@ async fn leave(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<
 #[derive(serde::Deserialize)]
 struct KeyForm {
     key: String,
+    /// Block: also every node it admitted, transitively.
+    subtree: Option<String>,
 }
 
 async fn block(
@@ -556,6 +562,19 @@ async fn block(
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
     };
+    if f.subtree.is_some() {
+        return Ok(match crate::cluster::block::block_subtree(node, id).await {
+            Ok((ids, n)) => back(
+                Some(format!(
+                    "Blocked {} and the {} node(s) it admitted, directly or not ({n} records taken out of view). Other nodes are unaffected.",
+                    id.short(),
+                    ids.len() - 1
+                )),
+                None,
+            ),
+            Err(e) => back(None, Some(format!("{e:#}"))),
+        });
+    }
     Ok(match crate::cluster::block::block(node, id).await {
         Ok(n) => back(
             Some(format!(
@@ -584,6 +603,28 @@ async fn unblock(
         )
     } else {
         back(None, Some("That node was not blocked.".into()))
+    })
+}
+
+/// Delete a blocked node's data here and stop relaying it.
+async fn purge(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Form(f): Form<KeyForm>,
+) -> AppResult<Redirect> {
+    let node = node(&st)?;
+    let Ok(id) = NodeId::parse(&f.key) else {
+        return Ok(back(None, Some("unknown node".into())));
+    };
+    Ok(match crate::cluster::block::purge(node, id).await {
+        Ok(n) => back(
+            Some(format!(
+                "Purged {}: {n} log entries deleted here. Its entries are no longer accepted or relayed; unblocking fetches them again.",
+                id.short()
+            )),
+            None,
+        ),
+        Err(e) => back(None, Some(format!("{e:#}"))),
     })
 }
 

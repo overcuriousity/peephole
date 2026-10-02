@@ -12,8 +12,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
 
-/// Reconcile at least this often, even without news.
+/// Reconcile at least this often, even without news (plus up to
+/// [`IDLE_JITTER`], so a full mesh does not sync in lockstep).
 const IDLE_ROUND: Duration = Duration::from_secs(30);
+const IDLE_JITTER: Duration = Duration::from_secs(10);
+/// Sync exchanges running at once, over all peers: in a full mesh every
+/// member has its own loop, and the database serializes their writes anyway.
+pub(crate) const MAX_CONCURRENT_SYNCS: usize = 8;
+/// Longest wait between attempts to reach an unreachable peer.
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// Gather bursts of local writes into one round.
 const DEBOUNCE: Duration = Duration::from_millis(200);
 /// How long a peer holds our long-poll open.
@@ -119,7 +126,11 @@ async fn peer_loop(
     loop {
         changes.borrow_and_update();
         let hello_due = last_hello.is_none_or(|t| t.elapsed() > HELLO_EVERY);
-        match reconcile(&node, peer, &addr, hello_due).await {
+        let round = {
+            let _slot = node.sync_slots.acquire().await;
+            reconcile(&node, peer, &addr, hello_due).await
+        };
+        match round {
             Ok(stuck) => {
                 if hello_due {
                     last_hello = Some(tokio::time::Instant::now());
@@ -155,7 +166,9 @@ async fn peer_loop(
                     _ = tokio::time::sleep(backoff) => {}
                     _ = shutdown.changed() => return,
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(60));
+                // A peer whose published address keeps failing is dialled
+                // less and less often.
+                backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
             }
         }
@@ -168,10 +181,17 @@ async fn peer_loop(
             // News on their side, or the poll timed out; an error here
             // surfaces in the next reconcile.
             _ = long_poll => {}
-            _ = tokio::time::sleep(IDLE_ROUND) => {}
+            _ = tokio::time::sleep(IDLE_ROUND + jitter(IDLE_JITTER)) => {}
             _ = shutdown.changed() => return,
         }
     }
+}
+
+/// A random duration below `max`.
+fn jitter(max: Duration) -> Duration {
+    let mut b = [0u8; 4];
+    let _ = aws_lc_rs::rand::fill(&mut b);
+    max.mul_f64(u32::from_le_bytes(b) as f64 / u32::MAX as f64)
 }
 
 /// One full exchange with a peer. Returns `true` when it is "stuck": the peer
@@ -194,14 +214,18 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         .call(peer, addr, "/rpc/v1/gossip", &node.status.all_signed())
         .await?;
     node.merge_heartbeats(gossip);
-    // Pull what we lack.
+    // Pull what we lack, except from origins we would refuse anyway (they
+    // must not crowd out the rest).
+    let refused = repl::refused_origins(node).await?;
     let mut stuck = false;
     loop {
-        let ours = repl::heads(&node.store).await?;
+        let ours = repl::head_map(&repl::heads(&node.store).await?);
         let wants: Vec<_> = theirs
             .iter()
-            .filter(|(o, s)| repl::head_in(&ours, o) < *s)
-            .map(|(o, _)| (*o, repl::head_in(&ours, o)))
+            .filter(|(o, _)| !refused.contains(o))
+            .map(|(o, s)| (*o, *s, ours.get(o).copied().unwrap_or(0)))
+            .filter(|(_, s, mine)| mine < s)
+            .map(|(o, _, mine)| (o, mine))
             .collect();
         if wants.is_empty() {
             break;
@@ -230,13 +254,14 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         }
     }
     // Push what they lack.
-    let mut theirs = theirs;
+    let mut theirs = repl::head_map(&theirs);
     loop {
         let ours = repl::heads(&node.store).await?;
         let wants: Vec<_> = ours
             .iter()
-            .filter(|(o, s)| repl::head_in(&theirs, o) < *s)
-            .map(|(o, _)| (*o, repl::head_in(&theirs, o)))
+            .map(|(o, s)| (*o, *s, theirs.get(o).copied().unwrap_or(0)))
+            .filter(|(_, s, t)| t < s)
+            .map(|(o, _, t)| (o, t))
             .collect();
         if wants.is_empty() {
             break;
@@ -246,10 +271,10 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             break;
         }
         let after: Heads = node.call(peer, addr, "/rpc/v1/push", &batch).await?;
-        if !repl::ahead_of(&after, &theirs) {
+        if !repl::ahead_of_map(&after, &theirs) {
             break; // they accepted nothing (e.g. a gap on their side)
         }
-        theirs = after;
+        theirs = repl::head_map(&after);
     }
     node.record_status(peer, &name, Ok(None)).await;
     Ok(stuck)

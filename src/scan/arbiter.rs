@@ -453,6 +453,8 @@ const LIVE_WINDOW: Duration = Duration::from_secs(45);
 
 /// Adopt queued jobs of arbiters silent for `cluster.takeover_hours`.
 /// Only the lowest-keyed live scanner adopts, so takeovers rarely collide.
+/// Every other node applies an adoption only once it, too, sees the arbiter
+/// silent (or the job unchanged) for that long (see `cluster::repl`).
 pub async fn takeover_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let window = Duration::from_secs_f64(node.cfg.takeover_hours * 3600.0);
     let tick = (window / 4).clamp(Duration::from_millis(250), Duration::from_secs(60));
@@ -468,8 +470,18 @@ pub async fn takeover_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Re
     }
 }
 
+/// One takeover pass. Jobs move to this node when their arbiter
+/// - is blocked here (scanners here skip it, so its jobs would be stranded;
+///   any scanner node that blocked it adopts, whatever its rank),
+/// - has been silent for `window` (lowest live scanner only), or
+/// - keeps running but has not touched a job for `window` while this
+///   node's scanner has idle workers (lowest live scanner only): an
+///   arbiter that never hands its jobs out.
 async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Result<()> {
     let me = node.id();
+    if !node.roles().scanner {
+        return Ok(());
+    }
     let members = node.members();
     let scanner = |id: &NodeId| {
         node.status
@@ -482,14 +494,18 @@ async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Re
             })
             .unwrap_or(false)
     };
-    let lowest_live_scanner = node
+    let lowest = node
         .live_members(LIVE_WINDOW)
         .into_iter()
-        .filter(|id| *id == me || scanner(id))
-        .min();
-    if lowest_live_scanner != Some(me) || !node.roles().scanner {
-        return Ok(());
-    }
+        .filter(|id| !node.is_blocked(id) && (*id == me || scanner(id)))
+        .min()
+        == Some(me);
+    let idle = {
+        let local = node.status.local.lock().unwrap();
+        local
+            .pace
+            .is_some_and(|p| local.active_scans < p.max_workers)
+    };
     let arbiters: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT DISTINCT arbiter FROM scan_jobs
          WHERE status IN ('queued','running') AND arbiter IS NOT NULL AND arbiter != ?",
@@ -497,26 +513,42 @@ async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Re
     .bind(&me.0[..])
     .fetch_all(&node.store.pool)
     .await?;
+    // Jobs unchanged since this HLC are stale.
+    let stale_before = crate::cluster::hlc::to_db(
+        crate::cluster::hlc::wall_ms().saturating_sub(window.as_millis() as u64) << 16,
+    );
     for a in arbiters {
         let Ok(from) = NodeId::from_slice(&a) else {
             continue;
         };
-        if node.silent_for(&from) < window {
+        let gone = node.is_blocked(&from) || (lowest && node.silent_for(&from) >= window);
+        // Include 'running' jobs: after takeover_hours any lease is long
+        // expired, so a job still marked running is stale and would
+        // otherwise block its IP cluster-wide forever.
+        let uids: Vec<String> = if gone {
+            sqlx::query_scalar(
+                "SELECT uid FROM scan_jobs WHERE status IN ('queued','running') AND arbiter = ?
+                 LIMIT 500",
+            )
+            .bind(&a)
+            .fetch_all(&node.store.pool)
+            .await?
+        } else if lowest && idle {
+            sqlx::query_scalar(
+                "SELECT uid FROM scan_jobs WHERE status IN ('queued','running') AND arbiter = ?
+                   AND MAX(COALESCE(hlc, 0), status_hlc) < ? LIMIT 500",
+            )
+            .bind(&a)
+            .bind(stale_before)
+            .fetch_all(&node.store.pool)
+            .await?
+        } else {
             continue;
-        }
-        // Include 'running' jobs: after takeover_hours of silence any lease is
-        // long expired, so a job still marked running under a dead arbiter is
-        // stale and would otherwise block its IP cluster-wide forever.
-        let uids: Vec<String> = sqlx::query_scalar(
-            "SELECT uid FROM scan_jobs WHERE status IN ('queued','running') AND arbiter = ? LIMIT 500",
-        )
-        .bind(&a)
-        .fetch_all(&node.store.pool)
-        .await?;
+        };
         if uids.is_empty() {
             continue;
         }
-        info!(from = %from.short(), jobs = uids.len(), "adopting queued scans of an unreachable node");
+        info!(from = %from.short(), jobs = uids.len(), "adopting scans of an unreachable, blocked or stalling node");
         rec.write(vec![Record::JobAdopt(
             crate::cluster::record::JobAdoptRec {
                 from,
@@ -550,6 +582,8 @@ mod tests {
                 takeover_hours: 6.0,
                 lease_secs: 120,
                 remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                retention_days: 0,
                 peers: vec![],
             },
             roles: Default::default(),

@@ -108,12 +108,25 @@ async fn gossip(
 
 /// A directed message to deliver here or pass on. Routed in the
 /// background; the caller only learns it was accepted.
+/// Only messages signed by members and within the replay window are taken,
+/// and only so many are routed at once.
 async fn message(State(node): State<Arc<Node>>, Cbor(mut env): Cbor<Envelope>) -> Response {
     env.hops = env.hops.saturating_add(1);
-    if let Err(e) = env.open() {
-        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    let body = match env.open() {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    if !node.is_member(&body.from) {
+        return (StatusCode::FORBIDDEN, "sender is not a member").into_response();
     }
+    if !body.fresh() {
+        return (StatusCode::BAD_REQUEST, "stale or future-dated message").into_response();
+    }
+    let Ok(permit) = node.route_slots.clone().try_acquire_owned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response();
+    };
     tokio::spawn(async move {
+        let _permit = permit;
         if let Err(e) = node.route(env).await {
             tracing::debug!(?e, "message not routed");
         }
@@ -148,13 +161,14 @@ async fn inbox(State(node): State<Arc<Node>>, Extension(Peer(peer)): Extension<P
 async fn wait(State(node): State<Arc<Node>>, Cbor(req): Cbor<WaitReq>) -> Response {
     let mut changes = node.subscribe_changes();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(WAIT_SECS);
+    let theirs = repl::head_map(&req.heads);
     loop {
         changes.borrow_and_update();
         let ours = match repl::heads(&node.store).await {
             Ok(h) => h,
             Err(e) => return internal(e),
         };
-        if repl::ahead_of(&ours, &req.heads) {
+        if repl::ahead_of_map(&ours, &theirs) {
             return Cbor(ours).into_response();
         }
         tokio::select! {
@@ -167,9 +181,10 @@ async fn wait(State(node): State<Arc<Node>>, Cbor(req): Cbor<WaitReq>) -> Respon
 async fn join(
     State(node): State<Arc<Node>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Extension(server::RemoteAddr(addr)): Extension<server::RemoteAddr>,
     Cbor(req): Cbor<JoinReq>,
 ) -> Response {
-    if !node.join_allowed() {
+    if !node.join_allowed(peer, addr.ip()) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
     }
     match invite::redeem(&node, peer, req).await {
