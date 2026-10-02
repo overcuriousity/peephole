@@ -843,6 +843,23 @@ impl Recorder {
         .await?;
         let scans = scan_uids.len() as u64;
         self.bury(scan_uids).await?;
+        // Finished jobs without a scan left: otherwise they (and their IP
+        // rows, which a job keeps alive) would stay forever.
+        let job_uids: Vec<String> = sqlx::query_scalar(
+            "SELECT j.uid FROM scan_jobs j
+             WHERE j.status IN ('done', 'failed', 'superseded', 'refused')
+               AND COALESCE(j.finished_at, j.queued_at) < datetime('now', ?)
+               AND NOT EXISTS (SELECT 1 FROM scans s WHERE s.job_id = j.id)
+             ORDER BY j.id LIMIT ?",
+        )
+        .bind(&cutoff)
+        .bind(BATCH)
+        .fetch_all(pool)
+        .await?;
+        if !job_uids.is_empty() {
+            tracing::info!(jobs = job_uids.len(), "retention: pruned old scan jobs");
+        }
+        self.bury(job_uids).await?;
         Ok((reqs, scans))
     }
 }

@@ -252,7 +252,28 @@ mod tests {
             .execute(&s.pool)
             .await
             .unwrap();
+        sqlx::query("UPDATE scan_jobs SET finished_at = datetime('now','-100 days')")
+            .execute(&s.pool)
+            .await
+            .unwrap();
         let (reqs, scans) = s.local().prune_older_than(90).await.unwrap();
+        // Finished jobs go too, and with them the last rows of both IPs.
+        for table in ["scan_jobs", "ips"] {
+            let n: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(&s.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(n, 0, "{table}");
+        }
+        // The local tombstones these deletes left behind are dropped on a
+        // standalone node.
+        assert!(s.prune_local_tombstones().await.unwrap() > 0);
+        let t: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tombstoned")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(t, 0);
         assert_eq!(reqs, 2);
         assert_eq!(scans, 2);
         let rc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")

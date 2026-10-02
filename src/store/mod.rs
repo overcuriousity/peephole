@@ -4,6 +4,7 @@ pub mod data;
 pub mod delete;
 pub mod fingerprints;
 pub mod inspect;
+pub mod maintenance;
 pub mod recorder;
 pub mod requests;
 pub mod scans;

@@ -171,6 +171,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         ));
     }
 
+    // Housekeeping on every node: expired sessions and ceremonies, planner
+    // statistics, freed pages; local tombstones on a standalone node.
+    tokio::spawn(store::maintenance::run(
+        store.clone(),
+        cfg.cluster.is_none(),
+        shutdown_rx.clone(),
+    ));
+
     // Queue change notifications: trap + workers publish, admin SSE subscribes.
     let notifier = events::Notifier::new();
 
