@@ -1,5 +1,11 @@
 # Remote code execution and command injection. Runs against raw and decoded
-# forms, and the header rule inspects every request header.
+# forms, and the header rules inspect every request header.
+#
+# Shell and interpreter names only count in command-injection context:
+# after a separator (; | & $( ` = quote whitespace), a traversal (..) or, for
+# Windows interpreters, a path separator, so a slug such as
+# /learn-powershell or /cgi-bin/shop.cgi is not an attack. Patterns with
+# quotes use TOML literal strings ('''…''').
 
 [[rule]]
 label = "rce"
@@ -7,23 +13,58 @@ weight = 4
 # Command separators and tooling. \b after id/whoami so "id" does not match
 # "idx=". $(...) and `...` command substitution, pipes into nc/curl/wget,
 # shells and Windows interpreters.
-target_regex = ";\\s*(id|whoami|uname|cat\\s+/etc)\\b|\\|\\s*(nc|curl|wget)\\s|\\$\\(.*\\)|`.*`|/bin/(sh|bash)|cmd\\.exe|powershell"
+target_regex = ''';\s*(id|whoami|uname|cat\s+/etc)\b|\|\s*(nc|curl|wget)\s|\$\(.*\)|`.*`|(^|[;|&$(`='"\s]|\.\.)\s*/bin/(ba|da|z)?sh\b|(^|[;|&$(`='"\s\\/])(cmd(\.exe)?\s+/[ck]\b|cmd\.exe\b|powershell(\.exe\b|\s+[-/]\w))'''
 
 [[rule]]
 label = "rce"
 weight = 4
-body_regex = "/bin/(sh|bash)|cmd\\.exe|powershell|\\|\\s*(nc|curl|wget)\\s|;\\s*(id|whoami|uname)\\b"
+# The same in a body, plus the dropper chains IoT botnets post
+# (`cd /tmp; wget …`, `$(busybox …)`).
+body_regex = '''(^|[;|&$(`='"\s]|\.\.)\s*/bin/(ba|da|z)?sh\b|(^|[;|&$(`='"\s\\/])(cmd(\.exe)?\s+/[ck]\b|cmd\.exe\b|powershell(\.exe\b|\s+[-/]\w))|\|\s*(nc|curl|wget|sh|bash)\b|;\s*(id|whoami|uname|wget|curl|busybox|chmod|tftp)\b|[`(]\s*(busybox|wget|curl|tftp|chmod)\s'''
 
 [[rule]]
 label = "rce"
 weight = 4
-# Shellshock — () { :;}; — in any header (classically User-Agent/Referer),
-# and Log4Shell ${jndi:...} JNDI lookups (also ${lower:...}/${env:...}
-# obfuscation) in any header.
-header_regex = "\\(\\s*\\)\\s*\\{|\\$\\{jndi:|\\$\\{(lower|upper|env|sys|date):"
+# Shellshock — () { :;}; — in any header (classically User-Agent/Referer).
+header_regex = "\\(\\s*\\)\\s*\\{"
 
 [[rule]]
 label = "rce"
 weight = 4
-# Log4Shell / template-injection lookups in the URL or body too.
-target_regex = "\\$\\{jndi:|\\$\\{(lower|upper|env|sys):"
+# Log4Shell: ${jndi:…} lookups and their obfuscations in any header, the
+# URL or the body: other lookups (${lower:j}, ${env:X:-j}, ${::-j}) and any
+# lookup nested inside another (${${::-j}${::-n}di:…, ${jn${lower:d}i:…).
+header_regex = '''\$\{\s*jndi\s*:|\$\{\s*(lower|upper|env|sys|date|java|main|base64|ctx|k8s|docker|bundle|spring|web|log4j|marker|sd|map|event)\s*:|\$\{\s*::-|\$\{[^{}]{0,64}\$\{'''
+target_regex = '''\$\{\s*jndi\s*:|\$\{\s*(lower|upper|env|sys|date|java|main|base64|ctx|k8s|docker|bundle|spring|web|log4j|marker|sd|map|event)\s*:|\$\{\s*::-|\$\{[^{}]{0,64}\$\{'''
+body_regex = '''\$\{\s*jndi\s*:|\$\{\s*(lower|upper|env|sys|date|java|main|base64|ctx|k8s|docker|bundle|spring|web|log4j|marker|sd|map|event)\s*:|\$\{\s*::-|\$\{[^{}]{0,64}\$\{'''
+
+[[rule]]
+label = "rce"
+weight = 4
+# Expression-language injection: OGNL (Struts2 %{(#…)}, Confluence
+# ${(#…)}), Spring SpEL T(java.lang.Runtime), in any part of the request.
+target_regex = '''[%$]\{\s*\(?\s*#|#_memberaccess|@java\.lang\.(runtime|processbuilder)@|ognl\.ognlcontext|T\s*\(\s*java\.lang\.(runtime|processbuilder)'''
+body_regex = '''[%$]\{\s*\(?\s*#|#_memberaccess|@java\.lang\.(runtime|processbuilder)@|ognl\.ognlcontext|T\s*\(\s*java\.lang\.(runtime|processbuilder)'''
+header_regex = '''[%$]\{\s*\(?\s*#|#_memberaccess|@java\.lang\.(runtime|processbuilder)@|ognl\.ognlcontext|T\s*\(\s*java\.lang\.(runtime|processbuilder)'''
+
+[[rule]]
+label = "rce"
+weight = 4
+# Spring Cloud Function (CVE-2022-22963): SpEL in a routing header.
+header_regex = '''(^|\n)spring\.cloud\.function\.routing-expression\s*:'''
+
+[[rule]]
+label = "rce"
+weight = 4
+# Spring4Shell (CVE-2022-22965): class loader properties bound from a form.
+target_regex = '''\bclass(\.|\[)module(\.|\]\[)classloader'''
+body_regex = '''\bclass(\.|\[)module(\.|\]\[)classloader'''
+
+[[rule]]
+label = "rce"
+weight = 4
+# Known code-execution endpoints: PHPUnit eval-stdin.php (CVE-2017-9841),
+# Laravel Ignition (CVE-2021-3129), F5 BIG-IP iControl bash
+# (CVE-2022-1388) and TMUI traversal (CVE-2020-5902), GPON and Boa router
+# command injection.
+target_regex = '''eval-stdin\.php|/_ignition/execute-solution|/mgmt/tm/util/bash|/tmui/.*\.\.;|/gponform/diag_form|/boaform/admin/form(ping|tracert)'''

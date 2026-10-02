@@ -1,0 +1,27 @@
+# Probes for network appliances and mail servers: VPN gateways, firewalls,
+# load balancers and Exchange are the first thing mass exploitation looks
+# for after a new CVE. Paths are anchored at segment boundaries so ordinary
+# pages (/remote-work, /vpn-setup, /owasp) do not match.
+
+[[rule]]
+label = "appliance-probe"
+weight = 3
+# Fortinet FortiGate SSL VPN (/remote/fgt_lang, /remote/logincheck), Ivanti /
+# Pulse Connect Secure (/dana-na/, the TOTP backup-code and license APIs),
+# Palo Alto GlobalProtect, Cisco ASA (/+CSCOE+/), Citrix ADC/Gateway
+# (/vpn/, /vpns/, /logon/LogonPoint/).
+target_regex = '''/remote/(fgt_lang|logincheck|login|info)(/|\?|$)|/dana-(na|ws|cached)/|/api/v1/totp/user-backup-code|/api/v1/license/keys-status|/global-protect/|/ssl-vpn/|(\+|%2b|\s)csco[etlu](\+|%2b|\s)/|/vpns?/|/logon/logonpoint/'''
+
+[[rule]]
+label = "appliance-probe"
+weight = 3
+# Microsoft Exchange (ProxyLogon/ProxyShell recon): Autodiscover, OWA, ECP,
+# EWS, MAPI at the root of the site.
+target_regex = '''^/(autodiscover/|owa(/|\?|$)|ecp/|ews/|mapi/)'''
+
+[[rule]]
+label = "iot-probe"
+weight = 3
+# Consumer routers and modems (Mirai-style botnets): D-Link HNAP, Boa web
+# server forms, GPON ONT forms.
+target_regex = '''/hnap1(/|\?|$)|/boaform/|/gponform/'''

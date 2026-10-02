@@ -1,4 +1,7 @@
+# Tools that announce themselves in the User-Agent, and research scanners
+# (Censys, Palo Alto Xpanse/Expanse, LeakIX). httpx is ProjectDiscovery's
+# probe; python-httpx (a general HTTP library) is not matched.
 [[rule]]
 label = "scanner-ua"
 weight = 2
-ua_regex = "sqlmap|nikto|nmap|masscan|nuclei|acunetix|nessus|openvas|wpscan|dirbuster|gobuster|hydra|metasploit|zgrab"
+ua_regex = '''sqlmap|nikto|nmap|masscan|nuclei|acunetix|nessus|openvas|wpscan|dirbuster|gobuster|hydra|metasploit|zgrab|\bffuf\b|fuzz faster u fool|feroxbuster|wfuzz|\bdirb\b|(^|[^-\w])httpx\b|projectdiscovery|censysinspect|\bexpanse\b|xpanse|l9explore|l9tcpid|leakix'''

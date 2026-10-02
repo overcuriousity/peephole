@@ -1,14 +1,16 @@
 # SQL injection. Matched against raw and percent-decoded text, so encoded
-# payloads (%27%20OR, UNION%09SELECT via + / %xx) are caught.
+# payloads (%27%20OR, UNION%09SELECT via + / %xx) are caught. UNION may be
+# followed by ALL/DISTINCT and separated by comments (union/**/select);
+# MySQL versioned comments (/*!50000union*/) count too.
 
 [[rule]]
 label = "sqli"
 weight = 4
-target_regex = "('|%27)(\\s|%20|\\+)*(or|and)(\\s|%20|\\+)+('|%27)?[0-9'=%20\\+]+('|%27)?=|union(\\s|%20|\\+)+select|information_schema|sleep\\s*\\(|benchmark\\s*\\(|updatexml|extractvalue"
+target_regex = '''('|%27)(\s|%20|\+)*(or|and)(\s|%20|\+)+('|%27)?[0-9'=%20\+]+('|%27)?=|union(\s|%20|%09|%0a|\+|/\*.*?\*/)+((all|distinct)(\s|%20|%09|%0a|\+|/\*.*?\*/)+)?select\b|/\*!\d*\s*(union|select)\b|information_schema|sleep\s*\(|benchmark\s*\(|updatexml|extractvalue'''
 
 [[rule]]
 label = "sqli"
 weight = 4
 # Body form: the boolean-logic clause must be followed by a quote, digit or
 # paren, so ordinary English such as "users' and admins" does not match.
-body_regex = "('|%27)\\s*(or|and)\\s+('|\"|[0-9(])|union\\s+select|sleep\\s*\\(|benchmark\\s*\\(|information_schema"
+body_regex = '''('|%27)\s*(or|and)\s+('|"|[0-9(])|union(\s|/\*.*?\*/)+((all|distinct)(\s|/\*.*?\*/)+)?select\b|/\*!\d*\s*(union|select)\b|sleep\s*\(|benchmark\s*\(|information_schema'''
