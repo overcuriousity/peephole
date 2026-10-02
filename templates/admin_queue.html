@@ -14,7 +14,7 @@
   <div class="tiles">
     <div class="tile"><span class="label">Backlog</span><div class="value">{{ pace.m.backlog }}</div><div class="hint">oldest waiting {{ pace.oldest }}</div></div>
     <div class="tile"><span class="label">Arrivals / h</span><div class="value">{{ pace.arrival }}</div><div class="hint">{{ pace.m.arrivals_1h }} last hour · {{ pace.m.arrivals_24h }} last 24 h</div></div>
-    <div class="tile"><span class="label">Capacity / h</span><div class="value">{{ pace.capacity }}</div><div class="hint">{{ pace.m.completed_1h }} finished last hour · {{ pace.m.completed_24h }} last 24 h</div></div>
+    <div class="tile"><span class="label">Capacity / h</span><div class="value">{{ pace.capacity }}</div><div class="hint">{% match pace.cluster_note %}{% when Some(n) %}{{ n }}· {% when None %}{% endmatch %}{{ pace.m.completed_1h }} finished last hour · {{ pace.m.completed_24h }} last 24 h</div></div>
     <div class="tile"><span class="label">Net growth / h</span><div class="value{% if pace.growing %} brand{% endif %}">{{ pace.net }}</div><div class="hint">backlog drains: {{ pace.drain }}</div></div>
     <div class="tile"><span class="label">Scan duration</span><div class="value">{{ pace.scan_secs }}</div><div class="hint">{% if pace.scan_secs_measured %}mean of the last 7 days{% else %}assumed, nothing measured yet{% endif %}</div></div>
     <div class="tile"><span class="label">Failed · 24 h</span><div class="value{% if pace.m.failed_24h > 0 %} brand{% endif %}">{{ pace.m.failed_24h }}</div><div class="hint">{{ pace.m.timeouts_24h }} timeouts ({{ pace.timeout_share }} of finished)</div></div>
@@ -35,8 +35,8 @@
       <input type="hidden" name="max_workers" value="{{ pace.rec.max_workers }}">
       <input type="hidden" name="max_scans_per_hour" value="{{ pace.rec.max_scans_per_hour }}">
       <input type="hidden" name="timeout_minutes" value="{{ pace.rec_timeout_min }}">
-      <p><strong>Recommended:</strong> {{ pace.rec.max_workers }} workers, {{ pace.rec.max_scans_per_hour }} scans per hour ({{ pace.rec_cadence }}), {{ pace.rec_timeout_min }} min timeout.</p>
-      <p class="muted">Covers the arrival rate with 25% headroom and clears the current backlog within a day. Raises the timeout by half when more than 10% of scans hit it.</p>
+      <p><strong>Recommended{% if pace.cluster_note.is_some() %} for this node{% endif %}:</strong> {{ pace.rec.max_workers }} workers, {{ pace.rec.max_scans_per_hour }} scans per hour ({{ pace.rec_cadence }}), {{ pace.rec_timeout_min }} min timeout.</p>
+      <p class="muted">Covers the arrival rate with 25% headroom and clears the current backlog within a day. {% if pace.cluster_note.is_some() %}The queue is shared: what the other live scanners finish is counted first, and this node covers the rest. {% endif %}Raises the timeout by half when more than 10% of scans hit it.</p>
       {% if pace.rec_differs %}<button class="btn" type="submit">Apply recommendation</button>{% else %}<p class="muted">The current pace matches.</p>{% endif %}
     </form>
   </div>

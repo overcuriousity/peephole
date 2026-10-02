@@ -9,7 +9,7 @@
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{
     FingerprintRec, FpClaimRec, IntelManifestRec, IpIntelRec, JobAdoptRec, JobStatusRec, PortRec,
-    ROW_BACKED, Record, RequestRec, ScanJobRec, ScanResultRec, TombstoneRec,
+    ROW_BACKED, Record, RequestRec, ScanJobRec, ScanResultRec, SkipBatchRec, TombstoneRec,
 };
 use anyhow::Result;
 use sqlx::SqliteConnection;
@@ -83,6 +83,7 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
         Record::ScanResult(r) => scan_result(conn, ctx, r).await,
         Record::Tombstone(t) => tombstone(conn, ctx, t).await,
         Record::IntelManifest(m) => intel_manifest(conn, ctx, m).await,
+        Record::SkipBatch(b) => skip_batch(conn, ctx, b).await,
         Record::MemberAdd(_) | Record::MemberUpdate(_) | Record::MemberRevoke { .. } => {
             Ok(Effect::Ignored)
         }
@@ -91,8 +92,9 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
 
 /// Record kinds a local hide or block keeps out of the tables. Membership,
 /// tombstones and scan-job state still apply, so the cluster stays in step.
-const CONTENT_KINDS: [&str; 6] = [
+const CONTENT_KINDS: [&str; 7] = [
     "request",
+    "skip_batch",
     "fingerprint",
     "fp_claim",
     "scan_job",
@@ -222,8 +224,9 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     let ip_id = ensure_ip(conn, &r.ip, Some(&r.ts)).await?;
     sqlx::query(
         "INSERT OR IGNORE INTO requests (uid, origin, hlc, ts, ip_id, method, path, query,
-           headers_json, body, labels_json, severity, scan_level, is_fp_claim, page_token)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           headers_json, body, labels_json, severity, scan_level, is_fp_claim, page_token,
+           answer, status, unrecorded, transport, via_proxy, raw_head, tls_client_hello, ja4)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -240,8 +243,75 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(r.scan_level)
     .bind(r.is_fp_claim)
     .bind(&r.page_token)
+    .bind(&r.answer)
+    .bind(r.status)
+    .bind(r.unrecorded)
+    .bind(&r.transport)
+    .bind(r.via_proxy)
+    .bind(&r.raw_head)
+    .bind(&r.tls_client_hello)
+    .bind(&r.ja4)
     .execute(&mut *conn)
     .await?;
+    Ok(Effect::Applied)
+}
+
+/// Most light rows one batch may carry, and the longest path kept.
+pub const SKIP_BATCH_MAX: usize = 1000;
+pub const SKIP_PATH_MAX: usize = 1024;
+
+/// `s` cut to at most `max` bytes, on a character boundary.
+pub fn cut(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec) -> Result<Effect> {
+    if let Some(t) = erased_by(conn, &b.uid).await? {
+        return Ok(Effect::Erased(t));
+    }
+    if b.ip.parse::<std::net::IpAddr>().is_err() || b.rows.len() > SKIP_BATCH_MAX || b.dropped < 0 {
+        return Ok(Effect::Ignored);
+    }
+    let first = b.rows.iter().map(|r| r.ts_ms).min().unwrap_or(0);
+    let last = b.rows.iter().map(|r| r.ts_ms).max().unwrap_or(0);
+    let seen = chrono::DateTime::from_timestamp_millis(last)
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
+    let ip_id = ensure_ip(conn, &b.ip, seen.as_deref()).await?;
+    let id: Option<i64> = sqlx::query_scalar(
+        "INSERT OR IGNORE INTO skipped_batches (uid, origin, hlc, ip_id, first_ms, last_ms, dropped)
+         VALUES (?,?,?,?,?,?,?) RETURNING id",
+    )
+    .bind(&b.uid)
+    .bind(ctx.origin_bytes())
+    .bind(ctx.hlc as i64)
+    .bind(ip_id)
+    .bind(first)
+    .bind(last)
+    .bind(b.dropped)
+    .fetch_optional(&mut *conn)
+    .await?;
+    // Already there: applied before.
+    let Some(id) = id else {
+        return Ok(Effect::Applied);
+    };
+    for r in &b.rows {
+        sqlx::query(
+            "INSERT INTO skipped_requests (batch_id, ts_ms, method, path) VALUES (?,?,?,?)",
+        )
+        .bind(id)
+        .bind(r.ts_ms)
+        .bind(cut(&r.method, 64))
+        .bind(cut(&r.path, SKIP_PATH_MAX))
+        .execute(&mut *conn)
+        .await?;
+    }
     Ok(Effect::Applied)
 }
 
@@ -824,6 +894,7 @@ async fn tombstone(conn: &mut SqliteConnection, ctx: Ctx<'_>, t: &TombstoneRec) 
         "fingerprints",
         "scan_jobs",
         "scans",
+        "skipped_batches",
     ] {
         let sql = format!("SELECT DISTINCT ip_id FROM {table} WHERE uid IN ({{}})");
         for chunk in own.chunks(400) {
@@ -869,6 +940,7 @@ async fn tombstone(conn: &mut SqliteConnection, ctx: Ctx<'_>, t: &TombstoneRec) 
         "fingerprints",
         "scan_jobs",
         "requests",
+        "skipped_batches",
     ] {
         let sql = format!("DELETE FROM {table} WHERE uid IN ({{}})");
         for_uids(conn, &sql, &own).await?;
@@ -891,7 +963,8 @@ pub(crate) async fn drop_orphan_ip(conn: &mut SqliteConnection, ip_id: i64) -> R
            AND NOT EXISTS (SELECT 1 FROM scan_jobs WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM scans WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM fingerprints WHERE ip_id = ?1)
-           AND NOT EXISTS (SELECT 1 FROM fp_claims WHERE ip_id = ?1)",
+           AND NOT EXISTS (SELECT 1 FROM fp_claims WHERE ip_id = ?1)
+           AND NOT EXISTS (SELECT 1 FROM skipped_batches WHERE ip_id = ?1)",
     )
     .bind(ip_id)
     .execute(&mut *conn)
@@ -949,6 +1022,7 @@ pub(crate) async fn unmaterialize(
         "fingerprint" => "fingerprints",
         "scan_job" => "scan_jobs",
         "scan_result" => "scans",
+        "skip_batch" => "skipped_batches",
         _ => return Ok(None),
     };
     let sql = format!("SELECT ip_id FROM {table} WHERE uid = ?");
@@ -1009,6 +1083,17 @@ pub(crate) async fn unmaterialize(
 /// Rebuild a row-backed record from its row, byte-for-byte as it was
 /// signed. None if the row is gone.
 pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Result<Option<Record>> {
+    // The columns added with the dataset fields (migration 0022).
+    type ReqExtra = (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<bool>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<String>,
+    );
     type Req = (
         String,
         String,
@@ -1056,23 +1141,42 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
             .bind(uid)
             .fetch_optional(&mut *conn)
             .await?;
-            r.map(|r| {
-                Record::Request(RequestRec {
-                    uid: r.0,
-                    ts: r.1,
-                    ip: r.2,
-                    method: r.3,
-                    path: r.4,
-                    query: r.5,
-                    headers_json: r.6,
-                    body: r.7,
-                    labels_json: r.8,
-                    severity: r.9,
-                    scan_level: r.10,
-                    is_fp_claim: r.11,
-                    page_token: r.12,
-                })
-            })
+            match r {
+                None => None,
+                Some(r) => {
+                    let x: ReqExtra = sqlx::query_as(
+                        "SELECT answer, status, unrecorded, transport, via_proxy, raw_head,
+                                tls_client_hello, ja4
+                         FROM requests WHERE uid = ?",
+                    )
+                    .bind(uid)
+                    .fetch_one(&mut *conn)
+                    .await?;
+                    Some(Record::Request(RequestRec {
+                        uid: r.0,
+                        ts: r.1,
+                        ip: r.2,
+                        method: r.3,
+                        path: r.4,
+                        query: r.5,
+                        headers_json: r.6,
+                        body: r.7,
+                        labels_json: r.8,
+                        severity: r.9,
+                        scan_level: r.10,
+                        is_fp_claim: r.11,
+                        page_token: r.12,
+                        answer: x.0,
+                        status: x.1,
+                        unrecorded: x.2,
+                        transport: x.3,
+                        via_proxy: x.4,
+                        raw_head: x.5,
+                        tls_client_hello: x.6,
+                        ja4: x.7,
+                    }))
+                }
+            }
         }
         "fingerprint" => {
             let r: Option<Fp> = sqlx::query_as(
@@ -1168,6 +1272,7 @@ mod tests {
             scan_level: 1,
             is_fp_claim: false,
             page_token: None,
+            ..Default::default()
         })
     }
 
@@ -1201,7 +1306,7 @@ mod tests {
             .unwrap()
     }
 
-    use crate::cluster::record::IpIntelRec;
+    use crate::cluster::record::{IpIntelRec, SkipBatchRec, SkipRow};
 
     fn intel(ip: &str, provider: &str, data: &str) -> Record {
         Record::IpIntel(IpIntelRec {
@@ -1579,6 +1684,132 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(eff, Effect::Applied);
+    }
+
+    #[tokio::test]
+    async fn request_rebuild_reproduces_old_and_new_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let old = request(&format!("{}old", a.uid_prefix()), "/old");
+        let Record::Request(mut r) = request(&format!("{}new", a.uid_prefix()), "/new") else {
+            unreachable!()
+        };
+        r.answer = Some("decoy:dotenv".into());
+        r.status = Some(200);
+        r.unrecorded = Some(3);
+        r.transport = Some("https".into());
+        r.via_proxy = Some(true);
+        r.raw_head = Some(b"GET /new HTTP/1.1\r\n\r\n".to_vec());
+        r.tls_client_hello = Some(vec![0x16, 3, 1, 0, 0]);
+        r.ja4 = Some("t13d0305h2_aaaaaaaaaaaa_bbbbbbbbbbbb".into());
+        let new = Record::Request(r);
+        for rec in [old, new] {
+            assert_eq!(apply(&mut conn, ctx, &rec).await.unwrap(), Effect::Applied);
+            let rebuilt = rebuild(&mut conn, "request", &rec.uid().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crate::cluster::rpc::cbor::encode(&rebuilt).unwrap(),
+                crate::cluster::rpc::cbor::encode(&rec).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn skip_batch_applies_and_its_tombstone_erases_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let uid = format!("{}skip", a.uid_prefix());
+        let row = |ts_ms, path: &str| SkipRow {
+            ts_ms,
+            method: "GET".into(),
+            path: path.into(),
+        };
+        let b = Record::SkipBatch(SkipBatchRec {
+            uid: uid.clone(),
+            ip: "203.0.113.7".into(),
+            dropped: 5,
+            rows: vec![
+                row(1000, "/a"),
+                row(1500, "/b"),
+                row(2000, &"x".repeat(3000)),
+            ],
+        });
+        assert_eq!(apply(&mut conn, ctx, &b).await.unwrap(), Effect::Applied);
+        assert_eq!(
+            count(&mut conn, "SELECT COUNT(*) FROM skipped_requests").await,
+            3
+        );
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT first_ms + last_ms + dropped FROM skipped_batches"
+            )
+            .await,
+            3005
+        );
+        assert_eq!(
+            count(&mut conn, "SELECT MAX(length(path)) FROM skipped_requests").await,
+            1024
+        );
+        let t = Record::Tombstone(TombstoneRec {
+            uid: format!("{}tomb", a.uid_prefix()),
+            uids: vec![uid],
+            seqs: vec![],
+        });
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 2,
+        };
+        apply(&mut conn, ctx, &t).await.unwrap();
+        assert_eq!(
+            count(&mut conn, "SELECT COUNT(*) FROM skipped_requests").await,
+            0
+        );
+        assert_eq!(
+            count(&mut conn, "SELECT COUNT(*) FROM skipped_batches").await,
+            0
+        );
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ips").await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_skip_batch_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let rows = (0..1001)
+            .map(|i| SkipRow {
+                ts_ms: i,
+                method: "GET".into(),
+                path: "/".into(),
+            })
+            .collect();
+        let b = Record::SkipBatch(SkipBatchRec {
+            uid: format!("{}big", a.uid_prefix()),
+            ip: "203.0.113.7".into(),
+            dropped: 0,
+            rows,
+        });
+        assert_eq!(apply(&mut conn, ctx, &b).await.unwrap(), Effect::Ignored);
     }
 
     #[tokio::test]

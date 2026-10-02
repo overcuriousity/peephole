@@ -687,6 +687,10 @@ async fn admin_pages_and_deletes_with_session() {
             && html.contains("x-forwarded-for")
             && html.contains("form-interaction")
     );
+    assert!(
+        html.contains("answered not-found (404)"),
+        "how it was answered"
+    );
 
     let html = get("/admin/scans").await.unwrap().text().await.unwrap();
     assert!(html.contains("203.0.113.78"));
@@ -893,6 +897,29 @@ async fn export_download_requires_auth_and_filters() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert!(resp.bytes().await.unwrap().len() > 100);
+
+    let resp = client
+        .get(format!(
+            "{base}/admin/export/download?format=csv&mode=redistributable"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .get(format!(
+            "{base}/admin/export/download?format=csv&mode=everything"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let resp = client
+        .get(format!("{base}/admin/export/intel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "the separate enrichment export is gone");
 
     // The export form submits every field, blank ones included.
     let body = client
@@ -1453,6 +1480,7 @@ async fn bulk_delete_checked_and_filtered() {
                 scan_level: 0,
                 is_fp_claim: false,
                 page_token: None,
+                ..Default::default()
             })
             .await
             .unwrap();

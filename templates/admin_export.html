@@ -2,9 +2,10 @@
 {% block title %}peephole — export{% endblock %}
 {% block content %}
 {% let sub = "export" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Export requests</h1><p class="muted">CSV, Timesketch JSONL or Parquet. Filters are optional; up to 100 000 rows.</p></div></div>
+<div class="page-head"><div><h1>Export</h1><p class="muted">Every request, and every request the flood gate answered without recording it in full, with all peephole knows about it and its IP: headers, body, raw request head, TLS ClientHello and JA4, how it was answered, every enrichment lookup, counter-scans and browser fingerprints. Uncapped; filters are optional. Claim e-mails are never exported.</p></div></div>
 <form class="filters card" method="get" action="/admin/export/download">
-  <label>Format <select name="format"><option value="csv">CSV</option><option value="jsonl">Timesketch JSONL</option><option value="parquet">Parquet</option></select></label>
+  <label>Format <select name="format"><option value="parquet">Parquet (typed)</option><option value="csv">CSV (Timesketch)</option><option value="jsonl">Timesketch JSONL</option></select></label>
+  <label>Content <select name="mode"><option value="full">Everything</option><option value="redistributable">Redistributable: without GeoIP and API results</option></select></label>
   <label>From (UTC) <input name="from" type="datetime-local"></label>
   <label>To (UTC) <input name="to" type="datetime-local"></label>
   <label>IP <input name="ip"></label>
@@ -12,8 +13,5 @@
   <label>Min severity <input name="min_severity" type="number" min="0" max="4"></label>
   <button class="btn btn-primary" type="submit">Download</button>
 </form>
-<section class="card"><h2>Enrichment results</h2>
-  <p class="muted">What each provider (GeoIP, Tor exit list, AbuseIPDB, Shodan, InternetDB, GreyNoise) said about each IP, with the time (UTC), the data version and the node that looked it up. JSON Lines.</p>
-  <p><a class="btn" href="/admin/export/intel">Newest results</a> <span class="muted small">one row per IP, provider and node, up to 100 000 rows</span></p>
-  <p><a class="btn" href="/admin/export/intel?history=1">Full lookup history</a> <span class="muted small">every lookup, oldest first, uncapped</span></p></section>
+<p class="muted small">A label or severity filter leaves out the requests not recorded in full (they have neither). The <code>weight</code> column says how many answered requests each row stands for; the weights of any export add up to the requests answered. Redistributable leaves out the results of providers whose terms forbid passing them on (all but the Tor exit list), including the GeoIP columns.</p>
 {% endblock %}

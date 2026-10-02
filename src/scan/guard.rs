@@ -331,6 +331,7 @@ mod tests {
             scan_level: level,
             is_fp_claim: false,
             page_token: None,
+            ..Default::default()
         }
     }
 

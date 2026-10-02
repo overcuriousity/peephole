@@ -3,6 +3,7 @@ pub mod browse;
 pub mod cli;
 pub mod data;
 pub mod delete;
+pub mod export;
 pub mod fingerprints;
 pub mod inspect;
 pub mod maintenance;
@@ -45,6 +46,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0019_read_models.sql"),
     include_str!("migrations/0020_sessions.sql"),
     include_str!("migrations/0021_intel_history.sql"),
+    include_str!("migrations/0022_dataset.sql"),
 ];
 
 #[derive(Clone)]
@@ -400,136 +402,6 @@ impl Store {
             distinct_paths_1h: (paths + i64::from(!seen)) as u32,
             requests_1h: (reqs + 1) as u32,
         })
-    }
-}
-
-/// Position after the last exported row: `(ts, id)`.
-pub type ExportCursor = (String, i64);
-
-impl Store {
-    /// One page of the export: up to `limit` requests matching `f` after
-    /// `after`, oldest first (by `ts`, then id). Keyset paging: each page is
-    /// a short read, so an export of any size never holds one long read
-    /// transaction (which would stop WAL checkpoints) or the whole result
-    /// in memory.
-    pub async fn export_page(
-        &self,
-        f: &crate::export::ExportFilter,
-        after: Option<&ExportCursor>,
-        limit: i64,
-    ) -> anyhow::Result<Vec<(crate::export::ExportRow, ExportCursor)>> {
-        let mut sql = String::from(
-            "SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.severity, r.scan_level,
-                    r.labels_json, i.country, i.asn, i.asn_org, i.is_tor_exit
-             FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1",
-        );
-        if after.is_some() {
-            // A row value, so the (ts, rowid) index serves the range.
-            sql.push_str(" AND (r.ts, r.id) > (?, ?)");
-        }
-        if f.from.is_some() {
-            sql.push_str(" AND r.ts >= ?");
-        }
-        if f.to.is_some() {
-            sql.push_str(" AND r.ts <= ?");
-        }
-        if f.ip.is_some() {
-            sql.push_str(" AND i.ip = ?");
-        }
-        if f.label.is_some() {
-            // Exact label match via json_each, matching the admin search
-            // (a LIKE on the raw JSON would treat %/_ as wildcards and could
-            // match a label as a substring of another).
-            sql.push_str(
-                " AND EXISTS (SELECT 1 FROM json_each(r.labels_json) je WHERE je.value = ?)",
-            );
-        }
-        if f.min_severity.is_some() {
-            sql.push_str(" AND r.severity >= ?");
-        }
-        sql.push_str(" ORDER BY r.ts, r.id LIMIT ?");
-        type Row = (
-            i64,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            i64,
-            i64,
-            String,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            bool,
-        );
-        let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()));
-        if let Some((ts, id)) = after {
-            q = q.bind(ts).bind(id);
-        }
-        for v in [&f.from, &f.to, &f.ip, &f.label].into_iter().flatten() {
-            q = q.bind(v);
-        }
-        if let Some(v) = f.min_severity {
-            q = q.bind(v);
-        }
-        let rows = q.bind(limit).fetch_all(&self.read).await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(
-                    id,
-                    ts,
-                    ip,
-                    method,
-                    path,
-                    query,
-                    severity,
-                    scan_level,
-                    labels_json,
-                    country,
-                    asn,
-                    asn_org,
-                    is_tor,
-                )| {
-                    let cursor = (ts.clone(), id);
-                    (
-                        crate::export::ExportRow {
-                            ts,
-                            ip,
-                            method,
-                            path,
-                            query,
-                            severity,
-                            scan_level,
-                            labels: serde_json::from_str(&labels_json).unwrap_or_default(),
-                            country,
-                            asn,
-                            asn_org,
-                            is_tor,
-                        },
-                        cursor,
-                    )
-                },
-            )
-            .collect())
-    }
-
-    /// Every request matching `f`, oldest first (tests and small exports).
-    pub async fn export_requests(
-        &self,
-        f: &crate::export::ExportFilter,
-    ) -> anyhow::Result<Vec<crate::export::ExportRow>> {
-        let mut out = vec![];
-        let mut after = None;
-        loop {
-            let page = self.export_page(f, after.as_ref(), 10_000).await?;
-            let Some((_, last)) = page.last() else {
-                return Ok(out);
-            };
-            after = Some(last.clone());
-            out.extend(page.into_iter().map(|(r, _)| r));
-        }
     }
 }
 

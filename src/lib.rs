@@ -457,7 +457,7 @@ impl RoleRunner {
         // Loaded on every start, so edited rules apply when the role is
         // switched off and on.
         let classifier = classify::Classifier::from_dir(dir).context("loading rules")?;
-        let app = trap::router(Arc::new(trap::TrapState {
+        let state = Arc::new(trap::TrapState {
             store: self.store.clone(),
             recorder: self.recorder.clone(),
             cfg: self.cfg.clone(),
@@ -468,15 +468,49 @@ impl RoleRunner {
             helper_rate: Default::default(),
             pace: self.settings.pace.clone(),
             guards: Default::default(),
-        }));
+        });
+        let app = trap::router(state.clone());
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding trap listener {addr}"))?;
         info!(%addr, "trap listener up");
+        let trusted = Arc::new(self.cfg.trusted_proxies.clone());
+        let (tls_listener, tls) = match self.cfg.trap_tls_listen {
+            Some(a) => {
+                let tls = trap::listen::trap_tls_config(
+                    self.cfg.trap_tls_cert.as_deref(),
+                    self.cfg.trap_tls_key.as_deref(),
+                )
+                .context("trap TLS certificate")?;
+                let l = tokio::net::TcpListener::bind(a)
+                    .await
+                    .with_context(|| format!("binding trap TLS listener {a}"))?;
+                info!(addr = %a, "trap TLS listener up");
+                (Some(l), Some(tls))
+            }
+            None => (None, None),
+        };
         let (stop, rx) = tokio::sync::watch::channel(false);
         Ok(Running {
             stop,
-            task: tokio::spawn(serve_trap(listener, app, rx)),
+            task: tokio::spawn(async move {
+                let rx_tls = rx.clone();
+                tokio::join!(
+                    trap::listen::serve_trap(
+                        listener,
+                        app.clone(),
+                        None,
+                        trusted.clone(),
+                        rx.clone()
+                    ),
+                    async move {
+                        if let Some(l) = tls_listener {
+                            trap::listen::serve_trap(l, app, tls, trusted, rx_tls).await;
+                        }
+                    },
+                    trap::flush_skips(state, rx)
+                );
+            }),
         })
     }
 
@@ -602,79 +636,6 @@ async fn run_retention(
                 break;
             }
         }
-    }
-}
-
-/// Serve the public trap listener with slowloris protection: a per-connection
-/// header-read timeout and overall deadline (hyper on its own disables its
-/// default header timeout when no timer is installed), plus a cap on concurrent
-/// connections that sheds load rather than exhausting file descriptors/tasks.
-/// The direct peer address is injected as `ConnectInfo` for the handlers.
-async fn serve_trap(
-    listener: tokio::net::TcpListener,
-    app: axum::Router,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
-    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-    use hyper_util::server::conn::auto;
-    use std::time::Duration;
-    use tower::ServiceExt;
-
-    // Bound simultaneous connections; excess are dropped (load shedding).
-    const MAX_CONNS: usize = 2048;
-    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
-    loop {
-        let (stream, peer) = tokio::select! {
-            r = listener.accept() => match r {
-                Ok(v) => v,
-                Err(e) => { warn!(?e, "trap accept failed"); continue; }
-            },
-            _ = shutdown.changed() => break,
-        };
-        let Ok(permit) = sem.clone().try_acquire_owned() else {
-            // At the connection cap: drop this one instead of piling up.
-            continue;
-        };
-        let app = app.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let service =
-                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                    let app = app.clone();
-                    async move {
-                        let (mut parts, body) = req.into_parts();
-                        parts.extensions.insert(axum::extract::ConnectInfo(peer));
-                        let req = hyper::Request::from_parts(parts, axum::body::Body::new(body));
-                        app.oneshot(req).await
-                    }
-                });
-            let mut builder = auto::Builder::new(TokioExecutor::new());
-            // Request heads must fit in 64 KiB (hyper's default allows
-            // ~400 KB) and 100 headers; HTTP/2 gets the same bounds plus a
-            // cap on parallel streams and an idle ping deadline.
-            builder
-                .http1()
-                .timer(TokioTimer::new())
-                .header_read_timeout(Duration::from_secs(15))
-                .max_buf_size(64 * 1024)
-                .max_headers(100);
-            builder
-                .http2()
-                .timer(TokioTimer::new())
-                .max_concurrent_streams(32)
-                .max_header_list_size(64 * 1024)
-                .max_pending_accept_reset_streams(16)
-                .keep_alive_interval(Duration::from_secs(30))
-                .keep_alive_timeout(Duration::from_secs(15));
-            let io = TokioIo::new(stream);
-            // Overall per-connection deadline bounds slow bodies and keep-alive
-            // trickling as well as slow headers.
-            let _ = tokio::time::timeout(
-                Duration::from_secs(120),
-                builder.serve_connection_with_upgrades(io, service),
-            )
-            .await;
-        });
     }
 }
 

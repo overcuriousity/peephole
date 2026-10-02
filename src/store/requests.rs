@@ -3,6 +3,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::net::IpAddr;
 
+#[derive(Default)]
 pub struct NewRequest {
     pub ip_id: i64,
     pub method: String,
@@ -15,6 +16,15 @@ pub struct NewRequest {
     pub scan_level: i64,
     pub is_fp_claim: bool,
     pub page_token: Option<String>,
+    /// Dataset fields; see `cluster::record::RequestRec`.
+    pub answer: Option<String>,
+    pub status: Option<i64>,
+    pub unrecorded: Option<i64>,
+    pub transport: Option<String>,
+    pub via_proxy: Option<bool>,
+    pub raw_head: Option<Vec<u8>>,
+    pub tls_client_hello: Option<Vec<u8>>,
+    pub ja4: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -49,6 +59,12 @@ pub struct RequestRow {
     pub scan_level: i64,
     pub is_fp_claim: bool,
     pub page_token: Option<String>,
+    pub answer: Option<String>,
+    pub status: Option<i64>,
+    pub unrecorded: Option<i64>,
+    pub transport: Option<String>,
+    pub via_proxy: Option<bool>,
+    pub ja4: Option<String>,
 }
 
 /// Distinct refresh intervals; later lookups reuse the last one (over
@@ -471,6 +487,7 @@ mod tests {
             scan_level: 0,
             is_fp_claim: false,
             page_token: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -519,6 +536,7 @@ mod tests {
                 scan_level: 2,
                 is_fp_claim: false,
                 page_token: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -544,6 +562,7 @@ mod tests {
                 scan_level: 0,
                 is_fp_claim: true,
                 page_token: None,
+                ..Default::default()
             })
             .await
             .unwrap();

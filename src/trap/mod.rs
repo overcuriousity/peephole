@@ -1,7 +1,12 @@
 mod config;
 mod decoy;
 mod flood;
+pub mod listen;
 mod pages;
+pub mod proxy_proto;
+pub mod raw_head;
+pub mod skiplog;
+pub mod tls_hello;
 
 pub use config::TrapConfig;
 
@@ -67,6 +72,45 @@ pub struct Guards {
     flood: flood::FloodGate,
     /// Intel results recorded moments ago.
     intel: flood::IntelCache,
+    /// Light rows of the requests the flood gate skips.
+    pub skips: skiplog::SkipLog,
+}
+
+/// Write a batch of light rows; a failure is logged, the requests were
+/// answered either way.
+async fn write_skips(state: &TrapState, b: skiplog::Batch) {
+    let ip = b.ip.to_string();
+    if let Err(e) = state
+        .recorder
+        .insert_skip_batch(&ip, b.dropped, b.rows)
+        .await
+    {
+        warn!(%ip, error = %e, "trap: recording skipped requests failed");
+    }
+}
+
+/// Write the light rows that have waited long enough, every few seconds,
+/// until `shutdown`.
+pub async fn flush_skips(state: Arc<TrapState>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = shutdown.changed() => {
+                // Nothing buffered is lost on a clean stop.
+                for b in state.guards.skips.take_older(Duration::ZERO, Instant::now()) {
+                    write_skips(&state, b).await;
+                }
+                return;
+            }
+        }
+        for b in state
+            .guards
+            .skips
+            .take_older(Duration::from_secs(10), Instant::now())
+        {
+            write_skips(&state, b).await;
+        }
+    }
 }
 
 /// Minimal fixed-window rate limiter. Bounded in size so an attacker rotating
@@ -162,8 +206,8 @@ fn parse_xff_entry(s: &str) -> Option<IpAddr> {
 /// header right-to-left, stepping over each hop that is itself trusted; the
 /// first address that is not a trusted proxy is the real client. Taking the
 /// first (leftmost) entry, or a single fixed position, lets a client forge its
-/// address — HAProxy's `option forwardfor` appends rather than replaces, so a
-/// client-supplied entry survives. Addresses are canonicalised so an
+/// address — a proxy that appends rather than replaces keeps a
+/// client-supplied entry. Addresses are canonicalised so an
 /// IPv4-mapped IPv6 hop matches IPv4 trust CIDRs. All `x-forwarded-for` header
 /// lines are considered, newest last, and values are parsed from raw bytes so
 /// a non-ASCII byte cannot blank the header and pin everything on the proxy.
@@ -256,6 +300,44 @@ struct Capture<'a> {
     body: Option<Vec<u8>>,
     is_fp_claim: bool,
     page_token: String,
+    /// How the request is answered: `not-found`, `decoy:<name>`, `claim`.
+    answer: String,
+    status: u16,
+    /// Requests from this IP answered but not recorded since its last
+    /// recorded one.
+    unrecorded: u64,
+    /// What the connection showed (None when served without the trap's
+    /// listeners, as in some tests).
+    conn: Option<ConnCapture>,
+}
+
+/// The connection-level part of a capture.
+struct ConnCapture {
+    transport: &'static str,
+    via_proxy: bool,
+    raw_head: Option<Vec<u8>>,
+    client_hello: Option<Vec<u8>>,
+    ja4: Option<String>,
+}
+
+impl ConnCapture {
+    fn of(meta: &listen::ConnMeta, version: Version) -> Self {
+        // HTTP/2 has no text head; for HTTP/1 the connection carries one
+        // request, so its first bytes are this request's head.
+        let raw_head = (version < Version::HTTP_2)
+            .then(|| {
+                let b = meta.head.lock().unwrap_or_else(|p| p.into_inner());
+                raw_head::head_of(&b).map(<[u8]>::to_vec)
+            })
+            .flatten();
+        Self {
+            transport: meta.transport,
+            via_proxy: meta.via_proxy,
+            raw_head,
+            client_hello: meta.client_hello.as_ref().map(|h| h.to_vec()),
+            ja4: meta.ja4.clone(),
+        }
+    }
 }
 
 /// What the trap stored for one request.
@@ -365,6 +447,14 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 scan_level: verdict.scan_level as i64,
                 is_fp_claim: c.is_fp_claim,
                 page_token: Some(c.page_token),
+                answer: Some(c.answer),
+                status: Some(i64::from(c.status)),
+                unrecorded: (c.unrecorded > 0).then_some(c.unrecorded as i64),
+                transport: c.conn.as_ref().map(|k| k.transport.to_string()),
+                via_proxy: c.conn.as_ref().map(|k| k.via_proxy),
+                raw_head: c.conn.as_ref().and_then(|k| k.raw_head.clone()),
+                tls_client_hello: c.conn.as_ref().and_then(|k| k.client_hello.clone()),
+                ja4: c.conn.as_ref().and_then(|k| k.ja4.clone()),
             },
         )
         .await?;
@@ -427,8 +517,8 @@ fn header_pairs(h: &HeaderMap) -> Vec<(String, String)> {
 /// proxy, the proxy's), `:authority` (the host of an absolute-form target
 /// such as an open-proxy probe, or HTTP/2's authority), `:body-truncated`
 /// (bytes received when the stored body is not the whole body; the declared
-/// length is in `content-length`) and `:unrecorded` (requests from this IP
-/// answered but not recorded since its previous recorded one).
+/// length is in `content-length`). Rows recorded before the `unrecorded`
+/// column existed carry that count as `:unrecorded`.
 async fn trap_handler(
     State(state): State<Arc<TrapState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -440,12 +530,37 @@ async fn trap_handler(
     let page_token = uuid::Uuid::new_v4().to_string();
     let method = parts.method.as_str();
     let path = parts.uri.path();
+    // Decided before recording, so the row says what was sent.
+    let decoy = if state.cfg.trap.decoys {
+        decoy::decoy(method, path, &page_token.replace('-', "")[..12])
+    } else {
+        None
+    };
+    let (answer, status) = match &decoy {
+        Some(d) => (format!("decoy:{}", d.name), 200),
+        None => ("not-found".to_string(), 404),
+    };
 
     match state.guards.flood.admit(ip, &state.cfg.trap) {
         flood::Admission::Skip => {
-            debug!(%ip, "trap: over the recording rate; answered, not recorded");
+            debug!(%ip, "trap: over the recording rate; answered, light row only");
+            let full = state.guards.skips.note(
+                ip,
+                chrono::Utc::now().timestamp_millis(),
+                method,
+                path,
+                state.cfg.trap.skip_log_rate,
+                Instant::now(),
+            );
+            if let Some(b) = full {
+                write_skips(&state, b).await;
+            }
         }
         flood::Admission::Record { unrecorded } => {
+            // The light rows before it go first, so they precede it in time.
+            if let Some(b) = state.guards.skips.take(ip) {
+                write_skips(&state, b).await;
+            }
             let mut raw = vec![(":version".to_string(), format!("{:?}", parts.version))];
             let authority = parts.uri.authority().map(|a| a.as_str());
             if let Some(a) = authority {
@@ -453,9 +568,6 @@ async fn trap_handler(
             }
             if let Some(n) = received {
                 raw.push((":body-truncated".into(), n.to_string()));
-            }
-            if unrecorded > 0 {
-                raw.push((":unrecorded".into(), unrecorded.to_string()));
             }
             raw.extend(header_pairs(&parts.headers));
             // HTTP/2 always names the authority; in HTTP/1 only a client
@@ -477,6 +589,13 @@ async fn trap_handler(
                 body: (!body.is_empty()).then(|| body.clone()),
                 is_fp_claim: false,
                 page_token: page_token.clone(),
+                answer,
+                status,
+                unrecorded,
+                conn: parts
+                    .extensions
+                    .get::<listen::ConnMeta>()
+                    .map(|m| ConnCapture::of(m, parts.version)),
             };
             if let Err(e) = record(&state, capture).await {
                 // Answer as always: an error page would tell a scanner it
@@ -485,9 +604,7 @@ async fn trap_handler(
             }
         }
     }
-    if state.cfg.trap.decoys
-        && let Some(d) = decoy::decoy(method, path, &page_token.replace('-', "")[..12])
-    {
+    if let Some(d) = decoy {
         return (
             StatusCode::OK,
             [(header::CONTENT_TYPE, d.content_type)],
@@ -510,6 +627,8 @@ pub struct ClaimForm {
 async fn claim_handler(
     State(state): State<Arc<TrapState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    version: Version,
+    meta: Option<axum::Extension<listen::ConnMeta>>,
     headers: HeaderMap,
     Form(form): Form<ClaimForm>,
 ) -> impl IntoResponse {
@@ -538,6 +657,10 @@ async fn claim_handler(
         body: None,
         is_fp_claim: true,
         page_token: uuid::Uuid::new_v4().to_string(),
+        answer: "claim".into(),
+        status: 200,
+        unrecorded: 0,
+        conn: meta.map(|m| ConnCapture::of(&m, version)),
     };
     if let Ok(rec) = record(&state, capture).await {
         let email = form.email.filter(|e| !e.trim().is_empty());
@@ -776,7 +899,7 @@ mod tests {
 
     #[test]
     fn multiple_header_lines_are_joined_newest_last() {
-        // HAProxy/nginx may emit several XFF lines; the last entry overall wins.
+        // A proxy may emit several XFF lines; the last entry overall wins.
         let ip = client_ip(
             &hm(&["9.9.9.9", "203.0.113.42"]),
             "10.0.0.1".parse().unwrap(),

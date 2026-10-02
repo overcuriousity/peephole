@@ -743,6 +743,7 @@ async fn a_uid_not_bound_to_its_origin_is_rejected() {
             scan_level: 0,
             is_fp_claim: false,
             page_token: None,
+            ..Default::default()
         })
     };
     let a_uid = format!("{}one", a_id.id.uid_prefix());
@@ -989,6 +990,7 @@ fn new_request(ip_id: i64, path: &str) -> NewRequest {
         scan_level: 3,
         is_fp_claim: false,
         page_token: Some("tok-1".into()),
+        ..Default::default()
     }
 }
 
@@ -2883,15 +2885,21 @@ async fn api_lookup_history_replicates_and_follows_blocks() {
     };
     assert_eq!(score(&nb).await, Some(77));
     let (admin, base) = admin_on(&nb).await;
-    let body = text(&admin, format!("{base}/admin/export/intel?history=1")).await;
-    let lines: Vec<serde_json::Value> = body
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
+    let body = text(&admin, format!("{base}/admin/export/download?format=jsonl")).await;
+    let row: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+    let lookups: Vec<&serde_json::Value> = row["intel"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["provider"] == "abuseipdb")
         .collect();
-    assert_eq!(lines.len(), 2, "{body}");
-    assert_eq!(lines[0]["node"], "node-alpha");
+    assert_eq!(lookups.len(), 2, "{body}");
+    assert_eq!(lookups[0]["node"], "node-alpha");
     assert!(
-        lines[0]["fetched_at"].as_str().unwrap().ends_with("+00:00"),
+        lookups[0]["fetched_at"]
+            .as_str()
+            .unwrap()
+            .ends_with("+00:00"),
         "{body}"
     );
     let html = text(&admin, format!("{base}/ips?tag=abuseipdb:SSH&min_abuse=50")).await;
@@ -2965,7 +2973,7 @@ async fn a_geo_only_write_leaves_tor_alone() {
     assert!(tor(&nb).await, "a's Tor result still shows");
 }
 
-/// Enrichment results can be exported with their provenance.
+/// Enrichment results go out with each request, with their provenance.
 #[tokio::test]
 async fn enrichment_results_are_exported_with_provenance() {
     let (ia, a) = new_node("node-alpha");
@@ -2995,21 +3003,31 @@ async fn enrichment_results_are_exported_with_provenance() {
     .await
     .unwrap();
     let (admin, base) = admin_on(&na).await;
-    let body = text(&admin, format!("{base}/admin/export/intel")).await;
+    let body = text(&admin, format!("{base}/admin/export/download?format=jsonl")).await;
     assert_eq!(body.lines().count(), 1, "{body}");
-    let line: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
-    assert_eq!(line["ip"], "203.0.113.91");
-    assert_eq!(line["provider"], "maxmind-geolite2");
-    assert_eq!(line["source_version"], "2026-09-30");
-    assert_eq!(line["node"], "node-bravo");
-    assert_eq!(line["data"]["country"], "NL");
+    let row: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+    assert_eq!(row["ip"], "203.0.113.91");
+    assert_eq!(row["node"], "node-bravo");
+    let geo = row["intel"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["provider"] == "maxmind-geolite2")
+        .unwrap();
+    assert_eq!(geo["source_version"], "2026-09-30");
+    assert_eq!(geo["node"], "node-bravo");
+    assert_eq!(geo["data"]["country"], "NL");
+    assert!(
+        !body.contains("198.51.100.7"),
+        "results without a request stay out"
+    );
     // Not public.
     let anon = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
     let r = anon
-        .get(format!("{base}/admin/export/intel"))
+        .get(format!("{base}/admin/export/download?format=jsonl"))
         .send()
         .await
         .unwrap();

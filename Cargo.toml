@@ -33,7 +33,7 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "http1", "h
 ipnet = { version = "2", features = ["serde"] }
 maxminddb = "0.32"
 # Only the Arrow writer/reader; the export is uncompressed, so no codecs.
-parquet = { version = "60", default-features = false, features = ["arrow"] }
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 quick-xml = "0.42"
 rand = "0.10"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }

@@ -449,7 +449,7 @@ impl Arbiter {
 const SCANNER_PRESENT: Duration = Duration::from_secs(300);
 
 /// Heartbeats this recent count a scanner as alive for takeover decisions.
-const LIVE_WINDOW: Duration = Duration::from_secs(45);
+pub(crate) const LIVE_WINDOW: Duration = Duration::from_secs(45);
 
 /// Adopt queued jobs of arbiters silent for `cluster.takeover_hours`.
 /// Only the lowest-keyed live scanner adopts, so takeovers rarely collide.

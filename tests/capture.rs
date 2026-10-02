@@ -164,8 +164,18 @@ async fn a_flood_from_one_ip_is_answered_but_sampled() {
     }
     // 3 within the burst, then 1 in 5 of the 10 over it.
     assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 5);
+    let n: Option<i64> =
+        sqlx::query_scalar("SELECT unrecorded FROM requests ORDER BY id DESC LIMIT 1")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(n, Some(4));
     let h = last_headers(&store).await;
-    assert_eq!(header(&h, ":unrecorded"), Some("4"));
+    assert_eq!(
+        header(&h, ":unrecorded"),
+        None,
+        "a column now, not a header"
+    );
     // Another address is not held back by it.
     client
         .get(format!("{base}/other"))
@@ -368,5 +378,390 @@ async fn a_failed_write_still_gets_the_trap_page() {
             .unwrap()
             .contains("route which does not exist")
     );
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 0);
+}
+
+#[tokio::test]
+async fn answer_and_status_are_recorded() {
+    let (base, store, _dir) = spawn("[trap]\ndecoys = true\n").await;
+    let client = reqwest::Client::new();
+    for p in ["/.env", "/nothing", "/wp-login.php"] {
+        client.get(format!("{base}{p}")).send().await.unwrap();
+    }
+    client
+        .post(format!("{base}/wp-login.php"))
+        .form(&[("log", "a"), ("pwd", "b")])
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/claim"))
+        .form(&[("email", "")])
+        .send()
+        .await
+        .unwrap();
+    let rows: Vec<(Option<String>, Option<i64>)> =
+        sqlx::query_as("SELECT answer, status FROM requests ORDER BY id")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (Some("decoy:dotenv".into()), Some(200)),
+            (Some("not-found".into()), Some(404)),
+            (Some("decoy:wp-login".into()), Some(200)),
+            (Some("decoy:wp-login-failed".into()), Some(200)),
+            (Some("claim".into()), Some(200)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn every_answered_request_is_a_row_a_light_row_or_counted() {
+    let (base, store, _dir) =
+        spawn("[trap]\nrecord_rate = 1\nrecord_burst = 1\nsample_every = 0\nskip_log_rate = 5\n")
+            .await;
+    let client = reqwest::Client::new();
+    let send = |i: usize| {
+        client
+            .get(format!("{base}/p{i}"))
+            .header("x-forwarded-for", "203.0.113.9")
+            .send()
+    };
+    for i in 0..50 {
+        assert_eq!(send(i).await.unwrap().status(), 404);
+    }
+    // A token again: this one is recorded and writes the pending batch.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    send(50).await.unwrap();
+    let full = count(&store, "SELECT COUNT(*) FROM requests").await;
+    let light = count(&store, "SELECT COUNT(*) FROM skipped_requests").await;
+    let dropped = count(
+        &store,
+        "SELECT COALESCE(SUM(dropped), 0) FROM skipped_batches",
+    )
+    .await;
+    assert_eq!(full, 2);
+    assert!(light >= 5, "light rows: {light}");
+    assert_eq!(full + light + dropped, 51);
+    let paths: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM skipped_requests ORDER BY ts_ms LIMIT 2")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(paths, ["/p1", "/p2"]);
+    let unrecorded: Option<i64> =
+        sqlx::query_scalar("SELECT unrecorded FROM requests ORDER BY id DESC LIMIT 1")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(unrecorded, Some(light + dropped));
+}
+
+/// Accepts any server certificate (the trap's is self-signed).
+#[derive(Debug)]
+struct AnyCert;
+
+impl rustls::client::danger::ServerCertVerifier for AnyCert {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn tls_client() -> tokio_rustls::TlsConnector {
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AnyCert))
+    .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(cfg))
+}
+
+/// Both trap listeners as the binary runs them: plain and TLS, with
+/// `trusted` as trusted_proxies. Returns (plain addr, tls addr, store).
+async fn spawn_listeners(
+    trusted: &str,
+) -> (
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    Store,
+    tempfile::TempDir,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_text = format!(
+        r#"
+trap_listen = "127.0.0.1:0"
+trap_tls_listen = "127.0.0.1:0"
+database_path = "{db}"
+data_dir = "{d}"
+rules_dir = "rules"
+trusted_proxies = [{trusted}]
+[roles]
+web = false
+"#,
+        db = dir.path().join("t.db").display(),
+        d = dir.path().display()
+    );
+    let cfg_path = dir.path().join("c.toml");
+    std::fs::write(&cfg_path, cfg_text).unwrap();
+    let cfg = Config::load(&cfg_path).unwrap();
+    let store = Store::connect(&cfg.database_path).await.unwrap();
+    let trusted = Arc::new(cfg.trusted_proxies.clone());
+    let app = trap::router(Arc::new(TrapState::for_test(store.clone(), cfg)));
+    let tls = trap::listen::trap_tls_config(None, None).unwrap();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let plain = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let secure = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (pa, sa) = (plain.local_addr().unwrap(), secure.local_addr().unwrap());
+    tokio::spawn(trap::listen::serve_trap(
+        plain,
+        app.clone(),
+        None,
+        trusted.clone(),
+        rx.clone(),
+    ));
+    tokio::spawn(trap::listen::serve_trap(
+        secure,
+        app,
+        Some(tls),
+        trusted,
+        rx,
+    ));
+    (pa, sa, store, dir, stop)
+}
+
+/// Send a raw HTTP/1.1 request over `io` and read the answer to the end.
+async fn raw_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    io: &mut S,
+    head: &str,
+) -> String {
+    io.write_all(head.as_bytes()).await.unwrap();
+    let mut out = vec![];
+    let _ = io.read_to_end(&mut out).await;
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test]
+async fn https_request_records_ja4_hello_and_raw_head() {
+    let (_p, s, store, _d, _stop) = spawn_listeners("").await;
+    let tcp = tokio::net::TcpStream::connect(s).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("probe.test").unwrap();
+    let mut tls = tls_client().connect(name, tcp).await.unwrap();
+    let head = "GET /x HTTP/1.1\r\nHost: probe.test\r\nX-Mixed-Case: 1\r\n\r\n";
+    let answer = raw_request(&mut tls, head).await;
+    assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+    let (transport, via, ja4, hello, raw): (String, bool, String, Vec<u8>, Vec<u8>) =
+        sqlx::query_as(
+            "SELECT transport, via_proxy, ja4, tls_client_hello, raw_head FROM requests",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(transport, "https");
+    assert!(!via);
+    assert!(ja4.starts_with("t13d"), "{ja4}");
+    assert_eq!(hello[0], 0x16);
+    assert_eq!(raw, head.as_bytes());
+}
+
+#[tokio::test]
+async fn a_proxy_header_from_a_trusted_peer_names_the_client() {
+    let (_p, s, store, _d, _stop) = spawn_listeners(r#""127.0.0.1/32""#).await;
+    let mut tcp = tokio::net::TcpStream::connect(s).await.unwrap();
+    tcp.write_all(b"PROXY TCP4 203.0.113.9 127.0.0.1 5555 443\r\n")
+        .await
+        .unwrap();
+    let name = rustls::pki_types::ServerName::try_from("probe.test").unwrap();
+    let mut tls = tls_client().connect(name, tcp).await.unwrap();
+    raw_request(
+        &mut tls,
+        "GET /p HTTP/1.1\r\nHost: probe.test\r\nX-Forwarded-For: 198.51.100.1\r\n\r\n",
+    )
+    .await;
+    let (ip, via): (String, bool) =
+        sqlx::query_as("SELECT i.ip, r.via_proxy FROM requests r JOIN ips i ON i.id = r.ip_id")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(ip, "203.0.113.9", "the PROXY source, not X-Forwarded-For");
+    assert!(via);
+}
+
+#[tokio::test]
+async fn a_trusted_peer_without_a_proxy_header_is_dropped() {
+    let (_p, s, store, _d, _stop) = spawn_listeners(r#""127.0.0.1/32""#).await;
+    let tcp = tokio::net::TcpStream::connect(s).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("probe.test").unwrap();
+    assert!(tls_client().connect(name, tcp).await.is_err());
+    let mut garbage = tokio::net::TcpStream::connect(s).await.unwrap();
+    garbage.write_all(b"PROXY NONSENSE\r\n").await.unwrap();
+    let mut out = vec![];
+    let _ = garbage.read_to_end(&mut out).await;
+    assert!(out.is_empty());
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 0);
+}
+
+#[tokio::test]
+async fn the_plain_listener_records_the_raw_head() {
+    let (p, _s, store, _d, _stop) = spawn_listeners(r#""127.0.0.1/32""#).await;
+    let mut tcp = tokio::net::TcpStream::connect(p).await.unwrap();
+    let head =
+        "GET /a HTTP/1.1\r\nHost: x\r\nUser-AGENT: Q\r\nX-Forwarded-For: 203.0.113.5\r\n\r\n";
+    let answer = raw_request(&mut tcp, head).await;
+    assert!(
+        answer.contains("onnection: close"),
+        "one request per connection: {answer}"
+    );
+    let (transport, via, raw, ja4): (String, bool, Vec<u8>, Option<String>) =
+        sqlx::query_as("SELECT transport, via_proxy, raw_head, ja4 FROM requests")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!((transport.as_str(), via, ja4), ("http", true, None));
+    assert_eq!(raw, head.as_bytes());
+}
+
+/// The export's weights add up to every answered request, light rows
+/// included, without counting a skipped request twice.
+#[tokio::test]
+async fn export_weights_sum_to_the_requests_answered() {
+    let (base, store, _dir) =
+        spawn("[trap]\nrecord_rate = 1\nrecord_burst = 1\nsample_every = 7\nskip_log_rate = 5\n")
+            .await;
+    let client = reqwest::Client::new();
+    for i in 0..60 {
+        client
+            .get(format!("{base}/w{i}"))
+            .header("x-forwarded-for", "203.0.113.9")
+            .send()
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    client
+        .get(format!("{base}/last"))
+        .header("x-forwarded-for", "203.0.113.9")
+        .send()
+        .await
+        .unwrap();
+    use futures::TryStreamExt;
+    let weights = |f: peephole::export::ExportFilter| {
+        let store = store.clone();
+        async move {
+            let parts: Vec<bytes::Bytes> = peephole::export::stream_requests(
+                store,
+                f,
+                peephole::export::Format::Jsonl,
+                Default::default(),
+            )
+            .try_collect()
+            .await
+            .unwrap();
+            let text: String = parts.iter().map(|b| String::from_utf8_lossy(b)).collect();
+            text.lines()
+                .map(|l| {
+                    serde_json::from_str::<serde_json::Value>(l).unwrap()["weight"]
+                        .as_i64()
+                        .unwrap()
+                })
+                .sum::<i64>()
+        }
+    };
+    assert_eq!(weights(Default::default()).await, 61, "with light rows");
+    // Without light rows (a severity filter), the recorded rows carry them.
+    let f = peephole::export::ExportFilter {
+        min_severity: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(weights(f).await, 61, "recorded rows only");
+}
+
+/// A long flood: full batches of light rows go out on their own, and
+/// nothing is lost across several batches.
+#[tokio::test]
+async fn a_long_flood_fills_several_batches_and_loses_nothing() {
+    let (base, store, _dir) =
+        spawn("[trap]\nrecord_rate = 0.5\nrecord_burst = 1\nsample_every = 0\nskip_log_rate = 0\n")
+            .await;
+    let client = reqwest::Client::new();
+    let n = 2600;
+    for i in 0..n {
+        client
+            .get(format!("{base}/f{i}"))
+            .header("x-forwarded-for", "203.0.113.11")
+            .send()
+            .await
+            .unwrap();
+    }
+    let full = count(&store, "SELECT COUNT(*) FROM requests").await;
+    let light = count(&store, "SELECT COUNT(*) FROM skipped_requests").await;
+    // Two full batches went out while the flood went on.
+    assert!(
+        count(&store, "SELECT COUNT(*) FROM skipped_batches WHERE (SELECT COUNT(*) FROM skipped_requests r WHERE r.batch_id = skipped_batches.id) = 1000").await >= 2
+    );
+    assert!(full + light < n, "the rest waits in memory");
+    // The next recorded request writes the rest first.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    client
+        .get(format!("{base}/after"))
+        .header("x-forwarded-for", "203.0.113.11")
+        .send()
+        .await
+        .unwrap();
+    let full = count(&store, "SELECT COUNT(*) FROM requests").await;
+    let light = count(&store, "SELECT COUNT(*) FROM skipped_requests").await;
+    let dropped = count(&store, "SELECT SUM(dropped) FROM skipped_batches").await;
+    assert_eq!((full, dropped), (2, 0));
+    assert_eq!(full + light, n + 1);
+}
+
+/// A PROXY header that names no client (UNKNOWN, LOCAL) on the TLS listener
+/// is dropped: otherwise the client's own X-Forwarded-For would be believed.
+#[tokio::test]
+async fn a_proxy_header_without_a_client_is_dropped() {
+    let (_p, s, store, _d, _stop) = spawn_listeners(r#""127.0.0.1/32""#).await;
+    let mut tcp = tokio::net::TcpStream::connect(s).await.unwrap();
+    tcp.write_all(b"PROXY UNKNOWN\r\n").await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("probe.test").unwrap();
+    if let Ok(mut tls) = tls_client().connect(name, tcp).await {
+        raw_request(
+            &mut tls,
+            "GET /p HTTP/1.1\r\nHost: probe.test\r\nX-Forwarded-For: 198.51.100.1\r\n\r\n",
+        )
+        .await;
+    }
     assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 0);
 }

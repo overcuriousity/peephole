@@ -687,6 +687,7 @@ mod tests {
             scan_level: 1,
             is_fp_claim: false,
             page_token: None,
+            ..Default::default()
         };
         let a = s.upsert_ip("203.0.113.1".parse().unwrap()).await.unwrap();
         let b = s.upsert_ip("203.0.113.200".parse().unwrap()).await.unwrap();
@@ -853,6 +854,7 @@ mod tests {
                 scan_level: 0,
                 is_fp_claim: false,
                 page_token: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -956,6 +958,7 @@ mod tests {
                 scan_level: 0,
                 is_fp_claim: false,
                 page_token: None,
+                ..Default::default()
             })
             .await
             .unwrap();

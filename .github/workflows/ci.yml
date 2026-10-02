@@ -55,7 +55,7 @@ jobs:
       - name: shellcheck
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck nginx-light
+          sudo apt-get install -y shellcheck nginx-light libnginx-mod-stream
           shellcheck install.sh tests/install-smoke.sh tests/deploy-check.sh tools/package.sh
 
       # deploy/nginx.example.conf equals install.sh's output, nginx -t accepts

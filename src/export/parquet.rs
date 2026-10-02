@@ -1,73 +1,200 @@
-use super::ExportRow;
+//! The export as typed Parquet: real timestamps, lists, binary blobs; the
+//! per-IP JSON columns as text. Footer metadata names the format version,
+//! the mode and the filter.
+use super::{ExportFilter, ExportRow, Mode};
 use anyhow::Result;
-use arrow::array::{BooleanArray, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{
+    ArrayRef, BinaryBuilder, BooleanBuilder, Int64Builder, ListBuilder, StringBuilder,
+    StructBuilder, TimestampMillisecondBuilder,
+};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use parquet::file::metadata::KeyValue;
 use std::sync::{Arc, Mutex};
 
+/// Version of this file layout (`peephole.format_version`).
+pub const FORMAT_VERSION: &str = "1";
+
+fn header_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("value", DataType::Utf8, false),
+    ])
+}
+
 fn schema() -> SchemaRef {
+    let s = |n: &str, null| Field::new(n, DataType::Utf8, null);
+    let i = |n: &str, null| Field::new(n, DataType::Int64, null);
+    let b = |n: &str| Field::new(n, DataType::Binary, true);
+    let flag = |n: &str, null| Field::new(n, DataType::Boolean, null);
     Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Utf8, false),
-        Field::new("ip", DataType::Utf8, false),
-        Field::new("method", DataType::Utf8, false),
-        Field::new("path", DataType::Utf8, false),
-        Field::new("query", DataType::Utf8, true),
-        Field::new("severity", DataType::Int64, false),
-        Field::new("scan_level", DataType::Int64, false),
-        Field::new("labels", DataType::Utf8, false),
-        Field::new("country", DataType::Utf8, true),
-        Field::new("asn", DataType::Int64, true),
-        Field::new("asn_org", DataType::Utf8, true),
-        Field::new("is_tor", DataType::Boolean, false),
+        s("kind", false),
+        s("uid", false),
+        s("node", false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            false,
+        ),
+        s("ip", false),
+        s("method", false),
+        s("path", false),
+        s("query", true),
+        s("http_version", true),
+        s("host", true),
+        s("user_agent", true),
+        Field::new(
+            "headers",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(header_fields()),
+                true,
+            ))),
+            false,
+        ),
+        b("body"),
+        i("body_size", true),
+        i("body_truncated_at", true),
+        s("transport", true),
+        flag("via_proxy", true),
+        b("raw_head"),
+        b("tls_client_hello"),
+        s("ja4", true),
+        s("answer", true),
+        i("status", true),
+        i("unrecorded", false),
+        i("weight", false),
+        Field::new(
+            "labels",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        ),
+        i("severity", true),
+        i("scan_level", true),
+        flag("fp_claim", false),
+        s("country", true),
+        i("asn", true),
+        s("asn_org", true),
+        flag("is_tor", true),
+        s("intel", false),
+        s("scans", false),
+        s("fingerprints", false),
+        s("message", false),
+        s("timestamp_desc", false),
     ]))
 }
 
+fn strs<'a>(it: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
+    let mut b = StringBuilder::new();
+    for v in it {
+        b.append_option(v);
+    }
+    Arc::new(b.finish())
+}
+
+fn ints(it: impl Iterator<Item = Option<i64>>) -> ArrayRef {
+    let mut b = Int64Builder::new();
+    for v in it {
+        b.append_option(v);
+    }
+    Arc::new(b.finish())
+}
+
+fn bools(it: impl Iterator<Item = Option<bool>>) -> ArrayRef {
+    let mut b = BooleanBuilder::new();
+    for v in it {
+        b.append_option(v);
+    }
+    Arc::new(b.finish())
+}
+
+fn bins<'a>(it: impl Iterator<Item = Option<&'a [u8]>>) -> ArrayRef {
+    let mut b = BinaryBuilder::new();
+    for v in it {
+        b.append_option(v);
+    }
+    Arc::new(b.finish())
+}
+
 fn batch(schema: SchemaRef, rows: &[ExportRow]) -> Result<RecordBatch> {
-    Ok(RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.ts.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.ip.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.method.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.query.as_deref()).collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                rows.iter().map(|r| r.severity).collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                rows.iter().map(|r| r.scan_level).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.labels.join(";")).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.country.as_deref())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                rows.iter().map(|r| r.asn).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.asn_org.as_deref())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(BooleanArray::from(
-                rows.iter().map(|r| r.is_tor).collect::<Vec<_>>(),
-            )),
-        ],
-    )?)
+    let mut ts = TimestampMillisecondBuilder::new().with_timezone("UTC");
+    for r in rows {
+        ts.append_value(r.ts_ms);
+    }
+    let mut headers = ListBuilder::new(StructBuilder::from_fields(header_fields(), 0));
+    for r in rows {
+        let st = headers.values();
+        for (n, v) in &r.headers {
+            st.field_builder::<StringBuilder>(0)
+                .expect("name builder")
+                .append_value(n);
+            st.field_builder::<StringBuilder>(1)
+                .expect("value builder")
+                .append_value(v);
+            st.append(true);
+        }
+        headers.append(true);
+    }
+    let mut labels = ListBuilder::new(StringBuilder::new());
+    for r in rows {
+        for l in &r.labels {
+            labels.values().append_value(l);
+        }
+        labels.append(true);
+    }
+    let json = |f: fn(&ExportRow) -> &str| -> ArrayRef {
+        let mut b = StringBuilder::new();
+        for r in rows {
+            b.append_value(f(r));
+        }
+        Arc::new(b.finish())
+    };
+    let columns: Vec<ArrayRef> = vec![
+        strs(rows.iter().map(|r| Some(r.kind))),
+        strs(rows.iter().map(|r| Some(r.uid.as_str()))),
+        strs(rows.iter().map(|r| Some(r.node.as_str()))),
+        Arc::new(ts.finish()),
+        strs(rows.iter().map(|r| Some(r.ip.as_str()))),
+        strs(rows.iter().map(|r| Some(r.method.as_str()))),
+        strs(rows.iter().map(|r| Some(r.path.as_str()))),
+        strs(rows.iter().map(|r| r.query.as_deref())),
+        strs(rows.iter().map(|r| r.http_version.as_deref())),
+        strs(rows.iter().map(|r| r.host.as_deref())),
+        strs(rows.iter().map(|r| r.user_agent.as_deref())),
+        Arc::new(headers.finish()),
+        bins(rows.iter().map(|r| r.body.as_deref())),
+        ints(rows.iter().map(|r| r.body_size)),
+        ints(rows.iter().map(|r| r.body_truncated_at)),
+        strs(rows.iter().map(|r| r.transport.as_deref())),
+        bools(rows.iter().map(|r| r.via_proxy)),
+        bins(rows.iter().map(|r| r.raw_head.as_deref())),
+        bins(rows.iter().map(|r| r.tls_client_hello.as_deref())),
+        strs(rows.iter().map(|r| r.ja4.as_deref())),
+        strs(rows.iter().map(|r| r.answer.as_deref())),
+        ints(rows.iter().map(|r| r.status)),
+        ints(rows.iter().map(|r| Some(r.unrecorded))),
+        ints(rows.iter().map(|r| Some(r.weight))),
+        Arc::new(labels.finish()),
+        ints(rows.iter().map(|r| r.severity)),
+        ints(rows.iter().map(|r| r.scan_level)),
+        bools(rows.iter().map(|r| Some(r.fp_claim))),
+        strs(rows.iter().map(|r| r.country.as_deref())),
+        ints(rows.iter().map(|r| r.asn)),
+        strs(rows.iter().map(|r| r.asn_org.as_deref())),
+        bools(rows.iter().map(|r| r.is_tor)),
+        json(|r| &r.intel),
+        json(|r| &r.scans),
+        json(|r| &r.fingerprints),
+        strs(
+            rows.iter()
+                .map(|r| Some(r.message()))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|m| m.as_deref()),
+        ),
+        strs(rows.iter().map(|r| Some(r.timestamp_desc()))),
+    ];
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 /// Output the writer has produced and the caller has not taken yet.
@@ -105,11 +232,40 @@ pub struct ParquetStream {
 }
 
 impl ParquetStream {
-    pub fn new() -> Result<Self> {
+    pub fn new(filter: &ExportFilter, mode: Mode) -> Result<Self> {
         let out = Pending::default();
         let schema = schema();
+        let meta = vec![
+            KeyValue::new("peephole.format_version".into(), FORMAT_VERSION.to_string()),
+            KeyValue::new(
+                "peephole.version".into(),
+                env!("CARGO_PKG_VERSION").to_string(),
+            ),
+            KeyValue::new(
+                "peephole.exported_at".into(),
+                chrono::Utc::now().to_rfc3339(),
+            ),
+            KeyValue::new(
+                "peephole.mode".into(),
+                match mode {
+                    Mode::Full => "full",
+                    Mode::Redistributable => "redistributable",
+                }
+                .to_string(),
+            ),
+            KeyValue::new(
+                "peephole.filter".into(),
+                serde_json::json!({
+                    "from": filter.from, "to": filter.to, "ip": filter.ip,
+                    "label": filter.label, "min_severity": filter.min_severity,
+                })
+                .to_string(),
+            ),
+        ];
         let props = parquet::file::properties::WriterProperties::builder()
             .set_max_row_group_row_count(Some(super::STREAM_PAGE as usize))
+            .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
+            .set_key_value_metadata(Some(meta))
             .build();
         let writer =
             parquet::arrow::ArrowWriter::try_new(out.clone(), schema.clone(), Some(props))?;
@@ -132,15 +288,4 @@ impl ParquetStream {
         self.writer.close()?;
         Ok(self.out.take())
     }
-}
-
-/// A whole Parquet file in memory (small exports and tests).
-pub fn requests_parquet(rows: &[ExportRow]) -> Result<Vec<u8>> {
-    let mut w = ParquetStream::new()?;
-    let mut out = vec![];
-    for chunk in rows.chunks(super::STREAM_PAGE as usize) {
-        out.extend(w.write(chunk)?);
-    }
-    out.extend(w.finish()?);
-    Ok(out)
 }

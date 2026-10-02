@@ -10,6 +10,14 @@ pub struct Config {
     pub roles: Roles,
     /// Required with the listener role.
     pub trap_listen: Option<SocketAddr>,
+    /// Optional second trap listener for TLS: peephole terminates TLS
+    /// itself, keeping the ClientHello (JA4). Trusted proxies must send a
+    /// PROXY protocol header on it.
+    pub trap_tls_listen: Option<SocketAddr>,
+    /// PEM certificate chain and key for `trap_tls_listen`; without them a
+    /// self-signed certificate is made at start.
+    pub trap_tls_cert: Option<PathBuf>,
+    pub trap_tls_key: Option<PathBuf>,
     /// Required with the web role.
     pub admin_listen: Option<SocketAddr>,
     pub database_path: PathBuf,
@@ -528,6 +536,11 @@ impl Config {
         if !(r.listener || r.scanner || r.web) {
             bail!("[roles]: enable at least one of listener, scanner, web");
         }
+        if self.trap_tls_cert.is_some() != self.trap_tls_key.is_some() {
+            bail!(
+                "trap_tls_cert and trap_tls_key go together (or omit both for a self-signed one)"
+            );
+        }
         if r.listener {
             if self.trap_listen.is_none() {
                 bail!("trap_listen is required with roles.listener");
@@ -837,6 +850,19 @@ rp_name = "x"
         for level in [0, 5, 9, 255] {
             assert_eq!(cfg.default_level_argv(level), None, "level {level}");
         }
+    }
+
+    #[test]
+    fn a_trap_certificate_needs_its_key() {
+        let base = "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n\
+                    rules_dir = \"r\"\n[roles]\nweb = false\n";
+        let cfg: Config = toml::from_str(&format!("trap_tls_cert = \"/c.pem\"\n{base}")).unwrap();
+        assert!(cfg.validate().is_err());
+        let cfg: Config = toml::from_str(&format!(
+            "trap_tls_listen = \"127.0.0.1:2\"\ntrap_tls_cert = \"/c.pem\"\ntrap_tls_key = \"/k.pem\"\n{base}"
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

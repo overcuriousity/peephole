@@ -207,8 +207,13 @@ pub struct QueueMetrics {
 pub struct Recommendation {
     /// Jobs queued per hour, averaged over the observed window.
     pub arrival_per_hour: f64,
-    /// Jobs the current pace can finish per hour.
+    /// Jobs the cluster's scanners can finish per hour at their current
+    /// paces (this node's and the other live scanners').
     pub capacity_per_hour: f64,
+    /// This node's part of `capacity_per_hour`.
+    pub own_capacity_per_hour: f64,
+    /// Scanners counted in `capacity_per_hour`, this node included.
+    pub scanners: usize,
     /// Positive: the backlog grows by this much per hour.
     pub net_growth_per_hour: f64,
     /// Hours until the backlog is empty at the current pace; None = never.
@@ -239,12 +244,50 @@ pub fn capacity(p: Pace, scan_secs: f64) -> f64 {
     (p.max_scans_per_hour as f64).min(p.max_workers as f64 * 3600.0 / scan_secs.max(1.0))
 }
 
+/// Capacity of the cluster's other live scanners.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Others {
+    pub capacity_per_hour: f64,
+    pub scanners: usize,
+}
+
+/// What the other live scanners of this node's cluster can finish per
+/// hour, from the paces they announce in heartbeats. The queue is shared,
+/// so its arrivals are the cluster's and so must be the capacity.
+pub fn others(node: &crate::cluster::Node, scan_secs: f64) -> Others {
+    let me = node.id();
+    let mut o = Others::default();
+    for id in node.live_members(crate::scan::arbiter::LIVE_WINDOW) {
+        if id == me || node.is_blocked(&id) {
+            continue;
+        }
+        let Some(k) = node.status.known(&id) else {
+            continue;
+        };
+        if !k.hb.roles.iter().any(|r| r == "scanner") {
+            continue;
+        }
+        if let Some(p) = k.hb.pace {
+            let p = Pace {
+                max_workers: p.max_workers as usize,
+                max_scans_per_hour: p.max_scans_per_hour,
+                timeout_secs: p.timeout_secs,
+            };
+            o.capacity_per_hour += capacity(p, scan_secs);
+            o.scanners += 1;
+        }
+    }
+    o
+}
+
 /// Size the pace to absorb arrivals with headroom and drain the backlog
 /// within [`DRAIN_HOURS`], never below one scan per hour and one worker.
 /// When more than [`TIMEOUT_SHARE`] of recent scans hit the limit, the
 /// timeout is raised by half (rounded up to a minute) and the worker count
-/// is sized for scans that may take that long.
-pub fn recommend(m: &QueueMetrics, current: Pace) -> Recommendation {
+/// is sized for scans that may take that long. In a cluster, `others` is
+/// what the other scanners already cover: the recommendation is this
+/// node's share of the rest.
+pub fn recommend(m: &QueueMetrics, current: Pace, others: Others) -> Recommendation {
     let timeout_share = if m.completed_24h > 0 {
         m.timeouts_24h as f64 / m.completed_24h as f64
     } else {
@@ -263,7 +306,8 @@ pub fn recommend(m: &QueueMetrics, current: Pace) -> Recommendation {
     // Timed-out scans would have run longer: budget them at the new limit.
     let scan_secs = measured * (1.0 - timeout_share) + timeout_secs as f64 * timeout_share;
     let arrival = m.arrivals_24h as f64 / m.observed_hours.clamp(1.0, 24.0);
-    let cap_now = capacity(current, measured);
+    let own = capacity(current, measured);
+    let cap_now = own + others.capacity_per_hour;
     let net = arrival - cap_now;
     let drain_hours = match m.backlog {
         0 => Some(0.0),
@@ -271,14 +315,15 @@ pub fn recommend(m: &QueueMetrics, current: Pace) -> Recommendation {
         _ => None,
     };
 
-    let target = (arrival * HEADROOM + m.backlog as f64 / DRAIN_HOURS)
-        .ceil()
-        .max(1.0);
+    let target = (arrival * HEADROOM + m.backlog as f64 / DRAIN_HOURS).ceil();
+    let target = (target - others.capacity_per_hour).ceil().max(1.0);
     let workers = ((target * scan_secs / 3600.0).ceil() as usize).clamp(1, MAX_WORKERS);
     let per_hour = (target as i64).clamp(1, MAX_PER_HOUR);
     Recommendation {
         arrival_per_hour: arrival,
         capacity_per_hour: cap_now,
+        own_capacity_per_hour: own,
+        scanners: others.scanners + 1,
         net_growth_per_hour: net,
         drain_hours,
         scan_secs,
@@ -324,6 +369,41 @@ mod tests {
     };
 
     #[test]
+    fn other_scanners_count_toward_capacity_and_shrink_our_share() {
+        let o = Others {
+            capacity_per_hour: 20.0,
+            scanners: 1,
+        };
+        // 240/day = 10/h arrivals, no backlog, 300 s scans.
+        let r = recommend(&m(0, 240, Some(300.0)), P, o);
+        assert_eq!(r.own_capacity_per_hour, 24.0);
+        assert_eq!(r.capacity_per_hour, 44.0);
+        assert!(r.net_growth_per_hour < 0.0);
+        assert_eq!(r.scanners, 2);
+        // target 10 × 1.25 = 12.5 → 13, minus 20 elsewhere → the minimum.
+        assert_eq!(r.pace.max_scans_per_hour, 1);
+        assert_eq!(r.pace.max_workers, 1);
+    }
+
+    #[test]
+    fn our_share_is_what_the_others_leave() {
+        let o = Others {
+            capacity_per_hour: 5.0,
+            scanners: 1,
+        };
+        // 13/h needed (see above), 5 covered elsewhere → 8 here.
+        let r = recommend(&m(0, 240, Some(300.0)), P, o);
+        assert_eq!(r.pace.max_scans_per_hour, 8);
+    }
+
+    #[test]
+    fn alone_is_unchanged() {
+        let a = recommend(&m(480, 240, Some(300.0)), P, Others::default());
+        assert_eq!(a.capacity_per_hour, 24.0);
+        assert_eq!(a.scanners, 1);
+    }
+
+    #[test]
     fn capacity_is_bounded_by_cap_and_by_workers() {
         assert_eq!(capacity(P, 60.0), 30.0); // workers could do 120/h
         assert_eq!(capacity(P, 600.0), 12.0); // 2 × 6/h
@@ -342,7 +422,7 @@ mod tests {
     #[test]
     fn keeps_up_with_arrivals_and_drains_backlog_in_a_day() {
         // 240 arrivals/day = 10/h; backlog 480 → +20/h; ×1.25 headroom on arrivals.
-        let r = recommend(&m(480, 240, Some(300.0)), P);
+        let r = recommend(&m(480, 240, Some(300.0)), P, Others::default());
         assert_eq!(r.arrival_per_hour, 10.0);
         assert_eq!(r.pace.max_scans_per_hour, 33); // ceil(12.5 + 20)
         assert_eq!(r.pace.max_workers, 3); // 33 × 300s / 3600 = 2.75
@@ -354,7 +434,7 @@ mod tests {
 
     #[test]
     fn growing_queue_never_drains() {
-        let r = recommend(&m(100, 24 * 50, None), P);
+        let r = recommend(&m(100, 24 * 50, None), P, Others::default());
         assert!(r.growing());
         assert_eq!(r.drain_hours, None);
         assert_eq!(r.scan_secs, DEFAULT_SCAN_SECS);
@@ -363,7 +443,7 @@ mod tests {
 
     #[test]
     fn idle_queue_recommends_the_minimum() {
-        let r = recommend(&m(0, 0, None), P);
+        let r = recommend(&m(0, 0, None), P, Others::default());
         assert_eq!(
             r.pace,
             Pace {
@@ -379,12 +459,12 @@ mod tests {
     fn short_observation_window_is_not_diluted() {
         let mut q = m(0, 20, Some(60.0));
         q.observed_hours = 2.0;
-        assert_eq!(recommend(&q, P).arrival_per_hour, 10.0);
+        assert_eq!(recommend(&q, P, Others::default()).arrival_per_hour, 10.0);
     }
 
     #[test]
     fn workers_are_capped() {
-        let r = recommend(&m(0, 24 * 1000, Some(900.0)), P);
+        let r = recommend(&m(0, 24 * 1000, Some(900.0)), P, Others::default());
         assert_eq!(r.pace.max_workers, MAX_WORKERS);
     }
 
@@ -393,7 +473,7 @@ mod tests {
         let mut q = m(0, 24 * 10, Some(300.0));
         q.completed_24h = 20;
         q.timeouts_24h = 5; // 25% hit the 900 s limit
-        let r = recommend(&q, P);
+        let r = recommend(&q, P, Others::default());
         assert_eq!(r.timeout_share, 0.25);
         assert_eq!(r.pace.timeout_secs, 1380); // 1350 rounded up to a minute
         // 75% × 300 s + 25% × 1380 s = 570 s per job; 13/h needs 3 workers.
@@ -401,7 +481,7 @@ mod tests {
         assert_eq!(r.pace.max_workers, 3);
 
         q.timeouts_24h = 1; // 5%: below the threshold
-        assert_eq!(recommend(&q, P).pace.timeout_secs, 900);
+        assert_eq!(recommend(&q, P, Others::default()).pace.timeout_secs, 900);
     }
 
     #[test]

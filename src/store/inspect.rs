@@ -88,10 +88,10 @@ const CLAIM_SELECT: &str = "SELECT c.id, c.ts, i.ip, c.contact_email, c.user_age
 
 const BODY_LIMIT: usize = 16 * 1024;
 /// Upper bound on a decompressed scan's raw nmap XML.
-const MAX_RAW_XML: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_RAW_XML: u64 = 64 * 1024 * 1024;
 
 /// Decompress zstd data, refusing output larger than `limit` (bomb guard).
-fn zstd_decode_capped(data: &[u8], limit: u64) -> Result<Vec<u8>> {
+pub(crate) fn zstd_decode_capped(data: &[u8], limit: u64) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut dec = zstd::stream::Decoder::new(data)?;
     let mut out = Vec::new();
@@ -117,29 +117,7 @@ pub struct IpIntelRow {
 /// Lookups per provider shown on the IP page.
 pub const INTEL_HISTORY_PER_PROVIDER: i64 = 50;
 
-/// `(ip, provider, hlc, fetched_at, source_version, origin, data_json)`.
-pub type IntelLogRow = (String, String, i64, String, Option<String>, Vec<u8>, String);
-/// Where a history page ends: `(fetched_at, ip, provider, hlc)`.
-pub type IntelLogKey = (String, String, String, i64);
-
-/// `(ip, provider, fetched_at, source_version, origin, data_json)`.
-pub type IntelRow = (String, String, String, Option<String>, Vec<u8>, String);
-
 impl Store {
-    /// Enrichment results with the node that looked them up, newest first.
-    /// Only IPs that still have a row (results outlive deleted IPs).
-    pub async fn intel_export(&self, limit: i64) -> Result<Vec<IntelRow>> {
-        Ok(sqlx::query_as(
-            "SELECT ip, provider, fetched_at, source_version, origin, data_json
-             FROM ip_intel
-             WHERE EXISTS (SELECT 1 FROM ips WHERE ips.ip = ip_intel.ip)
-             ORDER BY fetched_at DESC, ip LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(&self.read)
-        .await?)
-    }
-
     /// Every provider's results for one IP from the lookup history, newest
     /// first per provider (at most [`INTEL_HISTORY_PER_PROVIDER`] each), with
     /// the cluster node that looked each one up (None standalone or for a
@@ -166,34 +144,6 @@ impl Store {
         Ok(sqlx::query_scalar(
             "SELECT tag FROM ip_intel_tags GROUP BY tag ORDER BY COUNT(*) DESC, tag LIMIT 300",
         )
-        .fetch_all(&self.read)
-        .await?)
-    }
-
-    /// Every lookup in the history, oldest first, after `after` (keyset
-    /// paging by rowid-free key: `(fetched_at, ip, provider, hlc)`), for
-    /// the full-history export. Only IPs that still have a row.
-    pub async fn intel_log_page(
-        &self,
-        after: Option<&IntelLogKey>,
-        limit: i64,
-    ) -> Result<Vec<IntelLogRow>> {
-        let (f, i, p, h) = match after {
-            Some(k) => (k.0.as_str(), k.1.as_str(), k.2.as_str(), k.3),
-            None => ("", "", "", i64::MIN),
-        };
-        Ok(sqlx::query_as(
-            "SELECT ip, provider, hlc, fetched_at, source_version, origin, data_json
-             FROM ip_intel_log t
-             WHERE (fetched_at, ip, provider, hlc) > (?, ?, ?, ?)
-               AND EXISTS (SELECT 1 FROM ips WHERE ips.ip = t.ip)
-             ORDER BY fetched_at, ip, provider, hlc LIMIT ?",
-        )
-        .bind(f)
-        .bind(i)
-        .bind(p)
-        .bind(h)
-        .bind(limit)
         .fetch_all(&self.read)
         .await?)
     }
@@ -380,6 +330,19 @@ impl Store {
             .collect())
     }
 
+    /// Requests from this IP answered without being recorded in full: light
+    /// rows plus the ones only counted.
+    pub async fn skipped_for_ip(&self, ip_id: i64) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE(SUM(dropped + (SELECT COUNT(*) FROM skipped_requests r
+                                            WHERE r.batch_id = b.id)), 0)
+             FROM skipped_batches b WHERE b.ip_id = ?",
+        )
+        .bind(ip_id)
+        .fetch_one(&self.read)
+        .await?)
+    }
+
     pub async fn claims_for_ip(&self, ip_id: i64) -> Result<Vec<FpClaimRow>> {
         let sql = format!("{CLAIM_SELECT} WHERE c.ip_id = ? ORDER BY c.id DESC");
         Ok(
@@ -504,6 +467,22 @@ mod tests {
     use crate::scan::nmap_xml::{PortResult, ScanResult};
     use crate::store::requests::NewRequest;
 
+    #[tokio::test]
+    async fn skipped_counts_light_rows_and_drops() {
+        let (s, a) = seeded().await;
+        assert_eq!(s.skipped_for_ip(a).await.unwrap(), 0);
+        let row = |ts_ms| crate::cluster::record::SkipRow {
+            ts_ms,
+            method: "GET".into(),
+            path: "/".into(),
+        };
+        s.local()
+            .insert_skip_batch("203.0.113.1", 4, vec![row(1), row(2)])
+            .await
+            .unwrap();
+        assert_eq!(s.skipped_for_ip(a).await.unwrap(), 6);
+    }
+
     async fn seeded() -> (Store, i64) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
@@ -524,6 +503,7 @@ mod tests {
                 scan_level: 3,
                 is_fp_claim: false,
                 page_token: Some("tok".into()),
+                ..Default::default()
             })
             .await
             .unwrap();

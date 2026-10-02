@@ -42,7 +42,6 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/claims/{id}/delete", post(claim_delete))
         .route("/admin/export", get(export_page))
         .route("/admin/export/download", get(export_download))
-        .route("/admin/export/intel", get(export_intel))
         .route("/admin/keys", get(keys))
         .route("/admin/keys/delete", post(key_delete))
 }
@@ -192,6 +191,8 @@ struct PaceView {
     m: QueueMetrics,
     arrival: String,
     capacity: String,
+    /// In a cluster with other live scanners: how the capacity splits.
+    cluster_note: Option<String>,
     net: String,
     drain: String,
     cadence: String,
@@ -260,7 +261,13 @@ async fn pace_view(
 ) -> AppResult<PaceView> {
     let m = st.store.queue_metrics().await?;
     let current = st.pace.get();
-    let r = recommend(&m, current);
+    let scan_secs = m.avg_scan_secs.unwrap_or(pace::DEFAULT_SCAN_SECS);
+    let others = st
+        .recorder
+        .node()
+        .map(|n| pace::others(n, scan_secs))
+        .unwrap_or_default();
+    let r = recommend(&m, current, others);
     Ok(PaceView {
         current,
         rec: r.pace,
@@ -269,6 +276,15 @@ async fn pace_view(
         growing: r.growing(),
         arrival: fmt_rate(r.arrival_per_hour),
         capacity: fmt_rate(r.capacity_per_hour),
+        cluster_note: (others.scanners > 0).then(|| {
+            format!(
+                "{} here + {} from {} other scanner{}",
+                fmt_rate(r.own_capacity_per_hour),
+                fmt_rate(others.capacity_per_hour),
+                others.scanners,
+                if others.scanners == 1 { "" } else { "s" }
+            )
+        }),
         net: format!(
             "{}{}",
             if r.net_growth_per_hour > 0.0 { "+" } else { "" },
@@ -631,89 +647,6 @@ async fn export_page(_u: SessionUser) -> AppResult<Html<String>> {
     render(&ExportPage { chrome: chrome() })
 }
 
-/// Enrichment results as JSON Lines: what each provider said about each
-/// IP, when, from which data version, and which node looked it up.
-/// With `history=1`: every lookup ever recorded, streamed and uncapped.
-async fn export_intel(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Query(q): Query<HashMap<String, String>>,
-) -> AppResult<Response> {
-    let names: HashMap<Vec<u8>, String> = match st.recorder.node() {
-        Some(node) => crate::cluster::members::all(&node.store)
-            .await?
-            .into_iter()
-            .map(|m| (m.id.0.to_vec(), m.name))
-            .collect(),
-        None => HashMap::new(),
-    };
-    if q.get("history").map(String::as_str) == Some("1") {
-        let body = axum::body::Body::from_stream(crate::export::stream_intel_history(
-            st.store.clone(),
-            names,
-        ));
-        return Ok((
-            [
-                (axum::http::header::CONTENT_TYPE, "application/x-ndjson"),
-                (
-                    axum::http::header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"peephole-enrichment-history.jsonl\"",
-                ),
-            ],
-            body,
-        )
-            .into_response());
-    }
-    let mut out = String::new();
-    let mut rows = st.store.intel_export(INTEL_EXPORT_CAP + 1).await?;
-    // Capped: say so (header and a last line) rather than cut silently.
-    let truncated = rows.len() as i64 > INTEL_EXPORT_CAP;
-    rows.truncate(INTEL_EXPORT_CAP as usize);
-    for (ip, provider, fetched_at, source_version, origin, data_json) in rows {
-        let node = match names.get(&origin) {
-            Some(n) => n.clone(),
-            None if origin.is_empty() => "this node".to_string(),
-            None => data_encoding::HEXLOWER.encode(&origin[..origin.len().min(6)]),
-        };
-        let data: serde_json::Value =
-            serde_json::from_str(&data_json).unwrap_or(serde_json::Value::Null);
-        out.push_str(
-            &serde_json::json!({
-                "ip": ip, "provider": provider, "fetched_at": fetched_at,
-                "source_version": source_version, "node": node, "data": data,
-            })
-            .to_string(),
-        );
-        out.push('\n');
-    }
-    if truncated {
-        let marker = serde_json::json!({"truncated": true, "limit": INTEL_EXPORT_CAP});
-        out.push_str(&format!("{marker}\n"));
-    }
-    let mut res = (
-        [
-            (axum::http::header::CONTENT_TYPE, "application/x-ndjson"),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                "attachment; filename=\"peephole-enrichment.jsonl\"",
-            ),
-        ],
-        out,
-    )
-        .into_response();
-    if truncated {
-        res.headers_mut().insert(
-            "x-peephole-truncated",
-            axum::http::HeaderValue::from(INTEL_EXPORT_CAP),
-        );
-    }
-    Ok(res)
-}
-
-/// Newest enrichment results in one intel export (one row per IP, provider
-/// and node, so this is far beyond a typical node's IP count).
-const INTEL_EXPORT_CAP: i64 = 100_000;
-
 async fn export_download(
     _u: SessionUser,
     State(state): State<Arc<AdminState>>,
@@ -735,11 +668,27 @@ async fn export_download(
         Some("parquet") => (Format::Parquet, "parquet", "application/octet-stream"),
         _ => return (StatusCode::BAD_REQUEST, "format must be csv|jsonl|parquet").into_response(),
     };
+    let mode = match q.get("mode").map(String::as_str) {
+        None | Some("" | "full") => crate::export::Mode::Full,
+        Some("redistributable") => crate::export::Mode::Redistributable,
+        _ => return (StatusCode::BAD_REQUEST, "mode must be full|redistributable").into_response(),
+    };
+    let names = match state.recorder.node() {
+        Some(node) => match crate::cluster::members::all(&node.store).await {
+            Ok(m) => m.into_iter().map(|m| (m.id.0.to_vec(), m.name)).collect(),
+            Err(e) => {
+                tracing::warn!(?e, "export: reading member names");
+                HashMap::new()
+            }
+        },
+        None => HashMap::new(),
+    };
     // Streamed, uncapped: rows are read and written page by page.
     let body = axum::body::Body::from_stream(crate::export::stream_requests(
         state.store.clone(),
         filter,
         format,
+        crate::export::ExportOptions { mode, names },
     ));
     (
         [
