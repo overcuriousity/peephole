@@ -31,6 +31,7 @@ pub struct ReqRow {
     pub raw_head: Option<Vec<u8>>,
     pub tls_client_hello: Option<Vec<u8>>,
     pub ja4: Option<String>,
+    pub build: String,
 }
 
 /// A light row with its batch.
@@ -44,6 +45,7 @@ pub struct SkipOut {
     pub ip: String,
     pub uid: String,
     pub origin: Option<Vec<u8>>,
+    pub build: String,
     pub dropped: i64,
     /// The batch's last light row (it carries the batch's drops).
     pub last_in_batch: bool,
@@ -57,6 +59,7 @@ pub struct IntelOut {
     pub source_version: Option<String>,
     pub origin: Vec<u8>,
     pub data_json: String,
+    pub build: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -72,6 +75,7 @@ pub struct ScanOut {
     pub status: Option<String>,
     pub scanner: Option<Vec<u8>>,
     pub origin: Option<Vec<u8>>,
+    pub build: String,
 }
 
 #[derive(sqlx::FromRow, serde::Serialize)]
@@ -89,6 +93,8 @@ pub struct PortOut {
 #[derive(sqlx::FromRow)]
 pub struct FpOut {
     pub request_uid: String,
+    pub origin: Option<Vec<u8>>,
+    pub build: String,
     pub ts: String,
     pub fp_hash: Option<String>,
     pub visitor_id: Option<String>,
@@ -127,7 +133,7 @@ impl Store {
             "SELECT r.id, r.uid, r.origin, r.ts, r.ip_id, i.ip, r.method, r.path, r.query,
                     r.headers_json, r.body, r.labels_json, r.severity, r.scan_level, r.answer,
                     r.status, r.unrecorded, r.transport, r.via_proxy, r.raw_head,
-                    r.tls_client_hello, r.ja4
+                    r.tls_client_hello, r.ja4, r.build
              FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1",
         );
         if after.is_some() {
@@ -176,7 +182,7 @@ impl Store {
     ) -> Result<Vec<SkipOut>> {
         let mut sql = String::from(
             "SELECT s.rowid AS rowid, s.ts_ms, s.method, s.path, b.ip_id, i.ip, b.uid, b.origin,
-                    b.dropped,
+                    b.build, b.dropped,
                     s.rowid = (SELECT MAX(x.rowid) FROM skipped_requests x
                                WHERE x.batch_id = s.batch_id) AS last_in_batch
              FROM skipped_requests s JOIN skipped_batches b ON b.id = s.batch_id
@@ -215,7 +221,7 @@ impl Store {
     ) -> Result<PageContext> {
         let mut c = PageContext::default();
         let intel: Vec<IntelOut> = sqlx::query_as(
-            "SELECT ip, provider, fetched_at, source_version, origin, data_json
+            "SELECT ip, provider, fetched_at, source_version, origin, data_json, build
              FROM ip_intel_log WHERE ip IN (SELECT value FROM json_each(?))
              ORDER BY fetched_at, hlc",
         )
@@ -227,7 +233,7 @@ impl Store {
         }
         let scans: Vec<ScanOut> = sqlx::query_as(
             "SELECT s.id, s.ip_id, s.level, s.started_at, s.finished_at, s.os_guess, s.raw_xml,
-                    j.status, j.scanner, s.origin
+                    j.status, j.scanner, s.origin, s.build
              FROM scans s LEFT JOIN scan_jobs j ON j.id = s.job_id
              WHERE s.ip_id IN (SELECT value FROM json_each(?)) ORDER BY s.id",
         )
@@ -251,7 +257,7 @@ impl Store {
             c.scans.entry(s.ip_id).or_default().push((s, p));
         }
         let fps: Vec<FpOut> = sqlx::query_as(
-            "SELECT request_uid, ts, fp_hash, visitor_id, attributes_json, behavior_summary_json,
+            "SELECT request_uid, origin, build, ts, fp_hash, visitor_id, attributes_json, behavior_summary_json,
                     event_blob
              FROM fingerprints WHERE request_uid IN (SELECT value FROM json_each(?)) ORDER BY id",
         )

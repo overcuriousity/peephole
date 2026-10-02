@@ -986,10 +986,7 @@ data_dir = "/tmp"
     #[test]
     fn retention_defaults_to_keep_everything_and_is_at_least_a_week() {
         let roles = "[roles]\nlistener = false\nweb = false\n";
-        assert_eq!(
-            parse(&format!("{BASE}{roles}")).unwrap().retention_days,
-            0
-        );
+        assert_eq!(parse(&format!("{BASE}{roles}")).unwrap().retention_days, 0);
         for days in [1, 6] {
             let e = parse(&format!("retention_days = {days}\n{BASE}{roles}")).unwrap_err();
             assert!(e.to_string().contains("at least 7"), "{e}");
@@ -1004,7 +1001,10 @@ data_dir = "/tmp"
         let path = dir.path().join("c.toml");
         std::fs::write(&path, BASE).unwrap();
         let notes = optional_key_notes(&path).join("\n");
-        assert!(notes.contains("`retention_days` not set (default 0)"), "{notes}");
+        assert!(
+            notes.contains("`retention_days` not set (default 0)"),
+            "{notes}"
+        );
         assert!(!notes.contains("scan.retention_days"), "{notes}");
     }
 

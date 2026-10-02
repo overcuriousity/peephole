@@ -260,10 +260,9 @@ mod tests {
     #[tokio::test]
     async fn retention_of_light_rows_uses_an_index() {
         let (s, _a, _b) = seeded().await;
-        for sql in [
-            "EXPLAIN QUERY PLAN SELECT uid FROM skipped_batches
-             WHERE last_ms < 5 ORDER BY last_ms LIMIT 10",
-        ] {
+        for sql in ["EXPLAIN QUERY PLAN SELECT uid FROM skipped_batches
+             WHERE last_ms < 5 ORDER BY last_ms LIMIT 10"]
+        {
             let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .fetch_all(&s.pool)
                 .await

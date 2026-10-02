@@ -3033,6 +3033,9 @@ async fn enrichment_results_are_exported_with_provenance() {
     let row: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
     assert_eq!(row["ip"], "203.0.113.91");
     assert_eq!(row["node"], "node-bravo");
+    // Full provenance: the creating node's key and the build it ran.
+    assert_eq!(row["node_id"], b.id.to_string());
+    assert_eq!(row["build"], peephole::COMMIT);
     let geo = row["intel"]
         .as_array()
         .unwrap()
@@ -3041,6 +3044,8 @@ async fn enrichment_results_are_exported_with_provenance() {
         .unwrap();
     assert_eq!(geo["source_version"], "2026-09-30");
     assert_eq!(geo["node"], "node-bravo");
+    assert_eq!(geo["node_id"], b.id.to_string());
+    assert_eq!(geo["build"], peephole::COMMIT);
     assert_eq!(geo["data"]["country"], "NL");
     assert!(
         !body.contains("198.51.100.7"),

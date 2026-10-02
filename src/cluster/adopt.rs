@@ -24,9 +24,10 @@ async fn record_for(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resul
                 String,
                 Option<String>,
                 Option<String>,
+                String,
             );
             let r: Option<Row> = sqlx::query_as(
-                "SELECT c.request_uid, i.ip, c.ts, c.contact_email, c.user_agent
+                "SELECT c.request_uid, i.ip, c.ts, c.contact_email, c.user_agent, c.build
                  FROM fp_claims c JOIN ips i ON i.id = c.ip_id WHERE c.uid = ?",
             )
             .bind(uid)
@@ -40,6 +41,7 @@ async fn record_for(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resul
                     ts: r.2,
                     contact_email: r.3,
                     user_agent: r.4,
+                    build: r.5,
                 }))
             })
         }
@@ -214,9 +216,10 @@ async fn adopt_intel(node: &Node) -> Result<u64> {
     loop {
         let _g = node.apply_lock.lock().await;
         let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        type Row = (String, String, i64, String, Option<String>, String);
+        type Row = (String, String, i64, String, Option<String>, String, String);
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT ip, provider, hlc, fetched_at, source_version, data_json FROM ip_intel_log
+            "SELECT ip, provider, hlc, fetched_at, source_version, data_json, build
+             FROM ip_intel_log
              WHERE origin = x'' ORDER BY hlc, ip, provider LIMIT ?",
         )
         .bind(BATCH)
@@ -225,7 +228,7 @@ async fn adopt_intel(node: &Node) -> Result<u64> {
         if rows.is_empty() {
             break;
         }
-        for (ip, provider, hlc, fetched_at, source_version, data_json) in rows {
+        for (ip, provider, hlc, fetched_at, source_version, data_json, build) in rows {
             let e = repl::append_existing(
                 node,
                 &mut tx,
@@ -235,6 +238,7 @@ async fn adopt_intel(node: &Node) -> Result<u64> {
                     fetched_at,
                     source_version,
                     data_json,
+                    build,
                 }),
             )
             .await?;

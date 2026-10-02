@@ -225,8 +225,8 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     sqlx::query(
         "INSERT OR IGNORE INTO requests (uid, origin, hlc, ts, ip_id, method, path, query,
            headers_json, body, labels_json, severity, scan_level, is_fp_claim, page_token,
-           answer, status, unrecorded, transport, via_proxy, raw_head, tls_client_hello, ja4)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           answer, status, unrecorded, transport, via_proxy, raw_head, tls_client_hello, ja4, build)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -251,6 +251,7 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(&r.raw_head)
     .bind(&r.tls_client_hello)
     .bind(&r.ja4)
+    .bind(&r.build)
     .execute(&mut *conn)
     .await?;
     Ok(Effect::Applied)
@@ -291,8 +292,9 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
     let ip_id = ensure_ip(conn, &b.ip, seen.as_deref()).await?;
     let id: Option<i64> = sqlx::query_scalar(
-        "INSERT OR IGNORE INTO skipped_batches (uid, origin, hlc, ip_id, first_ms, last_ms, dropped)
-         VALUES (?,?,?,?,?,?,?) RETURNING id",
+        "INSERT OR IGNORE INTO skipped_batches
+           (uid, origin, hlc, ip_id, first_ms, last_ms, dropped, build)
+         VALUES (?,?,?,?,?,?,?,?) RETURNING id",
     )
     .bind(&b.uid)
     .bind(ctx.origin_bytes())
@@ -301,6 +303,7 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
     .bind(first)
     .bind(last)
     .bind(b.dropped)
+    .bind(&b.build)
     .fetch_optional(&mut *conn)
     .await?;
     // Already there: applied before.
@@ -333,8 +336,8 @@ async fn ip_intel(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpIntelRec) -> 
     // The lookup history keeps every result, also the ones replaced below.
     sqlx::query(
         "INSERT OR IGNORE INTO ip_intel_log
-           (ip, provider, origin, hlc, fetched_at, source_version, data_json)
-         VALUES (?,?,?,?,?,?,?)",
+           (ip, provider, origin, hlc, fetched_at, source_version, data_json, build)
+         VALUES (?,?,?,?,?,?,?,?)",
     )
     .bind(&r.ip)
     .bind(&r.provider)
@@ -343,14 +346,16 @@ async fn ip_intel(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpIntelRec) -> 
     .bind(&r.fetched_at)
     .bind(&r.source_version)
     .bind(&r.data_json)
+    .bind(&r.build)
     .execute(&mut *conn)
     .await?;
     sqlx::query(
-        "INSERT INTO ip_intel (ip, provider, origin, hlc, fetched_at, source_version, data_json)
-         VALUES (?,?,?,?,?,?,?)
+        "INSERT INTO ip_intel
+           (ip, provider, origin, hlc, fetched_at, source_version, data_json, build)
+         VALUES (?,?,?,?,?,?,?,?)
          ON CONFLICT(ip, provider, origin) DO UPDATE SET hlc = excluded.hlc,
            fetched_at = excluded.fetched_at, source_version = excluded.source_version,
-           data_json = excluded.data_json
+           data_json = excluded.data_json, build = excluded.build
          WHERE excluded.hlc > ip_intel.hlc",
     )
     .bind(&r.ip)
@@ -360,6 +365,7 @@ async fn ip_intel(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpIntelRec) -> 
     .bind(&r.fetched_at)
     .bind(&r.source_version)
     .bind(&r.data_json)
+    .bind(&r.build)
     .execute(&mut *conn)
     .await?;
     refresh_ip_view(conn, &r.ip).await?;
@@ -458,8 +464,8 @@ async fn fp_claim(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &FpClaimRec) -> 
     let ip_id = ensure_ip(conn, &r.ip, Some(&r.ts)).await?;
     sqlx::query(
         "INSERT OR IGNORE INTO fp_claims (uid, origin, hlc, ip_id, request_id, request_uid, ts,
-           contact_email, user_agent)
-         VALUES (?,?,?,?,?,?,?,?,?)",
+           contact_email, user_agent, build)
+         VALUES (?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -470,6 +476,7 @@ async fn fp_claim(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &FpClaimRec) -> 
     .bind(&r.ts)
     .bind(&r.contact_email)
     .bind(&r.user_agent)
+    .bind(&r.build)
     .execute(&mut *conn)
     .await?;
     sqlx::query("UPDATE ips SET fp_claimed = 1 WHERE id = ?")
@@ -494,8 +501,8 @@ async fn fingerprint(
     let ip_id = ensure_ip(conn, &r.ip, Some(&r.ts)).await?;
     sqlx::query(
         "INSERT OR IGNORE INTO fingerprints (uid, origin, hlc, request_id, request_uid, ip_id, ts,
-           fp_hash, visitor_id, attributes_json, behavior_summary_json, event_blob)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+           fp_hash, visitor_id, attributes_json, behavior_summary_json, event_blob, build)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -509,6 +516,7 @@ async fn fingerprint(
     .bind(&r.attributes_json)
     .bind(&r.behavior_summary_json)
     .bind(&r.event_blob)
+    .bind(&r.build)
     .execute(&mut *conn)
     .await?;
     Ok(Effect::Applied)
@@ -733,8 +741,8 @@ async fn scan_result(
     let ip_id = ensure_ip(conn, &r.ip, None).await?;
     let res = sqlx::query(
         "INSERT OR IGNORE INTO scans (uid, origin, hlc, job_id, job_uid, ip_id, level, started_at,
-           finished_at, os_guess, raw_xml)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+           finished_at, os_guess, raw_xml, build)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -747,6 +755,7 @@ async fn scan_result(
     .bind(&r.finished_at)
     .bind(&r.os_guess)
     .bind(&r.raw_xml)
+    .bind(&r.build)
     .execute(&mut *conn)
     .await?;
     if res.rows_affected() == 1 {
@@ -1091,6 +1100,7 @@ pub(crate) async fn unmaterialize(
 pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Result<Option<Record>> {
     // The columns added with the dataset fields (migration 0022).
     type ReqExtra = (
+        String,
         Option<String>,
         Option<i64>,
         Option<i64>,
@@ -1117,6 +1127,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
     );
     type Fp = (
         String,
+        String,
         Option<String>,
         String,
         String,
@@ -1128,6 +1139,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
     );
     type Scan = (
         i64,
+        String,
         String,
         String,
         String,
@@ -1151,7 +1163,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                 None => None,
                 Some(r) => {
                     let x: ReqExtra = sqlx::query_as(
-                        "SELECT answer, status, unrecorded, transport, via_proxy, raw_head,
+                        "SELECT build, answer, status, unrecorded, transport, via_proxy, raw_head,
                                 tls_client_hello, ja4
                          FROM requests WHERE uid = ?",
                     )
@@ -1172,21 +1184,22 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         scan_level: r.10,
                         is_fp_claim: r.11,
                         page_token: r.12,
-                        answer: x.0,
-                        status: x.1,
-                        unrecorded: x.2,
-                        transport: x.3,
-                        via_proxy: x.4,
-                        raw_head: x.5,
-                        tls_client_hello: x.6,
-                        ja4: x.7,
+                        build: x.0,
+                        answer: x.1,
+                        status: x.2,
+                        unrecorded: x.3,
+                        transport: x.4,
+                        via_proxy: x.5,
+                        raw_head: x.6,
+                        tls_client_hello: x.7,
+                        ja4: x.8,
                     }))
                 }
             }
         }
         "skip_batch" => {
-            let b: Option<(i64, String, i64)> = sqlx::query_as(
-                "SELECT b.id, i.ip, b.dropped FROM skipped_batches b JOIN ips i ON i.id = b.ip_id
+            let b: Option<(i64, String, i64, String)> = sqlx::query_as(
+                "SELECT b.id, i.ip, b.dropped, b.build FROM skipped_batches b JOIN ips i ON i.id = b.ip_id
                  WHERE b.uid = ?",
             )
             .bind(uid)
@@ -1194,7 +1207,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
             .await?;
             match b {
                 None => None,
-                Some((id, ip, dropped)) => {
+                Some((id, ip, dropped, build)) => {
                     let rows: Vec<(i64, String, String)> = sqlx::query_as(
                         "SELECT ts_ms, method, path FROM skipped_requests
                          WHERE batch_id = ? ORDER BY rowid",
@@ -1214,13 +1227,14 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                                 path,
                             })
                             .collect(),
+                        build,
                     }))
                 }
             }
         }
         "fingerprint" => {
             let r: Option<Fp> = sqlx::query_as(
-                "SELECT f.uid, f.request_uid, i.ip, f.ts, f.fp_hash, f.visitor_id,
+                "SELECT f.build, f.uid, f.request_uid, i.ip, f.ts, f.fp_hash, f.visitor_id,
                         f.attributes_json, f.behavior_summary_json, f.event_blob
                  FROM fingerprints f JOIN ips i ON i.id = f.ip_id WHERE f.uid = ?",
             )
@@ -1229,22 +1243,23 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
             .await?;
             r.map(|r| {
                 Record::Fingerprint(FingerprintRec {
-                    uid: r.0,
-                    request_uid: r.1,
-                    ip: r.2,
-                    ts: r.3,
-                    fp_hash: r.4,
-                    visitor_id: r.5,
-                    attributes_json: r.6,
-                    behavior_summary_json: r.7,
-                    event_blob: r.8,
+                    build: r.0,
+                    uid: r.1,
+                    request_uid: r.2,
+                    ip: r.3,
+                    ts: r.4,
+                    fp_hash: r.5,
+                    visitor_id: r.6,
+                    attributes_json: r.7,
+                    behavior_summary_json: r.8,
+                    event_blob: r.9,
                 })
             })
         }
         "scan_result" => {
             let r: Option<Scan> = sqlx::query_as(
-                "SELECT s.id, s.uid, s.job_uid, i.ip, s.level, s.started_at, s.finished_at,
-                        s.os_guess, s.raw_xml
+                "SELECT s.id, s.build, s.uid, s.job_uid, i.ip, s.level, s.started_at,
+                        s.finished_at, s.os_guess, s.raw_xml
                  FROM scans s JOIN ips i ON i.id = s.ip_id WHERE s.uid = ?",
             )
             .bind(uid)
@@ -1261,14 +1276,15 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                     .fetch_all(&mut *conn)
                     .await?;
                     Some(Record::ScanResult(ScanResultRec {
-                        uid: r.1,
-                        job_uid: r.2,
-                        ip: r.3,
-                        level: r.4,
-                        started_at: r.5,
-                        finished_at: r.6,
-                        os_guess: r.7,
-                        raw_xml: r.8,
+                        build: r.1,
+                        uid: r.2,
+                        job_uid: r.3,
+                        ip: r.4,
+                        level: r.5,
+                        started_at: r.6,
+                        finished_at: r.7,
+                        os_guess: r.8,
+                        raw_xml: r.9,
                         ports: ports
                             .into_iter()
                             .map(|p| PortRec {
@@ -1350,6 +1366,7 @@ mod tests {
 
     fn intel(ip: &str, provider: &str, data: &str) -> Record {
         Record::IpIntel(IpIntelRec {
+            build: String::new(),
             ip: ip.into(),
             provider: provider.into(),
             fetched_at: now_ts(),
@@ -1620,6 +1637,7 @@ mod tests {
             &mut conn,
             ctx(2),
             &Record::FpClaim(crate::cluster::record::FpClaimRec {
+                build: String::new(),
                 uid: "claim".into(),
                 request_uid: "req".into(),
                 ip: "203.0.113.7".into(),
@@ -1646,6 +1664,7 @@ mod tests {
             &mut conn,
             ctx(4),
             &Record::ScanResult(ScanResultRec {
+                build: String::new(),
                 uid: "scan".into(),
                 job_uid: "job".into(),
                 ip: "203.0.113.7".into(),
@@ -1681,6 +1700,7 @@ mod tests {
             .unwrap();
         let mut conn = store.pool.acquire().await.unwrap();
         let res = ScanResultRec {
+            build: String::new(),
             uid: new_uid(),
             job_uid: "job-not-here-yet".into(),
             ip: "203.0.113.9".into(),
@@ -1762,6 +1782,109 @@ mod tests {
         }
     }
 
+    /// Every data row keeps the build (source commit) of the binary that
+    /// created it, and row-backed records rebuild with it.
+    #[tokio::test]
+    async fn data_rows_keep_the_build_that_created_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let u = |s: &str| format!("{}{s}", a.uid_prefix());
+        let build = "0123456789ab".to_string();
+        let Record::Request(mut r) = request(&u("req"), "/x") else {
+            unreachable!()
+        };
+        r.build = build.clone();
+        let records = [
+            Record::Request(r),
+            Record::FpClaim(crate::cluster::record::FpClaimRec {
+                uid: u("claim"),
+                request_uid: u("req"),
+                ip: "203.0.113.7".into(),
+                ts: now_ts(),
+                contact_email: None,
+                user_agent: None,
+                build: build.clone(),
+            }),
+            Record::Fingerprint(FingerprintRec {
+                uid: u("fp"),
+                request_uid: Some(u("req")),
+                ip: "203.0.113.7".into(),
+                ts: now_ts(),
+                fp_hash: None,
+                visitor_id: None,
+                attributes_json: None,
+                behavior_summary_json: None,
+                event_blob: None,
+                build: build.clone(),
+            }),
+            Record::ScanJob(ScanJobRec {
+                uid: u("job"),
+                ip: "203.0.113.7".into(),
+                level: 1,
+                queued_at: now_ts(),
+            }),
+            Record::ScanResult(ScanResultRec {
+                uid: u("scan"),
+                job_uid: u("job"),
+                ip: "203.0.113.7".into(),
+                level: 1,
+                started_at: now_ts(),
+                finished_at: None,
+                os_guess: None,
+                raw_xml: None,
+                ports: vec![],
+                build: build.clone(),
+            }),
+            Record::SkipBatch(SkipBatchRec {
+                uid: u("skip"),
+                ip: "203.0.113.7".into(),
+                dropped: 0,
+                rows: vec![],
+                build: build.clone(),
+            }),
+            Record::IpIntel(IpIntelRec {
+                ip: "203.0.113.7".into(),
+                provider: crate::intel::TOR.into(),
+                fetched_at: now_ts(),
+                source_version: None,
+                data_json: "{}".into(),
+                build: build.clone(),
+            }),
+        ];
+        for rec in &records {
+            assert_eq!(apply(&mut conn, ctx, rec).await.unwrap(), Effect::Applied);
+            if ROW_BACKED.contains(&rec.kind()) {
+                let rebuilt = rebuild(&mut conn, rec.kind(), &rec.uid().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&rebuilt, rec);
+            }
+        }
+        for table in [
+            "requests",
+            "fp_claims",
+            "fingerprints",
+            "scans",
+            "skipped_batches",
+            "ip_intel",
+            "ip_intel_log",
+        ] {
+            let b: String =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT build FROM {table}")))
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+            assert_eq!(b, build, "{table}");
+        }
+    }
+
     #[tokio::test]
     async fn skip_batch_applies_and_its_tombstone_erases_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -1779,6 +1902,7 @@ mod tests {
             path: path.into(),
         };
         let b = Record::SkipBatch(SkipBatchRec {
+            build: String::new(),
             uid: uid.clone(),
             ip: "203.0.113.7".into(),
             dropped: 5,
@@ -1846,6 +1970,7 @@ mod tests {
         };
         // Out of time order on purpose: the order sent is kept.
         let b = Record::SkipBatch(SkipBatchRec {
+            build: String::new(),
             uid: format!("{}skip", a.uid_prefix()),
             ip: "203.0.113.7".into(),
             dropped: 2,
@@ -1873,6 +1998,7 @@ mod tests {
             hlc: 1,
         };
         let b = Record::SkipBatch(SkipBatchRec {
+            build: String::new(),
             uid: format!("{}huge", a.uid_prefix()),
             ip: "203.0.113.7".into(),
             dropped: i64::MAX,
@@ -1899,6 +2025,7 @@ mod tests {
             })
             .collect();
         let b = Record::SkipBatch(SkipBatchRec {
+            build: String::new(),
             uid: format!("{}big", a.uid_prefix()),
             ip: "203.0.113.7".into(),
             dropped: 0,

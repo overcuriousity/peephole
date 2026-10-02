@@ -70,6 +70,9 @@ pub struct RequestRec {
     pub tls_client_hello: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ja4: Option<String>,
+    /// Source commit of the binary that created the record (provenance).
+    #[serde(default)]
+    pub build: String,
 }
 
 /// One request the flood gate answered without recording it in full.
@@ -89,6 +92,9 @@ pub struct SkipBatchRec {
     pub ip: String,
     pub dropped: i64,
     pub rows: Vec<SkipRow>,
+    /// Source commit of the binary that created the record (provenance).
+    #[serde(default)]
+    pub build: String,
 }
 
 /// One provider's result for an IP (per origin, newest wins by HLC).
@@ -103,6 +109,9 @@ pub struct IpIntelRec {
     /// Provider-specific fields as a JSON object. `{}`: the provider was
     /// asked and knows nothing.
     pub data_json: String,
+    /// Source commit of the binary that created the record (provenance).
+    #[serde(default)]
+    pub build: String,
 }
 
 /// "I landed here by accident" claim.
@@ -114,6 +123,9 @@ pub struct FpClaimRec {
     pub ts: String,
     pub contact_email: Option<String>,
     pub user_agent: Option<String>,
+    /// Source commit of the binary that created the record (provenance).
+    #[serde(default)]
+    pub build: String,
 }
 
 /// Browser fingerprint from the trap page's collector.
@@ -130,6 +142,9 @@ pub struct FingerprintRec {
     /// zstd-compressed, as stored.
     #[serde(with = "serde_bytes")]
     pub event_blob: Option<Vec<u8>>,
+    /// Source commit of the binary that created the record (provenance).
+    #[serde(default)]
+    pub build: String,
 }
 
 /// A queued counter-scan. The origin arbitrates the job.
@@ -190,6 +205,9 @@ pub struct ScanResultRec {
     #[serde(with = "serde_bytes")]
     pub raw_xml: Option<Vec<u8>>,
     pub ports: Vec<PortRec>,
+    /// Source commit of the binary that created the record (provenance).
+    #[serde(default)]
+    pub build: String,
 }
 
 /// A new version of a shared intel file, fetched by the origin.

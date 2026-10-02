@@ -566,6 +566,7 @@ async fn future_dated_entries_are_ordered_by_their_receipt() {
             a.at(
                 far,
                 Record::IpIntel(IpIntelRec {
+                    build: String::new(),
                     ip: "203.0.113.20".into(),
                     provider: "tor-exits".into(),
                     fetched_at: "2026-10-01 00:00:00".into(),
