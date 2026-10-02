@@ -19,6 +19,11 @@ pub struct TrapConfig {
     /// request).
     #[serde(default = "default_sample_every")]
     pub sample_every: u32,
+    /// Requests not recorded in full still leave a light row (time,
+    /// method, path): at most this many per IP and second; past it they are
+    /// only counted. 0: no limit.
+    #[serde(default = "default_skip_log_rate")]
+    pub skip_log_rate: u32,
     /// Answer common first-stage probes (`/.env`, `/.git/config`,
     /// `/wp-login.php`, phpinfo pages) with plausible fake content and
     /// status 200 instead of the trap page, so the follow-up request is
@@ -41,6 +46,9 @@ fn default_record_burst() -> u32 {
 fn default_sample_every() -> u32 {
     20
 }
+fn default_skip_log_rate() -> u32 {
+    100
+}
 
 impl Default for TrapConfig {
     fn default() -> Self {
@@ -48,6 +56,7 @@ impl Default for TrapConfig {
             record_rate: default_record_rate(),
             record_burst: default_record_burst(),
             sample_every: default_sample_every(),
+            skip_log_rate: default_skip_log_rate(),
             decoys: false,
             helper_prefix: String::new(),
         }

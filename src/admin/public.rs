@@ -609,6 +609,8 @@ pub struct IpAdminData {
     pub scans: Vec<ScanWithPorts>,
     pub fingerprints: Vec<FpSummary>,
     pub claims: Vec<FpClaimRow>,
+    /// Requests answered but not recorded in full (flood sampling).
+    pub skipped: i64,
 }
 
 #[derive(Template)]
@@ -679,6 +681,7 @@ async fn ip_page(
             scans,
             fingerprints: state.store.fingerprints_for_ip(ip.id).await?,
             claims: state.store.claims_for_ip(ip.id).await?,
+            skipped: state.store.skipped_for_ip(ip.id).await?,
         })
     } else {
         None

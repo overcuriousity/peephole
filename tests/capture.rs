@@ -416,3 +416,45 @@ async fn answer_and_status_are_recorded() {
         ]
     );
 }
+
+#[tokio::test]
+async fn every_answered_request_is_a_row_a_light_row_or_counted() {
+    let (base, store, _dir) =
+        spawn("[trap]\nrecord_rate = 1\nrecord_burst = 1\nsample_every = 0\nskip_log_rate = 5\n")
+            .await;
+    let client = reqwest::Client::new();
+    let send = |i: usize| {
+        client
+            .get(format!("{base}/p{i}"))
+            .header("x-forwarded-for", "203.0.113.9")
+            .send()
+    };
+    for i in 0..50 {
+        assert_eq!(send(i).await.unwrap().status(), 404);
+    }
+    // A token again: this one is recorded and writes the pending batch.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    send(50).await.unwrap();
+    let full = count(&store, "SELECT COUNT(*) FROM requests").await;
+    let light = count(&store, "SELECT COUNT(*) FROM skipped_requests").await;
+    let dropped = count(
+        &store,
+        "SELECT COALESCE(SUM(dropped), 0) FROM skipped_batches",
+    )
+    .await;
+    assert_eq!(full, 2);
+    assert!(light >= 5, "light rows: {light}");
+    assert_eq!(full + light + dropped, 51);
+    let paths: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM skipped_requests ORDER BY ts_ms LIMIT 2")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(paths, ["/p1", "/p2"]);
+    let unrecorded: Option<i64> =
+        sqlx::query_scalar("SELECT unrecorded FROM requests ORDER BY id DESC LIMIT 1")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(unrecorded, Some(light + dropped));
+}

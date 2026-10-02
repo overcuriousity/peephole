@@ -457,7 +457,7 @@ impl RoleRunner {
         // Loaded on every start, so edited rules apply when the role is
         // switched off and on.
         let classifier = classify::Classifier::from_dir(dir).context("loading rules")?;
-        let app = trap::router(Arc::new(trap::TrapState {
+        let state = Arc::new(trap::TrapState {
             store: self.store.clone(),
             recorder: self.recorder.clone(),
             cfg: self.cfg.clone(),
@@ -468,7 +468,8 @@ impl RoleRunner {
             helper_rate: Default::default(),
             pace: self.settings.pace.clone(),
             guards: Default::default(),
-        }));
+        });
+        let app = trap::router(state.clone());
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding trap listener {addr}"))?;
@@ -476,7 +477,12 @@ impl RoleRunner {
         let (stop, rx) = tokio::sync::watch::channel(false);
         Ok(Running {
             stop,
-            task: tokio::spawn(serve_trap(listener, app, rx)),
+            task: tokio::spawn(async move {
+                tokio::join!(
+                    serve_trap(listener, app, rx.clone()),
+                    trap::flush_skips(state, rx)
+                );
+            }),
         })
     }
 

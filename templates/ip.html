@@ -13,7 +13,7 @@
     </div>
   </div>
   <div class="tiles">
-    <div class="tile"><span class="label">Requests</span><div class="value">{{ ov.request_count }}</div></div>
+    <div class="tile"><span class="label">Requests</span><div class="value">{{ ov.request_count }}</div>{% if let Some(a) = admin %}{% if a.skipped > 0 %}<div class="hint">+ {{ a.skipped }} not recorded in full</div>{% endif %}{% endif %}</div>
     <div class="tile"><span class="label">Max severity</span><div class="value">{% let sev = ov.max_severity %}{% include "_severity.html" %}</div></div>
     {% if let Some(adm) = admin %}<div class="tile"><span class="label">Open ports</span><div class="value">{% if let Some(sc) = adm.scans.first() %}{{ sc.s.open_ports }}{% else %}—{% endif %}</div><div class="hint">{% if let Some(sc) = adm.scans.first() %}newest scan, level {{ sc.s.level }}{% else %}not scanned{% endif %}</div></div>{% endif %}
   </div>

@@ -2,6 +2,7 @@ mod config;
 mod decoy;
 mod flood;
 mod pages;
+pub mod skiplog;
 
 pub use config::TrapConfig;
 
@@ -67,6 +68,45 @@ pub struct Guards {
     flood: flood::FloodGate,
     /// Intel results recorded moments ago.
     intel: flood::IntelCache,
+    /// Light rows of the requests the flood gate skips.
+    pub skips: skiplog::SkipLog,
+}
+
+/// Write a batch of light rows; a failure is logged, the requests were
+/// answered either way.
+async fn write_skips(state: &TrapState, b: skiplog::Batch) {
+    let ip = b.ip.to_string();
+    if let Err(e) = state
+        .recorder
+        .insert_skip_batch(&ip, b.dropped, b.rows)
+        .await
+    {
+        warn!(%ip, error = %e, "trap: recording skipped requests failed");
+    }
+}
+
+/// Write the light rows that have waited long enough, every few seconds,
+/// until `shutdown`.
+pub async fn flush_skips(state: Arc<TrapState>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = shutdown.changed() => {
+                // Nothing buffered is lost on a clean stop.
+                for b in state.guards.skips.take_older(Duration::ZERO, Instant::now()) {
+                    write_skips(&state, b).await;
+                }
+                return;
+            }
+        }
+        for b in state
+            .guards
+            .skips
+            .take_older(Duration::from_secs(10), Instant::now())
+        {
+            write_skips(&state, b).await;
+        }
+    }
 }
 
 /// Minimal fixed-window rate limiter. Bounded in size so an attacker rotating
@@ -463,9 +503,24 @@ async fn trap_handler(
 
     match state.guards.flood.admit(ip, &state.cfg.trap) {
         flood::Admission::Skip => {
-            debug!(%ip, "trap: over the recording rate; answered, not recorded");
+            debug!(%ip, "trap: over the recording rate; answered, light row only");
+            let full = state.guards.skips.note(
+                ip,
+                chrono::Utc::now().timestamp_millis(),
+                method,
+                path,
+                state.cfg.trap.skip_log_rate,
+                Instant::now(),
+            );
+            if let Some(b) = full {
+                write_skips(&state, b).await;
+            }
         }
         flood::Admission::Record { unrecorded } => {
+            // The light rows before it go first, so they precede it in time.
+            if let Some(b) = state.guards.skips.take(ip) {
+                write_skips(&state, b).await;
+            }
             let mut raw = vec![(":version".to_string(), format!("{:?}", parts.version))];
             let authority = parts.uri.authority().map(|a| a.as_str());
             if let Some(a) = authority {

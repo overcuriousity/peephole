@@ -380,6 +380,19 @@ impl Store {
             .collect())
     }
 
+    /// Requests from this IP answered without being recorded in full: light
+    /// rows plus the ones only counted.
+    pub async fn skipped_for_ip(&self, ip_id: i64) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE(SUM(dropped + (SELECT COUNT(*) FROM skipped_requests r
+                                            WHERE r.batch_id = b.id)), 0)
+             FROM skipped_batches b WHERE b.ip_id = ?",
+        )
+        .bind(ip_id)
+        .fetch_one(&self.read)
+        .await?)
+    }
+
     pub async fn claims_for_ip(&self, ip_id: i64) -> Result<Vec<FpClaimRow>> {
         let sql = format!("{CLAIM_SELECT} WHERE c.ip_id = ? ORDER BY c.id DESC");
         Ok(
@@ -503,6 +516,22 @@ mod tests {
     use super::*;
     use crate::scan::nmap_xml::{PortResult, ScanResult};
     use crate::store::requests::NewRequest;
+
+    #[tokio::test]
+    async fn skipped_counts_light_rows_and_drops() {
+        let (s, a) = seeded().await;
+        assert_eq!(s.skipped_for_ip(a).await.unwrap(), 0);
+        let row = |ts_ms| crate::cluster::record::SkipRow {
+            ts_ms,
+            method: "GET".into(),
+            path: "/".into(),
+        };
+        s.local()
+            .insert_skip_batch("203.0.113.1", 4, vec![row(1), row(2)])
+            .await
+            .unwrap();
+        assert_eq!(s.skipped_for_ip(a).await.unwrap(), 6);
+    }
 
     async fn seeded() -> (Store, i64) {
         let dir = tempfile::tempdir().unwrap();
