@@ -209,6 +209,8 @@ advertise = "scanner-1.example:7443"
         "{members}"
     );
     assert!(members.contains("roles=scanner"), "{members}");
+    let status = run(&["status"]);
+    assert!(status.contains("history   full"), "{status}");
     // The config key exists only with remote configuration switched on.
     let out = bin()
         .args(["cluster", "config-key", "show"])
@@ -404,4 +406,59 @@ rp_name = "peephole"
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// `cluster status` says how much history this node keeps and where it
+/// starts per member.
+#[tokio::test]
+async fn cluster_status_shows_the_history_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("c.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"
+retention_days = 7
+database_path = "{d}/t.db"
+data_dir = "{d}"
+[roles]
+listener = false
+web = false
+[cluster]
+node_name = "window-1"
+listen = "127.0.0.1:0"
+advertise = "window-1.example:7443"
+"#,
+            d = dir.path().display()
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let out = bin()
+            .arg("cluster")
+            .args(args)
+            .arg(cfg.to_str().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    run(&["invite", "--ttl", "2"]);
+    let id = run(&["id"]);
+    let id = peephole::cluster::identity::NodeId::parse(id.trim()).unwrap();
+    let store = peephole::store::Store::connect(&dir.path().join("t.db"))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO repl_floors (origin, seq) VALUES (?, 3)")
+        .bind(&id.0[..])
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let status = run(&["status"]);
+    assert!(status.contains("history   keeps 7 days"), "{status}");
+    assert!(status.contains("held from seq 3"), "{status}");
 }

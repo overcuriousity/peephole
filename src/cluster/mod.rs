@@ -273,6 +273,9 @@ pub struct Node {
     pub own_floors: RwLock<history::Floors>,
     /// Sync rounds run, with any peer (status and tests).
     pub sync_rounds: std::sync::atomic::AtomicU64,
+    /// Per peer: origins we lack that its history does not reach back to,
+    /// as of the last round (a full node waits for a full member).
+    pub unserved: Mutex<HashMap<NodeId, Vec<NodeId>>>,
 }
 
 impl Node {
@@ -314,6 +317,7 @@ impl Node {
             retention_days: p.retention_days,
             own_floors: Default::default(),
             sync_rounds: Default::default(),
+            unserved: Default::default(),
         });
         // Our clock must not run behind anything already in the log.
         let max_hlc: Option<i64> = sqlx::query_scalar("SELECT MAX(hlc) FROM repl_log")
@@ -487,6 +491,22 @@ impl Node {
             0 => 0,
             d => history::window_hlc(d, hlc::wall_ms()),
         }
+    }
+
+    /// Origins this node lacks history of that no peer it reached could
+    /// serve (only a node keeping everything can be in this state).
+    pub fn unserved_origins(&self) -> Vec<NodeId> {
+        let mut v: Vec<NodeId> = self
+            .unserved
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        v.sort();
+        v.dedup();
+        v
     }
 
     /// Re-read this node's floors (after a prune, for the heartbeat).

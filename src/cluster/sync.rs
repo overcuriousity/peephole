@@ -241,6 +241,20 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
     // must not crowd out the rest) and what the peer cannot serve us (its
     // history starts past ours).
     let refused = repl::refused_origins(node).await?;
+    let unserved: Vec<NodeId> = {
+        let ours = repl::head_map(&repl::heads(&node.store).await?);
+        theirs
+            .iter()
+            .filter(|(o, s)| {
+                let mine = ours.get(o).copied().unwrap_or(0);
+                !refused.contains(o)
+                    && mine < *s
+                    && !history::servable(node.peer_floor(&peer, o), mine, node.windowed())
+            })
+            .map(|(o, _)| *o)
+            .collect()
+    };
+    node.unserved.lock().unwrap().insert(peer, unserved);
     let mut stuck = false;
     loop {
         let ours = repl::head_map(&repl::heads(&node.store).await?);

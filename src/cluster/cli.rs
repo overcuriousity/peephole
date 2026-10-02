@@ -207,6 +207,10 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                     .fetch_all(&store.pool)
                     .await?;
             let blocked = super::block::list(&store).await?;
+            let floors = {
+                let mut conn = store.pool.acquire().await?;
+                super::history::floors(&mut conn).await?
+            };
             if let Some(d) = crate::cluster::Detached::read(&store).await? {
                 println!("{}", d.label());
             }
@@ -233,7 +237,19 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 );
                 if status {
                     println!("    key       {}", m.id);
-                    println!("    log head  {}", repl::head_in(&heads, &m.id));
+                    match floors.get(&m.id) {
+                        Some(f) => println!(
+                            "    log head  {} (held from seq {f})",
+                            repl::head_in(&heads, &m.id)
+                        ),
+                        None => println!("    log head  {}", repl::head_in(&heads, &m.id)),
+                    }
+                    if Some(m.id) == my_id {
+                        match cfg.retention_days {
+                            0 => println!("    history   full"),
+                            d => println!("    history   keeps {d} days"),
+                        }
+                    }
                     if let Some((_, ok, err)) = contact.iter().find(|c| c.0 == m.id.0) {
                         println!("    last ok   {}", ok.as_deref().unwrap_or("never"));
                         if let Some(e) = err {
