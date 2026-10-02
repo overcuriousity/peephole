@@ -13,5 +13,5 @@
   <label>Min severity <input name="min_severity" type="number" min="0" max="4"></label>
   <button class="btn btn-primary" type="submit">Download</button>
 </form>
-<p class="muted small">A label or severity filter leaves out the requests not recorded in full (they have neither). Their <code>weight</code> column says how many answered requests each row stands for. Redistributable leaves out the results of providers whose terms forbid passing them on (all but the Tor exit list), including the GeoIP columns.</p>
+<p class="muted small">A label or severity filter leaves out the requests not recorded in full (they have neither). The <code>weight</code> column says how many answered requests each row stands for; the weights of any export add up to the requests answered. Redistributable leaves out the results of providers whose terms forbid passing them on (all but the Tor exit list), including the GeoIP columns.</p>
 {% endblock %}

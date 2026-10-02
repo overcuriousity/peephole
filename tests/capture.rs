@@ -653,3 +653,58 @@ async fn the_plain_listener_records_the_raw_head() {
     assert_eq!((transport.as_str(), via, ja4), ("http", true, None));
     assert_eq!(raw, head.as_bytes());
 }
+
+/// The export's weights add up to every answered request, light rows
+/// included, without counting a skipped request twice.
+#[tokio::test]
+async fn export_weights_sum_to_the_requests_answered() {
+    let (base, store, _dir) =
+        spawn("[trap]\nrecord_rate = 1\nrecord_burst = 1\nsample_every = 7\nskip_log_rate = 5\n")
+            .await;
+    let client = reqwest::Client::new();
+    for i in 0..60 {
+        client
+            .get(format!("{base}/w{i}"))
+            .header("x-forwarded-for", "203.0.113.9")
+            .send()
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    client
+        .get(format!("{base}/last"))
+        .header("x-forwarded-for", "203.0.113.9")
+        .send()
+        .await
+        .unwrap();
+    use futures::TryStreamExt;
+    let weights = |f: peephole::export::ExportFilter| {
+        let store = store.clone();
+        async move {
+            let parts: Vec<bytes::Bytes> = peephole::export::stream_requests(
+                store,
+                f,
+                peephole::export::Format::Jsonl,
+                Default::default(),
+            )
+            .try_collect()
+            .await
+            .unwrap();
+            let text: String = parts.iter().map(|b| String::from_utf8_lossy(b)).collect();
+            text.lines()
+                .map(|l| {
+                    serde_json::from_str::<serde_json::Value>(l).unwrap()["weight"]
+                        .as_i64()
+                        .unwrap()
+                })
+                .sum::<i64>()
+        }
+    };
+    assert_eq!(weights(Default::default()).await, 61, "with light rows");
+    // Without light rows (a severity filter), the recorded rows carry them.
+    let f = peephole::export::ExportFilter {
+        min_severity: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(weights(f).await, 61, "recorded rows only");
+}

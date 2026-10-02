@@ -77,7 +77,12 @@ pub struct ExportRow {
     /// Requests from the IP answered but not recorded since the previous
     /// recorded one (for a light row: drops of its batch, on its last row).
     pub unrecorded: i64,
-    /// Answered requests this row stands for: `unrecorded + 1`.
+    /// Answered requests this row stands for, so that the weights of an
+    /// export add up to the requests answered. With light rows in the
+    /// export, a recorded request stands for itself (its skipped
+    /// predecessors are light rows or counted drops); without them, it also
+    /// stands for its `unrecorded` predecessors. Rows recorded before light
+    /// rows existed always carry theirs.
     pub weight: i64,
     pub labels: Vec<String>,
     pub severity: Option<i64>,
@@ -467,13 +472,26 @@ fn fill_ip(
     row.is_tor = as_of(&cols.tor, row.ts_ms);
 }
 
-fn request_row(r: ReqRow, ctx: &PageContext, cols: &IpCols, opts: &ExportOptions) -> ExportRow {
+fn request_row(
+    r: ReqRow,
+    ctx: &PageContext,
+    cols: &IpCols,
+    opts: &ExportOptions,
+    with_skipped: bool,
+) -> ExportRow {
     let headers: Vec<(String, String)> = serde_json::from_str(&r.headers_json).unwrap_or_default();
-    // Rows recorded before the column existed carry the count as a header.
+    // Rows recorded before the column existed carry the count as a header;
+    // no light rows were kept for them.
+    let legacy = r.unrecorded.is_none();
     let unrecorded = r
         .unrecorded
         .or_else(|| header(&headers, ":unrecorded").and_then(|v| v.parse().ok()))
         .unwrap_or(0);
+    let weight = if with_skipped && !legacy {
+        1
+    } else {
+        unrecorded + 1
+    };
     let fingerprints = r
         .uid
         .as_ref()
@@ -506,7 +524,7 @@ fn request_row(r: ReqRow, ctx: &PageContext, cols: &IpCols, opts: &ExportOptions
         answer: r.answer,
         status: r.status,
         unrecorded,
-        weight: unrecorded + 1,
+        weight,
         labels: serde_json::from_str(&r.labels_json).unwrap_or_default(),
         severity: Some(r.severity),
         scan_level: Some(r.scan_level),
@@ -577,7 +595,7 @@ async fn next_rows(
                     let c = cols
                         .entry(r.ip_id)
                         .or_insert_with(|| ip_cols(&r.ip, r.ip_id, &ctx, opts));
-                    request_row(r, &ctx, c, opts)
+                    request_row(r, &ctx, c, opts, f.includes_skipped())
                 })
                 .collect())
         }
@@ -966,7 +984,10 @@ mod tests {
         assert_eq!(r["fingerprints"][0]["fp_hash"], "fphash");
         assert_eq!(r["fingerprints"][0]["events"], serde_json::json!([1, 2]));
         assert_eq!(r["unrecorded"], 2);
-        assert_eq!(r["weight"], 3);
+        assert_eq!(
+            r["weight"], 1,
+            "its skipped predecessors are light rows here"
+        );
         assert_eq!(rows[1]["kind"], "skipped");
         assert_eq!(rows[1]["path"], "/s1");
         assert_eq!(rows[1]["timestamp_desc"], "HTTP request skipped");
@@ -975,7 +996,7 @@ mod tests {
         assert_eq!(rows[1]["weight"], 1);
         assert_eq!(rows[2]["weight"], 4);
         let w: i64 = rows.iter().map(|r| r["weight"].as_i64().unwrap()).sum();
-        assert_eq!(w, 3 + 1 + 4);
+        assert_eq!(w, 1 + 1 + 4);
 
         let csv = text(&collect(&s, ExportFilter::default(), Format::Csv).await);
         let mut rdr = csv::Reader::from_reader(csv.as_bytes());
@@ -1013,6 +1034,11 @@ mod tests {
         };
         let out = text(&collect(&s, f, Format::Jsonl).await);
         assert_eq!(out.lines().count(), 1, "{out}");
+        let r: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            r["weight"], 3,
+            "without light rows it carries its predecessors"
+        );
         let f = ExportFilter {
             ip: Some("203.0.113.5".into()),
             ..Default::default()
