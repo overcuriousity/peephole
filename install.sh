@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# peephole installer / upgrader (Debian/Ubuntu, x86_64):
+# peephole installer / upgrader (Debian/Ubuntu, x86_64 or aarch64):
 #   curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/install.sh | sudo bash
+# A pinned release, with the installer from the same tag:
+#   curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/v0.1.0/install.sh | sudo PEEPHOLE_VERSION=v0.1.0 bash
 #
 # Re-running upgrades an existing installation. Environment overrides:
+#   PEEPHOLE_VERSION   release tag to install (e.g. v0.1.0); default: the rolling "latest" build of master
+#   PEEPHOLE_VERIFY=1|0  1: require a verified GitHub build provenance attestation (needs the gh CLI);
+#                      0: skip it; unset: verify when gh is installed, warn if that fails
 #   MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY, PEEPHOLE_DOMAIN, PEEPHOLE_TRUSTED_PROXIES  (first install)
 #   PEEPHOLE_LOCAL_PROXY=1|0  a reverse proxy on this machine fronts the trap (first install);
 #                      when 1, PEEPHOLE_TRUSTED_PROXIES is ignored and loopback is trusted instead
@@ -220,14 +225,24 @@ fi
 
 main() {
 REPO="overcuriousity/peephole"
-ASSET="peephole-x86_64-unknown-linux-gnu"
-BASE_URL="${BASE_URL:-https://github.com/${REPO}/releases/download/latest}"
+case "$(uname -m)" in
+    x86_64|amd64) ARCH="x86_64" ;;
+    aarch64|arm64) ARCH="aarch64" ;;
+    *) ARCH="" ;;
+esac
+ASSET="peephole-${ARCH:-unsupported}-unknown-linux-gnu"
+# A release tag pins the download; the default is the rolling build of master.
+RELEASE="${PEEPHOLE_VERSION:-latest}"
+BASE_URL="${BASE_URL:-https://github.com/${REPO}/releases/download/${RELEASE}}"
 INSTALL_BIN="/usr/local/bin/peephole"
 CONFIG_DIR="/etc/peephole"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
 DATA_DIR="/var/lib/peephole"
 UNIT_FILE="/etc/systemd/system/peephole.service"
 RULES_MANIFEST="${DATA_DIR}/.installed-rules.sha256"
+UNIT_MANIFEST="${DATA_DIR}/.installed-unit.sha256"
+# Units earlier installers wrote without recording them: unedited if they match.
+KNOWN_UNIT_SUMS="da20ef8147a9f2a9e704318e80ce381adc7b222fc5b21706bc1f5fd3bd4c5cb2"
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -240,7 +255,11 @@ command -v systemctl >/dev/null 2>&1 || die "systemd is required (systemctl not 
 if [ "${PEEPHOLE_ALLOW_NO_SYSTEMD:-0}" != "1" ] && [ "$(cat /proc/1/comm 2>/dev/null)" != "systemd" ]; then
     die "systemd is not PID 1 (container or chroot?). The service cannot be managed here; set PEEPHOLE_ALLOW_NO_SYSTEMD=1 to install anyway."
 fi
-[ "$(uname -m)" = "x86_64" ] || die "only x86_64 builds are published; build from source on $(uname -m) (see README)"
+[ -n "$ARCH" ] || die "builds are published for x86_64 and aarch64 only; build from source on $(uname -m) (see README)"
+case "$RELEASE" in
+    latest|v[0-9]*) ;;
+    *) die "PEEPHOLE_VERSION must be a release tag such as v0.1.0 (got '${RELEASE}')" ;;
+esac
 
 # Questions are read from the terminal, or from the file PEEPHOLE_TTY names
 # (tests). One descriptor stays open so answers are consumed in order.
@@ -320,15 +339,69 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 fetch() { curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors "$1" -o "$2"; }
 
-info "Downloading latest peephole build"
-fetch "${BASE_URL}/${ASSET}.tar.gz"        "${tmpdir}/${ASSET}.tar.gz"        || die "download failed (the rolling release may be mid-rebuild; retry in a minute)"
-fetch "${BASE_URL}/${ASSET}.tar.gz.sha256" "${tmpdir}/${ASSET}.tar.gz.sha256" || die "checksum download failed"
+download() {
+    fetch "${BASE_URL}/${ASSET}.tar.gz"        "${tmpdir}/${ASSET}.tar.gz"        || die "download of ${BASE_URL}/${ASSET}.tar.gz failed (no such release, or the rolling release is mid-update; retry in a minute)"
+    fetch "${BASE_URL}/${ASSET}.tar.gz.sha256" "${tmpdir}/${ASSET}.tar.gz.sha256" || die "checksum download failed"
+}
+checksum_ok() { ( cd "$tmpdir" && sha256sum -c --quiet "${ASSET}.tar.gz.sha256" ); }
+
+info "Downloading peephole ${RELEASE} (${ARCH})"
+download
 info "Verifying checksum"
-( cd "$tmpdir" && sha256sum -c --quiet "${ASSET}.tar.gz.sha256" ) || die "checksum mismatch"
+if ! checksum_ok; then
+    # The rolling release replaces its files one at a time, so a download in
+    # between can get a tarball and a checksum of different builds.
+    warn "checksum mismatch; the release may be mid-update, downloading again in 15 s"
+    sleep 15
+    download
+    checksum_ok || die "checksum mismatch"
+fi
+
+# Provenance: a GitHub attestation that this repository's workflow built the
+# tarball (the checksum alone only shows the download is intact).
+verify="${PEEPHOLE_VERIFY:-}"
+if [ "$verify" != 0 ]; then
+    if command -v gh >/dev/null 2>&1; then
+        info "Verifying the build provenance attestation"
+        bundle=()
+        # Releases carry the attestation bundle, so no GitHub API call is needed.
+        if curl -fsSL "${BASE_URL}/peephole-provenance.sigstore.json" -o "${tmpdir}/provenance.json" 2>/dev/null; then
+            bundle=(--bundle "${tmpdir}/provenance.json")
+        fi
+        if gh attestation verify "${tmpdir}/${ASSET}.tar.gz" --repo "$REPO" "${bundle[@]}" > "${tmpdir}/attestation.log" 2>&1; then
+            info "Provenance verified: built by a GitHub Actions workflow of ${REPO}"
+        elif [ "$verify" = 1 ]; then
+            cat "${tmpdir}/attestation.log" >&2
+            die "the provenance attestation did not verify (PEEPHOLE_VERIFY=1)"
+        else
+            warn "could not verify the provenance attestation (gh may need 'gh auth login'); relying on the checksum. PEEPHOLE_VERIFY=1 makes this fatal."
+        fi
+    elif [ "$verify" = 1 ]; then
+        die "PEEPHOLE_VERIFY=1 needs the GitHub CLI (gh) to verify the provenance attestation"
+    fi
+fi
+
 tar -xzf "${tmpdir}/${ASSET}.tar.gz" -C "$tmpdir"
 src="${tmpdir}/${ASSET}"
 
-new_version="$(cut -d' ' -f1 "${src}/VERSION" 2>/dev/null || echo unknown)"
+# VERSION: "<build> <date> <commit>" (older builds have no commit).
+new_version="unknown"; build_date=""; build_commit=""
+if [ -r "${src}/VERSION" ]; then read -r new_version build_date build_commit < "${src}/VERSION" || true; fi
+[ -n "$new_version" ] || new_version="unknown"
+info "Build ${new_version} of ${build_date:-unknown date}, from commit ${build_commit:-unknown}"
+# This script and the binary may come from different commits (the script
+# from master, the binary from a release). The build ships its own copy.
+if [ -n "$build_commit" ] && [ -f "${src}/install.sh" ]; then
+    self="${BASH_SOURCE[0]:-}"
+    if [ -n "$self" ] && [ -f "$self" ] && cmp -s "$self" "${src}/install.sh"; then
+        info "This installer is the one shipped with the build"
+    else
+        info "The installer shipped with this build: https://raw.githubusercontent.com/${REPO}/${build_commit}/install.sh"
+        if [ -n "$self" ] && [ -f "$self" ]; then
+            warn "this installer differs from the one shipped with the build"
+        fi
+    fi
+fi
 installed_version=""
 if [ -x "$INSTALL_BIN" ]; then
     installed_version="$("$INSTALL_BIN" --version 2>/dev/null | awk '{print $2}' || true)"
@@ -420,8 +493,61 @@ fi
 # The wizard is done (or was skipped on an upgrade); closing an fd that was never opened is harmless.
 exec 3<&-
 
+# --- backups for a rollback (upgrades) ----------------------------------------
+# The binary is kept as peephole.prev; rules, their manifest and the unit
+# beside the download (for this run's rollback); the database next to itself.
+backup="${tmpdir}/rollback"
+mkdir -p "$backup"
+DB_PATH="${DATA_DIR}/peephole.db"
+DB_BACKUP=""
+DB_SCHEMA=""
+schema_version() { sqlite3 "$1" 'PRAGMA user_version' 2>/dev/null || true; }
+backup_database() {
+    local need avail dest
+    [ -e "$DB_PATH" ] || return 0
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        warn "sqlite3 is not installed; upgrading without a database backup"
+        return 0
+    fi
+    # The WAL file may not exist (du then fails but still prints the total).
+    need="$(du -ck "$DB_PATH" "${DB_PATH}-wal" 2>/dev/null | tail -1 | cut -f1 || true)"
+    avail="$(df -Pk "$(dirname "$DB_PATH")" | awk 'NR==2 {print $4}')"
+    if [ "${avail:-0}" -le "$(( ${need:-0} + 1024 ))" ]; then
+        warn "not enough free space for a copy of ${DB_PATH}; upgrading without a database backup"
+        return 0
+    fi
+    dest="$(dirname "$DB_PATH")/backup-$(date -u +%Y%m%dT%H%M%SZ).db"
+    info "Backing up the database to ${dest}"
+    # The online backup API: consistent while the running service writes.
+    if ( umask 077; sqlite3 "$DB_PATH" ".backup '${dest}'" ); then
+        DB_BACKUP="$dest"
+        DB_SCHEMA="$(schema_version "$dest")"
+        # Keep the two newest backups (the names sort by time).
+        find "$(dirname "$DB_PATH")" -maxdepth 1 -name 'backup-*.db' | sort -r | tail -n +3 | xargs -r rm -f --
+    else
+        rm -f "$dest"
+        warn "the database backup failed; upgrading without one"
+    fi
+}
+if [ "$upgrade" -eq 1 ]; then
+    configured_db="$(sed -n 's/^database_path *= *"\([^"]*\)".*/\1/p' "$CONFIG_FILE" | head -1)"
+    DB_PATH="${configured_db:-$DB_PATH}"
+    if [ -d "${CONFIG_DIR}/rules" ]; then cp -a "${CONFIG_DIR}/rules" "${backup}/rules"; fi
+    if [ -e "$RULES_MANIFEST" ]; then cp -p "$RULES_MANIFEST" "${backup}/rules.sha256"; fi
+    if [ -e "$UNIT_FILE" ]; then cp -p "$UNIT_FILE" "${backup}/peephole.service"; fi
+    if [ -e "$UNIT_MANIFEST" ]; then cp -p "$UNIT_MANIFEST" "${backup}/unit.sha256"; fi
+    backup_database
+fi
+
 # --- install files -----------------------------------------------------------
+# The config holds the MaxMind key, the data dir the node key and the
+# database: readable by root only.
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "${CONFIG_DIR}/rules"
+chmod 0750 "$CONFIG_DIR"
+chmod 0700 "$DATA_DIR"
+for f in "$DB_PATH" "${DB_PATH}-wal" "${DB_PATH}-shm"; do
+    if [ -e "$f" ]; then chmod 0600 "$f"; fi
+done
 info "Installing binary to ${INSTALL_BIN}"
 install -m 0755 "${src}/peephole" "${INSTALL_BIN}.new"
 if [ -x "$INSTALL_BIN" ]; then cp -p "$INSTALL_BIN" "${INSTALL_BIN}.prev"; fi
@@ -452,6 +578,8 @@ for rule in "${src}/rules/"*.toml; do
     printf '%s %s\n' "$new_sum" "$name" >> "$new_manifest"
 done
 mv -f "$new_manifest" "$RULES_MANIFEST"
+# The annotated reference for this version (not read by peephole).
+install -m 0644 "${src}/deploy/config.example.toml" "${CONFIG_DIR}/config.example.toml"
 
 # --- configuration (first install only) --------------------------------------
 CONFIG_KEY=""
@@ -466,7 +594,7 @@ else
     new_config="${tmpdir}/config.toml"
     {
         echo "# peephole configuration — generated by install.sh"
-        echo "# Full reference: https://github.com/${REPO}/blob/master/deploy/config.example.toml"
+        echo "# Annotated reference for the installed version: ${CONFIG_DIR}/config.example.toml"
         if has_role listener; then
             echo
             echo "# Trap listener: your reverse proxy sends requests that match no real site here."
@@ -515,8 +643,10 @@ timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admi
 rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
 max_scans_per_hour = 30    # rate cap of this scanner; excess jobs stay queued
 retention_days = 90        # standalone only: delete older requests and scans; 0 = keep forever (ignored in a cluster)
-# Non-global addresses (loopback, private, link-local, …) are never scanned.
-never_scan = ["192.168.0.0/16"] # extra CIDRs this node's scanner never scans (own infra, monitoring)
+# Non-global addresses (loopback, private, link-local, …) are never scanned,
+# so list public ranges only: your own servers, monitoring, upstream, e.g.
+# never_scan = ["203.0.113.0/24", "2001:db8::/32"]
+never_scan = [] # extra CIDRs this node's scanner never scans
 CONFIG
         if [ "${PEEPHOLE_CLUSTER:-0}" = 1 ]; then
             cat <<CONFIG
@@ -564,41 +694,99 @@ CONFIG
 fi
 
 # --- systemd -----------------------------------------------------------------
+# The unit is a conffile like the rules: an edited unit is kept and the new
+# upstream one is placed beside it as peephole.service.new (systemd ignores
+# that name). Changes belong in a drop-in (systemctl edit peephole), which the
+# installer never touches.
 info "Installing systemd service"
-install -m 0644 "${src}/deploy/peephole.service" "$UNIT_FILE"
-systemctl daemon-reload
-if systemctl is-enabled peephole >/dev/null 2>&1; then
-    systemctl restart peephole; info "Restarted peephole service"
+UNIT_NEW_WRITTEN=0
+unit_sum="$(sha256sum "${src}/deploy/peephole.service" | cut -d' ' -f1)"
+if [ ! -e "$UNIT_FILE" ]; then
+    install -m 0644 "${src}/deploy/peephole.service" "$UNIT_FILE"
 else
-    systemctl enable --now peephole; info "Enabled and started peephole service"
+    current="$(sha256sum "$UNIT_FILE" | cut -d' ' -f1)"
+    recorded="$(cat "$UNIT_MANIFEST" 2>/dev/null || true)"
+    if [ "$current" = "$unit_sum" ]; then
+        : # identical already
+    elif [ "$current" = "$recorded" ] || [[ " ${KNOWN_UNIT_SUMS} " == *" ${current} "* ]]; then
+        install -m 0644 "${src}/deploy/peephole.service" "$UNIT_FILE"   # unedited → take upstream
+    else
+        install -m 0644 "${src}/deploy/peephole.service" "${UNIT_FILE}.new"
+        UNIT_NEW_WRITTEN=1
+        warn "kept your edited ${UNIT_FILE}; the new upstream unit is ${UNIT_FILE}.new. Merge it, and keep local changes in a drop-in (systemctl edit peephole)."
+    fi
 fi
+printf '%s\n' "$unit_sum" > "$UNIT_MANIFEST"
 
-# --- health check with rollback ----------------------------------------------
+# Start or restart. With Type=notify the call returns once the listeners are
+# bound, and fails if peephole exits first.
+start_service() {
+    systemctl daemon-reload
+    if systemctl is-enabled peephole >/dev/null 2>&1; then
+        systemctl restart peephole
+    else
+        systemctl enable --now peephole
+    fi
+}
+
 admin_listen="$(sed -n 's/^admin_listen *= *"\([^"]*\)".*/\1/p' "$CONFIG_FILE" | head -1)"
-if [ "${PEEPHOLE_SKIP_HEALTH:-0}" != "1" ]; then
-    healthy=0
+wait_healthy() {
+    [ "${PEEPHOLE_SKIP_HEALTH:-0}" = "1" ] && return 0
     if [ -n "$admin_listen" ]; then
         info "Waiting for http://${admin_listen}/healthz"
         for _ in $(seq 1 20); do
-            if curl -fs "http://${admin_listen}/healthz" >/dev/null 2>&1; then healthy=1; break; fi
+            if curl -fs "http://${admin_listen}/healthz" >/dev/null 2>&1; then return 0; fi
             sleep 1
         done
-    else
-        # No web role, so no HTTP endpoint: the service must stay up.
+        return 1
+    fi
+    # No web role, so no HTTP endpoint: the service must be up and stay up.
+    # A notify unit is up once started; an older (kept) simple unit only shows
+    # a failed start after a moment.
+    if [ "$(systemctl show -p Type --value peephole 2>/dev/null)" != "notify" ]; then
         info "Waiting for the service to stay up (no web role, no /healthz)"
         sleep 5
-        if systemctl is-active --quiet peephole; then healthy=1; fi
     fi
-    if [ "$healthy" -ne 1 ]; then
-        journalctl -u peephole -n 30 --no-pager >&2 || true
-        if [ -x "${INSTALL_BIN}.prev" ] && [ "$upgrade" -eq 1 ]; then
-            warn "new version did not become healthy; rolling back to the previous binary"
-            mv -f "${INSTALL_BIN}.prev" "$INSTALL_BIN"
-            systemctl restart peephole
-            die "rolled back. The log above shows why the new version failed."
+    systemctl is-active --quiet peephole
+}
+
+# Put back what this run changed: binary, rules, unit and, if the new version
+# migrated it, the database.
+rollback() {
+    systemctl stop peephole || true
+    mv -f "${INSTALL_BIN}.prev" "$INSTALL_BIN"
+    if [ -d "${backup}/rules" ]; then
+        rm -rf "${CONFIG_DIR}/rules"
+        cp -a "${backup}/rules" "${CONFIG_DIR}/rules"
+    fi
+    if [ -e "${backup}/rules.sha256" ]; then cp -p "${backup}/rules.sha256" "$RULES_MANIFEST"; fi
+    if [ -e "${backup}/peephole.service" ]; then
+        cp -p "${backup}/peephole.service" "$UNIT_FILE"
+        if [ "$UNIT_NEW_WRITTEN" = 1 ]; then rm -f "${UNIT_FILE}.new"; fi
+    fi
+    if [ -e "${backup}/unit.sha256" ]; then cp -p "${backup}/unit.sha256" "$UNIT_MANIFEST"; else rm -f "$UNIT_MANIFEST"; fi
+    if [ -n "$DB_BACKUP" ] && [ "$(schema_version "$DB_PATH")" != "$DB_SCHEMA" ]; then
+        warn "the new version changed the database schema; restoring ${DB_BACKUP} (requests recorded since the backup are lost)"
+        rm -f "${DB_PATH}-wal" "${DB_PATH}-shm"
+        install -m 0600 "$DB_BACKUP" "$DB_PATH"
+    fi
+}
+
+started=1
+start_service || started=0
+if [ "$started" -eq 1 ]; then info "Started peephole ${new_version}"; fi
+if [ "$started" -ne 1 ] || ! wait_healthy; then
+    journalctl -u peephole -n 30 --no-pager >&2 || true
+    if [ "$upgrade" -eq 1 ] && [ -x "${INSTALL_BIN}.prev" ]; then
+        warn "the new version did not become healthy; rolling back binary, rules and unit"
+        rollback
+        if start_service && wait_healthy; then
+            die "rolled back to ${installed_version:-the previous version}, which is running again. The log above shows why ${new_version} failed."
         fi
-        die "peephole did not become healthy; see the log above"
+        journalctl -u peephole -n 30 --no-pager >&2 || true
+        die "rolled back to ${installed_version:-the previous version}, but the service did not come up either; see journalctl -u peephole.${DB_BACKUP:+ Database backup: ${DB_BACKUP}}"
     fi
+    die "peephole did not become healthy; see the log above"
 fi
 
 # --- done --------------------------------------------------------------------
