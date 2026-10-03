@@ -107,7 +107,9 @@ const RECLASSIFY_ROWS: usize = 200;
 /// and two labels are known (all [`Evidence::thin`] asks of them), at most
 /// [`RECLASSIFY_ROWS`]; `labels` is then a lower bound.
 ///
-/// Without `verify`, the stored verdicts count as they are.
+/// Without `verify`, the stored verdicts count as they are: for the trap
+/// queueing a scan on what it has just classified itself. A scanner always
+/// verifies, with the rules built into its binary.
 pub async fn evidence(
     pool: &SqlitePool,
     ip: &str,
@@ -495,7 +497,7 @@ mod tests {
     async fn verified_evidence_counts_what_our_rules_see() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
-        let rules = Classifier::from_dir(std::path::Path::new("rules")).unwrap();
+        let rules = Classifier::builtin();
         let rec = store.local();
         let ip = store
             .upsert_ip("198.51.100.6".parse().unwrap())
@@ -517,7 +519,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(trusted.allowed_level(&s), 4);
-        let ev = evidence(&store.pool, &ip.ip, &Origins::Any, Some(&rules))
+        let ev = evidence(&store.pool, &ip.ip, &Origins::Any, Some(rules))
             .await
             .unwrap();
         assert_eq!(
@@ -533,7 +535,7 @@ mod tests {
         let mut r = req(ip.id, 1, r#"["probe"]"#);
         r.path = "/.env".into();
         rec.insert_request(&r).await.unwrap();
-        let ev = evidence(&store.pool, &ip.ip, &Origins::Any, Some(&rules))
+        let ev = evidence(&store.pool, &ip.ip, &Origins::Any, Some(rules))
             .await
             .unwrap();
         assert_eq!((ev.max_level, ev.labels), (1, 2), "{ev:?}");
@@ -549,7 +551,7 @@ mod tests {
             r.path = format!("/p{n}");
             rec.insert_request(&r).await.unwrap();
         }
-        let ev = evidence(&store.pool, &scanner.ip, &Origins::Any, Some(&rules))
+        let ev = evidence(&store.pool, &scanner.ip, &Origins::Any, Some(rules))
             .await
             .unwrap();
         assert_eq!(ev.max_level, 2);

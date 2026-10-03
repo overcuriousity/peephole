@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,47 +92,32 @@ impl Rule {
     }
 }
 
-pub fn load_dir(dir: &Path) -> Result<Vec<Rule>> {
-    Ok(load(dir)?.0)
-}
-
-/// A rules file as loaded: its name (without the directory) and its text.
+/// A rules file: its name (as in `rules/`) and its text.
 pub type RulesFile = (String, String);
 
-/// The rules of `dir`, and the files they came from, in name order.
-pub fn load(dir: &Path) -> Result<(Vec<Rule>, Vec<RulesFile>)> {
+/// The rules files built into the binary (`rules/*.toml` at build time, by
+/// name), from `build.rs`.
+pub const BUILTIN: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/builtin_rules.rs"));
+
+/// The built-in rules files, owned.
+pub fn builtin_files() -> Vec<RulesFile> {
+    BUILTIN
+        .iter()
+        .map(|(n, t)| (n.to_string(), t.to_string()))
+        .collect()
+}
+
+/// The rules of `files`, parsed and validated, in the files' order.
+pub fn parse(files: &[RulesFile]) -> Result<Vec<Rule>> {
     let mut rules = vec![];
-    let mut files = vec![];
-    let mut entries: Vec<_> = std::fs::read_dir(dir)
-        .with_context(|| format!("reading rules dir {}", dir.display()))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-        // Not hidden files (an editor's `.#x.toml` lock, often a dangling
-        // symlink), and only regular files (symlinks followed).
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| !n.as_encoded_bytes().starts_with(b"."))
-                && std::fs::metadata(p).is_ok_and(|m| m.is_file())
-        })
-        .collect();
-    entries.sort();
-    for path in entries {
-        let text = std::fs::read_to_string(&path)?;
-        let file: RuleFile =
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    for (name, text) in files {
+        let file: RuleFile = toml::from_str(text).with_context(|| format!("parsing {name}"))?;
         for r in &file.rule {
-            r.validate()
-                .with_context(|| format!("in {}", path.display()))?;
+            r.validate().with_context(|| format!("in {name}"))?;
         }
         rules.extend(file.rule);
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        files.push((name, text));
     }
-    Ok((rules, files))
+    Ok(rules)
 }
 
 /// The fingerprint of a ruleset: SHA-256 (lower-case hex) over its files
@@ -171,21 +155,23 @@ mod tests {
     }
 
     #[test]
-    fn empty_files_hidden_files_and_directories_are_fine() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        std::fs::write(d.join("a.toml"), "# [[rule]]\n# label = \"x\"\n").unwrap();
-        std::fs::write(
-            d.join("b.toml"),
-            "[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\n",
-        )
+    fn empty_files_are_fine_and_errors_name_the_file() {
+        let files = |list: &[(&str, &str)]| {
+            list.iter()
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let rules = parse(&files(&[
+            ("a.toml", "# [[rule]]\n# label = \"x\"\n"),
+            (
+                "b.toml",
+                "[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\n",
+            ),
+        ]))
         .unwrap();
-        std::fs::write(d.join(".hidden.toml"), "not toml").unwrap();
-        std::fs::create_dir(d.join("dir.toml")).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("user@host.1234", d.join(".#b.toml")).unwrap();
-        let rules = load_dir(d).unwrap();
         assert_eq!(rules.len(), 1);
+        let e = parse(&files(&[("c.toml", "not toml")])).unwrap_err();
+        assert!(format!("{e:#}").contains("c.toml"), "{e:#}");
     }
 
     #[test]
@@ -254,27 +240,37 @@ mod tests {
         }
         assert!(!is_fingerprint("abc"));
         assert!(!is_fingerprint(&base.to_uppercase()));
-        // The files load_dir reads are the ones fingerprinted.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.toml"), "# none yet\n").unwrap();
-        std::fs::write(dir.path().join(".hidden.toml"), "junk").unwrap();
-        std::fs::write(dir.path().join("notes.txt"), "junk").unwrap();
-        let (_, files) = load(dir.path()).unwrap();
-        assert_eq!(
-            files,
-            vec![("a.toml".to_string(), "# none yet\n".to_string())]
-        );
+    }
+
+    /// The built-in rules are the `*.toml` files of `rules/` (not hidden
+    /// ones), in name order, as they are on disk.
+    #[test]
+    fn builtin_rules_are_the_rules_directory() {
+        let mut on_disk: Vec<RulesFile> = std::fs::read_dir("rules")
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .filter(|p| !p.file_name().unwrap().as_encoded_bytes().starts_with(b"."))
+            .map(|p| {
+                (
+                    p.file_name().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read_to_string(&p).unwrap(),
+                )
+            })
+            .collect();
+        on_disk.sort();
+        assert_eq!(builtin_files(), on_disk);
     }
 
     #[test]
     fn shipped_rules_load_and_validate() {
-        let rules = load_dir(std::path::Path::new("rules")).unwrap();
+        let rules = parse(&builtin_files()).unwrap();
         assert!(!rules.is_empty());
     }
 
     #[test]
     fn shipped_rules_all_carry_owasp_tags() {
-        let rules = load_dir(std::path::Path::new("rules")).unwrap();
+        let rules = parse(&builtin_files()).unwrap();
         assert!(rules.len() >= 30, "rule-count sanity: {}", rules.len());
         for r in &rules {
             assert!(

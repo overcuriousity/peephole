@@ -5,7 +5,6 @@ use anyhow::Result;
 use regex::Regex;
 use std::borrow::Cow;
 use std::io::Read;
-use std::path::Path;
 
 #[derive(Debug)]
 pub struct RequestView<'a> {
@@ -187,8 +186,7 @@ pub fn decoded_body<'a>(headers: &[(String, String)], body: &'a [u8]) -> Cow<'a,
 
 pub struct Classifier {
     rules: Vec<CompiledRule>,
-    /// The files the rules came from, and their fingerprint.
-    files: Vec<rules::RulesFile>,
+    /// [`rules::fingerprint`] of the files the rules came from.
     fingerprint: String,
 }
 
@@ -199,18 +197,24 @@ impl Classifier {
     }
 
     /// SHA-256 over the rules files (see [`rules::fingerprint`]): stored
-    /// with every request this classifier labels.
+    /// with every request this classifier labels. For [`Self::builtin`],
+    /// the fingerprint of the rules this binary was built with.
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
 
-    /// The rules files as loaded: name and text, in name order.
-    pub fn files(&self) -> &[rules::RulesFile] {
-        &self.files
+    /// The rules built into this binary ([`rules::BUILTIN`]), compiled once.
+    /// Panics if they do not load; unit tests make sure they do.
+    pub fn builtin() -> &'static Classifier {
+        static BUILTIN: std::sync::OnceLock<Classifier> = std::sync::OnceLock::new();
+        BUILTIN.get_or_init(|| {
+            Classifier::from_files(&rules::builtin_files()).expect("the built-in rules load")
+        })
     }
 
-    pub fn from_dir(dir: &Path) -> Result<Self> {
-        let (rules, files) = rules::load(dir)?;
+    /// A classifier for the given rules files (name and text).
+    pub fn from_files(files: &[rules::RulesFile]) -> Result<Self> {
+        let rules = rules::parse(files)?;
         let rules = rules
             .into_iter()
             .map(|r| {
@@ -228,9 +232,8 @@ impl Classifier {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            fingerprint: rules::fingerprint(&files),
+            fingerprint: rules::fingerprint(files),
             rules,
-            files,
         })
     }
 
@@ -365,7 +368,7 @@ mod tests {
     use super::*;
 
     fn classifier() -> Classifier {
-        Classifier::from_dir(std::path::Path::new("rules")).unwrap()
+        Classifier::from_files(&rules::builtin_files()).unwrap()
     }
     fn view<'a>(
         method: &'a str,
@@ -1014,16 +1017,26 @@ mod tests {
         assert!(v.labels.contains(&"proxy-probe".to_string()), "{v:?}");
     }
 
+    /// The rules built into the binary load, once, and carry the
+    /// fingerprint of their files.
+    #[test]
+    fn builtin_rules_load() {
+        let c = Classifier::builtin();
+        assert!(c.rule_count() > 0);
+        assert!(std::ptr::eq(c, Classifier::builtin()));
+        assert_eq!(c.fingerprint(), rules::fingerprint(&rules::builtin_files()));
+        assert!(rules::is_fingerprint(c.fingerprint()));
+    }
+
     #[test]
     fn rules_can_match_on_method() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("m.toml"),
+        let c = Classifier::from_files(&[(
+            "m.toml".into(),
             "[[rule]]\nlabel = \"jsp-upload\"\nweight = 4\nmethods = [\"PUT\"]\ntarget_regex = \"\\\\.jsp/?$\"\n\
-             [[rule]]\nlabel = \"webdav\"\nweight = 2\nmethods = [\"PROPFIND\", \"MKCOL\"]\n",
-        )
+             [[rule]]\nlabel = \"webdav\"\nweight = 2\nmethods = [\"PROPFIND\", \"MKCOL\"]\n"
+                .into(),
+        )])
         .unwrap();
-        let c = Classifier::from_dir(dir.path()).unwrap();
         assert!(labels_of(&c, "PUT", "/shell.jsp/", &[], None).contains(&"jsp-upload".into()));
         assert!(!labels_of(&c, "GET", "/shell.jsp/", &[], None).contains(&"jsp-upload".into()));
         assert!(!labels_of(&c, "PUT", "/a.txt", &[], None).contains(&"jsp-upload".into()));

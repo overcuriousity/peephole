@@ -42,7 +42,6 @@ trap_listen = "127.0.0.1:{trap}"
 admin_listen = "127.0.0.1:{admin}"
 database_path = "{d}/p.db"
 data_dir = "{d}"
-rules_dir = "rules"
 [roles]
 scanner = false
 [webauthn]
@@ -102,7 +101,6 @@ trap_listen = "127.0.0.1:{trap}"
 admin_listen = "127.0.0.1:{admin}"
 database_path = "{d}/p.db"
 data_dir = "{d}"
-rules_dir = "rules"
 [roles]
 scanner = false
 [webauthn]

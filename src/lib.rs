@@ -25,22 +25,21 @@ pub const VERSION: &str = env!("PEEPHOLE_VERSION");
 pub const COMMIT: &str = env!("PEEPHOLE_COMMIT");
 
 /// Startup validation shared by `run` and `check-config`: config parses and
-/// is sane, rules load (listener), nmap is executable (scanner). Returns the
-/// classifier when the listener role is on, and a one-line summary.
-pub async fn check_config(
-    config_path: &std::path::Path,
-) -> Result<(config::Config, Option<classify::Classifier>, String)> {
+/// is sane, nmap is executable (scanner). Returns the config and a summary:
+/// one line, then notes (the built-in rules, keys that do nothing).
+pub async fn check_config(config_path: &std::path::Path) -> Result<(config::Config, String)> {
     let cfg = config::Config::load(config_path).context("config")?;
-    let notes = config::optional_key_notes(config_path);
+    let mut notes = cfg.obsolete_notes();
+    notes.extend(config::optional_key_notes(config_path));
     let mut summary = format!("ok: config (roles: {})", cfg.roles.names().join(", "));
-    let classifier = match (&cfg.rules_dir, cfg.roles.listener) {
-        (Some(dir), true) => {
-            let c = classify::Classifier::from_dir(dir).context("loading rules")?;
-            summary.push_str(&format!(", rules ({})", c.rule_count()));
-            Some(c)
-        }
-        _ => None,
-    };
+    // Built into the binary: the same on every start and every node of
+    // this build.
+    let rules = classify::Classifier::builtin();
+    summary.push_str(&format!(
+        ", rules built in ({}, {})",
+        rules.rule_count(),
+        &rules.fingerprint()[..12]
+    ));
     if cfg.roles.scanner {
         let nmap = cfg.scan.nmap();
         let out = tokio::process::Command::new(&nmap)
@@ -83,7 +82,7 @@ pub async fn check_config(
         summary.push('\n');
         summary.push_str(&n);
     }
-    Ok((cfg, classifier, summary))
+    Ok((cfg, summary))
 }
 
 /// Whether this node loads the GeoLite2 databases in its data dir. A cluster
@@ -95,8 +94,11 @@ pub fn geolite_loads(cfg: &config::Config) -> bool {
 
 pub async fn run(config_path: PathBuf) -> Result<()> {
     // Startup validation (spec §12).
-    let (cfg, _, summary) = check_config(&config_path).await?;
+    let (cfg, summary) = check_config(&config_path).await?;
     info!(version = VERSION, "{summary}");
+    for note in cfg.obsolete_notes() {
+        warn!("{note}");
+    }
     std::fs::create_dir_all(&cfg.data_dir)?;
     let store = store::Store::connect(&cfg.database_path).await?;
 
@@ -467,19 +469,12 @@ impl RoleRunner {
     }
 
     async fn start_trap(&self) -> Result<Running> {
-        let (Some(addr), Some(dir)) = (self.cfg.trap_listen, &self.cfg.rules_dir) else {
-            anyhow::bail!("trap_listen and rules_dir are required");
+        let Some(addr) = self.cfg.trap_listen else {
+            anyhow::bail!("trap_listen is required");
         };
-        // Loaded on every start, so edited rules apply when the role is
-        // switched off and on.
-        let classifier = classify::Classifier::from_dir(dir).context("loading rules")?;
-        // Every request carries the rules' fingerprint; the rules themselves
-        // are published once per change.
-        match self.recorder.publish_ruleset(&classifier).await {
-            Ok(true) => info!(rules = classifier.fingerprint(), "ruleset published"),
-            Ok(false) => {}
-            Err(e) => warn!(error = %format!("{e:#}"), "publishing the ruleset failed"),
-        }
+        // The rules built into the binary; every request carries their
+        // fingerprint.
+        let classifier = classify::Classifier::builtin();
         let state = Arc::new(trap::TrapState {
             store: self.store.clone(),
             recorder: self.recorder.clone(),
@@ -539,23 +534,8 @@ impl RoleRunner {
     }
 
     async fn start_scanner(&self) -> Result<Running> {
-        // Grants are checked against this node's own rules (loaded on every
-        // start, like the trap's). A node without `rules_dir` takes the
-        // stored verdicts as they are.
-        let classifier = match &self.cfg.rules_dir {
-            Some(dir) => Some(Arc::new(
-                classify::Classifier::from_dir(dir).context("loading rules")?,
-            )),
-            None => {
-                if self.node.is_some() {
-                    warn!(
-                        "no rules_dir: this scanner trusts the scan levels other nodes \
-                         stored instead of classifying their requests again"
-                    );
-                }
-                None
-            }
-        };
+        // Grants are checked against the rules built into this binary.
+        let classifier = classify::Classifier::builtin();
         let (stop, rx) = tokio::sync::watch::channel(false);
         Ok(Running {
             stop,

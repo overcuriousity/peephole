@@ -130,7 +130,6 @@ trap_listen = "127.0.0.1:0"
 admin_listen = "127.0.0.1:0"
 database_path = "{d}/t.db"
 data_dir = "{d}"
-rules_dir = "rules"
 [webauthn]
 rp_id = "localhost"
 origin = "https://localhost"

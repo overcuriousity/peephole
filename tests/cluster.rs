@@ -186,7 +186,7 @@ async fn boot_in(
             nmap.clone(),
             rx.clone(),
             peephole::events::Notifier::new(),
-            None,
+            peephole::classify::Classifier::builtin(),
         ))
     });
     cluster::start(node.clone(), rx).await.unwrap();
@@ -1546,55 +1546,6 @@ async fn blocking_a_peer_hides_its_records_until_unblocked() {
     assert!(!nb.is_blocked(&a.id));
 }
 
-/// A ruleset is published once per change and reaches every member; a
-/// block takes it out of the tables (the log keeps it), an unblock brings
-/// it back, and a purge removes it.
-#[tokio::test]
-async fn rulesets_are_published_once_and_replicate() {
-    use peephole::cluster::block;
-    let (ia, a) = new_node("rules-a");
-    let (ib, b) = new_node("rules-b");
-    let na = boot(ia, &a, &[&b], DEFAULT).await;
-    let nb = boot(ib, &b, &[&a], DEFAULT).await;
-    let rules = peephole::classify::Classifier::from_dir(std::path::Path::new("rules")).unwrap();
-    assert!(rec(&na).publish_ruleset(&rules).await.unwrap());
-    assert!(
-        !rec(&na).publish_ruleset(&rules).await.unwrap(),
-        "already a's current ruleset"
-    );
-    let held = format!(
-        "SELECT COUNT(*) FROM rulesets WHERE origin = x'{}' AND hash = '{}'",
-        data_encoding::HEXLOWER.encode(&a.id.0),
-        rules.fingerprint()
-    );
-    eventually("b holds a's ruleset", || async {
-        count(&nb, &held).await == 1
-    })
-    .await;
-    // Another ruleset is published; going back publishes the first again,
-    // so the newest is always the current one.
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("x.toml"), "# no rules\n").unwrap();
-    let other = peephole::classify::Classifier::from_dir(dir.path()).unwrap();
-    assert!(rec(&na).publish_ruleset(&other).await.unwrap());
-    assert!(rec(&na).publish_ruleset(&rules).await.unwrap());
-    eventually("b holds all three", || async {
-        count(&nb, "SELECT COUNT(*) FROM rulesets").await == 3
-    })
-    .await;
-
-    block::block(&nb, a.id).await.unwrap();
-    assert_eq!(count(&nb, "SELECT COUNT(*) FROM rulesets").await, 0);
-    block::unblock(&nb, a.id).await.unwrap();
-    assert_eq!(count(&nb, "SELECT COUNT(*) FROM rulesets").await, 3);
-    block::block(&nb, a.id).await.unwrap();
-    block::purge(&nb, a.id).await.unwrap();
-    assert_eq!(
-        count(&nb, "SELECT COUNT(*) FROM repl_log WHERE kind = 'ruleset'").await,
-        0
-    );
-}
-
 /// A cluster node's admin cannot delete records: the data belongs to the
 /// cluster, and retention prunes it.
 #[tokio::test]
@@ -2541,7 +2492,6 @@ async fn admin_on(n: &TestNode) -> (reqwest::Client, String) {
         r#"
 database_path = "/x"
 data_dir = "/x"
-rules_dir = "rules"
 [webauthn]
 rp_id = "localhost"
 origin = "https://localhost"
@@ -2663,7 +2613,9 @@ async fn admin_cluster_page_and_private_attribution() {
         "Scanner pace",
         // B and C recorded nothing to classify again, and run no trap.
         "no requests to compare",
-        "none published",
+        "none recorded",
+        "built in",
+        &peephole::classify::Classifier::builtin().fingerprint()[..12],
     ] {
         assert!(page.contains(want), "cluster page lacks {want}");
     }

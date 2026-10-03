@@ -90,11 +90,12 @@ Column order is as listed.
 ### Classification
 
 These are **rule output, not ground truth**. The trap matches each
-request against the TOML signature rules in `rules/` (operators can edit
-them); a model trained on `labels` or `severity` learns those rules back.
+request against the TOML signature rules in `rules/`, built into the
+recording binary; a model trained on `labels` or `severity` learns those
+rules back.
 Treat them as weak labels, or re-label from `method`, `path`, `query`,
-`headers` and `body`. The `rules` column says which ruleset classified a
-row (`build` says which build recorded it).
+`headers` and `body`. The `rules` column says which rules classified a row
+(`build` says which build recorded it).
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -102,7 +103,7 @@ row (`build` says which build recorded it).
 | `owasp` | list of string | OWASP tags of the matching rules: a Top 10 2021 class (`A03:2021`) for payload families, an Automated Threat (`OAT-014`) for scanning behaviour. Behavioural labels carry none |
 | `severity` | int? | 0 (noise) to 4 (exploit attempt); the highest of the matching rules. Null on light rows |
 | `scan_level` | int? | Counter-scan level this request earned (0: none, 1 to 4) |
-| `rules` | string? | Fingerprint of the ruleset that classified it: SHA-256 (hex) over the rules files, sorted by name, each as its name's and text's 8-byte big-endian length followed by the bytes. Every node publishes the files of each ruleset it uses once (Admin → Cluster shows each member's current one). Null for claims, light rows and rows recorded before the column existed. It is what the recording node says it used, not a proof |
+| `rules` | string? | Fingerprint of the rules that classified it, those built into the recording binary: SHA-256 (hex) over the `rules/*.toml` files, sorted by name, each as its name's and text's 8-byte big-endian length followed by the bytes. Rows with the same value were classified by the same rules, whatever the build; to see the rules, check out a commit whose `rules/` has that fingerprint (`peephole check-config` prints the start of a binary's). Null for claims, light rows and rows recorded before the column existed. It is what the recording node says it used, not a proof |
 | `fp_claim` | bool | The address filed a false-positive claim at some point (claim texts and e-mail addresses are never exported) |
 
 ### The source address, at the time of the request

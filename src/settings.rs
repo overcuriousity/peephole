@@ -129,11 +129,10 @@ pub struct Prereqs {
 
 impl Prereqs {
     pub fn from_config(cfg: &Config, nmap_ok: bool) -> Self {
-        let listener = match (&cfg.trap_listen, &cfg.rules_dir) {
-            (None, _) => Some("trap_listen is not set in the config file".to_string()),
-            (_, None) => Some("rules_dir is not set in the config file".to_string()),
-            _ => None,
-        };
+        let listener = cfg
+            .trap_listen
+            .is_none()
+            .then(|| "trap_listen is not set in the config file".to_string());
         let web = match (&cfg.admin_listen, &cfg.webauthn) {
             (None, _) => Some("admin_listen is not set in the config file".to_string()),
             (_, None) => Some("[webauthn] is missing in the config file".to_string()),
@@ -460,7 +459,7 @@ mod tests {
 
     fn cfg(extra: &str) -> Config {
         toml::from_str(&format!(
-            "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\nrules_dir = \"r\"\n{extra}"
+            "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n{extra}"
         ))
         .unwrap()
     }

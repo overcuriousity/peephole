@@ -30,7 +30,6 @@ async fn spawn(extra: &str) -> (String, Store, tempfile::TempDir) {
 trap_listen = "127.0.0.1:0"
 database_path = "{db}"
 data_dir = "{d}"
-rules_dir = "rules"
 trusted_proxies = ["127.0.0.1/32"]
 [roles]
 web = false
@@ -588,7 +587,6 @@ trap_listen = "127.0.0.1:0"
 trap_tls_listen = "127.0.0.1:0"
 database_path = "{db}"
 data_dir = "{d}"
-rules_dir = "rules"
 trusted_proxies = [{trusted}]
 [roles]
 web = false
@@ -829,7 +827,7 @@ async fn light_rows_of_requests_in_flight_at_shutdown_are_kept() {
     std::fs::write(
         &cfg_path,
         format!(
-            "trap_listen = \"127.0.0.1:0\"\ndatabase_path = \"{}\"\ndata_dir = \"{}\"\nrules_dir = \"rules\"\n[roles]\nweb = false\n",
+            "trap_listen = \"127.0.0.1:0\"\ndatabase_path = \"{}\"\ndata_dir = \"{}\"\n[roles]\nweb = false\n",
             dir.path().join("t.db").display(),
             dir.path().display()
         ),

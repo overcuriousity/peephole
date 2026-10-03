@@ -22,7 +22,7 @@ nmap.
 - **Trap** — records every request that reaches no real site, with headers
   and body, the raw request head as received, how it was answered and, over
   HTTPS, the raw TLS ClientHello and its JA4 fingerprint; and classifies it
-  against editable TOML signature rules — sixteen families from `sqli`,
+  against TOML signature rules built into the binary — sixteen families from `sqli`,
   `rce` and path traversal to SSRF, webshells, deserialization and
   AI-infrastructure probes, each tagged with its OWASP reference (Top 10
   2021 class or Automated Threat) — into a severity 0–4. Floods are
@@ -122,9 +122,11 @@ On port 443 nginx routes by server name without decrypting, so the trap
 terminates TLS itself and keeps the raw ClientHello and its JA4 fingerprint.
 
 Configuration lives in `/etc/peephole/config.toml`
-([annotated reference](deploy/config.example.toml)); signature rules are TOML
-files in `/etc/peephole/rules` ([defaults](rules/)). Scan pace, rescan
-cooldown and roles can also be changed at runtime from the admin area.
+([annotated reference](deploy/config.example.toml)). The signature rules
+([`rules/`](rules/)) ship inside the binary, so every node of a build
+classifies alike and each request records which rules it was classified
+with; changing them means a new build. Scan pace, rescan cooldown and roles
+can also be changed at runtime from the admin area.
 
 ## License
 

@@ -79,9 +79,10 @@ pub struct RequestRec {
     /// (both stored as `[]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owasp_json: Option<String>,
-    /// Fingerprint of the ruleset that classified the request (see
-    /// [`RulesetRec`]); absent for claims and records written before the
-    /// field existed.
+    /// Fingerprint of the rules that classified the request: those built
+    /// into the recording binary ([`crate::classify::rules::fingerprint`]).
+    /// The recording node's word, like the verdict; absent for claims and
+    /// records written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<String>,
 }
@@ -237,26 +238,6 @@ pub struct IntelManifestRec {
     pub fetched_at: String,
 }
 
-/// The rules a node classifies requests with, published once per change:
-/// when its trap starts with rules it has not published as its current
-/// ones. Requests carry only the fingerprint.
-///
-/// What a node publishes is its word, like any verdict it stores: a node
-/// can publish one ruleset and classify with another. Nodes check what
-/// they act on by classifying the requests again with their own rules.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RulesetRec {
-    pub uid: String,
-    /// [`crate::classify::rules::fingerprint`] of `files`.
-    pub hash: String,
-    /// The rules files: name and text, in name order.
-    pub files: Vec<(String, String)>,
-    /// Source commit of the binary that created the record (provenance);
-    /// left out when unset, like every field added later.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub build: String,
-}
-
 /// A delete by the node that created the listed records. Wherever it is
 /// applied, it only affects entries of the tombstone's own origin; uids of
 /// other nodes' records in the list are ignored.
@@ -294,7 +275,6 @@ pub enum Record {
     Tombstone(TombstoneRec),
     IntelManifest(IntelManifestRec),
     SkipBatch(SkipBatchRec),
-    Ruleset(RulesetRec),
 }
 
 /// Kinds whose payload is not stored in the log but rebuilt from their row
@@ -318,7 +298,6 @@ impl Record {
             Record::Tombstone(_) => "tombstone",
             Record::IntelManifest(_) => "intel_manifest",
             Record::SkipBatch(_) => "skip_batch",
-            Record::Ruleset(_) => "ruleset",
         }
     }
 
@@ -333,7 +312,6 @@ impl Record {
             Record::ScanResult(r) => Some(r.uid.clone()),
             Record::Tombstone(r) => Some(r.uid.clone()),
             Record::SkipBatch(r) => Some(r.uid.clone()),
-            Record::Ruleset(r) => Some(r.uid.clone()),
             _ => None,
         }
     }

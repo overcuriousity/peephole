@@ -9,8 +9,7 @@
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{
     FingerprintRec, FpClaimRec, IntelManifestRec, IpIntelRec, JobAdoptRec, JobStatusRec, PortRec,
-    ROW_BACKED, Record, RequestRec, RulesetRec, ScanJobRec, ScanResultRec, SkipBatchRec,
-    TombstoneRec,
+    ROW_BACKED, Record, RequestRec, ScanJobRec, ScanResultRec, SkipBatchRec, TombstoneRec,
 };
 use anyhow::Result;
 use sqlx::SqliteConnection;
@@ -85,7 +84,6 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
         Record::Tombstone(t) => tombstone(conn, ctx, t).await,
         Record::IntelManifest(m) => intel_manifest(conn, ctx, m).await,
         Record::SkipBatch(b) => skip_batch(conn, ctx, b).await,
-        Record::Ruleset(r) => ruleset(conn, ctx, r).await,
         Record::MemberAdd(_) | Record::MemberUpdate(_) | Record::MemberRevoke { .. } => {
             Ok(Effect::Ignored)
         }
@@ -94,7 +92,7 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
 
 /// Record kinds a local hide or block keeps out of the tables. Membership,
 /// tombstones and scan-job state still apply, so the cluster stays in step.
-const CONTENT_KINDS: [&str; 8] = [
+const CONTENT_KINDS: [&str; 7] = [
     "request",
     "skip_batch",
     "fingerprint",
@@ -102,7 +100,6 @@ const CONTENT_KINDS: [&str; 8] = [
     "scan_job",
     "scan_result",
     "ip_intel",
-    "ruleset",
 ];
 
 async fn origin_blocked(conn: &mut SqliteConnection, origin: Option<&NodeId>) -> Result<bool> {
@@ -305,39 +302,6 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(&r.ja4)
     .bind(&r.build)
     .bind(rules)
-    .execute(&mut *conn)
-    .await?;
-    Ok(Effect::Applied)
-}
-
-/// Most files, and bytes of text in all, a published ruleset may have
-/// (the shipped rules are a few dozen kB).
-pub const RULESET_MAX_FILES: usize = 256;
-pub const RULESET_MAX_BYTES: usize = 1024 * 1024;
-
-/// Whether a ruleset fits [`RULESET_MAX_FILES`] and [`RULESET_MAX_BYTES`].
-pub fn ruleset_fits(files: &[(String, String)]) -> bool {
-    files.len() <= RULESET_MAX_FILES
-        && files.iter().map(|(n, t)| n.len() + t.len()).sum::<usize>() <= RULESET_MAX_BYTES
-}
-
-/// A ruleset as published. Its hash must be its files' fingerprint; an
-/// oversized one is ignored. A node's current ruleset is its newest.
-async fn ruleset(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RulesetRec) -> Result<Effect> {
-    if !ruleset_fits(&r.files) || crate::classify::rules::fingerprint(&r.files) != r.hash {
-        return Ok(Effect::Ignored);
-    }
-    sqlx::query(
-        "INSERT OR IGNORE INTO rulesets (uid, origin, hlc, hash, files_json, build, published_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&r.uid)
-    .bind(ctx.origin_bytes())
-    .bind(ctx.hlc as i64)
-    .bind(&r.hash)
-    .bind(serde_json::to_string(&r.files)?)
-    .bind(&r.build)
-    .bind(now_ts())
     .execute(&mut *conn)
     .await?;
     Ok(Effect::Applied)
@@ -2310,57 +2274,6 @@ mod tests {
         ] {
             assert_eq!(count(&mut conn, sql).await, 0, "{sql}");
         }
-    }
-
-    /// A ruleset is stored when its hash is its files' fingerprint and it
-    /// is not oversized; standalone too.
-    #[tokio::test]
-    async fn rulesets_are_stored_when_their_hash_holds() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
-        let mut conn = store.pool.acquire().await.unwrap();
-        let a = Identity::generate().unwrap().id;
-        let files = vec![("a.toml".to_string(), "# a\n".to_string())];
-        let rec = |uid: &str, files: Vec<(String, String)>, hash: String| {
-            Record::Ruleset(RulesetRec {
-                uid: format!("{}{uid}", a.uid_prefix()),
-                hash,
-                files,
-                build: String::new(),
-            })
-        };
-        let hash = crate::classify::rules::fingerprint(&files);
-        for (ctx_origin, uid) in [(Some(&a), "r1"), (None, "r2")] {
-            let ctx = Ctx {
-                origin: ctx_origin,
-                hlc: 5,
-            };
-            let r = rec(uid, files.clone(), hash.clone());
-            assert_eq!(apply(&mut conn, ctx, &r).await.unwrap(), Effect::Applied);
-        }
-        let ctx = Ctx {
-            origin: Some(&a),
-            hlc: 6,
-        };
-        let lie = rec("lie", vec![("b.toml".into(), "# b\n".into())], hash.clone());
-        assert_eq!(apply(&mut conn, ctx, &lie).await.unwrap(), Effect::Ignored);
-        let big = vec![("big.toml".to_string(), "#".repeat(RULESET_MAX_BYTES))];
-        let r = rec(
-            "big",
-            big.clone(),
-            crate::classify::rules::fingerprint(&big),
-        );
-        assert_eq!(apply(&mut conn, ctx, &r).await.unwrap(), Effect::Ignored);
-        let rows: Vec<(Option<Vec<u8>>, String, String)> =
-            sqlx::query_as("SELECT origin, hash, files_json FROM rulesets ORDER BY id")
-                .fetch_all(&mut *conn)
-                .await
-                .unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0.as_deref(), Some(&a.0[..]));
-        assert_eq!(rows[1].0, None);
-        assert_eq!(rows[0].1, hash);
-        assert_eq!(rows[0].2, r##"[["a.toml","# a\n"]]"##);
     }
 
     #[tokio::test]

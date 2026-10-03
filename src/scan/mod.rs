@@ -199,10 +199,9 @@ struct Source {
     crawlers: Option<crawler::Crawlers>,
     tor: std::sync::Mutex<guard::TorView>,
     origins: guard::Origins,
-    /// This node's rules, to classify the requests behind a grant again
-    /// (`guard::evidence`). None without `rules_dir`: stored verdicts count
-    /// as they are.
-    classifier: Option<Arc<Classifier>>,
+    /// This node's rules (built in), to classify the requests behind a
+    /// grant again (`guard::evidence`).
+    classifier: &'static Classifier,
     /// Standalone jobs waiting (Tor status unknown), until when.
     deferred: std::sync::Mutex<HashMap<i64, Instant>>,
     tor_warned: std::sync::Mutex<Option<Instant>>,
@@ -224,7 +223,7 @@ impl Source {
         rec: Recorder,
         cfg: Config,
         pace: pace::SharedPace,
-        classifier: Option<Arc<Classifier>>,
+        classifier: &'static Classifier,
     ) -> Self {
         let s = &cfg.scan.safety;
         Self {
@@ -501,7 +500,7 @@ impl Source {
             let why = Some(format!("this scanner is scanning the IP at level {l}"));
             return Ok(Err((if l >= level { "superseded" } else { "later" }, why)));
         }
-        let ev = guard::evidence(pool, &ip_text, &self.origins, self.classifier.as_deref()).await?;
+        let ev = guard::evidence(pool, &ip_text, &self.origins, Some(self.classifier)).await?;
         let allowed = ev.allowed_level(&self.cfg.scan.safety);
         if allowed < level {
             if ev.max_level < level {
@@ -802,7 +801,7 @@ pub async fn run_workers(
     nmap_path: PathBuf,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     notifier: crate::events::Notifier,
-    classifier: Option<Arc<Classifier>>,
+    classifier: &'static Classifier,
 ) {
     if matches!(rec, Recorder::Local(_)) {
         // In a cluster the arbiters recover their own jobs.
@@ -919,7 +918,6 @@ trap_listen = "0.0.0.0:8080"
 admin_listen = "127.0.0.1:8443"
 database_path = "{db}"
 data_dir = "{dir}"
-rules_dir = "rules"
 [webauthn]
 rp_id = "x.example"
 origin = "https://x.example"
@@ -1172,7 +1170,7 @@ license_key = "k"
             fake,
             rx,
             crate::events::Notifier::new(),
-            None,
+            Classifier::builtin(),
         ));
         wait_for_scans(&store, jobs).await;
         tx.send(true).unwrap();
@@ -1218,7 +1216,7 @@ license_key = "k"
             fake,
             rx,
             crate::events::Notifier::new(),
-            None,
+            Classifier::builtin(),
         ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let err = loop {
@@ -1280,7 +1278,7 @@ license_key = "k"
             fake.clone(),
             rx,
             crate::events::Notifier::new(),
-            None,
+            Classifier::builtin(),
         ));
         // Wait until the job is done (poll DB, max 5s).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1348,7 +1346,7 @@ license_key = "k"
             .unwrap();
         store.enqueue_scan(ok.id, 1, 24).await.unwrap();
         let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
-        let source = Source::new(store.local(), cfg, p, None);
+        let source = Source::new(store.local(), cfg, p, Classifier::builtin());
         let job = source.acquire().await.unwrap().expect("the valid job");
         assert_eq!(job.ip().to_string(), "203.0.113.50");
         let (status, started, error) = status_of(&store, "198.51.0.1").await;
@@ -1379,13 +1377,13 @@ license_key = "k"
             .await
             .unwrap();
         store.enqueue_scan(a.id, 2, 24).await.unwrap();
-        let source = Source::new(store.local(), cfg.clone(), p(), None);
+        let source = Source::new(store.local(), cfg.clone(), p(), Classifier::builtin());
         assert!(source.acquire().await.unwrap().is_none(), "deferred");
         assert_eq!(status_of(&store, "203.0.113.60").await.0, "queued");
         assert!(source.acquire().await.unwrap().is_none(), "still waiting");
         // The list loads (a fresh scanner, so the retry delay is not waited out).
         write_tor_list(dir.path(), "203.0.113.61\n");
-        let source = Source::new(store.local(), cfg.clone(), p(), None);
+        let source = Source::new(store.local(), cfg.clone(), p(), Classifier::builtin());
         let job = source
             .acquire()
             .await
@@ -1416,7 +1414,7 @@ license_key = "k"
             .execute(&store.pool)
             .await
             .unwrap();
-        let source = Source::new(store.local(), cfg.clone(), p(), None);
+        let source = Source::new(store.local(), cfg.clone(), p(), Classifier::builtin());
         assert!(source.acquire().await.unwrap().is_none());
         let (status, _, error) = status_of(&store, "203.0.113.62").await;
         assert_eq!(status, "refused");
@@ -1490,13 +1488,13 @@ license_key = "k"
             &format!("tor_unknown = \"scan\"\nverify_crawlers = false\n{scan}"),
         );
         let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
-        let source = Source::new(Recorder::Cluster(node.clone()), cfg, p, Some(rules()));
+        let source = Source::new(
+            Recorder::Cluster(node.clone()),
+            cfg,
+            p,
+            Classifier::builtin(),
+        );
         (node, source, store)
-    }
-
-    /// This node's rules: the shipped ones.
-    fn rules() -> Arc<Classifier> {
-        Arc::new(Classifier::from_dir(std::path::Path::new("rules")).unwrap())
     }
 
     /// A request that the shipped rules put at `level`, as stored with that
@@ -1633,15 +1631,6 @@ license_key = "k"
         let (status, why) = r.err().unwrap();
         assert_eq!(status, "declined");
         assert!(why.unwrap().contains("highest: 1"));
-        // Without rules of its own, a scanner takes the stored level.
-        let trusting = Source::new(rec.clone(), source.cfg.clone(), source.pace.clone(), None);
-        assert!(
-            trusting
-                .check_grant(node.id(), &grant(&uid, &ip.ip, 4))
-                .await
-                .unwrap()
-                .is_ok()
-        );
     }
 
     /// A grant for an IP this scanner is scanning now, or for a job that

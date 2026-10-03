@@ -57,7 +57,8 @@ pub struct TrapState {
     /// Writes; replicated in a cluster.
     pub recorder: crate::store::recorder::Recorder,
     pub cfg: Config,
-    pub classifier: Classifier,
+    /// The rules built into the binary ([`Classifier::builtin`]).
+    pub classifier: &'static Classifier,
     pub geo: Arc<RwLock<Option<GeoIp>>>,
     pub tor: Arc<RwLock<TorExitList>>,
     pub notifier: crate::events::Notifier,
@@ -249,8 +250,7 @@ impl TrapState {
     }
 
     pub fn for_test(store: Store, cfg: Config) -> Self {
-        let classifier =
-            Classifier::from_dir(cfg.rules_dir.as_ref().expect("rules_dir")).expect("rules");
+        let classifier = Classifier::builtin();
         let pace =
             crate::scan::pace::SharedPace::new(crate::scan::pace::Pace::from_config(&cfg.scan));
         pace.set_cooldown_hours(cfg.scan.rescan_cooldown_hours);

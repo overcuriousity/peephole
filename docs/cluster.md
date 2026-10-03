@@ -7,7 +7,7 @@ combination of three roles, set in `[roles]`:
 
 | Role | Does | Needs |
 |---|---|---|
-| `listener` | the trap: records and classifies requests, queues scans | `trap_listen`, `rules_dir` |
+| `listener` | the trap: records and classifies requests, queues scans | `trap_listen` |
 | `scanner` | runs nmap for jobs from any trap | nmap |
 | `web` | wall of shame and admin area | `admin_listen`, `[webauthn]` |
 
@@ -104,40 +104,39 @@ be listed under `[[cluster.peers]]` with their key.
   job and runs it only when requests it holds back the level;
   `scan.trusted_origins` limits whose requests count. It does not take a
   request's stored scan level on trust: it classifies the request again
-  with its own rules (`rules_dir`) and counts the lower of the two levels,
-  and the labels its own rules give. A node with doctored rules cannot make
-  other scanners scan harder than their rules allow. The IP's history in
-  the hour before (which turns many requests into a path scanner) is
-  rebuilt from the rows the scanner holds, so it can come out smaller,
-  never above the stored level. A scanner without `rules_dir` takes the
-  stored levels as they are (and says so in its log).
+  with the rules built into its own binary and counts the lower of the two
+  levels, and the labels its own rules give. A node with doctored rules
+  cannot make other scanners scan harder than their rules allow. The IP's
+  history in the hour before (which turns many requests into a path
+  scanner) is rebuilt from the rows the scanner holds, so it can come out
+  smaller, never above the stored level.
 - The Members table on the Cluster page shows, per member, how its newest
   500 requests compare with this node's rules ("rules agree 100%",
   "disagree on 12% of 500"): the share whose labels or severity come out
   differently when classified again here. A request agrees when either
   history (all the rows held here, or only the member's own) reproduces
   it, so requests of other nodes the member had not seen yet do not count
-  as disagreement. Made at most every 10 minutes, from the rules on disk.
-  Differences come from rules that differ (an older or newer version, local
-  edits) as much as from doctored ones.
-- **Rulesets.** Every request carries the fingerprint of the rules that
-  classified it (`rules`, a SHA-256 over the rules files), and every node
-  publishes the files of a ruleset once, when its trap starts with rules
-  that are not its current published ones. The Cluster page shows each
-  member's current ruleset, "same as ours" or "differs", and a request's
-  page its fingerprint. What is checked and what is only declared:
-  - A published ruleset's fingerprint is checked against its files, but
-    nothing proves a node classifies with the ruleset it publishes, or that
-    the fingerprint on its requests is the one it used: a node can lie
-    about both.
+  as disagreement. Made at most every 10 minutes, with the rules built into
+  this binary. Differences come from members running another build (older
+  or newer rules) as much as from doctored ones.
+- **Rules fingerprints.** The signature rules are built into the binary, so
+  nodes of one build classify alike. Every request carries the fingerprint
+  of the rules that classified it (`rules`, a SHA-256 over the rules files)
+  and the build that recorded it (`build`). The Cluster page shows our own
+  fingerprint and, per member, the one its newest requests carry ("same as
+  ours" or "differs", with a count when they carry more than one, as after
+  an upgrade); a request's page shows its fingerprint. What is checked and
+  what is only declared:
+  - The build and the rules fingerprint on a row are the recording node's
+    word. A modified binary can claim any build and any fingerprint, and
+    classify with whatever rules it likes.
   - The actual check is classifying again: scanners do it for every grant,
     and the Rules column for each member's recent requests.
   - Neither can tell a fabricated request from a real one: a node can
     record requests nobody sent. `scan.trusted_origins` and blocking are
     the answer to a member you do not trust.
-  - Older nodes relay the new record kind without understanding it, and
-    keep the signed form of requests with a fingerprint (their rows have no
-    column for it), so a mixed cluster keeps syncing.
+  - Older nodes keep the signed form of requests with a fingerprint (their
+    rows have no column for it), so a mixed cluster keeps syncing.
 - When two nodes queue the same IP before either job has reached the
   other, only one of them is scanned: the higher level, else the one
   queued first. Arbiters and scanners both apply this, and the other job

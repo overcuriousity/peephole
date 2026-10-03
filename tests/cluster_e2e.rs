@@ -73,7 +73,6 @@ trap_listen = "127.0.0.1:{trap}"
 admin_listen = "127.0.0.1:{admin}"
 database_path = "{d}/a.db"
 data_dir = "{d}"
-rules_dir = "rules"
 trusted_proxies = ["127.0.0.1/32"]
 [roles]
 scanner = false

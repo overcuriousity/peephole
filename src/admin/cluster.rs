@@ -78,38 +78,71 @@ pub struct MemberView {
     pub rules: String,
     /// Some of them came out differently here.
     pub rules_differ: bool,
-    /// Its current ruleset, short ("3f9a0c1d2e4b"), or "none published".
+    /// The rules fingerprint its newest requests carry, short
+    /// ("3f9a0c1d2e4b", "3f9a0c1d2e4b +1 other"), or "none recorded".
     pub ruleset: String,
-    /// Whether that is ours; None when either is unknown.
+    /// Whether that newest fingerprint is ours; None without one.
     pub ruleset_same: Option<bool>,
 }
 
-/// Characters of a ruleset fingerprint shown.
+/// Characters of a rules fingerprint shown.
 const SHORT_HASH: usize = 12;
 
-/// Each node's current ruleset: the one it published last.
-async fn current_rulesets(
-    store: &crate::store::Store,
-) -> AppResult<std::collections::HashMap<Vec<u8>, String>> {
-    let rows: Vec<(Option<Vec<u8>>, String)> =
-        sqlx::query_as("SELECT origin, hash FROM rulesets ORDER BY hlc, id")
-            .fetch_all(&store.pool)
-            .await?;
-    // Later rows overwrite earlier ones.
-    Ok(rows
-        .into_iter()
-        .map(|(o, h)| (o.unwrap_or_default(), h))
-        .collect())
+/// The rules fingerprints a member's newest classified requests carry
+/// (`requests.rules`): what the recording binary says it classified with.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Carried {
+    /// The newest request's.
+    pub newest: Option<String>,
+    /// Other fingerprints among the sample (a node upgraded meanwhile).
+    pub others: usize,
 }
 
-/// Members' recent requests classified again with this node's rules, by
-/// member ([`crate::classify::stored::agreement`]).
+impl Carried {
+    /// What the page shows, and whether the newest is `ours`.
+    fn view(&self, ours: &str) -> (String, Option<bool>) {
+        let Some(h) = &self.newest else {
+            return ("none recorded".into(), None);
+        };
+        let mut s: String = h.chars().take(SHORT_HASH).collect();
+        match self.others {
+            0 => {}
+            1 => s.push_str(" +1 other"),
+            n => s.push_str(&format!(" +{n} others")),
+        }
+        (s, Some(h == ours))
+    }
+}
+
+/// The fingerprints the newest `sample` classified requests of `origin`
+/// carry (None: this standalone node's own rows).
+pub async fn carried(
+    pool: &sqlx::SqlitePool,
+    origin: Option<&[u8]>,
+    sample: i64,
+) -> anyhow::Result<Carried> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT rules FROM requests
+         WHERE origin IS ? AND is_fp_claim = 0 AND rules IS NOT NULL
+         ORDER BY id DESC LIMIT ?",
+    )
+    .bind(origin)
+    .bind(sample)
+    .fetch_all(pool)
+    .await?;
+    let distinct: std::collections::HashSet<&String> = rows.iter().collect();
+    Ok(Carried {
+        newest: rows.first().cloned(),
+        others: distinct.len().saturating_sub(1),
+    })
+}
+
+/// Members' recent requests classified again with this node's (built-in)
+/// rules, and the rules fingerprints they carry, by member
+/// ([`crate::classify::stored::agreement`], [`carried`]).
 pub struct RulesCheck {
     pub by_member: std::collections::HashMap<NodeId, Agreement>,
-    /// Why nothing was compared (no or broken `rules_dir` here).
-    pub unavailable: Option<String>,
-    /// The fingerprint of the rules compared with.
-    pub fingerprint: Option<String>,
+    pub carried: std::collections::HashMap<NodeId, Carried>,
 }
 
 /// How long a comparison is shown before it is made again.
@@ -120,43 +153,28 @@ const RULES_SAMPLE: i64 = 500;
 /// The comparison, made at most every [`RULES_CHECK_TTL`] (an older one is
 /// shown while it is made again), so the page stays fast.
 async fn rules_check(st: &AdminState, node: &Node) -> AppResult<Arc<RulesCheck>> {
-    let (store, dir) = (node.store.clone(), st.cfg.rules_dir.clone());
+    let store = node.store.clone();
     Ok(st
         .rules_check
         .get((), RULES_CHECK_TTL, move || {
-            let (store, dir) = (store.clone(), dir.clone());
-            Box::pin(async move { compare_rules(&store, dir.as_deref()).await })
+            let store = store.clone();
+            Box::pin(async move { compare_rules(&store).await })
         })
         .await?)
 }
 
-async fn compare_rules(
-    store: &crate::store::Store,
-    dir: Option<&std::path::Path>,
-) -> anyhow::Result<RulesCheck> {
+async fn compare_rules(store: &crate::store::Store) -> anyhow::Result<RulesCheck> {
     let mut check = RulesCheck {
         by_member: Default::default(),
-        unavailable: None,
-        fingerprint: None,
+        carried: Default::default(),
     };
-    // The rules as they are on disk now (the trap and scanner load them
-    // when they start).
-    let rules = match dir.map(crate::classify::Classifier::from_dir) {
-        None => Err("no rules_dir on this node".to_string()),
-        Some(Err(e)) => Err(format!("rules do not load: {e:#}")),
-        Some(Ok(c)) => Ok(c),
-    };
-    let c = match rules {
-        Ok(c) => c,
-        Err(why) => {
-            check.unavailable = Some(why);
-            return Ok(check);
-        }
-    };
-    check.fingerprint = Some(c.fingerprint().to_string());
+    let c = crate::classify::Classifier::builtin();
     for m in members::all(store).await? {
-        let a = agreement(&store.pool, &c, Some(&m.id.0[..]), RULES_SAMPLE).await?;
+        let origin = Some(&m.id.0[..]);
+        let a = agreement(&store.pool, c, origin, RULES_SAMPLE).await?;
         check.by_member.insert(m.id, a);
+        let k = carried(&store.pool, origin, RULES_SAMPLE).await?;
+        check.carried.insert(m.id, k);
     }
     Ok(check)
 }
@@ -207,6 +225,9 @@ struct ClusterPage {
     /// Members whose older history no reachable peer can give this node.
     unserved: Option<String>,
     contributions: Vec<ContribView>,
+    /// The fingerprint of the rules built into this binary, and its start.
+    rules: &'static str,
+    rules_short: String,
 }
 
 /// This node's runtime settings as its own page shows them.
@@ -273,21 +294,14 @@ async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<Me
     let statuses = node.peer_status.read().unwrap().clone();
     let me = node.id();
     let keys = crate::cluster::confkey::held(&node.store).await?;
-    let rulesets = current_rulesets(&node.store).await?;
-    // What our trap published, else the rules on disk.
-    let ours = rulesets
-        .get(&me.0[..])
-        .or(check.fingerprint.as_ref())
-        .cloned();
+    let ours = builtin_rules();
     let ruleset_of = |id: &NodeId| {
-        let theirs = rulesets.get(&id.0[..]);
-        (
-            theirs.map_or_else(
-                || "none published".to_string(),
-                |h| h.chars().take(SHORT_HASH).collect(),
-            ),
-            theirs.zip(ours.as_ref()).map(|(t, o)| t == o),
-        )
+        check
+            .carried
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
+            .view(ours)
     };
     let mut out = vec![];
     let mut mine = None;
@@ -321,11 +335,7 @@ async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<Me
         let v = MemberView {
             ruleset,
             ruleset_same,
-            rules: match (&check.unavailable, agreement) {
-                (Some(why), _) => format!("not compared: {why}"),
-                (None, Some(a)) => a.summary(),
-                (None, None) => String::new(),
-            },
+            rules: agreement.map(Agreement::summary).unwrap_or_default(),
             rules_differ: agreement.is_some_and(|a| a.differing > 0),
             key: m.id.to_string(),
             short: m.id.short(),
@@ -385,10 +395,10 @@ async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<Me
         }
     }
     let own = own_history(node).await?;
-    let (ruleset, _) = ruleset_of(&me);
+    let (ruleset, ruleset_same) = ruleset_of(&me);
     let mine = mine.unwrap_or_else(|| MemberView {
         ruleset,
-        ruleset_same: None,
+        ruleset_same,
         key: me.to_string(),
         short: me.short(),
         name: node.cfg.node_name.clone(),
@@ -676,6 +686,8 @@ async fn render_page(st: &AdminState, invite: Option<String>) -> AppResult<Html<
             audit: vec![],
             unserved: None,
             contributions: vec![],
+            rules: builtin_rules(),
+            rules_short: builtin_rules().chars().take(SHORT_HASH).collect(),
         });
     };
     let names: std::collections::HashMap<NodeId, String> = members::all(&node.store)
@@ -722,7 +734,14 @@ async fn render_page(st: &AdminState, invite: Option<String>) -> AppResult<Html<
         audit,
         unserved: unserved(node).await?,
         contributions: contributions(node).await?,
+        rules: builtin_rules(),
+        rules_short: builtin_rules().chars().take(SHORT_HASH).collect(),
     })
+}
+
+/// The fingerprint of the rules built into this binary.
+fn builtin_rules() -> &'static str {
+    crate::classify::Classifier::builtin().fingerprint()
 }
 
 async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
@@ -1212,6 +1231,59 @@ async fn set_pace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fingerprint a member's newest requests carry, read from the
+    /// rows: claims and rows without one left out, others counted.
+    #[tokio::test]
+    async fn carried_rules_come_from_the_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let rec = store.local();
+        let ip = store
+            .upsert_ip("203.0.113.9".parse().unwrap())
+            .await
+            .unwrap();
+        let ours = builtin_rules().to_string();
+        let old = "ab".repeat(32);
+        for (rules, claim) in [
+            (Some(old.clone()), false),
+            (Some(ours.clone()), false),
+            (None, false),
+            (Some(old.clone()), true),
+        ] {
+            rec.insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                is_fp_claim: claim,
+                rules,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let k = carried(&store.pool, None, 500).await.unwrap();
+        assert_eq!(
+            k,
+            Carried {
+                newest: Some(ours.clone()),
+                others: 1
+            }
+        );
+        assert_eq!(
+            k.view(&ours),
+            (format!("{} +1 other", &ours[..12]), Some(true))
+        );
+        assert_eq!(k.view(&old).1, Some(false));
+        let none = carried(&store.pool, Some(&[1u8; 32][..]), 500)
+            .await
+            .unwrap();
+        assert_eq!(none.view(&ours), ("none recorded".to_string(), None));
+    }
 
     #[test]
     fn outcomes_travel_in_a_cookie_not_the_url() {

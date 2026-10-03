@@ -15,8 +15,8 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
   checksum. With the GitHub CLI (`gh`) installed it also verifies the build's
   provenance attestation (`PEEPHOLE_VERIFY=1` makes that required, `0` skips
   it), and prints the commit the binary was built from.
-- Installs the binary to `/usr/local/bin/peephole` and the default signature
-  rules to `/etc/peephole/rules`.
+- Installs the binary to `/usr/local/bin/peephole`; the signature rules are
+  built into it.
 - Asks what this node should do:
   - run a **trap**, the **scanner**, the **web interface**, in any combination;
   - whether a reverse proxy on the same machine fronts the trap, and otherwise
@@ -142,13 +142,12 @@ version already matches (`PEEPHOLE_FORCE=1` reinstalls), validates the
 existing config with the new binary, backs up the database
 (`/var/lib/peephole/backup-<time>.db`, the two newest are kept), restarts and
 waits for `/healthz` (or for systemd to report the service up). If the new
-version does not come up, it rolls back the binary, the rules, the unit and —
-when the new version changed its schema — the database, then checks the old
-version is running again.
+version does not come up, it rolls back the binary, the unit and — when the
+new version changed its schema — the database, then checks the old version
+is running again.
 
-Shipped rule files and the systemd unit are treated like conffiles: a file you
-edited is kept and the new upstream version is placed beside it as
-`<name>.new`. Keep your own service settings (sandboxing, limits) in a drop-in
+The systemd unit is treated like a conffile: if you edited it, it is kept and
+the new upstream version is placed beside it as `peephole.service.new`. Keep your own service settings (sandboxing, limits) in a drop-in
 (`systemctl edit peephole`), which upgrades never touch. Your config, the
 nginx example and the nginx site are never rewritten.
 
@@ -167,7 +166,7 @@ systemctl status peephole                         # service status
 journalctl -u peephole -f                         # logs (incl. FIDO2 enrollment instructions)
 peephole --version                                # installed build and its commit
 peephole --help                                   # commands and arguments
-peephole check-config /etc/peephole/config.toml   # validate config, rules and nmap
+peephole check-config /etc/peephole/config.toml   # validate config and nmap; show the built-in rules
 peephole settings show|set|reset                  # runtime settings (pace, cooldown, roles)
 peephole admin reset-token                        # new one-time admin setup token
 peephole export -o data.parquet                   # the dataset (--format, --from, --redistributable, --help)
@@ -177,8 +176,18 @@ peephole db vacuum                                # shrink the database file (st
 Configuration lives in `/etc/peephole/config.toml`; restart after editing
 (`systemctl restart peephole`). Scan pace, rescan cooldown and roles are
 runtime settings, changed from **Admin → Cluster** or `peephole settings`
-without a restart. Signature rules are plain TOML files in
-`/etc/peephole/rules`; see [`rules/`](../rules/) for the shipped defaults.
+without a restart.
+
+**Signature rules** are built into the binary from [`rules/`](../rules/) at
+build time: there is nothing to install or edit on the node, and changing a
+rule means changing `rules/*.toml` and building (CI checks every rule loads).
+`check-config` and the startup log show the number of rules and the start of
+their fingerprint (SHA-256 over the files), which every classified request
+stores. Installs from before this change had the rules in
+`/etc/peephole/rules` and `rules_dir` in the config: both are now ignored
+(peephole logs a warning, `check-config` a note, and the installer says so
+once on upgrade). The installer leaves that directory in place; remove it and
+the `rules_dir` line when you like.
 
 **Admin keys and sessions.** The first FIDO2 key is enrolled at `/enroll` with
 a one-time setup token from the service log. It is valid for 24 hours; a
@@ -244,7 +253,7 @@ immutable release the same way; the tag must equal the `version` in
 
 ## Classification taxonomy
 
-Rules live in `rules/*.toml`, one file per family; each rule has a weight,
+Rules live in `rules/*.toml` (built into the binary), one file per family; each rule has a weight,
 a label and an `owasp` tag. The weight (1–4) is the request's severity and
 drives the counter-scan level:
 
@@ -258,7 +267,7 @@ drives the counter-scan level:
 The `owasp` tag is a Top-10 2021 class (`A03:2021`) for payload families or
 an Automated Threat (`OAT-014`) for scanning behaviour. Tags are stored on
 the request row (`owasp_json`), shown as badges next to the labels in the
-web UI, and included in exports. A typo'd tag fails `check-config`.
+web UI, and included in exports. A typo'd tag fails the build's tests.
 Behavioural labels (`probe`, `path-scanner`, `form-interaction`, …) come
 from code, not rule files, and carry no tag.
 

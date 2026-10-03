@@ -22,7 +22,8 @@ pub struct Config {
     pub admin_listen: Option<SocketAddr>,
     pub database_path: PathBuf,
     pub data_dir: PathBuf,
-    /// Required with the listener role.
+    /// Obsolete and ignored: the signature rules are built into the binary.
+    /// Still accepted so older configs load; see [`Config::obsolete_notes`].
     pub rules_dir: Option<PathBuf>,
     #[serde(default)]
     pub trusted_proxies: Vec<IpNet>,
@@ -475,6 +476,22 @@ const REQUIRED_BY_ROLE: &[&str] = &["webauthn"];
 
 /// One human-readable note per optional key the file does not set.
 /// Unparsable files yield no notes; `load` reports those errors.
+impl Config {
+    /// Keys this config sets that no longer do anything.
+    pub fn obsolete_notes(&self) -> Vec<String> {
+        let mut notes = vec![];
+        if let Some(dir) = &self.rules_dir {
+            notes.push(format!(
+                "note: `rules_dir` ({}) is ignored: the signature rules are built into the \
+                 binary (changing them means a new build); remove the key, and the directory \
+                 if nothing else uses it",
+                dir.display()
+            ));
+        }
+        notes
+    }
+}
+
 pub fn optional_key_notes(path: &Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return vec![];
@@ -542,13 +559,8 @@ impl Config {
                 "trap_tls_cert and trap_tls_key go together (or omit both for a self-signed one)"
             );
         }
-        if r.listener {
-            if self.trap_listen.is_none() {
-                bail!("trap_listen is required with roles.listener");
-            }
-            if self.rules_dir.is_none() {
-                bail!("rules_dir is required with roles.listener");
-            }
+        if r.listener && self.trap_listen.is_none() {
+            bail!("trap_listen is required with roles.listener");
         }
         if r.web {
             if self.admin_listen.is_none() {
@@ -783,7 +795,6 @@ trap_listen = "0.0.0.0:8080"
 admin_listen = "127.0.0.1:8443"
 database_path = "/tmp/x.db"
 data_dir = "/tmp"
-rules_dir = "rules"
 [webauthn]
 rp_id = "x.example"
 origin = "https://x.example"
@@ -811,7 +822,6 @@ trap_listen = "0.0.0.0:8080"
 admin_listen = "127.0.0.1:8443"
 database_path = "/tmp/x.db"
 data_dir = "/tmp"
-rules_dir = "rules"
 [webauthn]
 rp_id = "x.example"
 origin = "https://x.example"
@@ -872,7 +882,7 @@ rp_name = "x"
     #[test]
     fn a_trap_certificate_needs_its_key() {
         let base = "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n\
-                    rules_dir = \"r\"\n[roles]\nweb = false\n";
+                    [roles]\nweb = false\n";
         let cfg: Config = toml::from_str(&format!("trap_tls_cert = \"/c.pem\"\n{base}")).unwrap();
         assert!(cfg.validate().is_err());
         let cfg: Config = toml::from_str(&format!(
@@ -894,7 +904,6 @@ trap_listen = "0.0.0.0:8080"
 admin_listen = "127.0.0.1:8443"
 database_path = "/var/lib/peephole/peephole.db"
 data_dir = "/var/lib/peephole"
-rules_dir = "/etc/peephole/rules"
 trusted_proxies = ["10.0.0.0/8"]
 
 [webauthn]
@@ -942,7 +951,6 @@ trap_listen = "0.0.0.0:8080"
 admin_listen = "127.0.0.1:8443"
 database_path = "/tmp/x.db"
 data_dir = "/tmp"
-rules_dir = "/tmp/rules"
 [maxmind]
 account_id = "1"
 license_key = "k"
@@ -973,17 +981,9 @@ data_dir = "/tmp"
 
     #[test]
     fn each_role_requires_its_settings() {
-        // listener without trap_listen / rules_dir
-        let e = parse(&format!(
-            "{BASE}rules_dir = \"r\"\n[roles]\nscanner = false\nweb = false\n"
-        ))
-        .unwrap_err();
+        // listener without trap_listen
+        let e = parse(&format!("{BASE}[roles]\nscanner = false\nweb = false\n")).unwrap_err();
         assert!(e.to_string().contains("trap_listen"), "{e}");
-        let e = parse(&format!(
-            "trap_listen = \"0.0.0.0:1\"\n{BASE}[roles]\nscanner = false\nweb = false\n"
-        ))
-        .unwrap_err();
-        assert!(e.to_string().contains("rules_dir"), "{e}");
         // web without admin_listen / [webauthn]
         let e = parse(&format!(
             "{BASE}[roles]\nlistener = false\nscanner = false\n"
@@ -995,12 +995,29 @@ data_dir = "/tmp"
         ))
         .unwrap_err();
         assert!(e.to_string().contains("[webauthn]"), "{e}");
-        // listener-only with what it needs
+        // listener-only with what it needs (rules are built in)
         let cfg = parse(&format!(
-            "trap_listen = \"0.0.0.0:1\"\nrules_dir = \"r\"\n{BASE}[roles]\nscanner = false\nweb = false\n"
+            "trap_listen = \"0.0.0.0:1\"\n{BASE}[roles]\nscanner = false\nweb = false\n"
         ))
         .unwrap();
         assert_eq!(cfg.roles.names(), ["listener"]);
+        assert!(cfg.obsolete_notes().is_empty());
+    }
+
+    /// An older config's `rules_dir` still loads, and is reported as
+    /// ignored.
+    #[test]
+    fn rules_dir_is_accepted_and_ignored() {
+        let cfg = parse(&format!(
+            "trap_listen = \"0.0.0.0:1\"\nrules_dir = \"/etc/peephole/rules\"\n{BASE}[roles]\nscanner = false\nweb = false\n"
+        ))
+        .unwrap();
+        let notes = cfg.obsolete_notes();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("rules_dir") && notes[0].contains("built into the binary"),
+            "{notes:?}"
+        );
     }
 
     /// Keep everything unless asked; a window shorter than a week would cut

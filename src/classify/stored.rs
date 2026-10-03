@@ -3,7 +3,7 @@
 //! A row carries the verdict of the node that recorded it. A node whose
 //! rules were tampered with can store any verdict, so whoever acts on one
 //! (a scanner deciding how hard it may scan, the cluster page comparing
-//! rulesets) classifies the row again with its own rules.
+//! rules) classifies the row again with its own rules.
 //!
 //! The trap classifies exactly what it stores: the method, target and
 //! headers (with its `:`-pseudo-headers), and the kept body (at most the
@@ -217,8 +217,8 @@ mod tests {
     use crate::store::Store;
     use crate::store::requests::NewRequest;
 
-    fn classifier() -> Classifier {
-        Classifier::from_dir(std::path::Path::new("rules")).unwrap()
+    fn classifier() -> &'static Classifier {
+        Classifier::builtin()
     }
 
     async fn stored(store: &Store, id: i64) -> StoredRequest {
@@ -322,10 +322,10 @@ mod tests {
         ];
         for (i, (method, target, headers, body)) in cases.into_iter().enumerate() {
             let ip = format!("198.51.100.{}", i + 1);
-            let (id, v) = record(&store, &c, &ip, method, target, &headers, body).await;
+            let (id, v) = record(&store, c, &ip, method, target, &headers, body).await;
             let row = stored(&store, id).await;
             for scope in [History::Seen, History::Own] {
-                let again = row.reclassify(&store.pool, &c, scope).await.unwrap();
+                let again = row.reclassify(&store.pool, c, scope).await.unwrap();
                 assert_eq!(again, v, "{method} {target} ({scope:?})");
             }
         }
@@ -335,7 +335,7 @@ mod tests {
             last = Some(
                 record(
                     &store,
-                    &c,
+                    c,
                     "203.0.113.9",
                     "GET",
                     &format!("/p{n}"),
@@ -349,13 +349,11 @@ mod tests {
         assert!(v.labels.contains(&"path-scanner".to_string()));
         let row = stored(&store, id).await;
         assert_eq!(
-            row.reclassify(&store.pool, &c, History::Seen)
-                .await
-                .unwrap(),
+            row.reclassify(&store.pool, c, History::Seen).await.unwrap(),
             v
         );
         assert_eq!(
-            row.reclassify(&store.pool, &c, History::Own).await.unwrap(),
+            row.reclassify(&store.pool, c, History::Own).await.unwrap(),
             v
         );
         // Another origin's rows count only as what was seen.
@@ -364,12 +362,10 @@ mod tests {
             .execute(&store.pool)
             .await
             .unwrap();
-        let own = row.reclassify(&store.pool, &c, History::Own).await.unwrap();
+        let own = row.reclassify(&store.pool, c, History::Own).await.unwrap();
         assert!(!own.labels.contains(&"path-scanner".to_string()));
         assert_eq!(
-            row.reclassify(&store.pool, &c, History::Seen)
-                .await
-                .unwrap(),
+            row.reclassify(&store.pool, c, History::Seen).await.unwrap(),
             v
         );
     }
@@ -393,17 +389,15 @@ mod tests {
         // The honest node saw two requests of the IP; another node's twenty
         // in the same hour reached it only later.
         for target in ["/a", "/b?id=1%27%20OR%201%3D1--"] {
-            record(&store, &c, "203.0.113.5", "GET", target, &[], None).await;
+            record(&store, c, "203.0.113.5", "GET", target, &[], None).await;
         }
         mark(&honest).await;
         for n in 0..20 {
             let target = format!("/o{n}");
-            record(&store, &c, "203.0.113.5", "GET", &target, &[], None).await;
+            record(&store, c, "203.0.113.5", "GET", &target, &[], None).await;
         }
         mark(&other).await;
-        let a = agreement(&store.pool, &c, Some(&honest), 500)
-            .await
-            .unwrap();
+        let a = agreement(&store.pool, c, Some(&honest), 500).await.unwrap();
         assert_eq!(
             a,
             Agreement {
@@ -412,7 +406,7 @@ mod tests {
             }
         );
         assert_eq!(a.summary(), "rules agree 100%");
-        let a = agreement(&store.pool, &c, Some(&other), 500).await.unwrap();
+        let a = agreement(&store.pool, c, Some(&other), 500).await.unwrap();
         assert_eq!(
             a,
             Agreement {
@@ -428,7 +422,7 @@ mod tests {
         .execute(&store.pool)
         .await
         .unwrap();
-        let a = agreement(&store.pool, &c, Some(&other), 500).await.unwrap();
+        let a = agreement(&store.pool, c, Some(&other), 500).await.unwrap();
         assert_eq!(
             a,
             Agreement {
@@ -441,9 +435,7 @@ mod tests {
             .execute(&store.pool)
             .await
             .unwrap();
-        let a = agreement(&store.pool, &c, Some(&honest), 500)
-            .await
-            .unwrap();
+        let a = agreement(&store.pool, c, Some(&honest), 500).await.unwrap();
         assert_eq!(a.differing, 1);
         let rare = Agreement {
             sampled: 500,

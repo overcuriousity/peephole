@@ -4,7 +4,7 @@ const DEFAULT_CONFIG: &str = "/etc/peephole/config.toml";
 
 const USAGE: &str = "\
 usage: peephole [CONFIG]                 run the daemon (default /etc/peephole/config.toml)
-       peephole check-config [CONFIG]    validate config, rules and nmap
+       peephole check-config [CONFIG]    validate config and nmap; show the built-in rules
        peephole cluster (id|invite|invites|invite-revoke|join|members|status|config-key|block|unblock|leave) …
        peephole settings (show|set|reset) …
        peephole export [OPTIONS] [CONFIG]  the dataset as Parquet, CSV or JSON Lines (--help)
@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
             peephole::COMMIT
         ),
         Cmd::CheckConfig(path) => match peephole::check_config(&path).await {
-            Ok((_, _, summary)) => println!("{summary}"),
+            Ok((_, summary)) => println!("{summary}"),
             Err(e) => fail(e),
         },
         Cmd::Cluster => {

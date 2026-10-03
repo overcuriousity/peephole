@@ -24,7 +24,7 @@
     <dt>Roles</dt><dd>{{ me.roles }}</dd>
     <dt>Address</dt><dd class="mono">{{ me.address }}</dd>
     <dt>Version</dt><dd class="mono">{{ me.version }}</dd>
-    <dt>Rules</dt><dd class="mono" title="Fingerprint of the ruleset this node published last">{{ me.ruleset }}</dd>
+    <dt>Rules</dt><dd><span class="mono" title="Fingerprint of the rules built into this binary: {{ rules }}">{{ rules_short }}</span> <span class="muted small">built in</span></dd>
     <dt>History</dt><dd>{{ me.history }}</dd>
   </dl>
   {% include "_node_settings.html" %}
@@ -49,7 +49,7 @@
 <section class="card">
   <div class="card-head"><h2>Members</h2></div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Node</th><th>Roles</th><th>Address</th><th>Seen</th><th>Version</th><th title="Its newest requests classified again with this node's rules">Rules</th><th>History</th><th>Replication</th><th>Scans</th><th>Settings</th><th></th></tr></thead>
+    <thead><tr><th>Node</th><th>Roles</th><th>Address</th><th>Seen</th><th>Version</th><th title="The rules fingerprint its newest requests carry, and those requests classified again with this node's rules">Rules</th><th>History</th><th>Replication</th><th>Scans</th><th>Settings</th><th></th></tr></thead>
     <tbody>
     {% for m in members %}
       <tr{% if !m.active %} class="muted"{% endif %}>
@@ -61,7 +61,7 @@
         <td class="mono">{{ m.address }}</td>
         <td><span class="badge badge-status" data-status="{% if m.live %}done{% else %}queued{% endif %}">{{ m.last_seen }}</span></td>
         <td class="mono">{{ m.version }}</td>
-        <td><span class="mono" title="The ruleset it published last (its word: what it classifies with is checked below)">{{ m.ruleset }}</span>{% match m.ruleset_same %}{% when Some(true) %} <span class="muted small">same as ours</span>{% when Some(false) %} <span class="badge badge-status" data-status="queued">differs</span>{% when None %}{% endmatch %}
+        <td><span class="mono" title="The rules fingerprint its newest requests carry (its word: what it classifies with is checked below)">{{ m.ruleset }}</span>{% match m.ruleset_same %}{% when Some(true) %} <span class="muted small">same as ours</span>{% when Some(false) %} <span class="badge badge-status" data-status="queued">differs</span>{% when None %}{% endmatch %}
           <br>{% if m.rules_differ %}<span class="badge badge-status" data-status="failed">{{ m.rules }}</span>{% else %}<span class="muted small">{{ m.rules }}</span>{% endif %}</td>
         <td>{{ m.history }}</td>
         <td>{{ m.lag }}</td>

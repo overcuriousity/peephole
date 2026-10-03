@@ -35,7 +35,6 @@ trap_listen = "127.0.0.1:0"
 admin_listen = "127.0.0.1:0"
 database_path = "{d}/t.db"
 data_dir = "{d}"
-rules_dir = "rules"
 [webauthn]
 rp_id = "localhost"
 origin = "https://localhost"
@@ -102,7 +101,6 @@ fn check_config_listener_only_needs_no_nmap_or_webauthn() {
 trap_listen = "127.0.0.1:0"
 database_path = "{d}/t.db"
 data_dir = "{d}"
-rules_dir = "rules"
 [roles]
 scanner = false
 web = false
@@ -291,7 +289,6 @@ fn settings_are_shown_set_and_reset_from_the_shell() {
         format!(
             r#"
 trap_listen = "127.0.0.1:1"
-rules_dir = "rules"
 database_path = "{d}/t.db"
 data_dir = "{d}"
 [roles]
@@ -347,7 +344,6 @@ fn admin_reset_token_replaces_the_setup_token() {
                 r#"
 trap_listen = "127.0.0.1:1"
 admin_listen = "127.0.0.1:2"
-rules_dir = "rules"
 database_path = "{d}/t.db"
 data_dir = "{d}"
 [roles]

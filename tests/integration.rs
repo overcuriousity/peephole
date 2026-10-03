@@ -34,7 +34,6 @@ trap_listen = "127.0.0.1:0"
 admin_listen = "127.0.0.1:0"
 database_path = "{db}"
 data_dir = "{d}"
-rules_dir = "rules"
 trusted_proxies = ["127.0.0.1/32"]
 [webauthn]
 rp_id = "localhost"
@@ -232,8 +231,7 @@ async fn fp_claim_is_stored_and_scan_still_proceeds() {
             .fetch_all(&store.pool)
             .await
             .unwrap();
-    let ours = peephole::classify::Classifier::from_dir(std::path::Path::new("rules"))
-        .unwrap()
+    let ours = peephole::classify::Classifier::builtin()
         .fingerprint()
         .to_string();
     assert_eq!(rules, vec![(false, Some(ours)), (true, None)]);
@@ -1076,7 +1074,6 @@ trap_listen = "127.0.0.1:{trap}"
 admin_listen = "127.0.0.1:{admin}"
 database_path = "{db}"
 data_dir = "{d}"
-rules_dir = "rules"
 trusted_proxies = ["127.0.0.1/32"]
 [webauthn]
 rp_id = "localhost"
@@ -1188,7 +1185,6 @@ trap_listen = "127.0.0.1:{trap}"
 admin_listen = "127.0.0.1:{admin}"
 database_path = "{db}"
 data_dir = "{d}"
-rules_dir = "rules"
 [roles]
 scanner = false
 web = false
@@ -1992,7 +1988,6 @@ trap_listen = "127.0.0.1:0"
 admin_listen = "127.0.0.1:0"
 database_path = "{d}/t.db"
 data_dir = "{d}"
-rules_dir = "rules"
 [webauthn]
 rp_id = "localhost"
 origin = "https://localhost"

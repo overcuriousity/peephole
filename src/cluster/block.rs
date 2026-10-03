@@ -99,11 +99,6 @@ pub async fn block(node: &Node, id: NodeId) -> Result<u64> {
         }
         tx.commit().await?;
     }
-    // Its published rulesets too (the log keeps them for relaying).
-    sqlx::query("DELETE FROM rulesets WHERE origin = ?")
-        .bind(&id.0[..])
-        .execute(&node.store.pool)
-        .await?;
     tracing::info!(id = %id.short(), records = n, "peer blocked");
     Ok(n)
 }
@@ -163,7 +158,6 @@ pub async fn purge(node: &Node, id: NodeId) -> Result<u64> {
         "DELETE FROM intel_files WHERE origin = ?",
         "DELETE FROM origin_usage WHERE origin = ?",
         "DELETE FROM repl_floors WHERE origin = ?",
-        "DELETE FROM rulesets WHERE origin = ?",
     ] {
         sqlx::query(sql).bind(&id.0[..]).execute(&mut *tx).await?;
     }
