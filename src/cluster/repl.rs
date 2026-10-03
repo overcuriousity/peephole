@@ -684,9 +684,31 @@ pub async fn apply_batch_with(
     }
     let guard = node.apply_lock.lock().await;
     let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    // Each entry in a savepoint: one that cannot be stored is rolled back
+    // alone instead of failing the batch, and with it every origin's sync,
+    // round after round. Its origin stops there for this batch (its log
+    // must stay gap-free); the others go on.
+    let mut failed: HashSet<NodeId> = HashSet::new();
     for e in entries {
+        if failed.contains(&e.origin) {
+            st.rejected += 1;
+            continue;
+        }
+        let (origin, seq) = (e.origin, e.seq);
         let start = floors.get(&e.origin).copied();
-        apply_one(node, &mut tx, e, &proofs, start, &mut st).await?;
+        let before = st;
+        let mut sp = sqlx::Connection::begin(&mut *tx).await?;
+        match apply_one(node, &mut sp, e, &proofs, start, &mut st).await {
+            Ok(()) => sp.commit().await?,
+            Err(err) => {
+                sp.rollback().await?;
+                warn!(origin = %origin.short(), seq, error = %format!("{err:#}"),
+                      "log entry could not be stored; its origin waits for a later round");
+                st = before;
+                st.rejected += 1;
+                failed.insert(origin);
+            }
+        }
     }
     // Parked entries may wait for an origin trusted since they were parked
     // (also through a local append), so parking alone is reason to look.
@@ -980,7 +1002,7 @@ async fn apply_verified(
     };
     insert_log(conn, &e, state).await?;
     if let Some(r) = &record {
-        let settled = apply_record(node, conn, &e, r, hlc::wall_ms()).await?;
+        let settled = apply_isolated(node, conn, &e, r, hlc::wall_ms()).await?;
         st.membership_changed |= settled.membership;
         if settled.deferred {
             // Not applicable yet: kept for retry_deferred.
@@ -1078,7 +1100,7 @@ pub async fn apply_unknown_kinds(node: &Node) -> Result<usize> {
     for r in rows {
         let (e, received) = from_timed(r)?;
         let Some(rec) = e.record() else { continue };
-        let settled = apply_record(node, &mut tx, &e, &rec, received).await?;
+        let settled = apply_isolated(node, &mut tx, &e, &rec, received).await?;
         if settled.deferred {
             mark_deferred(&mut tx, &e.origin, e.seq, settled.wait_uid.as_deref()).await?;
         } else {
@@ -1134,7 +1156,7 @@ async fn retry_deferred(node: &Node, conn: &mut SqliteConnection, st: &mut Appli
                     .await?;
                 continue;
             };
-            let settled = apply_record(node, conn, &e, &rec, received).await?;
+            let settled = apply_isolated(node, conn, &e, &rec, received).await?;
             st.membership_changed |= settled.membership;
             if settled.deferred {
                 // Pushes its retry time out, so this call does not see it again.
@@ -1269,7 +1291,7 @@ pub async fn rematerialize(node: &Node) -> Result<usize> {
                 continue;
             };
             if let Some(rec) = e.record() {
-                apply_record(node, &mut tx, &e, &rec, received).await?;
+                apply_isolated(node, &mut tx, &e, &rec, received).await?;
             }
         }
         tx.commit().await?;
@@ -1287,6 +1309,37 @@ struct Settled {
     deferred: bool,
     /// The uid whose arrival makes a deferred entry due at once.
     wait_uid: Option<String>,
+}
+
+/// [`apply_record`] in a savepoint, for entries of the log (received, or
+/// replayed). A record that fails to apply (a constraint, a row this build
+/// cannot take) is rolled back alone and deferred: the entry stays in the
+/// log, so its origin's later entries still connect, and it is retried
+/// with backoff like one waiting for its parent, then given up after
+/// [`DEFER_MAX_AGE`]. Local appends use [`apply_record`] and fail instead.
+async fn apply_isolated(
+    node: &Node,
+    conn: &mut SqliteConnection,
+    e: &WireEntry,
+    r: &Record,
+    received_ms: u64,
+) -> Result<Settled> {
+    let mut sp = sqlx::Connection::begin(&mut *conn).await?;
+    match apply_record(node, &mut sp, e, r, received_ms).await {
+        Ok(settled) => {
+            sp.commit().await?;
+            Ok(settled)
+        }
+        Err(err) => {
+            sp.rollback().await?;
+            warn!(origin = %e.origin.short(), seq = e.seq, kind = %e.kind,
+                  error = %format!("{err:#}"), "log entry failed to apply; deferred");
+            Ok(Settled {
+                deferred: true,
+                ..Default::default()
+            })
+        }
+    }
 }
 
 /// The parent a record may wait for.
@@ -1699,6 +1752,95 @@ mod tests {
         let all = super::super::members::all(&node.store).await.unwrap();
         let row = all.iter().find(|m| m.id == x.id).unwrap();
         assert_eq!(row.name, "second");
+    }
+
+    fn request(o: &Identity, seq: u64, path: &str) -> WireEntry {
+        let r = Record::Request(Box::new(super::super::record::RequestRec {
+            uid: format!("{}{seq}", o.id.uid_prefix()),
+            ts: "2026-10-01 00:00:00".into(),
+            ip: "203.0.113.20".into(),
+            method: "GET".into(),
+            path: path.into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        }));
+        WireEntry::sign(o, seq, now_hlc(seq), &r).unwrap()
+    }
+
+    async fn paths(node: &super::Node) -> Vec<String> {
+        sqlx::query_scalar("SELECT path FROM requests ORDER BY path")
+            .fetch_all(&node.store.pool)
+            .await
+            .unwrap()
+    }
+
+    /// One entry that fails stops neither the batch nor the other origins.
+    /// Before, any error rolled back the whole batch; peers sent it again
+    /// and again and sync stalled for every origin.
+    #[tokio::test]
+    async fn a_failing_entry_does_not_stall_the_batch() {
+        let (_d, node) = test_node(0).await;
+        let (a, b) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        super::append(
+            &node,
+            &[
+                Record::MemberAdd(info(a.id, "a")),
+                Record::MemberAdd(info(b.id, "b")),
+            ],
+        )
+        .await
+        .unwrap();
+        let sql = |s: &'static str| sqlx::query(s).execute(&node.store.pool);
+        // A row the tables refuse (as a constraint would).
+        sql(
+            "CREATE TRIGGER fail_boom BEFORE INSERT ON requests WHEN NEW.path = '/boom'
+             BEGIN SELECT RAISE(ABORT, 'boom'); END",
+        )
+        .await
+        .unwrap();
+        let batch = vec![
+            request(&a, 1, "/boom"),
+            request(&a, 2, "/a"),
+            request(&b, 1, "/b"),
+        ];
+        let st = super::apply_batch(&node, batch).await.unwrap();
+        assert_eq!((st.applied, st.rejected), (3, 0), "{st:?}");
+        assert_eq!(paths(&node).await, ["/a", "/b"]);
+        // The failed one is held, deferred, and applies on a later retry.
+        let state: i64 =
+            sqlx::query_scalar("SELECT applied FROM repl_log WHERE origin = ? AND seq = 1")
+                .bind(&a.id.0[..])
+                .fetch_one(&node.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(state, super::DEFERRED);
+        sql("DROP TRIGGER fail_boom").await.unwrap();
+        sql("UPDATE repl_log SET retry_after = 0").await.unwrap();
+        super::retry_due(&node).await.unwrap();
+        assert_eq!(paths(&node).await, ["/a", "/b", "/boom"]);
+
+        // An entry that cannot even be stored: its origin stops there (no
+        // gap), the others go on.
+        sql(
+            "CREATE TRIGGER fail_log BEFORE INSERT ON repl_log WHEN NEW.seq = 3
+             BEGIN SELECT RAISE(ABORT, 'no room'); END",
+        )
+        .await
+        .unwrap();
+        let batch = vec![
+            request(&a, 3, "/a3"),
+            request(&a, 4, "/a4"),
+            request(&b, 2, "/b2"),
+        ];
+        let st = super::apply_batch(&node, batch).await.unwrap();
+        assert_eq!((st.applied, st.rejected), (1, 2), "{st:?}");
+        assert_eq!(paths(&node).await, ["/a", "/b", "/b2", "/boom"]);
+        let h = super::heads(&node.store).await.unwrap();
+        assert_eq!(
+            (super::head_in(&h, &a.id), super::head_in(&h, &b.id)),
+            (2, 2)
+        );
     }
 
     /// A heartbeat of `id`, as gossiped, keeping `retention_days` from
