@@ -117,31 +117,6 @@ pub type SharedGeo = Arc<RwLock<Option<geo::GeoIp>>>;
 /// Tor exit list shared with the trap.
 pub type SharedTor = Arc<RwLock<tor::TorExitList>>;
 
-/// Rewrite country names left by older builds to ISO codes (needs the MaxMind DBs).
-pub async fn backfill_geo(rec: &Recorder, geo: &RwLock<Option<geo::GeoIp>>) {
-    let store = rec.store();
-    let rows = match store.ips_with_legacy_country().await {
-        Ok(r) if !r.is_empty() => r,
-        Ok(_) => return,
-        Err(e) => return warn!(?e, "geo backfill: query failed"),
-    };
-    let (updates, version) = {
-        let guard = geo.read().unwrap();
-        match guard.as_ref() {
-            Some(g) => (g.relookup(&rows), g.build_date()),
-            None => return,
-        }
-    };
-    match geo::backfill_iso_codes(rec, updates, version.as_deref()).await {
-        Ok(n) => info!(
-            fixed = n,
-            pending = rows.len(),
-            "geo backfill: country names -> ISO codes"
-        ),
-        Err(e) => warn!(?e, "geo backfill failed"),
-    }
-}
-
 /// The providers a node was started with.
 pub type Providers = Vec<Arc<dyn provider::Provider>>;
 
@@ -454,25 +429,15 @@ fn edition_key(edition: &str) -> String {
 /// database keeps its own fetch time, so when one download fails the other
 /// is not fetched again (MaxMind counts every download against a daily
 /// limit). Errors when a download or the reload failed.
-async fn refresh_maxmind(
-    store: &Store,
-    rec: &Recorder,
-    cfg: &Config,
-    geo: &SharedGeo,
-) -> anyhow::Result<()> {
+async fn refresh_maxmind(store: &Store, cfg: &Config, geo: &SharedGeo) -> anyhow::Result<()> {
     let Some(mm) = &cfg.maxmind else {
         return Ok(());
     };
-    // Builds before per-database keys recorded one time for both.
-    let legacy = store.intel_get("maxmind_last_fetch").await?;
     let mut fetched = 0;
     let mut failed = None;
     for edition in geo::EDITIONS {
         let file = cfg.data_dir.join(format!("{edition}.mmdb"));
-        let last = store
-            .intel_get(&edition_key(edition))
-            .await?
-            .or(legacy.clone());
+        let last = store.intel_get(&edition_key(edition)).await?;
         if file.exists() && !is_stale_at(last.as_deref()) {
             continue;
         }
@@ -497,7 +462,6 @@ async fn refresh_maxmind(
                 if fetched > 0 {
                     info!(databases = fetched, "maxmind databases refreshed");
                 }
-                backfill_geo(rec, geo).await;
             }
             // Both files are needed; a first install whose ASN download
             // failed has nothing to load yet.
@@ -564,9 +528,8 @@ pub async fn run_scheduler(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let store = rec.store().clone();
-    backfill_geo(&rec, &geo).await;
     if let Recorder::Cluster(node) = &rec {
-        return run_cluster(node.clone(), rec.clone(), cfg, geo, tor, shutdown).await;
+        return run_cluster(node.clone(), cfg, geo, tor, shutdown).await;
     }
     if cfg.maxmind.is_none() && geo.read().unwrap().is_none() {
         warn!("no [maxmind] credentials and no GeoLite2 databases: GeoIP enrichment is off");
@@ -605,7 +568,7 @@ pub async fn run_scheduler(
             warn_without_tor_list(&tor, &cfg, &mut warned);
         }
         if now >= mm_next {
-            match refresh_maxmind(&store, &rec, &cfg, &geo).await {
+            match refresh_maxmind(&store, &cfg, &geo).await {
                 Ok(()) => {
                     mm_backoff.reset();
                     mm_next = now + MAXMIND_CHECK;
@@ -701,7 +664,6 @@ fn reload(kinds: &[String], cfg: &Config, tor: &SharedTor) {
 /// GeoLite2 databases fresh.
 async fn run_cluster(
     node: std::sync::Arc<crate::cluster::Node>,
-    rec: Recorder,
     cfg: Config,
     geo: SharedGeo,
     tor: SharedTor,
@@ -763,7 +725,7 @@ async fn run_cluster(
         warn_without_tor_list(&tor, &cfg, &mut warned);
         // Every node with credentials keeps its own databases fresh.
         if std::time::Instant::now() >= mm_next {
-            match refresh_maxmind(&node.store, &rec, &cfg, &geo).await {
+            match refresh_maxmind(&node.store, &cfg, &geo).await {
                 Ok(()) => {
                     mm_backoff.reset();
                     mm_next = std::time::Instant::now() + MAXMIND_CHECK;

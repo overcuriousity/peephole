@@ -329,19 +329,12 @@ impl Store {
         let expires = self.intel_get(SETUP_TOKEN_EXPIRES).await?;
         Ok(match (hash.as_deref(), expires) {
             (None, _) | (Some("consumed"), _) => SetupToken::None,
-            (Some(_), None) => SetupToken::Legacy,
+            (Some(_), None) => SetupToken::Expired,
             (Some(_), Some(e)) => match chrono::DateTime::parse_from_rfc3339(&e) {
                 Ok(t) if t > chrono::Utc::now() => SetupToken::Live,
                 _ => SetupToken::Expired,
             },
         })
-    }
-
-    /// Give a token issued before tokens expired a lifetime from now.
-    pub async fn date_legacy_setup_token(&self) -> Result<()> {
-        let expires = chrono::Utc::now() + chrono::Duration::hours(SETUP_TOKEN_HOURS);
-        self.intel_set(SETUP_TOKEN_EXPIRES, &expires.to_rfc3339())
-            .await
     }
 }
 
@@ -366,10 +359,8 @@ pub enum SetupToken {
     None,
     /// Issued and still valid.
     Live,
-    /// Issued and expired.
+    /// Issued and expired (or without an expiry).
     Expired,
-    /// Issued by a build without expiry.
-    Legacy,
 }
 
 /// Whether an RFC 3339 expiry lies in the future.

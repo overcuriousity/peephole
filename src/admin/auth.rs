@@ -84,16 +84,6 @@ pub async fn ensure_setup_token(
     match store.setup_token_state().await? {
         // Issued earlier; console output is the only copy.
         SetupToken::Live => Ok(None),
-        SetupToken::Legacy => {
-            // Issued by a build without expiry: keep it, from now on dated.
-            store.date_legacy_setup_token().await?;
-            tracing::info!(
-                hours = crate::store::auth::SETUP_TOKEN_HOURS,
-                "the admin setup token printed earlier now expires; \
-                 `peephole admin reset-token` prints a new one"
-            );
-            Ok(None)
-        }
         SetupToken::None | SetupToken::Expired => {
             let token = store.issue_setup_token().await?;
             print_setup_token(&token);

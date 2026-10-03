@@ -206,15 +206,6 @@ impl Store {
         .await?)
     }
 
-    /// `(id, ip, country)` for IPs whose country is not an ISO alpha-2 code.
-    pub async fn ips_with_legacy_country(&self) -> Result<Vec<(i64, String, String)>> {
-        Ok(sqlx::query_as(
-            "SELECT id, ip, country FROM ips WHERE country IS NOT NULL AND length(country) != 2",
-        )
-        .fetch_all(&self.pool)
-        .await?)
-    }
-
     /// Set an IP's Tor flag (this node's Tor result; GeoIP is untouched).
     pub async fn set_ip_tor(&self, ip_id: i64, is_tor: bool) -> Result<()> {
         self.local().record_tor(ip_id, is_tor).await
