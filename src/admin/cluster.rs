@@ -5,6 +5,7 @@ use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::pages::{redirect_with_error, redirect_with_notice};
 use crate::admin::views::Chrome;
+use crate::classify::stored::{Agreement, agreement};
 use crate::cluster::identity::NodeId;
 use crate::cluster::status::PaceInfo;
 use crate::cluster::{Node, invite, members, repl};
@@ -72,6 +73,66 @@ pub struct MemberView {
     /// Clock difference worth a warning (cooldowns compare timestamps
     /// written by different nodes), e.g. "+3.5 min".
     pub skew: Option<String>,
+    /// How its recent requests compare with our rules ("rules agree
+    /// 100%"); empty when not compared.
+    pub rules: String,
+    /// Some of them came out differently here.
+    pub rules_differ: bool,
+}
+
+/// Members' recent requests classified again with this node's rules, by
+/// member ([`crate::classify::stored::agreement`]).
+pub struct RulesCheck {
+    pub by_member: std::collections::HashMap<NodeId, Agreement>,
+    /// Why nothing was compared (no or broken `rules_dir` here).
+    pub unavailable: Option<String>,
+}
+
+/// How long a comparison is shown before it is made again.
+const RULES_CHECK_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Newest requests of each member compared.
+const RULES_SAMPLE: i64 = 500;
+
+/// The comparison, made at most every [`RULES_CHECK_TTL`] (an older one is
+/// shown while it is made again), so the page stays fast.
+async fn rules_check(st: &AdminState, node: &Node) -> AppResult<Arc<RulesCheck>> {
+    let (store, dir) = (node.store.clone(), st.cfg.rules_dir.clone());
+    Ok(st
+        .rules_check
+        .get((), RULES_CHECK_TTL, move || {
+            let (store, dir) = (store.clone(), dir.clone());
+            Box::pin(async move { compare_rules(&store, dir.as_deref()).await })
+        })
+        .await?)
+}
+
+async fn compare_rules(
+    store: &crate::store::Store,
+    dir: Option<&std::path::Path>,
+) -> anyhow::Result<RulesCheck> {
+    let mut check = RulesCheck {
+        by_member: Default::default(),
+        unavailable: None,
+    };
+    // The rules as they are on disk now (the trap and scanner load them
+    // when they start).
+    let rules = match dir.map(crate::classify::Classifier::from_dir) {
+        None => Err("no rules_dir on this node".to_string()),
+        Some(Err(e)) => Err(format!("rules do not load: {e:#}")),
+        Some(Ok(c)) => Ok(c),
+    };
+    let c = match rules {
+        Ok(c) => c,
+        Err(why) => {
+            check.unavailable = Some(why);
+            return Ok(check);
+        }
+    };
+    for m in members::all(store).await? {
+        let a = agreement(&store.pool, &c, Some(&m.id.0[..]), RULES_SAMPLE).await?;
+        check.by_member.insert(m.id, a);
+    }
+    Ok(check)
 }
 
 /// A fresh heartbeat's creation time against our clock at receipt. Gossip
@@ -179,7 +240,7 @@ fn node(st: &AdminState) -> AppResult<&Arc<Node>> {
     st.recorder.node().ok_or(AppError::NotFound)
 }
 
-async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
+async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<MemberView>)> {
     let rows = members::all(&node.store).await?;
     let heads = repl::head_map(&repl::heads(&node.store).await?);
     let purged = crate::cluster::block::purged(&node.store).await?;
@@ -213,7 +274,14 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
             hb.and_then(|h| h.pace)
         };
         let error = statuses.get(&m.id).and_then(|s| s.last_error.clone());
+        let agreement = check.by_member.get(&m.id);
         let v = MemberView {
+            rules: match (&check.unavailable, agreement) {
+                (Some(why), _) => format!("not compared: {why}"),
+                (None, Some(a)) => a.summary(),
+                (None, None) => String::new(),
+            },
+            rules_differ: agreement.is_some_and(|a| a.differing > 0),
             key: m.id.to_string(),
             short: m.id.short(),
             name: m.name.clone(),
@@ -298,6 +366,8 @@ async fn views(node: &Node) -> AppResult<(MemberView, Vec<MemberView>)> {
         error: None,
         incompatible: false,
         skew: None,
+        rules: String::new(),
+        rules_differ: false,
     });
     Ok((mine, out))
 }
@@ -588,7 +658,8 @@ async fn render_page(st: &AdminState, invite: Option<String>) -> AppResult<Html<
     } else {
         None
     };
-    let (me, members) = views(node).await?;
+    let check = rules_check(st, node).await?;
+    let (me, members) = views(node, &check).await?;
     render(&ClusterPage {
         chrome: Chrome::new(true, "admin"),
         detached: node.detached().map(|d| d.label()),

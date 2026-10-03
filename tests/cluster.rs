@@ -2492,6 +2492,7 @@ async fn admin_on(n: &TestNode) -> (reqwest::Client, String) {
         r#"
 database_path = "/x"
 data_dir = "/x"
+rules_dir = "rules"
 [webauthn]
 rp_id = "localhost"
 origin = "https://localhost"
@@ -2611,6 +2612,8 @@ async fn admin_cluster_page_and_private_attribution() {
         "sensor-charlie",
         &b.id.short(),
         "Scanner pace",
+        // B and C recorded nothing to classify again.
+        "no requests to compare",
     ] {
         assert!(page.contains(want), "cluster page lacks {want}");
     }

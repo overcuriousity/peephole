@@ -111,6 +111,15 @@ be listed under `[[cluster.peers]]` with their key.
   rebuilt from the rows the scanner holds, so it can come out smaller,
   never above the stored level. A scanner without `rules_dir` takes the
   stored levels as they are (and says so in its log).
+- The Members table on the Cluster page shows, per member, how its newest
+  500 requests compare with this node's rules ("rules agree 100%",
+  "disagree on 12% of 500"): the share whose labels or severity come out
+  differently when classified again here. A request agrees when either
+  history (all the rows held here, or only the member's own) reproduces
+  it, so requests of other nodes the member had not seen yet do not count
+  as disagreement. Made at most every 10 minutes, from the rules on disk.
+  Differences come from rules that differ (an older or newer version, local
+  edits) as much as from doctored ones.
 - When two nodes queue the same IP before either job has reached the
   other, only one of them is scanned: the higher level, else the one
   queued first. Arbiters and scanners both apply this, and the other job

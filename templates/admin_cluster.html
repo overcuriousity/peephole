@@ -48,7 +48,7 @@
 <section class="card">
   <div class="card-head"><h2>Members</h2></div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Node</th><th>Roles</th><th>Address</th><th>Seen</th><th>Version</th><th>History</th><th>Replication</th><th>Scans</th><th>Settings</th><th></th></tr></thead>
+    <thead><tr><th>Node</th><th>Roles</th><th>Address</th><th>Seen</th><th>Version</th><th title="Its newest requests classified again with this node's rules">Rules</th><th>History</th><th>Replication</th><th>Scans</th><th>Settings</th><th></th></tr></thead>
     <tbody>
     {% for m in members %}
       <tr{% if !m.active %} class="muted"{% endif %}>
@@ -60,6 +60,7 @@
         <td class="mono">{{ m.address }}</td>
         <td><span class="badge badge-status" data-status="{% if m.live %}done{% else %}queued{% endif %}">{{ m.last_seen }}</span></td>
         <td class="mono">{{ m.version }}</td>
+        <td>{% if m.rules_differ %}<span class="badge badge-status" data-status="failed">{{ m.rules }}</span>{% else %}<span class="muted small">{{ m.rules }}</span>{% endif %}</td>
         <td>{{ m.history }}</td>
         <td>{{ m.lag }}</td>
         <td>{% if m.scanner %}{{ m.active_scans }} running{% endif %}</td>
@@ -80,7 +81,7 @@
         {% endif %}</td>
       </tr>
     {% endfor %}
-    {% if members.is_empty() %}<tr><td colspan="10" class="empty">No other members yet. Create an invite, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}
+    {% if members.is_empty() %}<tr><td colspan="11" class="empty">No other members yet. Create an invite, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}
     </tbody>
   </table></div>
 </section>

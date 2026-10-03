@@ -36,6 +36,8 @@ pub struct AdminState {
     pub providers: crate::intel::Providers,
     /// Addresses the blocklist feed must leave out (members, own networks).
     pub safety: tokio::sync::Mutex<crate::scan::safety::Safety>,
+    /// How members' requests compare with this node's rules (Cluster page).
+    pub rules_check: crate::store::stats::SwrCache<(), cluster::RulesCheck>,
 }
 
 impl AdminState {
@@ -65,6 +67,7 @@ impl AdminState {
             pace,
             closing: None,
             providers: vec![],
+            rules_check: crate::store::stats::SwrCache::new(1),
         }
     }
 
