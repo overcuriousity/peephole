@@ -396,9 +396,10 @@ impl Source {
 
     /// A grant is the arbiter's word only: check it against this node's own
     /// replicated copy of the job and the evidence behind it before nmap
-    /// runs. Not yet replicated, or not backed well enough here: handed
-    /// back ("declined") for another scanner; contradicting our copy:
-    /// refused.
+    /// runs. Not yet replicated, not backed well enough yet, or Tor status
+    /// unknown: handed back for now ("later"); never scanned here: handed
+    /// back for good ("declined") for another scanner; contradicting our
+    /// copy: refused.
     async fn check_grant(
         &self,
         arbiter: NodeId,
@@ -419,10 +420,7 @@ impl Source {
         .fetch_optional(pool)
         .await?;
         let Some((ip_text, job_level, job_arbiter, queued_at)) = row else {
-            return Ok(Err((
-                "declined",
-                Some("job not replicated here yet".into()),
-            )));
+            return Ok(Err(("later", Some("job not replicated here yet".into()))));
         };
         if job_arbiter.as_deref() != Some(&arbiter.0[..]) {
             return Ok(Err((
@@ -444,25 +442,26 @@ impl Source {
         let ev = guard::evidence(pool, &ip_text, &self.origins).await?;
         let allowed = ev.allowed_level(&self.cfg.scan.safety);
         if allowed < level {
-            let why = if ev.max_level < level {
-                format!(
+            if ev.max_level < level {
+                let why = format!(
                     "no request here asks for level {level} (highest: {})",
                     ev.max_level
-                )
-            } else {
-                format!(
-                    "level {level} needs more evidence ({} request(s); thin evidence allows {allowed})",
-                    ev.requests
-                )
-            };
-            return Ok(Err(("declined", Some(why))));
+                );
+                return Ok(Err(("declined", Some(why))));
+            }
+            // More requests may still arrive or replicate here.
+            let why = format!(
+                "level {level} needs more evidence ({} request(s); thin evidence allows {allowed})",
+                ev.requests
+            );
+            return Ok(Err(("later", Some(why))));
         }
         match self.preflight(&ip, &ip_text, &queued_at).await? {
             Some(Refusal::Never(why)) => return Ok(Err(("refused", Some(why)))),
-            // Our own never_scan, or not now: hand it back for another scanner.
-            Some(Refusal::Mine(why)) | Some(Refusal::Defer(why)) => {
-                return Ok(Err(("declined", Some(why))));
-            }
+            // Our own never_scan: hand it back for another scanner.
+            Some(Refusal::Mine(why)) => return Ok(Err(("declined", Some(why)))),
+            // Not now: hand it back, to be offered here again later.
+            Some(Refusal::Defer(why)) => return Ok(Err(("later", Some(why)))),
             None => {}
         }
         // Our stored spelling: the arbiter's may differ (same_ip allows it).
@@ -517,6 +516,12 @@ impl Source {
         for _ in 0..6 {
             match node.request(arbiter, msg.clone(), CLAIM_TIMEOUT).await {
                 Ok(Msg::CompleteReply { ok: true }) => return,
+                // An arbiter older than "later" rejects it; the job goes
+                // back to its queue when our lease expires.
+                Ok(_) if status == "later" => {
+                    debug!(job = %uid, arbiter = %arbiter.short(), "arbiter does not take \"later\"; its lease expiry requeues the job");
+                    return;
+                }
                 Ok(_) => {
                     warn!(job = %uid, arbiter = %arbiter.short(), "arbiter refused the outcome");
                     return;
@@ -1462,7 +1467,7 @@ license_key = "k"
             .await
             .unwrap();
         assert_eq!(turned(r), Some("declined"));
-        // One request at level 3: thin evidence allows level 2 only.
+        // One request at level 3: thin evidence allows level 2 only, for now.
         rec.insert_request(&request(ip.id, 3, "sqli"))
             .await
             .unwrap();
@@ -1470,7 +1475,7 @@ license_key = "k"
             .check_grant(me, &grant(&uid, &ip.ip, 3))
             .await
             .unwrap();
-        assert_eq!(turned(r), Some("declined"));
+        assert_eq!(turned(r), Some("later"));
         // A second request with another label: enough.
         rec.insert_request(&request(ip.id, 1, "probe"))
             .await
@@ -1487,7 +1492,7 @@ license_key = "k"
             (grant(&uid, &ip.ip, 9), "refused"),
             (grant(&uid, &ip.ip, 259), "refused"),
             (grant(&uid, "not-an-ip", 3), "failed"),
-            (grant("unknown-job", &ip.ip, 3), "declined"),
+            (grant("unknown-job", &ip.ip, 3), "later"),
         ] {
             let r = source.check_grant(me, &g).await.unwrap();
             assert_eq!(turned(r), Some(want), "{g:?}");
