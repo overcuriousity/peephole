@@ -865,7 +865,8 @@ impl Recorder {
 
     /// Uids of `table` rows whose `col` is one of `keys`, split into what
     /// this node originated and what other nodes did. Only the former can be
-    /// deleted cluster-wide.
+    /// deleted cluster-wide. A standalone node deletes everything it holds,
+    /// rows it got while it was in a cluster included.
     async fn split(
         &self,
         table: &'static str,
@@ -873,6 +874,7 @@ impl Recorder {
         keys: Keys<'_>,
     ) -> Result<(Vec<String>, Vec<String>)> {
         let me = self.node_id().map(|id| id.0.to_vec());
+        let local = me.is_none();
         let n = match keys {
             Keys::Ids(k) => k.len(),
             Keys::Uids(k) => k.len(),
@@ -898,7 +900,7 @@ impl Recorder {
                 }
             }
             for (uid, origin) in q.fetch_all(&self.store().pool).await? {
-                if origin == me {
+                if local || origin == me {
                     own.push(uid);
                 } else {
                     other.push(uid);
