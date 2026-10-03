@@ -18,6 +18,17 @@ pub fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// What per-source guards (connection caps, rate limits, the flood gate)
+/// count `ip` under: an IPv4 address as is, an IPv6 address by its /64. One
+/// host commonly holds a whole /64, so keying by the full address would let
+/// it rotate past every per-source limit. Input is canonicalised first.
+pub fn source_key(ip: IpAddr) -> IpAddr {
+    match canonical(ip) {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from_bits(v6.to_bits() & !0u128 << 64)),
+        v4 => v4,
+    }
+}
+
 /// Whether `ip` is a routable public address safe to counter-scan. Non-global
 /// addresses (loopback, private, CGNAT, link-local, multicast, documentation,
 /// reserved, …) return false. Input is canonicalised first.
@@ -109,6 +120,19 @@ mod tests {
             canonical("::ffff:10.0.0.1".parse().unwrap()),
             "10.0.0.1".parse::<IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn source_key_groups_ipv6_by_64() {
+        let key = |s: &str| source_key(s.parse().unwrap());
+        assert_eq!(key("203.0.113.9"), key("::ffff:203.0.113.9"));
+        assert_ne!(key("203.0.113.9"), key("203.0.113.10"));
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), key("2001:db8:1:2:ffff::9"));
+        assert_eq!(
+            key("2001:db8:1:2::77"),
+            "2001:db8:1:2::".parse::<IpAddr>().unwrap()
+        );
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
     }
 
     #[test]
