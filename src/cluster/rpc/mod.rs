@@ -20,11 +20,11 @@ use server::Peer;
 use std::sync::Arc;
 
 /// Largest member RPC body (backfill batches are paced well below this).
-const BODY_LIMIT: usize = 64 * 1024 * 1024;
+pub(crate) const BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// `/join` is reachable by any key that completes the TLS handshake (not yet a
 /// member), so its body is capped tightly — a JoinReq is a token plus small
 /// node info — to deny an unauthenticated memory-exhaustion vector.
-const JOIN_BODY_LIMIT: usize = 64 * 1024;
+pub(crate) const JOIN_BODY_LIMIT: usize = 64 * 1024;
 
 pub fn router(node: Arc<Node>) -> Router {
     let members_only = Router::new()

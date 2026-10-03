@@ -3,8 +3,9 @@
 //!
 //! Any self-generated key passes the TLS handshake (joining needs that), so
 //! connections are bounded: in total, per remote address and for keys that
-//! are not members; a connection that sends no request for a while is
-//! closed, and HTTP/1 headers must arrive promptly.
+//! are not members (also per address); a connection that sends no request
+//! for a while is closed (for a non-member, no join request), HTTP/1
+//! headers must arrive promptly and request bodies in time.
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::tls::cert_node_id;
@@ -33,6 +34,12 @@ const MAX_CONNECTIONS: usize = 512;
 const MAX_PER_ADDRESS: usize = 32;
 /// Open connections from keys that are not members (joiners, strangers).
 const MAX_NON_MEMBERS: usize = 32;
+/// Of those, from one address (IPv6: one /64).
+const MAX_NON_MEMBERS_PER_ADDRESS: usize = 4;
+/// A request body must have arrived within this long: a member's batch
+/// can be large, a join request is tiny.
+const MEMBER_BODY_TIMEOUT: Duration = Duration::from_secs(120);
+const NON_MEMBER_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 /// A connection without a request for this long is closed (sync loops
 /// long-poll every 25 s, so a live peer never gets here).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -41,9 +48,11 @@ const CLOSE_GRACE: Duration = Duration::from_secs(30);
 /// HTTP/2 streams per connection.
 const MAX_STREAMS: u32 = 64;
 
-/// Connections per remote address (IPv4, or IPv6 /64).
-#[derive(Default)]
-struct PerAddress(Mutex<HashMap<IpAddr, usize>>);
+/// Connections per remote address (IPv4, or IPv6 /64), up to a limit.
+struct PerAddress {
+    max: usize,
+    open: Mutex<HashMap<IpAddr, usize>>,
+}
 
 fn address_key(ip: IpAddr) -> IpAddr {
     match crate::net::canonical(ip) {
@@ -59,11 +68,18 @@ fn address_key(ip: IpAddr) -> IpAddr {
 struct AddressSlot(Arc<PerAddress>, IpAddr);
 
 impl PerAddress {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max,
+            open: Default::default(),
+        })
+    }
+
     fn take(self: &Arc<Self>, ip: IpAddr) -> Option<AddressSlot> {
         let key = address_key(ip);
-        let mut m = self.0.lock().unwrap();
+        let mut m = self.open.lock().unwrap();
         let n = m.entry(key).or_default();
-        if *n >= MAX_PER_ADDRESS {
+        if *n >= self.max {
             return None;
         }
         *n += 1;
@@ -73,7 +89,7 @@ impl PerAddress {
 
 impl Drop for AddressSlot {
     fn drop(&mut self) {
-        let mut m = self.0.0.lock().unwrap();
+        let mut m = self.0.open.lock().unwrap();
         if let Some(n) = m.get_mut(&self.1) {
             *n -= 1;
             if *n == 0 {
@@ -94,6 +110,38 @@ fn now_ms() -> u64 {
     crate::cluster::hlc::wall_ms()
 }
 
+/// The only route open to keys that are not members.
+const JOIN_PATH: &str = "/rpc/v1/join";
+
+/// Size and time a request body of a member (or a non-member) gets.
+fn body_bounds(member: bool) -> (usize, Duration) {
+    if member {
+        (super::BODY_LIMIT, MEMBER_BODY_TIMEOUT)
+    } else {
+        (super::JOIN_BODY_LIMIT, NON_MEMBER_BODY_TIMEOUT)
+    }
+}
+
+/// The request with its body read in full, at most `limit` bytes within
+/// `timeout`; a slow or oversized body is answered here and never reaches
+/// a handler.
+async fn read_body(
+    req: axum::extract::Request,
+    (limit, timeout): (usize, Duration),
+) -> Result<axum::extract::Request, axum::response::Response> {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let (parts, body) = req.into_parts();
+    match tokio::time::timeout(timeout, axum::body::to_bytes(body, limit)).await {
+        Ok(Ok(bytes)) => Ok(axum::extract::Request::from_parts(
+            parts,
+            axum::body::Body::from(bytes),
+        )),
+        Ok(Err(_)) => Err((StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response()),
+        Err(_) => Err((StatusCode::REQUEST_TIMEOUT, "body too slow").into_response()),
+    }
+}
+
 pub async fn serve(
     listener: TcpListener,
     tls: Arc<rustls::ServerConfig>,
@@ -104,7 +152,8 @@ pub async fn serve(
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
     let total = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let strangers = Arc::new(tokio::sync::Semaphore::new(MAX_NON_MEMBERS));
-    let per_address = Arc::new(PerAddress::default());
+    let per_address = PerAddress::new(MAX_PER_ADDRESS);
+    let strangers_per_address = PerAddress::new(MAX_NON_MEMBERS_PER_ADDRESS);
     loop {
         let (tcp, addr) = tokio::select! {
             r = listener.accept() => match r {
@@ -130,6 +179,7 @@ pub async fn serve(
         let app = app.clone();
         let node = node.clone();
         let strangers = strangers.clone();
+        let strangers_per_address = strangers_per_address.clone();
         tokio::spawn(async move {
             let _slots = (slot, addr_slot);
             let stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
@@ -146,27 +196,44 @@ pub async fn serve(
             else {
                 return;
             };
-            // Keys that are not members can only try to join: few at once.
+            // Keys that are not members can only try to join: few at once,
+            // and fewer from one address.
             let _stranger = if node.is_member(&peer) {
                 None
             } else {
-                match strangers.try_acquire_owned() {
-                    Ok(p) => Some(p),
-                    Err(_) => return debug!(%addr, "rpc connection refused: too many non-members"),
-                }
+                let Ok(p) = strangers.try_acquire_owned() else {
+                    return debug!(%addr, "rpc connection refused: too many non-members");
+                };
+                let Some(s) = strangers_per_address.take(addr.ip()) else {
+                    return debug!(%addr, "rpc connection refused: too many non-members from this address");
+                };
+                Some((p, s))
             };
             let activity = Arc::new(Activity::default());
             activity.last_ms.store(now_ms(), Ordering::Relaxed);
             let seen = activity.clone();
+            let member_of = node.clone();
             let svc = app
                 .layer(axum::middleware::from_fn(
                     move |req: axum::extract::Request, next: axum::middleware::Next| {
                         let seen = seen.clone();
+                        // Membership can change while a connection is open.
+                        let member = member_of.is_member(&peer);
                         async move {
+                            // Only what a key may do keeps its connection
+                            // open: anything for a member, joining for others.
+                            let counts = member || req.uri().path() == JOIN_PATH;
                             seen.running.fetch_add(1, Ordering::Relaxed);
-                            seen.last_ms.store(now_ms(), Ordering::Relaxed);
-                            let resp = next.run(req).await;
-                            seen.last_ms.store(now_ms(), Ordering::Relaxed);
+                            if counts {
+                                seen.last_ms.store(now_ms(), Ordering::Relaxed);
+                            }
+                            let resp = match read_body(req, body_bounds(member)).await {
+                                Ok(req) => next.run(req).await,
+                                Err(resp) => resp,
+                            };
+                            if counts {
+                                seen.last_ms.store(now_ms(), Ordering::Relaxed);
+                            }
                             seen.running.fetch_sub(1, Ordering::Relaxed);
                             resp
                         }
@@ -216,5 +283,51 @@ pub async fn serve(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, Bytes};
+    use futures::StreamExt;
+
+    #[test]
+    fn connections_are_limited_per_address() {
+        let per = PerAddress::new(2);
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let a = per.take(ip("203.0.113.1")).unwrap();
+        let _b = per.take(ip("::ffff:203.0.113.1")).unwrap();
+        assert!(per.take(ip("203.0.113.1")).is_none());
+        assert!(per.take(ip("203.0.113.2")).is_some());
+        drop(a);
+        assert!(per.take(ip("203.0.113.1")).is_some());
+        // One IPv6 /64 counts as one address.
+        let _c = per.take(ip("2001:db8::1")).unwrap();
+        let _d = per.take(ip("2001:db8::2")).unwrap();
+        assert!(per.take(ip("2001:db8::3")).is_none());
+    }
+
+    /// A body that trickles in, or never ends, is cut off; one too large is
+    /// refused before a handler sees it. Before, a key that was not even a
+    /// member could hold a connection open with a body that never ended.
+    #[tokio::test]
+    async fn request_bodies_must_arrive_in_time_and_size() {
+        let req = |body: Body| axum::extract::Request::new(body);
+        let bounds = (8, Duration::from_millis(50));
+        let ok = read_body(req(Body::from("small")), bounds).await.unwrap();
+        let got = axum::body::to_bytes(ok.into_body(), 8).await.unwrap();
+        assert_eq!(&got[..], b"small");
+        let big = read_body(req(Body::from("far too large")), bounds)
+            .await
+            .unwrap_err();
+        assert_eq!(big.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        let stalled = futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from("x")) })
+            .chain(futures::stream::pending());
+        let slow = read_body(req(Body::from_stream(stalled)), bounds)
+            .await
+            .unwrap_err();
+        assert_eq!(slow.status(), axum::http::StatusCode::REQUEST_TIMEOUT);
+        assert!(body_bounds(false).1 < body_bounds(true).1);
     }
 }
