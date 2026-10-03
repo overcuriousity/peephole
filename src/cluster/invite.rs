@@ -211,6 +211,11 @@ pub async fn join(node: &Node, token: &str) -> Result<MemberInfo> {
 /// Inviter side: check and consume the invite, then vouch for the joiner.
 /// `peer` is the key the joiner authenticated with in TLS.
 pub async fn redeem(node: &Node, peer: NodeId, req: JoinReq) -> Result<JoinResp, (u16, String)> {
+    // Left or pruned: not ours to vouch for anyone any more (peers would
+    // ignore the admission of a node that left).
+    if node.detached().is_some() {
+        return Err((403, "this node is not in a cluster any more".into()));
+    }
     if req.info.id != peer {
         return Err((400, "member info does not match the TLS key".into()));
     }
@@ -341,6 +346,17 @@ pub async fn revoke(store: &crate::store::Store, id: i64) -> Result<bool> {
     .await?
     .rows_affected();
     Ok(n == 1)
+}
+
+/// Stop every invite that could still admit someone (on leaving the
+/// cluster). Returns how many were revoked.
+pub async fn revoke_all(store: &crate::store::Store) -> Result<u64> {
+    Ok(
+        sqlx::query("UPDATE invites SET revoked_at = datetime('now') WHERE revoked_at IS NULL")
+            .execute(&store.pool)
+            .await?
+            .rows_affected(),
+    )
 }
 
 #[cfg(test)]

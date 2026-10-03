@@ -36,6 +36,9 @@ pub type HeadMap = HashMap<NodeId, u64>;
 const APPLIED: i64 = 1;
 const DEFERRED: i64 = 0;
 const UNKNOWN_KIND: i64 = 2;
+/// Dated no later than its origin's previous entry: kept and relayed, never
+/// applied (see [`in_order`]).
+const OUT_OF_ORDER: i64 = 4;
 
 /// Entries of a node nobody admitted (yet) are parked and relayed only up
 /// to these limits per origin; the rest is fetched again once it is
@@ -103,6 +106,18 @@ pub fn advertised(ours: Heads, purged: &HashSet<NodeId>, theirs: &HeadMap) -> He
         .collect()
 }
 
+/// What of a peer's `wants` this node can serve: each origin once, and only
+/// origins it holds past what is asked for. A request names any number of
+/// origins; this keeps it to at most one per head held here, and an
+/// unknown origin costs no query.
+pub fn servable_wants(wants: Vec<(NodeId, u64)>, ours: &HeadMap) -> Vec<(NodeId, u64)> {
+    let mut seen = HashSet::new();
+    wants
+        .into_iter()
+        .filter(|(o, after)| ours.get(o).is_some_and(|h| h > after) && seen.insert(*o))
+        .collect()
+}
+
 /// One origin's head (a single lookup; use [`head_map`] for many).
 pub fn head_in(h: &Heads, origin: &NodeId) -> u64 {
     h.iter()
@@ -138,19 +153,6 @@ type LogRow = (
     Option<String>,
 );
 
-/// A log row with the time it was received (unix ms).
-type TimedRow = (
-    Vec<u8>,
-    i64,
-    i64,
-    String,
-    Option<String>,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    Option<String>,
-    Option<i64>,
-);
-
 fn from_row(r: LogRow) -> Result<WireEntry> {
     Ok(WireEntry {
         origin: NodeId::from_slice(&r.0)?,
@@ -162,14 +164,6 @@ fn from_row(r: LogRow) -> Result<WireEntry> {
         sig: r.6,
         erased_by: r.7,
     })
-}
-
-fn from_timed(r: TimedRow) -> Result<(WireEntry, u64)> {
-    let received = r.8.unwrap_or(0).max(0) as u64;
-    Ok((
-        from_row((r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7))?,
-        received,
-    ))
 }
 
 /// Origins this node purged (`cluster purge`).
@@ -569,7 +563,7 @@ pub async fn append_in_tx(
         anyhow::bail!("record uid `{uid}` does not carry this node's prefix");
     }
     insert_log(conn, &e, APPLIED).await?;
-    let settled = apply_record(node, conn, &e, record, hlc::wall_ms()).await?;
+    let settled = apply_record(node, conn, &e, record).await?;
     if settled.deferred {
         mark_deferred(conn, &e.origin, e.seq, settled.wait_uid.as_deref()).await?;
     }
@@ -750,6 +744,14 @@ async fn apply_one(
 ) -> Result<()> {
     // Purged here: neither stored nor relayed any more.
     if is_purged(conn, &e.origin).await? {
+        st.rejected += 1;
+        return Ok(());
+    }
+    // Dated too far ahead: not taken until its time comes (see
+    // [`hlc::ahead`]). The origin's stream stops here like at a gap; peers
+    // offer the entry again on every round, and other origins go on.
+    if hlc::ahead(e.hlc, hlc::wall_ms()) {
+        debug!(origin = %e.origin.short(), seq = e.seq, "entry dated too far ahead waits");
         st.rejected += 1;
         return Ok(());
     }
@@ -986,12 +988,47 @@ fn announce_job(node: &Node, _kind: &str, r: &Record) {
     }
 }
 
+/// Whether `e` is dated later than the entry its origin signed before it.
+/// HLCs rise with the sequence in an honest log (see `Hlc::now`); without
+/// this, a member could backdate entries past the windows its limits are
+/// judged in (admissions per day, scan jobs per hour).
+///
+/// The entry before is the latest held with its signature that was itself
+/// in order, so neither an out-of-order entry nor an erased stub (whose HLC
+/// nobody signed, and which a relay could set to anything) moves the bar.
+/// The verdict is the same on every node that holds the same entries. One
+/// case is not: an origin that breaks the order right after an entry it
+/// later erases is judged against that entry by nodes that got it before
+/// the erasure, and against the one before by nodes that only got a stub.
+async fn in_order(conn: &mut SqliteConnection, e: &WireEntry) -> Result<bool> {
+    let prev: Option<i64> = sqlx::query_scalar(
+        "SELECT hlc FROM repl_log
+         WHERE origin = ? AND seq < ? AND sig IS NOT NULL AND applied != ?
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(&e.origin.0[..])
+    .bind(e.seq.min(i64::MAX as u64) as i64)
+    .bind(OUT_OF_ORDER)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(prev.is_none_or(|p| hlc::to_db(e.hlc) > p))
+}
+
 async fn apply_verified(
     node: &Node,
     conn: &mut SqliteConnection,
     e: WireEntry,
     st: &mut Applied,
 ) -> Result<()> {
+    // Out of order: kept (the log stays gap-free, and it is relayed like
+    // any entry) but never applied, here or on any other node.
+    if !in_order(conn, &e).await? {
+        warn!(origin = %e.origin.short(), seq = e.seq, kind = %e.kind,
+              "entry dated before its origin's previous one ignored");
+        insert_log(conn, &e, OUT_OF_ORDER).await?;
+        st.applied += 1;
+        return Ok(());
+    }
     let record = e.record();
     // A kind this build does not know is kept (and relayed) and applied
     // after an upgrade, never retried before.
@@ -1002,7 +1039,7 @@ async fn apply_verified(
     };
     insert_log(conn, &e, state).await?;
     if let Some(r) = &record {
-        let settled = apply_isolated(node, conn, &e, r, hlc::wall_ms()).await?;
+        let settled = apply_isolated(node, conn, &e, r).await?;
         st.membership_changed |= settled.membership;
         if settled.deferred {
             // Not applicable yet: kept for retry_deferred.
@@ -1089,18 +1126,17 @@ async fn drain_pending(node: &Node, conn: &mut SqliteConnection, st: &mut Applie
 pub async fn apply_unknown_kinds(node: &Node) -> Result<usize> {
     let _g = node.apply_lock.lock().await;
     let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-    let rows: Vec<TimedRow> = sqlx::query_as(
-        "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by,
-                CAST(strftime('%s', received_at) AS INTEGER) * 1000
+    let rows: Vec<LogRow> = sqlx::query_as(
+        "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by
          FROM repl_log WHERE applied = 2 ORDER BY hlc",
     )
     .fetch_all(&mut *tx)
     .await?;
     let mut n = 0;
     for r in rows {
-        let (e, received) = from_timed(r)?;
+        let e = from_row(r)?;
         let Some(rec) = e.record() else { continue };
-        let settled = apply_isolated(node, &mut tx, &e, &rec, received).await?;
+        let settled = apply_isolated(node, &mut tx, &e, &rec).await?;
         if settled.deferred {
             mark_deferred(&mut tx, &e.origin, e.seq, settled.wait_uid.as_deref()).await?;
         } else {
@@ -1129,9 +1165,8 @@ async fn retry_deferred(node: &Node, conn: &mut SqliteConnection, st: &mut Appli
     let mut done = 0;
     while done < RETRY_MAX_PER_CALL {
         // `applied != 1` lets SQLite use the partial index.
-        let rows: Vec<TimedRow> = sqlx::query_as(
-            "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by,
-                    CAST(strftime('%s', received_at) AS INTEGER) * 1000
+        let rows: Vec<LogRow> = sqlx::query_as(
+            "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by
              FROM repl_log
              WHERE applied != 1 AND applied = ? AND retry_after <= ? AND payload IS NOT NULL
              ORDER BY hlc LIMIT ?",
@@ -1146,7 +1181,7 @@ async fn retry_deferred(node: &Node, conn: &mut SqliteConnection, st: &mut Appli
         }
         done += rows.len();
         for r in rows {
-            let (e, received) = from_timed(r)?;
+            let e = from_row(r)?;
             let Some(rec) = e.record() else {
                 sqlx::query("UPDATE repl_log SET applied = ? WHERE origin = ? AND seq = ?")
                     .bind(UNKNOWN_KIND)
@@ -1156,7 +1191,7 @@ async fn retry_deferred(node: &Node, conn: &mut SqliteConnection, st: &mut Appli
                     .await?;
                 continue;
             };
-            let settled = apply_isolated(node, conn, &e, &rec, received).await?;
+            let settled = apply_isolated(node, conn, &e, &rec).await?;
             st.membership_changed |= settled.membership;
             if settled.deferred {
                 // Pushes its retry time out, so this call does not see it again.
@@ -1260,13 +1295,14 @@ const REPLAY_BATCH: usize = 1000;
 
 /// Apply log entries that are held with their payload but have no row:
 /// after an unblock, everything the block kept out of the tables. Records an
-/// admin hid stay hidden. Returns how many entries were looked at.
+/// admin hid stay hidden, entries out of order stay unapplied. Returns how
+/// many entries were looked at.
 pub async fn rematerialize(node: &Node) -> Result<usize> {
     // Parents first; job state after the jobs it refers to. Only the keys
     // are collected up front; the entries are loaded batch by batch.
     let keys: Vec<(Vec<u8>, i64)> = sqlx::query_as(
         "SELECT origin, seq FROM repl_log
-         WHERE payload IS NOT NULL
+         WHERE payload IS NOT NULL AND applied != 4
            AND kind IN ('request','scan_job','job_adopt','job_status','fp_claim',
                         'fingerprint','scan_result','ip_intel','skip_batch')
          ORDER BY CASE kind WHEN 'request' THEN 0 WHEN 'scan_job' THEN 1
@@ -1278,20 +1314,19 @@ pub async fn rematerialize(node: &Node) -> Result<usize> {
         let _g = node.apply_lock.lock().await;
         let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
         for (origin, seq) in batch {
-            let row: Option<TimedRow> = sqlx::query_as(
-                "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by,
-                        CAST(strftime('%s', received_at) AS INTEGER) * 1000
+            let row: Option<LogRow> = sqlx::query_as(
+                "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by
                  FROM repl_log WHERE origin = ? AND seq = ?",
             )
             .bind(origin)
             .bind(seq)
             .fetch_optional(&mut *tx)
             .await?;
-            let Some((e, received)) = row.map(from_timed).transpose()? else {
+            let Some(e) = row.map(from_row).transpose()? else {
                 continue;
             };
             if let Some(rec) = e.record() {
-                apply_isolated(node, &mut tx, &e, &rec, received).await?;
+                apply_isolated(node, &mut tx, &e, &rec).await?;
             }
         }
         tx.commit().await?;
@@ -1322,10 +1357,9 @@ async fn apply_isolated(
     conn: &mut SqliteConnection,
     e: &WireEntry,
     r: &Record,
-    received_ms: u64,
 ) -> Result<Settled> {
     let mut sp = sqlx::Connection::begin(&mut *conn).await?;
-    match apply_record(node, &mut sp, e, r, received_ms).await {
+    match apply_record(node, &mut sp, e, r).await {
         Ok(settled) => {
             sp.commit().await?;
             Ok(settled)
@@ -1353,17 +1387,17 @@ fn waits_for(r: &Record) -> Option<String> {
 
 /// Effects of one record on the materialized tables, then settle its log
 /// entry: erased if a tombstone already deleted it, payload dropped if it
-/// can be rebuilt from its row. `received_ms` is when the entry reached this
-/// node: what the record is ordered by never lies further ahead than that
-/// (see [`hlc::effective`]).
+/// can be rebuilt from its row. The record is ordered by its own HLC, the
+/// same on every node whenever it arrived: entries dated too far ahead are
+/// only taken once their time comes (see [`hlc::ahead`]). Only entries a
+/// build before that stored may still lie beyond the signed range.
 async fn apply_record(
     node: &Node,
     conn: &mut SqliteConnection,
     e: &WireEntry,
     r: &Record,
-    received_ms: u64,
 ) -> Result<Settled> {
-    let at = hlc::effective(e.hlc, e.seq, received_ms);
+    let at = hlc::to_db(e.hlc) as u64;
     if super::members::apply(node, conn, e, r, at).await? {
         return Ok(Settled {
             membership: true,
@@ -1727,31 +1761,49 @@ mod tests {
         );
     }
 
-    /// Updates from an origin whose clock runs far ahead are all capped to
-    /// the same moment when they arrive in the same millisecond (one batch,
-    /// or a replay, which knows receipt to the second); the later one still
-    /// wins. Before, they tied and every update after the first was dropped.
+    /// An entry dated further ahead than the allowed drift is not taken:
+    /// its origin's stream waits there (the rest of it is a gap), other
+    /// origins go on, and what is taken counts at its own HLC. Before, such
+    /// entries were taken at once and capped to their receipt, so nodes that
+    /// received them at different times ordered them differently.
     #[tokio::test]
-    async fn capped_updates_keep_their_order() {
+    async fn entries_dated_too_far_ahead_wait_for_their_time() {
         let (_d, node) = test_node(0).await;
-        let x = Identity::generate().unwrap();
-        super::append(&node, &[Record::MemberAdd(info(x.id, "x"))])
-            .await
-            .unwrap();
-        let ahead = (super::hlc::wall_ms() + 400 * 86_400_000) << 16;
-        let received = super::hlc::wall_ms();
-        let mut tx = node.store.pool.begin().await.unwrap();
-        for (seq, name) in [(1, "first"), (2, "second")] {
-            let r = Record::MemberUpdate(info(x.id, name));
-            let e = WireEntry::sign(&x, seq, ahead + seq, &r).unwrap();
-            super::apply_record(&node, &mut tx, &e, &r, received)
-                .await
-                .unwrap();
-        }
-        tx.commit().await.unwrap();
+        let (x, y) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        super::append(
+            &node,
+            &[
+                Record::MemberAdd(info(x.id, "x")),
+                Record::MemberAdd(info(y.id, "y")),
+            ],
+        )
+        .await
+        .unwrap();
+        let soon = now_hlc(0) + ((super::hlc::MAX_DRIFT_MS - 60_000) << 16);
+        let later = now_hlc(0) + (86_400_000 << 16);
+        let update = |id: &Identity, seq, hlc, name: &str| {
+            WireEntry::sign(id, seq, hlc, &Record::MemberUpdate(info(id.id, name))).unwrap()
+        };
+        let far = update(&x, 2, later, "x-far");
+        let batch = vec![
+            update(&x, 1, soon, "x-soon"),
+            far.clone(),
+            update(&x, 3, later + 1, "x-after"),
+            update(&y, 1, now_hlc(1), "y"),
+        ];
+        let st = super::apply_batch(&node, batch).await.unwrap();
+        assert_eq!((st.applied, st.rejected), (2, 2), "{st:?}");
+        let h = super::heads(&node.store).await.unwrap();
+        assert_eq!(
+            (super::head_in(&h, &x.id), super::head_in(&h, &y.id)),
+            (1, 1)
+        );
         let all = super::super::members::all(&node.store).await.unwrap();
         let row = all.iter().find(|m| m.id == x.id).unwrap();
-        assert_eq!(row.name, "second");
+        assert_eq!((row.name.as_str(), row.info_hlc), ("x-soon", soon));
+        // Offered again before its time: still waits.
+        let st = super::apply_batch(&node, vec![far]).await.unwrap();
+        assert_eq!((st.applied, st.rejected), (0, 1), "{st:?}");
     }
 
     fn request(o: &Identity, seq: u64, path: &str) -> WireEntry {
@@ -1905,6 +1957,21 @@ mod tests {
             .await
             .unwrap();
         assert!(b.entries.is_empty() && b.floors.is_empty());
+    }
+
+    /// A pull serves each origin once and only what is held here past the
+    /// want; a list of unknown origins (any number fits in a body) costs
+    /// nothing. Before, each one cost queries on a held connection.
+    #[test]
+    fn wants_are_deduplicated_and_bounded_by_our_heads() {
+        let (a, b) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        );
+        let ours = super::head_map(&vec![(a, 5), (b, 3)]);
+        let mut wants = vec![(a, 2), (a, 0), (b, 3)];
+        wants.extend((0..1000).map(|_| (Identity::generate().unwrap().id, 0)));
+        assert_eq!(super::servable_wants(wants, &ours), vec![(a, 2)]);
     }
 
     /// A purged origin is reported at what the peer holds, or not at all.

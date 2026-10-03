@@ -108,7 +108,7 @@ impl Manifest {
 }
 
 /// Announced files of kinds this version knows; old `geolite2-*` rows are
-/// left out. Per kind the newest announcement (by its clamped HLC) of a
+/// left out. Per kind the newest announcement (by its HLC) of a
 /// node this node has not blocked, so a blocked node loses control of the
 /// shared files here.
 pub async fn manifests(store: &crate::store::Store) -> Result<HashMap<String, Manifest>> {
@@ -294,6 +294,12 @@ fn fresh_enough(m: &Manifest) -> Result<(), String> {
     Ok(())
 }
 
+/// The start of a hash, for logs. A manifest comes from a member and may
+/// carry anything: never cut inside a character.
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
 /// Bring local copies up to the announced versions; returns the kinds
 /// that changed.
 pub async fn sync_files(node: &Node, data_dir: &Path) -> Result<Vec<String>> {
@@ -307,12 +313,12 @@ pub async fn sync_files(node: &Node, data_dir: &Path) -> Result<Vec<String>> {
             continue;
         }
         if let Err(why) = fresh_enough(&m) {
-            warn!(%kind, sha = %&m.sha256[..12.min(m.sha256.len())], %why, "announced intel file not copied");
+            warn!(%kind, sha = %short_sha(&m.sha256), %why, "announced intel file not copied");
             continue;
         }
         match download(node, data_dir, &m).await {
             Ok(()) => {
-                info!(%kind, sha = %&m.sha256[..12], "intel file copied from the cluster");
+                info!(%kind, sha = %short_sha(&m.sha256), "intel file copied from the cluster");
                 changed.push(kind);
             }
             Err(e) => warn!(%kind, error = %format!("{e:#}"), "intel file copy failed"),
@@ -347,6 +353,15 @@ mod tests {
         assert!(!due(0, 23.0) && due(0, 25.0));
         assert!(!due(1, 47.0) && due(1, 49.0));
         assert!(due(0, f64::INFINITY), "never fetched: due at once");
+    }
+
+    /// Before, a hash with a multibyte character in its first 12 bytes
+    /// panicked the file sync task for good.
+    #[test]
+    fn a_hash_is_shortened_without_splitting_a_character() {
+        assert_eq!(short_sha(&"ab".repeat(32)), "abababababab");
+        assert_eq!(short_sha("abc"), "abc");
+        assert_eq!(short_sha("aaaaaaaaaaa\u{e9}x"), "aaaaaaaaaaa\u{e9}x");
     }
 
     #[test]

@@ -609,7 +609,7 @@ async fn scan_job(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &ScanJobRec) -> 
                            "scan job with an invalid level or target ignored");
             return Ok(Effect::Ignored);
         }
-        // Per-origin rate, judged by the jobs' own (clamped) HLCs, so every
+        // Per-origin rate, judged by the jobs' own HLCs, so every
         // node reaches the same verdict for the same stream.
         let since = ctx.hlc.saturating_sub(3_600_000 << 16);
         let recent: i64 = sqlx::query_scalar(
@@ -850,6 +850,11 @@ async fn scan_result(
     Ok(Effect::Applied)
 }
 
+/// 64 lowercase hex digits.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// The newest announced version of an intel file, per origin (by HLC);
 /// `intel::share::manifests` picks the newest of the nodes not blocked.
 async fn intel_manifest(
@@ -857,13 +862,15 @@ async fn intel_manifest(
     ctx: Ctx<'_>,
     m: &IntelManifestRec,
 ) -> Result<Effect> {
-    // Only the public Tor exit list is shared as a file.
+    // Only the public Tor exit list is shared as a file, named by its
+    // SHA-256 as `file_hash` writes it.
     if crate::intel::share::file_name(&m.kind).is_none()
         || m.size > crate::intel::share::MAX_INTEL_SIZE
+        || !is_sha256_hex(&m.sha256)
     {
         return Ok(Effect::Ignored);
     }
-    // A fetch time later than the (clamped) entry is a claim nobody can
+    // A fetch time later than the entry is a claim nobody can
     // check: it would make an old list look fresh and hold off refetches.
     let entry_ts = chrono::DateTime::from_timestamp_millis(
         crate::cluster::hlc::physical_ms(ctx.hlc).min(i64::MAX as u64) as i64,
@@ -2295,5 +2302,47 @@ mod tests {
         .unwrap();
         assert_eq!(eff, Effect::Ignored);
         assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ip_intel").await, 0);
+    }
+
+    /// An announced file is named by its SHA-256 in lowercase hex, nothing
+    /// else. Before, any string was stored, and one with a multibyte
+    /// character panicked every node's file sync when logged.
+    #[tokio::test]
+    async fn an_intel_manifest_needs_a_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let manifest = |sha256: String| {
+            Record::IntelManifest(IntelManifestRec {
+                kind: "tor-exits".into(),
+                sha256,
+                size: 10,
+                fetched_at: "2026-10-01 00:00:00".into(),
+            })
+        };
+        for bad in [
+            format!("{}\u{e9}", "a".repeat(62)),
+            "\u{e9}".repeat(32),
+            "AB".repeat(32),
+            "ab".repeat(31),
+            "ab".repeat(33),
+            "zz".repeat(32),
+        ] {
+            let eff = apply(&mut conn, ctx, &manifest(bad.clone())).await.unwrap();
+            assert_eq!(eff, Effect::Ignored, "{bad}");
+        }
+        assert_eq!(
+            count(&mut conn, "SELECT COUNT(*) FROM intel_files").await,
+            0
+        );
+        let eff = apply(&mut conn, ctx, &manifest("0f".repeat(32)))
+            .await
+            .unwrap();
+        assert_eq!(eff, Effect::Applied);
     }
 }
