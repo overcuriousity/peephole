@@ -1,6 +1,6 @@
 use crate::admin::AdminState;
 use crate::store::Store;
-use crate::store::auth::SetupToken;
+use crate::store::auth::{SetupToken, token_hash};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
@@ -84,16 +84,6 @@ pub async fn ensure_setup_token(
     match store.setup_token_state().await? {
         // Issued earlier; console output is the only copy.
         SetupToken::Live => Ok(None),
-        SetupToken::Legacy => {
-            // Issued by a build without expiry: keep it, from now on dated.
-            store.date_legacy_setup_token().await?;
-            tracing::info!(
-                hours = crate::store::auth::SETUP_TOKEN_HOURS,
-                "the admin setup token printed earlier now expires; \
-                 `peephole admin reset-token` prints a new one"
-            );
-            Ok(None)
-        }
         SetupToken::None | SetupToken::Expired => {
             let token = store.issue_setup_token().await?;
             print_setup_token(&token);
@@ -196,6 +186,16 @@ async fn enroll_page(
     })
 }
 
+/// An enrollment ceremony's server-side state and what authorised it: the
+/// hash of the admin's session (`reg`) or of the setup token (`reg-setup`).
+/// The finish re-checks that authority, so a session that ended or a token
+/// used or replaced meanwhile enrolls nothing.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Enrollment {
+    reg: PasskeyRegistration,
+    by: String,
+}
+
 #[derive(serde::Deserialize)]
 pub struct EnrollStart {
     setup_token: Option<String>,
@@ -208,14 +208,22 @@ async fn enroll_start(
     Json(body): Json<EnrollStart>,
 ) -> Response {
     // Either the one-time setup token or a live admin session authorises this.
-    let by_session = session_valid(&state, &jar).await;
     let by_token = match &body.setup_token {
-        Some(t) => state.store.setup_token_valid(t).await.unwrap_or(false),
-        None => false,
+        Some(t) if state.store.setup_token_valid(t).await.unwrap_or(false) => Some(token_hash(t)),
+        _ => None,
     };
-    if !by_session && !by_token {
+    let by_session = match session_token(&state, &jar) {
+        Some(t) if state.store.validate_session(&t).await.unwrap_or(false) => Some(token_hash(&t)),
+        _ => None,
+    };
+    let kind = if by_token.is_some() {
+        "reg-setup"
+    } else {
+        "reg"
+    };
+    let Some(by) = by_token.or(by_session) else {
         return (StatusCode::FORBIDDEN, "invalid setup token").into_response();
-    }
+    };
     let wa = match webauthn_for(&state.cfg) {
         Ok(w) => w,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -239,14 +247,10 @@ async fn enroll_start(
             // The ceremony state (challenge + exclude list) lives server-side.
             // The client only receives a random id, so it cannot substitute a
             // challenge or credential it controls.
-            let state_json = serde_json::to_string(&state_reg).unwrap();
+            let state_json = serde_json::to_string(&Enrollment { reg: state_reg, by }).unwrap();
             let sid = match state
                 .store
-                .put_webauthn_state(
-                    if by_token { "reg-setup" } else { "reg" },
-                    &state_json,
-                    Some(&label),
-                )
+                .put_webauthn_state(kind, &state_json, Some(&label))
                 .await
             {
                 Ok(Some(id)) => id,
@@ -299,7 +303,7 @@ async fn enroll_finish(
         )
             .into_response();
     };
-    let Ok(reg_state) = serde_json::from_str::<PasskeyRegistration>(&state_json) else {
+    let Ok(Enrollment { reg: reg_state, by }) = serde_json::from_str(&state_json) else {
         return (
             StatusCode::BAD_REQUEST,
             clear_ceremony(cfg, jar),
@@ -320,25 +324,49 @@ async fn enroll_finish(
     match wa.finish_passkey_registration(&body.credential, &reg_state) {
         Ok(passkey) => {
             let json = serde_json::to_string(&passkey).unwrap();
-            // A key that was not stored must not consume the one-time setup
-            // token, or the admin is locked out once this session expires.
-            if let Err(e) = state
-                .store
-                .save_credential(passkey.cred_id(), &json, label.as_deref())
-                .await
-            {
-                tracing::warn!(?e, "could not store the enrolled key");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "could not store the key")
-                    .into_response();
+            let (cred, label) = (passkey.cred_id(), label.as_deref());
+            // The key is stored only if what authorised the start still does,
+            // checked in the same transaction. The setup token is used up
+            // with it, and a key that was not stored leaves it usable (or the
+            // admin is locked out). An admin adding a key with their session
+            // leaves a setup token issued meanwhile (e.g. for a colleague)
+            // alone.
+            let stored = if by_token {
+                state
+                    .store
+                    .save_credential_with_setup_token(cred, &json, label, &by)
+                    .await
+            } else {
+                // The browser must still hold that very session.
+                match session_token(&state, &jar) {
+                    Some(t) if token_hash(&t) == by => {
+                        state
+                            .store
+                            .save_credential_in_session(cred, &json, label, &by)
+                            .await
+                    }
+                    _ => Ok(false),
+                }
+            };
+            match stored {
+                Ok(true) => {}
+                Ok(false) => {
+                    let why = if by_token {
+                        "the setup token was used, replaced or has expired"
+                    } else {
+                        "the session that started this enrollment has ended; sign in again"
+                    };
+                    return (StatusCode::FORBIDDEN, clear_ceremony(cfg, jar), why).into_response();
+                }
+                Err(e) => {
+                    tracing::warn!(?e, "could not store the enrolled key");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "could not store the key")
+                        .into_response();
+                }
             }
-            // An admin adding a key with their session leaves a setup token
-            // issued meanwhile (e.g. for a colleague) alone.
-            if by_token {
-                let _ = state.store.consume_setup_token().await;
-            }
-            // An admin adding a key keeps their session. The first key
-            // (setup token) signs in with that key.
-            if session_valid(&state, &jar).await {
+            // Only the first key (setup token) signs in, with that key; an
+            // admin adding a key keeps their session.
+            if !by_token || session_valid(&state, &jar).await {
                 return (clear_ceremony(cfg, jar), StatusCode::OK).into_response();
             }
             let old = session_token(&state, &jar);

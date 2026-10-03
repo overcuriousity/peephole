@@ -263,7 +263,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
         {
-            // A database created before incremental auto-vacuum.
+            // A database left in the default mode (created by two
+            // processes at once: only one sets incremental auto-vacuum).
             let opts = sqlx::sqlite::SqliteConnectOptions::new()
                 .filename(&path)
                 .create_if_missing(true);
@@ -271,10 +272,9 @@ mod tests {
                 .connect_with(opts)
                 .await
                 .unwrap();
-            sqlx::query("CREATE TABLE t (x)")
-                .execute(&pool)
-                .await
-                .unwrap();
+            for sql in ["PRAGMA application_id = 1885693296", "CREATE TABLE t (x)"] {
+                sqlx::query(sql).execute(&pool).await.unwrap();
+            }
             pool.close().await;
         }
         let s = Store::connect(&path).await.unwrap();

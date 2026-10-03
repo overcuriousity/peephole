@@ -87,44 +87,6 @@ impl GeoIp {
     }
 }
 
-impl GeoIp {
-    /// Re-resolve rows from [`Store::ips_with_legacy_country`] to fresh
-    /// geo data. Synchronous so callers can hold the shared lock briefly and
-    /// release it before the async write in [`backfill_iso_codes`].
-    pub fn relookup(&self, rows: &[(i64, String, String)]) -> Vec<(i64, Geo)> {
-        rows.iter()
-            .map(|(id, ip, legacy)| {
-                let mut g = ip.parse().map(|ip| self.lookup(&ip)).unwrap_or_default();
-                if g.country.is_none() {
-                    // No longer in the database: map the stored English name.
-                    g.country = crate::admin::countries::code_for_name(legacy).map(str::to_string);
-                }
-                (*id, g)
-            })
-            .collect()
-    }
-}
-
-/// Older builds stored the English country name instead of the ISO code,
-/// which left the choropleth empty. Rewrite those rows; returns how many
-/// were fixed. Rows that cannot be resolved are left untouched.
-pub async fn backfill_iso_codes(
-    rec: &crate::store::recorder::Recorder,
-    updates: Vec<(i64, Geo)>,
-    version: Option<&str>,
-) -> Result<usize> {
-    let mut n = 0;
-    for (id, g) in updates {
-        let Some(code) = g.country.as_deref() else {
-            continue;
-        };
-        rec.record_geo(id, version, Some(code), g.asn, g.asn_org.as_deref())
-            .await?;
-        n += 1;
-    }
-    Ok(n)
-}
-
 /// Download GeoLite2-City and GeoLite2-ASN into `data_dir` (spec §9).
 ///
 /// The HTTP client has connect and overall timeouts so one hung TLS
@@ -234,51 +196,6 @@ mod tests {
         let geo = GeoIp::load(dir.path()).unwrap();
         let g = geo.lookup(&"2.125.160.216".parse::<IpAddr>().unwrap());
         assert_eq!(g.country.as_deref(), Some("GB"));
-    }
-
-    #[tokio::test]
-    async fn backfill_rewrites_legacy_country_names() {
-        let dir = tempfile::tempdir().unwrap();
-        for f in ["GeoLite2-City", "GeoLite2-ASN"] {
-            std::fs::copy(
-                format!("tests/fixtures/{f}-Test.mmdb"),
-                dir.path().join(format!("{f}.mmdb")),
-            )
-            .unwrap();
-        }
-        let geo = GeoIp::load(dir.path()).unwrap();
-        let store = crate::store::Store::connect(&dir.path().join("t.db"))
-            .await
-            .unwrap();
-        let gb = store
-            .upsert_ip("2.125.160.216".parse().unwrap())
-            .await
-            .unwrap();
-        store
-            .set_ip_geo(gb.id, Some("United Kingdom"), None, None)
-            .await
-            .unwrap();
-        let de = store.upsert_ip("10.0.0.1".parse().unwrap()).await.unwrap();
-        store
-            .set_ip_geo(de.id, Some("DE"), None, None)
-            .await
-            .unwrap();
-
-        let rows = store.ips_with_legacy_country().await.unwrap();
-        assert_eq!(rows.len(), 1);
-        let n = backfill_iso_codes(
-            &store.local(),
-            geo.relookup(&rows),
-            geo.build_date().as_deref(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(n, 1);
-        let gb = store.ip_by_id(gb.id).await.unwrap().unwrap();
-        assert_eq!(gb.country.as_deref(), Some("GB"));
-        let de = store.ip_by_id(de.id).await.unwrap().unwrap();
-        assert_eq!(de.country.as_deref(), Some("DE"), "ISO rows untouched");
-        assert!(store.ips_with_legacy_country().await.unwrap().is_empty());
     }
 
     #[test]

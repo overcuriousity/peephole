@@ -16,6 +16,7 @@ pub mod rpc;
 pub mod status;
 pub mod sync;
 pub mod tls;
+pub mod traffic;
 
 use crate::config::{ClusterConfig, Config, Roles};
 use crate::store::Store;
@@ -138,9 +139,13 @@ pub async fn set_detached(store: &Store, d: Option<Detached>) -> Result<()> {
     Ok(())
 }
 
-/// Leave the cluster: announce it, hand the announcement to every peer we
-/// can reach, then stop syncing. Returns how many peers were told.
+/// Leave the cluster: revoke our invites, announce it, hand the
+/// announcement to every peer we can reach, then stop syncing. Returns how
+/// many peers were told.
 pub async fn leave(node: &Node) -> Result<usize> {
+    // A node that left admits nobody: an invite given out before must not
+    // let anyone in on its word afterwards.
+    invite::revoke_all(&node.store).await?;
     repl::append(node, &[Record::MemberRevoke { id: node.id() }]).await?;
     let mut told = 0;
     for (peer, _, addr) in node.dial_targets() {
@@ -277,6 +282,8 @@ pub struct Node {
     pub own_floors: RwLock<history::Floors>,
     /// Sync rounds run, with any peer (status and tests).
     pub sync_rounds: std::sync::atomic::AtomicU64,
+    /// What replication moved per peer, for the journal.
+    pub traffic: traffic::Traffic,
     /// The furthest any peer is known to hold this node's own log (from
     /// sync rounds since start). A windowed node never drops its own
     /// entries beyond it: they may be the only copy.
@@ -327,14 +334,24 @@ impl Node {
             retention_days: p.retention_days,
             own_floors: Default::default(),
             sync_rounds: Default::default(),
+            traffic: Default::default(),
             unserved: Default::default(),
             own_acked: Default::default(),
         });
-        // Our clock must not run behind anything already in the log.
+        // Our clock must not run behind anything already in the log, and
+        // never behind our own entries: peers ignore an entry of ours that
+        // is not later than the one before (see `repl`), also after the
+        // wall clock was set back.
         let max_hlc: Option<i64> = sqlx::query_scalar("SELECT MAX(hlc) FROM repl_log")
             .fetch_one(&node.store.pool)
             .await?;
         node.hlc.observe(hlc::from_db(max_hlc.unwrap_or(0)));
+        if let Some(own) = node.own_last_hlc().await? {
+            if hlc::ahead(own, hlc::wall_ms()) {
+                warn!("our last log entry is dated ahead of the clock; ours stay later than it");
+            }
+            node.hlc.observe_own(own);
+        }
         node.reload_members().await?;
         // Offline for longer than the prune window: the cluster dropped us,
         // and our log is too old to judge anyone else by.

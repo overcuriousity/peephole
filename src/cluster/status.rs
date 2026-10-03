@@ -14,6 +14,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const HB_DOMAIN: &[u8] = b"peephole-hb-v1\0";
+/// Heartbeats looked at per gossip message beyond one per member (the
+/// sender may know a few members this node does not yet).
+const GOSSIP_SLACK: usize = 16;
 /// Contacts this recent make two nodes neighbours.
 pub const NEIGHBOUR_WINDOW: Duration = Duration::from_secs(90);
 /// How often a node refreshes its own heartbeat.
@@ -75,11 +78,28 @@ impl SignedHeartbeat {
 
     /// Decode and check the signature (not membership).
     pub fn open(&self) -> Option<Heartbeat> {
-        let hb: Heartbeat = super::rpc::cbor::decode(&self.body).ok()?;
-        hb.node
-            .verify(&Self::signing(&self.body), &self.sig)
-            .then_some(hb)
+        self.decode().filter(|hb| self.signed_by(hb))
     }
+
+    /// Decode without checking the signature.
+    fn decode(&self) -> Option<Heartbeat> {
+        super::rpc::cbor::decode(&self.body).ok()
+    }
+
+    /// Whether the node `hb` (decoded from this body) signed it.
+    fn signed_by(&self, hb: &Heartbeat) -> bool {
+        hb.node.verify(&Self::signing(&self.body), &self.sig)
+    }
+}
+
+/// Whether `hb` would replace what `all` holds of its node at `now_ms` (see
+/// [`Status::merge`]).
+fn news(all: &HashMap<NodeId, Known>, hb: &Heartbeat, now_ms: u64) -> bool {
+    let limit = now_ms.saturating_add(super::hlc::MAX_DRIFT_MS);
+    hb.at_ms <= limit
+        && !all
+            .get(&hb.node)
+            .is_some_and(|k| k.hb.at_ms >= hb.at_ms && k.hb.at_ms <= limit)
 }
 
 /// A heartbeat as known here, with the local time it last advanced.
@@ -197,6 +217,12 @@ impl Status {
         )
     }
 
+    /// Whether [`Self::merge`] would take `hb` (checked before its
+    /// signature, which costs more).
+    pub fn is_news(&self, hb: &Heartbeat) -> bool {
+        news(&self.heartbeats.lock().unwrap(), hb, super::hlc::wall_ms())
+    }
+
     /// Store a heartbeat if it is newer than what we have.
     pub fn merge(&self, hb: Heartbeat, signed: SignedHeartbeat) -> bool {
         self.merge_at(hb, signed, super::hlc::wall_ms())
@@ -208,15 +234,8 @@ impl Status {
     /// newer-looking one: otherwise it would mute its node until our clock
     /// caught up with it.
     fn merge_at(&self, hb: Heartbeat, signed: SignedHeartbeat, now_ms: u64) -> bool {
-        let limit = now_ms.saturating_add(super::hlc::MAX_DRIFT_MS);
-        if hb.at_ms > limit {
-            return false;
-        }
         let mut all = self.heartbeats.lock().unwrap();
-        if all
-            .get(&hb.node)
-            .is_some_and(|k| k.hb.at_ms >= hb.at_ms && k.hb.at_ms <= limit)
-        {
+        if !news(&all, &hb, now_ms) {
             return false;
         }
         all.insert(
@@ -310,12 +329,20 @@ impl Node {
     }
 
     /// Merge gossiped heartbeats from members; returns how many were new.
+    /// Take the gossiped heartbeats that are news: of members and newer
+    /// than what is held. Only those are checked for a signature, and only
+    /// so many are looked at per message (one per member, plus a little),
+    /// so a peer cannot make this node verify signatures by the thousand.
     pub fn merge_heartbeats(&self, incoming: Vec<SignedHeartbeat>) -> usize {
+        let limit = self.members.read().unwrap().len() + GOSSIP_SLACK;
         incoming
             .into_iter()
-            .filter_map(|s| s.open().map(|hb| (hb, s)))
-            .filter(|(hb, _)| hb.node != self.id() && self.is_member(&hb.node))
-            .filter(|(hb, s)| self.status.merge(hb.clone(), s.clone()))
+            .take(limit)
+            .filter_map(|s| s.decode().map(|hb| (hb, s)))
+            .filter(|(hb, _)| {
+                hb.node != self.id() && self.is_member(&hb.node) && self.status.is_news(hb)
+            })
+            .filter(|(hb, s)| s.signed_by(hb) && self.status.merge(hb.clone(), s.clone()))
             .count()
     }
 
@@ -420,6 +447,72 @@ mod tests {
         let at = s.next_at();
         assert!(at <= crate::cluster::hlc::wall_ms(), "{at}");
         assert!(s.next_at() > at);
+    }
+
+    /// Gossip takes members' heartbeats that are news, drops strangers' and
+    /// forged ones, and looks at no more than one per member (plus a
+    /// little) in a message.
+    #[tokio::test]
+    async fn gossip_takes_members_news_only() {
+        use crate::cluster::identity::Identity;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let node = crate::cluster::Node::open(crate::cluster::NodeParams {
+            identity: Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store,
+            proto: (1, 1),
+            data_dir: dir.path().to_path_buf(),
+            retention_days: 0,
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        let (m, stranger) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let info = crate::cluster::record::MemberInfo {
+            id: m.id,
+            name: "m".into(),
+            address: None,
+            roles: vec![],
+            proto_min: 1,
+            proto_max: 1,
+            remote_config: false,
+        };
+        crate::cluster::repl::append(&node, &[crate::cluster::record::Record::MemberAdd(info)])
+            .await
+            .unwrap();
+        let now = crate::cluster::hlc::wall_ms();
+        let (_, forged) = {
+            let (hb, mut s) = signed_hb(&m, now + 10);
+            s.sig[0] ^= 1;
+            (hb, s)
+        };
+        let msg = vec![
+            signed_hb(&m, now).1,
+            signed_hb(&m, now + 5).1,
+            forged,
+            signed_hb(&stranger, now).1,
+        ];
+        assert_eq!(node.merge_heartbeats(msg), 2);
+        assert_eq!(node.status.known(&m.id).unwrap().hb.at_ms, now + 5);
+        // Past the cap, nothing more is looked at.
+        let mut flood: Vec<_> = (0..64).map(|_| signed_hb(&stranger, now).1).collect();
+        flood.push(signed_hb(&m, now + 20).1);
+        assert_eq!(node.merge_heartbeats(flood), 0);
+        assert_eq!(node.status.known(&m.id).unwrap().hb.at_ms, now + 5);
     }
 
     #[test]

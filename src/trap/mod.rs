@@ -18,7 +18,7 @@ use crate::store::{Store, requests::NewRequest};
 use anyhow::Result;
 use axum::{
     Router,
-    extract::{ConnectInfo, Form, Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode, Version, header},
     response::{Html, IntoResponse, Response},
     routing::{any, get, post},
@@ -85,6 +85,80 @@ pub struct Guards {
     in_flight: std::sync::Arc<Counter>,
     /// Bounds the recordings running apart from their answers.
     recording: RecordSlots,
+    /// Bounds the bodies held from reading to recording.
+    bodies: BodyBudget,
+}
+
+/// Bytes of request bodies held at once, across the trap's listeners, from
+/// the first byte read until the request is recorded. Bodies are read
+/// before a recording slot is free, so without it every connection's
+/// HTTP/2 streams could each hold [`MAX_BODY`]. A body that does not fit is
+/// not kept, and its request leaves a light row only, as in a flood.
+const BODY_BUDGET: usize = 64 * 1024 * 1024;
+
+struct BodyBudget(Arc<Budget>);
+
+struct Budget {
+    cap: usize,
+    used: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for BodyBudget {
+    fn default() -> Self {
+        Self::new(BODY_BUDGET)
+    }
+}
+
+impl BodyBudget {
+    fn new(cap: usize) -> Self {
+        Self(Arc::new(Budget {
+            cap,
+            used: Default::default(),
+        }))
+    }
+
+    fn hold(&self) -> BodyHold {
+        BodyHold {
+            budget: self.0.clone(),
+            n: 0,
+        }
+    }
+}
+
+/// Body bytes held against the [`BodyBudget`] until dropped.
+struct BodyHold {
+    budget: Arc<Budget>,
+    n: usize,
+}
+
+impl BodyHold {
+    /// Hold `by` more bytes; false, holding nothing more, if they do not fit.
+    fn grow(&mut self, by: usize) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let b = &self.budget;
+        let mut used = b.used.load(SeqCst);
+        let fits = loop {
+            let Some(next) = used.checked_add(by).filter(|t| *t <= b.cap) else {
+                break false;
+            };
+            match b.used.compare_exchange_weak(used, next, SeqCst, SeqCst) {
+                Ok(_) => break true,
+                Err(now) => used = now,
+            }
+        };
+        if fits {
+            self.n += by;
+        }
+        fits
+    }
+}
+
+impl Drop for BodyHold {
+    fn drop(&mut self) {
+        self.budget
+            .used
+            .fetch_sub(self.n, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Recordings that may run at once. A request waits for a slot before it
@@ -103,6 +177,14 @@ impl Default for RecordSlots {
 }
 
 impl Guards {
+    /// Guards with room for `bytes` of bodies (see [`BODY_BUDGET`]).
+    pub fn with_body_budget(bytes: usize) -> Self {
+        Self {
+            bodies: BodyBudget::new(bytes),
+            ..Default::default()
+        }
+    }
+
     /// Count a request as in flight until the returned guard is dropped.
     pub fn enter(&self) -> InFlight {
         self.in_flight
@@ -213,11 +295,23 @@ pub async fn flush_skips(state: Arc<TrapState>, mut shutdown: tokio::sync::watch
     }
 }
 
-/// Minimal fixed-window rate limiter. Bounded in size so an attacker rotating
-/// source addresses cannot grow it without limit.
+/// Minimal fixed-window rate limiter, per source (IPv6 by /64, see
+/// [`crate::net::source_key`]). Bounded in size so an attacker rotating
+/// sources cannot grow it without limit: windows are forgotten oldest first,
+/// once over or once more than [`RateLimiter::MAX_TRACKED`] are open, each
+/// at most once, so no request pays for more than its share.
 #[derive(Default)]
 pub struct RateLimiter {
-    windows: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    windows: Mutex<Windows>,
+}
+
+#[derive(Default)]
+struct Windows {
+    /// Per source: when its window opened, and the hits in it.
+    open: HashMap<IpAddr, (Instant, u32)>,
+    /// Windows in the order they opened; one whose source has opened
+    /// another since is stale and skipped.
+    order: std::collections::VecDeque<(IpAddr, Instant)>,
 }
 
 impl RateLimiter {
@@ -225,17 +319,26 @@ impl RateLimiter {
 
     /// Returns true if this hit is allowed (under the limit for its window).
     fn allow(&self, ip: IpAddr, limit: u32, window: std::time::Duration) -> bool {
-        let now = Instant::now();
-        let mut map = self.windows.lock().unwrap();
-        if map.len() > Self::MAX_TRACKED {
-            map.retain(|_, (start, _)| now.duration_since(*start) < window);
-            if map.len() > Self::MAX_TRACKED {
-                map.clear();
+        self.allow_at(ip, limit, window, Instant::now())
+    }
+
+    fn allow_at(&self, ip: IpAddr, limit: u32, window: Duration, now: Instant) -> bool {
+        let key = crate::net::source_key(ip);
+        let mut w = self.windows.lock().unwrap();
+        let Windows { open, order } = &mut *w;
+        while let Some(&(k, start)) = order.front() {
+            if now.saturating_duration_since(start) < window && open.len() < Self::MAX_TRACKED {
+                break;
+            }
+            order.pop_front();
+            if open.get(&k).is_some_and(|e| e.0 == start) {
+                open.remove(&k);
             }
         }
-        let e = map.entry(ip).or_insert((now, 0));
-        if now.duration_since(e.0) >= window {
+        let e = open.entry(key).or_insert((now, 0));
+        if e.1 == 0 || now.saturating_duration_since(e.0) >= window {
             *e = (now, 0);
+            order.push_back((key, now));
         }
         e.1 += 1;
         e.1 <= limit
@@ -271,7 +374,8 @@ impl TrapState {
 }
 
 /// The trap's routes. The helper endpoints the trap page uses sit under
-/// `trap.helper_prefix`; everything else is the trap.
+/// `trap.helper_prefix`; everything else is the trap. The helpers take no
+/// extractor that can fail: a request they cannot take goes to [`trap`].
 pub fn router(state: Arc<TrapState>) -> Router {
     let p = state.cfg.trap.helper_prefix.clone();
     Router::new()
@@ -283,8 +387,6 @@ pub fn router(state: Arc<TrapState>) -> Router {
         // A wrong method on a helper path is the trap too: axum's own 405
         // would go unrecorded and give the helpers away.
         .method_not_allowed_fallback(trap_handler)
-        // Limits the helpers' Form/Json bodies; the trap reads its own.
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
 }
 
@@ -358,12 +460,29 @@ pub fn client_ip(headers: &HeaderMap, fallback: IpAddr, trusted: &[IpNet]) -> Ip
     fallback
 }
 
-/// The body as far as the trap keeps it: at most `MAX_BODY` bytes, plus,
-/// when that is not the whole body, the number of bytes received before
-/// reading stopped (cut at the cap, drained up to `MAX_BODY_DRAIN`, timed out
-/// or broken off).
-async fn read_body(body: axum::body::Body) -> (Vec<u8>, Option<u64>) {
+/// A request body as far as the trap keeps it.
+struct ReadBody {
+    /// At most `MAX_BODY` bytes.
+    bytes: Vec<u8>,
+    /// When that is not the whole body, the number of bytes received
+    /// before reading stopped (cut at the cap, drained up to
+    /// `MAX_BODY_DRAIN`, timed out or broken off).
+    received: Option<u64>,
+    /// The bytes held against the budget; None when the body did not fit
+    /// it, and reading stopped with nothing kept.
+    hold: Option<BodyHold>,
+}
+
+impl ReadBody {
+    fn whole(&self) -> bool {
+        self.hold.is_some() && self.received.is_none()
+    }
+}
+
+/// Read a body (see [`ReadBody`]), holding what is kept against `budget`.
+async fn read_body(body: axum::body::Body, budget: &BodyBudget) -> ReadBody {
     let mut stream = body.into_data_stream();
+    let mut hold = budget.hold();
     let mut kept: Vec<u8> = Vec::new();
     let mut seen: u64 = 0;
     let mut complete = false;
@@ -374,8 +493,15 @@ async fn read_body(body: axum::body::Body) -> (Vec<u8>, Option<u64>) {
             next = stream.next() => match next {
                 Some(Ok(chunk)) => {
                     seen += chunk.len() as u64;
-                    let room = MAX_BODY.saturating_sub(kept.len());
-                    kept.extend_from_slice(&chunk[..room.min(chunk.len())]);
+                    let take = MAX_BODY.saturating_sub(kept.len()).min(chunk.len());
+                    if !hold.grow(take) {
+                        return ReadBody {
+                            bytes: vec![],
+                            received: Some(seen),
+                            hold: None,
+                        };
+                    }
+                    kept.extend_from_slice(&chunk[..take]);
                     if seen >= MAX_BODY_DRAIN {
                         break;
                     }
@@ -390,7 +516,11 @@ async fn read_body(body: axum::body::Body) -> (Vec<u8>, Option<u64>) {
         }
     }
     let whole = complete && seen == kept.len() as u64;
-    (kept, (!whole).then_some(seen))
+    ReadBody {
+        bytes: kept,
+        received: (!whole).then_some(seen),
+        hold: Some(hold),
+    }
 }
 
 /// What the trap stores for one request besides the verdict.
@@ -630,6 +760,9 @@ fn header_pairs(h: &HeaderMap) -> Vec<(String, String)> {
 /// (bytes received when the stored body is not the whole body; the declared
 /// length is in `content-length`). Rows recorded before the `unrecorded`
 /// column existed carry that count as `:unrecorded`.
+///
+/// A body that does not fit the trap's [`BODY_BUDGET`] is not kept, and the
+/// request leaves a light row only, as one over the recording rate does.
 async fn trap_handler(
     State(state): State<Arc<TrapState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -637,8 +770,21 @@ async fn trap_handler(
 ) -> Response {
     let in_flight = state.guards.enter();
     let (parts, body) = req.into_parts();
+    let body = read_body(body, &state.guards.bodies).await;
+    trap(state, peer, in_flight, parts, body).await
+}
+
+/// [`trap_handler`] once the body is read; also where a helper endpoint
+/// sends a request it cannot take, so it is recorded and answered as any
+/// other (a framework error page would give the helper away).
+async fn trap(
+    state: Arc<TrapState>,
+    peer: SocketAddr,
+    in_flight: InFlight,
+    parts: axum::http::request::Parts,
+    body: ReadBody,
+) -> Response {
     let ip = client_ip(&parts.headers, peer.ip(), &state.cfg.trusted_proxies);
-    let (body, received) = read_body(body).await;
     let page_token = uuid::Uuid::new_v4().to_string();
     // Decided before recording, so the row says what was sent.
     let decoy = if state.cfg.trap.decoys {
@@ -664,7 +810,6 @@ async fn trap_handler(
         ip,
         parts,
         body,
-        received,
         page_token.clone(),
         answer,
         status,
@@ -685,24 +830,39 @@ async fn trap_handler(
 }
 
 /// The recording part of [`trap_handler`]: a full row, or a light row when
-/// this IP is over its recording rate. In flight until it is done.
+/// this IP is over its recording rate or its body did not fit the budget.
+/// In flight until it is done.
 #[allow(clippy::too_many_arguments)]
 async fn record_trap(
     state: Arc<TrapState>,
     _in_flight: (InFlight, tokio::sync::OwnedSemaphorePermit),
     ip: IpAddr,
     parts: axum::http::request::Parts,
-    body: Vec<u8>,
-    received: Option<u64>,
+    body: ReadBody,
     page_token: String,
     answer: String,
     status: u16,
 ) {
     let method = parts.method.as_str();
     let path = parts.uri.path();
-    match state.guards.flood.admit(ip, &state.cfg.trap) {
-        flood::Admission::Skip => {
+    let admission = if body.hold.is_none() {
+        debug!(%ip, "trap: body over the in-memory budget; answered, light row only");
+        state.guards.flood.count_unrecorded(ip, &state.cfg.trap);
+        flood::Admission::Skip
+    } else {
+        let a = state.guards.flood.admit(ip, &state.cfg.trap);
+        if a == flood::Admission::Skip {
             debug!(%ip, "trap: over the recording rate; answered, light row only");
+        }
+        a
+    };
+    let ReadBody {
+        bytes: body,
+        received,
+        hold: _hold,
+    } = body;
+    match admission {
+        flood::Admission::Skip => {
             let full = state.guards.skips.note(
                 ip,
                 chrono::Utc::now().timestamp_millis(),
@@ -765,6 +925,15 @@ async fn record_trap(
     }
 }
 
+/// Whether the request's media type (without parameters) passes `is`.
+fn media_type(headers: &HeaderMap, is: impl Fn(&str) -> bool) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|m| is(&m.trim().to_ascii_lowercase()))
+}
+
 #[derive(serde::Deserialize)]
 pub struct ClaimForm {
     email: Option<String>,
@@ -773,15 +942,24 @@ pub struct ClaimForm {
 async fn claim_handler(
     State(state): State<Arc<TrapState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    version: Version,
-    meta: Option<axum::Extension<listen::ConnMeta>>,
-    headers: HeaderMap,
-    Form(form): Form<ClaimForm>,
-) -> impl IntoResponse {
-    let ip = client_ip(&headers, peer.ip(), &state.cfg.trusted_proxies);
+    req: Request,
+) -> Response {
+    let in_flight = state.guards.enter();
+    let (parts, body) = req.into_parts();
+    let ip = client_ip(&parts.headers, peer.ip(), &state.cfg.trusted_proxies);
     if !state.helper_rate.allow(ip, HELPER_LIMIT, HELPER_WINDOW) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
     }
+    let body = read_body(body, &state.guards.bodies).await;
+    let form = (body.whole()
+        && media_type(&parts.headers, |m| m == "application/x-www-form-urlencoded"))
+    .then(|| serde_urlencoded::from_bytes::<ClaimForm>(&body.bytes).ok())
+    .flatten();
+    let Some(form) = form else {
+        return trap(state, peer, in_flight, parts, body).await;
+    };
+    drop(body);
+    let headers = parts.headers;
     let ua = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -789,9 +967,12 @@ async fn claim_handler(
         .to_string();
     let raw = header_pairs(&headers);
     let path = format!("{}/claim", state.cfg.trap.helper_prefix);
-    let conn = meta.map(|m| ConnCapture::of(&m, version));
+    let conn = parts
+        .extensions
+        .get::<listen::ConnMeta>()
+        .map(|m| ConnCapture::of(m, parts.version));
     // Recorded apart from the answer, as in `trap_handler`.
-    let in_flight = (state.guards.enter(), state.guards.slot().await);
+    let in_flight = (in_flight, state.guards.slot().await);
     tokio::spawn(async move {
         let _in_flight = in_flight;
         let capture = Capture {
@@ -841,15 +1022,27 @@ pub struct CollectPayload {
 async fn collect_handler(
     State(state): State<Arc<TrapState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    axum::Json(payload): axum::Json<CollectPayload>,
-) -> impl IntoResponse {
-    let ip = client_ip(&headers, peer.ip(), &state.cfg.trusted_proxies);
+    req: Request,
+) -> Response {
+    let in_flight = state.guards.enter();
+    let (parts, body) = req.into_parts();
+    let ip = client_ip(&parts.headers, peer.ip(), &state.cfg.trusted_proxies);
     if !state.helper_rate.allow(ip, HELPER_LIMIT, HELPER_WINDOW) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
     }
+    let body = read_body(body, &state.guards.bodies).await;
+    let json = |m: &str| {
+        m == "application/json" || (m.starts_with("application/") && m.ends_with("+json"))
+    };
+    let payload = (body.whole() && media_type(&parts.headers, json))
+        .then(|| serde_json::from_slice::<CollectPayload>(&body.bytes).ok())
+        .flatten();
+    let Some(payload) = payload else {
+        return trap(state, peer, in_flight, parts, body).await;
+    };
+    drop(body);
     // Recorded apart from the answer, as in `trap_handler`.
-    let in_flight = (state.guards.enter(), state.guards.slot().await);
+    let in_flight = (in_flight, state.guards.slot().await);
     tokio::spawn(async move {
         let _in_flight = in_flight;
         // Attribute the fingerprint to the page view that issued the token.
@@ -929,17 +1122,24 @@ async fn collect_handler(
 async fn panel_handler(
     State(state): State<Arc<TrapState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
-    let ip = client_ip(&headers, peer.ip(), &state.cfg.trusted_proxies);
+    req: Request,
+) -> Response {
+    let (parts, body) = req.into_parts();
+    let ip = client_ip(&parts.headers, peer.ip(), &state.cfg.trusted_proxies);
     if !state.panel_rate.allow(ip, PANEL_LIMIT, HELPER_WINDOW) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
     }
-    let Some(token) = q.get("token") else {
-        return (StatusCode::BAD_REQUEST, "missing token").into_response();
+    let token = parts
+        .uri
+        .query()
+        .and_then(|q| serde_urlencoded::from_str::<HashMap<String, String>>(q).ok())
+        .and_then(|mut q| q.remove("token"));
+    let Some(token) = token else {
+        let in_flight = state.guards.enter();
+        let body = read_body(body, &state.guards.bodies).await;
+        return trap(state, peer, in_flight, parts, body).await;
     };
-    match state.store.fingerprint_by_token(token).await {
+    match state.store.fingerprint_by_token(&token).await {
         Ok(Some((ip_id, hash, attrs, behavior))) => {
             let attrs: serde_json::Value = serde_json::from_str(&attrs).unwrap_or_default();
             let behavior: serde_json::Value = serde_json::from_str(&behavior).unwrap_or_default();
@@ -1140,5 +1340,73 @@ mod tests {
             &trusted(),
         );
         assert_eq!(ip, "203.0.113.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn the_rate_limit_holds_for_a_whole_ipv6_64() {
+        let l = RateLimiter::default();
+        let w = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let v6 = |i: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, i, 0, 0, i));
+        for i in 0..3 {
+            assert!(l.allow_at(v6(i), 3, w, t0));
+        }
+        assert!(!l.allow_at(v6(99), 3, w, t0), "another address, same /64");
+        assert!(l.allow_at("2001:db8:0:2::1".parse().unwrap(), 3, w, t0));
+        assert!(l.allow_at(v6(5), 3, w, t0 + w), "a new window");
+    }
+
+    #[test]
+    fn the_rate_limiter_forgets_oldest_first_and_stays_bounded() {
+        let l = RateLimiter::default();
+        let w = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let first: IpAddr = "198.51.100.1".parse().unwrap();
+        assert!(l.allow_at(first, 1, w, t0));
+        assert!(!l.allow_at(first, 1, w, t0));
+        // A flood of sources inside one window: each insert evicts at most
+        // the oldest window, never scans the map.
+        for i in 0..(RateLimiter::MAX_TRACKED as u32 + 10) {
+            l.allow_at(IpAddr::V4((0x0a00_0000 + i).into()), 1, w, t0);
+        }
+        {
+            let ws = l.windows.lock().unwrap();
+            assert!(ws.open.len() <= RateLimiter::MAX_TRACKED);
+            assert!(ws.order.len() <= RateLimiter::MAX_TRACKED);
+            assert!(!ws.open.contains_key(&first), "the oldest went first");
+        }
+        // Past the window everything expired goes, in order.
+        assert!(l.allow_at(first, 1, w, t0 + w));
+        let ws = l.windows.lock().unwrap();
+        assert_eq!((ws.open.len(), ws.order.len()), (1, 1));
+    }
+
+    #[test]
+    fn body_holds_share_the_budget_and_give_it_back() {
+        let b = BodyBudget::new(100);
+        let mut h1 = b.hold();
+        assert!(h1.grow(60));
+        let mut h2 = b.hold();
+        assert!(!h2.grow(41), "does not fit");
+        assert!(h2.grow(40));
+        drop(h1);
+        assert!(h2.grow(60));
+        drop(h2);
+        assert_eq!(b.0.used.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_budget_is_not_kept() {
+        let b = BodyBudget::new(1000);
+        let read = read_body(axum::body::Body::from(vec![1u8; 600]), &b).await;
+        assert!(read.whole() && read.bytes.len() == 600);
+        let over = read_body(axum::body::Body::from(vec![1u8; 600]), &b).await;
+        assert!(over.hold.is_none() && over.bytes.is_empty() && !over.whole());
+        drop(read);
+        // Past MAX_BODY nothing more is held: only what is kept counts.
+        let b = BodyBudget::new(MAX_BODY);
+        let big = read_body(axum::body::Body::from(vec![1u8; MAX_BODY * 2]), &b).await;
+        assert_eq!(big.bytes.len(), MAX_BODY);
+        assert_eq!(big.received, Some(MAX_BODY as u64 * 2));
     }
 }

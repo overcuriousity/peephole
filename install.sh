@@ -235,6 +235,11 @@ NGINX
 # X-Forwarded-For is set to the real peer address (never appended to what
 # the client sent), and peephole trusts it only from the proxies in
 # trusted_proxies. Host is passed on exactly as the client sent it.
+# The trap caps connections per client (64), but behind this proxy it sees
+# only nginx: the same cap is applied here, so one client cannot hold every
+# upstream connection. limit_conn_zone belongs to the http context too.
+limit_conn_zone \$binary_remote_addr zone=peephole_trap:10m;
+
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
@@ -243,6 +248,8 @@ server {
     # Bodies up to 1 MiB reach the trap, which keeps the first 64 KiB; nginx
     # would otherwise refuse them with 413 and nothing would be recorded.
     client_max_body_size 1m;
+    limit_conn peephole_trap 64;
+    limit_conn_status 429;
 
     location / {
         proxy_pass http://127.0.0.1:${trap_port};
@@ -303,7 +310,7 @@ UNIT_FILE="/etc/systemd/system/peephole.service"
 OLD_RULES_MANIFEST="${DATA_DIR}/.installed-rules.sha256"
 UNIT_MANIFEST="${DATA_DIR}/.installed-unit.sha256"
 # Units earlier installers wrote without recording them: unedited if they match.
-KNOWN_UNIT_SUMS="da20ef8147a9f2a9e704318e80ce381adc7b222fc5b21706bc1f5fd3bd4c5cb2"
+KNOWN_UNIT_SUMS="da20ef8147a9f2a9e704318e80ce381adc7b222fc5b21706bc1f5fd3bd4c5cb2 38da8e128f109b566c222e2b5a44ff486893981057371225ddf1bd7e1d4aa8ae"
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }

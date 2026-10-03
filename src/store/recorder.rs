@@ -27,6 +27,12 @@ pub enum Recorder {
 
 /// Rows per tombstone record in bulk deletes.
 const TOMB_CHUNK: usize = 500;
+/// Retention deletes this many requests (with their claims and
+/// fingerprints), or rows of another table, per write transaction ...
+const PRUNE_CHUNK: usize = 500;
+/// ... and pauses this long between two, so the trap's writes waiting for
+/// the lock get in (a whole batch at once outlasted their busy timeout).
+const PRUNE_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// `v` with the null-valued keys of an object removed.
 fn without_nulls(mut v: serde_json::Value) -> serde_json::Value {
@@ -396,8 +402,9 @@ impl Recorder {
             .await
     }
 
-    /// Cooldown (spec §5): a finished scan of level >= requested within the
-    /// window suppresses; a higher requested level upgrades exactly once.
+    /// Cooldown (spec §5): a finished or refused scan of level >= requested
+    /// within the window suppresses; a higher requested level upgrades
+    /// exactly once.
     /// Checked against every job in the (replicated) database.
     ///
     /// With `policy.safety` (the trap's policy, see [`crate::scan::guard`]):
@@ -430,8 +437,13 @@ impl Recorder {
         {
             level = s.single_request_max_level;
         }
+        // A refusal (crawler, member, never_scan, Tor exit, ...) holds as
+        // long as a scan would, or every request would queue the IP again;
+        // a job dropped from a full queue says nothing about the IP.
         let recent: Option<(i64,)> = sqlx::query_as(
-            "SELECT level FROM scan_jobs WHERE ip_id = ? AND status IN ('done','failed')
+            "SELECT level FROM scan_jobs WHERE ip_id = ?
+             AND (status IN ('done','failed')
+                  OR (status = 'refused' AND COALESCE(error, '') NOT LIKE 'dropped:%'))
              AND finished_at > datetime('now', ?) ORDER BY level DESC LIMIT 1",
         )
         .bind(ip_id)
@@ -1079,7 +1091,8 @@ impl Recorder {
     /// fingerprints, scan results, skipped batches, finished jobs and
     /// fingerprints without a request, older than `days`. Bounded per call
     /// so a huge backlog drains over several runs: call again until the
-    /// result [`Pruned::is_empty`].
+    /// result [`Pruned::is_empty`]. Written in transactions of
+    /// [`PRUNE_CHUNK`] rows, [`PRUNE_PAUSE`] apart.
     pub async fn prune_older_than(&self, days: u32) -> Result<Pruned> {
         if days == 0 {
             return Ok(Pruned::default());
@@ -1094,7 +1107,17 @@ impl Recorder {
         .bind(BATCH)
         .fetch_all(pool)
         .await?;
-        let requests = self.delete_requests(&req_ids).await?.deleted;
+        let mut wrote = false;
+        let mut pause = async || {
+            if std::mem::replace(&mut wrote, true) {
+                tokio::time::sleep(PRUNE_PAUSE).await;
+            }
+        };
+        let mut requests = 0;
+        for c in req_ids.chunks(PRUNE_CHUNK) {
+            pause().await;
+            requests += self.delete_requests(c).await?.deleted;
+        }
         let mut counts = [0u64; 4];
         for (n, sql) in counts.iter_mut().zip([
             "SELECT uid FROM scans
@@ -1125,7 +1148,10 @@ impl Recorder {
                 .fetch_all(pool)
                 .await?;
             *n = uids.len() as u64;
-            self.bury(uids).await?;
+            for c in uids.chunks(PRUNE_CHUNK) {
+                pause().await;
+                self.bury(c.to_vec()).await?;
+            }
         }
         let [scans, skipped_batches, fingerprints, jobs] = counts;
         Ok(Pruned {
@@ -1168,4 +1194,104 @@ pub struct Deleted {
     pub deleted: u64,
     /// Records other nodes originated: hidden on this node only.
     pub hidden: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(ip_id: i64) -> NewRequest {
+        NewRequest {
+            ip_id,
+            method: "GET".into(),
+            path: "/x".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            severity: 1,
+            scan_level: 1,
+            ..Default::default()
+        }
+    }
+
+    /// A refused job holds the cooldown like a scan, so a crawler or a
+    /// member is not queued again on every request; a job dropped from a
+    /// full queue does not.
+    #[tokio::test]
+    async fn refused_jobs_hold_the_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let rec = store.local();
+        let ip = store
+            .upsert_ip("198.51.100.30".parse().unwrap())
+            .await
+            .unwrap();
+        let EnqueueOutcome::Queued(job) = rec.enqueue_scan(ip.id, 2, 24).await.unwrap() else {
+            panic!("not queued");
+        };
+        rec.refuse_job(job, "verified crawler (googlebot.com)")
+            .await
+            .unwrap();
+        assert_eq!(
+            rec.enqueue_scan(ip.id, 2, 24).await.unwrap(),
+            EnqueueOutcome::Cooldown
+        );
+        assert!(
+            matches!(
+                rec.enqueue_scan(ip.id, 3, 24).await.unwrap(),
+                EnqueueOutcome::Queued(_)
+            ),
+            "a higher level still queues"
+        );
+        let other = store
+            .upsert_ip("198.51.100.31".parse().unwrap())
+            .await
+            .unwrap();
+        let EnqueueOutcome::Queued(job) = rec.enqueue_scan(other.id, 2, 24).await.unwrap() else {
+            panic!("not queued");
+        };
+        sqlx::query(
+            "UPDATE scan_jobs SET status = 'refused', finished_at = datetime('now'),
+               error = 'dropped: scan queue full' WHERE id = ?",
+        )
+        .bind(job)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            rec.enqueue_scan(other.id, 2, 24).await.unwrap(),
+            EnqueueOutcome::Queued(_)
+        ));
+    }
+
+    /// Retention spans several short transactions; the trap writes in
+    /// between, and what it writes stays.
+    #[tokio::test]
+    async fn retention_deletes_in_short_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let rec = store.local();
+        let ip = store
+            .upsert_ip("198.51.100.40".parse().unwrap())
+            .await
+            .unwrap();
+        let old = PRUNE_CHUNK * 2 + 1;
+        for _ in 0..old {
+            rec.insert_request(&req(ip.id)).await.unwrap();
+        }
+        sqlx::query("UPDATE requests SET ts = datetime('now', '-100 days')")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let (pruned, new) = tokio::join!(rec.prune_older_than(90), async {
+            tokio::time::sleep(PRUNE_PAUSE / 2).await;
+            rec.insert_request(&req(ip.id)).await
+        });
+        assert_eq!(pruned.unwrap().requests, old as u64);
+        let left: Vec<i64> = sqlx::query_scalar("SELECT id FROM requests")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, [new.unwrap()]);
+        assert!(rec.prune_older_than(90).await.unwrap().is_empty());
+    }
 }

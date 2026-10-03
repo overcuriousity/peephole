@@ -215,6 +215,81 @@ async fn replicated_scan_jobs_are_validated_and_rate_limited() {
     assert_eq!(count(&x, &origin_jobs).await, limit as i64);
 }
 
+/// An entry dated before its origin's previous one is kept and relayed
+/// but never applied, so backdating cannot step around the windows the
+/// limits are judged in. Before, a member at its daily or hourly limit
+/// simply dated more admissions or jobs a day or an hour earlier.
+#[tokio::test]
+async fn backdated_entries_take_no_effect() {
+    let mut a = Origin::new();
+    let (x, _d) = offline(&[&a], |_| {}).await;
+    let limit = members::ADMISSIONS_PER_DAY as usize;
+    let ids: Vec<NodeId> = (0..=limit)
+        .map(|_| Identity::generate().unwrap().id)
+        .collect();
+    let mut entries: Vec<WireEntry> = ids[..limit]
+        .iter()
+        .enumerate()
+        .map(|(i, m)| a.now(Record::MemberAdd(info(*m, &format!("m{i}")))))
+        .collect();
+    // At the limit: one more, dated two days back.
+    entries.push(a.at(
+        hlc_in(-2 * DAY, 0),
+        Record::MemberAdd(info(ids[limit], "late")),
+    ));
+    // And a scan job dated after that one, but still before the admissions.
+    entries.push(a.at(hlc_in(-DAY, 0), job(&a, "j", "203.0.113.5", 1)));
+    let backdated = (entries[limit].seq, entries[limit + 1].seq);
+    let st = apply(&x, entries).await;
+    assert_eq!((st.applied, st.rejected), (limit + 2, 0), "{st:?}");
+    let rows = members::all(&x.store).await.unwrap();
+    assert!(!rows.iter().any(|m| m.id == ids[limit]), "not admitted");
+    assert!(rows.iter().any(|m| m.id == ids[limit - 1]));
+    assert_eq!(count(&x, "SELECT COUNT(*) FROM scan_jobs").await, 0);
+    assert_eq!(log_state(&x, a.key(), backdated.0).await, 4);
+    assert_eq!(log_state(&x, a.key(), backdated.1).await, 4);
+    // Kept and relayed: the log has no gap, and every node judges the
+    // same entries the same way.
+    let relayed = repl::entries_after(&x.store, &[(a.key(), 0)], 0, 1000, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(relayed.entries.len(), limit + 2);
+    // Later entries dated after the newest applied one apply again.
+    let st = apply(&x, vec![a.now(job(&a, "k", "203.0.113.5", 1))]).await;
+    assert_eq!(st.applied, 1);
+    assert_eq!(count(&x, "SELECT COUNT(*) FROM scan_jobs").await, 1);
+}
+
+/// An erased entry's HLC is not signed, so a relay could put anything in
+/// its stub: the next entry is judged against the last signed one, and a
+/// stub dated far ahead does not make an honest entry look backdated.
+#[tokio::test]
+async fn an_erased_stub_does_not_set_the_bar() {
+    let mut a = Origin::new();
+    let (x, _d) = offline(&[&a], |_| {}).await;
+    let first = a.now(request(&a, "r1"));
+    let mut stub = a.now(request(&a, "r2"));
+    let next = a.now(request(&a, "r3"));
+    let tomb = a.now(Record::Tombstone(peephole::cluster::record::TombstoneRec {
+        uid: a.uid("t"),
+        uids: vec![a.uid("r2")],
+        seqs: vec![stub.seq],
+    }));
+    stub.payload = None;
+    stub.sig = None;
+    stub.erased_by = Some(a.uid("t"));
+    stub.hlc = hlc_in(4 * 60 * 1000, 0);
+    let batch = peephole::cluster::sync::Batch {
+        entries: vec![first, stub, next.clone(), tomb.clone()],
+        proofs: vec![tomb],
+        ..Default::default()
+    };
+    let st = repl::apply_batch(&x, batch).await.unwrap();
+    assert_eq!((st.applied, st.rejected), (4, 0), "{st:?}");
+    assert_eq!(log_state(&x, a.key(), next.seq).await, 1);
+    assert_eq!(count(&x, "SELECT COUNT(*) FROM requests").await, 2);
+}
+
 fn hex(id: &NodeId) -> String {
     id.0.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -264,10 +339,13 @@ async fn job_takeovers_are_judged_locally() {
     assert_eq!(log_state(&x, b.key(), early_seq).await, 1);
 
     // Contested: B and C adopt the same stale job; both orders agree, and
-    // the winner is the lower hash rank, not the lower key.
-    let stale = a.at(hlc_in(-7 * HOUR, 0), job(&a, "stale", "203.0.113.31", 2));
-    let by_b = adopt(&mut b, a.key(), a.uid("stale"));
-    let by_c = adopt(&mut c, a.key(), a.uid("stale"));
+    // the winner is the lower hash rank, not the lower key. Its arbiter S
+    // (admitted by A) queued it 7 hours ago: an origin's HLCs only rise.
+    let mut s = Origin::new();
+    apply(&x, vec![a.now(Record::MemberAdd(info(s.key(), "s")))]).await;
+    let stale = s.at(hlc_in(-7 * HOUR, 0), job(&s, "stale", "203.0.113.31", 2));
+    let by_b = adopt(&mut b, s.key(), s.uid("stale"));
+    let by_c = adopt(&mut c, s.key(), s.uid("stale"));
     apply(&x, vec![stale.clone()]).await;
     apply(&x, vec![by_b.clone()]).await;
     apply(&x, vec![by_c.clone()]).await;
@@ -276,6 +354,7 @@ async fn job_takeovers_are_judged_locally() {
         .await
         .unwrap();
     apply(&y, a_log.entries).await;
+    apply(&y, vec![stale]).await;
     let c_log = repl::entries_after(&x.store, &[(c.key(), 0)], 0, 100, usize::MAX)
         .await
         .unwrap();
@@ -284,7 +363,7 @@ async fn job_takeovers_are_judged_locally() {
         .await
         .unwrap();
     apply(&y, b_log.entries).await;
-    let uid = a.uid("stale");
+    let uid = s.uid("stale");
     let rank = |k: &NodeId| peephole::store::data::adopt_rank(&uid, k);
     let winner = if rank(&b.key()) < rank(&c.key()) {
         b.key()
@@ -298,13 +377,13 @@ async fn job_takeovers_are_judged_locally() {
     let mut d = Origin::new();
     apply(&x, vec![a.now(Record::MemberAdd(info(d.key(), "d")))]).await;
     block::block(&x, d.key()).await.unwrap();
-    let other = a.at(hlc_in(-7 * HOUR, 1), job(&a, "other", "203.0.113.32", 2));
+    let other = s.at(hlc_in(-7 * HOUR, 1), job(&s, "other", "203.0.113.32", 2));
     apply(&x, vec![other]).await;
-    let by_d = adopt(&mut d, a.key(), a.uid("other"));
+    let by_d = adopt(&mut d, s.key(), s.uid("other"));
     apply(&x, vec![by_d]).await;
     assert_eq!(
-        arbiter_of(&x, &a.uid("other")).await,
-        Some(a.key().0.to_vec())
+        arbiter_of(&x, &s.uid("other")).await,
+        Some(s.key().0.to_vec())
     );
 }
 
@@ -551,32 +630,40 @@ async fn deferred_entries_back_off_and_give_up() {
     assert_eq!(log_state(&x, b.key(), oseq).await, 3);
 }
 
-/// Timestamps from the future buy nothing: results, announcements and
-/// liveness are ordered by the time this node received them (plus the
-/// allowed drift), and a blocked node's announcement is not used.
+/// Timestamps from the future buy nothing: an entry dated further ahead
+/// than the allowed drift is not taken (its origin's stream waits for its
+/// time), what is taken counts at its own HLC on every node, an
+/// announcement cannot claim a fetch later than its entry, and a blocked
+/// node's announcement is not used.
 #[tokio::test]
-async fn future_dated_entries_are_ordered_by_their_receipt() {
+async fn future_dated_entries_wait_for_their_time() {
     let (mut a, mut b) = (Origin::new(), Origin::new());
     let (x, _d) = offline(&[&a, &b], |_| {}).await;
-    let far = hlc_in(400 * DAY, 0);
-    let latest = ((wall_ms() + 5 * 60 * 1000 + 60_000) << 16) as i64;
-    apply(
+    let intel = Record::IpIntel(IpIntelRec {
+        build: String::new(),
+        ip: "203.0.113.20".into(),
+        provider: "tor-exits".into(),
+        fetched_at: "2026-10-01 00:00:00".into(),
+        source_version: None,
+        data_json: r#"{"exit":true}"#.into(),
+    });
+    let r = a.now(request(&a, "r"));
+    let far = a.at(hlc_in(400 * DAY, 0), intel.clone());
+    let st = apply(&x, vec![r, far]).await;
+    assert_eq!((st.applied, st.rejected), (1, 1), "{st:?}");
+    assert_eq!(count(&x, "SELECT COUNT(*) FROM ip_intel").await, 0);
+    let heads = repl::heads(&x.store).await.unwrap();
+    assert_eq!(repl::head_in(&heads, &a.key()), 1, "the stream waits there");
+
+    // Within the drift: taken, at its own HLC.
+    a.seq = 1;
+    let soon = hlc_in(4 * 60 * 1000, 0);
+    let st = apply(
         &x,
         vec![
-            a.now(request(&a, "r")),
+            a.at(soon, intel),
             a.at(
-                far,
-                Record::IpIntel(IpIntelRec {
-                    build: String::new(),
-                    ip: "203.0.113.20".into(),
-                    provider: "tor-exits".into(),
-                    fetched_at: "2026-10-01 00:00:00".into(),
-                    source_version: None,
-                    data_json: r#"{"exit":true}"#.into(),
-                }),
-            ),
-            a.at(
-                far + 1,
+                soon + 1,
                 Record::IntelManifest(IntelManifestRec {
                     kind: "tor-exits".into(),
                     sha256: "aa".repeat(32),
@@ -587,11 +674,12 @@ async fn future_dated_entries_are_ordered_by_their_receipt() {
         ],
     )
     .await;
+    assert_eq!(st.applied, 2, "{st:?}");
     let h: i64 = sqlx::query_scalar("SELECT hlc FROM ip_intel")
         .fetch_one(&x.store.pool)
         .await
         .unwrap();
-    assert!(h > 0 && h < latest, "clamped to receipt + drift");
+    assert_eq!(h as u64, soon);
     let m = peephole::intel::share::manifests(&x.store).await.unwrap();
     let tor = &m["tor-exits"];
     assert!(tor.fetched_at.as_str() < "2099", "{}", tor.fetched_at);
@@ -620,24 +708,6 @@ async fn future_dated_entries_are_ordered_by_their_receipt() {
         peephole::intel::share::manifests(&x.store).await.unwrap()["tor-exits"].sha256,
         "bb".repeat(32)
     );
-
-    // Liveness: A's last entry claims to be from the future, but it was
-    // received 31 days ago and nothing since: pruned.
-    let old = hlc_in(-40 * DAY, 0) as i64;
-    sqlx::query("UPDATE repl_log SET received_at = datetime('now', '-31 days') WHERE origin = ?")
-        .bind(&a.key().0[..])
-        .execute(&x.store.pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE members SET admitted_hlc = ? WHERE id = ?")
-        .bind(old)
-        .bind(&a.key().0[..])
-        .execute(&x.store.pool)
-        .await
-        .unwrap();
-    let rows = members::all(&x.store).await.unwrap();
-    let ma = rows.iter().find(|m| m.id == a.key()).unwrap();
-    assert_eq!(ma.standing, members::Standing::Pruned);
 }
 
 /// Member descriptions are cleaned on apply: nobody can make other nodes

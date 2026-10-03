@@ -186,6 +186,12 @@ impl Safety {
         self.lists.covering(ip)
     }
 
+    /// Why this scanner scans nothing for now: `scan.never_scan_dir` is set
+    /// but its lists never loaded (unreadable since startup).
+    pub fn unavailable(&self) -> Option<String> {
+        self.lists.unavailable()
+    }
+
     /// Whether `net` holds an address [`Self::refuses`] or overlaps a
     /// network [`Self::listed`] covers, so it must not be blocked whole.
     pub fn overlaps(&self, net: &IpNet) -> bool {
@@ -272,12 +278,16 @@ fn if_inet6(text: &str) -> Vec<IpAddr> {
 }
 
 /// The operator's CIDR lists in `scan.never_scan_dir`, reloaded when a
-/// file changes.
+/// file changes. A directory or file that cannot be read keeps the lists
+/// loaded before (retried at the next check); until they loaded once, this
+/// scanner scans nothing ([`Lists::unavailable`]).
 struct Lists {
     dir: Option<PathBuf>,
     stamp: Vec<(PathBuf, SystemTime, u64)>,
     nets: Vec<(IpNet, String)>,
     checked: Option<Instant>,
+    /// The lists loaded at least once.
+    loaded: bool,
 }
 
 /// How often the directory is looked at.
@@ -290,6 +300,7 @@ impl Lists {
             stamp: vec![],
             nets: vec![],
             checked: None,
+            loaded: false,
         }
     }
 
@@ -299,20 +310,46 @@ impl Lists {
             return;
         }
         self.checked = Some(Instant::now());
-        let files = list_files(dir);
-        let stamp: Vec<_> = files
-            .iter()
-            .filter_map(|p| {
-                let m = std::fs::metadata(p).ok()?;
-                Some((p.clone(), m.modified().ok()?, m.len()))
-            })
-            .collect();
-        if stamp == self.stamp {
-            return;
+        let loaded = list_files(dir).and_then(|files| {
+            let stamp = files
+                .iter()
+                .map(|p| {
+                    let m = std::fs::metadata(p)?;
+                    Ok((p.clone(), m.modified()?, m.len()))
+                })
+                .collect::<std::io::Result<Vec<_>>>()?;
+            if self.loaded && stamp == self.stamp {
+                return Ok(None);
+            }
+            let mut nets = vec![];
+            for p in &files {
+                nets.extend(parse_list(p)?);
+            }
+            Ok(Some((stamp, nets)))
+        });
+        match loaded {
+            Ok(None) => {}
+            Ok(Some((stamp, nets))) => {
+                info!(dir = %dir.display(), networks = nets.len(), files = stamp.len(), "never-scan lists loaded");
+                (self.stamp, self.nets, self.loaded) = (stamp, nets, true);
+            }
+            Err(e) if self.loaded => warn!(
+                dir = %dir.display(), error = %e,
+                "never-scan lists unreadable; keeping the {} networks loaded before",
+                self.nets.len()
+            ),
+            Err(e) => tracing::error!(
+                dir = %dir.display(), error = %e,
+                "never-scan lists unreadable; scanning nothing until they load"
+            ),
         }
-        self.stamp = stamp;
-        self.nets = files.iter().flat_map(|p| parse_list(p)).collect();
-        info!(dir = %dir.display(), networks = self.nets.len(), files = files.len(), "never-scan lists loaded");
+    }
+
+    /// Why nothing may be scanned yet: a list directory is configured but
+    /// never loaded.
+    fn unavailable(&self) -> Option<String> {
+        let dir = self.dir.as_ref().filter(|_| !self.loaded)?;
+        Some(format!("never_scan_dir {} not loaded", dir.display()))
     }
 
     fn covering(&self, ip: &IpAddr) -> Option<String> {
@@ -324,12 +361,11 @@ impl Lists {
     }
 }
 
-fn list_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return vec![];
-    };
-    let mut v: Vec<PathBuf> = rd
-        .filter_map(|e| e.ok().map(|e| e.path()))
+fn list_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
         .filter(|p| {
             p.is_file()
                 && p.extension()
@@ -337,16 +373,14 @@ fn list_files(dir: &Path) -> Vec<PathBuf> {
         })
         .collect();
     v.sort();
-    v
+    Ok(v)
 }
 
 /// One address or CIDR per line; `#` starts a comment; bad lines are
 /// skipped with a warning.
-fn parse_list(path: &Path) -> Vec<(IpNet, String)> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        warn!(file = %path.display(), "never-scan list unreadable");
-        return vec![];
-    };
+fn parse_list(path: &Path) -> std::io::Result<Vec<(IpNet, String)>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -368,7 +402,7 @@ fn parse_list(path: &Path) -> Vec<(IpNet, String)> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -433,6 +467,52 @@ mod tests {
         let mut none = Lists::new(None);
         none.refresh();
         assert!(none.covering(&"66.249.66.1".parse().unwrap()).is_none());
+    }
+
+    /// A read error keeps the lists loaded before and is retried; lists
+    /// that never loaded stop all scanning.
+    #[test]
+    fn unreadable_lists_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lists = dir.path().join("never_scan.d");
+        let mut l = Lists::new(Some(lists.clone()));
+        l.refresh();
+        assert!(
+            l.unavailable().unwrap().contains("not loaded"),
+            "no directory yet"
+        );
+        std::fs::create_dir(&lists).unwrap();
+        std::fs::write(lists.join("a.txt"), "198.51.100.0/24\n").unwrap();
+        l.refresh();
+        assert!(l.unavailable().is_some(), "checked once a minute");
+        l.checked = None;
+        l.refresh();
+        assert!(l.unavailable().is_none());
+        assert!(l.covering(&"198.51.100.9".parse().unwrap()).is_some());
+        // A file that cannot be read (not UTF-8) keeps the previous lists.
+        std::fs::write(lists.join("b.txt"), b"\xff\xfe203.0.113.0/24\n").unwrap();
+        l.checked = None;
+        l.refresh();
+        assert!(l.covering(&"198.51.100.9".parse().unwrap()).is_some());
+        // ... and so does a directory that went away.
+        std::fs::remove_dir_all(&lists).unwrap();
+        l.checked = None;
+        l.refresh();
+        assert!(l.unavailable().is_none());
+        assert!(l.covering(&"198.51.100.9".parse().unwrap()).is_some());
+        // Readable again: retried and replaced.
+        std::fs::create_dir(&lists).unwrap();
+        std::fs::write(lists.join("c.txt"), "203.0.113.0/24\n").unwrap();
+        l.checked = None;
+        l.refresh();
+        assert!(l.covering(&"198.51.100.9".parse().unwrap()).is_none());
+        assert!(l.covering(&"203.0.113.9".parse().unwrap()).is_some());
+        // An unreadable file from the start: nothing loaded, nothing scanned.
+        std::fs::write(lists.join("d.txt"), b"\xff\n").unwrap();
+        let mut fresh = Lists::new(Some(lists));
+        fresh.refresh();
+        assert!(fresh.unavailable().is_some());
+        assert!(Lists::new(None).unavailable().is_none());
     }
 
     #[tokio::test]

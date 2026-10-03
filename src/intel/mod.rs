@@ -117,31 +117,6 @@ pub type SharedGeo = Arc<RwLock<Option<geo::GeoIp>>>;
 /// Tor exit list shared with the trap.
 pub type SharedTor = Arc<RwLock<tor::TorExitList>>;
 
-/// Rewrite country names left by older builds to ISO codes (needs the MaxMind DBs).
-pub async fn backfill_geo(rec: &Recorder, geo: &RwLock<Option<geo::GeoIp>>) {
-    let store = rec.store();
-    let rows = match store.ips_with_legacy_country().await {
-        Ok(r) if !r.is_empty() => r,
-        Ok(_) => return,
-        Err(e) => return warn!(?e, "geo backfill: query failed"),
-    };
-    let (updates, version) = {
-        let guard = geo.read().unwrap();
-        match guard.as_ref() {
-            Some(g) => (g.relookup(&rows), g.build_date()),
-            None => return,
-        }
-    };
-    match geo::backfill_iso_codes(rec, updates, version.as_deref()).await {
-        Ok(n) => info!(
-            fixed = n,
-            pending = rows.len(),
-            "geo backfill: country names -> ISO codes"
-        ),
-        Err(e) => warn!(?e, "geo backfill failed"),
-    }
-}
-
 /// The providers a node was started with.
 pub type Providers = Vec<Arc<dyn provider::Provider>>;
 
@@ -454,25 +429,15 @@ fn edition_key(edition: &str) -> String {
 /// database keeps its own fetch time, so when one download fails the other
 /// is not fetched again (MaxMind counts every download against a daily
 /// limit). Errors when a download or the reload failed.
-async fn refresh_maxmind(
-    store: &Store,
-    rec: &Recorder,
-    cfg: &Config,
-    geo: &SharedGeo,
-) -> anyhow::Result<()> {
+async fn refresh_maxmind(store: &Store, cfg: &Config, geo: &SharedGeo) -> anyhow::Result<()> {
     let Some(mm) = &cfg.maxmind else {
         return Ok(());
     };
-    // Builds before per-database keys recorded one time for both.
-    let legacy = store.intel_get("maxmind_last_fetch").await?;
     let mut fetched = 0;
     let mut failed = None;
     for edition in geo::EDITIONS {
         let file = cfg.data_dir.join(format!("{edition}.mmdb"));
-        let last = store
-            .intel_get(&edition_key(edition))
-            .await?
-            .or(legacy.clone());
+        let last = store.intel_get(&edition_key(edition)).await?;
         if file.exists() && !is_stale_at(last.as_deref()) {
             continue;
         }
@@ -497,7 +462,6 @@ async fn refresh_maxmind(
                 if fetched > 0 {
                     info!(databases = fetched, "maxmind databases refreshed");
                 }
-                backfill_geo(rec, geo).await;
             }
             // Both files are needed; a first install whose ASN download
             // failed has nothing to load yet.
@@ -515,6 +479,22 @@ async fn refresh_maxmind(
             .await;
     }
     Ok(())
+}
+
+/// Unload the exit list once its file is older than [`tor::MAX_AGE`]
+/// (fetching or copying it kept failing): from a stale list the trap would
+/// record "not an exit" for exits that appeared since, and scanners believe
+/// that. Without a list their Tor status is unknown (`scan.tor_unknown`);
+/// IPs already recorded as exits stay exits.
+fn drop_stale_tor(tor: &SharedTor, cfg: &Config) {
+    if tor.read().unwrap().is_empty() || !tor::stale(&cfg.data_dir) {
+        return;
+    }
+    warn!(
+        "tor exit list older than {} h: unloaded until a fresh one is fetched",
+        tor::MAX_AGE.as_secs() / 3600
+    );
+    *tor.write().unwrap() = tor::TorExitList::default();
 }
 
 /// Warn, at most hourly, while no Tor exit list is loaded: Tor exits cannot
@@ -548,9 +528,8 @@ pub async fn run_scheduler(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let store = rec.store().clone();
-    backfill_geo(&rec, &geo).await;
     if let Recorder::Cluster(node) = &rec {
-        return run_cluster(node.clone(), rec.clone(), cfg, geo, tor, shutdown).await;
+        return run_cluster(node.clone(), cfg, geo, tor, shutdown).await;
     }
     if cfg.maxmind.is_none() && geo.read().unwrap().is_none() {
         warn!("no [maxmind] credentials and no GeoLite2 databases: GeoIP enrichment is off");
@@ -585,10 +564,11 @@ pub async fn run_scheduler(
                     tor_next = now + wait;
                 }
             }
+            drop_stale_tor(&tor, &cfg);
             warn_without_tor_list(&tor, &cfg, &mut warned);
         }
         if now >= mm_next {
-            match refresh_maxmind(&store, &rec, &cfg, &geo).await {
+            match refresh_maxmind(&store, &cfg, &geo).await {
                 Ok(()) => {
                     mm_backoff.reset();
                     mm_next = now + MAXMIND_CHECK;
@@ -684,7 +664,6 @@ fn reload(kinds: &[String], cfg: &Config, tor: &SharedTor) {
 /// GeoLite2 databases fresh.
 async fn run_cluster(
     node: std::sync::Arc<crate::cluster::Node>,
-    rec: Recorder,
     cfg: Config,
     geo: SharedGeo,
     tor: SharedTor,
@@ -742,10 +721,11 @@ async fn run_cluster(
                 }
             }
         }
+        drop_stale_tor(&tor, &cfg);
         warn_without_tor_list(&tor, &cfg, &mut warned);
         // Every node with credentials keeps its own databases fresh.
         if std::time::Instant::now() >= mm_next {
-            match refresh_maxmind(&node.store, &rec, &cfg, &geo).await {
+            match refresh_maxmind(&node.store, &cfg, &geo).await {
                 Ok(()) => {
                     mm_backoff.reset();
                     mm_next = std::time::Instant::now() + MAXMIND_CHECK;
@@ -789,6 +769,33 @@ mod tests {
             m.fail();
         }
         assert_eq!(m.fail().as_secs(), 7200);
+    }
+
+    /// A list whose file went stale is unloaded, so the trap stops
+    /// recording "not an exit" from it.
+    #[test]
+    fn a_stale_tor_list_is_unloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "database_path = \"{d}/t.db\"\ndata_dir = \"{d}\"\n",
+            d = dir.path().display()
+        ))
+        .unwrap();
+        let path = dir.path().join("tor-exit.txt");
+        std::fs::write(&path, "198.51.100.1\n").unwrap();
+        let shared: SharedTor =
+            Arc::new(RwLock::new(tor::TorExitList::load(&cfg.data_dir).unwrap()));
+        drop_stale_tor(&shared, &cfg);
+        assert!(!shared.read().unwrap().is_empty(), "fresh: kept");
+        let old = std::time::SystemTime::now() - tor::MAX_AGE - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        drop_stale_tor(&shared, &cfg);
+        assert!(shared.read().unwrap().is_empty());
     }
 
     #[test]

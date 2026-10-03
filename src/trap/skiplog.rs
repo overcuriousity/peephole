@@ -1,6 +1,7 @@
 //! Light rows for the requests the flood gate answers without recording
 //! them in full: time, method and path, buffered per IP and written as one
-//! replicated batch.
+//! replicated batch. Their rate is limited per source (IPv6 by /64, see
+//! [`crate::net::source_key`]), so rotating addresses buys no more rows.
 
 use crate::cluster::record::SkipRow;
 use crate::store::data::{SKIP_BATCH_MAX, SKIP_PATH_MAX, cut};
@@ -25,21 +26,47 @@ struct Pending {
     rows: Vec<SkipRow>,
     dropped: i64,
     opened: Instant,
+}
+
+/// Light rows one source was given in the current second.
+struct Rate {
     /// The wall-clock second `in_sec` counts rows for.
     sec: i64,
     in_sec: u32,
+    /// The address of its latest row, which requests past the rate are
+    /// counted against when their own address has nothing pending.
+    last: IpAddr,
+    seen: Instant,
+}
+
+#[derive(Default)]
+struct Buffers {
+    pending: HashMap<IpAddr, Pending>,
+    /// Per source key.
+    rates: HashMap<IpAddr, Rate>,
 }
 
 #[derive(Default)]
 pub struct SkipLog {
-    pending: Mutex<HashMap<IpAddr, Pending>>,
+    buffers: Mutex<Buffers>,
+}
+
+fn pending(now: Instant) -> Pending {
+    Pending {
+        rows: vec![],
+        dropped: 0,
+        opened: now,
+    }
 }
 
 impl SkipLog {
-    /// Note a skipped request. Past `rate` light rows per IP and second
-    /// (0: no limit) it is only counted. Returns the IP's batch once it is
-    /// full. The number of addresses buffered is not capped here:
-    /// [`SkipLog::take_older`] flushes them all past [`MAX_TRACKED`].
+    /// Note a skipped request. Past `rate` light rows per source and second
+    /// (0: no limit) it is only counted, against its own address when that
+    /// has rows pending, else against the source's latest address if that
+    /// has (else it gets a row after all). Returns the IP's
+    /// batch once it is full. The number of addresses buffered is not
+    /// capped here: [`SkipLog::take_older`] flushes them all past
+    /// [`MAX_TRACKED`].
     pub fn note(
         &self,
         ip: IpAddr,
@@ -49,24 +76,37 @@ impl SkipLog {
         rate: u32,
         now: Instant,
     ) -> Option<Batch> {
-        let mut map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-        let p = map.entry(ip).or_insert(Pending {
-            rows: vec![],
-            dropped: 0,
-            opened: now,
+        let mut b = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+        let Buffers {
+            pending: map,
+            rates,
+        } = &mut *b;
+        let r = rates.entry(crate::net::source_key(ip)).or_insert(Rate {
             sec: i64::MIN,
             in_sec: 0,
+            last: ip,
+            seen: now,
         });
+        r.seen = now;
         let sec = ts_ms.div_euclid(1000);
-        if sec != p.sec {
-            p.sec = sec;
-            p.in_sec = 0;
+        if sec != r.sec {
+            r.sec = sec;
+            r.in_sec = 0;
         }
-        if rate > 0 && p.in_sec >= rate {
-            p.dropped += 1;
+        // A count needs a row to go with it (the export weighs it onto the
+        // batch's last row): with nothing pending to count it against, this
+        // one gets a row past the rate, as after every batch taken.
+        let to = [ip, r.last].into_iter().find(|a| map.contains_key(a));
+        if rate > 0
+            && r.in_sec >= rate
+            && let Some(to) = to
+        {
+            map.get_mut(&to).expect("found above").dropped += 1;
             return None;
         }
-        p.in_sec += 1;
+        r.in_sec += 1;
+        r.last = ip;
+        let p = map.entry(ip).or_insert_with(|| pending(now));
         p.rows.push(SkipRow {
             ts_ms,
             method: cut(method, 64).to_string(),
@@ -80,14 +120,18 @@ impl SkipLog {
 
     /// Take the IP's pending batch (when its next request is recorded).
     pub fn take(&self, ip: IpAddr) -> Option<Batch> {
-        let mut map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-        map.remove(&ip).map(|p| batch(ip, p))
+        let mut b = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+        b.pending.remove(&ip).map(|p| batch(ip, p))
     }
 
     /// Take every batch opened at least `age` ago (all of them when more
-    /// than [`MAX_TRACKED`] addresses are buffered).
+    /// than [`MAX_TRACKED`] addresses are buffered). Forgets the rates of
+    /// sources not seen in the last two seconds.
     pub fn take_older(&self, age: Duration, now: Instant) -> Vec<Batch> {
-        let mut map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let mut b = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+        b.rates
+            .retain(|_, r| now.saturating_duration_since(r.seen) < Duration::from_secs(2));
+        let map = &mut b.pending;
         let all = map.len() > MAX_TRACKED;
         let due: Vec<IpAddr> = map
             .iter()
@@ -129,6 +173,40 @@ mod tests {
         let b = s.take(ip()).unwrap();
         assert_eq!((b.rows.len(), b.dropped), (101, 50));
         assert!(s.take(ip()).is_none());
+        // Past the rate with nothing pending (just taken): a row, never a
+        // count without one.
+        s.note(ip(), 1_001_500, "GET", "/z", 1, now);
+        let b = s.take(ip()).unwrap();
+        assert_eq!((b.rows.len(), b.dropped), (1, 0));
+    }
+
+    #[test]
+    fn the_rate_holds_for_a_whole_ipv6_64() {
+        let s = SkipLog::default();
+        let now = Instant::now();
+        let v6 = |i: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, i));
+        for i in 0..150 {
+            assert!(
+                s.note(v6(i), 1_000_000 + i64::from(i), "GET", "/x", 100, now)
+                    .is_none()
+            );
+        }
+        // 100 rows, one per address; the rest counted against the latest.
+        let rows: usize = (0..150)
+            .filter_map(|i| s.take(v6(i)))
+            .map(|b| b.rows.len())
+            .sum();
+        assert_eq!(rows, 100);
+        let s = SkipLog::default();
+        for i in 0..150 {
+            s.note(v6(i), 1_000_000 + i64::from(i), "GET", "/x", 100, now);
+        }
+        let last = s.take(v6(99)).unwrap();
+        assert_eq!((last.rows.len(), last.dropped), (1, 50));
+        // Another /64 has its own rate.
+        let other: IpAddr = "2001:db8:0:2::1".parse().unwrap();
+        s.note(other, 1_000_000, "GET", "/y", 100, now);
+        assert_eq!(s.take(other).unwrap().rows.len(), 1);
     }
 
     #[test]

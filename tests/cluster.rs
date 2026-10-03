@@ -535,6 +535,39 @@ async fn leaving_without_reachable_peers_still_detaches() {
     assert_eq!(x.detached(), Some(cluster::Detached::Left));
 }
 
+/// A node that left admits nobody: leaving revokes its invites, and it
+/// refuses to redeem any invite while detached. Before, a joiner could
+/// still redeem an old token and be vouched for by a node that was gone.
+#[tokio::test]
+async fn a_node_that_left_admits_nobody() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (id, d) = new_node("d");
+    let _na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let nd = boot(id, &d, &[], DEFAULT).await;
+    let old = invite::create(&nb, &Default::default()).await.unwrap();
+    cluster::leave(&nb).await.unwrap();
+    assert!(
+        invite::list(&nb.store)
+            .await
+            .unwrap()
+            .iter()
+            .all(|i| i.revoked)
+    );
+    // An invite made after leaving does not admit anyone either.
+    let new = invite::create(&nb, &Default::default()).await.unwrap();
+    for token in [old, new] {
+        let e = invite::join(&nd, &token).await.unwrap_err();
+        assert!(
+            format!("{e:#}").contains("not in a cluster any more"),
+            "{e:#}"
+        );
+    }
+    assert!(!members::can_admit(&nb, &d.id).await.unwrap());
+    assert!(!knows(&nb, d.id, true).await);
+}
+
 /// What a member recorded stays acceptable after it left: a node that
 /// syncs later still applies all of it.
 #[tokio::test]
@@ -792,14 +825,25 @@ async fn a_future_dated_admission_cannot_keep_a_node_from_leaving() {
         proto_max: 2,
         remote_config: false,
     };
-    let far = hlc_days_ago(0, 1) + ((400u64 * 24 * 3600 * 1000) << 16);
-    repl::apply_batch(
+    // A admits W, then dates a re-admission far ahead: that one is not
+    // taken before its time (A's stream waits there).
+    let far = hlc_days_ago(0, 4) + ((400u64 * 24 * 3600 * 1000) << 16);
+    let st = repl::apply_batch(
         &x,
-        vec![WireEntry::sign(&a_id, 1, far, &Record::MemberAdd(info.clone())).unwrap()],
+        vec![
+            WireEntry::sign(
+                &a_id,
+                1,
+                hlc_days_ago(0, 1),
+                &Record::MemberAdd(info.clone()),
+            )
+            .unwrap(),
+            WireEntry::sign(&a_id, 2, far, &Record::MemberAdd(info.clone())).unwrap(),
+        ],
     )
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!((st.applied, st.rejected), (1, 1), "{st:?}");
     repl::apply_batch(
         &x,
         vec![

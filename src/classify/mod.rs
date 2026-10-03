@@ -367,8 +367,9 @@ fn compile_ci(pattern: &str) -> Result<Regex> {
 mod tests {
     use super::*;
 
-    fn classifier() -> Classifier {
-        Classifier::from_files(&rules::builtin_files()).unwrap()
+    /// Compiled once: rebuilding every regex per call made these tests slow.
+    fn classifier() -> &'static Classifier {
+        Classifier::builtin()
     }
     fn view<'a>(
         method: &'a str,
@@ -598,7 +599,7 @@ mod tests {
     #[test]
     fn command_separators_need_a_command() {
         check(
-            &classifier(),
+            classifier(),
             "rce",
             &[
                 "/x?a=;id",
@@ -610,9 +611,9 @@ mod tests {
             &["/item;id=5", "/x?a=1;id=2"],
         );
         let c = classifier();
-        let b = labels_of(&c, "POST", "/x", &[], Some(b"a=1;id=2"));
+        let b = labels_of(c, "POST", "/x", &[], Some(b"a=1;id=2"));
         assert!(!b.iter().any(|x| x == "rce"), "{b:?}");
-        let b = labels_of(&c, "POST", "/x", &[], Some(b"ip=1.2.3.4;id"));
+        let b = labels_of(c, "POST", "/x", &[], Some(b"ip=1.2.3.4;id"));
         assert!(b.iter().any(|x| x == "rce"), "{b:?}");
     }
 
@@ -686,7 +687,7 @@ mod tests {
     #[test]
     fn dotfiles_with_a_query_string_are_sensitive() {
         check(
-            &classifier(),
+            classifier(),
             "sensitive-path",
             &[
                 "/.env?x=1",
@@ -717,7 +718,7 @@ mod tests {
     fn union_select_variants_are_sqli() {
         let c = classifier();
         check(
-            &c,
+            c,
             "sqli",
             &[
                 "/x?id=1 UNION ALL SELECT 1,2",
@@ -734,11 +735,11 @@ mod tests {
             b"id=1/**/union/**/select/**/1",
             b"q=1+union+all+select+1",
         ] {
-            let l = labels_of(&c, "POST", "/x", &[], Some(body));
+            let l = labels_of(c, "POST", "/x", &[], Some(body));
             assert!(l.iter().any(|x| x == "sqli"), "{body:?}: {l:?}");
         }
         let l = labels_of(
-            &c,
+            c,
             "POST",
             "/x",
             &[],
@@ -759,19 +760,19 @@ mod tests {
             "${jn${lower:d}i:rmi://x}",
         ];
         for p in payloads {
-            let h = labels_of(&c, "GET", "/", &[("x-api-version", p)], None);
+            let h = labels_of(c, "GET", "/", &[("x-api-version", p)], None);
             assert!(h.iter().any(|x| x == "rce"), "header {p}: {h:?}");
-            let t = labels_of(&c, "GET", &format!("/?q={p}"), &[], None);
+            let t = labels_of(c, "GET", &format!("/?q={p}"), &[], None);
             assert!(t.iter().any(|x| x == "rce"), "url {p}: {t:?}");
             let body = format!("{{\"user\":\"{p}\"}}");
-            let b = labels_of(&c, "POST", "/login", &[], Some(body.as_bytes()));
+            let b = labels_of(c, "POST", "/login", &[], Some(body.as_bytes()));
             assert!(b.iter().any(|x| x == "rce"), "body {p}: {b:?}");
         }
         // Percent-encoded in the URL.
-        let t = labels_of(&c, "GET", "/?q=%24%7Bjndi%3Aldap%3A%2F%2Fx%7D", &[], None);
+        let t = labels_of(c, "GET", "/?q=%24%7Bjndi%3Aldap%3A%2F%2Fx%7D", &[], None);
         assert!(t.iter().any(|x| x == "rce"), "{t:?}");
         // Ordinary template-looking text is not.
-        let b = labels_of(&c, "POST", "/x", &[], Some(b"price=${amount} total"));
+        let b = labels_of(c, "POST", "/x", &[], Some(b"price=${amount} total"));
         assert!(!b.iter().any(|x| x == "rce"), "{b:?}");
     }
 
@@ -779,7 +780,7 @@ mod tests {
     fn interpreter_names_need_injection_context() {
         let c = classifier();
         check(
-            &c,
+            c,
             "rce",
             &[
                 "/x?cmd=;/bin/sh -c id",
@@ -800,10 +801,10 @@ mod tests {
                 "/bin/shelf",
             ],
         );
-        let body = labels_of(&c, "POST", "/x", &[], Some(b"note=learn powershell today"));
+        let body = labels_of(c, "POST", "/x", &[], Some(b"note=learn powershell today"));
         assert!(!body.iter().any(|x| x == "rce"), "{body:?}");
         let body = labels_of(
-            &c,
+            c,
             "POST",
             "/GponForm/diag_Form?images/",
             &[],
@@ -816,7 +817,7 @@ mod tests {
     fn exploit_endpoints_and_expression_injection_are_rce() {
         let c = classifier();
         check(
-            &c,
+            c,
             "rce",
             &[
                 "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
@@ -838,7 +839,7 @@ mod tests {
             ],
         );
         let spring = labels_of(
-            &c,
+            c,
             "POST",
             "/functionRouter",
             &[(
@@ -849,7 +850,7 @@ mod tests {
         );
         assert!(spring.iter().any(|x| x == "rce"), "{spring:?}");
         let s2_045 = labels_of(
-            &c,
+            c,
             "GET",
             "/upload.action",
             &[("content-type", "%{(#_='multipart/form-data').(#cmd='id')}")],
@@ -857,7 +858,7 @@ mod tests {
         );
         assert!(s2_045.iter().any(|x| x == "rce"), "{s2_045:?}");
         let body = labels_of(
-            &c,
+            c,
             "POST",
             "/x",
             &[],
@@ -870,7 +871,7 @@ mod tests {
     fn appliance_and_router_probes_are_labelled() {
         let c = classifier();
         check(
-            &c,
+            c,
             "appliance-probe",
             &[
                 "/remote/fgt_lang?lang=/../../../..//////////dev/cmdb/sslvpn_websession",
@@ -897,7 +898,7 @@ mod tests {
             ],
         );
         check(
-            &c,
+            c,
             "iot-probe",
             &[
                 "/HNAP1/",
@@ -920,7 +921,7 @@ mod tests {
             "dirb",
             "httpx - Open-source project (github.com/projectdiscovery/httpx)",
         ] {
-            let l = labels_of(&c, "GET", "/", &[("user-agent", ua)], None);
+            let l = labels_of(c, "GET", "/", &[("user-agent", ua)], None);
             assert!(l.iter().any(|x| x == "scanner-ua"), "{ua}: {l:?}");
         }
         // Research scanners carry their own label since the scanners split.
@@ -929,7 +930,7 @@ mod tests {
             "Expanse, a Palo Alto Networks company, searches across the global IPv4 space",
             "l9explore/1.2.2",
         ] {
-            let l = labels_of(&c, "GET", "/", &[("user-agent", ua)], None);
+            let l = labels_of(c, "GET", "/", &[("user-agent", ua)], None);
             assert!(l.iter().any(|x| x == "research-scanner"), "{ua}: {l:?}");
         }
         for ua in [
@@ -937,7 +938,7 @@ mod tests {
             "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
             "dirbike/1",
         ] {
-            let l = labels_of(&c, "GET", "/", &[("user-agent", ua)], None);
+            let l = labels_of(c, "GET", "/", &[("user-agent", ua)], None);
             assert!(!l.iter().any(|x| x == "scanner-ua"), "{ua}: {l:?}");
         }
     }
@@ -950,11 +951,11 @@ mod tests {
             b"comment=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E",
             b"url=javascript:alert(document.cookie)",
         ] {
-            let l = labels_of(&c, "POST", "/c", &[], Some(body));
+            let l = labels_of(c, "POST", "/c", &[], Some(body));
             assert!(l.iter().any(|x| x == "xss"), "{body:?}: {l:?}");
         }
         let l = labels_of(
-            &c,
+            c,
             "POST",
             "/c",
             &[],
@@ -967,7 +968,7 @@ mod tests {
     fn methods_are_weighted() {
         let c = classifier();
         let level = |m: &str| {
-            let l = labels_of(&c, m, "/x", &[], None);
+            let l = labels_of(c, m, "/x", &[], None);
             (
                 l,
                 c.classify(
@@ -1066,7 +1067,7 @@ mod tests {
             "/x?f=%u002e%u002e%u2215%u002e%u002e/x",
             "/x?f=%u002e%u002e/%u002e%u002e/x",
         ] {
-            let l = labels_of(&c, "GET", t, &[], None);
+            let l = labels_of(c, "GET", t, &[], None);
             assert!(l.iter().any(|x| x == "path-traversal"), "{t}: {l:?}");
         }
     }
@@ -1091,7 +1092,7 @@ mod tests {
             let decoded = decoded_body(&h, body);
             assert_eq!(&decoded[..], &payload[..], "{enc}");
             let l = labels_of(
-                &c,
+                c,
                 "POST",
                 "/x",
                 &[("content-encoding", enc)],

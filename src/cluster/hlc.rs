@@ -4,7 +4,8 @@
 use std::sync::Mutex;
 
 /// Remote timestamps further ahead than this are not adopted, so one node
-/// with a wrong clock cannot drag every other clock into the future.
+/// with a wrong clock cannot drag every other clock into the future; log
+/// entries dated further ahead wait until they are not (see [`ahead`]).
 pub const MAX_DRIFT_MS: u64 = 5 * 60 * 1000;
 
 pub struct Hlc {
@@ -22,34 +23,13 @@ pub fn physical_ms(hlc: u64) -> u64 {
     hlc >> 16
 }
 
-/// The latest HLC a remote entry received at `recv_ms` may carry for
-/// ordering: its origin's clock may run ahead by [`MAX_DRIFT_MS`], no more.
-pub fn latest_at(recv_ms: u64) -> u64 {
-    (recv_ms
-        .saturating_add(MAX_DRIFT_MS)
-        .min(i64::MAX as u64 >> 16)
-        << 16)
-        | 0xffff
-}
-
-/// `hlc`, but no later than `limit`. Capped values keep the entry's
-/// sequence in the counter bits: entries of one origin capped to the same
-/// millisecond still order as written, so the later of two updates wins.
-pub fn cap(hlc: u64, seq: u64, limit: u64) -> u64 {
-    if hlc > limit {
-        (limit & !0xffff) | (seq & 0xffff)
-    } else {
-        hlc
-    }
-}
-
-/// The timestamp a remote entry (`seq` in its origin's log) is ordered by
-/// (last write wins, liveness): its HLC, but never later than its receipt
-/// plus the allowed drift. A member that dates its entries into the future
-/// gains nothing, and the value always fits the database's signed 64-bit
-/// integers.
-pub fn effective(hlc: u64, seq: u64, recv_ms: u64) -> u64 {
-    cap(hlc, seq, latest_at(recv_ms))
+/// Whether `hlc` lies further than [`MAX_DRIFT_MS`] ahead of `now_ms`. A
+/// remote log entry dated like that is not taken yet: its origin's stream
+/// waits here until the time comes, and then applies with its own HLC, so
+/// every node orders it the same way whenever it arrived. Everything taken
+/// therefore fits the database's signed 64-bit integers.
+pub fn ahead(hlc: u64, now_ms: u64) -> bool {
+    physical_ms(hlc) > now_ms.saturating_add(MAX_DRIFT_MS)
 }
 
 /// An HLC as stored in an ordering column (signed in SQLite).
@@ -80,11 +60,19 @@ impl Hlc {
 
     /// Take a remote timestamp into account.
     pub fn observe(&self, remote: u64) {
-        if physical_ms(remote) > wall_ms() + MAX_DRIFT_MS {
+        if ahead(remote, wall_ms()) {
             return;
         }
         let mut last = self.last.lock().unwrap();
         *last = (*last).max(remote);
+    }
+
+    /// Take a timestamp this node issued itself into account, however far
+    /// ahead: its entries must keep rising (peers ignore one that does not)
+    /// even after the wall clock was set back.
+    pub fn observe_own(&self, own: u64) {
+        let mut last = self.last.lock().unwrap();
+        *last = (*last).max(own);
     }
 }
 
@@ -110,19 +98,17 @@ mod tests {
         let far = (wall_ms() + MAX_DRIFT_MS * 10) << 16;
         c.observe(far);
         assert!(c.now() < far, "far-future timestamps are not adopted");
+        c.observe_own(far);
+        assert!(c.now() > far, "our own are");
     }
 
     #[test]
-    fn effective_time_is_capped_by_receipt() {
-        let now = wall_ms();
-        let honest = (now - 1000) << 16;
-        assert_eq!(effective(honest, 1, now), honest);
-        let future = (now + 400 * 24 * 3600 * 1000) << 16;
-        assert!(physical_ms(effective(future, 1, now)) <= now + MAX_DRIFT_MS);
-        // Later entries capped to the same millisecond still order by seq.
-        assert!(effective(future + 1, 8, now) > effective(future, 7, now));
-        // Values beyond i64 (which would sort negative) are clamped too.
-        assert!(effective(u64::MAX, u64::MAX, now) <= i64::MAX as u64);
+    fn entries_too_far_ahead_wait() {
+        let now = 1_000_000_000_000;
+        assert!(!ahead(now << 16, now));
+        assert!(!ahead(((now + MAX_DRIFT_MS) << 16) | 0xffff, now));
+        assert!(ahead((now + MAX_DRIFT_MS + 1) << 16, now));
+        assert!(ahead(u64::MAX, now));
         assert_eq!(to_db(u64::MAX), i64::MAX);
         assert_eq!(from_db(-5), 0);
     }
