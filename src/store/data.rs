@@ -175,9 +175,25 @@ type PortRow = (
     Option<String>,
 );
 
-/// The IP's row id, creating the row if needed. `seen` widens the
-/// first/last-seen window; scan records pass None (a scan is not a visit).
-async fn ensure_ip(conn: &mut SqliteConnection, ip: &str, seen: Option<&str>) -> Result<i64> {
+/// Whether a record's `ts` is in the rows' format (peers can send anything;
+/// garbage would break every read that decodes the column as a time).
+fn valid_ts(ts: &str) -> bool {
+    chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").is_ok()
+}
+
+/// The IP's row id, creating the row if needed (None: not an address). The
+/// address is stored in its canonical text, so a peer's `::ffff:a.b.c.d` or
+/// upper-case IPv6 finds the same row. `seen` widens the first/last-seen
+/// window; scan records pass None (a scan is not a visit).
+async fn ensure_ip(
+    conn: &mut SqliteConnection,
+    ip: &str,
+    seen: Option<&str>,
+) -> Result<Option<i64>> {
+    let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+        return Ok(None);
+    };
+    let ip = &crate::net::canonical(addr).to_string();
     let ts = seen.map(str::to_string).unwrap_or_else(now_ts);
     let id: Option<i64> = sqlx::query_scalar("SELECT id FROM ips WHERE ip = ?")
         .bind(ip)
@@ -196,7 +212,7 @@ async fn ensure_ip(conn: &mut SqliteConnection, ip: &str, seen: Option<&str>) ->
                 .execute(&mut *conn)
                 .await?;
             }
-            return Ok(id);
+            return Ok(Some(id));
         }
         None => {
             sqlx::query("INSERT INTO ips (ip, ip_key, first_seen, last_seen) VALUES (?, ?, ?, ?)")
@@ -210,18 +226,27 @@ async fn ensure_ip(conn: &mut SqliteConnection, ip: &str, seen: Option<&str>) ->
         }
     };
     refresh_ip_view(conn, ip).await?;
-    Ok(id)
+    Ok(Some(id))
 }
 
 async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> Result<Effect> {
     if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
     }
-    // A request always comes from an address; anything else is junk.
-    if r.ip.parse::<std::net::IpAddr>().is_err() {
+    // A request always comes from an address at a time; anything else is
+    // junk.
+    if !valid_ts(&r.ts) {
         return Ok(Effect::Ignored);
     }
-    let ip_id = ensure_ip(conn, &r.ip, Some(&r.ts)).await?;
+    let Some(ip_id) = ensure_ip(conn, &r.ip, Some(&r.ts)).await? else {
+        return Ok(Effect::Ignored);
+    };
+    // Labels must be a JSON list of strings (every label query walks it);
+    // anything else from a peer is stored as no labels.
+    let labels_json = match serde_json::from_str::<Vec<String>>(&r.labels_json) {
+        Ok(_) => r.labels_json.as_str(),
+        Err(_) => "[]",
+    };
     sqlx::query(
         "INSERT OR IGNORE INTO requests (uid, origin, hlc, ts, ip_id, method, path, query,
            headers_json, body, labels_json, owasp_json, severity, scan_level, is_fp_claim,
@@ -239,7 +264,7 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(&r.query)
     .bind(&r.headers_json)
     .bind(&r.body)
-    .bind(&r.labels_json)
+    .bind(labels_json)
     .bind(r.owasp_json.as_deref().unwrap_or("[]"))
     .bind(r.severity)
     .bind(r.scan_level)
@@ -283,6 +308,7 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
         return Ok(Effect::Erased(t));
     }
     if b.ip.parse::<std::net::IpAddr>().is_err()
+        || b.rows.is_empty()
         || b.rows.len() > SKIP_BATCH_MAX
         || !(0..=SKIP_DROPPED_MAX).contains(&b.dropped)
     {
@@ -290,9 +316,15 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
     }
     let first = b.rows.iter().map(|r| r.ts_ms).min().unwrap_or(0);
     let last = b.rows.iter().map(|r| r.ts_ms).max().unwrap_or(0);
-    let seen = chrono::DateTime::from_timestamp_millis(last)
-        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
-    let ip_id = ensure_ip(conn, &b.ip, seen.as_deref()).await?;
+    let seen = |ms| {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+    };
+    // Widen the IP's window by the batch's first and last row.
+    let Some(ip_id) = ensure_ip(conn, &b.ip, seen(first).as_deref()).await? else {
+        return Ok(Effect::Ignored);
+    };
+    ensure_ip(conn, &b.ip, seen(last).as_deref()).await?;
     let id: Option<i64> = sqlx::query_scalar(
         "INSERT OR IGNORE INTO skipped_batches
            (uid, origin, hlc, ip_id, first_ms, last_ms, dropped, build)
@@ -463,7 +495,12 @@ async fn fp_claim(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &FpClaimRec) -> 
     let Some(rid) = request_id(conn, &r.request_uid).await? else {
         return Ok(Effect::Ignored);
     };
-    let ip_id = ensure_ip(conn, &r.ip, Some(&r.ts)).await?;
+    if !valid_ts(&r.ts) {
+        return Ok(Effect::Ignored);
+    }
+    let Some(ip_id) = ensure_ip(conn, &r.ip, Some(&r.ts)).await? else {
+        return Ok(Effect::Ignored);
+    };
     sqlx::query(
         "INSERT OR IGNORE INTO fp_claims (uid, origin, hlc, ip_id, request_id, request_uid, ts,
            contact_email, user_agent, build)
@@ -500,7 +537,12 @@ async fn fingerprint(
         Some(u) => request_id(conn, u).await?,
         None => None,
     };
-    let ip_id = ensure_ip(conn, &r.ip, Some(&r.ts)).await?;
+    if !valid_ts(&r.ts) {
+        return Ok(Effect::Ignored);
+    }
+    let Some(ip_id) = ensure_ip(conn, &r.ip, Some(&r.ts)).await? else {
+        return Ok(Effect::Ignored);
+    };
     sqlx::query(
         "INSERT OR IGNORE INTO fingerprints (uid, origin, hlc, request_id, request_uid, ip_id, ts,
            fp_hash, visitor_id, attributes_json, behavior_summary_json, event_blob, build)
@@ -561,7 +603,9 @@ async fn scan_job(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &ScanJobRec) -> 
             return Ok(Effect::Ignored);
         }
     }
-    let ip_id = ensure_ip(conn, &r.ip, None).await?;
+    let Some(ip_id) = ensure_ip(conn, &r.ip, None).await? else {
+        return Ok(Effect::Ignored);
+    };
     sqlx::query(
         "INSERT OR IGNORE INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at)
          VALUES (?,?,?,?,?,?,'queued',?)",
@@ -740,7 +784,9 @@ async fn scan_result(
             Effect::Deferred
         });
     };
-    let ip_id = ensure_ip(conn, &r.ip, None).await?;
+    let Some(ip_id) = ensure_ip(conn, &r.ip, None).await? else {
+        return Ok(Effect::Ignored);
+    };
     let res = sqlx::query(
         "INSERT OR IGNORE INTO scans (uid, origin, hlc, job_id, job_uid, ip_id, level, started_at,
            finished_at, os_guess, raw_xml, build)
@@ -1872,7 +1918,11 @@ mod tests {
                 uid: u("skip"),
                 ip: "203.0.113.7".into(),
                 dropped: 0,
-                rows: vec![],
+                rows: vec![SkipRow {
+                    ts_ms: 1,
+                    method: "GET".into(),
+                    path: "/".into(),
+                }],
                 build: build.clone(),
             }),
             Record::IpIntel(IpIntelRec {
@@ -2079,6 +2129,86 @@ mod tests {
         assert_eq!(eff, Effect::Ignored);
         assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ips").await, 0);
         assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM requests").await, 0);
+    }
+
+    #[tokio::test]
+    async fn junk_peer_fields_are_ignored_or_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let req = |uid: &str| {
+            let Record::Request(r) = request(&format!("{}{uid}", a.uid_prefix()), "/x") else {
+                unreachable!()
+            };
+            r
+        };
+        // A time that is not one: the record is junk.
+        let mut r = req("badts");
+        r.ts = "yesterday".into();
+        let eff = apply(&mut conn, ctx, &Record::Request(r)).await.unwrap();
+        assert_eq!(eff, Effect::Ignored);
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ips").await, 0);
+        // Labels that are not a list of strings are stored as none.
+        let mut r = req("badlabels");
+        r.labels_json = "{not json".into();
+        let eff = apply(&mut conn, ctx, &Record::Request(r)).await.unwrap();
+        assert_eq!(eff, Effect::Applied);
+        let labels: String = sqlx::query_scalar("SELECT labels_json FROM requests")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(labels, "[]");
+        // A mapped IPv4 address lands on the plain IPv4 row.
+        let mut r = req("mapped");
+        r.ip = "::ffff:203.0.113.7".into();
+        let eff = apply(&mut conn, ctx, &Record::Request(r)).await.unwrap();
+        assert_eq!(eff, Effect::Applied);
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ips").await, 1);
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) FROM ips WHERE ip = '203.0.113.7'"
+            )
+            .await,
+            1
+        );
+        // A skip batch without rows says nothing about when the IP was seen.
+        let b = Record::SkipBatch(SkipBatchRec {
+            build: String::new(),
+            uid: format!("{}empty", a.uid_prefix()),
+            ip: "203.0.113.8".into(),
+            dropped: 3,
+            rows: vec![],
+        });
+        assert_eq!(apply(&mut conn, ctx, &b).await.unwrap(), Effect::Ignored);
+        // One with rows spans the IP's window from its first to its last.
+        let row = |ts_ms| SkipRow {
+            ts_ms,
+            method: "GET".into(),
+            path: "/".into(),
+        };
+        let b = Record::SkipBatch(SkipBatchRec {
+            build: String::new(),
+            uid: format!("{}span", a.uid_prefix()),
+            ip: "203.0.113.8".into(),
+            dropped: 0,
+            rows: vec![row(2_000_000_000_000), row(1_000_000_000_000)],
+        });
+        assert_eq!(apply(&mut conn, ctx, &b).await.unwrap(), Effect::Applied);
+        let seen: (String, String) =
+            sqlx::query_as("SELECT first_seen, last_seen FROM ips WHERE ip = '203.0.113.8'")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            seen,
+            ("2001-09-09 01:46:40".into(), "2033-05-18 03:33:20".into())
+        );
     }
 
     #[tokio::test]

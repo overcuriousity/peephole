@@ -40,6 +40,7 @@ impl Store {
 mod tests {
     use crate::scan::nmap_xml::{PortResult, ScanResult};
     use crate::store::Store;
+    use crate::store::recorder::Pruned;
     use crate::store::requests::NewRequest;
 
     async fn seeded() -> (Store, i64, i64) {
@@ -295,7 +296,27 @@ mod tests {
             .execute(&s.pool)
             .await
             .unwrap();
-        let (reqs, scans) = s.local().prune_older_than(90).await.unwrap();
+        // A fingerprint from an unknown page token: no request, own IP.
+        let lone = s.upsert_ip("198.51.100.9".parse().unwrap()).await.unwrap();
+        s.insert_fingerprint(None, lone.id, "h2", None, "{}", "{}", b"[]")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE fingerprints SET ts = datetime('now','-100 days')")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let p = s.local().prune_older_than(90).await.unwrap();
+        assert_eq!(
+            p,
+            Pruned {
+                requests: 2,
+                scans: 2,
+                skipped_batches: 2,
+                fingerprints: 1,
+                jobs: 2,
+            }
+        );
+        assert!(s.local().prune_older_than(90).await.unwrap().is_empty());
         // Finished jobs go too, and with them the last rows of both IPs.
         for table in ["scan_jobs", "skipped_batches", "skipped_requests", "ips"] {
             let n: i64 =
@@ -313,8 +334,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t, 0);
-        assert_eq!(reqs, 2);
-        assert_eq!(scans, 2);
         let rc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
             .fetch_one(&s.pool)
             .await
@@ -332,6 +351,6 @@ mod tests {
             .unwrap();
         assert_eq!(fc, 0);
         // Disabled retention is a no-op.
-        assert_eq!(s.local().prune_older_than(0).await.unwrap(), (0, 0));
+        assert!(s.local().prune_older_than(0).await.unwrap().is_empty());
     }
 }

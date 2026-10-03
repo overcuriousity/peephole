@@ -309,8 +309,10 @@ impl Store {
         let top_labels = self
             .named(
                 &format!(
-                    "SELECT je.value AS name, COUNT(*) AS count
-                     FROM requests r, json_each(r.labels_json) je WHERE 1=1{w}
+                    // A request counts once per distinct label, as in
+                    // the all-time `ip_labels`.
+                    "SELECT je.value AS name, COUNT(DISTINCT r.id) AS count
+                     FROM requests r, json_each(CASE WHEN json_valid(r.labels_json) THEN r.labels_json ELSE '[]' END) je WHERE 1=1{w}
                      GROUP BY je.value ORDER BY count DESC LIMIT 20"
                 ),
                 since,
@@ -841,6 +843,28 @@ mod tests {
         assert!(
             all.timeline.iter().all(|b| b.ts.len() == 10),
             "daily buckets are YYYY-MM-DD"
+        );
+    }
+
+    #[tokio::test]
+    async fn ranged_top_labels_count_requests_and_survive_bad_json() {
+        let s = seeded().await;
+        let ip: i64 = sqlx::query_scalar("SELECT id FROM ips LIMIT 1")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        for (uid, labels) in [
+            ("dup", r#"["sensitive-path","sensitive-path"]"#),
+            ("bad", "{not json"),
+        ] {
+            sqlx::query("INSERT INTO requests (uid, ts, ip_id, method, path, headers_json, labels_json, severity) VALUES (?, datetime('now'), ?, 'GET', '/x', '[]', ?, 1)")
+                .bind(uid).bind(ip).bind(labels).execute(&s.pool).await.unwrap();
+        }
+        let h24 = s.stats(Range::H24).await.unwrap();
+        assert_eq!(h24.top_labels[0].name, "sensitive-path");
+        assert_eq!(
+            h24.top_labels[0].count, 4,
+            "a request counts once per label"
         );
     }
 
