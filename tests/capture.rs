@@ -6,6 +6,21 @@ use peephole::trap::{self, TrapState};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// The trap's router, answering only once what the trap records (in the
+/// background) is written, so a test can check the store as soon as it has
+/// the answer.
+fn settled_router(state: Arc<TrapState>) -> axum::Router {
+    trap::router(state.clone()).layer(axum::middleware::map_response(
+        move |r: axum::response::Response| {
+            let state = state.clone();
+            async move {
+                state.guards.settled().await;
+                r
+            }
+        },
+    ))
+}
+
 /// A trap behind a trusted proxy at 127.0.0.1, with `extra` appended to the
 /// config (e.g. a `[trap]` section).
 async fn spawn(extra: &str) -> (String, Store, tempfile::TempDir) {
@@ -28,7 +43,7 @@ web = false
     std::fs::write(&cfg_path, cfg_text).unwrap();
     let cfg = Config::load(&cfg_path).unwrap();
     let store = Store::connect(&cfg.database_path).await.unwrap();
-    let app = trap::router(Arc::new(TrapState::for_test(store.clone(), cfg)));
+    let app = settled_router(Arc::new(TrapState::for_test(store.clone(), cfg)));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -541,7 +556,7 @@ web = false
     let cfg = Config::load(&cfg_path).unwrap();
     let store = Store::connect(&cfg.database_path).await.unwrap();
     let trusted = Arc::new(cfg.trusted_proxies.clone());
-    let app = trap::router(Arc::new(TrapState::for_test(store.clone(), cfg)));
+    let app = settled_router(Arc::new(TrapState::for_test(store.clone(), cfg)));
     let tls = trap::listen::trap_tls_config(None, None).unwrap();
     let (stop, rx) = tokio::sync::watch::channel(false);
     let plain = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
