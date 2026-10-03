@@ -38,7 +38,8 @@ pub struct SkipLog {
 impl SkipLog {
     /// Note a skipped request. Past `rate` light rows per IP and second
     /// (0: no limit) it is only counted. Returns the IP's batch once it is
-    /// full, or every batch when too many addresses are buffered.
+    /// full. The number of addresses buffered is not capped here:
+    /// [`SkipLog::take_older`] flushes them all past [`MAX_TRACKED`].
     pub fn note(
         &self,
         ip: IpAddr,

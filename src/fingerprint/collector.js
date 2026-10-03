@@ -4,8 +4,8 @@
   var TOKEN = window.PEEPHOLE_TOKEN || "";
   // Helper endpoints may sit under a configured prefix (trap.helper_prefix).
   var BASE = window.PEEPHOLE_BASE || "";
-  var behavior = { mouse_events: 0, mouse_dist: 0, clicks: 0, scrolls: 0,
-                   keys: [], fill_seconds: null };
+  var behavior = { mouse_events: 0, mouse_dist: 0, pointer_events: 0, clicks: 0,
+                   scrolls: 0, keys: [], fill_seconds: null };
   var lastX = null, lastY = null, firstFocus = null, submitTime = null;
   var attrs = null; // captured once, reused by the final behavior beacon
 
@@ -15,6 +15,10 @@
     if (lastX !== null) behavior.mouse_dist += Math.hypot(e.clientX - lastX, e.clientY - lastY);
     lastX = e.clientX; lastY = e.clientY;
   });
+  // Presses of any pointer (touch and pen included; touchstart for browsers
+  // without pointer events): a touch device never fires mousemove.
+  on("pointerdown", function () { behavior.pointer_events++; });
+  on("touchstart", function () { behavior.pointer_events++; });
   on("click", function () { behavior.clicks++; });
   on("scroll", function () { behavior.scrolls++; });
   on("focusin", function (e) {

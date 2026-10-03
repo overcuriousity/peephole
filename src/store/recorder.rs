@@ -337,6 +337,32 @@ impl Recorder {
         behavior_summary_json: &str,
         event_blob: &[u8],
     ) -> Result<i64> {
+        let ip = self.ip_of(ip_id).await?;
+        self.insert_fingerprint_from(
+            &ip,
+            request_id,
+            fp_hash,
+            visitor_id,
+            attributes_json,
+            behavior_summary_json,
+            event_blob,
+        )
+        .await
+    }
+
+    /// [`Recorder::insert_fingerprint`] from `ip`, creating the IP's row if
+    /// it has none (as [`Recorder::insert_request_from`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_fingerprint_from(
+        &self,
+        ip: &str,
+        request_id: Option<i64>,
+        fp_hash: &str,
+        visitor_id: Option<&str>,
+        attributes_json: &str,
+        behavior_summary_json: &str,
+        event_blob: &[u8],
+    ) -> Result<i64> {
         let request_uid = match request_id {
             Some(id) => self.uid_by_id("requests", id).await?,
             None => None,
@@ -346,7 +372,7 @@ impl Recorder {
             build: crate::COMMIT.into(),
             uid: uid.clone(),
             request_uid,
-            ip: self.ip_of(ip_id).await?,
+            ip: ip.to_string(),
             ts: now_ts(),
             fp_hash: Some(fp_hash.to_string()),
             visitor_id: visitor_id.map(str::to_string),

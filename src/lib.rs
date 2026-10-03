@@ -455,6 +455,7 @@ impl RoleRunner {
             tor: self.tor.clone(),
             notifier: self.notifier.clone(),
             helper_rate: Default::default(),
+            panel_rate: Default::default(),
             pace: self.settings.pace.clone(),
             guards: Default::default(),
         });

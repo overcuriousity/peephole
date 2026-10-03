@@ -47,6 +47,10 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(20);
 /// Fixed-window per-IP limit for the unauthenticated helper endpoints.
 const HELPER_LIMIT: u32 = 30;
 const HELPER_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// `/panel`'s own limit, in the same window: one page view polls it up to
+/// eight times, so it has room for several a minute and never uses up the
+/// budget `/collect` needs.
+const PANEL_LIMIT: u32 = 60;
 
 pub struct TrapState {
     pub store: Store,
@@ -59,6 +63,8 @@ pub struct TrapState {
     pub notifier: crate::events::Notifier,
     /// Per-IP rate limiter for `/collect` and `/claim`.
     pub helper_rate: RateLimiter,
+    /// Per-IP rate limiter for `/panel`.
+    pub panel_rate: RateLimiter,
     /// Runtime scan settings; the trap reads the rescan cooldown from it.
     pub pace: crate::scan::pace::SharedPace,
     /// Flood protection for the recording path.
@@ -258,6 +264,7 @@ impl TrapState {
             tor: Arc::new(RwLock::new(TorExitList::default())),
             notifier: Default::default(),
             helper_rate: RateLimiter::default(),
+            panel_rate: RateLimiter::default(),
             guards: Guards::default(),
         }
     }
@@ -843,63 +850,75 @@ async fn collect_handler(
     let in_flight = (state.guards.enter(), state.guards.slot().await);
     tokio::spawn(async move {
         let _in_flight = in_flight;
-        if let Ok(ip_row) = state.store.upsert_ip(ip).await {
-            // Attribute the fingerprint to the page view that issued the token;
-            // fall back to the connection IP for unknown tokens.
-            let req: Option<(i64, i64, String)> = sqlx::query_as(
-                "SELECT r.id, r.ip_id, i.ip FROM requests r JOIN ips i ON i.id = r.ip_id
-                 WHERE r.page_token = ? ORDER BY r.id DESC LIMIT 1",
-            )
-            .bind(&payload.token)
-            .fetch_optional(&state.store.pool)
-            .await
-            .unwrap_or(None);
-            let (request_id, ip_id, page_ip) = match req {
-                Some((rid, iid, page_ip)) => (Some(rid), iid, page_ip.parse::<IpAddr>().ok()),
-                None => (None, ip_row.id, Some(ip)),
-            };
-            let hash = crate::fingerprint::fp_hash(&payload.attrs);
-            let visitor = payload
-                .attrs
-                .get("visitor_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let events = payload
-                .behavior
-                .get("events")
-                .map(|e| e.to_string())
-                .unwrap_or_default();
+        // Attribute the fingerprint to the page view that issued the token.
+        let req: Option<(i64, i64, String)> = sqlx::query_as(
+            "SELECT r.id, r.ip_id, i.ip FROM requests r JOIN ips i ON i.id = r.ip_id
+             WHERE r.page_token = ? ORDER BY r.id DESC LIMIT 1",
+        )
+        .bind(&payload.token)
+        .fetch_optional(&state.store.pool)
+        .await
+        .unwrap_or(None);
+        let hash = crate::fingerprint::fp_hash(&payload.attrs);
+        let visitor = payload
+            .attrs
+            .get("visitor_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let events = payload
+            .behavior
+            .get("events")
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        let (attrs, behavior) = (payload.attrs.to_string(), payload.behavior.to_string());
+        let Some((request_id, ip_id, page_ip)) = req else {
+            // Unknown token (the page view was not recorded in full, or not
+            // yet): stored against the connection IP, whose row the record
+            // creates, and never escalated.
             let _ = state
                 .recorder
-                .insert_fingerprint(
-                    request_id,
-                    ip_id,
+                .insert_fingerprint_from(
+                    &ip.to_string(),
+                    None,
                     &hash,
                     visitor.as_deref(),
-                    &payload.attrs.to_string(),
-                    &payload.behavior.to_string(),
+                    &attrs,
+                    &behavior,
                     events.as_bytes(),
                 )
                 .await;
+            return;
+        };
+        let _ = state
+            .recorder
+            .insert_fingerprint(
+                Some(request_id),
+                ip_id,
+                &hash,
+                visitor.as_deref(),
+                &attrs,
+                &behavior,
+                events.as_bytes(),
+            )
+            .await;
 
-            // The fingerprint arrives after the page view that triggered it, so it
-            // cannot influence that request's own verdict. When it reveals a bot
-            // (navigator.webdriver, or a form filled inhumanly fast with no mouse
-            // movement), escalate a counter-scan now — of the address the page
-            // was served to, subject to the same tor / never_scan / non-global
-            // guards as the request path. Bot evidence posted from another
-            // address than the page's is stored but escalates nothing: it is not
-            // tied to one address, and a token alone must not aim a scan.
-            let tells = crate::fingerprint::bot_tells(&payload.attrs, &payload.behavior);
-            if (tells.webdriver || tells.inhuman_fill)
-                && let Some(target) = page_ip.map(crate::net::canonical)
-                && target == crate::net::canonical(ip)
-                && !state.tor.read().unwrap().contains(&target)
-                && may_scan(&state, target)
-            {
-                let level = if tells.inhuman_fill { 3 } else { 2 };
-                let _ = enqueue(&state, ip_id, level).await;
-            }
+        // The fingerprint arrives after the page view that triggered it, so it
+        // cannot influence that request's own verdict. When it reveals a bot
+        // (navigator.webdriver, or a form filled inhumanly fast with no pointer,
+        // touch or keyboard input), escalate a counter-scan now — of the
+        // address the page was served to, subject to the same tor / never_scan
+        // / non-global guards as the request path. Bot evidence posted from
+        // another address than the page's is stored but escalates nothing: it
+        // is not tied to one address, and a token alone must not aim a scan.
+        let tells = crate::fingerprint::bot_tells(&payload.attrs, &payload.behavior);
+        if (tells.webdriver || tells.inhuman_fill)
+            && let Ok(target) = page_ip.parse::<IpAddr>().map(crate::net::canonical)
+            && target == crate::net::canonical(ip)
+            && !state.tor.read().unwrap().contains(&target)
+            && may_scan(&state, target)
+        {
+            let level = if tells.inhuman_fill { 3 } else { 2 };
+            let _ = enqueue(&state, ip_id, level).await;
         }
     });
     axum::Json(serde_json::json!({"ok": true})).into_response() // opaque ack (spec §8.3)
@@ -907,8 +926,14 @@ async fn collect_handler(
 
 async fn panel_handler(
     State(state): State<Arc<TrapState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    let ip = client_ip(&headers, peer.ip(), &state.cfg.trusted_proxies);
+    if !state.panel_rate.allow(ip, PANEL_LIMIT, HELPER_WINDOW) {
+        return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
+    }
     let Some(token) = q.get("token") else {
         return (StatusCode::BAD_REQUEST, "missing token").into_response();
     };
