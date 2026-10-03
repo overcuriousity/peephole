@@ -5,6 +5,7 @@ pub mod nmap_xml;
 pub mod pace;
 pub mod safety;
 
+use crate::classify::Classifier;
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::msg::{Grant, Msg};
@@ -198,6 +199,10 @@ struct Source {
     crawlers: Option<crawler::Crawlers>,
     tor: std::sync::Mutex<guard::TorView>,
     origins: guard::Origins,
+    /// This node's rules, to classify the requests behind a grant again
+    /// (`guard::evidence`). None without `rules_dir`: stored verdicts count
+    /// as they are.
+    classifier: Option<Arc<Classifier>>,
     /// Standalone jobs waiting (Tor status unknown), until when.
     deferred: std::sync::Mutex<HashMap<i64, Instant>>,
     tor_warned: std::sync::Mutex<Option<Instant>>,
@@ -215,9 +220,15 @@ fn hours_since(ts: &str) -> f64 {
 }
 
 impl Source {
-    fn new(rec: Recorder, cfg: Config, pace: pace::SharedPace) -> Self {
+    fn new(
+        rec: Recorder,
+        cfg: Config,
+        pace: pace::SharedPace,
+        classifier: Option<Arc<Classifier>>,
+    ) -> Self {
         let s = &cfg.scan.safety;
         Self {
+            classifier,
             safety: tokio::sync::Mutex::new(safety::Safety::new(&cfg)),
             crawlers: s
                 .verify_crawlers
@@ -490,7 +501,7 @@ impl Source {
             let why = Some(format!("this scanner is scanning the IP at level {l}"));
             return Ok(Err((if l >= level { "superseded" } else { "later" }, why)));
         }
-        let ev = guard::evidence(pool, &ip_text, &self.origins).await?;
+        let ev = guard::evidence(pool, &ip_text, &self.origins, self.classifier.as_deref()).await?;
         let allowed = ev.allowed_level(&self.cfg.scan.safety);
         if allowed < level {
             if ev.max_level < level {
@@ -791,6 +802,7 @@ pub async fn run_workers(
     nmap_path: PathBuf,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     notifier: crate::events::Notifier,
+    classifier: Option<Arc<Classifier>>,
 ) {
     if matches!(rec, Recorder::Local(_)) {
         // In a cluster the arbiters recover their own jobs.
@@ -800,7 +812,12 @@ pub async fn run_workers(
             Err(e) => warn!(?e, "could not requeue interrupted scans"),
         }
     }
-    let source = Arc::new(Source::new(rec.clone(), cfg.clone(), pace.clone()));
+    let source = Arc::new(Source::new(
+        rec.clone(),
+        cfg.clone(),
+        pace.clone(),
+        classifier,
+    ));
     let mut joinset = tokio::task::JoinSet::new();
     let mut last_start: Option<tokio::time::Instant> = None;
     loop {
@@ -1155,6 +1172,7 @@ license_key = "k"
             fake,
             rx,
             crate::events::Notifier::new(),
+            None,
         ));
         wait_for_scans(&store, jobs).await;
         tx.send(true).unwrap();
@@ -1200,6 +1218,7 @@ license_key = "k"
             fake,
             rx,
             crate::events::Notifier::new(),
+            None,
         ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let err = loop {
@@ -1261,6 +1280,7 @@ license_key = "k"
             fake.clone(),
             rx,
             crate::events::Notifier::new(),
+            None,
         ));
         // Wait until the job is done (poll DB, max 5s).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1328,7 +1348,7 @@ license_key = "k"
             .unwrap();
         store.enqueue_scan(ok.id, 1, 24).await.unwrap();
         let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
-        let source = Source::new(store.local(), cfg, p);
+        let source = Source::new(store.local(), cfg, p, None);
         let job = source.acquire().await.unwrap().expect("the valid job");
         assert_eq!(job.ip().to_string(), "203.0.113.50");
         let (status, started, error) = status_of(&store, "198.51.0.1").await;
@@ -1359,13 +1379,13 @@ license_key = "k"
             .await
             .unwrap();
         store.enqueue_scan(a.id, 2, 24).await.unwrap();
-        let source = Source::new(store.local(), cfg.clone(), p());
+        let source = Source::new(store.local(), cfg.clone(), p(), None);
         assert!(source.acquire().await.unwrap().is_none(), "deferred");
         assert_eq!(status_of(&store, "203.0.113.60").await.0, "queued");
         assert!(source.acquire().await.unwrap().is_none(), "still waiting");
         // The list loads (a fresh scanner, so the retry delay is not waited out).
         write_tor_list(dir.path(), "203.0.113.61\n");
-        let source = Source::new(store.local(), cfg.clone(), p());
+        let source = Source::new(store.local(), cfg.clone(), p(), None);
         let job = source
             .acquire()
             .await
@@ -1396,7 +1416,7 @@ license_key = "k"
             .execute(&store.pool)
             .await
             .unwrap();
-        let source = Source::new(store.local(), cfg.clone(), p());
+        let source = Source::new(store.local(), cfg.clone(), p(), None);
         assert!(source.acquire().await.unwrap().is_none());
         let (status, _, error) = status_of(&store, "203.0.113.62").await;
         assert_eq!(status, "refused");
@@ -1470,18 +1490,31 @@ license_key = "k"
             &format!("tor_unknown = \"scan\"\nverify_crawlers = false\n{scan}"),
         );
         let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
-        let source = Source::new(Recorder::Cluster(node.clone()), cfg, p);
+        let source = Source::new(Recorder::Cluster(node.clone()), cfg, p, Some(rules()));
         (node, source, store)
     }
 
+    /// This node's rules: the shipped ones.
+    fn rules() -> Arc<Classifier> {
+        Arc::new(Classifier::from_dir(std::path::Path::new("rules")).unwrap())
+    }
+
+    /// A request that the shipped rules put at `level`, as stored with that
+    /// level and `label` (the scanner classifies it again).
     fn request(ip_id: i64, level: i64, label: &str) -> crate::store::requests::NewRequest {
+        let (method, path, query, body): (&str, &str, Option<&str>, Option<&[u8]>) = match level {
+            1 => ("GET", "/x", None, None),
+            2 => ("GET", "/.env", None, None),
+            3 => ("POST", "/login", None, Some(b"username=a&password=b")),
+            _ => ("GET", "/login", Some("user=admin'%20OR%20'1'='1"), None),
+        };
         crate::store::requests::NewRequest {
             ip_id,
-            method: "GET".into(),
-            path: "/x".into(),
-            query: None,
+            method: method.into(),
+            path: path.into(),
+            query: query.map(str::to_string),
             headers_json: "[]".into(),
-            body: None,
+            body: body.map(<[u8]>::to_vec),
             labels_json: format!("[\"{label}\"]"),
             severity: level,
             scan_level: level,
@@ -1566,6 +1599,49 @@ license_key = "k"
             .await
             .unwrap();
         assert_eq!(turned(r), Some("declined"));
+    }
+
+    /// A node whose rules put a harmless request at level 4 cannot make
+    /// this scanner scan at 4: its rules see a probe.
+    #[tokio::test]
+    async fn grants_need_requests_our_rules_put_at_the_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, source, store) = cluster_source(dir.path(), "").await;
+        let rec = Recorder::Cluster(node.clone());
+        let ip = store
+            .upsert_ip("203.0.113.74".parse().unwrap())
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let mut r = request(ip.id, 1, "rce");
+            r.scan_level = 4;
+            r.severity = 4;
+            rec.insert_request(&r).await.unwrap();
+        }
+        let other = crate::cluster::identity::Identity::generate().unwrap().id;
+        sqlx::query("UPDATE requests SET origin = ?")
+            .bind(&other.0[..])
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        rec.enqueue_scan(ip.id, 4, 24).await.unwrap();
+        let uid = job_uid(&store, ip.id).await;
+        let r = source
+            .check_grant(node.id(), &grant(&uid, &ip.ip, 4))
+            .await
+            .unwrap();
+        let (status, why) = r.err().unwrap();
+        assert_eq!(status, "declined");
+        assert!(why.unwrap().contains("highest: 1"));
+        // Without rules of its own, a scanner takes the stored level.
+        let trusting = Source::new(rec.clone(), source.cfg.clone(), source.pace.clone(), None);
+        assert!(
+            trusting
+                .check_grant(node.id(), &grant(&uid, &ip.ip, 4))
+                .await
+                .unwrap()
+                .is_ok()
+        );
     }
 
     /// A grant for an IP this scanner is scanning now, or for a job that

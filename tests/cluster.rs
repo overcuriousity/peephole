@@ -186,6 +186,7 @@ async fn boot_in(
             nmap.clone(),
             rx.clone(),
             peephole::events::Notifier::new(),
+            None,
         ))
     });
     cluster::start(node.clone(), rx).await.unwrap();

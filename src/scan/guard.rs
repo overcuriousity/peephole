@@ -4,12 +4,15 @@
 //! - **Evidence**: the requests (and browser fingerprints) recorded from an
 //!   IP justify a scan level. A scanner checks a job against them before it
 //!   runs it, so an arbiter cannot have it scan an IP nobody saw, or at a
-//!   level nothing asked for.
+//!   level nothing asked for. It classifies the requests again with its own
+//!   rules, so neither can a node whose rules ask for more than ours.
 //! - **Thin evidence**: one request is easily caused by a bystander (a link
 //!   preview, a URL scanner or a crawler following a link to the trap), so
 //!   it earns at most `scan.single_request_max_level`.
 //! - **Queue budgets**: per /24 or /64 network, per autonomous system and in
 //!   total, so a flood of sources cannot fill the queue.
+use crate::classify::Classifier;
+use crate::classify::stored::{History, StoredRequest};
 use crate::cluster::identity::NodeId;
 use crate::config::ScanSafety;
 use crate::intel::tor::{MIN_EXITS, TorExitList};
@@ -89,28 +92,72 @@ impl Origins {
 /// Requests and fingerprints considered per IP (newest first).
 const EVIDENCE_ROWS: i64 = 1000;
 const FINGERPRINT_ROWS: i64 = 50;
+/// Requests classified again per evidence check, at most.
+const RECLASSIFY_ROWS: usize = 200;
 
 /// The evidence recorded about `ip` (its text as stored in `ips`).
-pub async fn evidence(pool: &SqlitePool, ip: &str, origins: &Origins) -> Result<Evidence> {
-    type Req = (i64, String, Option<Vec<u8>>);
+///
+/// With `verify`, each request counts for what this node's rules make of
+/// it, not only for what its origin stored: its level is the lower of the
+/// stored one and the one `verify` gives it again
+/// ([`crate::classify::stored`]), and its labels are those `verify` gives
+/// it. So a node with tampered rules cannot make others scan harder than
+/// their own rules allow. Rows are examined highest stored level first, and
+/// only until no row left can raise the level (its stored level caps it)
+/// and two labels are known (all [`Evidence::thin`] asks of them), at most
+/// [`RECLASSIFY_ROWS`]; `labels` is then a lower bound.
+///
+/// Without `verify`, the stored verdicts count as they are.
+pub async fn evidence(
+    pool: &SqlitePool,
+    ip: &str,
+    origins: &Origins,
+    verify: Option<&Classifier>,
+) -> Result<Evidence> {
+    type Req = (i64, i64, String, Option<Vec<u8>>);
     let rows: Vec<Req> = sqlx::query_as(
-        "SELECT r.scan_level, r.labels_json, r.origin FROM requests r JOIN ips i ON i.id = r.ip_id
+        "SELECT r.id, r.scan_level, r.labels_json, r.origin
+         FROM requests r JOIN ips i ON i.id = r.ip_id
          WHERE i.ip = ? AND r.is_fp_claim = 0 ORDER BY r.id DESC LIMIT ?",
     )
     .bind(ip)
     .bind(EVIDENCE_ROWS)
     .fetch_all(pool)
     .await?;
-    let mut ev = Evidence::default();
+    let mut rows: Vec<Req> = rows
+        .into_iter()
+        .filter(|r| origins.admits(r.3.as_deref()))
+        .collect();
+    let mut ev = Evidence {
+        requests: rows.len() as u32,
+        ..Evidence::default()
+    };
+    let level = |l: i64| l.clamp(0, 4) as u8;
     let mut labels = HashSet::new();
-    for (level, labels_json, origin) in rows {
-        if !origins.admits(origin.as_deref()) {
-            continue;
+    match verify {
+        None => {
+            for (_, stored, labels_json, _) in rows {
+                ev.max_level = ev.max_level.max(level(stored));
+                if let Ok(l) = serde_json::from_str::<Vec<String>>(&labels_json) {
+                    labels.extend(l);
+                }
+            }
         }
-        ev.requests += 1;
-        ev.max_level = ev.max_level.max(level.clamp(0, 4) as u8);
-        if let Ok(l) = serde_json::from_str::<Vec<String>>(&labels_json) {
-            labels.extend(l);
+        Some(c) => {
+            // Stable: newest first within a level.
+            rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+            for (n, (id, stored, _, _)) in rows.into_iter().enumerate() {
+                let stored = level(stored);
+                if n >= RECLASSIFY_ROWS || (stored <= ev.max_level && labels.len() >= 2) {
+                    break;
+                }
+                let Some(row) = StoredRequest::load(pool, id).await? else {
+                    continue;
+                };
+                let local = row.reclassify(pool, c, History::Seen).await?;
+                ev.max_level = ev.max_level.max(stored.min(local.scan_level));
+                labels.extend(local.labels);
+            }
         }
     }
     ev.labels = labels.len() as u32;
@@ -387,7 +434,9 @@ mod tests {
         let mut claim = req(ip.id, 0, r#"["fp-claim"]"#);
         claim.is_fp_claim = true;
         rec.insert_request(&claim).await.unwrap();
-        let ev = evidence(&store.pool, &ip.ip, &Origins::Any).await.unwrap();
+        let ev = evidence(&store.pool, &ip.ip, &Origins::Any, None)
+            .await
+            .unwrap();
         assert_eq!(
             ev,
             Evidence {
@@ -401,7 +450,10 @@ mod tests {
             me: None,
             others: HashSet::new(),
         };
-        assert_eq!(evidence(&store.pool, &ip.ip, &only).await.unwrap(), ev);
+        assert_eq!(
+            evidence(&store.pool, &ip.ip, &only, None).await.unwrap(),
+            ev
+        );
         // A row from another node counts only when that node is trusted.
         let other = crate::cluster::identity::Identity::generate().unwrap().id;
         sqlx::query("UPDATE requests SET origin = ? WHERE scan_level = 3")
@@ -410,7 +462,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            evidence(&store.pool, &ip.ip, &only)
+            evidence(&store.pool, &ip.ip, &only, None)
                 .await
                 .unwrap()
                 .max_level,
@@ -421,7 +473,7 @@ mod tests {
             others: [other].into(),
         };
         assert_eq!(
-            evidence(&store.pool, &ip.ip, &trusting)
+            evidence(&store.pool, &ip.ip, &trusting, None)
                 .await
                 .unwrap()
                 .max_level,
@@ -429,11 +481,78 @@ mod tests {
         );
         // Nothing recorded: nothing justified.
         assert_eq!(
-            evidence(&store.pool, "203.0.113.200", &Origins::Any)
+            evidence(&store.pool, "203.0.113.200", &Origins::Any, None)
                 .await
                 .unwrap(),
             Evidence::default()
         );
+    }
+
+    /// Classified again with our rules, a harmless request claiming level 4
+    /// backs level 1, and its labels are the ones our rules give; an honest
+    /// path scanner's level 2 (from its history) still counts.
+    #[tokio::test]
+    async fn verified_evidence_counts_what_our_rules_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let rules = Classifier::from_dir(std::path::Path::new("rules")).unwrap();
+        let rec = store.local();
+        let ip = store
+            .upsert_ip("198.51.100.6".parse().unwrap())
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let mut r = req(ip.id, 4, r#"["rce","sqli"]"#);
+            r.path = "/index.html".into();
+            rec.insert_request(&r).await.unwrap();
+        }
+        let other = crate::cluster::identity::Identity::generate().unwrap().id;
+        sqlx::query("UPDATE requests SET origin = ?")
+            .bind(&other.0[..])
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let s = ScanSafety::default();
+        let trusted = evidence(&store.pool, &ip.ip, &Origins::Any, None)
+            .await
+            .unwrap();
+        assert_eq!(trusted.allowed_level(&s), 4);
+        let ev = evidence(&store.pool, &ip.ip, &Origins::Any, Some(&rules))
+            .await
+            .unwrap();
+        assert_eq!(
+            ev,
+            Evidence {
+                max_level: 1,
+                requests: 3,
+                labels: 1
+            }
+        );
+        assert_eq!(ev.allowed_level(&s), 1);
+        // A stored level below what our rules see caps it.
+        let mut r = req(ip.id, 1, r#"["probe"]"#);
+        r.path = "/.env".into();
+        rec.insert_request(&r).await.unwrap();
+        let ev = evidence(&store.pool, &ip.ip, &Origins::Any, Some(&rules))
+            .await
+            .unwrap();
+        assert_eq!((ev.max_level, ev.labels), (1, 2), "{ev:?}");
+
+        // Twenty paths in an hour: our rules see the path scanner too.
+        let scanner = store
+            .upsert_ip("198.51.100.7".parse().unwrap())
+            .await
+            .unwrap();
+        for n in 0..20 {
+            let level = if n >= 9 { 2 } else { 1 };
+            let mut r = req(scanner.id, level, r#"["probe"]"#);
+            r.path = format!("/p{n}");
+            rec.insert_request(&r).await.unwrap();
+        }
+        let ev = evidence(&store.pool, &scanner.ip, &Origins::Any, Some(&rules))
+            .await
+            .unwrap();
+        assert_eq!(ev.max_level, 2);
     }
 
     #[tokio::test]
@@ -457,7 +576,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let ev = evidence(&store.pool, &ip.ip, &Origins::Any).await.unwrap();
+        let ev = evidence(&store.pool, &ip.ip, &Origins::Any, None)
+            .await
+            .unwrap();
         assert_eq!(ev.max_level, 3);
     }
 

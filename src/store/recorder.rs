@@ -419,9 +419,11 @@ impl Recorder {
         let pool = &self.store().pool;
         let ip_text = self.ip_of(ip_id).await?;
         let mut level = level;
+        // Stored verdicts as they are: the scanner that takes the job
+        // classifies the requests again before it runs it.
         if let Some(s) = &policy.safety
             && level > s.single_request_max_level
-            && guard::evidence(pool, &ip_text, &guard::Origins::Any)
+            && guard::evidence(pool, &ip_text, &guard::Origins::Any, None)
                 .await?
                 .thin(s)
         {

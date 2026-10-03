@@ -532,6 +532,23 @@ impl RoleRunner {
     }
 
     async fn start_scanner(&self) -> Result<Running> {
+        // Grants are checked against this node's own rules (loaded on every
+        // start, like the trap's). A node without `rules_dir` takes the
+        // stored verdicts as they are.
+        let classifier = match &self.cfg.rules_dir {
+            Some(dir) => Some(Arc::new(
+                classify::Classifier::from_dir(dir).context("loading rules")?,
+            )),
+            None => {
+                if self.node.is_some() {
+                    warn!(
+                        "no rules_dir: this scanner trusts the scan levels other nodes \
+                         stored instead of classifying their requests again"
+                    );
+                }
+                None
+            }
+        };
         let (stop, rx) = tokio::sync::watch::channel(false);
         Ok(Running {
             stop,
@@ -542,6 +559,7 @@ impl RoleRunner {
                 PathBuf::from(self.cfg.scan.nmap()),
                 rx,
                 self.notifier.clone(),
+                classifier,
             )),
         })
     }

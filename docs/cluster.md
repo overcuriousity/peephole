@@ -102,7 +102,15 @@ be listed under `[[cluster.peers]]` with their key.
   members (published ones, and the ones members connect from).
 - A scanner checks each job an arbiter grants against its own copy of the
   job and runs it only when requests it holds back the level;
-  `scan.trusted_origins` limits whose requests count.
+  `scan.trusted_origins` limits whose requests count. It does not take a
+  request's stored scan level on trust: it classifies the request again
+  with its own rules (`rules_dir`) and counts the lower of the two levels,
+  and the labels its own rules give. A node with doctored rules cannot make
+  other scanners scan harder than their rules allow. The IP's history in
+  the hour before (which turns many requests into a path scanner) is
+  rebuilt from the rows the scanner holds, so it can come out smaller,
+  never above the stored level. A scanner without `rules_dir` takes the
+  stored levels as they are (and says so in its log).
 - When two nodes queue the same IP before either job has reached the
   other, only one of them is scanned: the higher level, else the one
   queued first. Arbiters and scanners both apply this, and the other job
