@@ -446,6 +446,7 @@ struct RequestPage {
     d: RequestDetail,
     labels: Vec<String>,
     owasp: Vec<String>,
+    can_delete: bool,
 }
 
 async fn request_page(
@@ -463,6 +464,7 @@ async fn request_page(
         d,
         labels,
         owasp,
+        can_delete: st.can_delete(),
     })
 }
 
@@ -490,11 +492,24 @@ fn redirect_with_notice(to: &str, msg: &str) -> Response {
     ([(axum::http::header::SET_COOKIE, cookie)], Redirect::to(to)).into_response()
 }
 
+/// Deleting is for standalone nodes; a cluster node refuses (the buttons
+/// are not shown there).
+fn deletes_allowed(st: &AdminState) -> AppResult<()> {
+    if st.can_delete() {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
+            "Records cannot be deleted on a cluster node; retention prunes them.".into(),
+        ))
+    }
+}
+
 async fn request_delete(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
+    deletes_allowed(&st)?;
     let out = st.recorder.delete_request(id).await?;
     if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
@@ -507,6 +522,7 @@ async fn ip_delete(
     State(st): State<Arc<AdminState>>,
     Path(addr): Path<String>,
 ) -> AppResult<Response> {
+    deletes_allowed(&st)?;
     let Some(ip) = st.store.ip_by_addr(&addr).await? else {
         return Err(AppError::NotFound);
     };
@@ -546,6 +562,7 @@ struct ScanPage {
     chrome: Chrome,
     s: ScanSummary,
     ports: Vec<PortRow>,
+    can_delete: bool,
 }
 
 async fn scan_page(
@@ -561,6 +578,7 @@ async fn scan_page(
         chrome: chrome(),
         s,
         ports,
+        can_delete: st.can_delete(),
     })
 }
 
@@ -590,6 +608,7 @@ async fn scan_delete(
     State(st): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
+    deletes_allowed(&st)?;
     let out = st.recorder.delete_scan(id).await?;
     if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
@@ -619,12 +638,14 @@ async fn fingerprints(
 struct InboxPage {
     chrome: Chrome,
     claims: Vec<FpClaimRow>,
+    can_delete: bool,
 }
 
 async fn inbox(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
     render(&InboxPage {
         chrome: chrome(),
         claims: st.store.inbox().await?,
+        can_delete: st.can_delete(),
     })
 }
 
@@ -633,6 +654,7 @@ async fn claim_delete(
     State(st): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
+    deletes_allowed(&st)?;
     let out = st.recorder.delete_claim(id).await?;
     if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
@@ -789,6 +811,7 @@ async fn bulk_delete_requests(
     State(st): State<Arc<AdminState>>,
     body: String,
 ) -> AppResult<Response> {
+    deletes_allowed(&st)?;
     let form = parse_bulk::<RequestFilter>(&body)?;
     let mut total = Deleted::default();
     if form.all {
@@ -832,6 +855,7 @@ async fn bulk_delete_ips(
     State(st): State<Arc<AdminState>>,
     body: String,
 ) -> AppResult<Response> {
+    deletes_allowed(&st)?;
     let form = parse_bulk::<IpFilter>(&body)?;
     let mut total = Deleted::default();
     if form.all {

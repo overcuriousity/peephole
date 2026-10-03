@@ -6,8 +6,8 @@
   <div class="meta"><span class="mono">{{ d.row.ts }}</span><span>from <a class="mono" href="/ip/{{ d.ip }}">{{ d.ip }}</a></span>
     <span>severity {% let sev = d.row.severity %}{% include "_severity.html" %}</span><span>scan level {{ d.row.scan_level }}</span>{% if let Some(a) = d.row.answer %}<span>answered {{ a }}{% if let Some(st) = d.row.status %} ({{ st }}){% endif %}</span>{% endif %}{% if let Some(t) = d.row.transport %}<span>{{ t }}{% if d.row.via_proxy == Some(true) %} via proxy{% endif %}</span>{% endif %}{% if let Some(j) = d.row.ja4 %}<span class="mono">JA4 {{ j }}</span>{% endif %}{% if let Some(n) = d.row.unrecorded %}<span>{{ n }} unrecorded before it</span>{% endif %}{% if let Some(n) = d.node %}<span>recorded by {{ n }}</span>{% endif %}{% if d.row.is_fp_claim %}<span class="badge badge-label">fp claim</span>{% endif %}</div>
 </div>
-<button class="btn btn-danger" type="button" data-confirm="dlg-del">Delete request</button>
-<dialog id="dlg-del"><h3>Delete request #{{ d.row.id }}?</h3><form method="post" action="/admin/requests/{{ d.row.id }}/delete" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Delete</button></form></dialog>
+{% if can_delete %}<button class="btn btn-danger" type="button" data-confirm="dlg-del">Delete request</button>
+<dialog id="dlg-del"><h3>Delete request #{{ d.row.id }}?</h3><form method="post" action="/admin/requests/{{ d.row.id }}/delete" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Delete</button></form></dialog>{% endif %}
 </div>
 <div class="stack">
   <section class="card"><h2>Labels</h2><div class="chips">{% for l in labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}{% if labels.is_empty() && owasp.is_empty() %}<span class="muted">none</span>{% endif %}</div></section>

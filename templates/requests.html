@@ -16,7 +16,7 @@
     {% for n in nodes %}<option value="{{ n }}"{% if f.node.as_deref() == Some(n.as_str()) %} selected{% endif %}>{{ n }}</option>{% endfor %}</select></label>{% endif %}
   <button class="btn btn-primary" type="submit">Filter</button>
 </form>
-{% if chrome.authed %}
+{% if can_delete %}
 <div class="row bulk-bar">
   <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-sel" data-needs-checked="bulk-form">Delete selected</button>
   <dialog id="dlg-bulk-sel"><h3>Delete the selected requests?</h3><p class="muted">Only the rows checked on this page. Cannot be undone.</p>
@@ -35,11 +35,11 @@
 {% include "_request_filter_hidden.html" %}
 {% endif %}
 <div class="table-wrap"><table>
-  <thead><tr>{% if chrome.authed %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>Time (UTC)</th><th>IP</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th>{% if !nodes.is_empty() %}<th>Node</th>{% endif %}{% if chrome.authed %}<th></th>{% endif %}</tr></thead>
+  <thead><tr>{% if can_delete %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>Time (UTC)</th><th>IP</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th>{% if !nodes.is_empty() %}<th>Node</th>{% endif %}{% if chrome.authed %}<th></th>{% endif %}</tr></thead>
   <tbody>
   {% for r in page.items %}
     <tr>
-      {% if chrome.authed %}<td class="check"><input type="checkbox" name="ids" value="{{ r.id }}" aria-label="Select request {{ r.id }}"></td>{% endif %}
+      {% if can_delete %}<td class="check"><input type="checkbox" name="ids" value="{{ r.id }}" aria-label="Select request {{ r.id }}"></td>{% endif %}
       <td class="ts">{{ r.ts }}</td>
       <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% if r.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
       <td class="mono">{{ r.method }}</td>
@@ -50,9 +50,9 @@
       {% if chrome.authed %}<td><a class="btn btn-sm btn-ghost" href="/admin/requests/{{ r.id }}">inspect</a></td>{% endif %}
     </tr>
   {% endfor %}
-  {% if page.items.is_empty() %}<tr><td colspan="{% if chrome.authed %}{% if nodes.is_empty() %}8{% else %}9{% endif %}{% else %}{% if nodes.is_empty() %}6{% else %}7{% endif %}{% endif %}" class="empty">No requests match.</td></tr>{% endif %}
+  {% if page.items.is_empty() %}<tr><td colspan="{{ 7 + (!nodes.is_empty()) as usize + can_delete as usize }}" class="empty">No requests match.</td></tr>{% endif %}
   </tbody>
 </table></div>
-{% if chrome.authed %}</form>{% endif %}
+{% if can_delete %}</form>{% endif %}
 {% include "_pagination.html" %}
 {% endblock %}

@@ -39,6 +39,14 @@ pub struct AdminState {
 }
 
 impl AdminState {
+    /// Records can be deleted from the admin only on a standalone node. In
+    /// a cluster the data belongs to the cluster: retention prunes it.
+    pub fn can_delete(&self) -> bool {
+        matches!(self.recorder, crate::store::recorder::Recorder::Local(_))
+    }
+}
+
+impl AdminState {
     pub fn new(
         store: Store,
         cfg: Config,

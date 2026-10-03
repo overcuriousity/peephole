@@ -1545,9 +1545,10 @@ async fn blocking_a_peer_hides_its_records_until_unblocked() {
     assert!(!nb.is_blocked(&a.id));
 }
 
-/// The admin is told what a delete did: cluster-wide or local only.
+/// A cluster node's admin cannot delete records: the data belongs to the
+/// cluster, and retention prunes it.
 #[tokio::test]
-async fn admin_delete_reports_hidden_records() {
+async fn admin_cannot_delete_on_a_cluster_node() {
     let (ia, a) = new_node("a");
     let (ib, b) = new_node("b");
     let na = boot(ia, &a, &[&b], DEFAULT).await;
@@ -1570,14 +1571,23 @@ async fn admin_delete_reports_hidden_records() {
         .await
         .unwrap();
     let (admin, base) = admin_on(&nb).await;
+    let page = admin
+        .get(format!("{base}/admin/requests/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!page.contains("/delete"), "no delete button");
     let r = admin
         .post(format!("{base}/admin/requests/{id}/delete"))
         .send()
         .await
         .unwrap();
-    assert!(r.status().is_success());
-    assert_eq!(count(&nb, "SELECT COUNT(*) FROM requests").await, 0);
-    assert_eq!(count(&nb, "SELECT COUNT(*) FROM hidden").await, 1);
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM requests").await, 1);
+    assert_eq!(count(&nb, "SELECT COUNT(*) FROM hidden").await, 0);
 }
 
 /// A standalone install that switches to distributed mode brings its

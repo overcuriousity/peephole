@@ -110,7 +110,7 @@
   </section>
   {% endif %}
 
-  {% if admin.is_some() %}
+  {% if can_delete %}
   <section class="card danger-zone">
     <h2>Danger zone</h2>
     <p class="muted">Removes this IP with all its requests, scans, fingerprints and claims. Cannot be undone.</p>

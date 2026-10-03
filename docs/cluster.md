@@ -58,9 +58,9 @@ be listed under `[[cluster.peers]]` with their key.
   `takeover_hours`. Entries of a node nobody admitted are parked only up to
   100 per node and dropped after a week. `cluster.origin_quota_mb`
   (default 20 GiB) caps what one member's entries may take on this node.
-- **Deletes reach your own records only.** Deleting something your node
-  recorded removes it on every node. Deleting something another node
-  recorded hides it on your node only.
+- **No deletes from the admin.** On a cluster node the admin pages offer
+  no delete: the records belong to the cluster. Retention (`retention_days`)
+  still prunes, and `peephole cluster purge` removes a blocked peer's data.
 - **The dataset is persistent.** What a node contributed stays when it
   leaves or is pruned. By default every node keeps the whole history. The
   Cluster page counts, per member, the requests, fingerprints, scans and

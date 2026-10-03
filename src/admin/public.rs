@@ -169,6 +169,8 @@ struct IpsPage {
     qs: String,
     /// Rows matching the filter across all pages; `Some` only with a session.
     bulk_total: Option<i64>,
+    /// Admin on a standalone node: rows can be deleted.
+    can_delete: bool,
     labels: bool,
     /// Admin only: provider tags to filter by, and the API providers.
     tags: Vec<String>,
@@ -293,6 +295,7 @@ async fn ips(
         f,
         page,
         bulk_total,
+        can_delete: authed && state.can_delete(),
         labels: labels_shown(&state, authed),
         tags,
         api_providers,
@@ -307,6 +310,8 @@ struct RequestsPage {
     page: Page<RequestListRow>,
     qs: String,
     bulk_total: Option<crate::store::browse::Count>,
+    /// Standalone node: rows can be deleted.
+    can_delete: bool,
     /// Cluster member names for the admin-only node filter (empty
     /// standalone or for the public).
     nodes: Vec<String>,
@@ -333,6 +338,7 @@ async fn requests(
         page,
         qs,
         bulk_total,
+        can_delete: state.can_delete(),
         nodes,
     })
 }
@@ -623,6 +629,8 @@ struct IpPage {
     page: Page<RequestListRow>,
     intel: Vec<IntelCard>,
     admin: Option<IpAdminData>,
+    /// Admin on a standalone node: the IP can be deleted.
+    can_delete: bool,
     labels: bool,
 }
 
@@ -696,6 +704,7 @@ async fn ip_page(
         page,
         intel,
         admin,
+        can_delete: authed && state.can_delete(),
         labels: labels_shown(&state, authed),
     })
 }

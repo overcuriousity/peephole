@@ -9,9 +9,11 @@
 </div>
 <div class="row">
   <a class="btn" href="/admin/scans/{{ s.id }}/xml">Download raw XML</a>
+  {% if can_delete %}
   <button class="btn btn-danger" type="button" data-confirm="dlg-del">Delete scan</button>
   <dialog id="dlg-del"><h3>Delete scan #{{ s.id }}?</h3><p class="muted">Ports recorded by this scan are removed too.</p>
     <form method="post" action="/admin/scans/{{ s.id }}/delete" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Delete</button></form></dialog>
+  {% endif %}
 </div></div>
 <section class="card"><h2>Ports</h2>{% include "_ports.html" %}</section>
 {% endblock %}

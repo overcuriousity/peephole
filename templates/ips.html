@@ -26,7 +26,7 @@
   </select></label>
   <button class="btn btn-primary" type="submit">Filter</button>
 </form>
-{% if chrome.authed %}
+{% if can_delete %}
 <div class="row bulk-bar">
   <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-sel" data-needs-checked="bulk-form">Delete selected</button>
   <dialog id="dlg-bulk-sel"><h3>Delete the selected IPs?</h3><p class="muted">Each IP goes with all its requests, scans, fingerprints and claims. Cannot be undone.</p>
@@ -45,11 +45,11 @@
 {% include "_ip_filter_hidden.html" %}
 {% endif %}
 <div class="table-wrap"><table>
-  <thead><tr>{% if chrome.authed %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>IP</th><th>Country</th><th>Network</th><th class="num">Requests</th><th>Max sev</th>{% if chrome.authed %}<th class="num">Abuse</th>{% endif %}<th>First seen</th><th>Last seen</th></tr></thead>
+  <thead><tr>{% if can_delete %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>IP</th><th>Country</th><th>Network</th><th class="num">Requests</th><th>Max sev</th>{% if chrome.authed %}<th class="num">Abuse</th>{% endif %}<th>First seen</th><th>Last seen</th></tr></thead>
   <tbody>
   {% for i in page.items %}
     <tr>
-      {% if chrome.authed %}<td class="check"><input type="checkbox" name="ids" value="{{ i.ip }}" aria-label="Select {{ i.ip }}"></td>{% endif %}
+      {% if can_delete %}<td class="check"><input type="checkbox" name="ids" value="{{ i.ip }}" aria-label="Select {{ i.ip }}"></td>{% endif %}
       <td class="ip"><a href="/ip/{{ i.ip }}">{{ i.ip }}</a>{% if i.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
       <td>{% if let Some(c) = i.country %}{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}{% else %}<span class="muted">—</span>{% endif %}</td>
       <td>{% if let Some(o) = i.asn_org %}{{ o }}{% if let Some(a) = i.asn %} <span class="muted mono">AS{{ a }}</span>{% endif %}{% else %}<span class="muted">—</span>{% endif %}</td>
@@ -60,9 +60,9 @@
       <td class="ts">{{ i.last_seen }}</td>
     </tr>
   {% endfor %}
-  {% if page.items.is_empty() %}<tr><td colspan="{% if chrome.authed %}9{% else %}7{% endif %}" class="empty">No IPs match.</td></tr>{% endif %}
+  {% if page.items.is_empty() %}<tr><td colspan="{{ 7 + chrome.authed as usize + can_delete as usize }}" class="empty">No IPs match.</td></tr>{% endif %}
   </tbody>
 </table></div>
-{% if chrome.authed %}</form>{% endif %}
+{% if can_delete %}</form>{% endif %}
 {% include "_pagination.html" %}
 {% endblock %}
