@@ -104,7 +104,7 @@ impl Manifest {
 }
 
 /// Announced files of kinds this version knows; old `geolite2-*` rows are
-/// left out. Per kind the newest announcement (by its clamped HLC) of a
+/// left out. Per kind the newest announcement (by its HLC) of a
 /// node this node has not blocked, so a blocked node loses control of the
 /// shared files here.
 pub async fn manifests(store: &crate::store::Store) -> Result<HashMap<String, Manifest>> {

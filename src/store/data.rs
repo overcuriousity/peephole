@@ -609,7 +609,7 @@ async fn scan_job(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &ScanJobRec) -> 
                            "scan job with an invalid level or target ignored");
             return Ok(Effect::Ignored);
         }
-        // Per-origin rate, judged by the jobs' own (clamped) HLCs, so every
+        // Per-origin rate, judged by the jobs' own HLCs, so every
         // node reaches the same verdict for the same stream.
         let since = ctx.hlc.saturating_sub(3_600_000 << 16);
         let recent: i64 = sqlx::query_scalar(
@@ -870,7 +870,7 @@ async fn intel_manifest(
     {
         return Ok(Effect::Ignored);
     }
-    // A fetch time later than the (clamped) entry is a claim nobody can
+    // A fetch time later than the entry is a claim nobody can
     // check: it would make an old list look fresh and hold off refetches.
     let entry_ts = chrono::DateTime::from_timestamp_millis(
         crate::cluster::hlc::physical_ms(ctx.hlc).min(i64::MAX as u64) as i64,

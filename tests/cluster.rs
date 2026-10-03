@@ -792,14 +792,25 @@ async fn a_future_dated_admission_cannot_keep_a_node_from_leaving() {
         proto_max: 2,
         remote_config: false,
     };
-    let far = hlc_days_ago(0, 1) + ((400u64 * 24 * 3600 * 1000) << 16);
-    repl::apply_batch(
+    // A admits W, then dates a re-admission far ahead: that one is not
+    // taken before its time (A's stream waits there).
+    let far = hlc_days_ago(0, 4) + ((400u64 * 24 * 3600 * 1000) << 16);
+    let st = repl::apply_batch(
         &x,
-        vec![WireEntry::sign(&a_id, 1, far, &Record::MemberAdd(info.clone())).unwrap()],
+        vec![
+            WireEntry::sign(
+                &a_id,
+                1,
+                hlc_days_ago(0, 1),
+                &Record::MemberAdd(info.clone()),
+            )
+            .unwrap(),
+            WireEntry::sign(&a_id, 2, far, &Record::MemberAdd(info.clone())).unwrap(),
+        ],
     )
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!((st.applied, st.rejected), (1, 1), "{st:?}");
     repl::apply_batch(
         &x,
         vec![

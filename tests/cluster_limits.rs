@@ -551,32 +551,40 @@ async fn deferred_entries_back_off_and_give_up() {
     assert_eq!(log_state(&x, b.key(), oseq).await, 3);
 }
 
-/// Timestamps from the future buy nothing: results, announcements and
-/// liveness are ordered by the time this node received them (plus the
-/// allowed drift), and a blocked node's announcement is not used.
+/// Timestamps from the future buy nothing: an entry dated further ahead
+/// than the allowed drift is not taken (its origin's stream waits for its
+/// time), what is taken counts at its own HLC on every node, an
+/// announcement cannot claim a fetch later than its entry, and a blocked
+/// node's announcement is not used.
 #[tokio::test]
-async fn future_dated_entries_are_ordered_by_their_receipt() {
+async fn future_dated_entries_wait_for_their_time() {
     let (mut a, mut b) = (Origin::new(), Origin::new());
     let (x, _d) = offline(&[&a, &b], |_| {}).await;
-    let far = hlc_in(400 * DAY, 0);
-    let latest = ((wall_ms() + 5 * 60 * 1000 + 60_000) << 16) as i64;
-    apply(
+    let intel = Record::IpIntel(IpIntelRec {
+        build: String::new(),
+        ip: "203.0.113.20".into(),
+        provider: "tor-exits".into(),
+        fetched_at: "2026-10-01 00:00:00".into(),
+        source_version: None,
+        data_json: r#"{"exit":true}"#.into(),
+    });
+    let r = a.now(request(&a, "r"));
+    let far = a.at(hlc_in(400 * DAY, 0), intel.clone());
+    let st = apply(&x, vec![r, far]).await;
+    assert_eq!((st.applied, st.rejected), (1, 1), "{st:?}");
+    assert_eq!(count(&x, "SELECT COUNT(*) FROM ip_intel").await, 0);
+    let heads = repl::heads(&x.store).await.unwrap();
+    assert_eq!(repl::head_in(&heads, &a.key()), 1, "the stream waits there");
+
+    // Within the drift: taken, at its own HLC.
+    a.seq = 1;
+    let soon = hlc_in(4 * 60 * 1000, 0);
+    let st = apply(
         &x,
         vec![
-            a.now(request(&a, "r")),
+            a.at(soon, intel),
             a.at(
-                far,
-                Record::IpIntel(IpIntelRec {
-                    build: String::new(),
-                    ip: "203.0.113.20".into(),
-                    provider: "tor-exits".into(),
-                    fetched_at: "2026-10-01 00:00:00".into(),
-                    source_version: None,
-                    data_json: r#"{"exit":true}"#.into(),
-                }),
-            ),
-            a.at(
-                far + 1,
+                soon + 1,
                 Record::IntelManifest(IntelManifestRec {
                     kind: "tor-exits".into(),
                     sha256: "aa".repeat(32),
@@ -587,11 +595,12 @@ async fn future_dated_entries_are_ordered_by_their_receipt() {
         ],
     )
     .await;
+    assert_eq!(st.applied, 2, "{st:?}");
     let h: i64 = sqlx::query_scalar("SELECT hlc FROM ip_intel")
         .fetch_one(&x.store.pool)
         .await
         .unwrap();
-    assert!(h > 0 && h < latest, "clamped to receipt + drift");
+    assert_eq!(h as u64, soon);
     let m = peephole::intel::share::manifests(&x.store).await.unwrap();
     let tor = &m["tor-exits"];
     assert!(tor.fetched_at.as_str() < "2099", "{}", tor.fetched_at);
@@ -620,24 +629,6 @@ async fn future_dated_entries_are_ordered_by_their_receipt() {
         peephole::intel::share::manifests(&x.store).await.unwrap()["tor-exits"].sha256,
         "bb".repeat(32)
     );
-
-    // Liveness: A's last entry claims to be from the future, but it was
-    // received 31 days ago and nothing since: pruned.
-    let old = hlc_in(-40 * DAY, 0) as i64;
-    sqlx::query("UPDATE repl_log SET received_at = datetime('now', '-31 days') WHERE origin = ?")
-        .bind(&a.key().0[..])
-        .execute(&x.store.pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE members SET admitted_hlc = ? WHERE id = ?")
-        .bind(old)
-        .bind(&a.key().0[..])
-        .execute(&x.store.pool)
-        .await
-        .unwrap();
-    let rows = members::all(&x.store).await.unwrap();
-    let ma = rows.iter().find(|m| m.id == a.key()).unwrap();
-    assert_eq!(ma.standing, members::Standing::Pruned);
 }
 
 /// Member descriptions are cleaned on apply: nobody can make other nodes

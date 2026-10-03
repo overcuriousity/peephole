@@ -48,14 +48,14 @@ impl Standing {
 
 /// Signs of life are the newest entry the member signed and its latest
 /// admission. Entries are signed by their origin, so nobody can make another
-/// node look stale, and evidence relayed by any member counts. An entry
-/// counts at its HLC but no later than this node received it (plus the
-/// allowed clock drift): a clock running ahead buys no extra life.
+/// node look stale, and evidence relayed by any member counts. Entries are
+/// only taken once they lie no further ahead than the allowed clock drift
+/// (see [`super::hlc::ahead`]), so a clock running ahead buys at most that
+/// much extra life.
 pub fn standing(
     admitted_hlc: u64,
     left_hlc: Option<u64>,
     last_entry_hlc: u64,
-    last_entry_received_ms: u64,
     now_ms: u64,
 ) -> Standing {
     if admitted_hlc == 0 {
@@ -64,22 +64,12 @@ pub fn standing(
     if left_hlc.is_some_and(|l| l >= admitted_hlc) {
         return Standing::Left;
     }
-    // Only the millisecond counts here, not the order within it.
-    let entry = super::hlc::effective(last_entry_hlc, 0, last_entry_received_ms);
-    let evidence = super::hlc::physical_ms(admitted_hlc.max(entry));
+    let evidence = super::hlc::physical_ms(admitted_hlc.max(last_entry_hlc));
     if now_ms.saturating_sub(evidence) > PRUNE_AFTER_MS {
         Standing::Pruned
     } else {
         Standing::Active
     }
-}
-
-/// An admission time no later than now (`seq`: the entry's, see
-/// [`super::hlc::cap`]). A sponsor's timestamp from the future must not
-/// outrank what the admitted node decides later (leaving), nor count as a
-/// sign of life that has not happened yet.
-fn not_future(hlc: u64, seq: u64) -> u64 {
-    super::hlc::cap(hlc, seq, (super::hlc::wall_ms() << 16) | 0xffff)
 }
 
 /// A member row as the UI and CLI show it.
@@ -116,28 +106,21 @@ type Row = (
     Option<i64>,
     i64,
     Option<i64>,
-    Option<i64>,
 );
 
 const SELECT: &str = "SELECT id, name, address, roles_json, proto_min, proto_max,
                              sponsor, info_hlc, admitted_hlc, revoked_hlc, remote_config,
                              (SELECT l.hlc FROM repl_log l
                               WHERE l.origin = members.id AND l.sig IS NOT NULL
-                              ORDER BY l.seq DESC LIMIT 1),
-                             (SELECT CAST(strftime('%s', l.received_at) AS INTEGER) * 1000
-                              FROM repl_log l
-                              WHERE l.origin = members.id AND l.sig IS NOT NULL
                               ORDER BY l.seq DESC LIMIT 1)
                       FROM members";
 
 fn from_row(r: Row, now_ms: u64) -> Result<MemberRow> {
     let last_entry_hlc = super::hlc::from_db(r.11.unwrap_or(0));
-    let received = super::hlc::from_db(r.12.unwrap_or(0));
     let standing = standing(
         super::hlc::from_db(r.8),
         r.9.map(super::hlc::from_db),
         last_entry_hlc,
-        received,
         now_ms,
     );
     Ok(MemberRow {
@@ -308,21 +291,15 @@ async fn may_sponsor(
         }
         // Its previous sign of life: the entry before this one, or its
         // admission.
-        let prev: Option<(i64, Option<i64>)> = sqlx::query_as(
-            "SELECT hlc, CAST(strftime('%s', received_at) AS INTEGER) * 1000 FROM repl_log
+        let prev: Option<i64> = sqlx::query_scalar(
+            "SELECT hlc FROM repl_log
              WHERE origin = ? AND seq < ? AND sig IS NOT NULL ORDER BY seq DESC LIMIT 1",
         )
         .bind(&sponsor.0[..])
         .bind(e.seq.min(i64::MAX as u64) as i64)
         .fetch_optional(&mut *conn)
         .await?;
-        let prev = prev.map_or(0, |(h, r)| {
-            super::hlc::effective(
-                super::hlc::from_db(h),
-                0,
-                super::hlc::from_db(r.unwrap_or(0)),
-            )
-        });
+        let prev = prev.map_or(0, super::hlc::from_db);
         // The entry before this one is not held (history below this node's
         // floor): silence cannot be judged across that gap.
         let gap = e.seq > 1 && {
@@ -381,14 +358,7 @@ pub async fn can_admit(node: &Node, member: &NodeId) -> Result<bool> {
         sig: None,
         erased_by: None,
     };
-    may_sponsor(
-        node,
-        &mut conn,
-        &probe,
-        member,
-        not_future(probe.hlc, probe.seq),
-    )
-    .await
+    may_sponsor(node, &mut conn, &probe, member, probe.hlc).await
 }
 
 /// The nodes `root` admitted, the nodes those admitted, and so on (not
@@ -421,7 +391,10 @@ pub async fn subtree(
 }
 
 /// Effects of a membership record; returns true if it was one. `at` is the
-/// record's HLC as this node orders it (never later than its receipt).
+/// record's HLC: entries are only taken once it lies within the allowed
+/// drift (see [`super::hlc::ahead`]), so a sponsor's clock running ahead
+/// outranks what the admitted node decides (leaving) by that much at most,
+/// and every node orders the two the same way.
 pub async fn apply(
     node: &Node,
     conn: &mut SqliteConnection,
@@ -436,7 +409,6 @@ pub async fn apply(
                 return Ok(true);
             }
             let info = &sanitize(info);
-            let at = not_future(at, e.seq);
             if !may_sponsor(node, conn, e, &info.id, at).await? {
                 return Ok(true);
             }
@@ -497,7 +469,7 @@ pub async fn apply(
                 "UPDATE members SET revoked_hlc = MAX(COALESCE(revoked_hlc, 0), ?), revoked_by = ?
                  WHERE id = ?",
             )
-            .bind(super::hlc::to_db(not_future(at, e.seq)))
+            .bind(super::hlc::to_db(at))
             .bind(&e.origin.0[..])
             .bind(&id.0[..])
             .execute(&mut *conn)
@@ -522,50 +494,25 @@ mod tests {
     #[test]
     fn standing_follows_admission_leave_and_evidence() {
         let now = 1_000 * DAY;
-        assert_eq!(standing(0, None, hlc(now), now, now), Standing::NotAdmitted);
-        assert_eq!(standing(hlc(now), None, 0, 0, now), Standing::Active);
+        assert_eq!(standing(0, None, hlc(now), now), Standing::NotAdmitted);
+        assert_eq!(standing(hlc(now), None, 0, now), Standing::Active);
         // Left: the leave is newer than the admission; a later add re-admits.
         assert_eq!(
-            standing(hlc(now - DAY), Some(hlc(now)), hlc(now), now, now),
+            standing(hlc(now - DAY), Some(hlc(now)), hlc(now), now),
             Standing::Left
         );
         assert_eq!(
-            standing(hlc(now), Some(hlc(now - DAY)), 0, 0, now),
+            standing(hlc(now), Some(hlc(now - DAY)), 0, now),
             Standing::Active
         );
         // 31 days without an entry: pruned. Either kind of evidence revives.
         let old = hlc(now - 31 * DAY);
-        assert_eq!(standing(old, None, old, now, now), Standing::Pruned);
-        assert_eq!(
-            standing(old, None, hlc(now - DAY), now, now),
-            Standing::Active
-        );
-        assert_eq!(
-            standing(hlc(now - DAY), None, old, now, now),
-            Standing::Active
-        );
+        assert_eq!(standing(old, None, old, now), Standing::Pruned);
+        assert_eq!(standing(old, None, hlc(now - DAY), now), Standing::Active);
+        assert_eq!(standing(hlc(now - DAY), None, old, now), Standing::Active);
         // Exactly at the limit is still active.
         let edge = hlc(now - 30 * DAY);
-        assert_eq!(standing(edge, None, edge, now, now), Standing::Active);
-    }
-
-    /// A clock running ahead buys no extra life: an entry counts no later
-    /// than its receipt (plus the allowed drift). Before, a member whose
-    /// entries were dated 400 days ahead never looked stale.
-    #[test]
-    fn a_clock_running_ahead_counts_from_receipt() {
-        let now = 1_000 * DAY;
-        let future = hlc(now + 400 * DAY);
-        // Received just now: alive.
-        assert_eq!(
-            standing(hlc(now - 40 * DAY), None, future, now, now),
-            Standing::Active
-        );
-        // Received 31 days ago and silent since: pruned, whatever it claimed.
-        assert_eq!(
-            standing(hlc(now - 40 * DAY), None, future, now - 31 * DAY, now),
-            Standing::Pruned
-        );
+        assert_eq!(standing(edge, None, edge, now), Standing::Active);
     }
 
     #[test]
