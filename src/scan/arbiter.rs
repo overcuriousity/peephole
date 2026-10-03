@@ -214,18 +214,29 @@ impl Arbiter {
                 )
                 .collect()
         };
-        let row: Option<(String, String, i64, i64)> = sqlx::query_as(
-            "SELECT j.uid, i.ip, j.level, j.attempts FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
-             WHERE j.status = 'queued' AND j.arbiter = ?
-               AND j.uid NOT IN (SELECT value FROM json_each(?))
-             ORDER BY j.level DESC, j.queued_at ASC LIMIT 1",
-        )
-        .bind(&me.0[..])
-        .bind(serde_json::to_string(&declined)?)
-        .fetch_optional(&self.node.store.pool)
-        .await?;
-        let Some((uid, ip, level, attempts)) = row else {
-            return Ok(None);
+        let (uid, ip, level, attempts) = loop {
+            let row: Option<(String, String, i64, i64)> = sqlx::query_as(
+                "SELECT j.uid, i.ip, j.level, j.attempts FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
+                 WHERE j.status = 'queued' AND j.arbiter = ?
+                   AND j.uid NOT IN (SELECT value FROM json_each(?))
+                 ORDER BY j.level DESC, j.queued_at ASC LIMIT 1",
+            )
+            .bind(&me.0[..])
+            .bind(serde_json::to_string(&declined)?)
+            .fetch_optional(&self.node.store.pool)
+            .await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            // Another arbiter queued the same IP and its job ranks first, or
+            // a scan of it is running: the scanners would turn this one down.
+            let Some(other) = super::outranked_by(&self.node.store.pool, &row.0).await? else {
+                break row;
+            };
+            info!(job = %row.0, ip = %row.1, by = %other, "scan job superseded by another job for the same IP");
+            let why = format!("job {other} for this IP ranks first");
+            self.set_state(&row.0, "superseded", Some(why), Some(now_ts()))
+                .await?;
         };
         self.rec
             .write(vec![Record::JobStatus(JobStatusRec {
@@ -669,6 +680,54 @@ mod tests {
             .fetch_one(&store.pool)
             .await
             .unwrap()
+    }
+
+    /// A queued job of another arbiter, as if it had replicated here.
+    async fn foreign_job(store: &crate::store::Store, ip_id: i64, level: i64, queued_at: &str) {
+        let other = Identity::generate().unwrap().id;
+        sqlx::query(
+            "INSERT INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at)
+             VALUES (lower(hex(randomblob(16))), ?1, ?1, 1, ?2, ?3, 'queued', ?4)",
+        )
+        .bind(&other.0[..])
+        .bind(ip_id)
+        .bind(level)
+        .bind(queued_at)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Two arbiters queued the same IP: only the job that ranks first
+    /// (level, then queued_at, then uid) is granted; the other is
+    /// superseded for good.
+    #[tokio::test]
+    async fn the_same_ip_queued_by_two_arbiters_is_granted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        let rec = Recorder::Cluster(node.clone());
+        let scanner = Identity::generate().unwrap().id;
+        let ip = store
+            .upsert_ip("203.0.113.82".parse().unwrap())
+            .await
+            .unwrap();
+        rec.enqueue_scan(ip.id, 2, 24).await.unwrap();
+        let ours: String = sqlx::query_scalar("SELECT uid FROM scan_jobs WHERE ip_id = ?")
+            .bind(ip.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        // Queued later elsewhere, or at a lower level: ours runs.
+        foreign_job(&store, ip.id, 2, "2999-01-01 00:00:00").await;
+        foreign_job(&store, ip.id, 1, "2000-01-01 00:00:00").await;
+        let g = arbiter.next_job(scanner).await.unwrap().unwrap();
+        assert_eq!(g.job_uid, ours);
+        assert!(arbiter.complete(scanner, &ours, "later", None).await);
+        // Queued earlier elsewhere at the same level: that one runs, ours
+        // is superseded and nothing else is granted here.
+        foreign_job(&store, ip.id, 2, "2000-01-01 00:00:00").await;
+        assert!(arbiter.next_job(node.id()).await.unwrap().is_none());
+        assert_eq!(status(&store, &ours).await, "superseded");
     }
 
     /// Jobs a scanner handed back must not hide the jobs behind them.

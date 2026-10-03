@@ -103,6 +103,10 @@ be listed under `[[cluster.peers]]` with their key.
 - A scanner checks each job an arbiter grants against its own copy of the
   job and runs it only when requests it holds back the level;
   `scan.trusted_origins` limits whose requests count.
+- When two nodes queue the same IP before either job has reached the
+  other, only one of them is scanned: the higher level, else the one
+  queued first. Arbiters and scanners both apply this, and the other job
+  ends as "superseded".
 - Every member sees everything the cluster records, including raw requests
   and false-positive claims with their optional contact address. Every
   member can export the whole dataset (`peephole export`, or Admin →

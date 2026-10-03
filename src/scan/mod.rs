@@ -110,6 +110,35 @@ fn locally_refused(ip: &IpAddr, never: &[ipnet::IpNet]) -> Option<Refusal> {
         .map(|n| Refusal::Mine(format!("never_scan {n}")))
 }
 
+/// The job that job `uid` gives way to, if any: a scan of the same IP at
+/// its level or higher that is running, or a queued job of another arbiter
+/// that ranks first (higher level, then earlier `queued_at`, then lower
+/// uid). Decided from replicated rows only, so when two arbiters queued
+/// the same IP, every arbiter and scanner that holds both jobs lets the
+/// same one run and supersedes the other. Adoption keeps a job's uid and
+/// `queued_at`, so its rank survives a takeover.
+pub(crate) async fn outranked_by(
+    pool: &sqlx::SqlitePool,
+    uid: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT o.uid FROM scan_jobs j JOIN scan_jobs o ON o.ip_id = j.ip_id AND o.uid != j.uid
+         WHERE j.uid = ?
+           AND ((o.status = 'running' AND o.level >= j.level
+                 AND o.started_at > datetime('now', ?)
+                 AND o.started_at <= datetime('now', '+10 minutes'))
+             OR (o.status = 'queued' AND o.arbiter IS NOT NULL AND o.arbiter IS NOT j.arbiter
+                 AND (o.level > j.level OR (o.level = j.level
+                      AND (o.queued_at < j.queued_at
+                           OR (o.queued_at = j.queued_at AND o.uid < j.uid))))))
+         LIMIT 1",
+    )
+    .bind(uid)
+    .bind(format!("-{} hours", pace::STALE_RUNNING_HOURS))
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// A scan to run, and who to report it to.
 #[derive(Clone)]
 enum Job {
@@ -173,6 +202,9 @@ struct Source {
     deferred: std::sync::Mutex<HashMap<i64, Instant>>,
     tor_warned: std::sync::Mutex<Option<Instant>>,
     unreachable: std::sync::Mutex<HashMap<NodeId, Instant>>,
+    /// Granted jobs this scanner runs now: IP (canonical) and level. Known
+    /// before the job's state replicates anywhere.
+    active: std::sync::Mutex<HashMap<IpAddr, u8>>,
 }
 
 /// Hours since a `YYYY-MM-DD HH:MM:SS` (UTC) time; unparsable: infinite.
@@ -195,6 +227,7 @@ impl Source {
             deferred: Default::default(),
             tor_warned: Default::default(),
             unreachable: Default::default(),
+            active: Default::default(),
             rec,
             cfg,
             pace,
@@ -379,7 +412,13 @@ impl Source {
             };
             let Some(g) = grant else { continue };
             match self.check_grant(arbiter, &g).await? {
-                Ok(job) => return Ok(Some(job)),
+                Ok(job) => {
+                    self.active
+                        .lock()
+                        .unwrap()
+                        .insert(crate::net::canonical(job.ip()), job.level());
+                    return Ok(Some(job));
+                }
                 Err((status, why)) => {
                     info!(job = %g.job_uid, target = %g.ip, status, why = why.as_deref().unwrap_or(""), "scan grant turned down");
                     // In the background: the retries must not stall the
@@ -439,6 +478,18 @@ impl Source {
                 Some("grant does not match the job".into()),
             )));
         }
+        // Already scanning it here (another arbiter's job for the same IP
+        // whose state has not replicated yet): covered, or not now.
+        let running = self
+            .active
+            .lock()
+            .unwrap()
+            .get(&crate::net::canonical(ip))
+            .copied();
+        if let Some(l) = running {
+            let why = Some(format!("this scanner is scanning the IP at level {l}"));
+            return Ok(Err((if l >= level { "superseded" } else { "later" }, why)));
+        }
         let ev = guard::evidence(pool, &ip_text, &self.origins).await?;
         let allowed = ev.allowed_level(&self.cfg.scan.safety);
         if allowed < level {
@@ -467,6 +518,11 @@ impl Source {
         // Our stored spelling: the arbiter's may differ (same_ip allows it).
         if self.duplicate(&g.job_uid, &ip_text, g.level).await? {
             return Ok(Err(("superseded", None)));
+        }
+        // Arbiters older than this check grant a job that lost the tie-break.
+        if let Some(other) = outranked_by(pool, &g.job_uid).await? {
+            let why = format!("job {other} for this IP ranks first");
+            return Ok(Err(("superseded", Some(why))));
         }
         Ok(Ok(Job::Granted {
             arbiter,
@@ -536,6 +592,12 @@ impl Source {
 
     /// Record a finished job.
     async fn finish(&self, job: &Job, outcome: Outcome) {
+        if let Job::Granted { ip, .. } = job {
+            self.active
+                .lock()
+                .unwrap()
+                .remove(&crate::net::canonical(*ip));
+        }
         match (job, self.node()) {
             (Job::Local { id, .. }, _) => {
                 let r = match &outcome {
@@ -1504,6 +1566,63 @@ license_key = "k"
             .await
             .unwrap();
         assert_eq!(turned(r), Some("declined"));
+    }
+
+    /// A grant for an IP this scanner is scanning now, or for a job that
+    /// loses the tie-break against another arbiter's job for the same IP,
+    /// does not run (whatever the arbiter's version).
+    #[tokio::test]
+    async fn grants_for_an_ip_already_taken_do_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, source, store) = cluster_source(dir.path(), "").await;
+        let me = node.id();
+        let rec = Recorder::Cluster(node.clone());
+        let ip = store
+            .upsert_ip("203.0.113.73".parse().unwrap())
+            .await
+            .unwrap();
+        for label in ["a", "b", "c"] {
+            rec.insert_request(&request(ip.id, 2, label)).await.unwrap();
+        }
+        rec.enqueue_scan(ip.id, 2, 24).await.unwrap();
+        let uid = job_uid(&store, ip.id).await;
+        let turned = |r: Result<Job, Turndown>| r.err().map(|(s, _)| s);
+        // Scanning it here already: at this level it is covered; at a lower
+        // one the grant comes back later.
+        let addr: IpAddr = ip.ip.parse().unwrap();
+        for (active, want) in [(2, "superseded"), (1, "later")] {
+            source.active.lock().unwrap().insert(addr, active);
+            let r = source.check_grant(me, &grant(&uid, &ip.ip, 2)).await;
+            assert_eq!(turned(r.unwrap()), Some(want));
+        }
+        source.active.lock().unwrap().clear();
+        assert!(
+            source
+                .check_grant(me, &grant(&uid, &ip.ip, 2))
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        // Another arbiter queued the IP earlier: its job runs, not ours.
+        let other = crate::cluster::identity::Identity::generate().unwrap().id;
+        sqlx::query(
+            "INSERT INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at)
+             VALUES ('other-job', ?1, ?1, 1, ?2, 2, 'queued', '2000-01-01 00:00:00')",
+        )
+        .bind(&other.0[..])
+        .bind(ip.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let r = source
+            .check_grant(me, &grant(&uid, &ip.ip, 2))
+            .await
+            .unwrap();
+        let (status, why) = r.err().unwrap();
+        assert_eq!(status, "superseded");
+        assert!(why.unwrap().contains("other-job"));
+        // ... and the other way round, that job is the one that runs.
+        assert_eq!(outranked_by(&store.pool, "other-job").await.unwrap(), None);
     }
 
     /// An outbound-only member has no published address; the address it
