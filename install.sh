@@ -303,7 +303,7 @@ UNIT_FILE="/etc/systemd/system/peephole.service"
 OLD_RULES_MANIFEST="${DATA_DIR}/.installed-rules.sha256"
 UNIT_MANIFEST="${DATA_DIR}/.installed-unit.sha256"
 # Units earlier installers wrote without recording them: unedited if they match.
-KNOWN_UNIT_SUMS="da20ef8147a9f2a9e704318e80ce381adc7b222fc5b21706bc1f5fd3bd4c5cb2"
+KNOWN_UNIT_SUMS="da20ef8147a9f2a9e704318e80ce381adc7b222fc5b21706bc1f5fd3bd4c5cb2 38da8e128f109b566c222e2b5a44ff486893981057371225ddf1bd7e1d4aa8ae"
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }

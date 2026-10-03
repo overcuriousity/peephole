@@ -20,8 +20,18 @@ RestartSec=5
 TimeoutStartSec=5min
 # A scanner flood opens many connections at once; the default 1024 runs out.
 LimitNOFILE=65536
-# Runs as root by design (nmap -sS/-O). nmap is spawned with fixed argv, no shell.
-NoNewPrivileges=false
+# Runs as root (nmap -sS/-O), but with only the capabilities it uses: raw
+# sockets for nmap, low ports for listeners, reading operator files whatever
+# their mode. nmap is spawned with fixed argv, no shell.
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+# Only options that need no mount namespace: these also work in unprivileged
+# LXC containers without nesting. AF_PACKET and AF_NETLINK are nmap's.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
