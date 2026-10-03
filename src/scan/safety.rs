@@ -5,8 +5,9 @@
 //! Member addresses come from three places: the configured and published
 //! `host:port` of each member (resolved via DNS), and the source addresses
 //! members actually connected from (outbound-only members have no published
-//! address). A failed DNS lookup keeps the previous resolution and is
-//! retried within a minute instead of leaving the set short.
+//! address), kept for a week after they were last seen. A failed DNS lookup
+//! keeps the previous resolution and is retried within a minute instead of
+//! leaving the set short.
 //!
 //! A member's published address is its own claim: a hostile member could
 //! publish a victim's host name to shield the victim from scans. Refusing
@@ -29,6 +30,11 @@ const REFRESH: Duration = Duration::from_secs(300);
 const RETRY: Duration = Duration::from_secs(60);
 /// Per DNS lookup.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+/// Addresses members connected from are forgotten this long after the
+/// member stopped showing up from them ...
+const OBSERVED_KEEP: Duration = Duration::from_secs(7 * 24 * 3600);
+/// ... or, beyond this many, oldest first.
+const OBSERVED_MAX: usize = 4096;
 
 pub struct Safety {
     /// Host names (`host:port`) resolved before, kept when a lookup fails.
@@ -37,8 +43,9 @@ pub struct Safety {
     own: HashSet<IpAddr>,
     /// Published member addresses, and whose they are.
     published: HashMap<IpAddr, String>,
-    /// Addresses members connected from, and whose they are.
-    observed: HashMap<IpAddr, String>,
+    /// Addresses members connected from, whose they are, and when that
+    /// was last seen.
+    observed: HashMap<IpAddr, (String, Instant)>,
     built: Option<Instant>,
     retry: bool,
     lists: Lists,
@@ -67,10 +74,12 @@ impl Safety {
                 .values()
                 .map(|m| (m.id, m.name.clone()))
                 .collect();
+            let now = Instant::now();
             for (id, ip) in node.status.peer_ips() {
                 let who = names.get(&id).cloned().unwrap_or_else(|| id.short());
-                self.observed.insert(ip, who);
+                self.observed.insert(ip, (who, now));
             }
+            prune_observed(&mut self.observed, now);
         }
         let due = if self.retry { RETRY } else { REFRESH };
         if self.built.is_some_and(|t| t.elapsed() < due) {
@@ -156,7 +165,7 @@ impl Safety {
         if self.own.contains(&ip) {
             return Some("this node's own address".into());
         }
-        if let Some(who) = self.observed.get(&ip) {
+        if let Some((who, _)) = self.observed.get(&ip) {
             return Some(format!("cluster member address ({who})"));
         }
         if let Some(who) = self.published.get(&ip) {
@@ -186,6 +195,26 @@ impl Safety {
             .chain(self.published.keys())
             .any(|ip| net.contains(ip))
             || self.lists.nets.iter().any(|(n, _)| nets_overlap(n, net))
+    }
+}
+
+/// Drop observed addresses not seen for [`OBSERVED_KEEP`], then the oldest
+/// beyond [`OBSERVED_MAX`]. Addresses seen `now` (the ones members connect
+/// from at present) are always kept.
+fn prune_observed(observed: &mut HashMap<IpAddr, (String, Instant)>, now: Instant) {
+    observed.retain(|_, (_, seen)| now.duration_since(*seen) < OBSERVED_KEEP);
+    if observed.len() <= OBSERVED_MAX {
+        return;
+    }
+    let mut old: Vec<(Instant, IpAddr)> = observed
+        .iter()
+        .filter(|(_, (_, seen))| *seen < now)
+        .map(|(ip, (_, seen))| (*seen, *ip))
+        .collect();
+    old.sort_unstable();
+    let excess = observed.len() - OBSERVED_MAX;
+    for (_, ip) in old.into_iter().take(excess) {
+        observed.remove(&ip);
     }
 }
 
@@ -428,6 +457,31 @@ mod tests {
         assert!(s.refuses(&"203.0.113.81".parse().unwrap()).is_none());
         // Kept out of the blocklist's networks too.
         assert!(s.overlaps(&"198.51.100.0/24".parse().unwrap()));
+    }
+
+    #[test]
+    fn observed_addresses_expire_and_are_capped() {
+        let now = Instant::now() + OBSERVED_KEEP * 2;
+        let ip = |i: u32| IpAddr::V4(std::net::Ipv4Addr::from(0xcb00_7100 + i));
+        let mut m: HashMap<IpAddr, (String, Instant)> = HashMap::new();
+        m.insert(ip(0), ("gone".into(), now - OBSERVED_KEEP));
+        m.insert(ip(1), ("recent".into(), now - Duration::from_secs(60)));
+        prune_observed(&mut m, now);
+        assert!(!m.contains_key(&ip(0)), "not seen for a week");
+        assert!(m.contains_key(&ip(1)));
+        // Over the cap: the oldest go, the ones seen now always stay.
+        for i in 2..OBSERVED_MAX as u32 + 2 {
+            m.insert(ip(i), ("old".into(), now - Duration::from_secs(i as u64)));
+        }
+        m.insert(ip(1_000_000), ("current".into(), now));
+        prune_observed(&mut m, now);
+        assert_eq!(m.len(), OBSERVED_MAX);
+        assert!(m.contains_key(&ip(1_000_000)));
+        assert!(m.contains_key(&ip(1)), "recent ones stay");
+        assert!(
+            !m.contains_key(&ip(OBSERVED_MAX as u32 + 1)),
+            "the oldest go"
+        );
     }
 
     #[tokio::test]
