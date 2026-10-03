@@ -83,8 +83,9 @@ enum Refusal {
     Never(String),
     /// This scanner's own `never_scan` covers it; another scanner may take it.
     Mine(String),
-    /// Not now (Tor status unknown): standalone the job waits, in a
-    /// cluster it is handed back for another scanner.
+    /// Not now (Tor status unknown, never-scan lists not loaded):
+    /// standalone the job waits, in a cluster it is handed back for another
+    /// scanner.
     Defer(String),
 }
 
@@ -268,12 +269,16 @@ impl Source {
             if let Some(why) = s.refuses(ip) {
                 return Ok(Some(Refusal::Never(why)));
             }
+            // Fail closed: what the lists cover is not known.
+            if let Some(why) = s.unavailable() {
+                return Ok(Some(Refusal::Defer(why)));
+            }
             if let Some(why) = s.listed(ip) {
                 return Ok(Some(Refusal::Mine(why)));
             }
         }
         let local = self.tor.lock().unwrap().local(ip);
-        match guard::tor_status(&self.rec.store().pool, local, ip_text).await? {
+        match guard::tor_status(&self.rec.store().pool, local, ip_text, &self.origins).await? {
             guard::TorStatus::Exit => return Ok(Some(Refusal::Never("Tor exit".into()))),
             guard::TorStatus::NotExit => {}
             guard::TorStatus::Unknown => {

@@ -15,7 +15,7 @@ use crate::classify::Classifier;
 use crate::classify::stored::{History, StoredRequest};
 use crate::cluster::identity::NodeId;
 use crate::config::ScanSafety;
-use crate::intel::tor::{MIN_EXITS, TorExitList};
+use crate::intel::tor::{self, MIN_EXITS, TorExitList};
 use anyhow::Result;
 use ipnet::IpNet;
 use sqlx::SqlitePool;
@@ -285,11 +285,14 @@ pub enum TorStatus {
 
 /// The scanner's own view of the exit list file (`<data_dir>/tor-exit.txt`,
 /// fetched or copied from the cluster by the intel scheduler), reloaded when
-/// the file changes. A list that fails the sanity check counts as none.
+/// the file changes. A list that fails the sanity check, or whose file is
+/// older than [`tor::MAX_AGE`] (fetching kept failing), counts as none.
 pub struct TorView {
     path: PathBuf,
     stamp: Option<(SystemTime, u64)>,
     list: Option<TorExitList>,
+    /// The loaded list went stale (warned once).
+    stale: bool,
 }
 
 impl TorView {
@@ -298,6 +301,7 @@ impl TorView {
             path: data_dir.join("tor-exit.txt"),
             stamp: None,
             list: None,
+            stale: false,
         }
     }
 
@@ -305,43 +309,64 @@ impl TorView {
         let stamp = std::fs::metadata(&self.path)
             .ok()
             .and_then(|m| Some((m.modified().ok()?, m.len())));
-        if stamp == self.stamp {
-            return;
+        if stamp != self.stamp {
+            self.stamp = stamp;
+            self.list = stamp
+                .and_then(|_| TorExitList::load(self.path.parent()?).ok())
+                .filter(|l| l.len() as u64 > MIN_EXITS);
         }
-        self.stamp = stamp;
-        self.list = stamp
-            .and_then(|_| TorExitList::load(self.path.parent()?).ok())
-            .filter(|l| l.len() as u64 > MIN_EXITS);
+        // On every call: an unchanged file still ages.
+        let stale = self.list.is_some() && stamp.is_some_and(|(t, _)| tor::too_old(t));
+        if stale && !self.stale {
+            tracing::warn!(
+                file = %self.path.display(),
+                "tor exit list older than {} h: the Tor status of IPs is unknown \
+                 until a fresh list loads (see scan.tor_unknown)",
+                tor::MAX_AGE.as_secs() / 3600
+            );
+        }
+        self.stale = stale;
     }
 
-    /// Whether a sane list is loaded.
+    /// The list, if a sane and fresh one is loaded.
+    fn current(&mut self) -> Option<&TorExitList> {
+        self.refresh();
+        self.list.as_ref().filter(|_| !self.stale)
+    }
+
+    /// Whether a sane, fresh list is loaded.
     pub fn loaded(&mut self) -> bool {
-        self.refresh();
-        self.list.is_some()
+        self.current().is_some()
     }
 
-    /// Local list hit, then any node's recorded result.
+    /// Whether the loaded list holds `ip`; None without a usable list.
     pub fn local(&mut self, ip: &IpAddr) -> Option<bool> {
-        self.refresh();
-        self.list
-            .as_ref()
+        self.current()
             .map(|l| l.contains(&crate::net::canonical(*ip)))
     }
 }
 
 /// How long a recorded "not an exit" holds. Exit lists change daily; an
-/// older verdict counts as unknown (an "exit" always counts).
-const NOT_EXIT_MAX_AGE_HOURS: i64 = 72;
+/// older verdict counts as unknown (an "exit" always counts). As old as an
+/// exit list may get ([`tor::MAX_AGE`]).
+const NOT_EXIT_MAX_AGE_HOURS: i64 = (tor::MAX_AGE.as_secs() / 3600) as i64;
 
 /// Tor status of `ip` (its text as stored): this node's list, and the
-/// results every node recorded (`ip_intel`). Any "exit" wins; a "not an
-/// exit" counts only while fresh.
-pub async fn tor_status(pool: &SqlitePool, local: Option<bool>, ip: &str) -> Result<TorStatus> {
+/// results recorded by every node (`ip_intel`). Any "exit" wins; a "not an
+/// exit" counts only while fresh and only from an origin `origins` admits,
+/// as request evidence does (an untrusted node's word could otherwise clear
+/// a Tor exit for scanning).
+pub async fn tor_status(
+    pool: &SqlitePool,
+    local: Option<bool>,
+    ip: &str,
+    origins: &Origins,
+) -> Result<TorStatus> {
     if local == Some(true) {
         return Ok(TorStatus::Exit);
     }
-    let rows: Vec<(String, bool)> = sqlx::query_as(
-        "SELECT data_json, fetched_at >= datetime('now', ?) FROM ip_intel
+    let rows: Vec<(String, bool, Vec<u8>)> = sqlx::query_as(
+        "SELECT data_json, fetched_at >= datetime('now', ?), origin FROM ip_intel
          WHERE ip = ? AND provider = ?",
     )
     .bind(format!("-{NOT_EXIT_MAX_AGE_HOURS} hours"))
@@ -351,12 +376,14 @@ pub async fn tor_status(pool: &SqlitePool, local: Option<bool>, ip: &str) -> Res
     .await?;
     let said: Vec<bool> = rows
         .iter()
-        .filter_map(|(r, fresh)| {
+        .filter_map(|(r, fresh, origin)| {
             let exit = serde_json::from_str::<serde_json::Value>(r)
                 .ok()?
                 .get("exit")?
                 .as_bool()?;
-            (exit || *fresh).then_some(exit)
+            // An empty origin is this node's (standalone) result.
+            let trusted = || origins.admits((!origin.is_empty()).then_some(&origin[..]));
+            (exit || (*fresh && trusted())).then_some(exit)
         })
         .collect();
     Ok(if said.contains(&true) {
@@ -796,15 +823,21 @@ mod tests {
         let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
         let p = &store.pool;
         assert_eq!(
-            tor_status(p, None, "198.51.100.9").await.unwrap(),
+            tor_status(p, None, "198.51.100.9", &Origins::Any)
+                .await
+                .unwrap(),
             TorStatus::Unknown
         );
         assert_eq!(
-            tor_status(p, Some(false), "198.51.100.9").await.unwrap(),
+            tor_status(p, Some(false), "198.51.100.9", &Origins::Any)
+                .await
+                .unwrap(),
             TorStatus::NotExit
         );
         assert_eq!(
-            tor_status(p, Some(true), "198.51.100.9").await.unwrap(),
+            tor_status(p, Some(true), "198.51.100.9", &Origins::Any)
+                .await
+                .unwrap(),
             TorStatus::Exit
         );
         let rec = store.local();
@@ -817,7 +850,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            tor_status(p, None, "198.51.100.9").await.unwrap(),
+            tor_status(p, None, "198.51.100.9", &Origins::Any)
+                .await
+                .unwrap(),
             TorStatus::NotExit
         );
         rec.record_intel(
@@ -830,7 +865,9 @@ mod tests {
         .unwrap();
         // Another node's "exit" beats our list's silence.
         assert_eq!(
-            tor_status(p, Some(false), "198.51.100.10").await.unwrap(),
+            tor_status(p, Some(false), "198.51.100.10", &Origins::Any)
+                .await
+                .unwrap(),
             TorStatus::Exit
         );
         // A stale "not an exit" is unknown again; a stale "exit" still counts.
@@ -839,11 +876,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            tor_status(p, None, "198.51.100.9").await.unwrap(),
+            tor_status(p, None, "198.51.100.9", &Origins::Any)
+                .await
+                .unwrap(),
             TorStatus::Unknown
         );
         assert_eq!(
-            tor_status(p, None, "198.51.100.10").await.unwrap(),
+            tor_status(p, None, "198.51.100.10", &Origins::Any)
+                .await
+                .unwrap(),
             TorStatus::Exit
         );
     }
@@ -860,5 +901,82 @@ mod tests {
         assert!(v.loaded());
         assert_eq!(v.local(&"198.18.0.7".parse().unwrap()), Some(true));
         assert_eq!(v.local(&"198.51.100.1".parse().unwrap()), Some(false));
+    }
+
+    /// A list nobody managed to refresh for [`tor::MAX_AGE`] counts as none,
+    /// also when the file did not change since it loaded.
+    #[test]
+    fn tor_view_drops_a_stale_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tor-exit.txt");
+        let list: String = (1..=150).map(|i| format!("198.18.0.{i}\n")).collect();
+        std::fs::write(&path, list).unwrap();
+        let mut v = TorView::new(dir.path());
+        assert!(v.loaded());
+        // The file ages in place: same stamp as when it loaded.
+        let old = SystemTime::now() - tor::MAX_AGE - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        v.stamp = Some((old, v.stamp.unwrap().1));
+        assert!(!v.loaded());
+        assert_eq!(v.local(&"198.18.0.7".parse().unwrap()), None, "unknown");
+        // Loaded stale from the start: none either.
+        let mut restarted = TorView::new(dir.path());
+        assert!(!restarted.loaded());
+        // A fresh file counts again.
+        let list: String = (1..=150).map(|i| format!("198.18.1.{i}\n")).collect();
+        std::fs::write(&path, list).unwrap();
+        assert_eq!(v.local(&"198.18.1.7".parse().unwrap()), Some(true));
+    }
+
+    /// `scan.trusted_origins`: a "not an exit" counts only from a trusted
+    /// node (or this one); an "exit" from anyone.
+    #[tokio::test]
+    async fn tor_status_trusts_only_admitted_origins_with_not_an_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let p = &store.pool;
+        let rec = store.local();
+        for (ip, exit) in [("198.51.100.20", false), ("198.51.100.21", true)] {
+            rec.record_intel(
+                ip,
+                crate::intel::TOR,
+                None,
+                serde_json::json!({ "exit": exit }),
+            )
+            .await
+            .unwrap();
+        }
+        let other = crate::cluster::identity::Identity::generate().unwrap().id;
+        sqlx::query("UPDATE ip_intel SET origin = ?")
+            .bind(other.0.to_vec())
+            .execute(p)
+            .await
+            .unwrap();
+        let only_me = Origins::Only {
+            me: None,
+            others: HashSet::new(),
+        };
+        let trusting = Origins::Only {
+            me: None,
+            others: HashSet::from([other]),
+        };
+        let cases = [
+            ("198.51.100.20", &only_me, TorStatus::Unknown),
+            ("198.51.100.20", &trusting, TorStatus::NotExit),
+            ("198.51.100.20", &Origins::Any, TorStatus::NotExit),
+            ("198.51.100.21", &only_me, TorStatus::Exit),
+        ];
+        for (ip, origins, want) in cases {
+            assert_eq!(
+                tor_status(p, None, ip, origins).await.unwrap(),
+                want,
+                "{ip}"
+            );
+        }
     }
 }

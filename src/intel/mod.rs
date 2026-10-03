@@ -517,6 +517,22 @@ async fn refresh_maxmind(
     Ok(())
 }
 
+/// Unload the exit list once its file is older than [`tor::MAX_AGE`]
+/// (fetching or copying it kept failing): from a stale list the trap would
+/// record "not an exit" for exits that appeared since, and scanners believe
+/// that. Without a list their Tor status is unknown (`scan.tor_unknown`);
+/// IPs already recorded as exits stay exits.
+fn drop_stale_tor(tor: &SharedTor, cfg: &Config) {
+    if tor.read().unwrap().is_empty() || !tor::stale(&cfg.data_dir) {
+        return;
+    }
+    warn!(
+        "tor exit list older than {} h: unloaded until a fresh one is fetched",
+        tor::MAX_AGE.as_secs() / 3600
+    );
+    *tor.write().unwrap() = tor::TorExitList::default();
+}
+
 /// Warn, at most hourly, while no Tor exit list is loaded: Tor exits cannot
 /// be told apart from scanners then (see `scan.tor_unknown`).
 fn warn_without_tor_list(tor: &SharedTor, cfg: &Config, last: &mut Option<std::time::Instant>) {
@@ -585,6 +601,7 @@ pub async fn run_scheduler(
                     tor_next = now + wait;
                 }
             }
+            drop_stale_tor(&tor, &cfg);
             warn_without_tor_list(&tor, &cfg, &mut warned);
         }
         if now >= mm_next {
@@ -742,6 +759,7 @@ async fn run_cluster(
                 }
             }
         }
+        drop_stale_tor(&tor, &cfg);
         warn_without_tor_list(&tor, &cfg, &mut warned);
         // Every node with credentials keeps its own databases fresh.
         if std::time::Instant::now() >= mm_next {
@@ -789,6 +807,33 @@ mod tests {
             m.fail();
         }
         assert_eq!(m.fail().as_secs(), 7200);
+    }
+
+    /// A list whose file went stale is unloaded, so the trap stops
+    /// recording "not an exit" from it.
+    #[test]
+    fn a_stale_tor_list_is_unloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "database_path = \"{d}/t.db\"\ndata_dir = \"{d}\"\n",
+            d = dir.path().display()
+        ))
+        .unwrap();
+        let path = dir.path().join("tor-exit.txt");
+        std::fs::write(&path, "198.51.100.1\n").unwrap();
+        let shared: SharedTor =
+            Arc::new(RwLock::new(tor::TorExitList::load(&cfg.data_dir).unwrap()));
+        drop_stale_tor(&shared, &cfg);
+        assert!(!shared.read().unwrap().is_empty(), "fresh: kept");
+        let old = std::time::SystemTime::now() - tor::MAX_AGE - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        drop_stale_tor(&shared, &cfg);
+        assert!(shared.read().unwrap().is_empty());
     }
 
     #[test]
