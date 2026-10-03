@@ -123,22 +123,21 @@ fn body_bounds(member: bool) -> (usize, Duration) {
 }
 
 /// The request with its body read in full, at most `limit` bytes within
-/// `timeout`; a slow or oversized body is answered here and never reaches
-/// a handler.
+/// `timeout`; a slow or oversized body is answered here (with the error)
+/// and never reaches a handler.
 async fn read_body(
     req: axum::extract::Request,
     (limit, timeout): (usize, Duration),
-) -> Result<axum::extract::Request, axum::response::Response> {
+) -> Result<axum::extract::Request, (axum::http::StatusCode, &'static str)> {
     use axum::http::StatusCode;
-    use axum::response::IntoResponse;
     let (parts, body) = req.into_parts();
     match tokio::time::timeout(timeout, axum::body::to_bytes(body, limit)).await {
         Ok(Ok(bytes)) => Ok(axum::extract::Request::from_parts(
             parts,
             axum::body::Body::from(bytes),
         )),
-        Ok(Err(_)) => Err((StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response()),
-        Err(_) => Err((StatusCode::REQUEST_TIMEOUT, "body too slow").into_response()),
+        Ok(Err(_)) => Err((StatusCode::PAYLOAD_TOO_LARGE, "body too large")),
+        Err(_) => Err((StatusCode::REQUEST_TIMEOUT, "body too slow")),
     }
 }
 
@@ -229,7 +228,7 @@ pub async fn serve(
                             }
                             let resp = match read_body(req, body_bounds(member)).await {
                                 Ok(req) => next.run(req).await,
-                                Err(resp) => resp,
+                                Err(e) => axum::response::IntoResponse::into_response(e),
                             };
                             if counts {
                                 seen.last_ms.store(now_ms(), Ordering::Relaxed);
@@ -321,13 +320,13 @@ mod tests {
         let big = read_body(req(Body::from("far too large")), bounds)
             .await
             .unwrap_err();
-        assert_eq!(big.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(big.0, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         let stalled = futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from("x")) })
             .chain(futures::stream::pending());
         let slow = read_body(req(Body::from_stream(stalled)), bounds)
             .await
             .unwrap_err();
-        assert_eq!(slow.status(), axum::http::StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(slow.0, axum::http::StatusCode::REQUEST_TIMEOUT);
         assert!(body_bounds(false).1 < body_bounds(true).1);
     }
 }

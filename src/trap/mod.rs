@@ -136,12 +136,16 @@ impl BodyHold {
     fn grow(&mut self, by: usize) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         let b = &self.budget;
-        let fits = b
-            .used
-            .fetch_update(SeqCst, SeqCst, |u| {
-                u.checked_add(by).filter(|t| *t <= b.cap)
-            })
-            .is_ok();
+        let mut used = b.used.load(SeqCst);
+        let fits = loop {
+            let Some(next) = used.checked_add(by).filter(|t| *t <= b.cap) else {
+                break false;
+            };
+            match b.used.compare_exchange_weak(used, next, SeqCst, SeqCst) {
+                Ok(_) => break true,
+                Err(now) => used = now,
+            }
+        };
         if fits {
             self.n += by;
         }
