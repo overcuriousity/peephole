@@ -118,6 +118,8 @@ secure_cookies = false
     let cfg = peephole::config::Config::load(&cfg_path).unwrap();
     let node = tokio::spawn(peephole::run(cfg_path));
     eventually("trap up", trap, true).await;
+    // The admin listener binds after the trap's.
+    eventually("admin up", admin, true).await;
 
     // An admin with the queue page open.
     let store = Store::connect(&cfg.database_path).await.unwrap();

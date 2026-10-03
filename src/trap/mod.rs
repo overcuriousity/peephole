@@ -75,7 +75,7 @@ pub struct Guards {
     /// Light rows of the requests the flood gate skips.
     pub skips: skiplog::SkipLog,
     /// Trap requests being handled or recorded right now.
-    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    in_flight: std::sync::Arc<Counter>,
     /// Bounds the recordings running apart from their answers.
     recording: RecordSlots,
 }
@@ -99,6 +99,7 @@ impl Guards {
     /// Count a request as in flight until the returned guard is dropped.
     pub fn enter(&self) -> InFlight {
         self.in_flight
+            .n
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         InFlight(self.in_flight.clone())
     }
@@ -114,24 +115,39 @@ impl Guards {
     }
 
     fn in_flight(&self) -> usize {
-        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+        self.in_flight.n.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Wait until no request is in flight: every request answered so far
     /// is recorded (requests are recorded after they are answered).
     pub async fn settled(&self) {
-        while self.in_flight() > 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        loop {
+            // Registered before the check, so a last guard dropped in
+            // between still wakes us.
+            let idle = self.in_flight.idle.notified();
+            if self.in_flight() == 0 {
+                return;
+            }
+            idle.await;
         }
     }
 }
 
+/// Requests in flight, and a wake-up for whoever waits for none.
+#[derive(Default)]
+struct Counter {
+    n: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
 /// A trap request in progress (see [`Guards::enter`]).
-pub struct InFlight(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+pub struct InFlight(std::sync::Arc<Counter>);
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if self.0.n.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
     }
 }
 
