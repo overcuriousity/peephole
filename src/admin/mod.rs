@@ -161,7 +161,7 @@ async fn security_headers(
     // signed-in admin: never cache those responses either.
     let signed_in = carries_session(req.headers());
 
-    let mut res = next.run(req).await;
+    let mut res = error::SIGNED_IN.scope(signed_in, next.run(req)).await;
     let h = res.headers_mut();
     h.insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
@@ -296,5 +296,32 @@ mod tests {
         let h = headers("/", Some("theme=dark")).await;
         assert!(!h.contains_key(axum::http::header::CACHE_CONTROL));
         assert_eq!(h[axum::http::header::VARY], "Cookie");
+    }
+
+    #[tokio::test]
+    async fn error_page_nav_follows_the_session_cookie() {
+        let body = |cookie: Option<&'static str>| async move {
+            let app = axum::Router::new()
+                .fallback(error::not_found)
+                .layer(axum::middleware::from_fn(security_headers));
+            let mut req = axum::http::Request::get("/nowhere");
+            if let Some(c) = cookie {
+                req = req.header(axum::http::header::COOKIE, c);
+            }
+            let res = app
+                .oneshot(req.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), axum::http::StatusCode::NOT_FOUND);
+            let b = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(b.to_vec()).unwrap()
+        };
+        let signed_in = body(Some("__Host-peephole_session=x")).await;
+        assert!(signed_in.contains("Log out"), "{signed_in}");
+        let anonymous = body(None).await;
+        assert!(anonymous.contains("Admin login"), "{anonymous}");
+        assert!(!anonymous.contains("Log out"));
     }
 }

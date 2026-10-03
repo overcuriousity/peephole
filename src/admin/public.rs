@@ -73,7 +73,7 @@ async fn wall(
     Query(q): Query<RangeQuery>,
 ) -> AppResult<Html<String>> {
     let range = Range::parse(q.range.as_deref());
-    let stats = state.stats_cache.stats(&state.store, range).await?;
+    let stats = wall_stats(&state, authed, range).await?;
     let stale = intel_stale(&stats.intel);
     render(&WallPage {
         chrome: Chrome::new(authed, "wall"),
@@ -84,15 +84,22 @@ async fn wall(
     })
 }
 
+/// Anonymous views go through the cache; an admin always reads fresh (the
+/// wall lists recent rows, which may just have been deleted).
+async fn wall_stats(state: &AdminState, authed: bool, range: Range) -> AppResult<Arc<Stats>> {
+    Ok(if authed {
+        Arc::new(state.store.stats(range).await?)
+    } else {
+        state.stats_cache.stats(&state.store, range).await?
+    })
+}
+
 async fn stats_json(
     MaybeUser(authed): MaybeUser,
     State(state): State<Arc<AdminState>>,
     Query(q): Query<RangeQuery>,
 ) -> AppResult<Json<Arc<Stats>>> {
-    let stats = state
-        .stats_cache
-        .stats(&state.store, Range::parse(q.range.as_deref()))
-        .await?;
+    let stats = wall_stats(&state, authed, Range::parse(q.range.as_deref())).await?;
     if labels_shown(&state, authed) {
         return Ok(Json(stats));
     }
@@ -747,6 +754,11 @@ mod tests {
     }
 
     async fn app(show_labels: bool) -> (axum::Router, tempfile::TempDir) {
+        let (state, dir) = state(show_labels).await;
+        (crate::admin::full_router(state), dir)
+    }
+
+    async fn state(show_labels: bool) -> (Arc<AdminState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cfg: crate::config::Config = toml::from_str(&format!(
             r#"
@@ -792,8 +804,23 @@ show_labels = {show_labels}
             })
             .await
             .unwrap();
-        let state = Arc::new(AdminState::public_only(store, cfg));
-        (crate::admin::full_router(state), dir)
+        (Arc::new(AdminState::public_only(store, cfg)), dir)
+    }
+
+    #[tokio::test]
+    async fn admin_wall_reads_past_the_cache() {
+        let (st, _d) = state(true).await;
+        let cached = wall_stats(&st, false, Range::All).await.unwrap();
+        assert_eq!(cached.total_requests, 1);
+        let ip = st.store.ip_by_addr("203.0.113.9").await.unwrap().unwrap();
+        assert!(st.store.delete_ip(ip.id).await.unwrap());
+        // The public keeps the cached figures until they expire; an admin
+        // who just deleted sees the rows gone.
+        let public = wall_stats(&st, false, Range::All).await.unwrap();
+        assert_eq!(public.total_requests, 1);
+        let admin = wall_stats(&st, true, Range::All).await.unwrap();
+        assert_eq!(admin.total_requests, 0);
+        assert!(admin.recent.is_empty());
     }
 
     async fn get(app: &axum::Router, path: &str) -> String {

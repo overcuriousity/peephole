@@ -15,5 +15,5 @@ label = "credential-attack"
 weight = 3
 owasp = ["OAT-008", "A07:2021"]
 # HTTP Basic with the classic defaults, base64: admin:admin, root:root,
-# admin:password.
-header_regex = '''authorization:\s*basic\s+(YWRtaW46YWRtaW4=|cm9vdDpyb290|YWRtaW46cGFzc3dvcmQ=)'''
+# admin:password. The base64 values match case-sensitively.
+header_regex = '''authorization:\s*basic\s+(?-i:YWRtaW46YWRtaW4=|cm9vdDpyb290|YWRtaW46cGFzc3dvcmQ=)'''

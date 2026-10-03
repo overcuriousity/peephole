@@ -17,7 +17,7 @@ pub mod trap;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Build version, baked in by `build.rs` from `PEEPHOLE_VERSION` ("dev" locally).
 pub const VERSION: &str = env!("PEEPHOLE_VERSION");
@@ -255,6 +255,14 @@ const WEB_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// Longest wait between attempts to start a role that keeps failing.
 const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+/// A role that ran this long before its task ended is not crash-looping:
+/// its restart starts the backoff afresh.
+const RUN_STABLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The wait before the next attempt after `failures` failures in a row.
+fn retry_delay(failures: u32) -> std::time::Duration {
+    (SETTINGS_TICK * 2u32.saturating_pow(failures.saturating_sub(1))).min(RETRY_MAX)
+}
 
 /// A running role: send `true` to make it stop; the task ends by itself.
 struct Running {
@@ -278,9 +286,11 @@ struct Slot {
     /// lets its scans end). The role is not started again until it is gone:
     /// a fresh scanner would requeue the jobs it is still running.
     stopping: Option<tokio::task::JoinHandle<()>>,
-    /// Failed starts in a row, and when to try again.
+    /// Failed starts (or quick exits) in a row, and when to try again.
     failures: u32,
     next_try: Option<tokio::time::Instant>,
+    /// When the running instance started.
+    since: Option<tokio::time::Instant>,
 }
 
 /// The three roles: trap, scanner, web.
@@ -333,9 +343,26 @@ impl RoleRunner {
                 slot.stopping = None;
                 info!(role = name, "role stopped");
             }
-            // A task that ended by itself (listener error) is started afresh.
+            // A task that ended by itself (listener error) is started afresh,
+            // after a growing delay unless it had run for a while.
             if slot.running.as_ref().is_some_and(|x| x.task.is_finished()) {
                 slot.running = None;
+                if slot.since.is_some_and(|t| now - t >= RUN_STABLE) {
+                    slot.failures = 0;
+                }
+                slot.failures += 1;
+                let wait = retry_delay(slot.failures);
+                slot.next_try = Some(now + wait);
+                if slot.failures >= 3 {
+                    error!(
+                        role = name,
+                        failures = slot.failures,
+                        retry_in_secs = wait.as_secs(),
+                        "role keeps exiting"
+                    );
+                } else {
+                    warn!(role = name, retry_in_secs = wait.as_secs(), "role exited");
+                }
             }
             if !want {
                 slot.failures = 0;
@@ -361,7 +388,8 @@ impl RoleRunner {
                 Ok(x) => {
                     info!(role = name, "role started");
                     slot.running = Some(x);
-                    slot.failures = 0;
+                    // Failures are forgotten once it has run a while (above).
+                    slot.since = Some(now);
                     slot.next_try = None;
                 }
                 Err(e) if startup && from_file => {
@@ -369,8 +397,7 @@ impl RoleRunner {
                 }
                 Err(e) => {
                     slot.failures += 1;
-                    let wait =
-                        (SETTINGS_TICK * 2u32.saturating_pow(slot.failures - 1)).min(RETRY_MAX);
+                    let wait = retry_delay(slot.failures);
                     slot.next_try = Some(now + wait);
                     let why = if from_file {
                         String::new()
@@ -687,5 +714,13 @@ mod tests {
         assert!(geolite_loads(&cfg("")));
         assert!(!geolite_loads(&cfg(cluster)));
         assert!(geolite_loads(&cfg(&format!("{maxmind}{cluster}"))));
+    }
+
+    #[test]
+    fn retries_back_off_up_to_a_ceiling() {
+        assert_eq!(retry_delay(1), SETTINGS_TICK);
+        assert_eq!(retry_delay(2), SETTINGS_TICK * 2);
+        assert_eq!(retry_delay(4), SETTINGS_TICK * 8);
+        assert_eq!(retry_delay(40), RETRY_MAX);
     }
 }

@@ -483,10 +483,24 @@ fn deleted_msg(d: Deleted) -> String {
 
 /// Redirect with a one-shot notice. It travels in a short-lived cookie the
 /// page script shows and clears, so a crafted link cannot plant a message.
-fn redirect_with_notice(to: &str, msg: &str) -> Response {
-    let enc = serde_urlencoded::to_string([("m", msg)]).unwrap_or_default();
+pub(crate) fn redirect_with_notice(to: &str, msg: &str) -> Response {
+    redirect_with_flash("peephole_flash", to, msg)
+}
+
+/// [`redirect_with_notice`] for a failed action: shown as a warning.
+pub(crate) fn redirect_with_error(to: &str, msg: &str) -> Response {
+    redirect_with_flash("peephole_flash_error", to, msg)
+}
+
+fn redirect_with_flash(name: &str, to: &str, msg: &str) -> Response {
+    // An error chain can be long; a cookie cannot.
+    let mut end = msg.len().min(1000);
+    while !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    let enc = serde_urlencoded::to_string([("m", &msg[..end])]).unwrap_or_default();
     let cookie = format!(
-        "peephole_flash={}; Path=/; Max-Age=30; SameSite=Strict",
+        "{name}={}; Path=/; Max-Age=30; SameSite=Strict",
         enc.trim_start_matches("m=")
     );
     ([(axum::http::header::SET_COOKIE, cookie)], Redirect::to(to)).into_response()
@@ -927,5 +941,11 @@ mod delete_notice_tests {
         let value = c.split(';').next().unwrap();
         assert!(!value.contains(' '), "cookie value must be encoded: {c}");
         assert!(c.contains("hid+3+record"), "{c}");
+        let r = redirect_with_error("/admin/cluster", &"é".repeat(2000));
+        let c = r.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap();
+        assert!(c.starts_with("peephole_flash_error=%C3%A9"), "{c}");
+        assert!(c.len() < 4096, "a long message is cut to fit a cookie");
     }
 }

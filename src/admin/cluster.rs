@@ -3,6 +3,7 @@
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
+use crate::admin::pages::{redirect_with_error, redirect_with_notice};
 use crate::admin::views::Chrome;
 use crate::cluster::identity::NodeId;
 use crate::cluster::status::PaceInfo;
@@ -10,8 +11,8 @@ use crate::cluster::{Node, invite, members, repl};
 use askama::Template;
 use axum::{
     Router,
-    extract::{Form, Query, State},
-    response::{Html, Redirect},
+    extract::{Form, State},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use std::sync::Arc;
@@ -119,8 +120,6 @@ struct ClusterPage {
     /// Members whose older history no reachable peer can give this node.
     unserved: Option<String>,
     contributions: Vec<ContribView>,
-    notice: Option<String>,
-    error: Option<String>,
 }
 
 /// This node's runtime settings as its own page shows them.
@@ -160,7 +159,8 @@ pub struct AuditView {
     pub changes: String,
 }
 
-#[derive(serde::Deserialize, Default)]
+/// The outcome shown on a remote node's page, which renders in place.
+#[derive(Default)]
 struct Flash {
     notice: Option<String>,
     error: Option<String>,
@@ -542,11 +542,7 @@ async fn invites(node: &Node) -> AppResult<Vec<InviteView>> {
         .collect())
 }
 
-async fn render_page(
-    st: &AdminState,
-    invite: Option<String>,
-    flash: Flash,
-) -> AppResult<Html<String>> {
+async fn render_page(st: &AdminState, invite: Option<String>) -> AppResult<Html<String>> {
     let Some(node) = st.recorder.node() else {
         return render(&ClusterPage {
             chrome: Chrome::new(true, "admin"),
@@ -562,8 +558,6 @@ async fn render_page(
             audit: vec![],
             unserved: None,
             contributions: vec![],
-            notice: flash.notice,
-            error: flash.error,
         });
     };
     let names: std::collections::HashMap<NodeId, String> = members::all(&node.store)
@@ -609,28 +603,22 @@ async fn render_page(
         audit,
         unserved: unserved(node).await?,
         contributions: contributions(node).await?,
-        notice: flash.notice,
-        error: flash.error,
     })
 }
 
-async fn page(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Query(flash): Query<Flash>,
-) -> AppResult<Html<String>> {
-    render_page(&st, None, flash).await
+async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
+    render_page(&st, None).await
 }
 
-fn back(notice: Option<String>, error: Option<String>) -> Redirect {
-    let qs = serde_urlencoded::to_string(
-        [("notice", notice), ("error", error)]
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|v| (k, v)))
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or_default();
-    Redirect::to(&format!("/admin/cluster?{qs}"))
+/// Back to the cluster page with a one-shot notice or error (in a cookie,
+/// see [`redirect_with_notice`]).
+fn back(notice: Option<String>, error: Option<String>) -> Response {
+    const TO: &str = "/admin/cluster";
+    match (error, notice) {
+        (Some(e), _) => redirect_with_error(TO, &e),
+        (None, Some(n)) => redirect_with_notice(TO, &n),
+        (None, None) => Redirect::to(TO).into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -645,14 +633,16 @@ async fn create_invite(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Form(f): Form<InviteForm>,
-) -> AppResult<axum::response::Response> {
-    use axum::response::IntoResponse;
+) -> AppResult<Response> {
     let node = node(&st)?;
     // Empty fields mean the defaults (a week, 10 uses); 0 means no limit.
     let Ok((ttl_hours, max_uses)) =
         invite::InviteOpts::parse_limits(f.ttl_hours.as_deref(), f.max_uses.as_deref())
     else {
-        return Ok(back(None, Some("expiry and use limit must be numbers".into())).into_response());
+        return Ok(back(
+            None,
+            Some("expiry and use limit must be numbers".into()),
+        ));
     };
     let opts = invite::InviteOpts {
         label: f.label.unwrap_or_default(),
@@ -660,10 +650,8 @@ async fn create_invite(
         max_uses,
     };
     match invite::create(node, &opts).await {
-        Ok(token) => Ok(render_page(&st, Some(token), Flash::default())
-            .await?
-            .into_response()),
-        Err(e) => Ok(back(None, Some(format!("{e:#}"))).into_response()),
+        Ok(token) => Ok(render_page(&st, Some(token)).await?.into_response()),
+        Err(e) => Ok(back(None, Some(format!("{e:#}")))),
     }
 }
 
@@ -676,7 +664,7 @@ async fn revoke_invite(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Form(f): Form<InviteRevokeForm>,
-) -> AppResult<Redirect> {
+) -> AppResult<Response> {
     let node = node(&st)?;
     Ok(if invite::revoke(&node.store, f.id).await? {
         back(
@@ -697,7 +685,7 @@ async fn join(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Form(f): Form<JoinForm>,
-) -> AppResult<Redirect> {
+) -> AppResult<Response> {
     let node = node(&st)?;
     Ok(match invite::join(node, &f.token).await {
         Ok(i) => back(
@@ -711,7 +699,7 @@ async fn join(
     })
 }
 
-async fn leave(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Redirect> {
+async fn leave(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
     let node = node(&st)?;
     Ok(match crate::cluster::leave(node).await {
         Ok(told) => back(
@@ -735,7 +723,7 @@ async fn block(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Form(f): Form<KeyForm>,
-) -> AppResult<Redirect> {
+) -> AppResult<Response> {
     let node = node(&st)?;
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
@@ -769,7 +757,7 @@ async fn unblock(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Form(f): Form<KeyForm>,
-) -> AppResult<Redirect> {
+) -> AppResult<Response> {
     let node = node(&st)?;
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
@@ -789,7 +777,7 @@ async fn purge(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Form(f): Form<KeyForm>,
-) -> AppResult<Redirect> {
+) -> AppResult<Response> {
     let node = node(&st)?;
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
@@ -852,7 +840,7 @@ async fn set_own(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Form(f): Form<SettingsForm>,
-) -> AppResult<Redirect> {
+) -> AppResult<Response> {
     let changes = match f.changes() {
         Ok(c) => c,
         Err(e) => return Ok(back(None, Some(e))),
@@ -874,7 +862,7 @@ async fn set_own(
     })
 }
 
-async fn rotate_key(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Redirect> {
+async fn rotate_key(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
     let node = node(&st)?;
     if !node.cfg.remote_config {
         return Ok(back(
@@ -896,11 +884,11 @@ async fn add_key(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Form(f): Form<KeyForm>,
-) -> AppResult<Redirect> {
+) -> AppResult<Response> {
     let node = node(&st)?;
     Ok(
         match crate::cluster::confkey::add(&node.store, node.id(), &f.key).await {
-            Ok(id) => Redirect::to(&format!("/admin/cluster/node/{id}")),
+            Ok(id) => Redirect::to(&format!("/admin/cluster/node/{id}")).into_response(),
             Err(e) => back(None, Some(format!("{e:#}"))),
         },
     )
@@ -910,7 +898,7 @@ async fn forget_key(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Form(f): Form<KeyForm>,
-) -> AppResult<Redirect> {
+) -> AppResult<Response> {
     let node = node(&st)?;
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
@@ -993,9 +981,8 @@ async fn node_page(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     axum::extract::Path(key): axum::extract::Path<String>,
-    Query(flash): Query<Flash>,
 ) -> AppResult<Html<String>> {
-    node_view(&st, &key, flash).await
+    node_view(&st, &key, Flash::default()).await
 }
 
 async fn node_set(
@@ -1047,7 +1034,7 @@ async fn set_pace(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Form(f): Form<PaceForm>,
-) -> AppResult<Redirect> {
+) -> AppResult<Response> {
     let node = node(&st)?;
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
@@ -1101,4 +1088,25 @@ async fn set_pace(
         Ok(()) => back(Some(format!("Pace of {} saved.", id.short())), None),
         Err(e) => back(None, Some(format!("Pace not saved: {e}"))),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcomes_travel_in_a_cookie_not_the_url() {
+        let cookie = |r: &Response| {
+            r.headers()[axum::http::header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        let r = back(Some("Saved.".into()), None);
+        assert_eq!(r.headers()[axum::http::header::LOCATION], "/admin/cluster");
+        assert!(cookie(&r).starts_with("peephole_flash=Saved."));
+        let r = back(None, Some("Join failed".into()));
+        assert_eq!(r.headers()[axum::http::header::LOCATION], "/admin/cluster");
+        assert!(cookie(&r).starts_with("peephole_flash_error=Join+failed"));
+    }
 }
