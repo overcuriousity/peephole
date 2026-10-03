@@ -157,6 +157,20 @@ be listed under `[[cluster.peers]]` with their key.
   (published ones, and the ones members connect from).
 - Run NTP on every node: cooldowns and the 30-day prune compare timestamps
   written by different nodes. The Cluster page flags clock differences.
+  Entries dated more than 5 minutes ahead of a node's clock wait there
+  until it catches up, and a node's entries must be dated later than its
+  previous one; older ones are kept in the log but take no effect.
+- **In the journal** (`journalctl -u peephole`), each peer that exchanged
+  anything gets one `cluster traffic in the last minute` line: sync rounds
+  (and how many failed), entries received and applied, entries sent, each
+  by kind (`12 (request 10, scan_job 2)`). Peers becoming reachable or
+  unreachable are logged as they happen. `RUST_LOG=peephole=debug` (in a
+  drop-in, `systemctl edit peephole`) adds a line per sync round.
+- **Known limitation:** the admission limit (20 new members a day per
+  sponsor) is judged by the sponsor's own timestamps. A member key that
+  dates all of its entries in the past from its very first one can spread
+  admissions over past days and so admit more. Only members can do this;
+  block a member you do not trust.
 - A standalone node that joins brings its history with it.
 - Node names and keys appear only in the admin area, never on public pages.
 - GeoIP: a node with MaxMind credentials downloads the GeoLite2 databases

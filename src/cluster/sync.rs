@@ -101,6 +101,7 @@ pub async fn supervise(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiv
             }
             last_heads = Some(h);
         }
+        node.traffic.summarize_if_due();
         let targets = node.dial_targets();
         loops.retain(|id, (addr, h)| {
             let keep = !h.is_finished() && targets.iter().any(|t| t.0 == *id && t.2 == *addr);
@@ -156,6 +157,7 @@ async fn peer_loop(
             let _slot = node.sync_slots.acquire().await;
             reconcile(&node, peer, &addr, hello_due).await
         };
+        node.traffic.round(peer, &name, round.is_ok());
         match round {
             Ok(stuck) => {
                 if hello_due {
@@ -270,6 +272,8 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         .get(&peer)
         .map(|m| m.name.clone())
         .unwrap_or_default();
+    let started = std::time::Instant::now();
+    let (mut pulled, mut pushed) = (0usize, 0usize);
     if hello {
         let h = node.hello(peer, addr).await?;
         node.record_status(peer, &name, Ok(Some(h))).await;
@@ -344,7 +348,10 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             stuck = true;
             break;
         }
+        let kinds = super::traffic::Kinds::of(&batch.entries);
         let st = repl::apply_batch_with(node, batch, |o| skippable.contains(o)).await?;
+        pulled += kinds.total() as usize;
+        node.traffic.received(peer, &name, &kinds, st.applied);
         if st.applied + st.parked == 0 {
             // The peer has entries we cannot make progress on; stop pulling and
             // signal the caller to back off rather than spin.
@@ -388,8 +395,21 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             break; // they accepted nothing (e.g. a gap on their side)
         }
         note_own_acked(node, &after);
-        theirs = repl::head_map(&after);
+        let after = repl::head_map(&after);
+        // What they took: entries up to their new head of each origin.
+        let taken = super::traffic::Kinds::of(
+            batch
+                .entries
+                .iter()
+                .filter(|e| e.seq <= after.get(&e.origin).copied().unwrap_or(0)),
+        );
+        pushed += taken.total() as usize;
+        node.traffic.sent(peer, &name, &taken);
+        theirs = after;
     }
     node.record_status(peer, &name, Ok(None)).await;
+    if pulled + pushed > 0 {
+        debug!(peer = %name, pulled, pushed, ms = started.elapsed().as_millis() as u64, "sync round");
+    }
     Ok(stuck)
 }

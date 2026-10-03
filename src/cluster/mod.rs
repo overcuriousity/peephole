@@ -16,6 +16,7 @@ pub mod rpc;
 pub mod status;
 pub mod sync;
 pub mod tls;
+pub mod traffic;
 
 use crate::config::{ClusterConfig, Config, Roles};
 use crate::store::Store;
@@ -281,6 +282,8 @@ pub struct Node {
     pub own_floors: RwLock<history::Floors>,
     /// Sync rounds run, with any peer (status and tests).
     pub sync_rounds: std::sync::atomic::AtomicU64,
+    /// What replication moved per peer, for the journal.
+    pub traffic: traffic::Traffic,
     /// The furthest any peer is known to hold this node's own log (from
     /// sync rounds since start). A windowed node never drops its own
     /// entries beyond it: they may be the only copy.
@@ -331,6 +334,7 @@ impl Node {
             retention_days: p.retention_days,
             own_floors: Default::default(),
             sync_rounds: Default::default(),
+            traffic: Default::default(),
             unserved: Default::default(),
             own_acked: Default::default(),
         });

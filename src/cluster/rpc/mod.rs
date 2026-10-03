@@ -74,7 +74,19 @@ async fn heads(State(node): State<Arc<Node>>, Cbor(theirs): Cbor<repl::Heads>) -
     }
 }
 
-async fn pull(State(node): State<Arc<Node>>, Cbor(req): Cbor<PullReq>) -> Response {
+/// A member's name as this node knows it ("" when unknown).
+fn name_of(node: &Node, peer: &super::identity::NodeId) -> String {
+    node.members()
+        .get(peer)
+        .map(|m| m.name.clone())
+        .unwrap_or_default()
+}
+
+async fn pull(
+    State(node): State<Arc<Node>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Cbor(req): Cbor<PullReq>,
+) -> Response {
     // Only what is held here past each want, each origin once: the list
     // comes from the peer and may be as long as the body allows.
     let wants = match repl::heads(&node.store).await {
@@ -90,7 +102,13 @@ async fn pull(State(node): State<Arc<Node>>, Cbor(req): Cbor<PullReq>) -> Respon
     )
     .await
     {
-        Ok(v) => Cbor(v).into_response(),
+        Ok(v) => {
+            let kinds = super::traffic::Kinds::of(&v.entries);
+            if kinds.total() > 0 {
+                node.traffic.sent(peer, &name_of(&node, &peer), &kinds);
+            }
+            Cbor(v).into_response()
+        }
         Err(e) => internal(e),
     }
 }
@@ -112,8 +130,13 @@ async fn push(
     {
         return (StatusCode::PAYLOAD_TOO_LARGE, "too many entries").into_response();
     }
+    let kinds = super::traffic::Kinds::of(&batch.entries);
     match repl::apply_batch(&node, batch).await {
         Ok(st) => {
+            if kinds.total() > 0 {
+                node.traffic
+                    .received(peer, &name_of(&node, &peer), &kinds, st.applied);
+            }
             if st.rejected > 0 {
                 tracing::debug!(peer = %peer.short(), ?st, "push had rejected entries");
             }
