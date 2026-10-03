@@ -537,7 +537,8 @@ impl Node {
     }
 
     /// Origins this node lacks history of that no peer it reached could
-    /// serve (only a node keeping everything can be in this state).
+    /// serve (a node keeping everything, or a windowed one waiting for a
+    /// member that holds more of it).
     pub fn unserved_origins(&self) -> Vec<NodeId> {
         let mut v: Vec<NodeId> = self
             .unserved
@@ -552,10 +553,23 @@ impl Node {
         v
     }
 
+    /// The origins `peer` could not serve this node in the last round.
+    pub fn unserved_from(&self, peer: &NodeId) -> Vec<NodeId> {
+        self.unserved
+            .lock()
+            .unwrap()
+            .get(peer)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Whether a member other than `peer` that keeps at least this node's
-    /// window (or everything) was heard from recently: a windowed node then
-    /// fetches from it rather than start at `peer`'s floor.
-    pub fn keeps_more_elsewhere(&self, peer: &NodeId) -> bool {
+    /// window (or everything) was heard from recently and, by its heartbeat,
+    /// holds `origin` from right after `head` (what this node holds) on: a
+    /// windowed node then fetches that origin from it rather than start at
+    /// `peer`'s floor. A member whose floor lies past `head` too (equal
+    /// windows) would only make it wait forever.
+    pub fn keeps_more_elsewhere(&self, peer: &NodeId, origin: &NodeId, head: u64) -> bool {
         let mine = self.retention_days;
         self.members().keys().any(|id| {
             *id != self.id()
@@ -564,6 +578,7 @@ impl Node {
                     k.advanced.elapsed() < status::NEIGHBOUR_WINDOW
                         && (k.hb.retention_days == 0 || k.hb.retention_days >= mine)
                 })
+                && history::servable(self.peer_floor(id, origin), head, false)
         })
     }
 
