@@ -25,6 +25,7 @@ peephole cluster invite --label friends   # on a member: a reusable invite (a we
 peephole cluster invites                  # list them; invite-revoke <id> closes one
 peephole cluster join <token>             # on the new node; or Admin → Cluster
 peephole cluster members                  # who is in, and their standing
+peephole cluster agreement <node>         # its requests our rules classify differently
 peephole cluster block <node>             # this node ignores a peer (unblock undoes it)
 peephole cluster block --subtree <node>   # ... and every node it admitted, transitively
 peephole cluster purge <node>             # delete a blocked peer's data here, stop relaying it
@@ -108,17 +109,35 @@ be listed under `[[cluster.peers]]` with their key.
   levels, and the labels its own rules give. A node with doctored rules
   cannot make other scanners scan harder than their rules allow. The IP's
   history in the hour before (which turns many requests into a path
-  scanner) is rebuilt from the rows the scanner holds, so it can come out
-  smaller, never above the stored level.
+  scanner) is rebuilt from every row the scanner holds that the recording
+  trap can have counted (see below), so the level can come out lower when
+  rows are missing here, never above the stored level.
 - The Members table on the Cluster page shows, per member, how its newest
   500 requests compare with this node's rules ("rules agree 100%",
   "disagree on 12% of 500"): the share whose labels or severity come out
-  differently when classified again here. A request agrees when either
-  history (all the rows held here, or only the member's own) reproduces
-  it, so requests of other nodes the member had not seen yet do not count
-  as disagreement. Made at most every 10 minutes, with the rules built into
-  this binary. Differences come from members running another build (older
-  or newer rules) as much as from doctored ones.
+  differently when classified again here. Only the IP's history (requests
+  in the hour, which make a path scanner) cannot be read back exactly:
+  the trap counted the rows its database held at that moment, with no
+  upper bound in time. So it is bracketed, and a request agrees when
+  either bound reproduces it:
+  - *seen*, an upper bound: every node's rows of the IP dated from an
+    hour (plus a minute) before the request up to 5 minutes after it (the
+    clock drift cap: another node's row can be dated ahead of the
+    member's clock, and the trap counted it);
+  - *own*, a lower bound: only the member's own rows it recorded before
+    this one (by its clock, not by arrival here), dated at least a minute
+    earlier, within the hour. Requests of one IP are classified
+    concurrently, so a row dated in the same moment may not have been
+    written yet when the trap counted.
+
+  Requests of other nodes the member had not seen yet, or saw although
+  they were dated later, do not count as disagreement. Made at most every
+  10 minutes, with the rules built into this binary. Differences come from
+  members running another build (older or newer rules) as much as from
+  doctored ones. `peephole cluster agreement NODE [--sample N]` makes the
+  same comparison on the command line and lists each request that differs
+  (id, time, method, path; the stored labels and severity, ours under
+  both bounds, and the two history counts); the badge's tooltip names it.
 - **Rules fingerprints.** The signature rules are built into the binary, so
   nodes of one build classify alike. Every request carries the fingerprint
   of the rules that classified it (`rules`, a SHA-256 over the rules files)

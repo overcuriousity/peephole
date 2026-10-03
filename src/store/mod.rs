@@ -396,18 +396,26 @@ impl Store {
 
     /// What `ip` did in the last hour, counting the request to `path` that
     /// is being classified (it is stored with its verdict, so afterwards).
-    /// The IP need not have a row yet.
+    /// The IP need not have a row yet. Every row dated in the last hour
+    /// counts, also one of another node dated (slightly) in the future:
+    /// `classify::stored::History` brackets this count.
     pub async fn ip_history(
         &self,
         ip: &str,
         path: &str,
     ) -> anyhow::Result<crate::classify::IpHistory> {
+        // Rows are filed under the canonical text (`data::ensure_ip`): look
+        // the IP up the same way, or a `::ffff:a.b.c.d` would count nothing.
+        let ip = match ip.parse::<std::net::IpAddr>() {
+            Ok(a) => crate::net::canonical(a).to_string(),
+            Err(_) => ip.to_string(),
+        };
         let (paths, reqs, seen): (i64, i64, bool) = sqlx::query_as(
             "SELECT COUNT(DISTINCT r.path), COUNT(*), COALESCE(MAX(r.path = ?2), 0)
              FROM requests r JOIN ips i ON i.id = r.ip_id
              WHERE i.ip = ?1 AND r.ts > datetime('now','-1 hour')",
         )
-        .bind(ip)
+        .bind(&ip)
         .bind(path)
         .fetch_one(&self.pool)
         .await?;

@@ -62,7 +62,7 @@
         <td><span class="badge badge-status" data-status="{% if m.live %}done{% else %}queued{% endif %}">{{ m.last_seen }}</span></td>
         <td class="mono">{{ m.version }}</td>
         <td><span class="mono" title="The rules fingerprint its newest requests carry (its word: what it classifies with is checked below)">{{ m.ruleset }}</span>{% match m.ruleset_same %}{% when Some(true) %} <span class="muted small">same as ours</span>{% when Some(false) %} <span class="badge badge-status" data-status="queued">differs</span>{% when None %}{% endmatch %}
-          <br>{% if m.rules_differ %}<span class="badge badge-status" data-status="failed">{{ m.rules }}</span>{% else %}<span class="muted small">{{ m.rules }}</span>{% endif %}</td>
+          <br>{% if m.rules_differ %}<span class="badge badge-status" data-status="failed" title="Its newest requests classified again with our rules. Which ones differ, and why: peephole cluster agreement {{ m.short }}">{{ m.rules }}</span>{% else %}<span class="muted small">{{ m.rules }}</span>{% endif %}</td>
         <td>{{ m.history }}</td>
         <td>{{ m.lag }}</td>
         <td>{% if m.scanner %}{{ m.active_scans }} running{% endif %}</td>

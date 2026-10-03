@@ -25,6 +25,9 @@ pub const USAGE: &str = "usage: peephole cluster id [CONFIG]
                                 blocks every node it admitted, transitively)
        peephole cluster unblock NODE [CONFIG]
        peephole cluster purge NODE [CONFIG]     (delete a blocked node's data here)
+       peephole cluster agreement NODE [--sample N] [CONFIG]
+                               (its newest N requests (default 500) classified again with
+                                our rules, as the Cluster page does; lists those that differ)
        peephole cluster leave [CONFIG]";
 
 /// `--name value` pairs.
@@ -91,6 +94,73 @@ fn resolve(rows: &[members::MemberRow], who: &str) -> Result<NodeId> {
         [] => bail!("no member named `{who}`"),
         _ => bail!("`{who}` is ambiguous; use the full key"),
     }
+}
+
+/// Characters of a path shown by `agreement`.
+const PATH_SHOWN: usize = 60;
+
+/// What `cluster agreement` prints: the summary the Cluster page shows,
+/// then every request our rules do not reproduce, with the verdicts under
+/// both history bounds (see `classify::stored::History`).
+fn agreement_report(
+    id: NodeId,
+    ours: &str,
+    checks: &[crate::classify::stored::RowCheck],
+) -> String {
+    use crate::classify::stored::{Agreement, Reclassified};
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}: {} (our rules {})",
+        id.short(),
+        Agreement::of(checks).summary(),
+        ours.chars().take(12).collect::<String>()
+    );
+    let verdict = |labels: &[String], severity: i64| {
+        let labels = if labels.is_empty() {
+            "-".to_string()
+        } else {
+            labels.join(",")
+        };
+        format!("{labels} severity {severity}")
+    };
+    for c in checks.iter().filter(|c| !c.agrees) {
+        let r = &c.row;
+        let mut path: String = r.path.chars().take(PATH_SHOWN).collect();
+        if r.path.chars().count() > PATH_SHOWN {
+            path.push('…');
+        }
+        let _ = writeln!(
+            out,
+            "#{} {} {} {}",
+            r.id,
+            r.ts,
+            r.method,
+            path.escape_debug()
+        );
+        let _ = writeln!(
+            out,
+            "    stored  {}",
+            verdict(&r.stored_labels(), r.severity)
+        );
+        for x in [&c.seen, &c.own] {
+            let Reclassified {
+                scope,
+                hist,
+                verdict: v,
+            } = x;
+            let _ = writeln!(
+                out,
+                "    {:<7} {}  (history: {} requests, {} paths)",
+                scope.name(),
+                verdict(&v.labels, i64::from(v.severity)),
+                hist.requests_1h,
+                hist.distinct_paths_1h
+            );
+        }
+    }
+    out
 }
 
 /// Run a `cluster` subcommand; `args` excludes `cluster` itself.
@@ -300,6 +370,29 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 id.short()
             );
         }
+        Some("agreement") => {
+            reject_unknown_flags(&flags, &["sample"])?;
+            let who = pos.get(1).context(USAGE)?;
+            let sample: i64 = match flags.iter().find(|(k, _)| k == "sample") {
+                Some((_, v)) => v
+                    .parse()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .context("--sample takes a positive number")?,
+                None => crate::admin::cluster::RULES_SAMPLE,
+            };
+            // Read-only, as `status`.
+            let cfg = Config::load(Path::new(cfg_at(2)))?;
+            if cfg.cluster.is_none() {
+                bail!("config has no [cluster] section");
+            }
+            let store = Store::connect(&cfg.database_path).await?;
+            let id = resolve(&members::all(&store).await?, who)?;
+            let c = crate::classify::Classifier::builtin();
+            let checks =
+                crate::classify::stored::compare(&store.pool, c, Some(&id.0[..]), sample).await?;
+            print!("{}", agreement_report(id, c.fingerprint(), &checks));
+        }
         Some("config-key") => {
             reject_unknown_flags(&flags, &[])?;
             let sub = pos.get(1).map(String::as_str);
@@ -360,4 +453,58 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
         _ => bail!("{USAGE}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::requests::NewRequest;
+
+    /// The report lists the rows our rules do not reproduce, with both
+    /// histories, and summarises as the Cluster page does.
+    #[tokio::test]
+    async fn agreement_lists_differing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let id = NodeId([7u8; 32]);
+        for (path, labels, severity) in [("/fine", r#"["probe"]"#, 1), ("/odd", r#"["rce"]"#, 4)] {
+            store
+                .local()
+                .insert_request_from(
+                    "198.51.100.4",
+                    &NewRequest {
+                        method: "GET".into(),
+                        path: path.into(),
+                        headers_json: "[]".into(),
+                        labels_json: labels.into(),
+                        severity,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE requests SET origin = ?")
+            .bind(&id.0[..])
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let c = crate::classify::Classifier::builtin();
+        let checks = crate::classify::stored::compare(&store.pool, c, Some(&id.0[..]), 500)
+            .await
+            .unwrap();
+        let out = agreement_report(id, c.fingerprint(), &checks);
+        assert!(out.contains("disagree on 50% of 2"), "{out}");
+        assert!(out.contains(" GET /odd\n"), "{out}");
+        assert!(!out.contains("/fine"), "{out}");
+        assert!(out.contains("    stored  rce severity 4\n"), "{out}");
+        assert!(
+            out.contains("    seen    probe severity 1  (history: 2 requests, 2 paths)\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("    own     probe severity 1  (history: 1 requests, 1 paths)\n"),
+            "{out}"
+        );
+    }
 }

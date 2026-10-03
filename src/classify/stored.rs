@@ -10,12 +10,13 @@
 //! trap's body cap, decompressed for matching). So a row is classified
 //! again from the same input, with two differences:
 //!
-//! - **History**: the trap counts the IP's requests of the last hour as its
-//!   own database held them then. Here they are rebuilt from the rows held
-//!   now ([`History`]): rows that never reached this node, or were pruned
-//!   here, make the history smaller; rows that reached the origin only
-//!   later make it larger. Light rows of skipped requests do not count,
-//!   as in the trap.
+//! - **History**: the trap counts the IP's rows its database held when it
+//!   classified the request (every origin's, claims included, from the hour
+//!   before, with no upper bound in time). That set cannot be rebuilt
+//!   exactly, so it is bracketed ([`History`]): [`History::Seen`] takes
+//!   every row the trap can have held, [`History::Own`] only rows it must
+//!   have held. Light rows of skipped requests do not count, as in the
+//!   trap (they are not in `requests`).
 //! - **Bot tells**: the trap never passes them to the classifier (a
 //!   fingerprint arrives after its request and escalates a scan directly;
 //!   evidence reads fingerprints on its own), so none are passed here either.
@@ -29,6 +30,8 @@ pub struct StoredRequest {
     pub id: i64,
     pub ip_id: i64,
     pub origin: Option<Vec<u8>>,
+    /// The origin's clock when it recorded the row (orders its own rows).
+    pub hlc: Option<i64>,
     pub ts: String,
     pub method: String,
     pub path: String,
@@ -41,19 +44,49 @@ pub struct StoredRequest {
 }
 
 /// Columns of [`StoredRequest`], for `SELECT … FROM requests r`.
-pub const STORED_COLUMNS: &str = "r.id, r.ip_id, r.origin, r.ts, r.method, r.path, r.query,
-     r.headers_json, r.body, r.labels_json, r.severity, r.scan_level";
+pub const STORED_COLUMNS: &str = "r.id, r.ip_id, r.origin, r.hlc, r.ts, r.method, r.path,
+     r.query, r.headers_json, r.body, r.labels_json, r.severity, r.scan_level";
 
-/// Which other rows of the IP count as its history at a row's time: those
-/// recorded in the hour up to the row's `ts`.
+/// How far a row of another node may be dated after the moment the trap
+/// read it: its clock may run ahead of ours by up to the HLC drift cap (a
+/// row dated further ahead is stored at the cap).
+const AHEAD_SECS: u64 = crate::cluster::hlc::MAX_DRIFT_MS.div_ceil(1000);
+
+/// How long a request may take from the trap reading the IP's history to
+/// its row being dated (or from being dated to being written): rows dated
+/// that close to another were possibly not written yet when the other was
+/// classified. Requests of one IP are classified concurrently (scanners
+/// send them in parallel), so such a row may be missing from the trap's
+/// count even though it was dated earlier and has a smaller id.
+const IN_FLIGHT_SECS: u64 = 60;
+
+/// Which other rows of the IP count as its history at a row's time.
+///
+/// The trap's count `t` lies between the two, `own <= t <= seen` (unless
+/// rows are missing here), so with the history ladder only climbing, the
+/// trap's verdict is the one either reproduces.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum History {
-    /// Every origin's rows, up to and including the row's second: at least
-    /// what the origin can have seen, unless rows are missing here.
+    /// Every origin's rows the trap can have held: dated from an hour
+    /// (plus [`IN_FLIGHT_SECS`]) before the row up to [`AHEAD_SECS`] after
+    /// it, since rows of other nodes can be dated ahead of the origin's
+    /// clock. At least what the origin counted, unless rows are missing
+    /// here.
     Seen,
-    /// Only the origin's own rows, stored here before this one: at most
-    /// what the origin saw, unless it held rows of other nodes too.
+    /// Only the origin's own rows the trap must have held: recorded before
+    /// this one (by the origin's clock, not by arrival here) and dated at
+    /// least [`IN_FLIGHT_SECS`] earlier, within the hour. At most what the
+    /// origin counted.
     Own,
+}
+
+impl History {
+    pub fn name(self) -> &'static str {
+        match self {
+            History::Seen => "seen",
+            History::Own => "own",
+        }
+    }
 }
 
 impl StoredRequest {
@@ -73,22 +106,30 @@ impl StoredRequest {
     }
 
     /// The IP's history at this row's time, as the trap computes it (this
-    /// request included).
+    /// request included), bracketed as `scope` says.
     pub async fn history(&self, pool: &SqlitePool, scope: History) -> Result<IpHistory> {
         let scoped = match scope {
-            History::Seen => "r.ts <= ?3",
-            History::Own => "r.origin IS ?4 AND r.id < ?2",
+            History::Seen => format!(
+                "r.ts > datetime(?3, '-1 hour', '-{IN_FLIGHT_SECS} seconds')
+                 AND r.ts <= datetime(?3, '+{AHEAD_SECS} seconds')"
+            ),
+            History::Own => format!(
+                "r.ts > datetime(?3, '-1 hour')
+                 AND r.ts <= datetime(?3, '-{IN_FLIGHT_SECS} seconds')
+                 AND r.origin IS ?4 AND r.hlc < ?6"
+            ),
         };
         let (paths, reqs, seen): (i64, i64, bool) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(DISTINCT r.path), COUNT(*), COALESCE(MAX(r.path = ?5), 0)
              FROM requests r
-             WHERE r.ip_id = ?1 AND r.id != ?2 AND r.ts > datetime(?3, '-1 hour') AND {scoped}"
+             WHERE r.ip_id = ?1 AND r.id != ?2 AND {scoped}"
         )))
         .bind(self.ip_id)
         .bind(self.id)
         .bind(&self.ts)
         .bind(&self.origin)
         .bind(&self.path)
+        .bind(self.hlc)
         .fetch_one(pool)
         .await?;
         Ok(IpHistory {
@@ -137,22 +178,62 @@ impl StoredRequest {
         Ok(self.classify(c, &hist))
     }
 
-    /// Whether `c` gives this request the labels and severity its origin
-    /// stored, with the history as seen here or as the origin's own rows
-    /// make it: the truth lies in between, and the history ladder only
-    /// climbs, so a verdict either reproduces came from these rules.
-    pub async fn agrees(&self, pool: &SqlitePool, c: &Classifier) -> Result<bool> {
+    /// Whether this request's stored verdict is `v`'s.
+    fn stored_as(&self, v: &Verdict) -> bool {
         let mut stored = self.stored_labels();
         stored.sort();
         stored.dedup();
-        for scope in [History::Seen, History::Own] {
-            let v = self.reclassify(pool, c, scope).await?;
-            if v.labels == stored && i64::from(v.severity) == self.severity {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        v.labels == stored && i64::from(v.severity) == self.severity
     }
+
+    /// This request classified again by `c` under both histories.
+    pub async fn check(&self, pool: &SqlitePool, c: &Classifier) -> Result<RowCheck> {
+        let mut out = Vec::with_capacity(2);
+        for scope in [History::Seen, History::Own] {
+            let hist = self.history(pool, scope).await?;
+            let verdict = self.classify(c, &hist);
+            out.push(Reclassified {
+                scope,
+                hist,
+                verdict,
+            });
+        }
+        let own = out.pop().expect("two scopes");
+        let seen = out.pop().expect("two scopes");
+        let agrees = self.stored_as(&seen.verdict) || self.stored_as(&own.verdict);
+        Ok(RowCheck {
+            row: self.clone(),
+            seen,
+            own,
+            agrees,
+        })
+    }
+
+    /// Whether `c` gives this request the labels and severity its origin
+    /// stored, with the history of either [`History`] bound: the truth lies
+    /// in between, and the history ladder only climbs, so a verdict either
+    /// reproduces came from these rules.
+    pub async fn agrees(&self, pool: &SqlitePool, c: &Classifier) -> Result<bool> {
+        Ok(self.check(pool, c).await?.agrees)
+    }
+}
+
+/// A request classified again under one [`History`].
+#[derive(Debug, Clone)]
+pub struct Reclassified {
+    pub scope: History,
+    pub hist: IpHistory,
+    pub verdict: Verdict,
+}
+
+/// A request with what this node's rules make of it under both histories.
+#[derive(Debug, Clone)]
+pub struct RowCheck {
+    pub row: StoredRequest,
+    pub seen: Reclassified,
+    pub own: Reclassified,
+    /// Either reproduces the stored labels and severity.
+    pub agrees: bool,
 }
 
 /// How one origin's recent requests compare with what this node's rules
@@ -182,6 +263,38 @@ impl Agreement {
             }
         }
     }
+
+    /// The tally of `checks`.
+    pub fn of(checks: &[RowCheck]) -> Self {
+        Agreement {
+            sampled: checks.len() as u32,
+            differing: checks.iter().filter(|c| !c.agrees).count() as u32,
+        }
+    }
+}
+
+/// The newest `sample` requests `origin` recorded (claims left out), each
+/// classified again by `c`; `origin` None is this standalone node's own
+/// rows. What [`agreement`] counts, row by row.
+pub async fn compare(
+    pool: &SqlitePool,
+    c: &Classifier,
+    origin: Option<&[u8]>,
+    sample: i64,
+) -> Result<Vec<RowCheck>> {
+    let rows: Vec<StoredRequest> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {STORED_COLUMNS} FROM requests r
+         WHERE r.origin IS ? AND r.is_fp_claim = 0 ORDER BY r.id DESC LIMIT ?"
+    )))
+    .bind(origin)
+    .bind(sample)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(row.check(pool, c).await?);
+    }
+    Ok(out)
 }
 
 /// Compare the newest `sample` requests `origin` recorded (claims left
@@ -193,22 +306,7 @@ pub async fn agreement(
     origin: Option<&[u8]>,
     sample: i64,
 ) -> Result<Agreement> {
-    let rows: Vec<StoredRequest> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {STORED_COLUMNS} FROM requests r
-         WHERE r.origin IS ? AND r.is_fp_claim = 0 ORDER BY r.id DESC LIMIT ?"
-    )))
-    .bind(origin)
-    .bind(sample)
-    .fetch_all(pool)
-    .await?;
-    let mut a = Agreement::default();
-    for row in rows {
-        a.sampled += 1;
-        if !row.agrees(pool, c).await? {
-            a.differing += 1;
-        }
-    }
-    Ok(a)
+    Ok(Agreement::of(&compare(pool, c, origin, sample).await?))
 }
 
 #[cfg(test)]
@@ -223,6 +321,53 @@ mod tests {
 
     async fn stored(store: &Store, id: i64) -> StoredRequest {
         StoredRequest::load(&store.pool, id).await.unwrap().unwrap()
+    }
+
+    /// Move every row recorded so far by `modifier` (`'-2 minutes'`).
+    async fn backdate(store: &Store, modifier: &str) {
+        sqlx::query("UPDATE requests SET ts = datetime(ts, ?)")
+            .bind(modifier)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+
+    /// The trap's verdict for a request from `ip` to `path` now.
+    async fn verdict_now(store: &Store, c: &Classifier, ip: &str, path: &str) -> Verdict {
+        let hist = store.ip_history(ip, path).await.unwrap();
+        c.classify(
+            &RequestView {
+                method: "GET",
+                path,
+                query: None,
+                headers: vec![],
+                body: None,
+                proxy_target: None,
+            },
+            &hist,
+            &BotTells::default(),
+        )
+    }
+
+    /// Store a `GET path` from `ip` with verdict `v`.
+    async fn insert(store: &Store, ip: &str, path: &str, v: &Verdict) -> i64 {
+        store
+            .local()
+            .insert_request_from(
+                ip,
+                &NewRequest {
+                    method: "GET".into(),
+                    path: path.into(),
+                    headers_json: "[]".into(),
+                    labels_json: serde_json::to_string(&v.labels).unwrap(),
+                    severity: v.severity as i64,
+                    scan_level: v.scan_level as i64,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .0
     }
 
     /// What the trap would store for a request, with its verdict.
@@ -329,9 +474,14 @@ mod tests {
                 assert_eq!(again, v, "{method} {target} ({scope:?})");
             }
         }
-        // Twenty requests in the hour: the last is a path scanner's.
+        // Twenty requests in the hour: the last is a path scanner's. The
+        // first nineteen are minutes older, so they were certainly written
+        // when it was classified.
         let mut last = None;
         for n in 0..20 {
+            if n == 19 {
+                backdate(&store, "-2 minutes").await;
+            }
             last = Some(
                 record(
                     &store,
@@ -443,5 +593,113 @@ mod tests {
         };
         assert_eq!(rare.summary(), "disagree on <1% of 500");
         assert_eq!(Agreement::default().summary(), "no requests to compare");
+    }
+
+    /// The trap counted a row of another node dated two minutes after its
+    /// own request (that node's clock runs ahead): only then did the IP
+    /// reach twenty requests. Neither bound used to take that row; the
+    /// seen history now does, up to the drift cap.
+    #[tokio::test]
+    async fn a_row_of_another_node_dated_later_counts_as_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let c = classifier();
+        let (honest, ahead) = (vec![1u8; 32], vec![2u8; 32]);
+        let ip = "203.0.113.7";
+        // Eighteen requests of the honest node, minutes ago, to one path
+        // (so only the request count can make a path scanner).
+        for _ in 0..18 {
+            let v = verdict_now(&store, c, ip, "/x").await;
+            insert(&store, ip, "/x", &v).await;
+        }
+        backdate(&store, "-5 minutes").await;
+        // The other node's row, dated two minutes from now.
+        let v = verdict_now(&store, c, ip, "/x").await;
+        let other = insert(&store, ip, "/x", &v).await;
+        sqlx::query(
+            "UPDATE requests SET origin = ?, ts = datetime('now', '+2 minutes') WHERE id = ?",
+        )
+        .bind(&ahead)
+        .bind(other)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        // The twentieth request the honest node counted.
+        let v = verdict_now(&store, c, ip, "/x").await;
+        assert!(v.labels.contains(&"path-scanner".to_string()), "{v:?}");
+        let id = insert(&store, ip, "/x", &v).await;
+        sqlx::query("UPDATE requests SET origin = ? WHERE origin IS NULL")
+            .bind(&honest)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let row = stored(&store, id).await;
+        let check = row.check(&store.pool, c).await.unwrap();
+        assert_eq!(check.seen.hist.requests_1h, 20);
+        assert_eq!(check.own.hist.requests_1h, 19);
+        assert_eq!(check.seen.verdict, v);
+        assert!(check.agrees);
+        let a = agreement(&store.pool, c, Some(&honest), 500).await.unwrap();
+        assert_eq!(a.differing, 0, "{a:?}");
+        // A row dated past the drift cap cannot have been held then.
+        sqlx::query("UPDATE requests SET ts = datetime(?, '+6 minutes') WHERE id = ?")
+            .bind(&row.ts)
+            .bind(other)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let check = row.check(&store.pool, c).await.unwrap();
+        assert_eq!(check.seen.hist.requests_1h, 19);
+        assert!(!check.agrees);
+    }
+
+    /// Two requests of one IP classified concurrently: the second was
+    /// dated and stored first, so it has the smaller id, yet the first did
+    /// not count it. The own history does not count rows that close.
+    #[tokio::test]
+    async fn a_concurrent_request_the_trap_did_not_count_agrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let c = classifier();
+        let ip = "203.0.113.8";
+        for _ in 0..18 {
+            let v = verdict_now(&store, c, ip, "/x").await;
+            insert(&store, ip, "/x", &v).await;
+        }
+        backdate(&store, "-5 minutes").await;
+        // Both see eighteen rows: neither is a path scanner's.
+        let first = verdict_now(&store, c, ip, "/x").await;
+        let second = verdict_now(&store, c, ip, "/x").await;
+        assert!(!first.labels.contains(&"path-scanner".to_string()));
+        insert(&store, ip, "/x", &second).await;
+        let id = insert(&store, ip, "/x", &first).await;
+        let check = stored(&store, id)
+            .await
+            .check(&store.pool, c)
+            .await
+            .unwrap();
+        assert_eq!(check.own.hist.requests_1h, 19);
+        assert_eq!(check.own.verdict, first);
+        assert!(check.agrees);
+        let a = agreement(&store.pool, c, None, 500).await.unwrap();
+        assert_eq!(
+            a,
+            Agreement {
+                sampled: 20,
+                differing: 0
+            }
+        );
+    }
+
+    /// The trap looks an IP up by its canonical text, as rows are filed.
+    #[tokio::test]
+    async fn the_traps_history_finds_a_mapped_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let v = verdict_now(&store, classifier(), "192.0.2.1", "/a").await;
+        insert(&store, "192.0.2.1", "/a", &v).await;
+        let h = store.ip_history("::ffff:192.0.2.1", "/b").await.unwrap();
+        assert_eq!(h.requests_1h, 2);
+        assert_eq!(h.distinct_paths_1h, 2);
     }
 }

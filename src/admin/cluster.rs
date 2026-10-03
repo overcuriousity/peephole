@@ -148,7 +148,7 @@ pub struct RulesCheck {
 /// How long a comparison is shown before it is made again.
 const RULES_CHECK_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 /// Newest requests of each member compared.
-const RULES_SAMPLE: i64 = 500;
+pub const RULES_SAMPLE: i64 = 500;
 
 /// The comparison, made at most every [`RULES_CHECK_TTL`] (an older one is
 /// shown while it is made again), so the page stays fast.
