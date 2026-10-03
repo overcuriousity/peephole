@@ -126,8 +126,10 @@ impl Store {
     /// At most [`MAX_OPEN_CEREMONIES`] are open, since anonymous clients start
     /// sign-ins. At the cap the oldest open ceremony makes room rather than
     /// refusing, so a flood of sign-in starts cannot lock the admin out: a
-    /// sign-in (`auth`) evicts only the oldest sign-in, an enrollment (only
-    /// started when authorised) the oldest of any kind. `None` when nothing
+    /// sign-in (`auth`) evicts only the oldest sign-in at least
+    /// [`MIN_CEREMONY_SECS`] old, so a sign-in in progress cannot be pushed
+    /// out before the authenticator times out; an enrollment (only started
+    /// when authorised) evicts the oldest of any kind. `None` when nothing
     /// may be evicted.
     pub async fn put_webauthn_state(
         &self,
@@ -137,14 +139,16 @@ impl Store {
     ) -> Result<Option<String>> {
         let id = uuid::Uuid::new_v4().to_string();
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM webauthn_states WHERE rowid = (
                SELECT rowid FROM webauthn_states
-               WHERE expires_at > datetime('now') AND (kind = ?1 OR ?1 <> 'auth')
+               WHERE expires_at > datetime('now')
+                 AND (?1 <> 'auth' OR (kind = 'auth'
+                      AND created_at <= datetime('now', '-{MIN_CEREMONY_SECS} seconds')))
                ORDER BY created_at, rowid LIMIT 1)
              AND (SELECT COUNT(*) FROM webauthn_states
-                  WHERE expires_at > datetime('now')) >= ?2",
-        )
+                  WHERE expires_at > datetime('now')) >= ?2"
+        )))
         .bind(kind)
         .bind(MAX_OPEN_CEREMONIES)
         .execute(&mut *tx)
@@ -228,9 +232,72 @@ impl Store {
         ) else {
             return Ok(false);
         };
-        let live =
-            chrono::DateTime::parse_from_rfc3339(&expires).is_ok_and(|t| t > chrono::Utc::now());
-        Ok(live && hash == token_hash(token))
+        Ok(unexpired(&expires) && hash == token_hash(token))
+    }
+
+    /// Store a key enrolled under the session whose hash is `session_hash`,
+    /// in the same statement that checks the session is still live, so a
+    /// session that ended mid-ceremony (expired, signed out, its key
+    /// deleted) enrolls nothing. Returns whether the key was stored.
+    pub async fn save_credential_in_session(
+        &self,
+        cred_id: &[u8],
+        passkey_json: &str,
+        label: Option<&str>,
+        session_hash: &str,
+    ) -> Result<bool> {
+        let r = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO credentials (cred_id, passkey_json, created_at, label)
+             SELECT ?, ?, datetime('now'), ? WHERE EXISTS (
+               SELECT 1 FROM sessions
+               WHERE id_hash = ? AND expires_at > datetime('now')
+                 AND last_seen > datetime('now', '-{SESSION_IDLE_MINUTES} minutes'))"
+        )))
+        .bind(cred_id)
+        .bind(passkey_json)
+        .bind(label)
+        .bind(session_hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    /// Store a key enrolled with the setup token whose hash is `setup_hash`
+    /// and use that token up, in one transaction: nothing is stored unless
+    /// the token is still the current unexpired one (not used meanwhile, not
+    /// replaced by `peephole admin reset-token`), and a key that was not
+    /// stored leaves the token usable. Returns whether the key was stored.
+    pub async fn save_credential_with_setup_token(
+        &self,
+        cred_id: &[u8],
+        passkey_json: &str,
+        label: Option<&str>,
+        setup_hash: &str,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let expires: Option<String> =
+            sqlx::query_scalar("SELECT value FROM intel_meta WHERE key = ?")
+                .bind(SETUP_TOKEN_EXPIRES)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if !expires.is_some_and(|e| unexpired(&e)) {
+            return Ok(false);
+        }
+        let used =
+            sqlx::query("UPDATE intel_meta SET value = 'consumed' WHERE key = ? AND value = ?")
+                .bind(SETUP_TOKEN_HASH)
+                .bind(setup_hash)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                == 1;
+        if !used {
+            return Ok(false);
+        }
+        sqlx::query("INSERT INTO credentials (cred_id, passkey_json, created_at, label) VALUES (?,?,datetime('now'),?)")
+            .bind(cred_id).bind(passkey_json).bind(label).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Issue a fresh setup token (replacing any earlier one), valid for
@@ -254,11 +321,6 @@ impl Store {
         }
         tx.commit().await?;
         Ok(token)
-    }
-
-    /// Mark the setup token used (the first key is enrolled).
-    pub async fn consume_setup_token(&self) -> Result<()> {
-        self.intel_set(SETUP_TOKEN_HASH, "consumed").await
     }
 
     /// The setup token's state, for deciding whether to issue a new one.
@@ -289,6 +351,9 @@ pub const SESSION_HOURS: i64 = 12;
 pub const SESSION_IDLE_MINUTES: i64 = 60;
 /// Open (unexpired) WebAuthn ceremonies at most; more evict the oldest.
 pub const MAX_OPEN_CEREMONIES: i64 = 256;
+/// A sign-in this young is never evicted: the authenticator's own timeout
+/// (60 s) plus a margin for the round trips.
+pub const MIN_CEREMONY_SECS: i64 = 90;
 /// Lifetime of the first-run setup token.
 pub const SETUP_TOKEN_HOURS: i64 = 24;
 const SETUP_TOKEN_HASH: &str = "webauthn_setup_token_hash";
@@ -305,6 +370,11 @@ pub enum SetupToken {
     Expired,
     /// Issued by a build without expiry.
     Legacy,
+}
+
+/// Whether an RFC 3339 expiry lies in the future.
+fn unexpired(expires: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(expires).is_ok_and(|t| t > chrono::Utc::now())
 }
 
 /// What is stored for a session or setup token: hex SHA-256.
@@ -473,8 +543,23 @@ mod tests {
                     .unwrap(),
             );
         }
-        // At the cap a new sign-in still starts: it evicts the oldest
-        // sign-in, never the enrollment.
+        // At the cap, with every sign-in still young, a new one is refused
+        // rather than pushing out one in progress.
+        assert!(
+            s.put_webauthn_state("auth", "{}", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Once they are old enough, a new sign-in evicts the oldest sign-in,
+        // never the enrollment.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE webauthn_states SET created_at = datetime(created_at, '-{} seconds')",
+            super::MIN_CEREMONY_SECS
+        )))
+        .execute(&s.pool)
+        .await
+        .unwrap();
         let newest = s.put_webauthn_state("auth", "{}", None).await.unwrap();
         assert!(newest.is_some());
         assert_eq!(open(&s).await, super::MAX_OPEN_CEREMONIES);
@@ -537,8 +622,88 @@ mod tests {
         let t2 = s.issue_setup_token().await.unwrap();
         assert!(s.setup_token_valid(&t2).await.unwrap());
         assert!(!s.setup_token_valid(&t).await.unwrap());
-        s.consume_setup_token().await.unwrap();
+        let h2 = super::token_hash(&t2);
+        // Only the token a ceremony started with can be used up with it.
+        assert!(
+            !s.save_credential_with_setup_token(b"k0", "{}", None, &super::token_hash(&t))
+                .await
+                .unwrap()
+        );
+        assert!(
+            s.save_credential_with_setup_token(b"k1", "{}", None, &h2)
+                .await
+                .unwrap()
+        );
         assert!(!s.setup_token_valid(&t2).await.unwrap());
         assert_eq!(s.setup_token_state().await.unwrap(), SetupToken::None);
+        // Used once: a second ceremony with it stores nothing.
+        assert!(
+            !s.save_credential_with_setup_token(b"k2", "{}", None, &h2)
+                .await
+                .unwrap()
+        );
+        assert_eq!(s.load_credentials().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_key_not_stored_leaves_the_setup_token_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let t = s.issue_setup_token().await.unwrap();
+        let h = super::token_hash(&t);
+        s.save_credential(b"dup", "{}", None).await.unwrap();
+        // The insert fails (duplicate cred_id): the token is not used up.
+        assert!(
+            s.save_credential_with_setup_token(b"dup", "{}", None, &h)
+                .await
+                .is_err()
+        );
+        assert!(s.setup_token_valid(&t).await.unwrap());
+        // An expired token stores nothing either.
+        s.intel_set(
+            "webauthn_setup_token_expires",
+            &(chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !s.save_credential_with_setup_token(b"new", "{}", None, &h)
+                .await
+                .unwrap()
+        );
+        assert_eq!(s.load_credentials().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_key_enrolled_in_a_session_needs_that_session_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let live = s.create_session().await.unwrap();
+        let ended = s.create_session().await.unwrap();
+        s.destroy_session(&ended).await.unwrap();
+        let hash = super::token_hash;
+        assert!(
+            !s.save_credential_in_session(b"a", "{}", None, &hash(&ended))
+                .await
+                .unwrap()
+        );
+        assert!(
+            s.save_credential_in_session(b"b", "{}", None, &hash(&live))
+                .await
+                .unwrap()
+        );
+        // Idle too long counts as ended.
+        sqlx::query("UPDATE sessions SET last_seen = datetime('now', '-61 minutes')")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert!(
+            !s.save_credential_in_session(b"c", "{}", None, &hash(&live))
+                .await
+                .unwrap()
+        );
+        let creds = s.load_credentials().await.unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].0, b"b");
     }
 }
