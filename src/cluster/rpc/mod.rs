@@ -75,9 +75,15 @@ async fn heads(State(node): State<Arc<Node>>, Cbor(theirs): Cbor<repl::Heads>) -
 }
 
 async fn pull(State(node): State<Arc<Node>>, Cbor(req): Cbor<PullReq>) -> Response {
+    // Only what is held here past each want, each origin once: the list
+    // comes from the peer and may be as long as the body allows.
+    let wants = match repl::heads(&node.store).await {
+        Ok(h) => repl::servable_wants(req.wants, &repl::head_map(&h)),
+        Err(e) => return internal(e),
+    };
     match repl::entries_after(
         &node.store,
-        &req.wants,
+        &wants,
         req.since_hlc,
         req.max_entries.clamp(1, 5 * BATCH_ENTRIES),
         req.max_bytes.clamp(1, 4 * BATCH_BYTES),

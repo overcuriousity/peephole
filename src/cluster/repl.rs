@@ -106,6 +106,18 @@ pub fn advertised(ours: Heads, purged: &HashSet<NodeId>, theirs: &HeadMap) -> He
         .collect()
 }
 
+/// What of a peer's `wants` this node can serve: each origin once, and only
+/// origins it holds past what is asked for. A request names any number of
+/// origins; this keeps it to at most one per head held here, and an
+/// unknown origin costs no query.
+pub fn servable_wants(wants: Vec<(NodeId, u64)>, ours: &HeadMap) -> Vec<(NodeId, u64)> {
+    let mut seen = HashSet::new();
+    wants
+        .into_iter()
+        .filter(|(o, after)| ours.get(o).is_some_and(|h| h > after) && seen.insert(*o))
+        .collect()
+}
+
 /// One origin's head (a single lookup; use [`head_map`] for many).
 pub fn head_in(h: &Heads, origin: &NodeId) -> u64 {
     h.iter()
@@ -1945,6 +1957,21 @@ mod tests {
             .await
             .unwrap();
         assert!(b.entries.is_empty() && b.floors.is_empty());
+    }
+
+    /// A pull serves each origin once and only what is held here past the
+    /// want; a list of unknown origins (any number fits in a body) costs
+    /// nothing. Before, each one cost queries on a held connection.
+    #[test]
+    fn wants_are_deduplicated_and_bounded_by_our_heads() {
+        let (a, b) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        );
+        let ours = super::head_map(&vec![(a, 5), (b, 3)]);
+        let mut wants = vec![(a, 2), (a, 0), (b, 3)];
+        wants.extend((0..1000).map(|_| (Identity::generate().unwrap().id, 0)));
+        assert_eq!(super::servable_wants(wants, &ours), vec![(a, 2)]);
     }
 
     /// A purged origin is reported at what the peer holds, or not at all.
