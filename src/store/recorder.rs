@@ -8,8 +8,8 @@ use super::scans::{EnqueueOutcome, ScanJobRow};
 use crate::cluster::Node;
 use crate::cluster::hlc::Hlc;
 use crate::cluster::record::{
-    FingerprintRec, FpClaimRec, IpIntelRec, JobStatusRec, PortRec, Record, RequestRec, ScanJobRec,
-    ScanResultRec, TombstoneRec,
+    FingerprintRec, FpClaimRec, IpIntelRec, JobStatusRec, PortRec, Record, RequestRec, RulesetRec,
+    ScanJobRec, ScanResultRec, TombstoneRec,
 };
 use crate::scan::guard::{self, EnqueuePolicy};
 use crate::scan::nmap_xml::ScanResult;
@@ -161,6 +161,7 @@ impl Recorder {
             raw_head: n.raw_head.clone(),
             tls_client_hello: n.tls_client_hello.clone(),
             ja4: n.ja4.clone(),
+            rules: n.rules.clone(),
         }))])
         .await?;
         sqlx::query_as("SELECT id, ip_id FROM requests WHERE uid = ?")
@@ -168,6 +169,55 @@ impl Recorder {
             .fetch_optional(&self.store().pool)
             .await?
             .with_context(|| format!("requests {uid} was not stored"))
+    }
+
+    /// Publish the ruleset `c` was loaded from, unless it is this node's
+    /// current one already: its newest published ruleset, still in its log
+    /// for others to fetch (a node keeping a window drops old entries).
+    /// Returns whether it was published.
+    pub async fn publish_ruleset(&self, c: &crate::classify::Classifier) -> Result<bool> {
+        let files = c.files().to_vec();
+        if !data::ruleset_fits(&files) {
+            tracing::warn!(
+                files = files.len(),
+                "rules too large to publish to the cluster; requests still carry their fingerprint"
+            );
+            return Ok(false);
+        }
+        let pool = &self.store().pool;
+        let current: Option<(String, String)> = sqlx::query_as(
+            "SELECT hash, uid FROM rulesets WHERE origin IS ? ORDER BY hlc DESC, id DESC LIMIT 1",
+        )
+        .bind(self.node_id().map(|id| id.0.to_vec()))
+        .fetch_optional(pool)
+        .await?;
+        if let Some((hash, uid)) = current
+            && hash == c.fingerprint()
+        {
+            let held = match self {
+                Recorder::Local(_) => true,
+                Recorder::Cluster(_) => {
+                    sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM repl_log
+                                   WHERE uid = ? AND kind = 'ruleset' AND payload IS NOT NULL)",
+                    )
+                    .bind(&uid)
+                    .fetch_one(pool)
+                    .await?
+                }
+            };
+            if held {
+                return Ok(false);
+            }
+        }
+        self.write(vec![Record::Ruleset(RulesetRec {
+            uid: self.uid(),
+            hash: c.fingerprint().to_string(),
+            files,
+            build: crate::COMMIT.into(),
+        })])
+        .await?;
+        Ok(true)
     }
 
     /// Record requests from `ip` that the flood gate answered without
@@ -1167,4 +1217,26 @@ pub struct Deleted {
     pub deleted: u64,
     /// Records other nodes originated: hidden on this node only.
     pub hidden: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Standalone, a ruleset is stored once per change, without an origin.
+    #[tokio::test]
+    async fn a_standalone_node_publishes_its_ruleset_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let rec = store.local();
+        let rules = crate::classify::Classifier::from_dir(std::path::Path::new("rules")).unwrap();
+        assert!(rec.publish_ruleset(&rules).await.unwrap());
+        assert!(!rec.publish_ruleset(&rules).await.unwrap());
+        let rows: Vec<(Option<Vec<u8>>, String)> =
+            sqlx::query_as("SELECT origin, hash FROM rulesets")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(None, rules.fingerprint().to_string())]);
+    }
 }

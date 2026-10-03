@@ -78,6 +78,28 @@ pub struct MemberView {
     pub rules: String,
     /// Some of them came out differently here.
     pub rules_differ: bool,
+    /// Its current ruleset, short ("3f9a0c1d2e4b"), or "none published".
+    pub ruleset: String,
+    /// Whether that is ours; None when either is unknown.
+    pub ruleset_same: Option<bool>,
+}
+
+/// Characters of a ruleset fingerprint shown.
+const SHORT_HASH: usize = 12;
+
+/// Each node's current ruleset: the one it published last.
+async fn current_rulesets(
+    store: &crate::store::Store,
+) -> AppResult<std::collections::HashMap<Vec<u8>, String>> {
+    let rows: Vec<(Option<Vec<u8>>, String)> =
+        sqlx::query_as("SELECT origin, hash FROM rulesets ORDER BY hlc, id")
+            .fetch_all(&store.pool)
+            .await?;
+    // Later rows overwrite earlier ones.
+    Ok(rows
+        .into_iter()
+        .map(|(o, h)| (o.unwrap_or_default(), h))
+        .collect())
 }
 
 /// Members' recent requests classified again with this node's rules, by
@@ -86,6 +108,8 @@ pub struct RulesCheck {
     pub by_member: std::collections::HashMap<NodeId, Agreement>,
     /// Why nothing was compared (no or broken `rules_dir` here).
     pub unavailable: Option<String>,
+    /// The fingerprint of the rules compared with.
+    pub fingerprint: Option<String>,
 }
 
 /// How long a comparison is shown before it is made again.
@@ -113,6 +137,7 @@ async fn compare_rules(
     let mut check = RulesCheck {
         by_member: Default::default(),
         unavailable: None,
+        fingerprint: None,
     };
     // The rules as they are on disk now (the trap and scanner load them
     // when they start).
@@ -128,6 +153,7 @@ async fn compare_rules(
             return Ok(check);
         }
     };
+    check.fingerprint = Some(c.fingerprint().to_string());
     for m in members::all(store).await? {
         let a = agreement(&store.pool, &c, Some(&m.id.0[..]), RULES_SAMPLE).await?;
         check.by_member.insert(m.id, a);
@@ -247,6 +273,22 @@ async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<Me
     let statuses = node.peer_status.read().unwrap().clone();
     let me = node.id();
     let keys = crate::cluster::confkey::held(&node.store).await?;
+    let rulesets = current_rulesets(&node.store).await?;
+    // What our trap published, else the rules on disk.
+    let ours = rulesets
+        .get(&me.0[..])
+        .or(check.fingerprint.as_ref())
+        .cloned();
+    let ruleset_of = |id: &NodeId| {
+        let theirs = rulesets.get(&id.0[..]);
+        (
+            theirs.map_or_else(
+                || "none published".to_string(),
+                |h| h.chars().take(SHORT_HASH).collect(),
+            ),
+            theirs.zip(ours.as_ref()).map(|(t, o)| t == o),
+        )
+    };
     let mut out = vec![];
     let mut mine = None;
     for m in rows {
@@ -275,7 +317,10 @@ async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<Me
         };
         let error = statuses.get(&m.id).and_then(|s| s.last_error.clone());
         let agreement = check.by_member.get(&m.id);
+        let (ruleset, ruleset_same) = ruleset_of(&m.id);
         let v = MemberView {
+            ruleset,
+            ruleset_same,
             rules: match (&check.unavailable, agreement) {
                 (Some(why), _) => format!("not compared: {why}"),
                 (None, Some(a)) => a.summary(),
@@ -340,7 +385,10 @@ async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<Me
         }
     }
     let own = own_history(node).await?;
+    let (ruleset, _) = ruleset_of(&me);
     let mine = mine.unwrap_or_else(|| MemberView {
+        ruleset,
+        ruleset_same: None,
         key: me.to_string(),
         short: me.short(),
         name: node.cfg.node_name.clone(),

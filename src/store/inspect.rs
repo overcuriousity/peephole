@@ -77,6 +77,8 @@ pub struct RequestDetail {
     pub fingerprint: Option<FpSummary>,
     /// Distributed mode: the node that recorded it.
     pub node: Option<String>,
+    /// The start of the fingerprint of the ruleset that classified it.
+    pub rules_short: Option<String>,
 }
 
 const SCAN_SELECT: &str =
@@ -444,6 +446,7 @@ impl Store {
         .await?;
         Ok(Some(RequestDetail {
             node,
+            rules_short: row.rules.as_ref().map(|h| h.chars().take(12).collect()),
             row,
             ip,
             headers,

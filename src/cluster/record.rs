@@ -79,6 +79,11 @@ pub struct RequestRec {
     /// (both stored as `[]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owasp_json: Option<String>,
+    /// Fingerprint of the ruleset that classified the request (see
+    /// [`RulesetRec`]); absent for claims and records written before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<String>,
 }
 
 /// One request the flood gate answered without recording it in full.
@@ -232,6 +237,26 @@ pub struct IntelManifestRec {
     pub fetched_at: String,
 }
 
+/// The rules a node classifies requests with, published once per change:
+/// when its trap starts with rules it has not published as its current
+/// ones. Requests carry only the fingerprint.
+///
+/// What a node publishes is its word, like any verdict it stores: a node
+/// can publish one ruleset and classify with another. Nodes check what
+/// they act on by classifying the requests again with their own rules.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RulesetRec {
+    pub uid: String,
+    /// [`crate::classify::rules::fingerprint`] of `files`.
+    pub hash: String,
+    /// The rules files: name and text, in name order.
+    pub files: Vec<(String, String)>,
+    /// Source commit of the binary that created the record (provenance);
+    /// left out when unset, like every field added later.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build: String,
+}
+
 /// A delete by the node that created the listed records. Wherever it is
 /// applied, it only affects entries of the tombstone's own origin; uids of
 /// other nodes' records in the list are ignored.
@@ -269,6 +294,7 @@ pub enum Record {
     Tombstone(TombstoneRec),
     IntelManifest(IntelManifestRec),
     SkipBatch(SkipBatchRec),
+    Ruleset(RulesetRec),
 }
 
 /// Kinds whose payload is not stored in the log but rebuilt from their row
@@ -292,6 +318,7 @@ impl Record {
             Record::Tombstone(_) => "tombstone",
             Record::IntelManifest(_) => "intel_manifest",
             Record::SkipBatch(_) => "skip_batch",
+            Record::Ruleset(_) => "ruleset",
         }
     }
 
@@ -306,6 +333,7 @@ impl Record {
             Record::ScanResult(r) => Some(r.uid.clone()),
             Record::Tombstone(r) => Some(r.uid.clone()),
             Record::SkipBatch(r) => Some(r.uid.clone()),
+            Record::Ruleset(r) => Some(r.uid.clone()),
             _ => None,
         }
     }
@@ -457,6 +485,31 @@ mod tests {
         let back: Record = super::super::rpc::cbor::decode(&bytes).unwrap();
         assert_eq!(back, rec);
         assert_eq!(super::super::rpc::cbor::encode(&back).unwrap(), bytes);
+    }
+
+    /// A request without a ruleset fingerprint encodes as before; one with
+    /// it still decodes where the field is unknown (older nodes), since
+    /// fields a build does not know are skipped.
+    #[test]
+    fn rules_are_optional_and_unknown_fields_are_skipped() {
+        let enc = |r: &Record| crate::cluster::rpc::cbor::encode(r).unwrap();
+        let plain = Record::Request(Box::default());
+        assert!(!enc(&plain).windows(5).any(|w| w == b"rules"));
+        let with = Record::Request(Box::new(RequestRec {
+            rules: Some("ab".repeat(32)),
+            ..Default::default()
+        }));
+        let bytes = enc(&with);
+        assert!(bytes.windows(5).any(|w| w == b"rules"));
+        // A field from the future, as an older node sees `rules`.
+        let mut v: ciborium::Value = crate::cluster::rpc::cbor::decode(&bytes).unwrap();
+        if let ciborium::Value::Map(m) = &mut v {
+            m.push(("from_the_future".into(), 7.into()));
+        }
+        let back: Record =
+            crate::cluster::rpc::cbor::decode(&crate::cluster::rpc::cbor::encode(&v).unwrap())
+                .unwrap();
+        assert_eq!(back, with);
     }
 
     fn info(id: NodeId) -> MemberInfo {

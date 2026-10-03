@@ -27,6 +27,8 @@ pub struct NewRequest {
     pub ja4: Option<String>,
     /// JSON array of OWASP tags from the verdict; None stores `'[]'`.
     pub owasp_json: Option<String>,
+    /// Fingerprint of the ruleset that classified it (None for claims).
+    pub rules: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -68,6 +70,7 @@ pub struct RequestRow {
     pub transport: Option<String>,
     pub via_proxy: Option<bool>,
     pub ja4: Option<String>,
+    pub rules: Option<String>,
 }
 
 /// Distinct refresh intervals; later lookups reuse the last one (over

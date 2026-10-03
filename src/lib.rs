@@ -473,6 +473,13 @@ impl RoleRunner {
         // Loaded on every start, so edited rules apply when the role is
         // switched off and on.
         let classifier = classify::Classifier::from_dir(dir).context("loading rules")?;
+        // Every request carries the rules' fingerprint; the rules themselves
+        // are published once per change.
+        match self.recorder.publish_ruleset(&classifier).await {
+            Ok(true) => info!(rules = classifier.fingerprint(), "ruleset published"),
+            Ok(false) => {}
+            Err(e) => warn!(error = %format!("{e:#}"), "publishing the ruleset failed"),
+        }
         let state = Arc::new(trap::TrapState {
             store: self.store.clone(),
             recorder: self.recorder.clone(),

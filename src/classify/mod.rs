@@ -187,6 +187,9 @@ pub fn decoded_body<'a>(headers: &[(String, String)], body: &'a [u8]) -> Cow<'a,
 
 pub struct Classifier {
     rules: Vec<CompiledRule>,
+    /// The files the rules came from, and their fingerprint.
+    files: Vec<rules::RulesFile>,
+    fingerprint: String,
 }
 
 impl Classifier {
@@ -195,8 +198,20 @@ impl Classifier {
         self.rules.len()
     }
 
+    /// SHA-256 over the rules files (see [`rules::fingerprint`]): stored
+    /// with every request this classifier labels.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// The rules files as loaded: name and text, in name order.
+    pub fn files(&self) -> &[rules::RulesFile] {
+        &self.files
+    }
+
     pub fn from_dir(dir: &Path) -> Result<Self> {
-        let rules = rules::load_dir(dir)?
+        let (rules, files) = rules::load(dir)?;
+        let rules = rules
             .into_iter()
             .map(|r| {
                 Ok(CompiledRule {
@@ -212,7 +227,11 @@ impl Classifier {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { rules })
+        Ok(Self {
+            fingerprint: rules::fingerprint(&files),
+            rules,
+            files,
+        })
     }
 
     pub fn classify(&self, req: &RequestView, hist: &IpHistory, bot: &BotTells) -> Verdict {

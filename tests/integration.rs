@@ -225,6 +225,18 @@ async fn fp_claim_is_stored_and_scan_still_proceeds() {
         .await
         .unwrap();
     assert!(jobs >= 1, "scan must still be queued after fp claim");
+    // The probe carries the fingerprint of the rules that classified it;
+    // the claim, which no rule classified, none.
+    let rules: Vec<(bool, Option<String>)> =
+        sqlx::query_as("SELECT is_fp_claim, rules FROM requests ORDER BY id")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    let ours = peephole::classify::Classifier::from_dir(std::path::Path::new("rules"))
+        .unwrap()
+        .fingerprint()
+        .to_string();
+    assert_eq!(rules, vec![(false, Some(ours)), (true, None)]);
 }
 
 #[tokio::test]

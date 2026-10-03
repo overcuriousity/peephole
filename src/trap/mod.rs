@@ -564,6 +564,8 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 raw_head: c.conn.as_ref().and_then(|k| k.raw_head.clone()),
                 tls_client_hello: c.conn.as_ref().and_then(|k| k.client_hello.clone()),
                 ja4: c.conn.as_ref().and_then(|k| k.ja4.clone()),
+                // Claims are not classified.
+                rules: (!c.is_fp_claim).then(|| state.classifier.fingerprint().to_string()),
             },
         )
         .await?;

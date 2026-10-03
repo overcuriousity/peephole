@@ -120,6 +120,24 @@ be listed under `[[cluster.peers]]` with their key.
   as disagreement. Made at most every 10 minutes, from the rules on disk.
   Differences come from rules that differ (an older or newer version, local
   edits) as much as from doctored ones.
+- **Rulesets.** Every request carries the fingerprint of the rules that
+  classified it (`rules`, a SHA-256 over the rules files), and every node
+  publishes the files of a ruleset once, when its trap starts with rules
+  that are not its current published ones. The Cluster page shows each
+  member's current ruleset, "same as ours" or "differs", and a request's
+  page its fingerprint. What is checked and what is only declared:
+  - A published ruleset's fingerprint is checked against its files, but
+    nothing proves a node classifies with the ruleset it publishes, or that
+    the fingerprint on its requests is the one it used: a node can lie
+    about both.
+  - The actual check is classifying again: scanners do it for every grant,
+    and the Rules column for each member's recent requests.
+  - Neither can tell a fabricated request from a real one: a node can
+    record requests nobody sent. `scan.trusted_origins` and blocking are
+    the answer to a member you do not trust.
+  - Older nodes relay the new record kind without understanding it, and
+    keep the signed form of requests with a fingerprint (their rows have no
+    column for it), so a mixed cluster keeps syncing.
 - When two nodes queue the same IP before either job has reached the
   other, only one of them is scanned: the higher level, else the one
   queued first. Arbiters and scanners both apply this, and the other job

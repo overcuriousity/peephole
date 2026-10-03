@@ -94,6 +94,8 @@ pub struct ExportRow {
     pub owasp: Vec<String>,
     pub severity: Option<i64>,
     pub scan_level: Option<i64>,
+    /// Fingerprint of the ruleset that classified the request.
+    pub rules: Option<String>,
     pub fp_claim: bool,
     pub country: Option<String>,
     pub asn: Option<i64>,
@@ -138,6 +140,7 @@ pub const COLUMNS: &[&str] = &[
     "owasp",
     "severity",
     "scan_level",
+    "rules",
     "fp_claim",
     "country",
     "asn",
@@ -292,6 +295,7 @@ impl ExportRow {
             "owasp": self.owasp,
             "severity": self.severity,
             "scan_level": self.scan_level,
+            "rules": self.rules,
             "fp_claim": self.fp_claim,
             "country": self.country,
             "asn": self.asn,
@@ -613,6 +617,7 @@ fn request_row(
         owasp: serde_json::from_str(&r.owasp_json).unwrap_or_default(),
         severity: Some(r.severity),
         scan_level: Some(r.scan_level),
+        rules: r.rules,
         fingerprints: Value::Array(fingerprints).to_string().into(),
         ..Default::default()
     };
@@ -1051,6 +1056,7 @@ mod tests {
                 raw_head: Some(b"POST /login HTTP/1.1\r\n\r\n".to_vec()),
                 tls_client_hello: Some(vec![0x16, 3, 1]),
                 ja4: Some("t13d0305h2_aaaaaaaaaaaa_bbbbbbbbbbbb".into()),
+                rules: Some("ab".repeat(32)),
                 ..Default::default()
             })
             .await
@@ -1118,6 +1124,8 @@ mod tests {
         assert_eq!(r["answer"], "not-found");
         assert_eq!(r["status"], 404);
         assert_eq!(r["ja4"], "t13d0305h2_aaaaaaaaaaaa_bbbbbbbbbbbb");
+        assert_eq!(r["rules"], "ab".repeat(32));
+        assert!(rows[1]["rules"].is_null(), "light rows were not classified");
         assert_eq!(r["transport"], "https");
         assert_eq!(r["via_proxy"], true);
         assert_eq!(r["http_version"], "HTTP/1.1");
@@ -1172,6 +1180,15 @@ mod tests {
                 .any(|kv| kv.key == "peephole.format_version" && kv.value.as_deref() == Some("1"))
         );
         let schema = b.schema().clone();
+        // The same columns in the same order as the text exports, less
+        // their RFC 3339 copy of `ts`.
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        let text: Vec<&str> = COLUMNS
+            .iter()
+            .copied()
+            .filter(|c| *c != "datetime")
+            .collect();
+        assert_eq!(names, text);
         assert!(matches!(
             schema.field_with_name("ts").unwrap().data_type(),
             arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, Some(_))

@@ -9,7 +9,8 @@
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{
     FingerprintRec, FpClaimRec, IntelManifestRec, IpIntelRec, JobAdoptRec, JobStatusRec, PortRec,
-    ROW_BACKED, Record, RequestRec, ScanJobRec, ScanResultRec, SkipBatchRec, TombstoneRec,
+    ROW_BACKED, Record, RequestRec, RulesetRec, ScanJobRec, ScanResultRec, SkipBatchRec,
+    TombstoneRec,
 };
 use anyhow::Result;
 use sqlx::SqliteConnection;
@@ -84,6 +85,7 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
         Record::Tombstone(t) => tombstone(conn, ctx, t).await,
         Record::IntelManifest(m) => intel_manifest(conn, ctx, m).await,
         Record::SkipBatch(b) => skip_batch(conn, ctx, b).await,
+        Record::Ruleset(r) => ruleset(conn, ctx, r).await,
         Record::MemberAdd(_) | Record::MemberUpdate(_) | Record::MemberRevoke { .. } => {
             Ok(Effect::Ignored)
         }
@@ -92,7 +94,7 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
 
 /// Record kinds a local hide or block keeps out of the tables. Membership,
 /// tombstones and scan-job state still apply, so the cluster stays in step.
-const CONTENT_KINDS: [&str; 7] = [
+const CONTENT_KINDS: [&str; 8] = [
     "request",
     "skip_batch",
     "fingerprint",
@@ -100,6 +102,7 @@ const CONTENT_KINDS: [&str; 7] = [
     "scan_job",
     "scan_result",
     "ip_intel",
+    "ruleset",
 ];
 
 async fn origin_blocked(conn: &mut SqliteConnection, origin: Option<&NodeId>) -> Result<bool> {
@@ -264,12 +267,17 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
         Ok(_) => r.labels_json.as_str(),
         Err(_) => "[]",
     };
+    // A ruleset fingerprint, or nothing.
+    let rules = r
+        .rules
+        .as_deref()
+        .filter(|h| crate::classify::rules::is_fingerprint(h));
     sqlx::query(
         "INSERT OR IGNORE INTO requests (uid, origin, hlc, ts, ip_id, method, path, query,
            headers_json, body, labels_json, owasp_json, severity, scan_level, is_fp_claim,
            page_token, answer, status, unrecorded, transport, via_proxy, raw_head,
-           tls_client_hello, ja4, build)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           tls_client_hello, ja4, build, rules)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -296,6 +304,40 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(&r.tls_client_hello)
     .bind(&r.ja4)
     .bind(&r.build)
+    .bind(rules)
+    .execute(&mut *conn)
+    .await?;
+    Ok(Effect::Applied)
+}
+
+/// Most files, and bytes of text in all, a published ruleset may have
+/// (the shipped rules are a few dozen kB).
+pub const RULESET_MAX_FILES: usize = 256;
+pub const RULESET_MAX_BYTES: usize = 1024 * 1024;
+
+/// Whether a ruleset fits [`RULESET_MAX_FILES`] and [`RULESET_MAX_BYTES`].
+pub fn ruleset_fits(files: &[(String, String)]) -> bool {
+    files.len() <= RULESET_MAX_FILES
+        && files.iter().map(|(n, t)| n.len() + t.len()).sum::<usize>() <= RULESET_MAX_BYTES
+}
+
+/// A ruleset as published. Its hash must be its files' fingerprint; an
+/// oversized one is ignored. A node's current ruleset is its newest.
+async fn ruleset(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RulesetRec) -> Result<Effect> {
+    if !ruleset_fits(&r.files) || crate::classify::rules::fingerprint(&r.files) != r.hash {
+        return Ok(Effect::Ignored);
+    }
+    sqlx::query(
+        "INSERT OR IGNORE INTO rulesets (uid, origin, hlc, hash, files_json, build, published_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&r.uid)
+    .bind(ctx.origin_bytes())
+    .bind(ctx.hlc as i64)
+    .bind(&r.hash)
+    .bind(serde_json::to_string(&r.files)?)
+    .bind(&r.build)
+    .bind(now_ts())
     .execute(&mut *conn)
     .await?;
     Ok(Effect::Applied)
@@ -1185,7 +1227,7 @@ async fn remove_row(
 /// Rebuild a row-backed record from its row, byte-for-byte as it was
 /// signed. None if the row is gone.
 pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Result<Option<Record>> {
-    // The columns added later (dataset fields, build, owasp_json).
+    // The columns added later (dataset fields, build, owasp_json, rules).
     type ReqExtra = (
         String,
         Option<String>,
@@ -1197,6 +1239,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
         Option<Vec<u8>>,
         Option<String>,
         String,
+        Option<String>,
     );
     type Req = (
         String,
@@ -1252,7 +1295,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                 Some(r) => {
                     let x: ReqExtra = sqlx::query_as(
                         "SELECT build, answer, status, unrecorded, transport, via_proxy, raw_head,
-                                tls_client_hello, ja4, owasp_json
+                                tls_client_hello, ja4, owasp_json, rules
                          FROM requests WHERE uid = ?",
                     )
                     .bind(uid)
@@ -1282,6 +1325,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         tls_client_hello: x.7,
                         ja4: x.8,
                         owasp_json: Some(x.9).filter(|j| j != "[]"),
+                        rules: x.10,
                     })))
                 }
             }
@@ -1858,6 +1902,7 @@ mod tests {
         r.tls_client_hello = Some(vec![0x16, 3, 1, 0, 0]);
         r.ja4 = Some("t13d0305h2_aaaaaaaaaaaa_bbbbbbbbbbbb".into());
         r.owasp_json = Some(r#"["A03:2021"]"#.into());
+        r.rules = Some(crate::classify::rules::fingerprint(&[]));
         let new = Record::Request(r);
         for rec in [old, new] {
             assert_eq!(apply(&mut conn, ctx, &rec).await.unwrap(), Effect::Applied);
@@ -2180,6 +2225,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(labels, "[]");
+        // A ruleset fingerprint that is not one is stored as none.
+        let mut r = req("badrules");
+        r.rules = Some("not a hash".into());
+        let eff = apply(&mut conn, ctx, &Record::Request(r)).await.unwrap();
+        assert_eq!(eff, Effect::Applied);
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) FROM requests WHERE rules IS NOT NULL"
+            )
+            .await,
+            0
+        );
         // A mapped IPv4 address lands on the plain IPv4 row.
         let mut r = req("mapped");
         r.ip = "::ffff:203.0.113.7".into();
@@ -2252,6 +2310,57 @@ mod tests {
         ] {
             assert_eq!(count(&mut conn, sql).await, 0, "{sql}");
         }
+    }
+
+    /// A ruleset is stored when its hash is its files' fingerprint and it
+    /// is not oversized; standalone too.
+    #[tokio::test]
+    async fn rulesets_are_stored_when_their_hash_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let files = vec![("a.toml".to_string(), "# a\n".to_string())];
+        let rec = |uid: &str, files: Vec<(String, String)>, hash: String| {
+            Record::Ruleset(RulesetRec {
+                uid: format!("{}{uid}", a.uid_prefix()),
+                hash,
+                files,
+                build: String::new(),
+            })
+        };
+        let hash = crate::classify::rules::fingerprint(&files);
+        for (ctx_origin, uid) in [(Some(&a), "r1"), (None, "r2")] {
+            let ctx = Ctx {
+                origin: ctx_origin,
+                hlc: 5,
+            };
+            let r = rec(uid, files.clone(), hash.clone());
+            assert_eq!(apply(&mut conn, ctx, &r).await.unwrap(), Effect::Applied);
+        }
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 6,
+        };
+        let lie = rec("lie", vec![("b.toml".into(), "# b\n".into())], hash.clone());
+        assert_eq!(apply(&mut conn, ctx, &lie).await.unwrap(), Effect::Ignored);
+        let big = vec![("big.toml".to_string(), "#".repeat(RULESET_MAX_BYTES))];
+        let r = rec(
+            "big",
+            big.clone(),
+            crate::classify::rules::fingerprint(&big),
+        );
+        assert_eq!(apply(&mut conn, ctx, &r).await.unwrap(), Effect::Ignored);
+        let rows: Vec<(Option<Vec<u8>>, String, String)> =
+            sqlx::query_as("SELECT origin, hash, files_json FROM rulesets ORDER BY id")
+                .fetch_all(&mut *conn)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0.as_deref(), Some(&a.0[..]));
+        assert_eq!(rows[1].0, None);
+        assert_eq!(rows[0].1, hash);
+        assert_eq!(rows[0].2, r##"[["a.toml","# a\n"]]"##);
     }
 
     #[tokio::test]

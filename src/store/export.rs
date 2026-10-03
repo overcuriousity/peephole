@@ -33,6 +33,7 @@ pub struct ReqRow {
     pub tls_client_hello: Option<Vec<u8>>,
     pub ja4: Option<String>,
     pub build: String,
+    pub rules: Option<String>,
 }
 
 /// A light row with its batch.
@@ -134,7 +135,7 @@ impl Store {
             "SELECT r.id, r.uid, r.origin, r.ts, r.ip_id, i.ip, r.method, r.path, r.query,
                     r.headers_json, r.body, r.labels_json, r.owasp_json, r.severity, r.scan_level, r.answer,
                     r.status, r.unrecorded, r.transport, r.via_proxy, r.raw_head,
-                    r.tls_client_hello, r.ja4, r.build
+                    r.tls_client_hello, r.ja4, r.build, r.rules
              FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1",
         );
         if after.is_some() {

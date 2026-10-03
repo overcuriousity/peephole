@@ -94,7 +94,16 @@ impl Rule {
 }
 
 pub fn load_dir(dir: &Path) -> Result<Vec<Rule>> {
+    Ok(load(dir)?.0)
+}
+
+/// A rules file as loaded: its name (without the directory) and its text.
+pub type RulesFile = (String, String);
+
+/// The rules of `dir`, and the files they came from, in name order.
+pub fn load(dir: &Path) -> Result<(Vec<Rule>, Vec<RulesFile>)> {
     let mut rules = vec![];
+    let mut files = vec![];
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("reading rules dir {}", dir.display()))?
         .filter_map(|e| e.ok())
@@ -118,8 +127,35 @@ pub fn load_dir(dir: &Path) -> Result<Vec<Rule>> {
                 .with_context(|| format!("in {}", path.display()))?;
         }
         rules.extend(file.rule);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        files.push((name, text));
     }
-    Ok(rules)
+    Ok((rules, files))
+}
+
+/// The fingerprint of a ruleset: SHA-256 (lower-case hex) over its files
+/// sorted by name, each as its name's and its text's length (8 bytes, big
+/// endian) followed by the bytes, so no two rulesets share an encoding.
+pub fn fingerprint(files: &[RulesFile]) -> String {
+    use sha2::Digest;
+    let mut sorted: Vec<&RulesFile> = files.iter().collect();
+    sorted.sort();
+    let mut h = sha2::Sha256::new();
+    for (name, text) in sorted {
+        for part in [name.as_bytes(), text.as_bytes()] {
+            h.update((part.len() as u64).to_be_bytes());
+            h.update(part);
+        }
+    }
+    data_encoding::HEXLOWER.encode(&h.finalize())
+}
+
+/// Whether `s` has the form of a [`fingerprint`].
+pub fn is_fingerprint(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[cfg(test)]
@@ -193,6 +229,41 @@ mod tests {
         );
         // Absent stays legal for operator rules.
         assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\n").is_ok());
+    }
+
+    #[test]
+    fn the_fingerprint_covers_names_and_texts_in_any_order() {
+        let f = |files: &[(&str, &str)]| {
+            fingerprint(
+                &files
+                    .iter()
+                    .map(|(n, t)| (n.to_string(), t.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let base = f(&[("a.toml", "x"), ("b.toml", "y")]);
+        assert!(is_fingerprint(&base), "{base}");
+        assert_eq!(base, f(&[("b.toml", "y"), ("a.toml", "x")]));
+        for other in [
+            f(&[("a.toml", "x"), ("b.toml", "z")]),
+            f(&[("a.toml", "x"), ("c.toml", "y")]),
+            f(&[("a.toml", "xb.toml"), ("", "y")]),
+            f(&[("a.toml", "x")]),
+        ] {
+            assert_ne!(base, other);
+        }
+        assert!(!is_fingerprint("abc"));
+        assert!(!is_fingerprint(&base.to_uppercase()));
+        // The files load_dir reads are the ones fingerprinted.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.toml"), "# none yet\n").unwrap();
+        std::fs::write(dir.path().join(".hidden.toml"), "junk").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "junk").unwrap();
+        let (_, files) = load(dir.path()).unwrap();
+        assert_eq!(
+            files,
+            vec![("a.toml".to_string(), "# none yet\n".to_string())]
+        );
     }
 
     #[test]
