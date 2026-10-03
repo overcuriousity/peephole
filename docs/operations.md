@@ -19,8 +19,10 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
   built into it.
 - Asks what this node should do:
   - run a **trap**, the **scanner**, the **web interface**, in any combination;
-  - whether a reverse proxy on the same machine fronts the trap, and otherwise
-    which proxy addresses to trust;
+    the web interface needs a domain whose DNS points at the machine and
+    HTTPS (WebAuthn), so without one answer no: in a cluster the admin area
+    of another node shows everything;
+  - with a trap, **what is in front of it** (see below);
   - the public domain of the admin area (with the web interface);
   - whether to take part in a **cluster**: node name, addresses, an invite
     token, and whether holders of this node's **config key** may change its
@@ -30,9 +32,51 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
   - optional API keys for **AbuseIPDB**, **Shodan** and **GreyNoise**, and
     whether to use **Shodan InternetDB** (no key, non-commercial use only);
   - whether to **set up nginx** for you (see below).
+- Checks that every port the new config listens on is free (from
+  `/proc/net/tcp`, so it works without `ss`). Interactive installs are
+  offered the next free port; unattended ones stop before anything is
+  written. Upgrades skip this.
 - Writes `/etc/peephole/config.toml` and an nginx example that fits the answers
   to `/etc/peephole/nginx.example.conf`, and installs and starts a systemd
   service.
+
+### What is in front of the trap
+
+| Answer | Trap listens on | `trusted_proxies` | nginx |
+|---|---|---|---|
+| `direct`: nothing | `0.0.0.0:80`, `0.0.0.0:443` | `[]` | none |
+| `local`: nginx on this machine | `127.0.0.1:8080`, `127.0.0.1:8081` | loopback | example, optional automatic setup |
+| `remote`: a proxy elsewhere | `0.0.0.0:8080`, `0.0.0.0:8081` | the proxy's addresses (asked, no default) | none for the trap |
+
+- **direct** takes the public ports itself (the unit allows
+  `CAP_NET_BIND_SERVICE`); open 80 and 443 in any firewall in front of the
+  machine, and the cluster port if it is advertised. When `ufw` is active,
+  the installer prints the `ufw allow` commands (it does not run them). It is
+  the default when nothing listens on 80/443 and there is no web role.
+- **direct is refused with the web role**: the admin site needs port 443
+  too. Use **local** there: the nginx stream config splits 443 by name (the
+  admin domain to the admin site, every other name to the trap), which the
+  installer writes and can set up. Or run the web interface on another node
+  of a cluster. With the web role, or when 80/443 are taken, the default is
+  local.
+- **remote**: the proxy sends plain HTTP that matches no real site to
+  `trap_listen` with `X-Forwarded-For` set to the client, and passes TLS for
+  unknown names untouched, with a PROXY protocol v2 header, to
+  `trap_tls_listen`; no health checks on the TLS backend (a `LOCAL` header
+  is refused). Hosts in `trusted_proxies` are believed about the client
+  address, so list only the proxy (a bare address means that one host).
+
+**Cloud machines.** On AWS, Google Cloud, Azure, Alibaba Cloud and Oracle
+Cloud (recognised from the DMI data or the metadata service) the installer
+warns before the scanner question and defaults it to no: their acceptable
+use policies forbid scanning others, and the abuse reports counter-scans
+draw risk suspension of the account. Behind 1:1 NAT no interface carries
+the public address; with a trap or the scanner, the installer asks the
+cloud's metadata service (AWS, Google Cloud, Azure, Hetzner, DigitalOcean;
+one-second timeouts, no outside service) and, when it reports an address
+no interface shows, offers it for `[scan] own_addresses` (never scanned,
+never in the blocklist). It is also the example for the cluster's advertise
+address.
 
 Unattended installs pass the answers as environment variables:
 
@@ -42,10 +86,17 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
        PEEPHOLE_DOMAIN=peephole.example.net PEEPHOLE_NGINX=1 bash
 ```
 
-Every question has a variable (`PEEPHOLE_ROLES`, `PEEPHOLE_LOCAL_PROXY`,
-`PEEPHOLE_CLUSTER`, `PEEPHOLE_CLUSTER_NAME`, `PEEPHOLE_JOIN_TOKEN`,
-`PEEPHOLE_REMOTE_CONFIG`, `PEEPHOLE_NGINX`, `PEEPHOLE_ACME_EMAIL`, …); the
-head of `install.sh` lists them all.
+Every question has a variable (`PEEPHOLE_ROLES`, `PEEPHOLE_FRONT`,
+`PEEPHOLE_TRUSTED_PROXIES`, `PEEPHOLE_OWN_ADDRESSES`, `PEEPHOLE_CLUSTER`,
+`PEEPHOLE_CLUSTER_NAME`, `PEEPHOLE_JOIN_TOKEN`, `PEEPHOLE_REMOTE_CONFIG`,
+`PEEPHOLE_NGINX`, `PEEPHOLE_ACME_EMAIL`, …); the head of `install.sh` lists
+them all. `PEEPHOLE_FRONT=direct|local|remote` answers what is in front of
+the trap. Without it, unattended installs keep what they did before: the
+older `PEEPHOLE_LOCAL_PROXY=1` means local and `0` remote, and a preset
+`PEEPHOLE_TRUSTED_PROXIES` alone means remote; with none of these, the
+default above applies (local with the web role or 80/443 taken, else
+direct). `PEEPHOLE_OWN_ADDRESSES` overrides the metadata's address (`-` for
+none); `PEEPHOLE_METADATA=0` skips asking the metadata service.
 
 Published binaries are built on Ubuntu 22.04 and run on Debian 12 / Ubuntu
 22.04 or newer (glibc ≥ 2.35).
@@ -126,7 +177,7 @@ echo 'include /etc/nginx/peephole-stream.conf;' >> /etc/nginx/nginx.conf
 nginx -t && systemctl reload nginx
 ```
 
-Behind any other reverse proxy: send plain HTTP that matches no real site to
+Behind any other reverse proxy (the installer's **remote** answer): send plain HTTP that matches no real site to
 `trap_listen` with `X-Forwarded-For` set to the peer address, forward TLS for
 unknown names untouched (TCP) to `trap_tls_listen` with a PROXY protocol
 header (v1 or v2), and list the proxy in `trusted_proxies`. A trusted peer
@@ -161,8 +212,8 @@ A versioned release is immutable; install one with the installer from the same
 tag:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/v0.1.0/install.sh | \
-  sudo PEEPHOLE_VERSION=v0.1.0 bash
+curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/v0.1.1/install.sh | \
+  sudo PEEPHOLE_VERSION=v0.1.1 bash
 ```
 
 ## Day to day

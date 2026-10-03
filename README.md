@@ -93,8 +93,10 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
 ```
 
 The installer verifies the download, asks which roles the node runs (trap,
-scanner, web interface), the admin domain, cluster membership and optional
-API keys, writes `/etc/peephole/config.toml`, and starts a systemd service.
+scanner, web interface), what is in front of the trap (nothing, so it takes
+ports 80 and 443 itself; nginx on the machine; or a proxy elsewhere), the
+admin domain, cluster membership and optional API keys, checks the ports are
+free, writes `/etc/peephole/config.toml`, and starts a systemd service.
 On request it also installs nginx with a Let's Encrypt certificate; otherwise
 it writes a matching nginx example and prints the steps. Re-running it
 upgrades in place and rolls back if the new version does not start.
@@ -120,6 +122,7 @@ internet ──► nginx ──────────► (real sites)
 
 On port 443 nginx routes by server name without decrypting, so the trap
 terminates TLS itself and keeps the raw ClientHello and its JA4 fingerprint.
+A trap-only node can also go without nginx and listen on 80 and 443 itself.
 
 Configuration lives in `/etc/peephole/config.toml`
 ([annotated reference](deploy/config.example.toml)). The signature rules
