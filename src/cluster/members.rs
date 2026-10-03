@@ -112,6 +112,7 @@ const SELECT: &str = "SELECT id, name, address, roles_json, proto_min, proto_max
                              sponsor, info_hlc, admitted_hlc, revoked_hlc, remote_config,
                              (SELECT l.hlc FROM repl_log l
                               WHERE l.origin = members.id AND l.sig IS NOT NULL
+                                AND l.applied != 4
                               ORDER BY l.seq DESC LIMIT 1)
                       FROM members";
 
@@ -264,7 +265,9 @@ pub fn valid_address(addr: &str) -> bool {
 /// Whether the origin of `e` may admit `member` at `at`: it has not left,
 /// was not pruned before writing this (no sign of life for the prune window
 /// before it), and stays within [`ADMISSIONS_PER_DAY`]. Each sponsor's
-/// admissions arrive in its own log order, so the verdict is the same on
+/// admissions arrive in its own log order, with rising HLCs (an entry dated
+/// before the previous one is never applied, see `repl::in_order`), so the
+/// window holds every earlier admission and the verdict is the same on
 /// every node.
 async fn may_sponsor(
     node: &Node,
@@ -293,7 +296,8 @@ async fn may_sponsor(
         // admission.
         let prev: Option<i64> = sqlx::query_scalar(
             "SELECT hlc FROM repl_log
-             WHERE origin = ? AND seq < ? AND sig IS NOT NULL ORDER BY seq DESC LIMIT 1",
+             WHERE origin = ? AND seq < ? AND sig IS NOT NULL AND applied != 4
+             ORDER BY seq DESC LIMIT 1",
         )
         .bind(&sponsor.0[..])
         .bind(e.seq.min(i64::MAX as u64) as i64)

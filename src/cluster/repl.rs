@@ -36,6 +36,9 @@ pub type HeadMap = HashMap<NodeId, u64>;
 const APPLIED: i64 = 1;
 const DEFERRED: i64 = 0;
 const UNKNOWN_KIND: i64 = 2;
+/// Dated no later than its origin's previous entry: kept and relayed, never
+/// applied (see [`in_order`]).
+const OUT_OF_ORDER: i64 = 4;
 
 /// Entries of a node nobody admitted (yet) are parked and relayed only up
 /// to these limits per origin; the rest is fetched again once it is
@@ -973,12 +976,47 @@ fn announce_job(node: &Node, _kind: &str, r: &Record) {
     }
 }
 
+/// Whether `e` is dated later than the entry its origin signed before it.
+/// HLCs rise with the sequence in an honest log (see `Hlc::now`); without
+/// this, a member could backdate entries past the windows its limits are
+/// judged in (admissions per day, scan jobs per hour).
+///
+/// The entry before is the latest held with its signature that was itself
+/// in order, so neither an out-of-order entry nor an erased stub (whose HLC
+/// nobody signed, and which a relay could set to anything) moves the bar.
+/// The verdict is the same on every node that holds the same entries. One
+/// case is not: an origin that breaks the order right after an entry it
+/// later erases is judged against that entry by nodes that got it before
+/// the erasure, and against the one before by nodes that only got a stub.
+async fn in_order(conn: &mut SqliteConnection, e: &WireEntry) -> Result<bool> {
+    let prev: Option<i64> = sqlx::query_scalar(
+        "SELECT hlc FROM repl_log
+         WHERE origin = ? AND seq < ? AND sig IS NOT NULL AND applied != ?
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(&e.origin.0[..])
+    .bind(e.seq.min(i64::MAX as u64) as i64)
+    .bind(OUT_OF_ORDER)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(prev.is_none_or(|p| hlc::to_db(e.hlc) > p))
+}
+
 async fn apply_verified(
     node: &Node,
     conn: &mut SqliteConnection,
     e: WireEntry,
     st: &mut Applied,
 ) -> Result<()> {
+    // Out of order: kept (the log stays gap-free, and it is relayed like
+    // any entry) but never applied, here or on any other node.
+    if !in_order(conn, &e).await? {
+        warn!(origin = %e.origin.short(), seq = e.seq, kind = %e.kind,
+              "entry dated before its origin's previous one ignored");
+        insert_log(conn, &e, OUT_OF_ORDER).await?;
+        st.applied += 1;
+        return Ok(());
+    }
     let record = e.record();
     // A kind this build does not know is kept (and relayed) and applied
     // after an upgrade, never retried before.
@@ -1245,13 +1283,14 @@ const REPLAY_BATCH: usize = 1000;
 
 /// Apply log entries that are held with their payload but have no row:
 /// after an unblock, everything the block kept out of the tables. Records an
-/// admin hid stay hidden. Returns how many entries were looked at.
+/// admin hid stay hidden, entries out of order stay unapplied. Returns how
+/// many entries were looked at.
 pub async fn rematerialize(node: &Node) -> Result<usize> {
     // Parents first; job state after the jobs it refers to. Only the keys
     // are collected up front; the entries are loaded batch by batch.
     let keys: Vec<(Vec<u8>, i64)> = sqlx::query_as(
         "SELECT origin, seq FROM repl_log
-         WHERE payload IS NOT NULL
+         WHERE payload IS NOT NULL AND applied != 4
            AND kind IN ('request','scan_job','job_adopt','job_status','fp_claim',
                         'fingerprint','scan_result','ip_intel','skip_batch')
          ORDER BY CASE kind WHEN 'request' THEN 0 WHEN 'scan_job' THEN 1
