@@ -138,9 +138,13 @@ pub async fn set_detached(store: &Store, d: Option<Detached>) -> Result<()> {
     Ok(())
 }
 
-/// Leave the cluster: announce it, hand the announcement to every peer we
-/// can reach, then stop syncing. Returns how many peers were told.
+/// Leave the cluster: revoke our invites, announce it, hand the
+/// announcement to every peer we can reach, then stop syncing. Returns how
+/// many peers were told.
 pub async fn leave(node: &Node) -> Result<usize> {
+    // A node that left admits nobody: an invite given out before must not
+    // let anyone in on its word afterwards.
+    invite::revoke_all(&node.store).await?;
     repl::append(node, &[Record::MemberRevoke { id: node.id() }]).await?;
     let mut told = 0;
     for (peer, _, addr) in node.dial_targets() {

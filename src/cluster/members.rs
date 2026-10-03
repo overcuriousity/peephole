@@ -349,8 +349,14 @@ async fn may_sponsor(
 }
 
 /// Whether this node may admit `member` now (checked before an invite is
-/// used up: peers would ignore an admission over the daily limit).
+/// used up: peers would ignore an admission over the daily limit, or by a
+/// node that left). A node that left or was pruned admits nobody; that is
+/// decided here rather than in [`may_sponsor`], whose verdict on its own
+/// entries must match what peers decide when they apply them.
 pub async fn can_admit(node: &Node, member: &NodeId) -> Result<bool> {
+    if node.detached().is_some() {
+        return Ok(false);
+    }
     let mut conn = node.store.pool.acquire().await?;
     let probe = WireEntry {
         origin: node.id(),

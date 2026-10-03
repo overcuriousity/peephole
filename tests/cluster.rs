@@ -535,6 +535,39 @@ async fn leaving_without_reachable_peers_still_detaches() {
     assert_eq!(x.detached(), Some(cluster::Detached::Left));
 }
 
+/// A node that left admits nobody: leaving revokes its invites, and it
+/// refuses to redeem any invite while detached. Before, a joiner could
+/// still redeem an old token and be vouched for by a node that was gone.
+#[tokio::test]
+async fn a_node_that_left_admits_nobody() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (id, d) = new_node("d");
+    let _na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let nd = boot(id, &d, &[], DEFAULT).await;
+    let old = invite::create(&nb, &Default::default()).await.unwrap();
+    cluster::leave(&nb).await.unwrap();
+    assert!(
+        invite::list(&nb.store)
+            .await
+            .unwrap()
+            .iter()
+            .all(|i| i.revoked)
+    );
+    // An invite made after leaving does not admit anyone either.
+    let new = invite::create(&nb, &Default::default()).await.unwrap();
+    for token in [old, new] {
+        let e = invite::join(&nd, &token).await.unwrap_err();
+        assert!(
+            format!("{e:#}").contains("not in a cluster any more"),
+            "{e:#}"
+        );
+    }
+    assert!(!members::can_admit(&nb, &d.id).await.unwrap());
+    assert!(!knows(&nb, d.id, true).await);
+}
+
 /// What a member recorded stays acceptable after it left: a node that
 /// syncs later still applies all of it.
 #[tokio::test]
