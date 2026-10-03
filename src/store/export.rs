@@ -153,7 +153,7 @@ impl Store {
         if f.label.is_some() {
             // Exact label match via json_each, matching the admin search.
             sql.push_str(
-                " AND EXISTS (SELECT 1 FROM json_each(r.labels_json) je WHERE je.value = ?)",
+                " AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(r.labels_json) THEN r.labels_json ELSE '[]' END) je WHERE je.value = ?)",
             );
         }
         if f.min_severity.is_some() {

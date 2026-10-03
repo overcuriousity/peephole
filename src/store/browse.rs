@@ -361,7 +361,7 @@ fn request_filter_sql(f: &RequestFilter, a: Audience, indexed: bool) -> (String,
         binds.push(pat);
     }
     if let Some(v) = nonempty(&f.label) {
-        sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(r.labels_json) je WHERE je.value = ?)");
+        sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(r.labels_json) THEN r.labels_json ELSE '[]' END) je WHERE je.value = ?)");
         binds.push(v);
     }
     if let Some(v) = f.severity {

@@ -609,13 +609,15 @@ async fn run_retention(
         // Drain in batches until a pass removes nothing.
         loop {
             match recorder.prune_older_than(days).await {
-                Ok((0, 0)) => break,
-                Ok((r, s)) => {
-                    info!(requests = r, scans = s, "retention: pruned old records");
-                    if r == 0 && s == 0 {
-                        break;
-                    }
-                }
+                Ok(p) if p.is_empty() => break,
+                Ok(p) => info!(
+                    requests = p.requests,
+                    scans = p.scans,
+                    skipped_batches = p.skipped_batches,
+                    fingerprints = p.fingerprints,
+                    jobs = p.jobs,
+                    "retention: pruned old records"
+                ),
                 Err(e) => {
                     warn!(?e, "retention sweep failed");
                     break;

@@ -2,6 +2,7 @@
 //! health, full request detail. Never called from public handlers.
 use super::Store;
 use super::browse::{PAGE_SIZE, Page, offset};
+use super::recorder::Recorder;
 use super::requests::RequestRow;
 use crate::events::QueueJob;
 use anyhow::Result;
@@ -84,7 +85,7 @@ const SCAN_SELECT: &str =
             (SELECT name FROM members m WHERE m.id = s.origin) AS node
      FROM scans s JOIN ips i ON s.ip_id = i.id";
 
-const CLAIM_SELECT: &str = "SELECT c.id, c.ts, i.ip, c.contact_email, c.user_agent FROM fp_claims c JOIN ips i ON c.ip_id = i.id";
+const CLAIM_SELECT: &str = "SELECT c.id, c.ts, i.ip, c.contact_email, COALESCE(c.user_agent, '') AS user_agent FROM fp_claims c JOIN ips i ON c.ip_id = i.id";
 
 const BODY_LIMIT: usize = 16 * 1024;
 /// Upper bound on a decompressed scan's raw nmap XML.
@@ -369,7 +370,9 @@ impl Store {
             .await?)
     }
 
-    pub async fn queue_summary(&self) -> Result<QueueSummary> {
+    /// `rec` is this node's recorder, so the hourly count is the one the
+    /// node's rate cap uses (in a cluster: this node's scanner launches).
+    pub async fn queue_summary(&self, rec: &Recorder) -> Result<QueueSummary> {
         // Each count is a range of the (status, finished_at) index, not a
         // pass over every job ever queued.
         let (q, r, d, f): (i64, i64, i64, i64) = sqlx::query_as(
@@ -388,7 +391,7 @@ impl Store {
             done_24h: d,
             failed_24h: f,
             // Same count the hourly cap uses: every nmap launch, any outcome.
-            scans_last_hour: self.jobs_started_last_hour().await?,
+            scans_last_hour: rec.jobs_started_last_hour().await?,
         })
     }
 
@@ -593,12 +596,19 @@ mod tests {
         let claims = s.claims_for_ip(a).await.unwrap();
         assert_eq!(claims[0].contact_email.as_deref(), Some("me@x.y"));
         assert_eq!(s.inbox().await.unwrap().len(), 1);
+        // A replicated claim may carry no user agent.
+        sqlx::query("UPDATE fp_claims SET user_agent = NULL")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(s.inbox().await.unwrap()[0].user_agent, "");
+        assert_eq!(s.claims_for_ip(a).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn queue_summary_failed_jobs_and_request_detail() {
         let (s, a) = seeded().await;
-        let q = s.queue_summary().await.unwrap();
+        let q = s.queue_summary(&s.local()).await.unwrap();
         assert_eq!(q.done_24h, 1);
         assert_eq!(q.failed_24h, 1);
         assert_eq!(q.queued, 0);

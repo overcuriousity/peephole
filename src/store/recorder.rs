@@ -1045,11 +1045,13 @@ impl Recorder {
     }
 
     /// Retention (standalone nodes): delete requests, with their claims and
-    /// fingerprints, and scan results older than `days`. Bounded per call so
-    /// a huge backlog drains over several runs. Returns (requests, scans).
-    pub async fn prune_older_than(&self, days: u32) -> Result<(u64, u64)> {
+    /// fingerprints, scan results, skipped batches, finished jobs and
+    /// fingerprints without a request, older than `days`. Bounded per call
+    /// so a huge backlog drains over several runs: call again until the
+    /// result [`Pruned::is_empty`].
+    pub async fn prune_older_than(&self, days: u32) -> Result<Pruned> {
         if days == 0 {
-            return Ok((0, 0));
+            return Ok(Pruned::default());
         }
         const BATCH: i64 = 20_000;
         let pool = &self.store().pool;
@@ -1061,46 +1063,63 @@ impl Recorder {
         .bind(BATCH)
         .fetch_all(pool)
         .await?;
-        let reqs = self.delete_requests(&req_ids).await?.deleted;
-        let scan_uids: Vec<String> = sqlx::query_scalar(
+        let requests = self.delete_requests(&req_ids).await?.deleted;
+        let mut counts = [0u64; 4];
+        for (n, sql) in counts.iter_mut().zip([
             "SELECT uid FROM scans
              WHERE COALESCE(finished_at, started_at) < datetime('now', ?)
              ORDER BY id LIMIT ?",
-        )
-        .bind(&cutoff)
-        .bind(BATCH)
-        .fetch_all(pool)
-        .await?;
-        let scans = scan_uids.len() as u64;
-        self.bury(scan_uids).await?;
-        let skip_uids: Vec<String> = sqlx::query_scalar(
             "SELECT uid FROM skipped_batches
              WHERE last_ms < CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000
              ORDER BY last_ms LIMIT ?",
-        )
-        .bind(&cutoff)
-        .bind(BATCH)
-        .fetch_all(pool)
-        .await?;
-        self.bury(skip_uids).await?;
-        // Finished jobs without a scan left: otherwise they (and their IP
-        // rows, which a job keeps alive) would stay forever.
-        let job_uids: Vec<String> = sqlx::query_scalar(
+            // Fingerprints that never had a request (a /collect with an
+            // unknown token): nothing else deletes them, and they keep
+            // their IP alive.
+            "SELECT uid FROM fingerprints
+             WHERE request_id IS NULL AND request_uid IS NULL AND uid IS NOT NULL
+               AND ts < datetime('now', ?)
+             ORDER BY id LIMIT ?",
+            // Finished jobs without a scan left: otherwise they (and their
+            // IP rows, which a job keeps alive) would stay forever. After
+            // the scans above, so a job whose scan just went follows it.
             "SELECT j.uid FROM scan_jobs j
              WHERE j.status IN ('done', 'failed', 'superseded', 'refused')
                AND COALESCE(j.finished_at, j.queued_at) < datetime('now', ?)
                AND NOT EXISTS (SELECT 1 FROM scans s WHERE s.job_id = j.id)
              ORDER BY j.id LIMIT ?",
-        )
-        .bind(&cutoff)
-        .bind(BATCH)
-        .fetch_all(pool)
-        .await?;
-        if !job_uids.is_empty() {
-            tracing::info!(jobs = job_uids.len(), "retention: pruned old scan jobs");
+        ]) {
+            let uids: Vec<String> = sqlx::query_scalar(sql)
+                .bind(&cutoff)
+                .bind(BATCH)
+                .fetch_all(pool)
+                .await?;
+            *n = uids.len() as u64;
+            self.bury(uids).await?;
         }
-        self.bury(job_uids).await?;
-        Ok((reqs, scans))
+        let [scans, skipped_batches, fingerprints, jobs] = counts;
+        Ok(Pruned {
+            requests,
+            scans,
+            skipped_batches,
+            fingerprints,
+            jobs,
+        })
+    }
+}
+
+/// What one [`Recorder::prune_older_than`] pass deleted, per table.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Pruned {
+    pub requests: u64,
+    pub scans: u64,
+    pub skipped_batches: u64,
+    pub fingerprints: u64,
+    pub jobs: u64,
+}
+
+impl Pruned {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
     }
 }
 

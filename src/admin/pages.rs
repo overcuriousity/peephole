@@ -88,7 +88,7 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
     let fetched = |k: &str| intel.get(k).cloned().unwrap_or_else(|| "never".into());
     render(&HomePage {
         chrome: chrome(),
-        q: st.store.queue_summary().await?,
+        q: st.store.queue_summary(&st.recorder).await?,
         workers: st.pace.get().max_workers,
         cap: st.pace.get().max_scans_per_hour,
         inbox: st.store.inbox_count().await?,
