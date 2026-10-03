@@ -23,35 +23,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// many have run. Append new files only; never edit a shipped one. `--`
 /// comments are stripped, then each file is split on `;`, so statements
 /// must not contain semicolons themselves (no string literals with `;`).
-/// 0001 is idempotent (`IF NOT EXISTS`) so databases from before versioning
-/// (user_version 0, tables present) pass through it unharmed.
-const MIGRATIONS: &[&str] = &[
-    include_str!("migrations/0001_initial.sql"),
-    include_str!("migrations/0002_replication.sql"),
-    include_str!("migrations/0003_replicated_rows.sql"),
-    include_str!("migrations/0004_scan_arbiter.sql"),
-    include_str!("migrations/0005_intel_files.sql"),
-    include_str!("migrations/0006_repl_heads.sql"),
-    include_str!("migrations/0007_webauthn_states.sql"),
-    include_str!("migrations/0008_indexes.sql"),
-    include_str!("migrations/0009_member_info.sql"),
-    include_str!("migrations/0010_invites.sql"),
-    include_str!("migrations/0011_scoped_tombstones.sql"),
-    include_str!("migrations/0012_tomb_proofs.sql"),
-    include_str!("migrations/0013_hide_block.sql"),
-    include_str!("migrations/0014_origin_indexes.sql"),
-    include_str!("migrations/0015_config_audit.sql"),
-    include_str!("migrations/0016_config_keys.sql"),
-    include_str!("migrations/0017_ip_intel.sql"),
-    include_str!("migrations/0018_cluster_limits.sql"),
-    include_str!("migrations/0019_read_models.sql"),
-    include_str!("migrations/0020_sessions.sql"),
-    include_str!("migrations/0021_intel_history.sql"),
-    include_str!("migrations/0022_dataset.sql"),
-    include_str!("migrations/0023_skipped_retention.sql"),
-    include_str!("migrations/0024_history_floor.sql"),
-    include_str!("migrations/0025_request_rules.sql"),
-];
+/// 0001 is the schema as of 0.1.0; databases of earlier builds are refused
+/// (see [`APPLICATION_ID`]).
+const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_initial.sql")];
+
+/// `PRAGMA application_id` of a peephole database ("peep"). Databases of
+/// builds before 0.1.0 do not carry it and are refused rather than migrated.
+const APPLICATION_ID: i32 = 0x7065_6570;
 
 #[derive(Clone)]
 pub struct Store {
@@ -83,6 +61,9 @@ impl Store {
             .await
             .context("opening sqlite")?;
         incremental_vacuum_if_new(&pool).await;
+        check_application_id(&pool)
+            .await
+            .with_context(|| path.display().to_string())?;
         migrate(&pool, MIGRATIONS).await?;
         backfill_ip_keys(&pool).await?;
         let search = ensure_search_index(&pool).await;
@@ -271,6 +252,34 @@ async fn ensure_search_index(pool: &sqlx::SqlitePool) -> bool {
     }
 }
 
+/// Refuse a database that is not peephole's or predates 0.1.0; stamp a new
+/// one. Tables without the stamp come from a pre-release build, whose
+/// schema history was squashed into 0001: they are not migrated.
+async fn check_application_id(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
+    let id: i32 = sqlx::query_scalar("PRAGMA application_id")
+        .fetch_one(pool)
+        .await?;
+    if id == APPLICATION_ID {
+        return Ok(());
+    }
+    let tables: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master")
+        .fetch_one(pool)
+        .await?;
+    if tables > 0 || id != 0 {
+        anyhow::bail!(
+            "not a peephole 0.1.0 database (from a pre-release build, or another \
+             program's); move it aside and start again with an empty one"
+        );
+    }
+    // PRAGMA takes no bind parameters; the id is our own constant.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PRAGMA application_id = {APPLICATION_ID}"
+    )))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Statements of a migration file: `--` comments removed, split on `;`.
 /// A `CREATE TRIGGER … BEGIN …; …; END` stays one statement.
 fn statements(sql: &str) -> Vec<String> {
@@ -424,9 +433,9 @@ mod tests {
         assert_eq!(s.schema_version().await.unwrap(), MIGRATIONS.len() as i64);
     }
 
-    /// Databases created before versioning have the tables but user_version 0.
+    /// Pre-release databases (no application id) are refused, untouched.
     #[tokio::test]
-    async fn pre_versioning_database_is_adopted_with_its_data() {
+    async fn a_database_without_the_application_id_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
         {
@@ -434,95 +443,30 @@ mod tests {
                 .filename(&path)
                 .create_if_missing(true);
             let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
-            for stmt in MIGRATIONS[0]
-                .split(';')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                sqlx::query(sqlx::AssertSqlSafe(stmt))
-                    .execute(&pool)
-                    .await
-                    .unwrap();
-            }
-            sqlx::query("INSERT INTO settings (key, value) VALUES ('k','v')")
+            sqlx::query("CREATE TABLE ips (id INTEGER PRIMARY KEY)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("PRAGMA user_version = 25")
                 .execute(&pool)
                 .await
                 .unwrap();
             pool.close().await;
         }
-        let s = Store::connect(&path).await.unwrap();
-        assert_eq!(s.schema_version().await.unwrap(), MIGRATIONS.len() as i64);
-        assert_eq!(s.setting_get("k").await.unwrap().as_deref(), Some("v"));
-    }
-
-    /// 0017 keeps the facts already shown as this node's results.
-    #[tokio::test]
-    async fn migration_0017_keeps_existing_facts_as_results() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.db");
-        {
-            let opts = SqliteConnectOptions::new()
-                .filename(&path)
-                .create_if_missing(true);
-            let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
-            migrate(&pool, &MIGRATIONS[..16]).await.unwrap();
-            sqlx::query(
-                "INSERT INTO ips (ip, first_seen, last_seen, country, asn, asn_org, is_tor_exit)
-                 VALUES ('203.0.113.7', '2026-01-01 00:00:00', '2026-01-02 00:00:00',
-                         'DE', 3320, 'DTAG', 1),
-                        ('203.0.113.8', '2026-01-01 00:00:00', '2026-01-02 00:00:00',
-                         NULL, NULL, NULL, 0)",
-            )
-            .execute(&pool)
+        let e = Store::connect(&path).await.err().expect("refused");
+        assert!(
+            format!("{e:#}").contains("not a peephole 0.1.0 database"),
+            "{e:#}"
+        );
+        // A new database is stamped and opens again.
+        let fresh = dir.path().join("fresh.db");
+        drop(Store::connect(&fresh).await.unwrap());
+        let s = Store::connect(&fresh).await.unwrap();
+        let id: i32 = sqlx::query_scalar("PRAGMA application_id")
+            .fetch_one(&s.pool)
             .await
             .unwrap();
-            pool.close().await;
-        }
-        let s = Store::connect(&path).await.unwrap();
-        let rows: Vec<(String, String, Vec<u8>, i64, String)> = sqlx::query_as(
-            "SELECT ip, provider, origin, hlc, data_json FROM ip_intel ORDER BY provider",
-        )
-        .fetch_all(&s.pool)
-        .await
-        .unwrap();
-        assert_eq!(rows.len(), 2, "{rows:?}");
-        let (ip, provider, origin, hlc, data) = &rows[0];
-        assert_eq!(
-            (ip.as_str(), provider.as_str()),
-            ("203.0.113.7", "maxmind-geolite2")
-        );
-        assert!(origin.is_empty());
-        assert_eq!(*hlc, 0);
-        let data: serde_json::Value = serde_json::from_str(data).unwrap();
-        assert_eq!(data["country"], "DE");
-        assert_eq!(data["asn"], 3320);
-        assert_eq!(data["asn_org"], "DTAG");
-        let (ip, provider, origin, _, data) = &rows[1];
-        assert_eq!(
-            (ip.as_str(), provider.as_str()),
-            ("203.0.113.7", "tor-exits")
-        );
-        assert!(origin.is_empty());
-        assert_eq!(data, r#"{"exit":true}"#);
-        type View = (String, Option<String>, Option<i64>, Option<String>, bool);
-        let view: Vec<View> =
-            sqlx::query_as("SELECT ip, country, asn, asn_org, is_tor_exit FROM ips ORDER BY ip")
-                .fetch_all(&s.pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            view,
-            [
-                (
-                    "203.0.113.7".into(),
-                    Some("DE".into()),
-                    Some(3320),
-                    Some("DTAG".into()),
-                    true
-                ),
-                ("203.0.113.8".into(), None, None, None, false),
-            ]
-        );
+        assert_eq!(id, APPLICATION_ID);
     }
 
     #[test]
@@ -540,87 +484,6 @@ mod tests {
         assert!(s[1].contains("DELETE FROM a WHERE x = 0;"));
         assert!(s[2].starts_with("create temp trigger") && s[2].ends_with("end"));
         assert_eq!(s[3], "DROP TABLE b");
-    }
-
-    /// 0019 backfills the per-IP read models and the CIDR keys.
-    #[tokio::test]
-    async fn migration_0019_backfills_read_models() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.db");
-        {
-            let opts = SqliteConnectOptions::new()
-                .filename(&path)
-                .create_if_missing(true);
-            let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
-            migrate(&pool, &MIGRATIONS[..17]).await.unwrap();
-            sqlx::query(
-                "INSERT INTO ips (id, ip, first_seen, last_seen) VALUES
-                   (1, '203.0.113.7', '2026-01-01 00:00:00', '2026-01-02 00:00:00'),
-                   (2, '2001:db8::1', '2026-01-01 00:00:00', '2026-01-02 00:00:00')",
-            )
-            .execute(&pool)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO requests (uid, ts, ip_id, method, path, headers_json, labels_json, severity)
-                 VALUES ('a', '2026-01-01 00:00:00', 1, 'GET', '/a', '[]', '[\"x\",\"y\"]', 2),
-                        ('b', '2026-01-01 00:00:00', 1, 'GET', '/b', '[]', '[\"x\"]', 3),
-                        ('c', '2026-01-01 00:00:00', 1, 'GET', '/c', '[]', 'junk', 1)",
-            )
-            .execute(&pool)
-            .await
-            .unwrap();
-            pool.close().await;
-        }
-        let s = Store::connect(&path).await.unwrap();
-        let rows: Vec<(String, i64, i64, String)> =
-            sqlx::query_as("SELECT ip, request_count, max_severity, ip_key FROM ips ORDER BY id")
-                .fetch_all(&s.pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            rows,
-            [
-                (
-                    "203.0.113.7".into(),
-                    3,
-                    3,
-                    "00000000000000000000ffffcb007107".into()
-                ),
-                (
-                    "2001:db8::1".into(),
-                    0,
-                    0,
-                    "20010db8000000000000000000000001".into()
-                ),
-            ]
-        );
-        let labels: Vec<(String, i64)> =
-            sqlx::query_as("SELECT label, count FROM ip_labels ORDER BY label")
-                .fetch_all(&s.pool)
-                .await
-                .unwrap();
-        assert_eq!(labels, [("x".into(), 2), ("y".into(), 1)]);
-        // Rows written before the index existed are searchable.
-        let hits: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM requests_fts WHERE requests_fts MATCH 'path : \"/b\"'",
-        )
-        .fetch_one(&s.pool)
-        .await
-        .unwrap();
-        assert_eq!(hits, 0, "two characters are below the trigram length");
-        let hits: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM requests_fts WHERE requests_fts MATCH '\"junk\"'",
-        )
-        .fetch_one(&s.pool)
-        .await
-        .unwrap();
-        assert_eq!(hits, 0);
-        let all: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests_fts")
-            .fetch_one(&s.pool)
-            .await
-            .unwrap();
-        assert_eq!(all, 3);
     }
 
     #[test]

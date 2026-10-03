@@ -146,6 +146,12 @@ version does not come up, it rolls back the binary, the unit and — when the
 new version changed its schema — the database, then checks the old version
 is running again.
 
+0.1.0 starts the schema afresh: it refuses a database written by an earlier
+(pre-release) build, and says so in the journal. Stop peephole, move the
+database (`database_path`, with its `-wal` and `-shm` files) aside and start
+it again; it creates an empty one. In a cluster, do this on every node and
+join them again with fresh invites.
+
 The systemd unit is treated like a conffile: if you edited it, it is kept and
 the new upstream version is placed beside it as `peephole.service.new`. Keep your own service settings (sandboxing, limits) in a drop-in
 (`systemctl edit peephole`), which upgrades never touch. Your config, the
