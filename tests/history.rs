@@ -324,7 +324,7 @@ async fn batch_from(n: &Node, origin: NodeId, after: u64) -> peephole::cluster::
 async fn a_windowed_node_starts_at_a_peer_floor() {
     let (a, x, _d) = windowed_holder().await;
     let (w, _e) = offline(&[&a], 7).await;
-    let st = repl::apply_batch_with(&w, batch_from(&x, a.key(), 0).await, true)
+    let st = repl::apply_batch_with(&w, batch_from(&x, a.key(), 0).await, |_| true)
         .await
         .unwrap();
     assert_eq!((st.applied, st.rejected), (3, 0), "{st:?}");
@@ -336,7 +336,7 @@ async fn a_windowed_node_starts_at_a_peer_floor() {
         1
     );
     // Offered again: nothing new.
-    let st = repl::apply_batch_with(&w, batch_from(&x, a.key(), 0).await, true)
+    let st = repl::apply_batch_with(&w, batch_from(&x, a.key(), 0).await, |_| true)
         .await
         .unwrap();
     assert_eq!(st.applied, 0);
@@ -376,7 +376,7 @@ async fn a_windowed_node_jumps_to_a_peer_floor() {
     a.seq = 0;
     let first = old_and_new(&mut a).into_iter().take(2).collect();
     apply(&w, first).await;
-    let st = repl::apply_batch_with(&w, batch_from(&x, a.key(), 2).await, true)
+    let st = repl::apply_batch_with(&w, batch_from(&x, a.key(), 2).await, |_| true)
         .await
         .unwrap();
     assert_eq!(st.applied, 2, "{st:?}");
@@ -417,7 +417,7 @@ async fn an_admission_after_a_gap_in_the_sponsors_history_counts() {
         floors: vec![(a.key(), 5)],
         bounds: vec![],
     };
-    let st = repl::apply_batch_with(&w, batch, true).await.unwrap();
+    let st = repl::apply_batch_with(&w, batch, |_| true).await.unwrap();
     assert_eq!(st.applied, 2, "{st:?}");
     let admitted: i64 = sqlx::query_scalar("SELECT admitted_hlc FROM members WHERE id = ?")
         .bind(&c.key().0[..])
@@ -438,10 +438,12 @@ async fn the_floor_moves_before_the_membership_below_it() {
         .await
         .unwrap();
     assert_eq!(cut_short.entries.len(), 1);
-    repl::apply_batch_with(&w, cut_short, true).await.unwrap();
+    repl::apply_batch_with(&w, cut_short, |_| true)
+        .await
+        .unwrap();
     assert_eq!(floor(&w, a.key()).await, 5);
     // The rest connects (asked for after what is held).
-    let st = repl::apply_batch_with(&w, batch_from(&x, a.key(), 1).await, true)
+    let st = repl::apply_batch_with(&w, batch_from(&x, a.key(), 1).await, |_| true)
         .await
         .unwrap();
     assert_eq!(st.applied, 2, "{st:?}");

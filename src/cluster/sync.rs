@@ -8,7 +8,7 @@ use super::record::WireEntry;
 use super::repl::{self, Heads};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
@@ -198,13 +198,13 @@ async fn peer_loop(
                 continue;
             }
         }
+        // Origins we will not pull from this peer (waiting for a member that
+        // holds more of them) must not make it answer at once either.
+        let mut refused = repl::refused_origins(&node).await.unwrap_or_default();
+        refused.extend(node.unserved_from(&peer));
         let wait = WaitReq {
             heads: repl::heads(&node.store).await.unwrap_or_default(),
-            refused: repl::refused_origins(&node)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
+            refused: refused.into_iter().collect(),
             windowed: node.windowed(),
         };
         let long_poll = node.call::<_, Heads>(peer, &addr, "/rpc/v1/wait", &wait);
@@ -285,10 +285,11 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
     // must not crowd out the rest) and what the peer cannot serve us (its
     // history starts past ours).
     let refused = repl::refused_origins(node).await?;
-    // A windowed node starts at this peer's floor only when no member that
-    // keeps more is reachable; otherwise it waits for that one.
-    let skip_ok = !node.keeps_more_elsewhere(&peer);
-    let take_floor = node.windowed() && skip_ok;
+    // A windowed node starts an origin at this peer's floor only when no
+    // member that holds more of it is reachable; otherwise it waits for
+    // that one.
+    let skip_ok = |o: &NodeId, mine: u64| !node.keeps_more_elsewhere(&peer, o, mine);
+    let take_floor = |o: &NodeId, mine: u64| node.windowed() && skip_ok(o, mine);
     let unserved: Vec<NodeId> = {
         let ours = repl::head_map(&repl::heads(&node.store).await?);
         theirs
@@ -297,7 +298,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
                 let mine = ours.get(o).copied().unwrap_or(0);
                 !refused.contains(o)
                     && mine < *s
-                    && !history::servable(node.peer_floor(&peer, o), mine, take_floor)
+                    && !history::servable(node.peer_floor(&peer, o), mine, take_floor(o, mine))
             })
             .map(|(o, _)| *o)
             .collect()
@@ -311,13 +312,19 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             .filter(|(o, _)| !refused.contains(o))
             .map(|(o, s)| (*o, *s, ours.get(o).copied().unwrap_or(0)))
             .filter(|(o, s, mine)| {
-                mine < s && history::servable(node.peer_floor(&peer, o), *mine, take_floor)
+                mine < s
+                    && history::servable(node.peer_floor(&peer, o), *mine, take_floor(o, *mine))
             })
             .map(|(o, _, mine)| (o, mine))
             .collect();
         if wants.is_empty() {
             break;
         }
+        let skippable: HashSet<NodeId> = wants
+            .iter()
+            .filter(|(o, mine)| skip_ok(o, *mine))
+            .map(|(o, _)| *o)
+            .collect();
         let batch: Batch = node
             .call(
                 peer,
@@ -337,7 +344,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             stuck = true;
             break;
         }
-        let st = repl::apply_batch_with(node, batch, skip_ok).await?;
+        let st = repl::apply_batch_with(node, batch, |o| skippable.contains(o)).await?;
         if st.applied + st.parked == 0 {
             // The peer has entries we cannot make progress on; stop pulling and
             // signal the caller to back off rather than spin.
