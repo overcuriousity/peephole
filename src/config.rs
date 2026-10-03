@@ -283,6 +283,11 @@ pub struct ScanConfig {
     pub max_scans_per_hour: i64,
     #[serde(default)]
     pub never_scan: Vec<IpNet>,
+    /// More addresses of this node, never scanned and never in the
+    /// blocklist like the ones it finds itself: e.g. its public address
+    /// behind 1:1 NAT, which no interface carries.
+    #[serde(default)]
+    pub own_addresses: Vec<std::net::IpAddr>,
     /// Optional per-level argv overrides. The target IP is appended as the
     /// final argument (there is no `{target}` placeholder).
     #[serde(default)]
@@ -433,6 +438,7 @@ impl Default for ScanConfig {
             rescan_cooldown_hours: default_cooldown(),
             max_scans_per_hour: default_rate(),
             never_scan: vec![],
+            own_addresses: vec![],
             level_argv: Default::default(),
             safety: ScanSafety::default(),
             nmap_path: default_nmap_path(),
@@ -648,6 +654,13 @@ impl Config {
             if argv.is_empty() {
                 bail!("scan.level_argv: level {level} is empty (nmap would run its default scan)");
             }
+        }
+        if let Some(a) = s
+            .own_addresses
+            .iter()
+            .find(|a| a.is_unspecified() || a.is_multicast())
+        {
+            bail!("scan.own_addresses: `{a}` is not a host address");
         }
         if !(1..=4).contains(&s.safety.single_request_max_level) {
             bail!("scan.single_request_max_level must be between 1 and 4");
@@ -1015,6 +1028,22 @@ data_dir = "/tmp"
             "{notes}"
         );
         assert!(!notes.contains("scan.retention_days"), "{notes}");
+    }
+
+    #[test]
+    fn own_addresses_must_be_host_addresses() {
+        let scan = |list: &str| {
+            parse(&format!(
+                "{BASE}[roles]\nlistener = false\nweb = false\n[scan]\nown_addresses = [{list}]\n"
+            ))
+        };
+        let cfg = scan("\"203.0.113.5\", \"2001:db8::5\"").unwrap();
+        assert_eq!(cfg.scan.own_addresses.len(), 2);
+        for bad in ["0.0.0.0", "::", "224.0.0.1"] {
+            let e = scan(&format!("\"{bad}\"")).unwrap_err();
+            assert!(e.to_string().contains("own_addresses"), "{e}");
+        }
+        assert!(scan("\"nat.example\"").is_err(), "addresses, not names");
     }
 
     #[test]

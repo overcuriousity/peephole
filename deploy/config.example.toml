@@ -108,11 +108,15 @@ max_scans_per_hour = 30    # global rate cap; excess jobs stay queued
 never_scan = [] # extra CIDRs this node's scanner never scans (own infra, monitoring); other cluster scanners are not bound by it
 # Non-global addresses (loopback, private, CGNAT, link-local, multicast,
 # reserved, NAT64/6to4 forms of those) and this node's own addresses are
-# never counter-scanned regardless of never_scan. Behind 1:1 NAT, add the
-# public address to never_scan.
+# never counter-scanned regardless of never_scan.
 #
 # List public ranges only, e.g. your servers and monitoring:
 # never_scan = ["203.0.113.0/24", "2001:db8::/32"]
+# Behind 1:1 NAT (most clouds) no interface carries the public address, so
+# this node does not know it as its own unless cluster.advertise names it.
+# List it here: it is then never scanned and never in the blocklist, so
+# requests the host itself makes to its traps (hairpin NAT) are harmless.
+# own_addresses = ["203.0.113.5"]
 # nmap_path = "nmap"       # the nmap program (PATH lookup); PEEPHOLE_NMAP_PATH overrides it
 #
 # Bystanders: one request is easily caused by a link preview, URL scanner or

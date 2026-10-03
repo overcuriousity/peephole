@@ -202,7 +202,8 @@ pages: one address (or prefix) per line, requests of severity 3+ in the
 last 24 hours by default, with `?hours=`, `?min_severity=` and
 `?networks=1`. Recomputed at most once a minute. Exclusions: Tor exits,
 addresses a scanner refused as a verified crawler, cluster members'
-addresses, this node's own addresses and `scan.never_scan`. For nginx:
+addresses, this node's own addresses (with `scan.own_addresses`, e.g. its
+public address behind 1:1 NAT) and `scan.never_scan`. For nginx:
 
 ```sh
 curl -fsS https://<your-domain>/api/blocklist | grep -v '^#' | sed 's/.*/deny &;/' > /etc/nginx/blocklist.conf \

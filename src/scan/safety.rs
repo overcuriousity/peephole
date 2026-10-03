@@ -80,13 +80,14 @@ impl Safety {
         self.retry = false;
 
         // This node: listeners bound to specific addresses, the advertised
-        // RPC address, and the addresses of its interfaces.
+        // RPC address, the addresses of its interfaces and `scan.own_addresses`.
         let mut own: HashSet<IpAddr> = local_addresses().await;
         let listeners = [cfg.trap_listen, cfg.admin_listen]
             .into_iter()
             .flatten()
             .chain(cfg.cluster.as_ref().map(|c| c.listen));
         own.extend(listeners.map(|a| a.ip()).filter(|ip| !ip.is_unspecified()));
+        own.extend(&cfg.scan.own_addresses);
         let mut hosts: Vec<(String, String)> = vec![];
         if let Some(a) = cfg.cluster.as_ref().and_then(|c| c.advertise.clone()) {
             hosts.push((a, "this node".into()));
@@ -409,17 +410,24 @@ mod tests {
     async fn own_addresses_are_refused_even_standalone() {
         let dir = tempfile::tempdir().unwrap();
         let cfg: Config = toml::from_str(&format!(
-            "database_path = \"{d}/t.db\"\ndata_dir = \"{d}\"\ntrap_listen = \"203.0.113.80:8080\"\n",
+            "database_path = \"{d}/t.db\"\ndata_dir = \"{d}\"\ntrap_listen = \"203.0.113.80:8080\"\n\
+             [scan]\nown_addresses = [\"198.51.100.5\", \"::ffff:198.51.100.6\"]\n",
             d = dir.path().display()
         ))
         .unwrap();
         let mut s = Safety::new(&cfg);
         s.refresh(&cfg, None).await;
-        assert_eq!(
-            s.refuses(&"203.0.113.80".parse().unwrap()).as_deref(),
-            Some("this node's own address")
-        );
+        // Bound listener, and the configured addresses (1:1 NAT).
+        for own in ["203.0.113.80", "198.51.100.5", "198.51.100.6"] {
+            assert_eq!(
+                s.refuses(&own.parse().unwrap()).as_deref(),
+                Some("this node's own address"),
+                "{own}"
+            );
+        }
         assert!(s.refuses(&"203.0.113.81".parse().unwrap()).is_none());
+        // Kept out of the blocklist's networks too.
+        assert!(s.overlaps(&"198.51.100.0/24".parse().unwrap()));
     }
 
     #[tokio::test]
