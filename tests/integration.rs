@@ -954,6 +954,154 @@ async fn enroll_additional_key_with_session() {
     assert_eq!(resp.status(), 403);
 }
 
+/// Start an enrollment with `body` and register a fresh soft passkey; the
+/// finish request is left to the caller.
+async fn start_enrollment(
+    client: &reqwest::Client,
+    base: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    use webauthn_authenticator_rs::AuthenticatorBackend;
+    use webauthn_authenticator_rs::prelude::Url;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+    let resp = client
+        .post(format!("{base}/enroll/start"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let cco: serde_json::Value = resp.json().await.unwrap();
+    let options: webauthn_rs_proto::PublicKeyCredentialCreationOptions =
+        serde_json::from_value(cco["publicKey"].clone()).unwrap();
+    let cred = SoftPasskey::new(true)
+        .perform_register(Url::parse("https://localhost").unwrap(), options, 60_000)
+        .unwrap();
+    serde_json::json!({ "credential": cred })
+}
+
+async fn session_count(store: &Store) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_enrollment_ends_with_the_session_that_started_it() {
+    let (_trap_base, store, dir) = spawn_trap().await;
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store.clone(), cfg).await;
+    let finish = start_enrollment(&client, &base, serde_json::json!({"label": "late"})).await;
+    // The session ends (signed out elsewhere, expired) mid-ceremony.
+    sqlx::query("DELETE FROM sessions")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let resp = client
+        .post(format!("{base}/enroll/finish"))
+        .json(&finish)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(store.load_credentials().await.unwrap().len(), 1, "no key");
+    assert_eq!(session_count(&store).await, 0, "and no new session");
+
+    // Nor does another session finish what one started.
+    let jar = Arc::new(reqwest::cookie::Jar::default());
+    let url = reqwest::Url::parse(&base).unwrap();
+    let signed_in = |token: String| jar.add_cookie_str(&format!("peephole_session={token}"), &url);
+    signed_in(store.create_session().await.unwrap());
+    let client = reqwest::Client::builder()
+        .cookie_provider(jar.clone())
+        .build()
+        .unwrap();
+    let finish = start_enrollment(&client, &base, serde_json::json!({"label": "x"})).await;
+    let swapped = store.create_session().await.unwrap();
+    signed_in(swapped.clone());
+    let resp = client
+        .post(format!("{base}/enroll/finish"))
+        .json(&finish)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(store.load_credentials().await.unwrap().len(), 1);
+
+    // A ceremony within its session still enrolls, without a new session.
+    let finish = start_enrollment(&client, &base, serde_json::json!({"label": "ok"})).await;
+    let before = session_count(&store).await;
+    let resp = client
+        .post(format!("{base}/enroll/finish"))
+        .json(&finish)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .all(|c| !c.to_str().unwrap().starts_with("peephole_session=")),
+        "no new session cookie"
+    );
+    assert_eq!(store.load_credentials().await.unwrap().len(), 2);
+    assert_eq!(session_count(&store).await, before);
+    assert!(store.validate_session(&swapped).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_setup_token_is_checked_again_when_the_enrollment_finishes() {
+    let (_trap_base, store, dir) = spawn_trap().await;
+    let token = store.issue_setup_token().await.unwrap();
+    let base = spawn_admin_with(store.clone(), dir.path()).await;
+    let client = || {
+        reqwest::Client::builder()
+            .cookie_store(true)
+            .build()
+            .unwrap()
+    };
+    // Two ceremonies start with the same token: only one may use it.
+    let (a, b) = (client(), client());
+    let fin_a = start_enrollment(&a, &base, serde_json::json!({"setup_token": token})).await;
+    let fin_b = start_enrollment(&b, &base, serde_json::json!({"setup_token": token})).await;
+    let resp = a
+        .post(format!("{base}/enroll/finish"))
+        .json(&fin_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = b
+        .post(format!("{base}/enroll/finish"))
+        .json(&fin_b)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(store.load_credentials().await.unwrap().len(), 1);
+    assert_eq!(session_count(&store).await, 1, "only the first signed in");
+
+    // `peephole admin reset-token` invalidates a ceremony already started.
+    let old = peephole::admin::cli::reset_token(&store).await.unwrap().0;
+    let c = client();
+    let fin = start_enrollment(&c, &base, serde_json::json!({"setup_token": old})).await;
+    let new = peephole::admin::cli::reset_token(&store).await.unwrap().0;
+    let resp = c
+        .post(format!("{base}/enroll/finish"))
+        .json(&fin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(store.load_credentials().await.unwrap().len(), 1);
+    assert!(
+        store.setup_token_valid(&new).await.unwrap(),
+        "new one intact"
+    );
+}
+
 #[tokio::test]
 async fn export_download_requires_auth_and_filters() {
     let (trap_base, store, dir) = spawn_trap().await;
