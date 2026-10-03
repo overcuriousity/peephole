@@ -1310,7 +1310,7 @@ async fn apply_record(
     r: &Record,
     received_ms: u64,
 ) -> Result<Settled> {
-    let at = hlc::effective(e.hlc, received_ms);
+    let at = hlc::effective(e.hlc, e.seq, received_ms);
     if super::members::apply(node, conn, e, r, at).await? {
         return Ok(Settled {
             membership: true,
@@ -1672,6 +1672,33 @@ mod tests {
                 .unwrap(),
             3
         );
+    }
+
+    /// Updates from an origin whose clock runs far ahead are all capped to
+    /// the same moment when they arrive in the same millisecond (one batch,
+    /// or a replay, which knows receipt to the second); the later one still
+    /// wins. Before, they tied and every update after the first was dropped.
+    #[tokio::test]
+    async fn capped_updates_keep_their_order() {
+        let (_d, node) = test_node(0).await;
+        let x = Identity::generate().unwrap();
+        super::append(&node, &[Record::MemberAdd(info(x.id, "x"))])
+            .await
+            .unwrap();
+        let ahead = (super::hlc::wall_ms() + 400 * 86_400_000) << 16;
+        let received = super::hlc::wall_ms();
+        let mut tx = node.store.pool.begin().await.unwrap();
+        for (seq, name) in [(1, "first"), (2, "second")] {
+            let r = Record::MemberUpdate(info(x.id, name));
+            let e = WireEntry::sign(&x, seq, ahead + seq, &r).unwrap();
+            super::apply_record(&node, &mut tx, &e, &r, received)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        let all = super::super::members::all(&node.store).await.unwrap();
+        let row = all.iter().find(|m| m.id == x.id).unwrap();
+        assert_eq!(row.name, "second");
     }
 
     /// A heartbeat of `id`, as gossiped, keeping `retention_days` from

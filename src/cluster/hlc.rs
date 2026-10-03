@@ -32,12 +32,24 @@ pub fn latest_at(recv_ms: u64) -> u64 {
         | 0xffff
 }
 
-/// The timestamp a remote entry is ordered by (last write wins, liveness):
-/// its HLC, but never later than its receipt plus the allowed drift. A
-/// member that dates its entries into the future gains nothing, and the
-/// value always fits the database's signed 64-bit integers.
-pub fn effective(hlc: u64, recv_ms: u64) -> u64 {
-    hlc.min(latest_at(recv_ms))
+/// `hlc`, but no later than `limit`. Capped values keep the entry's
+/// sequence in the counter bits: entries of one origin capped to the same
+/// millisecond still order as written, so the later of two updates wins.
+pub fn cap(hlc: u64, seq: u64, limit: u64) -> u64 {
+    if hlc > limit {
+        (limit & !0xffff) | (seq & 0xffff)
+    } else {
+        hlc
+    }
+}
+
+/// The timestamp a remote entry (`seq` in its origin's log) is ordered by
+/// (last write wins, liveness): its HLC, but never later than its receipt
+/// plus the allowed drift. A member that dates its entries into the future
+/// gains nothing, and the value always fits the database's signed 64-bit
+/// integers.
+pub fn effective(hlc: u64, seq: u64, recv_ms: u64) -> u64 {
+    cap(hlc, seq, latest_at(recv_ms))
 }
 
 /// An HLC as stored in an ordering column (signed in SQLite).
@@ -104,11 +116,13 @@ mod tests {
     fn effective_time_is_capped_by_receipt() {
         let now = wall_ms();
         let honest = (now - 1000) << 16;
-        assert_eq!(effective(honest, now), honest);
+        assert_eq!(effective(honest, 1, now), honest);
         let future = (now + 400 * 24 * 3600 * 1000) << 16;
-        assert!(physical_ms(effective(future, now)) <= now + MAX_DRIFT_MS);
+        assert!(physical_ms(effective(future, 1, now)) <= now + MAX_DRIFT_MS);
+        // Later entries capped to the same millisecond still order by seq.
+        assert!(effective(future + 1, 8, now) > effective(future, 7, now));
         // Values beyond i64 (which would sort negative) are clamped too.
-        assert!(effective(u64::MAX, now) <= i64::MAX as u64);
+        assert!(effective(u64::MAX, u64::MAX, now) <= i64::MAX as u64);
         assert_eq!(to_db(u64::MAX), i64::MAX);
         assert_eq!(from_db(-5), 0);
     }

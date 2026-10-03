@@ -64,7 +64,8 @@ pub fn standing(
     if left_hlc.is_some_and(|l| l >= admitted_hlc) {
         return Standing::Left;
     }
-    let entry = super::hlc::effective(last_entry_hlc, last_entry_received_ms);
+    // Only the millisecond counts here, not the order within it.
+    let entry = super::hlc::effective(last_entry_hlc, 0, last_entry_received_ms);
     let evidence = super::hlc::physical_ms(admitted_hlc.max(entry));
     if now_ms.saturating_sub(evidence) > PRUNE_AFTER_MS {
         Standing::Pruned
@@ -73,11 +74,12 @@ pub fn standing(
     }
 }
 
-/// An admission time no later than now. A sponsor's timestamp from the
-/// future must not outrank what the admitted node decides later (leaving),
-/// nor count as a sign of life that has not happened yet.
-fn not_future(hlc: u64) -> u64 {
-    hlc.min((super::hlc::wall_ms() << 16) | 0xffff)
+/// An admission time no later than now (`seq`: the entry's, see
+/// [`super::hlc::cap`]). A sponsor's timestamp from the future must not
+/// outrank what the admitted node decides later (leaving), nor count as a
+/// sign of life that has not happened yet.
+fn not_future(hlc: u64, seq: u64) -> u64 {
+    super::hlc::cap(hlc, seq, (super::hlc::wall_ms() << 16) | 0xffff)
 }
 
 /// A member row as the UI and CLI show it.
@@ -315,7 +317,11 @@ async fn may_sponsor(
         .fetch_optional(&mut *conn)
         .await?;
         let prev = prev.map_or(0, |(h, r)| {
-            super::hlc::effective(super::hlc::from_db(h), super::hlc::from_db(r.unwrap_or(0)))
+            super::hlc::effective(
+                super::hlc::from_db(h),
+                0,
+                super::hlc::from_db(r.unwrap_or(0)),
+            )
         });
         // The entry before this one is not held (history below this node's
         // floor): silence cannot be judged across that gap.
@@ -375,7 +381,14 @@ pub async fn can_admit(node: &Node, member: &NodeId) -> Result<bool> {
         sig: None,
         erased_by: None,
     };
-    may_sponsor(node, &mut conn, &probe, member, not_future(probe.hlc)).await
+    may_sponsor(
+        node,
+        &mut conn,
+        &probe,
+        member,
+        not_future(probe.hlc, probe.seq),
+    )
+    .await
 }
 
 /// The nodes `root` admitted, the nodes those admitted, and so on (not
@@ -423,7 +436,7 @@ pub async fn apply(
                 return Ok(true);
             }
             let info = &sanitize(info);
-            let at = not_future(at);
+            let at = not_future(at, e.seq);
             if !may_sponsor(node, conn, e, &info.id, at).await? {
                 return Ok(true);
             }
@@ -484,7 +497,7 @@ pub async fn apply(
                 "UPDATE members SET revoked_hlc = MAX(COALESCE(revoked_hlc, 0), ?), revoked_by = ?
                  WHERE id = ?",
             )
-            .bind(super::hlc::to_db(not_future(at)))
+            .bind(super::hlc::to_db(not_future(at, e.seq)))
             .bind(&e.origin.0[..])
             .bind(&id.0[..])
             .execute(&mut *conn)
