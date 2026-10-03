@@ -32,7 +32,7 @@ const BATCH: i64 = 500;
 /// receiver holding it up to `receiver_head`: the entries connect, or the
 /// receiver keeps a window and may start at the floor.
 pub fn servable(floor: u64, receiver_head: u64, receiver_windowed: bool) -> bool {
-    receiver_windowed || floor <= receiver_head + 1
+    receiver_windowed || floor <= receiver_head.saturating_add(1)
 }
 
 /// Whether a `/wait` from a peer is answered at once: this node holds
@@ -153,7 +153,7 @@ async fn prune_origin(node: &Node, origin: &NodeId, since: u64) -> Result<u64> {
     if *origin == node.id() {
         // Our own entries go only once a peer is known to hold them.
         let acked = node.own_acked.load(std::sync::atomic::Ordering::Relaxed);
-        new_floor = new_floor.min(acked + 1);
+        new_floor = new_floor.min(acked.saturating_add(1));
     }
     let new_floor = new_floor.max(floor);
     drop(conn);
@@ -294,6 +294,8 @@ mod tests {
         assert!(servable(5, 4, false));
         assert!(!servable(5, 3, false));
         assert!(servable(5, 0, true));
+        // A head sent by a peer cannot overflow the check.
+        assert!(servable(5, u64::MAX, false));
     }
 
     /// `/wait` answers early only for news it can actually deliver: not for

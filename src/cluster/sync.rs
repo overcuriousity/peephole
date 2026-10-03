@@ -26,6 +26,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const DEBOUNCE: Duration = Duration::from_millis(200);
 /// How long a peer holds our long-poll open.
 pub const WAIT_SECS: u64 = 25;
+/// A long-poll answered faster than this did not wait for news.
+const FAST_WAIT: Duration = Duration::from_secs(1);
+/// Longest pause after failed or instant long-polls in a row.
+const MAX_WAIT_BACKOFF: Duration = Duration::from_secs(60);
 /// Re-check the member list (picks up CLI changes) this often.
 const SUPERVISE_TICK: Duration = Duration::from_secs(5);
 /// Re-greet a reachable peer this often.
@@ -141,6 +145,8 @@ async fn peer_loop(
     // cannot apply): without it the loop would re-poll /wait — which answers
     // at once while the peer is ahead — and busy-spin at full CPU.
     let mut stuck_backoff = Duration::from_secs(1);
+    // Pause after a long-poll that failed or answered at once.
+    let mut wait_backoff = Duration::from_secs(1);
     let mut last_hello: Option<tokio::time::Instant> = None;
     let mut changes = node.subscribe_changes();
     loop {
@@ -202,13 +208,37 @@ async fn peer_loop(
             windowed: node.windowed(),
         };
         let long_poll = node.call::<_, Heads>(peer, &addr, "/rpc/v1/wait", &wait);
-        tokio::select! {
-            _ = changes.changed() => tokio::time::sleep(DEBOUNCE).await,
-            // News on their side, or the poll timed out; an error here
-            // surfaces in the next reconcile.
-            _ = long_poll => {}
-            _ = tokio::time::sleep(IDLE_ROUND + jitter(IDLE_JITTER)) => {}
+        let polled = tokio::time::Instant::now();
+        let pause = tokio::select! {
+            _ = changes.changed() => {
+                tokio::time::sleep(DEBOUNCE).await;
+                None
+            }
+            // News on their side, or the poll timed out. A poll that fails
+            // (or answers at once, round after round) while the reconcile
+            // succeeds must not turn this loop into a busy one: pause, more
+            // the more often it happens in a row.
+            r = long_poll => match r {
+                Err(_) => Some(wait_backoff),
+                // Busy clusters answer at once too: keep that pause short.
+                Ok(_) if polled.elapsed() < FAST_WAIT => {
+                    Some((wait_backoff / 4).clamp(DEBOUNCE, FAST_WAIT * 2))
+                }
+                Ok(_) => None,
+            },
+            _ = tokio::time::sleep(IDLE_ROUND + jitter(IDLE_JITTER)) => None,
             _ = shutdown.changed() => return,
+        };
+        match pause {
+            Some(d) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(d) => {}
+                    _ = changes.changed() => {}
+                    _ = shutdown.changed() => return,
+                }
+                wait_backoff = (wait_backoff * 2).min(MAX_WAIT_BACKOFF);
+            }
+            None => wait_backoff = Duration::from_secs(1),
         }
     }
 }

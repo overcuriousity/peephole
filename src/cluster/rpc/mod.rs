@@ -55,8 +55,20 @@ fn internal(e: anyhow::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
 
-async fn heads(State(node): State<Arc<Node>>) -> Response {
-    match repl::heads(&node.store).await {
+/// Our heads, given the caller's. A purged origin is neither served nor
+/// accepted here, so it is reported as far as the caller holds it: the
+/// caller neither asks for it (and backs off on an empty batch) nor pushes it.
+async fn heads(State(node): State<Arc<Node>>, Cbor(theirs): Cbor<repl::Heads>) -> Response {
+    let r = async {
+        let ours = repl::heads(&node.store).await?;
+        let purged = super::block::purged(&node.store).await?;
+        anyhow::Ok(repl::advertised(
+            ours,
+            &purged.into_iter().collect(),
+            &repl::head_map(&theirs),
+        ))
+    };
+    match r.await {
         Ok(h) => Cbor(h).into_response(),
         Err(e) => internal(e),
     }
@@ -82,7 +94,16 @@ async fn push(
     Extension(Peer(peer)): Extension<Peer>,
     Cbor(batch): Cbor<Batch>,
 ) -> Response {
-    if batch.entries.len() > 5 * BATCH_ENTRIES || batch.proofs.len() > 5 * BATCH_ENTRIES {
+    // Floors and bounds: at most one per origin asked for in an honest batch.
+    if [
+        batch.entries.len(),
+        batch.proofs.len(),
+        batch.floors.len(),
+        batch.bounds.len(),
+    ]
+    .iter()
+    .any(|n| *n > 5 * BATCH_ENTRIES)
+    {
         return (StatusCode::PAYLOAD_TOO_LARGE, "too many entries").into_response();
     }
     match repl::apply_batch(&node, batch).await {

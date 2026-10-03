@@ -88,6 +88,21 @@ pub fn ahead_of_map(ours: &Heads, theirs: &HeadMap) -> bool {
         .any(|(o, s)| theirs.get(o).copied().unwrap_or(0) < *s)
 }
 
+/// Heads as reported to a peer holding `theirs`: a purged origin at what
+/// the peer holds (absent if it holds none), so the peer neither pulls what
+/// is no longer served here nor pushes what is no longer accepted.
+pub fn advertised(ours: Heads, purged: &HashSet<NodeId>, theirs: &HeadMap) -> Heads {
+    ours.into_iter()
+        .filter_map(|(o, s)| {
+            if purged.contains(&o) {
+                theirs.get(&o).map(|t| (o, *t))
+            } else {
+                Some((o, s))
+            }
+        })
+        .collect()
+}
+
 /// One origin's head (a single lookup; use [`head_map`] for many).
 pub fn head_in(h: &Heads, origin: &NodeId) -> u64 {
     h.iter()
@@ -263,11 +278,13 @@ pub async fn entries_after(
         }
         let limit = share.min(max_entries - out.len());
         let mut taken = 0;
-        let mut start = (*after + 1).max(floors.get(origin).copied().unwrap_or(1));
+        // `after` comes from the peer: no overflow, no negative bind.
+        let after = (*after).min(i64::MAX as u64);
+        let mut start = (after + 1).max(floors.get(origin).copied().unwrap_or(1));
         if since_hlc > 0 {
             start = start.max(super::history::cut(&mut conn, origin, start, since_hlc).await?);
         }
-        if start > *after + 1 {
+        if start > after + 1 {
             declared.push((*origin, start));
             if let Some(b) = signed_entry(&mut conn, origin, start - 1).await? {
                 bounds.push(b);
@@ -281,7 +298,7 @@ pub async fn entries_after(
             super::history::MEMBERSHIP_SQL
         )))
         .bind(&origin.0[..])
-        .bind(*after as i64)
+        .bind(after as i64)
         .bind(start.min(i64::MAX as u64) as i64)
         .bind(limit as i64)
         .fetch_all(&mut *conn)
@@ -592,6 +609,15 @@ pub async fn append(node: &Node, records: &[Record]) -> Result<Vec<WireEntry>> {
         members |= changed;
         out.push(e);
     }
+    // A local admission (an invite redeemed, a join) can make parked
+    // entries of the admitted node applicable.
+    if members {
+        let mut st = Applied::default();
+        drain_pending(node, &mut tx, &mut st).await?;
+        if st.applied > 0 {
+            retry_deferred(node, &mut tx, &mut st).await?;
+        }
+    }
     tx.commit().await?;
     drop(_g);
     if let Some(last) = out.last() {
@@ -629,16 +655,25 @@ pub async fn apply_batch_with(
         floors,
         bounds,
     } = batch.into();
-    // Where each origin may start here, if past what is held.
+    // Where each origin may start here, if past what is held. Each bound is
+    // looked up by the start it proves and verified at most once.
     let since = node.since_hlc();
+    let declared: HashSet<(NodeId, u64)> = floors.iter().copied().collect();
+    let mut proven: HashSet<(NodeId, u64)> = HashSet::new();
+    if !skip_ok {
+        for b in &bounds {
+            let Some(start) = b.seq.checked_add(1) else {
+                continue;
+            };
+            let key = (b.origin, start);
+            if b.hlc < since && declared.contains(&key) && !proven.contains(&key) && b.verify() {
+                proven.insert(key);
+            }
+        }
+    }
     let floors: HeadMap = floors
         .into_iter()
-        .filter(|(o, start)| {
-            skip_ok
-                || bounds
-                    .iter()
-                    .any(|b| b.origin == *o && b.seq + 1 == *start && b.hlc < since && b.verify())
-        })
+        .filter(|f| skip_ok || proven.contains(f))
         .collect();
     let mut st = Applied::default();
     if entries.is_empty() {
@@ -650,8 +685,12 @@ pub async fn apply_batch_with(
         let start = floors.get(&e.origin).copied();
         apply_one(node, &mut tx, e, &proofs, start, &mut st).await?;
     }
-    if st.applied > 0 {
+    // Parked entries may wait for an origin trusted since they were parked
+    // (also through a local append), so parking alone is reason to look.
+    if st.applied + st.parked > 0 {
         drain_pending(node, &mut tx, &mut st).await?;
+    }
+    if st.applied > 0 {
         // Newly-applied entries may be the parent of earlier deferred ones
         // (those waiting for them were made due).
         retry_deferred(node, &mut tx, &mut st).await?;
@@ -770,14 +809,19 @@ async fn apply_one(
 }
 
 /// A membership entry below a sender's floor (see [`apply_one`]): taken
-/// once, signed by its origin, in log order among what is held.
+/// once, signed by its origin, in log order among what is held, and only
+/// from a trusted origin (a node nobody admitted could otherwise describe
+/// itself and then sponsor others past the parking of its entries).
 async fn apply_membership_below(
     node: &Node,
     conn: &mut SqliteConnection,
     e: WireEntry,
     st: &mut Applied,
 ) -> Result<()> {
-    if !super::history::MEMBERSHIP.contains(&e.kind.as_str()) || e.payload.is_none() || !e.verify()
+    if !super::history::MEMBERSHIP.contains(&e.kind.as_str())
+        || e.payload.is_none()
+        || !e.verify()
+        || !trusted(node, conn, &e.origin).await?
     {
         st.rejected += 1;
         return Ok(());
@@ -1438,5 +1482,220 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(scanned, table);
+    }
+
+    use super::super::identity::{Identity, NodeId};
+    use super::super::record::MemberInfo;
+    use super::super::sync::Batch;
+    use super::{Record, WireEntry};
+
+    async fn test_node(retention_days: u32) -> (tempfile::TempDir, std::sync::Arc<super::Node>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let node = super::Node::open(super::super::NodeParams {
+            identity: Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store,
+            proto: (1, 1),
+            data_dir: dir.path().to_path_buf(),
+            retention_days,
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        (dir, node)
+    }
+
+    fn info(id: NodeId, name: &str) -> MemberInfo {
+        MemberInfo {
+            id,
+            name: name.into(),
+            address: None,
+            roles: vec![],
+            proto_min: 1,
+            proto_max: 1,
+            remote_config: false,
+        }
+    }
+
+    fn now_hlc(n: u64) -> u64 {
+        (super::hlc::wall_ms() << 16) + n
+    }
+
+    async fn trusted(node: &super::Node, id: &NodeId) -> bool {
+        let mut conn = node.store.pool.acquire().await.unwrap();
+        super::trusted(node, &mut conn, id).await.unwrap()
+    }
+
+    async fn logged(node: &super::Node, id: &NodeId) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM repl_log WHERE origin = ?")
+            .bind(&id.0[..])
+            .fetch_one(&node.store.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Membership below a declared floor is taken only from a trusted
+    /// origin. Before, a node nobody admitted, with entries parked here,
+    /// could declare a floor at its parked head and have its own
+    /// description and then an admission of another key applied.
+    #[tokio::test]
+    async fn membership_below_a_floor_needs_a_trusted_origin() {
+        let (_d, node) = test_node(7).await;
+        let x = Identity::generate().unwrap();
+        let y = Identity::generate().unwrap();
+        let parked: Vec<_> = (1..=2)
+            .map(|s| {
+                WireEntry::sign(&x, s, now_hlc(s), &Record::MemberUpdate(info(x.id, "x"))).unwrap()
+            })
+            .collect();
+        let st = super::apply_batch(&node, parked).await.unwrap();
+        assert_eq!(st.parked, 2, "{st:?}");
+        let batch = Batch {
+            entries: vec![
+                WireEntry::sign(&x, 1, now_hlc(10), &Record::MemberUpdate(info(x.id, "x")))
+                    .unwrap(),
+                WireEntry::sign(&x, 2, now_hlc(11), &Record::MemberAdd(info(y.id, "y"))).unwrap(),
+            ],
+            floors: vec![(x.id, 3)],
+            ..Default::default()
+        };
+        let st = super::apply_batch_with(&node, batch, true).await.unwrap();
+        assert_eq!((st.applied, st.rejected), (0, 2), "{st:?}");
+        assert_eq!(logged(&node, &x.id).await, 0);
+        assert!(!trusted(&node, &y.id).await);
+        assert!(!trusted(&node, &x.id).await);
+    }
+
+    /// Parked entries of a node admitted by a local append (an invite
+    /// redeemed here) apply at once, and heartbeats of nodes that are no
+    /// longer members are forgotten.
+    #[tokio::test]
+    async fn a_local_admission_drains_parked_entries() {
+        let (_d, node) = test_node(0).await;
+        let x = Identity::generate().unwrap();
+        let e = WireEntry::sign(&x, 1, now_hlc(1), &Record::MemberUpdate(info(x.id, "x"))).unwrap();
+        assert_eq!(super::apply_batch(&node, vec![e]).await.unwrap().parked, 1);
+        super::append(&node, &[Record::MemberAdd(info(x.id, "x-by-n"))])
+            .await
+            .unwrap();
+        assert_eq!(logged(&node, &x.id).await, 1);
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repl_pending")
+            .fetch_one(&node.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(pending, 0);
+        // The next entry of x applies directly instead of parking.
+        let e =
+            WireEntry::sign(&x, 2, now_hlc(2), &Record::MemberUpdate(info(x.id, "x2"))).unwrap();
+        assert_eq!(super::apply_batch(&node, vec![e]).await.unwrap().applied, 1);
+
+        // Heartbeats: a member's stays, a stranger's goes on reload.
+        let z = Identity::generate().unwrap();
+        for id in [&x, &z] {
+            let hb = super::super::status::Heartbeat {
+                node: id.id,
+                at_ms: super::hlc::wall_ms(),
+                neighbours: vec![],
+                roles: vec![],
+                version: "x".into(),
+                pace: None,
+                active_scans: 0,
+                providers: vec![],
+                own_seq: 0,
+                retention_days: 0,
+                floors: vec![],
+            };
+            let body = super::super::rpc::cbor::encode(&hb).unwrap();
+            let signed = super::super::status::SignedHeartbeat { body, sig: vec![] };
+            assert!(node.status.merge(hb, signed));
+        }
+        node.reload_members().await.unwrap();
+        assert!(node.status.known(&x.id).is_some());
+        assert!(node.status.known(&z.id).is_none());
+    }
+
+    /// A floor is taken with a valid bound among bogus ones (each checked
+    /// once); without one, the gap is refused.
+    #[tokio::test]
+    async fn floors_need_a_valid_bound() {
+        let (_d, node) = test_node(7).await;
+        let o = Identity::generate().unwrap();
+        super::append(&node, &[Record::MemberAdd(info(o.id, "o"))])
+            .await
+            .unwrap();
+        let old = (super::hlc::wall_ms() - 30 * 86_400_000) << 16;
+        let rec = Record::MemberUpdate(info(o.id, "o"));
+        let bound = WireEntry::sign(&o, 2, old, &rec).unwrap();
+        let mut forged = bound.clone();
+        forged.hlc -= 1;
+        let mut huge = bound.clone();
+        huge.seq = u64::MAX;
+        let entry = WireEntry::sign(&o, 3, now_hlc(3), &rec).unwrap();
+        let batch = |bounds: Vec<WireEntry>| Batch {
+            entries: vec![entry.clone()],
+            floors: vec![(o.id, 3)],
+            bounds,
+            ..Default::default()
+        };
+        let st = super::apply_batch_with(&node, batch(vec![forged.clone(), huge.clone()]), false)
+            .await
+            .unwrap();
+        assert_eq!((st.applied, st.rejected), (0, 1), "{st:?}");
+        let st = super::apply_batch_with(&node, batch(vec![forged, huge, bound]), false)
+            .await
+            .unwrap();
+        assert_eq!(st.applied, 1, "{st:?}");
+        let mut conn = node.store.pool.acquire().await.unwrap();
+        assert_eq!(
+            super::super::history::floor_of(&mut conn, &o.id)
+                .await
+                .unwrap(),
+            3
+        );
+    }
+
+    /// A peer asking from the very end of the range gets nothing, not a
+    /// panic or a wrapped query.
+    #[tokio::test]
+    async fn entries_after_the_last_sequence_are_none() {
+        let (_d, node) = test_node(0).await;
+        let b = super::entries_after(&node.store, &[(node.id(), u64::MAX)], 0, 10, 1 << 20)
+            .await
+            .unwrap();
+        assert!(b.entries.is_empty() && b.floors.is_empty());
+    }
+
+    /// A purged origin is reported at what the peer holds, or not at all.
+    #[test]
+    fn purged_origins_are_advertised_at_the_peers_head() {
+        let (a, p) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        );
+        let ours = vec![(a, 5), (p, 9)];
+        let purged = std::collections::HashSet::from([p]);
+        let theirs = super::head_map(&vec![(p, 3)]);
+        assert_eq!(
+            super::advertised(ours.clone(), &purged, &theirs),
+            vec![(a, 5), (p, 3)]
+        );
+        assert_eq!(
+            super::advertised(ours, &purged, &Default::default()),
+            vec![(a, 5)]
+        );
     }
 }
