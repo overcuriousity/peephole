@@ -37,7 +37,8 @@ pub struct LocalStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Heartbeat {
     pub node: NodeId,
-    /// Creator's wall clock (ms); strictly increasing per node.
+    /// Creator's wall clock (ms); strictly increasing per node, except
+    /// after its clock was set back from beyond the allowed drift.
     pub at_ms: u64,
     pub neighbours: Vec<NodeId>,
     pub roles: Vec<String>,
@@ -198,8 +199,24 @@ impl Status {
 
     /// Store a heartbeat if it is newer than what we have.
     pub fn merge(&self, hb: Heartbeat, signed: SignedHeartbeat) -> bool {
+        self.merge_at(hb, signed, super::hlc::wall_ms())
+    }
+
+    /// [`Self::merge`] at local time `now_ms`. A heartbeat dated further
+    /// ahead than the allowed drift is refused, and one already held that
+    /// is (its node's clock ran ahead, then was corrected) gives way to any
+    /// newer-looking one: otherwise it would mute its node until our clock
+    /// caught up with it.
+    fn merge_at(&self, hb: Heartbeat, signed: SignedHeartbeat, now_ms: u64) -> bool {
+        let limit = now_ms.saturating_add(super::hlc::MAX_DRIFT_MS);
+        if hb.at_ms > limit {
+            return false;
+        }
         let mut all = self.heartbeats.lock().unwrap();
-        if all.get(&hb.node).is_some_and(|k| k.hb.at_ms >= hb.at_ms) {
+        if all
+            .get(&hb.node)
+            .is_some_and(|k| k.hb.at_ms >= hb.at_ms && k.hb.at_ms <= limit)
+        {
             return false;
         }
         all.insert(
@@ -227,13 +244,23 @@ impl Status {
     }
 
     fn next_at(&self) -> u64 {
-        let wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let wall = super::hlc::wall_ms();
         let mut last = self.last_at.lock().unwrap();
-        *last = wall.max(*last + 1);
+        // After our clock was set back from far ahead, start again from
+        // it: peers refuse heartbeats dated beyond their drift limit.
+        *last = if *last > wall.saturating_add(super::hlc::MAX_DRIFT_MS) {
+            wall
+        } else {
+            wall.max(*last + 1)
+        };
         *last
+    }
+
+    /// Forget the heartbeats of nodes that are no longer members (left,
+    /// pruned): they are neither gossiped on nor counted. What a node that
+    /// returns is known by comes back with its next heartbeat.
+    pub fn retain_heartbeats(&self, keep: impl Fn(&NodeId) -> bool) {
+        self.heartbeats.lock().unwrap().retain(|id, _| keep(id));
     }
 }
 
@@ -337,6 +364,62 @@ mod tests {
         let ips = s.peer_ips();
         assert_eq!(ips.len(), PEER_IPS_KEPT);
         assert!(ips.contains(&(a, "198.51.100.19".parse().unwrap())));
+    }
+
+    fn signed_hb(
+        id: &crate::cluster::identity::Identity,
+        at_ms: u64,
+    ) -> (Heartbeat, SignedHeartbeat) {
+        let hb = Heartbeat {
+            node: id.id,
+            at_ms,
+            neighbours: vec![],
+            roles: vec![],
+            version: "x".into(),
+            pace: None,
+            active_scans: 0,
+            providers: vec![],
+            own_seq: 0,
+            retention_days: 0,
+            floors: vec![],
+        };
+        let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
+        let sig = id.sign(&SignedHeartbeat::signing(&body));
+        (hb, SignedHeartbeat { body, sig })
+    }
+
+    /// A heartbeat dated far ahead is refused, and one held from before a
+    /// clock correction does not mute its node until our clock catches up.
+    #[test]
+    fn future_heartbeats_do_not_mute_a_node() {
+        let s = Status::default();
+        let a = crate::cluster::identity::Identity::generate().unwrap();
+        let now = 1_000_000_000_000;
+        let drift = crate::cluster::hlc::MAX_DRIFT_MS;
+        let merge = |at, now| {
+            let (hb, signed) = signed_hb(&a, at);
+            s.merge_at(hb, signed, now)
+        };
+        assert!(!merge(now + drift + 1, now), "too far ahead");
+        assert!(s.known(&a.id).is_none());
+        assert!(merge(now, now));
+        assert!(!merge(now, now), "not newer");
+        assert!(merge(now + drift, now), "within the drift");
+        // Held while it was within the drift; an hour later it is not (our
+        // clock was set back, say): a current heartbeat replaces it.
+        assert!(merge(now - 3_600_000 + 10, now - 3_600_000));
+        assert_eq!(s.known(&a.id).unwrap().hb.at_ms, now - 3_600_000 + 10);
+        assert!(!merge(now - 3_600_000, now - 3_600_000), "older again");
+    }
+
+    #[test]
+    fn own_heartbeat_time_recovers_from_a_clock_set_back() {
+        let s = Status::default();
+        let wall = crate::cluster::hlc::wall_ms();
+        *s.last_at.lock().unwrap() = wall + 3_600_000;
+        let at = s.next_at();
+        assert!(at <= crate::cluster::hlc::wall_ms(), "{at}");
+        assert!(s.next_at() > at);
     }
 
     #[test]

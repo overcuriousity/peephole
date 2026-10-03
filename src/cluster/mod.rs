@@ -629,6 +629,7 @@ impl Node {
             .collect();
         let before = self.dial_targets();
         *self.members.write().unwrap() = Arc::new(map);
+        self.status.retain_heartbeats(|id| self.is_member(id));
         *self.detached.write().unwrap() = detached;
         *self.blocked.write().unwrap() = Arc::new(blocked);
         *self.standings.write().unwrap() = Arc::new(standings);
