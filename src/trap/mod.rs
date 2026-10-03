@@ -76,6 +76,23 @@ pub struct Guards {
     pub skips: skiplog::SkipLog,
     /// Trap requests being handled or recorded right now.
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Bounds the recordings running apart from their answers.
+    recording: RecordSlots,
+}
+
+/// Recordings that may run at once. A request waits for a slot before it
+/// is answered, so a flood against a slow database is held up as when the
+/// handler recorded inline, instead of piling up tasks and bodies.
+const MAX_RECORDING: usize = 1024;
+
+struct RecordSlots(std::sync::Arc<tokio::sync::Semaphore>);
+
+impl Default for RecordSlots {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(tokio::sync::Semaphore::new(
+            MAX_RECORDING,
+        )))
+    }
 }
 
 impl Guards {
@@ -84,6 +101,16 @@ impl Guards {
         self.in_flight
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         InFlight(self.in_flight.clone())
+    }
+
+    /// A recording slot, waited for while [`MAX_RECORDING`] are running.
+    async fn slot(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.recording
+            .0
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed")
     }
 
     fn in_flight(&self) -> usize {
@@ -605,9 +632,10 @@ async fn trap_handler(
     // Recorded apart from the answer: hyper drops this future when the
     // client resets the stream or the connection ends, which must not lose
     // the request or a batch of light rows taken but not yet written.
+    let slot = state.guards.slot().await;
     tokio::spawn(record_trap(
         state.clone(),
-        in_flight,
+        (in_flight, slot),
         ip,
         parts,
         body,
@@ -636,7 +664,7 @@ async fn trap_handler(
 #[allow(clippy::too_many_arguments)]
 async fn record_trap(
     state: Arc<TrapState>,
-    _in_flight: InFlight,
+    _in_flight: (InFlight, tokio::sync::OwnedSemaphorePermit),
     ip: IpAddr,
     parts: axum::http::request::Parts,
     body: Vec<u8>,
@@ -738,7 +766,7 @@ async fn claim_handler(
     let path = format!("{}/claim", state.cfg.trap.helper_prefix);
     let conn = meta.map(|m| ConnCapture::of(&m, version));
     // Recorded apart from the answer, as in `trap_handler`.
-    let in_flight = state.guards.enter();
+    let in_flight = (state.guards.enter(), state.guards.slot().await);
     tokio::spawn(async move {
         let _in_flight = in_flight;
         let capture = Capture {
@@ -796,7 +824,7 @@ async fn collect_handler(
         return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
     }
     // Recorded apart from the answer, as in `trap_handler`.
-    let in_flight = state.guards.enter();
+    let in_flight = (state.guards.enter(), state.guards.slot().await);
     tokio::spawn(async move {
         let _in_flight = in_flight;
         if let Ok(ip_row) = state.store.upsert_ip(ip).await {
