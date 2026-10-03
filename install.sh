@@ -394,7 +394,10 @@ fi
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-fetch() { curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors "$1" -o "$2"; }
+# --retry-all-errors needs curl 7.71; older ones refuse the option.
+retry_all=()
+if curl --help all 2>/dev/null | grep -q -- --retry-all-errors; then retry_all=(--retry-all-errors); fi
+fetch() { curl -fsSL --retry 5 --retry-delay 3 ${retry_all[@]+"${retry_all[@]}"} "$1" -o "$2"; }
 
 download() {
     fetch "${BASE_URL}/${ASSET}.tar.gz"        "${tmpdir}/${ASSET}.tar.gz"        || die "download of ${BASE_URL}/${ASSET}.tar.gz failed (no such release, or the rolling release is mid-update; retry in a minute)"
@@ -466,9 +469,14 @@ fi
 upgrade=0
 [ -e "$CONFIG_FILE" ] && upgrade=1
 
+# Unless it is not running (say, a first install that failed to start):
+# then go on and start it.
 if [ "$upgrade" -eq 1 ] && [ -n "$installed_version" ] && [ "$installed_version" = "$new_version" ] && [ "${PEEPHOLE_FORCE:-0}" != "1" ]; then
-    info "peephole ${installed_version} is already up to date (set PEEPHOLE_FORCE=1 to reinstall)"
-    exit 0
+    if systemctl is-active --quiet peephole; then
+        info "peephole ${installed_version} is already up to date (set PEEPHOLE_FORCE=1 to reinstall)"
+        exit 0
+    fi
+    info "peephole ${installed_version} is installed but not running; installing again"
 fi
 
 # --- validate the new binary against the existing config before touching anything
@@ -887,6 +895,13 @@ wait_healthy() {
             if curl -fs "http://${admin_listen}/healthz" >/dev/null 2>&1; then return 0; fi
             sleep 1
         done
+        # The web role may be switched off in the runtime settings; a notify
+        # unit that is active has started all the same.
+        if [ "$(systemctl show -p Type --value peephole 2>/dev/null)" = "notify" ] \
+                && systemctl is-active --quiet peephole; then
+            warn "no answer on http://${admin_listen}/healthz, but the service is up (web role off in the settings?)"
+            return 0
+        fi
         return 1
     fi
     # No web role, so no HTTP endpoint: the service must be up and stay up.
@@ -963,7 +978,7 @@ setup_nginx() {
         # Port 443 goes to the stream config; sites that listen on it
         # themselves have to move behind it first (see the stream example).
         local others
-        others="$(grep -lsE '^[[:space:]]*listen[[:space:]][^;#]*443' /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf || true)"
+        others="$(grep -lsE '^[[:space:]]*listen[[:space:]]+([^;#[:space:]]*[]:])?443([[:space:];]|$)' /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf || true)"
         if [ -n "$others" ]; then
             warn "nginx: port 443 is already used by $(printf '%s' "$others" | tr '\n' ' ')- move those sites behind the stream config first (see ${CONFIG_DIR}/nginx-stream.example.conf); left alone"
             return 1

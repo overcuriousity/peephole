@@ -573,6 +573,27 @@ mod tests {
     }
 
     #[test]
+    fn command_separators_need_a_command() {
+        check(
+            &classifier(),
+            "rce",
+            &[
+                "/x?a=;id",
+                "/x?a=1; id;",
+                "/x?a=;whoami",
+                "/x?a=;id&b=2",
+                "/x?a=;cat%20/etc/passwd",
+            ],
+            &["/item;id=5", "/x?a=1;id=2"],
+        );
+        let c = classifier();
+        let b = labels_of(&c, "POST", "/x", &[], Some(b"a=1;id=2"));
+        assert!(!b.iter().any(|x| x == "rce"), "{b:?}");
+        let b = labels_of(&c, "POST", "/x", &[], Some(b"ip=1.2.3.4;id"));
+        assert!(b.iter().any(|x| x == "rce"), "{b:?}");
+    }
+
+    #[test]
     fn id_substring_is_not_rce() {
         // ";idx=" must not match the ";id" command-injection signature.
         let v = classifier().classify(
@@ -1235,6 +1256,9 @@ mod tests {
             "webhook=http://2130706433/",
             "u=http://0x7f000001/",
             "image=http://10.0.0.4/x",
+            "host=localhost:6379",
+            "url=http://user@127.0.0.1/",
+            "next=/login?u=169.254.1.1",
         ] {
             let v = classifier().classify(
                 &view("GET", "/proxy", Some(q), "curl/8", None),
@@ -1247,6 +1271,9 @@ mod tests {
         for (p, q) in [
             ("/blog/192.168.1.1-release", None),
             ("/fetch", Some("name=127.0.0.1")),
+            ("/", Some("src=jquery-3.10.2.min.js")),
+            ("/", Some("page=/docs/v10.4/")),
+            ("/", Some("ref=v1.10.2")),
         ] {
             let v = classifier().classify(
                 &view("GET", p, q, "Mozilla/5.0", None),

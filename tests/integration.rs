@@ -81,6 +81,29 @@ async fn probe_request_is_logged_and_serves_trap_page() {
 }
 
 #[tokio::test]
+async fn wrong_method_on_a_helper_path_is_the_trap() {
+    let (base, store, _dir) = spawn_trap().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/claim"))
+        .header("x-forwarded-for", "203.0.113.1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert!(
+        resp.text()
+            .await
+            .unwrap()
+            .contains("route which does not exist")
+    );
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE path = '/claim'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
 async fn sqli_request_queues_level_4() {
     let (base, store, _dir) = spawn_trap().await;
     let client = reqwest::Client::new();

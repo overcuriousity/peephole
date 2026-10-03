@@ -252,7 +252,7 @@ pub const SETTINGS_TICK: std::time::Duration = std::time::Duration::from_secs(2)
 const WEB_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long shutdown waits for the roles to stop (scans to finish) before it
 /// abandons them; interrupted scans are requeued as after a crash.
-const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// Longest wait between attempts to start a role that keeps failing.
 const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 

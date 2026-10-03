@@ -5,6 +5,8 @@ use std::path::Path;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleFile {
+    /// A file with every rule commented out is empty, not an error.
+    #[serde(default)]
     pub rule: Vec<Rule>,
 }
 
@@ -98,6 +100,13 @@ pub fn load_dir(dir: &Path) -> Result<Vec<Rule>> {
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        // Not hidden files (an editor's `.#x.toml` lock, often a dangling
+        // symlink), and only regular files (symlinks followed).
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| !n.as_encoded_bytes().starts_with(b"."))
+                && std::fs::metadata(p).is_ok_and(|m| m.is_file())
+        })
         .collect();
     entries.sort();
     for path in entries {
@@ -123,6 +132,24 @@ mod tests {
             r.validate()?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn empty_files_hidden_files_and_directories_are_fine() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join("a.toml"), "# [[rule]]\n# label = \"x\"\n").unwrap();
+        std::fs::write(
+            d.join("b.toml"),
+            "[[rule]]\nlabel=\"x\"\nweight=2\ntarget_regex=\"a\"\n",
+        )
+        .unwrap();
+        std::fs::write(d.join(".hidden.toml"), "not toml").unwrap();
+        std::fs::create_dir(d.join("dir.toml")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("user@host.1234", d.join(".#b.toml")).unwrap();
+        let rules = load_dir(d).unwrap();
+        assert_eq!(rules.len(), 1);
     }
 
     #[test]

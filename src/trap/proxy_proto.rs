@@ -7,16 +7,22 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 pub const SIG_V2: &[u8; 12] = b"\r\n\r\n\0\r\nQUIT\n";
 /// Longest v1 line, CRLF included.
 const MAX_V1: usize = 107;
-/// Longest v2 address block accepted (TLVs included).
-const MAX_V2_LEN: usize = 216;
+/// Longest v2 address block accepted, TLVs included (the format allows
+/// 64 KiB; proxies that add TLVs such as SSL details stay well below this).
+const MAX_V2_LEN: usize = 4096;
 /// Most bytes a header can take.
 pub const MAX_HEADER: usize = 16 + MAX_V2_LEN;
 
 pub enum Proxy {
     Incomplete,
     Invalid,
-    /// `src`: the client; None when the proxy speaks for itself (LOCAL,
-    /// UNKNOWN). `consumed`: the header's length.
+    /// A v2 LOCAL header: the proxy's own connection (a health check), to
+    /// be taken as coming from the real peer. `consumed`: the header's length.
+    Local {
+        consumed: usize,
+    },
+    /// `src`: the client; None when the proxy could not name it (UNKNOWN,
+    /// AF_UNSPEC). `consumed`: the header's length.
     Done {
         src: Option<SocketAddr>,
         consumed: usize,
@@ -88,11 +94,9 @@ fn v2(buf: &[u8]) -> Proxy {
     };
     let consumed = 16 + len;
     if cmd == 0 {
-        return Proxy::Done {
-            src: None,
-            consumed,
-        };
+        return Proxy::Local { consumed };
     }
+    // TLVs after the addresses are skipped with the rest of the block.
     let src = match fam {
         0x00 => None,
         0x11 | 0x12 if len >= 12 => {
@@ -183,14 +187,45 @@ mod tests {
             panic!()
         };
         assert_eq!(src, Some("[2001:db8::1]:7".parse().unwrap()));
-        let Proxy::Done { src, .. } = parse_proxy(&v2(0, 0, &[])) else {
+        assert!(
+            matches!(parse_proxy(&v2(0, 0, &[])), Proxy::Local { consumed: 16 }),
+            "LOCAL: the proxy's own connection"
+        );
+        let Proxy::Done { src, .. } = parse_proxy(&v2(1, 0, &[])) else {
             panic!()
         };
-        assert_eq!(src, None, "LOCAL: the proxy's own connection");
+        assert_eq!(src, None, "AF_UNSPEC names no client");
         assert!(matches!(parse_proxy(&v2(1, 0x11, &[1, 2])), Proxy::Invalid));
         assert!(matches!(
-            parse_proxy(&v2(1, 0x11, &[0; 300])),
+            parse_proxy(&v2(1, 0x11, &[0; MAX_V2_LEN + 1])),
             Proxy::Invalid
         ));
+    }
+
+    /// TLVs (here a PP2_TYPE_SSL block and padding, as HAProxy and cloud
+    /// load balancers add) are consumed and ignored.
+    #[test]
+    fn v2_tlvs_are_skipped() {
+        let mut a = vec![203, 0, 113, 9, 127, 0, 0, 1];
+        a.extend(5555u16.to_be_bytes());
+        a.extend(443u16.to_be_bytes());
+        let mut ssl = vec![0x01, 0, 0, 0, 0];
+        ssl.push(0x21); // PP2_SUBTYPE_SSL_VERSION
+        ssl.extend(7u16.to_be_bytes());
+        ssl.extend(b"TLSv1.3");
+        a.push(0x20); // PP2_TYPE_SSL
+        a.extend((ssl.len() as u16).to_be_bytes());
+        a.extend(ssl);
+        a.push(0x04); // PP2_TYPE_NOOP
+        a.extend(300u16.to_be_bytes());
+        a.extend([0; 300]);
+        let mut h = v2(1, 0x11, &a);
+        assert!(h.len() > 232 && h.len() <= MAX_HEADER);
+        h.extend(b"rest");
+        let Proxy::Done { src, consumed } = parse_proxy(&h) else {
+            panic!()
+        };
+        assert_eq!(src, Some("203.0.113.9:5555".parse().unwrap()));
+        assert_eq!(&h[consumed..], b"rest");
     }
 }
