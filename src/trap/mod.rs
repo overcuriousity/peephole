@@ -113,8 +113,10 @@ async fn write_skips(state: &TrapState, b: skiplog::Batch) {
     }
 }
 
-/// Longest a stopping trap waits for requests in progress to finish.
-const STOP_GRACE: Duration = Duration::from_secs(30);
+/// Longest a stopping trap waits for requests in progress to finish: less
+/// than the daemon's own shutdown grace, which aborts the trap after it, so
+/// the final write still happens.
+const STOP_GRACE: Duration = crate::SHUTDOWN_GRACE.saturating_sub(Duration::from_secs(2));
 
 /// Write the light rows that have waited long enough, every few seconds,
 /// until `shutdown`.
@@ -220,6 +222,9 @@ pub fn router(state: Arc<TrapState>) -> Router {
         .route(&format!("{p}/panel"), get(panel_handler))
         .route(&format!("{p}/collect.js"), get(collector_js))
         .fallback(any(trap_handler))
+        // A wrong method on a helper path is the trap too: axum's own 405
+        // would go unrecorded and give the helpers away.
+        .method_not_allowed_fallback(trap_handler)
         // Limits the helpers' Form/Json bodies; the trap reads its own.
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
@@ -387,22 +392,26 @@ struct Recorded {
 }
 
 /// Record this node's intel result unless it was recorded moments ago.
+/// Best effort: a failure is logged, and the request is recorded anyway.
 async fn record_intel(
     state: &TrapState,
     ip: IpAddr,
     provider: &'static str,
     version: Option<&str>,
     data: serde_json::Value,
-) -> Result<()> {
+) {
     if state.guards.intel.is_current(ip, provider, &data) {
-        return Ok(());
+        return;
     }
-    state
+    if let Err(e) = state
         .recorder
         .record_intel(&ip.to_string(), provider, version, data.clone())
-        .await?;
+        .await
+    {
+        warn!(%ip, provider, error = %e, "trap: recording intel failed");
+        return;
+    }
     state.guards.intel.put(ip, provider, data);
-    Ok(())
 }
 
 async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
@@ -430,7 +439,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 g.asn_org.as_deref(),
             ),
         )
-        .await?;
+        .await;
     }
     // With a Tor list loaded, every IP gets a result (false included); with
     // none, this node has nothing to say.
@@ -447,7 +456,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
             None,
             serde_json::json!({ "exit": exit }),
         )
-        .await?;
+        .await;
     }
 
     // A false-positive claim is the visitor saying "I'm not a scanner"; it must

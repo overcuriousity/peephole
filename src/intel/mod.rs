@@ -722,8 +722,16 @@ async fn run_cluster(
                         info!(n, "tor exit list refreshed for the cluster");
                         tor_backoff.reset();
                         reload(&[share::TOR.to_string()], &cfg, &tor);
+                        // A published list makes it not due; an unpublished
+                        // one would be fetched again every pass.
                         if let Err(e) = share::publish(&node, &cfg.data_dir, &[share::TOR]).await {
-                            warn!(?e, "announcing tor exit list failed");
+                            let wait = tor_backoff.fail();
+                            warn!(
+                                ?e,
+                                retry_in_secs = wait.as_secs(),
+                                "announcing tor exit list failed"
+                            );
+                            tor_next = std::time::Instant::now() + wait;
                         }
                     }
                     Err(e) => {

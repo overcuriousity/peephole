@@ -17,7 +17,7 @@ pub const KEY_ROLE_SCANNER: &str = "roles.scanner";
 pub const KEY_ROLE_WEB: &str = "roles.web";
 const KEY_VERSION: &str = "settings.version";
 /// Longest rescan cooldown (one year).
-const MAX_COOLDOWN_HOURS: i64 = 24 * 365;
+pub const MAX_COOLDOWN_HOURS: i64 = 24 * 365;
 
 /// Every key a runtime override can use.
 pub const KEYS: [&str; 7] = [

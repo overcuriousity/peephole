@@ -11,10 +11,11 @@
 label = "rce"
 weight = 4
 owasp = ["A03:2021"]
-# Command separators and tooling. \b after id/whoami so "id" does not match
-# "idx=". $(...) and `...` command substitution, pipes into nc/curl/wget,
-# shells and Windows interpreters.
-target_regex = ''';\s*(id|whoami|uname|wget|curl|busybox|chmod|tftp|cat\s+/etc)\b|\|\s*(nc|curl|wget)\s|\$\(.*\)|`.*`|(^|[;|&$(`='"\s]|\.\.)\s*/bin/(ba|da|z)?sh\b|(^|[;|&$(`='"\s\\/])(cmd(\.exe)?\s+/[ck]\b|cmd\.exe\b|powershell(\.exe\b|\s+[-/]\w))'''
+# Command separators and tooling. The command must end at whitespace, the
+# end or a shell metacharacter, so ";idx=" and the matrix parameter
+# ";id=5" do not match. $(...) and `...` command substitution, pipes into
+# nc/curl/wget, shells and Windows interpreters.
+target_regex = ''';\s*((id|whoami|uname|wget|curl|busybox|chmod|tftp)([\s+;|&<>`)'"]|$)|cat\s+/etc\b)|\|\s*(nc|curl|wget)\s|\$\(.*\)|`.*`|(^|[;|&$(`='"\s]|\.\.)\s*/bin/(ba|da|z)?sh\b|(^|[;|&$(`='"\s\\/])(cmd(\.exe)?\s+/[ck]\b|cmd\.exe\b|powershell(\.exe\b|\s+[-/]\w))'''
 
 [[rule]]
 label = "rce"
@@ -22,7 +23,7 @@ weight = 4
 owasp = ["A03:2021"]
 # The same in a body, plus the dropper chains IoT botnets post
 # (`cd /tmp; wget …`, `$(busybox …)`).
-body_regex = '''(^|[;|&$(`='"\s]|\.\.)\s*/bin/(ba|da|z)?sh\b|(^|[;|&$(`='"\s\\/])(cmd(\.exe)?\s+/[ck]\b|cmd\.exe\b|powershell(\.exe\b|\s+[-/]\w))|\|\s*(nc|curl|wget|sh|bash)\b|;\s*(id|whoami|uname|wget|curl|busybox|chmod|tftp)\b|[`(]\s*(busybox|wget|curl|tftp|chmod)\s'''
+body_regex = '''(^|[;|&$(`='"\s]|\.\.)\s*/bin/(ba|da|z)?sh\b|(^|[;|&$(`='"\s\\/])(cmd(\.exe)?\s+/[ck]\b|cmd\.exe\b|powershell(\.exe\b|\s+[-/]\w))|\|\s*(nc|curl|wget|sh|bash)\b|;\s*(id|whoami|uname|wget|curl|busybox|chmod|tftp)([\s+;|&<>`)'"]|$)|[`(]\s*(busybox|wget|curl|tftp|chmod)\s'''
 
 [[rule]]
 label = "rce"

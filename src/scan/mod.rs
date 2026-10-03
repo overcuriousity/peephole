@@ -382,7 +382,12 @@ impl Source {
                 Ok(job) => return Ok(Some(job)),
                 Err((status, why)) => {
                     info!(job = %g.job_uid, target = %g.ip, status, why = why.as_deref().unwrap_or(""), "scan grant turned down");
-                    self.report(node, arbiter, &g.job_uid, status, why).await;
+                    // In the background: the retries must not stall the
+                    // worker loop (finish reports run in a worker task too).
+                    let (node, uid) = (node.clone(), g.job_uid);
+                    tokio::spawn(async move {
+                        Self::report(&node, arbiter, &uid, status, why).await;
+                    });
                 }
             }
         }
@@ -460,7 +465,8 @@ impl Source {
             }
             None => {}
         }
-        if self.duplicate(&g.job_uid, &g.ip, g.level).await? {
+        // Our stored spelling: the arbiter's may differ (same_ip allows it).
+        if self.duplicate(&g.job_uid, &ip_text, g.level).await? {
             return Ok(Err(("superseded", None)));
         }
         Ok(Ok(Job::Granted {
@@ -496,7 +502,6 @@ impl Source {
     /// Tell the arbiter how a job ended, retrying for about two minutes; if
     /// it never hears, its lease sweep finds our result (or requeues).
     async fn report(
-        &self,
         node: &Arc<Node>,
         arbiter: NodeId,
         uid: &str,
@@ -555,13 +560,12 @@ impl Source {
                         .await
                     {
                         warn!(job = %uid, ?e, "could not record scan result");
-                        self.report(node, *arbiter, uid, "failed", Some(e.to_string()))
-                            .await;
+                        Self::report(node, *arbiter, uid, "failed", Some(e.to_string())).await;
                         return;
                     }
-                    self.report(node, *arbiter, uid, "done", None).await;
+                    Self::report(node, *arbiter, uid, "done", None).await;
                 }
-                Outcome::Failed(e) => self.report(node, *arbiter, uid, "failed", Some(e)).await,
+                Outcome::Failed(e) => Self::report(node, *arbiter, uid, "failed", Some(e)).await,
                 Outcome::Abandoned => {}
             },
             _ => {}

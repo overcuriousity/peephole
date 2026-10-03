@@ -551,9 +551,15 @@ impl Config {
             let Some(w) = &self.webauthn else {
                 bail!("[webauthn] is required with roles.web");
             };
-            if w.rp_id.is_empty() || w.origin.starts_with("http://") {
-                bail!("webauthn.rp_id must be set and origin must be https");
-            }
+            // The scheme is lowercased by the parser; the builder checks
+            // that rp_id is the origin's host or a registrable suffix of it.
+            let origin = webauthn_rs::prelude::Url::parse(&w.origin)
+                .ok()
+                .filter(|u| u.scheme() == "https")
+                .context("webauthn.origin must be an https:// URL")?;
+            webauthn_rs::WebauthnBuilder::new(&w.rp_id, &origin)
+                .and_then(|b| b.build())
+                .context("webauthn.rp_id must be the origin's host or a parent domain of it")?;
         }
         if let Some(m) = &self.maxmind
             && (m.account_id.is_empty() || m.license_key.is_empty())
@@ -623,8 +629,11 @@ impl Config {
                 crate::scan::pace::MAX_LEVEL4_FACTOR
             );
         }
-        if s.rescan_cooldown_hours < 0 {
-            bail!("scan.rescan_cooldown_hours must not be negative");
+        if !(0..=crate::settings::MAX_COOLDOWN_HOURS).contains(&s.rescan_cooldown_hours) {
+            bail!(
+                "scan.rescan_cooldown_hours must be between 0 and {}",
+                crate::settings::MAX_COOLDOWN_HOURS
+            );
         }
         if !(1..=crate::scan::pace::MAX_PER_HOUR).contains(&s.max_scans_per_hour) {
             bail!(
@@ -1106,11 +1115,37 @@ data_dir = "/tmp"
             "single_request_max_level = 5",
             "trusted_origins = [\"nope\"]",
             "level_argv = { 2 = [] }",
+            "rescan_cooldown_hours = -1",
+            "rescan_cooldown_hours = 8761",
         ] {
             let e = parse(&format!(
                 "{BASE}[roles]\nlistener = false\nweb = false\n[scan]\n{bad}\n"
             ));
             assert!(e.is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn webauthn_origin_must_be_https_and_match_rp_id() {
+        let with = |rp_id: &str, origin: &str| {
+            parse(&format!(
+                "{BASE}admin_listen = \"127.0.0.1:1\"\n[roles]\nlistener = false\n\
+                 [webauthn]\nrp_id = \"{rp_id}\"\norigin = \"{origin}\"\nrp_name = \"x\"\n"
+            ))
+        };
+        with("x.example", "https://x.example").unwrap();
+        with("x.example", "HTTPS://admin.x.example:8443").unwrap();
+        with("localhost", "https://localhost").unwrap();
+        for (rp_id, origin) in [
+            ("", "https://x.example"),
+            ("x.example", "http://x.example"),
+            ("x.example", "HTTP://x.example"),
+            ("x.example", "ftp://x.example"),
+            ("x.example", "x.example"),
+            ("x.example", "https://y.example"),
+            ("admin.x.example", "https://x.example"),
+        ] {
+            assert!(with(rp_id, origin).is_err(), "{rp_id} {origin} accepted");
         }
     }
 

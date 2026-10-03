@@ -97,7 +97,12 @@ pub async fn serve_trap(
         let (stream, peer) = tokio::select! {
             r = listener.accept() => match r {
                 Ok(v) => v,
-                Err(e) => { warn!(?e, "trap accept failed"); continue; }
+                Err(e) => {
+                    warn!(?e, "trap accept failed");
+                    // Out of descriptors (EMFILE) fails at once: don't spin.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
             },
             _ = shutdown.changed() => break,
         };
@@ -161,10 +166,16 @@ async fn preface(
         if expect_proxy {
             loop {
                 match proxy_proto::parse_proxy(&buf) {
-                    // A header that names no client (UNKNOWN, LOCAL) is
+                    // A header that names no client (UNKNOWN, AF_UNSPEC) is
                     // refused: the peer is a proxy, and the client's own
                     // X-Forwarded-For would be believed in its place.
                     Proxy::Done { src: None, .. } => return None,
+                    // The proxy's own connection (a health check): the peer
+                    // is the client.
+                    Proxy::Local { consumed } => {
+                        buf.drain(..consumed);
+                        break;
+                    }
                     Proxy::Done {
                         src: Some(s),
                         consumed,
