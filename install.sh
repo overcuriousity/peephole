@@ -235,6 +235,11 @@ NGINX
 # X-Forwarded-For is set to the real peer address (never appended to what
 # the client sent), and peephole trusts it only from the proxies in
 # trusted_proxies. Host is passed on exactly as the client sent it.
+# The trap caps connections per client (64), but behind this proxy it sees
+# only nginx: the same cap is applied here, so one client cannot hold every
+# upstream connection. limit_conn_zone belongs to the http context too.
+limit_conn_zone \$binary_remote_addr zone=peephole_trap:10m;
+
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
@@ -243,6 +248,8 @@ server {
     # Bodies up to 1 MiB reach the trap, which keeps the first 64 KiB; nginx
     # would otherwise refuse them with 413 and nothing would be recorded.
     client_max_body_size 1m;
+    limit_conn peephole_trap 64;
+    limit_conn_status 429;
 
     location / {
         proxy_pass http://127.0.0.1:${trap_port};
