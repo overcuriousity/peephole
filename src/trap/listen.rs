@@ -10,12 +10,13 @@ use anyhow::{Context, Result};
 use ipnet::IpNet;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context as TaskContext, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
@@ -26,6 +27,35 @@ const HEAD_CAP: usize = 64 * 1024;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Simultaneous connections per listener; excess are dropped.
 const MAX_CONNS: usize = 2048;
+/// A trusted proxy whose PROXY header is refused is warned about at most
+/// once per this long, so a misconfigured proxy is noticed without a log
+/// line per connection.
+const REFUSAL_WARN_EVERY: Duration = Duration::from_secs(3600);
+/// Proxies remembered for that; past it those warned about over that long
+/// ago are forgotten, or all of them.
+const REFUSAL_TRACKED: usize = 1024;
+
+/// When each trusted proxy was last warned about.
+static REFUSALS_WARNED: LazyLock<Mutex<HashMap<IpAddr, Instant>>> = LazyLock::new(Default::default);
+
+/// Whether a refusal from `peer` is worth a warning now (see
+/// [`REFUSAL_WARN_EVERY`]); records it if so.
+fn warn_refusal_now(warned: &mut HashMap<IpAddr, Instant>, peer: IpAddr, now: Instant) -> bool {
+    if warned
+        .get(&peer)
+        .is_some_and(|t| now.duration_since(*t) < REFUSAL_WARN_EVERY)
+    {
+        return false;
+    }
+    if warned.len() >= REFUSAL_TRACKED {
+        warned.retain(|_, t| now.duration_since(*t) < REFUSAL_WARN_EVERY);
+        if warned.len() >= REFUSAL_TRACKED {
+            warned.clear();
+        }
+    }
+    warned.insert(peer, now);
+    true
+}
 
 /// What the connection showed, attached to each request on it.
 #[derive(Clone, Debug, Default)]
@@ -128,9 +158,27 @@ pub async fn serve_trap(
                 }
                 Some(acceptor) => {
                     meta.transport = "https";
-                    let Some((io, src, hello)) = preface(stream, via_proxy).await else {
-                        debug!(%peer, "trap: no usable PROXY header or ClientHello");
-                        return;
+                    let (io, src, hello) = match preface(stream, via_proxy).await {
+                        Ok(v) => v,
+                        // A trusted proxy that sends no usable header loses
+                        // every TLS connection through it: say so.
+                        Err(Unusable::Proxy(why)) => {
+                            if warn_refusal_now(
+                                &mut REFUSALS_WARNED.lock().unwrap(),
+                                peer.ip(),
+                                Instant::now(),
+                            ) {
+                                warn!(%peer, why, "trap: refused a trusted proxy's PROXY header, \
+                                      dropping the connection (warned once an hour)");
+                            } else {
+                                debug!(%peer, why, "trap: PROXY header refused");
+                            }
+                            return;
+                        }
+                        Err(Unusable::Other) => {
+                            debug!(%peer, "trap: no usable PROXY header or ClientHello");
+                            return;
+                        }
                     };
                     meta.proxied_src = src;
                     meta.ja4 = Some(tls_hello::ja4(&hello));
@@ -149,17 +197,28 @@ pub async fn serve_trap(
     }
 }
 
+/// Why [`preface`] gave up on a connection.
+enum Unusable {
+    /// A trusted proxy's PROXY header was refused, and why.
+    Proxy(&'static str),
+    /// No ClientHello, or the connection ended or timed out first.
+    Other,
+}
+
 /// Read what comes before the TLS handshake proper: the PROXY header (from
 /// a trusted proxy, required) and the whole ClientHello. Returns a stream
 /// that replays the ClientHello to rustls.
 async fn preface(
     mut stream: TcpStream,
     expect_proxy: bool,
-) -> Option<(
-    Replay<TcpStream>,
-    Option<SocketAddr>,
-    tls_hello::ClientHello,
-)> {
+) -> Result<
+    (
+        Replay<TcpStream>,
+        Option<SocketAddr>,
+        tls_hello::ClientHello,
+    ),
+    Unusable,
+> {
     tokio::time::timeout(HELLO_TIMEOUT, async move {
         let mut buf: Vec<u8> = Vec::with_capacity(2048);
         let mut src = None;
@@ -169,7 +228,9 @@ async fn preface(
                     // A header that names no client (UNKNOWN, LOCAL) is
                     // refused: the peer is a proxy, and the client's own
                     // X-Forwarded-For would be believed in its place.
-                    Proxy::Done { src: None, .. } => return None,
+                    Proxy::Done { src: None, .. } => {
+                        return Err(Unusable::Proxy("names no client (LOCAL or UNKNOWN)"));
+                    }
                     Proxy::Done {
                         src: Some(s),
                         consumed,
@@ -178,9 +239,13 @@ async fn preface(
                         buf.drain(..consumed);
                         break;
                     }
-                    Proxy::Invalid => return None,
-                    Proxy::Incomplete if buf.len() >= proxy_proto::MAX_HEADER => return None,
-                    Proxy::Incomplete => fill(&mut stream, &mut buf).await?,
+                    Proxy::Invalid => return Err(Unusable::Proxy("missing or malformed")),
+                    Proxy::Incomplete if buf.len() >= proxy_proto::MAX_HEADER => {
+                        return Err(Unusable::Proxy("too long"));
+                    }
+                    Proxy::Incomplete => {
+                        fill(&mut stream, &mut buf).await.ok_or(Unusable::Other)?
+                    }
                 }
             }
         }
@@ -188,7 +253,7 @@ async fn preface(
         loop {
             match hello.advance(&buf) {
                 Hello::Done { hello, .. } => {
-                    return Some((
+                    return Ok((
                         Replay {
                             prefix: buf,
                             pos: 0,
@@ -198,15 +263,16 @@ async fn preface(
                         hello,
                     ));
                 }
-                Hello::Invalid => return None,
-                Hello::Incomplete if buf.len() > tls_hello::MAX_HELLO + 5 => return None,
-                Hello::Incomplete => fill(&mut stream, &mut buf).await?,
+                Hello::Invalid => return Err(Unusable::Other),
+                Hello::Incomplete if buf.len() > tls_hello::MAX_HELLO + 5 => {
+                    return Err(Unusable::Other);
+                }
+                Hello::Incomplete => fill(&mut stream, &mut buf).await.ok_or(Unusable::Other)?,
             }
         }
     })
     .await
-    .ok()
-    .flatten()
+    .unwrap_or(Err(Unusable::Other))
 }
 
 /// Read more bytes into `buf`; None at end of stream or on error.
@@ -333,5 +399,29 @@ mod tests {
         std::fs::write(&k, "not a key").unwrap();
         assert!(trap_tls_config(Some(&c), Some(&k)).is_err());
         trap_tls_config(None, None).unwrap();
+    }
+
+    #[test]
+    fn proxy_refusals_are_warned_about_at_most_hourly_per_peer() {
+        let mut warned = HashMap::new();
+        let (a, b): (IpAddr, IpAddr) = ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap());
+        let t0 = Instant::now();
+        assert!(warn_refusal_now(&mut warned, a, t0));
+        assert!(!warn_refusal_now(
+            &mut warned,
+            a,
+            t0 + Duration::from_secs(60)
+        ));
+        assert!(warn_refusal_now(
+            &mut warned,
+            b,
+            t0 + Duration::from_secs(60)
+        ));
+        assert!(warn_refusal_now(&mut warned, a, t0 + REFUSAL_WARN_EVERY));
+        // Bounded: a flood of peers never grows the map past the cap.
+        for i in 0..(REFUSAL_TRACKED as u32 * 2) {
+            warn_refusal_now(&mut warned, IpAddr::from(i.to_be_bytes()), t0);
+        }
+        assert!(warned.len() <= REFUSAL_TRACKED);
     }
 }

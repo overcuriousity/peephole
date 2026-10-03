@@ -38,15 +38,24 @@ pub fn bot_tells(attrs: &Value, behavior: &Value) -> crate::classify::BotTells {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let fill = behavior.get("fill_seconds").and_then(Value::as_f64);
-    let mouse = behavior
-        .get("mouse_events")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let inhuman_fill = matches!(fill, Some(s) if s < 1.0 && mouse == 0);
+    let inhuman_fill = matches!(fill, Some(s) if s < 1.0 && no_input(behavior));
     crate::classify::BotTells {
         webdriver,
         inhuman_fill,
     }
+}
+
+/// No pointer, touch or keyboard input at all. Mouse movement alone is not
+/// enough: a touch device never fires it, and a phone user who autofills and
+/// taps submit is quick too. Counters a payload lacks (older collectors send
+/// no `pointer_events`) count as zero.
+fn no_input(behavior: &Value) -> bool {
+    let count = |k: &str| behavior.get(k).and_then(Value::as_i64).unwrap_or(0);
+    let keys = behavior
+        .get("keys")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    count("mouse_events") == 0 && count("pointer_events") == 0 && keys == 0
 }
 
 /// Human-friendly pairs for the "What we see about you" panel (spec §8.3).
@@ -90,9 +99,9 @@ pub fn panel_summary(attrs: &Value, behavior: &Value, seen_ips: i64) -> Vec<(Str
         .and_then(Value::as_i64)
         .unwrap_or(0);
     match fill {
-        Some(s) if s < 1.0 && mouse == 0 => out.push((
+        Some(s) if s < 1.0 && no_input(behavior) => out.push((
             "Behavior".into(),
-            format!("form filled in {s:.1}s with zero mouse movement — inhuman"),
+            format!("form filled in {s:.1}s with no pointer, touch or key input — inhuman"),
         )),
         Some(s) => out.push((
             "Behavior".into(),
@@ -148,6 +157,17 @@ mod tests {
         );
         assert!(!human.webdriver);
         assert!(!human.inhuman_fill);
+    }
+
+    #[test]
+    fn inhuman_fill_needs_no_input_of_any_kind() {
+        // A phone: autofilled and tapped quickly, never a mousemove.
+        let tapped = json!({"fill_seconds": 0.6, "mouse_events": 0, "pointer_events": 2});
+        assert!(!bot_tells(&json!({}), &tapped).inhuman_fill);
+        let typed = json!({"fill_seconds": 0.8, "mouse_events": 0, "keys": [{"t": 1.0, "k": 1}]});
+        assert!(!bot_tells(&json!({}), &typed).inhuman_fill);
+        let none = json!({"fill_seconds": 0.6, "mouse_events": 0, "pointer_events": 0, "keys": []});
+        assert!(bot_tells(&json!({}), &none).inhuman_fill);
     }
 
     #[test]

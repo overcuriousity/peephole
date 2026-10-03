@@ -368,6 +368,51 @@ async fn collect_escalates_only_the_address_the_page_was_served_to() {
     let t = page("203.0.113.22").await;
     collect("203.0.113.22", t).await;
     assert_eq!(level("203.0.113.22").await, 2);
+
+    // A forged beacon with a token no page was served with: stored against
+    // the poster, never escalated.
+    collect(
+        "203.0.113.23",
+        "00000000-0000-4000-8000-000000000000".into(),
+    )
+    .await;
+    assert_eq!(level("203.0.113.23").await, 0);
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM fingerprints f JOIN ips i ON i.id = f.ip_id
+             WHERE f.request_id IS NULL AND i.ip = '203.0.113.23'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn panel_has_its_own_rate_limit() {
+    let (base, _store, _dir) = spawn("").await;
+    let client = reqwest::Client::new();
+    let mut statuses = vec![];
+    for _ in 0..61 {
+        let r = client
+            .get(format!("{base}/panel?token=x"))
+            .header("x-forwarded-for", "203.0.113.30")
+            .send()
+            .await
+            .unwrap();
+        statuses.push(r.status().as_u16());
+    }
+    assert!(statuses[..60].iter().all(|s| *s == 202), "{statuses:?}");
+    assert_eq!(statuses[60], 429);
+    // Polling the panel leaves /collect's budget alone.
+    let r = client
+        .post(format!("{base}/collect"))
+        .header("x-forwarded-for", "203.0.113.30")
+        .json(&serde_json::json!({"token": "x", "attrs": {}, "behavior": {}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
 }
 
 #[tokio::test]

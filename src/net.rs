@@ -65,10 +65,11 @@ fn v4_at(seg: &[u16; 8], at: usize) -> Ipv4Addr {
 fn is_global_v6(ip: Ipv6Addr) -> bool {
     let seg = ip.segments();
     // Forms that embed an IPv4 address are only as global as that address:
-    // the NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) and 6to4
-    // 2002::/16 (RFC 3056). `64:ff9b::127.0.0.1` must not reach loopback
-    // through a NAT64 gateway on the scanner's network.
-    if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+    // the NAT64 well-known prefix 64:ff9b::/96 (RFC 6052), IPv4-translated
+    // ::ffff:0:0/96 (SIIT, RFC 2765) and 6to4 2002::/16 (RFC 3056).
+    // `64:ff9b::127.0.0.1` must not reach loopback through a NAT64 gateway
+    // on the scanner's network, nor `::ffff:0:127.0.0.1` through SIIT.
+    if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || seg[..6] == [0, 0, 0, 0, 0xffff, 0] {
         return is_global_v4(v4_at(&seg, 6));
     }
     if seg[0] == 0x2002 {
@@ -138,6 +139,10 @@ mod tests {
             "64:ff9b::169.254.169.254",
             "2002:7f00:1::1",
             "2002:c0a8:101::1",
+            // IPv4-translated (SIIT) embedding a non-global IPv4
+            "::ffff:0:127.0.0.1",
+            "::ffff:0:10.0.0.1",
+            "::ffff:0:169.254.169.254",
             // local-use NAT64, whatever it embeds
             "64:ff9b:1::808:808",
             // IPv4-compatible, whatever it embeds
@@ -178,6 +183,8 @@ mod tests {
             // NAT64 / 6to4 embedding a global IPv4
             "64:ff9b::8.8.8.8",
             "2002:808:808::1",
+            // IPv4-translated (SIIT) embedding a global IPv4
+            "::ffff:0:8.8.8.8",
         ] {
             assert!(
                 is_scannable_target(s.parse().unwrap()),
