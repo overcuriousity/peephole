@@ -280,22 +280,35 @@ impl TorView {
     }
 }
 
+/// How long a recorded "not an exit" holds. Exit lists change daily; an
+/// older verdict counts as unknown (an "exit" always counts).
+const NOT_EXIT_MAX_AGE_HOURS: i64 = 72;
+
 /// Tor status of `ip` (its text as stored): this node's list, and the
-/// results every node recorded (`ip_intel`). Any "exit" wins.
+/// results every node recorded (`ip_intel`). Any "exit" wins; a "not an
+/// exit" counts only while fresh.
 pub async fn tor_status(pool: &SqlitePool, local: Option<bool>, ip: &str) -> Result<TorStatus> {
     if local == Some(true) {
         return Ok(TorStatus::Exit);
     }
-    let rows: Vec<String> =
-        sqlx::query_scalar("SELECT data_json FROM ip_intel WHERE ip = ? AND provider = ?")
-            .bind(ip)
-            .bind(crate::intel::TOR)
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT data_json, fetched_at >= datetime('now', ?) FROM ip_intel
+         WHERE ip = ? AND provider = ?",
+    )
+    .bind(format!("-{NOT_EXIT_MAX_AGE_HOURS} hours"))
+    .bind(ip)
+    .bind(crate::intel::TOR)
+    .fetch_all(pool)
+    .await?;
     let said: Vec<bool> = rows
         .iter()
-        .filter_map(|r| serde_json::from_str::<serde_json::Value>(r).ok())
-        .filter_map(|v| v.get("exit").and_then(|e| e.as_bool()))
+        .filter_map(|(r, fresh)| {
+            let exit = serde_json::from_str::<serde_json::Value>(r)
+                .ok()?
+                .get("exit")?
+                .as_bool()?;
+            (exit || *fresh).then_some(exit)
+        })
         .collect();
     Ok(if said.contains(&true) {
         TorStatus::Exit
@@ -695,6 +708,19 @@ mod tests {
         // Another node's "exit" beats our list's silence.
         assert_eq!(
             tor_status(p, Some(false), "198.51.100.10").await.unwrap(),
+            TorStatus::Exit
+        );
+        // A stale "not an exit" is unknown again; a stale "exit" still counts.
+        sqlx::query("UPDATE ip_intel SET fetched_at = datetime('now', '-73 hours')")
+            .execute(p)
+            .await
+            .unwrap();
+        assert_eq!(
+            tor_status(p, None, "198.51.100.9").await.unwrap(),
+            TorStatus::Unknown
+        );
+        assert_eq!(
+            tor_status(p, None, "198.51.100.10").await.unwrap(),
             TorStatus::Exit
         );
     }

@@ -175,10 +175,27 @@ type PortRow = (
     Option<String>,
 );
 
-/// Whether a record's `ts` is in the rows' format (peers can send anything;
-/// garbage would break every read that decodes the column as a time).
-fn valid_ts(ts: &str) -> bool {
-    chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").is_ok()
+/// How far ahead of our clock a row's time may be (the HLC drift cap).
+const MAX_AHEAD: chrono::TimeDelta =
+    chrono::TimeDelta::milliseconds(crate::cluster::hlc::MAX_DRIFT_MS as i64);
+
+/// A record's `ts` as stored: None unless in the rows' format (peers can
+/// send anything; garbage would break every read that decodes the column
+/// as a time), and no later than [`MAX_AHEAD`] from now (a fast clock would
+/// keep its rows "recent" and out of retention).
+fn row_ts(ts: &str) -> Option<String> {
+    let t = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").ok()?;
+    let limit = chrono::Utc::now().naive_utc() + MAX_AHEAD;
+    Some(if t > limit {
+        limit.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        ts.to_string()
+    })
+}
+
+/// [`row_ts`] for a light row's milliseconds.
+fn row_ms(ms: i64) -> i64 {
+    ms.min(chrono::Utc::now().timestamp_millis() + MAX_AHEAD.num_milliseconds())
 }
 
 /// The IP's row id, creating the row if needed (None: not an address). The
@@ -235,10 +252,10 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     }
     // A request always comes from an address at a time; anything else is
     // junk.
-    if !valid_ts(&r.ts) {
+    let Some(ts) = row_ts(&r.ts) else {
         return Ok(Effect::Ignored);
-    }
-    let Some(ip_id) = ensure_ip(conn, &r.ip, Some(&r.ts)).await? else {
+    };
+    let Some(ip_id) = ensure_ip(conn, &r.ip, Some(&ts)).await? else {
         return Ok(Effect::Ignored);
     };
     // Labels must be a JSON list of strings (every label query walks it);
@@ -257,7 +274,7 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
     .bind(ctx.hlc as i64)
-    .bind(&r.ts)
+    .bind(&ts)
     .bind(ip_id)
     .bind(&r.method)
     .bind(&r.path)
@@ -314,8 +331,8 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
     {
         return Ok(Effect::Ignored);
     }
-    let first = b.rows.iter().map(|r| r.ts_ms).min().unwrap_or(0);
-    let last = b.rows.iter().map(|r| r.ts_ms).max().unwrap_or(0);
+    let first = b.rows.iter().map(|r| row_ms(r.ts_ms)).min().unwrap_or(0);
+    let last = b.rows.iter().map(|r| row_ms(r.ts_ms)).max().unwrap_or(0);
     let seen = |ms| {
         chrono::DateTime::from_timestamp_millis(ms)
             .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -349,7 +366,7 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
             "INSERT INTO skipped_requests (batch_id, ts_ms, method, path) VALUES (?,?,?,?)",
         )
         .bind(id)
-        .bind(r.ts_ms)
+        .bind(row_ms(r.ts_ms))
         .bind(cut(&r.method, 64))
         .bind(cut(&r.path, SKIP_PATH_MAX))
         .execute(&mut *conn)
@@ -495,10 +512,10 @@ async fn fp_claim(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &FpClaimRec) -> 
     let Some(rid) = request_id(conn, &r.request_uid).await? else {
         return Ok(Effect::Ignored);
     };
-    if !valid_ts(&r.ts) {
+    let Some(ts) = row_ts(&r.ts) else {
         return Ok(Effect::Ignored);
-    }
-    let Some(ip_id) = ensure_ip(conn, &r.ip, Some(&r.ts)).await? else {
+    };
+    let Some(ip_id) = ensure_ip(conn, &r.ip, Some(&ts)).await? else {
         return Ok(Effect::Ignored);
     };
     sqlx::query(
@@ -512,7 +529,7 @@ async fn fp_claim(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &FpClaimRec) -> 
     .bind(ip_id)
     .bind(rid)
     .bind(&r.request_uid)
-    .bind(&r.ts)
+    .bind(&ts)
     .bind(&r.contact_email)
     .bind(&r.user_agent)
     .bind(&r.build)
@@ -537,10 +554,10 @@ async fn fingerprint(
         Some(u) => request_id(conn, u).await?,
         None => None,
     };
-    if !valid_ts(&r.ts) {
+    let Some(ts) = row_ts(&r.ts) else {
         return Ok(Effect::Ignored);
-    }
-    let Some(ip_id) = ensure_ip(conn, &r.ip, Some(&r.ts)).await? else {
+    };
+    let Some(ip_id) = ensure_ip(conn, &r.ip, Some(&ts)).await? else {
         return Ok(Effect::Ignored);
     };
     sqlx::query(
@@ -554,7 +571,7 @@ async fn fingerprint(
     .bind(rid)
     .bind(&r.request_uid)
     .bind(ip_id)
-    .bind(&r.ts)
+    .bind(&ts)
     .bind(&r.fp_hash)
     .bind(&r.visitor_id)
     .bind(&r.attributes_json)
@@ -2197,7 +2214,7 @@ mod tests {
             uid: format!("{}span", a.uid_prefix()),
             ip: "203.0.113.8".into(),
             dropped: 0,
-            rows: vec![row(2_000_000_000_000), row(1_000_000_000_000)],
+            rows: vec![row(1_700_000_000_000), row(1_000_000_000_000)],
         });
         assert_eq!(apply(&mut conn, ctx, &b).await.unwrap(), Effect::Applied);
         let seen: (String, String) =
@@ -2207,8 +2224,34 @@ mod tests {
                 .unwrap();
         assert_eq!(
             seen,
-            ("2001-09-09 01:46:40".into(), "2033-05-18 03:33:20".into())
+            ("2001-09-09 01:46:40".into(), "2023-11-14 22:13:20".into())
         );
+        // Times from a clock running ahead are held to ours plus the drift.
+        let mut r = req("future");
+        r.ip = "203.0.113.9".into();
+        r.ts = "2099-01-01 00:00:00".into();
+        assert_eq!(
+            apply(&mut conn, ctx, &Record::Request(r)).await.unwrap(),
+            Effect::Applied
+        );
+        let b = Record::SkipBatch(SkipBatchRec {
+            build: String::new(),
+            uid: format!("{}future", a.uid_prefix()),
+            ip: "203.0.113.9".into(),
+            dropped: 0,
+            rows: vec![row(4_070_908_800_000)],
+        });
+        assert_eq!(apply(&mut conn, ctx, &b).await.unwrap(), Effect::Applied);
+        for sql in [
+            "SELECT COUNT(*) FROM requests WHERE uid LIKE '%future'
+               AND ts > datetime('now', '+6 minutes')",
+            "SELECT COUNT(*) FROM ips WHERE ip = '203.0.113.9'
+               AND last_seen > datetime('now', '+6 minutes')",
+            "SELECT COUNT(*) FROM skipped_requests
+               WHERE ts_ms > (unixepoch('now') + 360) * 1000",
+        ] {
+            assert_eq!(count(&mut conn, sql).await, 0, "{sql}");
+        }
     }
 
     #[tokio::test]
