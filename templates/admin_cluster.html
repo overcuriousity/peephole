@@ -3,8 +3,6 @@
 {% block content %}
 {% let sub = "cluster" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Cluster</h1><p class="muted">Nodes sharing requests, the scan queue, results and intel. Node names never appear on public pages.</p></div></div>
-{% if let Some(n) = notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
-{% if let Some(e) = error %}<div class="banner banner-warning">{{ e }}</div>{% endif %}
 {% match me %}
 {% when None %}
 <section class="card"><h2>Standalone</h2>

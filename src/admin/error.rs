@@ -13,6 +13,13 @@ struct ErrorPage {
     detail: String,
 }
 
+tokio::task_local! {
+    /// Whether the request being answered carries a session cookie, set by
+    /// the admin router's middleware. Only picks the nav an error page
+    /// shows (the cookie is not checked: an error page shows no data).
+    pub(crate) static SIGNED_IN: bool;
+}
+
 #[derive(Debug)]
 pub enum AppError {
     NotFound,
@@ -57,7 +64,7 @@ impl IntoResponse for AppError {
             }
         };
         let page = ErrorPage {
-            chrome: Chrome::new(false, ""),
+            chrome: Chrome::new(SIGNED_IN.try_with(|s| *s).unwrap_or(false), ""),
             title,
             detail,
         };

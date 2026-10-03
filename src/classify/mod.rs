@@ -1496,6 +1496,20 @@ mod tests {
             "{:?}",
             v.labels
         );
+        // base64 is case-significant: the markers in another case are not
+        // the magic bytes (the rest of the rule stays case-insensitive).
+        for q in ["status=RO0ABORT", "x=ro0ab", "v=aaeaaad"] {
+            let v = classifier().classify(
+                &view("GET", "/order", Some(q), "Mozilla/5.0", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                !v.labels.iter().any(|l| l == "deserialization"),
+                "{q}: {:?}",
+                v.labels
+            );
+        }
     }
 
     #[test]
@@ -1678,6 +1692,17 @@ mod tests {
         let v = classifier().classify(&req, &hist(1, 1), &BotTells::default());
         assert!(
             v.labels.iter().any(|l| l == "credential-attack"),
+            "{:?}",
+            v.labels
+        );
+        // The scheme is case-insensitive, the base64 value is not.
+        let req = RequestView {
+            headers: vec![("authorization".into(), "BASIC ywrtaw46ywrtaw4=".into())],
+            ..req
+        };
+        let v = classifier().classify(&req, &hist(1, 1), &BotTells::default());
+        assert!(
+            !v.labels.iter().any(|l| l == "credential-attack"),
             "{:?}",
             v.labels
         );

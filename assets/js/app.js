@@ -41,17 +41,18 @@
     });
   });
   // One-shot notice the server set after an action; shown once, then cleared.
-  var fm = document.cookie.match(/(?:^|; )peephole_flash=([^;]*)/);
-  if (fm) {
-    document.cookie = "peephole_flash=; Path=/; Max-Age=0; SameSite=Strict";
+  [["peephole_flash", "success"], ["peephole_flash_error", "warning"]].forEach(function (f) {
+    var fm = document.cookie.match(new RegExp("(?:^|; )" + f[0] + "=([^;]*)"));
+    if (!fm) return;
+    document.cookie = f[0] + "=; Path=/; Max-Age=0; SameSite=Strict";
     var main = document.querySelector("main");
     if (main) {
       var note = document.createElement("div");
-      note.className = "banner banner-success";
+      note.className = "banner banner-" + f[1];
       try { note.textContent = decodeURIComponent(fm[1].replace(/\+/g, " ")); } catch (e) { note.textContent = ""; }
       if (note.textContent) main.insertBefore(note, main.firstChild);
     }
-  }
+  });
   // WebAuthn ceremonies (moved out of inline scripts for CSP).
   function b64uToBuf(s) { return Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), function (c) { return c.charCodeAt(0); }).buffer; }
   function bufToB64u(b) { return btoa(String.fromCharCode.apply(null, new Uint8Array(b))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }

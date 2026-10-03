@@ -8,6 +8,7 @@ weight = 4
 owasp = ["A08:2021"]
 # Java (rO0AB base64, AC ED 00 05 hex), .NET BinaryFormatter (AAEAAAD),
 # PHP objects, pickle opcode streams, Node func-serialization. rO0AB is a
-# three-byte magic: a word containing it is the accepted cost.
-target_regex = '''rO0AB|aced0005|AAEAAAD|O:\d+:"[^"]{1,64}":\d+:\{|_\$\$ND_FUNC\$\$_|__reduce__'''
-body_regex = '''rO0AB|\\xac\\xed\\x00\\x05|aced0005|AAEAAAD|O:\d+:"[^"]{1,64}":\d+:\{|_\$\$ND_FUNC\$\$_|__reduce__|c(system|posix|nt|__builtin__)\n'''
+# three-byte magic: a word containing it is the accepted cost. The base64
+# markers match case-sensitively: base64 is case-significant.
+target_regex = '''(?-i:rO0AB)|aced0005|(?-i:AAEAAAD)|O:\d+:"[^"]{1,64}":\d+:\{|_\$\$ND_FUNC\$\$_|__reduce__'''
+body_regex = '''(?-i:rO0AB)|\\xac\\xed\\x00\\x05|aced0005|(?-i:AAEAAAD)|O:\d+:"[^"]{1,64}":\d+:\{|_\$\$ND_FUNC\$\$_|__reduce__|c(system|posix|nt|__builtin__)\n'''
