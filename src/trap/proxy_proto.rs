@@ -16,13 +16,8 @@ pub const MAX_HEADER: usize = 16 + MAX_V2_LEN;
 pub enum Proxy {
     Incomplete,
     Invalid,
-    /// A v2 LOCAL header: the proxy's own connection (a health check), to
-    /// be taken as coming from the real peer. `consumed`: the header's length.
-    Local {
-        consumed: usize,
-    },
-    /// `src`: the client; None when the proxy could not name it (UNKNOWN,
-    /// AF_UNSPEC). `consumed`: the header's length.
+    /// `src`: the client; None when the proxy speaks for itself (LOCAL,
+    /// UNKNOWN). `consumed`: the header's length.
     Done {
         src: Option<SocketAddr>,
         consumed: usize,
@@ -94,7 +89,10 @@ fn v2(buf: &[u8]) -> Proxy {
     };
     let consumed = 16 + len;
     if cmd == 0 {
-        return Proxy::Local { consumed };
+        return Proxy::Done {
+            src: None,
+            consumed,
+        };
     }
     // TLVs after the addresses are skipped with the rest of the block.
     let src = match fam {
@@ -187,10 +185,10 @@ mod tests {
             panic!()
         };
         assert_eq!(src, Some("[2001:db8::1]:7".parse().unwrap()));
-        assert!(
-            matches!(parse_proxy(&v2(0, 0, &[])), Proxy::Local { consumed: 16 }),
-            "LOCAL: the proxy's own connection"
-        );
+        let Proxy::Done { src, .. } = parse_proxy(&v2(0, 0, &[])) else {
+            panic!()
+        };
+        assert_eq!(src, None, "LOCAL: the proxy's own connection");
         let Proxy::Done { src, .. } = parse_proxy(&v2(1, 0, &[])) else {
             panic!()
         };

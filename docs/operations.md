@@ -131,8 +131,7 @@ Behind any other reverse proxy: send plain HTTP that matches no real site to
 unknown names untouched (TCP) to `trap_tls_listen` with a PROXY protocol
 header (v1 or v2), and list the proxy in `trusted_proxies`. A trusted peer
 that connects to `trap_tls_listen` without a PROXY header, or with one that
-names no client (`UNKNOWN`), is dropped; a v2 `LOCAL` header (the proxy's
-own health check) is taken as coming from the proxy. In the
+names no client (`UNKNOWN`, `LOCAL`), is dropped. In the
 admin site's locations, set `X-Forwarded-For` to the peer address: the
 per-client rate limits key on it and are off without it.
 
