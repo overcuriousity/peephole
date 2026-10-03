@@ -60,7 +60,7 @@
       <td class="ts">{{ i.last_seen }}</td>
     </tr>
   {% endfor %}
-  {% if page.items.is_empty() %}<tr><td colspan="9" class="empty">No IPs match.</td></tr>{% endif %}
+  {% if page.items.is_empty() %}<tr><td colspan="{% if chrome.authed %}9{% else %}7{% endif %}" class="empty">No IPs match.</td></tr>{% endif %}
   </tbody>
 </table></div>
 {% if chrome.authed %}</form>{% endif %}

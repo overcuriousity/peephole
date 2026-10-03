@@ -8,13 +8,14 @@
 //! crawler, cluster members' addresses, this node's own addresses and its
 //! `never_scan` networks, and non-global addresses.
 use crate::admin::AdminState;
+use crate::scan::safety::nets_overlap;
 use axum::{
     extract::{Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use ipnet::IpNet;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,6 +124,22 @@ async fn build(state: &AdminState, p: Params) -> anyhow::Result<String> {
             limit: MAX_ENTRIES,
         })
         .await?;
+    // Tor exits and verified crawlers inside a prefix keep it from being
+    // collapsed. Only those the trap has seen in the window are known here
+    // (checking every address of a prefix against the exit list is not
+    // worth it); the rest of the exclusions are complete.
+    let spared: BTreeSet<IpAddr> = if p.networks {
+        state
+            .store
+            .blocklist_spared_ips(&since(p.hours))
+            .await?
+            .iter()
+            .filter_map(|s| s.parse::<IpAddr>().ok())
+            .map(crate::net::canonical)
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     let mut safety = state.safety.lock().await;
     safety
         .refresh(&state.cfg, state.recorder.node().map(|n| &**n))
@@ -136,14 +153,21 @@ async fn build(state: &AdminState, p: Params) -> anyhow::Result<String> {
         .filter(|ip| safety.refuses(ip).is_none() && safety.listed(ip).is_none())
         .filter(|ip| !never.iter().any(|n| n.contains(ip)))
         .collect();
-    drop(safety);
     ips.sort_unstable();
     ips.dedup();
     let entries = if p.networks {
-        collapse(&ips)
+        collapse(&ips, |net| {
+            safety.overlaps(net)
+                || never.iter().any(|n| nets_overlap(n, net))
+                || spared
+                    .range(net.network()..=net.broadcast())
+                    .next()
+                    .is_some()
+        })
     } else {
         ips.iter().map(ToString::to_string).collect()
     };
+    drop(safety);
     let mut out = String::with_capacity(entries.len() * 18 + 400);
     out.push_str("# peephole blocklist\n");
     out.push_str(&format!(
@@ -174,9 +198,9 @@ async fn build(state: &AdminState, p: Params) -> anyhow::Result<String> {
 }
 
 /// Addresses, with every /24 (IPv6 /64) holding [`NET_MIN_IPS`] or more
-/// of them replaced by the prefix. Sorted, prefixes where their first
-/// address would be.
-pub fn collapse(ips: &[IpAddr]) -> Vec<String> {
+/// of them replaced by the prefix, unless `spared` says the prefix holds
+/// an excluded address. Sorted, prefixes where their first address would be.
+pub fn collapse(ips: &[IpAddr], spared: impl Fn(&IpNet) -> bool) -> Vec<String> {
     let mut nets: BTreeMap<IpNet, Vec<IpAddr>> = BTreeMap::new();
     for ip in ips {
         let len = if ip.is_ipv4() { 24 } else { 64 };
@@ -185,7 +209,7 @@ pub fn collapse(ips: &[IpAddr]) -> Vec<String> {
     }
     let mut out = Vec::with_capacity(ips.len());
     for (net, members) in nets {
-        if members.len() >= NET_MIN_IPS {
+        if members.len() >= NET_MIN_IPS && !spared(&net) {
             out.push(net.to_string());
         } else {
             out.extend(members.iter().map(ToString::to_string));
@@ -234,7 +258,7 @@ mod tests {
         .map(|s| s.parse().unwrap())
         .collect();
         assert_eq!(
-            collapse(&ips),
+            collapse(&ips, |_| false),
             [
                 "198.51.100.7",
                 "198.51.100.8",
@@ -242,6 +266,19 @@ mod tests {
                 "2001:db8:1::/64",
                 "2001:db8:2::1"
             ]
+        );
+    }
+
+    #[test]
+    fn networks_holding_an_excluded_address_stay_split() {
+        let ips: Vec<IpAddr> = ["203.0.113.1", "203.0.113.2", "203.0.113.3"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let member: IpAddr = "203.0.113.77".parse().unwrap();
+        assert_eq!(
+            collapse(&ips, |net| net.contains(&member)),
+            ["203.0.113.1", "203.0.113.2", "203.0.113.3"]
         );
     }
 

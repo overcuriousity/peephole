@@ -391,7 +391,7 @@ async fn queue_pace(
     let parsed = form
         .max_workers
         .trim()
-        .parse::<usize>()
+        .parse::<u32>()
         .ok()
         .zip(form.max_scans_per_hour.trim().parse::<i64>().ok())
         .zip(match form.timeout_minutes.as_deref().map(str::trim) {
@@ -403,7 +403,7 @@ async fn queue_pace(
                 .map(|m| (m * 60.0).round() as u64),
         })
         .map(|((w, h), t)| Pace {
-            max_workers: w,
+            max_workers: w as usize,
             max_scans_per_hour: h,
             timeout_secs: t,
         });

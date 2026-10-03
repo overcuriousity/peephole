@@ -545,6 +545,31 @@ async fn webauthn_ceremony_with_soft_token() {
         .await
         .unwrap();
     assert!(sessions >= 1);
+
+    // A signed-in admin adding a key leaves a live setup token alone.
+    let fresh = store.issue_setup_token().await.unwrap();
+    let resp = client
+        .post(format!("{base}/enroll/start"))
+        .json(&serde_json::json!({"label": "second"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let cco: serde_json::Value = resp.json().await.unwrap();
+    let options: webauthn_rs_proto::PublicKeyCredentialCreationOptions =
+        serde_json::from_value(cco["publicKey"].clone()).unwrap();
+    let cred = SoftPasskey::new(true)
+        .perform_register(Url::parse("https://localhost").unwrap(), options, 60_000)
+        .unwrap();
+    let resp = client
+        .post(format!("{base}/enroll/finish"))
+        .json(&serde_json::json!({"credential": cred}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(store.load_credentials().await.unwrap().len(), 2);
+    assert!(store.setup_token_valid(&fresh).await.unwrap());
 }
 
 /// Spins the full router on an ephemeral port and runs the soft-passkey
@@ -1668,6 +1693,15 @@ async fn scan_pace_is_adjustable_from_the_queue_page() {
     assert_eq!(bad.status(), 400);
     assert!(bad.text().await.unwrap().contains("Pace not saved"));
     assert_eq!(state.pace.get(), p, "invalid input leaves the pace alone");
+    // 2^32 must not wrap to 0 workers (paused scanning).
+    let bad = client
+        .post(format!("{base}/admin/queue/pace"))
+        .form(&[("max_workers", "4294967296"), ("max_scans_per_hour", "90")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    assert_eq!(state.pace.get(), p);
     let bad = client
         .post(format!("{base}/admin/queue/pace"))
         .form(&[

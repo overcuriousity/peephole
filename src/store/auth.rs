@@ -123,8 +123,12 @@ impl Store {
 
     /// Store a WebAuthn ceremony state server-side and return its random id.
     /// The id is all the client ever holds; it cannot see or alter the state.
-    /// `None` when [`MAX_OPEN_CEREMONIES`] are already open: anonymous
-    /// clients start these, so their number is bounded.
+    /// At most [`MAX_OPEN_CEREMONIES`] are open, since anonymous clients start
+    /// sign-ins. At the cap the oldest open ceremony makes room rather than
+    /// refusing, so a flood of sign-in starts cannot lock the admin out: a
+    /// sign-in (`auth`) evicts only the oldest sign-in, an enrollment (only
+    /// started when authorised) the oldest of any kind. `None` when nothing
+    /// may be evicted.
     pub async fn put_webauthn_state(
         &self,
         kind: &str,
@@ -132,6 +136,19 @@ impl Store {
         label: Option<&str>,
     ) -> Result<Option<String>> {
         let id = uuid::Uuid::new_v4().to_string();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM webauthn_states WHERE rowid = (
+               SELECT rowid FROM webauthn_states
+               WHERE expires_at > datetime('now') AND (kind = ?1 OR ?1 <> 'auth')
+               ORDER BY created_at, rowid LIMIT 1)
+             AND (SELECT COUNT(*) FROM webauthn_states
+                  WHERE expires_at > datetime('now')) >= ?2",
+        )
+        .bind(kind)
+        .bind(MAX_OPEN_CEREMONIES)
+        .execute(&mut *tx)
+        .await?;
         let stored = sqlx::query(
             "INSERT INTO webauthn_states (id, kind, state_json, label, created_at, expires_at)
              SELECT ?, ?, ?, ?, datetime('now'), datetime('now','+10 minutes')
@@ -143,10 +160,11 @@ impl Store {
         .bind(state_json)
         .bind(label)
         .bind(MAX_OPEN_CEREMONIES)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected()
             == 1;
+        tx.commit().await?;
         Ok(stored.then_some(id))
     }
 
@@ -269,7 +287,7 @@ impl Store {
 pub const SESSION_HOURS: i64 = 12;
 /// Sessions end after this long without a request.
 pub const SESSION_IDLE_MINUTES: i64 = 60;
-/// Open (unexpired) WebAuthn ceremonies at most; more are refused.
+/// Open (unexpired) WebAuthn ceremonies at most; more evict the oldest.
 pub const MAX_OPEN_CEREMONIES: i64 = 256;
 /// Lifetime of the first-run setup token.
 pub const SETUP_TOKEN_HOURS: i64 = 24;
@@ -432,13 +450,54 @@ mod tests {
     async fn open_ceremonies_are_capped() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
-        for _ in 0..super::MAX_OPEN_CEREMONIES {
-            assert!(
+        let open = |s: &Store| {
+            let pool = s.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM webauthn_states")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        let reg = s
+            .put_webauthn_state("reg", "{}", None)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut auth = Vec::new();
+        for _ in 1..super::MAX_OPEN_CEREMONIES {
+            auth.push(
                 s.put_webauthn_state("auth", "{}", None)
                     .await
                     .unwrap()
-                    .is_some()
+                    .unwrap(),
             );
+        }
+        // At the cap a new sign-in still starts: it evicts the oldest
+        // sign-in, never the enrollment.
+        let newest = s.put_webauthn_state("auth", "{}", None).await.unwrap();
+        assert!(newest.is_some());
+        assert_eq!(open(&s).await, super::MAX_OPEN_CEREMONIES);
+        assert!(
+            s.take_webauthn_state(&auth[0], "auth")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.take_webauthn_state(&auth[1], "auth")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(s.take_webauthn_state(&reg, "reg").await.unwrap().is_some());
+        // Refilled with enrollments only, a sign-in has nothing to evict.
+        sqlx::query("DELETE FROM webauthn_states")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        for _ in 0..super::MAX_OPEN_CEREMONIES {
+            s.put_webauthn_state("reg", "{}", None).await.unwrap();
         }
         assert!(
             s.put_webauthn_state("auth", "{}", None)
@@ -446,20 +505,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // Expired ones do not count.
-        sqlx::query(
-            "UPDATE webauthn_states SET expires_at = datetime('now', '-1 second')
-             WHERE rowid IN (SELECT rowid FROM webauthn_states LIMIT 1)",
-        )
-        .execute(&s.pool)
-        .await
-        .unwrap();
+        // An enrollment evicts the oldest of any kind.
         assert!(
-            s.put_webauthn_state("auth", "{}", None)
+            s.put_webauthn_state("reg", "{}", None)
                 .await
                 .unwrap()
                 .is_some()
         );
+        assert_eq!(open(&s).await, super::MAX_OPEN_CEREMONIES);
     }
 
     #[tokio::test]

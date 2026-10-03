@@ -50,7 +50,7 @@
       {% if chrome.authed %}<td><a class="btn btn-sm btn-ghost" href="/admin/requests/{{ r.id }}">inspect</a></td>{% endif %}
     </tr>
   {% endfor %}
-  {% if page.items.is_empty() %}<tr><td colspan="9" class="empty">No requests match.</td></tr>{% endif %}
+  {% if page.items.is_empty() %}<tr><td colspan="{% if chrome.authed %}{% if nodes.is_empty() %}8{% else %}9{% endif %}{% else %}{% if nodes.is_empty() %}6{% else %}7{% endif %}{% endif %}" class="empty">No requests match.</td></tr>{% endif %}
   </tbody>
 </table></div>
 {% if chrome.authed %}</form>{% endif %}

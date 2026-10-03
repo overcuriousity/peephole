@@ -175,6 +175,17 @@ impl Safety {
     pub fn listed(&self, ip: &IpAddr) -> Option<String> {
         self.lists.covering(ip)
     }
+
+    /// Whether `net` holds an address [`Self::refuses`] or overlaps a
+    /// network [`Self::listed`] covers, so it must not be blocked whole.
+    pub fn overlaps(&self, net: &IpNet) -> bool {
+        self.own
+            .iter()
+            .chain(self.observed.keys())
+            .chain(self.published.keys())
+            .any(|ip| net.contains(ip))
+            || self.lists.nets.iter().any(|(n, _)| nets_overlap(n, net))
+    }
 }
 
 /// Addresses of this host's interfaces (Linux `/proc`), plus the source
@@ -197,6 +208,11 @@ async fn local_addresses() -> HashSet<IpAddr> {
         }
     }
     out
+}
+
+/// Whether two networks share an address (one contains the other).
+pub fn nets_overlap(a: &IpNet, b: &IpNet) -> bool {
+    a.contains(&b.network()) || b.contains(&a.network())
 }
 
 /// Local (`/32 host LOCAL`) addresses in `/proc/net/fib_trie`.

@@ -149,6 +149,9 @@ async fn security_headers(
         || path.starts_with("/enroll")
         || path == "/logout"
         || path == "/requests";
+    // Public pages (`/`, `/ips`, `/ip/{addr}`) show private data to a
+    // signed-in admin: never cache those responses either.
+    let signed_in = carries_session(req.headers());
 
     let mut res = next.run(req).await;
     let h = res.headers_mut();
@@ -177,8 +180,31 @@ async fn security_headers(
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),
         );
+    } else if signed_in {
+        h.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("private, no-store"),
+        );
+    } else if !h.contains_key(axum::http::header::CACHE_CONTROL) {
+        // What a page shows depends on the session cookie; responses that
+        // set their own caching (assets, the blocklist) do not.
+        h.append(
+            axum::http::header::VARY,
+            axum::http::HeaderValue::from_static("Cookie"),
+        );
     }
     res
+}
+
+/// Whether the request carries a session cookie (either name, see
+/// [`auth::session_cookie_name`]), valid or not.
+fn carries_session(h: &axum::http::HeaderMap) -> bool {
+    h.get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|c| c.split_once('=').map(|(name, _)| name.trim()))
+        .any(|name| name == "peephole_session" || name == "__Host-peephole_session")
 }
 
 fn method_mutates(m: &axum::http::Method) -> bool {
@@ -219,4 +245,48 @@ fn same_origin(h: &axum::http::HeaderMap) -> bool {
 #[derive(serde::Deserialize, Default)]
 pub struct RangeQuery {
     pub range: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    async fn headers(path: &str, cookie: Option<&str>) -> axum::http::HeaderMap {
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "page" }))
+            .route(
+                "/feed",
+                axum::routing::get(|| async {
+                    (
+                        [(axum::http::header::CACHE_CONTROL, "public, max-age=60")],
+                        "feed",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(security_headers));
+        let mut req = axum::http::Request::get(path);
+        if let Some(c) = cookie {
+            req = req.header(axum::http::header::COOKIE, c);
+        }
+        let res = app
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        res.headers().clone()
+    }
+
+    #[tokio::test]
+    async fn signed_in_pages_are_never_cached() {
+        let h = headers("/", Some("theme=dark; __Host-peephole_session=x")).await;
+        assert_eq!(h[axum::http::header::CACHE_CONTROL], "private, no-store");
+        let h = headers("/feed", Some("peephole_session=x")).await;
+        assert_eq!(h[axum::http::header::CACHE_CONTROL], "private, no-store");
+        // Anonymous visitors keep the handler's caching.
+        let h = headers("/feed", None).await;
+        assert_eq!(h[axum::http::header::CACHE_CONTROL], "public, max-age=60");
+        let h = headers("/", Some("theme=dark")).await;
+        assert!(!h.contains_key(axum::http::header::CACHE_CONTROL));
+        assert_eq!(h[axum::http::header::VARY], "Cookie");
+    }
 }

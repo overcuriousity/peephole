@@ -90,6 +90,8 @@ dialog .actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-
 .kv dt { color: var(--color-fg-muted); }
 .kv dd { margin: 0; font-family: var(--font-mono); word-break: break-all; }
 pre.panel { background: var(--color-bg-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: 0.75rem 1rem; overflow: auto; font-size: var(--text-xs); max-height: 32rem; white-space: pre-wrap; word-break: break-all; }
+[data-copy] { cursor: copy; }
+[data-copy][data-copied] { border-color: var(--color-accent); }
 .ip-head { align-items: center; }
 .ip-head h1 { font-family: var(--font-mono); font-size: var(--text-3xl); letter-spacing: 0; }
 .ip-head .tiles { margin-bottom: 0; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); min-width: min(100%, 20rem); }

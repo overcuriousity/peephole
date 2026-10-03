@@ -28,6 +28,18 @@
   document.querySelectorAll("dialog [data-close]").forEach(function (b) {
     b.addEventListener("click", function () { b.closest("dialog").close(); });
   });
+  // Click a [data-copy] panel (invite, config key) to copy its text.
+  document.querySelectorAll("[data-copy]").forEach(function (el) {
+    if (!navigator.clipboard) return;
+    el.title = "Click to copy";
+    el.addEventListener("click", function () {
+      navigator.clipboard.writeText(el.textContent.trim()).then(function () {
+        el.setAttribute("data-copied", "");
+        el.title = "Copied";
+        setTimeout(function () { el.removeAttribute("data-copied"); el.title = "Click to copy"; }, 1500);
+      }, function () {});
+    });
+  });
   // One-shot notice the server set after an action; shown once, then cleared.
   var fm = document.cookie.match(/(?:^|; )peephole_flash=([^;]*)/);
   if (fm) {
@@ -134,8 +146,10 @@
       return tr;
     };
     // The page's status/level filter applies to live rows too.
-    var fStatus = qt.getAttribute("data-filter-status") || "", fLevel = qt.getAttribute("data-filter-level") || "";
-    var matches = function (j) { return (!fStatus || j.status === fStatus) && (!fLevel || String(j.level) === fLevel); };
+    // The level compares as a number, as the server parses it ("03" is 3).
+    var fStatus = qt.getAttribute("data-filter-status") || "", lv = (qt.getAttribute("data-filter-level") || "").trim();
+    var fLevel = /^[+-]?\d+$/.test(lv) ? parseInt(lv, 10) : NaN;
+    var matches = function (j) { return (!fStatus || j.status === fStatus) && (isNaN(fLevel) || Number(j.level) === fLevel); };
     var COLS = 8;
     var apply = function (j) {
       var existing = tbody.querySelector('[data-job="' + j.id + '"]');

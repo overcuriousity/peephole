@@ -242,7 +242,11 @@ async fn enroll_start(
             let state_json = serde_json::to_string(&state_reg).unwrap();
             let sid = match state
                 .store
-                .put_webauthn_state("reg", &state_json, Some(&label))
+                .put_webauthn_state(
+                    if by_token { "reg-setup" } else { "reg" },
+                    &state_json,
+                    Some(&label),
+                )
                 .await
             {
                 Ok(Some(id)) => id,
@@ -277,7 +281,16 @@ async fn enroll_finish(
         return (StatusCode::BAD_REQUEST, "no enrollment in progress").into_response();
     };
     // Consume the server-side state (single-use). A forged or replayed id finds nothing.
-    let taken = state.store.take_webauthn_state(cookie.value(), "reg").await;
+    // Its kind tells whether the setup token authorised the enrollment.
+    let mut by_token = false;
+    let mut taken = Ok(None);
+    for (kind, token) in [("reg", false), ("reg-setup", true)] {
+        taken = state.store.take_webauthn_state(cookie.value(), kind).await;
+        if !matches!(taken, Ok(None)) {
+            by_token = token;
+            break;
+        }
+    }
     let Ok(Some((state_json, label))) = taken else {
         return (
             StatusCode::BAD_REQUEST,
@@ -318,7 +331,11 @@ async fn enroll_finish(
                 return (StatusCode::INTERNAL_SERVER_ERROR, "could not store the key")
                     .into_response();
             }
-            let _ = state.store.consume_setup_token().await;
+            // An admin adding a key with their session leaves a setup token
+            // issued meanwhile (e.g. for a colleague) alone.
+            if by_token {
+                let _ = state.store.consume_setup_token().await;
+            }
             // An admin adding a key keeps their session. The first key
             // (setup token) signs in with that key.
             if session_valid(&state, &jar).await {

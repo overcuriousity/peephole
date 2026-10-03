@@ -35,4 +35,21 @@ impl Store {
         .fetch_all(&self.read)
         .await?)
     }
+
+    /// IPs seen since `since` that [`Store::blocklist_ips`] leaves out as
+    /// Tor exits or verified crawlers, so the feed does not collapse a
+    /// prefix that holds one.
+    pub async fn blocklist_spared_ips(&self, since: &str) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT i.ip FROM ips i
+             WHERE i.last_seen >= ?1
+               AND (i.is_tor_exit = 1
+                    OR EXISTS (SELECT 1 FROM scan_jobs j
+                               WHERE j.ip_id = i.id AND j.status = 'refused'
+                                 AND j.error LIKE 'verified crawler%'))",
+        )
+        .bind(since)
+        .fetch_all(&self.read)
+        .await?)
+    }
 }
