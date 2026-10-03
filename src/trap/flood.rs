@@ -1,6 +1,7 @@
-//! Keeping a flood from one address off the database: a per-IP token
-//! bucket decides which requests are recorded in full, and a short-lived
-//! cache spares the intel lookups for an IP seen moments ago.
+//! Keeping a flood from one address off the database: a per-source token
+//! bucket (IPv6 by /64, see [`crate::net::source_key`]) decides which
+//! requests are recorded in full, and a short-lived cache spares the intel
+//! lookups for an IP seen moments ago.
 use super::config::TrapConfig;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -14,7 +15,7 @@ const MAX_TRACKED: usize = 100_000;
 /// Whether to record a request.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Admission {
-    /// Record it. `unrecorded`: requests from this IP answered but not
+    /// Record it. `unrecorded`: requests from this source answered but not
     /// recorded since its previous recorded one.
     Record { unrecorded: u64 },
     /// Answer it, record nothing (counted for the next recorded request).
@@ -27,7 +28,7 @@ struct Bucket {
     unrecorded: u64,
 }
 
-/// Per-IP token bucket over recorded requests.
+/// Per-source token bucket over recorded requests.
 #[derive(Default)]
 pub struct FloodGate {
     buckets: Mutex<HashMap<IpAddr, Bucket>>,
@@ -42,7 +43,7 @@ impl FloodGate {
         if cfg.record_rate <= 0.0 {
             return Admission::Record { unrecorded: 0 };
         }
-        let ip = crate::net::canonical(ip);
+        let ip = crate::net::source_key(ip);
         let burst = f64::from(cfg.record_burst);
         let refill = |b: &Bucket| {
             (b.tokens + now.saturating_duration_since(b.last).as_secs_f64() * cfg.record_rate)
@@ -77,6 +78,26 @@ impl FloodGate {
             return Admission::Record { unrecorded };
         }
         Admission::Skip
+    }
+
+    /// Count a request answered without being recorded for another reason
+    /// than its rate (its body did not fit the budget), so the next
+    /// recorded one from its source reports it like a skipped one.
+    pub fn count_unrecorded(&self, ip: IpAddr, cfg: &TrapConfig) {
+        if cfg.record_rate <= 0.0 {
+            return;
+        }
+        let ip = crate::net::source_key(ip);
+        let mut map = self.buckets.lock().unwrap();
+        if map.len() >= MAX_TRACKED && !map.contains_key(&ip) {
+            return;
+        }
+        let b = map.entry(ip).or_insert(Bucket {
+            tokens: f64::from(cfg.record_burst),
+            last: Instant::now(),
+            unrecorded: 0,
+        });
+        b.unrecorded += 1;
     }
 }
 
@@ -154,6 +175,37 @@ mod tests {
         // An IPv4-mapped address shares the IPv4 bucket.
         let mapped: IpAddr = "::ffff:203.0.113.1".parse().unwrap();
         assert_eq!(g.admit_at(mapped, &c, t1), Admission::Skip);
+    }
+
+    #[test]
+    fn an_ipv6_64_shares_one_bucket() {
+        let g = FloodGate::default();
+        let c = cfg(1.0, 2, 0);
+        let t0 = Instant::now();
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        assert_eq!(g.admit_at(a, &c, t0), Admission::Record { unrecorded: 0 });
+        assert_eq!(g.admit_at(b, &c, t0), Admission::Record { unrecorded: 0 });
+        // Rotating within the /64 does not get a fresh bucket.
+        for i in 0..100u16 {
+            let ip = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 7, i));
+            assert_eq!(g.admit_at(ip, &c, t0), Admission::Skip);
+        }
+        g.count_unrecorded(a, &c);
+        assert_eq!(
+            g.admit_at(b, &c, t0 + Duration::from_secs(1)),
+            Admission::Record { unrecorded: 101 }
+        );
+        // The next /64 has its own.
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(
+            g.admit_at(other, &c, t0),
+            Admission::Record { unrecorded: 0 }
+        );
+        // A count for a source not seen before is kept too.
+        let new: IpAddr = "203.0.113.7".parse().unwrap();
+        g.count_unrecorded(new, &c);
+        assert_eq!(g.admit_at(new, &c, t0), Admission::Record { unrecorded: 1 });
     }
 
     #[test]

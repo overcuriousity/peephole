@@ -24,6 +24,11 @@ fn settled_router(state: Arc<TrapState>) -> axum::Router {
 /// A trap behind a trusted proxy at 127.0.0.1, with `extra` appended to the
 /// config (e.g. a `[trap]` section).
 async fn spawn(extra: &str) -> (String, Store, tempfile::TempDir) {
+    spawn_with(extra, Default::default()).await
+}
+
+/// [`spawn`] with these guards.
+async fn spawn_with(extra: &str, guards: trap::Guards) -> (String, Store, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let cfg_text = format!(
         r#"
@@ -42,7 +47,10 @@ web = false
     std::fs::write(&cfg_path, cfg_text).unwrap();
     let cfg = Config::load(&cfg_path).unwrap();
     let store = Store::connect(&cfg.database_path).await.unwrap();
-    let app = settled_router(Arc::new(TrapState::for_test(store.clone(), cfg)));
+    let app = settled_router(Arc::new(TrapState {
+        guards,
+        ..TrapState::for_test(store.clone(), cfg)
+    }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -580,6 +588,20 @@ async fn spawn_listeners(
     tempfile::TempDir,
     tokio::sync::watch::Sender<bool>,
 ) {
+    spawn_listeners_with(trusted, Default::default()).await
+}
+
+/// [`spawn_listeners`] with these connection limits.
+async fn spawn_listeners_with(
+    trusted: &str,
+    limits: trap::listen::Limits,
+) -> (
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    Store,
+    tempfile::TempDir,
+    tokio::sync::watch::Sender<bool>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let cfg_text = format!(
         r#"
@@ -605,19 +627,21 @@ web = false
     let plain = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let secure = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (pa, sa) = (plain.local_addr().unwrap(), secure.local_addr().unwrap());
-    tokio::spawn(trap::listen::serve_trap(
+    tokio::spawn(trap::listen::serve_trap_with(
         plain,
         app.clone(),
         None,
         trusted.clone(),
         rx.clone(),
+        limits,
     ));
-    tokio::spawn(trap::listen::serve_trap(
+    tokio::spawn(trap::listen::serve_trap_with(
         secure,
         app,
         Some(tls),
         trusted,
         rx,
+        limits,
     ));
     (pa, sa, store, dir, stop)
 }
@@ -855,4 +879,219 @@ async fn light_rows_of_requests_in_flight_at_shutdown_are_kept() {
         count(&store, "SELECT COUNT(*) FROM skipped_requests").await,
         1
     );
+}
+
+/// Wait (at most five seconds) for the server to close `io`; true if it did.
+async fn closed_by_server<S: tokio::io::AsyncRead + Unpin>(io: &mut S) -> bool {
+    let mut buf = [0u8; 1024];
+    let wait = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match io.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    });
+    wait.await.is_ok()
+}
+
+fn limits(per_source: usize, head_secs: u64) -> trap::listen::Limits {
+    trap::listen::Limits {
+        max_conns_per_source: per_source,
+        head_timeout: std::time::Duration::from_secs(head_secs),
+        ..Default::default()
+    }
+}
+
+/// One address cannot hold every connection slot: past its own cap its
+/// connections are dropped, others still get in, and a slot it gives up is
+/// free again.
+#[tokio::test]
+async fn connections_are_capped_per_source() {
+    let (p, _s, store, _d, _stop) = spawn_listeners_with("", limits(2, 60)).await;
+    let mut idle = vec![];
+    for _ in 0..2 {
+        idle.push(tokio::net::TcpStream::connect(p).await.unwrap());
+    }
+    let mut third = tokio::net::TcpStream::connect(p).await.unwrap();
+    assert!(closed_by_server(&mut third).await, "over the cap: dropped");
+    drop(idle.pop());
+    let mut answered = String::new();
+    for _ in 0..50 {
+        let mut tcp = tokio::net::TcpStream::connect(p).await.unwrap();
+        answered = raw_request(&mut tcp, "GET /in HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        if !answered.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(answered.starts_with("HTTP/1.1 404"), "{answered}");
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 1);
+}
+
+/// Behind a trusted proxy every connection comes from the proxy: the cap
+/// applies to the client its PROXY header names.
+#[tokio::test]
+async fn the_per_source_cap_counts_the_proxied_client() {
+    let (_p, s, store, _d, _stop) = spawn_listeners_with(r#""127.0.0.1/32""#, limits(1, 60)).await;
+    let connect = |client: &'static str| async move {
+        let mut tcp = tokio::net::TcpStream::connect(s).await.unwrap();
+        tcp.write_all(format!("PROXY TCP4 {client} 127.0.0.1 5555 443\r\n").as_bytes())
+            .await
+            .unwrap();
+        let name = rustls::pki_types::ServerName::try_from("probe.test").unwrap();
+        tls_client().connect(name, tcp).await
+    };
+    let _held = connect("203.0.113.9").await.unwrap();
+    assert!(
+        connect("203.0.113.9").await.is_err(),
+        "the same client again"
+    );
+    let mut other = connect("203.0.113.10").await.unwrap();
+    let answer = raw_request(&mut other, "GET /o HTTP/1.1\r\nHost: probe.test\r\n\r\n").await;
+    assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+    let ip: String = sqlx::query_scalar("SELECT i.ip FROM requests r JOIN ips i ON i.id = r.ip_id")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(ip, "203.0.113.10");
+}
+
+/// A connection that sends no complete request head in time is dropped,
+/// on either listener; once the head is in, a slow body still has time.
+#[tokio::test]
+async fn a_connection_without_a_request_head_in_time_is_dropped() {
+    let (p, s, store, _d, _stop) = spawn_listeners_with("", limits(64, 1)).await;
+    let mut silent = tokio::net::TcpStream::connect(p).await.unwrap();
+    let mut partial = tokio::net::TcpStream::connect(p).await.unwrap();
+    partial.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+    let tcp = tokio::net::TcpStream::connect(s).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("probe.test").unwrap();
+    let mut tls = tls_client().connect(name, tcp).await.unwrap();
+    let t0 = std::time::Instant::now();
+    assert!(closed_by_server(&mut silent).await);
+    assert!(closed_by_server(&mut partial).await);
+    assert!(closed_by_server(&mut tls).await);
+    assert!(t0.elapsed() < std::time::Duration::from_secs(4));
+
+    let mut slow = tokio::net::TcpStream::connect(p).await.unwrap();
+    slow.write_all(b"POST /slow HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let answer = raw_request(&mut slow, "body").await;
+    assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+    let body: Vec<u8> = sqlx::query_scalar("SELECT body FROM requests")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(body, b"body");
+}
+
+/// Bodies held in memory are bounded: one that does not fit the budget is
+/// not kept, its request leaves a light row (counted on the next recorded
+/// one), and the budget is free again afterwards.
+#[tokio::test]
+async fn a_body_past_the_memory_budget_leaves_a_light_row() {
+    let (base, store, _dir) = spawn_with("", trap::Guards::with_body_budget(1000)).await;
+    let client = reqwest::Client::new();
+    let post = |path: &str, n: usize| {
+        client
+            .post(format!("{base}{path}"))
+            .header("x-forwarded-for", "203.0.113.40")
+            .body(vec![b'a'; n])
+            .send()
+    };
+    assert_eq!(post("/big", 2000).await.unwrap().status(), 404);
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 0);
+    assert_eq!(post("/small", 900).await.unwrap().status(), 404);
+    let (path, len, unrecorded): (String, i64, Option<i64>) = sqlx::query_as(
+        "SELECT path, length(body), unrecorded FROM requests ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    assert_eq!((path.as_str(), len, unrecorded), ("/small", 900, Some(1)));
+    let light: String = sqlx::query_scalar("SELECT path FROM skipped_requests")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(light, "/big");
+    // Both holds were given back.
+    assert_eq!(post("/again", 900).await.unwrap().status(), 404);
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM requests WHERE length(body) = 900"
+        )
+        .await,
+        2
+    );
+}
+
+/// What a helper endpoint cannot take (wrong content type, a body it cannot
+/// parse or that is too long, no token) is answered and recorded as the
+/// trap, never with the framework's own error.
+#[tokio::test]
+async fn helper_requests_they_cannot_take_are_the_trap() {
+    let (base, store, _dir) = spawn("").await;
+    let client = reqwest::Client::new();
+    let xff = "203.0.113.41";
+    let sent = [
+        client
+            .post(format!("{base}/claim"))
+            .header("content-type", "application/json")
+            .body("{}"),
+        client
+            .post(format!("{base}/claim"))
+            .form(&[("email", "a".repeat(70 * 1024))]),
+        client
+            .post(format!("{base}/collect"))
+            .header("content-type", "text/plain")
+            .body(r#"{"token":"x","attrs":{},"behavior":{}}"#),
+        client
+            .post(format!("{base}/collect"))
+            .header("content-type", "application/json")
+            .body("{not json"),
+        client
+            .post(format!("{base}/collect"))
+            .json(&serde_json::json!({"token": "x"})),
+        client.get(format!("{base}/panel")),
+        client.get(format!("{base}/panel?tok=x")),
+    ];
+    for req in sent {
+        let r = req.header("x-forwarded-for", xff).send().await.unwrap();
+        assert_eq!(r.status(), 404);
+        assert!(
+            r.text()
+                .await
+                .unwrap()
+                .contains("route which does not exist")
+        );
+    }
+    let rows = |sql: &'static str| count(&store, sql);
+    assert_eq!(
+        rows("SELECT COUNT(*) FROM requests WHERE path = '/claim'").await,
+        2
+    );
+    assert_eq!(
+        rows("SELECT COUNT(*) FROM requests WHERE path = '/collect'").await,
+        3
+    );
+    assert_eq!(
+        rows("SELECT COUNT(*) FROM requests WHERE path = '/panel'").await,
+        2
+    );
+    assert_eq!(
+        rows("SELECT COUNT(*) FROM requests WHERE is_fp_claim").await,
+        0
+    );
+    assert_eq!(rows("SELECT COUNT(*) FROM fingerprints").await, 0);
+    assert_eq!(rows("SELECT COUNT(*) FROM fp_claims").await, 0);
+    // The cut body is stored as the trap stores any.
+    let truncated: i64 = rows(
+        "SELECT COUNT(*) FROM requests WHERE path = '/claim' AND headers_json LIKE '%:body-truncated%'",
+    )
+    .await;
+    assert_eq!(truncated, 1);
 }

@@ -3,6 +3,10 @@
 //! proxies) and the ClientHello itself, so the raw handshake and its JA4
 //! fingerprint are kept, then terminates TLS. Both listeners keep a copy of
 //! the request head as received and answer one request per connection.
+//!
+//! Connections are capped per listener and per source (IPv6 by /64, see
+//! [`crate::net::source_key`]); a connection has [`HEAD_TIMEOUT`] from
+//! accept to send a complete request head and [`CONN_DEADLINE`] in all.
 use super::proxy_proto::{self, Proxy};
 use super::raw_head::{HeadBuf, Tee};
 use super::tls_hello::{self, Hello};
@@ -27,6 +31,19 @@ const HEAD_CAP: usize = 64 * 1024;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Simultaneous connections per listener; excess are dropped.
 const MAX_CONNS: usize = 2048;
+/// Simultaneous connections per source and listener; excess are dropped.
+/// The source is the client a trusted proxy's PROXY header names: all
+/// connections through that proxy share its address. Plain HTTP through a
+/// trusted proxy carries no PROXY header (the client is known per request,
+/// from `X-Forwarded-For`), so there only [`MAX_CONNS`] applies.
+const MAX_CONNS_PER_SOURCE: usize = 64;
+/// Time a connection has from accept to a complete first request head,
+/// PROXY header and TLS handshake included. hyper's protocol detection has
+/// no timeout of its own, and its HTTP/1 header timeout starts only once
+/// HTTP/1 is chosen.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest a connection lasts; bounds slow bodies and HTTP/2 streams.
+const CONN_DEADLINE: Duration = Duration::from_secs(120);
 /// A trusted proxy whose PROXY header is refused is warned about at most
 /// once per this long, so a misconfigured proxy is noticed without a log
 /// line per connection.
@@ -109,19 +126,97 @@ pub fn trap_tls_config(
     Ok(Arc::new(cfg))
 }
 
-/// Serve a trap listener with slowloris protection: a per-connection
-/// header-read timeout and overall deadline (hyper on its own disables its
-/// default header timeout when no timer is installed), plus a cap on
-/// concurrent connections that sheds load rather than exhausting file
-/// descriptors/tasks. With `tls`, connections are TLS (see the module).
+/// A listener's connection limits (see the constants of the same names).
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub max_conns: usize,
+    pub max_conns_per_source: usize,
+    pub head_timeout: Duration,
+    pub conn_deadline: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_conns: MAX_CONNS,
+            max_conns_per_source: MAX_CONNS_PER_SOURCE,
+            head_timeout: HEAD_TIMEOUT,
+            conn_deadline: CONN_DEADLINE,
+        }
+    }
+}
+
+/// Open connections per source key.
+#[derive(Default)]
+struct Sources(Mutex<HashMap<IpAddr, usize>>);
+
+/// A connection counted against its source until dropped.
+struct SourceSlot {
+    sources: Arc<Sources>,
+    key: IpAddr,
+}
+
+impl Sources {
+    /// Count a connection from `ip`; None when its source has `max` open.
+    fn take(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<SourceSlot> {
+        let key = crate::net::source_key(ip);
+        let mut open = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let n = open.entry(key).or_default();
+        if *n >= max {
+            return None;
+        }
+        *n += 1;
+        Some(SourceSlot {
+            sources: self.clone(),
+            key,
+        })
+    }
+
+    #[cfg(test)]
+    fn open(&self) -> usize {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        let mut open = self.sources.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = open.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// Serve a trap listener with slowloris protection: a deadline for the
+/// first request head and one for the whole connection (hyper on its own
+/// disables its default header timeout when no timer is installed), plus
+/// caps on concurrent connections, in all and per source, that shed load
+/// rather than exhausting file descriptors/tasks. With `tls`, connections
+/// are TLS (see the module).
 pub async fn serve_trap(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     tls: Option<Arc<rustls::ServerConfig>>,
     trusted: Arc<Vec<IpNet>>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
+    serve_trap_with(listener, app, tls, trusted, shutdown, Limits::default()).await
+}
+
+/// [`serve_trap`] with other limits (tests).
+pub async fn serve_trap_with(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    trusted: Arc<Vec<IpNet>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    limits: Limits,
+) {
+    let sem = Arc::new(tokio::sync::Semaphore::new(limits.max_conns));
+    let sources = Arc::new(Sources::default());
     let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
     loop {
         let (stream, peer) = tokio::select! {
@@ -136,16 +231,29 @@ pub async fn serve_trap(
             },
             _ = shutdown.changed() => break,
         };
+        let start = tokio::time::Instant::now();
+        let (head_by, end) = (start + limits.head_timeout, start + limits.conn_deadline);
         let Ok(permit) = sem.clone().try_acquire_owned() else {
             // At the connection cap: drop this one instead of piling up.
             continue;
         };
-        let (app, trusted, acceptor) = (app.clone(), trusted.clone(), acceptor.clone());
+        let via_proxy = trusted
+            .iter()
+            .any(|n| n.contains(&crate::net::canonical(peer.ip())));
+        // A trusted proxy's connections are counted against the client its
+        // PROXY header names, once that is read.
+        let source = if via_proxy {
+            None
+        } else {
+            let Some(s) = sources.take(peer.ip(), limits.max_conns_per_source) else {
+                debug!(%peer, "trap: at the per-source connection cap, dropped");
+                continue;
+            };
+            Some(s)
+        };
+        let (app, acceptor, sources) = (app.clone(), acceptor.clone(), sources.clone());
         tokio::spawn(async move {
-            let _permit = permit;
-            let via_proxy = trusted
-                .iter()
-                .any(|n| n.contains(&crate::net::canonical(peer.ip())));
+            let _held = (permit, source);
             let mut meta = ConnMeta {
                 via_proxy,
                 ..Default::default()
@@ -154,11 +262,12 @@ pub async fn serve_trap(
                 None => {
                     meta.transport = "http";
                     let io = Tee::new(stream, meta.head.clone(), HEAD_CAP);
-                    serve_conn(io, peer, meta, app).await;
+                    serve_conn(io, peer, meta, app, head_by, end).await;
                 }
                 Some(acceptor) => {
                     meta.transport = "https";
-                    let (io, src, hello) = match preface(stream, via_proxy).await {
+                    let preface = tokio::time::timeout_at(head_by, preface(stream, via_proxy));
+                    let (io, src, hello) = match preface.await.unwrap_or(Err(Unusable::Other)) {
                         Ok(v) => v,
                         // A trusted proxy that sends no usable header loses
                         // every TLS connection through it: say so.
@@ -180,17 +289,28 @@ pub async fn serve_trap(
                             return;
                         }
                     };
+                    let _source = match src {
+                        Some(client) => {
+                            match sources.take(client.ip(), limits.max_conns_per_source) {
+                                Some(slot) => Some(slot),
+                                None => {
+                                    debug!(%peer, %client, "trap: at the per-source connection cap, dropped");
+                                    return;
+                                }
+                            }
+                        }
+                        None => None,
+                    };
                     meta.proxied_src = src;
                     meta.ja4 = Some(tls_hello::ja4(&hello));
                     meta.client_hello = Some(Arc::new(hello.raw));
-                    let Ok(Ok(tls)) =
-                        tokio::time::timeout(HELLO_TIMEOUT, acceptor.accept(io)).await
+                    let Ok(Ok(tls)) = tokio::time::timeout_at(head_by, acceptor.accept(io)).await
                     else {
                         debug!(%peer, "trap: TLS handshake failed");
                         return;
                     };
                     let io = Tee::new(tls, meta.head.clone(), HEAD_CAP);
-                    serve_conn(io, peer, meta, app).await;
+                    serve_conn(io, peer, meta, app, head_by, end).await;
                 }
             }
         });
@@ -330,10 +450,17 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Replay<S> {
     }
 }
 
-/// Serve HTTP on one connection. The client address handlers see is the
-/// PROXY header's source when there is one.
-async fn serve_conn<I>(io: I, peer: SocketAddr, meta: ConnMeta, app: axum::Router)
-where
+/// Serve HTTP on one connection, dropping it if no complete request head
+/// has arrived by `head_by`, and in any case at `end`. The client address
+/// handlers see is the PROXY header's source when there is one.
+async fn serve_conn<I>(
+    io: I,
+    peer: SocketAddr,
+    meta: ConnMeta,
+    app: axum::Router,
+    head_by: tokio::time::Instant,
+    end: tokio::time::Instant,
+) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -341,7 +468,11 @@ where
     use tower::ServiceExt;
 
     let client = meta.proxied_src.unwrap_or(peer);
+    // Told when hyper hands over a request: its head is complete.
+    let headed = Arc::new(tokio::sync::Notify::new());
+    let on_head = headed.clone();
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        on_head.notify_one();
         let (app, meta) = (app.clone(), meta.clone());
         async move {
             let (mut parts, body) = req.into_parts();
@@ -371,13 +502,19 @@ where
         .max_pending_accept_reset_streams(16)
         .keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(15));
+    let conn = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
+    tokio::pin!(conn);
+    tokio::select! {
+        _ = conn.as_mut() => return,
+        _ = headed.notified() => {}
+        _ = tokio::time::sleep_until(head_by) => {
+            debug!(%peer, "trap: no complete request head in time, dropped");
+            return;
+        }
+    }
     // Overall per-connection deadline bounds slow bodies and keep-alive
     // trickling as well as slow headers.
-    let _ = tokio::time::timeout(
-        Duration::from_secs(120),
-        builder.serve_connection_with_upgrades(TokioIo::new(io), service),
-    )
-    .await;
+    let _ = tokio::time::timeout_at(end, conn).await;
 }
 
 #[cfg(test)]
@@ -399,6 +536,22 @@ mod tests {
         std::fs::write(&k, "not a key").unwrap();
         assert!(trap_tls_config(Some(&c), Some(&k)).is_err());
         trap_tls_config(None, None).unwrap();
+    }
+
+    #[test]
+    fn sources_are_capped_and_released() {
+        let s = Arc::new(Sources::default());
+        let a: IpAddr = "2001:db8:0:1::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:0:1::2".parse().unwrap();
+        let held: Vec<_> = (0..3).map(|_| s.take(a, 4).unwrap()).collect();
+        let fourth = s.take(b, 4).unwrap();
+        // The /64 is full, whichever address in it asks.
+        assert!(s.take(a, 4).is_none() && s.take(b, 4).is_none());
+        assert!(s.take("2001:db8:0:2::1".parse().unwrap(), 4).is_some());
+        drop(fourth);
+        let again = s.take(a, 4).unwrap();
+        drop((held, again));
+        assert_eq!(s.open(), 0, "nothing is left behind");
     }
 
     #[test]
