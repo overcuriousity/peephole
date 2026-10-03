@@ -367,8 +367,9 @@ fn compile_ci(pattern: &str) -> Result<Regex> {
 mod tests {
     use super::*;
 
-    fn classifier() -> Classifier {
-        Classifier::from_files(&rules::builtin_files()).unwrap()
+    /// Compiled once: rebuilding every regex per call made these tests slow.
+    fn classifier() -> &'static Classifier {
+        Classifier::builtin()
     }
     fn view<'a>(
         method: &'a str,
