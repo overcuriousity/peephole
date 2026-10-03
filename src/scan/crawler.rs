@@ -14,7 +14,8 @@
 //!   crawlers' reverse zones answer reliably);
 //! - the PTR names a crawler domain but the forward lookup times out:
 //!   treated as a crawler (the attacker does not control that zone, so a
-//!   timeout there is our resolver's trouble, not a trick).
+//!   timeout there is our resolver's trouble, not a trick), cached only as
+//!   long as a failed lookup.
 //!
 //! The PTR query goes to the first `nameserver` in `/etc/resolv.conf` (the
 //! standard library has no reverse lookup); forward lookups use tokio's
@@ -108,13 +109,15 @@ impl Crawlers {
     /// The crawler host name `ip` was confirmed as, if it is one.
     pub async fn confirmed(&self, ip: IpAddr) -> Option<String> {
         let resolver = self.resolver?;
+        // One cache entry per address, whatever its spelling.
+        let ip = crate::net::canonical(ip);
         if let Some((until, v)) = self.cache.lock().unwrap().get(&ip)
             && *until > Instant::now()
         {
             return v.clone();
         }
         let (verdict, ttl) = match tokio::time::timeout(LOOKUP_TIMEOUT, ptr(resolver, ip)).await {
-            Ok(Ok(names)) => (self.confirm(ip, &names).await, CACHE_OK),
+            Ok(Ok(names)) => self.confirm(ip, &names).await,
             Ok(Err(e)) => {
                 debug!(%ip, error = %e, "reverse lookup failed");
                 (None, CACHE_FAILED)
@@ -136,22 +139,24 @@ impl Crawlers {
         verdict
     }
 
-    /// The first PTR name under a crawler domain that resolves back to `ip`.
-    async fn confirm(&self, ip: IpAddr, names: &[String]) -> Option<String> {
+    /// The first PTR name under a crawler domain that resolves back to `ip`,
+    /// and how long to cache that verdict.
+    async fn confirm(&self, ip: IpAddr, names: &[String]) -> (Option<String>, Duration) {
         let ip = crate::net::canonical(ip);
         for name in names.iter().filter(|n| self.is_crawler_domain(n)) {
             match tokio::time::timeout(LOOKUP_TIMEOUT, (self.forward)(name.clone())).await {
                 Ok(Ok(addrs)) => {
                     if addrs.into_iter().any(|a| crate::net::canonical(a) == ip) {
-                        return Some(name.clone());
+                        return (Some(name.clone()), CACHE_OK);
                     }
                 }
                 Ok(Err(_)) => {}
                 // Fail safe: the crawler's own zone did not answer in time.
-                Err(_) => return Some(name.clone()),
+                // Only briefly: a resolver hiccup is no lasting exemption.
+                Err(_) => return (Some(name.clone()), CACHE_FAILED),
             }
         }
-        None
+        (None, CACHE_OK)
     }
 
     fn is_crawler_domain(&self, name: &str) -> bool {
@@ -488,5 +493,25 @@ mod tests {
         // The resolver changes its mind; the cached verdict stands.
         *answer.lock().unwrap() = None;
         assert!(c.confirmed(ip).await.is_some());
+        // A mapped spelling shares the entry.
+        assert!(
+            c.confirmed("::ffff:198.51.100.7".parse().unwrap())
+                .await
+                .is_some()
+        );
+        assert_eq!(c.cache.lock().unwrap().len(), 1);
+    }
+
+    /// A forward lookup that timed out counts as a crawler, but is cached
+    /// only for the failure lifetime.
+    #[tokio::test]
+    async fn forward_timeouts_are_cached_briefly() {
+        let answer = std::sync::Arc::new(Mutex::new(Some("x.slow.googlebot.com".to_string())));
+        let mut c = Crawlers::with_resolver(&[], Some(fake_resolver(answer).await));
+        c.forward = fake_forward();
+        let ip: IpAddr = "198.51.100.7".parse().unwrap();
+        assert!(c.confirmed(ip).await.is_some());
+        let until = c.cache.lock().unwrap()[&ip].0;
+        assert!(until <= Instant::now() + CACHE_FAILED);
     }
 }

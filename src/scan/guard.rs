@@ -156,41 +156,35 @@ pub fn network(ip: IpAddr) -> IpNet {
         .trunc()
 }
 
-/// A LIKE pattern every textual address of `net` matches (a pre-filter;
-/// candidates are checked by parsing).
-fn like_pattern(net: &IpNet) -> String {
-    match net {
-        IpNet::V4(n) => {
-            let o = n.network().octets();
-            format!("{}.{}.{}.%", o[0], o[1], o[2])
-        }
-        IpNet::V6(n) => format!("{:x}:%", n.network().segments()[0]),
-    }
-}
-
 /// Other IPs of `ip`'s network with a job queued in the last
-/// `window_hours` (refused and superseded jobs excluded).
+/// `window_hours` (refused and superseded jobs excluded). Exact: matched on
+/// the indexed `ip_key` range, so every spelling of an address counts once.
 pub async fn queued_in_network(pool: &SqlitePool, ip: &str, window_hours: i64) -> Result<usize> {
     let Ok(addr) = ip.parse::<IpAddr>() else {
         return Ok(0);
     };
     let net = network(addr);
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT i.ip FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
+    let (lo, hi) = crate::store::net_key_range(&net);
+    // IPv4 keys live in ::ffff:0:0/96, inside ::/64; an IPv6 network still
+    // means IPv6 addresses only.
+    let v4_keys = if net.addr().is_ipv6() {
+        "00000000000000000000ffff%"
+    } else {
+        ""
+    };
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT i.ip_key) FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
          WHERE j.queued_at > datetime('now', ?) AND j.status NOT IN ('refused','superseded')
-           AND i.ip LIKE ? AND i.ip != ?
-         LIMIT 10000",
+           AND i.ip_key BETWEEN ? AND ? AND i.ip_key != ? AND i.ip_key NOT LIKE ?",
     )
     .bind(format!("-{window_hours} hours"))
-    .bind(like_pattern(&net))
-    .bind(ip)
-    .fetch_all(pool)
+    .bind(lo)
+    .bind(hi)
+    .bind(crate::store::ip_key(addr))
+    .bind(v4_keys)
+    .fetch_one(pool)
     .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|s| s.parse::<IpAddr>().ok())
-        .filter(|a| net.contains(&crate::net::canonical(*a)))
-        .count())
+    Ok(n as usize)
 }
 
 /// Jobs queued in the last hour for IPs of autonomous system `asn`.
@@ -589,14 +583,71 @@ mod tests {
         assert_eq!(level_of(&store, ids[1]).await.1, "queued");
     }
 
+    /// The per-network count is exact: neighbouring networks sharing a
+    /// textual prefix (however many) cannot crowd out the network's own
+    /// rows, and an IPv4 address counts once whatever its spelling.
+    #[tokio::test]
+    async fn queued_in_network_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut tx = store.pool.begin().await.unwrap();
+        let mut add = async |ip: &str| {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO ips (ip, ip_key, first_seen, last_seen)
+                 VALUES (?, ?, datetime('now'), datetime('now')) RETURNING id",
+            )
+            .bind(ip)
+            .bind(crate::store::ip_key_of(ip).unwrap())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO scan_jobs (uid, ip_id, level, status, queued_at)
+                 VALUES (?, ?, 1, 'queued', datetime('now'))",
+            )
+            .bind(format!("job-{id}"))
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        };
+        // Same first 16 bits, other /64s: more than any old prefilter limit.
+        for n in 0..10_050u32 {
+            add(&format!("2001:{:x}:{:x}::1", n >> 16, n & 0xffff)).await;
+        }
+        for ip in ["2001:db8:0:1::1", "2001:db8:0:1::2", "2001:db8:0:1:ffff::3"] {
+            add(ip).await;
+        }
+        add("198.51.100.1").await;
+        add("::ffff:198.51.100.1").await;
+        add("198.51.100.2").await;
+        add("198.51.101.1").await;
+        tx.commit().await.unwrap();
+        let p = &store.pool;
+        assert_eq!(
+            queued_in_network(p, "2001:db8:0:1::9", 24).await.unwrap(),
+            3
+        );
+        assert_eq!(
+            queued_in_network(p, "2001:db8:0:1::1", 24).await.unwrap(),
+            2
+        );
+        assert_eq!(queued_in_network(p, "198.51.100.7", 24).await.unwrap(), 2);
+        assert_eq!(
+            queued_in_network(p, "::ffff:198.51.100.2", 24)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(queued_in_network(p, "::9", 24).await.unwrap(), 0);
+    }
+
     #[test]
     fn networks_and_patterns() {
         let n = network("198.51.100.77".parse().unwrap());
         assert_eq!(n.to_string(), "198.51.100.0/24");
-        assert_eq!(like_pattern(&n), "198.51.100.%");
         let n = network("2001:db8:1:2:3::4".parse().unwrap());
         assert_eq!(n.to_string(), "2001:db8:1:2::/64");
-        assert_eq!(like_pattern(&n), "2001:%");
         assert_eq!(
             network("::ffff:198.51.100.1".parse().unwrap()).to_string(),
             "198.51.100.0/24"

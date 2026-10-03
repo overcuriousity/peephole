@@ -54,7 +54,9 @@ pub struct LookupResp {
 /// this node runs when `wanted` is empty.
 pub async fn local(providers: &Providers, ip: &IpAddr, wanted: &[String]) -> LookupResp {
     let mut resp = LookupResp::default();
-    let text = crate::net::canonical(*ip).to_string();
+    // Canonical first: an IPv4-mapped address is IPv4 to every provider.
+    let ip = crate::net::canonical(*ip);
+    let text = ip.to_string();
     for p in providers {
         let name = p.name();
         if !wanted.is_empty() && !wanted.iter().any(|w| w == name) {
@@ -315,6 +317,43 @@ mod tests {
         let only = local(&providers(), &ip, &[super::super::TOR.into()]).await;
         assert_eq!(only.findings.len(), 1);
         assert!(only.declined.is_empty());
+    }
+
+    /// An IPv4-only provider answers for an IPv4-mapped address.
+    #[tokio::test]
+    async fn mapped_addresses_count_as_ipv4() {
+        struct V4Only;
+        impl crate::intel::provider::Provider for V4Only {
+            fn name(&self) -> &'static str {
+                "v4only"
+            }
+            fn ready(&self) -> bool {
+                true
+            }
+            fn ipv6(&self) -> bool {
+                false
+            }
+            fn lookup<'a>(
+                &'a self,
+                ips: &'a [String],
+            ) -> futures::future::BoxFuture<'a, Vec<crate::intel::provider::Finding>> {
+                Box::pin(async move {
+                    ips.iter()
+                        .map(|ip| crate::intel::provider::Finding {
+                            ip: ip.clone(),
+                            source_version: None,
+                            data: serde_json::json!({ "asked": ip }),
+                        })
+                        .collect()
+                })
+            }
+        }
+        let providers: Providers = vec![Arc::new(V4Only)];
+        let resp = local(&providers, &"::ffff:203.0.113.7".parse().unwrap(), &[]).await;
+        assert!(resp.declined.is_empty());
+        assert_eq!(resp.findings[0].data["asked"], "203.0.113.7");
+        let resp = local(&providers, &"2001:db8::7".parse().unwrap(), &[]).await;
+        assert_eq!(resp.declined.len(), 1);
     }
 
     #[tokio::test]

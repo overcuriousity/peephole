@@ -332,17 +332,26 @@ impl<S: Service> ApiProvider<S> {
 
 /// When the service says no more requests are allowed: on a 429, or on a
 /// success that used the last one (`X-RateLimit-Remaining: 0`). From
-/// `Retry-After` (seconds) or `X-RateLimit-Reset` (epoch seconds).
+/// `Retry-After` (seconds or HTTP-date) or `X-RateLimit-Reset` (epoch
+/// seconds).
 fn rate_limit_until(h: &HeaderMap, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let num = |k: &str| {
         h.get(k)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<i64>().ok())
     };
-    let retry = num("retry-after").map(|s| now + CDuration::seconds(s.clamp(0, 8 * 86400)));
+    let max = now + CDuration::days(8);
+    let retry = num("retry-after")
+        .map(|s| now + CDuration::seconds(s.clamp(0, 8 * 86400)))
+        .or_else(|| {
+            // The HTTP-date form (`Sun, 06 Nov 1994 08:49:37 GMT`).
+            let v = h.get("retry-after")?.to_str().ok()?;
+            let t = DateTime::parse_from_rfc2822(v.trim()).ok()?;
+            Some(t.with_timezone(&Utc).clamp(now, max))
+        });
     let reset = num("x-ratelimit-reset")
         .and_then(|t| DateTime::from_timestamp(t, 0))
-        .filter(|t| *t > now && *t < now + CDuration::days(8));
+        .filter(|t| *t > now && *t < max);
     match num("x-ratelimit-remaining") {
         Some(0) => reset
             .or(retry)
@@ -608,6 +617,20 @@ pub(crate) mod tests {
             rate_limit_until(&h, now),
             Some(now + CDuration::seconds(120))
         );
+        // The HTTP-date form, in the future and in the past.
+        let now = DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        h.insert(
+            "retry-after",
+            "Sat, 03 Oct 2026 12:05:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(rate_limit_until(&h, now), Some(now + CDuration::minutes(5)));
+        h.insert(
+            "retry-after",
+            "Sat, 03 Oct 2026 11:00:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(rate_limit_until(&h, now), Some(now));
     }
 
     struct Mock(String);
