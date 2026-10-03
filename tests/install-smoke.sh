@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Exercises install.sh against a locally served tarball: fresh install,
-# no-op re-run, forced upgrades (edited rules and unit kept, database backed
-# up), a failed upgrade that rolls back, and the wizard.
+# no-op re-run, forced upgrades (an edited unit kept, the rules directory of
+# an older install left alone, database backed up), a failed upgrade that
+# rolls back, and the wizard.
 # Runs as root in a throwaway Debian/Ubuntu container (CI: ubuntu:24.04).
 # PEEPHOLE_BIN is the release binary (default target/release/peephole).
 set -euo pipefail
@@ -88,9 +89,13 @@ echo "== fresh install"
 bash install.sh > /tmp/fresh.log 2>&1 || { cat /tmp/fresh.log; exit 1; }
 test -x /usr/local/bin/peephole
 test -f /etc/peephole/config.toml
-test -f /etc/peephole/rules/sqli.toml
+# The signature rules are built into the binary: none on disk, none shipped.
+test ! -e /etc/peephole/rules
+test ! -e "/tmp/$ASSET/rules"
+test ! -e /var/lib/peephole/.installed-rules.sha256
+if grep -q rules_dir /etc/peephole/config.toml; then echo "generated config sets rules_dir"; exit 1; fi
+grep -q 'rules built in' /tmp/fresh.log
 test -f /etc/peephole/nginx.example.conf
-test -f /var/lib/peephole/.installed-rules.sha256
 test -f /var/lib/peephole/.installed-unit.sha256
 test -f /etc/peephole/config.example.toml
 [ "$(stat -c %a /etc/peephole)" = 750 ] && [ "$(stat -c %a /var/lib/peephole)" = 700 ]
@@ -118,23 +123,27 @@ echo "== re-run is a no-op"
 out="$(bash install.sh)"
 echo "$out" | grep -q "already up to date"
 
-echo "== forced upgrade keeps an edited rule and drops .new beside it; an unedited unit is replaced"
-echo '# operator edit' >> /etc/peephole/rules/sqli.toml
+echo "== forced upgrade over an install that read its rules from disk: the rules directory and rules_dir stay, the operator is told once; an unedited unit is replaced"
+# What an older installer left: rules (one edited), their manifest, rules_dir.
+mkdir -p /etc/peephole/rules
+echo '# operator edit' > /etc/peephole/rules/sqli.toml
+echo "0000 sqli.toml" > /var/lib/peephole/.installed-rules.sha256
+sed -i '1a rules_dir = "/etc/peephole/rules"' /etc/peephole/config.toml
 printf 'test2 2026-01-02T00:00:00Z 1111111111111111111111111111111111111111\n' > "/tmp/$ASSET/VERSION"
-echo '# upstream change' >> "/tmp/$ASSET/rules/xss.toml"
-echo '# upstream change' >> "/tmp/$ASSET/rules/sqli.toml"
 echo '# upstream unit change' >> "/tmp/$ASSET/deploy/peephole.service"
 repack
 echo '# operator note' >> /etc/peephole/nginx.example.conf
 # A database to back up (the daemon never ran here).
 sqlite3 /var/lib/peephole/peephole.db 'CREATE TABLE t (x); PRAGMA user_version = 5'
 chmod 0644 /var/lib/peephole/peephole.db
-PEEPHOLE_FORCE=1 bash install.sh
+PEEPHOLE_FORCE=1 bash install.sh > /tmp/upgrade.log 2>&1 || { cat /tmp/upgrade.log; exit 1; }
 grep -q '# operator note' /etc/peephole/nginx.example.conf
 grep -q '# operator edit' /etc/peephole/rules/sqli.toml
-test -f /etc/peephole/rules/sqli.toml.new
-grep -q '# upstream change' /etc/peephole/rules/xss.toml
-test ! -e /etc/peephole/rules/xss.toml.new
+grep -q '/etc/peephole/rules is no longer used' /tmp/upgrade.log
+grep -q 'rules_dir in /etc/peephole/config.toml is ignored' /tmp/upgrade.log
+grep -q '^rules_dir = ' /etc/peephole/config.toml
+test ! -e /var/lib/peephole/.installed-rules.sha256
+/usr/local/bin/peephole check-config /etc/peephole/config.toml | grep -q 'rules_dir.*is ignored'
 grep -q '# upstream unit change' /etc/systemd/system/peephole.service
 test ! -e /etc/systemd/system/peephole.service.new
 grep -q 'systemctl restart peephole' /tmp/systemctl.log
@@ -152,13 +161,14 @@ for _ in 1 2; do sleep 1.1; PEEPHOLE_FORCE=1 bash install.sh > /tmp/unit.log 2>&
 grep -q '# operator unit edit' /etc/systemd/system/peephole.service
 grep -q '# upstream unit change 2' /etc/systemd/system/peephole.service.new
 grep -q 'systemctl edit peephole' /tmp/unit.log
+# Told once: not again on later upgrades.
+if grep -q 'no longer used' /tmp/unit.log; then echo "rules notice repeated"; exit 1; fi
+test -d /etc/peephole/rules
 [ "$(find /var/lib/peephole -name 'backup-*.db' | wc -l)" = 2 ]
 
-echo "== a new version that does not start is rolled back: binary, rules, unit and database"
+echo "== a new version that does not start is rolled back: binary, unit and database"
 rm -f /etc/systemd/system/peephole.service.new
 cp -p /etc/systemd/system/peephole.service /tmp/unit.before
-cp -a /etc/peephole/rules /tmp/rules.before
-echo '# broken release' >> "/tmp/$ASSET/rules/xss.toml"
 echo '# broken release' >> "/tmp/$ASSET/deploy/peephole.service"
 repack
 touch /tmp/fail-start
@@ -166,7 +176,6 @@ if PEEPHOLE_FORCE=1 bash install.sh > /tmp/rollback.log 2>&1; then echo "expecte
 grep -q 'rolled back' /tmp/rollback.log
 grep -q 'running again' /tmp/rollback.log
 grep -q 'restoring /var/lib/peephole/backup-' /tmp/rollback.log
-diff -r /tmp/rules.before /etc/peephole/rules
 cmp /tmp/unit.before /etc/systemd/system/peephole.service
 test ! -e /etc/systemd/system/peephole.service.new
 test ! -e /usr/local/bin/peephole.prev
@@ -285,7 +294,7 @@ grep -q "failed validation" /tmp/wizard-bad.log
 test ! -e /etc/peephole/config.toml
 
 echo "== wizard: re-run after the rejected answer asks again (scanner in a cluster, remote configuration on)"
-# No reset: the binary and rules from the failed run are in place.
+# No reset: the binary from the failed run is in place.
 # trap? no · scanner? yes · web? no · cluster? yes · name · listen (default) ·
 # advertise · token (none) · remote config? yes · MaxMind: skip
 printf 'n\ny\nn\ny\nscanner-9\n\nscan9.example:7443\n\ny\n\n' > /tmp/answers

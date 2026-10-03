@@ -2,8 +2,8 @@
 # Builds a release tarball and its checksum, the same way in CI and in the
 # installer smoke test:
 #   tools/package.sh <binary> <target triple> <build name> <commit> <out dir>
-# The tarball peephole-<target>.tar.gz holds the binary, the default rules,
-# deploy/, install.sh from this checkout, and VERSION
+# The tarball peephole-<target>.tar.gz holds the binary (the signature rules
+# are built into it), deploy/, install.sh from this checkout, and VERSION
 # ("<build name> <UTC date> <commit>"; install.sh reads it).
 set -euo pipefail
 [ "$#" -eq 5 ] || { echo "usage: $0 <binary> <target triple> <build name> <commit> <out dir>" >&2; exit 2; }
@@ -16,7 +16,6 @@ stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "${stage}/${asset}/deploy"
 install -m 0755 "$bin" "${stage}/${asset}/peephole"
-cp -r rules "${stage}/${asset}/rules"
 cp deploy/peephole.service deploy/config.example.toml deploy/nginx.example.conf "${stage}/${asset}/deploy/"
 install -m 0755 install.sh "${stage}/${asset}/install.sh"
 printf '%s %s %s\n' "$build" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$commit" > "${stage}/${asset}/VERSION"

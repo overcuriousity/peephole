@@ -297,7 +297,10 @@ CONFIG_DIR="/etc/peephole"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
 DATA_DIR="/var/lib/peephole"
 UNIT_FILE="/etc/systemd/system/peephole.service"
-RULES_MANIFEST="${DATA_DIR}/.installed-rules.sha256"
+# Written by installers that put the signature rules in ${CONFIG_DIR}/rules;
+# the rules are built into the binary now. Its presence means the operator
+# has not been told yet.
+OLD_RULES_MANIFEST="${DATA_DIR}/.installed-rules.sha256"
 UNIT_MANIFEST="${DATA_DIR}/.installed-unit.sha256"
 # Units earlier installers wrote without recording them: unedited if they match.
 KNOWN_UNIT_SUMS="da20ef8147a9f2a9e704318e80ce381adc7b222fc5b21706bc1f5fd3bd4c5cb2"
@@ -604,8 +607,8 @@ fi
 exec 3<&-
 
 # --- backups for a rollback (upgrades) ----------------------------------------
-# The binary is kept as peephole.prev; rules, their manifest and the unit
-# beside the download (for this run's rollback); the database next to itself.
+# The binary is kept as peephole.prev; the unit and its manifest beside the
+# download (for this run's rollback); the database next to itself.
 backup="${tmpdir}/rollback"
 mkdir -p "$backup"
 DB_PATH="${DATA_DIR}/peephole.db"
@@ -642,8 +645,6 @@ backup_database() {
 if [ "$upgrade" -eq 1 ]; then
     configured_db="$(sed -n 's/^database_path *= *"\([^"]*\)".*/\1/p' "$CONFIG_FILE" | head -1)"
     DB_PATH="${configured_db:-$DB_PATH}"
-    if [ -d "${CONFIG_DIR}/rules" ]; then cp -a "${CONFIG_DIR}/rules" "${backup}/rules"; fi
-    if [ -e "$RULES_MANIFEST" ]; then cp -p "$RULES_MANIFEST" "${backup}/rules.sha256"; fi
     if [ -e "$UNIT_FILE" ]; then cp -p "$UNIT_FILE" "${backup}/peephole.service"; fi
     if [ -e "$UNIT_MANIFEST" ]; then cp -p "$UNIT_MANIFEST" "${backup}/unit.sha256"; fi
     backup_database
@@ -652,7 +653,7 @@ fi
 # --- install files -----------------------------------------------------------
 # The config holds the MaxMind key, the data dir the node key and the
 # database: readable by root only.
-mkdir -p "$CONFIG_DIR" "$DATA_DIR" "${CONFIG_DIR}/rules"
+mkdir -p "$CONFIG_DIR" "$DATA_DIR"
 chmod 0750 "$CONFIG_DIR"
 chmod 0700 "$DATA_DIR"
 for f in "$DB_PATH" "${DB_PATH}-wal" "${DB_PATH}-shm"; do
@@ -663,31 +664,6 @@ install -m 0755 "${src}/peephole" "${INSTALL_BIN}.new"
 if [ -x "$INSTALL_BIN" ]; then cp -p "$INSTALL_BIN" "${INSTALL_BIN}.prev"; fi
 mv -f "${INSTALL_BIN}.new" "$INSTALL_BIN"
 
-# Rules as conffiles: replace only files the operator has not edited.
-info "Installing signature rules to ${CONFIG_DIR}/rules"
-touch "$RULES_MANIFEST"
-new_manifest="$(mktemp)"
-for rule in "${src}/rules/"*.toml; do
-    name="$(basename "$rule")"
-    dest="${CONFIG_DIR}/rules/${name}"
-    new_sum="$(sha256sum "$rule" | cut -d' ' -f1)"
-    if [ ! -e "$dest" ]; then
-        install -m 0644 "$rule" "$dest"
-    else
-        recorded="$(awk -v n="$name" '$2==n{print $1}' "$RULES_MANIFEST")"
-        current="$(sha256sum "$dest" | cut -d' ' -f1)"
-        if [ "$current" = "$new_sum" ]; then
-            : # identical already
-        elif [ -n "$recorded" ] && [ "$current" = "$recorded" ]; then
-            install -m 0644 "$rule" "$dest"   # unedited → take upstream
-        else
-            install -m 0644 "$rule" "${dest}.new"
-            warn "kept your edited ${dest}; new upstream version saved as ${dest}.new"
-        fi
-    fi
-    printf '%s %s\n' "$new_sum" "$name" >> "$new_manifest"
-done
-mv -f "$new_manifest" "$RULES_MANIFEST"
 # The annotated reference for this version (not read by peephole).
 install -m 0644 "${src}/deploy/config.example.toml" "${CONFIG_DIR}/config.example.toml"
 
@@ -712,7 +688,6 @@ else
             echo "# TLS trap listener: peephole terminates TLS itself and keeps the handshake"
             echo "# (JA4). Your proxy forwards TLS to it untouched, with a PROXY protocol header."
             echo "trap_tls_listen = \"${TRAP_TLS_LISTEN}\""
-            echo "rules_dir = \"${CONFIG_DIR}/rules\""
             echo "# Proxies whose X-Forwarded-For header is trusted for the real client IP."
             echo "trusted_proxies = [${proxies_toml}]"
         fi
@@ -851,7 +826,7 @@ CONFIG
 fi
 
 # --- systemd -----------------------------------------------------------------
-# The unit is a conffile like the rules: an edited unit is kept and the new
+# The unit is a conffile: an edited unit is kept and the new
 # upstream one is placed beside it as peephole.service.new (systemd ignores
 # that name). Changes belong in a drop-in (systemctl edit peephole), which the
 # installer never touches.
@@ -914,16 +889,12 @@ wait_healthy() {
     systemctl is-active --quiet peephole
 }
 
-# Put back what this run changed: binary, rules, unit and, if the new version
-# migrated it, the database.
+# Put back what this run changed: binary, unit and, if the new version
+# migrated it, the database. The rules of an older version stay in
+# ${CONFIG_DIR}/rules (never touched), so it finds them again.
 rollback() {
     systemctl stop peephole || true
     mv -f "${INSTALL_BIN}.prev" "$INSTALL_BIN"
-    if [ -d "${backup}/rules" ]; then
-        rm -rf "${CONFIG_DIR}/rules"
-        cp -a "${backup}/rules" "${CONFIG_DIR}/rules"
-    fi
-    if [ -e "${backup}/rules.sha256" ]; then cp -p "${backup}/rules.sha256" "$RULES_MANIFEST"; fi
     if [ -e "${backup}/peephole.service" ]; then
         cp -p "${backup}/peephole.service" "$UNIT_FILE"
         if [ "$UNIT_NEW_WRITTEN" = 1 ]; then rm -f "${UNIT_FILE}.new"; fi
@@ -942,7 +913,7 @@ if [ "$started" -eq 1 ]; then info "Started peephole ${new_version}"; fi
 if [ "$started" -ne 1 ] || ! wait_healthy; then
     journalctl -u peephole -n 30 --no-pager >&2 || true
     if [ "$upgrade" -eq 1 ] && [ -x "${INSTALL_BIN}.prev" ]; then
-        warn "the new version did not become healthy; rolling back binary, rules and unit"
+        warn "the new version did not become healthy; rolling back binary and unit"
         rollback
         if start_service && wait_healthy; then
             die "rolled back to ${installed_version:-the previous version}, which is running again. The log above shows why ${new_version} failed."
@@ -956,6 +927,16 @@ fi
 # --- done --------------------------------------------------------------------
 if [ "$upgrade" -eq 1 ]; then
     info "Upgraded peephole ${installed_version:-?} → ${new_version}"
+    # Once, after an upgrade from a version that read its rules from disk.
+    if [ -e "$OLD_RULES_MANIFEST" ]; then
+        if [ -d "${CONFIG_DIR}/rules" ]; then
+            warn "the signature rules are built into peephole now: ${CONFIG_DIR}/rules is no longer used and was left in place; remove it when you like (edits there have no effect any more)"
+        fi
+        if grep -q '^rules_dir *=' "$CONFIG_FILE" 2>/dev/null; then
+            warn "rules_dir in ${CONFIG_FILE} is ignored; remove that line"
+        fi
+        rm -f "$OLD_RULES_MANIFEST"
+    fi
     exit 0
 fi
 

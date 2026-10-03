@@ -3,7 +3,7 @@
 
 # What this deployment does. All three are on when the section is absent.
 # [roles]
-# listener = true   # trap listener (needs trap_listen, rules_dir)
+# listener = true   # trap listener (needs trap_listen)
 # scanner  = true   # nmap counter-scans (needs nmap)
 # web      = true   # wall of shame + admin area (needs admin_listen, [webauthn])
 
@@ -29,8 +29,8 @@ data_dir = "/var/lib/peephole"
 # members keeping everything serve the rest (see docs/cluster.md).
 # retention_days = 0
 
-# Directory with TOML signature rules (ships with defaults; editable without recompile).
-rules_dir = "/etc/peephole/rules"
+# The signature rules (rules/*.toml in the source) are built into the binary;
+# changing them means a new build. An older config's rules_dir is ignored.
 
 # Proxies whose X-Forwarded-For header is trusted for the real client IP.
 trusted_proxies = ["10.0.0.0/8"]
