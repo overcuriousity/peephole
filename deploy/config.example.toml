@@ -8,6 +8,8 @@
 # web      = true   # wall of shame + admin area (needs admin_listen, [webauthn])
 
 # Trap listener: your reverse proxy sends requests that match no real site here.
+# With nothing in front, the trap takes the public ports itself:
+# trap_listen = "0.0.0.0:80" and trap_tls_listen = "0.0.0.0:443".
 trap_listen = "0.0.0.0:8080"
 # Optional TLS trap listener: peephole terminates TLS itself and keeps the
 # handshake (raw ClientHello, JA4). The proxy forwards TLS for unknown names
@@ -33,7 +35,10 @@ data_dir = "/var/lib/peephole"
 # changing them means a new build. An older config's rules_dir is ignored.
 
 # Proxies whose X-Forwarded-For header is trusted for the real client IP.
-trusted_proxies = ["10.0.0.0/8"]
+# Every host in these ranges is believed about the client address: list only
+# the proxy (nginx on this machine: ["127.0.0.1/32", "::1/128"]; nothing in
+# front of the trap: []).
+trusted_proxies = ["10.0.0.5/32"]
 
 # Trap listener behaviour. All optional; the defaults are shown.
 # [trap]
@@ -116,6 +121,7 @@ never_scan = [] # extra CIDRs this node's scanner never scans (own infra, monito
 # this node does not know it as its own unless cluster.advertise names it.
 # List it here: it is then never scanned and never in the blocklist, so
 # requests the host itself makes to its traps (hairpin NAT) are harmless.
+# install.sh fills it in from the cloud's metadata service on a first install.
 # own_addresses = ["203.0.113.5"]
 # nmap_path = "nmap"       # the nmap program (PATH lookup); PEEPHOLE_NMAP_PATH overrides it
 #

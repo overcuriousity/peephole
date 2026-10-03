@@ -2,7 +2,7 @@
 # peephole installer / upgrader (Debian/Ubuntu, x86_64 or aarch64):
 #   curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/install.sh | sudo bash
 # A pinned release, with the installer from the same tag:
-#   curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/v0.1.0/install.sh | sudo PEEPHOLE_VERSION=v0.1.0 bash
+#   curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/v0.1.1/install.sh | sudo PEEPHOLE_VERSION=v0.1.1 bash
 #
 # Re-running upgrades an existing installation. Environment overrides:
 #   PEEPHOLE_VERSION   release tag to install (e.g. v0.1.0); default: the rolling "latest" build of master
@@ -12,8 +12,16 @@
 #   ABUSEIPDB_API_KEY, SHODAN_API_KEY, GREYNOISE_API_KEY  optional enrichment APIs (first install)
 #   PEEPHOLE_INTERNETDB=1|0    use Shodan InternetDB, no key, non-commercial use only (first
 #                              install; asked with default yes, off without a terminal)
-#   PEEPHOLE_LOCAL_PROXY=1|0  a reverse proxy on this machine fronts the trap (first install);
-#                      when 1, PEEPHOLE_TRUSTED_PROXIES is ignored and loopback is trusted instead
+#   PEEPHOLE_FRONT=direct|local|remote  what is in front of the trap (first install):
+#                      direct: nothing, the trap takes ports 80 and 443 itself (no proxy trusted);
+#                      local: nginx on this machine (loopback trusted, PEEPHOLE_TRUSTED_PROXIES
+#                      ignored); remote: a proxy on another machine (PEEPHOLE_TRUSTED_PROXIES
+#                      required). Default: remote when PEEPHOLE_TRUSTED_PROXIES is set, local with
+#                      the web role or when 80/443 are taken, direct otherwise
+#   PEEPHOLE_LOCAL_PROXY=1|0  older form of PEEPHOLE_FRONT: 1 is local, 0 is remote
+#   PEEPHOLE_OWN_ADDRESSES  public addresses no interface shows (1:1 NAT), comma-separated, for
+#                      [scan] own_addresses; default: what the cloud metadata reports, "-" for none
+#   PEEPHOLE_METADATA=1|0  ask the cloud's metadata service for the public address (default 1)
 #   PEEPHOLE_TTY       read the wizard's answers from this file instead of the terminal (tests)
 #   PEEPHOLE_ROLES     comma-separated subset of listener,scanner,web (asked when a terminal is
 #                      present; all three when there is none)
@@ -34,11 +42,12 @@
 # Other entry points: --extract-token (reads journal output on stdin),
 # --nginx-example and --nginx-stream-example (print the nginx site and the
 # top-level stream config for PEEPHOLE_ROLES, PEEPHOLE_DOMAIN and
-# PEEPHOLE_LOCAL_PROXY; deploy/nginx.example.conf and
+# PEEPHOLE_FRONT=local|remote; deploy/nginx.example.conf and
 # deploy/nginx-stream.example.conf are their output for a full node).
 #
 # The whole script is one function called on the last line, so a truncated
-# download executes nothing rather than half a script.
+# download executes nothing rather than half a script. With PEEPHOLE_NO_MAIN=1
+# sourcing it only defines the helpers above main (tests/deploy-check.sh).
 set -euo pipefail
 
 # Pull the one-time setup token out of journal output. journalctl's default
@@ -57,6 +66,115 @@ has_role() { [[ ",${PEEPHOLE_ROLES}," == *",$1,"* ]]; }
 # TLS for unknown names through to the trap (which reads the handshake
 # itself): a trap behind a local proxy.
 stream_trap() { has_role listener && [ "${PEEPHOLE_LOCAL_PROXY:-0}" = 1 ]; }
+
+# --- what the machine has (questions; top level so tests can source them) ---
+
+# Whether a TCP socket listens on <host> <port>, read from /proc/net/tcp and
+# tcp6: minimal systems (the ubuntu container) have no ss. A wildcard on
+# either side clashes, as does [::] with an IPv4 address; an IPv6 address
+# other than [::] is taken to clash with anything on the port. The kernel
+# prints an IPv4 address as a host-order word: little endian on x86_64 and
+# aarch64, the machines this installer supports. PEEPHOLE_PROC_NET: tests.
+port_in_use() {
+    local host="${1#[}" port="$2" dir="${PEEPHOLE_PROC_NET:-/proc/net}" want="" hexport f files=()
+    host="${host%]}"
+    printf -v hexport '%04X' "$port"
+    if [[ "$host" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] && [ "$host" != 0.0.0.0 ]; then
+        printf -v want '%02X%02X%02X%02X' "${BASH_REMATCH[4]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}"
+    fi
+    for f in "$dir/tcp" "$dir/tcp6"; do [ -r "$f" ] && files+=("$f"); done
+    [ "${#files[@]}" -gt 0 ] || return 1
+    # Column 2 is the local address:port, column 4 the state (0A: LISTEN).
+    awk -v port="$hexport" -v want="$want" '
+        $4 == "0A" {
+            split($2, la, ":")
+            if (la[2] != port) next
+            if (want == "" || la[1] == want || la[1] ~ /^0+$/ || la[1] == "0000000000000000FFFF0000" want) { found = 1; exit }
+        }
+        END { exit !found }' "${files[@]}"
+}
+
+# Who holds a port, as "nginx (pid 123)", when ss is there to say.
+port_holder() {
+    command -v ss >/dev/null 2>&1 || return 0
+    ss -Htlnp "sport = :$1" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)",pid=\([0-9]*\).*/\1 (pid \2)/p' | head -1
+}
+
+valid_ipv4() {
+    local IFS=. o
+    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    for o in $1; do [ "$((10#$o))" -le 255 ] || return 1; done
+}
+valid_ip() { valid_ipv4 "$1" || { [[ "$1" == *:* ]] && [[ "$1" =~ ^[0-9A-Fa-f:.]+$ ]]; }; }
+
+# Not loopback, private, CGNAT or link-local.
+public_ipv4() {
+    valid_ipv4 "$1" || return 1
+    case "$1" in
+        0.*|10.*|127.*|169.254.*|192.168.*) return 1 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 1 ;;
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 1 ;;
+    esac
+}
+
+# The big cloud this machine runs on, from its DMI data (empty elsewhere).
+# Their acceptable use policies forbid scanning others.
+cloud_from_dmi() {
+    local dir="${1:-/sys/class/dmi/id}" vendor product bios tag
+    vendor="$(cat "$dir/sys_vendor" 2>/dev/null || true)"
+    product="$(cat "$dir/product_name" 2>/dev/null || true)"
+    bios="$(cat "$dir/bios_vendor" 2>/dev/null || true)"
+    tag="$(cat "$dir/chassis_asset_tag" 2>/dev/null || true)"
+    if [[ "$vendor" == Amazon* || "$bios" == Amazon* ]]; then echo "Amazon Web Services"
+    elif [[ "$vendor" == Google* || "$product" == "Google Compute Engine" ]]; then echo "Google Cloud"
+    # Hyper-V on a desk says the same but for the asset tag.
+    elif [ "$vendor" = "Microsoft Corporation" ] && [ "$product" = "Virtual Machine" ] \
+            && [ "$tag" = 7783-7084-3265-9085-8269-3286-77 ]; then echo "Microsoft Azure"
+    elif [[ "$vendor $product" == *Alibaba* ]]; then echo "Alibaba Cloud"
+    elif [ "$tag" = OracleCloud.com ]; then echo "Oracle Cloud"
+    fi
+}
+
+# "<provider> <address>": this machine's public IPv4 address from its
+# cloud's metadata service, nothing when there is none. One second per
+# question at most, no proxy, no echo service outside the provider.
+cloud_public_ip() {
+    local md=(curl -fs --noproxy '*' --connect-timeout 1 --max-time 1) ip token
+    # Every service below answers at 169.254.169.254 (GCP's name too):
+    # nothing there, nothing to ask.
+    curl -s --noproxy '*' --connect-timeout 1 --max-time 1 -o /dev/null http://169.254.169.254/ || return 0
+    token="$("${md[@]}" -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token || true)"
+    if [ -n "$token" ]; then
+        ip="$("${md[@]}" -H "X-aws-ec2-metadata-token: ${token}" http://169.254.169.254/latest/meta-data/public-ipv4 || true)"
+        valid_ipv4 "$ip" && { echo "aws $ip"; return 0; }
+    fi
+    ip="$("${md[@]}" -H 'Metadata-Flavor: Google' \
+        http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip || true)"
+    valid_ipv4 "$ip" && { echo "gcp $ip"; return 0; }
+    ip="$("${md[@]}" -H 'Metadata: true' \
+        'http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text' || true)"
+    valid_ipv4 "$ip" && { echo "azure $ip"; return 0; }
+    ip="$("${md[@]}" http://169.254.169.254/hetzner/v1/metadata/public-ipv4 || true)"
+    valid_ipv4 "$ip" && { echo "hetzner $ip"; return 0; }
+    ip="$("${md[@]}" http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address || true)"
+    valid_ipv4 "$ip" && { echo "digitalocean $ip"; return 0; }
+    return 0
+}
+
+# The addresses of this machine's interfaces, one per line.
+local_addresses() {
+    if command -v ip >/dev/null 2>&1; then
+        ip -o addr show 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }'
+    elif [ -r "${PEEPHOLE_PROC_NET:-/proc/net}/fib_trie" ]; then
+        # IPv4 only: "|-- <address>" followed by "/32 host LOCAL".
+        awk '/\|--/ { a = $2 } /\/32 host LOCAL/ { print a }' "${PEEPHOLE_PROC_NET:-/proc/net}/fib_trie" | sort -u
+    else
+        hostname -I 2>/dev/null | tr ' ' '\n' | sed '/^$/d'
+    fi
+}
+
+# A comma-separated list as the inside of a TOML array: "a","b".
+toml_list() { printf '%s' "$1" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | sed '/^$/d' | sed 's/.*/"&"/' | paste -sd',' -; }
 
 # The top-level nginx stream config for this node, on stdout (nothing when
 # nginx does not front the trap's TLS). It goes into nginx.conf's main
@@ -111,9 +229,9 @@ NGINX
 
 # The nginx example that fits this node, on stdout: only the roles it runs,
 # with its domain and listen addresses filled in. Reads PEEPHOLE_ROLES,
-# PEEPHOLE_DOMAIN, TRAP_LISTEN, PEEPHOLE_LOCAL_PROXY and
+# PEEPHOLE_DOMAIN, TRAP_LISTEN, ADMIN_LISTEN, PEEPHOLE_LOCAL_PROXY and
 # PEEPHOLE_TRUSTED_PROXIES. deploy/nginx.example.conf is this output for a
-# full node behind a local nginx; tests/nginx-check.sh keeps the two equal.
+# full node behind a local nginx; tests/deploy-check.sh keeps the two equal.
 nginx_example() {
     local trap_port="${TRAP_LISTEN##*:}"
     echo "# nginx in front of peephole, generated by install.sh for a node with the"
@@ -169,7 +287,7 @@ NGINX
 
     # Server-Sent Events for the live scan queue: no buffering, long timeout.
     location /admin/api/queue {
-        proxy_pass http://127.0.0.1:8443;
+        proxy_pass http://${ADMIN_LISTEN};
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_set_header Host \$host;
@@ -186,7 +304,7 @@ NGINX
     location ~ ^/(login|enroll)(/|\$) {
         limit_req zone=peephole_auth burst=20 nodelay;
         limit_req_status 429;
-        proxy_pass http://127.0.0.1:8443;
+        proxy_pass http://${ADMIN_LISTEN};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-For \$remote_addr;
@@ -194,7 +312,7 @@ NGINX
     }
 
     location / {
-        proxy_pass http://127.0.0.1:8443;
+        proxy_pass http://${ADMIN_LISTEN};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-For \$remote_addr;
@@ -278,11 +396,19 @@ NGINX
 if [ "${1:-}" = "--nginx-example" ] || [ "${1:-}" = "--nginx-stream-example" ]; then
     PEEPHOLE_ROLES="${PEEPHOLE_ROLES:-listener,scanner,web}"
     PEEPHOLE_DOMAIN="${PEEPHOLE_DOMAIN:-peephole.example.net}"
+    ADMIN_LISTEN="127.0.0.1:8443"
+    # A trap that takes 80/443 itself (direct) has nothing for nginx to front.
+    case "${PEEPHOLE_FRONT:-}" in
+        local) PEEPHOLE_LOCAL_PROXY=1 ;;
+        remote) PEEPHOLE_LOCAL_PROXY=0 ;;
+        "") ;;
+        *) echo "PEEPHOLE_FRONT: local or remote for the nginx examples (got '${PEEPHOLE_FRONT}')" >&2; exit 1 ;;
+    esac
     if [ "${PEEPHOLE_LOCAL_PROXY:-1}" = 1 ]; then
         PEEPHOLE_LOCAL_PROXY=1; TRAP_LISTEN="127.0.0.1:8080"; TRAP_TLS_LISTEN="127.0.0.1:8081"
     else
         TRAP_LISTEN="0.0.0.0:8080"; TRAP_TLS_LISTEN="0.0.0.0:8081"
-        PEEPHOLE_TRUSTED_PROXIES="${PEEPHOLE_TRUSTED_PROXIES:-10.0.0.0/8}"
+        PEEPHOLE_TRUSTED_PROXIES="${PEEPHOLE_TRUSTED_PROXIES:-the address of your proxy}"
     fi
     if [ "$1" = "--nginx-stream-example" ]; then nginx_stream_example; else nginx_example; fi
     exit 0
@@ -384,6 +510,34 @@ ask_yn() {
         0|n|N|no|No|NO) printf -v "$var" '0' ;;
         *) die "${var}: answer yes or no (got '${value}')" ;;
     esac
+}
+
+# claim_port <varname> <what> <offer 1|0> [hint]: the host:port in the
+# variable must be free, and not taken by another listener of the new config.
+# If it is not, an interactive install is offered the next free port (when
+# <offer> is 1); otherwise the install stops before anything is written. A
+# value that is no host:port is left to check-config.
+CLAIMED_PORTS=" "
+claim_port() {
+    local var="$1" what="$2" offer="$3" hint="${4:-}" value="${!1}" host port next holder msg reply=""
+    port="${value##*:}"; host="${value%:*}"
+    { [[ "$port" =~ ^[0-9]{1,5}$ ]] && [ "$host" != "$value" ] && [ "$port" -le 65535 ]; } || return 0
+    port_taken() { port_in_use "$host" "$1" || [[ "$CLAIMED_PORTS" == *" $1 "* ]]; }
+    if ! port_taken "$port"; then CLAIMED_PORTS+="${port} "; return 0; fi
+    if [[ "$CLAIMED_PORTS" == *" $port "* ]]; then holder="another listener of this node"; else holder="$(port_holder "$port")"; fi
+    msg="port ${port} for the ${what} (${value}) is in use${holder:+ by ${holder}}"
+    if [ "$INTERACTIVE" -eq 1 ] && [ "$offer" = 1 ]; then
+        next=$((port + 1))
+        while [ "$next" -le 65535 ] && port_taken "$next"; do next=$((next + 1)); done
+        [ "$next" -le 65535 ] || die "$msg"
+        say "${msg}."$'\n'
+        ask_yn reply "Use ${host}:${next} instead?" y
+        [ "$reply" = 1 ] || die "${msg}; free it and run the installer again"
+        printf -v "$var" '%s' "${host}:${next}"
+        CLAIMED_PORTS+="${next} "
+        return 0
+    fi
+    die "${msg}; free it and run the installer again${hint}"
 }
 
 # --- prerequisites (only what is missing) ------------------------------------
@@ -499,12 +653,40 @@ fi
 
 # --- questions (first install only; nothing is written before they are done) --
 if [ "$upgrade" -ne 1 ]; then
+    # Where this runs. A big cloud forbids scanning others; behind 1:1 NAT
+    # (most clouds) no interface carries the public address, which only the
+    # metadata service knows.
+    CLOUD="$(cloud_from_dmi)"
+    md_provider=""; md_addr=""
+    if [ "${PEEPHOLE_METADATA:-1}" = 1 ] && { [ -z "${PEEPHOLE_ROLES:-}" ] || has_role listener || has_role scanner; }; then
+        read -r md_provider md_addr <<<"$(cloud_public_ip)" || true
+    fi
+    case "$md_provider" in
+        aws) CLOUD="${CLOUD:-Amazon Web Services}" ;;
+        gcp) CLOUD="${CLOUD:-Google Cloud}" ;;
+        azure) CLOUD="${CLOUD:-Microsoft Azure}" ;;
+    esac
+    if_addrs="$(local_addresses)"
+    # The public address: one an interface carries, else the metadata's.
+    PUBLIC_ADDR=""
+    for a in $if_addrs; do public_ipv4 "$a" && { PUBLIC_ADDR="$a"; break; }; done
+    DETECTED_OWN=""
+    if [ -n "$md_addr" ] && ! printf '%s\n' "$if_addrs" | grep -qxF "$md_addr"; then
+        DETECTED_OWN="$md_addr"
+        PUBLIC_ADDR="${PUBLIC_ADDR:-$md_addr}"
+    fi
+    cloud_warning="This machine runs on ${CLOUD}. Its acceptable use policy forbids scanning other people's machines, and counter-scans draw abuse reports that risk suspension of the account."
+
     ROLE_TRAP=""; ROLE_SCANNER=""; ROLE_WEB=""
     if [ -z "${PEEPHOLE_ROLES:-}" ]; then
         if [ "$INTERACTIVE" -eq 1 ]; then
             say $'\nWhat should this node do? Any combination works; a cluster shares the work.\n'
             ask_yn ROLE_TRAP "Run a trap (catch and record requests that reach no real site)?" y
-            ask_yn ROLE_SCANNER "Run the scanner (nmap counter-scans, from this machine's address)?" y
+            if [ -n "$CLOUD" ]; then
+                say "${cloud_warning} Run the scanner elsewhere (another node of a cluster)."$'\n'
+            fi
+            ask_yn ROLE_SCANNER "Run the scanner (nmap counter-scans, from this machine's address)?" "$([ -n "$CLOUD" ] && echo n || echo y)"
+            say $'The web interface needs a domain whose DNS points here, and HTTPS (WebAuthn). Without one answer no: in a cluster the admin area of another node shows everything.\n'
             ask_yn ROLE_WEB "Have the web interface (public wall of shame and admin area)?" y
             PEEPHOLE_ROLES=""
             [ "$ROLE_TRAP" = 1 ] && PEEPHOLE_ROLES="listener"
@@ -519,23 +701,126 @@ if [ "$upgrade" -ne 1 ]; then
         case "$r" in listener|scanner|web) ;; *) die "unknown role '$r' in PEEPHOLE_ROLES (listener, scanner, web)";; esac
     done
     has_role listener || has_role scanner || has_role web || die "enable at least one of trap, scanner and web interface"
+    # Without the question (preset roles, no terminal), the warning still.
+    if [ -n "$CLOUD" ] && has_role scanner && [ -z "$ROLE_SCANNER" ]; then warn "$cloud_warning"; fi
     TRAP_LISTEN="0.0.0.0:8080"
     TRAP_TLS_LISTEN="0.0.0.0:8081"
+    ADMIN_LISTEN="127.0.0.1:8443"
     if has_role listener; then
-        ask_yn PEEPHOLE_LOCAL_PROXY "Is a reverse proxy on this machine (nginx) in front of the trap?" n
-        if [ "$PEEPHOLE_LOCAL_PROXY" = 1 ]; then
-            TRAP_LISTEN="127.0.0.1:8080"
-            TRAP_TLS_LISTEN="127.0.0.1:8081"
-            if [ -n "${PEEPHOLE_TRUSTED_PROXIES:-}" ] && [ "$PEEPHOLE_TRUSTED_PROXIES" != "127.0.0.1/32,::1/128" ]; then
-                warn "PEEPHOLE_TRUSTED_PROXIES is ignored: with a proxy on this machine only loopback is trusted"
+        # What is in front of the trap. PEEPHOLE_LOCAL_PROXY is the yes/no
+        # form of this question that earlier installers asked.
+        if [ -z "${PEEPHOLE_FRONT:-}" ] && [ -n "${PEEPHOLE_LOCAL_PROXY:-}" ]; then
+            ask_yn PEEPHOLE_LOCAL_PROXY "" n
+            if [ "$PEEPHOLE_LOCAL_PROXY" = 1 ]; then PEEPHOLE_FRONT=local; else PEEPHOLE_FRONT=remote; fi
+        fi
+        busy=""
+        for p in 80 443; do
+            if port_in_use 0.0.0.0 "$p"; then
+                holder="$(port_holder "$p")"
+                busy="${busy:+$busy, }port ${p}${holder:+ (${holder})}"
             fi
-            PEEPHOLE_TRUSTED_PROXIES="127.0.0.1/32,::1/128"
-        else
-            prompt PEEPHOLE_TRUSTED_PROXIES "Trusted proxy CIDRs, comma-separated (X-Forwarded-For is trusted from these)" "10.0.0.0/8"
+        done
+        # The default: preset trusted proxies mean a proxy elsewhere (what
+        # unattended installs from before this question got). The web role
+        # needs port 443 for the admin site, so nginx shares it by name.
+        if [ -n "${PEEPHOLE_TRUSTED_PROXIES:-}" ]; then front_default=remote
+        elif has_role web || [ -n "$busy" ]; then front_default=local
+        else front_default=direct
+        fi
+        while :; do
+            front="${PEEPHOLE_FRONT:-}"
+            if [ -z "$front" ]; then
+                if [ "$INTERACTIVE" -eq 1 ]; then
+                    say $'\nWhat is in front of the trap?\n  direct  nothing: the trap takes ports 80 and 443 itself\n  local   nginx on this machine (it keeps 80/443 and hands the trap what no real site claims)\n  remote  a proxy or load balancer on another machine\n'
+                    say "direct, local or remote [${front_default}]: "
+                    read -r front <&3 || true
+                fi
+                front="${front:-$front_default}"
+            fi
+            problem=""
+            case "$front" in
+                direct)
+                    if has_role web; then
+                        problem="direct needs port 443 for the trap, and the admin site needs it too. Choose local: nginx on this machine splits port 443 by name (the admin domain to the admin site, every other name to the trap; the installer can set it up). Or run the web interface on another node of a cluster."
+                    elif [ -n "$busy" ]; then
+                        problem="direct needs ports 80 and 443, but ${busy} is in use here. Choose local to put the trap behind the nginx that holds it, or free the ports."
+                    fi ;;
+                local|remote) ;;
+                *) problem="answer direct, local or remote (got '${front}')" ;;
+            esac
+            [ -z "$problem" ] && break
+            # A preset answer, or one without a terminal, is not asked again.
+            if [ -n "${PEEPHOLE_FRONT:-}" ] || [ "$INTERACTIVE" -ne 1 ]; then die "PEEPHOLE_FRONT=${front}: ${problem}"; fi
+            say "${problem}"$'\n'
+            front_default=local
+        done
+        PEEPHOLE_FRONT="$front"
+        PEEPHOLE_LOCAL_PROXY=0
+        case "$front" in
+            direct)
+                TRAP_LISTEN="0.0.0.0:80"
+                TRAP_TLS_LISTEN="0.0.0.0:443"
+                if [ -n "${PEEPHOLE_TRUSTED_PROXIES:-}" ]; then
+                    warn "PEEPHOLE_TRUSTED_PROXIES is ignored: nothing is in front of the trap, so no proxy is trusted"
+                fi
+                PEEPHOLE_TRUSTED_PROXIES="" ;;
+            local)
+                PEEPHOLE_LOCAL_PROXY=1
+                TRAP_LISTEN="127.0.0.1:8080"
+                TRAP_TLS_LISTEN="127.0.0.1:8081"
+                if [ -n "${PEEPHOLE_TRUSTED_PROXIES:-}" ] && [ "$PEEPHOLE_TRUSTED_PROXIES" != "127.0.0.1/32,::1/128" ]; then
+                    warn "PEEPHOLE_TRUSTED_PROXIES is ignored: with a proxy on this machine only loopback is trusted"
+                fi
+                PEEPHOLE_TRUSTED_PROXIES="127.0.0.1/32,::1/128" ;;
+            remote)
+                if [ "$INTERACTIVE" -eq 1 ] && [ -z "${PEEPHOLE_TRUSTED_PROXIES:-}" ]; then
+                    say $'The proxy sends plain HTTP that matches no real site to the trap (port 8080) and passes TLS\nfor unknown names untouched, with a PROXY protocol v2 header, to the TLS trap (port 8081).\nHosts in these ranges are believed about the client address: list only the proxy.\n'
+                fi
+                prompt PEEPHOLE_TRUSTED_PROXIES "Address(es) of that proxy, as seen from this machine (CIDRs, comma-separated)"
+                # A bare address is that one host.
+                proxies=""
+                for a in $(printf '%s' "$PEEPHOLE_TRUSTED_PROXIES" | tr ',' ' '); do
+                    if [[ "$a" != */* ]] && valid_ip "$a"; then
+                        if [[ "$a" == *:* ]]; then a="${a}/128"; else a="${a}/32"; fi
+                    fi
+                    proxies="${proxies:+$proxies,}${a}"
+                done
+                PEEPHOLE_TRUSTED_PROXIES="$proxies" ;;
+        esac
+        # 80/443 for direct were checked above: no other port to offer.
+        offer=1; [ "$front" = direct ] && offer=0
+        claim_port TRAP_LISTEN "trap listener" "$offer"
+        claim_port TRAP_TLS_LISTEN "TLS trap listener" "$offer"
+    else
+        # No trap, nothing in front of it (a preset answer is moot).
+        PEEPHOLE_FRONT=""
+    fi
+    # Addresses the scanner must know as its own (never scanned, never in
+    # the blocklist): requests the host makes to its own trap through 1:1
+    # NAT arrive from them.
+    OWN_ADDRESSES=""
+    if has_role listener || has_role scanner; then
+        OWN_ADDRESSES="${PEEPHOLE_OWN_ADDRESSES:-$DETECTED_OWN}"
+        if [ -z "${PEEPHOLE_OWN_ADDRESSES:-}" ] && [ -n "$DETECTED_OWN" ] && [ "$INTERACTIVE" -eq 1 ]; then
+            say $'\n'"The ${md_provider} metadata gives this machine the public address ${DETECTED_OWN}, which no interface shows (1:1 NAT)."$'\n'
+            say "Public addresses of this machine that its interfaces do not show (comma-separated; - for none) [${DETECTED_OWN}]: "
+            answer=""
+            read -r answer <&3 || true
+            OWN_ADDRESSES="${answer:-$DETECTED_OWN}"
+        fi
+        [ "$OWN_ADDRESSES" = - ] && OWN_ADDRESSES=""
+        OWN_ADDRESSES="$(printf '%s' "$OWN_ADDRESSES" | tr -d ' ')"
+        toml_safe "$OWN_ADDRESSES"
+        for a in $(printf '%s' "$OWN_ADDRESSES" | tr ',' ' '); do
+            valid_ip "$a" || die "PEEPHOLE_OWN_ADDRESSES: '${a}' is not an IP address"
+        done
+        if [ -n "$OWN_ADDRESSES" ]; then
+            info "Public address not on an interface: ${OWN_ADDRESSES} (goes into [scan] own_addresses)"
         fi
     fi
     if has_role web; then
         prompt PEEPHOLE_DOMAIN "Public domain of the admin dashboard (WebAuthn relying party)"
+        claim_port ADMIN_LISTEN "admin listener" 1
     fi
     # A preset node name means "yes" (unattended installs from before this
     # question existed).
@@ -547,7 +832,10 @@ if [ "$upgrade" -ne 1 ]; then
     if [ "$PEEPHOLE_CLUSTER" = 1 ]; then
         prompt PEEPHOLE_CLUSTER_NAME "This node's name (other operators see it in their admin area)"
         prompt PEEPHOLE_CLUSTER_LISTEN "Cluster RPC listener" "0.0.0.0:7443"
-        prompt_optional PEEPHOLE_CLUSTER_ADVERTISE "Address other nodes dial (host:port; empty for an outbound-only node)"
+        claim_port PEEPHOLE_CLUSTER_LISTEN "cluster RPC listener" 1 "; or set PEEPHOLE_CLUSTER_LISTEN to another address"
+        advertise_example="host:port"
+        [ -n "$PUBLIC_ADDR" ] && advertise_example="host:port, e.g. ${PUBLIC_ADDR}:${PEEPHOLE_CLUSTER_LISTEN##*:}"
+        prompt_optional PEEPHOLE_CLUSTER_ADVERTISE "Address other nodes dial (${advertise_example}; empty: outbound-only, this node dials its peers, which works)"
         prompt_optional PEEPHOLE_JOIN_TOKEN "Invite token from a member (empty to start a new cluster or join later)"
         if [ "$INTERACTIVE" -eq 1 ] && [ -z "${PEEPHOLE_REMOTE_CONFIG:-}" ]; then
             say $'\nRemote configuration: this node gets a config key. Whoever you give it to can change\nthis node\'s scan pace, rescan cooldown and roles from their own node. You can rotate the key at any time.\n'
@@ -570,10 +858,12 @@ if [ "$upgrade" -ne 1 ]; then
     prompt_optional GREYNOISE_API_KEY "GreyNoise Community API key (https://viz.greynoise.io/account/api-key; mass-scanner or benign; free keys need a business email, 50 lookups/week)"
     ask_yn PEEPHOLE_INTERNETDB "Use Shodan InternetDB (no key; ports, tags and CVEs, weekly data; free for non-commercial use only)?" "$([ "$INTERACTIVE" -eq 1 ] && echo y || echo n)"
     # nginx is set up only where it fronts something peephole serves: the
-    # admin site, or a trap that trusts a proxy on this machine.
+    # admin site, or a trap behind nginx on this machine (local). Not for a
+    # trap that takes 80/443 itself (direct, never with the web role) or
+    # one behind a proxy elsewhere (remote).
     nginx_fits=0
     if has_role listener; then
-        [ "${PEEPHOLE_LOCAL_PROXY:-0}" = 1 ] && nginx_fits=1
+        [ "$PEEPHOLE_FRONT" = local ] && nginx_fits=1
     elif has_role web; then
         nginx_fits=1
     fi
@@ -597,7 +887,7 @@ distribution\'s default site) and reload nginx. Otherwise it prints the steps at
             prompt_optional PEEPHOLE_ACME_EMAIL "Contact email for Let's Encrypt (expiry notices)"
         fi
     elif [ "${PEEPHOLE_NGINX:-0}" = 1 ]; then
-        die "PEEPHOLE_NGINX=1 needs the web role or a trap behind a proxy on this machine (PEEPHOLE_LOCAL_PROXY=1); set up your proxy by hand"
+        die "PEEPHOLE_NGINX=1 needs the web role or a trap behind nginx on this machine (PEEPHOLE_FRONT=local); set up your proxy by hand"
     else
         PEEPHOLE_NGINX=0
     fi
@@ -680,7 +970,7 @@ if [ "$upgrade" -eq 1 ]; then
     info "Existing config at ${CONFIG_FILE} left untouched"
 else
     info "Configuring peephole"
-    proxies_toml="$(printf '%s' "${PEEPHOLE_TRUSTED_PROXIES:-}" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | sed '/^$/d' | sed 's/.*/"&"/' | paste -sd',' -)"
+    proxies_toml="$(toml_list "${PEEPHOLE_TRUSTED_PROXIES:-}")"
     role() { if has_role "$1"; then echo true; else echo false; fi; }
     # Written beside the download and checked first: a value the binary
     # rejects leaves no config behind, so a re-run asks again.
@@ -690,18 +980,27 @@ else
         echo "# Annotated reference for the installed version: ${CONFIG_DIR}/config.example.toml"
         if has_role listener; then
             echo
-            echo "# Trap listener: your reverse proxy sends requests that match no real site here."
-            echo "trap_listen = \"${TRAP_LISTEN}\""
-            echo "# TLS trap listener: peephole terminates TLS itself and keeps the handshake"
-            echo "# (JA4). Your proxy forwards TLS to it untouched, with a PROXY protocol header."
-            echo "trap_tls_listen = \"${TRAP_TLS_LISTEN}\""
-            echo "# Proxies whose X-Forwarded-For header is trusted for the real client IP."
+            if [ "${PEEPHOLE_FRONT:-}" = direct ]; then
+                echo "# Trap listener: nothing in front of it, it takes the public HTTP port itself."
+                echo "trap_listen = \"${TRAP_LISTEN}\""
+                echo "# TLS trap listener on the public HTTPS port: peephole terminates TLS itself"
+                echo "# and keeps the handshake (JA4)."
+                echo "trap_tls_listen = \"${TRAP_TLS_LISTEN}\""
+                echo "# No proxy in front: X-Forwarded-For is never believed."
+            else
+                echo "# Trap listener: your reverse proxy sends requests that match no real site here."
+                echo "trap_listen = \"${TRAP_LISTEN}\""
+                echo "# TLS trap listener: peephole terminates TLS itself and keeps the handshake"
+                echo "# (JA4). Your proxy forwards TLS to it untouched, with a PROXY protocol header."
+                echo "trap_tls_listen = \"${TRAP_TLS_LISTEN}\""
+                echo "# Proxies whose X-Forwarded-For header is trusted for the real client IP."
+            fi
             echo "trusted_proxies = [${proxies_toml}]"
         fi
         if has_role web; then
             echo
             echo "# Admin listener: nginx terminates TLS in front of this (see nginx.example.conf)."
-            echo 'admin_listen = "127.0.0.1:8443"'
+            echo "admin_listen = \"${ADMIN_LISTEN}\""
         fi
         cat <<CONFIG
 
@@ -782,6 +1081,11 @@ max_scans_per_hour = 30    # rate cap of this scanner; excess jobs stay queued
 # never_scan = ["203.0.113.0/24", "2001:db8::/32"]
 never_scan = [] # extra CIDRs this node's scanner never scans
 CONFIG
+        if [ -n "${OWN_ADDRESSES:-}" ]; then
+            echo "# Public address that no interface carries (1:1 NAT, found by install.sh):"
+            echo "# never scanned, never in the blocklist."
+            echo "own_addresses = [$(toml_list "$OWN_ADDRESSES")]"
+        fi
         if [ "${PEEPHOLE_CLUSTER:-0}" = 1 ]; then
             cat <<CONFIG
 
@@ -805,9 +1109,10 @@ CONFIG
         || die "generated config failed validation; nothing was written to ${CONFIG_FILE}. Re-run the installer to answer again."
     install -m 0600 "$new_config" "$CONFIG_FILE"
     info "Wrote ${CONFIG_FILE} (mode 0600 — may contain your MaxMind and API keys)"
-    # A reverse-proxy example that fits this node (see nginx_example).
+    # A reverse-proxy example that fits this node (see nginx_example). A
+    # trap with nothing in front (direct, never with the web role) has none.
     NGINX_EXAMPLE="${CONFIG_DIR}/nginx.example.conf"
-    if has_role web || has_role listener; then
+    if has_role web || { has_role listener && [ "${PEEPHOLE_FRONT:-}" != direct ]; }; then
         nginx_example > "$NGINX_EXAMPLE"
         chmod 0644 "$NGINX_EXAMPLE"
         info "Wrote ${NGINX_EXAMPLE} (reverse-proxy example for this node)"
@@ -1077,7 +1382,8 @@ if [ "$NGINX_DONE" = 1 ]; then
     if [ -n "$admin_listen" ]; then
         echo "    The certificate for ${PEEPHOLE_DOMAIN} renews automatically (certbot's systemd timer)."
     fi
-elif [ -e "${CONFIG_DIR}/nginx.example.conf" ]; then
+elif [ -e "${CONFIG_DIR}/nginx.example.conf" ] && { [ -n "$admin_listen" ] || [ "${PEEPHOLE_FRONT:-}" != remote ]; }; then
+    # A trap-only node behind a remote proxy needs no nginx here (below).
     echo "  - Reverse proxy: an nginx example for this node is in ${CONFIG_DIR}/nginx.example.conf."
     echo "    With nginx installed, in this order:"
     if [ -n "$admin_listen" ]; then
@@ -1101,9 +1407,39 @@ elif [ -e "${CONFIG_DIR}/nginx.example.conf" ]; then
         echo "    (the example refuses TLS for unknown names with ssl_reject_handshake: nginx >= 1.19.4)"
     fi
 fi
-if [ -n "$trap_listen" ] && [ "$NGINX_DONE" != 1 ]; then
-    echo "  - Send requests that match no real site to the trap listener (${trap_listen}); see the nginx example."
-fi
+case "${PEEPHOLE_FRONT:-}" in
+    direct)
+        # The ports to open: the trap's, and the cluster's when peers dial it.
+        open_ports=(80 443)
+        if grep -q '^advertise' "$CONFIG_FILE"; then open_ports+=("${PEEPHOLE_CLUSTER_LISTEN##*:}"); fi
+        echo "  - The trap listens on ports 80 and 443 itself (nothing in front of it). Open $(printf '%s/tcp ' "${open_ports[@]}" | sed 's/ $//; s/ /, /g')"
+        echo "    in any firewall in front of this machine (cloud security group, provider firewall)."
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+            echo "    ufw is active here; the installer did not change it. To open them:"
+            echo "      ufw allow 80/tcp"
+            echo "      ufw allow 443/tcp"
+            if [ "${#open_ports[@]}" -gt 2 ]; then
+                echo "      ufw allow from <other node> to any port ${open_ports[2]} proto tcp   (per node; or ufw allow ${open_ports[2]}/tcp)"
+            fi
+        fi
+        ;;
+    remote)
+        echo "  - Your proxy (trusted_proxies = ${PEEPHOLE_TRUSTED_PROXIES}) must:"
+        echo "      send plain HTTP that matches no real site to ${trap_listen}, with X-Forwarded-For set to the"
+        echo "        client's address (not appended to what the client sent);"
+        echo "      pass TLS for unknown names untouched (TCP), with a PROXY protocol v2 header, to ${TRAP_TLS_LISTEN};"
+        echo "      not health-check that TLS backend: a PROXY header without a client (LOCAL) is refused."
+        echo "    trusted_proxies must name that proxy only: whoever is in it is believed about the client address."
+        if [ -z "$admin_listen" ] && [ -e "${CONFIG_DIR}/nginx.example.conf" ]; then
+            echo "    For an nginx proxy, ${CONFIG_DIR}/nginx.example.conf shows how (point it at this machine)."
+        fi
+        ;;
+    local)
+        if [ "$NGINX_DONE" != 1 ]; then
+            echo "  - Send requests that match no real site to the trap listener (${trap_listen}); see the nginx example."
+        fi
+        ;;
+esac
 if grep -q '^\[cluster\]' "$CONFIG_FILE"; then
     echo "  - Cluster: open the RPC port to the other nodes only."
     echo "    Node key: $("$INSTALL_BIN" cluster id "$CONFIG_FILE" 2>/dev/null)"
@@ -1134,4 +1470,4 @@ if [ -n "$admin_listen" ]; then
 fi
 }
 
-main "$@"
+[ "${PEEPHOLE_NO_MAIN:-0}" = 1 ] || main "$@"

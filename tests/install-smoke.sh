@@ -2,7 +2,8 @@
 # Exercises install.sh against a locally served tarball: fresh install,
 # no-op re-run, forced upgrades (an edited unit kept, the rules directory of
 # an older install left alone, database backed up), a failed upgrade that
-# rolls back, and the wizard.
+# rolls back, the wizard, and what is in front of the trap (nothing, nginx
+# here, a proxy elsewhere) with the port check.
 # Runs as root in a throwaway Debian/Ubuntu container (CI: ubuntu:24.04).
 # PEEPHOLE_BIN is the release binary (default target/release/peephole).
 set -euo pipefail
@@ -49,6 +50,8 @@ chmod +x /tmp/bin/systemctl
 export PATH="/tmp/bin:$PATH"
 export PEEPHOLE_SKIP_APT=1 PEEPHOLE_SKIP_HEALTH=1 BASE_URL="http://127.0.0.1:8999"
 export MAXMIND_ACCOUNT_ID=1 MAXMIND_LICENSE_KEY=k PEEPHOLE_DOMAIN=peephole.test PEEPHOLE_TRUSTED_PROXIES=10.0.0.0/8
+# CI runs in a cloud: its metadata service would add a question to the wizard.
+export PEEPHOLE_METADATA=0
 
 echo "== token extraction survives journalctl prefixes"
 tok="$(printf 'Sep 30 10:00:00 host peephole[123]: Open /enroll on the admin interface and enter this one-time token:\nSep 30 10:00:00 host peephole[123]: \nSep 30 10:00:00 host peephole[123]:   3f2a1c4e-1111-4222-8333-444455556666\n' | bash install.sh --extract-token)"
@@ -212,9 +215,9 @@ reset_install() {
 
 echo "== wizard: trap only, behind a local nginx (answers typed at the prompts)"
 reset_install
-# trap? yes · scanner? no · web? no · local proxy? yes · cluster? no · MaxMind: skip ·
+# trap? yes · scanner? no · web? no · in front: local · cluster? no · MaxMind: skip ·
 # AbuseIPDB key · Shodan: skip · GreyNoise: skip · InternetDB? no
-printf 'y\nn\nn\ny\n\n\nabuse-key-1\n\n\nn\n' > /tmp/answers
+printf 'y\nn\nn\nlocal\n\n\nabuse-key-1\n\n\nn\n' > /tmp/answers
 # PEEPHOLE_TRUSTED_PROXIES stays preset (10.0.0.0/8): the local proxy answer replaces it, with a warning.
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard1.log 2>&1 || { cat /tmp/wizard1.log; exit 1; }
@@ -409,4 +412,104 @@ grep -q '^remote_config = false' /etc/peephole/config.toml
 # Without a terminal no third-party API is used unless asked for.
 if grep -q '\[internetdb\]' /etc/peephole/config.toml; then echo "unattended install enabled InternetDB"; exit 1; fi
 if grep -q 'peephole-cfg1:' /tmp/badjoin.log; then echo "locked node printed a config key"; exit 1; fi
+echo "== unattended direct: the trap takes 80/443 itself, no proxy trusted, no nginx"
+reset_install
+# PEEPHOLE_TRUSTED_PROXIES stays preset (10.0.0.0/8): direct ignores it, with a warning.
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+    PEEPHOLE_FRONT=direct PEEPHOLE_ROLES=listener,scanner PEEPHOLE_OWN_ADDRESSES=198.51.100.7 \
+    bash install.sh > /tmp/direct.log 2>&1 || { cat /tmp/direct.log; exit 1; }
+grep -q '^trap_listen = "0.0.0.0:80"' /etc/peephole/config.toml
+grep -q '^trap_tls_listen = "0.0.0.0:443"' /etc/peephole/config.toml
+grep -q '^trusted_proxies = \[\]' /etc/peephole/config.toml
+if grep -q '10\.0\.0\.0/8' /etc/peephole/config.toml; then echo "direct config trusts 10.0.0.0/8"; exit 1; fi
+grep -q 'PEEPHOLE_TRUSTED_PROXIES is ignored' /tmp/direct.log
+# own_addresses inside the one [scan] table.
+[ "$(grep -c '^\[scan\]' /etc/peephole/config.toml)" = 1 ]
+grep -q '^own_addresses = \["198.51.100.7"\]' /etc/peephole/config.toml
+[ "$(sed -n '/^\[/h; /^own_addresses/{x;p}' /etc/peephole/config.toml)" = "[scan]" ]
+/usr/local/bin/peephole check-config /etc/peephole/config.toml
+test ! -e /etc/peephole/nginx.example.conf
+grep -q 'ports 80 and 443 itself.*Open 80/tcp, 443/tcp$' /tmp/direct.log
+if grep -qi 'nginx\|trap listener (' /tmp/direct.log; then echo "direct install talks about nginx"; cat /tmp/direct.log; exit 1; fi
+
+echo "== direct with the web role is refused before anything is written (nginx shares 443 by name instead)"
+reset_install
+if PEEPHOLE_FRONT=direct PEEPHOLE_ROLES=listener,web bash install.sh > /tmp/direct-web.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q 'admin site needs it too' /tmp/direct-web.log
+test ! -e /usr/local/bin/peephole
+
+echo "== wizard: direct with the web role is explained and asked again (default local)"
+reset_install
+# in front: direct (refused) · then the default; the rest at its defaults
+printf 'direct\n\n' > /tmp/answers
+PEEPHOLE_ROLES=listener,web PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/direct-web-wizard.log 2>&1 \
+    || { cat /tmp/direct-web-wizard.log; exit 1; }
+grep -q 'admin site needs it too' /tmp/direct-web-wizard.log
+grep -q '^trap_listen = "127.0.0.1:8080"' /etc/peephole/config.toml
+test -f /etc/peephole/nginx-stream.example.conf
+
+echo "== direct with port 80 taken is refused; without PEEPHOLE_FRONT the default becomes local"
+reset_install
+python3 -m http.server 80 --bind 0.0.0.0 >/dev/null 2>&1 &
+busy_pid=$!
+for _ in $(seq 1 50); do curl -fs -o /dev/null http://127.0.0.1:80/ && break; sleep 0.1; done
+if env -u PEEPHOLE_TRUSTED_PROXIES PEEPHOLE_FRONT=direct PEEPHOLE_ROLES=listener \
+    bash install.sh > /tmp/direct-busy.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q 'port 80.* in use' /tmp/direct-busy.log
+test ! -e /etc/peephole/config.toml
+env -u PEEPHOLE_TRUSTED_PROXIES PEEPHOLE_ROLES=listener \
+    bash install.sh > /tmp/default-busy.log 2>&1 || { cat /tmp/default-busy.log; exit 1; }
+grep -q '^trap_listen = "127.0.0.1:8080"' /etc/peephole/config.toml
+kill "$busy_pid"; wait "$busy_pid" 2>/dev/null || true
+
+echo "== unattended without anything in front preset, nothing on 80/443: direct"
+reset_install
+env -u PEEPHOLE_TRUSTED_PROXIES PEEPHOLE_ROLES=listener \
+    bash install.sh > /tmp/default-direct.log 2>&1 || { cat /tmp/default-direct.log; exit 1; }
+grep -q '^trap_listen = "0.0.0.0:80"' /etc/peephole/config.toml
+
+echo "== remote needs the proxy's address: no default"
+reset_install
+if env -u PEEPHOLE_TRUSTED_PROXIES PEEPHOLE_FRONT=remote PEEPHOLE_ROLES=listener \
+    bash install.sh > /tmp/remote-none.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q 'missing required setting: PEEPHOLE_TRUSTED_PROXIES' /tmp/remote-none.log
+test ! -e /etc/peephole/config.toml
+PEEPHOLE_FRONT=remote PEEPHOLE_ROLES=listener PEEPHOLE_TRUSTED_PROXIES=192.0.2.10,2001:db8::/64 \
+    bash install.sh > /tmp/remote.log 2>&1 || { cat /tmp/remote.log; exit 1; }
+grep -q '^trap_listen = "0.0.0.0:8080"' /etc/peephole/config.toml
+grep -q '^trap_tls_listen = "0.0.0.0:8081"' /etc/peephole/config.toml
+# A bare address is that one host.
+grep -q '^trusted_proxies = \["192.0.2.10/32","2001:db8::/64"\]' /etc/peephole/config.toml
+grep -q 'PROXY protocol v2' /tmp/remote.log
+grep -q 'not health-check' /tmp/remote.log
+# No web role: nothing for an nginx on this machine to do.
+if grep -q 'rm /etc/nginx/sites-enabled/default' /tmp/remote.log; then echo "remote trap told to set up a local nginx"; exit 1; fi
+/usr/local/bin/peephole check-config /etc/peephole/config.toml
+
+echo "== a taken trap port: unattended stops, the wizard offers the next free ones"
+reset_install
+python3 -m http.server 8080 --bind 127.0.0.1 >/dev/null 2>&1 &
+busy_pid=$!
+for _ in $(seq 1 50); do curl -fs -o /dev/null http://127.0.0.1:8080/ && break; sleep 0.1; done
+if PEEPHOLE_FRONT=local PEEPHOLE_ROLES=listener bash install.sh > /tmp/port-busy.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q 'port 8080 for the trap listener (127.0.0.1:8080) is in use' /tmp/port-busy.log
+test ! -e /etc/peephole/config.toml
+# in front: local · 127.0.0.1:8081 for the trap? yes · 127.0.0.1:8082 for TLS? yes ·
+# cluster? no · MaxMind: skip · API keys: skip · InternetDB? no
+printf 'local\ny\ny\nn\n\n\n\n\nn\n' > /tmp/answers
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_TRUSTED_PROXIES PEEPHOLE_ROLES=listener \
+    PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/port-offer.log 2>&1 || { cat /tmp/port-offer.log; exit 1; }
+grep -q '^trap_listen = "127.0.0.1:8081"' /etc/peephole/config.toml
+grep -q '^trap_tls_listen = "127.0.0.1:8082"' /etc/peephole/config.toml
+grep -q 'proxy_pass http://127.0.0.1:8081;' /etc/peephole/nginx.example.conf
+grep -q 'proxy_pass 127.0.0.1:8082;' /etc/peephole/nginx-stream.example.conf
+kill "$busy_pid"; wait "$busy_pid" 2>/dev/null || true
 echo "== ok"
