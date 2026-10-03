@@ -3,7 +3,30 @@ use peephole::store::Store;
 use peephole::trap::{self, TrapState};
 use std::sync::Arc;
 
+/// The trap's router, answering only once what the trap records (in the
+/// background) is written, so a test can check the store as soon as it has
+/// the answer.
+fn settled_router(state: Arc<TrapState>) -> axum::Router {
+    trap::router(state.clone()).layer(axum::middleware::map_response(
+        move |r: axum::response::Response| {
+            let state = state.clone();
+            async move {
+                state.guards.settled().await;
+                r
+            }
+        },
+    ))
+}
+
 async fn spawn_trap() -> (String, Store, tempfile::TempDir) {
+    let (base, store, dir, _) = spawn_trap_with(settled_router).await;
+    (base, store, dir)
+}
+
+/// A trap served by `router` (`trap::router` or [`settled_router`]).
+async fn spawn_trap_with(
+    router: fn(Arc<TrapState>) -> axum::Router,
+) -> (String, Store, tempfile::TempDir, Arc<TrapState>) {
     let dir = tempfile::tempdir().unwrap();
     let cfg_text = format!(
         r#"
@@ -30,7 +53,7 @@ license_key = "k"
     let cfg = Config::load(&cfg_path).unwrap();
     let store = Store::connect(&cfg.database_path).await.unwrap();
     let state = Arc::new(TrapState::for_test(store.clone(), cfg));
-    let app = trap::router(state);
+    let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     // ConnectInfo extractors require into_make_service_with_connect_info.
@@ -42,7 +65,38 @@ license_key = "k"
         .await
         .unwrap()
     });
-    (format!("http://{addr}"), store, dir)
+    (format!("http://{addr}"), store, dir, state)
+}
+
+/// The answer does not wait for the recording, and a request whose answer
+/// went out is recorded even though its connection is gone.
+#[tokio::test]
+async fn request_is_recorded_after_it_is_answered() {
+    let (base, store, _dir, state) = spawn_trap_with(trap::router).await;
+    // Hold the write lock: recording cannot finish until it is released.
+    let mut lock = store.pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base}/wp-login.php"))
+        .header("x-forwarded-for", "203.0.113.9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    drop(resp);
+    drop(client);
+    sqlx::query("COMMIT").execute(&mut *lock).await.unwrap();
+    drop(lock);
+    state.guards.settled().await;
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE path = '/wp-login.php'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
 }
 
 #[tokio::test]
@@ -1063,6 +1117,19 @@ nmap_path = "{nmap}"
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+    // The trap records after it answers; `/api/stats` is cached for 15 s by
+    // design, so wait for the row in the database file before asking.
+    let probe = Store::connect(&dir.path().join("t.db")).await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM requests")
+        .fetch_one(&probe.pool)
+        .await
+        .unwrap()
+        == 0
+    {
+        assert!(std::time::Instant::now() < deadline, "request not recorded");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     let resp = client
         .get(format!("http://127.0.0.1:{admin}/api/stats"))
         .send()
@@ -1070,9 +1137,7 @@ nmap_path = "{nmap}"
         .unwrap();
     let stats: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(stats["total_requests"], 1);
-    // Fake nmap should have completed the queued scan. `/api/stats` is
-    // cached for 15 s by design, so poll the database file directly.
-    let probe = Store::connect(&dir.path().join("t.db")).await.unwrap();
+    // Fake nmap should have completed the queued scan (polled likewise).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let scans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scans")

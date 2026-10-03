@@ -353,4 +353,50 @@ mod tests {
         // Disabled retention is a no-op.
         assert!(s.local().prune_older_than(0).await.unwrap().is_empty());
     }
+
+    /// A node that left its cluster keeps rows other nodes (and itself, under
+    /// its cluster key) originated; standalone, they are all its to delete.
+    #[tokio::test]
+    async fn standalone_deletes_and_prunes_rows_from_a_cluster() {
+        let (s, a, b) = seeded().await;
+        for table in [
+            "requests",
+            "fp_claims",
+            "fingerprints",
+            "scan_jobs",
+            "scans",
+            "skipped_batches",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {table} SET origin = ?"
+            )))
+            .bind(vec![7u8; 32])
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let rid: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE ip_id = ?")
+            .bind(a)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        let d = s.local().delete_requests(&[rid]).await.unwrap();
+        assert_eq!((d.deleted, d.hidden), (1, 0));
+        assert_eq!(count(&s, "requests", "id", rid).await, 0);
+        assert_eq!(count(&s, "fp_claims", "request_id", rid).await, 0);
+        let d = s.local().delete_ips(&[a]).await.unwrap();
+        assert_eq!(d.hidden, 0);
+        assert!(d.deleted > 0);
+        assert_eq!(count(&s, "ips", "id", a).await, 0);
+
+        // Retention gets past them too, instead of selecting them forever.
+        sqlx::query("UPDATE requests SET ts = datetime('now','-100 days')")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let p = s.local().prune_older_than(90).await.unwrap();
+        assert_eq!(p.requests, 1);
+        assert_eq!(count(&s, "requests", "ip_id", b).await, 0);
+        assert_eq!(count(&s, "fp_claims", "ip_id", b).await, 0);
+    }
 }

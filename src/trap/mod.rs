@@ -74,7 +74,7 @@ pub struct Guards {
     intel: flood::IntelCache,
     /// Light rows of the requests the flood gate skips.
     pub skips: skiplog::SkipLog,
-    /// Trap requests being handled right now.
+    /// Trap requests being handled or recorded right now.
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -88,6 +88,14 @@ impl Guards {
 
     fn in_flight(&self) -> usize {
         self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until no request is in flight: every request answered so far
+    /// is recorded (requests are recorded after they are answered).
+    pub async fn settled(&self) {
+        while self.in_flight() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 
@@ -575,16 +583,18 @@ async fn trap_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Response {
-    let _in_flight = state.guards.enter();
+    let in_flight = state.guards.enter();
     let (parts, body) = req.into_parts();
     let ip = client_ip(&parts.headers, peer.ip(), &state.cfg.trusted_proxies);
     let (body, received) = read_body(body).await;
     let page_token = uuid::Uuid::new_v4().to_string();
-    let method = parts.method.as_str();
-    let path = parts.uri.path();
     // Decided before recording, so the row says what was sent.
     let decoy = if state.cfg.trap.decoys {
-        decoy::decoy(method, path, &page_token.replace('-', "")[..12])
+        decoy::decoy(
+            parts.method.as_str(),
+            parts.uri.path(),
+            &page_token.replace('-', "")[..12],
+        )
     } else {
         None
     };
@@ -592,7 +602,51 @@ async fn trap_handler(
         Some(d) => (format!("decoy:{}", d.name), 200),
         None => ("not-found".to_string(), 404),
     };
+    // Recorded apart from the answer: hyper drops this future when the
+    // client resets the stream or the connection ends, which must not lose
+    // the request or a batch of light rows taken but not yet written.
+    tokio::spawn(record_trap(
+        state.clone(),
+        in_flight,
+        ip,
+        parts,
+        body,
+        received,
+        page_token.clone(),
+        answer,
+        status,
+    ));
+    if let Some(d) = decoy {
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, d.content_type)],
+            d.body,
+        )
+            .into_response();
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Html(pages::trap_page(&page_token, &state.cfg.trap.helper_prefix)),
+    )
+        .into_response()
+}
 
+/// The recording part of [`trap_handler`]: a full row, or a light row when
+/// this IP is over its recording rate. In flight until it is done.
+#[allow(clippy::too_many_arguments)]
+async fn record_trap(
+    state: Arc<TrapState>,
+    _in_flight: InFlight,
+    ip: IpAddr,
+    parts: axum::http::request::Parts,
+    body: Vec<u8>,
+    received: Option<u64>,
+    page_token: String,
+    answer: String,
+    status: u16,
+) {
+    let method = parts.method.as_str();
+    let path = parts.uri.path();
     match state.guards.flood.admit(ip, &state.cfg.trap) {
         flood::Admission::Skip => {
             debug!(%ip, "trap: over the recording rate; answered, light row only");
@@ -640,7 +694,7 @@ async fn trap_handler(
                 raw_headers: &raw,
                 body: (!body.is_empty()).then(|| body.clone()),
                 is_fp_claim: false,
-                page_token: page_token.clone(),
+                page_token,
                 answer,
                 status,
                 unrecorded,
@@ -650,25 +704,12 @@ async fn trap_handler(
                     .map(|m| ConnCapture::of(m, parts.version)),
             };
             if let Err(e) = record(&state, capture).await {
-                // Answer as always: an error page would tell a scanner it
+                // Answered as always: an error page would tell a scanner it
                 // found something other than a missing route.
                 warn!(%ip, error = %e, "trap: recording the request failed");
             }
         }
     }
-    if let Some(d) = decoy {
-        return (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, d.content_type)],
-            d.body,
-        )
-            .into_response();
-    }
-    (
-        StatusCode::NOT_FOUND,
-        Html(pages::trap_page(&page_token, &state.cfg.trap.helper_prefix)),
-    )
-        .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -695,32 +736,38 @@ async fn claim_handler(
         .to_string();
     let raw = header_pairs(&headers);
     let path = format!("{}/claim", state.cfg.trap.helper_prefix);
-    let capture = Capture {
-        ip,
-        view: RequestView {
-            method: "POST",
-            path: &path,
-            query: None,
-            headers: raw.clone(),
+    let conn = meta.map(|m| ConnCapture::of(&m, version));
+    // Recorded apart from the answer, as in `trap_handler`.
+    let in_flight = state.guards.enter();
+    tokio::spawn(async move {
+        let _in_flight = in_flight;
+        let capture = Capture {
+            ip,
+            view: RequestView {
+                method: "POST",
+                path: &path,
+                query: None,
+                headers: raw.clone(),
+                body: None,
+                proxy_target: None,
+            },
+            raw_headers: &raw,
             body: None,
-            proxy_target: None,
-        },
-        raw_headers: &raw,
-        body: None,
-        is_fp_claim: true,
-        page_token: uuid::Uuid::new_v4().to_string(),
-        answer: "claim".into(),
-        status: 200,
-        unrecorded: 0,
-        conn: meta.map(|m| ConnCapture::of(&m, version)),
-    };
-    if let Ok(rec) = record(&state, capture).await {
-        let email = form.email.filter(|e| !e.trim().is_empty());
-        let _ = state
-            .recorder
-            .insert_fp_claim(rec.ip_id, rec.request_id, email.as_deref(), &ua)
-            .await;
-    }
+            is_fp_claim: true,
+            page_token: uuid::Uuid::new_v4().to_string(),
+            answer: "claim".into(),
+            status: 200,
+            unrecorded: 0,
+            conn,
+        };
+        if let Ok(rec) = record(&state, capture).await {
+            let email = form.email.filter(|e| !e.trim().is_empty());
+            let _ = state
+                .recorder
+                .insert_fp_claim(rec.ip_id, rec.request_id, email.as_deref(), &ua)
+                .await;
+        }
+    });
     Html(pages::claim_confirmation()).into_response()
 }
 
@@ -748,64 +795,69 @@ async fn collect_handler(
     if !state.helper_rate.allow(ip, HELPER_LIMIT, HELPER_WINDOW) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
     }
-    if let Ok(ip_row) = state.store.upsert_ip(ip).await {
-        // Attribute the fingerprint to the page view that issued the token;
-        // fall back to the connection IP for unknown tokens.
-        let req: Option<(i64, i64, String)> = sqlx::query_as(
-            "SELECT r.id, r.ip_id, i.ip FROM requests r JOIN ips i ON i.id = r.ip_id
-             WHERE r.page_token = ? ORDER BY r.id DESC LIMIT 1",
-        )
-        .bind(&payload.token)
-        .fetch_optional(&state.store.pool)
-        .await
-        .unwrap_or(None);
-        let (request_id, ip_id, page_ip) = match req {
-            Some((rid, iid, page_ip)) => (Some(rid), iid, page_ip.parse::<IpAddr>().ok()),
-            None => (None, ip_row.id, Some(ip)),
-        };
-        let hash = crate::fingerprint::fp_hash(&payload.attrs);
-        let visitor = payload
-            .attrs
-            .get("visitor_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let events = payload
-            .behavior
-            .get("events")
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        let _ = state
-            .recorder
-            .insert_fingerprint(
-                request_id,
-                ip_id,
-                &hash,
-                visitor.as_deref(),
-                &payload.attrs.to_string(),
-                &payload.behavior.to_string(),
-                events.as_bytes(),
+    // Recorded apart from the answer, as in `trap_handler`.
+    let in_flight = state.guards.enter();
+    tokio::spawn(async move {
+        let _in_flight = in_flight;
+        if let Ok(ip_row) = state.store.upsert_ip(ip).await {
+            // Attribute the fingerprint to the page view that issued the token;
+            // fall back to the connection IP for unknown tokens.
+            let req: Option<(i64, i64, String)> = sqlx::query_as(
+                "SELECT r.id, r.ip_id, i.ip FROM requests r JOIN ips i ON i.id = r.ip_id
+                 WHERE r.page_token = ? ORDER BY r.id DESC LIMIT 1",
             )
-            .await;
+            .bind(&payload.token)
+            .fetch_optional(&state.store.pool)
+            .await
+            .unwrap_or(None);
+            let (request_id, ip_id, page_ip) = match req {
+                Some((rid, iid, page_ip)) => (Some(rid), iid, page_ip.parse::<IpAddr>().ok()),
+                None => (None, ip_row.id, Some(ip)),
+            };
+            let hash = crate::fingerprint::fp_hash(&payload.attrs);
+            let visitor = payload
+                .attrs
+                .get("visitor_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let events = payload
+                .behavior
+                .get("events")
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            let _ = state
+                .recorder
+                .insert_fingerprint(
+                    request_id,
+                    ip_id,
+                    &hash,
+                    visitor.as_deref(),
+                    &payload.attrs.to_string(),
+                    &payload.behavior.to_string(),
+                    events.as_bytes(),
+                )
+                .await;
 
-        // The fingerprint arrives after the page view that triggered it, so it
-        // cannot influence that request's own verdict. When it reveals a bot
-        // (navigator.webdriver, or a form filled inhumanly fast with no mouse
-        // movement), escalate a counter-scan now — of the address the page
-        // was served to, subject to the same tor / never_scan / non-global
-        // guards as the request path. Bot evidence posted from another
-        // address than the page's is stored but escalates nothing: it is not
-        // tied to one address, and a token alone must not aim a scan.
-        let tells = crate::fingerprint::bot_tells(&payload.attrs, &payload.behavior);
-        if (tells.webdriver || tells.inhuman_fill)
-            && let Some(target) = page_ip.map(crate::net::canonical)
-            && target == crate::net::canonical(ip)
-            && !state.tor.read().unwrap().contains(&target)
-            && may_scan(&state, target)
-        {
-            let level = if tells.inhuman_fill { 3 } else { 2 };
-            let _ = enqueue(&state, ip_id, level).await;
+            // The fingerprint arrives after the page view that triggered it, so it
+            // cannot influence that request's own verdict. When it reveals a bot
+            // (navigator.webdriver, or a form filled inhumanly fast with no mouse
+            // movement), escalate a counter-scan now — of the address the page
+            // was served to, subject to the same tor / never_scan / non-global
+            // guards as the request path. Bot evidence posted from another
+            // address than the page's is stored but escalates nothing: it is not
+            // tied to one address, and a token alone must not aim a scan.
+            let tells = crate::fingerprint::bot_tells(&payload.attrs, &payload.behavior);
+            if (tells.webdriver || tells.inhuman_fill)
+                && let Some(target) = page_ip.map(crate::net::canonical)
+                && target == crate::net::canonical(ip)
+                && !state.tor.read().unwrap().contains(&target)
+                && may_scan(&state, target)
+            {
+                let level = if tells.inhuman_fill { 3 } else { 2 };
+                let _ = enqueue(&state, ip_id, level).await;
+            }
         }
-    }
+    });
     axum::Json(serde_json::json!({"ok": true})).into_response() // opaque ack (spec §8.3)
 }
 
