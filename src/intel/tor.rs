@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// The bulk exit list. It holds IPv4 addresses only (it is built from the
 /// exit lists TorDNSEL measures over IPv4), so a Tor exit that reaches the
@@ -25,6 +26,27 @@ pub fn sane_count(body: &[u8]) -> Result<u64> {
     Ok(count)
 }
 
+/// An exit list older than this counts as none: it misses the exits that
+/// appeared since, and those would pass for ordinary scanners. As long as a
+/// recorded "not an exit" holds (`scan::guard`), and the oldest list a node
+/// copies from the cluster (`share::MAX_COPY_AGE_HOURS`).
+pub const MAX_AGE: Duration = Duration::from_secs(72 * 3600);
+
+/// Whether a list file last modified at `mtime` is older than [`MAX_AGE`]
+/// (a time in the future is not).
+pub fn too_old(mtime: SystemTime) -> bool {
+    SystemTime::now()
+        .duration_since(mtime)
+        .is_ok_and(|age| age > MAX_AGE)
+}
+
+/// Whether the list file in `data_dir` exists and is older than [`MAX_AGE`].
+pub fn stale(data_dir: &Path) -> bool {
+    std::fs::metadata(file(data_dir))
+        .and_then(|m| m.modified())
+        .is_ok_and(too_old)
+}
+
 #[derive(Clone, Default)]
 pub struct TorExitList {
     set: BTreeSet<IpAddr>,
@@ -35,9 +57,19 @@ fn file(data_dir: &Path) -> PathBuf {
 }
 
 impl TorExitList {
+    /// The list file in `data_dir`; empty when there is none or it is
+    /// [`stale`].
     pub fn load(data_dir: &Path) -> Result<Self> {
         let path = file(data_dir);
         if !path.exists() {
+            return Ok(Self::default());
+        }
+        if stale(data_dir) {
+            tracing::warn!(
+                file = %path.display(),
+                "tor exit list older than {} h: not used until a fresh one is fetched",
+                MAX_AGE.as_secs() / 3600
+            );
             return Ok(Self::default());
         }
         let text = std::fs::read_to_string(&path).context("reading tor exit list")?;
@@ -101,6 +133,25 @@ mod tests {
         assert!(list.contains(&"203.0.113.1".parse::<IpAddr>().unwrap()));
         assert!(list.contains(&"2001:db8::5".parse::<IpAddr>().unwrap()));
         assert!(!list.contains(&"192.0.2.9".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn a_stale_list_is_no_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tor-exit.txt");
+        std::fs::write(&path, "203.0.113.1\n").unwrap();
+        assert!(!stale(dir.path()));
+        assert!(!TorExitList::load(dir.path()).unwrap().is_empty());
+        let old = SystemTime::now() - MAX_AGE - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(stale(dir.path()));
+        assert!(TorExitList::load(dir.path()).unwrap().is_empty());
+        assert!(!too_old(SystemTime::now() + Duration::from_secs(3600)));
     }
 
     #[test]

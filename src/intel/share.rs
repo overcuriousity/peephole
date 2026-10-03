@@ -97,9 +97,13 @@ impl Manifest {
 
     /// The fetch time as RFC 3339 (stored as UTC without a zone).
     pub fn fetched_rfc3339(&self) -> Option<String> {
+        self.fetched().map(|t| t.to_rfc3339())
+    }
+
+    fn fetched(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         chrono::NaiveDateTime::parse_from_str(&self.fetched_at, "%Y-%m-%d %H:%M:%S")
             .ok()
-            .map(|t| t.and_utc().to_rfc3339())
+            .map(|t| t.and_utc())
     }
 }
 
@@ -255,6 +259,14 @@ async fn download(node: &Node, data_dir: &Path, m: &Manifest) -> Result<()> {
             );
         }
         std::fs::write(&tmp, &out)?;
+        // Dated by its fetch, not by the copy: a list that is old where it
+        // was fetched is old here too (`tor::stale`).
+        if let Some(t) = m.fetched() {
+            std::fs::File::options()
+                .write(true)
+                .open(&tmp)?
+                .set_modified(t.into())?;
+        }
         std::fs::rename(&tmp, data_dir.join(name))?;
         return Ok(());
     }

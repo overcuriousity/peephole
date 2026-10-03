@@ -330,6 +330,8 @@ pub struct ScanSafety {
     /// Directory of local CIDR lists (`*.txt`/`*.list`/`*.conf`, one address
     /// or CIDR per line, `#` comments) this scanner never scans, e.g. the
     /// published ranges of search engine crawlers. Nothing is downloaded.
+    /// Must be a readable directory at startup; while its lists have not
+    /// loaded, the scanner scans nothing.
     #[serde(default)]
     pub never_scan_dir: Option<PathBuf>,
     /// Skip IPs whose reverse DNS names a known crawler domain and resolves
@@ -680,6 +682,11 @@ impl Config {
         for o in s.safety.trusted_origins.iter().flatten() {
             crate::cluster::identity::NodeId::parse(o)
                 .with_context(|| format!("scan.trusted_origins: `{o}`"))?;
+        }
+        // An unreadable list must stop the start, not silently protect nothing.
+        if let Some(d) = &s.safety.never_scan_dir {
+            std::fs::read_dir(d)
+                .with_context(|| format!("scan.never_scan_dir `{}`", d.display()))?;
         }
         if let Some(c) = &self.cluster {
             if c.node_name.trim().is_empty() {
@@ -1137,7 +1144,7 @@ data_dir = "/tmp"
         let cfg = parse(&format!(
             "{BASE}[roles]\nlistener = false\nweb = false\n[scan]\n\
              single_request_max_level = 3\nmax_queued = 10\ntor_unknown = \"scan\"\n\
-             trusted_origins = []\nnever_scan_dir = \"/etc/peephole/never_scan.d\"\n\
+             trusted_origins = []\nnever_scan_dir = \"/tmp\"\n\
              [scan.level_argv]\n1 = [\"-sS\"]\n"
         ))
         .unwrap();
@@ -1155,11 +1162,13 @@ data_dir = "/tmp"
             (2, TorUnknown::Defer, true)
         );
         assert!(s.trusted_origins.is_none());
-        // Out of range, bad keys and empty argv are refused.
+        // Out of range, bad keys, empty argv and a missing list directory
+        // are refused.
         for bad in [
             "single_request_max_level = 0",
             "single_request_max_level = 5",
             "trusted_origins = [\"nope\"]",
+            "never_scan_dir = \"/nonexistent/never_scan.d\"",
             "level_argv = { 2 = [] }",
             "rescan_cooldown_hours = -1",
             "rescan_cooldown_hours = 8761",
