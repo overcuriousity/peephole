@@ -59,7 +59,7 @@ pub enum Msg {
         ok: bool,
     },
     /// Scanner → arbiter: the job ended. Status: done, failed, superseded
-    /// or refused.
+    /// or refused; or handed back: declined (for good) or later (for now).
     Complete {
         job_uid: String,
         status: String,

@@ -22,6 +22,10 @@ use tracing::{info, warn};
 /// How long claims are collected before jobs are handed out.
 pub const CLAIM_WINDOW: Duration = Duration::from_secs(2);
 
+/// How long a job handed back "later" (not replicated there yet, thin
+/// evidence, Tor status unknown) is not offered to that scanner again.
+const LATER_BACKOFF: Duration = Duration::from_secs(180);
+
 struct Lease {
     scanner: NodeId,
     expires: Instant,
@@ -37,6 +41,8 @@ pub struct Arbiter {
     waiting: Mutex<Vec<Waiter>>,
     /// Scanners that handed a job back because their own never_scan covers it.
     declined: Mutex<HashMap<String, std::collections::HashSet<NodeId>>>,
+    /// Scanners that handed a job back for now, until when they are skipped.
+    later: Mutex<HashMap<String, HashMap<NodeId, Instant>>>,
     /// Serializes hand-outs and state writes.
     assign: tokio::sync::Mutex<()>,
 }
@@ -57,6 +63,7 @@ impl Arbiter {
             leases: Mutex::new(HashMap::new()),
             waiting: Mutex::new(vec![]),
             declined: Mutex::new(HashMap::new()),
+            later: Mutex::new(HashMap::new()),
             assign: tokio::sync::Mutex::new(()),
         });
         a.recover().await?;
@@ -192,12 +199,19 @@ impl Arbiter {
     /// Take our next queued job for `scanner` and mark it running.
     async fn next_job(&self, scanner: NodeId) -> Result<Option<Grant>> {
         let me = self.node.id();
-        // Not a job this scanner already handed back.
+        // Not a job this scanner already handed back (for now or for good).
         let declined: Vec<String> = {
             let d = self.declined.lock().unwrap();
+            let l = self.later.lock().unwrap();
+            let now = Instant::now();
             d.iter()
                 .filter(|(_, by)| by.contains(&scanner))
                 .map(|(uid, _)| uid.clone())
+                .chain(
+                    l.iter()
+                        .filter(|(_, by)| by.get(&scanner).is_some_and(|t| *t > now))
+                        .map(|(uid, _)| uid.clone()),
+                )
                 .collect()
         };
         let row: Option<(String, String, i64, i64)> = sqlx::query_as(
@@ -297,7 +311,16 @@ impl Arbiter {
         status: &str,
         error: Option<String>,
     ) -> bool {
-        if !["done", "failed", "superseded", "refused", "declined"].contains(&status) {
+        if ![
+            "done",
+            "failed",
+            "superseded",
+            "refused",
+            "declined",
+            "later",
+        ]
+        .contains(&status)
+        {
             return false;
         }
         let _g = self.assign.lock().await;
@@ -316,7 +339,11 @@ impl Arbiter {
         if status == "declined" {
             return self.decline(scanner, uid, error).await;
         }
+        if status == "later" {
+            return self.later(scanner, uid).await;
+        }
         self.declined.lock().unwrap().remove(uid);
+        self.later.lock().unwrap().remove(uid);
         if let Err(e) = self.set_state(uid, status, error, Some(now_ts())).await {
             warn!(?e, job = %uid, "recording job outcome failed");
             return false;
@@ -355,8 +382,17 @@ impl Arbiter {
 
     /// Declined jobs wait for another scanner. When the scanners that have
     /// not declined a job are gone, nobody is left to take it: refuse it.
-    /// Entries of jobs that are no longer queued here are dropped.
+    /// Entries of jobs that are no longer queued here are dropped, and so
+    /// are "later" turndowns once they have expired.
     async fn recheck_declined(&self) -> Result<()> {
+        {
+            let now = Instant::now();
+            let mut l = self.later.lock().unwrap();
+            l.retain(|_, by| {
+                by.retain(|_, until| *until > now);
+                !by.is_empty()
+            });
+        }
         let uids: Vec<String> = self.declined.lock().unwrap().keys().cloned().collect();
         for uid in uids {
             let queued = matches!(self.job(&uid).await?, Some((st, ..)) if st == "queued");
@@ -401,6 +437,22 @@ impl Arbiter {
         };
         if let Err(e) = r {
             warn!(?e, job = %uid, "recording a declined job failed");
+            return false;
+        }
+        true
+    }
+
+    /// A scanner handed the job back for now: it returns to the queue and
+    /// this scanner is skipped for it for a while. Never refuses the job.
+    async fn later(&self, scanner: NodeId, uid: &str) -> bool {
+        self.later
+            .lock()
+            .unwrap()
+            .entry(uid.to_string())
+            .or_default()
+            .insert(scanner, Instant::now() + LATER_BACKOFF);
+        if let Err(e) = self.set_state(uid, "queued", None, None).await {
+            warn!(?e, job = %uid, "recording a job handed back for now failed");
             return false;
         }
         true
@@ -572,11 +624,16 @@ mod tests {
     use super::*;
     use crate::cluster::identity::Identity;
 
-    /// Jobs a scanner handed back must not hide the jobs behind them.
-    #[tokio::test]
-    async fn declined_jobs_do_not_starve_a_scanner() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+    type Setup = (
+        Arc<Node>,
+        Arc<Arbiter>,
+        crate::store::Store,
+        tokio::sync::watch::Sender<bool>,
+    );
+
+    /// A bootstrapped node (a scanner too) with its arbiter running.
+    async fn setup(dir: &std::path::Path) -> Setup {
+        let store = crate::store::Store::connect(&dir.join("t.db"))
             .await
             .unwrap();
         let node = Node::open(crate::cluster::NodeParams {
@@ -595,14 +652,30 @@ mod tests {
             roles: Default::default(),
             store: store.clone(),
             proto: (2, 2),
-            data_dir: dir.path().to_path_buf(),
+            data_dir: dir.to_path_buf(),
             retention_days: 0,
         })
         .await
         .unwrap();
         node.bootstrap().await.unwrap();
-        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let (tx, rx) = tokio::sync::watch::channel(false);
         let arbiter = Arbiter::start(node.clone(), rx).await.unwrap();
+        (node, arbiter, store, tx)
+    }
+
+    async fn status(store: &crate::store::Store, uid: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM scan_jobs WHERE uid = ?")
+            .bind(uid)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Jobs a scanner handed back must not hide the jobs behind them.
+    #[tokio::test]
+    async fn declined_jobs_do_not_starve_a_scanner() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
         let rec = Recorder::Cluster(node.clone());
         // 60 urgent jobs the scanner declined, then one it can run.
         for i in 0..61u8 {
@@ -628,5 +701,76 @@ mod tests {
         }
         let grant = arbiter.next_job(scanner).await.unwrap();
         assert_eq!(grant.map(|g| g.level), Some(1));
+    }
+
+    /// "later" requeues the job and skips that scanner for it for a while
+    /// only; it never makes the job refused.
+    #[tokio::test]
+    async fn later_turndowns_are_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        let ip = store
+            .upsert_ip("203.0.113.80".parse().unwrap())
+            .await
+            .unwrap();
+        Recorder::Cluster(node.clone())
+            .enqueue_scan(ip.id, 2, 24)
+            .await
+            .unwrap();
+        let (a, b) = (node.id(), Identity::generate().unwrap().id);
+        let g = arbiter.next_job(a).await.unwrap().unwrap();
+        let why = Some("Tor exit status unknown (no exit list loaded)".into());
+        assert!(arbiter.complete(a, &g.job_uid, "later", why).await);
+        assert_eq!(status(&store, &g.job_uid).await, "queued");
+        // `a` is the only scanner present; the job still is not refused.
+        arbiter.recheck_declined().await.unwrap();
+        assert_eq!(status(&store, &g.job_uid).await, "queued");
+        // Not offered to `a` again yet, but to anyone else.
+        assert!(arbiter.next_job(a).await.unwrap().is_none());
+        let g = arbiter.next_job(b).await.unwrap().unwrap();
+        assert!(arbiter.complete(b, &g.job_uid, "later", None).await);
+        // Once the backoff is over, `a` gets it again.
+        arbiter
+            .later
+            .lock()
+            .unwrap()
+            .get_mut(&g.job_uid)
+            .unwrap()
+            .insert(a, Instant::now());
+        assert_eq!(
+            arbiter.next_job(a).await.unwrap().map(|g| g.job_uid),
+            Some(g.job_uid.clone())
+        );
+        assert_eq!(status(&store, &g.job_uid).await, "running");
+    }
+
+    /// "declined" (also from scanners older than "later") still hands the
+    /// job back for good: with nobody left to take it, it is refused.
+    #[tokio::test]
+    async fn declined_turndowns_stay_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        let ip = store
+            .upsert_ip("203.0.113.81".parse().unwrap())
+            .await
+            .unwrap();
+        Recorder::Cluster(node.clone())
+            .enqueue_scan(ip.id, 2, 24)
+            .await
+            .unwrap();
+        let a = Identity::generate().unwrap().id;
+        let g = arbiter.next_job(a).await.unwrap().unwrap();
+        let why = Some("never_scan 203.0.113.0/24".into());
+        assert!(arbiter.complete(a, &g.job_uid, "declined", why).await);
+        // This node's scanner may still take it, and then hands it back too.
+        assert_eq!(status(&store, &g.job_uid).await, "queued");
+        assert!(arbiter.next_job(a).await.unwrap().is_none());
+        let g = arbiter.next_job(node.id()).await.unwrap().unwrap();
+        assert!(
+            arbiter
+                .complete(node.id(), &g.job_uid, "declined", None)
+                .await
+        );
+        assert_eq!(status(&store, &g.job_uid).await, "refused");
     }
 }
