@@ -85,7 +85,7 @@ async fn request_is_recorded_after_it_is_answered() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.status(), 200); // the wp-login decoy
     drop(resp);
     drop(client);
     sqlx::query("COMMIT").execute(&mut *lock).await.unwrap();

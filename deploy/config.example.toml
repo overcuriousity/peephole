@@ -46,8 +46,6 @@ trusted_proxies = ["10.0.0.5/32"]
 # record_burst = 100   # ...after a burst of this many
 # sample_every = 20    # over the limit: record 1 in N in full (it carries the "unrecorded" count); the rest leave light rows
 # skip_log_rate = 100  # light rows (time, method, path) per IP and second for the rest; past it only counted; 0 = no limit
-# decoys = false       # true: answer /.env, /.git/config, /wp-login.php, phpinfo with fake content
-#                      # (status 200, canary credentials naming the request) to capture the follow-up
 # helper_prefix = ""   # path prefix for /claim, /collect, /panel, /collect.js (e.g. "/_a7f3"), so the
 #                      # trap page's helpers do not give peephole away on every vhost
 

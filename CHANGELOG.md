@@ -3,6 +3,15 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [Unreleased]
+
+### Changed
+
+- Trap: decoys are always on. `/.env`, `/.git/config`, `/wp-login.php` and
+  phpinfo probes get plausible fake content with canary credentials and
+  status 200, so the follow-up request lands in the trap too. The
+  `trap.decoys` setting is gone; an old `decoys = …` line is ignored.
+
 ## [0.2.1] - 2026-10-04
 
 ### Changed

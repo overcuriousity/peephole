@@ -1,4 +1,4 @@
-//! Opt-in decoys (`trap.decoys`): plausible answers to the first-stage
+//! Decoys, always on: plausible answers to the first-stage
 //! probes scanners send before they attack, so the second stage (a login
 //! with harvested credentials, an exploit for the PHP version shown) lands
 //! in the trap too. Nothing here is real: every credential is a canary

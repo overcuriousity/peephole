@@ -24,12 +24,6 @@ pub struct TrapConfig {
     /// only counted. 0: no limit.
     #[serde(default = "default_skip_log_rate")]
     pub skip_log_rate: u32,
-    /// Answer common first-stage probes (`/.env`, `/.git/config`,
-    /// `/wp-login.php`, phpinfo pages) with plausible fake content and
-    /// status 200 instead of the trap page, so the follow-up request is
-    /// captured too. The fake credentials are marked as canaries.
-    #[serde(default)]
-    pub decoys: bool,
     /// Path prefix of the trap page's helper endpoints (`/claim`,
     /// `/collect`, `/panel`, `/collect.js`), e.g. `/_a7f3`. Empty: at the
     /// root. A prefix of your own makes the trap harder to fingerprint.
@@ -57,7 +51,6 @@ impl Default for TrapConfig {
             record_burst: default_record_burst(),
             sample_every: default_sample_every(),
             skip_log_rate: default_skip_log_rate(),
-            decoys: false,
             helper_prefix: String::new(),
         }
     }
@@ -107,7 +100,6 @@ mod tests {
         assert_eq!(c.record_rate, 10.0);
         assert_eq!(c.record_burst, 100);
         assert_eq!(c.sample_every, 20);
-        assert!(!c.decoys);
         assert_eq!(c.helper_prefix, "");
         assert!(parse("record_rate = 0").is_ok());
         assert!(parse("record_rate = -1").is_err());
