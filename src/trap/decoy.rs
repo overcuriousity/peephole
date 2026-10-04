@@ -14,10 +14,12 @@ use crate::canary::{Kind, v0_ref, value};
 pub struct Input<'a> {
     pub v: i64,
     pub page_token: &'a str,
-    /// `:authority`, else `Host` ([`site::request_host`]).
+    /// The request's host ([`site::request_host`]).
     pub host: Option<&'a str>,
-    /// The recording node's key (None on a standalone node).
-    pub node_id: Option<&'a [u8]>,
+    /// The site word the node served under ([`site::word`]), stored with
+    /// the row: the node's key can change (a standalone node's history is
+    /// adopted under its cluster key), the word served cannot.
+    pub word: &'a str,
     /// The row's time, unix seconds.
     pub ts: i64,
     pub method: &'a str,
@@ -57,11 +59,11 @@ pub fn choose(
     path: &str,
     query: Option<&str>,
     p: Presented,
-    node_id: Option<&[u8]>,
+    word: &str,
 ) -> Option<&'static str> {
     let get = matches!(method, "GET" | "HEAD");
     let file = path.rsplit('/').next().unwrap_or("");
-    let repo = format!("/git/{}.git", site::word(node_id));
+    let repo = format!("/git/{word}.git");
     if method == "POST" && file == "wp-login.php" && p.body {
         return Some("wp-login-ok");
     }
@@ -123,8 +125,8 @@ pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
             }
         }
         1 => {
-            let word = site::word(inp.node_id);
-            let site_name = site::site(inp.node_id);
+            let word = inp.word;
+            let site_name = format!("{word}.internal");
             let ret = site::return_host(inp.host, &site_name);
             match name {
                 "dotenv" => (
@@ -470,7 +472,7 @@ mod tests {
             v,
             page_token: TOK,
             host,
-            node_id: Some(&NODE),
+            word: crate::canary::site::word(Some(&NODE)),
             ts: 1_791_000_000,
             method,
             path,
@@ -483,7 +485,7 @@ mod tests {
 
     #[test]
     fn choose_keeps_todays_answers_without_a_canary() {
-        let n = Some(&NODE[..]);
+        let n = crate::canary::site::word(Some(&NODE));
         assert_eq!(choose("GET", "/.env", None, none(), n), Some("dotenv"));
         assert_eq!(choose("GET", "/api/.env", None, none(), n), Some("dotenv"));
         assert_eq!(
@@ -520,8 +522,8 @@ mod tests {
 
     #[test]
     fn choose_with_canaries_follows_the_spec_precedence() {
-        let n = Some(&NODE[..]);
-        let repo = format!("/git/{}.git", crate::canary::site::word(n));
+        let n = crate::canary::site::word(Some(&NODE));
+        let repo = format!("/git/{n}.git");
         let basic = Presented {
             basic: true,
             ..none()

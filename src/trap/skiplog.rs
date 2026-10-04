@@ -66,6 +66,8 @@ pub struct SkipDecoy {
     pub host: Option<String>,
     pub answer: String,
     pub decoy_v: i64,
+    /// The site word it was served under.
+    pub site: String,
 }
 
 impl SkipLog {
@@ -128,6 +130,7 @@ impl SkipLog {
                 .and_then(|d| d.host.as_deref().map(|h| cut(h, 255).to_string())),
             answer: decoy.as_ref().map(|d| d.answer.clone()),
             decoy_v: decoy.as_ref().map(|d| d.decoy_v),
+            decoy_site: decoy.as_ref().map(|d| d.site.clone()),
         });
         if p.rows.len() >= SKIP_BATCH_MAX {
             return map.remove(&ip).map(|p| batch(ip, p));
@@ -276,6 +279,7 @@ mod tests {
             host: Some("203.0.113.7".into()),
             answer: "decoy:git-config".into(),
             decoy_v: 1,
+            site: "shop".into(),
         };
         log.note(ip, 1_000, "GET", "/.git/config", Some(d), 0, Instant::now());
         let b = log.take(ip).unwrap();

@@ -5,12 +5,16 @@
 -- canary_parsed holds the tokenizer version a row was parsed with (0: not
 -- yet).
 ALTER TABLE requests ADD COLUMN decoy_v INTEGER;
+-- The site word a version-1 decoy was served under (the node's key can
+-- change on adoption; what was served cannot).
+ALTER TABLE requests ADD COLUMN decoy_site TEXT;
 ALTER TABLE requests ADD COLUMN canary_parsed INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE skipped_batches ADD COLUMN canary_parsed INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE skipped_requests ADD COLUMN page_token TEXT;
 ALTER TABLE skipped_requests ADD COLUMN host TEXT;
 ALTER TABLE skipped_requests ADD COLUMN answer TEXT;
 ALTER TABLE skipped_requests ADD COLUMN decoy_v INTEGER;
+ALTER TABLE skipped_requests ADD COLUMN decoy_site TEXT;
 
 CREATE TABLE canaries (
   value_hash INTEGER NOT NULL,

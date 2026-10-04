@@ -551,11 +551,15 @@ async fn request_page(
             .collect(),
         _ => vec![],
     };
-    let origin = st.store.request_origin(id).await?;
-    let return_host = (!served.is_empty() && d.row.decoy_v.is_some()).then(|| {
-        let site = crate::canary::site::site(origin.as_deref());
-        crate::canary::site::return_host(crate::canary::site::request_host(&d.headers), &site)
-    });
+    let return_host = d
+        .row
+        .decoy_site
+        .as_deref()
+        .filter(|_| !served.is_empty())
+        .map(|w| {
+            let site = format!("{w}.internal");
+            crate::canary::site::return_host(crate::canary::site::request_host(&d.headers), &site)
+        });
     let reuses = st
         .store
         .reuses(&crate::store::canaries::ReuseFilter {

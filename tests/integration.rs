@@ -2543,3 +2543,33 @@ async fn a_served_decoy_renders_again_from_its_row() {
         .unwrap();
     assert_eq!(again.body, body);
 }
+
+/// A decoy served standalone renders the same after the node adopted its
+/// history into a cluster (which sets the row's origin).
+#[tokio::test]
+async fn a_decoy_renders_the_same_after_adoption() {
+    let (base, store, _dir) = spawn_trap().await;
+    let body = reqwest::Client::new()
+        .get(format!("{base}/.env"))
+        .header("x-forwarded-for", "203.0.113.80")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    sqlx::query("UPDATE requests SET origin = ? WHERE path = '/.env'")
+        .bind(vec![9u8; 32])
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let uid: String = sqlx::query_scalar("SELECT uid FROM requests WHERE path = '/.env'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    let again = peephole::canary::cli::render_uid(&store, &uid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.body, body);
+}

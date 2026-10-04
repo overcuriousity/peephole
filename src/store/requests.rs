@@ -33,6 +33,8 @@ pub struct NewRequest {
     /// the time it rendered a decoy with.
     pub ts: Option<String>,
     pub decoy_v: Option<i64>,
+    /// The site word a version-1 decoy was served under.
+    pub decoy_site: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -76,6 +78,7 @@ pub struct RequestRow {
     pub ja4: Option<String>,
     pub rules: Option<String>,
     pub decoy_v: Option<i64>,
+    pub decoy_site: Option<String>,
 }
 
 /// Distinct refresh intervals; later lookups reuse the last one (over

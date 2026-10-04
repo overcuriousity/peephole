@@ -530,6 +530,7 @@ mod tests {
                     host: Some("203.0.113.7".into()),
                     answer: Some("decoy:git-config".into()),
                     decoy_v: Some(1),
+                    decoy_site: Some("shop".into()),
                 }],
                 build: String::new(),
             }),

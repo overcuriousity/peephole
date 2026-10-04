@@ -536,6 +536,7 @@ struct Capture<'a> {
     /// The row's time, as the decoy was rendered with.
     ts: String,
     decoy_v: Option<i64>,
+    decoy_site: Option<String>,
     /// How the request is answered: `not-found`, `decoy:<name>`, `claim`.
     answer: String,
     status: u16,
@@ -701,6 +702,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 rules: (!c.is_fp_claim).then(|| state.classifier.fingerprint().to_string()),
                 ts: Some(c.ts),
                 decoy_v: c.decoy_v,
+                decoy_site: c.decoy_site,
             },
         )
         .await?;
@@ -803,14 +805,14 @@ async fn trap(
     let path = parts.uri.path();
     let presented = presented(&state, &headers, method, path, &body.bytes).await;
     let node_id = state.recorder.node_id();
-    let node = node_id.as_ref().map(|n| &n.0[..]);
-    let decoy = decoy::choose(method, path, parts.uri.query(), presented, node).and_then(|name| {
+    let word = crate::canary::site::word(node_id.as_ref().map(|n| &n.0[..]));
+    let decoy = decoy::choose(method, path, parts.uri.query(), presented, word).and_then(|name| {
         decoy::render(
             &decoy::Input {
                 v: crate::canary::DECOY_V,
                 page_token: &page_token,
                 host: host.as_deref(),
-                node_id: node,
+                word,
                 ts: now.timestamp(),
                 method,
                 path,
@@ -836,6 +838,7 @@ async fn trap(
             now,
             host,
             decoy_v: decoy.is_some().then_some(crate::canary::DECOY_V),
+            word,
         },
     ));
     if let Some(d) = decoy {
@@ -866,6 +869,8 @@ struct Served {
     now: chrono::DateTime<chrono::Utc>,
     host: Option<String>,
     decoy_v: Option<i64>,
+    /// The site word the decoy was served under.
+    word: &'static str,
 }
 
 /// Which credential places carried a canary this node knows. Only requests
@@ -934,6 +939,7 @@ async fn record_trap(
                 host: served.host.clone(),
                 answer: served.answer.clone(),
                 decoy_v: v,
+                site: served.word.to_string(),
             });
             let full = state.guards.skips.note(
                 ip,
@@ -983,6 +989,7 @@ async fn record_trap(
                 page_token: served.page_token,
                 ts: served.now.format("%Y-%m-%d %H:%M:%S").to_string(),
                 decoy_v: served.decoy_v,
+                decoy_site: served.decoy_v.map(|_| served.word.to_string()),
                 answer: served.answer,
                 status: served.status,
                 unrecorded,
@@ -1066,6 +1073,7 @@ async fn claim_handler(
             page_token: uuid::Uuid::new_v4().to_string(),
             ts: crate::store::data::now_ts(),
             decoy_v: None,
+            decoy_site: None,
             answer: "claim".into(),
             status: 200,
             unrecorded: 0,

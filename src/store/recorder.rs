@@ -169,6 +169,7 @@ impl Recorder {
             ja4: n.ja4.clone(),
             rules: n.rules.clone(),
             decoy_v: n.decoy_v,
+            decoy_site: n.decoy_site.clone(),
         }))])
         .await?;
         sqlx::query_as("SELECT id, ip_id FROM requests WHERE uid = ?")

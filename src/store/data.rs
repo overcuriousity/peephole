@@ -273,8 +273,8 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
         "INSERT OR IGNORE INTO requests (uid, origin, hlc, ts, ip_id, method, path, query,
            headers_json, body, labels_json, owasp_json, severity, scan_level, is_fp_claim,
            page_token, answer, status, unrecorded, transport, via_proxy, raw_head,
-           tls_client_hello, ja4, build, rules, decoy_v)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           tls_client_hello, ja4, build, rules, decoy_v, decoy_site)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -303,6 +303,7 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(&r.build)
     .bind(rules)
     .bind(r.decoy_v)
+    .bind(r.decoy_site.as_deref().map(|w| cut(w, 64)))
     .execute(&mut *conn)
     .await?;
     if done.rows_affected() == 1 {
@@ -373,8 +374,9 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
     };
     for r in &b.rows {
         sqlx::query(
-            "INSERT INTO skipped_requests (batch_id, ts_ms, method, path, page_token, host, answer, decoy_v)
-             VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO skipped_requests
+               (batch_id, ts_ms, method, path, page_token, host, answer, decoy_v, decoy_site)
+             VALUES (?,?,?,?,?,?,?,?,?)",
         )
         .bind(id)
         .bind(row_ms(r.ts_ms))
@@ -384,6 +386,7 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
         .bind(r.host.as_deref().map(|h| cut(h, 255)))
         .bind(r.answer.as_deref().map(|a| cut(a, 64)))
         .bind(r.decoy_v)
+        .bind(r.decoy_site.as_deref().map(|w| cut(w, 64)))
         .execute(&mut *conn)
         .await?;
     }
@@ -1223,6 +1226,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
         String,
         Option<String>,
         Option<i64>,
+        Option<String>,
     );
     type Req = (
         String,
@@ -1278,7 +1282,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                 Some(r) => {
                     let x: ReqExtra = sqlx::query_as(
                         "SELECT build, answer, status, unrecorded, transport, via_proxy, raw_head,
-                                tls_client_hello, ja4, owasp_json, rules, decoy_v
+                                tls_client_hello, ja4, owasp_json, rules, decoy_v, decoy_site
                          FROM requests WHERE uid = ?",
                     )
                     .bind(uid)
@@ -1310,6 +1314,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         owasp_json: Some(x.9).filter(|j| j != "[]"),
                         rules: x.10,
                         decoy_v: x.11,
+                        decoy_site: x.12,
                     })))
                 }
             }
@@ -1333,9 +1338,10 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         Option<String>,
                         Option<String>,
                         Option<i64>,
+                        Option<String>,
                     );
                     let rows: Vec<Row> = sqlx::query_as(
-                        "SELECT ts_ms, method, path, page_token, host, answer, decoy_v
+                        "SELECT ts_ms, method, path, page_token, host, answer, decoy_v, decoy_site
                          FROM skipped_requests WHERE batch_id = ? ORDER BY rowid",
                     )
                     .bind(id)
@@ -1347,8 +1353,8 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         dropped,
                         rows: rows
                             .into_iter()
-                            .map(|(ts_ms, method, path, page_token, host, answer, decoy_v)| {
-                                crate::cluster::record::SkipRow {
+                            .map(
+                                |(
                                     ts_ms,
                                     method,
                                     path,
@@ -1356,8 +1362,20 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                                     host,
                                     answer,
                                     decoy_v,
-                                }
-                            })
+                                    decoy_site,
+                                )| {
+                                    crate::cluster::record::SkipRow {
+                                        ts_ms,
+                                        method,
+                                        path,
+                                        page_token,
+                                        host,
+                                        answer,
+                                        decoy_v,
+                                        decoy_site,
+                                    }
+                                },
+                            )
                             .collect(),
                         build,
                     }))
@@ -1501,6 +1519,7 @@ mod tests {
                     host: None,
                     answer: None,
                     decoy_v: None,
+                    decoy_site: None,
                 },
                 crate::cluster::record::SkipRow {
                     ts_ms: 1_791_000_000_500,
@@ -1510,6 +1529,7 @@ mod tests {
                     host: Some("203.0.113.7".into()),
                     answer: Some("decoy:git-config".into()),
                     decoy_v: Some(1),
+                    decoy_site: Some("shop".into()),
                 },
             ],
             build: String::new(),
@@ -1533,6 +1553,7 @@ mod tests {
             host: None,
             answer: None,
             decoy_v: None,
+            decoy_site: None,
         };
         let bytes = crate::cluster::rpc::cbor::encode(&row).unwrap();
         #[derive(serde::Serialize)]

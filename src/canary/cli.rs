@@ -19,7 +19,7 @@ type LightRow = (
     Option<String>,
     Option<String>,
     Option<i64>,
-    Option<Vec<u8>>,
+    Option<String>,
 );
 /// A full row's decoy inputs.
 type FullRow = (
@@ -30,14 +30,14 @@ type FullRow = (
     Option<String>,
     Option<String>,
     Option<i64>,
-    Option<Vec<u8>>,
+    Option<String>,
 );
 
 /// The decoy of the row `uid` (None: no such row, or not a decoy).
 pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
     if let Some((batch, row)) = uid.split_once('#') {
         let r: Option<LightRow> = sqlx::query_as(
-            "SELECT s.ts_ms, s.method, s.path, s.page_token, s.host, s.answer, s.decoy_v, b.origin
+            "SELECT s.ts_ms, s.method, s.path, s.page_token, s.host, s.answer, s.decoy_v, s.decoy_site
                  FROM skipped_requests s JOIN skipped_batches b ON b.id = s.batch_id
                  WHERE b.uid = ? AND s.rowid = ?",
         )
@@ -45,7 +45,7 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
         .bind(row.parse::<i64>().unwrap_or(-1))
         .fetch_optional(&store.read)
         .await?;
-        let Some((ts_ms, method, path, Some(tok), host, Some(answer), v, origin)) = r else {
+        let Some((ts_ms, method, path, Some(tok), host, Some(answer), v, site)) = r else {
             return Ok(None);
         };
         let Some(name) = answer.strip_prefix("decoy:") else {
@@ -56,7 +56,8 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
                 v: v.unwrap_or(0),
                 page_token: &tok,
                 host: host.as_deref(),
-                node_id: origin.as_deref(),
+                // Version 0 did not use the site; version 1 always stores it.
+                word: site.as_deref().unwrap_or_default(),
                 ts: ts_ms.div_euclid(1000),
                 method: &method,
                 path: &path,
@@ -65,13 +66,13 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
         ));
     }
     let r: Option<FullRow> = sqlx::query_as(
-        "SELECT ts, method, path, headers_json, page_token, answer, decoy_v, origin
+        "SELECT ts, method, path, headers_json, page_token, answer, decoy_v, decoy_site
              FROM requests WHERE uid = ?",
     )
     .bind(uid)
     .fetch_optional(&store.read)
     .await?;
-    let Some((ts, method, path, headers_json, Some(tok), Some(answer), v, origin)) = r else {
+    let Some((ts, method, path, headers_json, Some(tok), Some(answer), v, site)) = r else {
         return Ok(None);
     };
     let Some(name) = answer.strip_prefix("decoy:") else {
@@ -86,7 +87,8 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
             v: v.unwrap_or(0),
             page_token: &tok,
             host: crate::canary::site::request_host(&headers),
-            node_id: origin.as_deref(),
+            // Version 0 did not use the site; version 1 always stores it.
+            word: site.as_deref().unwrap_or_default(),
             ts,
             method: &method,
             path: &path,
@@ -146,6 +148,7 @@ mod tests {
                     host: Some("203.0.113.7".into()),
                     answer: Some("decoy:dotenv".into()),
                     decoy_v: Some(1),
+                    decoy_site: Some("shop".into()),
                 }],
                 build: String::new(),
             }),
@@ -166,7 +169,7 @@ mod tests {
                 v: 1,
                 page_token: "tok",
                 host: Some("203.0.113.7"),
-                node_id: None,
+                word: "shop",
                 ts: 1_791_000_000,
                 method: "GET",
                 path: "/.env",

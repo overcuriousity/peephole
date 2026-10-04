@@ -89,6 +89,9 @@ pub struct RequestRec {
     /// absent for other answers and for decoy rows of version 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoy_v: Option<i64>,
+    /// The site word a version-1 decoy was served under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoy_site: Option<String>,
 }
 
 /// One request the flood gate answered without recording it in full.
@@ -108,6 +111,8 @@ pub struct SkipRow {
     pub answer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoy_v: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoy_site: Option<String>,
 }
 
 /// Skipped requests of one IP, sent together. `dropped`: requests past
