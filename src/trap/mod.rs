@@ -798,9 +798,8 @@ async fn trap(
     let headers = header_pairs(&parts.headers);
     // The same order the row is rendered again with (`request_host` over
     // the stored headers, where `:authority` is the URI's authority).
-    let host = crate::canary::site::request_host(&headers)
-        .map(str::to_string)
-        .or_else(|| parts.uri.authority().map(|a| a.to_string()));
+    let host =
+        crate::canary::site::served_host(&headers, parts.uri.authority().map(|a| a.as_str()));
     let method = parts.method.as_str();
     let path = parts.uri.path();
     let presented = presented(&state, &headers, method, path, &body.bytes).await;

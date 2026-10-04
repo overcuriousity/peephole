@@ -68,10 +68,24 @@ pub fn request_host(headers: &[(String, String)]) -> Option<&str> {
     find("host").or_else(|| find(":authority"))
 }
 
+/// Longest host a decoy is rendered with: what a light row keeps.
+pub const HOST_MAX: usize = 255;
+
+/// The host the trap renders a decoy with: [`request_host`] over the
+/// received headers, else the URI's authority (HTTP/2), and none when it is
+/// longer than a light row keeps (such a host renders the site anyway, so
+/// dropping it keeps the row's rendering the same).
+pub fn served_host(headers: &[(String, String)], authority: Option<&str>) -> Option<String> {
+    request_host(headers)
+        .or(authority)
+        .filter(|h| h.len() <= HOST_MAX)
+        .map(str::to_string)
+}
+
 /// Where a decoy's links point: the Host as sent when it is a public IP or
 /// a DNS name (the scanner just reached us with it), else the site.
 pub fn return_host(host: Option<&str>, site: &str) -> String {
-    let Some(h) = host.filter(|h| !h.is_empty() && h.len() <= 255) else {
+    let Some(h) = host.filter(|h| !h.is_empty() && h.len() <= HOST_MAX) else {
         return site.to_string();
     };
     let bare = if let Some(rest) = h.strip_prefix('[') {
@@ -215,6 +229,27 @@ mod tests {
         assert_eq!(return_host(None, s), s);
         // A bare IPv6 literal is bracketed, so links built from it parse.
         assert_eq!(return_host(Some("2001:db8::1"), s), "[2001:db8::1]");
+    }
+
+    #[test]
+    fn served_host_drops_what_a_light_row_could_not_keep() {
+        let h = |v: &str| vec![("host".to_string(), v.to_string())];
+        assert_eq!(
+            served_host(&h("a.example"), None).as_deref(),
+            Some("a.example")
+        );
+        assert_eq!(
+            served_host(&[], Some("b.example")).as_deref(),
+            Some("b.example")
+        );
+        // Cut to 255 in a light row it could become a valid name and render
+        // differently; served as no host, it renders the site either way.
+        let long = format!("{}.example:12345678", "a".repeat(250));
+        assert_eq!(served_host(&h(&long), None), None);
+        assert_eq!(
+            return_host(None, "shop.internal"),
+            return_host(Some(&long), "shop.internal")
+        );
     }
 
     #[test]
