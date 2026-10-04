@@ -284,7 +284,7 @@
     clusters.forEach(function (c, ci) {
       var a = (ci / clusters.length) * 2 * Math.PI, cx = W / 2 + Math.cos(a) * W * 0.3 * (clusters.length > 1), cy = H / 2 + Math.sin(a) * H * 0.28 * (clusters.length > 1);
       var f = node("fp:" + c.hash, "fp", c.hash.slice(0, 8));
-      f.x = cx; f.y = cy; f.count = c.count;
+      f.x = cx; f.y = cy; f.count = c.count; f.hub = c.kind || "fp";
       c.ips.forEach(function (ip, ii) {
         var fresh = !byKey["ip:" + ip], n = node("ip:" + ip, "ip", ip), b = (ii / c.ips.length) * 2 * Math.PI + rnd() * 0.3;
         if (fresh) { n.x = cx + Math.cos(b) * 70; n.y = cy + Math.sin(b) * 70; }
@@ -311,7 +311,8 @@
         n.vx += (W / 2 - n.x) * 0.002; n.vy += (H / 2 - n.y) * 0.002;
         var sp = Math.sqrt(n.vx * n.vx + n.vy * n.vy), lim = 20 * cool + 1;
         if (sp > lim) { n.vx *= lim / sp; n.vy *= lim / sp; }
-        n.x = Math.max(16, Math.min(W - 110, n.x + n.vx)); // room for the label n.y = Math.max(16, Math.min(H - 16, n.y + n.vy));
+        n.x = Math.max(16, Math.min(W - 110, n.x + n.vx)); // room for the label
+        n.y = Math.max(16, Math.min(H - 16, n.y + n.vy));
         n.vx *= 0.6; n.vy *= 0.6;
       });
     }
@@ -332,9 +333,10 @@
       edges.forEach(function (e, i) { lines[i].classList.toggle("is-dim", on && e[0] !== n && e[1] !== n); });
     }
     nodes.forEach(function (n) {
-      n.el = n.kind === "fp" ? el("rect", { "class": "n-fp", width: 14, height: 14, rx: 3, tabindex: 0 }, gn) : el("circle", { "class": "n-ip", r: 6, tabindex: 0 }, gn);
+      n.el = n.kind === "fp" ? el("rect", { "class": "n-fp n-" + n.hub, width: 14, height: 14, rx: 3, tabindex: 0 }, gn) : el("circle", { "class": "n-ip", r: 6, tabindex: 0 }, gn);
       n.text = text(gn, 0, 0, n.label, "n-label");
-      hover(n.el, function () { return n.kind === "fp" ? "fingerprint <b>" + esc(n.label) + "…</b> · " + n.links.length + " IPs · " + fmt(n.count) + " sightings" : "<b>" + esc(n.label) + "</b> · " + n.links.length + " shared fingerprint" + (n.links.length === 1 ? "" : "s"); });
+      var what = { fp: "fingerprint", ssh: "SSH host key", tls: "TLS certificate" };
+      hover(n.el, function () { return n.kind === "fp" ? what[n.hub] + " <b>" + esc(n.label) + "…</b> · " + n.links.length + " IPs · " + fmt(n.count) + " sightings" : "<b>" + esc(n.label) + "</b> · " + n.links.length + " shared identifier" + (n.links.length === 1 ? "" : "s"); });
       n.el.addEventListener("mouseenter", function () { focus(n, true); });
       n.el.addEventListener("mouseleave", function () { focus(n, false); });
       var drag = null;

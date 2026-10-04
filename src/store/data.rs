@@ -846,6 +846,7 @@ async fn scan_result(
             .execute(&mut *conn)
             .await?;
         }
+        super::hostkeys::derive(conn, scan_id, ip_id, r.raw_xml.as_deref()).await?;
     }
     Ok(Effect::Applied)
 }

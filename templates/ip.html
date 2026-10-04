@@ -64,6 +64,13 @@
       {% let ports = sc.ports %}{% include "_ports.html" %}
     {% endfor %}
   </section>
+
+  {% if !adm.scans.is_empty() %}
+  <section class="card" id="host-keys">
+    <div class="card-head"><h2>Host keys and certificates</h2>{% let linked = adm.linked_ips() %}{% if linked > 0 %}<span class="badge badge-status" data-status="running">shared with {{ linked }} other IP{% if linked != 1 %}s{% endif %}</span>{% endif %}</div>
+    {% let keys = adm.host_keys %}{% include "_host_keys.html" %}
+  </section>
+  {% endif %}
   {% endif %}
 
   <section class="card">

@@ -81,13 +81,30 @@
     </section>
   </div>
 
+  <div class="grid-2">
+    <section class="card">
+      <div class="card-head"><h2>SSH servers (HASSH)</h2><span class="muted">IPs</span></div>
+      <ol class="ranked">
+        {% for n in a.hassh %}<li><span class="ranked-name mono">{{ n.name }}{% let value = n.name.as_str() %}{% let what = "HASSH" %}{% let subtle = true %}{% include "_copy.html" %}</span><span class="num">{{ n.ips }}</span>{% let v = n.ips %}{% let max = max.hassh %}{% include "_bar.html" %}</li>{% endfor %}
+      </ol>
+      {% if a.hassh.is_empty() %}<p class="empty">None (needs level 2+).</p>{% endif %}
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>Certificate builders (JA4X)</h2><span class="muted">IPs</span></div>
+      <ol class="ranked">
+        {% for n in a.ja4x %}<li><span class="ranked-name mono">{{ n.name }}{% let value = n.name.as_str() %}{% let what = "JA4X" %}{% let subtle = true %}{% include "_copy.html" %}</span><span class="num">{{ n.ips }}</span>{% let v = n.ips %}{% let max = max.ja4x %}{% include "_bar.html" %}</li>{% endfor %}
+      </ol>
+      {% if a.ja4x.is_empty() %}<p class="empty">None (needs level 2+).</p>{% endif %}
+    </section>
+  </div>
+
   <div class="grid-3">
     <section class="card">
       <h2>OS guesses</h2>
       <ol class="ranked">
         {% for n in a.os_guesses %}<li><span class="ranked-name" title="{{ n.name }}">{{ n.name }}</span><span class="num">{{ n.ips }}</span>{% let v = n.ips %}{% let max = max.os %}{% include "_bar.html" %}</li>{% endfor %}
       </ol>
-      {% if a.os_guesses.is_empty() %}<p class="empty">None (needs level 3+).</p>{% endif %}
+      {% if a.os_guesses.is_empty() %}<p class="empty">None (needs level 2+).</p>{% endif %}
     </section>
     <section class="card">
       <h2>AbuseIPDB score</h2>

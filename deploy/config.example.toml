@@ -152,7 +152,9 @@ tor_wait_hours = 6
 
 # Default scans are non-intrusive: no -A, no intrusive NSE scripts, timing
 # capped at -T3. Severity escalates by scope (ports, -sV, -O, discovery/safe
-# scripts that neither contact third parties nor broadcast). nmap gets a
+# scripts that neither contact third parties nor broadcast). Level 2 runs
+# ssh-hostkey, ssh2-enum-algos and ssl-cert for the source's host keys and
+# certificates; an override without them loses those. nmap gets a
 # --host-timeout just under timeout_secs and a --script-timeout. Optional
 # per-level argv overrides below; {target} is NOT used — the target IP is
 # appended as the final argument. A script selector with spaces is one

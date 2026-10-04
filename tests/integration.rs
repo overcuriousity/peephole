@@ -754,7 +754,12 @@ async fn admin_pages_and_deletes_with_session() {
                 job.id,
                 Some(&peephole::scan::nmap_xml::ScanResult {
                     os_guess: Some("Linux".into()),
-                    raw_xml: b"<nmaprun>RAWXML</nmaprun>".to_vec(),
+                    // Both IPs show the same host keys and certificate.
+                    raw_xml: [
+                        include_bytes!("fixtures/nmap-hostkeys.xml").as_slice(),
+                        b"<!-- RAWXML -->\n",
+                    ]
+                    .concat(),
                     ports: vec![peephole::scan::nmap_xml::PortResult {
                         port: 22,
                         proto: "tcp".into(),
@@ -815,6 +820,24 @@ async fn admin_pages_and_deletes_with_session() {
         .await
         .unwrap();
     assert!(html.contains("22/tcp") && html.contains("ssh"));
+    assert!(
+        html.contains("Host keys and certificates")
+            && html.contains("SHA256:LvbxsAtrLqDESt7sCPrXK6n7L9j4J9myhtEO50ocsdM")
+            && html.contains("1 linked"),
+        "host keys on the scan page"
+    );
+    let html = get("/ip/203.0.113.78").await.unwrap().text().await.unwrap();
+    assert!(
+        html.contains("shared with 1 other IP"),
+        "host keys on the IP page"
+    );
+    let html = get("/admin/analytics?range=all")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("SSH servers (HASSH)") && html.contains("Certificate builders (JA4X)"));
     let xml = get(&format!("/admin/scans/{sid}/xml")).await.unwrap();
     assert_eq!(
         xml.headers().get("content-type").unwrap(),
@@ -833,6 +856,13 @@ async fn admin_pages_and_deletes_with_session() {
             && html.contains("203.0.113.77")
             && html.contains("203.0.113.78")
     );
+    assert!(
+        html.contains("SSH host key")
+            && html.contains("TLS certificate")
+            && html.contains("id=\"ssh-")
+            && html.contains("kind&#34;:&#34;tls"),
+        "shared host keys on the fingerprints page and in its graph"
+    );
     let html = get("/admin/inbox").await.unwrap().text().await.unwrap();
     assert!(html.contains("lost@example.org"));
     let html = get("/admin/keys").await.unwrap().text().await.unwrap();
@@ -843,6 +873,10 @@ async fn admin_pages_and_deletes_with_session() {
         "/admin",
         "/admin/queue",
         &format!("/admin/requests/{rid}"),
+        &format!("/admin/scans/{sid}"),
+        "/admin/fingerprints",
+        "/admin/analytics",
+        "/ip/203.0.113.78",
         "/admin/keys",
     ] {
         let html = get(html_path).await.unwrap().text().await.unwrap();
@@ -865,6 +899,12 @@ async fn admin_pages_and_deletes_with_session() {
         .await
         .unwrap();
     assert_eq!(n, 0);
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM host_keys WHERE scan_id = ?")
+        .bind(sid)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "a deleted scan's host keys go with it");
     let cid: i64 = sqlx::query_scalar("SELECT id FROM fp_claims")
         .fetch_one(&store.pool)
         .await

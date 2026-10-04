@@ -29,6 +29,9 @@ pub struct Analytics {
     /// Product strings nmap reported on open ports.
     pub products: Vec<NamedIps>,
     pub os_guesses: Vec<NamedIps>,
+    /// HASSH-server and JA4X of the scanned sources (`host_keys`).
+    pub hassh: Vec<NamedIps>,
+    pub ja4x: Vec<NamedIps>,
     /// IPs active in the range by AbuseIPDB score band.
     pub abuse: Vec<Named>,
     /// Scans finished in the range per level.
@@ -144,6 +147,20 @@ impl Store {
                 since,
             )
             .await?;
+        let host_key = |kind: &str| {
+            format!(
+                "SELECT h.fingerprint AS name, COUNT(*) AS count, COUNT(DISTINCT h.ip_id) AS ips
+                 FROM host_keys h JOIN scans s ON s.id = h.scan_id
+                 WHERE h.kind = '{kind}'{ws}
+                 GROUP BY name ORDER BY ips DESC, name LIMIT {TOP}"
+            )
+        };
+        let hassh = self
+            .named_ips(host_key(crate::scan::hostkeys::HASSH), since)
+            .await?;
+        let ja4x = self
+            .named_ips(host_key(crate::scan::hostkeys::JA4X), since)
+            .await?;
         // Bands in display order; an IP active in the range counts once.
         let active = match r {
             Range::All => "SELECT abuse_score FROM ips WHERE request_count > 0".to_string(),
@@ -206,6 +223,8 @@ impl Store {
             ports,
             products,
             os_guesses,
+            hassh,
+            ja4x,
             abuse,
             scan_levels,
             job_status,
