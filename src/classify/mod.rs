@@ -85,7 +85,7 @@ fn hex(c: u8) -> Option<u8> {
     }
 }
 
-fn percent_decode_once(b: &[u8]) -> Vec<u8> {
+pub(crate) fn percent_decode_once(b: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {

@@ -258,8 +258,8 @@ async fn decoys_answer_first_stage_probes() {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-    let canary = format!("canary-{}", &token.replace('-', "")[..12]);
-    assert!(text.contains(&format!("DB_PASSWORD={canary}")), "{text}");
+    let canary = peephole::canary::value(&token, peephole::canary::Kind::DbPassword);
+    assert!(text.contains(&format!("DB_PASSWORD={canary}\n")), "{text}");
     let resp = reqwest::get(format!("{base}/wp-login.php")).await.unwrap();
     assert_eq!(resp.status(), 200);
     assert!(resp.text().await.unwrap().contains("name=\"pwd\""));
@@ -865,6 +865,7 @@ async fn light_rows_of_requests_in_flight_at_shutdown_are_kept() {
         chrono::Utc::now().timestamp_millis(),
         "GET",
         "/late",
+        None,
         0,
         std::time::Instant::now(),
     );

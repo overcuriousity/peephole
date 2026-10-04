@@ -29,6 +29,12 @@ pub struct NewRequest {
     pub owasp_json: Option<String>,
     /// Fingerprint of the ruleset that classified it (None for claims).
     pub rules: Option<String>,
+    /// The row's time (`YYYY-MM-DD HH:MM:SS`); None: now. The trap passes
+    /// the time it rendered a decoy with.
+    pub ts: Option<String>,
+    pub decoy_v: Option<i64>,
+    /// The site word a version-1 decoy was served under.
+    pub decoy_site: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -71,6 +77,8 @@ pub struct RequestRow {
     pub via_proxy: Option<bool>,
     pub ja4: Option<String>,
     pub rules: Option<String>,
+    pub decoy_v: Option<i64>,
+    pub decoy_site: Option<String>,
 }
 
 /// Distinct refresh intervals; later lookups reuse the last one (over

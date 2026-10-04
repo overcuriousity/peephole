@@ -63,6 +63,12 @@ fn schema() -> SchemaRef {
         b("tls_client_hello"),
         s("ja4", true),
         s("answer", true),
+        i("decoy_v", true),
+        Field::new(
+            "canary_used_from",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        ),
         i("status", true),
         i("unrecorded", false),
         i("weight", false),
@@ -150,6 +156,13 @@ fn batch(schema: SchemaRef, rows: &[ExportRow]) -> Result<RecordBatch> {
         }
         labels.append(true);
     }
+    let mut used_from = ListBuilder::new(StringBuilder::new());
+    for r in rows {
+        for u in &r.canary_used_from {
+            used_from.values().append_value(u);
+        }
+        used_from.append(true);
+    }
     let mut owasp = ListBuilder::new(StringBuilder::new());
     for r in rows {
         for t in &r.owasp {
@@ -188,6 +201,8 @@ fn batch(schema: SchemaRef, rows: &[ExportRow]) -> Result<RecordBatch> {
         bins(rows.iter().map(|r| r.tls_client_hello.as_deref())),
         strs(rows.iter().map(|r| r.ja4.as_deref())),
         strs(rows.iter().map(|r| r.answer.as_deref())),
+        ints(rows.iter().map(|r| r.decoy_v)),
+        Arc::new(used_from.finish()),
         ints(rows.iter().map(|r| r.status)),
         ints(rows.iter().map(|r| Some(r.unrecorded))),
         ints(rows.iter().map(|r| Some(r.weight))),

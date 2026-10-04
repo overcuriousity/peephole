@@ -1,0 +1,11 @@
+200
+content-type: text/html; charset=UTF-8
+
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>dashboard — Administration</title><meta name="robots" content="noindex"></head>
+<body>
+<header><h1>dashboard administration</h1><nav><a href="users">Users</a> · <a href="orders">Orders</a> · <a href="settings">Settings</a> · <a href="logs">Logs</a></nav></header>
+<main><p>Signed in as admin.</p><table><tr><th>Queue</th><td>0 pending</td></tr><tr><th>Cache</th><td>warm</td></tr></table></main>
+</body>
+</html>

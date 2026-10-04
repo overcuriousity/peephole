@@ -79,6 +79,10 @@ pub struct ExportRow {
     pub tls_client_hello: Option<Vec<u8>>,
     pub ja4: Option<String>,
     pub answer: Option<String>,
+    /// Decoy template version of a decoy answer (None: version 0 or no decoy).
+    pub decoy_v: Option<i64>,
+    /// Uids of the rows whose served canaries this row carried.
+    pub canary_used_from: Vec<String>,
     pub status: Option<i64>,
     /// Requests from the IP answered but not recorded since the previous
     /// recorded one (for a light row: drops of its batch, on its last row).
@@ -133,6 +137,8 @@ pub const COLUMNS: &[&str] = &[
     "tls_client_hello",
     "ja4",
     "answer",
+    "decoy_v",
+    "canary_used_from",
     "status",
     "unrecorded",
     "weight",
@@ -288,6 +294,8 @@ impl ExportRow {
             "tls_client_hello": b64(&self.tls_client_hello),
             "ja4": self.ja4,
             "answer": self.answer,
+            "decoy_v": self.decoy_v,
+            "canary_used_from": self.canary_used_from,
             "status": self.status,
             "unrecorded": self.unrecorded,
             "weight": self.weight,
@@ -584,6 +592,7 @@ fn request_row(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let canary_used_from = ctx.canary_used_from.get(&r.id).cloned().unwrap_or_default();
     let mut row = ExportRow {
         kind: "request",
         uid: r.uid.unwrap_or_else(|| r.id.to_string()),
@@ -610,6 +619,8 @@ fn request_row(
         tls_client_hello: r.tls_client_hello,
         ja4: r.ja4,
         answer: r.answer,
+        decoy_v: r.decoy_v,
+        canary_used_from,
         status: r.status,
         unrecorded,
         weight,
@@ -629,13 +640,16 @@ fn skipped_row(s: SkipOut, ctx: &PageContext, cols: &IpCols, opts: &ExportOption
     let unrecorded = if s.last_in_batch { s.dropped } else { 0 };
     let mut row = ExportRow {
         kind: "skipped",
-        uid: format!("{}#{}", s.uid, s.rowid),
+        uid: format!("{}#{}", s.uid, s.row),
         node: node_name(&opts.names, s.origin.as_deref().unwrap_or_default()),
         node_id: node_id(s.origin.as_deref().unwrap_or_default()),
         build: s.build,
         ts_ms: s.ts_ms,
         ip: s.ip,
         method: s.method,
+        answer: s.answer,
+        host: s.host,
+        decoy_v: s.decoy_v,
         path: s.path,
         unrecorded,
         weight: unrecorded + 1,
@@ -679,7 +693,8 @@ async fn next_rows(
             let ips: Vec<String> = page.iter().map(|r| r.ip.clone()).collect();
             let ip_ids: Vec<i64> = page.iter().map(|r| r.ip_id).collect();
             let uids: Vec<String> = page.iter().filter_map(|r| r.uid.clone()).collect();
-            let ctx = store.export_context(&ips, &ip_ids, &uids).await?;
+            let ids: Vec<i64> = page.iter().map(|r| r.id).collect();
+            let ctx = store.export_context(&ips, &ip_ids, &uids, &ids).await?;
             let mut cols: HashMap<i64, IpCols> = HashMap::new();
             Ok(page
                 .into_iter()
@@ -701,7 +716,7 @@ async fn next_rows(
             };
             let ips: Vec<String> = page.iter().map(|r| r.ip.clone()).collect();
             let ip_ids: Vec<i64> = page.iter().map(|r| r.ip_id).collect();
-            let ctx = store.export_context(&ips, &ip_ids, &[]).await?;
+            let ctx = store.export_context(&ips, &ip_ids, &[], &[]).await?;
             let mut cols: HashMap<i64, IpCols> = HashMap::new();
             Ok(page
                 .into_iter()
@@ -1103,11 +1118,156 @@ mod tests {
             ts_ms,
             method: "GET".into(),
             path: path.into(),
+            ..Default::default()
         };
         rec.insert_skip_batch(ip, 3, vec![light(now, "/s1"), light(now + 1, "/s2")])
             .await
             .unwrap();
         (s, dir)
+    }
+
+    #[tokio::test]
+    async fn light_row_uids_are_the_same_on_every_node() {
+        // `<batch uid>#<position in its batch>`: a node-local rowid would
+        // differ between nodes that stored batches in another order.
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let row = |path: &str| crate::cluster::record::SkipRow {
+            ts_ms: now,
+            method: "GET".into(),
+            path: path.into(),
+            ..Default::default()
+        };
+        for ip in ["198.51.100.2", "198.51.100.3"] {
+            s.local()
+                .insert_skip_batch(ip, 0, vec![row("/a"), row("/b")])
+                .await
+                .unwrap();
+        }
+        let out = text(&collect(&s, ExportFilter::default(), Format::Jsonl).await);
+        let mut ends: Vec<String> = out
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .map(|r| {
+                r["uid"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('#')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        ends.sort();
+        assert_eq!(ends, ["1", "1", "2", "2"]);
+    }
+
+    #[tokio::test]
+    async fn a_decoy_light_row_exports_its_answer_and_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        s.local()
+            .insert_skip_batch(
+                "198.51.100.2",
+                0,
+                vec![crate::cluster::record::SkipRow {
+                    ts_ms: chrono::Utc::now().timestamp_millis(),
+                    method: "GET".into(),
+                    path: "/.git/config".into(),
+                    page_token: Some("tok".into()),
+                    host: Some("203.0.113.7".into()),
+                    answer: Some("decoy:git-config".into()),
+                    decoy_v: Some(1),
+                    decoy_site: Some("shop".into()),
+                }],
+            )
+            .await
+            .unwrap();
+        let out = text(&collect(&s, ExportFilter::default(), Format::Jsonl).await);
+        let row: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        assert_eq!(row["kind"], "skipped");
+        assert_eq!(row["answer"], "decoy:git-config");
+        assert_eq!(row["host"], "203.0.113.7");
+        assert_eq!(row["decoy_v"], 1);
+        assert!(!out.contains("\"tok\""), "the page token stays internal");
+    }
+
+    #[tokio::test]
+    async fn export_names_decoy_version_and_canary_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = crate::store::data::Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        let rec = |uid: &str, path: &str, headers: String, answer: &str, v: Option<i64>| {
+            crate::cluster::record::Record::Request(Box::new(crate::cluster::record::RequestRec {
+                uid: uid.into(),
+                ts: "2026-10-04 10:00:00".into(),
+                ip: "198.51.100.1".into(),
+                method: "GET".into(),
+                path: path.into(),
+                headers_json: headers,
+                labels_json: "[]".into(),
+                page_token: Some(format!("tok-{uid}")),
+                answer: Some(answer.into()),
+                decoy_v: v,
+                ..Default::default()
+            }))
+        };
+        crate::store::data::apply(
+            &mut conn,
+            ctx,
+            &rec(
+                "srv",
+                "/.git/config",
+                "[]".into(),
+                "decoy:git-config",
+                Some(1),
+            ),
+        )
+        .await
+        .unwrap();
+        let token = crate::canary::value("tok-srv", crate::canary::Kind::GitToken);
+        let auth = data_encoding::BASE64.encode(format!("deploy:{token}").as_bytes());
+        crate::store::data::apply(
+            &mut conn,
+            ctx,
+            &rec(
+                "use",
+                "/x",
+                format!(r#"[["authorization","Basic {auth}"]]"#),
+                "not-found",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        let out = text(&collect(&s, ExportFilter::default(), Format::Jsonl).await);
+        let rows: Vec<serde_json::Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let srv = rows.iter().find(|r| r["uid"] == "srv").unwrap();
+        let used = rows.iter().find(|r| r["uid"] == "use").unwrap();
+        assert_eq!(srv["decoy_v"], 1);
+        assert_eq!(used["decoy_v"], serde_json::Value::Null);
+        assert_eq!(used["canary_used_from"], serde_json::json!(["srv"]));
+        assert_eq!(srv["canary_used_from"], serde_json::json!([]));
+        assert!(
+            !rows.iter().any(|r| r.to_string().contains(&token)),
+            "canary values are not exported"
+        );
+        assert!(COLUMNS.contains(&"decoy_v") && COLUMNS.contains(&"canary_used_from"));
     }
 
     #[tokio::test]
@@ -1267,6 +1427,7 @@ mod tests {
             ts_ms,
             method: "GET".into(),
             path: path.into(),
+            ..Default::default()
         };
         s.local()
             .insert_skip_batch(

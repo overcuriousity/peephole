@@ -34,12 +34,15 @@ pub struct ReqRow {
     pub ja4: Option<String>,
     pub build: String,
     pub rules: Option<String>,
+    pub decoy_v: Option<i64>,
 }
 
 /// A light row with its batch.
 #[derive(sqlx::FromRow)]
 pub struct SkipOut {
     pub rowid: i64,
+    /// Its position in its batch, from 1: the same on every node.
+    pub row: i64,
     pub ts_ms: i64,
     pub method: String,
     pub path: String,
@@ -49,6 +52,10 @@ pub struct SkipOut {
     pub origin: Option<Vec<u8>>,
     pub build: String,
     pub dropped: i64,
+    pub decoy_v: Option<i64>,
+    /// Set when the request was answered with a decoy.
+    pub answer: Option<String>,
+    pub host: Option<String>,
     /// The batch's last light row (it carries the batch's drops).
     pub last_in_batch: bool,
 }
@@ -113,6 +120,9 @@ pub struct PageContext {
     pub intel: HashMap<String, Vec<IntelOut>>,
     pub scans: HashMap<i64, Vec<(ScanOut, Vec<PortOut>)>>,
     pub fingerprints: HashMap<String, Vec<FpOut>>,
+    /// Per request id: the uids of the rows whose served canaries it
+    /// carried (light rows as `<batch uid>#<row>`).
+    pub canary_used_from: HashMap<i64, Vec<String>>,
     /// IPs that filed a false-positive claim.
     pub claimed: HashSet<i64>,
 }
@@ -135,7 +145,7 @@ impl Store {
             "SELECT r.id, r.uid, r.origin, r.ts, r.ip_id, i.ip, r.method, r.path, r.query,
                     r.headers_json, r.body, r.labels_json, r.owasp_json, r.severity, r.scan_level, r.answer,
                     r.status, r.unrecorded, r.transport, r.via_proxy, r.raw_head,
-                    r.tls_client_hello, r.ja4, r.build, r.rules
+                    r.tls_client_hello, r.ja4, r.build, r.rules, r.decoy_v
              FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1",
         );
         if after.is_some() {
@@ -183,8 +193,11 @@ impl Store {
         limit: i64,
     ) -> Result<Vec<SkipOut>> {
         let mut sql = String::from(
-            "SELECT s.rowid AS rowid, s.ts_ms, s.method, s.path, b.ip_id, i.ip, b.uid, b.origin,
-                    b.build, b.dropped,
+            "SELECT s.rowid AS rowid,
+                    (SELECT COUNT(*) FROM skipped_requests x
+                     WHERE x.batch_id = s.batch_id AND x.rowid <= s.rowid) AS row,
+                    s.ts_ms, s.method, s.path, b.ip_id, i.ip, b.uid, b.origin,
+                    b.build, b.dropped, s.decoy_v, s.answer, s.host,
                     s.rowid = (SELECT MAX(x.rowid) FROM skipped_requests x
                                WHERE x.batch_id = s.batch_id) AS last_in_batch
              FROM skipped_requests s JOIN skipped_batches b ON b.id = s.batch_id
@@ -220,6 +233,7 @@ impl Store {
         ips: &[String],
         ip_ids: &[i64],
         request_uids: &[String],
+        request_ids: &[i64],
     ) -> Result<PageContext> {
         let mut c = PageContext::default();
         let intel: Vec<IntelOut> = sqlx::query_as(
@@ -279,6 +293,23 @@ impl Store {
         .fetch_all(&self.read)
         .await?;
         c.claimed = claimed.into_iter().collect();
+        let used: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT DISTINCT t.request_id,
+                    COALESCE(sr.uid, CAST(sr.id AS TEXT), sb.uid || '#' || c.skip_row)
+             FROM request_tokens t
+             JOIN canaries c ON c.value_hash = t.value_hash
+             LEFT JOIN requests sr ON sr.id = c.request_id
+             LEFT JOIN skipped_batches sb ON sb.id = c.batch_id
+             WHERE t.request_id IN (SELECT value FROM json_each(?))
+               AND (c.request_id IS NULL OR c.request_id != t.request_id)
+             ORDER BY 1, 2",
+        )
+        .bind(json_list(request_ids))
+        .fetch_all(&self.read)
+        .await?;
+        for (id, uid) in used {
+            c.canary_used_from.entry(id).or_default().push(uid);
+        }
         Ok(c)
     }
 }

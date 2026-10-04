@@ -24,6 +24,18 @@
     {% if let Some(ua) = user_agent %}<dl class="req-facts req-ua"><div><dt>User-Agent</dt><dd class="mono">{{ ua }}{% let value = ua.as_str() %}{% let what = "user agent" %}{% let subtle = false %}{% include "_copy.html" %}</dd></div></dl>{% endif %}
   </section>
   <section class="card"><h2>Labels</h2><div class="chips">{% for l in labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}" title="{{ crate::admin::views::family_name(crate::classify::label_family(l)) }}">{{ l }}</span>{% endfor %}{% for o in owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }} · {{ crate::admin::views::owasp_name(o) }}</span>{% endfor %}{% if labels.is_empty() && owasp.is_empty() %}<span class="muted">none</span>{% endif %}</div></section>
+  {% if !served.is_empty() %}<section class="card" id="canaries"><div class="card-head"><h2>Canaries served</h2><span class="muted">{{ served.len() }}{% if let Some(h) = return_host %} · links point to <span class="mono">{{ h }}</span>{% endif %}</span></div>
+    <table class="table"><thead><tr><th>Kind</th><th>Value</th></tr></thead><tbody>
+    {% for (k, v) in served %}<tr><td>{{ k }}</td><td class="mono">{{ v }}</td></tr>{% endfor %}
+    </tbody></table></section>{% endif %}
+  {% if !reuses.is_empty() %}<section class="card" id="canary-reuse"><h2>Canary reuse</h2>
+    <table class="table"><thead><tr><th>Harvested</th><th>Used</th><th>Kind</th><th>Where</th><th>Δt</th></tr></thead><tbody>
+    {% for r in reuses %}<tr>
+      <td>{% if let Some(s) = r.served_request_id %}<a href="/admin/requests/{{ s }}">#{{ s }}</a>{% else %}light row{% endif %} · <a href="/ip/{{ r.served_ip }}">{{ r.served_ip }}</a>{% if let Some(n) = r.served_node %} · <span class="muted">{{ n }}</span>{% endif %}</td>
+      <td><a href="/admin/requests/{{ r.used_request_id }}">#{{ r.used_request_id }}</a> · <a href="/ip/{{ r.used_ip }}">{{ r.used_ip }}</a>{% if r.same_source %} <span class="badge">same source</span>{% endif %}</td>
+      <td>{{ r.kind }}</td><td class="mono">{{ r.place }}</td><td>{{ crate::admin::views::duration(r.delta_s) }}</td>
+    </tr>{% endfor %}
+    </tbody></table></section>{% endif %}
   {% if let Some(q) = d.row.query %}<section class="card"><h2>Query string</h2><pre class="panel">{{ q }}</pre></section>{% endif %}
   <section class="card"><h2>Headers <span class="muted">in received order</span></h2>
     <dl class="kv">{% for (k, v) in d.headers %}<dt>{{ k }}</dt><dd>{{ v }}</dd>{% endfor %}</dl></section>

@@ -2,6 +2,7 @@ pub mod analytics;
 pub mod auth;
 pub mod blocklist;
 pub mod browse;
+pub mod canaries;
 pub mod cli;
 pub mod data;
 pub mod delete;
@@ -30,6 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_initial.sql"),
     include_str!("migrations/0002_host_keys.sql"),
+    include_str!("migrations/0003_canaries.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of

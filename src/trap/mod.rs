@@ -1,5 +1,5 @@
 mod config;
-mod decoy;
+pub mod decoy;
 mod flood;
 pub mod listen;
 mod pages;
@@ -533,6 +533,10 @@ struct Capture<'a> {
     body: Option<Vec<u8>>,
     is_fp_claim: bool,
     page_token: String,
+    /// The row's time, as the decoy was rendered with.
+    ts: String,
+    decoy_v: Option<i64>,
+    decoy_site: Option<String>,
     /// How the request is answered: `not-found`, `decoy:<name>`, `claim`.
     answer: String,
     status: u16,
@@ -696,6 +700,9 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 ja4: c.conn.as_ref().and_then(|k| k.ja4.clone()),
                 // Claims are not classified.
                 rules: (!c.is_fp_claim).then(|| state.classifier.fingerprint().to_string()),
+                ts: Some(c.ts),
+                decoy_v: c.decoy_v,
+                decoy_site: c.decoy_site,
             },
         )
         .await?;
@@ -786,14 +793,34 @@ async fn trap(
 ) -> Response {
     let ip = client_ip(&parts.headers, peer.ip(), &state.cfg.trusted_proxies);
     let page_token = uuid::Uuid::new_v4().to_string();
-    // Decided before recording, so the row says what was sent.
-    let decoy = decoy::decoy(
-        parts.method.as_str(),
-        parts.uri.path(),
-        &page_token.replace('-', "")[..12],
-    );
+    // One time for the row and the decoy, so the row renders it again.
+    let now = chrono::Utc::now();
+    let headers = header_pairs(&parts.headers);
+    // The same order the row is rendered again with (`request_host` over
+    // the stored headers, where `:authority` is the URI's authority).
+    let host =
+        crate::canary::site::served_host(&headers, parts.uri.authority().map(|a| a.as_str()));
+    let method = parts.method.as_str();
+    let path = parts.uri.path();
+    let presented = presented(&state, &headers, method, path, &body.bytes).await;
+    let node_id = state.recorder.node_id();
+    let word = crate::canary::site::word(node_id.as_ref().map(|n| &n.0[..]));
+    let decoy = decoy::choose(method, path, parts.uri.query(), presented, word).and_then(|name| {
+        decoy::render(
+            &decoy::Input {
+                v: crate::canary::DECOY_V,
+                page_token: &page_token,
+                host: host.as_deref(),
+                word,
+                ts: now.timestamp(),
+                method,
+                path,
+            },
+            name,
+        )
+    });
     let (answer, status) = match &decoy {
-        Some(d) => (format!("decoy:{}", d.name), 200),
+        Some(d) => (format!("decoy:{}", d.name), d.status),
         None => ("not-found".to_string(), 404),
     };
     // Recorded apart from the answer: hyper drops this future when the
@@ -806,23 +833,92 @@ async fn trap(
         ip,
         parts,
         body,
-        page_token.clone(),
-        answer,
-        status,
+        Served {
+            page_token: page_token.clone(),
+            answer,
+            status,
+            now,
+            host,
+            decoy_v: decoy.is_some().then_some(crate::canary::DECOY_V),
+            word,
+        },
     ));
     if let Some(d) = decoy {
-        return (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, d.content_type)],
+        let mut resp = (
+            StatusCode::from_u16(d.status).unwrap_or(StatusCode::OK),
             d.body,
         )
             .into_response();
+        for (k, v) in d.headers {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&v) {
+                resp.headers_mut().insert(k, v);
+            }
+        }
+        return resp;
     }
     (
         StatusCode::NOT_FOUND,
         Html(pages::trap_page(&page_token, &state.cfg.trap.helper_prefix)),
     )
         .into_response()
+}
+
+/// What the trap sent, for the row.
+struct Served {
+    page_token: String,
+    answer: String,
+    status: u16,
+    now: chrono::DateTime<chrono::Utc>,
+    host: Option<String>,
+    decoy_v: Option<i64>,
+    /// The site word the decoy was served under.
+    word: &'static str,
+}
+
+/// The credential tokens whose canary would change this request's answer:
+/// `Authorization` anywhere (a Basic canary opens the admin page), `Cookie`
+/// only under `/wp-admin`, the body only on a wp-login POST. Anything else
+/// costs no lookup, so cookie-carrying crawlers stay on the cheap path.
+fn credentials(
+    headers: &[(String, String)],
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Vec<(String, i64)> {
+    let wp_admin = path == "/wp-admin" || path.starts_with("/wp-admin/");
+    let login_post = method == "POST" && path.rsplit('/').next() == Some("wp-login.php");
+    let kept: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(k, _)| wp_admin || !k.eq_ignore_ascii_case("cookie"))
+        .cloned()
+        .collect();
+    crate::canary::tokens::of_credentials(&kept, login_post.then_some(body))
+}
+
+/// Which credential places carried a canary this node knows.
+async fn presented(
+    state: &TrapState,
+    headers: &[(String, String)],
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> decoy::Presented {
+    let tokens = credentials(headers, method, path, body);
+    if tokens.is_empty() {
+        return decoy::Presented::default();
+    }
+    let hashes: Vec<i64> = tokens.iter().map(|(_, h)| *h).collect();
+    let known = state
+        .store
+        .known_canaries(&hashes)
+        .await
+        .unwrap_or_default();
+    let at = |place: &str| tokens.iter().any(|(p, h)| p == place && known.contains(h));
+    decoy::Presented {
+        basic: at("header:authorization"),
+        cookie: at("header:cookie"),
+        body: at("body"),
+    }
 }
 
 /// The recording part of [`trap_handler`]: a full row, or a light row when
@@ -835,9 +931,7 @@ async fn record_trap(
     ip: IpAddr,
     parts: axum::http::request::Parts,
     body: ReadBody,
-    page_token: String,
-    answer: String,
-    status: u16,
+    served: Served,
 ) {
     let method = parts.method.as_str();
     let path = parts.uri.path();
@@ -859,11 +953,19 @@ async fn record_trap(
     } = body;
     match admission {
         flood::Admission::Skip => {
+            let decoy = served.decoy_v.map(|v| skiplog::SkipDecoy {
+                page_token: served.page_token.clone(),
+                host: served.host.clone(),
+                answer: served.answer.clone(),
+                decoy_v: v,
+                site: served.word.to_string(),
+            });
             let full = state.guards.skips.note(
                 ip,
-                chrono::Utc::now().timestamp_millis(),
+                served.now.timestamp_millis(),
                 method,
                 path,
+                decoy,
                 state.cfg.trap.skip_log_rate,
                 Instant::now(),
             );
@@ -903,9 +1005,12 @@ async fn record_trap(
                 raw_headers: &raw,
                 body: (!body.is_empty()).then(|| body.clone()),
                 is_fp_claim: false,
-                page_token,
-                answer,
-                status,
+                page_token: served.page_token,
+                ts: served.now.format("%Y-%m-%d %H:%M:%S").to_string(),
+                decoy_v: served.decoy_v,
+                decoy_site: served.decoy_v.map(|_| served.word.to_string()),
+                answer: served.answer,
+                status: served.status,
                 unrecorded,
                 conn: parts
                     .extensions
@@ -985,6 +1090,9 @@ async fn claim_handler(
             body: None,
             is_fp_claim: true,
             page_token: uuid::Uuid::new_v4().to_string(),
+            ts: crate::store::data::now_ts(),
+            decoy_v: None,
+            decoy_site: None,
             answer: "claim".into(),
             status: 200,
             unrecorded: 0,
@@ -1219,6 +1327,26 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_credentials_that_change_the_answer_cost_a_lookup() {
+        let h = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        let cookie = h(&[("cookie", "s=Zx8kQ2mPvR4tW6yB1nC3")]);
+        let auth = h(&[("authorization", "Bearer Zx8kQ2mPvR4tW6yB1nC3")]);
+        let body = b"pwd=Zx8kQ2mPvR4tW6yB1nC3";
+        // A cookie jar on any page but wp-admin: nothing to look up.
+        assert!(credentials(&cookie, "GET", "/", body).is_empty());
+        assert!(!credentials(&cookie, "GET", "/wp-admin/", body).is_empty());
+        // Authorization opens the admin page anywhere.
+        assert!(!credentials(&auth, "GET", "/", body).is_empty());
+        // A body only on a wp-login POST.
+        assert!(credentials(&[], "POST", "/contact", body).is_empty());
+        assert!(!credentials(&[], "POST", "/blog/wp-login.php", body).is_empty());
+    }
 
     fn hm(entries: &[&str]) -> HeaderMap {
         let mut h = HeaderMap::new();

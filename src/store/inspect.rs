@@ -481,6 +481,7 @@ mod tests {
             ts_ms,
             method: "GET".into(),
             path: "/".into(),
+            ..Default::default()
         };
         s.local()
             .insert_skip_batch("203.0.113.1", 4, vec![row(1), row(2)])

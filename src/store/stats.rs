@@ -6,11 +6,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum Range {
     H24,
     D7,
     D30,
+    #[default]
     All,
 }
 
@@ -159,6 +160,20 @@ pub struct Stats {
     #[serde(skip_serializing)]
     pub recent: Vec<RecentRequest>,
     pub intel: HashMap<String, String>,
+    /// Harvest to first use of the canaries served in the range; only from
+    /// [`CANARY_TILE_MIN`] reuses up, so no single event shows.
+    pub canaries: Option<CanaryTile>,
+}
+
+/// Fewest reused harvests (distinct decoy answers) before the wall shows
+/// the canary tile.
+pub const CANARY_TILE_MIN: i64 = 5;
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CanaryTile {
+    pub median_s: i64,
+    pub share_pct: i64,
+    pub reused: i64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -489,6 +504,14 @@ impl Store {
         .await?
         .into_iter()
         .collect();
+        let sum = self.canary_summary(r).await?;
+        // Counted per harvest, not per value: one request carrying many
+        // values of one decoy is one event.
+        let canaries = (sum.harvests_reused >= CANARY_TILE_MIN).then(|| CanaryTile {
+            median_s: sum.harvest_median_s.unwrap_or(0),
+            share_pct: sum.harvest_share_pct(),
+            reused: sum.harvests_reused,
+        });
         Ok(Stats {
             range: r.key(),
             generated_at: chrono::Utc::now().to_rfc3339(),
@@ -513,6 +536,7 @@ impl Store {
             scanned_ips,
             recent,
             intel,
+            canaries,
         })
     }
 

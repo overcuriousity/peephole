@@ -1,0 +1,5 @@
+302
+content-type: text/html; charset=UTF-8
+location: /wp-admin/
+set-cookie: wordpress_logged_in_97393f78113b2863c34f0c8d425c7f0e=admin%7C1791172800%7Cm3jbYnElNPvyUps07E20wPesvLEGj70Z3WD5NM4bJjy%7C10f8652628856b27d9a6d6fe0b080161ebe502ef6966cd4f8c4ca5f2fd096f6c; path=/; HttpOnly
+

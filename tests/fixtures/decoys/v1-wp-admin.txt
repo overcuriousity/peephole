@@ -1,0 +1,20 @@
+200
+content-type: text/html; charset=UTF-8
+
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<title>Dashboard &lsaquo; dashboard &#8212; WordPress</title>
+<meta name="robots" content="noindex, noarchive">
+</head>
+<body class="wp-admin wp-core-ui no-js index-php">
+<div id="wpwrap"><div id="adminmenumain"><ul id="adminmenu">
+<li><a href="index.php">Dashboard</a></li><li><a href="edit.php">Posts</a></li><li><a href="upload.php">Media</a></li>
+<li><a href="plugins.php">Plugins</a></li><li><a href="users.php">Users</a></li><li><a href="options-general.php">Settings</a></li>
+</ul></div>
+<div id="wpcontent"><div id="wpbody-content"><div class="wrap"><h1>Dashboard</h1>
+<div id="welcome-panel" class="welcome-panel"><h2>Welcome to WordPress!</h2></div>
+</div></div></div></div>
+</body>
+</html>

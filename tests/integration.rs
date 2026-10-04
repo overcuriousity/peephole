@@ -2211,3 +2211,377 @@ secure_cookies = false
         .unwrap();
     assert_eq!(r.status(), 404);
 }
+
+/// The canary a decoy served, read back from the store like a harvester
+/// would read it from the body.
+async fn served_value(store: &Store, path: &str, kind: peephole::canary::Kind) -> String {
+    let tok: String = sqlx::query_scalar(
+        "SELECT page_token FROM requests WHERE path = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(path)
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    peephole::canary::value(&tok, kind)
+}
+
+async fn answer_of(store: &Store, path: &str) -> String {
+    sqlx::query_scalar("SELECT answer FROM requests WHERE path = ? ORDER BY id DESC LIMIT 1")
+        .bind(path)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn harvested_credentials_open_the_decoy_logins() {
+    let (base, store, _dir) = spawn_trap().await;
+    let c = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let xff = ("x-forwarded-for", "203.0.113.20");
+    let env = c
+        .get(format!("{base}/.env"))
+        .header(xff.0, xff.1)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let admin_pw = served_value(&store, "/.env", peephole::canary::Kind::AdminPassword).await;
+    assert!(env.contains(&format!("ADMIN_PASSWORD={admin_pw}\n")));
+
+    // Basic with the harvested password, from another address.
+    let r = c
+        .get(format!("{base}/admin/"))
+        .basic_auth("admin", Some(&admin_pw))
+        .header("x-forwarded-for", "203.0.113.21")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(answer_of(&store, "/admin/").await, "decoy:admin");
+
+    // wp-login with it: a session cookie that opens wp-admin.
+    let r = c
+        .post(format!("{base}/wp-login.php"))
+        .form(&[("log", "admin"), ("pwd", admin_pw.as_str())])
+        .header(xff.0, xff.1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 302);
+    assert_eq!(
+        answer_of(&store, "/wp-login.php").await,
+        "decoy:wp-login-ok"
+    );
+    let cookie = r.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let r = c
+        .get(format!("{base}/wp-admin/"))
+        .header("cookie", &cookie)
+        .header("x-forwarded-for", "203.0.113.22")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("Dashboard"));
+    assert_eq!(answer_of(&store, "/wp-admin/").await, "decoy:wp-admin");
+
+    // A wrong password stays a failed login.
+    let r = c
+        .post(format!("{base}/wp-login.php"))
+        .form(&[("log", "admin"), ("pwd", "Wr0ngPassw0rdWr0ng12")])
+        .header(xff.0, xff.1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        answer_of(&store, "/wp-login.php").await,
+        "decoy:wp-login-failed"
+    );
+}
+
+#[tokio::test]
+async fn git_clone_with_the_harvested_token_reaches_the_refs() {
+    let (base, store, _dir) = spawn_trap().await;
+    let c = reqwest::Client::new();
+    let cfg = c
+        .get(format!("{base}/.git/config"))
+        .header("x-forwarded-for", "203.0.113.30")
+        .header("host", "203.0.113.5")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let token = served_value(&store, "/.git/config", peephole::canary::Kind::GitToken).await;
+    let url = cfg
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("url = "))
+        .unwrap()
+        .to_string();
+    assert!(
+        url.starts_with(&format!("http://deploy:{token}@203.0.113.5/git/")),
+        "{url}"
+    );
+    let repo_path = &url[url.find("/git/").unwrap()..];
+    let refs = format!("{base}{repo_path}/info/refs?service=git-upload-pack");
+    let r = c
+        .get(&refs)
+        .header("x-forwarded-for", "203.0.113.31")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    assert!(r.headers().contains_key("www-authenticate"));
+    let r = c
+        .get(&refs)
+        .basic_auth("deploy", Some(&token))
+        .header("x-forwarded-for", "203.0.113.31")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("refs/heads/main"));
+}
+
+#[tokio::test]
+async fn canary_free_requests_answer_as_before() {
+    let (base, store, _dir) = spawn_trap().await;
+    let c = reqwest::Client::new();
+    for (method, path, status) in [
+        ("GET", "/admin/", 404),
+        ("GET", "/wp-admin/", 404),
+        ("HEAD", "/.env", 200),
+        ("GET", "/.git/HEAD", 200),
+        ("GET", "/nothing", 404),
+    ] {
+        let r = c
+            .request(method.parse().unwrap(), format!("{base}{path}"))
+            .basic_auth("admin", Some("NotACanaryNotACanary"))
+            .header("x-forwarded-for", "203.0.113.40")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), status, "{method} {path}");
+    }
+    let v: Option<i64> =
+        sqlx::query_scalar("SELECT decoy_v FROM requests WHERE path = '/.git/HEAD'")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(v, Some(peephole::canary::DECOY_V));
+    let v: Option<i64> = sqlx::query_scalar("SELECT decoy_v FROM requests WHERE path = '/nothing'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(v, None);
+}
+
+#[tokio::test]
+async fn request_and_ip_pages_show_canary_reuse() {
+    let (base, store, dir) = spawn_trap().await;
+    let c = reqwest::Client::new();
+    c.get(format!("{base}/.git/config"))
+        .header("x-forwarded-for", "203.0.113.60")
+        .send()
+        .await
+        .unwrap();
+    let token = served_value(&store, "/.git/config", peephole::canary::Kind::GitToken).await;
+    c.get(format!("{base}/x"))
+        .basic_auth("deploy", Some(&token))
+        .header("x-forwarded-for", "203.0.113.61")
+        .send()
+        .await
+        .unwrap();
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (admin, admin_base) = enrolled_admin_client(store.clone(), cfg).await;
+    let served: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/.git/config'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    let used: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/x'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    let page = admin
+        .get(format!("{admin_base}/admin/requests/{served}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("Canaries served") && page.contains(&token),
+        "{page}"
+    );
+    assert!(page.contains("203.0.113.61"));
+    let page = admin
+        .get(format!("{admin_base}/admin/requests/{used}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains(&format!("/admin/requests/{served}"))
+            && page.contains("header:authorization")
+    );
+    let ip = admin
+        .get(format!("{admin_base}/ip/203.0.113.60"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(ip.contains("used by 1 other IP"), "{ip}");
+    // Nothing of it on the public IP page.
+    let public = reqwest::get(format!("{admin_base}/ip/203.0.113.60"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!public.contains("Canar") && !public.contains(&token));
+}
+
+#[tokio::test]
+async fn canaries_page_lists_reuses_and_filters() {
+    let (base, store, dir) = spawn_trap().await;
+    let c = reqwest::Client::new();
+    c.get(format!("{base}/.git/config"))
+        .header("x-forwarded-for", "203.0.113.70")
+        .send()
+        .await
+        .unwrap();
+    let token = served_value(&store, "/.git/config", peephole::canary::Kind::GitToken).await;
+    c.get(format!("{base}/x"))
+        .basic_auth("deploy", Some(&token))
+        .header("x-forwarded-for", "203.0.113.71")
+        .send()
+        .await
+        .unwrap();
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (admin, admin_base) = enrolled_admin_client(store.clone(), cfg).await;
+    let page = admin
+        .get(format!("{admin_base}/admin/canaries?range=all"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("203.0.113.71") && page.contains("git-token"),
+        "{page}"
+    );
+    let page = admin
+        .get(format!("{admin_base}/admin/canaries?range=all&source=same"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!page.contains("203.0.113.71"));
+    // An IP the store does not know matches nothing, not everything.
+    let page = admin
+        .get(format!(
+            "{admin_base}/admin/canaries?range=all&ip=198.51.100.250"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!page.contains("203.0.113.71"), "{page}");
+    let nav = admin
+        .get(format!("{admin_base}/admin"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(nav.contains("href=\"/admin/canaries\""));
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    assert_ne!(
+        anon.get(format!("{admin_base}/admin/canaries"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn a_served_decoy_renders_again_from_its_row() {
+    let (base, store, _dir) = spawn_trap().await;
+    let body = reqwest::Client::new()
+        .get(format!("{base}/.env"))
+        .header("x-forwarded-for", "203.0.113.50")
+        .header("host", "shop.example.org")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let uid: String = sqlx::query_scalar("SELECT uid FROM requests WHERE path = '/.env'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    let again = peephole::canary::cli::render_uid(&store, &uid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.body, body);
+}
+
+/// A decoy served standalone renders the same after the node adopted its
+/// history into a cluster (which sets the row's origin).
+#[tokio::test]
+async fn a_decoy_renders_the_same_after_adoption() {
+    let (base, store, _dir) = spawn_trap().await;
+    let body = reqwest::Client::new()
+        .get(format!("{base}/.env"))
+        .header("x-forwarded-for", "203.0.113.80")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    sqlx::query("UPDATE requests SET origin = ? WHERE path = '/.env'")
+        .bind(vec![9u8; 32])
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let uid: String = sqlx::query_scalar("SELECT uid FROM requests WHERE path = '/.env'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    let again = peephole::canary::cli::render_uid(&store, &uid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.body, body);
+}

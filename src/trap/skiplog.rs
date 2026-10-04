@@ -59,6 +59,17 @@ fn pending(now: Instant) -> Pending {
     }
 }
 
+/// What a light row keeps when its request was answered with a decoy.
+#[derive(Debug, Clone)]
+pub struct SkipDecoy {
+    pub page_token: String,
+    pub host: Option<String>,
+    pub answer: String,
+    pub decoy_v: i64,
+    /// The site word it was served under.
+    pub site: String,
+}
+
 impl SkipLog {
     /// Note a skipped request. Past `rate` light rows per source and second
     /// (0: no limit) it is only counted, against its own address when that
@@ -67,12 +78,14 @@ impl SkipLog {
     /// batch once it is full. The number of addresses buffered is not
     /// capped here: [`SkipLog::take_older`] flushes them all past
     /// [`MAX_TRACKED`].
+    #[allow(clippy::too_many_arguments)]
     pub fn note(
         &self,
         ip: IpAddr,
         ts_ms: i64,
         method: &str,
         path: &str,
+        decoy: Option<SkipDecoy>,
         rate: u32,
         now: Instant,
     ) -> Option<Batch> {
@@ -111,6 +124,13 @@ impl SkipLog {
             ts_ms,
             method: cut(method, 64).to_string(),
             path: cut(path, SKIP_PATH_MAX).to_string(),
+            page_token: decoy.as_ref().map(|d| d.page_token.clone()),
+            host: decoy
+                .as_ref()
+                .and_then(|d| d.host.as_deref().map(|h| cut(h, 255).to_string())),
+            answer: decoy.as_ref().map(|d| d.answer.clone()),
+            decoy_v: decoy.as_ref().map(|d| d.decoy_v),
+            decoy_site: decoy.as_ref().map(|d| d.site.clone()),
         });
         if p.rows.len() >= SKIP_BATCH_MAX {
             return map.remove(&ip).map(|p| batch(ip, p));
@@ -166,16 +186,22 @@ mod tests {
         let s = SkipLog::default();
         let now = Instant::now();
         for i in 0..150 {
-            assert!(s.note(ip(), 1_000_000 + i, "GET", "/x", 100, now).is_none());
+            assert!(
+                s.note(ip(), 1_000_000 + i, "GET", "/x", None, 100, now)
+                    .is_none()
+            );
         }
         // The next second has room again.
-        assert!(s.note(ip(), 1_001_000, "GET", "/y", 100, now).is_none());
+        assert!(
+            s.note(ip(), 1_001_000, "GET", "/y", None, 100, now)
+                .is_none()
+        );
         let b = s.take(ip()).unwrap();
         assert_eq!((b.rows.len(), b.dropped), (101, 50));
         assert!(s.take(ip()).is_none());
         // Past the rate with nothing pending (just taken): a row, never a
         // count without one.
-        s.note(ip(), 1_001_500, "GET", "/z", 1, now);
+        s.note(ip(), 1_001_500, "GET", "/z", None, 1, now);
         let b = s.take(ip()).unwrap();
         assert_eq!((b.rows.len(), b.dropped), (1, 0));
     }
@@ -187,7 +213,7 @@ mod tests {
         let v6 = |i: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, i));
         for i in 0..150 {
             assert!(
-                s.note(v6(i), 1_000_000 + i64::from(i), "GET", "/x", 100, now)
+                s.note(v6(i), 1_000_000 + i64::from(i), "GET", "/x", None, 100, now)
                     .is_none()
             );
         }
@@ -199,13 +225,13 @@ mod tests {
         assert_eq!(rows, 100);
         let s = SkipLog::default();
         for i in 0..150 {
-            s.note(v6(i), 1_000_000 + i64::from(i), "GET", "/x", 100, now);
+            s.note(v6(i), 1_000_000 + i64::from(i), "GET", "/x", None, 100, now);
         }
         let last = s.take(v6(99)).unwrap();
         assert_eq!((last.rows.len(), last.dropped), (1, 50));
         // Another /64 has its own rate.
         let other: IpAddr = "2001:db8:0:2::1".parse().unwrap();
-        s.note(other, 1_000_000, "GET", "/y", 100, now);
+        s.note(other, 1_000_000, "GET", "/y", None, 100, now);
         assert_eq!(s.take(other).unwrap().rows.len(), 1);
     }
 
@@ -216,7 +242,7 @@ mod tests {
         let mut got = None;
         for i in 0..1000 {
             assert!(got.is_none());
-            got = s.note(ip(), i * 1000, "GET", "/x", 0, now);
+            got = s.note(ip(), i * 1000, "GET", "/x", None, 0, now);
         }
         assert_eq!(got.unwrap().rows.len(), 1000);
         assert!(s.take(ip()).is_none());
@@ -225,7 +251,7 @@ mod tests {
     #[test]
     fn long_paths_are_cut_on_a_char_boundary() {
         let s = SkipLog::default();
-        s.note(ip(), 0, "GET", &"é".repeat(600), 0, Instant::now());
+        s.note(ip(), 0, "GET", &"é".repeat(600), None, 0, Instant::now());
         let b = s.take(ip()).unwrap();
         assert!(b.rows[0].path.len() <= 1024);
         assert!(b.rows[0].path.starts_with('é'));
@@ -235,12 +261,30 @@ mod tests {
     fn old_batches_are_taken_and_young_ones_stay() {
         let s = SkipLog::default();
         let t0 = Instant::now();
-        s.note(ip(), 0, "GET", "/a", 0, t0);
+        s.note(ip(), 0, "GET", "/a", None, 0, t0);
         let other: IpAddr = "192.0.2.2".parse().unwrap();
-        s.note(other, 0, "GET", "/b", 0, t0 + Duration::from_secs(8));
+        s.note(other, 0, "GET", "/b", None, 0, t0 + Duration::from_secs(8));
         let old = s.take_older(Duration::from_secs(10), t0 + Duration::from_secs(11));
         assert_eq!(old.len(), 1);
         assert_eq!(old[0].ip, ip());
         assert!(s.take(other).is_some());
+    }
+
+    #[test]
+    fn a_decoy_light_row_keeps_its_trace() {
+        let log = SkipLog::default();
+        let ip: IpAddr = "198.51.100.5".parse().unwrap();
+        let d = SkipDecoy {
+            page_token: "t".into(),
+            host: Some("203.0.113.7".into()),
+            answer: "decoy:git-config".into(),
+            decoy_v: 1,
+            site: "shop".into(),
+        };
+        log.note(ip, 1_000, "GET", "/.git/config", Some(d), 0, Instant::now());
+        let b = log.take(ip).unwrap();
+        assert_eq!(b.rows[0].page_token.as_deref(), Some("t"));
+        assert_eq!(b.rows[0].answer.as_deref(), Some("decoy:git-config"));
+        assert_eq!(b.rows[0].decoy_v, Some(1));
     }
 }

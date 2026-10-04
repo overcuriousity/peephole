@@ -40,6 +40,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/scans/{id}/xml", get(scan_xml))
         .route("/admin/scans/{id}/delete", post(scan_delete))
         .route("/admin/fingerprints", get(fingerprints))
+        .route("/admin/canaries", get(canaries))
         .route("/admin/inbox", get(inbox))
         .route("/admin/claims/{id}/delete", post(claim_delete))
         .route("/admin/export", get(export_page))
@@ -511,6 +512,11 @@ struct RequestPage {
     same_ja4: Vec<RecentRequest>,
     ja4_ips: i64,
     ja4_days: i64,
+    /// Canaries this request was served (kind, value) and where its links point.
+    served: Vec<(String, String)>,
+    return_host: Option<String>,
+    /// Reuses where this request is either side.
+    reuses: Vec<crate::store::canaries::Reuse>,
 }
 
 async fn request_page(
@@ -533,6 +539,36 @@ async fn request_page(
         Some(j) => st.store.related_by_ja4(j, d.row.ip_id).await?,
         None => (vec![], 0),
     };
+    let name = d
+        .row
+        .answer
+        .as_deref()
+        .and_then(|a| a.strip_prefix("decoy:"));
+    let served = match (d.row.page_token.as_deref(), name) {
+        (Some(t), Some(n)) => crate::canary::served(d.row.decoy_v, t, n)
+            .into_iter()
+            .map(|(k, v)| (k.name().to_string(), v))
+            .collect(),
+        _ => vec![],
+    };
+    let return_host = d
+        .row
+        .decoy_site
+        .as_deref()
+        .filter(|_| !served.is_empty())
+        .map(|w| {
+            let site = format!("{w}.internal");
+            crate::canary::site::return_host(crate::canary::site::request_host(&d.headers), &site)
+        });
+    let reuses = st
+        .store
+        .reuses(&crate::store::canaries::ReuseFilter {
+            request: Some(id),
+            range: Range::All,
+            limit: 50,
+            ..Default::default()
+        })
+        .await?;
     let request_target = match &d.row.query {
         Some(q) => format!("{}?{q}", d.row.path),
         None => d.row.path.clone(),
@@ -549,6 +585,9 @@ async fn request_page(
         same_ja4,
         ja4_ips,
         ja4_days: RELATED_JA4_DAYS,
+        served,
+        return_host,
+        reuses,
     })
 }
 
@@ -752,6 +791,68 @@ async fn fingerprints(
         clusters_json: serde_json::to_string(&hubs).unwrap_or_else(|_| "[]".into()),
         clusters,
         host_keys,
+    })
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct CanaryQuery {
+    pub range: Option<String>,
+    pub kind: Option<String>,
+    pub node: Option<String>,
+    /// `same` | `other`; anything else: both.
+    pub source: Option<String>,
+    pub ip: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "admin_canaries.html")]
+struct CanariesPage {
+    chrome: Chrome,
+    range: Range,
+    q: CanaryQuery,
+    sum: crate::store::canaries::CanarySummary,
+    reuses: Vec<crate::store::canaries::Reuse>,
+    kinds: Vec<&'static str>,
+}
+
+async fn canaries(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Query(q): Query<CanaryQuery>,
+) -> AppResult<Html<String>> {
+    let range = Range::parse(q.range.as_deref());
+    // An address the store does not know matches no row (id 0 is never
+    // used), rather than dropping the filter.
+    let ip_id = match q.ip.as_deref().filter(|s| !s.is_empty()) {
+        Some(a) => Some(st.store.ip_by_addr(a).await?.map_or(0, |i| i.id)),
+        None => None,
+    };
+    let filter = crate::store::canaries::ReuseFilter {
+        kind: q.kind.clone().filter(|k| !k.is_empty()),
+        node: q.node.clone().filter(|n| !n.is_empty()),
+        same_source: match q.source.as_deref() {
+            Some("same") => Some(true),
+            Some("other") => Some(false),
+            _ => None,
+        },
+        range,
+        request: None,
+        ip_id,
+        limit: 500,
+    };
+    let reuses = st.store.reuses(&filter).await?;
+    let sum = st.store.canary_summary(range).await?;
+    render(&CanariesPage {
+        chrome: chrome(),
+        range,
+        q,
+        sum,
+        reuses,
+        kinds: crate::canary::Kind::ALL_V1
+            .iter()
+            .map(|k| k.name())
+            .chain(["legacy"])
+            .collect(),
     })
 }
 
