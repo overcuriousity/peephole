@@ -263,7 +263,8 @@ impl Store {
             sql.push_str(" AND ? IN (c.ip_id, u.ip_id)");
         }
         if f.range.since().is_some() {
-            sql.push_str(" AND u.ts >= datetime('now', ?)");
+            // The period is when the canary was served, as in the summary.
+            sql.push_str(" AND c.ts >= datetime('now', ?)");
         }
         sql.push_str(" GROUP BY u.id, c.value_hash ORDER BY u.ts DESC, u.id DESC LIMIT ?");
         let mut q = sqlx::query_as::<_, Reuse>(sqlx::AssertSqlSafe(sql));
@@ -974,5 +975,66 @@ mod tests {
             Some((1, 1))
         );
         assert_eq!(sum.share_pct(), 13); // 1 of 8, rounded
+    }
+
+    #[tokio::test]
+    async fn summary_and_table_share_the_serve_time_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        let now = chrono::Utc::now();
+        let at = |d: i64| {
+            (now - chrono::Duration::days(d))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+        apply(
+            &mut conn,
+            ctx,
+            &req(
+                "srv",
+                &at(40),
+                "198.51.100.1",
+                "/.git/config",
+                "[]",
+                "decoy:git-config",
+                Some(1),
+            ),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx,
+            &req(
+                "use",
+                &at(1),
+                "198.51.100.2",
+                "/x",
+                &basic("deploy", &git_token("srv")),
+                "not-found",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        let d30 = crate::store::stats::Range::D30;
+        assert_eq!(s.canary_summary(d30).await.unwrap().reused, 0);
+        let f = ReuseFilter {
+            range: d30,
+            limit: 10,
+            ..Default::default()
+        };
+        assert!(
+            s.reuses(&f).await.unwrap().is_empty(),
+            "harvested before the period"
+        );
     }
 }

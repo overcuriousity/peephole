@@ -2,7 +2,7 @@
 {% block title %}peephole — canaries{% endblock %}
 {% block content %}
 {% let sub = "canaries" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Canaries</h1><p class="muted">Credentials served in decoys and the requests that used them again.</p></div>{% let base = "/admin/canaries" %}{% include "_range.html" %}</div>
+<div class="page-head"><div><h1>Canaries</h1><p class="muted">Credentials served in decoys and the requests that used them again. The period is when they were served.</p></div>{% let base = "/admin/canaries" %}{% include "_range.html" %}</div>
 <div class="stack">
 <div class="tiles kpis">
   <div class="tile"><span class="label">Served</span><div class="value">{{ crate::admin::views::thousands(sum.served) }}</div></div>
@@ -10,7 +10,7 @@
   <div class="tile"><span class="label">Median to first use</span><div class="value">{% if let Some(m) = sum.median_s %}{{ crate::admin::views::duration(m) }}{% else %}—{% endif %}</div></div>
   <div class="tile"><span class="label">Longest</span><div class="value">{% if let Some(m) = sum.max_s %}{{ crate::admin::views::duration(m) }}{% else %}—{% endif %}</div></div>
 </div>
-{% if !sum.per_kind.is_empty() %}<section class="card"><h2>Per kind</h2><table class="table"><thead><tr><th>Kind</th><th>Served</th><th>Used again</th></tr></thead><tbody>
+{% if !sum.per_kind.is_empty() %}<section class="card"><h2>Per canary kind</h2><table class="table"><thead><tr><th>Kind</th><th>Served</th><th>Used again</th></tr></thead><tbody>
 {% for k in sum.per_kind %}<tr><td>{{ k.kind }}</td><td>{{ k.served }}</td><td>{{ k.reused }}</td></tr>{% endfor %}
 </tbody></table></section>{% endif %}
 <section class="card">
