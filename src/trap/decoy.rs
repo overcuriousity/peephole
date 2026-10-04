@@ -458,23 +458,6 @@ fn phpinfo(host: &str) -> String {
     body
 }
 
-/// Today's call, until the serve path chooses with canaries (Task 6).
-pub fn decoy(method: &str, path: &str, page_token: &str) -> Option<Decoy> {
-    let inp = Input {
-        v: 0,
-        page_token,
-        host: None,
-        node_id: None,
-        ts: 0,
-        method,
-        path,
-    };
-    render(
-        &inp,
-        choose(method, path, None, Presented::default(), None)?,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -533,6 +533,9 @@ struct Capture<'a> {
     body: Option<Vec<u8>>,
     is_fp_claim: bool,
     page_token: String,
+    /// The row's time, as the decoy was rendered with.
+    ts: String,
+    decoy_v: Option<i64>,
     /// How the request is answered: `not-found`, `decoy:<name>`, `claim`.
     answer: String,
     status: u16,
@@ -696,8 +699,8 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 ja4: c.conn.as_ref().and_then(|k| k.ja4.clone()),
                 // Claims are not classified.
                 rules: (!c.is_fp_claim).then(|| state.classifier.fingerprint().to_string()),
-                ts: None,
-                decoy_v: None,
+                ts: Some(c.ts),
+                decoy_v: c.decoy_v,
             },
         )
         .await?;
@@ -788,15 +791,37 @@ async fn trap(
 ) -> Response {
     let ip = client_ip(&parts.headers, peer.ip(), &state.cfg.trusted_proxies);
     let page_token = uuid::Uuid::new_v4().to_string();
-    // Decided before recording, so the row says what was sent.
-    let decoy = decoy::decoy(parts.method.as_str(), parts.uri.path(), &page_token);
+    // One time for the row and the decoy, so the row renders it again.
+    let now = chrono::Utc::now();
+    let headers = header_pairs(&parts.headers);
+    let host = parts
+        .uri
+        .authority()
+        .map(|a| a.to_string())
+        .or_else(|| crate::canary::site::request_host(&headers).map(str::to_string));
+    let method = parts.method.as_str();
+    let path = parts.uri.path();
+    let presented = presented(&state, &headers, method, path, &body.bytes).await;
+    let node_id = state.recorder.node_id();
+    let node = node_id.as_ref().map(|n| &n.0[..]);
+    let decoy = decoy::choose(method, path, parts.uri.query(), presented, node).and_then(|name| {
+        decoy::render(
+            &decoy::Input {
+                v: crate::canary::DECOY_V,
+                page_token: &page_token,
+                host: host.as_deref(),
+                node_id: node,
+                ts: now.timestamp(),
+                method,
+                path,
+            },
+            name,
+        )
+    });
     let (answer, status) = match &decoy {
         Some(d) => (format!("decoy:{}", d.name), d.status),
         None => ("not-found".to_string(), 404),
     };
-    // Recorded apart from the answer: hyper drops this future when the
-    // client resets the stream or the connection ends, which must not lose
-    // the request or a batch of light rows taken but not yet written.
     let slot = state.guards.slot().await;
     tokio::spawn(record_trap(
         state.clone(),
@@ -804,9 +829,14 @@ async fn trap(
         ip,
         parts,
         body,
-        page_token.clone(),
-        answer,
-        status,
+        Served {
+            page_token: page_token.clone(),
+            answer,
+            status,
+            now,
+            host,
+            decoy_v: decoy.is_some().then_some(crate::canary::DECOY_V),
+        },
     ));
     if let Some(d) = decoy {
         let mut resp = (
@@ -828,6 +858,45 @@ async fn trap(
         .into_response()
 }
 
+/// What the trap sent, for the row.
+struct Served {
+    page_token: String,
+    answer: String,
+    status: u16,
+    now: chrono::DateTime<chrono::Utc>,
+    host: Option<String>,
+    decoy_v: Option<i64>,
+}
+
+/// Which credential places carried a canary this node knows. Only requests
+/// with a credential (an `Authorization` or `Cookie` header, a wp-login
+/// POST body) cost a lookup.
+async fn presented(
+    state: &TrapState,
+    headers: &[(String, String)],
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> decoy::Presented {
+    let login_post = method == "POST" && path.rsplit('/').next() == Some("wp-login.php");
+    let tokens = crate::canary::tokens::of_credentials(headers, login_post.then_some(body));
+    if tokens.is_empty() {
+        return decoy::Presented::default();
+    }
+    let hashes: Vec<i64> = tokens.iter().map(|(_, h)| *h).collect();
+    let known = state
+        .store
+        .known_canaries(&hashes)
+        .await
+        .unwrap_or_default();
+    let at = |place: &str| tokens.iter().any(|(p, h)| p == place && known.contains(h));
+    decoy::Presented {
+        basic: at("header:authorization"),
+        cookie: at("header:cookie"),
+        body: at("body"),
+    }
+}
+
 /// The recording part of [`trap_handler`]: a full row, or a light row when
 /// this IP is over its recording rate or its body did not fit the budget.
 /// In flight until it is done.
@@ -838,9 +907,7 @@ async fn record_trap(
     ip: IpAddr,
     parts: axum::http::request::Parts,
     body: ReadBody,
-    page_token: String,
-    answer: String,
-    status: u16,
+    served: Served,
 ) {
     let method = parts.method.as_str();
     let path = parts.uri.path();
@@ -862,11 +929,18 @@ async fn record_trap(
     } = body;
     match admission {
         flood::Admission::Skip => {
+            let decoy = served.decoy_v.map(|v| skiplog::SkipDecoy {
+                page_token: served.page_token.clone(),
+                host: served.host.clone(),
+                answer: served.answer.clone(),
+                decoy_v: v,
+            });
             let full = state.guards.skips.note(
                 ip,
-                chrono::Utc::now().timestamp_millis(),
+                served.now.timestamp_millis(),
                 method,
                 path,
+                decoy,
                 state.cfg.trap.skip_log_rate,
                 Instant::now(),
             );
@@ -906,9 +980,11 @@ async fn record_trap(
                 raw_headers: &raw,
                 body: (!body.is_empty()).then(|| body.clone()),
                 is_fp_claim: false,
-                page_token,
-                answer,
-                status,
+                page_token: served.page_token,
+                ts: served.now.format("%Y-%m-%d %H:%M:%S").to_string(),
+                decoy_v: served.decoy_v,
+                answer: served.answer,
+                status: served.status,
                 unrecorded,
                 conn: parts
                     .extensions
@@ -988,6 +1064,8 @@ async fn claim_handler(
             body: None,
             is_fp_claim: true,
             page_token: uuid::Uuid::new_v4().to_string(),
+            ts: crate::store::data::now_ts(),
+            decoy_v: None,
             answer: "claim".into(),
             status: 200,
             unrecorded: 0,
