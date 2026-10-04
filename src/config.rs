@@ -758,7 +758,7 @@ impl Config {
             "(discovery or safe) and not (intrusive or broadcast or external or dos)";
         let argv: &[&str] = match level {
             1 => &["-Pn", "-sS", "-T2", "--top-ports", "100"],
-            2 => &["-Pn", "-sS", "-sV", "-T3", "--top-ports", "1000"],
+            2 => &["-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000"],
             3 => &[
                 "-Pn",
                 "-sS",
@@ -863,14 +863,15 @@ rp_name = "x"
                 );
             }
         }
-        // Only the top two levels do OS detection; only level 4 scans all ports.
+        // OS detection from level 2 up; only level 4 scans all ports.
         let has = |level, flag| {
             cfg.default_level_argv(level)
                 .unwrap()
                 .iter()
                 .any(|a| a == flag)
         };
-        assert!(!has(2, "-O"));
+        assert!(!has(1, "-O"));
+        assert!(has(2, "-O"));
         assert!(has(3, "-O"));
         assert!(!has(3, "-p-"));
         assert!(has(4, "-p-"));

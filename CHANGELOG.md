@@ -3,6 +3,16 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [0.2.1] - 2026-10-04
+
+### Changed
+
+- Counter-scans: level 2 now adds OS detection (`-O`), so OS guesses cover
+  far more sources. Level 2 is also the most a single request earns by
+  default (`scan.single_request_max_level`), so those sources are now
+  OS-fingerprinted too; `-O` sends a few extra TCP/ICMP probes and stays
+  non-intrusive. Override with `scan.level_argv` to keep the old preset.
+
 ## [0.2.0] - 2026-10-04
 
 ### Added
@@ -74,6 +84,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 First release.
 
+[0.2.1]: https://github.com/overcuriousity/peephole/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/overcuriousity/peephole/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/overcuriousity/peephole/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/overcuriousity/peephole/releases/tag/v0.1.0
