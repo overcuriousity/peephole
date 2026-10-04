@@ -180,4 +180,53 @@ mod tests {
             assert!(render_uid(&s, bad).await.unwrap().is_none(), "{bad}");
         }
     }
+
+    #[tokio::test]
+    async fn another_nodes_decoy_renders_with_the_site_it_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let node = crate::cluster::identity::NodeId([3; 32]);
+        let word = crate::canary::site::word(Some(&node.0));
+        apply(
+            &mut conn,
+            Ctx {
+                origin: Some(&node),
+                hlc: 1,
+            },
+            &Record::Request(Box::new(crate::cluster::record::RequestRec {
+                uid: "r1".into(),
+                ts: "2026-10-04 10:00:00".into(),
+                ip: "198.51.100.4".into(),
+                method: "GET".into(),
+                path: "/.env".into(),
+                headers_json: r#"[["host","203.0.113.7"]]"#.into(),
+                labels_json: "[]".into(),
+                page_token: Some("tok".into()),
+                answer: Some("decoy:dotenv".into()),
+                decoy_v: Some(1),
+                decoy_site: Some(word.into()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        let want = crate::trap::decoy::render(
+            &crate::trap::decoy::Input {
+                v: 1,
+                page_token: "tok",
+                host: Some("203.0.113.7"),
+                word,
+                ts: 1_791_108_000,
+                method: "GET",
+                path: "/.env",
+            },
+            "dotenv",
+        )
+        .unwrap();
+        assert_eq!(render_uid(&s, "r1").await.unwrap().unwrap(), want);
+    }
 }

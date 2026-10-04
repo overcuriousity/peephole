@@ -1037,4 +1037,174 @@ mod tests {
             "harvested before the period"
         );
     }
+
+    async fn derived(pool: &sqlx::SqlitePool) -> (i64, i64) {
+        let n = |t: &'static str| async move {
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {t}")))
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        };
+        (n("canaries").await, n("request_tokens").await)
+    }
+
+    #[tokio::test]
+    async fn hiding_a_request_drops_its_derived_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        apply(
+            &mut conn,
+            ctx,
+            &req(
+                "srv",
+                "2026-10-04 10:00:00",
+                "198.51.100.1",
+                "/.git/config",
+                "[]",
+                "decoy:git-config",
+                Some(1),
+            ),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx,
+            &req(
+                "use",
+                "2026-10-04 13:00:00",
+                "198.51.100.2",
+                "/x",
+                &basic("deploy", &git_token("srv")),
+                "not-found",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(derived(&s.pool).await.0 > 0 && derived(&s.pool).await.1 > 0);
+        for uid in ["srv", "use"] {
+            crate::store::data::unmaterialize(&mut conn, "request", uid)
+                .await
+                .unwrap();
+        }
+        drop(conn);
+        assert_eq!(derived(&s.pool).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn pruning_drops_derived_rows_of_requests_and_light_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        let old = chrono::Utc::now() - chrono::Duration::days(40);
+        let ts = old.format("%Y-%m-%d %H:%M:%S").to_string();
+        apply(
+            &mut conn,
+            ctx,
+            &req(
+                "srv",
+                &ts,
+                "198.51.100.1",
+                "/.git/config",
+                "[]",
+                "decoy:git-config",
+                Some(1),
+            ),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx,
+            &req(
+                "use",
+                &ts,
+                "198.51.100.2",
+                "/x",
+                &basic("deploy", &git_token("srv")),
+                "not-found",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx,
+            &Record::SkipBatch(SkipBatchRec {
+                uid: "b1".into(),
+                ip: "198.51.100.3".into(),
+                dropped: 0,
+                rows: vec![SkipRow {
+                    ts_ms: old.timestamp_millis(),
+                    method: "GET".into(),
+                    path: "/.env".into(),
+                    page_token: Some("t".into()),
+                    host: None,
+                    answer: Some("decoy:dotenv".into()),
+                    decoy_v: Some(1),
+                    decoy_site: Some("shop".into()),
+                }],
+                build: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        s.local().prune_older_than(30).await.unwrap();
+        assert_eq!(derived(&s.pool).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn deleting_an_ip_drops_its_light_rows_canaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        apply(
+            &mut conn,
+            Ctx {
+                origin: None,
+                hlc: 1,
+            },
+            &Record::SkipBatch(SkipBatchRec {
+                uid: "b1".into(),
+                ip: "198.51.100.3".into(),
+                dropped: 0,
+                rows: vec![SkipRow {
+                    ts_ms: 1_791_000_000_000,
+                    method: "GET".into(),
+                    path: "/.env".into(),
+                    page_token: Some("t".into()),
+                    host: None,
+                    answer: Some("decoy:dotenv".into()),
+                    decoy_v: Some(1),
+                    decoy_site: Some("shop".into()),
+                }],
+                build: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        assert_eq!(derived(&s.pool).await.0, 7);
+        let ip = s.ip_by_addr("198.51.100.3").await.unwrap().unwrap();
+        assert!(s.local().delete_ip(ip.id).await.unwrap());
+        assert_eq!(derived(&s.pool).await, (0, 0));
+    }
 }
