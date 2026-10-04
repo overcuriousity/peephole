@@ -88,10 +88,11 @@ pub fn return_host(host: Option<&str>, site: &str) -> String {
         h
     };
     if let Ok(ip) = bare.parse::<IpAddr>() {
-        return if crate::net::is_scannable_target(ip) {
-            h.to_string()
-        } else {
-            site.to_string()
+        return match ip {
+            _ if !crate::net::is_scannable_target(ip) => site.to_string(),
+            // Unbracketed in the Host header; a URL needs the brackets.
+            IpAddr::V6(_) if !h.starts_with('[') => format!("[{h}]"),
+            _ => h.to_string(),
         };
     }
     if is_public_name(bare) {
@@ -185,7 +186,6 @@ mod tests {
             "203.0.113.7",
             "203.0.113.7:8080",
             "[2001:db8::1]:443",
-            "2001:db8::1",
             "forensics.cc24.dev",
             "Mikoshi.de:80",
         ] {
@@ -206,6 +206,8 @@ mod tests {
             assert_eq!(return_host(Some(h), s), s, "{h}");
         }
         assert_eq!(return_host(None, s), s);
+        // A bare IPv6 literal is bracketed, so links built from it parse.
+        assert_eq!(return_host(Some("2001:db8::1"), s), "[2001:db8::1]");
     }
 
     #[test]
