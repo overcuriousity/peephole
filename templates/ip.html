@@ -51,7 +51,7 @@
     <div class="card-head"><h2>Counter-scans</h2><span class="muted">admin only</span></div>
     {% if !adm.jobs.is_empty() %}
     <h3>Jobs</h3>
-    <div class="table-wrap"><table>
+    <div class="table-wrap wide"><table>
       <thead><tr><th>Job</th><th>IP</th><th>Level</th><th>Status</th><th>Queued</th><th>Finished</th><th>Error</th><th>Node</th></tr></thead>
       <tbody>{% for j in adm.jobs %}{% include "_queue_row.html" %}{% endfor %}</tbody>
     </table></div>
@@ -91,7 +91,7 @@
   {% if chrome.authed %}
   <section class="card">
     <div class="card-head"><h2>Requests</h2></div>
-    <div class="table-wrap"><table>
+    <div class="table-wrap wide"><table>
       <thead><tr><th>Time (UTC)</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th><th></th></tr></thead>
       <tbody>
       {% for r in page.items %}

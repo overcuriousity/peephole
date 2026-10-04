@@ -18,6 +18,9 @@
     // CSS `width:100%; height:auto` scales it instead of falling back to 150px.
     return el("svg", { viewBox: "0 0 " + w + " " + h, width: w, height: h, preserveAspectRatio: "xMidYMid meet" }, host);
   }
+  // Charts are drawn at the host's own width (1 unit = 1 CSS px), so text
+  // keeps its size on a phone instead of shrinking with a fixed viewBox.
+  function widthOf(host, fallback) { return Math.round(host.clientWidth) || fallback; }
   function empty(host, w, h) { var s = svg(host, w, h); text(s, w / 2, h / 2, "no data in this range", "empty-note", "middle"); }
   var tip = document.createElement("div"); tip.className = "tooltip"; document.body.appendChild(tip);
   function showTip(ev, html) { tip.innerHTML = html; tip.style.display = "block"; tip.style.left = (ev.clientX + 12) + "px"; tip.style.top = (ev.clientY + 12) + "px"; }
@@ -46,7 +49,7 @@
 
   // Vertical bars over time: [{ts, count}]. Single series, so no legend.
   function timeline(host, buckets) {
-    var W = 900, H = 180, L = 36, B = 22, T = 6;
+    var W = Math.max(widthOf(host, 900), 240), H = 180, L = 36, B = 22, T = 6;
     if (!buckets.length) return empty(host, W, H);
     var s = svg(host, W, H), max = Math.max.apply(null, buckets.map(function (b) { return b.count; })) || 1;
     var n = buckets.length, bw = (W - L) / n, plotH = H - B - T;
@@ -63,26 +66,29 @@
       r.addEventListener("mousemove", function (ev) { showTip(ev, "<b>" + b.count + "</b> · " + esc(b.ts.replace("T", " ")) + " UTC"); });
       r.addEventListener("mouseleave", hideTip);
     });
-    var step = Math.max(1, Math.ceil(n / 8));
+    // About one tick label per 80px: "10-03 09:00" in 10px mono is ~70px.
+    var step = Math.max(1, Math.ceil(n / Math.max(2, Math.min(8, Math.floor((W - L) / 80)))));
     buckets.forEach(function (b, i) { if (i % step === 0) text(axis, L + i * bw + bw / 2, H - 6, b.ts.slice(5).replace("T", " "), "", "middle"); });
   }
 
   // Horizontal ranked bars: [{name, count}]
   function hbars(host, items, opts) {
     opts = opts || {};
-    var W = 400, rowH = 22, H = Math.max(rowH * items.length + 4, 40);
+    var W = Math.max(widthOf(host, 400), 220), rowH = 22, H = Math.max(rowH * items.length + 4, 40);
     if (!items.length) return empty(host, W, 80);
     var s = svg(host, W, H), max = Math.max.apply(null, items.map(function (i) { return i.count; })) || 1;
-    var labelW = 150;
+    var labelW = Math.min(150, Math.round(W * 0.4)), maxChars = Math.floor((labelW - 8) / 6.5);
     items.forEach(function (it, i) {
       var y = 2 + i * rowH, w = ((W - labelW - 50) * it.count) / max;
-      text(s, labelW - 8, y + 15, (opts.label ? opts.label(it) : it.name).slice(0, 22), "hbar-label", "end");
+      text(s, labelW - 8, y + 15, clip(opts.label ? opts.label(it) : it.name, maxChars), "hbar-label", "end");
       var r = el("rect", { "class": (opts.cls ? opts.cls(it) : "hbar"), x: labelW, y: y + 4, width: Math.max(w, 2), height: rowH - 8, rx: 2 }, s);
       r.addEventListener("mousemove", function (ev) { showTip(ev, "<b>" + it.count + "</b> · " + esc(opts.label ? opts.label(it) : it.name)); });
       r.addEventListener("mouseleave", hideTip);
       text(s, labelW + w + 6, y + 15, it.count, "hbar-value");
     });
   }
+
+  function clip(s, n) { s = String(s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
 
   function countryName(code) { return (window.peephole.countryNames && window.peephole.countryNames[code]) || code; }
 
@@ -123,18 +129,37 @@
     values.forEach(function (v, i) { var h = (v / max) * H; el("rect", { x: i * bw + 0.5, y: H - h, width: Math.max(bw - 1, 1), height: h }, s); });
   }
 
+  // Redraw after the viewport width settles (rotation, window resize); a
+  // height-only change (mobile URL bar) does not count.
+  function onWidthChange(fn) {
+    var last = window.innerWidth, timer;
+    window.addEventListener("resize", function () {
+      if (window.innerWidth === last) return;
+      last = window.innerWidth;
+      clearTimeout(timer);
+      timer = setTimeout(fn, 150);
+    });
+  }
+
   function boot() {
     var wall = document.getElementById("wall");
     if (wall) {
       var range = wall.getAttribute("data-range") || "24h";
       fetch("/api/stats?range=" + range).then(function (r) { return r.json(); }).then(function (st) {
-        timeline(document.getElementById("chart-timeline"), fillBuckets(st.timeline, range));
-        hbars(document.getElementById("chart-severity"), st.severity_distribution, { label: function (i) { return "severity " + i.name; }, cls: function (i) { return "sev-bar-" + i.name; } });
-        var labelsHost = document.getElementById("chart-labels");
-        if (labelsHost) hbars(labelsHost, (st.top_labels || []).slice(0, 10));
+        var buckets = fillBuckets(st.timeline, range), labelsHost = document.getElementById("chart-labels");
+        function drawStats() {
+          timeline(document.getElementById("chart-timeline"), buckets);
+          hbars(document.getElementById("chart-severity"), st.severity_distribution, { label: function (i) { return "severity " + i.name; }, cls: function (i) { return "sev-bar-" + i.name; } });
+          if (labelsHost) hbars(labelsHost, (st.top_labels || []).slice(0, 10));
+        }
+        function drawCountries() {
+          hbars(document.getElementById("chart-countries"), st.top_countries.slice(0, 10), { label: function (i) { return countryName(i.name); } });
+        }
+        drawStats();
+        onWidthChange(function () { drawStats(); if (window.peephole.countryNames) drawCountries(); });
         fetch("/api/countries").then(function (r) { return r.json(); }).then(function (names) {
           window.peephole.countryNames = names;
-          hbars(document.getElementById("chart-countries"), st.top_countries.slice(0, 10), { label: function (i) { return countryName(i.name); } });
+          drawCountries();
           return fetch("/api/map?range=" + range).then(function (r) { return r.json(); });
         }).then(function (m) {
           map(document.getElementById("map"), document.getElementById("map-legend"), m);

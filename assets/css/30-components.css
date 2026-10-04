@@ -1,6 +1,8 @@
 .card { background: var(--color-bg-elevated); border: 1px solid var(--color-border); border-radius: var(--radius-lg); padding: 1rem 1.25rem; }
 .card > h2:first-child { margin-top: 0; }
-.card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: 0.75rem; }
+.card-head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 0.25rem 1rem; margin-bottom: 0.75rem; }
+.card-head h2 { margin: 0; }
+.card-head > .muted { font-size: var(--text-sm); }
 .tile { background: var(--color-bg-elevated); border: 1px solid var(--color-border); border-radius: var(--radius-lg); padding: 0.9rem 1.1rem; }
 .tile .label { display: block; margin-bottom: 0.25rem; }
 .tile .value { font-size: var(--text-2xl); font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; }
@@ -16,6 +18,8 @@ tbody tr:last-child td { border-bottom: 0; }
 td.path { font-family: var(--font-mono); word-break: break-all; max-width: 40rem; }
 td.ip { font-family: var(--font-mono); white-space: nowrap; }
 td.ts { white-space: nowrap; color: var(--color-fg-secondary); font-family: var(--font-mono); font-size: var(--text-xs); }
+.narrow-only { display: none; }
+.cell-sub { color: var(--color-fg-secondary); font-family: var(--font-sans); font-size: var(--text-xs); margin-top: 0.15rem; }
 .empty { padding: 2rem; text-align: center; color: var(--color-fg-muted); }
 
 .badge { display: inline-block; padding: 0.05rem 0.45rem; border-radius: 999px; font-size: var(--text-xs); font-weight: 500; line-height: 1.5; white-space: nowrap; border: 1px solid transparent; }
@@ -93,7 +97,8 @@ pre.panel { background: var(--color-bg-surface); border: 1px solid var(--color-b
 [data-copy] { cursor: copy; }
 [data-copy][data-copied] { border-color: var(--color-accent); }
 .ip-head { align-items: center; }
-.ip-head h1 { font-family: var(--font-mono); font-size: var(--text-3xl); letter-spacing: 0; }
+.ip-head h1 { font-family: var(--font-mono); font-size: clamp(var(--text-xl), 6vw, var(--text-3xl)); letter-spacing: 0; overflow-wrap: anywhere; }
+.ip-head h1 .badge { font-family: var(--font-sans); vertical-align: middle; }
 .ip-head .tiles { margin-bottom: 0; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); min-width: min(100%, 20rem); }
 .kv dd.plain { font-family: inherit; word-break: normal; }
 .intel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1rem; }
@@ -128,3 +133,28 @@ td.check input, th.check input { margin: 0; vertical-align: middle; accent-color
 .pace-note { flex-basis: 100%; margin: 0; font-size: var(--text-xs); }
 .pace-rec p { margin: 0 0 0.5rem; font-size: var(--text-sm); }
 .pace-retry { margin-top: 1rem; font-size: var(--text-sm); }
+
+/* Phone widths. Last in the layer so it overrides the rules above. */
+@media (max-width: 48rem) {
+  .card { padding: 0.875rem 1rem; }
+  th, td { padding: 0.45rem 0.6rem; }
+  th { white-space: nowrap; }
+  /* Low-priority columns give way on a phone; their content moves into the
+     row's main cell (.narrow-only). */
+  .hide-narrow { display: none; }
+  .narrow-only { display: block; }
+  td.ip { white-space: normal; overflow-wrap: anywhere; }
+  td.ip a { white-space: nowrap; }
+  td.ip.v6 a { white-space: normal; }
+  /* Wide data tables scroll sideways instead of squeezing every column to
+     a word per line; paths keep a readable width. */
+  .table-wrap.wide table { width: max-content; min-width: 100%; }
+  .table-wrap.wide td { white-space: nowrap; }
+  .table-wrap.wide td.path { white-space: normal; width: 18rem; }
+  .table-wrap.wide td.wrap { white-space: normal; width: 13rem; }
+  .filters label { flex: 1 1 8rem; }
+  .filters input, .filters select { width: 100%; }
+  .filters input[name="q"], .filters input[name="path"] { min-width: 0; }
+  .filters label:has(input[name="q"]), .filters label:has(input[name="path"]) { flex-basis: 100%; }
+  .filters .btn { flex: 1 1 100%; justify-content: center; }
+}

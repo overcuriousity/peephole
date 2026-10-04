@@ -44,7 +44,7 @@
 <form id="bulk-form" method="post" action="/admin/ips/bulk-delete">
 {% include "_ip_filter_hidden.html" %}
 {% endif %}
-<div class="table-wrap"><table>
+<div class="table-wrap wide"><table>
   <thead><tr>{% if can_delete %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>IP</th><th>Country</th><th>Network</th><th class="num">Requests</th><th>Max sev</th>{% if chrome.authed %}<th class="num">Abuse</th>{% endif %}<th>First seen</th><th>Last seen</th></tr></thead>
   <tbody>
   {% for i in page.items %}
@@ -52,7 +52,7 @@
       {% if can_delete %}<td class="check"><input type="checkbox" name="ids" value="{{ i.ip }}" aria-label="Select {{ i.ip }}"></td>{% endif %}
       <td class="ip"><a href="/ip/{{ i.ip }}">{{ i.ip }}</a>{% if i.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
       <td>{% if let Some(c) = i.country %}{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}{% else %}<span class="muted">—</span>{% endif %}</td>
-      <td>{% if let Some(o) = i.asn_org %}{{ o }}{% if let Some(a) = i.asn %} <span class="muted mono">AS{{ a }}</span>{% endif %}{% else %}<span class="muted">—</span>{% endif %}</td>
+      <td class="wrap">{% if let Some(o) = i.asn_org %}{{ o }}{% if let Some(a) = i.asn %} <span class="muted mono">AS{{ a }}</span>{% endif %}{% else %}<span class="muted">—</span>{% endif %}</td>
       <td class="num">{{ i.request_count }}</td>
       <td>{% let sev = i.max_severity %}{% include "_severity.html" %}</td>
       {% if chrome.authed %}<td class="num mono">{% if let Some(a) = i.abuse_score %}{{ a }}{% else %}<span class="muted">—</span>{% endif %}</td>{% endif %}
