@@ -5,6 +5,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-04
+
 ### Added
 
 - Canaries that come back. Decoys serve realistic credentials derived from
@@ -131,6 +133,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 First release.
 
+[0.3.0]: https://github.com/overcuriousity/peephole/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/overcuriousity/peephole/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/overcuriousity/peephole/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/overcuriousity/peephole/compare/v0.1.0...v0.1.1
