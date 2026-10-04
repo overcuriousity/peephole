@@ -10,19 +10,33 @@ pub const USAGE: &str = "usage: peephole decoy render UID [CONFIG]
        UID is a request's uid, or a light row's <batch uid>#<row> as the export writes it.
        Prints the status line, headers and body the trap sent.";
 
+/// A light row's decoy inputs.
+type LightRow = (
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<Vec<u8>>,
+);
+/// A full row's decoy inputs.
+type FullRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<Vec<u8>>,
+);
+
 /// The decoy of the row `uid` (None: no such row, or not a decoy).
 pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
     if let Some((batch, row)) = uid.split_once('#') {
-        let r: Option<(
-            i64,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            Option<Vec<u8>>,
-        )> = sqlx::query_as(
+        let r: Option<LightRow> = sqlx::query_as(
             "SELECT s.ts_ms, s.method, s.path, s.page_token, s.host, s.answer, s.decoy_v, b.origin
                  FROM skipped_requests s JOIN skipped_batches b ON b.id = s.batch_id
                  WHERE b.uid = ? AND s.rowid = ?",
@@ -50,16 +64,7 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
             name,
         ));
     }
-    let r: Option<(
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<Vec<u8>>,
-    )> = sqlx::query_as(
+    let r: Option<FullRow> = sqlx::query_as(
         "SELECT ts, method, path, headers_json, page_token, answer, decoy_v, origin
              FROM requests WHERE uid = ?",
     )
