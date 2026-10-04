@@ -41,6 +41,8 @@ pub struct ReqRow {
 #[derive(sqlx::FromRow)]
 pub struct SkipOut {
     pub rowid: i64,
+    /// Its position in its batch, from 1: the same on every node.
+    pub row: i64,
     pub ts_ms: i64,
     pub method: String,
     pub path: String,
@@ -191,7 +193,10 @@ impl Store {
         limit: i64,
     ) -> Result<Vec<SkipOut>> {
         let mut sql = String::from(
-            "SELECT s.rowid AS rowid, s.ts_ms, s.method, s.path, b.ip_id, i.ip, b.uid, b.origin,
+            "SELECT s.rowid AS rowid,
+                    (SELECT COUNT(*) FROM skipped_requests x
+                     WHERE x.batch_id = s.batch_id AND x.rowid <= s.rowid) AS row,
+                    s.ts_ms, s.method, s.path, b.ip_id, i.ip, b.uid, b.origin,
                     b.build, b.dropped, s.decoy_v, s.answer, s.host,
                     s.rowid = (SELECT MAX(x.rowid) FROM skipped_requests x
                                WHERE x.batch_id = s.batch_id) AS last_in_batch
@@ -290,7 +295,7 @@ impl Store {
         c.claimed = claimed.into_iter().collect();
         let used: Vec<(i64, String)> = sqlx::query_as(
             "SELECT DISTINCT t.request_id,
-                    COALESCE(sr.uid, CAST(sr.id AS TEXT), sb.uid || '#' || c.skip_rowid)
+                    COALESCE(sr.uid, CAST(sr.id AS TEXT), sb.uid || '#' || c.skip_row)
              FROM request_tokens t
              JOIN canaries c ON c.value_hash = t.value_hash
              LEFT JOIN requests sr ON sr.id = c.request_id

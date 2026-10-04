@@ -36,13 +36,17 @@ type FullRow = (
 /// The decoy of the row `uid` (None: no such row, or not a decoy).
 pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
     if let Some((batch, row)) = uid.split_once('#') {
+        // `row` is the position in the batch, from 1.
+        let Some(offset) = row.parse::<i64>().ok().filter(|n| *n >= 1).map(|n| n - 1) else {
+            return Ok(None);
+        };
         let r: Option<LightRow> = sqlx::query_as(
             "SELECT s.ts_ms, s.method, s.path, s.page_token, s.host, s.answer, s.decoy_v, s.decoy_site
                  FROM skipped_requests s JOIN skipped_batches b ON b.id = s.batch_id
-                 WHERE b.uid = ? AND s.rowid = ?",
+                 WHERE b.uid = ? ORDER BY s.rowid LIMIT 1 OFFSET ?",
         )
         .bind(batch)
-        .bind(row.parse::<i64>().unwrap_or(-1))
+        .bind(offset)
         .fetch_optional(&store.read)
         .await?;
         let Some((ts_ms, method, path, Some(tok), host, Some(answer), v, site)) = r else {
@@ -156,14 +160,7 @@ mod tests {
         .await
         .unwrap();
         drop(conn);
-        let rowid: i64 = sqlx::query_scalar("SELECT rowid FROM skipped_requests")
-            .fetch_one(&s.pool)
-            .await
-            .unwrap();
-        let d = render_uid(&s, &format!("b1#{rowid}"))
-            .await
-            .unwrap()
-            .unwrap();
+        let d = render_uid(&s, "b1#1").await.unwrap().unwrap();
         let want = crate::trap::decoy::render(
             &crate::trap::decoy::Input {
                 v: 1,
@@ -179,5 +176,8 @@ mod tests {
         .unwrap();
         assert_eq!(d, want);
         assert!(render_uid(&s, "nope").await.unwrap().is_none());
+        for bad in ["b1#0", "b1#-1", "b1#x", "b1#2"] {
+            assert!(render_uid(&s, bad).await.unwrap().is_none(), "{bad}");
+        }
     }
 }

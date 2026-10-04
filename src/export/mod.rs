@@ -640,7 +640,7 @@ fn skipped_row(s: SkipOut, ctx: &PageContext, cols: &IpCols, opts: &ExportOption
     let unrecorded = if s.last_in_batch { s.dropped } else { 0 };
     let mut row = ExportRow {
         kind: "skipped",
-        uid: format!("{}#{}", s.uid, s.rowid),
+        uid: format!("{}#{}", s.uid, s.row),
         node: node_name(&opts.names, s.origin.as_deref().unwrap_or_default()),
         node_id: node_id(s.origin.as_deref().unwrap_or_default()),
         build: s.build,
@@ -1124,6 +1124,45 @@ mod tests {
             .await
             .unwrap();
         (s, dir)
+    }
+
+    #[tokio::test]
+    async fn light_row_uids_are_the_same_on_every_node() {
+        // `<batch uid>#<position in its batch>`: a node-local rowid would
+        // differ between nodes that stored batches in another order.
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let row = |path: &str| crate::cluster::record::SkipRow {
+            ts_ms: now,
+            method: "GET".into(),
+            path: path.into(),
+            ..Default::default()
+        };
+        for ip in ["198.51.100.2", "198.51.100.3"] {
+            s.local()
+                .insert_skip_batch(ip, 0, vec![row("/a"), row("/b")])
+                .await
+                .unwrap();
+        }
+        let out = text(&collect(&s, ExportFilter::default(), Format::Jsonl).await);
+        let mut ends: Vec<String> = out
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .map(|r| {
+                r["uid"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('#')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        ends.sort();
+        assert_eq!(ends, ["1", "1", "2", "2"]);
     }
 
     #[tokio::test]

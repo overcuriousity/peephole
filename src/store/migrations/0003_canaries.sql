@@ -21,7 +21,8 @@ CREATE TABLE canaries (
   kind TEXT NOT NULL,
   request_id INTEGER REFERENCES requests(id) ON DELETE CASCADE,
   batch_id INTEGER REFERENCES skipped_batches(id) ON DELETE CASCADE,
-  skip_rowid INTEGER,
+  -- A light row's position in its batch, from 1.
+  skip_row INTEGER,
   ts TEXT NOT NULL,
   ip_id INTEGER NOT NULL
 );

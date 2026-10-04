@@ -91,28 +91,36 @@ pub(crate) async fn derive_batch(conn: &mut SqliteConnection, batch_id: i64) -> 
         .bind(batch_id)
         .execute(&mut *conn)
         .await?;
-    let rows: Vec<(i64, i64, String, String, Option<i64>, i64)> = sqlx::query_as(
-        "SELECT s.rowid, s.ts_ms, s.page_token, s.answer, s.decoy_v, b.ip_id
+    // Every row, in batch order: a row is named by its position (from 1),
+    // which is the same on every node.
+    type Row = (i64, Option<String>, Option<String>, Option<i64>, i64);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT s.ts_ms, s.page_token, s.answer, s.decoy_v, b.ip_id
          FROM skipped_requests s JOIN skipped_batches b ON b.id = s.batch_id
-         WHERE s.batch_id = ? AND s.page_token IS NOT NULL AND s.answer LIKE 'decoy:%'",
+         WHERE s.batch_id = ? ORDER BY s.rowid",
     )
     .bind(batch_id)
     .fetch_all(&mut *conn)
     .await?;
-    for (rowid, ts_ms, tok, answer, decoy_v, ip_id) in rows {
+    for (pos, (ts_ms, tok, answer, decoy_v, ip_id)) in rows.into_iter().enumerate() {
+        let (Some(tok), Some(name)) = (
+            tok,
+            answer.as_deref().and_then(|a| a.strip_prefix("decoy:")),
+        ) else {
+            continue;
+        };
         let ts = chrono::DateTime::from_timestamp_millis(ts_ms)
             .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
-        let name = answer.trim_start_matches("decoy:");
         for (kind, value) in crate::canary::served(decoy_v, &tok, name) {
             sqlx::query(
-                "INSERT INTO canaries (value_hash, kind, batch_id, skip_rowid, ts, ip_id)
+                "INSERT INTO canaries (value_hash, kind, batch_id, skip_row, ts, ip_id)
                  VALUES (?,?,?,?,?,?)",
             )
             .bind(crate::canary::hash(&value))
             .bind(kind.name())
             .bind(batch_id)
-            .bind(rowid)
+            .bind(pos as i64 + 1)
             .bind(&ts)
             .bind(ip_id)
             .execute(&mut *conn)
@@ -336,7 +344,7 @@ pub struct CanarySummary {
     pub harvest_median_s: Option<i64>,
 }
 
-/// A serving row: (request id, light-row batch id, light-row rowid).
+/// A serving row: (request id, light-row batch id, light-row position).
 type Harvest = (Option<i64>, Option<i64>, Option<i64>);
 
 impl CanarySummary {
@@ -369,7 +377,7 @@ impl Store {
         // Per served canary: its kind and its first use by another request.
         type Row = (Option<i64>, Option<i64>, Option<i64>, String, Option<i64>);
         let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(format!(
-            "SELECT c.request_id, c.batch_id, c.skip_rowid, c.kind,
+            "SELECT c.request_id, c.batch_id, c.skip_row, c.kind,
                     (SELECT MIN(CAST(strftime('%s', u.ts) AS INTEGER) - CAST(strftime('%s', c.ts) AS INTEGER))
                      FROM request_tokens t JOIN requests u ON u.id = t.request_id
                      WHERE t.value_hash = c.value_hash
