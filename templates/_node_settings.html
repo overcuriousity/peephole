@@ -1,10 +1,10 @@
 <form method="post" action="/admin/cluster/settings" class="filters">
   <input type="hidden" name="base_version" value="{{ settings.version }}">
   <label>Rescan cooldown (h) <input type="number" name="cooldown_hours" min="0" max="8760" value="{{ settings.cooldown_hours }}" required></label>
-  <label title="{{ settings.listener_missing }}"><input type="checkbox" name="listener"{% if settings.listener %} checked{% endif %}{% if !settings.listener && !settings.listener_missing.is_empty() %} disabled{% endif %}> Trap</label>
-  <label title="{{ settings.scanner_missing }}"><input type="checkbox" name="scanner"{% if settings.scanner %} checked{% endif %}{% if !settings.scanner && !settings.scanner_missing.is_empty() %} disabled{% endif %}> Scanner</label>
-  <label title="{{ settings.web_missing }}"><input type="checkbox" name="web"{% if settings.web %} checked{% endif %}{% if !settings.web && !settings.web_missing.is_empty() %} disabled{% endif %}> Web interface</label>
+  <label class="check" title="{{ settings.listener_missing }}"><input type="checkbox" name="listener"{% if settings.listener %} checked{% endif %}{% if !settings.listener && !settings.listener_missing.is_empty() %} disabled{% endif %}> Trap</label>
+  <label class="check" title="{{ settings.scanner_missing }}"><input type="checkbox" name="scanner"{% if settings.scanner %} checked{% endif %}{% if !settings.scanner && !settings.scanner_missing.is_empty() %} disabled{% endif %}> Scanner</label>
+  <label class="check" title="{{ settings.web_missing }}"><input type="checkbox" name="web"{% if settings.web %} checked{% endif %}{% if !settings.web && !settings.web_missing.is_empty() %} disabled{% endif %}> Web interface</label>
   <button class="btn btn-sm" type="submit">Save</button>
-  <span class="muted">settings version {{ settings.version }}; roles switch within seconds, without a restart</span>
+  <span class="muted small">settings version {{ settings.version }}; roles switch within seconds, without a restart</span>
 </form>
 <p class="muted">A role that is greyed out lacks its settings in the config file (hover for the reason). Switching the web interface off removes these pages; bring them back with <code>peephole settings reset roles.web</code>.</p>

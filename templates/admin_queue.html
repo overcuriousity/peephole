@@ -1,5 +1,6 @@
 {% extends "layout.html" %}
 {% block title %}peephole — scan queue{% endblock %}
+{% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
 {% let sub = "queue" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Scan queue</h1><p class="muted">Every job, live. Filters apply to live updates too.</p></div>

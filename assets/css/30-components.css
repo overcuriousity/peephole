@@ -67,6 +67,8 @@ input:focus, select:focus { border-color: var(--color-accent); outline: none; bo
 .filters { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; margin-bottom: 1rem; }
 .filters label { display: grid; gap: 0.2rem; font-size: var(--text-xs); color: var(--color-fg-muted); }
 .filters input[name="q"], .filters input[name="path"] { min-width: 16rem; font-family: var(--font-mono); }
+.filters label.check { display: flex; align-items: center; gap: 0.4rem; font-size: var(--text-sm); color: var(--color-fg-secondary); min-height: 2.15rem; }
+.filters label.check input { margin: 0; accent-color: var(--color-accent); }
 
 .seg { display: inline-flex; border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); overflow: hidden; }
 .seg a { padding: 0.3rem 0.7rem; font-size: var(--text-xs); color: var(--color-fg-secondary); border-right: 1px solid var(--color-border); }
@@ -98,6 +100,7 @@ pre.panel { background: var(--color-bg-surface); border: 1px solid var(--color-b
 [data-copy][data-copied] { border-color: var(--color-accent); }
 .ip-head { align-items: center; }
 .ip-head h1 { font-family: var(--font-mono); font-size: clamp(var(--text-xl), 6vw, var(--text-3xl)); letter-spacing: 0; overflow-wrap: anywhere; }
+.req-head h1 { font-size: clamp(var(--text-lg), 5.5vw, var(--text-2xl)); }
 .ip-head h1 .badge { font-family: var(--font-sans); vertical-align: middle; }
 .ip-head .tiles { margin-bottom: 0; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); min-width: min(100%, 20rem); }
 .kv dd.plain { font-family: inherit; word-break: normal; }
@@ -151,9 +154,11 @@ td.check input, th.check input { margin: 0; vertical-align: middle; accent-color
   .table-wrap.wide table { width: max-content; min-width: 100%; }
   .table-wrap.wide td { white-space: nowrap; }
   .table-wrap.wide td.path { white-space: normal; width: 18rem; }
-  .table-wrap.wide td.wrap { white-space: normal; width: 13rem; }
+  .table-wrap.wide td.wrap { white-space: normal; width: 16rem; }
   .filters label { flex: 1 1 8rem; }
-  .filters input, .filters select { width: 100%; }
+  .filters input:not([type="checkbox"]), .filters select { width: 100%; }
+  .pace-form input[type="number"] { width: 100%; }
+  .filters label.check { flex: 0 1 auto; }
   .filters input[name="q"], .filters input[name="path"] { min-width: 0; }
   .filters label:has(input[name="q"]), .filters label:has(input[name="path"]) { flex-basis: 100%; }
   .filters .btn { flex: 1 1 100%; justify-content: center; }

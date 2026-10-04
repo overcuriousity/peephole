@@ -12,6 +12,7 @@
 .topbar-actions { display: flex; align-items: center; gap: 0.5rem; }
 .shell { max-width: var(--shell-max); margin: 0 auto; padding: 1.5rem 1rem 3rem; }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.25rem; }
+.page-head > * { min-width: 0; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 0.75rem; margin-bottom: 1.25rem; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
