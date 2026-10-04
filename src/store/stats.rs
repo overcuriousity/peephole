@@ -160,6 +160,19 @@ pub struct Stats {
     #[serde(skip_serializing)]
     pub recent: Vec<RecentRequest>,
     pub intel: HashMap<String, String>,
+    /// Harvest to first use of the canaries served in the range; only from
+    /// [`CANARY_TILE_MIN`] reuses up, so no single event shows.
+    pub canaries: Option<CanaryTile>,
+}
+
+/// Fewest reuses before the wall shows the canary tile.
+pub const CANARY_TILE_MIN: i64 = 5;
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CanaryTile {
+    pub median_s: i64,
+    pub share_pct: i64,
+    pub reused: i64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -490,6 +503,12 @@ impl Store {
         .await?
         .into_iter()
         .collect();
+        let sum = self.canary_summary(r).await?;
+        let canaries = (sum.reused >= CANARY_TILE_MIN).then(|| CanaryTile {
+            median_s: sum.median_s.unwrap_or(0),
+            share_pct: sum.share_pct(),
+            reused: sum.reused,
+        });
         Ok(Stats {
             range: r.key(),
             generated_at: chrono::Utc::now().to_rfc3339(),
@@ -514,6 +533,7 @@ impl Store {
             scanned_ips,
             recent,
             intel,
+            canaries,
         })
     }
 

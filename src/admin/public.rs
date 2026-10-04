@@ -931,6 +931,110 @@ show_labels = {show_labels}
         assert!(admin.recent.is_empty());
     }
 
+    #[tokio::test]
+    async fn canary_tile_shows_only_from_five_reuses() {
+        let (st, _dir) = state(true).await;
+        let mut conn = st.store.pool.acquire().await.unwrap();
+        let ctx = crate::store::data::Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        let now = chrono::Utc::now();
+        let ts = |h: i64| {
+            (now - chrono::Duration::hours(h))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+        let rec = |uid: &str,
+                   ts: String,
+                   ip: &str,
+                   path: &str,
+                   headers: String,
+                   answer: &str,
+                   v: Option<i64>| {
+            crate::cluster::record::Record::Request(Box::new(crate::cluster::record::RequestRec {
+                uid: uid.into(),
+                ts,
+                ip: ip.into(),
+                method: "GET".into(),
+                path: path.into(),
+                headers_json: headers,
+                labels_json: "[]".into(),
+                page_token: Some(format!("tok-{uid}")),
+                answer: Some(answer.into()),
+                decoy_v: v,
+                ..Default::default()
+            }))
+        };
+        for i in 0..5 {
+            let srv = format!("s{i}");
+            crate::store::data::apply(
+                &mut conn,
+                ctx,
+                &rec(
+                    &srv,
+                    ts(5),
+                    "198.51.100.1",
+                    "/.git/config",
+                    "[]".into(),
+                    "decoy:git-config",
+                    Some(1),
+                ),
+            )
+            .await
+            .unwrap();
+            if i < 4 {
+                let token =
+                    crate::canary::value(&format!("tok-{srv}"), crate::canary::Kind::GitToken);
+                let auth = data_encoding::BASE64.encode(format!("deploy:{token}").as_bytes());
+                crate::store::data::apply(
+                    &mut conn,
+                    ctx,
+                    &rec(
+                        &format!("u{i}"),
+                        ts(1),
+                        "198.51.100.2",
+                        "/x",
+                        format!(r#"[["authorization","Basic {auth}"]]"#),
+                        "not-found",
+                        None,
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        drop(conn);
+        assert!(
+            st.store.stats(Range::H24).await.unwrap().canaries.is_none(),
+            "4 reuses: hidden"
+        );
+        let mut conn = st.store.pool.acquire().await.unwrap();
+        let token = crate::canary::value("tok-s4", crate::canary::Kind::GitToken);
+        let auth = data_encoding::BASE64.encode(format!("deploy:{token}").as_bytes());
+        crate::store::data::apply(
+            &mut conn,
+            ctx,
+            &rec(
+                "u4",
+                ts(1),
+                "198.51.100.3",
+                "/x",
+                format!(r#"[["authorization","Basic {auth}"]]"#),
+                "not-found",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        let t = st.store.stats(Range::H24).await.unwrap().canaries.unwrap();
+        assert_eq!((t.reused, t.median_s, t.share_pct), (5, 4 * 3600, 100));
+        let html = get(&crate::admin::full_router(st.clone()), "/").await;
+        assert!(html.contains("Harvest to first use"));
+        assert!(!html.contains(&token));
+    }
+
     async fn get(app: &axum::Router, path: &str) -> String {
         let r = app
             .clone()
