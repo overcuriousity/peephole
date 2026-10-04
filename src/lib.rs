@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod canary;
 pub mod classify;
 pub mod cluster;
 pub mod config;
