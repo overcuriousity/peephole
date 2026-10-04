@@ -2496,6 +2496,7 @@ async fn canaries_page_lists_reuses_and_filters() {
         .text()
         .await
         .unwrap();
+    assert!(!page.contains("203.0.113.71"));
     // An IP the store does not know matches nothing, not everything.
     let page = admin
         .get(format!(
@@ -2508,7 +2509,6 @@ async fn canaries_page_lists_reuses_and_filters() {
         .await
         .unwrap();
     assert!(!page.contains("203.0.113.71"), "{page}");
-    assert!(!page.contains("203.0.113.71"));
     let nav = admin
         .get(format!("{admin_base}/admin"))
         .send()
