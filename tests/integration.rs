@@ -2387,3 +2387,73 @@ async fn canary_free_requests_answer_as_before() {
         .unwrap();
     assert_eq!(v, None);
 }
+
+#[tokio::test]
+async fn request_and_ip_pages_show_canary_reuse() {
+    let (base, store, dir) = spawn_trap().await;
+    let c = reqwest::Client::new();
+    c.get(format!("{base}/.git/config"))
+        .header("x-forwarded-for", "203.0.113.60")
+        .send()
+        .await
+        .unwrap();
+    let token = served_value(&store, "/.git/config", peephole::canary::Kind::GitToken).await;
+    c.get(format!("{base}/x"))
+        .basic_auth("deploy", Some(&token))
+        .header("x-forwarded-for", "203.0.113.61")
+        .send()
+        .await
+        .unwrap();
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (admin, admin_base) = enrolled_admin_client(store.clone(), cfg).await;
+    let served: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/.git/config'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    let used: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/x'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    let page = admin
+        .get(format!("{admin_base}/admin/requests/{served}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("Canaries served") && page.contains(&token),
+        "{page}"
+    );
+    assert!(page.contains("203.0.113.61"));
+    let page = admin
+        .get(format!("{admin_base}/admin/requests/{used}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains(&format!("/admin/requests/{served}"))
+            && page.contains("header:authorization")
+    );
+    let ip = admin
+        .get(format!("{admin_base}/ip/203.0.113.60"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(ip.contains("used by 1 other IP"), "{ip}");
+    // Nothing of it on the public IP page.
+    let public = reqwest::get(format!("{admin_base}/ip/203.0.113.60"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!public.contains("Canar") && !public.contains(&token));
+}

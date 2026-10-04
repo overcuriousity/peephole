@@ -407,6 +407,17 @@ impl Store {
         .await?)
     }
 
+    /// The recording node's key of a request (None on a standalone node).
+    pub async fn request_origin(&self, id: i64) -> Result<Option<Vec<u8>>> {
+        Ok(
+            sqlx::query_scalar("SELECT origin FROM requests WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.read)
+                .await?
+                .flatten(),
+        )
+    }
+
     pub async fn request_detail(&self, id: i64) -> Result<Option<RequestDetail>> {
         let Some(row) = self.request_by_id(id).await? else {
             return Ok(None);

@@ -201,9 +201,29 @@ pub fn owasp_name<S: AsRef<str>>(tag: S) -> &'static str {
     }
 }
 
+/// A time span for people: `45 s`, `12 min`, `3 h 5 min`, `2 d 4 h`.
+pub fn duration<S: std::borrow::Borrow<i64>>(secs: S) -> String {
+    let s = (*secs.borrow()).max(0);
+    match s {
+        0..60 => format!("{s} s"),
+        60..3600 => format!("{} min", s / 60),
+        3600..86400 => format!("{} h {} min", s / 3600, s % 3600 / 60),
+        _ => format!("{} d {} h", s / 86400, s % 86400 / 3600),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations_read_like_people_say_them() {
+        assert_eq!(duration(45), "45 s");
+        assert_eq!(duration(720), "12 min");
+        assert_eq!(duration(10_800), "3 h 0 min");
+        assert_eq!(duration(-5), "0 s");
+        assert_eq!(duration(200_000), "2 d 7 h");
+    }
 
     #[test]
     fn label_families_map_to_their_colour_class() {

@@ -511,6 +511,11 @@ struct RequestPage {
     same_ja4: Vec<RecentRequest>,
     ja4_ips: i64,
     ja4_days: i64,
+    /// Canaries this request was served (kind, value) and where its links point.
+    served: Vec<(String, String)>,
+    return_host: Option<String>,
+    /// Reuses where this request is either side.
+    reuses: Vec<crate::store::canaries::Reuse>,
 }
 
 async fn request_page(
@@ -533,6 +538,32 @@ async fn request_page(
         Some(j) => st.store.related_by_ja4(j, d.row.ip_id).await?,
         None => (vec![], 0),
     };
+    let name = d
+        .row
+        .answer
+        .as_deref()
+        .and_then(|a| a.strip_prefix("decoy:"));
+    let served = match (d.row.page_token.as_deref(), name) {
+        (Some(t), Some(n)) => crate::canary::served(d.row.decoy_v, t, n)
+            .into_iter()
+            .map(|(k, v)| (k.name().to_string(), v))
+            .collect(),
+        _ => vec![],
+    };
+    let origin = st.store.request_origin(id).await?;
+    let return_host = (!served.is_empty() && d.row.decoy_v.is_some()).then(|| {
+        let site = crate::canary::site::site(origin.as_deref());
+        crate::canary::site::return_host(crate::canary::site::request_host(&d.headers), &site)
+    });
+    let reuses = st
+        .store
+        .reuses(&crate::store::canaries::ReuseFilter {
+            request: Some(id),
+            range: Range::All,
+            limit: 50,
+            ..Default::default()
+        })
+        .await?;
     let request_target = match &d.row.query {
         Some(q) => format!("{}?{q}", d.row.path),
         None => d.row.path.clone(),
@@ -549,6 +580,9 @@ async fn request_page(
         same_ja4,
         ja4_ips,
         ja4_days: RELATED_JA4_DAYS,
+        served,
+        return_host,
+        reuses,
     })
 }
 

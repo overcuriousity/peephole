@@ -708,6 +708,9 @@ pub struct IpAdminData {
     /// Requests answered but not recorded in full (flood sampling).
     pub skipped: i64,
     pub host_keys: Vec<crate::store::hostkeys::HostKeyRow>,
+    /// Other IPs that used canaries harvested here, and other IPs whose
+    /// canaries this IP used.
+    pub canary_links: (i64, i64),
 }
 
 impl IpAdminData {
@@ -798,6 +801,7 @@ async fn ip_page(
             claims: state.store.claims_for_ip(ip.id).await?,
             skipped: state.store.skipped_for_ip(ip.id).await?,
             host_keys: state.store.host_keys_for_ip(ip.id).await?,
+            canary_links: state.store.canary_links_for_ip(ip.id).await?,
         })
     } else {
         None

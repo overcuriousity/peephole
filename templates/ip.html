@@ -71,6 +71,14 @@
     {% let keys = adm.host_keys %}{% include "_host_keys.html" %}
   </section>
   {% endif %}
+  {% if adm.canary_links.0 > 0 || adm.canary_links.1 > 0 %}
+  <section class="card" id="canaries">
+    <h2>Canaries</h2>
+    {% if adm.canary_links.0 > 0 %}<p>Credentials harvested here were used by {{ adm.canary_links.0 }} other IP{% if adm.canary_links.0 != 1 %}s{% endif %}.</p>{% endif %}
+    {% if adm.canary_links.1 > 0 %}<p>Used credentials harvested by {{ adm.canary_links.1 }} other IP{% if adm.canary_links.1 != 1 %}s{% endif %}.</p>{% endif %}
+    <p><a href="/admin/canaries?ip={{ ov.ip.ip }}">Show the reuses</a></p>
+  </section>
+  {% endif %}
   {% endif %}
 
   <section class="card">
