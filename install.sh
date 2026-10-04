@@ -120,7 +120,7 @@ public_ipv4() {
 # The big cloud this machine runs on, from its DMI data (empty elsewhere).
 # Their acceptable use policies forbid scanning others.
 cloud_from_dmi() {
-    local dir="${1:-/sys/class/dmi/id}" vendor product bios tag
+    local dir="$1" vendor product bios tag
     vendor="$(cat "$dir/sys_vendor" 2>/dev/null || true)"
     product="$(cat "$dir/product_name" 2>/dev/null || true)"
     bios="$(cat "$dir/bios_vendor" 2>/dev/null || true)"
@@ -656,7 +656,7 @@ if [ "$upgrade" -ne 1 ]; then
     # Where this runs. A big cloud forbids scanning others; behind 1:1 NAT
     # (most clouds) no interface carries the public address, which only the
     # metadata service knows.
-    CLOUD="$(cloud_from_dmi)"
+    CLOUD="$(cloud_from_dmi /sys/class/dmi/id)"
     md_provider=""; md_addr=""
     if [ "${PEEPHOLE_METADATA:-1}" = 1 ] && { [ -z "${PEEPHOLE_ROLES:-}" ] || has_role listener || has_role scanner; }; then
         read -r md_provider md_addr <<<"$(cloud_public_ip)" || true
