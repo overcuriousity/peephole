@@ -736,11 +736,46 @@ async fn run_nmap(nmap: PathBuf, argv: &[String]) -> Outcome {
     let stderr = String::from_utf8_lossy(&stderr);
     let detail = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let detail: String = detail.chars().take(500).collect();
+    let how = describe_exit(&status);
     Outcome::Failed(if detail.is_empty() {
-        format!("exit {:?}", status.code())
+        how
     } else {
-        format!("exit {:?}: {}", status.code(), detail.trim())
+        format!("{how}: {}", detail.trim())
     })
+}
+
+/// Why a finished nmap process ended, for the failure message. A normal
+/// non-zero exit keeps its code. A process killed by a signal has no exit
+/// code (`None` on Unix), and a bare "exit None" tells an operator nothing;
+/// naming the signal does, since the common cases need different fixes: the
+/// OOM killer (SIGKILL) means too little memory, a crash (SIGSEGV/SIGABRT)
+/// is an nmap bug or bad input, and SIGTERM/SIGINT is an external stop.
+fn describe_exit(status: &std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit {code}");
+    }
+    #[cfg(unix)]
+    if let Some(sig) = std::os::unix::process::ExitStatusExt::signal(status) {
+        let (name, hint) = signal_desc(sig);
+        return match hint {
+            Some(h) => format!("killed by {name} ({h})"),
+            None => format!("killed by {name}"),
+        };
+    }
+    "exited abnormally".into()
+}
+
+/// Name and, where it points at a likely cause, a short hint for the signals
+/// that end an nmap scan. Unknown signals fall back to their number.
+fn signal_desc(sig: i32) -> (String, Option<&'static str>) {
+    match sig {
+        2 => ("SIGINT".into(), Some("interrupted")),
+        6 => ("SIGABRT".into(), Some("nmap aborted")),
+        9 => ("SIGKILL".into(), Some("forced kill, often out of memory")),
+        11 => ("SIGSEGV".into(), Some("nmap crashed")),
+        15 => ("SIGTERM".into(), Some("terminated externally")),
+        other => (format!("signal {other}"), None),
+    }
 }
 
 /// Run nmap for `job`; in a cluster, renew the lease meanwhile and give up
@@ -996,6 +1031,26 @@ license_key = "k"
         );
         let argv = nmap_argv(2, &ip, &cfg, 1800).unwrap();
         assert_eq!(argv.iter().filter(|a| *a == "--host-timeout").count(), 1);
+    }
+
+    /// A signal-killed nmap names the signal instead of "exit None", and a
+    /// normal non-zero exit keeps its code.
+    #[cfg(unix)]
+    #[test]
+    fn describe_exit_names_the_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        // Low 7 bits hold the terminating signal; a plain exit code is <<8.
+        let killed = std::process::ExitStatus::from_raw(9);
+        assert_eq!(
+            describe_exit(&killed),
+            "killed by SIGKILL (forced kill, often out of memory)"
+        );
+        let crashed = std::process::ExitStatus::from_raw(11);
+        assert_eq!(describe_exit(&crashed), "killed by SIGSEGV (nmap crashed)");
+        let odd = std::process::ExitStatus::from_raw(31);
+        assert_eq!(describe_exit(&odd), "killed by signal 31");
+        let exited = std::process::ExitStatus::from_raw(1 << 8);
+        assert_eq!(describe_exit(&exited), "exit 1");
     }
 
     /// Levels are 1..=4: nothing else gets an argv, nothing is truncated.
