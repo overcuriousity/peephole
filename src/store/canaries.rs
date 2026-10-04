@@ -310,7 +310,16 @@ pub struct CanarySummary {
     pub median_s: Option<i64>,
     pub max_s: Option<i64>,
     pub per_kind: Vec<KindStat>,
+    /// Decoy answers that served canaries (one harvest each, however many
+    /// values it carried), and how many of them were used again.
+    pub harvests: i64,
+    pub harvests_reused: i64,
+    /// Median time from a harvest to the first use of any of its values.
+    pub harvest_median_s: Option<i64>,
 }
+
+/// A serving row: (request id, light-row batch id, light-row rowid).
+type Harvest = (Option<i64>, Option<i64>, Option<i64>);
 
 impl CanarySummary {
     pub fn share_pct(&self) -> i64 {
@@ -318,6 +327,15 @@ impl CanarySummary {
             0
         } else {
             (self.reused * 100 + self.served / 2) / self.served
+        }
+    }
+
+    /// Harvests used again, in percent of harvests.
+    pub fn harvest_share_pct(&self) -> i64 {
+        if self.harvests == 0 {
+            0
+        } else {
+            (self.harvests_reused * 100 + self.harvests / 2) / self.harvests
         }
     }
 }
@@ -331,8 +349,9 @@ impl Store {
             ""
         };
         // Per served canary: its kind and its first use by another request.
-        let mut q = sqlx::query_as::<_, (String, Option<i64>)>(sqlx::AssertSqlSafe(format!(
-            "SELECT c.kind,
+        type Row = (Option<i64>, Option<i64>, Option<i64>, String, Option<i64>);
+        let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(format!(
+            "SELECT c.request_id, c.batch_id, c.skip_rowid, c.kind,
                     (SELECT MIN(CAST(strftime('%s', u.ts) AS INTEGER) - CAST(strftime('%s', c.ts) AS INTEGER))
                      FROM request_tokens t JOIN requests u ON u.id = t.request_id
                      WHERE t.value_hash = c.value_hash
@@ -345,7 +364,13 @@ impl Store {
         let rows = q.fetch_all(&self.read).await?;
         let mut per: std::collections::BTreeMap<String, (i64, i64)> = Default::default();
         let mut firsts: Vec<i64> = vec![];
-        for (kind, first) in &rows {
+        // Per harvest (serving row): the first use of any of its values.
+        let mut harvests: std::collections::BTreeMap<Harvest, Option<i64>> = Default::default();
+        for (req, batch, rowid, kind, first) in &rows {
+            let h = harvests.entry((*req, *batch, *rowid)).or_default();
+            if let Some(f) = first {
+                *h = Some(h.map_or(*f, |x| x.min(*f)));
+            }
             let e = per.entry(kind.clone()).or_default();
             e.0 += 1;
             if let Some(f) = first {
@@ -354,7 +379,14 @@ impl Store {
             }
         }
         firsts.sort_unstable();
+        let mut harvest_firsts: Vec<i64> =
+            harvests.values().flatten().map(|f| (*f).max(0)).collect();
+        harvest_firsts.sort_unstable();
         Ok(CanarySummary {
+            harvests: harvests.len() as i64,
+            harvests_reused: harvest_firsts.len() as i64,
+            harvest_median_s: (!harvest_firsts.is_empty())
+                .then(|| harvest_firsts[harvest_firsts.len() / 2]),
             served: rows.len() as i64,
             reused: firsts.len() as i64,
             median_s: (!firsts.is_empty()).then(|| firsts[firsts.len() / 2]),

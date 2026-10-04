@@ -1035,6 +1035,78 @@ show_labels = {show_labels}
         assert!(!html.contains(&token));
     }
 
+    #[tokio::test]
+    async fn one_harvest_used_once_never_shows_on_the_wall() {
+        // A checker posting a whole .env back carries seven canaries: still
+        // one event, so the tile stays hidden.
+        let (st, _dir) = state(true).await;
+        let mut conn = st.store.pool.acquire().await.unwrap();
+        let ctx = crate::store::data::Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        let now = chrono::Utc::now();
+        let ts = |h: i64| {
+            (now - chrono::Duration::hours(h))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+        let rec = |uid: &str,
+                   ts: String,
+                   path: &str,
+                   body: Option<Vec<u8>>,
+                   answer: &str,
+                   v: Option<i64>| {
+            crate::cluster::record::Record::Request(Box::new(crate::cluster::record::RequestRec {
+                uid: uid.into(),
+                ts,
+                ip: "198.51.100.1".into(),
+                method: "POST".into(),
+                path: path.into(),
+                headers_json: "[]".into(),
+                body,
+                labels_json: "[]".into(),
+                page_token: Some(format!("tok-{uid}")),
+                answer: Some(answer.into()),
+                decoy_v: v,
+                ..Default::default()
+            }))
+        };
+        crate::store::data::apply(
+            &mut conn,
+            ctx,
+            &rec("env", ts(5), "/.env", None, "decoy:dotenv", Some(1)),
+        )
+        .await
+        .unwrap();
+        let all: Vec<String> = crate::canary::served(Some(1), "tok-env", "dotenv")
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        let body = all
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("k{i}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        crate::store::data::apply(
+            &mut conn,
+            ctx,
+            &rec(
+                "chk",
+                ts(1),
+                "/check",
+                Some(body.into_bytes()),
+                "not-found",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        assert!(st.store.stats(Range::H24).await.unwrap().canaries.is_none());
+    }
+
     async fn get(app: &axum::Router, path: &str) -> String {
         let r = app
             .clone()

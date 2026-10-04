@@ -165,7 +165,8 @@ pub struct Stats {
     pub canaries: Option<CanaryTile>,
 }
 
-/// Fewest reuses before the wall shows the canary tile.
+/// Fewest reused harvests (distinct decoy answers) before the wall shows
+/// the canary tile.
 pub const CANARY_TILE_MIN: i64 = 5;
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -504,10 +505,12 @@ impl Store {
         .into_iter()
         .collect();
         let sum = self.canary_summary(r).await?;
-        let canaries = (sum.reused >= CANARY_TILE_MIN).then(|| CanaryTile {
-            median_s: sum.median_s.unwrap_or(0),
-            share_pct: sum.share_pct(),
-            reused: sum.reused,
+        // Counted per harvest, not per value: one request carrying many
+        // values of one decoy is one event.
+        let canaries = (sum.harvests_reused >= CANARY_TILE_MIN).then(|| CanaryTile {
+            median_s: sum.harvest_median_s.unwrap_or(0),
+            share_pct: sum.harvest_share_pct(),
+            reused: sum.harvests_reused,
         });
         Ok(Stats {
             range: r.key(),
