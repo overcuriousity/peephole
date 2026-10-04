@@ -273,8 +273,8 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
         "INSERT OR IGNORE INTO requests (uid, origin, hlc, ts, ip_id, method, path, query,
            headers_json, body, labels_json, owasp_json, severity, scan_level, is_fp_claim,
            page_token, answer, status, unrecorded, transport, via_proxy, raw_head,
-           tls_client_hello, ja4, build, rules)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           tls_client_hello, ja4, build, rules, decoy_v)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -302,6 +302,7 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(&r.ja4)
     .bind(&r.build)
     .bind(rules)
+    .bind(r.decoy_v)
     .execute(&mut *conn)
     .await?;
     Ok(Effect::Applied)
@@ -369,12 +370,17 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
     };
     for r in &b.rows {
         sqlx::query(
-            "INSERT INTO skipped_requests (batch_id, ts_ms, method, path) VALUES (?,?,?,?)",
+            "INSERT INTO skipped_requests (batch_id, ts_ms, method, path, page_token, host, answer, decoy_v)
+             VALUES (?,?,?,?,?,?,?,?)",
         )
         .bind(id)
         .bind(row_ms(r.ts_ms))
         .bind(cut(&r.method, 64))
         .bind(cut(&r.path, SKIP_PATH_MAX))
+        .bind(r.page_token.as_deref().map(|t| cut(t, 64)))
+        .bind(r.host.as_deref().map(|h| cut(h, 255)))
+        .bind(r.answer.as_deref().map(|a| cut(a, 64)))
+        .bind(r.decoy_v)
         .execute(&mut *conn)
         .await?;
     }
@@ -1212,6 +1218,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
         Option<String>,
         String,
         Option<String>,
+        Option<i64>,
     );
     type Req = (
         String,
@@ -1267,7 +1274,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                 Some(r) => {
                     let x: ReqExtra = sqlx::query_as(
                         "SELECT build, answer, status, unrecorded, transport, via_proxy, raw_head,
-                                tls_client_hello, ja4, owasp_json, rules
+                                tls_client_hello, ja4, owasp_json, rules, decoy_v
                          FROM requests WHERE uid = ?",
                     )
                     .bind(uid)
@@ -1298,6 +1305,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         ja4: x.8,
                         owasp_json: Some(x.9).filter(|j| j != "[]"),
                         rules: x.10,
+                        decoy_v: x.11,
                     })))
                 }
             }
@@ -1313,9 +1321,18 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
             match b {
                 None => None,
                 Some((id, ip, dropped, build)) => {
-                    let rows: Vec<(i64, String, String)> = sqlx::query_as(
-                        "SELECT ts_ms, method, path FROM skipped_requests
-                         WHERE batch_id = ? ORDER BY rowid",
+                    type Row = (
+                        i64,
+                        String,
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                        Option<i64>,
+                    );
+                    let rows: Vec<Row> = sqlx::query_as(
+                        "SELECT ts_ms, method, path, page_token, host, answer, decoy_v
+                         FROM skipped_requests WHERE batch_id = ? ORDER BY rowid",
                     )
                     .bind(id)
                     .fetch_all(&mut *conn)
@@ -1326,10 +1343,16 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         dropped,
                         rows: rows
                             .into_iter()
-                            .map(|(ts_ms, method, path)| crate::cluster::record::SkipRow {
-                                ts_ms,
-                                method,
-                                path,
+                            .map(|(ts_ms, method, path, page_token, host, answer, decoy_v)| {
+                                crate::cluster::record::SkipRow {
+                                    ts_ms,
+                                    method,
+                                    path,
+                                    page_token,
+                                    host,
+                                    answer,
+                                    decoy_v,
+                                }
                             })
                             .collect(),
                         build,
@@ -1435,6 +1458,95 @@ mod tests {
             page_token: None,
             ..Default::default()
         }))
+    }
+
+    #[tokio::test]
+    async fn decoy_fields_rebuild_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        let Record::Request(mut r) = request("u-dec", "/.env") else {
+            unreachable!()
+        };
+        r.page_token = Some("0f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a".into());
+        r.answer = Some("decoy:dotenv".into());
+        r.decoy_v = Some(1);
+        let rec = Record::Request(r);
+        apply(&mut conn, ctx, &rec).await.unwrap();
+        assert_eq!(
+            rebuild(&mut conn, "request", "u-dec").await.unwrap(),
+            Some(rec)
+        );
+
+        let b = Record::SkipBatch(crate::cluster::record::SkipBatchRec {
+            uid: "b-dec".into(),
+            ip: "198.51.100.9".into(),
+            dropped: 0,
+            rows: vec![
+                crate::cluster::record::SkipRow {
+                    ts_ms: 1_791_000_000_000,
+                    method: "GET".into(),
+                    path: "/a".into(),
+                    page_token: None,
+                    host: None,
+                    answer: None,
+                    decoy_v: None,
+                },
+                crate::cluster::record::SkipRow {
+                    ts_ms: 1_791_000_000_500,
+                    method: "GET".into(),
+                    path: "/.git/config".into(),
+                    page_token: Some("t".into()),
+                    host: Some("203.0.113.7".into()),
+                    answer: Some("decoy:git-config".into()),
+                    decoy_v: Some(1),
+                },
+            ],
+            build: String::new(),
+        });
+        apply(&mut conn, ctx, &b).await.unwrap();
+        assert_eq!(
+            rebuild(&mut conn, "skip_batch", "b-dec").await.unwrap(),
+            Some(b)
+        );
+    }
+
+    #[test]
+    fn old_records_rebuild_byte_for_byte() {
+        // A record from a peer without the new fields decodes, and encodes
+        // to the same bytes (the fields are left out when unset).
+        let row = crate::cluster::record::SkipRow {
+            ts_ms: 1,
+            method: "GET".into(),
+            path: "/".into(),
+            page_token: None,
+            host: None,
+            answer: None,
+            decoy_v: None,
+        };
+        let bytes = crate::cluster::rpc::cbor::encode(&row).unwrap();
+        #[derive(serde::Serialize)]
+        struct Old {
+            ts_ms: i64,
+            method: String,
+            path: String,
+        }
+        let old = crate::cluster::rpc::cbor::encode(&Old {
+            ts_ms: 1,
+            method: "GET".into(),
+            path: "/".into(),
+        })
+        .unwrap();
+        assert_eq!(bytes, old);
+        let back: crate::cluster::record::SkipRow =
+            crate::cluster::rpc::cbor::decode(&old).unwrap();
+        assert_eq!(back, row);
     }
 
     /// A log row as the replication layer would hold it for an applied,
@@ -1956,6 +2068,7 @@ mod tests {
                     ts_ms: 1,
                     method: "GET".into(),
                     path: "/".into(),
+                    ..Default::default()
                 }],
                 build: build.clone(),
             }),
@@ -2011,6 +2124,7 @@ mod tests {
             ts_ms,
             method: "GET".into(),
             path: path.into(),
+            ..Default::default()
         };
         let b = Record::SkipBatch(SkipBatchRec {
             build: String::new(),
@@ -2078,6 +2192,7 @@ mod tests {
             ts_ms,
             method: "GET".into(),
             path: path.into(),
+            ..Default::default()
         };
         // Out of time order on purpose: the order sent is kept.
         let b = Record::SkipBatch(SkipBatchRec {
@@ -2133,6 +2248,7 @@ mod tests {
                 ts_ms: i,
                 method: "GET".into(),
                 path: "/".into(),
+                ..Default::default()
             })
             .collect();
         let b = Record::SkipBatch(SkipBatchRec {
@@ -2238,6 +2354,7 @@ mod tests {
             ts_ms,
             method: "GET".into(),
             path: "/".into(),
+            ..Default::default()
         };
         let b = Record::SkipBatch(SkipBatchRec {
             build: String::new(),

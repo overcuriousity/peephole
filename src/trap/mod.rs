@@ -696,6 +696,8 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 ja4: c.conn.as_ref().and_then(|k| k.ja4.clone()),
                 // Claims are not classified.
                 rules: (!c.is_fp_claim).then(|| state.classifier.fingerprint().to_string()),
+                ts: None,
+                decoy_v: None,
             },
         )
         .await?;

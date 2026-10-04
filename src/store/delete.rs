@@ -76,6 +76,7 @@ mod tests {
                         ts_ms: chrono::Utc::now().timestamp_millis(),
                         method: "GET".into(),
                         path: "/y".into(),
+                        ..Default::default()
                     }],
                 )
                 .await

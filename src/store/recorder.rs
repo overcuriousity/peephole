@@ -144,7 +144,7 @@ impl Recorder {
         self.write(vec![Record::Request(Box::new(RequestRec {
             build: crate::COMMIT.into(),
             uid: uid.clone(),
-            ts: now_ts(),
+            ts: n.ts.clone().unwrap_or_else(now_ts),
             ip: ip.to_string(),
             method: n.method.clone(),
             path: n.path.clone(),
@@ -168,6 +168,7 @@ impl Recorder {
             tls_client_hello: n.tls_client_hello.clone(),
             ja4: n.ja4.clone(),
             rules: n.rules.clone(),
+            decoy_v: n.decoy_v,
         }))])
         .await?;
         sqlx::query_as("SELECT id, ip_id FROM requests WHERE uid = ?")

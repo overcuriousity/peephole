@@ -1535,6 +1535,7 @@ async fn blocking_a_peer_hides_its_records_until_unblocked() {
                 ts_ms: 1,
                 method: "GET".into(),
                 path: "/a0".into(),
+                ..Default::default()
             }],
         )
         .await
@@ -1667,6 +1668,7 @@ async fn standalone_history_is_adopted_and_backfilled() {
             ts_ms: 1,
             method: "GET".into(),
             path: path.into(),
+            ..Default::default()
         };
         s.local()
             .insert_skip_batch("192.0.2.200", 3, vec![light("/s1"), light("/s2")])

@@ -1103,6 +1103,7 @@ mod tests {
             ts_ms,
             method: "GET".into(),
             path: path.into(),
+            ..Default::default()
         };
         rec.insert_skip_batch(ip, 3, vec![light(now, "/s1"), light(now + 1, "/s2")])
             .await
@@ -1267,6 +1268,7 @@ mod tests {
             ts_ms,
             method: "GET".into(),
             path: path.into(),
+            ..Default::default()
         };
         s.local()
             .insert_skip_batch(

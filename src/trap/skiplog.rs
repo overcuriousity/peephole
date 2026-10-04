@@ -111,6 +111,7 @@ impl SkipLog {
             ts_ms,
             method: cut(method, 64).to_string(),
             path: cut(path, SKIP_PATH_MAX).to_string(),
+            ..Default::default()
         });
         if p.rows.len() >= SKIP_BATCH_MAX {
             return map.remove(&ip).map(|p| batch(ip, p));
