@@ -14,7 +14,7 @@
   </div>
   <div class="tiles">
     <div class="tile"><span class="label">Requests</span><div class="value">{{ crate::admin::views::thousands(ov.request_count) }}</div>{% if let Some(a) = admin %}{% if a.skipped > 0 %}<div class="hint">+ {{ a.skipped }} not recorded in full</div>{% endif %}{% endif %}</div>
-    <div class="tile"><span class="label">Rank</span><div class="value">#{{ crate::admin::views::thousands(ov.rank) }}</div><div class="hint">of {{ crate::admin::views::thousands(ov.ranked) }} sources, all time</div></div>
+    <div class="tile"><span class="label">Rank</span><div class="value">#{{ crate::admin::views::thousands(ov.rank) }}</div><div class="hint">of {{ crate::admin::views::thousands(ov.ranked) }}</div></div>
     <div class="tile"><span class="label">Max severity</span><div class="value">{% let sev = ov.max_severity %}{% include "_severity.html" %}</div></div>
     {% if let Some(adm) = admin %}<div class="tile"><span class="label">Open ports</span><div class="value">{% if let Some(sc) = adm.scans.first() %}{{ sc.s.open_ports }}{% else %}—{% endif %}</div><div class="hint">{% if let Some(sc) = adm.scans.first() %}newest scan, level {{ sc.s.level }}{% else %}not scanned{% endif %}</div></div>{% endif %}
   </div>
@@ -22,7 +22,7 @@
 
 <div class="stack">
   <section class="card" id="intel">
-    <div class="card-head"><h2>Intelligence</h2><span class="muted">{% if admin.is_some() %}every provider, every node · <a href="/admin/lookup?ip={{ ov.ip.ip }}">look up now</a>{% else %}enrichment results{% endif %}</span></div>
+    <div class="card-head"><h2>Intelligence</h2>{% if admin.is_some() %}<a href="/admin/lookup?ip={{ ov.ip.ip }}">look up now →</a>{% endif %}</div>
     <div class="intel-grid">
     {% for c in intel %}
       <div class="intel">
@@ -40,7 +40,7 @@
           </details>
           {% endif %}
         {% when None %}
-          <p class="muted">No result yet. Nothing has looked this address up with this provider (its database or API key may not be configured on any node).</p>
+          <p class="muted">No result yet.</p>
         {% endmatch %}
       </div>
     {% endfor %}
@@ -49,7 +49,7 @@
 
   {% if let Some(adm) = admin %}
   <section class="card ip-scans" id="scans">
-    <div class="card-head"><h2>Counter-scans</h2><span class="muted">admin only</span></div>
+    <div class="card-head"><h2>Counter-scans</h2></div>
     {% if !adm.jobs.is_empty() %}
     <h3>Jobs</h3>
     <div class="table-wrap wide"><table>
@@ -70,11 +70,11 @@
     <div class="card-head"><h2>Activity</h2><span class="muted">UTC</span></div>
     <div class="ip-activity">
       <div>
-        <span class="label">Last 7 days · requests per hour, by severity</span>
+        <span class="label">Last 7 days</span>
         <div class="chart" data-week="{{ week_json }}" role="img" aria-label="Requests per hour over the last 7 days"></div>
       </div>
       <div>
-        <span class="label">Last 26 weeks · one cell per day, coloured by its highest severity</span>
+        <span class="label">Last 26 weeks · highest severity per day</span>
         <div class="chart calendar" data-calendar="{{ calendar_json }}" data-days="{{ crate::store::browse::CALENDAR_DAYS }}" role="img" aria-label="Days with requests over the last 26 weeks"></div>
       </div>
       <div class="legend sev-legend" aria-hidden="true">{% for s in 0..5 %}<span><i class="swatch sev-fill-{{ s }}"></i>severity {{ s }}</span>{% endfor %}</div>
@@ -84,7 +84,7 @@
 
   {% if labels && !ov.families.is_empty() %}
   <section class="card">
-    <div class="card-head"><h2>What it was after</h2><span class="muted">label hits per attack family</span></div>
+    <div class="card-head"><h2>What it was after</h2></div>
     <ul class="families">
       {% for f in ov.families %}
       <li>
@@ -99,7 +99,7 @@
   {% endif %}
 
   <section class="card">
-    <div class="card-head"><h2>Neighbourhood</h2><span class="muted">other sources nearby that hit the trap</span></div>
+    <div class="card-head"><h2>Neighbourhood</h2></div>
     <div class="neighbours">
       <div>
         <h3>Same network{% if !ov.net.is_empty() %} · <a class="mono" href="/ips?q={{ ov.net }}">{{ ov.net }}</a>{% endif %}</h3>
@@ -111,19 +111,19 @@
           <li><a class="mono ranked-name" href="/ip/{{ n.ip }}">{{ n.ip }}</a><span class="num">{{ crate::admin::views::thousands(n.request_count) }}</span>{% let sev = n.max_severity %}{% include "_severity.html" %}{% let v = n.request_count %}{% let max = nmax %}{% include "_bar.html" %}</li>
           {% endfor %}
         </ol>
-        {% else %}<p class="muted small">No other address of this network so far.</p>{% endif %}
+        {% else %}<p class="muted small">None yet.</p>{% endif %}
       </div>
       <div>
         <h3>Same ASN{% if let Some(a) = ov.ip.asn %} · <a href="/ips?asn={{ a }}">AS{{ a }}</a>{% endif %}</h3>
         <div class="big-stat">{{ crate::admin::views::thousands(ov.asn_count) }}</div>
-        <p class="muted small">{% if ov.ip.asn.is_some() %}other addresses of {{ ov.ip.asn_org.as_deref().unwrap_or("this network operator") }} with requests.{% else %}The ASN of this address is not known.{% endif %}</p>
+        {% if ov.ip.asn.is_none() %}<p class="muted small">ASN unknown.</p>{% endif %}
       </div>
     </div>
   </section>
 
   {% if let Some(adm) = admin %}
   <section class="card">
-    <div class="card-head"><h2>Fingerprints</h2><span class="muted">admin only</span></div>
+    <div class="card-head"><h2>Fingerprints</h2></div>
     {% if adm.fingerprints.is_empty() %}<p class="muted">No browser fingerprints collected.</p>{% endif %}
     {% for f in adm.fingerprints %}
       <p><a class="mono" href="/admin/fingerprints#{{ f.hash }}">{{ f.hash }}</a> ×{{ f.count }} — seen from <b>{{ f.other_ips }}</b> other IPs
@@ -132,7 +132,7 @@
   </section>
 
   <section class="card">
-    <div class="card-head"><h2>False-positive claims</h2><span class="muted">admin only</span></div>
+    <div class="card-head"><h2>False-positive claims</h2></div>
     {% if adm.claims.is_empty() %}<p class="muted">None.</p>{% endif %}
     {% for c in adm.claims %}<p><span class="mono">{{ c.ts }}</span> · {{ c.contact_email.as_deref().unwrap_or("no email") }} · <span class="muted">{{ c.user_agent }}</span></p>{% endfor %}
   </section>
@@ -163,11 +163,11 @@
   {% if can_delete %}
   <section class="card danger-zone">
     <h2>Danger zone</h2>
-    <p class="muted">Removes this IP with all its requests, scans, fingerprints and claims. Cannot be undone.</p>
+    <p class="muted">The IP and everything recorded about it. Cannot be undone.</p>
     <button class="btn btn-danger" type="button" data-confirm="dlg-delete-ip">Delete this IP</button>
     <dialog id="dlg-delete-ip">
       <h3>Delete {{ ov.ip.ip }}?</h3>
-      <p class="muted">All {{ ov.request_count }} requests and every dependent record will be removed.</p>
+      <p class="muted">{{ ov.request_count }} requests and all related records.</p>
       <form method="post" action="/admin/ips/{{ ov.ip.ip }}/delete" class="actions">
         <button class="btn" type="button" data-close>Cancel</button>
         <button class="btn btn-danger" type="submit">Delete</button>

@@ -1,7 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — IPs{% endblock %}
 {% block content %}
-<div class="page-head"><div><h1>Source IPs</h1><p class="muted">Every address that has hit the trap. Search by IP, prefix or CIDR.</p></div></div>
+<div class="page-head"><div><h1>Source IPs</h1></div></div>
 <form class="filters" method="get" action="/ips">
   <label>Address / prefix / CIDR <input name="q" value="{{ f.q.as_deref().unwrap_or_default() }}" placeholder="203.0.113.0/24"></label>
   <label>Country <input name="country" size="3" maxlength="2" value="{{ f.country.as_deref().unwrap_or_default() }}" placeholder="DE"></label>
@@ -29,11 +29,11 @@
 {% if can_delete %}
 <div class="row bulk-bar">
   <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-sel" data-needs-checked="bulk-form">Delete selected</button>
-  <dialog id="dlg-bulk-sel"><h3>Delete the selected IPs?</h3><p class="muted">Each IP goes with all its requests, scans, fingerprints and claims. Cannot be undone.</p>
+  <dialog id="dlg-bulk-sel"><h3>Delete the selected IPs?</h3><p class="muted">With everything recorded about them. Cannot be undone.</p>
     <div class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit" form="bulk-form">Delete selected</button></div></dialog>
   {% if let Some(t) = bulk_total %}
   <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-all">Delete all {{ t }} matching</button>
-  <dialog id="dlg-bulk-all"><h3>Delete all {{ t }} IPs matching this filter?</h3><p class="muted">Across every page, with everything recorded about them. Cannot be undone.</p>
+  <dialog id="dlg-bulk-all"><h3>Delete all {{ t }} IPs matching this filter?</h3><p class="muted">On every page. Cannot be undone.</p>
     <form method="post" action="/admin/ips/bulk-delete" class="actions">
       <input type="hidden" name="all" value="1">
       {% include "_ip_filter_hidden.html" %}

@@ -5,9 +5,8 @@
   <img src="/assets/logo.svg?v={{ chrome.stamp }}" alt="">
   <h1>Enroll security key</h1>
   {% if chrome.authed %}
-  <p class="muted">You are logged in; the new key is added to your account.</p>
   {% else %}
-  <p class="muted">Enter the one-time setup token printed to the service log on first start.</p>
+  <p class="muted">The setup token is in the service log.</p>
   <label class="label">Setup token <input type="text" data-token autocomplete="off"></label>
   {% endif %}
   <label class="label">Key label (optional) <input type="text" data-label placeholder="yubikey-5"></label>

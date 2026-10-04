@@ -102,7 +102,7 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             intel.get(crate::intel::MAXMIND_CLUSTER_SEEN),
         ) {
             (None, Some(seen)) => {
-                format!("not on this node; lookups shared by a cluster member (seen {seen})")
+                format!("via a cluster member (seen {seen})")
             }
             _ => fetched("maxmind_last_fetch"),
         },
@@ -150,9 +150,7 @@ async fn api_provider_states(st: &AdminState) -> anyhow::Result<Vec<(&'static st
                         format!("waiting · {s}")
                     }
                 }
-                None if served_elsewhere(p.name) => {
-                    "not on this node; looked up by a cluster member".to_string()
-                }
+                None if served_elsewhere(p.name) => "via a cluster member".to_string(),
                 None => "not configured".to_string(),
             };
             if let Some(n) = counts.get(p.name) {

@@ -1,7 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — requests{% endblock %}
 {% block content %}
-<div class="page-head"><div><h1>Requests</h1><p class="muted">Every captured request (admin only). Paths and query strings are shown as received.</p></div></div>
+<div class="page-head"><div><h1>Requests</h1></div></div>
 <form class="filters" method="get" action="/requests">
   <label>IP <input name="ip" value="{{ f.ip.as_deref().unwrap_or_default() }}"></label>
   <label>Path contains <input name="path" value="{{ f.path.as_deref().unwrap_or_default() }}"></label>
@@ -19,11 +19,11 @@
 {% if can_delete %}
 <div class="row bulk-bar">
   <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-sel" data-needs-checked="bulk-form">Delete selected</button>
-  <dialog id="dlg-bulk-sel"><h3>Delete the selected requests?</h3><p class="muted">Only the rows checked on this page. Cannot be undone.</p>
+  <dialog id="dlg-bulk-sel"><h3>Delete the selected requests?</h3><p class="muted">Cannot be undone.</p>
     <div class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit" form="bulk-form">Delete selected</button></div></dialog>
   {% if let Some(t) = bulk_total %}
   <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-all">Delete all {{ t }} matching</button>
-  <dialog id="dlg-bulk-all"><h3>Delete all {{ t }} requests matching this filter?</h3><p class="muted">Across every page, not just the rows shown. Cannot be undone.</p>
+  <dialog id="dlg-bulk-all"><h3>Delete all {{ t }} requests matching this filter?</h3><p class="muted">On every page. Cannot be undone.</p>
     <form method="post" action="/admin/requests/bulk-delete" class="actions">
       <input type="hidden" name="all" value="1">
       {% include "_request_filter_hidden.html" %}

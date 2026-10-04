@@ -5,12 +5,12 @@
 <div class="page-head wall-head" data-range="{{ range.key() }}" id="wall" data-refresh="{{ crate::store::stats::ttl(range.clone()).as_secs() }}">
   <div>
     <h1>Wall of shame</h1>
-    <p class="muted">Everything that knocked on a door that does not exist. {{ range.label() }}.</p>
+    <p class="muted">{{ range.label() }}</p>
     <p class="pulse" data-region="pulse">{% if let Some(t) = stats.last_request %}<span class="pulse-dot" aria-hidden="true"></span><span>last hit <time datetime="{{ t }}" data-ago>{{ crate::admin::views::ago(t) }}</time> ago</span>{% else %}<span class="muted">nothing recorded yet</span>{% endif %}<span class="muted" data-updated></span></p>
   </div>
   {% let base = "/" %}{% include "_range.html" %}
 </div>
-{% if stale %}<div class="banner banner-warning">Intel data (Tor exit list / GeoIP) is missing or older than 48 hours — check the scheduler.</div>{% endif %}
+{% if stale %}<div class="banner banner-warning">Tor exit list or GeoIP data missing or older than 48 h.</div>{% endif %}
 
 <div class="tiles kpis" data-region="kpis">
   <div class="tile tile-hero">
@@ -21,29 +21,29 @@
   </div>
   <div class="tile"><span class="label">Unique IPs</span><div class="value">{{ crate::admin::views::thousands(stats.unique_ips) }}</div>
     <div class="hint">{% if let Some((d, dir)) = delta_ips %}<span class="delta" data-dir="{{ dir }}">{{ d }}</span> vs previous{% else %}all time{% endif %}</div></div>
-  <div class="tile"><span class="label">New IPs</span><div class="value">{{ crate::admin::views::thousands(stats.new_ips) }}</div><div class="hint">first seen in this range</div></div>
-  <div class="tile"><span class="label">Countries</span><div class="value">{{ stats.countries }}</div><div class="hint">with at least one source</div></div>
-  <div class="tile"><span class="label">Tor exits</span><div class="value">{{ stats.tor_ips }}</div><div class="hint">never scanned back</div></div>
-  <div class="tile"><span class="label">Counter-scans</span><div class="value brand">{{ crate::admin::views::thousands(stats.scans_done) }}</div><div class="hint">{{ stats.scanned_ips }} sources scanned back</div></div>
+  <div class="tile"><span class="label">New IPs</span><div class="value">{{ crate::admin::views::thousands(stats.new_ips) }}</div><div class="hint">first seen in range</div></div>
+  <div class="tile"><span class="label">Countries</span><div class="value">{{ stats.countries }}</div></div>
+  <div class="tile"><span class="label">Tor exits</span><div class="value">{{ stats.tor_ips }}</div></div>
+  <div class="tile"><span class="label">Counter-scans</span><div class="value brand">{{ crate::admin::views::thousands(stats.scans_done) }}</div><div class="hint">{{ stats.scanned_ips }} sources</div></div>
 </div>
 
 <div class="stack">
   <section class="card">
-    <div class="card-head"><h2>Requests over time</h2><span class="muted">{% if range.hourly() %}per hour{% else %}per day{% endif %}, by severity · UTC</span></div>
+    <div class="card-head"><h2>Requests over time</h2><span class="muted">{% if range.hourly() %}per hour{% else %}per day{% endif %} · UTC</span></div>
     <div class="chart" id="chart-timeline" role="img" aria-label="Requests over time, stacked by severity"></div>
     <div class="legend sev-legend" aria-hidden="true">{% for s in 0..5 %}<span><i class="swatch sev-fill-{{ s }}"></i>severity {{ s }}</span>{% endfor %}</div>
   </section>
 
   <div class="grid-2">
     <section class="card">
-      <div class="card-head"><h2>When they knock</h2><span class="muted">requests per weekday and hour · UTC</span></div>
+      <div class="card-head"><h2>When they knock</h2><span class="muted">UTC</span></div>
       <div class="chart" id="chart-heatmap" role="img" aria-label="Requests per weekday and hour"></div>
       <div class="legend ramp-legend" id="heatmap-legend" aria-hidden="true"></div>
     </section>
     {% if labels %}
     <section class="card" data-region="families">
-      <div class="card-head"><h2>What they were after</h2><span class="muted">requests per attack family</span></div>
-      {% if stats.families.is_empty() %}<p class="empty">No classified requests in this range.</p>{% else %}
+      <div class="card-head"><h2>What they were after</h2></div>
+      {% if stats.families.is_empty() %}<p class="empty">None.</p>{% else %}
       <ul class="families">
         {% for f in stats.families %}
         <li>
@@ -53,12 +53,11 @@
         </li>
         {% endfor %}
       </ul>
-      <p class="muted small">A request counts once per family it touched; one can touch several.</p>
       {% endif %}
     </section>
     {% else %}
     <section class="card">
-      <div class="card-head"><h2>Severity</h2><span class="muted">requests per severity</span></div>
+      <div class="card-head"><h2>Severity</h2></div>
       <div class="chart" id="chart-severity"></div>
       <table class="visually-hidden"><tbody>{% for n in stats.severity_distribution %}<tr><td>{{ n.name }}</td><td>{{ n.count }}</td></tr>{% endfor %}</tbody></table>
     </section>
@@ -85,7 +84,7 @@
 
   {% if labels %}
   <section class="card" data-region="owasp">
-    <div class="card-head"><h2>OWASP map</h2><span class="muted">requests per OWASP Top 10 (2021) class and Automated Threat</span></div>
+    <div class="card-head"><h2>OWASP map</h2><span class="muted">requests</span></div>
     <div class="owasp-grid">
       {% for t in owasp %}
       <div class="owasp-tile" data-bin="{{ t.bin }}" title="{{ t.tag }} {{ t.name }}: {{ t.count }} requests">
@@ -99,7 +98,7 @@
   {% endif %}
 
   <section class="card">
-    <div class="card-head"><h2>Where it comes from</h2><span class="muted">unique source IPs per country · click a country to list its IPs</span></div>
+    <div class="card-head"><h2>Where it comes from</h2><span class="muted">unique IPs</span></div>
     <div class="map-wrap">
       <div>
         <div class="map" id="map" data-src="/assets/world.svg?v={{ chrome.stamp }}"></div>
@@ -133,7 +132,7 @@
       {% if stats.top_ips.is_empty() %}<p class="empty">Nothing yet.</p>{% endif %}
     </section>
     <section class="card" data-region="top-asns">
-      <div class="card-head"><h2>Top networks</h2><span class="muted">unique IPs per ASN</span></div>
+      <div class="card-head"><h2>Top networks</h2><span class="muted">unique IPs</span></div>
       <ol class="ranked">
         {% for n in stats.top_asns.iter().take(10) %}
         <li><span class="ranked-name">{{ n.name }}</span><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = asn_max %}{% include "_bar.html" %}</li>
@@ -144,8 +143,8 @@
   </div>
 
   <section class="card" data-region="ports">
-    <div class="card-head"><h2>What the scanners run</h2><span class="muted">ports found open on the sources we scanned back · {{ stats.scanned_ips }} scanned</span></div>
-    {% if stats.ports.is_empty() %}<p class="empty">Not enough counter-scans in this range yet.</p>{% else %}
+    <div class="card-head"><h2>What the scanners run</h2><span class="muted">open on {{ stats.scanned_ips }} scanned sources · ports on ≥ {{ crate::store::stats::PORT_MIN_IPS }} IPs only</span></div>
+    {% if stats.ports.is_empty() %}<p class="empty">Not enough scans yet.</p>{% else %}
     <ol class="ports-list">
       {% for p in stats.ports %}
       <li>
@@ -156,7 +155,6 @@
       </li>
       {% endfor %}
     </ol>
-    <p class="muted small">Counts of distinct IPs only. A port is listed once it was found open on at least {{ crate::store::stats::PORT_MIN_IPS }} of them; no scan result of a single address is published.</p>
     {% endif %}
   </section>
 

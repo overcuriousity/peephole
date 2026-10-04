@@ -2778,10 +2778,7 @@ async fn admin_configures_another_node_with_its_key() {
     .await;
     let (admin, base) = admin_on(&na).await;
     let page = text(&admin, format!("{base}/admin/cluster")).await;
-    assert!(
-        page.contains("open for config key holders"),
-        "b is shown as open"
-    );
+    assert!(page.contains("open to key holders"), "b is shown as open");
     assert!(page.contains("locked"), "a itself is locked");
     assert!(
         !page.contains("peephole-cfg1:"),
