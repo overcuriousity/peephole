@@ -7,6 +7,20 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Added
 
+- Canaries that come back. Decoys serve realistic credentials derived from
+  the request (`.env`: AWS keys, app key, database, Redis, mail and admin
+  passwords; `.git/config`: a deploy token), with links to the address the
+  scanner used. A harvested password opens a fake admin page (Basic auth)
+  or WordPress dashboard, and the git token a ref listing, so the follow-up
+  lands in the trap. Every node finds requests carrying a served canary,
+  cluster-wide and in either arrival order, and names the request that
+  harvested it.
+- Admin: a Canaries page (served, used again, time to first use, a reuse
+  table with filters); request and IP pages show canaries served and
+  reuses. Wall: median time from harvest to first use and the share used
+  again, from 5 reuses up. Export: `decoy_v`, `canary_used_from`.
+  `peephole decoy render UID` prints a stored decoy again.
+
 - Counter-scans: level 2 runs nmap's `ssh-hostkey`, `ssh2-enum-algos` and
   `ssl-cert` scripts (all `safe`: one handshake with a port already found
   open). From their output, and from every stored scan's XML on upgrade,
@@ -20,6 +34,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   graph; Analytics ranks HASSH and JA4X values.
 
 ### Changed
+
+- Decoy answers to sources over their recording rate keep their page
+  token, host and answer in the light row, so their canaries are
+  traceable.
 
 - Trap: decoys are always on. `/.env`, `/.git/config`, `/wp-login.php` and
   phpinfo probes get plausible fake content with canary credentials and

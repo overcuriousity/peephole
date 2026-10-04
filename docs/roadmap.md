@@ -32,34 +32,7 @@ Measured on the real cluster, 30 days, before this roadmap (2026-10-04):
 
 ## Next
 
-### 1. Canary redesign and reuse detection
-
-- **Cost:** M
-- **Benefit:** high. It links "harvested here" to "used there" across
-  addresses, which is exactly what the cluster cannot see today, and it
-  measures the time from harvest to use.
-
-Today's canaries cannot come back to us: `DB_HOST` is `127.0.0.1`,
-`APP_URL` is `localhost`, and every secret reads `canary-…`, which
-harvesters filter out. The redesign:
-
-- Secrets that look random and are derived by HMAC from the request
-  reference, so a reused one names the request that leaked it.
-- Decoys that point back at the trap: `APP_URL` and admin links set to the
-  request's own Host, Basic-auth credentials for a path on the same vhost,
-  and a wp-login that accepts the canary.
-- Reuse detection on every recorded request (headers, query, body),
-  cluster-wide, since the canary may have been served by another node.
-
-**Shown:**
-
-- **Admin, request page:** "canary served", or "used canary from request
-  #N (served by node X, Δt)".
-- **Admin, IP page:** "harvested credentials used from N other IPs".
-- **Public wall:** a tile with the median time from harvest to first use,
-  and the share of harvested canaries used again.
-
-### 2. JA4H
+### 1. JA4H
 
 - **Cost:** S
 - **Benefit:** medium. A second client fingerprint, from HTTP rather than
@@ -74,7 +47,7 @@ backfill like `host_keys`, and an export column.
 - **Admin:** request page; Analytics "top JA4H"; the request search filter.
 - **Public:** none (fingerprints are never public).
 
-### 3. Tarpit
+### 2. Tarpit
 
 - **Cost:** S–M
 - **Benefit:** medium. It costs scanners time for almost nothing, and the
@@ -91,7 +64,7 @@ time held, so the dataset can separate the reduced follow-up traffic.
   held on the request page.
 - **Public wall:** a "scanner time wasted" tile (hours held this period).
 
-### 4. Stateful decoys, MCP and AI first
+### 3. Stateful decoys, MCP and AI first
 
 - **Cost:** M for the state machine and the MCP/Ollama decoys
 - **Benefit:** high. This is the newest attack surface, there is little
@@ -115,7 +88,7 @@ recorded in `answer` (`decoy:mcp:initialize`, `decoy:mcp:tools/call`, …):
 - **Public wall:** "What they asked our fake AI": counts per tool name (our
   own fake names, so safe to show) and per model requested.
 
-### 5. Stateful web decoys: wp-admin, upload sink, webshell commands
+### 4. Stateful web decoys: wp-admin, upload sink, webshell commands
 
 - **Cost:** M–L
 - **Benefit:** high. It captures the second stage (the dropped webshell and
@@ -137,7 +110,7 @@ recorded in `answer` (`decoy:mcp:initialize`, `decoy:mcp:tools/call`, …):
   timeline of the requests sent to it.
 - **Public wall:** a "webshells dropped" tile and counts per command verb.
 
-### 6. Campaign clustering
+### 5. Campaign clustering
 
 - **Cost:** L
 - **Benefit:** very high. It answers "who is this" across addresses and is
@@ -149,14 +122,14 @@ so every node arrives at the same campaigns. Every edge says why it exists.
 - **Hard edges:**
   - a shared SSH host key or TLS certificate (shipped: `host_keys`);
   - a shared browser fingerprint;
-  - canary reuse (item 1).
+  - canary reuse (shipped: `canaries`).
 - **Soft edges:**
   - rarity-weighted Jaccard similarity of each IP's normalized path set,
     above a threshold. About 500 IPs a month allows plain pairwise
     comparison; MinHash only if that grows by orders of magnitude;
-  - JA4 together with JA4H (item 2) as supporting evidence, never alone.
+  - JA4 together with JA4H (item 1) as supporting evidence, never alone.
 - **Path normalization** (IDs, random filenames, query values) is most of
-  the work and is shared with item 7.
+  the work and is shared with item 6.
 
 **Shown:**
 
@@ -168,9 +141,9 @@ so every node arrives at the same campaigns. Every edge says why it exists.
   and paths per campaign, as aggregates without fingerprints.
 - **Dataset:** a `campaign` column.
 
-### 7. New paths and exploit waves
+### 6. New paths and exploit waves
 
-- **Cost:** M (once item 6's path normalization exists)
+- **Cost:** M (once item 5's path normalization exists)
 - **Benefit:** high. It gives early warning when a new exploit starts
   spreading, often before CVE write-ups.
 
@@ -188,9 +161,9 @@ so every node arrives at the same campaigns. Every edge says why it exists.
 - **Public wall:** a count of new path shapes this period (paths themselves
   are request contents, so not public).
 
-### 8. Personas per node or hostname (opt-in)
+### 7. Personas per node or hostname (opt-in)
 
-- **Cost:** M (after items 4 and 5)
+- **Cost:** M (after items 3 and 4)
 - **Benefit:** medium–high. A controlled comparison of targeted versus spray
   traffic across the cluster.
 
@@ -214,6 +187,11 @@ honeypot.
 
 ## Small follow-ups
 
+- **Peer-observed public address.** S–M, medium. A NAT'd node cannot see
+  its public IP; peers report the source address they see on its RPC
+  connections. That replaces `cluster.own_addresses` for NAT'd nodes,
+  records which of our addresses a request reached, and lets the canary
+  return host cover `localhost` and missing Hosts (a new `decoy_v`).
 - **Host keys in the export.** S, medium. Each scan's XML is already
   exported. A parsed `host_keys` list per scan (kind, port, fingerprint,
   detail) saves every dataset user the parsing.
@@ -235,6 +213,6 @@ honeypot.
   `/api/blocklist`, and a CrowdSec-compatible endpoint. Cost M.
 - **Weekly digest page.** A generated, permalinked public summary: new
   families, the largest campaign, new path shapes, top movers. Cost M; worth
-  it once items 6 and 7 exist.
+  it once items 5 and 6 exist.
 - **Hall of fame.** Oldest CVE still probed, strangest User-Agent, longest
   payload, as aggregates. Cost S–M.

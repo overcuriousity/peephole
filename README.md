@@ -38,6 +38,11 @@ nmap.
   Bystanders are spared: one request earns at most a light scan, and
   verified crawlers, Tor exits, your own and `never_scan` networks are
   never scanned; per-network, per-ASN and queue budgets stop floods.
+- **Canaries** — decoys for the probes scanners send first (`.env`,
+  `.git/config`, wp-login, phpinfo) serve realistic credentials derived
+  from the request, with links back to the trap. When a harvested
+  credential comes back, from any address to any node, the admin names the
+  request that harvested it and the time in between.
 - **Wall of shame** (public) — aggregate statistics per time range that
   refresh themselves: trends against the previous period, requests over time
   by severity, a weekday × hour heatmap, attack families and an OWASP Top 10 /
@@ -53,7 +58,7 @@ nmap.
   feed of new requests, analytics (top paths, user agents, JA4, methods,
   open ports, products, OS guesses, abuse scores), per-IP pages with every
   enrichment result and counter-scan, the live scan queue, a graph of
-  browser fingerprints shared across IPs, the
+  browser fingerprints shared across IPs, canary reuse, the
   false-positive inbox, deletion, and the dataset export: every request with
   everything known about it and its IP (enrichment history, scans,
   fingerprints) as typed Parquet, CSV or Timesketch JSONL, optionally

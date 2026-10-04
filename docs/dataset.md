@@ -82,7 +82,9 @@ Column order is as listed.
 | `raw_head` | binary? | The request head exactly as it came off the wire (HTTP/1 only), for parser-level features |
 | `tls_client_hello` | binary? | The raw TLS ClientHello (HTTPS only) |
 | `ja4` | string? | JA4 fingerprint of that ClientHello |
-| `answer` | string? | What the trap sent: `not-found` (a 404), `decoy:<name>` (a believable fake, e.g. `decoy:dotenv`, `decoy:git-config`), `claim` (the false-positive claim page) |
+| `answer` | string? | What the trap sent: `not-found` (a 404), `decoy:<name>` (a believable fake: `decoy:dotenv`, `decoy:git-config`, `decoy:git-head`, `decoy:wp-login`, `decoy:wp-login-failed`, `decoy:phpinfo`; answers to a harvested canary: `decoy:wp-login-ok`, `decoy:wp-admin`, `decoy:admin`, `decoy:git-auth`, `decoy:git-refs`, `decoy:git-pack`), `claim` (the false-positive claim page) |
+| `decoy_v` | int? | Template version of a decoy answer (see Canaries); empty for other answers, and empty on a decoy row means version 0 |
+| `canary_used_from` | list of string | The `uid`s of the rows whose served canaries this row carried (light rows as `<batch uid>#<row>`); empty when none |
 | `status` | int? | HTTP status sent |
 | `unrecorded` | int | Requests from this address answered since the previous row but not recorded (light rows: the drops of the batch, on its last row) |
 | `weight` | int | Answered requests this row stands for (see Rows) |
@@ -171,6 +173,53 @@ JavaScript).
 
 The Parquet file carries `peephole.format_version` (`1`) and the export
 filter in its metadata.
+
+## Canaries
+
+Decoys serve credentials (canaries) that name the request they were
+served to. They are derived from the row with a public formula, with no
+secret, so anyone can recompute the canaries of any row and nothing
+secret is in the export. `peephole decoy render <uid>` prints the decoy a
+row was answered with, byte for byte.
+
+**Version 1** (`decoy_v` = 1). Each value is
+
+    SHA-256("peephole-canary-v1\0" || page_token || "\0" || kind)
+
+with further blocks `SHA-256(… || "\0" || n)` (`n` = 1, 2, … in decimal)
+appended when more bytes are needed, and each byte mapped to
+`alphabet[byte mod alphabet length]`:
+
+| kind | format |
+|---|---|
+| `aws-key` | `AKIA` + 16 characters of `A–Z2–7` |
+| `aws-secret` | 40 characters of the base64 alphabet |
+| `app-key` | base64 of 32 bytes (served as `base64:…`) |
+| `db-password`, `redis-password`, `mail-password`, `admin-password` | 20 characters of `A–Za–z0–9` |
+| `git-token` | 40 lowercase hex characters |
+| `wp-session` | 43 characters of `A–Za–z0–9` (the token part of the WordPress login cookie) |
+
+`.env` carries `app-key`, the three passwords, `aws-key`, `aws-secret` and
+`admin-password`; `.git/config` carries `git-token`; `decoy:wp-login-ok`
+sets a cookie with `wp-session`.
+
+The node's site is `<word>.internal`, where `word` is
+`WORDS[SHA-256("peephole-site-v1\0" || node_id)[0] mod 32]` (`node_id`
+is the recording node's 32-byte key; a standalone node hashes nothing),
+with `WORDS` = shop, portal, crm, billing, intranet, booking, support,
+store, app, dashboard, members, orders, invoice, payments, tickets,
+inventory, customers, partners, reports, hr, wiki, forms, events, media,
+docs, api, account, checkout, catalog, newsletter, jobs, status. Links a
+scanner can follow back (`ADMIN_URL`, the git remote) use the request's
+`host` when it is a public IP or DNS name, else the site.
+
+**Version 0** (empty `decoy_v` on a decoy row) served `canary-<ref>`,
+`AKIACANARY<REF>` (first 10 characters upper-cased) and
+`canary/<ref>/not+a+real+secret`, where `ref` is the first 12 hex
+characters of the page token without dashes.
+
+A later row that carries a served canary (in a header, the path, the
+query or the body) lists the serving row in `canary_used_from`.
 
 ## Two exports
 
