@@ -875,9 +875,27 @@ struct Served {
     word: &'static str,
 }
 
-/// Which credential places carried a canary this node knows. Only requests
-/// with a credential (an `Authorization` or `Cookie` header, a wp-login
-/// POST body) cost a lookup.
+/// The credential tokens whose canary would change this request's answer:
+/// `Authorization` anywhere (a Basic canary opens the admin page), `Cookie`
+/// only under `/wp-admin`, the body only on a wp-login POST. Anything else
+/// costs no lookup, so cookie-carrying crawlers stay on the cheap path.
+fn credentials(
+    headers: &[(String, String)],
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Vec<(String, i64)> {
+    let wp_admin = path == "/wp-admin" || path.starts_with("/wp-admin/");
+    let login_post = method == "POST" && path.rsplit('/').next() == Some("wp-login.php");
+    let kept: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(k, _)| wp_admin || !k.eq_ignore_ascii_case("cookie"))
+        .cloned()
+        .collect();
+    crate::canary::tokens::of_credentials(&kept, login_post.then_some(body))
+}
+
+/// Which credential places carried a canary this node knows.
 async fn presented(
     state: &TrapState,
     headers: &[(String, String)],
@@ -885,8 +903,7 @@ async fn presented(
     path: &str,
     body: &[u8],
 ) -> decoy::Presented {
-    let login_post = method == "POST" && path.rsplit('/').next() == Some("wp-login.php");
-    let tokens = crate::canary::tokens::of_credentials(headers, login_post.then_some(body));
+    let tokens = credentials(headers, method, path, body);
     if tokens.is_empty() {
         return decoy::Presented::default();
     }
@@ -1310,6 +1327,26 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_credentials_that_change_the_answer_cost_a_lookup() {
+        let h = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        let cookie = h(&[("cookie", "s=Zx8kQ2mPvR4tW6yB1nC3")]);
+        let auth = h(&[("authorization", "Bearer Zx8kQ2mPvR4tW6yB1nC3")]);
+        let body = b"pwd=Zx8kQ2mPvR4tW6yB1nC3";
+        // A cookie jar on any page but wp-admin: nothing to look up.
+        assert!(credentials(&cookie, "GET", "/", body).is_empty());
+        assert!(!credentials(&cookie, "GET", "/wp-admin/", body).is_empty());
+        // Authorization opens the admin page anywhere.
+        assert!(!credentials(&auth, "GET", "/", body).is_empty());
+        // A body only on a wp-login POST.
+        assert!(credentials(&[], "POST", "/contact", body).is_empty());
+        assert!(!credentials(&[], "POST", "/blog/wp-login.php", body).is_empty());
+    }
 
     fn hm(entries: &[&str]) -> HeaderMap {
         let mut h = HeaderMap::new();
