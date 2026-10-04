@@ -8,6 +8,7 @@ usage: peephole [CONFIG]                 run the daemon (default /etc/peephole/c
        peephole cluster (id|invite|invites|invite-revoke|join|members|status|agreement|config-key|block|unblock|purge|leave) …
        peephole settings (show|set|reset) …
        peephole export [OPTIONS] [CONFIG]  the dataset as Parquet, CSV or JSON Lines (--help)
+       peephole decoy render UID [CONFIG]  print a stored decoy answer again
        peephole admin reset-token [CONFIG]
        peephole db vacuum [CONFIG]
        peephole --version | -V
@@ -24,6 +25,7 @@ enum Cmd {
     Cluster,
     Settings,
     Export,
+    Decoy,
     Admin,
     Db,
     Run(PathBuf),
@@ -63,6 +65,7 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         Some("cluster") => Ok(Cmd::Cluster),
         Some("settings") => Ok(Cmd::Settings),
         Some("export") => Ok(Cmd::Export),
+        Some("decoy") => Ok(Cmd::Decoy),
         Some("admin") => Ok(Cmd::Admin),
         Some("db") => Ok(Cmd::Db),
         _ => config_at(0).map(Cmd::Run),
@@ -111,6 +114,13 @@ async fn main() -> anyhow::Result<()> {
             if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
                 println!("{}", peephole::export::cli::USAGE);
             } else if let Err(e) = peephole::export::cli::run(&args[1..], DEFAULT_CONFIG).await {
+                fail(e);
+            }
+        }
+        Cmd::Decoy => {
+            if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
+                println!("{}", peephole::canary::cli::USAGE);
+            } else if let Err(e) = peephole::canary::cli::run(&args[1..], DEFAULT_CONFIG).await {
                 fail(e);
             }
         }
@@ -168,6 +178,7 @@ mod tests {
         assert_eq!(p(&["cluster", "anything", "goes"]), Ok(Cmd::Cluster));
         assert_eq!(p(&["settings"]), Ok(Cmd::Settings));
         assert_eq!(p(&["export", "--format", "csv"]), Ok(Cmd::Export));
+        assert_eq!(p(&["decoy", "render", "x"]), Ok(Cmd::Decoy));
     }
 
     #[test]

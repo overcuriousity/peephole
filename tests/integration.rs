@@ -2519,3 +2519,27 @@ async fn canaries_page_lists_reuses_and_filters() {
         200
     );
 }
+
+#[tokio::test]
+async fn a_served_decoy_renders_again_from_its_row() {
+    let (base, store, _dir) = spawn_trap().await;
+    let body = reqwest::Client::new()
+        .get(format!("{base}/.env"))
+        .header("x-forwarded-for", "203.0.113.50")
+        .header("host", "shop.example.org")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let uid: String = sqlx::query_scalar("SELECT uid FROM requests WHERE path = '/.env'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    let again = peephole::canary::cli::render_uid(&store, &uid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.body, body);
+}
