@@ -823,6 +823,9 @@ async fn trap(
         Some(d) => (format!("decoy:{}", d.name), d.status),
         None => ("not-found".to_string(), 404),
     };
+    // Recorded apart from the answer: hyper drops this future when the
+    // client resets the stream or the connection ends, which must not lose
+    // the request or a batch of light rows taken but not yet written.
     let slot = state.guards.slot().await;
     tokio::spawn(record_trap(
         state.clone(),
