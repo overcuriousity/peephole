@@ -168,3 +168,22 @@ td .databar { margin-top: 0.3rem; min-width: 4rem; }
 .shares .databar { grid-column: 1 / -1; }
 .shares .share-pct { color: var(--color-fg-muted); font-size: var(--text-xs); margin-left: 0.35rem; }
 .families + .chips { margin-top: 0.75rem; }
+
+/* ---- Copy buttons --------------------------------------------------- */
+/* Shown only once the script found a usable clipboard (html.can-copy). */
+.copy-btn { display: none; align-items: center; justify-content: center; width: 1.6rem; height: 1.6rem; padding: 0; margin-left: 0.25rem;
+  vertical-align: middle; border: 1px solid transparent; border-radius: var(--radius-sm); background: transparent; color: var(--color-fg-muted); cursor: pointer; flex: none; }
+.can-copy .copy-btn { display: inline-flex; }
+.copy-btn:hover { color: var(--color-fg-primary); background: var(--color-bg-hover); }
+.copy-btn svg { width: 0.95rem; height: 0.95rem; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.copy-btn .copy-done { display: none; }
+.copy-btn[data-copied] { color: var(--color-success); }
+.copy-btn[data-copied] .copy-icon { display: none; }
+.copy-btn[data-copied] .copy-done { display: inline; }
+h1 .copy-btn { width: 2rem; height: 2rem; }
+h1 .copy-btn svg { width: 1.15rem; height: 1.15rem; }
+/* In tables: revealed on row hover or focus; always shown on touch. */
+.copy-btn.subtle { opacity: 0; width: 1.35rem; height: 1.35rem; }
+tr:hover .copy-btn.subtle, h2:hover .copy-btn.subtle, .copy-btn.subtle:focus-visible, .copy-btn.subtle[data-copied] { opacity: 1; }
+@media (hover: none) { .copy-btn.subtle { opacity: 1; } }
+.req-line { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.5rem; }

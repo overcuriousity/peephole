@@ -4,7 +4,7 @@
 {% block content %}
 <div class="page-head ip-head">
   <div>
-    <h1>{{ ov.ip.ip }}{% if ov.ip.is_tor_exit %} <span class="badge badge-tor">tor exit</span>{% endif %}</h1>
+    <h1>{{ ov.ip.ip }}{% let value = ov.ip.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}{% if ov.ip.is_tor_exit %} <span class="badge badge-tor">tor exit</span>{% endif %}</h1>
     <div class="meta">
       {% if let Some(c) = ov.ip.country %}<a href="/ips?country={{ c }}">{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}</a>{% else %}<span class="muted">country unknown</span>{% endif %}
       {% if let Some(a) = ov.ip.asn %}<a href="/ips?asn={{ a }}">{{ ov.ip.asn_org.as_deref().unwrap_or("") }} <span class="mono muted">AS{{ a }}</span></a>{% else %}<span class="muted">ASN unknown</span>{% endif %}

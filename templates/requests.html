@@ -41,7 +41,7 @@
     <tr data-sev="{{ r.severity }}">
       {% if can_delete %}<td class="check"><input type="checkbox" name="ids" value="{{ r.id }}" aria-label="Select request {{ r.id }}"></td>{% endif %}
       <td class="ts">{{ r.ts }}</td>
-      <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% if r.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
+      <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = true %}{% include "_copy.html" %}{% if r.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
       <td class="mono">{{ r.method }}</td>
       <td class="path">{% if chrome.authed %}<a href="/admin/requests/{{ r.id }}">{% endif %}{{ r.path }}{% if let Some(q) = r.query %}<span class="muted">?{{ q }}</span>{% endif %}{% if chrome.authed %}</a>{% endif %}</td>
       <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>

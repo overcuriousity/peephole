@@ -11,7 +11,7 @@
 {% if let Some(r) = result %}
 <div class="stack">
 <section class="card" id="intel">
-  <div class="card-head"><h2>{{ r.ip }}</h2><span class="muted">{% if r.known %}<a href="/ip/{{ r.ip }}">in the dataset</a> (stored results are on its page){% else %}not in the dataset{% endif %}</span></div>
+  <div class="card-head"><h2>{{ r.ip }}{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}</h2><span class="muted">{% if r.known %}<a href="/ip/{{ r.ip }}">in the dataset →</a>{% else %}not in the dataset{% endif %}</span></div>
   {% if r.cards.is_empty() %}
   <p class="muted">No provider answered.</p>
   {% else %}

@@ -22,7 +22,7 @@
     <dialog id="dlg-leave"><h3>Leave the cluster?</h3><p class="muted">Syncing stops; all data stays. Rejoining needs an invite.</p>
       <form method="post" action="/admin/cluster/leave" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Leave</button></form></dialog>{% endif %}</div>
   <dl class="kv">
-    <dt>Key</dt><dd class="mono break">{{ me.key }}</dd>
+    <dt>Key</dt><dd class="mono break">{{ me.key }}{% let value = me.key.as_str() %}{% let what = "node key" %}{% let subtle = false %}{% include "_copy.html" %}</dd>
     <dt>Roles</dt><dd>{{ me.roles }}</dd>
     <dt>Address</dt><dd class="mono">{{ me.address }}</dd>
     <dt>Version</dt><dd class="mono">{{ me.version }}</dd>

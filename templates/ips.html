@@ -50,7 +50,7 @@
   {% for i in page.items %}
     <tr data-sev="{{ i.max_severity }}">
       {% if can_delete %}<td class="check"><input type="checkbox" name="ids" value="{{ i.ip }}" aria-label="Select {{ i.ip }}"></td>{% endif %}
-      <td class="ip"><a href="/ip/{{ i.ip }}">{{ i.ip }}</a>{% if i.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
+      <td class="ip"><a href="/ip/{{ i.ip }}">{{ i.ip }}</a>{% let value = i.ip.as_str() %}{% let what = "IP address" %}{% let subtle = true %}{% include "_copy.html" %}{% if i.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
       <td>{% if let Some(c) = i.country %}{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}{% else %}<span class="muted">—</span>{% endif %}</td>
       <td class="wrap">{% if let Some(o) = i.asn_org %}{{ o }}{% if let Some(a) = i.asn %} <span class="muted mono">AS{{ a }}</span>{% endif %}{% else %}<span class="muted">—</span>{% endif %}</td>
       <td class="num">{{ crate::admin::views::thousands(i.request_count) }}{% let v = i.request_count %}{% let max = count_max %}{% include "_bar.html" %}</td>

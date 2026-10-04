@@ -14,7 +14,7 @@
 {% endif %}
 {% for c in clusters %}
   <section class="card" id="{{ c.hash }}">
-    <div class="card-head"><h2 class="mono">{{ c.hash }}</h2><span class="muted">{{ c.count }} sightings · {{ c.ips.len() }} IPs</span></div>
+    <div class="card-head"><h2 class="mono">{{ c.hash }}{% let value = c.hash.as_str() %}{% let what = "fingerprint" %}{% let subtle = true %}{% include "_copy.html" %}</h2><span class="muted">{{ c.count }} sightings · {{ c.ips.len() }} IPs</span></div>
     <div class="chips">{% for ip in c.ips %}<a class="badge badge-label" href="/ip/{{ ip }}">{{ ip }}</a>{% endfor %}</div>
   </section>
 {% endfor %}

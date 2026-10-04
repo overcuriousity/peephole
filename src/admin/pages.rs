@@ -499,6 +499,8 @@ struct RequestPage {
     can_delete: bool,
     /// The request's User-Agent header, if it sent one.
     user_agent: Option<String>,
+    /// Path and query as requested, for the copy button.
+    request_target: String,
     /// Other requests of the same IP, newest first.
     same_ip: Vec<RecentRequest>,
     /// Requests of other IPs with the same JA4 lately, and how many IPs.
@@ -527,8 +529,13 @@ async fn request_page(
         Some(j) => st.store.related_by_ja4(j, d.row.ip_id).await?,
         None => (vec![], 0),
     };
+    let request_target = match &d.row.query {
+        Some(q) => format!("{}?{q}", d.row.path),
+        None => d.row.path.clone(),
+    };
     render(&RequestPage {
         chrome: chrome(),
+        request_target,
         d,
         labels,
         owasp,

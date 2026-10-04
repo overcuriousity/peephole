@@ -28,7 +28,7 @@
       <div class="card-head"><h2>Top user agents</h2></div>
       <div class="table-wrap"><table class="an-table">
         <thead><tr><th>User-Agent</th><th class="num">Requests</th><th class="num">IPs</th></tr></thead>
-        <tbody>{% for n in a.user_agents %}<tr><td class="name">{{ n.name }}{% let v = n.count %}{% let max = max.user_agents %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
+        <tbody>{% for n in a.user_agents %}<tr><td class="name">{{ n.name }}{% let value = n.name.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}{% let v = n.count %}{% let max = max.user_agents %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
         {% if a.user_agents.is_empty() %}<tr><td colspan="3" class="empty">None.</td></tr>{% endif %}</tbody>
       </table></div>
     </section>
@@ -57,7 +57,7 @@
     <div class="card-head"><h2>TLS fingerprints (JA4)</h2></div>
     <div class="table-wrap"><table class="an-table">
       <thead><tr><th>JA4</th><th class="num">Requests</th><th class="num">IPs</th></tr></thead>
-      <tbody>{% for n in a.ja4 %}<tr><td class="name">{{ n.name }}{% let v = n.count %}{% let max = max.ja4 %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
+      <tbody>{% for n in a.ja4 %}<tr><td class="name">{{ n.name }}{% let value = n.name.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}{% let v = n.count %}{% let max = max.ja4 %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
       {% if a.ja4.is_empty() %}<tr><td colspan="3" class="empty">None.</td></tr>{% endif %}</tbody>
     </table></div>
   </section>

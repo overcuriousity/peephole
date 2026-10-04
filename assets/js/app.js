@@ -40,6 +40,21 @@
       }, function () {});
     });
   });
+  // Copy buttons ([data-copy-value]): shown only with a usable clipboard
+  // (secure context); delegated, so rows swapped in later work as well.
+  if (navigator.clipboard && window.isSecureContext) {
+    document.documentElement.classList.add("can-copy");
+    document.addEventListener("click", function (e) {
+      var b = e.target.closest && e.target.closest("[data-copy-value]");
+      if (!b) return;
+      e.preventDefault();
+      navigator.clipboard.writeText(b.getAttribute("data-copy-value")).then(function () {
+        var label = b.getAttribute("aria-label");
+        b.setAttribute("data-copied", ""); b.title = "Copied"; b.setAttribute("aria-label", "Copied");
+        setTimeout(function () { b.removeAttribute("data-copied"); b.title = "Copy"; b.setAttribute("aria-label", label); }, 1500);
+      }, function () {});
+    });
+  }
   // One-shot notice the server set after an action; shown once, then cleared.
   [["peephole_flash", "success"], ["peephole_flash_error", "warning"]].forEach(function (f) {
     var fm = document.cookie.match(new RegExp("(?:^|; )" + f[0] + "=([^;]*)"));
