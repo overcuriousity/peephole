@@ -76,6 +76,7 @@ impl SkipLog {
     /// batch once it is full. The number of addresses buffered is not
     /// capped here: [`SkipLog::take_older`] flushes them all past
     /// [`MAX_TRACKED`].
+    #[allow(clippy::too_many_arguments)]
     pub fn note(
         &self,
         ip: IpAddr,
