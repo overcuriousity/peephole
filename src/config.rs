@@ -756,9 +756,23 @@ impl Config {
         // (`dos`); those categories are excluded.
         const SCRIPTS: &str =
             "(discovery or safe) and not (intrusive or broadcast or external or dos)";
+        // Level 2 names its scripts: the source's own identifiers (SSH host
+        // keys and algorithm lists, the TLS certificate), each one handshake
+        // with a port nmap already found open, all in `safe`.
+        const IDENTITY_SCRIPTS: &str = "ssh-hostkey,ssh2-enum-algos,ssl-cert";
         let argv: &[&str] = match level {
             1 => &["-Pn", "-sS", "-T2", "--top-ports", "100"],
-            2 => &["-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000"],
+            2 => &[
+                "-Pn",
+                "-sS",
+                "-sV",
+                "-O",
+                "-T3",
+                "--top-ports",
+                "1000",
+                "--script",
+                IDENTITY_SCRIPTS,
+            ],
             3 => &[
                 "-Pn",
                 "-sS",
@@ -848,6 +862,16 @@ rp_name = "x"
             // broadcast on the local network, or flood.
             if let Some(i) = argv.iter().position(|a| a == "--script") {
                 let expr = &argv[i + 1];
+                // A named list holds only scripts of the `safe` category.
+                if !expr.contains(' ') {
+                    for script in expr.split(',') {
+                        assert!(
+                            ["ssh-hostkey", "ssh2-enum-algos", "ssl-cert"].contains(&script),
+                            "level {level}: {script} is not on the safe list"
+                        );
+                    }
+                    continue;
+                }
                 let (_, excluded) = expr.split_once("and not").unwrap();
                 for cat in ["intrusive", "broadcast", "external", "dos"] {
                     assert!(
@@ -855,7 +879,6 @@ rp_name = "x"
                         "level {level}: {expr} lets {cat} in"
                     );
                 }
-                assert!(expr.contains(' '), "selector must be one argv element");
             } else {
                 assert!(
                     !argv.iter().any(|a| a.contains("intrusive")),

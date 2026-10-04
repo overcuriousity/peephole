@@ -707,6 +707,19 @@ pub struct IpAdminData {
     pub claims: Vec<FpClaimRow>,
     /// Requests answered but not recorded in full (flood sampling).
     pub skipped: i64,
+    pub host_keys: Vec<crate::store::hostkeys::HostKeyRow>,
+}
+
+impl IpAdminData {
+    /// The most other IPs any one host key or certificate links this IP to.
+    pub fn linked_ips(&self) -> i64 {
+        self.host_keys
+            .iter()
+            .filter(|k| k.identifies())
+            .map(|k| k.other_ips)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Template)]
@@ -784,6 +797,7 @@ async fn ip_page(
             fingerprints: state.store.fingerprints_for_ip(ip.id).await?,
             claims: state.store.claims_for_ip(ip.id).await?,
             skipped: state.store.skipped_for_ip(ip.id).await?,
+            host_keys: state.store.host_keys_for_ip(ip.id).await?,
         })
     } else {
         None

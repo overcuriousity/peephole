@@ -7,6 +7,7 @@ pub mod data;
 pub mod delete;
 pub mod export;
 pub mod fingerprints;
+pub mod hostkeys;
 pub mod inspect;
 pub mod maintenance;
 pub mod recorder;
@@ -25,8 +26,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// comments are stripped, then each file is split on `;`, so statements
 /// must not contain semicolons themselves (no string literals with `;`).
 /// 0001 is the schema as of 0.1.0; databases of earlier builds are refused
-/// (see [`APPLICATION_ID`]).
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_initial.sql")];
+/// (see [`APPLICATION_ID`]). 0002 adds `host_keys`.
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_initial.sql"),
+    include_str!("migrations/0002_host_keys.sql"),
+];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
 /// builds before 0.1.0 do not carry it and are refused rather than migrated.
@@ -67,6 +71,7 @@ impl Store {
             .with_context(|| path.display().to_string())?;
         migrate(&pool, MIGRATIONS).await?;
         backfill_ip_keys(&pool).await?;
+        hostkeys::backfill(&pool).await?;
         let search = ensure_search_index(&pool).await;
         let read_opts = SqliteConnectOptions::new()
             .filename(path)

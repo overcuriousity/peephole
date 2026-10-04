@@ -456,6 +456,8 @@ struct AnalyticsMax {
     ports: i64,
     products: i64,
     os: i64,
+    hassh: i64,
+    ja4x: i64,
     abuse: i64,
     levels: i64,
 }
@@ -478,6 +480,8 @@ async fn analytics(
         ports: max_of(&a.ports, |p| p.ips),
         products: max_of(&a.products, |n| n.ips),
         os: max_of(&a.os_guesses, |n| n.ips),
+        hassh: max_of(&a.hassh, |n| n.ips),
+        ja4x: max_of(&a.ja4x, |n| n.ips),
         abuse: max_of(&a.abuse, |n| n.count),
         levels: max_of(&a.scan_levels, |n| n.count),
     };
@@ -656,6 +660,7 @@ struct ScanPage {
     chrome: Chrome,
     s: ScanSummary,
     ports: Vec<PortRow>,
+    keys: Vec<crate::store::hostkeys::HostKeyRow>,
     can_delete: bool,
 }
 
@@ -672,6 +677,7 @@ async fn scan_page(
         chrome: chrome(),
         s,
         ports,
+        keys: st.store.host_keys_for_scan(id).await?,
         can_delete: st.can_delete(),
     })
 }
@@ -715,7 +721,9 @@ async fn scan_delete(
 struct FingerprintsPage {
     chrome: Chrome,
     clusters: Vec<FpCluster>,
-    /// `clusters` for the graph.
+    /// Host keys and certificates found on more than one source.
+    host_keys: Vec<crate::store::hostkeys::HostKeyCluster>,
+    /// `clusters` and `host_keys` for the graph.
     clusters_json: String,
 }
 
@@ -724,10 +732,26 @@ async fn fingerprints(
     State(st): State<Arc<AdminState>>,
 ) -> AppResult<Html<String>> {
     let clusters = st.store.fingerprint_clusters().await?;
+    let host_keys = st.store.host_key_clusters().await?;
+    // One graph: browser fingerprints and host keys are both hubs, typed
+    // by `kind` (absent: a browser fingerprint).
+    let mut hubs: Vec<serde_json::Value> = clusters
+        .iter()
+        .map(|c| serde_json::json!({ "hash": c.hash, "ips": c.ips, "count": c.count }))
+        .collect();
+    hubs.extend(host_keys.iter().map(|c| {
+        serde_json::json!({
+            "hash": c.hash,
+            "ips": c.ips,
+            "count": c.count,
+            "kind": if c.kind == crate::scan::hostkeys::SSH_HOSTKEY { "ssh" } else { "tls" },
+        })
+    }));
     render(&FingerprintsPage {
         chrome: chrome(),
-        clusters_json: serde_json::to_string(&clusters).unwrap_or_else(|_| "[]".into()),
+        clusters_json: serde_json::to_string(&hubs).unwrap_or_else(|_| "[]".into()),
         clusters,
+        host_keys,
     })
 }
 

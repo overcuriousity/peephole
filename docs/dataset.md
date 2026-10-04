@@ -146,7 +146,9 @@ service's documentation; an empty object means the service knew nothing.
 ```
 
 `level` 1 to 4 (more ports, service versions, OS detection, safe scripts);
-`node` queued it, `scanner` ran it.
+`node` queued it, `scanner` ran it. From level 2 the XML carries the
+source's SSH host keys, SSH algorithm lists and TLS certificates
+(`ssh-hostkey`, `ssh2-enum-algos`, `ssl-cert`).
 
 **`fingerprints`**: browser fingerprints the trap page collected from this
 request (`request` rows only, usually empty: scanners rarely run

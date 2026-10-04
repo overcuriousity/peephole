@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///usr/bin/../share/nmap/nmap.xsl" type="text/xsl"?>
+<!-- Nmap 7.92 scan initiated Sun Oct  4 18:29:53 2026 as: nmap -Pn -sT -p 18022,18443 -&#45;script ssh-hostkey,ssh2-enum-algos,ssl-cert -&#45;script-timeout 60s -oX real.xml 127.0.0.1 -->
+<nmaprun scanner="nmap" args="nmap -Pn -sT -p 18022,18443 -&#45;script ssh-hostkey,ssh2-enum-algos,ssl-cert -&#45;script-timeout 60s -oX real.xml 127.0.0.1" start="1791131393" startstr="Sun Oct  4 18:29:53 2026" version="7.92" xmloutputversion="1.05">
+<scaninfo type="connect" protocol="tcp" numservices="2" services="18022,18443"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1791131394" endtime="1791131394"><status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="127.0.0.1" addrtype="ipv4"/>
+<hostnames>
+<hostname name="localhost" type="PTR"/>
+</hostnames>
+<ports><port protocol="tcp" portid="18022"><state state="open" reason="syn-ack" reason_ttl="0"/></port>
+<port protocol="tcp" portid="18443"><state state="open" reason="syn-ack" reason_ttl="0"/><script id="ssl-cert" output="Subject: commonName=trap.example&#xa;Issuer: commonName=trap.example&#xa;Public Key type: ec&#xa;Public Key bits: 256&#xa;Signature Algorithm: ecdsa-with-SHA256&#xa;Not valid before: 2026-10-04T16:20:42&#xa;Not valid after:  2027-10-04T16:20:42&#xa;MD5:   eaad d2ec 723e 4c1f 6f0c 4a90 2d01 108a&#xa;SHA-1: be54 f76f 24c7 d2f0 ec8c 5895 1b84 1c7e e288 bf48"><table key="subject">
+<elem key="commonName">trap.example</elem>
+</table>
+<table key="issuer">
+<elem key="commonName">trap.example</elem>
+</table>
+<table key="pubkey">
+<elem key="type">ec</elem>
+<elem key="bits">256</elem>
+<table key="ecdhparams">
+<table key="curve_params">
+<elem key="ec_curve_type">namedcurve</elem>
+<elem key="curve">prime256v1</elem>
+</table>
+</table>
+</table>
+<table key="extensions">
+<table>
+<elem key="name">X509v3 Subject Key Identifier</elem>
+<elem key="value">9D:76:2F:E2:77:E1:3B:DE:CC:5C:28:CE:FE:8B:F7:F4:1D:AA:50:99</elem>
+</table>
+<table>
+<elem key="name">X509v3 Authority Key Identifier</elem>
+<elem key="value">9D:76:2F:E2:77:E1:3B:DE:CC:5C:28:CE:FE:8B:F7:F4:1D:AA:50:99</elem>
+</table>
+<table>
+<elem key="name">X509v3 Basic Constraints</elem>
+<elem key="value">CA:TRUE</elem>
+<elem key="critical">true</elem>
+</table>
+</table>
+<elem key="sig_algo">ecdsa-with-SHA256</elem>
+<table key="validity">
+<elem key="notBefore">2026-10-04T16:20:42</elem>
+<elem key="notAfter">2027-10-04T16:20:42</elem>
+</table>
+<elem key="md5">eaadd2ec723e4c1f6f0c4a902d01108a</elem>
+<elem key="sha1">be54f76f24c7d2f0ec8c58951b841c7ee288bf48</elem>
+<elem key="pem">-&#45;&#45;&#45;&#45;BEGIN CERTIFICATE-&#45;&#45;&#45;&#45;&#xa;MIIBgzCCASmgAwIBAgIUCa0jszhBpEhFzDkZjn1aWaOzJmcwCgYIKoZIzj0EAwIw&#xa;FzEVMBMGA1UEAwwMdHJhcC5leGFtcGxlMB4XDTI2MTAwNDE2MjA0MloXDTI3MTAw&#xa;NDE2MjA0MlowFzEVMBMGA1UEAwwMdHJhcC5leGFtcGxlMFkwEwYHKoZIzj0CAQYI&#xa;KoZIzj0DAQcDQgAEe45/WE/7N4TOocqJs7sU24c3xaBMRBvIVX2FmPh10yTQehh+&#xa;LPkq/M+XzAljfHa0eNe4bYABtbyq/B7TUk3nCqNTMFEwHQYDVR0OBBYEFJ12L+J3&#xa;4TvezFwozv6L9/QdqlCZMB8GA1UdIwQYMBaAFJ12L+J34TvezFwozv6L9/QdqlCZ&#xa;MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgZCAy0xL5DHfiUApe&#xa;gVUBUBgsf1wm2Xxd7eh5QHKGNiQCIQCQY0sBgEDjOYmuJx12XSyf+ZC5PJL7uh1S&#xa;yPW8DYMEsw==&#xa;-&#45;&#45;&#45;&#45;END CERTIFICATE-&#45;&#45;&#45;&#45;&#xa;</elem>
+</script></port>
+</ports>
+<times srtt="246" rttvar="3757" to="100000"/>
+</host>
+<runstats><finished time="1791131394" timestr="Sun Oct  4 18:29:54 2026" summary="Nmap done at Sun Oct  4 18:29:54 2026; 1 IP address (1 host up) scanned in 0.13 seconds" elapsed="0.13" exit="success"/><hosts up="1" down="0" total="1"/>
+</runstats>
+</nmaprun>

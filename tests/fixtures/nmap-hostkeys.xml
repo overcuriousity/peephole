@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -Pn -sS -sV -O --script ssh-hostkey,ssl-cert,ssh2-enum-algos 192.0.2.7" version="7.95">
+<host><status state="up"/><address addr="192.0.2.7" addrtype="ipv4"/>
+<ports>
+<port protocol="tcp" portid="22"><state state="open"/><service name="ssh" product="OpenSSH" version="9.6p1"/>
+<script id="ssh-hostkey" output="&#xa;  256 aa:bb (ECDSA)&#xa;  256 cc:dd (ED25519)">
+<table>
+<elem key="key">AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBC8/SlLxgShqBxnxHcnKdNgRdejePvImVO3FZVoyZ9ddjTaQ0wIBlaDP5CrYpOgJ1qMGHDpfSYAAq+wA8DLALQM=</elem>
+<elem key="fingerprint">00112233445566778899aabbccddeeff</elem>
+<elem key="type">ecdsa-sha2-nistp256</elem>
+<elem key="bits">256</elem>
+</table>
+<table>
+<elem key="key">AAAAC3NzaC1lZDI1NTE5AAAAIFZmA3EIlntMC1GvM/Todkoq5XDvyEG+2HeyLRvC0t/z</elem>
+<elem key="fingerprint">ffeeddccbbaa99887766554433221100</elem>
+<elem key="type">ssh-ed25519</elem>
+<elem key="bits">256</elem>
+</table>
+</script>
+<script id="ssh2-enum-algos" output="&#xa;  kex_algorithms: (2)">
+<table key="kex_algorithms">
+<elem>curve25519-sha256</elem>
+<elem>ecdh-sha2-nistp256</elem>
+</table>
+<table key="server_host_key_algorithms">
+<elem>ssh-ed25519</elem>
+</table>
+<table key="encryption_algorithms">
+<elem>aes128-ctr</elem>
+<elem>chacha20-poly1305@openssh.com</elem>
+</table>
+<table key="mac_algorithms">
+<elem>hmac-sha2-256</elem>
+</table>
+<table key="compression_algorithms">
+<elem>none</elem>
+<elem>zlib@openssh.com</elem>
+</table>
+</script>
+</port>
+<port protocol="tcp" portid="443"><state state="open"/><service name="https"/>
+<script id="ssl-cert" output="Subject: commonName=trap.example">
+<table key="subject">
+<elem key="commonName">trap.example</elem>
+</table>
+<table key="issuer">
+<elem key="commonName">trap.example</elem>
+</table>
+<elem key="md5">0123</elem>
+<elem key="sha1">4567</elem>
+<elem key="pem">-----BEGIN CERTIFICATE-----&#xa;MIIBgzCCASmgAwIBAgIUCa0jszhBpEhFzDkZjn1aWaOzJmcwCgYIKoZIzj0EAwIw&#xa;FzEVMBMGA1UEAwwMdHJhcC5leGFtcGxlMB4XDTI2MTAwNDE2MjA0MloXDTI3MTAw&#xa;NDE2MjA0MlowFzEVMBMGA1UEAwwMdHJhcC5leGFtcGxlMFkwEwYHKoZIzj0CAQYI&#xa;KoZIzj0DAQcDQgAEe45/WE/7N4TOocqJs7sU24c3xaBMRBvIVX2FmPh10yTQehh+&#xa;LPkq/M+XzAljfHa0eNe4bYABtbyq/B7TUk3nCqNTMFEwHQYDVR0OBBYEFJ12L+J3&#xa;4TvezFwozv6L9/QdqlCZMB8GA1UdIwQYMBaAFJ12L+J34TvezFwozv6L9/QdqlCZ&#xa;MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgZCAy0xL5DHfiUApe&#xa;gVUBUBgsf1wm2Xxd7eh5QHKGNiQCIQCQY0sBgEDjOYmuJx12XSyf+ZC5PJL7uh1S&#xa;yPW8DYMEsw==&#xa;-----END CERTIFICATE-----&#xa;</elem>
+</script>
+</port>
+</ports>
+<os><osmatch name="Linux 5.X" accuracy="95"/></os>
+</host>
+</nmaprun>

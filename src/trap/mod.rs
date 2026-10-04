@@ -787,15 +787,11 @@ async fn trap(
     let ip = client_ip(&parts.headers, peer.ip(), &state.cfg.trusted_proxies);
     let page_token = uuid::Uuid::new_v4().to_string();
     // Decided before recording, so the row says what was sent.
-    let decoy = if state.cfg.trap.decoys {
-        decoy::decoy(
-            parts.method.as_str(),
-            parts.uri.path(),
-            &page_token.replace('-', "")[..12],
-        )
-    } else {
-        None
-    };
+    let decoy = decoy::decoy(
+        parts.method.as_str(),
+        parts.uri.path(),
+        &page_token.replace('-', "")[..12],
+    );
     let (answer, status) = match &decoy {
         Some(d) => (format!("decoy:{}", d.name), 200),
         None => ("not-found".to_string(), 404),

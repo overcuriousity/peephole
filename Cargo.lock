@@ -2280,6 +2280,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "maxminddb",
+ "md-5",
  "parquet",
  "quick-xml",
  "rand 0.10.3",

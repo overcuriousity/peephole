@@ -33,10 +33,11 @@ nmap.
   its own rate budget, refreshed when an IP returns.
 - **Counter-scans** — rate-limited nmap scans in four levels that escalate by
   scope (more ports, `-sV`, `-O`, then safe discovery scripts), never by
-  speed or aggressiveness. Bystanders are spared: one request earns at most a
-  light scan, and verified crawlers, Tor exits, your own and `never_scan`
-  networks are never scanned; per-network, per-ASN and queue budgets stop
-  floods.
+  speed or aggressiveness. From level 2 they read the source's SSH host
+  keys and TLS certificates, so sources that share one show up as linked.
+  Bystanders are spared: one request earns at most a light scan, and
+  verified crawlers, Tor exits, your own and `never_scan` networks are
+  never scanned; per-network, per-ASN and queue budgets stop floods.
 - **Wall of shame** (public) — aggregate statistics per time range that
   refresh themselves: trends against the previous period, requests over time
   by severity, a weekday × hour heatmap, attack families and an OWASP Top 10 /

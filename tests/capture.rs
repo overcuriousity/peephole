@@ -242,12 +242,8 @@ async fn the_hour_counts_include_the_current_request() {
 }
 
 #[tokio::test]
-async fn decoys_are_opt_in() {
+async fn decoys_answer_first_stage_probes() {
     let (base, store, _dir) = spawn("").await;
-    let resp = reqwest::get(format!("{base}/.env")).await.unwrap();
-    assert_eq!(resp.status(), 404);
-
-    let (base, store2, _dir2) = spawn("[trap]\ndecoys = true\n").await;
     let resp = reqwest::get(format!("{base}/.env")).await.unwrap();
     assert_eq!(resp.status(), 200);
     assert!(
@@ -259,7 +255,7 @@ async fn decoys_are_opt_in() {
     let text = resp.text().await.unwrap();
     // The canary names the request it was served to.
     let token: String = sqlx::query_scalar("SELECT page_token FROM requests")
-        .fetch_one(&store2.pool)
+        .fetch_one(&store.pool)
         .await
         .unwrap();
     let canary = format!("canary-{}", &token.replace('-', "")[..12]);
@@ -270,8 +266,7 @@ async fn decoys_are_opt_in() {
     // Other paths still get the trap page.
     let resp = reqwest::get(format!("{base}/nothing-here")).await.unwrap();
     assert_eq!(resp.status(), 404);
-    assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 1);
-    assert_eq!(count(&store2, "SELECT COUNT(*) FROM requests").await, 3);
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM requests").await, 3);
 }
 
 #[tokio::test]
@@ -450,7 +445,7 @@ async fn a_failed_write_still_gets_the_trap_page() {
 
 #[tokio::test]
 async fn answer_and_status_are_recorded() {
-    let (base, store, _dir) = spawn("[trap]\ndecoys = true\n").await;
+    let (base, store, _dir) = spawn("").await;
     let client = reqwest::Client::new();
     for p in ["/.env", "/nothing", "/wp-login.php"] {
         client.get(format!("{base}{p}")).send().await.unwrap();
