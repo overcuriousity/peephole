@@ -3,13 +3,13 @@
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
 {% let sub = "queue" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Scan queue</h1><p class="muted">Every job, live. Filters apply to live updates too.</p></div>
+<div class="page-head"><div><h1>Scan queue</h1></div>
   <span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></div>
 {% if let Some(n) = pace.notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
 {% if let Some(e) = pace.error %}<div class="banner banner-warning">Pace not saved: {{ e }}</div>{% endif %}
-{% if pace.timeouts_high %}<div class="banner banner-warning">{{ pace.timeout_share }} of the scans finished in the last 24 h hit the {{ pace.timeout_min }} min timeout. The recommendation below raises it to {{ pace.rec_timeout_min }} min.</div>{% endif %}
-{% if pace.growing %}<div class="banner banner-warning">The queue grows by about {{ pace.net }} jobs per hour at the current pace. Apply the recommendation below or raise the pace.</div>{% endif %}
-{% if pace.not_scanning %}<div class="banner banner-warning">This node does not scan. The queue below is the whole cluster's; set each scanner's pace on the <a href="/admin/cluster">Cluster</a> page.</div>{% endif %}
+{% if pace.timeouts_high %}<div class="banner banner-warning">{{ pace.timeout_share }} of scans in 24 h hit the {{ pace.timeout_min }} min timeout; recommended: {{ pace.rec_timeout_min }} min.</div>{% endif %}
+{% if pace.growing %}<div class="banner banner-warning">The queue grows by about {{ pace.net }} jobs per hour at this pace.</div>{% endif %}
+{% if pace.not_scanning %}<div class="banner banner-warning">This node does not scan; scanner pace is on the <a href="/admin/cluster">Cluster</a> page.</div>{% endif %}
 <section class="card pace" id="pace">
   <div class="card-head"><h2>Pace</h2><span class="muted">{% if pace.paused %}scanning paused{% else %}{{ pace.cadence }}{% endif %}</span></div>
   <div class="tiles">
@@ -30,18 +30,18 @@
       <label>Scans per hour <input type="number" name="max_scans_per_hour" min="0" max="{{ pace.max_per_hour }}" value="{{ pace.current.max_scans_per_hour }}" required></label>
       <label>Timeout (min) <input type="number" name="timeout_minutes" min="{{ pace.min_timeout_min }}" max="{{ pace.max_timeout_min }}" step="any" value="{{ pace.timeout_min }}" required></label>
       <button class="btn btn-primary" type="submit">Save pace</button>
-      <p class="muted pace-note">0 workers or 0 scans per hour pauses scanning. Starts are spaced evenly over the hour. nmap is killed when it exceeds the timeout; level-4 scans (every port) get {{ pace.level4_timeout_min }} min (<code>scan.level4_timeout_factor</code>).</p>
+      <p class="muted pace-note">0 pauses scanning. Level 4 timeout: {{ pace.level4_timeout_min }} min.</p>
     </form>
     <form class="pace-rec" method="post" action="/admin/queue/pace">
       <input type="hidden" name="max_workers" value="{{ pace.rec.max_workers }}">
       <input type="hidden" name="max_scans_per_hour" value="{{ pace.rec.max_scans_per_hour }}">
       <input type="hidden" name="timeout_minutes" value="{{ pace.rec_timeout_min }}">
       <p><strong>Recommended{% if pace.cluster_note.is_some() %} for this node{% endif %}:</strong> {{ pace.rec.max_workers }} workers, {{ pace.rec.max_scans_per_hour }} scans per hour ({{ pace.rec_cadence }}), {{ pace.rec_timeout_min }} min timeout.</p>
-      <p class="muted">Covers the arrival rate with 25% headroom and clears the current backlog within a day. {% if pace.cluster_note.is_some() %}The queue is shared: the need is split evenly over the live scanners, so each node can apply its own recommendation in any order. {% endif %}Raises the timeout by half when more than 10% of scans hit it.</p>
+      <p class="muted">Arrivals + 25 %, backlog cleared within a day{% if pace.cluster_note.is_some() %}, split over the live scanners{% endif %}.</p>
       {% if pace.rec_differs %}<button class="btn" type="submit">Apply recommendation</button>{% else %}<p class="muted">The current pace matches.</p>{% endif %}
     </form>
   </div>
-  {% if pace.m.failed_24h > 0 %}<form method="post" action="/admin/queue/retry-failed" class="pace-retry"><button class="btn btn-sm" type="submit">Retry failed scans</button> <span class="muted">Requeues the latest failed job per IP from the last 7 days.</span></form>{% endif %}
+  {% if pace.m.failed_24h > 0 %}<form method="post" action="/admin/queue/retry-failed" class="pace-retry"><button class="btn btn-sm" type="submit">Retry failed scans</button> <span class="muted">last 7 days, one per IP</span></form>{% endif %}
 </section>
 <form class="filters" method="get" action="/admin/queue">
   <label>Status <select name="status"><option value="">any</option>

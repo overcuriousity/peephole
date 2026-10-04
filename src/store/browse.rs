@@ -145,8 +145,41 @@ pub struct IpOverview {
     pub request_count: i64,
     pub max_severity: i64,
     pub labels: Vec<Named>,
-    /// 24 hourly buckets, oldest first, last = current hour.
-    pub sparkline: Vec<i64>,
+    /// Label hits per family (`classify::FAMILIES` order, non-zero only),
+    /// summed from the per-IP label counts.
+    pub families: Vec<Named>,
+    /// Hourly buckets of the last 7 days that have requests, oldest first,
+    /// each split by severity.
+    pub week: Vec<super::stats::Bucket>,
+    /// Days of the last [`CALENDAR_DAYS`] with requests, oldest first.
+    pub calendar: Vec<CalendarDay>,
+    /// 1 = most requests of every IP, all time; `ranked` IPs have requests.
+    pub rank: i64,
+    pub ranked: i64,
+    /// The surrounding network (/24 for IPv4, /48 for IPv6), how many other
+    /// IPs of it have requests, and the busiest of them.
+    pub net: String,
+    pub net_count: i64,
+    pub neighbours: Vec<Neighbour>,
+    /// Other IPs of the same ASN with requests.
+    pub asn_count: i64,
+}
+
+/// How far back the per-IP activity calendar reaches (26 weeks).
+pub const CALENDAR_DAYS: i64 = 182;
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct CalendarDay {
+    pub day: String,
+    pub count: i64,
+    pub max_severity: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct Neighbour {
+    pub ip: String,
+    pub request_count: i64,
+    pub max_severity: i64,
 }
 
 /// What the `q` box means.
@@ -569,8 +602,8 @@ impl Store {
             .await?)
     }
 
-    /// The IP's public aggregates, from its read models. Only the sparkline
-    /// reads requests, and only the last 24 hours of them.
+    /// The IP's public aggregates, from its read models. Only the week and
+    /// the calendar read requests, through the (ip_id, ts) index.
     pub async fn ip_overview(&self, ip_id: i64) -> Result<Option<IpOverview>> {
         let Some(ip) = sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE id = ?")
             .bind(ip_id)
@@ -586,26 +619,122 @@ impl Store {
         .bind(ip_id)
         .fetch_all(&self.read)
         .await?;
-        // Hours ago (0 = current hour) → count.
-        let rows: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT CAST((julianday('now') - julianday(ts)) * 24 AS INTEGER) AS h, COUNT(*)
-             FROM requests WHERE ip_id = ? AND ts >= datetime('now','-24 hours') GROUP BY h",
+        let mut fam: std::collections::HashMap<&'static str, i64> = Default::default();
+        for (label, n) in
+            sqlx::query_as::<_, (String, i64)>("SELECT label, count FROM ip_labels WHERE ip_id = ?")
+                .bind(ip_id)
+                .fetch_all(&self.read)
+                .await?
+        {
+            *fam.entry(crate::classify::label_family(&label))
+                .or_default() += n;
+        }
+        let families = crate::classify::FAMILIES
+            .iter()
+            .filter_map(|f| {
+                fam.get(f).map(|&count| Named {
+                    name: (*f).to_string(),
+                    count,
+                })
+            })
+            .collect();
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT strftime('%Y-%m-%dT%H:00', ts) AS h, severity, COUNT(*)
+             FROM requests WHERE ip_id = ? AND ts >= datetime('now','-7 days')
+             GROUP BY h, severity ORDER BY h",
         )
         .bind(ip_id)
         .fetch_all(&self.read)
         .await?;
-        let mut sparkline = vec![0i64; 24];
-        for (h, c) in rows {
-            if (0..24).contains(&h) {
-                sparkline[23 - h as usize] += c;
+        let mut week: Vec<super::stats::Bucket> = Vec::new();
+        for (h, sev, n) in rows {
+            if week.last().map(|b| b.ts != h).unwrap_or(true) {
+                week.push(super::stats::Bucket {
+                    ts: h,
+                    count: 0,
+                    by_severity: [0; 5],
+                });
             }
+            let b = week.last_mut().expect("pushed above");
+            b.count += n;
+            b.by_severity[sev.clamp(0, 4) as usize] += n;
         }
+        let calendar = sqlx::query_as::<_, CalendarDay>(
+            "SELECT date(ts) AS day, COUNT(*) AS count, MAX(severity) AS max_severity
+             FROM requests WHERE ip_id = ? AND ts >= date('now', ?)
+             GROUP BY day ORDER BY day",
+        )
+        .bind(ip_id)
+        .bind(format!("-{} days", CALENDAR_DAYS - 1))
+        .fetch_all(&self.read)
+        .await?;
+        let (rank, ranked): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) + 1 FROM ips WHERE request_count > ?1),
+                    (SELECT COUNT(*) FROM ips WHERE request_count > 0)",
+        )
+        .bind(ip.request_count)
+        .fetch_one(&self.read)
+        .await?;
+        let (net, net_count, neighbours) = match ip.ip.parse::<IpAddr>() {
+            Ok(addr) => {
+                let n = IpNet::new(addr, if addr.is_ipv4() { 24 } else { 48 })
+                    .map(|n| n.trunc())
+                    .expect("valid prefix length");
+                let (lo, hi) = super::net_key_range(&n);
+                let v6 = if addr.is_ipv6() {
+                    " AND instr(ip, ':') > 0"
+                } else {
+                    ""
+                };
+                let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM ips WHERE ip_key BETWEEN ? AND ? AND id != ?
+                     AND request_count > 0{v6}"
+                )))
+                .bind(&lo)
+                .bind(&hi)
+                .bind(ip_id)
+                .fetch_one(&self.read)
+                .await?;
+                let top = sqlx::query_as::<_, Neighbour>(sqlx::AssertSqlSafe(format!(
+                    "SELECT ip, request_count, max_severity FROM ips
+                     WHERE ip_key BETWEEN ? AND ? AND id != ? AND request_count > 0{v6}
+                     ORDER BY request_count DESC, ip LIMIT 8"
+                )))
+                .bind(&lo)
+                .bind(&hi)
+                .bind(ip_id)
+                .fetch_all(&self.read)
+                .await?;
+                (n.to_string(), count, top)
+            }
+            Err(_) => (String::new(), 0, vec![]),
+        };
+        let asn_count: i64 = match ip.asn {
+            Some(a) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM ips WHERE asn = ? AND id != ? AND request_count > 0",
+                )
+                .bind(a)
+                .bind(ip_id)
+                .fetch_one(&self.read)
+                .await?
+            }
+            None => 0,
+        };
         Ok(Some(IpOverview {
             request_count: ip.request_count,
             max_severity: ip.max_severity,
             ip,
             labels,
-            sparkline,
+            families,
+            week,
+            calendar,
+            rank,
+            ranked,
+            net,
+            net_count,
+            neighbours,
+            asn_count,
         }))
     }
 
@@ -831,13 +960,18 @@ mod tests {
         assert_eq!(ov.request_count, 3);
         assert_eq!(ov.max_severity, 3);
         assert_eq!(ov.labels[0].name, "sensitive-path");
-        assert_eq!(ov.sparkline.len(), 24);
-        assert_eq!(ov.sparkline.iter().sum::<i64>(), 3);
-        assert_eq!(
-            *ov.sparkline.last().unwrap(),
-            3,
-            "current hour is the last bucket"
-        );
+        assert_eq!(ov.week.iter().map(|b| b.count).sum::<i64>(), 3);
+        assert_eq!(ov.calendar.len(), 1);
+        assert_eq!(ov.calendar[0].count, 3);
+        assert_eq!(ov.rank, 1);
+        assert_eq!(ov.net, "203.0.113.0/24");
+        assert_eq!((ov.net_count, ov.asn_count), (1, 1));
+        assert_eq!(ov.neighbours[0].ip, "203.0.113.200");
+        assert_eq!(ov.families[0].name, "other");
+        let c = s.ip_by_addr("2001:db8::1").await.unwrap().unwrap();
+        let ov6 = s.ip_overview(c.id).await.unwrap().unwrap();
+        assert_eq!(ov6.net, "2001:db8::/48");
+        assert_eq!((ov6.net_count, ov6.rank, ov6.ranked), (0, 2, 3));
         let v6 = s.ip_by_addr("2001:db8::1").await.unwrap().unwrap();
         assert_eq!(v6.ip, "2001:db8::1");
     }

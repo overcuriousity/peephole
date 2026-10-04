@@ -5,6 +5,6 @@
   <label class="check" title="{{ settings.scanner_missing }}"><input type="checkbox" name="scanner"{% if settings.scanner %} checked{% endif %}{% if !settings.scanner && !settings.scanner_missing.is_empty() %} disabled{% endif %}> Scanner</label>
   <label class="check" title="{{ settings.web_missing }}"><input type="checkbox" name="web"{% if settings.web %} checked{% endif %}{% if !settings.web && !settings.web_missing.is_empty() %} disabled{% endif %}> Web interface</label>
   <button class="btn btn-sm" type="submit">Save</button>
-  <span class="muted small">settings version {{ settings.version }}; roles switch within seconds, without a restart</span>
+  <span class="muted small">version {{ settings.version }}</span>
 </form>
-<p class="muted">A role that is greyed out lacks its settings in the config file (hover for the reason). Switching the web interface off removes these pages; bring them back with <code>peephole settings reset roles.web</code>.</p>
+<p class="muted">Greyed out: not configured (hover). Web off removes these pages; restore: <code>peephole settings reset roles.web</code></p>

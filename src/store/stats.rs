@@ -77,11 +77,33 @@ pub struct TopIp {
     pub is_tor: bool,
 }
 
-#[derive(Clone, Debug, serde::Serialize, sqlx::FromRow)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Bucket {
     pub ts: String,
     pub count: i64,
+    /// The bucket's requests per severity 0..4.
+    pub by_severity: [i64; 5],
 }
+
+/// The window just before the selected one, as long as it, for trends.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Previous {
+    pub total_requests: i64,
+    pub unique_ips: i64,
+}
+
+/// A port found open on the scanned sources: how many distinct IPs.
+#[derive(Clone, Debug, serde::Serialize, sqlx::FromRow)]
+pub struct PortStat {
+    pub port: i64,
+    pub proto: String,
+    pub service: Option<String>,
+    pub ips: i64,
+}
+
+/// A port is shown publicly only once it was found open on this many
+/// distinct scanned IPs, so the panel never describes a single host.
+pub const PORT_MIN_IPS: i64 = 3;
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct RecentRequest {
@@ -92,6 +114,8 @@ pub struct RecentRequest {
     pub path: String,
     pub severity: i64,
     pub labels: Vec<String>,
+    /// The family of each label, in the same order (for badge colours).
+    pub families: Vec<&'static str>,
     pub owasp: Vec<String>,
     pub country: Option<String>,
     pub is_tor: bool,
@@ -112,6 +136,24 @@ pub struct Stats {
     pub top_labels: Vec<Named>,
     pub severity_distribution: Vec<Named>,
     pub timeline: Vec<Bucket>,
+    /// Requests per weekday (0 = Monday) and UTC hour.
+    pub heatmap: Vec<[i64; 24]>,
+    /// The previous window of the same length; `None` for all time.
+    pub previous: Option<Previous>,
+    /// IPs first seen in the range.
+    pub new_ips: i64,
+    /// The newest request's time (UTC), in the whole dataset.
+    pub last_request: Option<String>,
+    /// Requests per label family (`classify::FAMILIES` order, non-zero
+    /// only): a request counts once per family it touched.
+    pub families: Vec<Named>,
+    /// Requests per OWASP tag, most frequent first.
+    pub owasp: Vec<Named>,
+    /// Ports most often open on the scanned sources (finished in the range),
+    /// each on at least [`PORT_MIN_IPS`] distinct IPs.
+    pub ports: Vec<PortStat>,
+    /// Distinct IPs with a scan finished in the range.
+    pub scanned_ips: i64,
     /// Admin-only, rendered server-side on the wall. Never serialized to the
     /// public `/api/stats` JSON — request rows identify individual clients.
     #[serde(skip_serializing)]
@@ -150,7 +192,7 @@ struct IpAggregates {
     top_labels: Vec<Named>,
 }
 
-type RecentTuple = (
+pub(crate) type RecentTuple = (
     i64,
     String,
     String,
@@ -162,6 +204,28 @@ type RecentTuple = (
     Option<String>,
     bool,
 );
+
+pub(crate) fn recent_from(
+    (id, ts, ip, method, path, severity, labels, owasp, country, is_tor): RecentTuple,
+) -> RecentRequest {
+    let labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
+    RecentRequest {
+        id,
+        ts,
+        ip,
+        method,
+        path,
+        severity,
+        families: labels
+            .iter()
+            .map(|l| crate::classify::label_family(l))
+            .collect(),
+        labels,
+        owasp: serde_json::from_str(&owasp).unwrap_or_default(),
+        country,
+        is_tor,
+    }
+}
 
 impl Store {
     async fn count_where(&self, sql: &str, since: Option<&'static str>) -> Result<i64> {
@@ -361,21 +425,46 @@ impl Store {
                 since,
             )
             .await?;
-        let fmt = if r.hourly() {
-            "%Y-%m-%dT%H:00"
-        } else {
-            "%Y-%m-%d"
+        let (timeline, heatmap) = self.timeline_and_heatmap(r).await?;
+        let previous = match r.since() {
+            Some(m) => Some(self.previous_window(m).await?),
+            None => None,
         };
-        let sql = format!(
-            "SELECT strftime('{fmt}', r.ts) AS ts, COUNT(*) AS count FROM requests r
-             WHERE 1=1{w} GROUP BY ts ORDER BY ts"
-        );
-        let timeline = bind_since!(
-            sqlx::query_as::<_, Bucket>(sqlx::AssertSqlSafe(sql.as_str())),
-            since
+        let new_ips = match r {
+            Range::All => unique_ips,
+            _ => {
+                self.count_where(
+                    &format!(
+                        "SELECT COUNT(*) FROM ips i WHERE i.request_count > 0{}",
+                        r.ts_clause("i.first_seen").0
+                    ),
+                    since,
+                )
+                .await?
+            }
+        };
+        let last_request: Option<String> = sqlx::query_scalar("SELECT MAX(ts) FROM requests")
+            .fetch_one(&self.read)
+            .await?;
+        let (families, owasp) = self.families_and_owasp(r).await?;
+        let ports = bind_since!(
+            sqlx::query_as::<_, PortStat>(sqlx::AssertSqlSafe(format!(
+                "SELECT p.port, p.proto, MAX(p.service) AS service, COUNT(DISTINCT s.ip_id) AS ips
+                 FROM ports p JOIN scans s ON p.scan_id = s.id
+                 WHERE p.state = 'open'{ws}
+                 GROUP BY p.port, p.proto HAVING COUNT(DISTINCT s.ip_id) >= {PORT_MIN_IPS}
+                 ORDER BY ips DESC, p.port LIMIT 15"
+            ))),
+            since_s
         )
         .fetch_all(&self.read)
         .await?;
+        let scanned_ips = self
+            .count_where(
+                &format!("SELECT COUNT(DISTINCT s.ip_id) FROM scans s WHERE 1=1{ws}"),
+                since_s,
+            )
+            .await?;
         let sql = format!(
             "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, r.owasp_json,
                     i.country, i.is_tor_exit
@@ -388,25 +477,7 @@ impl Store {
         )
         .fetch_all(&self.read)
         .await?;
-        let recent = recent_rows
-            .into_iter()
-            .map(
-                |(id, ts, ip, method, path, severity, labels, owasp, country, is_tor)| {
-                    RecentRequest {
-                        id,
-                        ts,
-                        ip,
-                        method,
-                        path,
-                        severity,
-                        labels: serde_json::from_str(&labels).unwrap_or_default(),
-                        owasp: serde_json::from_str(&owasp).unwrap_or_default(),
-                        country,
-                        is_tor,
-                    }
-                },
-            )
-            .collect();
+        let recent = recent_rows.into_iter().map(recent_from).collect();
         // Only the public refresh timestamps — never the whole intel_meta
         // table, which also holds webauthn_setup_token_hash. `intel` is
         // serialized into the public /api/stats response.
@@ -432,9 +503,130 @@ impl Store {
             top_labels,
             severity_distribution,
             timeline,
+            heatmap,
+            previous,
+            new_ips,
+            last_request,
+            families,
+            owasp,
+            ports,
+            scanned_ips,
             recent,
             intel,
         })
+    }
+
+    /// The timeline (hourly or daily, as the range wants) with each bucket
+    /// split by severity, and the weekday × hour heatmap, from one pass of
+    /// hourly buckets.
+    async fn timeline_and_heatmap(&self, r: Range) -> Result<(Vec<Bucket>, Vec<[i64; 24]>)> {
+        let (w, since) = r.ts_clause("r.ts");
+        let sql = format!(
+            "SELECT strftime('%Y-%m-%dT%H:00', r.ts) AS h, r.severity, COUNT(*) FROM requests r
+             WHERE 1=1{w} GROUP BY h, r.severity ORDER BY h"
+        );
+        let rows = bind_since!(
+            sqlx::query_as::<_, (Option<String>, i64, i64)>(sqlx::AssertSqlSafe(sql.as_str())),
+            since
+        )
+        .fetch_all(&self.read)
+        .await?;
+        let mut heatmap = vec![[0i64; 24]; 7];
+        let mut timeline: Vec<Bucket> = Vec::new();
+        for (h, sev, n) in rows {
+            let Some(h) = h else { continue };
+            if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&h, "%Y-%m-%dT%H:%M") {
+                use chrono::{Datelike, Timelike};
+                heatmap[t.weekday().num_days_from_monday() as usize][t.hour() as usize] += n;
+            }
+            let key = if r.hourly() { h } else { h[..10].to_string() };
+            if timeline.last().map(|b| b.ts != key).unwrap_or(true) {
+                timeline.push(Bucket {
+                    ts: key,
+                    count: 0,
+                    by_severity: [0; 5],
+                });
+            }
+            let b = timeline.last_mut().expect("pushed above");
+            b.count += n;
+            b.by_severity[sev.clamp(0, 4) as usize] += n;
+        }
+        Ok((timeline, heatmap))
+    }
+
+    /// Requests and distinct IPs in the window of the same length just
+    /// before `datetime('now', since)`.
+    async fn previous_window(&self, since: &'static str) -> Result<Previous> {
+        // "-24 hours" → the window [now -48 h, now -24 h).
+        let earlier = match since {
+            "-24 hours" => "-48 hours",
+            "-7 days" => "-14 days",
+            _ => "-60 days",
+        };
+        let (total_requests, unique_ips): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(DISTINCT ip_id) FROM requests
+             WHERE ts >= datetime('now', ?) AND ts < datetime('now', ?)",
+        )
+        .bind(earlier)
+        .bind(since)
+        .fetch_one(&self.read)
+        .await?;
+        Ok(Previous {
+            total_requests,
+            unique_ips,
+        })
+    }
+
+    /// Requests per label family and per OWASP tag. Grouped by the stored
+    /// lists first (few distinct combinations), so each request counts once
+    /// per family or tag without unpacking every row's JSON.
+    async fn families_and_owasp(&self, r: Range) -> Result<(Vec<Named>, Vec<Named>)> {
+        let (w, since) = r.ts_clause("r.ts");
+        let sql = format!(
+            "SELECT r.labels_json, r.owasp_json, COUNT(*) FROM requests r
+             WHERE 1=1{w} GROUP BY r.labels_json, r.owasp_json"
+        );
+        let rows = bind_since!(
+            sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql.as_str())),
+            since
+        )
+        .fetch_all(&self.read)
+        .await?;
+        let mut fam: HashMap<&'static str, i64> = HashMap::new();
+        let mut tags: HashMap<String, i64> = HashMap::new();
+        for (labels, owasp, n) in rows {
+            let labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
+            let mut seen: Vec<&'static str> = labels
+                .iter()
+                .map(|l| crate::classify::label_family(l))
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            for f in seen {
+                *fam.entry(f).or_default() += n;
+            }
+            let mut owasp: Vec<String> = serde_json::from_str(&owasp).unwrap_or_default();
+            owasp.sort_unstable();
+            owasp.dedup();
+            for t in owasp {
+                *tags.entry(t).or_default() += n;
+            }
+        }
+        let families = crate::classify::FAMILIES
+            .iter()
+            .filter_map(|f| {
+                fam.get(f).map(|&count| Named {
+                    name: (*f).to_string(),
+                    count,
+                })
+            })
+            .collect();
+        let mut owasp: Vec<Named> = tags
+            .into_iter()
+            .map(|(name, count)| Named { name, count })
+            .collect();
+        owasp.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+        Ok((families, owasp))
     }
 
     pub async fn map_counts(&self, r: Range) -> Result<MapCounts> {
@@ -640,6 +832,9 @@ pub struct StatsCache {
     ip: SwrCache<i64, super::browse::IpOverview>,
     /// `/api/blocklist` bodies, keyed by their canonical parameters.
     blocklist: SwrCache<String, String>,
+    /// Admin analytics: aggregates only, so a short staleness is fine and
+    /// repeated views of the expensive ranges cost one query each.
+    analytics: SwrCache<Range, super::analytics::Analytics>,
 }
 
 impl Default for StatsCache {
@@ -650,6 +845,7 @@ impl Default for StatsCache {
             ips: SwrCache::new(IPS_CACHE_MAX),
             ip: SwrCache::new(IP_CACHE_MAX),
             blocklist: SwrCache::new(crate::admin::blocklist::CACHE_MAX),
+            analytics: SwrCache::new(Range::ALL.len()),
         }
     }
 }
@@ -723,6 +919,20 @@ impl StatsCache {
     #[cfg(test)]
     pub async fn ips_len(&self) -> usize {
         self.ips.len()
+    }
+
+    pub async fn analytics(
+        &self,
+        store: &Store,
+        r: Range,
+    ) -> Result<Arc<super::analytics::Analytics>> {
+        let store = store.clone();
+        self.analytics
+            .get(r, ttl(r), move || {
+                let store = store.clone();
+                Box::pin(async move { store.analytics(r).await })
+            })
+            .await
     }
 
     pub async fn map(&self, store: &Store, r: Range) -> Result<Arc<MapCounts>> {
@@ -996,6 +1206,85 @@ mod tests {
         // A scan-only IP (no requests) is not counted.
         s.upsert_ip("192.0.2.9".parse().unwrap()).await.unwrap();
         assert_eq!(s.stats(Range::All).await.unwrap().unique_ips, 2);
+    }
+
+    #[tokio::test]
+    async fn timeline_is_split_by_severity_and_heatmap_adds_up() {
+        let s = seeded().await;
+        let st = s.stats(Range::D7).await.unwrap();
+        let sum: i64 = st.timeline.iter().map(|b| b.count).sum();
+        assert_eq!(sum, 4);
+        for b in &st.timeline {
+            assert_eq!(b.by_severity.iter().sum::<i64>(), b.count, "{b:?}");
+        }
+        let sev3: i64 = st.timeline.iter().map(|b| b.by_severity[3]).sum();
+        assert_eq!(sev3, 1);
+        assert_eq!(st.heatmap.len(), 7);
+        assert_eq!(st.heatmap.iter().flatten().sum::<i64>(), 4);
+        // Daily buckets keep the split.
+        let all = s.stats(Range::All).await.unwrap();
+        assert!(all.timeline.iter().all(|b| b.ts.len() == 10));
+        assert_eq!(
+            all.timeline.iter().map(|b| b.by_severity[1]).sum::<i64>(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn trends_compare_with_the_previous_window() {
+        let s = seeded().await;
+        sqlx::query("INSERT INTO requests (uid, ts, ip_id, method, path, headers_json, labels_json, severity) VALUES ('prev', datetime('now','-30 hours'), 1, 'GET', '/p', '[]', '[]', 0)")
+            .execute(&s.pool).await.unwrap();
+        let h24 = s.stats(Range::H24).await.unwrap();
+        let p = h24.previous.as_ref().unwrap();
+        assert_eq!((p.total_requests, p.unique_ips), (1, 1));
+        assert!(s.stats(Range::All).await.unwrap().previous.is_none());
+        assert_eq!(h24.new_ips, 2);
+        assert!(h24.last_request.is_some());
+    }
+
+    #[tokio::test]
+    async fn families_and_owasp_count_each_request_once() {
+        let s = seeded().await;
+        sqlx::query("INSERT INTO requests (uid, ts, ip_id, method, path, headers_json, labels_json, owasp_json, severity) VALUES ('mix', datetime('now'), 1, 'GET', '/x', '[]', '[\"sqli\",\"xss\",\"env-probe\"]', '[\"A03:2021\",\"A03:2021\"]', 4)")
+            .execute(&s.pool).await.unwrap();
+        let st = s.stats(Range::H24).await.unwrap();
+        let get = |v: &[Named], k: &str| v.iter().find(|n| n.name == k).map(|n| n.count);
+        // sqli and xss are both injection: one request, counted once.
+        assert_eq!(get(&st.families, "inject"), Some(1));
+        assert_eq!(get(&st.families, "recon"), Some(1));
+        // The three seeded requests carry "sensitive-path": no family.
+        assert_eq!(get(&st.families, "other"), Some(3));
+        assert_eq!(get(&st.owasp, "A03:2021"), Some(1));
+        assert_eq!(get(&st.owasp, "OAT-018"), Some(3));
+        assert_eq!(st.owasp[0].name, "OAT-018", "most frequent first");
+    }
+
+    #[tokio::test]
+    async fn open_ports_need_several_distinct_ips() {
+        let s = seeded().await;
+        let mut ids = vec![];
+        for a in ["192.0.2.1", "192.0.2.2", "192.0.2.3"] {
+            ids.push(s.upsert_ip(a.parse().unwrap()).await.unwrap().id);
+        }
+        for (n, ip) in ids.iter().enumerate() {
+            sqlx::query("INSERT INTO scan_jobs (id, ip_id, level, status, queued_at) VALUES (?, ?, 1, 'done', datetime('now'))")
+                .bind(n as i64 + 1).bind(ip).execute(&s.pool).await.unwrap();
+            sqlx::query("INSERT INTO scans (id, job_id, ip_id, level, started_at, finished_at) VALUES (?, ?, ?, 1, datetime('now'), datetime('now'))")
+                .bind(n as i64 + 1).bind(n as i64 + 1).bind(ip).execute(&s.pool).await.unwrap();
+            // 22 open on all three, 8080 on one only.
+            sqlx::query("INSERT INTO ports (scan_id, port, proto, state, service) VALUES (?, 22, 'tcp', 'open', 'ssh')")
+                .bind(n as i64 + 1).execute(&s.pool).await.unwrap();
+            if n == 0 {
+                sqlx::query("INSERT INTO ports (scan_id, port, proto, state, service) VALUES (1, 8080, 'tcp', 'open', 'http-proxy')")
+                    .execute(&s.pool).await.unwrap();
+            }
+        }
+        let st = s.stats(Range::H24).await.unwrap();
+        assert_eq!(st.scanned_ips, 3);
+        assert_eq!(st.ports.len(), 1, "{:?}", st.ports);
+        assert_eq!((st.ports[0].port, st.ports[0].ips), (22, 3));
+        assert_eq!(st.ports[0].service.as_deref(), Some("ssh"));
     }
 
     #[test]

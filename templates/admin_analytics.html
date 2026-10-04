@@ -1,0 +1,104 @@
+{% extends "layout.html" %}
+{% block title %}peephole — analytics{% endblock %}
+{% block content %}
+{% let sub = "analytics" %}{% include "_admin_nav.html" %}
+<div class="page-head">
+  <div><h1>Analytics</h1><p class="muted">{{ range.label() }}</p></div>
+  {% let base = "/admin/analytics" %}{% include "_range.html" %}
+</div>
+
+<div class="tiles">
+  <div class="tile"><span class="label">Requests</span><div class="value">{{ crate::admin::views::thousands(a.total_requests) }}</div></div>
+  <div class="tile"><span class="label">Methods</span><div class="value">{{ a.methods.len() }}</div><div class="hint">{% if let Some(m) = a.methods.first() %}mostly {{ m.name }}{% else %}none{% endif %}</div></div>
+  <div class="tile"><span class="label">JA4 seen</span><div class="value">{{ a.ja4.len() }}{% if a.ja4.len() >= 15 %}+{% endif %}</div></div>
+  <div class="tile"><span class="label">Open ports</span><div class="value">{{ a.ports.len() }}{% if a.ports.len() >= 20 %}+{% endif %}</div></div>
+</div>
+
+<div class="stack">
+  <div class="grid-2">
+    <section class="card">
+      <div class="card-head"><h2>Top paths</h2><a href="/requests">search →</a></div>
+      <div class="table-wrap"><table class="an-table">
+        <thead><tr><th>Path</th><th class="num">Requests</th><th class="num">IPs</th></tr></thead>
+        <tbody>{% for n in a.paths %}<tr><td class="name"><a href="/requests?path={{ n.name|urlencode }}">{{ n.name }}</a>{% let v = n.count %}{% let max = max.paths %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
+        {% if a.paths.is_empty() %}<tr><td colspan="3" class="empty">None.</td></tr>{% endif %}</tbody>
+      </table></div>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>Top user agents</h2></div>
+      <div class="table-wrap"><table class="an-table">
+        <thead><tr><th>User-Agent</th><th class="num">Requests</th><th class="num">IPs</th></tr></thead>
+        <tbody>{% for n in a.user_agents %}<tr><td class="name">{{ n.name }}{% let value = n.name.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}{% let v = n.count %}{% let max = max.user_agents %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
+        {% if a.user_agents.is_empty() %}<tr><td colspan="3" class="empty">None.</td></tr>{% endif %}</tbody>
+      </table></div>
+    </section>
+  </div>
+
+  <div class="grid-3">
+    <section class="card">
+      <h2>Methods</h2>
+      {% let total = a.total_requests %}
+      <ul class="shares">{% for n in a.methods %}<li><span class="mono">{{ n.name }}</span><span class="num">{{ crate::admin::views::thousands(n.count) }}<span class="share-pct">{{ crate::admin::views::pct(n.count, total) }} %</span></span>{% let v = n.count %}{% let max = total %}{% include "_bar.html" %}</li>{% endfor %}</ul>
+      {% if a.methods.is_empty() %}<p class="empty">None.</p>{% endif %}
+    </section>
+    <section class="card">
+      <h2>Transport</h2>
+      <ul class="shares">{% for n in a.transports %}<li><span class="mono">{{ n.name }}</span><span class="num">{{ crate::admin::views::thousands(n.count) }}<span class="share-pct">{{ crate::admin::views::pct(n.count, total) }} %</span></span>{% let v = n.count %}{% let max = total %}{% include "_bar.html" %}</li>{% endfor %}</ul>
+      {% if a.transports.is_empty() %}<p class="empty">None.</p>{% endif %}
+    </section>
+    <section class="card">
+      <h2>Answered with</h2>
+      <ul class="shares">{% for n in a.answers %}<li><span class="mono">{{ n.name }}</span><span class="num">{{ crate::admin::views::thousands(n.count) }}<span class="share-pct">{{ crate::admin::views::pct(n.count, total) }} %</span></span>{% let v = n.count %}{% let max = total %}{% include "_bar.html" %}</li>{% endfor %}</ul>
+      {% if a.answers.is_empty() %}<p class="empty">None.</p>{% endif %}
+    </section>
+  </div>
+
+  <section class="card">
+    <div class="card-head"><h2>TLS fingerprints (JA4)</h2></div>
+    <div class="table-wrap"><table class="an-table">
+      <thead><tr><th>JA4</th><th class="num">Requests</th><th class="num">IPs</th></tr></thead>
+      <tbody>{% for n in a.ja4 %}<tr><td class="name">{{ n.name }}{% let value = n.name.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}{% let v = n.count %}{% let max = max.ja4 %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
+      {% if a.ja4.is_empty() %}<tr><td colspan="3" class="empty">None.</td></tr>{% endif %}</tbody>
+    </table></div>
+  </section>
+
+  <div class="grid-2">
+    <section class="card">
+      <div class="card-head"><h2>Open ports</h2><span class="muted">IPs</span></div>
+      <ol class="ports-list">
+        {% for p in a.ports %}
+        <li><span class="port mono">{{ p.port }}<span class="muted">/{{ p.proto }}</span></span><span class="port-svc">{{ p.service.as_deref().unwrap_or("unknown") }}</span>{% let v = p.ips %}{% let max = max.ports %}{% include "_bar.html" %}<span class="num">{{ p.ips }}</span></li>
+        {% endfor %}
+      </ol>
+      {% if a.ports.is_empty() %}<p class="empty">None.</p>{% endif %}
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>What runs on them</h2></div>
+      <ol class="ranked">
+        {% for n in a.products %}<li><span class="ranked-name">{{ n.name }}</span><span class="num">{{ n.ips }} IP{% if n.ips != 1 %}s{% endif %}</span>{% let v = n.ips %}{% let max = max.products %}{% include "_bar.html" %}</li>{% endfor %}
+      </ol>
+      {% if a.products.is_empty() %}<p class="empty">None (needs level 2+).</p>{% endif %}
+    </section>
+  </div>
+
+  <div class="grid-3">
+    <section class="card">
+      <h2>OS guesses</h2>
+      <ol class="ranked">
+        {% for n in a.os_guesses %}<li><span class="ranked-name" title="{{ n.name }}">{{ n.name }}</span><span class="num">{{ n.ips }}</span>{% let v = n.ips %}{% let max = max.os %}{% include "_bar.html" %}</li>{% endfor %}
+      </ol>
+      {% if a.os_guesses.is_empty() %}<p class="empty">None (needs level 3+).</p>{% endif %}
+    </section>
+    <section class="card">
+      <h2>AbuseIPDB score</h2>
+      <ul class="shares">{% for n in a.abuse %}<li><span>{{ n.name }}</span><span class="num">{{ crate::admin::views::thousands(n.count) }}</span>{% let v = n.count %}{% let max = max.abuse %}{% include "_bar.html" %}</li>{% endfor %}</ul>
+    </section>
+    <section class="card">
+      <h2>Counter-scans</h2>
+      <ul class="shares">{% for n in a.scan_levels %}<li><span>{{ n.name }}</span><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = max.levels %}{% include "_bar.html" %}</li>{% endfor %}</ul>
+      <div class="chips">{% for n in a.job_status %}<span class="badge badge-status" data-status="{{ n.name }}">{{ n.name }} {{ n.count }}</span>{% endfor %}</div>
+      {% if a.scan_levels.is_empty() && a.job_status.is_empty() %}<p class="empty">None.</p>{% endif %}
+    </section>
+  </div>
+</div>
+{% endblock %}

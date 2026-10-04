@@ -1,12 +1,20 @@
 {% extends "layout.html" %}
 {% block title %}peephole — fingerprints{% endblock %}
+{% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
 {% let sub = "fingerprints" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Fingerprint clusters</h1><p class="muted">Browser fingerprints seen from more than one source IP — the same operator hopping addresses.</p></div></div>
+<div class="page-head"><div><h1>Fingerprint clusters</h1><p class="muted">Seen from more than one IP.</p></div></div>
 <div class="stack">
+{% if !clusters.is_empty() %}
+<section class="card">
+  <div class="card-head"><h2>Graph</h2></div>
+  <div class="fp-graph" data-fp-graph="{{ clusters_json }}" role="img" aria-label="Fingerprints linked to the IPs they were seen from"></div>
+  <div class="legend fp-legend"><span><i class="swatch fp"></i>fingerprint</span><span><i class="swatch ip"></i>source IP</span></div>
+</section>
+{% endif %}
 {% for c in clusters %}
   <section class="card" id="{{ c.hash }}">
-    <div class="card-head"><h2 class="mono">{{ c.hash }}</h2><span class="muted">{{ c.count }} sightings · {{ c.ips.len() }} IPs</span></div>
+    <div class="card-head"><h2 class="mono">{{ c.hash }}{% let value = c.hash.as_str() %}{% let what = "fingerprint" %}{% let subtle = true %}{% include "_copy.html" %}</h2><span class="muted">{{ c.count }} sightings · {{ c.ips.len() }} IPs</span></div>
     <div class="chips">{% for ip in c.ips %}<a class="badge badge-label" href="/ip/{{ ip }}">{{ ip }}</a>{% endfor %}</div>
   </section>
 {% endfor %}

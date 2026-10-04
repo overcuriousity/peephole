@@ -60,6 +60,64 @@ struct WallPage {
     stale: bool,
     /// Show rule labels (always with a session; `[public] show_labels`).
     labels: bool,
+    /// Requests and unique IPs against the previous window.
+    delta_requests: Option<(String, &'static str)>,
+    delta_ips: Option<(String, &'static str)>,
+    /// OWASP Top 10 (always all ten) and the Automated Threats seen.
+    owasp: Vec<OwaspTile>,
+    /// Largest values, for the bar widths.
+    ip_max: i64,
+    asn_max: i64,
+    port_max: i64,
+    family_max: i64,
+    /// The newest request id the admin's recent table shows (live cursor).
+    recent_max_id: i64,
+}
+
+pub struct OwaspTile {
+    pub tag: String,
+    pub name: &'static str,
+    pub count: i64,
+    /// 0 (none) .. 4 (the most frequent), on the accent ramp.
+    pub bin: u8,
+}
+
+/// The OWASP grid: the ten Top 10 classes in order, whether seen or not,
+/// then every Automated Threat seen, most frequent first.
+fn owasp_tiles(counts: &[crate::store::stats::Named]) -> Vec<OwaspTile> {
+    let max = counts.iter().map(|n| n.count).max().unwrap_or(0);
+    let bin = |c: i64| -> u8 {
+        if c <= 0 || max <= 0 {
+            0
+        } else {
+            ((c as f64 / max as f64) * 4.0).ceil().clamp(1.0, 4.0) as u8
+        }
+    };
+    let get = |tag: &str| counts.iter().find(|n| n.name == tag).map_or(0, |n| n.count);
+    let mut tiles: Vec<OwaspTile> = (1..=10)
+        .map(|i| {
+            let tag = format!("A{i:02}:2021");
+            let count = get(&tag);
+            OwaspTile {
+                name: crate::admin::views::owasp_name(&tag),
+                bin: bin(count),
+                tag,
+                count,
+            }
+        })
+        .collect();
+    tiles.extend(
+        counts
+            .iter()
+            .filter(|n| n.name.starts_with("OAT-"))
+            .map(|n| OwaspTile {
+                tag: n.name.clone(),
+                name: crate::admin::views::owasp_name(&n.name),
+                count: n.count,
+                bin: bin(n.count),
+            }),
+    );
+    tiles
 }
 
 /// Whether this viewer sees rule labels.
@@ -75,9 +133,22 @@ async fn wall(
     let range = Range::parse(q.range.as_deref());
     let stats = wall_stats(&state, authed, range).await?;
     let stale = intel_stale(&stats.intel);
+    let prev = stats.previous.as_ref();
+    let max = |v: &mut dyn Iterator<Item = i64>| v.max().unwrap_or(0);
     render(&WallPage {
         chrome: Chrome::new(authed, "wall"),
         range,
+        delta_requests: crate::admin::views::delta(
+            stats.total_requests,
+            prev.map(|p| p.total_requests),
+        ),
+        delta_ips: crate::admin::views::delta(stats.unique_ips, prev.map(|p| p.unique_ips)),
+        owasp: owasp_tiles(&stats.owasp),
+        ip_max: max(&mut stats.top_ips.iter().map(|t| t.count)),
+        asn_max: max(&mut stats.top_asns.iter().map(|n| n.count)),
+        port_max: max(&mut stats.ports.iter().map(|p| p.ips)),
+        family_max: max(&mut stats.families.iter().map(|n| n.count)),
+        recent_max_id: max(&mut stats.recent.iter().map(|r| r.id)),
         stats,
         stale,
         labels: labels_shown(&state, authed),
@@ -105,6 +176,8 @@ async fn stats_json(
     }
     let mut hidden = (*stats).clone();
     hidden.top_labels.clear();
+    hidden.families.clear();
+    hidden.owasp.clear();
     Ok(Json(Arc::new(hidden)))
 }
 
@@ -182,6 +255,8 @@ struct IpsPage {
     /// Admin only: provider tags to filter by, and the API providers.
     tags: Vec<String>,
     api_providers: Vec<(&'static str, &'static str)>,
+    /// Largest request count on this page, for the bar widths.
+    count_max: i64,
 }
 
 /// Deepest IP-directory page anonymous visitors can open; with a session
@@ -296,8 +371,15 @@ async fn ips(
     } else {
         (vec![], vec![])
     };
+    let count_max = page
+        .items
+        .iter()
+        .map(|i| i.request_count)
+        .max()
+        .unwrap_or(0);
     render(&IpsPage {
         chrome: Chrome::new(authed, "ips"),
+        count_max,
         qs: ip_qs(&f),
         f,
         page,
@@ -632,7 +714,11 @@ pub struct IpAdminData {
 struct IpPage {
     chrome: Chrome,
     ov: Arc<IpOverview>,
-    sparkline_json: String,
+    /// `ov.week` and `ov.calendar` for the page's charts.
+    week_json: String,
+    calendar_json: String,
+    /// Largest family count, for the bar widths.
+    family_max: i64,
     page: Page<RequestListRow>,
     intel: Vec<IntelCard>,
     admin: Option<IpAdminData>,
@@ -703,11 +789,15 @@ async fn ip_page(
         None
     };
     let intel = intel_cards(state.store.intel_for_ip(&ip.ip).await?, authed);
-    let sparkline_json = serde_json::to_string(&ov.sparkline).unwrap_or_else(|_| "[]".into());
+    let week_json = serde_json::to_string(&ov.week).unwrap_or_else(|_| "[]".into());
+    let calendar_json = serde_json::to_string(&ov.calendar).unwrap_or_else(|_| "[]".into());
+    let family_max = ov.families.iter().map(|f| f.count).max().unwrap_or(0);
     render(&IpPage {
         chrome: Chrome::new(authed, "ips"),
         ov,
-        sparkline_json,
+        week_json,
+        calendar_json,
+        family_max,
         page,
         intel,
         admin,
@@ -854,7 +944,14 @@ show_labels = {show_labels}
                 .await
                 .contains("secret-category")
         );
-        assert!(get(&shown, "/").await.contains("Top labels"));
+        let wall = get(&shown, "/").await;
+        assert!(wall.contains("Top labels") && wall.contains("OWASP map"));
+        assert!(wall.contains("What they were after"));
+        assert!(
+            get(&shown, "/ip/203.0.113.9")
+                .await
+                .contains("What it was after")
+        );
 
         let (hidden, _d2) = app(false).await;
         assert!(
@@ -868,7 +965,20 @@ show_labels = {show_labels}
                 .await
                 .contains("secret-category")
         );
-        assert!(!get(&hidden, "/").await.contains("Top labels"));
+        let wall = get(&hidden, "/").await;
+        assert!(!wall.contains("Top labels") && !wall.contains("OWASP map"));
+        assert!(!wall.contains("What they were after"));
+        assert!(
+            !get(&hidden, "/ip/203.0.113.9")
+                .await
+                .contains("What it was after")
+        );
+        // Families and OWASP tags are derived from labels: hidden with them.
+        let json: serde_json::Value =
+            serde_json::from_str(&get(&hidden, "/api/stats?range=all").await).unwrap();
+        assert_eq!(json["families"], serde_json::json!([]));
+        assert_eq!(json["owasp"], serde_json::json!([]));
+        assert!(json["top_labels"].as_array().unwrap().is_empty());
         // The filter cannot be used to probe: it is ignored.
         let html = get(&hidden, "/ips?label=no-such-label").await;
         assert!(html.contains("203.0.113.9"), "label filter ignored");

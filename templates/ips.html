@@ -1,7 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — IPs{% endblock %}
 {% block content %}
-<div class="page-head"><div><h1>Source IPs</h1><p class="muted">Every address that has hit the trap. Search by IP, prefix or CIDR.</p></div></div>
+<div class="page-head"><div><h1>Source IPs</h1></div></div>
 <form class="filters" method="get" action="/ips">
   <label>Address / prefix / CIDR <input name="q" value="{{ f.q.as_deref().unwrap_or_default() }}" placeholder="203.0.113.0/24"></label>
   <label>Country <input name="country" size="3" maxlength="2" value="{{ f.country.as_deref().unwrap_or_default() }}" placeholder="DE"></label>
@@ -29,11 +29,11 @@
 {% if can_delete %}
 <div class="row bulk-bar">
   <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-sel" data-needs-checked="bulk-form">Delete selected</button>
-  <dialog id="dlg-bulk-sel"><h3>Delete the selected IPs?</h3><p class="muted">Each IP goes with all its requests, scans, fingerprints and claims. Cannot be undone.</p>
+  <dialog id="dlg-bulk-sel"><h3>Delete the selected IPs?</h3><p class="muted">With everything recorded about them. Cannot be undone.</p>
     <div class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit" form="bulk-form">Delete selected</button></div></dialog>
   {% if let Some(t) = bulk_total %}
   <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-all">Delete all {{ t }} matching</button>
-  <dialog id="dlg-bulk-all"><h3>Delete all {{ t }} IPs matching this filter?</h3><p class="muted">Across every page, with everything recorded about them. Cannot be undone.</p>
+  <dialog id="dlg-bulk-all"><h3>Delete all {{ t }} IPs matching this filter?</h3><p class="muted">On every page. Cannot be undone.</p>
     <form method="post" action="/admin/ips/bulk-delete" class="actions">
       <input type="hidden" name="all" value="1">
       {% include "_ip_filter_hidden.html" %}
@@ -48,16 +48,16 @@
   <thead><tr>{% if can_delete %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>IP</th><th>Country</th><th>Network</th><th class="num">Requests</th><th>Max sev</th>{% if chrome.authed %}<th class="num">Abuse</th>{% endif %}<th>First seen</th><th>Last seen</th></tr></thead>
   <tbody>
   {% for i in page.items %}
-    <tr>
+    <tr data-sev="{{ i.max_severity }}">
       {% if can_delete %}<td class="check"><input type="checkbox" name="ids" value="{{ i.ip }}" aria-label="Select {{ i.ip }}"></td>{% endif %}
-      <td class="ip"><a href="/ip/{{ i.ip }}">{{ i.ip }}</a>{% if i.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
+      <td class="ip"><a href="/ip/{{ i.ip }}">{{ i.ip }}</a>{% let value = i.ip.as_str() %}{% let what = "IP address" %}{% let subtle = true %}{% include "_copy.html" %}{% if i.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
       <td>{% if let Some(c) = i.country %}{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}{% else %}<span class="muted">—</span>{% endif %}</td>
       <td class="wrap">{% if let Some(o) = i.asn_org %}{{ o }}{% if let Some(a) = i.asn %} <span class="muted mono">AS{{ a }}</span>{% endif %}{% else %}<span class="muted">—</span>{% endif %}</td>
-      <td class="num">{{ i.request_count }}</td>
+      <td class="num">{{ crate::admin::views::thousands(i.request_count) }}{% let v = i.request_count %}{% let max = count_max %}{% include "_bar.html" %}</td>
       <td>{% let sev = i.max_severity %}{% include "_severity.html" %}</td>
       {% if chrome.authed %}<td class="num mono">{% if let Some(a) = i.abuse_score %}{{ a }}{% else %}<span class="muted">—</span>{% endif %}</td>{% endif %}
       <td class="ts">{{ i.first_seen }}</td>
-      <td class="ts">{{ i.last_seen }}</td>
+      <td class="ts"><time datetime="{{ i.last_seen }}" data-ago title="{{ i.last_seen }} UTC">{{ crate::admin::views::ago(i.last_seen) }}</time> ago</td>
     </tr>
   {% endfor %}
   {% if page.items.is_empty() %}<tr><td colspan="{{ 7 + chrome.authed as usize + can_delete as usize }}" class="empty">No IPs match.</td></tr>{% endif %}

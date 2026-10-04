@@ -113,6 +113,7 @@ pub fn router_with_auth(store: Store, cfg: Config) -> Router {
 pub fn full_router(state: Arc<AdminState>) -> Router {
     Router::new()
         .route("/admin/api/queue", get(sse::queue_stream))
+        .route("/admin/api/recent", get(sse::recent_stream))
         .merge(public::routes())
         .merge(assets::router())
         .merge(auth::auth_routes())

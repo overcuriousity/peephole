@@ -2,7 +2,7 @@
 {% block title %}peephole — lookup{% endblock %}
 {% block content %}
 {% let sub = "lookup" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Lookup</h1><p class="muted">What every enrichment provider {% if cluster %}the cluster{% else %}this node{% endif %} can reach says about one address, right now. This node's own databases and keys answer first{% if cluster %}; a provider nobody here serves is asked from a live member that announces it{% endif %}. Nothing is stored: not on this node, not on the answering node, not in the dataset. API lookups spend the answering node's budget{% if cluster %}; a member serves at most {{ per_peer }} of them a day per asking node{% endif %}.</p></div></div>
+<div class="page-head"><div><h1>Lookup</h1><p class="muted">Every reachable provider, now. Not stored; spends API budget{% if cluster %} (members serve {{ per_peer }} a day){% endif %}.</p></div></div>
 <form class="filters card" method="post" action="/admin/lookup">
   <label>IP address <input name="ip" value="{{ ip }}" placeholder="203.0.113.7 or 2001:db8::1" required autofocus></label>
   <button class="btn btn-primary" type="submit">Look up</button>
@@ -11,7 +11,7 @@
 {% if let Some(r) = result %}
 <div class="stack">
 <section class="card" id="intel">
-  <div class="card-head"><h2>{{ r.ip }}</h2><span class="muted">{% if r.known %}<a href="/ip/{{ r.ip }}">in the dataset</a> (stored results are on its page){% else %}not in the dataset{% endif %}</span></div>
+  <div class="card-head"><h2>{{ r.ip }}{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}</h2><span class="muted">{% if r.known %}<a href="/ip/{{ r.ip }}">in the dataset →</a>{% else %}not in the dataset{% endif %}</span></div>
   {% if r.cards.is_empty() %}
   <p class="muted">No provider answered.</p>
   {% else %}
