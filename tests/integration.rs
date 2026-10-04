@@ -799,10 +799,7 @@ async fn admin_pages_and_deletes_with_session() {
             && html.contains("x-forwarded-for")
             && html.contains("form-interaction")
     );
-    assert!(
-        html.contains("answered not-found (404)"),
-        "how it was answered"
-    );
+    assert!(html.contains("not-found · 404"), "how it was answered");
 
     let html = get("/admin/scans").await.unwrap().text().await.unwrap();
     assert!(html.contains("203.0.113.78"));
@@ -1557,7 +1554,11 @@ async fn public_ip_page_shows_aggregates_but_hides_requests_and_admin_data() {
         .await
         .unwrap();
     assert!(html.contains("203.0.113.42"));
-    assert!(html.contains("data-sparkline=\"["));
+    assert!(html.contains("data-week=\"["), "the activity chart's data");
+    assert!(
+        html.contains("data-calendar=\"["),
+        "the activity calendar's data"
+    );
     for marker in [
         // Per-request rows (path included) are admin-only now.
         "/wp-login.php",

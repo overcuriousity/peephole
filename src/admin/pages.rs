@@ -5,12 +5,13 @@ use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
 use crate::events::QueueJob;
 use crate::scan::pace::{self, Pace, QueueMetrics, recommend};
+use crate::store::analytics::{Analytics, RELATED_JA4_DAYS};
 use crate::store::browse::{IpFilter, Page, RequestFilter, page_num};
 use crate::store::inspect::{
     FpClaimRow, FpCluster, PortRow, QueueSummary, RequestDetail, ScanSummary,
 };
 use crate::store::recorder::Deleted;
-use crate::store::stats::intel_stale;
+use crate::store::stats::{Range, RecentRequest, intel_stale};
 use askama::Template;
 use axum::{
     Router,
@@ -25,6 +26,7 @@ use std::sync::Arc;
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/admin", get(home))
+        .route("/admin/analytics", get(analytics))
         .route("/admin/queue", get(queue))
         .route("/admin/queue/pace", post(queue_pace))
         .route("/admin/queue/retry-failed", post(queue_retry_failed))
@@ -440,6 +442,56 @@ async fn queue_pace(
 }
 
 #[derive(Template)]
+#[template(path = "admin_analytics.html")]
+struct AnalyticsPage {
+    chrome: Chrome,
+    range: Range,
+    a: Arc<Analytics>,
+    /// Largest value per list, for the bar widths.
+    max: AnalyticsMax,
+}
+
+struct AnalyticsMax {
+    paths: i64,
+    user_agents: i64,
+    ja4: i64,
+    ports: i64,
+    products: i64,
+    os: i64,
+    abuse: i64,
+    levels: i64,
+}
+
+fn max_of<T>(v: &[T], f: impl Fn(&T) -> i64) -> i64 {
+    v.iter().map(f).max().unwrap_or(0)
+}
+
+async fn analytics(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Query(q): Query<crate::admin::RangeQuery>,
+) -> AppResult<Html<String>> {
+    let range = Range::parse(q.range.as_deref());
+    let a = st.stats_cache.analytics(&st.store, range).await?;
+    let max = AnalyticsMax {
+        paths: max_of(&a.paths, |n| n.count),
+        user_agents: max_of(&a.user_agents, |n| n.count),
+        ja4: max_of(&a.ja4, |n| n.count),
+        ports: max_of(&a.ports, |p| p.ips),
+        products: max_of(&a.products, |n| n.ips),
+        os: max_of(&a.os_guesses, |n| n.ips),
+        abuse: max_of(&a.abuse, |n| n.count),
+        levels: max_of(&a.scan_levels, |n| n.count),
+    };
+    render(&AnalyticsPage {
+        chrome: chrome(),
+        range,
+        a,
+        max,
+    })
+}
+
+#[derive(Template)]
 #[template(path = "request.html")]
 struct RequestPage {
     chrome: Chrome,
@@ -447,6 +499,14 @@ struct RequestPage {
     labels: Vec<String>,
     owasp: Vec<String>,
     can_delete: bool,
+    /// The request's User-Agent header, if it sent one.
+    user_agent: Option<String>,
+    /// Other requests of the same IP, newest first.
+    same_ip: Vec<RecentRequest>,
+    /// Requests of other IPs with the same JA4 lately, and how many IPs.
+    same_ja4: Vec<RecentRequest>,
+    ja4_ips: i64,
+    ja4_days: i64,
 }
 
 async fn request_page(
@@ -459,12 +519,27 @@ async fn request_page(
     };
     let labels = serde_json::from_str(&d.row.labels_json).unwrap_or_default();
     let owasp = serde_json::from_str(&d.row.owasp_json).unwrap_or_default();
+    let user_agent = d
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, v)| v.clone());
+    let same_ip = st.store.related_by_ip(d.row.ip_id, d.row.id).await?;
+    let (same_ja4, ja4_ips) = match &d.row.ja4 {
+        Some(j) => st.store.related_by_ja4(j, d.row.ip_id).await?,
+        None => (vec![], 0),
+    };
     render(&RequestPage {
         chrome: chrome(),
         d,
         labels,
         owasp,
         can_delete: st.can_delete(),
+        user_agent,
+        same_ip,
+        same_ja4,
+        ja4_ips,
+        ja4_days: RELATED_JA4_DAYS,
     })
 }
 
@@ -635,15 +710,19 @@ async fn scan_delete(
 struct FingerprintsPage {
     chrome: Chrome,
     clusters: Vec<FpCluster>,
+    /// `clusters` for the graph.
+    clusters_json: String,
 }
 
 async fn fingerprints(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
 ) -> AppResult<Html<String>> {
+    let clusters = st.store.fingerprint_clusters().await?;
     render(&FingerprintsPage {
         chrome: chrome(),
-        clusters: st.store.fingerprint_clusters().await?,
+        clusters_json: serde_json::to_string(&clusters).unwrap_or_else(|_| "[]".into()),
+        clusters,
     })
 }
 

@@ -66,6 +66,11 @@
   --sev-2: #b04a00; --sev-2-dim: rgba(176, 74, 0, 0.14);
   --sev-3: #b31c1c; --sev-3-dim: rgba(179, 28, 28, 0.14);
   --sev-4: #7a1fa2; --sev-4-dim: rgba(122, 31, 162, 0.14);
+  /* Severity as chart fills: neutral grey for 0, then a heat ramp whose
+     lightness falls monotonically 1 → 4 (validated as an ordinal ramp;
+     multi-hue by design, as semantic heat). Text keeps the --sev-N inks. */
+  --sev-0-fill: #c4c1b6; --sev-1-fill: #d99a0b; --sev-2-fill: #d9661c;
+  --sev-3-fill: #bd2f30; --sev-4-fill: #6a2090;
 
   /* Label families: recon blue, injection red, impact violet, interaction
      orange, bot grey. Post-exploitation is a solid badge (no tokens). */
@@ -119,6 +124,8 @@
     --sev-2: #ff9440; --sev-2-dim: rgba(255, 148, 64, 0.16);
     --sev-3: #ff5c5c; --sev-3-dim: rgba(255, 92, 92, 0.16);
     --sev-4: #d17dff; --sev-4-dim: rgba(209, 125, 255, 0.16);
+    --sev-0-fill: #3a3f52; --sev-1-fill: #73561a; --sev-2-fill: #c2531f;
+    --sev-3-fill: #ee5d5d; --sev-4-fill: #e9a7ff;
 
     --cat-recon: #7aa2ff;    --cat-recon-dim: rgba(122, 162, 255, 0.15);
     --cat-inject: #ff5c5c;   --cat-inject-dim: rgba(255, 92, 92, 0.15);
@@ -165,6 +172,8 @@
   --sev-2: #ff9440; --sev-2-dim: rgba(255, 148, 64, 0.16);
   --sev-3: #ff5c5c; --sev-3-dim: rgba(255, 92, 92, 0.16);
   --sev-4: #d17dff; --sev-4-dim: rgba(209, 125, 255, 0.16);
+  --sev-0-fill: #3a3f52; --sev-1-fill: #73561a; --sev-2-fill: #c2531f;
+  --sev-3-fill: #ee5d5d; --sev-4-fill: #e9a7ff;
   --cat-recon: #7aa2ff;    --cat-recon-dim: rgba(122, 162, 255, 0.15);
   --cat-inject: #ff5c5c;   --cat-inject-dim: rgba(255, 92, 92, 0.15);
   --cat-impact: #d17dff;   --cat-impact-dim: rgba(209, 125, 255, 0.15);

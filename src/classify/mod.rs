@@ -363,6 +363,28 @@ fn compile_ci(pattern: &str) -> Result<Regex> {
     Ok(Regex::new(&format!("(?i){pattern}"))?)
 }
 
+/// Label families, in the order the pages show them: what a request was
+/// after, coarsest first.
+pub const FAMILIES: [&str; 7] = [
+    "recon", "inject", "impact", "interact", "postex", "bot", "other",
+];
+
+/// The family of a rule label. The explicit map comes first; then every
+/// other `-probe` label (including ones added later) is reconnaissance;
+/// anything unknown is "other".
+pub fn label_family(label: &str) -> &'static str {
+    match label {
+        "sqli" | "xss" | "ssti" | "nosqli" | "xxe" | "crlf-injection" => "inject",
+        "rce" | "deserialization" | "ssrf" | "path-traversal" => "impact",
+        "form-interaction" | "write-method" | "credential-attack" => "interact",
+        "webshell" | "mcp-abuse" => "postex",
+        "automation" | "inhuman-behavior" | "proxy-probe" | "unusual-method" => "bot",
+        "scanner-ua" | "research-scanner" => "recon",
+        _ if label.ends_with("-probe") => "recon",
+        _ => "other",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

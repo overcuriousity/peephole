@@ -1,0 +1,13 @@
+<div class="table-wrap"><table>
+  <tbody>
+  {% for r in rows %}
+    <tr data-sev="{{ r.severity }}">
+      <td class="ts">{{ r.ts }}</td>
+      {% if show_ip %}<td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>{% endif %}
+      <td class="path"><a href="/admin/requests/{{ r.id }}"><span class="mono muted">{{ r.method }}</span> {{ r.path }}</a></td>
+      <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
+    </tr>
+  {% endfor %}
+  {% if rows.is_empty() %}<tr><td class="empty">None.</td></tr>{% endif %}
+  </tbody>
+</table></div>

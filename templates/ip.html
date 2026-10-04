@@ -8,12 +8,13 @@
     <div class="meta">
       {% if let Some(c) = ov.ip.country %}<a href="/ips?country={{ c }}">{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}</a>{% else %}<span class="muted">country unknown</span>{% endif %}
       {% if let Some(a) = ov.ip.asn %}<a href="/ips?asn={{ a }}">{{ ov.ip.asn_org.as_deref().unwrap_or("") }} <span class="mono muted">AS{{ a }}</span></a>{% else %}<span class="muted">ASN unknown</span>{% endif %}
-      <span>first seen <span class="mono">{{ ov.ip.first_seen }}</span></span>
-      <span>last seen <span class="mono">{{ ov.ip.last_seen }}</span></span>
+      <span>first seen <time datetime="{{ crate::admin::views::stamp(ov.ip.first_seen) }}" data-ago>{{ crate::admin::views::ago(ov.ip.first_seen) }}</time> ago</span>
+      <span>last seen <time datetime="{{ crate::admin::views::stamp(ov.ip.last_seen) }}" data-ago>{{ crate::admin::views::ago(ov.ip.last_seen) }}</time> ago</span>
     </div>
   </div>
   <div class="tiles">
-    <div class="tile"><span class="label">Requests</span><div class="value">{{ ov.request_count }}</div>{% if let Some(a) = admin %}{% if a.skipped > 0 %}<div class="hint">+ {{ a.skipped }} not recorded in full</div>{% endif %}{% endif %}</div>
+    <div class="tile"><span class="label">Requests</span><div class="value">{{ crate::admin::views::thousands(ov.request_count) }}</div>{% if let Some(a) = admin %}{% if a.skipped > 0 %}<div class="hint">+ {{ a.skipped }} not recorded in full</div>{% endif %}{% endif %}</div>
+    <div class="tile"><span class="label">Rank</span><div class="value">#{{ crate::admin::views::thousands(ov.rank) }}</div><div class="hint">of {{ crate::admin::views::thousands(ov.ranked) }} sources, all time</div></div>
     <div class="tile"><span class="label">Max severity</span><div class="value">{% let sev = ov.max_severity %}{% include "_severity.html" %}</div></div>
     {% if let Some(adm) = admin %}<div class="tile"><span class="label">Open ports</span><div class="value">{% if let Some(sc) = adm.scans.first() %}{{ sc.s.open_ports }}{% else %}—{% endif %}</div><div class="hint">{% if let Some(sc) = adm.scans.first() %}newest scan, level {{ sc.s.level }}{% else %}not scanned{% endif %}</div></div>{% endif %}
   </div>
@@ -66,9 +67,58 @@
   {% endif %}
 
   <section class="card">
-    <div class="card-head"><h2>Last 24 hours</h2><span class="muted">requests per hour</span></div>
-    <div class="sparkline" data-sparkline="{{ sparkline_json }}"></div>
-    {% if labels && !ov.labels.is_empty() %}<div class="chips">{% for l in ov.labels %}<span class="badge badge-label">{{ l.name }} <span class="muted">×{{ l.count }}</span></span>{% endfor %}</div>{% endif %}
+    <div class="card-head"><h2>Activity</h2><span class="muted">UTC</span></div>
+    <div class="ip-activity">
+      <div>
+        <span class="label">Last 7 days · requests per hour, by severity</span>
+        <div class="chart" data-week="{{ week_json }}" role="img" aria-label="Requests per hour over the last 7 days"></div>
+      </div>
+      <div>
+        <span class="label">Last 26 weeks · one cell per day, coloured by its highest severity</span>
+        <div class="chart calendar" data-calendar="{{ calendar_json }}" data-days="{{ crate::store::browse::CALENDAR_DAYS }}" role="img" aria-label="Days with requests over the last 26 weeks"></div>
+      </div>
+      <div class="legend sev-legend" aria-hidden="true">{% for s in 0..5 %}<span><i class="swatch sev-fill-{{ s }}"></i>severity {{ s }}</span>{% endfor %}</div>
+      <table class="visually-hidden"><caption>Days with requests</caption><tbody>{% for d in ov.calendar %}<tr><td>{{ d.day }}</td><td>{{ d.count }}</td><td>{{ d.max_severity }}</td></tr>{% endfor %}</tbody></table>
+    </div>
+  </section>
+
+  {% if labels && !ov.families.is_empty() %}
+  <section class="card">
+    <div class="card-head"><h2>What it was after</h2><span class="muted">label hits per attack family</span></div>
+    <ul class="families">
+      {% for f in ov.families %}
+      <li>
+        <span class="fam-name"><i class="fam-dot fam-{{ f.name }}" aria-hidden="true"></i>{{ crate::admin::views::family_name(f.name) }}</span>
+        <span class="fam-bar"><svg viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true"><rect class="fam-fill fam-{{ f.name }}" width="{{ crate::admin::views::pct(f.count, family_max) }}" height="8"/></svg></span>
+        <span class="fam-count num">{{ crate::admin::views::thousands(f.count) }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    <div class="chips">{% for l in ov.labels %}<a class="badge badge-label {{ crate::admin::views::label_class(l.name) }}" href="/ips?label={{ l.name }}">{{ l.name }} <span class="muted">×{{ l.count }}</span></a>{% endfor %}</div>
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <div class="card-head"><h2>Neighbourhood</h2><span class="muted">other sources nearby that hit the trap</span></div>
+    <div class="neighbours">
+      <div>
+        <h3>Same network{% if !ov.net.is_empty() %} · <a class="mono" href="/ips?q={{ ov.net }}">{{ ov.net }}</a>{% endif %}</h3>
+        <div class="big-stat">{{ crate::admin::views::thousands(ov.net_count) }}</div>
+        {% if let Some(top) = ov.neighbours.first() %}
+        <ol class="ranked">
+          {% let nmax = top.request_count %}
+          {% for n in ov.neighbours %}
+          <li><a class="mono ranked-name" href="/ip/{{ n.ip }}">{{ n.ip }}</a><span class="num">{{ crate::admin::views::thousands(n.request_count) }}</span>{% let sev = n.max_severity %}{% include "_severity.html" %}{% let v = n.request_count %}{% let max = nmax %}{% include "_bar.html" %}</li>
+          {% endfor %}
+        </ol>
+        {% else %}<p class="muted small">No other address of this network so far.</p>{% endif %}
+      </div>
+      <div>
+        <h3>Same ASN{% if let Some(a) = ov.ip.asn %} · <a href="/ips?asn={{ a }}">AS{{ a }}</a>{% endif %}</h3>
+        <div class="big-stat">{{ crate::admin::views::thousands(ov.asn_count) }}</div>
+        <p class="muted small">{% if ov.ip.asn.is_some() %}other addresses of {{ ov.ip.asn_org.as_deref().unwrap_or("this network operator") }} with requests.{% else %}The ASN of this address is not known.{% endif %}</p>
+      </div>
+    </div>
   </section>
 
   {% if let Some(adm) = admin %}
@@ -95,7 +145,7 @@
       <thead><tr><th>Time (UTC)</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th><th></th></tr></thead>
       <tbody>
       {% for r in page.items %}
-        <tr>
+        <tr data-sev="{{ r.severity }}">
           <td class="ts">{{ r.ts }}</td><td class="mono">{{ r.method }}</td>
           <td class="path">{{ r.path }}{% if let Some(q) = r.query %}<span class="muted">?{{ q }}</span>{% endif %}</td>
           <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>

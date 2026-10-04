@@ -212,5 +212,61 @@
   document.addEventListener("change", function (e) { if (e.target && e.target.name === "ids") refreshBulkButtons(); });
   refreshBulkButtons();
 
+  // Relative times: <time datetime="YYYY-MM-DD HH:MM:SS" data-ago> (UTC)
+  // shows "5 min" and keeps counting; the exact time is in the tooltip.
+  function ago() {
+    var now = Date.now();
+    document.querySelectorAll("time[data-ago]").forEach(function (t) {
+      var at = Date.parse(t.getAttribute("datetime").replace(" ", "T") + "Z");
+      if (isNaN(at)) return;
+      var s = Math.max(0, Math.round((now - at) / 1000));
+      t.textContent = s < 60 ? s + " s" : s < 3600 ? Math.floor(s / 60) + " min" : s < 86400 ? Math.floor(s / 3600) + " h" : Math.floor(s / 86400) + " d";
+      if (!t.title) t.title = t.getAttribute("datetime") + " UTC";
+    });
+  }
+  ago();
+  setInterval(ago, 5000);
+
+  // Live "Recent activity" on the wall (admin): batches of new requests
+  // over SSE, newest on top, the table capped at its server-rendered size.
+  var rt = document.querySelector("[data-recent]");
+  if (rt && window.EventSource) {
+    var rLive = rt.closest("section").querySelector("[data-live]"), rLabel = rLive && rLive.querySelector("[data-live-label]");
+    var rBody = rt.querySelector("tbody"), rMax = 50;
+    var rSet = function (state, label) { if (rLive) { rLive.setAttribute("data-state", state); if (rLabel) rLabel.textContent = label; } };
+    var resc = function (s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); };
+    var flag = function (cc) { return cc && /^[A-Z]{2}$/.test(cc) ? String.fromCodePoint(0x1f1e6 + cc.charCodeAt(0) - 65, 0x1f1e6 + cc.charCodeAt(1) - 65) : ""; };
+    var rRow = function (r) {
+      var tr = document.createElement("tr"), sev = Math.max(0, Math.min(4, r.severity | 0));
+      tr.setAttribute("data-sev", sev); tr.className = "is-new";
+      var chips = (r.labels || []).map(function (l, i) { var f = (r.families || [])[i]; return '<span class="badge badge-label' + (f && f !== "other" ? " badge-cat-" + resc(f) : "") + '">' + resc(l) + "</span>"; }).join("") +
+        (r.owasp || []).map(function (o) { return '<span class="badge badge-owasp">' + resc(o) + "</span>"; }).join("");
+      tr.innerHTML = '<td class="ts">' + resc(r.ts) + '</td><td class="ip"><a href="/ip/' + resc(r.ip) + '">' + resc(r.ip) + "</a>" + (r.country ? ' <span class="flag">' + flag(r.country) + "</span>" : "") +
+        '</td><td class="mono">' + resc(r.method) + '</td><td class="path"><a href="/admin/requests/' + resc(r.id) + '">' + resc(r.path) + "</a></td>" +
+        '<td><span class="sev sev-' + sev + '" title="severity ' + sev + '">' + sev + '</span></td><td><span class="chips">' + chips + "</span></td>";
+      return tr;
+    };
+    // EventSource reconnects to the URL it was opened with, so a reconnect
+    // replays rows after the page's cursor: keep only ids not shown yet.
+    var rLast = parseInt((rt.getAttribute("data-src").match(/after=(\d+)/) || [0, "0"])[1], 10);
+    var res = new EventSource(rt.getAttribute("data-src"));
+    res.addEventListener("open", function () { rSet("open", "live"); });
+    res.addEventListener("error", function () {
+      // Closed for good (the session ended): reload so the redirect lands.
+      if (res.readyState === EventSource.CLOSED) { rSet("closed", "disconnected"); setTimeout(function () { location.reload(); }, 2000); } else { rSet("reconnecting", "reconnecting…"); }
+    });
+    res.addEventListener("requests", function (ev) {
+      var rows; try { rows = JSON.parse(ev.data); } catch (e) { return; }
+      rows = rows.filter(function (r) { return r.id > rLast; });
+      if (!rows.length) return;
+      rLast = rows[rows.length - 1].id;
+      var empty = rBody.querySelector("[data-empty]"); if (empty) empty.remove();
+      // Oldest first in the batch: inserting each at the top leaves the newest on top.
+      rows.forEach(function (r) { rBody.insertBefore(rRow(r), rBody.firstChild); });
+      while (rBody.children.length > rMax) rBody.removeChild(rBody.lastChild);
+    });
+  }
+
   window.peephole = window.peephole || {};
+  window.peephole.ago = ago;
 })();

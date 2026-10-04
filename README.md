@@ -37,13 +37,22 @@ nmap.
   light scan, and verified crawlers, Tor exits, your own and `never_scan`
   networks are never scanned; per-network, per-ASN and queue budgets stop
   floods.
-- **Wall of shame** (public) — aggregate statistics per time range, a world
-  map, top IPs and networks, and a searchable IP directory (exact, prefix or
-  CIDR) with per-IP geo, Tor status and counts. Request contents, scan results
-  and fingerprints are never public; rule labels can be hidden too.
+- **Wall of shame** (public) — aggregate statistics per time range that
+  refresh themselves: trends against the previous period, requests over time
+  by severity, a weekday × hour heatmap, attack families and an OWASP Top 10 /
+  Automated Threats map, a world map, top IPs and networks, the ports most
+  often found open on the scanned sources, and a searchable IP directory
+  (exact, prefix or CIDR). Each IP has its activity calendar, rank and
+  neighbours (same /24 and ASN). Request contents and fingerprints are never
+  public; of the scan results only per-port counts of distinct IPs are, and a
+  port only once it was found open on at least three. Rule labels, and the
+  families and OWASP tags derived from them, can be hidden too.
 - **Admin area** (FIDO2 security keys only, no passwords) — request search
-  and inspection, per-IP pages with every enrichment result and counter-scan,
-  the live scan queue, browser-fingerprint correlation across IPs, the
+  and inspection (with the same IP's and same JA4's other requests), a live
+  feed of new requests, analytics (top paths, user agents, JA4, methods,
+  open ports, products, OS guesses, abuse scores), per-IP pages with every
+  enrichment result and counter-scan, the live scan queue, a graph of
+  browser fingerprints shared across IPs, the
   false-positive inbox, deletion, and the dataset export: every request with
   everything known about it and its IP (enrichment history, scans,
   fingerprints) as typed Parquet, CSV or Timesketch JSONL, optionally

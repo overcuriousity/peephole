@@ -116,6 +116,90 @@ fn async_stream(
     )
 }
 
+/// How often the live request feed looks for new rows.
+const RECENT_POLL: Duration = Duration::from_secs(3);
+
+/// Rows per live batch: the wall's table keeps as many.
+const RECENT_BATCH: i64 = 50;
+
+#[derive(serde::Deserialize)]
+pub struct RecentQuery {
+    /// The newest request id the page already shows.
+    #[serde(default, deserialize_with = "crate::store::browse::lenient_i64")]
+    after: Option<i64>,
+}
+
+/// Live request feed for the wall's admin-only "Recent activity": a batch
+/// of the requests recorded since the last one, every few seconds. Polls
+/// the database rather than the trap, so rows replicated from cluster
+/// members show up as well.
+pub async fn recent_stream(
+    _u: SessionUser,
+    jar: axum_extra::extract::CookieJar,
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Query(q): axum::extract::Query<RecentQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let session = crate::admin::auth::session_token(&state, &jar);
+    let after = match q.after {
+        Some(a) => a,
+        None => state.store.max_request_id().await.unwrap_or(0),
+    };
+    Sse::new(recent_events(state, after, session)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    )
+}
+
+fn recent_events(
+    state: Arc<AdminState>,
+    after: i64,
+    session: Option<String>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    struct St {
+        state: Arc<AdminState>,
+        after: i64,
+        session: Option<String>,
+        next_check: tokio::time::Instant,
+    }
+    futures::stream::unfold(
+        St {
+            state,
+            after,
+            session,
+            next_check: tokio::time::Instant::now() + SNAPSHOT_EVERY,
+        },
+        |mut st| async move {
+            loop {
+                tokio::select! {
+                    _ = closing(&st.state) => return None,
+                    _ = tokio::time::sleep(RECENT_POLL) => {}
+                }
+                if tokio::time::Instant::now() >= st.next_check {
+                    st.next_check = tokio::time::Instant::now() + SNAPSHOT_EVERY;
+                    // A logout or expiry ends the stream, as for the queue.
+                    if let Some(id) = &st.session
+                        && !st.state.store.validate_session(id).await.unwrap_or(false)
+                    {
+                        return None;
+                    }
+                }
+                match st.state.store.requests_after(st.after, RECENT_BATCH).await {
+                    Ok(rows) if !rows.is_empty() => {
+                        st.after = rows.last().map(|r| r.id).unwrap_or(st.after);
+                        let ev = Event::default()
+                            .event("requests")
+                            .data(serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()));
+                        return Some((Ok(ev), st));
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = ?e, "live request feed unavailable"),
+                }
+            }
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

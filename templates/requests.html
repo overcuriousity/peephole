@@ -38,7 +38,7 @@
   <thead><tr>{% if can_delete %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>Time (UTC)</th><th>IP</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th>{% if !nodes.is_empty() %}<th>Node</th>{% endif %}{% if chrome.authed %}<th></th>{% endif %}</tr></thead>
   <tbody>
   {% for r in page.items %}
-    <tr>
+    <tr data-sev="{{ r.severity }}">
       {% if can_delete %}<td class="check"><input type="checkbox" name="ids" value="{{ r.id }}" aria-label="Select request {{ r.id }}"></td>{% endif %}
       <td class="ts">{{ r.ts }}</td>
       <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% if r.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
