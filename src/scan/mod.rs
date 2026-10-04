@@ -1513,7 +1513,7 @@ license_key = "k"
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(&fake, perms).unwrap();
         match run_nmap(fake, &[]).await {
-            Outcome::Failed(e) => assert!(e.starts_with("exit Some(3)"), "{e}"),
+            Outcome::Failed(e) => assert!(e.starts_with("exit 3:"), "{e}"),
             _ => panic!("failed nmap accepted"),
         }
     }
