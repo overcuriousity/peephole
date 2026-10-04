@@ -215,7 +215,8 @@ store, app, dashboard, members, orders, invoice, payments, tickets,
 inventory, customers, partners, reports, hr, wiki, forms, events, media,
 docs, api, account, checkout, catalog, newsletter, jobs, status. Links a
 scanner can follow back (`ADMIN_URL`, the git remote) use the request's
-`host` when it is a public IP or DNS name, else the site.
+`Host` header (HTTP/2: `:authority`; never a proxy-form target) when it
+is a public IP or DNS name, an IPv6 literal in brackets, else the site.
 
 **Version 0** (empty `decoy_v` on a decoy row) served `canary-<ref>`,
 `AKIACANARY<REF>` (first 10 characters upper-cased) and

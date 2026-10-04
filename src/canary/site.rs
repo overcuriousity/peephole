@@ -55,8 +55,9 @@ pub fn site(node_id: Option<&[u8]>) -> String {
     format!("{}.internal", word(node_id))
 }
 
-/// The request's host as stored: `:authority`, else the `Host` header (as
-/// the export's `host` column).
+/// The request's host as stored: the `Host` header, else `:authority`
+/// (HTTP/2). Not the other way round: in HTTP/1 a stored `:authority` is a
+/// proxy-form target, which names a third party.
 pub fn request_host(headers: &[(String, String)]) -> Option<&str> {
     let find = |name: &str| {
         headers
@@ -64,7 +65,7 @@ pub fn request_host(headers: &[(String, String)]) -> Option<&str> {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     };
-    find(":authority").or_else(|| find("host"))
+    find("host").or_else(|| find(":authority"))
 }
 
 /// Where a decoy's links point: the Host as sent when it is a public IP or
@@ -158,7 +159,9 @@ mod tests {
     }
 
     #[test]
-    fn request_host_prefers_authority() {
+    fn request_host_prefers_the_host_header() {
+        // A proxy-form target (`GET http://third.example/`) names a third
+        // party, not us; HTTP/2 has only `:authority`.
         let h = |v: &[(&str, &str)]| -> Vec<(String, String)> {
             v.iter()
                 .map(|(a, b)| (a.to_string(), b.to_string()))
@@ -170,11 +173,15 @@ mod tests {
         );
         assert_eq!(
             request_host(&h(&[("host", "a.example"), (":authority", "b.example")])),
-            Some("b.example")
+            Some("a.example")
         );
         assert_eq!(
             request_host(&h(&[("Host", "c.example")])),
             Some("c.example")
+        );
+        assert_eq!(
+            request_host(&h(&[(":authority", "d.example")])),
+            Some("d.example")
         );
         assert_eq!(request_host(&h(&[])), None);
     }

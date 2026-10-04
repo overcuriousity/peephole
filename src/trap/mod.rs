@@ -796,11 +796,11 @@ async fn trap(
     // One time for the row and the decoy, so the row renders it again.
     let now = chrono::Utc::now();
     let headers = header_pairs(&parts.headers);
-    let host = parts
-        .uri
-        .authority()
-        .map(|a| a.to_string())
-        .or_else(|| crate::canary::site::request_host(&headers).map(str::to_string));
+    // The same order the row is rendered again with (`request_host` over
+    // the stored headers, where `:authority` is the URI's authority).
+    let host = crate::canary::site::request_host(&headers)
+        .map(str::to_string)
+        .or_else(|| parts.uri.authority().map(|a| a.to_string()));
     let method = parts.method.as_str();
     let path = parts.uri.path();
     let presented = presented(&state, &headers, method, path, &body.bytes).await;
