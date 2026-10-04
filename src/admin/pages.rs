@@ -821,8 +821,10 @@ async fn canaries(
     Query(q): Query<CanaryQuery>,
 ) -> AppResult<Html<String>> {
     let range = Range::parse(q.range.as_deref());
+    // An address the store does not know matches no row (id 0 is never
+    // used), rather than dropping the filter.
     let ip_id = match q.ip.as_deref().filter(|s| !s.is_empty()) {
-        Some(a) => st.store.ip_by_addr(a).await?.map(|i| i.id),
+        Some(a) => Some(st.store.ip_by_addr(a).await?.map_or(0, |i| i.id)),
         None => None,
     };
     let filter = crate::store::canaries::ReuseFilter {
