@@ -12,16 +12,23 @@
 .topbar-actions { display: flex; align-items: center; gap: 0.5rem; }
 .shell { max-width: var(--shell-max); margin: 0 auto; padding: 1.5rem 1rem 3rem; }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.25rem; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: 0.75rem; margin-bottom: 1.25rem; }
+.page-head > * { min-width: 0; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 0.75rem; margin-bottom: 1.25rem; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
 .stack { display: grid; gap: 1rem; }
 .stack > *, .grid-2 > *, .grid-3 > *, .tiles > * { min-width: 0; }
 .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
-.footer { max-width: var(--shell-max); margin: 0 auto; padding: 1rem; color: var(--color-fg-muted); font-size: var(--text-xs); display: flex; justify-content: space-between; }
+.footer { max-width: var(--shell-max); margin: 0 auto; padding: 1rem; color: var(--color-fg-muted); font-size: var(--text-xs); display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
 @media (max-width: 48rem) {
   .grid-2, .grid-3 { grid-template-columns: 1fr; }
-  .nav { overflow-x: auto; }
-  .topbar-row { gap: 0.75rem; }
   .table-wrap { overflow-x: auto; }
+  /* Two rows: brand and actions on top, the full-width nav below, so no
+     link is clipped (four of them once logged in). */
+  .topbar-row { flex-wrap: wrap; height: auto; gap: 0 0.75rem; padding-top: 0.4rem; }
+  .brand { flex: 1; }
+  .topbar-actions { gap: 0.25rem; }
+  .nav { order: 3; flex: 1 0 100%; overflow-x: auto; padding: 0.25rem 0 0.4rem; margin: 0 -0.6rem; }
+  .nav a { white-space: nowrap; }
+  .shell { padding-top: 1.25rem; }
 }

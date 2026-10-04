@@ -5,6 +5,6 @@
   <td><span class="badge badge-status" data-status="{{ j.status }}">{{ j.status }}</span></td>
   <td class="ts">{{ j.queued_at }}</td>
   <td class="ts">{{ j.finished_at.as_deref().unwrap_or("") }}</td>
-  <td class="mono">{{ j.error.as_deref().unwrap_or("") }}</td>
+  <td class="mono wrap">{{ j.error.as_deref().unwrap_or("") }}</td>
   <td class="muted">{% if let Some(s) = j.scanner %}{{ s }}{% endif %}{% if let Some(a) = j.arbiter %}<span class="node-via"> via {{ a }}</span>{% endif %}</td>
 </tr>

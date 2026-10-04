@@ -142,7 +142,7 @@
       tr.appendChild(cell("", '<span class="badge badge-status" data-status="' + esc(j.status) + '">' + esc(j.status) + "</span>"));
       tr.appendChild(cell("ts", esc(j.queued_at)));
       tr.appendChild(cell("ts", esc(j.finished_at)));
-      tr.appendChild(cell("mono", esc(j.error)));
+      tr.appendChild(cell("mono wrap", esc(j.error)));
       tr.appendChild(cell("muted", esc(j.scanner) + (j.arbiter ? '<span class="node-via"> via ' + esc(j.arbiter) + "</span>" : "")));
       return tr;
     };

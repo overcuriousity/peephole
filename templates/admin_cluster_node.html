@@ -16,9 +16,9 @@
     <label>Scans per hour <input type="number" name="max_scans_per_hour" min="0" max="3600" value="{{ s.pace.max_scans_per_hour }}" required></label>
     <label>Timeout (min) <input type="number" name="timeout_minutes" min="1" max="240" step="any" value="{{ timeout_min }}" required></label>
     <label>Rescan cooldown (h) <input type="number" name="cooldown_hours" min="0" max="8760" value="{{ s.cooldown_hours }}" required></label>
-    <label><input type="checkbox" name="listener"{% if has.0 %} checked{% endif %}> Trap</label>
-    <label><input type="checkbox" name="scanner"{% if has.1 %} checked{% endif %}> Scanner</label>
-    <label><input type="checkbox" name="web"{% if has.2 %} checked{% endif %}> Web interface</label>
+    <label class="check"><input type="checkbox" name="listener"{% if has.0 %} checked{% endif %}> Trap</label>
+    <label class="check"><input type="checkbox" name="scanner"{% if has.1 %} checked{% endif %}> Scanner</label>
+    <label class="check"><input type="checkbox" name="web"{% if has.2 %} checked{% endif %}> Web interface</label>
     <button class="btn btn-primary" type="submit"{% if !s.open || !key_held %} disabled{% endif %}>Save</button>
   </form>
   {% if let Some(r) = rec %}<p class="muted">Recommended pace from this node's queue: {{ r.0 }} workers, {{ r.1 }} scans per hour, {{ r.2 }} min timeout.</p>{% endif %}

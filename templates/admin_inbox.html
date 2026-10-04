@@ -3,13 +3,13 @@
 {% block content %}
 {% let sub = "inbox" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Inbox</h1><p class="muted">"I landed here by accident" claims. The counter-scan still ran.</p></div></div>
-<div class="table-wrap"><table>
+<div class="table-wrap wide"><table>
   <thead><tr><th>Time (UTC)</th><th>IP</th><th>Contact</th><th>User agent</th>{% if can_delete %}<th></th>{% endif %}</tr></thead>
   <tbody>
   {% for c in claims %}
     <tr><td class="ts">{{ c.ts }}</td><td class="ip"><a href="/ip/{{ c.ip }}">{{ c.ip }}</a></td>
         <td>{% if let Some(e) = c.contact_email %}<a href="mailto:{{ e }}">{{ e }}</a>{% else %}<span class="muted">none</span>{% endif %}</td>
-        <td class="muted">{{ c.user_agent }}</td>
+        <td class="muted wrap">{{ c.user_agent }}</td>
         {% if can_delete %}        <td><button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-claim-{{ c.id }}">Delete</button>
           <dialog id="dlg-claim-{{ c.id }}"><h3>Delete this claim?</h3>
             <form method="post" action="/admin/claims/{{ c.id }}/delete" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Delete</button></form></dialog></td>{% endif %}</tr>

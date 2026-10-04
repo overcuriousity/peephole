@@ -1,7 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — request #{{ d.row.id }}{% endblock %}
 {% block content %}
-<div class="page-head"><div>
+<div class="page-head req-head"><div>
   <h1><span class="mono">{{ d.row.method }}</span> <span class="mono">{{ d.row.path }}</span></h1>
   <div class="meta"><span class="mono">{{ d.row.ts }}</span><span>from <a class="mono" href="/ip/{{ d.ip }}">{{ d.ip }}</a></span>
     <span>severity {% let sev = d.row.severity %}{% include "_severity.html" %}</span><span>scan level {{ d.row.scan_level }}</span>{% if let Some(a) = d.row.answer %}<span>answered {{ a }}{% if let Some(st) = d.row.status %} ({{ st }}){% endif %}</span>{% endif %}{% if let Some(t) = d.row.transport %}<span>{{ t }}{% if d.row.via_proxy == Some(true) %} via proxy{% endif %}</span>{% endif %}{% if let Some(j) = d.row.ja4 %}<span class="mono">JA4 {{ j }}</span>{% endif %}{% if let Some(n) = d.row.unrecorded %}<span>{{ n }} unrecorded before it</span>{% endif %}{% if let Some(n) = d.node %}<span>recorded by {{ n }}</span>{% endif %}{% if let Some(h) = d.rules_short %}<span class="mono" title="Fingerprint of the rules that classified it: {{ d.row.rules.as_deref().unwrap_or_default() }}">rules {{ h }}</span>{% endif %}{% if d.row.is_fp_claim %}<span class="badge badge-label">fp claim</span>{% endif %}</div>

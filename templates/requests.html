@@ -34,7 +34,7 @@
 <form id="bulk-form" method="post" action="/admin/requests/bulk-delete">
 {% include "_request_filter_hidden.html" %}
 {% endif %}
-<div class="table-wrap"><table>
+<div class="table-wrap wide"><table>
   <thead><tr>{% if can_delete %}<th class="check"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all rows on this page"></th>{% endif %}<th>Time (UTC)</th><th>IP</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th>{% if !nodes.is_empty() %}<th>Node</th>{% endif %}{% if chrome.authed %}<th></th>{% endif %}</tr></thead>
   <tbody>
   {% for r in page.items %}

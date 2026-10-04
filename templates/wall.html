@@ -53,12 +53,12 @@
     <section class="card">
       <h2>Top attacking IPs</h2>
       <div class="table-wrap"><table>
-        <thead><tr><th>IP</th><th>Country</th><th class="num">Requests</th><th>Max sev</th></tr></thead>
+        <thead><tr><th>IP</th><th class="hide-narrow">Country</th><th class="num">Requests</th><th>Max sev</th></tr></thead>
         <tbody>
         {% for t in stats.top_ips %}
           <tr>
-            <td class="ip"><a href="/ip/{{ t.ip }}">{{ t.ip }}</a>{% if t.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
-            <td>{% if let Some(c) = t.country %}{{ crate::admin::countries::flag(c) }} {{ c }}{% else %}<span class="muted">—</span>{% endif %}</td>
+            <td class="ip{% if t.ip.contains(':') %} v6{% endif %}"><a href="/ip/{{ t.ip }}">{{ t.ip }}</a>{% if t.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}{% if let Some(c) = t.country %}<div class="cell-sub narrow-only">{{ crate::admin::countries::flag(c) }} {{ c }}</div>{% endif %}</td>
+            <td class="hide-narrow">{% if let Some(c) = t.country %}{{ crate::admin::countries::flag(c) }} {{ c }}{% else %}<span class="muted">—</span>{% endif %}</td>
             <td class="num">{{ t.count }}</td>
             <td>{% let sev = t.max_severity %}{% include "_severity.html" %}</td>
           </tr>
@@ -82,7 +82,7 @@
   {% if chrome.authed %}
   <section class="card">
     <div class="card-head"><h2>Recent activity</h2><a href="/requests">search all →</a></div>
-    <div class="table-wrap"><table>
+    <div class="table-wrap wide"><table>
       <thead><tr><th>Time (UTC)</th><th>IP</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th></tr></thead>
       <tbody>
       {% for r in stats.recent %}

@@ -16,7 +16,7 @@
 <div class="stack">
   <section class="card">
     <div class="card-head"><h2>Scan queue</h2><span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></div>
-    <div class="table-wrap"><table data-queue data-src="/admin/api/queue" data-limit="25">
+    <div class="table-wrap wide"><table data-queue data-src="/admin/api/queue" data-limit="25">
       <thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Status</th><th>Queued</th><th>Finished</th><th>Error</th><th>Node</th></tr></thead>
       <tbody>{% for j in jobs %}{% include "_queue_row.html" %}{% endfor %}
       {% if jobs.is_empty() %}<tr data-empty><td colspan="8" class="empty">Queue empty.</td></tr>{% endif %}</tbody>
@@ -25,8 +25,8 @@
   <section class="card">
     <div class="card-head"><h2>Recent failures</h2>{% if !failed.is_empty() %}<form method="post" action="/admin/queue/retry-failed"><button class="btn btn-sm" type="submit">Retry failed scans</button></form>{% endif %}</div>
     {% if failed.is_empty() %}<p class="muted">None.</p>{% else %}
-    <div class="table-wrap"><table><thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Finished</th><th>Error</th></tr></thead><tbody>
-      {% for j in failed %}<tr><td class="mono">#{{ j.id }}</td><td class="ip"><a href="/ip/{{ j.ip }}">{{ j.ip }}</a></td><td>{{ j.level }}</td><td class="ts">{{ j.finished_at.as_deref().unwrap_or("") }}</td><td class="mono">{{ j.error.as_deref().unwrap_or("") }}</td></tr>{% endfor %}
+    <div class="table-wrap wide"><table><thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Finished</th><th>Error</th></tr></thead><tbody>
+      {% for j in failed %}<tr><td class="mono">#{{ j.id }}</td><td class="ip"><a href="/ip/{{ j.ip }}">{{ j.ip }}</a></td><td>{{ j.level }}</td><td class="ts">{{ j.finished_at.as_deref().unwrap_or("") }}</td><td class="mono wrap">{{ j.error.as_deref().unwrap_or("") }}</td></tr>{% endfor %}
     </tbody></table></div>{% endif %}
   </section>
   <section class="card">

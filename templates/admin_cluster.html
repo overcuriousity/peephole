@@ -5,11 +5,13 @@
 <div class="page-head"><div><h1>Cluster</h1><p class="muted">Nodes sharing requests, the scan queue, results and intel. Node names never appear on public pages.</p></div></div>
 {% match me %}
 {% when None %}
+<div class="stack">
 <section class="card"><h2>Standalone</h2>
   <p>This node runs on its own. To share data with other peephole deployments, add a <code>[cluster]</code> section to <code>config.toml</code> (see <code>deploy/config.example.toml</code>) and restart. Its existing history is shared with the cluster on the first start.</p></section>
 <section class="card"><h2>Runtime settings</h2>
 {% include "_node_settings.html" %}
 <p class="muted">The scan pace is set on the <a href="/admin/queue">Queue</a> page.</p></section>
+</div>
 {% when Some(me) %}
 <div class="stack">
 {% if let Some(d) = detached %}<div class="banner banner-warning">{{ d }}</div>{% endif %}
