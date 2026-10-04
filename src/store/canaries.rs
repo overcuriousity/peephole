@@ -127,25 +127,42 @@ pub(crate) async fn derive_batch(conn: &mut SqliteConnection, batch_id: i64) -> 
     Ok(())
 }
 
+/// Rows parsed per write transaction by [`backfill`].
+const BACKFILL_BATCH: i64 = 50;
+/// Pause between [`backfill`]'s transactions, so the trap's and
+/// replication's writes get the lock in between.
+const BACKFILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// Parse the rows stored before this build (or by an older tokenizer), a
-/// batch at a time, each batch its own short write transaction so the trap
-/// is not held up. Returns how many rows were parsed.
+/// small batch at a time, each batch its own short write transaction with a
+/// pause after it, so the trap and replication are not held up on a large
+/// database. Walks each table once by id. Returns how many rows were
+/// parsed.
 pub async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
     let mut done = 0;
+    let (mut after_req, mut after_batch) = (0i64, 0i64);
     loop {
-        let ids: Vec<i64> =
-            sqlx::query_scalar("SELECT id FROM requests WHERE canary_parsed < ? LIMIT 200")
-                .bind(TOKENS_V)
-                .fetch_all(pool)
-                .await?;
-        let batches: Vec<i64> =
-            sqlx::query_scalar("SELECT id FROM skipped_batches WHERE canary_parsed < ? LIMIT 200")
-                .bind(TOKENS_V)
-                .fetch_all(pool)
-                .await?;
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM requests WHERE canary_parsed < ? AND id > ? ORDER BY id LIMIT ?",
+        )
+        .bind(TOKENS_V)
+        .bind(after_req)
+        .bind(BACKFILL_BATCH)
+        .fetch_all(pool)
+        .await?;
+        let batches: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM skipped_batches WHERE canary_parsed < ? AND id > ? ORDER BY id LIMIT ?",
+        )
+        .bind(TOKENS_V)
+        .bind(after_batch)
+        .bind(BACKFILL_BATCH)
+        .fetch_all(pool)
+        .await?;
         if ids.is_empty() && batches.is_empty() {
             return Ok(done);
         }
+        after_req = ids.last().copied().unwrap_or(after_req);
+        after_batch = batches.last().copied().unwrap_or(after_batch);
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         for id in &ids {
             derive_request(&mut tx, *id).await?;
@@ -155,6 +172,7 @@ pub async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
         }
         tx.commit().await?;
         done += (ids.len() + batches.len()) as u64;
+        tokio::time::sleep(BACKFILL_PAUSE).await;
     }
 }
 

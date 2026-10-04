@@ -37,4 +37,5 @@ CREATE TABLE request_tokens (
   PRIMARY KEY (request_id, value_hash, place)
 ) WITHOUT ROWID;
 CREATE INDEX idx_request_tokens_hash ON request_tokens(value_hash);
-CREATE INDEX idx_requests_canary_parsed ON requests(canary_parsed);
+CREATE INDEX idx_requests_canary_parsed ON requests(canary_parsed, id);
+CREATE INDEX idx_skipped_batches_canary_parsed ON skipped_batches(canary_parsed, id);
