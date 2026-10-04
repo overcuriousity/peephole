@@ -25,7 +25,7 @@ else.
 
 Every decoy body is a pure function of
 
-    (decoy_v, page_token, host, node_id, ts, method, path, answer)
+    (decoy_v, page_token, host, site word, ts, method, path, answer)
 
 all of which are stored with the row. No clock, no RNG, no secret, no
 setting read at serve time. The trap takes the time once per request and
@@ -122,7 +122,9 @@ alphabet length`. No value contains the word
   (`shop`, `portal`, `crm`, `billing`, …, listed in the code and
   documented) by the first byte of `SHA-256("peephole-site-v1\0" ||
   node_id)` mod 32. Fixed per node, never resolves anywhere (`.internal`
-  is reserved for private use).
+  is reserved for private use). The word served is stored with the row
+  (`decoy_site`), since a standalone node's key changes when it joins a
+  cluster and adopts its history.
 - **Return host**: the request's Host (port included) if it is a public
   IP literal or a DNS name; otherwise (loopback, private, link-local,
   `localhost`, missing) the site. Public names and IPs demonstrably reach
@@ -246,8 +248,11 @@ from 5 reuses up, so no single event can be read off the wall.
 ### Export
 
 New columns `decoy_v` and `canary_used_from` (uids of the serving
-requests, on rows that used a canary). Canary values are not exported;
-the dataset docs give the formula to recompute them from `page_token`.
+requests, on rows that used a canary); light rows also export their
+`answer` and `host`. Canary values are not exported, and neither is
+`page_token` (it links fingerprints and claims to their request, so
+publishing it would let anyone attach data to old rows); the dataset docs
+give the formula, and `peephole decoy render` recomputes on a node.
 
 ## Render command
 

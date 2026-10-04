@@ -177,10 +177,12 @@ filter in its metadata.
 ## Canaries
 
 Decoys serve credentials (canaries) that name the request they were
-served to. They are derived from the row with a public formula, with no
-secret, so anyone can recompute the canaries of any row and nothing
-secret is in the export. `peephole decoy render <uid>` prints the decoy a
-row was answered with, byte for byte.
+served to. They are derived with a public formula and no secret, from
+the request's page token. The page token is not exported (it also links
+a browser fingerprint or a false-positive claim to its request), so
+canary values are recomputed where the data lives: `peephole decoy render
+<uid>` prints the decoy a row was answered with, byte for byte, on any
+node. In the export, `canary_used_from` already names the reuses.
 
 **Version 1** (`decoy_v` = 1). Each value is
 
@@ -205,7 +207,9 @@ sets a cookie with `wp-session`.
 
 The node's site is `<word>.internal`, where `word` is
 `WORDS[SHA-256("peephole-site-v1\0" || node_id)[0] mod 32]` (`node_id`
-is the recording node's 32-byte key; a standalone node hashes nothing),
+is the serving node's 32-byte key; a standalone node hashes nothing; the
+word served is stored with the row, so it survives a standalone node
+joining a cluster),
 with `WORDS` = shop, portal, crm, billing, intranet, booking, support,
 store, app, dashboard, members, orders, invoice, payments, tickets,
 inventory, customers, partners, reports, hr, wiki, forms, events, media,

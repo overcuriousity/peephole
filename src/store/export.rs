@@ -51,6 +51,9 @@ pub struct SkipOut {
     pub build: String,
     pub dropped: i64,
     pub decoy_v: Option<i64>,
+    /// Set when the request was answered with a decoy.
+    pub answer: Option<String>,
+    pub host: Option<String>,
     /// The batch's last light row (it carries the batch's drops).
     pub last_in_batch: bool,
 }
@@ -189,7 +192,7 @@ impl Store {
     ) -> Result<Vec<SkipOut>> {
         let mut sql = String::from(
             "SELECT s.rowid AS rowid, s.ts_ms, s.method, s.path, b.ip_id, i.ip, b.uid, b.origin,
-                    b.build, b.dropped, s.decoy_v,
+                    b.build, b.dropped, s.decoy_v, s.answer, s.host,
                     s.rowid = (SELECT MAX(x.rowid) FROM skipped_requests x
                                WHERE x.batch_id = s.batch_id) AS last_in_batch
              FROM skipped_requests s JOIN skipped_batches b ON b.id = s.batch_id

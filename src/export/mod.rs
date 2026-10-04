@@ -647,6 +647,8 @@ fn skipped_row(s: SkipOut, ctx: &PageContext, cols: &IpCols, opts: &ExportOption
         ts_ms: s.ts_ms,
         ip: s.ip,
         method: s.method,
+        answer: s.answer,
+        host: s.host,
         decoy_v: s.decoy_v,
         path: s.path,
         unrecorded,
@@ -1122,6 +1124,38 @@ mod tests {
             .await
             .unwrap();
         (s, dir)
+    }
+
+    #[tokio::test]
+    async fn a_decoy_light_row_exports_its_answer_and_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        s.local()
+            .insert_skip_batch(
+                "198.51.100.2",
+                0,
+                vec![crate::cluster::record::SkipRow {
+                    ts_ms: chrono::Utc::now().timestamp_millis(),
+                    method: "GET".into(),
+                    path: "/.git/config".into(),
+                    page_token: Some("tok".into()),
+                    host: Some("203.0.113.7".into()),
+                    answer: Some("decoy:git-config".into()),
+                    decoy_v: Some(1),
+                    decoy_site: Some("shop".into()),
+                }],
+            )
+            .await
+            .unwrap();
+        let out = text(&collect(&s, ExportFilter::default(), Format::Jsonl).await);
+        let row: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        assert_eq!(row["kind"], "skipped");
+        assert_eq!(row["answer"], "decoy:git-config");
+        assert_eq!(row["host"], "203.0.113.7");
+        assert_eq!(row["decoy_v"], 1);
+        assert!(!out.contains("\"tok\""), "the page token stays internal");
     }
 
     #[tokio::test]
