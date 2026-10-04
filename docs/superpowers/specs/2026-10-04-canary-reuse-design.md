@@ -28,7 +28,13 @@ Every decoy body is a pure function of
     (decoy_v, page_token, host, node_id, ts, method, path, answer)
 
 all of which are stored with the row. No clock, no RNG, no secret, no
-setting read at serve time. Consequences:
+setting read at serve time. The trap takes the time once per request and
+stores exactly that time as the row's `ts` (light rows: `ts_ms`), so the
+wp-login cookie's expiry is reproducible.
+
+A decoy is rendered from its stored `answer`: the serve path first
+chooses the answer (from method, path and which canaries the request
+carried), then renders it; the render command renders the stored answer. Consequences:
 
 - Canary values come from a public derivation; any node and any dataset
   user can recompute the canaries of any row.
@@ -71,8 +77,9 @@ Built on each node from replicated rows, like `host_keys`.
 - `request_tokens(value_hash BLOB, request_id, place TEXT)`: tokens from
   each full request (see Detection). Index on `value_hash`; unique on
   `(request_id, value_hash, place)`.
-- `value_hash` is the first 8 bytes of SHA-256 of the value; neither
-  table stores a credential in readable form.
+- `value_hash` is the first 8 bytes of SHA-256 of the value, stored as a
+  big-endian signed `INTEGER`; neither table stores a credential in
+  readable form.
 - A reuse is the join `canaries ⋈ request_tokens` on `value_hash` where
   the using request is not the serving one. Δt is the using row's `ts`
   minus the serving row's. No stored link table: the join is always
@@ -103,8 +110,10 @@ formatted per kind:
 | `git-token` | 40 lowercase hex characters |
 | `wp-session` | 43 characters of `A–Za–z0–9` (the token part of a WordPress `logged_in` cookie) |
 
-Where `raw` has too few bytes for a format, the input is extended with a
-counter (`… || "\0" || kind || "\0" || n`). No value contains the word
+Where `raw` has too few bytes for a format, further blocks are hashed
+with a counter (`… || "\0" || kind || "\0" || n`, `n` = 1, 2, … in
+decimal ASCII) and appended. Characters are picked as `byte mod
+alphabet length`. No value contains the word
 "canary".
 
 ### Names
@@ -195,8 +204,10 @@ One tokenizer, version `tokens_v = 1`, applied to each full request row.
 
 ### Tokens
 
-- Maximal runs of `[A-Za-z0-9+/=]`, plus their pieces split at `/`, `+`
-  and `=`, of 16 to 128 characters.
+- Maximal runs of `[A-Za-z0-9+/=_-]` (base64 and base64url), plus their
+  pieces split at `/`, `+`, `=`, `_` and `-`, of 16 to 128 characters.
+  `-` is in the alphabet so version-0 values (`canary-<ref>`) are one
+  token.
 - Each run taken raw and decoded (form bodies with a literal `+`).
 - Deduplicated per request, at most 256 per request.
 - Light rows are not tokenized (no headers or body).
