@@ -1,0 +1,35 @@
+{% extends "layout.html" %}
+{% block title %}peephole — canaries{% endblock %}
+{% block content %}
+{% let sub = "canaries" %}{% include "_admin_nav.html" %}
+<div class="page-head"><div><h1>Canaries</h1><p class="muted">Credentials served in decoys and the requests that used them again.</p></div>{% let base = "/admin/canaries" %}{% include "_range.html" %}</div>
+<div class="stack">
+<div class="tiles kpis">
+  <div class="tile"><span class="label">Served</span><div class="value">{{ crate::admin::views::thousands(sum.served) }}</div></div>
+  <div class="tile"><span class="label">Used again</span><div class="value brand">{{ sum.reused }}</div><div class="hint">{{ sum.share_pct() }} %</div></div>
+  <div class="tile"><span class="label">Median to first use</span><div class="value">{% if let Some(m) = sum.median_s %}{{ crate::admin::views::duration(m) }}{% else %}—{% endif %}</div></div>
+  <div class="tile"><span class="label">Longest</span><div class="value">{% if let Some(m) = sum.max_s %}{{ crate::admin::views::duration(m) }}{% else %}—{% endif %}</div></div>
+</div>
+{% if !sum.per_kind.is_empty() %}<section class="card"><h2>Per kind</h2><table class="table"><thead><tr><th>Kind</th><th>Served</th><th>Used again</th></tr></thead><tbody>
+{% for k in sum.per_kind %}<tr><td>{{ k.kind }}</td><td>{{ k.served }}</td><td>{{ k.reused }}</td></tr>{% endfor %}
+</tbody></table></section>{% endif %}
+<section class="card">
+  <form class="filters" method="get" action="/admin/canaries">
+    <input type="hidden" name="range" value="{{ range.key() }}">
+    <label>Kind <select name="kind"><option value="">any</option>{% for k in kinds %}<option{% if q.kind.as_deref() == Some(k) %} selected{% endif %}>{{ k }}</option>{% endfor %}</select></label>
+    <label>Node <input name="node" value="{{ q.node.as_deref().unwrap_or_default() }}"></label>
+    <label>Source <select name="source"><option value="">any</option><option value="other"{% if q.source.as_deref() == Some("other") %} selected{% endif %}>different</option><option value="same"{% if q.source.as_deref() == Some("same") %} selected{% endif %}>same</option></select></label>
+    <label>IP <input name="ip" value="{{ q.ip.as_deref().unwrap_or_default() }}"></label>
+    <button>Filter</button>
+  </form>
+  {% if reuses.is_empty() %}<p class="empty">No canary has been used again{% if range.since().is_some() %} in this period{% endif %}.</p>{% else %}
+  <table class="table"><thead><tr><th>Harvested</th><th>Used</th><th>Kind</th><th>Where</th><th>Δt</th></tr></thead><tbody>
+  {% for r in reuses %}<tr>
+    <td>{% if let Some(s) = r.served_request_id %}<a href="/admin/requests/{{ s }}">#{{ s }}</a>{% else %}light row{% endif %} · <a href="/ip/{{ r.served_ip }}">{{ r.served_ip }}</a>{% if let Some(n) = r.served_node %} · <span class="muted">{{ n }}</span>{% endif %}{% if let Some(a) = r.served_answer %} · <span class="mono">{{ a }}</span>{% endif %} · <span class="mono">{{ r.served_ts }}</span></td>
+    <td><a href="/admin/requests/{{ r.used_request_id }}">#{{ r.used_request_id }}</a> · <a href="/ip/{{ r.used_ip }}">{{ r.used_ip }}</a>{% if let Some(n) = r.used_node %} · <span class="muted">{{ n }}</span>{% endif %} · <span class="mono">{{ r.used_ts }}</span>{% if r.same_source %} <span class="badge">same source</span>{% endif %}</td>
+    <td>{{ r.kind }}</td><td class="mono">{{ r.place }}</td><td>{{ crate::admin::views::duration(r.delta_s) }}</td>
+  </tr>{% endfor %}
+  </tbody></table>{% endif %}
+</section>
+</div>
+{% endblock %}

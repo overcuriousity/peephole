@@ -202,8 +202,8 @@ pub fn owasp_name<S: AsRef<str>>(tag: S) -> &'static str {
 }
 
 /// A time span for people: `45 s`, `12 min`, `3 h 5 min`, `2 d 4 h`.
-pub fn duration<S: std::borrow::Borrow<i64>>(secs: S) -> String {
-    let s = (*secs.borrow()).max(0);
+pub fn duration<S: SevValue>(secs: S) -> String {
+    let s = secs.sev().max(0);
     match s {
         0..60 => format!("{s} s"),
         60..3600 => format!("{} min", s / 60),

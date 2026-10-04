@@ -40,6 +40,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/scans/{id}/xml", get(scan_xml))
         .route("/admin/scans/{id}/delete", post(scan_delete))
         .route("/admin/fingerprints", get(fingerprints))
+        .route("/admin/canaries", get(canaries))
         .route("/admin/inbox", get(inbox))
         .route("/admin/claims/{id}/delete", post(claim_delete))
         .route("/admin/export", get(export_page))
@@ -786,6 +787,66 @@ async fn fingerprints(
         clusters_json: serde_json::to_string(&hubs).unwrap_or_else(|_| "[]".into()),
         clusters,
         host_keys,
+    })
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct CanaryQuery {
+    pub range: Option<String>,
+    pub kind: Option<String>,
+    pub node: Option<String>,
+    /// `same` | `other`; anything else: both.
+    pub source: Option<String>,
+    pub ip: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "admin_canaries.html")]
+struct CanariesPage {
+    chrome: Chrome,
+    range: Range,
+    q: CanaryQuery,
+    sum: crate::store::canaries::CanarySummary,
+    reuses: Vec<crate::store::canaries::Reuse>,
+    kinds: Vec<&'static str>,
+}
+
+async fn canaries(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Query(q): Query<CanaryQuery>,
+) -> AppResult<Html<String>> {
+    let range = Range::parse(q.range.as_deref());
+    let ip_id = match q.ip.as_deref().filter(|s| !s.is_empty()) {
+        Some(a) => st.store.ip_by_addr(a).await?.map(|i| i.id),
+        None => None,
+    };
+    let filter = crate::store::canaries::ReuseFilter {
+        kind: q.kind.clone().filter(|k| !k.is_empty()),
+        node: q.node.clone().filter(|n| !n.is_empty()),
+        same_source: match q.source.as_deref() {
+            Some("same") => Some(true),
+            Some("other") => Some(false),
+            _ => None,
+        },
+        range,
+        request: None,
+        ip_id,
+        limit: 500,
+    };
+    let reuses = st.store.reuses(&filter).await?;
+    let sum = st.store.canary_summary(range).await?;
+    render(&CanariesPage {
+        chrome: chrome(),
+        range,
+        q,
+        sum,
+        reuses,
+        kinds: crate::canary::Kind::ALL_V1
+            .iter()
+            .map(|k| k.name())
+            .chain(["legacy"])
+            .collect(),
     })
 }
 

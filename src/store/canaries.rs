@@ -294,6 +294,83 @@ impl Store {
     }
 }
 
+/// Served canaries of one kind.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct KindStat {
+    pub kind: String,
+    pub served: i64,
+    pub reused: i64,
+}
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CanarySummary {
+    pub served: i64,
+    /// Served canaries used at least once by any request but their own.
+    pub reused: i64,
+    /// Median and maximum time from harvest to first use, seconds.
+    pub median_s: Option<i64>,
+    pub max_s: Option<i64>,
+    pub per_kind: Vec<KindStat>,
+}
+
+impl CanarySummary {
+    pub fn share_pct(&self) -> i64 {
+        if self.served == 0 {
+            0
+        } else {
+            (self.reused * 100 + self.served / 2) / self.served
+        }
+    }
+}
+
+impl Store {
+    pub async fn canary_summary(&self, range: crate::store::stats::Range) -> Result<CanarySummary> {
+        let since = range.since();
+        let window = if since.is_some() {
+            " AND c.ts >= datetime('now', ?)"
+        } else {
+            ""
+        };
+        // Per served canary: its kind and its first use by another request.
+        let mut q = sqlx::query_as::<_, (String, Option<i64>)>(sqlx::AssertSqlSafe(format!(
+            "SELECT c.kind,
+                    (SELECT MIN(CAST(strftime('%s', u.ts) AS INTEGER) - CAST(strftime('%s', c.ts) AS INTEGER))
+                     FROM request_tokens t JOIN requests u ON u.id = t.request_id
+                     WHERE t.value_hash = c.value_hash
+                       AND (c.request_id IS NULL OR t.request_id != c.request_id))
+             FROM canaries c WHERE 1 = 1{window}"
+        )));
+        if let Some(m) = since {
+            q = q.bind(m);
+        }
+        let rows = q.fetch_all(&self.read).await?;
+        let mut per: std::collections::BTreeMap<String, (i64, i64)> = Default::default();
+        let mut firsts: Vec<i64> = vec![];
+        for (kind, first) in &rows {
+            let e = per.entry(kind.clone()).or_default();
+            e.0 += 1;
+            if let Some(f) = first {
+                e.1 += 1;
+                firsts.push((*f).max(0));
+            }
+        }
+        firsts.sort_unstable();
+        Ok(CanarySummary {
+            served: rows.len() as i64,
+            reused: firsts.len() as i64,
+            median_s: (!firsts.is_empty()).then(|| firsts[firsts.len() / 2]),
+            max_s: firsts.last().copied(),
+            per_kind: per
+                .into_iter()
+                .map(|(kind, (served, reused))| KindStat {
+                    kind,
+                    served,
+                    reused,
+                })
+                .collect(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,5 +820,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s.canary_links_for_ip(use_ip).await.unwrap(), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn summary_counts_first_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        let now = chrono::Utc::now();
+        let at = |h: i64| {
+            (now - chrono::Duration::hours(h))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+        apply(
+            &mut conn,
+            ctx,
+            &req(
+                "srv",
+                &at(10),
+                "198.51.100.1",
+                "/.git/config",
+                "[]",
+                "decoy:git-config",
+                Some(1),
+            ),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx,
+            &req(
+                "env",
+                &at(10),
+                "198.51.100.1",
+                "/.env",
+                "[]",
+                "decoy:dotenv",
+                Some(1),
+            ),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx,
+            &req(
+                "u1",
+                &at(8),
+                "198.51.100.2",
+                "/x",
+                &basic("deploy", &git_token("srv")),
+                "not-found",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx,
+            &req(
+                "u2",
+                &at(2),
+                "198.51.100.3",
+                "/x",
+                &basic("deploy", &git_token("srv")),
+                "not-found",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        let sum = s
+            .canary_summary(crate::store::stats::Range::H24)
+            .await
+            .unwrap();
+        assert_eq!(sum.served, 8); // 1 git token + 7 in the .env
+        assert_eq!(sum.reused, 1);
+        assert_eq!(sum.median_s, Some(2 * 3600), "first use only");
+        assert_eq!(
+            sum.per_kind
+                .iter()
+                .find(|k| k.kind == "git-token")
+                .map(|k| (k.served, k.reused)),
+            Some((1, 1))
+        );
+        assert_eq!(sum.share_pct(), 13); // 1 of 8, rounded
     }
 }

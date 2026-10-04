@@ -2457,3 +2457,65 @@ async fn request_and_ip_pages_show_canary_reuse() {
         .unwrap();
     assert!(!public.contains("Canar") && !public.contains(&token));
 }
+
+#[tokio::test]
+async fn canaries_page_lists_reuses_and_filters() {
+    let (base, store, dir) = spawn_trap().await;
+    let c = reqwest::Client::new();
+    c.get(format!("{base}/.git/config"))
+        .header("x-forwarded-for", "203.0.113.70")
+        .send()
+        .await
+        .unwrap();
+    let token = served_value(&store, "/.git/config", peephole::canary::Kind::GitToken).await;
+    c.get(format!("{base}/x"))
+        .basic_auth("deploy", Some(&token))
+        .header("x-forwarded-for", "203.0.113.71")
+        .send()
+        .await
+        .unwrap();
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (admin, admin_base) = enrolled_admin_client(store.clone(), cfg).await;
+    let page = admin
+        .get(format!("{admin_base}/admin/canaries?range=all"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("203.0.113.71") && page.contains("git-token"),
+        "{page}"
+    );
+    let page = admin
+        .get(format!("{admin_base}/admin/canaries?range=all&source=same"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!page.contains("203.0.113.71"));
+    let nav = admin
+        .get(format!("{admin_base}/admin"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(nav.contains("href=\"/admin/canaries\""));
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    assert_ne!(
+        anon.get(format!("{admin_base}/admin/canaries"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+}

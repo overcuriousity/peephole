@@ -3,7 +3,7 @@
 {% block content %}
 {% let sub = "analytics" %}{% include "_admin_nav.html" %}
 <div class="page-head">
-  <div><h1>Analytics</h1><p class="muted">{{ range.label() }}</p></div>
+  <div><h1>Analytics</h1><p class="muted">{{ range.label() }} · canary reuse: <a href="/admin/canaries?range={{ range.key() }}">Canaries</a></p></div>
   {% let base = "/admin/analytics" %}{% include "_range.html" %}
 </div>
 
