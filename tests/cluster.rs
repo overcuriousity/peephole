@@ -1146,6 +1146,59 @@ async fn data_replicates_cluster_wide() {
     assert!(rec(&nc).next_queued_job().await.unwrap().is_none());
 }
 
+/// A canary served on A and used on B: both nodes find the same reuse.
+#[tokio::test]
+async fn canary_reuse_is_found_on_every_node() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let ip_a = na
+        .store
+        .upsert_ip("198.51.100.10".parse().unwrap())
+        .await
+        .unwrap();
+    rec(&na)
+        .insert_request(&NewRequest {
+            ip_id: ip_a.id,
+            method: "GET".into(),
+            path: "/.git/config".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            page_token: Some("served-on-a".into()),
+            answer: Some("decoy:git-config".into()),
+            decoy_v: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let token = peephole::canary::value("served-on-a", peephole::canary::Kind::GitToken);
+    let auth = data_encoding::BASE64.encode(format!("deploy:{token}").as_bytes());
+    let ip_b = nb
+        .store
+        .upsert_ip("198.51.100.11".parse().unwrap())
+        .await
+        .unwrap();
+    rec(&nb)
+        .insert_request(&NewRequest {
+            ip_id: ip_b.id,
+            method: "GET".into(),
+            path: "/x".into(),
+            headers_json: format!(r#"[["authorization","Basic {auth}"]]"#),
+            labels_json: "[]".into(),
+            page_token: Some("used-on-b".into()),
+            answer: Some("not-found".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let sql =
+        "SELECT COUNT(*) FROM request_tokens t JOIN canaries c ON c.value_hash = t.value_hash";
+    for n in [&na, &nb] {
+        eventually("reuse found", || async { count(n, sql).await == 1 }).await;
+    }
+}
+
 /// A node with the given trusted peers that never touches the network.
 async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();

@@ -2,6 +2,7 @@ pub mod analytics;
 pub mod auth;
 pub mod blocklist;
 pub mod browse;
+pub mod canaries;
 pub mod cli;
 pub mod data;
 pub mod delete;

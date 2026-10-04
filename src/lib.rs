@@ -182,6 +182,19 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         shutdown_rx.clone(),
     ));
 
+    // Canaries and tokens of rows stored before this build (or by an older
+    // tokenizer); new rows are derived as they are written.
+    tokio::spawn({
+        let pool = store.pool.clone();
+        async move {
+            match store::canaries::backfill(&pool).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(rows = n, "canaries: parsed stored rows"),
+                Err(e) => tracing::warn!(error = %e, "canaries: backfill failed"),
+            }
+        }
+    });
+
     // Queue change notifications: trap + workers publish, admin SSE subscribes.
     let notifier = events::Notifier::new();
 
