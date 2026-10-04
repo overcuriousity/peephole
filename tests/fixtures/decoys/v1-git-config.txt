@@ -1,0 +1,14 @@
+200
+content-type: text/plain; charset=utf-8
+
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+[remote "origin"]
+	url = http://deploy:cd97699d1cebd19ed238dbc9d4c5fb613f675a52@203.0.113.7/git/dashboard.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+	remote = origin
+	merge = refs/heads/main

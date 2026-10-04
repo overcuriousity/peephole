@@ -1,5 +1,5 @@
 mod config;
-mod decoy;
+pub mod decoy;
 mod flood;
 pub mod listen;
 mod pages;
@@ -787,13 +787,9 @@ async fn trap(
     let ip = client_ip(&parts.headers, peer.ip(), &state.cfg.trusted_proxies);
     let page_token = uuid::Uuid::new_v4().to_string();
     // Decided before recording, so the row says what was sent.
-    let decoy = decoy::decoy(
-        parts.method.as_str(),
-        parts.uri.path(),
-        &page_token.replace('-', "")[..12],
-    );
+    let decoy = decoy::decoy(parts.method.as_str(), parts.uri.path(), &page_token);
     let (answer, status) = match &decoy {
-        Some(d) => (format!("decoy:{}", d.name), 200),
+        Some(d) => (format!("decoy:{}", d.name), d.status),
         None => ("not-found".to_string(), 404),
     };
     // Recorded apart from the answer: hyper drops this future when the
@@ -811,12 +807,17 @@ async fn trap(
         status,
     ));
     if let Some(d) = decoy {
-        return (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, d.content_type)],
+        let mut resp = (
+            StatusCode::from_u16(d.status).unwrap_or(StatusCode::OK),
             d.body,
         )
             .into_response();
+        for (k, v) in d.headers {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&v) {
+                resp.headers_mut().insert(k, v);
+            }
+        }
+        return resp;
     }
     (
         StatusCode::NOT_FOUND,
