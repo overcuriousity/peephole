@@ -6,7 +6,8 @@ use anyhow::Result;
 
 /// Version of the JA4H derivation a row was read with (0: not yet). A
 /// change to the derivation bumps it, and its migration sets `ja4h_v = 0`
-/// on the rows to derive again.
+/// on the rows to derive again (`WHERE raw_head IS NOT NULL`: only those
+/// can have one).
 pub const JA4H_V: i64 = 1;
 
 /// The JA4H of a request as stored. None for plain HTTP from a trusted

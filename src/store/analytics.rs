@@ -386,7 +386,8 @@ mod tests {
     }
 
     /// Over a time window the fingerprint lists read the window through
-    /// the time index, not every fingerprinted row through the JA4H one.
+    /// the time index, not every fingerprinted row through the JA4H one
+    /// (`ja4` has no index of its own yet; it is checked for when it does).
     #[tokio::test]
     async fn fingerprint_lists_read_only_the_window() {
         let s = seeded().await;
