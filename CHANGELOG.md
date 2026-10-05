@@ -9,10 +9,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 - Cluster: per-level scanner weights. A scanner that fails a scan level
   (hard failures, timeouts aside) more often than the best live scanner
-  over the last 24 h takes jobs of that level only with probability equal
-  to its relative success rate (at least 0.1), so better scanners get
-  them. It recovers as failures age out; jobs waiting over 30 min go to
-  any scanner. The Cluster page's scanner table shows the weights.
+  over the last 24 h (among scanners with at least 5 scans there) sits
+  that level out for 10-minute stretches, a share of 1 − its relative
+  success rate (weight at least 0.1), so better scanners get those jobs.
+  It recovers as failures age out; jobs waiting over 30 min go to any
+  scanner. The Cluster page's scanner table shows the weights.
 
 ### Changed
 

@@ -133,7 +133,7 @@
     {% for m in members %}{% if m.scanner && m.active %}{% include "_cluster_pace_row.html" %}{% endif %}{% endfor %}
     </tbody>
   </table></div>
-  <p class="muted">0 pauses a scanner. A scanner that fails a scan level more often than the others (last 24 h, timeouts aside) takes jobs of that level only with the shown weight; it recovers as old failures age out, and jobs waiting over 30 min go to any scanner.</p>
+  <p class="muted">0 pauses a scanner. A scanner that fails a scan level more often than the others (last 24 h, timeouts aside) sits that level out for 10-minute stretches, a share of 1 − weight of them, while the others take its jobs; scanners with fewer than 5 scans at a level set no bar. It recovers as old failures age out, and jobs waiting over 30 min go to any scanner.</p>
 </section>
 <section class="card">
   <div class="card-head"><h2>Shared intel</h2><span class="muted">Tor exit list</span></div>

@@ -89,7 +89,9 @@ impl Store {
             Option<i64>,
         );
         let (backlog, running, a1, a24, c1, c24, f24, t24, ar, lr): Sums = sqlx::query_as(
-            "SELECT SUM(status='queued'), SUM(status='running'),
+            // A job "running" past any scan's limit is dead and never leaves.
+            "SELECT SUM(status='queued'),
+                    SUM(status='running' AND started_at > datetime('now', ?)),
                     SUM(queued_at > datetime('now','-1 hour')),
                     SUM(queued_at > datetime('now','-24 hours')),
                     SUM(status IN ('done','failed') AND finished_at > datetime('now','-1 hour')),
@@ -102,6 +104,7 @@ impl Store {
                         AND finished_at > datetime('now', ?))
              FROM scan_jobs",
         )
+        .bind(format!("-{} hours", crate::scan::pace::STALE_RUNNING_HOURS))
         .bind(&recent)
         .bind(&recent)
         .fetch_one(&self.pool)
@@ -316,6 +319,34 @@ mod tests {
         assert_eq!(m.observed_hours, 1.0);
         assert!((m.avg_scan_secs.unwrap() - 120.0).abs() < 1.0);
         assert!(m.oldest_queued_secs.is_some());
+
+        // Refused and superseded jobs left the queue too; a job "running"
+        // past any scan's limit is dead and not outstanding.
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM scan_jobs WHERE status='queued'")
+            .fetch_all(&s.pool)
+            .await
+            .unwrap();
+        for (id, status) in ids.iter().zip(["refused", "superseded"]) {
+            sqlx::query("UPDATE scan_jobs SET status=?, finished_at=datetime('now') WHERE id=?")
+                .bind(status)
+                .bind(id)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        let ip = s.upsert_ip("203.0.113.40".parse().unwrap()).await.unwrap();
+        s.enqueue_scan(ip.id, 2, 24).await.unwrap();
+        sqlx::query(
+            "UPDATE scan_jobs SET status='running', started_at=datetime('now','-14 hours')
+             WHERE ip_id=?",
+        )
+        .bind(ip.id)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let m = s.queue_metrics().await.unwrap();
+        assert_eq!(m.left_recent, 3);
+        assert_eq!((m.backlog, m.running), (0, 0));
 
         assert_eq!(s.setting_get("k").await.unwrap(), None);
         s.setting_set("k", "1").await.unwrap();

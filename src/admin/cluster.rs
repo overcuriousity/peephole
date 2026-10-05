@@ -307,11 +307,8 @@ async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<Me
             .view(ours)
     };
     let tallies = crate::scan::weight::tallies(&node.store.pool).await?;
-    let scanners: Vec<NodeId> = rows
-        .iter()
-        .filter(|m| m.active && m.roles.iter().any(|r| r == "scanner") && !node.is_blocked(&m.id))
-        .map(|m| m.id)
-        .collect();
+    // The arbiter's view: the scanners that could take a job now.
+    let scanners = crate::scan::arbiter::scanners(node);
     let level_weights = |id: NodeId| {
         (1..=4)
             .filter_map(|l| {
