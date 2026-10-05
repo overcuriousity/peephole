@@ -1,6 +1,7 @@
 //! Aggregates for the public wall of shame, per time range, plus a short
 //! TTL cache so anonymous traffic cannot hammer SQLite.
 use super::Store;
+use super::browse::Audience;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -155,8 +156,9 @@ pub struct Stats {
     pub ports: Vec<PortStat>,
     /// Distinct IPs with a scan finished in the range.
     pub scanned_ips: i64,
-    /// Admin-only, rendered server-side on the wall. Never serialized to the
-    /// public `/api/stats` JSON — request rows identify individual clients.
+    /// The newest requests of the last 24 hours (up to [`RECENT_MAX`]) this
+    /// audience may see, for the wall's 'Recent requests'. Not serialized to
+    /// `/api/stats`.
     #[serde(skip_serializing)]
     pub recent: Vec<RecentRequest>,
     pub intel: HashMap<String, String>,
@@ -164,6 +166,10 @@ pub struct Stats {
     /// [`CANARY_TILE_MIN`] reuses up, so no single event shows.
     pub canaries: Option<CanaryTile>,
 }
+
+/// Most rows "Recent requests" can show (`[public] recent_rows` is at most
+/// this).
+pub const RECENT_MAX: i64 = 200;
 
 /// Fewest reused harvests (distinct decoy answers) before the wall shows
 /// the canary tile.
@@ -264,42 +270,51 @@ impl Store {
     /// (`request_count`, `max_severity`, `ip_labels`) instead of every
     /// request. IPs without requests (scan-only) are left out, as in the
     /// ranged queries.
-    async fn all_time_ip_aggregates(&self) -> Result<IpAggregates> {
+    async fn all_time_ip_aggregates(&self, a: Audience) -> Result<IpAggregates> {
+        let p = a.rm();
+        let lc = a.label_count();
         let (total_requests, unique_ips, countries, tor_ips): (i64, i64, i64, i64) =
-            sqlx::query_as(
-                "SELECT COALESCE(SUM(request_count), 0), COUNT(*),
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT COALESCE(SUM({p}request_count), 0), COUNT(*),
                         COUNT(DISTINCT country), COALESCE(SUM(is_tor_exit = 1), 0)
-                 FROM ips WHERE request_count > 0",
-            )
+                 FROM ips WHERE {p}request_count > 0"
+            )))
             .fetch_one(&self.read)
             .await?;
-        let top_ips = sqlx::query_as::<_, TopIp>(
-            "SELECT ip, request_count AS count, country, max_severity, is_tor_exit AS is_tor
-             FROM ips WHERE request_count > 0
-             ORDER BY request_count DESC, last_seen DESC LIMIT 20",
-        )
+        let top_ips = sqlx::query_as::<_, TopIp>(sqlx::AssertSqlSafe(format!(
+            "SELECT ip, {p}request_count AS count, country, {p}max_severity AS max_severity,
+                    is_tor_exit AS is_tor
+             FROM ips WHERE {p}request_count > 0
+             ORDER BY {p}request_count DESC, {p}last_seen DESC LIMIT 20"
+        )))
         .fetch_all(&self.read)
         .await?;
         let top_countries = self
             .named(
-                "SELECT COALESCE(country,'??') AS name, COUNT(*) AS count
-                 FROM ips WHERE request_count > 0
-                 GROUP BY country ORDER BY count DESC LIMIT 20",
+                &format!(
+                    "SELECT COALESCE(country,'??') AS name, COUNT(*) AS count
+                     FROM ips WHERE {p}request_count > 0
+                     GROUP BY country ORDER BY count DESC LIMIT 20"
+                ),
                 None,
             )
             .await?;
         let top_asns = self
             .named(
-                "SELECT COALESCE(MAX(asn_org), 'AS' || asn, 'unknown') AS name, COUNT(*) AS count
-                 FROM ips WHERE request_count > 0
-                 GROUP BY asn ORDER BY count DESC LIMIT 20",
+                &format!(
+                    "SELECT COALESCE(MAX(asn_org), 'AS' || asn, 'unknown') AS name, COUNT(*) AS count
+                     FROM ips WHERE {p}request_count > 0
+                     GROUP BY asn ORDER BY count DESC LIMIT 20"
+                ),
                 None,
             )
             .await?;
         let top_labels = self
             .named(
-                "SELECT label AS name, SUM(count) AS count FROM ip_labels
-                 GROUP BY label ORDER BY count DESC LIMIT 20",
+                &format!(
+                    "SELECT label AS name, SUM({lc}) AS count FROM ip_labels WHERE {lc} > 0
+                     GROUP BY label ORDER BY count DESC LIMIT 20"
+                ),
                 None,
             )
             .await?;
@@ -316,8 +331,9 @@ impl Store {
     }
 
     /// Per-IP aggregates over the requests of a time range.
-    async fn ranged_ip_aggregates(&self, r: Range) -> Result<IpAggregates> {
+    async fn ranged_ip_aggregates(&self, r: Range, a: Audience) -> Result<IpAggregates> {
         let (w, since) = r.ts_clause("r.ts");
+        let w = w + &a.released("r");
         let total_requests = self
             .count_where(
                 &format!("SELECT COUNT(*) FROM requests r WHERE 1=1{w}"),
@@ -409,8 +425,36 @@ impl Store {
         })
     }
 
+    /// Everything, as an admin sees it.
     pub async fn stats(&self, r: Range) -> Result<Stats> {
+        self.stats_as(r, Audience::Admin).await
+    }
+
+    /// The newest requests of the last 24 hours this audience may see,
+    /// newest first.
+    pub async fn recent_requests(&self, limit: i64, a: Audience) -> Result<Vec<RecentRequest>> {
+        let sql = format!(
+            "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, r.owasp_json,
+                    i.country, i.is_tor_exit
+             FROM requests r JOIN ips i ON r.ip_id = i.id
+             WHERE r.ts >= datetime('now', '-24 hours'){}
+             ORDER BY r.id DESC LIMIT ?",
+            a.released("r")
+        );
+        Ok(
+            sqlx::query_as::<_, RecentTuple>(sqlx::AssertSqlSafe(sql.as_str()))
+                .bind(limit)
+                .fetch_all(&self.read)
+                .await?
+                .into_iter()
+                .map(recent_from)
+                .collect(),
+        )
+    }
+
+    pub async fn stats_as(&self, r: Range, a: Audience) -> Result<Stats> {
         let (w, since) = r.ts_clause("r.ts");
+        let w = w + &a.released("r");
         let IpAggregates {
             total_requests,
             unique_ips,
@@ -421,10 +465,11 @@ impl Store {
             top_asns,
             top_labels,
         } = match r {
-            Range::All => self.all_time_ip_aggregates().await?,
-            _ => self.ranged_ip_aggregates(r).await?,
+            Range::All => self.all_time_ip_aggregates(a).await?,
+            _ => self.ranged_ip_aggregates(r, a).await?,
         };
         let (ws, since_s) = r.ts_clause("s.finished_at");
+        let ws = ws + &a.scans("s");
         let scans_done = self
             .count_where(
                 &format!("SELECT COUNT(*) FROM scans s WHERE 1=1{ws}"),
@@ -440,28 +485,32 @@ impl Store {
                 since,
             )
             .await?;
-        let (timeline, heatmap) = self.timeline_and_heatmap(r).await?;
+        let (timeline, heatmap) = self.timeline_and_heatmap(r, a).await?;
         let previous = match r.since() {
-            Some(m) => Some(self.previous_window(m).await?),
+            Some(m) => Some(self.previous_window(m, a).await?),
             None => None,
         };
         let new_ips = match r {
             Range::All => unique_ips,
             _ => {
+                let p = a.rm();
                 self.count_where(
                     &format!(
-                        "SELECT COUNT(*) FROM ips i WHERE i.request_count > 0{}",
-                        r.ts_clause("i.first_seen").0
+                        "SELECT COUNT(*) FROM ips i WHERE i.{p}request_count > 0{}",
+                        r.ts_clause(&format!("i.{p}first_seen")).0
                     ),
                     since,
                 )
                 .await?
             }
         };
-        let last_request: Option<String> = sqlx::query_scalar("SELECT MAX(ts) FROM requests")
-            .fetch_one(&self.read)
-            .await?;
-        let (families, owasp) = self.families_and_owasp(r).await?;
+        let last_request: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT MAX(r.ts) FROM requests r WHERE 1=1{}",
+            a.released("r")
+        )))
+        .fetch_one(&self.read)
+        .await?;
+        let (families, owasp) = self.families_and_owasp(r, a).await?;
         let ports = bind_since!(
             sqlx::query_as::<_, PortStat>(sqlx::AssertSqlSafe(format!(
                 "SELECT p.port, p.proto, MAX(p.service) AS service, COUNT(DISTINCT s.ip_id) AS ips
@@ -480,19 +529,7 @@ impl Store {
                 since_s,
             )
             .await?;
-        let sql = format!(
-            "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, r.owasp_json,
-                    i.country, i.is_tor_exit
-             FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1{w}
-             ORDER BY r.id DESC LIMIT 50"
-        );
-        let recent_rows = bind_since!(
-            sqlx::query_as::<_, RecentTuple>(sqlx::AssertSqlSafe(sql.as_str())),
-            since
-        )
-        .fetch_all(&self.read)
-        .await?;
-        let recent = recent_rows.into_iter().map(recent_from).collect();
+        let recent = self.recent_requests(RECENT_MAX, a).await?;
         // Only the public refresh timestamps — never the whole intel_meta
         // table, which also holds webauthn_setup_token_hash. `intel` is
         // serialized into the public /api/stats response.
@@ -504,7 +541,7 @@ impl Store {
         .await?
         .into_iter()
         .collect();
-        let sum = self.canary_summary(r).await?;
+        let sum = self.canary_summary_as(r, a).await?;
         // Counted per harvest, not per value: one request carrying many
         // values of one decoy is one event.
         let canaries = (sum.harvests_reused >= CANARY_TILE_MIN).then(|| CanaryTile {
@@ -543,8 +580,13 @@ impl Store {
     /// The timeline (hourly or daily, as the range wants) with each bucket
     /// split by severity, and the weekday × hour heatmap, from one pass of
     /// hourly buckets.
-    async fn timeline_and_heatmap(&self, r: Range) -> Result<(Vec<Bucket>, Vec<[i64; 24]>)> {
+    async fn timeline_and_heatmap(
+        &self,
+        r: Range,
+        a: Audience,
+    ) -> Result<(Vec<Bucket>, Vec<[i64; 24]>)> {
         let (w, since) = r.ts_clause("r.ts");
+        let w = w + &a.released("r");
         let sql = format!(
             "SELECT strftime('%Y-%m-%dT%H:00', r.ts) AS h, r.severity, COUNT(*) FROM requests r
              WHERE 1=1{w} GROUP BY h, r.severity ORDER BY h"
@@ -580,21 +622,23 @@ impl Store {
 
     /// Requests and distinct IPs in the window of the same length just
     /// before `datetime('now', since)`.
-    async fn previous_window(&self, since: &'static str) -> Result<Previous> {
+    async fn previous_window(&self, since: &'static str, a: Audience) -> Result<Previous> {
         // "-24 hours" → the window [now -48 h, now -24 h).
         let earlier = match since {
             "-24 hours" => "-48 hours",
             "-7 days" => "-14 days",
             _ => "-60 days",
         };
-        let (total_requests, unique_ips): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), COUNT(DISTINCT ip_id) FROM requests
-             WHERE ts >= datetime('now', ?) AND ts < datetime('now', ?)",
-        )
-        .bind(earlier)
-        .bind(since)
-        .fetch_one(&self.read)
-        .await?;
+        let (total_requests, unique_ips): (i64, i64) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*), COUNT(DISTINCT r.ip_id) FROM requests r
+             WHERE r.ts >= datetime('now', ?) AND r.ts < datetime('now', ?){}",
+                a.released("r")
+            )))
+            .bind(earlier)
+            .bind(since)
+            .fetch_one(&self.read)
+            .await?;
         Ok(Previous {
             total_requests,
             unique_ips,
@@ -604,8 +648,9 @@ impl Store {
     /// Requests per label family and per OWASP tag. Grouped by the stored
     /// lists first (few distinct combinations), so each request counts once
     /// per family or tag without unpacking every row's JSON.
-    async fn families_and_owasp(&self, r: Range) -> Result<(Vec<Named>, Vec<Named>)> {
+    async fn families_and_owasp(&self, r: Range, a: Audience) -> Result<(Vec<Named>, Vec<Named>)> {
         let (w, since) = r.ts_clause("r.ts");
+        let w = w + &a.released("r");
         let sql = format!(
             "SELECT r.labels_json, r.owasp_json, COUNT(*) FROM requests r
              WHERE 1=1{w} GROUP BY r.labels_json, r.owasp_json"
@@ -653,12 +698,20 @@ impl Store {
         Ok((families, owasp))
     }
 
+    /// Everything, as an admin sees it.
     pub async fn map_counts(&self, r: Range) -> Result<MapCounts> {
+        self.map_counts_as(r, Audience::Admin).await
+    }
+
+    pub async fn map_counts_as(&self, r: Range, a: Audience) -> Result<MapCounts> {
         let (w, since) = r.ts_clause("r.ts");
+        let w = w + &a.released("r");
+        let p = a.rm();
         let sql = match r {
-            Range::All => "SELECT country AS name, COUNT(*) AS count FROM ips
-                 WHERE country IS NOT NULL AND request_count > 0 GROUP BY country"
-                .to_string(),
+            Range::All => format!(
+                "SELECT country AS name, COUNT(*) AS count FROM ips
+                 WHERE country IS NOT NULL AND {p}request_count > 0 GROUP BY country"
+            ),
             _ => format!(
                 "SELECT i.country AS name, COUNT(DISTINCT i.id) AS count
                  FROM requests r JOIN ips i ON r.ip_id = i.id
@@ -884,7 +937,7 @@ impl StatsCache {
         self.stats
             .get(r, ttl(r), move || {
                 let store = store.clone();
-                Box::pin(async move { store.stats(r).await })
+                Box::pin(async move { store.stats_as(r, Audience::Public).await })
             })
             .await
     }
@@ -964,7 +1017,7 @@ impl StatsCache {
         self.map
             .get(r, ttl(r), move || {
                 let store = store.clone();
-                Box::pin(async move { store.map_counts(r).await })
+                Box::pin(async move { store.map_counts_as(r, Audience::Public).await })
             })
             .await
     }
@@ -985,6 +1038,7 @@ impl std::error::Error for Gone {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::browse::Audience;
     use crate::store::requests::NewRequest;
 
     async fn seeded() -> Store {
@@ -1309,6 +1363,147 @@ mod tests {
         assert_eq!(st.ports.len(), 1, "{:?}", st.ports);
         assert_eq!((st.ports[0].port, st.ports[0].ips), (22, 3));
         assert_eq!(st.ports[0].service.as_deref(), Some("ssh"));
+    }
+
+    async fn delayed() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        // One released request from a known IP ...
+        let known = s.upsert_ip("203.0.113.1".parse().unwrap()).await.unwrap();
+        s.set_ip_geo(known.id, Some("DE"), Some(3320), Some("DTAG"))
+            .await
+            .unwrap();
+        s.insert_request(&NewRequest {
+            ip_id: known.id,
+            method: "GET".into(),
+            path: "/old".into(),
+            headers_json: "[]".into(),
+            labels_json: r#"["wp"]"#.into(),
+            severity: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // ... then pending ones: the known IP again, and a new IP.
+        s.set_publish_delay(Duration::from_secs(300), Duration::ZERO)
+            .await
+            .unwrap();
+        s.insert_request(&NewRequest {
+            ip_id: known.id,
+            method: "POST".into(),
+            path: "/new".into(),
+            headers_json: "[]".into(),
+            labels_json: r#"["sqli"]"#.into(),
+            severity: 4,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let fresh = s.upsert_ip("198.51.100.2".parse().unwrap()).await.unwrap();
+        s.set_ip_geo(fresh.id, Some("US"), Some(15169), Some("G"))
+            .await
+            .unwrap();
+        s.insert_request(&NewRequest {
+            ip_id: fresh.id,
+            method: "GET".into(),
+            path: "/fresh".into(),
+            headers_json: "[]".into(),
+            labels_json: r#"["sqli"]"#.into(),
+            severity: 4,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        (s, dir)
+    }
+
+    #[tokio::test]
+    async fn public_stats_count_released_rows_only() {
+        let (s, _d) = delayed().await;
+        for r in Range::ALL {
+            let p = s.stats_as(r, Audience::Public).await.unwrap();
+            assert_eq!((p.total_requests, p.unique_ips), (1, 1), "{r:?}");
+            assert_eq!(p.top_ips.len(), 1, "{r:?}");
+            assert_eq!(p.top_ips[0].max_severity, 1, "{r:?}");
+            assert!(p.top_labels.iter().all(|l| l.name != "sqli"), "{r:?}");
+            assert!(p.recent.iter().all(|x| x.path == "/old"), "{r:?}");
+            assert_eq!(p.top_countries.len(), 1, "{r:?}");
+            let a = s.stats_as(r, Audience::Admin).await.unwrap();
+            assert_eq!((a.total_requests, a.unique_ips), (3, 2), "{r:?}");
+        }
+        let h = s.stats_as(Range::H24, Audience::Public).await.unwrap();
+        assert_eq!(h.new_ips, 1);
+        assert_eq!(h.timeline.iter().map(|b| b.count).sum::<i64>(), 1);
+        let m = s.map_counts_as(Range::All, Audience::Public).await.unwrap();
+        assert_eq!(m.countries.get("US"), None);
+        assert_eq!(m.countries.get("DE"), Some(&1));
+        let m = s.map_counts_as(Range::H24, Audience::Public).await.unwrap();
+        assert_eq!(m.countries.get("US"), None);
+    }
+
+    #[tokio::test]
+    async fn released_rows_appear_publicly() {
+        let (s, _d) = delayed().await;
+        sqlx::query("UPDATE requests SET public_at = datetime('now', '-1 seconds') WHERE public_at IS NOT NULL")
+            .execute(&s.pool).await.unwrap();
+        s.release_due().await.unwrap();
+        let p = s.stats_as(Range::All, Audience::Public).await.unwrap();
+        assert_eq!((p.total_requests, p.unique_ips), (3, 2));
+        assert_eq!(
+            s.recent_requests(RECENT_MAX, Audience::Public)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_requests_cover_the_last_day_newest_first() {
+        let (s, _d) = delayed().await;
+        let admin = s.recent_requests(2, Audience::Admin).await.unwrap();
+        assert_eq!(
+            admin.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            ["/fresh", "/new"]
+        );
+        sqlx::query("UPDATE requests SET ts = datetime('now', '-25 hours') WHERE path = '/old'")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert!(
+            s.recent_requests(RECENT_MAX, Audience::Public)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_scans_wait_for_the_delay_and_a_public_ip() {
+        let (s, _d) = delayed().await;
+        s.set_publish_delay(Duration::from_secs(300), Duration::ZERO)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO scan_jobs (id, ip_id, level, status, queued_at) VALUES (1, 1, 1, 'done', datetime('now'))")
+            .execute(&s.pool).await.unwrap();
+        // A scan of the public IP finished long ago, one just now, and one
+        // of the pending-only IP long ago.
+        for (ip, ago) in [
+            ("203.0.113.1", "-1 hours"),
+            ("203.0.113.1", "-0 seconds"),
+            ("198.51.100.2", "-1 hours"),
+        ] {
+            sqlx::query(
+                "INSERT INTO scans (job_id, ip_id, level, started_at, finished_at)
+                 VALUES (1, (SELECT id FROM ips WHERE ip = ?), 1, datetime('now', ?), datetime('now', ?))",
+            )
+            .bind(ip).bind(ago).bind(ago)
+            .execute(&s.pool).await.unwrap();
+        }
+        let p = s.stats_as(Range::All, Audience::Public).await.unwrap();
+        assert_eq!((p.scans_done, p.scanned_ips), (1, 1));
+        let a = s.stats_as(Range::All, Audience::Admin).await.unwrap();
+        assert_eq!((a.scans_done, a.scanned_ips), (3, 2));
     }
 
     #[test]

@@ -368,7 +368,18 @@ impl CanarySummary {
 }
 
 impl Store {
+    /// Canary reuse as an admin sees it.
     pub async fn canary_summary(&self, range: crate::store::stats::Range) -> Result<CanarySummary> {
+        self.canary_summary_as(range, crate::store::browse::Audience::Admin)
+            .await
+    }
+
+    pub async fn canary_summary_as(
+        &self,
+        range: crate::store::stats::Range,
+        a: crate::store::browse::Audience,
+    ) -> Result<CanarySummary> {
+        let rel = a.released("u");
         let since = range.since();
         let window = if since.is_some() {
             " AND c.ts >= datetime('now', ?)"
@@ -382,7 +393,7 @@ impl Store {
                     (SELECT MIN(CAST(strftime('%s', u.ts) AS INTEGER) - CAST(strftime('%s', c.ts) AS INTEGER))
                      FROM request_tokens t JOIN requests u ON u.id = t.request_id
                      WHERE t.value_hash = c.value_hash
-                       AND (c.request_id IS NULL OR t.request_id != c.request_id))
+                       AND (c.request_id IS NULL OR t.request_id != c.request_id){rel})
              FROM canaries c WHERE 1 = 1{window}"
         )));
         if let Some(m) = since {

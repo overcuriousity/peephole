@@ -81,6 +81,9 @@ rp_id = "localhost"
 origin = "https://localhost"
 rp_name = "t"
 secure_cookies = false
+[public]
+delay_minutes = 0
+jitter_minutes = 0
 [cluster]
 node_name = "listener-a"
 listen = "127.0.0.1:{a_rpc}"

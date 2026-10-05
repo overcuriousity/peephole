@@ -254,6 +254,43 @@ impl Audience {
             Self::Public => "NULL",
         }
     }
+    /// `AND`-fragment keeping only the requests this audience may count
+    /// (`alias` names the requests table): the public sees released rows.
+    pub(crate) fn released(self, alias: &str) -> String {
+        match self {
+            Self::Admin => String::new(),
+            Self::Public => format!(" AND {alias}.public_at IS NULL"),
+        }
+    }
+    /// Prefix of the per-IP read models (`request_count`, `max_severity`,
+    /// `first_seen`, `last_seen`) this audience reads: `pub_` for the public.
+    pub(crate) fn rm(self) -> &'static str {
+        match self {
+            Self::Admin => "",
+            Self::Public => "pub_",
+        }
+    }
+    /// The `ip_labels` column holding this audience's count.
+    pub(crate) fn label_count(self) -> &'static str {
+        match self {
+            Self::Admin => "count",
+            Self::Public => "pub_count",
+        }
+    }
+    /// `AND`-fragment for the scans this audience may count (`alias` names
+    /// the scans table): the public sees scans finished at least the
+    /// publication delay ago, of IPs it can see.
+    pub(crate) fn scans(self, alias: &str) -> String {
+        match self {
+            Self::Admin => String::new(),
+            Self::Public => format!(
+                " AND {alias}.finished_at <= datetime('now', '-' || \
+                 (SELECT delay_s FROM publish_cfg WHERE id = 1) || ' seconds') \
+                 AND EXISTS (SELECT 1 FROM ips pi WHERE pi.id = {alias}.ip_id \
+                 AND pi.pub_request_count > 0)"
+            ),
+        }
+    }
 }
 
 fn request_row_select(a: Audience) -> String {
