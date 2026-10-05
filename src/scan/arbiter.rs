@@ -45,8 +45,6 @@ pub struct Arbiter {
     declined: Mutex<HashMap<String, std::collections::HashSet<NodeId>>>,
     /// Scanners that handed a job back for now, until when they are skipped.
     later: Mutex<HashMap<String, HashMap<NodeId, Instant>>>,
-    /// Standing decisions of weak scanners to sit a level out.
-    holds: Mutex<super::weight::Holds>,
     /// Serializes hand-outs and state writes.
     assign: tokio::sync::Mutex<()>,
 }
@@ -68,7 +66,6 @@ impl Arbiter {
             waiting: Mutex::new(vec![]),
             declined: Mutex::new(HashMap::new()),
             later: Mutex::new(HashMap::new()),
-            holds: Mutex::new(Default::default()),
             assign: tokio::sync::Mutex::new(()),
         });
         a.recover().await?;
@@ -230,13 +227,11 @@ impl Arbiter {
             return Ok(vec![]);
         }
         let t = super::weight::tallies(&self.node.store.pool).await?;
-        Ok(self.holds.lock().unwrap().skipped(
-            &t,
-            scanner,
-            &scanners,
-            Instant::now(),
-            super::weight::roll,
-        ))
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Ok(super::weight::skipped_levels(&t, scanner, &scanners, now))
     }
 
     /// [`Self::next_job`] past the jobs `scanner` handed back and, unless

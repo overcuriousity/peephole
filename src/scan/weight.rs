@@ -18,7 +18,7 @@ use crate::cluster::identity::NodeId;
 use anyhow::Result;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Hours of finished scans a weight is measured over.
 pub const WINDOW_HOURS: i64 = 24;
@@ -33,7 +33,7 @@ pub const OVERRIDE_WAIT_MINS: i64 = 30;
 /// there: one that is idle, paused or new does not make the rest look bad.
 pub const MIN_SAMPLE: i64 = 5;
 /// How long one decision to sit a level out (or not) holds. Scanners claim
-/// every few seconds when idle, so a fresh roll per claim would let a weak
+/// every few seconds when idle, so a fresh draw per claim would let a weak
 /// scanner take the level's jobs almost at once anyway.
 pub const HOLD: Duration = Duration::from_secs(600);
 
@@ -93,44 +93,36 @@ pub fn weight(t: &Tallies, scanner: NodeId, scanners: &[NodeId], level: i64) -> 
     (own / best).clamp(MIN_WEIGHT, 1.0)
 }
 
-/// Standing decisions to sit a level out, per scanner and level.
-#[derive(Default)]
-pub struct Holds(HashMap<(NodeId, i64), (Instant, bool)>);
-
-impl Holds {
-    /// The levels `scanner` sits out now. A level with weight `w < 1` is
-    /// sat out unless the roll (uniform in [0, 1)) comes in below `w`; the
-    /// decision then stands for [`HOLD`]. Full weight clears it at once.
-    pub fn skipped(
-        &mut self,
-        t: &Tallies,
-        scanner: NodeId,
-        scanners: &[NodeId],
-        now: Instant,
-        mut roll: impl FnMut() -> f64,
-    ) -> Vec<i64> {
-        self.0.retain(|_, (until, _)| *until > now);
-        (1..=4)
-            .filter(|l| {
-                let w = weight(t, scanner, scanners, *l);
-                if w >= 1.0 {
-                    self.0.remove(&(scanner, *l));
-                    return false;
-                }
-                self.0
-                    .entry((scanner, *l))
-                    .or_insert_with(|| (now + HOLD, roll() >= w))
-                    .1
-            })
-            .collect()
-    }
+/// The draw that decides whether `scanner` sits `level` out during the
+/// stretch of [`HOLD`] containing `unix_secs`: uniform in [0, 1), and the
+/// same on every node, so all arbiters agree without sharing any state
+/// (with rolls of their own, a scanner turned away by one would just be
+/// served by the next).
+pub fn draw(scanner: NodeId, level: i64, unix_secs: u64) -> f64 {
+    let mut b = Vec::with_capacity(48);
+    b.extend_from_slice(&scanner.0);
+    b.extend_from_slice(&level.to_le_bytes());
+    b.extend_from_slice(&(unix_secs / HOLD.as_secs()).to_le_bytes());
+    let d = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &b);
+    let n = u32::from_le_bytes(d.as_ref()[..4].try_into().unwrap());
+    n as f64 / (u32::MAX as f64 + 1.0)
 }
 
-/// Uniform in [0, 1).
-pub fn roll() -> f64 {
-    let mut b = [0u8; 4];
-    let _ = aws_lc_rs::rand::fill(&mut b);
-    u32::from_le_bytes(b) as f64 / (u32::MAX as f64 + 1.0)
+/// The levels `scanner` sits out at `unix_secs`: those with weight `w < 1`
+/// whose [`draw`] comes in at or above `w`, so a share `1 - w` of the
+/// stretches. Back at full weight, it sits out nothing.
+pub fn skipped_levels(
+    t: &Tallies,
+    scanner: NodeId,
+    scanners: &[NodeId],
+    unix_secs: u64,
+) -> Vec<i64> {
+    (1..=4)
+        .filter(|l| {
+            let w = weight(t, scanner, scanners, *l);
+            w < 1.0 && draw(scanner, *l, unix_secs) >= w
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -236,26 +228,33 @@ mod tests {
     }
 
     #[test]
-    fn a_decision_holds_then_is_rolled_again() {
+    fn a_decision_holds_for_a_stretch_and_follows_the_weight() {
         let all = [id(1), id(2)];
         let ts = t(&[(1, 4, 0, 4), (2, 4, 10, 0)]); // weight 0.5 at level 4
-        let now = Instant::now();
-        let mut h = Holds::default();
-        assert_eq!(h.skipped(&ts, id(1), &all, now, || 0.7), vec![4]);
-        // Within the hold a lucky roll changes nothing.
-        let later = now + HOLD / 2;
-        assert_eq!(h.skipped(&ts, id(1), &all, later, || 0.0), vec![4]);
-        // After it, the next roll decides.
-        let after = now + HOLD + Duration::from_secs(1);
-        assert!(h.skipped(&ts, id(1), &all, after, || 0.3).is_empty());
-        // The good scanner never sits out.
-        assert!(h.skipped(&ts, id(2), &all, now, || 0.99).is_empty());
-        // Recovered to full weight: the standing decision is dropped.
-        let mut h = Holds::default();
-        assert_eq!(h.skipped(&ts, id(1), &all, now, || 0.7), vec![4]);
+        let hold = HOLD.as_secs();
+        // Within one stretch the decision stands; it is the draw's.
+        let start = 1_000 * hold;
+        let sat = draw(id(1), 4, start) >= 0.5;
+        for at in [start, start + 1, start + hold - 1] {
+            assert_eq!(draw(id(1), 4, at), draw(id(1), 4, start));
+            assert_eq!(skipped_levels(&ts, id(1), &all, at) == vec![4], sat);
+        }
+        // Over many stretches it sits out about half of them.
+        let n = 2000u64;
+        let out = (0..n)
+            .filter(|i| !skipped_levels(&ts, id(1), &all, i * hold).is_empty())
+            .count() as f64;
+        assert!((out / n as f64 - 0.5).abs() < 0.05, "{out}");
+        // The good scanner, or the weak one recovered, never sits out.
         let ok = t(&[(1, 4, 10, 0), (2, 4, 10, 0)]);
-        assert!(h.skipped(&ok, id(1), &all, now, || 0.99).is_empty());
-        let r = roll();
-        assert!((0.0..1.0).contains(&r));
+        for i in 0..50 {
+            assert!(skipped_levels(&ts, id(2), &all, i * hold).is_empty());
+            assert!(skipped_levels(&ok, id(1), &all, i * hold).is_empty());
+        }
+        // Draws are in [0, 1) and differ per level and scanner.
+        let d = draw(id(1), 4, start);
+        assert!((0.0..1.0).contains(&d));
+        assert_ne!(d, draw(id(1), 3, start));
+        assert_ne!(d, draw(id(2), 4, start));
     }
 }
