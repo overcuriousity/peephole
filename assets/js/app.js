@@ -104,7 +104,7 @@
             attestationObject: bufToB64u(ccred.response.attestationObject), clientDataJSON: bufToB64u(ccred.response.clientDataJSON) },
             extensions: ccred.getClientExtensionResults ? ccred.getClientExtensionResults() : {} } };
           var fin2 = await fetch("/enroll/finish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(cbody) });
-          if (fin2.ok) location.href = "/admin/keys"; else msg.textContent = "enrollment failed (" + fin2.status + ")";
+          if (fin2.ok) location.href = "/admin/system/keys"; else msg.textContent = "enrollment failed (" + fin2.status + ")";
         }
       } catch (e) { msg.textContent = e.message || String(e); }
     });
@@ -156,20 +156,20 @@
       tr.appendChild(cell("", esc(j.level)));
       tr.appendChild(cell("", '<span class="badge badge-status" data-status="' + esc(j.status) + '">' + esc(j.status) + "</span>"));
       tr.appendChild(cell("ts", esc(j.queued_at)));
-      tr.appendChild(cell("ts", esc(j.finished_at)));
-      tr.appendChild(cell("mono wrap", esc(j.error)));
+      tr.appendChild(cell("ts", esc(j.started_at)));
       tr.appendChild(cell("muted", esc(j.scanner) + (j.arbiter ? '<span class="node-via"> via ' + esc(j.arbiter) + "</span>" : "")));
       return tr;
     };
-    // The page's status/level filter applies to live rows too.
-    // The level compares as a number, as the server parses it ("03" is 3).
-    var fStatus = qt.getAttribute("data-filter-status") || "", lv = (qt.getAttribute("data-filter-level") || "").trim();
-    var fLevel = /^[+-]?\d+$/.test(lv) ? parseInt(lv, 10) : NaN;
-    var matches = function (j) { return (!fStatus || j.status === fStatus) && (isNaN(fLevel) || Number(j.level) === fLevel); };
-    var COLS = 8;
+    // The live card holds active jobs only; a job that finishes leaves it.
+    var matches = function (j) { return j.status === "queued" || j.status === "running"; };
+    var COLS = 7;
+    // "newest N of M" when more jobs are active than the card keeps.
+    var total = qs && qs.querySelector("[data-queue-total]");
+    var setTotal = function (active) { if (total) { total.textContent = "newest " + limit + " of " + active; total.hidden = !(active > limit); } };
+    var showEmpty = function () { var tr = document.createElement("tr"); tr.setAttribute("data-empty", ""); var td = cell("empty", "Nothing queued or running."); td.setAttribute("colspan", String(COLS)); tr.appendChild(td); tbody.appendChild(tr); };
     var apply = function (j) {
       var existing = tbody.querySelector('[data-job="' + j.id + '"]');
-      if (!matches(j)) { if (existing) existing.remove(); return; }
+      if (!matches(j)) { if (existing) { existing.remove(); if (!tbody.querySelector("[data-job]")) showEmpty(); } return; }
       var empty = tbody.querySelector("[data-empty]"); if (empty) empty.remove();
       var fresh = row(j);
       if (existing) {
@@ -185,13 +185,16 @@
         }
         tbody.insertBefore(fresh, before);
       }
+      // Over the limit, a finished job's row is not backfilled until the
+      // next periodic snapshot (every 30 s).
       while (tbody.children.length > limit) tbody.removeChild(tbody.lastChild);
     };
-    var snapshot = function (jobs) {
+    var snapshot = function (d) {
       tbody.innerHTML = "";
-      jobs = jobs.filter(matches);
+      setTotal(d.active);
+      var jobs = (d.jobs || []).filter(matches);
       jobs.slice(0, limit).forEach(function (j) { tbody.appendChild(row(j)); });
-      if (!jobs.length) { var tr = document.createElement("tr"); tr.setAttribute("data-empty", ""); var td = cell("empty", "Queue empty."); td.setAttribute("colspan", String(COLS)); tr.appendChild(td); tbody.appendChild(tr); }
+      if (!jobs.length) showEmpty();
     };
     var es = new EventSource(qt.getAttribute("data-src"));
     es.addEventListener("open", function () { setLive("open", "live"); });

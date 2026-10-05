@@ -1,7 +1,8 @@
 {% extends "layout.html" %}
 {% block title %}peephole — canaries{% endblock %}
 {% block content %}
-{% let sub = "canaries" %}{% include "_admin_nav.html" %}
+{% let sub = "links" %}{% include "_admin_nav.html" %}
+{% let subtab = "canaries" %}{% let tabs = crate::admin::views::LINKS_TABS %}{% let tabs_label = "Links pages" %}{% include "_subtabs.html" %}
 <div class="page-head"><div><h1>Canaries</h1><p class="muted">Credentials served in decoys and the requests that used them again. The period is when they were served.</p></div>{% let base = "/admin/canaries" %}{% include "_range.html" %}</div>
 <div class="stack">
 <div class="tiles kpis">

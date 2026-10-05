@@ -27,7 +27,7 @@ pub const USAGE: &str = "usage: peephole cluster id [CONFIG]
        peephole cluster purge NODE [CONFIG]     (delete a blocked node's data here)
        peephole cluster agreement NODE [--sample N] [CONFIG]
                                (its newest N requests (default 500) classified again with
-                                our rules, as the Cluster page does; lists those that differ)
+                                our rules, as the member pages do; lists those that differ)
        peephole cluster leave [CONFIG]";
 
 /// `--name value` pairs.
@@ -99,7 +99,7 @@ fn resolve(rows: &[members::MemberRow], who: &str) -> Result<NodeId> {
 /// Characters of a path shown by `agreement`.
 const PATH_SHOWN: usize = 60;
 
-/// What `cluster agreement` prints: the summary the Cluster page shows,
+/// What `cluster agreement` prints: the summary a member's page shows,
 /// then every request our rules do not reproduce, with the verdicts under
 /// both history bounds (see `classify::stored::History`).
 fn agreement_report(
@@ -461,7 +461,7 @@ mod tests {
     use crate::store::requests::NewRequest;
 
     /// The report lists the rows our rules do not reproduce, with both
-    /// histories, and summarises as the Cluster page does.
+    /// histories, and summarises as the member pages do.
     #[tokio::test]
     async fn agreement_lists_differing_rows() {
         let dir = tempfile::tempdir().unwrap();

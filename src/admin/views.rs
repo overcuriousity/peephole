@@ -234,6 +234,22 @@ pub fn duration<S: SevValue>(secs: S) -> String {
     }
 }
 
+/// Second-level tabs: `(key, href, label)`, drawn by `_subtabs.html`.
+pub const LINKS_TABS: &[(&str, &str, &str)] = &[
+    ("fingerprints", "/admin/fingerprints", "Fingerprints"),
+    ("canaries", "/admin/canaries", "Canaries"),
+];
+pub const CLUSTER_TABS: &[(&str, &str, &str)] = &[
+    ("members", "/admin/cluster", "Members"),
+    ("access", "/admin/cluster/access", "Access"),
+];
+pub const SYSTEM_TABS: &[(&str, &str, &str)] = &[
+    ("status", "/admin/system", "Status"),
+    ("settings", "/admin/system/settings", "Settings"),
+    ("keys", "/admin/system/keys", "Keys"),
+    ("export", "/admin/system/export", "Export"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

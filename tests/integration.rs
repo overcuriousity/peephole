@@ -489,6 +489,10 @@ async fn queue_sse_requires_session_and_streams_snapshot_then_jobs() {
     );
     let body = read_sse_until(resp, "event: snapshot", 5).await;
     assert!(body.contains("\"status\":\"queued\""));
+    assert!(
+        body.contains("\"active\":1"),
+        "the snapshot carries the total: {body}"
+    );
 
     // A published job arrives as `event: job`.
     let resp = client
@@ -521,16 +525,17 @@ async fn admin_routes_redirect_without_session() {
         .unwrap();
     for path in [
         "/admin",
-        "/admin/queue",
         "/admin/requests/1",
         "/admin/scans",
         "/admin/scans/1",
         "/admin/scans/1/xml",
         "/admin/fingerprints",
         "/admin/inbox",
-        "/admin/export",
+        "/admin/system",
+        "/admin/system/settings",
+        "/admin/system/export",
         "/admin/export/download?format=csv",
-        "/admin/keys",
+        "/admin/system/keys",
         // Request rows identify individual clients, so request search is
         // admin-only.
         "/requests",
@@ -779,15 +784,41 @@ async fn admin_pages_and_deletes_with_session() {
     let (client, base) = enrolled_admin_client(store.clone(), cfg).await;
     let get = |p: &str| client.get(format!("{base}{p}")).send();
 
+    // A failed scan is something to look at.
+    let ipf = store
+        .upsert_ip("203.0.113.79".parse().unwrap())
+        .await
+        .unwrap();
+    if let peephole::store::scans::EnqueueOutcome::Queued(j) =
+        store.enqueue_scan(ipf.id, 1, 24).await.unwrap()
+    {
+        store.next_queued_job().await.unwrap();
+        store.finish_job(j, None, Some("host down")).await.unwrap();
+    }
     let html = get("/admin").await.unwrap().text().await.unwrap();
+    assert!(!html.contains("data-queue"), "no queue card on Overview");
+    assert!(!html.contains("<h2>Intel</h2>"), "intel lives on System");
+    assert!(html.contains("href=\"/admin/inbox\"") && html.contains("href=\"/admin/scans\""));
+    assert!(html.contains("data-recent"), "recent activity stays");
     assert!(
-        html.contains("Scan queue")
-            && html.contains("data-queue")
-            && html.contains("/admin/api/queue")
+        html.contains("Needs attention") && html.contains("failed in 24 h"),
+        "{html}"
     );
-    assert!(html.contains("unread"));
-    let html = get("/admin/queue").await.unwrap().text().await.unwrap();
+    let html = get("/admin/scans?status=done")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(html.contains("203.0.113.78") && html.contains("done"));
+    let html = get("/admin/scans?status=nonsense&level=abc")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("203.0.113.78"), "unknown filters are ignored");
+    assert!(!html.contains("nonsense"), "and not echoed");
 
     let rid: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/login'")
         .fetch_one(&store.pool)
@@ -892,19 +923,31 @@ async fn admin_pages_and_deletes_with_session() {
     );
     let html = get("/admin/inbox").await.unwrap().text().await.unwrap();
     assert!(html.contains("lost@example.org"));
-    let html = get("/admin/keys").await.unwrap().text().await.unwrap();
+    let html = get("/admin/system/keys")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(html.contains("test-key") && html.contains("/enroll"));
-    let html = get("/admin/export").await.unwrap().text().await.unwrap();
+    let html = get("/admin/system/export")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(html.contains("/admin/export/download"));
     for html_path in [
         "/admin",
-        "/admin/queue",
+        "/admin/scans",
         &format!("/admin/requests/{rid}"),
         &format!("/admin/scans/{sid}"),
         "/admin/fingerprints",
         "/admin/analytics",
         "/ip/203.0.113.78",
-        "/admin/keys",
+        "/admin/system/keys",
+        "/admin/system",
+        "/admin/system/settings",
     ] {
         let html = get(html_path).await.unwrap().text().await.unwrap();
         assert!(
@@ -1977,7 +2020,7 @@ async fn bulk_delete_checked_and_filtered() {
 }
 
 #[tokio::test]
-async fn scan_pace_is_adjustable_from_the_queue_page() {
+async fn scan_pace_is_adjustable_from_the_scans_page() {
     let (trap_base, store, dir) = spawn_trap().await;
     // One queued job so the metrics have something to measure.
     let _ = reqwest::Client::new()
@@ -1990,7 +2033,7 @@ async fn scan_pace_is_adjustable_from_the_queue_page() {
     let (client, base, state) = enrolled_admin_client_with_state(store.clone(), cfg).await;
 
     let page = client
-        .get(format!("{base}/admin/queue"))
+        .get(format!("{base}/admin/scans"))
         .send()
         .await
         .unwrap();
@@ -1999,6 +2042,10 @@ async fn scan_pace_is_adjustable_from_the_queue_page() {
     assert!(html.contains("Save pace"), "pace form on queue page");
     assert!(html.contains("Recommended:"));
     assert!(html.contains("Arrivals / h"));
+    assert!(
+        html.contains("data-queue") && html.contains("History"),
+        "live card and history"
+    );
 
     let resp = client
         .post(format!("{base}/admin/queue/pace"))
@@ -2056,6 +2103,18 @@ async fn scan_pace_is_adjustable_from_the_queue_page() {
         .unwrap();
     assert_eq!(bad.status(), 400, "timeout below the minimum");
     assert_eq!(state.pace.get(), p);
+    let bad = client
+        .post(format!("{base}/admin/queue/pace"))
+        .form(&[("max_workers", "x"), ("max_scans_per_hour", "90")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let html = bad.text().await.unwrap();
+    assert!(
+        html.contains("Pace not saved") && html.contains("data-queue") && html.contains("History"),
+        "an error re-renders the whole Scans page"
+    );
 
     // Retry: the failed job goes back in the queue.
     let job = store.next_queued_job().await.unwrap().unwrap();
@@ -2081,6 +2140,22 @@ async fn scan_pace_is_adjustable_from_the_queue_page() {
         .await
         .unwrap();
     assert_eq!(status, "queued");
+    store
+        .finish_job(job.id, None, Some("host reported down"))
+        .await
+        .unwrap();
+    let html = client
+        .get(format!("{base}/admin/scans?status=failed"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        html.contains("Retry failed") && html.contains("host reported down"),
+        "retry next to the failed filter"
+    );
 
     // Without a session the endpoint is closed.
     let anon = reqwest::Client::builder()
@@ -2584,7 +2659,10 @@ async fn canaries_page_lists_reuses_and_filters() {
         .text()
         .await
         .unwrap();
-    assert!(nav.contains("href=\"/admin/canaries\""));
+    assert!(
+        nav.contains("href=\"/admin/fingerprints\">Links<"),
+        "links tab"
+    );
     let anon = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -2651,4 +2729,225 @@ async fn a_decoy_renders_the_same_after_adoption() {
         .unwrap()
         .unwrap();
     assert_eq!(again.body, body);
+}
+
+/// The admin subnav has seven tabs; Fingerprints and Canaries sit under
+/// Links, intel status under System.
+#[tokio::test]
+async fn admin_nav_groups_pages_under_seven_tabs() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store, cfg).await;
+    let get = |p: &str| {
+        let (c, u) = (client.clone(), format!("{base}{p}"));
+        async move {
+            let r = c.get(u).send().await.unwrap();
+            assert_eq!(r.status(), 200);
+            r.text().await.unwrap()
+        }
+    };
+    let nav = |html: &str| {
+        html.split("aria-label=\"Admin sections\"")
+            .nth(1)
+            .expect("admin subnav")
+            .split("</nav>")
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let current = |html: &str| {
+        nav(html)
+            .split("aria-current=\"true\">")
+            .nth(1)
+            .map(|s| s.split('<').next().unwrap().to_string())
+    };
+    let home = get("/admin").await;
+    let n = nav(&home);
+    for want in [
+        ">Overview<",
+        ">Analytics<",
+        ">Scans<",
+        ">Links<",
+        ">Inbox<",
+        ">Cluster<",
+        ">System<",
+    ] {
+        assert!(n.contains(want), "nav lacks {want}");
+    }
+    for gone in [
+        ">Queue<",
+        ">Fingerprints<",
+        ">Canaries<",
+        ">Lookup<",
+        ">Export<",
+        ">Keys<",
+    ] {
+        assert!(!n.contains(gone), "nav still has {gone}");
+    }
+    let fp = get("/admin/fingerprints").await;
+    assert_eq!(current(&fp).as_deref(), Some("Links"));
+    assert!(
+        fp.contains("aria-label=\"Links pages\""),
+        "named sub-tab nav"
+    );
+    let css = get("/assets/app.css").await;
+    for rule in [".subtabs", ".topbar-search", "a.tile", ".attention-list"] {
+        assert!(css.contains(rule), "app.css lacks {rule}");
+    }
+    let scans = get("/admin/scans").await;
+    let live = scans
+        .split("<table data-queue")
+        .nth(1)
+        .unwrap()
+        .split("</thead>")
+        .next()
+        .unwrap();
+    assert!(
+        live.contains("<th>Started</th>") && !live.contains("<th>Error</th>"),
+        "live queue columns: {live}"
+    );
+    assert!(fp.contains("href=\"/admin/canaries\""), "links sub-tabs");
+    assert_eq!(
+        current(&get("/admin/canaries").await).as_deref(),
+        Some("Links")
+    );
+    let sys = get("/admin/system").await;
+    assert_eq!(current(&sys).as_deref(), Some("System"));
+    assert!(sys.contains("Tor exit list") && sys.contains("MaxMind GeoLite2"));
+    assert!(sys.contains("built in"), "this binary's rules");
+}
+
+/// Moved admin pages answer 308 to their new place, without a session
+/// (the redirect reveals nothing).
+#[tokio::test]
+async fn moved_admin_pages_redirect_permanently() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let base = spawn_admin_with(store, dir.path()).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    for (from, to) in [
+        ("/admin/keys", "/admin/system/keys"),
+        ("/admin/export", "/admin/system/export"),
+        ("/admin/queue", "/admin/scans"),
+        (
+            "/admin/queue?status=failed",
+            "/admin/scans?status=failed#history",
+        ),
+        ("/admin/queue?status=queued", "/admin/scans"),
+        (
+            "/admin/queue?status=failed&level=3&page=2",
+            "/admin/scans?status=failed&level=3&page=2#history",
+        ),
+    ] {
+        let r = client.get(format!("{base}{from}")).send().await.unwrap();
+        assert_eq!(r.status(), 308, "{from}");
+        assert_eq!(r.headers()["location"], to, "{from}");
+    }
+}
+
+/// Signed in, every page has the Lookup box; anonymous visitors don't.
+#[tokio::test]
+async fn lookup_box_only_for_admins() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store, cfg).await;
+    for p in [
+        "/admin",
+        "/ips",
+        "/admin/system/settings",
+        "/admin/system/keys",
+        "/admin/system/export",
+    ] {
+        let r = client.get(format!("{base}{p}")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{p}");
+        let html = r.text().await.unwrap();
+        assert!(html.contains("action=\"/admin/lookup\""), "{p}");
+    }
+    let anon = reqwest::Client::new()
+        .get(format!("{base}/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!anon.contains("action=\"/admin/lookup\""));
+}
+
+/// A standalone node has no Access page and no node pages.
+#[tokio::test]
+async fn standalone_cluster_page_has_no_access() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store, cfg).await;
+    let html = client
+        .get(format!("{base}/admin/cluster"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("Standalone") && !html.contains("/admin/cluster/access"));
+    for p in [
+        "/admin/cluster/access".to_string(),
+        format!("/admin/cluster/node/{}", "00".repeat(32)),
+    ] {
+        let r = client.get(format!("{base}{p}")).send().await.unwrap();
+        assert_eq!(r.status(), 404, "{p}");
+    }
+}
+
+/// History pages link to the Scans page itself, also from the page a pace
+/// error re-renders under the form's URL.
+#[tokio::test]
+async fn scans_history_pages_link_back_to_scans() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let ip = store
+        .upsert_ip("203.0.113.91".parse().unwrap())
+        .await
+        .unwrap();
+    for _ in 0..101 {
+        sqlx::query(
+            "INSERT INTO scan_jobs (ip_id, level, status, queued_at, finished_at, error)
+             VALUES (?, 1, 'failed', datetime('now'), datetime('now'), 'x')",
+        )
+        .bind(ip.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store, cfg).await;
+    let bad = client
+        .post(format!("{base}/admin/queue/pace"))
+        .form(&[("max_workers", "x"), ("max_scans_per_hour", "90")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let html = bad.text().await.unwrap();
+    assert!(
+        html.contains("href=\"/admin/scans?page=2#history\""),
+        "absolute next link"
+    );
+    let html = client
+        .get(format!("{base}/admin/scans?status=failed&level=1"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let next = html
+        .split("page=2#history")
+        .next()
+        .and_then(|h| h.rsplit("href=\"").next())
+        .unwrap_or_default();
+    assert!(
+        html.contains("href=\"/admin/scans?status=failed&#38;level=1&#38;page=2#history\""),
+        "filters carried: {next}"
+    );
 }

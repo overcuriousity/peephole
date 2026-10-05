@@ -3,13 +3,17 @@ pub mod auth;
 pub mod blocklist;
 pub mod cli;
 pub mod cluster;
+pub mod cluster_access;
 pub mod countries;
 pub mod error;
 pub mod limit;
 pub mod lookup;
+pub mod overview;
 pub mod pages;
 pub mod public;
+pub mod scans;
 pub mod sse;
+pub mod system;
 pub mod views;
 
 use crate::config::Config;
@@ -32,11 +36,11 @@ pub struct AdminState {
     pub closing: Option<tokio::sync::watch::Receiver<bool>>,
     /// Per-client rate limits (public pages, sign-in ceremonies).
     pub limits: limit::Limits,
-    /// This node's enrichment providers (their budgets on the cluster page).
+    /// This node's enrichment providers (their budgets on System › Status).
     pub providers: crate::intel::Providers,
     /// Addresses the blocklist feed must leave out (members, own networks).
     pub safety: tokio::sync::Mutex<crate::scan::safety::Safety>,
-    /// How members' requests compare with this node's rules (Cluster page).
+    /// How members' requests compare with this node's rules (Cluster pages).
     pub rules_check: crate::store::stats::SwrCache<(), cluster::RulesCheck>,
 }
 
@@ -118,8 +122,12 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(assets::router())
         .merge(auth::auth_routes())
         .merge(pages::routes())
+        .merge(system::routes())
+        .merge(scans::routes())
+        .merge(overview::routes())
         .merge(lookup::routes())
         .merge(cluster::routes())
+        .merge(cluster_access::routes())
         .fallback(error::not_found)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

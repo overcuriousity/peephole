@@ -4,7 +4,6 @@ use super::Store;
 use super::browse::{PAGE_SIZE, Page, offset};
 use super::recorder::Recorder;
 use super::requests::RequestRow;
-use crate::events::QueueJob;
 use anyhow::Result;
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -53,6 +52,32 @@ pub struct FpClaimRow {
     pub ip: String,
     pub contact_email: Option<String>,
     pub user_agent: String,
+}
+
+/// Job states that end a job; the history filter offers these.
+pub const FINISHED_STATUSES: [&str; 4] = ["done", "failed", "superseded", "refused"];
+
+/// Scan history filter. A status that is not finished is ignored.
+#[derive(Debug, Clone, Default)]
+pub struct JobFilter {
+    pub status: Option<String>,
+    pub level: Option<i64>,
+}
+
+/// One finished job, with its scan when it produced one.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct HistoryRow {
+    pub id: i64,
+    pub ip: String,
+    pub level: i64,
+    pub status: String,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+    pub scanner: Option<String>,
+    pub arbiter: Option<String>,
+    pub scan_id: Option<i64>,
+    pub os_guess: Option<String>,
+    pub open_ports: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -190,6 +215,45 @@ impl Store {
             .fetch_all(&self.read)
             .await?;
         Ok(Page::from_rows(rows, page))
+    }
+
+    /// Finished jobs, newest first, one page.
+    pub async fn job_history(&self, f: &JobFilter, page: u32) -> Result<Page<HistoryRow>> {
+        let page = page.max(1);
+        let status = f
+            .status
+            .as_deref()
+            .filter(|s| FINISHED_STATUSES.contains(s));
+        let mut sql = String::from(
+            "SELECT j.id, i.ip, j.level, j.status, j.finished_at, j.error,
+                    (SELECT name FROM members m WHERE m.id = j.scanner) AS scanner,
+                    (SELECT name FROM members m WHERE m.id = j.arbiter) AS arbiter,
+                    s.id AS scan_id, s.os_guess,
+                    (SELECT COUNT(*) FROM ports p
+                      WHERE s.id IS NOT NULL AND p.scan_id = s.id AND p.state = 'open') AS open_ports
+             FROM scan_jobs j JOIN ips i ON j.ip_id = i.id
+             LEFT JOIN scans s ON s.id = (SELECT MAX(x.id) FROM scans x WHERE x.job_id = j.id)
+             WHERE j.status IN ('done', 'failed', 'superseded', 'refused')",
+        );
+        if status.is_some() {
+            sql.push_str(" AND j.status = ?");
+        }
+        if f.level.is_some() {
+            sql.push_str(" AND j.level = ?");
+        }
+        sql.push_str(&format!(
+            " ORDER BY j.id DESC LIMIT {} OFFSET {}",
+            PAGE_SIZE + 1,
+            offset(page)
+        ));
+        let mut q = sqlx::query_as::<_, HistoryRow>(sqlx::AssertSqlSafe(sql.as_str()));
+        if let Some(s) = status {
+            q = q.bind(s);
+        }
+        if let Some(l) = f.level {
+            q = q.bind(l);
+        }
+        Ok(Page::from_rows(q.fetch_all(&self.read).await?, page))
     }
 
     pub async fn scan_by_id(&self, id: i64) -> Result<Option<ScanSummary>> {
@@ -397,16 +461,6 @@ impl Store {
         })
     }
 
-    pub async fn recent_failed_jobs(&self, limit: i64) -> Result<Vec<QueueJob>> {
-        Ok(sqlx::query_as::<_, QueueJob>(sqlx::AssertSqlSafe(format!(
-            "{} WHERE j.status = 'failed' ORDER BY j.id DESC LIMIT ?",
-            super::scans::QUEUE_JOB_SQL
-        )))
-        .bind(limit)
-        .fetch_all(&self.read)
-        .await?)
-    }
-
     pub async fn request_detail(&self, id: i64) -> Result<Option<RequestDetail>> {
         let Some(row) = self.request_by_id(id).await? else {
             return Ok(None);
@@ -610,6 +664,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_jobs_leave_finished_ones_out() {
+        let (s, _) = seeded().await;
+        for ip in ["203.0.113.10", "203.0.113.11"] {
+            let id = s.upsert_ip(ip.parse().unwrap()).await.unwrap().id;
+            s.enqueue_scan(id, 1, 24).await.unwrap();
+        }
+        let two = s.active_jobs(2).await.unwrap();
+        assert_eq!(two.len(), 2, "the two finished jobs take no rows");
+        assert!(two.iter().all(|j| j.status == "queued"));
+        assert_eq!(s.active_jobs(10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn job_history_filters_and_links_scans() {
+        let (s, _) = seeded().await;
+        let all = s.job_history(&JobFilter::default(), 1).await.unwrap();
+        assert_eq!(all.items.len(), 2);
+        let done = all.items.iter().find(|r| r.status == "done").unwrap();
+        assert!(done.scan_id.is_some(), "a done job links to its scan");
+        assert_eq!(done.open_ports, 1);
+        assert_eq!(done.os_guess.as_deref(), Some("Linux 5"));
+        let failed = s
+            .job_history(
+                &JobFilter {
+                    status: Some("failed".into()),
+                    level: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.items.len(), 1);
+        assert_eq!(failed.items[0].error.as_deref(), Some("timeout"));
+        assert!(failed.items[0].scan_id.is_none());
+        let l3 = s
+            .job_history(
+                &JobFilter {
+                    status: None,
+                    level: Some(3),
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(l3.items.len(), 1);
+        // Not a finished status: ignored, never an active job.
+        let s2 = s
+            .upsert_ip("203.0.113.12".parse().unwrap())
+            .await
+            .unwrap()
+            .id;
+        s.enqueue_scan(s2, 1, 24).await.unwrap();
+        for bogus in ["queued", "running", "x' OR 1=1 --"] {
+            let r = s
+                .job_history(
+                    &JobFilter {
+                        status: Some(bogus.into()),
+                        level: None,
+                    },
+                    1,
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.items.len(), 2, "{bogus}");
+        }
+    }
+
+    #[tokio::test]
     async fn queue_summary_failed_jobs_and_request_detail() {
         let (s, a) = seeded().await;
         let q = s.queue_summary(&s.local()).await.unwrap();
@@ -617,9 +739,6 @@ mod tests {
         assert_eq!(q.failed_24h, 1);
         assert_eq!(q.queued, 0);
         assert_eq!(q.scans_last_hour, 2, "done + failed: both were launched");
-        let failed = s.recent_failed_jobs(10).await.unwrap();
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].error.as_deref(), Some("timeout"));
         let rid: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE ip_id = ?")
             .bind(a)
             .fetch_one(&s.pool)

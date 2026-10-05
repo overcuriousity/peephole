@@ -3,14 +3,14 @@
 Date: 2026-10-05 · Status: brainstormed, not designed. Each piece gets its own
 spec → plan → implementation cycle.
 
-The rework splits into five mostly independent pieces. A is done; this file
+The rework splits into five mostly independent pieces. A and B are done; this file
 keeps what was found and decided for the rest, so a new session can start
 from here.
 
 | # | Piece | Depends on | Status |
 |---|---|---|---|
 | A | Public privacy: delayed, jittered public surface, no live elements | — | done: `2026-10-05-public-delay-design.md` |
-| B | Admin information architecture: nav, Overview/Queue/Scans merge, Cluster cleanup | — | next |
+| B | Admin information architecture: nav, Overview/Queue/Scans merge, Cluster cleanup | — | done: `2026-10-05-admin-ia-design.md` |
 | C | Fingerprints + Canaries → one page about what links IPs | B (nav); shares filters with D | open |
 | D | Clickable analytics with filtered drill-downs | partly C | open |
 | E | Lookup → global search | B | open |

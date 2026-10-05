@@ -2,7 +2,8 @@
 {% block title %}peephole — fingerprints{% endblock %}
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
-{% let sub = "fingerprints" %}{% include "_admin_nav.html" %}
+{% let sub = "links" %}{% include "_admin_nav.html" %}
+{% let subtab = "fingerprints" %}{% let tabs = crate::admin::views::LINKS_TABS %}{% let tabs_label = "Links pages" %}{% include "_subtabs.html" %}
 <div class="page-head"><div><h1>Fingerprint clusters</h1><p class="muted">Browser fingerprints, SSH host keys and TLS certificates seen on more than one IP.</p></div></div>
 <div class="stack">
 {% if !clusters.is_empty() || !host_keys.is_empty() %}

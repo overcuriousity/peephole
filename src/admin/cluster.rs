@@ -21,13 +21,7 @@ use std::sync::Arc;
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/admin/cluster", get(page))
-        .route("/admin/cluster/invite", post(create_invite))
-        .route("/admin/cluster/invite/revoke", post(revoke_invite))
-        .route("/admin/cluster/join", post(join))
-        .route("/admin/cluster/leave", post(leave))
         .route("/admin/cluster/settings", post(set_own))
-        .route("/admin/cluster/config-key/rotate", post(rotate_key))
-        .route("/admin/cluster/config-key/add", post(add_key))
         .route("/admin/cluster/config-key/forget", post(forget_key))
         .route("/admin/cluster/node/{key}", get(node_page).post(node_set))
         .route("/admin/cluster/block", post(block))
@@ -37,6 +31,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
 }
 
 /// One member as the page shows it.
+#[derive(Default, Clone)]
 pub struct MemberView {
     pub key: String,
     pub short: String,
@@ -88,8 +83,32 @@ pub struct MemberView {
     pub ruleset_same: Option<bool>,
 }
 
+impl MemberView {
+    /// What needs a look, in words; empty when nothing does. The Members
+    /// table's badge and Overview's strip both read this.
+    pub fn issues(&self) -> Vec<String> {
+        let mut v = vec![];
+        if self.incompatible {
+            v.push("incompatible version".to_string());
+        }
+        if let Some(s) = &self.skew {
+            v.push(format!("clock {s}"));
+        }
+        if self.rules_differ {
+            v.push(format!("rules: {}", self.rules));
+        }
+        if self.ruleset_same == Some(false) {
+            v.push("records with other rules".to_string());
+        }
+        if let Some(e) = self.error.as_ref().filter(|_| !self.incompatible) {
+            v.push(e.clone());
+        }
+        v
+    }
+}
+
 /// Characters of a rules fingerprint shown.
-const SHORT_HASH: usize = 12;
+pub(crate) const SHORT_HASH: usize = 12;
 
 /// The rules fingerprints a member's newest classified requests carry
 /// (`requests.rules`): what the recording binary says it classified with.
@@ -155,7 +174,7 @@ pub const RULES_SAMPLE: i64 = 500;
 
 /// The comparison, made at most every [`RULES_CHECK_TTL`] (an older one is
 /// shown while it is made again), so the page stays fast.
-async fn rules_check(st: &AdminState, node: &Node) -> AppResult<Arc<RulesCheck>> {
+pub(crate) async fn rules_check(st: &AdminState, node: &Node) -> AppResult<Arc<RulesCheck>> {
     let store = node.store.clone();
     Ok(st
         .rules_check
@@ -211,26 +230,13 @@ pub struct IntelView {
 #[template(path = "admin_cluster.html")]
 struct ClusterPage {
     chrome: Chrome,
-    /// None: standalone node.
-    me: Option<MemberView>,
-    members: Vec<MemberView>,
-    intel: Vec<IntelView>,
+    /// This node first, then the other members.
+    rows: Vec<MemberView>,
+    standalone: bool,
     /// Why this node is out of its cluster, if it is.
     detached: Option<&'static str>,
-    invite: Option<String>,
-    invites: Vec<InviteView>,
-    /// This node's config key, shown only when remote configuration is on.
-    config_key: Option<String>,
-    remote_config: bool,
-    /// This node's runtime settings and why a role cannot be switched on.
-    settings: SettingsView,
-    audit: Vec<AuditView>,
     /// Members whose older history no reachable peer can give this node.
     unserved: Option<String>,
-    contributions: Vec<ContribView>,
-    /// The fingerprint of the rules built into this binary, and its start.
-    rules: &'static str,
-    rules_short: String,
 }
 
 /// This node's runtime settings as its own page shows them.
@@ -247,7 +253,7 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    fn of(st: &AdminState) -> Self {
+    pub(crate) fn of(st: &AdminState) -> Self {
         let s = st.settings.snapshot();
         let p = st.settings.prereqs();
         Self {
@@ -270,11 +276,30 @@ pub struct AuditView {
     pub changes: String,
 }
 
-/// The outcome shown on a remote node's page, which renders in place.
-#[derive(Default)]
-struct Flash {
-    notice: Option<String>,
-    error: Option<String>,
+/// Settings changes, newest first, with the changing node's name.
+pub(crate) async fn audit_views(st: &AdminState) -> AppResult<Vec<AuditView>> {
+    let names: std::collections::HashMap<NodeId, String> = match st.recorder.node() {
+        Some(node) => members::all(&node.store)
+            .await?
+            .into_iter()
+            .map(|m| (m.id, m.name))
+            .collect(),
+        None => Default::default(),
+    };
+    Ok(st
+        .settings
+        .audit(20)
+        .await?
+        .into_iter()
+        .map(|a| AuditView {
+            at: a.at,
+            by: match a.by {
+                Some(id) => names.get(&id).cloned().unwrap_or_else(|| id.short()),
+                None => "this node".into(),
+            },
+            changes: a.changes,
+        })
+        .collect())
 }
 
 fn ago(d: std::time::Duration) -> String {
@@ -286,11 +311,14 @@ fn ago(d: std::time::Duration) -> String {
     }
 }
 
-fn node(st: &AdminState) -> AppResult<&Arc<Node>> {
+pub(crate) fn node(st: &AdminState) -> AppResult<&Arc<Node>> {
     st.recorder.node().ok_or(AppError::NotFound)
 }
 
-async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<MemberView>)> {
+pub(crate) async fn views(
+    node: &Node,
+    check: &RulesCheck,
+) -> AppResult<(MemberView, Vec<MemberView>)> {
     let rows = members::all(&node.store).await?;
     let heads = repl::head_map(&repl::heads(&node.store).await?);
     let purged = crate::cluster::block::purged(&node.store).await?;
@@ -448,6 +476,25 @@ async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<Me
     Ok((mine, out))
 }
 
+/// This node (when it scans) and the active scanner members, for the
+/// Scans page's pace table. Empty on a standalone node.
+pub(crate) async fn scanner_rows(st: &AdminState) -> AppResult<Vec<MemberView>> {
+    let Some(node) = st.recorder.node() else {
+        return Ok(vec![]);
+    };
+    // The pace table reads no rules fields: skip the (possibly cold)
+    // comparison so the Scans page never waits on it.
+    let none = RulesCheck {
+        by_member: Default::default(),
+        carried: Default::default(),
+    };
+    let (me, members) = views(node, &none).await?;
+    Ok(std::iter::once(me)
+        .filter(|m| m.scanner)
+        .chain(members.into_iter().filter(|m| m.scanner && m.active))
+        .collect())
+}
+
 /// How much history this node keeps, and from when it holds it.
 async fn own_history(node: &Node) -> AppResult<String> {
     if !node.windowed() {
@@ -471,7 +518,7 @@ async fn own_history(node: &Node) -> AppResult<String> {
 }
 
 /// Origins whose history this node waits for, by name.
-async fn unserved(node: &Node) -> AppResult<Option<String>> {
+pub(crate) async fn unserved(node: &Node) -> AppResult<Option<String>> {
     let ids = node.unserved_origins();
     if ids.is_empty() {
         return Ok(None);
@@ -489,7 +536,7 @@ async fn unserved(node: &Node) -> AppResult<Option<String>> {
     ))
 }
 
-async fn intel(node: &Node) -> AppResult<Vec<IntelView>> {
+pub(crate) async fn intel(node: &Node) -> AppResult<Vec<IntelView>> {
     let names: std::collections::HashMap<NodeId, String> = members::all(&node.store)
         .await?
         .into_iter()
@@ -522,6 +569,8 @@ async fn intel(node: &Node) -> AppResult<Vec<IntelView>> {
 
 /// What one node contributed, as far as this node holds it.
 pub struct ContribView {
+    /// The member's key; empty for rows not shared yet.
+    pub key: String,
     pub name: String,
     pub short: String,
     pub requests: i64,
@@ -596,10 +645,11 @@ async fn contributions(node: &Node) -> AppResult<Vec<ContribView>> {
             .into_iter()
             .map(|(o, e, b)| (o, (e, b)))
             .collect();
-    let row = |key: &[u8], name: String, short: String| {
+    let row = |key: &[u8], name: String, short: String, id: String| {
         let get = |m: &Counts| m.get(key).copied().unwrap_or(0);
         let (log_entries, bytes) = usage.get(key).copied().unwrap_or((0, 0));
         ContribView {
+            key: id,
             name,
             short,
             requests: get(&requests),
@@ -622,11 +672,11 @@ async fn contributions(node: &Node) -> AppResult<Vec<ContribView>> {
             } else {
                 m.name
             };
-            row(&m.id.0[..], name, m.id.short())
+            row(&m.id.0[..], name, m.id.short(), m.id.to_string())
         })
         .collect();
     out.sort_by_key(|c| std::cmp::Reverse(c.requests));
-    let unshared = row(&[], "not shared yet".into(), String::new());
+    let unshared = row(&[], "not shared yet".into(), String::new(), String::new());
     if unshared.requests
         + unshared.skipped
         + unshared.fingerprints
@@ -652,7 +702,7 @@ pub struct InviteView {
     pub joined: String,
 }
 
-async fn invites(node: &Node) -> AppResult<Vec<InviteView>> {
+pub(crate) async fn invites(node: &Node) -> AppResult<Vec<InviteView>> {
     let names: std::collections::HashMap<NodeId, String> = members::all(&node.store)
         .await?
         .into_iter()
@@ -688,191 +738,56 @@ async fn invites(node: &Node) -> AppResult<Vec<InviteView>> {
         .collect())
 }
 
-async fn render_page(st: &AdminState, invite: Option<String>) -> AppResult<Html<String>> {
+async fn render_page(st: &AdminState) -> AppResult<Html<String>> {
     let Some(node) = st.recorder.node() else {
         return render(&ClusterPage {
             chrome: Chrome::new(true, "admin"),
-            me: None,
-            members: vec![],
-            intel: vec![],
+            rows: vec![],
+            standalone: true,
             detached: None,
-            invite: None,
-            invites: vec![],
-            config_key: None,
-            remote_config: false,
-            settings: SettingsView::of(st),
-            audit: vec![],
             unserved: None,
-            contributions: vec![],
-            rules: builtin_rules(),
-            rules_short: builtin_rules().chars().take(SHORT_HASH).collect(),
         });
-    };
-    let names: std::collections::HashMap<NodeId, String> = members::all(&node.store)
-        .await?
-        .into_iter()
-        .map(|m| (m.id, m.name))
-        .collect();
-    let audit = st
-        .settings
-        .audit(20)
-        .await?
-        .into_iter()
-        .map(|a| AuditView {
-            at: a.at,
-            by: match a.by {
-                Some(id) => names.get(&id).cloned().unwrap_or_else(|| id.short()),
-                None => "this node".into(),
-            },
-            changes: a.changes,
-        })
-        .collect();
-    let config_key = if node.cfg.remote_config {
-        Some(
-            crate::cluster::confkey::ensure(&node.store, node.id())
-                .await?
-                .encode(),
-        )
-    } else {
-        None
     };
     let check = rules_check(st, node).await?;
     let (me, members) = views(node, &check).await?;
     render(&ClusterPage {
         chrome: Chrome::new(true, "admin"),
+        rows: std::iter::once(me).chain(members).collect(),
+        standalone: false,
         detached: node.detached().map(|d| d.label()),
-        me: Some(me),
-        members,
-        intel: intel(node).await?,
-        invite,
-        invites: invites(node).await?,
-        config_key,
-        remote_config: node.cfg.remote_config,
-        settings: SettingsView::of(st),
-        audit,
         unserved: unserved(node).await?,
-        contributions: contributions(node).await?,
-        rules: builtin_rules(),
-        rules_short: builtin_rules().chars().take(SHORT_HASH).collect(),
     })
 }
 
 /// The fingerprint of the rules built into this binary.
-fn builtin_rules() -> &'static str {
+pub(crate) fn builtin_rules() -> &'static str {
     crate::classify::Classifier::builtin().fingerprint()
 }
 
 async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
-    render_page(&st, None).await
+    render_page(&st).await
 }
 
-/// Back to the cluster page with a one-shot notice or error (in a cookie,
-/// see [`redirect_with_notice`]).
-fn back(notice: Option<String>, error: Option<String>) -> Response {
-    const TO: &str = "/admin/cluster";
+/// Back to `to` with a one-shot notice or error (in a cookie, see
+/// [`redirect_with_notice`]).
+pub(crate) fn back_to(to: &str, notice: Option<String>, error: Option<String>) -> Response {
     match (error, notice) {
-        (Some(e), _) => redirect_with_error(TO, &e),
-        (None, Some(n)) => redirect_with_notice(TO, &n),
-        (None, None) => Redirect::to(TO).into_response(),
+        (Some(e), _) => redirect_with_error(to, &e),
+        (None, Some(n)) => redirect_with_notice(to, &n),
+        (None, None) => Redirect::to(to).into_response(),
     }
 }
 
-#[derive(serde::Deserialize)]
-struct InviteForm {
-    label: Option<String>,
-    ttl_hours: Option<String>,
-    max_uses: Option<String>,
-}
-
-/// Create an invite and show it once (never stored in clear).
-async fn create_invite(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Form(f): Form<InviteForm>,
-) -> AppResult<Response> {
-    let node = node(&st)?;
-    // Empty fields mean the defaults (a week, 10 uses); 0 means no limit.
-    let Ok((ttl_hours, max_uses)) =
-        invite::InviteOpts::parse_limits(f.ttl_hours.as_deref(), f.max_uses.as_deref())
-    else {
-        return Ok(back(
-            None,
-            Some("expiry and use limit must be numbers".into()),
-        ));
-    };
-    let opts = invite::InviteOpts {
-        label: f.label.unwrap_or_default(),
-        ttl_hours,
-        max_uses,
-    };
-    match invite::create(node, &opts).await {
-        Ok(token) => Ok(render_page(&st, Some(token)).await?.into_response()),
-        Err(e) => Ok(back(None, Some(format!("{e:#}")))),
-    }
+/// Back to the Members page.
+fn back(notice: Option<String>, error: Option<String>) -> Response {
+    back_to("/admin/cluster", notice, error)
 }
 
 #[derive(serde::Deserialize)]
-struct InviteRevokeForm {
-    id: i64,
-}
-
-async fn revoke_invite(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Form(f): Form<InviteRevokeForm>,
-) -> AppResult<Response> {
-    let node = node(&st)?;
-    Ok(if invite::revoke(&node.store, f.id).await? {
-        back(
-            Some("Invite revoked. Members that joined with it stay.".into()),
-            None,
-        )
-    } else {
-        back(None, Some("No usable invite with that id.".into()))
-    })
-}
-
-#[derive(serde::Deserialize)]
-struct JoinForm {
-    token: String,
-}
-
-async fn join(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Form(f): Form<JoinForm>,
-) -> AppResult<Response> {
-    let node = node(&st)?;
-    Ok(match invite::join(node, &f.token).await {
-        Ok(i) => back(
-            Some(format!(
-                "Joined the cluster via {}. Data now syncs.",
-                i.name
-            )),
-            None,
-        ),
-        Err(e) => back(None, Some(format!("Join failed: {e:#}"))),
-    })
-}
-
-async fn leave(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
-    let node = node(&st)?;
-    Ok(match crate::cluster::leave(node).await {
-        Ok(told) => back(
-            Some(format!(
-                "This node left the cluster ({told} peer(s) told). Its data stays here; it no longer syncs."
-            )),
-            None,
-        ),
-        Err(e) => back(None, Some(format!("Leaving failed: {e:#}"))),
-    })
-}
-
-#[derive(serde::Deserialize)]
-struct KeyForm {
-    key: String,
+pub(crate) struct KeyForm {
+    pub(crate) key: String,
     /// Block: also every node it admitted, transitively.
-    subtree: Option<String>,
+    pub(crate) subtree: Option<String>,
 }
 
 async fn block(
@@ -884,9 +799,11 @@ async fn block(
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
     };
+    let to = format!("/admin/cluster/node/{id}");
     if f.subtree.is_some() {
         return Ok(match crate::cluster::block::block_subtree(node, id).await {
-            Ok((ids, n)) => back(
+            Ok((ids, n)) => back_to(
+                &to,
                 Some(format!(
                     "Blocked {} and the {} node(s) it admitted, directly or not ({n} records taken out of view). Other nodes are unaffected.",
                     id.short(),
@@ -894,18 +811,19 @@ async fn block(
                 )),
                 None,
             ),
-            Err(e) => back(None, Some(format!("{e:#}"))),
+            Err(e) => back_to(&to, None, Some(format!("{e:#}"))),
         });
     }
     Ok(match crate::cluster::block::block(node, id).await {
-        Ok(n) => back(
+        Ok(n) => back_to(
+            &to,
             Some(format!(
                 "Blocked {}. This node no longer talks to it and shows none of its records ({n} taken out of view). Other nodes are unaffected.",
                 id.short()
             )),
             None,
         ),
-        Err(e) => back(None, Some(format!("{e:#}"))),
+        Err(e) => back_to(&to, None, Some(format!("{e:#}"))),
     })
 }
 
@@ -918,13 +836,15 @@ async fn unblock(
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
     };
+    let to = format!("/admin/cluster/node/{id}");
     Ok(if crate::cluster::block::unblock(node, id).await? {
-        back(
+        back_to(
+            &to,
             Some(format!("Unblocked {}. Its records are back.", id.short())),
             None,
         )
     } else {
-        back(None, Some("That node was not blocked.".into()))
+        back_to(&to, None, Some("That node was not blocked.".into()))
     })
 }
 
@@ -938,15 +858,17 @@ async fn purge(
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
     };
+    let to = format!("/admin/cluster/node/{id}");
     Ok(match crate::cluster::block::purge(node, id).await {
-        Ok(n) => back(
+        Ok(n) => back_to(
+            &to,
             Some(format!(
                 "Purged {}: {n} log entries deleted here. Its entries are no longer accepted or relayed; unblocking fetches them again.",
                 id.short()
             )),
             None,
         ),
-        Err(e) => back(None, Some(format!("{e:#}"))),
+        Err(e) => back_to(&to, None, Some(format!("{e:#}"))),
     })
 }
 
@@ -992,6 +914,9 @@ impl SettingsForm {
     }
 }
 
+/// Where this node's own settings form lives.
+const SETTINGS: &str = "/admin/system/settings";
+
 async fn set_own(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
@@ -999,55 +924,25 @@ async fn set_own(
 ) -> AppResult<Response> {
     let changes = match f.changes() {
         Ok(c) => c,
-        Err(e) => return Ok(back(None, Some(e))),
+        Err(e) => return Ok(back_to(SETTINGS, None, Some(e))),
     };
     // The form sends every role, so it must not overwrite a change made
     // elsewhere (CLI, a config key holder) after the page was loaded.
     let Some(base) = f.base_version else {
-        return Ok(back(
+        return Ok(back_to(
+            SETTINGS,
             None,
             Some("Settings not saved: reload the page and try again".into()),
         ));
     };
     Ok(match st.settings.apply_at(base, &changes, None).await? {
-        Ok(_) => back(
+        Ok(_) => back_to(
+            SETTINGS,
             Some("Settings saved. Roles switch within seconds.".into()),
             None,
         ),
-        Err(e) => back(None, Some(format!("Settings not saved: {e}"))),
+        Err(e) => back_to(SETTINGS, None, Some(format!("Settings not saved: {e}"))),
     })
-}
-
-async fn rotate_key(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
-    let node = node(&st)?;
-    if !node.cfg.remote_config {
-        return Ok(back(
-            None,
-            Some("Remote configuration is off on this node; there is no key to rotate.".into()),
-        ));
-    }
-    crate::cluster::confkey::rotate(&node.store, node.id()).await?;
-    Ok(back(
-        Some(
-            "Config key rotated. Everyone who held the old key can no longer configure this node."
-                .into(),
-        ),
-        None,
-    ))
-}
-
-async fn add_key(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Form(f): Form<KeyForm>,
-) -> AppResult<Response> {
-    let node = node(&st)?;
-    Ok(
-        match crate::cluster::confkey::add(&node.store, node.id(), &f.key).await {
-            Ok(id) => Redirect::to(&format!("/admin/cluster/node/{id}")).into_response(),
-            Err(e) => back(None, Some(format!("{e:#}"))),
-        },
-    )
 }
 
 async fn forget_key(
@@ -1060,76 +955,98 @@ async fn forget_key(
         return Ok(back(None, Some("unknown node".into())));
     };
     crate::cluster::confkey::forget(&node.store, &id).await?;
-    Ok(back(
+    Ok(back_to(
+        &format!("/admin/cluster/node/{id}"),
         Some(format!("Config key for {} forgotten.", id.short())),
         None,
     ))
+}
+
+/// The live part of a node page: its remote settings.
+enum Remote {
+    /// This node: settings live on System.
+    Own,
+    /// No config key held here: nothing asked.
+    NoKey,
+    /// Asked, and it answered.
+    Settings {
+        state: crate::cluster::confkey::State,
+        timeout_min: String,
+        rec: Option<(u32, i64, String)>,
+        has: (bool, bool, bool),
+    },
+    /// Asked; no answer.
+    Silent(String),
+    /// Key held, but the member is offline or blocked: not asked.
+    Offline,
 }
 
 #[derive(Template)]
 #[template(path = "admin_cluster_node.html")]
 struct NodePage {
     chrome: Chrome,
-    key: String,
-    name: String,
-    short: String,
-    /// None: the node did not answer.
-    state: Option<crate::cluster::confkey::State>,
-    timeout_min: String,
-    rec: Option<(u32, i64, String)>,
-    key_held: bool,
-    has: (bool, bool, bool),
-    notice: Option<String>,
-    error: Option<String>,
+    m: MemberView,
+    contrib: Vec<ContribView>,
+    remote: Remote,
 }
 
-async fn node_view(st: &AdminState, key: &str, flash: Flash) -> AppResult<Html<String>> {
+/// Whether a node page asks the member for its settings: only a live,
+/// unblocked member whose key is held here (an offline one would hold the
+/// page for the whole request timeout).
+fn asks_remote(m: &MemberView) -> bool {
+    !m.is_self && m.key_held && m.live && !m.blocked
+}
+
+async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
     let node = node(st)?;
     let Ok(id) = NodeId::parse(key) else {
         return Err(AppError::NotFound);
     };
-    let Some(m) = members::all(&node.store)
-        .await?
-        .into_iter()
-        .find(|m| m.id == id)
-    else {
+    let check = rules_check(st, node).await?;
+    let (me, members) = views(node, &check).await?;
+    let key = id.to_string();
+    let Some(m) = std::iter::once(me).chain(members).find(|m| m.key == key) else {
         return Err(AppError::NotFound);
     };
-    let (state, error) = match crate::cluster::confkey::get(node, id).await {
-        Ok(s) => (Some(s), flash.error),
-        Err(e) => (None, Some(format!("{} did not answer: {e:#}", m.name))),
-    };
-    let minutes = |secs: u64| {
-        if secs.is_multiple_of(60) {
-            (secs / 60).to_string()
-        } else {
-            format!("{:.1}", secs as f64 / 60.0)
+    let contrib = contributions(node)
+        .await?
+        .into_iter()
+        .filter(|c| c.key == m.key || (m.is_self && c.key.is_empty()))
+        .collect();
+    let remote = if m.is_self {
+        Remote::Own
+    } else if !m.key_held {
+        Remote::NoKey
+    } else if !asks_remote(&m) {
+        Remote::Offline
+    } else {
+        match crate::cluster::confkey::get(node, id).await {
+            Ok(s) => {
+                let minutes = |secs: u64| {
+                    if secs.is_multiple_of(60) {
+                        (secs / 60).to_string()
+                    } else {
+                        format!("{:.1}", secs as f64 / 60.0)
+                    }
+                };
+                let has = |r: &str| s.roles.iter().any(|x| x == r);
+                Remote::Settings {
+                    timeout_min: minutes(s.pace.timeout_secs),
+                    rec: s
+                        .recommended
+                        .map(|p| (p.max_workers, p.max_scans_per_hour, minutes(p.timeout_secs))),
+                    has: (has("listener"), has("scanner"), has("web")),
+                    state: s,
+                }
+            }
+            Err(e) => Remote::Silent(format!("{} did not answer: {e:#}", m.name)),
         }
     };
-    let has = |s: &crate::cluster::confkey::State, r: &str| s.roles.iter().any(|x| x == r);
     render(&NodePage {
         chrome: Chrome::new(true, "admin"),
-        key: id.to_string(),
-        name: m.name,
-        short: id.short(),
-        timeout_min: state
-            .as_ref()
-            .map(|s| minutes(s.pace.timeout_secs))
-            .unwrap_or_default(),
-        rec: state
-            .as_ref()
-            .and_then(|s| s.recommended)
-            .map(|p| (p.max_workers, p.max_scans_per_hour, minutes(p.timeout_secs))),
-        has: state
-            .as_ref()
-            .map(|s| (has(s, "listener"), has(s, "scanner"), has(s, "web")))
-            .unwrap_or_default(),
-        key_held: crate::cluster::confkey::held(&node.store)
-            .await?
-            .contains(&id),
-        state,
-        notice: flash.notice,
-        error,
+        m,
+        contrib,
+        remote,
     })
 }
 
@@ -1138,7 +1055,7 @@ async fn node_page(
     State(st): State<Arc<AdminState>>,
     axum::extract::Path(key): axum::extract::Path<String>,
 ) -> AppResult<Html<String>> {
-    node_view(&st, &key, Flash::default()).await
+    node_view(&st, &key).await
 }
 
 async fn node_set(
@@ -1146,36 +1063,26 @@ async fn node_set(
     State(st): State<Arc<AdminState>>,
     axum::extract::Path(key): axum::extract::Path<String>,
     Form(f): Form<SettingsForm>,
-) -> AppResult<Html<String>> {
+) -> AppResult<Response> {
     let node = node(&st)?;
     let Ok(id) = NodeId::parse(&key) else {
         return Err(AppError::NotFound);
     };
-    let flash = match (f.changes(), f.base_version) {
-        (Err(e), _) => Flash {
-            notice: None,
-            error: Some(e),
-        },
-        (_, None) => Flash {
-            notice: None,
-            error: Some("reload the page and try again".into()),
-        },
+    let to = format!("/admin/cluster/node/{id}");
+    // Post/redirect/get: a reload of the page does not send the form again.
+    Ok(match (f.changes(), f.base_version) {
+        (Err(e), _) => back_to(&to, None, Some(e)),
+        (_, None) => back_to(&to, None, Some("reload the page and try again".into())),
         (Ok(c), Some(base)) => match crate::cluster::confkey::set(node, id, base, &c).await {
-            Ok(Ok(_)) => Flash {
-                notice: Some("Saved. Roles switch within seconds.".into()),
-                error: None,
-            },
-            Ok(Err(e)) => Flash {
-                notice: None,
-                error: Some(format!("Not saved: {e}")),
-            },
-            Err(e) => Flash {
-                notice: None,
-                error: Some(format!("Not saved: {e:#}")),
-            },
+            Ok(Ok(_)) => back_to(
+                &to,
+                Some("Saved. Roles switch within seconds.".into()),
+                None,
+            ),
+            Ok(Err(e)) => back_to(&to, None, Some(format!("Not saved: {e}"))),
+            Err(e) => back_to(&to, None, Some(format!("Not saved: {e:#}"))),
         },
-    };
-    node_view(&st, &key, flash).await
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -1186,6 +1093,9 @@ struct PaceForm {
     timeout_minutes: String,
 }
 
+/// Where the scanner pace table lives.
+const SCANNERS: &str = "/admin/scans#scanners";
+
 async fn set_pace(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
@@ -1193,12 +1103,13 @@ async fn set_pace(
 ) -> AppResult<Response> {
     let node = node(&st)?;
     let Ok(id) = NodeId::parse(&f.key) else {
-        return Ok(back(None, Some("unknown node".into())));
+        return Ok(back_to(SCANNERS, None, Some("unknown node".into())));
     };
     // Other nodes are changed from their own page, which carries the
     // settings version it showed (a change made meanwhile is refused).
     if id != node.id() {
-        return Ok(back(
+        return Ok(back_to(
+            SCANNERS,
             None,
             Some(format!(
                 "Change {}'s pace from its page: /admin/cluster/node/{}",
@@ -1213,10 +1124,18 @@ async fn set_pace(
         f.timeout_minutes.trim().parse::<f64>(),
     );
     let (Ok(w), Ok(h), Ok(t)) = parsed else {
-        return Ok(back(None, Some("pace values must be numbers".into())));
+        return Ok(back_to(
+            SCANNERS,
+            None,
+            Some("pace values must be numbers".into()),
+        ));
     };
     if !t.is_finite() || t <= 0.0 {
-        return Ok(back(None, Some("timeout must be positive".into())));
+        return Ok(back_to(
+            SCANNERS,
+            None,
+            Some("timeout must be positive".into()),
+        ));
     }
     let timeout_secs = (t * 60.0).round() as u64;
     let outcome = st
@@ -1241,8 +1160,12 @@ async fn set_pace(
         node.publish_status();
     }
     Ok(match outcome {
-        Ok(()) => back(Some(format!("Pace of {} saved.", id.short())), None),
-        Err(e) => back(None, Some(format!("Pace not saved: {e}"))),
+        Ok(()) => back_to(
+            SCANNERS,
+            Some(format!("Pace of {} saved.", id.short())),
+            None,
+        ),
+        Err(e) => back_to(SCANNERS, None, Some(format!("Pace not saved: {e}"))),
     })
 }
 
@@ -1304,6 +1227,69 @@ mod tests {
     }
 
     #[test]
+    fn only_a_live_member_whose_key_is_held_is_asked() {
+        let held = MemberView {
+            key_held: true,
+            live: true,
+            active: true,
+            ..Default::default()
+        };
+        assert!(asks_remote(&held));
+        for m in [
+            MemberView {
+                live: false,
+                ..held.clone()
+            },
+            MemberView {
+                blocked: true,
+                ..held.clone()
+            },
+            MemberView {
+                key_held: false,
+                ..held.clone()
+            },
+            MemberView {
+                is_self: true,
+                ..held.clone()
+            },
+        ] {
+            assert!(!asks_remote(&m));
+        }
+    }
+
+    #[test]
+    fn issues_list_what_needs_a_look() {
+        let ok = MemberView {
+            ruleset_same: Some(true),
+            ..Default::default()
+        };
+        assert!(ok.issues().is_empty());
+        let bad = MemberView {
+            incompatible: true,
+            error: Some("incompatible protocol 3".into()),
+            skew: Some("+3.5 min".into()),
+            rules_differ: true,
+            rules: "disagree on 12% of 500".into(),
+            ruleset_same: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            bad.issues(),
+            [
+                "incompatible version",
+                "clock +3.5 min",
+                "rules: disagree on 12% of 500",
+                "records with other rules",
+            ]
+        );
+        let err = MemberView {
+            error: Some("connection refused".into()),
+            ..Default::default()
+        };
+        assert_eq!(err.issues(), ["connection refused"]);
+    }
+
+    #[test]
     fn outcomes_travel_in_a_cookie_not_the_url() {
         let cookie = |r: &Response| {
             r.headers()[axum::http::header::SET_COOKIE]
@@ -1317,5 +1303,14 @@ mod tests {
         let r = back(None, Some("Join failed".into()));
         assert_eq!(r.headers()[axum::http::header::LOCATION], "/admin/cluster");
         assert!(cookie(&r).starts_with("peephole_flash_error=Join+failed"));
+        let r = back_to(
+            "/admin/cluster/access",
+            Some("Invite revoked.".into()),
+            None,
+        );
+        assert_eq!(
+            r.headers()[axum::http::header::LOCATION],
+            "/admin/cluster/access"
+        );
     }
 }

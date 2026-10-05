@@ -163,3 +163,20 @@ td.check input, th.check input { margin: 0; vertical-align: middle; accent-color
   .filters label:has(input[name="q"]), .filters label:has(input[name="path"]) { flex-basis: 100%; }
   .filters .btn { flex: 1 1 100%; justify-content: center; }
 }
+
+/* Second-level tabs under the admin nav. */
+.subnav.subtabs { margin-top: -0.75rem; }
+.subnav.subtabs a { padding: 0.2rem 0.6rem; }
+
+/* Lookup box in the top bar (signed-in admins). */
+.topbar-search input { width: 11rem; padding: 0.25rem 0.5rem; font-size: var(--text-xs); }
+@media (max-width: 640px) { .topbar-search { display: none; } }
+
+/* Overview: tiles that link through, and the needs-attention list. */
+a.tile { display: block; color: inherit; }
+a.tile:hover { text-decoration: none; border-color: var(--color-border-strong); }
+a.tile .hint { color: var(--color-accent); }
+.attention { border-left: 3px solid var(--color-warning); }
+.attention-list { margin: 0; padding-left: 1.1rem; }
+.attention-list li + li { margin-top: 0.25rem; }
+.attention-list li[data-level="warn"]::marker { color: var(--color-warning); }

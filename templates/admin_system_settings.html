@@ -1,0 +1,18 @@
+{% extends "layout.html" %}
+{% block title %}peephole — settings{% endblock %}
+{% block content %}
+{% let sub = "system" %}{% include "_admin_nav.html" %}
+{% let subtab = "settings" %}{% let tabs = crate::admin::views::SYSTEM_TABS %}{% let tabs_label = "System pages" %}{% include "_subtabs.html" %}
+<div class="page-head"><div><h1>Settings</h1><p class="muted">This node's runtime settings. Scan pace is on <a href="/admin/scans#pace">Scans</a>.</p></div></div>
+<div class="stack">
+<section class="card"><h2>Cooldown and roles</h2>
+{% include "_node_settings.html" %}
+</section>
+{% if !audit.is_empty() %}
+<section class="card"><h2>Changes</h2>
+  <div class="table-wrap"><table><thead><tr><th>When (UTC)</th><th>By</th><th>Change</th></tr></thead>
+    <tbody>{% for a in audit %}<tr><td class="ts">{{ a.at }}</td><td>{{ a.by }}</td><td class="mono">{{ a.changes }}</td></tr>{% endfor %}</tbody></table></div>
+</section>
+{% endif %}
+</div>
+{% endblock %}

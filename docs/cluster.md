@@ -50,7 +50,7 @@ be listed under `[[cluster.peers]]` with their key.
 - **Blocking is local.** A node that blocks a peer stops talking to it and
   shows none of its records. It still stores and relays them, so other
   nodes are unaffected. `--subtree` (or "Block with all it admitted" on
-  the Cluster page) also blocks every node it admitted. Purging a blocked
+  the member's page under Cluster) also blocks every node it admitted. Purging a blocked
   peer deletes what this node holds of it and stops relaying it.
 - **Each node judges for itself.** Timestamps from the future count as of
   receipt; scan jobs must name a public address and a known level, at most
@@ -63,15 +63,15 @@ be listed under `[[cluster.peers]]` with their key.
   no delete: the records belong to the cluster. Retention (`retention_days`)
   still prunes, and `peephole cluster purge` removes a blocked peer's data.
 - **The dataset is persistent.** What a node contributed stays when it
-  leaves or is pruned. By default every node keeps the whole history. The
-  Cluster page counts, per member, the requests, fingerprints, scans and
+  leaves or is pruned. By default every node keeps the whole history. Each
+  member's page (Cluster › the member) counts the requests, fingerprints, scans and
   lookups this node holds from it; the dataset export has the records.
 - **A node may keep only a window.** With `retention_days = N` (top level,
   at least 7) a node keeps the last N days, like a pruned Bitcoin node: daily
   it drops older records *and* their log entries on this node only (no
   deletes reach other nodes), keeps the newest entry of every member and all
   membership entries, and serves only what it holds. Its heartbeat tells the
-  others where its history starts ("keeps N days" on the Cluster page), so
+  others where its history starts ("keeps N days" on its page under Cluster), so
   nobody asks it for more. A node joining with a window fetches only that
   window, from any member; a node keeping everything fetches the old history
   from members that keep everything, and waits ("History incomplete: waiting
@@ -81,11 +81,12 @@ be listed under `[[cluster.peers]]` with their key.
 ## Changing another node's settings
 
 - A node's scan pace, rescan cooldown and roles are runtime settings. Its
-  own admin (Cluster page, or `peephole settings set|reset|show`) can always
+  own admin (System › Settings and Scans for the pace, or
+  `peephole settings set|reset|show`) can always
   change them, and roles switch without a restart.
 - With `remote_config = true` under `[cluster]`, the node has a **config
   key** (`peephole cluster config-key show`). Whoever holds it can change
-  those settings from their own node: paste the key on their Cluster page,
+  those settings from their own node: paste the key on their Cluster › Access page,
   or `peephole cluster config-key add <key>`.
 - `peephole cluster config-key rotate` replaces the key and withdraws the
   permission from everyone at once. The node lists who changed what.
@@ -112,7 +113,7 @@ be listed under `[[cluster.peers]]` with their key.
   scanner) is rebuilt from every row the scanner holds that the recording
   trap can have counted (see below), so the level can come out lower when
   rows are missing here, never above the stored level.
-- The Members table on the Cluster page shows, per member, how its newest
+- Each member's page under Cluster shows how its newest
   500 requests compare with this node's rules ("rules agree 100%",
   "disagree on 12% of 500"): the share whose labels or severity come out
   differently when classified again here. Only the IP's history (requests
@@ -141,8 +142,8 @@ be listed under `[[cluster.peers]]` with their key.
 - **Rules fingerprints.** The signature rules are built into the binary, so
   nodes of one build classify alike. Every request carries the fingerprint
   of the rules that classified it (`rules`, a SHA-256 over the rules files)
-  and the build that recorded it (`build`). The Cluster page shows our own
-  fingerprint and, per member, the one its newest requests carry ("same as
+  and the build that recorded it (`build`). System › Status shows our own
+  fingerprint and each member's page the one its newest requests carry ("same as
   ours" or "differs", with a count when they carry more than one, as after
   an upgrade); a request's page shows its fingerprint. What is checked and
   what is only declared:
@@ -175,7 +176,7 @@ be listed under `[[cluster.peers]]` with their key.
   the whole cluster's requests and never lists a member's addresses
   (published ones, and the ones members connect from).
 - Run NTP on every node: cooldowns and the 30-day prune compare timestamps
-  written by different nodes. The Cluster page flags clock differences.
+  written by different nodes. The Members table's Issues column flags clock differences.
   Entries dated more than 5 minutes ahead of a node's clock wait there
   until it catches up, and a node's entries must be dated later than its
   previous one; older ones are kept in the log but take no effect.

@@ -2,152 +2,32 @@
 {% block title %}peephole — cluster{% endblock %}
 {% block content %}
 {% let sub = "cluster" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Cluster</h1><p class="muted">Node names never appear on public pages.</p></div></div>
-{% match me %}
-{% when None %}
-<div class="stack">
+{% if standalone %}
+<div class="page-head"><div><h1>Cluster</h1></div></div>
 <section class="card"><h2>Standalone</h2>
-  <p>To join, add a <code>[cluster]</code> section to <code>config.toml</code> and restart.</p></section>
-<section class="card"><h2>Runtime settings</h2>
-{% include "_node_settings.html" %}
-<p class="muted">Scan pace: <a href="/admin/queue">Queue</a>.</p></section>
-</div>
-{% when Some(me) %}
-<div class="stack">
+  <p>To join, add a <code>[cluster]</code> section to <code>config.toml</code> and restart. See <a href="https://github.com/overcuriousity/peephole/blob/master/docs/cluster.md">docs/cluster.md</a>.</p>
+  <p class="muted">Cooldown and roles: <a href="/admin/system/settings">System › Settings</a>. Scan pace: <a href="/admin/scans#pace">Scans</a>.</p></section>
+{% else %}
+{% let subtab = "members" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
+<div class="page-head"><div><h1>Cluster</h1><p class="muted">Node names never appear on public pages.</p></div></div>
 {% if let Some(d) = detached %}<div class="banner banner-warning">{{ d }}</div>{% endif %}
 {% if let Some(u) = unserved %}<div class="banner banner-warning">History incomplete for {{ u }}: waiting for a full member.</div>{% endif %}
 <section class="card">
-  <div class="card-head"><h2>This node · {{ me.name }}</h2><span class="muted mono">{{ me.short }}</span>
-    {% if detached.is_none() %}<button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-leave">Leave cluster</button>
-    <dialog id="dlg-leave"><h3>Leave the cluster?</h3><p class="muted">Syncing stops; all data stays. Rejoining needs an invite.</p>
-      <form method="post" action="/admin/cluster/leave" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Leave</button></form></dialog>{% endif %}</div>
-  <dl class="kv">
-    <dt>Key</dt><dd class="mono break">{{ me.key }}{% let value = me.key.as_str() %}{% let what = "node key" %}{% let subtle = false %}{% include "_copy.html" %}</dd>
-    <dt>Roles</dt><dd>{{ me.roles }}</dd>
-    <dt>Address</dt><dd class="mono">{{ me.address }}</dd>
-    <dt>Version</dt><dd class="mono">{{ me.version }}</dd>
-    <dt>Rules</dt><dd><span class="mono" title="Fingerprint of the rules built into this binary: {{ rules }}">{{ rules_short }}</span> <span class="muted small">built in</span></dd>
-    <dt>History</dt><dd>{{ me.history }}</dd>
-  </dl>
-  {% include "_node_settings.html" %}
-  {% if remote_config %}
-  <h3>Config key</h3>
-  <p class="muted">Lets its holders change this node's pace, cooldown and roles. Rotate to revoke.</p>
-  {% if let Some(k) = config_key %}<details><summary>Show key</summary><pre class="panel mono break" data-copy>{{ k }}</pre></details>{% endif %}
-  <form method="post" action="/admin/cluster/config-key/rotate"><button class="btn btn-sm btn-danger" type="submit">Rotate key</button></form>
-  {% if !audit.is_empty() %}
-  <div class="table-wrap"><table><thead><tr><th>When (UTC)</th><th>By</th><th>Change</th></tr></thead>
-    <tbody>{% for a in audit %}<tr><td class="ts">{{ a.at }}</td><td>{{ a.by }}</td><td class="mono">{{ a.changes }}</td></tr>{% endfor %}</tbody></table></div>
-  {% endif %}
-  {% else %}
-  <p class="muted">Remote configuration: <b>locked</b> (<code>remote_config = true</code> opens it).</p>
-  {% endif %}
-</section>
-{% if let Some(t) = invite %}
-<section class="card"><h2>Invite</h2>
-  <p>Shown once. Use with <code>peephole cluster join</code> or on the new node's Cluster page.</p>
-  <pre class="panel mono break" data-copy>{{ t }}</pre></section>
-{% endif %}
-<section class="card">
-  <div class="card-head"><h2>Members</h2></div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Node</th><th>Roles</th><th>Address</th><th>Seen</th><th>Version</th><th title="The rules fingerprint its newest requests carry, and those requests classified again with this node's rules">Rules</th><th>History</th><th>Replication</th><th>Scans</th><th>Settings</th><th></th></tr></thead>
+    <thead><tr><th>Node</th><th>Status</th><th>Seen</th><th>Lag</th><th>Issues</th></tr></thead>
     <tbody>
-    {% for m in members %}
+    {% for m in rows %}
       <tr{% if !m.active %} class="muted"{% endif %}>
-        <td><b>{{ m.name }}</b> <span class="mono muted">{{ m.short }}</span>{% if !m.active %} <span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% endif %}{% if m.blocked %} <span class="badge badge-status" data-status="failed">blocked</span>{% endif %}
-          {% if m.incompatible %}<br><span class="badge badge-status" data-status="failed">incompatible version</span>{% endif %}
-          {% if let Some(s) = m.skew %}<br><span class="badge badge-status" data-status="running" title="Run NTP on every node: scan cooldowns compare timestamps from different nodes.">clock {{ s }}</span>{% endif %}
-          {% if let Some(e) = m.error %}<br><span class="muted mono small">{{ e }}</span>{% endif %}</td>
-        <td>{{ m.roles }}{% if !m.providers.is_empty() %}<br><span class="muted small">looks up: {{ m.providers }}</span>{% endif %}</td>
-        <td class="mono">{{ m.address }}</td>
-        <td><span class="badge badge-status" data-status="{% if m.live %}done{% else %}queued{% endif %}">{{ m.last_seen }}</span></td>
-        <td class="mono">{{ m.version }}</td>
-        <td><span class="mono" title="The rules fingerprint its newest requests carry (its word: what it classifies with is checked below)">{{ m.ruleset }}</span>{% match m.ruleset_same %}{% when Some(true) %} <span class="muted small">same as ours</span>{% when Some(false) %} <span class="badge badge-status" data-status="queued">differs</span>{% when None %}{% endmatch %}
-          <br>{% if m.rules_differ %}<span class="badge badge-status" data-status="failed" title="Its newest requests classified again with our rules. Which ones differ, and why: peephole cluster agreement {{ m.short }}">{{ m.rules }}</span>{% else %}<span class="muted small">{{ m.rules }}</span>{% endif %}</td>
-        <td>{{ m.history }}</td>
+        <td><a href="/admin/cluster/node/{{ m.key }}"><b>{{ m.name }}</b></a> <span class="mono muted">{{ m.short }}</span>{% if m.is_self %} <span class="muted small">this node</span>{% endif %}</td>
+        <td>{% if m.blocked %}<span class="badge badge-status" data-status="failed">{% if m.purged %}purged{% else %}blocked{% endif %}</span>{% else if !m.active %}<span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% else if m.live %}<span class="badge badge-status" data-status="done">live</span>{% else %}<span class="badge badge-status" data-status="queued">not seen</span>{% endif %}</td>
+        <td>{{ m.last_seen }}</td>
         <td>{{ m.lag }}</td>
-        <td>{% if m.scanner %}{{ m.active_scans }} running{% endif %}</td>
-        <td>{% if m.key_held %}<a class="btn btn-sm" href="/admin/cluster/node/{{ m.key }}">Configure</a>{% else if m.remote_config %}<span class="muted">open to key holders</span>{% else %}<span class="muted">locked</span>{% endif %}</td>
-        <td>{% if m.blocked %}
-          <form method="post" action="/admin/cluster/unblock"><input type="hidden" name="key" value="{{ m.key }}"><button class="btn btn-sm" type="submit">Unblock</button></form>
-          {% if m.purged %}<span class="muted small">purged</span>{% else %}
-          <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-purge-{{ loop.index }}">Purge</button>
-          <dialog id="dlg-purge-{{ loop.index }}"><h3>Purge {{ m.name }}?</h3><p class="muted">Deletes its data here and stops relaying it. Other nodes keep theirs.</p>
-            <form method="post" action="/admin/cluster/purge" class="actions"><input type="hidden" name="key" value="{{ m.key }}">
-              <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Purge</button></form></dialog>
-          {% endif %}
-        {% else %}
-          <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-block-{{ loop.index }}">Block</button>
-          <dialog id="dlg-block-{{ loop.index }}"><h3>Block {{ m.name }}?</h3><p class="muted">Hides it and its records here only. Reversible.</p>
-            <form method="post" action="/admin/cluster/block" class="actions"><input type="hidden" name="key" value="{{ m.key }}">
-              <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit" name="subtree" value="1" title="Also block every node it admitted, and the nodes those admitted">Block with all it admitted</button><button class="btn btn-danger" type="submit">Block</button></form></dialog>
-        {% endif %}</td>
+        <td>{% let issues = m.issues() %}{% if !issues.is_empty() %}<a class="badge badge-status" data-status="running" href="/admin/cluster/node/{{ m.key }}" title="{{ issues.join(" · ") }}{% if m.skew.is_some() %}. Run NTP on every node: scan cooldowns compare timestamps from different nodes.{% endif %}" aria-label="{{ issues.len() }} issue{% if issues.len() != 1 %}s{% endif %}: {{ issues.join("; ") }}">{{ issues.len() }} issue{% if issues.len() != 1 %}s{% endif %}</a>{% endif %}</td>
       </tr>
     {% endfor %}
-    {% if members.is_empty() %}<tr><td colspan="11" class="empty">No other members yet. Create an invite, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}
+    {% if rows.len() == 1 %}<tr><td colspan="5" class="empty">No other members yet. Create an invite on <a href="/admin/cluster/access">Access</a>, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}
     </tbody>
   </table></div>
 </section>
-<section class="card">
-  <div class="card-head"><h2>Contributions</h2><span class="muted">what this node holds from each member</span></div>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Node</th><th class="num">Requests</th><th class="num">Flood-sampled</th><th class="num">Fingerprints</th><th class="num">Claims</th><th class="num">Scans</th><th class="num">IPs looked up</th><th class="num">Log entries</th><th class="num">Log size</th></tr></thead>
-    <tbody>{% for c in contributions %}<tr>
-      <td><b>{{ c.name }}</b> <span class="mono muted">{{ c.short }}</span></td>
-      <td class="num">{{ c.requests }}</td><td class="num">{{ c.skipped }}</td><td class="num">{{ c.fingerprints }}</td><td class="num">{{ c.claims }}</td>
-      <td class="num">{{ c.scans }}</td><td class="num">{{ c.lookups }}</td><td class="num">{{ c.log_entries }}</td><td class="num">{{ c.log_size }}</td>
-    </tr>{% endfor %}</tbody>
-  </table></div>
-</section>
-<section class="card">
-  <div class="card-head"><h2>Invites</h2><span class="muted">created on this node</span></div>
-  <div class="banner banner-warning">Members cannot be removed, only blocked. Limit uses and expiry.</div>
-  <form method="post" action="/admin/cluster/invite" class="filters">
-    <label>For <input name="label" maxlength="64" placeholder="peer group"></label>
-    <label>Expires after <input type="number" name="ttl_hours" min="0" max="8760" placeholder="168" size="6"> h</label>
-    <label>Use limit <input type="number" name="max_uses" min="0" max="10000" placeholder="10" size="6"></label>
-    <span class="muted small">Default 168 h, 10 uses; 0 = no limit.</span>
-    <button class="btn btn-primary" type="submit">Create invite</button></form>
-  {% if !invites.is_empty() %}
-  <div class="table-wrap"><table>
-    <thead><tr><th>For</th><th>State</th><th>Uses</th><th>Expires (UTC)</th><th>Created (UTC)</th><th>Joined</th><th></th></tr></thead>
-    <tbody>{% for i in invites %}<tr{% if !i.usable %} class="muted"{% endif %}>
-      <td>{{ i.label }}</td>
-      <td><span class="badge badge-status" data-status="{% if i.usable %}done{% else %}failed{% endif %}">{{ i.state }}</span></td>
-      <td>{{ i.uses }}</td><td class="ts">{{ i.expires }}</td><td class="ts">{{ i.created_at }}</td><td>{{ i.joined }}</td>
-      <td>{% if i.usable %}<form method="post" action="/admin/cluster/invite/revoke"><input type="hidden" name="id" value="{{ i.id }}"><button class="btn btn-sm btn-danger" type="submit">Revoke invite</button></form>{% endif %}</td>
-    </tr>{% endfor %}</tbody>
-  </table></div>{% endif %}
-</section>
-<section class="card">
-  <div class="card-head"><h2>Configure another node</h2></div>
-  <form method="post" action="/admin/cluster/config-key/add" class="filters"><label>Config key <input name="key" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Add key</button></form>
-</section>
-<section class="card">
-  <div class="card-head"><h2>Scanner pace</h2></div>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Scanner</th><th>Workers</th><th>Scans / hour</th><th>Timeout (min)</th><th></th><th>Level weights</th></tr></thead>
-    <tbody>
-    {% if me.scanner %}{% let m = me %}{% include "_cluster_pace_row.html" %}{% endif %}
-    {% for m in members %}{% if m.scanner && m.active %}{% include "_cluster_pace_row.html" %}{% endif %}{% endfor %}
-    </tbody>
-  </table></div>
-  <p class="muted">0 pauses a scanner. A scanner that fails a scan level more often than the others (last 24 h, timeouts aside) sits that level out for 10-minute stretches, a share of 1 − weight of them, while the others take its jobs; scanners with fewer than 5 scans at a level set no bar. It recovers as old failures age out, and jobs waiting over 30 min go to any scanner.</p>
-</section>
-<section class="card">
-  <div class="card-head"><h2>Shared intel</h2><span class="muted">Tor exit list</span></div>
-  {% if intel.is_empty() %}<p class="muted">Nothing announced yet.</p>{% else %}
-  <div class="table-wrap"><table>
-    <thead><tr><th>File</th><th>Version</th><th>Size</th><th>Fetched (UTC)</th><th>By</th><th>Here</th></tr></thead>
-    <tbody>{% for i in intel %}<tr><td class="mono">{{ i.kind }}</td><td class="mono">{{ i.sha }}</td><td>{{ i.size }}</td><td class="ts">{{ i.fetched_at }}</td><td>{{ i.by }}</td>
-      <td>{% if i.local %}<span class="badge badge-status" data-status="done">current</span>{% else %}<span class="badge badge-status" data-status="queued">copying</span>{% endif %}</td></tr>{% endfor %}</tbody>
-  </table></div>{% endif %}
-  <p class="muted">GeoIP databases stay local; their lookups are shared.</p>
-</section>
-<section class="card"><h2>Join or rejoin a cluster</h2>
-  <form method="post" action="/admin/cluster/join" class="filters"><label>Invite token <input name="token" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Join</button></form>
-</section>
-</div>
-{% endmatch %}
+{% endif %}
 {% endblock %}

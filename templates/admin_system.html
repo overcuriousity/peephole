@@ -1,0 +1,37 @@
+{% extends "layout.html" %}
+{% block title %}peephole — system{% endblock %}
+{% block content %}
+{% let sub = "system" %}{% include "_admin_nav.html" %}
+{% let subtab = "status" %}{% let tabs = crate::admin::views::SYSTEM_TABS %}{% let tabs_label = "System pages" %}{% include "_subtabs.html" %}
+<div class="page-head"><div><h1>System</h1><p class="muted">Intel feeds and what this node runs.</p></div></div>
+{% if intel.stale %}<div class="banner banner-warning">Tor exit list or GeoIP data missing or older than 48 h.</div>{% endif %}
+<div class="stack">
+<section class="card">
+  <div class="card-head"><h2>Intel feeds</h2></div>
+  <dl class="kv">
+    <dt>Tor exit list</dt><dd>{{ intel.tor_fetch }}</dd>
+    <dt>MaxMind GeoLite2</dt><dd>{{ intel.maxmind_fetch }}</dd>
+    {% for (label, state) in intel.api %}<dt>{{ label }}</dt><dd>{{ state }}</dd>{% endfor %}
+  </dl>
+</section>
+{% if let Some(shared) = shared %}
+<section class="card">
+  <div class="card-head"><h2>Shared intel</h2><span class="muted">Tor exit list</span></div>
+  {% if shared.is_empty() %}<p class="muted">Nothing announced yet.</p>{% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>File</th><th>Version</th><th>Size</th><th>Fetched (UTC)</th><th>By</th><th>Here</th></tr></thead>
+    <tbody>{% for i in shared %}<tr><td class="mono">{{ i.kind }}</td><td class="mono">{{ i.sha }}</td><td>{{ i.size }}</td><td class="ts">{{ i.fetched_at }}</td><td>{{ i.by }}</td>
+      <td>{% if i.local %}<span class="badge badge-status" data-status="done">current</span>{% else %}<span class="badge badge-status" data-status="queued">copying</span>{% endif %}</td></tr>{% endfor %}</tbody>
+  </table></div>{% endif %}
+  <p class="muted">GeoIP databases stay local; their lookups are shared.</p>
+</section>
+{% endif %}
+<section class="card">
+  <div class="card-head"><h2>This node</h2></div>
+  <dl class="kv">
+    <dt>Version</dt><dd class="mono">{{ chrome.version }}</dd>
+    <dt>Rules</dt><dd><span class="mono" title="Fingerprint of the rules built into this binary: {{ rules }}">{{ rules_short }}</span> <span class="muted small">built in</span></dd>
+  </dl>
+</section>
+</div>
+{% endblock %}

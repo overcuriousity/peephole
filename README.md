@@ -60,7 +60,8 @@ nmap.
   and inspection (with the same IP's and same JA4's other requests), a live
   feed of new requests, analytics (top paths, user agents, JA4, methods,
   open ports, products, OS guesses, abuse scores), per-IP pages with every
-  enrichment result and counter-scan, the live scan queue, a graph of
+  enrichment result and counter-scan, the scan pace with the live queue and
+  every finished job, a "needs attention" list on the Overview, a graph of
   browser fingerprints shared across IPs, canary reuse, the
   false-positive inbox, deletion, and the dataset export: every request with
   everything known about it and its IP (enrichment history, scans,
