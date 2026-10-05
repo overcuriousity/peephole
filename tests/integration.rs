@@ -1023,6 +1023,40 @@ async fn admin_pages_and_deletes_with_session() {
         400
     );
     assert_eq!(get("/admin/api/links/graph").await.unwrap().status(), 400);
+    // An SSH fingerprint with `/` and `+` (base64) round-trips through its
+    // item URL, an old anchor and the graph API.
+    let odd = "SHA256:ab/cd+ef/gh+ij0123456789";
+    sqlx::query(
+        "INSERT INTO host_keys (scan_id, ip_id, port, kind, fingerprint, detail)
+         SELECT s.id, s.ip_id, 2222, 'ssh-hostkey', ?, 'ssh-ed25519 256'
+         FROM scans s JOIN ips i ON i.id = s.ip_id WHERE i.ip = '203.0.113.78' LIMIT 1",
+    )
+    .bind(odd)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    let href = peephole::admin::views::link_href("ssh", odd);
+    assert!(href.contains("%2F") && href.contains("%2B"), "{href}");
+    let r = get(&href).await.unwrap();
+    assert_eq!(r.status(), 200, "{href}");
+    let html = r.text().await.unwrap();
+    assert!(
+        html.contains(odd) && html.contains("203.0.113.78"),
+        "{html}"
+    );
+    let a = peephole::store::hostkeys::anchor("ssh-hostkey", odd);
+    let r = get(&format!("/admin/links?anchor={a}")).await.unwrap();
+    assert_eq!(r.url().path(), href, "anchor {a}");
+    let j: serde_json::Value = get(&format!(
+        "/admin/api/links/graph?focus={}&depth=1",
+        peephole::admin::views::link_href("ssh", odd).replacen("/admin/links/ssh/", "ssh:", 1)
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(j["nodes"][0]["id"], format!("ssh:{odd}"));
     let html = get("/admin/inbox").await.unwrap().text().await.unwrap();
     assert!(html.contains("lost@example.org"));
     let html = get("/admin/system/keys")
