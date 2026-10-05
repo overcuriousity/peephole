@@ -97,7 +97,12 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         .store
         .recent_requests(50, crate::store::browse::Audience::Admin)
         .await?;
-    let recent_max_id = recent.iter().map(|r| r.id).max().unwrap_or(0);
+    // Nothing in the last 24 h: follow from the newest row overall, so the
+    // live feed does not backfill the table with old requests.
+    let recent_max_id = match recent.iter().map(|r| r.id).max() {
+        Some(id) => id,
+        None => st.store.max_request_id().await?,
+    };
     render(&HomePage {
         chrome: chrome(),
         q: st.store.queue_summary(&st.recorder).await?,

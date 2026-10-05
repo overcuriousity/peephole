@@ -947,6 +947,24 @@ show_labels = {show_labels}
         assert!(!authed.contains("0–0"));
     }
 
+    #[tokio::test]
+    async fn admin_home_follows_from_the_newest_request_when_none_is_recent() {
+        let (st, _d) = state(true).await;
+        sqlx::query("UPDATE requests SET ts = datetime('now', '-3 days')")
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let max = st.store.max_request_id().await.unwrap();
+        assert!(max > 0);
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st);
+        let (_, home) = get_with(&app, "/admin", Some(&cookie)).await;
+        assert!(
+            home.contains(&format!("/admin/api/recent?after={max}\"")),
+            "{home}"
+        );
+    }
+
     async fn admin_cookie(st: &AdminState) -> String {
         let token = st.store.create_session().await.unwrap();
         format!(
