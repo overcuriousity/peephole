@@ -26,6 +26,7 @@
   <div class="tile"><span class="label">Tor exits</span><div class="value">{{ stats.tor_ips }}</div></div>
   <div class="tile"><span class="label">Counter-scans</span><div class="value brand">{{ crate::admin::views::thousands(stats.scans_done) }}</div><div class="hint">{{ stats.scanned_ips }} sources</div></div>
   {% if let Some(c) = stats.canaries %}<div class="tile"><span class="label">Harvest to first use</span><div class="value">{{ crate::admin::views::duration(c.median_s) }}</div><div class="hint">median · {{ c.share_pct }} % of harvested credentials used again</div></div>{% endif %}
+  {% if stats.tarpit_held_ms > 0 %}<div class="tile"><span class="label">Scanner time wasted</span><div class="value">{{ crate::admin::views::duration(stats.tarpit_held_ms / 1000) }}</div><div class="hint">held by the tarpit</div></div>{% endif %}
 </div>
 
 <div class="stack">

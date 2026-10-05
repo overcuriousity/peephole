@@ -281,7 +281,7 @@ fn if_inet6(text: &str) -> Vec<IpAddr> {
 /// file changes. A directory or file that cannot be read keeps the lists
 /// loaded before (retried at the next check); until they loaded once, this
 /// scanner scans nothing ([`Lists::unavailable`]).
-struct Lists {
+pub(crate) struct Lists {
     dir: Option<PathBuf>,
     stamp: Vec<(PathBuf, SystemTime, u64)>,
     nets: Vec<(IpNet, String)>,
@@ -294,7 +294,7 @@ struct Lists {
 const LISTS_CHECK: Duration = Duration::from_secs(60);
 
 impl Lists {
-    fn new(dir: Option<PathBuf>) -> Self {
+    pub(crate) fn new(dir: Option<PathBuf>) -> Self {
         Self {
             dir,
             stamp: vec![],
@@ -304,7 +304,7 @@ impl Lists {
         }
     }
 
-    fn refresh(&mut self) {
+    pub(crate) fn refresh(&mut self) {
         let Some(dir) = &self.dir else { return };
         if self.checked.is_some_and(|t| t.elapsed() < LISTS_CHECK) {
             return;
@@ -347,12 +347,12 @@ impl Lists {
 
     /// Why nothing may be scanned yet: a list directory is configured but
     /// never loaded.
-    fn unavailable(&self) -> Option<String> {
+    pub(crate) fn unavailable(&self) -> Option<String> {
         let dir = self.dir.as_ref().filter(|_| !self.loaded)?;
         Some(format!("never_scan_dir {} not loaded", dir.display()))
     }
 
-    fn covering(&self, ip: &IpAddr) -> Option<String> {
+    pub(crate) fn covering(&self, ip: &IpAddr) -> Option<String> {
         let ip = crate::net::canonical(*ip);
         self.nets
             .iter()

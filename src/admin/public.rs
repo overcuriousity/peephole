@@ -1063,6 +1063,36 @@ show_labels = {show_labels}
     }
 
     #[tokio::test]
+    async fn wall_shows_scanner_time_wasted_once_there_is_some() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, before) = get_with(&app, "/", None).await;
+        assert!(!before.contains("Scanner time wasted"), "{before}");
+        let ip = st
+            .store
+            .upsert_ip("203.0.113.9".parse().unwrap())
+            .await
+            .unwrap();
+        st.store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/held".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                answer: Some("tarpit".into()),
+                held_ms: Some(2 * 3_600_000 + 5 * 60_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // A fresh range: the anonymous wall's cache holds the last one.
+        let (_, after) = get_with(&app, "/?range=7d", None).await;
+        assert!(after.contains("Scanner time wasted"), "{after}");
+        assert!(after.contains("2 h 5 min"), "{after}");
+    }
+
+    #[tokio::test]
     async fn wall_without_a_delay_says_so_plainly() {
         let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
         let cookie = admin_cookie(&st).await;

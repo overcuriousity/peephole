@@ -86,6 +86,8 @@ pub struct ExportRow {
     /// Uids of the rows whose served canaries this row carried.
     pub canary_used_from: Vec<String>,
     pub status: Option<i64>,
+    /// How long a `tarpit` answer held the client, in milliseconds.
+    pub held_ms: Option<i64>,
     /// Requests from the IP answered but not recorded since the previous
     /// recorded one (for a light row: drops of its batch, on its last row).
     pub unrecorded: i64,
@@ -143,6 +145,7 @@ pub const COLUMNS: &[&str] = &[
     "decoy_v",
     "canary_used_from",
     "status",
+    "held_ms",
     "unrecorded",
     "weight",
     "labels",
@@ -301,6 +304,7 @@ impl ExportRow {
             "decoy_v": self.decoy_v,
             "canary_used_from": self.canary_used_from,
             "status": self.status,
+            "held_ms": self.held_ms,
             "unrecorded": self.unrecorded,
             "weight": self.weight,
             "labels": self.labels,
@@ -627,6 +631,7 @@ fn request_row(
         decoy_v: r.decoy_v,
         canary_used_from,
         status: r.status,
+        held_ms: r.held_ms,
         unrecorded,
         weight,
         labels: serde_json::from_str(&r.labels_json).unwrap_or_default(),
@@ -655,6 +660,7 @@ fn skipped_row(s: SkipOut, ctx: &PageContext, cols: &IpCols, opts: &ExportOption
         answer: s.answer,
         host: s.host,
         decoy_v: s.decoy_v,
+        held_ms: s.held_ms,
         path: s.path,
         unrecorded,
         weight: unrecorded + 1,
@@ -1189,6 +1195,7 @@ mod tests {
                     answer: Some("decoy:git-config".into()),
                     decoy_v: Some(1),
                     decoy_site: Some("shop".into()),
+                    held_ms: None,
                 }],
             )
             .await
@@ -1200,6 +1207,57 @@ mod tests {
         assert_eq!(row["host"], "203.0.113.7");
         assert_eq!(row["decoy_v"], 1);
         assert!(!out.contains("\"tok\""), "the page token stays internal");
+    }
+
+    #[tokio::test]
+    async fn tarpit_rows_export_the_time_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let row = s.upsert_ip("198.51.100.3".parse().unwrap()).await.unwrap();
+        s.insert_request(&NewRequest {
+            ip_id: row.id,
+            method: "GET".into(),
+            path: "/a".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            answer: Some("tarpit".into()),
+            status: Some(200),
+            held_ms: Some(600_000),
+            ts: Some("2026-01-01 00:00:00".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        s.local()
+            .insert_skip_batch(
+                "198.51.100.3",
+                0,
+                vec![crate::cluster::record::SkipRow {
+                    ts_ms: chrono::Utc::now().timestamp_millis(),
+                    method: "GET".into(),
+                    path: "/b".into(),
+                    answer: Some("tarpit".into()),
+                    held_ms: Some(12_000),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .unwrap();
+        let out = text(&collect(&s, ExportFilter::default(), Format::Jsonl).await);
+        let rows: Vec<serde_json::Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows[0]["answer"], "tarpit");
+        assert_eq!(rows[0]["held_ms"], 600_000);
+        assert_eq!(rows[1]["kind"], "skipped");
+        assert_eq!(rows[1]["answer"], "tarpit");
+        assert_eq!(rows[1]["held_ms"], 12_000);
+        assert!(COLUMNS.contains(&"held_ms"));
+        let csv = text(&collect(&s, ExportFilter::default(), Format::Csv).await);
+        assert!(csv.lines().next().unwrap().contains("held_ms"));
     }
 
     #[tokio::test]

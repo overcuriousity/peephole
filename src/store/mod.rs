@@ -40,6 +40,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0005_public_delay.sql"),
     include_str!("migrations/0006_links.sql"),
     include_str!("migrations/0007_user_agent.sql"),
+    include_str!("migrations/0008_tarpit.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of

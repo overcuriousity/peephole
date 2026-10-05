@@ -33,7 +33,7 @@ duckdb.sql("SELECT country, COUNT(*) FROM 'peephole.parquet' GROUP BY 1 ORDER BY
 | `kind` | One row per | Columns filled |
 |---|---|---|
 | `request` | request recorded in full | all |
-| `skipped` | request the flood gate answered but recorded only lightly (time, method, path) | `uid`, `node*`, `build`, `ts`, `ip`, `method`, `path`, `unrecorded`, `weight`, the per-IP columns |
+| `skipped` | request the flood gate answered but recorded only lightly (time, method, path) | `uid`, `node*`, `build`, `ts`, `ip`, `method`, `path`, `unrecorded`, `weight`, the per-IP columns; for a decoy or tarpit answer also `answer` (and `decoy_v`, `host`, or `held_ms`) |
 
 A trap records every request from an address up to a rate; above it, the
 request is still answered and classified but kept as a light row, and
@@ -83,10 +83,11 @@ Column order is as listed.
 | `tls_client_hello` | binary? | The raw TLS ClientHello (HTTPS only) |
 | `ja4` | string? | JA4 fingerprint of that ClientHello |
 | `ja4h` | string? | JA4H fingerprint of `raw_head` (HTTP/1 only; null for plain HTTP from a trusted proxy, whose head is the proxy's request, not the client's): method, version, cookie and referer flags, header count, first `Accept-Language`, then hashes of the header names in order and of the sorted cookie names and pairs. An unknown method gives its first two letters |
-| `answer` | string? | What the trap sent: `not-found` (a 404), `decoy:<name>` (a believable fake: `decoy:dotenv`, `decoy:git-config`, `decoy:git-head`, `decoy:wp-login`, `decoy:wp-login-failed`, `decoy:phpinfo`; answers to a harvested canary: `decoy:wp-login-ok`, `decoy:wp-admin`, `decoy:admin`, `decoy:git-auth`, `decoy:git-refs`, `decoy:git-pack`), `claim` (the false-positive claim page) |
+| `answer` | string? | What the trap sent: `not-found` (a 404), `decoy:<name>` (a believable fake: `decoy:dotenv`, `decoy:git-config`, `decoy:git-head`, `decoy:wp-login`, `decoy:wp-login-failed`, `decoy:phpinfo`; answers to a harvested canary: `decoy:wp-login-ok`, `decoy:wp-admin`, `decoy:admin`, `decoy:git-auth`, `decoy:git-refs`, `decoy:git-pack`), `claim` (the false-positive claim page), `tarpit` (a slow `200` that drips a few bytes at a time, for sources whose requests reached severity 4 in the hour before; see `held_ms`) |
 | `decoy_v` | int? | Template version of a decoy answer (see Canaries); empty for other answers, and empty on a decoy row means version 0 |
 | `canary_used_from` | list of string | The `uid`s of the rows whose served canaries this row carried (light rows as `<batch uid>#<n>`, `n` the row's position in its batch from 1); empty when none |
 | `status` | int? | HTTP status sent |
+| `held_ms` | int? | How long a `tarpit` answer held the client, in milliseconds: up to the last chunk the connection took, so a client that gave up counts until then; the configured hold (`trap.tarpit_hold_secs`, default 600 s) when it waited to the end. Null for other answers |
 | `unrecorded` | int | Requests from this address answered since the previous row but not recorded (light rows: the drops of the batch, on its last row) |
 | `weight` | int | Answered requests this row stands for (see Rows) |
 

@@ -884,7 +884,7 @@ async fn light_rows_of_requests_in_flight_at_shutdown_are_kept() {
         chrono::Utc::now().timestamp_millis(),
         "GET",
         "/late",
-        None,
+        trap::skiplog::SkipAnswer::Plain,
         0,
         std::time::Instant::now(),
     );

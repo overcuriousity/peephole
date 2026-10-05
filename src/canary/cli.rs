@@ -153,6 +153,7 @@ mod tests {
                     answer: Some("decoy:dotenv".into()),
                     decoy_v: Some(1),
                     decoy_site: Some("shop".into()),
+                    held_ms: None,
                 }],
                 build: String::new(),
             }),

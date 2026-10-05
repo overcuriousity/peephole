@@ -87,6 +87,74 @@ pub struct ConnMeta {
     pub ja4: Option<String>,
     /// The first bytes received (after TLS), for the raw request head.
     pub head: HeadBuf,
+    /// The connection's slots, for the tarpit to take over.
+    pub handover: Handover,
+}
+
+/// A connection's hold on its listener's limits (the connection cap, the
+/// source's share) and its deadline. The tarpit takes it over: the slots
+/// are given back, and the connection lasts until the tarpit's deadline.
+#[derive(Clone, Default)]
+pub struct Handover(Arc<HandoverInner>);
+
+#[derive(Default)]
+struct HandoverInner {
+    slots: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
+    until: Mutex<Option<tokio::time::Instant>>,
+    moved: tokio::sync::Notify,
+}
+
+/// Releases a connection's slots when the connection's task ends.
+struct Release(Handover);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+impl std::fmt::Debug for Handover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Handover")
+            .field(
+                "until",
+                &*self.0.until.lock().unwrap_or_else(|p| p.into_inner()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Handover {
+    /// Count `slot` as the connection's until it ends or is taken over.
+    fn hold(&self, slot: impl Send + 'static) {
+        let mut slots = self.0.slots.lock().unwrap_or_else(|p| p.into_inner());
+        slots.push(Box::new(slot));
+    }
+
+    /// Give the connection's slots back and let it last until `until`
+    /// (or longer, if it already may).
+    pub fn take_over(&self, until: tokio::time::Instant) {
+        self.release();
+        let mut u = self.0.until.lock().unwrap_or_else(|p| p.into_inner());
+        *u = Some(u.map_or(until, |t| t.max(until)));
+        self.0.moved.notify_one();
+    }
+
+    /// Give the slots back without moving the deadline.
+    fn release(&self) {
+        drop(std::mem::take(
+            &mut *self.0.slots.lock().unwrap_or_else(|p| p.into_inner()),
+        ));
+    }
+
+    /// The connection's deadline: `end`, or the one it was taken over with.
+    fn deadline(&self, end: tokio::time::Instant) -> tokio::time::Instant {
+        self.0
+            .until
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or(end)
+    }
 }
 
 /// TLS settings for the trap: the configured certificate, or a
@@ -148,17 +216,17 @@ impl Default for Limits {
 
 /// Open connections per source key.
 #[derive(Default)]
-struct Sources(Mutex<HashMap<IpAddr, usize>>);
+pub(super) struct Sources(Mutex<HashMap<IpAddr, usize>>);
 
 /// A connection counted against its source until dropped.
-struct SourceSlot {
+pub(super) struct SourceSlot {
     sources: Arc<Sources>,
     key: IpAddr,
 }
 
 impl Sources {
     /// Count a connection from `ip`; None when its source has `max` open.
-    fn take(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<SourceSlot> {
+    pub(super) fn take(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<SourceSlot> {
         let key = crate::net::source_key(ip);
         let mut open = self.0.lock().unwrap_or_else(|p| p.into_inner());
         let n = open.entry(key).or_default();
@@ -253,11 +321,14 @@ pub async fn serve_trap_with(
         };
         let (app, acceptor, sources) = (app.clone(), acceptor.clone(), sources.clone());
         tokio::spawn(async move {
-            let _held = (permit, source);
             let mut meta = ConnMeta {
                 via_proxy,
                 ..Default::default()
             };
+            meta.handover.hold((permit, source));
+            // Requests keep a copy of the meta while they are recorded; the
+            // slots go with the connection all the same.
+            let _release = Release(meta.handover.clone());
             match acceptor {
                 None => {
                     meta.transport = "http";
@@ -289,18 +360,15 @@ pub async fn serve_trap_with(
                             return;
                         }
                     };
-                    let _source = match src {
-                        Some(client) => {
-                            match sources.take(client.ip(), limits.max_conns_per_source) {
-                                Some(slot) => Some(slot),
-                                None => {
-                                    debug!(%peer, %client, "trap: at the per-source connection cap, dropped");
-                                    return;
-                                }
+                    if let Some(client) = src {
+                        match sources.take(client.ip(), limits.max_conns_per_source) {
+                            Some(slot) => meta.handover.hold(slot),
+                            None => {
+                                debug!(%peer, %client, "trap: at the per-source connection cap, dropped");
+                                return;
                             }
                         }
-                        None => None,
-                    };
+                    }
                     meta.proxied_src = src;
                     meta.ja4 = Some(tls_hello::ja4(&hello));
                     meta.client_hello = Some(Arc::new(hello.raw));
@@ -468,6 +536,7 @@ async fn serve_conn<I>(
     use tower::ServiceExt;
 
     let client = meta.proxied_src.unwrap_or(peer);
+    let handover = meta.handover.clone();
     // Told when hyper hands over a request: its head is complete.
     let headed = Arc::new(tokio::sync::Notify::new());
     let on_head = headed.clone();
@@ -513,8 +582,14 @@ async fn serve_conn<I>(
         }
     }
     // Overall per-connection deadline bounds slow bodies and keep-alive
-    // trickling as well as slow headers.
-    let _ = tokio::time::timeout_at(end, conn).await;
+    // trickling as well as slow headers; the tarpit moves it.
+    loop {
+        tokio::select! {
+            _ = conn.as_mut() => return,
+            _ = tokio::time::sleep_until(handover.deadline(end)) => return,
+            _ = handover.0.moved.notified() => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -536,6 +611,72 @@ mod tests {
         std::fs::write(&k, "not a key").unwrap();
         assert!(trap_tls_config(Some(&c), Some(&k)).is_err());
         trap_tls_config(None, None).unwrap();
+    }
+
+    /// A handler that takes the connection over (as the tarpit does) frees
+    /// the listener's slots and outlives the connection deadline.
+    #[tokio::test]
+    async fn a_taken_over_connection_frees_its_slots_and_gets_its_own_deadline() {
+        use axum::routing::get;
+        use tokio::io::AsyncWriteExt;
+        let app = axum::Router::new()
+            .route(
+                "/hold",
+                get(|req: axum::extract::Request| async move {
+                    let meta = req.extensions().get::<ConnMeta>().unwrap().clone();
+                    meta.handover
+                        .take_over(tokio::time::Instant::now() + Duration::from_secs(5));
+                    let chunks = futures::stream::unfold(0, |i| async move {
+                        match i {
+                            0 => Some((Ok::<_, std::convert::Infallible>("a"), 1)),
+                            1 => {
+                                tokio::time::sleep(Duration::from_millis(1500)).await;
+                                Some((Ok("b"), 2))
+                            }
+                            _ => None,
+                        }
+                    });
+                    axum::body::Body::from_stream(chunks)
+                }),
+            )
+            .route("/quick", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_stop, rx) = tokio::sync::watch::channel(false);
+        let limits = Limits {
+            max_conns: 1,
+            max_conns_per_source: 1,
+            head_timeout: Duration::from_secs(2),
+            conn_deadline: Duration::from_secs(1),
+        };
+        tokio::spawn(serve_trap_with(
+            listener,
+            app,
+            None,
+            Arc::new(vec![]),
+            rx,
+            limits,
+        ));
+        let mut held = TcpStream::connect(addr).await.unwrap();
+        held.write_all(b"GET /hold HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut first = [0u8; 12];
+        held.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"HTTP/1.1 200");
+        // Both caps are 1, so this one is served only if the held
+        // connection gave its slots back.
+        let mut other = TcpStream::connect(addr).await.unwrap();
+        other
+            .write_all(b"GET /quick HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        other.read_to_string(&mut answer).await.unwrap();
+        assert!(answer.ends_with("ok"), "{answer}");
+        let mut rest = String::new();
+        held.read_to_string(&mut rest).await.unwrap();
+        assert!(rest.contains("b\r\n"), "past the 1 s deadline: {rest}");
     }
 
     #[test]

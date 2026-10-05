@@ -286,6 +286,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         settings: settings.clone(),
         node: node.clone(),
         providers,
+        tarpit: Arc::new(trap::tarpit::Tarpit::of(&cfg)),
     };
     // At startup a role that cannot start is fatal, as it always was (the
     // installer's health check relies on it); later changes are retried.
@@ -371,6 +372,8 @@ struct RoleRunner {
     settings: settings::Settings,
     node: Option<Arc<cluster::Node>>,
     providers: intel::Providers,
+    /// The trap's tarpit: outlives a listener restart, read by the admin.
+    tarpit: Arc<trap::tarpit::Tarpit>,
 }
 
 impl RoleRunner {
@@ -544,6 +547,7 @@ impl RoleRunner {
             panel_rate: Default::default(),
             pace: self.settings.pace.clone(),
             guards: Default::default(),
+            tarpit: self.tarpit.clone(),
         });
         let app = trap::router(state.clone());
         let listener = tokio::net::TcpListener::bind(addr)
@@ -625,6 +629,7 @@ impl RoleRunner {
             .with_recorder(self.recorder.clone())
             .with_settings(self.settings.clone())
             .with_providers(self.providers.clone())
+            .with_tarpit(self.tarpit.clone())
             .with_closing(rx.clone()),
         ));
         let listener = tokio::net::TcpListener::bind(addr)
