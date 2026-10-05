@@ -37,6 +37,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
 }
 
 /// One member as the page shows it.
+#[derive(Default)]
 pub struct MemberView {
     pub key: String,
     pub short: String,
@@ -86,6 +87,30 @@ pub struct MemberView {
     pub ruleset: String,
     /// Whether that newest fingerprint is ours; None without one.
     pub ruleset_same: Option<bool>,
+}
+
+impl MemberView {
+    /// What needs a look, in words; empty when nothing does. The Members
+    /// table's badge and Overview's strip both read this.
+    pub fn issues(&self) -> Vec<String> {
+        let mut v = vec![];
+        if self.incompatible {
+            v.push("incompatible version".to_string());
+        }
+        if let Some(s) = &self.skew {
+            v.push(format!("clock {s}"));
+        }
+        if self.rules_differ {
+            v.push(format!("rules: {}", self.rules));
+        }
+        if self.ruleset_same == Some(false) {
+            v.push("records with other rules".to_string());
+        }
+        if let Some(e) = self.error.as_ref().filter(|_| !self.incompatible) {
+            v.push(e.clone());
+        }
+        v
+    }
 }
 
 /// Characters of a rules fingerprint shown.
@@ -1337,6 +1362,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(none.view(&ours), ("none recorded".to_string(), None));
+    }
+
+    #[test]
+    fn issues_list_what_needs_a_look() {
+        let ok = MemberView {
+            ruleset_same: Some(true),
+            ..Default::default()
+        };
+        assert!(ok.issues().is_empty());
+        let bad = MemberView {
+            incompatible: true,
+            error: Some("incompatible protocol 3".into()),
+            skew: Some("+3.5 min".into()),
+            rules_differ: true,
+            rules: "disagree on 12% of 500".into(),
+            ruleset_same: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            bad.issues(),
+            [
+                "incompatible version",
+                "clock +3.5 min",
+                "rules: disagree on 12% of 500",
+                "records with other rules",
+            ]
+        );
+        let err = MemberView {
+            error: Some("connection refused".into()),
+            ..Default::default()
+        };
+        assert_eq!(err.issues(), ["connection refused"]);
     }
 
     #[test]

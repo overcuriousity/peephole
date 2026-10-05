@@ -899,7 +899,8 @@ where
 
 type IpsPage = super::browse::Page<super::browse::IpSummary>;
 
-/// Aggregates and pages for anonymous traffic (an admin always reads fresh).
+/// Aggregates and pages for anonymous traffic, plus the admin's aggregates
+/// (short TTL).
 pub struct StatsCache {
     stats: SwrCache<Range, Stats>,
     map: SwrCache<Range, MapCounts>,
@@ -912,6 +913,8 @@ pub struct StatsCache {
     /// Admin analytics: aggregates only, so a short staleness is fine and
     /// repeated views of the expensive ranges cost one query each.
     analytics: SwrCache<Range, super::analytics::Analytics>,
+    /// Admin aggregates (Overview tiles): every row, released or not.
+    admin_stats: SwrCache<Range, Stats>,
 }
 
 impl Default for StatsCache {
@@ -923,6 +926,7 @@ impl Default for StatsCache {
             ip: SwrCache::new(IP_CACHE_MAX),
             blocklist: SwrCache::new(crate::admin::blocklist::CACHE_MAX),
             analytics: SwrCache::new(Range::ALL.len()),
+            admin_stats: SwrCache::new(Range::ALL.len()),
         }
     }
 }
@@ -938,6 +942,17 @@ impl StatsCache {
             .get(r, ttl(r), move || {
                 let store = store.clone();
                 Box::pin(async move { store.stats_as(r, Audience::Public).await })
+            })
+            .await
+    }
+
+    /// [`Stats`] as an admin sees them: unreleased rows included.
+    pub async fn admin_stats(&self, store: &Store, r: Range) -> Result<Arc<Stats>> {
+        let store = store.clone();
+        self.admin_stats
+            .get(r, ttl(r), move || {
+                let store = store.clone();
+                Box::pin(async move { store.stats_as(r, Audience::Admin).await })
             })
             .await
     }
@@ -1507,6 +1522,25 @@ mod tests {
         assert_eq!((p.scans_done, p.scanned_ips), (1, 1));
         let a = s.stats_as(Range::All, Audience::Admin).await.unwrap();
         assert_eq!((a.scans_done, a.scanned_ips), (3, 2));
+    }
+
+    #[tokio::test]
+    async fn admin_stats_read_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = s.upsert_ip("203.0.113.5".parse().unwrap()).await.unwrap();
+        s.insert_request(&crate::store::requests::NewRequest {
+            ip_id: ip.id,
+            method: "GET".into(),
+            path: "/x".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let a = StatsCache::new().admin_stats(&s, Range::H24).await.unwrap();
+        assert_eq!((a.total_requests, a.unique_ips), (1, 1));
     }
 
     #[test]
