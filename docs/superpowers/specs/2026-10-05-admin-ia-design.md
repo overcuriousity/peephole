@@ -108,8 +108,9 @@ card's head.
 - Store: `active_jobs(limit)`: `QUEUE_JOB_SQL` with
   `WHERE j.status IN ('queued','running') ORDER BY j.id DESC LIMIT ?`.
   The page and the SSE snapshot (`sse.rs::snapshot_or_comment`) both use it,
-  so a backlog larger than the limit no longer hides the oldest queued jobs.
-  `SNAPSHOT_ROWS` stays 500.
+  so finished jobs no longer take rows from queued ones. `SNAPSHOT_ROWS`
+  stays 500; with more active jobs than that the newest 500 show, and the
+  card head gives the total ("N queued · M running") from `queue_summary`.
 - JS (`app.js`, live queue): the status/level filter attributes go; a row
   matches when its status is `queued` or `running`. A `job` event that moves
   a job to any other status removes its row.
@@ -215,7 +216,9 @@ System or in the strip.
   last seen, lag, history, running scans, clock skew, last error.
 - Rules: carried fingerprint, agreement, and the
   `peephole cluster agreement <short>` hint.
-- Contributions: this node's row of today's contributions table.
+- Contributions: this node's row of today's contributions table. This
+  node's own page also shows the "not shared yet" row (records created
+  before it joined).
 - Pace (scanners): read-only, linking to `/admin/scans#scanners`.
 - Remote settings: today's form, only when this node holds its config key.
   Only this card asks the node live; when it does not answer, the card shows
@@ -269,7 +272,7 @@ Cluster page's cards; the roadmap marks B done and links this spec.
 - Step 1: the auth-required page list (`tests/integration.rs`) gets the new
   URLs; each old URL redirects to its new one; the right subnav and sub-tab
   are current.
-- Step 2: a backlog above the limit still lists the oldest queued job;
+- Step 2: finished jobs do not take rows from active ones in `active_jobs`;
   `job_history` with `status=failed` returns only failed jobs; a done job
   links to its scan; retry redirects to the failed filter; existing pace and
   retry tests move to `/admin/scans`; `tests/cluster.rs` checks of
