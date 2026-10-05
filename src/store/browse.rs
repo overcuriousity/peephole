@@ -76,6 +76,13 @@ pub struct IpFilter {
     pub intel: Option<String>,
     /// Admin only: has no result from this provider.
     pub nointel: Option<String>,
+    /// Admin only: open in any stored scan (`22` or `22/tcp`).
+    pub port: Option<String>,
+    /// Admin only: product and version on an open port in any stored scan,
+    /// as Analytics names it (`OpenSSH 9.6p1`).
+    pub product: Option<String>,
+    /// Admin only: nmap's OS guess in any stored scan.
+    pub os: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -111,6 +118,17 @@ pub struct RequestFilter {
     pub node: Option<String>,
     /// Admin only: the request's JA4H.
     pub ja4h: Option<String>,
+    /// Admin only: the request's JA4.
+    pub ja4: Option<String>,
+    /// Admin only: the HTTP method (any case).
+    pub method: Option<String>,
+    /// Admin only: the User-Agent, exactly (`(none)`: without one).
+    pub ua: Option<String>,
+    /// Admin only: `http`, `https`, …; `unknown` for a row without one.
+    pub transport: Option<String>,
+    /// Admin only: what the trap answered (`not-found`, `decoy:…`);
+    /// `unknown` for a row without one.
+    pub answer: Option<String>,
     #[serde(default, deserialize_with = "lenient_i64")]
     pub page: Option<i64>,
 }
@@ -315,7 +333,7 @@ fn request_row_select(a: Audience) -> String {
     )
 }
 
-fn nonempty(s: &Option<String>) -> Option<String> {
+pub(crate) fn nonempty(s: &Option<String>) -> Option<String> {
     s.as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -403,6 +421,38 @@ fn ip_filter_sql(f: &IpFilter, a: Audience) -> Option<IpFilterSql> {
         );
         binds.push(p);
     }
+    if a == Audience::Admin {
+        if let Some(p) = nonempty(&f.port) {
+            let (port, proto) = p.split_once('/').unwrap_or((&p, ""));
+            let Ok(port) = port.trim().parse::<u16>() else {
+                return None;
+            };
+            let mut sql = "EXISTS (SELECT 1 FROM scans s JOIN ports p ON p.scan_id = s.id
+                 WHERE s.ip_id = i.id AND p.state = 'open' AND p.port = ?"
+                .to_string();
+            binds.push(port.to_string());
+            if !proto.trim().is_empty() {
+                sql.push_str(" AND p.proto = ?");
+                binds.push(proto.trim().to_ascii_lowercase());
+            }
+            wheres.push(sql + ")");
+        }
+        if let Some(v) = nonempty(&f.product) {
+            wheres.push(
+                "EXISTS (SELECT 1 FROM scans s JOIN ports p ON p.scan_id = s.id
+                 WHERE s.ip_id = i.id AND p.state = 'open'
+                   AND p.product || COALESCE(' ' || p.version, '') = ?)"
+                    .into(),
+            );
+            binds.push(v);
+        }
+        if let Some(v) = nonempty(&f.os) {
+            wheres.push(
+                "EXISTS (SELECT 1 FROM scans s WHERE s.ip_id = i.id AND s.os_guess = ?)".into(),
+            );
+            binds.push(v);
+        }
+    }
     let where_sql = if wheres.is_empty() {
         String::new()
     } else {
@@ -479,6 +529,33 @@ fn request_filter_sql(f: &RequestFilter, a: Audience, indexed: bool) -> (String,
         sql.push_str(" AND r.ja4h = ?");
         binds.push(v);
     }
+    if a == Audience::Admin
+        && let Some(v) = nonempty(&f.ja4)
+    {
+        sql.push_str(" AND r.ja4 = ?");
+        binds.push(v);
+    }
+    if a == Audience::Admin {
+        if let Some(v) = nonempty(&f.method) {
+            sql.push_str(" AND r.method = ?");
+            binds.push(v.to_ascii_uppercase());
+        }
+        if let Some(v) = nonempty(&f.ua) {
+            sql.push_str(" AND r.user_agent = ?");
+            binds.push(v);
+        }
+        // Analytics shows a missing value as `unknown`.
+        for (col, v) in [("transport", &f.transport), ("answer", &f.answer)] {
+            match nonempty(v).as_deref() {
+                Some("unknown") => sql.push_str(&format!(" AND r.{col} IS NULL")),
+                Some(v) => {
+                    sql.push_str(&format!(" AND r.{col} = ?"));
+                    binds.push(v.to_string());
+                }
+                None => {}
+            }
+        }
+    }
     if let Some(v) = f.asn {
         sql.push_str(" AND i.asn = ?");
         binds.push(v.to_string());
@@ -550,6 +627,45 @@ impl Count {
 }
 
 impl Store {
+    /// Stored IPs among `addrs` or inside `nets`, by address, at most
+    /// `limit` (admin bulk lookup).
+    pub async fn ips_matching(
+        &self,
+        addrs: &[IpAddr],
+        nets: &[IpNet],
+        limit: i64,
+    ) -> Result<Vec<IpSummary>> {
+        let mut ors = vec![];
+        let mut binds = vec![];
+        for a in addrs {
+            ors.push("i.ip = ?".to_string());
+            binds.push(a.to_string());
+        }
+        for n in nets {
+            let (lo, hi) = super::net_key_range(n);
+            ors.push(if n.addr().is_ipv6() {
+                "(i.ip_key BETWEEN ? AND ? AND instr(i.ip, ':') > 0)".to_string()
+            } else {
+                "i.ip_key BETWEEN ? AND ?".to_string()
+            });
+            binds.push(lo);
+            binds.push(hi);
+        }
+        if ors.is_empty() {
+            return Ok(vec![]);
+        }
+        let sql = format!(
+            "{} WHERE {} ORDER BY i.ip_key LIMIT {limit}",
+            ip_summary_select(Audience::Admin),
+            ors.join(" OR ")
+        );
+        let mut q = sqlx::query_as::<_, IpSummary>(sqlx::AssertSqlSafe(sql.as_str()));
+        for b in &binds {
+            q = q.bind(b);
+        }
+        Ok(q.fetch_all(&self.read).await?)
+    }
+
     pub async fn list_ips(&self, f: &IpFilter) -> Result<Page<IpSummary>> {
         self.list_ips_as(f, Audience::Admin).await
     }
@@ -1397,6 +1513,170 @@ mod tests {
         assert_eq!(n(find("wp")).await, 4, "short terms scan");
         assert_eq!(n(find("\"quoted\"")).await, 0);
         assert_eq!(s.count_requests(&find("wp-admin")).await.unwrap().n, 3);
+    }
+
+    /// Method, transport and answer as Analytics names them; `unknown` is
+    /// a row without one. Admin only.
+    #[tokio::test]
+    async fn requests_are_found_by_method_transport_and_answer() {
+        let s = seeded().await;
+        let ip = s.ip_by_addr("203.0.113.1").await.unwrap().unwrap();
+        for (method, transport, answer) in [
+            ("PROPFIND", Some("https"), Some("decoy:dotenv")),
+            ("PROPFIND", None, None),
+        ] {
+            s.insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: method.into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                transport: transport.map(String::from),
+                answer: answer.map(String::from),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let n = |f: RequestFilter| {
+            let s = s.clone();
+            async move { s.count_requests(&f).await.unwrap().n }
+        };
+        let f = |m: Option<&str>, t: Option<&str>, a: Option<&str>| RequestFilter {
+            method: m.map(String::from),
+            transport: t.map(String::from),
+            answer: a.map(String::from),
+            ..Default::default()
+        };
+        assert_eq!(n(f(Some("PROPFIND"), None, None)).await, 2);
+        assert_eq!(n(f(Some("propfind"), None, None)).await, 2, "any case");
+        assert_eq!(n(f(Some("PROPFIND"), Some("https"), None)).await, 1);
+        assert_eq!(n(f(Some("PROPFIND"), Some("unknown"), None)).await, 1);
+        assert_eq!(n(f(None, None, Some("decoy:dotenv"))).await, 1);
+        assert_eq!(n(f(Some("PROPFIND"), None, Some("unknown"))).await, 1);
+        let all = s
+            .search_requests(&RequestFilter::default(), Audience::Public)
+            .await
+            .unwrap()
+            .items
+            .len();
+        let public = s
+            .search_requests(&f(Some("PROPFIND"), None, None), Audience::Public)
+            .await
+            .unwrap()
+            .items
+            .len();
+        assert_eq!(public, all, "admin-only filters");
+    }
+
+    /// Port, product and OS from any stored scan of the IP. Admin only.
+    #[tokio::test]
+    async fn ips_are_found_by_open_port_product_and_os() {
+        let s = seeded().await;
+        let ip = s.ip_by_addr("203.0.113.1").await.unwrap().unwrap();
+        s.enqueue_scan(ip.id, 2, 0).await.unwrap();
+        let job = s.next_queued_job().await.unwrap().unwrap();
+        let port = |port, state: &str, product: Option<&str>| crate::scan::nmap_xml::PortResult {
+            port,
+            proto: "tcp".into(),
+            state: state.into(),
+            service: Some("ssh".into()),
+            product: product.map(String::from),
+            version: product.map(|_| "9.6p1".into()),
+        };
+        s.finish_job(
+            job.id,
+            Some(&crate::scan::nmap_xml::ScanResult {
+                os_guess: Some("Linux 5.X".into()),
+                raw_xml: vec![],
+                ports: vec![port(22, "open", Some("OpenSSH")), port(23, "closed", None)],
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let n = |f: IpFilter, a: Audience| {
+            let s = s.clone();
+            async move { s.list_ips_as(&f, a).await.unwrap().items.len() }
+        };
+        let f = |port: Option<&str>, product: Option<&str>, os: Option<&str>| IpFilter {
+            port: port.map(String::from),
+            product: product.map(String::from),
+            os: os.map(String::from),
+            ..Default::default()
+        };
+        assert_eq!(n(f(Some("22"), None, None), Audience::Admin).await, 1);
+        assert_eq!(n(f(Some("22/tcp"), None, None), Audience::Admin).await, 1);
+        assert_eq!(n(f(Some("22/udp"), None, None), Audience::Admin).await, 0);
+        assert_eq!(
+            n(f(Some("23"), None, None), Audience::Admin).await,
+            0,
+            "closed"
+        );
+        assert_eq!(
+            n(f(Some("x"), None, None), Audience::Admin).await,
+            0,
+            "not a port"
+        );
+        assert_eq!(
+            n(f(None, Some("OpenSSH 9.6p1"), None), Audience::Admin).await,
+            1
+        );
+        assert_eq!(
+            n(f(None, Some("OpenSSH"), None), Audience::Admin).await,
+            0,
+            "as Analytics names it"
+        );
+        assert_eq!(
+            n(f(None, None, Some("Linux 5.X")), Audience::Admin).await,
+            1
+        );
+        let all = n(IpFilter::default(), Audience::Public).await;
+        assert!(all > 1);
+        assert_eq!(
+            n(f(Some("22"), None, None), Audience::Public).await,
+            all,
+            "admin only"
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_are_found_by_ja4_for_the_admin_only() {
+        let s = seeded().await;
+        let ip = s.ip_by_addr("203.0.113.1").await.unwrap().unwrap();
+        for ja4 in [Some("t13d_only"), None] {
+            s.insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ja4: ja4.map(String::from),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let f = RequestFilter {
+            ja4: Some("t13d_only".into()),
+            ..Default::default()
+        };
+        let found = s.search_requests(&f, Audience::Admin).await.unwrap().items;
+        assert_eq!(found.len(), 1);
+        assert_eq!(s.count_requests(&f).await.unwrap().n, 1);
+        let public = s
+            .search_requests(&f, Audience::Public)
+            .await
+            .unwrap()
+            .items
+            .len();
+        let all = s
+            .search_requests(&RequestFilter::default(), Audience::Public)
+            .await
+            .unwrap()
+            .items
+            .len();
+        assert_eq!(public, all, "fingerprints are never public");
     }
 
     #[tokio::test]

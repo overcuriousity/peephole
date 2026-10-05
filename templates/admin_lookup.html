@@ -7,6 +7,21 @@
   <label>IP address <input name="ip" value="{{ ip }}" placeholder="203.0.113.7 or 2001:db8::1" required autofocus></label>
   <button class="btn btn-primary" type="submit">Look up</button>
 </form>
+<form class="filters card bulk-lookup" method="post" action="/admin/lookup/bulk">
+  <label>Many addresses or networks, from stored data (no provider is asked) <textarea name="ips" rows="3" cols="60" placeholder="203.0.113.7, 198.51.100.0/24 …">{% if let Some(b) = bulk %}{{ b.text }}{% endif %}</textarea></label>
+  <button class="btn" type="submit">Check stored</button>
+</form>
+{% if let Some(b) = bulk %}
+<section class="card">
+  <div class="card-head"><h2>Stored</h2><span class="muted">{{ b.rows.len() }}{% if b.capped %} (first {{ crate::admin::lookup::BULK_MAX }}){% endif %}</span></div>
+  <div class="table-wrap"><table class="table" data-bulk><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th class="num">Requests</th><th>Max sev.</th><th class="num">Abuse</th><th>Last seen</th><th></th></tr></thead><tbody>
+  {% for r in b.rows %}<tr><td><a class="mono" href="/ip/{{ r.ip }}">{{ r.ip }}</a></td><td>{{ r.country.as_deref().unwrap_or("—") }}</td><td>{% if let Some(a) = r.asn %}AS{{ a }}{% else %}—{% endif %}</td><td class="num">{{ r.request_count }}</td><td>{{ r.max_severity }}</td><td class="num">{% if let Some(a) = r.abuse_score %}{{ a }}{% else %}—{% endif %}</td><td class="mono">{{ r.last_seen }}</td><td><a href="{{ crate::admin::views::link_href("ip", r.ip.as_str()) }}">links</a> · <a href="/admin/lookup?ip={{ r.ip }}">look up</a></td></tr>{% endfor %}
+  {% for m in b.missing %}<tr><td class="mono">{{ m }}</td><td colspan="6" class="muted">not stored</td><td><a href="/admin/lookup?ip={{ m }}">look up</a></td></tr>{% endfor %}
+  {% if b.rows.is_empty() && b.missing.is_empty() %}<tr><td colspan="8" class="empty">Nothing stored matches.</td></tr>{% endif %}
+  </tbody></table></div>
+  {% if !b.unreadable.is_empty() %}<p class="muted">Not an address or network: <span class="mono">{{ b.unreadable.join(", ") }}</span></p>{% endif %}
+</section>
+{% endif %}
 {% if let Some(e) = error %}<p class="muted">{{ e }}</p>{% endif %}
 {% if let Some(r) = result %}
 <div class="stack">

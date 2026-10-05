@@ -1,0 +1,35 @@
+{% extends "layout.html" %}
+{% block title %}peephole — links{% endblock %}
+{% block content %}
+{% let sub = "links" %}{% include "_admin_nav.html" %}
+{% let subtab = "fingerprints" %}{% let tabs = crate::admin::views::LINKS_TABS %}{% let tabs_label = "Links pages" %}{% include "_subtabs.html" %}
+<div class="page-head"><div><h1>Links</h1><p class="muted">What ties source IPs together. Browser fingerprints, SSH host keys and TLS certificates point to one operator; JA4, JA4H, HASSH and JA4X only to the same software. Open a value for its graph.</p></div></div>
+<div class="stack">
+{% if let Some(a) = not_found %}<div class="card empty">The old link <span class="mono">{{ a }}</span> no longer matches anything stored.</div>{% endif %}
+<section class="card">
+  <form class="filters" method="get" action="/admin/links">
+    <label>Kind <select name="kind">
+      <optgroup label="Identity">{% for k in crate::store::links::LinkKind::LIST %}{% if k.identity() %}<option value="{{ k.key() }}"{% if k == kind %} selected{% endif %}>{{ k.name() }}</option>{% endif %}{% endfor %}</optgroup>
+      <optgroup label="Software">{% for k in crate::store::links::LinkKind::LIST %}{% if !k.identity() %}<option value="{{ k.key() }}"{% if k == kind %} selected{% endif %}>{{ k.name() }}</option>{% endif %}{% endfor %}</optgroup>
+    </select></label>
+    <label>Starts with <input name="q" size="16" value="{{ f.q.as_deref().unwrap_or_default() }}"></label>
+    <label>Seen on <select name="shared"><option value="1">two or more IPs</option><option value="0"{% if !f.shared() %} selected{% endif %}>any number of IPs</option></select></label>
+    <label>From (UTC) <input name="from" type="date" value="{{ f.from.as_deref().unwrap_or_default() }}"></label>
+    <label>To (UTC) <input name="to" type="date" value="{{ f.to.as_deref().unwrap_or_default() }}"></label>
+    <label>Country <input name="country" size="3" maxlength="2" value="{{ f.country.as_deref().unwrap_or_default() }}"></label>
+    <label>Node <input name="node" size="10" value="{{ f.node.as_deref().unwrap_or_default() }}"{% if !kind.by_node() %} disabled title="Scans are not recorded per node"{% endif %}></label>
+    <label>Sort <select name="sort"><option value="ips">IPs</option><option value="sightings"{% if f.sort.as_deref() == Some("sightings") %} selected{% endif %}>sightings</option><option value="recent"{% if f.sort.as_deref() == Some("recent") %} selected{% endif %}>last seen</option></select></label>
+    <button>Filter</button>
+  </form>
+  <div class="table-wrap"><table class="table"><thead><tr><th>{{ kind.name() }}</th><th class="num">IPs</th><th class="num">Sightings</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>
+  {% for r in page.items %}<tr>
+    <td class="mono hk-fp"><a href="{{ crate::admin::views::link_href(kind.key(), r.value.as_str()) }}">{{ r.value }}</a>{% let value = r.value.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}</td>
+    <td class="num">{{ r.ips }}</td><td class="num">{{ crate::admin::views::thousands(r.sightings) }}</td>
+    <td class="mono">{{ r.first_seen.as_deref().unwrap_or("—") }}</td><td class="mono">{{ r.last_seen.as_deref().unwrap_or("—") }}</td>
+  </tr>{% endfor %}
+  {% if page.items.is_empty() %}<tr><td colspan="5" class="empty">Nothing{% if f.shared() %} seen on two or more IPs{% endif %} matches.</td></tr>{% endif %}
+  </tbody></table></div>
+  {% include "_pagination.html" %}
+</section>
+</div>
+{% endblock %}

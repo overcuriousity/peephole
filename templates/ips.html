@@ -17,6 +17,9 @@
   <label>Intel tag <input name="tag" list="intel-tags" value="{{ f.tag.as_deref().unwrap_or_default() }}" placeholder="greynoise:malicious"></label>
   <datalist id="intel-tags">{% for t in tags %}<option value="{{ t }}">{% endfor %}</datalist>
   <label>Looked up by <select name="intel"><option value="">any</option>{% for (n, l) in api_providers %}<option value="{{ n }}"{% if f.intel.as_deref() == Some(n) %} selected{% endif %}>{{ l }}</option>{% endfor %}</select></label>
+  <label>Open port <input name="port" size="7" value="{{ f.port.as_deref().unwrap_or_default() }}" placeholder="22/tcp"></label>
+  <label>Product <input name="product" size="14" value="{{ f.product.as_deref().unwrap_or_default() }}"></label>
+  <label>OS guess <input name="os" size="12" value="{{ f.os.as_deref().unwrap_or_default() }}"></label>
   <label>Not yet by <select name="nointel"><option value="">any</option>{% for (n, l) in api_providers %}<option value="{{ n }}"{% if f.nointel.as_deref() == Some(n) %} selected{% endif %}>{{ l }}</option>{% endfor %}</select></label>
   {% endif %}
   <label>Sort <select name="sort">
@@ -26,6 +29,7 @@
   </select></label>
   <button class="btn btn-primary" type="submit">Filter</button>
 </form>
+{% include "_chips.html" %}
 {% if can_delete %}
 <div class="row bulk-bar">
   <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-sel" data-needs-checked="bulk-form">Delete selected</button>

@@ -59,10 +59,14 @@ nmap.
 - **Admin area** (FIDO2 security keys only, no passwords) — request search
   and inspection (with the same IP's and same JA4's other requests), a live
   feed of new requests, analytics (top paths, user agents, JA4, methods,
-  open ports, products, OS guesses, abuse scores), per-IP pages with every
+  open ports, products, OS guesses, abuse scores; every row opens the
+  matching requests or IPs), a search box for IPs, networks, AS numbers,
+  requests, paths and fingerprints, per-IP pages with every
   enrichment result and counter-scan, the scan pace with the live queue and
-  every finished job, a "needs attention" list on the Overview, a graph of
-  browser fingerprints shared across IPs, canary reuse, the
+  every finished job, a "needs attention" list on the Overview, a Links
+  area (every browser fingerprint, SSH host key, TLS certificate, JA4, JA4H,
+  HASSH and JA4X, filterable, each with a graph of the IPs it was seen on and
+  what else links them), canary reuse, the
   false-positive inbox, deletion, and the dataset export: every request with
   everything known about it and its IP (enrichment history, scans,
   fingerprints) as typed Parquet, CSV or Timesketch JSONL, optionally
@@ -82,7 +86,8 @@ nmap.
   line, for nginx `deny`, nftables, ipset, fail2ban or CrowdSec. In a
   cluster it is drawn from every member's trap, so one node's catch
   protects everybody's real sites. Tor exits, verified crawlers, cluster
-  members and the node's own networks are never listed.
+  members and the node's own networks are never listed. Every node
+  documents its public endpoints at `/api` (linked in the footer).
 - **Lookup** (admin) — ask every provider the cluster can reach about one
   address, now: this node's databases and keys first, then a member that
   announces the missing provider. Shown once, never stored.

@@ -9,7 +9,23 @@ pub struct Chrome {
     pub version: &'static str,
 }
 
+/// The project's source repository.
+pub const REPO: &str = "https://github.com/overcuriousity/peephole";
+
 impl Chrome {
+    /// Where this build comes from: a release tag's release page, else its
+    /// commit; none for a source tree without either.
+    pub fn version_href(&self) -> Option<String> {
+        let v = self.version;
+        if v.starts_with('v') && v.contains('.') {
+            Some(format!("{REPO}/releases/tag/{v}"))
+        } else if crate::COMMIT.len() >= 7 && crate::COMMIT.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(format!("{REPO}/commit/{}", crate::COMMIT))
+        } else {
+            None
+        }
+    }
+
     pub fn new(authed: bool, active: &'static str) -> Self {
         Self {
             authed,
@@ -236,9 +252,18 @@ pub fn duration<S: SevValue>(secs: S) -> String {
 
 /// Second-level tabs: `(key, href, label)`, drawn by `_subtabs.html`.
 pub const LINKS_TABS: &[(&str, &str, &str)] = &[
-    ("fingerprints", "/admin/fingerprints", "Fingerprints"),
-    ("canaries", "/admin/canaries", "Canaries"),
+    ("fingerprints", "/admin/links", "Fingerprints"),
+    ("canaries", "/admin/links/canaries", "Canaries"),
 ];
+
+/// A value's page under Links. Values are percent-encoded: SSH
+/// fingerprints are base64 (`/`, `+`).
+pub fn link_href(kind: &str, value: &str) -> String {
+    format!(
+        "/admin/links/{kind}/{}",
+        crate::admin::public::urlencode(value)
+    )
+}
 pub const CLUSTER_TABS: &[(&str, &str, &str)] = &[
     ("members", "/admin/cluster", "Members"),
     ("access", "/admin/cluster/access", "Access"),

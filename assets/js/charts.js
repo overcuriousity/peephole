@@ -266,97 +266,6 @@
     }
   }
 
-  // Fingerprint ↔ IP graph: a small force layout (repulsion, springs,
-  // centring), run to rest once, then drawn; nodes can be dragged.
-  function fpGraph(host, clusters) {
-    var W = Math.max(widthOf(host, 800), 260), H = host.clientHeight || 420;
-    var nodes = [], edges = [], byKey = {};
-    // A seeded generator: the same clusters lay out the same on every load.
-    var seed = 7;
-    function rnd() { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; }
-    function node(key, kind, label) {
-      if (!byKey[key]) { byKey[key] = { key: key, kind: kind, label: label, x: W / 2 + (rnd() - 0.5) * W * 0.8, y: H / 2 + (rnd() - 0.5) * H * 0.8, vx: 0, vy: 0, links: [] }; nodes.push(byKey[key]); }
-      return byKey[key];
-    }
-    // Start each fingerprint at its own point on an ellipse and its IPs in a
-    // ring around it, so the force pass only relaxes an already sorted layout
-    // (from random starts, linked clusters end up tangled).
-    clusters.forEach(function (c, ci) {
-      var a = (ci / clusters.length) * 2 * Math.PI, cx = W / 2 + Math.cos(a) * W * 0.3 * (clusters.length > 1), cy = H / 2 + Math.sin(a) * H * 0.28 * (clusters.length > 1);
-      var f = node("fp:" + c.hash, "fp", c.hash.slice(0, 8));
-      f.x = cx; f.y = cy; f.count = c.count; f.hub = c.kind || "fp";
-      c.ips.forEach(function (ip, ii) {
-        var fresh = !byKey["ip:" + ip], n = node("ip:" + ip, "ip", ip), b = (ii / c.ips.length) * 2 * Math.PI + rnd() * 0.3;
-        if (fresh) { n.x = cx + Math.cos(b) * 70; n.y = cy + Math.sin(b) * 70; }
-        edges.push([f, n]); f.links.push(n); n.links.push(f);
-      });
-    });
-    if (!nodes.length) return;
-    // Spacing: room for an IP label, smaller when crowded.
-    var k = Math.max(40, Math.min(90, Math.sqrt((W * H) / nodes.length) * 0.4));
-    for (var it = 0; it < 300; it++) {
-      var cool = 1 - it / 300;
-      for (var i = 0; i < nodes.length; i++) {
-        var a = nodes[i];
-        for (var j = i + 1; j < nodes.length; j++) {
-          var b = nodes[j], dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy + 0.01, f = (k * k) / d2;
-          a.vx += dx * f * 0.06; a.vy += dy * f * 0.06; b.vx -= dx * f * 0.06; b.vy -= dy * f * 0.06;
-        }
-      }
-      edges.forEach(function (e) {
-        var dx = e[1].x - e[0].x, dy = e[1].y - e[0].y, d = Math.sqrt(dx * dx + dy * dy) || 1, f = (d - k) / d * 0.1;
-        e[0].vx += dx * f; e[0].vy += dy * f; e[1].vx -= dx * f; e[1].vy -= dy * f;
-      });
-      nodes.forEach(function (n) {
-        n.vx += (W / 2 - n.x) * 0.002; n.vy += (H / 2 - n.y) * 0.002;
-        var sp = Math.sqrt(n.vx * n.vx + n.vy * n.vy), lim = 20 * cool + 1;
-        if (sp > lim) { n.vx *= lim / sp; n.vy *= lim / sp; }
-        n.x = Math.max(16, Math.min(W - 110, n.x + n.vx)); // room for the label
-        n.y = Math.max(16, Math.min(H - 16, n.y + n.vy));
-        n.vx *= 0.6; n.vy *= 0.6;
-      });
-    }
-    var s = svg(host, W, H);
-    s.removeAttribute("height"); s.removeAttribute("width");
-    var ge = el("g", {}, s), gn = el("g", {}, s);
-    var lines = edges.map(function (e) { return el("line", { "class": "edge" }, ge); });
-    function place() {
-      edges.forEach(function (e, i) { lines[i].setAttribute("x1", e[0].x); lines[i].setAttribute("y1", e[0].y); lines[i].setAttribute("x2", e[1].x); lines[i].setAttribute("y2", e[1].y); });
-      nodes.forEach(function (n) {
-        if (n.kind === "fp") { n.el.setAttribute("x", n.x - 7); n.el.setAttribute("y", n.y - 7); } else { n.el.setAttribute("cx", n.x); n.el.setAttribute("cy", n.y); }
-        n.text.setAttribute("x", n.x + 10); n.text.setAttribute("y", n.y + 3);
-      });
-    }
-    function focus(n, on) {
-      var near = {}; near[n.key] = 1; n.links.forEach(function (m) { near[m.key] = 1; });
-      nodes.forEach(function (m) { m.el.classList.toggle("is-dim", on && !near[m.key]); m.text.classList.toggle("is-dim", on && !near[m.key]); });
-      edges.forEach(function (e, i) { lines[i].classList.toggle("is-dim", on && e[0] !== n && e[1] !== n); });
-    }
-    nodes.forEach(function (n) {
-      n.el = n.kind === "fp" ? el("rect", { "class": "n-fp n-" + n.hub, width: 14, height: 14, rx: 3, tabindex: 0 }, gn) : el("circle", { "class": "n-ip", r: 6, tabindex: 0 }, gn);
-      n.text = text(gn, 0, 0, n.label, "n-label");
-      var what = { fp: "fingerprint", ssh: "SSH host key", tls: "TLS certificate" };
-      hover(n.el, function () { return n.kind === "fp" ? what[n.hub] + " <b>" + esc(n.label) + "…</b> · " + n.links.length + " IPs · " + fmt(n.count) + " sightings" : "<b>" + esc(n.label) + "</b> · " + n.links.length + " shared identifier" + (n.links.length === 1 ? "" : "s"); });
-      n.el.addEventListener("mouseenter", function () { focus(n, true); });
-      n.el.addEventListener("mouseleave", function () { focus(n, false); });
-      var drag = null;
-      n.el.addEventListener("pointerdown", function (ev) { drag = { x: ev.clientX, y: ev.clientY, moved: false }; n.el.setPointerCapture(ev.pointerId); });
-      n.el.addEventListener("pointermove", function (ev) {
-        if (!drag) return;
-        var sc = W / s.getBoundingClientRect().width;
-        n.x += (ev.clientX - drag.x) * sc; n.y += (ev.clientY - drag.y) * sc;
-        if (Math.abs(ev.clientX - drag.x) + Math.abs(ev.clientY - drag.y) > 2) drag.moved = true;
-        drag.x = ev.clientX; drag.y = ev.clientY; place();
-      });
-      n.el.addEventListener("pointerup", function () {
-        var moved = drag && drag.moved; drag = null;
-        if (!moved) location.href = n.kind === "ip" ? "/ip/" + encodeURIComponent(n.label) : "#" + n.key.slice(3);
-      });
-      n.el.addEventListener("keydown", function (ev) { if (ev.key === "Enter") location.href = n.kind === "ip" ? "/ip/" + encodeURIComponent(n.label) : "#" + n.key.slice(3); });
-    });
-    place();
-  }
-
   // Redraw after the viewport width settles (rotation, window resize); a
   // height-only change (mobile URL bar) does not count.
   function onWidthChange(fn) {
@@ -396,8 +305,6 @@
         drawIp(); onWidthChange(drawIp);
       } catch (e) {}
     }
-    var fg = document.querySelector("[data-fp-graph]");
-    if (fg) { try { var cl = JSON.parse(fg.getAttribute("data-fp-graph")); fpGraph(fg, cl); onWidthChange(function () { fpGraph(fg, cl); }); } catch (e) {} }
   }
 
   function bootWall(wall) {
@@ -435,6 +342,6 @@
   }
 
   window.peephole = window.peephole || {};
-  window.peephole.charts = { timeline: timeline, hbars: hbars, map: map, sparkline: sparkline, heatmap: heatmap, calendar: calendar, fpGraph: fpGraph };
+  window.peephole.charts = { timeline: timeline, hbars: hbars, map: map, sparkline: sparkline, heatmap: heatmap, calendar: calendar };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
 })();

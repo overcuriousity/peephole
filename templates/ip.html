@@ -76,7 +76,7 @@
     <h2>Canaries</h2>
     {% if adm.canary_links.0 > 0 %}<p>Credentials harvested here were used by {{ adm.canary_links.0 }} other IP{% if adm.canary_links.0 != 1 %}s{% endif %}.</p>{% endif %}
     {% if adm.canary_links.1 > 0 %}<p>Used credentials harvested by {{ adm.canary_links.1 }} other IP{% if adm.canary_links.1 != 1 %}s{% endif %}.</p>{% endif %}
-    <p><a href="/admin/canaries?ip={{ ov.ip.ip }}">Show the reuses</a></p>
+    <p><a href="/admin/links/canaries?ip={{ ov.ip.ip }}">Show the reuses</a></p>
   </section>
   {% endif %}
   {% endif %}
@@ -138,10 +138,10 @@
 
   {% if let Some(adm) = admin %}
   <section class="card">
-    <div class="card-head"><h2>Fingerprints</h2></div>
+    <div class="card-head"><h2>Fingerprints</h2><a href="{{ crate::admin::views::link_href("ip", ov.ip.ip.as_str()) }}">Link graph</a></div>
     {% if adm.fingerprints.is_empty() %}<p class="muted">No browser fingerprints collected.</p>{% endif %}
     {% for f in adm.fingerprints %}
-      <p><a class="mono" href="/admin/fingerprints#{{ f.hash }}">{{ f.hash }}</a> ×{{ f.count }} — seen from <b>{{ f.other_ips }}</b> other IPs
+      <p><a class="mono" href="{{ crate::admin::views::link_href("fp", f.hash.as_str()) }}">{{ f.hash }}</a> ×{{ f.count }} — seen from <b>{{ f.other_ips }}</b> other IPs
         {% for v in f.visitor_ids %}<span class="badge badge-label">visitor {{ v }}</span>{% endfor %}</p>
     {% endfor %}
   </section>

@@ -1,0 +1,51 @@
+{% extends "layout.html" %}
+{% block title %}peephole — {{ kind_name }}{% endblock %}
+{% block head %}<script src="/assets/js/linkgraph.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
+{% block content %}
+{% let sub = "links" %}{% include "_admin_nav.html" %}
+{% let subtab = "fingerprints" %}{% let tabs = crate::admin::views::LINKS_TABS %}{% let tabs_label = "Links pages" %}{% include "_subtabs.html" %}
+<div class="page-head"><div><h1>{{ kind_name }}</h1><p class="mono hk-fp">{{ value }}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}</p></div></div>
+{% if !seen() %}
+<div class="card empty">Not seen: nothing with this value is stored.</div>
+{% else %}
+<div class="link-layout">
+  <section class="card link-graph-card">
+    <div class="card-head"><h2>Graph</h2><span class="muted" data-graph-status></span></div>
+    <form class="filters link-controls" data-graph-controls hidden>
+      {% for k in kinds %}<label class="check link-type{% if !k.identity() %} soft{% endif %}"><input type="checkbox" name="types" value="{{ k.key() }}"{% if types.contains(k) %} checked{% endif %}> {{ k.name() }}</label>{% endfor %}
+      <label>Depth <select name="depth"><option{% if depth == 1 %} selected{% endif %}>1</option><option{% if depth == 2 %} selected{% endif %}>2</option><option{% if depth == 3 %} selected{% endif %}>3</option></select></label>
+      <button type="button" class="btn btn-sm" data-graph-fit>Fit</button>
+    </form>
+    <div class="link-graph" data-link-graph data-focus="{{ focus }}" data-kinds="{{ kinds_json }}" data-identity="{{ identity_json }}" role="img" aria-label="{{ kind_name }} {{ value }}, the IPs it was seen on and what else links them">
+      <p class="muted link-graph-nojs">The graph needs JavaScript; the IPs are listed below.</p>
+    </div>
+    <div class="legend link-legend"><span><i class="swatch item"></i>linking value</span><span><i class="swatch ip"></i>IP</span><span><i class="swatch group"></i>many IPs (expand)</span><span><i class="line"></i>identity</span><span><i class="line soft"></i>software</span></div>
+  </section>
+  <aside class="card link-panel" data-link-panel>
+    <div data-selected hidden></div>
+    <dl class="kv">
+    {% if let Some(it) = item %}
+      <dt>IPs</dt><dd>{{ it.ips }}</dd>
+      <dt>Sightings</dt><dd>{{ crate::admin::views::thousands(it.sightings) }}</dd>
+      <dt>First seen</dt><dd>{{ it.first_seen.as_deref().unwrap_or("—") }}</dd>
+      <dt>Last seen</dt><dd>{{ it.last_seen.as_deref().unwrap_or("—") }}</dd>
+      {% if !it.countries.is_empty() %}<dt>Countries</dt><dd>{{ it.countries.join(", ") }}</dd>{% endif %}
+      {% if !it.nodes.is_empty() %}<dt>Nodes</dt><dd>{{ it.nodes.join(", ") }}</dd>{% endif %}
+      {% if !it.detail.is_empty() %}<dt>Detail</dt><dd class="plain">{{ it.detail }}</dd>{% endif %}
+    {% else %}
+      <dt>IP page</dt><dd><a href="/ip/{{ value }}">{{ value }}</a></dd>
+    {% endif %}
+    </dl>
+    {% if let Some(h) = requests_href() %}<p><a href="{{ h }}">Requests with this value</a></p>{% endif %}
+  </aside>
+</div>
+{% if let Some(it) = item %}
+<section class="card">
+  <div class="card-head"><h2>IPs</h2><span class="muted">{{ it.ips }}{% if it.ips > crate::store::links::ITEM_IPS %} (first {{ crate::store::links::ITEM_IPS }}){% endif %}</span></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th class="num">Sightings</th><th>Last seen</th></tr></thead><tbody>
+  {% for r in it.ip_rows %}<tr><td><a class="mono" href="/ip/{{ r.ip }}">{{ r.ip }}</a></td><td>{{ r.country.as_deref().unwrap_or("—") }}</td><td>{% if let Some(a) = r.asn %}AS{{ a }}{% else %}—{% endif %}</td><td class="num">{{ r.sightings }}</td><td class="mono">{{ r.last_seen.as_deref().unwrap_or("—") }}</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+{% endif %}
+{% endif %}
+{% endblock %}

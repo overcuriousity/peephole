@@ -45,7 +45,7 @@ pub struct Analytics {
 const TOP: i64 = 15;
 
 /// The User-Agent of a stored `headers_json` (`[[name, value], …]`).
-const UA_SQL: &str = "COALESCE((SELECT json_extract(h.value, '$[1]')
+pub(crate) const UA_SQL: &str = "COALESCE((SELECT json_extract(h.value, '$[1]')
       FROM json_each(CASE WHEN json_valid(r.headers_json) THEN r.headers_json ELSE '[]' END) h
       WHERE lower(json_extract(h.value, '$[0]')) = 'user-agent' LIMIT 1), '(none)')";
 
@@ -386,8 +386,8 @@ mod tests {
     }
 
     /// Over a time window the fingerprint lists read the window through
-    /// the time index, not every fingerprinted row through the JA4H one
-    /// (`ja4` has no index of its own yet; it is checked for when it does).
+    /// the time index, not every fingerprinted row through the JA4 / JA4H
+    /// one.
     #[tokio::test]
     async fn fingerprint_lists_read_only_the_window() {
         let s = seeded().await;
@@ -404,6 +404,23 @@ mod tests {
                 "{col}: {plan:?}"
             );
         }
+    }
+
+    /// A lookup by value reads the JA4 index.
+    #[tokio::test]
+    async fn ja4_lookups_use_their_index() {
+        let s = seeded().await;
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "EXPLAIN QUERY PLAN SELECT ip_id FROM requests r WHERE r.ja4 IS NOT NULL AND r.ja4 = ?",
+        )
+        .bind("t13d_a")
+        .fetch_all(&s.pool)
+        .await
+        .unwrap();
+        assert!(
+            plan.iter().any(|p| p.3.contains("idx_requests_ja4")),
+            "{plan:?}"
+        );
     }
 
     #[tokio::test]

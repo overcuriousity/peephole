@@ -1,0 +1,43 @@
+{% extends "layout.html" %}
+{% block title %}peephole — API{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>API</h1><p class="muted">The public endpoints of this node. No key needed. Everything public is delayed: a request shows up only {{ delay_minutes }} minutes plus a random 0–{{ jitter_minutes }} minutes after it arrived. Request contents, query strings and fingerprints are never public.</p></div></div>
+<div class="stack prose">
+<section class="card api-endpoint">
+  <h2>GET /api/blocklist</h2>
+  <p>Threat intelligence for firewalls: the addresses that sent requests of a given severity in a time window, one address (or prefix) per line, as <span class="mono">text/plain</span>. Lines starting with <span class="mono">#</span> are comments. Recomputed at most once a minute per parameter set; the newest entries first, at most {{ crate::admin::blocklist::MAX_ENTRIES }}.</p>
+  <table class="table"><thead><tr><th>Parameter</th><th>Values</th><th>Default</th></tr></thead><tbody>
+    <tr><td class="mono">hours</td><td>1–{{ crate::admin::blocklist::MAX_HOURS }}: the window</td><td>{{ crate::admin::blocklist::DEFAULT_HOURS }}</td></tr>
+    <tr><td class="mono">min_severity</td><td>1–4: the least severity a request needs</td><td>{{ crate::admin::blocklist::DEFAULT_MIN_SEVERITY }}</td></tr>
+    <tr><td class="mono">networks=1</td><td>collapse a /24 (IPv6: /64) with {{ crate::admin::blocklist::NET_MIN_IPS }} or more entries into one prefix</td><td>off</td></tr>
+  </tbody></table>
+  <p>An unusable value means its default, so a typo never makes a firewall script fail open. Never listed: Tor exits, verified crawlers, the addresses of this project's own nodes, and the operator's own and excluded networks. In a cluster, the list is drawn from every member's trap.</p>
+  <pre>curl -fsS 'https://&lt;this host&gt;/api/blocklist?hours=48&amp;min_severity=3&amp;networks=1'
+
+# nginx
+curl -fsS https://&lt;this host&gt;/api/blocklist | grep -v '^#' | sed 's/.*/deny &amp;;/' &gt; /etc/nginx/blocklist.conf \
+  &amp;&amp; nginx -t &amp;&amp; systemctl reload nginx
+
+# nftables (an IPv4 set "peephole" in table inet filter)
+curl -fsS https://&lt;this host&gt;/api/blocklist | grep -v '^#' | grep -v : \
+  | sed 's/.*/add element inet filter peephole { & }/' | nft -f -</pre>
+</section>
+<section class="card api-endpoint">
+  <h2>GET /api/stats</h2>
+  <p>The wall's numbers as JSON: totals, unique IPs, countries, Tor exits, finished counter-scans, top IPs, countries and ASNs, the severity distribution, a timeline and a weekday × hour heatmap. Parameter <span class="mono">range</span>: <span class="mono">24h</span> (default), <span class="mono">7d</span>, <span class="mono">30d</span> or <span class="mono">all</span>.</p>
+  <pre>curl -fsS 'https://&lt;this host&gt;/api/stats?range=7d'</pre>
+</section>
+<section class="card api-endpoint">
+  <h2>GET /api/map</h2>
+  <p>Unique IPs per country (ISO 3166-1 alpha-2) as JSON, with the largest count. Parameter <span class="mono">range</span> as for <span class="mono">/api/stats</span>.</p>
+</section>
+<section class="card api-endpoint">
+  <h2>GET /api/countries</h2>
+  <p>Country codes and their names as JSON; cached for a day.</p>
+</section>
+<section class="card api-endpoint">
+  <h2>GET /healthz</h2>
+  <p><span class="mono">ok</span> while the database answers, otherwise HTTP 503 <span class="mono">unavailable</span>. For load balancers and monitoring.</p>
+</section>
+</div>
+{% endblock %}

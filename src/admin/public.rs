@@ -49,6 +49,8 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/api/countries", get(countries_json))
         .route("/api/blocklist", get(crate::admin::blocklist::feed))
         .route("/healthz", get(healthz))
+        .route("/api", get(api_page))
+        .route("/about", get(about_page))
 }
 
 #[derive(Template)]
@@ -213,6 +215,40 @@ async fn countries_json() -> impl IntoResponse {
     )
 }
 
+#[derive(Template)]
+#[template(path = "api.html")]
+struct ApiPage {
+    chrome: Chrome,
+    /// This node's publication delay and jitter, in minutes.
+    delay_minutes: u32,
+    jitter_minutes: u32,
+}
+
+/// The public endpoints, their parameters and formats.
+async fn api_page(
+    MaybeUser(authed): MaybeUser,
+    State(state): State<Arc<AdminState>>,
+) -> AppResult<Html<String>> {
+    render(&ApiPage {
+        chrome: Chrome::new(authed, ""),
+        delay_minutes: state.cfg.public.delay_minutes,
+        jitter_minutes: state.cfg.public.jitter_minutes,
+    })
+}
+
+#[derive(Template)]
+#[template(path = "about.html")]
+struct AboutPage {
+    chrome: Chrome,
+}
+
+/// What peephole does to whom, and on what grounds.
+async fn about_page(MaybeUser(authed): MaybeUser) -> AppResult<Html<String>> {
+    render(&AboutPage {
+        chrome: Chrome::new(authed, ""),
+    })
+}
+
 async fn healthz(State(state): State<Arc<AdminState>>) -> Response {
     match sqlx::query_scalar::<_, i64>("SELECT 1")
         .fetch_one(&state.store.pool)
@@ -238,7 +274,7 @@ pub(crate) fn qs_without_page(pairs: &[(&str, Option<String>)]) -> String {
     out
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     let mut o = String::new();
     for b in s.bytes() {
         match b {
@@ -256,6 +292,7 @@ fn urlencode(s: &str) -> String {
 struct IpsPage {
     chrome: Chrome,
     f: IpFilter,
+    chips: Vec<Chip>,
     page: Arc<Page<IpSummary>>,
     qs: String,
     /// Rows matching the filter across all pages; `Some` only with a session.
@@ -312,11 +349,15 @@ pub(crate) fn public_ip_filter(f: &IpFilter, show_labels: bool) -> IpFilter {
         tag: None,
         intel: None,
         nointel: None,
+        port: None,
+        product: None,
+        os: None,
     }
 }
 
-pub(crate) fn ip_qs(f: &IpFilter) -> String {
-    qs_without_page(&[
+/// The IP filter as query pairs, in the order pages show them.
+fn ip_pairs(f: &IpFilter) -> Vec<(&'static str, Option<String>)> {
+    vec![
         ("q", f.q.clone()),
         ("country", f.country.clone()),
         ("asn", f.asn.map(|a| a.to_string())),
@@ -328,11 +369,19 @@ pub(crate) fn ip_qs(f: &IpFilter) -> String {
         ("tag", f.tag.clone()),
         ("intel", f.intel.clone()),
         ("nointel", f.nointel.clone()),
-    ])
+        ("port", f.port.clone()),
+        ("product", f.product.clone()),
+        ("os", f.os.clone()),
+    ]
 }
 
-pub(crate) fn request_qs(f: &RequestFilter) -> String {
-    qs_without_page(&[
+pub(crate) fn ip_qs(f: &IpFilter) -> String {
+    qs_without_page(&ip_pairs(f))
+}
+
+/// The request filter as query pairs, in the order pages show them.
+fn request_pairs(f: &RequestFilter) -> Vec<(&'static str, Option<String>)> {
+    vec![
         ("ip", f.ip.clone()),
         ("path", f.path.clone()),
         ("label", f.label.clone()),
@@ -344,7 +393,83 @@ pub(crate) fn request_qs(f: &RequestFilter) -> String {
         ("to", f.to.clone()),
         ("node", f.node.clone()),
         ("ja4h", f.ja4h.clone()),
-    ])
+        ("ja4", f.ja4.clone()),
+        ("ua", f.ua.clone()),
+        ("method", f.method.clone()),
+        ("transport", f.transport.clone()),
+        ("answer", f.answer.clone()),
+    ]
+}
+
+pub(crate) fn request_qs(f: &RequestFilter) -> String {
+    qs_without_page(&request_pairs(f))
+}
+
+/// An applied filter, and the page without it.
+pub struct Chip {
+    pub label: &'static str,
+    pub value: String,
+    pub href: String,
+}
+
+/// One chip per non-empty filter of `pairs` (`sort` is not a filter); each
+/// links to `path` with every other filter, from the first page.
+pub(crate) fn chips(path: &str, pairs: &[(&str, Option<String>)]) -> Vec<Chip> {
+    pairs
+        .iter()
+        .enumerate()
+        .filter(|(_, (k, v))| *k != "sort" && v.as_deref().is_some_and(|v| !v.trim().is_empty()))
+        .map(|(i, (k, v))| {
+            let rest: Vec<_> = pairs
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, p)| p.clone())
+                .collect();
+            let qs = qs_without_page(&rest);
+            Chip {
+                label: filter_label(k),
+                value: v.clone().unwrap_or_default(),
+                href: if qs.is_empty() {
+                    path.to_string()
+                } else {
+                    format!("{path}?{}", qs.trim_end_matches('&'))
+                },
+            }
+        })
+        .collect()
+}
+
+/// A query parameter as people read it.
+fn filter_label(k: &str) -> &'static str {
+    match k {
+        "q" => "Address",
+        "ip" => "IP",
+        "path" => "Path",
+        "label" => "Label",
+        "severity" => "Severity",
+        "min_severity" => "Min severity",
+        "country" => "Country",
+        "asn" => "ASN",
+        "from" => "From",
+        "to" => "To",
+        "node" => "Node",
+        "ja4" => "JA4",
+        "ja4h" => "JA4H",
+        "ua" => "User agent",
+        "method" => "Method",
+        "transport" => "Transport",
+        "answer" => "Answer",
+        "tor" => "Tor exits",
+        "min_abuse" => "Min abuse score",
+        "tag" => "Intel tag",
+        "intel" => "Looked up by",
+        "nointel" => "Not yet by",
+        "port" => "Open port",
+        "product" => "Product",
+        "os" => "OS guess",
+        _ => "Filter",
+    }
 }
 
 async fn ips(
@@ -393,6 +518,7 @@ async fn ips(
         chrome: Chrome::new(authed, "ips"),
         count_max,
         qs: ip_qs(&f),
+        chips: chips("/ips", &ip_pairs(&f)),
         f,
         page,
         bulk_total,
@@ -408,6 +534,7 @@ async fn ips(
 struct RequestsPage {
     chrome: Chrome,
     f: RequestFilter,
+    chips: Vec<Chip>,
     page: Page<RequestListRow>,
     qs: String,
     bulk_total: Option<crate::store::browse::Count>,
@@ -436,6 +563,7 @@ async fn requests(
         .collect();
     render(&RequestsPage {
         chrome: Chrome::new(true, "requests"),
+        chips: chips("/requests", &request_pairs(&f)),
         f,
         page,
         qs,

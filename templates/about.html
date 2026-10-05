@@ -1,0 +1,12 @@
+{% extends "layout.html" %}
+{% block title %}peephole — about{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>About</h1></div></div>
+<section class="card prose">
+  <p>When you connect anything to the internet, you get scanned. We claim the right to scan back.</p>
+  <p>Every request against our configured interfaces is heuristically evaluated and classified; in consequence, appropriate reconnaissance measures are taken. The generated reconnaissance data is then used to create research datasets and threat intelligence.</p>
+  <p>Node operators are advised to configure their peephole instances in such a way that they do not apply to legitimate web requests on their official sites: normal visitors are usually not subject to this project.</p>
+  <p>We process IP addresses and the requests sent from them on the basis of our legitimate interest under Art. 6(1)(f) GDPR: protecting our and others' systems against attacks, and researching the scanning that precedes them. Request contents are never published; public pages show addresses and aggregates only, delayed.</p>
+  <p>The source code is public: <a href="{{ crate::admin::views::REPO }}">{{ crate::admin::views::REPO }}</a>. The threat intelligence is available through the <a href="/api">public API</a>.</p>
+</section>
+{% endblock %}

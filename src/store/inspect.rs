@@ -38,13 +38,6 @@ pub struct FpSummary {
     pub visitor_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FpCluster {
-    pub hash: String,
-    pub ips: Vec<String>,
-    pub count: i64,
-}
-
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct FpClaimRow {
     pub id: i64,
@@ -377,26 +370,6 @@ impl Store {
             .collect())
     }
 
-    /// Fingerprint hashes seen from more than one source IP.
-    pub async fn fingerprint_clusters(&self) -> Result<Vec<FpCluster>> {
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT f.fp_hash, GROUP_CONCAT(DISTINCT i.ip), COUNT(*)
-             FROM fingerprints f JOIN ips i ON f.ip_id = i.id WHERE f.fp_hash IS NOT NULL
-             GROUP BY f.fp_hash HAVING COUNT(DISTINCT f.ip_id) > 1
-             ORDER BY COUNT(DISTINCT f.ip_id) DESC LIMIT 200",
-        )
-        .fetch_all(&self.read)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(hash, ips, count)| FpCluster {
-                hash,
-                ips: ips.split(',').map(str::to_string).collect(),
-                count,
-            })
-            .collect())
-    }
-
     /// Requests from this IP answered without being recorded in full: light
     /// rows plus the ones only counted.
     pub async fn skipped_for_ip(&self, ip_id: i64) -> Result<i64> {
@@ -648,9 +621,12 @@ mod tests {
         assert_eq!(fps[0].hash, "h1");
         assert_eq!(fps[0].other_ips, 1);
         assert_eq!(fps[0].visitor_ids, vec!["v1".to_string()]);
-        let clusters = s.fingerprint_clusters().await.unwrap();
-        assert_eq!(clusters.len(), 1);
-        assert_eq!(clusters[0].ips.len(), 2);
+        let shared = s
+            .links_list(&crate::store::links::LinkFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(shared.items.len(), 1);
+        assert_eq!(shared.items[0].ips, 2);
         let claims = s.claims_for_ip(a).await.unwrap();
         assert_eq!(claims[0].contact_email.as_deref(), Some("me@x.y"));
         assert_eq!(s.inbox().await.unwrap().len(), 1);

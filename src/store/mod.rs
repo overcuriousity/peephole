@@ -11,12 +11,14 @@ pub mod fingerprints;
 pub mod hostkeys;
 pub mod inspect;
 pub mod ja4h;
+pub mod links;
 pub mod maintenance;
 pub mod publish;
 pub mod recorder;
 pub mod requests;
 pub mod scans;
 pub mod stats;
+pub mod useragent;
 
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -36,6 +38,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0003_canaries.sql"),
     include_str!("migrations/0004_ja4h.sql"),
     include_str!("migrations/0005_public_delay.sql"),
+    include_str!("migrations/0006_links.sql"),
+    include_str!("migrations/0007_user_agent.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of

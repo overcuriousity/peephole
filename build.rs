@@ -92,6 +92,7 @@ fn stamp_assets() {
         "assets/app.css",
         "assets/js/app.js",
         "assets/js/charts.js",
+        "assets/js/linkgraph.js",
         "assets/js/theme.js",
         "assets/world.svg",
     ] {

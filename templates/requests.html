@@ -12,11 +12,17 @@
   <label>ASN <input name="asn" size="7" value="{% if let Some(a) = f.asn %}{{ a }}{% endif %}"></label>
   <label>From (UTC) <input name="from" type="datetime-local" value="{{ f.from.as_deref().unwrap_or_default() }}"></label>
   <label>To (UTC) <input name="to" type="datetime-local" value="{{ f.to.as_deref().unwrap_or_default() }}"></label>
+  <label>User agent <input name="ua" size="16" value="{{ f.ua.as_deref().unwrap_or_default() }}"></label>
+  <label>Method <input name="method" size="7" value="{{ f.method.as_deref().unwrap_or_default() }}"></label>
+  <label>Transport <input name="transport" size="7" value="{{ f.transport.as_deref().unwrap_or_default() }}"></label>
+  <label>Answer <input name="answer" size="12" value="{{ f.answer.as_deref().unwrap_or_default() }}"></label>
+  <label>JA4 <input name="ja4" size="20" value="{{ f.ja4.as_deref().unwrap_or_default() }}"></label>
   <label>JA4H <input name="ja4h" size="20" value="{{ f.ja4h.as_deref().unwrap_or_default() }}"></label>
   {% if !nodes.is_empty() %}<label>Node <select name="node"><option value="">any</option>
     {% for n in nodes %}<option value="{{ n }}"{% if f.node.as_deref() == Some(n.as_str()) %} selected{% endif %}>{{ n }}</option>{% endfor %}</select></label>{% endif %}
   <button class="btn btn-primary" type="submit">Filter</button>
 </form>
+{% include "_chips.html" %}
 {% if can_delete %}
 <div class="row bulk-bar">
   <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-sel" data-needs-checked="bulk-form">Delete selected</button>

@@ -19,7 +19,15 @@
 .stack { display: grid; gap: 1rem; }
 .stack > *, .grid-2 > *, .grid-3 > *, .tiles > * { min-width: 0; }
 .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
-.footer { max-width: var(--shell-max); margin: 0 auto; padding: 1rem; color: var(--color-fg-muted); font-size: var(--text-xs); display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+.footer { max-width: var(--shell-max); margin: 0 auto; padding: 1rem; color: var(--color-fg-muted); font-size: var(--text-xs); display: grid; gap: 0.5rem; }
+.footer a { color: var(--color-fg-secondary); }
+.footer-disclaimer { margin: 0; }
+.footer-links { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; }
+.footer-links > span:first-child { margin-right: auto; }
+.prose { max-width: 46rem; }
+.prose p, .prose li { line-height: 1.6; }
+.api-endpoint h2 { font-family: var(--font-mono); font-size: var(--text-base); }
+.api-endpoint pre { overflow-x: auto; padding: 0.75rem; background: var(--color-bg-elevated); border-radius: var(--radius-md); font-size: var(--text-xs); }
 @media (max-width: 48rem) {
   .grid-2, .grid-3 { grid-template-columns: 1fr; }
   /* Two rows: brand and actions on top, the full-width nav below, so no

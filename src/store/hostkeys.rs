@@ -30,9 +30,11 @@ impl HostKeyRow {
         kind_name(&self.kind)
     }
 
-    /// Its section on the fingerprints page, when it identifies.
-    pub fn anchor(&self) -> String {
-        anchor(&self.kind, &self.fingerprint)
+    /// Its page under Links.
+    pub fn link_href(&self) -> String {
+        let kind =
+            crate::store::links::LinkKind::of_host_kind(&self.kind).map_or("ssh", |k| k.key());
+        crate::admin::views::link_href(kind, &self.fingerprint)
     }
 }
 
@@ -47,25 +49,6 @@ pub fn kind_name(kind: &str) -> &'static str {
         JA4X => "JA4X",
         HASSH => "HASSH",
         _ => "other",
-    }
-}
-
-/// A host key or certificate found on more than one source IP.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct HostKeyCluster {
-    pub kind: String,
-    /// What the graph and the anchors use: `ssh:`/`tls:` and the first
-    /// characters of the fingerprint.
-    pub hash: String,
-    pub fingerprint: String,
-    pub detail: String,
-    pub ips: Vec<String>,
-    pub count: i64,
-}
-
-impl HostKeyCluster {
-    pub fn kind_name(&self) -> &'static str {
-        kind_name(&self.kind)
     }
 }
 
@@ -154,33 +137,6 @@ impl Store {
         .fetch_all(&self.read)
         .await?)
     }
-
-    /// Host keys and certificates found on more than one source IP, the
-    /// most widely shared first.
-    pub async fn host_key_clusters(&self) -> Result<Vec<HostKeyCluster>> {
-        let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
-            "SELECT h.kind, h.fingerprint, MAX(h.detail), GROUP_CONCAT(DISTINCT i.ip), COUNT(*)
-             FROM host_keys h JOIN ips i ON i.id = h.ip_id
-             WHERE h.kind IN (?, ?)
-             GROUP BY h.kind, h.fingerprint HAVING COUNT(DISTINCT h.ip_id) > 1
-             ORDER BY COUNT(DISTINCT h.ip_id) DESC LIMIT 200",
-        )
-        .bind(SSH_HOSTKEY)
-        .bind(TLS_CERT)
-        .fetch_all(&self.read)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(kind, fingerprint, detail, ips, count)| HostKeyCluster {
-                hash: anchor(&kind, &fingerprint),
-                kind,
-                fingerprint,
-                detail,
-                ips: ips.split(',').map(str::to_string).collect(),
-                count,
-            })
-            .collect())
-    }
 }
 
 /// A short id for a host key or certificate, usable as a page anchor:
@@ -233,11 +189,18 @@ mod tests {
         assert!(rows.iter().all(|r| r.other_ips == 1), "{rows:?}");
         assert!(s.host_keys_for_scan(plain).await.unwrap().is_empty());
 
-        let clusters = s.host_key_clusters().await.unwrap();
         // Two SSH host keys and one certificate, each on both IPs.
-        assert_eq!(clusters.len(), 3, "{clusters:?}");
-        assert!(clusters.iter().all(|c| c.ips.len() == 2));
-        assert!(clusters.iter().any(|c| c.hash.starts_with("tls-")));
+        for (kind, n) in [("ssh", 2), ("tls", 1)] {
+            let shared = s
+                .links_list(&crate::store::links::LinkFilter {
+                    kind: Some(kind.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(shared.items.len(), n, "{kind}");
+            assert!(shared.items.iter().all(|c| c.ips == 2));
+        }
 
         let a = s.analytics(crate::store::stats::Range::All).await.unwrap();
         assert_eq!((a.hassh.len(), a.ja4x.len()), (1, 1));

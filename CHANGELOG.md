@@ -11,6 +11,35 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   requests", `[public] recent_rows`, default 50): time, IP, method, path
   (no query string, cut at 80 characters), severity and, when shown,
   labels.
+- Admin "Links": every browser fingerprint, SSH host key, TLS certificate,
+  JA4, JA4H, HASSH and JA4X, not only shared ones, filterable by value,
+  date, country and node and sortable by IPs, sightings or last seen. Each
+  value (and each IP) has a page with a graph of the IPs it was seen on and
+  what else links them: identity links by default, software fingerprints on
+  request, crowded values collapsed. Every such value in the admin pages
+  links there. The requests search filters by JA4.
+- Admin Analytics: every row opens what is behind it: paths, user agents,
+  methods, transports and answers the matching requests (from the range's
+  start), open ports, products and OS guesses the IPs with them in any
+  stored scan, abuse bands, scan levels and job statuses their lists.
+  New admin filters: requests by user agent, method, transport and answer;
+  IPs by open port, product and OS guess. Applied filters show as chips
+  that remove one filter each.
+- Requests keep their User-Agent in a column of their own (derived from
+  the stored headers on each node; rows stored before are filled in the
+  background on start).
+- Admin search: the top bar box takes an IP (its page, or a prefilled
+  live lookup when not stored), a network, `AS123`, `#<request id>`, a
+  path, or a fingerprint, host key, certificate or JA4/JA4H/HASSH/JA4X
+  value (its Links page).
+- Lookup checks many addresses or networks at once against stored data
+  (no provider is asked).
+- Every page's footer links the public API specification (`/api`: the
+  blocklist feed, `/api/stats`, `/api/map`, `/api/countries`, `/healthz`
+  with their parameters and defaults), an About page (`/about`: what
+  peephole does, and the legitimate interest it relies on), the source
+  repository and the running build. The blocklist names `/api` in its
+  comment lines.
 
 ### Changed
 
@@ -21,6 +50,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   "last hit … ago", static UTC times.
 - The live "Recent activity" feed moved from the wall to the admin
   Overview.
+- The Fingerprints and Canaries pages moved to `/admin/links` and
+  `/admin/links/canaries`; the old addresses redirect.
 
 ## [0.4.0] - 2026-10-05
 

@@ -24,7 +24,7 @@
       {% if chrome.authed %}<a href="/admin"{% if chrome.active == "admin" %} aria-current="page"{% endif %}>Admin</a>{% endif %}
     </nav>
     <div class="topbar-actions">
-      {% if chrome.authed %}<form class="topbar-search" method="get" action="/admin/lookup" role="search"><input class="mono" name="ip" placeholder="Look up IP" aria-label="Look up an IP" size="15" required></form>{% endif %}
+      {% if chrome.authed %}<form class="topbar-search" method="get" action="/admin/search" role="search"><input class="mono" name="q" placeholder="IP, AS…, hash, /path" aria-label="Search: an IP, network, AS number, request id, path or fingerprint" size="18" required></form>{% endif %}
       <button class="btn btn-ghost btn-sm" type="button" data-theme-toggle aria-label="Toggle theme"><span data-theme-label>Auto</span></button>
       {% if chrome.authed %}
         <form method="post" action="/logout"><button class="btn btn-ghost btn-sm" type="submit">Log out</button></form>
@@ -37,6 +37,9 @@
 <main class="shell">
 {% block content %}{% endblock %}
 </main>
-<footer class="footer"><span>peephole · scan the scanners</span><span class="mono">{{ chrome.version }}</span></footer>
+<footer class="footer">
+  <p class="footer-disclaimer">When you connect anything to the internet, you get scanned. We claim the right to scan back. <a href="/about">Why and how →</a></p>
+  <nav class="footer-links" aria-label="About peephole"><span>peephole · scan the scanners</span><a href="/api">API</a><a href="/about">About</a><a href="{{ crate::admin::views::REPO }}">Source</a>{% if let Some(h) = chrome.version_href() %}<a class="mono" href="{{ h }}">{{ chrome.version }}</a>{% else %}<span class="mono">{{ chrome.version }}</span>{% endif %}</nav>
+</footer>
 </body>
 </html>

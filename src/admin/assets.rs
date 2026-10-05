@@ -41,6 +41,11 @@ static ASSETS: &[Asset] = &[
         bytes: include_bytes!("../../assets/js/charts.js"),
     },
     Asset {
+        path: "js/linkgraph.js",
+        mime: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../../assets/js/linkgraph.js"),
+    },
+    Asset {
         path: "fonts/inter-400.woff2",
         mime: "font/woff2",
         bytes: include_bytes!("../../assets/fonts/inter-400.woff2"),
