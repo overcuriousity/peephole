@@ -1592,6 +1592,12 @@ async fn assets_and_security_headers() {
     let css = resp.text().await.unwrap();
     assert!(css.contains("--color-accent"));
     assert!(css.contains("@font-face"));
+    assert!(css.contains(".link-graph"), "the link graph's styles");
+    let js = reqwest::get(format!("{base}/assets/js/linkgraph.js"))
+        .await
+        .unwrap();
+    assert_eq!(js.status(), 200);
+    assert!(js.text().await.unwrap().contains("data-link-graph"));
 
     let resp = reqwest::get(format!("{base}/assets/fonts/inter-400.woff2"))
         .await
