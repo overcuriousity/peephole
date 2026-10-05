@@ -12,6 +12,7 @@ pub mod hostkeys;
 pub mod inspect;
 pub mod ja4h;
 pub mod maintenance;
+pub mod publish;
 pub mod recorder;
 pub mod requests;
 pub mod scans;
@@ -34,6 +35,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_host_keys.sql"),
     include_str!("migrations/0003_canaries.sql"),
     include_str!("migrations/0004_ja4h.sql"),
+    include_str!("migrations/0005_public_delay.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
@@ -532,5 +534,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t2, 0, "partial migration must not persist");
+    }
+
+    #[tokio::test]
+    async fn migration_0005_keeps_existing_rows_public() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        // A 0.4.0 database: migrations 0001-0004 only, with one request.
+        {
+            let opts = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+            check_application_id(&pool).await.unwrap();
+            migrate(&pool, &MIGRATIONS[..4]).await.unwrap();
+            sqlx::query(
+                "INSERT INTO ips (ip, ip_key, first_seen, last_seen)
+                 VALUES ('203.0.113.7', '', '2026-01-01 00:00:00', '2026-01-02 00:00:00')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO requests (uid, ts, ip_id, method, path, headers_json, labels_json, severity)
+                 VALUES ('old', '2026-01-02 00:00:00', (SELECT id FROM ips WHERE ip = '203.0.113.7'),
+                         'GET', '/', '[]', '[\"wp\"]', 2)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let s = Store::connect(&path).await.unwrap();
+        assert_eq!(s.schema_version().await.unwrap(), MIGRATIONS.len() as i64);
+        let row: (i64, i64, String, String) = sqlx::query_as(
+            "SELECT pub_request_count, pub_max_severity, pub_first_seen, pub_last_seen
+             FROM ips WHERE ip = '203.0.113.7'",
+        )
+        .fetch_one(&s.read)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                1,
+                2,
+                "2026-01-01 00:00:00".into(),
+                "2026-01-02 00:00:00".into()
+            )
+        );
+        let pc: i64 = sqlx::query_scalar("SELECT pub_count FROM ip_labels WHERE label = 'wp'")
+            .fetch_one(&s.read)
+            .await
+            .unwrap();
+        assert_eq!(pc, 1);
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE public_at IS NOT NULL")
+                .fetch_one(&s.read)
+                .await
+                .unwrap();
+        assert_eq!(pending, 0);
     }
 }
