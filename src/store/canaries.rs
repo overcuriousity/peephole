@@ -381,11 +381,22 @@ impl Store {
     ) -> Result<CanarySummary> {
         let rel = a.released("u");
         let since = range.since();
-        let window = if since.is_some() {
+        let mut window = String::from(if since.is_some() {
             " AND c.ts >= datetime('now', ?)"
         } else {
             ""
-        };
+        });
+        if a == crate::store::browse::Audience::Public {
+            // Only canaries whose serving request is released; light rows
+            // (no request, never delayed) once the delay has elapsed, so a
+            // probe cannot move the public share live.
+            window.push_str(
+                " AND ((c.request_id IS NOT NULL AND EXISTS (SELECT 1 FROM requests sr
+                        WHERE sr.id = c.request_id AND sr.public_at IS NULL))
+                    OR (c.request_id IS NULL AND c.ts <= datetime('now', '-' ||
+                        (SELECT delay_s FROM publish_cfg WHERE id = 1) || ' seconds')))",
+            );
+        }
         // Per served canary: its kind and its first use by another request.
         type Row = (Option<i64>, Option<i64>, Option<i64>, String, Option<i64>);
         let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(format!(
@@ -986,6 +997,74 @@ mod tests {
             Some((1, 1))
         );
         assert_eq!(sum.share_pct(), 13); // 1 of 8, rounded
+    }
+
+    #[tokio::test]
+    async fn public_summary_ignores_canaries_of_pending_requests() {
+        use crate::store::browse::Audience;
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        s.set_publish_delay(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        let at = |h: i64| {
+            (chrono::Utc::now() - chrono::Duration::hours(h))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+        apply(
+            &mut conn,
+            ctx,
+            &req(
+                "srv",
+                &at(3),
+                "198.51.100.1",
+                "/.git/config",
+                "[]",
+                "decoy:git-config",
+                Some(1),
+            ),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut conn,
+            ctx,
+            &req(
+                "use",
+                &at(1),
+                "198.51.100.2",
+                "/x",
+                &basic("deploy", &git_token("srv")),
+                "not-found",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        let r = crate::store::stats::Range::H24;
+        let public = s.canary_summary_as(r, Audience::Public).await.unwrap();
+        assert_eq!((public.served, public.harvests, public.reused), (0, 0, 0));
+        let admin = s.canary_summary_as(r, Audience::Admin).await.unwrap();
+        assert_eq!((admin.served, admin.harvests, admin.reused), (1, 1, 1));
+        sqlx::query("UPDATE requests SET public_at = datetime('now', '-1 seconds') WHERE public_at IS NOT NULL")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        s.release_due().await.unwrap();
+        let public = s.canary_summary_as(r, Audience::Public).await.unwrap();
+        assert_eq!((public.served, public.harvests, public.reused), (1, 1, 1));
     }
 
     #[tokio::test]
