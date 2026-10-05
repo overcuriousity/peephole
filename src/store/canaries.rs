@@ -187,6 +187,8 @@ pub async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
 /// One use of a served canary by another request.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Reuse {
+    /// The canary, as the Links pages name it.
+    pub value_hash: i64,
     pub kind: String,
     pub place: String,
     /// The serving request (None: a light row).
@@ -218,7 +220,7 @@ pub struct ReuseFilter {
 }
 
 const REUSE_SELECT: &str = "
-    SELECT c.kind, t.place,
+    SELECT c.value_hash, c.kind, t.place,
            c.request_id AS served_request_id,
            ci.ip AS served_ip,
            (SELECT name FROM members m WHERE m.id = COALESCE(sr.origin, sb.origin)) AS served_node,

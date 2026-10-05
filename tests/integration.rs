@@ -889,6 +889,35 @@ async fn admin_pages_and_deletes_with_session() {
         .unwrap();
     assert!(html.contains("SSH servers (HASSH)") && html.contains("Certificate builders (JA4X)"));
     assert!(html.contains("HTTP fingerprints (JA4H)") && html.contains(ja4h));
+    assert!(
+        html.contains(&format!("href=\"/admin/links/ja4h/{ja4h}\"")),
+        "JA4H → item page"
+    );
+    assert!(
+        html.contains("href=\"/admin/links/hassh/") && html.contains("href=\"/admin/links/ja4x/")
+    );
+    assert!(html.contains("href=\"/admin/links/canaries?range=all\""));
+    let html = get(&format!("/admin/requests/{rid}"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains(&format!("href=\"/admin/links/ja4h/{ja4h}\"")));
+    let html = get("/ip/203.0.113.78").await.unwrap().text().await.unwrap();
+    assert!(
+        html.contains("href=\"/admin/links/fp/CLUSTERHASH\""),
+        "fingerprint → item page"
+    );
+    assert!(
+        html.contains("href=\"/admin/links/ip/203.0.113.78\""),
+        "IP link graph"
+    );
+    assert!(
+        html.contains("href=\"/admin/links/ssh/") && html.contains("href=\"/admin/links/hassh/"),
+        "host keys → item pages"
+    );
+    assert!(!html.contains("/admin/fingerprints"));
     let html = get(&format!("/requests?ja4h={ja4h}"))
         .await
         .unwrap()
@@ -1764,6 +1793,7 @@ async fn public_ip_page_shows_aggregates_but_hides_requests_and_admin_data() {
         "/wp-login.php",
         // Fingerprints are never public.
         ja4h,
+        "/admin/links",
         "HEADER-MARKER",
         "claimant@example.org",
         "FPHASHMARKER",
@@ -2710,6 +2740,10 @@ async fn canaries_page_lists_reuses_and_filters() {
     assert!(
         page.contains("203.0.113.71") && page.contains("git-token"),
         "{page}"
+    );
+    assert!(
+        page.contains("/admin/links/canary/"),
+        "reuse rows link to the canary's graph"
     );
     let page = admin
         .get(format!(

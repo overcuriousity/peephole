@@ -16,8 +16,8 @@
       <div><dt>Scan level</dt><dd>{{ d.row.scan_level }}</dd></div>
       <div><dt>Answered</dt><dd class="mono">{% if let Some(a) = d.row.answer %}{{ a }}{% if let Some(st) = d.row.status %} · {{ st }}{% endif %}{% else %}<span class="muted">—</span>{% endif %}</dd></div>
       <div><dt>Transport</dt><dd>{% if let Some(t) = d.row.transport %}{{ t }}{% if d.row.via_proxy == Some(true) %} via proxy{% endif %}{% else %}<span class="muted">—</span>{% endif %}</dd></div>
-      <div><dt>JA4</dt><dd class="mono">{% if let Some(j) = d.row.ja4 %}{{ j }}{% let value = j.as_str() %}{% let what = "JA4" %}{% let subtle = false %}{% include "_copy.html" %}{% else %}<span class="muted">—</span>{% endif %}</dd></div>
-      <div><dt>JA4H</dt><dd class="mono">{% if let Some(j) = d.row.ja4h %}<a href="/requests?ja4h={{ j|urlencode }}" title="All requests with this JA4H">{{ j }}</a>{% let value = j.as_str() %}{% let what = "JA4H" %}{% let subtle = false %}{% include "_copy.html" %}{% else %}<span class="muted">—</span>{% endif %}</dd></div>
+      <div><dt>JA4</dt><dd class="mono">{% if let Some(j) = d.row.ja4 %}<a href="{{ crate::admin::views::link_href("ja4", j.as_str()) }}" title="Its link graph">{{ j }}</a>{% let value = j.as_str() %}{% let what = "JA4" %}{% let subtle = false %}{% include "_copy.html" %}{% else %}<span class="muted">—</span>{% endif %}</dd></div>
+      <div><dt>JA4H</dt><dd class="mono">{% if let Some(j) = d.row.ja4h %}<a href="{{ crate::admin::views::link_href("ja4h", j.as_str()) }}" title="Its link graph">{{ j }}</a>{% let value = j.as_str() %}{% let what = "JA4H" %}{% let subtle = false %}{% include "_copy.html" %}{% else %}<span class="muted">—</span>{% endif %}</dd></div>
       {% if let Some(n) = d.row.unrecorded %}<div><dt>Unrecorded before it</dt><dd>{{ n }}</dd></div>{% endif %}
       {% if let Some(h) = d.rules_short %}<div><dt>Rules</dt><dd class="mono" title="Fingerprint of the rules that classified it: {{ d.row.rules.as_deref().unwrap_or_default() }}">{{ h }}</dd></div>{% endif %}
       <div><dt>Body</dt><dd>{{ crate::admin::views::thousands(d.body_len) }} bytes</dd></div>
@@ -43,7 +43,7 @@
   <section class="card"><div class="card-head"><h2>Body <span class="muted">{{ d.body_len }} bytes{% if d.body_truncated %}, showing first 16 KiB{% endif %}</span></h2>
     <button class="btn btn-sm" type="button" data-hex-toggle="body">hex</button></div>
     <pre class="panel" id="body" data-text="{{ d.body_text }}" data-b64="{{ d.body_b64 }}">{% if d.body_text.is_empty() %}<span class="muted">(empty)</span>{% else %}{{ d.body_text }}{% endif %}</pre></section>
-  {% if let Some(fp) = d.fingerprint %}<section class="card"><h2>Fingerprint</h2><p><a class="mono" href="/admin/fingerprints#{{ fp.hash }}">{{ fp.hash }}</a> — seen from <b>{{ fp.other_ips }}</b> other IPs</p></section>{% endif %}
+  {% if let Some(fp) = d.fingerprint %}<section class="card"><h2>Fingerprint</h2><p><a class="mono" href="{{ crate::admin::views::link_href("fp", fp.hash.as_str()) }}">{{ fp.hash }}</a> — seen from <b>{{ fp.other_ips }}</b> other IPs</p></section>{% endif %}
 
   <div class="grid-2">
     <section class="card">

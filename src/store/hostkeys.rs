@@ -36,11 +36,6 @@ impl HostKeyRow {
             crate::store::links::LinkKind::of_host_kind(&self.kind).map_or("ssh", |k| k.key());
         crate::admin::views::link_href(kind, &self.fingerprint)
     }
-
-    /// Its section on the old fingerprints page, when it identifies.
-    pub fn anchor(&self) -> String {
-        anchor(&self.kind, &self.fingerprint)
-    }
 }
 
 fn is_identity(kind: &str) -> bool {

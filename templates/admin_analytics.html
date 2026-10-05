@@ -3,7 +3,7 @@
 {% block content %}
 {% let sub = "analytics" %}{% include "_admin_nav.html" %}
 <div class="page-head">
-  <div><h1>Analytics</h1><p class="muted">{{ range.label() }} · canary reuse: <a href="/admin/canaries?range={{ range.key() }}">Canaries</a></p></div>
+  <div><h1>Analytics</h1><p class="muted">{{ range.label() }} · canary reuse: <a href="/admin/links/canaries?range={{ range.key() }}">Canaries</a></p></div>
   {% let base = "/admin/analytics" %}{% include "_range.html" %}
 </div>
 
@@ -57,7 +57,7 @@
     <div class="card-head"><h2>TLS fingerprints (JA4)</h2></div>
     <div class="table-wrap"><table class="an-table">
       <thead><tr><th>JA4</th><th class="num">Requests</th><th class="num">IPs</th></tr></thead>
-      <tbody>{% for n in a.ja4 %}<tr><td class="name">{{ n.name }}{% let value = n.name.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}{% let v = n.count %}{% let max = max.ja4 %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
+      <tbody>{% for n in a.ja4 %}<tr><td class="name"><a href="{{ crate::admin::views::link_href("ja4", n.name.as_str()) }}">{{ n.name }}</a>{% let value = n.name.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}{% let v = n.count %}{% let max = max.ja4 %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
       {% if a.ja4.is_empty() %}<tr><td colspan="3" class="empty">None.</td></tr>{% endif %}</tbody>
     </table></div>
   </section>
@@ -66,7 +66,7 @@
     <div class="card-head"><h2>HTTP fingerprints (JA4H)</h2><span class="muted">HTTP/1 sent to the trap itself (not through an HTTP proxy)</span></div>
     <div class="table-wrap"><table class="an-table">
       <thead><tr><th>JA4H</th><th class="num">Requests</th><th class="num">IPs</th></tr></thead>
-      <tbody>{% for n in a.ja4h %}<tr><td class="name"><a href="/requests?ja4h={{ n.name|urlencode }}">{{ n.name }}</a>{% let value = n.name.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}{% let v = n.count %}{% let max = max.ja4h %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
+      <tbody>{% for n in a.ja4h %}<tr><td class="name"><a href="{{ crate::admin::views::link_href("ja4h", n.name.as_str()) }}">{{ n.name }}</a>{% let value = n.name.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}{% let v = n.count %}{% let max = max.ja4h %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
       {% if a.ja4h.is_empty() %}<tr><td colspan="3" class="empty">None.</td></tr>{% endif %}</tbody>
     </table></div>
   </section>
@@ -94,14 +94,14 @@
     <section class="card">
       <div class="card-head"><h2>SSH servers (HASSH)</h2><span class="muted">IPs</span></div>
       <ol class="ranked">
-        {% for n in a.hassh %}<li><span class="ranked-name mono">{{ n.name }}{% let value = n.name.as_str() %}{% let what = "HASSH" %}{% let subtle = true %}{% include "_copy.html" %}</span><span class="num">{{ n.ips }}</span>{% let v = n.ips %}{% let max = max.hassh %}{% include "_bar.html" %}</li>{% endfor %}
+        {% for n in a.hassh %}<li><span class="ranked-name mono"><a href="{{ crate::admin::views::link_href("hassh", n.name.as_str()) }}">{{ n.name }}</a>{% let value = n.name.as_str() %}{% let what = "HASSH" %}{% let subtle = true %}{% include "_copy.html" %}</span><span class="num">{{ n.ips }}</span>{% let v = n.ips %}{% let max = max.hassh %}{% include "_bar.html" %}</li>{% endfor %}
       </ol>
       {% if a.hassh.is_empty() %}<p class="empty">None (needs level 2+).</p>{% endif %}
     </section>
     <section class="card">
       <div class="card-head"><h2>Certificate builders (JA4X)</h2><span class="muted">IPs</span></div>
       <ol class="ranked">
-        {% for n in a.ja4x %}<li><span class="ranked-name mono">{{ n.name }}{% let value = n.name.as_str() %}{% let what = "JA4X" %}{% let subtle = true %}{% include "_copy.html" %}</span><span class="num">{{ n.ips }}</span>{% let v = n.ips %}{% let max = max.ja4x %}{% include "_bar.html" %}</li>{% endfor %}
+        {% for n in a.ja4x %}<li><span class="ranked-name mono"><a href="{{ crate::admin::views::link_href("ja4x", n.name.as_str()) }}">{{ n.name }}</a>{% let value = n.name.as_str() %}{% let what = "JA4X" %}{% let subtle = true %}{% include "_copy.html" %}</span><span class="num">{{ n.ips }}</span>{% let v = n.ips %}{% let max = max.ja4x %}{% include "_bar.html" %}</li>{% endfor %}
       </ol>
       {% if a.ja4x.is_empty() %}<p class="empty">None (needs level 2+).</p>{% endif %}
     </section>
