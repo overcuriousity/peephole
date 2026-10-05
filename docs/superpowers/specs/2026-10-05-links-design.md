@@ -1,6 +1,6 @@
 # Links: what ties IPs together (UI rework, piece C)
 
-Date: 2026-10-05 · Status: designed.
+Date: 2026-10-05 · Status: implemented (branch `links`).
 Roadmap: `2026-10-05-ui-rework-roadmap.md` (piece C). Constraints from piece A
 (`2026-10-05-public-delay-design.md`) and piece B
 (`2026-10-05-admin-ia-design.md`).

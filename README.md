@@ -61,8 +61,10 @@ nmap.
   feed of new requests, analytics (top paths, user agents, JA4, methods,
   open ports, products, OS guesses, abuse scores), per-IP pages with every
   enrichment result and counter-scan, the scan pace with the live queue and
-  every finished job, a "needs attention" list on the Overview, a graph of
-  browser fingerprints shared across IPs, canary reuse, the
+  every finished job, a "needs attention" list on the Overview, a Links
+  area (every browser fingerprint, SSH host key, TLS certificate, JA4, JA4H,
+  HASSH and JA4X, filterable, each with a graph of the IPs it was seen on and
+  what else links them), canary reuse, the
   false-positive inbox, deletion, and the dataset export: every request with
   everything known about it and its IP (enrichment history, scans,
   fingerprints) as typed Parquet, CSV or Timesketch JSONL, optionally

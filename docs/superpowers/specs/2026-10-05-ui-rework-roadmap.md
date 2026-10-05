@@ -11,7 +11,7 @@ from here.
 |---|---|---|---|
 | A | Public privacy: delayed, jittered public surface, no live elements | — | done: `2026-10-05-public-delay-design.md` |
 | B | Admin information architecture: nav, Overview/Queue/Scans merge, Cluster cleanup | — | done: `2026-10-05-admin-ia-design.md` |
-| C | Fingerprints + Canaries → one page about what links IPs | B (nav); shares filters with D | open |
+| C | Fingerprints + Canaries → one page about what links IPs | B (nav); shares filters with D | done: `2026-10-05-links-design.md` |
 | D | Clickable analytics with filtered drill-downs | partly C | open |
 | E | Lookup → global search | B | open |
 

@@ -11,6 +11,13 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   requests", `[public] recent_rows`, default 50): time, IP, method, path
   (no query string, cut at 80 characters), severity and, when shown,
   labels.
+- Admin "Links": every browser fingerprint, SSH host key, TLS certificate,
+  JA4, JA4H, HASSH and JA4X, not only shared ones, filterable by value,
+  date, country and node and sortable by IPs, sightings or last seen. Each
+  value (and each IP) has a page with a graph of the IPs it was seen on and
+  what else links them: identity links by default, software fingerprints on
+  request, crowded values collapsed. Every such value in the admin pages
+  links there. The requests search filters by JA4.
 
 ### Changed
 
@@ -21,6 +28,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   "last hit … ago", static UTC times.
 - The live "Recent activity" feed moved from the wall to the admin
   Overview.
+- The Fingerprints and Canaries pages moved to `/admin/links` and
+  `/admin/links/canaries`; the old addresses redirect.
 
 ## [0.4.0] - 2026-10-05
 
