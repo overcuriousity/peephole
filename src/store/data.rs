@@ -273,8 +273,9 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
         "INSERT OR IGNORE INTO requests (uid, origin, hlc, ts, ip_id, method, path, query,
            headers_json, body, labels_json, owasp_json, severity, scan_level, is_fp_claim,
            page_token, answer, status, unrecorded, transport, via_proxy, raw_head,
-           tls_client_hello, ja4, build, rules, decoy_v, decoy_site, ja4h, ja4h_v)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           tls_client_hello, ja4, build, rules, decoy_v, decoy_site, ja4h, ja4h_v,
+           user_agent, ua_v)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -310,6 +311,8 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
         r.via_proxy,
     ))
     .bind(super::ja4h::JA4H_V)
+    .bind(super::useragent::derive(&r.headers_json))
+    .bind(super::useragent::UA_V)
     .execute(&mut *conn)
     .await?;
     if done.rows_affected() == 1 {

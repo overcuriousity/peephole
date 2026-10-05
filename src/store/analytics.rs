@@ -45,7 +45,7 @@ pub struct Analytics {
 const TOP: i64 = 15;
 
 /// The User-Agent of a stored `headers_json` (`[[name, value], …]`).
-const UA_SQL: &str = "COALESCE((SELECT json_extract(h.value, '$[1]')
+pub(crate) const UA_SQL: &str = "COALESCE((SELECT json_extract(h.value, '$[1]')
       FROM json_each(CASE WHEN json_valid(r.headers_json) THEN r.headers_json ELSE '[]' END) h
       WHERE lower(json_extract(h.value, '$[0]')) = 'user-agent' LIMIT 1), '(none)')";
 

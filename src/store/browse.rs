@@ -115,6 +115,8 @@ pub struct RequestFilter {
     pub ja4: Option<String>,
     /// Admin only: the HTTP method (any case).
     pub method: Option<String>,
+    /// Admin only: the User-Agent, exactly (`(none)`: without one).
+    pub ua: Option<String>,
     /// Admin only: `http`, `https`, …; `unknown` for a row without one.
     pub transport: Option<String>,
     /// Admin only: what the trap answered (`not-found`, `decoy:…`);
@@ -498,6 +500,10 @@ fn request_filter_sql(f: &RequestFilter, a: Audience, indexed: bool) -> (String,
         if let Some(v) = nonempty(&f.method) {
             sql.push_str(" AND r.method = ?");
             binds.push(v.to_ascii_uppercase());
+        }
+        if let Some(v) = nonempty(&f.ua) {
+            sql.push_str(" AND r.user_agent = ?");
+            binds.push(v);
         }
         // Analytics shows a missing value as `unknown`.
         for (col, v) in [("transport", &f.transport), ("answer", &f.answer)] {

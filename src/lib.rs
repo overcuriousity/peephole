@@ -226,6 +226,18 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         }
     });
 
+    // User-Agent of rows stored before this build; new rows get it as written.
+    tokio::spawn({
+        let pool = store.pool.clone();
+        async move {
+            match store::useragent::backfill(&pool).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(rows = n, "user-agent: derived stored rows"),
+                Err(e) => tracing::warn!(error = %e, "user-agent: backfill failed"),
+            }
+        }
+    });
+
     // Queue change notifications: trap + workers publish, admin SSE subscribes.
     let notifier = events::Notifier::new();
 

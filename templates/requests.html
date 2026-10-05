@@ -12,6 +12,7 @@
   <label>ASN <input name="asn" size="7" value="{% if let Some(a) = f.asn %}{{ a }}{% endif %}"></label>
   <label>From (UTC) <input name="from" type="datetime-local" value="{{ f.from.as_deref().unwrap_or_default() }}"></label>
   <label>To (UTC) <input name="to" type="datetime-local" value="{{ f.to.as_deref().unwrap_or_default() }}"></label>
+  <label>User agent <input name="ua" size="16" value="{{ f.ua.as_deref().unwrap_or_default() }}"></label>
   <label>Method <input name="method" size="7" value="{{ f.method.as_deref().unwrap_or_default() }}"></label>
   <label>Transport <input name="transport" size="7" value="{{ f.transport.as_deref().unwrap_or_default() }}"></label>
   <label>Answer <input name="answer" size="12" value="{{ f.answer.as_deref().unwrap_or_default() }}"></label>
