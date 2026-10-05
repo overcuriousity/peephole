@@ -89,7 +89,7 @@ pub struct MemberView {
 }
 
 /// Characters of a rules fingerprint shown.
-const SHORT_HASH: usize = 12;
+pub(crate) const SHORT_HASH: usize = 12;
 
 /// The rules fingerprints a member's newest classified requests carry
 /// (`requests.rules`): what the recording binary says it classified with.
@@ -214,7 +214,6 @@ struct ClusterPage {
     /// None: standalone node.
     me: Option<MemberView>,
     members: Vec<MemberView>,
-    intel: Vec<IntelView>,
     /// Why this node is out of its cluster, if it is.
     detached: Option<&'static str>,
     invite: Option<String>,
@@ -489,7 +488,7 @@ async fn unserved(node: &Node) -> AppResult<Option<String>> {
     ))
 }
 
-async fn intel(node: &Node) -> AppResult<Vec<IntelView>> {
+pub(crate) async fn intel(node: &Node) -> AppResult<Vec<IntelView>> {
     let names: std::collections::HashMap<NodeId, String> = members::all(&node.store)
         .await?
         .into_iter()
@@ -694,7 +693,6 @@ async fn render_page(st: &AdminState, invite: Option<String>) -> AppResult<Html<
             chrome: Chrome::new(true, "admin"),
             me: None,
             members: vec![],
-            intel: vec![],
             detached: None,
             invite: None,
             invites: vec![],
@@ -743,7 +741,6 @@ async fn render_page(st: &AdminState, invite: Option<String>) -> AppResult<Html<
         detached: node.detached().map(|d| d.label()),
         me: Some(me),
         members,
-        intel: intel(node).await?,
         invite,
         invites: invites(node).await?,
         config_key,
@@ -758,7 +755,7 @@ async fn render_page(st: &AdminState, invite: Option<String>) -> AppResult<Html<
 }
 
 /// The fingerprint of the rules built into this binary.
-fn builtin_rules() -> &'static str {
+pub(crate) fn builtin_rules() -> &'static str {
     crate::classify::Classifier::builtin().fingerprint()
 }
 

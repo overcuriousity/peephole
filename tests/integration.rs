@@ -2584,7 +2584,10 @@ async fn canaries_page_lists_reuses_and_filters() {
         .text()
         .await
         .unwrap();
-    assert!(nav.contains("href=\"/admin/canaries\""));
+    assert!(
+        nav.contains("href=\"/admin/fingerprints\">Links<"),
+        "links tab"
+    );
     let anon = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -2651,4 +2654,70 @@ async fn a_decoy_renders_the_same_after_adoption() {
         .unwrap()
         .unwrap();
     assert_eq!(again.body, body);
+}
+
+/// The admin subnav has seven tabs; Fingerprints and Canaries sit under
+/// Links, intel status under System.
+#[tokio::test]
+async fn admin_nav_groups_pages_under_seven_tabs() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store, cfg).await;
+    let get = |p: &str| {
+        let (c, u) = (client.clone(), format!("{base}{p}"));
+        async move {
+            let r = c.get(u).send().await.unwrap();
+            assert_eq!(r.status(), 200);
+            r.text().await.unwrap()
+        }
+    };
+    let nav = |html: &str| {
+        html.split("aria-label=\"Admin sections\"")
+            .nth(1)
+            .expect("admin subnav")
+            .split("</nav>")
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let current = |html: &str| {
+        nav(html)
+            .split("aria-current=\"page\">")
+            .nth(1)
+            .map(|s| s.split('<').next().unwrap().to_string())
+    };
+    let home = get("/admin").await;
+    let n = nav(&home);
+    for want in [
+        ">Overview<",
+        ">Analytics<",
+        ">Scans<",
+        ">Links<",
+        ">Inbox<",
+        ">Cluster<",
+        ">System<",
+    ] {
+        assert!(n.contains(want), "nav lacks {want}");
+    }
+    for gone in [
+        ">Queue<",
+        ">Fingerprints<",
+        ">Canaries<",
+        ">Lookup<",
+        ">Export<",
+        ">Keys<",
+    ] {
+        assert!(!n.contains(gone), "nav still has {gone}");
+    }
+    let fp = get("/admin/fingerprints").await;
+    assert_eq!(current(&fp).as_deref(), Some("Links"));
+    assert!(fp.contains("href=\"/admin/canaries\""), "links sub-tabs");
+    assert_eq!(
+        current(&get("/admin/canaries").await).as_deref(),
+        Some("Links")
+    );
+    let sys = get("/admin/system").await;
+    assert_eq!(current(&sys).as_deref(), Some("System"));
+    assert!(sys.contains("Tor exit list") && sys.contains("MaxMind GeoLite2"));
+    assert!(sys.contains("built in"), "this binary's rules");
 }

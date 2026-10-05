@@ -11,7 +11,7 @@ use crate::store::inspect::{
     FpClaimRow, FpCluster, PortRow, QueueSummary, RequestDetail, ScanSummary,
 };
 use crate::store::recorder::Deleted;
-use crate::store::stats::{Range, RecentRequest, intel_stale};
+use crate::store::stats::{Range, RecentRequest};
 use askama::Template;
 use axum::{
     Router,
@@ -73,11 +73,7 @@ struct HomePage {
     inbox: i64,
     jobs: Vec<QueueJob>,
     failed: Vec<QueueJob>,
-    tor_fetch: String,
-    maxmind_fetch: String,
-    stale: bool,
-    /// `(label, state)` per API provider.
-    api: Vec<(&'static str, String)>,
+    intel: crate::admin::system::IntelStatus,
     /// "Recent activity": the newest requests, then live over SSE.
     recent: Vec<crate::store::stats::RecentRequest>,
     /// The newest request id shown (the live feed's cursor).
@@ -85,14 +81,6 @@ struct HomePage {
 }
 
 async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
-    let intel: HashMap<String, String> =
-        sqlx::query_as::<_, (String, String)>("SELECT key, value FROM intel_meta")
-            .fetch_all(&st.store.pool)
-            .await?
-            .into_iter()
-            .collect();
-    let stale = intel_stale(&intel);
-    let fetched = |k: &str| intel.get(k).cloned().unwrap_or_else(|| "never".into());
     let recent = st
         .store
         .recent_requests(50, crate::store::browse::Audience::Admin)
@@ -111,71 +99,10 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         inbox: st.store.inbox_count().await?,
         jobs: st.store.queue_snapshot(25).await?,
         failed: st.store.recent_failed_jobs(10).await?,
-        tor_fetch: fetched("tor_last_fetch"),
-        maxmind_fetch: match (
-            intel.get("maxmind_last_fetch"),
-            intel.get(crate::intel::MAXMIND_CLUSTER_SEEN),
-        ) {
-            (None, Some(seen)) => {
-                format!("via a cluster member (seen {seen})")
-            }
-            _ => fetched("maxmind_last_fetch"),
-        },
-        stale,
-        api: api_provider_states(&st).await?,
+        intel: crate::admin::system::intel_status(&st).await?,
         recent,
         recent_max_id,
     })
-}
-
-/// Each API provider's state as this node sees it: its own budget and
-/// pause, or whether a cluster member serves it; and how many lookups the
-/// dataset holds.
-async fn api_provider_states(st: &AdminState) -> anyhow::Result<Vec<(&'static str, String)>> {
-    let counts: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
-        "SELECT provider, COUNT(*) FROM ip_intel_log GROUP BY provider",
-    )
-    .fetch_all(&st.store.read)
-    .await?
-    .into_iter()
-    .collect();
-    let served_elsewhere = |name: &str| {
-        st.recorder.node().is_some_and(|node| {
-            let me = node.id();
-            node.live_members(std::time::Duration::from_secs(45))
-                .into_iter()
-                .any(|id| {
-                    id != me
-                        && node
-                            .status
-                            .known(&id)
-                            .is_some_and(|k| k.hb.providers.iter().any(|n| n == name))
-                })
-        })
-    };
-    Ok(crate::intel::KNOWN_PROVIDERS
-        .iter()
-        .filter(|p| p.api)
-        .map(|p| {
-            let here = st.providers.iter().find(|x| x.name() == p.name);
-            let mut state = match here {
-                Some(x) => {
-                    let s = x.status().unwrap_or_default();
-                    if x.ready() {
-                        format!("active · {s}")
-                    } else {
-                        format!("waiting · {s}")
-                    }
-                }
-                None if served_elsewhere(p.name) => "via a cluster member".to_string(),
-                None => "not configured".to_string(),
-            };
-            if let Some(n) = counts.get(p.name) {
-                state.push_str(&format!(" · {n} lookups recorded"));
-            }
-            (p.label, state)
-        })
-        .collect())
 }
 
 #[derive(serde::Deserialize, Default)]

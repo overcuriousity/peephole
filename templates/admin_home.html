@@ -4,7 +4,7 @@
 {% let sub = "home" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Admin</h1></div>
 </div>
-{% if stale %}<div class="banner banner-warning">Tor exit list or GeoIP data missing or older than 48 h.</div>{% endif %}
+{% if intel.stale %}<div class="banner banner-warning">Tor exit list or GeoIP data missing or older than 48 h.</div>{% endif %}
 <div class="tiles">
   <div class="tile"><span class="label">Queued</span><div class="value">{{ q.queued }}</div></div>
   <div class="tile"><span class="label">Running</span><div class="value">{{ q.running }}</div><div class="hint">{{ workers }} workers</div></div>
@@ -51,9 +51,9 @@
   <section class="card">
     <div class="card-head"><h2>Intel</h2></div>
     <dl class="kv">
-      <dt>Tor exit list</dt><dd>{{ tor_fetch }}</dd>
-      <dt>MaxMind GeoLite2</dt><dd>{{ maxmind_fetch }}</dd>
-      {% for (label, state) in api %}<dt>{{ label }}</dt><dd>{{ state }}</dd>{% endfor %}
+      <dt>Tor exit list</dt><dd>{{ intel.tor_fetch }}</dd>
+      <dt>MaxMind GeoLite2</dt><dd>{{ intel.maxmind_fetch }}</dd>
+      {% for (label, state) in intel.api %}<dt>{{ label }}</dt><dd>{{ state }}</dd>{% endfor %}
     </dl>
   </section>
 </div>

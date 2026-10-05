@@ -1,0 +1,5 @@
+<nav class="seg subnav subtabs" aria-label="Section">
+  {% for (key, href, label) in tabs %}
+  <a href="{{ href }}"{% if *key == subtab %} aria-current="page"{% endif %}>{{ label }}</a>
+  {% endfor %}
+</nav>

@@ -10,6 +10,7 @@ pub mod lookup;
 pub mod pages;
 pub mod public;
 pub mod sse;
+pub mod system;
 pub mod views;
 
 use crate::config::Config;
@@ -118,6 +119,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(assets::router())
         .merge(auth::auth_routes())
         .merge(pages::routes())
+        .merge(system::routes())
         .merge(lookup::routes())
         .merge(cluster::routes())
         .fallback(error::not_found)

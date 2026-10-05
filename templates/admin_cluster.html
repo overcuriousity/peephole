@@ -135,16 +135,6 @@
   </table></div>
   <p class="muted">0 pauses a scanner. A scanner that fails a scan level more often than the others (last 24 h, timeouts aside) sits that level out for 10-minute stretches, a share of 1 − weight of them, while the others take its jobs; scanners with fewer than 5 scans at a level set no bar. It recovers as old failures age out, and jobs waiting over 30 min go to any scanner.</p>
 </section>
-<section class="card">
-  <div class="card-head"><h2>Shared intel</h2><span class="muted">Tor exit list</span></div>
-  {% if intel.is_empty() %}<p class="muted">Nothing announced yet.</p>{% else %}
-  <div class="table-wrap"><table>
-    <thead><tr><th>File</th><th>Version</th><th>Size</th><th>Fetched (UTC)</th><th>By</th><th>Here</th></tr></thead>
-    <tbody>{% for i in intel %}<tr><td class="mono">{{ i.kind }}</td><td class="mono">{{ i.sha }}</td><td>{{ i.size }}</td><td class="ts">{{ i.fetched_at }}</td><td>{{ i.by }}</td>
-      <td>{% if i.local %}<span class="badge badge-status" data-status="done">current</span>{% else %}<span class="badge badge-status" data-status="queued">copying</span>{% endif %}</td></tr>{% endfor %}</tbody>
-  </table></div>{% endif %}
-  <p class="muted">GeoIP databases stay local; their lookups are shared.</p>
-</section>
 <section class="card"><h2>Join or rejoin a cluster</h2>
   <form method="post" action="/admin/cluster/join" class="filters"><label>Invite token <input name="token" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Join</button></form>
 </section>
