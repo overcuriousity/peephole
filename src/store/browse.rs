@@ -76,6 +76,13 @@ pub struct IpFilter {
     pub intel: Option<String>,
     /// Admin only: has no result from this provider.
     pub nointel: Option<String>,
+    /// Admin only: open in any stored scan (`22` or `22/tcp`).
+    pub port: Option<String>,
+    /// Admin only: product and version on an open port in any stored scan,
+    /// as Analytics names it (`OpenSSH 9.6p1`).
+    pub product: Option<String>,
+    /// Admin only: nmap's OS guess in any stored scan.
+    pub os: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -413,6 +420,38 @@ fn ip_filter_sql(f: &IpFilter, a: Audience) -> Option<IpFilterSql> {
             "NOT EXISTS (SELECT 1 FROM ip_intel x WHERE x.provider = ? AND x.ip = i.ip)".into(),
         );
         binds.push(p);
+    }
+    if a == Audience::Admin {
+        if let Some(p) = nonempty(&f.port) {
+            let (port, proto) = p.split_once('/').unwrap_or((&p, ""));
+            let Ok(port) = port.trim().parse::<u16>() else {
+                return None;
+            };
+            let mut sql = "EXISTS (SELECT 1 FROM scans s JOIN ports p ON p.scan_id = s.id
+                 WHERE s.ip_id = i.id AND p.state = 'open' AND p.port = ?"
+                .to_string();
+            binds.push(port.to_string());
+            if !proto.trim().is_empty() {
+                sql.push_str(" AND p.proto = ?");
+                binds.push(proto.trim().to_ascii_lowercase());
+            }
+            wheres.push(sql + ")");
+        }
+        if let Some(v) = nonempty(&f.product) {
+            wheres.push(
+                "EXISTS (SELECT 1 FROM scans s JOIN ports p ON p.scan_id = s.id
+                 WHERE s.ip_id = i.id AND p.state = 'open'
+                   AND p.product || COALESCE(' ' || p.version, '') = ?)"
+                    .into(),
+            );
+            binds.push(v);
+        }
+        if let Some(v) = nonempty(&f.os) {
+            wheres.push(
+                "EXISTS (SELECT 1 FROM scans s WHERE s.ip_id = i.id AND s.os_guess = ?)".into(),
+            );
+            binds.push(v);
+        }
     }
     let where_sql = if wheres.is_empty() {
         String::new()
@@ -1489,6 +1528,77 @@ mod tests {
             .items
             .len();
         assert_eq!(public, all, "admin-only filters");
+    }
+
+    /// Port, product and OS from any stored scan of the IP. Admin only.
+    #[tokio::test]
+    async fn ips_are_found_by_open_port_product_and_os() {
+        let s = seeded().await;
+        let ip = s.ip_by_addr("203.0.113.1").await.unwrap().unwrap();
+        s.enqueue_scan(ip.id, 2, 0).await.unwrap();
+        let job = s.next_queued_job().await.unwrap().unwrap();
+        let port = |port, state: &str, product: Option<&str>| crate::scan::nmap_xml::PortResult {
+            port,
+            proto: "tcp".into(),
+            state: state.into(),
+            service: Some("ssh".into()),
+            product: product.map(String::from),
+            version: product.map(|_| "9.6p1".into()),
+        };
+        s.finish_job(
+            job.id,
+            Some(&crate::scan::nmap_xml::ScanResult {
+                os_guess: Some("Linux 5.X".into()),
+                raw_xml: vec![],
+                ports: vec![port(22, "open", Some("OpenSSH")), port(23, "closed", None)],
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let n = |f: IpFilter, a: Audience| {
+            let s = s.clone();
+            async move { s.list_ips_as(&f, a).await.unwrap().items.len() }
+        };
+        let f = |port: Option<&str>, product: Option<&str>, os: Option<&str>| IpFilter {
+            port: port.map(String::from),
+            product: product.map(String::from),
+            os: os.map(String::from),
+            ..Default::default()
+        };
+        assert_eq!(n(f(Some("22"), None, None), Audience::Admin).await, 1);
+        assert_eq!(n(f(Some("22/tcp"), None, None), Audience::Admin).await, 1);
+        assert_eq!(n(f(Some("22/udp"), None, None), Audience::Admin).await, 0);
+        assert_eq!(
+            n(f(Some("23"), None, None), Audience::Admin).await,
+            0,
+            "closed"
+        );
+        assert_eq!(
+            n(f(Some("x"), None, None), Audience::Admin).await,
+            0,
+            "not a port"
+        );
+        assert_eq!(
+            n(f(None, Some("OpenSSH 9.6p1"), None), Audience::Admin).await,
+            1
+        );
+        assert_eq!(
+            n(f(None, Some("OpenSSH"), None), Audience::Admin).await,
+            0,
+            "as Analytics names it"
+        );
+        assert_eq!(
+            n(f(None, None, Some("Linux 5.X")), Audience::Admin).await,
+            1
+        );
+        let all = n(IpFilter::default(), Audience::Public).await;
+        assert!(all > 1);
+        assert_eq!(
+            n(f(Some("22"), None, None), Audience::Public).await,
+            all,
+            "admin only"
+        );
     }
 
     #[tokio::test]

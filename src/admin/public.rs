@@ -312,6 +312,9 @@ pub(crate) fn public_ip_filter(f: &IpFilter, show_labels: bool) -> IpFilter {
         tag: None,
         intel: None,
         nointel: None,
+        port: None,
+        product: None,
+        os: None,
     }
 }
 
@@ -328,6 +331,9 @@ pub(crate) fn ip_qs(f: &IpFilter) -> String {
         ("tag", f.tag.clone()),
         ("intel", f.intel.clone()),
         ("nointel", f.nointel.clone()),
+        ("port", f.port.clone()),
+        ("product", f.product.clone()),
+        ("os", f.os.clone()),
     ])
 }
 
