@@ -15,7 +15,7 @@
   var focusId = host.getAttribute("data-focus");
   var calm = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var RING = 150, LINK = 90, MAX = 400;
-  var g = { nodes: [], edges: [], byId: {} };
+  var g = { nodes: [], edges: [], byId: {}, adj: {} };
   var view = { x: 0, y: 0, k: 1 };
   var W = 800, H = 520, svg, vp, selected = null;
 
@@ -59,11 +59,14 @@
   }
   function edgeKey(a, b) { return a < b ? a + "\n" + b : b + "\n" + a; }
   // Union by id; new nodes start at `at` (their parent) and are marked.
+  // The page holds at most MAX nodes, as one answer does; returns whether
+  // some were left out.
   function merge(data, at) {
-    var keys = {};
+    var keys = {}, capped = false;
     g.edges.forEach(function (e) { keys[edgeKey(e.a, e.b)] = 1; });
     data.nodes.forEach(function (n) {
       if (g.byId[n.id]) return;
+      if (g.nodes.length >= MAX) { capped = true; return; }
       n.fresh = true;
       if (at) { n.x = at.x; n.y = at.y; }
       g.byId[n.id] = n;
@@ -73,19 +76,25 @@
       var k = edgeKey(e.a, e.b);
       if (!keys[k] && g.byId[e.a] && g.byId[e.b]) { keys[k] = 1; g.edges.push(e); }
     });
+    reindex();
+    return capped;
   }
   function drop(id) {
     g.nodes = g.nodes.filter(function (n) { return n.id !== id; });
     g.edges = g.edges.filter(function (e) { return e.a !== id && e.b !== id; });
     delete g.byId[id];
+    reindex();
+  }
+  function reindex() {
+    g.adj = {};
+    g.edges.forEach(function (e) {
+      (g.adj[e.a] = g.adj[e.a] || []).push(e.b);
+      (g.adj[e.b] = g.adj[e.b] || []).push(e.a);
+    });
   }
 
   // ---- layout -----------------------------------------------------------
-  function neighbours(id) {
-    var out = [];
-    g.edges.forEach(function (e) { if (e.a === id) out.push(e.b); else if (e.b === id) out.push(e.a); });
-    return out;
-  }
+  function neighbours(id) { return g.adj[id] || []; }
   // Hops from the focus (breadth-first) and each node's parent.
   function rings() {
     var hop = {}, parent = {}, q = [focusId];
@@ -255,9 +264,9 @@
     load(focus, 1, group).then(function (data) {
       var at = { x: n.x, y: n.y };
       if (group) { drop(n.id); if (selected === n) selected = null; }
-      merge(data, at);
+      var capped = merge(data, at);
       layout(); draw(); transform();
-      return settle().then(function () { report(data); });
+      return settle().then(function () { report(data, capped); });
     }).catch(fail);
   }
 
@@ -293,16 +302,16 @@
   }
 
   // ---- boot -------------------------------------------------------------
-  function report(data) {
+  function report(data, capped) {
     var t = g.nodes.length + " nodes";
-    if (data && data.truncated) t += " · stopped at " + MAX + " nodes: lower the depth or untick kinds";
+    if (capped || (data && data.truncated)) t += " · stopped at " + MAX + " nodes: lower the depth or untick kinds";
     say(t);
   }
   function fail(e) { say("Could not load the graph (" + e.message + ")."); }
   function reload() {
     say("Loading…");
     load(focusId).then(function (data) {
-      g = { nodes: [], edges: [], byId: {} }; selected = null;
+      g = { nodes: [], edges: [], byId: {}, adj: {} }; selected = null;
       merge(data, null);
       layout(); land();
       draw(); fit(); report(data);
