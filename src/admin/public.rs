@@ -1034,6 +1034,13 @@ show_labels = {show_labels}
             home.contains("/pending-path"),
             "admins see pending rows at once"
         );
+        // Each live card owns exactly one indicator (app.js scopes by section).
+        for sec in home.split("<section").skip(1) {
+            let sec = sec.split("</section>").next().unwrap();
+            if sec.contains("data-recent") || sec.contains("data-queue") {
+                assert_eq!(sec.matches("data-live>").count(), 1);
+            }
+        }
     }
 
     #[tokio::test]
