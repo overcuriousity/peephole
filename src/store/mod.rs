@@ -11,6 +11,7 @@ pub mod fingerprints;
 pub mod hostkeys;
 pub mod inspect;
 pub mod ja4h;
+pub mod links;
 pub mod maintenance;
 pub mod publish;
 pub mod recorder;
