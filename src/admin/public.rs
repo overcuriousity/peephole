@@ -49,6 +49,8 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/api/countries", get(countries_json))
         .route("/api/blocklist", get(crate::admin::blocklist::feed))
         .route("/healthz", get(healthz))
+        .route("/api", get(api_page))
+        .route("/about", get(about_page))
 }
 
 #[derive(Template)]
@@ -211,6 +213,40 @@ async fn countries_json() -> impl IntoResponse {
         [(axum::http::header::CACHE_CONTROL, "public, max-age=86400")],
         Json(map),
     )
+}
+
+#[derive(Template)]
+#[template(path = "api.html")]
+struct ApiPage {
+    chrome: Chrome,
+    /// This node's publication delay and jitter, in minutes.
+    delay_minutes: u32,
+    jitter_minutes: u32,
+}
+
+/// The public endpoints, their parameters and formats.
+async fn api_page(
+    MaybeUser(authed): MaybeUser,
+    State(state): State<Arc<AdminState>>,
+) -> AppResult<Html<String>> {
+    render(&ApiPage {
+        chrome: Chrome::new(authed, ""),
+        delay_minutes: state.cfg.public.delay_minutes,
+        jitter_minutes: state.cfg.public.jitter_minutes,
+    })
+}
+
+#[derive(Template)]
+#[template(path = "about.html")]
+struct AboutPage {
+    chrome: Chrome,
+}
+
+/// What peephole does to whom, and on what grounds.
+async fn about_page(MaybeUser(authed): MaybeUser) -> AppResult<Html<String>> {
+    render(&AboutPage {
+        chrome: Chrome::new(authed, ""),
+    })
 }
 
 async fn healthz(State(state): State<Arc<AdminState>>) -> Response {

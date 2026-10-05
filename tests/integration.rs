@@ -3194,6 +3194,70 @@ async fn bulk_lookup_lists_stored_addresses() {
     assert_eq!(r.status(), 303, "admin only");
 }
 
+/// Every page's footer carries the version, the API specification, the
+/// source and the disclaimer; /api and /about are public.
+#[tokio::test]
+async fn footer_links_api_specification_source_and_disclaimer() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (admin, base) = enrolled_admin_client(store, cfg).await;
+    let anon = reqwest::Client::new();
+    let footer = |html: &str| {
+        html.split("<footer")
+            .nth(1)
+            .expect("footer")
+            .split("</footer>")
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    for (who, client, path) in [
+        ("public", &anon, "/"),
+        ("public", &anon, "/ips"),
+        ("admin", &admin, "/admin"),
+    ] {
+        let r = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{who} {path}");
+        let f = footer(&r.text().await.unwrap());
+        for want in [
+            "href=\"/api\"",
+            "href=\"/about\"",
+            "href=\"https://github.com/overcuriousity/peephole\"",
+            peephole::VERSION,
+            "We claim the right to scan back.",
+        ] {
+            assert!(f.contains(want), "{who} {path} footer lacks {want}: {f}");
+        }
+    }
+    let api = anon.get(format!("{base}/api")).send().await.unwrap();
+    assert_eq!(api.status(), 200);
+    let api = api.text().await.unwrap();
+    for want in [
+        "/api/blocklist",
+        "/api/stats",
+        "/api/map",
+        "/api/countries",
+        "/healthz",
+        "min_severity",
+        "networks=1",
+        &format!("{}", peephole::admin::blocklist::MAX_HOURS),
+        &format!("{}", peephole::admin::blocklist::MAX_ENTRIES),
+    ] {
+        assert!(api.contains(want), "/api lacks {want}");
+    }
+    let about = anon.get(format!("{base}/about")).send().await.unwrap();
+    assert_eq!(about.status(), 200);
+    let about = about.text().await.unwrap();
+    assert!(about.contains("When you connect anything to the internet, you get scanned."));
+    assert!(about.contains("GDPR"));
+    for html in [&api, &about] {
+        assert!(
+            !html.contains("<script>") && !html.contains(" style=\""),
+            "inline code"
+        );
+    }
+}
+
 /// Signed in, every page has the Lookup box; anonymous visitors don't.
 #[tokio::test]
 async fn lookup_box_only_for_admins() {

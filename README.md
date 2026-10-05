@@ -86,7 +86,8 @@ nmap.
   line, for nginx `deny`, nftables, ipset, fail2ban or CrowdSec. In a
   cluster it is drawn from every member's trap, so one node's catch
   protects everybody's real sites. Tor exits, verified crawlers, cluster
-  members and the node's own networks are never listed.
+  members and the node's own networks are never listed. Every node
+  documents its public endpoints at `/api` (linked in the footer).
 - **Lookup** (admin) — ask every provider the cluster can reach about one
   address, now: this node's databases and keys first, then a member that
   announces the missing provider. Shown once, never stored.

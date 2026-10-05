@@ -34,6 +34,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   value (its Links page).
 - Lookup checks many addresses or networks at once against stored data
   (no provider is asked).
+- Every page's footer links the public API specification (`/api`: the
+  blocklist feed, `/api/stats`, `/api/map`, `/api/countries`, `/healthz`
+  with their parameters and defaults), an About page (`/about`: what
+  peephole does, and the legitimate interest it relies on), the source
+  repository and the running build. The blocklist names `/api` in its
+  comment lines.
 
 ### Changed
 

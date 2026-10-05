@@ -37,6 +37,9 @@
 <main class="shell">
 {% block content %}{% endblock %}
 </main>
-<footer class="footer"><span>peephole · scan the scanners</span><span class="mono">{{ chrome.version }}</span></footer>
+<footer class="footer">
+  <p class="footer-disclaimer">When you connect anything to the internet, you get scanned. We claim the right to scan back. <a href="/about">Why and how →</a></p>
+  <nav class="footer-links" aria-label="About peephole"><span>peephole · scan the scanners</span><a href="/api">API</a><a href="/about">About</a><a href="{{ crate::admin::views::REPO }}">Source</a>{% if let Some(h) = chrome.version_href() %}<a class="mono" href="{{ h }}">{{ chrome.version }}</a>{% else %}<span class="mono">{{ chrome.version }}</span>{% endif %}</nav>
+</footer>
 </body>
 </html>

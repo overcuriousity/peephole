@@ -190,6 +190,7 @@ async fn build(state: &AdminState, p: Params) -> anyhow::Result<String> {
     out.push_str(&format!(
         "# parameters: hours=1..{MAX_HOURS} min_severity=1..4 networks=1 (collapse /24 and /64 with {NET_MIN_IPS}+ entries)\n"
     ));
+    out.push_str("# documentation: /api\n");
     for e in &entries {
         out.push_str(e);
         out.push('\n');
@@ -377,6 +378,7 @@ never_scan = ["198.51.100.0/24"]
                 .starts_with("text/plain")
         );
         assert!(text.starts_with("# peephole blocklist\n"));
+        assert!(text.contains("\n# documentation: /api\n"), "{text}");
         assert_eq!(
             entries(&text),
             ["203.0.113.9", "203.0.113.10", "203.0.113.11"]
