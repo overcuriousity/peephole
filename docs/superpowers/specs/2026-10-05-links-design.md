@@ -94,7 +94,7 @@ SQL for "IPs of a value" and "values of an IP". `host_keys` sightings count
 rows (one per scan and port), as `host_key_clusters` does today; their time is
 the scan's `finished_at`.
 
-### `links_list(&LinkFilter) -> (Vec<LinkRow>, total)`
+### `links_list(&LinkFilter) -> Page<LinkRow>`
 
 `LinkFilter` (serde, names and formats as `RequestFilter`, `lenient_i64` for
 numbers):
@@ -102,10 +102,13 @@ numbers):
 - `kind` (default `fp`), `q` (prefix of the value, case-insensitive for hex),
   `shared` (`1` default: more than one IP; `0`: all), `from`, `to`
   (`ts_bound` as `RequestFilter`), `country`, `node`, `sort` = `ips`
-  (default) | `sightings` | `recent`, `page` (50 rows per page).
-- `country` keeps a value if any of its IPs is in that country.
-- `node` applies to request-based kinds (`fp` via the fingerprint's request,
-  `ja4`, `ja4h`, `canary` via either request); for `ssh`, `tls`, `hassh`,
+  (default) | `sightings` | `recent`, `page` (`browse::PAGE_SIZE` rows, the
+  shared pager; no total count).
+- Every filter narrows the sightings, and counts are over the matching
+  sightings: with `country=DE`, a value is listed if it was seen on an IP in
+  Germany, and its IP count is its German IPs.
+- `node` applies to request-based kinds (`fp` via the fingerprint row's
+  `origin`, `ja4`, `ja4h`, `canary` via either side); for `ssh`, `tls`, `hassh`,
   `ja4x` the field is shown disabled and ignored.
 - `LinkRow`: value, ips, sightings, first_seen, last_seen.
 
