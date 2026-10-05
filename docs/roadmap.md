@@ -186,11 +186,58 @@ honeypot.
   its defaults. `ssh2-enum-algos`, and so HASSH, still works. First check
   the nmap version the scanner nodes run (Debian 12 ships 7.93). If the
   limit holds there too, fetch the host key with a minimal key exchange of
-  our own (curve25519).
+  our own (curve25519; the `russh` client hands over the server key before
+  authentication), one connection per key type. `host_keys` is derived from
+  the stored XML and not replicated, so keys fetched outside nmap need a
+  record of their own on the scan.
+- **ETags of scanned sources.** S, medium. nmap's `http-headers` (in
+  `discovery` and `safe`) already runs at levels 3–4, so the `ETag` of each
+  HTTP port is in the stored XML; parse it into `host_keys` as a new kind,
+  reparsing old scans via `keys_parsed`. Optionally add `http-headers` to
+  level 2's named scripts. A shared ETag means the same file with the same
+  mtime and size (one image, one kit), but distro default pages share it
+  across thousands of hosts: a soft, rarity-weighted edge for item 4, never
+  a hard one. nginx ETags also date the file, roughly when the box was set
+  up. Shown on the IP page beside the host keys.
+- **ETags as a return marker.** S, low. Decoys answer with an ETag derived
+  from the request, like a canary; an `If-None-Match` carrying it from
+  another IP links the two. Only caching clients (browsers, headless
+  Chrome) send it back, so first count how many recorded requests carry
+  `If-None-Match` at all.
+- **Reverse DNS of every source.** S, medium. Store the forward-confirmed
+  PTR name per IP (the lookup `scan/crawler.rs` already does), refreshed
+  when the IP returns. It often names the hoster or a research scanner.
+  Shown on the IP page and in the IP directory filter (admin); a `ptr`
+  column in the dataset.
+- **VPN and relay exits.** M, high. Scanning a VPN exit scans the VPN
+  company, a bystander, as with Tor exits. Load X4BNet's `lists_vpn` (MIT,
+  ASN-derived) the way the Tor list is loaded. Listed IPs are never
+  scanned, flagged like `is_tor_exit`, and kept off the blocklist. Shown
+  on the IP page, as an IP directory filter, and as a public "via VPN"
+  share beside the Tor share.
+- **Proxy signals from our own data.** S, medium. A `Via`, `Forwarded` or
+  `X-Forwarded-For` header in the probe itself means a forwarding proxy
+  (a rule label); a counter-scan finding `socks5`, `http-proxy` or OpenVPN
+  means the source likely is one. Both are admin-only flags on the IP page.
 - **JA4T on directly listening traps.** S–M, medium. `TCP_SAVE_SYN` and
   `TCP_SAVED_SYN` give the client's SYN without pcap. This works only where
   the trap listens on 80/443 itself; behind nginx the SYN goes to nginx.
-  Shown on the request page and in Analytics.
+  Shown on the request page and in Analytics. A lowered MSS (around 1380
+  for WireGuard, 1360 for OpenVPN) also hints at a tunnel.
+
+## Not planned
+
+- **Passive DNS.** The useful sources (DNSDB, SecurityTrails, VirusTotal,
+  OTX, CIRCL) need an API key or vetting and are proprietary data; and
+  sources seen once from a throwaway VPS rarely have domains. Reverse DNS
+  covers the free part.
+- **Per-vendor VPN exit lists** (Mullvad, Proton VPN, NordVPN, iCloud
+  Private Relay, …). Which vendors to include would be our own arbitrary
+  choice, and every list is one more source to keep working as vendors
+  change their endpoints.
+- **Paid anonymizer detection** (ip-api, proxycheck.io, IPinfo privacy and
+  the like). Residential proxy exits are ordinary home addresses and cannot
+  be told apart without such a service, so they stay undetected.
 
 ## After 1.0
 
