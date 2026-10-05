@@ -18,7 +18,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
-    Router::new().route("/admin/lookup", get(page).post(lookup))
+    Router::new()
+        .route("/admin/lookup", get(page).post(lookup))
+        .route("/admin/lookup/bulk", axum::routing::post(bulk))
 }
 
 /// The result for one address.
@@ -42,6 +44,28 @@ struct LookupPage {
     result: Option<LookupResult>,
     per_peer: u32,
     cluster: bool,
+    bulk: Option<Bulk>,
+}
+
+/// Addresses read from stored data only (no provider is asked).
+pub struct Bulk {
+    /// What was pasted, for the form.
+    pub text: String,
+    pub rows: Vec<crate::store::browse::IpSummary>,
+    /// Single addresses not in the dataset.
+    pub missing: Vec<String>,
+    /// Pieces that are neither an address nor a network.
+    pub unreadable: Vec<String>,
+    /// More stored addresses matched than [`BULK_MAX`].
+    pub capped: bool,
+}
+
+/// Most addresses one bulk lookup reads or lists.
+pub const BULK_MAX: usize = 500;
+
+#[derive(serde::Deserialize, Default)]
+pub struct BulkForm {
+    pub ips: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -65,6 +89,7 @@ async fn page(
         result: None,
         per_peer: crate::intel::lookup::PER_PEER_PER_DAY,
         cluster: state.recorder.node().is_some(),
+        bulk: None,
     })
 }
 
@@ -83,6 +108,7 @@ async fn lookup(
             result: None,
             per_peer: crate::intel::lookup::PER_PEER_PER_DAY,
             cluster,
+            bulk: None,
         });
     };
     let ip = crate::net::canonical(ip);
@@ -94,6 +120,58 @@ async fn lookup(
         result: Some(result),
         per_peer: crate::intel::lookup::PER_PEER_PER_DAY,
         cluster,
+        bulk: None,
+    })
+}
+
+/// Many addresses at once, from stored data: whether each is in the
+/// dataset and what it did. Provider lookups stay one at a time (each
+/// spends API budget).
+async fn bulk(
+    _u: SessionUser,
+    State(state): State<Arc<AdminState>>,
+    Form(f): Form<BulkForm>,
+) -> AppResult<Html<String>> {
+    let text = f.ips.unwrap_or_default();
+    let (mut addrs, mut nets, mut unreadable) = (vec![], vec![], vec![]);
+    for piece in text
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|p| !p.is_empty())
+        .take(BULK_MAX)
+    {
+        if let Ok(ip) = piece.parse::<IpAddr>() {
+            addrs.push(crate::net::canonical(ip));
+        } else if let Ok(n) = piece.parse::<ipnet::IpNet>() {
+            nets.push(n.trunc());
+        } else {
+            unreadable.push(piece.to_string());
+        }
+    }
+    let mut rows = state
+        .store
+        .ips_matching(&addrs, &nets, BULK_MAX as i64 + 1)
+        .await?;
+    let capped = rows.len() > BULK_MAX;
+    rows.truncate(BULK_MAX);
+    let missing = addrs
+        .iter()
+        .map(IpAddr::to_string)
+        .filter(|a| !rows.iter().any(|r| &r.ip == a))
+        .collect();
+    render(&LookupPage {
+        chrome: chrome(),
+        ip: String::new(),
+        error: None,
+        result: None,
+        per_peer: crate::intel::lookup::PER_PEER_PER_DAY,
+        cluster: state.recorder.node().is_some(),
+        bulk: Some(Bulk {
+            text,
+            rows,
+            missing,
+            unreadable,
+            capped,
+        }),
     })
 }
 

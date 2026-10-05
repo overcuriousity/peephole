@@ -627,6 +627,45 @@ impl Count {
 }
 
 impl Store {
+    /// Stored IPs among `addrs` or inside `nets`, by address, at most
+    /// `limit` (admin bulk lookup).
+    pub async fn ips_matching(
+        &self,
+        addrs: &[IpAddr],
+        nets: &[IpNet],
+        limit: i64,
+    ) -> Result<Vec<IpSummary>> {
+        let mut ors = vec![];
+        let mut binds = vec![];
+        for a in addrs {
+            ors.push("i.ip = ?".to_string());
+            binds.push(a.to_string());
+        }
+        for n in nets {
+            let (lo, hi) = super::net_key_range(n);
+            ors.push(if n.addr().is_ipv6() {
+                "(i.ip_key BETWEEN ? AND ? AND instr(i.ip, ':') > 0)".to_string()
+            } else {
+                "i.ip_key BETWEEN ? AND ?".to_string()
+            });
+            binds.push(lo);
+            binds.push(hi);
+        }
+        if ors.is_empty() {
+            return Ok(vec![]);
+        }
+        let sql = format!(
+            "{} WHERE {} ORDER BY i.ip_key LIMIT {limit}",
+            ip_summary_select(Audience::Admin),
+            ors.join(" OR ")
+        );
+        let mut q = sqlx::query_as::<_, IpSummary>(sqlx::AssertSqlSafe(sql.as_str()));
+        for b in &binds {
+            q = q.bind(b);
+        }
+        Ok(q.fetch_all(&self.read).await?)
+    }
+
     pub async fn list_ips(&self, f: &IpFilter) -> Result<Page<IpSummary>> {
         self.list_ips_as(f, Audience::Admin).await
     }

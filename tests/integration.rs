@@ -3150,6 +3150,50 @@ async fn admin_search_sends_each_kind_of_input_to_its_page() {
     assert_eq!(r.status(), 303, "admin only");
 }
 
+/// Bulk lookup answers from stored data only: one row per stored address
+/// or per stored address in a network, and the rest listed.
+#[tokio::test]
+async fn bulk_lookup_lists_stored_addresses() {
+    let (_trap, store, dir) = spawn_trap().await;
+    for a in ["203.0.113.5", "10.9.1.1", "10.9.2.2", "10.8.0.1"] {
+        store.upsert_ip(a.parse().unwrap()).await.unwrap();
+    }
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store, cfg).await;
+    let html = client
+        .post(format!("{base}/admin/lookup/bulk"))
+        .form(&[("ips", "203.0.113.5, 198.51.100.99\n10.9.0.0/16  bogus")])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let rows = html.split("data-bulk").nth(1).expect("bulk table");
+    for want in [
+        "/ip/203.0.113.5",
+        "/ip/10.9.1.1",
+        "/ip/10.9.2.2",
+        "/admin/links/ip/10.9.1.1",
+    ] {
+        assert!(rows.contains(want), "bulk lacks {want}");
+    }
+    assert!(!rows.contains("10.8.0.1"), "outside the network");
+    assert!(rows.contains("198.51.100.99") && rows.contains("not stored"));
+    assert!(html.contains("bogus"), "unreadable input is named");
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let r = anon
+        .post(format!("{base}/admin/lookup/bulk"))
+        .form(&[("ips", "203.0.113.5")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 303, "admin only");
+}
+
 /// Signed in, every page has the Lookup box; anonymous visitors don't.
 #[tokio::test]
 async fn lookup_box_only_for_admins() {
