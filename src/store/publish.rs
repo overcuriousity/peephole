@@ -57,7 +57,7 @@ pub async fn run(store: Store, mut shutdown: tokio::sync::watch::Receiver<bool>)
         }
         tokio::select! {
             _ = tokio::time::sleep(TICK) => {}
-            _ = shutdown.changed() => {}
+            r = shutdown.changed() => if r.is_err() { return },
         }
         if *shutdown.borrow() {
             return;
@@ -262,6 +262,18 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stops")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_stops_when_the_sender_is_dropped() {
+        let (s, _d) = store().await;
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run(s, rx));
+        drop(tx);
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("stops")

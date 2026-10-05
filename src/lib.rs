@@ -106,6 +106,19 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     }
     std::fs::create_dir_all(&cfg.data_dir)?;
     let store = store::Store::connect(&cfg.database_path).await?;
+    // Public pages show a request only after this delay (spec 2026-10-05).
+    let minutes = |m: u32| std::time::Duration::from_secs(u64::from(m) * 60);
+    store
+        .set_publish_delay(
+            minutes(cfg.public.delay_minutes),
+            minutes(cfg.public.jitter_minutes),
+        )
+        .await?;
+    if cfg.public.delay_minutes + cfg.public.jitter_minutes == 0 {
+        warn!(
+            "[public] delay_minutes and jitter_minutes are 0: public pages show requests at once"
+        );
+    }
 
     let geo = Arc::new(RwLock::new(if geolite_loads(&cfg) {
         intel::geo::GeoIp::load_blocking(&cfg.data_dir)
@@ -185,6 +198,9 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         cfg.cluster.is_none(),
         shutdown_rx.clone(),
     ));
+
+    // Release delayed requests to the public pages.
+    tokio::spawn(store::publish::run(store.clone(), shutdown_rx.clone()));
 
     // Canaries and tokens of rows stored before this build (or by an older
     // tokenizer); new rows are derived as they are written.

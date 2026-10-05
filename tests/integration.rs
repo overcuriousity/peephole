@@ -1287,6 +1287,9 @@ admin_listen = "127.0.0.1:{admin}"
 database_path = "{db}"
 data_dir = "{d}"
 trusted_proxies = ["127.0.0.1/32"]
+[public]
+delay_minutes = 0
+jitter_minutes = 0
 [webauthn]
 rp_id = "localhost"
 origin = "https://localhost"

@@ -167,6 +167,9 @@ tor_wait_hours = 6
 # [public]
 # show_labels = true   # rule labels (coarse categories of what an IP requested):
 #                      # per-IP chips, the label filter and the label chart
+# delay_minutes = 5    # a request shows on public pages (wall, IPs, blocklist)
+# jitter_minutes = 5   # only after the delay plus a random 0..jitter per request
+# recent_rows = 50     # rows of the wall's "Recent requests" (last 24 h)
 
 # Distributed mode: share requests, scan queue, results and intel with other
 # nodes (docs/cluster.md). Absent: standalone. The node key is
