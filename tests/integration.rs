@@ -897,6 +897,56 @@ async fn admin_pages_and_deletes_with_session() {
         html.contains("href=\"/admin/links/hassh/") && html.contains("href=\"/admin/links/ja4x/")
     );
     assert!(html.contains("href=\"/admin/links/canaries?range=all\""));
+    // Every Analytics row opens a filtered view.
+    for want in [
+        "href=\"/requests?ua=",
+        "href=\"/requests?method=",
+        "href=\"/requests?transport=",
+        "href=\"/requests?answer=",
+        "href=\"/ips?port=22%2Ftcp\"",
+        "href=\"/ips?os=Linux\"",
+        "href=\"/admin/scans?level=",
+        "href=\"/admin/scans?status=",
+        "href=\"/ips?nointel=abuseipdb\"",
+    ] {
+        assert!(html.contains(want), "analytics lacks {want}");
+    }
+    let ua_link = html
+        .split("href=\"/requests?ua=")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap()
+        .replace("&#38;", "&");
+    let rows = get(&format!("/requests?ua={ua_link}"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        rows.contains("/admin/requests/"),
+        "the UA link finds requests"
+    );
+    let rows = get("/ips?port=22%2Ftcp")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(rows.contains("203.0.113.78"), "the port link finds IPs");
+    let html = get("/admin/analytics?range=24h")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // Askama writes `&` as `&#38;`.
+    assert!(
+        html.contains("&#38;from=") && !html.contains("ips?port=22%2Ftcp&#38;from"),
+        "request links carry the range start, IP links don't"
+    );
     let html = get(&format!("/admin/requests/{rid}"))
         .await
         .unwrap()

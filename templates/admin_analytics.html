@@ -20,7 +20,7 @@
       <div class="card-head"><h2>Top paths</h2><a href="/requests">search →</a></div>
       <div class="table-wrap"><table class="an-table">
         <thead><tr><th>Path</th><th class="num">Requests</th><th class="num">IPs</th></tr></thead>
-        <tbody>{% for n in a.paths %}<tr><td class="name"><a href="/requests?path={{ n.name|urlencode }}">{{ n.name }}</a>{% let v = n.count %}{% let max = max.paths %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
+        <tbody>{% for n in a.paths %}<tr><td class="name"><a href="{{ req("path", n.name) }}">{{ n.name }}</a>{% let v = n.count %}{% let max = max.paths %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
         {% if a.paths.is_empty() %}<tr><td colspan="3" class="empty">None.</td></tr>{% endif %}</tbody>
       </table></div>
     </section>
@@ -28,7 +28,7 @@
       <div class="card-head"><h2>Top user agents</h2></div>
       <div class="table-wrap"><table class="an-table">
         <thead><tr><th>User-Agent</th><th class="num">Requests</th><th class="num">IPs</th></tr></thead>
-        <tbody>{% for n in a.user_agents %}<tr><td class="name">{{ n.name }}{% let value = n.name.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}{% let v = n.count %}{% let max = max.user_agents %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
+        <tbody>{% for n in a.user_agents %}<tr><td class="name"><a href="{{ req("ua", n.name) }}">{{ n.name }}</a>{% let value = n.name.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}{% let v = n.count %}{% let max = max.user_agents %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
         {% if a.user_agents.is_empty() %}<tr><td colspan="3" class="empty">None.</td></tr>{% endif %}</tbody>
       </table></div>
     </section>
@@ -38,17 +38,17 @@
     <section class="card">
       <h2>Methods</h2>
       {% let total = a.total_requests %}
-      <ul class="shares">{% for n in a.methods %}<li><span class="mono">{{ n.name }}</span><span class="num">{{ crate::admin::views::thousands(n.count) }}<span class="share-pct">{{ crate::admin::views::pct(n.count, total) }} %</span></span>{% let v = n.count %}{% let max = total %}{% include "_bar.html" %}</li>{% endfor %}</ul>
+      <ul class="shares">{% for n in a.methods %}<li><a class="mono" href="{{ req("method", n.name) }}">{{ n.name }}</a><span class="num">{{ crate::admin::views::thousands(n.count) }}<span class="share-pct">{{ crate::admin::views::pct(n.count, total) }} %</span></span>{% let v = n.count %}{% let max = total %}{% include "_bar.html" %}</li>{% endfor %}</ul>
       {% if a.methods.is_empty() %}<p class="empty">None.</p>{% endif %}
     </section>
     <section class="card">
       <h2>Transport</h2>
-      <ul class="shares">{% for n in a.transports %}<li><span class="mono">{{ n.name }}</span><span class="num">{{ crate::admin::views::thousands(n.count) }}<span class="share-pct">{{ crate::admin::views::pct(n.count, total) }} %</span></span>{% let v = n.count %}{% let max = total %}{% include "_bar.html" %}</li>{% endfor %}</ul>
+      <ul class="shares">{% for n in a.transports %}<li><a class="mono" href="{{ req("transport", n.name) }}">{{ n.name }}</a><span class="num">{{ crate::admin::views::thousands(n.count) }}<span class="share-pct">{{ crate::admin::views::pct(n.count, total) }} %</span></span>{% let v = n.count %}{% let max = total %}{% include "_bar.html" %}</li>{% endfor %}</ul>
       {% if a.transports.is_empty() %}<p class="empty">None.</p>{% endif %}
     </section>
     <section class="card">
       <h2>Answered with</h2>
-      <ul class="shares">{% for n in a.answers %}<li><span class="mono">{{ n.name }}</span><span class="num">{{ crate::admin::views::thousands(n.count) }}<span class="share-pct">{{ crate::admin::views::pct(n.count, total) }} %</span></span>{% let v = n.count %}{% let max = total %}{% include "_bar.html" %}</li>{% endfor %}</ul>
+      <ul class="shares">{% for n in a.answers %}<li><a class="mono" href="{{ req("answer", n.name) }}">{{ n.name }}</a><span class="num">{{ crate::admin::views::thousands(n.count) }}<span class="share-pct">{{ crate::admin::views::pct(n.count, total) }} %</span></span>{% let v = n.count %}{% let max = total %}{% include "_bar.html" %}</li>{% endfor %}</ul>
       {% if a.answers.is_empty() %}<p class="empty">None.</p>{% endif %}
     </section>
   </div>
@@ -76,7 +76,7 @@
       <div class="card-head"><h2>Open ports</h2><span class="muted">IPs</span></div>
       <ol class="ports-list">
         {% for p in a.ports %}
-        <li><span class="port mono">{{ p.port }}<span class="muted">/{{ p.proto }}</span></span><span class="port-svc">{{ p.service.as_deref().unwrap_or("unknown") }}</span>{% let v = p.ips %}{% let max = max.ports %}{% include "_bar.html" %}<span class="num">{{ p.ips }}</span></li>
+        <li><a class="port mono" href="{{ ips("port", format!("{}/{}", p.port, p.proto).as_str()) }}">{{ p.port }}<span class="muted">/{{ p.proto }}</span></a><span class="port-svc">{{ p.service.as_deref().unwrap_or("unknown") }}</span>{% let v = p.ips %}{% let max = max.ports %}{% include "_bar.html" %}<span class="num">{{ p.ips }}</span></li>
         {% endfor %}
       </ol>
       {% if a.ports.is_empty() %}<p class="empty">None.</p>{% endif %}
@@ -84,7 +84,7 @@
     <section class="card">
       <div class="card-head"><h2>What runs on them</h2></div>
       <ol class="ranked">
-        {% for n in a.products %}<li><span class="ranked-name">{{ n.name }}</span><span class="num">{{ n.ips }} IP{% if n.ips != 1 %}s{% endif %}</span>{% let v = n.ips %}{% let max = max.products %}{% include "_bar.html" %}</li>{% endfor %}
+        {% for n in a.products %}<li><a class="ranked-name" href="{{ ips("product", n.name) }}">{{ n.name }}</a><span class="num">{{ n.ips }} IP{% if n.ips != 1 %}s{% endif %}</span>{% let v = n.ips %}{% let max = max.products %}{% include "_bar.html" %}</li>{% endfor %}
       </ol>
       {% if a.products.is_empty() %}<p class="empty">None (needs level 2+).</p>{% endif %}
     </section>
@@ -111,18 +111,18 @@
     <section class="card">
       <h2>OS guesses</h2>
       <ol class="ranked">
-        {% for n in a.os_guesses %}<li><span class="ranked-name" title="{{ n.name }}">{{ n.name }}</span><span class="num">{{ n.ips }}</span>{% let v = n.ips %}{% let max = max.os %}{% include "_bar.html" %}</li>{% endfor %}
+        {% for n in a.os_guesses %}<li><a class="ranked-name" title="{{ n.name }}" href="{{ ips("os", n.name) }}">{{ n.name }}</a><span class="num">{{ n.ips }}</span>{% let v = n.ips %}{% let max = max.os %}{% include "_bar.html" %}</li>{% endfor %}
       </ol>
       {% if a.os_guesses.is_empty() %}<p class="empty">None (needs level 2+).</p>{% endif %}
     </section>
     <section class="card">
       <h2>AbuseIPDB score</h2>
-      <ul class="shares">{% for n in a.abuse %}<li><span>{{ n.name }}</span><span class="num">{{ crate::admin::views::thousands(n.count) }}</span>{% let v = n.count %}{% let max = max.abuse %}{% include "_bar.html" %}</li>{% endfor %}</ul>
+      <ul class="shares">{% for n in a.abuse %}<li><a href="{{ abuse_href(n.name) }}">{{ n.name }}</a><span class="num">{{ crate::admin::views::thousands(n.count) }}</span>{% let v = n.count %}{% let max = max.abuse %}{% include "_bar.html" %}</li>{% endfor %}</ul>
     </section>
     <section class="card">
       <h2>Counter-scans</h2>
-      <ul class="shares">{% for n in a.scan_levels %}<li><span>{{ n.name }}</span><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = max.levels %}{% include "_bar.html" %}</li>{% endfor %}</ul>
-      <div class="chips">{% for n in a.job_status %}<span class="badge badge-status" data-status="{{ n.name }}">{{ n.name }} {{ n.count }}</span>{% endfor %}</div>
+      <ul class="shares">{% for n in a.scan_levels %}<li><a href="{{ level_href(n.name) }}">{{ n.name }}</a><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = max.levels %}{% include "_bar.html" %}</li>{% endfor %}</ul>
+      <div class="chips">{% for n in a.job_status %}<a class="badge badge-status" data-status="{{ n.name }}" href="/admin/scans?status={{ n.name|urlencode }}#history">{{ n.name }} {{ n.count }}</a>{% endfor %}</div>
       {% if a.scan_levels.is_empty() && a.job_status.is_empty() %}<p class="empty">None.</p>{% endif %}
     </section>
   </div>

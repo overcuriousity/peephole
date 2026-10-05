@@ -38,6 +38,8 @@ fn chrome() -> Chrome {
 struct AnalyticsPage {
     chrome: Chrome,
     range: Range,
+    /// The range's start for request links (`from`), none for all time.
+    from: Option<String>,
     a: Arc<Analytics>,
     /// Largest value per list, for the bar widths.
     max: AnalyticsMax,
@@ -81,12 +83,58 @@ async fn analytics(
         abuse: max_of(&a.abuse, |n| n.count),
         levels: max_of(&a.scan_levels, |n| n.count),
     };
+    let from = match range {
+        Range::H24 => Some(chrono::Duration::hours(24)),
+        Range::D7 => Some(chrono::Duration::days(7)),
+        Range::D30 => Some(chrono::Duration::days(30)),
+        Range::All => None,
+    }
+    .map(|d| {
+        (chrono::Utc::now() - d)
+            .format("%Y-%m-%dT%H:%M")
+            .to_string()
+    });
     render(&AnalyticsPage {
         chrome: chrome(),
         range,
+        from,
         a,
         max,
     })
+}
+
+/// Where each Analytics row leads: the requests or IPs with that value.
+impl AnalyticsPage {
+    /// The requests with `key=value` in the page's range.
+    fn req(&self, key: &str, value: &str) -> String {
+        let mut href = format!("/requests?{key}={}", crate::admin::public::urlencode(value));
+        if let Some(f) = &self.from {
+            href.push_str(&format!("&from={f}"));
+        }
+        href
+    }
+
+    /// The IPs with `key=value` (scan facts: in any stored scan).
+    fn ips(&self, key: &str, value: &str) -> String {
+        format!("/ips?{key}={}", crate::admin::public::urlencode(value))
+    }
+
+    /// An AbuseIPDB band: its floor and up, or the IPs not looked up.
+    fn abuse_href(&self, band: &str) -> String {
+        if band == "not looked up" {
+            return format!("/ips?nointel={}", crate::intel::ABUSEIPDB);
+        }
+        let floor: String = band.chars().take_while(char::is_ascii_digit).collect();
+        format!("/ips?min_abuse={floor}&sort=abuse")
+    }
+
+    /// A scan level (`level 2`) in the scans history.
+    fn level_href(&self, name: &str) -> String {
+        format!(
+            "/admin/scans?level={}#history",
+            name.trim_start_matches("level ")
+        )
+    }
 }
 
 #[derive(Template)]
