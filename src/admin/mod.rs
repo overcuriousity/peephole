@@ -36,11 +36,11 @@ pub struct AdminState {
     pub closing: Option<tokio::sync::watch::Receiver<bool>>,
     /// Per-client rate limits (public pages, sign-in ceremonies).
     pub limits: limit::Limits,
-    /// This node's enrichment providers (their budgets on the cluster page).
+    /// This node's enrichment providers (their budgets on System › Status).
     pub providers: crate::intel::Providers,
     /// Addresses the blocklist feed must leave out (members, own networks).
     pub safety: tokio::sync::Mutex<crate::scan::safety::Safety>,
-    /// How members' requests compare with this node's rules (Cluster page).
+    /// How members' requests compare with this node's rules (Cluster pages).
     pub rules_check: crate::store::stats::SwrCache<(), cluster::RulesCheck>,
 }
 

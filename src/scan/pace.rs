@@ -1,6 +1,6 @@
 //! Runtime scan pacing: how many nmap workers run at once and how many scans
 //! may start per hour. Defaults come from `[scan]` in the config; the admin
-//! queue page can override both at runtime (persisted in the `settings` table).
+//! Scans page can override both at runtime (persisted in the `settings` table).
 //!
 //! The queue metrics feed [`recommend`], which sizes the pace so the queue
 //! keeps up with arrivals and drains any backlog within a day.

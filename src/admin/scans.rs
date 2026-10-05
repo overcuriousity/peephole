@@ -166,7 +166,7 @@ pub(crate) struct PaceView {
     pub(crate) notice: Option<String>,
     pub(crate) error: Option<String>,
     /// Distributed mode on a node without the scanner role: its own pace
-    /// does nothing; scanners are paced on the Cluster page.
+    /// does nothing; scanners are paced in the Scans page's Scanners table.
     pub(crate) not_scanning: bool,
 }
 

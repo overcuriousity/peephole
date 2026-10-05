@@ -1,6 +1,6 @@
 # Admin information architecture (UI rework, piece B)
 
-Date: 2026-10-05 · Status: design approved, spec for review.
+Date: 2026-10-05 · Status: implemented (branch `admin-ia`).
 Roadmap: `2026-10-05-ui-rework-roadmap.md` (piece B). Constraints from piece A:
 `2026-10-05-public-delay-design.md`.
 
