@@ -38,6 +38,10 @@ nmap.
   Bystanders are spared: one request earns at most a light scan, and
   verified crawlers, Tor exits, your own and `never_scan` networks are
   never scanned; per-network, per-ASN and queue budgets stop floods.
+- **Tarpit** — for an hour after a source's request reaches severity 4,
+  its requests get a slow-drip `200` that holds them up to 10 minutes, from
+  a bounded pool of its own; the time held is recorded. Bystander and
+  `never_scan` networks are never held.
 - **Canaries** — decoys for the probes scanners send first (`.env`,
   `.git/config`, wp-login, phpinfo) serve realistic credentials derived
   from the request, with links back to the trap. When a harvested
@@ -46,7 +50,7 @@ nmap.
 - **Wall of shame** (public) — aggregate statistics per time range, shown
   after a delay (`[public] delay_minutes` plus up to `jitter_minutes` more,
   5 + 0–5 min by default) so the wall cannot be used to watch a scan live:
-  trends against the previous period, requests over time
+  trends against the previous period, scanner time wasted in the tarpit, requests over time
   by severity, a weekday × hour heatmap, attack families and an OWASP Top 10 /
   Automated Threats map, a world map, top IPs and networks, the ports most
   often found open on the scanned sources, and a searchable IP directory

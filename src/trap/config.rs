@@ -2,6 +2,13 @@
 use anyhow::bail;
 use serde::Deserialize;
 
+/// Most connections the tarpit may hold (`tarpit_pool`).
+const MAX_TARPIT_POOL: usize = 16 * 1024;
+/// Longest hold (`tarpit_hold_secs`): a day.
+const MAX_TARPIT_HOLD_SECS: u64 = 24 * 3600;
+/// Most bytes per drip (`tarpit_drip_bytes`).
+const MAX_TARPIT_DRIP_BYTES: usize = 4096;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrapConfig {
     /// Requests per second one IP may have recorded in full, sustained.
@@ -29,6 +36,23 @@ pub struct TrapConfig {
     /// root. A prefix of your own makes the trap harder to fingerprint.
     #[serde(default)]
     pub helper_prefix: String,
+    /// Connections held at once in the tarpit: the slow answer for sources
+    /// whose requests reached severity 4. Past it they get the normal
+    /// answer. 0 turns the tarpit off.
+    #[serde(default = "default_tarpit_pool")]
+    pub tarpit_pool: usize,
+    /// Of those, at most this many from one source (IPv6 by /64).
+    #[serde(default = "default_tarpit_per_source")]
+    pub tarpit_per_source: usize,
+    /// Longest a tarpitted connection is held, in seconds.
+    #[serde(default = "default_tarpit_hold_secs")]
+    pub tarpit_hold_secs: u64,
+    /// Bytes sent per drip.
+    #[serde(default = "default_tarpit_drip_bytes")]
+    pub tarpit_drip_bytes: usize,
+    /// Seconds between drips; shorter than the hold.
+    #[serde(default = "default_tarpit_drip_every_secs")]
+    pub tarpit_drip_every_secs: u64,
 }
 
 fn default_record_rate() -> f64 {
@@ -43,6 +67,21 @@ fn default_sample_every() -> u32 {
 fn default_skip_log_rate() -> u32 {
     100
 }
+fn default_tarpit_pool() -> usize {
+    256
+}
+fn default_tarpit_per_source() -> usize {
+    8
+}
+fn default_tarpit_hold_secs() -> u64 {
+    600
+}
+fn default_tarpit_drip_bytes() -> usize {
+    1
+}
+fn default_tarpit_drip_every_secs() -> u64 {
+    10
+}
 
 impl Default for TrapConfig {
     fn default() -> Self {
@@ -52,6 +91,11 @@ impl Default for TrapConfig {
             sample_every: default_sample_every(),
             skip_log_rate: default_skip_log_rate(),
             helper_prefix: String::new(),
+            tarpit_pool: default_tarpit_pool(),
+            tarpit_per_source: default_tarpit_per_source(),
+            tarpit_hold_secs: default_tarpit_hold_secs(),
+            tarpit_drip_bytes: default_tarpit_drip_bytes(),
+            tarpit_drip_every_secs: default_tarpit_drip_every_secs(),
         }
     }
 }
@@ -63,6 +107,25 @@ impl TrapConfig {
         }
         if self.record_rate > 0.0 && self.record_burst == 0 {
             bail!("trap.record_burst must be at least 1");
+        }
+        if self.tarpit_pool > MAX_TARPIT_POOL {
+            bail!("trap.tarpit_pool must be at most {MAX_TARPIT_POOL}");
+        }
+        if self.tarpit_pool > 0 {
+            if self.tarpit_per_source == 0 {
+                bail!("trap.tarpit_per_source must be at least 1");
+            }
+            if !(1..=MAX_TARPIT_HOLD_SECS).contains(&self.tarpit_hold_secs) {
+                bail!("trap.tarpit_hold_secs must be 1..={MAX_TARPIT_HOLD_SECS}");
+            }
+            if !(1..=MAX_TARPIT_DRIP_BYTES).contains(&self.tarpit_drip_bytes) {
+                bail!("trap.tarpit_drip_bytes must be 1..={MAX_TARPIT_DRIP_BYTES}");
+            }
+            if self.tarpit_drip_every_secs == 0
+                || self.tarpit_drip_every_secs >= self.tarpit_hold_secs
+            {
+                bail!("trap.tarpit_drip_every_secs must be at least 1 and below tarpit_hold_secs");
+            }
         }
         let p = &self.helper_prefix;
         // Rendered into the trap page's HTML and JS: path characters only.
@@ -115,5 +178,27 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn tarpit_defaults_and_validation() {
+        let c = parse("").unwrap();
+        assert_eq!(c.tarpit_pool, 256);
+        assert_eq!(c.tarpit_per_source, 8);
+        assert_eq!(c.tarpit_hold_secs, 600);
+        assert_eq!(c.tarpit_drip_bytes, 1);
+        assert_eq!(c.tarpit_drip_every_secs, 10);
+        assert!(parse("tarpit_pool = 0").is_ok(), "0 turns it off");
+        assert!(parse("tarpit_pool = 100000").is_err());
+        assert!(parse("tarpit_per_source = 0").is_err());
+        assert!(parse("tarpit_hold_secs = 0").is_err());
+        assert!(parse("tarpit_hold_secs = 100000").is_err());
+        assert!(parse("tarpit_drip_bytes = 0").is_err());
+        assert!(parse("tarpit_drip_bytes = 100000").is_err());
+        assert!(parse("tarpit_drip_every_secs = 0").is_err());
+        assert!(parse("tarpit_hold_secs = 10\ntarpit_drip_every_secs = 10").is_err());
+        assert!(parse("tarpit_hold_secs = 11\ntarpit_drip_every_secs = 10").is_ok());
+        // Off: the rest is not checked.
+        assert!(parse("tarpit_pool = 0\ntarpit_drip_bytes = 0").is_ok());
     }
 }

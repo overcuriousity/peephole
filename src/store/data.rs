@@ -274,8 +274,8 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
            headers_json, body, labels_json, owasp_json, severity, scan_level, is_fp_claim,
            page_token, answer, status, unrecorded, transport, via_proxy, raw_head,
            tls_client_hello, ja4, build, rules, decoy_v, decoy_site, ja4h, ja4h_v,
-           user_agent, ua_v)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           user_agent, ua_v, held_ms)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -313,6 +313,7 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(super::ja4h::JA4H_V)
     .bind(super::useragent::derive(&r.headers_json))
     .bind(super::useragent::UA_V)
+    .bind(r.held_ms.filter(|ms| *ms >= 0))
     .execute(&mut *conn)
     .await?;
     if done.rows_affected() == 1 {
@@ -384,8 +385,9 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
     for r in &b.rows {
         sqlx::query(
             "INSERT INTO skipped_requests
-               (batch_id, ts_ms, method, path, page_token, host, answer, decoy_v, decoy_site)
-             VALUES (?,?,?,?,?,?,?,?,?)",
+               (batch_id, ts_ms, method, path, page_token, host, answer, decoy_v, decoy_site,
+                held_ms)
+             VALUES (?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(id)
         .bind(row_ms(r.ts_ms))
@@ -396,6 +398,7 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
         .bind(r.answer.as_deref().map(|a| cut(a, 64)))
         .bind(r.decoy_v)
         .bind(r.decoy_site.as_deref().map(|w| cut(w, 64)))
+        .bind(r.held_ms.filter(|ms| *ms >= 0))
         .execute(&mut *conn)
         .await?;
     }
@@ -1236,6 +1239,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
         Option<String>,
         Option<i64>,
         Option<String>,
+        Option<i64>,
     );
     type Req = (
         String,
@@ -1291,7 +1295,8 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                 Some(r) => {
                     let x: ReqExtra = sqlx::query_as(
                         "SELECT build, answer, status, unrecorded, transport, via_proxy, raw_head,
-                                tls_client_hello, ja4, owasp_json, rules, decoy_v, decoy_site
+                                tls_client_hello, ja4, owasp_json, rules, decoy_v, decoy_site,
+                                held_ms
                          FROM requests WHERE uid = ?",
                     )
                     .bind(uid)
@@ -1324,6 +1329,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         rules: x.10,
                         decoy_v: x.11,
                         decoy_site: x.12,
+                        held_ms: x.13,
                     })))
                 }
             }
@@ -1348,9 +1354,11 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         Option<String>,
                         Option<i64>,
                         Option<String>,
+                        Option<i64>,
                     );
                     let rows: Vec<Row> = sqlx::query_as(
-                        "SELECT ts_ms, method, path, page_token, host, answer, decoy_v, decoy_site
+                        "SELECT ts_ms, method, path, page_token, host, answer, decoy_v, decoy_site,
+                                held_ms
                          FROM skipped_requests WHERE batch_id = ? ORDER BY rowid",
                     )
                     .bind(id)
@@ -1372,6 +1380,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                                     answer,
                                     decoy_v,
                                     decoy_site,
+                                    held_ms,
                                 )| {
                                     crate::cluster::record::SkipRow {
                                         ts_ms,
@@ -1382,6 +1391,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                                         answer,
                                         decoy_v,
                                         decoy_site,
+                                        held_ms,
                                     }
                                 },
                             )
@@ -1529,6 +1539,7 @@ mod tests {
                     answer: None,
                     decoy_v: None,
                     decoy_site: None,
+                    held_ms: None,
                 },
                 crate::cluster::record::SkipRow {
                     ts_ms: 1_791_000_000_500,
@@ -1539,6 +1550,7 @@ mod tests {
                     answer: Some("decoy:git-config".into()),
                     decoy_v: Some(1),
                     decoy_site: Some("shop".into()),
+                    held_ms: None,
                 },
             ],
             build: String::new(),
@@ -1546,6 +1558,57 @@ mod tests {
         apply(&mut conn, ctx, &b).await.unwrap();
         assert_eq!(
             rebuild(&mut conn, "skip_batch", "b-dec").await.unwrap(),
+            Some(b)
+        );
+    }
+
+    #[tokio::test]
+    async fn time_held_rebuilds_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        let Record::Request(mut r) = request("u-tar", "/cgi-bin/x") else {
+            unreachable!()
+        };
+        r.answer = Some("tarpit".into());
+        r.status = Some(200);
+        r.held_ms = Some(42_000);
+        let rec = Record::Request(r);
+        apply(&mut conn, ctx, &rec).await.unwrap();
+        assert_eq!(
+            rebuild(&mut conn, "request", "u-tar").await.unwrap(),
+            Some(rec)
+        );
+        let held: Option<i64> =
+            sqlx::query_scalar("SELECT held_ms FROM requests WHERE uid = 'u-tar'")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert_eq!(held, Some(42_000));
+
+        let b = Record::SkipBatch(crate::cluster::record::SkipBatchRec {
+            uid: "b-tar".into(),
+            ip: "198.51.100.9".into(),
+            dropped: 0,
+            rows: vec![crate::cluster::record::SkipRow {
+                ts_ms: 1_791_000_000_000,
+                method: "GET".into(),
+                path: "/cgi-bin/y".into(),
+                answer: Some("tarpit".into()),
+                held_ms: Some(600_000),
+                ..Default::default()
+            }],
+            build: String::new(),
+        });
+        apply(&mut conn, ctx, &b).await.unwrap();
+        assert_eq!(
+            rebuild(&mut conn, "skip_batch", "b-tar").await.unwrap(),
             Some(b)
         );
     }
@@ -1563,6 +1626,7 @@ mod tests {
             answer: None,
             decoy_v: None,
             decoy_site: None,
+            held_ms: None,
         };
         let bytes = crate::cluster::rpc::cbor::encode(&row).unwrap();
         #[derive(serde::Serialize)]

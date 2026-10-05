@@ -35,6 +35,8 @@ pub struct NewRequest {
     pub decoy_v: Option<i64>,
     /// The site word a version-1 decoy was served under.
     pub decoy_site: Option<String>,
+    /// How long a `tarpit` answer held the client, in milliseconds.
+    pub held_ms: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -81,6 +83,8 @@ pub struct RequestRow {
     pub rules: Option<String>,
     pub decoy_v: Option<i64>,
     pub decoy_site: Option<String>,
+    /// How long a `tarpit` answer held the client, in milliseconds.
+    pub held_ms: Option<i64>,
 }
 
 /// Distinct refresh intervals; later lookups reuse the last one (over

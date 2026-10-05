@@ -855,6 +855,21 @@ async fn admin_pages_and_deletes_with_session() {
         .await
         .unwrap();
     assert!(html.contains(ja4h), "JA4H on the request page");
+    // A tarpit answer says how long it held the client.
+    sqlx::query(
+        "UPDATE requests SET answer = 'tarpit', status = 200, held_ms = 252000 WHERE id = ?",
+    )
+    .bind(rid)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    let html = get(&format!("/admin/requests/{rid}"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("tarpit · 200 · held 4 min"), "time held");
 
     let html = get("/admin/scans").await.unwrap().text().await.unwrap();
     assert!(html.contains("203.0.113.78"));

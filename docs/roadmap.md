@@ -32,24 +32,7 @@ Measured on the real cluster, 30 days, before this roadmap (2026-10-04):
 
 ## Next
 
-### 1. Tarpit
-
-- **Cost:** S–M
-- **Benefit:** medium. It costs scanners time for almost nothing, and the
-  tarpitted connections are themselves a measurement (how long they wait).
-
-A slow-drip answer for severity-4 sources, with its own bounded pool of
-connections (separate from the per-source cap and the global slots), and a
-normal answer when the pool is full. Recorded as `answer = tarpit` with the
-time held, so the dataset can separate the reduced follow-up traffic.
-
-**Shown:**
-
-- **Admin:** Analytics answer shares (already there, under `tarpit`); time
-  held on the request page.
-- **Public wall:** a "scanner time wasted" tile (hours held this period).
-
-### 2. Stateful decoys, MCP and AI first
+### 1. Stateful decoys, MCP and AI first
 
 - **Cost:** M for the state machine and the MCP/Ollama decoys
 - **Benefit:** high. This is the newest attack surface, there is little
@@ -73,7 +56,7 @@ recorded in `answer` (`decoy:mcp:initialize`, `decoy:mcp:tools/call`, …):
 - **Public wall:** "What they asked our fake AI": counts per tool name (our
   own fake names, so safe to show) and per model requested.
 
-### 3. Stateful web decoys: wp-admin, upload sink, webshell commands
+### 2. Stateful web decoys: wp-admin, upload sink, webshell commands
 
 - **Cost:** M–L
 - **Benefit:** high. It captures the second stage (the dropped webshell and
@@ -95,7 +78,7 @@ recorded in `answer` (`decoy:mcp:initialize`, `decoy:mcp:tools/call`, …):
   timeline of the requests sent to it.
 - **Public wall:** a "webshells dropped" tile and counts per command verb.
 
-### 4. Campaign clustering
+### 3. Campaign clustering
 
 - **Cost:** L
 - **Benefit:** very high. It answers "who is this" across addresses and is
@@ -114,7 +97,7 @@ so every node arrives at the same campaigns. Every edge says why it exists.
     comparison; MinHash only if that grows by orders of magnitude;
   - JA4 together with JA4H (shipped: `requests.ja4h`) as supporting evidence, never alone.
 - **Path normalization** (IDs, random filenames, query values) is most of
-  the work and is shared with item 5.
+  the work and is shared with item 4.
 
 **Shown:**
 
@@ -126,9 +109,9 @@ so every node arrives at the same campaigns. Every edge says why it exists.
   and paths per campaign, as aggregates without fingerprints.
 - **Dataset:** a `campaign` column.
 
-### 5. New paths and exploit waves
+### 4. New paths and exploit waves
 
-- **Cost:** M (once item 4's path normalization exists)
+- **Cost:** M (once item 3's path normalization exists)
 - **Benefit:** high. It gives early warning when a new exploit starts
   spreading, often before CVE write-ups.
 
@@ -146,9 +129,9 @@ so every node arrives at the same campaigns. Every edge says why it exists.
 - **Public wall:** a count of new path shapes this period (paths themselves
   are request contents, so not public).
 
-### 6. Personas per node or hostname (opt-in)
+### 5. Personas per node or hostname (opt-in)
 
-- **Cost:** M (after items 2 and 3)
+- **Cost:** M (after items 1 and 2)
 - **Benefit:** medium–high. A controlled comparison of targeted versus spray
   traffic across the cluster.
 
@@ -196,7 +179,7 @@ honeypot.
   reparsing old scans via `keys_parsed`. Optionally add `http-headers` to
   level 2's named scripts. A shared ETag means the same file with the same
   mtime and size (one image, one kit), but distro default pages share it
-  across thousands of hosts: a soft, rarity-weighted edge for item 4, never
+  across thousands of hosts: a soft, rarity-weighted edge for item 3, never
   a hard one. nginx ETags also date the file, roughly when the box was set
   up. Shown on the IP page beside the host keys.
 - **ETags as a return marker.** S, low. Decoys answer with an ETag derived

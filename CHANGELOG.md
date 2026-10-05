@@ -7,6 +7,17 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Added
 
+- Tarpit: for an hour after a source's request reaches severity 4, its
+  requests get a `200` that drips a byte every 10 s until the client gives
+  up or 10 minutes pass (`[trap] tarpit_*`). It has a pool of its own (256
+  connections, 8 per source); a held connection gives its listener slots
+  back, and with the pool full the normal answer is sent. Addresses that
+  are not global and those in `scan.never_scan` or `never_scan_dir` are
+  never held; a request carrying a known canary keeps its decoy answer.
+  Recorded as `answer = tarpit` with the time held (`held_ms`, new column,
+  replicated and exported); shown on the request page, as a "Scanner time
+  wasted" tile on the wall (released rows only), and how full it is on
+  System › Status.
 - The wall lists the newest requests of the last 24 hours ("Recent
   requests", `[public] recent_rows`, default 50): time, IP, method, path
   (no query string, cut at 80 characters), severity and, when shown,

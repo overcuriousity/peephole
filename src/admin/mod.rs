@@ -44,6 +44,8 @@ pub struct AdminState {
     pub safety: tokio::sync::Mutex<crate::scan::safety::Safety>,
     /// How members' requests compare with this node's rules (Cluster pages).
     pub rules_check: crate::store::stats::SwrCache<(), cluster::RulesCheck>,
+    /// This node's tarpit, for System › Status; None without a trap here.
+    pub tarpit: Option<Arc<crate::trap::tarpit::Tarpit>>,
 }
 
 impl AdminState {
@@ -74,6 +76,7 @@ impl AdminState {
             closing: None,
             providers: vec![],
             rules_check: crate::store::stats::SwrCache::new(1),
+            tarpit: None,
         }
     }
 
@@ -97,6 +100,12 @@ impl AdminState {
     }
 
     /// End long-lived responses once `closing` turns `true`.
+    /// Show this node's tarpit on System › Status.
+    pub fn with_tarpit(mut self, tarpit: Arc<crate::trap::tarpit::Tarpit>) -> Self {
+        self.tarpit = Some(tarpit);
+        self
+    }
+
     pub fn with_closing(mut self, closing: tokio::sync::watch::Receiver<bool>) -> Self {
         self.closing = Some(closing);
         self

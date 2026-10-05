@@ -92,6 +92,9 @@ pub struct RequestRec {
     /// The site word a version-1 decoy was served under.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoy_site: Option<String>,
+    /// How long a `tarpit` answer held the client, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_ms: Option<i64>,
 }
 
 /// One request the flood gate answered without recording it in full.
@@ -113,6 +116,9 @@ pub struct SkipRow {
     pub decoy_v: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoy_site: Option<String>,
+    /// How long a `tarpit` answer held the client, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_ms: Option<i64>,
 }
 
 /// Skipped requests of one IP, sent together. `dropped`: requests past

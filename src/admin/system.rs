@@ -140,6 +140,27 @@ struct StatusPage {
     shared: Option<Vec<crate::admin::cluster::IntelView>>,
     rules: &'static str,
     rules_short: String,
+    /// How full this node's tarpit is; None without a trap here.
+    tarpit: Option<String>,
+}
+
+/// This node's tarpit, as System › Status says it.
+fn tarpit_line(s: crate::trap::tarpit::Status) -> String {
+    if s.pool == 0 {
+        return "off".into();
+    }
+    let plural = if s.marked == 1 { "" } else { "s" };
+    let mut line = format!(
+        "{} of {} connections held ({} %) · {} source{plural} marked",
+        s.held,
+        s.pool,
+        s.held * 100 / s.pool,
+        s.marked
+    );
+    if s.held >= s.pool {
+        line.push_str(" · full: new requests get the normal answer");
+    }
+    line
 }
 
 async fn status(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
@@ -157,6 +178,7 @@ async fn status(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult
             .chars()
             .take(crate::admin::cluster::SHORT_HASH)
             .collect(),
+        tarpit: st.tarpit.as_ref().map(|t| tarpit_line(t.status())),
     })
 }
 
@@ -295,4 +317,24 @@ async fn key_delete(
         let _ = state.store.delete_credential_keeping_last(&bytes).await;
     }
     Redirect::to("/admin/system/keys")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trap::tarpit::Status;
+
+    #[test]
+    fn the_tarpit_line_says_how_full_it_is() {
+        let s = |held, pool, marked| Status { held, pool, marked };
+        assert_eq!(tarpit_line(s(0, 0, 0)), "off");
+        assert_eq!(
+            tarpit_line(s(3, 256, 12)),
+            "3 of 256 connections held (1 %) · 12 sources marked"
+        );
+        assert_eq!(
+            tarpit_line(s(256, 256, 1)),
+            "256 of 256 connections held (100 %) · 1 source marked · full: new requests get the normal answer"
+        );
+    }
 }

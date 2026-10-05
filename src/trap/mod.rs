@@ -7,6 +7,7 @@ mod pages;
 pub mod proxy_proto;
 pub mod raw_head;
 pub mod skiplog;
+pub mod tarpit;
 pub mod tls_hello;
 
 pub use config::TrapConfig;
@@ -71,6 +72,9 @@ pub struct TrapState {
     pub pace: crate::scan::pace::SharedPace,
     /// Flood protection for the recording path.
     pub guards: Guards,
+    /// The slow answer for severity-4 sources; shared with the admin's
+    /// System page, and kept across listener restarts.
+    pub tarpit: Arc<tarpit::Tarpit>,
 }
 
 /// In-memory state that keeps floods off the database.
@@ -362,7 +366,6 @@ impl TrapState {
             pace,
             recorder: store.local(),
             store,
-            cfg,
             classifier,
             geo: Arc::new(RwLock::new(None)),
             tor: Arc::new(RwLock::new(TorExitList::default())),
@@ -370,6 +373,10 @@ impl TrapState {
             helper_rate: RateLimiter::default(),
             panel_rate: RateLimiter::default(),
             guards: Guards::default(),
+            // Off: a test's severity-4 request would hold the next one for
+            // the whole hold. Tests of the tarpit set their own.
+            tarpit: Arc::new(tarpit::Tarpit::off()),
+            cfg,
         }
     }
 }
@@ -538,8 +545,11 @@ struct Capture<'a> {
     ts: String,
     decoy_v: Option<i64>,
     decoy_site: Option<String>,
-    /// How the request is answered: `not-found`, `decoy:<name>`, `claim`.
+    /// How the request is answered: `not-found`, `decoy:<name>`, `claim`,
+    /// `tarpit`.
     answer: String,
+    /// How long the tarpit held the client, in milliseconds.
+    held_ms: Option<i64>,
     status: u16,
     /// Requests from this IP answered but not recorded since its last
     /// recorded one.
@@ -673,6 +683,10 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
             .classify(&c.view, &history, &BotTells::default())
     };
 
+    if verdict.severity >= 4 {
+        state.tarpit.mark(ip);
+    }
+
     // Creates the IP's row too: one write transaction.
     let (request_id, ip_id) = state
         .recorder
@@ -704,6 +718,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 ts: Some(c.ts),
                 decoy_v: c.decoy_v,
                 decoy_site: c.decoy_site,
+                held_ms: c.held_ms,
             },
         )
         .await?;
@@ -804,6 +819,14 @@ async fn trap(
     let method = parts.method.as_str();
     let path = parts.uri.path();
     let presented = presented(&state, &headers, method, path, &body.bytes).await;
+    // A canary presented is answered as always: its trace is worth more.
+    if presented == decoy::Presented::default()
+        && let Some(hold) = state.tarpit.take(ip)
+    {
+        return tarpit_answer(
+            state, in_flight, ip, parts, body, hold, page_token, now, host,
+        );
+    }
     let node_id = state.recorder.node_id();
     let word = crate::canary::site::word(node_id.as_ref().map(|n| &n.0[..]));
     let decoy = decoy::choose(method, path, parts.uri.query(), presented, word).and_then(|name| {
@@ -842,6 +865,7 @@ async fn trap(
             host,
             decoy_v: decoy.is_some().then_some(crate::canary::DECOY_V),
             word,
+            held_ms: None,
         },
     ));
     if let Some(d) = decoy {
@@ -864,6 +888,65 @@ async fn trap(
         .into_response()
 }
 
+/// Answer from the tarpit: a dripping `200`, recorded once the hold ends.
+#[allow(clippy::too_many_arguments)]
+fn tarpit_answer(
+    state: Arc<TrapState>,
+    in_flight: InFlight,
+    ip: IpAddr,
+    parts: axum::http::request::Parts,
+    body: ReadBody,
+    hold: tarpit::Hold,
+    page_token: String,
+    now: chrono::DateTime<chrono::Utc>,
+    host: Option<String>,
+) -> Response {
+    // Past the cap the drip ends on its own; the margin lets it say so.
+    let wait = hold.cap() + TARPIT_MARGIN;
+    if let Some(meta) = parts.extensions.get::<listen::ConnMeta>() {
+        meta.handover.take_over(tokio::time::Instant::now() + wait);
+    }
+    let (drip, held) = hold.drip();
+    let word = crate::canary::site::word(state.recorder.node_id().as_ref().map(|n| &n.0[..]));
+    tokio::spawn(async move {
+        let held_ms = tokio::time::timeout(wait, held)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX));
+        // The recording slot only now: the pool bounds the holds.
+        let slot = state.guards.slot().await;
+        record_trap(
+            state.clone(),
+            (in_flight, slot),
+            ip,
+            parts,
+            body,
+            Served {
+                page_token,
+                answer: "tarpit".into(),
+                status: 200,
+                now,
+                host,
+                decoy_v: None,
+                word,
+                held_ms,
+            },
+        )
+        .await;
+    });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        axum::body::Body::from_stream(drip),
+    )
+        .into_response()
+}
+
+/// How long past its cap a tarpitted connection may last, and its row
+/// waits for the time held.
+const TARPIT_MARGIN: Duration = Duration::from_secs(5);
+
 /// What the trap sent, for the row.
 struct Served {
     page_token: String,
@@ -874,6 +957,8 @@ struct Served {
     decoy_v: Option<i64>,
     /// The site word the decoy was served under.
     word: &'static str,
+    /// How long the tarpit held the client, in milliseconds.
+    held_ms: Option<i64>,
 }
 
 /// The credential tokens whose canary would change this request's answer:
@@ -954,19 +1039,23 @@ async fn record_trap(
     } = body;
     match admission {
         flood::Admission::Skip => {
-            let decoy = served.decoy_v.map(|v| skiplog::SkipDecoy {
-                page_token: served.page_token.clone(),
-                host: served.host.clone(),
-                answer: served.answer.clone(),
-                decoy_v: v,
-                site: served.word.to_string(),
-            });
+            let answer = match (served.decoy_v, served.held_ms) {
+                (Some(v), _) => skiplog::SkipAnswer::Decoy(skiplog::SkipDecoy {
+                    page_token: served.page_token.clone(),
+                    host: served.host.clone(),
+                    answer: served.answer.clone(),
+                    decoy_v: v,
+                    site: served.word.to_string(),
+                }),
+                (None, Some(held_ms)) => skiplog::SkipAnswer::Tarpit { held_ms },
+                (None, None) => skiplog::SkipAnswer::Plain,
+            };
             let full = state.guards.skips.note(
                 ip,
                 served.now.timestamp_millis(),
                 method,
                 path,
-                decoy,
+                answer,
                 state.cfg.trap.skip_log_rate,
                 Instant::now(),
             );
@@ -1011,6 +1100,7 @@ async fn record_trap(
                 decoy_v: served.decoy_v,
                 decoy_site: served.decoy_v.map(|_| served.word.to_string()),
                 answer: served.answer,
+                held_ms: served.held_ms,
                 status: served.status,
                 unrecorded,
                 conn: parts
@@ -1095,6 +1185,7 @@ async fn claim_handler(
             decoy_v: None,
             decoy_site: None,
             answer: "claim".into(),
+            held_ms: None,
             status: 200,
             unrecorded: 0,
             conn,

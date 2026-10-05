@@ -165,6 +165,9 @@ pub struct Stats {
     /// Harvest to first use of the canaries served in the range; only from
     /// [`CANARY_TILE_MIN`] reuses up, so no single event shows.
     pub canaries: Option<CanaryTile>,
+    /// Milliseconds the tarpit held clients, over the requests in the range
+    /// recorded in full (light rows are never public).
+    pub tarpit_held_ms: i64,
 }
 
 /// Most rows "Recent requests" can show (`[public] recent_rows` is at most
@@ -541,6 +544,15 @@ impl Store {
         .await?
         .into_iter()
         .collect();
+        let tarpit_held_ms = self
+            .count_where(
+                &format!(
+                    "SELECT COALESCE(SUM(r.held_ms), 0) FROM requests r
+                     WHERE r.held_ms IS NOT NULL{w}"
+                ),
+                since,
+            )
+            .await?;
         let sum = self.canary_summary_as(r, a).await?;
         // Counted per harvest, not per value: one request carrying many
         // values of one decoy is one event.
@@ -574,6 +586,7 @@ impl Store {
             recent,
             intel,
             canaries,
+            tarpit_held_ms,
         })
     }
 
@@ -1457,6 +1470,37 @@ mod tests {
         assert_eq!(m.countries.get("DE"), Some(&1));
         let m = s.map_counts_as(Range::H24, Audience::Public).await.unwrap();
         assert_eq!(m.countries.get("US"), None);
+    }
+
+    #[tokio::test]
+    async fn time_held_counts_only_released_rows_publicly() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = s.upsert_ip("203.0.113.1".parse().unwrap()).await.unwrap();
+        let held = |path: &str, ms: Option<i64>| NewRequest {
+            ip_id: ip.id,
+            method: "GET".into(),
+            path: path.into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            answer: ms.map(|_| "tarpit".into()),
+            held_ms: ms,
+            ..Default::default()
+        };
+        s.insert_request(&held("/released", Some(3_600_000)))
+            .await
+            .unwrap();
+        s.insert_request(&held("/plain", None)).await.unwrap();
+        s.set_publish_delay(Duration::from_secs(300), Duration::ZERO)
+            .await
+            .unwrap();
+        s.insert_request(&held("/pending", Some(7_200_000)))
+            .await
+            .unwrap();
+        let admin = s.stats_as(Range::H24, Audience::Admin).await.unwrap();
+        assert_eq!(admin.tarpit_held_ms, 10_800_000);
+        let public = s.stats_as(Range::H24, Audience::Public).await.unwrap();
+        assert_eq!(public.tarpit_held_ms, 3_600_000, "only released rows");
     }
 
     #[tokio::test]

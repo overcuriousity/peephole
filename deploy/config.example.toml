@@ -48,6 +48,13 @@ trusted_proxies = ["10.0.0.5/32"]
 # skip_log_rate = 100  # light rows (time, method, path) per IP and second for the rest; past it only counted; 0 = no limit
 # helper_prefix = ""   # path prefix for /claim, /collect, /panel, /collect.js (e.g. "/_a7f3"), so the
 #                      # trap page's helpers do not give peephole away on every vhost
+# Tarpit: sources whose requests reached severity 4 get a slow 200 for an
+# hour after, while the pool has room (then the normal answer).
+# tarpit_pool = 256           # connections held at once; 0 = no tarpit
+# tarpit_per_source = 8       # ...from one source (IPv6 by /64)
+# tarpit_hold_secs = 600      # longest a connection is held
+# tarpit_drip_bytes = 1       # bytes sent per drip
+# tarpit_drip_every_secs = 10 # seconds between drips (below the hold)
 
 [webauthn]
 # Public domain the dashboard is reached at through nginx (FIDO2 relying party).
