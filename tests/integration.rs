@@ -2844,3 +2844,27 @@ async fn lookup_box_only_for_admins() {
         .unwrap();
     assert!(!anon.contains("action=\"/admin/lookup\""));
 }
+
+/// A standalone node has no Access page and no node pages.
+#[tokio::test]
+async fn standalone_cluster_page_has_no_access() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store, cfg).await;
+    let html = client
+        .get(format!("{base}/admin/cluster"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("Standalone") && !html.contains("/admin/cluster/access"));
+    for p in [
+        "/admin/cluster/access".to_string(),
+        format!("/admin/cluster/node/{}", "00".repeat(32)),
+    ] {
+        let r = client.get(format!("{base}{p}")).send().await.unwrap();
+        assert_eq!(r.status(), 404, "{p}");
+    }
+}

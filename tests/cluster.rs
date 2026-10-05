@@ -2647,6 +2647,20 @@ secure_cookies = false
     (client, base)
 }
 
+/// The Members page and every node page it links to, as one string.
+async fn cluster_pages(admin: &reqwest::Client, base: &str) -> String {
+    let mut all = text(admin, format!("{base}/admin/cluster")).await;
+    let keys: Vec<String> = all
+        .split("href=\"/admin/cluster/node/")
+        .skip(1)
+        .filter_map(|s| s.split('"').next().map(str::to_string))
+        .collect();
+    for k in keys {
+        all.push_str(&text(admin, format!("{base}/admin/cluster/node/{k}")).await);
+    }
+    all
+}
+
 async fn text(c: &reqwest::Client, url: String) -> String {
     let r = c.get(&url).send().await.unwrap();
     assert!(r.status().is_success(), "{url}: {}", r.status());
@@ -2703,7 +2717,7 @@ async fn admin_cluster_page_and_private_attribution() {
     .await;
 
     let (admin, base) = admin_on(&na).await;
-    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    let page = cluster_pages(&admin, &base).await;
     for want in [
         "sensor-alpha",
         "sensor-bravo",
@@ -2712,10 +2726,31 @@ async fn admin_cluster_page_and_private_attribution() {
         // B and C recorded nothing to classify again, and run no trap.
         "no requests to compare",
         "none recorded",
-        "built in",
-        &peephole::classify::Classifier::builtin().fingerprint()[..12],
     ] {
         assert!(page.contains(want), "cluster page lacks {want}");
+    }
+    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    let head = members
+        .split("<thead>")
+        .nth(1)
+        .unwrap()
+        .split("</thead>")
+        .next()
+        .unwrap();
+    assert_eq!(head.matches("<th>").count(), 5, "five columns: {head}");
+    let sys = text(&admin, format!("{base}/admin/system")).await;
+    assert!(
+        sys.contains("built in")
+            && sys.contains(&peephole::classify::Classifier::builtin().fingerprint()[..12])
+    );
+    // Unknown and malformed keys are 404.
+    for bad in ["zz".to_string(), "00".repeat(32)] {
+        let r = admin
+            .get(format!("{base}/admin/cluster/node/{bad}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "{bad}");
     }
     let scans = text(&admin, format!("{base}/admin/scans")).await;
     assert!(
@@ -2770,7 +2805,23 @@ async fn admin_cluster_page_and_private_attribution() {
         .unwrap();
     assert!(!r.status().is_success(), "revoke route is gone");
     assert!(knows(&na, c.id, true).await);
-    assert!(page.contains("Leave cluster"), "leave button");
+    let access = text(&admin, format!("{base}/admin/cluster/access")).await;
+    assert!(
+        access.contains("Leave cluster") && access.contains("Create invite"),
+        "access page"
+    );
+    assert!(!page.contains("Create invite"), "invites left Members");
+    let r = admin
+        .post(format!("{base}/admin/cluster/block"))
+        .form(&[("key", c.id.to_string())])
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.url().path().starts_with("/admin/cluster/node/"),
+        "back to the node page: {}",
+        r.url()
+    );
 
     // Nothing about the cluster leaks to the public.
     let public = reqwest::Client::new();
@@ -2834,7 +2885,8 @@ async fn admin_configures_another_node_with_its_key() {
     })
     .await;
     let (admin, base) = admin_on(&na).await;
-    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    let mut page = cluster_pages(&admin, &base).await;
+    page.push_str(&text(&admin, format!("{base}/admin/cluster/access")).await);
     assert!(page.contains("open to key holders"), "b is shown as open");
     assert!(page.contains("locked"), "a itself is locked");
     assert!(
@@ -2937,6 +2989,20 @@ async fn admin_configures_another_node_with_its_key() {
         "a stale form does not switch the scanner back on"
     );
     assert_eq!(s.cooldown_hours, 6);
+
+    // B stops answering: only the settings card says so.
+    drop(nb);
+    let r = admin
+        .get(format!("{base}/admin/cluster/node/{}", b.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let html = r.text().await.unwrap();
+    assert!(
+        html.contains("did not answer") && html.contains("Contributions"),
+        "{html}"
+    );
 }
 
 /// Enrichment results replicate with their origin; a blocked peer's results
@@ -3369,7 +3435,7 @@ async fn a_history_floor_is_local() {
 
     // The admin page says who keeps what.
     let (admin, base) = admin_on(&na).await;
-    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    let page = cluster_pages(&admin, &base).await;
     for want in ["keeps 7 days", "full history"] {
         assert!(page.contains(want), "cluster page lacks {want}");
     }
@@ -3458,7 +3524,7 @@ async fn admin_page_shows_contributions_per_node() {
     ];
     repl::apply_batch(&na, batch).await.unwrap();
     let (admin, base) = admin_on(&na).await;
-    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    let page = text(&admin, format!("{base}/admin/cluster/node/{}", o.id.id)).await;
     let section = page
         .split("<h2>Contributions</h2>")
         .nth(1)
@@ -3466,13 +3532,13 @@ async fn admin_page_shows_contributions_per_node() {
         .split("</table>")
         .next()
         .unwrap();
-    let row = section
-        .split("<tr>")
-        .find(|r| r.contains("<b>writer</b>"))
-        .expect("a row for the writer");
     assert!(
-        row.contains(r#"<td class="num">3</td>"#),
-        "writer's three requests: {row}"
+        section.contains(r#"<td class="num">3</td>"#),
+        "writer's three requests: {section}"
     );
-    assert!(section.contains("counter-a (this node)"), "{section}");
+    let own = text(&admin, format!("{base}/admin/cluster/node/{}", a.id)).await;
+    assert!(
+        own.contains("<h2>Contributions</h2>") && own.contains("this node"),
+        "{own}"
+    );
 }

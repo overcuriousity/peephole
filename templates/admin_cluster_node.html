@@ -1,28 +1,91 @@
 {% extends "layout.html" %}
-{% block title %}peephole — {{ name }}{% endblock %}
+{% block title %}peephole — {{ m.name }}{% endblock %}
 {% block content %}
 {% let sub = "cluster" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>{{ name }} <span class="mono muted">{{ short }}</span></h1></div></div>
+{% let subtab = "members" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% include "_subtabs.html" %}
+<div class="page-head"><div>
+  <h1>{{ m.name }} <span class="mono muted">{{ m.short }}</span>{% if m.is_self %} <span class="muted small">this node</span>{% endif %}</h1>
+  <div class="meta">{% if m.blocked %}<span class="badge badge-status" data-status="failed">{% if m.purged %}purged{% else %}blocked{% endif %}</span>{% else if !m.active %}<span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% else if m.live %}<span class="badge badge-status" data-status="done">live</span>{% else %}<span class="badge badge-status" data-status="queued">not seen</span>{% endif %}</div>
+</div>
+{% if !m.is_self %}<div class="row">
+  {% if m.blocked %}
+  <form method="post" action="/admin/cluster/unblock"><input type="hidden" name="key" value="{{ m.key }}"><button class="btn btn-sm" type="submit">Unblock</button></form>
+  {% if !m.purged %}
+  <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-purge">Purge</button>
+  <dialog id="dlg-purge"><h3>Purge {{ m.name }}?</h3><p class="muted">Deletes its data here and stops relaying it. Other nodes keep theirs.</p>
+    <form method="post" action="/admin/cluster/purge" class="actions"><input type="hidden" name="key" value="{{ m.key }}">
+      <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Purge</button></form></dialog>
+  {% endif %}
+  {% else %}
+  <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-block">Block</button>
+  <dialog id="dlg-block"><h3>Block {{ m.name }}?</h3><p class="muted">Hides it and its records here only. Reversible.</p>
+    <form method="post" action="/admin/cluster/block" class="actions"><input type="hidden" name="key" value="{{ m.key }}">
+      <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit" name="subtree" value="1" title="Also block every node it admitted, and the nodes those admitted">Block with all it admitted</button><button class="btn btn-danger" type="submit">Block</button></form></dialog>
+  {% endif %}
+</div>{% endif %}
+</div>
 {% if let Some(n) = notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
 {% if let Some(e) = error %}<div class="banner banner-warning">{{ e }}</div>{% endif %}
-{% if let Some(s) = state %}
-{% if !s.open %}<div class="banner banner-warning">Locked: remote configuration is off on this node.</div>{% endif %}
-{% if !key_held %}<div class="banner banner-warning">No config key held for this node.</div>{% endif %}
-<section class="card">
-  <div class="card-head"><h2>Settings</h2><span class="muted">version {{ s.version }}</span></div>
-  <form method="post" action="/admin/cluster/node/{{ key }}" class="filters">
-    <input type="hidden" name="base_version" value="{{ s.version }}">
-    <label>Workers <input type="number" name="max_workers" min="0" max="16" value="{{ s.pace.max_workers }}" required></label>
-    <label>Scans per hour <input type="number" name="max_scans_per_hour" min="0" max="3600" value="{{ s.pace.max_scans_per_hour }}" required></label>
+<div class="stack">
+<section class="card"><h2>Details</h2>
+  <dl class="kv">
+    <dt>Key</dt><dd class="mono break">{{ m.key }}{% let value = m.key.as_str() %}{% let what = "node key" %}{% let subtle = false %}{% include "_copy.html" %}</dd>
+    <dt>Roles</dt><dd>{{ m.roles }}{% if !m.providers.is_empty() %} <span class="muted small">looks up: {{ m.providers }}</span>{% endif %}</dd>
+    <dt>Address</dt><dd class="mono">{{ m.address }}</dd>
+    <dt>Version</dt><dd class="mono">{{ m.version }}</dd>
+    <dt>Seen</dt><dd>{{ m.last_seen }}</dd>
+    <dt>Replication</dt><dd>{{ m.lag }}</dd>
+    <dt>History</dt><dd>{{ m.history }}</dd>
+    {% if m.scanner %}<dt>Scans running</dt><dd>{{ m.active_scans }}</dd>{% endif %}
+    <dt>Remote configuration</dt><dd>{% if m.is_self %}{% if m.remote_config %}open to key holders (key on <a href="/admin/cluster/access">Access</a>){% else %}locked{% endif %}{% else if m.key_held %}key held here{% else if m.remote_config %}open to key holders{% else %}locked{% endif %}</dd>
+    {% for i in m.issues() %}<dt>Issue</dt><dd><span class="badge badge-status" data-status="running">{{ i }}</span></dd>{% endfor %}
+  </dl>
+</section>
+<section class="card"><h2>Rules</h2>
+  <dl class="kv">
+    <dt>Carried</dt><dd><span class="mono">{{ m.ruleset }}</span>{% match m.ruleset_same %}{% when Some(true) %} <span class="muted small">same as ours</span>{% when Some(false) %} <span class="badge badge-status" data-status="queued">differs</span>{% when None %}{% endmatch %}</dd>
+    {% if !m.is_self %}<dt>Classified again here</dt><dd>{% if m.rules_differ %}<span class="badge badge-status" data-status="failed">{{ m.rules }}</span>{% else %}{{ m.rules }}{% endif %} <span class="muted small">details: <code>peephole cluster agreement {{ m.short }}</code></span></dd>{% endif %}
+  </dl>
+</section>
+<section class="card"><h2>Contributions</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th class="num">Requests</th><th class="num">Flood-sampled</th><th class="num">Fingerprints</th><th class="num">Claims</th><th class="num">Scans</th><th class="num">IPs looked up</th><th class="num">Log entries</th><th class="num">Log size</th></tr></thead>
+    <tbody>{% for c in contrib %}<tr>
+      <td>{% if c.key.is_empty() %}not shared yet{% else %}held here{% endif %}</td>
+      <td class="num">{{ c.requests }}</td><td class="num">{{ c.skipped }}</td><td class="num">{{ c.fingerprints }}</td><td class="num">{{ c.claims }}</td>
+      <td class="num">{{ c.scans }}</td><td class="num">{{ c.lookups }}</td><td class="num">{{ c.log_entries }}</td><td class="num">{{ c.log_size }}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+</section>
+{% if m.scanner %}
+<section class="card"><h2>Pace</h2>
+  {% match m.pace %}{% when Some(p) %}<p>{{ p.max_workers }} workers, {{ p.max_scans_per_hour }} scans per hour, {{ m.timeout_min }} min timeout{% if !m.level_weights.is_empty() %} · {{ m.level_weights }}{% endif %}.</p>{% when None %}<p class="muted">Pace not reported yet.</p>{% endmatch %}
+  <p class="muted">All scanners: <a href="/admin/scans#scanners">Scans › Scanners</a>.</p>
+</section>
+{% endif %}
+<section class="card"><h2>Settings</h2>
+{% match remote %}
+{% when Remote::Own %}<p>This node's settings: <a href="/admin/system/settings">System › Settings</a>; pace on <a href="/admin/scans#pace">Scans</a>.</p>
+{% when Remote::NoKey %}<p class="muted">No config key for this node is held here. Add one on <a href="/admin/cluster/access">Access</a>.</p>
+{% when Remote::Silent with (msg) %}<div class="banner banner-warning">{{ msg }}</div>
+{% when Remote::Settings with { state, timeout_min, rec, has } %}
+  {% if !state.open %}<div class="banner banner-warning">Locked: remote configuration is off on this node.</div>{% endif %}
+  <form method="post" action="/admin/cluster/node/{{ m.key }}" class="filters">
+    <input type="hidden" name="base_version" value="{{ state.version }}">
+    <label>Workers <input type="number" name="max_workers" min="0" max="16" value="{{ state.pace.max_workers }}" required></label>
+    <label>Scans per hour <input type="number" name="max_scans_per_hour" min="0" max="3600" value="{{ state.pace.max_scans_per_hour }}" required></label>
     <label>Timeout (min) <input type="number" name="timeout_minutes" min="1" max="240" step="any" value="{{ timeout_min }}" required></label>
-    <label>Rescan cooldown (h) <input type="number" name="cooldown_hours" min="0" max="8760" value="{{ s.cooldown_hours }}" required></label>
+    <label>Rescan cooldown (h) <input type="number" name="cooldown_hours" min="0" max="8760" value="{{ state.cooldown_hours }}" required></label>
     <label class="check"><input type="checkbox" name="listener"{% if has.0 %} checked{% endif %}> Trap</label>
     <label class="check"><input type="checkbox" name="scanner"{% if has.1 %} checked{% endif %}> Scanner</label>
     <label class="check"><input type="checkbox" name="web"{% if has.2 %} checked{% endif %}> Web interface</label>
-    <button class="btn btn-primary" type="submit"{% if !s.open || !key_held %} disabled{% endif %}>Save</button>
+    <button class="btn btn-primary" type="submit"{% if !state.open %} disabled{% endif %}>Save</button>
+    <span class="muted small">version {{ state.version }}</span>
   </form>
   {% if let Some(r) = rec %}<p class="muted">Recommended: {{ r.0 }} workers, {{ r.1 }} scans/h, {{ r.2 }} min timeout.</p>{% endif %}
   <p class="muted">Web off removes its admin pages; restore: <code>peephole settings reset roles.web</code></p>
+{% endmatch %}
+{% if m.key_held %}<form method="post" action="/admin/cluster/config-key/forget"><input type="hidden" name="key" value="{{ m.key }}"><button class="btn btn-sm" type="submit">Forget its key</button></form>{% endif %}
 </section>
-{% endif %}
+</div>
 {% endblock %}

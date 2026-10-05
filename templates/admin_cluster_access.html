@@ -1,0 +1,57 @@
+{% extends "layout.html" %}
+{% block title %}peephole — cluster access{% endblock %}
+{% block content %}
+{% let sub = "cluster" %}{% include "_admin_nav.html" %}
+{% let subtab = "access" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% include "_subtabs.html" %}
+<div class="page-head"><div><h1>Access</h1><p class="muted">Invites, config keys, joining and leaving.</p></div></div>
+<div class="stack">
+{% if let Some(t) = invite %}
+<section class="card"><h2>Invite</h2>
+  <p>Shown once. Use with <code>peephole cluster join</code> or on the new node's Access page.</p>
+  <pre class="panel mono break" data-copy>{{ t }}</pre></section>
+{% endif %}
+<section class="card">
+  <div class="card-head"><h2>Invites</h2><span class="muted">created on this node</span></div>
+  <div class="banner banner-warning">Members cannot be removed, only blocked. Limit uses and expiry.</div>
+  <form method="post" action="/admin/cluster/invite" class="filters">
+    <label>For <input name="label" maxlength="64" placeholder="peer group"></label>
+    <label>Expires after <input type="number" name="ttl_hours" min="0" max="8760" placeholder="168" size="6"> h</label>
+    <label>Use limit <input type="number" name="max_uses" min="0" max="10000" placeholder="10" size="6"></label>
+    <span class="muted small">Default 168 h, 10 uses; 0 = no limit.</span>
+    <button class="btn btn-primary" type="submit">Create invite</button></form>
+  {% if !invites.is_empty() %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>For</th><th>State</th><th>Uses</th><th>Expires (UTC)</th><th>Created (UTC)</th><th>Joined</th><th></th></tr></thead>
+    <tbody>{% for i in invites %}<tr{% if !i.usable %} class="muted"{% endif %}>
+      <td>{{ i.label }}</td>
+      <td><span class="badge badge-status" data-status="{% if i.usable %}done{% else %}failed{% endif %}">{{ i.state }}</span></td>
+      <td>{{ i.uses }}</td><td class="ts">{{ i.expires }}</td><td class="ts">{{ i.created_at }}</td><td>{{ i.joined }}</td>
+      <td>{% if i.usable %}<form method="post" action="/admin/cluster/invite/revoke"><input type="hidden" name="id" value="{{ i.id }}"><button class="btn btn-sm btn-danger" type="submit">Revoke invite</button></form>{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>{% endif %}
+</section>
+<section class="card"><h2>This node's config key</h2>
+  {% if remote_config %}
+  <p class="muted">Lets its holders change this node's pace, cooldown and roles. Rotate to revoke.</p>
+  {% if let Some(k) = config_key %}<details><summary>Show key</summary><pre class="panel mono break" data-copy>{{ k }}</pre></details>{% endif %}
+  <form method="post" action="/admin/cluster/config-key/rotate"><button class="btn btn-sm btn-danger" type="submit">Rotate key</button></form>
+  {% else %}
+  <p class="muted">Remote configuration: <b>locked</b> (<code>remote_config = true</code> opens it).</p>
+  {% endif %}
+</section>
+<section class="card"><h2>Configure another node</h2>
+  <form method="post" action="/admin/cluster/config-key/add" class="filters"><label>Config key <input name="key" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Add key</button></form>
+</section>
+<section class="card"><h2>Join or rejoin a cluster</h2>
+  <form method="post" action="/admin/cluster/join" class="filters"><label>Invite token <input name="token" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Join</button></form>
+</section>
+{% if !detached %}
+<section class="card"><h2>Leave</h2>
+  <p class="muted">Syncing stops; all data stays. Rejoining needs an invite.</p>
+  <button class="btn btn-danger" type="button" data-confirm="dlg-leave">Leave cluster</button>
+  <dialog id="dlg-leave"><h3>Leave the cluster?</h3><p class="muted">Syncing stops; all data stays. Rejoining needs an invite.</p>
+    <form method="post" action="/admin/cluster/leave" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Leave</button></form></dialog>
+</section>
+{% endif %}
+</div>
+{% endblock %}

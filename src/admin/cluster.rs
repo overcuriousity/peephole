@@ -21,13 +21,7 @@ use std::sync::Arc;
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/admin/cluster", get(page))
-        .route("/admin/cluster/invite", post(create_invite))
-        .route("/admin/cluster/invite/revoke", post(revoke_invite))
-        .route("/admin/cluster/join", post(join))
-        .route("/admin/cluster/leave", post(leave))
         .route("/admin/cluster/settings", post(set_own))
-        .route("/admin/cluster/config-key/rotate", post(rotate_key))
-        .route("/admin/cluster/config-key/add", post(add_key))
         .route("/admin/cluster/config-key/forget", post(forget_key))
         .route("/admin/cluster/node/{key}", get(node_page).post(node_set))
         .route("/admin/cluster/block", post(block))
@@ -236,22 +230,13 @@ pub struct IntelView {
 #[template(path = "admin_cluster.html")]
 struct ClusterPage {
     chrome: Chrome,
-    /// None: standalone node.
-    me: Option<MemberView>,
-    members: Vec<MemberView>,
+    /// This node first, then the other members.
+    rows: Vec<MemberView>,
+    standalone: bool,
     /// Why this node is out of its cluster, if it is.
     detached: Option<&'static str>,
-    invite: Option<String>,
-    invites: Vec<InviteView>,
-    /// This node's config key, shown only when remote configuration is on.
-    config_key: Option<String>,
-    remote_config: bool,
     /// Members whose older history no reachable peer can give this node.
     unserved: Option<String>,
-    contributions: Vec<ContribView>,
-    /// The fingerprint of the rules built into this binary, and its start.
-    rules: &'static str,
-    rules_short: String,
 }
 
 /// This node's runtime settings as its own page shows them.
@@ -333,7 +318,7 @@ fn ago(d: std::time::Duration) -> String {
     }
 }
 
-fn node(st: &AdminState) -> AppResult<&Arc<Node>> {
+pub(crate) fn node(st: &AdminState) -> AppResult<&Arc<Node>> {
     st.recorder.node().ok_or(AppError::NotFound)
 }
 
@@ -586,6 +571,8 @@ pub(crate) async fn intel(node: &Node) -> AppResult<Vec<IntelView>> {
 
 /// What one node contributed, as far as this node holds it.
 pub struct ContribView {
+    /// The member's key; empty for rows not shared yet.
+    pub key: String,
     pub name: String,
     pub short: String,
     pub requests: i64,
@@ -660,10 +647,11 @@ async fn contributions(node: &Node) -> AppResult<Vec<ContribView>> {
             .into_iter()
             .map(|(o, e, b)| (o, (e, b)))
             .collect();
-    let row = |key: &[u8], name: String, short: String| {
+    let row = |key: &[u8], name: String, short: String, id: String| {
         let get = |m: &Counts| m.get(key).copied().unwrap_or(0);
         let (log_entries, bytes) = usage.get(key).copied().unwrap_or((0, 0));
         ContribView {
+            key: id,
             name,
             short,
             requests: get(&requests),
@@ -686,11 +674,11 @@ async fn contributions(node: &Node) -> AppResult<Vec<ContribView>> {
             } else {
                 m.name
             };
-            row(&m.id.0[..], name, m.id.short())
+            row(&m.id.0[..], name, m.id.short(), m.id.to_string())
         })
         .collect();
     out.sort_by_key(|c| std::cmp::Reverse(c.requests));
-    let unshared = row(&[], "not shared yet".into(), String::new());
+    let unshared = row(&[], "not shared yet".into(), String::new(), String::new());
     if unshared.requests
         + unshared.skipped
         + unshared.fingerprints
@@ -716,7 +704,7 @@ pub struct InviteView {
     pub joined: String,
 }
 
-async fn invites(node: &Node) -> AppResult<Vec<InviteView>> {
+pub(crate) async fn invites(node: &Node) -> AppResult<Vec<InviteView>> {
     let names: std::collections::HashMap<NodeId, String> = members::all(&node.store)
         .await?
         .into_iter()
@@ -752,47 +740,24 @@ async fn invites(node: &Node) -> AppResult<Vec<InviteView>> {
         .collect())
 }
 
-async fn render_page(st: &AdminState, invite: Option<String>) -> AppResult<Html<String>> {
+async fn render_page(st: &AdminState) -> AppResult<Html<String>> {
     let Some(node) = st.recorder.node() else {
         return render(&ClusterPage {
             chrome: Chrome::new(true, "admin"),
-            me: None,
-            members: vec![],
+            rows: vec![],
+            standalone: true,
             detached: None,
-            invite: None,
-            invites: vec![],
-            config_key: None,
-            remote_config: false,
             unserved: None,
-            contributions: vec![],
-            rules: builtin_rules(),
-            rules_short: builtin_rules().chars().take(SHORT_HASH).collect(),
         });
-    };
-    let config_key = if node.cfg.remote_config {
-        Some(
-            crate::cluster::confkey::ensure(&node.store, node.id())
-                .await?
-                .encode(),
-        )
-    } else {
-        None
     };
     let check = rules_check(st, node).await?;
     let (me, members) = views(node, &check).await?;
     render(&ClusterPage {
         chrome: Chrome::new(true, "admin"),
+        rows: std::iter::once(me).chain(members).collect(),
+        standalone: false,
         detached: node.detached().map(|d| d.label()),
-        me: Some(me),
-        members,
-        invite,
-        invites: invites(node).await?,
-        config_key,
-        remote_config: node.cfg.remote_config,
         unserved: unserved(node).await?,
-        contributions: contributions(node).await?,
-        rules: builtin_rules(),
-        rules_short: builtin_rules().chars().take(SHORT_HASH).collect(),
     })
 }
 
@@ -802,7 +767,7 @@ pub(crate) fn builtin_rules() -> &'static str {
 }
 
 async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
-    render_page(&st, None).await
+    render_page(&st).await
 }
 
 /// Back to `to` with a one-shot notice or error (in a cookie, see
@@ -821,101 +786,10 @@ fn back(notice: Option<String>, error: Option<String>) -> Response {
 }
 
 #[derive(serde::Deserialize)]
-struct InviteForm {
-    label: Option<String>,
-    ttl_hours: Option<String>,
-    max_uses: Option<String>,
-}
-
-/// Create an invite and show it once (never stored in clear).
-async fn create_invite(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Form(f): Form<InviteForm>,
-) -> AppResult<Response> {
-    let node = node(&st)?;
-    // Empty fields mean the defaults (a week, 10 uses); 0 means no limit.
-    let Ok((ttl_hours, max_uses)) =
-        invite::InviteOpts::parse_limits(f.ttl_hours.as_deref(), f.max_uses.as_deref())
-    else {
-        return Ok(back(
-            None,
-            Some("expiry and use limit must be numbers".into()),
-        ));
-    };
-    let opts = invite::InviteOpts {
-        label: f.label.unwrap_or_default(),
-        ttl_hours,
-        max_uses,
-    };
-    match invite::create(node, &opts).await {
-        Ok(token) => Ok(render_page(&st, Some(token)).await?.into_response()),
-        Err(e) => Ok(back(None, Some(format!("{e:#}")))),
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct InviteRevokeForm {
-    id: i64,
-}
-
-async fn revoke_invite(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Form(f): Form<InviteRevokeForm>,
-) -> AppResult<Response> {
-    let node = node(&st)?;
-    Ok(if invite::revoke(&node.store, f.id).await? {
-        back(
-            Some("Invite revoked. Members that joined with it stay.".into()),
-            None,
-        )
-    } else {
-        back(None, Some("No usable invite with that id.".into()))
-    })
-}
-
-#[derive(serde::Deserialize)]
-struct JoinForm {
-    token: String,
-}
-
-async fn join(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Form(f): Form<JoinForm>,
-) -> AppResult<Response> {
-    let node = node(&st)?;
-    Ok(match invite::join(node, &f.token).await {
-        Ok(i) => back(
-            Some(format!(
-                "Joined the cluster via {}. Data now syncs.",
-                i.name
-            )),
-            None,
-        ),
-        Err(e) => back(None, Some(format!("Join failed: {e:#}"))),
-    })
-}
-
-async fn leave(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
-    let node = node(&st)?;
-    Ok(match crate::cluster::leave(node).await {
-        Ok(told) => back(
-            Some(format!(
-                "This node left the cluster ({told} peer(s) told). Its data stays here; it no longer syncs."
-            )),
-            None,
-        ),
-        Err(e) => back(None, Some(format!("Leaving failed: {e:#}"))),
-    })
-}
-
-#[derive(serde::Deserialize)]
-struct KeyForm {
-    key: String,
+pub(crate) struct KeyForm {
+    pub(crate) key: String,
     /// Block: also every node it admitted, transitively.
-    subtree: Option<String>,
+    pub(crate) subtree: Option<String>,
 }
 
 async fn block(
@@ -927,9 +801,11 @@ async fn block(
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
     };
+    let to = format!("/admin/cluster/node/{id}");
     if f.subtree.is_some() {
         return Ok(match crate::cluster::block::block_subtree(node, id).await {
-            Ok((ids, n)) => back(
+            Ok((ids, n)) => back_to(
+                &to,
                 Some(format!(
                     "Blocked {} and the {} node(s) it admitted, directly or not ({n} records taken out of view). Other nodes are unaffected.",
                     id.short(),
@@ -937,18 +813,19 @@ async fn block(
                 )),
                 None,
             ),
-            Err(e) => back(None, Some(format!("{e:#}"))),
+            Err(e) => back_to(&to, None, Some(format!("{e:#}"))),
         });
     }
     Ok(match crate::cluster::block::block(node, id).await {
-        Ok(n) => back(
+        Ok(n) => back_to(
+            &to,
             Some(format!(
                 "Blocked {}. This node no longer talks to it and shows none of its records ({n} taken out of view). Other nodes are unaffected.",
                 id.short()
             )),
             None,
         ),
-        Err(e) => back(None, Some(format!("{e:#}"))),
+        Err(e) => back_to(&to, None, Some(format!("{e:#}"))),
     })
 }
 
@@ -961,13 +838,15 @@ async fn unblock(
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
     };
+    let to = format!("/admin/cluster/node/{id}");
     Ok(if crate::cluster::block::unblock(node, id).await? {
-        back(
+        back_to(
+            &to,
             Some(format!("Unblocked {}. Its records are back.", id.short())),
             None,
         )
     } else {
-        back(None, Some("That node was not blocked.".into()))
+        back_to(&to, None, Some("That node was not blocked.".into()))
     })
 }
 
@@ -981,15 +860,17 @@ async fn purge(
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
     };
+    let to = format!("/admin/cluster/node/{id}");
     Ok(match crate::cluster::block::purge(node, id).await {
-        Ok(n) => back(
+        Ok(n) => back_to(
+            &to,
             Some(format!(
                 "Purged {}: {n} log entries deleted here. Its entries are no longer accepted or relayed; unblocking fetches them again.",
                 id.short()
             )),
             None,
         ),
-        Err(e) => back(None, Some(format!("{e:#}"))),
+        Err(e) => back_to(&to, None, Some(format!("{e:#}"))),
     })
 }
 
@@ -1066,38 +947,6 @@ async fn set_own(
     })
 }
 
-async fn rotate_key(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
-    let node = node(&st)?;
-    if !node.cfg.remote_config {
-        return Ok(back(
-            None,
-            Some("Remote configuration is off on this node; there is no key to rotate.".into()),
-        ));
-    }
-    crate::cluster::confkey::rotate(&node.store, node.id()).await?;
-    Ok(back(
-        Some(
-            "Config key rotated. Everyone who held the old key can no longer configure this node."
-                .into(),
-        ),
-        None,
-    ))
-}
-
-async fn add_key(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Form(f): Form<KeyForm>,
-) -> AppResult<Response> {
-    let node = node(&st)?;
-    Ok(
-        match crate::cluster::confkey::add(&node.store, node.id(), &f.key).await {
-            Ok(id) => Redirect::to(&format!("/admin/cluster/node/{id}")).into_response(),
-            Err(e) => back(None, Some(format!("{e:#}"))),
-        },
-    )
-}
-
 async fn forget_key(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
@@ -1114,19 +963,30 @@ async fn forget_key(
     ))
 }
 
+/// The live part of a node page: its remote settings.
+enum Remote {
+    /// This node: settings live on System.
+    Own,
+    /// No config key held here: nothing asked.
+    NoKey,
+    /// Asked, and it answered.
+    Settings {
+        state: crate::cluster::confkey::State,
+        timeout_min: String,
+        rec: Option<(u32, i64, String)>,
+        has: (bool, bool, bool),
+    },
+    /// Asked; no answer.
+    Silent(String),
+}
+
 #[derive(Template)]
 #[template(path = "admin_cluster_node.html")]
 struct NodePage {
     chrome: Chrome,
-    key: String,
-    name: String,
-    short: String,
-    /// None: the node did not answer.
-    state: Option<crate::cluster::confkey::State>,
-    timeout_min: String,
-    rec: Option<(u32, i64, String)>,
-    key_held: bool,
-    has: (bool, bool, bool),
+    m: MemberView,
+    contrib: Vec<ContribView>,
+    remote: Remote,
     notice: Option<String>,
     error: Option<String>,
 }
@@ -1136,48 +996,51 @@ async fn node_view(st: &AdminState, key: &str, flash: Flash) -> AppResult<Html<S
     let Ok(id) = NodeId::parse(key) else {
         return Err(AppError::NotFound);
     };
-    let Some(m) = members::all(&node.store)
-        .await?
-        .into_iter()
-        .find(|m| m.id == id)
-    else {
+    let check = rules_check(st, node).await?;
+    let (me, members) = views(node, &check).await?;
+    let key = id.to_string();
+    let Some(m) = std::iter::once(me).chain(members).find(|m| m.key == key) else {
         return Err(AppError::NotFound);
     };
-    let (state, error) = match crate::cluster::confkey::get(node, id).await {
-        Ok(s) => (Some(s), flash.error),
-        Err(e) => (None, Some(format!("{} did not answer: {e:#}", m.name))),
-    };
-    let minutes = |secs: u64| {
-        if secs.is_multiple_of(60) {
-            (secs / 60).to_string()
-        } else {
-            format!("{:.1}", secs as f64 / 60.0)
+    let contrib = contributions(node)
+        .await?
+        .into_iter()
+        .filter(|c| c.key == m.key || (m.is_self && c.key.is_empty()))
+        .collect();
+    let remote = if m.is_self {
+        Remote::Own
+    } else if !m.key_held {
+        Remote::NoKey
+    } else {
+        match crate::cluster::confkey::get(node, id).await {
+            Ok(s) => {
+                let minutes = |secs: u64| {
+                    if secs.is_multiple_of(60) {
+                        (secs / 60).to_string()
+                    } else {
+                        format!("{:.1}", secs as f64 / 60.0)
+                    }
+                };
+                let has = |r: &str| s.roles.iter().any(|x| x == r);
+                Remote::Settings {
+                    timeout_min: minutes(s.pace.timeout_secs),
+                    rec: s
+                        .recommended
+                        .map(|p| (p.max_workers, p.max_scans_per_hour, minutes(p.timeout_secs))),
+                    has: (has("listener"), has("scanner"), has("web")),
+                    state: s,
+                }
+            }
+            Err(e) => Remote::Silent(format!("{} did not answer: {e:#}", m.name)),
         }
     };
-    let has = |s: &crate::cluster::confkey::State, r: &str| s.roles.iter().any(|x| x == r);
     render(&NodePage {
         chrome: Chrome::new(true, "admin"),
-        key: id.to_string(),
-        name: m.name,
-        short: id.short(),
-        timeout_min: state
-            .as_ref()
-            .map(|s| minutes(s.pace.timeout_secs))
-            .unwrap_or_default(),
-        rec: state
-            .as_ref()
-            .and_then(|s| s.recommended)
-            .map(|p| (p.max_workers, p.max_scans_per_hour, minutes(p.timeout_secs))),
-        has: state
-            .as_ref()
-            .map(|s| (has(s, "listener"), has(s, "scanner"), has(s, "web")))
-            .unwrap_or_default(),
-        key_held: crate::cluster::confkey::held(&node.store)
-            .await?
-            .contains(&id),
-        state,
+        m,
+        contrib,
+        remote,
         notice: flash.notice,
-        error,
+        error: flash.error,
     })
 }
 
@@ -1413,5 +1276,14 @@ mod tests {
         let r = back(None, Some("Join failed".into()));
         assert_eq!(r.headers()[axum::http::header::LOCATION], "/admin/cluster");
         assert!(cookie(&r).starts_with("peephole_flash_error=Join+failed"));
+        let r = back_to(
+            "/admin/cluster/access",
+            Some("Invite revoked.".into()),
+            None,
+        );
+        assert_eq!(
+            r.headers()[axum::http::header::LOCATION],
+            "/admin/cluster/access"
+        );
     }
 }
