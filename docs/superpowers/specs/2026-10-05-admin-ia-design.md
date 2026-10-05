@@ -149,7 +149,7 @@ when it is a finished status. `/admin/queue/pace` and
 "What is happening, and what needs me". Top to bottom:
 
 **Needs attention**: `attention(st) -> Vec<Attention>` with
-`Attention { level: Warn | Info, text: String, href: String }`, computed on
+`Attention { level: Warn, text: String, href: String }` (one level today; the list is styled by it), computed on
 page load. The strip renders only the items that apply and is absent when
 none do.
 

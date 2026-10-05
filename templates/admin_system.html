@@ -2,7 +2,7 @@
 {% block title %}peephole — system{% endblock %}
 {% block content %}
 {% let sub = "system" %}{% include "_admin_nav.html" %}
-{% let subtab = "status" %}{% let tabs = crate::admin::views::SYSTEM_TABS %}{% include "_subtabs.html" %}
+{% let subtab = "status" %}{% let tabs = crate::admin::views::SYSTEM_TABS %}{% let tabs_label = "System pages" %}{% include "_subtabs.html" %}
 <div class="page-head"><div><h1>System</h1><p class="muted">Intel feeds and what this node runs.</p></div></div>
 {% if intel.stale %}<div class="banner banner-warning">Tor exit list or GeoIP data missing or older than 48 h.</div>{% endif %}
 <div class="stack">

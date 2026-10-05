@@ -13,9 +13,18 @@ pub fn routes() -> Router<Arc<AdminState>> {
     Router::new().route("/admin", get(home))
 }
 
+/// How urgent an item is (one kind today; the strip styles by it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     Warn,
+}
+
+impl Level {
+    pub fn key(&self) -> &'static str {
+        match self {
+            Level::Warn => "warn",
+        }
+    }
 }
 
 /// One "needs attention" item: what, and where to deal with it.
@@ -78,7 +87,8 @@ pub fn attention(s: &Signals) -> Vec<Attention> {
     for n in nodes {
         let href = format!("/admin/cluster/node/{}", n.key);
         if !n.live {
-            let text = if n.last_seen == "never" {
+            // One item per offline member: what else is wrong rides along.
+            let mut text = if n.last_seen == "never" {
                 format!("{} has never been seen.", n.name)
             } else {
                 format!(
@@ -87,7 +97,11 @@ pub fn attention(s: &Signals) -> Vec<Attention> {
                     n.last_seen.trim_end_matches(" ago")
                 )
             };
+            if !n.issues.is_empty() {
+                text.push_str(&format!(" Also: {}.", n.issues.join(" · ")));
+            }
             v.push(warn(text, &href));
+            continue;
         }
         if !n.issues.is_empty() {
             v.push(warn(format!("{}: {}", n.name, n.issues.join(" · ")), &href));
@@ -105,7 +119,10 @@ pub fn attention(s: &Signals) -> Vec<Attention> {
     }
     if let Some(n) = &s.growing {
         v.push(warn(
-            format!("The scan queue grows by {n} jobs per hour."),
+            format!(
+                "The scan queue grows by about {} jobs per hour.",
+                n.trim_start_matches('+')
+            ),
             "/admin/scans#pace",
         ));
     }
@@ -130,27 +147,49 @@ async fn signals(st: &AdminState) -> AppResult<Signals> {
         failed_24h: pace.m.failed_24h,
         growing: pace.growing.then(|| pace.net.clone()),
         timeouts: pace.timeouts_high.then(|| pace.timeout_share.clone()),
-        intel_stale: crate::admin::system::intel_status(st).await?.stale,
+        intel_stale: crate::admin::system::intel_is_stale(st).await?,
         ..Default::default()
     };
     if let Some(node) = st.recorder.node() {
-        let check = crate::admin::cluster::rules_check(st, node).await?;
-        let (_, members) = crate::admin::cluster::views(node, &check).await?;
-        s.nodes = members
-            .into_iter()
-            .filter(|m| m.active && !m.blocked)
-            .map(|m| NodeState {
-                issues: m.issues(),
-                name: m.name,
-                key: m.key,
-                live: m.live,
-                last_seen: m.last_seen,
-            })
-            .collect();
         s.detached = node.detached().map(|d| d.label());
-        s.unserved = crate::admin::cluster::unserved(node).await?;
+        // The landing page must not fail with the cluster checks: without
+        // them it lists what it can.
+        match members(st, node).await {
+            Ok(nodes) => s.nodes = nodes,
+            Err(e) => tracing::warn!(error = ?e, "overview: member checks unavailable"),
+        }
+        match crate::admin::cluster::unserved(node).await {
+            Ok(u) => s.unserved = u,
+            Err(e) => tracing::warn!(error = ?e, "overview: unserved history unknown"),
+        }
     }
     Ok(s)
+}
+
+/// Active, unblocked members as the strip needs them. An offline member's
+/// last error is left out: "not seen" says it already.
+async fn members(st: &AdminState, node: &crate::cluster::Node) -> AppResult<Vec<NodeState>> {
+    let check = crate::admin::cluster::rules_check(st, node).await?;
+    let (_, members) = crate::admin::cluster::views(node, &check).await?;
+    Ok(members
+        .into_iter()
+        .filter(|m| m.active && !m.blocked)
+        .map(|m| NodeState {
+            issues: if m.live {
+                m.issues()
+            } else {
+                crate::admin::cluster::MemberView {
+                    error: None,
+                    ..m.clone()
+                }
+                .issues()
+            },
+            name: m.name,
+            key: m.key,
+            live: m.live,
+            last_seen: m.last_seen,
+        })
+        .collect())
 }
 
 #[derive(Template)]
@@ -164,6 +203,8 @@ struct HomePage {
     running: i64,
     done_24h: i64,
     inbox: i64,
+    /// 24 h ago (UTC), for the request search link.
+    since_24h: String,
     /// "Recent activity": the newest requests, then live over SSE.
     recent: Vec<crate::store::stats::RecentRequest>,
     /// The newest request id shown (the live feed's cursor).
@@ -189,6 +230,9 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         running: q.running,
         done_24h: q.done_24h,
         inbox: st.store.inbox_count().await?,
+        since_24h: (chrono::Utc::now() - chrono::Duration::hours(24))
+            .format("%Y-%m-%dT%H:%M")
+            .to_string(),
         recent,
         recent_max_id,
     })
@@ -243,7 +287,7 @@ mod tests {
             )
         };
         find("/admin/scans?status=failed#history", "3 scans failed");
-        find("/admin/scans#pace", "+4.0");
+        find("/admin/scans#pace", "by about 4.0 jobs");
         find("/admin/scans#pace", "25%");
         find("/admin/system", "older than 48 h");
         find("/admin/cluster/node/b-key", "not seen for 2.0 h");
@@ -280,6 +324,24 @@ mod tests {
         let items = attention(&s);
         assert_eq!(items.len(), 1, "{items:?}");
         assert!(items[0].text.contains("left its cluster"));
+    }
+
+    #[test]
+    fn an_offline_member_is_one_item() {
+        let mut n = node("e");
+        n.live = false;
+        n.last_seen = "5 min ago".into();
+        n.issues = vec!["incompatible version".into()];
+        let s = Signals {
+            nodes: vec![n],
+            ..Default::default()
+        };
+        let items = attention(&s);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(
+            items[0].text.contains("not seen for 5 min")
+                && items[0].text.contains("incompatible version")
+        );
     }
 
     #[test]

@@ -8,15 +8,15 @@
 <section class="card attention" aria-label="Needs attention">
   <div class="card-head"><h2>Needs attention</h2></div>
   <ul class="attention-list">
-  {% for a in attention %}<li><a href="{{ a.href }}">{{ a.text }}</a></li>{% endfor %}
+  {% for a in attention %}<li data-level="{{ a.level.key() }}"><a href="{{ a.href }}">{{ a.text }}</a></li>{% endfor %}
   </ul>
 </section>
 {% endif %}
 <div class="tiles">
-  <a class="tile" href="/requests"><span class="label">Requests · 24 h</span><div class="value">{{ requests_24h }}</div></a>
-  <a class="tile" href="/ips"><span class="label">New IPs · 24 h</span><div class="value">{{ new_ips_24h }}</div></a>
-  <a class="tile" href="/admin/scans"><span class="label">Queued / running</span><div class="value">{{ queued }}<span class="muted"> / {{ running }}</span></div></a>
-  <a class="tile" href="/admin/scans?status=done#history"><span class="label">Scans done · 24 h</span><div class="value">{{ done_24h }}</div></a>
+  <a class="tile" href="/requests?from={{ since_24h }}"><span class="label">Requests · 24 h</span><div class="value">{{ requests_24h }}</div><div class="hint">search them →</div></a>
+  <a class="tile" href="/ips"><span class="label">New IPs · 24 h</span><div class="value">{{ new_ips_24h }}</div><div class="hint">all IPs →</div></a>
+  <a class="tile" href="/admin/scans#pace"><span class="label">Queued / running</span><div class="value">{{ queued }}<span class="muted"> / {{ running }}</span></div></a>
+  <a class="tile" href="/admin/scans?status=done#history"><span class="label">Scans done · 24 h</span><div class="value">{{ done_24h }}</div><div class="hint">history →</div></a>
   <a class="tile" href="/admin/inbox"><span class="label">Inbox</span><div class="value">{{ inbox }}</div><div class="hint">claims</div></a>
 </div>
   <section class="card">

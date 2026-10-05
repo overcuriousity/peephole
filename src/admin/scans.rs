@@ -79,13 +79,7 @@ struct ScansPage {
 
 async fn render_page(st: &AdminState, q: &ScansQuery, pace: PaceView) -> AppResult<Html<String>> {
     let f = q.filter();
-    let mut qs = String::new();
-    if let Some(s) = &f.status {
-        qs.push_str(&format!("status={s}&"));
-    }
-    if let Some(l) = f.level {
-        qs.push_str(&format!("level={l}&"));
-    }
+    let qs = history_qs(&f);
     let summary = st.store.queue_summary(&st.recorder).await?;
     render(&ScansPage {
         chrome: chrome(),
@@ -120,11 +114,32 @@ async fn page(
     render_page(&st, &q, pace).await
 }
 
-/// The Queue page became part of Scans.
+/// The history filter as a query string prefix ("status=failed&level=3&"),
+/// from validated values only.
+fn history_qs(f: &JobFilter) -> String {
+    let mut qs = String::new();
+    if let Some(s) = &f.status {
+        qs.push_str(&format!("status={s}&"));
+    }
+    if let Some(l) = f.level {
+        qs.push_str(&format!("level={l}&"));
+    }
+    qs
+}
+
+/// The Queue page became part of Scans; its filter and page carry over.
 async fn queue_moved(Query(q): Query<ScansQuery>) -> Redirect {
-    match q.filter().status {
-        Some(s) => Redirect::permanent(&format!("/admin/scans?status={s}")),
-        None => Redirect::permanent("/admin/scans"),
+    let mut qs = history_qs(&q.filter());
+    if let Some(p) = q.page.filter(|p| *p > 1) {
+        qs.push_str(&format!("page={p}&"));
+    }
+    if qs.is_empty() {
+        Redirect::permanent("/admin/scans")
+    } else {
+        Redirect::permanent(&format!(
+            "/admin/scans?{}#history",
+            qs.trim_end_matches('&')
+        ))
     }
 }
 

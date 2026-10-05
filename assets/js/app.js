@@ -156,14 +156,16 @@
       tr.appendChild(cell("", esc(j.level)));
       tr.appendChild(cell("", '<span class="badge badge-status" data-status="' + esc(j.status) + '">' + esc(j.status) + "</span>"));
       tr.appendChild(cell("ts", esc(j.queued_at)));
-      tr.appendChild(cell("ts", esc(j.finished_at)));
-      tr.appendChild(cell("mono wrap", esc(j.error)));
+      tr.appendChild(cell("ts", esc(j.started_at)));
       tr.appendChild(cell("muted", esc(j.scanner) + (j.arbiter ? '<span class="node-via"> via ' + esc(j.arbiter) + "</span>" : "")));
       return tr;
     };
     // The live card holds active jobs only; a job that finishes leaves it.
     var matches = function (j) { return j.status === "queued" || j.status === "running"; };
-    var COLS = 8;
+    var COLS = 7;
+    // "newest N of M" when more jobs are active than the card keeps.
+    var total = qs && qs.querySelector("[data-queue-total]");
+    var setTotal = function (active) { if (total) { total.textContent = "newest " + limit + " of " + active; total.hidden = !(active > limit); } };
     var showEmpty = function () { var tr = document.createElement("tr"); tr.setAttribute("data-empty", ""); var td = cell("empty", "Nothing queued or running."); td.setAttribute("colspan", String(COLS)); tr.appendChild(td); tbody.appendChild(tr); };
     var apply = function (j) {
       var existing = tbody.querySelector('[data-job="' + j.id + '"]');
@@ -183,11 +185,14 @@
         }
         tbody.insertBefore(fresh, before);
       }
+      // Over the limit, a finished job's row is not backfilled until the
+      // next periodic snapshot (every 30 s).
       while (tbody.children.length > limit) tbody.removeChild(tbody.lastChild);
     };
-    var snapshot = function (jobs) {
+    var snapshot = function (d) {
       tbody.innerHTML = "";
-      jobs = jobs.filter(matches);
+      setTotal(d.active);
+      var jobs = (d.jobs || []).filter(matches);
       jobs.slice(0, limit).forEach(function (j) { tbody.appendChild(row(j)); });
       if (!jobs.length) showEmpty();
     };

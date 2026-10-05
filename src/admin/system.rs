@@ -48,13 +48,24 @@ pub struct IntelStatus {
     pub api: Vec<(&'static str, String)>,
 }
 
-pub(crate) async fn intel_status(st: &AdminState) -> AppResult<IntelStatus> {
-    let intel: HashMap<String, String> =
+/// The intel feeds' fetch times (`intel_meta`).
+async fn intel_meta(st: &AdminState) -> AppResult<HashMap<String, String>> {
+    Ok(
         sqlx::query_as::<_, (String, String)>("SELECT key, value FROM intel_meta")
             .fetch_all(&st.store.pool)
             .await?
             .into_iter()
-            .collect();
+            .collect(),
+    )
+}
+
+/// Tor or GeoIP data missing or older than 48 h (cheap: one small table).
+pub(crate) async fn intel_is_stale(st: &AdminState) -> AppResult<bool> {
+    Ok(intel_stale(&intel_meta(st).await?))
+}
+
+pub(crate) async fn intel_status(st: &AdminState) -> AppResult<IntelStatus> {
+    let intel = intel_meta(st).await?;
     let fetched = |k: &str| intel.get(k).cloned().unwrap_or_else(|| "never".into());
     Ok(IntelStatus {
         stale: intel_stale(&intel),

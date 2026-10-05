@@ -16,17 +16,25 @@ use tokio::sync::broadcast::error::RecvError;
 /// Matches the Scans page's live card, so a resync never shrinks it.
 const SNAPSHOT_ROWS: i64 = crate::admin::scans::LIVE_ROWS;
 
-fn snapshot_event(jobs: &[QueueJob]) -> Event {
-    Event::default()
-        .event("snapshot")
-        .data(serde_json::to_string(jobs).unwrap_or_else(|_| "[]".into()))
+/// The live card's rows and how many jobs are active in all (more than the
+/// rows when over [`SNAPSHOT_ROWS`]).
+fn snapshot_event(jobs: &[QueueJob], active: i64) -> Event {
+    Event::default().event("snapshot").data(
+        serde_json::to_string(&serde_json::json!({ "jobs": jobs, "active": active }))
+            .unwrap_or_else(|_| r#"{"jobs":[],"active":0}"#.into()),
+    )
 }
 
 /// A snapshot, or — when the store fails — a comment the client ignores, so a
 /// transient DB error never renders as "Queue empty".
 async fn snapshot_or_comment(state: &AdminState) -> Event {
-    match state.store.active_jobs(SNAPSHOT_ROWS).await {
-        Ok(jobs) => snapshot_event(&jobs),
+    let snap = async {
+        let jobs = state.store.active_jobs(SNAPSHOT_ROWS).await?;
+        let q = state.store.queue_summary(&state.recorder).await?;
+        anyhow::Ok((jobs, q.queued + q.running))
+    };
+    match snap.await {
+        Ok((jobs, active)) => snapshot_event(&jobs, active),
         Err(e) => {
             tracing::warn!(error = ?e, "queue snapshot unavailable");
             Event::default().comment("snapshot unavailable")

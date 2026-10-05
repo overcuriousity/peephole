@@ -2,7 +2,7 @@
 {% block title %}peephole — {{ m.name }}{% endblock %}
 {% block content %}
 {% let sub = "cluster" %}{% include "_admin_nav.html" %}
-{% let subtab = "members" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% include "_subtabs.html" %}
+{% let subtab = "members" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
 <div class="page-head"><div>
   <h1>{{ m.name }} <span class="mono muted">{{ m.short }}</span>{% if m.is_self %} <span class="muted small">this node</span>{% endif %}</h1>
   <div class="meta">{% if m.blocked %}<span class="badge badge-status" data-status="failed">{% if m.purged %}purged{% else %}blocked{% endif %}</span>{% else if !m.active %}<span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% else if m.live %}<span class="badge badge-status" data-status="done">live</span>{% else %}<span class="badge badge-status" data-status="queued">not seen</span>{% endif %}</div>
@@ -24,8 +24,6 @@
   {% endif %}
 </div>{% endif %}
 </div>
-{% if let Some(n) = notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
-{% if let Some(e) = error %}<div class="banner banner-warning">{{ e }}</div>{% endif %}
 <div class="stack">
 <section class="card"><h2>Details</h2>
   <dl class="kv">
@@ -39,6 +37,7 @@
     {% if m.scanner %}<dt>Scans running</dt><dd>{{ m.active_scans }}</dd>{% endif %}
     <dt>Remote configuration</dt><dd>{% if m.is_self %}{% if m.remote_config %}open to key holders (key on <a href="/admin/cluster/access">Access</a>){% else %}locked{% endif %}{% else if m.key_held %}key held here{% else if m.remote_config %}open to key holders{% else %}locked{% endif %}</dd>
     {% for i in m.issues() %}<dt>Issue</dt><dd><span class="badge badge-status" data-status="running">{{ i }}</span></dd>{% endfor %}
+    {% if m.skew.is_some() %}<dt></dt><dd class="muted small">Run NTP on every node: scan cooldowns compare timestamps from different nodes.</dd>{% endif %}
   </dl>
 </section>
 <section class="card"><h2>Rules</h2>

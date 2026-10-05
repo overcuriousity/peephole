@@ -8,7 +8,7 @@
   <p>To join, add a <code>[cluster]</code> section to <code>config.toml</code> and restart. See <a href="https://github.com/overcuriousity/peephole/blob/master/docs/cluster.md">docs/cluster.md</a>.</p>
   <p class="muted">Cooldown and roles: <a href="/admin/system/settings">System › Settings</a>. Scan pace: <a href="/admin/scans#pace">Scans</a>.</p></section>
 {% else %}
-{% let subtab = "members" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% include "_subtabs.html" %}
+{% let subtab = "members" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
 <div class="page-head"><div><h1>Cluster</h1><p class="muted">Node names never appear on public pages.</p></div></div>
 {% if let Some(d) = detached %}<div class="banner banner-warning">{{ d }}</div>{% endif %}
 {% if let Some(u) = unserved %}<div class="banner banner-warning">History incomplete for {{ u }}: waiting for a full member.</div>{% endif %}
@@ -22,7 +22,7 @@
         <td>{% if m.blocked %}<span class="badge badge-status" data-status="failed">{% if m.purged %}purged{% else %}blocked{% endif %}</span>{% else if !m.active %}<span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% else if m.live %}<span class="badge badge-status" data-status="done">live</span>{% else %}<span class="badge badge-status" data-status="queued">not seen</span>{% endif %}</td>
         <td>{{ m.last_seen }}</td>
         <td>{{ m.lag }}</td>
-        <td>{% let issues = m.issues() %}{% if !issues.is_empty() %}<span class="badge badge-status" data-status="running" title="{{ issues.join(" · ") }}">{{ issues.len() }} issue{% if issues.len() != 1 %}s{% endif %}</span>{% endif %}</td>
+        <td>{% let issues = m.issues() %}{% if !issues.is_empty() %}<a class="badge badge-status" data-status="running" href="/admin/cluster/node/{{ m.key }}" title="{{ issues.join(" · ") }}{% if m.skew.is_some() %}. Run NTP on every node: scan cooldowns compare timestamps from different nodes.{% endif %}" aria-label="{{ issues.len() }} issue{% if issues.len() != 1 %}s{% endif %}: {{ issues.join("; ") }}">{{ issues.len() }} issue{% if issues.len() != 1 %}s{% endif %}</a>{% endif %}</td>
       </tr>
     {% endfor %}
     {% if rows.len() == 1 %}<tr><td colspan="5" class="empty">No other members yet. Create an invite on <a href="/admin/cluster/access">Access</a>, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}

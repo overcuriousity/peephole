@@ -2,7 +2,7 @@
 {% block title %}peephole — security keys{% endblock %}
 {% block content %}
 {% let sub = "system" %}{% include "_admin_nav.html" %}
-{% let subtab = "keys" %}{% let tabs = crate::admin::views::SYSTEM_TABS %}{% include "_subtabs.html" %}
+{% let subtab = "keys" %}{% let tabs = crate::admin::views::SYSTEM_TABS %}{% let tabs_label = "System pages" %}{% include "_subtabs.html" %}
 <div class="page-head"><div><h1>Security keys</h1><p class="muted">Keep at least two.</p></div>
   <a class="btn btn-primary" href="/enroll">Enroll another key</a></div>
 <div class="table-wrap"><table>

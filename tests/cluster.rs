@@ -3003,6 +3003,17 @@ async fn admin_configures_another_node_with_its_key() {
         html.contains("did not answer") && html.contains("Contributions"),
         "{html}"
     );
+    let r = admin
+        .post(format!("{base}/admin/cluster/config-key/forget"))
+        .form(&[("key", b.id.to_string())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.url().path(),
+        format!("/admin/cluster/node/{}", b.id),
+        "forgetting a key stays on the node page"
+    );
 }
 
 /// Enrichment results replicate with their origin; a blocked peer's results

@@ -489,6 +489,10 @@ async fn queue_sse_requires_session_and_streams_snapshot_then_jobs() {
     );
     let body = read_sse_until(resp, "event: snapshot", 5).await;
     assert!(body.contains("\"status\":\"queued\""));
+    assert!(
+        body.contains("\"active\":1"),
+        "the snapshot carries the total: {body}"
+    );
 
     // A published job arrives as `event: job`.
     let resp = client
@@ -2753,7 +2757,7 @@ async fn admin_nav_groups_pages_under_seven_tabs() {
     };
     let current = |html: &str| {
         nav(html)
-            .split("aria-current=\"page\">")
+            .split("aria-current=\"true\">")
             .nth(1)
             .map(|s| s.split('<').next().unwrap().to_string())
     };
@@ -2782,6 +2786,26 @@ async fn admin_nav_groups_pages_under_seven_tabs() {
     }
     let fp = get("/admin/fingerprints").await;
     assert_eq!(current(&fp).as_deref(), Some("Links"));
+    assert!(
+        fp.contains("aria-label=\"Links pages\""),
+        "named sub-tab nav"
+    );
+    let css = get("/assets/app.css").await;
+    for rule in [".subtabs", ".topbar-search", "a.tile", ".attention-list"] {
+        assert!(css.contains(rule), "app.css lacks {rule}");
+    }
+    let scans = get("/admin/scans").await;
+    let live = scans
+        .split("<table data-queue")
+        .nth(1)
+        .unwrap()
+        .split("</thead>")
+        .next()
+        .unwrap();
+    assert!(
+        live.contains("<th>Started</th>") && !live.contains("<th>Error</th>"),
+        "live queue columns: {live}"
+    );
     assert!(fp.contains("href=\"/admin/canaries\""), "links sub-tabs");
     assert_eq!(
         current(&get("/admin/canaries").await).as_deref(),
@@ -2807,8 +2831,15 @@ async fn moved_admin_pages_redirect_permanently() {
         ("/admin/keys", "/admin/system/keys"),
         ("/admin/export", "/admin/system/export"),
         ("/admin/queue", "/admin/scans"),
-        ("/admin/queue?status=failed", "/admin/scans?status=failed"),
+        (
+            "/admin/queue?status=failed",
+            "/admin/scans?status=failed#history",
+        ),
         ("/admin/queue?status=queued", "/admin/scans"),
+        (
+            "/admin/queue?status=failed&level=3&page=2",
+            "/admin/scans?status=failed&level=3&page=2#history",
+        ),
     ] {
         let r = client.get(format!("{base}{from}")).send().await.unwrap();
         assert_eq!(r.status(), 308, "{from}");

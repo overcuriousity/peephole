@@ -302,13 +302,6 @@ pub(crate) async fn audit_views(st: &AdminState) -> AppResult<Vec<AuditView>> {
         .collect())
 }
 
-/// The outcome shown on a remote node's page, which renders in place.
-#[derive(Default)]
-struct Flash {
-    notice: Option<String>,
-    error: Option<String>,
-}
-
 fn ago(d: std::time::Duration) -> String {
     let s = d.as_secs();
     match s {
@@ -489,8 +482,13 @@ pub(crate) async fn scanner_rows(st: &AdminState) -> AppResult<Vec<MemberView>> 
     let Some(node) = st.recorder.node() else {
         return Ok(vec![]);
     };
-    let check = rules_check(st, node).await?;
-    let (me, members) = views(node, &check).await?;
+    // The pace table reads no rules fields: skip the (possibly cold)
+    // comparison so the Scans page never waits on it.
+    let none = RulesCheck {
+        by_member: Default::default(),
+        carried: Default::default(),
+    };
+    let (me, members) = views(node, &none).await?;
     Ok(std::iter::once(me)
         .filter(|m| m.scanner)
         .chain(members.into_iter().filter(|m| m.scanner && m.active))
@@ -957,7 +955,8 @@ async fn forget_key(
         return Ok(back(None, Some("unknown node".into())));
     };
     crate::cluster::confkey::forget(&node.store, &id).await?;
-    Ok(back(
+    Ok(back_to(
+        &format!("/admin/cluster/node/{id}"),
         Some(format!("Config key for {} forgotten.", id.short())),
         None,
     ))
@@ -989,8 +988,6 @@ struct NodePage {
     m: MemberView,
     contrib: Vec<ContribView>,
     remote: Remote,
-    notice: Option<String>,
-    error: Option<String>,
 }
 
 /// Whether a node page asks the member for its settings: only a live,
@@ -1000,7 +997,7 @@ fn asks_remote(m: &MemberView) -> bool {
     !m.is_self && m.key_held && m.live && !m.blocked
 }
 
-async fn node_view(st: &AdminState, key: &str, flash: Flash) -> AppResult<Html<String>> {
+async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
     let node = node(st)?;
     let Ok(id) = NodeId::parse(key) else {
         return Err(AppError::NotFound);
@@ -1050,8 +1047,6 @@ async fn node_view(st: &AdminState, key: &str, flash: Flash) -> AppResult<Html<S
         m,
         contrib,
         remote,
-        notice: flash.notice,
-        error: flash.error,
     })
 }
 
@@ -1060,7 +1055,7 @@ async fn node_page(
     State(st): State<Arc<AdminState>>,
     axum::extract::Path(key): axum::extract::Path<String>,
 ) -> AppResult<Html<String>> {
-    node_view(&st, &key, Flash::default()).await
+    node_view(&st, &key).await
 }
 
 async fn node_set(
@@ -1068,36 +1063,26 @@ async fn node_set(
     State(st): State<Arc<AdminState>>,
     axum::extract::Path(key): axum::extract::Path<String>,
     Form(f): Form<SettingsForm>,
-) -> AppResult<Html<String>> {
+) -> AppResult<Response> {
     let node = node(&st)?;
     let Ok(id) = NodeId::parse(&key) else {
         return Err(AppError::NotFound);
     };
-    let flash = match (f.changes(), f.base_version) {
-        (Err(e), _) => Flash {
-            notice: None,
-            error: Some(e),
-        },
-        (_, None) => Flash {
-            notice: None,
-            error: Some("reload the page and try again".into()),
-        },
+    let to = format!("/admin/cluster/node/{id}");
+    // Post/redirect/get: a reload of the page does not send the form again.
+    Ok(match (f.changes(), f.base_version) {
+        (Err(e), _) => back_to(&to, None, Some(e)),
+        (_, None) => back_to(&to, None, Some("reload the page and try again".into())),
         (Ok(c), Some(base)) => match crate::cluster::confkey::set(node, id, base, &c).await {
-            Ok(Ok(_)) => Flash {
-                notice: Some("Saved. Roles switch within seconds.".into()),
-                error: None,
-            },
-            Ok(Err(e)) => Flash {
-                notice: None,
-                error: Some(format!("Not saved: {e}")),
-            },
-            Err(e) => Flash {
-                notice: None,
-                error: Some(format!("Not saved: {e:#}")),
-            },
+            Ok(Ok(_)) => back_to(
+                &to,
+                Some("Saved. Roles switch within seconds.".into()),
+                None,
+            ),
+            Ok(Err(e)) => back_to(&to, None, Some(format!("Not saved: {e}"))),
+            Err(e) => back_to(&to, None, Some(format!("Not saved: {e:#}"))),
         },
-    };
-    node_view(&st, &key, flash).await
+    })
 }
 
 #[derive(serde::Deserialize)]

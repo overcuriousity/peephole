@@ -8,7 +8,7 @@
 {% if let Some(e) = pace.error %}<div class="banner banner-warning">Pace not saved: {{ e }}</div>{% endif %}
 {% if pace.timeouts_high %}<div class="banner banner-warning">{{ pace.timeout_share }} of scans in 24 h hit the {{ pace.timeout_min }} min timeout; recommended: {{ pace.rec_timeout_min }} min.</div>{% endif %}
 {% if pace.growing %}<div class="banner banner-warning">The queue grew by about {{ pace.net }} jobs per hour over the last {{ pace.drain_window_h }} h.</div>{% endif %}
-{% if pace.not_scanning %}<div class="banner banner-warning">This node does not scan; its own pace does nothing. Scanners are paced below.</div>{% endif %}
+{% if pace.not_scanning %}<div class="banner banner-warning">This node does not scan; its own pace does nothing. {% if scanners.is_empty() %}No member has the scanner role: turn it on under <a href="/admin/system/settings">System › Settings</a> or on a member's page.{% else %}Scanners are paced in <a href="#scanners">Scanners</a> below.{% endif %}</div>{% endif %}
 <div class="stack">
 <section class="card pace" id="pace">
   <div class="card-head"><h2>Pace</h2><span class="muted">{% if pace.paused %}scanning paused{% else %}{{ pace.cadence }}{% endif %}</span></div>
@@ -54,11 +54,11 @@
   {% if pace.m.failed_24h > 0 %}<p class="muted pace-retry"><a href="/admin/scans?status=failed#history">{{ pace.m.failed_24h }} failed in 24 h →</a></p>{% endif %}
 </section>
 <section class="card">
-  <div class="card-head"><h2>Live queue</h2><span class="row">{% if active_total > jobs.len() as i64 %}<span class="muted">newest {{ jobs.len() }} of {{ active_total }}</span>{% endif %}<span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></span></div>
-  <div class="table-wrap wide"><table data-queue data-src="/admin/api/queue" data-limit="500">
-    <thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Status</th><th>Queued</th><th>Finished</th><th>Error</th><th>Node</th></tr></thead>
-    <tbody>{% for j in jobs %}{% include "_queue_row.html" %}{% endfor %}
-    {% if jobs.is_empty() %}<tr data-empty><td colspan="8" class="empty">Nothing queued or running.</td></tr>{% endif %}</tbody>
+  <div class="card-head"><h2>Live queue</h2><span class="row"><span class="muted" data-queue-total{% if active_total <= crate::admin::scans::LIVE_ROWS %} hidden{% endif %}>newest {{ crate::admin::scans::LIVE_ROWS }} of {{ active_total }}</span><span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></span></div>
+  <div class="table-wrap wide"><table data-queue data-src="/admin/api/queue" data-limit="{{ crate::admin::scans::LIVE_ROWS }}">
+    <thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Status</th><th>Queued</th><th>Started</th><th>Node</th></tr></thead>
+    <tbody>{% for j in jobs %}{% include "_live_queue_row.html" %}{% endfor %}
+    {% if jobs.is_empty() %}<tr data-empty><td colspan="7" class="empty">Nothing queued or running.</td></tr>{% endif %}</tbody>
   </table></div>
 </section>
 <section class="card" id="history">
