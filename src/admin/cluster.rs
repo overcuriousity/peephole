@@ -63,6 +63,9 @@ pub struct MemberView {
     pub scanner: bool,
     pub pace: Option<PaceInfo>,
     pub timeout_min: String,
+    /// Scan levels it is weighted down at, against the other scanners
+    /// (see `scan::weight`); "" when none.
+    pub level_weights: String,
     pub active_scans: u32,
     pub lag: String,
     /// "full history", "keeps N days" (this node: and where its history
@@ -303,6 +306,19 @@ async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<Me
             .unwrap_or_default()
             .view(ours)
     };
+    let tallies = crate::scan::weight::tallies(&node.store.pool).await?;
+    // The arbiter's view: the scanners that could take a job now.
+    let scanners = crate::scan::arbiter::scanners(node);
+    let level_weights = |id: NodeId| {
+        (1..=4)
+            .filter_map(|l| {
+                let w = crate::scan::weight::weight(&tallies, id, &scanners, l);
+                let t = tallies.get(&(id, l)).copied().unwrap_or_default();
+                (w < 1.0).then(|| format!("L{l} ×{w:.2} ({} ok, {} failed)", t.ok, t.failed))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
     let mut out = vec![];
     let mut mine = None;
     for m in rows {
@@ -366,6 +382,7 @@ async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<Me
             timeout_min: pace
                 .map(|p| format!("{}", p.timeout_secs / 60))
                 .unwrap_or_default(),
+            level_weights: level_weights(m.id),
             pace,
             active_scans: if is_self {
                 node.status.local.lock().unwrap().active_scans
@@ -418,6 +435,7 @@ async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<Me
         scanner: node.roles().scanner,
         pace: None,
         timeout_min: String::new(),
+        level_weights: String::new(),
         active_scans: 0,
         lag: "—".into(),
         history: own,

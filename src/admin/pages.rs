@@ -192,6 +192,9 @@ struct PaceView {
     m: QueueMetrics,
     arrival: String,
     capacity: String,
+    /// Jobs that actually left the queue per hour, recent window.
+    throughput: String,
+    drain_window_h: i64,
     /// In a cluster with other live scanners: how the capacity splits.
     cluster_note: Option<String>,
     net: String,
@@ -277,6 +280,8 @@ async fn pace_view(
         growing: r.growing(),
         arrival: fmt_rate(r.arrival_per_hour),
         capacity: fmt_rate(r.capacity_per_hour),
+        throughput: fmt_rate(r.throughput_per_hour),
+        drain_window_h: pace::DRAIN_WINDOW_HOURS,
         cluster_note: (others.scanners > 0).then(|| {
             format!(
                 "{} here + {} from {} other scanner{}",

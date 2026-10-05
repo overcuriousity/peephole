@@ -6,6 +6,8 @@
 //! Fairness: claims are collected for a short window and the jobs go to
 //! the claimants that ran the fewest scans in the last hour, so equally
 //! paced scanners share the queue equally wherever the job came from.
+//! A scanner that fails a level more than the others is weighted down at
+//! that level (see `weight`).
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::msg::{Grant, Msg};
@@ -198,7 +200,6 @@ impl Arbiter {
 
     /// Take our next queued job for `scanner` and mark it running.
     async fn next_job(&self, scanner: NodeId) -> Result<Option<Grant>> {
-        let me = self.node.id();
         // Not a job this scanner already handed back (for now or for good).
         let declined: Vec<String> = {
             let d = self.declined.lock().unwrap();
@@ -214,15 +215,48 @@ impl Arbiter {
                 )
                 .collect()
         };
+        let skipped = self.skipped_levels(scanner).await?;
+        self.next_job_skipping(scanner, declined, &skipped).await
+    }
+
+    /// Levels `scanner` fails more than the other live scanners and sits
+    /// out for now (see `weight`). None when it is the only scanner.
+    async fn skipped_levels(&self, scanner: NodeId) -> Result<Vec<i64>> {
+        let scanners = self.scanners();
+        if scanners.len() < 2 {
+            return Ok(vec![]);
+        }
+        let t = super::weight::tallies(&self.node.store.pool).await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Ok(super::weight::skipped_levels(&t, scanner, &scanners, now))
+    }
+
+    /// [`Self::next_job`] past the jobs `scanner` handed back and, unless
+    /// they have waited [`super::weight::OVERRIDE_WAIT_MINS`], the jobs of
+    /// the levels it sits out.
+    async fn next_job_skipping(
+        &self,
+        scanner: NodeId,
+        declined: Vec<String>,
+        skipped: &[i64],
+    ) -> Result<Option<Grant>> {
+        let me = self.node.id();
         let (uid, ip, level, attempts) = loop {
-            let row: Option<(String, String, i64, i64)> = sqlx::query_as(
+            let row: Option<(String, String, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT j.uid, i.ip, j.level, j.attempts FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
                  WHERE j.status = 'queued' AND j.arbiter = ?
                    AND j.uid NOT IN (SELECT value FROM json_each(?))
+                   AND (j.level NOT IN (SELECT value FROM json_each(?))
+                        OR j.queued_at < datetime('now', '-{} minutes'))
                  ORDER BY j.level DESC, j.queued_at ASC LIMIT 1",
-            )
+                super::weight::OVERRIDE_WAIT_MINS
+            )))
             .bind(&me.0[..])
             .bind(serde_json::to_string(&declined)?)
+            .bind(serde_json::to_string(skipped)?)
             .fetch_optional(&self.node.store.pool)
             .await?;
             let Some(row) = row else {
@@ -362,26 +396,8 @@ impl Arbiter {
         true
     }
 
-    /// Scanners that could still take a job: members with the scanner role
-    /// that this node does not block and has heard from recently (or has not
-    /// had the chance to hear from yet), this node included.
     fn scanners(&self) -> Vec<NodeId> {
-        let me = self.node.id();
-        let mut v: Vec<NodeId> = self
-            .node
-            .members()
-            .values()
-            .filter(|m| m.roles.iter().any(|r| r == "scanner"))
-            .map(|m| m.id)
-            .filter(|id| {
-                *id == me
-                    || (!self.node.is_blocked(id) && self.node.silent_for(id) < SCANNER_PRESENT)
-            })
-            .collect();
-        if self.node.roles().scanner && !v.contains(&me) {
-            v.push(me);
-        }
-        v
+        scanners(&self.node)
     }
 
     /// Whether every scanner that could take `uid` has declined it.
@@ -510,6 +526,24 @@ impl Arbiter {
 /// A scanner silent for longer than this no longer counts as someone who
 /// could still take a declined job.
 const SCANNER_PRESENT: Duration = Duration::from_secs(300);
+
+/// Scanners that could still take a job: members with the scanner role
+/// that this node does not block and has heard from recently (or has not
+/// had the chance to hear from yet), this node included.
+pub fn scanners(node: &Node) -> Vec<NodeId> {
+    let me = node.id();
+    let mut v: Vec<NodeId> = node
+        .members()
+        .values()
+        .filter(|m| m.roles.iter().any(|r| r == "scanner"))
+        .map(|m| m.id)
+        .filter(|id| *id == me || (!node.is_blocked(id) && node.silent_for(id) < SCANNER_PRESENT))
+        .collect();
+    if node.roles().scanner && !v.contains(&me) {
+        v.push(me);
+    }
+    v
+}
 
 /// Heartbeats this recent count a scanner as alive for takeover decisions.
 pub(crate) const LIVE_WINDOW: Duration = Duration::from_secs(45);
@@ -728,6 +762,51 @@ mod tests {
         foreign_job(&store, ip.id, 2, "2000-01-01 00:00:00").await;
         assert!(arbiter.next_job(node.id()).await.unwrap().is_none());
         assert_eq!(status(&store, &ours).await, "superseded");
+    }
+
+    /// A level a scanner sits out is passed over for the next one down,
+    /// unless its job has waited long enough.
+    #[tokio::test]
+    async fn sat_out_levels_are_skipped_until_the_job_has_waited() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        let rec = Recorder::Cluster(node.clone());
+        for (i, level) in [(1u8, 4), (2, 2)] {
+            let ip = store
+                .upsert_ip(format!("203.0.113.{i}").parse().unwrap())
+                .await
+                .unwrap();
+            rec.enqueue_scan(ip.id, level, 24).await.unwrap();
+        }
+        let scanner = Identity::generate().unwrap().id;
+        let g = arbiter
+            .next_job_skipping(scanner, vec![], &[4])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.level, 2);
+        assert!(
+            arbiter
+                .next_job_skipping(scanner, vec![], &[4])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Waited past the override: anyone takes it.
+        sqlx::query(
+            "UPDATE scan_jobs SET queued_at = datetime('now', '-31 minutes') WHERE level = 4",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let g = arbiter
+            .next_job_skipping(scanner, vec![], &[4])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.level, 4);
+        // A lone scanner sits nothing out.
+        assert!(arbiter.skipped_levels(scanner).await.unwrap().is_empty());
     }
 
     /// Jobs a scanner handed back must not hide the jobs behind them.

@@ -5,6 +5,7 @@ pub mod hostkeys;
 pub mod nmap_xml;
 pub mod pace;
 pub mod safety;
+pub mod weight;
 
 use crate::classify::Classifier;
 use crate::cluster::Node;

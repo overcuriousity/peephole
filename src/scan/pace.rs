@@ -19,6 +19,9 @@ pub const DEFAULT_SCAN_SECS: f64 = 180.0;
 const HEADROOM: f64 = 1.25;
 /// Horizon over which a recommendation drains the current backlog.
 const DRAIN_HOURS: f64 = 24.0;
+/// Window over which the queue's actual inflow and outflow are measured
+/// for the drain estimate: recent enough to follow a pace change.
+pub const DRAIN_WINDOW_HOURS: i64 = 6;
 
 /// Per-scan wall-clock limit bounds settable from the admin UI.
 pub const MIN_TIMEOUT: u64 = 60;
@@ -193,6 +196,11 @@ pub struct QueueMetrics {
     /// Failed / timed-out jobs among `completed_24h`.
     pub failed_24h: i64,
     pub timeouts_24h: i64,
+    /// Jobs queued within the last [`DRAIN_WINDOW_HOURS`].
+    pub arrivals_recent: i64,
+    /// Jobs that left the queue for good (done, failed, refused,
+    /// superseded) within the last [`DRAIN_WINDOW_HOURS`].
+    pub left_recent: i64,
     /// Hours the 24h window actually covers (a fresh install has less), >= 1.
     pub observed_hours: f64,
     /// Mean seconds a job held a worker (done, failed or timed out), last 7 days.
@@ -214,9 +222,15 @@ pub struct Recommendation {
     pub own_capacity_per_hour: f64,
     /// Scanners counted in `capacity_per_hour`, this node included.
     pub scanners: usize,
-    /// Positive: the backlog grows by this much per hour.
+    /// Jobs that actually left the queue per hour, measured over
+    /// [`DRAIN_WINDOW_HOURS`].
+    pub throughput_per_hour: f64,
+    /// Positive: the outstanding jobs (queued and running) grew by this
+    /// much per hour over [`DRAIN_WINDOW_HOURS`] (arrivals minus jobs that
+    /// left), measured rather than derived from the paces.
     pub net_growth_per_hour: f64,
-    /// Hours until the backlog is empty at the current pace; None = never.
+    /// Hours until the outstanding jobs are gone if the measured drain
+    /// continues; None = never (not draining).
     pub drain_hours: Option<f64>,
     pub scan_secs: f64,
     pub scan_secs_measured: bool,
@@ -311,8 +325,14 @@ pub fn recommend(m: &QueueMetrics, current: Pace, others: Others) -> Recommendat
     let arrival = m.arrivals_24h as f64 / m.observed_hours.clamp(1.0, 24.0);
     let own = capacity(current, measured);
     let cap_now = own + others.capacity_per_hour;
-    let net = arrival - cap_now;
-    let drain_hours = match m.backlog {
+    // The drain estimate measures the queue rather than modelling it:
+    // what came in and what left over the recent window. Jobs that are
+    // refused, superseded or fail count as leaving, and scanners that sit
+    // idle or are slower than their pace show up as they are.
+    let window = m.observed_hours.clamp(1.0, DRAIN_WINDOW_HOURS as f64);
+    let throughput = m.left_recent as f64 / window;
+    let net = (m.arrivals_recent - m.left_recent) as f64 / window;
+    let drain_hours = match m.backlog + m.running {
         0 => Some(0.0),
         b if net < 0.0 => Some(b as f64 / -net),
         _ => None,
@@ -330,6 +350,7 @@ pub fn recommend(m: &QueueMetrics, current: Pace, others: Others) -> Recommendat
         capacity_per_hour: cap_now,
         own_capacity_per_hour: own,
         scanners: others.scanners + 1,
+        throughput_per_hour: throughput,
         net_growth_per_hour: net,
         drain_hours,
         scan_secs,
@@ -384,7 +405,6 @@ mod tests {
         let r = recommend(&m(0, 240, Some(300.0)), P, o);
         assert_eq!(r.own_capacity_per_hour, 24.0);
         assert_eq!(r.capacity_per_hour, 44.0);
-        assert!(r.net_growth_per_hour < 0.0);
         assert_eq!(r.scanners, 2);
         // target 10 × 1.25 = 12.5 → 13, over two scanners → 7 each,
         // whatever the other one runs at now.
@@ -457,18 +477,43 @@ mod tests {
         assert_eq!(r.pace.max_scans_per_hour, 33); // ceil(12.5 + 20)
         assert_eq!(r.pace.max_workers, 3); // 33 × 300s / 3600 = 2.75
         assert_eq!(r.capacity_per_hour, 24.0); // 2 workers × 12/h
-        assert!(!r.growing());
-        assert_eq!(r.drain_hours, Some(480.0 / 14.0));
         assert!(r.scan_secs_measured);
     }
 
     #[test]
-    fn growing_queue_never_drains() {
+    fn growing_queue_raises_the_pace() {
         let r = recommend(&m(100, 24 * 50, None), P, Others::default());
-        assert!(r.growing());
-        assert_eq!(r.drain_hours, None);
         assert_eq!(r.scan_secs, DEFAULT_SCAN_SECS);
         assert!(r.pace.max_scans_per_hour > 50);
+    }
+
+    /// The drain estimate follows what actually left the queue, not what
+    /// the paces would allow.
+    #[test]
+    fn drain_is_measured_from_the_queue() {
+        let mut q = m(90, 240, Some(300.0));
+        q.running = 10;
+        // 6 h window: 30 in, 90 out → −10/h; 100 outstanding → 10 h.
+        q.arrivals_recent = 30;
+        q.left_recent = 90;
+        let r = recommend(&q, P, Others::default());
+        assert_eq!(r.throughput_per_hour, 15.0);
+        assert_eq!(r.net_growth_per_hour, -10.0);
+        assert!(!r.growing());
+        assert_eq!(r.drain_hours, Some(10.0));
+        // The paces would allow 24/h, but nothing left: it never drains.
+        q.left_recent = 0;
+        let r = recommend(&q, P, Others::default());
+        assert!(r.growing());
+        assert_eq!(r.drain_hours, None);
+        // A young install measures over the hours it has.
+        q.observed_hours = 2.0;
+        q.left_recent = 60;
+        let r = recommend(&q, P, Others::default());
+        assert_eq!(r.net_growth_per_hour, -15.0);
+        // Nothing outstanding: empty, whatever the rates.
+        let r = recommend(&m(0, 0, None), P, Others::default());
+        assert_eq!(r.drain_hours, Some(0.0));
     }
 
     #[test]

@@ -5,6 +5,27 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Added
+
+- Cluster: per-level scanner weights. A scanner that fails a scan level
+  (hard failures, timeouts aside) more often than the best live scanner
+  over the last 24 h (among scanners with at least 5 scans there) sits
+  that level out for 10-minute stretches, a share of 1 − its relative
+  success rate (weight at least 0.1), so better scanners get those jobs.
+  It recovers as failures age out; jobs waiting over 30 min go to any
+  scanner. The Cluster page's scanner table shows the weights.
+
+### Changed
+
+- Scan queue: throughput, net growth and the drain estimate are measured
+  from the queue (jobs queued vs. jobs that left it over the last 6 h)
+  instead of derived from the scanners' paces. The recommended pace is
+  sized as before.
+
+### Fixed
+
+- Tables were cut off on narrow screens instead of scrolling sideways.
+
 ## [0.3.0] - 2026-10-04
 
 ### Added
