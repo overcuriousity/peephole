@@ -104,7 +104,7 @@
             attestationObject: bufToB64u(ccred.response.attestationObject), clientDataJSON: bufToB64u(ccred.response.clientDataJSON) },
             extensions: ccred.getClientExtensionResults ? ccred.getClientExtensionResults() : {} } };
           var fin2 = await fetch("/enroll/finish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(cbody) });
-          if (fin2.ok) location.href = "/admin/keys"; else msg.textContent = "enrollment failed (" + fin2.status + ")";
+          if (fin2.ok) location.href = "/admin/system/keys"; else msg.textContent = "enrollment failed (" + fin2.status + ")";
         }
       } catch (e) { msg.textContent = e.message || String(e); }
     });

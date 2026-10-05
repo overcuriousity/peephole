@@ -1,7 +1,8 @@
 {% extends "layout.html" %}
 {% block title %}peephole — export{% endblock %}
 {% block content %}
-{% let sub = "export" %}{% include "_admin_nav.html" %}
+{% let sub = "system" %}{% include "_admin_nav.html" %}
+{% let subtab = "export" %}{% let tabs = crate::admin::views::SYSTEM_TABS %}{% include "_subtabs.html" %}
 <div class="page-head"><div><h1>Export</h1><p class="muted">Every request with all that is known about it. Claim e-mails are never exported. Shell: <code>peephole export</code> · <a href="https://github.com/overcuriousity/peephole/blob/master/docs/dataset.md">columns</a></p></div></div>
 <form class="filters card" method="get" action="/admin/export/download">
   <label>Format <select name="format"><option value="parquet">Parquet (typed)</option><option value="csv">CSV (Timesketch)</option><option value="jsonl">Timesketch JSONL</option></select></label>

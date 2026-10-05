@@ -24,6 +24,7 @@
       {% if chrome.authed %}<a href="/admin"{% if chrome.active == "admin" %} aria-current="page"{% endif %}>Admin</a>{% endif %}
     </nav>
     <div class="topbar-actions">
+      {% if chrome.authed %}<form class="topbar-search" method="get" action="/admin/lookup" role="search"><input class="mono" name="ip" placeholder="Look up IP" aria-label="Look up an IP" size="15" required></form>{% endif %}
       <button class="btn btn-ghost btn-sm" type="button" data-theme-toggle aria-label="Toggle theme"><span data-theme-label>Auto</span></button>
       {% if chrome.authed %}
         <form method="post" action="/logout"><button class="btn btn-ghost btn-sm" type="submit">Log out</button></form>

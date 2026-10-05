@@ -528,9 +528,11 @@ async fn admin_routes_redirect_without_session() {
         "/admin/scans/1/xml",
         "/admin/fingerprints",
         "/admin/inbox",
-        "/admin/export",
+        "/admin/system",
+        "/admin/system/settings",
+        "/admin/system/export",
         "/admin/export/download?format=csv",
-        "/admin/keys",
+        "/admin/system/keys",
         // Request rows identify individual clients, so request search is
         // admin-only.
         "/requests",
@@ -892,9 +894,19 @@ async fn admin_pages_and_deletes_with_session() {
     );
     let html = get("/admin/inbox").await.unwrap().text().await.unwrap();
     assert!(html.contains("lost@example.org"));
-    let html = get("/admin/keys").await.unwrap().text().await.unwrap();
+    let html = get("/admin/system/keys")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(html.contains("test-key") && html.contains("/enroll"));
-    let html = get("/admin/export").await.unwrap().text().await.unwrap();
+    let html = get("/admin/system/export")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(html.contains("/admin/export/download"));
     for html_path in [
         "/admin",
@@ -904,7 +916,9 @@ async fn admin_pages_and_deletes_with_session() {
         "/admin/fingerprints",
         "/admin/analytics",
         "/ip/203.0.113.78",
-        "/admin/keys",
+        "/admin/system/keys",
+        "/admin/system",
+        "/admin/system/settings",
     ] {
         let html = get(html_path).await.unwrap().text().await.unwrap();
         assert!(
@@ -2720,4 +2734,53 @@ async fn admin_nav_groups_pages_under_seven_tabs() {
     assert_eq!(current(&sys).as_deref(), Some("System"));
     assert!(sys.contains("Tor exit list") && sys.contains("MaxMind GeoLite2"));
     assert!(sys.contains("built in"), "this binary's rules");
+}
+
+/// Moved admin pages answer 308 to their new place, without a session
+/// (the redirect reveals nothing).
+#[tokio::test]
+async fn moved_admin_pages_redirect_permanently() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let base = spawn_admin_with(store, dir.path()).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    for (from, to) in [
+        ("/admin/keys", "/admin/system/keys"),
+        ("/admin/export", "/admin/system/export"),
+    ] {
+        let r = client.get(format!("{base}{from}")).send().await.unwrap();
+        assert_eq!(r.status(), 308, "{from}");
+        assert_eq!(r.headers()["location"], to, "{from}");
+    }
+}
+
+/// Signed in, every page has the Lookup box; anonymous visitors don't.
+#[tokio::test]
+async fn lookup_box_only_for_admins() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store, cfg).await;
+    for p in [
+        "/admin",
+        "/ips",
+        "/admin/system/settings",
+        "/admin/system/keys",
+        "/admin/system/export",
+    ] {
+        let r = client.get(format!("{base}{p}")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{p}");
+        let html = r.text().await.unwrap();
+        assert!(html.contains("action=\"/admin/lookup\""), "{p}");
+    }
+    let anon = reqwest::Client::new()
+        .get(format!("{base}/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!anon.contains("action=\"/admin/lookup\""));
 }

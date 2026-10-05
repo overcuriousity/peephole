@@ -2896,7 +2896,7 @@ async fn admin_configures_another_node_with_its_key() {
 
     // This node's own settings from its own page, which carries the version
     // it showed.
-    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    let page = text(&admin, format!("{base}/admin/system/settings")).await;
     let shown = na.settings.snapshot().version;
     assert!(
         page.contains(&format!("name=\"base_version\" value=\"{shown}\"")),

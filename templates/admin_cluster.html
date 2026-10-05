@@ -8,9 +8,7 @@
 <div class="stack">
 <section class="card"><h2>Standalone</h2>
   <p>To join, add a <code>[cluster]</code> section to <code>config.toml</code> and restart.</p></section>
-<section class="card"><h2>Runtime settings</h2>
-{% include "_node_settings.html" %}
-<p class="muted">Scan pace: <a href="/admin/queue">Queue</a>.</p></section>
+<section class="card"><h2>Settings</h2><p class="muted">Cooldown and roles: <a href="/admin/system/settings">System › Settings</a>. Scan pace: <a href="/admin/scans#pace">Scans</a>.</p></section>
 </div>
 {% when Some(me) %}
 <div class="stack">
@@ -29,16 +27,11 @@
     <dt>Rules</dt><dd><span class="mono" title="Fingerprint of the rules built into this binary: {{ rules }}">{{ rules_short }}</span> <span class="muted small">built in</span></dd>
     <dt>History</dt><dd>{{ me.history }}</dd>
   </dl>
-  {% include "_node_settings.html" %}
   {% if remote_config %}
   <h3>Config key</h3>
   <p class="muted">Lets its holders change this node's pace, cooldown and roles. Rotate to revoke.</p>
   {% if let Some(k) = config_key %}<details><summary>Show key</summary><pre class="panel mono break" data-copy>{{ k }}</pre></details>{% endif %}
   <form method="post" action="/admin/cluster/config-key/rotate"><button class="btn btn-sm btn-danger" type="submit">Rotate key</button></form>
-  {% if !audit.is_empty() %}
-  <div class="table-wrap"><table><thead><tr><th>When (UTC)</th><th>By</th><th>Change</th></tr></thead>
-    <tbody>{% for a in audit %}<tr><td class="ts">{{ a.at }}</td><td>{{ a.by }}</td><td class="mono">{{ a.changes }}</td></tr>{% endfor %}</tbody></table></div>
-  {% endif %}
   {% else %}
   <p class="muted">Remote configuration: <b>locked</b> (<code>remote_config = true</code> opens it).</p>
   {% endif %}

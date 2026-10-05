@@ -20,7 +20,6 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
@@ -43,10 +42,6 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/canaries", get(canaries))
         .route("/admin/inbox", get(inbox))
         .route("/admin/claims/{id}/delete", post(claim_delete))
-        .route("/admin/export", get(export_page))
-        .route("/admin/export/download", get(export_download))
-        .route("/admin/keys", get(keys))
-        .route("/admin/keys/delete", post(key_delete))
 }
 
 /// Job states the queue filter offers.
@@ -833,127 +828,6 @@ async fn claim_delete(
         return Err(AppError::NotFound);
     }
     Ok(redirect_with_notice("/admin/inbox", &deleted_msg(out)))
-}
-
-#[derive(Template)]
-#[template(path = "admin_export.html")]
-struct ExportPage {
-    chrome: Chrome,
-}
-
-async fn export_page(_u: SessionUser) -> AppResult<Html<String>> {
-    render(&ExportPage { chrome: chrome() })
-}
-
-async fn export_download(
-    _u: SessionUser,
-    State(state): State<Arc<AdminState>>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Response {
-    // The form submits blank fields; blank means "no filter".
-    let field = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
-    let filter = crate::export::ExportFilter {
-        from: field("from").map(|v| crate::store::browse::ts_bound(v, false)),
-        to: field("to").map(|v| crate::store::browse::ts_bound(v, true)),
-        ip: field("ip").map(crate::store::browse::canonical_ip),
-        label: field("label").map(str::to_string),
-        min_severity: field("min_severity").and_then(|s| s.parse().ok()),
-    };
-    use crate::export::Format;
-    let (format, ext, mime) = match q.get("format").map(String::as_str) {
-        Some("csv") => (Format::Csv, "csv", "text/csv"),
-        Some("jsonl") => (Format::Jsonl, "jsonl", "application/x-ndjson"),
-        Some("parquet") => (Format::Parquet, "parquet", "application/octet-stream"),
-        _ => return (StatusCode::BAD_REQUEST, "format must be csv|jsonl|parquet").into_response(),
-    };
-    let mode = match q.get("mode").map(String::as_str) {
-        None | Some("" | "full") => crate::export::Mode::Full,
-        Some("redistributable") => crate::export::Mode::Redistributable,
-        _ => return (StatusCode::BAD_REQUEST, "mode must be full|redistributable").into_response(),
-    };
-    let names = match state.recorder.node() {
-        Some(node) => match crate::cluster::members::all(&node.store).await {
-            Ok(m) => m.into_iter().map(|m| (m.id.0.to_vec(), m.name)).collect(),
-            Err(e) => {
-                tracing::warn!(?e, "export: reading member names");
-                HashMap::new()
-            }
-        },
-        None => HashMap::new(),
-    };
-    // Streamed, uncapped: rows are read and written page by page.
-    let body = axum::body::Body::from_stream(crate::export::stream_requests(
-        state.store.clone(),
-        filter,
-        format,
-        crate::export::ExportOptions { mode, names },
-    ));
-    (
-        [
-            (header::CONTENT_TYPE, mime.to_string()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"peephole-export.{ext}\""),
-            ),
-        ],
-        body,
-    )
-        .into_response()
-}
-
-struct KeyRow {
-    id: String,
-    short: String,
-    label: String,
-    created: String,
-}
-
-#[derive(Template)]
-#[template(path = "admin_keys.html")]
-struct KeysPage {
-    chrome: Chrome,
-    keys: Vec<KeyRow>,
-    can_delete: bool,
-}
-
-async fn keys(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
-    let keys: Vec<KeyRow> = st
-        .store
-        .list_credential_labels()
-        .await?
-        .into_iter()
-        .map(|(id, label, created)| KeyRow {
-            short: id.chars().take(16).collect(),
-            id,
-            label,
-            created,
-        })
-        .collect();
-    render(&KeysPage {
-        chrome: chrome(),
-        can_delete: keys.len() > 1,
-        keys,
-    })
-}
-
-#[derive(serde::Deserialize)]
-pub struct KeyDeleteForm {
-    cred_id: String,
-}
-
-async fn key_delete(
-    _u: SessionUser,
-    State(state): State<Arc<AdminState>>,
-    Form(f): Form<KeyDeleteForm>,
-) -> Redirect {
-    // SQLite hex() is uppercase; normalize before decoding.
-    if let Ok(bytes) = data_encoding::HEXLOWER.decode(f.cred_id.to_lowercase().as_bytes()) {
-        // Never delete the last remaining key (would lock the admin out). The
-        // check and delete are one atomic statement, so two concurrent deletes
-        // cannot both pass and leave zero keys.
-        let _ = state.store.delete_credential_keeping_last(&bytes).await;
-    }
-    Redirect::to("/admin/keys")
 }
 
 /// Parsed bulk form: checked row keys, or "everything matching the filter".

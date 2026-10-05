@@ -221,9 +221,6 @@ struct ClusterPage {
     /// This node's config key, shown only when remote configuration is on.
     config_key: Option<String>,
     remote_config: bool,
-    /// This node's runtime settings and why a role cannot be switched on.
-    settings: SettingsView,
-    audit: Vec<AuditView>,
     /// Members whose older history no reachable peer can give this node.
     unserved: Option<String>,
     contributions: Vec<ContribView>,
@@ -246,7 +243,7 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    fn of(st: &AdminState) -> Self {
+    pub(crate) fn of(st: &AdminState) -> Self {
         let s = st.settings.snapshot();
         let p = st.settings.prereqs();
         Self {
@@ -267,6 +264,32 @@ pub struct AuditView {
     pub at: String,
     pub by: String,
     pub changes: String,
+}
+
+/// Settings changes, newest first, with the changing node's name.
+pub(crate) async fn audit_views(st: &AdminState) -> AppResult<Vec<AuditView>> {
+    let names: std::collections::HashMap<NodeId, String> = match st.recorder.node() {
+        Some(node) => members::all(&node.store)
+            .await?
+            .into_iter()
+            .map(|m| (m.id, m.name))
+            .collect(),
+        None => Default::default(),
+    };
+    Ok(st
+        .settings
+        .audit(20)
+        .await?
+        .into_iter()
+        .map(|a| AuditView {
+            at: a.at,
+            by: match a.by {
+                Some(id) => names.get(&id).cloned().unwrap_or_else(|| id.short()),
+                None => "this node".into(),
+            },
+            changes: a.changes,
+        })
+        .collect())
 }
 
 /// The outcome shown on a remote node's page, which renders in place.
@@ -698,33 +721,12 @@ async fn render_page(st: &AdminState, invite: Option<String>) -> AppResult<Html<
             invites: vec![],
             config_key: None,
             remote_config: false,
-            settings: SettingsView::of(st),
-            audit: vec![],
             unserved: None,
             contributions: vec![],
             rules: builtin_rules(),
             rules_short: builtin_rules().chars().take(SHORT_HASH).collect(),
         });
     };
-    let names: std::collections::HashMap<NodeId, String> = members::all(&node.store)
-        .await?
-        .into_iter()
-        .map(|m| (m.id, m.name))
-        .collect();
-    let audit = st
-        .settings
-        .audit(20)
-        .await?
-        .into_iter()
-        .map(|a| AuditView {
-            at: a.at,
-            by: match a.by {
-                Some(id) => names.get(&id).cloned().unwrap_or_else(|| id.short()),
-                None => "this node".into(),
-            },
-            changes: a.changes,
-        })
-        .collect();
     let config_key = if node.cfg.remote_config {
         Some(
             crate::cluster::confkey::ensure(&node.store, node.id())
@@ -745,8 +747,6 @@ async fn render_page(st: &AdminState, invite: Option<String>) -> AppResult<Html<
         invites: invites(node).await?,
         config_key,
         remote_config: node.cfg.remote_config,
-        settings: SettingsView::of(st),
-        audit,
         unserved: unserved(node).await?,
         contributions: contributions(node).await?,
         rules: builtin_rules(),
@@ -763,15 +763,19 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
     render_page(&st, None).await
 }
 
-/// Back to the cluster page with a one-shot notice or error (in a cookie,
-/// see [`redirect_with_notice`]).
-fn back(notice: Option<String>, error: Option<String>) -> Response {
-    const TO: &str = "/admin/cluster";
+/// Back to `to` with a one-shot notice or error (in a cookie, see
+/// [`redirect_with_notice`]).
+pub(crate) fn back_to(to: &str, notice: Option<String>, error: Option<String>) -> Response {
     match (error, notice) {
-        (Some(e), _) => redirect_with_error(TO, &e),
-        (None, Some(n)) => redirect_with_notice(TO, &n),
-        (None, None) => Redirect::to(TO).into_response(),
+        (Some(e), _) => redirect_with_error(to, &e),
+        (None, Some(n)) => redirect_with_notice(to, &n),
+        (None, None) => Redirect::to(to).into_response(),
     }
+}
+
+/// Back to the Members page.
+fn back(notice: Option<String>, error: Option<String>) -> Response {
+    back_to("/admin/cluster", notice, error)
 }
 
 #[derive(serde::Deserialize)]
@@ -989,6 +993,9 @@ impl SettingsForm {
     }
 }
 
+/// Where this node's own settings form lives.
+const SETTINGS: &str = "/admin/system/settings";
+
 async fn set_own(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
@@ -996,22 +1003,24 @@ async fn set_own(
 ) -> AppResult<Response> {
     let changes = match f.changes() {
         Ok(c) => c,
-        Err(e) => return Ok(back(None, Some(e))),
+        Err(e) => return Ok(back_to(SETTINGS, None, Some(e))),
     };
     // The form sends every role, so it must not overwrite a change made
     // elsewhere (CLI, a config key holder) after the page was loaded.
     let Some(base) = f.base_version else {
-        return Ok(back(
+        return Ok(back_to(
+            SETTINGS,
             None,
             Some("Settings not saved: reload the page and try again".into()),
         ));
     };
     Ok(match st.settings.apply_at(base, &changes, None).await? {
-        Ok(_) => back(
+        Ok(_) => back_to(
+            SETTINGS,
             Some("Settings saved. Roles switch within seconds.".into()),
             None,
         ),
-        Err(e) => back(None, Some(format!("Settings not saved: {e}"))),
+        Err(e) => back_to(SETTINGS, None, Some(format!("Settings not saved: {e}"))),
     })
 }
 
