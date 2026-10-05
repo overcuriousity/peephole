@@ -405,17 +405,17 @@ async fn wall_shows_aggregates_not_payloads() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let html = resp.text().await.unwrap();
-    // The IP is named (wall of shame) but no request rows are shown: the
-    // public wall has no "Recent activity" table, so request paths stay out.
+    // The IP is named (wall of shame) and "Recent requests" lists paths,
+    // but never bodies, headers or query strings.
     assert!(html.contains("203.0.113.99"));
     assert!(html.contains("href=\"/ip/203.0.113.99\""));
-    assert!(
-        !html.contains("/wp-login.php"),
-        "public wall must not list request paths"
-    );
+    assert!(html.contains("Recent requests"));
+    assert!(html.contains("/wp-login.php"));
+    assert!(!html.contains("SECRET-PAYLOAD-MARKER"));
+    assert!(!html.contains("HEADER-MARKER"));
     assert!(
         !html.contains("Recent activity"),
-        "public wall has no recent-activity table"
+        "public wall has no live recent-activity card"
     );
     assert!(html.contains("Last 7 days"));
     assert!(html.contains("data-range=\"7d\""));
@@ -2179,8 +2179,8 @@ async fn query_strings_are_admin_only() {
         .unwrap();
     let base = spawn_admin_with(store.clone(), dir.path()).await;
     let get = |url: String| async move { reqwest::get(url).await.unwrap().text().await.unwrap() };
-    // No public surface shows the query string — nor, now, request paths or
-    // the per-request rows that carried them.
+    // No public surface shows the query string. The wall's "Recent
+    // requests" (and its JSON) list the path alone; the IP pages do not.
     for url in [
         format!("{base}/ip/203.0.113.200"),
         format!("{base}/ips"),
@@ -2189,8 +2189,11 @@ async fn query_strings_are_admin_only() {
     ] {
         let body = get(url.clone()).await;
         assert!(!body.contains("SECRET"), "{url} leaks the query string");
+        assert!(!body.contains("api_key"), "{url} leaks the query string");
+    }
+    for url in [format!("{base}/ip/203.0.113.200"), format!("{base}/ips")] {
         assert!(
-            !body.contains("/api/v1/usres"),
+            !get(url.clone()).await.contains("/api/v1/usres"),
             "{url} leaks the request path"
         );
     }

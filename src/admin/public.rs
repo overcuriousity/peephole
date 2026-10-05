@@ -70,8 +70,11 @@ struct WallPage {
     asn_max: i64,
     port_max: i64,
     family_max: i64,
-    /// The newest request id the admin's recent table shows (live cursor).
-    recent_max_id: i64,
+    /// "Recent requests": the newest `[public] recent_rows` of `stats.recent`.
+    recent: Vec<crate::store::stats::RecentRequest>,
+    /// Shortest and longest publication delay, in minutes.
+    delay_min: u32,
+    delay_max: u32,
 }
 
 pub struct OwaspTile {
@@ -135,6 +138,12 @@ async fn wall(
     let stale = intel_stale(&stats.intel);
     let prev = stats.previous.as_ref();
     let max = |v: &mut dyn Iterator<Item = i64>| v.max().unwrap_or(0);
+    let recent: Vec<_> = stats
+        .recent
+        .iter()
+        .take(state.cfg.public.recent_rows)
+        .cloned()
+        .collect();
     render(&WallPage {
         chrome: Chrome::new(authed, "wall"),
         range,
@@ -148,7 +157,9 @@ async fn wall(
         asn_max: max(&mut stats.top_asns.iter().map(|n| n.count)),
         port_max: max(&mut stats.ports.iter().map(|p| p.ips)),
         family_max: max(&mut stats.families.iter().map(|n| n.count)),
-        recent_max_id: max(&mut stats.recent.iter().map(|r| r.id)),
+        recent,
+        delay_min: state.cfg.public.delay_minutes,
+        delay_max: state.cfg.public.delay_minutes + state.cfg.public.jitter_minutes,
         stats,
         stale,
         labels: labels_shown(&state, authed),
@@ -914,6 +925,149 @@ show_labels = {show_labels}
             .await
             .unwrap();
         (Arc::new(AdminState::public_only(store, cfg)), dir)
+    }
+
+    async fn admin_cookie(st: &AdminState) -> String {
+        let token = st.store.create_session().await.unwrap();
+        format!(
+            "{}={token}",
+            crate::admin::auth::session_cookie_name(&st.cfg)
+        )
+    }
+
+    async fn get_with(app: &axum::Router, path: &str, cookie: Option<&str>) -> (u16, String) {
+        let mut req = axum::http::Request::get(path);
+        if let Some(c) = cookie {
+            req = req.header(axum::http::header::COOKIE, c);
+        }
+        let r = app
+            .clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// `state(true)` plus, with a 5 min delay, a pending request from a
+    /// new IP with a long path and a query string.
+    async fn delayed_state() -> (Arc<AdminState>, tempfile::TempDir) {
+        let (st, dir) = state(true).await;
+        st.store
+            .set_publish_delay(
+                std::time::Duration::from_secs(300),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let ip = st
+            .store
+            .upsert_ip("198.51.100.77".parse().unwrap())
+            .await
+            .unwrap();
+        st.store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/pending-path".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                severity: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        (st, dir)
+    }
+
+    #[tokio::test]
+    async fn anonymous_wall_is_static_and_lists_released_requests() {
+        let (st, _d) = delayed_state().await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, wall) = get_with(&app, "/", None).await;
+        for live in [
+            "data-refresh",
+            "data-ago",
+            "pulse-dot",
+            "data-recent",
+            "data-live",
+        ] {
+            assert!(!wall.contains(live), "anonymous wall carries {live}");
+        }
+        assert!(wall.contains("Recent requests"));
+        assert!(wall.contains("Data delayed by about 5–10 min"));
+        assert!(
+            wall.contains(r#"<td class="path">/x</td>"#),
+            "released request listed"
+        );
+        assert!(!wall.contains("/pending-path"), "pending request hidden");
+        assert!(!wall.contains("198.51.100.77"));
+    }
+
+    #[tokio::test]
+    async fn signed_in_wall_shows_pending_rows() {
+        let (st, _d) = delayed_state().await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, wall) = get_with(&app, "/", Some(&cookie)).await;
+        assert!(wall.contains("/pending-path"));
+        assert!(wall.contains("Live view (signed in)"));
+        assert!(
+            !wall.contains("data-recent"),
+            "the live feed lives on /admin now"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_only_ip_is_a_404_for_the_public() {
+        let (st, _d) = delayed_state().await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        assert_eq!(get_with(&app, "/ip/198.51.100.77", None).await.0, 404);
+        assert_eq!(
+            get_with(&app, "/ip/198.51.100.77", Some(&cookie)).await.0,
+            200
+        );
+        let (_, ips) = get_with(&app, "/ips", None).await;
+        assert!(!ips.contains("198.51.100.77"));
+        assert!(!ips.contains("data-ago"));
+        let (_, ip) = get_with(&app, "/ip/203.0.113.9", None).await;
+        assert!(!ip.contains("data-ago"));
+    }
+
+    #[tokio::test]
+    async fn recent_requests_hide_queries_cut_paths_and_respect_labels() {
+        let (st, _d) = state(false).await;
+        let ip = st
+            .store
+            .upsert_ip("203.0.113.9".parse().unwrap())
+            .await
+            .unwrap();
+        st.store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: format!("/{}", "z".repeat(120)),
+                query: Some("token=hunter2".into()),
+                headers_json: "[]".into(),
+                labels_json: r#"["secret-category"]"#.into(),
+                severity: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let app = crate::admin::full_router(st.clone());
+        let (_, wall) = get_with(&app, "/", None).await;
+        assert!(!wall.contains("hunter2"));
+        assert!(wall.contains(&format!("/{}…", "z".repeat(78))));
+        assert!(!wall.contains(&"z".repeat(80)));
+        assert!(
+            !wall.contains("secret-category"),
+            "labels hidden with show_labels = false"
+        );
     }
 
     #[tokio::test]

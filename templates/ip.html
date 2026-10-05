@@ -8,8 +8,8 @@
     <div class="meta">
       {% if let Some(c) = ov.ip.country %}<a href="/ips?country={{ c }}">{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}</a>{% else %}<span class="muted">country unknown</span>{% endif %}
       {% if let Some(a) = ov.ip.asn %}<a href="/ips?asn={{ a }}">{{ ov.ip.asn_org.as_deref().unwrap_or("") }} <span class="mono muted">AS{{ a }}</span></a>{% else %}<span class="muted">ASN unknown</span>{% endif %}
-      <span>first seen <time datetime="{{ crate::admin::views::stamp(ov.ip.first_seen) }}" data-ago>{{ crate::admin::views::ago(ov.ip.first_seen) }}</time> ago</span>
-      <span>last seen <time datetime="{{ crate::admin::views::stamp(ov.ip.last_seen) }}" data-ago>{{ crate::admin::views::ago(ov.ip.last_seen) }}</time> ago</span>
+      <span>first seen <span class="mono">{{ crate::admin::views::minute(ov.ip.first_seen) }}</span> UTC</span>
+      <span>last seen <span class="mono">{{ crate::admin::views::minute(ov.ip.last_seen) }}</span> UTC</span>
     </div>
   </div>
   <div class="tiles">

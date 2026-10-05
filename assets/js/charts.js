@@ -432,34 +432,6 @@
       mapData = m;
       map(document.getElementById("map"), document.getElementById("map-legend"), m);
     }).catch(function () {});
-
-    // Soft refresh: while the tab is visible, re-read the page and the
-    // aggregates once per cache lifetime and swap the server-rendered
-    // regions in place. No new endpoint; anonymous reads hit the cache.
-    var every = Math.max(15, parseInt(wall.getAttribute("data-refresh") || "60", 10)) * 1000, updated = document.querySelector("[data-updated]");
-    function refresh() {
-      if (document.hidden) return;
-      fetch(location.pathname + location.search, { headers: { accept: "text/html" }, credentials: "same-origin" })
-        .then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); })
-        .then(function (html) {
-          var doc = new DOMParser().parseFromString(html, "text/html");
-          document.querySelectorAll("[data-region]").forEach(function (old) {
-            var fresh = doc.querySelector('[data-region="' + old.getAttribute("data-region") + '"]');
-            if (fresh) old.replaceWith(document.importNode(fresh, true));
-          });
-          if (window.peephole.ago) window.peephole.ago();
-          return load();
-        })
-        .then(function () {
-          if (mapData) return fetch("/api/map?range=" + range).then(function (r) { return r.json(); }).then(function (m) { if (map.update) map.update(m); });
-        })
-        .then(function () {
-          if (updated) updated.textContent = "updated " + new Date().toISOString().slice(11, 19) + " UTC";
-        })
-        .catch(function () {});
-    }
-    setInterval(refresh, every);
-    document.addEventListener("visibilitychange", function () { if (!document.hidden) refresh(); });
   }
 
   window.peephole = window.peephole || {};

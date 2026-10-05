@@ -124,6 +124,28 @@ pub fn ago<S: Stamp>(ts: S) -> String {
     }
 }
 
+/// `YYYY-MM-DD HH:MM` (UTC) for static times on public pages; "" when
+/// unparsable.
+pub fn minute<S: Stamp>(ts: S) -> String {
+    ts.utc()
+        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// Longest path "Recent requests" shows, "…" included.
+const PUBLIC_PATH_MAX: usize = 80;
+
+/// A request path for the public "Recent requests": whole up to
+/// [`PUBLIC_PATH_MAX`] characters, else cut to fit with a trailing "…".
+pub fn public_path<S: AsRef<str>>(path: S) -> String {
+    let p = path.as_ref();
+    if p.chars().count() <= PUBLIC_PATH_MAX {
+        return p.to_string();
+    }
+    let cut: String = p.chars().take(PUBLIC_PATH_MAX - 1).collect();
+    format!("{cut}…")
+}
+
 /// Change against a previous value as "+23%" / "−5%" and a direction
 /// ("up" | "down" | "flat"); `None` without a previous value to compare.
 pub fn delta(cur: i64, prev: Option<i64>) -> Option<(String, &'static str)> {
@@ -215,6 +237,19 @@ pub fn duration<S: SevValue>(secs: S) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minute_and_public_path() {
+        assert_eq!(minute("2026-10-05 12:34:56"), "2026-10-05 12:34");
+        assert_eq!(minute("garbage"), "");
+        assert_eq!(public_path("/short"), "/short");
+        let long = format!("/{}", "a".repeat(100));
+        let cut = public_path(&long);
+        assert_eq!(cut.chars().count(), 80);
+        assert!(cut.ends_with('…'));
+        let exact = format!("/{}", "é".repeat(79));
+        assert_eq!(public_path(&exact), exact, "80 characters stay whole");
+    }
 
     #[test]
     fn durations_read_like_people_say_them() {

@@ -2,17 +2,17 @@
 {% block title %}peephole — wall of shame{% endblock %}
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
-<div class="page-head wall-head" data-range="{{ range.key() }}" id="wall" data-refresh="{{ crate::store::stats::ttl(range.clone()).as_secs() }}">
+<div class="page-head wall-head" data-range="{{ range.key() }}" id="wall">
   <div>
     <h1>Wall of shame</h1>
     <p class="muted">{{ range.label() }}</p>
-    <p class="pulse" data-region="pulse">{% if let Some(t) = stats.last_request %}<span class="pulse-dot" aria-hidden="true"></span><span>last hit <time datetime="{{ t }}" data-ago>{{ crate::admin::views::ago(t) }}</time> ago</span>{% else %}<span class="muted">nothing recorded yet</span>{% endif %}<span class="muted" data-updated></span></p>
+    <p class="muted">{% if chrome.authed %}Live view (signed in); the public sees this {{ delay_min }}–{{ delay_max }} min later.{% else %}Data delayed by about {{ delay_min }}–{{ delay_max }} min.{% endif %}</p>
   </div>
   {% let base = "/" %}{% include "_range.html" %}
 </div>
 {% if stale %}<div class="banner banner-warning">Tor exit list or GeoIP data missing or older than 48 h.</div>{% endif %}
 
-<div class="tiles kpis" data-region="kpis">
+<div class="tiles kpis">
   <div class="tile tile-hero">
     <span class="label">Requests</span>
     <div class="value">{{ crate::admin::views::thousands(stats.total_requests) }}</div>
@@ -42,7 +42,7 @@
       <div class="legend ramp-legend" id="heatmap-legend" aria-hidden="true"></div>
     </section>
     {% if labels %}
-    <section class="card" data-region="families">
+    <section class="card">
       <div class="card-head"><h2>What they were after</h2></div>
       {% if stats.families.is_empty() %}<p class="empty">None.</p>{% else %}
       <ul class="families">
@@ -84,7 +84,7 @@
   </div>
 
   {% if labels %}
-  <section class="card" data-region="owasp">
+  <section class="card">
     <div class="card-head"><h2>OWASP map</h2><span class="muted">requests</span></div>
     <div class="owasp-grid">
       {% for t in owasp %}
@@ -105,7 +105,7 @@
         <div class="map" id="map" data-src="/assets/world.svg?v={{ chrome.stamp }}"></div>
         <div class="legend ramp-legend" id="map-legend"></div>
       </div>
-      <ol class="rank-list" id="map-rank" data-region="map-rank">
+      <ol class="rank-list" id="map-rank">
         {% for n in stats.top_countries.iter().take(10) %}
         <li data-country="{{ n.name }}"><a href="/ips?country={{ n.name }}"><span class="flag">{{ crate::admin::countries::flag(n.name.as_str()) }}</span><span class="rank-name">{{ crate::admin::countries::country_name(n.name.as_str()) }}</span><span class="num">{{ crate::admin::views::thousands(n.count) }}</span></a></li>
         {% endfor %}
@@ -114,7 +114,7 @@
   </section>
 
   <div class="grid-2">
-    <section class="card" data-region="top-ips">
+    <section class="card">
       <div class="card-head"><h2>Most wanted</h2><a href="/ips">all IPs →</a></div>
       <ol class="wanted">
         {% for t in stats.top_ips.iter().take(10) %}
@@ -132,7 +132,7 @@
       </ol>
       {% if stats.top_ips.is_empty() %}<p class="empty">Nothing yet.</p>{% endif %}
     </section>
-    <section class="card" data-region="top-asns">
+    <section class="card">
       <div class="card-head"><h2>Top networks</h2><span class="muted">unique IPs</span></div>
       <ol class="ranked">
         {% for n in stats.top_asns.iter().take(10) %}
@@ -143,7 +143,7 @@
     </section>
   </div>
 
-  <section class="card" data-region="ports">
+  <section class="card">
     <div class="card-head"><h2>What the scanners run</h2><span class="muted">open on {{ stats.scanned_ips }} scanned sources · ports on ≥ {{ crate::store::stats::PORT_MIN_IPS }} IPs only</span></div>
     {% if stats.ports.is_empty() %}<p class="empty">Not enough scans yet.</p>{% else %}
     <ol class="ports-list">
@@ -159,27 +159,25 @@
     {% endif %}
   </section>
 
-  {% if chrome.authed %}
   <section class="card">
-    <div class="card-head"><h2>Recent activity</h2><span class="row"><span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span><a href="/requests">search all →</a></span></div>
-    <div class="table-wrap wide"><table data-recent data-src="/admin/api/recent?after={{ recent_max_id }}" data-labels="1">
-      <thead><tr><th>Time (UTC)</th><th>IP</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th></tr></thead>
+    <div class="card-head"><h2>Recent requests</h2><span class="muted">last 24 h · UTC</span></div>
+    <div class="table-wrap wide"><table>
+      <thead><tr><th>Time (UTC)</th><th>IP</th><th>Method</th><th>Path</th><th>Sev</th>{% if labels %}<th>Labels</th>{% endif %}</tr></thead>
       <tbody>
-      {% for r in stats.recent %}
+      {% for r in recent %}
         <tr data-sev="{{ r.severity }}">
-          <td class="ts">{{ r.ts }}</td>
+          <td class="ts">{{ crate::admin::views::minute(r.ts) }}</td>
           <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% if let Some(c) = r.country %} <span class="flag" title="{{ crate::admin::countries::country_name(c) }}">{{ crate::admin::countries::flag(c) }}</span>{% endif %}</td>
           <td class="mono">{{ r.method }}</td>
-          <td class="path"><a href="/admin/requests/{{ r.id }}">{{ r.path }}</a></td>
+          <td class="path">{{ crate::admin::views::public_path(r.path) }}</td>
           <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
-          <td><span class="chips">{% for l in r.labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>
+          {% if labels %}<td><span class="chips">{% for l in r.labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>{% endif %}
         </tr>
       {% endfor %}
-      {% if stats.recent.is_empty() %}<tr data-empty><td colspan="6" class="empty">Nothing yet.</td></tr>{% endif %}
+      {% if recent.is_empty() %}<tr><td colspan="{{ 5 + labels as usize }}" class="empty">Nothing yet.</td></tr>{% endif %}
       </tbody>
     </table></div>
   </section>
-  {% endif %}
 </div>
 <div class="visually-hidden" id="stats-tables" aria-live="off"></div>
 {% endblock %}
