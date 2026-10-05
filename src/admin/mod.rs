@@ -13,6 +13,7 @@ pub mod overview;
 pub mod pages;
 pub mod public;
 pub mod scans;
+pub mod search;
 pub mod sse;
 pub mod system;
 pub mod views;
@@ -124,6 +125,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(auth::auth_routes())
         .merge(pages::routes())
         .merge(links::routes())
+        .merge(search::routes())
         .merge(system::routes())
         .merge(scans::routes())
         .merge(overview::routes())

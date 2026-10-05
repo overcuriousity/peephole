@@ -454,6 +454,35 @@ impl Store {
         }))
     }
 
+    /// The listed kinds (not canaries: their values are internal) that
+    /// hold exactly `value`, in [`LinkKind::LIST`] order.
+    pub async fn find_value(&self, value: &str) -> Result<Vec<LinkKind>> {
+        let value = value.trim();
+        let mut out = vec![];
+        if value.is_empty() {
+            return Ok(out);
+        }
+        for kind in LinkKind::LIST {
+            let (s, binds) = sightings(
+                kind,
+                &Where {
+                    value: Some(value),
+                    ..Default::default()
+                },
+            );
+            let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT EXISTS (SELECT 1 FROM ({s}))"
+            )));
+            for b in &binds {
+                q = q.bind(b);
+            }
+            if q.fetch_one(&self.read).await? == 1 {
+                out.push(kind);
+            }
+        }
+        Ok(out)
+    }
+
     /// The item an anchor of the old fingerprints page named: a browser
     /// fingerprint's hash, or `ssh-`/`tls-` and the start of a host key
     /// ([`super::hostkeys::anchor`] drops characters, so it is recomputed
@@ -1013,6 +1042,27 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn a_value_is_found_in_every_kind_that_has_it() {
+        let (s, _) = seeded().await;
+        assert_eq!(s.find_value("F").await.unwrap(), [LinkKind::Fp]);
+        assert_eq!(s.find_value("J").await.unwrap(), [LinkKind::Ja4]);
+        let ssh = s.links_list(&filter("ssh")).await.unwrap().items[0]
+            .value
+            .clone();
+        assert_eq!(s.find_value(&ssh).await.unwrap(), [LinkKind::Ssh]);
+        // The same value under two kinds: both.
+        s.insert_fingerprint(None, 1, "J", None, "{}", "{}", b"[]")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.find_value("J").await.unwrap(),
+            [LinkKind::Fp, LinkKind::Ja4]
+        );
+        assert!(s.find_value("nothing").await.unwrap().is_empty());
+        assert!(s.find_value("").await.unwrap().is_empty());
     }
 
     #[tokio::test]

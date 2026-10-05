@@ -1,0 +1,15 @@
+{% extends "layout.html" %}
+{% block title %}peephole — search{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>Search</h1><p class="muted">An IP or network, <span class="mono">AS123</span>, <span class="mono">#&lt;request id&gt;</span>, a path starting with <span class="mono">/</span>, or a fingerprint, host key, certificate, JA4, JA4H, HASSH or JA4X.</p></div></div>
+<section class="card">
+{% if q.is_empty() %}
+  <p class="muted">Type something into the search box.</p>
+{% else if found.is_empty() %}
+  <p>Nothing found for <span class="mono">{{ q }}</span>: not an address, network, AS number, request or path, and no stored fingerprint, key or certificate has this exact value.</p>
+{% else %}
+  <p><span class="mono">{{ q }}</span> was found as:</p>
+  <ul>{% for (name, href) in found %}<li><a href="{{ href }}">{{ name }}</a></li>{% endfor %}</ul>
+{% endif %}
+</section>
+{% endblock %}

@@ -3073,6 +3073,83 @@ async fn moved_admin_pages_redirect_permanently() {
     }
 }
 
+/// The search box sends each kind of input to its page.
+#[tokio::test]
+async fn admin_search_sends_each_kind_of_input_to_its_page() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let ip = store
+        .upsert_ip("203.0.113.5".parse().unwrap())
+        .await
+        .unwrap();
+    let rid = store
+        .insert_request(&peephole::store::requests::NewRequest {
+            ip_id: ip.id,
+            method: "GET".into(),
+            path: "/x".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ja4: Some("BOTHKINDS".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for h in ["FPSEARCH", "BOTHKINDS"] {
+        store
+            .insert_fingerprint(None, ip.id, h, None, "{}", "{}", b"[]")
+            .await
+            .unwrap();
+    }
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store, cfg).await;
+    let go = |q: &str| {
+        let (c, u) = (
+            client.clone(),
+            format!(
+                "{base}/admin/search?q={}",
+                q.replace('#', "%23").replace('/', "%2F")
+            ),
+        );
+        async move { c.get(u).send().await.unwrap() }
+    };
+    for (q, want) in [
+        ("203.0.113.5", "/ip/203.0.113.5"),
+        (" 198.51.100.99 ", "/admin/lookup?ip=198.51.100.99"),
+        ("203.0.113.0/24", "/ips?q=203.0.113.0%2F24"),
+        ("AS64500", "/ips?asn=64500"),
+        ("as64500", "/ips?asn=64500"),
+        (&format!("#{rid}"), &format!("/admin/requests/{rid}")),
+        ("/wp-login.php", "/requests?path=%2Fwp-login.php"),
+        ("FPSEARCH", "/admin/links/fp/FPSEARCH"),
+    ] {
+        let r = go(q).await;
+        let got = format!(
+            "{}{}",
+            r.url().path(),
+            r.url().query().map(|q| format!("?{q}")).unwrap_or_default()
+        );
+        assert_eq!(got, want, "{q}");
+        assert_eq!(r.status(), 200, "{q}");
+    }
+    let html = go("BOTHKINDS").await.text().await.unwrap();
+    assert!(
+        html.contains("href=\"/admin/links/fp/BOTHKINDS\"")
+            && html.contains("href=\"/admin/links/ja4/BOTHKINDS\""),
+        "a value under two kinds lists both"
+    );
+    let html = go("zzz-nothing").await.text().await.unwrap();
+    assert!(html.contains("Nothing found") && html.contains("zzz-nothing"));
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let r = anon
+        .get(format!("{base}/admin/search?q=203.0.113.5"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 303, "admin only");
+}
+
 /// Signed in, every page has the Lookup box; anonymous visitors don't.
 #[tokio::test]
 async fn lookup_box_only_for_admins() {
@@ -3089,7 +3166,7 @@ async fn lookup_box_only_for_admins() {
         let r = client.get(format!("{base}{p}")).send().await.unwrap();
         assert_eq!(r.status(), 200, "{p}");
         let html = r.text().await.unwrap();
-        assert!(html.contains("action=\"/admin/lookup\""), "{p}");
+        assert!(html.contains("action=\"/admin/search\""), "{p}");
     }
     let anon = reqwest::Client::new()
         .get(format!("{base}/"))
@@ -3099,7 +3176,7 @@ async fn lookup_box_only_for_admins() {
         .text()
         .await
         .unwrap();
-    assert!(!anon.contains("action=\"/admin/lookup\""));
+    assert!(!anon.contains("action=\"/admin/search\""));
 }
 
 /// A standalone node has no Access page and no node pages.
