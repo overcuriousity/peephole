@@ -1,17 +1,83 @@
 {% extends "layout.html" %}
 {% block title %}peephole — scans{% endblock %}
+{% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
 {% let sub = "scans" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Counter-scans</h1><p class="muted">Completed nmap runs, newest first.</p></div></div>
-<div class="table-wrap wide"><table>
-  <thead><tr><th>Scan</th><th>Target</th><th>Level</th><th>Finished</th><th>OS guess</th><th class="num">Open ports</th><th>Scanner</th></tr></thead>
-  <tbody>
-  {% for s in page.items %}
-    <tr><td class="mono"><a href="/admin/scans/{{ s.id }}">#{{ s.id }}</a></td><td class="ip"><a href="/ip/{{ s.ip }}">{{ s.ip }}</a></td><td>{{ s.level }}</td>
-        <td class="ts">{{ s.finished_at.as_deref().unwrap_or("") }}</td><td class="wrap">{{ s.os_guess.as_deref().unwrap_or("—") }}</td><td class="num">{{ s.open_ports }}</td><td class="muted">{{ s.node.as_deref().unwrap_or("") }}</td></tr>
-  {% endfor %}
-  {% if page.items.is_empty() %}<tr><td colspan="7" class="empty">No scans yet.</td></tr>{% endif %}
-  </tbody>
-</table></div>
-{% include "_pagination.html" %}
+<div class="page-head"><div><h1>Scans</h1><p class="muted">Pace, the live queue, and every finished job.</p></div></div>
+{% if let Some(n) = pace.notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
+{% if let Some(e) = pace.error %}<div class="banner banner-warning">Pace not saved: {{ e }}</div>{% endif %}
+{% if pace.timeouts_high %}<div class="banner banner-warning">{{ pace.timeout_share }} of scans in 24 h hit the {{ pace.timeout_min }} min timeout; recommended: {{ pace.rec_timeout_min }} min.</div>{% endif %}
+{% if pace.growing %}<div class="banner banner-warning">The queue grew by about {{ pace.net }} jobs per hour over the last {{ pace.drain_window_h }} h.</div>{% endif %}
+{% if pace.not_scanning %}<div class="banner banner-warning">This node does not scan; its own pace does nothing. Scanners are paced below.</div>{% endif %}
+<div class="stack">
+<section class="card pace" id="pace">
+  <div class="card-head"><h2>Pace</h2><span class="muted">{% if pace.paused %}scanning paused{% else %}{{ pace.cadence }}{% endif %}</span></div>
+  <div class="tiles">
+    <div class="tile"><span class="label">Backlog</span><div class="value">{{ pace.m.backlog }}</div><div class="hint">oldest waiting {{ pace.oldest }}</div></div>
+    <div class="tile"><span class="label">Arrivals / h</span><div class="value">{{ pace.arrival }}</div><div class="hint">{{ pace.m.arrivals_1h }} last hour · {{ pace.m.arrivals_24h }} last 24 h</div></div>
+    <div class="tile"><span class="label">Throughput / h</span><div class="value">{{ pace.throughput }}</div><div class="hint">left the queue, last {{ pace.drain_window_h }} h · pace allows {{ pace.capacity }}{% match pace.cluster_note %}{% when Some(n) %} ({{ n }}){% when None %}{% endmatch %} · {{ pace.m.completed_1h }} finished last hour · {{ pace.m.completed_24h }} last 24 h</div></div>
+    <div class="tile"><span class="label">Net growth / h</span><div class="value{% if pace.growing %} brand{% endif %}">{{ pace.net }}</div><div class="hint">last {{ pace.drain_window_h }} h: {{ pace.m.arrivals_recent }} in, {{ pace.m.left_recent }} out · backlog drains: {{ pace.drain }}</div></div>
+    <div class="tile"><span class="label">Scan duration</span><div class="value">{{ pace.scan_secs }}</div><div class="hint">{% if pace.scan_secs_measured %}mean of the last 7 days{% else %}assumed, nothing measured yet{% endif %}</div></div>
+    <div class="tile"><span class="label">Failed · 24 h</span><div class="value{% if pace.m.failed_24h > 0 %} brand{% endif %}">{{ pace.m.failed_24h }}</div><div class="hint">{{ pace.m.timeouts_24h }} timeouts ({{ pace.timeout_share }} of finished)</div></div>
+  </div>
+  <div class="grid-2 pace-trend">
+    <div><span class="label">Queued per hour · last 24 h</span><div class="sparkline" data-sparkline="{{ pace.arrivals_json }}"></div></div>
+    <div><span class="label">Finished per hour · last 24 h</span><div class="sparkline" data-sparkline="{{ pace.completions_json }}"></div></div>
+  </div>
+  <div class="grid-2">
+    <form class="filters pace-form" method="post" action="/admin/queue/pace">
+      <label>Workers <input type="number" name="max_workers" min="0" max="{{ pace.max_workers }}" value="{{ pace.current.max_workers }}" required></label>
+      <label>Scans per hour <input type="number" name="max_scans_per_hour" min="0" max="{{ pace.max_per_hour }}" value="{{ pace.current.max_scans_per_hour }}" required></label>
+      <label>Timeout (min) <input type="number" name="timeout_minutes" min="{{ pace.min_timeout_min }}" max="{{ pace.max_timeout_min }}" step="any" value="{{ pace.timeout_min }}" required></label>
+      <button class="btn btn-primary" type="submit">Save pace</button>
+      <p class="muted pace-note">0 pauses scanning. Level 4 timeout: {{ pace.level4_timeout_min }} min.</p>
+    </form>
+    <form class="pace-rec" method="post" action="/admin/queue/pace">
+      <input type="hidden" name="max_workers" value="{{ pace.rec.max_workers }}">
+      <input type="hidden" name="max_scans_per_hour" value="{{ pace.rec.max_scans_per_hour }}">
+      <input type="hidden" name="timeout_minutes" value="{{ pace.rec_timeout_min }}">
+      <p><strong>Recommended{% if pace.cluster_note.is_some() %} for this node{% endif %}:</strong> {{ pace.rec.max_workers }} workers, {{ pace.rec.max_scans_per_hour }} scans per hour ({{ pace.rec_cadence }}), {{ pace.rec_timeout_min }} min timeout.</p>
+      <p class="muted">Arrivals + 25 %, backlog cleared within a day{% if pace.cluster_note.is_some() %}, split over the live scanners{% endif %}.</p>
+      {% if pace.rec_differs %}<button class="btn" type="submit">Apply recommendation</button>{% else %}<p class="muted">The current pace matches.</p>{% endif %}
+    </form>
+  </div>
+  {% if pace.m.failed_24h > 0 %}<p class="muted pace-retry"><a href="/admin/scans?status=failed#history">{{ pace.m.failed_24h }} failed in 24 h →</a></p>{% endif %}
+</section>
+<section class="card">
+  <div class="card-head"><h2>Live queue</h2><span class="row">{% if active_total > jobs.len() as i64 %}<span class="muted">newest {{ jobs.len() }} of {{ active_total }}</span>{% endif %}<span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></span></div>
+  <div class="table-wrap wide"><table data-queue data-src="/admin/api/queue" data-limit="500">
+    <thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Status</th><th>Queued</th><th>Finished</th><th>Error</th><th>Node</th></tr></thead>
+    <tbody>{% for j in jobs %}{% include "_queue_row.html" %}{% endfor %}
+    {% if jobs.is_empty() %}<tr data-empty><td colspan="8" class="empty">Nothing queued or running.</td></tr>{% endif %}</tbody>
+  </table></div>
+</section>
+<section class="card" id="history">
+  <div class="card-head"><h2>History</h2>
+    {% if f.status.as_deref() == Some("failed") %}<form method="post" action="/admin/queue/retry-failed"><button class="btn btn-sm" type="submit">Retry failed (last 7 days, one per IP)</button></form>{% endif %}</div>
+  <form class="filters" method="get" action="/admin/scans#history">
+    <label>Status <select name="status"><option value="">any finished</option>
+      {% for st in statuses %}<option value="{{ st }}"{% if f.status.as_deref() == Some(st) %} selected{% endif %}>{{ st }}</option>{% endfor %}</select></label>
+    <label>Level <input name="level" size="3" value="{% if let Some(l) = f.level %}{{ l }}{% endif %}"></label>
+    <button class="btn btn-primary" type="submit">Filter</button>
+  </form>
+  <div class="table-wrap wide"><table>
+    <thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Status</th><th>Finished</th><th>Result</th><th>Node</th></tr></thead>
+    <tbody>
+    {% for r in history.items %}
+      <tr>
+        <td class="mono">#{{ r.id }}</td>
+        <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
+        <td>{{ r.level }}</td>
+        <td><span class="badge badge-status" data-status="{{ r.status }}">{{ r.status }}</span></td>
+        <td class="ts">{{ r.finished_at.as_deref().unwrap_or("") }}</td>
+        <td class="wrap">{% if let Some(sid) = r.scan_id %}<a class="mono" href="/admin/scans/{{ sid }}">scan #{{ sid }}</a> · {{ r.open_ports }} open{% if let Some(os) = r.os_guess %} · {{ os }}{% endif %}{% else if let Some(e) = r.error %}<span class="mono">{{ e }}</span>{% endif %}</td>
+        <td class="muted">{% if let Some(s) = r.scanner %}{{ s }}{% endif %}{% if let Some(a) = r.arbiter %}<span class="node-via"> via {{ a }}</span>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    {% if history.items.is_empty() %}<tr><td colspan="7" class="empty">No finished jobs{% if f.status.is_some() || f.level.is_some() %} match{% endif %}.</td></tr>{% endif %}
+    </tbody>
+  </table></div>
+  {% let page = history %}{% include "_pagination.html" %}
+</section>
+</div>
 {% endblock %}

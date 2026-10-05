@@ -2745,13 +2745,11 @@ async fn admin_cluster_page_and_private_attribution() {
         .unwrap();
     assert!(r.text().await.unwrap().contains("peephole1:"));
     // Attribution on admin views.
-    let queue = text(&admin, format!("{base}/admin/queue")).await;
-    assert!(
-        queue.contains("sensor-bravo") && queue.contains("via sensor-alpha"),
-        "queue"
-    );
     let scans = text(&admin, format!("{base}/admin/scans")).await;
-    assert!(scans.contains("sensor-bravo"), "scans");
+    assert!(
+        scans.contains("sensor-bravo") && scans.contains("via sensor-alpha"),
+        "scan history names scanner and arbiter"
+    );
     let reqs = text(&admin, format!("{base}/requests?node=sensor-alpha")).await;
     assert!(
         reqs.contains("/admin.php") && reqs.contains("<th>Node</th>"),

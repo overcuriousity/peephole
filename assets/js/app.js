@@ -161,11 +161,8 @@
       tr.appendChild(cell("muted", esc(j.scanner) + (j.arbiter ? '<span class="node-via"> via ' + esc(j.arbiter) + "</span>" : "")));
       return tr;
     };
-    // The page's status/level filter applies to live rows too.
-    // The level compares as a number, as the server parses it ("03" is 3).
-    var fStatus = qt.getAttribute("data-filter-status") || "", lv = (qt.getAttribute("data-filter-level") || "").trim();
-    var fLevel = /^[+-]?\d+$/.test(lv) ? parseInt(lv, 10) : NaN;
-    var matches = function (j) { return (!fStatus || j.status === fStatus) && (isNaN(fLevel) || Number(j.level) === fLevel); };
+    // The live card holds active jobs only; a job that finishes leaves it.
+    var matches = function (j) { return j.status === "queued" || j.status === "running"; };
     var COLS = 8;
     var apply = function (j) {
       var existing = tbody.querySelector('[data-job="' + j.id + '"]');
@@ -191,7 +188,7 @@
       tbody.innerHTML = "";
       jobs = jobs.filter(matches);
       jobs.slice(0, limit).forEach(function (j) { tbody.appendChild(row(j)); });
-      if (!jobs.length) { var tr = document.createElement("tr"); tr.setAttribute("data-empty", ""); var td = cell("empty", "Queue empty."); td.setAttribute("colspan", String(COLS)); tr.appendChild(td); tbody.appendChild(tr); }
+      if (!jobs.length) { var tr = document.createElement("tr"); tr.setAttribute("data-empty", ""); var td = cell("empty", "Nothing queued or running."); td.setAttribute("colspan", String(COLS)); tr.appendChild(td); tbody.appendChild(tr); }
     };
     var es = new EventSource(qt.getAttribute("data-src"));
     es.addEventListener("open", function () { setLive("open", "live"); });

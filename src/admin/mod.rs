@@ -9,6 +9,7 @@ pub mod limit;
 pub mod lookup;
 pub mod pages;
 pub mod public;
+pub mod scans;
 pub mod sse;
 pub mod system;
 pub mod views;
@@ -120,6 +121,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(auth::auth_routes())
         .merge(pages::routes())
         .merge(system::routes())
+        .merge(scans::routes())
         .merge(lookup::routes())
         .merge(cluster::routes())
         .fallback(error::not_found)

@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 
-/// Matches the queue page's server-rendered rows, so a resync never shrinks it.
-const SNAPSHOT_ROWS: i64 = 500;
+/// Matches the Scans page's live card, so a resync never shrinks it.
+const SNAPSHOT_ROWS: i64 = crate::admin::scans::LIVE_ROWS;
 
 fn snapshot_event(jobs: &[QueueJob]) -> Event {
     Event::default()
@@ -25,7 +25,7 @@ fn snapshot_event(jobs: &[QueueJob]) -> Event {
 /// A snapshot, or — when the store fails — a comment the client ignores, so a
 /// transient DB error never renders as "Queue empty".
 async fn snapshot_or_comment(state: &AdminState) -> Event {
-    match state.store.queue_snapshot(SNAPSHOT_ROWS).await {
+    match state.store.active_jobs(SNAPSHOT_ROWS).await {
         Ok(jobs) => snapshot_event(&jobs),
         Err(e) => {
             tracing::warn!(error = ?e, "queue snapshot unavailable");

@@ -521,7 +521,6 @@ async fn admin_routes_redirect_without_session() {
         .unwrap();
     for path in [
         "/admin",
-        "/admin/queue",
         "/admin/requests/1",
         "/admin/scans",
         "/admin/scans/1",
@@ -782,14 +781,22 @@ async fn admin_pages_and_deletes_with_session() {
     let get = |p: &str| client.get(format!("{base}{p}")).send();
 
     let html = get("/admin").await.unwrap().text().await.unwrap();
-    assert!(
-        html.contains("Scan queue")
-            && html.contains("data-queue")
-            && html.contains("/admin/api/queue")
-    );
     assert!(html.contains("unread"));
-    let html = get("/admin/queue").await.unwrap().text().await.unwrap();
+    let html = get("/admin/scans?status=done")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(html.contains("203.0.113.78") && html.contains("done"));
+    let html = get("/admin/scans?status=nonsense&level=abc")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("203.0.113.78"), "unknown filters are ignored");
+    assert!(!html.contains("nonsense"), "and not echoed");
 
     let rid: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/login'")
         .fetch_one(&store.pool)
@@ -910,7 +917,7 @@ async fn admin_pages_and_deletes_with_session() {
     assert!(html.contains("/admin/export/download"));
     for html_path in [
         "/admin",
-        "/admin/queue",
+        "/admin/scans",
         &format!("/admin/requests/{rid}"),
         &format!("/admin/scans/{sid}"),
         "/admin/fingerprints",
@@ -1991,7 +1998,7 @@ async fn bulk_delete_checked_and_filtered() {
 }
 
 #[tokio::test]
-async fn scan_pace_is_adjustable_from_the_queue_page() {
+async fn scan_pace_is_adjustable_from_the_scans_page() {
     let (trap_base, store, dir) = spawn_trap().await;
     // One queued job so the metrics have something to measure.
     let _ = reqwest::Client::new()
@@ -2004,7 +2011,7 @@ async fn scan_pace_is_adjustable_from_the_queue_page() {
     let (client, base, state) = enrolled_admin_client_with_state(store.clone(), cfg).await;
 
     let page = client
-        .get(format!("{base}/admin/queue"))
+        .get(format!("{base}/admin/scans"))
         .send()
         .await
         .unwrap();
@@ -2013,6 +2020,10 @@ async fn scan_pace_is_adjustable_from_the_queue_page() {
     assert!(html.contains("Save pace"), "pace form on queue page");
     assert!(html.contains("Recommended:"));
     assert!(html.contains("Arrivals / h"));
+    assert!(
+        html.contains("data-queue") && html.contains("History"),
+        "live card and history"
+    );
 
     let resp = client
         .post(format!("{base}/admin/queue/pace"))
@@ -2070,6 +2081,18 @@ async fn scan_pace_is_adjustable_from_the_queue_page() {
         .unwrap();
     assert_eq!(bad.status(), 400, "timeout below the minimum");
     assert_eq!(state.pace.get(), p);
+    let bad = client
+        .post(format!("{base}/admin/queue/pace"))
+        .form(&[("max_workers", "x"), ("max_scans_per_hour", "90")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let html = bad.text().await.unwrap();
+    assert!(
+        html.contains("Pace not saved") && html.contains("data-queue") && html.contains("History"),
+        "an error re-renders the whole Scans page"
+    );
 
     // Retry: the failed job goes back in the queue.
     let job = store.next_queued_job().await.unwrap().unwrap();
@@ -2095,6 +2118,22 @@ async fn scan_pace_is_adjustable_from_the_queue_page() {
         .await
         .unwrap();
     assert_eq!(status, "queued");
+    store
+        .finish_job(job.id, None, Some("host reported down"))
+        .await
+        .unwrap();
+    let html = client
+        .get(format!("{base}/admin/scans?status=failed"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        html.contains("Retry failed") && html.contains("host reported down"),
+        "retry next to the failed filter"
+    );
 
     // Without a session the endpoint is closed.
     let anon = reqwest::Client::builder()
@@ -2749,6 +2788,9 @@ async fn moved_admin_pages_redirect_permanently() {
     for (from, to) in [
         ("/admin/keys", "/admin/system/keys"),
         ("/admin/export", "/admin/system/export"),
+        ("/admin/queue", "/admin/scans"),
+        ("/admin/queue?status=failed", "/admin/scans?status=failed"),
+        ("/admin/queue?status=queued", "/admin/scans"),
     ] {
         let r = client.get(format!("{base}{from}")).send().await.unwrap();
         assert_eq!(r.status(), 308, "{from}");
