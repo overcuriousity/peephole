@@ -74,6 +74,7 @@ impl Store {
 
     /// Queue growth measurements for the pacing recommendation.
     pub async fn queue_metrics(&self) -> Result<crate::scan::pace::QueueMetrics> {
+        let recent = format!("-{} hours", crate::scan::pace::DRAIN_WINDOW_HOURS);
         // SUM over zero rows is NULL.
         type Sums = (
             Option<i64>,
@@ -84,8 +85,10 @@ impl Store {
             Option<i64>,
             Option<i64>,
             Option<i64>,
+            Option<i64>,
+            Option<i64>,
         );
-        let (backlog, running, a1, a24, c1, c24, f24, t24): Sums = sqlx::query_as(
+        let (backlog, running, a1, a24, c1, c24, f24, t24, ar, lr): Sums = sqlx::query_as(
             "SELECT SUM(status='queued'), SUM(status='running'),
                     SUM(queued_at > datetime('now','-1 hour')),
                     SUM(queued_at > datetime('now','-24 hours')),
@@ -93,9 +96,14 @@ impl Store {
                     SUM(status IN ('done','failed') AND finished_at > datetime('now','-24 hours')),
                     SUM(status = 'failed' AND finished_at > datetime('now','-24 hours')),
                     SUM(status = 'failed' AND error LIKE 'timeout%'
-                        AND finished_at > datetime('now','-24 hours'))
+                        AND finished_at > datetime('now','-24 hours')),
+                    SUM(queued_at > datetime('now', ?)),
+                    SUM(status IN ('done','failed','refused','superseded')
+                        AND finished_at > datetime('now', ?))
              FROM scan_jobs",
         )
+        .bind(&recent)
+        .bind(&recent)
         .fetch_one(&self.pool)
         .await?;
         // How much of the 24h window has data: the first job ever queued.
@@ -151,6 +159,8 @@ impl Store {
             completed_24h: c24.unwrap_or(0),
             failed_24h: f24.unwrap_or(0),
             timeouts_24h: t24.unwrap_or(0),
+            arrivals_recent: ar.unwrap_or(0),
+            left_recent: lr.unwrap_or(0),
             observed_hours: first_age_h.unwrap_or(24.0).clamp(1.0, 24.0),
             avg_scan_secs,
             oldest_queued_secs,
@@ -298,6 +308,8 @@ mod tests {
         assert_eq!(m.arrivals_1h, 3);
         assert_eq!(m.arrivals_24h, 3);
         assert_eq!(m.completed_24h, 1);
+        assert_eq!(m.arrivals_recent, 3);
+        assert_eq!(m.left_recent, 1);
         assert_eq!(m.hourly_arrivals.len(), 24);
         assert_eq!(m.hourly_arrivals[23], 3);
         assert_eq!(m.hourly_completions[23], 1);

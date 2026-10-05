@@ -8,15 +8,15 @@
 {% if let Some(n) = pace.notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
 {% if let Some(e) = pace.error %}<div class="banner banner-warning">Pace not saved: {{ e }}</div>{% endif %}
 {% if pace.timeouts_high %}<div class="banner banner-warning">{{ pace.timeout_share }} of scans in 24 h hit the {{ pace.timeout_min }} min timeout; recommended: {{ pace.rec_timeout_min }} min.</div>{% endif %}
-{% if pace.growing %}<div class="banner banner-warning">The queue grows by about {{ pace.net }} jobs per hour at this pace.</div>{% endif %}
+{% if pace.growing %}<div class="banner banner-warning">The queue grew by about {{ pace.net }} jobs per hour over the last {{ pace.drain_window_h }} h.</div>{% endif %}
 {% if pace.not_scanning %}<div class="banner banner-warning">This node does not scan; scanner pace is on the <a href="/admin/cluster">Cluster</a> page.</div>{% endif %}
 <section class="card pace" id="pace">
   <div class="card-head"><h2>Pace</h2><span class="muted">{% if pace.paused %}scanning paused{% else %}{{ pace.cadence }}{% endif %}</span></div>
   <div class="tiles">
     <div class="tile"><span class="label">Backlog</span><div class="value">{{ pace.m.backlog }}</div><div class="hint">oldest waiting {{ pace.oldest }}</div></div>
     <div class="tile"><span class="label">Arrivals / h</span><div class="value">{{ pace.arrival }}</div><div class="hint">{{ pace.m.arrivals_1h }} last hour · {{ pace.m.arrivals_24h }} last 24 h</div></div>
-    <div class="tile"><span class="label">Capacity / h</span><div class="value">{{ pace.capacity }}</div><div class="hint">{% match pace.cluster_note %}{% when Some(n) %}{{ n }}· {% when None %}{% endmatch %}{{ pace.m.completed_1h }} finished last hour · {{ pace.m.completed_24h }} last 24 h</div></div>
-    <div class="tile"><span class="label">Net growth / h</span><div class="value{% if pace.growing %} brand{% endif %}">{{ pace.net }}</div><div class="hint">backlog drains: {{ pace.drain }}</div></div>
+    <div class="tile"><span class="label">Throughput / h</span><div class="value">{{ pace.throughput }}</div><div class="hint">left the queue, last {{ pace.drain_window_h }} h · pace allows {{ pace.capacity }}{% match pace.cluster_note %}{% when Some(n) %} ({{ n }}){% when None %}{% endmatch %} · {{ pace.m.completed_1h }} finished last hour · {{ pace.m.completed_24h }} last 24 h</div></div>
+    <div class="tile"><span class="label">Net growth / h</span><div class="value{% if pace.growing %} brand{% endif %}">{{ pace.net }}</div><div class="hint">last {{ pace.drain_window_h }} h: {{ pace.m.arrivals_recent }} in, {{ pace.m.left_recent }} out · backlog drains: {{ pace.drain }}</div></div>
     <div class="tile"><span class="label">Scan duration</span><div class="value">{{ pace.scan_secs }}</div><div class="hint">{% if pace.scan_secs_measured %}mean of the last 7 days{% else %}assumed, nothing measured yet{% endif %}</div></div>
     <div class="tile"><span class="label">Failed · 24 h</span><div class="value{% if pace.m.failed_24h > 0 %} brand{% endif %}">{{ pace.m.failed_24h }}</div><div class="hint">{{ pace.m.timeouts_24h }} timeouts ({{ pace.timeout_share }} of finished)</div></div>
   </div>

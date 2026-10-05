@@ -6,6 +6,8 @@
 //! Fairness: claims are collected for a short window and the jobs go to
 //! the claimants that ran the fewest scans in the last hour, so equally
 //! paced scanners share the queue equally wherever the job came from.
+//! A scanner that fails a level more than the others is weighted down at
+//! that level (see `weight`).
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::msg::{Grant, Msg};
@@ -214,15 +216,30 @@ impl Arbiter {
                 )
                 .collect()
         };
+        // Levels this scanner fails more than the others sit out this claim
+        // (see `weight`), unless the job has waited long enough.
+        let skipped = {
+            let scanners = self.scanners();
+            if scanners.len() > 1 {
+                let t = super::weight::tallies(&self.node.store.pool).await?;
+                super::weight::skipped_levels(&t, scanner, &scanners, super::weight::roll)
+            } else {
+                vec![]
+            }
+        };
         let (uid, ip, level, attempts) = loop {
-            let row: Option<(String, String, i64, i64)> = sqlx::query_as(
+            let row: Option<(String, String, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT j.uid, i.ip, j.level, j.attempts FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
                  WHERE j.status = 'queued' AND j.arbiter = ?
                    AND j.uid NOT IN (SELECT value FROM json_each(?))
+                   AND (j.level NOT IN (SELECT value FROM json_each(?))
+                        OR j.queued_at < datetime('now', '-{} minutes'))
                  ORDER BY j.level DESC, j.queued_at ASC LIMIT 1",
-            )
+                super::weight::OVERRIDE_WAIT_MINS
+            )))
             .bind(&me.0[..])
             .bind(serde_json::to_string(&declined)?)
+            .bind(serde_json::to_string(&skipped)?)
             .fetch_optional(&self.node.store.pool)
             .await?;
             let Some(row) = row else {

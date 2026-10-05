@@ -12,4 +12,5 @@
   <td>{% if m.key_held %}<a class="btn btn-sm" href="/admin/cluster/node/{{ m.key }}">Configure</a>{% endif %}</td>
   {% endif %}
   {% when None %}<td colspan="4" class="muted">pace not reported yet</td>{% endmatch %}
+  <td>{% if m.level_weights.is_empty() %}<span class="muted">full</span>{% else %}{{ m.level_weights }}{% endif %}</td>
 </tr>

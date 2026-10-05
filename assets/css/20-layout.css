@@ -22,7 +22,6 @@
 .footer { max-width: var(--shell-max); margin: 0 auto; padding: 1rem; color: var(--color-fg-muted); font-size: var(--text-xs); display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
 @media (max-width: 48rem) {
   .grid-2, .grid-3 { grid-template-columns: 1fr; }
-  .table-wrap { overflow-x: auto; }
   /* Two rows: brand and actions on top, the full-width nav below, so no
      link is clipped (four of them once logged in). */
   .topbar-row { flex-wrap: wrap; height: auto; gap: 0 0.75rem; padding-top: 0.4rem; }
