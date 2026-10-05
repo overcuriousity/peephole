@@ -3,10 +3,9 @@ use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
-use crate::events::QueueJob;
 use crate::store::analytics::{Analytics, RELATED_JA4_DAYS};
 use crate::store::browse::{IpFilter, RequestFilter};
-use crate::store::inspect::{FpClaimRow, FpCluster, QueueSummary, RequestDetail};
+use crate::store::inspect::{FpClaimRow, FpCluster, RequestDetail};
 use crate::store::recorder::Deleted;
 use crate::store::stats::{Range, RecentRequest};
 use askama::Template;
@@ -20,7 +19,6 @@ use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/admin", get(home))
         .route("/admin/analytics", get(analytics))
         .route("/admin/requests/{id}", get(request_page))
         .route("/admin/requests/{id}/delete", post(request_delete))
@@ -35,48 +33,6 @@ pub fn routes() -> Router<Arc<AdminState>> {
 
 fn chrome() -> Chrome {
     Chrome::new(true, "admin")
-}
-
-#[derive(Template)]
-#[template(path = "admin_home.html")]
-struct HomePage {
-    chrome: Chrome,
-    q: QueueSummary,
-    workers: usize,
-    cap: i64,
-    inbox: i64,
-    jobs: Vec<QueueJob>,
-    failed: Vec<QueueJob>,
-    intel: crate::admin::system::IntelStatus,
-    /// "Recent activity": the newest requests, then live over SSE.
-    recent: Vec<crate::store::stats::RecentRequest>,
-    /// The newest request id shown (the live feed's cursor).
-    recent_max_id: i64,
-}
-
-async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
-    let recent = st
-        .store
-        .recent_requests(50, crate::store::browse::Audience::Admin)
-        .await?;
-    // Nothing in the last 24 h: follow from the newest row overall, so the
-    // live feed does not backfill the table with old requests.
-    let recent_max_id = match recent.iter().map(|r| r.id).max() {
-        Some(id) => id,
-        None => st.store.max_request_id().await?,
-    };
-    render(&HomePage {
-        chrome: chrome(),
-        q: st.store.queue_summary(&st.recorder).await?,
-        workers: st.pace.get().max_workers,
-        cap: st.pace.get().max_scans_per_hour,
-        inbox: st.store.inbox_count().await?,
-        jobs: st.store.queue_snapshot(25).await?,
-        failed: st.store.recent_failed_jobs(10).await?,
-        intel: crate::admin::system::intel_status(&st).await?,
-        recent,
-        recent_max_id,
-    })
 }
 
 #[derive(Template)]

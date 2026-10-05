@@ -212,16 +212,6 @@ impl Store {
         .fetch_all(&self.pool)
         .await?)
     }
-
-    /// Newest jobs first; `limit` rows.
-    pub async fn queue_snapshot(&self, limit: i64) -> Result<Vec<QueueJob>> {
-        Ok(sqlx::query_as::<_, QueueJob>(sqlx::AssertSqlSafe(format!(
-            "{QUEUE_JOB_SQL} ORDER BY j.id DESC LIMIT ?"
-        )))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
-    }
 }
 
 #[cfg(test)]
@@ -241,7 +231,7 @@ mod tests {
         let job = s.queue_job(id).await.unwrap().unwrap();
         assert_eq!(job.ip, "203.0.113.5");
         assert_eq!(job.status, "queued");
-        let snap = s.queue_snapshot(50).await.unwrap();
+        let snap = s.active_jobs(50).await.unwrap();
         assert_eq!(snap.len(), 1);
         assert!(s.queue_job(9999).await.unwrap().is_none());
     }

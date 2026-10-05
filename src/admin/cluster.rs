@@ -180,7 +180,7 @@ pub const RULES_SAMPLE: i64 = 500;
 
 /// The comparison, made at most every [`RULES_CHECK_TTL`] (an older one is
 /// shown while it is made again), so the page stays fast.
-async fn rules_check(st: &AdminState, node: &Node) -> AppResult<Arc<RulesCheck>> {
+pub(crate) async fn rules_check(st: &AdminState, node: &Node) -> AppResult<Arc<RulesCheck>> {
     let store = node.store.clone();
     Ok(st
         .rules_check
@@ -337,7 +337,10 @@ fn node(st: &AdminState) -> AppResult<&Arc<Node>> {
     st.recorder.node().ok_or(AppError::NotFound)
 }
 
-async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<MemberView>)> {
+pub(crate) async fn views(
+    node: &Node,
+    check: &RulesCheck,
+) -> AppResult<(MemberView, Vec<MemberView>)> {
     let rows = members::all(&node.store).await?;
     let heads = repl::head_map(&repl::heads(&node.store).await?);
     let purged = crate::cluster::block::purged(&node.store).await?;
@@ -532,7 +535,7 @@ async fn own_history(node: &Node) -> AppResult<String> {
 }
 
 /// Origins whose history this node waits for, by name.
-async fn unserved(node: &Node) -> AppResult<Option<String>> {
+pub(crate) async fn unserved(node: &Node) -> AppResult<Option<String>> {
     let ids = node.unserved_origins();
     if ids.is_empty() {
         return Ok(None);

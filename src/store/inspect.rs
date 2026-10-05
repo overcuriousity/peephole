@@ -4,7 +4,6 @@ use super::Store;
 use super::browse::{PAGE_SIZE, Page, offset};
 use super::recorder::Recorder;
 use super::requests::RequestRow;
-use crate::events::QueueJob;
 use anyhow::Result;
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -462,16 +461,6 @@ impl Store {
         })
     }
 
-    pub async fn recent_failed_jobs(&self, limit: i64) -> Result<Vec<QueueJob>> {
-        Ok(sqlx::query_as::<_, QueueJob>(sqlx::AssertSqlSafe(format!(
-            "{} WHERE j.status = 'failed' ORDER BY j.id DESC LIMIT ?",
-            super::scans::QUEUE_JOB_SQL
-        )))
-        .bind(limit)
-        .fetch_all(&self.read)
-        .await?)
-    }
-
     pub async fn request_detail(&self, id: i64) -> Result<Option<RequestDetail>> {
         let Some(row) = self.request_by_id(id).await? else {
             return Ok(None);
@@ -750,9 +739,6 @@ mod tests {
         assert_eq!(q.failed_24h, 1);
         assert_eq!(q.queued, 0);
         assert_eq!(q.scans_last_hour, 2, "done + failed: both were launched");
-        let failed = s.recent_failed_jobs(10).await.unwrap();
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].error.as_deref(), Some("timeout"));
         let rid: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE ip_id = ?")
             .bind(a)
             .fetch_one(&s.pool)

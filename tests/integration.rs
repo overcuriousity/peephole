@@ -780,8 +780,26 @@ async fn admin_pages_and_deletes_with_session() {
     let (client, base) = enrolled_admin_client(store.clone(), cfg).await;
     let get = |p: &str| client.get(format!("{base}{p}")).send();
 
+    // A failed scan is something to look at.
+    let ipf = store
+        .upsert_ip("203.0.113.79".parse().unwrap())
+        .await
+        .unwrap();
+    if let peephole::store::scans::EnqueueOutcome::Queued(j) =
+        store.enqueue_scan(ipf.id, 1, 24).await.unwrap()
+    {
+        store.next_queued_job().await.unwrap();
+        store.finish_job(j, None, Some("host down")).await.unwrap();
+    }
     let html = get("/admin").await.unwrap().text().await.unwrap();
-    assert!(html.contains("unread"));
+    assert!(!html.contains("data-queue"), "no queue card on Overview");
+    assert!(!html.contains("<h2>Intel</h2>"), "intel lives on System");
+    assert!(html.contains("href=\"/admin/inbox\"") && html.contains("href=\"/admin/scans\""));
+    assert!(html.contains("data-recent"), "recent activity stays");
+    assert!(
+        html.contains("Needs attention") && html.contains("failed in 24 h"),
+        "{html}"
+    );
     let html = get("/admin/scans?status=done")
         .await
         .unwrap()
