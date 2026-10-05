@@ -113,6 +113,13 @@ pub struct RequestFilter {
     pub ja4h: Option<String>,
     /// Admin only: the request's JA4.
     pub ja4: Option<String>,
+    /// Admin only: the HTTP method (any case).
+    pub method: Option<String>,
+    /// Admin only: `http`, `https`, …; `unknown` for a row without one.
+    pub transport: Option<String>,
+    /// Admin only: what the trap answered (`not-found`, `decoy:…`);
+    /// `unknown` for a row without one.
+    pub answer: Option<String>,
     #[serde(default, deserialize_with = "lenient_i64")]
     pub page: Option<i64>,
 }
@@ -486,6 +493,23 @@ fn request_filter_sql(f: &RequestFilter, a: Audience, indexed: bool) -> (String,
     {
         sql.push_str(" AND r.ja4 = ?");
         binds.push(v);
+    }
+    if a == Audience::Admin {
+        if let Some(v) = nonempty(&f.method) {
+            sql.push_str(" AND r.method = ?");
+            binds.push(v.to_ascii_uppercase());
+        }
+        // Analytics shows a missing value as `unknown`.
+        for (col, v) in [("transport", &f.transport), ("answer", &f.answer)] {
+            match nonempty(v).as_deref() {
+                Some("unknown") => sql.push_str(&format!(" AND r.{col} IS NULL")),
+                Some(v) => {
+                    sql.push_str(&format!(" AND r.{col} = ?"));
+                    binds.push(v.to_string());
+                }
+                None => {}
+            }
+        }
     }
     if let Some(v) = f.asn {
         sql.push_str(" AND i.asn = ?");
@@ -1405,6 +1429,60 @@ mod tests {
         assert_eq!(n(find("wp")).await, 4, "short terms scan");
         assert_eq!(n(find("\"quoted\"")).await, 0);
         assert_eq!(s.count_requests(&find("wp-admin")).await.unwrap().n, 3);
+    }
+
+    /// Method, transport and answer as Analytics names them; `unknown` is
+    /// a row without one. Admin only.
+    #[tokio::test]
+    async fn requests_are_found_by_method_transport_and_answer() {
+        let s = seeded().await;
+        let ip = s.ip_by_addr("203.0.113.1").await.unwrap().unwrap();
+        for (method, transport, answer) in [
+            ("PROPFIND", Some("https"), Some("decoy:dotenv")),
+            ("PROPFIND", None, None),
+        ] {
+            s.insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: method.into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                transport: transport.map(String::from),
+                answer: answer.map(String::from),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let n = |f: RequestFilter| {
+            let s = s.clone();
+            async move { s.count_requests(&f).await.unwrap().n }
+        };
+        let f = |m: Option<&str>, t: Option<&str>, a: Option<&str>| RequestFilter {
+            method: m.map(String::from),
+            transport: t.map(String::from),
+            answer: a.map(String::from),
+            ..Default::default()
+        };
+        assert_eq!(n(f(Some("PROPFIND"), None, None)).await, 2);
+        assert_eq!(n(f(Some("propfind"), None, None)).await, 2, "any case");
+        assert_eq!(n(f(Some("PROPFIND"), Some("https"), None)).await, 1);
+        assert_eq!(n(f(Some("PROPFIND"), Some("unknown"), None)).await, 1);
+        assert_eq!(n(f(None, None, Some("decoy:dotenv"))).await, 1);
+        assert_eq!(n(f(Some("PROPFIND"), None, Some("unknown"))).await, 1);
+        let all = s
+            .search_requests(&RequestFilter::default(), Audience::Public)
+            .await
+            .unwrap()
+            .items
+            .len();
+        let public = s
+            .search_requests(&f(Some("PROPFIND"), None, None), Audience::Public)
+            .await
+            .unwrap()
+            .items
+            .len();
+        assert_eq!(public, all, "admin-only filters");
     }
 
     #[tokio::test]
