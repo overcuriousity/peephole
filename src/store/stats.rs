@@ -954,7 +954,9 @@ impl StatsCache {
         self.ips
             .get(key, PAGE_TTL, move || {
                 let (store, f) = (store.clone(), f.clone());
-                Box::pin(async move { store.list_ips(&f).await })
+                Box::pin(
+                    async move { store.list_ips_as(&f, super::browse::Audience::Public).await },
+                )
             })
             .await
     }
@@ -972,7 +974,7 @@ impl StatsCache {
                 let store = store.clone();
                 Box::pin(async move {
                     store
-                        .ip_overview(ip_id)
+                        .ip_overview_as(ip_id, super::browse::Audience::Public)
                         .await?
                         .ok_or_else(|| anyhow::Error::new(Gone))
                 })

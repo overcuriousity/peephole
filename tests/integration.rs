@@ -1668,8 +1668,27 @@ async fn public_ip_page_shows_aggregates_but_hides_requests_and_admin_data() {
             .status(),
         404
     );
-    store
+    let v6 = store
         .upsert_ip("2001:db8::1".parse().unwrap())
+        .await
+        .unwrap();
+    // An IP with no released request has no public page.
+    assert_eq!(
+        reqwest::get(format!("{base}/ip/2001:db8::1"))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    store
+        .insert_request(&peephole::store::requests::NewRequest {
+            ip_id: v6.id,
+            method: "GET".into(),
+            path: "/v6".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
         .await
         .unwrap();
     assert_eq!(
