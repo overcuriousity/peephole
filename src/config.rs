@@ -493,6 +493,9 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("scan", "verify_crawlers", "true"),
     ("scan", "tor_unknown", "\"defer\""),
     ("public", "show_labels", "true"),
+    ("public", "delay_minutes", "5"),
+    ("public", "jitter_minutes", "5"),
+    ("public", "recent_rows", "50"),
 ];
 
 /// Sections that are required when their role is on and unused otherwise.

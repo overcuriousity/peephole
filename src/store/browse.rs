@@ -262,11 +262,16 @@ impl Audience {
         }
     }
     /// `AND`-fragment keeping only the requests this audience may count
-    /// (`alias` names the requests table): the public sees released rows.
+    /// (`alias` names a `requests` table): the public sees released rows.
+    /// Phrased as a subquery on the partial index `idx_requests_pending`
+    /// rather than `public_at IS NULL`, which would force a row lookup and
+    /// cost the `idx_requests_ts` covering scan of count queries.
     pub(crate) fn released(self, alias: &str) -> String {
         match self {
             Self::Admin => String::new(),
-            Self::Public => format!(" AND {alias}.public_at IS NULL"),
+            Self::Public => format!(
+                " AND {alias}.id NOT IN (SELECT id FROM requests WHERE public_at IS NOT NULL)"
+            ),
         }
     }
     /// Prefix of the per-IP read models (`request_count`, `max_severity`,
@@ -319,7 +324,8 @@ fn nonempty(s: &Option<String>) -> Option<String> {
 
 /// SQL fragments for an `IpFilter`; `None` when the query box holds garbage.
 /// Everything is answered from the `ips` row and its read models
-/// (`request_count`, `max_severity`, `ip_key`, `ip_labels`), never by
+/// (`request_count`, `max_severity`, `ip_key`, `ip_labels`; for the public
+/// the released-only variants `pub_*` and `ip_labels.pub_count`), never by
 /// aggregating requests.
 struct IpFilterSql {
     where_sql: String,

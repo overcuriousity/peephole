@@ -2180,7 +2180,8 @@ async fn query_strings_are_admin_only() {
     let base = spawn_admin_with(store.clone(), dir.path()).await;
     let get = |url: String| async move { reqwest::get(url).await.unwrap().text().await.unwrap() };
     // No public surface shows the query string. The wall's "Recent
-    // requests" (and its JSON) list the path alone; the IP pages do not.
+    // requests" list the path alone (not in the JSON); the IP pages show
+    // no request rows.
     for url in [
         format!("{base}/ip/203.0.113.200"),
         format!("{base}/ips"),
@@ -2197,6 +2198,12 @@ async fn query_strings_are_admin_only() {
             "{url} leaks the request path"
         );
     }
+    // The wall lists paths now, but its JSON keeps `recent` out.
+    let stats = get(format!("{base}/api/stats?range=24h")).await;
+    assert!(
+        !stats.contains("/api/v1/usres"),
+        "/api/stats leaks the request path"
+    );
     // Request search is admin-only, so there is no public oracle at all.
     let anon = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())

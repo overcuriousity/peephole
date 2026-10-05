@@ -43,14 +43,17 @@ nmap.
   from the request, with links back to the trap. When a harvested
   credential comes back, from any address to any node, the admin names the
   request that harvested it and the time in between.
-- **Wall of shame** (public) — aggregate statistics per time range that
-  refresh themselves: trends against the previous period, requests over time
+- **Wall of shame** (public) — aggregate statistics per time range, shown
+  after a delay (`[public] delay_minutes` plus up to `jitter_minutes` more,
+  5 + 0–5 min by default) so the wall cannot be used to watch a scan live:
+  trends against the previous period, requests over time
   by severity, a weekday × hour heatmap, attack families and an OWASP Top 10 /
   Automated Threats map, a world map, top IPs and networks, the ports most
   often found open on the scanned sources, and a searchable IP directory
   (exact, prefix or CIDR). Each IP has its activity calendar, rank and
-  neighbours (same /24 and ASN). Request contents and fingerprints are never
-  public; of the scan results only per-port counts of distinct IPs are, and a
+  neighbours (same /24 and ASN). The wall lists the latest requests as method
+  and path only (no query string, cut at 80 characters); bodies, headers,
+  query strings and fingerprints are never public; of the scan results only per-port counts of distinct IPs are, and a
   port only once it was found open on at least three. Rule labels, and the
   families and OWASP tags derived from them, can be hidden too.
 - **Admin area** (FIDO2 security keys only, no passwords) — request search
@@ -73,7 +76,7 @@ nmap.
   them on. Column by column in [docs/dataset.md](docs/dataset.md): built
   for machine learning on real scanner traffic.
 - **Blocklist feed** (public) — `GET /api/blocklist` lists the addresses
-  that sent requests of severity 3 or more in the last 24 hours (parameters
+  that sent requests of severity 3 or more in the last 24 hours, as released after the publication delay (parameters
   `hours`, `min_severity`, `networks=1` to collapse busy /24s), one per
   line, for nginx `deny`, nftables, ipset, fail2ban or CrowdSec. In a
   cluster it is drawn from every member's trap, so one node's catch

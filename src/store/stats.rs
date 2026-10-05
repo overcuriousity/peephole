@@ -961,7 +961,8 @@ impl StatsCache {
             .await
     }
 
-    /// Public per-IP overview; `None` when the IP is gone.
+    /// Public per-IP overview; `None` when the IP is gone or has no released
+    /// request.
     pub async fn ip(
         &self,
         store: &Store,

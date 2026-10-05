@@ -45,7 +45,8 @@ CREATE TRIGGER requests_agg_ai AFTER INSERT ON requests BEGIN
   UPDATE requests SET public_at = (
       SELECT datetime('now', '+' || (delay_s + abs(random() % (jitter_s + 1))) || ' seconds')
         FROM publish_cfg WHERE id = 1 AND delay_s + jitter_s > 0)
-   WHERE id = NEW.id AND NEW.public_at IS NULL;
+   WHERE id = NEW.id AND NEW.public_at IS NULL
+     AND (SELECT delay_s + jitter_s FROM publish_cfg WHERE id = 1) > 0;
   UPDATE ips SET pub_request_count = pub_request_count + 1,
                  pub_max_severity = MAX(pub_max_severity, NEW.severity),
                  pub_first_seen = MIN(COALESCE(pub_first_seen, NEW.ts), NEW.ts),
@@ -60,7 +61,10 @@ CREATE TRIGGER requests_agg_ai AFTER INSERT ON requests BEGIN
      AND (SELECT public_at FROM requests WHERE id = NEW.id) IS NULL;
 END;
 
--- Release: a pending row becomes public.
+-- Release: a pending row becomes public. An UPDATE that both releases a
+-- row and changes ip_id/severity/labels_json, or that sets public_at back
+-- from NULL to non-NULL, is unsupported (the public read models would
+-- over-count): release only via `release_due`.
 CREATE TRIGGER requests_pub_release AFTER UPDATE OF public_at ON requests
 WHEN OLD.public_at IS NOT NULL AND NEW.public_at IS NULL BEGIN
   UPDATE ips SET pub_request_count = pub_request_count + 1,
