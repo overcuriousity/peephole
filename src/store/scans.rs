@@ -202,6 +202,17 @@ impl Store {
         .await?)
     }
 
+    /// Queued and running jobs, newest first; `limit` rows. Finished jobs
+    /// are in [`Store::job_history`].
+    pub async fn active_jobs(&self, limit: i64) -> Result<Vec<QueueJob>> {
+        Ok(sqlx::query_as::<_, QueueJob>(sqlx::AssertSqlSafe(format!(
+            "{QUEUE_JOB_SQL} WHERE j.status IN ('queued', 'running') ORDER BY j.id DESC LIMIT ?"
+        )))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Newest jobs first; `limit` rows.
     pub async fn queue_snapshot(&self, limit: i64) -> Result<Vec<QueueJob>> {
         Ok(sqlx::query_as::<_, QueueJob>(sqlx::AssertSqlSafe(format!(
