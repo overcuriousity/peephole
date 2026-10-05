@@ -236,9 +236,18 @@ pub fn duration<S: SevValue>(secs: S) -> String {
 
 /// Second-level tabs: `(key, href, label)`, drawn by `_subtabs.html`.
 pub const LINKS_TABS: &[(&str, &str, &str)] = &[
-    ("fingerprints", "/admin/fingerprints", "Fingerprints"),
-    ("canaries", "/admin/canaries", "Canaries"),
+    ("fingerprints", "/admin/links", "Fingerprints"),
+    ("canaries", "/admin/links/canaries", "Canaries"),
 ];
+
+/// A value's page under Links. Values are percent-encoded: SSH
+/// fingerprints are base64 (`/`, `+`).
+pub fn link_href(kind: &str, value: &str) -> String {
+    format!(
+        "/admin/links/{kind}/{}",
+        crate::admin::public::urlencode(value)
+    )
+}
 pub const CLUSTER_TABS: &[(&str, &str, &str)] = &[
     ("members", "/admin/cluster", "Members"),
     ("access", "/admin/cluster/access", "Access"),

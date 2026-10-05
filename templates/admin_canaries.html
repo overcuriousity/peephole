@@ -3,7 +3,7 @@
 {% block content %}
 {% let sub = "links" %}{% include "_admin_nav.html" %}
 {% let subtab = "canaries" %}{% let tabs = crate::admin::views::LINKS_TABS %}{% let tabs_label = "Links pages" %}{% include "_subtabs.html" %}
-<div class="page-head"><div><h1>Canaries</h1><p class="muted">Credentials served in decoys and the requests that used them again. The period is when they were served.</p></div>{% let base = "/admin/canaries" %}{% include "_range.html" %}</div>
+<div class="page-head"><div><h1>Canaries</h1><p class="muted">Credentials served in decoys and the requests that used them again. The period is when they were served.</p></div>{% let base = "/admin/links/canaries" %}{% include "_range.html" %}</div>
 <div class="stack">
 <div class="tiles kpis">
   <div class="tile"><span class="label">Served</span><div class="value">{{ crate::admin::views::thousands(sum.served) }}</div></div>
@@ -15,7 +15,7 @@
 {% for k in sum.per_kind %}<tr><td>{{ k.kind }}</td><td>{{ k.served }}</td><td>{{ k.reused }}</td></tr>{% endfor %}
 </tbody></table></div></section>{% endif %}
 <section class="card">
-  <form class="filters" method="get" action="/admin/canaries">
+  <form class="filters" method="get" action="/admin/links/canaries">
     <input type="hidden" name="range" value="{{ range.key() }}">
     <label>Kind <select name="kind"><option value="">any</option>{% for k in kinds %}<option{% if q.kind.as_deref() == Some(k) %} selected{% endif %}>{{ k }}</option>{% endfor %}</select></label>
     <label>Node <input name="node" value="{{ q.node.as_deref().unwrap_or_default() }}"></label>

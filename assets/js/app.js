@@ -287,4 +287,9 @@
 
   window.peephole = window.peephole || {};
   window.peephole.ago = ago;
+  // Old /admin/fingerprints#<anchor> links land on the Links index after
+  // the 308 (browsers keep the fragment); the server resolves the anchor.
+  if (location.pathname === "/admin/links" && location.hash.length > 1 && !location.search) {
+    location.replace("/admin/links?anchor=" + encodeURIComponent(decodeURIComponent(location.hash.slice(1))));
+  }
 })();

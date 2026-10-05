@@ -7,6 +7,7 @@ pub mod cluster_access;
 pub mod countries;
 pub mod error;
 pub mod limit;
+pub mod links;
 pub mod lookup;
 pub mod overview;
 pub mod pages;
@@ -122,6 +123,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(assets::router())
         .merge(auth::auth_routes())
         .merge(pages::routes())
+        .merge(links::routes())
         .merge(system::routes())
         .merge(scans::routes())
         .merge(overview::routes())

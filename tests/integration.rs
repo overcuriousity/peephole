@@ -529,7 +529,10 @@ async fn admin_routes_redirect_without_session() {
         "/admin/scans",
         "/admin/scans/1",
         "/admin/scans/1/xml",
-        "/admin/fingerprints",
+        "/admin/links",
+        "/admin/links/canaries",
+        "/admin/links/fp/x",
+        "/admin/api/links/graph?focus=fp:x",
         "/admin/inbox",
         "/admin/system",
         "/admin/system/settings",
@@ -903,24 +906,94 @@ async fn admin_pages_and_deletes_with_session() {
     );
     assert!(xml.text().await.unwrap().contains("RAWXML"));
 
-    let html = get("/admin/fingerprints")
+    let html = get("/admin/links").await.unwrap().text().await.unwrap();
+    assert!(html.contains("CLUSTERHASH") && html.contains("/admin/links/fp/CLUSTERHASH"));
+    let html = get("/admin/links?kind=ssh")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let ssh: String =
+        sqlx::query_scalar("SELECT fingerprint FROM host_keys WHERE kind = 'ssh-hostkey' LIMIT 1")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    let href = peephole::admin::views::link_href("ssh", &ssh);
+    assert!(html.contains(&href), "ssh row links to {href}");
+    // The encoded value round-trips through the path.
+    let html = get(&href).await.unwrap().text().await.unwrap();
+    assert!(
+        html.contains("SSH host key") && html.contains(&ssh) && html.contains("203.0.113.78"),
+        "{html}"
+    );
+    assert!(html.contains("data-link-graph") && html.contains("data-focus=\"ssh:"));
+    let html = get("/admin/links/fp/CLUSTERHASH")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("203.0.113.77") && html.contains("203.0.113.78"));
+    let html = get("/admin/links/fp/NEVERSEEN")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("Not seen") && !html.contains("data-link-graph"));
+    assert_eq!(get("/admin/links/bogus/x").await.unwrap().status(), 404);
+    let html = get("/admin/links/ip/203.0.113.77")
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
     assert!(
-        html.contains("CLUSTERHASH")
-            && html.contains("203.0.113.77")
-            && html.contains("203.0.113.78")
+        html.contains("data-focus=\"ip:203.0.113.77\"")
+            && html.contains("href=\"/ip/203.0.113.77\"")
     );
+    // Old anchors.
+    let r = get("/admin/links?anchor=CLUSTERHASH").await.unwrap();
     assert!(
-        html.contains("SSH host key")
-            && html.contains("TLS certificate")
-            && html.contains("id=\"ssh-")
-            && html.contains("kind&#34;:&#34;tls"),
-        "shared host keys on the fingerprints page and in its graph"
+        r.url().path().ends_with("/admin/links/fp/CLUSTERHASH"),
+        "{}",
+        r.url()
     );
+    let a = peephole::store::hostkeys::anchor("ssh-hostkey", &ssh);
+    let r = get(&format!("/admin/links?anchor={a}")).await.unwrap();
+    assert!(
+        r.url().path().starts_with("/admin/links/ssh/"),
+        "{}",
+        r.url()
+    );
+    let html = get("/admin/links?anchor=ssh-000000000000")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("no longer matches"));
+    // The graph API.
+    let j: serde_json::Value =
+        get("/admin/api/links/graph?focus=fp:CLUSTERHASH&depth=9&types=fp,bogus")
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let nodes = j["nodes"].as_array().unwrap();
+    assert_eq!(nodes[0]["id"], "fp:CLUSTERHASH");
+    assert!(nodes.iter().any(|n| n["id"] == "ip:203.0.113.78"));
+    assert_eq!(j["truncated"], false);
+    assert_eq!(
+        get("/admin/api/links/graph?focus=bogus")
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(get("/admin/api/links/graph").await.unwrap().status(), 400);
     let html = get("/admin/inbox").await.unwrap().text().await.unwrap();
     assert!(html.contains("lost@example.org"));
     let html = get("/admin/system/keys")
@@ -942,7 +1015,9 @@ async fn admin_pages_and_deletes_with_session() {
         "/admin/scans",
         &format!("/admin/requests/{rid}"),
         &format!("/admin/scans/{sid}"),
-        "/admin/fingerprints",
+        "/admin/links",
+        "/admin/links/fp/CLUSTERHASH",
+        "/admin/links/canaries",
         "/admin/analytics",
         "/ip/203.0.113.78",
         "/admin/system/keys",
@@ -2619,7 +2694,7 @@ async fn canaries_page_lists_reuses_and_filters() {
     let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
     let (admin, admin_base) = enrolled_admin_client(store.clone(), cfg).await;
     let page = admin
-        .get(format!("{admin_base}/admin/canaries?range=all"))
+        .get(format!("{admin_base}/admin/links/canaries?range=all"))
         .send()
         .await
         .unwrap()
@@ -2631,7 +2706,9 @@ async fn canaries_page_lists_reuses_and_filters() {
         "{page}"
     );
     let page = admin
-        .get(format!("{admin_base}/admin/canaries?range=all&source=same"))
+        .get(format!(
+            "{admin_base}/admin/links/canaries?range=all&source=same"
+        ))
         .send()
         .await
         .unwrap()
@@ -2642,7 +2719,7 @@ async fn canaries_page_lists_reuses_and_filters() {
     // An IP the store does not know matches nothing, not everything.
     let page = admin
         .get(format!(
-            "{admin_base}/admin/canaries?range=all&ip=198.51.100.250"
+            "{admin_base}/admin/links/canaries?range=all&ip=198.51.100.250"
         ))
         .send()
         .await
@@ -2659,16 +2736,13 @@ async fn canaries_page_lists_reuses_and_filters() {
         .text()
         .await
         .unwrap();
-    assert!(
-        nav.contains("href=\"/admin/fingerprints\">Links<"),
-        "links tab"
-    );
+    assert!(nav.contains("href=\"/admin/links\">Links<"), "links tab");
     let anon = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
     assert_ne!(
-        anon.get(format!("{admin_base}/admin/canaries"))
+        anon.get(format!("{admin_base}/admin/links/canaries"))
             .send()
             .await
             .unwrap()
@@ -2784,7 +2858,7 @@ async fn admin_nav_groups_pages_under_seven_tabs() {
     ] {
         assert!(!n.contains(gone), "nav still has {gone}");
     }
-    let fp = get("/admin/fingerprints").await;
+    let fp = get("/admin/links").await;
     assert_eq!(current(&fp).as_deref(), Some("Links"));
     assert!(
         fp.contains("aria-label=\"Links pages\""),
@@ -2806,9 +2880,12 @@ async fn admin_nav_groups_pages_under_seven_tabs() {
         live.contains("<th>Started</th>") && !live.contains("<th>Error</th>"),
         "live queue columns: {live}"
     );
-    assert!(fp.contains("href=\"/admin/canaries\""), "links sub-tabs");
+    assert!(
+        fp.contains("href=\"/admin/links/canaries\""),
+        "links sub-tabs"
+    );
     assert_eq!(
-        current(&get("/admin/canaries").await).as_deref(),
+        current(&get("/admin/links/canaries").await).as_deref(),
         Some("Links")
     );
     let sys = get("/admin/system").await;
@@ -2830,6 +2907,12 @@ async fn moved_admin_pages_redirect_permanently() {
     for (from, to) in [
         ("/admin/keys", "/admin/system/keys"),
         ("/admin/export", "/admin/system/export"),
+        ("/admin/fingerprints", "/admin/links"),
+        ("/admin/canaries", "/admin/links/canaries"),
+        (
+            "/admin/canaries?range=all&ip=203.0.113.9",
+            "/admin/links/canaries?range=all&ip=203.0.113.9",
+        ),
         ("/admin/queue", "/admin/scans"),
         (
             "/admin/queue?status=failed",

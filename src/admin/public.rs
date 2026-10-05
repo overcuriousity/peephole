@@ -238,7 +238,7 @@ pub(crate) fn qs_without_page(pairs: &[(&str, Option<String>)]) -> String {
     out
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     let mut o = String::new();
     for b in s.bytes() {
         match b {
