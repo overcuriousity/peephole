@@ -172,6 +172,35 @@ mod tests {
         assert!(fp.starts_with("pr11nn01"), "{fp}");
     }
 
+    /// Edge cases, as FoxIO's implementation reads them.
+    #[test]
+    fn edge_cases_follow_the_reference() {
+        let fp = |head: &str| ja4h(head.as_bytes()).unwrap();
+        let parts = |head: &str| {
+            let f = fp(head);
+            let p: Vec<String> = f.split('_').map(String::from).collect();
+            p
+        };
+        // The first Cookie header is read; a second one is only a flag.
+        let p = parts("GET / HTTP/1.1\r\nCookie: b=2\r\nCookie: a=1\r\n\r\n");
+        assert_eq!(
+            (&p[0][..6], &p[2], &p[3]),
+            ("ge11cn", &sha12("b"), &sha12("b=2"))
+        );
+        // Pairs are split on "; " only.
+        let p = parts("GET / HTTP/1.1\r\nCookie: a=1;b=2\r\n\r\n");
+        assert_eq!(p[3], sha12("a=1;b=2"));
+        // An empty Cookie header: the flag, no pairs.
+        let p = parts("GET / HTTP/1.1\r\nCookie:\r\n\r\n");
+        assert_eq!((&p[0][..6], p[2].as_str()), ("ge11cn", "000000000000"));
+        // Methods are lowercased and cut, whatever they are.
+        assert!(fp("get / HTTP/1.1\r\n\r\n").starts_with("ge11"));
+        assert!(fp("M-SEARCH * HTTP/1.1\r\n\r\n").starts_with("m-11"));
+        // The language is cut at the first comma only.
+        let head = "GET / HTTP/1.1\r\nAccept-Language: en;q=0.9\r\n\r\n";
+        assert_eq!(&fp(head)[8..12], "en;q");
+    }
+
     #[test]
     fn the_header_count_stops_at_99() {
         let mut head = String::from("GET / HTTP/1.1\r\n");

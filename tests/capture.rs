@@ -734,11 +734,21 @@ async fn the_plain_listener_records_the_raw_head() {
         .fetch_one(&store.pool)
         .await
         .unwrap();
+    assert_eq!(ja4h, None, "a proxy's request, not the client's");
+}
+
+#[tokio::test]
+async fn a_direct_plain_request_gets_its_ja4h() {
+    let (p, _s, store, _d, _stop) = spawn_listeners("").await;
+    let mut tcp = tokio::net::TcpStream::connect(p).await.unwrap();
+    let head = "GET /a HTTP/1.0\r\nHost: x\r\nUser-AGENT: Q\r\n\r\n";
+    raw_request(&mut tcp, head).await;
+    let ja4h: Option<String> = sqlx::query_scalar("SELECT ja4h FROM requests")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
     assert_eq!(ja4h, peephole::trap::ja4h::ja4h(head.as_bytes()));
-    assert!(
-        ja4h.unwrap().starts_with("ge11nn03"),
-        "X-Forwarded-For is a header too"
-    );
+    assert!(ja4h.unwrap().starts_with("ge10nn02"));
 }
 
 /// The export's weights add up to every answered request, light rows

@@ -304,7 +304,11 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(rules)
     .bind(r.decoy_v)
     .bind(r.decoy_site.as_deref().map(|w| cut(w, 64)))
-    .bind(r.raw_head.as_deref().and_then(crate::trap::ja4h::ja4h))
+    .bind(super::ja4h::derive(
+        r.raw_head.as_deref(),
+        r.transport.as_deref(),
+        r.via_proxy,
+    ))
     .bind(super::ja4h::JA4H_V)
     .execute(&mut *conn)
     .await?;

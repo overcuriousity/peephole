@@ -49,6 +49,19 @@ const UA_SQL: &str = "COALESCE((SELECT json_extract(h.value, '$[1]')
       FROM json_each(CASE WHEN json_valid(r.headers_json) THEN r.headers_json ELSE '[]' END) h
       WHERE lower(json_extract(h.value, '$[0]')) = 'user-agent' LIMIT 1), '(none)')";
 
+/// The top values of a fingerprint column, rows without one left out; `w`
+/// is the time window's `AND …` (or nothing). In a window, `+` keeps a
+/// partial index on the column out of the plan: it would read every
+/// fingerprinted row to find the window's.
+fn ranked_fp(col: &str, w: &str) -> String {
+    let plus = if w.is_empty() { "" } else { "+" };
+    format!(
+        "SELECT r.{col} AS name, COUNT(*) AS count, COUNT(DISTINCT r.ip_id) AS ips
+         FROM requests r WHERE {plus}r.{col} IS NOT NULL{w}
+         GROUP BY name ORDER BY count DESC, name LIMIT {TOP}"
+    )
+}
+
 impl Store {
     async fn named_ips(&self, sql: String, since: Option<&'static str>) -> Result<Vec<NamedIps>> {
         let mut q = sqlx::query_as::<_, NamedIps>(sqlx::AssertSqlSafe(sql));
@@ -99,16 +112,8 @@ impl Store {
         let total_requests = total.fetch_one(&self.read).await?;
         let paths = self.named_ips(ranked("r.path"), since).await?;
         let user_agents = self.named_ips(ranked(UA_SQL), since).await?;
-        // A fingerprint column, rows without one left out.
-        let ranked_fp = |col: &str| {
-            format!(
-                "SELECT r.{col} AS name, COUNT(*) AS count, COUNT(DISTINCT r.ip_id) AS ips
-                 FROM requests r WHERE r.{col} IS NOT NULL{w}
-                 GROUP BY name ORDER BY count DESC, name LIMIT {TOP}"
-            )
-        };
-        let ja4 = self.named_ips(ranked_fp("ja4"), since).await?;
-        let ja4h = self.named_ips(ranked_fp("ja4h"), since).await?;
+        let ja4 = self.named_ips(ranked_fp("ja4", w), since).await?;
+        let ja4h = self.named_ips(ranked_fp("ja4h", w), since).await?;
         let methods = self.named_in(shares("r.method"), since).await?;
         let transports = self
             .named_in(shares("COALESCE(r.transport, 'unknown')"), since)
@@ -378,6 +383,26 @@ mod tests {
         assert_eq!(a.transports[0].name, "https");
         assert_eq!(a.abuse[0].name, "not looked up");
         assert_eq!(a.abuse[0].count, 2);
+    }
+
+    /// Over a time window the fingerprint lists read the window through
+    /// the time index, not every fingerprinted row through the JA4H one.
+    #[tokio::test]
+    async fn fingerprint_lists_read_only_the_window() {
+        let s = seeded().await;
+        for col in ["ja4", "ja4h"] {
+            let sql = ranked_fp(col, " AND r.ts >= datetime('now', ?)");
+            let plan: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                    .bind("-24 hours")
+                    .fetch_all(&s.pool)
+                    .await
+                    .unwrap();
+            assert!(
+                plan.iter().any(|p| p.3.contains("idx_requests_ts")),
+                "{col}: {plan:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -11,7 +11,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   derived from its raw head on each node (rows stored before are derived
   in the background at start). Shown on the request page, as "top JA4H" in
   Analytics and as a request search filter, and exported as `ja4h`. Never
-  public. HTTP/2 requests have none (no raw head is kept for them).
+  public. HTTP/2 requests have none (no raw head is kept for them), nor
+  does plain HTTP through a trusted proxy (nginx on port 80): its head is
+  the proxy's request, not the client's.
 
 - Cluster: per-level scanner weights. A scanner that fails a scan level
   (hard failures, timeouts aside) more often than the best live scanner

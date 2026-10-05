@@ -4,40 +4,60 @@
 
 use anyhow::Result;
 
-/// Version of the JA4H derivation; rows derived by an older one are derived
-/// again by [`backfill`].
+/// Version of the JA4H derivation a row was read with (0: not yet). A
+/// change to the derivation bumps it, and its migration sets `ja4h_v = 0`
+/// on the rows to derive again.
 pub const JA4H_V: i64 = 1;
 
-/// Rows read per write transaction by [`backfill`].
-const BACKFILL_BATCH: i64 = 500;
+/// The JA4H of a request as stored. None for plain HTTP from a trusted
+/// proxy: the head is the proxy's request (nginx sends HTTP/1.1 and its own
+/// Host and X-Forwarded-For), not the client's. HTTPS through one is the
+/// client's own bytes behind a PROXY header.
+pub(crate) fn derive(
+    raw_head: Option<&[u8]>,
+    transport: Option<&str>,
+    via_proxy: Option<bool>,
+) -> Option<String> {
+    if transport == Some("http") && via_proxy == Some(true) {
+        return None;
+    }
+    raw_head.and_then(crate::trap::ja4h::ja4h)
+}
+
+/// Rows read per write transaction by [`backfill`] (heads are up to 64 KiB).
+const BACKFILL_BATCH: i64 = 100;
 /// Pause between [`backfill`]'s transactions, so the trap's and
 /// replication's writes get the lock in between.
 const BACKFILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Derive the JA4H of the rows stored before this build (or by an older
-/// derivation), a batch at a time, each batch its own short write
-/// transaction with a pause after it. Walks the table once by id. Returns
-/// how many rows were read.
+/// The rows [`backfill`] has left, through `idx_requests_ja4h_pending`
+/// (which holds only those).
+const PENDING: &str = "SELECT id, raw_head, transport, via_proxy FROM requests
+     WHERE raw_head IS NOT NULL AND ja4h_v = 0 AND id > ? ORDER BY id LIMIT ?";
+
+/// A pending row: id, head, transport, via proxy.
+type Pending = (i64, Vec<u8>, Option<String>, Option<bool>);
+
+/// Derive the JA4H of the rows stored before this build (or marked for a
+/// new derivation), a batch at a time, each batch its own short write
+/// transaction with a pause after it. Walks the pending rows once by id.
+/// Returns how many rows were read.
 pub async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
     let (mut done, mut after) = (0, 0i64);
     loop {
-        let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
-            "SELECT id, raw_head FROM requests
-             WHERE raw_head IS NOT NULL AND ja4h_v < ? AND id > ? ORDER BY id LIMIT ?",
-        )
-        .bind(JA4H_V)
-        .bind(after)
-        .bind(BACKFILL_BATCH)
-        .fetch_all(pool)
-        .await?;
-        let Some(&(last, _)) = rows.last() else {
+        let rows: Vec<Pending> = sqlx::query_as(PENDING)
+            .bind(after)
+            .bind(BACKFILL_BATCH)
+            .fetch_all(pool)
+            .await?;
+        let Some((last, ..)) = rows.last() else {
             return Ok(done);
         };
-        after = last;
+        after = *last;
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        for (id, head) in &rows {
+        for (id, head, transport, via_proxy) in &rows {
             sqlx::query("UPDATE requests SET ja4h = ?, ja4h_v = ? WHERE id = ?")
-                .bind(crate::trap::ja4h::ja4h(head))
+                .bind(derive(Some(head), transport.as_deref(), *via_proxy))
                 .bind(JA4H_V)
                 .bind(id)
                 .execute(&mut *tx)
@@ -65,6 +85,10 @@ mod tests {
     }
 
     async fn insert(s: &Store, raw_head: Option<&[u8]>) -> i64 {
+        insert_via(s, raw_head, "http", false).await
+    }
+
+    async fn insert_via(s: &Store, raw_head: Option<&[u8]>, transport: &str, proxy: bool) -> i64 {
         let ip = s.upsert_ip("203.0.113.1".parse().unwrap()).await.unwrap();
         s.insert_request(&NewRequest {
             ip_id: ip.id,
@@ -73,6 +97,8 @@ mod tests {
             headers_json: "[]".into(),
             labels_json: "[]".into(),
             raw_head: raw_head.map(<[u8]>::to_vec),
+            transport: Some(transport.into()),
+            via_proxy: Some(proxy),
             ..Default::default()
         })
         .await
@@ -106,5 +132,45 @@ mod tests {
         assert_eq!(backfill(&s.pool).await.unwrap(), 2);
         assert_eq!(ja4h_of(&s, id).await, crate::trap::ja4h::ja4h(HEAD));
         assert_eq!(backfill(&s.pool).await.unwrap(), 0, "each row once");
+    }
+
+    /// Plain HTTP from a trusted proxy is the proxy's request (nginx sends
+    /// HTTP/1.1 and its own Host and X-Forwarded-For), not the client's.
+    /// HTTPS through one is the client's bytes behind a PROXY header.
+    #[tokio::test]
+    async fn a_head_an_http_proxy_rewrote_has_none() {
+        let s = store().await;
+        let proxied = insert_via(&s, Some(HEAD), "http", true).await;
+        let tls = insert_via(&s, Some(HEAD), "https", true).await;
+        let direct = insert_via(&s, Some(HEAD), "http", false).await;
+        assert_eq!(ja4h_of(&s, proxied).await, None);
+        assert!(ja4h_of(&s, tls).await.is_some());
+        assert!(ja4h_of(&s, direct).await.is_some());
+        sqlx::query("UPDATE requests SET ja4h = NULL, ja4h_v = 0")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(backfill(&s.pool).await.unwrap(), 3);
+        assert_eq!(ja4h_of(&s, proxied).await, None, "nor from the backfill");
+        assert!(ja4h_of(&s, tls).await.is_some());
+    }
+
+    /// The backfill finds what is left through an index of only those
+    /// rows, not by walking the table at every start.
+    #[tokio::test]
+    async fn the_backfill_reads_only_pending_rows() {
+        let s = store().await;
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {PENDING}")))
+                .bind(0)
+                .bind(BACKFILL_BATCH)
+                .fetch_all(&s.pool)
+                .await
+                .unwrap();
+        assert!(
+            plan.iter()
+                .any(|p| p.3.contains("idx_requests_ja4h_pending")),
+            "{plan:?}"
+        );
     }
 }
