@@ -5,6 +5,23 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Added
+
+- The wall lists the newest requests of the last 24 hours ("Recent
+  requests", `[public] recent_rows`, default 50): time, IP, method, path
+  (no query string, cut at 80 characters), severity and, when shown,
+  labels.
+
+### Changed
+
+- Public pages and feeds (wall, IP directory, IP pages, `/api/stats`,
+  `/api/map`, `/api/blocklist`) show a request only after
+  `[public] delay_minutes` plus a random 0–`jitter_minutes` (default
+  5 + 0–5 min). Nothing on them updates live any more: no auto-refresh, no
+  "last hit … ago", static UTC times.
+- The live "Recent activity" feed moved from the wall to the admin
+  Overview.
+
 ## [0.4.0] - 2026-10-05
 
 ### Added

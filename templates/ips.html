@@ -56,8 +56,8 @@
       <td class="num">{{ crate::admin::views::thousands(i.request_count) }}{% let v = i.request_count %}{% let max = count_max %}{% include "_bar.html" %}</td>
       <td>{% let sev = i.max_severity %}{% include "_severity.html" %}</td>
       {% if chrome.authed %}<td class="num mono">{% if let Some(a) = i.abuse_score %}{{ a }}{% else %}<span class="muted">—</span>{% endif %}</td>{% endif %}
-      <td class="ts">{{ i.first_seen }}</td>
-      <td class="ts"><time datetime="{{ i.last_seen }}" data-ago title="{{ i.last_seen }} UTC">{{ crate::admin::views::ago(i.last_seen) }}</time> ago</td>
+      <td class="ts">{{ crate::admin::views::minute(i.first_seen) }}</td>
+      <td class="ts">{{ crate::admin::views::minute(i.last_seen) }}</td>
     </tr>
   {% endfor %}
   {% if page.items.is_empty() %}<tr><td colspan="{{ 7 + chrome.authed as usize + can_delete as usize }}" class="empty">No IPs match.</td></tr>{% endif %}

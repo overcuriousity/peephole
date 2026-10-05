@@ -285,6 +285,17 @@ default; `retention_days = N` (top level, at least 7) keeps only the last N
 days on this node: a standalone node deletes older requests and scan results,
 a cluster node drops its old copies and history (see docs/cluster.md).
 
+### Public pages are delayed
+
+The wall, the IP directory, IP pages, `/api/stats`, `/api/map` and
+`/api/blocklist` show a request only after `[public] delay_minutes` plus
+a random 0 to `jitter_minutes` (5 + 0–5 min by default), counted from when
+this node stored it. Someone probing an address and watching the wall can't
+tell from the timing whether it was one of yours. Signed-in admins see
+everything at once; the live feed is on the admin Overview. A changed delay
+applies to requests stored after the restart. Setting both to 0 publishes
+at once (logged as a warning).
+
 ## Building and releases
 
 Requires Rust 1.94 or newer (`rust-version` in `Cargo.toml`):

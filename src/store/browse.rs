@@ -220,10 +220,17 @@ pub(crate) fn like_escape(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-const IP_SUMMARY_SELECT: &str =
-    "SELECT i.ip, i.country, i.asn, i.asn_org, i.is_tor_exit AS is_tor, i.first_seen, i.last_seen,
-            i.request_count, i.max_severity, i.abuse_score
-     FROM ips i";
+/// `IpSummary` columns as `a` sees them.
+fn ip_summary_select(a: Audience) -> String {
+    let p = a.rm();
+    format!(
+        "SELECT i.ip, i.country, i.asn, i.asn_org, i.is_tor_exit AS is_tor,
+                i.{p}first_seen AS first_seen, i.{p}last_seen AS last_seen,
+                i.{p}request_count AS request_count, i.{p}max_severity AS max_severity,
+                i.abuse_score
+         FROM ips i"
+    )
+}
 
 /// Who a request listing is for. A mistyped legitimate API call lands in
 /// the trap with its credentials in the query string, so query strings are
@@ -254,6 +261,48 @@ impl Audience {
             Self::Public => "NULL",
         }
     }
+    /// `AND`-fragment keeping only the requests this audience may count
+    /// (`alias` names a `requests` table): the public sees released rows.
+    /// Phrased as a subquery on the partial index `idx_requests_pending`
+    /// rather than `public_at IS NULL`, which would force a row lookup and
+    /// cost the `idx_requests_ts` covering scan of count queries.
+    pub(crate) fn released(self, alias: &str) -> String {
+        match self {
+            Self::Admin => String::new(),
+            Self::Public => format!(
+                " AND {alias}.id NOT IN (SELECT id FROM requests WHERE public_at IS NOT NULL)"
+            ),
+        }
+    }
+    /// Prefix of the per-IP read models (`request_count`, `max_severity`,
+    /// `first_seen`, `last_seen`) this audience reads: `pub_` for the public.
+    pub(crate) fn rm(self) -> &'static str {
+        match self {
+            Self::Admin => "",
+            Self::Public => "pub_",
+        }
+    }
+    /// The `ip_labels` column holding this audience's count.
+    pub(crate) fn label_count(self) -> &'static str {
+        match self {
+            Self::Admin => "count",
+            Self::Public => "pub_count",
+        }
+    }
+    /// `AND`-fragment for the scans this audience may count (`alias` names
+    /// the scans table): the public sees scans finished at least the
+    /// publication delay ago, of IPs it can see.
+    pub(crate) fn scans(self, alias: &str) -> String {
+        match self {
+            Self::Admin => String::new(),
+            Self::Public => format!(
+                " AND {alias}.finished_at <= datetime('now', '-' || \
+                 (SELECT delay_s FROM publish_cfg WHERE id = 1) || ' seconds') \
+                 AND EXISTS (SELECT 1 FROM ips pi WHERE pi.id = {alias}.ip_id \
+                 AND pi.pub_request_count > 0)"
+            ),
+        }
+    }
 }
 
 fn request_row_select(a: Audience) -> String {
@@ -275,16 +324,20 @@ fn nonempty(s: &Option<String>) -> Option<String> {
 
 /// SQL fragments for an `IpFilter`; `None` when the query box holds garbage.
 /// Everything is answered from the `ips` row and its read models
-/// (`request_count`, `max_severity`, `ip_key`, `ip_labels`), never by
+/// (`request_count`, `max_severity`, `ip_key`, `ip_labels`; for the public
+/// the released-only variants `pub_*` and `ip_labels.pub_count`), never by
 /// aggregating requests.
 struct IpFilterSql {
     where_sql: String,
     binds: Vec<String>,
 }
 
-fn ip_filter_sql(f: &IpFilter) -> Option<IpFilterSql> {
+fn ip_filter_sql(f: &IpFilter, a: Audience) -> Option<IpFilterSql> {
     let mut wheres: Vec<String> = vec![];
     let mut binds: Vec<String> = vec![];
+    if a == Audience::Public {
+        wheres.push("i.pub_request_count > 0".into());
+    }
     if let Some(q) = nonempty(&f.q) {
         match parse_q(&q) {
             IpQuery::Exact(ip) => {
@@ -313,19 +366,22 @@ fn ip_filter_sql(f: &IpFilter) -> Option<IpFilterSql> {
         wheres.push("i.country = ?".into());
         binds.push(c.to_ascii_uppercase());
     }
-    if let Some(a) = f.asn {
+    if let Some(asn) = f.asn {
         wheres.push("i.asn = ?".into());
-        binds.push(a.to_string());
+        binds.push(asn.to_string());
     }
     if f.tor.as_deref() == Some("1") {
         wheres.push("i.is_tor_exit = 1".into());
     }
     if let Some(l) = nonempty(&f.label) {
-        wheres.push("i.id IN (SELECT l.ip_id FROM ip_labels l WHERE l.label = ?)".into());
+        wheres.push(format!(
+            "i.id IN (SELECT l.ip_id FROM ip_labels l WHERE l.label = ? AND l.{} > 0)",
+            a.label_count()
+        ));
         binds.push(l);
     }
     if let Some(m) = f.min_severity {
-        wheres.push("i.max_severity >= CAST(? AS INTEGER)".into());
+        wheres.push(format!("i.{}max_severity >= CAST(? AS INTEGER)", a.rm()));
         binds.push(m.to_string());
     }
     if let Some(m) = f.min_abuse {
@@ -495,21 +551,29 @@ impl Count {
 
 impl Store {
     pub async fn list_ips(&self, f: &IpFilter) -> Result<Page<IpSummary>> {
+        self.list_ips_as(f, Audience::Admin).await
+    }
+
+    pub async fn list_ips_as(&self, f: &IpFilter, a: Audience) -> Result<Page<IpSummary>> {
         let page = page_num(f.page);
-        let Some(fs) = ip_filter_sql(f) else {
+        let Some(fs) = ip_filter_sql(f, a) else {
             return Ok(Page {
                 items: vec![],
                 page,
                 has_next: false,
             });
         };
+        let p = a.rm();
         let order = match f.sort.as_deref() {
-            Some("recent") => "i.last_seen DESC",
-            Some("abuse") => "i.abuse_score IS NULL, i.abuse_score DESC, i.last_seen DESC",
-            _ => "i.request_count DESC, i.last_seen DESC",
+            Some("recent") => format!("i.{p}last_seen DESC"),
+            Some("abuse") => {
+                format!("i.abuse_score IS NULL, i.abuse_score DESC, i.{p}last_seen DESC")
+            }
+            _ => format!("i.{p}request_count DESC, i.{p}last_seen DESC"),
         };
         let sql = format!(
-            "{IP_SUMMARY_SELECT}{} ORDER BY {order} LIMIT {} OFFSET {}",
+            "{}{} ORDER BY {order} LIMIT {} OFFSET {}",
+            ip_summary_select(a),
             fs.where_sql,
             PAGE_SIZE + 1,
             offset(page)
@@ -524,7 +588,7 @@ impl Store {
     /// Up to [`MATCH_LIMIT`] ids of IPs matching the filter, in id order,
     /// above `after` (keyset paging, so bulk delete covers every match).
     pub async fn matching_ip_ids_after(&self, f: &IpFilter, after: i64) -> Result<Vec<i64>> {
-        let Some(fs) = ip_filter_sql(f) else {
+        let Some(fs) = ip_filter_sql(f, Audience::Admin) else {
             return Ok(vec![]);
         };
         let glue = if fs.where_sql.is_empty() {
@@ -550,7 +614,7 @@ impl Store {
 
     /// Number of IPs matching the filter.
     pub async fn count_ips(&self, f: &IpFilter) -> Result<i64> {
-        let Some(fs) = ip_filter_sql(f) else {
+        let Some(fs) = ip_filter_sql(f, Audience::Admin) else {
             return Ok(0);
         };
         let sql = format!("SELECT COUNT(*) FROM ips i{}", fs.where_sql);
@@ -613,26 +677,43 @@ impl Store {
     /// The IP's public aggregates, from its read models. Only the week and
     /// the calendar read requests, through the (ip_id, ts) index.
     pub async fn ip_overview(&self, ip_id: i64) -> Result<Option<IpOverview>> {
-        let Some(ip) = sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE id = ?")
+        self.ip_overview_as(ip_id, Audience::Admin).await
+    }
+
+    /// [`Store::ip_overview`] as `a` sees it; `None` for the public when
+    /// none of the IP's requests is released.
+    pub async fn ip_overview_as(&self, ip_id: i64, a: Audience) -> Result<Option<IpOverview>> {
+        let (p, lc, rel) = (a.rm(), a.label_count(), a.released("requests"));
+        let row_sql = match a {
+            Audience::Admin => "SELECT * FROM ips WHERE id = ?",
+            Audience::Public => {
+                "SELECT id, ip, pub_first_seen AS first_seen, pub_last_seen AS last_seen,
+                        country, asn, asn_org, is_tor_exit, fp_claimed, notes,
+                        pub_request_count AS request_count, pub_max_severity AS max_severity
+                 FROM ips WHERE id = ? AND pub_request_count > 0"
+            }
+        };
+        let Some(ip) = sqlx::query_as::<_, IpRow>(row_sql)
             .bind(ip_id)
             .fetch_optional(&self.read)
             .await?
         else {
             return Ok(None);
         };
-        let labels = sqlx::query_as::<_, Named>(
-            "SELECT label AS name, count FROM ip_labels WHERE ip_id = ?
-             ORDER BY count DESC, label LIMIT 20",
-        )
+        let labels = sqlx::query_as::<_, Named>(sqlx::AssertSqlSafe(format!(
+            "SELECT label AS name, {lc} AS count FROM ip_labels WHERE ip_id = ? AND {lc} > 0
+             ORDER BY count DESC, label LIMIT 20"
+        )))
         .bind(ip_id)
         .fetch_all(&self.read)
         .await?;
         let mut fam: std::collections::HashMap<&'static str, i64> = Default::default();
-        for (label, n) in
-            sqlx::query_as::<_, (String, i64)>("SELECT label, count FROM ip_labels WHERE ip_id = ?")
-                .bind(ip_id)
-                .fetch_all(&self.read)
-                .await?
+        for (label, n) in sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(format!(
+            "SELECT label, {lc} FROM ip_labels WHERE ip_id = ? AND {lc} > 0"
+        )))
+        .bind(ip_id)
+        .fetch_all(&self.read)
+        .await?
         {
             *fam.entry(crate::classify::label_family(&label))
                 .or_default() += n;
@@ -646,11 +727,11 @@ impl Store {
                 })
             })
             .collect();
-        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT strftime('%Y-%m-%dT%H:00', ts) AS h, severity, COUNT(*)
-             FROM requests WHERE ip_id = ? AND ts >= datetime('now','-7 days')
-             GROUP BY h, severity ORDER BY h",
-        )
+             FROM requests WHERE ip_id = ? AND ts >= datetime('now','-7 days'){rel}
+             GROUP BY h, severity ORDER BY h"
+        )))
         .bind(ip_id)
         .fetch_all(&self.read)
         .await?;
@@ -667,19 +748,19 @@ impl Store {
             b.count += n;
             b.by_severity[sev.clamp(0, 4) as usize] += n;
         }
-        let calendar = sqlx::query_as::<_, CalendarDay>(
+        let calendar = sqlx::query_as::<_, CalendarDay>(sqlx::AssertSqlSafe(format!(
             "SELECT date(ts) AS day, COUNT(*) AS count, MAX(severity) AS max_severity
-             FROM requests WHERE ip_id = ? AND ts >= date('now', ?)
-             GROUP BY day ORDER BY day",
-        )
+             FROM requests WHERE ip_id = ? AND ts >= date('now', ?){rel}
+             GROUP BY day ORDER BY day"
+        )))
         .bind(ip_id)
         .bind(format!("-{} days", CALENDAR_DAYS - 1))
         .fetch_all(&self.read)
         .await?;
-        let (rank, ranked): (i64, i64) = sqlx::query_as(
-            "SELECT (SELECT COUNT(*) + 1 FROM ips WHERE request_count > ?1),
-                    (SELECT COUNT(*) FROM ips WHERE request_count > 0)",
-        )
+        let (rank, ranked): (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT (SELECT COUNT(*) + 1 FROM ips WHERE {p}request_count > ?1),
+                    (SELECT COUNT(*) FROM ips WHERE {p}request_count > 0)"
+        )))
         .bind(ip.request_count)
         .fetch_one(&self.read)
         .await?;
@@ -696,7 +777,7 @@ impl Store {
                 };
                 let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT COUNT(*) FROM ips WHERE ip_key BETWEEN ? AND ? AND id != ?
-                     AND request_count > 0{v6}"
+                     AND {p}request_count > 0{v6}"
                 )))
                 .bind(&lo)
                 .bind(&hi)
@@ -704,9 +785,10 @@ impl Store {
                 .fetch_one(&self.read)
                 .await?;
                 let top = sqlx::query_as::<_, Neighbour>(sqlx::AssertSqlSafe(format!(
-                    "SELECT ip, request_count, max_severity FROM ips
-                     WHERE ip_key BETWEEN ? AND ? AND id != ? AND request_count > 0{v6}
-                     ORDER BY request_count DESC, ip LIMIT 8"
+                    "SELECT ip, {p}request_count AS request_count, {p}max_severity AS max_severity
+                     FROM ips
+                     WHERE ip_key BETWEEN ? AND ? AND id != ? AND {p}request_count > 0{v6}
+                     ORDER BY {p}request_count DESC, ip LIMIT 8"
                 )))
                 .bind(&lo)
                 .bind(&hi)
@@ -717,18 +799,17 @@ impl Store {
             }
             Err(_) => (String::new(), 0, vec![]),
         };
-        let asn_count: i64 = match ip.asn {
-            Some(a) => {
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM ips WHERE asn = ? AND id != ? AND request_count > 0",
-                )
+        let asn_count: i64 =
+            match ip.asn {
+                Some(a) => sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM ips WHERE asn = ? AND id != ? AND {p}request_count > 0"
+                )))
                 .bind(a)
                 .bind(ip_id)
                 .fetch_one(&self.read)
-                .await?
-            }
-            None => 0,
-        };
+                .await?,
+                None => 0,
+            };
         Ok(Some(IpOverview {
             request_count: ip.request_count,
             max_severity: ip.max_severity,
@@ -810,6 +891,125 @@ mod ts_tests {
 mod tests {
     use super::*;
     use crate::store::requests::NewRequest;
+
+    /// A released hit from `known`, then (delay on) a pending hit from
+    /// `known` and one from `fresh`.
+    async fn delayed() -> (Store, tempfile::TempDir, i64, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let req = |ip_id, path: &str, sev, labels: &str| NewRequest {
+            ip_id,
+            method: "GET".into(),
+            path: path.into(),
+            headers_json: "[]".into(),
+            labels_json: labels.into(),
+            severity: sev,
+            ..Default::default()
+        };
+        let known = s.upsert_ip("203.0.113.1".parse().unwrap()).await.unwrap();
+        s.insert_request(&req(known.id, "/old", 1, r#"["wp"]"#))
+            .await
+            .unwrap();
+        s.set_publish_delay(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        s.insert_request(&req(known.id, "/new", 4, r#"["sqli"]"#))
+            .await
+            .unwrap();
+        let fresh = s.upsert_ip("203.0.113.2".parse().unwrap()).await.unwrap();
+        s.insert_request(&req(fresh.id, "/fresh", 4, r#"["sqli"]"#))
+            .await
+            .unwrap();
+        (s, dir, known.id, fresh.id)
+    }
+
+    #[tokio::test]
+    async fn public_directory_lists_released_ips_with_public_counts() {
+        let (s, _d, _, _) = delayed().await;
+        let p = s
+            .list_ips_as(&IpFilter::default(), Audience::Public)
+            .await
+            .unwrap();
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].ip, "203.0.113.1");
+        assert_eq!((p.items[0].request_count, p.items[0].max_severity), (1, 1));
+        let by_label = |l: &str| IpFilter {
+            label: Some(l.into()),
+            ..Default::default()
+        };
+        assert!(
+            s.list_ips_as(&by_label("sqli"), Audience::Public)
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let sev4 = IpFilter {
+            min_severity: Some(4),
+            ..Default::default()
+        };
+        assert!(
+            s.list_ips_as(&sev4, Audience::Public)
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let exact = IpFilter {
+            q: Some("203.0.113.2".into()),
+            ..Default::default()
+        };
+        assert!(
+            s.list_ips_as(&exact, Audience::Public)
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_sees_pending_rows() {
+        let (s, _d, known, fresh) = delayed().await;
+        assert_eq!(
+            s.list_ips(&IpFilter::default()).await.unwrap().items.len(),
+            2
+        );
+        let ov = s.ip_overview(known).await.unwrap().unwrap();
+        assert_eq!((ov.request_count, ov.max_severity), (2, 4));
+        assert!(s.ip_overview(fresh).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn known_ip_overview_ignores_pending_rows() {
+        let (s, _d, known, fresh) = delayed().await;
+        assert!(
+            s.ip_overview_as(fresh, Audience::Public)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let ov = s
+            .ip_overview_as(known, Audience::Public)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((ov.request_count, ov.max_severity), (1, 1));
+        assert_eq!(
+            ov.labels
+                .iter()
+                .map(|l| l.name.as_str())
+                .collect::<Vec<_>>(),
+            ["wp"]
+        );
+        assert_eq!(ov.week.iter().map(|b| b.count).sum::<i64>(), 1);
+        assert_eq!(ov.calendar.iter().map(|d| d.count).sum::<i64>(), 1);
+        assert_eq!(ov.net_count, 0, "the pending-only neighbour is not public");
+        assert_eq!(ov.ranked, 1);
+    }
 
     async fn seeded() -> Store {
         let dir = tempfile::tempdir().unwrap();

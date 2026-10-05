@@ -151,11 +151,33 @@ pub struct PublicConfig {
     /// pages: per-IP label chips, the label filter and the label chart.
     #[serde(default = "default_true")]
     pub show_labels: bool,
+    /// Minutes before a request shows on public pages ...
+    #[serde(default = "default_public_delay")]
+    pub delay_minutes: u32,
+    /// ... plus a random 0 to this many minutes per request.
+    #[serde(default = "default_public_delay")]
+    pub jitter_minutes: u32,
+    /// Rows of the wall's "Recent requests".
+    #[serde(default = "default_recent_rows")]
+    pub recent_rows: usize,
+}
+
+fn default_public_delay() -> u32 {
+    5
+}
+
+fn default_recent_rows() -> usize {
+    50
 }
 
 impl Default for PublicConfig {
     fn default() -> Self {
-        Self { show_labels: true }
+        Self {
+            show_labels: true,
+            delay_minutes: default_public_delay(),
+            jitter_minutes: default_public_delay(),
+            recent_rows: default_recent_rows(),
+        }
     }
 }
 
@@ -471,6 +493,9 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("scan", "verify_crawlers", "true"),
     ("scan", "tor_unknown", "\"defer\""),
     ("public", "show_labels", "true"),
+    ("public", "delay_minutes", "5"),
+    ("public", "jitter_minutes", "5"),
+    ("public", "recent_rows", "50"),
 ];
 
 /// Sections that are required when their role is on and unused otherwise.
@@ -551,6 +576,13 @@ impl Config {
         self.trap.validate()?;
         if (1..7).contains(&self.retention_days) {
             bail!("retention_days must be 0 (keep everything) or at least 7");
+        }
+        let p = &self.public;
+        if p.delay_minutes > 60 || p.jitter_minutes > 60 {
+            bail!("public.delay_minutes and public.jitter_minutes must be between 0 and 60");
+        }
+        if !(1..=200).contains(&p.recent_rows) {
+            bail!("public.recent_rows must be between 1 and 200");
         }
         let r = self.roles;
         if !(r.listener || r.scanner || r.web) {
@@ -1063,6 +1095,28 @@ data_dir = "/tmp"
         }
         let cfg = parse(&format!("retention_days = 7\n{BASE}{roles}")).unwrap();
         assert_eq!(cfg.retention_days, 7);
+    }
+
+    #[test]
+    fn public_delay_defaults_and_bounds() {
+        let base = format!("{BASE}[roles]\nlistener = false\nweb = false\n");
+        let cfg = parse(&base).unwrap();
+        assert_eq!(
+            (
+                cfg.public.delay_minutes,
+                cfg.public.jitter_minutes,
+                cfg.public.recent_rows
+            ),
+            (5, 5, 50)
+        );
+        let with = |extra: &str| parse(&format!("{base}[public]\n{extra}\n"));
+        assert!(with("delay_minutes = 0\njitter_minutes = 0").is_ok());
+        assert!(with("delay_minutes = 60\njitter_minutes = 60").is_ok());
+        assert!(with("delay_minutes = 61").is_err());
+        assert!(with("jitter_minutes = 61").is_err());
+        assert!(with("recent_rows = 0").is_err());
+        assert!(with("recent_rows = 201").is_err());
+        assert!(with("recent_rows = 200").is_ok());
     }
 
     #[test]

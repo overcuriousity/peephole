@@ -144,7 +144,7 @@
   // Live scan queue over SSE.
   var qt = document.querySelector("[data-queue]");
   if (qt && window.EventSource) {
-    var live = document.querySelector("[data-live]"), liveLabel = live && live.querySelector("[data-live-label]");
+    var qs = qt.closest("section"), live = (qs && qs.querySelector("[data-live]")) || document.querySelector("[data-live]"), liveLabel = live && live.querySelector("[data-live-label]");
     var tbody = qt.querySelector("tbody"), limit = parseInt(qt.getAttribute("data-limit") || "25", 10);
     var setLive = function (state, label) { if (live) { live.setAttribute("data-state", state); if (liveLabel) liveLabel.textContent = label; } };
     var cell = function (cls, html) { var td = document.createElement("td"); if (cls) td.className = cls; td.innerHTML = html; return td; };

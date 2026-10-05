@@ -405,17 +405,17 @@ async fn wall_shows_aggregates_not_payloads() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let html = resp.text().await.unwrap();
-    // The IP is named (wall of shame) but no request rows are shown: the
-    // public wall has no "Recent activity" table, so request paths stay out.
+    // The IP is named (wall of shame) and "Recent requests" lists paths,
+    // but never bodies, headers or query strings.
     assert!(html.contains("203.0.113.99"));
     assert!(html.contains("href=\"/ip/203.0.113.99\""));
-    assert!(
-        !html.contains("/wp-login.php"),
-        "public wall must not list request paths"
-    );
+    assert!(html.contains("Recent requests"));
+    assert!(html.contains("/wp-login.php"));
+    assert!(!html.contains("SECRET-PAYLOAD-MARKER"));
+    assert!(!html.contains("HEADER-MARKER"));
     assert!(
         !html.contains("Recent activity"),
-        "public wall has no recent-activity table"
+        "public wall has no live recent-activity card"
     );
     assert!(html.contains("Last 7 days"));
     assert!(html.contains("data-range=\"7d\""));
@@ -1287,6 +1287,9 @@ admin_listen = "127.0.0.1:{admin}"
 database_path = "{db}"
 data_dir = "{d}"
 trusted_proxies = ["127.0.0.1/32"]
+[public]
+delay_minutes = 0
+jitter_minutes = 0
 [webauthn]
 rp_id = "localhost"
 origin = "https://localhost"
@@ -1665,8 +1668,27 @@ async fn public_ip_page_shows_aggregates_but_hides_requests_and_admin_data() {
             .status(),
         404
     );
-    store
+    let v6 = store
         .upsert_ip("2001:db8::1".parse().unwrap())
+        .await
+        .unwrap();
+    // An IP with no released request has no public page.
+    assert_eq!(
+        reqwest::get(format!("{base}/ip/2001:db8::1"))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    store
+        .insert_request(&peephole::store::requests::NewRequest {
+            ip_id: v6.id,
+            method: "GET".into(),
+            path: "/v6".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
         .await
         .unwrap();
     assert_eq!(
@@ -2157,8 +2179,9 @@ async fn query_strings_are_admin_only() {
         .unwrap();
     let base = spawn_admin_with(store.clone(), dir.path()).await;
     let get = |url: String| async move { reqwest::get(url).await.unwrap().text().await.unwrap() };
-    // No public surface shows the query string — nor, now, request paths or
-    // the per-request rows that carried them.
+    // No public surface shows the query string. The wall's "Recent
+    // requests" list the path alone (not in the JSON); the IP pages show
+    // no request rows.
     for url in [
         format!("{base}/ip/203.0.113.200"),
         format!("{base}/ips"),
@@ -2167,11 +2190,20 @@ async fn query_strings_are_admin_only() {
     ] {
         let body = get(url.clone()).await;
         assert!(!body.contains("SECRET"), "{url} leaks the query string");
+        assert!(!body.contains("api_key"), "{url} leaks the query string");
+    }
+    for url in [format!("{base}/ip/203.0.113.200"), format!("{base}/ips")] {
         assert!(
-            !body.contains("/api/v1/usres"),
+            !get(url.clone()).await.contains("/api/v1/usres"),
             "{url} leaks the request path"
         );
     }
+    // The wall lists paths now, but its JSON keeps `recent` out.
+    let stats = get(format!("{base}/api/stats?range=24h")).await;
+    assert!(
+        !stats.contains("/api/v1/usres"),
+        "/api/stats leaks the request path"
+    );
     // Request search is admin-only, so there is no public oracle at all.
     let anon = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
