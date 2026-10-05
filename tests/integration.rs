@@ -2868,3 +2868,55 @@ async fn standalone_cluster_page_has_no_access() {
         assert_eq!(r.status(), 404, "{p}");
     }
 }
+
+/// History pages link to the Scans page itself, also from the page a pace
+/// error re-renders under the form's URL.
+#[tokio::test]
+async fn scans_history_pages_link_back_to_scans() {
+    let (_trap, store, dir) = spawn_trap().await;
+    let ip = store
+        .upsert_ip("203.0.113.91".parse().unwrap())
+        .await
+        .unwrap();
+    for _ in 0..101 {
+        sqlx::query(
+            "INSERT INTO scan_jobs (ip_id, level, status, queued_at, finished_at, error)
+             VALUES (?, 1, 'failed', datetime('now'), datetime('now'), 'x')",
+        )
+        .bind(ip.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let (client, base) = enrolled_admin_client(store, cfg).await;
+    let bad = client
+        .post(format!("{base}/admin/queue/pace"))
+        .form(&[("max_workers", "x"), ("max_scans_per_hour", "90")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let html = bad.text().await.unwrap();
+    assert!(
+        html.contains("href=\"/admin/scans?page=2#history\""),
+        "absolute next link"
+    );
+    let html = client
+        .get(format!("{base}/admin/scans?status=failed&level=1"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let next = html
+        .split("page=2#history")
+        .next()
+        .and_then(|h| h.rsplit("href=\"").next())
+        .unwrap_or_default();
+    assert!(
+        html.contains("href=\"/admin/scans?status=failed&#38;level=1&#38;page=2#history\""),
+        "filters carried: {next}"
+    );
+}

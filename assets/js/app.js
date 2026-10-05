@@ -164,9 +164,10 @@
     // The live card holds active jobs only; a job that finishes leaves it.
     var matches = function (j) { return j.status === "queued" || j.status === "running"; };
     var COLS = 8;
+    var showEmpty = function () { var tr = document.createElement("tr"); tr.setAttribute("data-empty", ""); var td = cell("empty", "Nothing queued or running."); td.setAttribute("colspan", String(COLS)); tr.appendChild(td); tbody.appendChild(tr); };
     var apply = function (j) {
       var existing = tbody.querySelector('[data-job="' + j.id + '"]');
-      if (!matches(j)) { if (existing) existing.remove(); return; }
+      if (!matches(j)) { if (existing) { existing.remove(); if (!tbody.querySelector("[data-job]")) showEmpty(); } return; }
       var empty = tbody.querySelector("[data-empty]"); if (empty) empty.remove();
       var fresh = row(j);
       if (existing) {
@@ -188,7 +189,7 @@
       tbody.innerHTML = "";
       jobs = jobs.filter(matches);
       jobs.slice(0, limit).forEach(function (j) { tbody.appendChild(row(j)); });
-      if (!jobs.length) { var tr = document.createElement("tr"); tr.setAttribute("data-empty", ""); var td = cell("empty", "Nothing queued or running."); td.setAttribute("colspan", String(COLS)); tr.appendChild(td); tbody.appendChild(tr); }
+      if (!jobs.length) showEmpty();
     };
     var es = new EventSource(qt.getAttribute("data-src"));
     es.addEventListener("open", function () { setLive("open", "live"); });

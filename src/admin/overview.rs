@@ -69,7 +69,13 @@ pub fn attention(s: &Signals) -> Vec<Attention> {
             "/admin/cluster",
         ));
     }
-    for n in &s.nodes {
+    // Out of the cluster, every member looks offline: nothing to act on.
+    let nodes = if s.detached.is_some() {
+        &[][..]
+    } else {
+        &s.nodes[..]
+    };
+    for n in nodes {
         let href = format!("/admin/cluster/node/{}", n.key);
         if !n.live {
             let text = if n.last_seen == "never" {
@@ -224,7 +230,7 @@ mod tests {
             timeouts: Some("25%".into()),
             intel_stale: true,
             nodes: vec![down, odd],
-            detached: Some("This node left its cluster."),
+            detached: None,
             unserved: Some("writer".into()),
         };
         let items = attention(&s);
@@ -245,9 +251,8 @@ mod tests {
             "/admin/cluster/node/c-key",
             "clock +3.5 min · incompatible version",
         );
-        find("/admin/cluster", "left its cluster");
         find("/admin/cluster", "writer");
-        assert_eq!(items.len(), 8);
+        assert_eq!(items.len(), 7);
         assert!(items.iter().all(|a| a.level == Level::Warn));
     }
 
@@ -261,6 +266,20 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(attention(&s)[0].text, "d has never been seen.");
+    }
+
+    #[test]
+    fn a_node_out_of_its_cluster_lists_no_members() {
+        let mut down = node("b");
+        down.live = false;
+        let s = Signals {
+            detached: Some("This node left its cluster."),
+            nodes: vec![down],
+            ..Default::default()
+        };
+        let items = attention(&s);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0].text.contains("left its cluster"));
     }
 
     #[test]

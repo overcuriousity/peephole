@@ -67,6 +67,7 @@
 {% match remote %}
 {% when Remote::Own %}<p>This node's settings: <a href="/admin/system/settings">System › Settings</a>; pace on <a href="/admin/scans#pace">Scans</a>.</p>
 {% when Remote::NoKey %}<p class="muted">No config key for this node is held here. Add one on <a href="/admin/cluster/access">Access</a>.</p>
+{% when Remote::Offline %}<p class="muted">Not live{% if m.blocked %} (blocked){% endif %}: its settings were not asked.</p>
 {% when Remote::Silent with (msg) %}<div class="banner banner-warning">{{ msg }}</div>
 {% when Remote::Settings with { state, timeout_min, rec, has } %}
   {% if !state.open %}<div class="banner banner-warning">Locked: remote configuration is off on this node.</div>{% endif %}

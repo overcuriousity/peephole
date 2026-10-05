@@ -31,7 +31,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
 }
 
 /// One member as the page shows it.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct MemberView {
     pub key: String,
     pub short: String,
@@ -978,6 +978,8 @@ enum Remote {
     },
     /// Asked; no answer.
     Silent(String),
+    /// Key held, but the member is offline or blocked: not asked.
+    Offline,
 }
 
 #[derive(Template)]
@@ -989,6 +991,13 @@ struct NodePage {
     remote: Remote,
     notice: Option<String>,
     error: Option<String>,
+}
+
+/// Whether a node page asks the member for its settings: only a live,
+/// unblocked member whose key is held here (an offline one would hold the
+/// page for the whole request timeout).
+fn asks_remote(m: &MemberView) -> bool {
+    !m.is_self && m.key_held && m.live && !m.blocked
 }
 
 async fn node_view(st: &AdminState, key: &str, flash: Flash) -> AppResult<Html<String>> {
@@ -1011,6 +1020,8 @@ async fn node_view(st: &AdminState, key: &str, flash: Flash) -> AppResult<Html<S
         Remote::Own
     } else if !m.key_held {
         Remote::NoKey
+    } else if !asks_remote(&m) {
+        Remote::Offline
     } else {
         match crate::cluster::confkey::get(node, id).await {
             Ok(s) => {
@@ -1228,6 +1239,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(none.view(&ours), ("none recorded".to_string(), None));
+    }
+
+    #[test]
+    fn only_a_live_member_whose_key_is_held_is_asked() {
+        let held = MemberView {
+            key_held: true,
+            live: true,
+            active: true,
+            ..Default::default()
+        };
+        assert!(asks_remote(&held));
+        for m in [
+            MemberView {
+                live: false,
+                ..held.clone()
+            },
+            MemberView {
+                blocked: true,
+                ..held.clone()
+            },
+            MemberView {
+                key_held: false,
+                ..held.clone()
+            },
+            MemberView {
+                is_self: true,
+                ..held.clone()
+            },
+        ] {
+            assert!(!asks_remote(&m));
+        }
     }
 
     #[test]

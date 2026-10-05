@@ -87,7 +87,14 @@
     {% if history.items.is_empty() %}<tr><td colspan="7" class="empty">No finished jobs{% if f.status.is_some() || f.level.is_some() %} match{% endif %}.</td></tr>{% endif %}
     </tbody>
   </table></div>
-  {% let page = history %}{% include "_pagination.html" %}
+  {# Absolute links: a pace error renders this page under the form's URL. #}
+  {% if history.prev().is_some() || history.next().is_some() %}
+  <nav class="pagination" aria-label="Pagination">
+    <span>{% if let Some(p) = history.prev() %}<a class="btn btn-sm" href="/admin/scans?{{ qs }}page={{ p }}#history">← Previous</a>{% endif %}</span>
+    <span class="muted">page {{ history.page }}</span>
+    <span>{% if let Some(n) = history.next() %}<a class="btn btn-sm" href="/admin/scans?{{ qs }}page={{ n }}#history">Next →</a>{% endif %}</span>
+  </nav>
+  {% endif %}
 </section>
 </div>
 {% endblock %}
