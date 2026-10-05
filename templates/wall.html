@@ -6,7 +6,7 @@
   <div>
     <h1>Wall of shame</h1>
     <p class="muted">{{ range.label() }}</p>
-    <p class="muted">{% if chrome.authed %}Live view (signed in); the public sees this {{ delay_min }}–{{ delay_max }} min later.{% else %}Data delayed by about {{ delay_min }}–{{ delay_max }} min.{% endif %}</p>
+    <p class="muted">{% if delay_max == 0 %}{% if chrome.authed %}Live view (signed in); the public sees the same.{% else %}Data shown as recorded.{% endif %}{% else if chrome.authed %}Live view (signed in); the public sees this {{ delay_min }}–{{ delay_max }} min later.{% else %}Data delayed by about {{ delay_min }}–{{ delay_max }} min.{% endif %}</p>
   </div>
   {% let base = "/" %}{% include "_range.html" %}
 </div>

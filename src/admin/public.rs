@@ -418,8 +418,9 @@ struct RequestsPage {
     nodes: Vec<String>,
 }
 
-/// Admin-only: request rows (timestamp, method, path, severity, labels)
-/// identify individual clients, so the public side never lists them.
+/// Admin-only: the full request search (timestamps, query strings, bodies,
+/// headers) identifies individual clients. The public wall lists only a
+/// delayed, query-free tail of recent requests.
 async fn requests(
     _u: SessionUser,
     State(state): State<Arc<AdminState>>,
@@ -879,6 +880,11 @@ mod tests {
     }
 
     async fn state(show_labels: bool) -> (Arc<AdminState>, tempfile::TempDir) {
+        state_with(show_labels, "").await
+    }
+
+    /// `extra`: further `[public]` keys.
+    async fn state_with(show_labels: bool, extra: &str) -> (Arc<AdminState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cfg: crate::config::Config = toml::from_str(&format!(
             r#"
@@ -895,6 +901,7 @@ rp_name = "t"
 secure_cookies = false
 [public]
 show_labels = {show_labels}
+{extra}
 "#,
             db = dir.path().join("t.db").display(),
             d = dir.path().display()
@@ -925,6 +932,19 @@ show_labels = {show_labels}
             .await
             .unwrap();
         (Arc::new(AdminState::public_only(store, cfg)), dir)
+    }
+
+    #[tokio::test]
+    async fn wall_without_a_delay_says_so_plainly() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st);
+        let (_, anon) = get_with(&app, "/", None).await;
+        assert!(anon.contains("Data shown as recorded."), "{anon}");
+        assert!(!anon.contains("0–0"), "{anon}");
+        let (_, authed) = get_with(&app, "/", Some(&cookie)).await;
+        assert!(authed.contains("Live view (signed in); the public sees the same."));
+        assert!(!authed.contains("0–0"));
     }
 
     async fn admin_cookie(st: &AdminState) -> String {
