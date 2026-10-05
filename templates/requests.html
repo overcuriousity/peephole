@@ -22,6 +22,7 @@
     {% for n in nodes %}<option value="{{ n }}"{% if f.node.as_deref() == Some(n.as_str()) %} selected{% endif %}>{{ n }}</option>{% endfor %}</select></label>{% endif %}
   <button class="btn btn-primary" type="submit">Filter</button>
 </form>
+{% include "_chips.html" %}
 {% if can_delete %}
 <div class="row bulk-bar">
   <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-sel" data-needs-checked="bulk-form">Delete selected</button>

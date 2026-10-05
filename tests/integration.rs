@@ -936,6 +936,25 @@ async fn admin_pages_and_deletes_with_session() {
         .await
         .unwrap();
     assert!(rows.contains("203.0.113.78"), "the port link finds IPs");
+    // Applied filters show as chips; each × drops exactly that filter.
+    assert!(
+        rows.contains("class=\"chip\" href=\"/ips\"")
+            && rows.contains("Open port: <span class=\"mono\">22/tcp</span>"),
+        "port chip"
+    );
+    let rows = get("/requests?method=GET&path=%2Flogin&page=2")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        rows.contains("class=\"chip\" href=\"/requests?path=%2Flogin\""),
+        "method chip keeps path, drops page"
+    );
+    assert!(rows.contains("class=\"chip\" href=\"/requests?method=GET\""));
+    let rows = get("/requests").await.unwrap().text().await.unwrap();
+    assert!(!rows.contains("class=\"chip\""), "no filter, no chips");
     let html = get("/admin/analytics?range=24h")
         .await
         .unwrap()

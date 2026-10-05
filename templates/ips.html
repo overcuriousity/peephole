@@ -29,6 +29,7 @@
   </select></label>
   <button class="btn btn-primary" type="submit">Filter</button>
 </form>
+{% include "_chips.html" %}
 {% if can_delete %}
 <div class="row bulk-bar">
   <button class="btn btn-danger btn-sm" type="button" data-confirm="dlg-bulk-sel" data-needs-checked="bulk-form">Delete selected</button>

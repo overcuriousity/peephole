@@ -1,0 +1,1 @@
+{% if !chips.is_empty() %}<div class="chips filter-chips" aria-label="Applied filters">{% for c in chips %}<a class="chip" href="{{ c.href }}" title="Remove this filter">{{ c.label }}: <span class="mono">{{ c.value }}</span> <span aria-hidden="true">×</span></a>{% endfor %}</div>{% endif %}

@@ -48,6 +48,10 @@ td.ts { white-space: nowrap; color: var(--color-fg-secondary); font-family: var(
 .sev-3 { background: var(--sev-3-dim); color: var(--sev-3); }
 .sev-4 { background: var(--sev-4-dim); color: var(--sev-4); }
 .chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.filter-chips { margin: -0.5rem 0 1rem; }
+.chip { display: inline-flex; align-items: center; gap: 0.25rem; padding: 0.15rem 0.55rem; border: 1px solid var(--color-border); border-radius: 999px; background: var(--color-bg-surface); color: var(--color-fg-secondary); font-size: var(--text-xs); text-decoration: none; max-width: 100%; }
+.chip .mono { color: var(--color-fg-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 28rem; }
+.chip:hover { border-color: var(--color-border-strong); background: var(--color-bg-hover); }
 
 .btn { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.4rem 0.85rem; border-radius: var(--radius-md); border: 1px solid var(--color-border-strong);
   background: var(--color-bg-elevated); color: var(--color-fg-primary); font: inherit; font-size: var(--text-sm); cursor: pointer; }
