@@ -27,7 +27,7 @@ Success:
 | Fingerprints, Canaries, Lookup until C/E | Final nav now. "Links" tab over today's Fingerprints and Canaries pages (sub-tabs); Lookup as an IP box in the top bar |
 | Requests / IPs | Stay in the top bar only, not in the admin subnav |
 | Queue model | Live card holds only queued + running jobs; finished jobs in a server-side, paginated, filterable history |
-| Overview "needs attention" | Seven items, computed at page load, reusing existing checks |
+| Overview "needs attention" | Six items, computed at page load, reusing existing checks; the inbox is a tile, not an item (claims have no read state, so a count would never clear) |
 | Settings home | A "System" tab with sub-tabs Status · Settings · Keys · Export |
 | Code layout | Modules follow the new sections (`overview.rs`, `scans.rs`, `system.rs`, `cluster_access.rs`) |
 
@@ -154,7 +154,6 @@ none do.
 
 | Item | From | Links to |
 |---|---|---|
-| N inbox claims | `inbox_count` | `/admin/inbox` |
 | N scans failed in 24 h | `queue_summary().failed_24h` | `/admin/scans?status=failed` |
 | Queue growing; timeouts high | `queue_metrics` + `recommend` (the same checks as the pace banners, without sparklines) | `/admin/scans#pace` |
 | Intel stale | `intel_stale` | `/admin/system` |
@@ -175,6 +174,7 @@ called without the rest; no check is copied.
 | New IPs · 24 h | `new_ips` | `/ips` |
 | Queued / running | `queue_summary` | `/admin/scans` |
 | Done · 24 h | `queue_summary().done_24h` | `/admin/scans?status=done` |
+| Inbox | `inbox_count` (all claims) | `/admin/inbox` |
 
 Request and IP numbers come from a new `StatsCache::admin_stats(store, r)`:
 `stats_as(r, Audience::Admin)` behind the same SWR cache and TTL as the
