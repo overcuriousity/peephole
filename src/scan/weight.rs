@@ -11,8 +11,9 @@
 //! weak scanner keeps taking the odd job and proves itself again; and a job
 //! that has waited [`OVERRIDE_WAIT_MINS`] goes to whoever asks.
 //!
-//! Only hard failures count. Timeouts are a pacing matter (see `pace`),
-//! and declines, hand-backs and expired leases ran nothing.
+//! Only hard failures count. Timeouts are a pacing matter (see `pace`), an
+//! invalid target is the job's fault, and declines, hand-backs and expired
+//! leases ran nothing.
 use crate::cluster::identity::NodeId;
 use anyhow::Result;
 use sqlx::SqlitePool;
@@ -57,7 +58,8 @@ pub type Tallies = HashMap<(NodeId, i64), Tally>;
 pub async fn tallies(pool: &SqlitePool) -> Result<Tallies> {
     let rows: Vec<(Vec<u8>, i64, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT scanner, level, SUM(status = 'done'),
-                SUM(status = 'failed' AND COALESCE(error, '') NOT LIKE 'timeout%')
+                SUM(status = 'failed' AND COALESCE(error, '') NOT LIKE 'timeout%'
+                    AND COALESCE(error, '') != 'invalid target')
          FROM scan_jobs
          WHERE scanner IS NOT NULL AND status IN ('done', 'failed')
            AND finished_at > datetime('now', '-{WINDOW_HOURS} hours')
@@ -211,6 +213,7 @@ mod tests {
             ("done", None, "-1 hours"),
             ("failed", Some("nmap exited 1"), "-1 hours"),
             ("failed", Some("timeout after 900 s"), "-1 hours"),
+            ("failed", Some("invalid target"), "-1 hours"),
             ("failed", Some("nmap exited 1"), "-30 hours"),
             ("refused", None, "-1 hours"),
         ] {
