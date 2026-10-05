@@ -110,7 +110,7 @@ card's head.
   The page and the SSE snapshot (`sse.rs::snapshot_or_comment`) both use it,
   so finished jobs no longer take rows from queued ones. `SNAPSHOT_ROWS`
   stays 500; with more active jobs than that the newest 500 show, and the
-  card head gives the total ("N queued · M running") from `queue_summary`.
+  card head says so ("newest 500 of N") from `queue_summary`.
 - JS (`app.js`, live queue): the status/level filter attributes go; a row
   matches when its status is `queued` or `running`. A `job` event that moves
   a job to any other status removes its row.
