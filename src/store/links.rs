@@ -489,6 +489,300 @@ impl Store {
     }
 }
 
+/// A value on more IPs than this is drawn as one group node.
+pub const GROUP_AT: i64 = 25;
+/// IPs listed when a group is expanded.
+pub const GROUP_MAX: i64 = 500;
+/// Nodes in one graph.
+pub const GRAPH_MAX: usize = 400;
+/// Values of one kind read per IP.
+pub const PER_IP: i64 = 50;
+
+/// What a graph is centred on, as the API names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Focus {
+    Item(LinkKind, String),
+    Ip(String),
+}
+
+impl Focus {
+    /// `<kind>:<value>` or `ip:<addr>`.
+    pub fn parse(s: &str) -> Option<Focus> {
+        let (k, v) = s.split_once(':')?;
+        if v.is_empty() {
+            return None;
+        }
+        if k == "ip" {
+            return Some(Focus::Ip(super::browse::canonical_ip(v)));
+        }
+        Some(Focus::Item(LinkKind::parse(k)?, v.to_string()))
+    }
+
+    pub fn id(&self) -> String {
+        match self {
+            Focus::Item(k, v) => format!("{}:{v}", k.key()),
+            Focus::Ip(a) => format!("ip:{a}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GraphNode {
+    pub id: String,
+    /// `ip`, `group`, or a kind's key.
+    pub kind: String,
+    /// The address, the item's value, or (group) the collapsed item's value.
+    pub value: String,
+    /// Hops from the focus.
+    pub hop: u32,
+    pub identity: bool,
+    pub ips: Option<i64>,
+    pub sightings: Option<i64>,
+    pub last_seen: Option<String>,
+    pub country: Option<String>,
+    /// A group: the collapsed item's kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub of: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GraphEdge {
+    pub a: String,
+    pub b: String,
+    pub identity: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LinkGraph {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    /// Stopped at [`GRAPH_MAX`] nodes.
+    pub truncated: bool,
+}
+
+impl LinkGraph {
+    fn has(&self, id: &str) -> bool {
+        self.nodes.iter().any(|n| n.id == id)
+    }
+
+    fn link(&mut self, a: &str, b: &str, identity: bool) {
+        let dup = self
+            .edges
+            .iter()
+            .any(|e| (e.a == a && e.b == b) || (e.a == b && e.b == a));
+        if !dup {
+            self.edges.push(GraphEdge {
+                a: a.into(),
+                b: b.into(),
+                identity,
+            });
+        }
+    }
+}
+
+impl Store {
+    /// The neighbourhood of `focus`: breadth-first, `depth` hops (1–3), one
+    /// hop being item → its IPs or IP → its values of `types` (the focus'
+    /// own kind always walked). A value on more than [`GROUP_AT`] IPs is
+    /// one group node and not walked through, unless `all` (expanding a
+    /// group: the focus' IPs, up to [`GROUP_MAX`]).
+    pub async fn link_graph(
+        &self,
+        focus: &Focus,
+        depth: u32,
+        types: &[LinkKind],
+        all: bool,
+    ) -> Result<LinkGraph> {
+        let depth = depth.clamp(1, 3);
+        let mut types = types.to_vec();
+        if let Focus::Item(k, _) = focus
+            && !types.contains(k)
+        {
+            types.push(*k);
+        }
+        let mut g = LinkGraph::default();
+        let Some(first) = self.graph_node(focus, 0).await? else {
+            return Ok(g);
+        };
+        g.nodes.push(first);
+        let mut frontier = vec![focus.clone()];
+        'walk: for hop in 1..=depth {
+            let mut next = vec![];
+            for f in &frontier {
+                let from = f.id();
+                let found: Vec<Focus> = match f {
+                    Focus::Item(k, v) => {
+                        let ips = g
+                            .nodes
+                            .iter()
+                            .find(|n| n.id == from)
+                            .and_then(|n| n.ips)
+                            .unwrap_or(0);
+                        if ips > GROUP_AT && !(all && hop == 1) {
+                            let gid = format!("group:{from}");
+                            if !g.has(&gid) {
+                                if g.nodes.len() >= GRAPH_MAX {
+                                    g.truncated = true;
+                                    break 'walk;
+                                }
+                                g.nodes.push(GraphNode {
+                                    id: gid.clone(),
+                                    kind: "group".into(),
+                                    value: v.clone(),
+                                    hop,
+                                    identity: k.identity(),
+                                    ips: Some(ips),
+                                    sightings: None,
+                                    last_seen: None,
+                                    country: None,
+                                    of: Some(k.key().into()),
+                                });
+                            }
+                            g.link(&from, &gid, k.identity());
+                            continue;
+                        }
+                        let limit = if all { GROUP_MAX } else { GROUP_AT };
+                        self.item_ips(*k, v, limit)
+                            .await?
+                            .into_iter()
+                            .map(Focus::Ip)
+                            .collect()
+                    }
+                    Focus::Ip(addr) => self
+                        .ip_values(addr, &types)
+                        .await?
+                        .into_iter()
+                        .map(|(k, v)| Focus::Item(k, v))
+                        .collect(),
+                };
+                for n in found {
+                    let id = n.id();
+                    let identity = match (f, &n) {
+                        (Focus::Item(k, _), _) | (_, Focus::Item(k, _)) => k.identity(),
+                        _ => true,
+                    };
+                    if !g.has(&id) {
+                        if g.nodes.len() >= GRAPH_MAX {
+                            g.truncated = true;
+                            break 'walk;
+                        }
+                        let Some(node) = self.graph_node(&n, hop).await? else {
+                            continue;
+                        };
+                        g.nodes.push(node);
+                        next.push(n);
+                    }
+                    g.link(&from, &id, identity);
+                }
+            }
+            frontier = next;
+        }
+        Ok(g)
+    }
+
+    /// A node's facts; `None` when nothing is stored for it.
+    async fn graph_node(&self, f: &Focus, hop: u32) -> Result<Option<GraphNode>> {
+        match f {
+            Focus::Ip(addr) => {
+                let row: Option<(String, Option<String>, i64, Option<String>)> = sqlx::query_as(
+                    "SELECT ip, country, request_count, last_seen FROM ips WHERE ip = ?",
+                )
+                .bind(addr)
+                .fetch_optional(&self.read)
+                .await?;
+                Ok(row.map(|(ip, country, n, last_seen)| GraphNode {
+                    id: f.id(),
+                    kind: "ip".into(),
+                    value: ip,
+                    hop,
+                    identity: true,
+                    ips: None,
+                    sightings: Some(n),
+                    last_seen,
+                    country,
+                    of: None,
+                }))
+            }
+            Focus::Item(k, v) => {
+                let (s, binds) = sightings(
+                    *k,
+                    &Where {
+                        value: Some(v),
+                        ..Default::default()
+                    },
+                );
+                let mut q = sqlx::query_as::<_, (i64, i64, Option<String>)>(sqlx::AssertSqlSafe(
+                    format!("SELECT COUNT(*), COUNT(DISTINCT ip_id), MAX(ts) FROM ({s})"),
+                ));
+                for b in &binds {
+                    q = q.bind(b);
+                }
+                let (n, ips, last_seen) = q.fetch_one(&self.read).await?;
+                Ok((n > 0).then(|| GraphNode {
+                    id: f.id(),
+                    kind: k.key().into(),
+                    value: v.clone(),
+                    hop,
+                    identity: k.identity(),
+                    ips: Some(ips),
+                    sightings: Some(n),
+                    last_seen,
+                    country: None,
+                    of: None,
+                }))
+            }
+        }
+    }
+
+    /// Addresses a value was seen on, most sightings first.
+    async fn item_ips(&self, kind: LinkKind, value: &str, limit: i64) -> Result<Vec<String>> {
+        let (s, binds) = sightings(
+            kind,
+            &Where {
+                value: Some(value),
+                ..Default::default()
+            },
+        );
+        let mut q = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+            "SELECT i.ip FROM ({s}) s JOIN ips i ON i.id = s.ip_id
+             GROUP BY s.ip_id ORDER BY COUNT(*) DESC, i.ip LIMIT {limit}"
+        )));
+        for b in &binds {
+            q = q.bind(b);
+        }
+        Ok(q.fetch_all(&self.read).await?)
+    }
+
+    /// Values of `kinds` seen on an address, at most [`PER_IP`] per kind.
+    async fn ip_values(&self, addr: &str, kinds: &[LinkKind]) -> Result<Vec<(LinkKind, String)>> {
+        let ip_id: Option<i64> = sqlx::query_scalar("SELECT id FROM ips WHERE ip = ?")
+            .bind(addr)
+            .fetch_optional(&self.read)
+            .await?;
+        let Some(ip_id) = ip_id else {
+            return Ok(vec![]);
+        };
+        let mut out = vec![];
+        for k in kinds {
+            let (s, binds) = sightings(
+                *k,
+                &Where {
+                    ip_id: Some(ip_id),
+                    ..Default::default()
+                },
+            );
+            let mut q = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+                "SELECT DISTINCT v FROM ({s}) ORDER BY v LIMIT {PER_IP}"
+            )));
+            for b in &binds {
+                q = q.bind(b);
+            }
+            out.extend(q.fetch_all(&self.read).await?.into_iter().map(|v| (*k, v)));
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,5 +1032,209 @@ mod tests {
         );
         assert_eq!(s.resolve_anchor("ssh-000000000000").await.unwrap(), None);
         assert_eq!(s.resolve_anchor("nothing").await.unwrap(), None);
+    }
+
+    fn ids(g: &LinkGraph) -> Vec<&str> {
+        let mut v: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn focus_parses() {
+        assert_eq!(
+            Focus::parse("fp:F"),
+            Some(Focus::Item(LinkKind::Fp, "F".into()))
+        );
+        assert_eq!(
+            Focus::parse("ssh:SHA256:a/b+c"),
+            Some(Focus::Item(LinkKind::Ssh, "SHA256:a/b+c".into()))
+        );
+        assert_eq!(
+            Focus::parse("ip:2001:DB8::1"),
+            Some(Focus::Ip("2001:db8::1".into()))
+        );
+        assert_eq!(Focus::parse("nope:x"), None);
+        assert_eq!(Focus::parse("fp:"), None);
+        assert_eq!(Focus::parse("fp"), None);
+    }
+
+    #[tokio::test]
+    async fn walks_identity_links_by_default() {
+        let (s, _) = seeded().await;
+        let f = Focus::Item(LinkKind::Fp, "F".into());
+        let g = s
+            .link_graph(&f, 2, &LinkKind::IDENTITY, false)
+            .await
+            .unwrap();
+        // F → a, b → a's host keys, cert and canary (not J: software).
+        assert!(ids(&g).contains(&"ip:203.0.113.1") && ids(&g).contains(&"ip:203.0.113.2"));
+        assert!(ids(&g).contains(&"canary:77"));
+        assert!(g.nodes.iter().any(|n| n.kind == "ssh"));
+        assert!(!g.nodes.iter().any(|n| n.kind == "ja4" || n.kind == "hassh"));
+        assert_eq!(g.nodes[0].id, "fp:F");
+        assert_eq!(g.nodes[0].hop, 0);
+        assert!(!g.truncated);
+        // Depth 3 reaches through canary 77 to c.
+        let g3 = s
+            .link_graph(&f, 3, &LinkKind::IDENTITY, false)
+            .await
+            .unwrap();
+        assert!(ids(&g3).contains(&"ip:198.51.100.3"));
+        assert!(!ids(&g).contains(&"ip:198.51.100.3"), "not at depth 2");
+    }
+
+    #[tokio::test]
+    async fn software_kinds_on_request_and_the_focus_kind_always() {
+        let (s, _) = seeded().await;
+        let f = Focus::Item(LinkKind::Fp, "F".into());
+        let g = s.link_graph(&f, 2, &[LinkKind::Ja4], false).await.unwrap();
+        assert!(ids(&g).contains(&"ja4:J"));
+        assert!(
+            ids(&g).contains(&"ip:203.0.113.1"),
+            "fp walked: the focus' kind"
+        );
+        let e = g
+            .edges
+            .iter()
+            .find(|e| e.a == "ja4:J" || e.b == "ja4:J")
+            .unwrap();
+        assert!(!e.identity);
+        // From an IP.
+        let g = s
+            .link_graph(
+                &Focus::Ip("198.51.100.3".into()),
+                1,
+                &LinkKind::IDENTITY,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&g), ["canary:77", "fp:G", "ip:198.51.100.3"]);
+    }
+
+    #[tokio::test]
+    async fn edges_are_not_duplicated() {
+        let (s, _) = seeded().await;
+        let f = Focus::Item(LinkKind::Fp, "F".into());
+        let g = s.link_graph(&f, 3, &LinkKind::ALL, false).await.unwrap();
+        let mut keys: Vec<(String, String)> = g
+            .edges
+            .iter()
+            .map(|e| {
+                if e.a < e.b {
+                    (e.a.clone(), e.b.clone())
+                } else {
+                    (e.b.clone(), e.a.clone())
+                }
+            })
+            .collect();
+        let n = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), n);
+        let mut node_ids = ids(&g);
+        let m = node_ids.len();
+        node_ids.dedup();
+        assert_eq!(node_ids.len(), m);
+        for e in &g.edges {
+            assert!(
+                node_ids.contains(&e.a.as_str()) && node_ids.contains(&e.b.as_str()),
+                "{e:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_crowded_value_collapses_into_a_group() {
+        let (s, _) = seeded().await;
+        for n in 0..(GROUP_AT + 5) {
+            let ip = s
+                .upsert_ip(format!("192.0.2.{}", n + 1).parse().unwrap())
+                .await
+                .unwrap();
+            s.insert_request(&NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ja4: Some("J".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let f = Focus::Ip("203.0.113.1".into());
+        let g = s.link_graph(&f, 2, &[LinkKind::Ja4], false).await.unwrap();
+        let grp = g.nodes.iter().find(|n| n.kind == "group").expect("a group");
+        assert_eq!(grp.id, "group:ja4:J");
+        assert_eq!(grp.of.as_deref(), Some("ja4"));
+        assert_eq!(grp.ips, Some(GROUP_AT + 5 + 3));
+        assert!(!ids(&g).contains(&"ip:192.0.2.1"), "not walked through");
+        // Expanding the group lists them all.
+        let all = s
+            .link_graph(&Focus::Item(LinkKind::Ja4, "J".into()), 1, &[], true)
+            .await
+            .unwrap();
+        assert_eq!(all.nodes.len() as i64, 1 + GROUP_AT + 5 + 3);
+        assert!(!all.nodes.iter().any(|n| n.kind == "group"));
+    }
+
+    #[tokio::test]
+    async fn says_when_it_truncates() {
+        let (s, _) = seeded().await;
+        // Value Y on 20 IPs (below GROUP_AT), each IP with 30 more values:
+        // 1 + 20 + 20 × 30 = 621 nodes at depth 2.
+        for n in 0..20 {
+            let ip = s
+                .upsert_ip(format!("10.9.{n}.1").parse().unwrap())
+                .await
+                .unwrap();
+            s.insert_fingerprint(None, ip.id, "Y", None, "{}", "{}", b"[]")
+                .await
+                .unwrap();
+            for m in 0..30 {
+                s.insert_fingerprint(None, ip.id, &format!("Y{n}-{m}"), None, "{}", "{}", b"[]")
+                    .await
+                    .unwrap();
+            }
+        }
+        let g = s
+            .link_graph(
+                &Focus::Item(LinkKind::Fp, "Y".into()),
+                2,
+                &LinkKind::IDENTITY,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(g.truncated);
+        assert_eq!(g.nodes.len(), GRAPH_MAX);
+    }
+
+    #[tokio::test]
+    async fn unknown_focus_is_an_empty_graph() {
+        let (s, _) = seeded().await;
+        let g = s
+            .link_graph(
+                &Focus::Item(LinkKind::Fp, "nope".into()),
+                2,
+                &LinkKind::IDENTITY,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(g.nodes.is_empty() && g.edges.is_empty());
+        let g = s
+            .link_graph(
+                &Focus::Ip("192.0.2.200".into()),
+                2,
+                &LinkKind::IDENTITY,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(g.nodes.is_empty());
     }
 }
