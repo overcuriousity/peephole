@@ -67,6 +67,9 @@ CREATE INDEX idx_ips_pub_request_count ON ips(pub_request_count, pub_last_seen);
 CREATE INDEX idx_ips_pub_last_seen ON ips(pub_last_seen);
 
 ALTER TABLE ip_labels ADD COLUMN pub_count INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE publish_cfg (id INTEGER PRIMARY KEY CHECK (id = 1),
+                          delay_s INTEGER NOT NULL, jitter_s INTEGER NOT NULL);
 ```
 
 - **Backfill:** every existing request is already released
@@ -94,18 +97,21 @@ ALTER TABLE ip_labels ADD COLUMN pub_count INTEGER NOT NULL DEFAULT 0;
 
 ### 2. Insert: setting `public_at`
 
-`Store` gets a publish delay, set once at startup from config:
+The delay lives in a one-row local table, `publish_cfg(delay_s, jitter_s)`,
+which the migration creates with `(0, 0)`. `Store` writes it once at
+startup from config:
 
 ```rust
-pub fn set_publish_delay(&self, delay: Duration, jitter: Duration)
+pub async fn set_publish_delay(&self, delay: Duration, jitter: Duration) -> Result<()>
 ```
 
-The default is zero, so tests and tools that don't call it release rows
-immediately. `data::request` sets
-`public_at = local now + delay + uniform random 0..=jitter`, in the `ts`
-text format, or NULL when `delay + jitter` is zero. The delay starts at
-this node's insert time, so replicated or clock-skewed rows can't become
-public earlier than they arrived here.
+The insert trigger `requests_agg_ai` sets
+`public_at = datetime('now', '+' || (delay_s + abs(random() % (jitter_s + 1))) || ' seconds')`
+(local insert time + delay + random 0..=jitter), or leaves it NULL when
+`delay_s + jitter_s = 0`. Tests and tools that never set a delay release
+rows at once. The delay starts at this node's insert time, so replicated
+or clock-skewed rows can't become public earlier than they arrived here.
+No insert code path changes.
 
 ### 3. The publisher task
 
