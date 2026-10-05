@@ -344,6 +344,7 @@ pub(crate) fn request_qs(f: &RequestFilter) -> String {
         ("to", f.to.clone()),
         ("node", f.node.clone()),
         ("ja4h", f.ja4h.clone()),
+        ("ja4", f.ja4.clone()),
     ])
 }
 
