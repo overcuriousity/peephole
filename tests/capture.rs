@@ -730,6 +730,15 @@ async fn the_plain_listener_records_the_raw_head() {
             .unwrap();
     assert_eq!((transport.as_str(), via, ja4), ("http", true, None));
     assert_eq!(raw, head.as_bytes());
+    let ja4h: Option<String> = sqlx::query_scalar("SELECT ja4h FROM requests")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(ja4h, peephole::trap::ja4h::ja4h(head.as_bytes()));
+    assert!(
+        ja4h.unwrap().starts_with("ge11nn03"),
+        "X-Forwarded-For is a header too"
+    );
 }
 
 /// The export's weights add up to every answered request, light rows

@@ -1,6 +1,6 @@
 //! Aggregates for the admin analytics page: what the trap's requests asked
 //! for and what the counter-scans found, per time range. Admin-only — the
-//! paths, user agents and JA4 fingerprints describe request contents.
+//! paths, user agents and JA4/JA4H fingerprints describe request contents.
 use super::Store;
 use super::stats::{Named, PortStat, Range, RecentRequest, RecentTuple, recent_from};
 use anyhow::Result;
@@ -21,6 +21,7 @@ pub struct Analytics {
     pub paths: Vec<NamedIps>,
     pub user_agents: Vec<NamedIps>,
     pub ja4: Vec<NamedIps>,
+    pub ja4h: Vec<NamedIps>,
     pub methods: Vec<Named>,
     pub transports: Vec<Named>,
     pub answers: Vec<Named>,
@@ -98,16 +99,16 @@ impl Store {
         let total_requests = total.fetch_one(&self.read).await?;
         let paths = self.named_ips(ranked("r.path"), since).await?;
         let user_agents = self.named_ips(ranked(UA_SQL), since).await?;
-        let ja4 = self
-            .named_ips(
-                format!(
-                    "SELECT r.ja4 AS name, COUNT(*) AS count, COUNT(DISTINCT r.ip_id) AS ips
-                     FROM requests r WHERE r.ja4 IS NOT NULL{w}
-                     GROUP BY name ORDER BY count DESC, name LIMIT {TOP}"
-                ),
-                since,
+        // A fingerprint column, rows without one left out.
+        let ranked_fp = |col: &str| {
+            format!(
+                "SELECT r.{col} AS name, COUNT(*) AS count, COUNT(DISTINCT r.ip_id) AS ips
+                 FROM requests r WHERE r.{col} IS NOT NULL{w}
+                 GROUP BY name ORDER BY count DESC, name LIMIT {TOP}"
             )
-            .await?;
+        };
+        let ja4 = self.named_ips(ranked_fp("ja4"), since).await?;
+        let ja4h = self.named_ips(ranked_fp("ja4h"), since).await?;
         let methods = self.named_in(shares("r.method"), since).await?;
         let transports = self
             .named_in(shares("COALESCE(r.transport, 'unknown')"), since)
@@ -217,6 +218,7 @@ impl Store {
             paths,
             user_agents,
             ja4,
+            ja4h,
             methods,
             transports,
             answers,
@@ -325,6 +327,14 @@ mod tests {
             headers_json: serde_json::to_string(&[("Host", "x"), ("User-Agent", ua)]).unwrap(),
             labels_json: "[]".into(),
             ja4: ja4.map(String::from),
+            // zgrab sends one header more: another JA4H.
+            raw_head: Some(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: {ua}\r\n{}\r\n",
+                    if ua == "zgrab" { "Accept: */*\r\n" } else { "" }
+                )
+                .into_bytes(),
+            ),
             transport: Some("https".into()),
             ..Default::default()
         };
@@ -362,6 +372,9 @@ mod tests {
             "{ua:?}"
         );
         assert_eq!((a.ja4[0].count, a.ja4[0].ips), (3, 2));
+        let ja4h: Vec<_> = a.ja4h.iter().map(|n| (n.count, n.ips)).collect();
+        assert_eq!(ja4h, [(2, 1), (2, 1)], "one per header order");
+        assert!(a.ja4h.iter().all(|n| n.name.starts_with("ge11nn")));
         assert_eq!(a.transports[0].name, "https");
         assert_eq!(a.abuse[0].name, "not looked up");
         assert_eq!(a.abuse[0].count, 2);

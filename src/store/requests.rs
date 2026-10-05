@@ -76,6 +76,8 @@ pub struct RequestRow {
     pub transport: Option<String>,
     pub via_proxy: Option<bool>,
     pub ja4: Option<String>,
+    /// Derived from `raw_head` on this node (`store::ja4h`).
+    pub ja4h: Option<String>,
     pub rules: Option<String>,
     pub decoy_v: Option<i64>,
     pub decoy_site: Option<String>,

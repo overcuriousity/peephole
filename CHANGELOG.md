@@ -7,6 +7,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Added
 
+- JA4H, the HTTP client fingerprint (FoxIO), of every HTTP/1 request,
+  derived from its raw head on each node (rows stored before are derived
+  in the background at start). Shown on the request page, as "top JA4H" in
+  Analytics and as a request search filter, and exported as `ja4h`. Never
+  public. HTTP/2 requests have none (no raw head is kept for them).
+
 - Cluster: per-level scanner weights. A scanner that fails a scan level
   (hard failures, timeouts aside) more often than the best live scanner
   over the last 24 h (among scanners with at least 5 scans there) sits

@@ -109,6 +109,8 @@ pub struct RequestFilter {
     pub to: Option<String>,
     /// Admin only: the cluster node that recorded the request (its name).
     pub node: Option<String>,
+    /// Admin only: the request's JA4H.
+    pub ja4h: Option<String>,
     #[serde(default, deserialize_with = "lenient_i64")]
     pub page: Option<i64>,
 }
@@ -413,6 +415,12 @@ fn request_filter_sql(f: &RequestFilter, a: Audience, indexed: bool) -> (String,
         && let Some(v) = nonempty(&f.node)
     {
         sql.push_str(" AND r.origin IN (SELECT id FROM members WHERE name = ?)");
+        binds.push(v);
+    }
+    if a == Audience::Admin
+        && let Some(v) = nonempty(&f.ja4h)
+    {
+        sql.push_str(" AND r.ja4h = ?");
         binds.push(v);
     }
     if let Some(v) = f.asn {
@@ -1189,6 +1197,48 @@ mod tests {
         assert_eq!(n(find("wp")).await, 4, "short terms scan");
         assert_eq!(n(find("\"quoted\"")).await, 0);
         assert_eq!(s.count_requests(&find("wp-admin")).await.unwrap().n, 3);
+    }
+
+    #[tokio::test]
+    async fn requests_are_found_by_ja4h_for_the_admin_only() {
+        let s = seeded().await;
+        let ip = s.ip_by_addr("203.0.113.1").await.unwrap().unwrap();
+        let head = b"GET / HTTP/1.1\r\nHost: x\r\nX-Odd: 1\r\n\r\n";
+        for raw_head in [Some(head.to_vec()), None] {
+            s.insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                raw_head,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let f = RequestFilter {
+            ja4h: crate::trap::ja4h::ja4h(head),
+            ..Default::default()
+        };
+        let found = s.search_requests(&f, Audience::Admin).await.unwrap().items;
+        assert_eq!(found.len(), 1);
+        assert_eq!(s.count_requests(&f).await.unwrap().n, 1);
+        let public = |f: RequestFilter| {
+            let s = s.clone();
+            async move {
+                s.search_requests(&f, Audience::Public)
+                    .await
+                    .unwrap()
+                    .items
+                    .len()
+            }
+        };
+        assert_eq!(
+            public(f).await,
+            public(RequestFilter::default()).await,
+            "fingerprints are never public"
+        );
     }
 
     #[tokio::test]

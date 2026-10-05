@@ -62,6 +62,7 @@ fn schema() -> SchemaRef {
         b("raw_head"),
         b("tls_client_hello"),
         s("ja4", true),
+        s("ja4h", true),
         s("answer", true),
         i("decoy_v", true),
         Field::new(
@@ -200,6 +201,7 @@ fn batch(schema: SchemaRef, rows: &[ExportRow]) -> Result<RecordBatch> {
         bins(rows.iter().map(|r| r.raw_head.as_deref())),
         bins(rows.iter().map(|r| r.tls_client_hello.as_deref())),
         strs(rows.iter().map(|r| r.ja4.as_deref())),
+        strs(rows.iter().map(|r| r.ja4h.as_deref())),
         strs(rows.iter().map(|r| r.answer.as_deref())),
         ints(rows.iter().map(|r| r.decoy_v)),
         Arc::new(used_from.finish()),

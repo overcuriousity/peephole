@@ -805,6 +805,22 @@ async fn admin_pages_and_deletes_with_session() {
             && html.contains("form-interaction")
     );
     assert!(html.contains("not-found · 404"), "how it was answered");
+    // This harness has no listener to keep the raw head (tests/capture.rs
+    // covers that); the row is given a JA4H.
+    let ja4h = "po11nn030000_aaaaaaaaaaaa_000000000000_000000000000";
+    sqlx::query("UPDATE requests SET ja4h = ? WHERE id = ?")
+        .bind(ja4h)
+        .bind(rid)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let html = get(&format!("/admin/requests/{rid}"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains(ja4h), "JA4H on the request page");
 
     let html = get("/admin/scans").await.unwrap().text().await.unwrap();
     assert!(html.contains("203.0.113.78"));
@@ -838,6 +854,17 @@ async fn admin_pages_and_deletes_with_session() {
         .await
         .unwrap();
     assert!(html.contains("SSH servers (HASSH)") && html.contains("Certificate builders (JA4X)"));
+    assert!(html.contains("HTTP fingerprints (JA4H)") && html.contains(ja4h));
+    let html = get(&format!("/requests?ja4h={ja4h}"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        html.contains(&format!("/admin/requests/{rid}")),
+        "JA4H search"
+    );
     let xml = get(&format!("/admin/scans/{sid}/xml")).await.unwrap();
     assert_eq!(
         xml.headers().get("content-type").unwrap(),
@@ -1599,9 +1626,17 @@ async fn public_ip_page_shows_aggregates_but_hides_requests_and_admin_data() {
         html.contains("data-calendar=\"["),
         "the activity calendar's data"
     );
+    let ja4h = "ge11nn020000_bbbbbbbbbbbb_000000000000_000000000000";
+    sqlx::query("UPDATE requests SET ja4h = ?")
+        .bind(ja4h)
+        .execute(&store.pool)
+        .await
+        .unwrap();
     for marker in [
         // Per-request rows (path included) are admin-only now.
         "/wp-login.php",
+        // Fingerprints are never public.
+        ja4h,
         "HEADER-MARKER",
         "claimant@example.org",
         "FPHASHMARKER",

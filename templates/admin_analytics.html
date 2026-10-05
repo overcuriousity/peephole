@@ -62,6 +62,15 @@
     </table></div>
   </section>
 
+  <section class="card">
+    <div class="card-head"><h2>HTTP fingerprints (JA4H)</h2><span class="muted">HTTP/1 only</span></div>
+    <div class="table-wrap"><table class="an-table">
+      <thead><tr><th>JA4H</th><th class="num">Requests</th><th class="num">IPs</th></tr></thead>
+      <tbody>{% for n in a.ja4h %}<tr><td class="name"><a href="/requests?ja4h={{ n.name|urlencode }}">{{ n.name }}</a>{% let value = n.name.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}{% let v = n.count %}{% let max = max.ja4h %}{% include "_bar.html" %}</td><td class="num">{{ crate::admin::views::thousands(n.count) }}</td><td class="num">{{ n.ips }}</td></tr>{% endfor %}
+      {% if a.ja4h.is_empty() %}<tr><td colspan="3" class="empty">None.</td></tr>{% endif %}</tbody>
+    </table></div>
+  </section>
+
   <div class="grid-2">
     <section class="card">
       <div class="card-head"><h2>Open ports</h2><span class="muted">IPs</span></div>

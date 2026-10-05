@@ -10,6 +10,7 @@ pub mod export;
 pub mod fingerprints;
 pub mod hostkeys;
 pub mod inspect;
+pub mod ja4h;
 pub mod maintenance;
 pub mod recorder;
 pub mod requests;
@@ -32,6 +33,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_initial.sql"),
     include_str!("migrations/0002_host_keys.sql"),
     include_str!("migrations/0003_canaries.sql"),
+    include_str!("migrations/0004_ja4h.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
