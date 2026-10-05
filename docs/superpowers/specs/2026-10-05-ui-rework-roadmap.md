@@ -12,8 +12,8 @@ from here.
 | A | Public privacy: delayed, jittered public surface, no live elements | — | done: `2026-10-05-public-delay-design.md` |
 | B | Admin information architecture: nav, Overview/Queue/Scans merge, Cluster cleanup | — | done: `2026-10-05-admin-ia-design.md` |
 | C | Fingerprints + Canaries → one page about what links IPs | B (nav); shares filters with D | done: `2026-10-05-links-design.md` |
-| D | Clickable analytics with filtered drill-downs | partly C | open |
-| E | Lookup → global search | B | open |
+| D | Clickable analytics with filtered drill-downs | partly C | done (in-chat design, branch `drilldown-search`) |
+| E | Lookup → global search | B | done (in-chat design, branch `drilldown-search`) |
 
 Agreed order: A → B → C → D → E.
 

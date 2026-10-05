@@ -59,7 +59,9 @@ nmap.
 - **Admin area** (FIDO2 security keys only, no passwords) — request search
   and inspection (with the same IP's and same JA4's other requests), a live
   feed of new requests, analytics (top paths, user agents, JA4, methods,
-  open ports, products, OS guesses, abuse scores), per-IP pages with every
+  open ports, products, OS guesses, abuse scores; every row opens the
+  matching requests or IPs), a search box for IPs, networks, AS numbers,
+  requests, paths and fingerprints, per-IP pages with every
   enrichment result and counter-scan, the scan pace with the live queue and
   every finished job, a "needs attention" list on the Overview, a Links
   area (every browser fingerprint, SSH host key, TLS certificate, JA4, JA4H,
