@@ -2709,7 +2709,6 @@ async fn admin_cluster_page_and_private_attribution() {
         "sensor-bravo",
         "sensor-charlie",
         &b.id.short(),
-        "Scanner pace",
         // B and C recorded nothing to classify again, and run no trap.
         "no requests to compare",
         "none recorded",
@@ -2718,6 +2717,11 @@ async fn admin_cluster_page_and_private_attribution() {
     ] {
         assert!(page.contains(want), "cluster page lacks {want}");
     }
+    let scans = text(&admin, format!("{base}/admin/scans")).await;
+    assert!(
+        scans.contains("id=\"scanners\"") && scans.contains(&b.id.short()),
+        "scanner pace on the Scans page"
+    );
     // Remote pace from the UI.
     let r = admin
         .post(format!("{base}/admin/cluster/pace"))

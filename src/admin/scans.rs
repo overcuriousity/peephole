@@ -73,6 +73,8 @@ struct ScansPage {
     statuses: [&'static str; 4],
     /// Query string for the pagination links ("status=failed&").
     qs: String,
+    /// This node and the cluster's scanners, for the pace table.
+    scanners: Vec<crate::admin::cluster::MemberView>,
 }
 
 async fn render_page(st: &AdminState, q: &ScansQuery, pace: PaceView) -> AppResult<Html<String>> {
@@ -94,6 +96,7 @@ async fn render_page(st: &AdminState, q: &ScansQuery, pace: PaceView) -> AppResu
         f,
         statuses: FINISHED_STATUSES,
         qs,
+        scanners: crate::admin::cluster::scanner_rows(st).await?,
     })
 }
 

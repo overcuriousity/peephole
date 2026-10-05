@@ -117,17 +117,6 @@
   <div class="card-head"><h2>Configure another node</h2></div>
   <form method="post" action="/admin/cluster/config-key/add" class="filters"><label>Config key <input name="key" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Add key</button></form>
 </section>
-<section class="card">
-  <div class="card-head"><h2>Scanner pace</h2></div>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Scanner</th><th>Workers</th><th>Scans / hour</th><th>Timeout (min)</th><th></th><th>Level weights</th></tr></thead>
-    <tbody>
-    {% if me.scanner %}{% let m = me %}{% include "_cluster_pace_row.html" %}{% endif %}
-    {% for m in members %}{% if m.scanner && m.active %}{% include "_cluster_pace_row.html" %}{% endif %}{% endfor %}
-    </tbody>
-  </table></div>
-  <p class="muted">0 pauses a scanner. A scanner that fails a scan level more often than the others (last 24 h, timeouts aside) sits that level out for 10-minute stretches, a share of 1 − weight of them, while the others take its jobs; scanners with fewer than 5 scans at a level set no bar. It recovers as old failures age out, and jobs waiting over 30 min go to any scanner.</p>
-</section>
 <section class="card"><h2>Join or rejoin a cluster</h2>
   <form method="post" action="/admin/cluster/join" class="filters"><label>Invite token <input name="token" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Join</button></form>
 </section>

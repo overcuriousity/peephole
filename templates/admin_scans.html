@@ -41,6 +41,16 @@
       {% if pace.rec_differs %}<button class="btn" type="submit">Apply recommendation</button>{% else %}<p class="muted">The current pace matches.</p>{% endif %}
     </form>
   </div>
+  {% if !scanners.is_empty() %}
+  <div id="scanners">
+  <h3>Scanners</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Scanner</th><th>Workers</th><th>Scans / hour</th><th>Timeout (min)</th><th></th><th>Level weights</th></tr></thead>
+    <tbody>{% for m in scanners %}{% include "_cluster_pace_row.html" %}{% endfor %}</tbody>
+  </table></div>
+  <p class="muted">0 pauses a scanner. A scanner that fails a scan level more often than the others (last 24 h, timeouts aside) sits that level out for 10-minute stretches, a share of 1 − weight of them, while the others take its jobs; scanners with fewer than 5 scans at a level set no bar. It recovers as old failures age out, and jobs waiting over 30 min go to any scanner.</p>
+  </div>
+  {% endif %}
   {% if pace.m.failed_24h > 0 %}<p class="muted pace-retry"><a href="/admin/scans?status=failed#history">{{ pace.m.failed_24h }} failed in 24 h →</a></p>{% endif %}
 </section>
 <section class="card">

@@ -470,6 +470,20 @@ async fn views(node: &Node, check: &RulesCheck) -> AppResult<(MemberView, Vec<Me
     Ok((mine, out))
 }
 
+/// This node (when it scans) and the active scanner members, for the
+/// Scans page's pace table. Empty on a standalone node.
+pub(crate) async fn scanner_rows(st: &AdminState) -> AppResult<Vec<MemberView>> {
+    let Some(node) = st.recorder.node() else {
+        return Ok(vec![]);
+    };
+    let check = rules_check(st, node).await?;
+    let (me, members) = views(node, &check).await?;
+    Ok(std::iter::once(me)
+        .filter(|m| m.scanner)
+        .chain(members.into_iter().filter(|m| m.scanner && m.active))
+        .collect())
+}
+
 /// How much history this node keeps, and from when it holds it.
 async fn own_history(node: &Node) -> AppResult<String> {
     if !node.windowed() {
@@ -1192,6 +1206,9 @@ struct PaceForm {
     timeout_minutes: String,
 }
 
+/// Where the scanner pace table lives.
+const SCANNERS: &str = "/admin/scans#scanners";
+
 async fn set_pace(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
@@ -1199,12 +1216,13 @@ async fn set_pace(
 ) -> AppResult<Response> {
     let node = node(&st)?;
     let Ok(id) = NodeId::parse(&f.key) else {
-        return Ok(back(None, Some("unknown node".into())));
+        return Ok(back_to(SCANNERS, None, Some("unknown node".into())));
     };
     // Other nodes are changed from their own page, which carries the
     // settings version it showed (a change made meanwhile is refused).
     if id != node.id() {
-        return Ok(back(
+        return Ok(back_to(
+            SCANNERS,
             None,
             Some(format!(
                 "Change {}'s pace from its page: /admin/cluster/node/{}",
@@ -1219,10 +1237,18 @@ async fn set_pace(
         f.timeout_minutes.trim().parse::<f64>(),
     );
     let (Ok(w), Ok(h), Ok(t)) = parsed else {
-        return Ok(back(None, Some("pace values must be numbers".into())));
+        return Ok(back_to(
+            SCANNERS,
+            None,
+            Some("pace values must be numbers".into()),
+        ));
     };
     if !t.is_finite() || t <= 0.0 {
-        return Ok(back(None, Some("timeout must be positive".into())));
+        return Ok(back_to(
+            SCANNERS,
+            None,
+            Some("timeout must be positive".into()),
+        ));
     }
     let timeout_secs = (t * 60.0).round() as u64;
     let outcome = st
@@ -1247,8 +1273,12 @@ async fn set_pace(
         node.publish_status();
     }
     Ok(match outcome {
-        Ok(()) => back(Some(format!("Pace of {} saved.", id.short())), None),
-        Err(e) => back(None, Some(format!("Pace not saved: {e}"))),
+        Ok(()) => back_to(
+            SCANNERS,
+            Some(format!("Pace of {} saved.", id.short())),
+            None,
+        ),
+        Err(e) => back_to(SCANNERS, None, Some(format!("Pace not saved: {e}"))),
     })
 }
 
