@@ -78,6 +78,8 @@ pub struct ExportRow {
     pub raw_head: Option<Vec<u8>>,
     pub tls_client_hello: Option<Vec<u8>>,
     pub ja4: Option<String>,
+    /// JA4H of `raw_head`.
+    pub ja4h: Option<String>,
     pub answer: Option<String>,
     /// Decoy template version of a decoy answer (None: version 0 or no decoy).
     pub decoy_v: Option<i64>,
@@ -136,6 +138,7 @@ pub const COLUMNS: &[&str] = &[
     "raw_head",
     "tls_client_hello",
     "ja4",
+    "ja4h",
     "answer",
     "decoy_v",
     "canary_used_from",
@@ -293,6 +296,7 @@ impl ExportRow {
             "raw_head": b64(&self.raw_head),
             "tls_client_hello": b64(&self.tls_client_hello),
             "ja4": self.ja4,
+            "ja4h": self.ja4h,
             "answer": self.answer,
             "decoy_v": self.decoy_v,
             "canary_used_from": self.canary_used_from,
@@ -618,6 +622,7 @@ fn request_row(
         raw_head: r.raw_head,
         tls_client_hello: r.tls_client_hello,
         ja4: r.ja4,
+        ja4h: r.ja4h,
         answer: r.answer,
         decoy_v: r.decoy_v,
         canary_used_from,
@@ -1284,6 +1289,9 @@ mod tests {
         assert_eq!(r["answer"], "not-found");
         assert_eq!(r["status"], 404);
         assert_eq!(r["ja4"], "t13d0305h2_aaaaaaaaaaaa_bbbbbbbbbbbb");
+        let ja4h = crate::trap::ja4h::ja4h(b"POST /login HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(r["ja4h"], ja4h);
+        assert!(rows[1]["ja4h"].is_null(), "light rows have no head");
         assert_eq!(r["rules"], "ab".repeat(32));
         assert!(rows[1]["rules"].is_null(), "light rows were not classified");
         assert_eq!(r["transport"], "https");

@@ -82,6 +82,7 @@ Column order is as listed.
 | `raw_head` | binary? | The request head exactly as it came off the wire (HTTP/1 only), for parser-level features |
 | `tls_client_hello` | binary? | The raw TLS ClientHello (HTTPS only) |
 | `ja4` | string? | JA4 fingerprint of that ClientHello |
+| `ja4h` | string? | JA4H fingerprint of `raw_head` (HTTP/1 only; null for plain HTTP from a trusted proxy, whose head is the proxy's request, not the client's): method, version, cookie and referer flags, header count, first `Accept-Language`, then hashes of the header names in order and of the sorted cookie names and pairs. An unknown method gives its first two letters |
 | `answer` | string? | What the trap sent: `not-found` (a 404), `decoy:<name>` (a believable fake: `decoy:dotenv`, `decoy:git-config`, `decoy:git-head`, `decoy:wp-login`, `decoy:wp-login-failed`, `decoy:phpinfo`; answers to a harvested canary: `decoy:wp-login-ok`, `decoy:wp-admin`, `decoy:admin`, `decoy:git-auth`, `decoy:git-refs`, `decoy:git-pack`), `claim` (the false-positive claim page) |
 | `decoy_v` | int? | Template version of a decoy answer (see Canaries); empty for other answers, and empty on a decoy row means version 0 |
 | `canary_used_from` | list of string | The `uid`s of the rows whose served canaries this row carried (light rows as `<batch uid>#<n>`, `n` the row's position in its batch from 1); empty when none |
@@ -251,3 +252,6 @@ cluster.
   operators should not be identifiable from the file.
 - **Claim e-mails are never exported**, only `fp_claim`.
 - **Counts need `weight`.** See Rows.
+- **JA4H is FoxIO's method under the FoxIO License 1.1** (JA4 is BSD
+  3-Clause). Check its terms before building a commercial product on the
+  `ja4h` column.

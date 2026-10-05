@@ -17,6 +17,7 @@
       <div><dt>Answered</dt><dd class="mono">{% if let Some(a) = d.row.answer %}{{ a }}{% if let Some(st) = d.row.status %} · {{ st }}{% endif %}{% else %}<span class="muted">—</span>{% endif %}</dd></div>
       <div><dt>Transport</dt><dd>{% if let Some(t) = d.row.transport %}{{ t }}{% if d.row.via_proxy == Some(true) %} via proxy{% endif %}{% else %}<span class="muted">—</span>{% endif %}</dd></div>
       <div><dt>JA4</dt><dd class="mono">{% if let Some(j) = d.row.ja4 %}{{ j }}{% let value = j.as_str() %}{% let what = "JA4" %}{% let subtle = false %}{% include "_copy.html" %}{% else %}<span class="muted">—</span>{% endif %}</dd></div>
+      <div><dt>JA4H</dt><dd class="mono">{% if let Some(j) = d.row.ja4h %}<a href="/requests?ja4h={{ j|urlencode }}" title="All requests with this JA4H">{{ j }}</a>{% let value = j.as_str() %}{% let what = "JA4H" %}{% let subtle = false %}{% include "_copy.html" %}{% else %}<span class="muted">—</span>{% endif %}</dd></div>
       {% if let Some(n) = d.row.unrecorded %}<div><dt>Unrecorded before it</dt><dd>{{ n }}</dd></div>{% endif %}
       {% if let Some(h) = d.rules_short %}<div><dt>Rules</dt><dd class="mono" title="Fingerprint of the rules that classified it: {{ d.row.rules.as_deref().unwrap_or_default() }}">{{ h }}</dd></div>{% endif %}
       <div><dt>Body</dt><dd>{{ crate::admin::views::thousands(d.body_len) }} bytes</dd></div>

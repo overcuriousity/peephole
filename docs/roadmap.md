@@ -32,22 +32,7 @@ Measured on the real cluster, 30 days, before this roadmap (2026-10-04):
 
 ## Next
 
-### 1. JA4H
-
-- **Cost:** S
-- **Benefit:** medium. A second client fingerprint, from HTTP rather than
-  TLS, and the strongest cheap campaign signal when combined with JA4.
-  Backfills over all history.
-
-It is a pure function of the stored `raw_head`, so it needs a column, a
-backfill like `host_keys`, and an export column.
-
-**Shown:**
-
-- **Admin:** request page; Analytics "top JA4H"; the request search filter.
-- **Public:** none (fingerprints are never public).
-
-### 2. Tarpit
+### 1. Tarpit
 
 - **Cost:** S–M
 - **Benefit:** medium. It costs scanners time for almost nothing, and the
@@ -64,7 +49,7 @@ time held, so the dataset can separate the reduced follow-up traffic.
   held on the request page.
 - **Public wall:** a "scanner time wasted" tile (hours held this period).
 
-### 3. Stateful decoys, MCP and AI first
+### 2. Stateful decoys, MCP and AI first
 
 - **Cost:** M for the state machine and the MCP/Ollama decoys
 - **Benefit:** high. This is the newest attack surface, there is little
@@ -88,7 +73,7 @@ recorded in `answer` (`decoy:mcp:initialize`, `decoy:mcp:tools/call`, …):
 - **Public wall:** "What they asked our fake AI": counts per tool name (our
   own fake names, so safe to show) and per model requested.
 
-### 4. Stateful web decoys: wp-admin, upload sink, webshell commands
+### 3. Stateful web decoys: wp-admin, upload sink, webshell commands
 
 - **Cost:** M–L
 - **Benefit:** high. It captures the second stage (the dropped webshell and
@@ -110,7 +95,7 @@ recorded in `answer` (`decoy:mcp:initialize`, `decoy:mcp:tools/call`, …):
   timeline of the requests sent to it.
 - **Public wall:** a "webshells dropped" tile and counts per command verb.
 
-### 5. Campaign clustering
+### 4. Campaign clustering
 
 - **Cost:** L
 - **Benefit:** very high. It answers "who is this" across addresses and is
@@ -127,9 +112,9 @@ so every node arrives at the same campaigns. Every edge says why it exists.
   - rarity-weighted Jaccard similarity of each IP's normalized path set,
     above a threshold. About 500 IPs a month allows plain pairwise
     comparison; MinHash only if that grows by orders of magnitude;
-  - JA4 together with JA4H (item 1) as supporting evidence, never alone.
+  - JA4 together with JA4H (shipped: `requests.ja4h`) as supporting evidence, never alone.
 - **Path normalization** (IDs, random filenames, query values) is most of
-  the work and is shared with item 6.
+  the work and is shared with item 5.
 
 **Shown:**
 
@@ -141,9 +126,9 @@ so every node arrives at the same campaigns. Every edge says why it exists.
   and paths per campaign, as aggregates without fingerprints.
 - **Dataset:** a `campaign` column.
 
-### 6. New paths and exploit waves
+### 5. New paths and exploit waves
 
-- **Cost:** M (once item 5's path normalization exists)
+- **Cost:** M (once item 4's path normalization exists)
 - **Benefit:** high. It gives early warning when a new exploit starts
   spreading, often before CVE write-ups.
 
@@ -161,9 +146,9 @@ so every node arrives at the same campaigns. Every edge says why it exists.
 - **Public wall:** a count of new path shapes this period (paths themselves
   are request contents, so not public).
 
-### 7. Personas per node or hostname (opt-in)
+### 6. Personas per node or hostname (opt-in)
 
-- **Cost:** M (after items 3 and 4)
+- **Cost:** M (after items 2 and 3)
 - **Benefit:** medium–high. A controlled comparison of targeted versus spray
   traffic across the cluster.
 
@@ -213,6 +198,6 @@ honeypot.
   `/api/blocklist`, and a CrowdSec-compatible endpoint. Cost M.
 - **Weekly digest page.** A generated, permalinked public summary: new
   families, the largest campaign, new path shapes, top movers. Cost M; worth
-  it once items 5 and 6 exist.
+  it once items 4 and 5 exist.
 - **Hall of fame.** Oldest CVE still probed, strangest User-Agent, longest
   payload, as aggregates. Cost S–M.

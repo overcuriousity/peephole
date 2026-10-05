@@ -1,3 +1,7 @@
+// The export row's `json!` (export::ExportRow::to_json) has more keys than
+// the default limit expands.
+#![recursion_limit = "256"]
+
 pub mod admin;
 pub mod canary;
 pub mod classify;
@@ -191,6 +195,17 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(rows = n, "canaries: parsed stored rows"),
                 Err(e) => tracing::warn!(error = %e, "canaries: backfill failed"),
+            }
+        }
+    });
+    // JA4H of rows stored before this build; new rows get it as written.
+    tokio::spawn({
+        let pool = store.pool.clone();
+        async move {
+            match store::ja4h::backfill(&pool).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(rows = n, "ja4h: derived stored rows"),
+                Err(e) => tracing::warn!(error = %e, "ja4h: backfill failed"),
             }
         }
     });

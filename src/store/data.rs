@@ -273,8 +273,8 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
         "INSERT OR IGNORE INTO requests (uid, origin, hlc, ts, ip_id, method, path, query,
            headers_json, body, labels_json, owasp_json, severity, scan_level, is_fp_claim,
            page_token, answer, status, unrecorded, transport, via_proxy, raw_head,
-           tls_client_hello, ja4, build, rules, decoy_v, decoy_site)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           tls_client_hello, ja4, build, rules, decoy_v, decoy_site, ja4h, ja4h_v)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -304,6 +304,12 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(rules)
     .bind(r.decoy_v)
     .bind(r.decoy_site.as_deref().map(|w| cut(w, 64)))
+    .bind(super::ja4h::derive(
+        r.raw_head.as_deref(),
+        r.transport.as_deref(),
+        r.via_proxy,
+    ))
+    .bind(super::ja4h::JA4H_V)
     .execute(&mut *conn)
     .await?;
     if done.rows_affected() == 1 {

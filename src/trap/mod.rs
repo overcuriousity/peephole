@@ -1,6 +1,7 @@
 mod config;
 pub mod decoy;
 mod flood;
+pub mod ja4h;
 pub mod listen;
 mod pages;
 pub mod proxy_proto;

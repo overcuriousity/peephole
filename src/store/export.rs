@@ -32,6 +32,7 @@ pub struct ReqRow {
     pub raw_head: Option<Vec<u8>>,
     pub tls_client_hello: Option<Vec<u8>>,
     pub ja4: Option<String>,
+    pub ja4h: Option<String>,
     pub build: String,
     pub rules: Option<String>,
     pub decoy_v: Option<i64>,
@@ -145,7 +146,7 @@ impl Store {
             "SELECT r.id, r.uid, r.origin, r.ts, r.ip_id, i.ip, r.method, r.path, r.query,
                     r.headers_json, r.body, r.labels_json, r.owasp_json, r.severity, r.scan_level, r.answer,
                     r.status, r.unrecorded, r.transport, r.via_proxy, r.raw_head,
-                    r.tls_client_hello, r.ja4, r.build, r.rules, r.decoy_v
+                    r.tls_client_hello, r.ja4, r.ja4h, r.build, r.rules, r.decoy_v
              FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1",
         );
         if after.is_some() {
