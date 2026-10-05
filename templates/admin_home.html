@@ -15,6 +15,25 @@
 </div>
 <div class="stack">
   <section class="card">
+    <div class="card-head"><h2>Recent activity</h2><span class="row"><span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span><a href="/requests">search all →</a></span></div>
+    <div class="table-wrap wide"><table data-recent data-src="/admin/api/recent?after={{ recent_max_id }}" data-labels="1">
+      <thead><tr><th>Time (UTC)</th><th>IP</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th></tr></thead>
+      <tbody>
+      {% for r in recent %}
+        <tr data-sev="{{ r.severity }}">
+          <td class="ts">{{ r.ts }}</td>
+          <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% if let Some(c) = r.country %} <span class="flag" title="{{ crate::admin::countries::country_name(c) }}">{{ crate::admin::countries::flag(c) }}</span>{% endif %}</td>
+          <td class="mono">{{ r.method }}</td>
+          <td class="path"><a href="/admin/requests/{{ r.id }}">{{ r.path }}</a></td>
+          <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
+          <td><span class="chips">{% for l in r.labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>
+        </tr>
+      {% endfor %}
+      {% if recent.is_empty() %}<tr data-empty><td colspan="6" class="empty">Nothing yet.</td></tr>{% endif %}
+      </tbody>
+    </table></div>
+  </section>
+  <section class="card">
     <div class="card-head"><h2>Scan queue</h2><span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></div>
     <div class="table-wrap wide"><table data-queue data-src="/admin/api/queue" data-limit="25">
       <thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Status</th><th>Queued</th><th>Finished</th><th>Error</th><th>Node</th></tr></thead>

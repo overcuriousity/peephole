@@ -78,6 +78,10 @@ struct HomePage {
     stale: bool,
     /// `(label, state)` per API provider.
     api: Vec<(&'static str, String)>,
+    /// "Recent activity": the newest requests, then live over SSE.
+    recent: Vec<crate::store::stats::RecentRequest>,
+    /// The newest request id shown (the live feed's cursor).
+    recent_max_id: i64,
 }
 
 async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
@@ -89,6 +93,11 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             .collect();
     let stale = intel_stale(&intel);
     let fetched = |k: &str| intel.get(k).cloned().unwrap_or_else(|| "never".into());
+    let recent = st
+        .store
+        .recent_requests(50, crate::store::browse::Audience::Admin)
+        .await?;
+    let recent_max_id = recent.iter().map(|r| r.id).max().unwrap_or(0);
     render(&HomePage {
         chrome: chrome(),
         q: st.store.queue_summary(&st.recorder).await?,
@@ -109,6 +118,8 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         },
         stale,
         api: api_provider_states(&st).await?,
+        recent,
+        recent_max_id,
     })
 }
 

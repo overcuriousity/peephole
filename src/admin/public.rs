@@ -1022,6 +1022,21 @@ show_labels = {show_labels}
     }
 
     #[tokio::test]
+    async fn admin_overview_has_the_live_feed() {
+        let (st, _d) = delayed_state().await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, home) = get_with(&app, "/admin", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(home.contains("data-recent"));
+        assert!(home.contains("/admin/api/recent?after="));
+        assert!(
+            home.contains("/pending-path"),
+            "admins see pending rows at once"
+        );
+    }
+
+    #[tokio::test]
     async fn pending_only_ip_is_a_404_for_the_public() {
         let (st, _d) = delayed_state().await;
         let cookie = admin_cookie(&st).await;
