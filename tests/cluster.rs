@@ -4219,3 +4219,45 @@ async fn a_rotation_leaves_out_the_nodes_named() {
     assert!(fleet::discover(&nc.node).await.unwrap().is_empty());
     assert_eq!(fleet::discover(&na.node).await.unwrap(), vec![b.id]);
 }
+/// A payment written on one node is in every node's table of credit
+/// entries, also when the node that receives it has blocked nobody and
+/// knows nothing else about credits yet.
+#[tokio::test]
+async fn credit_entries_replicate_into_every_nodes_table() {
+    use peephole::cluster::record::Seal;
+    use peephole::credits::{self, entries};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let today = credits::day_of(na.hlc.now());
+    let written = repl::append(
+        &na,
+        &[Record::CreditTransfer {
+            to: b.id,
+            parts: vec![(today, 250)],
+            seal: Seal::default(),
+        }],
+    )
+    .await
+    .unwrap();
+    eventually("b holds a's transfer as a row", || async {
+        entries::get(&nb.store.pool, &a.id, written[0].seq)
+            .await
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    let row = entries::get(&nb.store.pool, &a.id, written[0].seq)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.kind,
+        entries::Kind::Transfer {
+            to: b.id,
+            parts: vec![(today, 250)]
+        }
+    );
+    assert_eq!(entries::since(&na.store.pool, 0).await.unwrap().len(), 1);
+}

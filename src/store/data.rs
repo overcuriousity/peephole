@@ -84,9 +84,16 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
         Record::Tombstone(t) => tombstone(conn, ctx, t).await,
         Record::IntelManifest(m) => intel_manifest(conn, ctx, m).await,
         Record::SkipBatch(b) => skip_batch(conn, ctx, b).await,
-        Record::MemberAdd(_) | Record::MemberUpdate(_) | Record::MemberRevoke { .. } => {
-            Ok(Effect::Ignored)
-        }
+        // Membership and credits are the cluster layer's (`members::apply`,
+        // `credits::entries`, `cluster::seal`): no row of the dataset.
+        Record::MemberAdd(_)
+        | Record::MemberUpdate(_)
+        | Record::MemberRevoke { .. }
+        | Record::CreditOffer { .. }
+        | Record::CreditReceipt { .. }
+        | Record::CreditTransfer { .. }
+        | Record::LogSeal { .. }
+        | Record::ForkProof { .. } => Ok(Effect::Ignored),
     }
 }
 

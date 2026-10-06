@@ -284,6 +284,19 @@ pub struct TombstoneRec {
     pub seqs: Vec<u64>,
 }
 
+/// What a sealing entry (an offer, a transfer, a `log_seal`) says about
+/// its origin's log before it: see `cluster::seal`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Seal {
+    /// Sequence number of the origin's previous sealing entry; the entry's
+    /// own number for the first one.
+    pub from: u64,
+    /// SHA-256 over the digests of the origin's entries from `from` up to
+    /// the one before this entry.
+    #[serde(with = "serde_bytes")]
+    pub digest: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "k", rename_all = "snake_case")]
 pub enum Record {
@@ -306,6 +319,37 @@ pub enum Record {
     Tombstone(TombstoneRec),
     IntelManifest(IntelManifestRec),
     SkipBatch(SkipBatchRec),
+    /// Credits set aside for a lookup at `to`: `(day, mc)` of the origin's
+    /// lots (see `credits`). Identified by its origin and sequence number.
+    CreditOffer {
+        to: NodeId,
+        parts: Vec<(u32, u32)>,
+        seal: Seal,
+    },
+    /// The server's word on an offer: what it charged, and for which
+    /// providers. The address looked up is not in it.
+    CreditReceipt {
+        payer: NodeId,
+        offer_seq: u64,
+        charged_mc: u32,
+        answered: Vec<String>,
+    },
+    /// Credits sent to another node.
+    CreditTransfer {
+        to: NodeId,
+        parts: Vec<(u32, u32)>,
+        seal: Seal,
+    },
+    /// A seal with nothing else to say (written when many entries have
+    /// none yet).
+    LogSeal {
+        seal: Seal,
+    },
+    /// Two entries one origin signed for the same position of its log.
+    ForkProof {
+        a: Box<WireEntry>,
+        b: Box<WireEntry>,
+    },
 }
 
 /// Kinds whose payload is not stored in the log but rebuilt from their row
@@ -329,6 +373,11 @@ impl Record {
             Record::Tombstone(_) => "tombstone",
             Record::IntelManifest(_) => "intel_manifest",
             Record::SkipBatch(_) => "skip_batch",
+            Record::CreditOffer { .. } => "credit_offer",
+            Record::CreditReceipt { .. } => "credit_receipt",
+            Record::CreditTransfer { .. } => "credit_transfer",
+            Record::LogSeal { .. } => "log_seal",
+            Record::ForkProof { .. } => "fork_proof",
         }
     }
 
@@ -564,5 +613,59 @@ mod tests {
         let mut e = WireEntry::sign(&me, 1, 1, &Record::MemberRevoke { id: me.id }).unwrap();
         e.kind = "from_the_future".into();
         assert_eq!(e.record(), None);
+    }
+
+    /// The credit kinds have no uid (no tombstone can erase a payment) and
+    /// survive the wire.
+    #[test]
+    fn credit_records_round_trip_without_a_uid() {
+        let id = Identity::generate().unwrap();
+        let seal = Seal {
+            from: 3,
+            digest: vec![7; 32],
+        };
+        let inner =
+            WireEntry::sign(&id, 1, 1 << 16, &Record::LogSeal { seal: seal.clone() }).unwrap();
+        for (r, kind) in [
+            (
+                Record::CreditOffer {
+                    to: id.id,
+                    parts: vec![(20_000, 250), (20_001, 4_000_000_000)],
+                    seal: seal.clone(),
+                },
+                "credit_offer",
+            ),
+            (
+                Record::CreditReceipt {
+                    payer: id.id,
+                    offer_seq: 12,
+                    charged_mc: 200,
+                    answered: vec!["shodan".into()],
+                },
+                "credit_receipt",
+            ),
+            (
+                Record::CreditTransfer {
+                    to: id.id,
+                    parts: vec![(20_000, 1)],
+                    seal: seal.clone(),
+                },
+                "credit_transfer",
+            ),
+            (Record::LogSeal { seal: seal.clone() }, "log_seal"),
+            (
+                Record::ForkProof {
+                    a: Box::new(inner.clone()),
+                    b: Box::new(inner.clone()),
+                },
+                "fork_proof",
+            ),
+        ] {
+            assert_eq!(r.kind(), kind);
+            assert_eq!(r.uid(), None);
+            let e = WireEntry::sign(&id, 2, 2 << 16, &r).unwrap();
+            assert!(e.verify());
+            assert_eq!(e.record(), Some(r));
+        }
     }
 }

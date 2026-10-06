@@ -7,6 +7,7 @@ pub mod canary;
 pub mod classify;
 pub mod cluster;
 pub mod config;
+pub mod credits;
 pub mod events;
 pub mod export;
 pub mod fingerprint;

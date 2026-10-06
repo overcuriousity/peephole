@@ -1407,6 +1407,18 @@ async fn apply_record(
     if let Record::JobAdopt(a) = r {
         return adopt(node, conn, e, a, at).await;
     }
+    // Payments become rows; Task 2 replaces the state by the seal's check.
+    if matches!(
+        r,
+        Record::CreditOffer { .. } | Record::CreditReceipt { .. } | Record::CreditTransfer { .. }
+    ) {
+        let state = match r {
+            Record::CreditReceipt { .. } => crate::credits::entries::SealState::None,
+            _ => crate::credits::entries::SealState::Unchecked,
+        };
+        crate::credits::entries::apply(conn, e, r, state).await?;
+        return Ok(Settled::default());
+    }
     let ctx = Ctx {
         origin: Some(&e.origin),
         hlc: at,
