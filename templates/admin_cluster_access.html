@@ -3,7 +3,7 @@
 {% block content %}
 {% let sub = "cluster" %}{% include "_admin_nav.html" %}
 {% let subtab = "access" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
-<div class="page-head"><div><h1>Access</h1><p class="muted">Invites, config keys, joining and leaving.</p></div></div>
+<div class="page-head"><div><h1>Access</h1><p class="muted">Invites, joining and leaving.</p></div></div>
 <div class="stack">
 {% if let Some(t) = invite %}
 <section class="card"><h2>Invite</h2>
@@ -29,18 +29,6 @@
       <td>{% if i.usable %}<form method="post" action="/admin/cluster/invite/revoke"><input type="hidden" name="id" value="{{ i.id }}"><button class="btn btn-sm btn-danger" type="submit">Revoke invite</button></form>{% endif %}</td>
     </tr>{% endfor %}</tbody>
   </table></div>{% endif %}
-</section>
-<section class="card"><h2>This node's config key</h2>
-  {% if remote_config %}
-  <p class="muted">Lets its holders change this node's pace, cooldown and roles. Rotate to revoke.</p>
-  {% if let Some(k) = config_key %}<details><summary>Show key</summary><pre class="panel mono break" data-copy>{{ k }}</pre></details>{% endif %}
-  <form method="post" action="/admin/cluster/config-key/rotate"><button class="btn btn-sm btn-danger" type="submit">Rotate key</button></form>
-  {% else %}
-  <p class="muted">Remote configuration: <b>locked</b> (<code>remote_config = true</code> opens it).</p>
-  {% endif %}
-</section>
-<section class="card"><h2>Configure another node</h2>
-  <form method="post" action="/admin/cluster/config-key/add" class="filters"><label>Config key <input name="key" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Add key</button></form>
 </section>
 <section class="card"><h2>Join or rejoin a cluster</h2>
   <form method="post" action="/admin/cluster/join" class="filters"><label>Invite token <input name="token" size="60" class="mono" required></label><button class="btn btn-primary" type="submit">Join</button></form>

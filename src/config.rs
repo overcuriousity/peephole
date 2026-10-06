@@ -198,9 +198,8 @@ pub struct ClusterConfig {
     /// Scan lease length; renewed while nmap runs.
     #[serde(default = "default_lease_secs")]
     pub lease_secs: u64,
-    /// Let holders of this node's config key change its runtime settings
-    /// (scan pace, rescan cooldown, roles). Default: only the local admin
-    /// interface, the CLI and this file can.
+    /// Ignored. It switched config keys on, which the ownership key replaced;
+    /// still accepted so existing config files load.
     #[serde(default)]
     pub remote_config: bool,
     /// Stop storing a member's entries once they take this many MiB here
@@ -899,6 +898,17 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config file from before ownership still loads.
+    #[test]
+    fn remote_config_is_still_accepted() {
+        let cfg: Config = toml::from_str(
+            "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n\
+             [cluster]\nnode_name = \"n\"\nlisten = \"127.0.0.1:7443\"\nremote_config = true\n",
+        )
+        .unwrap();
+        assert!(cfg.cluster.unwrap().remote_config);
+    }
 
     /// The target just connected to us, so it is up. Without -Pn nmap's own
     /// discovery probes (often filtered) decide "down" and nothing is scanned.

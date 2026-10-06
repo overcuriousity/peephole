@@ -3,7 +3,6 @@
 pub mod adopt;
 pub mod block;
 pub mod cli;
-pub mod confkey;
 pub mod history;
 pub mod hlc;
 pub mod identity;
@@ -413,7 +412,8 @@ impl Node {
                 .collect(),
             proto_min: self.proto.0,
             proto_max: self.proto.1,
-            remote_config: self.cfg.remote_config,
+            // Config keys are gone; the field stays for records of earlier versions.
+            remote_config: false,
         }
     }
 

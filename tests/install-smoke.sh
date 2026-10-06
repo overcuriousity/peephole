@@ -188,7 +188,7 @@ test ! -e /usr/local/bin/peephole.prev
 echo "== forced re-run with wizard variables set leaves config and nginx example alone"
 md5sum /etc/peephole/config.toml /etc/peephole/nginx.example.conf > /tmp/before.md5
 PEEPHOLE_FORCE=1 PEEPHOLE_ROLES=scanner PEEPHOLE_LOCAL_PROXY=1 PEEPHOLE_CLUSTER=1 \
-    PEEPHOLE_CLUSTER_NAME=other PEEPHOLE_CLUSTER_LISTEN=0.0.0.0:7443 PEEPHOLE_REMOTE_CONFIG=1 \
+    PEEPHOLE_CLUSTER_NAME=other PEEPHOLE_CLUSTER_LISTEN=0.0.0.0:7443 \
     bash install.sh > /tmp/forced-vars.log 2>&1 || { cat /tmp/forced-vars.log; exit 1; }
 md5sum -c --quiet /tmp/before.md5
 
@@ -287,8 +287,8 @@ test ! -e /usr/local/bin/peephole
 echo "== wizard: a value the binary rejects leaves no config behind"
 reset_install
 # trap? no · scanner? yes · web? no · cluster? yes · name · listen "bogus" ·
-# advertise (none) · token (none) · remote config? no · MaxMind: skip
-printf 'n\ny\nn\ny\nscanner-9\nbogus\n\n\nn\n\n' > /tmp/answers
+# advertise (none) · token (none) · MaxMind: skip
+printf 'n\ny\nn\ny\nscanner-9\nbogus\n\n\n\n' > /tmp/answers
 if env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard-bad.log 2>&1; then
     echo "expected failure"; exit 1
@@ -296,23 +296,20 @@ fi
 grep -q "failed validation" /tmp/wizard-bad.log
 test ! -e /etc/peephole/config.toml
 
-echo "== wizard: re-run after the rejected answer asks again (scanner in a cluster, remote configuration on)"
+echo "== wizard: re-run after the rejected answer asks again (scanner in a cluster)"
 # No reset: the binary from the failed run is in place.
 # trap? no · scanner? yes · web? no · cluster? yes · name · listen (default) ·
-# advertise · token (none) · remote config? yes · MaxMind: skip
-printf 'n\ny\nn\ny\nscanner-9\n\nscan9.example:7443\n\ny\n\n' > /tmp/answers
+# advertise · token (none) · MaxMind: skip
+printf 'n\ny\nn\ny\nscanner-9\n\nscan9.example:7443\n\n\n' > /tmp/answers
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard4.log 2>&1 || { cat /tmp/wizard4.log; exit 1; }
 if grep -q 'already up to date' /tmp/wizard4.log; then echo "re-run after a failed first install skipped the wizard"; exit 1; fi
 grep -q '^node_name = "scanner-9"' /etc/peephole/config.toml
 grep -q '^listen = "0.0.0.0:7443"' /etc/peephole/config.toml
 grep -q '^advertise = "scan9.example:7443"' /etc/peephole/config.toml
-grep -q '^remote_config = true' /etc/peephole/config.toml
 # The InternetDB question was not answered: its default (yes) applies.
 grep -q '^\[internetdb\]' /etc/peephole/config.toml
-grep -q 'peephole-cfg1:' /tmp/wizard4.log
 grep -q 'ed25519:' /tmp/wizard4.log
-/usr/local/bin/peephole check-config /etc/peephole/config.toml | grep -q 'remote config: on'
 
 # certbot stand-in: records its arguments and writes a self-signed
 # certificate where Let's Encrypt would; /tmp/certbot-fail makes it fail.
@@ -405,13 +402,11 @@ echo "== unattended: a bad join token does not fail the install"
 reset_install
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     PEEPHOLE_ROLES=scanner PEEPHOLE_CLUSTER_NAME=scanner-2 PEEPHOLE_CLUSTER_LISTEN=0.0.0.0:7443 \
-    PEEPHOLE_JOIN_TOKEN=peephole1:garbage PEEPHOLE_REMOTE_CONFIG=0 \
+    PEEPHOLE_JOIN_TOKEN=peephole1:garbage \
     bash install.sh > /tmp/badjoin.log 2>&1 || { cat /tmp/badjoin.log; exit 1; }
 grep -q 'joining the cluster failed' /tmp/badjoin.log
-grep -q '^remote_config = false' /etc/peephole/config.toml
 # Without a terminal no third-party API is used unless asked for.
 if grep -q '\[internetdb\]' /etc/peephole/config.toml; then echo "unattended install enabled InternetDB"; exit 1; fi
-if grep -q 'peephole-cfg1:' /tmp/badjoin.log; then echo "locked node printed a config key"; exit 1; fi
 echo "== unattended direct: the trap takes 80/443 itself, no proxy trusted, no nginx"
 reset_install
 # PEEPHOLE_TRUSTED_PROXIES stays preset (10.0.0.0/8): direct ignores it, with a warning.

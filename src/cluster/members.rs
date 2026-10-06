@@ -89,7 +89,7 @@ pub struct MemberRow {
     pub info_hlc: u64,
     /// HLC of the newest log entry this member signed (0: none held).
     pub last_entry_hlc: u64,
-    /// The member lets config key holders change its runtime settings.
+    /// Unused since ownership replaced config keys; always false in new records.
     pub remote_config: bool,
 }
 

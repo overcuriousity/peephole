@@ -70,11 +70,6 @@ pub async fn check_config(config_path: &std::path::Path) -> Result<(config::Conf
             )),
             Err(e) => return Err(e.context("node key")),
         }
-        summary.push_str(if cfg.cluster.as_ref().is_some_and(|c| c.remote_config) {
-            "\nremote config: on (config key holders may change runtime settings)"
-        } else {
-            "\nremote config: off"
-        });
     }
     if cfg.retention_days > 0 {
         summary.push_str(&format!(
@@ -242,7 +237,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let notifier = events::Notifier::new();
 
     // Runtime settings: config defaults, overridden from the admin UI, the
-    // CLI or a config key holder.
+    // CLI or the owner.
     let nmap_ok = tokio::process::Command::new(cfg.scan.nmap())
         .arg("--version")
         .output()
@@ -258,7 +253,10 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     if let Some(node) = &node {
         scan::arbiter::Arbiter::start(node.clone(), shutdown_rx.clone()).await?;
         if cfg.cluster.as_ref().is_some_and(|c| c.remote_config) {
-            cluster::confkey::ensure(&store, node.id()).await?;
+            tracing::warn!(
+                "cluster.remote_config is ignored: config keys were replaced by the ownership \
+                 key (peephole owner new, peephole owner adopt)"
+            );
         }
         cluster::remote::serve(node, settings.clone());
         cluster::owner::fleet::serve(node);
@@ -267,7 +265,6 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             node.clone(),
             shutdown_rx.clone(),
         ));
-        cluster::confkey::serve(node, settings.clone());
         // Does nothing unless this node currently scans.
         tokio::spawn(scan::arbiter::takeover_loop(
             node.clone(),
@@ -282,7 +279,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     }
 
     // Roles run under a supervisor that starts and stops them when the
-    // effective roles change (admin UI, CLI, or a config key holder).
+    // effective roles change (admin UI, CLI, or the owner).
     let roles = RoleRunner {
         cfg: cfg.clone(),
         store: store.clone(),

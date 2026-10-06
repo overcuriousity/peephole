@@ -13,10 +13,16 @@ use std::sync::Arc;
 /// How long to wait for a node's answer.
 pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// What a node of an earlier version is told when it sends a config key
+/// request.
+pub const CONFIG_KEY_GONE: &str =
+    "config keys were replaced by the ownership key (this node runs a newer version)";
+
 /// A node's runtime settings as it reports them to a member that asks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct State {
-    /// Whether the node accepts changes from config key holders at all.
+    /// Always false: config keys are gone. Kept so nodes of earlier versions
+    /// decode the answer.
     pub open: bool,
     pub version: u64,
     pub pace: PaceInfo,
@@ -51,7 +57,7 @@ pub async fn state(node: &Node, settings: &Settings) -> State {
         _ => None,
     };
     State {
-        open: node.cfg.remote_config,
+        open: false,
         version: s.version,
         pace: pace_info(s.pace),
         cooldown_hours: s.cooldown_hours,
@@ -69,6 +75,10 @@ pub fn serve(node: &Arc<Node>, settings: Settings) {
             let node = weak.upgrade()?;
             match msg {
                 Msg::ConfigGet => Some(Msg::ConfigState(state(&node, &settings).await)),
+                Msg::ConfigSet { .. } => Some(Msg::ConfigSetReply {
+                    version: None,
+                    error: Some(CONFIG_KEY_GONE.into()),
+                }),
                 _ => None,
             }
         })

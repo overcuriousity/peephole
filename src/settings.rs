@@ -1,7 +1,7 @@
 //! Runtime settings: the values an operator may change while the node runs
 //! (scan pace, rescan cooldown, roles). The TOML gives the defaults; rows in
 //! the `settings` table override them. Every change, from the local admin
-//! UI, the CLI or a config key holder, goes through [`Settings::apply`].
+//! UI, the CLI or the owner, goes through [`Settings::apply`].
 use crate::cluster::identity::NodeId;
 use crate::config::{Config, Roles};
 use crate::scan::pace::{self, Pace, SharedPace};

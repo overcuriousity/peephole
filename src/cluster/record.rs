@@ -19,7 +19,7 @@ pub struct MemberInfo {
     pub roles: Vec<String>,
     pub proto_min: u32,
     pub proto_max: u32,
-    /// Whether the node lets config key holders change its runtime settings.
+    /// Unused since ownership replaced config keys; always false in new records.
     #[serde(default)]
     pub remote_config: bool,
 }

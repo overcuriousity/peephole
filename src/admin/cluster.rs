@@ -22,8 +22,8 @@ pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/admin/cluster", get(page))
         .route("/admin/cluster/settings", post(set_own))
-        .route("/admin/cluster/config-key/forget", post(forget_key))
         .route("/admin/cluster/node/{key}", get(node_page).post(node_set))
+        .route("/admin/cluster/node/{key}/owner", post(node_owner))
         .route("/admin/cluster/block", post(block))
         .route("/admin/cluster/unblock", post(unblock))
         .route("/admin/cluster/purge", post(purge))
@@ -47,10 +47,10 @@ pub struct MemberView {
     pub blocked: bool,
     /// This node deleted its data and no longer relays it.
     pub purged: bool,
-    /// It lets config key holders change its runtime settings.
-    pub remote_config: bool,
-    /// This node holds its config key.
-    pub key_held: bool,
+    /// One of this operator's nodes (same owner as this node).
+    pub sibling: bool,
+    /// A sibling this node can command: it keeps the ownership key.
+    pub managed: bool,
     pub is_self: bool,
     pub version: String,
     pub last_seen: String,
@@ -329,7 +329,10 @@ pub(crate) async fn views(
     let purged = crate::cluster::block::purged(&node.store).await?;
     let statuses = node.peer_status.read().unwrap().clone();
     let me = node.id();
-    let keys = crate::cluster::confkey::held(&node.store).await?;
+    let sibs = crate::cluster::owner::fleet::siblings(&node.store).await?;
+    let managing = crate::cluster::owner::load(&node.store, me)
+        .await?
+        .is_some_and(|o| o.managing());
     let ours = builtin_rules();
     let ruleset_of = |id: &NodeId| {
         check
@@ -399,8 +402,8 @@ pub(crate) async fn views(
             state: m.standing.label(),
             blocked: node.is_blocked(&m.id),
             purged: purged.contains(&m.id),
-            remote_config: m.remote_config,
-            key_held: keys.contains(&m.id),
+            sibling: sibs.contains(&m.id),
+            managed: managing && sibs.contains(&m.id),
             is_self,
             version: hb.map(|h| h.version.clone()).unwrap_or_else(|| {
                 if is_self {
@@ -459,8 +462,8 @@ pub(crate) async fn views(
         state: "active",
         blocked: false,
         purged: false,
-        remote_config: node.cfg.remote_config,
-        key_held: false,
+        sibling: false,
+        managed: false,
         is_self: true,
         version: crate::VERSION.into(),
         last_seen: "this node".into(),
@@ -917,6 +920,7 @@ async fn purge(
 /// role fields always describe the wanted state in full.
 #[derive(serde::Deserialize)]
 struct SettingsForm {
+    counter: Option<u64>,
     base_version: Option<u64>,
     max_workers: Option<String>,
     max_scans_per_hour: Option<String>,
@@ -968,7 +972,7 @@ async fn set_own(
         Err(e) => return Ok(back_to(SETTINGS, None, Some(e))),
     };
     // The form sends every role, so it must not overwrite a change made
-    // elsewhere (CLI, a config key holder) after the page was loaded.
+    // elsewhere (CLI, the owner) after the page was loaded.
     let Some(base) = f.base_version else {
         return Ok(back_to(
             SETTINGS,
@@ -986,39 +990,28 @@ async fn set_own(
     })
 }
 
-async fn forget_key(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Form(f): Form<KeyForm>,
-) -> AppResult<Response> {
-    let node = node(&st)?;
-    let Ok(id) = NodeId::parse(&f.key) else {
-        return Ok(back(None, Some("unknown node".into())));
-    };
-    crate::cluster::confkey::forget(&node.store, &id).await?;
-    Ok(back_to(
-        &format!("/admin/cluster/node/{id}"),
-        Some(format!("Config key for {} forgotten.", id.short())),
-        None,
-    ))
-}
-
-/// The live part of a node page: its remote settings.
+/// The live part of a node page: its settings, for a node of this operator.
 enum Remote {
     /// This node: settings live on System.
     Own,
-    /// No config key held here: nothing asked.
+    /// A member that is not one of this operator's nodes.
+    NotYours,
+    /// A sibling, but the ownership key is not kept on this node.
     NoKey,
     /// Asked, and it answered.
     Settings {
-        state: crate::cluster::remote::State,
+        status: Box<crate::cluster::owner::cmd::Status>,
         timeout_min: String,
         rec: Option<(u32, i64, String)>,
         has: (bool, bool, bool),
+        /// `(key, name)` of the peers it blocks.
+        blocked: Vec<(String, String)>,
+        /// `(key, name)` of the members it could be told to block.
+        peers: Vec<(String, String)>,
     },
     /// Asked; no answer.
     Silent(String),
-    /// Key held, but the member is offline or blocked: not asked.
+    /// A managed sibling that is offline or blocked here: not asked.
     Offline,
 }
 
@@ -1031,11 +1024,11 @@ struct NodePage {
     remote: Remote,
 }
 
-/// Whether a node page asks the member for its settings: only a live,
-/// unblocked member whose key is held here (an offline one would hold the
+/// Whether a node page asks the member for its status: only a live,
+/// unblocked sibling this node can command (an offline one would hold the
 /// page for the whole request timeout).
 fn asks_remote(m: &MemberView) -> bool {
-    !m.is_self && m.key_held && m.live && !m.blocked
+    !m.is_self && m.managed && m.live && !m.blocked
 }
 
 async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
@@ -1045,8 +1038,9 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
     };
     let check = rules_check(st, node).await?;
     let (me, members) = views(node, &check).await?;
+    let all: Vec<MemberView> = std::iter::once(me).chain(members).collect();
     let key = id.to_string();
-    let Some(m) = std::iter::once(me).chain(members).find(|m| m.key == key) else {
+    let Some(m) = all.iter().find(|m| m.key == key).cloned() else {
         return Err(AppError::NotFound);
     };
     let contrib = contributions(node)
@@ -1056,13 +1050,20 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
         .collect();
     let remote = if m.is_self {
         Remote::Own
-    } else if !m.key_held {
+    } else if !m.sibling {
+        Remote::NotYours
+    } else if !m.managed {
         Remote::NoKey
     } else if !asks_remote(&m) {
         Remote::Offline
     } else {
-        match crate::cluster::remote::get(node, id).await {
-            Ok(s) => {
+        use crate::cluster::owner::cmd;
+        let asked = async {
+            let key = cmd::kept_key(node).await?;
+            cmd::status(node, &key, id).await
+        };
+        match asked.await {
+            Ok(st) => {
                 let minutes = |secs: u64| {
                     if secs.is_multiple_of(60) {
                         (secs / 60).to_string()
@@ -1070,14 +1071,33 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
                         format!("{:.1}", secs as f64 / 60.0)
                     }
                 };
-                let has = |r: &str| s.roles.iter().any(|x| x == r);
+                let has = |r: &str| st.state.roles.iter().any(|x| x == r);
+                let name_of = |k: &str| {
+                    all.iter()
+                        .find(|x| x.key == k)
+                        .map(|x| x.name.clone())
+                        .unwrap_or_else(|| k.chars().take(20).collect())
+                };
+                let blocked: Vec<(String, String)> = st
+                    .blocked
+                    .iter()
+                    .map(|b| (b.to_string(), name_of(&b.to_string())))
+                    .collect();
                 Remote::Settings {
-                    timeout_min: minutes(s.pace.timeout_secs),
-                    rec: s
+                    timeout_min: minutes(st.state.pace.timeout_secs),
+                    rec: st
+                        .state
                         .recommended
                         .map(|p| (p.max_workers, p.max_scans_per_hour, minutes(p.timeout_secs))),
                     has: (has("listener"), has("scanner"), has("web")),
-                    state: s,
+                    peers: all
+                        .iter()
+                        .filter(|x| !x.is_self && x.key != m.key)
+                        .filter(|x| !blocked.iter().any(|(k, _)| *k == x.key))
+                        .map(|x| (x.key.clone(), x.name.clone()))
+                        .collect(),
+                    blocked,
+                    status: Box::new(st),
                 }
             }
             Err(e) => Remote::Silent(format!("{} did not answer: {e:#}", m.name)),
@@ -1099,6 +1119,23 @@ async fn node_page(
     node_view(&st, &key).await
 }
 
+/// Send `cmd` to sibling `id` with the key this node keeps. Ok: what the
+/// node did; Err: why nothing happened, in words for the page.
+async fn owner_run(
+    node: &Arc<crate::cluster::Node>,
+    id: NodeId,
+    counter: u64,
+    cmd: crate::cluster::owner::cmd::OwnerCmd,
+) -> Result<String, String> {
+    use crate::cluster::owner::cmd as oc;
+    let key = oc::kept_key(node).await.map_err(|e| format!("{e:#}"))?;
+    match oc::run(node, &key, id, counter, cmd).await {
+        Ok(Ok(note)) => Ok(note),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
 async fn node_set(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
@@ -1111,18 +1148,66 @@ async fn node_set(
     };
     let to = format!("/admin/cluster/node/{id}");
     // Post/redirect/get: a reload of the page does not send the form again.
-    Ok(match (f.changes(), f.base_version) {
-        (Err(e), _) => back_to(&to, None, Some(e)),
-        (_, None) => back_to(&to, None, Some("reload the page and try again".into())),
-        (Ok(c), Some(base)) => match crate::cluster::confkey::set(node, id, base, &c).await {
-            Ok(Ok(_)) => back_to(
-                &to,
-                Some("Saved. Roles switch within seconds.".into()),
-                None,
-            ),
-            Ok(Err(e)) => back_to(&to, None, Some(format!("Not saved: {e}"))),
-            Err(e) => back_to(&to, None, Some(format!("Not saved: {e:#}"))),
+    Ok(match (f.changes(), f.base_version, f.counter) {
+        (Err(e), _, _) => back_to(&to, None, Some(e)),
+        (Ok(c), Some(base), Some(counter)) => {
+            let cmd = crate::cluster::owner::cmd::OwnerCmd::Settings {
+                base_version: base,
+                changes: c,
+            };
+            match owner_run(node, id, counter, cmd).await {
+                Ok(_) => back_to(
+                    &to,
+                    Some("Saved. Roles switch within seconds.".into()),
+                    None,
+                ),
+                Err(e) => back_to(&to, None, Some(format!("Not saved: {e}"))),
+            }
+        }
+        _ => back_to(&to, None, Some("reload the page and try again".into())),
+    })
+}
+
+/// An owner action on a sibling, from its page.
+#[derive(serde::Deserialize)]
+struct OwnerForm {
+    counter: u64,
+    action: String,
+    /// The peer a block, unblock or purge is about.
+    target: Option<String>,
+    subtree: Option<String>,
+    /// The invite to revoke.
+    invite: Option<i64>,
+}
+
+async fn node_owner(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+    Form(f): Form<OwnerForm>,
+) -> AppResult<Response> {
+    use crate::cluster::owner::cmd::OwnerCmd;
+    let node = node(&st)?;
+    let Ok(id) = NodeId::parse(&key) else {
+        return Err(AppError::NotFound);
+    };
+    let to = format!("/admin/cluster/node/{id}");
+    let peer = f.target.as_deref().and_then(|t| NodeId::parse(t).ok());
+    let cmd = match (f.action.as_str(), peer, f.invite) {
+        ("block", Some(n), _) => OwnerCmd::Block {
+            node: n,
+            subtree: f.subtree.is_some(),
         },
+        ("unblock", Some(n), _) => OwnerCmd::Unblock { node: n },
+        ("purge", Some(n), _) => OwnerCmd::Purge { node: n },
+        ("invite-revoke", _, Some(i)) => OwnerCmd::InviteRevoke { id: i },
+        ("leave", _, _) => OwnerCmd::Leave,
+        ("release", _, _) => OwnerCmd::Release,
+        _ => return Ok(back_to(&to, None, Some("unknown action".into()))),
+    };
+    Ok(match owner_run(node, id, f.counter, cmd).await {
+        Ok(note) => back_to(&to, Some(format!("Done: {note}.")), None),
+        Err(e) => back_to(&to, None, Some(format!("Not done: {e}"))),
     })
 }
 
@@ -1268,9 +1353,10 @@ mod tests {
     }
 
     #[test]
-    fn only_a_live_member_whose_key_is_held_is_asked() {
+    fn only_a_live_managed_sibling_is_asked() {
         let held = MemberView {
-            key_held: true,
+            sibling: true,
+            managed: true,
             live: true,
             active: true,
             ..Default::default()
@@ -1286,7 +1372,7 @@ mod tests {
                 ..held.clone()
             },
             MemberView {
-                key_held: false,
+                managed: false,
                 ..held.clone()
             },
             MemberView {

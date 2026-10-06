@@ -17,9 +17,6 @@ pub const USAGE: &str = "usage: peephole cluster id [CONFIG]
        peephole cluster join TOKEN [CONFIG]
        peephole cluster members [CONFIG]
        peephole cluster status [CONFIG]
-       peephole cluster config-key show|rotate [CONFIG]
-       peephole cluster config-key add KEY [CONFIG]
-       peephole cluster config-key forget NODE [CONFIG]
        peephole cluster block [--subtree] NODE [CONFIG]
                                (NODE: name, fingerprint or ed25519:… key; --subtree also
                                 blocks every node it admitted, transitively)
@@ -392,54 +389,6 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             let checks =
                 crate::classify::stored::compare(&store.pool, c, Some(&id.0[..]), sample).await?;
             print!("{}", agreement_report(id, c.fingerprint(), &checks));
-        }
-        Some("config-key") => {
-            reject_unknown_flags(&flags, &[])?;
-            let sub = pos.get(1).map(String::as_str);
-            let takes_arg = matches!(sub, Some("add" | "forget"));
-            let cfg = Config::load(Path::new(cfg_at(if takes_arg { 3 } else { 2 })))?;
-            let Some(c) = &cfg.cluster else {
-                bail!("config has no [cluster] section");
-            };
-            let store = Store::connect(&cfg.database_path).await?;
-            let me = Identity::load_or_create(&cfg.node_key_path())?.id;
-            match sub {
-                Some("show" | "rotate") => {
-                    if !c.remote_config {
-                        bail!(
-                            "remote configuration is off (cluster.remote_config = false): \
-                             this node has no usable config key"
-                        );
-                    }
-                    let key = if sub == Some("rotate") {
-                        super::confkey::rotate(&store, me).await?
-                    } else {
-                        super::confkey::ensure(&store, me).await?
-                    };
-                    println!("{}", key.encode());
-                    eprintln!(
-                        "whoever holds this key can change this node's scan pace, rescan \
-                         cooldown and roles. `peephole cluster config-key rotate` withdraws it \
-                         from everyone."
-                    );
-                }
-                Some("add") => {
-                    let id = super::confkey::add(&store, me, pos.get(2).context(USAGE)?).await?;
-                    println!(
-                        "config key for {} stored; configure it on Admin → Cluster",
-                        id.short()
-                    );
-                }
-                Some("forget") => {
-                    let id = resolve(&members::all(&store).await?, pos.get(2).context(USAGE)?)?;
-                    if super::confkey::forget(&store, &id).await? {
-                        println!("config key for {} forgotten", id.short());
-                    } else {
-                        println!("no config key held for {}", id.short());
-                    }
-                }
-                _ => bail!("{USAGE}"),
-            }
         }
         Some("leave") => {
             reject_unknown_flags(&flags, &[])?;

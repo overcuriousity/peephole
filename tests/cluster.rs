@@ -84,8 +84,6 @@ struct Opts {
     /// Run scan workers with this fake nmap.
     scanner: Option<std::path::PathBuf>,
     workers: usize,
-    /// Let config key holders change this node's settings.
-    remote_config: bool,
     /// Days of history kept (0: all).
     retention_days: u32,
 }
@@ -98,7 +96,6 @@ const DEFAULT: Opts = Opts {
     never_scan: vec![],
     scanner: None,
     workers: 1,
-    remote_config: false,
     retention_days: 0,
 };
 
@@ -123,7 +120,7 @@ async fn boot_in(
         key_path: None,
         takeover_hours: o.takeover_hours,
         lease_secs: o.lease_secs,
-        remote_config: o.remote_config,
+        remote_config: false,
         origin_quota_mb: 20 * 1024,
         peers: peers
             .iter()
@@ -168,15 +165,9 @@ async fn boot_in(
         &scan_config(&o.never_scan),
         pace.clone(),
     );
-    if o.remote_config {
-        cluster::confkey::ensure(&node.store, node.id())
-            .await
-            .unwrap();
-    }
     cluster::remote::serve(&node, settings.clone());
     cluster::owner::fleet::serve(&node);
     cluster::owner::cmd::serve(&node, settings.clone());
-    cluster::confkey::serve(&node, settings.clone());
     let workers = o.scanner.as_ref().map(|nmap| {
         tokio::spawn(peephole::scan::arbiter::takeover_loop(
             node.clone(),
@@ -2216,134 +2207,6 @@ async fn outbound_only_scanner_drains_the_queue() {
     .await;
 }
 
-/// A config key holder changes another node's settings; nobody else can.
-#[tokio::test]
-async fn config_key_holders_change_a_nodes_settings() {
-    use peephole::cluster::confkey;
-    use peephole::settings::Changes;
-    let (ia, a) = new_node("a");
-    let (ib, b) = new_node("b");
-    let (ic, c) = new_node("c");
-    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
-    let nb = boot(
-        ib,
-        &b,
-        &[&a, &c],
-        Opts {
-            remote_config: true,
-            ..DEFAULT
-        },
-    )
-    .await;
-    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
-    eventually("a sees that b is open", || async {
-        members::all(&na.store)
-            .await
-            .unwrap()
-            .iter()
-            .any(|m| m.id == b.id && m.remote_config)
-    })
-    .await;
-
-    // Anyone may look.
-    let state = peephole::cluster::remote::get(&na.node, b.id)
-        .await
-        .unwrap();
-    assert!(state.open);
-    assert_eq!(state.version, 0);
-    let faster = Changes {
-        max_scans_per_hour: Some(77),
-        ..Default::default()
-    };
-
-    // Without the key: refused, before any message is sent.
-    let e = confkey::set(&na.node, b.id, 0, &faster)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert!(e.contains("no config key"), "{e}");
-
-    // B's operator hands A the key.
-    let key = confkey::own(&nb.store, b.id).await.unwrap().unwrap();
-    assert_eq!(
-        confkey::add(&na.store, a.id, &key.encode()).await.unwrap(),
-        b.id
-    );
-    assert_eq!(
-        confkey::set(&na.node, b.id, 0, &faster).await.unwrap(),
-        Ok(1)
-    );
-    assert_eq!(nb.pace.get().max_scans_per_hour, 77);
-    let audit = nb.settings.audit(10).await.unwrap();
-    assert_eq!(audit.len(), 1);
-    assert_eq!(audit[0].by, Some(a.id));
-
-    // A stale version (a second editor, or a replay) changes nothing.
-    let e = confkey::set(&na.node, b.id, 0, &faster)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert!(e.contains("changed meanwhile"), "{e}");
-
-    // Invalid values are refused by the same rules as locally.
-    let e = confkey::set(
-        &na.node,
-        b.id,
-        1,
-        &Changes {
-            listener: Some(false),
-            scanner: Some(false),
-            web: Some(false),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap()
-    .unwrap_err();
-    assert!(e.contains("at least one role"), "{e}");
-
-    // C holds a wrong key for B.
-    let wrong = confkey::ConfigKey {
-        id: b.id,
-        key: [0u8; 32],
-    };
-    confkey::add(&nc.store, c.id, &wrong.encode())
-        .await
-        .unwrap();
-    let e = confkey::set(&nc.node, b.id, 1, &faster)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert!(e.contains("not accepted"), "{e}");
-
-    // Rotation cuts A off.
-    confkey::rotate(&nb.store, b.id).await.unwrap();
-    let e = confkey::set(&na.node, b.id, 1, &faster)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert!(e.contains("not accepted"), "{e}");
-    assert_eq!(nb.settings.snapshot().version, 1);
-
-    // A locked node refuses even a correct key.
-    confkey::ensure(&na.store, a.id).await.unwrap();
-    let a_key = confkey::own(&na.store, a.id).await.unwrap().unwrap();
-    confkey::add(&nb.store, b.id, &a_key.encode())
-        .await
-        .unwrap();
-    assert!(
-        !peephole::cluster::remote::get(&nb.node, a.id)
-            .await
-            .unwrap()
-            .open
-    );
-    let e = confkey::set(&nb.node, a.id, 0, &faster)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert!(e.contains("switched off"), "{e}");
-}
-
 use peephole::intel::share;
 
 /// The Tor exit list is shared as a file; GeoLite2 databases are not.
@@ -2783,7 +2646,7 @@ async fn admin_cluster_page_and_private_attribution() {
     assert_ne!(
         nb.pace.get().max_scans_per_hour,
         77,
-        "no config key: the pace of another node cannot be changed"
+        "the pace of another node is not changed from the pace row"
     );
     // Invites are shown once.
     let r = admin
@@ -2867,163 +2730,6 @@ async fn admin_cluster_page_and_private_attribution() {
         assert_eq!(resp.status(), 303, "{path} should require a session");
         assert_eq!(resp.headers().get("location").unwrap(), "/login", "{path}");
     }
-}
-
-/// The admin of A configures B through the UI once B's key is added.
-#[tokio::test]
-async fn admin_configures_another_node_with_its_key() {
-    use peephole::cluster::confkey;
-    let (ia, a) = new_node("node-alpha");
-    let (ib, b) = new_node("node-bravo");
-    let na = boot(ia, &a, &[&b], DEFAULT).await;
-    let nb = boot(
-        ib,
-        &b,
-        &[&a],
-        Opts {
-            remote_config: true,
-            ..DEFAULT
-        },
-    )
-    .await;
-    eventually("a sees that b is open", || async {
-        members::all(&na.store)
-            .await
-            .unwrap()
-            .iter()
-            .any(|m| m.id == b.id && m.remote_config)
-    })
-    .await;
-    let (admin, base) = admin_on(&na).await;
-    let mut page = cluster_pages(&admin, &base).await;
-    page.push_str(&text(&admin, format!("{base}/admin/cluster/access")).await);
-    assert!(page.contains("open to key holders"), "b is shown as open");
-    assert!(page.contains("locked"), "a itself is locked");
-    assert!(
-        !page.contains("peephole-cfg1:"),
-        "a locked node shows no key"
-    );
-
-    // Add B's key, then change B from A's node page.
-    let key = confkey::own(&nb.store, b.id).await.unwrap().unwrap();
-    let r = admin
-        .post(format!("{base}/admin/cluster/config-key/add"))
-        .form(&[("key", key.encode())])
-        .send()
-        .await
-        .unwrap();
-    assert!(r.status().is_success());
-    let node_page = text(&admin, format!("{base}/admin/cluster/node/{}", b.id)).await;
-    assert!(node_page.contains("node-bravo"));
-    assert!(
-        node_page.contains("name=\"base_version\" value=\"0\""),
-        "{node_page}"
-    );
-    let r = admin
-        .post(format!("{base}/admin/cluster/node/{}", b.id))
-        .form(&[
-            ("base_version", "0"),
-            ("max_workers", "3"),
-            ("max_scans_per_hour", "55"),
-            ("timeout_minutes", "20"),
-            ("cooldown_hours", "12"),
-            ("listener", "on"),
-            ("web", "on"),
-        ])
-        .send()
-        .await
-        .unwrap();
-    assert!(r.status().is_success());
-    let s = nb.settings.snapshot();
-    assert_eq!((s.pace.max_workers, s.pace.max_scans_per_hour), (3, 55));
-    assert_eq!(s.pace.timeout_secs, 1200);
-    assert_eq!(s.cooldown_hours, 12);
-    assert!(
-        s.roles.listener && s.roles.web && !s.roles.scanner,
-        "unchecked role is off"
-    );
-
-    // The pace row cannot change B behind the version check.
-    let r = admin
-        .post(format!("{base}/admin/cluster/pace"))
-        .form(&[
-            ("key", b.id.to_string()),
-            ("max_workers", "1".into()),
-            ("max_scans_per_hour", "11".into()),
-            ("timeout_minutes", "5".into()),
-        ])
-        .send()
-        .await
-        .unwrap();
-    assert!(r.status().is_success());
-    assert_eq!(nb.settings.snapshot().pace.max_scans_per_hour, 55);
-
-    // This node's own settings from its own page, which carries the version
-    // it showed.
-    let page = text(&admin, format!("{base}/admin/system/settings")).await;
-    let shown = na.settings.snapshot().version;
-    assert!(
-        page.contains(&format!("name=\"base_version\" value=\"{shown}\"")),
-        "own form carries the version"
-    );
-    let own = |base_version: u64, cooldown: &'static str| {
-        admin
-            .post(format!("{base}/admin/cluster/settings"))
-            .form(&[
-                ("base_version", base_version.to_string()),
-                ("cooldown_hours", cooldown.into()),
-                ("listener", "on".into()),
-                ("scanner", "on".into()),
-                ("web", "on".into()),
-            ])
-            .send()
-    };
-    assert!(own(shown, "6").await.unwrap().status().is_success());
-    assert_eq!(na.settings.snapshot().cooldown_hours, 6);
-    // A change made elsewhere after the page was loaded is not overwritten.
-    na.settings
-        .apply(
-            &peephole::settings::Changes {
-                scanner: Some(false),
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(own(shown + 1, "7").await.unwrap().status().is_success());
-    let s = na.settings.snapshot();
-    assert!(
-        !s.roles.scanner,
-        "a stale form does not switch the scanner back on"
-    );
-    assert_eq!(s.cooldown_hours, 6);
-
-    // B stops answering: only the settings card says so.
-    drop(nb);
-    let r = admin
-        .get(format!("{base}/admin/cluster/node/{}", b.id))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200);
-    let html = r.text().await.unwrap();
-    assert!(
-        html.contains("did not answer") && html.contains("Contributions"),
-        "{html}"
-    );
-    let r = admin
-        .post(format!("{base}/admin/cluster/config-key/forget"))
-        .form(&[("key", b.id.to_string())])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        r.url().path(),
-        format!("/admin/cluster/node/{}", b.id),
-        "forgetting a key stays on the node page"
-    );
 }
 
 /// Enrichment results replicate with their origin; a blocked peer's results
@@ -4054,4 +3760,241 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
         .unwrap();
     let html = text(&admin_b, page_b).await;
     assert!(html.contains("No owner"), "{html}");
+}
+
+/// A node of an earlier version sends a config key request: it is told
+/// what replaced it, and no node reports itself open any more.
+#[tokio::test]
+async fn old_config_key_requests_are_answered_with_the_replacement() {
+    use peephole::cluster::msg::Msg;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
+    eventually("b answers", || async {
+        peephole::cluster::remote::get(&na.node, b.id).await.is_ok()
+    })
+    .await;
+    assert!(
+        !peephole::cluster::remote::get(&na.node, b.id)
+            .await
+            .unwrap()
+            .open
+    );
+    let old = Msg::ConfigSet {
+        base_version: 0,
+        changes: Default::default(),
+        mac: serde_bytes::ByteBuf::new(),
+    };
+    match na
+        .node
+        .request(b.id, old, Duration::from_secs(10))
+        .await
+        .unwrap()
+    {
+        Msg::ConfigSetReply {
+            version: None,
+            error: Some(e),
+        } => assert!(e.contains("replaced by the ownership key"), "{e}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The counter a member page's forms carry.
+fn counter_on(html: &str) -> String {
+    html.split("name=\"counter\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("the page carries the counter")
+        .to_string()
+}
+
+/// The admin of a managing node changes a sibling from its page.
+#[tokio::test]
+async fn admin_manages_a_sibling_from_its_page() {
+    use peephole::cluster::owner::{self, fleet};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let _nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    eventually("a finds b", || async {
+        fleet::discover(&na.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+    let (admin, base) = admin_on(&na).await;
+    let b_page = format!("{base}/admin/cluster/node/{}", b.id);
+
+    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    assert!(members.contains(">yours<"), "b is marked in the table");
+    let html = text(&admin, b_page.clone()).await;
+    assert!(html.contains("node-bravo") && html.contains(">yours<"));
+    assert!(html.contains("name=\"base_version\" value=\"0\""), "{html}");
+    assert!(
+        !html.contains("Remote configuration"),
+        "the old line is gone"
+    );
+    // c is a member, not a sibling.
+    let c_html = text(&admin, format!("{base}/admin/cluster/node/{}", c.id)).await;
+    assert!(c_html.contains("Not one of your nodes"), "{c_html}");
+
+    let r = admin
+        .post(b_page.clone())
+        .form(&[
+            ("counter", counter_on(&html).as_str()),
+            ("base_version", "0"),
+            ("max_workers", "3"),
+            ("max_scans_per_hour", "55"),
+            ("timeout_minutes", "20"),
+            ("cooldown_hours", "12"),
+            ("listener", "on"),
+            ("web", "on"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let s = nb.settings.snapshot();
+    assert_eq!((s.pace.max_workers, s.pace.max_scans_per_hour), (3, 55));
+    assert_eq!(s.pace.timeout_secs, 1200);
+    assert_eq!(s.cooldown_hours, 12);
+    assert!(
+        s.roles.listener && s.roles.web && !s.roles.scanner,
+        "unchecked role is off"
+    );
+
+    // The pace row cannot change b behind the version check.
+    let r = admin
+        .post(format!("{base}/admin/cluster/pace"))
+        .form(&[
+            ("key", b.id.to_string()),
+            ("max_workers", "1".into()),
+            ("max_scans_per_hour", "11".into()),
+            ("timeout_minutes", "5".into()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(nb.settings.snapshot().pace.max_scans_per_hour, 55);
+
+    // An owner action: b blocks c, and the page then lists it.
+    let html = text(&admin, b_page.clone()).await;
+    let r = admin
+        .post(format!("{b_page}/owner"))
+        .form(&[
+            ("counter", counter_on(&html)),
+            ("action", "block".into()),
+            ("target", c.id.to_string()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert!(nb.is_blocked(&c.id));
+    let html = text(&admin, b_page.clone()).await;
+    assert!(
+        html.contains("Blocked there") && html.contains("node-charlie"),
+        "{html}"
+    );
+
+    // A stale form (the counter moved on) changes nothing.
+    let r = admin
+        .post(format!("{b_page}/owner"))
+        .form(&[
+            ("counter", "0".to_string()),
+            ("action", "unblock".to_string()),
+            ("target", c.id.to_string()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert!(nb.is_blocked(&c.id));
+
+    // This node's own settings from its own page, as before.
+    let page = text(&admin, format!("{base}/admin/system/settings")).await;
+    let shown = na.settings.snapshot().version;
+    assert!(
+        page.contains(&format!("name=\"base_version\" value=\"{shown}\"")),
+        "own form carries the version"
+    );
+    let r = admin
+        .post(format!("{base}/admin/cluster/settings"))
+        .form(&[
+            ("base_version", shown.to_string()),
+            ("cooldown_hours", "6".into()),
+            ("listener", "on".into()),
+            ("scanner", "on".into()),
+            ("web", "on".into()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(na.settings.snapshot().cooldown_hours, 6);
+
+    // b stops answering: only the settings card says so.
+    drop(nb);
+    let r = admin.get(b_page).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let html = r.text().await.unwrap();
+    assert!(
+        html.contains("did not answer") && html.contains("Contributions"),
+        "{html}"
+    );
+}
+
+/// On a node that does not keep the key, a sibling's page says so and
+/// nothing can be sent from it.
+#[tokio::test]
+async fn a_node_without_the_key_shows_its_siblings_read_only() {
+    use peephole::cluster::owner::{self, fleet};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    eventually("b knows a as a sibling", || async {
+        fleet::discover(&nb.node).await.unwrap() == vec![a.id]
+    })
+    .await;
+    let (admin, base) = admin_on(&nb).await;
+    let a_page = format!("{base}/admin/cluster/node/{}", a.id);
+    let html = text(&admin, a_page.clone()).await;
+    assert!(html.contains(">yours<"), "{html}");
+    assert!(
+        html.contains("The ownership key is not kept on this node"),
+        "{html}"
+    );
+    assert!(
+        !html.contains("name=\"counter\""),
+        "no form without the key"
+    );
+    // Posted anyway: nothing is sent, nothing changes.
+    for (path, form) in [
+        (
+            a_page.clone(),
+            vec![
+                ("counter", "0"),
+                ("base_version", "0"),
+                ("cooldown_hours", "1"),
+                ("listener", "on"),
+            ],
+        ),
+        (
+            format!("{a_page}/owner"),
+            vec![("counter", "0"), ("action", "leave")],
+        ),
+    ] {
+        let r = admin.post(path).form(&form).send().await.unwrap();
+        assert!(r.status().is_success());
+    }
+    assert_eq!(owner::counter(&na.store).await.unwrap(), 0);
+    assert_eq!(na.settings.snapshot().version, 0);
+    assert!(knows(&nb, a.id, true).await);
 }

@@ -209,30 +209,6 @@ advertise = "scanner-1.example:7443"
     assert!(members.contains("roles=scanner"), "{members}");
     let status = run(&["status"]);
     assert!(status.contains("history   full"), "{status}");
-    // The config key exists only with remote configuration switched on.
-    let out = bin()
-        .args(["cluster", "config-key", "show"])
-        .arg(cfg.to_str().unwrap())
-        .output()
-        .unwrap();
-    assert!(!out.status.success(), "locked node has no usable key");
-    let text = std::fs::read_to_string(&cfg).unwrap();
-    std::fs::write(
-        &cfg,
-        text.replace(
-            "node_name = \"scanner-1\"",
-            "node_name = \"scanner-1\"\nremote_config = true",
-        ),
-    )
-    .unwrap();
-    let shown = run(&["config-key", "show"]);
-    assert!(shown.starts_with("peephole-cfg1:"), "{shown}");
-    let rotated = run(&["config-key", "rotate"]);
-    assert!(
-        rotated.starts_with("peephole-cfg1:") && rotated != shown,
-        "{rotated}"
-    );
-    assert_eq!(run(&["config-key", "show"]), rotated);
 }
 
 #[test]

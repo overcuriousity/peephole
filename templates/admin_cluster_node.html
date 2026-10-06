@@ -4,7 +4,7 @@
 {% let sub = "cluster" %}{% include "_admin_nav.html" %}
 {% let subtab = "members" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
 <div class="page-head"><div>
-  <h1>{{ m.name }} <span class="mono muted">{{ m.short }}</span>{% if m.is_self %} <span class="muted small">this node</span>{% endif %}</h1>
+  <h1>{{ m.name }} <span class="mono muted">{{ m.short }}</span>{% if m.sibling %} <span class="badge badge-status" data-status="done">yours</span>{% endif %}{% if m.is_self %} <span class="muted small">this node</span>{% endif %}</h1>
   <div class="meta">{% if m.blocked %}<span class="badge badge-status" data-status="failed">{% if m.purged %}purged{% else %}blocked{% endif %}</span>{% else if !m.active %}<span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% else if m.live %}<span class="badge badge-status" data-status="done">live</span>{% else %}<span class="badge badge-status" data-status="queued">not seen</span>{% endif %}</div>
 </div>
 {% if !m.is_self %}<div class="row">
@@ -35,7 +35,6 @@
     <dt>Replication</dt><dd>{{ m.lag }}</dd>
     <dt>History</dt><dd>{{ m.history }}</dd>
     {% if m.scanner %}<dt>Scans running</dt><dd>{{ m.active_scans }}</dd>{% endif %}
-    <dt>Remote configuration</dt><dd>{% if m.is_self %}{% if m.remote_config %}open to key holders (key on <a href="/admin/cluster/access">Access</a>){% else %}locked{% endif %}{% else if m.key_held %}key held here{% else if m.remote_config %}open to key holders{% else %}locked{% endif %}</dd>
     {% for i in m.issues() %}<dt>Issue</dt><dd><span class="badge badge-status" data-status="running">{{ i }}</span></dd>{% endfor %}
     {% if m.skew.is_some() %}<dt></dt><dd class="muted small">Run NTP on every node: scan cooldowns compare timestamps from different nodes.</dd>{% endif %}
   </dl>
@@ -65,27 +64,65 @@
 <section class="card"><h2>Settings</h2>
 {% match remote %}
 {% when Remote::Own %}<p>This node's settings: <a href="/admin/system/settings">System › Settings</a>; pace on <a href="/admin/scans#pace">Scans</a>.</p>
-{% when Remote::NoKey %}<p class="muted">No config key for this node is held here. Add one on <a href="/admin/cluster/access">Access</a>.</p>
+{% when Remote::NotYours %}<p class="muted">Not one of your nodes. Only its owner can change it.</p>
+{% when Remote::NoKey %}<p class="muted">The ownership key is not kept on this node. Manage {{ m.name }} from a node that keeps it (<a href="/admin/cluster/ownership">Ownership</a>).</p>
 {% when Remote::Offline %}<p class="muted">Not live{% if m.blocked %} (blocked){% endif %}: its settings were not asked.</p>
 {% when Remote::Silent with (msg) %}<div class="banner banner-warning">{{ msg }}</div>
-{% when Remote::Settings with { state, timeout_min, rec, has } %}
-  {% if !state.open %}<div class="banner banner-warning">Locked: remote configuration is off on this node.</div>{% endif %}
+{% when Remote::Settings with { status, timeout_min, rec, has, blocked, peers } %}
   <form method="post" action="/admin/cluster/node/{{ m.key }}" class="filters">
-    <input type="hidden" name="base_version" value="{{ state.version }}">
-    <label>Workers <input type="number" name="max_workers" min="0" max="16" value="{{ state.pace.max_workers }}" required></label>
-    <label>Scans per hour <input type="number" name="max_scans_per_hour" min="0" max="3600" value="{{ state.pace.max_scans_per_hour }}" required></label>
+    <input type="hidden" name="counter" value="{{ status.counter }}">
+    <input type="hidden" name="base_version" value="{{ status.state.version }}">
+    <label>Workers <input type="number" name="max_workers" min="0" max="16" value="{{ status.state.pace.max_workers }}" required></label>
+    <label>Scans per hour <input type="number" name="max_scans_per_hour" min="0" max="3600" value="{{ status.state.pace.max_scans_per_hour }}" required></label>
     <label>Timeout (min) <input type="number" name="timeout_minutes" min="1" max="240" step="any" value="{{ timeout_min }}" required></label>
-    <label>Rescan cooldown (h) <input type="number" name="cooldown_hours" min="0" max="8760" value="{{ state.cooldown_hours }}" required></label>
+    <label>Rescan cooldown (h) <input type="number" name="cooldown_hours" min="0" max="8760" value="{{ status.state.cooldown_hours }}" required></label>
     <label class="check"><input type="checkbox" name="listener"{% if has.0 %} checked{% endif %}> Trap</label>
     <label class="check"><input type="checkbox" name="scanner"{% if has.1 %} checked{% endif %}> Scanner</label>
     <label class="check"><input type="checkbox" name="web"{% if has.2 %} checked{% endif %}> Web interface</label>
-    <button class="btn btn-primary" type="submit"{% if !state.open %} disabled{% endif %}>Save</button>
-    <span class="muted small">version {{ state.version }}</span>
+    <button class="btn btn-primary" type="submit">Save</button>
+    <span class="muted small">version {{ status.state.version }} · build {{ status.build }}</span>
   </form>
   {% if let Some(r) = rec %}<p class="muted">Recommended: {{ r.0 }} workers, {{ r.1 }} scans/h, {{ r.2 }} min timeout.</p>{% endif %}
   <p class="muted">Web off removes its admin pages; restore: <code>peephole settings reset roles.web</code></p>
+
+  <h3>Blocked there</h3>
+  {% if blocked.is_empty() %}<p class="muted">{{ m.name }} blocks nobody.</p>{% else %}
+  <div class="table-wrap"><table><tbody>{% for b in blocked %}<tr>
+    <td><b>{{ b.1 }}</b></td>
+    <td><form method="post" action="/admin/cluster/node/{{ m.key }}/owner"><input type="hidden" name="counter" value="{{ status.counter }}"><input type="hidden" name="target" value="{{ b.0 }}">
+      <button class="btn btn-sm" type="submit" name="action" value="unblock">Unblock there</button>
+      <button class="btn btn-sm btn-danger" type="submit" name="action" value="purge" title="Deletes its data on {{ m.name }}">Purge there</button></form></td>
+  </tr>{% endfor %}</tbody></table></div>{% endif %}
+  {% if !peers.is_empty() %}
+  <form method="post" action="/admin/cluster/node/{{ m.key }}/owner" class="filters">
+    <input type="hidden" name="counter" value="{{ status.counter }}"><input type="hidden" name="action" value="block">
+    <label>Block a peer there <select name="target">{% for p in peers %}<option value="{{ p.0 }}">{{ p.1 }}</option>{% endfor %}</select></label>
+    <label class="check"><input type="checkbox" name="subtree"> with all it admitted</label>
+    <button class="btn btn-sm btn-danger" type="submit">Block there</button>
+  </form>{% endif %}
+
+  <h3>Its invites</h3>
+  {% if status.invites.is_empty() %}<p class="muted">None. Invites are created on the node itself: the invite is a secret and would pass through other members.</p>{% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>For</th><th>Uses</th><th>Expires (UTC)</th><th></th></tr></thead>
+    <tbody>{% for i in status.invites %}<tr{% if !i.usable %} class="muted"{% endif %}>
+      <td>{{ i.label }}</td>
+      <td>{{ i.uses }}{% if let Some(x) = i.max_uses %}/{{ x }}{% endif %}</td>
+      <td class="ts">{% if let Some(e) = i.expires_at %}{{ e }}{% else %}never{% endif %}</td>
+      <td>{% if i.usable %}<form method="post" action="/admin/cluster/node/{{ m.key }}/owner"><input type="hidden" name="counter" value="{{ status.counter }}"><input type="hidden" name="invite" value="{{ i.id }}"><button class="btn btn-sm btn-danger" type="submit" name="action" value="invite-revoke">Revoke invite</button></form>{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>{% endif %}
+
+  <h3>Leave or release</h3>
+  <div class="row">
+    <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-owner-leave">Leave the cluster</button>
+    <dialog id="dlg-owner-leave"><h3>Have {{ m.name }} leave the cluster?</h3><p class="muted">Its syncing stops; its data stays there. Rejoining needs an invite, entered on the node itself.</p>
+      <form method="post" action="/admin/cluster/node/{{ m.key }}/owner" class="actions"><input type="hidden" name="counter" value="{{ status.counter }}"><input type="hidden" name="action" value="leave"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Leave</button></form></dialog>
+    <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-owner-release">Release</button>
+    <dialog id="dlg-owner-release"><h3>Release {{ m.name }}?</h3><p class="muted">It has no owner afterwards. To manage it again, adopt it on the node itself.</p>
+      <form method="post" action="/admin/cluster/node/{{ m.key }}/owner" class="actions"><input type="hidden" name="counter" value="{{ status.counter }}"><input type="hidden" name="action" value="release"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Release</button></form></dialog>
+  </div>
 {% endmatch %}
-{% if m.key_held %}<form method="post" action="/admin/cluster/config-key/forget"><input type="hidden" name="key" value="{{ m.key }}"><button class="btn btn-sm" type="submit">Forget its key</button></form>{% endif %}
 </section>
 </div>
 {% endblock %}

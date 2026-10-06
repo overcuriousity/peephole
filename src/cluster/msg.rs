@@ -83,14 +83,14 @@ pub enum Msg {
     /// Any member → node: what are your runtime settings?
     ConfigGet,
     ConfigState(super::remote::State),
-    /// Config key holder → node: change your settings. `mac` proves the
-    /// sender holds the node's config key without sending it.
+    /// A config key request of an earlier version. Still decoded; always
+    /// answered with a refusal that names the ownership key.
     ConfigSet {
         base_version: u64,
         changes: crate::settings::Changes,
         mac: serde_bytes::ByteBuf,
     },
-    /// `version` is the new settings version on success.
+    /// The refusal.
     ConfigSetReply {
         version: Option<u64>,
         error: Option<String>,
