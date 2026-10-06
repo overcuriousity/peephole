@@ -4742,3 +4742,289 @@ async fn announced_prices_follow_the_clusters_earnings() {
     assert_eq!(t.price_of("abuseipdb"), Some(800));
     eventually("b sees the new price", || async { seen(800) }).await;
 }
+
+/// Until `asker` has heard `server`'s heartbeat with a price for
+/// `provider`; returns the price.
+async fn price_seen(asker: &TestNode, server: NodeId, provider: &str) -> u32 {
+    let find = || {
+        asker.status.known(&server).and_then(|k| {
+            k.hb.prices
+                .iter()
+                .find(|(p, _)| p == provider)
+                .map(|(_, mc)| *mc)
+        })
+    };
+    eventually("the server's price is heard", || async { find().is_some() }).await;
+    // Paid lookups go to members known to speak the credits protocol: the
+    // server's own description of itself (its protocol) has to arrive first.
+    eventually("the server's protocol is known", || async {
+        asker
+            .members()
+            .get(&server)
+            .is_some_and(|m| m.proto_max > 0)
+    })
+    .await;
+    find().unwrap()
+}
+
+/// The asker pays the announced price; the server gets half; both nodes
+/// hold the offer and the receipt and arrive at the same balances.
+#[tokio::test]
+async fn a_paid_lookup_moves_credits_from_the_asker_to_the_server() {
+    use peephole::credits::{self, entries, price};
+    use std::sync::atomic::Ordering;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
+    assert!(cost > 0);
+
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.77".parse().unwrap();
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    let from_b = answers
+        .iter()
+        .find(|x| x.node == "node-bravo")
+        .expect("b answered");
+    assert_eq!(from_b.resp.findings.len(), 1, "{answers:?}");
+    assert_eq!(from_b.resp.findings[0].provider, "abuseipdb");
+    assert_eq!(from_b.charged_mc as u64, cost);
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+    eventually("both hold the offer and the receipt", || async {
+        entries::since(&na.store.pool, 0).await.unwrap().len() == 2
+            && entries::since(&nb.store.pool, 0).await.unwrap().len() == 2
+    })
+    .await;
+    for n in [&na, &nb] {
+        let book = credits::book_fresh(&n.node).await.unwrap();
+        assert_eq!(book.balance(&a.id), 10_000 - cost);
+        assert_eq!(book.balance(&b.id), cost / 2);
+        assert_eq!(book.ledger.held(&a.id), 0);
+    }
+    // Nothing about the address was stored: nobody recorded it.
+    for n in [&na, &nb] {
+        assert_eq!(count(n, "SELECT COUNT(*) FROM ip_intel_log").await, 0);
+        assert_eq!(count(n, "SELECT COUNT(*) FROM ips").await, 0);
+    }
+}
+
+/// Without credits the asker refuses on its own and says how much is
+/// missing; credits the server does not count are declined there, and the
+/// asker gets them back at once; a spent on-demand share declines the API
+/// provider and still serves what has no budget.
+#[tokio::test]
+async fn an_asker_without_credits_is_declined_with_the_reason() {
+    use peephole::credits::{self, entries, price};
+    use std::sync::atomic::Ordering;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    // A budget of 5 a day and a share of a fifth: one paid lookup a day.
+    let asked = serves(
+        &nb,
+        &[("abuseipdb", Some(5.0)), ("maxmind-geolite2", None)],
+        0.2,
+    );
+    price::refresh(&nb.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.78".parse().unwrap();
+    let why = |answers: &[peephole::intel::lookup::NodeAnswer], provider: &str| {
+        answers
+            .iter()
+            .flat_map(|x| x.resp.declined.iter())
+            .find(|(p, _)| p == provider)
+            .map(|(_, w)| w.clone())
+            .unwrap_or_default()
+    };
+
+    // 1. No credits: no offer is written, nobody is asked.
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    let reason = why(&answers, "abuseipdb");
+    assert!(
+        reason.contains("holds 0.00 credits") && reason.contains("missing"),
+        "{reason}"
+    );
+    assert!(entries::since(&na.store.pool, 0).await.unwrap().is_empty());
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+
+    // 2. Credits only this node counts (the server judged no such scans).
+    grant_scans(&[&na], a.id, 4).await;
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    assert!(
+        why(&answers, "abuseipdb").contains("not covered here"),
+        "{answers:?}"
+    );
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    eventually(
+        "the receipt of nothing frees the credits at once",
+        || async {
+            let book = credits::book_fresh(&na.node).await.unwrap();
+            book.balance(&a.id) == 5000 && book.ledger.held(&a.id) == 0
+        },
+    )
+    .await;
+
+    // 3. The server counts them too: served, and the share of the day is
+    // used up by that one lookup.
+    grant_scans(&[&nb], a.id, 4).await;
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    assert_eq!(
+        answers.iter().map(|x| x.resp.findings.len()).sum::<usize>(),
+        2
+    );
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    assert!(
+        why(&answers, "abuseipdb").contains("on-demand share"),
+        "{answers:?}"
+    );
+    let served: Vec<&str> = answers
+        .iter()
+        .flat_map(|x| x.resp.findings.iter())
+        .map(|f| f.provider.as_str())
+        .collect();
+    assert_eq!(served, ["maxmind-geolite2"]);
+    let geo = nb.price_table().price_of("maxmind-geolite2").unwrap();
+    assert_eq!(answers.iter().map(|x| x.charged_mc).sum::<u32>(), geo);
+}
+
+/// A lookup the node's own provider answers is paid like any other: half
+/// of the price comes back, half is destroyed.
+#[tokio::test]
+async fn a_lookup_answered_by_the_nodes_own_provider_costs_half_net() {
+    use peephole::credits::{self, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&na, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na], a.id, 8).await;
+    let cost = price::refresh(&na.node)
+        .await
+        .unwrap()
+        .price_of("abuseipdb")
+        .unwrap() as u64;
+    let own = na.lookup_providers().unwrap().clone();
+    let answers =
+        peephole::intel::lookup::cluster(&rec(&na), &own, "203.0.113.79".parse().unwrap()).await;
+    assert_eq!(answers[0].node, "this node");
+    assert_eq!(answers[0].resp.findings.len(), 1, "{answers:?}");
+    assert_eq!(answers[0].charged_mc as u64, cost);
+    let book = credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(book.balance(&a.id), 10_000 - cost + cost / 2);
+    assert_eq!(book.ledger.tally(&a.id).destroyed, cost - cost / 2);
+}
+
+/// Review focus: the server's price moved after the asker read it. The
+/// server declines, names its price and charges nothing; an offer at that
+/// price is served.
+#[tokio::test]
+async fn a_price_above_the_offer_is_declined_and_named() {
+    use peephole::credits::{self, pay, price};
+    use std::sync::atomic::Ordering;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    let cost = price::refresh(&nb.node)
+        .await
+        .unwrap()
+        .price_of("abuseipdb")
+        .unwrap();
+    assert!(cost > 1);
+    price_seen(&na, b.id, "abuseipdb").await;
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.80".parse().unwrap();
+    let wanted = ["abuseipdb".to_string()];
+    let low = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, cost as u64 - 1).await;
+    assert!(low.findings.is_empty());
+    assert_eq!((low.price_mc, low.charged_mc), (Some(cost), 0));
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    let enough = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, cost as u64).await;
+    assert_eq!((enough.findings.len(), enough.charged_mc), (1, cost));
+    eventually("a paid once", || async {
+        let book = credits::book_fresh(&na.node).await.unwrap();
+        book.balance(&a.id) == 10_000 - cost as u64 && book.ledger.held(&a.id) == 0
+    })
+    .await;
+    // An offer is served once: naming it again gets nothing.
+    let seq = peephole::credits::entries::since(&na.store.pool, 0)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| e.origin == a.id)
+        .map(|e| e.seq)
+        .max()
+        .unwrap();
+    let again: peephole::intel::lookup::LookupResp = na
+        .call(
+            b.id,
+            &b.address(),
+            "/rpc/v1/lookup",
+            &peephole::intel::lookup::LookupReq {
+                ip: ip.to_string(),
+                providers: wanted.to_vec(),
+                offer_seq: Some(seq),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(again.findings.is_empty(), "{again:?}");
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    // And without an offer only free providers answer.
+    let free: peephole::intel::lookup::LookupResp = na
+        .call(
+            b.id,
+            &b.address(),
+            "/rpc/v1/lookup",
+            &peephole::intel::lookup::LookupReq {
+                ip: ip.to_string(),
+                providers: wanted.to_vec(),
+                offer_seq: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(free.findings.is_empty());
+    assert!(free.declined[0].1.contains("paid with credits"), "{free:?}");
+}
+
+/// A member that speaks only the protocol before credits is never asked
+/// for a paid lookup, whatever its heartbeat says.
+#[tokio::test]
+async fn a_member_of_an_earlier_version_is_not_asked() {
+    use peephole::credits::{pay, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a, &c],
+        Opts {
+            proto: Some((2, 2)),
+            ..DEFAULT
+        },
+    )
+    .await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    serves(&nc, &[("abuseipdb", Some(1000.0))], 0.2);
+    price::refresh(&nb.node).await.unwrap();
+    price::refresh(&nc.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    price_seen(&na, c.id, "abuseipdb").await;
+    let none: peephole::intel::Providers = vec![];
+    let all = pay::quotes(&na.node, &none);
+    let servers: Vec<NodeId> = all["abuseipdb"].iter().map(|q| q.server).collect();
+    assert_eq!(servers, [c.id], "b announces a price and is left out");
+}

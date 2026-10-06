@@ -278,8 +278,11 @@ pub struct Node {
     lookup_shares: std::sync::OnceLock<crate::credits::share::Shares>,
     /// This node's lookup prices, as last computed (`credits::price`).
     price_table: RwLock<Arc<crate::credits::price::Table>>,
-    /// On-demand API lookups served per asking member: `(UTC day, count)`.
-    lookup_budget: Mutex<HashMap<NodeId, (String, u32)>>,
+    /// Free lookups served per asking member in the last hour.
+    free_lookups: Mutex<HashMap<NodeId, std::collections::VecDeque<std::time::Instant>>>,
+    /// Offers a paid lookup is being served for right now: `(payer,
+    /// sequence number)`. An offer is served once.
+    pub(crate) serving_offers: Mutex<std::collections::HashSet<(NodeId, u64)>>,
     pub data_dir: std::path::PathBuf,
     /// Contacts and heartbeats (ephemeral).
     pub status: status::Status,
@@ -342,7 +345,8 @@ impl Node {
             lookup_providers: Default::default(),
             lookup_shares: Default::default(),
             price_table: Default::default(),
-            lookup_budget: Mutex::new(HashMap::new()),
+            free_lookups: Mutex::new(HashMap::new()),
+            serving_offers: Mutex::new(Default::default()),
             data_dir: p.data_dir,
             status: Default::default(),
             msg: Default::default(),
@@ -506,17 +510,20 @@ impl Node {
         self.publish_status();
     }
 
-    /// Take `n` of `peer`'s on-demand API lookups for today; `false` when
-    /// that would exceed [`crate::intel::lookup::PER_PEER_PER_DAY`].
-    pub fn take_lookup_budget(&self, peer: NodeId, n: u32) -> bool {
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let mut all = self.lookup_budget.lock().unwrap();
-        all.retain(|_, (day, _)| *day == today);
-        let (_, used) = all.entry(peer).or_insert_with(|| (today, 0));
-        if used.saturating_add(n) > crate::intel::lookup::PER_PEER_PER_DAY {
+    /// Count one free lookup for `peer`; false when it had
+    /// [`crate::credits::pay::FREE_PER_HOUR`] in the last hour.
+    pub fn take_free_lookup(&self, peer: NodeId) -> bool {
+        let hour = Duration::from_secs(3600);
+        let mut all = self.free_lookups.lock().unwrap();
+        all.retain(|_, q| q.back().is_some_and(|t| t.elapsed() < hour));
+        let q = all.entry(peer).or_default();
+        while q.front().is_some_and(|t| t.elapsed() >= hour) {
+            q.pop_front();
+        }
+        if q.len() >= crate::credits::pay::FREE_PER_HOUR {
             return false;
         }
-        *used += n;
+        q.push_back(std::time::Instant::now());
         true
     }
 

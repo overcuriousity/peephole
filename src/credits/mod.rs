@@ -6,6 +6,7 @@ pub mod earn;
 pub mod entries;
 pub mod gates;
 pub mod ledger;
+pub mod pay;
 pub mod price;
 pub mod share;
 

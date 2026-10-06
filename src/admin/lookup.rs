@@ -42,7 +42,6 @@ struct LookupPage {
     ip: String,
     error: Option<String>,
     result: Option<LookupResult>,
-    per_peer: u32,
     cluster: bool,
     bulk: Option<Bulk>,
 }
@@ -87,7 +86,6 @@ async fn page(
         ip: q.ip.unwrap_or_default().trim().to_string(),
         error: None,
         result: None,
-        per_peer: crate::intel::lookup::PER_PEER_PER_DAY,
         cluster: state.recorder.node().is_some(),
         bulk: None,
     })
@@ -106,7 +104,6 @@ async fn lookup(
             ip: text,
             error: Some("Not an IP address.".into()),
             result: None,
-            per_peer: crate::intel::lookup::PER_PEER_PER_DAY,
             cluster,
             bulk: None,
         });
@@ -118,7 +115,6 @@ async fn lookup(
         ip: ip.to_string(),
         error: None,
         result: Some(result),
-        per_peer: crate::intel::lookup::PER_PEER_PER_DAY,
         cluster,
         bulk: None,
     })
@@ -163,7 +159,6 @@ async fn bulk(
         ip: String::new(),
         error: None,
         result: None,
-        per_peer: crate::intel::lookup::PER_PEER_PER_DAY,
         cluster: state.recorder.node().is_some(),
         bulk: Some(Bulk {
             text,

@@ -2,7 +2,7 @@
 {% block title %}peephole — lookup{% endblock %}
 {% block content %}
 {% let sub = "lookup" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Lookup</h1><p class="muted">Every reachable provider, now. Not stored; spends API budget{% if cluster %} (members serve {{ per_peer }} a day){% endif %}.</p></div></div>
+<div class="page-head"><div><h1>Lookup</h1><p class="muted">Every reachable provider, now.{% if cluster %} Paid with credits; kept in the dataset when the cluster has recorded the address.{% else %} Not stored; spends API budget.{% endif %}</p></div></div>
 <form class="filters card" method="post" action="/admin/lookup">
   <label>IP address <input name="ip" value="{{ ip }}" placeholder="203.0.113.7 or 2001:db8::1" required autofocus></label>
   <button class="btn btn-primary" type="submit">Look up</button>
