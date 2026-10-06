@@ -233,6 +233,9 @@ fn ms_of(ts: &str) -> Option<u64> {
         .map(|t| t.and_utc().timestamp_millis().max(0) as u64)
 }
 
+/// Scans read per look; a burst larger than this is read over several.
+const POLL_BATCH: i64 = 500;
+
 impl Picker {
     pub fn new(share: f64) -> Self {
         Self {
@@ -257,17 +260,26 @@ impl Picker {
             self.last_id = Some(max.unwrap_or(0));
             return Ok(());
         };
+        // The mark moves to `top` only once every row up to it was read:
+        // rows of this node's own scans and of audits move it too, and
+        // rows that arrive meanwhile lie above it.
+        let top: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM scans")
+            .fetch_one(pool)
+            .await?;
         let rows: Vec<(i64, String, String, String, i64, Option<String>)> = sqlx::query_as(
             "SELECT s.id, s.uid, s.job_uid, i.ip, s.level, s.finished_at
              FROM scans s JOIN ips i ON i.id = s.ip_id
-             WHERE s.id > ? AND s.audit_of IS NULL AND s.uid IS NOT NULL
+             WHERE s.id > ? AND s.id <= ? AND s.audit_of IS NULL AND s.uid IS NOT NULL
                AND s.job_uid IS NOT NULL AND s.origin IS NOT NULL AND s.origin != ?
-             ORDER BY s.id LIMIT 500",
+             ORDER BY s.id LIMIT ?",
         )
         .bind(last)
+        .bind(top)
         .bind(&me.0[..])
+        .bind(POLL_BATCH)
         .fetch_all(pool)
         .await?;
+        let all_read = rows.len() < POLL_BATCH as usize;
         let now = hlc::wall_ms();
         for (id, scan_uid, job_uid, ip, level, finished_at) in rows {
             self.last_id = Some(id);
@@ -288,11 +300,9 @@ impl Picker {
                 });
             }
         }
-        // Rows of this node's own scans and of audits move the mark too.
-        let max: Option<i64> = sqlx::query_scalar("SELECT MAX(id) FROM scans")
-            .fetch_one(pool)
-            .await?;
-        self.last_id = Some(max.unwrap_or(0).max(self.last_id.unwrap_or(0)));
+        if all_read {
+            self.last_id = Some(top.max(last));
+        }
         Ok(())
     }
 
@@ -556,5 +566,24 @@ mod tests {
         all.started();
         all.started();
         assert_eq!(all.started_last_hour(), 2);
+    }
+
+    /// A burst larger than one look is read over several: the mark does
+    /// not jump past the rows that were not read yet.
+    #[tokio::test]
+    async fn a_burst_of_scans_is_read_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let me = id(9);
+        let mut p = Picker::new(1.0);
+        p.poll(&store.pool, &me).await.unwrap();
+        for i in 0..POLL_BATCH {
+            finished(&store, &format!("late-{i}"), 1, 31, 1).await;
+        }
+        finished(&store, "fresh", 1, 1, 1).await;
+        p.poll(&store.pool, &me).await.unwrap();
+        assert!(p.take(&[]).is_none(), "the first look reads the late ones");
+        p.poll(&store.pool, &me).await.unwrap();
+        assert_eq!(p.take(&[]).unwrap().scan_uid, "fresh");
     }
 }
