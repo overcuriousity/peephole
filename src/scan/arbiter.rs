@@ -948,28 +948,27 @@ mod tests {
     /// long one; a long job that has waited long enough goes first.
     #[tokio::test]
     async fn jobs_are_granted_by_response_ratio() {
-        let dir = tempfile::tempdir().unwrap();
-        let (node, arbiter, store, _tx) = setup(dir.path()).await;
-        let rec = Recorder::Cluster(node.clone());
-        let scanner = Identity::generate().unwrap().id;
-        let a = store.upsert_ip("203.0.113.92".parse().unwrap()).await.unwrap();
-        let b = store.upsert_ip("203.0.113.93".parse().unwrap()).await.unwrap();
-        rec.enqueue_scan(a.id, 4, 24).await.unwrap();
-        rec.enqueue_scan(b.id, 2, 24).await.unwrap();
-        let age = |level: i64, mins: i64| {
-            let pool = store.pool.clone();
-            async move {
+        // (minutes the L4 has waited, minutes the L2 has waited, level granted)
+        for (l4_mins, l2_mins, first) in [(10, 5, 2), (120, 5, 4)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (node, arbiter, store, _tx) = setup(dir.path()).await;
+            let rec = Recorder::Cluster(node.clone());
+            let scanner = Identity::generate().unwrap().id;
+            let a = store.upsert_ip("203.0.113.92".parse().unwrap()).await.unwrap();
+            let b = store.upsert_ip("203.0.113.93".parse().unwrap()).await.unwrap();
+            rec.enqueue_scan(a.id, 4, 24).await.unwrap();
+            rec.enqueue_scan(b.id, 2, 24).await.unwrap();
+            for (level, mins) in [(4, l4_mins), (2, l2_mins)] {
+                // ratio 1.5 / 2.0 with the default 20-min estimate at 10 / 5 min
                 sqlx::query("UPDATE scan_jobs SET queued_at = datetime('now', ?) WHERE level = ?")
                     .bind(format!("-{mins} minutes"))
                     .bind(level)
-                    .execute(&pool)
+                    .execute(&store.pool)
                     .await
                     .unwrap();
             }
-        };
-        age(4, 10).await; // ratio 1.5 with the default 20-min estimate
-        age(2, 5).await; // ratio 2.0
-        let g = arbiter.next_job(scanner, &[]).await.unwrap().unwrap();
-        assert_eq!(g.level, 2);
+            let g = arbiter.next_job(scanner, &[]).await.unwrap().unwrap();
+            assert_eq!(g.level, first, "L4 waited {l4_mins} min, L2 {l2_mins} min");
+        }
     }
 }
