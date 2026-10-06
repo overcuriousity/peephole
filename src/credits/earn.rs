@@ -75,7 +75,10 @@ fn command_line(raw_xml: Option<&[u8]>) -> Option<String> {
 /// back would slip it past the daily and per-address limits. A scan
 /// dated before the ledger window is left alone: its judgment would be
 /// pruned again within the hour, and judging it would only crowd out
-/// the scans that can still be paid.
+/// the scans that can still be paid. The earlier-result check goes by the
+/// job's index: without statistics (a node just upgraded, before its
+/// first `PRAGMA optimize`) SQLite may pick the origin index and walk
+/// every scan of the scanner, once per row.
 /// Returns how many were judged.
 pub async fn judge(j: &Judge<'_>, min_age_secs: i64) -> Result<usize> {
     type Row = (
@@ -100,7 +103,7 @@ pub async fn judge(j: &Judge<'_>, min_age_secs: i64) -> Result<usize> {
            AND l.received_at <= datetime('now', ?)
            AND MAX(s.hlc, COALESCE(j.hlc, 0)) >= ?
            AND NOT EXISTS (SELECT 1 FROM credit_scans c WHERE c.job_uid = j.uid)
-           AND NOT EXISTS (SELECT 1 FROM scans e
+           AND NOT EXISTS (SELECT 1 FROM scans e INDEXED BY idx_scans_job_uid
                            WHERE e.job_uid = s.job_uid AND e.origin = s.origin
                              AND e.audit_of IS NULL
                              AND (e.hlc < s.hlc OR (e.hlc = s.hlc AND e.uid < s.uid)))
