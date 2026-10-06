@@ -3685,6 +3685,50 @@ async fn rotating_the_key_moves_reachable_siblings_and_retries_the_rest() {
     );
 }
 
+/// "Collect credits here": the siblings that answer forward to this node,
+/// one blocked here is not asked, and the page says where each node's
+/// credits go.
+#[tokio::test]
+async fn collecting_credits_here_tells_the_siblings_and_shows_where_credits_go() {
+    use peephole::cluster::owner::{self, fleet};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    owner::adopt(&nc.store, c.id, &key, false).await.unwrap();
+    eventually("a finds b and c", || async {
+        fleet::discover(&na.node).await.unwrap().len() == 2
+    })
+    .await;
+    peephole::cluster::block::block(&na.node, c.id)
+        .await
+        .unwrap();
+    let (admin, base) = admin_on(&na).await;
+    let page = format!("{base}/admin/cluster/ownership");
+    let r = admin
+        .post(format!("{page}/collect-here"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(nb.settings.snapshot().collect_to, Some(a.id));
+    assert_eq!(nc.settings.snapshot().collect_to, None, "not asked");
+    assert_eq!(na.settings.snapshot().collect_to, None);
+
+    eventually("b's status reaches the page", || async {
+        let html = text(&admin, page.clone()).await;
+        html.contains("Credits go") && html.contains("→ this node")
+    })
+    .await;
+    let html = text(&admin, page.clone()).await;
+    assert!(html.contains("keeps them"), "a keeps its own: {html}");
+    assert!(html.contains("offline"), "c is not asked: {html}");
+}
+
 /// The Ownership page: create a key (shown once), adopt it on a second
 /// node, see that node listed, see received commands, forget and release.
 #[tokio::test]

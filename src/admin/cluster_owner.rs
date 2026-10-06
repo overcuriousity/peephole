@@ -2,7 +2,7 @@
 //! the owner commands this node received.
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
-use crate::admin::cluster::{MemberView, back_to, node, rules_check, views};
+use crate::admin::cluster::{MemberView, asks_remote, back_to, node, rules_check, views};
 use crate::admin::error::{AppResult, render};
 use crate::admin::views::Chrome;
 use crate::cluster::Node;
@@ -19,6 +19,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const PAGE: &str = "/admin/cluster/ownership";
+
+/// How long the page waits for its siblings to say where their credits go.
+/// They are asked at once; one that is slower shows "not answered".
+const STATUS_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
@@ -43,6 +47,8 @@ struct NodeRow {
     version: String,
     /// Its balance in this node's book.
     credits: String,
+    /// Where it forwards its credits, in words.
+    collects: String,
     seen: String,
     is_self: bool,
 }
@@ -91,7 +97,14 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
         .iter()
         .map(|m| (m.key.clone(), m.name.clone()))
         .collect();
+    let managing = owned.as_ref().is_some_and(|o| o.managing());
+    let collects = if owned.is_some() {
+        collect_targets(node, managing, &me, &members, &sibs).await
+    } else {
+        HashMap::new()
+    };
     let row = |m: &MemberView| NodeRow {
+        collects: collects.get(&m.key).cloned().unwrap_or_default(),
         credits: NodeId::parse(&m.key)
             .map(|id| crate::credits::show(book.balance(&id)))
             .unwrap_or_default(),
@@ -137,7 +150,7 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
     render(&OwnershipPage {
         chrome: Chrome::new(true, "admin"),
         owner: owned.as_ref().map(|o| o.id.short()),
-        managing: owned.as_ref().is_some_and(|o| o.managing()),
+        managing,
         shown_key,
         nodes,
         pending,
@@ -145,6 +158,68 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
         log,
         refused,
     })
+}
+
+/// Where each of the operator's nodes forwards its credits, by member key:
+/// this node from its settings, a sibling from its own status (asked only
+/// with the key here, and only when it is live and not blocked).
+async fn collect_targets(
+    node: &Arc<Node>,
+    managing: bool,
+    me: &MemberView,
+    members: &[MemberView],
+    sibs: &[String],
+) -> HashMap<String, String> {
+    let name = |key: &str| {
+        if key == me.key {
+            "this node".to_string()
+        } else {
+            members
+                .iter()
+                .find(|m| m.key == key)
+                .map_or_else(|| key.chars().take(12).collect(), |m| m.name.clone())
+        }
+    };
+    let words = |to: Option<&str>| match to.filter(|t| !t.is_empty()) {
+        None => "keeps them".to_string(),
+        Some(t) => format!("→ {}", name(t)),
+    };
+    let mut out = HashMap::new();
+    let own = (*node.collect_to.read().unwrap()).map(|id| id.to_string());
+    out.insert(me.key.clone(), words(own.as_deref()));
+    let mine: Vec<&MemberView> = members.iter().filter(|m| sibs.contains(&m.key)).collect();
+    let key = match managing {
+        true => cmd::kept_key(node).await.ok(),
+        false => None,
+    };
+    let Some(key) = key else {
+        for m in mine {
+            out.insert(m.key.clone(), "—".into());
+        }
+        return out;
+    };
+    let asked = futures::future::join_all(mine.iter().map(|m| {
+        let key = &key;
+        async move {
+            let id = NodeId::parse(&m.key).map_err(|_| "—")?;
+            if !asks_remote(m) {
+                return Err("offline");
+            }
+            match tokio::time::timeout(STATUS_WAIT, cmd::status(node, key, id)).await {
+                Ok(Ok(s)) => Ok(s.collect_to),
+                _ => Err("not answered"),
+            }
+        }
+    }))
+    .await;
+    for (m, a) in mine.iter().zip(asked) {
+        let text = match a {
+            Ok(to) => words(to.as_deref()),
+            Err(why) => why.to_string(),
+        };
+        out.insert(m.key.clone(), text);
+    }
+    out
 }
 
 async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
@@ -311,29 +386,7 @@ async fn collect_here(_u: SessionUser, State(st): State<Arc<AdminState>>) -> App
         Ok(k) => k,
         Err(e) => return Ok(back_to(PAGE, None, Some(format!("{e:#}")))),
     };
-    let me = node.id().to_string();
-    let (mut told, mut failed) = (0, vec![]);
-    for sib in fleet::siblings(&node.store).await? {
-        let done = async {
-            let st = cmd::status(node, &key, sib).await?;
-            let set = cmd::OwnerCmd::Settings {
-                base_version: st.state.version,
-                changes: crate::settings::Changes {
-                    collect_to: Some(me.clone()),
-                    ..Default::default()
-                },
-            };
-            match cmd::run(node, &key, sib, st.counter, set).await? {
-                Ok(_) => anyhow::Ok(()),
-                Err(e) => anyhow::bail!("{e}"),
-            }
-        };
-        match done.await {
-            Ok(()) => told += 1,
-            Err(e) => failed.push(format!("{}: {e:#}", sib.short())),
-        }
-    }
-    // This node keeps what it earns.
+    // This node keeps what it earns, whatever the siblings answer.
     let own = crate::settings::Changes {
         collect_to: Some(String::new()),
         ..Default::default()
@@ -342,6 +395,42 @@ async fn collect_here(_u: SessionUser, State(st): State<Arc<AdminState>>) -> App
         .apply(&own, None)
         .await?
         .map_err(anyhow::Error::msg)?;
+    let me = node.id().to_string();
+    // All at once: a sibling that does not answer costs its timeout once,
+    // not once per sibling after it.
+    // A sibling blocked here is not asked: its answer would not arrive.
+    let (blocked, siblings): (Vec<_>, Vec<_>) = fleet::siblings(&node.store)
+        .await?
+        .into_iter()
+        .partition(|s| node.is_blocked(s));
+    let results = futures::future::join_all(siblings.iter().map(|&sib| {
+        let (key, me) = (&key, me.clone());
+        async move {
+            let st = cmd::status(node, key, sib).await?;
+            let set = cmd::OwnerCmd::Settings {
+                base_version: st.state.version,
+                changes: crate::settings::Changes {
+                    collect_to: Some(me),
+                    ..Default::default()
+                },
+            };
+            match cmd::run(node, key, sib, st.counter, set).await? {
+                Ok(_) => anyhow::Ok(()),
+                Err(e) => anyhow::bail!("{e}"),
+            }
+        }
+    }))
+    .await;
+    let (mut told, mut failed) = (0, vec![]);
+    for sib in blocked {
+        failed.push(format!("{}: blocked here", sib.short()));
+    }
+    for (sib, r) in siblings.iter().zip(results) {
+        match r {
+            Ok(()) => told += 1,
+            Err(e) => failed.push(format!("{}: {e:#}", sib.short())),
+        }
+    }
     Ok(if failed.is_empty() {
         back_to(
             PAGE,

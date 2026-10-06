@@ -74,10 +74,10 @@
 <section class="card">
   <div class="card-head"><h2>My nodes</h2>{% if !managing %}<span class="muted">read-only: the key is not kept on this node</span>{% endif %}</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Node</th><th>Roles</th><th>Version</th><th class="num">Credits</th><th>Seen</th></tr></thead>
+    <thead><tr><th>Node</th><th>Roles</th><th>Version</th><th class="num">Credits</th><th>Credits go</th><th>Seen</th></tr></thead>
     <tbody>{% for n in nodes %}<tr>
       <td><a href="/admin/cluster/node/{{ n.key }}"><b>{{ n.name }}</b></a> <span class="mono muted">{{ n.short }}</span>{% if n.is_self %} <span class="muted small">this node</span>{% endif %}</td>
-      <td>{{ n.roles }}</td><td class="mono">{{ n.version }}</td><td class="num">{{ n.credits }}</td><td>{{ n.seen }}</td>
+      <td>{{ n.roles }}</td><td class="mono">{{ n.version }}</td><td class="num">{{ n.credits }}</td><td>{{ n.collects }}</td><td>{{ n.seen }}</td>
     </tr>{% endfor %}</tbody>
   </table></div>
   {% if managing && nodes.len() > 1 %}
