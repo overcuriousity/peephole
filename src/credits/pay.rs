@@ -12,6 +12,7 @@ use crate::cluster::record::Record;
 use crate::cluster::{Node, repl};
 use crate::intel::lookup::{LookupReq, LookupResp, NodeAnswer};
 use crate::intel::{Providers, provider_info};
+use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -119,6 +120,63 @@ impl Drop for Serving<'_> {
     fn drop(&mut self) {
         self.0.serving_offers.lock().unwrap().remove(&self.1);
     }
+}
+
+/// A provider result the dataset holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stored {
+    pub provider: String,
+    pub fetched_at: String,
+    pub age_secs: i64,
+    /// The node that fetched it.
+    pub node: Option<String>,
+    pub source_version: Option<String>,
+    pub data: serde_json::Value,
+}
+
+/// Per provider, the newest result for `ip` any node fetched less than 24
+/// hours ago. Shown instead of asking again: it costs nothing.
+pub async fn stored(pool: &SqlitePool, ip: &IpAddr) -> anyhow::Result<Vec<Stored>> {
+    type Row = (String, String, Option<String>, String, Option<String>, i64);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT t.provider, t.fetched_at, t.source_version, t.data_json,
+                (SELECT name FROM members m WHERE m.id = t.origin),
+                CAST((julianday('now') - julianday(t.fetched_at)) * 86400 AS INTEGER)
+         FROM ip_intel_log t
+         WHERE t.ip = ? AND t.fetched_at > datetime('now', '-1 day')
+         ORDER BY t.hlc DESC, t.origin DESC",
+    )
+    .bind(crate::net::canonical(*ip).to_string())
+    .fetch_all(pool)
+    .await?;
+    let mut out: Vec<Stored> = vec![];
+    for (provider, fetched_at, source_version, data_json, node, age_secs) in rows {
+        if provider_info(&provider).is_none() || out.iter().any(|s| s.provider == provider) {
+            continue;
+        }
+        out.push(Stored {
+            provider,
+            fetched_at,
+            age_secs: age_secs.max(0),
+            node,
+            source_version,
+            data: serde_json::from_str(&data_json).unwrap_or(serde_json::Value::Null),
+        });
+    }
+    Ok(out)
+}
+
+/// Whether the dataset here holds a recorded request from `ip` (a
+/// false-positive claim alone does not count).
+pub async fn recorded(pool: &SqlitePool, ip: &IpAddr) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM requests r JOIN ips i ON i.id = r.ip_id
+                       WHERE i.ip = ? AND r.is_fp_claim = 0)",
+    )
+    .bind(crate::net::canonical(*ip).to_string())
+    .fetch_one(pool)
+    .await
+    .is_ok_and(|n| n > 0)
 }
 
 /// The serving side: check the offer `offer_seq` of `peer` in this node's
@@ -322,6 +380,29 @@ pub async fn serve(
     }
     tracing::info!(asker = %peer.short(), providers = %answered.join(","),
         charged = %show(charged), "paid lookup served");
+    // What was paid for is kept for everyone when the cluster has
+    // recorded the address, exactly as the automatic enrichment would
+    // write it; for an address nobody recorded nothing is written.
+    if !resp.findings.is_empty() && recorded(&node.store.pool, &ip).await {
+        let rec = crate::store::recorder::Recorder::Cluster(node.clone());
+        let text = crate::net::canonical(ip).to_string();
+        let mut all = true;
+        for f in &resp.findings {
+            let version = f.source_version.as_deref();
+            let written = if provider_info(&f.provider).is_some_and(|i| i.api) {
+                rec.record_lookup(&text, &f.provider, version, f.data.clone())
+                    .await
+            } else {
+                rec.record_intel(&text, &f.provider, version, f.data.clone())
+                    .await
+            };
+            if let Err(e) = written {
+                tracing::warn!(provider = %f.provider, ?e, "paid lookup result not kept");
+                all = false;
+            }
+        }
+        resp.kept = all;
+    }
     resp.declined.append(&mut declined);
     resp
 }

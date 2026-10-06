@@ -5028,3 +5028,138 @@ async fn a_member_of_an_earlier_version_is_not_asked() {
     let servers: Vec<NodeId> = all["abuseipdb"].iter().map(|q| q.server).collect();
     assert_eq!(servers, [c.id], "b announces a price and is left out");
 }
+
+/// A paid answer about an address the cluster has recorded is written
+/// into the dataset by the node that served it and reaches every member.
+/// For 24 hours the next lookup of that provider is answered from the
+/// dataset: no offer, nobody asked. "Ask again" pays.
+#[tokio::test]
+async fn a_paid_lookup_of_a_recorded_address_is_kept_and_then_free_for_everyone() {
+    use peephole::credits::{entries, price};
+    use peephole::intel::lookup;
+    use std::sync::atomic::Ordering;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    // c's trap recorded a request from the address.
+    let row = nc
+        .store
+        .upsert_ip("203.0.113.90".parse().unwrap())
+        .await
+        .unwrap();
+    rec(&nc)
+        .insert_request(&new_request(row.id, "/x"))
+        .await
+        .unwrap();
+    eventually("a and b hold the request", || async {
+        count(&na, "SELECT COUNT(*) FROM requests").await == 1
+            && count(&nb, "SELECT COUNT(*) FROM requests").await == 1
+    })
+    .await;
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.90".parse().unwrap();
+    let findings = |o: &lookup::Outcome| {
+        o.answers
+            .iter()
+            .map(|x| x.resp.findings.len())
+            .sum::<usize>()
+    };
+
+    let first = lookup::run(&rec(&na), &none, ip, &[]).await;
+    assert!(first.stored.is_empty());
+    assert_eq!(findings(&first), 1, "{:?}", first.answers);
+    assert!(first.kept);
+    let kept =
+        "SELECT COUNT(*) FROM ip_intel_log WHERE provider = 'abuseipdb' AND ip = '203.0.113.90'";
+    eventually("the answer is in everyone's dataset", || async {
+        count(&na, kept).await == 1 && count(&nb, kept).await == 1 && count(&nc, kept).await == 1
+    })
+    .await;
+    let by_b: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ip_intel_log WHERE origin = ?")
+        .bind(&b.id.0[..])
+        .fetch_one(&nc.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(by_b, 1, "written by the node that served it");
+
+    // Another member, without credits, within 24 hours: from the dataset.
+    let payments = entries::since(&nc.store.pool, 0).await.unwrap().len();
+    let second = lookup::run(&rec(&nc), &none, ip, &[]).await;
+    assert_eq!(second.stored.len(), 1);
+    assert_eq!(second.stored[0].provider, "abuseipdb");
+    assert_eq!(second.stored[0].node.as_deref(), Some("node-bravo"));
+    assert_eq!(second.stored[0].data["said_by"], "abuseipdb");
+    assert!(second.stored[0].age_secs < 3600);
+    assert_eq!(findings(&second), 0);
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "nobody was asked");
+    assert_eq!(
+        entries::since(&nc.store.pool, 0).await.unwrap().len(),
+        payments
+    );
+
+    // "Ask again" forces a paid lookup of that provider.
+    let again = lookup::run(&rec(&na), &none, ip, &["abuseipdb".to_string()]).await;
+    assert!(again.stored.is_empty());
+    assert_eq!(findings(&again), 1);
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+}
+
+/// Review focus: an address nobody recorded. The payment is in the log;
+/// nothing about the address is written on any node.
+#[tokio::test]
+async fn a_paid_lookup_of_an_unrecorded_address_writes_nothing() {
+    use peephole::credits::{entries, price};
+    use peephole::intel::lookup;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.91".parse().unwrap();
+    let out = lookup::run(&rec(&na), &none, ip, &[]).await;
+    assert_eq!(
+        out.answers
+            .iter()
+            .map(|x| x.resp.findings.len())
+            .sum::<usize>(),
+        1
+    );
+    assert!(!out.kept);
+    eventually("the payment is on both nodes", || async {
+        entries::since(&na.store.pool, 0).await.unwrap().len() == 2
+            && entries::since(&nb.store.pool, 0).await.unwrap().len() == 2
+    })
+    .await;
+    for n in [&na, &nb] {
+        for table in ["ips", "ip_intel", "ip_intel_log", "requests"] {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(count(n, &sql).await, 0, "{table}");
+        }
+        // The payment does not name the address either.
+        let log: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT payload FROM repl_log WHERE kind IN ('credit_offer', 'credit_receipt')",
+        )
+        .fetch_all(&n.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(
+            log.iter()
+                .all(|p| !p.windows(12).any(|w| w == b"203.0.113.91"))
+        );
+    }
+    // And a second lookup pays again: nothing was there to answer from.
+    let out = lookup::run(&rec(&na), &none, ip, &[]).await;
+    assert!(out.stored.is_empty());
+}

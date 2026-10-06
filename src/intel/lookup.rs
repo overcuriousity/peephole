@@ -55,6 +55,10 @@ pub struct LookupResp {
     /// that price, so the asker may offer again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_mc: Option<u32>,
+    /// The answering node wrote these answers into the dataset (the
+    /// cluster has recorded the address).
+    #[serde(default)]
+    pub kept: bool,
 }
 
 /// What the providers here say about `ip`: those in `wanted`, or every one
@@ -173,31 +177,70 @@ pub struct NodeAnswer {
     pub charged_mc: u32,
 }
 
-/// What every reachable node says about `ip`. Standalone: this node's
-/// providers. In a cluster: per provider the cheapest node, paid with
-/// this node's credits (`credits::pay::ask`).
-pub async fn cluster(rec: &Recorder, providers: &Providers, ip: IpAddr) -> Vec<NodeAnswer> {
+/// A lookup as the admin page shows it.
+#[derive(Debug, Clone, Default)]
+pub struct Outcome {
+    /// Provider results the dataset already holds, under 24 hours old:
+    /// shown instead of asking (and paying) again.
+    pub stored: Vec<crate::credits::pay::Stored>,
+    /// What the nodes asked now answered.
+    pub answers: Vec<NodeAnswer>,
+    /// An answering node kept the answers in the dataset.
+    pub kept: bool,
+}
+
+/// Look `ip` up: first in the dataset, then at the providers. `again`
+/// names the providers to ask although the dataset has a fresh result.
+pub async fn run(rec: &Recorder, providers: &Providers, ip: IpAddr, again: &[String]) -> Outcome {
     let known: Vec<String> = KNOWN_PROVIDERS.iter().map(|p| p.name.to_string()).collect();
     let Recorder::Cluster(node) = rec else {
-        let mine = local(providers, &ip, &[]).await;
-        let mut out = vec![NodeAnswer {
+        // Standalone: this node's providers, no credits, nothing stored.
+        let mut answers = vec![NodeAnswer {
             node: "this node".into(),
-            resp: mine,
+            resp: local(providers, &ip, &[]).await,
             charged_mc: 0,
         }];
-        note_unserved(&mut out, &known);
-        return out;
+        note_unserved(&mut answers, &known);
+        return Outcome {
+            answers,
+            ..Default::default()
+        };
     };
-    let mut out = crate::credits::pay::ask(node, providers, ip, &known).await;
-    if out.is_empty() {
-        out.push(NodeAnswer {
+    let stored: Vec<_> = match crate::credits::pay::stored(&node.store.pool, &ip).await {
+        Ok(s) => s
+            .into_iter()
+            .filter(|s| !again.contains(&s.provider))
+            .collect(),
+        Err(e) => {
+            tracing::debug!(?e, "lookup: stored results not read");
+            vec![]
+        }
+    };
+    let wanted: Vec<String> = known
+        .into_iter()
+        .filter(|p| !stored.iter().any(|s| &s.provider == p))
+        .collect();
+    let mut answers = crate::credits::pay::ask(node, providers, ip, &wanted).await;
+    if answers.is_empty() {
+        answers.push(NodeAnswer {
             node: "this node".into(),
             resp: LookupResp::default(),
             charged_mc: 0,
         });
     }
-    note_unserved(&mut out, &known);
-    out
+    note_unserved(&mut answers, &wanted);
+    Outcome {
+        kept: answers.iter().any(|a| a.resp.kept),
+        stored,
+        answers,
+    }
+}
+
+/// What every reachable node says about `ip` now, whatever the dataset
+/// holds (see [`run`]).
+pub async fn cluster(rec: &Recorder, providers: &Providers, ip: IpAddr) -> Vec<NodeAnswer> {
+    let all: Vec<String> = KNOWN_PROVIDERS.iter().map(|p| p.name.to_string()).collect();
+    run(rec, providers, ip, &all).await.answers
 }
 
 /// Every provider in `wanted` that nobody answered or declined gets a
