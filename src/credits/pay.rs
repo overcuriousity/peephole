@@ -214,9 +214,15 @@ pub async fn serve(
     served: Vec<String>,
     offer_seq: u64,
 ) -> LookupResp {
-    let decline = |names: &[String], why: String| LookupResp {
-        declined: names.iter().map(|n| (n.clone(), why.clone())).collect(),
-        ..Default::default()
+    // Every offer leaves one line in the journal: declined here, or
+    // served below.
+    let decline = |names: &[String], why: String| {
+        tracing::info!(asker = %peer.short(), offer = offer_seq,
+            providers = %names.join(","), %why, "paid lookup declined");
+        LookupResp {
+            declined: names.iter().map(|n| (n.clone(), why.clone())).collect(),
+            ..Default::default()
+        }
     };
     let Some(entry) = wait_for(node, &peer, offer_seq).await else {
         return decline(
@@ -329,7 +335,6 @@ pub async fn serve(
     let total: Mc = asking.iter().map(|n| price_of(n)).sum();
     let refuse = |why: String, price_mc: Option<u32>| async move {
         release(node, peer, offer_seq).await;
-        tracing::info!(asker = %peer.short(), %why, "paid lookup declined");
         (why, price_mc)
     };
     let refused = if total > offered {
@@ -404,7 +409,9 @@ pub async fn serve(
         // credits return after 15 minutes.
         Err(e) => tracing::warn!(?e, "credit receipt not written"),
     }
-    tracing::info!(asker = %peer.short(), providers = %answered.join(","),
+    let not_served: Vec<String> = declined.iter().map(|(n, _)| n.clone()).collect();
+    tracing::info!(asker = %peer.short(), offer = offer_seq,
+        providers = %answered.join(","), declined = %not_served.join(","),
         charged = %show(charged), "paid lookup served");
     // What was paid for is kept for everyone when the cluster has
     // recorded the address, exactly as the automatic enrichment would
