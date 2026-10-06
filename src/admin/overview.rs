@@ -264,7 +264,8 @@ pub struct ClusterFigures {
     /// Paid scans a day, low and high tier.
     pub paid_scans: (String, String),
     /// Scans a day the scanners can do, did, and the utilization in %.
-    pub capacity: (String, String, String),
+    /// Scans a day: possible, done, idle; and the utilization in %.
+    pub capacity: (String, String, String, String),
     /// Counted audits of 7 days: agrees, differs, inconclusive.
     pub audits: (u32, u32, u32),
     /// The unit price with its load factor.
@@ -392,6 +393,10 @@ async fn cluster_figures(
         capacity: (
             format!("{:.0}", t.capacity.per_day),
             format!("{:.0}", t.capacity.used_per_day),
+            format!(
+                "{:.0}",
+                (t.capacity.per_day - t.capacity.used_per_day).max(0.0)
+            ),
             format!("{:.0}", t.capacity.utilization * 100.0),
         ),
         audits,

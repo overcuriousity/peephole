@@ -5713,6 +5713,49 @@ async fn a_members_page_says_whether_it_earns_here() {
     );
 }
 
+/// Two members on different builds carry different rules fingerprints;
+/// while their requests classify the same here, the Members table does
+/// not flag the member (§11 of the credits spec).
+#[tokio::test]
+async fn a_member_on_another_build_is_not_flagged_while_its_requests_agree() {
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    for i in 0..25 {
+        record(&nb, "198.51.100.40", &format!("/login{i}")).await;
+    }
+    let hex: String = b.id.0.iter().map(|x| format!("{x:02x}")).collect();
+    let of_b = format!("SELECT COUNT(*) FROM requests WHERE origin = x'{hex}'");
+    eventually("a holds b's requests", || async {
+        count(&na, &of_b).await == 25
+    })
+    .await;
+    // As another build would have stamped them.
+    sqlx::query("UPDATE requests SET rules = ? WHERE origin = ?")
+        .bind("f".repeat(64))
+        .bind(&b.id.0[..])
+        .execute(&na.store.pool)
+        .await
+        .unwrap();
+    let (admin, base) = admin_on(&na).await;
+    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    assert!(members.contains("node-bravo"), "{members}");
+    assert!(
+        !members.contains("not earning here") && !members.contains("other rules"),
+        "{members}"
+    );
+    let page = text(&admin, format!("{base}/admin/cluster/node/{}", b.id)).await;
+    assert!(
+        page.contains("Earns here") && page.contains(">yes<"),
+        "{page}"
+    );
+    assert!(
+        page.contains("differs from ours"),
+        "shown as information: {page}"
+    );
+}
+
 /// Overview shows the cluster's figures from this node's view.
 #[tokio::test]
 async fn the_overview_shows_the_clusters_credit_figures() {
@@ -5732,6 +5775,7 @@ async fn the_overview_shows_the_clusters_credit_figures() {
     assert!(html.contains("200"), "weighted lookups a day");
     assert!(html.contains("0.40"), "the unit price: saturated, double");
     assert!(html.contains("Forks") && html.contains("Audits"));
+    assert!(html.contains("0 idle"), "no scanner: nothing idle: {html}");
 }
 
 /// A declined offer frees what it held before the asker offers again:
