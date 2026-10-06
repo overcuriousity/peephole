@@ -330,4 +330,39 @@ mod tests {
             vec![(Kind::Legacy, format!("canary-{r}"))]
         );
     }
+
+    #[test]
+    fn mcp_tool_answers_serve_what_they_show() {
+        let rf = r#"{"tool":"read_file","cls":"dotenv"}"#;
+        assert_eq!(served(Some(2), TOK, "mcp:tools/call", Some(rf)).len(), 7);
+        assert_eq!(
+            served(
+                Some(2),
+                TOK,
+                "mcp:resources/read",
+                Some(r#"{"cls":"aws-credentials"}"#)
+            )
+            .len(),
+            2
+        );
+        assert_eq!(
+            served(
+                Some(2),
+                TOK,
+                "mcp:tools/call",
+                Some(r#"{"tool":"query_db","cls":"select"}"#)
+            ),
+            vec![(Kind::AppKey, value(TOK, Kind::AppKey))]
+        );
+        assert!(
+            served(
+                Some(2),
+                TOK,
+                "mcp:tools/call",
+                Some(r#"{"tool":"run_command","cls":"id"}"#)
+            )
+            .is_empty()
+        );
+        assert!(served(Some(2), TOK, "mcp:no-session", Some(rf)).is_empty());
+    }
 }
