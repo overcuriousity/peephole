@@ -86,6 +86,8 @@ struct Opts {
     workers: usize,
     /// Days of history kept (0: all).
     retention_days: u32,
+    /// Share of other nodes' fresh scans this scanner audits.
+    audit_share: f64,
 }
 
 const DEFAULT: Opts = Opts {
@@ -97,6 +99,7 @@ const DEFAULT: Opts = Opts {
     scanner: None,
     workers: 1,
     retention_days: 0,
+    audit_share: 0.0,
 };
 
 async fn boot(identity: Identity, me: &Addr, peers: &[&Addr], o: Opts) -> TestNode {
@@ -162,7 +165,7 @@ async fn boot_in(
     });
     let settings = peephole::settings::Settings::with_pace(
         node.store.clone(),
-        &scan_config(&o.never_scan),
+        &scan_config(&o.never_scan, o.audit_share),
         pace.clone(),
     );
     cluster::remote::serve(&node, settings.clone());
@@ -175,7 +178,7 @@ async fn boot_in(
         ));
         tokio::spawn(peephole::scan::run_workers(
             peephole::store::recorder::Recorder::Cluster(node.clone()),
-            scan_config(&o.never_scan),
+            scan_config(&o.never_scan, o.audit_share),
             pace.clone(),
             nmap.clone(),
             rx.clone(),
@@ -195,7 +198,7 @@ async fn boot_in(
 }
 
 /// Config for the scan workers (argv presets, never_scan, cooldown).
-fn scan_config(never_scan: &[String]) -> peephole::config::Config {
+fn scan_config(never_scan: &[String], audit_share: f64) -> peephole::config::Config {
     let list = never_scan
         .iter()
         .map(|n| format!("\"{n}\""))
@@ -204,7 +207,7 @@ fn scan_config(never_scan: &[String]) -> peephole::config::Config {
     // No Tor list and no DNS in tests: neither check may hold scans back.
     toml::from_str(&format!(
         "database_path = \"/x\"\ndata_dir = \"/x\"\n[scan]\nnever_scan = [{list}]\n\
-         tor_unknown = \"scan\"\nverify_crawlers = false\n"
+         tor_unknown = \"scan\"\nverify_crawlers = false\n[credits]\naudit_share = {audit_share}\n"
     ))
     .unwrap()
 }
@@ -1027,7 +1030,9 @@ fn new_request(ip_id: i64, path: &str) -> NewRequest {
         query: Some("q=1".into()),
         headers_json: r#"[["user-agent","sqlmap/1.7"]]"#.into(),
         body: Some(b"user=admin&pass=' OR 1=1--".to_vec()),
-        labels_json: r#"["sqli"]"#.into(),
+        // What this build's rules make of the request: the credits' rules
+        // gate compares a member's newest requests with them.
+        labels_json: r#"["form-interaction","scanner-ua","sqli"]"#.into(),
         severity: 4,
         scan_level: 3,
         is_fp_claim: false,
@@ -4481,4 +4486,119 @@ async fn a_completed_scan_pays_scanner_and_trap_in_every_nodes_book() {
         credits::book_fresh(&na.node).await.unwrap().balance(&b.id),
         1000
     );
+}
+
+/// A stand-in nmap that reports a host with no open port, whatever the
+/// target: a scanner that makes its results up.
+fn fake_nmap_empty(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("fake-nmap-empty");
+    std::fs::write(
+        &p,
+        "#!/bin/sh\nfor a; do t=$a; done\ncat <<EOF\n<?xml version=\"1.0\"?>\n\
+         <nmaprun scanner=\"nmap\" args=\"nmap $*\" start=\"1\" version=\"7.94\">\n\
+         <host><status state=\"up\"/><address addr=\"$t\" addrtype=\"ipv4\"/>\
+         <ports></ports></host>\n</nmaprun>\nEOF\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// A scanner that audits everything finds another scanner's results made
+/// up. That scanner then earns no scanner share where those audits count:
+/// at the auditor and in its fleet, and at nobody else.
+#[tokio::test]
+async fn audits_of_made_up_results_stop_a_scanners_shares_where_they_count() {
+    use peephole::cluster::owner::{self, fleet};
+    use peephole::credits::{self, audit};
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("a");
+    let (i_f, f) = new_node("f");
+    let (ib, b) = new_node("b");
+    let (is, s) = new_node("s");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&f, &b, &s, &c], DEFAULT).await;
+    let _nf = boot(
+        i_f,
+        &f,
+        &[&a, &b, &s, &c],
+        Opts {
+            scanner: Some(fake_nmap_empty(tools.path())),
+            ..DEFAULT
+        },
+    )
+    .await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a, &f, &s, &c],
+        Opts {
+            scanner: Some(fake_nmap_args(tools.path())),
+            audit_share: 1.0,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let ns = boot(is, &s, &[&a, &f, &b, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &f, &b, &s], DEFAULT).await;
+    let key = owner::create(&nb.store, b.id).await.unwrap();
+    owner::adopt(&ns.store, s.id, &key, false).await.unwrap();
+    eventually("s knows b as one of its own", || async {
+        fleet::discover(&ns.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+
+    for i in 0..16 {
+        enqueue(&na, &format!("198.51.100.{}", 60 + i), 1).await;
+    }
+    eventually_for(Duration::from_secs(60), "all sixteen scanned", || async {
+        count(&na, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 16
+    })
+    .await;
+    let by_f = scans_by(&na, f.id).await;
+    assert!(by_f >= 5, "f ran {by_f} of 16 scans");
+    eventually_for(
+        Duration::from_secs(60),
+        "b ran f's scans again, and everyone holds the audits",
+        || async {
+            let mut all = true;
+            for n in [&nb, &ns, &nc] {
+                all &= count(n, "SELECT COUNT(*) FROM scans WHERE audit_of IS NOT NULL").await
+                    == by_f
+                    && count(n, "SELECT COUNT(*) FROM scans WHERE audit_of IS NULL").await == 16;
+            }
+            all
+        },
+    )
+    .await;
+    for n in [&nb, &ns, &nc] {
+        assert_eq!(judge_now(n).await, 16);
+        audit::settle(&n.store.pool).await.unwrap();
+        assert_eq!(
+            count(
+                n,
+                "SELECT COUNT(*) FROM scans WHERE audit_result = 'differs'"
+            )
+            .await,
+            by_f,
+            "nothing reported, a port found"
+        );
+    }
+    let honest = (16 - by_f) as u64 * 1000;
+    for n in [&nb, &ns] {
+        let book = credits::book_fresh(&n.node).await.unwrap();
+        let st = book.standing(&f.id);
+        assert_eq!(st.audits, Some((by_f as u32, by_f as u32)));
+        assert!(st.earns() && !st.earns_as_scanner());
+        assert_eq!(book.balance(&f.id), 0);
+        assert_eq!(book.balance(&b.id), honest);
+        // The trap is paid for every scan all the same.
+        assert_eq!(book.balance(&a.id), 16 * 250);
+    }
+    // c is not of b's fleet: b's audits are shown there, they do not count.
+    let book = credits::book_fresh(&nc.node).await.unwrap();
+    assert_eq!(book.standing(&f.id).audits, None);
+    assert_eq!(book.balance(&f.id), by_f as u64 * 1000);
+    assert_eq!(book.balance(&b.id), honest);
 }

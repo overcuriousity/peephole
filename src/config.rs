@@ -44,6 +44,9 @@ pub struct Config {
     /// When API providers look an IP up again.
     #[serde(default)]
     pub enrichment: EnrichmentConfig,
+    /// Lookup credits (cluster only).
+    #[serde(default)]
+    pub credits: CreditsConfig,
     /// Optional API providers; a missing section means the provider is off.
     pub abuseipdb: Option<AbuseIpDbConfig>,
     pub shodan: Option<ShodanConfig>,
@@ -74,6 +77,36 @@ impl Default for EnrichmentConfig {
         Self {
             refresh_after_days: default_refresh_days(),
         }
+    }
+}
+
+/// `[credits]`: this node's part in the cluster's credit system.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreditsConfig {
+    /// Share of the other nodes' fresh scans a scanner runs again to check
+    /// them (0 to 1; 0: this node audits nothing).
+    #[serde(default = "default_audit_share")]
+    pub audit_share: f64,
+}
+
+fn default_audit_share() -> f64 {
+    0.05
+}
+
+impl Default for CreditsConfig {
+    fn default() -> Self {
+        Self {
+            audit_share: default_audit_share(),
+        }
+    }
+}
+
+impl CreditsConfig {
+    pub fn check(&self) -> anyhow::Result<()> {
+        if !(0.0..=1.0).contains(&self.audit_share) {
+            anyhow::bail!("credits.audit_share must be between 0 and 1");
+        }
+        Ok(())
     }
 }
 
@@ -528,6 +561,7 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("public", "delay_minutes", "5"),
     ("public", "jitter_minutes", "5"),
     ("public", "recent_rows", "50"),
+    ("credits", "audit_share", "0.05"),
 ];
 
 /// Sections that are required when their role is on and unused otherwise.
@@ -654,6 +688,7 @@ impl Config {
         if !(e == 0.0 || (1.0..=3650.0).contains(&e)) {
             bail!("enrichment.refresh_after_days must be 0 (never) or between 1 and 3650");
         }
+        self.credits.check()?;
         if let Some(a) = &self.abuseipdb {
             if a.api_key.trim().is_empty() {
                 bail!("[abuseipdb] needs api_key (or omit the section)");
@@ -1400,5 +1435,19 @@ data_dir = "/tmp"
                 max: 20
             }]
         );
+    }
+
+    #[test]
+    fn the_audit_share_defaults_to_five_percent_and_is_a_share() {
+        let base = "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert_eq!(cfg.credits.audit_share, 0.05);
+        let cfg: Config = toml::from_str(&format!("{base}[credits]\naudit_share = 0\n")).unwrap();
+        assert_eq!(cfg.credits.audit_share, 0.0);
+        for bad in ["-0.1", "1.5"] {
+            let cfg: Config =
+                toml::from_str(&format!("{base}[credits]\naudit_share = {bad}\n")).unwrap();
+            assert!(cfg.credits.check().is_err(), "{bad}");
+        }
     }
 }
