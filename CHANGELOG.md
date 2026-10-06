@@ -5,6 +5,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Changed
+
+- Cluster › Members shows how many requests and scans each node
+  contributed, with its share, again; the full breakdown stays on the
+  node page.
+
 ## [0.5.1] - 2026-10-06
 
 ### Changed

@@ -3552,4 +3552,17 @@ async fn admin_page_shows_contributions_per_node() {
         own.contains("<h2>Contributions</h2>") && own.contains("this node"),
         "{own}"
     );
+    // The members table shows each node's share at a glance.
+    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    let row = members
+        .split(&format!("/admin/cluster/node/{}\"", o.id.id))
+        .nth(1)
+        .expect("writer row")
+        .split("</tr>")
+        .next()
+        .unwrap();
+    assert!(
+        row.contains(r#"<td class="num">3 · 100 %</td>"#),
+        "writer's share: {row}"
+    );
 }
