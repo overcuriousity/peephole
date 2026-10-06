@@ -15,12 +15,13 @@ pub const KEY_COOLDOWN: &str = "scan.rescan_cooldown_hours";
 pub const KEY_ROLE_LISTENER: &str = "roles.listener";
 pub const KEY_ROLE_SCANNER: &str = "roles.scanner";
 pub const KEY_ROLE_WEB: &str = "roles.web";
+pub const KEY_COLLECT_TO: &str = "credits.collect_to";
 const KEY_VERSION: &str = "settings.version";
 /// Longest rescan cooldown (one year).
 pub const MAX_COOLDOWN_HOURS: i64 = 24 * 365;
 
 /// Every key a runtime override can use.
-pub const KEYS: [&str; 7] = [
+pub const KEYS: [&str; 8] = [
     pace::KEY_WORKERS,
     pace::KEY_PER_HOUR,
     pace::KEY_TIMEOUT,
@@ -28,6 +29,7 @@ pub const KEYS: [&str; 7] = [
     KEY_ROLE_LISTENER,
     KEY_ROLE_SCANNER,
     KEY_ROLE_WEB,
+    KEY_COLLECT_TO,
 ];
 
 /// A set of changes; absent fields stay as they are.
@@ -40,6 +42,10 @@ pub struct Changes {
     pub listener: Option<bool>,
     pub scanner: Option<bool>,
     pub web: Option<bool>,
+    /// The fleet node this node forwards its credits to: a node key
+    /// (`ed25519:…`); the empty string forwards to nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collect_to: Option<String>,
 }
 
 impl Changes {
@@ -72,6 +78,12 @@ impl Changes {
         if let Some(x) = self.web {
             v.push(format!("web={}", on(x)));
         }
+        if let Some(x) = &self.collect_to {
+            v.push(match NodeId::parse(x) {
+                Ok(id) => format!("collect_to={}", id.short()),
+                Err(_) => "collect_to=off".into(),
+            });
+        }
         v.join(", ")
     }
 
@@ -84,6 +96,7 @@ impl Changes {
         self.listener = other.listener.or(self.listener);
         self.scanner = other.scanner.or(self.scanner);
         self.web = other.web.or(self.web);
+        self.collect_to = other.collect_to.or(self.collect_to.take());
     }
 
     /// One `key value` pair from the CLI.
@@ -108,6 +121,17 @@ impl Changes {
             KEY_ROLE_LISTENER => c.listener = Some(flag()?),
             KEY_ROLE_SCANNER => c.scanner = Some(flag()?),
             KEY_ROLE_WEB => c.web = Some(flag()?),
+            KEY_COLLECT_TO => {
+                let v = value.trim();
+                if !v.is_empty() {
+                    NodeId::parse(v).map_err(|_| {
+                        format!(
+                            "{key}: `{value}` is not a node key (see `peephole cluster members`)"
+                        )
+                    })?;
+                }
+                c.collect_to = Some(v.to_string());
+            }
             _ => {
                 return Err(format!(
                     "`{key}` is not a runtime setting (one of: {})",
@@ -153,6 +177,8 @@ pub struct Snapshot {
     pub cooldown_hours: i64,
     pub roles: Roles,
     pub version: u64,
+    /// Where this node forwards its credits (`credits::fleet`).
+    pub collect_to: Option<NodeId>,
 }
 
 /// `current` with `c` applied, or why not. The version is left alone.
@@ -175,6 +201,14 @@ pub fn validate(current: Snapshot, c: &Changes, prereqs: &Prereqs) -> Result<Sna
             ));
         }
         s.cooldown_hours = x;
+    }
+    if let Some(x) = &c.collect_to {
+        s.collect_to = match x.trim() {
+            "" => None,
+            key => {
+                Some(NodeId::parse(key).map_err(|_| "collect_to must be a node key".to_string())?)
+            }
+        };
     }
     for (new, cur, missing, name) in [
         (c.listener, &mut s.roles.listener, &prereqs.listener, "trap"),
@@ -213,6 +247,7 @@ pub struct Settings {
     prereqs: Arc<Prereqs>,
     roles: Arc<RwLock<Roles>>,
     version: Arc<AtomicU64>,
+    collect_to: Arc<RwLock<Option<NodeId>>>,
     changed: tokio::sync::watch::Sender<u64>,
     /// Serializes writers in this process.
     lock: Arc<tokio::sync::Mutex<()>>,
@@ -224,6 +259,7 @@ fn defaults(cfg: &Config) -> Snapshot {
         cooldown_hours: cfg.scan.rescan_cooldown_hours,
         roles: cfg.roles,
         version: 0,
+        collect_to: None,
     }
 }
 
@@ -238,6 +274,7 @@ impl Settings {
             prereqs: Arc::new(Prereqs::default()),
             roles: Arc::new(RwLock::new(d.roles)),
             version: Arc::new(AtomicU64::new(0)),
+            collect_to: Default::default(),
             changed: tokio::sync::watch::channel(0).0,
             lock: Default::default(),
         }
@@ -259,6 +296,7 @@ impl Settings {
             cooldown_hours: self.pace.cooldown_hours(),
             roles: self.roles(),
             version: self.version.load(Ordering::Relaxed),
+            collect_to: *self.collect_to.read().unwrap(),
         }
     }
 
@@ -307,6 +345,7 @@ impl Settings {
         self.pace.replace(s.pace);
         self.pace.set_cooldown_hours(s.cooldown_hours);
         *self.roles.write().unwrap() = s.roles;
+        *self.collect_to.write().unwrap() = s.collect_to;
         self.version.store(s.version, Ordering::Relaxed);
         self.changed.send_replace(s.version);
     }
@@ -390,6 +429,7 @@ impl Settings {
             (KEY_ROLE_LISTENER, c.listener.map(|v| v.to_string())),
             (KEY_ROLE_SCANNER, c.scanner.map(|v| v.to_string())),
             (KEY_ROLE_WEB, c.web.map(|v| v.to_string())),
+            (KEY_COLLECT_TO, c.collect_to.clone()),
         ] {
             if let Some(v) = value {
                 self.set(&mut tx, key, v).await?;
@@ -483,6 +523,7 @@ mod tests {
                 web: roles.2,
             },
             version: 7,
+            collect_to: None,
         }
     }
 
@@ -707,5 +748,33 @@ mod tests {
             Ok(1)
         );
         assert_eq!(s.audit(10).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_collecting_node_is_a_runtime_setting() {
+        let id = crate::cluster::identity::Identity::generate().unwrap().id;
+        let set = Changes::from_key_value(KEY_COLLECT_TO, &id.to_string()).unwrap();
+        assert_eq!(set.collect_to.as_deref(), Some(id.to_string().as_str()));
+        assert_eq!(set.describe(), format!("collect_to={}", id.short()));
+        let s = validate(snap((true, true, true)), &set, &Prereqs::default()).unwrap();
+        assert_eq!(s.collect_to, Some(id));
+        // Cleared with an empty value; untouched by a change that does not name it.
+        let off = Changes::from_key_value(KEY_COLLECT_TO, "").unwrap();
+        assert_eq!(off.describe(), "collect_to=off");
+        assert_eq!(
+            validate(s, &off, &Prereqs::default()).unwrap().collect_to,
+            None
+        );
+        assert_eq!(
+            validate(s, &Changes::default(), &Prereqs::default())
+                .unwrap()
+                .collect_to,
+            Some(id)
+        );
+        assert!(Changes::from_key_value(KEY_COLLECT_TO, "not a key").is_err());
+        assert!(KEYS.contains(&KEY_COLLECT_TO));
+        // A change without it encodes as before: an older node reads it.
+        let enc = crate::cluster::rpc::cbor::encode(&Changes::default()).unwrap();
+        assert!(!enc.windows(10).any(|w| w == b"collect_to"));
     }
 }

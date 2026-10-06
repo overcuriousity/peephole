@@ -171,6 +171,7 @@ async fn boot_in(
     cluster::remote::serve(&node, settings.clone());
     cluster::owner::fleet::serve(&node);
     cluster::owner::cmd::serve(&node, settings.clone());
+    peephole::credits::fleet::serve(&node);
     let workers = o.scanner.as_ref().map(|nmap| {
         tokio::spawn(peephole::scan::arbiter::takeover_loop(
             node.clone(),
@@ -5162,4 +5163,105 @@ async fn a_paid_lookup_of_an_unrecorded_address_writes_nothing() {
     // And a second lookup pays again: nothing was there to answer from.
     let out = lookup::run(&rec(&na), &none, ip, &[]).await;
     assert!(out.stored.is_empty());
+}
+
+/// A node forwards what it holds to its collecting node; the credits keep
+/// their day and can be spent there. Less than a credit waits, and
+/// nothing goes to a node that is no member.
+#[tokio::test]
+async fn a_fleet_collects_at_one_node_and_any_of_its_nodes_can_spend() {
+    use peephole::credits::{self, fleet};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    grant_scans(&[&na, &nb], b.id, 4).await;
+    let today = credits::day_of(nb.hlc.now());
+
+    let (_, stranger) = new_node("x");
+    assert_eq!(
+        fleet::collect(&nb.node, stranger.id).await.unwrap(),
+        0,
+        "no member"
+    );
+    assert_eq!(fleet::collect(&nb.node, b.id).await.unwrap(), 0, "itself");
+    assert_eq!(fleet::collect(&nb.node, a.id).await.unwrap(), 5000);
+    eventually("the credits are at a, on both nodes' books", || async {
+        let mut all = true;
+        for n in [&na, &nb] {
+            let book = credits::book_fresh(&n.node).await.unwrap();
+            all &= book.balance(&a.id) == 5000
+                && book.balance(&b.id) == 0
+                && book.ledger.by_day(&a.id) == vec![(today, 5000)];
+        }
+        all
+    })
+    .await;
+    // Sending back half a credit: any node may send to any member.
+    assert_eq!(fleet::send(&na.node, b.id, 500).await.unwrap(), 500);
+    assert!(
+        fleet::send(&na.node, b.id, 99_000).await.is_err(),
+        "more than it holds"
+    );
+    assert!(fleet::send(&na.node, stranger.id, 1).await.is_err());
+    eventually("b holds half a credit", || async {
+        credits::book_fresh(&nb.node).await.unwrap().balance(&b.id) == 500
+    })
+    .await;
+    // Less than a credit, none of it expiring today: it waits.
+    assert_eq!(fleet::collect(&nb.node, a.id).await.unwrap(), 0);
+    // The setting reaches the node that acts on it.
+    let set = peephole::settings::Changes {
+        collect_to: Some(a.id.to_string()),
+        ..Default::default()
+    };
+    nb.settings.apply(&set, None).await.unwrap().unwrap();
+    assert_eq!(nb.settings.snapshot().collect_to, Some(a.id));
+}
+
+/// A node whose balance does not cover a lookup draws the missing amount
+/// from its collecting node, which answers only its own fleet.
+#[tokio::test]
+async fn a_node_draws_what_a_lookup_needs_from_its_collecting_node() {
+    use peephole::cluster::msg::Msg;
+    use peephole::cluster::owner::{self, fleet as owned};
+    use peephole::credits::{self, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (is, s) = new_node("node-server");
+    let (ix, x) = new_node("node-x");
+    let na = boot(ia, &a, &[&b, &s, &x], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &s, &x], DEFAULT).await;
+    let ns = boot(is, &s, &[&a, &b, &x], DEFAULT).await;
+    let nx = boot(ix, &x, &[&a, &b, &s], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    eventually("a counts b as its own", || async {
+        owned::discover(&na.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+    serves(&ns, &[("abuseipdb", Some(1000.0))], 0.2);
+    // The fleet's credits sit at a; b holds nothing.
+    grant_scans(&[&na, &nb, &ns], a.id, 8).await;
+    price::refresh(&ns.node).await.unwrap();
+    let cost = price_seen(&nb, s.id, "abuseipdb").await as u64;
+    *nb.collect_to.write().unwrap() = Some(a.id);
+
+    // A stranger's draw is not answered, and moves nothing.
+    let asked = nx
+        .node
+        .request(a.id, Msg::CreditDraw { mc: 100 }, Duration::from_secs(3))
+        .await;
+    assert!(asked.is_err(), "{asked:?}");
+
+    let none: peephole::intel::Providers = vec![];
+    let answers =
+        peephole::intel::lookup::cluster(&rec(&nb), &none, "203.0.113.95".parse().unwrap()).await;
+    let found: usize = answers.iter().map(|x| x.resp.findings.len()).sum();
+    assert_eq!(found, 1, "{answers:?}");
+    eventually("the fleet paid, from a's balance", || async {
+        let book = credits::book_fresh(&ns.node).await.unwrap();
+        book.balance(&a.id) == 10_000 - cost && book.balance(&b.id) == 0
+    })
+    .await;
 }

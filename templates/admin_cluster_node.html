@@ -113,6 +113,15 @@
     </tr>{% endfor %}</tbody>
   </table></div>{% endif %}
 
+  <h3>Credits there</h3>
+  <p>{{ crate::credits::show(status.balance_mc.clone()) }} credits as {{ m.name }} counts them{% if let Some(c) = status.collect_to %} · forwards what it earns to <span class="mono">{{ c|truncate(24) }}</span>{% endif %}</p>
+  {% if !peers.is_empty() %}
+  <form method="post" action="/admin/cluster/node/{{ m.key }}/owner" class="filters">
+    <input type="hidden" name="counter" value="{{ status.counter }}"><input type="hidden" name="action" value="send-credits">
+    <label>Send from there to <select name="target">{% for p in peers %}<option value="{{ p.0 }}">{{ p.1 }}</option>{% endfor %}</select></label>
+    <label>Credits <input name="amount" size="8" inputmode="decimal" placeholder="0.5" required></label>
+    <button class="btn btn-sm" type="submit">Send</button>
+  </form>{% endif %}
   <h3>Leave or release</h3>
   <div class="row">
     <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-owner-leave">Leave the cluster</button>

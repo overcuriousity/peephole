@@ -31,6 +31,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/cluster/ownership/rotate", post(rotate))
         .route("/admin/cluster/ownership/retry", post(retry))
         .route("/admin/cluster/ownership/discard", post(discard))
+        .route("/admin/cluster/ownership/collect-here", post(collect_here))
 }
 
 /// One of the operator's nodes.
@@ -40,6 +41,8 @@ struct NodeRow {
     short: String,
     roles: String,
     version: String,
+    /// Its balance in this node's book.
+    credits: String,
     seen: String,
     is_self: bool,
 }
@@ -87,7 +90,11 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
         .iter()
         .map(|m| (m.key.clone(), m.name.clone()))
         .collect();
+    let book = crate::credits::book(node).await?;
     let row = |m: &MemberView| NodeRow {
+        credits: NodeId::parse(&m.key)
+            .map(|id| crate::credits::show(book.balance(&id)))
+            .unwrap_or_default(),
         key: m.key.clone(),
         name: m.name.clone(),
         short: m.short.clone(),
@@ -294,4 +301,60 @@ async fn discard(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResul
         ),
         None,
     ))
+}
+
+/// Make this node the fleet's collecting node: every sibling that answers
+/// is told to forward its credits here.
+async fn collect_here(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
+    let node = node(&st)?;
+    let key = match cmd::kept_key(node).await {
+        Ok(k) => k,
+        Err(e) => return Ok(back_to(PAGE, None, Some(format!("{e:#}")))),
+    };
+    let me = node.id().to_string();
+    let (mut told, mut failed) = (0, vec![]);
+    for sib in fleet::siblings(&node.store).await? {
+        let done = async {
+            let st = cmd::status(node, &key, sib).await?;
+            let set = cmd::OwnerCmd::Settings {
+                base_version: st.state.version,
+                changes: crate::settings::Changes {
+                    collect_to: Some(me.clone()),
+                    ..Default::default()
+                },
+            };
+            match cmd::run(node, &key, sib, st.counter, set).await? {
+                Ok(_) => anyhow::Ok(()),
+                Err(e) => anyhow::bail!("{e}"),
+            }
+        };
+        match done.await {
+            Ok(()) => told += 1,
+            Err(e) => failed.push(format!("{}: {e:#}", sib.short())),
+        }
+    }
+    // This node keeps what it earns.
+    let own = crate::settings::Changes {
+        collect_to: Some(String::new()),
+        ..Default::default()
+    };
+    st.settings
+        .apply(&own, None)
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    Ok(if failed.is_empty() {
+        back_to(
+            PAGE,
+            Some(format!(
+                "{told} of your nodes now forward their credits to this node."
+            )),
+            None,
+        )
+    } else {
+        back_to(
+            PAGE,
+            None,
+            Some(format!("{told} told; not reached: {}", failed.join("; "))),
+        )
+    })
 }

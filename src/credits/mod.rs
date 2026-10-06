@@ -4,6 +4,7 @@
 pub mod audit;
 pub mod earn;
 pub mod entries;
+pub mod fleet;
 pub mod gates;
 pub mod ledger;
 pub mod pay;

@@ -870,6 +870,8 @@ impl SettingsForm {
             listener: Some(self.listener.is_some()),
             scanner: Some(self.scanner.is_some()),
             web: Some(self.web.is_some()),
+            // Not on this form: the Ownership page and the CLI set it.
+            collect_to: None,
         })
     }
 }
@@ -1124,6 +1126,8 @@ struct OwnerForm {
     subtree: Option<String>,
     /// The invite to revoke.
     invite: Option<i64>,
+    /// Credits to send, as typed ("0.5").
+    amount: Option<String>,
 }
 
 async fn node_owner(
@@ -1149,6 +1153,18 @@ async fn node_owner(
         ("invite-revoke", _, Some(i)) => OwnerCmd::InviteRevoke { id: i },
         ("leave", _, _) => OwnerCmd::Leave,
         ("release", _, _) => OwnerCmd::Release,
+        ("send-credits", Some(n), _) => {
+            match f.amount.as_deref().and_then(crate::credits::parse_amount) {
+                Some(mc) => OwnerCmd::SendCredits { to: n, mc },
+                None => {
+                    return Ok(back_to(
+                        &to,
+                        None,
+                        Some("an amount like 0.5 is needed".into()),
+                    ));
+                }
+            }
+        }
         _ => return Ok(back_to(&to, None, Some("unknown action".into()))),
     };
     Ok(match owner_run(node, id, f.counter, cmd).await {

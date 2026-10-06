@@ -58,6 +58,11 @@ pub enum OwnerCmd {
     },
     /// The node drops its owner.
     Release,
+    /// The node sends credits to a member (`credits::fleet`).
+    SendCredits {
+        to: NodeId,
+        mc: u64,
+    },
 }
 
 impl OwnerCmd {
@@ -84,6 +89,13 @@ impl OwnerCmd {
                 Err(_) => "take another owner".into(),
             },
             OwnerCmd::Release => "release (drop the owner)".into(),
+            OwnerCmd::SendCredits { to, mc } => {
+                format!(
+                    "send {} credits to {}",
+                    crate::credits::show(*mc),
+                    to.short()
+                )
+            }
         }
     }
 }
@@ -108,6 +120,12 @@ pub struct Status {
     pub build: String,
     pub blocked: Vec<NodeId>,
     pub invites: Vec<InviteInfo>,
+    /// The node's credits as it counts them itself, in mc.
+    #[serde(default)]
+    pub balance_mc: u64,
+    /// Where it forwards its credits (a node key), if anywhere.
+    #[serde(default)]
+    pub collect_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -282,6 +300,11 @@ async fn status_of(node: &Node, settings: &Settings) -> Result<Status> {
         build: crate::VERSION.to_string(),
         blocked: crate::cluster::block::list(&node.store).await?,
         invites,
+        balance_mc: crate::credits::book(node)
+            .await
+            .map(|b| b.balance(&node.id()))
+            .unwrap_or(0),
+        collect_to: settings.snapshot().collect_to.map(|id| id.to_string()),
     })
 }
 
@@ -397,6 +420,16 @@ async fn execute(
         OwnerCmd::Release => {
             super::release(&node.store).await.map_err(err)?;
             Ok("released: this node has no owner".into())
+        }
+        OwnerCmd::SendCredits { to, mc } => {
+            let sent = crate::credits::fleet::send(node, *to, *mc)
+                .await
+                .map_err(err)?;
+            Ok(format!(
+                "sent {} credits to {}",
+                crate::credits::show(sent),
+                to.short()
+            ))
         }
     }
 }
@@ -840,7 +873,7 @@ mod tests {
         #[derive(Serialize)]
         struct LaterChanges {
             max_workers: Option<u32>,
-            collect_to: Option<String>,
+            later_field: Option<String>,
         }
         #[derive(Serialize)]
         #[serde(tag = "c", rename_all = "snake_case")]
@@ -849,7 +882,7 @@ mod tests {
                 base_version: u64,
                 changes: LaterChanges,
             },
-            SendCredits {
+            LaterCommand {
                 mc: u32,
             },
         }
@@ -863,7 +896,7 @@ mod tests {
             base_version: 4,
             changes: LaterChanges {
                 max_workers: Some(3),
-                collect_to: Some("x".into()),
+                later_field: Some("x".into()),
             },
         });
         let sig = sign(&k, &a, &b, 7, &bytes);
@@ -881,7 +914,7 @@ mod tests {
         // would refuse the command as signed with a wrong key.
         assert_ne!(encode(&read).unwrap(), bytes);
         // A kind of command this version does not know is not read.
-        assert!(decode(&enc(&Later::SendCredits { mc: 1 })).is_none());
+        assert!(decode(&enc(&Later::LaterCommand { mc: 1 })).is_none());
     }
 
     #[test]
@@ -925,6 +958,10 @@ mod tests {
         );
         assert_eq!(OwnerCmd::Leave.describe(), "leave the cluster");
         assert_eq!(OwnerCmd::Release.describe(), "release (drop the owner)");
+        assert_eq!(
+            OwnerCmd::SendCredits { to: n, mc: 1250 }.describe(),
+            format!("send 1.25 credits to {}", n.short())
+        );
     }
 
     #[tokio::test]

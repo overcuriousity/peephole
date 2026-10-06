@@ -278,6 +278,9 @@ pub struct Node {
     lookup_shares: std::sync::OnceLock<crate::credits::share::Shares>,
     /// This node's lookup prices, as last computed (`credits::price`).
     price_table: RwLock<Arc<crate::credits::price::Table>>,
+    /// The fleet node this node forwards its credits to and draws from
+    /// (the runtime setting `credits.collect_to`).
+    pub collect_to: RwLock<Option<NodeId>>,
     /// Free lookups served per asking member in the last hour.
     free_lookups: Mutex<HashMap<NodeId, std::collections::VecDeque<std::time::Instant>>>,
     /// Offers a paid lookup is being served for right now: `(payer,
@@ -345,6 +348,7 @@ impl Node {
             lookup_providers: Default::default(),
             lookup_shares: Default::default(),
             price_table: Default::default(),
+            collect_to: RwLock::new(None),
             free_lookups: Mutex::new(HashMap::new()),
             serving_offers: Mutex::new(Default::default()),
             data_dir: p.data_dir,

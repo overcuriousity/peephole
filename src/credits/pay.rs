@@ -426,6 +426,17 @@ pub async fn offer_and_ask(
         Ok(b) => b,
         Err(e) => return decline(format!("this node could not read its books: {e:#}")),
     };
+    let mut book = book;
+    if book.ledger.spendable_parts(&me, total_mc).is_none() {
+        // The fleet's balance sits at its collecting node: draw what is
+        // missing, then look again.
+        let missing = total_mc.saturating_sub(book.balance(&me));
+        if super::fleet::draw(node, missing).await
+            && let Ok(b) = super::book_fresh(node).await
+        {
+            book = b;
+        }
+    }
     let Some(parts) = book.ledger.spendable_parts(&me, total_mc) else {
         let have = book.balance(&me);
         return decline(format!(
