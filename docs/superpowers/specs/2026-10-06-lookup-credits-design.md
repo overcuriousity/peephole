@@ -807,7 +807,32 @@ moment, including right after the daily prune.
   node keys. The on-demand share does: it caps what all askers together
   can take from a server.
 - **Invented scans** are caught only where audits are counted, and only
-  for sources still reachable 30 minutes later.
+  for sources still reachable 30 minutes later. The 30 minutes start when
+  the scan finished, but never before it arrived at the auditor: a
+  scanner cannot keep its scans out of audits by leaving out or
+  backdating `finished_at` (review of 2026-10-06).
+- **A named price is offered again at most once, at most twice the
+  announced one** (§9, review of 2026-10-06). Without the bound a server
+  could decline and name the asker's whole balance; a server whose price
+  rose further is skipped for the next one.
+- **A payer can take back what it paid, for a while** (review of
+  2026-10-06; not fixed in this release). Gates are evaluated on every
+  recomputation over the whole window: a member that spent its credits
+  and then fails the rules gate loses its earnings of the window, and the
+  receipts of servers that served it shrink with them, at every node,
+  until it passes again. It keeps the lookups and gives up its own
+  earning to do so; the loss is bounded by what it spent in 8 days.
+  §8's "paid exactly for what it judged covered" holds only while the
+  payer's standing does not change.
+- **A late receipt counts.** A receipt dated inside its offer's 15
+  minutes counts whenever it arrives; a lapsed offer that was spent again
+  elsewhere can then leave the second server short. The loss is at most
+  the first server's price, and an honest receipt delayed by a partition
+  does the same.
+- **Backdating once.** A node that is trap and scanner and whose log lags
+  the clock can date its jobs and scans over the past days in order and
+  be paid each day's limit at once. It works once per node key: its log
+  cannot go back again.
 - **One double spend per node key** (§6).
 - **A server can take the price and not answer.** The asker sees it
   (charged, no finding) and loses at most one lookup's price per try; the

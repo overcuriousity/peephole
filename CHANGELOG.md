@@ -55,6 +55,21 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Cluster protocol version 3. Ownership works between nodes of this
   version; older members keep syncing as before.
 
+### Upgrading
+
+- Upgrade all members soon after each other. Until a member is upgraded,
+  upgraded members answer its lookups with free providers only, and it
+  cannot spend credits.
+- Balances start from the counter-scans of the last 8 days; there is no
+  starting grant. A member whose recent requests were classified by older
+  rules may earn nothing until enough new requests are recorded.
+- Remove `remote_config` from config files, and replace scripts that call
+  `peephole cluster config-key` with `peephole owner …`.
+- Do not go back to 0.6.0 and then upgrade again: entries erased under
+  0.6.0 can keep the node from sealing its log, and it can then no longer
+  pay for lookups. Do not restore a database backup from before the
+  upgrade on a cluster node.
+
 ## [0.6.0] - 2026-10-06
 
 ### Added

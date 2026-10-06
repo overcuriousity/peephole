@@ -235,10 +235,10 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
                 } => (
                     *charged,
                     *destroyed,
-                    // A server that declines gives the offer back with a
-                    // receipt that names nothing.
+                    // A server that declines, or whose providers all
+                    // failed, gives the offer back with a receipt of nothing.
                     if *charged == 0 && o.answered.is_empty() {
-                        "declined at the server"
+                        "nothing charged: declined or not answered at the server"
                     } else if o.covered < o.offered {
                         "charged (not fully covered at the server)"
                     } else {
