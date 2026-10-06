@@ -85,7 +85,26 @@ impl DecoyIn {
             return s;
         }
         d.arg = None;
-        serde_json::to_string(&d).unwrap_or_default()
+        let s = serde_json::to_string(&d).unwrap_or_default();
+        if s.len() <= MAX_LEN {
+            return s;
+        }
+        d.rpc = None;
+        let s = serde_json::to_string(&d).unwrap_or_default();
+        if s.len() <= MAX_LEN {
+            return s;
+        }
+        // Last resort: only the short, bounded routing fields.
+        let min = DecoyIn {
+            m: d.m.as_deref().map(|v| cut(v, 16)),
+            api: d.api,
+            ep: d.ep,
+            via: d.via,
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&min).unwrap_or_default();
+        debug_assert!(s.len() <= MAX_LEN);
+        s
     }
 
     /// The JSON-RPC id to echo (`null` when none was kept).
@@ -142,8 +161,74 @@ impl Ask<'_> {
     }
 }
 
+/// Whether the path could be an AI decoy at all: the cheap gate before the
+/// body is decoded and parsed.
+pub fn candidate(path: &str) -> bool {
+    const PREFIXES: [&str; 9] = [
+        "/mcp",
+        "/messages",
+        "/.well-known/mcp",
+        "/sse",
+        "/v1",
+        "/api",
+        "/openai",
+        "/anthropic",
+        "/litellm",
+    ];
+    PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
 /// The AI decoy for this request, if any: its name (`mcp:…`, `llm:…`) and
 /// what it is rendered from.
 pub fn choose(ask: &Ask) -> Option<(String, DecoyIn)> {
     super::mcp::choose(ask).or_else(|| super::llm::choose(ask))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_paths() {
+        for p in [
+            "/mcp",
+            "/mcp/",
+            "/messages",
+            "/.well-known/mcp",
+            "/sse",
+            "/v1/chat/completions",
+            "/api/tags",
+            "/openai/deployments/x",
+            "/anthropic/v1/messages",
+            "/litellm/chat",
+        ] {
+            assert!(candidate(p), "{p}");
+        }
+        for p in ["/", "/.env", "/wp-login.php", "/admin"] {
+            assert!(!candidate(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn to_json_never_exceeds_max_len() {
+        let ctl: String = std::iter::repeat_n('\u{1}', 64).collect();
+        let long: String = std::iter::repeat_n('\u{e9}', 200).collect();
+        let d = DecoyIn {
+            rpc: Some(Value::String(ctl)),
+            m: Some(long.clone()),
+            tool: Some(long.clone()),
+            model: Some(long.clone()),
+            deployment: Some(long.clone()),
+            proto: Some(long.clone()),
+            arg: Some(long),
+            api: Some("openai".into()),
+            via: Some("sse".into()),
+            ..Default::default()
+        };
+        let s = d.to_json();
+        assert!(s.len() <= MAX_LEN, "{}", s.len());
+        let back = DecoyIn::parse(Some(&s));
+        assert_eq!(back.api.as_deref(), Some("openai"));
+        assert_eq!(back.via.as_deref(), Some("sse"));
+    }
 }

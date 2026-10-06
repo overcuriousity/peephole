@@ -15,6 +15,10 @@ fn rpc_path(path: &str) -> bool {
 
 pub fn choose(ask: &Ask) -> Option<(String, DecoyIn)> {
     let path = ask.path;
+    if ask.method == "DELETE" {
+        // Session termination: answered like GET /mcp (405, Allow: POST).
+        return matches!(path, "/mcp" | "/mcp/").then(|| ("mcp:get".into(), DecoyIn::default()));
+    }
     if ask.method == "GET" {
         return match path {
             "/sse" | "/sse/" | "/mcp/sse" => Some((
@@ -428,6 +432,10 @@ mod tests {
         }
         assert!(choose(&ask("POST", "/other", None, b)).is_none());
         assert_eq!(choose(&ask("GET", "/mcp", None, b"")).unwrap().0, "mcp:get");
+        for p in ["/mcp", "/mcp/"] {
+            assert_eq!(choose(&ask("DELETE", p, None, b"")).unwrap().0, "mcp:get");
+        }
+        assert!(choose(&ask("DELETE", "/other", None, b"")).is_none());
         let (n, d) = choose(&ask("GET", "/sse", None, b"")).unwrap();
         assert_eq!((n.as_str(), d.via.as_deref()), ("mcp:sse", Some("sse")));
         let m = |method: &str| {

@@ -145,6 +145,8 @@ pub fn served(
     if ver >= 2 && decoy.starts_with("mcp:") {
         let d = crate::trap::decoy::ai::DecoyIn::parse(decoy_in);
         return match (decoy, d.tool.as_deref(), d.cls.as_deref()) {
+            // A legacy-SSE initialize POST is answered 202 without a session.
+            ("mcp:initialize", _, _) if d.via.as_deref() == Some("sse") => vec![],
             ("mcp:initialize" | "mcp:sse", _, _) => v(&[Kind::McpSession]),
             ("mcp:tools/call", Some("read_file"), Some(c)) | ("mcp:resources/read", _, Some(c)) => {
                 match c {
@@ -272,6 +274,26 @@ mod tests {
             served(Some(1), TOK, "dotenv", None)
         );
         assert!(served(Some(1), TOK, "mcp:initialize", None).is_empty());
+    }
+
+    #[test]
+    fn legacy_sse_initialize_serves_no_session() {
+        let sse = r#"{"m":"initialize","via":"sse"}"#;
+        assert!(served(Some(2), TOK, "mcp:initialize", Some(sse)).is_empty());
+        assert_eq!(
+            served(
+                Some(2),
+                TOK,
+                "mcp:initialize",
+                Some(r#"{"m":"initialize"}"#)
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            served(Some(2), TOK, "mcp:sse", Some(r#"{"via":"sse"}"#)).len(),
+            1
+        );
     }
 
     #[test]

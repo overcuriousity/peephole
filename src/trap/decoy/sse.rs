@@ -117,6 +117,8 @@ impl SseHub {
         }
         let (done, held) = oneshot::channel();
         let start = Instant::now();
+        let mut ping = tokio::time::interval_at(start + PING_EVERY, PING_EVERY);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let state = Held {
             _guard: Guard {
                 hub: self.clone(),
@@ -130,7 +132,7 @@ impl SseHub {
             first: Some(first),
             end: start + self.hold,
             idle_until: start + IDLE,
-            ping: tokio::time::interval_at(start + PING_EVERY, PING_EVERY),
+            ping,
         };
         let stream = futures::stream::unfold(state, |mut h| async move {
             if let Some(f) = h.first.take() {

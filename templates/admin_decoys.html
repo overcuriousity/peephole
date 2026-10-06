@@ -10,7 +10,7 @@
 <section class="card">
   <div class="card-head"><h2>Funnel</h2><span class="muted">per session</span></div>
   <div class="tiles">
-    <div class="tile"><span class="label">Sessions started</span><div class="value"><a href="/requests?answer=decoy%3Amcp%3Ainitialize">{{ funnel.sessions }}</a></div></div>
+    <div class="tile"><span class="label">Sessions started</span><div class="value"><a href="/requests?answer=decoy%3Amcp%3Ainitialize">{{ funnel.sessions }}</a></div><div class="hint">initialize calls and legacy SSE streams</div></div>
     <div class="tile"><span class="label">Listed tools</span><div class="value"><a href="/requests?answer=decoy%3Amcp%3Atools%2Flist">{{ funnel.listed }}</a></div></div>
     <div class="tile"><span class="label">Called a tool</span><div class="value"><a href="/requests?answer=decoy%3Amcp%3Atools%2Fcall">{{ funnel.called }}</a></div></div>
     <div class="tile"><span class="label">Credentials reused</span><div class="value"><a href="/admin/links/canaries">{{ funnel.reused }}</a></div></div>

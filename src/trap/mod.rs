@@ -825,15 +825,18 @@ async fn trap(
     let method = parts.method.as_str();
     let path = parts.uri.path();
     let presented = presented(&state, &headers, method, path, &body.bytes).await;
-    let decoded = crate::classify::decoded_body(&headers, &body.bytes);
-    let mut ai = decoy::ai::choose(&decoy::ai::Ask {
-        method,
-        path,
-        query: parts.uri.query(),
-        headers: &headers,
-        body: &decoded,
-    });
-    drop(decoded);
+    let mut ai = if decoy::ai::candidate(path) {
+        let decoded = crate::classify::decoded_body(&headers, &body.bytes);
+        decoy::ai::choose(&decoy::ai::Ask {
+            method,
+            path,
+            query: parts.uri.query(),
+            headers: &headers,
+            body: &decoded,
+        })
+    } else {
+        None
+    };
     // A canary presented is answered as always: its trace is worth more.
     // So is an AI decoy: `mcp-abuse` is severity 4, and the tarpit would
     // cut the session it marks short.
@@ -869,7 +872,8 @@ async fn trap(
                 word,
             );
         }
-        // Pool or share full: no stream, so no endpoint event either.
+        // Pool or share full: no stream, so no endpoint event either (and
+        // nothing of it is recorded: `decoy_in` is dropped below).
         ai = None;
     }
     // AI decoys first: a Bearer key that is one of our canaries must get
@@ -877,7 +881,10 @@ async fn trap(
     let decoy = match &ai {
         Some((name, d)) if d.via.as_deref() == Some("sse") => {
             let method_name = name.trim_start_matches("mcp:");
-            let frame = decoy::mcp::message(&input, d, method_name)
+            // From the stored JSON, as render does, so the frame matches
+            // what the row can be rendered from again.
+            let stored = decoy::ai::DecoyIn::parse(input.decoy_in);
+            let frame = decoy::mcp::message(&input, &stored, method_name)
                 .map(|m| format!("event: message\ndata: {m}\n\n"));
             let sid = parts
                 .uri
@@ -890,7 +897,11 @@ async fn trap(
         None => decoy::choose(method, path, parts.uri.query(), presented, word)
             .and_then(|name| decoy::render(&input, name)),
     };
-    let decoy_in = decoy.as_ref().and(decoy_in);
+    let decoy_in = if ai.is_some() {
+        decoy.as_ref().and(decoy_in)
+    } else {
+        None
+    };
     let (answer, status) = match &decoy {
         Some(d) => (format!("decoy:{}", d.name), d.status),
         None => ("not-found".to_string(), 404),

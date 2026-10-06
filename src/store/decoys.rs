@@ -106,7 +106,8 @@ impl Store {
         let sse = format!(
             "SELECT COALESCE(SUM(r.answer = 'decoy:mcp:sse'), 0),
                     COALESCE(SUM(r.answer LIKE 'decoy:mcp:%' AND json_extract(r.decoy_in, '$.via') = 'sse'
-                                 AND r.answer NOT IN ('decoy:mcp:sse', 'decoy:mcp:no-session')), 0),
+                                 AND r.answer NOT IN ('decoy:mcp:sse', 'decoy:mcp:no-session')
+                                 AND COALESCE(json_extract(r.decoy_in, '$.m'), '') NOT LIKE 'notifications/%'), 0),
                     COALESCE(SUM(r.answer = 'decoy:mcp:no-session'), 0)
              FROM requests r WHERE r.decoy_in IS NOT NULL{w}"
         );
@@ -171,7 +172,7 @@ impl Store {
                     COALESCE(json_extract(r.decoy_in, '$.arg'), '') AS arg,
                     COALESCE(json_extract(r.decoy_in, '$.cls'), '') AS cls
              FROM requests r JOIN ips i ON i.id = r.ip_id
-             WHERE r.answer IN ('decoy:mcp:tools/call', 'decoy:mcp:resources/read'){w}{tw}
+             WHERE r.decoy_in IS NOT NULL AND r.answer IN ('decoy:mcp:tools/call', 'decoy:mcp:resources/read'){w}{tw}
              ORDER BY r.id DESC LIMIT {} OFFSET {}",
             PAGE_SIZE + 1,
             i64::from(page - 1) * PAGE_SIZE
@@ -187,7 +188,9 @@ impl Store {
 
     pub async fn llm_summary(&self, r: Range) -> Result<LlmSummary> {
         let (w, since) = r.ts_clause("r.ts");
-        let base = format!("FROM requests r WHERE r.answer LIKE 'decoy:llm:%'{w}");
+        let base = format!(
+            "FROM requests r WHERE r.decoy_in IS NOT NULL AND r.answer LIKE 'decoy:llm:%'{w}"
+        );
         let mut q = sqlx::query_as::<_, Named>(sqlx::AssertSqlSafe(format!(
             "SELECT COALESCE(json_extract(r.decoy_in, '$.api'), 'unknown') AS name, COUNT(*) AS count {base} GROUP BY 1 ORDER BY 2 DESC"
         )));
@@ -232,7 +235,7 @@ impl Store {
         let mut q = sqlx::query_as::<_, ModelRow>(sqlx::AssertSqlSafe(format!(
             "SELECT json_extract(r.decoy_in, '$.model') AS model, COALESCE(json_extract(r.decoy_in, '$.api'), '') AS api,
                     COUNT(*) AS requests, COUNT(DISTINCT r.ip_id) AS ips
-             FROM requests r WHERE r.answer LIKE 'decoy:llm:%' AND json_extract(r.decoy_in, '$.model') IS NOT NULL{w}
+             FROM requests r WHERE r.decoy_in IS NOT NULL AND r.answer LIKE 'decoy:llm:%' AND json_extract(r.decoy_in, '$.model') IS NOT NULL{w}
              GROUP BY 1, 2 ORDER BY requests DESC LIMIT 100")));
         if let Some(m) = since {
             q = q.bind(m);
@@ -255,7 +258,7 @@ impl Store {
         let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(format!(
             "SELECT r.id, r.ts, i.ip, json_extract(r.decoy_in, '$.api'), json_extract(r.decoy_in, '$.model'),
                     r.headers_json, r.body
-             FROM requests r JOIN ips i ON i.id = r.ip_id WHERE r.answer IN
+             FROM requests r JOIN ips i ON i.id = r.ip_id WHERE r.decoy_in IS NOT NULL AND r.answer IN
                ('decoy:llm:chat', 'decoy:llm:generate', 'decoy:llm:chat-completions', 'decoy:llm:completions',
                 'decoy:llm:responses', 'decoy:llm:messages', 'decoy:llm:complete'){w}
              ORDER BY r.id DESC LIMIT {} OFFSET {}",
@@ -301,7 +304,8 @@ impl Store {
 
     pub async fn decoy_counts_for_ip(&self, ip_id: i64) -> Result<(i64, i64, i64)> {
         Ok(sqlx::query_as(
-            "SELECT COALESCE(SUM(answer IN ('decoy:mcp:initialize', 'decoy:mcp:sse')), 0),
+            "SELECT COALESCE(SUM(answer = 'decoy:mcp:sse'
+                                 OR (answer = 'decoy:mcp:initialize' AND COALESCE(json_extract(decoy_in, '$.via'), '') <> 'sse')), 0),
                     COALESCE(SUM(answer = 'decoy:mcp:tools/call'), 0),
                     COALESCE(SUM(answer LIKE 'decoy:llm:%'), 0)
              FROM requests WHERE ip_id = ? AND decoy_in IS NOT NULL",
@@ -339,7 +343,7 @@ impl Store {
         ];
         let mut q = sqlx::query_as::<_, Named>(sqlx::AssertSqlSafe(format!(
             "SELECT COALESCE(json_extract(r.decoy_in, '$.tool'), '') AS name, COUNT(*) AS count FROM requests r
-             WHERE r.answer = 'decoy:mcp:tools/call'{w} GROUP BY 1")));
+             WHERE r.decoy_in IS NOT NULL AND r.answer = 'decoy:mcp:tools/call'{w} GROUP BY 1")));
         if let Some(m) = since {
             q = q.bind(m);
         }
@@ -350,7 +354,7 @@ impl Store {
         );
         let mut q = sqlx::query_as::<_, (String, i64, i64)>(sqlx::AssertSqlSafe(format!(
             "SELECT lower(json_extract(r.decoy_in, '$.model')), COUNT(*), COUNT(DISTINCT r.ip_id) FROM requests r
-             WHERE r.answer LIKE 'decoy:llm:%' AND json_extract(r.decoy_in, '$.model') IS NOT NULL{w} GROUP BY 1")));
+             WHERE r.decoy_in IS NOT NULL AND r.answer LIKE 'decoy:llm:%' AND json_extract(r.decoy_in, '$.model') IS NOT NULL{w} GROUP BY 1")));
         if let Some(m) = since {
             q = q.bind(m);
         }
@@ -633,6 +637,54 @@ mod tests {
         );
         assert_eq!(
             s.decoy_counts_for_ip(ip_id(&s, "8.8.8.8").await)
+                .await
+                .unwrap(),
+            (1, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_sse_flow_is_one_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        req(
+            &s,
+            "7.7.7.7",
+            "/sse",
+            "decoy:mcp:sse",
+            r#"{"via":"sse"}"#,
+            &[],
+            None,
+            "",
+        )
+        .await;
+        req(
+            &s,
+            "7.7.7.7",
+            "/messages",
+            "decoy:mcp:initialize",
+            r#"{"m":"initialize","via":"sse"}"#,
+            &[],
+            Some("sessionId=abc"),
+            "",
+        )
+        .await;
+        req(
+            &s,
+            "7.7.7.7",
+            "/messages",
+            "decoy:mcp:notify",
+            r#"{"m":"notifications/initialized","via":"sse"}"#,
+            &[],
+            Some("sessionId=abc"),
+            "",
+        )
+        .await;
+        let f = s.mcp_funnel(Range::All).await.unwrap();
+        assert_eq!(f.sessions, 1);
+        assert_eq!((f.sse_opened, f.sse_pushed), (1, 1));
+        assert_eq!(
+            s.decoy_counts_for_ip(ip_id(&s, "7.7.7.7").await)
                 .await
                 .unwrap(),
             (1, 0, 0)

@@ -367,8 +367,17 @@ async fn legacy_sse_pushes_answers_down_the_stream() {
     let mut sse = tokio::net::TcpStream::connect(addr).await.unwrap();
     sse.write_all(b"GET /sse HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 8.8.8.8\r\nAccept: text/event-stream\r\n\r\n").await.unwrap();
     let mut buf = vec![0u8; 4096];
-    let n = sse.read(&mut buf).await.unwrap();
-    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let mut head = String::new();
+    // Headers and the endpoint event may arrive in separate reads.
+    while !head
+        .split("data: ")
+        .nth(1)
+        .is_some_and(|r| r.contains('\n'))
+    {
+        let n = sse.read(&mut buf).await.unwrap();
+        assert!(n > 0, "stream ended early: {head}");
+        head.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
     let endpoint = head
         .split("data: ")
         .nth(1)
