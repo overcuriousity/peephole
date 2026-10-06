@@ -512,3 +512,51 @@ fn ownership_key_is_created_adopted_and_released_from_the_shell() {
     let (_, shown, _) = run(&b, &["show"], None);
     assert!(shown.contains("no owner"), "{shown}");
 }
+
+/// The credits subcommands on a fresh cluster node: nothing held, nothing
+/// earned, and the errors say what is wrong.
+#[test]
+fn credits_from_the_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("c.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "database_path = \"{d}/t.db\"\ndata_dir = \"{d}\"\n[roles]\nlistener = false\nweb = false\n\
+             [cluster]\nnode_name = \"n1\"\nlisten = \"127.0.0.1:0\"\n",
+            d = dir.path().display()
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let out = bin()
+            .arg("credits")
+            .args(args)
+            .arg(cfg.to_str().unwrap())
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    };
+    let (ok, out, err) = run(&[]);
+    assert!(ok, "{err}");
+    assert!(out.contains("balance 0.00 credits"), "{out}");
+    let (ok, out, _) = run(&["log"]);
+    assert!(ok && out.contains("nothing earned, spent or sent"), "{out}");
+    let (ok, out, _) = run(&["members"]);
+    assert!(ok && out.contains("n1") && out.contains("0.00"), "{out}");
+    let (ok, _, err) = run(&["why", "no-such-scan"]);
+    assert!(!ok && err.contains("not judged"), "{err}");
+    let (ok, _, err) = run(&["send", "n1", "1"]);
+    assert!(
+        !ok && err.contains("not a member credits can be sent to"),
+        "{err}"
+    );
+    let (ok, _, err) = run(&["send", "n1", "abc"]);
+    assert!(!ok && err.contains("amount"), "{err}");
+    let (ok, _, err) = run(&["bogus"]);
+    assert!(!ok && err.contains("usage: peephole credits"), "{err}");
+}

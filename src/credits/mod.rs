@@ -2,6 +2,7 @@
 //! Every node computes every balance for itself, from its own copy of the
 //! log; see docs/superpowers/specs/2026-10-06-lookup-credits-design.md.
 pub mod audit;
+pub mod cli;
 pub mod earn;
 pub mod entries;
 pub mod fleet;

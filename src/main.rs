@@ -7,6 +7,7 @@ usage: peephole [CONFIG]                 run the daemon (default /etc/peephole/c
        peephole check-config [CONFIG]    validate config and nmap; show the built-in rules
        peephole cluster (id|invite|invites|invite-revoke|join|members|status|agreement|block|unblock|purge|leave) …
        peephole owner (new|adopt|show|forget-key|release) …    the ownership key on this node
+       peephole credits [log|members|why|send] …             this node's credits (--help)
        peephole settings (show|set|reset) …
        peephole export [OPTIONS] [CONFIG]  the dataset as Parquet, CSV or JSON Lines (--help)
        peephole decoy render UID [CONFIG]  print a stored decoy answer again
@@ -25,6 +26,7 @@ enum Cmd {
     CheckConfig(PathBuf),
     Cluster,
     Owner,
+    Credits,
     Settings,
     Export,
     Decoy,
@@ -66,6 +68,7 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         // These parse their own arguments.
         Some("cluster") => Ok(Cmd::Cluster),
         Some("owner") => Ok(Cmd::Owner),
+        Some("credits") => Ok(Cmd::Credits),
         Some("settings") => Ok(Cmd::Settings),
         Some("export") => Ok(Cmd::Export),
         Some("decoy") => Ok(Cmd::Decoy),
@@ -110,6 +113,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Owner => {
             if let Err(e) = peephole::cluster::owner::cli::run(&args[1..], DEFAULT_CONFIG).await {
+                fail(e);
+            }
+        }
+        Cmd::Credits => {
+            if let Err(e) = peephole::credits::cli::run(&args[1..], DEFAULT_CONFIG).await {
                 fail(e);
             }
         }
@@ -185,6 +193,7 @@ mod tests {
         );
         assert_eq!(p(&["cluster", "anything", "goes"]), Ok(Cmd::Cluster));
         assert_eq!(p(&["owner", "show"]), Ok(Cmd::Owner));
+        assert_eq!(p(&["credits", "log"]), Ok(Cmd::Credits));
         assert_eq!(p(&["settings"]), Ok(Cmd::Settings));
         assert_eq!(p(&["export", "--format", "csv"]), Ok(Cmd::Export));
         assert_eq!(p(&["decoy", "render", "x"]), Ok(Cmd::Decoy));

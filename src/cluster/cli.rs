@@ -65,7 +65,7 @@ fn reject_unknown_flags(flags: &Flags, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
-async fn open(config: &str) -> Result<(Config, Arc<Node>)> {
+pub(crate) async fn open(config: &str) -> Result<(Config, Arc<Node>)> {
     let cfg = Config::load(Path::new(config))?;
     if cfg.cluster.is_none() {
         bail!("{config} has no [cluster] section");
@@ -78,7 +78,7 @@ async fn open(config: &str) -> Result<(Config, Arc<Node>)> {
 }
 
 /// Find a member by name, short fingerprint or full key.
-fn resolve(rows: &[members::MemberRow], who: &str) -> Result<NodeId> {
+pub(crate) fn resolve(rows: &[members::MemberRow], who: &str) -> Result<NodeId> {
     if let Ok(id) = NodeId::parse(who) {
         return Ok(id);
     }
