@@ -92,6 +92,8 @@ pub struct ScanOut {
     pub scanner: Option<Vec<u8>>,
     pub origin: Option<Vec<u8>>,
     pub build: String,
+    pub uid: Option<String>,
+    pub audit_of: Option<String>,
 }
 
 #[derive(sqlx::FromRow, serde::Serialize)]
@@ -256,7 +258,7 @@ impl Store {
         }
         let scans: Vec<ScanOut> = sqlx::query_as(
             "SELECT s.id, s.ip_id, s.level, s.started_at, s.finished_at, s.os_guess, s.raw_xml,
-                    j.status, j.scanner, s.origin, s.build
+                    j.status, j.scanner, s.origin, s.build, s.uid, s.audit_of
              FROM scans s LEFT JOIN scan_jobs j ON j.id = s.job_id
              WHERE s.ip_id IN (SELECT value FROM json_each(?)) ORDER BY s.id",
         )

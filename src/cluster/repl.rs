@@ -1328,7 +1328,7 @@ pub async fn rematerialize(node: &Node) -> Result<usize> {
         "SELECT origin, seq FROM repl_log
          WHERE payload IS NOT NULL AND applied != 4
            AND kind IN ('request','scan_job','job_adopt','job_status','fp_claim',
-                        'fingerprint','scan_result','ip_intel','skip_batch')
+                        'fingerprint','scan_result','scan_audit','ip_intel','skip_batch')
          ORDER BY CASE kind WHEN 'request' THEN 0 WHEN 'scan_job' THEN 1
                             WHEN 'job_adopt' THEN 2 WHEN 'job_status' THEN 3 ELSE 4 END, hlc",
     )
@@ -1405,6 +1405,7 @@ fn waits_for(r: &Record) -> Option<String> {
     match r {
         Record::JobStatus(s) => Some(s.job_uid.clone()),
         Record::ScanResult(s) => Some(s.job_uid.clone()),
+        Record::ScanAudit(a) => Some(a.scan.job_uid.clone()),
         _ => None,
     }
 }

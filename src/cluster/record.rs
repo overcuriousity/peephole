@@ -258,6 +258,16 @@ pub struct ScanResultRec {
     pub build: String,
 }
 
+/// A finished audit: a scan run again by another scanner to check a
+/// result (see `credits::audit`). Audits earn nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanAuditRec {
+    /// The uid of the audited scan.
+    pub audit_of: String,
+    /// The audit's own result; its `job_uid` is the audited scan's job.
+    pub scan: ScanResultRec,
+}
+
 /// A new version of a shared intel file, fetched by the origin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntelManifestRec {
@@ -350,6 +360,7 @@ pub enum Record {
         a: Box<WireEntry>,
         b: Box<WireEntry>,
     },
+    ScanAudit(Box<ScanAuditRec>),
 }
 
 /// Kinds whose payload is not stored in the log but rebuilt from their row
@@ -378,6 +389,7 @@ impl Record {
             Record::CreditTransfer { .. } => "credit_transfer",
             Record::LogSeal { .. } => "log_seal",
             Record::ForkProof { .. } => "fork_proof",
+            Record::ScanAudit(_) => "scan_audit",
         }
     }
 
@@ -392,6 +404,7 @@ impl Record {
             Record::ScanResult(r) => Some(r.uid.clone()),
             Record::Tombstone(r) => Some(r.uid.clone()),
             Record::SkipBatch(r) => Some(r.uid.clone()),
+            Record::ScanAudit(r) => Some(r.scan.uid.clone()),
             _ => None,
         }
     }

@@ -505,6 +505,8 @@ fn scan_json(s: &ScanOut, ports: &[crate::store::export::PortOut], opts: &Export
     });
     json!({
         "level": s.level,
+        "uid": s.uid,
+        "audit_of": s.audit_of,
         "status": s.status,
         "started_at": iso8601(&s.started_at),
         "finished_at": s.finished_at.as_deref().map(iso8601),

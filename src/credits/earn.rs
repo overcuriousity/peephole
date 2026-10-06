@@ -88,7 +88,7 @@ pub async fn judge(j: &Judge<'_>, min_age_secs: i64) -> Result<usize> {
          JOIN ips i ON i.id = s.ip_id
          JOIN repl_log l ON l.uid = s.uid AND l.origin = s.origin
          WHERE j.status = 'done' AND j.scanner IS NOT NULL AND j.origin IS NOT NULL
-           AND s.origin = j.scanner AND s.ip_id = j.ip_id AND s.level = j.level
+           AND s.origin = j.scanner AND s.audit_of IS NULL AND s.ip_id = j.ip_id AND s.level = j.level
            AND l.received_at <= datetime('now', ?)
            AND NOT EXISTS (SELECT 1 FROM credit_scans c WHERE c.job_uid = j.uid)
          ORDER BY s.hlc, s.uid LIMIT ?",
@@ -620,6 +620,25 @@ mod tests {
             finished_scan(&store, "203.0.113.8", 2, "nmap -A -T5 -oX - 203.0.113.8", 2).await;
         let built_in = finished_scan(&store, "203.0.113.8", 1, &line(1), 3).await;
 
+        // An audit of the last scan, by another node: not a payable scan.
+        sqlx::query(
+            "INSERT INTO scans (uid, origin, hlc, job_id, job_uid, ip_id, level, started_at, audit_of)
+             SELECT 'audit-1', ?, hlc - 1, job_id, job_uid, ip_id, level, started_at, uid
+             FROM scans WHERE uid = ?",
+        )
+        .bind(&id(1).0[..])
+        .bind(&built_in)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO repl_log (origin, seq, hlc, kind, uid, applied, received_at)
+             VALUES (?, 99, 99, 'scan_audit', 'audit-1', 1, datetime('now', '-5 minutes'))",
+        )
+        .bind(&id(1).0[..])
+        .execute(&store.pool)
+        .await
+        .unwrap();
         let origins = guard::Origins::Any;
         let j = Judge {
             pool: &store.pool,

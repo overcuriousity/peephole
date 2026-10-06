@@ -518,11 +518,12 @@ impl Arbiter {
         }
         let _g = self.assign.lock().await;
         for (uid, scanner) in expired {
-            let has_result: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM scans WHERE job_uid = ?")
-                    .bind(&uid)
-                    .fetch_one(&self.node.store.pool)
-                    .await?;
+            let has_result: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM scans WHERE job_uid = ? AND audit_of IS NULL",
+            )
+            .bind(&uid)
+            .fetch_one(&self.node.store.pool)
+            .await?;
             if has_result > 0 {
                 self.set_state(&uid, "done", None, Some(now_ts())).await?;
             } else {

@@ -809,6 +809,48 @@ impl Recorder {
         .await
     }
 
+    /// Publish an audit: this node's own scan of `ip`, run to check the
+    /// scan `audit_of` of another node (whose job is `job_uid`).
+    pub async fn record_scan_audit(
+        &self,
+        audit_of: &str,
+        job_uid: &str,
+        ip: &str,
+        level: i64,
+        started_at: &str,
+        res: &ScanResult,
+    ) -> Result<()> {
+        self.write(vec![Record::ScanAudit(Box::new(
+            crate::cluster::record::ScanAuditRec {
+                audit_of: audit_of.to_string(),
+                scan: ScanResultRec {
+                    build: crate::COMMIT.into(),
+                    uid: self.uid(),
+                    job_uid: job_uid.to_string(),
+                    ip: ip.to_string(),
+                    level,
+                    started_at: started_at.to_string(),
+                    finished_at: Some(now_ts()),
+                    os_guess: res.os_guess.clone(),
+                    raw_xml: Some(zstd::encode_all(res.raw_xml.as_slice(), 3)?),
+                    ports: res
+                        .ports
+                        .iter()
+                        .map(|p| PortRec {
+                            port: p.port as i64,
+                            proto: p.proto.clone(),
+                            state: p.state.clone(),
+                            service: p.service.clone(),
+                            product: p.product.clone(),
+                            version: p.version.clone(),
+                        })
+                        .collect(),
+                },
+            },
+        ))])
+        .await
+    }
+
     /// Requeue failed jobs on every arbiter: ours directly, the others'
     /// by asking them. Returns how many were requeued (as far as known).
     pub async fn requeue_failed_everywhere(&self, days: i64) -> Result<u64> {

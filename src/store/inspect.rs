@@ -18,6 +18,10 @@ pub struct ScanSummary {
     pub open_ports: i64,
     /// Distributed mode: the node that ran the scan (admin only).
     pub node: Option<String>,
+    /// The uid of the scan this one audits; None for an ordinary scan.
+    pub audit_of: Option<String>,
+    /// How the audit compares with the scan it checks, once compared here.
+    pub audit_result: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -101,6 +105,7 @@ pub struct RequestDetail {
 
 const SCAN_SELECT: &str =
     "SELECT s.id, s.ip_id, i.ip, s.level, s.started_at, s.finished_at, s.os_guess,
+            s.audit_of, s.audit_result,
             (SELECT COUNT(*) FROM ports p WHERE p.scan_id = s.id AND p.state = 'open') AS open_ports,
             (SELECT name FROM members m WHERE m.id = s.origin) AS node
      FROM scans s JOIN ips i ON s.ip_id = i.id";
@@ -225,7 +230,7 @@ impl Store {
                     (SELECT COUNT(*) FROM ports p
                       WHERE s.id IS NOT NULL AND p.scan_id = s.id AND p.state = 'open') AS open_ports
              FROM scan_jobs j JOIN ips i ON j.ip_id = i.id
-             LEFT JOIN scans s ON s.id = (SELECT MAX(x.id) FROM scans x WHERE x.job_id = j.id)
+             LEFT JOIN scans s ON s.id = (SELECT MAX(x.id) FROM scans x WHERE x.job_id = j.id AND x.audit_of IS NULL)
              WHERE j.status IN ('done', 'failed', 'superseded', 'refused')",
         );
         if status.is_some() {
