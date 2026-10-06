@@ -861,8 +861,7 @@ Unit:
 - Load factor: 0.5 at utilization 0, 1 at 0.5, 2 at 1; no capacity counts
   as saturated; blocked scanners left out.
 - Price formula: the example above; no earnings gives the floor; no
-  announced capacity gives no `unit` (what is served, e.g. GeoLite2
-  alone, is then priced from the floor); blocked and forked members'
+  announced capacity gives no price; blocked and forked members'
   announcements left out; the weights; the clamp at both ends.
 - Scan capacity: limited by workers, limited by scans per hour, fewer
   than 5 jobs falls back to the cluster's mean, none to the default.
