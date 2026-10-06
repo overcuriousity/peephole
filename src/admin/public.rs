@@ -398,6 +398,7 @@ fn request_pairs(f: &RequestFilter) -> Vec<(&'static str, Option<String>)> {
         ("method", f.method.clone()),
         ("transport", f.transport.clone()),
         ("answer", f.answer.clone()),
+        ("session", f.session.clone()),
     ]
 }
 
@@ -460,6 +461,7 @@ fn filter_label(k: &str) -> &'static str {
         "method" => "Method",
         "transport" => "Transport",
         "answer" => "Answer",
+        "session" => "MCP session",
         "tor" => "Tor exits",
         "min_abuse" => "Min abuse score",
         "tag" => "Intel tag",
@@ -545,7 +547,7 @@ fn request_shortcuts(f: &RequestFilter, now: chrono::NaiveDateTime) -> Vec<Short
             .format("%Y-%m-%dT%H:%M")
             .to_string()
     };
-    let presets: [(&str, &str, &str, String); 10] = [
+    let presets: [(&str, &str, &str, String); 12] = [
         ("Last hour", "Received in the last hour", "from", since(1)),
         (
             "Last 24 h",
@@ -585,6 +587,18 @@ fn request_shortcuts(f: &RequestFilter, now: chrono::NaiveDateTime) -> Vec<Short
             "credential-attack".into(),
         ),
         ("POST", "Requests with method POST", "method", "POST".into()),
+        (
+            "MCP decoy",
+            "Answered by the MCP decoy",
+            "answer",
+            "decoy:mcp".into(),
+        ),
+        (
+            "LLM decoy",
+            "Answered by the LLM gateway decoy",
+            "answer",
+            "decoy:llm".into(),
+        ),
         (
             "No user agent",
             "Requests without a User-Agent header",
@@ -945,6 +959,8 @@ pub struct IpAdminData {
     /// Other IPs that used canaries harvested here, and other IPs whose
     /// canaries this IP used.
     pub canary_links: (i64, i64),
+    /// MCP sessions, MCP tool calls and LLM calls the decoys saw from it.
+    pub decoys: (i64, i64, i64),
 }
 
 impl IpAdminData {
@@ -1036,6 +1052,7 @@ async fn ip_page(
             skipped: state.store.skipped_for_ip(ip.id).await?,
             host_keys: state.store.host_keys_for_ip(ip.id).await?,
             canary_links: state.store.canary_links_for_ip(ip.id).await?,
+            decoys: state.store.decoy_counts_for_ip(ip.id).await?,
         })
     } else {
         None
@@ -1076,6 +1093,13 @@ mod tests {
                 .unwrap()
         };
         let none = RequestFilter::default();
+        assert_eq!(get(&none, "MCP decoy").href, "/requests?answer=decoy%3Amcp");
+        assert_eq!(get(&none, "LLM decoy").href, "/requests?answer=decoy%3Allm");
+        let s = request_qs(&RequestFilter {
+            session: Some("ab-cd".into()),
+            ..Default::default()
+        });
+        assert!(s.contains("session=ab-cd"));
         let t = get(&none, "Tarpitted");
         assert_eq!(
             (t.href.as_str(), t.active),
@@ -1445,6 +1469,29 @@ show_labels = {show_labels}
         let admin = wall_stats(&st, true, Range::All).await.unwrap();
         assert_eq!(admin.total_requests, 0);
         assert!(admin.recent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_decoys_page_needs_a_login_and_renders_each_tab() {
+        let (st, _dir) = state(true).await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st);
+        let (status, _) = get_with(&app, "/admin/decoys", None).await;
+        assert_ne!(status, 200, "admin only");
+        for (tab, heading) in [
+            ("mcp", "Sessions"),
+            ("llm", "Models requested"),
+            ("web", "Web decoys"),
+        ] {
+            let (status, body) =
+                get_with(&app, &format!("/admin/decoys?tab={tab}"), Some(&cookie)).await;
+            assert_eq!(status, 200, "{tab}");
+            assert!(body.contains(heading), "{tab}: {body}");
+            assert!(
+                body.contains(r#"href="/admin/decoys" aria-current="true""#),
+                "nav marks Decoys"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,70 @@
+{% extends "layout.html" %}
+{% block title %}peephole — decoys{% endblock %}
+{% block content %}
+{# The range picker links to /admin/decoys?range=…, so switching range returns to the MCP tab. #}
+{% let sub = "decoys" %}{% include "_admin_nav.html" %}
+{% let subtab = tab.to_string() %}{% let tabs = crate::admin::views::DECOYS_TABS %}{% let tabs_label = "Decoy kinds" %}{% include "_subtabs.html" %}
+<div class="page-head"><div><h1>Decoys</h1><p class="muted">What the fake MCP server and LLM gateway drew out. Nothing they ask for is ever executed.</p></div>{% include "_range.html" %}</div>
+<div class="stack">
+{% if tab == "mcp" %}
+<section class="card">
+  <div class="card-head"><h2>Funnel</h2><span class="muted">per session</span></div>
+  <div class="tiles">
+    <div class="tile"><span class="label">Sessions started</span><div class="value"><a href="/requests?answer=decoy%3Amcp%3Ainitialize">{{ funnel.sessions }}</a></div></div>
+    <div class="tile"><span class="label">Listed tools</span><div class="value"><a href="/requests?answer=decoy%3Amcp%3Atools%2Flist">{{ funnel.listed }}</a></div></div>
+    <div class="tile"><span class="label">Called a tool</span><div class="value"><a href="/requests?answer=decoy%3Amcp%3Atools%2Fcall">{{ funnel.called }}</a></div></div>
+    <div class="tile"><span class="label">Credentials reused</span><div class="value"><a href="/admin/links/canaries">{{ funnel.reused }}</a></div></div>
+  </div>
+  <p class="muted">Legacy SSE: {{ funnel.sse_opened }} streams opened · {{ funnel.sse_pushed }} messages pushed · <a href="/requests?answer=decoy%3Amcp%3Ano-session">{{ funnel.sse_lost }} for unknown sessions</a></p>
+</section>
+<section class="card">
+  <h2>Sessions</h2>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Session</th><th>IPs</th><th>First seen</th><th>Last seen</th><th class="num">Steps</th><th>Tools</th></tr></thead><tbody>
+  {% for (short, s) in sessions %}<tr><td class="mono"><a href="/requests?session={{ s.id|urlencode }}">{{ short }}</a></td><td class="mono">{{ s.ips }}</td><td class="mono">{{ s.first }}</td><td class="mono">{{ s.last }}</td><td class="num">{{ s.steps }}</td><td class="mono">{{ s.tools }}</td></tr>{% endfor %}
+  {% if sessions.is_empty() %}<tr><td colspan="6" class="empty">No MCP session in this range.</td></tr>{% endif %}
+  </tbody></table></div>
+</section>
+{% if let Some(c) = calls %}<section class="card">
+  <div class="card-head"><h2>Tool calls</h2>
+    <form class="filters" method="get" action="/admin/decoys"><input type="hidden" name="tab" value="mcp"><input type="hidden" name="range" value="{{ range.key() }}">
+      <label>Tool <select name="tool"><option value="">any</option>{% for t in ["read_file", "list_directory", "run_command", "query_db", "fetch_url"] %}<option{% if tool.as_deref() == Some(t) %} selected{% endif %}>{{ t }}</option>{% endfor %}</select></label><button>Filter</button></form></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>Tool</th><th>Argument</th><th>Answer</th></tr></thead><tbody>
+  {% for r in c.items %}<tr><td class="mono"><a href="/admin/requests/{{ r.id }}">{{ r.ts }}</a></td><td class="mono"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td><td class="mono">{{ r.tool }}</td><td class="mono">{{ r.arg }}</td><td class="mono">{{ r.cls }}</td></tr>{% endfor %}
+  {% if c.items.is_empty() %}<tr><td colspan="5" class="empty">No tool call in this range.</td></tr>{% endif %}
+  </tbody></table></div>
+  {% let page = c %}{% include "_pagination.html" %}
+</section>{% endif %}
+{% else if tab == "llm" %}
+<section class="card">
+  <h2>By API</h2>
+  <ul class="shares">{% for n in llm.by_api %}<li><span class="mono">{{ n.name }}</span><span class="num">{{ crate::admin::views::thousands(n.count) }}</span></li>{% endfor %}</ul>
+  <div class="tiles">
+    <div class="tile"><span class="label">Listed models</span><div class="value">{{ llm.listings }}</div></div>
+    <div class="tile"><span class="label">Chat calls</span><div class="value">{{ llm.calls }}</div><div class="hint">{{ llm.listed }} for a model we list · {{ llm.unlisted }} for one we do not</div></div>
+    <div class="tile"><span class="label">Pulls</span><div class="value"><a href="/requests?answer=decoy%3Allm%3Apull">{{ llm.pulls }}</a></div></div>
+  </div>
+</section>
+<section class="card">
+  <h2>Models requested</h2>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Model</th><th>API</th><th class="num">Requests</th><th class="num">IPs</th><th>Listed</th></tr></thead><tbody>
+  {% for m in models %}<tr><td class="mono">{{ m.model }}</td><td>{{ m.api }}</td><td class="num">{{ m.requests }}</td><td class="num">{{ m.ips }}</td><td>{% if crate::trap::decoy::llm::listed(m.model.as_str()) %}yes{% else %}no{% endif %}</td></tr>{% endfor %}
+  {% if models.is_empty() %}<tr><td colspan="5" class="empty">No model asked for in this range.</td></tr>{% endif %}
+  </tbody></table></div>
+</section>
+{% if let Some(pr) = prompts %}<section class="card">
+  <h2>Prompts</h2>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>API</th><th>Model</th><th>Last user message</th></tr></thead><tbody>
+  {% for r in pr.items %}<tr><td class="mono"><a href="/admin/requests/{{ r.id }}">{{ r.ts }}</a></td><td class="mono"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td><td>{{ r.api }}</td><td class="mono">{{ r.model }}</td><td>{{ r.prompt }}</td></tr>{% endfor %}
+  {% if pr.items.is_empty() %}<tr><td colspan="5" class="empty">No prompt in this range.</td></tr>{% endif %}
+  </tbody></table></div>
+  {% let page = pr %}{% include "_pagination.html" %}
+</section>{% endif %}
+{% else %}
+<section class="card">
+  <h2>Web decoys</h2>
+  <ul class="shares">{% for n in web %}<li><a class="mono" href="/requests?answer={{ n.name|urlencode }}">{{ n.name }}</a><span class="num">{{ crate::admin::views::thousands(n.count) }}</span></li>{% endfor %}</ul>
+  {% if web.is_empty() %}<p class="empty">No web decoy served in this range.</p>{% endif %}
+</section>
+{% endif %}
+</div>
+{% endblock %}

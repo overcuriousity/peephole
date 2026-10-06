@@ -79,6 +79,7 @@
     <p><a href="/admin/links/canaries?ip={{ ov.ip.ip }}">Show the reuses</a></p>
   </section>
   {% endif %}
+  {% if adm.decoys.0 > 0 || adm.decoys.1 > 0 || adm.decoys.2 > 0 %}<p>MCP sessions {{ adm.decoys.0 }} · tool calls {{ adm.decoys.1 }} · LLM calls {{ adm.decoys.2 }} · <a href="/requests?ip={{ ov.ip.ip }}&answer=decoy">decoy requests</a></p>{% endif %}
   {% endif %}
 
   <section class="card">
