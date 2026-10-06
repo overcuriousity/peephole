@@ -184,8 +184,10 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         (show(total), rows)
     });
 
+    // The ledger walks 8 days (a lot's life and one): the page says 7.
+    let week = book.now_ms.saturating_sub(7 * credits::DAY_MS) << 16;
     let mut earned = vec![];
-    for p in book.paid.iter().rev() {
+    for p in book.paid.iter().rev().filter(|p| p.scan.hlc >= week) {
         for (who, role, mc, note) in [
             (p.scan.scanner, "scanner", p.scanner_mc, &p.scanner_note),
             (p.scan.trap, "trap", p.trap_mc, &p.trap_note),
@@ -211,13 +213,11 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
     let waiting: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scans s JOIN scan_jobs j ON j.uid = s.job_uid
          WHERE j.status = 'done' AND s.origin = j.scanner AND s.audit_of IS NULL
-           AND (j.scanner = ?1 OR j.origin = ?1) AND s.hlc >= ?2
+           AND (j.scanner = ?1 OR j.origin = ?1) AND MAX(s.hlc, COALESCE(j.hlc, 0)) >= ?2
            AND NOT EXISTS (SELECT 1 FROM credit_scans c WHERE c.job_uid = j.uid)",
     )
     .bind(&me.0[..])
-    .bind(crate::cluster::hlc::to_db(credits::window_start(
-        book.now_ms,
-    )))
+    .bind(crate::cluster::hlc::to_db(week))
     .fetch_one(&st.store.read)
     .await?;
 
