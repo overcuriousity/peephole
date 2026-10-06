@@ -11,6 +11,19 @@ use std::sync::{Arc, RwLock};
 
 /// Upper bound for workers settable from the admin UI (nmap -sS/-O is heavy).
 pub const MAX_WORKERS: usize = 16;
+/// Fewest workers a scanning node runs: one may run a level-4 scan while
+/// the other keeps the shorter levels moving (0 still pauses).
+pub const MIN_WORKERS: usize = 2;
+
+/// Level-4 scans one scanner runs at once: `share` of its workers, rounded
+/// down, but at least one while it scans at all.
+pub fn level4_cap(workers: usize, share: f64) -> usize {
+    if workers == 0 {
+        return 0;
+    }
+    ((workers as f64 * share).floor() as usize).clamp(1, workers)
+}
+
 /// Upper bound for the hourly start cap settable from the admin UI.
 pub const MAX_PER_HOUR: i64 = 3600;
 /// Assumed scan duration until enough scans have finished to measure it.
@@ -85,8 +98,10 @@ impl Pace {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.max_workers > MAX_WORKERS {
-            return Err(format!("workers must be between 0 and {MAX_WORKERS}"));
+        if self.max_workers != 0 && !(MIN_WORKERS..=MAX_WORKERS).contains(&self.max_workers) {
+            return Err(format!(
+                "workers must be 0 or between {MIN_WORKERS} and {MAX_WORKERS}"
+            ));
         }
         if !(0..=MAX_PER_HOUR).contains(&self.max_scans_per_hour) {
             return Err(format!(
@@ -138,6 +153,10 @@ impl SharedPace {
             .and_then(|v| v.parse().ok())
         {
             p.max_workers = v;
+        }
+        // Saved before the minimum existed (e.g. an applied recommendation).
+        if p.max_workers == 1 {
+            p.max_workers = MIN_WORKERS;
         }
         if let Some(v) = store
             .setting_get(KEY_PER_HOUR)
@@ -298,7 +317,7 @@ pub fn others(node: &crate::cluster::Node, scan_secs: f64) -> Others {
 }
 
 /// Size the pace to absorb arrivals with headroom and drain the backlog
-/// within [`DRAIN_HOURS`], never below one scan per hour and one worker.
+/// within [`DRAIN_HOURS`], never below one scan per hour and [`MIN_WORKERS`] workers.
 /// When more than [`TIMEOUT_SHARE`] of recent scans hit the limit, the
 /// timeout is raised by half (rounded up to a minute) and the worker count
 /// is sized for scans that may take that long. In a cluster, capacity
@@ -343,7 +362,7 @@ pub fn recommend(m: &QueueMetrics, current: Pace, others: Others) -> Recommendat
     // gets the same share whatever the others run at now, so applying the
     // recommendations anywhere, in any order, settles at once.
     let target = (target / (others.scanners + 1) as f64).ceil().max(1.0);
-    let workers = ((target * scan_secs / 3600.0).ceil() as usize).clamp(1, MAX_WORKERS);
+    let workers = ((target * scan_secs / 3600.0).ceil() as usize).clamp(MIN_WORKERS, MAX_WORKERS);
     let per_hour = (target as i64).clamp(1, MAX_PER_HOUR);
     Recommendation {
         arrival_per_hour: arrival,
@@ -409,7 +428,7 @@ mod tests {
         // target 10 × 1.25 = 12.5 → 13, over two scanners → 7 each,
         // whatever the other one runs at now.
         assert_eq!(r.pace.max_scans_per_hour, 7);
-        assert_eq!(r.pace.max_workers, 1);
+        assert_eq!(r.pace.max_workers, MIN_WORKERS);
         let o = Others {
             capacity_per_hour: 5.0,
             scanners: 1,
@@ -522,7 +541,7 @@ mod tests {
         assert_eq!(
             r.pace,
             Pace {
-                max_workers: 1,
+                max_workers: MIN_WORKERS,
                 max_scans_per_hour: 1,
                 timeout_secs: 900,
             }
@@ -594,5 +613,44 @@ mod tests {
             .interval(),
             None
         );
+    }
+
+    #[test]
+    fn one_worker_is_not_a_valid_pace() {
+        let one = Pace { max_workers: 1, ..P };
+        assert!(one.validate().unwrap_err().contains("0 or between 2"));
+        assert!(Pace { max_workers: 0, ..P }.validate().is_ok(), "0 pauses");
+        assert!(Pace { max_workers: 2, ..P }.validate().is_ok());
+    }
+
+    #[test]
+    fn recommendations_never_go_below_two_workers() {
+        let r = recommend(&m(0, 0, None), P, Others::default());
+        assert_eq!(r.pace.max_workers, MIN_WORKERS);
+    }
+
+    #[test]
+    fn level4_cap_is_half_the_workers_and_at_least_one() {
+        assert_eq!(level4_cap(2, 0.5), 1);
+        assert_eq!(level4_cap(3, 0.5), 1);
+        assert_eq!(level4_cap(4, 0.5), 2);
+        assert_eq!(level4_cap(16, 0.5), 8);
+        assert_eq!(level4_cap(2, 0.1), 1, "never 0 while scanning");
+        assert_eq!(level4_cap(2, 1.0), 2);
+        assert_eq!(level4_cap(0, 0.5), 0, "paused");
+    }
+
+    /// Review focus 1: a stored 1 from before the minimum is raised to 2;
+    /// the other saved values survive.
+    #[tokio::test]
+    async fn a_stored_single_worker_is_raised_not_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        store.setting_set(KEY_WORKERS, "1").await.unwrap();
+        store.setting_set(KEY_PER_HOUR, "11").await.unwrap();
+        let c = crate::config::ScanConfig::default();
+        let p = SharedPace::load(&store, &c).await.unwrap().get();
+        assert_eq!(p.max_workers, 2);
+        assert_eq!(p.max_scans_per_hour, 11);
     }
 }
