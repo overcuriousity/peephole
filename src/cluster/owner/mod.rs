@@ -203,6 +203,37 @@ async fn del(conn: &mut sqlx::SqliteConnection, key: &str) -> Result<bool> {
         > 0)
 }
 
+/// Whether `key` holds `value` right now, inside the caller's transaction.
+async fn holds(conn: &mut sqlx::SqliteConnection, key: &str, value: &[u8]) -> Result<bool> {
+    let v: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(key)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(v.as_deref() == Some(data_encoding::BASE64URL_NOPAD.encode(value).as_str()))
+}
+
+/// A rotation waits on its siblings for seconds, and the local admin may
+/// release, adopt or forget the key meanwhile (from the CLI, another
+/// process). Its writes go ahead only while this node is still owned by
+/// `owner` with its seed kept here, and `other` (the key the rotation
+/// moves to, or the one it moves from) still holds its seed.
+async fn still_rotating(
+    conn: &mut sqlx::SqliteConnection,
+    owner: &OwnerKey,
+    (slot, other): (&str, &OwnerKey),
+) -> Result<()> {
+    let same = holds(conn, KEY_ID, &owner.id.0).await?
+        && holds(conn, KEY_SEED, &owner.seed()).await?
+        && holds(conn, slot, &other.seed()).await?;
+    if !same {
+        bail!(
+            "the owner or the key kept here changed while the rotation waited for the other \
+             nodes; nothing was changed on this node"
+        );
+    }
+    Ok(())
+}
+
 /// Empty the write-ahead log into the database file (best effort), so a key
 /// that was just deleted or replaced is not left in older page images. The
 /// file itself is covered by `secure_delete` (see `Store::connect`), which
@@ -368,6 +399,7 @@ pub(crate) async fn switch_key(
 ) -> Result<()> {
     let b64 = |b: &[u8]| data_encoding::BASE64URL_NOPAD.encode(b);
     let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    still_rotating(&mut tx, old, (KEY_NEXT_SEED, new)).await?;
     put(&mut tx, KEY_ID, &b64(&new.id.0)).await?;
     put(&mut tx, KEY_CERT, &b64(&new.certify(&me))).await?;
     put(&mut tx, KEY_SEED, &b64(&new.seed())).await?;
@@ -393,6 +425,52 @@ pub(crate) async fn switch_key(
     }
     tx.commit().await?;
     scrub(store).await;
+    Ok(())
+}
+
+/// The bookkeeping after a retry, all or nothing: the siblings that
+/// `moved` are siblings under `new` again, the others keep waiting with
+/// the reason; when none is left, `old` is deleted.
+pub(crate) async fn settle_retry(
+    store: &Store,
+    new: &OwnerKey,
+    old: &OwnerKey,
+    moved: &[NodeId],
+    failed: &[(NodeId, String)],
+) -> Result<()> {
+    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    still_rotating(&mut tx, new, (KEY_OLD_SEED, old)).await?;
+    for m in moved {
+        sqlx::query("DELETE FROM reown_pending WHERE node = ?")
+            .bind(&m.0[..])
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO siblings (node, cert, seen_at) VALUES (?, ?, datetime('now'))
+             ON CONFLICT(node) DO UPDATE SET cert = excluded.cert, seen_at = excluded.seen_at",
+        )
+        .bind(&m.0[..])
+        .bind(new.certify(m))
+        .execute(&mut *tx)
+        .await?;
+    }
+    for (p, why) in failed {
+        sqlx::query("UPDATE reown_pending SET why = ? WHERE node = ?")
+            .bind(why)
+            .bind(&p.0[..])
+            .execute(&mut *tx)
+            .await?;
+    }
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reown_pending")
+        .fetch_one(&mut *tx)
+        .await?;
+    if left == 0 {
+        del(&mut tx, KEY_OLD_SEED).await?;
+    }
+    tx.commit().await?;
+    if left == 0 {
+        scrub(store).await;
+    }
     Ok(())
 }
 
@@ -668,5 +746,122 @@ mod tests {
         assert!(holds(), "kept: it is in the file");
         assert!(forget_key(&store).await.unwrap());
         assert!(!holds(), "forgotten: no copy left");
+    }
+
+    /// A rotation waits on its siblings before it switches. A release,
+    /// adoption or forgotten key in the meantime (the CLI is another
+    /// process) is not undone by that last step.
+    #[tokio::test]
+    async fn a_rotation_does_not_undo_what_the_local_admin_did_meanwhile() {
+        let (store, _dir) = store().await;
+        let me = Identity::generate().unwrap().id;
+        let sib = Identity::generate().unwrap().id;
+        let start = || async {
+            let old = create(&store, me).await.unwrap();
+            let new = OwnerKey::generate().unwrap();
+            store_next(&store, &new).await.unwrap();
+            (old, new)
+        };
+
+        let (old, new) = start().await;
+        release(&store).await.unwrap();
+        assert!(
+            switch_key(&store, me, &new, &old, &[sib], &[])
+                .await
+                .is_err()
+        );
+        assert!(load(&store, me).await.unwrap().is_none(), "still released");
+
+        let (old, new) = start().await;
+        let other = OwnerKey::generate().unwrap();
+        adopt(&store, me, &other, false).await.unwrap();
+        assert!(
+            switch_key(&store, me, &new, &old, &[sib], &[])
+                .await
+                .is_err()
+        );
+        assert_eq!(load(&store, me).await.unwrap().unwrap().id, other.id);
+        release(&store).await.unwrap();
+
+        let (old, new) = start().await;
+        forget_key(&store).await.unwrap();
+        assert!(
+            switch_key(&store, me, &new, &old, &[sib], &[])
+                .await
+                .is_err()
+        );
+        let o = load(&store, me).await.unwrap().unwrap();
+        assert_eq!(o.id, old.id);
+        assert!(!o.managing(), "the key stays forgotten");
+        release(&store).await.unwrap();
+
+        // Left alone, it switches.
+        let (old, new) = start().await;
+        switch_key(
+            &store,
+            me,
+            &new,
+            &old,
+            &[sib],
+            &[(Identity::generate().unwrap().id, "x".into())],
+        )
+        .await
+        .unwrap();
+        let o = load(&store, me).await.unwrap().unwrap();
+        assert_eq!(o.id, new.id);
+        assert!(o.managing());
+        assert!(!rotation_unfinished(&store).await.unwrap());
+
+        // The retry's bookkeeping is held to the same: once the key is
+        // forgotten, nothing is written.
+        forget_key(&store).await.unwrap();
+        store
+            .setting_set(
+                KEY_OLD_SEED,
+                &data_encoding::BASE64URL_NOPAD.encode(&old.seed()),
+            )
+            .await
+            .unwrap();
+        assert!(settle_retry(&store, &new, &old, &[sib], &[]).await.is_err());
+        adopt(&store, me, &new, true).await.unwrap();
+        store
+            .setting_set(
+                KEY_OLD_SEED,
+                &data_encoding::BASE64URL_NOPAD.encode(&old.seed()),
+            )
+            .await
+            .unwrap();
+        let waiting = Identity::generate().unwrap().id;
+        sqlx::query("INSERT INTO reown_pending (node, why) VALUES (?, 'x'), (?, 'y')")
+            .bind(&sib.0[..])
+            .bind(&waiting.0[..])
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        settle_retry(
+            &store,
+            &new,
+            &old,
+            &[sib],
+            &[(waiting, "still down".into())],
+        )
+        .await
+        .unwrap();
+        assert!(
+            store.setting_get(KEY_OLD_SEED).await.unwrap().is_some(),
+            "one left"
+        );
+        settle_retry(&store, &new, &old, &[waiting], &[])
+            .await
+            .unwrap();
+        assert!(
+            store.setting_get(KEY_OLD_SEED).await.unwrap().is_none(),
+            "none left"
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM siblings")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
     }
 }

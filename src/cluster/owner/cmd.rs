@@ -804,30 +804,15 @@ pub async fn retry(node: &Arc<Node>) -> Result<Vec<(NodeId, Result<(), String>)>
     let waiting = pending(&node.store).await?;
     let results =
         futures::future::join_all(waiting.iter().map(|p| move_one(node, &old, &new, *p))).await;
-    let mut out = vec![];
-    for (p, r) in waiting.into_iter().zip(results) {
-        match &r {
-            Ok(()) => {
-                sqlx::query("DELETE FROM reown_pending WHERE node = ?")
-                    .bind(&p.0[..])
-                    .execute(&node.store.pool)
-                    .await?;
-                super::fleet::remember(&node.store, &p, &new.certify(&p)).await?;
-            }
-            Err(why) => {
-                sqlx::query("UPDATE reown_pending SET why = ? WHERE node = ?")
-                    .bind(why)
-                    .bind(&p.0[..])
-                    .execute(&node.store.pool)
-                    .await?;
-            }
+    let (mut moved, mut failed) = (vec![], vec![]);
+    for (p, r) in waiting.iter().zip(&results) {
+        match r {
+            Ok(()) => moved.push(*p),
+            Err(why) => failed.push((*p, why.clone())),
         }
-        out.push((p, r));
     }
-    if pending(&node.store).await?.is_empty() {
-        discard(&node.store).await?;
-    }
-    Ok(out)
+    super::settle_retry(&node.store, &new, &old, &moved, &failed).await?;
+    Ok(waiting.into_iter().zip(results).collect())
 }
 
 /// Give up on the siblings still on the previous key: delete it.
