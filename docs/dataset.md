@@ -156,7 +156,9 @@ source's SSH host keys, SSH algorithm lists and TLS certificates
 (`ssh-hostkey`, `ssh2-enum-algos`, `ssl-cert`).
 `uid` is the scan's identifier in the cluster. `audit_of` is set when the
 scan is an audit: the `uid` of the scan it checks. An audit is a scan run
-again by another scanner, not a counter-scan of its own.
+again by another scanner, not a counter-scan of its own; its `node` and
+`scanner` are the auditing node, and its `status` is its own (`done` once
+it finished), not that of the job it checks.
 
 **`fingerprints`**: browser fingerprints the trap page collected from this
 request (`request` rows only, usually empty: scanners rarely run

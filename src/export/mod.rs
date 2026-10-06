@@ -1342,6 +1342,64 @@ mod tests {
         assert!(COLUMNS.contains(&"decoy_v") && COLUMNS.contains(&"canary_used_from"));
     }
 
+    /// An audit is exported as the auditor's scan, not as a second scan by
+    /// the scanner it checks.
+    #[tokio::test]
+    async fn an_audit_names_its_auditor_as_scanner() {
+        let (s, _d) = rich().await;
+        let (scanner, auditor) = (vec![1u8; 32], vec![2u8; 32]);
+        sqlx::query("UPDATE scan_jobs SET scanner = ?")
+            .bind(&scanner)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE scans SET origin = ?, uid = 'orig'")
+            .bind(&scanner)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO scans (uid, origin, job_id, job_uid, ip_id, level, started_at,
+                                finished_at, audit_of)
+             SELECT 'aud', ?, job_id, job_uid, ip_id, level, started_at, finished_at, 'orig'
+             FROM scans WHERE uid = 'orig'",
+        )
+        .bind(&auditor)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let names = [
+            (scanner, "carol".to_string()),
+            (auditor, "dave".to_string()),
+        ];
+        let opts = ExportOptions {
+            names: names.into_iter().collect(),
+            ..Default::default()
+        };
+        let out: Vec<axum::body::Bytes> = {
+            use futures::TryStreamExt;
+            stream_requests(s.clone(), ExportFilter::default(), Format::Jsonl, opts)
+                .try_collect()
+                .await
+                .unwrap()
+        };
+        let out = text(&out);
+        let r: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        let scans = r["scans"].as_array().unwrap();
+        let orig = scans.iter().find(|x| x["uid"] == "orig").unwrap();
+        let aud = scans.iter().find(|x| x["uid"] == "aud").unwrap();
+        assert_eq!(
+            (orig["node"].as_str(), orig["scanner"].as_str()),
+            (Some("carol"), Some("carol"))
+        );
+        assert_eq!(
+            (aud["node"].as_str(), aud["scanner"].as_str()),
+            (Some("dave"), Some("dave"))
+        );
+        assert_eq!(aud["audit_of"], "orig");
+        assert_eq!(aud["status"], "done");
+    }
+
     #[tokio::test]
     async fn the_export_carries_every_field_and_both_kinds() {
         let (s, _d) = rich().await;
