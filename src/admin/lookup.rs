@@ -3,7 +3,7 @@
 //! a cluster). See [`crate::intel::lookup`] and [`crate::credits::pay`].
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
-use crate::admin::error::{AppResult, render};
+use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::public::{IntelCard, intel_cards};
 use crate::admin::views::Chrome;
 use crate::store::inspect::IpIntelRow;
@@ -67,16 +67,24 @@ pub struct Offer {
     pub total: String,
 }
 
-async fn offer(state: &AdminState) -> anyhow::Result<Offer> {
+/// The offer box is information only: when the balance cannot be read, it
+/// is left out and the page (and an answer already paid for) still shows.
+async fn offer(state: &AdminState) -> Offer {
     let Some(node) = state.recorder.node() else {
-        return Ok(Offer::default());
+        return Offer::default();
     };
-    let book = crate::credits::book(node).await?;
-    let siblings = crate::cluster::owner::fleet::siblings(&node.store).await?;
-    let balance: u64 = std::iter::once(node.id())
-        .chain(siblings.iter().copied())
-        .map(|id| book.balance(&id))
-        .sum();
+    let balance = async {
+        let book = crate::credits::book(node).await?;
+        let siblings = crate::cluster::owner::fleet::siblings(&node.store).await?;
+        let balance: u64 = std::iter::once(node.id())
+            .chain(siblings.iter().copied())
+            .map(|id| book.balance(&id))
+            .sum();
+        anyhow::Ok((balance, !siblings.is_empty()))
+    }
+    .await
+    .inspect_err(|e| tracing::warn!(?e, "lookup: balance not read"))
+    .ok();
     let all = crate::credits::pay::quotes(node, &state.providers);
     let mut quotes = vec![];
     let mut total = 0u64;
@@ -95,12 +103,12 @@ async fn offer(state: &AdminState) -> anyhow::Result<Offer> {
             },
         });
     }
-    Ok(Offer {
-        balance: Some(crate::credits::show(balance)),
-        fleet: !siblings.is_empty(),
+    Offer {
+        balance: balance.map(|(b, _)| crate::credits::show(b)),
+        fleet: balance.is_some_and(|(_, fleet)| fleet),
         quotes,
         total: crate::credits::show(total),
-    })
+    }
 }
 
 /// A provider answer the dataset already held.
@@ -159,7 +167,7 @@ async fn page(
         error: None,
         result: None,
         cluster: state.recorder.node().is_some(),
-        offer: offer(&state).await?,
+        offer: offer(&state).await,
         bulk: None,
     })
 }
@@ -178,7 +186,7 @@ async fn lookup(
             error: Some("Not an IP address.".into()),
             result: None,
             cluster,
-            offer: offer(&state).await?,
+            offer: offer(&state).await,
             bulk: None,
         });
     };
@@ -192,7 +200,7 @@ async fn lookup(
         result: Some(result),
         cluster,
         // After the lookup: the balance it left.
-        offer: offer(&state).await?,
+        offer: offer(&state).await,
         bulk: None,
     })
 }
@@ -259,15 +267,24 @@ pub async fn run(state: &AdminState, ip: IpAddr, again: &[String]) -> AppResult<
                 })
         })
         .collect();
-    let row = state.store.ip_by_addr(&ip.to_string()).await?;
-    let target = match &row {
-        Some(r) => crate::admin::target::load(state, r, true, 1, false).await?,
-        None => None,
-    };
-    let near = match target {
-        Some(_) => None,
-        None => Some(crate::admin::target::neighbourhood(state, ip).await?),
-    };
+    // The answers are paid for: what the dataset adds is shown when it can
+    // be read, and its failure does not throw them away.
+    let held = async {
+        let row = state.store.ip_by_addr(&ip.to_string()).await?;
+        let target = match &row {
+            Some(r) => crate::admin::target::load(state, r, true, 1, false).await?,
+            None => None,
+        };
+        let near = match target {
+            Some(_) => None,
+            None => Some(crate::admin::target::neighbourhood(state, ip).await?),
+        };
+        Ok::<_, AppError>((target, near))
+    }
+    .await;
+    let (target, near) = held
+        .inspect_err(|e| tracing::warn!(?e, %ip, "lookup: dataset not read"))
+        .unwrap_or_default();
     Ok(LookupResult {
         ip: ip.to_string(),
         target,
@@ -320,7 +337,7 @@ async fn bulk(
         error: None,
         result: None,
         cluster: state.recorder.node().is_some(),
-        offer: offer(&state).await?,
+        offer: offer(&state).await,
         bulk: Some(Bulk {
             text,
             rows,
