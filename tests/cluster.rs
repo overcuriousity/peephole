@@ -3955,6 +3955,10 @@ async fn admin_manages_a_sibling_from_its_page() {
     assert!(html.contains("node-bravo") && html.contains(">yours<"));
     assert!(html.contains("name=\"base_version\" value=\"0\""), "{html}");
     assert!(
+        html.contains("Collect credits at") && html.contains(&format!("value=\"{}\"", a.id)),
+        "this node is offered as b's collecting node: {html}"
+    );
+    assert!(
         !html.contains("Remote configuration"),
         "the old line is gone"
     );
@@ -3973,12 +3977,14 @@ async fn admin_manages_a_sibling_from_its_page() {
             ("cooldown_hours", "12"),
             ("listener", "on"),
             ("web", "on"),
+            ("collect_to", &a.id.to_string()),
         ])
         .send()
         .await
         .unwrap();
     assert!(r.status().is_success());
     let s = nb.settings.snapshot();
+    assert_eq!(s.collect_to, Some(a.id), "b now forwards to a");
     assert_eq!((s.pace.max_workers, s.pace.max_scans_per_hour), (3, 55));
     assert_eq!(s.pace.timeout_secs, 1200);
     assert_eq!(s.cooldown_hours, 12);

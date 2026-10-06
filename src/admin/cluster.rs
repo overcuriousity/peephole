@@ -904,8 +904,8 @@ struct SettingsForm {
     listener: Option<String>,
     scanner: Option<String>,
     web: Option<String>,
-    /// The node this one forwards its credits to; "" = none. Absent:
-    /// unchanged (a sibling's form has no such field).
+    /// The node this one (or the sibling the form is for) forwards its
+    /// credits to; "" = none. Absent: unchanged.
     collect_to: Option<String>,
 }
 
@@ -987,6 +987,9 @@ enum Remote {
         blocked: Vec<(String, String)>,
         /// `(key, name)` of the members it could be told to block.
         peers: Vec<(String, String)>,
+        /// `(key, name)` of the operator's other nodes it can forward its
+        /// credits to (this node first).
+        fleet: Vec<(String, String)>,
     },
     /// Asked; no answer.
     Silent(String),
@@ -1146,6 +1149,18 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
                         .filter(|x| !x.is_self && x.key != m.key)
                         .filter(|x| !blocked.iter().any(|(k, _)| *k == x.key))
                         .map(|x| (x.key.clone(), x.name.clone()))
+                        .collect(),
+                    fleet: all
+                        .iter()
+                        .filter(|x| (x.is_self || x.sibling) && x.key != m.key)
+                        .map(|x| {
+                            let name = if x.is_self {
+                                "this node".into()
+                            } else {
+                                x.name.clone()
+                            };
+                            (x.key.clone(), name)
+                        })
                         .collect(),
                     blocked,
                     status: Box::new(st),
