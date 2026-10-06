@@ -182,6 +182,16 @@ pub async fn standings(node: &Node) -> Result<Standings> {
             out.entry(*id).or_default().rules = Some(*a);
         }
     }
+    // Audits this node made itself, and those of its own fleet.
+    let mut auditors = crate::cluster::owner::fleet::siblings(&node.store).await?;
+    auditors.push(node.id());
+    let week = crate::cluster::hlc::wall_ms().saturating_sub(7 * super::DAY_MS) << 16;
+    let counts = super::audit::counts(&node.store.pool, week).await?;
+    for (scanner, (conclusive, differing)) in super::audit::counted(&counts, &auditors) {
+        if super::audit::audits_fail(conclusive, differing) {
+            out.entry(scanner).or_default().audits = Some((conclusive, differing));
+        }
+    }
     Ok(out)
 }
 

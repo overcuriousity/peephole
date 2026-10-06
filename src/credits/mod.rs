@@ -1,6 +1,7 @@
 //! Lookup credits: earned by completed counter-scans, spent on lookups.
 //! Every node computes every balance for itself, from its own copy of the
 //! log; see docs/superpowers/specs/2026-10-06-lookup-credits-design.md.
+pub mod audit;
 pub mod earn;
 pub mod entries;
 pub mod gates;
@@ -156,6 +157,9 @@ pub async fn run(
             Ok(0) => {}
             Ok(n) => tracing::debug!(scans = n, "credits: scans judged"),
             Err(e) => tracing::warn!(?e, "credits: judging scans failed"),
+        }
+        if let Err(e) = audit::settle(&node.store.pool).await {
+            tracing::debug!(?e, "credits: comparing audits failed");
         }
         match gates::standings(&node).await {
             Ok(now) => {
