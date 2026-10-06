@@ -72,7 +72,10 @@ fn command_line(raw_xml: Option<&[u8]>) -> Option<String> {
 /// and is judged only while no earlier one of the job is held, so every
 /// node that holds both picks the same. A scan is dated no earlier than
 /// its job was queued: its own date is the scanner's word, and dating it
-/// back would slip it past the daily and per-address limits.
+/// back would slip it past the daily and per-address limits. A scan
+/// dated before the ledger window is left alone: its judgment would be
+/// pruned again within the hour, and judging it would only crowd out
+/// the scans that can still be paid.
 /// Returns how many were judged.
 pub async fn judge(j: &Judge<'_>, min_age_secs: i64) -> Result<usize> {
     type Row = (
@@ -95,6 +98,7 @@ pub async fn judge(j: &Judge<'_>, min_age_secs: i64) -> Result<usize> {
          WHERE j.status = 'done' AND j.scanner IS NOT NULL AND j.origin IS NOT NULL
            AND s.origin = j.scanner AND s.audit_of IS NULL AND s.ip_id = j.ip_id AND s.level = j.level
            AND l.received_at <= datetime('now', ?)
+           AND MAX(s.hlc, COALESCE(j.hlc, 0)) >= ?
            AND NOT EXISTS (SELECT 1 FROM credit_scans c WHERE c.job_uid = j.uid)
            AND NOT EXISTS (SELECT 1 FROM scans e
                            WHERE e.job_uid = s.job_uid AND e.origin = s.origin
@@ -103,6 +107,7 @@ pub async fn judge(j: &Judge<'_>, min_age_secs: i64) -> Result<usize> {
          ORDER BY s.hlc, s.uid LIMIT ?",
     )
     .bind(format!("-{} seconds", min_age_secs.max(0)))
+    .bind(hlc::to_db(super::window_start(hlc::wall_ms())))
     .bind(JUDGE_BATCH)
     .fetch_all(j.pool)
     .await?;
@@ -638,7 +643,7 @@ mod tests {
             .unwrap();
         // Job 2: a later result arrived first; the earlier one only now.
         finished_scan(&store, "203.0.113.21", 1, "nmap", 21).await;
-        result_of(&store, "job-21", "scan-21-early", 50, 2, "-1 minutes").await;
+        result_of(&store, "job-21", "scan-21-early", 50, now + 2, "-1 minutes").await;
         let origins = guard::Origins::Any;
         let j = Judge {
             pool: &store.pool,
@@ -658,6 +663,36 @@ mod tests {
                 .is_some()
         );
         assert_eq!(judged_one(&store.pool, "scan-21").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn scans_older_than_the_window_are_not_judged_again_after_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let day = (DAY_MS << 16) as i64;
+        let now = (hlc::wall_ms() << 16) as i64;
+        // An old scan whose judgment the hourly prune has removed, and a
+        // fresh one behind it.
+        finished_scan(&store, "203.0.113.30", 1, "nmap", 30).await;
+        sqlx::query("UPDATE scans SET hlc = ? WHERE uid = 'scan-30'")
+            .bind(now - 20 * day)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        finished_scan(&store, "203.0.113.31", 1, "nmap", 31).await;
+        let origins = guard::Origins::Any;
+        let j = Judge {
+            pool: &store.pool,
+            origins: &origins,
+            classifier: Classifier::builtin(),
+        };
+        assert_eq!(judge(&j, 60).await.unwrap(), 1, "only the fresh one");
+        assert_eq!(judged_one(&store.pool, "scan-30").await.unwrap(), None);
+        assert!(judged_one(&store.pool, "scan-31").await.unwrap().is_some());
+        prune(&store.pool, super::super::window_start(hlc::wall_ms()))
+            .await
+            .unwrap();
+        assert_eq!(judge(&j, 60).await.unwrap(), 0, "nothing to judge again");
     }
 
     #[tokio::test]
