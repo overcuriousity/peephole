@@ -2,6 +2,7 @@
 {% block title %}peephole — requests{% endblock %}
 {% block content %}
 <div class="page-head"><div><h1>Requests</h1></div></div>
+<nav class="chips shortcuts" aria-label="Quick filters">{% for s in shortcuts %}<a class="chip shortcut" href="{{ s.href }}" title="{{ s.title }}{% if s.active %} (click to remove){% endif %}"{% if s.active %} aria-current="true"{% endif %}>{{ s.label }}</a>{% endfor %}</nav>
 <form class="filters" method="get" action="/requests">
   <label>IP <input name="ip" value="{{ f.ip.as_deref().unwrap_or_default() }}"></label>
   <label>Path contains <input name="path" value="{{ f.path.as_deref().unwrap_or_default() }}"></label>

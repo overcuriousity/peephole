@@ -24,7 +24,7 @@ curl -fsS https://&lt;this host&gt;/api/blocklist | grep -v '^#' | grep -v : \
 </section>
 <section class="card api-endpoint">
   <h2>GET /api/stats</h2>
-  <p>The wall's numbers as JSON: totals, unique IPs, countries, Tor exits, finished counter-scans, top IPs, countries and ASNs, the severity distribution, a timeline and a weekday × hour heatmap. Parameter <span class="mono">range</span>: <span class="mono">24h</span> (default), <span class="mono">7d</span>, <span class="mono">30d</span> or <span class="mono">all</span>.</p>
+  <p>The wall's numbers as JSON: totals, unique IPs, countries, Tor exits, finished counter-scans, top IPs, countries and ASNs, the severity distribution, a timeline and a weekday × hour heatmap (always the last 7 days). Parameter <span class="mono">range</span>: <span class="mono">24h</span> (default), <span class="mono">7d</span>, <span class="mono">30d</span> or <span class="mono">all</span>.</p>
   <pre>curl -fsS 'https://&lt;this host&gt;/api/stats?range=7d'</pre>
 </section>
 <section class="card api-endpoint">

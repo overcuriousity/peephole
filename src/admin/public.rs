@@ -529,12 +529,104 @@ async fn ips(
     })
 }
 
+/// A one-click filter: the current filter with one field set to a
+/// preset, or, when it already is, without it.
+pub struct Shortcut {
+    pub label: &'static str,
+    pub title: &'static str,
+    pub href: String,
+    pub active: bool,
+}
+
+/// The requests page's shortcuts, relative to filter `f` at `now` (UTC).
+fn request_shortcuts(f: &RequestFilter, now: chrono::NaiveDateTime) -> Vec<Shortcut> {
+    let since = |h: i64| {
+        (now - chrono::Duration::hours(h))
+            .format("%Y-%m-%dT%H:%M")
+            .to_string()
+    };
+    let presets: [(&str, &str, &str, String); 10] = [
+        ("Last hour", "Received in the last hour", "from", since(1)),
+        (
+            "Last 24 h",
+            "Received in the last 24 hours",
+            "from",
+            since(24),
+        ),
+        (
+            "Severity 4",
+            "Unambiguous exploits and post-exploitation",
+            "min_severity",
+            "4".into(),
+        ),
+        (
+            "Severity 3+",
+            "Exploit-adjacent and worse",
+            "min_severity",
+            "3".into(),
+        ),
+        ("Tarpitted", "Held by the tarpit", "answer", "tarpit".into()),
+        (
+            "Decoy served",
+            "Answered with a decoy of any kind",
+            "answer",
+            "decoy".into(),
+        ),
+        (
+            "Webshell use",
+            "Talking to a webshell",
+            "label",
+            "webshell".into(),
+        ),
+        (
+            "Credential attacks",
+            "Logins with default credentials (admin:admin, Mirai pairs)",
+            "label",
+            "credential-attack".into(),
+        ),
+        ("POST", "Requests with method POST", "method", "POST".into()),
+        (
+            "No user agent",
+            "Requests without a User-Agent header",
+            "ua",
+            "(none)".into(),
+        ),
+    ];
+    let pairs = request_pairs(f);
+    presets
+        .into_iter()
+        .map(|(label, title, key, value)| {
+            let active = pairs.iter().any(|(k, v)| {
+                *k == key && v.as_deref().is_some_and(|v| v.eq_ignore_ascii_case(&value))
+            });
+            let next: Vec<_> = pairs
+                .iter()
+                .map(|(k, v)| match *k == key {
+                    true if active => (*k, None),
+                    true => (*k, Some(value.clone())),
+                    false => (*k, v.clone()),
+                })
+                .collect();
+            let qs = qs_without_page(&next);
+            Shortcut {
+                label,
+                title,
+                href: format!("/requests?{}", qs.trim_end_matches('&'))
+                    .trim_end_matches('?')
+                    .to_string(),
+                active,
+            }
+        })
+        .collect()
+}
+
 #[derive(Template)]
 #[template(path = "requests.html")]
 struct RequestsPage {
     chrome: Chrome,
     f: RequestFilter,
     chips: Vec<Chip>,
+    shortcuts: Vec<Shortcut>,
     page: Page<RequestListRow>,
     qs: String,
     bulk_total: Option<crate::store::browse::Count>,
@@ -564,6 +656,7 @@ async fn requests(
     render(&RequestsPage {
         chrome: Chrome::new(true, "requests"),
         chips: chips("/requests", &request_pairs(&f)),
+        shortcuts: request_shortcuts(&f, chrono::Utc::now().naive_utc()),
         f,
         page,
         qs,
@@ -969,6 +1062,56 @@ async fn ip_page(
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[test]
+    fn shortcuts_toggle_one_field_and_keep_the_rest() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 10, 6)
+            .unwrap()
+            .and_hms_opt(12, 30, 0)
+            .unwrap();
+        let get = |f: &RequestFilter, l: &str| {
+            request_shortcuts(f, now)
+                .into_iter()
+                .find(|s| s.label == l)
+                .unwrap()
+        };
+        let none = RequestFilter::default();
+        let t = get(&none, "Tarpitted");
+        assert_eq!(
+            (t.href.as_str(), t.active),
+            ("/requests?answer=tarpit", false)
+        );
+        assert_eq!(
+            get(&none, "Last hour").href,
+            "/requests?from=2026-10-06T11%3A30"
+        );
+        // Applied: active, and the link drops it but keeps the others.
+        let f = RequestFilter {
+            ip: Some("192.0.2.1".into()),
+            answer: Some("tarpit".into()),
+            ..Default::default()
+        };
+        let t = get(&f, "Tarpitted");
+        assert_eq!(
+            (t.href.as_str(), t.active),
+            ("/requests?ip=192.0.2.1", true)
+        );
+        // Another value of the same field is replaced, not added.
+        let d = get(&f, "Decoy served");
+        assert_eq!(
+            (d.href.as_str(), d.active),
+            ("/requests?ip=192.0.2.1&answer=decoy", false)
+        );
+        let m = get(
+            &RequestFilter {
+                method: Some("post".into()),
+                ..Default::default()
+            },
+            "POST",
+        );
+        assert!(m.active, "any case");
+        assert_eq!(m.href, "/requests");
+    }
 
     #[test]
     fn anonymous_filters_are_normalised_and_bounded() {

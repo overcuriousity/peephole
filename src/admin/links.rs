@@ -45,6 +45,10 @@ struct LinksPage {
     page: Page<LinkRow>,
     /// Query string of the filter without `page`, for the pager.
     qs: String,
+    /// Each kind and the page listing it with the other filters kept
+    /// (not "starts with", which is a value of the old kind), and whether
+    /// it opens the software group.
+    kind_tabs: Vec<(LinkKind, String, bool)>,
     /// An old anchor that matched nothing.
     not_found: Option<String>,
 }
@@ -72,9 +76,31 @@ async fn index(
         ("node", f.node.clone()),
         ("sort", f.sort.clone()),
     ]);
+    let kind_tabs = LinkKind::LIST
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let qs = crate::admin::public::qs_without_page(&[
+                ("kind", Some(k.key().to_string())),
+                ("shared", f.shared.clone()),
+                ("from", f.from.clone()),
+                ("to", f.to.clone()),
+                ("country", f.country.clone()),
+                ("node", f.node.clone()),
+                ("sort", f.sort.clone()),
+            ]);
+            let group_start = i > 0 && !k.identity() && LinkKind::LIST[i - 1].identity();
+            (
+                *k,
+                format!("/admin/links?{}", qs.trim_end_matches('&')),
+                group_start,
+            )
+        })
+        .collect();
     Ok(render(&LinksPage {
         chrome: chrome(),
         kind: f.kind(),
+        kind_tabs,
         f,
         page,
         qs,

@@ -68,6 +68,7 @@ pub fn label_class<S: AsRef<str>>(label: S) -> &'static str {
 pub fn family_class<S: AsRef<str>>(family: S) -> &'static str {
     match family.as_ref() {
         "recon" => "badge-cat-recon",
+        "exposure" => "badge-cat-exposure",
         "inject" => "badge-cat-inject",
         "impact" => "badge-cat-impact",
         "interact" => "badge-cat-interact",
@@ -81,6 +82,7 @@ pub fn family_class<S: AsRef<str>>(family: S) -> &'static str {
 pub fn family_name<S: AsRef<str>>(family: S) -> &'static str {
     match family.as_ref() {
         "recon" => "Reconnaissance",
+        "exposure" => "Exposure",
         "inject" => "Injection",
         "impact" => "Impact",
         "interact" => "Interaction",
@@ -319,7 +321,8 @@ mod tests {
         assert_eq!(label_class("some-future-probe"), "badge-cat-recon");
         // Everything else keeps the neutral accent.
         assert_eq!(label_class("fp-claim"), "");
-        assert_eq!(label_class("path-scanner"), "");
+        assert_eq!(label_class("path-scanner"), "badge-cat-recon");
+        assert_eq!(label_class("sensitive-path"), "badge-cat-exposure");
     }
 
     #[test]

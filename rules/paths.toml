@@ -42,3 +42,49 @@ owasp = ["OAT-018"]
 # Framework debug surfaces and deployment secrets: Symfony, Laravel, Yii,
 # ASP.NET error logs, Go expvar, Terraform and Kubernetes state, SSH keys.
 target_regex = "/(_profiler|telescope|horizon)(/|\\?|$)|/app_dev\\.php|/(elmah|trace)\\.axd|/debug/(vars|default|toolbar)(/|\\?|$)|/web\\.config(/|\\?|$)|/composer\\.(json|lock)(/|\\?|$)|/\\.terraform(/|\\?|$)|/terraform\\.tfstate|/\\.kube/config|/id_(rsa|dsa|ecdsa|ed25519)(/|\\.|\\?|$)|/(server|private)\\.key(/|\\?|$)|/\\.(pgpass|netrc)(/|\\?|$)"
+
+[[rule]]
+label = "sensitive-path"
+weight = 2
+owasp = ["OAT-018"]
+# .env variants (/.env_1, /.env_sample, /sendgrid.env, /.envrc) and the
+# runtime config single-page apps ship to the browser, where API keys end
+# up: /env.js, /__ENV.js, /env-config.js, /aws-exports.js, Firebase and
+# Amplify configs. /.environment stays out (no separator after "env").
+target_regex = '''(^|/)(\.env[_.-][\w.-]*|\.envrc|[\w-]+\.env|_*env([.-][\w-]+)?\.(js|json)|env-config\.js|environment\.(js|json)|runtime-config\.js|(app-)?config\.js|aws-exports\.js|firebase(-config)?\.js|amplifyconfiguration\.json)(\?|$)'''
+
+[[rule]]
+label = "sensitive-path"
+weight = 2
+owasp = ["OAT-018"]
+# Credential stores: git, Docker, cloud CLIs (gcloud, s3cmd, boto), mail
+# and download tools, package registries (gem, Maven, NuGet, Composer),
+# OAuth and service-account keys, and shell and REPL histories.
+target_regex = '''(^|/)(\.?git-credentials|\.dockercfg|\.docker/config\.json|\.boto|\.s3cfg|s3cmd\.ini|\.my\.cnf|_netrc|\.?wgetrc|\.wget-hsts|\.e?smtprc|\.msmtprc|\.?credentials(\.(json|ya?ml|db))?|\.config/(gcloud|sftp)[/.][^?]*|(\.config/gcloud/)?access_tokens\.db|\.gem/credentials|\.m2/settings\.xml|\.nuget/|nuget\.config|\.?composer-auth\.json|\.?auth\.json|client_secrets?\.json|oauth-credentials\.json|service-?account[\w-]*\.json|google-api-private-key\.json|google-services\.json|googleservice-info\.plist|token\.json|keycloak\.json|\.?sftp(-config)?\.json|postman(_collection)?\.json|secret_token\.rb|database_credentials\.inc|\.?[\w]*_history|\.lesshst|\.viminfo)(\?|$)'''
+
+[[rule]]
+label = "sensitive-path"
+weight = 2
+owasp = ["OAT-018"]
+# Application and deployment config: secrets files, Terraform variables,
+# Spring/.NET/Symfony/Rails/Django settings, Docker Compose and
+# serverless definitions, and edited copies of PHP configs
+# (config.php.bak, settings.php.orig).
+target_regex = '''(^|/)([\w-]*secrets?(\.[\w]+)?\.(json|ya?ml|properties|tfvars)(\.old)?|[\w.-]*\.tfvars|appsettings(\.\w+)?\.json|launchsettings\.json|application(-[\w]+)?\.(ya?ml|properties)|parameters\.ya?ml(\.dist)?|(database|storage)\.ya?ml|settings\.(py|ya?ml|json|toml|xml|js)|config\.(ya?ml|json|toml|ini|properties)(\.bak)?|(config|settings)\.php\.(bak|old|orig|save|txt|dist|swp)|[\w-]*cloud-config\.(txt|ya?ml)|(deployment|ws)-config\.json|ovh-backups\.json|_config\.yml|(docker-)?compose([.-][\w-]+)*\.ya?ml|serverless\.ya?ml|credentials\.(ya?ml|tfvars))(\?|$)'''
+
+[[rule]]
+label = "sensitive-path"
+weight = 2
+owasp = ["OAT-018"]
+# CI pipeline definitions, which carry deploy keys and secret names:
+# GitLab, GitHub Actions, CircleCI, Travis, Azure, Bitbucket, Buildkite,
+# Drone, Jenkins and the rest.
+target_regex = '''(^|/)(\.?gitlab-ci(\.ya?ml|/)|\.travis\.yml|\.circleci/|circle\.yml|\.github/workflows/|\.?azure-pipelines\.yml|bitbucket-pipelines\.yml|\.?buildkite(\.yml|/)|appveyor\.yml|jenkinsfile|jenkins\.ya?ml|wercker\.yml|\.semaphore/|codeship-[\w-]+\.yml|bitrise\.yml|bamboo\.yml|\.drone\.yml)'''
+
+[[rule]]
+label = "sensitive-path"
+weight = 2
+owasp = ["OAT-018"]
+# Source repositories and dumps: git's smart-HTTP clone endpoint, repo
+# metadata files, bare repos (/wiki.git) and SQL dumps by any name.
+target_regex = '''/info/refs\?service=git-(upload|receive)-pack|(^|/)\.git(modules|ignore|attributes)(\?|$)|/[\w.-]+\.git(/|\?|$)|(^|/)[\w-]*(dump|backup|data)[\w-]*\.sql(\.(gz|zip|bz2))?(\?|$)'''

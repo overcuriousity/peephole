@@ -5,6 +5,36 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Changed
+
+- The wall's "When they knock" card is now "Heatmap" and always covers the
+  last 7 days, whatever range is picked, so every weekday is filled in
+  (`heatmap` in `/api/stats` likewise).
+- "What they were after" no longer files most traffic under "Other". A new
+  family, Exposure (green), takes `sensitive-path`; `path-scanner`,
+  `api-recon` and `graphql-introspection` are reconnaissance. `path-scanner`
+  and the new `php-probe` count only when a request has no more specific
+  family, and "Other" only when nothing else applies. The regrouping
+  applies to stored requests at once; the new rules below only to new ones.
+
+### Added
+
+- Quick filters on the Requests page, one click to apply and again to
+  remove, keeping the other filters: last hour, last 24 h, severity 4,
+  severity 3+, tarpitted, decoy served, webshell use, credential attacks,
+  POST, no user agent. The Answer filter `decoy` now matches every
+  `decoy:…` answer.
+- Admin › Links picks the kind from a pill bar (identity kinds, then
+  software kinds) instead of a dropdown; switching keeps the other filters.
+- Rules from a week of real traffic that matched none: `.env` variants and
+  browser-side runtime configs (`/env.js`, `/aws-exports.js`), credential
+  stores (git, Docker, gcloud, s3cmd, boto, gem, Maven, NuGet, Composer,
+  service-account keys, shell histories), app and deployment config
+  (`secrets.yml`, `*.tfvars`, `appsettings*.json`, `docker-compose*.yml`,
+  `config.php.bak`), CI pipelines, git clone endpoints and SQL dumps, all
+  as `sensitive-path`; and `php-probe` (weight 1) for any PHP script, the
+  long filename lists sprayed to find shells left by others.
+
 ## [0.5.0] - 2026-10-05
 
 ### Added
