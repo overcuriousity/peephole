@@ -345,6 +345,13 @@ drives the counter-scan level:
 | 3 | exploit-adjacent | `form-interaction`, `write-method`, `xss`, `crlf-injection`, `webshell-probe`, `app-probe`, `cloud-infra-probe`, `credential-attack`, `mcp-probe`, `graphql-introspection`, `appliance-probe`, `iot-probe`, `inhuman-behavior` |
 | 4 | unambiguous exploit / post-exploitation | `sqli`, `rce`, `path-traversal`, `ssrf`, `ssti`, `nosqli`, `xxe`, `deserialization`, `webshell`, `mcp-abuse` |
 
+The counter-scan level is the weight, with one cap: a request whose labels
+only say someone looked (`probe`, `path-scanner`, `php-probe`) earns at
+most a level-1 scan, whatever its severity — a lone drive-by probe does
+not warrant a top-1000-port scan. Anything more specific scans at the
+weight, capped at 4. `severity` itself is not capped: it records what was
+seen.
+
 The `owasp` tag is a Top-10 2021 class (`A03:2021`) for payload families or
 an Automated Threat (`OAT-014`) for scanning behaviour. Tags are stored on
 the request row (`owasp_json`), shown as badges next to the labels in the

@@ -349,7 +349,12 @@ impl Classifier {
         labels.dedup();
         owasp.sort();
         owasp.dedup();
-        let scan_level = weight.min(4);
+        let weak_only = labels.iter().all(|l| WEAK_LABELS.contains(&l.as_str()));
+        let scan_level = if weak_only {
+            weight.min(1)
+        } else {
+            weight.min(4)
+        };
         Verdict {
             severity: weight,
             scan_level,
@@ -362,6 +367,11 @@ impl Classifier {
 fn compile_ci(pattern: &str) -> Result<Regex> {
     Ok(Regex::new(&format!("(?i){pattern}"))?)
 }
+
+/// Labels that only say someone looked, never what they were after. A
+/// request with no other label earns at most a level-1 counter-scan,
+/// however often it looked.
+const WEAK_LABELS: [&str; 3] = ["probe", "path-scanner", "php-probe"];
 
 /// Label families, in the order the pages show them: what a request was
 /// after, coarsest first.
@@ -484,14 +494,42 @@ mod tests {
     }
 
     #[test]
-    fn repeated_scanning_is_level_2() {
+    fn repeated_scanning_alone_caps_the_scan_at_level_1() {
+        // Severity records what was seen (a scan burst); the counter-scan
+        // stays light while nothing specific was touched.
         let v = classifier().classify(
             &view("GET", "/a", None, "Mozilla/5.0", None),
             &hist(15, 20),
             &BotTells::default(),
         );
-        assert_eq!(v.scan_level, 2);
+        assert_eq!(v.severity, 2);
+        assert_eq!(v.scan_level, 1);
         assert!(v.labels.contains(&"path-scanner".to_string()));
+    }
+
+    #[test]
+    fn scanning_plus_a_named_rule_keeps_level_2() {
+        let v = classifier().classify(
+            &view("GET", "/.env", None, "Mozilla/5.0", None),
+            &hist(15, 20),
+            &BotTells::default(),
+        );
+        assert!(v.labels.contains(&"sensitive-path".to_string()));
+        assert_eq!(v.scan_level, 2);
+    }
+
+    #[test]
+    fn php_probes_alone_stay_at_level_1() {
+        let v = classifier().classify(
+            &view("GET", "/myglu.php", None, "curl/8", None),
+            &hist(15, 20),
+            &BotTells::default(),
+        );
+        assert_eq!(
+            v.labels,
+            vec!["path-scanner".to_string(), "php-probe".to_string()]
+        );
+        assert_eq!(v.scan_level, 1);
     }
 
     #[test]
