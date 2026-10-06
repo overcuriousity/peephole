@@ -5,6 +5,7 @@ pub mod hostkeys;
 pub mod nmap_xml;
 pub mod order;
 pub mod pace;
+pub mod profiles;
 pub mod safety;
 pub mod weight;
 

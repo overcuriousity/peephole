@@ -822,76 +822,7 @@ impl Config {
         if let Some(custom) = self.scan.level_argv.get(&level) {
             return Some(custom.clone());
         }
-        // One NSE argument; it contains spaces, so argv is built element by
-        // element rather than split from a string. `discovery` and `safe`
-        // also hold scripts that would leak the target to third parties
-        // (`external`: whois, ASN and geolocation lookups), broadcast on
-        // the scanner's own network (`broadcast` prerules), or flood
-        // (`dos`); those categories are excluded.
-        const SCRIPTS: &str =
-            "(discovery or safe) and not (intrusive or broadcast or external or dos)";
-        // Level 2 names its scripts: the source's own identifiers (SSH host
-        // keys and algorithm lists, the TLS certificate), each one handshake
-        // with a port nmap already found open, all in `safe`.
-        const IDENTITY_SCRIPTS: &str = "ssh-hostkey,ssh2-enum-algos,ssl-cert";
-        let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<String>>();
-        let argv = match level {
-            1 => s(&[
-                "-Pn",
-                "-sS",
-                "-sV",
-                "--version-light",
-                "-T3",
-                "--top-ports",
-                "100",
-            ]),
-            2 => s(&[
-                "-Pn",
-                "-sS",
-                "-sV",
-                "-O",
-                "-T3",
-                "--top-ports",
-                "1000",
-                "--script",
-                IDENTITY_SCRIPTS,
-            ]),
-            3 => s(&[
-                "-Pn",
-                "-sS",
-                "-sV",
-                "-O",
-                "-T3",
-                "--top-ports",
-                "1000",
-                "--traceroute",
-                "--script",
-                SCRIPTS,
-            ]),
-            4 => {
-                let mut v = s(&["-Pn", "-sS"]);
-                if self.scan.level4_udp {
-                    v.push("-sU".into());
-                    v.push("-p".into());
-                    v.push(format!("T:1-65535,U:{UDP_TOP50}"));
-                } else {
-                    v.push("-p-".into());
-                }
-                v.extend(s(&[
-                    "-sV",
-                    "-O",
-                    "-T3",
-                    "--max-retries",
-                    "1",
-                    "--traceroute",
-                    "--script",
-                    SCRIPTS,
-                ]));
-                v
-            }
-            _ => return None,
-        };
-        Some(argv)
+        crate::scan::profiles::builtin(level, self.scan.level4_udp)
     }
 }
 
