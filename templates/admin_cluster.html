@@ -18,7 +18,7 @@
     <tbody>
     {% for m in rows %}
       <tr{% if !m.active %} class="muted"{% endif %}>
-        <td><a href="/admin/cluster/node/{{ m.key }}"><b>{{ m.name }}</b></a> <span class="mono muted">{{ m.short }}</span>{% if m.is_self %} <span class="muted small">this node</span>{% endif %}</td>
+        <td><a href="/admin/cluster/node/{{ m.key }}"><b>{{ m.name }}</b></a> <span class="mono muted">{{ m.short }}</span>{% if m.sibling %} <span class="badge badge-status" data-status="done">yours</span>{% endif %}{% if m.is_self %} <span class="muted small">this node</span>{% endif %}</td>
         <td>{% if m.blocked %}<span class="badge badge-status" data-status="failed">{% if m.purged %}purged{% else %}blocked{% endif %}</span>{% else if !m.active %}<span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% else if m.live %}<span class="badge badge-status" data-status="done">live</span>{% else %}<span class="badge badge-status" data-status="queued">not seen</span>{% endif %}</td>
         <td>{{ m.last_seen }}</td>
         <td>{{ m.lag }}</td>

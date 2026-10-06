@@ -84,10 +84,10 @@ struct Opts {
     /// Run scan workers with this fake nmap.
     scanner: Option<std::path::PathBuf>,
     workers: usize,
-    /// Let config key holders change this node's settings.
-    remote_config: bool,
     /// Days of history kept (0: all).
     retention_days: u32,
+    /// Share of other nodes' fresh scans this scanner audits.
+    audit_share: f64,
 }
 
 const DEFAULT: Opts = Opts {
@@ -98,8 +98,8 @@ const DEFAULT: Opts = Opts {
     never_scan: vec![],
     scanner: None,
     workers: 1,
-    remote_config: false,
     retention_days: 0,
+    audit_share: 0.0,
 };
 
 async fn boot(identity: Identity, me: &Addr, peers: &[&Addr], o: Opts) -> TestNode {
@@ -123,7 +123,7 @@ async fn boot_in(
         key_path: None,
         takeover_hours: o.takeover_hours,
         lease_secs: o.lease_secs,
-        remote_config: o.remote_config,
+        remote_config: false,
         origin_quota_mb: 20 * 1024,
         peers: peers
             .iter()
@@ -165,15 +165,13 @@ async fn boot_in(
     });
     let settings = peephole::settings::Settings::with_pace(
         node.store.clone(),
-        &scan_config(&o.never_scan),
+        &scan_config(&o.never_scan, o.audit_share),
         pace.clone(),
     );
-    if o.remote_config {
-        cluster::confkey::ensure(&node.store, node.id())
-            .await
-            .unwrap();
-    }
-    cluster::confkey::serve(&node, settings.clone());
+    cluster::remote::serve(&node, settings.clone());
+    cluster::owner::fleet::serve(&node);
+    cluster::owner::cmd::serve(&node, settings.clone());
+    peephole::credits::fleet::serve(&node);
     let workers = o.scanner.as_ref().map(|nmap| {
         tokio::spawn(peephole::scan::arbiter::takeover_loop(
             node.clone(),
@@ -181,7 +179,7 @@ async fn boot_in(
         ));
         tokio::spawn(peephole::scan::run_workers(
             peephole::store::recorder::Recorder::Cluster(node.clone()),
-            scan_config(&o.never_scan),
+            scan_config(&o.never_scan, o.audit_share),
             pace.clone(),
             nmap.clone(),
             rx.clone(),
@@ -201,7 +199,7 @@ async fn boot_in(
 }
 
 /// Config for the scan workers (argv presets, never_scan, cooldown).
-fn scan_config(never_scan: &[String]) -> peephole::config::Config {
+fn scan_config(never_scan: &[String], audit_share: f64) -> peephole::config::Config {
     let list = never_scan
         .iter()
         .map(|n| format!("\"{n}\""))
@@ -210,7 +208,7 @@ fn scan_config(never_scan: &[String]) -> peephole::config::Config {
     // No Tor list and no DNS in tests: neither check may hold scans back.
     toml::from_str(&format!(
         "database_path = \"/x\"\ndata_dir = \"/x\"\n[scan]\nnever_scan = [{list}]\n\
-         tor_unknown = \"scan\"\nverify_crawlers = false\n"
+         tor_unknown = \"scan\"\nverify_crawlers = false\n[credits]\naudit_share = {audit_share}\n"
     ))
     .unwrap()
 }
@@ -1033,7 +1031,9 @@ fn new_request(ip_id: i64, path: &str) -> NewRequest {
         query: Some("q=1".into()),
         headers_json: r#"[["user-agent","sqlmap/1.7"]]"#.into(),
         body: Some(b"user=admin&pass=' OR 1=1--".to_vec()),
-        labels_json: r#"["sqli"]"#.into(),
+        // What this build's rules make of the request: the credits' rules
+        // gate compares a member's newest requests with them.
+        labels_json: r#"["form-interaction","scanner-ua","sqli"]"#.into(),
         severity: 4,
         scan_level: 3,
         is_fp_claim: false,
@@ -2213,127 +2213,6 @@ async fn outbound_only_scanner_drains_the_queue() {
     .await;
 }
 
-/// A config key holder changes another node's settings; nobody else can.
-#[tokio::test]
-async fn config_key_holders_change_a_nodes_settings() {
-    use peephole::cluster::confkey;
-    use peephole::settings::Changes;
-    let (ia, a) = new_node("a");
-    let (ib, b) = new_node("b");
-    let (ic, c) = new_node("c");
-    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
-    let nb = boot(
-        ib,
-        &b,
-        &[&a, &c],
-        Opts {
-            remote_config: true,
-            ..DEFAULT
-        },
-    )
-    .await;
-    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
-    eventually("a sees that b is open", || async {
-        members::all(&na.store)
-            .await
-            .unwrap()
-            .iter()
-            .any(|m| m.id == b.id && m.remote_config)
-    })
-    .await;
-
-    // Anyone may look.
-    let state = confkey::get(&na.node, b.id).await.unwrap();
-    assert!(state.open);
-    assert_eq!(state.version, 0);
-    let faster = Changes {
-        max_scans_per_hour: Some(77),
-        ..Default::default()
-    };
-
-    // Without the key: refused, before any message is sent.
-    let e = confkey::set(&na.node, b.id, 0, &faster)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert!(e.contains("no config key"), "{e}");
-
-    // B's operator hands A the key.
-    let key = confkey::own(&nb.store, b.id).await.unwrap().unwrap();
-    assert_eq!(
-        confkey::add(&na.store, a.id, &key.encode()).await.unwrap(),
-        b.id
-    );
-    assert_eq!(
-        confkey::set(&na.node, b.id, 0, &faster).await.unwrap(),
-        Ok(1)
-    );
-    assert_eq!(nb.pace.get().max_scans_per_hour, 77);
-    let audit = nb.settings.audit(10).await.unwrap();
-    assert_eq!(audit.len(), 1);
-    assert_eq!(audit[0].by, Some(a.id));
-
-    // A stale version (a second editor, or a replay) changes nothing.
-    let e = confkey::set(&na.node, b.id, 0, &faster)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert!(e.contains("changed meanwhile"), "{e}");
-
-    // Invalid values are refused by the same rules as locally.
-    let e = confkey::set(
-        &na.node,
-        b.id,
-        1,
-        &Changes {
-            listener: Some(false),
-            scanner: Some(false),
-            web: Some(false),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap()
-    .unwrap_err();
-    assert!(e.contains("at least one role"), "{e}");
-
-    // C holds a wrong key for B.
-    let wrong = confkey::ConfigKey {
-        id: b.id,
-        key: [0u8; 32],
-    };
-    confkey::add(&nc.store, c.id, &wrong.encode())
-        .await
-        .unwrap();
-    let e = confkey::set(&nc.node, b.id, 1, &faster)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert!(e.contains("not accepted"), "{e}");
-
-    // Rotation cuts A off.
-    confkey::rotate(&nb.store, b.id).await.unwrap();
-    let e = confkey::set(&na.node, b.id, 1, &faster)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert!(e.contains("not accepted"), "{e}");
-    assert_eq!(nb.settings.snapshot().version, 1);
-
-    // A locked node refuses even a correct key.
-    confkey::ensure(&na.store, a.id).await.unwrap();
-    let a_key = confkey::own(&na.store, a.id).await.unwrap().unwrap();
-    confkey::add(&nb.store, b.id, &a_key.encode())
-        .await
-        .unwrap();
-    assert!(!confkey::get(&nb.node, a.id).await.unwrap().open);
-    let e = confkey::set(&nb.node, a.id, 0, &faster)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert!(e.contains("switched off"), "{e}");
-}
-
 use peephole::intel::share;
 
 /// The Tor exit list is shared as a file; GeoLite2 databases are not.
@@ -2773,7 +2652,7 @@ async fn admin_cluster_page_and_private_attribution() {
     assert_ne!(
         nb.pace.get().max_scans_per_hour,
         77,
-        "no config key: the pace of another node cannot be changed"
+        "the pace of another node is not changed from the pace row"
     );
     // Invites are shown once.
     let r = admin
@@ -2857,163 +2736,6 @@ async fn admin_cluster_page_and_private_attribution() {
         assert_eq!(resp.status(), 303, "{path} should require a session");
         assert_eq!(resp.headers().get("location").unwrap(), "/login", "{path}");
     }
-}
-
-/// The admin of A configures B through the UI once B's key is added.
-#[tokio::test]
-async fn admin_configures_another_node_with_its_key() {
-    use peephole::cluster::confkey;
-    let (ia, a) = new_node("node-alpha");
-    let (ib, b) = new_node("node-bravo");
-    let na = boot(ia, &a, &[&b], DEFAULT).await;
-    let nb = boot(
-        ib,
-        &b,
-        &[&a],
-        Opts {
-            remote_config: true,
-            ..DEFAULT
-        },
-    )
-    .await;
-    eventually("a sees that b is open", || async {
-        members::all(&na.store)
-            .await
-            .unwrap()
-            .iter()
-            .any(|m| m.id == b.id && m.remote_config)
-    })
-    .await;
-    let (admin, base) = admin_on(&na).await;
-    let mut page = cluster_pages(&admin, &base).await;
-    page.push_str(&text(&admin, format!("{base}/admin/cluster/access")).await);
-    assert!(page.contains("open to key holders"), "b is shown as open");
-    assert!(page.contains("locked"), "a itself is locked");
-    assert!(
-        !page.contains("peephole-cfg1:"),
-        "a locked node shows no key"
-    );
-
-    // Add B's key, then change B from A's node page.
-    let key = confkey::own(&nb.store, b.id).await.unwrap().unwrap();
-    let r = admin
-        .post(format!("{base}/admin/cluster/config-key/add"))
-        .form(&[("key", key.encode())])
-        .send()
-        .await
-        .unwrap();
-    assert!(r.status().is_success());
-    let node_page = text(&admin, format!("{base}/admin/cluster/node/{}", b.id)).await;
-    assert!(node_page.contains("node-bravo"));
-    assert!(
-        node_page.contains("name=\"base_version\" value=\"0\""),
-        "{node_page}"
-    );
-    let r = admin
-        .post(format!("{base}/admin/cluster/node/{}", b.id))
-        .form(&[
-            ("base_version", "0"),
-            ("max_workers", "3"),
-            ("max_scans_per_hour", "55"),
-            ("timeout_minutes", "20"),
-            ("cooldown_hours", "12"),
-            ("listener", "on"),
-            ("web", "on"),
-        ])
-        .send()
-        .await
-        .unwrap();
-    assert!(r.status().is_success());
-    let s = nb.settings.snapshot();
-    assert_eq!((s.pace.max_workers, s.pace.max_scans_per_hour), (3, 55));
-    assert_eq!(s.pace.timeout_secs, 1200);
-    assert_eq!(s.cooldown_hours, 12);
-    assert!(
-        s.roles.listener && s.roles.web && !s.roles.scanner,
-        "unchecked role is off"
-    );
-
-    // The pace row cannot change B behind the version check.
-    let r = admin
-        .post(format!("{base}/admin/cluster/pace"))
-        .form(&[
-            ("key", b.id.to_string()),
-            ("max_workers", "1".into()),
-            ("max_scans_per_hour", "11".into()),
-            ("timeout_minutes", "5".into()),
-        ])
-        .send()
-        .await
-        .unwrap();
-    assert!(r.status().is_success());
-    assert_eq!(nb.settings.snapshot().pace.max_scans_per_hour, 55);
-
-    // This node's own settings from its own page, which carries the version
-    // it showed.
-    let page = text(&admin, format!("{base}/admin/system/settings")).await;
-    let shown = na.settings.snapshot().version;
-    assert!(
-        page.contains(&format!("name=\"base_version\" value=\"{shown}\"")),
-        "own form carries the version"
-    );
-    let own = |base_version: u64, cooldown: &'static str| {
-        admin
-            .post(format!("{base}/admin/cluster/settings"))
-            .form(&[
-                ("base_version", base_version.to_string()),
-                ("cooldown_hours", cooldown.into()),
-                ("listener", "on".into()),
-                ("scanner", "on".into()),
-                ("web", "on".into()),
-            ])
-            .send()
-    };
-    assert!(own(shown, "6").await.unwrap().status().is_success());
-    assert_eq!(na.settings.snapshot().cooldown_hours, 6);
-    // A change made elsewhere after the page was loaded is not overwritten.
-    na.settings
-        .apply(
-            &peephole::settings::Changes {
-                scanner: Some(false),
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(own(shown + 1, "7").await.unwrap().status().is_success());
-    let s = na.settings.snapshot();
-    assert!(
-        !s.roles.scanner,
-        "a stale form does not switch the scanner back on"
-    );
-    assert_eq!(s.cooldown_hours, 6);
-
-    // B stops answering: only the settings card says so.
-    drop(nb);
-    let r = admin
-        .get(format!("{base}/admin/cluster/node/{}", b.id))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200);
-    let html = r.text().await.unwrap();
-    assert!(
-        html.contains("did not answer") && html.contains("Contributions"),
-        "{html}"
-    );
-    let r = admin
-        .post(format!("{base}/admin/cluster/config-key/forget"))
-        .form(&[("key", b.id.to_string())])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        r.url().path(),
-        format!("/admin/cluster/node/{}", b.id),
-        "forgetting a key stays on the node page"
-    );
 }
 
 /// Enrichment results replicate with their origin; a blocked peer's results
@@ -3565,4 +3287,2567 @@ async fn admin_page_shows_contributions_per_node() {
         row.contains(r#"<td class="num">3 · 100 %</td>"#),
         "writer's share: {row}"
     );
+}
+
+/// Nodes with one ownership key find each other; nobody else is a sibling,
+/// and a released node is dropped at the next round.
+#[tokio::test]
+async fn fleet_nodes_find_each_other_and_nobody_else() {
+    use peephole::cluster::owner::{self, fleet};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let (id, d) = new_node("d");
+    let na = boot(ia, &a, &[&b, &c, &d], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c, &d], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b, &d], DEFAULT).await;
+    let nd = boot(id, &d, &[&a, &b, &c], DEFAULT).await;
+    // a and b share a key, c has its own, d has none.
+    let k1 = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &k1, false).await.unwrap();
+    owner::create(&nc.store, c.id).await.unwrap();
+
+    eventually("a and b find each other", || async {
+        fleet::discover(&na.node).await.unwrap() == vec![b.id]
+            && fleet::siblings(&nb.store).await.unwrap() == vec![a.id]
+    })
+    .await;
+    eventually("c and d reach the others and find nobody", || async {
+        nc.live_members(Duration::from_secs(45)).len() == 4
+            && nd.live_members(Duration::from_secs(45)).len() == 4
+    })
+    .await;
+    assert!(fleet::discover(&nc.node).await.unwrap().is_empty());
+    assert!(fleet::discover(&nd.node).await.unwrap().is_empty());
+    assert!(fleet::siblings(&nd.store).await.unwrap().is_empty());
+
+    // b cannot read its owner for a moment: it does not answer, and a
+    // keeps it as a sibling instead of forgetting it.
+    let cert = nb.store.setting_get("owner.cert").await.unwrap().unwrap();
+    nb.store.setting_set("owner.cert", "!").await.unwrap();
+    assert_eq!(fleet::discover(&na.node).await.unwrap(), vec![b.id]);
+    nb.store.setting_set("owner.cert", &cert).await.unwrap();
+
+    // b is released on its own console: a learns it at its next round.
+    owner::release(&nb.store).await.unwrap();
+    eventually("a drops b", || async {
+        fleet::discover(&na.node).await.unwrap().is_empty()
+    })
+    .await;
+}
+
+/// A managing node changes a sibling's settings; nobody else can, and a
+/// command works only once.
+#[tokio::test]
+async fn a_managing_node_changes_a_siblings_settings() {
+    use peephole::cluster::owner::{self, cmd, fleet};
+    use peephole::settings::Changes;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let (id, d) = new_node("d");
+    let na = boot(ia, &a, &[&b, &c, &d], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c, &d], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b, &d], DEFAULT).await;
+    let nd = boot(id, &d, &[&a, &b, &c], DEFAULT).await;
+    // Adopted while the nodes run: no restart is needed.
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    let stranger = owner::create(&nc.store, c.id).await.unwrap();
+    eventually("a finds b", || async {
+        fleet::discover(&na.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+
+    // Commands go only to members known to speak version 3: wait until a
+    // and c have b's and d's own descriptions.
+    eventually("the nodes know each other's version", || async {
+        [&na, &nc].iter().all(|n| {
+            let m = n.members();
+            [b.id, d.id]
+                .iter()
+                .all(|id| m.get(id).is_some_and(|x| x.proto_max >= 3))
+        })
+    })
+    .await;
+
+    let st = cmd::status(&na.node, &key, b.id).await.unwrap();
+    assert_eq!((st.counter, st.state.version), (0, 0));
+    let faster = cmd::OwnerCmd::Settings {
+        base_version: 0,
+        changes: Changes {
+            max_scans_per_hour: Some(77),
+            ..Default::default()
+        },
+    };
+    let note = cmd::run(&na.node, &key, b.id, 0, faster.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(note.contains("version 1"), "{note}");
+    assert_eq!(nb.pace.get().max_scans_per_hour, 77);
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 1);
+    let log = cmd::log_rows(&nb.store, 10).await.unwrap();
+    assert_eq!(log.len(), 1, "status is not logged");
+    assert_eq!(log[0].from, a.id);
+    assert!(log[0].command.contains("scans/h=77"), "{}", log[0].command);
+
+    // The same counter again (a replay, or a second manager): refused.
+    let e = cmd::run(&na.node, &key, b.id, 0, faster.clone())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("changed meanwhile"), "{e}");
+
+    // The settings' own rules still apply; the counter is used up anyway.
+    let none = cmd::OwnerCmd::Settings {
+        base_version: 1,
+        changes: Changes {
+            listener: Some(false),
+            scanner: Some(false),
+            web: Some(false),
+            ..Default::default()
+        },
+    };
+    let e = cmd::run(&na.node, &key, b.id, 1, none)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("at least one role"), "{e}");
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 2);
+
+    // Another owner's key is not accepted, and nothing changes.
+    let e = cmd::run(&nc.node, &stranger, b.id, 2, faster.clone())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("not accepted"), "{e}");
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 2);
+
+    // Status is answered whatever counter it names and changes nothing.
+    let logged = cmd::log_rows(&nb.store, 10).await.unwrap().len();
+    for _ in 0..2 {
+        let st = cmd::status(&na.node, &key, b.id).await.unwrap();
+        assert_eq!(st.counter, 2);
+    }
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 2);
+    assert_eq!(cmd::log_rows(&nb.store, 10).await.unwrap().len(), logged);
+
+    // A node that does not keep the key has nothing to send with.
+    let e = cmd::kept_key(&nb.node).await.err().unwrap().to_string();
+    assert!(e.contains("not kept on this node"), "{e}");
+
+    // A node without an owner refuses.
+    let e = cmd::run(&na.node, &key, d.id, 0, faster)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("no owner"), "{e}");
+    // ... and lists it among the refused attempts.
+    let refused = cmd::refused_rows(&nd.store, 10).await.unwrap();
+    assert!(
+        refused[0].command.contains("scans/h=77") && refused[0].result.contains("no owner"),
+        "{refused:?}"
+    );
+}
+
+/// A sibling that only dials out gets its commands from the outbox of a
+/// member it dials, once.
+#[tokio::test]
+async fn owner_commands_reach_an_outbound_only_sibling() {
+    use peephole::cluster::owner::{self, cmd};
+    use peephole::settings::Changes;
+    let (ia, a) = new_node("a");
+    let (ir, r) = new_node("r");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&r], DEFAULT).await;
+    let nr = boot(ir, &r, &[&a], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[],
+        Opts {
+            advertise: false,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let token = invite::create(&nr, &Default::default()).await.unwrap();
+    invite::join(&nb, &token).await.unwrap();
+    eventually("a knows b, which has no address", || async {
+        members::all(&na.store)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == b.id && m.info_hlc > 0 && m.address.is_none())
+    })
+    .await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    let slower = cmd::OwnerCmd::Settings {
+        base_version: 0,
+        changes: Changes {
+            cooldown_hours: Some(48),
+            ..Default::default()
+        },
+    };
+    eventually_for(Duration::from_secs(40), "the command arrives", || async {
+        matches!(
+            cmd::run(&na.node, &key, b.id, 0, slower.clone()).await,
+            Ok(Ok(_))
+        ) || nb.settings.snapshot().cooldown_hours == 48
+    })
+    .await;
+    assert_eq!(nb.settings.snapshot().cooldown_hours, 48);
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 1, "applied once");
+    // The same command sent again through the relay: refused.
+    let e = cmd::run(&na.node, &key, b.id, 0, slower)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("changed meanwhile"), "{e}");
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 1);
+}
+
+/// The owner's other commands on a sibling: block and unblock a peer,
+/// revoke an invite, release the node, have it leave.
+#[tokio::test]
+async fn owner_commands_block_revoke_release_and_leave() {
+    use peephole::cluster::owner::{self, cmd, cmd::OwnerCmd, fleet};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let _nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    eventually("a finds b", || async {
+        fleet::discover(&na.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+    // Each command with the counter the node reports.
+    let go = |c: OwnerCmd| {
+        let (node, key) = (na.node.clone(), &key);
+        async move {
+            let st = cmd::status(&node, key, b.id).await.unwrap();
+            cmd::run(&node, key, b.id, st.counter, c).await.unwrap()
+        }
+    };
+
+    go(OwnerCmd::Block {
+        node: c.id,
+        subtree: false,
+    })
+    .await
+    .unwrap();
+    assert!(nb.is_blocked(&c.id));
+    let st = cmd::status(&na.node, &key, b.id).await.unwrap();
+    assert_eq!(st.blocked, vec![c.id]);
+    // A node is not told to block the node that manages it.
+    let e = go(OwnerCmd::Block {
+        node: a.id,
+        subtree: false,
+    })
+    .await
+    .unwrap_err();
+    assert!(e.contains("manages it"), "{e}");
+    go(OwnerCmd::Unblock { node: c.id }).await.unwrap();
+    eventually("b unblocked c", || async { !nb.is_blocked(&c.id) }).await;
+
+    invite::create(&nb, &Default::default()).await.unwrap();
+    let st = cmd::status(&na.node, &key, b.id).await.unwrap();
+    let inv = st.invites.iter().find(|i| i.usable).expect("an invite").id;
+    go(OwnerCmd::InviteRevoke { id: inv }).await.unwrap();
+    let e = go(OwnerCmd::InviteRevoke { id: inv }).await.unwrap_err();
+    assert!(e.contains("no usable invite"), "{e}");
+
+    // Released: b has no owner, a no longer counts it, commands end.
+    go(OwnerCmd::Release).await.unwrap();
+    assert!(owner::load(&nb.store, b.id).await.unwrap().is_none());
+    assert!(fleet::siblings(&na.store).await.unwrap().is_empty());
+    let e = cmd::run(&na.node, &key, b.id, 0, OwnerCmd::Leave)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("no owner"), "{e}");
+
+    // Leave: adopted again, then told to leave.
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    go(OwnerCmd::Leave).await.unwrap();
+    eventually("a sees that b left", || async {
+        knows(&na, b.id, false).await
+    })
+    .await;
+}
+
+/// Rotation moves the siblings that answer to the new key and keeps the
+/// old one for the rest until they are moved or given up.
+#[tokio::test]
+async fn rotating_the_key_moves_reachable_siblings_and_retries_the_rest() {
+    use peephole::cluster::owner::{self, cmd, cmd::OwnerCmd, fleet};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let old = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &old, false).await.unwrap();
+    owner::adopt(&nc.store, c.id, &old, false).await.unwrap();
+    eventually("a finds b and c", || async {
+        fleet::discover(&na.node).await.unwrap().len() == 2
+    })
+    .await;
+    // c cannot answer a for now: a drops what a blocked peer says.
+    peephole::cluster::block::block(&na.node, c.id)
+        .await
+        .unwrap();
+
+    let rot = cmd::rotate(&na.node, &[]).await.unwrap();
+    assert_eq!(rot.moved, vec![b.id]);
+    assert_eq!(rot.pending.len(), 1);
+    assert_eq!(rot.pending[0].0, c.id);
+    assert_ne!(rot.key.id, old.id);
+    let mine = owner::load(&na.store, a.id).await.unwrap().unwrap();
+    assert_eq!(mine.id, rot.key.id);
+    assert!(mine.managing());
+    assert_eq!(
+        owner::load(&nb.store, b.id).await.unwrap().unwrap().id,
+        rot.key.id
+    );
+    assert_eq!(fleet::siblings(&na.store).await.unwrap(), vec![b.id]);
+    assert_eq!(cmd::pending(&na.store).await.unwrap(), vec![c.id]);
+    let why = cmd::pending_reasons(&na.store).await.unwrap();
+    assert!(why[0].1.contains("no answer"), "{why:?}");
+    // A second rotation would forget c and the key it is still on: refused
+    // while c is pending.
+    let e = cmd::rotate(&na.node, &[])
+        .await
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(e.contains("retry or give up"), "{e}");
+    assert_eq!(cmd::pending(&na.store).await.unwrap(), vec![c.id]);
+    assert_eq!(
+        owner::load(&nb.store, b.id).await.unwrap().unwrap().id,
+        rot.key.id,
+        "b was not moved again"
+    );
+    // Forgetting the key now would strand c on the old one: the page refuses.
+    let (admin, base) = admin_on(&na).await;
+    let r = admin
+        .post(format!("{base}/admin/cluster/ownership/forget-key"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert!(
+        owner::load(&na.store, a.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .managing()
+    );
+    assert_eq!(cmd::pending(&na.store).await.unwrap(), vec![c.id]);
+    // b no longer takes the old key.
+    let e = cmd::run(&na.node, &old, b.id, 0, OwnerCmd::Leave)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("not accepted"), "{e}");
+    // c is still on the old key.
+    assert_eq!(
+        owner::load(&nc.store, c.id).await.unwrap().unwrap().id,
+        old.id
+    );
+
+    // Reachable again: the retry moves it and the old key is dropped.
+    peephole::cluster::block::unblock(&na.node, c.id)
+        .await
+        .unwrap();
+    // Until it is moved, c does not take the new key.
+    eventually_for(Duration::from_secs(40), "c refuses the new key", || async {
+        cmd::status(&na.node, &rot.key, c.id)
+            .await
+            .is_err_and(|e| e.to_string().contains("not accepted"))
+    })
+    .await;
+    eventually_for(Duration::from_secs(40), "the retry moves c", || async {
+        cmd::retry(&na.node)
+            .await
+            .unwrap()
+            .iter()
+            .all(|(_, r)| r.is_ok())
+    })
+    .await;
+    assert_eq!(
+        owner::load(&nc.store, c.id).await.unwrap().unwrap().id,
+        rot.key.id
+    );
+    assert!(cmd::pending(&na.store).await.unwrap().is_empty());
+    assert!(
+        na.store
+            .setting_get("owner.old_seed")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut sibs = fleet::siblings(&na.store).await.unwrap();
+    sibs.sort();
+    let mut want = vec![b.id, c.id];
+    want.sort();
+    assert_eq!(sibs, want);
+
+    // Giving up on the rest instead: nothing pending, no old key.
+    na.store
+        .setting_set("owner.old_seed", "AAAA")
+        .await
+        .unwrap();
+    cmd::discard(&na.store).await.unwrap();
+    assert!(
+        na.store
+            .setting_get("owner.old_seed")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// "Collect credits here": the siblings that answer forward to this node,
+/// one blocked here is not asked, and the page says where each node's
+/// credits go.
+#[tokio::test]
+async fn collecting_credits_here_tells_the_siblings_and_shows_where_credits_go() {
+    use peephole::cluster::owner::{self, fleet};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    owner::adopt(&nc.store, c.id, &key, false).await.unwrap();
+    eventually("a finds b and c", || async {
+        fleet::discover(&na.node).await.unwrap().len() == 2
+    })
+    .await;
+    peephole::cluster::block::block(&na.node, c.id)
+        .await
+        .unwrap();
+    let (admin, base) = admin_on(&na).await;
+    let page = format!("{base}/admin/cluster/ownership");
+    let r = admin
+        .post(format!("{page}/collect-here"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(nb.settings.snapshot().collect_to, Some(a.id));
+    assert_eq!(nc.settings.snapshot().collect_to, None, "not asked");
+    assert_eq!(na.settings.snapshot().collect_to, None);
+
+    eventually("b's status reaches the page", || async {
+        let html = text(&admin, page.clone()).await;
+        html.contains("Credits go") && html.contains("forwards to this node")
+    })
+    .await;
+    let html = text(&admin, page.clone()).await;
+    assert!(
+        html.contains("keeps what it earns"),
+        "a keeps its own: {html}"
+    );
+    assert!(html.contains("offline"), "c is not asked: {html}");
+}
+
+/// The Ownership page: create a key (shown once), adopt it on a second
+/// node, see that node listed, see received commands, forget and release.
+#[tokio::test]
+async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
+    use peephole::cluster::owner::{self, cmd, fleet};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let (admin_a, base_a) = admin_on(&na).await;
+    let (admin_b, base_b) = admin_on(&nb).await;
+    let page_a = format!("{base_a}/admin/cluster/ownership");
+    let page_b = format!("{base_b}/admin/cluster/ownership");
+
+    let html = text(&admin_a, page_a.clone()).await;
+    assert!(html.contains("No owner"), "{html}");
+    assert!(html.contains("Ownership</a>"), "the tab is there");
+
+    // Create: the key is on the answer, and nowhere afterwards.
+    let r = admin_a
+        .post(format!("{page_a}/create"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let html = r.text().await.unwrap();
+    let key = html
+        .split("peephole-own1:")
+        .nth(1)
+        .and_then(|s| s.split('<').next())
+        .map(|s| format!("peephole-own1:{}", s.trim()))
+        .expect("the key is shown");
+    let html = text(&admin_a, page_a.clone()).await;
+    assert!(!html.contains("peephole-own1:"), "shown once");
+    assert!(html.contains("key kept here"), "{html}");
+    // A second create does not replace the owner.
+    let before = owner::load(&na.store, a.id).await.unwrap().unwrap().id;
+    admin_a
+        .post(format!("{page_a}/create"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        owner::load(&na.store, a.id).await.unwrap().unwrap().id,
+        before
+    );
+
+    // On b: an invite token is not a key; the real key is adopted, not kept.
+    admin_b
+        .post(format!("{page_b}/adopt"))
+        .form(&[("key", "peephole1:abc")])
+        .send()
+        .await
+        .unwrap();
+    assert!(owner::load(&nb.store, b.id).await.unwrap().is_none());
+    let r = admin_b
+        .post(format!("{page_b}/adopt"))
+        .form(&[("key", key.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let html = text(&admin_b, page_b.clone()).await;
+    assert!(html.contains("key not kept here"), "{html}");
+
+    // a lists b under My nodes; b lists what a told it to do.
+    eventually("a finds b", || async {
+        fleet::discover(&na.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+    let html = text(&admin_a, page_a.clone()).await;
+    assert!(
+        html.contains("My nodes") && html.contains("node-bravo"),
+        "{html}"
+    );
+    let kept = cmd::kept_key(&na.node).await.unwrap();
+    cmd::run(
+        &na.node,
+        &kept,
+        b.id,
+        0,
+        cmd::OwnerCmd::Settings {
+            base_version: 0,
+            changes: peephole::settings::Changes {
+                cooldown_hours: Some(12),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let html = text(&admin_b, page_b.clone()).await;
+    assert!(
+        html.contains("Commands received") && html.contains("settings: cooldown=12h"),
+        "{html}"
+    );
+    assert!(html.contains("node-alpha"), "who sent it");
+
+    // Show key again, forget it, release b.
+    let r = admin_a
+        .post(format!("{page_a}/show-key"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.text().await.unwrap().contains(&key));
+    admin_a
+        .post(format!("{page_a}/forget-key"))
+        .send()
+        .await
+        .unwrap();
+    let html = text(&admin_a, page_a.clone()).await;
+    assert!(html.contains("key not kept here"), "{html}");
+    admin_b
+        .post(format!("{page_b}/release"))
+        .send()
+        .await
+        .unwrap();
+    let html = text(&admin_b, page_b).await;
+    assert!(html.contains("No owner"), "{html}");
+}
+
+/// A node of an earlier version sends a config key request: it is told
+/// what replaced it, and no node reports itself open any more.
+#[tokio::test]
+async fn old_config_key_requests_are_answered_with_the_replacement() {
+    use peephole::cluster::msg::Msg;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
+    eventually("b answers", || async {
+        peephole::cluster::remote::get(&na.node, b.id).await.is_ok()
+    })
+    .await;
+    assert!(
+        !peephole::cluster::remote::get(&na.node, b.id)
+            .await
+            .unwrap()
+            .open
+    );
+    let old = Msg::ConfigSet {
+        base_version: 0,
+        changes: Default::default(),
+        mac: serde_bytes::ByteBuf::new(),
+    };
+    match na
+        .node
+        .request(b.id, old, Duration::from_secs(10))
+        .await
+        .unwrap()
+    {
+        Msg::ConfigSetReply {
+            version: None,
+            error: Some(e),
+        } => assert!(e.contains("replaced by the ownership key"), "{e}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The counter a member page's forms carry.
+fn counter_on(html: &str) -> String {
+    html.split("name=\"counter\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("the page carries the counter")
+        .to_string()
+}
+
+/// The admin of a managing node changes a sibling from its page.
+#[tokio::test]
+async fn admin_manages_a_sibling_from_its_page() {
+    use peephole::cluster::owner::{self, fleet};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let _nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    eventually("a finds b", || async {
+        fleet::discover(&na.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+    let (admin, base) = admin_on(&na).await;
+    let b_page = format!("{base}/admin/cluster/node/{}", b.id);
+
+    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    assert!(members.contains(">yours<"), "b is marked in the table");
+    let html = text(&admin, b_page.clone()).await;
+    assert!(html.contains("node-bravo") && html.contains(">yours<"));
+    assert!(html.contains("name=\"base_version\" value=\"0\""), "{html}");
+    assert!(
+        html.contains("Collect credits at") && html.contains(&format!("value=\"{}\"", a.id)),
+        "this node is offered as b's collecting node: {html}"
+    );
+    assert!(
+        !html.contains("Remote configuration"),
+        "the old line is gone"
+    );
+    // c is a member, not a sibling.
+    let c_html = text(&admin, format!("{base}/admin/cluster/node/{}", c.id)).await;
+    assert!(c_html.contains("Not one of your nodes"), "{c_html}");
+
+    let r = admin
+        .post(b_page.clone())
+        .form(&[
+            ("counter", counter_on(&html).as_str()),
+            ("base_version", "0"),
+            ("max_workers", "3"),
+            ("max_scans_per_hour", "55"),
+            ("timeout_minutes", "20"),
+            ("cooldown_hours", "12"),
+            ("listener", "on"),
+            ("web", "on"),
+            ("collect_to", &a.id.to_string()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let s = nb.settings.snapshot();
+    assert_eq!(s.collect_to, Some(a.id), "b now forwards to a");
+    assert_eq!((s.pace.max_workers, s.pace.max_scans_per_hour), (3, 55));
+    assert_eq!(s.pace.timeout_secs, 1200);
+    assert_eq!(s.cooldown_hours, 12);
+    assert!(
+        s.roles.listener && s.roles.web && !s.roles.scanner,
+        "unchecked role is off"
+    );
+
+    // The pace row cannot change b behind the version check.
+    let r = admin
+        .post(format!("{base}/admin/cluster/pace"))
+        .form(&[
+            ("key", b.id.to_string()),
+            ("max_workers", "1".into()),
+            ("max_scans_per_hour", "11".into()),
+            ("timeout_minutes", "5".into()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(nb.settings.snapshot().pace.max_scans_per_hour, 55);
+
+    // An owner action: b blocks c, and the page then lists it.
+    let html = text(&admin, b_page.clone()).await;
+    let r = admin
+        .post(format!("{b_page}/owner"))
+        .form(&[
+            ("counter", counter_on(&html)),
+            ("action", "block".into()),
+            ("target", c.id.to_string()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert!(nb.is_blocked(&c.id));
+    let html = text(&admin, b_page.clone()).await;
+    assert!(
+        html.contains("Blocked there") && html.contains("node-charlie"),
+        "{html}"
+    );
+
+    // A stale form (the counter moved on) changes nothing.
+    let r = admin
+        .post(format!("{b_page}/owner"))
+        .form(&[
+            ("counter", "0".to_string()),
+            ("action", "unblock".to_string()),
+            ("target", c.id.to_string()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert!(nb.is_blocked(&c.id));
+
+    // This node's own settings from its own page, as before.
+    let page = text(&admin, format!("{base}/admin/system/settings")).await;
+    let shown = na.settings.snapshot().version;
+    assert!(
+        page.contains(&format!("name=\"base_version\" value=\"{shown}\"")),
+        "own form carries the version"
+    );
+    let r = admin
+        .post(format!("{base}/admin/cluster/settings"))
+        .form(&[
+            ("base_version", shown.to_string()),
+            ("cooldown_hours", "6".into()),
+            ("listener", "on".into()),
+            ("scanner", "on".into()),
+            ("web", "on".into()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(na.settings.snapshot().cooldown_hours, 6);
+    // Where it forwards its credits is set here too (spec §9), and
+    // cleared with an empty field.
+    let page = text(&admin, format!("{base}/admin/system/settings")).await;
+    assert!(page.contains("name=\"collect_to\""), "{page}");
+    for (to, want) in [(b.id.to_string(), Some(b.id)), (String::new(), None)] {
+        let shown = na.settings.snapshot().version;
+        let r = admin
+            .post(format!("{base}/admin/cluster/settings"))
+            .form(&[
+                ("base_version", shown.to_string()),
+                ("cooldown_hours", "6".into()),
+                ("listener", "on".into()),
+                ("scanner", "on".into()),
+                ("web", "on".into()),
+                ("collect_to", to),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        assert_eq!(na.settings.snapshot().collect_to, want);
+    }
+
+    // A crafted form cannot aim an owner command at this node itself, or
+    // at a member that is not one of the operator's nodes.
+    let mine = owner::counter(&na.store).await.unwrap().to_string();
+    for target in [a.id, c.id] {
+        let r = admin
+            .post(format!("{base}/admin/cluster/node/{target}/owner"))
+            .form(&[("counter", mine.as_str()), ("action", "release")])
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+    }
+    assert!(
+        owner::load(&na.store, a.id).await.unwrap().is_some(),
+        "not released through its own form"
+    );
+    assert_eq!(owner::counter(&na.store).await.unwrap().to_string(), mine);
+
+    // b stops answering: only the settings card says so. Its server
+    // shuts down in the background, so ask until it is gone; one ask
+    // waits out the 15 s status timeout.
+    drop(nb);
+    eventually_for(
+        Duration::from_secs(60),
+        "b's page says it did not answer",
+        || async {
+            let r = admin.get(&b_page).send().await.unwrap();
+            assert_eq!(r.status(), 200);
+            let html = r.text().await.unwrap();
+            html.contains("did not answer") && html.contains("Contributions")
+        },
+    )
+    .await;
+}
+
+/// On a node that does not keep the key, a sibling's page says so and
+/// nothing can be sent from it.
+#[tokio::test]
+async fn a_node_without_the_key_shows_its_siblings_read_only() {
+    use peephole::cluster::owner::{self, fleet};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    eventually("b knows a as a sibling", || async {
+        fleet::discover(&nb.node).await.unwrap() == vec![a.id]
+    })
+    .await;
+    let (admin, base) = admin_on(&nb).await;
+    let a_page = format!("{base}/admin/cluster/node/{}", a.id);
+    let html = text(&admin, a_page.clone()).await;
+    assert!(html.contains(">yours<"), "{html}");
+    assert!(
+        html.contains("The ownership key is not kept on this node"),
+        "{html}"
+    );
+    assert!(
+        !html.contains("name=\"counter\""),
+        "no form without the key"
+    );
+    // Posted anyway: nothing is sent, nothing changes.
+    for (path, form) in [
+        (
+            a_page.clone(),
+            vec![
+                ("counter", "0"),
+                ("base_version", "0"),
+                ("cooldown_hours", "1"),
+                ("listener", "on"),
+            ],
+        ),
+        (
+            format!("{a_page}/owner"),
+            vec![("counter", "0"), ("action", "leave")],
+        ),
+    ] {
+        let r = admin.post(path).form(&form).send().await.unwrap();
+        assert!(r.status().is_success());
+    }
+    assert_eq!(owner::counter(&na.store).await.unwrap(), 0);
+    assert_eq!(na.settings.snapshot().version, 0);
+    assert!(knows(&nb, a.id, true).await);
+}
+
+/// A subtree block that would take in the managing node is refused: the
+/// owner cannot lock itself out of a node from afar.
+#[tokio::test]
+async fn a_subtree_block_never_includes_the_managing_node() {
+    use peephole::cluster::owner::{self, cmd, cmd::OwnerCmd, fleet};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let _nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    eventually("a finds b", || async {
+        fleet::discover(&na.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+    // c vouched for a (its config peer), so a is in c's subtree as b sees it.
+    eventually("b knows that c admitted a", || async {
+        members::subtree(&nb.store, c.id, b.id)
+            .await
+            .unwrap()
+            .contains(&a.id)
+    })
+    .await;
+    let st = cmd::status(&na.node, &key, b.id).await.unwrap();
+    let all = OwnerCmd::Block {
+        node: c.id,
+        subtree: true,
+    };
+    let e = cmd::run(&na.node, &key, b.id, st.counter, all)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("manages it"), "{e}");
+    assert!(!nb.is_blocked(&a.id) && !nb.is_blocked(&c.id));
+    // b still answers a.
+    cmd::status(&na.node, &key, b.id).await.unwrap();
+}
+
+/// A rotation that is cut short (the browser went away, the process was
+/// stopped) does not lose the new key: siblings that already took it are
+/// not left with an owner nobody holds, and finishing uses the same key.
+#[tokio::test]
+async fn an_interrupted_rotation_is_finished_with_the_same_key() {
+    use peephole::cluster::owner::{self, cmd, fleet};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let old = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &old, false).await.unwrap();
+    owner::adopt(&nc.store, c.id, &old, false).await.unwrap();
+    eventually("a finds b and c", || async {
+        fleet::discover(&na.node).await.unwrap().len() == 2
+    })
+    .await;
+    // Siblings are asked in the order of their ids: the first one moves,
+    // the second one does not answer (a drops what a blocked peer says).
+    let (first, n_first, last) = if b.id < c.id {
+        (b.id, &nb, c.id)
+    } else {
+        (c.id, &nc, b.id)
+    };
+    peephole::cluster::block::block(&na.node, last)
+        .await
+        .unwrap();
+    let cut = tokio::time::timeout(Duration::from_secs(5), cmd::rotate(&na.node, &[])).await;
+    assert!(cut.is_err(), "still waiting for the silent sibling");
+    let moved_to = owner::load(&n_first.store, first)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    assert_ne!(
+        moved_to, old.id,
+        "the first sibling already took the new key"
+    );
+    assert_eq!(
+        owner::load(&na.store, a.id).await.unwrap().unwrap().id,
+        old.id,
+        "this node switches last"
+    );
+
+    // Finishing the rotation: the same key, not another new one.
+    let rot = cmd::rotate(&na.node, &[]).await.unwrap();
+    assert_eq!(rot.key.id, moved_to);
+    assert_eq!(
+        owner::load(&na.store, a.id).await.unwrap().unwrap().id,
+        moved_to
+    );
+    assert_eq!(cmd::pending(&na.store).await.unwrap(), vec![last]);
+    eventually("a counts the moved sibling as its own again", || async {
+        fleet::discover(&na.node).await.unwrap().contains(&first)
+    })
+    .await;
+}
+
+/// A node left out of a rotation stays on the old key and is no longer
+/// counted: this is how a node that does not cooperate is put out.
+#[tokio::test]
+async fn a_rotation_leaves_out_the_nodes_named() {
+    use peephole::cluster::owner::{self, cmd, fleet};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let old = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &old, false).await.unwrap();
+    owner::adopt(&nc.store, c.id, &old, false).await.unwrap();
+    eventually("a finds b and c", || async {
+        fleet::discover(&na.node).await.unwrap().len() == 2
+    })
+    .await;
+    let (admin, base) = admin_on(&na).await;
+    let page = format!("{base}/admin/cluster/ownership");
+    let html = text(&admin, page.clone()).await;
+    assert!(
+        html.contains(&format!("name=\"skip\" value=\"{}\"", c.id)),
+        "the dialog offers to leave c out"
+    );
+    let r = admin
+        .post(format!("{page}/rotate"))
+        .form(&[("skip", c.id.to_string())])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert!(r.text().await.unwrap().contains("peephole-own1:"));
+
+    let new = owner::load(&na.store, a.id).await.unwrap().unwrap().id;
+    assert_ne!(new, old.id);
+    assert_eq!(owner::load(&nb.store, b.id).await.unwrap().unwrap().id, new);
+    assert_eq!(
+        owner::load(&nc.store, c.id).await.unwrap().unwrap().id,
+        old.id
+    );
+    assert!(
+        cmd::pending(&na.store).await.unwrap().is_empty(),
+        "left out, not waited for"
+    );
+    assert!(
+        na.store
+            .setting_get("owner.old_seed")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        na.store
+            .setting_get("owner.next_seed")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // c still greets with its old certificate: it is counted by nobody.
+    assert!(fleet::discover(&nc.node).await.unwrap().is_empty());
+    assert_eq!(fleet::discover(&na.node).await.unwrap(), vec![b.id]);
+}
+/// A payment written on one node is in every node's table of credit
+/// entries, also when the node that receives it has blocked nobody and
+/// knows nothing else about credits yet.
+#[tokio::test]
+async fn credit_entries_replicate_into_every_nodes_table() {
+    use peephole::cluster::record::Seal;
+    use peephole::credits::{self, entries};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let today = credits::day_of(na.hlc.now());
+    let written = repl::append(
+        &na,
+        &[Record::CreditTransfer {
+            to: b.id,
+            parts: vec![(today, 250)],
+            seal: Seal::default(),
+        }],
+    )
+    .await
+    .unwrap();
+    eventually("b holds a's transfer as a row", || async {
+        entries::get(&nb.store.pool, &a.id, written[0].seq)
+            .await
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    let row = entries::get(&nb.store.pool, &a.id, written[0].seq)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.kind,
+        entries::Kind::Transfer {
+            to: b.id,
+            parts: vec![(today, 250)]
+        }
+    );
+    assert_eq!(entries::since(&na.store.pool, 0).await.unwrap().len(), 1);
+}
+/// A node's sealed payments check out where its log is held, and an
+/// entry with a made-up seal does not.
+#[tokio::test]
+async fn sealed_payments_check_out_on_the_other_node() {
+    use peephole::cluster::record::Seal;
+    use peephole::credits::{self, entries, entries::SealState};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let today = credits::day_of(na.hlc.now());
+    let transfer = |seal: Seal| Record::CreditTransfer {
+        to: b.id,
+        parts: vec![(today, 10)],
+        seal,
+    };
+    let first = repl::append_sealing(&na, transfer).await.unwrap();
+    let second = repl::append_sealing(&na, transfer).await.unwrap();
+    let made_up = repl::append(
+        &na,
+        &[transfer(Seal {
+            from: second.seq,
+            digest: vec![3; 32],
+        })],
+    )
+    .await
+    .unwrap();
+    eventually("b holds all three", || async {
+        entries::get(&nb.store.pool, &a.id, made_up[0].seq)
+            .await
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    for n in [&na, &nb] {
+        let state = |seq: u64| async move {
+            entries::get(&n.store.pool, &a.id, seq)
+                .await
+                .unwrap()
+                .unwrap()
+                .seal
+        };
+        assert_eq!(state(first.seq).await, SealState::Consistent);
+        assert_eq!(state(second.seq).await, SealState::Consistent);
+        assert_eq!(state(made_up[0].seq).await, SealState::Inconsistent);
+    }
+}
+/// A node gives two members different entries at one position of its
+/// log and then seals one of them. The member holding the other one marks
+/// it, fetches the contradicting entry and publishes the proof; a member
+/// that saw no contradiction itself marks it from the proof alone.
+#[tokio::test]
+async fn a_node_that_shows_two_histories_is_proven_and_marked_everywhere() {
+    use peephole::cluster::record::Seal;
+    use peephole::cluster::seal;
+    use sha2::Digest;
+    // x never runs: its log is written by hand below.
+    let (ix, x) = new_node("x");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let nb = boot(ib, &b, &[&x, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&x, &b], DEFAULT).await;
+    let now = nb.hlc.now();
+    let sign = |seq: u64, r: &Record| WireEntry::sign(&ix, seq, now + seq, r).unwrap();
+    let e1 = sign(
+        1,
+        &Record::LogSeal {
+            seal: Seal {
+                from: 1,
+                digest: seal::empty().to_vec(),
+            },
+        },
+    );
+    let receipt = |charged: u32| Record::CreditReceipt {
+        payer: b.id,
+        offer_seq: 1,
+        charged_mc: charged,
+        answered: vec![],
+    };
+    let (for_b, for_c) = (sign(2, &receipt(1)), sign(2, &receipt(2)));
+    repl::apply_batch(&nb, vec![e1.clone(), for_b.clone()])
+        .await
+        .unwrap();
+    repl::apply_batch(&nc, vec![e1.clone(), for_c.clone()])
+        .await
+        .unwrap();
+    // Both hold x up to 2, so a sync round moves nothing: the fork is
+    // invisible until x commits to one branch.
+    assert!(seal::forked_set(&nb.store.pool).await.unwrap().is_empty());
+    let mut h = sha2::Sha256::new();
+    h.update(e1.digest().unwrap());
+    h.update(for_c.digest().unwrap());
+    let e3 = sign(
+        3,
+        &Record::LogSeal {
+            seal: Seal {
+                from: 1,
+                digest: h.finalize().to_vec(),
+            },
+        },
+    );
+    repl::apply_batch(&nc, vec![e3]).await.unwrap();
+    assert!(
+        seal::forked_set(&nc.store.pool).await.unwrap().is_empty(),
+        "c holds the branch that was sealed"
+    );
+    eventually("b gets the seal and sees it does not match", || async {
+        seal::forked_set(&nb.store.pool)
+            .await
+            .unwrap()
+            .contains(&x.id)
+    })
+    .await;
+    assert_eq!(seal::forked(&nb.store.pool).await.unwrap()[0].proof, None);
+    eventually("b fetches c's entry and writes the proof", || async {
+        seal::investigate(&nb.node).await.unwrap();
+        seal::forked(&nb.store.pool).await.unwrap()[0]
+            .proof
+            .is_some()
+    })
+    .await;
+    eventually("c marks x from b's proof alone", || async {
+        seal::forked(&nc.store.pool)
+            .await
+            .unwrap()
+            .iter()
+            .any(|f| f.origin == x.id && f.seq == 2 && f.proof.is_some_and(|p| p.0 == b.id))
+    })
+    .await;
+    // Marked for good, and one proof is enough.
+    assert_eq!(seal::investigate(&nb.node).await.unwrap(), 0);
+}
+/// A stand-in nmap that records the command line it was given, as nmap
+/// does: its results count as run with the built-in arguments.
+fn fake_nmap_args(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("fake-nmap-args");
+    std::fs::write(
+        &p,
+        "#!/bin/sh\nfor a; do t=$a; done\ncat <<EOF\n<?xml version=\"1.0\"?>\n\
+         <nmaprun scanner=\"nmap\" args=\"nmap $*\" start=\"1\" version=\"7.94\">\n\
+         <host><status state=\"up\"/><address addr=\"$t\" addrtype=\"ipv4\"/>\n\
+         <ports><port protocol=\"tcp\" portid=\"22\"><state state=\"open\"/>\
+         <service name=\"ssh\"/></port></ports></host>\n</nmaprun>\nEOF\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// Judge every payable scan held on `n` now (the node's own loop waits
+/// ten minutes for the requests behind a scan).
+async fn judge_now(n: &TestNode) -> usize {
+    let origins = peephole::scan::guard::Origins::Any;
+    let j = peephole::credits::earn::Judge {
+        pool: &n.store.pool,
+        origins: &origins,
+        classifier: peephole::classify::Classifier::builtin(),
+    };
+    peephole::credits::earn::judge(&j, 0).await.unwrap()
+}
+
+/// A scanner completes a scan for another node's trap: both hold their
+/// shares in every node's book.
+#[tokio::test]
+async fn a_completed_scan_pays_scanner_and_trap_in_every_nodes_book() {
+    use peephole::credits;
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a, &c],
+        Opts {
+            scanner: Some(fake_nmap_args(tools.path())),
+            ..DEFAULT
+        },
+    )
+    .await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    enqueue(&na, "198.51.100.40", 2).await;
+    eventually_for(
+        Duration::from_secs(40),
+        "scanned, and everyone has it all",
+        || async {
+            let mut all = true;
+            for n in [&na, &nb, &nc] {
+                all &= count(n, "SELECT COUNT(*) FROM scans").await == 1
+                    && count(n, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 1
+                    && count(n, "SELECT COUNT(*) FROM requests").await == 3;
+            }
+            all
+        },
+    )
+    .await;
+    for n in [&na, &nb, &nc] {
+        assert_eq!(judge_now(n).await, 1);
+        let book = credits::book_fresh(&n.node).await.unwrap();
+        assert_eq!(book.paid.len(), 1);
+        assert!(book.paid[0].scan.args_ok && book.paid[0].scan.level == 2);
+        assert_eq!(book.balance(&b.id), 1000, "the scanner's share");
+        assert_eq!(book.balance(&a.id), 250, "the trap's share");
+        assert_eq!(book.balance(&c.id), 0);
+        assert_eq!(book.earned_per_day(), 1250 / 7);
+        assert!(book.standing(&b.id).earns());
+    }
+    // A member blocked here earns nothing here; elsewhere it still does.
+    peephole::cluster::block::block(&nc.node, b.id)
+        .await
+        .unwrap();
+    let book = credits::book_fresh(&nc.node).await.unwrap();
+    assert_eq!(book.balance(&b.id), 0);
+    assert!(book.standing(&b.id).blocked);
+    assert_eq!(
+        credits::book_fresh(&na.node).await.unwrap().balance(&b.id),
+        1000
+    );
+}
+
+/// A stand-in nmap that reports a host with no open port, whatever the
+/// target: a scanner that makes its results up.
+fn fake_nmap_empty(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("fake-nmap-empty");
+    std::fs::write(
+        &p,
+        "#!/bin/sh\nfor a; do t=$a; done\ncat <<EOF\n<?xml version=\"1.0\"?>\n\
+         <nmaprun scanner=\"nmap\" args=\"nmap $*\" start=\"1\" version=\"7.94\">\n\
+         <host><status state=\"up\"/><address addr=\"$t\" addrtype=\"ipv4\"/>\
+         <ports></ports></host>\n</nmaprun>\nEOF\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// A scanner that audits everything finds another scanner's results made
+/// up. That scanner then earns no scanner share where those audits count:
+/// at the auditor and in its fleet, and at nobody else.
+#[tokio::test]
+async fn audits_of_made_up_results_stop_a_scanners_shares_where_they_count() {
+    use peephole::cluster::owner::{self, fleet};
+    use peephole::credits::{self, audit};
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("a");
+    let (i_f, f) = new_node("f");
+    let (ib, b) = new_node("b");
+    let (is, s) = new_node("s");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&f, &b, &s, &c], DEFAULT).await;
+    let _nf = boot(
+        i_f,
+        &f,
+        &[&a, &b, &s, &c],
+        Opts {
+            scanner: Some(fake_nmap_empty(tools.path())),
+            ..DEFAULT
+        },
+    )
+    .await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a, &f, &s, &c],
+        Opts {
+            scanner: Some(fake_nmap_args(tools.path())),
+            audit_share: 1.0,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let ns = boot(is, &s, &[&a, &f, &b, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &f, &b, &s], DEFAULT).await;
+    let key = owner::create(&nb.store, b.id).await.unwrap();
+    owner::adopt(&ns.store, s.id, &key, false).await.unwrap();
+    eventually("s knows b as one of its own", || async {
+        fleet::discover(&ns.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+
+    for i in 0..16 {
+        enqueue(&na, &format!("198.51.100.{}", 60 + i), 1).await;
+    }
+    eventually_for(Duration::from_secs(60), "all sixteen scanned", || async {
+        count(&na, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 16
+    })
+    .await;
+    let by_f = scans_by(&na, f.id).await;
+    assert!(by_f >= 5, "f ran {by_f} of 16 scans");
+    eventually_for(
+        Duration::from_secs(60),
+        "b ran f's scans again, and everyone holds the audits",
+        || async {
+            let mut all = true;
+            for n in [&nb, &ns, &nc] {
+                all &= count(n, "SELECT COUNT(*) FROM scans WHERE audit_of IS NOT NULL").await
+                    == by_f
+                    && count(n, "SELECT COUNT(*) FROM scans WHERE audit_of IS NULL").await == 16;
+            }
+            all
+        },
+    )
+    .await;
+    for n in [&nb, &ns, &nc] {
+        assert_eq!(judge_now(n).await, 16);
+        audit::settle(&n.store.pool).await.unwrap();
+        assert_eq!(
+            count(
+                n,
+                "SELECT COUNT(*) FROM scans WHERE audit_result = 'differs'"
+            )
+            .await,
+            by_f,
+            "nothing reported, a port found"
+        );
+    }
+    let honest = (16 - by_f) as u64 * 1000;
+    for n in [&nb, &ns] {
+        let book = credits::book_fresh(&n.node).await.unwrap();
+        let st = book.standing(&f.id);
+        assert_eq!(st.audits, Some((by_f as u32, by_f as u32)));
+        assert!(st.earns() && !st.earns_as_scanner());
+        assert_eq!(book.balance(&f.id), 0);
+        assert_eq!(book.balance(&b.id), honest);
+        // The trap is paid for every scan all the same.
+        assert_eq!(book.balance(&a.id), 16 * 250);
+    }
+    // c is not of b's fleet: b's audits are shown there, they do not count.
+    let book = credits::book_fresh(&nc.node).await.unwrap();
+    assert_eq!(book.standing(&f.id).audits, None);
+    assert_eq!(book.balance(&f.id), by_f as u64 * 1000);
+    assert_eq!(book.balance(&b.id), honest);
+}
+
+/// A provider a test node serves: a name the cluster knows, an optional
+/// budget a day, and a count of the addresses it was asked about.
+struct TestProvider {
+    name: &'static str,
+    per_day: Option<f64>,
+    asked: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl peephole::intel::provider::Provider for TestProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn ready(&self) -> bool {
+        true
+    }
+    fn per_day(&self) -> Option<f64> {
+        self.per_day
+    }
+    fn lookup<'a>(
+        &'a self,
+        ips: &'a [String],
+    ) -> futures::future::BoxFuture<'a, Vec<peephole::intel::provider::Finding>> {
+        Box::pin(async move {
+            self.asked
+                .fetch_add(ips.len(), std::sync::atomic::Ordering::SeqCst);
+            ips.iter()
+                .map(|ip| peephole::intel::provider::Finding {
+                    ip: ip.clone(),
+                    source_version: None,
+                    data: serde_json::json!({ "said_by": self.name }),
+                })
+                .collect()
+        })
+    }
+}
+
+/// Make `n` serve `list` (provider name, budget a day) with the given
+/// on-demand share. Returns the counter of addresses its providers were
+/// asked about.
+fn serves(
+    n: &TestNode,
+    list: &[(&'static str, Option<f64>)],
+    share: f64,
+) -> Arc<std::sync::atomic::AtomicUsize> {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let providers: peephole::intel::Providers = list
+        .iter()
+        .map(|(name, per_day)| {
+            Arc::new(TestProvider {
+                name,
+                per_day: *per_day,
+                asked: asked.clone(),
+            }) as Arc<dyn peephole::intel::provider::Provider>
+        })
+        .collect();
+    n.node
+        .set_providers(list.iter().map(|(n, _)| n.to_string()).collect());
+    n.node.set_lookup_providers(providers);
+    n.node
+        .set_lookup_shares(peephole::credits::share::Shares::new(
+            n.store.clone(),
+            share,
+        ));
+    asked
+}
+
+/// The price counts only members that earn here: a blocked member's
+/// announced lookups and its scan capacity are left out.
+#[tokio::test]
+async fn a_blocked_members_announcements_do_not_move_the_price() {
+    use peephole::credits::price;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let tools = tempfile::tempdir().unwrap();
+    let scan = Opts {
+        scanner: Some(fake_nmap(tools.path(), 0.5)),
+        ..DEFAULT
+    };
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], scan.clone()).await;
+    let nc = boot(ic, &c, &[&a, &b], scan).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    serves(&nc, &[("abuseipdb", Some(1000.0))], 0.2);
+    price::refresh(&nb.node).await.unwrap();
+    price::refresh(&nc.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    price_seen(&na, c.id, "abuseipdb").await;
+    let scans = |t: &price::Table, id| t.capacity.scanners.iter().any(|s| s.node == id);
+    eventually("both scanners' pace is heard", || async {
+        let t = price::refresh(&na.node).await.unwrap();
+        scans(&t, b.id) && scans(&t, c.id)
+    })
+    .await;
+    let both = price::refresh(&na.node).await.unwrap();
+    assert!(
+        scans(&both, c.id),
+        "c's scan capacity counts: {:?}",
+        both.capacity
+    );
+    peephole::cluster::block::block(&na.node, c.id)
+        .await
+        .unwrap();
+    let one = price::refresh(&na.node).await.unwrap();
+    assert!(
+        (one.lookups_per_day * 2.0 - both.lookups_per_day).abs() < 1e-9
+            && one.lookups_per_day > 0.0,
+        "{} then {}",
+        both.lookups_per_day,
+        one.lookups_per_day
+    );
+    assert!(!scans(&one, c.id), "c's scan capacity is left out");
+    assert!(scans(&one, b.id));
+}
+
+/// A member of an earlier version can serve providers, but it does not know
+/// offers and receipts: it is not offered as a server of paid lookups.
+#[tokio::test]
+async fn an_old_version_member_is_not_asked_for_paid_lookups() {
+    use peephole::credits::{pay, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-old");
+    let (ic, c) = new_node("node-new");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let old = Opts {
+        proto: Some((
+            peephole::cluster::rpc::proto::PROTO_MIN,
+            peephole::cluster::rpc::proto::OWNER_PROTO - 1,
+        )),
+        ..DEFAULT
+    };
+    let nb = boot(ib, &b, &[&a, &c], old).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    serves(&nc, &[("abuseipdb", Some(1000.0))], 0.2);
+    price::refresh(&nb.node).await.unwrap();
+    price::refresh(&nc.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    price_seen(&na, c.id, "abuseipdb").await;
+    let none: peephole::intel::Providers = vec![];
+    let servers: Vec<_> = pay::quotes(&na.node, &none)
+        .remove("abuseipdb")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|q| q.server)
+        .collect();
+    assert_eq!(servers, vec![c.id], "only the member that speaks credits");
+}
+
+/// Give `node` credits in the books of every node in `on`: `scans` judged
+/// level-1 scans it ran for its own trap, 1250 mc each.
+async fn grant_scans(on: &[&TestNode], node: NodeId, scans: u32) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let first = NEXT.fetch_add(scans as u64, std::sync::atomic::Ordering::SeqCst);
+    let now = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64)
+        << 16;
+    for n in on {
+        for i in 0..scans as u64 {
+            let k = first + i;
+            sqlx::query(
+                "INSERT INTO credit_scans
+                   (scan_uid, job_uid, ip, scanner, trap, hlc, level, job_level, args_ok, judged_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 1, 1, 1, datetime('now'))",
+            )
+            .bind(format!("granted-{k}"))
+            .bind(format!("granted-job-{k}"))
+            .bind(format!("100.64.{}.{}", k / 250, k % 250))
+            .bind(&node.0[..])
+            .bind(&node.0[..])
+            .bind(now + k as i64)
+            .execute(&n.store.pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
+/// A server's prices follow what the cluster earns, and its heartbeat
+/// carries them and the lookups it serves a day.
+#[tokio::test]
+async fn announced_prices_follow_the_clusters_earnings() {
+    use peephole::credits::price;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    // A budget of 1000 a day and a share of a fifth: 200 lookups a day.
+    serves(
+        &na,
+        &[("abuseipdb", Some(1000.0)), ("maxmind-geolite2", None)],
+        0.2,
+    );
+    // 112 scans at 1.25 credits in a week: 20 credits a day.
+    grant_scans(&[&na], a.id, 112).await;
+    let t = price::refresh(&na.node).await.unwrap();
+    assert_eq!((t.earned_per_day, t.lookups_per_day), (20_000, 200.0));
+    // No scanner runs: no capacity, which counts as saturated (double).
+    assert_eq!(
+        (t.capacity.utilization, t.load, t.unit),
+        (1.0, 2.0, Some(400))
+    );
+    assert_eq!(t.price_of("abuseipdb"), Some(400));
+    assert_eq!(t.price_of("maxmind-geolite2"), Some(100));
+    let seen = |price: u32| {
+        nb.status.known(&a.id).is_some_and(|k| {
+            k.hb.prices.contains(&("abuseipdb".to_string(), price))
+                && k.hb.on_demand == vec![("abuseipdb".to_string(), 200)]
+        })
+    };
+    eventually("b reads a's prices from its heartbeat", || async {
+        seen(400)
+    })
+    .await;
+    // Twice the earnings, twice the price.
+    grant_scans(&[&na], a.id, 112).await;
+    let t = price::refresh(&na.node).await.unwrap();
+    assert_eq!(t.price_of("abuseipdb"), Some(800));
+    eventually("b sees the new price", || async { seen(800) }).await;
+}
+
+/// Until `asker` has heard `server`'s heartbeat with a price for
+/// `provider`; returns the price.
+async fn price_seen(asker: &TestNode, server: NodeId, provider: &str) -> u32 {
+    let find = || {
+        asker.status.known(&server).and_then(|k| {
+            k.hb.prices
+                .iter()
+                .find(|(p, _)| p == provider)
+                .map(|(_, mc)| *mc)
+        })
+    };
+    eventually("the server's price is heard", || async { find().is_some() }).await;
+    // Paid lookups go to members known to speak the credits protocol: the
+    // server's own description of itself (its protocol) has to arrive first.
+    eventually("the server's protocol is known", || async {
+        asker
+            .members()
+            .get(&server)
+            .is_some_and(|m| m.proto_max > 0)
+    })
+    .await;
+    find().unwrap()
+}
+
+/// The asker pays the announced price; the server gets half; both nodes
+/// hold the offer and the receipt and arrive at the same balances.
+#[tokio::test]
+async fn a_paid_lookup_moves_credits_from_the_asker_to_the_server() {
+    use peephole::credits::{self, entries, price};
+    use std::sync::atomic::Ordering;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
+    assert!(cost > 0);
+
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.77".parse().unwrap();
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    let from_b = answers
+        .iter()
+        .find(|x| x.node == "node-bravo")
+        .expect("b answered");
+    assert_eq!(from_b.resp.findings.len(), 1, "{answers:?}");
+    assert_eq!(from_b.resp.findings[0].provider, "abuseipdb");
+    assert_eq!(from_b.charged_mc as u64, cost);
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+    eventually("both hold the offer and the receipt", || async {
+        entries::since(&na.store.pool, 0).await.unwrap().len() == 2
+            && entries::since(&nb.store.pool, 0).await.unwrap().len() == 2
+    })
+    .await;
+    for n in [&na, &nb] {
+        let book = credits::book_fresh(&n.node).await.unwrap();
+        assert_eq!(book.balance(&a.id), 10_000 - cost);
+        assert_eq!(book.balance(&b.id), cost / 2);
+        assert_eq!(book.ledger.held(&a.id), 0);
+    }
+    // Nothing about the address was stored: nobody recorded it.
+    for n in [&na, &nb] {
+        assert_eq!(count(n, "SELECT COUNT(*) FROM ip_intel_log").await, 0);
+        assert_eq!(count(n, "SELECT COUNT(*) FROM ips").await, 0);
+    }
+}
+
+/// Without credits the asker refuses on its own and says how much is
+/// missing; credits the server does not count are declined there, and the
+/// asker gets them back at once; a spent on-demand share declines the API
+/// provider and still serves what has no budget.
+#[tokio::test]
+async fn an_asker_without_credits_is_declined_with_the_reason() {
+    use peephole::credits::{self, entries, price};
+    use std::sync::atomic::Ordering;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    // A budget of 5 a day and a share of a fifth: one paid lookup a day.
+    let asked = serves(
+        &nb,
+        &[("abuseipdb", Some(5.0)), ("maxmind-geolite2", None)],
+        0.2,
+    );
+    price::refresh(&nb.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.78".parse().unwrap();
+    let why = |answers: &[peephole::intel::lookup::NodeAnswer], provider: &str| {
+        answers
+            .iter()
+            .flat_map(|x| x.resp.declined.iter())
+            .find(|(p, _)| p == provider)
+            .map(|(_, w)| w.clone())
+            .unwrap_or_default()
+    };
+
+    // 1. No credits: no offer is written, nobody is asked.
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    let reason = why(&answers, "abuseipdb");
+    assert!(
+        reason.contains("holds 0.00 credits") && reason.contains("missing"),
+        "{reason}"
+    );
+    assert!(entries::since(&na.store.pool, 0).await.unwrap().is_empty());
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+
+    // 2. Credits only this node counts (the server judged no such scans).
+    grant_scans(&[&na], a.id, 4).await;
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    assert!(
+        why(&answers, "abuseipdb").contains("not covered here"),
+        "{answers:?}"
+    );
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    eventually(
+        "the receipt of nothing frees the credits at once",
+        || async {
+            let book = credits::book_fresh(&na.node).await.unwrap();
+            book.balance(&a.id) == 5000 && book.ledger.held(&a.id) == 0
+        },
+    )
+    .await;
+
+    // 3. The server counts them too: served, and the share of the day is
+    // used up by that one lookup.
+    grant_scans(&[&nb], a.id, 4).await;
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    assert_eq!(
+        answers.iter().map(|x| x.resp.findings.len()).sum::<usize>(),
+        2
+    );
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    assert!(
+        why(&answers, "abuseipdb").contains("on-demand share"),
+        "{answers:?}"
+    );
+    let served: Vec<&str> = answers
+        .iter()
+        .flat_map(|x| x.resp.findings.iter())
+        .map(|f| f.provider.as_str())
+        .collect();
+    assert_eq!(served, ["maxmind-geolite2"]);
+    let geo = nb.price_table().price_of("maxmind-geolite2").unwrap();
+    assert_eq!(answers.iter().map(|x| x.charged_mc).sum::<u32>(), geo);
+}
+
+/// A lookup the node's own provider answers is paid like any other: half
+/// of the price comes back, half is destroyed.
+#[tokio::test]
+async fn a_lookup_answered_by_the_nodes_own_provider_costs_half_net() {
+    use peephole::credits::{self, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&na, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na], a.id, 8).await;
+    let cost = price::refresh(&na.node)
+        .await
+        .unwrap()
+        .price_of("abuseipdb")
+        .unwrap() as u64;
+    let own = na.lookup_providers().unwrap().clone();
+    let answers =
+        peephole::intel::lookup::cluster(&rec(&na), &own, "203.0.113.79".parse().unwrap()).await;
+    assert_eq!(answers[0].node, "this node");
+    assert_eq!(answers[0].resp.findings.len(), 1, "{answers:?}");
+    assert_eq!(answers[0].charged_mc as u64, cost);
+    let book = credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(book.balance(&a.id), 10_000 - cost + cost / 2);
+    assert_eq!(book.ledger.tally(&a.id).destroyed, cost - cost / 2);
+}
+
+/// Review focus: the server's price moved after the asker read it. The
+/// server declines, names its price and charges nothing; an offer at that
+/// price is served.
+#[tokio::test]
+async fn a_price_above_the_offer_is_declined_and_named() {
+    use peephole::credits::{self, pay, price};
+    use std::sync::atomic::Ordering;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    let cost = price::refresh(&nb.node)
+        .await
+        .unwrap()
+        .price_of("abuseipdb")
+        .unwrap();
+    assert!(cost > 1);
+    price_seen(&na, b.id, "abuseipdb").await;
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.80".parse().unwrap();
+    let wanted = ["abuseipdb".to_string()];
+    let low = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, cost as u64 - 1).await;
+    assert!(low.findings.is_empty());
+    assert_eq!((low.price_mc, low.charged_mc), (Some(cost), 0));
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    let enough = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, cost as u64).await;
+    assert_eq!((enough.findings.len(), enough.charged_mc), (1, cost));
+    eventually("a paid once", || async {
+        let book = credits::book_fresh(&na.node).await.unwrap();
+        book.balance(&a.id) == 10_000 - cost as u64 && book.ledger.held(&a.id) == 0
+    })
+    .await;
+    // An offer is served once: naming it again gets nothing.
+    let seq = peephole::credits::entries::since(&na.store.pool, 0)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| e.origin == a.id)
+        .map(|e| e.seq)
+        .max()
+        .unwrap();
+    let again: peephole::intel::lookup::LookupResp = na
+        .call(
+            b.id,
+            &b.address(),
+            "/rpc/v1/lookup",
+            &peephole::intel::lookup::LookupReq {
+                ip: ip.to_string(),
+                providers: wanted.to_vec(),
+                offer_seq: Some(seq),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(again.findings.is_empty(), "{again:?}");
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    // And without an offer only free providers answer.
+    let free: peephole::intel::lookup::LookupResp = na
+        .call(
+            b.id,
+            &b.address(),
+            "/rpc/v1/lookup",
+            &peephole::intel::lookup::LookupReq {
+                ip: ip.to_string(),
+                providers: wanted.to_vec(),
+                offer_seq: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(free.findings.is_empty());
+    assert!(free.declined[0].1.contains("paid with credits"), "{free:?}");
+}
+
+/// A member that speaks only the protocol before credits is never asked
+/// for a paid lookup, whatever its heartbeat says.
+#[tokio::test]
+async fn a_member_of_an_earlier_version_is_not_asked() {
+    use peephole::credits::{pay, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a, &c],
+        Opts {
+            proto: Some((2, 2)),
+            ..DEFAULT
+        },
+    )
+    .await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    serves(&nc, &[("abuseipdb", Some(1000.0))], 0.2);
+    price::refresh(&nb.node).await.unwrap();
+    price::refresh(&nc.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    price_seen(&na, c.id, "abuseipdb").await;
+    let none: peephole::intel::Providers = vec![];
+    let all = pay::quotes(&na.node, &none);
+    let servers: Vec<NodeId> = all["abuseipdb"].iter().map(|q| q.server).collect();
+    assert_eq!(servers, [c.id], "b announces a price and is left out");
+}
+
+/// A paid answer about an address the cluster has recorded is written
+/// into the dataset by the node that served it and reaches every member.
+/// For 24 hours the next lookup of that provider is answered from the
+/// dataset: no offer, nobody asked. "Ask again" pays.
+#[tokio::test]
+async fn a_paid_lookup_of_a_recorded_address_is_kept_and_then_free_for_everyone() {
+    use peephole::credits::{entries, price};
+    use peephole::intel::lookup;
+    use std::sync::atomic::Ordering;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    // c's trap recorded a request from the address.
+    let row = nc
+        .store
+        .upsert_ip("203.0.113.90".parse().unwrap())
+        .await
+        .unwrap();
+    rec(&nc)
+        .insert_request(&new_request(row.id, "/x"))
+        .await
+        .unwrap();
+    eventually("a and b hold the request", || async {
+        count(&na, "SELECT COUNT(*) FROM requests").await == 1
+            && count(&nb, "SELECT COUNT(*) FROM requests").await == 1
+    })
+    .await;
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.90".parse().unwrap();
+    let findings = |o: &lookup::Outcome| {
+        o.answers
+            .iter()
+            .map(|x| x.resp.findings.len())
+            .sum::<usize>()
+    };
+
+    let first = lookup::run(&rec(&na), &none, ip, &[]).await;
+    assert!(first.stored.is_empty());
+    assert_eq!(findings(&first), 1, "{:?}", first.answers);
+    assert!(first.kept);
+    let kept =
+        "SELECT COUNT(*) FROM ip_intel_log WHERE provider = 'abuseipdb' AND ip = '203.0.113.90'";
+    eventually("the answer is in everyone's dataset", || async {
+        count(&na, kept).await == 1 && count(&nb, kept).await == 1 && count(&nc, kept).await == 1
+    })
+    .await;
+    let by_b: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ip_intel_log WHERE origin = ?")
+        .bind(&b.id.0[..])
+        .fetch_one(&nc.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(by_b, 1, "written by the node that served it");
+
+    // Another member, without credits, within 24 hours: from the dataset.
+    let payments = entries::since(&nc.store.pool, 0).await.unwrap().len();
+    let second = lookup::run(&rec(&nc), &none, ip, &[]).await;
+    assert_eq!(second.stored.len(), 1);
+    assert_eq!(second.stored[0].provider, "abuseipdb");
+    assert_eq!(second.stored[0].node.as_deref(), Some("node-bravo"));
+    assert_eq!(second.stored[0].data["said_by"], "abuseipdb");
+    assert!(second.stored[0].age_secs < 3600);
+    assert_eq!(findings(&second), 0);
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "nobody was asked");
+    assert_eq!(
+        entries::since(&nc.store.pool, 0).await.unwrap().len(),
+        payments
+    );
+
+    // "Ask again" forces a paid lookup of that provider.
+    let again = lookup::run(&rec(&na), &none, ip, &["abuseipdb".to_string()]).await;
+    assert!(again.stored.is_empty());
+    assert_eq!(findings(&again), 1);
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+}
+
+/// Review focus: an address nobody recorded. The payment is in the log;
+/// nothing about the address is written on any node.
+#[tokio::test]
+async fn a_paid_lookup_of_an_unrecorded_address_writes_nothing() {
+    use peephole::credits::{entries, price};
+    use peephole::intel::lookup;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.91".parse().unwrap();
+    let out = lookup::run(&rec(&na), &none, ip, &[]).await;
+    assert_eq!(
+        out.answers
+            .iter()
+            .map(|x| x.resp.findings.len())
+            .sum::<usize>(),
+        1
+    );
+    assert!(!out.kept);
+    eventually("the payment is on both nodes", || async {
+        entries::since(&na.store.pool, 0).await.unwrap().len() == 2
+            && entries::since(&nb.store.pool, 0).await.unwrap().len() == 2
+    })
+    .await;
+    for n in [&na, &nb] {
+        for table in ["ips", "ip_intel", "ip_intel_log", "requests"] {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(count(n, &sql).await, 0, "{table}");
+        }
+        // The payment does not name the address either.
+        let log: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT payload FROM repl_log WHERE kind IN ('credit_offer', 'credit_receipt')",
+        )
+        .fetch_all(&n.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(
+            log.iter()
+                .all(|p| !p.windows(12).any(|w| w == b"203.0.113.91"))
+        );
+    }
+    // And a second lookup pays again: nothing was there to answer from.
+    let out = lookup::run(&rec(&na), &none, ip, &[]).await;
+    assert!(out.stored.is_empty());
+}
+
+/// A node forwards what it holds to its collecting node; the credits keep
+/// their day and can be spent there. Less than a credit waits, and
+/// nothing goes to a node that is no member.
+#[tokio::test]
+async fn a_fleet_collects_at_one_node_and_any_of_its_nodes_can_spend() {
+    use peephole::credits::{self, fleet};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    grant_scans(&[&na, &nb], b.id, 4).await;
+    let today = credits::day_of(nb.hlc.now());
+
+    let (_, stranger) = new_node("x");
+    assert_eq!(
+        fleet::collect(&nb.node, stranger.id).await.unwrap(),
+        0,
+        "no member"
+    );
+    assert_eq!(fleet::collect(&nb.node, b.id).await.unwrap(), 0, "itself");
+    assert_eq!(fleet::collect(&nb.node, a.id).await.unwrap(), 5000);
+    eventually("the credits are at a, on both nodes' books", || async {
+        let mut all = true;
+        for n in [&na, &nb] {
+            let book = credits::book_fresh(&n.node).await.unwrap();
+            all &= book.balance(&a.id) == 5000
+                && book.balance(&b.id) == 0
+                && book.ledger.by_day(&a.id) == vec![(today, 5000)];
+        }
+        all
+    })
+    .await;
+    // Sending back half a credit: any node may send to any member.
+    assert_eq!(fleet::send(&na.node, b.id, 500).await.unwrap(), 500);
+    assert!(
+        fleet::send(&na.node, b.id, 99_000).await.is_err(),
+        "more than it holds"
+    );
+    assert!(fleet::send(&na.node, stranger.id, 1).await.is_err());
+    eventually("b holds half a credit", || async {
+        credits::book_fresh(&nb.node).await.unwrap().balance(&b.id) == 500
+    })
+    .await;
+    // Less than a credit, none of it expiring today: it waits.
+    assert_eq!(fleet::collect(&nb.node, a.id).await.unwrap(), 0);
+    // The setting reaches the node that acts on it.
+    let set = peephole::settings::Changes {
+        collect_to: Some(a.id.to_string()),
+        ..Default::default()
+    };
+    nb.settings.apply(&set, None).await.unwrap().unwrap();
+    assert_eq!(nb.settings.snapshot().collect_to, Some(a.id));
+}
+
+/// A node whose balance does not cover a lookup draws the missing amount
+/// from its collecting node, which answers only its own fleet.
+#[tokio::test]
+async fn a_node_draws_what_a_lookup_needs_from_its_collecting_node() {
+    use peephole::cluster::msg::Msg;
+    use peephole::cluster::owner::{self, fleet as owned};
+    use peephole::credits::{self, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (is, s) = new_node("node-server");
+    let (ix, x) = new_node("node-x");
+    let na = boot(ia, &a, &[&b, &s, &x], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &s, &x], DEFAULT).await;
+    let ns = boot(is, &s, &[&a, &b, &x], DEFAULT).await;
+    let nx = boot(ix, &x, &[&a, &b, &s], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    eventually("a counts b as its own", || async {
+        owned::discover(&na.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+    serves(&ns, &[("abuseipdb", Some(1000.0))], 0.2);
+    // The fleet's credits sit at a; b holds nothing.
+    grant_scans(&[&na, &nb, &ns], a.id, 8).await;
+    price::refresh(&ns.node).await.unwrap();
+    let cost = price_seen(&nb, s.id, "abuseipdb").await as u64;
+    *nb.collect_to.write().unwrap() = Some(a.id);
+
+    // A stranger's draw is not answered, and moves nothing.
+    let asked = nx
+        .node
+        .request(a.id, Msg::CreditDraw { mc: 100 }, Duration::from_secs(3))
+        .await;
+    assert!(asked.is_err(), "{asked:?}");
+
+    let none: peephole::intel::Providers = vec![];
+    let answers =
+        peephole::intel::lookup::cluster(&rec(&nb), &none, "203.0.113.95".parse().unwrap()).await;
+    let found: usize = answers.iter().map(|x| x.resp.findings.len()).sum();
+    assert_eq!(found, 1, "{answers:?}");
+    eventually("the fleet paid, from a's balance", || async {
+        let book = credits::book_fresh(&ns.node).await.unwrap();
+        book.balance(&a.id) == 10_000 - cost && book.balance(&b.id) == 0
+    })
+    .await;
+}
+
+/// The section names of a rendered page, in order.
+fn sections(html: &str) -> Vec<String> {
+    html.split("data-section=\"")
+        .skip(1)
+        .filter_map(|s| s.split('"').next().map(str::to_string))
+        .collect()
+}
+
+/// The lookup result of a recorded address lists what its IP page lists,
+/// with the provider answers on top; the page says what a lookup costs
+/// and what was charged.
+#[tokio::test]
+async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page() {
+    use peephole::credits::price;
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a],
+        Opts {
+            scanner: Some(fake_nmap_args(tools.path())),
+            ..DEFAULT
+        },
+    )
+    .await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    let cost = price_seen(&na, b.id, "abuseipdb").await;
+    // A recorded address with requests and a finished scan.
+    enqueue(&na, "198.51.100.77", 1).await;
+    eventually_for(Duration::from_secs(30), "scanned", || async {
+        count(&na, "SELECT COUNT(*) FROM scans").await == 1
+    })
+    .await;
+    let (admin, base) = admin_on(&na).await;
+
+    let form = text(&admin, format!("{base}/admin/lookup?ip=198.51.100.77")).await;
+    assert!(form.contains("Balance") && form.contains("10.00"), "{form}");
+    assert!(form.contains("node-bravo"), "who would be asked");
+    assert!(
+        form.contains(&peephole::credits::show(cost as u64)),
+        "and at what price"
+    );
+
+    let ip_page = text(&admin, format!("{base}/ip/198.51.100.77")).await;
+    let result = admin
+        .post(format!("{base}/admin/lookup"))
+        .form(&[("ip", "198.51.100.77")])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let on_ip_page = sections(&ip_page);
+    assert!(
+        on_ip_page.contains(&"scans".to_string()) && on_ip_page.contains(&"requests".to_string())
+    );
+    assert_eq!(sections(&result), on_ip_page, "one source for both pages");
+    assert!(result.contains("Asked now") && result.contains("node-bravo"));
+    assert!(result.contains(&format!("charged {}", peephole::credits::show(cost as u64))));
+    assert!(
+        result.contains("kept in the dataset"),
+        "the cluster recorded this address"
+    );
+
+    // Asked again within 24 hours: from the dataset, with "Ask again".
+    eventually("b's kept answer reached this node", || async {
+        count(
+            &na,
+            "SELECT COUNT(*) FROM ip_intel_log WHERE provider = 'abuseipdb'",
+        )
+        .await
+            == 1
+    })
+    .await;
+    let second = admin
+        .post(format!("{base}/admin/lookup"))
+        .form(&[("ip", "198.51.100.77")])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        second.contains("From the dataset") && second.contains("Ask again"),
+        "{second}"
+    );
+    assert!(!second.contains("Asked now"));
+
+    // An address the dataset does not hold: said so, with what is near it,
+    // by network and, since an answer names its ASN, by ASN.
+    sqlx::query("UPDATE ips SET asn = 64500 WHERE ip = '198.51.100.77'")
+        .execute(&na.store.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ip_intel_log (ip, provider, origin, hlc, fetched_at, data_json)
+         VALUES ('198.51.100.78', 'shodan', ?, 1, datetime('now'), '{\"asn\":\"AS64500\"}')",
+    )
+    .bind(&b.id.0[..])
+    .execute(&na.store.pool)
+    .await
+    .unwrap();
+    let unknown = admin
+        .post(format!("{base}/admin/lookup"))
+        .form(&[("ip", "198.51.100.78")])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(unknown.contains("not in the dataset"));
+    assert!(
+        unknown.contains("198.51.100.0/24") && unknown.contains("198.51.100.77"),
+        "{unknown}"
+    );
+    assert!(unknown.contains("not kept"));
+    assert!(
+        unknown.contains("Same ASN") && unknown.contains("/ips?asn=64500"),
+        "{unknown}"
+    );
+    assert!(sections(&unknown).is_empty());
+}
+
+/// The Credits page: what this node holds, what it earned and spent, what
+/// everyone holds, and how the price comes about.
+#[tokio::test]
+async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
+    use peephole::credits::{self, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    price::refresh(&na.node).await.unwrap();
+    let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
+    let none: peephole::intel::Providers = vec![];
+    peephole::intel::lookup::cluster(&rec(&na), &none, "203.0.113.99".parse().unwrap()).await;
+    eventually("the receipt is back", || async {
+        let book = credits::book_fresh(&na.node).await.unwrap();
+        book.balance(&a.id) == 10_000 - cost && book.ledger.held(&a.id) == 0
+    })
+    .await;
+    let (admin, base) = admin_on(&na).await;
+    let page = format!("{base}/admin/cluster/credits");
+    let html = text(&admin, page.clone()).await;
+    assert!(html.contains("Credits</a>"), "the tab is there");
+    assert!(
+        html.contains(&credits::show(10_000 - cost)),
+        "the balance: {html}"
+    );
+    assert!(html.contains("expires in 6 days") || html.contains("in 6 days"));
+    // Earned: the granted scans, with what each paid.
+    assert!(html.contains("Earned") && html.contains("1.00") && html.contains("0.25"));
+    // Spent: one lookup at b, charged, half of it destroyed.
+    assert!(html.contains("Spent") && html.contains("node-bravo") && html.contains("charged"));
+    assert!(html.contains("abuseipdb"));
+    // Everyone: b holds its half.
+    assert!(html.contains(&credits::show(cost / 2)));
+    // The price, in words and numbers.
+    assert!(
+        html.contains("earned") && html.contains("credits a day"),
+        "{html}"
+    );
+    assert!(html.contains("lookups a day"));
+
+    // Sending: half a credit to b.
+    let r = admin
+        .post(format!("{page}/send"))
+        .form(&[("to", b.id.to_string()), ("amount", "0.5".into())])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    eventually("b received it", || async {
+        credits::book_fresh(&nb.node).await.unwrap().balance(&b.id) == cost / 2 + 500
+    })
+    .await;
+    let html = text(&admin, page.clone()).await;
+    assert!(html.contains("Sent and received") && html.contains("0.50"));
+    // More than it holds, and nonsense: nothing moves.
+    for amount in ["500", "abc", "0"] {
+        admin
+            .post(format!("{page}/send"))
+            .form(&[("to", b.id.to_string()), ("amount", amount.into())])
+            .send()
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        credits::book_fresh(&na.node).await.unwrap().balance(&a.id),
+        10_000 - cost - 500
+    );
+}
+
+/// The Members table and a member's page say whether it earns here, why
+/// not, and what audits found.
+#[tokio::test]
+async fn a_members_page_says_whether_it_earns_here() {
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
+    grant_scans(&[&na], b.id, 4).await;
+    let (admin, base) = admin_on(&na).await;
+    let page = format!("{base}/admin/cluster/node/{}", b.id);
+    let html = text(&admin, page.clone()).await;
+    assert!(html.contains("Credits") && html.contains("5.00"), "{html}");
+    assert!(
+        html.contains("Earns here") && html.contains(">yes<"),
+        "{html}"
+    );
+    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    assert!(!members.contains("not earning here"));
+
+    // b showed two histories (marked as the seal check would), proven by
+    // an entry of a's log (any signed entry stands in for the proof here).
+    sqlx::query(
+        "INSERT INTO forked (origin, seq, found_at, proof_origin, proof_seq)
+         VALUES (?, 7, datetime('now'), ?, 1)",
+    )
+    .bind(&b.id.0[..])
+    .bind(&a.id.0[..])
+    .execute(&na.store.pool)
+    .await
+    .unwrap();
+    // The page reads a book of at most ten seconds ago: compute one now.
+    peephole::credits::book_fresh(&na.node).await.unwrap();
+    let html = text(&admin, page.clone()).await;
+    assert!(html.contains("showed two histories"), "{html}");
+    assert!(html.contains(">no<") && html.contains("0.00"));
+    assert!(html.contains("Download the proof"), "{html}");
+    let proof = admin
+        .get(format!("{page}/fork-proof"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let entry: peephole::cluster::record::WireEntry =
+        peephole::cluster::rpc::cbor::decode(&proof).unwrap();
+    assert_eq!((entry.origin, entry.seq), (a.id, 1));
+    assert!(entry.verify(), "as its publisher signed it");
+    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    assert!(
+        members.contains("showed two histories") && !members.contains("not earning here"),
+        "an issue of its own: {members}"
+    );
+}
+
+/// Two members on different builds carry different rules fingerprints;
+/// while their requests classify the same here, the Members table does
+/// not flag the member (§11 of the credits spec).
+#[tokio::test]
+async fn a_member_on_another_build_is_not_flagged_while_its_requests_agree() {
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    for i in 0..25 {
+        record(&nb, "198.51.100.40", &format!("/login{i}")).await;
+    }
+    let hex: String = b.id.0.iter().map(|x| format!("{x:02x}")).collect();
+    let of_b = format!("SELECT COUNT(*) FROM requests WHERE origin = x'{hex}'");
+    eventually("a holds b's requests", || async {
+        count(&na, &of_b).await == 25
+    })
+    .await;
+    // As another build would have stamped them.
+    sqlx::query("UPDATE requests SET rules = ? WHERE origin = ?")
+        .bind("f".repeat(64))
+        .bind(&b.id.0[..])
+        .execute(&na.store.pool)
+        .await
+        .unwrap();
+    let (admin, base) = admin_on(&na).await;
+    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    assert!(members.contains("node-bravo"), "{members}");
+    assert!(
+        !members.contains("not earning here") && !members.contains("other rules"),
+        "{members}"
+    );
+    let page = text(&admin, format!("{base}/admin/cluster/node/{}", b.id)).await;
+    assert!(
+        page.contains("Earns here") && page.contains(">yes<"),
+        "{page}"
+    );
+    assert!(
+        page.contains("differs from ours"),
+        "shown as information: {page}"
+    );
+}
+
+/// Overview shows the cluster's figures from this node's view.
+#[tokio::test]
+async fn the_overview_shows_the_clusters_credit_figures() {
+    use peephole::credits::price;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&na, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na], a.id, 112).await;
+    price::refresh(&na.node).await.unwrap();
+    let (admin, base) = admin_on(&na).await;
+    let html = text(&admin, format!("{base}/admin")).await;
+    assert!(html.contains("2 of 2 members earn here"), "{html}");
+    assert!(html.contains("140.00"), "credits in circulation");
+    assert!(html.contains("20.00"), "earned a day");
+    assert!(html.contains("200"), "weighted lookups a day");
+    assert!(html.contains("0.40"), "the unit price: saturated, double");
+    assert!(html.contains("Forks") && html.contains("Audits"));
+    assert!(html.contains("0 idle"), "no scanner: nothing idle: {html}");
+}
+
+/// A declined offer frees what it held before the asker offers again:
+/// the second offer needs credits the first one held.
+#[tokio::test]
+async fn a_declined_offer_frees_its_credits_for_the_next() {
+    use peephole::credits::{pay, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 1).await;
+    let cost = price::refresh(&nb.node)
+        .await
+        .unwrap()
+        .price_of("abuseipdb")
+        .unwrap() as u64;
+    assert!(cost > 1 && cost < 600, "{cost}");
+    price_seen(&na, b.id, "abuseipdb").await;
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.81".parse().unwrap();
+    let wanted = ["abuseipdb".to_string()];
+    let low = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, cost - 1).await;
+    assert_eq!(low.price_mc, Some(cost as u32), "{low:?}");
+    // 1250 held: cost - 1 by the first offer. This needs some of it back.
+    let more = 1250 - cost + 2;
+    let second = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, more).await;
+    assert_eq!(
+        (second.findings.len(), second.charged_mc as u64),
+        (1, cost),
+        "{second:?}"
+    );
+}
+
+/// An offer the server will not take for the asker's standing there is
+/// released at once: what it held is free again on the asker.
+#[tokio::test]
+async fn an_offer_declined_for_the_askers_standing_is_released() {
+    use peephole::credits::{self, pay, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 1).await;
+    let cost = price::refresh(&nb.node)
+        .await
+        .unwrap()
+        .price_of("abuseipdb")
+        .unwrap() as u64;
+    price_seen(&na, b.id, "abuseipdb").await;
+    sqlx::query("INSERT INTO forked (origin, seq, found_at) VALUES (?, 7, datetime('now'))")
+        .bind(&a.id.0[..])
+        .execute(&nb.store.pool)
+        .await
+        .unwrap();
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.82".parse().unwrap();
+    let wanted = ["abuseipdb".to_string()];
+    let r = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, cost).await;
+    assert!(
+        r.findings.is_empty() && r.declined[0].1.contains("not accepted here"),
+        "{r:?}"
+    );
+    let book = credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(book.ledger.held(&a.id), 0);
+    assert_eq!(book.balance(&a.id), 1250);
 }

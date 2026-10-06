@@ -82,18 +82,51 @@ pub enum Msg {
     },
     /// Any member → node: what are your runtime settings?
     ConfigGet,
-    ConfigState(super::confkey::State),
-    /// Config key holder → node: change your settings. `mac` proves the
-    /// sender holds the node's config key without sending it.
+    ConfigState(super::remote::State),
+    /// A config key request of an earlier version. Still decoded; always
+    /// answered with a refusal that names the ownership key.
     ConfigSet {
         base_version: u64,
         changes: crate::settings::Changes,
         mac: serde_bytes::ByteBuf,
     },
-    /// `version` is the new settings version on success.
+    /// The refusal.
     ConfigSetReply {
         version: Option<u64>,
         error: Option<String>,
+    },
+    /// Owned node → member: are you a node of my owner? `tag` is a hash
+    /// that only a node with the same owner id can recompute, `cert` the
+    /// sender's certificate.
+    OwnerHello {
+        tag: serde_bytes::ByteBuf,
+        cert: serde_bytes::ByteBuf,
+    },
+    /// The answerer's certificate; empty when it is no sibling.
+    OwnerHelloReply {
+        cert: serde_bytes::ByteBuf,
+    },
+    /// Managing node → sibling: do this. `cmd` is the encoded command
+    /// (`owner::cmd::OwnerCmd`), `sig` the owner key's signature over
+    /// sender, target, `counter` and those bytes.
+    OwnerCmd {
+        counter: u64,
+        cmd: serde_bytes::ByteBuf,
+        sig: serde_bytes::ByteBuf,
+    },
+    /// `counter` is the node's counter after the command.
+    OwnerReply {
+        counter: u64,
+        error: Option<String>,
+        data: Option<super::owner::cmd::OwnerData>,
+    },
+    /// Fleet node → its collecting node: send me this much (`credits::fleet`).
+    CreditDraw {
+        mc: u64,
+    },
+    /// What the collecting node sent.
+    CreditDrawReply {
+        sent_mc: u64,
     },
 }
 
@@ -194,6 +227,18 @@ impl Node {
 
     /// Ask `to` and wait for its answer.
     pub async fn request(self: &Arc<Self>, to: NodeId, msg: Msg, timeout: Duration) -> Result<Msg> {
+        self.request_avoiding(to, msg, timeout, vec![]).await
+    }
+
+    /// Like [`Node::request`], never sent through the first hops in
+    /// `avoid`: members that could not relay this kind of message.
+    pub async fn request_avoiding(
+        self: &Arc<Self>,
+        to: NodeId,
+        msg: Msg,
+        timeout: Duration,
+        avoid: Vec<NodeId>,
+    ) -> Result<Msg> {
         let (id, env) = Envelope::seal(self, to, None, msg)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.msg
@@ -203,7 +248,7 @@ impl Node {
             .insert(id.clone(), (to, tx));
         let mut rx = rx;
         let no_answer = || anyhow::anyhow!("no answer from {} within {timeout:?}", to.short());
-        let out = match self.route_avoiding(env.clone(), vec![]).await {
+        let out = match self.route_avoiding(env.clone(), avoid.clone()).await {
             Ok(hop) => match tokio::time::timeout(timeout / 2, &mut rx).await {
                 Ok(r) => r.map_err(|_| anyhow::anyhow!("request dropped")),
                 Err(_) => {
@@ -211,7 +256,9 @@ impl Node {
                     // used, in case that relay drops it. The id stays the
                     // same, so the destination handles it only once.
                     if let Some(h) = hop {
-                        let _ = self.route_avoiding(env, vec![h]).await;
+                        let mut avoid = avoid;
+                        avoid.push(h);
+                        let _ = self.route_avoiding(env, avoid).await;
                     }
                     tokio::time::timeout(timeout - timeout / 2, rx)
                         .await

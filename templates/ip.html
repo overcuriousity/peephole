@@ -1,186 +1,27 @@
 {% extends "layout.html" %}
-{% block title %}peephole — {{ ov.ip.ip }}{% endblock %}
+{% block title %}peephole — {{ t.ov.ip.ip }}{% endblock %}
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
 <div class="page-head ip-head">
   <div>
-    <h1>{{ ov.ip.ip }}{% let value = ov.ip.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}{% if ov.ip.is_tor_exit %} <span class="badge badge-tor">tor exit</span>{% endif %}</h1>
+    <h1>{{ t.ov.ip.ip }}{% let value = t.ov.ip.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}{% if t.ov.ip.is_tor_exit %} <span class="badge badge-tor">tor exit</span>{% endif %}</h1>
     <div class="meta">
-      {% if let Some(c) = ov.ip.country %}<a href="/ips?country={{ c }}">{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}</a>{% else %}<span class="muted">country unknown</span>{% endif %}
-      {% if let Some(a) = ov.ip.asn %}<a href="/ips?asn={{ a }}">{{ ov.ip.asn_org.as_deref().unwrap_or("") }} <span class="mono muted">AS{{ a }}</span></a>{% else %}<span class="muted">ASN unknown</span>{% endif %}
-      <span>first seen <span class="mono">{{ crate::admin::views::minute(ov.ip.first_seen) }}</span> UTC</span>
-      <span>last seen <span class="mono">{{ crate::admin::views::minute(ov.ip.last_seen) }}</span> UTC</span>
+      {% if let Some(c) = t.ov.ip.country %}<a href="/ips?country={{ c }}">{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}</a>{% else %}<span class="muted">country unknown</span>{% endif %}
+      {% if let Some(a) = t.ov.ip.asn %}<a href="/ips?asn={{ a }}">{{ t.ov.ip.asn_org.as_deref().unwrap_or("") }} <span class="mono muted">AS{{ a }}</span></a>{% else %}<span class="muted">ASN unknown</span>{% endif %}
+      <span>first seen <span class="mono">{{ crate::admin::views::minute(t.ov.ip.first_seen) }}</span> UTC</span>
+      <span>last seen <span class="mono">{{ crate::admin::views::minute(t.ov.ip.last_seen) }}</span> UTC</span>
     </div>
   </div>
   <div class="tiles">
-    <div class="tile"><span class="label">Requests</span><div class="value">{{ crate::admin::views::thousands(ov.request_count) }}</div>{% if let Some(a) = admin %}{% if a.skipped > 0 %}<div class="hint">+ {{ a.skipped }} not recorded in full</div>{% endif %}{% endif %}</div>
-    <div class="tile"><span class="label">Rank</span><div class="value">#{{ crate::admin::views::thousands(ov.rank) }}</div><div class="hint">of {{ crate::admin::views::thousands(ov.ranked) }}</div></div>
-    <div class="tile"><span class="label">Max severity</span><div class="value">{% let sev = ov.max_severity %}{% include "_severity.html" %}</div></div>
-    {% if let Some(adm) = admin %}<div class="tile"><span class="label">Open ports</span><div class="value">{% if let Some(sc) = adm.scans.first() %}{{ sc.s.open_ports }}{% else %}—{% endif %}</div><div class="hint">{% if let Some(sc) = adm.scans.first() %}newest scan, level {{ sc.s.level }}{% else %}not scanned{% endif %}</div></div>{% endif %}
+    <div class="tile"><span class="label">Requests</span><div class="value">{{ crate::admin::views::thousands(t.ov.request_count) }}</div>{% if let Some(a) = t.admin %}{% if a.skipped > 0 %}<div class="hint">+ {{ a.skipped }} not recorded in full</div>{% endif %}{% endif %}</div>
+    <div class="tile"><span class="label">Rank</span><div class="value">#{{ crate::admin::views::thousands(t.ov.rank) }}</div><div class="hint">of {{ crate::admin::views::thousands(t.ov.ranked) }}</div></div>
+    <div class="tile"><span class="label">Max severity</span><div class="value">{% let sev = t.ov.max_severity %}{% include "_severity.html" %}</div></div>
+    {% if let Some(adm) = t.admin %}<div class="tile"><span class="label">Open ports</span><div class="value">{% if let Some(sc) = adm.scans.first() %}{{ sc.s.open_ports }}{% else %}—{% endif %}</div><div class="hint">{% if let Some(sc) = adm.scans.first() %}newest scan, level {{ sc.s.level }}{% else %}not scanned{% endif %}</div></div>{% endif %}
   </div>
 </div>
 
 <div class="stack">
-  <section class="card" id="intel">
-    <div class="card-head"><h2>Intelligence</h2>{% if admin.is_some() %}<a href="/admin/lookup?ip={{ ov.ip.ip }}">look up now →</a>{% endif %}</div>
-    <div class="intel-grid">
-    {% for c in intel %}
-      <div class="intel">
-        <h3>{{ c.label }} <span class="mono muted small">{{ c.name }}</span></h3>
-        {% match c.newest %}
-        {% when Some(r) %}
-          <dl class="kv">{% for f in r.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
-          <p class="muted small intel-src">checked <span class="mono">{{ r.fetched_at }}</span>{% if let Some(v) = r.source_version %} · data <span class="mono">{{ v }}</span>{% endif %}{% if let Some(n) = r.node %} · by {{ n }}{% endif %}</p>
-          {% if !c.others.is_empty() %}
-          <details class="small"><summary>{{ c.others.len() }} older or other-node result{% if c.others.len() != 1 %}s{% endif %}</summary>
-            {% for o in c.others %}
-            <dl class="kv">{% for f in o.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
-            <p class="muted small intel-src"><span class="mono">{{ o.fetched_at }}</span>{% if let Some(v) = o.source_version %} · data <span class="mono">{{ v }}</span>{% endif %}{% if let Some(n) = o.node %} · by {{ n }}{% endif %}</p>
-            {% endfor %}
-          </details>
-          {% endif %}
-        {% when None %}
-          <p class="muted">No result yet.</p>
-        {% endmatch %}
-      </div>
-    {% endfor %}
-    </div>
-  </section>
-
-  {% if let Some(adm) = admin %}
-  <section class="card ip-scans" id="scans">
-    <div class="card-head"><h2>Counter-scans</h2></div>
-    {% if !adm.jobs.is_empty() %}
-    <h3>Jobs</h3>
-    <div class="table-wrap wide"><table>
-      <thead><tr><th>Job</th><th>IP</th><th>Level</th><th>Status</th><th>Queued</th><th>Finished</th><th>Error</th><th>Node</th></tr></thead>
-      <tbody>{% for j in adm.jobs %}{% include "_queue_row.html" %}{% endfor %}</tbody>
-    </table></div>
-    {% endif %}
-    {% if adm.scans.is_empty() %}<p class="muted">{% if adm.jobs.is_empty() %}Never queued for a counter-scan.{% else %}No completed scan yet.{% endif %}</p>{% endif %}
-    {% for sc in adm.scans %}
-      <h3>Level {{ sc.s.level }} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {{ sc.s.os_guess.as_deref().unwrap_or("OS unknown") }} · {{ sc.s.open_ports }} open
-        {% if let Some(n) = sc.s.node %}· <span class="muted">{{ n }}</span> {% endif %}· <a href="/admin/scans/{{ sc.s.id }}">details</a> · <a href="/admin/scans/{{ sc.s.id }}/xml">raw XML</a></h3>
-      {% let ports = sc.ports %}{% include "_ports.html" %}
-    {% endfor %}
-  </section>
-
-  {% if !adm.scans.is_empty() %}
-  <section class="card" id="host-keys">
-    <div class="card-head"><h2>Host keys and certificates</h2>{% let linked = adm.linked_ips() %}{% if linked > 0 %}<span class="badge badge-status" data-status="running">shared with {{ linked }} other IP{% if linked != 1 %}s{% endif %}</span>{% endif %}</div>
-    {% let keys = adm.host_keys %}{% include "_host_keys.html" %}
-  </section>
-  {% endif %}
-  {% if adm.canary_links.0 > 0 || adm.canary_links.1 > 0 %}
-  <section class="card" id="canaries">
-    <h2>Canaries</h2>
-    {% if adm.canary_links.0 > 0 %}<p>Credentials harvested here were used by {{ adm.canary_links.0 }} other IP{% if adm.canary_links.0 != 1 %}s{% endif %}.</p>{% endif %}
-    {% if adm.canary_links.1 > 0 %}<p>Used credentials harvested by {{ adm.canary_links.1 }} other IP{% if adm.canary_links.1 != 1 %}s{% endif %}.</p>{% endif %}
-    <p><a href="/admin/links/canaries?ip={{ ov.ip.ip }}">Show the reuses</a></p>
-  </section>
-  {% endif %}
-  {% if adm.decoys.0 > 0 || adm.decoys.1 > 0 || adm.decoys.2 > 0 %}
-  <section class="card" id="decoys">
-    <h2>Decoys</h2>
-    <p>MCP sessions {{ adm.decoys.0 }} · tool calls {{ adm.decoys.1 }} · LLM calls {{ adm.decoys.2 }}</p>
-    <p><a href="/requests?ip={{ ov.ip.ip|urlencode }}&amp;answer=decoy">Show the decoy requests</a></p>
-  </section>
-  {% endif %}
-  {% endif %}
-
-  <section class="card">
-    <div class="card-head"><h2>Activity</h2><span class="muted">UTC</span></div>
-    <div class="ip-activity">
-      <div>
-        <span class="label">Last 7 days</span>
-        <div class="chart" data-week="{{ week_json }}" role="img" aria-label="Requests per hour over the last 7 days"></div>
-      </div>
-      <div>
-        <span class="label">Last 26 weeks · highest severity per day</span>
-        <div class="chart calendar" data-calendar="{{ calendar_json }}" data-days="{{ crate::store::browse::CALENDAR_DAYS }}" role="img" aria-label="Days with requests over the last 26 weeks"></div>
-      </div>
-      <div class="legend sev-legend" aria-hidden="true">{% for s in 0..5 %}<span><i class="swatch sev-fill-{{ s }}"></i>severity {{ s }}</span>{% endfor %}</div>
-      <table class="visually-hidden"><caption>Days with requests</caption><tbody>{% for d in ov.calendar %}<tr><td>{{ d.day }}</td><td>{{ d.count }}</td><td>{{ d.max_severity }}</td></tr>{% endfor %}</tbody></table>
-    </div>
-  </section>
-
-  {% if labels && !ov.families.is_empty() %}
-  <section class="card">
-    <div class="card-head"><h2>What it was after</h2></div>
-    <ul class="families">
-      {% for f in ov.families %}
-      <li>
-        <span class="fam-name"><i class="fam-dot fam-{{ f.name }}" aria-hidden="true"></i>{{ crate::admin::views::family_name(f.name) }}</span>
-        <span class="fam-bar"><svg viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true"><rect class="fam-fill fam-{{ f.name }}" width="{{ crate::admin::views::pct(f.count, family_max) }}" height="8"/></svg></span>
-        <span class="fam-count num">{{ crate::admin::views::thousands(f.count) }}</span>
-      </li>
-      {% endfor %}
-    </ul>
-    <div class="chips">{% for l in ov.labels %}<a class="badge badge-label {{ crate::admin::views::label_class(l.name) }}" href="/ips?label={{ l.name }}">{{ l.name }} <span class="muted">×{{ l.count }}</span></a>{% endfor %}</div>
-  </section>
-  {% endif %}
-
-  <section class="card">
-    <div class="card-head"><h2>Neighbourhood</h2></div>
-    <div class="neighbours">
-      <div>
-        <h3>Same network{% if !ov.net.is_empty() %} · <a class="mono" href="/ips?q={{ ov.net }}">{{ ov.net }}</a>{% endif %}</h3>
-        <div class="big-stat">{{ crate::admin::views::thousands(ov.net_count) }}</div>
-        {% if let Some(top) = ov.neighbours.first() %}
-        <ol class="ranked">
-          {% let nmax = top.request_count %}
-          {% for n in ov.neighbours %}
-          <li><a class="mono ranked-name" href="/ip/{{ n.ip }}">{{ n.ip }}</a><span class="num">{{ crate::admin::views::thousands(n.request_count) }}</span>{% let sev = n.max_severity %}{% include "_severity.html" %}{% let v = n.request_count %}{% let max = nmax %}{% include "_bar.html" %}</li>
-          {% endfor %}
-        </ol>
-        {% else %}<p class="muted small">None yet.</p>{% endif %}
-      </div>
-      <div>
-        <h3>Same ASN{% if let Some(a) = ov.ip.asn %} · <a href="/ips?asn={{ a }}">AS{{ a }}</a>{% endif %}</h3>
-        <div class="big-stat">{{ crate::admin::views::thousands(ov.asn_count) }}</div>
-        {% if ov.ip.asn.is_none() %}<p class="muted small">ASN unknown.</p>{% endif %}
-      </div>
-    </div>
-  </section>
-
-  {% if let Some(adm) = admin %}
-  <section class="card">
-    <div class="card-head"><h2>Fingerprints</h2><a href="{{ crate::admin::views::link_href("ip", ov.ip.ip.as_str()) }}">Link graph</a></div>
-    {% if adm.fingerprints.is_empty() %}<p class="muted">No browser fingerprints collected.</p>{% endif %}
-    {% for f in adm.fingerprints %}
-      <p><a class="mono" href="{{ crate::admin::views::link_href("fp", f.hash.as_str()) }}">{{ f.hash }}</a> ×{{ f.count }} — seen from <b>{{ f.other_ips }}</b> other IPs
-        {% for v in f.visitor_ids %}<span class="badge badge-label">visitor {{ v }}</span>{% endfor %}</p>
-    {% endfor %}
-  </section>
-
-  <section class="card">
-    <div class="card-head"><h2>False-positive claims</h2></div>
-    {% if adm.claims.is_empty() %}<p class="muted">None.</p>{% endif %}
-    {% for c in adm.claims %}<p><span class="mono">{{ c.ts }}</span> · {{ c.contact_email.as_deref().unwrap_or("no email") }} · <span class="muted">{{ c.user_agent }}</span></p>{% endfor %}
-  </section>
-  {% endif %}
-
-  {% if chrome.authed %}
-  <section class="card">
-    <div class="card-head"><h2>Requests</h2></div>
-    <div class="table-wrap wide"><table>
-      <thead><tr><th>Time (UTC)</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th><th></th></tr></thead>
-      <tbody>
-      {% for r in page.items %}
-        <tr data-sev="{{ r.severity }}">
-          <td class="ts">{{ r.ts }}</td><td class="mono">{{ r.method }}</td>
-          <td class="path">{{ r.path }}{% if let Some(q) = r.query %}<span class="muted">?{{ q }}</span>{% endif %}</td>
-          <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
-          <td><span class="chips">{% for l in r.labels() %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp() %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>
-          <td><a class="btn btn-sm btn-ghost" href="/admin/requests/{{ r.id }}">inspect</a></td>
-        </tr>
-      {% endfor %}
-      {% if page.items.is_empty() %}<tr><td colspan="6" class="empty">No requests recorded.</td></tr>{% endif %}
-      </tbody>
-    </table></div>
-    {% let qs = "" %}{% include "_pagination.html" %}
-  </section>
-  {% endif %}
+  {% include "_target.html" %}
 
   {% if can_delete %}
   <section class="card danger-zone">
@@ -188,9 +29,9 @@
     <p class="muted">The IP and everything recorded about it. Cannot be undone.</p>
     <button class="btn btn-danger" type="button" data-confirm="dlg-delete-ip">Delete this IP</button>
     <dialog id="dlg-delete-ip">
-      <h3>Delete {{ ov.ip.ip }}?</h3>
-      <p class="muted">{{ ov.request_count }} requests and all related records.</p>
-      <form method="post" action="/admin/ips/{{ ov.ip.ip }}/delete" class="actions">
+      <h3>Delete {{ t.ov.ip.ip }}?</h3>
+      <p class="muted">{{ t.ov.request_count }} requests and all related records.</p>
+      <form method="post" action="/admin/ips/{{ t.ov.ip.ip }}/delete" class="actions">
         <button class="btn" type="button" data-close>Cancel</button>
         <button class="btn btn-danger" type="submit">Delete</button>
       </form>

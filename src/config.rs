@@ -44,6 +44,9 @@ pub struct Config {
     /// When API providers look an IP up again.
     #[serde(default)]
     pub enrichment: EnrichmentConfig,
+    /// Lookup credits (cluster only).
+    #[serde(default)]
+    pub credits: CreditsConfig,
     /// Optional API providers; a missing section means the provider is off.
     pub abuseipdb: Option<AbuseIpDbConfig>,
     pub shodan: Option<ShodanConfig>,
@@ -63,17 +66,66 @@ pub struct EnrichmentConfig {
     /// seen `N × 1.5^(k−1)` days after the newest one (N = this); 0 never.
     #[serde(default = "default_refresh_days")]
     pub refresh_after_days: f64,
+    /// The part of each API provider's budget that paid on-demand lookups
+    /// may use (0 to 1). Whatever happens to credits, no more than this is
+    /// taken from this node's budgets.
+    #[serde(default = "default_on_demand_share")]
+    pub on_demand_share: f64,
 }
 
 fn default_refresh_days() -> f64 {
     30.0
 }
 
+fn default_on_demand_share() -> f64 {
+    0.2
+}
+
 impl Default for EnrichmentConfig {
     fn default() -> Self {
         Self {
             refresh_after_days: default_refresh_days(),
+            on_demand_share: default_on_demand_share(),
         }
+    }
+}
+
+impl EnrichmentConfig {
+    pub fn check(&self) -> anyhow::Result<()> {
+        if !(0.0..=1.0).contains(&self.on_demand_share) {
+            anyhow::bail!("enrichment.on_demand_share must be between 0 and 1");
+        }
+        Ok(())
+    }
+}
+
+/// `[credits]`: this node's part in the cluster's credit system.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreditsConfig {
+    /// Share of the other nodes' fresh scans a scanner runs again to check
+    /// them (0 to 1; 0: this node audits nothing).
+    #[serde(default = "default_audit_share")]
+    pub audit_share: f64,
+}
+
+fn default_audit_share() -> f64 {
+    0.05
+}
+
+impl Default for CreditsConfig {
+    fn default() -> Self {
+        Self {
+            audit_share: default_audit_share(),
+        }
+    }
+}
+
+impl CreditsConfig {
+    pub fn check(&self) -> anyhow::Result<()> {
+        if !(0.0..=1.0).contains(&self.audit_share) {
+            anyhow::bail!("credits.audit_share must be between 0 and 1");
+        }
+        Ok(())
     }
 }
 
@@ -198,9 +250,8 @@ pub struct ClusterConfig {
     /// Scan lease length; renewed while nmap runs.
     #[serde(default = "default_lease_secs")]
     pub lease_secs: u64,
-    /// Let holders of this node's config key change its runtime settings
-    /// (scan pace, rescan cooldown, roles). Default: only the local admin
-    /// interface, the CLI and this file can.
+    /// Ignored. It switched config keys on, which the ownership key replaced;
+    /// still accepted so existing config files load.
     #[serde(default)]
     pub remote_config: bool,
     /// Stop storing a member's entries once they take this many MiB here
@@ -529,6 +580,8 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("public", "delay_minutes", "5"),
     ("public", "jitter_minutes", "5"),
     ("public", "recent_rows", "50"),
+    ("enrichment", "on_demand_share", "0.2"),
+    ("credits", "audit_share", "0.05"),
 ];
 
 /// Sections that are required when their role is on and unused otherwise.
@@ -547,6 +600,13 @@ impl Config {
                  if nothing else uses it",
                 dir.display()
             ));
+        }
+        if self.cluster.as_ref().is_some_and(|c| c.remote_config) {
+            notes.push(
+                "note: `cluster.remote_config` is ignored: config keys were replaced by the \
+                 ownership key (peephole owner new, peephole owner adopt); remove the key"
+                    .into(),
+            );
         }
         notes
     }
@@ -655,6 +715,8 @@ impl Config {
         if !(e == 0.0 || (1.0..=3650.0).contains(&e)) {
             bail!("enrichment.refresh_after_days must be 0 (never) or between 1 and 3650");
         }
+        self.enrichment.check()?;
+        self.credits.check()?;
         if let Some(a) = &self.abuseipdb {
             if a.api_key.trim().is_empty() {
                 bail!("[abuseipdb] needs api_key (or omit the section)");
@@ -823,82 +885,32 @@ impl Config {
         if let Some(custom) = self.scan.level_argv.get(&level) {
             return Some(custom.clone());
         }
-        // One NSE argument; it contains spaces, so argv is built element by
-        // element rather than split from a string. `discovery` and `safe`
-        // also hold scripts that would leak the target to third parties
-        // (`external`: whois, ASN and geolocation lookups), broadcast on
-        // the scanner's own network (`broadcast` prerules), or flood
-        // (`dos`); those categories are excluded.
-        const SCRIPTS: &str =
-            "(discovery or safe) and not (intrusive or broadcast or external or dos)";
-        // Level 2 names its scripts: the source's own identifiers (SSH host
-        // keys and algorithm lists, the TLS certificate), each one handshake
-        // with a port nmap already found open, all in `safe`.
-        const IDENTITY_SCRIPTS: &str = "ssh-hostkey,ssh2-enum-algos,ssl-cert";
-        let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<String>>();
-        let argv = match level {
-            1 => s(&[
-                "-Pn",
-                "-sS",
-                "-sV",
-                "--version-light",
-                "-T3",
-                "--top-ports",
-                "100",
-            ]),
-            2 => s(&[
-                "-Pn",
-                "-sS",
-                "-sV",
-                "-O",
-                "-T3",
-                "--top-ports",
-                "1000",
-                "--script",
-                IDENTITY_SCRIPTS,
-            ]),
-            3 => s(&[
-                "-Pn",
-                "-sS",
-                "-sV",
-                "-O",
-                "-T3",
-                "--top-ports",
-                "1000",
-                "--traceroute",
-                "--script",
-                SCRIPTS,
-            ]),
-            4 => {
-                let mut v = s(&["-Pn", "-sS"]);
-                if self.scan.level4_udp {
-                    v.push("-sU".into());
-                    v.push("-p".into());
-                    v.push(format!("T:1-65535,U:{UDP_TOP50}"));
-                } else {
-                    v.push("-p-".into());
-                }
-                v.extend(s(&[
-                    "-sV",
-                    "-O",
-                    "-T3",
-                    "--max-retries",
-                    "1",
-                    "--traceroute",
-                    "--script",
-                    SCRIPTS,
-                ]));
-                v
-            }
-            _ => return None,
-        };
-        Some(argv)
+        crate::scan::profiles::builtin(level, self.scan.level4_udp)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config file from before ownership still loads, and says the key
+    /// does nothing.
+    #[test]
+    fn remote_config_is_still_accepted() {
+        let cfg: Config = toml::from_str(
+            "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n\
+             [cluster]\nnode_name = \"n\"\nlisten = \"127.0.0.1:7443\"\nremote_config = true\n",
+        )
+        .unwrap();
+        let notes = cfg.obsolete_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("remote_config` is ignored")),
+            "{notes:?}"
+        );
+        assert!(cfg.cluster.unwrap().remote_config);
+    }
 
     /// The target just connected to us, so it is up. Without -Pn nmap's own
     /// discovery probes (often filtered) decide "down" and nothing is scanned.
@@ -1459,5 +1471,30 @@ data_dir = "/tmp"
                 max: 20
             }]
         );
+    }
+
+    #[test]
+    fn the_audit_share_defaults_to_five_percent_and_is_a_share() {
+        let base = "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert_eq!(cfg.credits.audit_share, 0.05);
+        let cfg: Config = toml::from_str(&format!("{base}[credits]\naudit_share = 0\n")).unwrap();
+        assert_eq!(cfg.credits.audit_share, 0.0);
+        for bad in ["-0.1", "1.5"] {
+            let cfg: Config =
+                toml::from_str(&format!("{base}[credits]\naudit_share = {bad}\n")).unwrap();
+            assert!(cfg.credits.check().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_on_demand_share_defaults_to_a_fifth() {
+        let base = "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert_eq!(cfg.enrichment.on_demand_share, 0.2);
+        assert_eq!(cfg.enrichment.refresh_after_days, 30.0);
+        let cfg: Config =
+            toml::from_str(&format!("{base}[enrichment]\non_demand_share = 1.5\n")).unwrap();
+        assert!(cfg.enrichment.check().is_err());
     }
 }

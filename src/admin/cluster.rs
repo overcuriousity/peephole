@@ -5,7 +5,7 @@ use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::pages::{redirect_with_error, redirect_with_notice};
 use crate::admin::views::Chrome;
-use crate::classify::stored::{Agreement, agreement};
+use crate::classify::stored::Agreement;
 use crate::cluster::identity::NodeId;
 use crate::cluster::status::PaceInfo;
 use crate::cluster::{Node, invite, members, repl};
@@ -22,8 +22,9 @@ pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/admin/cluster", get(page))
         .route("/admin/cluster/settings", post(set_own))
-        .route("/admin/cluster/config-key/forget", post(forget_key))
         .route("/admin/cluster/node/{key}", get(node_page).post(node_set))
+        .route("/admin/cluster/node/{key}/owner", post(node_owner))
+        .route("/admin/cluster/node/{key}/fork-proof", get(fork_proof))
         .route("/admin/cluster/block", post(block))
         .route("/admin/cluster/unblock", post(unblock))
         .route("/admin/cluster/purge", post(purge))
@@ -47,10 +48,14 @@ pub struct MemberView {
     pub blocked: bool,
     /// This node deleted its data and no longer relays it.
     pub purged: bool,
-    /// It lets config key holders change its runtime settings.
-    pub remote_config: bool,
-    /// This node holds its config key.
-    pub key_held: bool,
+    /// One of this operator's nodes (same owner as this node).
+    pub sibling: bool,
+    /// A sibling this node can command: it keeps the ownership key.
+    pub managed: bool,
+    /// Its credits in this node's count ("5.00"); empty when not loaded.
+    pub balance: String,
+    /// Why its shares do not count in full here; empty: it earns.
+    pub not_earning: Vec<String>,
     pub is_self: bool,
     pub version: String,
     pub last_seen: String,
@@ -81,6 +86,10 @@ pub struct MemberView {
     pub ruleset: String,
     /// Whether that newest fingerprint is ours; None without one.
     pub ruleset_same: Option<bool>,
+    /// Scans an hour it can do and did ("20.0"), and which setting binds it.
+    pub can_do: String,
+    pub did: String,
+    pub limited_by: &'static str,
 }
 
 impl MemberView {
@@ -94,11 +103,15 @@ impl MemberView {
         if let Some(s) = &self.skew {
             v.push(format!("clock {s}"));
         }
-        if self.rules_differ {
-            v.push(format!("rules: {}", self.rules));
-        }
-        if self.ruleset_same == Some(false) {
-            v.push("records with other rules".to_string());
+        // A fork is an issue of its own; the other reasons go together.
+        let (forked, rest): (Vec<&String>, Vec<&String>) = self
+            .not_earning
+            .iter()
+            .partition(|r| r.starts_with(crate::credits::gates::FORKED));
+        v.extend(forked.into_iter().cloned());
+        if !rest.is_empty() {
+            let rest: Vec<&str> = rest.into_iter().map(String::as_str).collect();
+            v.push(format!("not earning here: {}", rest.join("; ")));
         }
         if let Some(e) = self.error.as_ref().filter(|_| !self.incompatible) {
             v.push(e.clone());
@@ -107,98 +120,13 @@ impl MemberView {
     }
 }
 
-/// Characters of a rules fingerprint shown.
-pub(crate) const SHORT_HASH: usize = 12;
+use crate::credits::gates::RulesCheck;
+pub(crate) use crate::credits::gates::SHORT_HASH;
 
-/// The rules fingerprints a member's newest classified requests carry
-/// (`requests.rules`): what the recording binary says it classified with.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Carried {
-    /// The newest request's.
-    pub newest: Option<String>,
-    /// Other fingerprints among the sample (a node upgraded meanwhile).
-    pub others: usize,
-}
-
-impl Carried {
-    /// What the page shows, and whether the newest is `ours`.
-    fn view(&self, ours: &str) -> (String, Option<bool>) {
-        let Some(h) = &self.newest else {
-            return ("none recorded".into(), None);
-        };
-        let mut s: String = h.chars().take(SHORT_HASH).collect();
-        match self.others {
-            0 => {}
-            1 => s.push_str(" +1 other"),
-            n => s.push_str(&format!(" +{n} others")),
-        }
-        (s, Some(h == ours))
-    }
-}
-
-/// The fingerprints the newest `sample` classified requests of `origin`
-/// carry (None: this standalone node's own rows).
-pub async fn carried(
-    pool: &sqlx::SqlitePool,
-    origin: Option<&[u8]>,
-    sample: i64,
-) -> anyhow::Result<Carried> {
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT rules FROM requests
-         WHERE origin IS ? AND is_fp_claim = 0 AND rules IS NOT NULL
-         ORDER BY id DESC LIMIT ?",
-    )
-    .bind(origin)
-    .bind(sample)
-    .fetch_all(pool)
-    .await?;
-    let distinct: std::collections::HashSet<&String> = rows.iter().collect();
-    Ok(Carried {
-        newest: rows.first().cloned(),
-        others: distinct.len().saturating_sub(1),
-    })
-}
-
-/// Members' recent requests classified again with this node's (built-in)
-/// rules, and the rules fingerprints they carry, by member
-/// ([`crate::classify::stored::agreement`], [`carried`]).
-pub struct RulesCheck {
-    pub by_member: std::collections::HashMap<NodeId, Agreement>,
-    pub carried: std::collections::HashMap<NodeId, Carried>,
-}
-
-/// How long a comparison is shown before it is made again.
-const RULES_CHECK_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-/// Newest requests of each member compared.
-pub const RULES_SAMPLE: i64 = 500;
-
-/// The comparison, made at most every [`RULES_CHECK_TTL`] (an older one is
-/// shown while it is made again), so the page stays fast.
-pub(crate) async fn rules_check(st: &AdminState, node: &Node) -> AppResult<Arc<RulesCheck>> {
-    let store = node.store.clone();
-    Ok(st
-        .rules_check
-        .get((), RULES_CHECK_TTL, move || {
-            let store = store.clone();
-            Box::pin(async move { compare_rules(&store).await })
-        })
-        .await?)
-}
-
-async fn compare_rules(store: &crate::store::Store) -> anyhow::Result<RulesCheck> {
-    let mut check = RulesCheck {
-        by_member: Default::default(),
-        carried: Default::default(),
-    };
-    let c = crate::classify::Classifier::builtin();
-    for m in members::all(store).await? {
-        let origin = Some(&m.id.0[..]);
-        let a = agreement(&store.pool, c, origin, RULES_SAMPLE).await?;
-        check.by_member.insert(m.id, a);
-        let k = carried(&store.pool, origin, RULES_SAMPLE).await?;
-        check.carried.insert(m.id, k);
-    }
-    Ok(check)
+/// The comparison of members' requests with this node's rules, made at
+/// most every ten minutes (see [`crate::credits::gates::rules_check`]).
+pub(crate) async fn rules_check(_st: &AdminState, node: &Node) -> AppResult<Arc<RulesCheck>> {
+    Ok(crate::credits::gates::rules_check(node).await?)
 }
 
 /// A fresh heartbeat's creation time against our clock at receipt. Gossip
@@ -255,6 +183,8 @@ pub struct SettingsView {
     pub listener_missing: String,
     pub scanner_missing: String,
     pub web_missing: String,
+    /// In a cluster: the node it forwards its credits to ("" = none).
+    pub collect_to: Option<String>,
 }
 
 impl SettingsView {
@@ -270,6 +200,10 @@ impl SettingsView {
             listener_missing: p.listener.clone().unwrap_or_default(),
             scanner_missing: p.scanner.clone().unwrap_or_default(),
             web_missing: p.web.clone().unwrap_or_default(),
+            collect_to: st
+                .recorder
+                .node()
+                .map(|_| s.collect_to.map(|id| id.to_string()).unwrap_or_default()),
         }
     }
 }
@@ -323,13 +257,17 @@ pub(crate) fn node(st: &AdminState) -> AppResult<&Arc<Node>> {
 pub(crate) async fn views(
     node: &Node,
     check: &RulesCheck,
+    book: Option<&crate::credits::Book>,
 ) -> AppResult<(MemberView, Vec<MemberView>)> {
     let rows = members::all(&node.store).await?;
     let heads = repl::head_map(&repl::heads(&node.store).await?);
     let purged = crate::cluster::block::purged(&node.store).await?;
     let statuses = node.peer_status.read().unwrap().clone();
     let me = node.id();
-    let keys = crate::cluster::confkey::held(&node.store).await?;
+    let sibs = crate::cluster::owner::fleet::siblings(&node.store).await?;
+    let managing = crate::cluster::owner::load(&node.store, me)
+        .await?
+        .is_some_and(|o| o.managing());
     let ours = builtin_rules();
     let ruleset_of = |id: &NodeId| {
         check
@@ -399,8 +337,14 @@ pub(crate) async fn views(
             state: m.standing.label(),
             blocked: node.is_blocked(&m.id),
             purged: purged.contains(&m.id),
-            remote_config: m.remote_config,
-            key_held: keys.contains(&m.id),
+            sibling: sibs.contains(&m.id),
+            managed: managing && sibs.contains(&m.id),
+            balance: book
+                .map(|b| crate::credits::show(b.balance(&m.id)))
+                .unwrap_or_default(),
+            not_earning: book
+                .map(|b| b.standing(&m.id).reasons())
+                .unwrap_or_default(),
             is_self,
             version: hb.map(|h| h.version.clone()).unwrap_or_else(|| {
                 if is_self {
@@ -437,6 +381,9 @@ pub(crate) async fn views(
                 .is_some_and(|e| e.contains("incompatible protocol")),
             error,
             skew: known.as_ref().and_then(clock_skew),
+            can_do: String::new(),
+            did: String::new(),
+            limited_by: "",
         };
         if is_self {
             mine = Some(v);
@@ -459,8 +406,12 @@ pub(crate) async fn views(
         state: "active",
         blocked: false,
         purged: false,
-        remote_config: node.cfg.remote_config,
-        key_held: false,
+        sibling: false,
+        managed: false,
+        balance: book
+            .map(|b| crate::credits::show(b.balance(&me)))
+            .unwrap_or_default(),
+        not_earning: book.map(|b| b.standing(&me).reasons()).unwrap_or_default(),
         is_self: true,
         version: crate::VERSION.into(),
         last_seen: "this node".into(),
@@ -477,6 +428,9 @@ pub(crate) async fn views(
         skew: None,
         rules: String::new(),
         rules_differ: false,
+        can_do: String::new(),
+        did: String::new(),
+        limited_by: "",
     });
     Ok((mine, out))
 }
@@ -493,11 +447,34 @@ pub(crate) async fn scanner_rows(st: &AdminState) -> AppResult<Vec<MemberView>> 
         by_member: Default::default(),
         carried: Default::default(),
     };
-    let (me, members) = views(node, &none).await?;
-    Ok(std::iter::once(me)
+    let (me, members) = views(node, &none, None).await?;
+    let rows: Vec<MemberView> = std::iter::once(me)
         .filter(|m| m.scanner)
         .chain(members.into_iter().filter(|m| m.scanner && m.active))
-        .collect())
+        .collect();
+    // As the price counts them: blocked and forked scanners are left out,
+    // also of the mean that stands in for scanners with few jobs.
+    let mut left_out: std::collections::HashSet<NodeId> =
+        crate::cluster::seal::forked(&node.store.pool)
+            .await?
+            .into_iter()
+            .map(|f| f.origin)
+            .collect();
+    left_out.extend(node.members().keys().filter(|id| node.is_blocked(id)));
+    let cap =
+        crate::credits::price::capacity(&crate::credits::price::scanners(node, &left_out).await?);
+    let mut rows = rows;
+    for m in rows.iter_mut() {
+        if let Some(c) = cap.scanners.iter().find(|c| c.node.to_string() == m.key) {
+            m.can_do = format!("{:.1}", c.can_do);
+            m.did = format!("{:.1}", c.did);
+            m.limited_by = match c.limited_by {
+                crate::credits::price::Limit::Workers => "workers",
+                crate::credits::price::Limit::PerHour => "scans per hour",
+            };
+        }
+    }
+    Ok(rows)
 }
 
 /// How much history this node keeps, and from when it holds it.
@@ -756,7 +733,8 @@ async fn render_page(st: &AdminState) -> AppResult<Html<String>> {
         });
     };
     let check = rules_check(st, node).await?;
-    let (me, members) = views(node, &check).await?;
+    let book = crate::credits::book(node).await?;
+    let (me, members) = views(node, &check, Some(&book)).await?;
     let contrib = contributions(node).await?;
     let (shares, unshared) = share_cells(&contrib);
     render(&ClusterPage {
@@ -917,6 +895,7 @@ async fn purge(
 /// role fields always describe the wanted state in full.
 #[derive(serde::Deserialize)]
 struct SettingsForm {
+    counter: Option<u64>,
     base_version: Option<u64>,
     max_workers: Option<String>,
     max_scans_per_hour: Option<String>,
@@ -925,6 +904,9 @@ struct SettingsForm {
     listener: Option<String>,
     scanner: Option<String>,
     web: Option<String>,
+    /// The node this one (or the sibling the form is for) forwards its
+    /// credits to; "" = none. Absent: unchanged.
+    collect_to: Option<String>,
 }
 
 impl SettingsForm {
@@ -951,6 +933,7 @@ impl SettingsForm {
             listener: Some(self.listener.is_some()),
             scanner: Some(self.scanner.is_some()),
             web: Some(self.web.is_some()),
+            collect_to: self.collect_to.clone(),
         })
     }
 }
@@ -968,7 +951,7 @@ async fn set_own(
         Err(e) => return Ok(back_to(SETTINGS, None, Some(e))),
     };
     // The form sends every role, so it must not overwrite a change made
-    // elsewhere (CLI, a config key holder) after the page was loaded.
+    // elsewhere (CLI, the owner) after the page was loaded.
     let Some(base) = f.base_version else {
         return Ok(back_to(
             SETTINGS,
@@ -986,40 +969,102 @@ async fn set_own(
     })
 }
 
-async fn forget_key(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Form(f): Form<KeyForm>,
-) -> AppResult<Response> {
-    let node = node(&st)?;
-    let Ok(id) = NodeId::parse(&f.key) else {
-        return Ok(back(None, Some("unknown node".into())));
-    };
-    crate::cluster::confkey::forget(&node.store, &id).await?;
-    Ok(back_to(
-        &format!("/admin/cluster/node/{id}"),
-        Some(format!("Config key for {} forgotten.", id.short())),
-        None,
-    ))
-}
-
-/// The live part of a node page: its remote settings.
+/// The live part of a node page: its settings, for a node of this operator.
 enum Remote {
     /// This node: settings live on System.
     Own,
-    /// No config key held here: nothing asked.
+    /// A member that is not one of this operator's nodes.
+    NotYours,
+    /// A sibling, but the ownership key is not kept on this node.
     NoKey,
     /// Asked, and it answered.
     Settings {
-        state: crate::cluster::confkey::State,
+        status: Box<crate::cluster::owner::cmd::Status>,
         timeout_min: String,
         rec: Option<(u32, i64, String)>,
         has: (bool, bool, bool),
+        /// `(key, name)` of the peers it blocks.
+        blocked: Vec<(String, String)>,
+        /// `(key, name)` of the members it could be told to block.
+        peers: Vec<(String, String)>,
+        /// `(key, name)` of the operator's other nodes it can forward its
+        /// credits to (this node first).
+        fleet: Vec<(String, String)>,
     },
     /// Asked; no answer.
     Silent(String),
-    /// Key held, but the member is offline or blocked: not asked.
+    /// A managed sibling that is offline or blocked here: not asked.
     Offline,
+}
+
+/// A member's credits as this node counts them.
+pub struct CreditsBlock {
+    pub balance: String,
+    pub earns: bool,
+    /// Every reason it does not earn in full here.
+    pub reasons: Vec<String>,
+    /// Audits of its scans over 7 days as `(agrees, differs,
+    /// inconclusive)`: by this node and its fleet (they count), and by
+    /// other members (shown only).
+    pub counted: (u32, u32, u32),
+    pub others: (u32, u32, u32),
+    /// Where it showed two histories, and the proof if one is known.
+    pub fork: Option<String>,
+    /// A proof is held here and can be downloaded.
+    pub fork_proof: bool,
+}
+
+async fn credits_block(node: &Node, id: NodeId) -> AppResult<CreditsBlock> {
+    use crate::credits::audit::Outcome;
+    let book = crate::credits::book(node).await?;
+    let standing = book.standing(&id);
+    let mut auditors = crate::cluster::owner::fleet::siblings(&node.store).await?;
+    auditors.push(node.id());
+    let week = crate::cluster::hlc::wall_ms().saturating_sub(7 * crate::credits::DAY_MS) << 16;
+    let (mut counted, mut others) = ((0, 0, 0), (0, 0, 0));
+    for c in crate::credits::audit::counts(&node.store.pool, week).await? {
+        if c.scanner != id {
+            continue;
+        }
+        let t = if auditors.contains(&c.auditor) {
+            &mut counted
+        } else {
+            &mut others
+        };
+        match c.outcome {
+            Outcome::Agrees => t.0 += c.n,
+            Outcome::Differs => t.1 += c.n,
+            Outcome::Inconclusive => t.2 += c.n,
+        }
+    }
+    let members = node.members();
+    let forked = crate::cluster::seal::forked(&node.store.pool)
+        .await?
+        .into_iter()
+        .find(|f| f.origin == id);
+    let fork_proof = forked.as_ref().is_some_and(|f| f.proof.is_some());
+    let fork = forked.map(|f| match f.proof {
+        Some((by, seq)) => format!(
+            "two entries at position {} of its log; proof published by {} (entry {seq} of its log)",
+            f.seq,
+            members
+                .get(&by)
+                .map_or_else(|| by.short(), |m| m.name.clone())
+        ),
+        None => format!(
+            "its seal at entry {} does not match its log as held here; no proof yet",
+            f.seq
+        ),
+    });
+    Ok(CreditsBlock {
+        balance: crate::credits::show(book.balance(&id)),
+        earns: standing.earns_as_scanner(),
+        reasons: standing.reasons(),
+        counted,
+        others,
+        fork,
+        fork_proof,
+    })
 }
 
 #[derive(Template)]
@@ -1029,13 +1074,44 @@ struct NodePage {
     m: MemberView,
     contrib: Vec<ContribView>,
     remote: Remote,
+    credits: CreditsBlock,
 }
 
-/// Whether a node page asks the member for its settings: only a live,
-/// unblocked member whose key is held here (an offline one would hold the
+/// Whether a node page asks the member for its status: only a live,
+/// unblocked sibling this node can command (an offline one would hold the
 /// page for the whole request timeout).
 fn asks_remote(m: &MemberView) -> bool {
-    !m.is_self && m.key_held && m.live && !m.blocked
+    !m.is_self && m.managed && m.live && !m.blocked
+}
+
+/// Where a sibling can be told to forward its credits: this node and the
+/// other siblings. The node it forwards to now is always among them, also
+/// when it is no sibling here (still on the previous key after a rotation,
+/// not found again yet), so saving the form does not quietly change it.
+fn collect_options(all: &[MemberView], target: &str, now: Option<&str>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = all
+        .iter()
+        .filter(|x| (x.is_self || x.sibling) && x.key != target)
+        .map(|x| {
+            let name = if x.is_self {
+                "this node".into()
+            } else {
+                x.name.clone()
+            };
+            (x.key.clone(), name)
+        })
+        .collect();
+    if let Some(now) = now.filter(|n| !n.is_empty() && !out.iter().any(|(k, _)| k == n)) {
+        let name = all
+            .iter()
+            .find(|x| x.key == now)
+            .map_or_else(|| now.chars().take(20).collect(), |x| x.name.clone());
+        out.push((
+            now.to_string(),
+            format!("{name} (not one of your nodes here)"),
+        ));
+    }
+    out
 }
 
 async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
@@ -1044,9 +1120,11 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
         return Err(AppError::NotFound);
     };
     let check = rules_check(st, node).await?;
-    let (me, members) = views(node, &check).await?;
+    let book = crate::credits::book(node).await?;
+    let (me, members) = views(node, &check, Some(&book)).await?;
+    let all: Vec<MemberView> = std::iter::once(me).chain(members).collect();
     let key = id.to_string();
-    let Some(m) = std::iter::once(me).chain(members).find(|m| m.key == key) else {
+    let Some(m) = all.iter().find(|m| m.key == key).cloned() else {
         return Err(AppError::NotFound);
     };
     let contrib = contributions(node)
@@ -1056,13 +1134,20 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
         .collect();
     let remote = if m.is_self {
         Remote::Own
-    } else if !m.key_held {
+    } else if !m.sibling {
+        Remote::NotYours
+    } else if !m.managed {
         Remote::NoKey
     } else if !asks_remote(&m) {
         Remote::Offline
     } else {
-        match crate::cluster::confkey::get(node, id).await {
-            Ok(s) => {
+        use crate::cluster::owner::cmd;
+        let asked = async {
+            let key = cmd::kept_key(node).await?;
+            cmd::status(node, &key, id).await
+        };
+        match asked.await {
+            Ok(st) => {
                 let minutes = |secs: u64| {
                     if secs.is_multiple_of(60) {
                         (secs / 60).to_string()
@@ -1070,14 +1155,34 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
                         format!("{:.1}", secs as f64 / 60.0)
                     }
                 };
-                let has = |r: &str| s.roles.iter().any(|x| x == r);
+                let has = |r: &str| st.state.roles.iter().any(|x| x == r);
+                let name_of = |k: &str| {
+                    all.iter()
+                        .find(|x| x.key == k)
+                        .map(|x| x.name.clone())
+                        .unwrap_or_else(|| k.chars().take(20).collect())
+                };
+                let blocked: Vec<(String, String)> = st
+                    .blocked
+                    .iter()
+                    .map(|b| (b.to_string(), name_of(&b.to_string())))
+                    .collect();
                 Remote::Settings {
-                    timeout_min: minutes(s.pace.timeout_secs),
-                    rec: s
+                    timeout_min: minutes(st.state.pace.timeout_secs),
+                    rec: st
+                        .state
                         .recommended
                         .map(|p| (p.max_workers, p.max_scans_per_hour, minutes(p.timeout_secs))),
                     has: (has("listener"), has("scanner"), has("web")),
-                    state: s,
+                    peers: all
+                        .iter()
+                        .filter(|x| !x.is_self && x.key != m.key)
+                        .filter(|x| !blocked.iter().any(|(k, _)| *k == x.key))
+                        .map(|x| (x.key.clone(), x.name.clone()))
+                        .collect(),
+                    fleet: collect_options(&all, &m.key, st.collect_to.as_deref()),
+                    blocked,
+                    status: Box::new(st),
                 }
             }
             Err(e) => Remote::Silent(format!("{} did not answer: {e:#}", m.name)),
@@ -1085,10 +1190,60 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
     };
     render(&NodePage {
         chrome: Chrome::new(true, "admin"),
+        credits: credits_block(node, id).await?,
         m,
         contrib,
         remote,
     })
+}
+
+/// The proof that a member showed two histories: the `fork_proof` entry
+/// as its publisher signed it (CBOR, a `WireEntry` holding both of the
+/// member's entries), for anyone to check.
+async fn fork_proof(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> AppResult<Response> {
+    let node = node(&st)?;
+    let Ok(id) = NodeId::parse(&key) else {
+        return Err(AppError::NotFound);
+    };
+    let Some((by, seq)) = crate::cluster::seal::forked(&node.store.pool)
+        .await?
+        .into_iter()
+        .find(|f| f.origin == id)
+        .and_then(|f| f.proof)
+    else {
+        return Err(AppError::NotFound);
+    };
+    let mut conn = node
+        .store
+        .pool
+        .acquire()
+        .await
+        .map_err(anyhow::Error::from)?;
+    let Some(entry) = crate::cluster::repl::signed_entry(&mut conn, &by, seq).await? else {
+        return Err(AppError::NotFound);
+    };
+    let bytes = crate::cluster::rpc::cbor::encode(&entry)?;
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/cbor".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!(
+                    "attachment; filename=\"peephole-fork-proof-{}.cbor\"",
+                    id.short()
+                ),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 async fn node_page(
@@ -1097,6 +1252,54 @@ async fn node_page(
     axum::extract::Path(key): axum::extract::Path<String>,
 ) -> AppResult<Html<String>> {
     node_view(&st, &key).await
+}
+
+/// Why an owner command did nothing, or may not have.
+#[derive(Debug, PartialEq)]
+enum Unsent {
+    /// Nothing was sent, or the node said no.
+    Refused(String),
+    /// Sent, but no answer came back in time.
+    NoAnswer(String),
+}
+
+impl Unsent {
+    /// The message for the page; `what`: "Not saved", "Not done".
+    fn text(&self, what: &str) -> String {
+        match self {
+            Unsent::Refused(e) => format!("{what}: {e}"),
+            Unsent::NoAnswer(e) => format!(
+                "{e}. The command may still be carried out there (a block of a busy peer \
+                 takes a while): reload this page to see."
+            ),
+        }
+    }
+}
+
+/// Send `cmd` to sibling `id` with the key this node keeps. Ok: what the
+/// node did.
+async fn owner_run(
+    node: &Arc<crate::cluster::Node>,
+    id: NodeId,
+    counter: u64,
+    cmd: crate::cluster::owner::cmd::OwnerCmd,
+) -> Result<String, Unsent> {
+    use crate::cluster::owner::{cmd as oc, fleet};
+    let refused = |e: anyhow::Error| Unsent::Refused(format!("{e:#}"));
+    // Only to the operator's other nodes: the path names any member, and
+    // this node would carry out a command it sent to itself.
+    let sibs = fleet::siblings(&node.store).await.map_err(refused)?;
+    if id == node.id() || !sibs.contains(&id) {
+        return Err(Unsent::Refused(
+            "that is not one of your other nodes".into(),
+        ));
+    }
+    let key = oc::kept_key(node).await.map_err(refused)?;
+    match oc::run(node, &key, id, counter, cmd).await {
+        Ok(Ok(note)) => Ok(note),
+        Ok(Err(e)) => Err(Unsent::Refused(e)),
+        Err(e) => Err(Unsent::NoAnswer(format!("{e:#}"))),
+    }
 }
 
 async fn node_set(
@@ -1111,18 +1314,80 @@ async fn node_set(
     };
     let to = format!("/admin/cluster/node/{id}");
     // Post/redirect/get: a reload of the page does not send the form again.
-    Ok(match (f.changes(), f.base_version) {
-        (Err(e), _) => back_to(&to, None, Some(e)),
-        (_, None) => back_to(&to, None, Some("reload the page and try again".into())),
-        (Ok(c), Some(base)) => match crate::cluster::confkey::set(node, id, base, &c).await {
-            Ok(Ok(_)) => back_to(
-                &to,
-                Some("Saved. Roles switch within seconds.".into()),
-                None,
-            ),
-            Ok(Err(e)) => back_to(&to, None, Some(format!("Not saved: {e}"))),
-            Err(e) => back_to(&to, None, Some(format!("Not saved: {e:#}"))),
+    Ok(match (f.changes(), f.base_version, f.counter) {
+        (Err(e), _, _) => back_to(&to, None, Some(e)),
+        (Ok(c), Some(base), Some(counter)) => {
+            let cmd = crate::cluster::owner::cmd::OwnerCmd::Settings {
+                base_version: base,
+                changes: c,
+            };
+            match owner_run(node, id, counter, cmd).await {
+                Ok(_) => back_to(
+                    &to,
+                    Some("Saved. Roles switch within seconds.".into()),
+                    None,
+                ),
+                Err(e) => back_to(&to, None, Some(e.text("Not saved"))),
+            }
+        }
+        _ => back_to(&to, None, Some("reload the page and try again".into())),
+    })
+}
+
+/// An owner action on a sibling, from its page.
+#[derive(serde::Deserialize)]
+struct OwnerForm {
+    counter: u64,
+    action: String,
+    /// The peer a block, unblock or purge is about.
+    target: Option<String>,
+    subtree: Option<String>,
+    /// The invite to revoke.
+    invite: Option<i64>,
+    /// Credits to send, as typed ("0.5").
+    amount: Option<String>,
+}
+
+async fn node_owner(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+    Form(f): Form<OwnerForm>,
+) -> AppResult<Response> {
+    use crate::cluster::owner::cmd::OwnerCmd;
+    let node = node(&st)?;
+    let Ok(id) = NodeId::parse(&key) else {
+        return Err(AppError::NotFound);
+    };
+    let to = format!("/admin/cluster/node/{id}");
+    let peer = f.target.as_deref().and_then(|t| NodeId::parse(t).ok());
+    let cmd = match (f.action.as_str(), peer, f.invite) {
+        ("block", Some(n), _) => OwnerCmd::Block {
+            node: n,
+            subtree: f.subtree.is_some(),
         },
+        ("unblock", Some(n), _) => OwnerCmd::Unblock { node: n },
+        ("purge", Some(n), _) => OwnerCmd::Purge { node: n },
+        ("invite-revoke", _, Some(i)) => OwnerCmd::InviteRevoke { id: i },
+        ("leave", _, _) => OwnerCmd::Leave,
+        ("release", _, _) => OwnerCmd::Release,
+        ("send-credits", Some(n), _) => {
+            match f.amount.as_deref().and_then(crate::credits::parse_amount) {
+                Some(mc) => OwnerCmd::SendCredits { to: n, mc },
+                None => {
+                    return Ok(back_to(
+                        &to,
+                        None,
+                        Some("an amount like 0.5 is needed".into()),
+                    ));
+                }
+            }
+        }
+        _ => return Ok(back_to(&to, None, Some("unknown action".into()))),
+    };
+    Ok(match owner_run(node, id, f.counter, cmd).await {
+        Ok(note) => back_to(&to, Some(format!("Done: {note}.")), None),
+        Err(e) => back_to(&to, None, Some(e.text("Not done"))),
     })
 }
 
@@ -1213,6 +1478,7 @@ async fn set_pace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credits::gates::{Carried, carried};
 
     /// The fingerprint a member's newest requests carry, read from the
     /// rows: claims and rows without one left out, others counted.
@@ -1268,9 +1534,19 @@ mod tests {
     }
 
     #[test]
-    fn only_a_live_member_whose_key_is_held_is_asked() {
+    fn a_missing_answer_is_not_reported_as_a_refusal() {
+        let said_no = Unsent::Refused("no usable invite 4".into());
+        assert_eq!(said_no.text("Not done"), "Not done: no usable invite 4");
+        let silent = Unsent::NoAnswer("no answer from 3f9a within 15s".into()).text("Not done");
+        assert!(!silent.starts_with("Not done"), "{silent}");
+        assert!(silent.contains("may still be carried out"), "{silent}");
+    }
+
+    #[test]
+    fn only_a_live_managed_sibling_is_asked() {
         let held = MemberView {
-            key_held: true,
+            sibling: true,
+            managed: true,
             live: true,
             active: true,
             ..Default::default()
@@ -1286,7 +1562,7 @@ mod tests {
                 ..held.clone()
             },
             MemberView {
-                key_held: false,
+                managed: false,
                 ..held.clone()
             },
             MemberView {
@@ -1296,6 +1572,64 @@ mod tests {
         ] {
             assert!(!asks_remote(&m));
         }
+    }
+
+    /// A member is flagged for its rules only when it does not earn here;
+    /// another fingerprint or a few differing requests are information.
+    #[test]
+    fn issues_name_what_stops_a_member_from_earning() {
+        let other_build = MemberView {
+            ruleset_same: Some(false),
+            rules_differ: true,
+            rules: "disagree on <1% of 500".into(),
+            ..Default::default()
+        };
+        assert!(
+            other_build.issues().is_empty(),
+            "{:?}",
+            other_build.issues()
+        );
+        let gated = MemberView {
+            not_earning: vec![
+                "rules: disagree on 12% of 500".into(),
+                "showed two histories (at entry 7 of its log)".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            gated.issues(),
+            [
+                "showed two histories (at entry 7 of its log)",
+                "not earning here: rules: disagree on 12% of 500",
+            ]
+        );
+    }
+
+    /// The node a sibling forwards to stays selectable, so a save that
+    /// changes something else does not clear it.
+    #[test]
+    fn the_current_collecting_node_is_always_an_option() {
+        let view = |key: &str, is_self: bool, sibling: bool| MemberView {
+            key: key.into(),
+            name: format!("n-{key}"),
+            is_self,
+            sibling,
+            ..Default::default()
+        };
+        let all = [
+            view("me", true, false),
+            view("b", false, true),
+            view("c", false, false),
+        ];
+        let keys = |o: Vec<(String, String)>| o.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+        assert_eq!(keys(collect_options(&all, "b", None)), ["me"]);
+        assert_eq!(keys(collect_options(&all, "b", Some("me"))), ["me"]);
+        let o = collect_options(&all, "b", Some("c"));
+        assert_eq!(
+            o[1],
+            ("c".into(), "n-c (not one of your nodes here)".into())
+        );
+        assert_eq!(keys(collect_options(&all, "b", Some(""))), ["me"]);
     }
 
     #[test]
@@ -1309,20 +1643,9 @@ mod tests {
             incompatible: true,
             error: Some("incompatible protocol 3".into()),
             skew: Some("+3.5 min".into()),
-            rules_differ: true,
-            rules: "disagree on 12% of 500".into(),
-            ruleset_same: Some(false),
             ..Default::default()
         };
-        assert_eq!(
-            bad.issues(),
-            [
-                "incompatible version",
-                "clock +3.5 min",
-                "rules: disagree on 12% of 500",
-                "records with other rules",
-            ]
-        );
+        assert_eq!(bad.issues(), ["incompatible version", "clock +3.5 min"]);
         let err = MemberView {
             error: Some("connection refused".into()),
             ..Default::default()

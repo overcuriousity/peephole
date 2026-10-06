@@ -3,16 +3,18 @@
 pub mod adopt;
 pub mod block;
 pub mod cli;
-pub mod confkey;
 pub mod history;
 pub mod hlc;
 pub mod identity;
 pub mod invite;
 pub mod members;
 pub mod msg;
+pub mod owner;
 pub mod record;
+pub mod remote;
 pub mod repl;
 pub mod rpc;
+pub mod seal;
 pub mod status;
 pub mod sync;
 pub mod tls;
@@ -252,6 +254,13 @@ pub struct Node {
     pub peer_status: RwLock<HashMap<NodeId, PeerStatus>>,
     /// Serializes log writes (local appends and remote batches).
     pub apply_lock: tokio::sync::Mutex<()>,
+    /// Owner commands and key rotations, each one at a time.
+    pub owner_locks: owner::Locks,
+    /// How members' requests compare with this node's rules (the credits
+    /// gate and the cluster pages).
+    pub rules_check: crate::store::stats::SwrCache<(), crate::credits::gates::RulesCheck>,
+    /// This node's book of credits, as last computed.
+    pub credits_book: Mutex<Option<(std::time::Instant, Arc<crate::credits::Book>)>>,
     /// Bumped whenever the log grows; wakes sync loops and long-polls.
     changed: tokio::sync::watch::Sender<u64>,
     join_attempts: Mutex<JoinAttempts>,
@@ -265,8 +274,18 @@ pub struct Node {
     providers: RwLock<Vec<String>>,
     /// This node's provider objects, for on-demand lookups members ask for.
     lookup_providers: std::sync::OnceLock<crate::intel::Providers>,
-    /// On-demand API lookups served per asking member: `(UTC day, count)`.
-    lookup_budget: Mutex<HashMap<NodeId, (String, u32)>>,
+    /// The on-demand share of each provider budget (see `credits::share`).
+    lookup_shares: std::sync::OnceLock<crate::credits::share::Shares>,
+    /// This node's lookup prices, as last computed (`credits::price`).
+    price_table: RwLock<Arc<crate::credits::price::Table>>,
+    /// The fleet node this node forwards its credits to and draws from
+    /// (the runtime setting `credits.collect_to`).
+    pub collect_to: RwLock<Option<NodeId>>,
+    /// Free lookups served per asking member in the last hour.
+    free_lookups: Mutex<HashMap<NodeId, std::collections::VecDeque<std::time::Instant>>>,
+    /// Offers a paid lookup is being served for right now: `(payer,
+    /// sequence number)`. An offer is served once.
+    pub(crate) serving_offers: Mutex<std::collections::HashSet<(NodeId, u64)>>,
     pub data_dir: std::path::PathBuf,
     /// Contacts and heartbeats (ephemeral).
     pub status: status::Status,
@@ -317,6 +336,9 @@ impl Node {
             clients: Mutex::new(HashMap::new()),
             peer_status: RwLock::new(HashMap::new()),
             apply_lock: tokio::sync::Mutex::new(()),
+            owner_locks: Default::default(),
+            rules_check: crate::store::stats::SwrCache::new(1),
+            credits_book: Mutex::new(None),
             changed: tokio::sync::watch::channel(0).0,
             join_attempts: Mutex::new(Default::default()),
             sync_slots: tokio::sync::Semaphore::new(sync::MAX_CONCURRENT_SYNCS),
@@ -324,7 +346,11 @@ impl Node {
             members_changed: tokio::sync::Notify::new(),
             providers: RwLock::new(vec![]),
             lookup_providers: Default::default(),
-            lookup_budget: Mutex::new(HashMap::new()),
+            lookup_shares: Default::default(),
+            price_table: Default::default(),
+            collect_to: RwLock::new(None),
+            free_lookups: Mutex::new(HashMap::new()),
+            serving_offers: Mutex::new(Default::default()),
             data_dir: p.data_dir,
             status: Default::default(),
             msg: Default::default(),
@@ -411,7 +437,8 @@ impl Node {
                 .collect(),
             proto_min: self.proto.0,
             proto_max: self.proto.1,
-            remote_config: self.cfg.remote_config,
+            // Config keys are gone; the field stays for records of earlier versions.
+            remote_config: false,
         }
     }
 
@@ -469,17 +496,38 @@ impl Node {
         self.lookup_providers.get()
     }
 
-    /// Take `n` of `peer`'s on-demand API lookups for today; `false` when
-    /// that would exceed [`crate::intel::lookup::PER_PEER_PER_DAY`].
-    pub fn take_lookup_budget(&self, peer: NodeId, n: u32) -> bool {
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let mut all = self.lookup_budget.lock().unwrap();
-        all.retain(|_, (day, _)| *day == today);
-        let (_, used) = all.entry(peer).or_insert_with(|| (today, 0));
-        if used.saturating_add(n) > crate::intel::lookup::PER_PEER_PER_DAY {
+    pub fn set_lookup_shares(&self, s: crate::credits::share::Shares) {
+        let _ = self.lookup_shares.set(s);
+    }
+
+    pub fn lookup_shares(&self) -> Option<&crate::credits::share::Shares> {
+        self.lookup_shares.get()
+    }
+
+    pub fn price_table(&self) -> Arc<crate::credits::price::Table> {
+        self.price_table.read().unwrap().clone()
+    }
+
+    /// Adopt new prices and announce them with the next heartbeat.
+    pub fn set_price_table(&self, t: Arc<crate::credits::price::Table>) {
+        *self.price_table.write().unwrap() = t;
+        self.publish_status();
+    }
+
+    /// Count one free lookup for `peer`; false when it had
+    /// [`crate::credits::pay::FREE_PER_HOUR`] in the last hour.
+    pub fn take_free_lookup(&self, peer: NodeId) -> bool {
+        let hour = Duration::from_secs(3600);
+        let mut all = self.free_lookups.lock().unwrap();
+        all.retain(|_, q| q.back().is_some_and(|t| t.elapsed() < hour));
+        let q = all.entry(peer).or_default();
+        while q.front().is_some_and(|t| t.elapsed() >= hour) {
+            q.pop_front();
+        }
+        if q.len() >= crate::credits::pay::FREE_PER_HOUR {
             return false;
         }
-        *used += n;
+        q.push_back(std::time::Instant::now());
         true
     }
 

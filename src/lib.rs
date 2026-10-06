@@ -7,6 +7,7 @@ pub mod canary;
 pub mod classify;
 pub mod cluster;
 pub mod config;
+pub mod credits;
 pub mod events;
 pub mod export;
 pub mod fingerprint;
@@ -70,11 +71,6 @@ pub async fn check_config(config_path: &std::path::Path) -> Result<(config::Conf
             )),
             Err(e) => return Err(e.context("node key")),
         }
-        summary.push_str(if cfg.cluster.as_ref().is_some_and(|c| c.remote_config) {
-            "\nremote config: on (config key holders may change runtime settings)"
-        } else {
-            "\nremote config: off"
-        });
     }
     if cfg.retention_days > 0 {
         summary.push_str(&format!(
@@ -174,6 +170,10 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let providers = intel::providers(&cfg, &store, &geo, &tor);
     if let Some(n) = &node {
         n.set_lookup_providers(providers.clone());
+        n.set_lookup_shares(credits::share::Shares::new(
+            store.clone(),
+            cfg.enrichment.on_demand_share,
+        ));
     }
     tokio::spawn(intel::enrich_loop(
         recorder.clone(),
@@ -242,7 +242,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let notifier = events::Notifier::new();
 
     // Runtime settings: config defaults, overridden from the admin UI, the
-    // CLI or a config key holder.
+    // CLI or the owner.
     let nmap_ok = tokio::process::Command::new(cfg.scan.nmap())
         .arg("--version")
         .output()
@@ -257,10 +257,21 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // RPC listener and sync loops.
     if let Some(node) = &node {
         scan::arbiter::Arbiter::start(node.clone(), shutdown_rx.clone()).await?;
-        if cfg.cluster.as_ref().is_some_and(|c| c.remote_config) {
-            cluster::confkey::ensure(&store, node.id()).await?;
-        }
-        cluster::confkey::serve(node, settings.clone());
+        cluster::remote::serve(node, settings.clone());
+        cluster::owner::fleet::serve(node);
+        cluster::owner::cmd::serve(node, settings.clone());
+        tokio::spawn(cluster::owner::fleet::run(
+            node.clone(),
+            shutdown_rx.clone(),
+        ));
+        tokio::spawn(cluster::seal::run(node.clone(), shutdown_rx.clone()));
+        tokio::spawn(credits::run(node.clone(), cfg.clone(), shutdown_rx.clone()));
+        credits::fleet::serve(node);
+        tokio::spawn(credits::fleet::run(
+            node.clone(),
+            settings.clone(),
+            shutdown_rx.clone(),
+        ));
         // Does nothing unless this node currently scans.
         tokio::spawn(scan::arbiter::takeover_loop(
             node.clone(),
@@ -275,7 +286,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     }
 
     // Roles run under a supervisor that starts and stops them when the
-    // effective roles change (admin UI, CLI, or a config key holder).
+    // effective roles change (admin UI, CLI, or the owner).
     let roles = RoleRunner {
         cfg: cfg.clone(),
         store: store.clone(),

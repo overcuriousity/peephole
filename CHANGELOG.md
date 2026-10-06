@@ -5,6 +5,71 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Added
+
+- Ownership. One key for all nodes of an operator (`peephole owner new`,
+  `peephole owner adopt`, Cluster › Ownership). Your nodes find each other
+  and are marked "yours"; from a node that keeps the key you change a
+  sibling's pace, cooldown and roles, block and purge peers there, revoke
+  its invites, have it leave, release it, and rotate the key (a node left
+  out of a rotation is no longer yours). Each node lists the commands it
+  received. See docs/cluster.md.
+- Lookup credits. Lookups are paid with credits earned by completed
+  counter-scans (scanner 1 or 2, the trap a quarter); every node computes
+  every balance from its own copy of the log. Prices follow the cluster's
+  earnings, lookup capacity and scanner load; half of a payment goes to
+  the node that answered, half is destroyed. A lookup shows everything the
+  dataset holds on the address, answers under 24 hours old come from the
+  dataset for free, and paid answers are kept for recorded addresses.
+  Scanners audit a share of each other's scans; a node that shows two
+  histories of its log is proven and marked. `Cluster › Credits`,
+  `peephole credits`, `[credits] audit_share`,
+  `[enrichment] on_demand_share`. See docs/cluster.md.
+- Verified research scanners (Censys, LeakIX, Shodan) are recognised by
+  forward-confirmed reverse DNS and never counter-scanned, like
+  search-engine crawlers; the Scans page links the day's refused jobs with
+  their reasons. See docs/scanners.md.
+
+### Changed
+
+- A source whose requests only look — probe, path-scanner, php-probe and
+  nothing else — now earns at most a level-1 counter-scan, however often it
+  looked; severity is unchanged. Level 2 and up needs a specific rule hit.
+- webshell-probe knows the shell names the current spray waves use
+  (chosen, simple, adminfuns, dex, go, ccc, sm, ebkid,
+  this_is_a_new_hello_world).
+
+- **Breaking:** a member no longer serves 50 free API lookups a day to
+  every other member. Lookups in a cluster cost credits, your own
+  providers included; a standalone node is unchanged.
+- The Members table flags a member for its rules only when it does not
+  earn here (less than 98 % agreement); another rules fingerprint alone is
+  no issue.
+- Export: scans carry `uid` and `audit_of`.
+- **Breaking:** config keys are gone. `cluster.remote_config`,
+  `peephole cluster config-key` and the config-key cards on Cluster ›
+  Access no longer exist; `remote_config` in a config file is ignored with
+  a warning. After the upgrade no node can be changed from another node
+  until you run `peephole owner new` on one node and `peephole owner adopt`
+  on the others.
+- Cluster protocol version 3. Ownership works between nodes of this
+  version; older members keep syncing as before.
+
+### Upgrading
+
+- Upgrade all members soon after each other. Until a member is upgraded,
+  upgraded members answer its lookups with free providers only, and it
+  cannot spend credits.
+- Balances start from the counter-scans of the last 8 days; there is no
+  starting grant. A member whose recent requests were classified by older
+  rules may earn nothing until enough new requests are recorded.
+- Remove `remote_config` from config files, and replace scripts that call
+  `peephole cluster config-key` with `peephole owner …`.
+- Do not go back to 0.6.0 and then upgrade again: entries erased under
+  0.6.0 can keep the node from sealing its log, and it can then no longer
+  pay for lookups. Do not restore a database backup from before the
+  upgrade on a cluster node.
+
 ## [0.6.0] - 2026-10-06
 
 ### Added

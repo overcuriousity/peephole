@@ -1,6 +1,8 @@
-//! Known crawlers are not counter-scanned. A search engine, link preview or
-//! feed fetcher that follows a link to the trap looks like a probe, and a
-//! counter-scan would hit the crawler operator, not an attacker.
+//! Known crawlers and verified research scanners are not counter-scanned. A
+//! search engine, link preview or feed fetcher that follows a link to the
+//! trap looks like a probe, and so does a research scanner (Censys, LeakIX,
+//! Shodan) that documents its addresses; a counter-scan would hit the
+//! service's operator, not an attacker. See docs/scanners.md.
 //!
 //! A crawler is recognised by forward-confirmed reverse DNS: the IP's PTR
 //! name lies under a known crawler domain *and* that name resolves back to
@@ -44,6 +46,12 @@ pub const DOMAINS: &[&str] = &[
     "crawl.baidu.jp",
     "petalsearch.com",
     "crawl.amazonbot.amazon",
+    // Verified research scanners (docs/scanners.md): Censys, LeakIX, Shodan.
+    // Their operators publish these reverse zones; anything merely claiming
+    // the UA (zgrab and friends) stays scannable.
+    "censys-scanner.com",
+    "scan.leakix.org",
+    "shodan.io",
 ];
 
 /// Per lookup (PTR, then forward).
@@ -424,12 +432,15 @@ mod tests {
     }
 
     /// Forward lookups: `*.real.googlebot.com` resolves to 198.51.100.7,
-    /// `*.slow.googlebot.com` never answers, anything else does not exist.
+    /// `*.real.censys-scanner.com` to 198.51.100.9, `*.slow.googlebot.com`
+    /// never answers, anything else does not exist.
     fn fake_forward() -> Forward {
         std::sync::Arc::new(|name: String| {
             Box::pin(async move {
                 if name.ends_with(".real.googlebot.com") {
                     Ok(vec!["198.51.100.7".parse().unwrap()])
+                } else if name.ends_with(".real.censys-scanner.com") {
+                    Ok(vec!["198.51.100.9".parse().unwrap()])
                 } else if name.ends_with(".slow.googlebot.com") {
                     std::future::pending().await
                 } else {
@@ -481,6 +492,52 @@ mod tests {
         // No resolver: the check is off.
         let ip: IpAddr = "198.51.100.7".parse().unwrap();
         assert_eq!(Crawlers::with_resolver(&[], None).confirmed(ip).await, None);
+    }
+
+    #[tokio::test]
+    async fn research_scanners_are_forward_confirmed() {
+        // A Censys scanner host, confirmed: exempt like any crawler.
+        assert_eq!(
+            check(
+                Some("66-132-186-177.real.censys-scanner.com"),
+                "198.51.100.9"
+            )
+            .await
+            .as_deref(),
+            Some("66-132-186-177.real.censys-scanner.com")
+        );
+        // ... claiming the name from another IP: not a scanner.
+        assert_eq!(
+            check(
+                Some("66-132-186-177.real.censys-scanner.com"),
+                "198.51.100.7"
+            )
+            .await,
+            None
+        );
+        // A lookalike zone: not a scanner domain at all.
+        assert_eq!(
+            check(Some("x.real.censys-scanner.com.evil.net"), "198.51.100.9").await,
+            None
+        );
+    }
+
+    #[test]
+    fn research_scanner_domains_match_on_label_boundaries() {
+        let c = Crawlers::with_resolver(&[], None);
+        assert!(c.is_crawler_domain("177.186.132.66.censys-scanner.com."));
+        assert!(c.is_crawler_domain("f20a02ce01.scan.leakix.org."));
+        assert!(c.is_crawler_domain("census12.shodan.io."));
+        assert!(
+            !c.is_crawler_domain("censys-scanner.com."),
+            "the apex is no host"
+        );
+        assert!(!c.is_crawler_domain("evilcensys-scanner.com."));
+        assert!(!c.is_crawler_domain("censys-scanner.com.attacker.net."));
+        assert!(
+            !c.is_crawler_domain("evil.leakix.org."),
+            "only hosts under scan.leakix.org scan for LeakIX"
+        );
     }
 
     #[tokio::test]

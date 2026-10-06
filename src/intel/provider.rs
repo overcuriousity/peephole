@@ -45,6 +45,13 @@ pub trait Provider: Send + Sync {
     fn status(&self) -> Option<String> {
         None
     }
+
+    /// The provider's budget in requests a day (a weekly budget divided by
+    /// 7; the tightest when it has several). None: no budget here, as for
+    /// a local database.
+    fn per_day(&self) -> Option<f64> {
+        None
+    }
 }
 
 /// Seconds after an IP was first seen before the node at `rank` among the

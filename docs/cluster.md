@@ -30,6 +30,16 @@ peephole cluster block <node>             # this node ignores a peer (unblock un
 peephole cluster block --subtree <node>   # ... and every node it admitted, transitively
 peephole cluster purge <node>             # delete a blocked peer's data here, stop relaying it
 peephole cluster leave                    # this node leaves; it keeps its data
+peephole owner new                        # an ownership key for your nodes; this node keeps it
+peephole owner adopt                      # on each other node of yours: reads the key from standard input
+peephole owner show                       # this node's owner and the nodes that share it
+peephole owner forget-key [--force]       # this node no longer keeps the key; it stays owned
+peephole owner release                    # this node has no owner afterwards
+peephole credits                          # this node's credits, by day
+peephole credits log [--days N]           # earned, spent, sent, received (up to 7 days)
+peephole credits members                  # every member's balance and whether it earns here
+peephole credits why <scan>               # how this node judged one scan, and what it paid
+peephole credits send <node> <amount>     # send credits to a member
 ```
 
 Nodes talk HTTP/2 over mutual TLS with pinned Ed25519 keys on
@@ -78,21 +88,140 @@ be listed under `[[cluster.peers]]` with their key.
   for a full member") while none is reachable. Switching a window off later
   does not bring the dropped history back.
 
-## Changing another node's settings
+## Your own nodes: ownership
 
-- A node's scan pace, rescan cooldown and roles are runtime settings. Its
-  own admin (System › Settings and Scans for the pace, or
-  `peephole settings set|reset|show`) can always
-  change them, and roles switch without a restart.
-- With `remote_config = true` under `[cluster]`, the node has a **config
-  key** (`peephole cluster config-key show`). Whoever holds it can change
-  those settings from their own node: paste the key on their Cluster › Access page,
-  or `peephole cluster config-key add <key>`.
-- `peephole cluster config-key rotate` replaces the key and withdraws the
-  permission from everyone at once. The node lists who changed what.
-- Nothing else is changeable from outside: addresses, paths, WebAuthn, API
-  keys, `never_scan`, nmap arguments and `remote_config` itself stay in the
-  config file.
+Operators in a cluster need not know each other. The nodes of one operator
+can still belong together: they share an **ownership key**.
+
+- **Create it once** (`peephole owner new`, or Cluster › Ownership) and
+  **enter it on each of your other nodes** (`peephole owner adopt`, or the
+  same page there). The key is shown once; `adopt` reads it from standard
+  input so it does not end up in the shell history.
+- A node stores the owner's public half and a certificate for itself. The
+  key itself stays only where you choose to keep it (`--keep`, or the
+  checkbox): those are your **managing nodes**. A scanner that gets broken
+  into cannot take over your other nodes if it does not keep the key.
+- Your nodes find each other on their own and are marked "yours" on the
+  cluster pages. Nothing about ownership is replicated: other operators'
+  nodes cannot verify who owns what, though a member that relays the
+  messages can see which nodes answered each other.
+- From a managing node you can change a sibling's scan pace, rescan
+  cooldown and roles, block, unblock and purge peers there, revoke its
+  invites, have it leave the cluster, and release it. Each of your nodes
+  lists the commands it received (Cluster › Ownership).
+- **Not possible from outside**, also for the owner: creating an invite
+  (the invite is a secret and would pass through other members), and
+  everything in the config file (addresses, paths, WebAuthn, API keys,
+  `never_scan`, nmap arguments).
+- **A leaked key**: rotate it on a managing node (Cluster › Ownership).
+  Every node of yours that answers takes the new key; for the rest the page
+  offers to retry. On a node you cannot reach that way, run
+  `peephole owner adopt` locally. The new key is stored before the first
+  node is told, so a rotation that was cut short is finished from the same
+  page with the same key. A rotation also removes the kept key from your
+  other managing nodes: enter the new one there again if they should keep
+  managing. Until a rotation is finished, forgetting the key on that node
+  is refused (on the CLI: unless `--force`): the keys it keeps are the
+  only way to the nodes it has moved or not moved yet. A release, adoption
+  or forgotten key on the node itself while the rotation waits for the
+  others is not undone by it; the rotation then stops with an error.
+- **Putting a node out**: `Release` asks the node to drop its owner. A node
+  that does not cooperate (it was broken into, or its certificate was
+  copied) is put out by rotating the key and leaving it out in the rotate
+  dialog: it stays on the old key and is counted by nobody afterwards.
+- A member that relays your commands cannot change, redirect or replay
+  them, but it sees them: the settings you send, a node's block list and
+  invite labels in its status, and the new owner's public half during a
+  rotation.
+- A key that is forgotten, replaced or released is blanked in the node's
+  database. Copies of the database made while the node kept the key (the
+  installer's backups, your own) still contain it: delete them, or rotate.
+- Whoever can log in to a node, or run the CLI on it, can always release it
+  or give it another owner. Ownership adds a remote door; it does not lock
+  the local one. Protecting the key and the nodes is the operator's job.
+- A node's own admin (System › Settings and Scans, or
+  `peephole settings set|reset|show`) can always change its runtime
+  settings, and roles switch without a restart.
+
+Config keys (`cluster.remote_config`, `peephole cluster config-key`) are
+gone. `remote_config` in a config file is ignored.
+
+## Credits: lookups are paid with scans
+
+A lookup (Admin → Lookup) asks every provider the cluster reaches about one
+address. It is paid with **credits**, and credits are earned by the work
+the cluster asked for: completed counter-scans.
+
+- **Earning.** A completed scan pays its scanner 1 credit (levels 1, 2) or
+  2 (levels 3, 4) and the trap that queued the job a quarter of that. One
+  paid scan per address in 24 hours, 500 a day per node and role. A credit
+  can be used on the day it was earned and the 6 days after.
+- **What does not earn.** A scan run with your own `scan.level_argv`
+  (no scanner share at that level), a scan no request held on the judging
+  node backs, uptime, recorded requests, audits.
+- **Every node counts for itself**, from its own copy of the log. There is
+  no vote and no shared chain; `Cluster › Credits` shows this node's count
+  and says why a scan was not paid in full.
+- **Conformity.** A member earns on your node only while at least 98 % of
+  its newest 500 requests classify the same with your rules, and its scans
+  stand up to the audits you believe: those of your own nodes. A scanner
+  runs 5 % of the other nodes' fresh scans again (`[credits] audit_share`);
+  audits earn nothing.
+- **Prices** follow what the cluster earns and what it can serve: each
+  serving node computes one unit price an hour (a day's earnings buy a
+  day's lookups), halved while the scanners idle and doubled when they are
+  saturated. A keyed API costs 1 unit, Shodan InternetDB and GeoLite2 a
+  quarter, the Tor exit list nothing. Half of what you pay goes to the
+  node that answered, half is destroyed. Your own providers cost the same.
+- **Your budgets are safe.** Paid lookups take at most
+  `[enrichment] on_demand_share` (a fifth by default) of each API budget,
+  whatever happens to credits. A provider whose share ran out costs double
+  the next day.
+- **Known addresses.** A lookup shows everything the dataset holds on the
+  address. A provider answer under 24 hours old is shown instead of asking
+  again, free. An answer that was paid for is kept in the dataset when the
+  cluster has recorded the address (members can then infer who looked it
+  up); for an address nobody recorded nothing is written anywhere.
+- **Your nodes as one.** `Cluster › Ownership › Collect credits here`
+  makes one node of yours the collecting node: the others forward what
+  they earn and draw from it when a lookup needs more than they hold.
+  Each node can also be pointed there itself: `System › Settings › Collect credits at`
+  or `peephole settings set credits.collect_to <key>`.
+- **Two histories.** A node that gives two members different entries at
+  one position of its log is found out with its next payment: its entries
+  carry seals over its log. Members that hold the proof show "showed two
+  histories"; that node's credits are void there for good.
+- **What this cannot do.**
+  - It cannot tell a recorded request nobody sent from a real one. Honest
+    scanners then scan the address and the inventor earns the trap share
+    (at most 0.5 per address and day). `scan.trusted_origins` and blocking
+    are the answer.
+  - Invented scan results are caught only by audits, and only for sources
+    still reachable 30 minutes after the scan arrived.
+  - It cannot stop one double spend per node key: the second branch is
+    proven and the node's credits are void everywhere afterwards.
+  - Many node keys of one operator are bounded only by each server's
+    on-demand share, not per node.
+  - A server can take the price and not answer; you lose that lookup's
+    price, and the receipt is public. A server that declines and names a
+    higher price is offered it once, up to twice its announced price;
+    beyond that the next server is asked.
+  - Announced pace and lookup capacity are claims. Inflated ones lower
+    the price until the surge corrects it; blocked members are not
+    counted.
+  - A member that spent its credits and then stops earning here (its
+    rules agreement drops below 98 %) loses its earnings of the last 8
+    days in every node's count, and the servers it paid lose those
+    receipts with them, until it earns again.
+  - A receipt counts when it arrives late; if the lapsed offer was spent
+    again elsewhere, the second server is paid less (at most the first
+    server's price).
+  - A node that is trap and scanner and whose log lags the clock can date
+    a few days of scans at once, one time per node key.
+  - A sibling that was broken into can spend what your collecting node
+    holds (credits of at most 7 days); release it.
+  - Lookups of recorded addresses are visible to members, with a good
+    guess at who asked.
 
 ## Things to know
 
@@ -165,13 +294,18 @@ be listed under `[[cluster.peers]]` with their key.
   and false-positive claims with their optional contact address. Every
   member can export the whole dataset (`peephole export`, or Admin →
   Export); see [docs/dataset.md](dataset.md).
-- **On-demand lookups.** Admin → Lookup asks every provider the cluster can
-  reach about one address: this node's own databases and keys first, then
-  one live member per provider nobody here serves, over the cluster RPC.
-  Nothing is stored anywhere. A member serves at most 50 API lookups a day
-  per asking node (GeoLite2 and the Tor list are free), so curiosity cannot
-  spend the budget the automatic enrichment runs on. An outbound-only
-  member cannot be asked.
+- **On-demand lookups.** Admin → Lookup shows first what the dataset
+  holds on the address (the same sections as its IP page; for an unknown
+  address, what is near it by network and ASN) and any provider answer
+  under 24 hours old, for free. The other providers are asked at the
+  member that offers each one cheapest, this node included, and paid in
+  credits (see Credits above). A member serves paid lookups only from
+  its on-demand share of each provider's budget (`[enrichment]
+  on_demand_share`), so curiosity cannot spend what the automatic
+  enrichment runs on. Paid answers for an address the cluster has
+  recorded are kept in the dataset; for any other address nothing is
+  stored. An outbound-only member, and one of an earlier version, cannot
+  be asked.
 - **The blocklist feed** of a web node (`/api/blocklist`) is drawn from
   the whole cluster's requests and never lists a member's addresses
   (published ones, and the ones members connect from).

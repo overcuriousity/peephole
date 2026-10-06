@@ -519,7 +519,8 @@ mod tests {
 
     /// Classified again with our rules, a harmless request claiming level 4
     /// backs level 1, and its labels are the ones our rules give; an honest
-    /// path scanner's level 2 (from its history) still counts.
+    /// path scanner's history shows, but weak tells alone back level 1, the
+    /// same cap the trap applies when it queues the scan.
     #[tokio::test]
     async fn verified_evidence_counts_what_our_rules_see() {
         let dir = tempfile::tempdir().unwrap();
@@ -567,7 +568,8 @@ mod tests {
             .unwrap();
         assert_eq!((ev.max_level, ev.labels), (1, 2), "{ev:?}");
 
-        // Twenty paths in an hour: our rules see the path scanner too.
+        // Twenty paths in an hour: our rules see the path scanner, and cap
+        // its weak-only evidence at level 1, whatever it claimed.
         let scanner = store
             .upsert_ip("198.51.100.7".parse().unwrap())
             .await
@@ -578,6 +580,14 @@ mod tests {
             r.path = format!("/p{n}");
             rec.insert_request(&r).await.unwrap();
         }
+        let ev = evidence(&store.pool, &scanner.ip, &Origins::Any, Some(rules))
+            .await
+            .unwrap();
+        assert_eq!(ev.max_level, 1);
+        // A named rule in the mix backs level 2 again.
+        let mut r = req(scanner.id, 2, r#"["sensitive-path"]"#);
+        r.path = "/.env".into();
+        rec.insert_request(&r).await.unwrap();
         let ev = evidence(&store.pool, &scanner.ip, &Origins::Any, Some(rules))
             .await
             .unwrap();

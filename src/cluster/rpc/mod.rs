@@ -204,7 +204,7 @@ async fn intel_chunk(
     }
 }
 
-/// On-demand enrichment for a member, within its daily budget here.
+/// On-demand enrichment for a member: paid with the offer it names, or free providers only.
 async fn lookup(
     State(node): State<Arc<Node>>,
     Extension(Peer(peer)): Extension<Peer>,

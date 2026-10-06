@@ -78,6 +78,11 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                     now.roles.web.to_string(),
                     now.roles.web != cfg.roles.web,
                 ),
+                (
+                    KEYS[7],
+                    now.collect_to.map(|id| id.to_string()).unwrap_or_default(),
+                    now.collect_to.is_some(),
+                ),
             ] {
                 println!("{key:<28} {value:<8} ({})", src(changed));
             }

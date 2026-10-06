@@ -80,25 +80,40 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
         Record::ScanJob(r) => scan_job(conn, ctx, r).await,
         Record::JobStatus(r) => job_status(conn, ctx, r).await,
         Record::JobAdopt(r) => job_adopt(conn, ctx, r).await,
-        Record::ScanResult(r) => scan_result(conn, ctx, r).await,
+        Record::ScanResult(r) => scan_result(conn, ctx, r, None).await,
+        Record::ScanAudit(a) => {
+            // The uid of another node's scan: a plain identifier, bounded.
+            if a.audit_of.is_empty() || a.audit_of.len() > 128 {
+                return Ok(Effect::Ignored);
+            }
+            scan_result(conn, ctx, &a.scan, Some(&a.audit_of)).await
+        }
         Record::Tombstone(t) => tombstone(conn, ctx, t).await,
         Record::IntelManifest(m) => intel_manifest(conn, ctx, m).await,
         Record::SkipBatch(b) => skip_batch(conn, ctx, b).await,
-        Record::MemberAdd(_) | Record::MemberUpdate(_) | Record::MemberRevoke { .. } => {
-            Ok(Effect::Ignored)
-        }
+        // Membership and credits are the cluster layer's (`members::apply`,
+        // `credits::entries`, `cluster::seal`): no row of the dataset.
+        Record::MemberAdd(_)
+        | Record::MemberUpdate(_)
+        | Record::MemberRevoke { .. }
+        | Record::CreditOffer { .. }
+        | Record::CreditReceipt { .. }
+        | Record::CreditTransfer { .. }
+        | Record::LogSeal { .. }
+        | Record::ForkProof { .. } => Ok(Effect::Ignored),
     }
 }
 
 /// Record kinds a local hide or block keeps out of the tables. Membership,
 /// tombstones and scan-job state still apply, so the cluster stays in step.
-const CONTENT_KINDS: [&str; 7] = [
+const CONTENT_KINDS: [&str; 8] = [
     "request",
     "skip_batch",
     "fingerprint",
     "fp_claim",
     "scan_job",
     "scan_result",
+    "scan_audit",
     "ip_intel",
 ];
 
@@ -816,6 +831,7 @@ async fn scan_result(
     conn: &mut SqliteConnection,
     ctx: Ctx<'_>,
     r: &ScanResultRec,
+    audit_of: Option<&str>,
 ) -> Result<Effect> {
     if let Some(t) = erased_by(conn, &r.uid).await? {
         return Ok(Effect::Erased(t));
@@ -839,8 +855,8 @@ async fn scan_result(
     };
     let res = sqlx::query(
         "INSERT OR IGNORE INTO scans (uid, origin, hlc, job_id, job_uid, ip_id, level, started_at,
-           finished_at, os_guess, raw_xml, build)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+           finished_at, os_guess, raw_xml, build, audit_of)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -854,6 +870,7 @@ async fn scan_result(
     .bind(&r.os_guess)
     .bind(&r.raw_xml)
     .bind(&r.build)
+    .bind(audit_of)
     .execute(&mut *conn)
     .await?;
     if res.rows_affected() == 1 {
@@ -1162,7 +1179,7 @@ async fn remove_row(
         "fp_claim" => "fp_claims",
         "fingerprint" => "fingerprints",
         "scan_job" => "scan_jobs",
-        "scan_result" => "scans",
+        "scan_result" | "scan_audit" => "scans",
         "skip_batch" => "skipped_batches",
         _ => return Ok(None),
     };
@@ -1207,7 +1224,7 @@ async fn remove_row(
                     .await?;
             }
         }
-        "scan_result" => {
+        "scan_result" | "scan_audit" => {
             sqlx::query("DELETE FROM ports WHERE scan_id IN (SELECT id FROM scans WHERE uid = ?)")
                 .bind(uid)
                 .execute(&mut *conn)
@@ -2094,6 +2111,120 @@ mod tests {
             let sql = format!("SELECT COUNT(*) FROM {table}");
             assert_eq!(count(&mut conn, &sql).await, 0, "{table}");
         }
+    }
+
+    /// An audit is stored as a scan of the same job, marked as an audit,
+    /// and leaves the tables without taking the audited scan along.
+    #[tokio::test]
+    async fn an_audit_is_a_scan_of_the_same_job_marked_as_such() {
+        use crate::cluster::record::{PortRec, ScanAuditRec, ScanJobRec};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let (scanner, auditor) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        );
+        let ctx = |origin, hlc| Ctx {
+            origin: Some(origin),
+            hlc,
+        };
+        let job = Record::ScanJob(ScanJobRec {
+            uid: "job".into(),
+            ip: "203.0.113.9".into(),
+            level: 2,
+            queued_at: now_ts(),
+        });
+        assert_eq!(
+            apply(&mut conn, ctx(&scanner, 1), &job).await.unwrap(),
+            Effect::Applied
+        );
+        let scan = |uid: &str, job: &str| ScanResultRec {
+            build: String::new(),
+            uid: uid.into(),
+            job_uid: job.into(),
+            ip: "203.0.113.9".into(),
+            level: 2,
+            started_at: now_ts(),
+            finished_at: Some(now_ts()),
+            os_guess: None,
+            raw_xml: None,
+            ports: vec![PortRec {
+                port: 22,
+                proto: "tcp".into(),
+                state: "open".into(),
+                service: None,
+                product: None,
+                version: None,
+            }],
+        };
+        let original = Record::ScanResult(scan("orig", "job"));
+        assert_eq!(
+            apply(&mut conn, ctx(&scanner, 2), &original).await.unwrap(),
+            Effect::Applied
+        );
+        let audit = Record::ScanAudit(Box::new(ScanAuditRec {
+            audit_of: "orig".into(),
+            scan: scan("audit", "job"),
+        }));
+        assert_eq!(
+            (audit.kind(), audit.uid().as_deref()),
+            ("scan_audit", Some("audit"))
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                apply(&mut conn, ctx(&auditor, 3), &audit).await.unwrap(),
+                Effect::Applied
+            );
+        }
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM scans").await, 2);
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ports").await, 2);
+        let of: Option<String> =
+            sqlx::query_scalar("SELECT audit_of FROM scans WHERE uid = 'audit'")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert_eq!(of.as_deref(), Some("orig"));
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) FROM scans WHERE audit_of IS NULL"
+            )
+            .await,
+            1
+        );
+        // Its job has not arrived: it waits, like a scan result.
+        let early = Record::ScanAudit(Box::new(ScanAuditRec {
+            audit_of: "x".into(),
+            scan: scan("audit-2", "job-not-here"),
+        }));
+        assert_eq!(
+            apply(&mut conn, ctx(&auditor, 4), &early).await.unwrap(),
+            Effect::Deferred
+        );
+        // A blocked auditor's audits stay out of the tables.
+        sqlx::query("INSERT INTO blocked_peers (id, blocked_at) VALUES (?, datetime('now'))")
+            .bind(&auditor.0[..])
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let more = Record::ScanAudit(Box::new(ScanAuditRec {
+            audit_of: "orig".into(),
+            scan: scan("audit-3", "job"),
+        }));
+        assert_eq!(
+            apply(&mut conn, ctx(&auditor, 5), &more).await.unwrap(),
+            Effect::Ignored
+        );
+        // Taken out of the tables alone.
+        assert!(
+            unmaterialize(&mut conn, "scan_audit", "audit")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM scans").await, 1);
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ports").await, 1);
     }
 
     #[tokio::test]

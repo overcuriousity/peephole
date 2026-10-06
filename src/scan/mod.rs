@@ -5,6 +5,7 @@ pub mod hostkeys;
 pub mod nmap_xml;
 pub mod order;
 pub mod pace;
+pub mod profiles;
 pub mod safety;
 pub mod weight;
 
@@ -42,19 +43,15 @@ fn host_timeout_secs(timeout_secs: u64) -> u64 {
         .max(30)
 }
 
-/// nmap argv (after the binary name) for a level and target (spec §5).
-/// None for a level outside 1..=4.
-pub fn nmap_argv(
+/// `argv` (a level's list) with what every run adds: the timeouts, the
+/// rate floor of level 4, `-6`, XML on standard output and the target.
+fn complete(
+    mut argv: Vec<String>,
     level: u8,
-    target: &IpAddr,
+    target: IpAddr,
     cfg: &Config,
     timeout_secs: u64,
-) -> Option<Vec<String>> {
-    // Collapse IPv4-mapped IPv6 to IPv4 so a `::ffff:a.b.c.d` target is scanned
-    // as the v4 address (and matched by v4 guards) rather than handed to nmap
-    // as an IPv6 literal.
-    let target = crate::net::canonical(*target);
-    let mut argv = cfg.default_level_argv(level)?;
+) -> Vec<String> {
     let host_timeout = host_timeout_secs(timeout_secs);
     if !argv.iter().any(|a| a.starts_with("--host-timeout")) {
         argv.push("--host-timeout".into());
@@ -85,7 +82,36 @@ pub fn nmap_argv(
     argv.push("-oX".into());
     argv.push("-".into());
     argv.push(target.to_string());
-    Some(argv)
+    argv
+}
+
+/// nmap argv (after the binary name) for a level and target (spec §5).
+/// None for a level outside 1..=4.
+pub fn nmap_argv(
+    level: u8,
+    target: &IpAddr,
+    cfg: &Config,
+    timeout_secs: u64,
+) -> Option<Vec<String>> {
+    // Collapse IPv4-mapped IPv6 to IPv4 so a `::ffff:a.b.c.d` target is scanned
+    // as the v4 address (and matched by v4 guards) rather than handed to nmap
+    // as an IPv6 literal.
+    let target = crate::net::canonical(*target);
+    let argv = cfg.default_level_argv(level)?;
+    Some(complete(argv, level, target, cfg, timeout_secs))
+}
+
+/// The arguments of an audit: the built-in list of the level, whatever
+/// `scan.level_argv` says, so the audit is comparable.
+pub fn audit_argv(
+    level: u8,
+    target: &IpAddr,
+    cfg: &Config,
+    timeout_secs: u64,
+) -> Option<Vec<String>> {
+    let target = crate::net::canonical(*target);
+    let argv = profiles::builtin(level, cfg.scan.level4_udp)?;
+    Some(complete(argv, level, target, cfg, timeout_secs))
 }
 
 /// Why this scanner will not run a job (now).
@@ -174,17 +200,29 @@ enum Job {
         lease: Duration,
         started_at: String,
     },
+    /// Another node's scan, run again here to check it (`credits::audit`).
+    /// No arbiter and no lease: nobody waits for it.
+    Audit {
+        /// The uid of the audited scan, and its job's.
+        of: String,
+        job_uid: String,
+        ip: IpAddr,
+        level: u8,
+        started_at: String,
+    },
 }
 
 impl Job {
     fn ip(&self) -> IpAddr {
         match self {
-            Job::Local { ip, .. } | Job::Granted { ip, .. } => *ip,
+            Job::Local { ip, .. } | Job::Granted { ip, .. } | Job::Audit { ip, .. } => *ip,
         }
     }
     fn level(&self) -> u8 {
         match self {
-            Job::Local { level, .. } | Job::Granted { level, .. } => *level,
+            Job::Local { level, .. } | Job::Granted { level, .. } | Job::Audit { level, .. } => {
+                *level
+            }
         }
     }
 }
@@ -231,6 +269,8 @@ struct Source {
     active: std::sync::Mutex<HashMap<IpAddr, u8>>,
     /// Per-level duration estimates for the response-ratio order.
     order: order::Cached,
+    /// The scans of other nodes this scanner audits.
+    audits: tokio::sync::Mutex<crate::credits::audit::Picker>,
 }
 
 /// Hours since a `YYYY-MM-DD HH:MM:SS` (UTC) time; unparsable: infinite.
@@ -261,6 +301,9 @@ impl Source {
             unreachable: Default::default(),
             active: Default::default(),
             order: order::Cached::new(),
+            audits: tokio::sync::Mutex::new(crate::credits::audit::Picker::new(
+                cfg.credits.audit_share,
+            )),
             rec,
             cfg,
             pace,
@@ -344,6 +387,47 @@ impl Source {
             None => self.acquire_local(exclude).await,
             Some(node) => self.acquire_granted(node, exclude).await,
         }
+    }
+
+    /// The next audit this scanner can start: an audit obeys everything a
+    /// scan does (never_scan, members' addresses, Tor exits, crawlers, the
+    /// evidence held here) except the rescan cooldown.
+    async fn next_audit(&self, exclude: &[u8]) -> anyhow::Result<Option<Job>> {
+        let Some(node) = self.node() else {
+            return Ok(None);
+        };
+        let pool = &node.store.pool;
+        let mut picker = self.audits.lock().await;
+        picker.poll(pool, &node.id()).await?;
+        while let Some(t) = picker.take(exclude) {
+            let Ok(ip) = t.ip.parse::<IpAddr>() else {
+                continue;
+            };
+            let key = crate::net::canonical(ip);
+            if self.active.lock().unwrap().contains_key(&key) {
+                continue;
+            }
+            let now = crate::store::data::now_ts();
+            if let Some(r) = self.preflight(&ip, &t.ip, &now).await? {
+                debug!(target = %ip, why = r.reason(), "audit not run");
+                continue;
+            }
+            let ev = guard::evidence(pool, &t.ip, &self.origins, Some(self.classifier)).await?;
+            if ev.allowed_level(&self.cfg.scan.safety) < t.level {
+                debug!(target = %ip, level = t.level, "audit not run: the requests held here do not back it");
+                continue;
+            }
+            picker.started();
+            self.active.lock().unwrap().insert(key, t.level);
+            return Ok(Some(Job::Audit {
+                of: t.scan_uid,
+                job_uid: t.job_uid,
+                ip,
+                level: t.level,
+                started_at: now,
+            }));
+        }
+        Ok(None)
     }
 
     /// Standalone: our queue's next job that passes the pre-flight checks.
@@ -666,7 +750,7 @@ impl Source {
 
     /// Record a finished job.
     async fn finish(&self, job: &Job, outcome: Outcome) {
-        if let Job::Granted { ip, .. } = job {
+        if let Job::Granted { ip, .. } | Job::Audit { ip, .. } = job {
             self.active
                 .lock()
                 .unwrap()
@@ -683,6 +767,36 @@ impl Source {
                     warn!(job = id, ?e, "could not record scan outcome (job deleted?)");
                 }
             }
+            (
+                Job::Audit {
+                    of,
+                    job_uid,
+                    ip,
+                    level,
+                    started_at,
+                },
+                _,
+            ) => match outcome {
+                Outcome::Done(res) => {
+                    if let Err(e) = self
+                        .rec
+                        .record_scan_audit(
+                            of,
+                            job_uid,
+                            &ip.to_string(),
+                            *level as i64,
+                            started_at,
+                            &res,
+                        )
+                        .await
+                    {
+                        warn!(audit_of = %of, ?e, "could not record audit");
+                    }
+                }
+                // A failed audit says nothing: it is not published.
+                Outcome::Failed(e) => debug!(audit_of = %of, error = %e, "audit scan failed"),
+                Outcome::Abandoned => {}
+            },
             (
                 Job::Granted {
                     arbiter,
@@ -718,6 +832,7 @@ impl Source {
         let store = self.rec.store();
         let id = match job {
             Job::Local { id, .. } => *id,
+            Job::Audit { .. } => return None,
             Job::Granted { uid, .. } => {
                 sqlx::query_scalar("SELECT id FROM scan_jobs WHERE uid = ?")
                     .bind(uid)
@@ -962,7 +1077,12 @@ pub async fn run_workers(
             }
             // Rate cap (spec §5), also across restarts; per scanner.
             match rec.jobs_started_last_hour().await {
-                Ok(n) if n >= p.max_scans_per_hour => break,
+                Ok(n)
+                    if n + source.audits.lock().await.started_last_hour()
+                        >= p.max_scans_per_hour =>
+                {
+                    break;
+                }
                 Err(e) => {
                     warn!(?e, "rate cap check failed");
                     break;
@@ -975,13 +1095,23 @@ pub async fn run_workers(
             } else {
                 vec![]
             };
-            let job = match source.acquire(&exclude).await {
-                Ok(Some(job)) => job,
-                Ok(None) => break,
+            let audit = match source.next_audit(&exclude).await {
+                Ok(a) => a,
                 Err(e) => {
-                    warn!(?e, "queue poll failed");
-                    break;
+                    warn!(?e, "audit poll failed");
+                    None
                 }
+            };
+            let job = match audit {
+                Some(job) => job,
+                None => match source.acquire(&exclude).await {
+                    Ok(Some(job)) => job,
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!(?e, "queue poll failed");
+                        break;
+                    }
+                },
             };
             let l4 = (job.level() == 4).then(|| L4Slot::take(&running_l4));
             if let Some(j) = source.queue_row(&job).await {
@@ -993,7 +1123,10 @@ pub async fn run_workers(
                 job.level(),
                 cfg.scan.level4_timeout_factor,
             );
-            let argv = nmap_argv(job.level(), &job.ip(), &cfg, limit);
+            let argv = match &job {
+                Job::Audit { .. } => audit_argv(job.level(), &job.ip(), &cfg, limit),
+                _ => nmap_argv(job.level(), &job.ip(), &cfg, limit),
+            };
             let source2 = source.clone();
             let notifier2 = notifier.clone();
             let nmap = nmap_path.clone();

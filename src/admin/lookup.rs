@@ -1,9 +1,9 @@
-//! Admin → Lookup: on-demand enrichment of one address by every provider
-//! the cluster can reach, shown once and never stored. See
-//! [`crate::intel::lookup`].
+//! Admin → Lookup: what the dataset holds on one address, and what every
+//! provider the cluster can reach says about it now (paid with credits in
+//! a cluster). See [`crate::intel::lookup`] and [`crate::credits::pay`].
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
-use crate::admin::error::{AppResult, render};
+use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::public::{IntelCard, intel_cards};
 use crate::admin::views::Chrome;
 use crate::store::inspect::IpIntelRow;
@@ -21,30 +21,6 @@ pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/admin/lookup", get(page).post(lookup))
         .route("/admin/lookup/bulk", axum::routing::post(bulk))
-}
-
-/// The result for one address.
-pub struct LookupResult {
-    pub ip: String,
-    /// Whether the dataset holds this address (then the IP page has the
-    /// stored results).
-    pub known: bool,
-    /// Providers that answered, with the answering node.
-    pub cards: Vec<IntelCard>,
-    /// `(provider label, node, why)` for every provider without an answer.
-    pub declined: Vec<(String, String, String)>,
-}
-
-#[derive(Template)]
-#[template(path = "admin_lookup.html")]
-struct LookupPage {
-    chrome: Chrome,
-    ip: String,
-    error: Option<String>,
-    result: Option<LookupResult>,
-    per_peer: u32,
-    cluster: bool,
-    bulk: Option<Bulk>,
 }
 
 /// Addresses read from stored data only (no provider is asked).
@@ -68,13 +44,116 @@ pub struct BulkForm {
     pub ips: Option<String>,
 }
 
+fn chrome() -> Chrome {
+    Chrome::new(true, "admin")
+}
+
+/// One provider as it would be asked: by whom, and at what price.
+pub struct QuoteView {
+    pub label: String,
+    pub node: String,
+    pub price: String,
+}
+
+/// What the form shows before a lookup: what this node can spend and what
+/// the cluster asks.
+#[derive(Default)]
+pub struct Offer {
+    /// The balance in credits (the fleet's, when this node has an owner).
+    pub balance: Option<String>,
+    pub fleet: bool,
+    pub quotes: Vec<QuoteView>,
+    /// What a lookup of every provider costs at most.
+    pub total: String,
+}
+
+/// The offer box is information only: when the balance cannot be read, it
+/// is left out and the page (and an answer already paid for) still shows.
+async fn offer(state: &AdminState) -> Offer {
+    let Some(node) = state.recorder.node() else {
+        return Offer::default();
+    };
+    let balance = async {
+        let book = crate::credits::book(node).await?;
+        let siblings = crate::cluster::owner::fleet::siblings(&node.store).await?;
+        let balance: u64 = std::iter::once(node.id())
+            .chain(siblings.iter().copied())
+            .map(|id| book.balance(&id))
+            .sum();
+        anyhow::Ok((balance, !siblings.is_empty()))
+    }
+    .await
+    .inspect_err(|e| tracing::warn!(?e, "lookup: balance not read"))
+    .ok();
+    let all = crate::credits::pay::quotes(node, &state.providers);
+    let mut quotes = vec![];
+    let mut total = 0u64;
+    for info in crate::intel::KNOWN_PROVIDERS {
+        let Some(q) = all.get(info.name).and_then(|l| l.first()) else {
+            continue;
+        };
+        total += q.price_mc as u64;
+        quotes.push(QuoteView {
+            label: info.label.to_string(),
+            node: q.server_name.clone(),
+            price: if q.price_mc == 0 {
+                "free".into()
+            } else {
+                crate::credits::show(q.price_mc as u64)
+            },
+        });
+    }
+    Offer {
+        balance: balance.map(|(b, _)| crate::credits::show(b)),
+        fleet: balance.is_some_and(|(_, fleet)| fleet),
+        quotes,
+        total: crate::credits::show(total),
+    }
+}
+
+/// A provider answer the dataset already held.
+pub struct StoredView {
+    pub card: IntelCard,
+    pub provider: String,
+    pub age: String,
+}
+
+/// The result for one address.
+pub struct LookupResult {
+    pub ip: String,
+    /// What the dataset holds on the address; None: it is not in it.
+    pub target: Option<crate::admin::target::Target>,
+    /// For an address the dataset does not hold: what is near it.
+    pub near: Option<crate::admin::target::Neighbourhood>,
+    /// Provider answers from the dataset (under 24 hours old).
+    pub stored: Vec<StoredView>,
+    /// Answers asked for now, with the node that served and its charge.
+    pub cards: Vec<IntelCard>,
+    /// `(node, charged)` for every node that charged something.
+    pub charges: Vec<(String, String)>,
+    /// `(provider label, node, why)` for every provider without an answer.
+    pub declined: Vec<(String, String, String)>,
+    /// A serving node kept the answers in the dataset.
+    pub kept: bool,
+}
+
+#[derive(Template)]
+#[template(path = "admin_lookup.html")]
+struct LookupPage {
+    chrome: Chrome,
+    ip: String,
+    error: Option<String>,
+    result: Option<LookupResult>,
+    cluster: bool,
+    offer: Offer,
+    bulk: Option<Bulk>,
+}
+
 #[derive(serde::Deserialize, Default)]
 pub struct IpForm {
     pub ip: Option<String>,
-}
-
-fn chrome() -> Chrome {
-    Chrome::new(true, "admin")
+    /// A provider to ask although the dataset has a fresh answer.
+    pub again: Option<String>,
 }
 
 async fn page(
@@ -87,8 +166,8 @@ async fn page(
         ip: q.ip.unwrap_or_default().trim().to_string(),
         error: None,
         result: None,
-        per_peer: crate::intel::lookup::PER_PEER_PER_DAY,
         cluster: state.recorder.node().is_some(),
+        offer: offer(&state).await,
         bulk: None,
     })
 }
@@ -106,21 +185,124 @@ async fn lookup(
             ip: text,
             error: Some("Not an IP address.".into()),
             result: None,
-            per_peer: crate::intel::lookup::PER_PEER_PER_DAY,
             cluster,
+            offer: offer(&state).await,
             bulk: None,
         });
     };
     let ip = crate::net::canonical(ip);
-    let result = run(&state, ip).await?;
+    let again: Vec<String> = f.again.into_iter().filter(|a| !a.is_empty()).collect();
+    let result = run(&state, ip, &again).await?;
     render(&LookupPage {
         chrome: chrome(),
         ip: ip.to_string(),
         error: None,
         result: Some(result),
-        per_peer: crate::intel::lookup::PER_PEER_PER_DAY,
         cluster,
+        // After the lookup: the balance it left.
+        offer: offer(&state).await,
         bulk: None,
+    })
+}
+
+fn age(secs: i64) -> String {
+    match secs {
+        s if s < 120 => "just now".into(),
+        s if s < 7200 => format!("{} min old", s / 60),
+        s => format!("{} h old", s / 3600),
+    }
+}
+
+/// Look the address up and arrange the three parts of the page: what the
+/// dataset knows, provider answers from the dataset, and live answers.
+pub async fn run(state: &AdminState, ip: IpAddr, again: &[String]) -> AppResult<LookupResult> {
+    let out = crate::intel::lookup::run(&state.recorder, &state.providers, ip, again).await;
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let label = |p: &str| {
+        crate::intel::provider_info(p)
+            .map(|i| i.label.to_string())
+            .unwrap_or_else(|| p.to_string())
+    };
+    let (mut rows, mut declined, mut charges) = (vec![], vec![], vec![]);
+    for a in &out.answers {
+        for f in &a.resp.findings {
+            rows.push(IpIntelRow {
+                provider: f.provider.clone(),
+                fetched_at: now.clone(),
+                source_version: f.source_version.clone(),
+                data_json: f.data.to_string(),
+                node: Some(a.node.clone()),
+            });
+        }
+        for (p, why) in &a.resp.declined {
+            declined.push((label(p), a.node.clone(), why.clone()));
+        }
+        if a.charged_mc > 0 {
+            charges.push((a.node.clone(), crate::credits::show(a.charged_mc as u64)));
+        }
+    }
+    // Cards only for providers that answered; the rest is listed below.
+    let cards = intel_cards(rows, true)
+        .into_iter()
+        .filter(|c| c.newest.is_some())
+        .collect();
+    let stored = out
+        .stored
+        .iter()
+        .flat_map(|s| {
+            let row = IpIntelRow {
+                provider: s.provider.clone(),
+                fetched_at: s.fetched_at.clone(),
+                source_version: s.source_version.clone(),
+                data_json: s.data.to_string(),
+                node: s.node.clone(),
+            };
+            intel_cards(vec![row], true)
+                .into_iter()
+                .filter(|c| c.newest.is_some())
+                .map(|card| StoredView {
+                    card,
+                    provider: s.provider.clone(),
+                    age: age(s.age_secs),
+                })
+        })
+        .collect();
+    // The answers are paid for: what the dataset adds is shown when it can
+    // be read, and its failure does not throw them away.
+    let held = async {
+        let row = state.store.ip_by_addr(&ip.to_string()).await?;
+        let target = match &row {
+            Some(r) => crate::admin::target::load(state, r, true, 1, false).await?,
+            None => None,
+        };
+        let near = match target {
+            Some(_) => None,
+            None => {
+                let asn = crate::admin::target::asn_named(
+                    out.answers
+                        .iter()
+                        .flat_map(|a| &a.resp.findings)
+                        .map(|f| &f.data)
+                        .chain(out.stored.iter().map(|s| &s.data)),
+                );
+                Some(crate::admin::target::neighbourhood(state, ip, asn).await?)
+            }
+        };
+        Ok::<_, AppError>((target, near))
+    }
+    .await;
+    let (target, near) = held
+        .inspect_err(|e| tracing::warn!(?e, %ip, "lookup: dataset not read"))
+        .unwrap_or_default();
+    Ok(LookupResult {
+        ip: ip.to_string(),
+        target,
+        near,
+        stored,
+        cards,
+        charges,
+        declined,
+        kept: out.kept,
     })
 }
 
@@ -163,8 +345,8 @@ async fn bulk(
         ip: String::new(),
         error: None,
         result: None,
-        per_peer: crate::intel::lookup::PER_PEER_PER_DAY,
         cluster: state.recorder.node().is_some(),
+        offer: offer(&state).await,
         bulk: Some(Bulk {
             text,
             rows,
@@ -172,43 +354,6 @@ async fn bulk(
             unreadable,
             capped,
         }),
-    })
-}
-
-/// Ask every reachable node and arrange the answers for the page.
-pub async fn run(state: &AdminState, ip: IpAddr) -> anyhow::Result<LookupResult> {
-    let answers = crate::intel::lookup::cluster(&state.recorder, &state.providers, ip).await;
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let mut rows: Vec<IpIntelRow> = vec![];
-    let mut declined = vec![];
-    for a in &answers {
-        for f in &a.resp.findings {
-            rows.push(IpIntelRow {
-                provider: f.provider.clone(),
-                fetched_at: now.clone(),
-                source_version: f.source_version.clone(),
-                data_json: f.data.to_string(),
-                node: Some(a.node.clone()),
-            });
-        }
-        for (p, why) in &a.resp.declined {
-            let label = crate::intel::provider_info(p)
-                .map(|i| i.label.to_string())
-                .unwrap_or_else(|| p.clone());
-            declined.push((label, a.node.clone(), why.clone()));
-        }
-    }
-    // Cards only for providers that answered; the rest is listed below.
-    let cards = intel_cards(rows, true)
-        .into_iter()
-        .filter(|c| c.newest.is_some())
-        .collect();
-    let known = state.store.ip_by_addr(&ip.to_string()).await?.is_some();
-    Ok(LookupResult {
-        ip: ip.to_string(),
-        known,
-        cards,
-        declined,
     })
 }
 

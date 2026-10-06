@@ -1,0 +1,93 @@
+{% extends "layout.html" %}
+{% block title %}peephole — cluster credits{% endblock %}
+{% block content %}
+{% let sub = "cluster" %}{% include "_admin_nav.html" %}
+{% let subtab = "credits" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
+<div class="page-head"><div><h1>Credits</h1><p class="muted">Earned by completed counter-scans, spent on lookups. Every figure is this node's own count, from its copy of the log.</p></div></div>
+<div class="stack">
+<section class="card"><h2>Balance</h2>
+  <div class="tiles">
+    <div class="tile"><span class="label">This node</span><div class="value">{{ balance }}</div><div class="hint">credits</div></div>
+    <div class="tile"><span class="label">Set aside</span><div class="value">{{ held }}</div><div class="hint">in open lookups</div></div>
+    {% if let Some((total, _)) = fleet %}<div class="tile"><span class="label">All your nodes</span><div class="value">{{ total }}</div><div class="hint">credits</div></div>{% endif %}
+  </div>
+  {% if days.is_empty() %}<p class="muted">Nothing to spend. Credits come from completed counter-scans: the scanner earns 1 (levels 1, 2) or 2 (levels 3, 4), the trap that queued the job a quarter of that.</p>{% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Earned on (UTC)</th><th class="num">Credits</th><th>Expires</th></tr></thead>
+    <tbody>{% for d in days %}<tr><td class="mono">{{ d.date }}</td><td class="num">{{ d.amount }}</td><td>{{ d.expires }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  <p class="muted small">A credit can be used on the day it was earned and the 6 days after, whoever holds it by then.</p>{% endif %}
+</section>
+{% if let Some((_, nodes)) = fleet %}
+<section class="card"><h2>My nodes</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Node</th><th class="num">Credits</th><th>Collects</th></tr></thead>
+    <tbody>{% for n in nodes %}<tr><td><b>{{ n.name }}</b></td><td class="num">{{ n.balance }}</td><td>{{ n.collects }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  <p class="muted small">One node can collect what the others earn (<a href="/admin/cluster/ownership">Ownership</a> › Collect credits here); each of them draws from it when a lookup needs more than it holds.</p>
+</section>
+{% endif %}
+<section class="card"><div class="card-head"><h2>Earned</h2><span class="muted">last 7 days, newest first (UTC)</span></div>
+  {% if waiting > 0 %}<p class="muted">{{ waiting }} scan{% if waiting != 1 %}s{% endif %} not judged yet: a scan is judged ten minutes after it arrives.</p>{% endif %}
+  {% if earned.is_empty() %}<p class="muted">Nothing yet.</p>{% else %}
+  <div class="table-wrap wide"><table>
+    <thead><tr><th>When</th><th>Scan</th><th>IP</th><th>Level</th><th>As</th><th class="num">Credits</th><th></th></tr></thead>
+    <tbody>{% for e in earned %}<tr>
+      <td class="ts">{{ e.at }}</td>
+      <td>{% if let Some(id) = e.scan %}<a class="mono" href="/admin/scans/{{ id }}">scan #{{ id }}</a>{% else %}<span class="muted">not held here</span>{% endif %}</td>
+      <td><a class="mono" href="/ip/{{ e.ip }}">{{ e.ip }}</a></td><td>{{ e.level }}</td><td>{{ e.role }}</td>
+      <td class="num">{{ e.amount }}</td><td class="muted">{{ e.note }}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>{% endif %}
+</section>
+<section class="card"><div class="card-head"><h2>Spent</h2><span class="muted">lookups this node paid for</span></div>
+  {% if spent.is_empty() %}<p class="muted">Nothing yet.</p>{% else %}
+  <div class="table-wrap wide"><table>
+    <thead><tr><th>When</th><th>Answered by</th><th>Providers</th><th class="num">Offered</th><th class="num">Charged</th><th class="num">Of which destroyed</th><th>State</th></tr></thead>
+    <tbody>{% for s in spent %}<tr>
+      <td class="ts">{{ s.at }}</td><td>{{ s.server }}</td><td class="mono">{{ s.providers }}</td>
+      <td class="num">{{ s.offered }}</td><td class="num">{{ s.charged }}</td><td class="num">{{ s.destroyed }}</td><td>{{ s.state }}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  <p class="muted small">Half of what is charged goes to the node that answered; the other half is destroyed. An offer without an answer lapses after 15 minutes and costs nothing.</p>{% endif %}
+</section>
+<section class="card"><div class="card-head"><h2>Sent and received</h2></div>
+  {% if moved.is_empty() %}<p class="muted">No transfers.</p>{% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>When</th><th>From</th><th>To</th><th class="num">Credits</th></tr></thead>
+    <tbody>{% for m in moved %}<tr><td class="ts">{{ m.at }}</td><td>{{ m.from }}</td><td>{{ m.to }}</td><td class="num">{{ m.amount }}{% if m.short %} <span class="muted small">(less than named)</span>{% endif %}</td></tr>{% endfor %}</tbody>
+  </table></div>{% endif %}
+  {% if !receivers.is_empty() %}
+  <form method="post" action="/admin/cluster/credits/send" class="filters">
+    <label>Send to <select name="to">{% for r in receivers %}<option value="{{ r.0 }}">{{ r.1 }}</option>{% endfor %}</select></label>
+    <label>Credits <input name="amount" size="8" inputmode="decimal" placeholder="0.5" required></label>
+    <button class="btn" type="submit">Send</button>
+    <span class="muted small">any member, no fee; it cannot be taken back</span>
+  </form>{% endif %}
+</section>
+<section class="card"><div class="card-head"><h2>Cluster</h2><span class="muted">as this node counts it</span></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Member</th><th class="num">Credits</th><th class="num">Earned, 7 days</th><th class="num">Spent, 7 days</th><th></th></tr></thead>
+    <tbody>{% for m in members %}<tr>
+      <td><a href="/admin/cluster/node/{{ m.key }}"><b>{{ m.name }}</b></a></td>
+      <td class="num">{{ m.balance }}</td><td class="num">{{ m.earned }}</td><td class="num">{{ m.spent }}</td>
+      <td>{% if !m.standing.is_empty() %}<span class="badge badge-status" data-status="running">not earning here: {{ m.standing }}</span>{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  <p class="muted">In 7 days earned {{ totals.0 }} · destroyed {{ totals.1 }} · in circulation now {{ totals.2 }} credits. Another node may count differently: it holds other entries, blocks other members, or runs other rules.</p>
+</section>
+<section class="card"><div class="card-head"><h2>What a lookup costs here</h2></div>
+  <ul>
+    <li>The cluster earned <b>{{ price.earned_per_day }}</b> credits a day over the last 7 days.</li>
+    <li>Its members announce <b>{{ price.lookups_per_day }}</b> paid lookups a day (weighted: a keyed API counts 1, Shodan InternetDB and GeoLite2 a quarter).</li>
+    <li>The scanners ran at <b>{{ price.utilization }}%</b> of what they can do: lookups cost <b>{{ price.load }}</b> of the plain price (half when they idle, double when they are saturated).</li>
+    <li>{% if let Some(u) = price.unit %}One weighted lookup costs <b>{{ u }}</b> credits: the price at which a day's earnings buy a day's lookups.{% else %}No member announces lookup capacity: what has no budget is priced at the lowest price.{% endif %}</li>
+  </ul>
+  {% if !price.offers.is_empty() %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Provider served here</th><th class="num">Price (credits)</th><th class="num" title="Doubles after a day on which the on-demand share ran out, halves after a day on which it did not">Surge</th><th class="num">Paid lookups a day</th></tr></thead>
+    <tbody>{% for o in price.offers %}<tr><td>{{ o.0 }}</td><td class="num">{{ o.1 }}</td><td class="num">×{{ o.2 }}</td><td class="num">{{ o.3 }}</td></tr>{% endfor %}</tbody>
+  </table></div>{% endif %}
+</section>
+</div>
+{% endblock %}

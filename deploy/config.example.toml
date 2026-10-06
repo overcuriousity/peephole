@@ -88,6 +88,15 @@ license_key = "testkey"
 # is never looked up again. 0 = never again.
 refresh_after_days = 30
 
+# Cluster only: the part of each API provider's budget that paid lookups of
+# other members (and your own on-demand lookups) may use. 0.2 = a fifth.
+# on_demand_share = 0.2
+
+# [credits]
+# # Cluster only. A scanner runs this share of the other nodes' fresh scans
+# # again to check them (audits earn nothing; 0 = audit nothing).
+# audit_share = 0.05
+
 # [abuseipdb]
 # # Abuse reports per IP (https://www.abuseipdb.com/account/api).
 # api_key = "..."
@@ -176,6 +185,7 @@ tor_wait_hours = 6
 # per-level argv overrides below; {target} is NOT used — the target IP is
 # appended as the final argument. A script selector with spaces is one
 # element. Example:
+# A scanner that sets its own arguments for a level earns no scanner share for scans at that level (lookup credits).
 # [scan.level_argv]
 # 2 = ["-Pn", "-sS", "-sV", "-T3", "--top-ports", "2000"]
 # 3 = ["-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000", "--script", "(discovery or safe) and not (intrusive or broadcast or external or dos)"]
@@ -201,8 +211,6 @@ tor_wait_hours = 6
 # advertise = "a.example.net:7443"  # how peers reach us; omit if outbound-only
 # takeover_hours = 6                # adopt an unreachable node's queued jobs after
 # lease_secs     = 120              # scan lease, renewed while nmap runs
-# remote_config  = false            # true: holders of this node's config key may change its
-#                                   # scan pace, rescan cooldown and roles (peephole cluster config-key show)
 # origin_quota_mb = 20480           # stop storing a member's entries beyond this (0 = no limit)
 #
 # [[cluster.peers]]

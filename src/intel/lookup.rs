@@ -1,23 +1,19 @@
 //! On-demand enrichment: an admin asks what the providers say about one
-//! address, now. This node's own databases and keys answer first; a
-//! provider nobody here serves is asked from a live member that announces
-//! it, over the cluster RPC. Nothing is stored: not on this node, not on
-//! the answering node, not in the dataset. The automatic enrichment
+//! address, now. On a standalone node its own databases and keys answer.
+//! In a cluster a lookup is paid with credits (`crate::credits::pay`): per
+//! provider the node with the lowest announced price answers, this node's
+//! own providers included, and what was paid for is kept in the dataset
+//! when the cluster has recorded the address. The automatic enrichment
 //! ([`super::enrich_loop`]) keeps recording on its own schedule.
-//!
-//! API lookups spend the answering node's provider budget, so a member
-//! serves at most [`PER_PEER_PER_DAY`] of them per asking node per UTC day;
-//! local databases (GeoLite2, the Tor exit list) are free.
-use super::{KNOWN_PROVIDERS, Providers, provider_info};
+use super::{KNOWN_PROVIDERS, Providers};
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::store::recorder::Recorder;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
-/// API lookups a member serves per asking node and UTC day.
-pub const PER_PEER_PER_DAY: u32 = 50;
 /// Longest wait for one member's answer (API providers pace themselves at
 /// a request per second and time out after 20 s).
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(40);
@@ -31,6 +27,10 @@ pub struct LookupReq {
     /// Provider names wanted; empty: every provider the node serves.
     #[serde(default)]
     pub providers: Vec<String>,
+    /// The asker's `credit_offer` (its sequence number in the asker's log)
+    /// that pays for this request. None: free providers only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer_seq: Option<u64>,
 }
 
 /// One provider's answer.
@@ -48,6 +48,17 @@ pub struct LookupResp {
     /// `(provider, why)` for every provider asked but not answered.
     #[serde(default)]
     pub declined: Vec<(String, String)>,
+    /// What the receipt charges, in mc.
+    #[serde(default)]
+    pub charged_mc: u32,
+    /// Set when the offer was below this node's price for what was asked:
+    /// that price, so the asker may offer again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_mc: Option<u32>,
+    /// The answering node wrote these answers into the dataset (the
+    /// cluster has recorded the address).
+    #[serde(default)]
+    pub kept: bool,
 }
 
 /// What the providers here say about `ip`: those in `wanted`, or every one
@@ -95,26 +106,23 @@ pub async fn local(providers: &Providers, ip: &IpAddr, wanted: &[String]) -> Loo
     resp
 }
 
-/// Serve a member's request with this node's providers, within the
-/// member's daily budget for API lookups.
-pub async fn serve(node: &Node, peer: NodeId, req: &LookupReq) -> LookupResp {
+/// Serve a member's request (or this node's own, `peer` being itself)
+/// with this node's providers. With an offer the request is paid
+/// (`credits::pay::serve`); without one only free providers answer, at
+/// most [`crate::credits::pay::FREE_PER_HOUR`] times an hour per asker.
+pub async fn serve(node: &Arc<Node>, peer: NodeId, req: &LookupReq) -> LookupResp {
+    let all = |why: &str| LookupResp {
+        declined: vec![("*".into(), why.into())],
+        ..Default::default()
+    };
     let Some(providers) = node.lookup_providers() else {
-        return LookupResp {
-            declined: vec![("*".into(), "this node runs no enrichment providers".into())],
-            ..Default::default()
-        };
+        return all("this node runs no enrichment providers");
     };
     if req.ip.len() > MAX_IP_LEN {
-        return LookupResp {
-            declined: vec![("*".into(), "address too long".into())],
-            ..Default::default()
-        };
+        return all("address too long");
     }
     let Ok(ip) = req.ip.trim().parse::<IpAddr>() else {
-        return LookupResp {
-            declined: vec![("*".into(), "not an IP address".into())],
-            ..Default::default()
-        };
+        return all("not an IP address");
     };
     // Only what this node serves is asked; the rest is declined at once.
     let served: Vec<String> = providers
@@ -128,33 +136,33 @@ pub async fn serve(node: &Node, peer: NodeId, req: &LookupReq) -> LookupResp {
         .filter(|n| !served.contains(n))
         .map(|n| (n.clone(), "not served by this node".into()))
         .collect();
-    let api_asked = served
-        .iter()
-        .filter(|n| provider_info(n).is_some_and(|i| i.api))
-        .count() as u32;
-    let wanted: Vec<String> = if api_asked > 0 && !node.take_lookup_budget(peer, api_asked) {
-        for n in served
-            .iter()
-            .filter(|n| provider_info(n).is_some_and(|i| i.api))
-        {
-            declined.push((
-                n.clone(),
-                format!(
-                    "your node's on-demand budget here ({PER_PEER_PER_DAY} API lookups a day) is spent"
-                ),
-            ));
+    let mut resp = match req.offer_seq {
+        Some(seq) => crate::credits::pay::serve(node, providers, peer, ip, served, seq).await,
+        None => {
+            let (free, paid): (Vec<String>, Vec<String>) = served
+                .into_iter()
+                .partition(|n| crate::credits::price::weight_milli(n) == 0);
+            declined.extend(paid.into_iter().map(|n| {
+                (
+                    n,
+                    "lookups of this provider are paid with credits: the request carries no offer"
+                        .into(),
+                )
+            }));
+            if free.is_empty() {
+                LookupResp::default()
+            } else if !node.take_free_lookup(peer) {
+                LookupResp {
+                    declined: free
+                        .into_iter()
+                        .map(|n| (n, "too many free lookups from your node this hour".into()))
+                        .collect(),
+                    ..Default::default()
+                }
+            } else {
+                local(providers, &ip, &free).await
+            }
         }
-        served
-            .into_iter()
-            .filter(|n| !provider_info(n).is_some_and(|i| i.api))
-            .collect()
-    } else {
-        served
-    };
-    let mut resp = if wanted.is_empty() {
-        LookupResp::default()
-    } else {
-        local(providers, &ip, &wanted).await
     };
     resp.declined.append(&mut declined);
     resp
@@ -165,124 +173,94 @@ pub async fn serve(node: &Node, peer: NodeId, req: &LookupReq) -> LookupResp {
 pub struct NodeAnswer {
     pub node: String,
     pub resp: LookupResp,
+    /// What that node charged for this answer, in mc.
+    pub charged_mc: u32,
 }
 
-/// What every reachable node says about `ip`: this node's providers first,
-/// then one live member per provider nobody here answered.
-pub async fn cluster(rec: &Recorder, providers: &Providers, ip: IpAddr) -> Vec<NodeAnswer> {
-    let mine = local(providers, &ip, &[]).await;
-    let mut missing: Vec<String> = KNOWN_PROVIDERS
-        .iter()
-        .map(|p| p.name.to_string())
-        .filter(|n| !mine.findings.iter().any(|f| &f.provider == n))
-        .collect();
-    let mut out = vec![NodeAnswer {
-        node: "this node".into(),
-        resp: mine,
-    }];
-    if let Some(node) = rec.node() {
-        ask_members(node, ip, &mut missing, &mut out).await;
-    }
-    for p in missing {
-        if !out
-            .iter()
-            .any(|a| a.resp.declined.iter().any(|(n, _)| *n == p))
-        {
-            out[0]
-                .resp
-                .declined
-                .push((p, "no reachable node serves this provider".into()));
+/// A lookup as the admin page shows it.
+#[derive(Debug, Clone, Default)]
+pub struct Outcome {
+    /// Provider results the dataset already holds, under 24 hours old:
+    /// shown instead of asking (and paying) again.
+    pub stored: Vec<crate::credits::pay::Stored>,
+    /// What the nodes asked now answered.
+    pub answers: Vec<NodeAnswer>,
+    /// An answering node kept the answers in the dataset.
+    pub kept: bool,
+}
+
+/// Look `ip` up: first in the dataset, then at the providers. `again`
+/// names the providers to ask although the dataset has a fresh result.
+pub async fn run(rec: &Recorder, providers: &Providers, ip: IpAddr, again: &[String]) -> Outcome {
+    let known: Vec<String> = KNOWN_PROVIDERS.iter().map(|p| p.name.to_string()).collect();
+    let Recorder::Cluster(node) = rec else {
+        // Standalone: this node's providers, no credits, nothing stored.
+        let mut answers = vec![NodeAnswer {
+            node: "this node".into(),
+            resp: local(providers, &ip, &[]).await,
+            charged_mc: 0,
+        }];
+        note_unserved(&mut answers, &known);
+        return Outcome {
+            answers,
+            ..Default::default()
+        };
+    };
+    let stored: Vec<_> = match crate::credits::pay::stored(&node.store.pool, &ip).await {
+        Ok(s) => s
+            .into_iter()
+            .filter(|s| !again.contains(&s.provider))
+            .collect(),
+        Err(e) => {
+            tracing::debug!(?e, "lookup: stored results not read");
+            vec![]
         }
-    }
-    out
-}
-
-/// Ask one live member per provider in `missing`, removing what they
-/// answered; their answers go to `out`.
-async fn ask_members(
-    node: &Node,
-    ip: IpAddr,
-    missing: &mut Vec<String>,
-    out: &mut Vec<NodeAnswer>,
-) {
-    let me = node.id();
-    let members = node.members();
-    let live = node.live_members(super::LIVE_WINDOW);
-    // Dialable members first: an outbound-only member cannot be asked.
-    let mut candidates: Vec<(NodeId, Vec<String>)> = live
+    };
+    let wanted: Vec<String> = known
         .into_iter()
-        .filter(|id| *id != me && !node.is_blocked(id))
-        .filter_map(|id| {
-            let serves = node.status.known(&id)?.hb.providers;
-            Some((id, serves))
-        })
+        .filter(|p| !stored.iter().any(|s| &s.provider == p))
         .collect();
-    candidates.sort_by_key(|(id, _)| (members.get(id).is_none_or(|m| m.address.is_none()), *id));
-    for (id, serves) in candidates {
-        if missing.is_empty() {
-            break;
-        }
-        let ask: Vec<String> = serves.into_iter().filter(|s| missing.contains(s)).collect();
-        if ask.is_empty() {
-            continue;
-        }
-        let Some(member) = members.get(&id) else {
-            continue;
-        };
-        let Some(addr) = node.dial_address(&id) else {
-            out.push(NodeAnswer {
-                node: member.name.clone(),
-                resp: LookupResp {
-                    declined: ask
-                        .iter()
-                        .map(|p| {
-                            (
-                                p.clone(),
-                                "serves it, but is outbound-only: it cannot be asked".into(),
-                            )
-                        })
-                        .collect(),
-                    ..Default::default()
-                },
-            });
-            continue;
-        };
-        let req = LookupReq {
-            ip: ip.to_string(),
-            providers: ask.clone(),
-        };
-        let answer = tokio::time::timeout(
-            RPC_TIMEOUT,
-            node.call::<LookupReq, LookupResp>(id, &addr, "/rpc/v1/lookup", &req),
-        )
-        .await;
-        let resp = match answer {
-            Ok(Ok(mut resp)) => {
-                // Only what was asked for, and only from known providers.
-                resp.findings
-                    .retain(|f| ask.contains(&f.provider) && provider_info(&f.provider).is_some());
-                missing.retain(|m| !resp.findings.iter().any(|f| &f.provider == m));
-                resp
-            }
-            Ok(Err(e)) => LookupResp {
-                declined: ask
-                    .iter()
-                    .map(|p| (p.clone(), format!("could not be asked: {e:#}")))
-                    .collect(),
-                ..Default::default()
-            },
-            Err(_) => LookupResp {
-                declined: ask
-                    .iter()
-                    .map(|p| (p.clone(), "did not answer in time".into()))
-                    .collect(),
-                ..Default::default()
-            },
-        };
-        out.push(NodeAnswer {
-            node: member.name.clone(),
-            resp,
+    let mut answers = crate::credits::pay::ask(node, providers, ip, &wanted).await;
+    if answers.is_empty() {
+        answers.push(NodeAnswer {
+            node: "this node".into(),
+            resp: LookupResp::default(),
+            charged_mc: 0,
         });
+    }
+    note_unserved(&mut answers, &wanted);
+    Outcome {
+        kept: answers.iter().any(|a| a.resp.kept),
+        stored,
+        answers,
+    }
+}
+
+/// What every reachable node says about `ip` now, whatever the dataset
+/// holds (see [`run`]).
+pub async fn cluster(rec: &Recorder, providers: &Providers, ip: IpAddr) -> Vec<NodeAnswer> {
+    let all: Vec<String> = KNOWN_PROVIDERS.iter().map(|p| p.name.to_string()).collect();
+    run(rec, providers, ip, &all).await.answers
+}
+
+/// Every provider in `wanted` that nobody answered or declined gets a
+/// note on the first answer.
+fn note_unserved(out: &mut [NodeAnswer], wanted: &[String]) {
+    let missing: Vec<String> = wanted
+        .iter()
+        .filter(|p| {
+            !out.iter().any(|a| {
+                a.resp.findings.iter().any(|f| &f.provider == *p)
+                    || a.resp.declined.iter().any(|(n, _)| n == *p)
+            })
+        })
+        .cloned()
+        .collect();
+    for p in missing {
+        out[0]
+            .resp
+            .declined
+            .push((p, "no reachable node serves this provider".into()));
     }
 }
 
@@ -376,5 +354,35 @@ mod tests {
         assert_eq!(declined.len(), KNOWN_PROVIDERS.len() - 1);
         assert!(declined.contains(&super::super::SHODAN));
         assert!(!declined.contains(&super::super::TOR));
+    }
+
+    /// A request of a node of an earlier version carries no offer and
+    /// still decodes; an answer of one carries no charge.
+    #[test]
+    fn requests_and_answers_of_an_earlier_version_decode() {
+        #[derive(Serialize)]
+        struct OldReq {
+            ip: String,
+            providers: Vec<String>,
+        }
+        #[derive(Serialize)]
+        struct OldResp {
+            findings: Vec<Found>,
+            declined: Vec<(String, String)>,
+        }
+        let raw = crate::cluster::rpc::cbor::encode(&OldReq {
+            ip: "203.0.113.7".into(),
+            providers: vec![],
+        })
+        .unwrap();
+        let req: LookupReq = crate::cluster::rpc::cbor::decode(&raw).unwrap();
+        assert_eq!(req.offer_seq, None);
+        let raw = crate::cluster::rpc::cbor::encode(&OldResp {
+            findings: vec![],
+            declined: vec![],
+        })
+        .unwrap();
+        let resp: LookupResp = crate::cluster::rpc::cbor::decode(&raw).unwrap();
+        assert_eq!((resp.charged_mc, resp.price_mc), (0, None));
     }
 }

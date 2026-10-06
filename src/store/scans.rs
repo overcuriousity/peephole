@@ -87,8 +87,9 @@ impl Store {
             Option<i64>,
             Option<i64>,
             Option<i64>,
+            Option<i64>,
         );
-        let (backlog, running, a1, a24, c1, c24, f24, t24, ar, lr): Sums = sqlx::query_as(
+        let (backlog, running, a1, a24, c1, c24, f24, t24, ar, lr, r24): Sums = sqlx::query_as(
             // A job "running" past any scan's limit is dead and never leaves.
             "SELECT SUM(status='queued'),
                     SUM(status='running' AND started_at > datetime('now', ?)),
@@ -101,7 +102,8 @@ impl Store {
                         AND finished_at > datetime('now','-24 hours')),
                     SUM(queued_at > datetime('now', ?)),
                     SUM(status IN ('done','failed','refused','superseded')
-                        AND finished_at > datetime('now', ?))
+                        AND finished_at > datetime('now', ?)),
+                    SUM(status = 'refused' AND finished_at > datetime('now','-24 hours'))
              FROM scan_jobs",
         )
         .bind(format!("-{} hours", crate::scan::pace::STALE_RUNNING_HOURS))
@@ -161,6 +163,7 @@ impl Store {
             completed_1h: c1.unwrap_or(0),
             completed_24h: c24.unwrap_or(0),
             failed_24h: f24.unwrap_or(0),
+            refused_24h: r24.unwrap_or(0),
             timeouts_24h: t24.unwrap_or(0),
             arrivals_recent: ar.unwrap_or(0),
             left_recent: lr.unwrap_or(0),
@@ -347,6 +350,7 @@ mod tests {
         .unwrap();
         let m = s.queue_metrics().await.unwrap();
         assert_eq!(m.left_recent, 3);
+        assert_eq!(m.refused_24h, 1, "one job was set to refused above");
         assert_eq!((m.backlog, m.running), (0, 0));
 
         assert_eq!(s.setting_get("k").await.unwrap(), None);

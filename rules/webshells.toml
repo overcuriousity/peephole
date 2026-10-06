@@ -9,7 +9,7 @@ owasp = ["A08:2021"]
 # Known shell filenames and shells dropped where uploads land: generic
 # short names (x.php, 1.php, up.php) are what scanners spray for, and on a
 # trap there is no legitimate /x.php.
-target_regex = '''/(x|1|2|3|aa|aaa|abc|alfa|b374k|backdoor|bash|bd|c99|cmd|cong|death|exec|hack|hacker|leaf|mini|r57|root|sh3ll|shell|shellz|small|up|upload|uploader|wso|wsoshell|xxx)\.(php[3457]?|phtml|phar|asp|aspx|ashx|jsp|jspx|cgi|pl|py)(/|\?|$)|/wp-content/uploads?/[^/\s]+\.(php[3457]?|phtml)(/|\?|$)|/(images?|img|files?|uploads?|tmp|cache|assets)/[^/\s]+\.(php[3457]?|phtml|jspx?)(/|\?|$)|/\.well-known/[^/\s]+\.(php[3457]?|phtml|asp|aspx)(/|\?|$)'''
+target_regex = '''/(x|1|2|3|aa|aaa|abc|adminfuns|alfa|b374k|backdoor|bash|bd|c99|ccc|chosen|cmd|cong|death|dex|ebkid|exec|go|hack|hacker|leaf|mini|r57|root|sh3ll|shell|shellz|simple|sm|small|this_is_a_new_hello_world|up|upload|uploader|wso|wsoshell|xxx)\.(php[3457]?|phtml|phar|asp|aspx|ashx|jsp|jspx|cgi|pl|py)(/|\?|$)|/wp-content/uploads?/[^/\s]+\.(php[3457]?|phtml)(/|\?|$)|/(images?|img|files?|uploads?|tmp|cache|assets)/[^/\s]+\.(php[3457]?|phtml|jspx?)(/|\?|$)|/\.well-known/[^/\s]+\.(php[3457]?|phtml|asp|aspx)(/|\?|$)'''
 
 [[rule]]
 label = "webshell"
@@ -18,7 +18,7 @@ owasp = ["A08:2021"]
 # Shell interaction: a known shell name plus a command parameter, or the
 # China Chopper parameter names z0/z1/z2 on any script. A generic
 # /index.php?action=edit does not match.
-target_regex = '''/(x|1|2|aa|aaa|alfa|b374k|c99|cmd|cong|exec|hack|r57|sh3ll|shell|shellz|small|up|upload|wso|root|backdoor)\.(php[3457]?|phtml|asp|aspx|jsp|cgi|pl)\?[^ ]{0,500}(cmd|c|exec|command|act|do|pass|pwd)=|\.(php[3457]?|phtml|asp|aspx|jsp)\?([^ ]{0,500}[&?])?(z0|z1|z2)='''
+target_regex = '''/(x|1|2|aa|aaa|adminfuns|alfa|b374k|c99|ccc|chosen|cmd|cong|dex|ebkid|exec|go|hack|r57|root|sh3ll|shell|shellz|simple|sm|small|this_is_a_new_hello_world|up|upload|wso|backdoor)\.(php[3457]?|phtml|asp|aspx|jsp|cgi|pl)\?[^ ]{0,500}(cmd|c|exec|command|act|do|pass|pwd)=|\.(php[3457]?|phtml|asp|aspx|jsp)\?([^ ]{0,500}[&?])?(z0|z1|z2)='''
 
 [[rule]]
 label = "php-probe"

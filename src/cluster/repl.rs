@@ -19,7 +19,7 @@
 use super::Node;
 use super::hlc;
 use super::identity::NodeId;
-use super::record::{JobAdoptRec, ROW_BACKED, Record, WireEntry};
+use super::record::{JobAdoptRec, ROW_BACKED, Record, Seal, WireEntry};
 use super::sync::Batch;
 use crate::store::data::{self, Ctx, Effect};
 use anyhow::Result;
@@ -379,7 +379,7 @@ pub async fn entries_after(
 
 /// `origin`'s entry `seq` with its signed payload (rebuilt from its row if
 /// need be); None if it is not held or erased.
-async fn signed_entry(
+pub(crate) async fn signed_entry(
     conn: &mut SqliteConnection,
     origin: &NodeId,
     seq: u64,
@@ -499,8 +499,8 @@ async fn insert_log(conn: &mut SqliteConnection, e: &WireEntry, state: i64) -> R
     let accounted = (e.payload.as_ref().map_or(0, Vec::len) + 128) as i64;
     sqlx::query(
         "INSERT INTO repl_log (origin, seq, hlc, kind, uid, payload, sig, erased_by, applied,
-                               received_at, accounted)
-         VALUES (?,?,?,?,?,?,?,?,?,datetime('now'),?)",
+                               received_at, accounted, digest)
+         VALUES (?,?,?,?,?,?,?,?,?,datetime('now'),?,?)",
     )
     .bind(&e.origin.0[..])
     .bind(e.seq as i64)
@@ -512,6 +512,8 @@ async fn insert_log(conn: &mut SqliteConnection, e: &WireEntry, state: i64) -> R
     .bind(&e.erased_by)
     .bind(state)
     .bind(accounted)
+    // While the payload is here: a row-backed entry gives it up below.
+    .bind(e.digest().map(|d| d.to_vec()))
     .execute(&mut *conn)
     .await?;
     // What the origin costs this node (its quota); row-backed payloads are
@@ -626,6 +628,28 @@ pub async fn append(node: &Node, records: &[Record]) -> Result<Vec<WireEntry>> {
     }
     node.notify_changed();
     Ok(out)
+}
+
+/// Append one sealing record created by this node (an offer, a transfer,
+/// a `log_seal`). `make` gets the seal for the position the entry takes,
+/// computed in the same transaction that writes it.
+pub async fn append_sealing(node: &Node, make: impl FnOnce(Seal) -> Record) -> Result<WireEntry> {
+    let guard = node.apply_lock.lock().await;
+    let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let me = node.id();
+    let seq = log_head(&mut tx, &me)
+        .await?
+        .max(pending_head(&mut tx, &me).await?)
+        + 1;
+    let seal = super::seal::next(&mut tx, &me, seq).await?;
+    let record = make(seal);
+    let (e, _) = append_in_tx(node, &mut tx, &record).await?;
+    tx.commit().await?;
+    drop(guard);
+    node.own_head
+        .fetch_max(e.seq, std::sync::atomic::Ordering::Relaxed);
+    node.notify_changed();
+    Ok(e)
 }
 
 /// Apply entries received from a peer (any origin). A windowed node skips
@@ -1304,7 +1328,7 @@ pub async fn rematerialize(node: &Node) -> Result<usize> {
         "SELECT origin, seq FROM repl_log
          WHERE payload IS NOT NULL AND applied != 4
            AND kind IN ('request','scan_job','job_adopt','job_status','fp_claim',
-                        'fingerprint','scan_result','ip_intel','skip_batch')
+                        'fingerprint','scan_result','scan_audit','ip_intel','skip_batch')
          ORDER BY CASE kind WHEN 'request' THEN 0 WHEN 'scan_job' THEN 1
                             WHEN 'job_adopt' THEN 2 WHEN 'job_status' THEN 3 ELSE 4 END, hlc",
     )
@@ -1381,6 +1405,7 @@ fn waits_for(r: &Record) -> Option<String> {
     match r {
         Record::JobStatus(s) => Some(s.job_uid.clone()),
         Record::ScanResult(s) => Some(s.job_uid.clone()),
+        Record::ScanAudit(a) => Some(a.scan.job_uid.clone()),
         _ => None,
     }
 }
@@ -1406,6 +1431,17 @@ async fn apply_record(
     }
     if let Record::JobAdopt(a) = r {
         return adopt(node, conn, e, a, at).await;
+    }
+    if matches!(
+        r,
+        Record::CreditOffer { .. }
+            | Record::CreditReceipt { .. }
+            | Record::CreditTransfer { .. }
+            | Record::LogSeal { .. }
+            | Record::ForkProof { .. }
+    ) {
+        super::seal::on_apply(node, conn, e, r).await?;
+        return Ok(Settled::default());
     }
     let ctx = Ctx {
         origin: Some(&e.origin),
@@ -1710,6 +1746,8 @@ mod tests {
                 own_seq: 0,
                 retention_days: 0,
                 floors: vec![],
+                on_demand: vec![],
+                prices: vec![],
             };
             let body = super::super::rpc::cbor::encode(&hb).unwrap();
             let signed = super::super::status::SignedHeartbeat { body, sig: vec![] };
@@ -1827,6 +1865,51 @@ mod tests {
             .unwrap()
     }
 
+    /// A node of an earlier version meets a record kind it does not know
+    /// (as the credit kinds are to a node before them): it keeps the entry,
+    /// does not apply it, and relays it unchanged, so the nodes behind it
+    /// receive it as their origin signed it.
+    #[tokio::test]
+    async fn a_kind_this_build_does_not_know_is_kept_and_relayed_unchanged() {
+        let (_d, node) = test_node(0).await;
+        let a = Identity::generate().unwrap();
+        super::append(&node, &[Record::MemberAdd(info(a.id, "a"))])
+            .await
+            .unwrap();
+        let payload = super::super::rpc::cbor::encode(&serde_json::json!({
+            "payer": "x", "offer_seq": 7, "charged_mc": 1500, "answered": ["abuseipdb"]
+        }))
+        .unwrap();
+        let later = WireEntry::sign_kind(&a, 1, now_hlc(1), "credit_receipt_v9", payload);
+        assert!(later.record().is_none(), "unknown here");
+        let after = request(&a, 2, "/after");
+        let st = super::apply_batch(&node, vec![later.clone(), after])
+            .await
+            .unwrap();
+        assert_eq!((st.applied, st.rejected), (2, 0), "{st:?}");
+        let state: i64 =
+            sqlx::query_scalar("SELECT applied FROM repl_log WHERE origin = ? AND seq = 1")
+                .bind(&a.id.0[..])
+                .fetch_one(&node.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(state, super::UNKNOWN_KIND);
+        assert_eq!(paths(&node).await, ["/after"], "the origin's log goes on");
+        // Still unknown after a restart's retry.
+        super::apply_unknown_kinds(&node).await.unwrap();
+
+        let batch = super::entries_after(&node.store, &[(a.id, 0)], 0, 100, 1 << 20)
+            .await
+            .unwrap();
+        let sent = batch
+            .entries
+            .iter()
+            .find(|e| e.origin == a.id && e.seq == 1)
+            .expect("relayed");
+        assert_eq!(sent, &later, "byte for byte");
+        assert!(sent.verify(), "the origin's signature still holds");
+    }
+
     /// One entry that fails stops neither the batch nor the other origins.
     /// Before, any error rolled back the whole batch; peers sent it again
     /// and again and sync stalled for every origin.
@@ -1910,6 +1993,8 @@ mod tests {
             own_seq: 0,
             retention_days,
             floors,
+            on_demand: vec![],
+            prices: vec![],
         };
         let body = super::super::rpc::cbor::encode(&hb).unwrap();
         let signed = super::super::status::SignedHeartbeat { body, sig: vec![] };

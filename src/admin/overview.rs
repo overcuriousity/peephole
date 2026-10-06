@@ -59,6 +59,13 @@ pub struct Signals {
     pub detached: Option<&'static str>,
     /// Members whose older history no reachable peer can give.
     pub unserved: Option<String>,
+    /// Members that showed two histories: `(name, key)`.
+    pub forked: Vec<(String, String)>,
+    /// Levels this node scans with its own arguments (`scan.level_argv`):
+    /// those scans earn no scanner share.
+    pub custom_argv: Vec<u8>,
+    /// Credits of this node in the lot that expires today, when at least 1.
+    pub expiring: Option<String>,
 }
 
 /// The items to show, in a fixed order; empty when all is well.
@@ -138,6 +145,28 @@ pub fn attention(s: &Signals) -> Vec<Attention> {
             "/admin/system",
         ));
     }
+    for (name, key) in &s.forked {
+        v.push(warn(
+            format!("{name} showed two histories: its credits are void here."),
+            &format!("/admin/cluster/node/{key}"),
+        ));
+    }
+    if !s.custom_argv.is_empty() {
+        let levels: Vec<String> = s.custom_argv.iter().map(u8::to_string).collect();
+        v.push(warn(
+            format!(
+                "This node sets scan.level_argv for level {}: its scans there earn no scanner share.",
+                levels.join(", ")
+            ),
+            "/admin/cluster/credits",
+        ));
+    }
+    if let Some(c) = &s.expiring {
+        v.push(warn(
+            format!("{c} credits expire today."),
+            "/admin/cluster/credits",
+        ));
+    }
     v
 }
 
@@ -162,6 +191,30 @@ async fn signals(st: &AdminState) -> AppResult<Signals> {
             Ok(u) => s.unserved = u,
             Err(e) => tracing::warn!(error = ?e, "overview: unserved history unknown"),
         }
+        if let Ok(forked) = crate::cluster::seal::forked(&node.store.pool).await {
+            let members = node.members();
+            s.forked = forked
+                .iter()
+                .map(|f| {
+                    (
+                        members
+                            .get(&f.origin)
+                            .map_or_else(|| f.origin.short(), |m| m.name.clone()),
+                        f.origin.to_string(),
+                    )
+                })
+                .collect();
+        }
+        if node.roles().scanner {
+            let mut levels: Vec<u8> = st.cfg.scan.level_argv.keys().copied().collect();
+            levels.sort();
+            s.custom_argv = levels;
+        }
+        if let Ok(book) = crate::credits::book(node).await {
+            let expiring = book.ledger.expiring_today(&node.id());
+            s.expiring =
+                (expiring >= crate::credits::CREDIT).then(|| crate::credits::show(expiring));
+        }
     }
     Ok(s)
 }
@@ -170,7 +223,8 @@ async fn signals(st: &AdminState) -> AppResult<Signals> {
 /// last error is left out: "not seen" says it already.
 async fn members(st: &AdminState, node: &crate::cluster::Node) -> AppResult<Vec<NodeState>> {
     let check = crate::admin::cluster::rules_check(st, node).await?;
-    let (_, members) = crate::admin::cluster::views(node, &check).await?;
+    let book = crate::credits::book(node).await?;
+    let (_, members) = crate::admin::cluster::views(node, &check, Some(&book)).await?;
     Ok(members
         .into_iter()
         .filter(|m| m.active && !m.blocked)
@@ -192,6 +246,172 @@ async fn members(st: &AdminState, node: &crate::cluster::Node) -> AppResult<Vec<
         .collect())
 }
 
+/// The "Cluster" row: every figure from this node's view, each linked to
+/// the page that breaks it down.
+pub struct ClusterFigures {
+    /// "11 of 12 members earn here".
+    pub conformity: String,
+    /// The lowest rules agreement among members ("disagree on 3% of 500").
+    pub lowest_agreement: String,
+    /// Different rules fingerprints the members' newest requests carry.
+    pub rule_sets: usize,
+    pub circulating: String,
+    /// Per day, 7-day averages.
+    pub earned: String,
+    pub spent: String,
+    pub destroyed: String,
+    pub expiring_today: String,
+    /// Paid scans a day, low and high tier.
+    pub paid_scans: (String, String),
+    /// Scans a day the scanners can do, did, and the utilization in %.
+    /// Scans a day: possible, done, idle; and the utilization in %.
+    pub capacity: (String, String, String, String),
+    /// Counted audits of 7 days: agrees, differs, inconclusive.
+    pub audits: (u32, u32, u32),
+    /// The unit price with its load factor.
+    pub unit: String,
+    pub load: String,
+    /// Lowest and highest announced price of a keyed provider.
+    pub price_range: Option<(String, String)>,
+    /// Weighted paid lookups a day announced, and lookups served today.
+    pub lookups: (String, i64),
+    pub forks: usize,
+}
+
+/// What lookups charged, and the part of it destroyed, over the offers
+/// written since `from_ms`.
+fn spending(offers: &[crate::credits::ledger::Offer], from_ms: u64) -> (u64, u64) {
+    offers
+        .iter()
+        .filter(|o| crate::cluster::hlc::physical_ms(o.hlc) >= from_ms)
+        .filter_map(|o| match o.state {
+            crate::credits::ledger::OfferState::Charged {
+                charged, destroyed, ..
+            } => Some((charged, destroyed)),
+            _ => None,
+        })
+        .fold((0, 0), |(c, d), (c2, d2)| (c + c2, d + d2))
+}
+
+async fn cluster_figures(
+    st: &AdminState,
+    node: &crate::cluster::Node,
+) -> AppResult<ClusterFigures> {
+    use crate::credits::audit::Outcome;
+    use crate::credits::show;
+    let book = crate::credits::book(node).await?;
+    let check = crate::admin::cluster::rules_check(st, node).await?;
+    let members = node.members();
+    let active: Vec<_> = members.values().filter(|m| m.active).collect();
+    let earning = active
+        .iter()
+        .filter(|m| book.standing(&m.id).earns_as_scanner())
+        .count();
+    let lowest = check
+        .by_member
+        .values()
+        .filter(|a| a.sampled > 0)
+        .max_by(|a, b| {
+            (u64::from(a.differing) * u64::from(b.sampled))
+                .cmp(&(u64::from(b.differing) * u64::from(a.sampled)))
+        })
+        .map(|a| a.summary())
+        .unwrap_or_else(|| "no requests to compare".into());
+    let rule_sets: std::collections::HashSet<&String> = check
+        .carried
+        .values()
+        .filter_map(|c| c.newest.as_ref())
+        .collect();
+    let l = &book.ledger;
+    let per_day = |total: u64| show(total / 7);
+    let week = book.now_ms.saturating_sub(7 * crate::credits::DAY_MS);
+    let in_week = |hlc: u64| crate::cluster::hlc::physical_ms(hlc) >= week;
+    // The ledger walks 8 days of entries: count the last 7.
+    let (spent, destroyed) = spending(&l.offers, week);
+    let (mut low, mut high) = (0u64, 0u64);
+    for p in book.paid.iter().filter(|p| in_week(p.scan.hlc)) {
+        if p.scanner_mc + p.trap_mc == 0 {
+            continue;
+        }
+        if p.scan.level >= 3 {
+            high += 1;
+        } else {
+            low += 1;
+        }
+    }
+    let tenth = |n: u64| format!("{:.1}", n as f64 / 7.0);
+    let mut auditors = crate::cluster::owner::fleet::siblings(&node.store).await?;
+    auditors.push(node.id());
+    let mut audits = (0, 0, 0);
+    for c in crate::credits::audit::counts(&node.store.pool, week << 16).await? {
+        if !auditors.contains(&c.auditor) {
+            continue;
+        }
+        match c.outcome {
+            Outcome::Agrees => audits.0 += c.n,
+            Outcome::Differs => audits.1 += c.n,
+            Outcome::Inconclusive => audits.2 += c.n,
+        }
+    }
+    let t = node.price_table();
+    // What live members ask for a keyed provider.
+    let mut keyed: Vec<u32> = t
+        .offers
+        .iter()
+        .filter(|o| crate::credits::price::weight_milli(&o.provider) == 1000)
+        .map(|o| o.price_mc)
+        .collect();
+    for id in node.live_members(crate::intel::LIVE_WINDOW) {
+        if let Some(k) = node.status.known(&id) {
+            keyed.extend(
+                k.hb.prices
+                    .iter()
+                    .filter(|(p, _)| crate::credits::price::weight_milli(p) == 1000)
+                    .map(|(_, mc)| *mc),
+            );
+        }
+    }
+    let served_today: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM credit_entries
+         WHERE kind = 'receipt' AND charged_mc > 0 AND hlc >= ?",
+    )
+    .bind(crate::cluster::hlc::to_db(
+        (book.now_ms / crate::credits::DAY_MS * crate::credits::DAY_MS) << 16,
+    ))
+    .fetch_one(&st.store.read)
+    .await?;
+    Ok(ClusterFigures {
+        conformity: format!("{earning} of {} members earn here", active.len()),
+        lowest_agreement: lowest,
+        rule_sets: rule_sets.len(),
+        circulating: show(l.circulating()),
+        earned: show(book.earned_per_day()),
+        spent: per_day(spent),
+        destroyed: per_day(destroyed),
+        expiring_today: show(active.iter().map(|m| l.expiring_today(&m.id)).sum::<u64>()),
+        paid_scans: (tenth(low), tenth(high)),
+        capacity: (
+            format!("{:.0}", t.capacity.per_day),
+            format!("{:.0}", t.capacity.used_per_day),
+            format!(
+                "{:.0}",
+                (t.capacity.per_day - t.capacity.used_per_day).max(0.0)
+            ),
+            format!("{:.0}", t.capacity.utilization * 100.0),
+        ),
+        audits,
+        unit: t.unit.map_or_else(|| "—".into(), show),
+        load: format!("{:.2}", t.load),
+        price_range: keyed
+            .iter()
+            .min()
+            .zip(keyed.iter().max())
+            .map(|(lo, hi)| (show(*lo as u64), show(*hi as u64))),
+        lookups: (format!("{:.0}", t.lookups_per_day), served_today),
+        forks: crate::cluster::seal::forked(&node.store.pool).await?.len(),
+    })
+}
+
 #[derive(Template)]
 #[template(path = "admin_home.html")]
 struct HomePage {
@@ -209,6 +429,7 @@ struct HomePage {
     recent: Vec<crate::store::stats::RecentRequest>,
     /// The newest request id shown (the live feed's cursor).
     recent_max_id: i64,
+    cluster: Option<ClusterFigures>,
 }
 
 async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
@@ -235,6 +456,16 @@ async fn home(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             .to_string(),
         recent,
         recent_max_id,
+        cluster: match st.recorder.node() {
+            // The landing page must not fail with the cluster's figures.
+            Some(node) => cluster_figures(&st, node)
+                .await
+                .inspect_err(
+                    |e| tracing::warn!(error = ?e, "overview: cluster figures unavailable"),
+                )
+                .ok(),
+            None => None,
+        },
     })
 }
 
@@ -276,6 +507,7 @@ mod tests {
             nodes: vec![down, odd],
             detached: None,
             unserved: Some("writer".into()),
+            ..Default::default()
         };
         let items = attention(&s);
         let find = |href: &str, text: &str| {
@@ -351,5 +583,51 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(attention(&s)[0].text, "1 scan failed in 24 h");
+    }
+
+    #[test]
+    fn spending_counts_the_last_seven_days_only() {
+        use crate::credits::ledger::{Offer, OfferState};
+        let id = crate::cluster::identity::NodeId([1; 32]);
+        let offer = |day: u64, charged: u64| Offer {
+            payer: id,
+            seq: day,
+            hlc: (day * crate::credits::DAY_MS) << 16,
+            to: id,
+            offered: charged,
+            covered: charged,
+            held: vec![],
+            state: OfferState::Charged {
+                charged,
+                to_server: charged / 2,
+                destroyed: charged - charged / 2,
+            },
+            answered: vec![],
+        };
+        // Day 1 lies outside the week that starts on day 2.
+        let offers = [offer(1, 1000), offer(2, 400), offer(8, 200)];
+        assert_eq!(spending(&offers, 2 * crate::credits::DAY_MS), (600, 300));
+    }
+
+    #[test]
+    fn credit_matters_that_need_a_look() {
+        let s = Signals {
+            forked: vec![("node-x".into(), "key-x".into())],
+            custom_argv: vec![2, 4],
+            expiring: Some("3.25".into()),
+            ..Default::default()
+        };
+        let v = attention(&s);
+        let texts: Vec<&str> = v.iter().map(|a| a.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "node-x showed two histories: its credits are void here.",
+                "This node sets scan.level_argv for level 2, 4: its scans there earn no scanner share.",
+                "3.25 credits expire today.",
+            ]
+        );
+        assert_eq!(v[0].href, "/admin/cluster/node/key-x");
+        assert_eq!(v[2].href, "/admin/cluster/credits");
     }
 }

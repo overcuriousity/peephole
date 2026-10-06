@@ -25,8 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
   - with a trap, **what is in front of it** (see below);
   - the public domain of the admin area (with the web interface);
   - whether to take part in a **cluster**: node name, addresses, an invite
-    token, and whether holders of this node's **config key** may change its
-    settings;
+    token;
   - optional **MaxMind GeoLite2** credentials
     (<https://www.maxmind.com/en/accounts/current/license-key>);
   - optional API keys for **AbuseIPDB**, **Shodan** and **GreyNoise**, and
@@ -88,7 +87,7 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
 
 Every question has a variable (`PEEPHOLE_ROLES`, `PEEPHOLE_FRONT`,
 `PEEPHOLE_TRUSTED_PROXIES`, `PEEPHOLE_OWN_ADDRESSES`, `PEEPHOLE_CLUSTER`,
-`PEEPHOLE_CLUSTER_NAME`, `PEEPHOLE_JOIN_TOKEN`, `PEEPHOLE_REMOTE_CONFIG`,
+`PEEPHOLE_CLUSTER_NAME`, `PEEPHOLE_JOIN_TOKEN`,
 `PEEPHOLE_NGINX`, `PEEPHOLE_ACME_EMAIL`, …); the head of `install.sh` lists
 them all. `PEEPHOLE_FRONT=direct|local|remote` answers what is in front of
 the trap. Without it, unattended installs keep what they did before: the
@@ -267,7 +266,8 @@ export under **Admin → Export**. Columns, weights and the two modes:
 pages: one address (or prefix) per line, requests of severity 3+ in the
 last 24 hours by default, with `?hours=`, `?min_severity=` and
 `?networks=1`. Recomputed at most once a minute. Exclusions: Tor exits,
-addresses a scanner refused as a verified crawler, cluster members'
+addresses a scanner refused as a verified crawler or research scanner
+([docs/scanners.md](scanners.md)), cluster members'
 addresses, this node's own addresses (with `scan.own_addresses`, e.g. its
 public address behind 1:1 NAT) and `scan.never_scan`. For nginx:
 
@@ -345,6 +345,13 @@ drives the counter-scan level:
 | 2 | automated reconnaissance | `scanner-ua`, `research-scanner`, `sensitive-path`, `path-scanner`, `ai-infra-probe`, `api-recon`, `proxy-probe`, `unusual-method`, `automation` |
 | 3 | exploit-adjacent | `form-interaction`, `write-method`, `xss`, `crlf-injection`, `webshell-probe`, `app-probe`, `cloud-infra-probe`, `credential-attack`, `mcp-probe`, `graphql-introspection`, `appliance-probe`, `iot-probe`, `inhuman-behavior` |
 | 4 | unambiguous exploit / post-exploitation | `sqli`, `rce`, `path-traversal`, `ssrf`, `ssti`, `nosqli`, `xxe`, `deserialization`, `webshell`, `mcp-abuse` |
+
+The counter-scan level is the weight, with one cap: a request whose labels
+only say someone looked (`probe`, `path-scanner`, `php-probe`) earns at
+most a level-1 scan, whatever its severity — a lone drive-by probe does
+not warrant a top-1000-port scan. Anything more specific scans at the
+weight, capped at 4. `severity` itself is not capped: it records what was
+seen.
 
 The `owasp` tag is a Top-10 2021 class (`A03:2021`) for payload families or
 an Automated Threat (`OAT-014`) for scanning behaviour. Tags are stored on

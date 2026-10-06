@@ -214,6 +214,9 @@ pub struct QueueMetrics {
     pub completed_24h: i64,
     /// Failed / timed-out jobs among `completed_24h`.
     pub failed_24h: i64,
+    /// Jobs refused in the last 24 h (never_scan, Tor exit, verified
+    /// crawler, …); the reason is on each job.
+    pub refused_24h: i64,
     pub timeouts_24h: i64,
     /// Jobs queued within the last [`DRAIN_WINDOW_HOURS`].
     pub arrivals_recent: i64,

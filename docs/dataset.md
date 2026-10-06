@@ -107,7 +107,7 @@ Treat them as weak labels, or re-label from `method`, `path`, `query`,
 | `labels` | list of string | Labels that matched: rule labels (`sqli`, `rce`, `path-traversal`, `ssrf`, `webshell`, `scanner-ua`, `ai-infra-probe`, … one family per file in `rules/`) and behavioural labels from code (`probe`, `path-scanner`, `form-interaction`, …); see the taxonomy in [operations.md](operations.md#classification-taxonomy) |
 | `owasp` | list of string | OWASP tags of the matching rules: a Top 10 2021 class (`A03:2021`) for payload families, an Automated Threat (`OAT-014`) for scanning behaviour. Behavioural labels carry none |
 | `severity` | int? | 0 (noise) to 4 (exploit attempt); the highest of the matching rules. Null on light rows |
-| `scan_level` | int? | Counter-scan level this request earned (0: none, 1 to 4) |
+| `scan_level` | int? | Counter-scan level this request earned (0: none, 1 to 4); weak tells alone (`probe`, `path-scanner`, `php-probe`) cap it at 1 whatever the severity |
 | `rules` | string? | Fingerprint of the rules that classified it, those built into the recording binary: SHA-256 (hex) over the `rules/*.toml` files, sorted by name, each as its name's and text's 8-byte big-endian length followed by the bytes. Rows with the same value were classified by the same rules, whatever the build; to see the rules, check out a commit whose `rules/` has that fingerprint (`peephole check-config` prints the start of a binary's). Null for claims, light rows and rows recorded before the column existed. It is what the recording node says it used, not a proof |
 | `fp_claim` | bool | The address filed a false-positive claim at some point (claim texts and e-mail addresses are never exported) |
 
@@ -144,7 +144,7 @@ service's documentation; an empty object means the service knew nothing.
 **`scans`**: every counter-scan of the address, oldest first.
 
 ```json
-[{"level": 2, "status": "done", "started_at": "…", "finished_at": "…",
+[{"uid": "…", "audit_of": null, "level": 2, "status": "done", "started_at": "…", "finished_at": "…",
   "node": "alice", "node_id": "…", "build": "…", "scanner": "carol", "os_guess": "Linux 5.x",
   "ports": [{"port": 22, "proto": "tcp", "state": "open", "service": "ssh", "product": "OpenSSH", "version": "9.6"}],
   "xml": "<?xml …>  the full nmap output"}]
@@ -154,6 +154,11 @@ service's documentation; an empty object means the service knew nothing.
 `node` queued it, `scanner` ran it. From level 2 the XML carries the
 source's SSH host keys, SSH algorithm lists and TLS certificates
 (`ssh-hostkey`, `ssh2-enum-algos`, `ssl-cert`).
+`uid` is the scan's identifier in the cluster. `audit_of` is set when the
+scan is an audit: the `uid` of the scan it checks. An audit is a scan run
+again by another scanner, not a counter-scan of its own; its `node` and
+`scanner` are the auditing node, and its `status` is its own (`done` once
+it finished), not that of the job it checks.
 
 **`fingerprints`**: browser fingerprints the trap page collected from this
 request (`request` rows only, usually empty: scanners rarely run

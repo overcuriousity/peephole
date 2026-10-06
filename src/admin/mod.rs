@@ -4,7 +4,9 @@ pub mod blocklist;
 pub mod cli;
 pub mod cluster;
 pub mod cluster_access;
+pub mod cluster_owner;
 pub mod countries;
+pub mod credits;
 pub mod decoys;
 pub mod error;
 pub mod limit;
@@ -17,6 +19,7 @@ pub mod scans;
 pub mod search;
 pub mod sse;
 pub mod system;
+pub mod target;
 pub mod views;
 
 use crate::config::Config;
@@ -43,8 +46,6 @@ pub struct AdminState {
     pub providers: crate::intel::Providers,
     /// Addresses the blocklist feed must leave out (members, own networks).
     pub safety: tokio::sync::Mutex<crate::scan::safety::Safety>,
-    /// How members' requests compare with this node's rules (Cluster pages).
-    pub rules_check: crate::store::stats::SwrCache<(), cluster::RulesCheck>,
     /// This node's tarpit, for System › Status; None without a trap here.
     pub tarpit: Option<Arc<crate::trap::tarpit::Tarpit>>,
 }
@@ -76,7 +77,6 @@ impl AdminState {
             pace,
             closing: None,
             providers: vec![],
-            rules_check: crate::store::stats::SwrCache::new(1),
             tarpit: None,
         }
     }
@@ -143,6 +143,8 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(lookup::routes())
         .merge(cluster::routes())
         .merge(cluster_access::routes())
+        .merge(cluster_owner::routes())
+        .merge(credits::routes())
         .fallback(error::not_found)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

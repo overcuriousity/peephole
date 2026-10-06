@@ -31,7 +31,7 @@
 #                              unattended cluster install)
 #   PEEPHOLE_CLUSTER_ADVERTISE host:port peers dial (omit for an outbound-only node)
 #   PEEPHOLE_JOIN_TOKEN        invite from an existing member; joined before the first start
-#   PEEPHOLE_REMOTE_CONFIG=1|0 let holders of this node's config key change its settings (cluster only)
+#   PEEPHOLE_REMOTE_CONFIG     ignored (config keys were replaced by the ownership key: peephole owner adopt)
 #   PEEPHOLE_NGINX=1|0 install and configure nginx (and, with the web role, a Let's Encrypt
 #                      certificate via certbot) after peephole is up (first install; default 0;
 #                      offered for the web role and for a trap behind a local proxy)
@@ -837,10 +837,6 @@ if [ "$upgrade" -ne 1 ]; then
         [ -n "$PUBLIC_ADDR" ] && advertise_example="host:port, e.g. ${PUBLIC_ADDR}:${PEEPHOLE_CLUSTER_LISTEN##*:}"
         prompt_optional PEEPHOLE_CLUSTER_ADVERTISE "Address other nodes dial (${advertise_example}; empty: outbound-only, this node dials its peers, which works)"
         prompt_optional PEEPHOLE_JOIN_TOKEN "Invite token from a member (empty to start a new cluster or join later)"
-        if [ "$INTERACTIVE" -eq 1 ] && [ -z "${PEEPHOLE_REMOTE_CONFIG:-}" ]; then
-            say $'\nRemote configuration: this node gets a config key. Whoever you give it to can change\nthis node\'s scan pace, rescan cooldown and roles from their own node. You can rotate the key at any time.\n'
-        fi
-        ask_yn PEEPHOLE_REMOTE_CONFIG "Allow holders of this node's config key to change its settings?" n
         toml_safe "$PEEPHOLE_CLUSTER_NAME"; toml_safe "$PEEPHOLE_CLUSTER_LISTEN"
         toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"; toml_safe "${PEEPHOLE_JOIN_TOKEN:-}"
     fi
@@ -965,7 +961,6 @@ mv -f "${INSTALL_BIN}.new" "$INSTALL_BIN"
 install -m 0644 "${src}/deploy/config.example.toml" "${CONFIG_DIR}/config.example.toml"
 
 # --- configuration (first install only) --------------------------------------
-CONFIG_KEY=""
 if [ "$upgrade" -eq 1 ]; then
     info "Existing config at ${CONFIG_FILE} left untouched"
 else
@@ -1098,11 +1093,6 @@ CONFIG
             else
                 echo "# No advertise address: outbound-only (this node dials its peers)."
             fi
-            if [ "$PEEPHOLE_REMOTE_CONFIG" = 1 ]; then
-                echo "remote_config = true   # holders of this node's config key may change pace, cooldown and roles"
-            else
-                echo "remote_config = false  # only this node's admin interface, CLI and this file change its settings"
-            fi
         fi
     } > "$new_config"
     "$INSTALL_BIN" check-config "$new_config" \
@@ -1130,9 +1120,6 @@ CONFIG
             else
                 warn "joining the cluster failed; retry with: peephole cluster join <token>"
             fi
-        fi
-        if [ "$PEEPHOLE_REMOTE_CONFIG" = 1 ]; then
-            CONFIG_KEY="$("$INSTALL_BIN" cluster config-key show "$CONFIG_FILE" 2>/dev/null || true)"
         fi
     fi
 fi
@@ -1447,14 +1434,8 @@ if grep -q '^\[cluster\]' "$CONFIG_FILE"; then
         echo "    Invite others with 'peephole cluster invite' (the invite is reusable; limit it with --uses or --ttl)."
     fi
     echo "    Join a cluster with 'peephole cluster join <token>'; leave with 'peephole cluster leave'."
-    if [ -n "$CONFIG_KEY" ]; then
-        echo "    Config key (give it only to operators who may change this node's pace, cooldown and roles):"
-        echo "      $CONFIG_KEY"
-        echo "    Withdraw it from everyone with 'peephole cluster config-key rotate'."
-    elif grep -q '^remote_config = true' "$CONFIG_FILE"; then
-        echo "    Config key: print it with 'peephole cluster config-key show' (give it only to operators"
-        echo "    who may change this node's pace, cooldown and roles)."
-    fi
+    echo "    Several nodes of your own: create one ownership key with 'peephole owner new' and enter it"
+    echo "    on each of the others with 'peephole owner adopt'; then manage them from Cluster › Ownership."
 fi
 if [ -n "$admin_listen" ]; then
     if [ "$NGINX_DONE" != 1 ]; then

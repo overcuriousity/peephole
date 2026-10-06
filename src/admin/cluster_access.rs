@@ -1,8 +1,7 @@
-//! Cluster › Access: who may join, who may configure this node, and
-//! joining or leaving.
+//! Cluster › Access: who may join, and joining or leaving.
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
-use crate::admin::cluster::{InviteView, KeyForm, back_to, invites, node};
+use crate::admin::cluster::{InviteView, back_to, invites, node};
 use crate::admin::error::{AppResult, render};
 use crate::admin::views::Chrome;
 use crate::cluster::invite;
@@ -10,7 +9,7 @@ use askama::Template;
 use axum::{
     Router,
     extract::{Form, State},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use std::sync::Arc;
@@ -24,8 +23,6 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/cluster/invite/revoke", post(revoke_invite))
         .route("/admin/cluster/join", post(join))
         .route("/admin/cluster/leave", post(leave))
-        .route("/admin/cluster/config-key/rotate", post(rotate_key))
-        .route("/admin/cluster/config-key/add", post(add_key))
 }
 
 #[derive(Template)]
@@ -35,29 +32,15 @@ struct AccessPage {
     /// A just-created invite, shown once.
     invite: Option<String>,
     invites: Vec<InviteView>,
-    /// This node's config key, when remote configuration is on.
-    config_key: Option<String>,
-    remote_config: bool,
     detached: bool,
 }
 
 async fn render_access(st: &AdminState, invite: Option<String>) -> AppResult<Html<String>> {
     let node = node(st)?;
-    let config_key = if node.cfg.remote_config {
-        Some(
-            crate::cluster::confkey::ensure(&node.store, node.id())
-                .await?
-                .encode(),
-        )
-    } else {
-        None
-    };
     render(&AccessPage {
         chrome: Chrome::new(true, "admin"),
         invite,
         invites: invites(node).await?,
-        config_key,
-        remote_config: node.cfg.remote_config,
         detached: node.detached().is_some(),
     })
 }
@@ -159,38 +142,4 @@ async fn leave(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<
         ),
         Err(e) => back_to(ACCESS, None, Some(format!("Leaving failed: {e:#}"))),
     })
-}
-
-async fn rotate_key(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
-    let node = node(&st)?;
-    if !node.cfg.remote_config {
-        return Ok(back_to(
-            ACCESS,
-            None,
-            Some("Remote configuration is off on this node; there is no key to rotate.".into()),
-        ));
-    }
-    crate::cluster::confkey::rotate(&node.store, node.id()).await?;
-    Ok(back_to(
-        ACCESS,
-        Some(
-            "Config key rotated. Everyone who held the old key can no longer configure this node."
-                .into(),
-        ),
-        None,
-    ))
-}
-
-async fn add_key(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-    Form(f): Form<KeyForm>,
-) -> AppResult<Response> {
-    let node = node(&st)?;
-    Ok(
-        match crate::cluster::confkey::add(&node.store, node.id(), &f.key).await {
-            Ok(id) => Redirect::to(&format!("/admin/cluster/node/{id}")).into_response(),
-            Err(e) => back_to(ACCESS, None, Some(format!("{e:#}"))),
-        },
-    )
 }

@@ -38,7 +38,7 @@ impl HostKeyRow {
     }
 }
 
-fn is_identity(kind: &str) -> bool {
+pub(crate) fn is_identity(kind: &str) -> bool {
     kind == SSH_HOSTKEY || kind == TLS_CERT
 }
 
