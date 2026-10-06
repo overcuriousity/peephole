@@ -118,13 +118,18 @@ membership changes and every 10 minutes:
   matches and the certificate verifies for the sender's id, the sender is a
   sibling; the receiver answers `OwnerHelloReply { cert }` with its own
   certificate, which the sender checks the same way.
-- Any other receiver does not answer.
+- Any other receiver answers `OwnerHelloReply` with an empty certificate.
+  The sender then knows the node is reachable and not a sibling, and
+  drops it from its siblings if it was one (a node that was released).
+  This tells the sender nothing that silence would not.
+- No answer at all (unreachable) changes nothing.
 
 The owner id never travels: the tag reveals it to nobody who does not have
 it already, and an Ed25519 signature does not give away the public key.
 
 Siblings are kept in a `siblings (node, cert, seen_at)` table and dropped
-when the member leaves, is pruned, or when this node's owner changes.
+when the member leaves, is pruned, answers that it is no sibling, or when
+this node's owner changes.
 
 What a third party can see: a member that relays the two messages learns
 that the two nodes answered each other, and every member sees nodes
@@ -259,10 +264,12 @@ changelog says so under "Changed" with the two commands to run.
 - A new node refuses an old node's `ConfigSet` with the message above.
 - Nothing here adds a replicated record kind.
 
-Plan-time check: confirm how `msg.rs` treats a `Msg` variant it cannot
-decode (dropped silently, or an error to the sender). If the sender sees an
-error for every `OwnerHello` to an old node, send hellos only to members
-whose `proto_max` is at least the version that introduces them.
+Checked for the plan: a node cannot decode a message body with a `Msg`
+variant it does not know (`Envelope::open` fails), so it can neither
+handle nor relay it, and the sender gets an error. `PROTO_VERSION`
+therefore goes to 3, and hellos and commands are sent only to members
+whose `proto_max` is at least 3. A command whose only route leads through
+an old member does not arrive; the page says the node did not answer.
 
 ## 9. Limits
 
