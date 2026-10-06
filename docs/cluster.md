@@ -33,6 +33,10 @@ peephole cluster leave                    # this node leaves; it keeps its data
 peephole owner new                        # an ownership key for your nodes; this node keeps it
 peephole owner adopt                      # on each other node of yours: reads the key from standard input
 peephole owner show                       # this node's owner and the nodes that share it
+peephole credits                          # this node's credits, by day
+peephole credits log                      # earned, spent, sent, received (7 days)
+peephole credits members                  # every member's balance and whether it earns here
+peephole credits send <node> <amount>     # send credits to a member
 ```
 
 Nodes talk HTTP/2 over mutual TLS with pinned Ed25519 keys on
@@ -134,6 +138,53 @@ can still belong together: they share an **ownership key**.
 
 Config keys (`cluster.remote_config`, `peephole cluster config-key`) are
 gone. `remote_config` in a config file is ignored.
+
+## Credits: lookups are paid with scans
+
+A lookup (Admin → Lookup) asks every provider the cluster reaches about one
+address. It is paid with **credits**, and credits are earned by the work
+the cluster asked for: completed counter-scans.
+
+- **Earning.** A completed scan pays its scanner 1 credit (levels 1, 2) or
+  2 (levels 3, 4) and the trap that queued the job a quarter of that. One
+  paid scan per address in 24 hours, 500 a day per node and role. A credit
+  can be used on the day it was earned and the 6 days after.
+- **What does not earn.** A scan run with your own `scan.level_argv`
+  (no scanner share at that level), a scan no request held on the judging
+  node backs, uptime, recorded requests, audits.
+- **Every node counts for itself**, from its own copy of the log. There is
+  no vote and no shared chain; `Cluster › Credits` shows this node's count
+  and says why a scan was not paid in full.
+- **Conformity.** A member earns on your node only while at least 98 % of
+  its newest 500 requests classify the same with your rules, and its scans
+  stand up to the audits you believe: those of your own nodes. A scanner
+  runs 5 % of the other nodes' fresh scans again (`[credits] audit_share`);
+  audits earn nothing.
+- **Prices** follow what the cluster earns and what it can serve: each
+  serving node computes one unit price an hour (a day's earnings buy a
+  day's lookups), halved while the scanners idle and doubled when they are
+  saturated. A keyed API costs 1 unit, Shodan InternetDB and GeoLite2 a
+  quarter, the Tor exit list nothing. Half of what you pay goes to the
+  node that answered, half is destroyed. Your own providers cost the same.
+- **Your budgets are safe.** Paid lookups take at most
+  `[enrichment] on_demand_share` (a fifth by default) of each API budget,
+  whatever happens to credits. A provider whose share ran out costs double
+  the next day.
+- **Known addresses.** A lookup shows everything the dataset holds on the
+  address. A provider answer under 24 hours old is shown instead of asking
+  again, free. An answer that was paid for is kept in the dataset when the
+  cluster has recorded the address (members can then infer who looked it
+  up); for an address nobody recorded nothing is written anywhere.
+- **Your nodes as one.** `Cluster › Ownership › Collect credits here`
+  makes one node of yours the collecting node: the others forward what
+  they earn and draw from it when a lookup needs more than they hold.
+- **Two histories.** A node that gives two members different entries at
+  one position of its log is found out with its next payment: its entries
+  carry seals over its log. Members that hold the proof show "showed two
+  histories"; that node's credits are void there for good.
+- **What this cannot do.** It cannot tell a recorded request nobody sent
+  from a real one, and it cannot stop one double spend per node key. See
+  the limits in `docs/superpowers/specs/2026-10-06-lookup-credits-design.md`.
 
 ## Things to know
 

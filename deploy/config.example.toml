@@ -185,6 +185,7 @@ tor_wait_hours = 6
 # per-level argv overrides below; {target} is NOT used — the target IP is
 # appended as the final argument. A script selector with spaces is one
 # element. Example:
+# A scanner that sets its own arguments for a level earns no scanner share for scans at that level (lookup credits).
 # [scan.level_argv]
 # 2 = ["-Pn", "-sS", "-sV", "-T3", "--top-ports", "2000"]
 # 3 = ["-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000", "--script", "(discovery or safe) and not (intrusive or broadcast or external or dos)"]

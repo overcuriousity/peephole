@@ -14,9 +14,27 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   its invites, have it leave, release it, and rotate the key (a node left
   out of a rotation is no longer yours). Each node lists the commands it
   received. See docs/cluster.md.
+- Lookup credits. Lookups are paid with credits earned by completed
+  counter-scans (scanner 1 or 2, the trap a quarter); every node computes
+  every balance from its own copy of the log. Prices follow the cluster's
+  earnings, lookup capacity and scanner load; half of a payment goes to
+  the node that answered, half is destroyed. A lookup shows everything the
+  dataset holds on the address, answers under 24 hours old come from the
+  dataset for free, and paid answers are kept for recorded addresses.
+  Scanners audit a share of each other's scans; a node that shows two
+  histories of its log is proven and marked. `Cluster › Credits`,
+  `peephole credits`, `[credits] audit_share`,
+  `[enrichment] on_demand_share`. See docs/cluster.md.
 
 ### Changed
 
+- **Breaking:** a member no longer serves 50 free API lookups a day to
+  every other member. Lookups in a cluster cost credits, your own
+  providers included; a standalone node is unchanged.
+- The Members table flags a member for its rules only when it does not
+  earn here (less than 98 % agreement); another rules fingerprint alone is
+  no issue.
+- Export: scans carry `uid` and `audit_of`.
 - **Breaking:** config keys are gone. `cluster.remote_config`,
   `peephole cluster config-key` and the config-key cards on Cluster ›
   Access no longer exist; `remote_config` in a config file is ignored with

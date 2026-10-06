@@ -144,7 +144,7 @@ service's documentation; an empty object means the service knew nothing.
 **`scans`**: every counter-scan of the address, oldest first.
 
 ```json
-[{"level": 2, "status": "done", "started_at": "…", "finished_at": "…",
+[{"uid": "…", "audit_of": null, "level": 2, "status": "done", "started_at": "…", "finished_at": "…",
   "node": "alice", "node_id": "…", "build": "…", "scanner": "carol", "os_guess": "Linux 5.x",
   "ports": [{"port": 22, "proto": "tcp", "state": "open", "service": "ssh", "product": "OpenSSH", "version": "9.6"}],
   "xml": "<?xml …>  the full nmap output"}]
@@ -154,6 +154,9 @@ service's documentation; an empty object means the service knew nothing.
 `node` queued it, `scanner` ran it. From level 2 the XML carries the
 source's SSH host keys, SSH algorithm lists and TLS certificates
 (`ssh-hostkey`, `ssh2-enum-algos`, `ssl-cert`).
+`uid` is the scan's identifier in the cluster. `audit_of` is set when the
+scan is an audit: the `uid` of the scan it checks. An audit is a scan run
+again by another scanner, not a counter-scan of its own.
 
 **`fingerprints`**: browser fingerprints the trap page collected from this
 request (`request` rows only, usually empty: scanners rarely run
