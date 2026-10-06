@@ -236,6 +236,18 @@ fn ms_of(ts: &str) -> Option<u64> {
 /// Scans read per look; a burst larger than this is read over several.
 const POLL_BATCH: i64 = 500;
 
+/// When the audit window of a scan starts: when it finished, but never
+/// before it arrived here. `finished_at` is the scanner's own word: left
+/// out, or dated back past the window, it would keep the scan from ever
+/// being audited. A date in the future counts as now.
+fn audit_from(finished: Option<u64>, arrived: Option<u64>, now: u64) -> Option<u64> {
+    let from = match (finished, arrived) {
+        (Some(f), Some(a)) => f.max(a),
+        (f, a) => f.or(a)?,
+    };
+    Some(from.min(now))
+}
+
 impl Picker {
     pub fn new(share: f64) -> Self {
         Self {
@@ -266,9 +278,19 @@ impl Picker {
         let top: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM scans")
             .fetch_one(pool)
             .await?;
-        let rows: Vec<(i64, String, String, String, i64, Option<String>)> = sqlx::query_as(
-            "SELECT s.id, s.uid, s.job_uid, i.ip, s.level, s.finished_at
+        type Row = (
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT s.id, s.uid, s.job_uid, i.ip, s.level, s.finished_at, l.received_at
              FROM scans s JOIN ips i ON i.id = s.ip_id
+             LEFT JOIN repl_log l ON l.uid = s.uid AND l.origin = s.origin
              WHERE s.id > ? AND s.id <= ? AND s.audit_of IS NULL AND s.uid IS NOT NULL
                AND s.job_uid IS NOT NULL AND s.origin IS NOT NULL AND s.origin != ?
              ORDER BY s.id LIMIT ?",
@@ -281,9 +303,13 @@ impl Picker {
         .await?;
         let all_read = rows.len() < POLL_BATCH as usize;
         let now = hlc::wall_ms();
-        for (id, scan_uid, job_uid, ip, level, finished_at) in rows {
+        for (id, scan_uid, job_uid, ip, level, finished_at, arrived) in rows {
             self.last_id = Some(id);
-            let Some(ended) = finished_at.as_deref().and_then(ms_of) else {
+            let Some(ended) = audit_from(
+                finished_at.as_deref().and_then(ms_of),
+                arrived.as_deref().and_then(ms_of),
+                now,
+            ) else {
                 continue;
             };
             let deadline_ms = ended + AUDIT_WINDOW_MS;
@@ -585,5 +611,23 @@ mod tests {
         assert!(p.take(&[]).is_none(), "the first look reads the late ones");
         p.poll(&store.pool, &me).await.unwrap();
         assert_eq!(p.take(&[]).unwrap().scan_uid, "fresh");
+    }
+
+    #[test]
+    fn the_audit_window_starts_no_earlier_than_the_scan_arrived() {
+        let (now, min) = (10_000_000u64, 60_000u64);
+        assert_eq!(
+            audit_from(Some(now - min), Some(now - 2 * min), now),
+            Some(now - min)
+        );
+        // Without a finish date, or one dated back an hour: from its arrival.
+        assert_eq!(audit_from(None, Some(now - min), now), Some(now - min));
+        assert_eq!(audit_from(Some(now - 60 * min), Some(now), now), Some(now));
+        assert_eq!(
+            audit_from(Some(now + 60 * min), Some(now), now),
+            Some(now),
+            "future"
+        );
+        assert_eq!(audit_from(None, None, now), None);
     }
 }
