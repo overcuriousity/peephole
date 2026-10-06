@@ -261,6 +261,11 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             cluster::confkey::ensure(&store, node.id()).await?;
         }
         cluster::remote::serve(node, settings.clone());
+        cluster::owner::fleet::serve(node);
+        tokio::spawn(cluster::owner::fleet::run(
+            node.clone(),
+            shutdown_rx.clone(),
+        ));
         cluster::confkey::serve(node, settings.clone());
         // Does nothing unless this node currently scans.
         tokio::spawn(scan::arbiter::takeover_loop(

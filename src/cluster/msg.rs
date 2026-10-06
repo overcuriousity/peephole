@@ -95,6 +95,17 @@ pub enum Msg {
         version: Option<u64>,
         error: Option<String>,
     },
+    /// Owned node → member: are you a node of my owner? `tag` is a hash
+    /// that only a node with the same owner id can recompute, `cert` the
+    /// sender's certificate.
+    OwnerHello {
+        tag: serde_bytes::ByteBuf,
+        cert: serde_bytes::ByteBuf,
+    },
+    /// The answerer's certificate; empty when it is no sibling.
+    OwnerHelloReply {
+        cert: serde_bytes::ByteBuf,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

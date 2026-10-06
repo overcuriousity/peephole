@@ -2,10 +2,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Highest protocol version this build speaks.
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 /// Lowest protocol version this build still speaks. Version 1 let any
 /// member revoke others and delete their records; it is not spoken.
 pub const PROTO_MIN: u32 = 2;
+/// First version that knows the owner messages (`OwnerHello`, `OwnerCmd`).
+/// A node cannot decode a message kind it does not know, so these go only
+/// to members that announce at least this version.
+pub const OWNER_PROTO: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Hello {

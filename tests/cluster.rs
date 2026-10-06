@@ -174,6 +174,7 @@ async fn boot_in(
             .unwrap();
     }
     cluster::remote::serve(&node, settings.clone());
+    cluster::owner::fleet::serve(&node);
     cluster::confkey::serve(&node, settings.clone());
     let workers = o.scanner.as_ref().map(|nmap| {
         tokio::spawn(peephole::scan::arbiter::takeover_loop(
@@ -3573,4 +3574,44 @@ async fn admin_page_shows_contributions_per_node() {
         row.contains(r#"<td class="num">3 · 100 %</td>"#),
         "writer's share: {row}"
     );
+}
+
+/// Nodes with one ownership key find each other; nobody else is a sibling,
+/// and a released node is dropped at the next round.
+#[tokio::test]
+async fn fleet_nodes_find_each_other_and_nobody_else() {
+    use peephole::cluster::owner::{self, fleet};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let (id, d) = new_node("d");
+    let na = boot(ia, &a, &[&b, &c, &d], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c, &d], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b, &d], DEFAULT).await;
+    let nd = boot(id, &d, &[&a, &b, &c], DEFAULT).await;
+    // a and b share a key, c has its own, d has none.
+    let k1 = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &k1, false).await.unwrap();
+    owner::create(&nc.store, c.id).await.unwrap();
+
+    eventually("a and b find each other", || async {
+        fleet::discover(&na.node).await.unwrap() == vec![b.id]
+            && fleet::siblings(&nb.store).await.unwrap() == vec![a.id]
+    })
+    .await;
+    eventually("c and d reach the others and find nobody", || async {
+        nc.live_members(Duration::from_secs(45)).len() == 4
+            && nd.live_members(Duration::from_secs(45)).len() == 4
+    })
+    .await;
+    assert!(fleet::discover(&nc.node).await.unwrap().is_empty());
+    assert!(fleet::discover(&nd.node).await.unwrap().is_empty());
+    assert!(fleet::siblings(&nd.store).await.unwrap().is_empty());
+
+    // b is released on its own console: a learns it at its next round.
+    owner::release(&nb.store).await.unwrap();
+    eventually("a drops b", || async {
+        fleet::discover(&na.node).await.unwrap().is_empty()
+    })
+    .await;
 }
