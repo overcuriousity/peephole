@@ -294,6 +294,11 @@ impl Settings {
                 all.merge(c);
             }
         }
+        // A single worker was valid before the minimum of 2; raise it so the
+        // other saved overrides are not thrown away with it.
+        if all.max_workers == Some(1) {
+            all.max_workers = Some(pace::MIN_WORKERS as u32);
+        }
         // Overrides are trusted like the TOML: no prerequisite check here.
         Ok(validate(s, &all, &Prereqs::default()).unwrap_or(s))
     }
@@ -586,6 +591,33 @@ mod tests {
             .await
             .unwrap();
         (s, store, dir)
+    }
+
+    /// A stored single worker (from before the minimum of 2) is raised to 2
+    /// on load; the other saved overrides, roles included, survive.
+    #[tokio::test]
+    async fn a_stored_single_worker_is_raised_and_other_overrides_survive() {
+        let (s, store, _d) = open("").await;
+        for (k, v) in [
+            (pace::KEY_WORKERS, "1"),
+            (pace::KEY_PER_HOUR, "11"),
+            (KEY_ROLE_SCANNER, "false"),
+        ] {
+            sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
+                .bind(k)
+                .bind(v)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        drop(s);
+        let loaded = Settings::load(&store, &cfg(""), Prereqs::default())
+            .await
+            .unwrap();
+        let snap = loaded.snapshot();
+        assert_eq!(snap.pace.max_workers, 2);
+        assert_eq!(snap.pace.max_scans_per_hour, 11);
+        assert!(!snap.roles.scanner);
     }
 
     #[tokio::test]
