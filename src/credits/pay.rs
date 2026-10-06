@@ -24,6 +24,12 @@ pub const SERVE_WAIT: Duration = Duration::from_secs(10);
 pub const FREE_PER_HOUR: usize = 60;
 /// Servers tried for one provider before giving up.
 const MAX_ROUNDS: usize = 3;
+/// A server that turns an offer down names its price; the asker offers it
+/// once more only up to this many times what the server announced. A
+/// price can move within an hour (earnings, load, surge), but the server
+/// names it alone: without a bound it could ask for the asker's whole
+/// balance, and the fleet's behind it.
+const RETRY_AT_MOST: Mc = 2;
 
 /// A node that could answer for a provider, and what it asks.
 #[derive(Debug, Clone, PartialEq)]
@@ -575,13 +581,19 @@ async fn ask_server(
         };
     }
     let first = offer_and_ask(node, own, ip, server, &names, total).await;
-    match first.price_mc {
+    match retry_price(total, first.price_mc, first.findings.is_empty()) {
         // Its price moved since its heartbeat: offer that, once.
-        Some(p) if first.findings.is_empty() && p as Mc > total => {
-            offer_and_ask(node, own, ip, server, &names, p as Mc).await
-        }
-        _ => first,
+        Some(p) => offer_and_ask(node, own, ip, server, &names, p).await,
+        None => first,
     }
+}
+
+/// What to offer a server that turned down `offered` naming `named`: its
+/// price when that is higher, but at most [`RETRY_AT_MOST`] times the
+/// offer. None: do not offer again (the next server is asked instead).
+fn retry_price(offered: Mc, named: Option<u32>, nothing_answered: bool) -> Option<Mc> {
+    let p = named? as Mc;
+    (nothing_answered && p > offered && p <= offered.saturating_mul(RETRY_AT_MOST)).then_some(p)
 }
 
 /// The asking side: for each provider in `wanted` that somebody serves,
@@ -651,6 +663,37 @@ mod tests {
         // everywhere, the server unpaid.
         assert!(!time_left(made(14 * min), now));
         assert!(!time_left(made(20 * min), now));
+    }
+
+    #[test]
+    fn a_named_price_is_offered_again_only_within_bounds() {
+        assert_eq!(retry_price(500, Some(800), true), Some(800));
+        assert_eq!(
+            retry_price(500, Some(1000), true),
+            Some(1000),
+            "twice is the most"
+        );
+        assert_eq!(
+            retry_price(500, Some(1001), true),
+            None,
+            "beyond: ask the next server"
+        );
+        assert_eq!(
+            retry_price(1, Some(10_000_000), true),
+            None,
+            "a balance named as price"
+        );
+        assert_eq!(
+            retry_price(500, Some(400), true),
+            None,
+            "lower: it declined for another reason"
+        );
+        assert_eq!(
+            retry_price(500, Some(800), false),
+            None,
+            "something was answered"
+        );
+        assert_eq!(retry_price(500, None, true), None);
     }
 
     fn q(provider: &str, server: u8, price_mc: u32) -> Quote {
