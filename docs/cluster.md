@@ -191,9 +191,37 @@ the cluster asked for: completed counter-scans.
   one position of its log is found out with its next payment: its entries
   carry seals over its log. Members that hold the proof show "showed two
   histories"; that node's credits are void there for good.
-- **What this cannot do.** It cannot tell a recorded request nobody sent
-  from a real one, and it cannot stop one double spend per node key. See
-  the limits in `docs/superpowers/specs/2026-10-06-lookup-credits-design.md`.
+- **What this cannot do.**
+  - It cannot tell a recorded request nobody sent from a real one. Honest
+    scanners then scan the address and the inventor earns the trap share
+    (at most 0.5 per address and day). `scan.trusted_origins` and blocking
+    are the answer.
+  - Invented scan results are caught only by audits, and only for sources
+    still reachable 30 minutes after the scan arrived.
+  - It cannot stop one double spend per node key: the second branch is
+    proven and the node's credits are void everywhere afterwards.
+  - Many node keys of one operator are bounded only by each server's
+    on-demand share, not per node.
+  - A server can take the price and not answer; you lose that lookup's
+    price, and the receipt is public. A server that declines and names a
+    higher price is offered it once, up to twice its announced price;
+    beyond that the next server is asked.
+  - Announced pace and lookup capacity are claims. Inflated ones lower
+    the price until the surge corrects it; blocked members are not
+    counted.
+  - A member that spent its credits and then stops earning here (its
+    rules agreement drops below 98 %) loses its earnings of the last 8
+    days in every node's count, and the servers it paid lose those
+    receipts with them, until it earns again.
+  - A receipt counts when it arrives late; if the lapsed offer was spent
+    again elsewhere, the second server is paid less (at most the first
+    server's price).
+  - A node that is trap and scanner and whose log lags the clock can date
+    a few days of scans at once, one time per node key.
+  - A sibling that was broken into can spend what your collecting node
+    holds (credits of at most 7 days); release it.
+  - Lookups of recorded addresses are visible to members, with a good
+    guess at who asked.
 
 ## Things to know
 
