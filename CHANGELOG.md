@@ -5,6 +5,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-06
+
 ### Changed
 
 - The wall's "When they knock" card is now "Heatmap" and always covers the
@@ -255,6 +257,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 First release.
 
+[0.5.1]: https://github.com/overcuriousity/peephole/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/overcuriousity/peephole/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/overcuriousity/peephole/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/overcuriousity/peephole/compare/v0.2.1...v0.3.0
