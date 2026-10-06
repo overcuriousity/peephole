@@ -25,8 +25,19 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   histories of its log is proven and marked. `Cluster › Credits`,
   `peephole credits`, `[credits] audit_share`,
   `[enrichment] on_demand_share`. See docs/cluster.md.
+- Verified research scanners (Censys, LeakIX, Shodan) are recognised by
+  forward-confirmed reverse DNS and never counter-scanned, like
+  search-engine crawlers; the Scans page links the day's refused jobs with
+  their reasons. See docs/scanners.md.
 
 ### Changed
+
+- A source whose requests only look — probe, path-scanner, php-probe and
+  nothing else — now earns at most a level-1 counter-scan, however often it
+  looked; severity is unchanged. Level 2 and up needs a specific rule hit.
+- webshell-probe knows the shell names the current spray waves use
+  (chosen, simple, adminfuns, dex, go, ccc, sm, ebkid,
+  this_is_a_new_hello_world).
 
 - **Breaking:** a member no longer serves 50 free API lookups a day to
   every other member. Lookups in a cluster cost credits, your own
