@@ -422,7 +422,7 @@ impl Source {
             {
                 continue;
             }
-            let grant = match node.request(arbiter, Msg::Claim, CLAIM_TIMEOUT).await {
+            let grant = match node.request(arbiter, Msg::Claim { exclude_levels: vec![] }, CLAIM_TIMEOUT).await {
                 Ok(Msg::ClaimReply { grant }) => grant,
                 Ok(_) => None,
                 Err(e) => {
