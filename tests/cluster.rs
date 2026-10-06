@@ -5677,21 +5677,39 @@ async fn a_members_page_says_whether_it_earns_here() {
     let members = text(&admin, format!("{base}/admin/cluster")).await;
     assert!(!members.contains("not earning here"));
 
-    // b showed two histories (marked as the seal check would).
-    sqlx::query("INSERT INTO forked (origin, seq, found_at) VALUES (?, 7, datetime('now'))")
-        .bind(&b.id.0[..])
-        .execute(&na.store.pool)
-        .await
-        .unwrap();
+    // b showed two histories (marked as the seal check would), proven by
+    // an entry of a's log (any signed entry stands in for the proof here).
+    sqlx::query(
+        "INSERT INTO forked (origin, seq, found_at, proof_origin, proof_seq)
+         VALUES (?, 7, datetime('now'), ?, 1)",
+    )
+    .bind(&b.id.0[..])
+    .bind(&a.id.0[..])
+    .execute(&na.store.pool)
+    .await
+    .unwrap();
     // The page reads a book of at most ten seconds ago: compute one now.
     peephole::credits::book_fresh(&na.node).await.unwrap();
-    let html = text(&admin, page).await;
+    let html = text(&admin, page.clone()).await;
     assert!(html.contains("showed two histories"), "{html}");
     assert!(html.contains(">no<") && html.contains("0.00"));
+    assert!(html.contains("Download the proof"), "{html}");
+    let proof = admin
+        .get(format!("{page}/fork-proof"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let entry: peephole::cluster::record::WireEntry =
+        peephole::cluster::rpc::cbor::decode(&proof).unwrap();
+    assert_eq!((entry.origin, entry.seq), (a.id, 1));
+    assert!(entry.verify(), "as its publisher signed it");
     let members = text(&admin, format!("{base}/admin/cluster")).await;
     assert!(
-        members.contains("not earning here: showed two histories"),
-        "{members}"
+        members.contains("showed two histories") && !members.contains("not earning here"),
+        "an issue of its own: {members}"
     );
 }
 

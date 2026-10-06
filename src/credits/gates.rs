@@ -116,6 +116,9 @@ pub fn rules_fail(a: &Agreement) -> bool {
 }
 
 /// What stands between a member and its earnings on this node.
+/// How a member that showed two histories is named, here and in issues.
+pub const FORKED: &str = "showed two histories";
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Standing {
     pub blocked: bool,
@@ -151,7 +154,7 @@ impl Standing {
             v.push("blocked on this node".to_string());
         }
         if let Some(seq) = self.forked {
-            v.push(format!("showed two histories (at entry {seq} of its log)"));
+            v.push(format!("{FORKED} (at entry {seq} of its log)"));
         }
         if let Some(a) = &self.rules {
             v.push(format!("rules: {}", a.summary()));

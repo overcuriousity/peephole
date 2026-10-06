@@ -24,6 +24,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/cluster/settings", post(set_own))
         .route("/admin/cluster/node/{key}", get(node_page).post(node_set))
         .route("/admin/cluster/node/{key}/owner", post(node_owner))
+        .route("/admin/cluster/node/{key}/fork-proof", get(fork_proof))
         .route("/admin/cluster/block", post(block))
         .route("/admin/cluster/unblock", post(unblock))
         .route("/admin/cluster/purge", post(purge))
@@ -102,8 +103,15 @@ impl MemberView {
         if let Some(s) = &self.skew {
             v.push(format!("clock {s}"));
         }
-        if !self.not_earning.is_empty() {
-            v.push(format!("not earning here: {}", self.not_earning.join("; ")));
+        // A fork is an issue of its own; the other reasons go together.
+        let (forked, rest): (Vec<&String>, Vec<&String>) = self
+            .not_earning
+            .iter()
+            .partition(|r| r.starts_with(crate::credits::gates::FORKED));
+        v.extend(forked.into_iter().cloned());
+        if !rest.is_empty() {
+            let rest: Vec<&str> = rest.into_iter().map(String::as_str).collect();
+            v.push(format!("not earning here: {}", rest.join("; ")));
         }
         if let Some(e) = self.error.as_ref().filter(|_| !self.incompatible) {
             v.push(e.clone());
@@ -999,6 +1007,8 @@ pub struct CreditsBlock {
     pub others: (u32, u32, u32),
     /// Where it showed two histories, and the proof if one is known.
     pub fork: Option<String>,
+    /// A proof is held here and can be downloaded.
+    pub fork_proof: bool,
 }
 
 async fn credits_block(node: &Node, id: NodeId) -> AppResult<CreditsBlock> {
@@ -1025,21 +1035,24 @@ async fn credits_block(node: &Node, id: NodeId) -> AppResult<CreditsBlock> {
         }
     }
     let members = node.members();
-    let fork = crate::cluster::seal::forked(&node.store.pool)
+    let forked = crate::cluster::seal::forked(&node.store.pool)
         .await?
         .into_iter()
-        .find(|f| f.origin == id)
-        .map(|f| match f.proof {
-            Some((by, seq)) => format!(
-                "two entries at position {} of its log; proof published by {} (entry {seq} of its log)",
-                f.seq,
-                members.get(&by).map_or_else(|| by.short(), |m| m.name.clone())
-            ),
-            None => format!(
-                "its seal at entry {} does not match its log as held here; no proof yet",
-                f.seq
-            ),
-        });
+        .find(|f| f.origin == id);
+    let fork_proof = forked.as_ref().is_some_and(|f| f.proof.is_some());
+    let fork = forked.map(|f| match f.proof {
+        Some((by, seq)) => format!(
+            "two entries at position {} of its log; proof published by {} (entry {seq} of its log)",
+            f.seq,
+            members
+                .get(&by)
+                .map_or_else(|| by.short(), |m| m.name.clone())
+        ),
+        None => format!(
+            "its seal at entry {} does not match its log as held here; no proof yet",
+            f.seq
+        ),
+    });
     Ok(CreditsBlock {
         balance: crate::credits::show(book.balance(&id)),
         earns: standing.earns_as_scanner(),
@@ -1047,6 +1060,7 @@ async fn credits_block(node: &Node, id: NodeId) -> AppResult<CreditsBlock> {
         counted,
         others,
         fork,
+        fork_proof,
     })
 }
 
@@ -1147,6 +1161,55 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
         contrib,
         remote,
     })
+}
+
+/// The proof that a member showed two histories: the `fork_proof` entry
+/// as its publisher signed it (CBOR, a `WireEntry` holding both of the
+/// member's entries), for anyone to check.
+async fn fork_proof(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> AppResult<Response> {
+    let node = node(&st)?;
+    let Ok(id) = NodeId::parse(&key) else {
+        return Err(AppError::NotFound);
+    };
+    let Some((by, seq)) = crate::cluster::seal::forked(&node.store.pool)
+        .await?
+        .into_iter()
+        .find(|f| f.origin == id)
+        .and_then(|f| f.proof)
+    else {
+        return Err(AppError::NotFound);
+    };
+    let mut conn = node
+        .store
+        .pool
+        .acquire()
+        .await
+        .map_err(anyhow::Error::from)?;
+    let Some(entry) = crate::cluster::repl::signed_entry(&mut conn, &by, seq).await? else {
+        return Err(AppError::NotFound);
+    };
+    let bytes = crate::cluster::rpc::cbor::encode(&entry)?;
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/cbor".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!(
+                    "attachment; filename=\"peephole-fork-proof-{}.cbor\"",
+                    id.short()
+                ),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 async fn node_page(
@@ -1502,7 +1565,8 @@ mod tests {
         assert_eq!(
             gated.issues(),
             [
-                "not earning here: rules: disagree on 12% of 500; showed two histories (at entry 7 of its log)"
+                "showed two histories (at entry 7 of its log)",
+                "not earning here: rules: disagree on 12% of 500",
             ]
         );
     }

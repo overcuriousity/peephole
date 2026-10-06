@@ -49,7 +49,7 @@
   <dl class="kv">
     <dt>Balance</dt><dd>{{ credits.balance }} <span class="muted small">credits, as this node counts them</span></dd>
     <dt>Earns here</dt><dd>{% if credits.earns %}<span class="badge badge-status" data-status="done">yes</span>{% else %}<span class="badge badge-status" data-status="failed">no</span>{% endif %}{% for r in credits.reasons %} <span class="small">{{ r }}{% if !loop.last %};{% endif %}</span>{% endfor %}</dd>
-    {% if let Some(f) = credits.fork %}<dt>Showed two histories</dt><dd>{{ f }}. <span class="muted small">Its credits are void here, for good.</span></dd>{% endif %}
+    {% if let Some(f) = credits.fork %}<dt>Showed two histories</dt><dd>{{ f }}.{% if credits.fork_proof %} <a href="/admin/cluster/node/{{ m.key }}/fork-proof">Download the proof</a>{% endif %} <span class="muted small">Its credits are void here, for good.</span></dd>{% endif %}
     <dt>Audits, 7 days</dt><dd>{{ credits.counted.0 }} agree · {{ credits.counted.1 }} differ · {{ credits.counted.2 }} inconclusive <span class="muted small">by this node and your other nodes: these count</span>{% if credits.others.0 + credits.others.1 + credits.others.2 > 0 %}<br>{{ credits.others.0 }} agree · {{ credits.others.1 }} differ · {{ credits.others.2 }} inconclusive <span class="muted small">by other members: shown, not counted</span>{% endif %}</dd>
   </dl>
 </section>
