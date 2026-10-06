@@ -96,9 +96,12 @@ nmap.
   protects everybody's real sites. Tor exits, verified crawlers, cluster
   members and the node's own networks are never listed. Every node
   documents its public endpoints at `/api` (linked in the footer).
-- **Lookup** (admin) — ask every provider the cluster can reach about one
-  address, now: this node's databases and keys first, then a member that
-  announces the missing provider. Shown once, never stored.
+- **Lookup** (admin) — everything the dataset holds on one address, and
+  every provider the cluster can reach about it, now. In a cluster,
+  lookups are paid with credits that completed counter-scans earn; an
+  answer under 24 hours old comes from the dataset for free, and paid
+  answers about recorded addresses are kept. On a standalone node, your
+  own providers, shown once.
 - **Cluster** — several operators can share one dataset over mutual TLS:
   requests, the scan queue, results and lookups. Each node runs any mix of
   trap, scanner and web roles and decides for itself whom it trusts. A node

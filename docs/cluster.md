@@ -36,8 +36,9 @@ peephole owner show                       # this node's owner and the nodes that
 peephole owner forget-key [--force]       # this node no longer keeps the key; it stays owned
 peephole owner release                    # this node has no owner afterwards
 peephole credits                          # this node's credits, by day
-peephole credits log                      # earned, spent, sent, received (7 days)
+peephole credits log [--days N]           # earned, spent, sent, received (up to 7 days)
 peephole credits members                  # every member's balance and whether it earns here
+peephole credits why <scan>               # how this node judged one scan, and what it paid
 peephole credits send <node> <amount>     # send credits to a member
 ```
 
@@ -265,13 +266,18 @@ the cluster asked for: completed counter-scans.
   and false-positive claims with their optional contact address. Every
   member can export the whole dataset (`peephole export`, or Admin →
   Export); see [docs/dataset.md](dataset.md).
-- **On-demand lookups.** Admin → Lookup asks every provider the cluster can
-  reach about one address: this node's own databases and keys first, then
-  one live member per provider nobody here serves, over the cluster RPC.
-  Nothing is stored anywhere. A member serves at most 50 API lookups a day
-  per asking node (GeoLite2 and the Tor list are free), so curiosity cannot
-  spend the budget the automatic enrichment runs on. An outbound-only
-  member cannot be asked.
+- **On-demand lookups.** Admin → Lookup shows first what the dataset
+  holds on the address (the same sections as its IP page; for an unknown
+  address, what is near it by network and ASN) and any provider answer
+  under 24 hours old, for free. The other providers are asked at the
+  member that offers each one cheapest, this node included, and paid in
+  credits (see Credits above). A member serves paid lookups only from
+  its on-demand share of each provider's budget (`[enrichment]
+  on_demand_share`), so curiosity cannot spend what the automatic
+  enrichment runs on. Paid answers for an address the cluster has
+  recorded are kept in the dataset; for any other address nothing is
+  stored. An outbound-only member, and one of an earlier version, cannot
+  be asked.
 - **The blocklist feed** of a web node (`/api/blocklist`) is drawn from
   the whole cluster's requests and never lists a member's addresses
   (published ones, and the ones members connect from).
