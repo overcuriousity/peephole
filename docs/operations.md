@@ -266,7 +266,8 @@ export under **Admin → Export**. Columns, weights and the two modes:
 pages: one address (or prefix) per line, requests of severity 3+ in the
 last 24 hours by default, with `?hours=`, `?min_severity=` and
 `?networks=1`. Recomputed at most once a minute. Exclusions: Tor exits,
-addresses a scanner refused as a verified crawler, cluster members'
+addresses a scanner refused as a verified crawler or research scanner
+([docs/scanners.md](scanners.md)), cluster members'
 addresses, this node's own addresses (with `scan.own_addresses`, e.g. its
 public address behind 1:1 NAT) and `scan.never_scan`. For nginx:
 
