@@ -252,7 +252,8 @@ mod tests {
             OwnerKey::generate().unwrap().id,
             OwnerKey::generate().unwrap().id,
         );
-        let (a, b) = (
+        let (a, b, c) = (
+            Identity::generate().unwrap().id,
             Identity::generate().unwrap().id,
             Identity::generate().unwrap().id,
         );
@@ -260,6 +261,8 @@ mod tests {
         assert_eq!(t, hello_tag(&o1, &a, &b));
         assert_ne!(t, hello_tag(&o2, &a, &b), "another owner");
         assert_ne!(t, hello_tag(&o1, &b, &a), "direction");
+        assert_ne!(t, hello_tag(&o1, &a, &c), "another receiver");
+        assert_ne!(t, hello_tag(&o1, &c, &b), "another sender");
     }
 
     #[test]

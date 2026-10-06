@@ -601,6 +601,13 @@ impl Config {
                 dir.display()
             ));
         }
+        if self.cluster.as_ref().is_some_and(|c| c.remote_config) {
+            notes.push(
+                "note: `cluster.remote_config` is ignored: config keys were replaced by the \
+                 ownership key (peephole owner new, peephole owner adopt); remove the key"
+                    .into(),
+            );
+        }
         notes
     }
 }
@@ -886,7 +893,8 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// A config file from before ownership still loads.
+    /// A config file from before ownership still loads, and says the key
+    /// does nothing.
     #[test]
     fn remote_config_is_still_accepted() {
         let cfg: Config = toml::from_str(
@@ -894,6 +902,13 @@ mod tests {
              [cluster]\nnode_name = \"n\"\nlisten = \"127.0.0.1:7443\"\nremote_config = true\n",
         )
         .unwrap();
+        let notes = cfg.obsolete_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("remote_config` is ignored")),
+            "{notes:?}"
+        );
         assert!(cfg.cluster.unwrap().remote_config);
     }
 

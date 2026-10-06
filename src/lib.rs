@@ -257,12 +257,6 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // RPC listener and sync loops.
     if let Some(node) = &node {
         scan::arbiter::Arbiter::start(node.clone(), shutdown_rx.clone()).await?;
-        if cfg.cluster.as_ref().is_some_and(|c| c.remote_config) {
-            tracing::warn!(
-                "cluster.remote_config is ignored: config keys were replaced by the ownership \
-                 key (peephole owner new, peephole owner adopt)"
-            );
-        }
         cluster::remote::serve(node, settings.clone());
         cluster::owner::fleet::serve(node);
         cluster::owner::cmd::serve(node, settings.clone());
