@@ -1,0 +1,256 @@
+//! Cluster › Ownership: this node's owner, the nodes that share it, and
+//! the owner commands this node received.
+use crate::admin::AdminState;
+use crate::admin::auth::SessionUser;
+use crate::admin::cluster::{MemberView, back_to, node, rules_check, views};
+use crate::admin::error::{AppResult, render};
+use crate::admin::views::Chrome;
+use crate::cluster::Node;
+use crate::cluster::owner::{self, OwnerKey, cmd, fleet};
+use askama::Template;
+use axum::{
+    Router,
+    extract::{Form, State},
+    response::{Html, IntoResponse, Response},
+    routing::{get, post},
+};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+const PAGE: &str = "/admin/cluster/ownership";
+
+pub fn routes() -> Router<Arc<AdminState>> {
+    Router::new()
+        .route(PAGE, get(page))
+        .route("/admin/cluster/ownership/create", post(create))
+        .route("/admin/cluster/ownership/adopt", post(adopt))
+        .route("/admin/cluster/ownership/forget-key", post(forget_key))
+        .route("/admin/cluster/ownership/release", post(release))
+        .route("/admin/cluster/ownership/show-key", post(show_key))
+        .route("/admin/cluster/ownership/rotate", post(rotate))
+        .route("/admin/cluster/ownership/retry", post(retry))
+        .route("/admin/cluster/ownership/discard", post(discard))
+}
+
+/// One of the operator's nodes.
+struct NodeRow {
+    key: String,
+    name: String,
+    short: String,
+    roles: String,
+    version: String,
+    seen: String,
+    is_self: bool,
+}
+
+/// One received command.
+struct LogView {
+    at: String,
+    from: String,
+    command: String,
+    result: String,
+}
+
+#[derive(Template)]
+#[template(path = "admin_cluster_ownership.html")]
+struct OwnershipPage {
+    chrome: Chrome,
+    /// The owner id, short; None: no owner.
+    owner: Option<String>,
+    /// This node keeps the key.
+    managing: bool,
+    /// The key itself: after creating or rotating it, or when asked for.
+    shown_key: Option<String>,
+    nodes: Vec<NodeRow>,
+    /// Names of nodes still on the previous key after a rotation.
+    pending: Vec<String>,
+    log: Vec<LogView>,
+}
+
+async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Html<String>> {
+    let node = node(st)?;
+    let owned = owner::load(&node.store, node.id()).await?;
+    let check = rules_check(st, node).await?;
+    let (me, members) = views(node, &check).await?;
+    let sibs: Vec<String> = fleet::siblings(&node.store)
+        .await?
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    let names: HashMap<String, String> = members
+        .iter()
+        .map(|m| (m.key.clone(), m.name.clone()))
+        .collect();
+    let row = |m: &MemberView| NodeRow {
+        key: m.key.clone(),
+        name: m.name.clone(),
+        short: m.short.clone(),
+        roles: m.roles.clone(),
+        version: m.version.clone(),
+        seen: m.last_seen.clone(),
+        is_self: m.is_self,
+    };
+    let mut nodes = vec![];
+    if owned.is_some() {
+        nodes.push(row(&me));
+        nodes.extend(members.iter().filter(|m| sibs.contains(&m.key)).map(row));
+    }
+    let pending = cmd::pending(&node.store)
+        .await?
+        .iter()
+        .map(|id| {
+            names
+                .get(&id.to_string())
+                .cloned()
+                .unwrap_or_else(|| id.short())
+        })
+        .collect();
+    let log = cmd::log_rows(&node.store, 50)
+        .await?
+        .into_iter()
+        .map(|r| LogView {
+            from: names
+                .get(&r.from.to_string())
+                .cloned()
+                .unwrap_or_else(|| r.from.short()),
+            at: r.at,
+            command: r.command,
+            result: r.result,
+        })
+        .collect();
+    render(&OwnershipPage {
+        chrome: Chrome::new(true, "admin"),
+        owner: owned.as_ref().map(|o| o.id.short()),
+        managing: owned.as_ref().is_some_and(|o| o.managing()),
+        shown_key,
+        nodes,
+        pending,
+        log,
+    })
+}
+
+async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
+    render_page(&st, None).await
+}
+
+/// Look for siblings now instead of at the loop's next tick.
+fn discover_soon(node: &Arc<Node>) {
+    let node = node.clone();
+    tokio::spawn(async move {
+        if let Err(e) = fleet::discover(&node).await {
+            tracing::debug!(?e, "sibling discovery failed");
+        }
+    });
+}
+
+/// Generate a key, make this node owned and managing, show the key once.
+async fn create(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
+    let node = node(&st)?;
+    if owner::load(&node.store, node.id()).await?.is_some() {
+        return Ok(back_to(
+            PAGE,
+            None,
+            Some("This node already has an owner. Release it first.".into()),
+        ));
+    }
+    let key = owner::create(&node.store, node.id()).await?;
+    Ok(render_page(&st, Some(key.encode())).await?.into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct AdoptForm {
+    key: String,
+    /// Ticked: this node keeps the key and manages the others.
+    keep: Option<String>,
+}
+
+async fn adopt(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Form(f): Form<AdoptForm>,
+) -> AppResult<Response> {
+    let node = node(&st)?;
+    let key = match OwnerKey::parse(&f.key) {
+        Ok(k) => k,
+        Err(e) => return Ok(back_to(PAGE, None, Some(format!("{e:#}")))),
+    };
+    owner::adopt(&node.store, node.id(), &key, f.keep.is_some()).await?;
+    discover_soon(node);
+    Ok(back_to(
+        PAGE,
+        Some(format!("This node is now owned by {}.", key.id.short())),
+        None,
+    ))
+}
+
+async fn forget_key(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
+    let node = node(&st)?;
+    Ok(if owner::forget_key(&node.store).await? {
+        back_to(
+            PAGE,
+            Some("The key is no longer kept on this node. It stays owned.".into()),
+            None,
+        )
+    } else {
+        back_to(PAGE, None, Some("No key was kept on this node.".into()))
+    })
+}
+
+async fn release(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
+    let node = node(&st)?;
+    Ok(if owner::release(&node.store).await? {
+        back_to(PAGE, Some("This node has no owner now.".into()), None)
+    } else {
+        back_to(PAGE, None, Some("This node had no owner.".into()))
+    })
+}
+
+async fn show_key(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
+    let node = node(&st)?;
+    Ok(match cmd::kept_key(node).await {
+        Ok(k) => render_page(&st, Some(k.encode())).await?.into_response(),
+        Err(e) => back_to(PAGE, None, Some(format!("{e:#}"))),
+    })
+}
+
+/// Replace the key on every node that answers, then here; show the new one.
+async fn rotate(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
+    let node = node(&st)?;
+    Ok(match cmd::rotate(node).await {
+        Ok(r) => render_page(&st, Some(r.key.encode()))
+            .await?
+            .into_response(),
+        Err(e) => back_to(PAGE, None, Some(format!("Not rotated: {e:#}"))),
+    })
+}
+
+async fn retry(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
+    let node = node(&st)?;
+    Ok(match cmd::retry(node).await {
+        Ok(results) => {
+            let failed = results.iter().filter(|(_, r)| r.is_err()).count();
+            back_to(
+                PAGE,
+                Some(format!(
+                    "{} node(s) moved to the new key, {failed} still on the previous one.",
+                    results.len() - failed
+                )),
+                None,
+            )
+        }
+        Err(e) => back_to(PAGE, None, Some(format!("{e:#}"))),
+    })
+}
+
+async fn discard(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
+    let node = node(&st)?;
+    cmd::discard(&node.store).await?;
+    Ok(back_to(
+        PAGE,
+        Some(
+            "The previous key is deleted. Nodes still on it are no longer yours until you adopt them again."
+                .into(),
+        ),
+        None,
+    ))
+}

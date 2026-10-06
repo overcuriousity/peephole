@@ -3933,3 +3933,125 @@ async fn rotating_the_key_moves_reachable_siblings_and_retries_the_rest() {
             .is_none()
     );
 }
+
+/// The Ownership page: create a key (shown once), adopt it on a second
+/// node, see that node listed, see received commands, forget and release.
+#[tokio::test]
+async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
+    use peephole::cluster::owner::{self, cmd, fleet};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let (admin_a, base_a) = admin_on(&na).await;
+    let (admin_b, base_b) = admin_on(&nb).await;
+    let page_a = format!("{base_a}/admin/cluster/ownership");
+    let page_b = format!("{base_b}/admin/cluster/ownership");
+
+    let html = text(&admin_a, page_a.clone()).await;
+    assert!(html.contains("No owner"), "{html}");
+    assert!(html.contains("Ownership</a>"), "the tab is there");
+
+    // Create: the key is on the answer, and nowhere afterwards.
+    let r = admin_a
+        .post(format!("{page_a}/create"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let html = r.text().await.unwrap();
+    let key = html
+        .split("peephole-own1:")
+        .nth(1)
+        .and_then(|s| s.split('<').next())
+        .map(|s| format!("peephole-own1:{}", s.trim()))
+        .expect("the key is shown");
+    let html = text(&admin_a, page_a.clone()).await;
+    assert!(!html.contains("peephole-own1:"), "shown once");
+    assert!(html.contains("key kept here"), "{html}");
+    // A second create does not replace the owner.
+    let before = owner::load(&na.store, a.id).await.unwrap().unwrap().id;
+    admin_a
+        .post(format!("{page_a}/create"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        owner::load(&na.store, a.id).await.unwrap().unwrap().id,
+        before
+    );
+
+    // On b: an invite token is not a key; the real key is adopted, not kept.
+    admin_b
+        .post(format!("{page_b}/adopt"))
+        .form(&[("key", "peephole1:abc")])
+        .send()
+        .await
+        .unwrap();
+    assert!(owner::load(&nb.store, b.id).await.unwrap().is_none());
+    let r = admin_b
+        .post(format!("{page_b}/adopt"))
+        .form(&[("key", key.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let html = text(&admin_b, page_b.clone()).await;
+    assert!(html.contains("key not kept here"), "{html}");
+
+    // a lists b under My nodes; b lists what a told it to do.
+    eventually("a finds b", || async {
+        fleet::discover(&na.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+    let html = text(&admin_a, page_a.clone()).await;
+    assert!(
+        html.contains("My nodes") && html.contains("node-bravo"),
+        "{html}"
+    );
+    let kept = cmd::kept_key(&na.node).await.unwrap();
+    cmd::run(
+        &na.node,
+        &kept,
+        b.id,
+        0,
+        cmd::OwnerCmd::Settings {
+            base_version: 0,
+            changes: peephole::settings::Changes {
+                cooldown_hours: Some(12),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let html = text(&admin_b, page_b.clone()).await;
+    assert!(
+        html.contains("Commands received") && html.contains("settings: cooldown=12h"),
+        "{html}"
+    );
+    assert!(html.contains("node-alpha"), "who sent it");
+
+    // Show key again, forget it, release b.
+    let r = admin_a
+        .post(format!("{page_a}/show-key"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.text().await.unwrap().contains(&key));
+    admin_a
+        .post(format!("{page_a}/forget-key"))
+        .send()
+        .await
+        .unwrap();
+    let html = text(&admin_a, page_a.clone()).await;
+    assert!(html.contains("key not kept here"), "{html}");
+    admin_b
+        .post(format!("{page_b}/release"))
+        .send()
+        .await
+        .unwrap();
+    let html = text(&admin_b, page_b).await;
+    assert!(html.contains("No owner"), "{html}");
+}

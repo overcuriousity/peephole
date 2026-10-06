@@ -275,6 +275,7 @@ pub fn link_href(kind: &str, value: &str) -> String {
 pub const CLUSTER_TABS: &[(&str, &str, &str)] = &[
     ("members", "/admin/cluster", "Members"),
     ("access", "/admin/cluster/access", "Access"),
+    ("ownership", "/admin/cluster/ownership", "Ownership"),
 ];
 pub const SYSTEM_TABS: &[(&str, &str, &str)] = &[
     ("status", "/admin/system", "Status"),

@@ -4,6 +4,7 @@ pub mod blocklist;
 pub mod cli;
 pub mod cluster;
 pub mod cluster_access;
+pub mod cluster_owner;
 pub mod countries;
 pub mod decoys;
 pub mod error;
@@ -143,6 +144,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(lookup::routes())
         .merge(cluster::routes())
         .merge(cluster_access::routes())
+        .merge(cluster_owner::routes())
         .fallback(error::not_found)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
