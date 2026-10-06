@@ -38,6 +38,19 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Changed
 
+- At most half of a node's workers run level-4 scans (`scan.level4_max_share`,
+  default 0.5); the rest keep shorter scans moving. Workers are now 0 (paused)
+  or at least 2; a saved 1 is raised to 2.
+- Level 4 sends at least `scan.min_rate` probes per second (default 300; lower
+  it behind a home router) with `--max-retries 1`, and `level4_timeout_factor`
+  defaults to 2.
+- The queue runs the job with the highest response ratio (time waited relative
+  to how long its level takes) instead of the highest level first.
+- Presets: level 1 runs at `-T3` with `--version-light`; levels 3 and 4 add
+  `--traceroute`; `scan.level4_udp` adds the top 50 UDP ports to level 4 (off
+  by default).
+- Cluster: claims name the levels a scanner cannot take; older nodes ignore
+  the field and interoperate.
 - Decoy version 2: renders every version 1 name unchanged plus the new
   ones. The Answer filter now matches any prefix. AI decoys skip the
   tarpit. An AI decoy that cannot be rendered falls back to the version 1

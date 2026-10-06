@@ -1,7 +1,6 @@
 # Scan scheduling: L4 share, minimum rate, response-ratio queue, presets
 
-Date: 2026-10-06 · Status: design approved in chat, spec under review.
-Ships on branch `ai-decoys` (PR #41); no separate PR.
+Date: 2026-10-06 · Status: implemented (branch `ai-decoys`, PR #41).
 
 ## Problem
 
