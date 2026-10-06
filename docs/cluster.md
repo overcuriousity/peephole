@@ -33,6 +33,8 @@ peephole cluster leave                    # this node leaves; it keeps its data
 peephole owner new                        # an ownership key for your nodes; this node keeps it
 peephole owner adopt                      # on each other node of yours: reads the key from standard input
 peephole owner show                       # this node's owner and the nodes that share it
+peephole owner forget-key [--force]       # this node no longer keeps the key; it stays owned
+peephole owner release                    # this node has no owner afterwards
 peephole credits                          # this node's credits, by day
 peephole credits log                      # earned, spent, sent, received (7 days)
 peephole credits members                  # every member's balance and whether it earns here
@@ -117,7 +119,11 @@ can still belong together: they share an **ownership key**.
   node is told, so a rotation that was cut short is finished from the same
   page with the same key. A rotation also removes the kept key from your
   other managing nodes: enter the new one there again if they should keep
-  managing.
+  managing. Until a rotation is finished, forgetting the key on that node
+  is refused (on the CLI: unless `--force`): the keys it keeps are the
+  only way to the nodes it has moved or not moved yet. A release, adoption
+  or forgotten key on the node itself while the rotation waits for the
+  others is not undone by it; the rotation then stops with an error.
 - **Putting a node out**: `Release` asks the node to drop its owner. A node
   that does not cooperate (it was broken into, or its certificate was
   copied) is put out by rotating the key and leaving it out in the rotate
