@@ -498,15 +498,21 @@ mod tests {
     async fn research_scanners_are_forward_confirmed() {
         // A Censys scanner host, confirmed: exempt like any crawler.
         assert_eq!(
-            check(Some("66-132-186-177.real.censys-scanner.com"), "198.51.100.9")
-                .await
-                .as_deref(),
+            check(
+                Some("66-132-186-177.real.censys-scanner.com"),
+                "198.51.100.9"
+            )
+            .await
+            .as_deref(),
             Some("66-132-186-177.real.censys-scanner.com")
         );
         // ... claiming the name from another IP: not a scanner.
         assert_eq!(
-            check(Some("66-132-186-177.real.censys-scanner.com"), "198.51.100.7")
-                .await,
+            check(
+                Some("66-132-186-177.real.censys-scanner.com"),
+                "198.51.100.7"
+            )
+            .await,
             None
         );
         // A lookalike zone: not a scanner domain at all.
@@ -522,7 +528,10 @@ mod tests {
         assert!(c.is_crawler_domain("177.186.132.66.censys-scanner.com."));
         assert!(c.is_crawler_domain("f20a02ce01.scan.leakix.org."));
         assert!(c.is_crawler_domain("census12.shodan.io."));
-        assert!(!c.is_crawler_domain("censys-scanner.com."), "the apex is no host");
+        assert!(
+            !c.is_crawler_domain("censys-scanner.com."),
+            "the apex is no host"
+        );
         assert!(!c.is_crawler_domain("evilcensys-scanner.com."));
         assert!(!c.is_crawler_domain("censys-scanner.com.attacker.net."));
         assert!(

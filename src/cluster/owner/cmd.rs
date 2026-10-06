@@ -529,7 +529,7 @@ async fn handle(
             .await;
             return refuse(current, why.into());
         }
-        Err(e) => return refuse(current, format!("{e:#}")),
+        Err(e) => return refuse(current, refused(format!("{e:#}"), true).await),
     }
     // Anything else may take long (a block walks the peer's records) and
     // does not touch the owner: the next command need not wait for it.
