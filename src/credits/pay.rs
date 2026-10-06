@@ -99,6 +99,30 @@ pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
     out
 }
 
+/// What an offer must have left of its 15 minutes to be served: the
+/// providers' time and some slack. A receipt written after the offer
+/// lapsed counts nowhere, so the server would answer unpaid.
+const SERVE_MARGIN_MS: u64 = 2 * 60 * 1000;
+
+/// Whether an offer dated `hlc` can still be charged when served `now_ms`.
+fn time_left(hlc: u64, now_ms: u64) -> bool {
+    now_ms + SERVE_MARGIN_MS <= crate::cluster::hlc::physical_ms(hlc) + super::OFFER_TTL_MS
+}
+
+/// Write a receipt of nothing for `peer`'s offer `offer_seq`: it frees
+/// what the offer held at once, on every node.
+async fn release(node: &Arc<Node>, peer: NodeId, offer_seq: u64) {
+    let receipt = Record::CreditReceipt {
+        payer: peer,
+        offer_seq,
+        charged_mc: 0,
+        answered: vec![],
+    };
+    if let Err(e) = repl::append(node, &[receipt]).await {
+        tracing::debug!(?e, "receipt not written");
+    }
+}
+
 /// The asker's entry `seq`, once it is held here (as a payment row).
 async fn wait_for(node: &Node, peer: &NodeId, seq: u64) -> Option<entries::Entry> {
     let until = tokio::time::Instant::now() + SERVE_WAIT;
@@ -215,12 +239,14 @@ pub async fn serve(
     match entry.seal {
         SealState::Consistent => {}
         SealState::Inconsistent => {
+            release(node, peer, offer_seq).await;
             return decline(
                 &served,
                 "the offer's seal does not match your node's log here".into(),
             );
         }
         _ => {
+            release(node, peer, offer_seq).await;
             return decline(
                 &served,
                 "the offer's seal could not be checked here yet; offer again".into(),
@@ -239,6 +265,7 @@ pub async fn serve(
     let book = match super::book_fresh(node).await {
         Ok(b) => b,
         Err(e) => {
+            release(node, peer, offer_seq).await;
             return decline(
                 &served,
                 format!("this node could not read its books: {e:#}"),
@@ -247,6 +274,7 @@ pub async fn serve(
     };
     let standing = book.standing(&peer);
     if standing.left_out() {
+        release(node, peer, offer_seq).await;
         return decline(
             &served,
             format!(
@@ -262,6 +290,13 @@ pub async fn serve(
         return decline(
             &served,
             "the offer is used up, or older than 15 minutes".into(),
+        );
+    }
+    if !time_left(offer.hlc, book.now_ms) {
+        release(node, peer, offer_seq).await;
+        return decline(
+            &served,
+            "the offer lapses before it could be charged; offer again".into(),
         );
     }
     let (offered, covered) = (offer.offered, offer.covered);
@@ -293,16 +328,7 @@ pub async fn serve(
     }
     let total: Mc = asking.iter().map(|n| price_of(n)).sum();
     let refuse = |why: String, price_mc: Option<u32>| async move {
-        // A receipt of nothing frees the asker's credits at once.
-        let receipt = Record::CreditReceipt {
-            payer: peer,
-            offer_seq,
-            charged_mc: 0,
-            answered: vec![],
-        };
-        if let Err(e) = repl::append(node, &[receipt]).await {
-            tracing::debug!(?e, "receipt not written");
-        }
+        release(node, peer, offer_seq).await;
         tracing::info!(asker = %peer.short(), %why, "paid lookup declined");
         (why, price_mc)
     };
@@ -476,11 +502,22 @@ pub async fn offer_and_ask(
             );
         }
         let call = node.call::<LookupReq, LookupResp>(server, &addr, "/rpc/v1/lookup", &req);
-        match tokio::time::timeout(crate::intel::lookup::RPC_TIMEOUT + SERVE_WAIT, call).await {
+        let r = match tokio::time::timeout(crate::intel::lookup::RPC_TIMEOUT + SERVE_WAIT, call)
+            .await
+        {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return decline(format!("could not be asked: {e:#}")),
             Err(_) => return decline("did not answer in time".into()),
+        };
+        // A declined offer comes with a receipt of nothing: fetch it, so
+        // what the offer held is free for the next one.
+        if r.findings.is_empty()
+            && r.charged_mc == 0
+            && let Err(e) = crate::cluster::sync::reconcile(node, server, &addr, false).await
+        {
+            tracing::debug!(?e, "sync after a declined offer failed");
         }
+        r
     };
     // Only what was asked for, and only from providers this build knows.
     resp.findings
@@ -595,6 +632,19 @@ pub async fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_offer_is_served_only_with_time_left_to_be_charged() {
+        let min = 60 * 1000;
+        let now = 1_000 * min;
+        let made = |ago: u64| (now - ago) << 16;
+        assert!(time_left(made(0), now));
+        assert!(time_left(made(10 * min), now));
+        // Its receipt would be written after the offer lapsed: ignored
+        // everywhere, the server unpaid.
+        assert!(!time_left(made(14 * min), now));
+        assert!(!time_left(made(20 * min), now));
+    }
 
     fn q(provider: &str, server: u8, price_mc: u32) -> Quote {
         Quote {

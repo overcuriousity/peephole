@@ -5512,3 +5512,71 @@ async fn the_overview_shows_the_clusters_credit_figures() {
     assert!(html.contains("0.40"), "the unit price: saturated, double");
     assert!(html.contains("Forks") && html.contains("Audits"));
 }
+
+/// A declined offer frees what it held before the asker offers again:
+/// the second offer needs credits the first one held.
+#[tokio::test]
+async fn a_declined_offer_frees_its_credits_for_the_next() {
+    use peephole::credits::{pay, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 1).await;
+    let cost = price::refresh(&nb.node)
+        .await
+        .unwrap()
+        .price_of("abuseipdb")
+        .unwrap() as u64;
+    assert!(cost > 1 && cost < 600, "{cost}");
+    price_seen(&na, b.id, "abuseipdb").await;
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.81".parse().unwrap();
+    let wanted = ["abuseipdb".to_string()];
+    let low = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, cost - 1).await;
+    assert_eq!(low.price_mc, Some(cost as u32), "{low:?}");
+    // 1250 held: cost - 1 by the first offer. This needs some of it back.
+    let more = 1250 - cost + 2;
+    let second = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, more).await;
+    assert_eq!(
+        (second.findings.len(), second.charged_mc as u64),
+        (1, cost),
+        "{second:?}"
+    );
+}
+
+/// An offer the server will not take for the asker's standing there is
+/// released at once: what it held is free again on the asker.
+#[tokio::test]
+async fn an_offer_declined_for_the_askers_standing_is_released() {
+    use peephole::credits::{self, pay, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 1).await;
+    let cost = price::refresh(&nb.node)
+        .await
+        .unwrap()
+        .price_of("abuseipdb")
+        .unwrap() as u64;
+    price_seen(&na, b.id, "abuseipdb").await;
+    sqlx::query("INSERT INTO forked (origin, seq, found_at) VALUES (?, 7, datetime('now'))")
+        .bind(&a.id.0[..])
+        .execute(&nb.store.pool)
+        .await
+        .unwrap();
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.82".parse().unwrap();
+    let wanted = ["abuseipdb".to_string()];
+    let r = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, cost).await;
+    assert!(
+        r.findings.is_empty() && r.declined[0].1.contains("not accepted here"),
+        "{r:?}"
+    );
+    let book = credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(book.ledger.held(&a.id), 0);
+    assert_eq!(book.balance(&a.id), 1250);
+}
