@@ -4000,15 +4000,16 @@ async fn admin_manages_a_sibling_from_its_page() {
     );
     assert_eq!(owner::counter(&na.store).await.unwrap().to_string(), mine);
 
-    // b stops answering: only the settings card says so.
+    // b stops answering: only the settings card says so. Its server
+    // shuts down in the background, so ask until it is gone.
     drop(nb);
-    let r = admin.get(b_page).send().await.unwrap();
-    assert_eq!(r.status(), 200);
-    let html = r.text().await.unwrap();
-    assert!(
-        html.contains("did not answer") && html.contains("Contributions"),
-        "{html}"
-    );
+    eventually("b's page says it did not answer", || async {
+        let r = admin.get(&b_page).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let html = r.text().await.unwrap();
+        html.contains("did not answer") && html.contains("Contributions")
+    })
+    .await;
 }
 
 /// On a node that does not keep the key, a sibling's page says so and
