@@ -68,7 +68,11 @@ fn command_line(raw_xml: Option<&[u8]>) -> Option<String> {
 /// Judge the payable scans that arrived at least `min_age_secs` ago and
 /// have no judgment yet. A scan is payable when its job is done by a
 /// scanner as its arbiter recorded it, and a result of that scanner for
-/// the job's address and level is held; the earliest one of a job counts.
+/// the job's address and level is held; the earliest one of a job counts,
+/// and is judged only while no earlier one of the job is held, so every
+/// node that holds both picks the same. A scan is dated no earlier than
+/// its job was queued: its own date is the scanner's word, and dating it
+/// back would slip it past the daily and per-address limits.
 /// Returns how many were judged.
 pub async fn judge(j: &Judge<'_>, min_age_secs: i64) -> Result<usize> {
     type Row = (
@@ -82,7 +86,8 @@ pub async fn judge(j: &Judge<'_>, min_age_secs: i64) -> Result<usize> {
         Option<Vec<u8>>,
     );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT s.uid, j.uid, i.ip, j.scanner, j.origin, s.hlc, j.level, s.raw_xml
+        "SELECT s.uid, j.uid, i.ip, j.scanner, j.origin, MAX(s.hlc, COALESCE(j.hlc, 0)),
+                j.level, s.raw_xml
          FROM scans s
          JOIN scan_jobs j ON j.uid = s.job_uid
          JOIN ips i ON i.id = s.ip_id
@@ -91,6 +96,10 @@ pub async fn judge(j: &Judge<'_>, min_age_secs: i64) -> Result<usize> {
            AND s.origin = j.scanner AND s.audit_of IS NULL AND s.ip_id = j.ip_id AND s.level = j.level
            AND l.received_at <= datetime('now', ?)
            AND NOT EXISTS (SELECT 1 FROM credit_scans c WHERE c.job_uid = j.uid)
+           AND NOT EXISTS (SELECT 1 FROM scans e
+                           WHERE e.job_uid = s.job_uid AND e.origin = s.origin
+                             AND e.audit_of IS NULL
+                             AND (e.hlc < s.hlc OR (e.hlc = s.hlc AND e.uid < s.uid)))
          ORDER BY s.hlc, s.uid LIMIT ?",
     )
     .bind(format!("-{} seconds", min_age_secs.max(0)))
@@ -579,6 +588,76 @@ mod tests {
         .await
         .unwrap();
         uid
+    }
+
+    /// A result of `job` by scanner 1, dated `hlc`, that arrived
+    /// `arrived` ago (an SQLite modifier like "-5 minutes").
+    async fn result_of(store: &Store, job: &str, uid: &str, seq: i64, hlc: i64, arrived: &str) {
+        sqlx::query(
+            "INSERT INTO scans (uid, origin, hlc, job_id, job_uid, ip_id, level, started_at)
+             SELECT ?, ?, ?, id, uid, ip_id, level, datetime('now') FROM scan_jobs WHERE uid = ?",
+        )
+        .bind(uid)
+        .bind(&id(1).0[..])
+        .bind(hlc)
+        .bind(job)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO repl_log (origin, seq, hlc, kind, uid, applied, received_at)
+             VALUES (?, ?, ?, 'scan_result', ?, 1, datetime('now', ?))",
+        )
+        .bind(&id(1).0[..])
+        .bind(seq)
+        .bind(hlc)
+        .bind(uid)
+        .bind(arrived)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scan_is_paid_no_earlier_than_its_job_and_the_earliest_result_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let now = (hlc::wall_ms() << 16) as i64;
+        let day = (DAY_MS << 16) as i64;
+        // Job 1, queued now; its result is dated two days back.
+        finished_scan(&store, "203.0.113.20", 1, "nmap", 20).await;
+        sqlx::query("UPDATE scan_jobs SET hlc = ? WHERE uid = 'job-20'")
+            .bind(now)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE scans SET hlc = ? WHERE uid = 'scan-20'")
+            .bind(now - 2 * day)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        // Job 2: a later result arrived first; the earlier one only now.
+        finished_scan(&store, "203.0.113.21", 1, "nmap", 21).await;
+        result_of(&store, "job-21", "scan-21-early", 50, 2, "-1 minutes").await;
+        let origins = guard::Origins::Any;
+        let j = Judge {
+            pool: &store.pool,
+            origins: &origins,
+            classifier: Classifier::builtin(),
+        };
+        assert_eq!(judge(&j, 120).await.unwrap(), 1);
+        let backdated = judged_one(&store.pool, "scan-20").await.unwrap().unwrap();
+        assert_eq!(backdated.hlc, now as u64, "paid as of its job");
+        assert_eq!(judged_one(&store.pool, "scan-21").await.unwrap(), None);
+        // Once the earlier result has been here long enough, it is the one.
+        assert_eq!(judge(&j, 30).await.unwrap(), 1);
+        assert!(
+            judged_one(&store.pool, "scan-21-early")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(judged_one(&store.pool, "scan-21").await.unwrap(), None);
     }
 
     #[tokio::test]
