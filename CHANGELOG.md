@@ -5,6 +5,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-06
+
 ### Added
 
 - AI decoys. The trap answers MCP and LLM-API probes instead of a 404, so
@@ -314,6 +316,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 First release.
 
+[0.6.0]: https://github.com/overcuriousity/peephole/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/overcuriousity/peephole/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/overcuriousity/peephole/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/overcuriousity/peephole/compare/v0.3.0...v0.4.0
