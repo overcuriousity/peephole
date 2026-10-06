@@ -18,7 +18,22 @@ const KEY_CERT: &str = "owner.cert";
 const KEY_SEED: &str = "owner.seed";
 /// The previous key after a rotation, while siblings are still on it.
 pub(crate) const KEY_OLD_SEED: &str = "owner.old_seed";
+/// The key a rotation is moving to, from before the first sibling is told
+/// until this node has switched: an interrupted rotation is finished with
+/// it, instead of leaving siblings on a key nobody holds.
+pub(crate) const KEY_NEXT_SEED: &str = "owner.next_seed";
 const KEY_COUNTER: &str = "owner.counter";
+
+/// What must not interleave on one node (see [`cmd`]).
+#[derive(Default)]
+pub struct Locks {
+    /// Owner commands are checked one at a time, and one that changes the
+    /// owner is also carried out before the next is looked at: a command
+    /// signed under the owner being replaced cannot slip in between.
+    pub(crate) commands: tokio::sync::Mutex<()>,
+    /// One rotation or retry at a time.
+    pub(crate) rotation: tokio::sync::Mutex<()>,
+}
 
 /// An owner: the public half of an ownership key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -195,6 +210,7 @@ async fn forget_fleet(conn: &mut sqlx::SqliteConnection) -> Result<()> {
         sqlx::query(sql).execute(&mut *conn).await?;
     }
     del(conn, KEY_OLD_SEED).await?;
+    del(conn, KEY_NEXT_SEED).await?;
     Ok(())
 }
 
@@ -267,11 +283,77 @@ pub async fn reown(store: &Store, me: NodeId, id: OwnerId, cert: &[u8]) -> Resul
     set_owner(store, &id, cert, None).await
 }
 
+/// A key stored beside the owner's (`owner.next_seed`, `owner.old_seed`).
+pub(crate) async fn stored_key(store: &Store, key: &str) -> Result<Option<OwnerKey>> {
+    let Some(seed) = get(store, key).await? else {
+        return Ok(None);
+    };
+    let seed: [u8; 32] = seed
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("stored {key}: wrong length"))?;
+    Ok(Some(OwnerKey::from_seed(seed)?))
+}
+
+/// Remember the key a rotation is about to move to.
+pub(crate) async fn store_next(store: &Store, key: &OwnerKey) -> Result<()> {
+    store
+        .setting_set(
+            KEY_NEXT_SEED,
+            &data_encoding::BASE64URL_NOPAD.encode(&key.seed()),
+        )
+        .await
+}
+
+/// Whether a rotation was started here and not finished.
+pub async fn rotation_unfinished(store: &Store) -> Result<bool> {
+    Ok(store.setting_get(KEY_NEXT_SEED).await?.is_some())
+}
+
+/// The last step of a rotation, all or nothing: this node takes `new`,
+/// counts the siblings that `moved` as its own again, and keeps `old` for
+/// the ones still `pending` on it.
+pub(crate) async fn switch_key(
+    store: &Store,
+    me: NodeId,
+    new: &OwnerKey,
+    old: &OwnerKey,
+    moved: &[NodeId],
+    pending: &[NodeId],
+) -> Result<()> {
+    let b64 = |b: &[u8]| data_encoding::BASE64URL_NOPAD.encode(b);
+    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    put(&mut tx, KEY_ID, &b64(&new.id.0)).await?;
+    put(&mut tx, KEY_CERT, &b64(&new.certify(&me))).await?;
+    put(&mut tx, KEY_SEED, &b64(&new.seed())).await?;
+    forget_fleet(&mut tx).await?;
+    for m in moved {
+        sqlx::query(
+            "INSERT OR REPLACE INTO siblings (node, cert, seen_at) VALUES (?, ?, datetime('now'))",
+        )
+        .bind(&m.0[..])
+        .bind(new.certify(m))
+        .execute(&mut *tx)
+        .await?;
+    }
+    if !pending.is_empty() {
+        put(&mut tx, KEY_OLD_SEED, &b64(&old.seed())).await?;
+        for p in pending {
+            sqlx::query("INSERT OR IGNORE INTO reown_pending (node) VALUES (?)")
+                .bind(&p.0[..])
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Delete the key here; the node stays owned. False: no key was kept.
 pub async fn forget_key(store: &Store) -> Result<bool> {
     let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
     let had = del(&mut tx, KEY_SEED).await?;
     del(&mut tx, KEY_OLD_SEED).await?;
+    del(&mut tx, KEY_NEXT_SEED).await?;
     sqlx::query("DELETE FROM reown_pending")
         .execute(&mut *tx)
         .await?;
@@ -299,11 +381,21 @@ pub async fn counter(store: &Store) -> Result<u64> {
         .unwrap_or(0))
 }
 
-/// Use up `expected` if it is the current counter. Never reset, not even
-/// when the owner changes: a reset would let an old command be replayed.
-pub async fn take_counter(store: &Store, expected: u64) -> Result<bool> {
+/// Use up `expected` if it is the current counter and `owner` is still
+/// this node's owner (the one the command was checked against; it may have
+/// changed since, on the node's own console). Never reset, not even when
+/// the owner changes: a reset would let an old command be replayed.
+pub async fn take_counter(store: &Store, expected: u64, owner: &OwnerId) -> Result<bool> {
     let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
-    let cur: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+    let read = "SELECT value FROM settings WHERE key = ?";
+    let id: Option<String> = sqlx::query_scalar(read)
+        .bind(KEY_ID)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if id.as_deref() != Some(data_encoding::BASE64URL_NOPAD.encode(&owner.0).as_str()) {
+        return Ok(false);
+    }
+    let cur: Option<String> = sqlx::query_scalar(read)
         .bind(KEY_COUNTER)
         .fetch_optional(&mut *tx)
         .await?;
@@ -395,6 +487,7 @@ mod tests {
             .await
             .unwrap();
         store.setting_set(KEY_OLD_SEED, "AAAA").await.unwrap();
+        store.setting_set(KEY_NEXT_SEED, "AAAA").await.unwrap();
 
         // Adopting with another key replaces the owner and forgets the fleet.
         let k2 = OwnerKey::generate().unwrap();
@@ -405,12 +498,14 @@ mod tests {
             !o.managing(),
             "the old owner's key is gone, the new one was not kept"
         );
+        assert!(store.setting_get(KEY_SEED).await.unwrap().is_none());
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM siblings")
             .fetch_one(&store.pool)
             .await
             .unwrap();
         assert_eq!(n, 0);
         assert!(store.setting_get(KEY_OLD_SEED).await.unwrap().is_none());
+        assert!(store.setting_get(KEY_NEXT_SEED).await.unwrap().is_none());
 
         // Reown needs a certificate for this node.
         let k3 = OwnerKey::generate().unwrap();
@@ -433,13 +528,25 @@ mod tests {
         let (store, _dir) = store().await;
         let me = Identity::generate().unwrap().id;
         assert_eq!(counter(&store).await.unwrap(), 0);
-        assert!(take_counter(&store, 0).await.unwrap());
-        assert!(!take_counter(&store, 0).await.unwrap(), "used");
-        assert!(!take_counter(&store, 5).await.unwrap(), "ahead");
+        let k1 = create(&store, me).await.unwrap();
+        assert!(take_counter(&store, 0, &k1.id).await.unwrap());
+        assert!(!take_counter(&store, 0, &k1.id).await.unwrap(), "used");
+        assert!(!take_counter(&store, 5, &k1.id).await.unwrap(), "ahead");
         assert_eq!(counter(&store).await.unwrap(), 1);
-        // A change of owner does not reset it.
-        create(&store, me).await.unwrap();
+        // A change of owner does not reset it, and a command that was
+        // checked against the previous owner no longer takes it.
+        let k2 = OwnerKey::generate().unwrap();
+        adopt(&store, me, &k2, false).await.unwrap();
+        assert_eq!(counter(&store).await.unwrap(), 1);
+        assert!(
+            !take_counter(&store, 1, &k1.id).await.unwrap(),
+            "owner changed"
+        );
+        assert_eq!(counter(&store).await.unwrap(), 1);
+        assert!(take_counter(&store, 1, &k2.id).await.unwrap());
+        // Nor does a release: without an owner nothing takes it.
         release(&store).await.unwrap();
-        assert_eq!(counter(&store).await.unwrap(), 1);
+        assert_eq!(counter(&store).await.unwrap(), 2);
+        assert!(!take_counter(&store, 2, &k2.id).await.unwrap(), "no owner");
     }
 }

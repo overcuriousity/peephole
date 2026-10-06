@@ -109,7 +109,19 @@ can still belong together: they share an **ownership key**.
 - **A leaked key**: rotate it on a managing node (Cluster › Ownership).
   Every node of yours that answers takes the new key; for the rest the page
   offers to retry. On a node you cannot reach that way, run
-  `peephole owner adopt` locally.
+  `peephole owner adopt` locally. The new key is stored before the first
+  node is told, so a rotation that was cut short is finished from the same
+  page with the same key. A rotation also removes the kept key from your
+  other managing nodes: enter the new one there again if they should keep
+  managing.
+- **Putting a node out**: `Release` asks the node to drop its owner. A node
+  that does not cooperate (it was broken into, or its certificate was
+  copied) is put out by rotating the key and leaving it out in the rotate
+  dialog: it stays on the old key and is counted by nobody afterwards.
+- A member that relays your commands cannot change, redirect or replay
+  them, but it sees them: the settings you send, a node's block list and
+  invite labels in its status, and the new owner's public half during a
+  rotation.
 - Whoever can log in to a node, or run the CLI on it, can always release it
   or give it another owner. Ownership adds a remote door; it does not lock
   the local one. Protecting the key and the nodes is the operator's job.

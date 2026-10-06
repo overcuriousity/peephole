@@ -147,6 +147,9 @@ Msg::OwnerReply { counter: u64, error: Option<String>, data: Option<OwnerData> }
 
 `sig` is the owner key's signature over
 `"peephole-owner-cmd-v1\0" ‖ sender id ‖ target id ‖ counter (u64, big endian) ‖ CBOR(cmd)`.
+`cmd` travels as those CBOR bytes and the target checks the signature over
+the bytes it received before it reads them, so a field a later version adds
+to a command does not break the signature on an earlier one.
 
 The target executes a command only when all of this holds:
 
@@ -209,6 +212,21 @@ node to send messages):
 4. Lists the siblings that did not answer. They stay on the old key. The
    old seed is kept under `owner.old_seed` until every sibling has moved or
    the admin discards it; the page keeps offering "Retry" for the rest.
+
+From the review of the implementation (2026-10-06):
+
+- The new key is stored (`owner.next_seed`) before the first `Reown` is
+  sent and this node switches in one transaction, so a rotation that is cut
+  short is finished with the same key instead of leaving siblings on a key
+  nobody holds. The page offers "Finish rotation" while that key exists.
+- The rotate dialog can leave siblings out. They stay on the old key and
+  are no siblings afterwards: this is how a node that does not cooperate
+  is put out (§9), since a hello with a valid old certificate would
+  otherwise get it a fresh one.
+- A second rotation, and forgetting the key in the web interface, are
+  refused while nodes are still pending or a rotation is unfinished.
+- A sibling that no longer takes the old key but answers under the new one
+  counts as moved (the answer to its `Reown` was lost).
 
 Rotation is the answer to a leaked key. A leaked key in the meantime lets
 its holder do everything in §4 to the owned nodes, including `Reown`: an

@@ -107,8 +107,19 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             }
         },
         "forget-key" => {
+            let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reown_pending")
+                .fetch_one(&store.pool)
+                .await?;
+            let unfinished = super::rotation_unfinished(&store).await?;
             if super::forget_key(&store).await? {
                 println!("the ownership key is no longer kept on this node; it stays owned");
+                if waiting > 0 || unfinished {
+                    eprintln!(
+                        "warning: a key rotation was not finished here ({waiting} node(s) still \
+                         on the previous key). The keys kept for it are deleted too; give those \
+                         nodes their owner again on the nodes themselves: peephole owner adopt"
+                    );
+                }
             } else {
                 println!("no ownership key was kept on this node");
             }

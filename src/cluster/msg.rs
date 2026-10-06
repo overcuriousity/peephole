@@ -106,11 +106,12 @@ pub enum Msg {
     OwnerHelloReply {
         cert: serde_bytes::ByteBuf,
     },
-    /// Managing node → sibling: do this. `sig` is the owner key's
-    /// signature over sender, target, `counter` and the command.
+    /// Managing node → sibling: do this. `cmd` is the encoded command
+    /// (`owner::cmd::OwnerCmd`), `sig` the owner key's signature over
+    /// sender, target, `counter` and those bytes.
     OwnerCmd {
         counter: u64,
-        cmd: super::owner::cmd::OwnerCmd,
+        cmd: serde_bytes::ByteBuf,
         sig: serde_bytes::ByteBuf,
     },
     /// `counter` is the node's counter after the command.

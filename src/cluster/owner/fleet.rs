@@ -1,7 +1,7 @@
 //! The fleet: the members that share this node's owner. They are found
 //! with a directed hello and kept in the `siblings` table. The rest of
-//! the cluster takes no part: the owner id never travels, and a node of
-//! another owner (or of none) only answers that it is no sibling.
+//! the cluster takes no part: a hello does not carry the owner id, and a
+//! node of another owner (or of none) only answers that it is no sibling.
 use super::{OwnerId, cert_valid, load};
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;

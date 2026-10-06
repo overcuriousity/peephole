@@ -6,6 +6,7 @@ use crate::admin::cluster::{MemberView, back_to, node, rules_check, views};
 use crate::admin::error::{AppResult, render};
 use crate::admin::views::Chrome;
 use crate::cluster::Node;
+use crate::cluster::identity::NodeId;
 use crate::cluster::owner::{self, OwnerKey, cmd, fleet};
 use askama::Template;
 use axum::{
@@ -64,6 +65,8 @@ struct OwnershipPage {
     nodes: Vec<NodeRow>,
     /// Names of nodes still on the previous key after a rotation.
     pending: Vec<String>,
+    /// A rotation was started here and cut short before this node switched.
+    unfinished: bool,
     log: Vec<LogView>,
 }
 
@@ -125,6 +128,7 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
         shown_key,
         nodes,
         pending,
+        unfinished: owner::rotation_unfinished(&node.store).await?,
         log,
     })
 }
@@ -185,6 +189,21 @@ async fn adopt(
 
 async fn forget_key(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
     let node = node(&st)?;
+    // The key kept here is the only way to the nodes a rotation has not
+    // moved yet (or has moved already, when it was cut short).
+    if owner::rotation_unfinished(&node.store).await?
+        || !cmd::pending(&node.store).await?.is_empty()
+    {
+        return Ok(back_to(
+            PAGE,
+            None,
+            Some(
+                "A key rotation is not finished: finish it, or retry or give up on the nodes \
+                 still on the previous key, before the key is forgotten here."
+                    .into(),
+            ),
+        ));
+    }
     Ok(if owner::forget_key(&node.store).await? {
         back_to(
             PAGE,
@@ -213,14 +232,29 @@ async fn show_key(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResu
     })
 }
 
-/// Replace the key on every node that answers, then here; show the new one.
-async fn rotate(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
-    let node = node(&st)?;
-    Ok(match cmd::rotate(node).await {
-        Ok(r) => render_page(&st, Some(r.key.encode()))
+/// Replace the key on every node that answers, then here; show the new
+/// one. `skip` fields name the nodes to leave on the old key.
+async fn rotate(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    body: axum::body::Bytes,
+) -> AppResult<Response> {
+    let node = node(&st)?.clone();
+    let leave_out: Vec<NodeId> = serde_urlencoded::from_bytes::<Vec<(String, String)>>(&body)
+        .unwrap_or_default()
+        .iter()
+        .filter(|(k, _)| k == "skip")
+        .filter_map(|(_, v)| NodeId::parse(v).ok())
+        .collect();
+    // In a task of its own: a rotation must not stop halfway because the
+    // browser went away.
+    let done = tokio::spawn(async move { cmd::rotate(&node, &leave_out).await }).await;
+    Ok(match done {
+        Ok(Ok(r)) => render_page(&st, Some(r.key.encode()))
             .await?
             .into_response(),
-        Err(e) => back_to(PAGE, None, Some(format!("Not rotated: {e:#}"))),
+        Ok(Err(e)) => back_to(PAGE, None, Some(format!("Not rotated: {e:#}"))),
+        Err(e) => back_to(PAGE, None, Some(format!("Not rotated: {e}"))),
     })
 }
 

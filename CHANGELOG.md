@@ -11,8 +11,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   `peephole owner adopt`, Cluster › Ownership). Your nodes find each other
   and are marked "yours"; from a node that keeps the key you change a
   sibling's pace, cooldown and roles, block and purge peers there, revoke
-  its invites, have it leave, release it, and rotate the key. Each node
-  lists the commands it received. See docs/cluster.md.
+  its invites, have it leave, release it, and rotate the key (a node left
+  out of a rotation is no longer yours). Each node lists the commands it
+  received. See docs/cluster.md.
 
 ### Changed
 

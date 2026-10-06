@@ -120,17 +120,29 @@ pub enum OwnerData {
     },
 }
 
-fn signing_bytes(from: &NodeId, to: &NodeId, counter: u64, cmd: &OwnerCmd) -> Vec<u8> {
+/// A command as it is signed and sent. The receiver checks the signature
+/// over the bytes it received and only then reads them, so a field a later
+/// version adds to a command does not break the signature here.
+pub fn encode(cmd: &OwnerCmd) -> Result<Vec<u8>> {
+    crate::cluster::rpc::cbor::encode(cmd)
+}
+
+/// None: a command this version does not know.
+fn decode(cmd: &[u8]) -> Option<OwnerCmd> {
+    crate::cluster::rpc::cbor::decode(cmd).ok()
+}
+
+fn signing_bytes(from: &NodeId, to: &NodeId, counter: u64, cmd: &[u8]) -> Vec<u8> {
     let mut m = CMD_DOMAIN.to_vec();
     m.extend_from_slice(&from.0);
     m.extend_from_slice(&to.0);
     m.extend_from_slice(&counter.to_be_bytes());
-    // Encoding a plain enum into a Vec cannot fail.
-    m.extend_from_slice(&crate::cluster::rpc::cbor::encode(cmd).unwrap_or_default());
+    m.extend_from_slice(cmd);
     m
 }
 
-pub fn sign(key: &OwnerKey, from: &NodeId, to: &NodeId, counter: u64, cmd: &OwnerCmd) -> Vec<u8> {
+/// `cmd`: the encoded command ([`encode`]).
+pub fn sign(key: &OwnerKey, from: &NodeId, to: &NodeId, counter: u64, cmd: &[u8]) -> Vec<u8> {
     key.sign(&signing_bytes(from, to, counter, cmd))
 }
 
@@ -139,7 +151,7 @@ pub fn verify(
     from: &NodeId,
     to: &NodeId,
     counter: u64,
-    cmd: &OwnerCmd,
+    cmd: &[u8],
     sig: &[u8],
 ) -> bool {
     owner.verify(&signing_bytes(from, to, counter, cmd), sig)
@@ -254,6 +266,19 @@ async fn execute(
                 return Err("a node is not told to block the node that manages it".into());
             }
             if *subtree {
+                // Looked up first: the block below would already cut this
+                // node off from the one that manages it.
+                let below = crate::cluster::members::subtree(&node.store, *peer, node.id())
+                    .await
+                    .map_err(err)?;
+                if below.contains(&from) {
+                    return Err(format!(
+                        "{} admitted the node that manages it (directly or not), and a node is \
+                         not told to block the node that manages it; block {} alone",
+                        peer.short(),
+                        peer.short()
+                    ));
+                }
                 let (ids, n) = crate::cluster::block::block_subtree(node, *peer)
                     .await
                     .map_err(err)?;
@@ -330,7 +355,7 @@ async fn handle(
     seen: &Refusals,
     from: NodeId,
     counter: u64,
-    cmd: OwnerCmd,
+    cmd: &[u8],
     sig: &[u8],
 ) -> Msg {
     let refuse = |counter: u64, e: String| Msg::OwnerReply {
@@ -338,18 +363,22 @@ async fn handle(
         error: Some(e),
         data: None,
     };
+    // One command at a time from here to the counter, and to the end for a
+    // command that changes the owner.
+    let turn = node.owner_locks.commands.lock().await;
     let owned = match super::load(&node.store, node.id()).await {
         Ok(Some(o)) => o,
         Ok(None) => return refuse(0, "this node has no owner".into()),
         Err(e) => return refuse(0, format!("{e:#}")),
     };
-    if !verify(&owned.id, &from, &node.id(), counter, &cmd, sig) {
+    if !verify(&owned.id, &from, &node.id(), counter, cmd, sig) {
         if may_log(seen, from) {
             tracing::warn!(by = %from.short(), "owner command with a wrong ownership key refused");
+            let what = decode(cmd).map_or_else(|| "unreadable command".into(), |c| c.describe());
             let _ = log(
                 &node.store,
                 &from,
-                &format!("(not verified) {}", cmd.describe()),
+                &format!("(not verified) {what}"),
                 "refused: the ownership key was not accepted",
             )
             .await;
@@ -357,7 +386,14 @@ async fn handle(
         return refuse(0, "the ownership key was not accepted".into());
     }
     let current = super::counter(&node.store).await.unwrap_or(0);
+    let Some(cmd) = decode(cmd) else {
+        return refuse(
+            current,
+            "this node does not know that command (it runs an earlier version)".into(),
+        );
+    };
     if cmd == OwnerCmd::Status {
+        drop(turn);
         return match status_of(node, settings).await {
             Ok(s) => Msg::OwnerReply {
                 counter: current,
@@ -368,7 +404,7 @@ async fn handle(
         };
     }
     // Used up before the command runs: a copy of it never runs again.
-    match super::take_counter(&node.store, counter).await {
+    match super::take_counter(&node.store, counter, &owned.id).await {
         Ok(true) => {}
         Ok(false) => {
             let why = "the node changed meanwhile; reload and try again";
@@ -383,7 +419,11 @@ async fn handle(
         }
         Err(e) => return refuse(current, format!("{e:#}")),
     }
+    // Anything else may take long (a block walks the peer's records) and
+    // does not touch the owner: the next command need not wait for it.
+    let turn = matches!(cmd, OwnerCmd::Reown { .. } | OwnerCmd::Release).then_some(turn);
     let result = execute(node, settings, from, &cmd).await;
+    drop(turn);
     let text = match &result {
         Ok(note) => note.clone(),
         Err(e) => format!("refused: {e}"),
@@ -411,7 +451,7 @@ pub fn serve(node: &Arc<Node>, settings: Settings) {
                 return None;
             };
             let node = weak.upgrade()?;
-            Some(handle(&node, &settings, &seen, from, counter, cmd, &sig).await)
+            Some(handle(&node, &settings, &seen, from, counter, &cmd, &sig).await)
         })
     }));
 }
@@ -435,22 +475,63 @@ fn speaks_owner(node: &Node, target: &NodeId) -> Result<()> {
     }
 }
 
-/// Ask `target` for its status, signed with `key`.
-pub async fn status(node: &Arc<Node>, key: &OwnerKey, target: NodeId) -> Result<Status> {
+/// Sign `cmd` with `key` for `target`'s counter `counter` and wait for the
+/// answer.
+async fn send(
+    node: &Arc<Node>,
+    key: &OwnerKey,
+    target: NodeId,
+    counter: u64,
+    cmd: &OwnerCmd,
+) -> Result<Msg> {
     speaks_owner(node, &target)?;
-    let cmd = OwnerCmd::Status;
-    let sig = sign(key, &node.id(), &target, 0, &cmd);
+    let bytes = encode(cmd)?;
+    let sig = sign(key, &node.id(), &target, counter, &bytes);
     let msg = Msg::OwnerCmd {
-        counter: 0,
-        cmd,
+        counter,
+        cmd: serde_bytes::ByteBuf::from(bytes),
         sig: serde_bytes::ByteBuf::from(sig),
     };
-    match node.request(target, msg, TIMEOUT).await? {
+    node.request(target, msg, TIMEOUT).await
+}
+
+/// The outer error: no answer; the inner one: the target's refusal.
+async fn ask_status(
+    node: &Arc<Node>,
+    key: &OwnerKey,
+    target: NodeId,
+) -> Result<Result<Status, String>> {
+    match send(node, key, target, 0, &OwnerCmd::Status).await? {
         Msg::OwnerReply {
             data: Some(OwnerData::Status(s)),
             ..
-        } => Ok(*s),
-        Msg::OwnerReply { error: Some(e), .. } => bail!("{e}"),
+        } => Ok(Ok(*s)),
+        Msg::OwnerReply { error: Some(e), .. } => Ok(Err(e)),
+        other => bail!("unexpected answer {other:?}"),
+    }
+}
+
+/// Ask `target` for its status, signed with `key`.
+pub async fn status(node: &Arc<Node>, key: &OwnerKey, target: NodeId) -> Result<Status> {
+    match ask_status(node, key, target).await? {
+        Ok(s) => Ok(s),
+        Err(e) => bail!("{e}"),
+    }
+}
+
+async fn command(
+    node: &Arc<Node>,
+    key: &OwnerKey,
+    target: NodeId,
+    counter: u64,
+    cmd: &OwnerCmd,
+) -> Result<Result<String, String>> {
+    match send(node, key, target, counter, cmd).await? {
+        Msg::OwnerReply { error: Some(e), .. } => Ok(Err(e)),
+        Msg::OwnerReply {
+            data: Some(OwnerData::Done { note }),
+            ..
+        } => Ok(Ok(note)),
         other => bail!("unexpected answer {other:?}"),
     }
 }
@@ -464,27 +545,12 @@ pub async fn run(
     counter: u64,
     cmd: OwnerCmd,
 ) -> Result<Result<String, String>> {
-    speaks_owner(node, &target)?;
     let leaves_fleet = matches!(cmd, OwnerCmd::Release | OwnerCmd::Reown { .. });
-    let sig = sign(key, &node.id(), &target, counter, &cmd);
-    let msg = Msg::OwnerCmd {
-        counter,
-        cmd,
-        sig: serde_bytes::ByteBuf::from(sig),
-    };
-    match node.request(target, msg, TIMEOUT).await? {
-        Msg::OwnerReply { error: Some(e), .. } => Ok(Err(e)),
-        Msg::OwnerReply {
-            data: Some(OwnerData::Done { note }),
-            ..
-        } => {
-            if leaves_fleet {
-                super::fleet::forget(&node.store, &target).await?;
-            }
-            Ok(Ok(note))
-        }
-        other => bail!("unexpected answer {other:?}"),
+    let answer = command(node, key, target, counter, &cmd).await?;
+    if leaves_fleet && answer.is_ok() {
+        super::fleet::forget(&node.store, &target).await?;
     }
+    Ok(answer)
 }
 
 /// What a key rotation did.
@@ -496,24 +562,33 @@ pub struct Rotation {
     pub pending: Vec<(NodeId, String)>,
 }
 
-/// Tell `target` (still under `signer`) to take `new` as its owner.
-async fn reown_one(
+/// Bring `target` from `old` to `new`. A node that no longer takes the old
+/// key but answers under the new one has moved already: in an attempt
+/// whose answer was lost, or one that was cut short.
+async fn move_one(
     node: &Arc<Node>,
-    signer: &OwnerKey,
+    old: &OwnerKey,
     new: &OwnerKey,
     target: NodeId,
 ) -> Result<(), String> {
-    let st = status(node, signer, target)
-        .await
-        .map_err(|e| format!("{e:#}"))?;
+    let text = |e: anyhow::Error| format!("{e:#}");
+    let st = match ask_status(node, old, target).await.map_err(text)? {
+        Ok(st) => st,
+        Err(refusal) => {
+            return match ask_status(node, new, target).await {
+                Ok(Ok(_)) => Ok(()),
+                _ => Err(refusal),
+            };
+        }
+    };
     let cmd = OwnerCmd::Reown {
         owner_id: serde_bytes::ByteBuf::from(new.id.0.to_vec()),
         cert: serde_bytes::ByteBuf::from(new.certify(&target)),
     };
-    match run(node, signer, target, st.counter, cmd).await {
+    match command(node, old, target, st.counter, &cmd).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(e),
-        Err(e) => Err(format!("{e:#}")),
+        Err(e) => Err(text(e)),
     }
 }
 
@@ -527,36 +602,54 @@ pub async fn pending(store: &Store) -> Result<Vec<NodeId>> {
 
 /// Replace the ownership key: every sibling that answers takes the new
 /// one, then this node does. The old key stays here for the rest (see
-/// [`retry`], [`discard`]).
-pub async fn rotate(node: &Arc<Node>) -> Result<Rotation> {
+/// [`retry`], [`discard`]). Siblings in `leave_out` are not told: they stay
+/// on the old key and are no siblings afterwards, which is how a node that
+/// does not cooperate is put out of the fleet.
+///
+/// The new key is stored before the first sibling is told, so a rotation
+/// that is cut short (the process stops, the caller goes away) is finished
+/// by calling this again: with the same key.
+pub async fn rotate(node: &Arc<Node>, leave_out: &[NodeId]) -> Result<Rotation> {
+    let _one = node.owner_locks.rotation.lock().await;
     let old = kept_key(node).await?;
-    let new = OwnerKey::generate()?;
+    if node.store.setting_get(super::KEY_OLD_SEED).await?.is_some()
+        || !pending(&node.store).await?.is_empty()
+    {
+        bail!(
+            "a rotation is still waiting for nodes on the previous key: retry or give up on \
+             them first"
+        );
+    }
+    let new = match super::stored_key(&node.store, super::KEY_NEXT_SEED).await? {
+        Some(k) => k,
+        None => {
+            let k = OwnerKey::generate()?;
+            super::store_next(&node.store, &k).await?;
+            k
+        }
+    };
+    // A sibling adopted minutes ago is known after one round.
+    if let Err(e) = super::fleet::discover(node).await {
+        tracing::debug!(?e, "sibling discovery before the rotation failed");
+    }
     let (mut moved, mut pending) = (vec![], vec![]);
     for s in super::fleet::siblings(&node.store).await? {
-        match reown_one(node, &old, &new, s).await {
+        if leave_out.contains(&s) {
+            continue;
+        }
+        match move_one(node, &old, &new, s).await {
             Ok(()) => moved.push(s),
             Err(e) => pending.push((s, e)),
         }
     }
-    // Forgets the siblings and any earlier rotation.
-    super::adopt(&node.store, node.id(), &new, true).await?;
-    for m in &moved {
-        super::fleet::remember(&node.store, m, &new.certify(m)).await?;
-    }
-    if !pending.is_empty() {
-        node.store
-            .setting_set(
-                super::KEY_OLD_SEED,
-                &data_encoding::BASE64URL_NOPAD.encode(&old.seed()),
-            )
-            .await?;
-        for (p, _) in &pending {
-            sqlx::query("INSERT OR IGNORE INTO reown_pending (node) VALUES (?)")
-                .bind(&p.0[..])
-                .execute(&node.store.pool)
-                .await?;
-        }
-    }
+    let waiting: Vec<NodeId> = pending.iter().map(|(p, _)| *p).collect();
+    super::switch_key(&node.store, node.id(), &new, &old, &moved, &waiting).await?;
+    tracing::info!(
+        owner = %new.id.short(),
+        moved = moved.len(),
+        pending = waiting.len(),
+        "ownership key rotated"
+    );
     Ok(Rotation {
         key: new,
         moved,
@@ -567,19 +660,14 @@ pub async fn rotate(node: &Arc<Node>) -> Result<Rotation> {
 /// Try again to move the siblings a rotation did not reach. When none is
 /// left, the old key is deleted.
 pub async fn retry(node: &Arc<Node>) -> Result<Vec<(NodeId, Result<(), String>)>> {
+    let _one = node.owner_locks.rotation.lock().await;
     let new = kept_key(node).await?;
-    let Some(old) = node.store.setting_get(super::KEY_OLD_SEED).await? else {
+    let Some(old) = super::stored_key(&node.store, super::KEY_OLD_SEED).await? else {
         bail!("no rotation is waiting for siblings");
     };
-    let seed: [u8; 32] = data_encoding::BASE64URL_NOPAD
-        .decode(old.as_bytes())
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| anyhow::anyhow!("the stored previous key is unreadable"))?;
-    let old = OwnerKey::from_seed(seed)?;
     let mut out = vec![];
     for p in pending(&node.store).await? {
-        let r = reown_one(node, &old, &new, p).await;
+        let r = move_one(node, &old, &new, p).await;
         if r.is_ok() {
             sqlx::query("DELETE FROM reown_pending WHERE node = ?")
                 .bind(&p.0[..])
@@ -625,15 +713,82 @@ mod tests {
                 ..Default::default()
             },
         };
-        let sig = sign(&k, &a, &b, 7, &cmd);
-        assert!(verify(&k.id, &a, &b, 7, &cmd, &sig));
-        assert!(!verify(&other.id, &a, &b, 7, &cmd, &sig), "another owner");
-        assert!(!verify(&k.id, &b, &a, 7, &cmd, &sig), "direction");
-        assert!(!verify(&k.id, &a, &b, 8, &cmd, &sig), "counter");
-        assert!(
-            !verify(&k.id, &a, &b, 7, &OwnerCmd::Status, &sig),
-            "command"
+        let (c, bytes) = (Identity::generate().unwrap().id, encode(&cmd).unwrap());
+        let sig = sign(&k, &a, &b, 7, &bytes);
+        assert!(verify(&k.id, &a, &b, 7, &bytes, &sig));
+        assert!(!verify(&other.id, &a, &b, 7, &bytes, &sig), "another owner");
+        assert!(!verify(&k.id, &c, &b, 7, &bytes, &sig), "another sender");
+        assert!(!verify(&k.id, &a, &c, 7, &bytes, &sig), "another target");
+        assert!(!verify(&k.id, &b, &a, 7, &bytes, &sig), "direction");
+        assert!(!verify(&k.id, &a, &b, 8, &bytes, &sig), "counter");
+        let status = encode(&OwnerCmd::Status).unwrap();
+        assert!(!verify(&k.id, &a, &b, 7, &status, &sig), "command");
+    }
+
+    /// A later version may add a field to a command. The signature is
+    /// checked over the bytes as sent, so such a command still verifies
+    /// here and is read without the field.
+    #[test]
+    fn a_command_with_a_field_of_a_later_version_still_verifies() {
+        #[derive(Serialize)]
+        struct LaterChanges {
+            max_workers: Option<u32>,
+            collect_to: Option<String>,
+        }
+        #[derive(Serialize)]
+        #[serde(tag = "c", rename_all = "snake_case")]
+        enum Later {
+            Settings {
+                base_version: u64,
+                changes: LaterChanges,
+            },
+            SendCredits {
+                mc: u32,
+            },
+        }
+        let enc = |c: &Later| crate::cluster::rpc::cbor::encode(c).unwrap();
+        let k = OwnerKey::generate().unwrap();
+        let (a, b) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
         );
+        let bytes = enc(&Later::Settings {
+            base_version: 4,
+            changes: LaterChanges {
+                max_workers: Some(3),
+                collect_to: Some("x".into()),
+            },
+        });
+        let sig = sign(&k, &a, &b, 7, &bytes);
+        assert!(verify(&k.id, &a, &b, 7, &bytes, &sig));
+        let read = decode(&bytes).expect("read without the field");
+        let known = OwnerCmd::Settings {
+            base_version: 4,
+            changes: Changes {
+                max_workers: Some(3),
+                ..Default::default()
+            },
+        };
+        assert_eq!(read, known);
+        // Encoding what was read gives other bytes: a check over those
+        // would refuse the command as signed with a wrong key.
+        assert_ne!(encode(&read).unwrap(), bytes);
+        // A kind of command this version does not know is not read.
+        assert!(decode(&enc(&Later::SendCredits { mc: 1 })).is_none());
+    }
+
+    #[test]
+    fn bad_signatures_are_logged_ten_times_an_hour_per_sender() {
+        let seen: Refusals = Default::default();
+        let (a, b) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        );
+        for _ in 0..BAD_SIGNATURES_LOGGED {
+            assert!(may_log(&seen, a));
+        }
+        assert!(!may_log(&seen, a));
+        assert!(may_log(&seen, b), "counted per sender");
     }
 
     #[test]

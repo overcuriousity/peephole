@@ -3569,7 +3569,7 @@ async fn rotating_the_key_moves_reachable_siblings_and_retries_the_rest() {
         .await
         .unwrap();
 
-    let rot = cmd::rotate(&na.node).await.unwrap();
+    let rot = cmd::rotate(&na.node, &[]).await.unwrap();
     assert_eq!(rot.moved, vec![b.id]);
     assert_eq!(rot.pending.len(), 1);
     assert_eq!(rot.pending[0].0, c.id);
@@ -3582,6 +3582,36 @@ async fn rotating_the_key_moves_reachable_siblings_and_retries_the_rest() {
         rot.key.id
     );
     assert_eq!(fleet::siblings(&na.store).await.unwrap(), vec![b.id]);
+    assert_eq!(cmd::pending(&na.store).await.unwrap(), vec![c.id]);
+    // A second rotation would forget c and the key it is still on: refused
+    // while c is pending.
+    let e = cmd::rotate(&na.node, &[])
+        .await
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(e.contains("retry or give up"), "{e}");
+    assert_eq!(cmd::pending(&na.store).await.unwrap(), vec![c.id]);
+    assert_eq!(
+        owner::load(&nb.store, b.id).await.unwrap().unwrap().id,
+        rot.key.id,
+        "b was not moved again"
+    );
+    // Forgetting the key now would strand c on the old one: the page refuses.
+    let (admin, base) = admin_on(&na).await;
+    let r = admin
+        .post(format!("{base}/admin/cluster/ownership/forget-key"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert!(
+        owner::load(&na.store, a.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .managing()
+    );
     assert_eq!(cmd::pending(&na.store).await.unwrap(), vec![c.id]);
     // b no longer takes the old key.
     let e = cmd::run(&na.node, &old, b.id, 0, OwnerCmd::Leave)
@@ -3599,6 +3629,13 @@ async fn rotating_the_key_moves_reachable_siblings_and_retries_the_rest() {
     peephole::cluster::block::unblock(&na.node, c.id)
         .await
         .unwrap();
+    // Until it is moved, c does not take the new key.
+    eventually_for(Duration::from_secs(40), "c refuses the new key", || async {
+        cmd::status(&na.node, &rot.key, c.id)
+            .await
+            .is_err_and(|e| e.to_string().contains("not accepted"))
+    })
+    .await;
     eventually_for(Duration::from_secs(40), "the retry moves c", || async {
         cmd::retry(&na.node)
             .await
@@ -3997,4 +4034,168 @@ async fn a_node_without_the_key_shows_its_siblings_read_only() {
     assert_eq!(owner::counter(&na.store).await.unwrap(), 0);
     assert_eq!(na.settings.snapshot().version, 0);
     assert!(knows(&nb, a.id, true).await);
+}
+
+/// A subtree block that would take in the managing node is refused: the
+/// owner cannot lock itself out of a node from afar.
+#[tokio::test]
+async fn a_subtree_block_never_includes_the_managing_node() {
+    use peephole::cluster::owner::{self, cmd, cmd::OwnerCmd, fleet};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let _nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    eventually("a finds b", || async {
+        fleet::discover(&na.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+    // c vouched for a (its config peer), so a is in c's subtree as b sees it.
+    eventually("b knows that c admitted a", || async {
+        members::subtree(&nb.store, c.id, b.id)
+            .await
+            .unwrap()
+            .contains(&a.id)
+    })
+    .await;
+    let st = cmd::status(&na.node, &key, b.id).await.unwrap();
+    let all = OwnerCmd::Block {
+        node: c.id,
+        subtree: true,
+    };
+    let e = cmd::run(&na.node, &key, b.id, st.counter, all)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("manages it"), "{e}");
+    assert!(!nb.is_blocked(&a.id) && !nb.is_blocked(&c.id));
+    // b still answers a.
+    cmd::status(&na.node, &key, b.id).await.unwrap();
+}
+
+/// A rotation that is cut short (the browser went away, the process was
+/// stopped) does not lose the new key: siblings that already took it are
+/// not left with an owner nobody holds, and finishing uses the same key.
+#[tokio::test]
+async fn an_interrupted_rotation_is_finished_with_the_same_key() {
+    use peephole::cluster::owner::{self, cmd, fleet};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let old = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &old, false).await.unwrap();
+    owner::adopt(&nc.store, c.id, &old, false).await.unwrap();
+    eventually("a finds b and c", || async {
+        fleet::discover(&na.node).await.unwrap().len() == 2
+    })
+    .await;
+    // Siblings are asked in the order of their ids: the first one moves,
+    // the second one does not answer (a drops what a blocked peer says).
+    let (first, n_first, last) = if b.id < c.id {
+        (b.id, &nb, c.id)
+    } else {
+        (c.id, &nc, b.id)
+    };
+    peephole::cluster::block::block(&na.node, last)
+        .await
+        .unwrap();
+    let cut = tokio::time::timeout(Duration::from_secs(5), cmd::rotate(&na.node, &[])).await;
+    assert!(cut.is_err(), "still waiting for the silent sibling");
+    let moved_to = owner::load(&n_first.store, first)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    assert_ne!(
+        moved_to, old.id,
+        "the first sibling already took the new key"
+    );
+    assert_eq!(
+        owner::load(&na.store, a.id).await.unwrap().unwrap().id,
+        old.id,
+        "this node switches last"
+    );
+
+    // Finishing the rotation: the same key, not another new one.
+    let rot = cmd::rotate(&na.node, &[]).await.unwrap();
+    assert_eq!(rot.key.id, moved_to);
+    assert_eq!(
+        owner::load(&na.store, a.id).await.unwrap().unwrap().id,
+        moved_to
+    );
+    assert_eq!(cmd::pending(&na.store).await.unwrap(), vec![last]);
+    eventually("a counts the moved sibling as its own again", || async {
+        fleet::discover(&na.node).await.unwrap().contains(&first)
+    })
+    .await;
+}
+
+/// A node left out of a rotation stays on the old key and is no longer
+/// counted: this is how a node that does not cooperate is put out.
+#[tokio::test]
+async fn a_rotation_leaves_out_the_nodes_named() {
+    use peephole::cluster::owner::{self, cmd, fleet};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let old = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &old, false).await.unwrap();
+    owner::adopt(&nc.store, c.id, &old, false).await.unwrap();
+    eventually("a finds b and c", || async {
+        fleet::discover(&na.node).await.unwrap().len() == 2
+    })
+    .await;
+    let (admin, base) = admin_on(&na).await;
+    let page = format!("{base}/admin/cluster/ownership");
+    let html = text(&admin, page.clone()).await;
+    assert!(
+        html.contains(&format!("name=\"skip\" value=\"{}\"", c.id)),
+        "the dialog offers to leave c out"
+    );
+    let r = admin
+        .post(format!("{page}/rotate"))
+        .form(&[("skip", c.id.to_string())])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert!(r.text().await.unwrap().contains("peephole-own1:"));
+
+    let new = owner::load(&na.store, a.id).await.unwrap().unwrap().id;
+    assert_ne!(new, old.id);
+    assert_eq!(owner::load(&nb.store, b.id).await.unwrap().unwrap().id, new);
+    assert_eq!(
+        owner::load(&nc.store, c.id).await.unwrap().unwrap().id,
+        old.id
+    );
+    assert!(
+        cmd::pending(&na.store).await.unwrap().is_empty(),
+        "left out, not waited for"
+    );
+    assert!(
+        na.store
+            .setting_get("owner.old_seed")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        na.store
+            .setting_get("owner.next_seed")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // c still greets with its old certificate: it is counted by nobody.
+    assert!(fleet::discover(&nc.node).await.unwrap().is_empty());
+    assert_eq!(fleet::discover(&na.node).await.unwrap(), vec![b.id]);
 }

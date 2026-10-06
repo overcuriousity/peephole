@@ -32,7 +32,11 @@
       <form method="post" action="/admin/cluster/ownership/forget-key" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Forget key</button></form></dialog>
     <button class="btn btn-sm" type="button" data-confirm="dlg-rotate">Rotate key</button>
     <dialog id="dlg-rotate"><h3>Replace the ownership key?</h3><p class="muted">Every node of yours that answers takes the new key; the old one stops working there. The new key is shown once.</p>
-      <form method="post" action="/admin/cluster/ownership/rotate" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Rotate key</button></form></dialog>
+      <form method="post" action="/admin/cluster/ownership/rotate">
+        {% for n in nodes %}{% if !n.is_self %}{% if loop.index == 2 %}<p class="muted">Leave out a node that should no longer be yours. It stays on the old key and is not counted afterwards:</p>{% endif %}
+        <label class="check"><input type="checkbox" name="skip" value="{{ n.key }}"> Leave out {{ n.name }} <span class="mono muted">{{ n.short }}</span></label>{% endif %}{% endfor %}
+        <div class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Rotate key</button></div>
+      </form></dialog>
     {% endif %}
     <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-release">Release this node</button>
     <dialog id="dlg-release"><h3>Release this node?</h3><p class="muted">It has no owner afterwards and cannot be managed from your other nodes.</p>
@@ -48,6 +52,12 @@
   </details>
 {% endmatch %}
 </section>
+{% if unfinished %}
+<section class="card"><h2>Key rotation not finished</h2>
+  <div class="banner banner-warning">A key rotation was started on this node and cut short. Some of your nodes may already be on the new key, which is kept here. Finishing moves the rest and then this node.</div>
+  <form method="post" action="/admin/cluster/ownership/rotate"><button class="btn btn-sm btn-primary" type="submit">Finish rotation</button></form>
+</section>
+{% endif %}
 {% if !pending.is_empty() %}
 <section class="card"><h2>Still on the previous key</h2>
   <div class="banner banner-warning">{% for p in pending %}{% if !loop.first %}, {% endif %}{{ p }}{% endfor %} did not answer when the key was rotated. The previous key is kept here for them.</div>

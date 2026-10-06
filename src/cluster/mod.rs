@@ -253,6 +253,8 @@ pub struct Node {
     pub peer_status: RwLock<HashMap<NodeId, PeerStatus>>,
     /// Serializes log writes (local appends and remote batches).
     pub apply_lock: tokio::sync::Mutex<()>,
+    /// Owner commands and key rotations, each one at a time.
+    pub owner_locks: owner::Locks,
     /// Bumped whenever the log grows; wakes sync loops and long-polls.
     changed: tokio::sync::watch::Sender<u64>,
     join_attempts: Mutex<JoinAttempts>,
@@ -318,6 +320,7 @@ impl Node {
             clients: Mutex::new(HashMap::new()),
             peer_status: RwLock::new(HashMap::new()),
             apply_lock: tokio::sync::Mutex::new(()),
+            owner_locks: Default::default(),
             changed: tokio::sync::watch::channel(0).0,
             join_attempts: Mutex::new(Default::default()),
             sync_slots: tokio::sync::Semaphore::new(sync::MAX_CONCURRENT_SYNCS),
