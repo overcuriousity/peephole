@@ -5,6 +5,26 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Added
+
+- Ownership. One key for all nodes of an operator (`peephole owner new`,
+  `peephole owner adopt`, Cluster › Ownership). Your nodes find each other
+  and are marked "yours"; from a node that keeps the key you change a
+  sibling's pace, cooldown and roles, block and purge peers there, revoke
+  its invites, have it leave, release it, and rotate the key. Each node
+  lists the commands it received. See docs/cluster.md.
+
+### Changed
+
+- **Breaking:** config keys are gone. `cluster.remote_config`,
+  `peephole cluster config-key` and the config-key cards on Cluster ›
+  Access no longer exist; `remote_config` in a config file is ignored with
+  a warning. After the upgrade no node can be changed from another node
+  until you run `peephole owner new` on one node and `peephole owner adopt`
+  on the others.
+- Cluster protocol version 3. Ownership works between nodes of this
+  version; older members keep syncing as before.
+
 ## [0.6.0] - 2026-10-06
 
 ### Added

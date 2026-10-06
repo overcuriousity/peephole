@@ -25,8 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
   - with a trap, **what is in front of it** (see below);
   - the public domain of the admin area (with the web interface);
   - whether to take part in a **cluster**: node name, addresses, an invite
-    token, and whether holders of this node's **config key** may change its
-    settings;
+    token;
   - optional **MaxMind GeoLite2** credentials
     (<https://www.maxmind.com/en/accounts/current/license-key>);
   - optional API keys for **AbuseIPDB**, **Shodan** and **GreyNoise**, and
@@ -88,7 +87,7 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
 
 Every question has a variable (`PEEPHOLE_ROLES`, `PEEPHOLE_FRONT`,
 `PEEPHOLE_TRUSTED_PROXIES`, `PEEPHOLE_OWN_ADDRESSES`, `PEEPHOLE_CLUSTER`,
-`PEEPHOLE_CLUSTER_NAME`, `PEEPHOLE_JOIN_TOKEN`, `PEEPHOLE_REMOTE_CONFIG`,
+`PEEPHOLE_CLUSTER_NAME`, `PEEPHOLE_JOIN_TOKEN`,
 `PEEPHOLE_NGINX`, `PEEPHOLE_ACME_EMAIL`, …); the head of `install.sh` lists
 them all. `PEEPHOLE_FRONT=direct|local|remote` answers what is in front of
 the trap. Without it, unattended installs keep what they did before: the

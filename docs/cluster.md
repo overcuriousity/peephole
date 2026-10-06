@@ -30,6 +30,9 @@ peephole cluster block <node>             # this node ignores a peer (unblock un
 peephole cluster block --subtree <node>   # ... and every node it admitted, transitively
 peephole cluster purge <node>             # delete a blocked peer's data here, stop relaying it
 peephole cluster leave                    # this node leaves; it keeps its data
+peephole owner new                        # an ownership key for your nodes; this node keeps it
+peephole owner adopt                      # on each other node of yours: reads the key from standard input
+peephole owner show                       # this node's owner and the nodes that share it
 ```
 
 Nodes talk HTTP/2 over mutual TLS with pinned Ed25519 keys on
@@ -78,21 +81,44 @@ be listed under `[[cluster.peers]]` with their key.
   for a full member") while none is reachable. Switching a window off later
   does not bring the dropped history back.
 
-## Changing another node's settings
+## Your own nodes: ownership
 
-- A node's scan pace, rescan cooldown and roles are runtime settings. Its
-  own admin (System › Settings and Scans for the pace, or
-  `peephole settings set|reset|show`) can always
-  change them, and roles switch without a restart.
-- With `remote_config = true` under `[cluster]`, the node has a **config
-  key** (`peephole cluster config-key show`). Whoever holds it can change
-  those settings from their own node: paste the key on their Cluster › Access page,
-  or `peephole cluster config-key add <key>`.
-- `peephole cluster config-key rotate` replaces the key and withdraws the
-  permission from everyone at once. The node lists who changed what.
-- Nothing else is changeable from outside: addresses, paths, WebAuthn, API
-  keys, `never_scan`, nmap arguments and `remote_config` itself stay in the
-  config file.
+Operators in a cluster need not know each other. The nodes of one operator
+can still belong together: they share an **ownership key**.
+
+- **Create it once** (`peephole owner new`, or Cluster › Ownership) and
+  **enter it on each of your other nodes** (`peephole owner adopt`, or the
+  same page there). The key is shown once; `adopt` reads it from standard
+  input so it does not end up in the shell history.
+- A node stores the owner's public half and a certificate for itself. The
+  key itself stays only where you choose to keep it (`--keep`, or the
+  checkbox): those are your **managing nodes**. A scanner that gets broken
+  into cannot take over your other nodes if it does not keep the key.
+- Your nodes find each other on their own and are marked "yours" on the
+  cluster pages. Nothing about ownership is replicated: other operators'
+  nodes cannot verify who owns what, though a member that relays the
+  messages can see which nodes answered each other.
+- From a managing node you can change a sibling's scan pace, rescan
+  cooldown and roles, block, unblock and purge peers there, revoke its
+  invites, have it leave the cluster, and release it. Each of your nodes
+  lists the commands it received (Cluster › Ownership).
+- **Not possible from outside**, also for the owner: creating an invite
+  (the invite is a secret and would pass through other members), and
+  everything in the config file (addresses, paths, WebAuthn, API keys,
+  `never_scan`, nmap arguments).
+- **A leaked key**: rotate it on a managing node (Cluster › Ownership).
+  Every node of yours that answers takes the new key; for the rest the page
+  offers to retry. On a node you cannot reach that way, run
+  `peephole owner adopt` locally.
+- Whoever can log in to a node, or run the CLI on it, can always release it
+  or give it another owner. Ownership adds a remote door; it does not lock
+  the local one. Protecting the key and the nodes is the operator's job.
+- A node's own admin (System › Settings and Scans, or
+  `peephole settings set|reset|show`) can always change its runtime
+  settings, and roles switch without a restart.
+
+Config keys (`cluster.remote_config`, `peephole cluster config-key`) are
+gone. `remote_config` in a config file is ignored.
 
 ## Things to know
 
