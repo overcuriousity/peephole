@@ -1055,7 +1055,7 @@ struct NodePage {
 /// Whether a node page asks the member for its status: only a live,
 /// unblocked sibling this node can command (an offline one would hold the
 /// page for the whole request timeout).
-pub(crate) fn asks_remote(m: &MemberView) -> bool {
+fn asks_remote(m: &MemberView) -> bool {
     !m.is_self && m.managed && m.live && !m.blocked
 }
 

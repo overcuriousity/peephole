@@ -91,6 +91,9 @@ pub struct Ledger {
     pub offers: Vec<Offer>,
     pub transfers: Vec<Moved>,
     pub tallies: HashMap<NodeId, Tally>,
+    /// The same, counting only the last 7 days (the walk covers 8: a lot's
+    /// life and one).
+    pub week: HashMap<NodeId, Tally>,
     /// The UTC day balances are read for.
     pub today: u32,
 }
@@ -182,6 +185,11 @@ impl Ledger {
     pub fn tally(&self, node: &NodeId) -> Tally {
         self.tallies.get(node).copied().unwrap_or_default()
     }
+
+    /// [`Ledger::tally`] of the last 7 days.
+    pub fn week_tally(&self, node: &NodeId) -> Tally {
+        self.week.get(node).copied().unwrap_or_default()
+    }
 }
 
 enum Step<'a> {
@@ -203,6 +211,8 @@ impl Step<'_> {
 struct Walk<'a> {
     l: Ledger,
     left_out: &'a HashSet<NodeId>,
+    /// The HLC the last 7 days start at.
+    week_from: u64,
 }
 
 impl Walk<'_> {
@@ -210,8 +220,13 @@ impl Walk<'_> {
         self.l.lots.entry((node, day)).or_insert(0)
     }
 
-    fn tally(&mut self, node: NodeId) -> &mut Tally {
-        self.l.tallies.entry(node).or_default()
+    /// Count `f` for `node` in the tallies, and in the week's when `hlc`
+    /// lies in the last 7 days.
+    fn tally(&mut self, node: NodeId, hlc: u64, f: impl Fn(&mut Tally)) {
+        f(self.l.tallies.entry(node).or_default());
+        if hlc >= self.week_from {
+            f(self.l.week.entry(node).or_default());
+        }
     }
 
     /// Give back what offers older than 15 minutes still hold.
@@ -290,10 +305,11 @@ impl Walk<'_> {
             to_server,
             destroyed,
         };
-        let t = self.tally(payer);
-        t.spent += paid;
-        t.destroyed += destroyed;
-        self.tally(e.origin).served += to_server;
+        self.tally(payer, e.hlc, |t| {
+            t.spent += paid;
+            t.destroyed += destroyed;
+        });
+        self.tally(e.origin, e.hlc, |t| t.served += to_server);
     }
 
     fn transfer(&mut self, e: &Entry, to: NodeId, parts: &[(u32, u32)]) {
@@ -312,8 +328,8 @@ impl Walk<'_> {
             named: parts.iter().map(|(_, mc)| *mc as Mc).sum(),
             moved,
         });
-        self.tally(e.origin).sent += moved;
-        self.tally(to).received += moved;
+        self.tally(e.origin, e.hlc, |t| t.sent += moved);
+        self.tally(to, e.hlc, |t| t.received += moved);
     }
 }
 
@@ -339,6 +355,7 @@ pub fn run(
             ..Default::default()
         },
         left_out,
+        week_from: now_ms.saturating_sub(7 * DAY_MS) << 16,
     };
     for step in steps {
         match step {
@@ -348,7 +365,7 @@ pub fn run(
                     continue;
                 }
                 *w.lot(e.node, day_of(e.hlc)) += e.mc;
-                w.tally(e.node).earned += e.mc;
+                w.tally(e.node, e.hlc, |t| t.earned += e.mc);
             }
             Step::Entry(e) => {
                 w.lapse(physical_ms(e.hlc));
@@ -460,6 +477,25 @@ mod tests {
 
     fn ledger(earned: &[Earned], entries: &[Entry], now_ms: u64) -> Ledger {
         run(earned, entries, &HashSet::new(), now_ms)
+    }
+
+    /// The walk covers 8 days; the week's tallies count only the last 7.
+    #[test]
+    fn the_week_tallies_leave_out_the_eighth_day() {
+        let l = ledger(
+            &[earn(1, DAY, 0, 1000), earn(1, DAY + 7, 0, 300)],
+            &[
+                offer(1, 1, at(DAY, 10), 2, &[(DAY, 400)]),
+                receipt(2, 1, at(DAY, 11), 1, 1, 400),
+                offer(1, 2, at(DAY + 7, 10), 2, &[(DAY + 7, 100)]),
+                receipt(2, 2, at(DAY + 7, 11), 1, 2, 100),
+            ],
+            now(DAY + 7, 60),
+        );
+        let (all, week) = (l.tally(&id(1)), l.week_tally(&id(1)));
+        assert_eq!((all.earned, all.spent, all.destroyed), (1300, 500, 250));
+        assert_eq!((week.earned, week.spent, week.destroyed), (300, 100, 50));
+        assert_eq!(l.week_tally(&id(2)).served, 50);
     }
 
     #[test]

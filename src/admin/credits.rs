@@ -163,8 +163,10 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             expires: expires_in(day, l.today),
         })
         .collect();
-    // Where each of this operator's nodes sent credits last.
-    let last_to: HashMap<NodeId, NodeId> = l.transfers.iter().map(|t| (t.from, t.to)).collect();
+    let collects = match siblings.is_empty() {
+        true => HashMap::new(),
+        false => crate::admin::cluster_owner::collect_targets(node, &siblings).await,
+    };
     let fleet = (!siblings.is_empty()).then(|| {
         let all: Vec<NodeId> = std::iter::once(me)
             .chain(siblings.iter().copied())
@@ -175,10 +177,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             .map(|id| NodeRow {
                 name: name(id),
                 balance: show(book.balance(id)),
-                collects: match last_to.get(id).filter(|to| all.contains(to)) {
-                    Some(to) => format!("forwards to {}", name(to)),
-                    None => "keeps what it earns".into(),
-                },
+                collects: collects.get(id).cloned().unwrap_or_default(),
             })
             .collect();
         (show(total), rows)
@@ -236,7 +235,11 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
                 } => (
                     *charged,
                     *destroyed,
-                    if o.covered < o.offered {
+                    // A server that declines gives the offer back with a
+                    // receipt that names nothing.
+                    if *charged == 0 && o.answered.is_empty() {
+                        "declined at the server"
+                    } else if o.covered < o.offered {
                         "charged (not fully covered at the server)"
                     } else {
                         "charged"
@@ -273,7 +276,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         .values()
         .filter(|m| m.active)
         .map(|m| {
-            let t = l.tally(&m.id);
+            let t = l.week_tally(&m.id);
             MemberRow {
                 key: m.id.to_string(),
                 name: name(&m.id),
@@ -286,8 +289,8 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     let totals = (
-        show(l.tallies.values().map(|t| t.earned).sum()),
-        show(l.tallies.values().map(|t| t.destroyed).sum()),
+        show(l.week.values().map(|t| t.earned).sum()),
+        show(l.week.values().map(|t| t.destroyed).sum()),
         show(l.circulating()),
     );
 

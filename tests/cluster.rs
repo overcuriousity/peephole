@@ -3750,11 +3750,14 @@ async fn collecting_credits_here_tells_the_siblings_and_shows_where_credits_go()
 
     eventually("b's status reaches the page", || async {
         let html = text(&admin, page.clone()).await;
-        html.contains("Credits go") && html.contains("→ this node")
+        html.contains("Credits go") && html.contains("forwards to this node")
     })
     .await;
     let html = text(&admin, page.clone()).await;
-    assert!(html.contains("keeps them"), "a keeps its own: {html}");
+    assert!(
+        html.contains("keeps what it earns"),
+        "a keeps its own: {html}"
+    );
     assert!(html.contains("offline"), "c is not asked: {html}");
 }
 

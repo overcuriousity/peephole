@@ -67,14 +67,14 @@
 </section>
 <section class="card"><div class="card-head"><h2>Cluster</h2><span class="muted">as this node counts it</span></div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Member</th><th class="num">Credits</th><th class="num">Earned</th><th class="num">Spent</th><th></th></tr></thead>
+    <thead><tr><th>Member</th><th class="num">Credits</th><th class="num">Earned, 7 days</th><th class="num">Spent, 7 days</th><th></th></tr></thead>
     <tbody>{% for m in members %}<tr>
       <td><a href="/admin/cluster/node/{{ m.key }}"><b>{{ m.name }}</b></a></td>
       <td class="num">{{ m.balance }}</td><td class="num">{{ m.earned }}</td><td class="num">{{ m.spent }}</td>
       <td>{% if !m.standing.is_empty() %}<span class="badge badge-status" data-status="running">not earning here: {{ m.standing }}</span>{% endif %}</td>
     </tr>{% endfor %}</tbody>
   </table></div>
-  <p class="muted">Earned {{ totals.0 }} · destroyed {{ totals.1 }} · in circulation {{ totals.2 }} credits. Another node may count differently: it holds other entries, blocks other members, or runs other rules.</p>
+  <p class="muted">In 7 days earned {{ totals.0 }} · destroyed {{ totals.1 }} · in circulation now {{ totals.2 }} credits. Another node may count differently: it holds other entries, blocks other members, or runs other rules.</p>
 </section>
 <section class="card"><div class="card-head"><h2>What a lookup costs here</h2></div>
   <ul>
