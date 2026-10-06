@@ -8,6 +8,7 @@ use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 pub mod cli;
+pub mod cmd;
 pub mod fleet;
 
 const PREFIX: &str = "peephole-own1:";

@@ -262,6 +262,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         }
         cluster::remote::serve(node, settings.clone());
         cluster::owner::fleet::serve(node);
+        cluster::owner::cmd::serve(node, settings.clone());
         tokio::spawn(cluster::owner::fleet::run(
             node.clone(),
             shutdown_rx.clone(),

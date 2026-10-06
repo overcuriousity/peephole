@@ -175,6 +175,7 @@ async fn boot_in(
     }
     cluster::remote::serve(&node, settings.clone());
     cluster::owner::fleet::serve(&node);
+    cluster::owner::cmd::serve(&node, settings.clone());
     cluster::confkey::serve(&node, settings.clone());
     let workers = o.scanner.as_ref().map(|nmap| {
         tokio::spawn(peephole::scan::arbiter::takeover_loop(
@@ -3614,4 +3615,155 @@ async fn fleet_nodes_find_each_other_and_nobody_else() {
         fleet::discover(&na.node).await.unwrap().is_empty()
     })
     .await;
+}
+
+/// A managing node changes a sibling's settings; nobody else can, and a
+/// command works only once.
+#[tokio::test]
+async fn a_managing_node_changes_a_siblings_settings() {
+    use peephole::cluster::owner::{self, cmd, fleet};
+    use peephole::settings::Changes;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let (id, d) = new_node("d");
+    let na = boot(ia, &a, &[&b, &c, &d], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c, &d], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b, &d], DEFAULT).await;
+    let _nd = boot(id, &d, &[&a, &b, &c], DEFAULT).await;
+    // Adopted while the nodes run: no restart is needed.
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    let stranger = owner::create(&nc.store, c.id).await.unwrap();
+    eventually("a finds b", || async {
+        fleet::discover(&na.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+
+    // Commands go only to members known to speak version 3: wait until a
+    // and c have b's and d's own descriptions.
+    eventually("the nodes know each other's version", || async {
+        [&na, &nc].iter().all(|n| {
+            let m = n.members();
+            [b.id, d.id]
+                .iter()
+                .all(|id| m.get(id).is_some_and(|x| x.proto_max >= 3))
+        })
+    })
+    .await;
+
+    let st = cmd::status(&na.node, &key, b.id).await.unwrap();
+    assert_eq!((st.counter, st.state.version), (0, 0));
+    let faster = cmd::OwnerCmd::Settings {
+        base_version: 0,
+        changes: Changes {
+            max_scans_per_hour: Some(77),
+            ..Default::default()
+        },
+    };
+    let note = cmd::run(&na.node, &key, b.id, 0, faster.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(note.contains("version 1"), "{note}");
+    assert_eq!(nb.pace.get().max_scans_per_hour, 77);
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 1);
+    let log = cmd::log_rows(&nb.store, 10).await.unwrap();
+    assert_eq!(log.len(), 1, "status is not logged");
+    assert_eq!(log[0].from, a.id);
+    assert!(log[0].command.contains("scans/h=77"), "{}", log[0].command);
+
+    // The same counter again (a replay, or a second manager): refused.
+    let e = cmd::run(&na.node, &key, b.id, 0, faster.clone())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("changed meanwhile"), "{e}");
+
+    // The settings' own rules still apply; the counter is used up anyway.
+    let none = cmd::OwnerCmd::Settings {
+        base_version: 1,
+        changes: Changes {
+            listener: Some(false),
+            scanner: Some(false),
+            web: Some(false),
+            ..Default::default()
+        },
+    };
+    let e = cmd::run(&na.node, &key, b.id, 1, none)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("at least one role"), "{e}");
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 2);
+
+    // Another owner's key is not accepted, and nothing changes.
+    let e = cmd::run(&nc.node, &stranger, b.id, 2, faster.clone())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("not accepted"), "{e}");
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 2);
+
+    // A node that does not keep the key has nothing to send with.
+    let e = cmd::kept_key(&nb.node).await.err().unwrap().to_string();
+    assert!(e.contains("not kept on this node"), "{e}");
+
+    // A node without an owner refuses.
+    let e = cmd::run(&na.node, &key, d.id, 0, faster)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("no owner"), "{e}");
+}
+
+/// A sibling that only dials out gets its commands from the outbox of a
+/// member it dials, once.
+#[tokio::test]
+async fn owner_commands_reach_an_outbound_only_sibling() {
+    use peephole::cluster::owner::{self, cmd};
+    use peephole::settings::Changes;
+    let (ia, a) = new_node("a");
+    let (ir, r) = new_node("r");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&r], DEFAULT).await;
+    let nr = boot(ir, &r, &[&a], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[],
+        Opts {
+            advertise: false,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let token = invite::create(&nr, &Default::default()).await.unwrap();
+    invite::join(&nb, &token).await.unwrap();
+    eventually("a knows b, which has no address", || async {
+        members::all(&na.store)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == b.id && m.info_hlc > 0 && m.address.is_none())
+    })
+    .await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    let slower = cmd::OwnerCmd::Settings {
+        base_version: 0,
+        changes: Changes {
+            cooldown_hours: Some(48),
+            ..Default::default()
+        },
+    };
+    eventually_for(Duration::from_secs(40), "the command arrives", || async {
+        matches!(
+            cmd::run(&na.node, &key, b.id, 0, slower.clone()).await,
+            Ok(Ok(_))
+        ) || nb.settings.snapshot().cooldown_hours == 48
+    })
+    .await;
+    assert_eq!(nb.settings.snapshot().cooldown_hours, 48);
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 1, "applied once");
 }
