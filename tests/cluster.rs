@@ -2024,7 +2024,7 @@ async fn silent_arbiters_queue_is_taken_over() {
         .set(
             &nb.store,
             peephole::scan::pace::Pace {
-                max_workers: 1,
+                max_workers: peephole::scan::pace::MIN_WORKERS,
                 max_scans_per_hour: 3600,
                 timeout_secs: 60,
             },
