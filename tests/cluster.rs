@@ -3321,6 +3321,13 @@ async fn fleet_nodes_find_each_other_and_nobody_else() {
     assert!(fleet::discover(&nd.node).await.unwrap().is_empty());
     assert!(fleet::siblings(&nd.store).await.unwrap().is_empty());
 
+    // b cannot read its owner for a moment: it does not answer, and a
+    // keeps it as a sibling instead of forgetting it.
+    let cert = nb.store.setting_get("owner.cert").await.unwrap().unwrap();
+    nb.store.setting_set("owner.cert", "!").await.unwrap();
+    assert_eq!(fleet::discover(&na.node).await.unwrap(), vec![b.id]);
+    nb.store.setting_set("owner.cert", &cert).await.unwrap();
+
     // b is released on its own console: a learns it at its next round.
     owner::release(&nb.store).await.unwrap();
     eventually("a drops b", || async {

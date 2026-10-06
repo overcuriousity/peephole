@@ -76,8 +76,16 @@ pub fn serve(node: &Arc<Node>) {
             let no = Some(Msg::OwnerHelloReply {
                 cert: serde_bytes::ByteBuf::new(),
             });
-            let Ok(Some(owned)) = load(&node.store, node.id()).await else {
-                return no;
+            // Not owned: an empty answer. Not known (the database could
+            // not be read): no answer, so the sender keeps what it knew
+            // instead of forgetting a sibling over a busy database.
+            let owned = match load(&node.store, node.id()).await {
+                Ok(Some(o)) => o,
+                Ok(None) => return no,
+                Err(e) => {
+                    tracing::debug!(?e, "owner hello not answered");
+                    return None;
+                }
             };
             let ours = hello_tag(&owned.id, &from, &node.id());
             if aws_lc_rs::constant_time::verify_slices_are_equal(tag.as_slice(), &ours).is_err()
