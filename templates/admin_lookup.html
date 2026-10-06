@@ -1,12 +1,25 @@
 {% extends "layout.html" %}
 {% block title %}peephole — lookup{% endblock %}
+{% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
 {% let sub = "lookup" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Lookup</h1><p class="muted">Every reachable provider, now.{% if cluster %} Paid with credits; kept in the dataset when the cluster has recorded the address.{% else %} Not stored; spends API budget.{% endif %}</p></div></div>
+<div class="page-head"><div><h1>Lookup</h1><p class="muted">What the cluster knows about an address, and what every reachable provider says now.{% if cluster %} Provider answers are paid with credits.{% endif %}</p></div></div>
 <form class="filters card" method="post" action="/admin/lookup">
   <label>IP address <input name="ip" value="{{ ip }}" placeholder="203.0.113.7 or 2001:db8::1" required autofocus></label>
   <button class="btn btn-primary" type="submit">Look up</button>
+  {% if let Some(b) = offer.balance %}
+  <span class="muted">Balance{% if offer.fleet %} of your nodes{% endif %}: <b>{{ b }}</b> credits · this lookup costs up to {{ offer.total }} · <a href="/admin/cluster/credits">credits →</a></span>
+  {% endif %}
 </form>
+{% if !offer.quotes.is_empty() %}
+<details class="card"><summary>Who would be asked, and at what price</summary>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Provider</th><th>Node</th><th class="num">Price (credits)</th></tr></thead>
+    <tbody>{% for q in offer.quotes %}<tr><td>{{ q.label }}</td><td>{{ q.node }}</td><td class="num">{{ q.price }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  <p class="muted small">Per provider the node with the lowest price answers, your own included. An answer of the last 24 hours in the dataset is shown instead and costs nothing.</p>
+</details>
+{% endif %}
 <form class="filters card bulk-lookup" method="post" action="/admin/lookup/bulk">
   <label>Many addresses or networks, from stored data (no provider is asked) <textarea name="ips" rows="3" cols="60" placeholder="203.0.113.7, 198.51.100.0/24 …">{% if let Some(b) = bulk %}{{ b.text }}{% endif %}</textarea></label>
   <button class="btn" type="submit">Check stored</button>
@@ -25,11 +38,25 @@
 {% if let Some(e) = error %}<p class="muted">{{ e }}</p>{% endif %}
 {% if let Some(r) = result %}
 <div class="stack">
-<section class="card" id="intel">
-  <div class="card-head"><h2>{{ r.ip }}{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}</h2><span class="muted">{% if r.known %}<a href="/ip/{{ r.ip }}">in the dataset →</a>{% else %}not in the dataset{% endif %}</span></div>
-  {% if r.cards.is_empty() %}
-  <p class="muted">No provider answered.</p>
-  {% else %}
+<section class="card" id="answers">
+  <div class="card-head"><h2>{{ r.ip }}{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}</h2><span class="muted">{% if r.target.is_some() %}<a href="/ip/{{ r.ip }}">in the dataset →</a>{% else %}not in the dataset{% endif %}</span></div>
+  {% if !r.stored.is_empty() %}
+  <h3>From the dataset</h3>
+  <div class="intel-grid">
+  {% for s in r.stored %}
+    <div class="intel">
+      <h3>{{ s.card.label }} <span class="mono muted small">{{ s.card.name }}</span></h3>
+      {% if let Some(x) = s.card.newest %}
+        <dl class="kv">{% for f in x.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
+        <p class="muted small intel-src">from the dataset, {{ s.age }}{% if let Some(n) = x.node %}, fetched by {{ n }}{% endif %} · free</p>
+      {% endif %}
+      <form method="post" action="/admin/lookup"><input type="hidden" name="ip" value="{{ r.ip }}"><input type="hidden" name="again" value="{{ s.provider }}"><button class="btn btn-sm" type="submit">Ask again</button> <span class="muted small">a paid lookup</span></form>
+    </div>
+  {% endfor %}
+  </div>
+  {% endif %}
+  {% if !r.cards.is_empty() %}
+  <h3>Asked now</h3>
   <div class="intel-grid">
   {% for c in r.cards %}
     <div class="intel">
@@ -41,6 +68,10 @@
     </div>
   {% endfor %}
   </div>
+  {% for (node, amount) in r.charges %}<p class="small">{{ node }} charged {{ amount }} credits.</p>{% endfor %}
+  {% if cluster %}<p class="muted small">{% if r.kept %}The answers are kept in the dataset: the cluster has recorded this address.{% else %}The answers are not kept: the cluster has not recorded this address.{% endif %}</p>{% endif %}
+  {% else if r.stored.is_empty() %}
+  <p class="muted">No provider answered.</p>
   {% endif %}
   {% if !r.declined.is_empty() %}
   <h3>Not answered</h3>
@@ -49,6 +80,17 @@
   </ul>
   {% endif %}
 </section>
+{% if let Some(t) = r.target %}
+{% include "_target.html" %}
+{% endif %}
+{% if let Some(n) = r.near %}
+<section class="card"><div class="card-head"><h2>Near it</h2><span class="muted">recorded addresses in <a class="mono" href="/ips?q={{ n.net }}">{{ n.net }}</a></span></div>
+  {% if n.rows.is_empty() %}<p class="muted">None recorded.</p>{% else %}
+  <div class="table-wrap"><table><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th class="num">Requests</th><th>Max sev.</th></tr></thead><tbody>
+  {% for x in n.rows %}<tr><td><a class="mono" href="/ip/{{ x.ip }}">{{ x.ip }}</a></td><td>{{ x.country.as_deref().unwrap_or("—") }}</td><td>{% if let Some(a) = x.asn %}AS{{ a }}{% else %}—{% endif %}</td><td class="num">{{ x.request_count }}</td><td>{{ x.max_severity }}</td></tr>{% endfor %}
+  </tbody></table></div>{% endif %}
+</section>
+{% endif %}
 </div>
 {% endif %}
 {% endblock %}

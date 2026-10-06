@@ -5265,3 +5265,117 @@ async fn a_node_draws_what_a_lookup_needs_from_its_collecting_node() {
     })
     .await;
 }
+
+/// The section names of a rendered page, in order.
+fn sections(html: &str) -> Vec<String> {
+    html.split("data-section=\"")
+        .skip(1)
+        .filter_map(|s| s.split('"').next().map(str::to_string))
+        .collect()
+}
+
+/// The lookup result of a recorded address lists what its IP page lists,
+/// with the provider answers on top; the page says what a lookup costs
+/// and what was charged.
+#[tokio::test]
+async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page() {
+    use peephole::credits::price;
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a],
+        Opts {
+            scanner: Some(fake_nmap_args(tools.path())),
+            ..DEFAULT
+        },
+    )
+    .await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    let cost = price_seen(&na, b.id, "abuseipdb").await;
+    // A recorded address with requests and a finished scan.
+    enqueue(&na, "198.51.100.77", 1).await;
+    eventually_for(Duration::from_secs(30), "scanned", || async {
+        count(&na, "SELECT COUNT(*) FROM scans").await == 1
+    })
+    .await;
+    let (admin, base) = admin_on(&na).await;
+
+    let form = text(&admin, format!("{base}/admin/lookup?ip=198.51.100.77")).await;
+    assert!(form.contains("Balance") && form.contains("10.00"), "{form}");
+    assert!(form.contains("node-bravo"), "who would be asked");
+    assert!(
+        form.contains(&peephole::credits::show(cost as u64)),
+        "and at what price"
+    );
+
+    let ip_page = text(&admin, format!("{base}/ip/198.51.100.77")).await;
+    let result = admin
+        .post(format!("{base}/admin/lookup"))
+        .form(&[("ip", "198.51.100.77")])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let on_ip_page = sections(&ip_page);
+    assert!(
+        on_ip_page.contains(&"scans".to_string()) && on_ip_page.contains(&"requests".to_string())
+    );
+    assert_eq!(sections(&result), on_ip_page, "one source for both pages");
+    assert!(result.contains("Asked now") && result.contains("node-bravo"));
+    assert!(result.contains(&format!("charged {}", peephole::credits::show(cost as u64))));
+    assert!(
+        result.contains("kept in the dataset"),
+        "the cluster recorded this address"
+    );
+
+    // Asked again within 24 hours: from the dataset, with "Ask again".
+    eventually("b's kept answer reached this node", || async {
+        count(
+            &na,
+            "SELECT COUNT(*) FROM ip_intel_log WHERE provider = 'abuseipdb'",
+        )
+        .await
+            == 1
+    })
+    .await;
+    let second = admin
+        .post(format!("{base}/admin/lookup"))
+        .form(&[("ip", "198.51.100.77")])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        second.contains("From the dataset") && second.contains("Ask again"),
+        "{second}"
+    );
+    assert!(!second.contains("Asked now"));
+
+    // An address the dataset does not hold: said so, with what is near it.
+    let unknown = admin
+        .post(format!("{base}/admin/lookup"))
+        .form(&[("ip", "198.51.100.78")])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(unknown.contains("not in the dataset"));
+    assert!(
+        unknown.contains("198.51.100.0/24") && unknown.contains("198.51.100.77"),
+        "{unknown}"
+    );
+    assert!(unknown.contains("not kept"));
+    assert!(sections(&unknown).is_empty());
+}

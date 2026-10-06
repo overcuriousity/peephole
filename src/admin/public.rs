@@ -5,7 +5,7 @@ use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
 use crate::admin::{AdminState, RangeQuery};
 use crate::store::browse::{
-    Audience, IpFilter, IpOverview, IpSummary, Page, RequestFilter, RequestListRow, page_num,
+    Audience, IpFilter, IpSummary, Page, RequestFilter, RequestListRow, page_num,
 };
 use crate::store::inspect::{FpClaimRow, FpSummary, IpIntelRow, PortRow, ScanSummary};
 use crate::store::stats::{MapCounts, Range, Stats, intel_stale};
@@ -126,7 +126,7 @@ fn owasp_tiles(counts: &[crate::store::stats::Named]) -> Vec<OwaspTile> {
 }
 
 /// Whether this viewer sees rule labels.
-fn labels_shown(state: &AdminState, authed: bool) -> bool {
+pub(crate) fn labels_shown(state: &AdminState, authed: bool) -> bool {
     authed || state.cfg.public.show_labels
 }
 
@@ -979,18 +979,11 @@ impl IpAdminData {
 #[template(path = "ip.html")]
 struct IpPage {
     chrome: Chrome,
-    ov: Arc<IpOverview>,
-    /// `ov.week` and `ov.calendar` for the page's charts.
-    week_json: String,
-    calendar_json: String,
-    /// Largest family count, for the bar widths.
-    family_max: i64,
-    page: Page<RequestListRow>,
-    intel: Vec<IntelCard>,
-    admin: Option<IpAdminData>,
+    /// Everything the dataset holds on the address (also what the lookup
+    /// result shows).
+    t: crate::admin::target::Target,
     /// Admin on a standalone node: the IP can be deleted.
     can_delete: bool,
-    labels: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -1008,70 +1001,14 @@ async fn ip_page(
     let Some(ip) = state.store.ip_by_addr(&addr).await? else {
         return Err(AppError::NotFound);
     };
-    // Anonymous views go through the cache; an admin always reads fresh.
-    let ov = if authed {
-        state.store.ip_overview(ip.id).await?.map(Arc::new)
-    } else {
-        state.stats_cache.ip(&state.store, ip.id).await?
-    };
-    let Some(ov) = ov else {
+    let Some(t) = crate::admin::target::load(&state, &ip, authed, page_num(q.page), true).await?
+    else {
         return Err(AppError::NotFound);
     };
-    // Per-request rows are admin-only; the public page shows only the IP's
-    // aggregates (geo, counts, max severity, labels). Not even queried for
-    // the public.
-    let page = if authed {
-        state
-            .store
-            .requests_for_ip(ip.id, page_num(q.page), Audience::Admin)
-            .await?
-    } else {
-        Page {
-            items: vec![],
-            page: 1,
-            has_next: false,
-        }
-    };
-    // Admin-only data is only *queried* with a session (spec §5).
-    let admin = if authed {
-        let found = state.store.scans_for_ip(ip.id).await?;
-        let ids: Vec<i64> = found.iter().map(|s| s.id).collect();
-        let mut ports = state.store.ports_for_scans(&ids).await?;
-        let scans = found
-            .into_iter()
-            .map(|s| ScanWithPorts {
-                ports: ports.remove(&s.id).unwrap_or_default(),
-                s,
-            })
-            .collect();
-        Some(IpAdminData {
-            jobs: state.store.jobs_for_ip(ip.id, 20).await?,
-            scans,
-            fingerprints: state.store.fingerprints_for_ip(ip.id).await?,
-            claims: state.store.claims_for_ip(ip.id).await?,
-            skipped: state.store.skipped_for_ip(ip.id).await?,
-            host_keys: state.store.host_keys_for_ip(ip.id).await?,
-            canary_links: state.store.canary_links_for_ip(ip.id).await?,
-            decoys: state.store.decoy_counts_for_ip(ip.id).await?,
-        })
-    } else {
-        None
-    };
-    let intel = intel_cards(state.store.intel_for_ip(&ip.ip).await?, authed);
-    let week_json = serde_json::to_string(&ov.week).unwrap_or_else(|_| "[]".into());
-    let calendar_json = serde_json::to_string(&ov.calendar).unwrap_or_else(|_| "[]".into());
-    let family_max = ov.families.iter().map(|f| f.count).max().unwrap_or(0);
     render(&IpPage {
         chrome: Chrome::new(authed, "ips"),
-        ov,
-        week_json,
-        calendar_json,
-        family_max,
-        page,
-        intel,
-        admin,
+        t,
         can_delete: authed && state.can_delete(),
-        labels: labels_shown(&state, authed),
     })
 }
 

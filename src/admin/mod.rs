@@ -18,6 +18,7 @@ pub mod scans;
 pub mod search;
 pub mod sse;
 pub mod system;
+pub mod target;
 pub mod views;
 
 use crate::config::Config;
