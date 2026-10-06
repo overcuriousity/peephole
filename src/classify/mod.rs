@@ -365,8 +365,8 @@ fn compile_ci(pattern: &str) -> Result<Regex> {
 
 /// Label families, in the order the pages show them: what a request was
 /// after, coarsest first.
-pub const FAMILIES: [&str; 7] = [
-    "recon", "inject", "impact", "interact", "postex", "bot", "other",
+pub const FAMILIES: [&str; 8] = [
+    "recon", "exposure", "inject", "impact", "interact", "postex", "bot", "other",
 ];
 
 /// The family of a rule label. The explicit map comes first; then every
@@ -374,14 +374,46 @@ pub const FAMILIES: [&str; 7] = [
 /// anything unknown is "other".
 pub fn label_family(label: &str) -> &'static str {
     match label {
+        "sensitive-path" => "exposure",
         "sqli" | "xss" | "ssti" | "nosqli" | "xxe" | "crlf-injection" => "inject",
         "rce" | "deserialization" | "ssrf" | "path-traversal" => "impact",
         "form-interaction" | "write-method" | "credential-attack" => "interact",
         "webshell" | "mcp-abuse" => "postex",
         "automation" | "inhuman-behavior" | "proxy-probe" | "unusual-method" => "bot",
-        "scanner-ua" | "research-scanner" => "recon",
+        "scanner-ua"
+        | "research-scanner"
+        | "path-scanner"
+        | "api-recon"
+        | "graphql-introspection" => "recon",
         _ if label.ends_with("-probe") => "recon",
         _ => "other",
+    }
+}
+
+/// Labels that say how a request came rather than what it was after:
+/// "path-scanner" (one of many from its source) and "php-probe" (some PHP
+/// script, a guess on a trap that serves none).
+const WEAK: [&str; 2] = ["path-scanner", "php-probe"];
+
+/// The families one request touched, each once, in [`FAMILIES`] order.
+/// A [`WEAK`] label counts (as reconnaissance) only when no other label
+/// names a family, and "other" only when nothing else does.
+pub fn request_families<S: AsRef<str>>(labels: &[S]) -> Vec<&'static str> {
+    let of = |weak: bool| -> Vec<&'static str> {
+        let fams: Vec<&'static str> = labels
+            .iter()
+            .filter(|l| weak || !WEAK.contains(&l.as_ref()))
+            .map(|l| label_family(l.as_ref()))
+            .collect();
+        FAMILIES
+            .iter()
+            .copied()
+            .filter(|f| fams.contains(f) && (*f != "other" || fams.iter().all(|g| *g == "other")))
+            .collect()
+    };
+    match of(false) {
+        f if f.is_empty() || f == ["other"] => of(true),
+        f => f,
     }
 }
 
@@ -704,6 +736,104 @@ mod tests {
                 "{t} must not be {label}: {l:?}"
             );
         }
+    }
+
+    #[test]
+    fn request_families_prefer_what_over_how() {
+        let f = |l: &[&str]| request_families(l);
+        assert_eq!(f(&["path-scanner", "sensitive-path"]), ["exposure"]);
+        assert_eq!(f(&["php-probe", "path-scanner", "sqli"]), ["inject"]);
+        assert_eq!(f(&["path-scanner"]), ["recon"]);
+        assert_eq!(f(&["php-probe"]), ["recon"]);
+        assert_eq!(f(&["path-scanner", "my-custom"]), ["recon"]);
+        assert_eq!(f(&["probe"]), ["other"]);
+        assert_eq!(f(&["probe", "form-interaction"]), ["interact"]);
+        assert_eq!(f(&["sqli", "xss", "env-probe"]), ["recon", "inject"]);
+        assert!(f(&[]).is_empty());
+    }
+
+    /// Paths from a week of real traffic that matched no rule.
+    #[test]
+    fn secret_hunting_seen_in_the_wild_is_sensitive() {
+        check(
+            classifier(),
+            "sensitive-path",
+            &[
+                "/.env_1",
+                "/.env_sample",
+                "/sendgrid.env",
+                "/.envrc",
+                "/__ENV.js",
+                "/env.js",
+                "/env.production.js",
+                "/config/env.js",
+                "/dashboard/env-config.js",
+                "/aws-exports.js",
+                "/assets/env.json",
+                "/.git-credentials",
+                "/.docker/config.json",
+                "/.boto",
+                "/.s3cfg",
+                "/.config/gcloud/credentials.db",
+                "/.config/gcloud/configurations/config_default",
+                "/.auth.json",
+                "/.gem/credentials",
+                "/.m2/settings.xml",
+                "/.zsh_history",
+                "/.psql_history",
+                "/client_secrets.json",
+                "/assets/other/service-account-credentials.json",
+                "/api/auth.json",
+                "/secrets.yml",
+                "/config/secrets.yml",
+                "/user_secrets.yml.old",
+                "/terraform.tfvars",
+                "/appsettings.Production.json",
+                "/application-secrets.properties",
+                "/app/config/parameters.yml.dist",
+                "/django/settings.py",
+                "/config/database.yml",
+                "/config.php.bak",
+                "/sites/default/settings.php.orig",
+                "/docker-compose.override.yml",
+                "/compose.yaml",
+                "/.gitlab-ci.yml",
+                "/.github/workflows/deploy.yml",
+                "/Jenkinsfile",
+                "/bitbucket-pipelines.yml",
+                "/git/wiki.git",
+                "/api/info/refs?service=git-upload-pack",
+                "/.gitmodules",
+                "/db_dump.sql",
+                "/database_backup.sql",
+            ],
+            &[
+                "/.environment",
+                "/environmental-report",
+                "/static/js/main.js",
+                "/history",
+                "/blog/docker-compose-tips",
+                "/settings",
+                "/github/workflows",
+                "/git/",
+            ],
+        );
+    }
+
+    #[test]
+    fn php_scripts_are_probes() {
+        check(
+            classifier(),
+            "php-probe",
+            &[
+                "/myglu.php",
+                "/wp-blink.php",
+                "/0.php?x=1",
+                "/zup.php7",
+                "/randkeyword.PhP7",
+            ],
+            &["/", "/php", "/phpmyadmin/", "/x.phps", "/a.php.html"],
+        );
     }
 
     #[test]

@@ -970,6 +970,8 @@ async fn admin_pages_and_deletes_with_session() {
     assert!(rows.contains("class=\"chip\" href=\"/requests?method=GET\""));
     let rows = get("/requests").await.unwrap().text().await.unwrap();
     assert!(!rows.contains("class=\"chip\""), "no filter, no chips");
+    // Quick filters are always there and apply in one click.
+    assert!(rows.contains("class=\"chip shortcut\" href=\"/requests?answer=tarpit\""));
     let html = get("/admin/analytics?range=24h")
         .await
         .unwrap()
@@ -1021,6 +1023,18 @@ async fn admin_pages_and_deletes_with_session() {
 
     let html = get("/admin/links").await.unwrap().text().await.unwrap();
     assert!(html.contains("CLUSTERHASH") && html.contains("/admin/links/fp/CLUSTERHASH"));
+    let html = get("/admin/links?kind=ssh&q=ab&shared=0")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // Kinds are a pill bar: the current one marked, the others keep every
+    // filter but "starts with"; the software group is set apart.
+    assert!(html.contains("<a href=\"/admin/links?kind=ssh&#38;shared=0\" title=\"Identity"));
+    assert!(html.contains("<a href=\"/admin/links?kind=ja4&#38;shared=0\" class=\"group-start\""));
+    assert!(html.contains(" aria-current=\"true\">SSH host key</a>"));
+    assert!(!html.contains("<select name=\"kind\""));
     let html = get("/admin/links?kind=ssh")
         .await
         .unwrap()

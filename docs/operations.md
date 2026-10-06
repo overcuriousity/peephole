@@ -327,7 +327,7 @@ drives the counter-scan level:
 
 | Weight | Meaning | Labels |
 |---|---|---|
-| 1 | single weak tell | `probe` (behavioural floor) |
+| 1 | single weak tell | `probe` (behavioural floor), `php-probe` |
 | 2 | automated reconnaissance | `scanner-ua`, `research-scanner`, `sensitive-path`, `path-scanner`, `ai-infra-probe`, `api-recon`, `proxy-probe`, `unusual-method`, `automation` |
 | 3 | exploit-adjacent | `form-interaction`, `write-method`, `xss`, `crlf-injection`, `webshell-probe`, `app-probe`, `cloud-infra-probe`, `credential-attack`, `mcp-probe`, `graphql-introspection`, `appliance-probe`, `iot-probe`, `inhuman-behavior` |
 | 4 | unambiguous exploit / post-exploitation | `sqli`, `rce`, `path-traversal`, `ssrf`, `ssti`, `nosqli`, `xxe`, `deserialization`, `webshell`, `mcp-abuse` |
@@ -340,11 +340,18 @@ Behavioural labels (`probe`, `path-scanner`, `form-interaction`, …) come
 from code, not rule files, and carry no tag.
 
 Label badge colours follow the family: blue = reconnaissance (any
-`*-probe` label, plus `scanner-ua`/`research-scanner`), red = injection,
+`*-probe` label, plus `scanner-ua`/`research-scanner`/`path-scanner`/
+`api-recon`/`graphql-introspection`), green = exposure (`sensitive-path`:
+secrets, config, repos, dumps, admin and debug pages), red = injection,
 violet = execution/impact, orange = interaction, solid = post-exploitation,
 grey = automation tells (including `proxy-probe`), neutral accent =
 everything else. New labels need no UI work: a `something-probe` label is
 blue automatically, everything unknown is neutral.
+
+The wall's "What they were after" counts each request once per family it
+touched. `path-scanner` and `php-probe` say how a request came, not what
+it was after, so they count (as reconnaissance) only when no other label
+names a family; "other" likewise only when nothing else applies.
 
 Weight rationale when adding rules: would you counter-scan a source that
 did *only* this? Recon gets 2, anything that touches an exploit gets 4

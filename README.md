@@ -51,7 +51,7 @@ nmap.
   after a delay (`[public] delay_minutes` plus up to `jitter_minutes` more,
   5 + 0–5 min by default) so the wall cannot be used to watch a scan live:
   trends against the previous period, scanner time wasted in the tarpit, requests over time
-  by severity, a weekday × hour heatmap, attack families and an OWASP Top 10 /
+  by severity, a weekday × hour heatmap of the last 7 days, attack families and an OWASP Top 10 /
   Automated Threats map, a world map, top IPs and networks, the ports most
   often found open on the scanned sources, and a searchable IP directory
   (exact, prefix or CIDR). Each IP has its activity calendar, rank and

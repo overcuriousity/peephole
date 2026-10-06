@@ -127,7 +127,7 @@ pub struct RequestFilter {
     /// Admin only: `http`, `https`, …; `unknown` for a row without one.
     pub transport: Option<String>,
     /// Admin only: what the trap answered (`not-found`, `decoy:…`);
-    /// `unknown` for a row without one.
+    /// `unknown` for a row without one; `decoy` for every `decoy:…`.
     pub answer: Option<String>,
     #[serde(default, deserialize_with = "lenient_i64")]
     pub page: Option<i64>,
@@ -544,10 +544,16 @@ fn request_filter_sql(f: &RequestFilter, a: Audience, indexed: bool) -> (String,
             sql.push_str(" AND r.user_agent = ?");
             binds.push(v);
         }
-        // Analytics shows a missing value as `unknown`.
+        // Analytics shows a missing value as `unknown`. An answer without
+        // a `:` also takes its variants: `decoy` finds `decoy:dotenv`.
         for (col, v) in [("transport", &f.transport), ("answer", &f.answer)] {
             match nonempty(v).as_deref() {
                 Some("unknown") => sql.push_str(&format!(" AND r.{col} IS NULL")),
+                Some(v) if col == "answer" && !v.contains(':') => {
+                    sql.push_str(" AND (r.answer = ? OR r.answer LIKE ? ESCAPE '\\')");
+                    binds.push(v.to_string());
+                    binds.push(format!("{}:%", like_escape(v)));
+                }
                 Some(v) => {
                     sql.push_str(&format!(" AND r.{col} = ?"));
                     binds.push(v.to_string());
@@ -1291,7 +1297,7 @@ mod tests {
         assert_eq!(ov.net, "203.0.113.0/24");
         assert_eq!((ov.net_count, ov.asn_count), (1, 1));
         assert_eq!(ov.neighbours[0].ip, "203.0.113.200");
-        assert_eq!(ov.families[0].name, "other");
+        assert_eq!(ov.families[0].name, "exposure");
         let c = s.ip_by_addr("2001:db8::1").await.unwrap().unwrap();
         let ov6 = s.ip_overview(c.id).await.unwrap().unwrap();
         assert_eq!(ov6.net, "2001:db8::/48");
@@ -1553,6 +1559,8 @@ mod tests {
         assert_eq!(n(f(Some("PROPFIND"), Some("https"), None)).await, 1);
         assert_eq!(n(f(Some("PROPFIND"), Some("unknown"), None)).await, 1);
         assert_eq!(n(f(None, None, Some("decoy:dotenv"))).await, 1);
+        assert_eq!(n(f(None, None, Some("decoy"))).await, 1, "every decoy");
+        assert_eq!(n(f(None, None, Some("decoy:git-config"))).await, 0);
         assert_eq!(n(f(Some("PROPFIND"), None, Some("unknown"))).await, 1);
         let all = s
             .search_requests(&RequestFilter::default(), Audience::Public)

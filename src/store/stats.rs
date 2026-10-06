@@ -138,7 +138,8 @@ pub struct Stats {
     pub top_labels: Vec<Named>,
     pub severity_distribution: Vec<Named>,
     pub timeline: Vec<Bucket>,
-    /// Requests per weekday (0 = Monday) and UTC hour.
+    /// Requests per weekday (0 = Monday) and UTC hour over the last 7
+    /// days, whatever the range.
     pub heatmap: Vec<[i64; 24]>,
     /// The previous window of the same length; `None` for all time.
     pub previous: Option<Previous>,
@@ -591,33 +592,28 @@ impl Store {
     }
 
     /// The timeline (hourly or daily, as the range wants) with each bucket
-    /// split by severity, and the weekday × hour heatmap, from one pass of
-    /// hourly buckets.
+    /// split by severity, and the weekday × hour heatmap. The heatmap always
+    /// covers the last 7 days, whatever the range, so every weekday shows;
+    /// on the 7-day range both come from one pass of hourly buckets.
     async fn timeline_and_heatmap(
         &self,
         r: Range,
         a: Audience,
     ) -> Result<(Vec<Bucket>, Vec<[i64; 24]>)> {
-        let (w, since) = r.ts_clause("r.ts");
-        let w = w + &a.released("r");
-        let sql = format!(
-            "SELECT strftime('%Y-%m-%dT%H:00', r.ts) AS h, r.severity, COUNT(*) FROM requests r
-             WHERE 1=1{w} GROUP BY h, r.severity ORDER BY h"
-        );
-        let rows = bind_since!(
-            sqlx::query_as::<_, (Option<String>, i64, i64)>(sqlx::AssertSqlSafe(sql.as_str())),
-            since
-        )
-        .fetch_all(&self.read)
-        .await?;
+        let rows = self.hourly_by_severity(r, a).await?;
+        let week = match r {
+            Range::D7 => None,
+            _ => Some(self.hourly_by_severity(Range::D7, a).await?),
+        };
         let mut heatmap = vec![[0i64; 24]; 7];
-        let mut timeline: Vec<Bucket> = Vec::new();
-        for (h, sev, n) in rows {
-            let Some(h) = h else { continue };
-            if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&h, "%Y-%m-%dT%H:%M") {
+        for (h, _, n) in week.as_ref().unwrap_or(&rows) {
+            if let Ok(t) = chrono::NaiveDateTime::parse_from_str(h, "%Y-%m-%dT%H:%M") {
                 use chrono::{Datelike, Timelike};
                 heatmap[t.weekday().num_days_from_monday() as usize][t.hour() as usize] += n;
             }
+        }
+        let mut timeline: Vec<Bucket> = Vec::new();
+        for (h, sev, n) in rows {
             let key = if r.hourly() { h } else { h[..10].to_string() };
             if timeline.last().map(|b| b.ts != key).unwrap_or(true) {
                 timeline.push(Bucket {
@@ -631,6 +627,27 @@ impl Store {
             b.by_severity[sev.clamp(0, 4) as usize] += n;
         }
         Ok((timeline, heatmap))
+    }
+
+    /// Request counts per UTC hour (`%Y-%m-%dT%H:00`) and severity, oldest
+    /// first.
+    async fn hourly_by_severity(&self, r: Range, a: Audience) -> Result<Vec<(String, i64, i64)>> {
+        let (w, since) = r.ts_clause("r.ts");
+        let w = w + &a.released("r");
+        let sql = format!(
+            "SELECT strftime('%Y-%m-%dT%H:00', r.ts) AS h, r.severity, COUNT(*) FROM requests r
+             WHERE 1=1{w} GROUP BY h, r.severity ORDER BY h"
+        );
+        let rows = bind_since!(
+            sqlx::query_as::<_, (Option<String>, i64, i64)>(sqlx::AssertSqlSafe(sql.as_str())),
+            since
+        )
+        .fetch_all(&self.read)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(h, sev, n)| Some((h?, sev, n)))
+            .collect())
     }
 
     /// Requests and distinct IPs in the window of the same length just
@@ -678,13 +695,7 @@ impl Store {
         let mut tags: HashMap<String, i64> = HashMap::new();
         for (labels, owasp, n) in rows {
             let labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
-            let mut seen: Vec<&'static str> = labels
-                .iter()
-                .map(|l| crate::classify::label_family(l))
-                .collect();
-            seen.sort_unstable();
-            seen.dedup();
-            for f in seen {
+            for f in crate::classify::request_families(&labels) {
                 *fam.entry(f).or_default() += n;
             }
             let mut owasp: Vec<String> = serde_json::from_str(&owasp).unwrap_or_default();
@@ -1318,6 +1329,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heatmap_covers_the_last_week_whatever_the_range() {
+        let s = seeded().await;
+        // The 3-day-old request is outside 24h but still on the heatmap.
+        let day = s.stats(Range::H24).await.unwrap();
+        assert_eq!(day.timeline.iter().map(|b| b.count).sum::<i64>(), 3);
+        assert_eq!(day.heatmap.iter().flatten().sum::<i64>(), 4);
+        let all = s.stats(Range::All).await.unwrap();
+        assert_eq!(all.heatmap, s.stats(Range::D7).await.unwrap().heatmap);
+    }
+
+    #[tokio::test]
     async fn timeline_is_split_by_severity_and_heatmap_adds_up() {
         let s = seeded().await;
         let st = s.stats(Range::D7).await.unwrap();
@@ -1362,8 +1384,9 @@ mod tests {
         // sqli and xss are both injection: one request, counted once.
         assert_eq!(get(&st.families, "inject"), Some(1));
         assert_eq!(get(&st.families, "recon"), Some(1));
-        // The three seeded requests carry "sensitive-path": no family.
-        assert_eq!(get(&st.families, "other"), Some(3));
+        // The three seeded requests carry "sensitive-path".
+        assert_eq!(get(&st.families, "exposure"), Some(3));
+        assert_eq!(get(&st.families, "other"), None);
         assert_eq!(get(&st.owasp, "A03:2021"), Some(1));
         assert_eq!(get(&st.owasp, "OAT-018"), Some(3));
         assert_eq!(st.owasp[0].name, "OAT-018", "most frequent first");

@@ -19,3 +19,13 @@ owasp = ["A08:2021"]
 # China Chopper parameter names z0/z1/z2 on any script. A generic
 # /index.php?action=edit does not match.
 target_regex = '''/(x|1|2|aa|aaa|alfa|b374k|c99|cmd|cong|exec|hack|r57|sh3ll|shell|shellz|small|up|upload|wso|root|backdoor)\.(php[3457]?|phtml|asp|aspx|jsp|cgi|pl)\?[^ ]{0,500}(cmd|c|exec|command|act|do|pass|pwd)=|\.(php[3457]?|phtml|asp|aspx|jsp)\?([^ ]{0,500}[&?])?(z0|z1|z2)='''
+
+[[rule]]
+label = "php-probe"
+weight = 1
+owasp = ["OAT-018"]
+# Any PHP script: the trap serves none, so a request for one is a guess.
+# Most are the long filename lists (/myglu.php, /wp-blink.php, /0.php)
+# sprayed to find shells others left behind, but a name alone does not
+# prove that, so this is reconnaissance, not webshell-probe.
+target_regex = '''\.php\d?(\?|$)'''

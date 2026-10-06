@@ -72,9 +72,10 @@
   --sev-0-fill: #c4c1b6; --sev-1-fill: #d99a0b; --sev-2-fill: #d9661c;
   --sev-3-fill: #bd2f30; --sev-4-fill: #6a2090;
 
-  /* Label families: recon blue, injection red, impact violet, interaction
+  /* Label families: recon blue, exposure green, injection red, impact violet, interaction
      orange, bot grey. Post-exploitation is a solid badge (no tokens). */
   --cat-recon: #1d4ed8;    --cat-recon-dim: rgba(29, 78, 216, 0.12);
+  --cat-exposure: #0f7a3d; --cat-exposure-dim: rgba(15, 122, 61, 0.12);
   --cat-inject: #b31c1c;   --cat-inject-dim: rgba(179, 28, 28, 0.12);
   --cat-impact: #7a1fa2;   --cat-impact-dim: rgba(122, 31, 162, 0.12);
   --cat-interact: #b04a00; --cat-interact-dim: rgba(176, 74, 0, 0.12);
@@ -128,6 +129,7 @@
     --sev-3-fill: #ee5d5d; --sev-4-fill: #e9a7ff;
 
     --cat-recon: #7aa2ff;    --cat-recon-dim: rgba(122, 162, 255, 0.15);
+    --cat-exposure: #4ade80; --cat-exposure-dim: rgba(74, 222, 128, 0.15);
     --cat-inject: #ff5c5c;   --cat-inject-dim: rgba(255, 92, 92, 0.15);
     --cat-impact: #d17dff;   --cat-impact-dim: rgba(209, 125, 255, 0.15);
     --cat-interact: #ff9440; --cat-interact-dim: rgba(255, 148, 64, 0.15);
@@ -175,6 +177,7 @@
   --sev-0-fill: #3a3f52; --sev-1-fill: #73561a; --sev-2-fill: #c2531f;
   --sev-3-fill: #ee5d5d; --sev-4-fill: #e9a7ff;
   --cat-recon: #7aa2ff;    --cat-recon-dim: rgba(122, 162, 255, 0.15);
+  --cat-exposure: #4ade80; --cat-exposure-dim: rgba(74, 222, 128, 0.15);
   --cat-inject: #ff5c5c;   --cat-inject-dim: rgba(255, 92, 92, 0.15);
   --cat-impact: #d17dff;   --cat-impact-dim: rgba(209, 125, 255, 0.15);
   --cat-interact: #ff9440; --cat-interact-dim: rgba(255, 148, 64, 0.15);
