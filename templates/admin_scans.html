@@ -52,6 +52,7 @@
   </div>
   {% endif %}
   {% if pace.m.failed_24h > 0 %}<p class="muted pace-retry"><a href="/admin/scans?status=failed#history">{{ pace.m.failed_24h }} failed in 24 h →</a></p>{% endif %}
+  {% if pace.m.refused_24h > 0 %}<p class="muted pace-retry"><a href="/admin/scans?status=refused#history">{{ pace.m.refused_24h }} refused in 24 h →</a></p>{% endif %}
 </section>
 <section class="card">
   <div class="card-head"><h2>Live queue</h2><span class="row"><span class="muted" data-queue-total{% if active_total <= crate::admin::scans::LIVE_ROWS %} hidden{% endif %}>newest {{ crate::admin::scans::LIVE_ROWS }} of {{ active_total }}</span><span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></span></div>
