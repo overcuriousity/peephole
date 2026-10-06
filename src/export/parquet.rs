@@ -65,6 +65,7 @@ fn schema() -> SchemaRef {
         s("ja4h", true),
         s("answer", true),
         i("decoy_v", true),
+        s("decoy_in", true),
         Field::new(
             "canary_used_from",
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
@@ -205,6 +206,7 @@ fn batch(schema: SchemaRef, rows: &[ExportRow]) -> Result<RecordBatch> {
         strs(rows.iter().map(|r| r.ja4h.as_deref())),
         strs(rows.iter().map(|r| r.answer.as_deref())),
         ints(rows.iter().map(|r| r.decoy_v)),
+        strs(rows.iter().map(|r| r.decoy_in.as_deref())),
         Arc::new(used_from.finish()),
         ints(rows.iter().map(|r| r.status)),
         ints(rows.iter().map(|r| r.held_ms)),

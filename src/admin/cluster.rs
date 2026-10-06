@@ -237,6 +237,11 @@ struct ClusterPage {
     detached: Option<&'static str>,
     /// Members whose older history no reachable peer can give this node.
     unserved: Option<String>,
+    /// Requests and scans each member contributed, by member key, as
+    /// "count · share"; the full breakdown is on the node page.
+    shares: std::collections::HashMap<String, (String, String)>,
+    /// The same for rows created before this node joined, if any.
+    unshared: Option<(String, String)>,
 }
 
 /// This node's runtime settings as its own page shows them.
@@ -746,17 +751,53 @@ async fn render_page(st: &AdminState) -> AppResult<Html<String>> {
             standalone: true,
             detached: None,
             unserved: None,
+            shares: Default::default(),
+            unshared: None,
         });
     };
     let check = rules_check(st, node).await?;
     let (me, members) = views(node, &check).await?;
+    let contrib = contributions(node).await?;
+    let (shares, unshared) = share_cells(&contrib);
     render(&ClusterPage {
         chrome: Chrome::new(true, "admin"),
         rows: std::iter::once(me).chain(members).collect(),
         standalone: false,
         detached: node.detached().map(|d| d.label()),
         unserved: unserved(node).await?,
+        shares,
+        unshared,
     })
+}
+
+/// Requests and scans per member as "count · share of all", keyed by
+/// member key, and the not-yet-shared row apart.
+type Cells = (String, String);
+fn share_cells(
+    contrib: &[ContribView],
+) -> (std::collections::HashMap<String, Cells>, Option<Cells>) {
+    let (req, scans) = contrib
+        .iter()
+        .fold((0, 0), |(r, s), c| (r + c.requests, s + c.scans));
+    let cell = |n: i64, of: i64| match of {
+        0 => "0".to_string(),
+        _ => format!(
+            "{} · {} %",
+            super::views::thousands(n),
+            (n * 100 + of / 2) / of
+        ),
+    };
+    let mut map = std::collections::HashMap::new();
+    let mut unshared = None;
+    for c in contrib {
+        let v = (cell(c.requests, req), cell(c.scans, scans));
+        if c.key.is_empty() {
+            unshared = Some(v);
+        } else {
+            map.insert(c.key.clone(), v);
+        }
+    }
+    (map, unshared)
 }
 
 /// The fingerprint of the rules built into this binary.

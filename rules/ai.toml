@@ -12,7 +12,7 @@ owasp = ["OAT-004"]
 # LLM serving APIs: OpenAI-compatible /v1/*, Ollama /api/*. Anchored at the
 # root. /api/tags also names a blog taxonomy endpoint — accepted as the
 # family's one naming-collision risk (a wrong label, nothing more).
-target_regex = '''^/v1/(models|chat/completions|completions|embeddings|moderations|images|audio|responses|messages)(/|\?|$)|^/api/(tags|generate|chat|show|ps|version|embeddings|embed|pull|create|delete|copy|blobs)(/|\?|$)|^/(ollama|openai)(/|\?|$)|^/\.well-known/ai-plugin\.json'''
+target_regex = '''^/v1/(models|chat/completions|completions|embeddings|moderations|images|audio|responses|messages)(/|\?|$)|^/api/(tags|generate|chat|show|ps|version|embeddings|embed|pull|create|delete|copy|blobs)(/|\?|$)|^/(ollama|openai)(/|\?|$)|^/\.well-known/ai-plugin\.json|^/api/v1/(chat/completions|models)(/|\?|$)|^/(anthropic|api/anthropic|litellm)/v1/|^/v1/complete(\?|$)|^/openai/deployments/'''
 
 [[rule]]
 label = "ai-infra-probe"
@@ -28,6 +28,16 @@ weight = 2
 owasp = ["OAT-004"]
 # Vector databases (Chroma, Qdrant, Weaviate) and model artifacts.
 target_regex = '''^/api/v[12]/(collections|heartbeat|tenants|databases)(/|\?|$)|^/collections(/|\?|$)|^/(v1/)?(schema|objects|meta)(/|\?|$)|\.(gguf|safetensors|ckpt|onnx|tflite|pth|h5|pkl)(\?|$)|/(pytorch_model|model)\.(json|safetensors|pkl)(\?|$)'''
+
+[[rule]]
+label = "llm-key-use"
+weight = 3
+owasp = ["OAT-004"]
+# Trying to spend someone's inference: a request carrying an LLM-provider
+# key shape (OpenAI Bearer sk-, Anthropic x-api-key sk-ant-, Azure OpenAI api-key: 32 hex characters).
+# Header-only on purpose: matchers are OR-combined, so adding a path matcher
+# would label every request to that path. Headers are newline-joined, hence (?m).
+header_regex = '''(?m)^(authorization:[ \t]*bearer[ \t]+sk-\S|x-api-key:[ \t]*sk-ant-\S|api-key:[ \t]*[0-9a-fA-F]{32}\b)'''
 
 [[rule]]
 label = "mcp-probe"

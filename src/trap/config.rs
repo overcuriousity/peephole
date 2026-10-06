@@ -53,6 +53,16 @@ pub struct TrapConfig {
     /// Seconds between drips; shorter than the hold.
     #[serde(default = "default_tarpit_drip_every_secs")]
     pub tarpit_drip_every_secs: u64,
+    /// Legacy MCP SSE streams held at once, in a pool of their own. Past it
+    /// the request gets the trap's normal answer. 0 turns them off.
+    #[serde(default = "default_mcp_sse_pool")]
+    pub mcp_sse_pool: usize,
+    /// Of those, at most this many from one source (IPv6 by /64).
+    #[serde(default = "default_mcp_sse_per_source")]
+    pub mcp_sse_per_source: usize,
+    /// Longest an SSE stream is held, in seconds.
+    #[serde(default = "default_mcp_sse_hold_secs")]
+    pub mcp_sse_hold_secs: u64,
 }
 
 fn default_record_rate() -> f64 {
@@ -82,6 +92,15 @@ fn default_tarpit_drip_bytes() -> usize {
 fn default_tarpit_drip_every_secs() -> u64 {
     10
 }
+fn default_mcp_sse_pool() -> usize {
+    64
+}
+fn default_mcp_sse_per_source() -> usize {
+    2
+}
+fn default_mcp_sse_hold_secs() -> u64 {
+    300
+}
 
 impl Default for TrapConfig {
     fn default() -> Self {
@@ -96,6 +115,9 @@ impl Default for TrapConfig {
             tarpit_hold_secs: default_tarpit_hold_secs(),
             tarpit_drip_bytes: default_tarpit_drip_bytes(),
             tarpit_drip_every_secs: default_tarpit_drip_every_secs(),
+            mcp_sse_pool: default_mcp_sse_pool(),
+            mcp_sse_per_source: default_mcp_sse_per_source(),
+            mcp_sse_hold_secs: default_mcp_sse_hold_secs(),
         }
     }
 }
@@ -110,6 +132,15 @@ impl TrapConfig {
         }
         if self.tarpit_pool > MAX_TARPIT_POOL {
             bail!("trap.tarpit_pool must be at most {MAX_TARPIT_POOL}");
+        }
+        if self.mcp_sse_pool > MAX_TARPIT_POOL {
+            bail!("trap.mcp_sse_pool must be at most {MAX_TARPIT_POOL}");
+        }
+        if self.mcp_sse_pool > 0 && self.mcp_sse_per_source == 0 {
+            bail!("trap.mcp_sse_per_source must be at least 1");
+        }
+        if self.mcp_sse_hold_secs == 0 || self.mcp_sse_hold_secs > 3600 {
+            bail!("trap.mcp_sse_hold_secs must be between 1 and 3600");
         }
         if self.tarpit_pool > 0 {
             if self.tarpit_per_source == 0 {

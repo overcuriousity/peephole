@@ -5,6 +5,7 @@ pub mod cli;
 pub mod cluster;
 pub mod cluster_access;
 pub mod countries;
+pub mod decoys;
 pub mod error;
 pub mod limit;
 pub mod links;
@@ -134,6 +135,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(auth::auth_routes())
         .merge(pages::routes())
         .merge(links::routes())
+        .merge(decoys::routes())
         .merge(search::routes())
         .merge(system::routes())
         .merge(scans::routes())

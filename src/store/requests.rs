@@ -37,6 +37,8 @@ pub struct NewRequest {
     pub decoy_site: Option<String>,
     /// How long a `tarpit` answer held the client, in milliseconds.
     pub held_ms: Option<i64>,
+    /// What an MCP or LLM decoy was rendered from (compact JSON).
+    pub decoy_in: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -85,6 +87,8 @@ pub struct RequestRow {
     pub decoy_site: Option<String>,
     /// How long a `tarpit` answer held the client, in milliseconds.
     pub held_ms: Option<i64>,
+    /// What an MCP or LLM decoy was rendered from (compact JSON).
+    pub decoy_in: Option<String>,
 }
 
 /// Distinct refresh intervals; later lookups reuse the last one (over

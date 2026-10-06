@@ -175,6 +175,8 @@ pub(crate) struct PaceView {
     pub(crate) max_timeout_min: u64,
     /// Level-4 limit at the current timeout, e.g. "120".
     pub(crate) level4_timeout_min: String,
+    /// Most level-4 scans at once at the current worker count.
+    pub(crate) level4_cap: usize,
     /// Share of last-24h jobs that hit the timeout, e.g. "25%".
     pub(crate) timeout_share: String,
     pub(crate) timeouts_high: bool,
@@ -287,6 +289,7 @@ pub(crate) async fn pace_view(
             4,
             st.cfg.scan.level4_timeout_factor,
         )),
+        level4_cap: pace::level4_cap(current.max_workers, st.cfg.scan.level4_max_share),
         timeout_share: format!("{:.0}%", r.timeout_share * 100.0),
         timeouts_high: r.pace.timeout_secs > current.timeout_secs,
         notice,

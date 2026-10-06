@@ -1578,7 +1578,7 @@ secure_cookies = false
 account_id = "1"
 license_key = "k"
 [scan]
-max_workers = 1
+max_workers = 2
 timeout_secs = 60
 rescan_cooldown_hours = 24
 max_scans_per_hour = 100
@@ -2943,7 +2943,8 @@ async fn a_served_decoy_renders_again_from_its_row() {
     let again = peephole::canary::cli::render_uid(&store, &uid)
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(again.body, body);
 }
 
@@ -2973,7 +2974,8 @@ async fn a_decoy_renders_the_same_after_adoption() {
     let again = peephole::canary::cli::render_uid(&store, &uid)
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(again.body, body);
 }
 

@@ -56,10 +56,14 @@ nmap.
   often found open on the scanned sources, and a searchable IP directory
   (exact, prefix or CIDR). Each IP has its activity calendar, rank and
   neighbours (same /24 and ASN). The wall lists the latest requests as method
-  and path only (no query string, cut at 80 characters); bodies, headers,
-  query strings and fingerprints are never public; of the scan results only per-port counts of distinct IPs are, and a
-  port only once it was found open on at least three. Rule labels, and the
-  families and OWASP tags derived from them, can be hidden too.
+  and path only (no query string, cut at 80 characters). Bodies, headers,
+  query strings and fingerprints are never public. Of the scan results only
+  per-port counts of distinct IPs are, and a port only once it was found open
+  on at least three. The card "What they asked our fake AI" shows only our
+  own tool names and model names that are lowercased, match
+  `[a-z0-9._:/-]{1,64}` and were asked by at least 2 IPs (else "other").
+  Rule labels, and the families and OWASP tags derived from them, can be
+  hidden too.
 - **Admin area** (FIDO2 security keys only, no passwords) — request search
   and inspection (with the same IP's and same JA4's other requests), a live
   feed of new requests, analytics (top paths, user agents, JA4, methods,

@@ -300,6 +300,18 @@ pub struct ScanConfig {
     /// `timeout_secs`, capped at 12 h.
     #[serde(default = "default_level4_timeout_factor")]
     pub level4_timeout_factor: u32,
+    /// Share of `max_workers` that may run level-4 scans at once (rounded
+    /// down, at least one), so shorter levels never wait behind them.
+    #[serde(default = "default_level4_share")]
+    pub level4_max_share: f64,
+    /// nmap `--min-rate` (packets per second) for level 4, so hosts that
+    /// drop probes cannot stretch a full-range scan for hours. Per node: a
+    /// scanner behind a home router may want less.
+    #[serde(default = "default_min_rate")]
+    pub min_rate: u32,
+    /// Level 4 also scans the top 50 UDP ports.
+    #[serde(default)]
+    pub level4_udp: bool,
     #[serde(default = "default_cooldown")]
     pub rescan_cooldown_hours: i64,
     #[serde(default = "default_rate")]
@@ -432,6 +444,15 @@ impl ScanConfig {
     }
 }
 
+pub const MIN_RATE: u32 = 50;
+pub const MAX_RATE: u32 = 5000;
+
+/// nmap's 50 most frequent UDP ports (`nmap-services` frequency order),
+/// for level 4 with `scan.level4_udp`.
+pub const UDP_TOP50: &str = "631,161,137,123,138,1434,445,135,67,53,139,500,68,520,1900,\
+4500,514,49152,162,69,5353,111,49154,1701,998,996,997,999,3283,49153,1812,136,2222,2049,\
+32768,5060,1025,1433,3456,80,20031,1026,7,1646,1645,593,518,2048,626,1027";
+
 fn default_nmap_path() -> String {
     "nmap".into()
 }
@@ -440,11 +461,17 @@ fn default_workers() -> usize {
     2
 }
 fn default_level4_timeout_factor() -> u32 {
-    4
+    2
+}
+fn default_level4_share() -> f64 {
+    0.5
+}
+fn default_min_rate() -> u32 {
+    300
 }
 
 fn default_timeout() -> u64 {
-    // Full-range levels (-p- -sV -O) on filtered hosts need well over 15 min.
+    // Base limit; level 4 gets level4_timeout_factor times this.
     1800
 }
 fn default_cooldown() -> i64 {
@@ -460,6 +487,9 @@ impl Default for ScanConfig {
             max_workers: default_workers(),
             timeout_secs: default_timeout(),
             level4_timeout_factor: default_level4_timeout_factor(),
+            level4_max_share: default_level4_share(),
+            min_rate: default_min_rate(),
+            level4_udp: false,
             rescan_cooldown_hours: default_cooldown(),
             max_scans_per_hour: default_rate(),
             never_scan: vec![],
@@ -482,7 +512,10 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("webauthn", "secure_cookies", "true"),
     ("scan", "max_workers", "2"),
     ("scan", "timeout_secs", "1800"),
-    ("scan", "level4_timeout_factor", "4"),
+    ("scan", "level4_timeout_factor", "2"),
+    ("scan", "level4_max_share", "0.5"),
+    ("scan", "min_rate", "300"),
+    ("scan", "level4_udp", "false"),
     ("scan", "rescan_cooldown_hours", "24"),
     ("scan", "max_scans_per_hour", "30"),
     ("scan", "never_scan", "[]"),
@@ -660,9 +693,12 @@ impl Config {
         // Bounds mirror the runtime pace limits (scan::pace) so the config
         // defaults are always a valid pace.
         let s = &self.scan;
-        if !(1..=crate::scan::pace::MAX_WORKERS).contains(&s.max_workers) {
+        if !(crate::scan::pace::MIN_WORKERS..=crate::scan::pace::MAX_WORKERS)
+            .contains(&s.max_workers)
+        {
             bail!(
-                "scan.max_workers must be between 1 and {}",
+                "scan.max_workers must be between {} and {}",
+                crate::scan::pace::MIN_WORKERS,
                 crate::scan::pace::MAX_WORKERS
             );
         }
@@ -680,6 +716,12 @@ impl Config {
                 "scan.level4_timeout_factor must be between 1 and {}",
                 crate::scan::pace::MAX_LEVEL4_FACTOR
             );
+        }
+        if !(s.level4_max_share > 0.0 && s.level4_max_share <= 1.0) {
+            bail!("scan.level4_max_share must be above 0 and at most 1");
+        }
+        if !(MIN_RATE..=MAX_RATE).contains(&s.min_rate) {
+            bail!("scan.min_rate must be between {MIN_RATE} and {MAX_RATE}");
         }
         if !(0..=crate::settings::MAX_COOLDOWN_HOURS).contains(&s.rescan_cooldown_hours) {
             bail!(
@@ -761,10 +803,11 @@ impl Config {
     /// Operator overrides come from `scan.level_argv`.
     ///
     /// Non-intrusive by design: no `-A`, no intrusive NSE scripts, and timing
-    /// capped at `-T3`. Severity escalates by *scope* — more ports, service
-    /// (`-sV`) and OS (`-O`) detection, then discovery/safe scripts — not by
-    /// speed or aggressiveness, so a higher level maps to a more thorough but
-    /// still defensible scan.
+    /// template capped at `-T3`; level 4 also gets `--min-rate` (see `scan::nmap_argv`)
+    /// so hosts that drop probes cannot stretch a full-range scan. Severity escalates
+    /// by *scope* — more ports, service (`-sV`) and OS (`-O`) detection, then
+    /// discovery/safe scripts — not by speed or aggressiveness, so a higher level
+    /// maps to a more thorough but still defensible scan.
     ///
     /// `-Pn`: the target just connected to us, so it is up; nmap's own
     /// discovery probes are often filtered and would report it down. The
@@ -792,9 +835,18 @@ impl Config {
         // keys and algorithm lists, the TLS certificate), each one handshake
         // with a port nmap already found open, all in `safe`.
         const IDENTITY_SCRIPTS: &str = "ssh-hostkey,ssh2-enum-algos,ssl-cert";
-        let argv: &[&str] = match level {
-            1 => &["-Pn", "-sS", "-T2", "--top-ports", "100"],
-            2 => &[
+        let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<String>>();
+        let argv = match level {
+            1 => s(&[
+                "-Pn",
+                "-sS",
+                "-sV",
+                "--version-light",
+                "-T3",
+                "--top-ports",
+                "100",
+            ]),
+            2 => s(&[
                 "-Pn",
                 "-sS",
                 "-sV",
@@ -804,8 +856,8 @@ impl Config {
                 "1000",
                 "--script",
                 IDENTITY_SCRIPTS,
-            ],
-            3 => &[
+            ]),
+            3 => s(&[
                 "-Pn",
                 "-sS",
                 "-sV",
@@ -813,24 +865,34 @@ impl Config {
                 "-T3",
                 "--top-ports",
                 "1000",
+                "--traceroute",
                 "--script",
                 SCRIPTS,
-            ],
-            4 => &[
-                "-Pn",
-                "-sS",
-                "-sV",
-                "-O",
-                "-T3",
-                "-p-",
-                "--max-retries",
-                "2",
-                "--script",
-                SCRIPTS,
-            ],
+            ]),
+            4 => {
+                let mut v = s(&["-Pn", "-sS"]);
+                if self.scan.level4_udp {
+                    v.push("-sU".into());
+                    v.push("-p".into());
+                    v.push(format!("T:1-65535,U:{UDP_TOP50}"));
+                } else {
+                    v.push("-p-".into());
+                }
+                v.extend(s(&[
+                    "-sV",
+                    "-O",
+                    "-T3",
+                    "--max-retries",
+                    "1",
+                    "--traceroute",
+                    "--script",
+                    SCRIPTS,
+                ]));
+                v
+            }
             _ => return None,
         };
-        Some(argv.iter().map(|s| s.to_string()).collect())
+        Some(argv)
     }
 }
 
@@ -1034,6 +1096,64 @@ license_key = "k"
 database_path = "/tmp/x.db"
 data_dir = "/tmp"
 "#;
+
+    /// A scanner-only config with `extra` under `[scan]`.
+    fn with_scan(extra: &str) -> anyhow::Result<Config> {
+        parse(&format!(
+            "{BASE}[roles]\nlistener = false\nweb = false\n[scan]\n{extra}\n"
+        ))
+    }
+
+    #[test]
+    fn rebalanced_presets() {
+        let cfg = with_scan("").unwrap();
+        let argv = |l| cfg.default_level_argv(l).unwrap();
+        let has = |l, f: &str| argv(l).iter().any(|a| a == f);
+        assert!(!has(1, "-T2") && has(1, "-T3"), "{:?}", argv(1));
+        assert!(has(1, "--version-light") && has(1, "-sV"));
+        assert!(!has(1, "-O"));
+        assert!(!has(2, "--traceroute"));
+        assert!(has(3, "--traceroute") && has(4, "--traceroute"));
+        let a4 = argv(4);
+        let after = |f: &str| a4.iter().position(|a| a == f).map(|i| a4[i + 1].clone());
+        assert_eq!(after("--max-retries").as_deref(), Some("1"));
+        assert!(has(4, "-p-") && !has(4, "-sU"), "UDP off by default");
+    }
+
+    #[test]
+    fn level4_udp_scans_all_tcp_and_top_udp() {
+        let cfg = with_scan("level4_udp = true").unwrap();
+        let a4 = cfg.default_level_argv(4).unwrap();
+        assert!(a4.iter().any(|a| a == "-sU") && a4.iter().any(|a| a == "-sS"));
+        assert!(!a4.iter().any(|a| a == "-p-"));
+        let p = a4
+            .iter()
+            .position(|a| a == "-p")
+            .map(|i| a4[i + 1].clone())
+            .unwrap();
+        assert_eq!(p, format!("T:1-65535,U:{UDP_TOP50}"));
+        assert_eq!(UDP_TOP50.split(',').count(), 50);
+    }
+
+    #[test]
+    fn scheduling_keys_have_defaults() {
+        let s = ScanConfig::default();
+        assert_eq!(s.level4_max_share, 0.5);
+        assert_eq!(s.min_rate, 300);
+        assert!(!s.level4_udp);
+        assert_eq!(s.level4_timeout_factor, 2);
+    }
+
+    #[test]
+    fn scheduling_keys_are_validated() {
+        let err = |extra: &str| format!("{:#}", with_scan(extra).unwrap_err());
+        assert!(err("max_workers = 1").contains("scan.max_workers must be between 2"));
+        assert!(err("level4_max_share = 0.0").contains("level4_max_share"));
+        assert!(err("level4_max_share = 1.5").contains("level4_max_share"));
+        assert!(err("min_rate = 10").contains("scan.min_rate"));
+        assert!(err("min_rate = 9000").contains("scan.min_rate"));
+        assert!(with_scan("max_workers = 2\nlevel4_max_share = 1.0\nmin_rate = 50").is_ok());
+    }
 
     #[test]
     fn scanner_only_needs_no_listener_web_or_maxmind() {

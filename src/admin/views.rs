@@ -258,6 +258,12 @@ pub const LINKS_TABS: &[(&str, &str, &str)] = &[
     ("canaries", "/admin/links/canaries", "Canaries"),
 ];
 
+pub const DECOYS_TABS: &[(&str, &str, &str)] = &[
+    ("mcp", "/admin/decoys?tab=mcp", "MCP"),
+    ("llm", "/admin/decoys?tab=llm", "LLM"),
+    ("web", "/admin/decoys?tab=web", "Web"),
+];
+
 /// A value's page under Links. Values are percent-encoded: SSH
 /// fingerprints are base64 (`/`, `+`).
 pub fn link_href(kind: &str, value: &str) -> String {

@@ -5,6 +5,63 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Added
+
+- AI decoys. The trap answers MCP and LLM-API probes instead of a 404, so
+  the next steps are recorded.
+  - MCP over Streamable HTTP (`/mcp`, `/messages`) and the legacy HTTP+SSE
+    transport (`/sse`, held streams in a pool of their own), with five fake
+    tools (`read_file`, `list_directory`, `run_command`, `query_db`,
+    `fetch_url`). Reads and queries return canary content; nothing is run.
+    The session ID is a canary (`mcp-session`) that links later requests,
+    from any address and node, to the one that started the session.
+  - An LLM gateway decoy: Ollama's native API, OpenAI's (Chat Completions,
+    legacy completions, Responses, models; also under Azure, OpenRouter,
+    LiteLLM-style prefixes) and Anthropic's (messages, count_tokens,
+    complete, models). One fixed reply, framed per API and streamed when
+    asked; unlisted models get the API's own 404.
+  - `decoy_in` (migration 0009): the parsed decoy input stored with each
+    request so answers re-render byte for byte. Replicated between nodes
+    and exported beside `answer` and `decoy_v`.
+  - The rule `llm-key-use` (weight 3), header-only: LLM-provider key shapes
+    (`Authorization: Bearer sk-...`, `x-api-key: sk-ant-...`, Azure OpenAI
+    `api-key` of 32 hex characters) on any path. `ai-infra-probe` also matches the new gateway
+    paths.
+  - Admin › Decoys (MCP funnel, sessions, tool calls, LLM models and
+    prompts, web decoys), the quick filters "MCP decoy" and "LLM decoy", the
+    request and IP pages' decoy details, and the wall card "What they
+    asked our fake AI" (tool names ours, model names filtered, from 2 IPs).
+  - A legacy SSE message whose stream queue is full is answered `503` and
+    recorded as `decoy:mcp:busy`.
+  - `[trap]` settings `mcp_sse_pool` (64), `mcp_sse_per_source` (2),
+    `mcp_sse_hold_secs` (300).
+
+### Changed
+
+- At most half of a node's workers run level-4 scans (`scan.level4_max_share`,
+  default 0.5); the rest keep shorter scans moving. Workers are now 0 (paused)
+  or at least 2; a saved 1 is raised to 2, but a config file with
+  `scan.max_workers = 1` now fails to start (set 2 or more).
+- Level 4 sends at least `scan.min_rate` probes per second (default 300; lower
+  it behind a home router) with `--max-retries 1`, and `level4_timeout_factor`
+  defaults to 2. Configs copied from the old example set
+  `level4_timeout_factor = 4` explicitly; remove the key or set 2 to get the
+  new default.
+- The queue runs the job with the highest response ratio (time waited relative
+  to how long its level takes) instead of the highest level first.
+- Presets: level 1 runs at `-T3` with `--version-light`; levels 3 and 4 add
+  `--traceroute`; `scan.level4_udp` adds the top 50 UDP ports to level 4 (off
+  by default).
+- Cluster: claims name the levels a scanner cannot take; older nodes ignore
+  the field and interoperate.
+- Decoy version 2: renders every version 1 name unchanged plus the new
+  ones. The Answer filter now matches any prefix. AI decoys skip the
+  tarpit. An AI decoy that cannot be rendered falls back to the version 1
+  pick instead of the 404.
+- Cluster › Members shows how many requests and scans each node
+  contributed, with its share, again; the full breakdown stays on the
+  node page.
+
 ## [0.5.1] - 2026-10-06
 
 ### Changed

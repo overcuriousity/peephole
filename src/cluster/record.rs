@@ -95,6 +95,9 @@ pub struct RequestRec {
     /// How long a `tarpit` answer held the client, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_ms: Option<i64>,
+    /// What an MCP or LLM decoy was rendered from (compact JSON).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoy_in: Option<String>,
 }
 
 /// One request the flood gate answered without recording it in full.
@@ -119,6 +122,9 @@ pub struct SkipRow {
     /// How long a `tarpit` answer held the client, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_ms: Option<i64>,
+    /// What an MCP or LLM decoy was rendered from (compact JSON).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoy_in: Option<String>,
 }
 
 /// Skipped requests of one IP, sent together. `dropped`: requests past

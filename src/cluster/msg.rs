@@ -46,8 +46,13 @@ pub struct Grant {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "m", rename_all = "snake_case")]
 pub enum Msg {
-    /// Scanner → arbiter: give me a job.
-    Claim,
+    /// Scanner → arbiter: give me a job, but none of these levels (a
+    /// scanner at its level-4 share excludes 4). Empty encodes exactly like
+    /// the claim of nodes that predate the field; such nodes ignore it.
+    Claim {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude_levels: Vec<u8>,
+    },
     ClaimReply {
         grant: Option<Grant>,
     },
@@ -476,6 +481,37 @@ pub async fn inbox_loop(node: Arc<Node>, peer: NodeId, addr: String) {
 mod tests {
     use super::*;
 
+    /// The claim as nodes before `exclude_levels` know it.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "m", rename_all = "snake_case")]
+    enum OldMsg {
+        Claim,
+    }
+
+    /// Mixed versions: an empty exclusion encodes exactly like the old
+    /// unit claim, each side decodes the other's claim, and an old node
+    /// decodes a claim that carries exclusions.
+    #[test]
+    fn claims_stay_compatible_across_versions() {
+        use crate::cluster::rpc::cbor::{decode, encode};
+        let new_empty = Msg::Claim {
+            exclude_levels: vec![],
+        };
+        assert_eq!(encode(&new_empty).unwrap(), encode(&OldMsg::Claim).unwrap());
+        assert_eq!(
+            decode::<Msg>(&encode(&OldMsg::Claim).unwrap()).unwrap(),
+            new_empty
+        );
+        let excl = Msg::Claim {
+            exclude_levels: vec![4],
+        };
+        assert_eq!(decode::<Msg>(&encode(&excl).unwrap()).unwrap(), excl);
+        assert_eq!(
+            decode::<OldMsg>(&encode(&excl).unwrap()).unwrap(),
+            OldMsg::Claim
+        );
+    }
+
     #[test]
     fn messages_from_the_future_are_not_fresh() {
         let id = crate::cluster::identity::Identity::generate().unwrap().id;
@@ -485,7 +521,9 @@ mod tests {
             to: id,
             created_ms,
             in_reply_to: None,
-            msg: Msg::Claim,
+            msg: Msg::Claim {
+                exclude_levels: vec![],
+            },
         };
         let now = now_ms();
         assert!(at(now).fresh());

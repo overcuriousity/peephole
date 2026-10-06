@@ -188,7 +188,7 @@ async fn request_page(
         .as_deref()
         .and_then(|a| a.strip_prefix("decoy:"));
     let served = match (d.row.page_token.as_deref(), name) {
-        (Some(t), Some(n)) => crate::canary::served(d.row.decoy_v, t, n)
+        (Some(t), Some(n)) => crate::canary::served(d.row.decoy_v, t, n, d.row.decoy_in.as_deref())
             .into_iter()
             .map(|(k, v)| (k.name().to_string(), v))
             .collect(),

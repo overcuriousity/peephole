@@ -55,6 +55,11 @@ trusted_proxies = ["10.0.0.5/32"]
 # tarpit_hold_secs = 600      # longest a connection is held
 # tarpit_drip_bytes = 1       # bytes sent per drip
 # tarpit_drip_every_secs = 10 # seconds between drips (below the hold)
+# Legacy MCP HTTP+SSE decoy: streams held open for scanners probing GET /sse,
+# in a pool of their own.
+# mcp_sse_pool = 64           # streams held at once; 0 = none
+# mcp_sse_per_source = 2      # ...from one source (IPv6 by /64)
+# mcp_sse_hold_secs = 300     # longest a stream is held
 
 [webauthn]
 # Public domain the dashboard is reached at through nginx (FIDO2 relying party).
@@ -110,9 +115,13 @@ refresh_after_days = 30
 # weekly_limit = 50
 
 [scan]
-max_workers = 2            # concurrent nmap subprocesses
+max_workers = 2            # concurrent nmap subprocesses (2–16)
 timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admin queue page)
-level4_timeout_factor = 4  # level 4 (all ports, -sV -O, scripts) gets this many times timeout_secs, at most 12 h
+level4_timeout_factor = 2  # level 4 (all ports, -sV -O, scripts) gets this many times timeout_secs, at most 12 h
+level4_max_share = 0.5     # at most this share of max_workers runs level 4 at once (at least one)
+min_rate = 300             # level 4 sends at least this many probes per second (--min-rate);
+#                            lower it on a node behind a home router
+level4_udp = false         # level 4 also scans the top 50 UDP ports
 rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
 max_scans_per_hour = 30    # global rate cap; excess jobs stay queued
 never_scan = [] # extra CIDRs this node's scanner never scans (own infra, monitoring); other cluster scanners are not bound by it
@@ -158,7 +167,8 @@ tor_wait_hours = 6
 # trusted_origins = ["ed25519:..."]
 
 # Default scans are non-intrusive: no -A, no intrusive NSE scripts, timing
-# capped at -T3. Severity escalates by scope (ports, -sV, -O, discovery/safe
+# capped at -T3. Level 4 sets --min-rate (min_rate above).
+# Severity escalates by scope (ports, -sV, -O, discovery/safe
 # scripts that neither contact third parties nor broadcast). Level 2 runs
 # ssh-hostkey, ssh2-enum-algos and ssl-cert for the source's host keys and
 # certificates; an override without them loses those. nmap gets a

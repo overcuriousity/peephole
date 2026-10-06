@@ -2,6 +2,7 @@
 //! rendered again from the row, byte for byte.
 use crate::config::Config;
 use crate::store::Store;
+use crate::trap::decoy::ai::DecoyIn;
 use crate::trap::decoy::{Decoy, Input, render};
 use anyhow::{Result, bail};
 use std::path::Path;
@@ -20,6 +21,7 @@ type LightRow = (
     Option<String>,
     Option<i64>,
     Option<String>,
+    Option<String>,
 );
 /// A full row's decoy inputs.
 type FullRow = (
@@ -31,17 +33,19 @@ type FullRow = (
     Option<String>,
     Option<i64>,
     Option<String>,
+    Option<String>,
 );
 
-/// The decoy of the row `uid` (None: no such row, or not a decoy).
-pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
+/// The decoy of the row `uid` (None: no such row, or not a decoy), and for
+/// a legacy-SSE POST the frame that went down the stream instead.
+pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<(Decoy, Option<String>)>> {
     if let Some((batch, row)) = uid.split_once('#') {
         // `row` is the position in the batch, from 1.
         let Some(offset) = row.parse::<i64>().ok().filter(|n| *n >= 1).map(|n| n - 1) else {
             return Ok(None);
         };
         let r: Option<LightRow> = sqlx::query_as(
-            "SELECT s.ts_ms, s.method, s.path, s.page_token, s.host, s.answer, s.decoy_v, s.decoy_site
+            "SELECT s.ts_ms, s.method, s.path, s.page_token, s.host, s.answer, s.decoy_v, s.decoy_site, s.decoy_in
                  FROM skipped_requests s JOIN skipped_batches b ON b.id = s.batch_id
                  WHERE b.uid = ? ORDER BY s.rowid LIMIT 1 OFFSET ?",
         )
@@ -49,13 +53,14 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
         .bind(offset)
         .fetch_optional(&store.read)
         .await?;
-        let Some((ts_ms, method, path, Some(tok), host, Some(answer), v, site)) = r else {
+        let Some((ts_ms, method, path, Some(tok), host, Some(answer), v, site, decoy_in)) = r
+        else {
             return Ok(None);
         };
         let Some(name) = answer.strip_prefix("decoy:") else {
             return Ok(None);
         };
-        return Ok(render(
+        return Ok(with_pushed(
             &Input {
                 v: v.unwrap_or(0),
                 page_token: &tok,
@@ -65,18 +70,20 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
                 ts: ts_ms.div_euclid(1000),
                 method: &method,
                 path: &path,
+                decoy_in: decoy_in.as_deref(),
             },
             name,
         ));
     }
     let r: Option<FullRow> = sqlx::query_as(
-        "SELECT ts, method, path, headers_json, page_token, answer, decoy_v, decoy_site
+        "SELECT ts, method, path, headers_json, page_token, answer, decoy_v, decoy_site, decoy_in
              FROM requests WHERE uid = ?",
     )
     .bind(uid)
     .fetch_optional(&store.read)
     .await?;
-    let Some((ts, method, path, headers_json, Some(tok), Some(answer), v, site)) = r else {
+    let Some((ts, method, path, headers_json, Some(tok), Some(answer), v, site, decoy_in)) = r
+    else {
         return Ok(None);
     };
     let Some(name) = answer.strip_prefix("decoy:") else {
@@ -86,7 +93,7 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
     let ts = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S")
         .map(|t| t.and_utc().timestamp())
         .unwrap_or(0);
-    Ok(render(
+    Ok(with_pushed(
         &Input {
             v: v.unwrap_or(0),
             page_token: &tok,
@@ -96,9 +103,23 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
             ts,
             method: &method,
             path: &path,
+            decoy_in: decoy_in.as_deref(),
         },
         name,
     ))
+}
+
+/// The decoy of `name`, and for a legacy-SSE POST the frame that went down
+/// the stream (the POST itself was answered `Accepted`).
+fn with_pushed(input: &Input, name: &str) -> Option<(Decoy, Option<String>)> {
+    let d = render(input, name)?;
+    let din = DecoyIn::parse(input.decoy_in);
+    let pushed = (din.via.as_deref() == Some("sse")
+        && !matches!(name, "mcp:sse" | "mcp:no-session" | "mcp:busy"))
+    .then(|| crate::trap::decoy::mcp::message(input, &din, name.trim_start_matches("mcp:")))
+    .flatten()
+    .map(|m| format!("event: message\ndata: {m}\n\n"));
+    Some((d, pushed))
 }
 
 /// Run `decoy …`; `args` excludes `decoy` itself.
@@ -109,7 +130,7 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
     let config = args.get(2).map(String::as_str).unwrap_or(default_config);
     let cfg = Config::load(Path::new(config))?;
     let store = Store::connect(&cfg.database_path).await?;
-    let Some(d) = render_uid(&store, uid).await? else {
+    let Some((d, pushed)) = render_uid(&store, uid).await? else {
         bail!("no decoy row with uid {uid}");
     };
     println!("{}", d.status);
@@ -118,6 +139,9 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
     }
     println!();
     print!("{}", d.body);
+    if let Some(frame) = pushed {
+        println!("\n# pushed down the session's SSE stream:\n{frame}");
+    }
     Ok(())
 }
 
@@ -154,6 +178,7 @@ mod tests {
                     decoy_v: Some(1),
                     decoy_site: Some("shop".into()),
                     held_ms: None,
+                    decoy_in: None,
                 }],
                 build: String::new(),
             }),
@@ -161,7 +186,7 @@ mod tests {
         .await
         .unwrap();
         drop(conn);
-        let d = render_uid(&s, "b1#1").await.unwrap().unwrap();
+        let (d, _) = render_uid(&s, "b1#1").await.unwrap().unwrap();
         let want = crate::trap::decoy::render(
             &crate::trap::decoy::Input {
                 v: 1,
@@ -171,6 +196,7 @@ mod tests {
                 ts: 1_791_000_000,
                 method: "GET",
                 path: "/.env",
+                decoy_in: None,
             },
             "dotenv",
         )
@@ -224,10 +250,11 @@ mod tests {
                 ts: 1_791_108_000,
                 method: "GET",
                 path: "/.env",
+                decoy_in: None,
             },
             "dotenv",
         )
         .unwrap();
-        assert_eq!(render_uid(&s, "r1").await.unwrap().unwrap(), want);
+        assert_eq!(render_uid(&s, "r1").await.unwrap().unwrap().0, want);
     }
 }

@@ -68,17 +68,19 @@ pub struct SkipDecoy {
     pub decoy_v: i64,
     /// The site word it was served under.
     pub site: String,
+    /// What an MCP or LLM decoy was rendered from (compact JSON).
+    pub decoy_in: Option<String>,
 }
 
 /// How a skipped request was answered, as far as its light row keeps it.
 pub enum SkipAnswer {
     /// The trap page or another answer a light row does not name.
     Plain,
+    /// A decoy. Its light row keeps no `held_ms` (the tarpit's and the
+    /// legacy SSE stream's): that stays tarpit-only.
     Decoy(SkipDecoy),
     /// The tarpit, and how long it held the client.
-    Tarpit {
-        held_ms: i64,
-    },
+    Tarpit { held_ms: i64 },
 }
 
 impl SkipLog {
@@ -145,6 +147,7 @@ impl SkipLog {
                 row.answer = Some(d.answer);
                 row.decoy_v = Some(d.decoy_v);
                 row.decoy_site = Some(d.site);
+                row.decoy_in = d.decoy_in;
             }
             SkipAnswer::Tarpit { held_ms } => {
                 row.answer = Some("tarpit".into());
@@ -340,6 +343,7 @@ mod tests {
             answer: "decoy:git-config".into(),
             decoy_v: 1,
             site: "shop".into(),
+            decoy_in: None,
         };
         log.note(
             ip,

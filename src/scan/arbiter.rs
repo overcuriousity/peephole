@@ -7,7 +7,8 @@
 //! the claimants that ran the fewest scans in the last hour, so equally
 //! paced scanners share the queue equally wherever the job came from.
 //! A scanner that fails a level more than the others is weighted down at
-//! that level (see `weight`).
+//! that level (see `weight`). Among an arbiter's jobs, the highest
+//! response ratio goes first (see `order`).
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::msg::{Grant, Msg};
@@ -33,7 +34,7 @@ struct Lease {
     expires: Instant,
 }
 
-type Waiter = (NodeId, oneshot::Sender<Option<Grant>>);
+type Waiter = (NodeId, Vec<u8>, oneshot::Sender<Option<Grant>>);
 
 pub struct Arbiter {
     node: Arc<Node>,
@@ -41,6 +42,8 @@ pub struct Arbiter {
     lease: Duration,
     leases: Mutex<HashMap<String, Lease>>,
     waiting: Mutex<Vec<Waiter>>,
+    /// Estimated job durations for the response-ratio order.
+    order: super::order::Cached,
     /// Scanners that handed a job back because their own never_scan covers it.
     declined: Mutex<HashMap<String, std::collections::HashSet<NodeId>>>,
     /// Scanners that handed a job back for now, until when they are skipped.
@@ -64,6 +67,7 @@ impl Arbiter {
             node: node.clone(),
             leases: Mutex::new(HashMap::new()),
             waiting: Mutex::new(vec![]),
+            order: super::order::Cached::new(),
             declined: Mutex::new(HashMap::new()),
             later: Mutex::new(HashMap::new()),
             assign: tokio::sync::Mutex::new(()),
@@ -124,8 +128,8 @@ impl Arbiter {
 
     async fn handle(self: Arc<Self>, from: NodeId, msg: Msg) -> Option<Msg> {
         match msg {
-            Msg::Claim => Some(Msg::ClaimReply {
-                grant: self.claim(from).await,
+            Msg::Claim { exclude_levels } => Some(Msg::ClaimReply {
+                grant: self.claim(from, exclude_levels).await,
             }),
             Msg::Renew { job_uid } => Some(Msg::RenewReply {
                 ok: self.renew(from, &job_uid),
@@ -145,11 +149,11 @@ impl Arbiter {
     }
 
     /// Wait for the claim window, then get a job or nothing.
-    async fn claim(self: &Arc<Self>, scanner: NodeId) -> Option<Grant> {
+    async fn claim(self: &Arc<Self>, scanner: NodeId, exclude: Vec<u8>) -> Option<Grant> {
         let (tx, rx) = oneshot::channel();
         let first = {
             let mut w = self.waiting.lock().unwrap();
-            w.push((scanner, tx));
+            w.push((scanner, exclude, tx));
             w.len() == 1
         };
         if first {
@@ -180,15 +184,15 @@ impl Arbiter {
         let _g = self.assign.lock().await;
         let mut waiters = std::mem::take(&mut *self.waiting.lock().unwrap());
         let mut load = HashMap::new();
-        for (s, _) in &waiters {
+        for (s, _, _) in &waiters {
             if !load.contains_key(s) {
                 load.insert(*s, self.scans_last_hour(s).await);
             }
         }
         // Fewest recent scans first; ties broken by key so it is stable.
-        waiters.sort_by_key(|(s, _)| (load[s], *s));
-        for (scanner, tx) in waiters {
-            let grant = self.next_job(scanner).await?;
+        waiters.sort_by_key(|(s, _, _)| (load[s], *s));
+        for (scanner, exclude, tx) in waiters {
+            let grant = self.next_job(scanner, &exclude).await?;
             if let Some(g) = &grant {
                 *load.get_mut(&scanner).unwrap() += 1;
                 info!(job = %g.job_uid, ip = %g.ip, scanner = %scanner.short(), "scan job granted");
@@ -199,7 +203,7 @@ impl Arbiter {
     }
 
     /// Take our next queued job for `scanner` and mark it running.
-    async fn next_job(&self, scanner: NodeId) -> Result<Option<Grant>> {
+    async fn next_job(&self, scanner: NodeId, exclude: &[u8]) -> Result<Option<Grant>> {
         // Not a job this scanner already handed back (for now or for good).
         let declined: Vec<String> = {
             let d = self.declined.lock().unwrap();
@@ -216,7 +220,8 @@ impl Arbiter {
                 .collect()
         };
         let skipped = self.skipped_levels(scanner).await?;
-        self.next_job_skipping(scanner, declined, &skipped).await
+        self.next_job_skipping(scanner, declined, &skipped, exclude)
+            .await
     }
 
     /// Levels `scanner` fails more than the other live scanners and sits
@@ -234,16 +239,19 @@ impl Arbiter {
         Ok(super::weight::skipped_levels(&t, scanner, &scanners, now))
     }
 
-    /// [`Self::next_job`] past the jobs `scanner` handed back and, unless
-    /// they have waited [`super::weight::OVERRIDE_WAIT_MINS`], the jobs of
-    /// the levels it sits out.
+    /// [`Self::next_job`] past the jobs `scanner` handed back, the jobs of
+    /// the levels it sits out (unless they have waited
+    /// [`super::weight::OVERRIDE_WAIT_MINS`]) or excludes (always). Highest
+    /// response ratio first (`order`).
     async fn next_job_skipping(
         &self,
         scanner: NodeId,
         declined: Vec<String>,
         skipped: &[i64],
+        exclude: &[u8],
     ) -> Result<Option<Grant>> {
         let me = self.node.id();
+        let est = self.order.get(&self.node.store.pool).await;
         let (uid, ip, level, attempts) = loop {
             let row: Option<(String, String, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT j.uid, i.ip, j.level, j.attempts FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
@@ -251,12 +259,15 @@ impl Arbiter {
                    AND j.uid NOT IN (SELECT value FROM json_each(?))
                    AND (j.level NOT IN (SELECT value FROM json_each(?))
                         OR j.queued_at < datetime('now', '-{} minutes'))
-                 ORDER BY j.level DESC, j.queued_at ASC LIMIT 1",
-                super::weight::OVERRIDE_WAIT_MINS
+                   AND j.level NOT IN (SELECT value FROM json_each(?))
+                 ORDER BY {} LIMIT 1",
+                super::weight::OVERRIDE_WAIT_MINS,
+                est.order_by("j", "j.uid"),
             )))
             .bind(&me.0[..])
             .bind(serde_json::to_string(&declined)?)
             .bind(serde_json::to_string(skipped)?)
+            .bind(serde_json::to_string(exclude)?)
             .fetch_optional(&self.node.store.pool)
             .await?;
             let Some(row) = row else {
@@ -754,13 +765,13 @@ mod tests {
         // Queued later elsewhere, or at a lower level: ours runs.
         foreign_job(&store, ip.id, 2, "2999-01-01 00:00:00").await;
         foreign_job(&store, ip.id, 1, "2000-01-01 00:00:00").await;
-        let g = arbiter.next_job(scanner).await.unwrap().unwrap();
+        let g = arbiter.next_job(scanner, &[]).await.unwrap().unwrap();
         assert_eq!(g.job_uid, ours);
         assert!(arbiter.complete(scanner, &ours, "later", None).await);
         // Queued earlier elsewhere at the same level: that one runs, ours
         // is superseded and nothing else is granted here.
         foreign_job(&store, ip.id, 2, "2000-01-01 00:00:00").await;
-        assert!(arbiter.next_job(node.id()).await.unwrap().is_none());
+        assert!(arbiter.next_job(node.id(), &[]).await.unwrap().is_none());
         assert_eq!(status(&store, &ours).await, "superseded");
     }
 
@@ -780,14 +791,14 @@ mod tests {
         }
         let scanner = Identity::generate().unwrap().id;
         let g = arbiter
-            .next_job_skipping(scanner, vec![], &[4])
+            .next_job_skipping(scanner, vec![], &[4], &[])
             .await
             .unwrap()
             .unwrap();
         assert_eq!(g.level, 2);
         assert!(
             arbiter
-                .next_job_skipping(scanner, vec![], &[4])
+                .next_job_skipping(scanner, vec![], &[4], &[])
                 .await
                 .unwrap()
                 .is_none()
@@ -800,7 +811,7 @@ mod tests {
         .await
         .unwrap();
         let g = arbiter
-            .next_job_skipping(scanner, vec![], &[4])
+            .next_job_skipping(scanner, vec![], &[4], &[])
             .await
             .unwrap()
             .unwrap();
@@ -837,7 +848,7 @@ mod tests {
                 d.entry(uid).or_default().insert(scanner);
             }
         }
-        let grant = arbiter.next_job(scanner).await.unwrap();
+        let grant = arbiter.next_job(scanner, &[]).await.unwrap();
         assert_eq!(grant.map(|g| g.level), Some(1));
     }
 
@@ -856,7 +867,7 @@ mod tests {
             .await
             .unwrap();
         let (a, b) = (node.id(), Identity::generate().unwrap().id);
-        let g = arbiter.next_job(a).await.unwrap().unwrap();
+        let g = arbiter.next_job(a, &[]).await.unwrap().unwrap();
         let why = Some("Tor exit status unknown (no exit list loaded)".into());
         assert!(arbiter.complete(a, &g.job_uid, "later", why).await);
         assert_eq!(status(&store, &g.job_uid).await, "queued");
@@ -864,8 +875,8 @@ mod tests {
         arbiter.recheck_declined().await.unwrap();
         assert_eq!(status(&store, &g.job_uid).await, "queued");
         // Not offered to `a` again yet, but to anyone else.
-        assert!(arbiter.next_job(a).await.unwrap().is_none());
-        let g = arbiter.next_job(b).await.unwrap().unwrap();
+        assert!(arbiter.next_job(a, &[]).await.unwrap().is_none());
+        let g = arbiter.next_job(b, &[]).await.unwrap().unwrap();
         assert!(arbiter.complete(b, &g.job_uid, "later", None).await);
         // Once the backoff is over, `a` gets it again.
         arbiter
@@ -876,7 +887,7 @@ mod tests {
             .unwrap()
             .insert(a, Instant::now());
         assert_eq!(
-            arbiter.next_job(a).await.unwrap().map(|g| g.job_uid),
+            arbiter.next_job(a, &[]).await.unwrap().map(|g| g.job_uid),
             Some(g.job_uid.clone())
         );
         assert_eq!(status(&store, &g.job_uid).await, "running");
@@ -897,18 +908,83 @@ mod tests {
             .await
             .unwrap();
         let a = Identity::generate().unwrap().id;
-        let g = arbiter.next_job(a).await.unwrap().unwrap();
+        let g = arbiter.next_job(a, &[]).await.unwrap().unwrap();
         let why = Some("never_scan 203.0.113.0/24".into());
         assert!(arbiter.complete(a, &g.job_uid, "declined", why).await);
         // This node's scanner may still take it, and then hands it back too.
         assert_eq!(status(&store, &g.job_uid).await, "queued");
-        assert!(arbiter.next_job(a).await.unwrap().is_none());
-        let g = arbiter.next_job(node.id()).await.unwrap().unwrap();
+        assert!(arbiter.next_job(a, &[]).await.unwrap().is_none());
+        let g = arbiter.next_job(node.id(), &[]).await.unwrap().unwrap();
         assert!(
             arbiter
                 .complete(node.id(), &g.job_uid, "declined", None)
                 .await
         );
         assert_eq!(status(&store, &g.job_uid).await, "refused");
+    }
+
+    /// A scanner at its level-4 share is offered no level-4 job, however
+    /// long it has waited (unlike the weight skips).
+    #[tokio::test]
+    async fn excluded_levels_are_never_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        let rec = Recorder::Cluster(node.clone());
+        let scanner = Identity::generate().unwrap().id;
+        let a = store
+            .upsert_ip("203.0.113.90".parse().unwrap())
+            .await
+            .unwrap();
+        let b = store
+            .upsert_ip("203.0.113.91".parse().unwrap())
+            .await
+            .unwrap();
+        rec.enqueue_scan(a.id, 4, 24).await.unwrap();
+        rec.enqueue_scan(b.id, 2, 24).await.unwrap();
+        sqlx::query("UPDATE scan_jobs SET queued_at = datetime('now', '-3 hours') WHERE level = 4")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let g = arbiter.next_job(scanner, &[4]).await.unwrap().unwrap();
+        assert_eq!(g.level, 2);
+        assert!(arbiter.next_job(scanner, &[4]).await.unwrap().is_none());
+        assert_eq!(
+            arbiter.next_job(scanner, &[]).await.unwrap().unwrap().level,
+            4
+        );
+    }
+
+    /// Highest response ratio first: a fresher short job beats a younger
+    /// long one; a long job that has waited long enough goes first.
+    #[tokio::test]
+    async fn jobs_are_granted_by_response_ratio() {
+        // (minutes the L4 has waited, minutes the L2 has waited, level granted)
+        for (l4_mins, l2_mins, first) in [(10, 5, 2), (120, 5, 4)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (node, arbiter, store, _tx) = setup(dir.path()).await;
+            let rec = Recorder::Cluster(node.clone());
+            let scanner = Identity::generate().unwrap().id;
+            let a = store
+                .upsert_ip("203.0.113.92".parse().unwrap())
+                .await
+                .unwrap();
+            let b = store
+                .upsert_ip("203.0.113.93".parse().unwrap())
+                .await
+                .unwrap();
+            rec.enqueue_scan(a.id, 4, 24).await.unwrap();
+            rec.enqueue_scan(b.id, 2, 24).await.unwrap();
+            for (level, mins) in [(4, l4_mins), (2, l2_mins)] {
+                // ratio 1.5 / 2.0 with the default 20-min estimate at 10 / 5 min
+                sqlx::query("UPDATE scan_jobs SET queued_at = datetime('now', ?) WHERE level = ?")
+                    .bind(format!("-{mins} minutes"))
+                    .bind(level)
+                    .execute(&store.pool)
+                    .await
+                    .unwrap();
+            }
+            let g = arbiter.next_job(scanner, &[]).await.unwrap().unwrap();
+            assert_eq!(g.level, first, "L4 waited {l4_mins} min, L2 {l2_mins} min");
+        }
     }
 }

@@ -296,6 +296,20 @@ everything at once; the live feed is on the admin Overview. A changed delay
 applies to requests stored after the restart. Setting both to 0 publishes
 at once (logged as a warning).
 
+### Tarpit and decoy streams
+
+Both hold a connection open and take a place from a pool, in `[trap]`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `tarpit_pool`, `tarpit_per_source`, `tarpit_hold_secs` | 256, 8, 600 | slow 200s for sources that reached severity 4; `tarpit_pool = 0` turns it off |
+| `mcp_sse_pool` | 64 | legacy MCP HTTP+SSE streams (`GET /sse`) held at once, in a pool of their own; 0 = none |
+| `mcp_sse_per_source` | 2 | ...from one source (IPv6 by /64) |
+| `mcp_sse_hold_secs` | 300 | longest a stream is held (it also ends after 120 s without a message) |
+
+A full pool answers with the trap 404. The AI decoy routes (MCP, LLM
+gateway) skip the tarpit.
+
 ## Building and releases
 
 Requires Rust 1.94 or newer (`rust-version` in `Cargo.toml`):

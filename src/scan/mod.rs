@@ -3,6 +3,7 @@ pub mod crawler;
 pub mod guard;
 pub mod hostkeys;
 pub mod nmap_xml;
+pub mod order;
 pub mod pace;
 pub mod safety;
 pub mod weight;
@@ -66,6 +67,16 @@ pub fn nmap_argv(
         argv.push("--script-timeout".into());
         argv.push(format!("{}s", (host_timeout / 3).clamp(30, 600)));
     }
+    // Level 4 scans every port: a floor on the send rate keeps hosts that
+    // drop probes from slowing nmap's adaptive timing to a crawl.
+    if level == 4
+        && !argv
+            .iter()
+            .any(|a| a == "--min-rate" || a.starts_with("--min-rate="))
+    {
+        argv.push("--min-rate".into());
+        argv.push(cfg.scan.min_rate.to_string());
+    }
     // nmap treats a bare IPv6 literal as a hostname unless -6 is given, so
     // every IPv6 scan would otherwise fail with "host down".
     if target.is_ipv6() {
@@ -97,6 +108,12 @@ impl Refusal {
             Refusal::Never(w) | Refusal::Mine(w) | Refusal::Defer(w) => w,
         }
     }
+}
+
+/// A grant at a level this scanner excluded from its claim: an arbiter
+/// older than `exclude_levels` ignored it. Handed back "later".
+fn over_share(level: i64, exclude: &[u8]) -> bool {
+    u8::try_from(level).is_ok_and(|l| exclude.contains(&l))
 }
 
 /// Config-only refusal applied before nmap runs: never scan a non-global
@@ -212,6 +229,8 @@ struct Source {
     /// Granted jobs this scanner runs now: IP (canonical) and level. Known
     /// before the job's state replicates anywhere.
     active: std::sync::Mutex<HashMap<IpAddr, u8>>,
+    /// Per-level duration estimates for the response-ratio order.
+    order: order::Cached,
 }
 
 /// Hours since a `YYYY-MM-DD HH:MM:SS` (UTC) time; unparsable: infinite.
@@ -241,6 +260,7 @@ impl Source {
             tor_warned: Default::default(),
             unreachable: Default::default(),
             active: Default::default(),
+            order: order::Cached::new(),
             rec,
             cfg,
             pace,
@@ -319,18 +339,19 @@ impl Source {
     }
 
     /// Next job to run, or None when there is nothing for us.
-    async fn acquire(&self) -> anyhow::Result<Option<Job>> {
+    async fn acquire(&self, exclude: &[u8]) -> anyhow::Result<Option<Job>> {
         match self.node() {
-            None => self.acquire_local().await,
-            Some(node) => self.acquire_granted(node).await,
+            None => self.acquire_local(exclude).await,
+            Some(node) => self.acquire_granted(node, exclude).await,
         }
     }
 
     /// Standalone: our queue's next job that passes the pre-flight checks.
     /// Refused jobs never start (they do not count against the hourly
     /// rate); deferred ones stay queued and are looked at again later.
-    async fn acquire_local(&self) -> anyhow::Result<Option<Job>> {
+    async fn acquire_local(&self, exclude: &[u8]) -> anyhow::Result<Option<Job>> {
         let pool = &self.rec.store().pool;
+        let est = self.order.get(pool).await;
         let mut seen: HashSet<i64> = HashSet::new();
         loop {
             let skip: Vec<i64> = {
@@ -339,16 +360,20 @@ impl Source {
                 d.retain(|_, until| *until > now);
                 d.keys().copied().chain(seen.iter().copied()).collect()
             };
-            let row: Option<(i64, Option<String>, i64, String)> = sqlx::query_as(
-                "SELECT j.id, i.ip, j.level, j.queued_at FROM scan_jobs j
+            let row: Option<(i64, Option<String>, i64, String)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT j.id, i.ip, j.level, j.queued_at FROM scan_jobs j
                  LEFT JOIN ips i ON i.id = j.ip_id
                  WHERE j.status = 'queued' AND j.arbiter IS NULL
                    AND j.id NOT IN (SELECT value FROM json_each(?))
-                 ORDER BY j.level DESC, j.queued_at ASC LIMIT 1",
-            )
-            .bind(serde_json::to_string(&skip)?)
-            .fetch_optional(pool)
-            .await?;
+                   AND j.level NOT IN (SELECT value FROM json_each(?))
+                 ORDER BY {} LIMIT 1",
+                    est.order_by("j", "j.id")
+                )))
+                .bind(serde_json::to_string(&skip)?)
+                .bind(serde_json::to_string(exclude)?)
+                .fetch_optional(pool)
+                .await?;
             let Some((id, ip_text, level, queued_at)) = row else {
                 return Ok(None);
             };
@@ -390,15 +415,23 @@ impl Source {
     }
 
     /// Cluster: ask the arbiters with queued work, most urgent first.
-    async fn acquire_granted(&self, node: &Arc<Node>) -> anyhow::Result<Option<Job>> {
-        let arbiters: Vec<(Vec<u8>, i64, String)> = sqlx::query_as(
-            "SELECT arbiter, MAX(level) AS l, MIN(queued_at) AS q FROM scan_jobs
-             WHERE status = 'queued' AND arbiter IS NOT NULL
-             GROUP BY arbiter ORDER BY l DESC, q ASC",
-        )
+    async fn acquire_granted(
+        &self,
+        node: &Arc<Node>,
+        exclude: &[u8],
+    ) -> anyhow::Result<Option<Job>> {
+        let est = self.order.get(&node.store.pool).await;
+        let arbiters: Vec<(Vec<u8>, f64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT j.arbiter, MAX({}) AS r FROM scan_jobs j
+             WHERE j.status = 'queued' AND j.arbiter IS NOT NULL
+               AND j.level NOT IN (SELECT value FROM json_each(?))
+             GROUP BY j.arbiter ORDER BY r DESC, MIN(j.queued_at) ASC",
+            est.ratio_sql("j")
+        )))
+        .bind(serde_json::to_string(exclude)?)
         .fetch_all(&node.store.pool)
         .await?;
-        for (a, _, _) in arbiters {
+        for (a, _) in arbiters {
             let Ok(arbiter) = NodeId::from_slice(&a) else {
                 continue;
             };
@@ -415,7 +448,16 @@ impl Source {
             {
                 continue;
             }
-            let grant = match node.request(arbiter, Msg::Claim, CLAIM_TIMEOUT).await {
+            let grant = match node
+                .request(
+                    arbiter,
+                    Msg::Claim {
+                        exclude_levels: exclude.to_vec(),
+                    },
+                    CLAIM_TIMEOUT,
+                )
+                .await
+            {
                 Ok(Msg::ClaimReply { grant }) => grant,
                 Ok(_) => None,
                 Err(e) => {
@@ -428,6 +470,21 @@ impl Source {
                 }
             };
             let Some(g) = grant else { continue };
+            if over_share(g.level, exclude) {
+                info!(job = %g.job_uid, target = %g.ip, "scan grant turned down: at the level-4 share");
+                let (node, uid) = (node.clone(), g.job_uid);
+                tokio::spawn(async move {
+                    Self::report(
+                        &node,
+                        arbiter,
+                        &uid,
+                        "later",
+                        Some("at the level-4 share".into()),
+                    )
+                    .await;
+                });
+                continue;
+            }
             match self.check_grant(arbiter, &g).await? {
                 Ok(job) => {
                     self.active
@@ -836,6 +893,22 @@ async fn run_scan(
     }
 }
 
+/// One running level-4 scan, counted while it lives.
+struct L4Slot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl L4Slot {
+    fn take(n: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(n.clone())
+    }
+}
+
+impl Drop for L4Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub async fn run_workers(
     rec: Recorder,
     cfg: Config,
@@ -859,6 +932,8 @@ pub async fn run_workers(
         pace.clone(),
         classifier,
     ));
+    // Level-4 scans running now (see `L4Slot`).
+    let running_l4 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut joinset = tokio::task::JoinSet::new();
     let mut last_start: Option<tokio::time::Instant> = None;
     loop {
@@ -894,7 +969,13 @@ pub async fn run_workers(
                 }
                 _ => {}
             }
-            let job = match source.acquire().await {
+            let cap = pace::level4_cap(p.max_workers, cfg.scan.level4_max_share);
+            let exclude: Vec<u8> = if running_l4.load(std::sync::atomic::Ordering::SeqCst) >= cap {
+                vec![4]
+            } else {
+                vec![]
+            };
+            let job = match source.acquire(&exclude).await {
                 Ok(Some(job)) => job,
                 Ok(None) => break,
                 Err(e) => {
@@ -902,6 +983,7 @@ pub async fn run_workers(
                     break;
                 }
             };
+            let l4 = (job.level() == 4).then(|| L4Slot::take(&running_l4));
             if let Some(j) = source.queue_row(&job).await {
                 notifier.publish(j);
             }
@@ -917,6 +999,7 @@ pub async fn run_workers(
             let nmap = nmap_path.clone();
             let timeout = Duration::from_secs(limit);
             joinset.spawn(async move {
+                let _l4 = l4;
                 let outcome = match argv {
                     Some(argv) => run_scan(&source2, &job, argv, nmap, timeout).await,
                     // Unreachable: acquire only hands out levels 1..=4.
@@ -1033,6 +1116,37 @@ license_key = "k"
         );
         let argv = nmap_argv(2, &ip, &cfg, 1800).unwrap();
         assert_eq!(argv.iter().filter(|a| *a == "--host-timeout").count(), 1);
+    }
+
+    /// --min-rate at level 4 only, from the config, and an
+    /// operator's own value is kept.
+    #[test]
+    fn min_rate_is_added_at_level_4_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let cfg = config_with(dir.path(), "min_rate = 120\n");
+        let after = |argv: &[String], flag: &str| {
+            argv.iter()
+                .position(|a| a == flag)
+                .map(|i| argv[i + 1].clone())
+        };
+        let a4 = nmap_argv(4, &ip, &cfg, 3600).unwrap();
+        assert_eq!(after(&a4, "--min-rate").as_deref(), Some("120"));
+        for l in 1..=3 {
+            assert!(
+                !nmap_argv(l, &ip, &cfg, 1800)
+                    .unwrap()
+                    .iter()
+                    .any(|a| a == "--min-rate")
+            );
+        }
+        let cfg = config_with(
+            dir.path(),
+            "[scan.level_argv]\n4 = [\"-sS\", \"-p-\", \"--min-rate\", \"999\"]\n",
+        );
+        let a4 = nmap_argv(4, &ip, &cfg, 3600).unwrap();
+        assert_eq!(a4.iter().filter(|a| *a == "--min-rate").count(), 1);
+        assert_eq!(after(&a4, "--min-rate").as_deref(), Some("999"));
     }
 
     /// A signal-killed nmap names the signal instead of "exit None", and a
@@ -1409,14 +1523,14 @@ license_key = "k"
         store.enqueue_scan(ok.id, 1, 24).await.unwrap();
         let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
         let source = Source::new(store.local(), cfg, p, Classifier::builtin());
-        let job = source.acquire().await.unwrap().expect("the valid job");
+        let job = source.acquire(&[]).await.unwrap().expect("the valid job");
         assert_eq!(job.ip().to_string(), "203.0.113.50");
         let (status, started, error) = status_of(&store, "198.51.0.1").await;
         assert_eq!(status, "refused");
         assert!(started.is_none());
         assert!(error.unwrap().contains("never_scan"));
         assert_eq!(store.local().jobs_started_last_hour().await.unwrap(), 1);
-        assert!(source.acquire().await.unwrap().is_none());
+        assert!(source.acquire(&[]).await.unwrap().is_none());
     }
 
     fn write_tor_list(dir: &std::path::Path, extra: &str) {
@@ -1440,14 +1554,17 @@ license_key = "k"
             .unwrap();
         store.enqueue_scan(a.id, 2, 24).await.unwrap();
         let source = Source::new(store.local(), cfg.clone(), p(), Classifier::builtin());
-        assert!(source.acquire().await.unwrap().is_none(), "deferred");
+        assert!(source.acquire(&[]).await.unwrap().is_none(), "deferred");
         assert_eq!(status_of(&store, "203.0.113.60").await.0, "queued");
-        assert!(source.acquire().await.unwrap().is_none(), "still waiting");
+        assert!(
+            source.acquire(&[]).await.unwrap().is_none(),
+            "still waiting"
+        );
         // The list loads (a fresh scanner, so the retry delay is not waited out).
         write_tor_list(dir.path(), "203.0.113.61\n");
         let source = Source::new(store.local(), cfg.clone(), p(), Classifier::builtin());
         let job = source
-            .acquire()
+            .acquire(&[])
             .await
             .unwrap()
             .expect("runs once the list is there");
@@ -1458,7 +1575,7 @@ license_key = "k"
             .await
             .unwrap();
         store.enqueue_scan(b.id, 2, 24).await.unwrap();
-        assert!(source.acquire().await.unwrap().is_none());
+        assert!(source.acquire(&[]).await.unwrap().is_none());
         let (status, _, error) = status_of(&store, "203.0.113.61").await;
         assert_eq!(
             (status.as_str(), error.as_deref()),
@@ -1477,7 +1594,7 @@ license_key = "k"
             .await
             .unwrap();
         let source = Source::new(store.local(), cfg.clone(), p(), Classifier::builtin());
-        assert!(source.acquire().await.unwrap().is_none());
+        assert!(source.acquire(&[]).await.unwrap().is_none());
         let (status, _, error) = status_of(&store, "203.0.113.62").await;
         assert_eq!(status, "refused");
         assert!(error.unwrap().contains("still unknown"));
@@ -1815,5 +1932,89 @@ license_key = "k"
             .await
             .unwrap();
         assert_eq!(r.err().map(|(s, _)| s), Some("declined"));
+    }
+
+    #[test]
+    fn a_grant_at_an_excluded_level_is_over_the_share() {
+        assert!(over_share(4, &[4]));
+        assert!(!over_share(2, &[4]));
+        assert!(!over_share(4, &[]));
+    }
+
+    #[tokio::test]
+    async fn standalone_pick_skips_excluded_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        for (ip, level) in [("203.0.113.70", 4), ("203.0.113.71", 2)] {
+            let ip = store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+            store.enqueue_scan(ip.id, level, 24).await.unwrap();
+        }
+        let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
+        let source = Source::new(store.local(), cfg, p, Classifier::builtin());
+        let job = source.acquire(&[4]).await.unwrap().unwrap();
+        assert_eq!(job.level(), 2);
+        assert!(source.acquire(&[4]).await.unwrap().is_none());
+        assert_eq!(source.acquire(&[]).await.unwrap().unwrap().level(), 4);
+    }
+
+    /// A fake nmap that records how many level-4 scans (argv has -p-) run
+    /// at once, holding each for `secs`.
+    fn counting_nmap(dir: &std::path::Path, secs: &str) -> PathBuf {
+        let fake = fake_nmap(dir); // writes nmap.xml next to it
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nd=\"$(dirname \"$0\")\"\n\
+                 case \" $* \" in *\" -p- \"*) mkdir -p \"$d/l4\"; touch \"$d/l4/$$\"; \
+                 ls \"$d/l4\" | wc -l >> \"$d/l4-seen\"; sleep {secs}; rm \"$d/l4/$$\";; esac\n\
+                 cat \"$d/nmap.xml\"\n"
+            ),
+        )
+        .unwrap();
+        fake
+    }
+
+    /// With 2 workers at most one level-4 scan runs, the other worker keeps
+    /// the shorter levels moving, and a queue of only level-4 jobs still
+    /// drains.
+    #[tokio::test]
+    async fn level4_never_takes_more_than_its_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = counting_nmap(dir.path(), "1.5");
+        let cfg = test_config(dir.path());
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        for (i, level) in [4, 4, 2, 2].into_iter().enumerate() {
+            let ip = store
+                .upsert_ip(format!("198.51.100.{}", 80 + i).parse().unwrap())
+                .await
+                .unwrap();
+            store.enqueue_scan(ip.id, level, 24).await.unwrap();
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let p = pace::SharedPace::new(pace::Pace {
+            max_workers: 2,
+            max_scans_per_hour: 3600,
+            timeout_secs: 60,
+        });
+        let pool = tokio::spawn(run_workers(
+            store.local(),
+            cfg,
+            p,
+            fake,
+            rx,
+            crate::events::Notifier::new(),
+            Classifier::builtin(),
+        ));
+        wait_for_scans(&store, 4).await;
+        tx.send(true).unwrap();
+        pool.await.unwrap();
+        let seen = std::fs::read_to_string(dir.path().join("l4-seen")).unwrap();
+        let max: u32 = seen
+            .split_whitespace()
+            .map(|n| n.parse::<u32>().unwrap())
+            .max()
+            .unwrap();
+        assert_eq!(max, 1, "two level-4 scans ran at once: {seen:?}");
     }
 }

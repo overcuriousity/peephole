@@ -22,9 +22,10 @@ pub(crate) async fn derive_request(conn: &mut SqliteConnection, request_id: i64)
         Option<String>,
         Option<String>,
         Option<i64>,
+        Option<String>,
     );
     let Some(r): Option<Row> = sqlx::query_as(
-        "SELECT ts, ip_id, path, query, headers_json, body, raw_head, page_token, answer, decoy_v
+        "SELECT ts, ip_id, path, query, headers_json, body, raw_head, page_token, answer, decoy_v, decoy_in
          FROM requests WHERE id = ?",
     )
     .bind(request_id)
@@ -33,7 +34,19 @@ pub(crate) async fn derive_request(conn: &mut SqliteConnection, request_id: i64)
     else {
         return Ok(());
     };
-    let (ts, ip_id, path, query, headers_json, body, raw_head, page_token, answer, decoy_v) = r;
+    let (
+        ts,
+        ip_id,
+        path,
+        query,
+        headers_json,
+        body,
+        raw_head,
+        page_token,
+        answer,
+        decoy_v,
+        decoy_in,
+    ) = r;
     sqlx::query("DELETE FROM canaries WHERE request_id = ?")
         .bind(request_id)
         .execute(&mut *conn)
@@ -46,7 +59,7 @@ pub(crate) async fn derive_request(conn: &mut SqliteConnection, request_id: i64)
         page_token.as_deref(),
         answer.as_deref().and_then(|a| a.strip_prefix("decoy:")),
     ) {
-        for (kind, value) in crate::canary::served(decoy_v, tok, name) {
+        for (kind, value) in crate::canary::served(decoy_v, tok, name, decoy_in.as_deref()) {
             sqlx::query(
                 "INSERT INTO canaries (value_hash, kind, request_id, ts, ip_id) VALUES (?,?,?,?,?)",
             )
@@ -93,16 +106,23 @@ pub(crate) async fn derive_batch(conn: &mut SqliteConnection, batch_id: i64) -> 
         .await?;
     // Every row, in batch order: a row is named by its position (from 1),
     // which is the same on every node.
-    type Row = (i64, Option<String>, Option<String>, Option<i64>, i64);
+    type Row = (
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        i64,
+    );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT s.ts_ms, s.page_token, s.answer, s.decoy_v, b.ip_id
+        "SELECT s.ts_ms, s.page_token, s.answer, s.decoy_v, s.decoy_in, b.ip_id
          FROM skipped_requests s JOIN skipped_batches b ON b.id = s.batch_id
          WHERE s.batch_id = ? ORDER BY s.rowid",
     )
     .bind(batch_id)
     .fetch_all(&mut *conn)
     .await?;
-    for (pos, (ts_ms, tok, answer, decoy_v, ip_id)) in rows.into_iter().enumerate() {
+    for (pos, (ts_ms, tok, answer, decoy_v, decoy_in, ip_id)) in rows.into_iter().enumerate() {
         let (Some(tok), Some(name)) = (
             tok,
             answer.as_deref().and_then(|a| a.strip_prefix("decoy:")),
@@ -112,7 +132,7 @@ pub(crate) async fn derive_batch(conn: &mut SqliteConnection, batch_id: i64) -> 
         let ts = chrono::DateTime::from_timestamp_millis(ts_ms)
             .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
-        for (kind, value) in crate::canary::served(decoy_v, &tok, name) {
+        for (kind, value) in crate::canary::served(decoy_v, &tok, name, decoy_in.as_deref()) {
             sqlx::query(
                 "INSERT INTO canaries (value_hash, kind, batch_id, skip_row, ts, ip_id)
                  VALUES (?,?,?,?,?,?)",
@@ -583,6 +603,7 @@ mod tests {
                     decoy_v: Some(1),
                     decoy_site: Some("shop".into()),
                     held_ms: None,
+                    decoy_in: None,
                 }],
                 build: String::new(),
             }),
@@ -1252,6 +1273,7 @@ mod tests {
                     decoy_v: Some(1),
                     decoy_site: Some("shop".into()),
                     held_ms: None,
+                    decoy_in: None,
                 }],
                 build: String::new(),
             }),
@@ -1290,6 +1312,7 @@ mod tests {
                     decoy_v: Some(1),
                     decoy_site: Some("shop".into()),
                     held_ms: None,
+                    decoy_in: None,
                 }],
                 build: String::new(),
             }),

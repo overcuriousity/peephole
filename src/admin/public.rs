@@ -398,6 +398,7 @@ fn request_pairs(f: &RequestFilter) -> Vec<(&'static str, Option<String>)> {
         ("method", f.method.clone()),
         ("transport", f.transport.clone()),
         ("answer", f.answer.clone()),
+        ("session", f.session.clone()),
     ]
 }
 
@@ -460,6 +461,7 @@ fn filter_label(k: &str) -> &'static str {
         "method" => "Method",
         "transport" => "Transport",
         "answer" => "Answer",
+        "session" => "MCP session",
         "tor" => "Tor exits",
         "min_abuse" => "Min abuse score",
         "tag" => "Intel tag",
@@ -545,7 +547,7 @@ fn request_shortcuts(f: &RequestFilter, now: chrono::NaiveDateTime) -> Vec<Short
             .format("%Y-%m-%dT%H:%M")
             .to_string()
     };
-    let presets: [(&str, &str, &str, String); 10] = [
+    let presets: [(&str, &str, &str, String); 12] = [
         ("Last hour", "Received in the last hour", "from", since(1)),
         (
             "Last 24 h",
@@ -585,6 +587,18 @@ fn request_shortcuts(f: &RequestFilter, now: chrono::NaiveDateTime) -> Vec<Short
             "credential-attack".into(),
         ),
         ("POST", "Requests with method POST", "method", "POST".into()),
+        (
+            "MCP decoy",
+            "Answered by the MCP decoy",
+            "answer",
+            "decoy:mcp".into(),
+        ),
+        (
+            "LLM decoy",
+            "Answered by the LLM gateway decoy",
+            "answer",
+            "decoy:llm".into(),
+        ),
         (
             "No user agent",
             "Requests without a User-Agent header",
@@ -945,6 +959,8 @@ pub struct IpAdminData {
     /// Other IPs that used canaries harvested here, and other IPs whose
     /// canaries this IP used.
     pub canary_links: (i64, i64),
+    /// MCP sessions, MCP tool calls and LLM calls the decoys saw from it.
+    pub decoys: (i64, i64, i64),
 }
 
 impl IpAdminData {
@@ -1036,6 +1052,7 @@ async fn ip_page(
             skipped: state.store.skipped_for_ip(ip.id).await?,
             host_keys: state.store.host_keys_for_ip(ip.id).await?,
             canary_links: state.store.canary_links_for_ip(ip.id).await?,
+            decoys: state.store.decoy_counts_for_ip(ip.id).await?,
         })
     } else {
         None
@@ -1076,6 +1093,13 @@ mod tests {
                 .unwrap()
         };
         let none = RequestFilter::default();
+        assert_eq!(get(&none, "MCP decoy").href, "/requests?answer=decoy%3Amcp");
+        assert_eq!(get(&none, "LLM decoy").href, "/requests?answer=decoy%3Allm");
+        let s = request_qs(&RequestFilter {
+            session: Some("ab-cd".into()),
+            ..Default::default()
+        });
+        assert!(s.contains("session=ab-cd"));
         let t = get(&none, "Tarpitted");
         assert_eq!(
             (t.href.as_str(), t.active),
@@ -1233,6 +1257,87 @@ show_labels = {show_labels}
         let (_, after) = get_with(&app, "/?range=7d", None).await;
         assert!(after.contains("Scanner time wasted"), "{after}");
         assert!(after.contains("2 h 5 min"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn wall_shows_ai_card_only_with_released_ai_requests() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, before) = get_with(&app, "/", None).await;
+        assert!(!before.contains("What they asked our fake AI"), "{before}");
+        for i in 0..6 {
+            let ip = st
+                .store
+                .upsert_ip(format!("203.0.113.{}", i % 2 + 1).parse().unwrap())
+                .await
+                .unwrap();
+            st.store
+                .insert_request(&crate::store::requests::NewRequest {
+                    ip_id: ip.id,
+                    method: "POST".into(),
+                    path: "/v1/chat/completions".into(),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    answer: Some("decoy:llm:chat-completions".into()),
+                    decoy_in: Some(r#"{"api":"openai","model":"llama3:70b"}"#.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let (_, after) = get_with(&app, "/?range=7d", None).await;
+        assert!(after.contains("What they asked our fake AI"), "{after}");
+        assert!(after.contains("llama3:70b"), "{after}");
+    }
+
+    async fn insert_ai_rows(st: &AdminState, n: usize) {
+        for i in 0..n {
+            let ip = st
+                .store
+                .upsert_ip(format!("203.0.113.{}", i % 2 + 1).parse().unwrap())
+                .await
+                .unwrap();
+            st.store
+                .insert_request(&crate::store::requests::NewRequest {
+                    ip_id: ip.id,
+                    method: "POST".into(),
+                    path: "/v1/chat/completions".into(),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    answer: Some("decoy:llm:chat-completions".into()),
+                    decoy_in: Some(r#"{"api":"openai","model":"llama3:70b"}"#.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn wall_hides_ai_card_below_the_minimum_of_released_rows() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let app = crate::admin::full_router(st.clone());
+        insert_ai_rows(&st, 4).await;
+        let (_, body) = get_with(&app, "/?range=7d", None).await;
+        assert!(!body.contains("What they asked our fake AI"), "{body}");
+        assert!(!body.contains("llama3:70b"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn wall_hides_ai_card_while_rows_await_their_publish_delay() {
+        let (st, _d) = state_with(true, "delay_minutes = 60\njitter_minutes = 0").await;
+        st.store
+            .set_publish_delay(
+                std::time::Duration::from_secs(3600),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let app = crate::admin::full_router(st.clone());
+        insert_ai_rows(&st, 8).await;
+        let (_, body) = get_with(&app, "/?range=7d", None).await;
+        assert!(!body.contains("What they asked our fake AI"), "{body}");
+        assert!(!body.contains("llama3:70b"), "{body}");
     }
 
     #[tokio::test]
@@ -1448,6 +1553,38 @@ show_labels = {show_labels}
     }
 
     #[tokio::test]
+    async fn the_decoys_page_needs_a_login_and_renders_each_tab() {
+        let (st, _dir) = state(true).await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st);
+        let (status, _) = get_with(&app, "/admin/decoys", None).await;
+        assert_ne!(status, 200, "admin only");
+        for (tab, heading) in [
+            ("mcp", "Sessions"),
+            ("llm", "Models requested"),
+            ("web", "Web decoys"),
+        ] {
+            let (status, body) =
+                get_with(&app, &format!("/admin/decoys?tab={tab}"), Some(&cookie)).await;
+            assert_eq!(status, 200, "{tab}");
+            assert!(body.contains(heading), "{tab}: {body}");
+            assert!(
+                body.contains(r#"href="/admin/decoys" aria-current="true""#),
+                "nav marks Decoys"
+            );
+        }
+        let (_, body) = get_with(&app, "/admin/decoys?tab=llm&range=7d", Some(&cookie)).await;
+        assert!(
+            body.contains("/admin/decoys?tab=mcp&#38;range=7d"),
+            "tabs keep the range"
+        );
+        assert!(
+            body.contains("/admin/decoys?tab=llm&amp;range=30d"),
+            "range keeps the tab"
+        );
+    }
+
+    #[tokio::test]
     async fn canary_tile_shows_only_from_five_reuses() {
         let (st, _dir) = state(true).await;
         let mut conn = st.store.pool.acquire().await.unwrap();
@@ -1595,7 +1732,7 @@ show_labels = {show_labels}
         )
         .await
         .unwrap();
-        let all: Vec<String> = crate::canary::served(Some(1), "tok-env", "dotenv")
+        let all: Vec<String> = crate::canary::served(Some(1), "tok-env", "dotenv", None)
             .into_iter()
             .map(|(_, v)| v)
             .collect();
