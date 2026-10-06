@@ -198,6 +198,8 @@ pub fn render(inp: &Input, d: &DecoyIn, name: &str) -> Option<Decoy> {
             "Method Not Allowed\n".into(),
         ),
         "no-session" => (404, super::ct(TEXT), "Could not find session".into()),
+        // Legacy stream's queue full: the frame was dropped.
+        "busy" => (503, super::ct(TEXT), "Service Unavailable\n".into()),
         // Legacy transport: the answer goes down the stream (`message`).
         _ if sse => {
             if name != "notify" {
@@ -732,6 +734,11 @@ mod tests {
         assert_eq!(render(&i, &d, "notify").unwrap().status, 202);
         assert_eq!(render(&i, &d, "get").unwrap().status, 405);
         assert_eq!(render(&i, &d, "no-session").unwrap().status, 404);
+        let sse_in = DecoyIn {
+            via: Some("sse".into()),
+            ..Default::default()
+        };
+        assert_eq!(render(&i, &sse_in, "busy").unwrap().status, 503);
         let sse = render(&i, &d, "sse").unwrap();
         assert_eq!(
             sse.body,

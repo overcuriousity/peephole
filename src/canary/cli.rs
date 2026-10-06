@@ -114,11 +114,11 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<(Decoy, Optio
 fn with_pushed(input: &Input, name: &str) -> Option<(Decoy, Option<String>)> {
     let d = render(input, name)?;
     let din = DecoyIn::parse(input.decoy_in);
-    let pushed =
-        (din.via.as_deref() == Some("sse") && name != "mcp:sse" && name != "mcp:no-session")
-            .then(|| crate::trap::decoy::mcp::message(input, &din, name.trim_start_matches("mcp:")))
-            .flatten()
-            .map(|m| format!("event: message\ndata: {m}\n\n"));
+    let pushed = (din.via.as_deref() == Some("sse")
+        && !matches!(name, "mcp:sse" | "mcp:no-session" | "mcp:busy"))
+    .then(|| crate::trap::decoy::mcp::message(input, &din, name.trim_start_matches("mcp:")))
+    .flatten()
+    .map(|m| format!("event: message\ndata: {m}\n\n"));
     Some((d, pushed))
 }
 

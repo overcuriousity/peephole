@@ -890,12 +890,29 @@ async fn trap(
                 .uri
                 .query()
                 .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("sessionId=")));
-            let open = sid.is_some_and(|s| state.sse.deliver(s, frame));
-            decoy::render(&input, if open { name } else { "mcp:no-session" })
+            use decoy::sse::Delivery;
+            let sent = sid.map_or(Delivery::NoSession, |s| state.sse.deliver(s, frame));
+            decoy::render(
+                &input,
+                match sent {
+                    Delivery::Sent => name,
+                    Delivery::Full => "mcp:busy",
+                    Delivery::NoSession => "mcp:no-session",
+                },
+            )
         }
         Some((name, _)) => decoy::render(&input, name),
-        None => decoy::choose(method, path, parts.uri.query(), presented, word)
-            .and_then(|name| decoy::render(&input, name)),
+        None => None,
+    };
+    // An AI decoy that renders nothing falls back to the version-1 pick
+    // (and its row carries no `decoy_in`).
+    let (decoy, ai) = match (decoy, ai) {
+        (None, _) => (
+            decoy::choose(method, path, parts.uri.query(), presented, word)
+                .and_then(|name| decoy::render(&input, name)),
+            None,
+        ),
+        (d, a) => (d, a),
     };
     let decoy_in = if ai.is_some() {
         decoy.as_ref().and(decoy_in)
@@ -967,7 +984,8 @@ fn sse_answer(
     decoy_in: Option<String>,
     word: &'static str,
 ) -> Response {
-    let wait = state.sse.hold() + TARPIT_MARGIN;
+    let hold = state.sse.hold();
+    let wait = hold + TARPIT_MARGIN;
     if let Some(meta) = parts.extensions.get::<listen::ConnMeta>() {
         meta.handover.take_over(tokio::time::Instant::now() + wait);
     }
@@ -976,7 +994,10 @@ fn sse_answer(
             .await
             .ok()
             .and_then(Result::ok)
-            .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX));
+            .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX))
+            // A stream the client never read is ended by the connection
+            // deadline (hold + margin); it was still held only `hold` long.
+            .map(|ms| ms.min(i64::try_from(hold.as_millis()).unwrap_or(i64::MAX)));
         let slot = state.guards.slot().await;
         record_trap(
             state.clone(),

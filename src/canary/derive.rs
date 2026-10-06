@@ -386,5 +386,6 @@ mod tests {
             .is_empty()
         );
         assert!(served(Some(2), TOK, "mcp:no-session", Some(rf)).is_empty());
+        assert!(served(Some(2), TOK, "mcp:busy", Some(rf)).is_empty());
     }
 }

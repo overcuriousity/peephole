@@ -34,10 +34,10 @@ label = "llm-key-use"
 weight = 3
 owasp = ["OAT-004"]
 # Trying to spend someone's inference: a request carrying an LLM-provider
-# key shape (OpenAI Bearer sk-, Anthropic x-api-key sk-ant-, Azure api-key).
+# key shape (OpenAI Bearer sk-, Anthropic x-api-key sk-ant-, Azure OpenAI api-key: 32 hex characters).
 # Header-only on purpose: matchers are OR-combined, so adding a path matcher
 # would label every request to that path. Headers are newline-joined, hence (?m).
-header_regex = '''(?m)^(authorization:[ \t]*bearer[ \t]+sk-\S|x-api-key:[ \t]*sk-ant-\S|api-key:[ \t]*\S)'''
+header_regex = '''(?m)^(authorization:[ \t]*bearer[ \t]+sk-\S|x-api-key:[ \t]*sk-ant-\S|api-key:[ \t]*[0-9a-fA-F]{32}\b)'''
 
 [[rule]]
 label = "mcp-probe"

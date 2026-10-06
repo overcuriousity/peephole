@@ -1736,10 +1736,13 @@ mod tests {
                 ("Authorization", "Bearer sk-proj-x"),
             ),
             ("/v1/messages", ("x-api-key", "sk-ant-api03-x")),
-            ("/v1/responses", ("api-key", "0123456789abcdef")),
+            (
+                "/v1/responses",
+                ("api-key", "0123456789abcdef0123456789abcdef"),
+            ),
             (
                 "/openai/deployments/gpt4/chat/completions",
-                ("api-key", "abc"),
+                ("api-key", "0123456789ABCDEF0123456789abcdef"),
             ),
         ] {
             let v = with_key("POST", p, h);
@@ -1759,6 +1762,18 @@ mod tests {
             !v.labels.iter().any(|l| l == "llm-key-use"),
             "no key, no key use"
         );
+        for (k, val) in [
+            ("x-api-key", "abc123"),
+            ("api-key", "hello"),
+            ("api-key", "0123456789abcdef"),
+        ] {
+            let v = with_key("GET", "/", (k, val));
+            assert!(
+                !v.labels.iter().any(|l| l == "llm-key-use"),
+                "{k}: {val}: {:?}",
+                v.labels
+            );
+        }
         let v = with_key("GET", "/", ("Authorization", "Bearer abc123"));
         assert!(
             !v.labels.iter().any(|l| l == "llm-key-use"),

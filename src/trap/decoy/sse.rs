@@ -156,17 +156,32 @@ impl SseHub {
     }
 
     /// Push `frame` down the stream of `session` (None: only ask whether
-    /// it is open). False: no such stream on this node, or its queue is full.
-    pub fn deliver(&self, session: &str, frame: Option<String>) -> bool {
+    /// it is open).
+    pub fn deliver(&self, session: &str, frame: Option<String>) -> Delivery {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(tx) = g.sessions.get(session) else {
-            return false;
+            return Delivery::NoSession;
         };
         match frame {
-            None => !tx.is_closed(),
-            Some(f) => tx.try_send(f).is_ok(),
+            None if tx.is_closed() => Delivery::NoSession,
+            None => Delivery::Sent,
+            Some(f) => match tx.try_send(f) {
+                Ok(()) => Delivery::Sent,
+                Err(mpsc::error::TrySendError::Full(_)) => Delivery::Full,
+                Err(mpsc::error::TrySendError::Closed(_)) => Delivery::NoSession,
+            },
         }
     }
+}
+
+/// What became of a frame pushed to a legacy stream.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Delivery {
+    Sent,
+    /// No such stream on this node.
+    NoSession,
+    /// The stream exists but its queue is full: the frame was dropped.
+    Full,
 }
 
 #[cfg(test)]
@@ -196,16 +211,20 @@ mod tests {
             .unwrap();
         tokio::pin!(s);
         assert_eq!(s.next().await.unwrap().unwrap(), "event: endpoint\n\n");
-        assert!(h.deliver("sid", Some("event: message\ndata: {}\n\n".into())));
+        assert_eq!(
+            h.deliver("sid", Some("event: message\ndata: {}\n\n".into())),
+            Delivery::Sent
+        );
         assert_eq!(
             s.next().await.unwrap().unwrap(),
             "event: message\ndata: {}\n\n"
         );
-        assert!(
+        assert_eq!(
             h.deliver("sid", None),
+            Delivery::Sent,
             "open: a notification needs no frame"
         );
-        assert!(!h.deliver("other", Some("x".into())));
+        assert_eq!(h.deliver("other", Some("x".into())), Delivery::NoSession);
         assert_eq!(s.next().await.unwrap().unwrap(), ": ping\n\n");
     }
 
@@ -219,7 +238,11 @@ mod tests {
         assert_eq!(n, 1 + 7);
         assert_eq!(held.await.unwrap(), 120_000);
         assert_eq!(h.open_count(), 0);
-        assert!(!h.deliver("sid", None), "gone once ended");
+        assert_eq!(
+            h.deliver("sid", None),
+            Delivery::NoSession,
+            "gone once ended"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -245,5 +268,18 @@ mod tests {
                 .is_some(),
             "freed on drop"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_queue_is_told_apart_from_no_session() {
+        let h = hub(4, 2, 300);
+        let _s = h
+            .open(IP.parse().unwrap(), "sid".into(), String::new())
+            .unwrap();
+        for _ in 0..QUEUE {
+            assert_eq!(h.deliver("sid", Some("x".into())), Delivery::Sent);
+        }
+        assert_eq!(h.deliver("sid", Some("x".into())), Delivery::Full);
+        assert_eq!(h.deliver("nope", Some("x".into())), Delivery::NoSession);
     }
 }

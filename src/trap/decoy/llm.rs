@@ -40,7 +40,8 @@ pub fn choose(ask: &Ask) -> Option<(String, DecoyIn)> {
     let ep = match (api, rest) {
         ("ollama", "/version" | "/tags" | "/ps") if get => &rest[1..],
         ("ollama", "/show" | "/pull" | "/chat" | "/generate") if post => &rest[1..],
-        ("ollama", "/create" | "/delete" | "/copy" | "/embed" | "/embeddings") => "unsupported",
+        ("ollama", "/delete") if ask.method == "DELETE" || post => "unsupported",
+        ("ollama", "/create" | "/copy" | "/embed" | "/embeddings") if post => "unsupported",
         (_, "/models") if get && (oai || api == "anthropic") => "models",
         (_, r) if oai && get && r.starts_with("/models/") => "models",
         (_, "/chat/completions") if oai && post => "chat-completions",
@@ -362,6 +363,7 @@ fn openai_reply(inp: &Input, model: &str, ep: &str, stream: bool) -> Out {
             let full = |status: &str, text: Option<&str>| {
                 json!({
                     "id": rid, "object": "response", "created_at": ts, "status": status, "model": model,
+                    "parallel_tool_calls": true, "tool_choice": "auto", "tools": [],
                     "output": match text {
                         Some(t) => json!([{"type": "message", "id": mid, "status": "completed", "role": "assistant",
                                            "content": [{"type": "output_text", "text": t, "annotations": []}]}]),
@@ -443,13 +445,30 @@ fn openai_reply(inp: &Input, model: &str, ep: &str, stream: bool) -> Out {
 
 fn anthropic_reply(inp: &Input, model: &str, ep: &str, stream: bool) -> Out {
     if ep == "complete" {
-        let v = json!({"type": "completion", "id": format!("compl_{}", id(inp, ep, 24)),
-                       "completion": format!(" {REPLY}"), "stop_reason": "stop_sequence", "model": model});
-        return if stream {
-            (200, SSE, sse([(Some("completion"), v.to_string())]))
-        } else {
-            ok(v)
+        let cid = format!("compl_{}", id(inp, ep, 24));
+        let piece = |text: &str, stop: Option<&str>| {
+            json!({"type": "completion", "id": cid, "completion": text,
+                   "stop_reason": stop, "stop": stop.map(|_| "\n\nHuman:"), "model": model})
         };
+        if !stream {
+            return ok(piece(&format!(" {REPLY}"), Some("stop_sequence")));
+        }
+        let mut ev: Vec<_> = pieces()
+            .enumerate()
+            .map(|(i, p)| {
+                let t = if i == 0 {
+                    format!(" {p}")
+                } else {
+                    p.to_string()
+                };
+                (Some("completion"), piece(&t, None).to_string())
+            })
+            .collect();
+        ev.push((
+            Some("completion"),
+            piece("", Some("stop_sequence")).to_string(),
+        ));
+        return (200, SSE, sse(ev));
     }
     let mid = format!("msg_{}", id(inp, ep, 24));
     if !stream {
@@ -469,6 +488,7 @@ fn anthropic_reply(inp: &Input, model: &str, ep: &str, stream: bool) -> Out {
             "stop_reason": null, "stop_sequence": null,
             "usage": {"input_tokens": PROMPT_TOKENS, "output_tokens": 1}}}),
         ),
+        e("ping", json!({"type": "ping"})),
         e(
             "content_block_start",
             json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
@@ -518,6 +538,10 @@ mod tests {
         assert_eq!(ep("POST", "/api/chat"), e("llm:chat", "ollama"));
         assert_eq!(ep("POST", "/api/pull"), e("llm:pull", "ollama"));
         assert_eq!(ep("POST", "/api/embed"), e("llm:unsupported", "ollama"));
+        assert_eq!(ep("DELETE", "/api/delete"), e("llm:unsupported", "ollama"));
+        assert_eq!(ep("GET", "/api/embed"), None);
+        assert_eq!(ep("GET", "/api/create"), None);
+        assert_eq!(ep("DELETE", "/api/copy"), None);
         for pre in ["/v1", "/openai/v1", "/api/v1", "/litellm/v1"] {
             assert_eq!(
                 ep("POST", &format!("{pre}/chat/completions")),
@@ -741,6 +765,14 @@ mod tests {
             REPLY
         );
         let r = js(&run(d("openai", "responses", Some("gpt-4.1"), false)));
+        assert_eq!(
+            (
+                r["parallel_tool_calls"].as_bool(),
+                r["tool_choice"].as_str(),
+                r["tools"].as_array().map(Vec::len)
+            ),
+            (Some(true), Some("auto"), Some(0))
+        );
         assert_eq!(r["output"][0]["content"][0]["text"], REPLY);
         let rs = run(d("openai", "responses", Some("gpt-4.1"), true));
         let events: Vec<&str> = rs
@@ -839,7 +871,10 @@ mod tests {
             .lines()
             .filter_map(|l| l.strip_prefix("event: "))
             .collect();
-        assert_eq!(events.first(), Some(&"message_start"));
+        assert_eq!(
+            &events[..3],
+            ["message_start", "ping", "content_block_start"]
+        );
         assert_eq!(
             &events[events.len() - 3..],
             ["content_block_stop", "message_delta", "message_stop"]
@@ -864,6 +899,33 @@ mod tests {
             )))["type"],
             "completion"
         );
+        let legacy = js(&run(d(
+            "anthropic",
+            "complete",
+            Some("claude-opus-5-5"),
+            false,
+        )));
+        assert_eq!(
+            (legacy["stop_reason"].as_str(), legacy["stop"].as_str()),
+            (Some("stop_sequence"), Some("\n\nHuman:"))
+        );
+        let ls = run(d("anthropic", "complete", Some("claude-opus-5-5"), true));
+        let parts: Vec<serde_json::Value> = sse_data(&ls)
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(!ls.body.contains("event: ping"));
+        assert!(
+            parts[..parts.len() - 1]
+                .iter()
+                .all(|v| v["stop_reason"].is_null())
+        );
+        assert_eq!(parts.last().unwrap()["stop_reason"], "stop_sequence");
+        let text: String = parts
+            .iter()
+            .map(|v| v["completion"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, format!(" {REPLY}"));
         let miss = run(d("anthropic", "messages", Some("claude-2"), false));
         assert_eq!(
             (miss.status, js(&miss)["error"]["type"].as_str()),

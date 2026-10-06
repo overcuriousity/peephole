@@ -90,7 +90,7 @@ impl Store {
         let (w, since) = r.ts_clause("r.ts");
         let sql = format!(
             "{SESSIONS}
-             SELECT (SELECT COUNT(*) FROM s),
+             SELECT (SELECT COUNT(DISTINCT h) FROM s),
                (SELECT COUNT(DISTINCT carrier.h) FROM carrier JOIN requests r ON r.id = carrier.rid WHERE r.answer = 'decoy:mcp:tools/list'),
                (SELECT COUNT(DISTINCT carrier.h) FROM carrier JOIN requests r ON r.id = carrier.rid WHERE r.answer = 'decoy:mcp:tools/call'),
                (SELECT COUNT(DISTINCT carrier.h) FROM carrier JOIN canaries c2 ON c2.request_id = carrier.rid
@@ -106,7 +106,7 @@ impl Store {
         let sse = format!(
             "SELECT COALESCE(SUM(r.answer = 'decoy:mcp:sse'), 0),
                     COALESCE(SUM(r.answer LIKE 'decoy:mcp:%' AND json_extract(r.decoy_in, '$.via') = 'sse'
-                                 AND r.answer NOT IN ('decoy:mcp:sse', 'decoy:mcp:no-session')
+                                 AND r.answer NOT IN ('decoy:mcp:sse', 'decoy:mcp:no-session', 'decoy:mcp:busy')
                                  AND COALESCE(json_extract(r.decoy_in, '$.m'), '') NOT LIKE 'notifications/%'), 0),
                     COALESCE(SUM(r.answer = 'decoy:mcp:no-session'), 0)
              FROM requests r WHERE r.decoy_in IS NOT NULL{w}"
@@ -134,12 +134,12 @@ impl Store {
             "{SESSIONS}, rows AS (
                SELECT s.h, s.rid AS start, s.rid AS rid FROM s
                UNION SELECT carrier.h, s.rid, carrier.rid FROM carrier JOIN s ON s.h = carrier.h)
-             SELECT st.page_token AS id, group_concat(DISTINCT i.ip) AS ips, MIN(r.ts) AS first, MAX(r.ts) AS last,
+             SELECT (SELECT page_token FROM requests WHERE id = g.st) AS id, g.ips, g.first, g.last, g.steps, g.tools FROM (
+             SELECT MIN(rows.start) AS st, group_concat(DISTINCT i.ip) AS ips, MIN(r.ts) AS first, MAX(r.ts) AS last,
                     COUNT(DISTINCT rows.rid) AS steps,
                     COALESCE(group_concat(DISTINCT json_extract(r.decoy_in, '$.tool')), '') AS tools
              FROM rows JOIN requests r ON r.id = rows.rid JOIN ips i ON i.id = r.ip_id
-               JOIN requests st ON st.id = rows.start
-             GROUP BY rows.h ORDER BY last DESC LIMIT ?",
+             GROUP BY rows.h) g ORDER BY g.last DESC LIMIT ?",
             SESSIONS = SESSIONS.replace("{w}", &w)
         );
         let mut q = sqlx::query_as::<_, McpSession>(sqlx::AssertSqlSafe(sql));
@@ -161,7 +161,7 @@ impl Store {
     ) -> Result<Page<ToolCall>> {
         let (w, since) = r.ts_clause("r.ts");
         let tw = if tool.is_some() {
-            " AND json_extract(r.decoy_in, '$.tool') = ?"
+            " AND COALESCE(json_extract(r.decoy_in, '$.tool'), json_extract(r.decoy_in, '$.m')) = ?"
         } else {
             ""
         };
@@ -622,6 +622,23 @@ mod tests {
         assert!(first.ips.contains("8.8.4.4") && first.tools.contains("read_file"));
         let calls = s.mcp_calls(Range::All, Some("read_file"), 1).await.unwrap();
         assert_eq!(calls.items[0].arg, "/app/.env");
+        req(
+            &s,
+            "8.8.4.4",
+            "/mcp",
+            "decoy:mcp:resources/read",
+            r#"{"m":"resources/read","arg":"file:///app/.env","cls":"dotenv"}"#,
+            &h,
+            None,
+            "",
+        )
+        .await;
+        let res = s
+            .mcp_calls(Range::All, Some("resources/read"), 1)
+            .await
+            .unwrap();
+        assert_eq!(res.items.len(), 1);
+        assert_eq!(res.items[0].tool, "resources/read");
 
         // The session filter finds the initialize request and its carriers.
         assert_eq!(
@@ -633,7 +650,7 @@ mod tests {
                 }
             )
             .await,
-            3
+            4
         );
         assert_eq!(
             s.decoy_counts_for_ip(ip_id(&s, "8.8.8.8").await)
