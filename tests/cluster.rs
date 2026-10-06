@@ -4749,6 +4749,40 @@ fn serves(
     asked
 }
 
+/// A member of an earlier version can serve providers, but it does not know
+/// offers and receipts: it is not offered as a server of paid lookups.
+#[tokio::test]
+async fn an_old_version_member_is_not_asked_for_paid_lookups() {
+    use peephole::credits::{pay, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-old");
+    let (ic, c) = new_node("node-new");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let old = Opts {
+        proto: Some((
+            peephole::cluster::rpc::proto::PROTO_MIN,
+            peephole::cluster::rpc::proto::OWNER_PROTO - 1,
+        )),
+        ..DEFAULT
+    };
+    let nb = boot(ib, &b, &[&a, &c], old).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    serves(&nc, &[("abuseipdb", Some(1000.0))], 0.2);
+    price::refresh(&nb.node).await.unwrap();
+    price::refresh(&nc.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    price_seen(&na, c.id, "abuseipdb").await;
+    let none: peephole::intel::Providers = vec![];
+    let servers: Vec<_> = pay::quotes(&na.node, &none)
+        .remove("abuseipdb")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|q| q.server)
+        .collect();
+    assert_eq!(servers, vec![c.id], "only the member that speaks credits");
+}
+
 /// Give `node` credits in the books of every node in `on`: `scans` judged
 /// level-1 scans it ran for its own trap, 1250 mc each.
 async fn grant_scans(on: &[&TestNode], node: NodeId, scans: u32) {

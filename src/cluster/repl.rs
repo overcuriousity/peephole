@@ -1865,6 +1865,51 @@ mod tests {
             .unwrap()
     }
 
+    /// A node of an earlier version meets a record kind it does not know
+    /// (as the credit kinds are to a node before them): it keeps the entry,
+    /// does not apply it, and relays it unchanged, so the nodes behind it
+    /// receive it as their origin signed it.
+    #[tokio::test]
+    async fn a_kind_this_build_does_not_know_is_kept_and_relayed_unchanged() {
+        let (_d, node) = test_node(0).await;
+        let a = Identity::generate().unwrap();
+        super::append(&node, &[Record::MemberAdd(info(a.id, "a"))])
+            .await
+            .unwrap();
+        let payload = super::super::rpc::cbor::encode(&serde_json::json!({
+            "payer": "x", "offer_seq": 7, "charged_mc": 1500, "answered": ["abuseipdb"]
+        }))
+        .unwrap();
+        let later = WireEntry::sign_kind(&a, 1, now_hlc(1), "credit_receipt_v9", payload);
+        assert!(later.record().is_none(), "unknown here");
+        let after = request(&a, 2, "/after");
+        let st = super::apply_batch(&node, vec![later.clone(), after])
+            .await
+            .unwrap();
+        assert_eq!((st.applied, st.rejected), (2, 0), "{st:?}");
+        let state: i64 =
+            sqlx::query_scalar("SELECT applied FROM repl_log WHERE origin = ? AND seq = 1")
+                .bind(&a.id.0[..])
+                .fetch_one(&node.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(state, super::UNKNOWN_KIND);
+        assert_eq!(paths(&node).await, ["/after"], "the origin's log goes on");
+        // Still unknown after a restart's retry.
+        super::apply_unknown_kinds(&node).await.unwrap();
+
+        let batch = super::entries_after(&node.store, &[(a.id, 0)], 0, 100, 1 << 20)
+            .await
+            .unwrap();
+        let sent = batch
+            .entries
+            .iter()
+            .find(|e| e.origin == a.id && e.seq == 1)
+            .expect("relayed");
+        assert_eq!(sent, &later, "byte for byte");
+        assert!(sent.verify(), "the origin's signature still holds");
+    }
+
     /// One entry that fails stops neither the batch nor the other origins.
     /// Before, any error rolled back the whole batch; peers sent it again
     /// and again and sync stalled for every origin.

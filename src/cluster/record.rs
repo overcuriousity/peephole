@@ -475,6 +475,29 @@ impl WireEntry {
         })
     }
 
+    /// An entry of a kind this build may not know, as a later version
+    /// writes it (for tests of mixed versions).
+    #[cfg(test)]
+    pub(crate) fn sign_kind(
+        identity: &Identity,
+        seq: u64,
+        hlc: u64,
+        kind: &str,
+        payload: Vec<u8>,
+    ) -> Self {
+        let sig = identity.sign(&signing_bytes(&identity.id, seq, hlc, kind, None, &payload));
+        Self {
+            origin: identity.id,
+            seq,
+            hlc,
+            kind: kind.into(),
+            uid: None,
+            payload: Some(payload),
+            sig: Some(sig),
+            erased_by: None,
+        }
+    }
+
     /// True if payload and signature are present and the origin signed them.
     pub fn verify(&self) -> bool {
         match (&self.payload, &self.sig) {
