@@ -376,7 +376,7 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                     .ok()
                     .filter(|n| *n > 0)
                     .context("--sample takes a positive number")?,
-                None => crate::admin::cluster::RULES_SAMPLE,
+                None => crate::credits::gates::RULES_SAMPLE,
             };
             // Read-only, as `status`.
             let cfg = Config::load(Path::new(cfg_at(2)))?;

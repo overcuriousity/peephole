@@ -4393,3 +4393,92 @@ async fn a_node_that_shows_two_histories_is_proven_and_marked_everywhere() {
     // Marked for good, and one proof is enough.
     assert_eq!(seal::investigate(&nb.node).await.unwrap(), 0);
 }
+/// A stand-in nmap that records the command line it was given, as nmap
+/// does: its results count as run with the built-in arguments.
+fn fake_nmap_args(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("fake-nmap-args");
+    std::fs::write(
+        &p,
+        "#!/bin/sh\nfor a; do t=$a; done\ncat <<EOF\n<?xml version=\"1.0\"?>\n\
+         <nmaprun scanner=\"nmap\" args=\"nmap $*\" start=\"1\" version=\"7.94\">\n\
+         <host><status state=\"up\"/><address addr=\"$t\" addrtype=\"ipv4\"/>\n\
+         <ports><port protocol=\"tcp\" portid=\"22\"><state state=\"open\"/>\
+         <service name=\"ssh\"/></port></ports></host>\n</nmaprun>\nEOF\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// Judge every payable scan held on `n` now (the node's own loop waits
+/// ten minutes for the requests behind a scan).
+async fn judge_now(n: &TestNode) -> usize {
+    let origins = peephole::scan::guard::Origins::Any;
+    let j = peephole::credits::earn::Judge {
+        pool: &n.store.pool,
+        origins: &origins,
+        classifier: peephole::classify::Classifier::builtin(),
+    };
+    peephole::credits::earn::judge(&j, 0).await.unwrap()
+}
+
+/// A scanner completes a scan for another node's trap: both hold their
+/// shares in every node's book.
+#[tokio::test]
+async fn a_completed_scan_pays_scanner_and_trap_in_every_nodes_book() {
+    use peephole::credits;
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a, &c],
+        Opts {
+            scanner: Some(fake_nmap_args(tools.path())),
+            ..DEFAULT
+        },
+    )
+    .await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    enqueue(&na, "198.51.100.40", 2).await;
+    eventually_for(
+        Duration::from_secs(40),
+        "scanned, and everyone has it all",
+        || async {
+            let mut all = true;
+            for n in [&na, &nb, &nc] {
+                all &= count(n, "SELECT COUNT(*) FROM scans").await == 1
+                    && count(n, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 1
+                    && count(n, "SELECT COUNT(*) FROM requests").await == 3;
+            }
+            all
+        },
+    )
+    .await;
+    for n in [&na, &nb, &nc] {
+        assert_eq!(judge_now(n).await, 1);
+        let book = credits::book_fresh(&n.node).await.unwrap();
+        assert_eq!(book.paid.len(), 1);
+        assert!(book.paid[0].scan.args_ok && book.paid[0].scan.level == 2);
+        assert_eq!(book.balance(&b.id), 1000, "the scanner's share");
+        assert_eq!(book.balance(&a.id), 250, "the trap's share");
+        assert_eq!(book.balance(&c.id), 0);
+        assert_eq!(book.earned_per_day(), 1250 / 7);
+        assert!(book.standing(&b.id).earns());
+    }
+    // A member blocked here earns nothing here; elsewhere it still does.
+    peephole::cluster::block::block(&nc.node, b.id)
+        .await
+        .unwrap();
+    let book = credits::book_fresh(&nc.node).await.unwrap();
+    assert_eq!(book.balance(&b.id), 0);
+    assert!(book.standing(&b.id).blocked);
+    assert_eq!(
+        credits::book_fresh(&na.node).await.unwrap().balance(&b.id),
+        1000
+    );
+}

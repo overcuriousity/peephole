@@ -5,7 +5,7 @@ use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::pages::{redirect_with_error, redirect_with_notice};
 use crate::admin::views::Chrome;
-use crate::classify::stored::{Agreement, agreement};
+use crate::classify::stored::Agreement;
 use crate::cluster::identity::NodeId;
 use crate::cluster::status::PaceInfo;
 use crate::cluster::{Node, invite, members, repl};
@@ -107,98 +107,13 @@ impl MemberView {
     }
 }
 
-/// Characters of a rules fingerprint shown.
-pub(crate) const SHORT_HASH: usize = 12;
+use crate::credits::gates::RulesCheck;
+pub(crate) use crate::credits::gates::SHORT_HASH;
 
-/// The rules fingerprints a member's newest classified requests carry
-/// (`requests.rules`): what the recording binary says it classified with.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Carried {
-    /// The newest request's.
-    pub newest: Option<String>,
-    /// Other fingerprints among the sample (a node upgraded meanwhile).
-    pub others: usize,
-}
-
-impl Carried {
-    /// What the page shows, and whether the newest is `ours`.
-    fn view(&self, ours: &str) -> (String, Option<bool>) {
-        let Some(h) = &self.newest else {
-            return ("none recorded".into(), None);
-        };
-        let mut s: String = h.chars().take(SHORT_HASH).collect();
-        match self.others {
-            0 => {}
-            1 => s.push_str(" +1 other"),
-            n => s.push_str(&format!(" +{n} others")),
-        }
-        (s, Some(h == ours))
-    }
-}
-
-/// The fingerprints the newest `sample` classified requests of `origin`
-/// carry (None: this standalone node's own rows).
-pub async fn carried(
-    pool: &sqlx::SqlitePool,
-    origin: Option<&[u8]>,
-    sample: i64,
-) -> anyhow::Result<Carried> {
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT rules FROM requests
-         WHERE origin IS ? AND is_fp_claim = 0 AND rules IS NOT NULL
-         ORDER BY id DESC LIMIT ?",
-    )
-    .bind(origin)
-    .bind(sample)
-    .fetch_all(pool)
-    .await?;
-    let distinct: std::collections::HashSet<&String> = rows.iter().collect();
-    Ok(Carried {
-        newest: rows.first().cloned(),
-        others: distinct.len().saturating_sub(1),
-    })
-}
-
-/// Members' recent requests classified again with this node's (built-in)
-/// rules, and the rules fingerprints they carry, by member
-/// ([`crate::classify::stored::agreement`], [`carried`]).
-pub struct RulesCheck {
-    pub by_member: std::collections::HashMap<NodeId, Agreement>,
-    pub carried: std::collections::HashMap<NodeId, Carried>,
-}
-
-/// How long a comparison is shown before it is made again.
-const RULES_CHECK_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-/// Newest requests of each member compared.
-pub const RULES_SAMPLE: i64 = 500;
-
-/// The comparison, made at most every [`RULES_CHECK_TTL`] (an older one is
-/// shown while it is made again), so the page stays fast.
-pub(crate) async fn rules_check(st: &AdminState, node: &Node) -> AppResult<Arc<RulesCheck>> {
-    let store = node.store.clone();
-    Ok(st
-        .rules_check
-        .get((), RULES_CHECK_TTL, move || {
-            let store = store.clone();
-            Box::pin(async move { compare_rules(&store).await })
-        })
-        .await?)
-}
-
-async fn compare_rules(store: &crate::store::Store) -> anyhow::Result<RulesCheck> {
-    let mut check = RulesCheck {
-        by_member: Default::default(),
-        carried: Default::default(),
-    };
-    let c = crate::classify::Classifier::builtin();
-    for m in members::all(store).await? {
-        let origin = Some(&m.id.0[..]);
-        let a = agreement(&store.pool, c, origin, RULES_SAMPLE).await?;
-        check.by_member.insert(m.id, a);
-        let k = carried(&store.pool, origin, RULES_SAMPLE).await?;
-        check.carried.insert(m.id, k);
-    }
-    Ok(check)
+/// The comparison of members' requests with this node's rules, made at
+/// most every ten minutes (see [`crate::credits::gates::rules_check`]).
+pub(crate) async fn rules_check(_st: &AdminState, node: &Node) -> AppResult<Arc<RulesCheck>> {
+    Ok(crate::credits::gates::rules_check(node).await?)
 }
 
 /// A fresh heartbeat's creation time against our clock at receipt. Gossip
@@ -1329,6 +1244,7 @@ async fn set_pace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credits::gates::{Carried, carried};
 
     /// The fingerprint a member's newest requests carry, read from the
     /// rows: claims and rows without one left out, others counted.

@@ -256,6 +256,11 @@ pub struct Node {
     pub apply_lock: tokio::sync::Mutex<()>,
     /// Owner commands and key rotations, each one at a time.
     pub owner_locks: owner::Locks,
+    /// How members' requests compare with this node's rules (the credits
+    /// gate and the cluster pages).
+    pub rules_check: crate::store::stats::SwrCache<(), crate::credits::gates::RulesCheck>,
+    /// This node's book of credits, as last computed.
+    pub credits_book: Mutex<Option<(std::time::Instant, Arc<crate::credits::Book>)>>,
     /// Bumped whenever the log grows; wakes sync loops and long-polls.
     changed: tokio::sync::watch::Sender<u64>,
     join_attempts: Mutex<JoinAttempts>,
@@ -322,6 +327,8 @@ impl Node {
             peer_status: RwLock::new(HashMap::new()),
             apply_lock: tokio::sync::Mutex::new(()),
             owner_locks: Default::default(),
+            rules_check: crate::store::stats::SwrCache::new(1),
+            credits_book: Mutex::new(None),
             changed: tokio::sync::watch::channel(0).0,
             join_attempts: Mutex::new(Default::default()),
             sync_slots: tokio::sync::Semaphore::new(sync::MAX_CONCURRENT_SYNCS),
