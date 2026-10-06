@@ -1,0 +1,126 @@
+//! `peephole owner …`: the ownership key on this node. Like `peephole
+//! cluster`, it opens the node's database directly, so it works on
+//! headless nodes and while the daemon runs.
+use super::OwnerKey;
+use crate::cluster::identity::Identity;
+use crate::cluster::members;
+use crate::config::Config;
+use crate::store::Store;
+use anyhow::{Context, Result, bail};
+use std::path::Path;
+
+pub const USAGE: &str = "usage: peephole owner new [CONFIG]
+       peephole owner adopt [--keep] [CONFIG]   (reads the key from standard input;
+                                                 --keep: manage other nodes from here)
+       peephole owner show [CONFIG]
+       peephole owner forget-key [CONFIG]       (the node stays owned)
+       peephole owner release [CONFIG]          (the node has no owner afterwards)";
+
+pub async fn run(args: &[String], default_config: &str) -> Result<()> {
+    let mut keep = false;
+    let mut pos: Vec<&str> = vec![];
+    for a in args {
+        match a.as_str() {
+            "--keep" => keep = true,
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            f if f.starts_with("--") => bail!("unknown flag {f}\n\n{USAGE}"),
+            p => pos.push(p),
+        }
+    }
+    let sub = *pos.first().context(USAGE)?;
+    if pos.len() > 2 {
+        bail!("unexpected argument '{}'\n\n{USAGE}", pos[2]);
+    }
+    if keep && sub != "adopt" {
+        bail!("--keep belongs to `adopt`\n\n{USAGE}");
+    }
+    let cfg = Config::load(Path::new(pos.get(1).copied().unwrap_or(default_config)))?;
+    if cfg.cluster.is_none() {
+        bail!("config has no [cluster] section: ownership is for cluster nodes");
+    }
+    let store = Store::connect(&cfg.database_path).await?;
+    let me = Identity::load_or_create(&cfg.node_key_path())?.id;
+    match sub {
+        "new" => {
+            if let Some(o) = super::load(&store, me).await? {
+                bail!(
+                    "this node already has an owner ({}); release it first: peephole owner release",
+                    o.id.short()
+                );
+            }
+            let key = super::create(&store, me).await?;
+            println!("{}", key.encode());
+            eprintln!(
+                "this is the ownership key, shown once. Whoever holds it controls every node \
+                 it is entered on. Enter it on your other nodes with: peephole owner adopt"
+            );
+        }
+        "adopt" => {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .context("reading the key from standard input")?;
+            let key = OwnerKey::parse(&line)?;
+            super::adopt(&store, me, &key, keep).await?;
+            println!(
+                "this node is now owned by {} ({})",
+                key.id.short(),
+                if keep {
+                    "key kept here"
+                } else {
+                    "key not kept here"
+                }
+            );
+        }
+        "show" => match super::load(&store, me).await? {
+            None => println!("no owner"),
+            Some(o) => {
+                println!(
+                    "owner {} ({})",
+                    o.id.short(),
+                    if o.managing() {
+                        "key kept here"
+                    } else {
+                        "key not kept here"
+                    }
+                );
+                let names: std::collections::HashMap<_, _> = members::all(&store)
+                    .await?
+                    .into_iter()
+                    .map(|m| (m.id, m.name))
+                    .collect();
+                let rows: Vec<Vec<u8>> =
+                    sqlx::query_scalar("SELECT node FROM siblings ORDER BY node")
+                        .fetch_all(&store.pool)
+                        .await?;
+                for r in rows {
+                    let id = crate::cluster::identity::NodeId::from_slice(&r)?;
+                    println!(
+                        "  {} {}",
+                        id.short(),
+                        names.get(&id).map(String::as_str).unwrap_or("?")
+                    );
+                }
+            }
+        },
+        "forget-key" => {
+            if super::forget_key(&store).await? {
+                println!("the ownership key is no longer kept on this node; it stays owned");
+            } else {
+                println!("no ownership key was kept on this node");
+            }
+        }
+        "release" => {
+            if super::release(&store).await? {
+                println!("this node has no owner now");
+            } else {
+                println!("this node had no owner");
+            }
+        }
+        other => bail!("unknown subcommand '{other}'\n\n{USAGE}"),
+    }
+    Ok(())
+}

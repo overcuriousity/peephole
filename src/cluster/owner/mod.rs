@@ -7,6 +7,8 @@ use anyhow::{Context, Result, bail};
 use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
+pub mod cli;
+
 const PREFIX: &str = "peephole-own1:";
 const CERT_DOMAIN: &[u8] = b"peephole-owner-cert-v1\0";
 const KEY_ID: &str = "owner.id";

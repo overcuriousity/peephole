@@ -458,3 +458,81 @@ advertise = "window-1.example:7443"
     assert!(status.contains("history   keeps 7 days"), "{status}");
     assert!(status.contains("held from seq 3"), "{status}");
 }
+
+/// The ownership key from the shell: created on one node, adopted on
+/// another from standard input, forgotten and released.
+#[test]
+fn ownership_key_is_created_adopted_and_released_from_the_shell() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let config = |name: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("c.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "database_path = \"{d}/t.db\"\ndata_dir = \"{d}\"\n[roles]\nlistener = false\nweb = false\n\
+                 [cluster]\nnode_name = \"{name}\"\nlisten = \"127.0.0.1:0\"\n",
+                d = dir.path().display()
+            ),
+        )
+        .unwrap();
+        (dir, cfg)
+    };
+    let run = |cfg: &std::path::Path, args: &[&str], stdin: Option<&str>| {
+        let mut child = bin()
+            .arg("owner")
+            .args(args)
+            .arg(cfg.to_str().unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if let Some(s) = stdin {
+            child.stdin.take().unwrap().write_all(s.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    };
+    let (_da, a) = config("a");
+    let (_db, b) = config("b");
+
+    let (ok, shown, _) = run(&a, &["show"], None);
+    assert!(ok && shown.contains("no owner"), "{shown}");
+
+    let (ok, key, err) = run(&a, &["new"], None);
+    assert!(ok, "{err}");
+    let key = key.trim().to_string();
+    assert!(key.starts_with("peephole-own1:"), "{key}");
+    let (_, shown, _) = run(&a, &["show"], None);
+    assert!(shown.contains("key kept here"), "{shown}");
+    let owner = shown.split_whitespace().nth(1).unwrap().to_string();
+    let (ok, _, err) = run(&a, &["new"], None);
+    assert!(!ok && err.contains("already has an owner"), "{err}");
+
+    // The key never goes on the command line: adopt reads standard input.
+    let (ok, _, err) = run(&b, &["adopt"], Some(&format!("{key}\n")));
+    assert!(ok, "{err}");
+    let (_, shown, _) = run(&b, &["show"], None);
+    assert!(
+        shown.contains(&owner) && shown.contains("key not kept here"),
+        "{shown}"
+    );
+    let (ok, _, err) = run(&b, &["adopt"], Some("peephole1:abc\n"));
+    assert!(!ok && err.contains("invite"), "{err}");
+
+    let (ok, _, _) = run(&a, &["forget-key"], None);
+    assert!(ok);
+    let (_, shown, _) = run(&a, &["show"], None);
+    assert!(shown.contains("key not kept here"), "{shown}");
+
+    let (ok, _, _) = run(&b, &["release"], None);
+    assert!(ok);
+    let (_, shown, _) = run(&b, &["show"], None);
+    assert!(shown.contains("no owner"), "{shown}");
+}

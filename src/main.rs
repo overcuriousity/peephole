@@ -6,6 +6,7 @@ const USAGE: &str = "\
 usage: peephole [CONFIG]                 run the daemon (default /etc/peephole/config.toml)
        peephole check-config [CONFIG]    validate config and nmap; show the built-in rules
        peephole cluster (id|invite|invites|invite-revoke|join|members|status|agreement|config-key|block|unblock|purge|leave) …
+       peephole owner (new|adopt|show|forget-key|release) …    the ownership key on this node
        peephole settings (show|set|reset) …
        peephole export [OPTIONS] [CONFIG]  the dataset as Parquet, CSV or JSON Lines (--help)
        peephole decoy render UID [CONFIG]  print a stored decoy answer again
@@ -23,6 +24,7 @@ enum Cmd {
     Version,
     CheckConfig(PathBuf),
     Cluster,
+    Owner,
     Settings,
     Export,
     Decoy,
@@ -63,6 +65,7 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         Some("check-config") => config_at(1).map(Cmd::CheckConfig),
         // These parse their own arguments.
         Some("cluster") => Ok(Cmd::Cluster),
+        Some("owner") => Ok(Cmd::Owner),
         Some("settings") => Ok(Cmd::Settings),
         Some("export") => Ok(Cmd::Export),
         Some("decoy") => Ok(Cmd::Decoy),
@@ -102,6 +105,11 @@ async fn main() -> anyhow::Result<()> {
         },
         Cmd::Cluster => {
             if let Err(e) = peephole::cluster::cli::run(&args[1..], DEFAULT_CONFIG).await {
+                fail(e);
+            }
+        }
+        Cmd::Owner => {
+            if let Err(e) = peephole::cluster::owner::cli::run(&args[1..], DEFAULT_CONFIG).await {
                 fail(e);
             }
         }
@@ -176,6 +184,7 @@ mod tests {
             Ok(Cmd::CheckConfig("c.toml".into()))
         );
         assert_eq!(p(&["cluster", "anything", "goes"]), Ok(Cmd::Cluster));
+        assert_eq!(p(&["owner", "show"]), Ok(Cmd::Owner));
         assert_eq!(p(&["settings"]), Ok(Cmd::Settings));
         assert_eq!(p(&["export", "--format", "csv"]), Ok(Cmd::Export));
         assert_eq!(p(&["decoy", "render", "x"]), Ok(Cmd::Decoy));
