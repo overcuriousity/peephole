@@ -24,13 +24,15 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
     request so answers re-render byte for byte. Replicated between nodes
     and exported beside `answer` and `decoy_v`.
   - The rule `llm-key-use` (weight 3), header-only: LLM-provider key shapes
-    (`Authorization: Bearer sk-...`, `x-api-key: sk-ant-...`, Azure
-    `api-key`) on any path. `ai-infra-probe` also matches the new gateway
+    (`Authorization: Bearer sk-...`, `x-api-key: sk-ant-...`, Azure OpenAI
+    `api-key` of 32 hex characters) on any path. `ai-infra-probe` also matches the new gateway
     paths.
   - Admin › Decoys (MCP funnel, sessions, tool calls, LLM models and
     prompts, web decoys), the quick filters "MCP decoy" and "LLM decoy", the
     request and IP pages' decoy details, and the wall card "What they
     asked our fake AI" (tool names ours, model names filtered, from 2 IPs).
+  - A legacy SSE message whose stream queue is full is answered `503` and
+    recorded as `decoy:mcp:busy`.
   - `[trap]` settings `mcp_sse_pool` (64), `mcp_sse_per_source` (2),
     `mcp_sse_hold_secs` (300).
 
@@ -38,8 +40,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 - Decoy version 2: renders every version 1 name unchanged plus the new
   ones. The Answer filter now matches any prefix. AI decoys skip the
-  tarpit.
-
+  tarpit. An AI decoy that cannot be rendered falls back to the version 1
+  pick instead of the 404.
 - Cluster › Members shows how many requests and scans each node
   contributed, with its share, again; the full breakdown stays on the
   node page.

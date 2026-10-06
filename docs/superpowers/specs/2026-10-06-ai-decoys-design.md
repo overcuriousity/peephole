@@ -1,7 +1,7 @@
-# AI decoys: MCP and LLM gateway (roadmap item 1)
+# AI decoys: MCP and LLM gateway
 
 Date: 2026-10-06 · Status: implemented (branch `ai-decoys`).
-Roadmap: `docs/roadmap.md`, item 1 "Stateful decoys, MCP and AI first".
+Formerly roadmap item 1 ("Stateful decoys, MCP and AI first"; see `docs/roadmap.md`).
 
 ## Goal
 
@@ -106,9 +106,13 @@ A per-node `SseHub`:
     `"via":"sse"`.
   - X unknown here: `404 Could not find session`; `answer` =
     `decoy:mcp:no-session`, `decoy_in` still holds method and tool.
+  - X open but its queue is full: the frame is dropped and the POST gets
+    `503`; `answer` = `decoy:mcp:busy` (nothing is derived from it).
 - The GET's row is written when the stream ends, with `held_ms` and
   `answer` = `decoy:mcp:sse`. A node crash mid-stream loses it, as with the
-  tarpit.
+  tarpit. The recorded `held_ms` is capped at `mcp_sse_hold_secs`, since a
+  stream the client never reads ends at the connection deadline (hold plus
+  margin). SSE light rows do not keep `held_ms`.
 
 ## LLM gateway decoy
 
@@ -174,8 +178,8 @@ not at random IPs); Jupyter, Gradio, Open WebUI, vector databases (keep the
 - New `llm-key-use` (weight 3), header-only (a rule's matchers are
   OR-combined, so it cannot also require a path): it matches LLM-provider key
   shapes on any path, i.e. an attempt to spend someone's inference:
-  `Authorization: Bearer sk-…`, `x-api-key: sk-ant-…`, Azure's `api-key`
-  header.
+  `Authorization: Bearer sk-…`, `x-api-key: sk-ant-…`, Azure OpenAI's `api-key` header when it is 32 hex
+  characters (a bare `api-key: hello` or `x-api-key: abc` does not match).
 
 ## Data model
 
@@ -238,8 +242,8 @@ Cluster · System), with the range picker and sub-tabs:
   characters of the last user message, decoded from the body at view time).
 - **Web**: requests per existing decoy name, linking to Requests.
 
-Switching the range on the Decoys page goes back to the MCP tab. SSE light
-rows do not keep `held_ms`.
+The sub-tab links carry the current range, and the range picker keeps the
+tab, so switching either keeps the other.
 
 Elsewhere: the request page shows `decoy_in`; quick filters "MCP decoy" and
 "LLM decoy" on Requests; the IP page gets "MCP sessions N · tool calls M ·
