@@ -260,6 +260,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         if cfg.cluster.as_ref().is_some_and(|c| c.remote_config) {
             cluster::confkey::ensure(&store, node.id()).await?;
         }
+        cluster::remote::serve(node, settings.clone());
         cluster::confkey::serve(node, settings.clone());
         // Does nothing unless this node currently scans.
         tokio::spawn(scan::arbiter::takeover_loop(

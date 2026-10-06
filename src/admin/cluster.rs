@@ -1011,7 +1011,7 @@ enum Remote {
     NoKey,
     /// Asked, and it answered.
     Settings {
-        state: crate::cluster::confkey::State,
+        state: crate::cluster::remote::State,
         timeout_min: String,
         rec: Option<(u32, i64, String)>,
         has: (bool, bool, bool),
@@ -1061,7 +1061,7 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
     } else if !asks_remote(&m) {
         Remote::Offline
     } else {
-        match crate::cluster::confkey::get(node, id).await {
+        match crate::cluster::remote::get(node, id).await {
             Ok(s) => {
                 let minutes = |secs: u64| {
                     if secs.is_multiple_of(60) {

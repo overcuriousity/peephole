@@ -82,7 +82,7 @@ pub enum Msg {
     },
     /// Any member → node: what are your runtime settings?
     ConfigGet,
-    ConfigState(super::confkey::State),
+    ConfigState(super::remote::State),
     /// Config key holder → node: change your settings. `mac` proves the
     /// sender holds the node's config key without sending it.
     ConfigSet {

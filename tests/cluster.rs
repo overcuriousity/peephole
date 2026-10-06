@@ -173,6 +173,7 @@ async fn boot_in(
             .await
             .unwrap();
     }
+    cluster::remote::serve(&node, settings.clone());
     cluster::confkey::serve(&node, settings.clone());
     let workers = o.scanner.as_ref().map(|nmap| {
         tokio::spawn(peephole::scan::arbiter::takeover_loop(
@@ -2243,7 +2244,9 @@ async fn config_key_holders_change_a_nodes_settings() {
     .await;
 
     // Anyone may look.
-    let state = confkey::get(&na.node, b.id).await.unwrap();
+    let state = peephole::cluster::remote::get(&na.node, b.id)
+        .await
+        .unwrap();
     assert!(state.open);
     assert_eq!(state.version, 0);
     let faster = Changes {
@@ -2326,7 +2329,12 @@ async fn config_key_holders_change_a_nodes_settings() {
     confkey::add(&nb.store, b.id, &a_key.encode())
         .await
         .unwrap();
-    assert!(!confkey::get(&nb.node, a.id).await.unwrap().open);
+    assert!(
+        !peephole::cluster::remote::get(&nb.node, a.id)
+            .await
+            .unwrap()
+            .open
+    );
     let e = confkey::set(&nb.node, a.id, 0, &faster)
         .await
         .unwrap()

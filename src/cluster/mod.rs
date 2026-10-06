@@ -11,6 +11,7 @@ pub mod invite;
 pub mod members;
 pub mod msg;
 pub mod record;
+pub mod remote;
 pub mod repl;
 pub mod rpc;
 pub mod status;
