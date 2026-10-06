@@ -56,7 +56,7 @@ impl Range {
         matches!(self, Range::H24 | Range::D7)
     }
     /// `WHERE`-fragment and bind value for a timestamp column.
-    fn ts_clause(self, col: &str) -> (String, Option<&'static str>) {
+    pub(crate) fn ts_clause(self, col: &str) -> (String, Option<&'static str>) {
         match self.since() {
             Some(m) => (format!(" AND {col} >= datetime('now', ?)"), Some(m)),
             None => (String::new(), None),

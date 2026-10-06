@@ -5,6 +5,7 @@ pub mod browse;
 pub mod canaries;
 pub mod cli;
 pub mod data;
+pub mod decoys;
 pub mod delete;
 pub mod export;
 pub mod fingerprints;

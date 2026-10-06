@@ -129,6 +129,9 @@ pub struct RequestFilter {
     /// Admin only: what the trap answered (`not-found`, `decoy:…`);
     /// `unknown` for a row without one; `decoy` for every `decoy:…`.
     pub answer: Option<String>,
+    /// Admin only: an MCP session id as served; the request that started
+    /// it and every request that carried it.
+    pub session: Option<String>,
     #[serde(default, deserialize_with = "lenient_i64")]
     pub page: Option<i64>,
 }
@@ -544,12 +547,22 @@ fn request_filter_sql(f: &RequestFilter, a: Audience, indexed: bool) -> (String,
             sql.push_str(" AND r.user_agent = ?");
             binds.push(v);
         }
-        // Analytics shows a missing value as `unknown`. An answer without
-        // a `:` also takes its variants: `decoy` finds `decoy:dotenv`.
+        if let Some(v) = nonempty(&f.session) {
+            sql.push_str(
+                " AND r.id IN (SELECT c.request_id FROM canaries c WHERE c.kind = 'mcp-session' AND c.value_hash = ?
+                              UNION SELECT t.request_id FROM request_tokens t WHERE t.value_hash = ?)",
+            );
+            let h = crate::canary::hash(v.trim()).to_string();
+            binds.push(h.clone());
+            binds.push(h);
+        }
+        // Analytics shows a missing value as `unknown`. An answer also takes
+        // its variants: `decoy` finds `decoy:dotenv`, `decoy:mcp` finds
+        // `decoy:mcp:ping`.
         for (col, v) in [("transport", &f.transport), ("answer", &f.answer)] {
             match nonempty(v).as_deref() {
                 Some("unknown") => sql.push_str(&format!(" AND r.{col} IS NULL")),
-                Some(v) if col == "answer" && !v.contains(':') => {
+                Some(v) if col == "answer" => {
                     sql.push_str(" AND (r.answer = ? OR r.answer LIKE ? ESCAPE '\\')");
                     binds.push(v.to_string());
                     binds.push(format!("{}:%", like_escape(v)));
