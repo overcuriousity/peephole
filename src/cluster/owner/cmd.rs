@@ -29,7 +29,35 @@ pub enum OwnerCmd {
     /// so it is accepted with any counter and not logged.
     Status,
     /// Change runtime settings, like the node's own settings form.
-    Settings { base_version: u64, changes: Changes },
+    Settings {
+        base_version: u64,
+        changes: Changes,
+    },
+    /// Block a peer on the node (its local block list).
+    Block {
+        node: NodeId,
+        subtree: bool,
+    },
+    Unblock {
+        node: NodeId,
+    },
+    /// Delete a blocked peer's data on the node.
+    Purge {
+        node: NodeId,
+    },
+    /// Revoke one of the node's invites.
+    InviteRevoke {
+        id: i64,
+    },
+    /// The node leaves the cluster and keeps its data.
+    Leave,
+    /// Take another owner: its id and its certificate for the node.
+    Reown {
+        owner_id: serde_bytes::ByteBuf,
+        cert: serde_bytes::ByteBuf,
+    },
+    /// The node drops its owner.
+    Release,
 }
 
 impl OwnerCmd {
@@ -38,6 +66,24 @@ impl OwnerCmd {
         match self {
             OwnerCmd::Status => "status".into(),
             OwnerCmd::Settings { changes, .. } => format!("settings: {}", changes.describe()),
+            OwnerCmd::Block { node, subtree } => format!(
+                "block {}{}",
+                node.short(),
+                if *subtree {
+                    " with all it admitted"
+                } else {
+                    ""
+                }
+            ),
+            OwnerCmd::Unblock { node } => format!("unblock {}", node.short()),
+            OwnerCmd::Purge { node } => format!("purge {}", node.short()),
+            OwnerCmd::InviteRevoke { id } => format!("revoke invite {id}"),
+            OwnerCmd::Leave => "leave the cluster".into(),
+            OwnerCmd::Reown { owner_id, .. } => match OwnerId::from_slice(owner_id) {
+                Ok(id) => format!("take owner {}", id.short()),
+                Err(_) => "take another owner".into(),
+            },
+            OwnerCmd::Release => "release (drop the owner)".into(),
         }
     }
 }
@@ -182,6 +228,7 @@ async fn execute(
     from: NodeId,
     cmd: &OwnerCmd,
 ) -> Result<String, String> {
+    let err = |e: anyhow::Error| format!("{e:#}");
     match cmd {
         OwnerCmd::Status => Ok(String::new()),
         OwnerCmd::Settings {
@@ -199,6 +246,81 @@ async fn execute(
             Ok(Err(e)) => Err(e),
             Err(e) => Err(format!("{e:#}")),
         },
+        OwnerCmd::Block {
+            node: peer,
+            subtree,
+        } => {
+            if *peer == from {
+                return Err("a node is not told to block the node that manages it".into());
+            }
+            if *subtree {
+                let (ids, n) = crate::cluster::block::block_subtree(node, *peer)
+                    .await
+                    .map_err(err)?;
+                Ok(format!(
+                    "blocked {} and the {} node(s) it admitted ({n} records out of view)",
+                    peer.short(),
+                    ids.len() - 1
+                ))
+            } else {
+                let n = crate::cluster::block::block(node, *peer)
+                    .await
+                    .map_err(err)?;
+                Ok(format!(
+                    "blocked {} ({n} records out of view)",
+                    peer.short()
+                ))
+            }
+        }
+        OwnerCmd::Unblock { node: peer } => {
+            if crate::cluster::block::unblock(node, *peer)
+                .await
+                .map_err(err)?
+            {
+                Ok(format!("unblocked {}", peer.short()))
+            } else {
+                Err(format!("{} was not blocked", peer.short()))
+            }
+        }
+        OwnerCmd::Purge { node: peer } => {
+            let n = crate::cluster::block::purge(node, *peer)
+                .await
+                .map_err(err)?;
+            Ok(format!("purged {} ({n} log entries deleted)", peer.short()))
+        }
+        OwnerCmd::InviteRevoke { id } => {
+            if crate::cluster::invite::revoke(&node.store, *id)
+                .await
+                .map_err(err)?
+            {
+                Ok(format!("invite {id} revoked"))
+            } else {
+                Err(format!("no usable invite {id}"))
+            }
+        }
+        OwnerCmd::Leave => {
+            // After the answer is on its way: leaving stops the node's
+            // contact with its peers.
+            let node = node.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if let Err(e) = crate::cluster::leave(&node).await {
+                    tracing::warn!(?e, "leaving on the owner's command failed");
+                }
+            });
+            Ok("leaving the cluster".into())
+        }
+        OwnerCmd::Reown { owner_id, cert } => {
+            let id = OwnerId::from_slice(owner_id).map_err(err)?;
+            super::reown(&node.store, node.id(), id, cert)
+                .await
+                .map_err(err)?;
+            Ok(format!("owner is now {}", id.short()))
+        }
+        OwnerCmd::Release => {
+            super::release(&node.store).await.map_err(err)?;
+            Ok("released: this node has no owner".into())
+        }
     }
 }
 
@@ -343,6 +465,7 @@ pub async fn run(
     cmd: OwnerCmd,
 ) -> Result<Result<String, String>> {
     speaks_owner(node, &target)?;
+    let leaves_fleet = matches!(cmd, OwnerCmd::Release | OwnerCmd::Reown { .. });
     let sig = sign(key, &node.id(), &target, counter, &cmd);
     let msg = Msg::OwnerCmd {
         counter,
@@ -354,9 +477,133 @@ pub async fn run(
         Msg::OwnerReply {
             data: Some(OwnerData::Done { note }),
             ..
-        } => Ok(Ok(note)),
+        } => {
+            if leaves_fleet {
+                super::fleet::forget(&node.store, &target).await?;
+            }
+            Ok(Ok(note))
+        }
         other => bail!("unexpected answer {other:?}"),
     }
+}
+
+/// What a key rotation did.
+pub struct Rotation {
+    /// The new key, to show once.
+    pub key: OwnerKey,
+    pub moved: Vec<NodeId>,
+    /// Siblings still on the old key, and why.
+    pub pending: Vec<(NodeId, String)>,
+}
+
+/// Tell `target` (still under `signer`) to take `new` as its owner.
+async fn reown_one(
+    node: &Arc<Node>,
+    signer: &OwnerKey,
+    new: &OwnerKey,
+    target: NodeId,
+) -> Result<(), String> {
+    let st = status(node, signer, target)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let cmd = OwnerCmd::Reown {
+        owner_id: serde_bytes::ByteBuf::from(new.id.0.to_vec()),
+        cert: serde_bytes::ByteBuf::from(new.certify(&target)),
+    };
+    match run(node, signer, target, st.counter, cmd).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
+/// Siblings still on the previous key after a rotation.
+pub async fn pending(store: &Store) -> Result<Vec<NodeId>> {
+    let rows: Vec<Vec<u8>> = sqlx::query_scalar("SELECT node FROM reown_pending ORDER BY node")
+        .fetch_all(&store.pool)
+        .await?;
+    rows.iter().map(|r| NodeId::from_slice(r)).collect()
+}
+
+/// Replace the ownership key: every sibling that answers takes the new
+/// one, then this node does. The old key stays here for the rest (see
+/// [`retry`], [`discard`]).
+pub async fn rotate(node: &Arc<Node>) -> Result<Rotation> {
+    let old = kept_key(node).await?;
+    let new = OwnerKey::generate()?;
+    let (mut moved, mut pending) = (vec![], vec![]);
+    for s in super::fleet::siblings(&node.store).await? {
+        match reown_one(node, &old, &new, s).await {
+            Ok(()) => moved.push(s),
+            Err(e) => pending.push((s, e)),
+        }
+    }
+    // Forgets the siblings and any earlier rotation.
+    super::adopt(&node.store, node.id(), &new, true).await?;
+    for m in &moved {
+        super::fleet::remember(&node.store, m, &new.certify(m)).await?;
+    }
+    if !pending.is_empty() {
+        node.store
+            .setting_set(
+                super::KEY_OLD_SEED,
+                &data_encoding::BASE64URL_NOPAD.encode(&old.seed()),
+            )
+            .await?;
+        for (p, _) in &pending {
+            sqlx::query("INSERT OR IGNORE INTO reown_pending (node) VALUES (?)")
+                .bind(&p.0[..])
+                .execute(&node.store.pool)
+                .await?;
+        }
+    }
+    Ok(Rotation {
+        key: new,
+        moved,
+        pending,
+    })
+}
+
+/// Try again to move the siblings a rotation did not reach. When none is
+/// left, the old key is deleted.
+pub async fn retry(node: &Arc<Node>) -> Result<Vec<(NodeId, Result<(), String>)>> {
+    let new = kept_key(node).await?;
+    let Some(old) = node.store.setting_get(super::KEY_OLD_SEED).await? else {
+        bail!("no rotation is waiting for siblings");
+    };
+    let seed: [u8; 32] = data_encoding::BASE64URL_NOPAD
+        .decode(old.as_bytes())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("the stored previous key is unreadable"))?;
+    let old = OwnerKey::from_seed(seed)?;
+    let mut out = vec![];
+    for p in pending(&node.store).await? {
+        let r = reown_one(node, &old, &new, p).await;
+        if r.is_ok() {
+            sqlx::query("DELETE FROM reown_pending WHERE node = ?")
+                .bind(&p.0[..])
+                .execute(&node.store.pool)
+                .await?;
+            super::fleet::remember(&node.store, &p, &new.certify(&p)).await?;
+        }
+        out.push((p, r));
+    }
+    if pending(&node.store).await?.is_empty() {
+        discard(&node.store).await?;
+    }
+    Ok(out)
+}
+
+/// Give up on the siblings still on the previous key: delete it.
+pub async fn discard(store: &Store) -> Result<()> {
+    for sql in [
+        "DELETE FROM reown_pending",
+        "DELETE FROM settings WHERE key = 'owner.old_seed'",
+    ] {
+        sqlx::query(sql).execute(&store.pool).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -401,6 +648,21 @@ mod tests {
             },
         };
         assert_eq!(c.describe(), "settings: workers=2, scanner=off");
+        let n = Identity::generate().unwrap().id;
+        assert_eq!(
+            OwnerCmd::Block {
+                node: n,
+                subtree: true
+            }
+            .describe(),
+            format!("block {} with all it admitted", n.short())
+        );
+        assert_eq!(
+            OwnerCmd::InviteRevoke { id: 4 }.describe(),
+            "revoke invite 4"
+        );
+        assert_eq!(OwnerCmd::Leave.describe(), "leave the cluster");
+        assert_eq!(OwnerCmd::Release.describe(), "release (drop the owner)");
     }
 
     #[tokio::test]

@@ -3767,3 +3767,169 @@ async fn owner_commands_reach_an_outbound_only_sibling() {
     assert_eq!(nb.settings.snapshot().cooldown_hours, 48);
     assert_eq!(owner::counter(&nb.store).await.unwrap(), 1, "applied once");
 }
+
+/// The owner's other commands on a sibling: block and unblock a peer,
+/// revoke an invite, release the node, have it leave.
+#[tokio::test]
+async fn owner_commands_block_revoke_release_and_leave() {
+    use peephole::cluster::owner::{self, cmd, cmd::OwnerCmd, fleet};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let _nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    eventually("a finds b", || async {
+        fleet::discover(&na.node).await.unwrap() == vec![b.id]
+    })
+    .await;
+    // Each command with the counter the node reports.
+    let go = |c: OwnerCmd| {
+        let (node, key) = (na.node.clone(), &key);
+        async move {
+            let st = cmd::status(&node, key, b.id).await.unwrap();
+            cmd::run(&node, key, b.id, st.counter, c).await.unwrap()
+        }
+    };
+
+    go(OwnerCmd::Block {
+        node: c.id,
+        subtree: false,
+    })
+    .await
+    .unwrap();
+    assert!(nb.is_blocked(&c.id));
+    let st = cmd::status(&na.node, &key, b.id).await.unwrap();
+    assert_eq!(st.blocked, vec![c.id]);
+    // A node is not told to block the node that manages it.
+    let e = go(OwnerCmd::Block {
+        node: a.id,
+        subtree: false,
+    })
+    .await
+    .unwrap_err();
+    assert!(e.contains("manages it"), "{e}");
+    go(OwnerCmd::Unblock { node: c.id }).await.unwrap();
+    eventually("b unblocked c", || async { !nb.is_blocked(&c.id) }).await;
+
+    invite::create(&nb, &Default::default()).await.unwrap();
+    let st = cmd::status(&na.node, &key, b.id).await.unwrap();
+    let inv = st.invites.iter().find(|i| i.usable).expect("an invite").id;
+    go(OwnerCmd::InviteRevoke { id: inv }).await.unwrap();
+    let e = go(OwnerCmd::InviteRevoke { id: inv }).await.unwrap_err();
+    assert!(e.contains("no usable invite"), "{e}");
+
+    // Released: b has no owner, a no longer counts it, commands end.
+    go(OwnerCmd::Release).await.unwrap();
+    assert!(owner::load(&nb.store, b.id).await.unwrap().is_none());
+    assert!(fleet::siblings(&na.store).await.unwrap().is_empty());
+    let e = cmd::run(&na.node, &key, b.id, 0, OwnerCmd::Leave)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("no owner"), "{e}");
+
+    // Leave: adopted again, then told to leave.
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    go(OwnerCmd::Leave).await.unwrap();
+    eventually("a sees that b left", || async {
+        knows(&na, b.id, false).await
+    })
+    .await;
+}
+
+/// Rotation moves the siblings that answer to the new key and keeps the
+/// old one for the rest until they are moved or given up.
+#[tokio::test]
+async fn rotating_the_key_moves_reachable_siblings_and_retries_the_rest() {
+    use peephole::cluster::owner::{self, cmd, cmd::OwnerCmd, fleet};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let old = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &old, false).await.unwrap();
+    owner::adopt(&nc.store, c.id, &old, false).await.unwrap();
+    eventually("a finds b and c", || async {
+        fleet::discover(&na.node).await.unwrap().len() == 2
+    })
+    .await;
+    // c cannot answer a for now: a drops what a blocked peer says.
+    peephole::cluster::block::block(&na.node, c.id)
+        .await
+        .unwrap();
+
+    let rot = cmd::rotate(&na.node).await.unwrap();
+    assert_eq!(rot.moved, vec![b.id]);
+    assert_eq!(rot.pending.len(), 1);
+    assert_eq!(rot.pending[0].0, c.id);
+    assert_ne!(rot.key.id, old.id);
+    let mine = owner::load(&na.store, a.id).await.unwrap().unwrap();
+    assert_eq!(mine.id, rot.key.id);
+    assert!(mine.managing());
+    assert_eq!(
+        owner::load(&nb.store, b.id).await.unwrap().unwrap().id,
+        rot.key.id
+    );
+    assert_eq!(fleet::siblings(&na.store).await.unwrap(), vec![b.id]);
+    assert_eq!(cmd::pending(&na.store).await.unwrap(), vec![c.id]);
+    // b no longer takes the old key.
+    let e = cmd::run(&na.node, &old, b.id, 0, OwnerCmd::Leave)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("not accepted"), "{e}");
+    // c is still on the old key.
+    assert_eq!(
+        owner::load(&nc.store, c.id).await.unwrap().unwrap().id,
+        old.id
+    );
+
+    // Reachable again: the retry moves it and the old key is dropped.
+    peephole::cluster::block::unblock(&na.node, c.id)
+        .await
+        .unwrap();
+    eventually_for(Duration::from_secs(40), "the retry moves c", || async {
+        cmd::retry(&na.node)
+            .await
+            .unwrap()
+            .iter()
+            .all(|(_, r)| r.is_ok())
+    })
+    .await;
+    assert_eq!(
+        owner::load(&nc.store, c.id).await.unwrap().unwrap().id,
+        rot.key.id
+    );
+    assert!(cmd::pending(&na.store).await.unwrap().is_empty());
+    assert!(
+        na.store
+            .setting_get("owner.old_seed")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut sibs = fleet::siblings(&na.store).await.unwrap();
+    sibs.sort();
+    let mut want = vec![b.id, c.id];
+    want.sort();
+    assert_eq!(sibs, want);
+
+    // Giving up on the rest instead: nothing pending, no old key.
+    na.store
+        .setting_set("owner.old_seed", "AAAA")
+        .await
+        .unwrap();
+    cmd::discard(&na.store).await.unwrap();
+    assert!(
+        na.store
+            .setting_get("owner.old_seed")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
