@@ -763,12 +763,18 @@ pub async fn rotate(node: &Arc<Node>, leave_out: &[NodeId]) -> Result<Rotation> 
     if let Err(e) = super::fleet::discover(node).await {
         tracing::debug!(?e, "sibling discovery before the rotation failed");
     }
+    // All at once: a sibling that does not answer costs its timeouts
+    // once, not once per sibling after it.
+    let targets: Vec<NodeId> = super::fleet::siblings(&node.store)
+        .await?
+        .into_iter()
+        .filter(|s| !leave_out.contains(s))
+        .collect();
+    let results =
+        futures::future::join_all(targets.iter().map(|s| move_one(node, &old, &new, *s))).await;
     let (mut moved, mut pending) = (vec![], vec![]);
-    for s in super::fleet::siblings(&node.store).await? {
-        if leave_out.contains(&s) {
-            continue;
-        }
-        match move_one(node, &old, &new, s).await {
+    for (s, r) in targets.into_iter().zip(results) {
+        match r {
             Ok(()) => moved.push(s),
             Err(e) => pending.push((s, e)),
         }
@@ -795,9 +801,11 @@ pub async fn retry(node: &Arc<Node>) -> Result<Vec<(NodeId, Result<(), String>)>
     let Some(old) = super::stored_key(&node.store, super::KEY_OLD_SEED).await? else {
         bail!("no rotation is waiting for siblings");
     };
+    let waiting = pending(&node.store).await?;
+    let results =
+        futures::future::join_all(waiting.iter().map(|p| move_one(node, &old, &new, *p))).await;
     let mut out = vec![];
-    for p in pending(&node.store).await? {
-        let r = move_one(node, &old, &new, p).await;
+    for (p, r) in waiting.into_iter().zip(results) {
         match &r {
             Ok(()) => {
                 sqlx::query("DELETE FROM reown_pending WHERE node = ?")
