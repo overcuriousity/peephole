@@ -1569,6 +1569,8 @@ mod tests {
 
     #[test]
     fn webshell_probes_are_level_3_and_interaction_is_level_4() {
+        // The second block: shell names the spray waves actually ask for
+        // (dataset 2026-10, 24-42 distinct IPs each).
         for p in [
             "/shell.php",
             "/alfa.php",
@@ -1579,6 +1581,15 @@ mod tests {
             "/wp-content/uploads/evil.php",
             "/.well-known/shell.phtml",
             "/images/cmd.php",
+            "/chosen.php",
+            "/simple.php",
+            "/adminfuns.php",
+            "/dex.php",
+            "/go.php",
+            "/ccc.php",
+            "/sm.php",
+            "/ebkid.php",
+            "/this_is_a_new_hello_world.php",
         ] {
             let v = classifier().classify(
                 &view("GET", p, None, "curl/8", None),
@@ -1592,7 +1603,11 @@ mod tests {
             );
             assert_eq!(v.scan_level, 3, "{p}");
         }
-        for (p, q) in [("/shell.php", "cmd=id"), ("/index.php", "z0=aWQ9")] {
+        for (p, q) in [
+            ("/shell.php", "cmd=id"),
+            ("/index.php", "z0=aWQ9"),
+            ("/chosen.php", "cmd=id"),
+        ] {
             let v = classifier().classify(
                 &view("GET", p, Some(q), "curl/8", None),
                 &hist(1, 1),
