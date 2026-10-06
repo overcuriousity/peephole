@@ -167,6 +167,9 @@ pub struct Table {
     pub offers: Vec<Offer>,
 }
 
+/// `(provider, millicredits)` pairs as a heartbeat carries them.
+pub type Announced = Vec<(String, u32)>;
+
 impl Table {
     pub fn price_of(&self, provider: &str) -> Option<u32> {
         self.offers
@@ -176,7 +179,7 @@ impl Table {
     }
 
     /// What the heartbeat carries: `(on_demand, prices)`.
-    pub fn announced(&self) -> (Vec<(String, u32)>, Vec<(String, u32)>) {
+    pub fn announced(&self) -> (Announced, Announced) {
         (
             self.offers
                 .iter()

@@ -184,7 +184,7 @@ pub async fn run(
             }
             Err(e) => tracing::debug!(?e, "credits: standings not evaluated"),
         }
-        if ticks % 60 == 0 {
+        if ticks.is_multiple_of(60) {
             let before = window_start(crate::cluster::hlc::wall_ms());
             let pool = &node.store.pool;
             if let Err(e) = async {
@@ -197,10 +197,10 @@ pub async fn run(
             }
         }
         // At the start (once the first heartbeats are in) and every hour.
-        if ticks % 60 == 1 {
-            if let Err(e) = price::refresh(&node).await {
-                tracing::debug!(?e, "credits: prices not computed");
-            }
+        if ticks % 60 == 1
+            && let Err(e) = price::refresh(&node).await
+        {
+            tracing::debug!(?e, "credits: prices not computed");
         }
         ticks += 1;
         tokio::select! {
