@@ -640,7 +640,7 @@ mod tests {
         assert_eq!(level4_cap(0, 0.5), 0, "paused");
     }
 
-    /// Review focus 1: a stored 1 from before the minimum is raised to 2;
+    /// A stored 1 from before the minimum is raised to 2;
     /// the other saved values survive.
     #[tokio::test]
     async fn a_stored_single_worker_is_raised_not_reset() {

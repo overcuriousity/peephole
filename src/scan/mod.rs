@@ -421,7 +421,7 @@ impl Source {
             "SELECT j.arbiter, MAX({}) AS r FROM scan_jobs j
              WHERE j.status = 'queued' AND j.arbiter IS NOT NULL
                AND j.level NOT IN (SELECT value FROM json_each(?))
-             GROUP BY j.arbiter ORDER BY r DESC",
+             GROUP BY j.arbiter ORDER BY r DESC, MIN(j.queued_at) ASC",
             est.ratio_sql("j")
         )))
         .bind(serde_json::to_string(exclude)?)
@@ -1112,7 +1112,7 @@ license_key = "k"
         assert_eq!(argv.iter().filter(|a| *a == "--host-timeout").count(), 1);
     }
 
-    /// Review focus 2: --min-rate at level 4 only, from the config, and an
+    /// --min-rate at level 4 only, from the config, and an
     /// operator's own value is kept.
     #[test]
     fn min_rate_is_added_at_level_4_only() {
