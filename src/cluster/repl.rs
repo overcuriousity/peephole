@@ -19,7 +19,7 @@
 use super::Node;
 use super::hlc;
 use super::identity::NodeId;
-use super::record::{JobAdoptRec, ROW_BACKED, Record, WireEntry};
+use super::record::{JobAdoptRec, ROW_BACKED, Record, Seal, WireEntry};
 use super::sync::Batch;
 use crate::store::data::{self, Ctx, Effect};
 use anyhow::Result;
@@ -499,8 +499,8 @@ async fn insert_log(conn: &mut SqliteConnection, e: &WireEntry, state: i64) -> R
     let accounted = (e.payload.as_ref().map_or(0, Vec::len) + 128) as i64;
     sqlx::query(
         "INSERT INTO repl_log (origin, seq, hlc, kind, uid, payload, sig, erased_by, applied,
-                               received_at, accounted)
-         VALUES (?,?,?,?,?,?,?,?,?,datetime('now'),?)",
+                               received_at, accounted, digest)
+         VALUES (?,?,?,?,?,?,?,?,?,datetime('now'),?,?)",
     )
     .bind(&e.origin.0[..])
     .bind(e.seq as i64)
@@ -512,6 +512,8 @@ async fn insert_log(conn: &mut SqliteConnection, e: &WireEntry, state: i64) -> R
     .bind(&e.erased_by)
     .bind(state)
     .bind(accounted)
+    // While the payload is here: a row-backed entry gives it up below.
+    .bind(e.digest().map(|d| d.to_vec()))
     .execute(&mut *conn)
     .await?;
     // What the origin costs this node (its quota); row-backed payloads are
@@ -626,6 +628,28 @@ pub async fn append(node: &Node, records: &[Record]) -> Result<Vec<WireEntry>> {
     }
     node.notify_changed();
     Ok(out)
+}
+
+/// Append one sealing record created by this node (an offer, a transfer,
+/// a `log_seal`). `make` gets the seal for the position the entry takes,
+/// computed in the same transaction that writes it.
+pub async fn append_sealing(node: &Node, make: impl FnOnce(Seal) -> Record) -> Result<WireEntry> {
+    let guard = node.apply_lock.lock().await;
+    let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let me = node.id();
+    let seq = log_head(&mut tx, &me)
+        .await?
+        .max(pending_head(&mut tx, &me).await?)
+        + 1;
+    let seal = super::seal::next(&mut tx, &me, seq).await?;
+    let record = make(seal);
+    let (e, _) = append_in_tx(node, &mut tx, &record).await?;
+    tx.commit().await?;
+    drop(guard);
+    node.own_head
+        .fetch_max(e.seq, std::sync::atomic::Ordering::Relaxed);
+    node.notify_changed();
+    Ok(e)
 }
 
 /// Apply entries received from a peer (any origin). A windowed node skips
@@ -1407,16 +1431,15 @@ async fn apply_record(
     if let Record::JobAdopt(a) = r {
         return adopt(node, conn, e, a, at).await;
     }
-    // Payments become rows; Task 2 replaces the state by the seal's check.
     if matches!(
         r,
-        Record::CreditOffer { .. } | Record::CreditReceipt { .. } | Record::CreditTransfer { .. }
+        Record::CreditOffer { .. }
+            | Record::CreditReceipt { .. }
+            | Record::CreditTransfer { .. }
+            | Record::LogSeal { .. }
+            | Record::ForkProof { .. }
     ) {
-        let state = match r {
-            Record::CreditReceipt { .. } => crate::credits::entries::SealState::None,
-            _ => crate::credits::entries::SealState::Unchecked,
-        };
-        crate::credits::entries::apply(conn, e, r, state).await?;
+        super::seal::on_apply(node, conn, e, r).await?;
         return Ok(Settled::default());
     }
     let ctx = Ctx {

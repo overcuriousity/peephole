@@ -480,6 +480,24 @@ impl WireEntry {
         }
     }
 
+    /// SHA-256 of what the origin signed: the entry's digest in its
+    /// origin's seals. None for an erased entry (nothing signed is left).
+    pub fn digest(&self) -> Option<[u8; 32]> {
+        use sha2::Digest;
+        let p = self.payload.as_ref()?;
+        Some(
+            sha2::Sha256::digest(signing_bytes(
+                &self.origin,
+                self.seq,
+                self.hlc,
+                &self.kind,
+                self.uid.as_deref(),
+                p,
+            ))
+            .into(),
+        )
+    }
+
     /// Decode the payload; None for erased entries or kinds this build
     /// does not know.
     pub fn record(&self) -> Option<Record> {

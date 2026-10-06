@@ -14,6 +14,7 @@ pub mod record;
 pub mod remote;
 pub mod repl;
 pub mod rpc;
+pub mod seal;
 pub mod status;
 pub mod sync;
 pub mod tls;

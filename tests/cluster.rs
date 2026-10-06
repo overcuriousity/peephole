@@ -4261,3 +4261,50 @@ async fn credit_entries_replicate_into_every_nodes_table() {
     );
     assert_eq!(entries::since(&na.store.pool, 0).await.unwrap().len(), 1);
 }
+/// A node's sealed payments check out where its log is held, and an
+/// entry with a made-up seal does not.
+#[tokio::test]
+async fn sealed_payments_check_out_on_the_other_node() {
+    use peephole::cluster::record::Seal;
+    use peephole::credits::{self, entries, entries::SealState};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let today = credits::day_of(na.hlc.now());
+    let transfer = |seal: Seal| Record::CreditTransfer {
+        to: b.id,
+        parts: vec![(today, 10)],
+        seal,
+    };
+    let first = repl::append_sealing(&na, transfer).await.unwrap();
+    let second = repl::append_sealing(&na, transfer).await.unwrap();
+    let made_up = repl::append(
+        &na,
+        &[transfer(Seal {
+            from: second.seq,
+            digest: vec![3; 32],
+        })],
+    )
+    .await
+    .unwrap();
+    eventually("b holds all three", || async {
+        entries::get(&nb.store.pool, &a.id, made_up[0].seq)
+            .await
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    for n in [&na, &nb] {
+        let state = |seq: u64| async move {
+            entries::get(&n.store.pool, &a.id, seq)
+                .await
+                .unwrap()
+                .unwrap()
+                .seal
+        };
+        assert_eq!(state(first.seq).await, SealState::Consistent);
+        assert_eq!(state(second.seq).await, SealState::Consistent);
+        assert_eq!(state(made_up[0].seq).await, SealState::Inconsistent);
+    }
+}
