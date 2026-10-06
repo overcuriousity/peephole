@@ -300,6 +300,18 @@ pub struct ScanConfig {
     /// `timeout_secs`, capped at 12 h.
     #[serde(default = "default_level4_timeout_factor")]
     pub level4_timeout_factor: u32,
+    /// Share of `max_workers` that may run level-4 scans at once (rounded
+    /// down, at least one), so shorter levels never wait behind them.
+    #[serde(default = "default_level4_share")]
+    pub level4_max_share: f64,
+    /// nmap `--min-rate` (packets per second) for level 4, so hosts that
+    /// drop probes cannot stretch a full-range scan for hours. Per node: a
+    /// scanner behind a home router may want less.
+    #[serde(default = "default_min_rate")]
+    pub min_rate: u32,
+    /// Level 4 also scans the top 50 UDP ports.
+    #[serde(default)]
+    pub level4_udp: bool,
     #[serde(default = "default_cooldown")]
     pub rescan_cooldown_hours: i64,
     #[serde(default = "default_rate")]
@@ -432,6 +444,9 @@ impl ScanConfig {
     }
 }
 
+pub const MIN_RATE: u32 = 50;
+pub const MAX_RATE: u32 = 5000;
+
 fn default_nmap_path() -> String {
     "nmap".into()
 }
@@ -440,11 +455,17 @@ fn default_workers() -> usize {
     2
 }
 fn default_level4_timeout_factor() -> u32 {
-    4
+    2
+}
+fn default_level4_share() -> f64 {
+    0.5
+}
+fn default_min_rate() -> u32 {
+    300
 }
 
 fn default_timeout() -> u64 {
-    // Full-range levels (-p- -sV -O) on filtered hosts need well over 15 min.
+    // Base limit; level 4 gets level4_timeout_factor times this.
     1800
 }
 fn default_cooldown() -> i64 {
@@ -460,6 +481,9 @@ impl Default for ScanConfig {
             max_workers: default_workers(),
             timeout_secs: default_timeout(),
             level4_timeout_factor: default_level4_timeout_factor(),
+            level4_max_share: default_level4_share(),
+            min_rate: default_min_rate(),
+            level4_udp: false,
             rescan_cooldown_hours: default_cooldown(),
             max_scans_per_hour: default_rate(),
             never_scan: vec![],
@@ -482,7 +506,10 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("webauthn", "secure_cookies", "true"),
     ("scan", "max_workers", "2"),
     ("scan", "timeout_secs", "1800"),
-    ("scan", "level4_timeout_factor", "4"),
+    ("scan", "level4_timeout_factor", "2"),
+    ("scan", "level4_max_share", "0.5"),
+    ("scan", "min_rate", "300"),
+    ("scan", "level4_udp", "false"),
     ("scan", "rescan_cooldown_hours", "24"),
     ("scan", "max_scans_per_hour", "30"),
     ("scan", "never_scan", "[]"),
@@ -660,9 +687,12 @@ impl Config {
         // Bounds mirror the runtime pace limits (scan::pace) so the config
         // defaults are always a valid pace.
         let s = &self.scan;
-        if !(1..=crate::scan::pace::MAX_WORKERS).contains(&s.max_workers) {
+        if !(crate::scan::pace::MIN_WORKERS..=crate::scan::pace::MAX_WORKERS)
+            .contains(&s.max_workers)
+        {
             bail!(
-                "scan.max_workers must be between 1 and {}",
+                "scan.max_workers must be between {} and {}",
+                crate::scan::pace::MIN_WORKERS,
                 crate::scan::pace::MAX_WORKERS
             );
         }
@@ -680,6 +710,12 @@ impl Config {
                 "scan.level4_timeout_factor must be between 1 and {}",
                 crate::scan::pace::MAX_LEVEL4_FACTOR
             );
+        }
+        if !(s.level4_max_share > 0.0 && s.level4_max_share <= 1.0) {
+            bail!("scan.level4_max_share must be above 0 and at most 1");
+        }
+        if !(MIN_RATE..=MAX_RATE).contains(&s.min_rate) {
+            bail!("scan.min_rate must be between {MIN_RATE} and {MAX_RATE}");
         }
         if !(0..=crate::settings::MAX_COOLDOWN_HOURS).contains(&s.rescan_cooldown_hours) {
             bail!(
@@ -1034,6 +1070,33 @@ license_key = "k"
 database_path = "/tmp/x.db"
 data_dir = "/tmp"
 "#;
+
+    /// A scanner-only config with `extra` under `[scan]`.
+    fn with_scan(extra: &str) -> anyhow::Result<Config> {
+        parse(&format!(
+            "{BASE}[roles]\nlistener = false\nweb = false\n[scan]\n{extra}\n"
+        ))
+    }
+
+    #[test]
+    fn scheduling_keys_have_defaults() {
+        let s = ScanConfig::default();
+        assert_eq!(s.level4_max_share, 0.5);
+        assert_eq!(s.min_rate, 300);
+        assert!(!s.level4_udp);
+        assert_eq!(s.level4_timeout_factor, 2);
+    }
+
+    #[test]
+    fn scheduling_keys_are_validated() {
+        let err = |extra: &str| format!("{:#}", with_scan(extra).unwrap_err());
+        assert!(err("max_workers = 1").contains("scan.max_workers must be between 2"));
+        assert!(err("level4_max_share = 0.0").contains("level4_max_share"));
+        assert!(err("level4_max_share = 1.5").contains("level4_max_share"));
+        assert!(err("min_rate = 10").contains("scan.min_rate"));
+        assert!(err("min_rate = 9000").contains("scan.min_rate"));
+        assert!(with_scan("max_workers = 2\nlevel4_max_share = 1.0\nmin_rate = 50").is_ok());
+    }
 
     #[test]
     fn scanner_only_needs_no_listener_web_or_maxmind() {

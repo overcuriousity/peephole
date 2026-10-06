@@ -109,7 +109,7 @@ data_dir = "{d}"
 listener = false
 web = false
 [scan]
-max_workers = 1
+max_workers = 2
 max_scans_per_hour = 600
 # No Tor list and no DNS in tests.
 tor_unknown = "scan"
