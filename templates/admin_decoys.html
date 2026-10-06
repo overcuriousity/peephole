@@ -1,23 +1,26 @@
 {% extends "layout.html" %}
 {% block title %}peephole — decoys{% endblock %}
 {% block content %}
-{# The range picker links to /admin/decoys?range=…, so switching range returns to the MCP tab. #}
 {% let sub = "decoys" %}{% include "_admin_nav.html" %}
-{% let subtab = tab.to_string() %}{% let tabs = crate::admin::views::DECOYS_TABS %}{% let tabs_label = "Decoy kinds" %}{% include "_subtabs.html" %}
-<div class="page-head"><div><h1>Decoys</h1><p class="muted">What the fake MCP server and LLM gateway drew out. Nothing they ask for is ever executed.</p></div>{% include "_range.html" %}</div>
+{% let subtab = tab.to_string() %}{% let tabs_label = "Decoy kinds" %}{% include "_subtabs.html" %}
+<div class="page-head"><div><h1>Decoys</h1><p class="muted">What the fake MCP server and LLM gateway drew out. Nothing they ask for is ever executed.</p></div><nav class="seg" aria-label="Time range">
+  {% for r in crate::store::stats::Range::ALL %}
+  <a href="/admin/decoys?tab={{ tab }}&amp;range={{ r.key() }}"{% if r.key() == range.key() %} aria-current="true"{% endif %}>{{ r.key() }}</a>
+  {% endfor %}
+</nav></div>
 <div class="stack">
 {% if tab == "mcp" %}
 <section class="card">
   <div class="card-head"><h2>Funnel</h2><span class="muted">per session</span></div>
   <div class="tiles">
-    <div class="tile"><span class="label">Sessions started</span><div class="value"><a href="/requests?answer=decoy%3Amcp%3Ainitialize">{{ funnel.sessions }}</a></div><div class="hint">initialize calls and legacy SSE streams</div></div>
+    <div class="tile"><span class="label">Sessions started</span><div class="value"><a href="/admin/decoys?tab=mcp&amp;range={{ range.key() }}#sessions">{{ funnel.sessions }}</a></div><div class="hint">distinct sessions, as listed below</div></div>
     <div class="tile"><span class="label">Listed tools</span><div class="value"><a href="/requests?answer=decoy%3Amcp%3Atools%2Flist">{{ funnel.listed }}</a></div></div>
     <div class="tile"><span class="label">Called a tool</span><div class="value"><a href="/requests?answer=decoy%3Amcp%3Atools%2Fcall">{{ funnel.called }}</a></div></div>
     <div class="tile"><span class="label">Credentials reused</span><div class="value"><a href="/admin/links/canaries">{{ funnel.reused }}</a></div></div>
   </div>
   <p class="muted">Legacy SSE: {{ funnel.sse_opened }} streams opened · {{ funnel.sse_pushed }} messages pushed · <a href="/requests?answer=decoy%3Amcp%3Ano-session">{{ funnel.sse_lost }} for unknown sessions</a></p>
 </section>
-<section class="card">
+<section class="card" id="sessions">
   <h2>Sessions</h2>
   <div class="table-wrap"><table class="table"><thead><tr><th>Session</th><th>IPs</th><th>First seen</th><th>Last seen</th><th class="num">Steps</th><th>Tools</th></tr></thead><tbody>
   {% for (short, s) in sessions %}<tr><td class="mono"><a href="/requests?session={{ s.id|urlencode }}">{{ short }}</a></td><td class="mono">{{ s.ips }}</td><td class="mono">{{ s.first }}</td><td class="mono">{{ s.last }}</td><td class="num">{{ s.steps }}</td><td class="mono">{{ s.tools }}</td></tr>{% endfor %}
@@ -27,7 +30,7 @@
 {% if let Some(c) = calls %}<section class="card">
   <div class="card-head"><h2>Tool calls</h2>
     <form class="filters" method="get" action="/admin/decoys"><input type="hidden" name="tab" value="mcp"><input type="hidden" name="range" value="{{ range.key() }}">
-      <label>Tool <select name="tool"><option value="">any</option>{% for t in ["read_file", "list_directory", "run_command", "query_db", "fetch_url"] %}<option{% if tool.as_deref() == Some(t) %} selected{% endif %}>{{ t }}</option>{% endfor %}</select></label><button>Filter</button></form></div>
+      <label>Tool <select name="tool"><option value="">any</option>{% for t in ["read_file", "list_directory", "run_command", "query_db", "fetch_url", "resources/read"] %}<option{% if tool.as_deref() == Some(t) %} selected{% endif %}>{{ t }}</option>{% endfor %}</select></label><button>Filter</button></form></div>
   <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>Tool</th><th>Argument</th><th>Answer</th></tr></thead><tbody>
   {% for r in c.items %}<tr><td class="mono"><a href="/admin/requests/{{ r.id }}">{{ r.ts }}</a></td><td class="mono"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td><td class="mono">{{ r.tool }}</td><td class="mono">{{ r.arg }}</td><td class="mono">{{ r.cls }}</td></tr>{% endfor %}
   {% if c.items.is_empty() %}<tr><td colspan="5" class="empty">No tool call in this range.</td></tr>{% endif %}

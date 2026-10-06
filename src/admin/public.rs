@@ -1290,6 +1290,56 @@ show_labels = {show_labels}
         assert!(after.contains("llama3:70b"), "{after}");
     }
 
+    async fn insert_ai_rows(st: &AdminState, n: usize) {
+        for i in 0..n {
+            let ip = st
+                .store
+                .upsert_ip(format!("203.0.113.{}", i % 2 + 1).parse().unwrap())
+                .await
+                .unwrap();
+            st.store
+                .insert_request(&crate::store::requests::NewRequest {
+                    ip_id: ip.id,
+                    method: "POST".into(),
+                    path: "/v1/chat/completions".into(),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    answer: Some("decoy:llm:chat-completions".into()),
+                    decoy_in: Some(r#"{"api":"openai","model":"llama3:70b"}"#.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn wall_hides_ai_card_below_the_minimum_of_released_rows() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let app = crate::admin::full_router(st.clone());
+        insert_ai_rows(&st, 4).await;
+        let (_, body) = get_with(&app, "/?range=7d", None).await;
+        assert!(!body.contains("What they asked our fake AI"), "{body}");
+        assert!(!body.contains("llama3:70b"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn wall_hides_ai_card_while_rows_await_their_publish_delay() {
+        let (st, _d) = state_with(true, "delay_minutes = 60\njitter_minutes = 0").await;
+        st.store
+            .set_publish_delay(
+                std::time::Duration::from_secs(3600),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let app = crate::admin::full_router(st.clone());
+        insert_ai_rows(&st, 8).await;
+        let (_, body) = get_with(&app, "/?range=7d", None).await;
+        assert!(!body.contains("What they asked our fake AI"), "{body}");
+        assert!(!body.contains("llama3:70b"), "{body}");
+    }
+
     #[tokio::test]
     async fn wall_without_a_delay_says_so_plainly() {
         let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
@@ -1523,6 +1573,15 @@ show_labels = {show_labels}
                 "nav marks Decoys"
             );
         }
+        let (_, body) = get_with(&app, "/admin/decoys?tab=llm&range=7d", Some(&cookie)).await;
+        assert!(
+            body.contains("/admin/decoys?tab=mcp&#38;range=7d"),
+            "tabs keep the range"
+        );
+        assert!(
+            body.contains("/admin/decoys?tab=llm&amp;range=30d"),
+            "range keeps the tab"
+        );
     }
 
     #[tokio::test]

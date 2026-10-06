@@ -33,9 +33,8 @@ pub struct DecoysQuery {
 struct DecoysPage {
     chrome: Chrome,
     range: Range,
-    /// The range picker builds `{base}?range=…`, so it leaves the tab
-    /// behind: switching the range returns to the MCP tab.
-    base: &'static str,
+    /// The sub-tab links, each carrying the current range.
+    tabs: Vec<(&'static str, String, &'static str)>,
     tab: &'static str,
     tool: Option<String>,
     /// Query string for the pager (ends in `&`).
@@ -70,7 +69,16 @@ async fn page(
     let mut p = DecoysPage {
         chrome: Chrome::new(true, "admin"),
         range,
-        base: "/admin/decoys",
+        tabs: crate::admin::views::DECOYS_TABS
+            .iter()
+            .map(|(k, _, l)| {
+                (
+                    *k,
+                    format!("/admin/decoys?tab={k}&range={}", range.key()),
+                    *l,
+                )
+            })
+            .collect(),
         tab,
         tool: tool.clone(),
         qs,
