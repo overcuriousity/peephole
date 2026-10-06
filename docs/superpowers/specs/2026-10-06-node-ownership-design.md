@@ -84,10 +84,10 @@ session on its web interface.
 
 | Action | CLI | Effect |
 |---|---|---|
-| Create | `peephole owner new` | Generates a key, prints it once, makes this node owned and managing |
+| Create | `peephole owner new` | Generates a key, prints it once, makes this node owned and managing. Refused on a node that already has an owner: release it first (a new key would silently orphan the fleet) |
 | Adopt | `peephole owner adopt [--keep]` | Reads a key from standard input (never from the arguments, which end up in the shell history). Stores owner id and certificate; with `--keep` also the seed |
 | Show | `peephole owner show` | Owner id (short), whether the key is kept here, known siblings |
-| Forget key | `peephole owner forget-key` | Deletes the seed here. The node stays owned |
+| Forget key | `peephole owner forget-key [--force]` | Deletes the seed here. The node stays owned. While a rotation started here is unfinished, refused without `--force` (the keys it keeps are the only way to the nodes it moved or did not move yet) |
 | Release | `peephole owner release` | Deletes owner id, certificate and seed. The node has no owner |
 
 Adopting on a node that already has another owner replaces that owner. The
