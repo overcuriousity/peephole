@@ -66,6 +66,12 @@ pub fn nmap_argv(
         argv.push("--script-timeout".into());
         argv.push(format!("{}s", (host_timeout / 3).clamp(30, 600)));
     }
+    // Level 4 scans every port: a floor on the send rate keeps hosts that
+    // drop probes from slowing nmap's adaptive timing to a crawl.
+    if level == 4 && !argv.iter().any(|a| a == "--min-rate" || a.starts_with("--min-rate=")) {
+        argv.push("--min-rate".into());
+        argv.push(cfg.scan.min_rate.to_string());
+    }
     // nmap treats a bare IPv6 literal as a hostname unless -6 is given, so
     // every IPv6 scan would otherwise fail with "host down".
     if target.is_ipv6() {
@@ -1033,6 +1039,30 @@ license_key = "k"
         );
         let argv = nmap_argv(2, &ip, &cfg, 1800).unwrap();
         assert_eq!(argv.iter().filter(|a| *a == "--host-timeout").count(), 1);
+    }
+
+    /// Review focus 2: --min-rate at level 4 only, from the config, and an
+    /// operator's own value is kept.
+    #[test]
+    fn min_rate_is_added_at_level_4_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let cfg = config_with(dir.path(), "min_rate = 120\n");
+        let after = |argv: &[String], flag: &str| {
+            argv.iter().position(|a| a == flag).map(|i| argv[i + 1].clone())
+        };
+        let a4 = nmap_argv(4, &ip, &cfg, 3600).unwrap();
+        assert_eq!(after(&a4, "--min-rate").as_deref(), Some("120"));
+        for l in 1..=3 {
+            assert!(!nmap_argv(l, &ip, &cfg, 1800).unwrap().iter().any(|a| a == "--min-rate"));
+        }
+        let cfg = config_with(
+            dir.path(),
+            "[scan.level_argv]\n4 = [\"-sS\", \"-p-\", \"--min-rate\", \"999\"]\n",
+        );
+        let a4 = nmap_argv(4, &ip, &cfg, 3600).unwrap();
+        assert_eq!(a4.iter().filter(|a| *a == "--min-rate").count(), 1);
+        assert_eq!(after(&a4, "--min-rate").as_deref(), Some("999"));
     }
 
     /// A signal-killed nmap names the signal instead of "exit None", and a

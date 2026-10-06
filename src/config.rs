@@ -447,6 +447,12 @@ impl ScanConfig {
 pub const MIN_RATE: u32 = 50;
 pub const MAX_RATE: u32 = 5000;
 
+/// nmap's 50 most frequent UDP ports (`nmap-services` frequency order),
+/// for level 4 with `scan.level4_udp`.
+pub const UDP_TOP50: &str = "631,161,137,123,138,1434,445,135,67,53,139,500,68,520,1900,\
+4500,514,49152,162,69,5353,111,49154,1701,998,996,997,999,3283,49153,1812,136,2222,2049,\
+32768,5060,1025,1433,3456,80,20031,1026,7,1646,1645,593,518,2048,626,1027";
+
 fn default_nmap_path() -> String {
     "nmap".into()
 }
@@ -797,10 +803,11 @@ impl Config {
     /// Operator overrides come from `scan.level_argv`.
     ///
     /// Non-intrusive by design: no `-A`, no intrusive NSE scripts, and timing
-    /// capped at `-T3`. Severity escalates by *scope* — more ports, service
-    /// (`-sV`) and OS (`-O`) detection, then discovery/safe scripts — not by
-    /// speed or aggressiveness, so a higher level maps to a more thorough but
-    /// still defensible scan.
+    /// template capped at `-T3`; level 4 also gets `--min-rate` (see `scan::nmap_argv`)
+    /// so hosts that drop probes cannot stretch a full-range scan. Severity escalates
+    /// by *scope* — more ports, service (`-sV`) and OS (`-O`) detection, then
+    /// discovery/safe scripts — not by speed or aggressiveness, so a higher level
+    /// maps to a more thorough but still defensible scan.
     ///
     /// `-Pn`: the target just connected to us, so it is up; nmap's own
     /// discovery probes are often filtered and would report it down. The
@@ -828,45 +835,35 @@ impl Config {
         // keys and algorithm lists, the TLS certificate), each one handshake
         // with a port nmap already found open, all in `safe`.
         const IDENTITY_SCRIPTS: &str = "ssh-hostkey,ssh2-enum-algos,ssl-cert";
-        let argv: &[&str] = match level {
-            1 => &["-Pn", "-sS", "-T2", "--top-ports", "100"],
-            2 => &[
-                "-Pn",
-                "-sS",
-                "-sV",
-                "-O",
-                "-T3",
-                "--top-ports",
-                "1000",
-                "--script",
-                IDENTITY_SCRIPTS,
-            ],
-            3 => &[
-                "-Pn",
-                "-sS",
-                "-sV",
-                "-O",
-                "-T3",
-                "--top-ports",
-                "1000",
-                "--script",
-                SCRIPTS,
-            ],
-            4 => &[
-                "-Pn",
-                "-sS",
-                "-sV",
-                "-O",
-                "-T3",
-                "-p-",
-                "--max-retries",
-                "2",
-                "--script",
-                SCRIPTS,
-            ],
+        let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<String>>();
+        let argv = match level {
+            1 => s(&["-Pn", "-sS", "-sV", "--version-light", "-T3", "--top-ports", "100"]),
+            2 => s(&[
+                "-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000",
+                "--script", IDENTITY_SCRIPTS,
+            ]),
+            3 => s(&[
+                "-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000",
+                "--traceroute", "--script", SCRIPTS,
+            ]),
+            4 => {
+                let mut v = s(&["-Pn", "-sS"]);
+                if self.scan.level4_udp {
+                    v.push("-sU".into());
+                    v.push("-p".into());
+                    v.push(format!("T:1-65535,U:{UDP_TOP50}"));
+                } else {
+                    v.push("-p-".into());
+                }
+                v.extend(s(&[
+                    "-sV", "-O", "-T3", "--max-retries", "1", "--traceroute",
+                    "--script", SCRIPTS,
+                ]));
+                v
+            }
             _ => return None,
         };
-        Some(argv.iter().map(|s| s.to_string()).collect())
+        Some(argv)
     }
 }
 
@@ -1076,6 +1073,33 @@ data_dir = "/tmp"
         parse(&format!(
             "{BASE}[roles]\nlistener = false\nweb = false\n[scan]\n{extra}\n"
         ))
+    }
+
+    #[test]
+    fn rebalanced_presets() {
+        let cfg = with_scan("").unwrap();
+        let argv = |l| cfg.default_level_argv(l).unwrap();
+        let has = |l, f: &str| argv(l).iter().any(|a| a == f);
+        assert!(!has(1, "-T2") && has(1, "-T3"), "{:?}", argv(1));
+        assert!(has(1, "--version-light") && has(1, "-sV"));
+        assert!(!has(1, "-O"));
+        assert!(!has(2, "--traceroute"));
+        assert!(has(3, "--traceroute") && has(4, "--traceroute"));
+        let a4 = argv(4);
+        let after = |f: &str| a4.iter().position(|a| a == f).map(|i| a4[i + 1].clone());
+        assert_eq!(after("--max-retries").as_deref(), Some("1"));
+        assert!(has(4, "-p-") && !has(4, "-sU"), "UDP off by default");
+    }
+
+    #[test]
+    fn level4_udp_scans_all_tcp_and_top_udp() {
+        let cfg = with_scan("level4_udp = true").unwrap();
+        let a4 = cfg.default_level_argv(4).unwrap();
+        assert!(a4.iter().any(|a| a == "-sU") && a4.iter().any(|a| a == "-sS"));
+        assert!(!a4.iter().any(|a| a == "-p-"));
+        let p = a4.iter().position(|a| a == "-p").map(|i| a4[i + 1].clone()).unwrap();
+        assert_eq!(p, format!("T:1-65535,U:{UDP_TOP50}"));
+        assert_eq!(UDP_TOP50.split(',').count(), 50);
     }
 
     #[test]
