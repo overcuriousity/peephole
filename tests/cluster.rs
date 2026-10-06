@@ -4104,18 +4104,23 @@ async fn admin_manages_a_sibling_from_its_page() {
     );
     assert_eq!(owner::counter(&na.store).await.unwrap().to_string(), mine);
 
-    // b stops answering: only the settings card says so. Its server
-    // shuts down in the background, so ask until it is gone; one ask
-    // waits out the 15 s status timeout.
+    // b stops answering: only the settings card says so, and the rest of
+    // the page still shows. Its server shuts down in the background, so
+    // ask until it is gone. While b still counts as live here (45 s after
+    // its last heartbeat) the page asks it and says it did not answer
+    // (one ask waits out the 15 s status timeout); after that it says b
+    // is not live without asking. Which one a slow machine sees first
+    // depends on timing: both mean the same.
     drop(nb);
     eventually_for(
-        Duration::from_secs(60),
-        "b's page says it did not answer",
+        Duration::from_secs(90),
+        "b's page says it is not reachable",
         || async {
             let r = admin.get(&b_page).send().await.unwrap();
             assert_eq!(r.status(), 200);
             let html = r.text().await.unwrap();
-            html.contains("did not answer") && html.contains("Contributions")
+            (html.contains("did not answer") || html.contains("Not live"))
+                && html.contains("Contributions")
         },
     )
     .await;
