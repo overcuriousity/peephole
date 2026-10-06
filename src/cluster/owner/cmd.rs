@@ -451,15 +451,33 @@ async fn handle(
     // One command at a time from here to the counter, and to the end for a
     // command that changes the owner.
     let turn = node.owner_locks.commands.lock().await;
+    let what = || decode(cmd).map_or_else(|| "unreadable command".into(), |c| c.describe());
+    // Every command, accepted or refused, is listed; refusals that anyone
+    // can cause (no signature checked yet) at most so often per sender.
+    let refused = |why: String, verified: bool| {
+        let what = what();
+        async move {
+            if verified || may_log(seen, from) {
+                tracing::info!(by = %from.short(), command = %what, "owner command refused: {why}");
+                let _ = log(
+                    &node.store,
+                    &from,
+                    &what,
+                    &format!("refused: {why}"),
+                    verified,
+                )
+                .await;
+            }
+            why
+        }
+    };
     let owned = match super::load(&node.store, node.id()).await {
         Ok(Some(o)) => o,
-        Ok(None) => {
-            if may_log(seen, from) {
-                tracing::info!(by = %from.short(), "owner command refused: this node has no owner");
-            }
-            return refuse(0, "this node has no owner".into());
+        Ok(None) => return refuse(0, refused("this node has no owner".into(), false).await),
+        Err(e) => {
+            let why = format!("this node could not read its owner: {e:#}");
+            return refuse(0, refused(why, false).await);
         }
-        Err(e) => return refuse(0, format!("{e:#}")),
     };
     if !verify(&owned.id, &from, &node.id(), counter, cmd, sig) {
         if may_log(seen, from) {
@@ -478,13 +496,11 @@ async fn handle(
     }
     let current = match super::counter(&node.store).await {
         Ok(c) => c,
-        Err(e) => return refuse(0, format!("{e:#}")),
+        Err(e) => return refuse(0, refused(format!("{e:#}"), true).await),
     };
     let Some(cmd) = decode(cmd) else {
-        return refuse(
-            current,
-            "this node does not know that command (it runs an earlier version)".into(),
-        );
+        let why = "this node does not know that command (it runs an earlier version)";
+        return refuse(current, refused(why.into(), true).await);
     };
     if cmd == OwnerCmd::Status {
         drop(turn);

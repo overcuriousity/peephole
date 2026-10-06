@@ -96,12 +96,12 @@
     </tr>{% endfor %}</tbody>
   </table></div>{% endif %}
   {% if !refused.is_empty() %}
-  <details><summary>Refused: not signed with your key ({{ refused.len() }})</summary>
+  <details><summary>Refused: not signed with this node's ownership key ({{ refused.len() }})</summary>
   <p class="muted">Any member can send such a command; none was carried out. Only the newest are kept.</p>
   <div class="table-wrap"><table>
-    <thead><tr><th>When</th><th>From</th><th>Command</th></tr></thead>
+    <thead><tr><th>When</th><th>From</th><th>Command</th><th>Result</th></tr></thead>
     <tbody>{% for l in refused %}<tr>
-      <td class="ts">{{ l.at }}</td><td>{{ l.from }}</td><td>{{ l.command }}</td>
+      <td class="ts">{{ l.at }}</td><td>{{ l.from }}</td><td>{{ l.command }}</td><td>{{ l.result }}</td>
     </tr>{% endfor %}</tbody>
   </table></div></details>{% endif %}
 </section>

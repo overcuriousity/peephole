@@ -3349,7 +3349,7 @@ async fn a_managing_node_changes_a_siblings_settings() {
     let na = boot(ia, &a, &[&b, &c, &d], DEFAULT).await;
     let nb = boot(ib, &b, &[&a, &c, &d], DEFAULT).await;
     let nc = boot(ic, &c, &[&a, &b, &d], DEFAULT).await;
-    let _nd = boot(id, &d, &[&a, &b, &c], DEFAULT).await;
+    let nd = boot(id, &d, &[&a, &b, &c], DEFAULT).await;
     // Adopted while the nodes run: no restart is needed.
     let key = owner::create(&na.store, a.id).await.unwrap();
     owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
@@ -3424,6 +3424,15 @@ async fn a_managing_node_changes_a_siblings_settings() {
     assert!(e.contains("not accepted"), "{e}");
     assert_eq!(owner::counter(&nb.store).await.unwrap(), 2);
 
+    // Status is answered whatever counter it names and changes nothing.
+    let logged = cmd::log_rows(&nb.store, 10).await.unwrap().len();
+    for _ in 0..2 {
+        let st = cmd::status(&na.node, &key, b.id).await.unwrap();
+        assert_eq!(st.counter, 2);
+    }
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 2);
+    assert_eq!(cmd::log_rows(&nb.store, 10).await.unwrap().len(), logged);
+
     // A node that does not keep the key has nothing to send with.
     let e = cmd::kept_key(&nb.node).await.err().unwrap().to_string();
     assert!(e.contains("not kept on this node"), "{e}");
@@ -3434,6 +3443,12 @@ async fn a_managing_node_changes_a_siblings_settings() {
         .unwrap()
         .unwrap_err();
     assert!(e.contains("no owner"), "{e}");
+    // ... and lists it among the refused attempts.
+    let refused = cmd::refused_rows(&nd.store, 10).await.unwrap();
+    assert!(
+        refused[0].command.contains("scans/h=77") && refused[0].result.contains("no owner"),
+        "{refused:?}"
+    );
 }
 
 /// A sibling that only dials out gets its commands from the outbox of a
@@ -3485,6 +3500,13 @@ async fn owner_commands_reach_an_outbound_only_sibling() {
     .await;
     assert_eq!(nb.settings.snapshot().cooldown_hours, 48);
     assert_eq!(owner::counter(&nb.store).await.unwrap(), 1, "applied once");
+    // The same command sent again through the relay: refused.
+    let e = cmd::run(&na.node, &key, b.id, 0, slower)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("changed meanwhile"), "{e}");
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 1);
 }
 
 /// The owner's other commands on a sibling: block and unblock a peer,
