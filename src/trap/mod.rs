@@ -719,6 +719,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 decoy_v: c.decoy_v,
                 decoy_site: c.decoy_site,
                 held_ms: c.held_ms,
+                decoy_in: None,
             },
         )
         .await?;
@@ -1046,6 +1047,7 @@ async fn record_trap(
                     answer: served.answer.clone(),
                     decoy_v: v,
                     site: served.word.to_string(),
+                    decoy_in: None,
                 }),
                 (None, Some(held_ms)) => skiplog::SkipAnswer::Tarpit { held_ms },
                 (None, None) => skiplog::SkipAnswer::Plain,

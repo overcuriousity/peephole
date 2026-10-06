@@ -274,8 +274,8 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
            headers_json, body, labels_json, owasp_json, severity, scan_level, is_fp_claim,
            page_token, answer, status, unrecorded, transport, via_proxy, raw_head,
            tls_client_hello, ja4, build, rules, decoy_v, decoy_site, ja4h, ja4h_v,
-           user_agent, ua_v, held_ms)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           user_agent, ua_v, held_ms, decoy_in)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -314,6 +314,7 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(super::useragent::derive(&r.headers_json))
     .bind(super::useragent::UA_V)
     .bind(r.held_ms.filter(|ms| *ms >= 0))
+    .bind(r.decoy_in.as_deref().filter(|d| d.len() <= 512))
     .execute(&mut *conn)
     .await?;
     if done.rows_affected() == 1 {
@@ -386,8 +387,8 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
         sqlx::query(
             "INSERT INTO skipped_requests
                (batch_id, ts_ms, method, path, page_token, host, answer, decoy_v, decoy_site,
-                held_ms)
-             VALUES (?,?,?,?,?,?,?,?,?,?)",
+                held_ms, decoy_in)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(id)
         .bind(row_ms(r.ts_ms))
@@ -399,6 +400,7 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
         .bind(r.decoy_v)
         .bind(r.decoy_site.as_deref().map(|w| cut(w, 64)))
         .bind(r.held_ms.filter(|ms| *ms >= 0))
+        .bind(r.decoy_in.as_deref().filter(|d| d.len() <= 512))
         .execute(&mut *conn)
         .await?;
     }
@@ -1240,6 +1242,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
         Option<i64>,
         Option<String>,
         Option<i64>,
+        Option<String>,
     );
     type Req = (
         String,
@@ -1296,7 +1299,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                     let x: ReqExtra = sqlx::query_as(
                         "SELECT build, answer, status, unrecorded, transport, via_proxy, raw_head,
                                 tls_client_hello, ja4, owasp_json, rules, decoy_v, decoy_site,
-                                held_ms
+                                held_ms, decoy_in
                          FROM requests WHERE uid = ?",
                     )
                     .bind(uid)
@@ -1330,6 +1333,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         decoy_v: x.11,
                         decoy_site: x.12,
                         held_ms: x.13,
+                        decoy_in: x.14,
                     })))
                 }
             }
@@ -1355,10 +1359,11 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         Option<i64>,
                         Option<String>,
                         Option<i64>,
+                        Option<String>,
                     );
                     let rows: Vec<Row> = sqlx::query_as(
                         "SELECT ts_ms, method, path, page_token, host, answer, decoy_v, decoy_site,
-                                held_ms
+                                held_ms, decoy_in
                          FROM skipped_requests WHERE batch_id = ? ORDER BY rowid",
                     )
                     .bind(id)
@@ -1381,6 +1386,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                                     decoy_v,
                                     decoy_site,
                                     held_ms,
+                                    decoy_in,
                                 )| {
                                     crate::cluster::record::SkipRow {
                                         ts_ms,
@@ -1392,6 +1398,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                                         decoy_v,
                                         decoy_site,
                                         held_ms,
+                                        decoy_in,
                                     }
                                 },
                             )
@@ -1540,6 +1547,7 @@ mod tests {
                     decoy_v: None,
                     decoy_site: None,
                     held_ms: None,
+                    decoy_in: None,
                 },
                 crate::cluster::record::SkipRow {
                     ts_ms: 1_791_000_000_500,
@@ -1551,6 +1559,7 @@ mod tests {
                     decoy_v: Some(1),
                     decoy_site: Some("shop".into()),
                     held_ms: None,
+                    decoy_in: None,
                 },
             ],
             build: String::new(),
@@ -1560,6 +1569,87 @@ mod tests {
             rebuild(&mut conn, "skip_batch", "b-dec").await.unwrap(),
             Some(b)
         );
+    }
+
+    #[tokio::test]
+    async fn decoy_input_rebuilds_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        let din =
+            r#"{"rpc":7,"m":"tools/call","tool":"read_file","arg":"/app/.env","cls":"dotenv"}"#;
+        let Record::Request(mut r) = request("u-mcp", "/mcp") else {
+            unreachable!()
+        };
+        r.answer = Some("decoy:mcp:tools/call".into());
+        r.decoy_v = Some(2);
+        r.decoy_in = Some(din.into());
+        let rec = Record::Request(r);
+        apply(&mut conn, ctx, &rec).await.unwrap();
+        assert_eq!(
+            rebuild(&mut conn, "request", "u-mcp").await.unwrap(),
+            Some(rec)
+        );
+
+        let b = Record::SkipBatch(crate::cluster::record::SkipBatchRec {
+            uid: "b-mcp".into(),
+            ip: "198.51.100.9".into(),
+            dropped: 0,
+            rows: vec![crate::cluster::record::SkipRow {
+                ts_ms: 1_791_000_000_000,
+                method: "POST".into(),
+                path: "/mcp".into(),
+                page_token: Some("t".into()),
+                answer: Some("decoy:mcp:initialize".into()),
+                decoy_v: Some(2),
+                decoy_site: Some("shop".into()),
+                decoy_in: Some(r#"{"rpc":1,"m":"initialize"}"#.into()),
+                ..Default::default()
+            }],
+            build: String::new(),
+        });
+        apply(&mut conn, ctx, &b).await.unwrap();
+        assert_eq!(
+            rebuild(&mut conn, "skip_batch", "b-mcp").await.unwrap(),
+            Some(b)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_decoy_input_is_dropped_not_cut() {
+        // A peer's row with a decoy_in over 512 bytes is stored without it: a
+        // cut JSON value would no longer parse.
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let Record::Request(mut r) = request("u-big", "/mcp") else {
+            unreachable!()
+        };
+        r.decoy_in = Some(format!(r#"{{"arg":"{}"}}"#, "x".repeat(600)));
+        apply(
+            &mut conn,
+            Ctx {
+                origin: None,
+                hlc: 1,
+            },
+            &Record::Request(r),
+        )
+        .await
+        .unwrap();
+        let got: Option<String> =
+            sqlx::query_scalar("SELECT decoy_in FROM requests WHERE uid='u-big'")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert_eq!(got, None);
     }
 
     #[tokio::test]
@@ -1627,6 +1717,7 @@ mod tests {
             decoy_v: None,
             decoy_site: None,
             held_ms: None,
+            decoy_in: None,
         };
         let bytes = crate::cluster::rpc::cbor::encode(&row).unwrap();
         #[derive(serde::Serialize)]

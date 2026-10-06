@@ -68,6 +68,8 @@ pub struct SkipDecoy {
     pub decoy_v: i64,
     /// The site word it was served under.
     pub site: String,
+    /// What an MCP or LLM decoy was rendered from (compact JSON).
+    pub decoy_in: Option<String>,
 }
 
 /// How a skipped request was answered, as far as its light row keeps it.
@@ -145,6 +147,7 @@ impl SkipLog {
                 row.answer = Some(d.answer);
                 row.decoy_v = Some(d.decoy_v);
                 row.decoy_site = Some(d.site);
+                row.decoy_in = d.decoy_in;
             }
             SkipAnswer::Tarpit { held_ms } => {
                 row.answer = Some("tarpit".into());
@@ -340,6 +343,7 @@ mod tests {
             answer: "decoy:git-config".into(),
             decoy_v: 1,
             site: "shop".into(),
+            decoy_in: None,
         };
         log.note(
             ip,

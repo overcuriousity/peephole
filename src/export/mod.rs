@@ -83,6 +83,8 @@ pub struct ExportRow {
     pub answer: Option<String>,
     /// Decoy template version of a decoy answer (None: version 0 or no decoy).
     pub decoy_v: Option<i64>,
+    /// What an MCP or LLM decoy was rendered from (compact JSON).
+    pub decoy_in: Option<String>,
     /// Uids of the rows whose served canaries this row carried.
     pub canary_used_from: Vec<String>,
     pub status: Option<i64>,
@@ -143,6 +145,7 @@ pub const COLUMNS: &[&str] = &[
     "ja4h",
     "answer",
     "decoy_v",
+    "decoy_in",
     "canary_used_from",
     "status",
     "held_ms",
@@ -302,6 +305,7 @@ impl ExportRow {
             "ja4h": self.ja4h,
             "answer": self.answer,
             "decoy_v": self.decoy_v,
+            "decoy_in": self.decoy_in,
             "canary_used_from": self.canary_used_from,
             "status": self.status,
             "held_ms": self.held_ms,
@@ -629,6 +633,7 @@ fn request_row(
         ja4h: r.ja4h,
         answer: r.answer,
         decoy_v: r.decoy_v,
+        decoy_in: r.decoy_in,
         canary_used_from,
         status: r.status,
         held_ms: r.held_ms,
@@ -660,6 +665,7 @@ fn skipped_row(s: SkipOut, ctx: &PageContext, cols: &IpCols, opts: &ExportOption
         answer: s.answer,
         host: s.host,
         decoy_v: s.decoy_v,
+        decoy_in: s.decoy_in,
         held_ms: s.held_ms,
         path: s.path,
         unrecorded,
@@ -1196,6 +1202,7 @@ mod tests {
                     decoy_v: Some(1),
                     decoy_site: Some("shop".into()),
                     held_ms: None,
+                    decoy_in: None,
                 }],
             )
             .await
