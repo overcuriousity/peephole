@@ -160,7 +160,9 @@ mod tests {
     #[tokio::test]
     async fn sql_order_matches_ratio() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
         let mut ids = vec![];
         for (level, mins) in [(4, 10), (2, 5), (4, 60), (1, 1)] {
             let ip = store
@@ -195,11 +197,21 @@ mod tests {
     #[tokio::test]
     async fn measure_reads_done_and_failed_jobs_of_the_last_week() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::connect(&dir.path().join("t.db")).await.unwrap();
-        let ip = store.upsert_ip("203.0.113.40".parse().unwrap()).await.unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let ip = store
+            .upsert_ip("203.0.113.40".parse().unwrap())
+            .await
+            .unwrap();
         for (status, mins, age_days) in [
-            ("done", 10, 1), ("done", 20, 1), ("failed", 30, 1), ("done", 20, 1),
-            ("failed", 20, 1), ("done", 999, 30), ("refused", 999, 1),
+            ("done", 10, 1),
+            ("done", 20, 1),
+            ("failed", 30, 1),
+            ("done", 20, 1),
+            ("failed", 20, 1),
+            ("done", 999, 30),
+            ("refused", 999, 1),
         ] {
             sqlx::query(
                 "INSERT INTO scan_jobs (ip_id, level, status, queued_at, started_at, finished_at)

@@ -837,14 +837,37 @@ impl Config {
         const IDENTITY_SCRIPTS: &str = "ssh-hostkey,ssh2-enum-algos,ssl-cert";
         let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<String>>();
         let argv = match level {
-            1 => s(&["-Pn", "-sS", "-sV", "--version-light", "-T3", "--top-ports", "100"]),
+            1 => s(&[
+                "-Pn",
+                "-sS",
+                "-sV",
+                "--version-light",
+                "-T3",
+                "--top-ports",
+                "100",
+            ]),
             2 => s(&[
-                "-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000",
-                "--script", IDENTITY_SCRIPTS,
+                "-Pn",
+                "-sS",
+                "-sV",
+                "-O",
+                "-T3",
+                "--top-ports",
+                "1000",
+                "--script",
+                IDENTITY_SCRIPTS,
             ]),
             3 => s(&[
-                "-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000",
-                "--traceroute", "--script", SCRIPTS,
+                "-Pn",
+                "-sS",
+                "-sV",
+                "-O",
+                "-T3",
+                "--top-ports",
+                "1000",
+                "--traceroute",
+                "--script",
+                SCRIPTS,
             ]),
             4 => {
                 let mut v = s(&["-Pn", "-sS"]);
@@ -856,8 +879,14 @@ impl Config {
                     v.push("-p-".into());
                 }
                 v.extend(s(&[
-                    "-sV", "-O", "-T3", "--max-retries", "1", "--traceroute",
-                    "--script", SCRIPTS,
+                    "-sV",
+                    "-O",
+                    "-T3",
+                    "--max-retries",
+                    "1",
+                    "--traceroute",
+                    "--script",
+                    SCRIPTS,
                 ]));
                 v
             }
@@ -1097,7 +1126,11 @@ data_dir = "/tmp"
         let a4 = cfg.default_level_argv(4).unwrap();
         assert!(a4.iter().any(|a| a == "-sU") && a4.iter().any(|a| a == "-sS"));
         assert!(!a4.iter().any(|a| a == "-p-"));
-        let p = a4.iter().position(|a| a == "-p").map(|i| a4[i + 1].clone()).unwrap();
+        let p = a4
+            .iter()
+            .position(|a| a == "-p")
+            .map(|i| a4[i + 1].clone())
+            .unwrap();
         assert_eq!(p, format!("T:1-65535,U:{UDP_TOP50}"));
         assert_eq!(UDP_TOP50.split(',').count(), 50);
     }

@@ -617,10 +617,28 @@ mod tests {
 
     #[test]
     fn one_worker_is_not_a_valid_pace() {
-        let one = Pace { max_workers: 1, ..P };
+        let one = Pace {
+            max_workers: 1,
+            ..P
+        };
         assert!(one.validate().unwrap_err().contains("0 or between 2"));
-        assert!(Pace { max_workers: 0, ..P }.validate().is_ok(), "0 pauses");
-        assert!(Pace { max_workers: 2, ..P }.validate().is_ok());
+        assert!(
+            Pace {
+                max_workers: 0,
+                ..P
+            }
+            .validate()
+            .is_ok(),
+            "0 pauses"
+        );
+        assert!(
+            Pace {
+                max_workers: 2,
+                ..P
+            }
+            .validate()
+            .is_ok()
+        );
     }
 
     #[test]

@@ -220,7 +220,8 @@ impl Arbiter {
                 .collect()
         };
         let skipped = self.skipped_levels(scanner).await?;
-        self.next_job_skipping(scanner, declined, &skipped, exclude).await
+        self.next_job_skipping(scanner, declined, &skipped, exclude)
+            .await
     }
 
     /// Levels `scanner` fails more than the other live scanners and sits
@@ -930,8 +931,14 @@ mod tests {
         let (node, arbiter, store, _tx) = setup(dir.path()).await;
         let rec = Recorder::Cluster(node.clone());
         let scanner = Identity::generate().unwrap().id;
-        let a = store.upsert_ip("203.0.113.90".parse().unwrap()).await.unwrap();
-        let b = store.upsert_ip("203.0.113.91".parse().unwrap()).await.unwrap();
+        let a = store
+            .upsert_ip("203.0.113.90".parse().unwrap())
+            .await
+            .unwrap();
+        let b = store
+            .upsert_ip("203.0.113.91".parse().unwrap())
+            .await
+            .unwrap();
         rec.enqueue_scan(a.id, 4, 24).await.unwrap();
         rec.enqueue_scan(b.id, 2, 24).await.unwrap();
         sqlx::query("UPDATE scan_jobs SET queued_at = datetime('now', '-3 hours') WHERE level = 4")
@@ -941,7 +948,10 @@ mod tests {
         let g = arbiter.next_job(scanner, &[4]).await.unwrap().unwrap();
         assert_eq!(g.level, 2);
         assert!(arbiter.next_job(scanner, &[4]).await.unwrap().is_none());
-        assert_eq!(arbiter.next_job(scanner, &[]).await.unwrap().unwrap().level, 4);
+        assert_eq!(
+            arbiter.next_job(scanner, &[]).await.unwrap().unwrap().level,
+            4
+        );
     }
 
     /// Highest response ratio first: a fresher short job beats a younger
@@ -954,8 +964,14 @@ mod tests {
             let (node, arbiter, store, _tx) = setup(dir.path()).await;
             let rec = Recorder::Cluster(node.clone());
             let scanner = Identity::generate().unwrap().id;
-            let a = store.upsert_ip("203.0.113.92".parse().unwrap()).await.unwrap();
-            let b = store.upsert_ip("203.0.113.93".parse().unwrap()).await.unwrap();
+            let a = store
+                .upsert_ip("203.0.113.92".parse().unwrap())
+                .await
+                .unwrap();
+            let b = store
+                .upsert_ip("203.0.113.93".parse().unwrap())
+                .await
+                .unwrap();
             rec.enqueue_scan(a.id, 4, 24).await.unwrap();
             rec.enqueue_scan(b.id, 2, 24).await.unwrap();
             for (level, mins) in [(4, l4_mins), (2, l2_mins)] {

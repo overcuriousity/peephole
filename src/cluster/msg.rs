@@ -494,12 +494,22 @@ mod tests {
     #[test]
     fn claims_stay_compatible_across_versions() {
         use crate::cluster::rpc::cbor::{decode, encode};
-        let new_empty = Msg::Claim { exclude_levels: vec![] };
+        let new_empty = Msg::Claim {
+            exclude_levels: vec![],
+        };
         assert_eq!(encode(&new_empty).unwrap(), encode(&OldMsg::Claim).unwrap());
-        assert_eq!(decode::<Msg>(&encode(&OldMsg::Claim).unwrap()).unwrap(), new_empty);
-        let excl = Msg::Claim { exclude_levels: vec![4] };
+        assert_eq!(
+            decode::<Msg>(&encode(&OldMsg::Claim).unwrap()).unwrap(),
+            new_empty
+        );
+        let excl = Msg::Claim {
+            exclude_levels: vec![4],
+        };
         assert_eq!(decode::<Msg>(&encode(&excl).unwrap()).unwrap(), excl);
-        assert_eq!(decode::<OldMsg>(&encode(&excl).unwrap()).unwrap(), OldMsg::Claim);
+        assert_eq!(
+            decode::<OldMsg>(&encode(&excl).unwrap()).unwrap(),
+            OldMsg::Claim
+        );
     }
 
     #[test]
@@ -511,7 +521,9 @@ mod tests {
             to: id,
             created_ms,
             in_reply_to: None,
-            msg: Msg::Claim { exclude_levels: vec![] },
+            msg: Msg::Claim {
+                exclude_levels: vec![],
+            },
         };
         let now = now_ms();
         assert!(at(now).fresh());

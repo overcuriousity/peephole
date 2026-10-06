@@ -69,7 +69,11 @@ pub fn nmap_argv(
     }
     // Level 4 scans every port: a floor on the send rate keeps hosts that
     // drop probes from slowing nmap's adaptive timing to a crawl.
-    if level == 4 && !argv.iter().any(|a| a == "--min-rate" || a.starts_with("--min-rate=")) {
+    if level == 4
+        && !argv
+            .iter()
+            .any(|a| a == "--min-rate" || a.starts_with("--min-rate="))
+    {
         argv.push("--min-rate".into());
         argv.push(cfg.scan.min_rate.to_string());
     }
@@ -1091,7 +1095,9 @@ license_key = "k"
         let cfg = test_config(dir.path());
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         let after = |argv: &[String], flag: &str| {
-            argv.iter().position(|a| a == flag).map(|i| argv[i + 1].clone())
+            argv.iter()
+                .position(|a| a == flag)
+                .map(|i| argv[i + 1].clone())
         };
         let argv = nmap_argv(4, &ip, &cfg, 1800).unwrap();
         assert_eq!(after(&argv, "--host-timeout").as_deref(), Some("1710s"));
@@ -1120,12 +1126,19 @@ license_key = "k"
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         let cfg = config_with(dir.path(), "min_rate = 120\n");
         let after = |argv: &[String], flag: &str| {
-            argv.iter().position(|a| a == flag).map(|i| argv[i + 1].clone())
+            argv.iter()
+                .position(|a| a == flag)
+                .map(|i| argv[i + 1].clone())
         };
         let a4 = nmap_argv(4, &ip, &cfg, 3600).unwrap();
         assert_eq!(after(&a4, "--min-rate").as_deref(), Some("120"));
         for l in 1..=3 {
-            assert!(!nmap_argv(l, &ip, &cfg, 1800).unwrap().iter().any(|a| a == "--min-rate"));
+            assert!(
+                !nmap_argv(l, &ip, &cfg, 1800)
+                    .unwrap()
+                    .iter()
+                    .any(|a| a == "--min-rate")
+            );
         }
         let cfg = config_with(
             dir.path(),
