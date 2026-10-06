@@ -384,6 +384,27 @@ fn openai_reply(inp: &Input, model: &str, ep: &str, stream: bool) -> Out {
                 "response.created",
                 json!({"response": full("in_progress", None)}),
             )];
+            ev.push(next(
+                "response.in_progress",
+                json!({"response": full("in_progress", None)}),
+            ));
+            ev.push(next(
+                "response.output_item.added",
+                json!({
+                    "output_index": 0,
+                    "item": {
+                        "type": "message", "id": mid, "status": "in_progress", "role": "assistant",
+                        "content": []
+                    }
+                }),
+            ));
+            ev.push(next(
+                "response.content_part.added",
+                json!({
+                    "item_id": mid, "output_index": 0, "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []}
+                }),
+            ));
             for p in pieces() {
                 ev.push(next(
                     "response.output_text.delta",
@@ -393,6 +414,23 @@ fn openai_reply(inp: &Input, model: &str, ep: &str, stream: bool) -> Out {
             ev.push(next(
                 "response.output_text.done",
                 json!({"item_id": mid, "output_index": 0, "content_index": 0, "text": REPLY}),
+            ));
+            ev.push(next(
+                "response.content_part.done",
+                json!({
+                    "item_id": mid, "output_index": 0, "content_index": 0,
+                    "part": {"type": "output_text", "text": REPLY, "annotations": []}
+                }),
+            ));
+            ev.push(next(
+                "response.output_item.done",
+                json!({
+                    "output_index": 0,
+                    "item": {
+                        "type": "message", "id": mid, "status": "completed", "role": "assistant",
+                        "content": [{"type": "output_text", "text": REPLY, "annotations": []}]
+                    }
+                }),
             ));
             ev.push(next(
                 "response.completed",
@@ -712,6 +750,54 @@ mod tests {
             .collect();
         assert_eq!(events.first(), Some(&"response.created"));
         assert_eq!(events.last(), Some(&"response.completed"));
+        // Full Responses stream event sequence (deltas vary by REPLY length)
+        let expected_base = [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            // Multiple response.output_text.delta events interspersed here
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed",
+        ];
+        let non_delta: Vec<&str> = events
+            .iter()
+            .filter(|e| !e.contains("delta"))
+            .copied()
+            .collect();
+        assert_eq!(
+            non_delta, expected_base,
+            "Responses stream non-delta events out of order"
+        );
+        // Count delta events (one per piece of REPLY)
+        let delta_count = events
+            .iter()
+            .filter(|e| *e == &"response.output_text.delta")
+            .count();
+        assert_eq!(
+            delta_count,
+            REPLY.split_inclusive(' ').count(),
+            "delta event count"
+        );
+        // Verify each event corresponds to valid JSON
+        for line in rs.body.lines() {
+            if let Some(event_name) = line.strip_prefix("event: ") {
+                let data_line = line
+                    .lines()
+                    .next()
+                    .and_then(|_| rs.body.lines().skip_while(|l| *l != line).nth(1))
+                    .and_then(|l| l.strip_prefix("data: "));
+                if let Some(data_str) = data_line {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(data_str).expect("valid JSON");
+                    if let Some(t) = parsed.get("type").and_then(|x| x.as_str()) {
+                        assert_eq!(t, event_name, "Event type in data mismatches event line");
+                    }
+                }
+            }
+        }
         let miss = run(d("openai", "chat-completions", Some("o9-ultra"), false));
         assert_eq!(
             (miss.status, js(&miss)["error"]["code"].as_str()),
