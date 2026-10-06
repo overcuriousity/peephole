@@ -98,20 +98,86 @@ pub async fn load(
 }
 
 /// What is near an address the dataset does not hold: the recorded
-/// addresses in its network.
+/// addresses in its network, and in its ASN once an answer names one.
 pub struct Neighbourhood {
     pub net: String,
     pub rows: Vec<crate::store::browse::IpSummary>,
+    pub asn: Option<i64>,
+    /// Recorded addresses in that ASN, and the first of them.
+    pub asn_count: i64,
+    pub asn_rows: Vec<crate::store::browse::IpSummary>,
 }
 
-pub async fn neighbourhood(state: &AdminState, ip: std::net::IpAddr) -> AppResult<Neighbourhood> {
+/// Addresses shown per part of the neighbourhood.
+const NEAR_ROWS: usize = 20;
+
+pub async fn neighbourhood(
+    state: &AdminState,
+    ip: std::net::IpAddr,
+    asn: Option<i64>,
+) -> AppResult<Neighbourhood> {
     let prefix = if ip.is_ipv4() { 24 } else { 48 };
     let net = ipnet::IpNet::new(ip, prefix)
         .map(|n| n.trunc())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let rows = state.store.ips_matching(&[], &[net], 20).await?;
+    let rows = state
+        .store
+        .ips_matching(&[], &[net], NEAR_ROWS as i64)
+        .await?;
+    let (asn_count, asn_rows) = match asn {
+        Some(a) => {
+            let f = crate::store::browse::IpFilter {
+                asn: Some(a),
+                ..Default::default()
+            };
+            let mut page = state.store.list_ips(&f).await?.items;
+            page.truncate(NEAR_ROWS);
+            (state.store.count_ips(&f).await?, page)
+        }
+        None => (0, vec![]),
+    };
     Ok(Neighbourhood {
         net: net.to_string(),
         rows,
+        asn,
+        asn_count,
+        asn_rows,
     })
+}
+
+/// The ASN an answer names: MaxMind's number, or Shodan's "AS64500".
+pub fn asn_named<'a>(data: impl IntoIterator<Item = &'a serde_json::Value>) -> Option<i64> {
+    data.into_iter()
+        .find_map(|d| match &d["asn"] {
+            serde_json::Value::Number(n) => n.as_i64(),
+            serde_json::Value::String(s) => s
+                .trim()
+                .trim_start_matches(['A', 'a'])
+                .trim_start_matches(['S', 's'])
+                .parse()
+                .ok(),
+            _ => None,
+        })
+        .filter(|a| *a > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_asn_is_read_from_either_provider() {
+        assert_eq!(
+            asn_named([&json!({"country": "DE", "asn": 3320})]),
+            Some(3320)
+        );
+        assert_eq!(asn_named([&json!({"asn": "AS64500"})]), Some(64500));
+        assert_eq!(
+            asn_named([&json!({}), &json!({"asn": "as15169"})]),
+            Some(15169)
+        );
+        assert_eq!(asn_named([&json!({"asn": "unknown"}), &json!({})]), None);
+        assert_eq!(asn_named([&json!({"asn": 0})]), None);
+    }
 }

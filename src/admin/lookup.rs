@@ -277,7 +277,16 @@ pub async fn run(state: &AdminState, ip: IpAddr, again: &[String]) -> AppResult<
         };
         let near = match target {
             Some(_) => None,
-            None => Some(crate::admin::target::neighbourhood(state, ip).await?),
+            None => {
+                let asn = crate::admin::target::asn_named(
+                    out.answers
+                        .iter()
+                        .flat_map(|a| &a.resp.findings)
+                        .map(|f| &f.data)
+                        .chain(out.stored.iter().map(|s| &s.data)),
+                );
+                Some(crate::admin::target::neighbourhood(state, ip, asn).await?)
+            }
         };
         Ok::<_, AppError>((target, near))
     }

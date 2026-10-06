@@ -5440,7 +5440,20 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     );
     assert!(!second.contains("Asked now"));
 
-    // An address the dataset does not hold: said so, with what is near it.
+    // An address the dataset does not hold: said so, with what is near it,
+    // by network and, since an answer names its ASN, by ASN.
+    sqlx::query("UPDATE ips SET asn = 64500 WHERE ip = '198.51.100.77'")
+        .execute(&na.store.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ip_intel_log (ip, provider, origin, hlc, fetched_at, data_json)
+         VALUES ('198.51.100.78', 'shodan', ?, 1, datetime('now'), '{\"asn\":\"AS64500\"}')",
+    )
+    .bind(&b.id.0[..])
+    .execute(&na.store.pool)
+    .await
+    .unwrap();
     let unknown = admin
         .post(format!("{base}/admin/lookup"))
         .form(&[("ip", "198.51.100.78")])
@@ -5456,6 +5469,10 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
         "{unknown}"
     );
     assert!(unknown.contains("not kept"));
+    assert!(
+        unknown.contains("Same ASN") && unknown.contains("/ips?asn=64500"),
+        "{unknown}"
+    );
     assert!(sections(&unknown).is_empty());
 }
 

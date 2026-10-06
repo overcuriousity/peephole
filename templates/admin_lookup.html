@@ -84,11 +84,19 @@
 {% include "_target.html" %}
 {% endif %}
 {% if let Some(n) = r.near %}
-<section class="card"><div class="card-head"><h2>Near it</h2><span class="muted">recorded addresses in <a class="mono" href="/ips?q={{ n.net }}">{{ n.net }}</a></span></div>
+<section class="card"><div class="card-head"><h2>Near it</h2><span class="muted">recorded addresses in <a class="mono" href="/ips?q={{ n.net }}">{{ n.net }}</a>{% if let Some(a) = n.asn %} and in AS{{ a }}{% endif %}</span></div>
   {% if n.rows.is_empty() %}<p class="muted">None recorded.</p>{% else %}
   <div class="table-wrap"><table><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th class="num">Requests</th><th>Max sev.</th></tr></thead><tbody>
   {% for x in n.rows %}<tr><td><a class="mono" href="/ip/{{ x.ip }}">{{ x.ip }}</a></td><td>{{ x.country.as_deref().unwrap_or("—") }}</td><td>{% if let Some(a) = x.asn %}AS{{ a }}{% else %}—{% endif %}</td><td class="num">{{ x.request_count }}</td><td>{{ x.max_severity }}</td></tr>{% endfor %}
   </tbody></table></div>{% endif %}
+  {% if let Some(a) = n.asn %}
+  <h3>Same ASN · <a href="/ips?asn={{ a }}">AS{{ a }}</a></h3>
+  {% if n.asn_rows.is_empty() %}<p class="muted">None recorded.</p>{% else %}
+  <p class="muted small">{{ crate::admin::views::thousands(n.asn_count) }} recorded{% if n.asn_count > n.asn_rows.len() as i64 %}, the first {{ n.asn_rows.len() }} shown{% endif %}</p>
+  <div class="table-wrap"><table><thead><tr><th>IP</th><th>Country</th><th class="num">Requests</th><th>Max sev.</th></tr></thead><tbody>
+  {% for x in n.asn_rows %}<tr><td><a class="mono" href="/ip/{{ x.ip }}">{{ x.ip }}</a></td><td>{{ x.country.as_deref().unwrap_or("—") }}</td><td class="num">{{ x.request_count }}</td><td>{{ x.max_severity }}</td></tr>{% endfor %}
+  </tbody></table></div>{% endif %}
+  {% endif %}
 </section>
 {% endif %}
 </div>
