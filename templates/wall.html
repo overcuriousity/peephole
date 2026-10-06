@@ -64,6 +64,14 @@
       <table class="visually-hidden"><tbody>{% for n in stats.severity_distribution %}<tr><td>{{ n.name }}</td><td>{{ n.count }}</td></tr>{% endfor %}</tbody></table>
     </section>
     {% endif %}
+    {% if let Some(ai) = stats.ai_decoys %}<section class="card">
+      <div class="card-head"><h2>What they asked our fake AI</h2><span class="muted">{{ crate::admin::views::thousands(ai.total) }} requests to our MCP server and LLM gateway</span></div>
+      {% if !ai.tools.is_empty() %}<h3>Tools called</h3>
+      <ol class="ranked">{% for n in ai.tools %}<li><span class="ranked-name mono">{{ n.name }}</span><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = ai.tools_max %}{% include "_bar.html" %}</li>{% endfor %}</ol>{% endif %}
+      {% if !ai.models.is_empty() %}<h3>Models asked for</h3>
+      <ol class="ranked">{% for n in ai.models %}<li><span class="ranked-name mono">{{ n.name }}</span><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = ai.models_max %}{% include "_bar.html" %}</li>{% endfor %}</ol>{% endif %}
+      <p class="muted">{% for n in ai.apis %}{{ n.name }} {{ n.count }}{% if !loop.last %} · {% endif %}{% endfor %}</p>
+    </section>{% endif %}
   </div>
 
   <div class="grid-3">

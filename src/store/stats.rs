@@ -169,6 +169,9 @@ pub struct Stats {
     /// Milliseconds the tarpit held clients, over the requests in the range
     /// recorded in full (light rows are never public).
     pub tarpit_held_ms: i64,
+    /// The AI decoys' aggregates; only from [`super::decoys::AI_TILE_MIN`]
+    /// requests up.
+    pub ai_decoys: Option<super::decoys::AiDecoys>,
 }
 
 /// Most rows "Recent requests" can show (`[public] recent_rows` is at most
@@ -554,6 +557,7 @@ impl Store {
                 since,
             )
             .await?;
+        let ai_decoys = self.ai_decoys_as(r, a).await?;
         let sum = self.canary_summary_as(r, a).await?;
         // Counted per harvest, not per value: one request carrying many
         // values of one decoy is one event.
@@ -588,6 +592,7 @@ impl Store {
             intel,
             canaries,
             tarpit_held_ms,
+            ai_decoys,
         })
     }
 
@@ -1493,6 +1498,52 @@ mod tests {
         assert_eq!(m.countries.get("DE"), Some(&1));
         let m = s.map_counts_as(Range::H24, Audience::Public).await.unwrap();
         assert_eq!(m.countries.get("US"), None);
+    }
+
+    #[tokio::test]
+    async fn ai_decoys_card_only_from_released_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        s.set_publish_delay(Duration::from_secs(300), Duration::ZERO)
+            .await
+            .unwrap();
+        for i in 0..6 {
+            let ip = s
+                .upsert_ip(format!("203.0.113.{}", i % 2 + 1).parse().unwrap())
+                .await
+                .unwrap();
+            s.insert_request(&NewRequest {
+                ip_id: ip.id,
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                answer: Some("decoy:llm:chat-completions".into()),
+                decoy_in: Some(r#"{"api":"openai","model":"llama3:70b"}"#.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let p = s.stats_as(Range::All, Audience::Public).await.unwrap();
+        assert!(p.ai_decoys.is_none(), "pending rows");
+        assert!(
+            s.stats_as(Range::All, Audience::Admin)
+                .await
+                .unwrap()
+                .ai_decoys
+                .is_some()
+        );
+        sqlx::query("UPDATE requests SET public_at = datetime('now', '-1 seconds') WHERE public_at IS NOT NULL")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        s.release_due().await.unwrap();
+        let p = s.stats_as(Range::All, Audience::Public).await.unwrap();
+        let a = p.ai_decoys.as_ref().expect("card shown");
+        assert!(a.models.iter().any(|n| n.name == "llama3:70b"));
+        let json = serde_json::to_value(&p).unwrap();
+        assert!(json["ai_decoys"]["models"].is_array());
     }
 
     #[tokio::test]

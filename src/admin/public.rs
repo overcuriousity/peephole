@@ -1260,6 +1260,37 @@ show_labels = {show_labels}
     }
 
     #[tokio::test]
+    async fn wall_shows_ai_card_only_with_released_ai_requests() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, before) = get_with(&app, "/", None).await;
+        assert!(!before.contains("What they asked our fake AI"), "{before}");
+        for i in 0..6 {
+            let ip = st
+                .store
+                .upsert_ip(format!("203.0.113.{}", i % 2 + 1).parse().unwrap())
+                .await
+                .unwrap();
+            st.store
+                .insert_request(&crate::store::requests::NewRequest {
+                    ip_id: ip.id,
+                    method: "POST".into(),
+                    path: "/v1/chat/completions".into(),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    answer: Some("decoy:llm:chat-completions".into()),
+                    decoy_in: Some(r#"{"api":"openai","model":"llama3:70b"}"#.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let (_, after) = get_with(&app, "/?range=7d", None).await;
+        assert!(after.contains("What they asked our fake AI"), "{after}");
+        assert!(after.contains("llama3:70b"), "{after}");
+    }
+
+    #[tokio::test]
     async fn wall_without_a_delay_says_so_plainly() {
         let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
         let cookie = admin_cookie(&st).await;

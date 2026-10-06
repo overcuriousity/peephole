@@ -74,6 +74,9 @@ pub struct AiDecoys {
     pub models: Vec<Named>,
     pub apis: Vec<Named>,
     pub total: i64,
+    /// The largest count in `tools` / `models` (at least 1): bar scales.
+    pub tools_max: i64,
+    pub models_max: i64,
 }
 
 /// The session canaries served in the range, and the requests carrying them.
@@ -376,7 +379,10 @@ impl Store {
             q = q.bind(m);
         }
         let apis = q.fetch_all(&self.read).await?;
+        let max = |v: &[Named]| v.iter().map(|n| n.count).max().unwrap_or(1).max(1);
         Ok(Some(AiDecoys {
+            tools_max: max(&tools),
+            models_max: max(&models),
             tools,
             models,
             apis,
