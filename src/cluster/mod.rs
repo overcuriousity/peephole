@@ -10,6 +10,7 @@ pub mod identity;
 pub mod invite;
 pub mod members;
 pub mod msg;
+pub mod owner;
 pub mod record;
 pub mod remote;
 pub mod repl;
