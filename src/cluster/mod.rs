@@ -276,6 +276,8 @@ pub struct Node {
     lookup_providers: std::sync::OnceLock<crate::intel::Providers>,
     /// The on-demand share of each provider budget (see `credits::share`).
     lookup_shares: std::sync::OnceLock<crate::credits::share::Shares>,
+    /// This node's lookup prices, as last computed (`credits::price`).
+    price_table: RwLock<Arc<crate::credits::price::Table>>,
     /// On-demand API lookups served per asking member: `(UTC day, count)`.
     lookup_budget: Mutex<HashMap<NodeId, (String, u32)>>,
     pub data_dir: std::path::PathBuf,
@@ -339,6 +341,7 @@ impl Node {
             providers: RwLock::new(vec![]),
             lookup_providers: Default::default(),
             lookup_shares: Default::default(),
+            price_table: Default::default(),
             lookup_budget: Mutex::new(HashMap::new()),
             data_dir: p.data_dir,
             status: Default::default(),
@@ -491,6 +494,16 @@ impl Node {
 
     pub fn lookup_shares(&self) -> Option<&crate::credits::share::Shares> {
         self.lookup_shares.get()
+    }
+
+    pub fn price_table(&self) -> Arc<crate::credits::price::Table> {
+        self.price_table.read().unwrap().clone()
+    }
+
+    /// Adopt new prices and announce them with the next heartbeat.
+    pub fn set_price_table(&self, t: Arc<crate::credits::price::Table>) {
+        *self.price_table.write().unwrap() = t;
+        self.publish_status();
     }
 
     /// Take `n` of `peer`'s on-demand API lookups for today; `false` when

@@ -61,6 +61,13 @@ pub struct Heartbeat {
     /// serves nothing below.
     #[serde(default)]
     pub floors: Vec<(NodeId, u64)>,
+    /// Per provider with a budget: paid on-demand lookups this node
+    /// serves a day (see `credits::price`).
+    #[serde(default)]
+    pub on_demand: Vec<(String, u32)>,
+    /// Per provider this node serves: its current price in mc.
+    #[serde(default)]
+    pub prices: Vec<(String, u32)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +294,7 @@ impl Node {
     /// Build, sign and store this node's current heartbeat.
     pub fn refresh_heartbeat(&self) {
         let local = self.status.local.lock().unwrap().clone();
+        let (on_demand, prices) = self.price_table().announced();
         let hb = Heartbeat {
             node: self.id(),
             at_ms: self.status.next_at(),
@@ -314,6 +322,8 @@ impl Node {
                 f.sort();
                 f
             },
+            on_demand,
+            prices,
         };
         let Ok(body) = super::rpc::cbor::encode(&hb) else {
             return;
@@ -409,6 +419,8 @@ mod tests {
             own_seq: 0,
             retention_days: 0,
             floors: vec![],
+            on_demand: vec![],
+            prices: vec![],
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = id.sign(&SignedHeartbeat::signing(&body));
@@ -530,6 +542,8 @@ mod tests {
             own_seq: 0,
             retention_days: 0,
             floors: vec![],
+            on_demand: vec![],
+            prices: vec![],
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = a.sign(&SignedHeartbeat::signing(&body));

@@ -4602,3 +4602,143 @@ async fn audits_of_made_up_results_stop_a_scanners_shares_where_they_count() {
     assert_eq!(book.balance(&f.id), by_f as u64 * 1000);
     assert_eq!(book.balance(&b.id), honest);
 }
+
+/// A provider a test node serves: a name the cluster knows, an optional
+/// budget a day, and a count of the addresses it was asked about.
+struct TestProvider {
+    name: &'static str,
+    per_day: Option<f64>,
+    asked: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl peephole::intel::provider::Provider for TestProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn ready(&self) -> bool {
+        true
+    }
+    fn per_day(&self) -> Option<f64> {
+        self.per_day
+    }
+    fn lookup<'a>(
+        &'a self,
+        ips: &'a [String],
+    ) -> futures::future::BoxFuture<'a, Vec<peephole::intel::provider::Finding>> {
+        Box::pin(async move {
+            self.asked
+                .fetch_add(ips.len(), std::sync::atomic::Ordering::SeqCst);
+            ips.iter()
+                .map(|ip| peephole::intel::provider::Finding {
+                    ip: ip.clone(),
+                    source_version: None,
+                    data: serde_json::json!({ "said_by": self.name }),
+                })
+                .collect()
+        })
+    }
+}
+
+/// Make `n` serve `list` (provider name, budget a day) with the given
+/// on-demand share. Returns the counter of addresses its providers were
+/// asked about.
+fn serves(
+    n: &TestNode,
+    list: &[(&'static str, Option<f64>)],
+    share: f64,
+) -> Arc<std::sync::atomic::AtomicUsize> {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let providers: peephole::intel::Providers = list
+        .iter()
+        .map(|(name, per_day)| {
+            Arc::new(TestProvider {
+                name,
+                per_day: *per_day,
+                asked: asked.clone(),
+            }) as Arc<dyn peephole::intel::provider::Provider>
+        })
+        .collect();
+    n.node
+        .set_providers(list.iter().map(|(n, _)| n.to_string()).collect());
+    n.node.set_lookup_providers(providers);
+    n.node
+        .set_lookup_shares(peephole::credits::share::Shares::new(
+            n.store.clone(),
+            share,
+        ));
+    asked
+}
+
+/// Give `node` credits in the books of every node in `on`: `scans` judged
+/// level-1 scans it ran for its own trap, 1250 mc each.
+async fn grant_scans(on: &[&TestNode], node: NodeId, scans: u32) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let first = NEXT.fetch_add(scans as u64, std::sync::atomic::Ordering::SeqCst);
+    let now = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64)
+        << 16;
+    for n in on {
+        for i in 0..scans as u64 {
+            let k = first + i;
+            sqlx::query(
+                "INSERT INTO credit_scans
+                   (scan_uid, job_uid, ip, scanner, trap, hlc, level, job_level, args_ok, judged_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 1, 1, 1, datetime('now'))",
+            )
+            .bind(format!("granted-{k}"))
+            .bind(format!("granted-job-{k}"))
+            .bind(format!("100.64.{}.{}", k / 250, k % 250))
+            .bind(&node.0[..])
+            .bind(&node.0[..])
+            .bind(now + k as i64)
+            .execute(&n.store.pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
+/// A server's prices follow what the cluster earns, and its heartbeat
+/// carries them and the lookups it serves a day.
+#[tokio::test]
+async fn announced_prices_follow_the_clusters_earnings() {
+    use peephole::credits::price;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    // A budget of 1000 a day and a share of a fifth: 200 lookups a day.
+    serves(
+        &na,
+        &[("abuseipdb", Some(1000.0)), ("maxmind-geolite2", None)],
+        0.2,
+    );
+    // 112 scans at 1.25 credits in a week: 20 credits a day.
+    grant_scans(&[&na], a.id, 112).await;
+    let t = price::refresh(&na.node).await.unwrap();
+    assert_eq!((t.earned_per_day, t.lookups_per_day), (20_000, 200.0));
+    // No scanner runs: no capacity, which counts as saturated (double).
+    assert_eq!(
+        (t.capacity.utilization, t.load, t.unit),
+        (1.0, 2.0, Some(400))
+    );
+    assert_eq!(t.price_of("abuseipdb"), Some(400));
+    assert_eq!(t.price_of("maxmind-geolite2"), Some(100));
+    let seen = |price: u32| {
+        nb.status.known(&a.id).is_some_and(|k| {
+            k.hb.prices.contains(&("abuseipdb".to_string(), price))
+                && k.hb.on_demand == vec![("abuseipdb".to_string(), 200)]
+        })
+    };
+    eventually("b reads a's prices from its heartbeat", || async {
+        seen(400)
+    })
+    .await;
+    // Twice the earnings, twice the price.
+    grant_scans(&[&na], a.id, 112).await;
+    let t = price::refresh(&na.node).await.unwrap();
+    assert_eq!(t.price_of("abuseipdb"), Some(800));
+    eventually("b sees the new price", || async { seen(800) }).await;
+}

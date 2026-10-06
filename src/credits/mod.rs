@@ -6,6 +6,7 @@ pub mod earn;
 pub mod entries;
 pub mod gates;
 pub mod ledger;
+pub mod price;
 pub mod share;
 
 /// Millicredits: 1 credit = 1000 mc. Sums are `u64`, amounts on the wire
@@ -190,6 +191,12 @@ pub async fn run(
             .await
             {
                 tracing::debug!(?e, "credits: pruning failed");
+            }
+        }
+        // At the start (once the first heartbeats are in) and every hour.
+        if ticks % 60 == 1 {
+            if let Err(e) = price::refresh(&node).await {
+                tracing::debug!(?e, "credits: prices not computed");
             }
         }
         ticks += 1;

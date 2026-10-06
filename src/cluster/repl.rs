@@ -1746,6 +1746,8 @@ mod tests {
                 own_seq: 0,
                 retention_days: 0,
                 floors: vec![],
+                on_demand: vec![],
+                prices: vec![],
             };
             let body = super::super::rpc::cbor::encode(&hb).unwrap();
             let signed = super::super::status::SignedHeartbeat { body, sig: vec![] };
@@ -1946,6 +1948,8 @@ mod tests {
             own_seq: 0,
             retention_days,
             floors,
+            on_demand: vec![],
+            prices: vec![],
         };
         let body = super::super::rpc::cbor::encode(&hb).unwrap();
         let signed = super::super::status::SignedHeartbeat { body, sig: vec![] };

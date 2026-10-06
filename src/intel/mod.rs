@@ -594,7 +594,7 @@ const INTEL_MIN_GAP: Duration = Duration::from_secs(5);
 /// Wait for heartbeats before deciding who fetches.
 const ELECTION_GRACE: Duration = Duration::from_secs(90);
 /// Heartbeats this recent count a member as alive for the fetch order.
-const LIVE_WINDOW: Duration = Duration::from_secs(45);
+pub(crate) const LIVE_WINDOW: Duration = Duration::from_secs(45);
 
 /// Refresh `maxmind_cluster_seen` at most this often while it holds.
 const CLUSTER_SEEN_EVERY: Duration = Duration::from_secs(600);
