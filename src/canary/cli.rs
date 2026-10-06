@@ -2,6 +2,7 @@
 //! rendered again from the row, byte for byte.
 use crate::config::Config;
 use crate::store::Store;
+use crate::trap::decoy::ai::DecoyIn;
 use crate::trap::decoy::{Decoy, Input, render};
 use anyhow::{Result, bail};
 use std::path::Path;
@@ -35,8 +36,9 @@ type FullRow = (
     Option<String>,
 );
 
-/// The decoy of the row `uid` (None: no such row, or not a decoy).
-pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
+/// The decoy of the row `uid` (None: no such row, or not a decoy), and for
+/// a legacy-SSE POST the frame that went down the stream instead.
+pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<(Decoy, Option<String>)>> {
     if let Some((batch, row)) = uid.split_once('#') {
         // `row` is the position in the batch, from 1.
         let Some(offset) = row.parse::<i64>().ok().filter(|n| *n >= 1).map(|n| n - 1) else {
@@ -58,7 +60,7 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
         let Some(name) = answer.strip_prefix("decoy:") else {
             return Ok(None);
         };
-        return Ok(render(
+        return Ok(with_pushed(
             &Input {
                 v: v.unwrap_or(0),
                 page_token: &tok,
@@ -91,7 +93,7 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
     let ts = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S")
         .map(|t| t.and_utc().timestamp())
         .unwrap_or(0);
-    Ok(render(
+    Ok(with_pushed(
         &Input {
             v: v.unwrap_or(0),
             page_token: &tok,
@@ -107,6 +109,19 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
     ))
 }
 
+/// The decoy of `name`, and for a legacy-SSE POST the frame that went down
+/// the stream (the POST itself was answered `Accepted`).
+fn with_pushed(input: &Input, name: &str) -> Option<(Decoy, Option<String>)> {
+    let d = render(input, name)?;
+    let din = DecoyIn::parse(input.decoy_in);
+    let pushed =
+        (din.via.as_deref() == Some("sse") && name != "mcp:sse" && name != "mcp:no-session")
+            .then(|| crate::trap::decoy::mcp::message(input, &din, name.trim_start_matches("mcp:")))
+            .flatten()
+            .map(|m| format!("event: message\ndata: {m}\n\n"));
+    Some((d, pushed))
+}
+
 /// Run `decoy …`; `args` excludes `decoy` itself.
 pub async fn run(args: &[String], default_config: &str) -> Result<()> {
     let (Some("render"), Some(uid)) = (args.first().map(String::as_str), args.get(1)) else {
@@ -115,7 +130,7 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
     let config = args.get(2).map(String::as_str).unwrap_or(default_config);
     let cfg = Config::load(Path::new(config))?;
     let store = Store::connect(&cfg.database_path).await?;
-    let Some(d) = render_uid(&store, uid).await? else {
+    let Some((d, pushed)) = render_uid(&store, uid).await? else {
         bail!("no decoy row with uid {uid}");
     };
     println!("{}", d.status);
@@ -124,6 +139,9 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
     }
     println!();
     print!("{}", d.body);
+    if let Some(frame) = pushed {
+        println!("\n# pushed down the session's SSE stream:\n{frame}");
+    }
     Ok(())
 }
 
@@ -168,7 +186,7 @@ mod tests {
         .await
         .unwrap();
         drop(conn);
-        let d = render_uid(&s, "b1#1").await.unwrap().unwrap();
+        let (d, _) = render_uid(&s, "b1#1").await.unwrap().unwrap();
         let want = crate::trap::decoy::render(
             &crate::trap::decoy::Input {
                 v: 1,
@@ -237,6 +255,6 @@ mod tests {
             "dotenv",
         )
         .unwrap();
-        assert_eq!(render_uid(&s, "r1").await.unwrap().unwrap(), want);
+        assert_eq!(render_uid(&s, "r1").await.unwrap().unwrap().0, want);
     }
 }

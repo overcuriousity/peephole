@@ -354,9 +354,75 @@ async fn a_source_over_its_recording_rate_gets_the_decoy_and_a_renderable_light_
         "SELECT b.uid, (SELECT COUNT(*) FROM skipped_requests x WHERE x.batch_id = s.batch_id AND x.rowid <= s.rowid)
          FROM skipped_requests s JOIN skipped_batches b ON b.id = s.batch_id WHERE s.decoy_in IS NOT NULL LIMIT 1")
         .fetch_one(&store.pool).await.unwrap();
-    let d = peephole::canary::cli::render_uid(&store, &format!("{b}#{row}"))
+    let (d, _) = peephole::canary::cli::render_uid(&store, &format!("{b}#{row}"))
         .await
         .unwrap()
         .unwrap();
     assert!(d.body.contains("\"id\":5"), "{}", d.body);
+}
+
+#[tokio::test]
+async fn legacy_sse_pushes_answers_down_the_stream() {
+    let (addr, store, _d) = spawn("mcp_sse_hold_secs = 2", false).await;
+    let mut sse = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sse.write_all(b"GET /sse HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 8.8.8.8\r\nAccept: text/event-stream\r\n\r\n").await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = sse.read(&mut buf).await.unwrap();
+    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let endpoint = head
+        .split("data: ")
+        .nth(1)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(endpoint.starts_with("/messages?sessionId="), "{head}");
+    let (st, _, b) = http(
+        addr,
+        "8.8.8.8",
+        "POST",
+        &endpoint,
+        &[JSON_CT],
+        br#"{"jsonrpc":"2.0","id":11,"method":"tools/list"}"#,
+    )
+    .await;
+    assert_eq!((st, b.as_str()), (202, "Accepted"));
+    let mut got = String::new();
+    while !got.contains("\"id\":11") {
+        let n = sse.read(&mut buf).await.unwrap();
+        assert!(n > 0, "stream ended early: {got}");
+        got.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    assert!(got.contains("event: message") && got.contains("run_command"));
+    // Unknown session: 404, recorded as no-session.
+    let (st, _, _) = http(
+        addr,
+        "8.8.8.8",
+        "POST",
+        "/messages?sessionId=nope",
+        &[JSON_CT],
+        br#"{"jsonrpc":"2.0","id":12,"method":"ping"}"#,
+    )
+    .await;
+    assert_eq!(st, 404);
+    // The stream's own row arrives once it ends, with the time held.
+    until(
+        &store,
+        "SELECT COUNT(*) FROM requests WHERE answer = 'decoy:mcp:sse' AND held_ms >= 1000",
+        1,
+    )
+    .await;
+    until(
+        &store,
+        "SELECT COUNT(*) FROM requests WHERE answer = 'decoy:mcp:no-session'",
+        1,
+    )
+    .await;
+    // The POST carried the session id the GET was served: linked.
+    let linked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT r.id) FROM canaries c JOIN request_tokens t ON t.value_hash = c.value_hash
+         JOIN requests r ON r.id = t.request_id WHERE c.kind = 'mcp-session' AND r.answer = 'decoy:mcp:tools/list'")
+        .fetch_one(&store.pool).await.unwrap();
+    assert_eq!(linked, 1);
 }

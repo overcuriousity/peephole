@@ -75,6 +75,8 @@ pub struct TrapState {
     /// The slow answer for severity-4 sources; shared with the admin's
     /// System page, and kept across listener restarts.
     pub tarpit: Arc<tarpit::Tarpit>,
+    /// Legacy MCP SSE streams on this node.
+    pub sse: Arc<decoy::sse::SseHub>,
 }
 
 /// In-memory state that keeps floods off the database.
@@ -376,6 +378,7 @@ impl TrapState {
             // Off: a test's severity-4 request would hold the next one for
             // the whole hold. Tests of the tarpit set their own.
             tarpit: Arc::new(tarpit::Tarpit::off()),
+            sse: Arc::new(decoy::sse::SseHub::new(&cfg.trap)),
             cfg,
         }
     }
@@ -823,15 +826,13 @@ async fn trap(
     let path = parts.uri.path();
     let presented = presented(&state, &headers, method, path, &body.bytes).await;
     let decoded = crate::classify::decoded_body(&headers, &body.bytes);
-    let ai = decoy::ai::choose(&decoy::ai::Ask {
+    let mut ai = decoy::ai::choose(&decoy::ai::Ask {
         method,
         path,
         query: parts.uri.query(),
         headers: &headers,
         body: &decoded,
-    })
-    // The legacy SSE stream is Task 9's; until then it is no decoy.
-    .filter(|(name, _)| name != "mcp:sse");
+    });
     drop(decoded);
     // A canary presented is answered as always: its trace is worth more.
     // So is an AI decoy: `mcp-abuse` is severity 4, and the tarpit would
@@ -857,9 +858,34 @@ async fn trap(
         path,
         decoy_in: decoy_in.as_deref(),
     };
+    if let Some((name, _)) = &ai
+        && name == "mcp:sse"
+        && let Some(d) = decoy::render(&input, name)
+    {
+        let session = decoy::mcp::session_id(&page_token);
+        if let Some((stream, held)) = state.sse.open(ip, session, d.body) {
+            return sse_answer(
+                state, in_flight, ip, parts, body, stream, held, page_token, now, host, decoy_in,
+                word,
+            );
+        }
+        // Pool or share full: no stream, so no endpoint event either.
+        ai = None;
+    }
     // AI decoys first: a Bearer key that is one of our canaries must get
     // the LLM answer, not the version-1 admin page.
     let decoy = match &ai {
+        Some((name, d)) if d.via.as_deref() == Some("sse") => {
+            let method_name = name.trim_start_matches("mcp:");
+            let frame = decoy::mcp::message(&input, d, method_name)
+                .map(|m| format!("event: message\ndata: {m}\n\n"));
+            let sid = parts
+                .uri
+                .query()
+                .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("sessionId=")));
+            let open = sid.is_some_and(|s| state.sse.deliver(s, frame));
+            decoy::render(&input, if open { name } else { "mcp:no-session" })
+        }
         Some((name, _)) => decoy::render(&input, name),
         None => decoy::choose(method, path, parts.uri.query(), presented, word)
             .and_then(|name| decoy::render(&input, name)),
@@ -907,6 +933,67 @@ async fn trap(
     (
         StatusCode::NOT_FOUND,
         Html(pages::trap_page(&page_token, &state.cfg.trap.helper_prefix)),
+    )
+        .into_response()
+}
+
+/// The legacy MCP stream: answered at once, recorded once it ends (with
+/// the time it held the client).
+#[allow(clippy::too_many_arguments)]
+fn sse_answer(
+    state: Arc<TrapState>,
+    in_flight: InFlight,
+    ip: IpAddr,
+    parts: axum::http::request::Parts,
+    body: ReadBody,
+    stream: impl futures::Stream<Item = Result<axum::body::Bytes, std::convert::Infallible>>
+    + Send
+    + 'static,
+    held: tokio::sync::oneshot::Receiver<u64>,
+    page_token: String,
+    now: chrono::DateTime<chrono::Utc>,
+    host: Option<String>,
+    decoy_in: Option<String>,
+    word: &'static str,
+) -> Response {
+    let wait = state.sse.hold() + TARPIT_MARGIN;
+    if let Some(meta) = parts.extensions.get::<listen::ConnMeta>() {
+        meta.handover.take_over(tokio::time::Instant::now() + wait);
+    }
+    tokio::spawn(async move {
+        let held_ms = tokio::time::timeout(wait, held)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX));
+        let slot = state.guards.slot().await;
+        record_trap(
+            state.clone(),
+            (in_flight, slot),
+            ip,
+            parts,
+            body,
+            Served {
+                page_token,
+                answer: "decoy:mcp:sse".into(),
+                status: 200,
+                now,
+                host,
+                decoy_v: Some(crate::canary::DECOY_V),
+                word,
+                held_ms,
+                decoy_in,
+            },
+        )
+        .await;
+    });
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        axum::body::Body::from_stream(stream),
     )
         .into_response()
 }

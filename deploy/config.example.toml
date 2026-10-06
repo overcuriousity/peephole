@@ -55,6 +55,11 @@ trusted_proxies = ["10.0.0.5/32"]
 # tarpit_hold_secs = 600      # longest a connection is held
 # tarpit_drip_bytes = 1       # bytes sent per drip
 # tarpit_drip_every_secs = 10 # seconds between drips (below the hold)
+# Legacy MCP HTTP+SSE decoy: streams held open for scanners probing GET /sse,
+# in a pool of their own.
+# mcp_sse_pool = 64           # streams held at once; 0 = none
+# mcp_sse_per_source = 2      # ...from one source (IPv6 by /64)
+# mcp_sse_hold_secs = 300     # longest a stream is held
 
 [webauthn]
 # Public domain the dashboard is reached at through nginx (FIDO2 relying party).

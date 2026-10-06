@@ -76,11 +76,11 @@ pub struct SkipDecoy {
 pub enum SkipAnswer {
     /// The trap page or another answer a light row does not name.
     Plain,
+    /// A decoy. Its light row keeps no `held_ms` (the tarpit's and the
+    /// legacy SSE stream's): that stays tarpit-only.
     Decoy(SkipDecoy),
     /// The tarpit, and how long it held the client.
-    Tarpit {
-        held_ms: i64,
-    },
+    Tarpit { held_ms: i64 },
 }
 
 impl SkipLog {

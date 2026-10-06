@@ -287,6 +287,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         node: node.clone(),
         providers,
         tarpit: Arc::new(trap::tarpit::Tarpit::of(&cfg)),
+        sse: Arc::new(trap::decoy::sse::SseHub::new(&cfg.trap)),
     };
     // At startup a role that cannot start is fatal, as it always was (the
     // installer's health check relies on it); later changes are retried.
@@ -374,6 +375,8 @@ struct RoleRunner {
     providers: intel::Providers,
     /// The trap's tarpit: outlives a listener restart, read by the admin.
     tarpit: Arc<trap::tarpit::Tarpit>,
+    /// The trap's legacy MCP SSE streams: outlive a listener restart.
+    sse: Arc<trap::decoy::sse::SseHub>,
 }
 
 impl RoleRunner {
@@ -548,6 +551,7 @@ impl RoleRunner {
             pace: self.settings.pace.clone(),
             guards: Default::default(),
             tarpit: self.tarpit.clone(),
+            sse: self.sse.clone(),
         });
         let app = trap::router(state.clone());
         let listener = tokio::net::TcpListener::bind(addr)

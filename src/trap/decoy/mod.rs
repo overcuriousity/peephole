@@ -10,6 +10,7 @@
 pub mod ai;
 pub mod llm;
 pub mod mcp;
+pub mod sse;
 
 use crate::canary::site;
 use crate::canary::{Kind, v0_ref, value};
