@@ -40,10 +40,13 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 - At most half of a node's workers run level-4 scans (`scan.level4_max_share`,
   default 0.5); the rest keep shorter scans moving. Workers are now 0 (paused)
-  or at least 2; a saved 1 is raised to 2.
+  or at least 2; a saved 1 is raised to 2, but a config file with
+  `scan.max_workers = 1` now fails to start (set 2 or more).
 - Level 4 sends at least `scan.min_rate` probes per second (default 300; lower
   it behind a home router) with `--max-retries 1`, and `level4_timeout_factor`
-  defaults to 2.
+  defaults to 2. Configs copied from the old example set
+  `level4_timeout_factor = 4` explicitly; remove the key or set 2 to get the
+  new default.
 - The queue runs the job with the highest response ratio (time waited relative
   to how long its level takes) instead of the highest level first.
 - Presets: level 1 runs at `-T3` with `--version-light`; levels 3 and 4 add

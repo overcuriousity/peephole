@@ -275,4 +275,12 @@ no time does a scanner run 2 L4 at once, and L2 jobs start while L4 runs.
    used for this spec. Then decide on `scan.level4_udp`, and look again at
    whether any old L4 jobs are still being skipped.
 
+Until every arbiter runs the new version, a capped scanner takes and hands
+back one L4 grant per claim from old arbiters (backoff 180 s), and old
+arbiters offer it no lower levels until their L4s are in backoff. Upgrade all
+nodes promptly.
+
+The UDP argv form (`-p T:1-65535,U:<list>`) is still unverified on a real
+nmap; check it before enabling `level4_udp`.
+
 The changelog gets one entry under the next release.
