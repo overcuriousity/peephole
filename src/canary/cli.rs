@@ -65,6 +65,7 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
                 ts: ts_ms.div_euclid(1000),
                 method: &method,
                 path: &path,
+                decoy_in: None,
             },
             name,
         ));
@@ -96,6 +97,7 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
             ts,
             method: &method,
             path: &path,
+            decoy_in: None,
         },
         name,
     ))
@@ -172,6 +174,7 @@ mod tests {
                 ts: 1_791_000_000,
                 method: "GET",
                 path: "/.env",
+                decoy_in: None,
             },
             "dotenv",
         )
@@ -225,6 +228,7 @@ mod tests {
                 ts: 1_791_108_000,
                 method: "GET",
                 path: "/.env",
+                decoy_in: None,
             },
             "dotenv",
         )

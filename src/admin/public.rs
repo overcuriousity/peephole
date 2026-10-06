@@ -1595,7 +1595,7 @@ show_labels = {show_labels}
         )
         .await
         .unwrap();
-        let all: Vec<String> = crate::canary::served(Some(1), "tok-env", "dotenv")
+        let all: Vec<String> = crate::canary::served(Some(1), "tok-env", "dotenv", None)
             .into_iter()
             .map(|(_, v)| v)
             .collect();

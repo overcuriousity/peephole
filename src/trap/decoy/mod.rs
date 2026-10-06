@@ -7,6 +7,10 @@
 //! (`peephole decoy render`). Version 1 serves canaries derived from the
 //! page token ([`crate::canary`]); version 0 (rows with no `decoy_v`)
 //! served `canary-<ref>`.
+pub mod ai;
+pub mod llm;
+pub mod mcp;
+
 use crate::canary::site;
 use crate::canary::{Kind, v0_ref, value};
 
@@ -24,6 +28,8 @@ pub struct Input<'a> {
     pub ts: i64,
     pub method: &'a str,
     pub path: &'a str,
+    /// What an MCP or LLM decoy is rendered from ([`ai::DecoyIn`] as JSON).
+    pub decoy_in: Option<&'a str>,
 }
 
 /// Which places of the request carried a canary this node knows.
@@ -111,6 +117,15 @@ pub fn choose(
 
 /// The decoy `name` as version `inp.v` renders it (None: unknown).
 pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
+    if inp.v >= 2 {
+        let d = ai::DecoyIn::parse(inp.decoy_in);
+        if let Some(n) = name.strip_prefix("mcp:") {
+            return mcp::render(inp, &d, n);
+        }
+        if let Some(n) = name.strip_prefix("llm:") {
+            return llm::render(inp, &d, n);
+        }
+    }
     let (status, headers, body): (u16, Vec<(&'static str, String)>, String) = match inp.v {
         0 => {
             let r = v0_ref(inp.page_token);
@@ -124,17 +139,12 @@ pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
                 _ => return None,
             }
         }
-        1 => {
+        1 | 2 => {
             let word = inp.word;
             let site_name = format!("{word}.internal");
-            let ret = site::return_host(inp.host, &site_name);
             match name {
-                "dotenv" => (
-                    200,
-                    ct(TEXT),
-                    v1_dotenv(inp.page_token, word, &site_name, &ret),
-                ),
-                "git-config" => (200, ct(TEXT), v1_git_config(inp.page_token, word, &ret)),
+                "dotenv" => (200, ct(TEXT), dotenv_text(inp)),
+                "git-config" => (200, ct(TEXT), git_config_text(inp)),
                 "git-head" => (200, ct(TEXT), "ref: refs/heads/main\n".into()),
                 "wp-login" => (200, ct(HTML), wp_login(false)),
                 "wp-login-failed" => (200, ct(HTML), wp_login(true)),
@@ -183,11 +193,25 @@ pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
     })
 }
 
-fn ct(v: &str) -> Vec<(&'static str, String)> {
+/// The version-1 `.env` body for this request.
+pub(super) fn dotenv_text(inp: &Input) -> String {
+    let site_name = format!("{}.internal", inp.word);
+    let ret = site::return_host(inp.host, &site_name);
+    v1_dotenv(inp.page_token, inp.word, &site_name, &ret)
+}
+
+/// The version-1 `.git/config` body for this request.
+pub(super) fn git_config_text(inp: &Input) -> String {
+    let site_name = format!("{}.internal", inp.word);
+    let ret = site::return_host(inp.host, &site_name);
+    v1_git_config(inp.page_token, inp.word, &ret)
+}
+
+pub(super) fn ct(v: &str) -> Vec<(&'static str, String)> {
     vec![("content-type", v.to_string())]
 }
 
-fn hex(data: &[u8], n: usize) -> String {
+pub(super) fn hex(data: &[u8], n: usize) -> String {
     use sha2::Digest;
     let d = sha2::Sha256::digest(data);
     d.iter().map(|b| format!("{b:02x}")).collect::<String>()[..n].to_string()
@@ -476,7 +500,49 @@ mod tests {
             ts: 1_791_000_000,
             method,
             path,
+            decoy_in: None,
         }
+    }
+
+    #[test]
+    fn version_two_renders_every_version_one_name_unchanged() {
+        for name in [
+            "dotenv",
+            "git-config",
+            "git-head",
+            "wp-login",
+            "wp-login-failed",
+            "wp-login-ok",
+            "wp-admin",
+            "admin",
+            "git-auth",
+            "git-refs",
+            "git-pack",
+            "phpinfo",
+        ] {
+            let one = inp(1, None, "GET", "/");
+            let two = inp(2, None, "GET", "/");
+            assert_eq!(render(&one, name), render(&two, name), "{name}");
+        }
+    }
+
+    #[test]
+    fn decoy_input_round_trips_and_stays_small() {
+        use ai::DecoyIn;
+        let d = DecoyIn {
+            rpc: Some(serde_json::json!(7)),
+            m: Some("tools/call".into()),
+            arg: Some("x".repeat(128)),
+            model: Some("m".repeat(128)),
+            tool: Some("t".repeat(64)),
+            deployment: Some("d".repeat(64)),
+            ..Default::default()
+        };
+        let s = d.to_json();
+        assert!(s.len() <= ai::MAX_LEN, "{}", s.len());
+        assert_eq!(DecoyIn::parse(Some(&s)).rpc, d.rpc);
+        assert_eq!(DecoyIn::parse(Some("not json")), DecoyIn::default());
+        assert_eq!(DecoyIn::parse(None), DecoyIn::default());
     }
 
     fn none() -> Presented {

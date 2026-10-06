@@ -840,6 +840,7 @@ async fn trap(
                 ts: now.timestamp(),
                 method,
                 path,
+                decoy_in: None,
             },
             name,
         )

@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 
 /// Version of the decoy templates this build serves (`requests.decoy_v`).
 /// A change to any template or to [`value`] bumps it.
-pub const DECOY_V: i64 = 1;
+pub const DECOY_V: i64 = 2;
 
 const B32: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -21,6 +21,8 @@ pub enum Kind {
     AdminPassword,
     GitToken,
     WpSession,
+    /// An MCP session id (Mcp-Session-Id, legacy ?sessionId=).
+    McpSession,
     /// A version-0 value (`canary-<ref>` and its variants).
     Legacy,
 }
@@ -49,6 +51,7 @@ impl Kind {
             Kind::AdminPassword => "admin-password",
             Kind::GitToken => "git-token",
             Kind::WpSession => "wp-session",
+            Kind::McpSession => "mcp-session",
             Kind::Legacy => "legacy",
         }
     }
@@ -94,6 +97,20 @@ pub fn value(page_token: &str, kind: Kind) -> String {
         }
         Kind::GitToken => pick(&stream(page_token, kind, 40), HEX),
         Kind::WpSession => pick(&stream(page_token, kind, 43), ALNUM),
+        Kind::McpSession => {
+            let h: String = stream(page_token, kind, 16)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!(
+                "{}-{}-{}-{}-{}",
+                &h[..8],
+                &h[8..12],
+                &h[12..16],
+                &h[16..20],
+                &h[20..]
+            )
+        }
         Kind::Legacy => format!("canary-{}", v0_ref(page_token)),
     }
 }
@@ -104,12 +121,44 @@ pub fn v0_ref(page_token: &str) -> String {
 }
 
 /// The canaries a decoy answer carried. `decoy` is the answer without its
-/// `decoy:` prefix; `decoy_v` None is version 0.
-pub fn served(decoy_v: Option<i64>, page_token: &str, decoy: &str) -> Vec<(Kind, String)> {
+/// `decoy:` prefix; `decoy_v` None is version 0; `decoy_in` is the row's
+/// parsed decoy input (version 2's MCP answers depend on it).
+pub fn served(
+    decoy_v: Option<i64>,
+    page_token: &str,
+    decoy: &str,
+    decoy_in: Option<&str>,
+) -> Vec<(Kind, String)> {
     let v = |kinds: &[Kind]| -> Vec<(Kind, String)> {
         kinds.iter().map(|k| (*k, value(page_token, *k))).collect()
     };
-    match decoy_v.unwrap_or(0) {
+    const DOTENV: [Kind; 7] = [
+        Kind::AppKey,
+        Kind::DbPassword,
+        Kind::RedisPassword,
+        Kind::MailPassword,
+        Kind::AwsKey,
+        Kind::AwsSecret,
+        Kind::AdminPassword,
+    ];
+    let ver = decoy_v.unwrap_or(0);
+    if ver >= 2 && decoy.starts_with("mcp:") {
+        let d = crate::trap::decoy::ai::DecoyIn::parse(decoy_in);
+        return match (decoy, d.tool.as_deref(), d.cls.as_deref()) {
+            ("mcp:initialize" | "mcp:sse", _, _) => v(&[Kind::McpSession]),
+            ("mcp:tools/call", Some("read_file"), Some(c)) | ("mcp:resources/read", _, Some(c)) => {
+                match c {
+                    "dotenv" => v(&DOTENV),
+                    "aws-credentials" => v(&[Kind::AwsKey, Kind::AwsSecret]),
+                    "git-config" => v(&[Kind::GitToken]),
+                    _ => vec![],
+                }
+            }
+            ("mcp:tools/call", Some("query_db"), Some("select")) => v(&[Kind::AppKey]),
+            _ => vec![],
+        };
+    }
+    match ver {
         0 => {
             let r = v0_ref(page_token);
             match decoy {
@@ -128,16 +177,8 @@ pub fn served(decoy_v: Option<i64>, page_token: &str, decoy: &str) -> Vec<(Kind,
                 _ => vec![],
             }
         }
-        1 => match decoy {
-            "dotenv" => v(&[
-                Kind::AppKey,
-                Kind::DbPassword,
-                Kind::RedisPassword,
-                Kind::MailPassword,
-                Kind::AwsKey,
-                Kind::AwsSecret,
-                Kind::AdminPassword,
-            ]),
+        1 | 2 => match decoy {
+            "dotenv" => v(&DOTENV),
             "git-config" => v(&[Kind::GitToken]),
             "wp-login-ok" => v(&[Kind::WpSession]),
             _ => vec![],
@@ -209,6 +250,31 @@ mod tests {
     }
 
     #[test]
+    fn mcp_session_is_uuid_shaped_and_served_by_initialize_and_sse() {
+        let s = value(TOK, Kind::McpSession);
+        assert_eq!(s.len(), 36, "{s}");
+        let parts: Vec<&str> = s.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
+        assert!(s.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
+        assert_ne!(s, value("another", Kind::McpSession));
+        for name in ["mcp:initialize", "mcp:sse"] {
+            assert_eq!(
+                served(Some(2), TOK, name, None),
+                vec![(Kind::McpSession, s.clone())]
+            );
+        }
+        // Version 2 serves what version 1 did for the old names.
+        assert_eq!(
+            served(Some(2), TOK, "dotenv", None),
+            served(Some(1), TOK, "dotenv", None)
+        );
+        assert!(served(Some(1), TOK, "mcp:initialize", None).is_empty());
+    }
+
+    #[test]
     fn values_are_pinned() {
         // The formula is part of the dataset's contract: these never change
         // without a new decoy version.
@@ -233,34 +299,34 @@ mod tests {
 
     #[test]
     fn served_per_decoy_and_version() {
-        let env = served(Some(1), TOK, "dotenv");
+        let env = served(Some(1), TOK, "dotenv", None);
         assert_eq!(env.len(), 7);
         assert!(
             env.iter()
                 .any(|(k, v)| *k == Kind::AwsKey && v.starts_with("AKIA"))
         );
         assert_eq!(
-            served(Some(1), TOK, "git-config"),
+            served(Some(1), TOK, "git-config", None),
             vec![(Kind::GitToken, value(TOK, Kind::GitToken))]
         );
         assert_eq!(
-            served(Some(1), TOK, "wp-login-ok"),
+            served(Some(1), TOK, "wp-login-ok", None),
             vec![(Kind::WpSession, value(TOK, Kind::WpSession))]
         );
-        assert!(served(Some(1), TOK, "phpinfo").is_empty());
-        assert!(served(Some(1), TOK, "wp-login-failed").is_empty());
+        assert!(served(Some(1), TOK, "phpinfo", None).is_empty());
+        assert!(served(Some(1), TOK, "wp-login-failed", None).is_empty());
         assert!(
-            served(Some(9), TOK, "dotenv").is_empty(),
+            served(Some(9), TOK, "dotenv", None).is_empty(),
             "unknown versions serve nothing known"
         );
         let r = v0_ref(TOK);
         assert_eq!(r, "0f8e7d6c5b4a");
-        let old = served(None, TOK, "dotenv");
+        let old = served(None, TOK, "dotenv", None);
         assert!(old.contains(&(Kind::Legacy, format!("canary-{r}"))));
         assert!(old.contains(&(Kind::Legacy, "AKIACANARY0F8E7D6C5B".to_string())));
         assert!(old.contains(&(Kind::Legacy, format!("canary/{r}/not+a+real+secret"))));
         assert_eq!(
-            served(Some(0), TOK, "git-config"),
+            served(Some(0), TOK, "git-config", None),
             vec![(Kind::Legacy, format!("canary-{r}"))]
         );
     }
