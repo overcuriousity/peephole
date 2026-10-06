@@ -80,7 +80,8 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
     let node = node(st)?;
     let owned = owner::load(&node.store, node.id()).await?;
     let check = rules_check(st, node).await?;
-    let (me, members) = views(node, &check).await?;
+    let book = crate::credits::book(node).await?;
+    let (me, members) = views(node, &check, Some(&book)).await?;
     let sibs: Vec<String> = fleet::siblings(&node.store)
         .await?
         .iter()
@@ -90,7 +91,6 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
         .iter()
         .map(|m| (m.key.clone(), m.name.clone()))
         .collect();
-    let book = crate::credits::book(node).await?;
     let row = |m: &MemberView| NodeRow {
         credits: NodeId::parse(&m.key)
             .map(|id| crate::credits::show(book.balance(&id)))

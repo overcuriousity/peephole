@@ -51,6 +51,10 @@ pub struct MemberView {
     pub sibling: bool,
     /// A sibling this node can command: it keeps the ownership key.
     pub managed: bool,
+    /// Its credits in this node's count ("5.00"); empty when not loaded.
+    pub balance: String,
+    /// Why its shares do not count in full here; empty: it earns.
+    pub not_earning: Vec<String>,
     pub is_self: bool,
     pub version: String,
     pub last_seen: String,
@@ -94,11 +98,8 @@ impl MemberView {
         if let Some(s) = &self.skew {
             v.push(format!("clock {s}"));
         }
-        if self.rules_differ {
-            v.push(format!("rules: {}", self.rules));
-        }
-        if self.ruleset_same == Some(false) {
-            v.push("records with other rules".to_string());
+        if !self.not_earning.is_empty() {
+            v.push(format!("not earning here: {}", self.not_earning.join("; ")));
         }
         if let Some(e) = self.error.as_ref().filter(|_| !self.incompatible) {
             v.push(e.clone());
@@ -238,6 +239,7 @@ pub(crate) fn node(st: &AdminState) -> AppResult<&Arc<Node>> {
 pub(crate) async fn views(
     node: &Node,
     check: &RulesCheck,
+    book: Option<&crate::credits::Book>,
 ) -> AppResult<(MemberView, Vec<MemberView>)> {
     let rows = members::all(&node.store).await?;
     let heads = repl::head_map(&repl::heads(&node.store).await?);
@@ -319,6 +321,12 @@ pub(crate) async fn views(
             purged: purged.contains(&m.id),
             sibling: sibs.contains(&m.id),
             managed: managing && sibs.contains(&m.id),
+            balance: book
+                .map(|b| crate::credits::show(b.balance(&m.id)))
+                .unwrap_or_default(),
+            not_earning: book
+                .map(|b| b.standing(&m.id).reasons())
+                .unwrap_or_default(),
             is_self,
             version: hb.map(|h| h.version.clone()).unwrap_or_else(|| {
                 if is_self {
@@ -379,6 +387,10 @@ pub(crate) async fn views(
         purged: false,
         sibling: false,
         managed: false,
+        balance: book
+            .map(|b| crate::credits::show(b.balance(&me)))
+            .unwrap_or_default(),
+        not_earning: book.map(|b| b.standing(&me).reasons()).unwrap_or_default(),
         is_self: true,
         version: crate::VERSION.into(),
         last_seen: "this node".into(),
@@ -411,7 +423,7 @@ pub(crate) async fn scanner_rows(st: &AdminState) -> AppResult<Vec<MemberView>> 
         by_member: Default::default(),
         carried: Default::default(),
     };
-    let (me, members) = views(node, &none).await?;
+    let (me, members) = views(node, &none, None).await?;
     Ok(std::iter::once(me)
         .filter(|m| m.scanner)
         .chain(members.into_iter().filter(|m| m.scanner && m.active))
@@ -674,7 +686,8 @@ async fn render_page(st: &AdminState) -> AppResult<Html<String>> {
         });
     };
     let check = rules_check(st, node).await?;
-    let (me, members) = views(node, &check).await?;
+    let book = crate::credits::book(node).await?;
+    let (me, members) = views(node, &check, Some(&book)).await?;
     let contrib = contributions(node).await?;
     let (shares, unshared) = share_cells(&contrib);
     render(&ClusterPage {
@@ -932,6 +945,70 @@ enum Remote {
     Offline,
 }
 
+/// A member's credits as this node counts them.
+pub struct CreditsBlock {
+    pub balance: String,
+    pub earns: bool,
+    /// Every reason it does not earn in full here.
+    pub reasons: Vec<String>,
+    /// Audits of its scans over 7 days as `(agrees, differs,
+    /// inconclusive)`: by this node and its fleet (they count), and by
+    /// other members (shown only).
+    pub counted: (u32, u32, u32),
+    pub others: (u32, u32, u32),
+    /// Where it showed two histories, and the proof if one is known.
+    pub fork: Option<String>,
+}
+
+async fn credits_block(node: &Node, id: NodeId) -> AppResult<CreditsBlock> {
+    use crate::credits::audit::Outcome;
+    let book = crate::credits::book(node).await?;
+    let standing = book.standing(&id);
+    let mut auditors = crate::cluster::owner::fleet::siblings(&node.store).await?;
+    auditors.push(node.id());
+    let week = crate::cluster::hlc::wall_ms().saturating_sub(7 * crate::credits::DAY_MS) << 16;
+    let (mut counted, mut others) = ((0, 0, 0), (0, 0, 0));
+    for c in crate::credits::audit::counts(&node.store.pool, week).await? {
+        if c.scanner != id {
+            continue;
+        }
+        let t = if auditors.contains(&c.auditor) {
+            &mut counted
+        } else {
+            &mut others
+        };
+        match c.outcome {
+            Outcome::Agrees => t.0 += c.n,
+            Outcome::Differs => t.1 += c.n,
+            Outcome::Inconclusive => t.2 += c.n,
+        }
+    }
+    let members = node.members();
+    let fork = crate::cluster::seal::forked(&node.store.pool)
+        .await?
+        .into_iter()
+        .find(|f| f.origin == id)
+        .map(|f| match f.proof {
+            Some((by, seq)) => format!(
+                "two entries at position {} of its log; proof published by {} (entry {seq} of its log)",
+                f.seq,
+                members.get(&by).map_or_else(|| by.short(), |m| m.name.clone())
+            ),
+            None => format!(
+                "its seal at entry {} does not match its log as held here; no proof yet",
+                f.seq
+            ),
+        });
+    Ok(CreditsBlock {
+        balance: crate::credits::show(book.balance(&id)),
+        earns: standing.earns_as_scanner(),
+        reasons: standing.reasons(),
+        counted,
+        others,
+        fork,
+    })
+}
+
 #[derive(Template)]
 #[template(path = "admin_cluster_node.html")]
 struct NodePage {
@@ -939,6 +1016,7 @@ struct NodePage {
     m: MemberView,
     contrib: Vec<ContribView>,
     remote: Remote,
+    credits: CreditsBlock,
 }
 
 /// Whether a node page asks the member for its status: only a live,
@@ -954,7 +1032,8 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
         return Err(AppError::NotFound);
     };
     let check = rules_check(st, node).await?;
-    let (me, members) = views(node, &check).await?;
+    let book = crate::credits::book(node).await?;
+    let (me, members) = views(node, &check, Some(&book)).await?;
     let all: Vec<MemberView> = std::iter::once(me).chain(members).collect();
     let key = id.to_string();
     let Some(m) = all.iter().find(|m| m.key == key).cloned() else {
@@ -1022,6 +1101,7 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
     };
     render(&NodePage {
         chrome: Chrome::new(true, "admin"),
+        credits: credits_block(node, id).await?,
         m,
         contrib,
         remote,
@@ -1356,6 +1436,36 @@ mod tests {
         }
     }
 
+    /// A member is flagged for its rules only when it does not earn here;
+    /// another fingerprint or a few differing requests are information.
+    #[test]
+    fn issues_name_what_stops_a_member_from_earning() {
+        let other_build = MemberView {
+            ruleset_same: Some(false),
+            rules_differ: true,
+            rules: "disagree on <1% of 500".into(),
+            ..Default::default()
+        };
+        assert!(
+            other_build.issues().is_empty(),
+            "{:?}",
+            other_build.issues()
+        );
+        let gated = MemberView {
+            not_earning: vec![
+                "rules: disagree on 12% of 500".into(),
+                "showed two histories (at entry 7 of its log)".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            gated.issues(),
+            [
+                "not earning here: rules: disagree on 12% of 500; showed two histories (at entry 7 of its log)"
+            ]
+        );
+    }
+
     #[test]
     fn issues_list_what_needs_a_look() {
         let ok = MemberView {
@@ -1367,20 +1477,9 @@ mod tests {
             incompatible: true,
             error: Some("incompatible protocol 3".into()),
             skew: Some("+3.5 min".into()),
-            rules_differ: true,
-            rules: "disagree on 12% of 500".into(),
-            ruleset_same: Some(false),
             ..Default::default()
         };
-        assert_eq!(
-            bad.issues(),
-            [
-                "incompatible version",
-                "clock +3.5 min",
-                "rules: disagree on 12% of 500",
-                "records with other rules",
-            ]
-        );
+        assert_eq!(bad.issues(), ["incompatible version", "clock +3.5 min"]);
         let err = MemberView {
             error: Some("connection refused".into()),
             ..Default::default()

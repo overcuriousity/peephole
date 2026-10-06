@@ -5452,3 +5452,41 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
         10_000 - cost - 500
     );
 }
+
+/// The Members table and a member's page say whether it earns here, why
+/// not, and what audits found.
+#[tokio::test]
+async fn a_members_page_says_whether_it_earns_here() {
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
+    grant_scans(&[&na], b.id, 4).await;
+    let (admin, base) = admin_on(&na).await;
+    let page = format!("{base}/admin/cluster/node/{}", b.id);
+    let html = text(&admin, page.clone()).await;
+    assert!(html.contains("Credits") && html.contains("5.00"), "{html}");
+    assert!(
+        html.contains("Earns here") && html.contains(">yes<"),
+        "{html}"
+    );
+    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    assert!(!members.contains("not earning here"));
+
+    // b showed two histories (marked as the seal check would).
+    sqlx::query("INSERT INTO forked (origin, seq, found_at) VALUES (?, 7, datetime('now'))")
+        .bind(&b.id.0[..])
+        .execute(&na.store.pool)
+        .await
+        .unwrap();
+    // The page reads a book of at most ten seconds ago: compute one now.
+    peephole::credits::book_fresh(&na.node).await.unwrap();
+    let html = text(&admin, page).await;
+    assert!(html.contains("showed two histories"), "{html}");
+    assert!(html.contains(">no<") && html.contains("0.00"));
+    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    assert!(
+        members.contains("not earning here: showed two histories"),
+        "{members}"
+    );
+}

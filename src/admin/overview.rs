@@ -170,7 +170,8 @@ async fn signals(st: &AdminState) -> AppResult<Signals> {
 /// last error is left out: "not seen" says it already.
 async fn members(st: &AdminState, node: &crate::cluster::Node) -> AppResult<Vec<NodeState>> {
     let check = crate::admin::cluster::rules_check(st, node).await?;
-    let (_, members) = crate::admin::cluster::views(node, &check).await?;
+    let book = crate::credits::book(node).await?;
+    let (_, members) = crate::admin::cluster::views(node, &check, Some(&book)).await?;
     Ok(members
         .into_iter()
         .filter(|m| m.active && !m.blocked)
