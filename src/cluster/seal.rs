@@ -190,14 +190,19 @@ pub(crate) async fn check(
     if seal.digest.len() != 32 || seal.from > e.seq {
         return Ok(SealState::Inconsistent);
     }
-    let prev = head(conn, &e.origin).await?.filter(|p| *p < e.seq);
+    // A head below the floor is from before a gap this node skipped (a long
+    // absence, a purge): what came between is not here, so it says nothing.
+    let floor = super::history::floor_of(conn, &e.origin).await?;
+    let prev = head(conn, &e.origin)
+        .await?
+        .filter(|p| *p < e.seq && *p >= floor);
     if seal.from == e.seq {
         // "My first sealing entry."
         if prev.is_some() {
             return Ok(SealState::Inconsistent);
         }
         // An earlier one may lie below what this node holds.
-        if super::history::floor_of(conn, &e.origin).await? > 1 {
+        if floor > 1 {
             return Ok(SealState::Unchecked);
         }
         return Ok(if seal.digest == empty() {
@@ -722,6 +727,39 @@ mod tests {
         let e = sealing(&id, 11, first.clone());
         assert_eq!(
             check(&mut conn, &e, &first).await.unwrap(),
+            SealState::Unchecked
+        );
+    }
+
+    /// A node that skipped part of an origin's log (long offline, or a
+    /// purge and an unblock) still holds the origin's last sealing entry
+    /// from before the gap: a later seal naming one past it is not a fork.
+    #[tokio::test]
+    async fn a_seal_head_below_the_floor_is_not_a_fork() {
+        let (store, _dir) = store().await;
+        let mut conn = store.pool.acquire().await.unwrap();
+        let id = Identity::generate().unwrap();
+        for seq in 1..=2 {
+            put(&mut conn, &filler(&id, seq), true).await;
+        }
+        let first = Seal {
+            from: 3,
+            digest: empty().to_vec(),
+        };
+        put_sealing(&mut conn, &sealing(&id, 3, first)).await;
+        crate::cluster::history::raise_floor(&mut conn, &id.id, 50)
+            .await
+            .unwrap();
+        for seq in 50..60 {
+            put(&mut conn, &filler(&id, seq), true).await;
+        }
+        let past_the_gap = Seal {
+            from: 40,
+            digest: vec![5; 32],
+        };
+        let e = sealing(&id, 60, past_the_gap.clone());
+        assert_eq!(
+            check(&mut conn, &e, &past_the_gap).await.unwrap(),
             SealState::Unchecked
         );
     }
