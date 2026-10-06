@@ -1699,6 +1699,75 @@ mod tests {
     }
 
     #[test]
+    fn gateway_paths_and_key_use() {
+        for p in [
+            "/api/v1/chat/completions",
+            "/api/v1/models",
+            "/anthropic/v1/messages",
+            "/api/anthropic/v1/messages",
+            "/litellm/v1/models",
+            "/v1/complete",
+        ] {
+            let v = classifier().classify(
+                &view("GET", p, None, "curl/8", None),
+                &hist(1, 1),
+                &BotTells::default(),
+            );
+            assert!(
+                v.labels.iter().any(|l| l == "ai-infra-probe"),
+                "{p}: {:?}",
+                v.labels
+            );
+        }
+        let with_key = |method: &str, path: &str, header: (&str, &str)| {
+            let mut view = view(
+                method,
+                path,
+                None,
+                "python-httpx/0.27",
+                Some(br#"{"model":"gpt-4o"}"#),
+            );
+            view.headers.push((header.0.into(), header.1.into()));
+            classifier().classify(&view, &hist(1, 1), &BotTells::default())
+        };
+        for (p, h) in [
+            (
+                "/v1/chat/completions",
+                ("Authorization", "Bearer sk-proj-x"),
+            ),
+            ("/v1/messages", ("x-api-key", "sk-ant-api03-x")),
+            ("/v1/responses", ("api-key", "0123456789abcdef")),
+            (
+                "/openai/deployments/gpt4/chat/completions",
+                ("api-key", "abc"),
+            ),
+        ] {
+            let v = with_key("POST", p, h);
+            assert!(
+                v.labels.iter().any(|l| l == "llm-key-use"),
+                "{p}: {:?}",
+                v.labels
+            );
+            assert_eq!(v.scan_level, 3, "{p}");
+        }
+        let v = classifier().classify(
+            &view("POST", "/v1/chat/completions", None, "curl/8", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(
+            !v.labels.iter().any(|l| l == "llm-key-use"),
+            "no key, no key use"
+        );
+        let v = with_key("GET", "/", ("Authorization", "Bearer abc123"));
+        assert!(
+            !v.labels.iter().any(|l| l == "llm-key-use"),
+            "non-sk bearer: {:?}",
+            v.labels
+        );
+    }
+
+    #[test]
     fn ai_infrastructure_probes_are_level_2() {
         for p in [
             "/v1/models",
