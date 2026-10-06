@@ -6,6 +6,7 @@ pub mod earn;
 pub mod entries;
 pub mod gates;
 pub mod ledger;
+pub mod share;
 
 /// Millicredits: 1 credit = 1000 mc. Sums are `u64`, amounts on the wire
 /// `u32`.

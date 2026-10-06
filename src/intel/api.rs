@@ -448,6 +448,16 @@ impl<S: Service> Provider for ApiProvider<S> {
         self.svc.name()
     }
 
+    fn per_day(&self) -> Option<f64> {
+        self.limits
+            .iter()
+            .map(|l| match l.period {
+                Period::Day => l.max as f64,
+                Period::Week => l.max as f64 / 7.0,
+            })
+            .reduce(f64::min)
+    }
+
     fn ready(&self) -> bool {
         let now = Utc::now();
         let st = self.state.lock().unwrap();
@@ -757,5 +767,36 @@ pub(crate) mod tests {
         assert!(v.get("vulns").is_none());
         let small = serde_json::json!({"ports": [22]});
         assert_eq!(fit(small.clone()), small);
+    }
+
+    #[tokio::test]
+    async fn the_budget_per_day_is_the_tightest_limit() {
+        struct Svc;
+        impl Service for Svc {
+            fn name(&self) -> &'static str {
+                "abuseipdb"
+            }
+            fn request(&self, client: &reqwest::Client, _ip: &str) -> reqwest::RequestBuilder {
+                client.get("http://127.0.0.1:9/")
+            }
+            fn parse(&self, _status: StatusCode, _body: &[u8]) -> Option<serde_json::Value> {
+                None
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let day = |max| Limit {
+            period: Period::Day,
+            max,
+        };
+        let week = |max| Limit {
+            period: Period::Week,
+            max,
+        };
+        let p = |limits| ApiProvider::new(Svc, store.clone(), limits, 30.0);
+        assert_eq!(p(vec![]).per_day(), None, "no local limit");
+        assert_eq!(p(vec![day(1000)]).per_day(), Some(1000.0));
+        assert_eq!(p(vec![week(70)]).per_day(), Some(10.0));
+        assert_eq!(p(vec![day(25), week(70)]).per_day(), Some(10.0));
     }
 }

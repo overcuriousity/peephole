@@ -274,6 +274,8 @@ pub struct Node {
     providers: RwLock<Vec<String>>,
     /// This node's provider objects, for on-demand lookups members ask for.
     lookup_providers: std::sync::OnceLock<crate::intel::Providers>,
+    /// The on-demand share of each provider budget (see `credits::share`).
+    lookup_shares: std::sync::OnceLock<crate::credits::share::Shares>,
     /// On-demand API lookups served per asking member: `(UTC day, count)`.
     lookup_budget: Mutex<HashMap<NodeId, (String, u32)>>,
     pub data_dir: std::path::PathBuf,
@@ -336,6 +338,7 @@ impl Node {
             members_changed: tokio::sync::Notify::new(),
             providers: RwLock::new(vec![]),
             lookup_providers: Default::default(),
+            lookup_shares: Default::default(),
             lookup_budget: Mutex::new(HashMap::new()),
             data_dir: p.data_dir,
             status: Default::default(),
@@ -480,6 +483,14 @@ impl Node {
 
     pub fn lookup_providers(&self) -> Option<&crate::intel::Providers> {
         self.lookup_providers.get()
+    }
+
+    pub fn set_lookup_shares(&self, s: crate::credits::share::Shares) {
+        let _ = self.lookup_shares.set(s);
+    }
+
+    pub fn lookup_shares(&self) -> Option<&crate::credits::share::Shares> {
+        self.lookup_shares.get()
     }
 
     /// Take `n` of `peer`'s on-demand API lookups for today; `false` when

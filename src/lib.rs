@@ -170,6 +170,10 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let providers = intel::providers(&cfg, &store, &geo, &tor);
     if let Some(n) = &node {
         n.set_lookup_providers(providers.clone());
+        n.set_lookup_shares(credits::share::Shares::new(
+            store.clone(),
+            cfg.enrichment.on_demand_share,
+        ));
     }
     tokio::spawn(intel::enrich_loop(
         recorder.clone(),

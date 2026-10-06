@@ -88,6 +88,10 @@ license_key = "testkey"
 # is never looked up again. 0 = never again.
 refresh_after_days = 30
 
+# Cluster only: the part of each API provider's budget that paid lookups of
+# other members (and your own on-demand lookups) may use. 0.2 = a fifth.
+# on_demand_share = 0.2
+
 # [credits]
 # # Cluster only. A scanner runs this share of the other nodes' fresh scans
 # # again to check them (audits earn nothing; 0 = audit nothing).

@@ -66,17 +66,36 @@ pub struct EnrichmentConfig {
     /// seen `N × 1.5^(k−1)` days after the newest one (N = this); 0 never.
     #[serde(default = "default_refresh_days")]
     pub refresh_after_days: f64,
+    /// The part of each API provider's budget that paid on-demand lookups
+    /// may use (0 to 1). Whatever happens to credits, no more than this is
+    /// taken from this node's budgets.
+    #[serde(default = "default_on_demand_share")]
+    pub on_demand_share: f64,
 }
 
 fn default_refresh_days() -> f64 {
     30.0
 }
 
+fn default_on_demand_share() -> f64 {
+    0.2
+}
+
 impl Default for EnrichmentConfig {
     fn default() -> Self {
         Self {
             refresh_after_days: default_refresh_days(),
+            on_demand_share: default_on_demand_share(),
         }
+    }
+}
+
+impl EnrichmentConfig {
+    pub fn check(&self) -> anyhow::Result<()> {
+        if !(0.0..=1.0).contains(&self.on_demand_share) {
+            anyhow::bail!("enrichment.on_demand_share must be between 0 and 1");
+        }
+        Ok(())
     }
 }
 
@@ -561,6 +580,7 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("public", "delay_minutes", "5"),
     ("public", "jitter_minutes", "5"),
     ("public", "recent_rows", "50"),
+    ("enrichment", "on_demand_share", "0.2"),
     ("credits", "audit_share", "0.05"),
 ];
 
@@ -688,6 +708,7 @@ impl Config {
         if !(e == 0.0 || (1.0..=3650.0).contains(&e)) {
             bail!("enrichment.refresh_after_days must be 0 (never) or between 1 and 3650");
         }
+        self.enrichment.check()?;
         self.credits.check()?;
         if let Some(a) = &self.abuseipdb {
             if a.api_key.trim().is_empty() {
@@ -1449,5 +1470,16 @@ data_dir = "/tmp"
                 toml::from_str(&format!("{base}[credits]\naudit_share = {bad}\n")).unwrap();
             assert!(cfg.credits.check().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_on_demand_share_defaults_to_a_fifth() {
+        let base = "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert_eq!(cfg.enrichment.on_demand_share, 0.2);
+        assert_eq!(cfg.enrichment.refresh_after_days, 30.0);
+        let cfg: Config =
+            toml::from_str(&format!("{base}[enrichment]\non_demand_share = 1.5\n")).unwrap();
+        assert!(cfg.enrichment.check().is_err());
     }
 }
