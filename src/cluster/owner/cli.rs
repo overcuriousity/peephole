@@ -13,7 +13,9 @@ pub const USAGE: &str = "usage: peephole owner new [CONFIG]
        peephole owner adopt [--keep] [CONFIG]   (reads the key from standard input;
                                                  --keep: manage other nodes from here)
        peephole owner show [CONFIG]
-       peephole owner forget-key [CONFIG]       (the node stays owned)
+       peephole owner forget-key [--force] [CONFIG]
+                                                (the node stays owned; --force: also
+                                                 while a key rotation is not finished)
        peephole owner release [CONFIG]          (the node has no owner afterwards)";
 
 /// One line from standard input. Typed at a terminal, it is not shown
@@ -52,11 +54,12 @@ fn read_key() -> Result<String> {
 }
 
 pub async fn run(args: &[String], default_config: &str) -> Result<()> {
-    let mut keep = false;
+    let (mut keep, mut force) = (false, false);
     let mut pos: Vec<&str> = vec![];
     for a in args {
         match a.as_str() {
             "--keep" => keep = true,
+            "--force" => force = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -71,6 +74,9 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
     }
     if keep && sub != "adopt" {
         bail!("--keep belongs to `adopt`\n\n{USAGE}");
+    }
+    if force && sub != "forget-key" {
+        bail!("--force belongs to `forget-key`\n\n{USAGE}");
     }
     let cfg = Config::load(Path::new(pos.get(1).copied().unwrap_or(default_config)))?;
     if cfg.cluster.is_none() {
@@ -145,13 +151,33 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 .fetch_one(&store.pool)
                 .await?;
             let unfinished = super::rotation_unfinished(&store).await?;
+            // The keys kept for a rotation are the only way to the nodes it
+            // has moved (when it was cut short) or not moved yet.
+            let stranded = if unfinished {
+                let siblings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM siblings")
+                    .fetch_one(&store.pool)
+                    .await?;
+                format!(
+                    "a key rotation was cut short here: up to {siblings} node(s) may already be \
+                     on the new key"
+                )
+            } else {
+                format!("a key rotation left {waiting} node(s) on the previous key")
+            };
+            if (unfinished || waiting > 0) && !force {
+                bail!(
+                    "{stranded}. Finish the rotation, or retry or give up on those nodes, on \
+                     Cluster › Ownership first. To forget every key kept here anyway: \
+                     peephole owner forget-key --force"
+                );
+            }
             if super::forget_key(&store).await? {
                 println!("the ownership key is no longer kept on this node; it stays owned");
-                if waiting > 0 || unfinished {
+                if unfinished || waiting > 0 {
                     eprintln!(
-                        "warning: a key rotation was not finished here ({waiting} node(s) still \
-                         on the previous key). The keys kept for it are deleted too; give those \
-                         nodes their owner again on the nodes themselves: peephole owner adopt"
+                        "warning: {stranded}. The keys kept for the rotation are deleted too; \
+                         give those nodes their owner again on the nodes themselves: \
+                         peephole owner adopt"
                     );
                 }
             } else {
