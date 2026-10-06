@@ -5379,3 +5379,76 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     assert!(unknown.contains("not kept"));
     assert!(sections(&unknown).is_empty());
 }
+
+/// The Credits page: what this node holds, what it earned and spent, what
+/// everyone holds, and how the price comes about.
+#[tokio::test]
+async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
+    use peephole::credits::{self, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    price::refresh(&na.node).await.unwrap();
+    let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
+    let none: peephole::intel::Providers = vec![];
+    peephole::intel::lookup::cluster(&rec(&na), &none, "203.0.113.99".parse().unwrap()).await;
+    eventually("the receipt is back", || async {
+        let book = credits::book_fresh(&na.node).await.unwrap();
+        book.balance(&a.id) == 10_000 - cost && book.ledger.held(&a.id) == 0
+    })
+    .await;
+    let (admin, base) = admin_on(&na).await;
+    let page = format!("{base}/admin/cluster/credits");
+    let html = text(&admin, page.clone()).await;
+    assert!(html.contains("Credits</a>"), "the tab is there");
+    assert!(
+        html.contains(&credits::show(10_000 - cost)),
+        "the balance: {html}"
+    );
+    assert!(html.contains("expires in 6 days") || html.contains("in 6 days"));
+    // Earned: the granted scans, with what each paid.
+    assert!(html.contains("Earned") && html.contains("1.00") && html.contains("0.25"));
+    // Spent: one lookup at b, charged, half of it destroyed.
+    assert!(html.contains("Spent") && html.contains("node-bravo") && html.contains("charged"));
+    assert!(html.contains("abuseipdb"));
+    // Everyone: b holds its half.
+    assert!(html.contains(&credits::show(cost / 2)));
+    // The price, in words and numbers.
+    assert!(
+        html.contains("earned") && html.contains("credits a day"),
+        "{html}"
+    );
+    assert!(html.contains("lookups a day"));
+
+    // Sending: half a credit to b.
+    let r = admin
+        .post(format!("{page}/send"))
+        .form(&[("to", b.id.to_string()), ("amount", "0.5".into())])
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    eventually("b received it", || async {
+        credits::book_fresh(&nb.node).await.unwrap().balance(&b.id) == cost / 2 + 500
+    })
+    .await;
+    let html = text(&admin, page.clone()).await;
+    assert!(html.contains("Sent and received") && html.contains("0.50"));
+    // More than it holds, and nonsense: nothing moves.
+    for amount in ["500", "abc", "0"] {
+        admin
+            .post(format!("{page}/send"))
+            .form(&[("to", b.id.to_string()), ("amount", amount.into())])
+            .send()
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        credits::book_fresh(&na.node).await.unwrap().balance(&a.id),
+        10_000 - cost - 500
+    );
+}

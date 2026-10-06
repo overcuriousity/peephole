@@ -1,0 +1,389 @@
+//! Cluster › Credits: what this node holds, earned and spent, what every
+//! member holds in this node's view, and how the price comes about.
+use crate::admin::AdminState;
+use crate::admin::auth::SessionUser;
+use crate::admin::cluster::{back_to, node};
+use crate::admin::error::{AppResult, render};
+use crate::admin::views::Chrome;
+use crate::cluster::identity::NodeId;
+use crate::credits::ledger::OfferState;
+use crate::credits::{self, show};
+use askama::Template;
+use axum::{
+    Router,
+    extract::{Form, State},
+    response::{Html, Response},
+    routing::{get, post},
+};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+const PAGE: &str = "/admin/cluster/credits";
+/// Rows shown per list.
+const ROWS: usize = 100;
+
+pub fn routes() -> Router<Arc<AdminState>> {
+    Router::new()
+        .route(PAGE, get(page))
+        .route("/admin/cluster/credits/send", post(send))
+}
+
+/// The date of a lot's day.
+pub fn date_of(day: u32) -> String {
+    chrono::DateTime::from_timestamp(day as i64 * 86_400, 0)
+        .map(|t| t.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// The minute an entry is dated (UTC).
+pub fn when(hlc: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(crate::cluster::hlc::physical_ms(hlc) as i64)
+        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// When a lot of `day` is gone, seen from `today`.
+fn expires_in(day: u32, today: u32) -> String {
+    match (day + credits::LOT_DAYS - 1).saturating_sub(today) {
+        0 => "today".into(),
+        1 => "in 1 day".into(),
+        n => format!("in {n} days"),
+    }
+}
+
+struct DayRow {
+    date: String,
+    amount: String,
+    expires: String,
+}
+
+struct NodeRow {
+    name: String,
+    balance: String,
+    /// Where it forwards its credits, as its transfers of the week show.
+    collects: String,
+}
+
+struct EarnedRow {
+    at: String,
+    /// The scan's page, when the scan is held here.
+    scan: Option<i64>,
+    ip: String,
+    level: u8,
+    role: &'static str,
+    amount: String,
+    note: String,
+}
+
+struct SpentRow {
+    at: String,
+    server: String,
+    providers: String,
+    offered: String,
+    charged: String,
+    destroyed: String,
+    state: &'static str,
+}
+
+struct MovedRow {
+    at: String,
+    from: String,
+    to: String,
+    amount: String,
+    /// It named more than was there.
+    short: bool,
+}
+
+struct MemberRow {
+    key: String,
+    name: String,
+    balance: String,
+    earned: String,
+    spent: String,
+    /// Why it does not earn in full here; empty: it does.
+    standing: String,
+}
+
+struct PriceView {
+    earned_per_day: String,
+    lookups_per_day: String,
+    utilization: String,
+    load: String,
+    unit: Option<String>,
+    /// `(provider label, price, surge, on-demand a day)`.
+    offers: Vec<(String, String, u32, String)>,
+}
+
+#[derive(Template)]
+#[template(path = "admin_cluster_credits.html")]
+struct CreditsPage {
+    chrome: Chrome,
+    balance: String,
+    held: String,
+    days: Vec<DayRow>,
+    /// This node has an owner: its nodes and their total.
+    fleet: Option<(String, Vec<NodeRow>)>,
+    earned: Vec<EarnedRow>,
+    /// Scans that wait to be judged.
+    waiting: i64,
+    spent: Vec<SpentRow>,
+    moved: Vec<MovedRow>,
+    members: Vec<MemberRow>,
+    /// Earned and destroyed over the entries read, and what is in
+    /// circulation now.
+    totals: (String, String, String),
+    price: PriceView,
+    /// `(key, name)` of the members credits can be sent to.
+    receivers: Vec<(String, String)>,
+}
+
+async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
+    let node = node(&st)?;
+    let me = node.id();
+    let book = credits::book_fresh(node).await?;
+    let l = &book.ledger;
+    let members = node.members();
+    let name = |id: &NodeId| {
+        if *id == me {
+            "this node".to_string()
+        } else {
+            members
+                .get(id)
+                .map_or_else(|| id.short(), |m| m.name.clone())
+        }
+    };
+    let siblings = crate::cluster::owner::fleet::siblings(&node.store).await?;
+
+    let days = l
+        .by_day(&me)
+        .into_iter()
+        .map(|(day, mc)| DayRow {
+            date: date_of(day),
+            amount: show(mc),
+            expires: expires_in(day, l.today),
+        })
+        .collect();
+    // Where each of this operator's nodes sent credits last.
+    let last_to: HashMap<NodeId, NodeId> = l.transfers.iter().map(|t| (t.from, t.to)).collect();
+    let fleet = (!siblings.is_empty()).then(|| {
+        let all: Vec<NodeId> = std::iter::once(me)
+            .chain(siblings.iter().copied())
+            .collect();
+        let total: u64 = all.iter().map(|id| book.balance(id)).sum();
+        let rows = all
+            .iter()
+            .map(|id| NodeRow {
+                name: name(id),
+                balance: show(book.balance(id)),
+                collects: match last_to.get(id).filter(|to| all.contains(to)) {
+                    Some(to) => format!("forwards to {}", name(to)),
+                    None => "keeps what it earns".into(),
+                },
+            })
+            .collect();
+        (show(total), rows)
+    });
+
+    let mut earned = vec![];
+    for p in book.paid.iter().rev() {
+        for (who, role, mc, note) in [
+            (p.scan.scanner, "scanner", p.scanner_mc, &p.scanner_note),
+            (p.scan.trap, "trap", p.trap_mc, &p.trap_note),
+        ] {
+            if who != me || earned.len() >= ROWS {
+                continue;
+            }
+            let scan: Option<i64> = sqlx::query_scalar("SELECT id FROM scans WHERE uid = ?")
+                .bind(&p.scan.scan_uid)
+                .fetch_optional(&st.store.read)
+                .await?;
+            earned.push(EarnedRow {
+                at: when(p.scan.hlc),
+                scan,
+                ip: p.scan.ip.clone(),
+                level: p.scan.job_level,
+                role,
+                amount: show(mc),
+                note: note.clone(),
+            });
+        }
+    }
+    let waiting: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scans s JOIN scan_jobs j ON j.uid = s.job_uid
+         WHERE j.status = 'done' AND s.origin = j.scanner AND s.audit_of IS NULL
+           AND (j.scanner = ?1 OR j.origin = ?1) AND s.hlc >= ?2
+           AND NOT EXISTS (SELECT 1 FROM credit_scans c WHERE c.job_uid = j.uid)",
+    )
+    .bind(&me.0[..])
+    .bind(crate::cluster::hlc::to_db(credits::window_start(
+        book.now_ms,
+    )))
+    .fetch_one(&st.store.read)
+    .await?;
+
+    let spent = l
+        .offers
+        .iter()
+        .rev()
+        .filter(|o| o.payer == me)
+        .take(ROWS)
+        .map(|o| {
+            let (charged, destroyed, state) = match &o.state {
+                OfferState::Open => (0, 0, "open"),
+                OfferState::Lapsed => (0, 0, "lapsed"),
+                OfferState::Charged {
+                    charged, destroyed, ..
+                } => (
+                    *charged,
+                    *destroyed,
+                    if o.covered < o.offered {
+                        "charged (not fully covered at the server)"
+                    } else {
+                        "charged"
+                    },
+                ),
+            };
+            SpentRow {
+                at: when(o.hlc),
+                server: name(&o.to),
+                providers: o.answered.join(", "),
+                offered: show(o.offered),
+                charged: show(charged),
+                destroyed: show(destroyed),
+                state,
+            }
+        })
+        .collect();
+    let moved = l
+        .transfers
+        .iter()
+        .rev()
+        .filter(|t| t.from == me || t.to == me)
+        .take(ROWS)
+        .map(|t| MovedRow {
+            at: when(t.hlc),
+            from: name(&t.from),
+            to: name(&t.to),
+            amount: show(t.moved),
+            short: t.moved < t.named,
+        })
+        .collect();
+
+    let mut rows: Vec<MemberRow> = members
+        .values()
+        .filter(|m| m.active)
+        .map(|m| {
+            let t = l.tally(&m.id);
+            MemberRow {
+                key: m.id.to_string(),
+                name: name(&m.id),
+                balance: show(book.balance(&m.id)),
+                earned: show(t.earned),
+                spent: show(t.spent),
+                standing: book.standing(&m.id).reasons().join("; "),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    let totals = (
+        show(l.tallies.values().map(|t| t.earned).sum()),
+        show(l.tallies.values().map(|t| t.destroyed).sum()),
+        show(l.circulating()),
+    );
+
+    let t = node.price_table();
+    let label = |p: &str| {
+        crate::intel::provider_info(p)
+            .map(|i| i.label.to_string())
+            .unwrap_or_else(|| p.to_string())
+    };
+    let price = PriceView {
+        earned_per_day: show(t.earned_per_day),
+        lookups_per_day: format!("{:.0}", t.lookups_per_day),
+        utilization: format!("{:.0}", t.capacity.utilization * 100.0),
+        load: format!("{:.2}", t.load),
+        unit: t.unit.map(show),
+        offers: t
+            .offers
+            .iter()
+            .map(|o| {
+                (
+                    label(&o.provider),
+                    if o.price_mc == 0 {
+                        "free".into()
+                    } else {
+                        show(o.price_mc as u64)
+                    },
+                    o.surge,
+                    o.on_demand
+                        .map_or_else(|| "no limit".to_string(), |n| n.to_string()),
+                )
+            })
+            .collect(),
+    };
+    let receivers = members
+        .values()
+        .filter(|m| m.active && m.id != me && !node.is_blocked(&m.id))
+        .map(|m| (m.id.to_string(), m.name.clone()))
+        .collect();
+    render(&CreditsPage {
+        chrome: Chrome::new(true, "admin"),
+        balance: show(book.balance(&me)),
+        held: show(l.held(&me)),
+        days,
+        fleet,
+        earned,
+        waiting,
+        spent,
+        moved,
+        members: rows,
+        totals,
+        price,
+        receivers,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct SendForm {
+    to: String,
+    amount: String,
+}
+
+async fn send(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Form(f): Form<SendForm>,
+) -> AppResult<Response> {
+    let node = node(&st)?;
+    let (Ok(to), Some(mc)) = (NodeId::parse(&f.to), credits::parse_amount(&f.amount)) else {
+        return Ok(back_to(
+            PAGE,
+            None,
+            Some("Choose a member and an amount like 0.5.".into()),
+        ));
+    };
+    Ok(match crate::credits::fleet::send(node, to, mc).await {
+        Ok(sent) => back_to(
+            PAGE,
+            Some(format!("Sent {} credits to {}.", show(sent), to.short())),
+            None,
+        ),
+        Err(e) => back_to(PAGE, None, Some(format!("Not sent: {e:#}"))),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn days_and_times_read_as_utc() {
+        // 2026-10-06 is day 20_732 of the epoch.
+        assert_eq!(date_of(20_732), "2026-10-06");
+        let noon = (20_732u64 * 86_400_000 + 12 * 3_600_000 + 34 * 60_000) << 16;
+        assert_eq!(when(noon), "2026-10-06 12:34");
+        assert_eq!(expires_in(20_732, 20_732), "in 6 days");
+        assert_eq!(expires_in(20_727, 20_732), "in 1 day");
+        assert_eq!(expires_in(20_726, 20_732), "today");
+    }
+}

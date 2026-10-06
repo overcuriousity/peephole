@@ -276,6 +276,7 @@ pub const CLUSTER_TABS: &[(&str, &str, &str)] = &[
     ("members", "/admin/cluster", "Members"),
     ("access", "/admin/cluster/access", "Access"),
     ("ownership", "/admin/cluster/ownership", "Ownership"),
+    ("credits", "/admin/cluster/credits", "Credits"),
 ];
 pub const SYSTEM_TABS: &[(&str, &str, &str)] = &[
     ("status", "/admin/system", "Status"),
