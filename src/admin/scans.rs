@@ -376,6 +376,10 @@ struct ScanPage {
     ports: Vec<PortRow>,
     keys: Vec<crate::store::hostkeys::HostKeyRow>,
     can_delete: bool,
+    /// When this scan is an audit: the page of the scan it checks.
+    audit_of: Option<i64>,
+    /// Audits of this scan: `(auditor, result)`.
+    audits: Vec<(String, String)>,
 }
 
 async fn scan_page(
@@ -387,12 +391,38 @@ async fn scan_page(
         return Err(AppError::NotFound);
     };
     let ports = st.store.ports_for_scan(id).await?;
+    let audit_of: Option<i64> = match &s.audit_of {
+        Some(uid) => {
+            sqlx::query_scalar("SELECT id FROM scans WHERE uid = ?")
+                .bind(uid)
+                .fetch_optional(&st.store.read)
+                .await?
+        }
+        None => None,
+    };
+    let audits: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT (SELECT name FROM members m WHERE m.id = a.origin), a.audit_result
+         FROM scans a WHERE a.audit_of = (SELECT uid FROM scans WHERE id = ?) ORDER BY a.id",
+    )
+    .bind(id)
+    .fetch_all(&st.store.read)
+    .await?;
     render(&ScanPage {
         chrome: chrome(),
         s,
         ports,
         keys: st.store.host_keys_for_scan(id).await?,
         can_delete: st.can_delete(),
+        audit_of,
+        audits: audits
+            .into_iter()
+            .map(|(n, r)| {
+                (
+                    n.unwrap_or_else(|| "another node".into()),
+                    r.unwrap_or_else(|| "not compared yet".into()),
+                )
+            })
+            .collect(),
     })
 }
 

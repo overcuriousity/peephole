@@ -5490,3 +5490,24 @@ async fn a_members_page_says_whether_it_earns_here() {
         "{members}"
     );
 }
+
+/// Overview shows the cluster's figures from this node's view.
+#[tokio::test]
+async fn the_overview_shows_the_clusters_credit_figures() {
+    use peephole::credits::price;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&na, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na], a.id, 112).await;
+    price::refresh(&na.node).await.unwrap();
+    let (admin, base) = admin_on(&na).await;
+    let html = text(&admin, format!("{base}/admin")).await;
+    assert!(html.contains("2 of 2 members earn here"), "{html}");
+    assert!(html.contains("140.00"), "credits in circulation");
+    assert!(html.contains("20.00"), "earned a day");
+    assert!(html.contains("200"), "weighted lookups a day");
+    assert!(html.contains("0.40"), "the unit price: saturated, double");
+    assert!(html.contains("Forks") && html.contains("Audits"));
+}

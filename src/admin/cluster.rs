@@ -85,6 +85,10 @@ pub struct MemberView {
     pub ruleset: String,
     /// Whether that newest fingerprint is ours; None without one.
     pub ruleset_same: Option<bool>,
+    /// Scans an hour it can do and did ("20.0"), and which setting binds it.
+    pub can_do: String,
+    pub did: String,
+    pub limited_by: &'static str,
 }
 
 impl MemberView {
@@ -363,6 +367,9 @@ pub(crate) async fn views(
                 .is_some_and(|e| e.contains("incompatible protocol")),
             error,
             skew: known.as_ref().and_then(clock_skew),
+            can_do: String::new(),
+            did: String::new(),
+            limited_by: "",
         };
         if is_self {
             mine = Some(v);
@@ -407,6 +414,9 @@ pub(crate) async fn views(
         skew: None,
         rules: String::new(),
         rules_differ: false,
+        can_do: String::new(),
+        did: String::new(),
+        limited_by: "",
     });
     Ok((mine, out))
 }
@@ -424,10 +434,25 @@ pub(crate) async fn scanner_rows(st: &AdminState) -> AppResult<Vec<MemberView>> 
         carried: Default::default(),
     };
     let (me, members) = views(node, &none, None).await?;
-    Ok(std::iter::once(me)
+    let rows: Vec<MemberView> = std::iter::once(me)
         .filter(|m| m.scanner)
         .chain(members.into_iter().filter(|m| m.scanner && m.active))
-        .collect())
+        .collect();
+    let left_out = std::collections::HashSet::new();
+    let cap =
+        crate::credits::price::capacity(&crate::credits::price::scanners(node, &left_out).await?);
+    let mut rows = rows;
+    for m in rows.iter_mut() {
+        if let Some(c) = cap.scanners.iter().find(|c| c.node.to_string() == m.key) {
+            m.can_do = format!("{:.1}", c.can_do);
+            m.did = format!("{:.1}", c.did);
+            m.limited_by = match c.limited_by {
+                crate::credits::price::Limit::Workers => "workers",
+                crate::credits::price::Limit::PerHour => "scans per hour",
+            };
+        }
+    }
+    Ok(rows)
 }
 
 /// How much history this node keeps, and from when it holds it.

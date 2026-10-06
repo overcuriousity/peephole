@@ -37,7 +37,7 @@
   {% endif %}
   {% if adm.scans.is_empty() %}<p class="muted">{% if adm.jobs.is_empty() %}Never queued for a counter-scan.{% else %}No completed scan yet.{% endif %}</p>{% endif %}
   {% for sc in adm.scans %}
-    <h3>Level {{ sc.s.level }} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {{ sc.s.os_guess.as_deref().unwrap_or("OS unknown") }} · {{ sc.s.open_ports }} open
+    <h3>Level {{ sc.s.level }}{% if sc.s.audit_of.is_some() %} <span class="badge badge-status" data-status="queued">audit{% if let Some(r) = sc.s.audit_result %}: {{ r }}{% endif %}</span>{% endif %} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {{ sc.s.os_guess.as_deref().unwrap_or("OS unknown") }} · {{ sc.s.open_ports }} open
       {% if let Some(n) = sc.s.node %}· <span class="muted">{{ n }}</span> {% endif %}· <a href="/admin/scans/{{ sc.s.id }}">details</a> · <a href="/admin/scans/{{ sc.s.id }}/xml">raw XML</a></h3>
     {% let ports = sc.ports %}{% include "_ports.html" %}
   {% endfor %}
