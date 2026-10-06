@@ -3981,6 +3981,28 @@ async fn admin_manages_a_sibling_from_its_page() {
         .unwrap();
     assert!(r.status().is_success());
     assert_eq!(na.settings.snapshot().cooldown_hours, 6);
+    // Where it forwards its credits is set here too (spec §9), and
+    // cleared with an empty field.
+    let page = text(&admin, format!("{base}/admin/system/settings")).await;
+    assert!(page.contains("name=\"collect_to\""), "{page}");
+    for (to, want) in [(b.id.to_string(), Some(b.id)), (String::new(), None)] {
+        let shown = na.settings.snapshot().version;
+        let r = admin
+            .post(format!("{base}/admin/cluster/settings"))
+            .form(&[
+                ("base_version", shown.to_string()),
+                ("cooldown_hours", "6".into()),
+                ("listener", "on".into()),
+                ("scanner", "on".into()),
+                ("web", "on".into()),
+                ("collect_to", to),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        assert_eq!(na.settings.snapshot().collect_to, want);
+    }
 
     // A crafted form cannot aim an owner command at this node itself, or
     // at a member that is not one of the operator's nodes.

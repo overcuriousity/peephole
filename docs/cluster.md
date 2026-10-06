@@ -178,6 +178,8 @@ the cluster asked for: completed counter-scans.
 - **Your nodes as one.** `Cluster › Ownership › Collect credits here`
   makes one node of yours the collecting node: the others forward what
   they earn and draw from it when a lookup needs more than they hold.
+  Each node can also be pointed there itself: `System › Settings › Collect credits at`
+  or `peephole settings set credits.collect_to <key>`.
 - **Two histories.** A node that gives two members different entries at
   one position of its log is found out with its next payment: its entries
   carry seals over its log. Members that hold the proof show "showed two

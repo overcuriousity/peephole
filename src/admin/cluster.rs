@@ -175,6 +175,8 @@ pub struct SettingsView {
     pub listener_missing: String,
     pub scanner_missing: String,
     pub web_missing: String,
+    /// In a cluster: the node it forwards its credits to ("" = none).
+    pub collect_to: Option<String>,
 }
 
 impl SettingsView {
@@ -190,6 +192,10 @@ impl SettingsView {
             listener_missing: p.listener.clone().unwrap_or_default(),
             scanner_missing: p.scanner.clone().unwrap_or_default(),
             web_missing: p.web.clone().unwrap_or_default(),
+            collect_to: st
+                .recorder
+                .node()
+                .map(|_| s.collect_to.map(|id| id.to_string()).unwrap_or_default()),
         }
     }
 }
@@ -882,6 +888,9 @@ struct SettingsForm {
     listener: Option<String>,
     scanner: Option<String>,
     web: Option<String>,
+    /// The node this one forwards its credits to; "" = none. Absent:
+    /// unchanged (a sibling's form has no such field).
+    collect_to: Option<String>,
 }
 
 impl SettingsForm {
@@ -908,8 +917,7 @@ impl SettingsForm {
             listener: Some(self.listener.is_some()),
             scanner: Some(self.scanner.is_some()),
             web: Some(self.web.is_some()),
-            // Not on this form: the Ownership page and the CLI set it.
-            collect_to: None,
+            collect_to: self.collect_to.clone(),
         })
     }
 }

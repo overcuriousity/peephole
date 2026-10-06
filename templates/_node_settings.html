@@ -4,6 +4,7 @@
   <label class="check" title="{{ settings.listener_missing }}"><input type="checkbox" name="listener"{% if settings.listener %} checked{% endif %}{% if !settings.listener && !settings.listener_missing.is_empty() %} disabled{% endif %}> Trap</label>
   <label class="check" title="{{ settings.scanner_missing }}"><input type="checkbox" name="scanner"{% if settings.scanner %} checked{% endif %}{% if !settings.scanner && !settings.scanner_missing.is_empty() %} disabled{% endif %}> Scanner</label>
   <label class="check" title="{{ settings.web_missing }}"><input type="checkbox" name="web"{% if settings.web %} checked{% endif %}{% if !settings.web && !settings.web_missing.is_empty() %} disabled{% endif %}> Web interface</label>
+  {% if let Some(c) = settings.collect_to %}<label title="Key of one of your nodes; empty: this node keeps what it earns">Collect credits at <input type="text" name="collect_to" value="{{ c }}" size="28" class="mono" placeholder="ed25519:…"></label>{% endif %}
   <button class="btn btn-sm" type="submit">Save</button>
   <span class="muted small">version {{ settings.version }}</span>
 </form>
