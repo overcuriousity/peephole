@@ -32,31 +32,7 @@ Measured on the real cluster, 30 days, before this roadmap (2026-10-04):
 
 ## Next
 
-### 1. Stateful decoys, MCP and AI first
-
-- **Cost:** M for the state machine and the MCP/Ollama decoys
-- **Benefit:** high. This is the newest attack surface, there is little
-  public data on it, and the rules already detect `mcp-probe` and
-  `ai-infra-probe` while the trap answers them with a 404.
-
-A small decoy state machine, keyed by canary or session, with each step
-recorded in `answer` (`decoy:mcp:initialize`, `decoy:mcp:tools/call`, …):
-
-- **MCP:** answer `initialize` and `tools/list` with enticing tools
-  (`read_file`, `run_command`, `query_db`), and record every `tools/call`
-  with its arguments. Reply with plausible errors or canary content.
-  Nothing is ever executed.
-- **Ollama/OpenAI-compatible:** `/api/tags` and `/v1/models` list fake
-  models; `/api/pull`, `/api/chat` and `/v1/chat/completions` are recorded.
-
-**Shown:**
-
-- **Admin:** a Decoys page with a funnel per decoy (served → follow-up →
-  next stage) and a log of tool calls with their arguments.
-- **Public wall:** "What they asked our fake AI": counts per tool name (our
-  own fake names, so safe to show) and per model requested.
-
-### 2. Stateful web decoys: wp-admin, upload sink, webshell commands
+### 1. Stateful web decoys: wp-admin, upload sink, webshell commands
 
 - **Cost:** M–L
 - **Benefit:** high. It captures the second stage (the dropped webshell and
@@ -78,7 +54,7 @@ recorded in `answer` (`decoy:mcp:initialize`, `decoy:mcp:tools/call`, …):
   timeline of the requests sent to it.
 - **Public wall:** a "webshells dropped" tile and counts per command verb.
 
-### 3. Campaign clustering
+### 2. Campaign clustering
 
 - **Cost:** L
 - **Benefit:** very high. It answers "who is this" across addresses and is
@@ -97,7 +73,7 @@ so every node arrives at the same campaigns. Every edge says why it exists.
     comparison; MinHash only if that grows by orders of magnitude;
   - JA4 together with JA4H (shipped: `requests.ja4h`) as supporting evidence, never alone.
 - **Path normalization** (IDs, random filenames, query values) is most of
-  the work and is shared with item 4.
+  the work and is shared with item 3.
 
 **Shown:**
 
@@ -109,9 +85,9 @@ so every node arrives at the same campaigns. Every edge says why it exists.
   and paths per campaign, as aggregates without fingerprints.
 - **Dataset:** a `campaign` column.
 
-### 4. New paths and exploit waves
+### 3. New paths and exploit waves
 
-- **Cost:** M (once item 3's path normalization exists)
+- **Cost:** M (once item 2's path normalization exists)
 - **Benefit:** high. It gives early warning when a new exploit starts
   spreading, often before CVE write-ups.
 
@@ -129,9 +105,9 @@ so every node arrives at the same campaigns. Every edge says why it exists.
 - **Public wall:** a count of new path shapes this period (paths themselves
   are request contents, so not public).
 
-### 5. Personas per node or hostname (opt-in)
+### 4. Personas per node or hostname (opt-in)
 
-- **Cost:** M (after items 1 and 2)
+- **Cost:** M (after item 1)
 - **Benefit:** medium–high. A controlled comparison of targeted versus spray
   traffic across the cluster.
 
@@ -179,7 +155,7 @@ honeypot.
   reparsing old scans via `keys_parsed`. Optionally add `http-headers` to
   level 2's named scripts. A shared ETag means the same file with the same
   mtime and size (one image, one kit), but distro default pages share it
-  across thousands of hosts: a soft, rarity-weighted edge for item 3, never
+  across thousands of hosts: a soft, rarity-weighted edge for item 2, never
   a hard one. nginx ETags also date the file, roughly when the box was set
   up. Shown on the IP page beside the host keys.
 - **ETags as a return marker.** S, low. Decoys answer with an ETag derived
@@ -228,6 +204,6 @@ honeypot.
   `/api/blocklist`, and a CrowdSec-compatible endpoint. Cost M.
 - **Weekly digest page.** A generated, permalinked public summary: new
   families, the largest campaign, new path shapes, top movers. Cost M; worth
-  it once items 4 and 5 exist.
+  it once items 3 and 4 exist.
 - **Hall of fame.** Oldest CVE still probed, strangest User-Agent, longest
   payload, as aggregates. Cost S–M.

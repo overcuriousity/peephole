@@ -5,7 +5,40 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Added
+
+- AI decoys. The trap answers MCP and LLM-API probes instead of a 404, so
+  the next steps are recorded.
+  - MCP over Streamable HTTP (`/mcp`, `/messages`) and the legacy HTTP+SSE
+    transport (`/sse`, held streams in a pool of their own), with five fake
+    tools (`read_file`, `list_directory`, `run_command`, `query_db`,
+    `fetch_url`). Reads and queries return canary content; nothing is run.
+    The session ID is a canary (`mcp-session`) that links later requests,
+    from any address and node, to the one that started the session.
+  - An LLM gateway decoy: Ollama's native API, OpenAI's (Chat Completions,
+    legacy completions, Responses, models; also under Azure, OpenRouter,
+    LiteLLM-style prefixes) and Anthropic's (messages, count_tokens,
+    complete, models). One fixed reply, framed per API and streamed when
+    asked; unlisted models get the API's own 404.
+  - `decoy_in` (migration 0009): the parsed decoy input stored with each
+    request so answers re-render byte for byte. Replicated between nodes
+    and exported beside `answer` and `decoy_v`.
+  - The rule `llm-key-use` (weight 3), header-only: LLM-provider key shapes
+    (`Authorization: Bearer sk-...`, `x-api-key: sk-ant-...`, Azure
+    `api-key`) on any path. `ai-infra-probe` also matches the new gateway
+    paths.
+  - Admin › Decoys (MCP funnel, sessions, tool calls, LLM models and
+    prompts, web decoys), the quick filters "MCP decoy" and "LLM decoy", the
+    request and IP pages' decoy details, and the wall card "What they
+    asked our fake AI" (tool names ours, model names filtered, from 2 IPs).
+  - `[trap]` settings `mcp_sse_pool` (64), `mcp_sse_per_source` (2),
+    `mcp_sse_hold_secs` (300).
+
 ### Changed
+
+- Decoy version 2: renders every version 1 name unchanged plus the new
+  ones. The Answer filter now matches any prefix. AI decoys skip the
+  tarpit.
 
 - Cluster › Members shows how many requests and scans each node
   contributed, with its share, again; the full breakdown stays on the

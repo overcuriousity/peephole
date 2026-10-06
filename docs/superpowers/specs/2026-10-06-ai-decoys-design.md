@@ -1,6 +1,6 @@
 # AI decoys: MCP and LLM gateway (roadmap item 1)
 
-Date: 2026-10-06 · Status: designed, not implemented.
+Date: 2026-10-06 · Status: implemented (branch `ai-decoys`).
 Roadmap: `docs/roadmap.md`, item 1 "Stateful decoys, MCP and AI first".
 
 ## Goal
@@ -114,7 +114,8 @@ A per-node `SseHub`:
 
 Models (fixed): local `llama3.1:8b`, `qwen2.5-coder:7b`, `deepseek-r1:14b`,
 `nomic-embed-text`; upstream `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`,
-`claude-sonnet-5-5`, `claude-opus-5-5`, `claude-haiku-4-5-20251001`. Any key
+`claude-sonnet-5-5`, `claude-opus-5-5`, `claude-haiku-4-5-20251001`. Ollama spells the embedding model
+`nomic-embed-text:latest`. Any key
 is accepted, none required.
 
 The fixed reply: "I'm here to help. Could you share a bit more detail about
@@ -170,8 +171,11 @@ not at random IPs); Jupyter, Gradio, Open WebUI, vector databases (keep the
 
 - `ai-infra-probe` gains `/api/v1/(chat/completions|models)`,
   `/(anthropic|api/anthropic|litellm)/v1/` and `/v1/complete`.
-- New `llm-key-use` (weight 3): a chat, messages or responses call carrying
-  a key, i.e. an attempt to spend someone's inference.
+- New `llm-key-use` (weight 3), header-only (a rule's matchers are
+  OR-combined, so it cannot also require a path): it matches LLM-provider key
+  shapes on any path, i.e. an attempt to spend someone's inference:
+  `Authorization: Bearer sk-…`, `x-api-key: sk-ant-…`, Azure's `api-key`
+  header.
 
 ## Data model
 
@@ -198,10 +202,14 @@ not at random IPs); Jupyter, Gradio, Open WebUI, vector databases (keep the
 - Export: a `decoy_in` column beside `answer` and `decoy_v`.
 
 Reflection limits: response bodies are canned and under 8 KiB. From the
-request only the command's first word (≤ 32 characters, `[A-Za-z0-9._/-]`)
-and the JSON-RPC `id` come back.
+request only the command's first word (≤ 32 characters, `[A-Za-z0-9._/-]`),
+the JSON-RPC `id` and the model name when it matches
+`[A-Za-z0-9._:/-]{1,128}` come back.
 
 ## Code layout
+
+AI decoy routes skip the tarpit, and AI decoys are chosen before the
+version-1 decoys.
 
 - `src/trap/decoy.rs` becomes `src/trap/decoy/mod.rs` (version-1 decoys,
   `choose`, `render` dispatch), with `decoy/mcp.rs`, `decoy/llm.rs` and
@@ -229,6 +237,9 @@ Cluster · System), with the range picker and sub-tabs:
   distinct IPs, listed); prompt log (time, IP, API, model, first 200
   characters of the last user message, decoded from the body at view time).
 - **Web**: requests per existing decoy name, linking to Requests.
+
+Switching the range on the Decoys page goes back to the MCP tab. SSE light
+rows do not keep `held_ms`.
 
 Elsewhere: the request page shows `decoy_in`; quick filters "MCP decoy" and
 "LLM decoy" on Requests; the IP page gets "MCP sessions N · tool calls M ·
