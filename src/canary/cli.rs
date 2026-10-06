@@ -20,6 +20,7 @@ type LightRow = (
     Option<String>,
     Option<i64>,
     Option<String>,
+    Option<String>,
 );
 /// A full row's decoy inputs.
 type FullRow = (
@@ -31,6 +32,7 @@ type FullRow = (
     Option<String>,
     Option<i64>,
     Option<String>,
+    Option<String>,
 );
 
 /// The decoy of the row `uid` (None: no such row, or not a decoy).
@@ -41,7 +43,7 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
             return Ok(None);
         };
         let r: Option<LightRow> = sqlx::query_as(
-            "SELECT s.ts_ms, s.method, s.path, s.page_token, s.host, s.answer, s.decoy_v, s.decoy_site
+            "SELECT s.ts_ms, s.method, s.path, s.page_token, s.host, s.answer, s.decoy_v, s.decoy_site, s.decoy_in
                  FROM skipped_requests s JOIN skipped_batches b ON b.id = s.batch_id
                  WHERE b.uid = ? ORDER BY s.rowid LIMIT 1 OFFSET ?",
         )
@@ -49,7 +51,8 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
         .bind(offset)
         .fetch_optional(&store.read)
         .await?;
-        let Some((ts_ms, method, path, Some(tok), host, Some(answer), v, site)) = r else {
+        let Some((ts_ms, method, path, Some(tok), host, Some(answer), v, site, decoy_in)) = r
+        else {
             return Ok(None);
         };
         let Some(name) = answer.strip_prefix("decoy:") else {
@@ -65,19 +68,20 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
                 ts: ts_ms.div_euclid(1000),
                 method: &method,
                 path: &path,
-                decoy_in: None,
+                decoy_in: decoy_in.as_deref(),
             },
             name,
         ));
     }
     let r: Option<FullRow> = sqlx::query_as(
-        "SELECT ts, method, path, headers_json, page_token, answer, decoy_v, decoy_site
+        "SELECT ts, method, path, headers_json, page_token, answer, decoy_v, decoy_site, decoy_in
              FROM requests WHERE uid = ?",
     )
     .bind(uid)
     .fetch_optional(&store.read)
     .await?;
-    let Some((ts, method, path, headers_json, Some(tok), Some(answer), v, site)) = r else {
+    let Some((ts, method, path, headers_json, Some(tok), Some(answer), v, site, decoy_in)) = r
+    else {
         return Ok(None);
     };
     let Some(name) = answer.strip_prefix("decoy:") else {
@@ -97,7 +101,7 @@ pub async fn render_uid(store: &Store, uid: &str) -> Result<Option<Decoy>> {
             ts,
             method: &method,
             path: &path,
-            decoy_in: None,
+            decoy_in: decoy_in.as_deref(),
         },
         name,
     ))

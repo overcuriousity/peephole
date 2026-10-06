@@ -545,6 +545,8 @@ struct Capture<'a> {
     ts: String,
     decoy_v: Option<i64>,
     decoy_site: Option<String>,
+    /// What an MCP or LLM decoy was rendered from.
+    decoy_in: Option<String>,
     /// How the request is answered: `not-found`, `decoy:<name>`, `claim`,
     /// `tarpit`.
     answer: String,
@@ -719,7 +721,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 decoy_v: c.decoy_v,
                 decoy_site: c.decoy_site,
                 held_ms: c.held_ms,
-                decoy_in: None,
+                decoy_in: c.decoy_in,
             },
         )
         .await?;
@@ -820,8 +822,22 @@ async fn trap(
     let method = parts.method.as_str();
     let path = parts.uri.path();
     let presented = presented(&state, &headers, method, path, &body.bytes).await;
+    let decoded = crate::classify::decoded_body(&headers, &body.bytes);
+    let ai = decoy::ai::choose(&decoy::ai::Ask {
+        method,
+        path,
+        query: parts.uri.query(),
+        headers: &headers,
+        body: &decoded,
+    })
+    // The legacy SSE stream is Task 9's; until then it is no decoy.
+    .filter(|(name, _)| name != "mcp:sse");
+    drop(decoded);
     // A canary presented is answered as always: its trace is worth more.
+    // So is an AI decoy: `mcp-abuse` is severity 4, and the tarpit would
+    // cut the session it marks short.
     if presented == decoy::Presented::default()
+        && ai.is_none()
         && let Some(hold) = state.tarpit.take(ip)
     {
         return tarpit_answer(
@@ -830,21 +846,25 @@ async fn trap(
     }
     let node_id = state.recorder.node_id();
     let word = crate::canary::site::word(node_id.as_ref().map(|n| &n.0[..]));
-    let decoy = decoy::choose(method, path, parts.uri.query(), presented, word).and_then(|name| {
-        decoy::render(
-            &decoy::Input {
-                v: crate::canary::DECOY_V,
-                page_token: &page_token,
-                host: host.as_deref(),
-                word,
-                ts: now.timestamp(),
-                method,
-                path,
-                decoy_in: None,
-            },
-            name,
-        )
-    });
+    let decoy_in = ai.as_ref().map(|(_, d)| d.to_json());
+    let input = decoy::Input {
+        v: crate::canary::DECOY_V,
+        page_token: &page_token,
+        host: host.as_deref(),
+        word,
+        ts: now.timestamp(),
+        method,
+        path,
+        decoy_in: decoy_in.as_deref(),
+    };
+    // AI decoys first: a Bearer key that is one of our canaries must get
+    // the LLM answer, not the version-1 admin page.
+    let decoy = match &ai {
+        Some((name, _)) => decoy::render(&input, name),
+        None => decoy::choose(method, path, parts.uri.query(), presented, word)
+            .and_then(|name| decoy::render(&input, name)),
+    };
+    let decoy_in = decoy.as_ref().and(decoy_in);
     let (answer, status) = match &decoy {
         Some(d) => (format!("decoy:{}", d.name), d.status),
         None => ("not-found".to_string(), 404),
@@ -867,6 +887,7 @@ async fn trap(
             host,
             decoy_v: decoy.is_some().then_some(crate::canary::DECOY_V),
             word,
+            decoy_in,
             held_ms: None,
         },
     ));
@@ -932,6 +953,7 @@ fn tarpit_answer(
                 host,
                 decoy_v: None,
                 word,
+                decoy_in: None,
                 held_ms,
             },
         )
@@ -959,6 +981,8 @@ struct Served {
     decoy_v: Option<i64>,
     /// The site word the decoy was served under.
     word: &'static str,
+    /// What an MCP or LLM decoy was rendered from.
+    decoy_in: Option<String>,
     /// How long the tarpit held the client, in milliseconds.
     held_ms: Option<i64>,
 }
@@ -1048,7 +1072,7 @@ async fn record_trap(
                     answer: served.answer.clone(),
                     decoy_v: v,
                     site: served.word.to_string(),
-                    decoy_in: None,
+                    decoy_in: served.decoy_in.clone(),
                 }),
                 (None, Some(held_ms)) => skiplog::SkipAnswer::Tarpit { held_ms },
                 (None, None) => skiplog::SkipAnswer::Plain,
@@ -1102,6 +1126,7 @@ async fn record_trap(
                 ts: served.now.format("%Y-%m-%d %H:%M:%S").to_string(),
                 decoy_v: served.decoy_v,
                 decoy_site: served.decoy_v.map(|_| served.word.to_string()),
+                decoy_in: served.decoy_in,
                 answer: served.answer,
                 held_ms: served.held_ms,
                 status: served.status,
@@ -1187,6 +1212,7 @@ async fn claim_handler(
             ts: crate::store::data::now_ts(),
             decoy_v: None,
             decoy_site: None,
+            decoy_in: None,
             answer: "claim".into(),
             held_ms: None,
             status: 200,
