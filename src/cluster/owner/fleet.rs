@@ -79,7 +79,8 @@ pub fn serve(node: &Arc<Node>) {
             let Ok(Some(owned)) = load(&node.store, node.id()).await else {
                 return no;
             };
-            if tag.as_slice() != hello_tag(&owned.id, &from, &node.id())
+            let ours = hello_tag(&owned.id, &from, &node.id());
+            if aws_lc_rs::constant_time::verify_slices_are_equal(tag.as_slice(), &ours).is_err()
                 || !cert_valid(&owned.id, &from, &cert)
             {
                 return no;
@@ -98,7 +99,16 @@ pub fn serve(node: &Arc<Node>) {
 /// live member, and return the siblings afterwards. A member that answers
 /// with its certificate is a sibling; one that answers without is not
 /// (any more); one that does not answer stays what it was.
+///
+/// A sibling this node blocked stays a sibling: whose node it is does not
+/// depend on whether this node talks to it, and a rotation must still list
+/// it as not moved.
 pub async fn discover(node: &Arc<Node>) -> Result<Vec<NodeId>> {
+    greet(node, None).await
+}
+
+/// [`discover`], greeting only the members in `only` when it is given.
+async fn greet(node: &Arc<Node>, only: Option<&[NodeId]>) -> Result<Vec<NodeId>> {
     let me = node.id();
     let Some(owned) = load(&node.store, me).await? else {
         return Ok(vec![]);
@@ -118,6 +128,7 @@ pub async fn discover(node: &Arc<Node>) -> Result<Vec<NodeId>> {
         .live_members(LIVE)
         .into_iter()
         .filter(|id| *id != me && !node.is_blocked(id))
+        .filter(|id| only.is_none_or(|o| o.contains(id)))
         .filter(|id| {
             members
                 .get(id)
@@ -129,7 +140,13 @@ pub async fn discover(node: &Arc<Node>) -> Result<Vec<NodeId>> {
             tag: serde_bytes::ByteBuf::from(hello_tag(&owned.id, &me, to).to_vec()),
             cert: serde_bytes::ByteBuf::from(owned.cert.clone()),
         };
-        async move { (*to, node.request(*to, hello, HELLO_TIMEOUT).await) }
+        let avoid = super::cmd::old_relays(node, to);
+        async move {
+            let answer = node
+                .request_avoiding(*to, hello, HELLO_TIMEOUT, avoid)
+                .await;
+            (*to, answer)
+        }
     });
     for (to, answer) in futures::future::join_all(asks).await {
         match answer {
@@ -144,10 +161,43 @@ pub async fn discover(node: &Arc<Node>) -> Result<Vec<NodeId>> {
     siblings(&node.store).await
 }
 
-/// Keep the siblings current: a round whenever the owner or the set of
-/// live members changed, and at least every [`ROUND`].
+/// What the loop does at a tick.
+#[derive(Debug, PartialEq)]
+enum Round {
+    Nothing,
+    /// Every live member: the owner changed, or [`ROUND`] has passed.
+    Full,
+    /// Only the members that came online since the last look.
+    Only(Vec<NodeId>),
+}
+
+/// The owner and the live members as last greeted, and as they are now.
+type View = (Option<OwnerId>, Vec<NodeId>);
+
+fn plan(seen: Option<&View>, now: &View, due: bool) -> Round {
+    match seen {
+        Some(seen) if seen.0 == now.0 && !due => {
+            let new: Vec<NodeId> = now
+                .1
+                .iter()
+                .filter(|id| !seen.1.contains(id))
+                .copied()
+                .collect();
+            if new.is_empty() {
+                Round::Nothing
+            } else {
+                Round::Only(new)
+            }
+        }
+        _ => Round::Full,
+    }
+}
+
+/// Keep the siblings current: a full round when the owner changed and at
+/// least every [`ROUND`], and a greeting for each member that comes online
+/// in between.
 pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-    let mut seen: Option<(Option<OwnerId>, Vec<NodeId>)> = None;
+    let mut seen: Option<View> = None;
     let mut last = Instant::now();
     loop {
         let owner = load(&node.store, node.id())
@@ -158,12 +208,22 @@ pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<boo
         let mut live = node.live_members(LIVE);
         live.sort();
         let now = (owner, live);
-        if seen.as_ref() != Some(&now) || last.elapsed() >= ROUND {
-            if let Err(e) = discover(&node).await {
-                tracing::debug!(?e, "sibling discovery failed");
+        let round = plan(seen.as_ref(), &now, last.elapsed() >= ROUND);
+        let done = match &round {
+            Round::Nothing => None,
+            Round::Full => Some(greet(&node, None).await),
+            Round::Only(new) => Some(greet(&node, Some(new)).await),
+        };
+        match done {
+            // A round that failed is made again at the next tick.
+            Some(Err(e)) => tracing::debug!(?e, "sibling discovery failed"),
+            Some(Ok(_)) => {
+                if round == Round::Full {
+                    last = Instant::now();
+                }
+                seen = Some(now);
             }
-            seen = Some(now);
-            last = Instant::now();
+            None => seen = Some(now),
         }
         tokio::select! {
             _ = tokio::time::sleep(TICK) => {}
@@ -192,6 +252,32 @@ mod tests {
         assert_eq!(t, hello_tag(&o1, &a, &b));
         assert_ne!(t, hello_tag(&o2, &a, &b), "another owner");
         assert_ne!(t, hello_tag(&o1, &b, &a), "direction");
+    }
+
+    #[test]
+    fn a_round_greets_everyone_only_when_the_owner_changed_or_it_is_due() {
+        let o = OwnerKey::generate().unwrap().id;
+        let (a, b, c) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        );
+        let was: View = (Some(o), vec![a, b]);
+        assert_eq!(plan(None, &was, false), Round::Full, "the first look");
+        assert_eq!(plan(Some(&was), &was, false), Round::Nothing);
+        assert_eq!(plan(Some(&was), &was, true), Round::Full, "due");
+        let more: View = (Some(o), vec![a, b, c]);
+        assert_eq!(plan(Some(&was), &more, false), Round::Only(vec![c]));
+        let fewer: View = (Some(o), vec![a]);
+        assert_eq!(plan(Some(&was), &fewer, false), Round::Nothing);
+        let other: View = (Some(OwnerKey::generate().unwrap().id), vec![a, b]);
+        assert_eq!(
+            plan(Some(&was), &other, false),
+            Round::Full,
+            "another owner"
+        );
+        let none: View = (None, vec![a, b]);
+        assert_eq!(plan(Some(&was), &none, false), Round::Full, "released");
     }
 
     #[tokio::test]

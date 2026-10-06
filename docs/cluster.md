@@ -122,6 +122,9 @@ can still belong together: they share an **ownership key**.
   them, but it sees them: the settings you send, a node's block list and
   invite labels in its status, and the new owner's public half during a
   rotation.
+- A key that is forgotten, replaced or released is blanked in the node's
+  database. Copies of the database made while the node kept the key (the
+  installer's backups, your own) still contain it: delete them, or rotate.
 - Whoever can log in to a node, or run the CLI on it, can always release it
   or give it another owner. Ownership adds a remote door; it does not lock
   the local one. Protecting the key and the nodes is the operator's job.

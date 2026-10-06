@@ -63,11 +63,14 @@ struct OwnershipPage {
     /// The key itself: after creating or rotating it, or when asked for.
     shown_key: Option<String>,
     nodes: Vec<NodeRow>,
-    /// Names of nodes still on the previous key after a rotation.
-    pending: Vec<String>,
+    /// Nodes still on the previous key after a rotation: name, and why
+    /// each was not moved when last tried.
+    pending: Vec<(String, String)>,
     /// A rotation was started here and cut short before this node switched.
     unfinished: bool,
     log: Vec<LogView>,
+    /// Attempts that were not signed with the owner's key.
+    refused: Vec<LogView>,
 }
 
 async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Html<String>> {
@@ -98,28 +101,31 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
         nodes.push(row(&me));
         nodes.extend(members.iter().filter(|m| sibs.contains(&m.key)).map(row));
     }
-    let pending = cmd::pending(&node.store)
+    // A name is the member's own choice: the key's fingerprint goes with it.
+    let who = |id: &NodeId| match names.get(&id.to_string()) {
+        Some(name) => format!("{name} ({})", id.short()),
+        None => id.short(),
+    };
+    let pending = cmd::pending_reasons(&node.store)
         .await?
         .iter()
-        .map(|id| {
-            names
-                .get(&id.to_string())
-                .cloned()
-                .unwrap_or_else(|| id.short())
-        })
+        .map(|(id, why)| (who(id), why.clone()))
         .collect();
+    let view = |r: cmd::LogRow| LogView {
+        from: who(&r.from),
+        at: r.at,
+        command: r.command,
+        result: r.result,
+    };
     let log = cmd::log_rows(&node.store, 50)
         .await?
         .into_iter()
-        .map(|r| LogView {
-            from: names
-                .get(&r.from.to_string())
-                .cloned()
-                .unwrap_or_else(|| r.from.short()),
-            at: r.at,
-            command: r.command,
-            result: r.result,
-        })
+        .map(view)
+        .collect();
+    let refused = cmd::refused_rows(&node.store, 20)
+        .await?
+        .into_iter()
+        .map(view)
         .collect();
     render(&OwnershipPage {
         chrome: Chrome::new(true, "admin"),
@@ -130,6 +136,7 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
         pending,
         unfinished: owner::rotation_unfinished(&node.store).await?,
         log,
+        refused,
     })
 }
 

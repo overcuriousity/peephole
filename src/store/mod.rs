@@ -44,7 +44,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0008_tarpit.sql"),
     include_str!("migrations/0009_decoy_in.sql"),
     include_str!("migrations/0010_ownership.sql"),
-    include_str!("migrations/0011_drop_config_keys.sql"),
+    include_str!("migrations/0011_clear_config_keys.sql"),
+    include_str!("migrations/0012_owner_log_kinds.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
@@ -74,6 +75,10 @@ impl Store {
             // which fsyncs on every commit and throttles the inline write path.
             .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(10))
+            // Blank the space of deleted values where that costs no extra
+            // writes (rows of small tables): a deleted key, token or
+            // setting is not left readable in the file.
+            .pragma("secure_delete", "FAST")
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
@@ -526,6 +531,19 @@ mod tests {
         assert!(lo <= k("10.1.2.3") && k("10.1.2.3") <= hi);
         assert!(k("11.0.0.0") > hi);
         assert_eq!(ip_key_of("not an ip"), None);
+    }
+
+    /// Config keys are gone after the upgrade, their table is not: a
+    /// database restored to the previous version still opens there.
+    #[tokio::test]
+    async fn the_config_key_table_stays_and_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM config_keys")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[tokio::test]

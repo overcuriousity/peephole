@@ -16,6 +16,41 @@ pub const USAGE: &str = "usage: peephole owner new [CONFIG]
        peephole owner forget-key [CONFIG]       (the node stays owned)
        peephole owner release [CONFIG]          (the node has no owner afterwards)";
 
+/// One line from standard input. Typed at a terminal, it is not shown
+/// while it is typed (as far as `stty` can be asked to).
+fn read_key() -> Result<String> {
+    use std::io::IsTerminal;
+    let stty = |arg: &str| {
+        std::process::Command::new("stty")
+            .arg(arg)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let typed = std::io::stdin().is_terminal();
+    let hidden = typed && stty("-echo");
+    if typed {
+        eprint!(
+            "ownership key{}: ",
+            if hidden {
+                ""
+            } else {
+                " (it will be visible; clear the screen afterwards)"
+            }
+        );
+    }
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    if hidden {
+        stty("echo");
+        eprintln!();
+    }
+    read.context("reading the key from standard input")?;
+    Ok(line)
+}
+
 pub async fn run(args: &[String], default_config: &str) -> Result<()> {
     let mut keep = false;
     let mut pos: Vec<&str> = vec![];
@@ -59,16 +94,15 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             );
         }
         "adopt" => {
-            let mut line = String::new();
-            std::io::stdin()
-                .read_line(&mut line)
-                .context("reading the key from standard input")?;
+            let line = read_key()?;
             let key = OwnerKey::parse(&line)?;
             super::adopt(&store, me, &key, keep).await?;
+            // As it is now: a key this node already kept stays kept.
+            let kept = super::load(&store, me).await?.is_some_and(|o| o.managing());
             println!(
                 "this node is now owned by {} ({})",
                 key.id.short(),
-                if keep {
+                if kept {
                     "key kept here"
                 } else {
                     "key not kept here"

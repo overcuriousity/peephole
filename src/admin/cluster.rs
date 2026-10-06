@@ -1119,20 +1119,51 @@ async fn node_page(
     node_view(&st, &key).await
 }
 
+/// Why an owner command did nothing, or may not have.
+#[derive(Debug, PartialEq)]
+enum Unsent {
+    /// Nothing was sent, or the node said no.
+    Refused(String),
+    /// Sent, but no answer came back in time.
+    NoAnswer(String),
+}
+
+impl Unsent {
+    /// The message for the page; `what`: "Not saved", "Not done".
+    fn text(&self, what: &str) -> String {
+        match self {
+            Unsent::Refused(e) => format!("{what}: {e}"),
+            Unsent::NoAnswer(e) => format!(
+                "{e}. The command may still be carried out there (a block of a busy peer \
+                 takes a while): reload this page to see."
+            ),
+        }
+    }
+}
+
 /// Send `cmd` to sibling `id` with the key this node keeps. Ok: what the
-/// node did; Err: why nothing happened, in words for the page.
+/// node did.
 async fn owner_run(
     node: &Arc<crate::cluster::Node>,
     id: NodeId,
     counter: u64,
     cmd: crate::cluster::owner::cmd::OwnerCmd,
-) -> Result<String, String> {
-    use crate::cluster::owner::cmd as oc;
-    let key = oc::kept_key(node).await.map_err(|e| format!("{e:#}"))?;
+) -> Result<String, Unsent> {
+    use crate::cluster::owner::{cmd as oc, fleet};
+    let refused = |e: anyhow::Error| Unsent::Refused(format!("{e:#}"));
+    // Only to the operator's other nodes: the path names any member, and
+    // this node would carry out a command it sent to itself.
+    let sibs = fleet::siblings(&node.store).await.map_err(refused)?;
+    if id == node.id() || !sibs.contains(&id) {
+        return Err(Unsent::Refused(
+            "that is not one of your other nodes".into(),
+        ));
+    }
+    let key = oc::kept_key(node).await.map_err(refused)?;
     match oc::run(node, &key, id, counter, cmd).await {
         Ok(Ok(note)) => Ok(note),
-        Ok(Err(e)) => Err(e),
-        Err(e) => Err(format!("{e:#}")),
+        Ok(Err(e)) => Err(Unsent::Refused(e)),
+        Err(e) => Err(Unsent::NoAnswer(format!("{e:#}"))),
     }
 }
 
@@ -1161,7 +1192,7 @@ async fn node_set(
                     Some("Saved. Roles switch within seconds.".into()),
                     None,
                 ),
-                Err(e) => back_to(&to, None, Some(format!("Not saved: {e}"))),
+                Err(e) => back_to(&to, None, Some(e.text("Not saved"))),
             }
         }
         _ => back_to(&to, None, Some("reload the page and try again".into())),
@@ -1207,7 +1238,7 @@ async fn node_owner(
     };
     Ok(match owner_run(node, id, f.counter, cmd).await {
         Ok(note) => back_to(&to, Some(format!("Done: {note}.")), None),
-        Err(e) => back_to(&to, None, Some(format!("Not done: {e}"))),
+        Err(e) => back_to(&to, None, Some(e.text("Not done"))),
     })
 }
 
@@ -1350,6 +1381,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(none.view(&ours), ("none recorded".to_string(), None));
+    }
+
+    #[test]
+    fn a_missing_answer_is_not_reported_as_a_refusal() {
+        let said_no = Unsent::Refused("no usable invite 4".into());
+        assert_eq!(said_no.text("Not done"), "Not done: no usable invite 4");
+        let silent = Unsent::NoAnswer("no answer from 3f9a within 15s".into()).text("Not done");
+        assert!(!silent.starts_with("Not done"), "{silent}");
+        assert!(silent.contains("may still be carried out"), "{silent}");
     }
 
     #[test]

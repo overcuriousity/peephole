@@ -219,6 +219,18 @@ impl Node {
 
     /// Ask `to` and wait for its answer.
     pub async fn request(self: &Arc<Self>, to: NodeId, msg: Msg, timeout: Duration) -> Result<Msg> {
+        self.request_avoiding(to, msg, timeout, vec![]).await
+    }
+
+    /// Like [`Node::request`], never sent through the first hops in
+    /// `avoid`: members that could not relay this kind of message.
+    pub async fn request_avoiding(
+        self: &Arc<Self>,
+        to: NodeId,
+        msg: Msg,
+        timeout: Duration,
+        avoid: Vec<NodeId>,
+    ) -> Result<Msg> {
         let (id, env) = Envelope::seal(self, to, None, msg)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.msg
@@ -228,7 +240,7 @@ impl Node {
             .insert(id.clone(), (to, tx));
         let mut rx = rx;
         let no_answer = || anyhow::anyhow!("no answer from {} within {timeout:?}", to.short());
-        let out = match self.route_avoiding(env.clone(), vec![]).await {
+        let out = match self.route_avoiding(env.clone(), avoid.clone()).await {
             Ok(hop) => match tokio::time::timeout(timeout / 2, &mut rx).await {
                 Ok(r) => r.map_err(|_| anyhow::anyhow!("request dropped")),
                 Err(_) => {
@@ -236,7 +248,9 @@ impl Node {
                     // used, in case that relay drops it. The id stays the
                     // same, so the destination handles it only once.
                     if let Some(h) = hop {
-                        let _ = self.route_avoiding(env, vec![h]).await;
+                        let mut avoid = avoid;
+                        avoid.push(h);
+                        let _ = self.route_avoiding(env, avoid).await;
                     }
                     tokio::time::timeout(timeout - timeout / 2, rx)
                         .await

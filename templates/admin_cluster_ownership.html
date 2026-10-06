@@ -60,7 +60,8 @@
 {% endif %}
 {% if !pending.is_empty() %}
 <section class="card"><h2>Still on the previous key</h2>
-  <div class="banner banner-warning">{% for p in pending %}{% if !loop.first %}, {% endif %}{{ p }}{% endfor %} did not answer when the key was rotated. The previous key is kept here for them.</div>
+  <div class="banner banner-warning">These nodes were not moved when the key was rotated. The previous key is kept here for them.</div>
+  <ul>{% for p in pending %}<li><b>{{ p.0 }}</b>{% if !p.1.is_empty() %}: {{ p.1 }}{% endif %}</li>{% endfor %}</ul>
   <div class="row">
     <form method="post" action="/admin/cluster/ownership/retry"><button class="btn btn-sm btn-primary" type="submit">Retry</button></form>
     <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-discard">Give up on them</button>
@@ -91,6 +92,15 @@
       <td class="ts">{{ l.at }}</td><td>{{ l.from }}</td><td>{{ l.command }}</td><td>{{ l.result }}</td>
     </tr>{% endfor %}</tbody>
   </table></div>{% endif %}
+  {% if !refused.is_empty() %}
+  <details><summary>Refused: not signed with your key ({{ refused.len() }})</summary>
+  <p class="muted">Any member can send such a command; none was carried out. Only the newest are kept.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>When</th><th>From</th><th>Command</th></tr></thead>
+    <tbody>{% for l in refused %}<tr>
+      <td class="ts">{{ l.at }}</td><td>{{ l.from }}</td><td>{{ l.command }}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div></details>{% endif %}
 </section>
 </div>
 {% endblock %}

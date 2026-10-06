@@ -271,6 +271,9 @@ open/locked" line disappears from the member page.
 - `MemberInfo.remote_config` stays in the struct so old membership records
   decode; new records always carry `false`, and nothing reads it.
 
+From the review (2026-10-06): the `config_keys` table is emptied, not
+dropped, so a database restored to the previous version still opens there.
+
 Existing config keys are not converted. After the upgrade no node is
 remotely configurable until its admin enters an ownership key. The
 changelog says so under "Changed" with the two commands to run.

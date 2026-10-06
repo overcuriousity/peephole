@@ -166,24 +166,64 @@ pub struct LogRow {
     pub result: String,
 }
 
-async fn log(store: &Store, from: &NodeId, command: &str, result: &str) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO owner_log (at, from_node, command, result)
-         VALUES (datetime('now'), ?, ?, ?)",
+/// Rows kept in `owner_log`: commands signed with the owner's key, and
+/// attempts that were not.
+const KEEP_VERIFIED: i64 = 2000;
+const KEEP_UNVERIFIED: i64 = 200;
+/// The result of a command until it has one: what stays when the node
+/// stopped while carrying it out.
+const STARTED: &str = "started; no result recorded";
+
+/// Write a row and return its id; the oldest rows of its kind go.
+/// `verified`: the command was signed with this node's owner key.
+async fn log(
+    store: &Store,
+    from: &NodeId,
+    command: &str,
+    result: &str,
+    verified: bool,
+) -> Result<i64> {
+    let id = sqlx::query(
+        "INSERT INTO owner_log (at, from_node, command, result, verified)
+         VALUES (datetime('now'), ?, ?, ?, ?)",
     )
     .bind(&from.0[..])
     .bind(command)
     .bind(result)
+    .bind(verified)
+    .execute(&store.pool)
+    .await?
+    .last_insert_rowid();
+    sqlx::query(
+        "DELETE FROM owner_log WHERE verified = ?1 AND id <= (
+           SELECT id FROM owner_log WHERE verified = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+    )
+    .bind(verified)
+    .bind(if verified {
+        KEEP_VERIFIED
+    } else {
+        KEEP_UNVERIFIED
+    })
     .execute(&store.pool)
     .await?;
+    Ok(id)
+}
+
+async fn log_result(store: &Store, id: i64, result: &str) -> Result<()> {
+    sqlx::query("UPDATE owner_log SET result = ? WHERE id = ?")
+        .bind(result)
+        .bind(id)
+        .execute(&store.pool)
+        .await?;
     Ok(())
 }
 
-/// The newest received commands, newest first.
-pub async fn log_rows(store: &Store, limit: i64) -> Result<Vec<LogRow>> {
+async fn rows(store: &Store, verified: bool, limit: i64) -> Result<Vec<LogRow>> {
     let rows: Vec<(String, Vec<u8>, String, String)> = sqlx::query_as(
-        "SELECT at, from_node, command, result FROM owner_log ORDER BY id DESC LIMIT ?",
+        "SELECT at, from_node, command, result FROM owner_log
+         WHERE verified = ? ORDER BY id DESC LIMIT ?",
     )
+    .bind(verified)
     .bind(limit)
     .fetch_all(&store.pool)
     .await?;
@@ -197,6 +237,18 @@ pub async fn log_rows(store: &Store, limit: i64) -> Result<Vec<LogRow>> {
             })
         })
         .collect()
+}
+
+/// The newest commands received from the owner, newest first.
+pub async fn log_rows(store: &Store, limit: i64) -> Result<Vec<LogRow>> {
+    rows(store, true, limit).await
+}
+
+/// The newest attempts that were not signed with the owner's key. Kept
+/// apart: any member can cause them, and they must not push the owner's
+/// commands off the page.
+pub async fn refused_rows(store: &Store, limit: i64) -> Result<Vec<LogRow>> {
+    rows(store, false, limit).await
 }
 
 /// Bad signatures seen per sender in the current hour.
@@ -368,7 +420,12 @@ async fn handle(
     let turn = node.owner_locks.commands.lock().await;
     let owned = match super::load(&node.store, node.id()).await {
         Ok(Some(o)) => o,
-        Ok(None) => return refuse(0, "this node has no owner".into()),
+        Ok(None) => {
+            if may_log(seen, from) {
+                tracing::info!(by = %from.short(), "owner command refused: this node has no owner");
+            }
+            return refuse(0, "this node has no owner".into());
+        }
         Err(e) => return refuse(0, format!("{e:#}")),
     };
     if !verify(&owned.id, &from, &node.id(), counter, cmd, sig) {
@@ -378,14 +435,18 @@ async fn handle(
             let _ = log(
                 &node.store,
                 &from,
-                &format!("(not verified) {what}"),
+                &what,
                 "refused: the ownership key was not accepted",
+                false,
             )
             .await;
         }
         return refuse(0, "the ownership key was not accepted".into());
     }
-    let current = super::counter(&node.store).await.unwrap_or(0);
+    let current = match super::counter(&node.store).await {
+        Ok(c) => c,
+        Err(e) => return refuse(0, format!("{e:#}")),
+    };
     let Some(cmd) = decode(cmd) else {
         return refuse(
             current,
@@ -408,11 +469,13 @@ async fn handle(
         Ok(true) => {}
         Ok(false) => {
             let why = "the node changed meanwhile; reload and try again";
+            tracing::info!(by = %from.short(), command = %cmd.describe(), "owner command refused: {why}");
             let _ = log(
                 &node.store,
                 &from,
                 &cmd.describe(),
                 &format!("refused: {why}"),
+                true,
             )
             .await;
             return refuse(current, why.into());
@@ -422,6 +485,11 @@ async fn handle(
     // Anything else may take long (a block walks the peer's records) and
     // does not touch the owner: the next command need not wait for it.
     let turn = matches!(cmd, OwnerCmd::Reown { .. } | OwnerCmd::Release).then_some(turn);
+    // Written before the command runs: the counter is used up, and the
+    // list must say for what also when the node stops halfway.
+    let row = log(&node.store, &from, &cmd.describe(), STARTED, true)
+        .await
+        .ok();
     let result = execute(node, settings, from, &cmd).await;
     drop(turn);
     let text = match &result {
@@ -429,7 +497,9 @@ async fn handle(
         Err(e) => format!("refused: {e}"),
     };
     tracing::info!(by = %from.short(), command = %cmd.describe(), result = %text, "owner command");
-    let _ = log(&node.store, &from, &cmd.describe(), &text).await;
+    if let Some(row) = row {
+        let _ = log_result(&node.store, row, &text).await;
+    }
     match result {
         Ok(note) => Msg::OwnerReply {
             counter: counter + 1,
@@ -484,7 +554,6 @@ async fn send(
     counter: u64,
     cmd: &OwnerCmd,
 ) -> Result<Msg> {
-    speaks_owner(node, &target)?;
     let bytes = encode(cmd)?;
     let sig = sign(key, &node.id(), &target, counter, &bytes);
     let msg = Msg::OwnerCmd {
@@ -492,7 +561,18 @@ async fn send(
         cmd: serde_bytes::ByteBuf::from(bytes),
         sig: serde_bytes::ByteBuf::from(sig),
     };
-    node.request(target, msg, TIMEOUT).await
+    node.request_avoiding(target, msg, TIMEOUT, old_relays(node, &target))
+        .await
+}
+
+/// Members that cannot pass an owner message on: a node cannot read, and
+/// so cannot relay, a kind of message it does not know.
+pub(crate) fn old_relays(node: &Node, target: &NodeId) -> Vec<NodeId> {
+    node.members()
+        .iter()
+        .filter(|(id, m)| *id != target && m.proto_max < OWNER_PROTO)
+        .map(|(id, _)| *id)
+        .collect()
 }
 
 /// The outer error: no answer; the inner one: the target's refusal.
@@ -501,6 +581,9 @@ async fn ask_status(
     key: &OwnerKey,
     target: NodeId,
 ) -> Result<Result<Status, String>> {
+    if let Err(e) = speaks_owner(node, &target) {
+        return Ok(Err(format!("{e:#}")));
+    }
     match send(node, key, target, 0, &OwnerCmd::Status).await? {
         Msg::OwnerReply {
             data: Some(OwnerData::Status(s)),
@@ -526,6 +609,10 @@ async fn command(
     counter: u64,
     cmd: &OwnerCmd,
 ) -> Result<Result<String, String>> {
+    // Nothing is sent: a refusal, not a missing answer.
+    if let Err(e) = speaks_owner(node, &target) {
+        return Ok(Err(format!("{e:#}")));
+    }
     match send(node, key, target, counter, cmd).await? {
         Msg::OwnerReply { error: Some(e), .. } => Ok(Err(e)),
         Msg::OwnerReply {
@@ -600,6 +687,17 @@ pub async fn pending(store: &Store) -> Result<Vec<NodeId>> {
     rows.iter().map(|r| NodeId::from_slice(r)).collect()
 }
 
+/// The same, each with why it was not moved when last tried.
+pub async fn pending_reasons(store: &Store) -> Result<Vec<(NodeId, String)>> {
+    let rows: Vec<(Vec<u8>, String)> =
+        sqlx::query_as("SELECT node, why FROM reown_pending ORDER BY node")
+            .fetch_all(&store.pool)
+            .await?;
+    rows.into_iter()
+        .map(|(n, why)| Ok((NodeId::from_slice(&n)?, why)))
+        .collect()
+}
+
 /// Replace the ownership key: every sibling that answers takes the new
 /// one, then this node does. The old key stays here for the rest (see
 /// [`retry`], [`discard`]). Siblings in `leave_out` are not told: they stay
@@ -642,12 +740,11 @@ pub async fn rotate(node: &Arc<Node>, leave_out: &[NodeId]) -> Result<Rotation> 
             Err(e) => pending.push((s, e)),
         }
     }
-    let waiting: Vec<NodeId> = pending.iter().map(|(p, _)| *p).collect();
-    super::switch_key(&node.store, node.id(), &new, &old, &moved, &waiting).await?;
+    super::switch_key(&node.store, node.id(), &new, &old, &moved, &pending).await?;
     tracing::info!(
         owner = %new.id.short(),
         moved = moved.len(),
-        pending = waiting.len(),
+        pending = pending.len(),
         "ownership key rotated"
     );
     Ok(Rotation {
@@ -668,12 +765,21 @@ pub async fn retry(node: &Arc<Node>) -> Result<Vec<(NodeId, Result<(), String>)>
     let mut out = vec![];
     for p in pending(&node.store).await? {
         let r = move_one(node, &old, &new, p).await;
-        if r.is_ok() {
-            sqlx::query("DELETE FROM reown_pending WHERE node = ?")
-                .bind(&p.0[..])
-                .execute(&node.store.pool)
-                .await?;
-            super::fleet::remember(&node.store, &p, &new.certify(&p)).await?;
+        match &r {
+            Ok(()) => {
+                sqlx::query("DELETE FROM reown_pending WHERE node = ?")
+                    .bind(&p.0[..])
+                    .execute(&node.store.pool)
+                    .await?;
+                super::fleet::remember(&node.store, &p, &new.certify(&p)).await?;
+            }
+            Err(why) => {
+                sqlx::query("UPDATE reown_pending SET why = ? WHERE node = ?")
+                    .bind(why)
+                    .bind(&p.0[..])
+                    .execute(&node.store.pool)
+                    .await?;
+            }
         }
         out.push((p, r));
     }
@@ -691,6 +797,7 @@ pub async fn discard(store: &Store) -> Result<()> {
     ] {
         sqlx::query(sql).execute(&store.pool).await?;
     }
+    super::scrub(store).await;
     Ok(())
 }
 
@@ -825,11 +932,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
         let from = Identity::generate().unwrap().id;
-        log(&store, &from, "one", "done").await.unwrap();
-        log(&store, &from, "two", "refused: x").await.unwrap();
+        log(&store, &from, "one", "done", true).await.unwrap();
+        let two = log(&store, &from, "two", STARTED, true).await.unwrap();
+        log(&store, &from, "forged", "refused: x", false)
+            .await
+            .unwrap();
         let rows = log_rows(&store, 10).await.unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 2, "attempts with a wrong key are listed apart");
         assert_eq!((rows[0].command.as_str(), rows[0].from), ("two", from));
+        assert_eq!(
+            rows[0].result, STARTED,
+            "what stays if the node stops halfway"
+        );
         assert_eq!(rows[1].result, "done");
+        log_result(&store, two, "refused: y").await.unwrap();
+        assert_eq!(log_rows(&store, 10).await.unwrap()[0].result, "refused: y");
+        assert_eq!(refused_rows(&store, 10).await.unwrap()[0].command, "forged");
+        // Any member can cause such rows: only the newest are kept, and
+        // they never push out the owner's commands.
+        for i in 0..KEEP_UNVERIFIED + 5 {
+            log(&store, &from, &format!("forged {i}"), "refused", false)
+                .await
+                .unwrap();
+        }
+        let kept = refused_rows(&store, 10_000).await.unwrap();
+        assert_eq!(kept.len() as i64, KEEP_UNVERIFIED);
+        assert_eq!(kept[0].command, format!("forged {}", KEEP_UNVERIFIED + 4));
+        assert_eq!(log_rows(&store, 10).await.unwrap().len(), 2);
     }
 }

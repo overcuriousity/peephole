@@ -203,6 +203,19 @@ async fn del(conn: &mut sqlx::SqliteConnection, key: &str) -> Result<bool> {
         > 0)
 }
 
+/// Empty the write-ahead log into the database file (best effort), so a key
+/// that was just deleted or replaced is not left in older page images. The
+/// file itself is covered by `secure_delete` (see `Store::connect`), which
+/// blanks the space a deleted value took.
+pub(crate) async fn scrub(store: &Store) {
+    if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&store.pool)
+        .await
+    {
+        tracing::debug!(?e, "write-ahead log not emptied after a key change");
+    }
+}
+
 /// The owner changed: nobody known under the old one is a sibling, and a
 /// rotation of the old key is over.
 async fn forget_fleet(conn: &mut sqlx::SqliteConnection) -> Result<()> {
@@ -232,6 +245,7 @@ async fn set_owner(
     }
     forget_fleet(&mut tx).await?;
     tx.commit().await?;
+    scrub(store).await;
     Ok(())
 }
 
@@ -239,14 +253,32 @@ async fn set_owner(
 /// fits this node. Read from the database every time, so a change made by
 /// the CLI takes effect on the running node at once.
 pub async fn load(store: &Store, me: NodeId) -> Result<Option<Owned>> {
-    let (Some(id), Some(cert)) = (get(store, KEY_ID).await?, get(store, KEY_CERT).await?) else {
+    // One read: a change made meanwhile is seen whole or not at all.
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, value FROM settings WHERE key IN (?, ?, ?)")
+            .bind(KEY_ID)
+            .bind(KEY_CERT)
+            .bind(KEY_SEED)
+            .fetch_all(&store.pool)
+            .await?;
+    let read = |k: &str| -> Result<Option<Vec<u8>>> {
+        rows.iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| {
+                data_encoding::BASE64URL_NOPAD
+                    .decode(v.as_bytes())
+                    .with_context(|| format!("stored {k}"))
+            })
+            .transpose()
+    };
+    let (Some(id), Some(cert)) = (read(KEY_ID)?, read(KEY_CERT)?) else {
         return Ok(None);
     };
     let id = OwnerId::from_slice(&id)?;
     if !cert_valid(&id, &me, &cert) {
         return Ok(None);
     }
-    let key = match get(store, KEY_SEED).await? {
+    let key = match read(KEY_SEED)? {
         Some(seed) => {
             let seed: [u8; 32] = seed
                 .try_into()
@@ -262,8 +294,22 @@ pub async fn load(store: &Store, me: NodeId) -> Result<Option<Owned>> {
 
 /// Make this node a node of `key`'s owner, replacing any owner it had.
 /// With `keep`, the key stays here and this becomes a managing node.
+///
+/// Entering the key of the owner the node already has forgets nobody and
+/// does not take a kept key away (`forget_key` does that); with `keep` it
+/// is kept from now on.
 pub async fn adopt(store: &Store, me: NodeId, key: &OwnerKey, keep: bool) -> Result<()> {
     let seed = key.seed();
+    if let Some(cur) = load(store, me).await?
+        && cur.id == key.id
+    {
+        if keep && !cur.managing() {
+            store
+                .setting_set(KEY_SEED, &data_encoding::BASE64URL_NOPAD.encode(&seed))
+                .await?;
+        }
+        return Ok(());
+    }
     set_owner(store, &key.id, &key.certify(&me), keep.then_some(&seed)).await
 }
 
@@ -318,7 +364,7 @@ pub(crate) async fn switch_key(
     new: &OwnerKey,
     old: &OwnerKey,
     moved: &[NodeId],
-    pending: &[NodeId],
+    pending: &[(NodeId, String)],
 ) -> Result<()> {
     let b64 = |b: &[u8]| data_encoding::BASE64URL_NOPAD.encode(b);
     let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -337,14 +383,16 @@ pub(crate) async fn switch_key(
     }
     if !pending.is_empty() {
         put(&mut tx, KEY_OLD_SEED, &b64(&old.seed())).await?;
-        for p in pending {
-            sqlx::query("INSERT OR IGNORE INTO reown_pending (node) VALUES (?)")
+        for (p, why) in pending {
+            sqlx::query("INSERT OR REPLACE INTO reown_pending (node, why) VALUES (?, ?)")
                 .bind(&p.0[..])
+                .bind(why)
                 .execute(&mut *tx)
                 .await?;
         }
     }
     tx.commit().await?;
+    scrub(store).await;
     Ok(())
 }
 
@@ -358,6 +406,7 @@ pub async fn forget_key(store: &Store) -> Result<bool> {
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    scrub(store).await;
     Ok(had)
 }
 
@@ -369,16 +418,24 @@ pub async fn release(store: &Store) -> Result<bool> {
     del(&mut tx, KEY_SEED).await?;
     forget_fleet(&mut tx).await?;
     tx.commit().await?;
+    scrub(store).await;
     Ok(had)
+}
+
+/// A stored counter. One that cannot be read stops commands: starting again
+/// at 0 would let old commands run a second time.
+fn read_counter(v: Option<String>) -> Result<u64> {
+    match v {
+        None => Ok(0),
+        Some(v) => v.parse().map_err(|_| {
+            anyhow::anyhow!("the stored owner command counter is unreadable; commands are refused")
+        }),
+    }
 }
 
 /// The counter the next owner command must name.
 pub async fn counter(store: &Store) -> Result<u64> {
-    Ok(store
-        .setting_get(KEY_COUNTER)
-        .await?
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0))
+    read_counter(store.setting_get(KEY_COUNTER).await?)
 }
 
 /// Use up `expected` if it is the current counter and `owner` is still
@@ -399,7 +456,7 @@ pub async fn take_counter(store: &Store, expected: u64, owner: &OwnerId) -> Resu
         .bind(KEY_COUNTER)
         .fetch_optional(&mut *tx)
         .await?;
-    let cur: u64 = cur.and_then(|v| v.parse().ok()).unwrap_or(0);
+    let cur = read_counter(cur)?;
     if cur != expected {
         return Ok(false);
     }
@@ -548,5 +605,68 @@ mod tests {
         release(&store).await.unwrap();
         assert_eq!(counter(&store).await.unwrap(), 2);
         assert!(!take_counter(&store, 2, &k2.id).await.unwrap(), "no owner");
+    }
+
+    /// Entering the key a node already keeps does not take it away again
+    /// (forgetting it is a command of its own) and forgets nobody.
+    #[tokio::test]
+    async fn adopting_the_key_already_kept_changes_nothing() {
+        let (store, _dir) = store().await;
+        let me = Identity::generate().unwrap().id;
+        let k = create(&store, me).await.unwrap();
+        let sib = Identity::generate().unwrap().id;
+        sqlx::query("INSERT INTO siblings (node, cert, seen_at) VALUES (?, x'00', 'now')")
+            .bind(&sib.0[..])
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        adopt(&store, me, &k, false).await.unwrap();
+        assert!(load(&store, me).await.unwrap().unwrap().managing());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM siblings")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // A node that does not keep it takes it when asked to.
+        forget_key(&store).await.unwrap();
+        adopt(&store, me, &k, false).await.unwrap();
+        assert!(!load(&store, me).await.unwrap().unwrap().managing());
+        adopt(&store, me, &k, true).await.unwrap();
+        assert!(load(&store, me).await.unwrap().unwrap().managing());
+    }
+
+    /// A counter that cannot be read stops commands instead of starting
+    /// again at 0.
+    #[tokio::test]
+    async fn an_unreadable_counter_stops_commands() {
+        let (store, _dir) = store().await;
+        let me = Identity::generate().unwrap().id;
+        let k = create(&store, me).await.unwrap();
+        store.setting_set(KEY_COUNTER, "x").await.unwrap();
+        assert!(counter(&store).await.is_err());
+        assert!(take_counter(&store, 0, &k.id).await.is_err());
+    }
+
+    /// A key that was forgotten is not left behind in the database file or
+    /// its write-ahead log.
+    #[tokio::test]
+    async fn a_forgotten_key_is_gone_from_the_database_file() {
+        let (store, dir) = store().await;
+        let me = Identity::generate().unwrap().id;
+        let k = create(&store, me).await.unwrap();
+        let needle = data_encoding::BASE64URL_NOPAD.encode(&k.seed());
+        let holds = || {
+            ["t.db", "t.db-wal"].iter().any(|f| {
+                std::fs::read(dir.path().join(f))
+                    .is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes()))
+            })
+        };
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(holds(), "kept: it is in the file");
+        assert!(forget_key(&store).await.unwrap());
+        assert!(!holds(), "forgotten: no copy left");
     }
 }

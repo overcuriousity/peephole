@@ -3583,6 +3583,8 @@ async fn rotating_the_key_moves_reachable_siblings_and_retries_the_rest() {
     );
     assert_eq!(fleet::siblings(&na.store).await.unwrap(), vec![b.id]);
     assert_eq!(cmd::pending(&na.store).await.unwrap(), vec![c.id]);
+    let why = cmd::pending_reasons(&na.store).await.unwrap();
+    assert!(why[0].1.contains("no answer"), "{why:?}");
     // A second rotation would forget c and the key it is still on: refused
     // while c is pending.
     let e = cmd::rotate(&na.node, &[])
@@ -3973,6 +3975,24 @@ async fn admin_manages_a_sibling_from_its_page() {
         .unwrap();
     assert!(r.status().is_success());
     assert_eq!(na.settings.snapshot().cooldown_hours, 6);
+
+    // A crafted form cannot aim an owner command at this node itself, or
+    // at a member that is not one of the operator's nodes.
+    let mine = owner::counter(&na.store).await.unwrap().to_string();
+    for target in [a.id, c.id] {
+        let r = admin
+            .post(format!("{base}/admin/cluster/node/{target}/owner"))
+            .form(&[("counter", mine.as_str()), ("action", "release")])
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+    }
+    assert!(
+        owner::load(&na.store, a.id).await.unwrap().is_some(),
+        "not released through its own form"
+    );
+    assert_eq!(owner::counter(&na.store).await.unwrap().to_string(), mine);
 
     // b stops answering: only the settings card says so.
     drop(nb);
