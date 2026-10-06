@@ -2,6 +2,7 @@
 //! Every node computes every balance for itself, from its own copy of the
 //! log; see docs/superpowers/specs/2026-10-06-lookup-credits-design.md.
 pub mod entries;
+pub mod ledger;
 
 /// Millicredits: 1 credit = 1000 mc. Sums are `u64`, amounts on the wire
 /// `u32`.
