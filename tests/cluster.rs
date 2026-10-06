@@ -4308,3 +4308,88 @@ async fn sealed_payments_check_out_on_the_other_node() {
         assert_eq!(state(made_up[0].seq).await, SealState::Inconsistent);
     }
 }
+/// A node gives two members different entries at one position of its
+/// log and then seals one of them. The member holding the other one marks
+/// it, fetches the contradicting entry and publishes the proof; a member
+/// that saw no contradiction itself marks it from the proof alone.
+#[tokio::test]
+async fn a_node_that_shows_two_histories_is_proven_and_marked_everywhere() {
+    use peephole::cluster::record::Seal;
+    use peephole::cluster::seal;
+    use sha2::Digest;
+    // x never runs: its log is written by hand below.
+    let (ix, x) = new_node("x");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let nb = boot(ib, &b, &[&x, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&x, &b], DEFAULT).await;
+    let now = nb.hlc.now();
+    let sign = |seq: u64, r: &Record| WireEntry::sign(&ix, seq, now + seq, r).unwrap();
+    let e1 = sign(
+        1,
+        &Record::LogSeal {
+            seal: Seal {
+                from: 1,
+                digest: seal::empty().to_vec(),
+            },
+        },
+    );
+    let receipt = |charged: u32| Record::CreditReceipt {
+        payer: b.id,
+        offer_seq: 1,
+        charged_mc: charged,
+        answered: vec![],
+    };
+    let (for_b, for_c) = (sign(2, &receipt(1)), sign(2, &receipt(2)));
+    repl::apply_batch(&nb, vec![e1.clone(), for_b.clone()])
+        .await
+        .unwrap();
+    repl::apply_batch(&nc, vec![e1.clone(), for_c.clone()])
+        .await
+        .unwrap();
+    // Both hold x up to 2, so a sync round moves nothing: the fork is
+    // invisible until x commits to one branch.
+    assert!(seal::forked_set(&nb.store.pool).await.unwrap().is_empty());
+    let mut h = sha2::Sha256::new();
+    h.update(e1.digest().unwrap());
+    h.update(for_c.digest().unwrap());
+    let e3 = sign(
+        3,
+        &Record::LogSeal {
+            seal: Seal {
+                from: 1,
+                digest: h.finalize().to_vec(),
+            },
+        },
+    );
+    repl::apply_batch(&nc, vec![e3]).await.unwrap();
+    assert!(
+        seal::forked_set(&nc.store.pool).await.unwrap().is_empty(),
+        "c holds the branch that was sealed"
+    );
+    eventually("b gets the seal and sees it does not match", || async {
+        seal::forked_set(&nb.store.pool)
+            .await
+            .unwrap()
+            .contains(&x.id)
+    })
+    .await;
+    assert_eq!(seal::forked(&nb.store.pool).await.unwrap()[0].proof, None);
+    eventually("b fetches c's entry and writes the proof", || async {
+        seal::investigate(&nb.node).await.unwrap();
+        seal::forked(&nb.store.pool).await.unwrap()[0]
+            .proof
+            .is_some()
+    })
+    .await;
+    eventually("c marks x from b's proof alone", || async {
+        seal::forked(&nc.store.pool)
+            .await
+            .unwrap()
+            .iter()
+            .any(|f| f.origin == x.id && f.seq == 2 && f.proof.is_some_and(|p| p.0 == b.id))
+    })
+    .await;
+    // Marked for good, and one proof is enough.
+    assert_eq!(seal::investigate(&nb.node).await.unwrap(), 0);
+}

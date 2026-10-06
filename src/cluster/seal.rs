@@ -14,7 +14,9 @@ use super::record::{Record, Seal, WireEntry};
 use crate::credits::entries::SealState;
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
-use sqlx::SqliteConnection;
+use sqlx::{SqliteConnection, SqlitePool};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 /// The kinds of entry that carry a seal.
 pub const SEALING: [&str; 3] = ["credit_offer", "credit_transfer", "log_seal"];
@@ -224,22 +226,270 @@ pub(crate) async fn check(
     )
 }
 
+/// A fork proof larger than this (both entries together) is not written.
+pub const MAX_PROOF_BYTES: usize = 1 << 20;
+/// A node seals its log when this many of its entries have no seal yet.
+pub const SEAL_EVERY: u64 = 500;
+/// A range that could not be compared with any peer's copy is given up
+/// after this long; the origin stays marked.
+const SUSPECT_TTL: &str = "-7 days";
+
+/// Whether `a` and `b` prove that their origin signed two entries for one
+/// position of its log. Needs nothing but the two entries.
+pub fn proof_valid(a: &WireEntry, b: &WireEntry) -> bool {
+    a.origin == b.origin
+        && a.seq == b.seq
+        && a.verify()
+        && b.verify()
+        && a.digest().is_some()
+        && a.digest() != b.digest()
+}
+
+/// An origin that showed two histories, as this node knows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Forked {
+    pub origin: NodeId,
+    /// Where it was noticed: the position of the two entries, or of the
+    /// seal that did not match.
+    pub seq: u64,
+    pub found_at: String,
+    /// The `fork_proof` entry (its origin and sequence number), once known.
+    pub proof: Option<(NodeId, u64)>,
+}
+
+/// Mark `origin` as having shown two histories. True: newly marked. The
+/// mark is permanent; a proof is added to a mark that had none, and takes
+/// its position.
+async fn mark(
+    conn: &mut SqliteConnection,
+    origin: &NodeId,
+    seq: u64,
+    proof: Option<(&NodeId, u64)>,
+) -> Result<bool> {
+    let new = sqlx::query(
+        "INSERT OR IGNORE INTO forked (origin, seq, found_at, proof_origin, proof_seq)
+         VALUES (?, ?, datetime('now'), ?, ?)",
+    )
+    .bind(&origin.0[..])
+    .bind(seq.min(i64::MAX as u64) as i64)
+    .bind(proof.map(|p| p.0.0.to_vec()))
+    .bind(proof.map(|p| p.1.min(i64::MAX as u64) as i64))
+    .execute(&mut *conn)
+    .await?
+    .rows_affected()
+        == 1;
+    if let (false, Some((by, at))) = (new, proof) {
+        sqlx::query(
+            "UPDATE forked SET seq = ?, proof_origin = ?, proof_seq = ?
+             WHERE origin = ? AND proof_origin IS NULL",
+        )
+        .bind(seq.min(i64::MAX as u64) as i64)
+        .bind(&by.0[..])
+        .bind(at.min(i64::MAX as u64) as i64)
+        .bind(&origin.0[..])
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(new)
+}
+
+/// Every origin marked here, oldest mark first.
+pub async fn forked(pool: &SqlitePool) -> Result<Vec<Forked>> {
+    type Row = (Vec<u8>, i64, String, Option<Vec<u8>>, Option<i64>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT origin, seq, found_at, proof_origin, proof_seq FROM forked ORDER BY found_at, origin",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(origin, seq, found_at, by, at)| {
+            Ok(Forked {
+                origin: NodeId::from_slice(&origin)?,
+                seq: seq.max(0) as u64,
+                found_at,
+                proof: match (by, at) {
+                    (Some(by), Some(at)) => Some((NodeId::from_slice(&by)?, at.max(0) as u64)),
+                    _ => None,
+                },
+            })
+        })
+        .collect()
+}
+
+pub async fn forked_set(pool: &SqlitePool) -> Result<HashSet<NodeId>> {
+    Ok(forked(pool).await?.into_iter().map(|f| f.origin).collect())
+}
+
+/// Compare the ranges whose seal did not match with the peers' copies of
+/// them. Two entries for one position, both signed, are published as a
+/// `fork_proof`. Returns how many proofs were written.
+pub async fn investigate(node: &Arc<Node>) -> Result<usize> {
+    sqlx::query("DELETE FROM fork_suspects WHERE found_at < datetime('now', ?)")
+        .bind(SUSPECT_TTL)
+        .execute(&node.store.pool)
+        .await?;
+    // A proof for the origin (ours or anyone's) ends the search.
+    sqlx::query(
+        "DELETE FROM fork_suspects WHERE origin IN
+           (SELECT origin FROM forked WHERE proof_origin IS NOT NULL)",
+    )
+    .execute(&node.store.pool)
+    .await?;
+    let suspects: Vec<(Vec<u8>, i64, i64)> =
+        sqlx::query_as("SELECT origin, from_seq, to_seq FROM fork_suspects ORDER BY found_at")
+            .fetch_all(&node.store.pool)
+            .await?;
+    let mut written = 0;
+    'suspect: for (origin, from, to) in suspects {
+        let origin = NodeId::from_slice(&origin)?;
+        let (from, to) = (from.max(1) as u64, to.max(1) as u64);
+        for (peer, _, addr) in node.dial_targets() {
+            if peer == origin {
+                continue;
+            }
+            let req = super::sync::PullReq {
+                wants: vec![(origin, from - 1)],
+                since_hlc: 0,
+                max_entries: (to - from + 1).min(5000) as usize,
+                max_bytes: 4 * super::sync::BATCH_BYTES,
+            };
+            let theirs: super::sync::Batch =
+                match node.call(peer, &addr, "/rpc/v1/pull", &req).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::debug!(peer = %peer.short(), ?e, "fork check: peer not asked");
+                        continue;
+                    }
+                };
+            for b in theirs.entries {
+                if b.origin != origin || b.seq < from || b.seq > to || b.payload.is_none() {
+                    continue;
+                }
+                let held = {
+                    let mut conn = node.store.pool.acquire().await?;
+                    super::repl::signed_entry(&mut conn, &origin, b.seq).await?
+                };
+                let Some(a) = held else { continue };
+                if !proof_valid(&a, &b) {
+                    continue;
+                }
+                let size =
+                    a.payload.as_ref().map_or(0, Vec::len) + b.payload.as_ref().map_or(0, Vec::len);
+                if size > MAX_PROOF_BYTES {
+                    tracing::warn!(origin = %origin.short(), seq = b.seq,
+                        "two histories found, too large to publish as a proof");
+                    continue;
+                }
+                let seq = b.seq;
+                super::repl::append(
+                    node,
+                    &[Record::ForkProof {
+                        a: Box::new(a),
+                        b: Box::new(b),
+                    }],
+                )
+                .await?;
+                tracing::warn!(origin = %origin.short(), seq,
+                    "a member showed two histories: proof published");
+                written += 1;
+                continue 'suspect;
+            }
+        }
+    }
+    Ok(written)
+}
+
+/// Write a `log_seal` when [`SEAL_EVERY`] of this node's entries have no
+/// seal yet, and once a day if its log grew (and at once when it has
+/// never sealed: the chain has to start somewhere). True: one was written.
+pub async fn seal_if_due(node: &Node) -> Result<bool> {
+    if node.detached().is_some() {
+        return Ok(false);
+    }
+    let me = node.id();
+    let (own, sealed, at): (i64, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT (SELECT COALESCE(MAX(seq), 0) FROM repl_log WHERE origin = ?1),
+                (SELECT seq FROM seal_heads WHERE origin = ?1),
+                (SELECT l.hlc FROM repl_log l JOIN seal_heads s
+                   ON s.origin = l.origin AND s.seq = l.seq WHERE l.origin = ?1)",
+    )
+    .bind(&me.0[..])
+    .fetch_one(&node.store.pool)
+    .await?;
+    let own = own.max(0) as u64;
+    let due = match sealed {
+        None => own > 0,
+        Some(s) => {
+            let unsealed = own.saturating_sub(s.max(0) as u64);
+            let age_ms = super::hlc::wall_ms().saturating_sub(super::hlc::physical_ms(
+                super::hlc::from_db(at.unwrap_or(0)),
+            ));
+            unsealed >= SEAL_EVERY || (unsealed > 0 && age_ms >= crate::credits::DAY_MS)
+        }
+    };
+    if !due {
+        return Ok(false);
+    }
+    super::repl::append_sealing(node, |seal| Record::LogSeal { seal }).await?;
+    Ok(true)
+}
+
+/// How often the loop looks.
+const TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Keep this node's log sealed, and turn seals that did not match into
+/// fork proofs.
+pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if let Err(e) = seal_if_due(&node).await {
+            tracing::warn!(?e, "sealing the log failed");
+        }
+        if let Err(e) = investigate(&node).await {
+            tracing::debug!(?e, "fork check failed");
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(TICK) => {}
+            _ = shutdown.changed() => break,
+        }
+    }
+}
+
 /// A credit entry is being applied: check its seal, remember where the
-/// origin's seals stand, and keep a payment as a row.
+/// origin's seals stand, keep a payment as a row, and take a fork proof.
 pub(crate) async fn on_apply(
     _node: &Node,
     conn: &mut SqliteConnection,
     e: &WireEntry,
     r: &Record,
 ) -> Result<()> {
+    if let Record::ForkProof { a, b } = r {
+        if proof_valid(a, b) && mark(conn, &a.origin, a.seq, Some((&e.origin, e.seq))).await? {
+            tracing::warn!(origin = %a.origin.short(), seq = a.seq, by = %e.origin.short(),
+                "a member showed two histories (proof received): its credits are void here");
+        }
+        return Ok(());
+    }
     let state = match seal_in(r) {
         None => SealState::None,
         Some(seal) => {
             let state = check(conn, e, seal).await?;
             note(conn, &e.origin, e.seq).await?;
             if state == SealState::Inconsistent {
-                tracing::warn!(origin = %e.origin.short(), seq = e.seq,
-                    "a seal does not match the log held here: its origin showed two histories");
+                // Its origin signed this seal and the entries held here.
+                if mark(conn, &e.origin, e.seq, None).await? {
+                    tracing::warn!(origin = %e.origin.short(), seq = e.seq,
+                        "a member showed two histories (its seal does not match the log held \
+                         here): its credits are void here");
+                }
+                sqlx::query(
+                    "INSERT OR IGNORE INTO fork_suspects (origin, from_seq, to_seq, found_at)
+                     VALUES (?, ?, ?, datetime('now'))",
+                )
+                .bind(&e.origin.0[..])
+                .bind(seal.from.min(e.seq).min(i64::MAX as u64) as i64)
+                .bind(e.seq.min(i64::MAX as u64) as i64)
+                .execute(&mut *conn)
+                .await?;
             }
             state
         }
@@ -474,5 +724,59 @@ mod tests {
             check(&mut conn, &e, &first).await.unwrap(),
             SealState::Unchecked
         );
+    }
+
+    #[test]
+    fn a_fork_proof_is_two_signed_entries_for_one_position() {
+        let (id, other) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let entry = |id: &Identity, seq: u64, charged: u32| {
+            let r = Record::CreditReceipt {
+                payer: id.id,
+                offer_seq: 1,
+                charged_mc: charged,
+                answered: vec![],
+            };
+            WireEntry::sign(id, seq, 5 << 16, &r).unwrap()
+        };
+        let (a, b) = (entry(&id, 2, 1), entry(&id, 2, 2));
+        assert!(proof_valid(&a, &b));
+        assert!(proof_valid(&b, &a));
+        assert!(!proof_valid(&a, &a.clone()), "the same bytes");
+        assert!(!proof_valid(&a, &entry(&other, 2, 2)), "different origins");
+        assert!(!proof_valid(&a, &entry(&id, 3, 2)), "different positions");
+        let mut forged = b.clone();
+        forged.sig = a.sig.clone();
+        assert!(!proof_valid(&a, &forged), "a bad signature");
+        let mut erased = b.clone();
+        erased.payload = None;
+        assert!(!proof_valid(&a, &erased), "nothing signed");
+        // The same record dated differently is two statements as well.
+        let r = a.record().unwrap();
+        let later = WireEntry::sign(&id, 2, 6 << 16, &r).unwrap();
+        assert!(proof_valid(&a, &later));
+    }
+
+    #[tokio::test]
+    async fn forked_origins_are_marked_once_and_keep_their_proof() {
+        let (store, _dir) = store().await;
+        let mut conn = store.pool.acquire().await.unwrap();
+        let (o, p) = (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        );
+        assert!(forked_set(&store.pool).await.unwrap().is_empty());
+        assert!(mark(&mut conn, &o, 7, None).await.unwrap(), "new");
+        assert!(!mark(&mut conn, &o, 9, None).await.unwrap());
+        assert!(!mark(&mut conn, &o, 7, Some((&p, 3))).await.unwrap());
+        // A later proof does not replace the first.
+        mark(&mut conn, &o, 7, Some((&o, 99))).await.unwrap();
+        drop(conn);
+        let all = forked(&store.pool).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            (all[0].origin, all[0].seq, all[0].proof),
+            (o, 7, Some((p, 3)))
+        );
+        assert!(forked_set(&store.pool).await.unwrap().contains(&o));
     }
 }

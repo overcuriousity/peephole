@@ -379,7 +379,7 @@ pub async fn entries_after(
 
 /// `origin`'s entry `seq` with its signed payload (rebuilt from its row if
 /// need be); None if it is not held or erased.
-async fn signed_entry(
+pub(crate) async fn signed_entry(
     conn: &mut SqliteConnection,
     origin: &NodeId,
     seq: u64,

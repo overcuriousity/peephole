@@ -266,6 +266,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             node.clone(),
             shutdown_rx.clone(),
         ));
+        tokio::spawn(cluster::seal::run(node.clone(), shutdown_rx.clone()));
         // Does nothing unless this node currently scans.
         tokio::spawn(scan::arbiter::takeover_loop(
             node.clone(),
