@@ -4774,6 +4774,55 @@ fn serves(
     asked
 }
 
+/// The price counts only members that earn here: a blocked member's
+/// announced lookups and its scan capacity are left out.
+#[tokio::test]
+async fn a_blocked_members_announcements_do_not_move_the_price() {
+    use peephole::credits::price;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let tools = tempfile::tempdir().unwrap();
+    let scan = Opts {
+        scanner: Some(fake_nmap(tools.path(), 0.5)),
+        ..DEFAULT
+    };
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], scan.clone()).await;
+    let nc = boot(ic, &c, &[&a, &b], scan).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    serves(&nc, &[("abuseipdb", Some(1000.0))], 0.2);
+    price::refresh(&nb.node).await.unwrap();
+    price::refresh(&nc.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    price_seen(&na, c.id, "abuseipdb").await;
+    let scans = |t: &price::Table, id| t.capacity.scanners.iter().any(|s| s.node == id);
+    eventually("both scanners' pace is heard", || async {
+        let t = price::refresh(&na.node).await.unwrap();
+        scans(&t, b.id) && scans(&t, c.id)
+    })
+    .await;
+    let both = price::refresh(&na.node).await.unwrap();
+    assert!(
+        scans(&both, c.id),
+        "c's scan capacity counts: {:?}",
+        both.capacity
+    );
+    peephole::cluster::block::block(&na.node, c.id)
+        .await
+        .unwrap();
+    let one = price::refresh(&na.node).await.unwrap();
+    assert!(
+        (one.lookups_per_day * 2.0 - both.lookups_per_day).abs() < 1e-9
+            && one.lookups_per_day > 0.0,
+        "{} then {}",
+        both.lookups_per_day,
+        one.lookups_per_day
+    );
+    assert!(!scans(&one, c.id), "c's scan capacity is left out");
+    assert!(scans(&one, b.id));
+}
+
 /// A member of an earlier version can serve providers, but it does not know
 /// offers and receipts: it is not offered as a server of paid lookups.
 #[tokio::test]

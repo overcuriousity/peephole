@@ -444,7 +444,15 @@ pub(crate) async fn scanner_rows(st: &AdminState) -> AppResult<Vec<MemberView>> 
         .filter(|m| m.scanner)
         .chain(members.into_iter().filter(|m| m.scanner && m.active))
         .collect();
-    let left_out = std::collections::HashSet::new();
+    // As the price counts them: blocked and forked scanners are left out,
+    // also of the mean that stands in for scanners with few jobs.
+    let mut left_out: std::collections::HashSet<NodeId> =
+        crate::cluster::seal::forked(&node.store.pool)
+            .await?
+            .into_iter()
+            .map(|f| f.origin)
+            .collect();
+    left_out.extend(node.members().keys().filter(|id| node.is_blocked(id)));
     let cap =
         crate::credits::price::capacity(&crate::credits::price::scanners(node, &left_out).await?);
     let mut rows = rows;
