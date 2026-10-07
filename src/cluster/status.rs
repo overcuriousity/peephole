@@ -418,7 +418,7 @@ impl Node {
             on_demand,
             prices,
             public_addrs: self.status.public_addresses(),
-            probe_price_mc: table.probe_mc,
+            probe_price_mc: self.prober().map(|p| p.price(&table)),
         };
         let Ok(body) = super::rpc::cbor::encode(&hb) else {
             return;

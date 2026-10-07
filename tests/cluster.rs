@@ -5889,7 +5889,7 @@ async fn accept_offer_declines_a_too_low_offer_naming_the_price() {
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     grant_scans(&[&na, &nb], a.id, 8).await;
     let seq = pay::make_offer(&na.node, b.id, 10).await.unwrap();
-    match pay::accept_offer(&nb.node, a.id, seq, 50, "test").await {
+    match pay::accept_offer(&nb.node, a.id, seq, 50, "test", pay::SERVE_MARGIN_MS).await {
         Err(pay::Declined::TooLow { price_mc, .. }) => assert_eq!(price_mc, 50),
         Err(other) => panic!("{other:?}"),
         Ok(_) => panic!("a too-low offer was accepted"),
@@ -5921,11 +5921,12 @@ async fn accept_offer_accepts_a_covering_offer() {
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     grant_scans(&[&na, &nb], a.id, 8).await;
     let seq = pay::make_offer(&na.node, b.id, 50).await.unwrap();
-    let Ok(acc) = pay::accept_offer(&nb.node, a.id, seq, 50, "test").await else {
+    let Ok(acc) = pay::accept_offer(&nb.node, a.id, seq, 50, "test", pay::SERVE_MARGIN_MS).await
+    else {
         panic!("a covering offer was declined");
     };
     assert_eq!((acc.offered, acc.covered), (50, 50));
-    match pay::accept_offer(&nb.node, a.id, seq, 50, "test").await {
+    match pay::accept_offer(&nb.node, a.id, seq, 50, "test", pay::SERVE_MARGIN_MS).await {
         Err(pay::Declined::Why(why)) => assert!(why.contains("being served already"), "{why}"),
         Err(other) => panic!("{other:?}"),
         Ok(_) => panic!("an offer was served twice"),
@@ -6037,7 +6038,8 @@ async fn a_paid_probe_is_accepted_served_and_charged() {
     let target = probe_target().await;
     probes(&nb, target);
     grant_scans(&[&na, &nb], a.id, 8).await;
-    let cost = price::refresh(&nb.node).await.unwrap().probe_mc.unwrap();
+    let table = price::refresh(&nb.node).await.unwrap();
+    let cost = nb.prober().unwrap().price(&table);
     assert_eq!(cost, price::price(price::PROBE, None, 1));
     nb.refresh_heartbeat();
     eventually("a hears b's probe price", || async {

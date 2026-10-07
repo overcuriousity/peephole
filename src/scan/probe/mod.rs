@@ -207,7 +207,8 @@ async fn probe_port(
             let https = p == "https";
             let mut page = http::probe_http(ip, port, https, guard, probe_end).await;
             if let Some(err) = page.get("error").and_then(Value::as_str) {
-                // probe_http reports failures as text only.
+                // probe_http reports failures as text only: the whole error
+                // chain, where the refusal or the timeout is named.
                 let lower = err.to_ascii_lowercase();
                 let outcome = if lower.contains("refused") {
                     "refused"
@@ -218,12 +219,17 @@ async fn probe_port(
                 };
                 return rec(port, p, outcome, page);
             }
-            if https
-                && let Value::Object(m) = &mut page
-                && let Ok(seen) = tls::capture(ip, port, connection_deadline(probe_end)).await
-                && let Value::Object(t) = tls_detail(ip, port, &seen, probe_end).await
-            {
-                m.extend(t);
+            if https && let Value::Object(m) = &mut page {
+                match tls::capture(ip, port, connection_deadline(probe_end)).await {
+                    Ok(seen) => {
+                        if let Value::Object(t) = tls_detail(ip, port, &seen, probe_end).await {
+                            m.extend(t);
+                        }
+                    }
+                    Err(e) => {
+                        m.insert("tls_error".into(), json!(format!("{e:#}")));
+                    }
+                }
             }
             rec(port, p, "ok", page)
         }

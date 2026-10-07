@@ -49,6 +49,8 @@ pub struct HttpSeen {
 fn builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // A proxy from the environment would connect past the pinned hop.
+        .no_proxy()
         .danger_accept_invalid_certs(true)
         .connect_timeout(super::CONNECT_TIMEOUT)
         .user_agent(USER_AGENT)
@@ -275,54 +277,31 @@ fn hop_client(
     }
 }
 
-/// Follow `first_url`'s redirects, one GET per hop, at most
-/// [`MAX_REDIRECTS`] hops. Each hop is resolved and shown to `guard` before
-/// anything connects; a refused, repeated or unresolvable hop, or one past
-/// the limit, ends the chain with a `skipped` marker.
+/// Follow the redirects of `root`, whose response `root_seen` is in hand:
+/// it is the first hop and is not fetched again (its TLS and JARM are the
+/// port's own). Then one GET per hop, at most [`MAX_REDIRECTS`] hops in
+/// all. Each hop is resolved and shown to `guard` before anything
+/// connects; a refused, repeated or unresolvable hop, or one past the
+/// limit, ends the chain with a `skipped` marker.
 pub async fn follow_redirects(
     client: &reqwest::Client,
-    first_url: &str,
+    root: &Url,
+    root_seen: HttpSeen,
     guard: Guard<'_>,
     probe_end: Instant,
 ) -> Vec<Value> {
     let mut hops = Vec::new();
     let mut seen_urls = HashSet::new();
-    let Ok(mut url) = Url::parse(first_url) else {
-        hops.push(json!({"url": first_url, "skipped": "unresolved"}));
-        return hops;
-    };
+    let (mut url, mut seen, mut tls_at) = (root.clone(), root_seen, None);
     loop {
         let text = url.to_string();
-        if hops.len() == MAX_REDIRECTS {
-            hops.push(json!({"url": text, "skipped": "limit"}));
-            break;
-        }
-        if !seen_urls.insert(text.clone()) {
-            hops.push(json!({"url": text, "skipped": "loop"}));
-            break;
-        }
-        let Some((ip, port)) = target_of(&url, connection_deadline(probe_end)).await else {
-            hops.push(json!({"url": text, "skipped": "unresolved"}));
-            break;
-        };
-        if let Some(why) = guard(&ip) {
-            hops.push(json!({"url": text, "skipped": "protected", "why": why}));
-            break;
-        }
-        let c = hop_client(client, &url, ip, port, probe_end);
-        let seen = match fetch(&c, &text, MAX_RESPONSE, connection_deadline(probe_end)).await {
-            Ok(s) => s,
-            Err(e) => {
-                hops.push(json!({"url": text, "error": e.to_string()}));
-                break;
-            }
-        };
+        seen_urls.insert(text.clone());
         let location = header(&seen.headers, LOCATION.as_str());
         let mut hop = Map::new();
         hop.insert("url".into(), json!(text));
         hop.extend(page_json(&seen));
         hop.insert("location".into(), json!(location));
-        if url.scheme() == "https" {
+        if let Some((ip, port)) = tls_at {
             let t = tls::capture(ip, port, connection_deadline(probe_end)).await;
             hop.insert(
                 "tls".into(),
@@ -340,10 +319,34 @@ pub async fn follow_redirects(
             .filter(|_| (300..400).contains(&seen.status))
             .and_then(|l| l.to_str().ok())
             .and_then(|l| url.join(l).ok());
-        match next {
-            Some(n) => url = n,
-            None => break,
+        let Some(next) = next else { break };
+        url = next;
+        let text = url.to_string();
+        if hops.len() == MAX_REDIRECTS {
+            hops.push(json!({"url": text, "skipped": "limit"}));
+            break;
         }
+        if seen_urls.contains(&text) {
+            hops.push(json!({"url": text, "skipped": "loop"}));
+            break;
+        }
+        let Some((ip, port)) = target_of(&url, connection_deadline(probe_end)).await else {
+            hops.push(json!({"url": text, "skipped": "unresolved"}));
+            break;
+        };
+        if let Some(why) = guard(&ip) {
+            hops.push(json!({"url": text, "skipped": "protected", "why": why}));
+            break;
+        }
+        let c = hop_client(client, &url, ip, port, probe_end);
+        seen = match fetch(&c, &text, MAX_RESPONSE, connection_deadline(probe_end)).await {
+            Ok(s) => s,
+            Err(e) => {
+                hops.push(json!({"url": text, "error": format!("{e:#}")}));
+                break;
+            }
+        };
+        tls_at = (url.scheme() == "https").then_some((ip, port));
     }
     hops
 }
@@ -415,12 +418,12 @@ pub async fn probe_http(
     let root = format!("{scheme}://{}/", SocketAddr::new(ip, port));
     let base = match Url::parse(&root) {
         Ok(u) => u,
-        Err(e) => return json!({"error": e.to_string()}),
+        Err(e) => return json!({"error": format!("{e:#}")}),
     };
     let client = client(probe_end);
     let seen = match fetch(&client, &root, MAX_RESPONSE, connection_deadline(probe_end)).await {
         Ok(s) => s,
-        Err(e) => return json!({"error": e.to_string()}),
+        Err(e) => return json!({"error": format!("{e:#}")}),
     };
     let mut out = page_json(&seen);
     out.insert("cookie_names".into(), json!(cookie_names(&seen.headers)));
@@ -474,7 +477,7 @@ pub async fn probe_http(
     out.insert("favicon_sha256".into(), sha);
 
     let redirects = if (300..400).contains(&seen.status) && seen.headers.contains_key(LOCATION) {
-        follow_redirects(&client, &root, guard, probe_end).await
+        follow_redirects(&client, &base, seen, guard, probe_end).await
     } else {
         Vec::new()
     };
@@ -509,6 +512,13 @@ mod tests {
 
     fn end() -> Instant {
         Instant::now() + Duration::from_secs(30)
+    }
+
+    /// The redirect chain from `url`, as `probe_http` follows it.
+    async fn chain(url: &str) -> Vec<Value> {
+        let c = client(end());
+        let seen = fetch(&c, url, MAX_RESPONSE, end()).await.unwrap();
+        follow_redirects(&c, &Url::parse(url).unwrap(), seen, &not_global, end()).await
     }
 
     #[test]
@@ -589,8 +599,7 @@ mod tests {
         );
         assert_eq!(v["redirects"], json!([]));
 
-        let c = client(end());
-        let hops = follow_redirects(&c, &format!("http://{addr}/go"), &not_global, end()).await;
+        let hops = chain(&format!("http://{addr}/go")).await;
         assert_eq!(hops.len(), 2, "{hops:?}");
         assert_eq!(hops[0]["status"], 302);
         assert_eq!(hops[0]["location"], "/landing");
@@ -616,6 +625,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_redirecting_root_is_fetched_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = Router::new()
+            .route(
+                "/",
+                get(move || {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    async { Redirect::temporary("/landing") }
+                }),
+            )
+            .route("/landing", get(|| async { "<title>Landing</title>" }))
+            .fallback(|| async { (StatusCode::NOT_FOUND, "nope") });
+        let addr = serve(app).await;
+        let v = probe_http(addr.ip(), addr.port(), false, &not_global, end()).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "one GET /");
+        let hops = v["redirects"].as_array().unwrap();
+        assert_eq!(hops.len(), 2, "{hops:?}");
+        assert_eq!(hops[0]["url"], format!("http://{addr}/"));
+        assert_eq!(hops[0]["status"], 307);
+        assert_eq!(hops[1]["title"], "Landing");
+    }
+
+    #[tokio::test]
     async fn a_chain_of_six_is_cut_at_five_hops() {
         let app = Router::new().route(
             "/{n}",
@@ -629,8 +664,7 @@ mod tests {
             ),
         );
         let addr = serve(app).await;
-        let c = client(end());
-        let hops = follow_redirects(&c, &format!("http://{addr}/1"), &not_global, end()).await;
+        let hops = chain(&format!("http://{addr}/1")).await;
         assert_eq!(hops.len(), 6, "{hops:?}");
         assert!(hops[..5].iter().all(|h| h["status"] == 302));
         assert_eq!(hops[5]["skipped"], "limit");

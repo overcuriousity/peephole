@@ -149,13 +149,13 @@ impl Gate {
         Ok(Target { ip, ports })
     }
 
-    /// The redirect-hop guard: non-global addresses and the safety lists
-    /// as last refreshed (sync). While the lists are being rebuilt every
-    /// hop is refused.
+    /// The redirect-hop guard: non-global addresses, `never_scan`, and the
+    /// safety lists as last refreshed (sync). While the lists are being
+    /// rebuilt every hop is refused.
     pub fn hop_guard(&self) -> impl Fn(&IpAddr) -> Option<String> + Send + Sync + '_ {
         move |ip: &IpAddr| {
-            if !crate::net::is_scannable_target(*ip) {
-                return Some("non-global address".into());
+            if let Some(r) = locally_refused(ip, &self.cfg.scan.never_scan) {
+                return Some(r.reason().to_string());
             }
             match self.safety.try_lock() {
                 Ok(s) => s.refuses(ip).or_else(|| s.listed(ip)),
@@ -238,6 +238,22 @@ pub(crate) mod tests {
 
     async fn store(dir: &std::path::Path) -> Store {
         Store::connect(&dir.join("t.db")).await.unwrap()
+    }
+
+    #[test]
+    fn a_redirect_hop_into_never_scan_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_with(dir.path(), "never_scan = [\"198.51.100.0/24\"]");
+        let gate = Gate::new(&cfg, None);
+        let guard = gate.hop_guard();
+        assert_eq!(
+            guard(&"198.51.100.7".parse().unwrap()).as_deref(),
+            Some("never_scan 198.51.100.0/24")
+        );
+        assert_eq!(
+            guard(&"10.0.0.1".parse().unwrap()).as_deref(),
+            Some("non-global address")
+        );
     }
 
     #[tokio::test]

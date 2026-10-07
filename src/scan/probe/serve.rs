@@ -15,8 +15,10 @@ use crate::credits::{Mc, price, show};
 use crate::store::Store;
 use crate::store::data::{new_uid, now_ts};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Longest address text and group uid accepted from a member.
 const MAX_TEXT: usize = 64;
@@ -49,8 +51,24 @@ pub struct Prober {
     gate: Gate,
     slots: Arc<tokio::sync::Semaphore>,
     max: u32,
+    /// Addresses being probed now: the gate's cooldown only sees finished
+    /// probes.
+    running: Mutex<HashSet<IpAddr>>,
     /// Tests only: where the probe connects instead of the probed address.
     connect_to: Option<IpAddr>,
+}
+
+/// What an offer must have left to pay for a probe: its longest run and a
+/// minute for the result and the receipt.
+const PROBE_MARGIN: Duration = super::PROBE_TIMEOUT.saturating_add(Duration::from_secs(60));
+
+/// Marks an address as being probed until dropped.
+struct Running(Arc<Prober>, IpAddr);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.running.lock().unwrap().remove(&self.1);
+    }
 }
 
 fn declined(why: impl Into<String>, price_mc: Option<u32>) -> ProbeResp {
@@ -67,8 +85,26 @@ impl Prober {
             gate: Gate::new(cfg, me),
             slots: Arc::new(tokio::sync::Semaphore::new(max as usize)),
             max,
+            running: Mutex::new(HashSet::new()),
             connect_to: None,
         }
+    }
+
+    /// The gate's verdict on `ip`, and the address marked as being probed
+    /// until the guard is dropped: a second probe of it waits for the
+    /// first one's result, which the cooldown then sees.
+    async fn admit(
+        self: &Arc<Self>,
+        store: &Store,
+        node: Option<&Node>,
+        ip: &IpAddr,
+    ) -> Result<(Target, Running), String> {
+        let target = self.gate.check(store, node, ip).await?;
+        let ip = crate::net::canonical(target.ip);
+        if !self.running.lock().unwrap().insert(ip) {
+            return Err("a probe of this address is running".into());
+        }
+        Ok((target, Running(self.clone(), ip)))
     }
 
     /// Tests only: connect to `ip` (a local server) instead of the probed
@@ -106,13 +142,10 @@ impl Prober {
         self.gate.allowed_level(store, ip).await
     }
 
-    /// What a probe costs here now.
-    fn price(&self, node: &Node) -> Mc {
-        let table = node.price_table();
-        table
-            .probe_mc
-            .unwrap_or_else(|| price::price(price::PROBE, table.unit, 1 + self.full() as u32))
-            as Mc
+    /// What a probe costs here now, at `table`'s unit: double while
+    /// every slot is busy. Read live, so the surge follows the slots.
+    pub fn price(&self, table: &price::Table) -> u32 {
+        price::price(price::PROBE, table.unit, 1 + self.full() as u32)
     }
 
     /// Run the probe of `t`; a probe that panicked yields an `error` port
@@ -162,30 +195,54 @@ impl Prober {
         peer: NodeId,
         req: &ProbeReq,
     ) -> ProbeResp {
-        let price = self.price(node);
-        let price_u32 = price.min(u32::MAX as Mc) as u32;
-        if req.ip.len() > MAX_TEXT || req.group.is_empty() || req.group.len() > MAX_TEXT {
-            return declined("malformed request", None);
-        }
-        let Ok(ip) = req.ip.trim().parse::<IpAddr>() else {
-            return declined("not an IP address", None);
-        };
+        let price_u32 = self.price(&node.price_table());
+        let price = price_u32 as Mc;
+        let parsed =
+            if req.ip.len() > MAX_TEXT || req.group.is_empty() || req.group.len() > MAX_TEXT {
+                Err("malformed request")
+            } else {
+                req.ip
+                    .trim()
+                    .parse::<IpAddr>()
+                    .map_err(|_| "not an IP address")
+            };
         let Some(offer_seq) = req.offer_seq else {
-            return declined(
-                "probes are paid with credits: the request carries no offer",
-                Some(price_u32),
-            );
+            return match parsed {
+                Err(why) => declined(why, None),
+                Ok(_) => declined(
+                    "probes are paid with credits: the request carries no offer",
+                    Some(price_u32),
+                ),
+            };
         };
         let decline = |why: String, price_mc: Option<u32>| {
-            tracing::info!(asker = %peer.short(), offer = offer_seq, %ip, %why, "probe declined");
+            tracing::info!(asker = %peer.short(), offer = offer_seq, ip = %req.ip, %why,
+                "probe declined");
             declined(why, price_mc)
         };
-        let acc = match pay::accept_offer(node, peer, offer_seq, price, "probe").await {
+        let acc = match pay::accept_offer(
+            node,
+            peer,
+            offer_seq,
+            price,
+            "probe",
+            PROBE_MARGIN.as_millis() as u64,
+        )
+        .await
+        {
             Ok(a) => a,
             Err(Declined::TooLow { why, price_mc }) => return decline(why, Some(price_mc)),
             Err(Declined::Why(why) | Declined::NotCovered(why)) => return decline(why, None),
         };
-        let target = match self.gate.check(&node.store, Some(node), &ip).await {
+        // Every decline of an accepted offer writes a receipt of nothing.
+        let ip = match parsed {
+            Ok(ip) => ip,
+            Err(why) => {
+                pay::release(node, peer, offer_seq).await;
+                return decline(why.into(), None);
+            }
+        };
+        let (target, running) = match self.admit(&node.store, Some(node), &ip).await {
             Ok(t) => t,
             Err(why) => {
                 pay::release(node, peer, offer_seq).await;
@@ -204,8 +261,9 @@ impl Prober {
         let (me, node, group, probe_uid) =
             (self.clone(), node.clone(), req.group.clone(), uid.clone());
         tokio::spawn(async move {
-            // The offer stays "being served" until its receipt is written.
-            let _held = (permit, acc);
+            // The offer stays "being served", and the address "being
+            // probed", until the result and the receipt are written.
+            let _held = (permit, acc, running);
             let o = me.run(target).await;
             let ports = o.ports.len();
             let result = Record::ProbeResult(ProbeResultRec {
@@ -220,6 +278,7 @@ impl Prober {
                 rtt_min_ms: o.rtt_min_ms,
                 ports: o.ports,
                 build: crate::COMMIT.into(),
+                charged_mc: price_u32,
             });
             let receipt = Record::CreditReceipt {
                 payer: peer,
@@ -243,7 +302,7 @@ impl Prober {
         ip: IpAddr,
         group: &str,
     ) -> Result<String, String> {
-        let target = self.gate.check(store, None, &ip).await?;
+        let (target, _running) = self.admit(store, None, &ip).await?;
         let Ok(_permit) = self.slots.clone().try_acquire_owned() else {
             return Err("all probe slots are busy".into());
         };
@@ -264,6 +323,7 @@ impl Prober {
                 rtt_min_ms: o.rtt_min_ms,
                 ports: o.ports,
                 build: crate::COMMIT.into(),
+                charged_mc: 0,
             })])
             .await
             .map_err(|e| format!("the probe result could not be written: {e:#}"))?;
@@ -306,6 +366,24 @@ mod tests {
         let ports = store.probe_ports(probes[0].id).await.unwrap();
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].outcome, "ok");
+    }
+
+    #[tokio::test]
+    async fn an_address_being_probed_is_not_probed_again_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let addr: IpAddr = "203.0.113.32".parse().unwrap();
+        let ip = store.upsert_ip(addr).await.unwrap();
+        requests(&store, ip.id, 3, 2).await;
+        scanned(&store, &ip.ip, &[(8080, "open", Some("http"))]).await;
+        let prober = Arc::new(Prober::new(&config_with(dir.path(), ""), None));
+        let first = prober.admit(&store, None, &addr).await.unwrap();
+        let Err(err) = prober.admit(&store, None, &addr).await else {
+            panic!("admitted twice");
+        };
+        assert_eq!(err, "a probe of this address is running");
+        drop(first);
+        assert!(prober.admit(&store, None, &addr).await.is_ok());
     }
 
     #[tokio::test]

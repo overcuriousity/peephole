@@ -4,8 +4,8 @@
 use super::serve::{ProbeReq, ProbeResp, Prober};
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
+use crate::credits::Mc;
 use crate::credits::pay::{self, SERVE_WAIT};
-use crate::credits::{Mc, price};
 use crate::intel::SharedGeo;
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -26,13 +26,7 @@ pub struct Vantage {
 /// What a probe at `id` costs, as this node knows it.
 fn price_at(node: &Node, id: &NodeId) -> Option<u32> {
     if *id == node.id() {
-        node.prober()?;
-        let table = node.price_table();
-        return Some(
-            table
-                .probe_mc
-                .unwrap_or_else(|| price::price(price::PROBE, table.unit, 1)),
-        );
+        return Some(node.prober()?.price(&node.price_table()));
     }
     node.status.known(id)?.hb.probe_price_mc
 }
@@ -41,11 +35,6 @@ fn price_at(node: &Node, id: &NodeId) -> Option<u32> {
 /// probes), cheapest first.
 pub fn vantages(node: &Node, geo: &SharedGeo) -> Vec<Vantage> {
     let me = node.id();
-    let members = node.members();
-    let country = |ip: Option<&IpAddr>| {
-        let ip = ip?;
-        geo.read().ok()?.as_ref()?.lookup(ip).country
-    };
     let mut out = vec![];
     for id in node.live_members(crate::intel::LIVE_WINDOW) {
         if id != me && (node.is_blocked(&id) || node.dial_address(&id).is_none()) {
@@ -54,28 +43,19 @@ pub fn vantages(node: &Node, geo: &SharedGeo) -> Vec<Vantage> {
         let Some(price_mc) = price_at(node, &id) else {
             continue;
         };
-        let (name, publics, dialled) = if id == me {
-            ("this node".to_string(), node.public_addrs(), None)
-        } else {
-            let addr = node.dial_address(&id);
-            (
-                members
-                    .get(&id)
-                    .map(|m| m.name.clone())
-                    .unwrap_or_else(|| id.short()),
-                node.status
-                    .known(&id)
-                    .map(|k| k.hb.public_addrs.clone())
-                    .unwrap_or_default(),
-                addr.and_then(|a| a.parse::<std::net::SocketAddr>().ok())
-                    .map(|a| a.ip()),
-            )
+        let (name, country) = crate::intel::dns::describe(node, geo, &id);
+        let dialled = match id == me {
+            true => None,
+            false => node
+                .dial_address(&id)
+                .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+                .map(|a| a.ip()),
         };
         out.push(Vantage {
             node: id,
             name,
             price_mc,
-            country: country(publics.first().or(dialled.as_ref())),
+            country,
             dialled,
         });
     }

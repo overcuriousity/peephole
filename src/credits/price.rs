@@ -170,8 +170,6 @@ pub struct Table {
     pub load: f64,
     pub unit: Option<Mc>,
     pub offers: Vec<Offer>,
-    /// What a probe costs here; None when this node does not probe.
-    pub probe_mc: Option<u32>,
 }
 
 /// `(provider, millicredits)` pairs as a heartbeat carries them.
@@ -336,10 +334,6 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
                 on_demand,
             })
             .collect(),
-        // Doubles while every probe slot is busy.
-        probe_mc: node
-            .prober()
-            .map(|p| price(PROBE, unit, 1 + p.full() as u32)),
     });
     node.set_price_table(table.clone());
     Ok(table)

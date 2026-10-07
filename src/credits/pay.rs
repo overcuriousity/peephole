@@ -107,12 +107,14 @@ pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
 
 /// What an offer must have left of its 15 minutes to be served: the
 /// providers' time and some slack. A receipt written after the offer
-/// lapsed counts nowhere, so the server would answer unpaid.
-const SERVE_MARGIN_MS: u64 = 2 * 60 * 1000;
+/// lapsed counts nowhere, so the server would answer unpaid. A paid
+/// request that takes longer passes its own margin to [`accept_offer`].
+pub const SERVE_MARGIN_MS: u64 = 2 * 60 * 1000;
 
-/// Whether an offer dated `hlc` can still be charged when served `now_ms`.
-fn time_left(hlc: u64, now_ms: u64) -> bool {
-    now_ms + SERVE_MARGIN_MS <= crate::cluster::hlc::physical_ms(hlc) + super::OFFER_TTL_MS
+/// Whether an offer dated `hlc` can still be charged when served `now_ms`
+/// by a request that takes up to `margin_ms`.
+fn time_left(hlc: u64, now_ms: u64, margin_ms: u64) -> bool {
+    now_ms + margin_ms <= crate::cluster::hlc::physical_ms(hlc) + super::OFFER_TTL_MS
 }
 
 /// Write a receipt of nothing for `peer`'s offer `offer_seq`: it frees
@@ -178,13 +180,15 @@ pub enum Declined {
 
 /// The checks `serve` does on an offer before answering: wait for the
 /// entry, is an offer, for me, seal consistent, not already serving,
-/// standing, counts, open, time left, amount covers `price`.
+/// standing, counts, open, `margin_ms` left (see [`SERVE_MARGIN_MS`]),
+/// amount covers `price`.
 pub async fn accept_offer(
     node: &Arc<Node>,
     peer: NodeId,
     offer_seq: u64,
     price: Mc,
     what: &str,
+    margin_ms: u64,
 ) -> Result<Accepted, Declined> {
     let why = |w: String| Err(Declined::Why(w));
     let Some(entry) = wait_for(node, &peer, offer_seq).await else {
@@ -240,7 +244,7 @@ pub async fn accept_offer(
     if offer.state != OfferState::Open {
         return why("the offer is used up, or older than 15 minutes".into());
     }
-    if !time_left(offer.hlc, book.now_ms) {
+    if !time_left(offer.hlc, book.now_ms, margin_ms) {
         release(node, peer, offer_seq).await;
         return why("the offer lapses before it could be charged; offer again".into());
     }
@@ -295,11 +299,21 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
     let Some(parts) = book.ledger.spendable_parts(&me, total_mc) else {
         let have = book.balance(&me);
         return Err(format!(
-            "this node holds {} credits; the lookup costs {} ({} missing)",
+            "this node holds {} credits; this costs {} ({} missing)",
             show(have),
             show(total_mc),
             show(total_mc.saturating_sub(have))
         ));
+    };
+    // Checked before the offer is written: an offer nobody can be asked
+    // to serve would stay held for 15 minutes.
+    let addr = if server != me {
+        match node.dial_address(&server) {
+            Some(a) => Some(a),
+            None => return Err("the node cannot be dialled from here".into()),
+        }
+    } else {
+        None
     };
     let offer = repl::append_sealing(node, |seal| Record::CreditOffer {
         to: server,
@@ -308,10 +322,7 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
     })
     .await
     .map_err(|e| format!("the offer could not be written: {e:#}"))?;
-    if server != me {
-        let Some(addr) = node.dial_address(&server) else {
-            return Err("the node cannot be dialled from here".into());
-        };
+    if let Some(addr) = addr {
         // So the offer is there before the request.
         if let Err(e) = crate::cluster::sync::reconcile(node, server, &addr, false).await {
             tracing::debug!(
@@ -428,7 +439,7 @@ pub async fn serve(
         }
     }
     let total: Mc = asking.iter().map(|n| price_of(n)).sum();
-    let acc = match accept_offer(node, peer, offer_seq, total, "lookup").await {
+    let acc = match accept_offer(node, peer, offer_seq, total, "lookup", SERVE_MARGIN_MS).await {
         Ok(a) => a,
         Err(Declined::Why(why)) => {
             // Not about the amount: every provider asked for hears it.
@@ -691,12 +702,16 @@ mod tests {
         let min = 60 * 1000;
         let now = 1_000 * min;
         let made = |ago: u64| (now - ago) << 16;
-        assert!(time_left(made(0), now));
-        assert!(time_left(made(10 * min), now));
+        let m = SERVE_MARGIN_MS;
+        assert!(time_left(made(0), now, m));
+        assert!(time_left(made(10 * min), now, m));
         // Its receipt would be written after the offer lapsed: ignored
         // everywhere, the server unpaid.
-        assert!(!time_left(made(14 * min), now));
-        assert!(!time_left(made(20 * min), now));
+        assert!(!time_left(made(14 * min), now, m));
+        assert!(!time_left(made(20 * min), now, m));
+        // A longer request needs more of the offer left.
+        assert!(time_left(made(12 * min), now, m));
+        assert!(!time_left(made(12 * min), now, 3 * min + 1));
     }
 
     #[test]
