@@ -31,6 +31,11 @@ pub struct ProbeReq {
     pub group: String,
     #[serde(default)]
     pub offer_seq: Option<u64>,
+    /// The address the asker dialled this scanner at, when that is an IP:
+    /// the vantage address recorded when the scanner has no single public
+    /// address. The asker's own claim; older askers send none.
+    #[serde(default)]
+    pub dialled: Option<IpAddr>,
 }
 
 /// The answer, given before the probe runs.
@@ -78,6 +83,18 @@ fn declined(why: impl Into<String>, price_mc: Option<u32>) -> ProbeResp {
     }
 }
 
+/// The vantage address a result records and where it came from: this
+/// node's one public address; for its own probe its first of several (or
+/// none, `local`); otherwise the address the asker says it dialled.
+fn vantage(public: &[IpAddr], own: bool, req: &ProbeReq) -> (Option<IpAddr>, &'static str) {
+    match (public, own) {
+        ([one], _) => (Some(*one), "public"),
+        ([first, ..], true) => (Some(*first), "public"),
+        ([], true) => (None, "local"),
+        (_, false) => (req.dialled, "dialled"),
+    }
+}
+
 impl Prober {
     pub fn new(cfg: &Config, me: Option<NodeId>) -> Self {
         let max = cfg.probe.max_parallel;
@@ -122,9 +139,9 @@ impl Prober {
             .saturating_sub(self.slots.available_permits().min(u32::MAX as usize) as u32)
     }
 
-    /// Every slot is busy (the price doubles).
-    pub fn full(&self) -> bool {
-        self.busy() >= self.max
+    /// A probe is running here (the price doubles).
+    pub fn surging(&self) -> bool {
+        self.busy() >= 1
     }
 
     /// What the gate says of `ip` here: the target, or why not.
@@ -142,10 +159,12 @@ impl Prober {
         self.gate.allowed_level(store, ip).await
     }
 
-    /// What a probe costs here now, at `table`'s unit: double while
-    /// every slot is busy. Read live, so the surge follows the slots.
+    /// What a probe costs here now, at `table`'s unit: double while at
+    /// least one probe slot is busy. Read live by the heartbeat and by
+    /// `serve`, so the announced price and the price an offer is checked
+    /// against are the same.
     pub fn price(&self, table: &price::Table) -> u32 {
-        price::price(price::PROBE, table.unit, 1 + self.full() as u32)
+        price::price(price::PROBE, table.unit, 1 + self.surging() as u32)
     }
 
     /// Run the probe of `t`; a probe that panicked yields an `error` port
@@ -254,10 +273,7 @@ impl Prober {
             return decline("all probe slots are busy".into(), Some(price_u32));
         };
         let uid = format!("{}{}", node.id().uid_prefix(), new_uid());
-        let (vantage_ip, vantage_ip_source) = match node.public_addrs()[..] {
-            [one] => (Some(one), "public"),
-            _ => (None, "dialled"),
-        };
+        let (vantage_ip, vantage_ip_source) = vantage(&node.public_addrs(), peer == node.id(), req);
         let (me, node, group, probe_uid) =
             (self.clone(), node.clone(), req.group.clone(), uid.clone());
         tokio::spawn(async move {
@@ -366,6 +382,46 @@ mod tests {
         let ports = store.probe_ports(probes[0].id).await.unwrap();
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].outcome, "ok");
+    }
+
+    #[test]
+    fn the_vantage_is_public_own_or_dialled() {
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        let b: IpAddr = "198.51.100.2".parse().unwrap();
+        let d: IpAddr = "192.0.2.9".parse().unwrap();
+        let req = ProbeReq {
+            ip: "203.0.113.1".into(),
+            group: "g".into(),
+            offer_seq: Some(1),
+            dialled: Some(d),
+        };
+        assert_eq!(vantage(&[a], false, &req), (Some(a), "public"));
+        assert_eq!(vantage(&[a, b], false, &req), (Some(d), "dialled"));
+        assert_eq!(vantage(&[], false, &req), (Some(d), "dialled"));
+        assert_eq!(vantage(&[a, b], true, &req), (Some(a), "public"));
+        assert_eq!(vantage(&[], true, &req), (None, "local"));
+        // An older asker's request carries no dialled address.
+        let old: ProbeReq =
+            serde_json::from_str(r#"{"ip":"203.0.113.1","group":"g","offer_seq":1}"#).unwrap();
+        assert_eq!(old.dialled, None);
+        assert_eq!(vantage(&[], false, &old), (None, "dialled"));
+    }
+
+    #[test]
+    fn the_price_doubles_while_one_slot_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let prober = Prober::new(&config_with(dir.path(), ""), None);
+        assert!(prober.max >= 2, "the default has room for a second probe");
+        let table = price::Table {
+            unit: Some(1000),
+            ..Default::default()
+        };
+        assert_eq!(prober.price(&table), 4000);
+        let one = prober.slots.clone().try_acquire_owned().unwrap();
+        assert_eq!(prober.busy(), 1);
+        assert_eq!(prober.price(&table), 8000, "one busy slot surges");
+        drop(one);
+        assert_eq!(prober.price(&table), 4000);
     }
 
     #[tokio::test]

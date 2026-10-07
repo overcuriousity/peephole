@@ -446,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn a_probe_costs_four_units_and_doubles_when_the_slots_are_full() {
+    fn a_probe_costs_four_units_and_doubles_while_a_slot_is_busy() {
         assert_eq!(weight_milli(PROBE), 4000);
         assert_eq!(price(PROBE, Some(1000), 1), 4000);
         assert_eq!(price(PROBE, Some(1000), 2), 8000);

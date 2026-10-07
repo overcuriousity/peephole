@@ -59,9 +59,6 @@ pub struct Pending {
     pub at: Instant,
     pub asked_at: String,
     pub price_mc: u32,
-    /// The address this node dials the scanner at, when that is an IP: the
-    /// vantage address of a result that names none.
-    pub dialled: Option<IpAddr>,
     /// None: the request is still on its way; `Ok`: accepted (with the
     /// probe uid when the scanner named it); `Err`: declined, and why.
     pub outcome: Option<Result<String, String>>,
@@ -356,8 +353,8 @@ pub struct ProbeView {
     pub state: &'static str,
     pub why: Option<String>,
     pub vantage_ip: Option<String>,
-    /// The result named no vantage address: `vantage_ip` is the address
-    /// this node dialled the scanner at.
+    /// The scanner had no single public address: `vantage_ip` is the
+    /// address the asker says it dialled it at (recorded `dialled`).
     pub vantage_dialled: bool,
     pub rtt_ms: Option<i64>,
     pub started_at: Option<String>,
@@ -672,14 +669,13 @@ async fn request(
         ));
     };
     let group = new_uid();
-    let pending = |node, name: String, price_mc, dialled, outcome| Pending {
+    let pending = |node, name: String, price_mc, outcome| Pending {
         ip_id: row.id,
         node,
         name,
         at: Instant::now(),
         asked_at: now_ts(),
         price_mc,
-        dialled,
         outcome,
     };
     let remember = |list: Vec<Pending>| {
@@ -701,7 +697,6 @@ async fn request(
             LOCAL,
             "this node".into(),
             0,
-            None,
             Some(Ok(String::new())),
         )]);
         let st = state.clone();
@@ -729,7 +724,7 @@ async fn request(
     remember(
         chosen
             .iter()
-            .map(|v| pending(v.node, v.name.clone(), v.price_mc, v.dialled, None))
+            .map(|v| pending(v.node, v.name.clone(), v.price_mc, None))
             .collect(),
     );
     let ids: Vec<NodeId> = chosen.iter().map(|v| v.node).collect();
@@ -813,8 +808,8 @@ pub async fn groups_for(state: &AdminState, ip_id: i64) -> Vec<GroupView> {
             node_id: id_text(&origin),
             state: "done",
             why: None,
+            vantage_dialled: r.vantage_ip.is_some() && r.vantage_ip_source == "dialled",
             vantage_ip: r.vantage_ip,
-            vantage_dialled: false,
             rtt_ms: r.rtt_min_ms,
             started_at: Some(r.started_at.clone()),
             ports,
@@ -880,15 +875,7 @@ pub async fn groups_for(state: &AdminState, ip_id: i64) -> Vec<GroupView> {
             g.cost_kind = "offered";
             for p in list {
                 let text = id_text(&p.node);
-                if let Some(m) = g.members.iter_mut().find(|m| m.node_id == text) {
-                    // A scanner without one public address names none: the
-                    // address this node dialled stands in (spec §3).
-                    if m.vantage_ip.is_none()
-                        && let Some(d) = p.dialled
-                    {
-                        m.vantage_ip = Some(d.to_string());
-                        m.vantage_dialled = true;
-                    }
+                if g.members.iter().any(|m| m.node_id == text) {
                     continue;
                 }
                 let (st, why) = pending_state(p, now);
@@ -1215,6 +1202,117 @@ secure_cookies = false
         assert!(d.consistent >= 2, "status and server");
     }
 
+    /// `_probes.html` alone, around a loaded target.
+    #[derive(askama::Template)]
+    #[template(source = r#"{% include "_probes.html" %}"#, ext = "html")]
+    struct ProbesCard {
+        t: crate::admin::target::Target,
+        first: bool,
+    }
+
+    #[tokio::test]
+    async fn the_diff_and_a_contradicted_claim_render() {
+        use askama::Template;
+        let (state, _c, _id, _d) = state(Some(8080)).await;
+        let row = state.store.ip_by_addr(IP).await.unwrap().unwrap();
+        let mut t = crate::admin::target::load(&state, &row, true, 1, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let members = vec![member("a", "ok", "aa"), member("b", "ok", "bb")];
+        let (berlin, sydney) = (
+            Coords {
+                lat: 52.52,
+                lon: 13.40,
+                accuracy_km: 50,
+            },
+            Coords {
+                lat: -33.87,
+                lon: 151.21,
+                accuracy_km: 50,
+            },
+        );
+        t.probes = vec![GroupView {
+            group: "g1".into(),
+            asked_at: "2026-10-07 12:00:00".into(),
+            by: "this node".into(),
+            cost: "free".into(),
+            cost_kind: "charged",
+            charged_mc: 0,
+            diff: Some(diff(&members)),
+            members,
+            verdicts: vec![rtt_verdict("a", 8, Some(berlin), Some(sydney))],
+        }];
+        let html = ProbesCard { t, first: true }.render().unwrap();
+        assert!(
+            html.contains(r#"<tr class="diff"><td class="mono">443</td><td>tls.leaf_sha256</td>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains("location claim contradicted by 1 of 1 vantages"),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stream_sends_the_states_again_when_a_result_arrives() {
+        use futures::StreamExt;
+        let server = web().await;
+        let (state, cookie, id, _d) = state(Some(server.port())).await;
+        state.pending_probes.lock().unwrap().insert(
+            "g1".into(),
+            vec![Pending {
+                ip_id: id,
+                node: LOCAL,
+                name: "this node".into(),
+                at: Instant::now(),
+                asked_at: now_ts(),
+                price_mc: 0,
+                outcome: Some(Ok(String::new())),
+            }],
+        );
+        let app = crate::admin::full_router(state.clone());
+        let r = app
+            .oneshot(
+                axum::http::Request::get(format!("/admin/api/probes?ip={IP}"))
+                    .header("cookie", &cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let mut body = r.into_body().into_data_stream();
+        // Read until an event carrying `state` arrives.
+        async fn until(
+            body: &mut (impl futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Unpin),
+            state: &str,
+        ) -> String {
+            let mut seen = String::new();
+            let read = async {
+                while let Some(Ok(chunk)) = body.next().await {
+                    seen.push_str(&String::from_utf8_lossy(&chunk));
+                    if seen.contains("event: probes") && seen.contains(state) {
+                        return;
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(10), read)
+                .await
+                .unwrap_or_else(|_| panic!("no {state} event in {seen:?}"));
+            seen
+        }
+        let first = until(&mut body, r#"["g1","","running"]"#).await;
+        assert!(!first.contains("done"), "{first}");
+        // The result row appears, as the standalone probe writes it.
+        let prober = state.prober.clone().unwrap();
+        prober
+            .run_local(&state.store, IP.parse().unwrap(), "g1")
+            .await
+            .unwrap();
+        until(&mut body, r#"["g1","","done"]"#).await;
+    }
+
     #[test]
     fn a_timed_out_port_is_not_a_difference() {
         let d = diff(&[member("a", "ok", "aa"), member("b", "timeout", "bb")]);
@@ -1290,7 +1388,6 @@ secure_cookies = false
                 at: Instant::now(),
                 asked_at: now_ts(),
                 price_mc: 0,
-                dialled: None,
                 outcome: Some(Ok(String::new())),
             }],
         );
@@ -1334,7 +1431,6 @@ secure_cookies = false
                 at: Instant::now() - Duration::from_secs(16 * 60),
                 asked_at: now_ts(),
                 price_mc: 0,
-                dialled: None,
                 outcome: Some(Ok("uid-1".into())),
             }],
         );

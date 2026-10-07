@@ -31,6 +31,13 @@ fn price_at(node: &Node, id: &NodeId) -> Option<u32> {
     node.status.known(id)?.hb.probe_price_mc
 }
 
+/// The address this node dials `id` at, when that is an IP.
+fn dialled_ip(node: &Node, id: &NodeId) -> Option<IpAddr> {
+    node.dial_address(id)
+        .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+        .map(|a| a.ip())
+}
+
 /// Live scanners announcing a probe price (this node included when it
 /// probes), cheapest first.
 pub fn vantages(node: &Node, geo: &SharedGeo) -> Vec<Vantage> {
@@ -46,10 +53,7 @@ pub fn vantages(node: &Node, geo: &SharedGeo) -> Vec<Vantage> {
         let (name, country) = crate::intel::dns::describe(node, geo, &id);
         let dialled = match id == me {
             true => None,
-            false => node
-                .dial_address(&id)
-                .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
-                .map(|a| a.ip()),
+            false => dialled_ip(node, &id),
         };
         out.push(Vantage {
             node: id,
@@ -125,6 +129,9 @@ async fn offer_once(
         ip: ip.to_string(),
         group: group.to_string(),
         offer_seq: Some(seq),
+        // As in its `Vantage`: the scanner records it when it has no
+        // single public address of its own.
+        dialled: own.is_none().then(|| dialled_ip(node, &server)).flatten(),
     };
     if let Some(p) = own {
         return p.serve(node, me, &req).await;
@@ -147,6 +154,24 @@ async fn offer_once(
         tracing::debug!(?e, "sync after a declined probe offer failed");
     }
     resp
+}
+
+/// Offer `first`; a decline naming a higher price (at most
+/// [`pay::RETRY_AT_MOST`] times `first`) is offered that once more.
+async fn with_retry<F, Fut>(first: Mc, mut offer: F) -> ProbeResp
+where
+    F: FnMut(Mc) -> Fut,
+    Fut: std::future::Future<Output = ProbeResp>,
+{
+    let resp = offer(first).await;
+    match &resp {
+        ProbeResp::Declined { price_mc, .. } => match pay::retry_price(first, *price_mc, true) {
+            // Its price moved since its heartbeat: offer that, once.
+            Some(again) => offer(again).await,
+            None => resp,
+        },
+        ProbeResp::Accepted { .. } => resp,
+    }
 }
 
 /// One offer and one call per chosen scanner; the group uid ties the
@@ -173,14 +198,10 @@ pub async fn ask(
         let outcome = match price_at(node, id) {
             None => Err("it announces no probe price".to_string()),
             Some(p) => {
-                let offered = p as Mc;
-                let mut resp = offer_once(node, prober, *id, ip, group, offered).await;
-                if let ProbeResp::Declined { price_mc, .. } = &resp
-                    && let Some(again) = pay::retry_price(offered, *price_mc, true)
-                {
-                    // Its price moved since its heartbeat: offer that, once.
-                    resp = offer_once(node, prober, *id, ip, group, again).await;
-                }
+                let resp = with_retry(p as Mc, |price| {
+                    offer_once(node, prober, *id, ip, group, price)
+                })
+                .await;
                 match resp {
                     ProbeResp::Accepted { probe_uid } => Ok(probe_uid),
                     ProbeResp::Declined { why, .. } => Err(why),
@@ -194,4 +215,53 @@ pub async fn ask(
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Offers made to a scanner whose price is `price`; it accepts any
+    /// offer that covers it.
+    async fn offers_to(price: u32, first: Mc) -> (ProbeResp, Vec<Mc>) {
+        let made = Mutex::new(vec![]);
+        let resp = with_retry(first, |offer| {
+            made.lock().unwrap().push(offer);
+            async move {
+                match offer >= price as Mc {
+                    true => ProbeResp::Accepted {
+                        probe_uid: "u".into(),
+                    },
+                    false => ProbeResp::Declined {
+                        why: "too low".into(),
+                        price_mc: Some(price),
+                    },
+                }
+            }
+        })
+        .await;
+        (resp, made.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_too_low_decline_is_offered_once_more_at_the_named_price() {
+        let (resp, made) = offers_to(8000, 4000).await;
+        assert!(matches!(resp, ProbeResp::Accepted { .. }), "{resp:?}");
+        assert_eq!(made, vec![4000, 8000], "the named price, at most twice");
+    }
+
+    #[tokio::test]
+    async fn a_price_above_twice_the_offer_is_not_chased() {
+        let (resp, made) = offers_to(8001, 4000).await;
+        assert!(matches!(resp, ProbeResp::Declined { .. }));
+        assert_eq!(made, vec![4000]);
+    }
+
+    #[tokio::test]
+    async fn an_accepted_offer_is_not_repeated() {
+        let (resp, made) = offers_to(4000, 4000).await;
+        assert!(matches!(resp, ProbeResp::Accepted { .. }));
+        assert_eq!(made, vec![4000]);
+    }
 }

@@ -164,8 +164,10 @@ any set. The asking node may be one of them. A node without a dial address
 is not offered.
 
 **`vantage_ip`.** The scanner's single taken public address at probe time.
-With several or none, the address the asker dialled, marked
-`vantage_ip_source: dialled`. Coordinates are never stored or sent: whoever
+With several or none, the address the asker dialled (it sends it as
+`ProbeReq.dialled`), marked `vantage_ip_source: dialled`. A node probing
+for itself takes its first public address (`public`), or none (`local`).
+Coordinates are never stored or sent: whoever
 renders resolves `vantage_ip` and the target through its own City mmdb, so
 a database update corrects old results too.
 
@@ -204,8 +206,8 @@ fully dynamic later; this section only fixes the hooks.
 **Announcement.** Heartbeat gains `probe_price_mc: Option<u32>`, its own
 field — `probe` is not a provider name and `quotes` keeps filtering unknown
 providers. Scanner-role nodes with probing enabled set it; `None` means no
-probes here. Surge rises while the node's probe slots are full. A too-low
-offer is declined naming the price; the asker offers once more up to
+probes here. Surge doubles while at least one of the node's probe slots
+is busy. A too-low offer is declined naming the price; the asker offers once more up to
 `RETRY_AT_MOST` times, as `ask_server` does.
 
 **Offer and ask.** Per vantage one `CreditOffer` pinned to the scanner,

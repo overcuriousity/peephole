@@ -6066,6 +6066,10 @@ async fn a_paid_probe_is_accepted_served_and_charged() {
     let probe = na.store.probes_for_ip(ip_id).await.unwrap().remove(0);
     assert_eq!(probe.group_uid, "group-1");
     assert_eq!(probe.asker, a.id.0.to_vec());
+    // B has no public address: the address A dialled it at is recorded,
+    // and replicates with the result.
+    assert_eq!(probe.vantage_ip.as_deref(), Some("127.0.0.1"));
+    assert_eq!(probe.vantage_ip_source, "dialled");
     let ports = na.store.probe_ports(probe.id).await.unwrap();
     assert_eq!(ports[0].outcome, "ok", "{ports:?}");
     let receipt = entries::since(&na.store.pool, 0)
@@ -6104,6 +6108,7 @@ async fn a_probe_of_an_unknown_offer_is_declined_with_a_receipt_of_nothing() {
                 ip: "203.0.113.96".into(),
                 group: "group-2".into(),
                 offer_seq: Some(99999),
+                dialled: None,
             },
         )
         .await

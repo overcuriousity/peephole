@@ -1106,9 +1106,15 @@ impl Recorder {
         let deleted = own.len() as u64;
         self.bury(own).await?;
         let hidden = self.hide(foreign).await?;
-        // An IP without any record left (or that never had one) goes too.
+        // An IP without any record left (or that never had one) goes too;
+        // the names that resolved to it are its own rows here and go first,
+        // or they alone would keep it.
         let mut conn = self.store().pool.acquire().await?;
         for id in ids {
+            sqlx::query("DELETE FROM ip_names WHERE ip_id = ?")
+                .bind(id)
+                .execute(&mut *conn)
+                .await?;
             data::drop_orphan_ip(&mut conn, *id).await?;
         }
         Ok(Deleted { deleted, hidden })
