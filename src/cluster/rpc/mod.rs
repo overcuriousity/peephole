@@ -1,6 +1,7 @@
 //! Node-to-node RPC: HTTP/2 + CBOR over pinned-key mutual TLS.
 pub mod cbor;
 pub mod proto;
+pub mod routed;
 pub mod server;
 
 use super::Node;
@@ -231,15 +232,7 @@ async fn probe(
     Extension(Peer(peer)): Extension<Peer>,
     Cbor(req): Cbor<crate::scan::probe::serve::ProbeReq>,
 ) -> Response {
-    use crate::scan::probe::serve::ProbeResp;
-    let resp = match node.prober() {
-        Some(p) => p.clone().serve(&node, peer, &req).await,
-        None => ProbeResp::Declined {
-            why: "this node does not probe".into(),
-            price_mc: None,
-        },
-    };
-    Cbor(resp).into_response()
+    Cbor(routed::probe_answer(&node, peer, &req).await).into_response()
 }
 
 /// Long-poll for messages waiting for the caller.

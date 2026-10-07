@@ -871,6 +871,43 @@ impl Node {
         rpc::cbor::decode(&bytes).with_context(|| format!("{path}: undecodable reply"))
     }
 
+    /// Like [`Node::call`], also for a member nobody can dial: then the
+    /// request goes as a message (only [`rpc::routed::ROUTED_PATHS`]).
+    pub async fn call_any<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+        self: &Arc<Self>,
+        peer: NodeId,
+        path: &str,
+        body: &Req,
+        timeout: Duration,
+    ) -> Result<Resp> {
+        if let Some(addr) = self.dial_address(&peer) {
+            return tokio::time::timeout(timeout, self.call(peer, &addr, path, body))
+                .await
+                .map_err(|_| anyhow::anyhow!("{path}: no answer within {timeout:?}"))?;
+        }
+        let bytes = rpc::cbor::encode(body)?;
+        if !rpc::routed::fits(&bytes) {
+            bail!(
+                "{path}: request larger than {} bytes",
+                rpc::routed::MAX_ROUTED_BODY
+            );
+        }
+        let msg = msg::Msg::Rpc {
+            path: path.into(),
+            body: serde_bytes::ByteBuf::from(bytes),
+        };
+        match self.request(peer, msg, timeout).await? {
+            msg::Msg::RpcReply { status: 200, body } => {
+                rpc::cbor::decode(&body).with_context(|| format!("{path}: undecodable reply"))
+            }
+            msg::Msg::RpcReply { status, body } => bail!(
+                "{path}: HTTP {status}: {}",
+                String::from_utf8_lossy(&body[..body.len().min(300)])
+            ),
+            other => bail!("{path}: unexpected answer {other:?}"),
+        }
+    }
+
     /// Exchange `hello` with a peer; errors on protocol mismatch.
     pub async fn hello(&self, peer: NodeId, address: &str) -> Result<Hello> {
         let (status, bytes) = self
@@ -976,6 +1013,7 @@ pub async fn start(
         "cluster rpc listener up"
     );
     let tls = tls::server_config(&node.cert)?;
+    rpc::routed::serve(&node);
     tokio::spawn(rpc::server::serve(
         listener,
         tls,

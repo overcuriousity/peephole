@@ -135,6 +135,17 @@ pub enum Msg {
     CreditDrawReply {
         sent_mc: u64,
     },
+    /// A paid call to a member nobody can dial (`rpc::routed`); `body` is
+    /// the CBOR request a direct call would POST to `path`.
+    Rpc {
+        path: String,
+        body: serde_bytes::ByteBuf,
+    },
+    /// Its answer: the HTTP status a direct call would get, and the body.
+    RpcReply {
+        status: u16,
+        body: serde_bytes::ByteBuf,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

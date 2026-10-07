@@ -5150,6 +5150,49 @@ async fn price_seen(asker: &TestNode, server: NodeId, provider: &str) -> u32 {
     find().unwrap()
 }
 
+/// A server nobody can dial answers a routed call through its outbox.
+#[tokio::test]
+async fn an_outbound_only_member_answers_a_routed_call() {
+    use peephole::intel::lookup::{LookupReq, LookupResp};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[],
+        Opts {
+            advertise: false,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let token = invite::create(&na, &Default::default()).await.unwrap();
+    invite::join(&nb, &token).await.unwrap();
+    eventually("b long-polls a", || async {
+        na.node.status.polled_recently(&b.id)
+    })
+    .await;
+    assert!(na.node.dial_address(&b.id).is_none());
+    let req = LookupReq {
+        ip: "203.0.113.5".into(),
+        providers: vec![],
+        offer_seq: None,
+    };
+    let resp: LookupResp = na
+        .node
+        .call_any(b.id, "/rpc/v1/lookup", &req, Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert!(resp.findings.is_empty());
+    let err = na
+        .node
+        .call_any::<_, LookupResp>(b.id, "/rpc/v1/push", &req, Duration::from_secs(20))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("404"), "{err:#}");
+}
+
 /// The asker pays the announced price; the server gets all of it; both
 /// nodes hold the offer and the receipt and arrive at the same balances.
 #[tokio::test]
