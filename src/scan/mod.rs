@@ -138,6 +138,25 @@ impl Refusal {
     }
 }
 
+/// `arbiters` with those announcing funded jobs (`(scan_bids, scan_price_mc)`
+/// with bids) first, by announced price descending; the rest after, each
+/// group in its given order.
+fn funded_first(
+    arbiters: Vec<NodeId>,
+    announced: impl Fn(&NodeId) -> Option<(u32, u32)>,
+) -> Vec<NodeId> {
+    let mut ranked: Vec<(u8, std::cmp::Reverse<u32>, usize, NodeId)> = arbiters
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| match announced(&a) {
+            Some((bids, price)) if bids > 0 => (0, std::cmp::Reverse(price), i, a),
+            _ => (1, std::cmp::Reverse(0), i, a),
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, price, i, _)| (*rank, *price, *i));
+    ranked.into_iter().map(|(.., a)| a).collect()
+}
+
 /// A grant at a level this scanner excluded from its claim: an arbiter
 /// older than `exclude_levels` ignored it. Handed back "later".
 fn over_share(level: i64, exclude: &[u8]) -> bool {
@@ -201,6 +220,8 @@ enum Job {
         level: u8,
         lease: Duration,
         started_at: String,
+        /// The arbiter's offer funding it and its price (`credits::jobs`).
+        offer: Option<(u64, u32)>,
     },
     /// Another node's scan, run again here to check it (`credits::audit`).
     /// No arbiter and no lease: nobody waits for it.
@@ -517,10 +538,27 @@ impl Source {
         .bind(serde_json::to_string(exclude)?)
         .fetch_all(&node.store.pool)
         .await?;
-        for (a, _) in arbiters {
-            let Ok(arbiter) = NodeId::from_slice(&a) else {
-                continue;
-            };
+        let arbiters: Vec<NodeId> = arbiters
+            .into_iter()
+            .filter_map(|(a, _)| NodeId::from_slice(&a).ok())
+            .collect();
+        // Arbiters that announce funded jobs first, the best paying first.
+        // This node's own jobs never pay its own scanner.
+        let me = node.id();
+        let arbiters = funded_first(arbiters, |a| {
+            if *a == me {
+                return None;
+            }
+            node.status
+                .known(a)
+                .map(|k| (k.hb.scan_bids, k.hb.scan_price_mc.unwrap_or(0)))
+        });
+        let min_mc = node
+            .price_table()
+            .price_of(crate::credits::price::SCAN)
+            .unwrap_or(0)
+            / 2;
+        for arbiter in arbiters {
             // No scan work for or from a peer this node blocked.
             if node.is_blocked(&arbiter) {
                 continue;
@@ -539,6 +577,7 @@ impl Source {
                     arbiter,
                     Msg::Claim {
                         exclude_levels: exclude.to_vec(),
+                        min_mc,
                     },
                     CLAIM_TIMEOUT,
                 )
@@ -558,7 +597,7 @@ impl Source {
             let Some(g) = grant else { continue };
             if over_share(g.level, exclude) {
                 info!(job = %g.job_uid, target = %g.ip, "scan grant turned down: at the level-4 share");
-                let (node, uid) = (node.clone(), g.job_uid);
+                let (node, uid, offer) = (node.clone(), g.job_uid, g.offer_seq);
                 tokio::spawn(async move {
                     Self::report(
                         &node,
@@ -568,6 +607,9 @@ impl Source {
                         Some("at the level-4 share".into()),
                     )
                     .await;
+                    if let Some(seq) = offer {
+                        crate::credits::jobs::settle(&node, arbiter, seq, 0).await;
+                    }
                 });
                 continue;
             }
@@ -583,9 +625,12 @@ impl Source {
                     info!(job = %g.job_uid, target = %g.ip, status, why = why.as_deref().unwrap_or(""), "scan grant turned down");
                     // In the background: the retries must not stall the
                     // worker loop (finish reports run in a worker task too).
-                    let (node, uid) = (node.clone(), g.job_uid);
+                    let (node, uid, offer) = (node.clone(), g.job_uid, g.offer_seq);
                     tokio::spawn(async move {
                         Self::report(&node, arbiter, &uid, status, why).await;
+                        if let Some(seq) = offer {
+                            crate::credits::jobs::settle(&node, arbiter, seq, 0).await;
+                        }
                     });
                 }
             }
@@ -691,6 +736,7 @@ impl Source {
             level,
             lease: Duration::from_secs(g.lease_secs),
             started_at: crate::store::data::now_ts(),
+            offer: g.offer_seq.zip(Some(g.price_mc)),
         }))
     }
 
@@ -806,25 +852,44 @@ impl Source {
                     ip,
                     level,
                     started_at,
+                    offer,
                     ..
                 },
                 Some(node),
-            ) => match outcome {
-                Outcome::Done(res) => {
-                    if let Err(e) = self
-                        .rec
-                        .record_scan_result(uid, &ip.to_string(), *level as i64, started_at, &res)
-                        .await
-                    {
-                        warn!(job = %uid, ?e, "could not record scan result");
-                        Self::report(node, *arbiter, uid, "failed", Some(e.to_string())).await;
-                        return;
+            ) => {
+                let delivered = match outcome {
+                    Outcome::Done(res) => {
+                        if let Err(e) = self
+                            .rec
+                            .record_scan_result(
+                                uid,
+                                &ip.to_string(),
+                                *level as i64,
+                                started_at,
+                                &res,
+                            )
+                            .await
+                        {
+                            warn!(job = %uid, ?e, "could not record scan result");
+                            Self::report(node, *arbiter, uid, "failed", Some(e.to_string())).await;
+                            false
+                        } else {
+                            Self::report(node, *arbiter, uid, "done", None).await;
+                            true
+                        }
                     }
-                    Self::report(node, *arbiter, uid, "done", None).await;
+                    Outcome::Failed(e) => {
+                        Self::report(node, *arbiter, uid, "failed", Some(e)).await;
+                        false
+                    }
+                    // The lease is lost: nothing delivered, the offer freed.
+                    Outcome::Abandoned => false,
+                };
+                if let Some((seq, price)) = offer {
+                    let charged = if delivered { *price } else { 0 };
+                    crate::credits::jobs::settle(node, *arbiter, *seq, charged).await;
                 }
-                Outcome::Failed(e) => Self::report(node, *arbiter, uid, "failed", Some(e)).await,
-                Outcome::Abandoned => {}
-            },
+            }
             _ => {}
         }
     }
@@ -1850,6 +1915,8 @@ license_key = "k"
             ip: ip.into(),
             level,
             lease_secs: 60,
+            offer_seq: None,
+            price_mc: 0,
         }
     }
 
@@ -2067,6 +2134,23 @@ license_key = "k"
             .await
             .unwrap();
         assert_eq!(r.err().map(|(s, _)| s), Some("declined"));
+    }
+
+    #[test]
+    fn funded_arbiters_are_asked_first_best_paying_first() {
+        let id = |n: u8| NodeId([n; 32]);
+        let order = vec![id(1), id(2), id(3), id(4), id(5)];
+        let announced = |a: &NodeId| match a.0[0] {
+            2 => Some((3, 40)),
+            3 => Some((0, 90)),
+            4 => Some((1, 60)),
+            5 => Some((2, 40)),
+            _ => None,
+        };
+        assert_eq!(
+            funded_first(order, announced),
+            vec![id(4), id(2), id(5), id(1), id(3)]
+        );
     }
 
     #[test]
