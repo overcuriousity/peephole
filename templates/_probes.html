@@ -3,6 +3,36 @@
   <div class="card-head"><h2>Probes</h2><span class="muted small">requests made before a restart show once their result arrives</span></div>
   {% for g in t.probes %}
   <h3><span class="mono">{{ g.asked_at }}</span> · by {{ g.by }}{% if g.cost == "free" %} · free{% else if !g.cost.is_empty() %} · offered <span class="num">{{ g.cost }}</span> credits{% endif %}</h3>
+  {% if !g.verdicts.is_empty() %}
+  <div class="table-wrap"><table class="table small">
+    <thead><tr><th>Vantage</th><th>RTT</th><th>Bound</th><th>Distance</th><th>Verdict</th></tr></thead>
+    <tbody>
+      {% for v in g.verdicts %}
+      <tr{% if v.impossible %} class="diff"{% endif %}><td>{{ v.vantage }}</td><td class="num">{{ v.rtt_ms }} ms</td><td class="num">{{ v.bound_text() }}</td><td class="num">{{ v.distance_text() }}</td><td>{{ v.text }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% if g.contradicted() > 0 %}<p class="diff"><b>location claim contradicted by {{ g.contradicted() }} of {{ g.verdicts.len() }} vantages</b></p>{% endif %}
+  {% endif %}
+  {% if let Some(d) = g.diff %}
+  <div class="table-wrap"><table class="table small">
+    <thead><tr><th>Port</th><th>Field</th>{% for n in d.members %}<th>{{ n }}</th>{% endfor %}</tr></thead>
+    <tbody>
+      {% for r in d.rows %}{% if r.differs %}
+      <tr class="diff"><td class="mono">{{ r.port }}</td><td>{{ r.field }}</td>{% for v in r.values %}<td class="mono">{% if let Some(x) = v %}{{ x }}{% else %}-{% endif %}</td>{% endfor %}</tr>
+      {% endif %}{% endfor %}
+    </tbody>
+  </table></div>
+  {% if d.consistent > 0 %}
+  <details class="small"><summary>{{ d.consistent }} fields consistent across all vantages</summary>
+    <div class="table-wrap"><table class="table small"><tbody>
+      {% for r in d.rows %}{% if !r.differs %}
+      <tr><td class="mono">{{ r.port }}</td><td>{{ r.field }}</td>{% for v in r.values %}<td class="mono">{% if let Some(x) = v %}{{ x }}{% else %}-{% endif %}</td>{% endfor %}</tr>
+      {% endif %}{% endfor %}
+    </tbody></table></div>
+  </details>
+  {% endif %}
+  {% endif %}
   {% for m in g.members %}
   <div class="probe-member">
     <p><b>{{ m.node }}</b> <span class="badge badge-status" data-status="{{ m.state }}">{{ m.state }}</span>{% if let Some(w) = m.why %} <span class="muted">{{ w }}</span>{% endif %}{% if let Some(v) = m.vantage_ip %} · from <span class="mono">{{ v }}</span>{% endif %}{% if let Some(r) = m.rtt_ms %} · RTT <span class="num">{{ r }}</span> ms{% endif %}{% if let Some(s) = m.started_at %} · <span class="mono">{{ s }}</span>{% endif %}</p>

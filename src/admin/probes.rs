@@ -12,6 +12,7 @@ use crate::admin::auth::SessionUser;
 use crate::admin::error::AppResult;
 use crate::admin::pages::{redirect_with_error, redirect_with_notice};
 use crate::cluster::identity::NodeId;
+use crate::intel::geo::{Coords, haversine_km};
 use crate::scan::probe::gate::LOCAL;
 use crate::scan::probe::{ask, serve::Prober};
 use crate::store::data::{new_uid, now_ts};
@@ -135,9 +136,207 @@ pub struct GroupView {
     /// What was offered; empty when not known here.
     pub cost: String,
     pub members: Vec<ProbeView>,
+    /// Some when at least two members are done.
+    pub diff: Option<DiffView>,
+    /// One per done member with an RTT and known coordinates on both sides.
+    pub verdicts: Vec<RttVerdict>,
+}
+
+/// About two thirds of c in fibre: the optimistic bound.
+pub const LIGHT_KM_PER_MS: f64 = 200.0;
+
+/// Whether a vantage's RTT leaves room for the distance to where the
+/// target is said to be. Never a positive claim about the location.
+pub struct RttVerdict {
+    pub vantage: String,
+    pub rtt_ms: i64,
+    pub bound_km: f64,
+    pub distance_km: Option<f64>,
+    pub impossible: bool,
+    pub text: String,
+}
+
+/// The one-way light-speed bound from the RTT against the distance, less
+/// the accuracy radius of the target's location.
+pub fn rtt_verdict(
+    name: &str,
+    rtt_ms: i64,
+    vantage: Option<Coords>,
+    target: Option<Coords>,
+) -> RttVerdict {
+    let bound_km = rtt_ms as f64 / 2.0 * LIGHT_KM_PER_MS;
+    let distance_km = match (vantage, target) {
+        (Some(v), Some(t)) => {
+            Some(haversine_km((v.lat, v.lon), (t.lat, t.lon)) - t.accuracy_km as f64)
+        }
+        _ => None,
+    };
+    let impossible = distance_km.is_some_and(|d| d > bound_km);
+    let text = match distance_km {
+        Some(d) if impossible => {
+            format!("impossible: claimed {d:.0} km away, light-speed bound {bound_km:.0} km")
+        }
+        Some(d) => format!("plausible: {d:.0} km within {bound_km:.0} km"),
+        None => "no coordinates".into(),
+    };
+    RttVerdict {
+        vantage: name.to_string(),
+        rtt_ms,
+        bound_km,
+        distance_km,
+        impossible,
+        text,
+    }
+}
+
+/// One field of one port across the vantages.
+pub struct DiffRow {
+    pub port: i64,
+    pub field: String,
+    /// One per member; None: the port was not reached.
+    pub values: Vec<Option<String>>,
+    pub differs: bool,
+}
+
+pub struct DiffView {
+    pub members: Vec<String>,
+    pub rows: Vec<DiffRow>,
+    /// Rows with at least two values, all equal.
+    pub consistent: usize,
+    /// Rows whose values differ.
+    pub contradicted: usize,
+}
+
+const DIFF_FIELDS: &[&str] = &[
+    "status",
+    "server",
+    "powered_by",
+    "title",
+    "body_sha256",
+    "not_found.body_sha256",
+    "favicon_mmh3",
+    "redirects.last.url",
+    "tls.leaf_sha256",
+    "tls.chain_len",
+    "tls.version",
+    "tls.alpn",
+    "jarm",
+    "ssh.host_key_sha256",
+    "ssh.hassh",
+    "banner",
+];
+
+fn field_at(detail: &Value, path: &str) -> Option<String> {
+    let mut v = detail;
+    for key in path.split('.') {
+        v = match key {
+            "last" => v.as_array()?.last()?,
+            k => v.get(k)?,
+        };
+    }
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// The fields of every port, side by side. A port that was not `ok` says
+/// nothing and never makes a row differ.
+pub fn diff(members: &[ProbeView]) -> DiffView {
+    let mut ports: Vec<i64> = members
+        .iter()
+        .flat_map(|m| m.ports.iter().map(|p| p.port))
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    let mut rows = vec![];
+    for port in ports {
+        for field in DIFF_FIELDS {
+            let values: Vec<Option<String>> = members
+                .iter()
+                .map(|m| {
+                    m.ports
+                        .iter()
+                        .find(|p| p.port == port && p.outcome == "ok")
+                        .and_then(|p| field_at(&p.detail, field))
+                })
+                .collect();
+            let some: Vec<&String> = values.iter().flatten().collect();
+            if some.is_empty() {
+                continue;
+            }
+            let differs = some.len() >= 2 && some.iter().any(|v| *v != some[0]);
+            rows.push(DiffRow {
+                port,
+                field: field.to_string(),
+                values,
+                differs,
+            });
+        }
+    }
+    let contradicted = rows.iter().filter(|r| r.differs).count();
+    let consistent = rows
+        .iter()
+        .filter(|r| !r.differs && r.values.iter().flatten().count() >= 2)
+        .count();
+    DiffView {
+        members: members.iter().map(|m| m.node.clone()).collect(),
+        rows,
+        consistent,
+        contradicted,
+    }
+}
+
+/// Diff and verdicts of a group, from its done members.
+fn judge(g: &mut GroupView, geo: &crate::intel::SharedGeo, target: Option<IpAddr>) {
+    let done: Vec<&ProbeView> = g.members.iter().filter(|m| m.state == "done").collect();
+    let diffed = (done.len() >= 2).then(|| {
+        let owned: Vec<ProbeView> = done.iter().map(|m| (*m).clone()).collect();
+        diff(&owned)
+    });
+    let mut verdicts = vec![];
+    if let Some(t) = target
+        && let Ok(guard) = geo.read()
+        && let Some(db) = guard.as_ref()
+    {
+        let tc = db.coords(&t);
+        for m in &done {
+            if let (Some(rtt), Some(v)) = (
+                m.rtt_ms,
+                m.vantage_ip
+                    .as_deref()
+                    .and_then(|v| v.parse::<IpAddr>().ok()),
+            ) {
+                verdicts.push(rtt_verdict(&m.node, rtt, db.coords(&v), tc));
+            }
+        }
+    }
+    g.diff = diffed;
+    g.verdicts = verdicts;
+}
+
+impl GroupView {
+    /// How many vantages found the location claim impossible.
+    pub fn contradicted(&self) -> usize {
+        self.verdicts.iter().filter(|v| v.impossible).count()
+    }
+}
+
+impl RttVerdict {
+    pub fn bound_text(&self) -> String {
+        format!("{:.0} km", self.bound_km)
+    }
+
+    pub fn distance_text(&self) -> String {
+        self.distance_km
+            .map_or("-".into(), |d| format!("{d:.0} km"))
+    }
 }
 
 /// One vantage of a request.
+#[derive(Clone)]
 pub struct ProbeView {
     pub node: String,
     /// The node id (text), or empty for a standalone node.
@@ -151,6 +350,7 @@ pub struct ProbeView {
 }
 
 /// What one port showed.
+#[derive(Clone)]
 pub struct PortView {
     pub port: i64,
     pub protocol: String,
@@ -165,6 +365,7 @@ pub struct PortView {
 }
 
 /// One redirect hop.
+#[derive(Clone)]
 pub struct HopView {
     pub url: String,
     pub status: Option<u64>,
@@ -618,52 +819,65 @@ pub async fn groups_for(state: &AdminState, ip_id: i64) -> Vec<GroupView> {
                     false => String::new(),
                 },
                 members: vec![member],
+                diff: None,
+                verdicts: vec![],
             }),
         }
     }
     let now = Instant::now();
-    let map = state.pending_probes.lock().unwrap();
-    for (group, list) in map.iter() {
-        if list.first().is_none_or(|p| p.ip_id != ip_id) {
-            continue;
-        }
-        let at = match groups.iter().position(|g| &g.group == group) {
-            Some(i) => i,
-            None => {
-                groups.push(GroupView {
-                    group: group.clone(),
-                    asked_at: list[0].asked_at.clone(),
-                    by: "this node".into(),
-                    cost: String::new(),
-                    members: vec![],
-                });
-                groups.len() - 1
-            }
-        };
-        let g = &mut groups[at];
-        g.asked_at = list[0].asked_at.clone();
-        let offered: u64 = list.iter().map(|p| p.price_mc as u64).sum();
-        g.cost = match offered {
-            0 => "free".into(),
-            mc => crate::credits::show(mc),
-        };
-        for p in list {
-            let text = id_text(&p.node);
-            if g.members.iter().any(|m| m.node_id == text) {
+    {
+        let map = state.pending_probes.lock().unwrap();
+        for (group, list) in map.iter() {
+            if list.first().is_none_or(|p| p.ip_id != ip_id) {
                 continue;
             }
-            let (st, why) = pending_state(p, now);
-            g.members.push(ProbeView {
-                node: p.name.clone(),
-                node_id: text,
-                state: st,
-                why,
-                vantage_ip: None,
-                rtt_ms: None,
-                started_at: None,
-                ports: vec![],
-            });
+            let at = match groups.iter().position(|g| &g.group == group) {
+                Some(i) => i,
+                None => {
+                    groups.push(GroupView {
+                        group: group.clone(),
+                        asked_at: list[0].asked_at.clone(),
+                        by: "this node".into(),
+                        cost: String::new(),
+                        members: vec![],
+                        diff: None,
+                        verdicts: vec![],
+                    });
+                    groups.len() - 1
+                }
+            };
+            let g = &mut groups[at];
+            g.asked_at = list[0].asked_at.clone();
+            let offered: u64 = list.iter().map(|p| p.price_mc as u64).sum();
+            g.cost = match offered {
+                0 => "free".into(),
+                mc => crate::credits::show(mc),
+            };
+            for p in list {
+                let text = id_text(&p.node);
+                if g.members.iter().any(|m| m.node_id == text) {
+                    continue;
+                }
+                let (st, why) = pending_state(p, now);
+                g.members.push(ProbeView {
+                    node: p.name.clone(),
+                    node_id: text,
+                    state: st,
+                    why,
+                    vantage_ip: None,
+                    rtt_ms: None,
+                    started_at: None,
+                    ports: vec![],
+                });
+            }
         }
+    }
+    let target = match state.store.ip_overview(ip_id).await {
+        Ok(Some(o)) => o.ip.ip.parse::<IpAddr>().ok(),
+        _ => None,
+    };
+    for g in &mut groups {
+        judge(g, &state.geo, target);
     }
     groups.sort_by(|a, b| b.asked_at.cmp(&a.asked_at));
     groups
@@ -883,6 +1097,93 @@ secure_cookies = false
             .await
             .unwrap();
         (status, headers, String::from_utf8_lossy(&b).into_owned())
+    }
+
+    #[test]
+    fn an_impossible_claim_is_flagged_and_a_possible_one_is_not() {
+        let berlin = Coords {
+            lat: 52.52,
+            lon: 13.40,
+            accuracy_km: 50,
+        };
+        let sydney = Coords {
+            lat: -33.87,
+            lon: 151.21,
+            accuracy_km: 50,
+        };
+        let v = rtt_verdict("a", 8, Some(berlin), Some(sydney));
+        assert!(v.impossible);
+        assert!(v.text.contains("impossible"), "{}", v.text);
+        assert!((v.bound_km - 800.0).abs() < 1.0);
+        let v = rtt_verdict("a", 200, Some(berlin), Some(sydney));
+        assert!(!v.impossible, "20 000 km bound covers 16 000 km");
+        let v = rtt_verdict("a", 8, Some(berlin), None);
+        assert!(!v.impossible && v.distance_km.is_none());
+    }
+
+    #[test]
+    fn the_accuracy_radius_is_subtracted_before_judging() {
+        let a = Coords {
+            lat: 52.52,
+            lon: 13.40,
+            accuracy_km: 0,
+        };
+        let b = Coords {
+            lat: 48.86,
+            lon: 2.35,
+            accuracy_km: 1000,
+        };
+        assert!(
+            !rtt_verdict("a", 1, Some(a), Some(b)).impossible,
+            "878 - 1000 < 100"
+        );
+        let b = Coords {
+            accuracy_km: 0,
+            ..b
+        };
+        assert!(
+            rtt_verdict("a", 1, Some(a), Some(b)).impossible,
+            "878 > 100"
+        );
+    }
+
+    fn member(name: &str, outcome: &str, cert: &str) -> ProbeView {
+        ProbeView {
+            node: name.into(),
+            node_id: String::new(),
+            state: "done",
+            why: None,
+            vantage_ip: None,
+            rtt_ms: Some(1),
+            started_at: None,
+            ports: vec![port_view(
+                443,
+                "https",
+                outcome,
+                &json!({"status": 200, "server": "nginx", "tls": {"leaf_sha256": cert}}),
+            )],
+        }
+    }
+
+    #[test]
+    fn the_diff_collapses_equal_rows_and_marks_different_ones() {
+        let d = diff(&[member("a", "ok", "aa"), member("b", "ok", "bb")]);
+        let server = d.rows.iter().find(|r| r.field == "server").unwrap();
+        assert!(!server.differs);
+        let leaf = d
+            .rows
+            .iter()
+            .find(|r| r.field == "tls.leaf_sha256")
+            .unwrap();
+        assert!(leaf.differs);
+        assert_eq!(leaf.values, vec![Some("aa".into()), Some("bb".into())]);
+        assert!(d.consistent >= 2, "status and server");
+    }
+
+    #[test]
+    fn a_timed_out_port_is_not_a_difference() {
+        let d = diff(&[member("a", "ok", "aa"), member("b", "timeout", "bb")]);
+        assert!(d.rows.iter().all(|r| !r.differs));
     }
 
     #[tokio::test]

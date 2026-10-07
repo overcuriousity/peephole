@@ -199,3 +199,4 @@ a.tile .hint { color: var(--color-accent); }
 .vantages li + li { margin-top: 0.25rem; }
 .probe-member { display: grid; gap: 0.75rem; margin-bottom: 1rem; }
 .probe-member .intel h4 { margin: 0 0 0.5rem; font-size: var(--text-sm); }
+tr.diff td, p.diff { background: var(--color-warning-dim); }
