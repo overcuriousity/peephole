@@ -86,7 +86,14 @@ async fn search(
     Query(sq): Query<SearchQuery>,
 ) -> AppResult<Response> {
     let q = sq.q.unwrap_or_default().trim().to_string();
-    let to = match classify(&q) {
+    // A name the links know as a value (a file name such as
+    // `wp-login.php`) is searched as one; any other name goes to Lookup.
+    let input = match classify(&q) {
+        Input::Host(h) if st.store.find_value(&q).await?.is_empty() => Input::Host(h),
+        Input::Host(_) => Input::Value(q.clone()),
+        i => i,
+    };
+    let to = match input {
         Input::Empty => None,
         Input::Ip(ip) => Some(if st.store.ip_by_addr(&ip.to_string()).await?.is_some() {
             format!("/ip/{ip}")

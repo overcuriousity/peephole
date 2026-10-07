@@ -56,6 +56,9 @@ pub struct AdminState {
     /// Probe requests made here and not yet answered by a result, by
     /// group uid (`admin::probes`). In memory: a restart forgets them.
     pub pending_probes: std::sync::Mutex<probes::PendingMap>,
+    /// The gate a member that does not probe judges addresses with, built
+    /// on first use (`admin::probes`).
+    pub probe_judge: std::sync::OnceLock<crate::scan::probe::serve::Prober>,
 }
 
 impl AdminState {
@@ -90,6 +93,7 @@ impl AdminState {
             prober: None,
             geo,
             pending_probes: Default::default(),
+            probe_judge: Default::default(),
         }
     }
 

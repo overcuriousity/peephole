@@ -1,8 +1,8 @@
 {# Probe requests and results on one address (admin::probes::GroupView): admin only. #}
-<section class="card" id="probes" data-section="probes"{% if t.probes_waiting() %} data-probes-src="/admin/api/probes?ip={{ t.ov.ip.ip|urlencode }}" data-probes-states="{{ t.probe_states() }}"{% endif %}>
+<section class="card"{% if first %} id="probes"{% endif %} data-section="probes"{% if t.probes_waiting() %} data-probes-src="/admin/api/probes?ip={{ t.ov.ip.ip|urlencode }}" data-probes-states="{{ t.probe_states() }}"{% endif %}>
   <div class="card-head"><h2>Probes</h2><span class="muted small">requests made before a restart show once their result arrives</span></div>
   {% for g in t.probes %}
-  <h3><span class="mono">{{ g.asked_at }}</span> · by {{ g.by }}{% if g.cost == "free" %} · free{% else if !g.cost.is_empty() %} · offered <span class="num">{{ g.cost }}</span> credits{% endif %}</h3>
+  <h3><span class="mono">{{ g.asked_at }}</span> · by {{ g.by }}{% if g.cost == "free" %} · free{% else if !g.cost.is_empty() %} · {{ g.cost_kind }} <span class="num">{{ g.cost }}</span> credits{% endif %}</h3>
   {% if !g.verdicts.is_empty() %}
   <div class="table-wrap"><table class="table small">
     <thead><tr><th>Vantage</th><th>RTT</th><th>Bound</th><th>Distance</th><th>Verdict</th></tr></thead>
@@ -35,7 +35,9 @@
   {% endif %}
   {% for m in g.members %}
   <div class="probe-member">
-    <p><b>{{ m.node }}</b> <span class="badge badge-status" data-status="{{ m.state }}">{{ m.state }}</span>{% if let Some(w) = m.why %} <span class="muted">{{ w }}</span>{% endif %}{% if let Some(v) = m.vantage_ip %} · from <span class="mono">{{ v }}</span>{% endif %}{% if let Some(r) = m.rtt_ms %} · RTT <span class="num">{{ r }}</span> ms{% endif %}{% if let Some(s) = m.started_at %} · <span class="mono">{{ s }}</span>{% endif %}</p>
+    <p><b>{{ m.node }}</b> <span class="badge badge-status" data-status="{{ m.state }}">{{ m.state }}</span>{% if let Some(w) = m.why %} <span class="muted">{{ w }}</span>{% endif %}{% if let Some(v) = m.vantage_ip %} · from <span class="mono">{{ v }}</span>{% if m.vantage_dialled %} <span class="muted">(dialled)</span>{% endif %}{% endif %}{% if let Some(r) = m.rtt_ms %} · RTT <span class="num">{{ r }}</span> ms{% endif %}{% if let Some(s) = m.started_at %} · <span class="mono">{{ s }}</span>{% endif %}</p>
+    {% if !m.ports.is_empty() %}
+    <details class="small"><summary>{{ m.ports.len() }} port{% if m.ports.len() != 1 %}s{% endif %} as seen from {{ m.node }}</summary>
     {% for p in m.ports %}
     <div class="intel">
       <h4><span class="mono">{{ p.port }}/{{ p.protocol }}</span> <span class="badge badge-status" data-status="{% if p.outcome == "ok" %}done{% else %}failed{% endif %}">{{ p.outcome }}</span></h4>
@@ -50,6 +52,8 @@
       {% endif %}
     </div>
     {% endfor %}
+    </details>
+    {% endif %}
   </div>
   {% endfor %}
   {% endfor %}

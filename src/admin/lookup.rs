@@ -183,8 +183,9 @@ pub struct NamesView {
     pub resolvers: Vec<String>,
     /// `(node, why)` for every node that did not answer.
     pub errors: Vec<(String, String)>,
-    /// More addresses were agreed than are looked up.
-    pub capped: bool,
+    /// Agreed addresses past the first [`crate::intel::dns::MAX_FOLLOWED`]:
+    /// not looked up.
+    pub also: Vec<String>,
 }
 
 #[derive(Template)]
@@ -271,6 +272,9 @@ async fn lookup(
     let ask = f.asked();
     let text = f.ip.unwrap_or_default().trim().to_string();
     let cluster = state.recorder.node().is_some();
+    if text.parse::<IpAddr>().is_err() && is_list(&text) {
+        return bulk_page(&state, text).await;
+    }
     let Ok(ip) = text.parse::<IpAddr>() else {
         let (names, results, error) = match crate::intel::dns::valid_name(&text) {
             None => (None, vec![], Some("Not an IP address or host name.".into())),
@@ -335,9 +339,18 @@ pub async fn by_name(
         .as_ref()
         .map(|r| r.answers.as_slice())
         .unwrap_or_default();
+    // Agreed addresses past those looked up go under "also resolves to".
+    let past: Vec<IpAddr> = tally
+        .votes
+        .iter()
+        .filter(|v| v.agreed)
+        .skip(dns::MAX_FOLLOWED)
+        .map(|v| v.addr)
+        .collect();
     let rows = tally
         .votes
         .iter()
+        .filter(|v| !past.contains(&v.addr))
         .map(|v| {
             let from: Vec<String> = answers
                 .iter()
@@ -395,7 +408,7 @@ pub async fn by_name(
                 .iter()
                 .map(|(id, why)| (label(id), why.clone()))
                 .collect(),
-            capped: agreed.len() > dns::MAX_FOLLOWED,
+            also: past.iter().map(IpAddr::to_string).collect(),
         },
         followed,
     )))
@@ -515,7 +528,16 @@ async fn bulk(
     State(state): State<Arc<AdminState>>,
     Form(f): Form<BulkForm>,
 ) -> AppResult<Html<String>> {
-    let text = f.ips.unwrap_or_default();
+    bulk_page(&state, f.ips.unwrap_or_default()).await
+}
+
+/// Several addresses or a network, as typed or pasted into the one field.
+fn is_list(text: &str) -> bool {
+    text.contains(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        || text.parse::<ipnet::IpNet>().is_ok()
+}
+
+async fn bulk_page(state: &AdminState, text: String) -> AppResult<Html<String>> {
     let (mut addrs, mut nets, mut unreadable) = (vec![], vec![], vec![]);
     for piece in text
         .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
@@ -548,7 +570,7 @@ async fn bulk(
         names: None,
         results: vec![],
         cluster: state.recorder.node().is_some(),
-        offer: offer(&state).await,
+        offer: offer(state).await,
         bulk: Some(Bulk {
             text,
             rows,
@@ -688,7 +710,7 @@ secure_cookies = false
         )
         .await;
         assert_eq!(status, 200);
-        assert!(html.contains(r#"value="203.0.113.9""#));
+        assert!(html.contains(r#"autofocus>203.0.113.9</textarea>"#));
 
         let post = || {
             axum::http::Request::post("/admin/lookup")

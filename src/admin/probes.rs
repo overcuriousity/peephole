@@ -45,7 +45,7 @@ pub const LAPSE_AFTER: Duration = Duration::from_secs(15 * 60);
 /// A pending request is forgotten after this long.
 const FORGET_AFTER: Duration = Duration::from_secs(24 * 3600);
 /// Vantages ticked by default.
-const DEFAULT_VANTAGES: usize = 3;
+const DEFAULT_VANTAGES: usize = 4;
 /// How often the stream looks again without a log change.
 const POLL: Duration = Duration::from_secs(3);
 /// How often the stream re-checks the session.
@@ -59,6 +59,9 @@ pub struct Pending {
     pub at: Instant,
     pub asked_at: String,
     pub price_mc: u32,
+    /// The address this node dials the scanner at, when that is an IP: the
+    /// vantage address of a result that names none.
+    pub dialled: Option<IpAddr>,
     /// None: the request is still on its way; `Ok`: accepted (with the
     /// probe uid when the scanner named it); `Err`: declined, and why.
     pub outcome: Option<Result<String, String>>,
@@ -133,8 +136,13 @@ pub struct GroupView {
     pub group: String,
     pub asked_at: String,
     pub by: String,
-    /// What was offered; empty when not known here.
+    /// What was offered (requests made here) or charged (the results'
+    /// record); empty when not known here.
     pub cost: String,
+    /// `offered` or `charged`.
+    pub cost_kind: &'static str,
+    /// What the results so far were charged.
+    charged_mc: u64,
     pub members: Vec<ProbeView>,
     /// Some when at least two members are done.
     pub diff: Option<DiffView>,
@@ -167,7 +175,7 @@ pub fn rtt_verdict(
     let bound_km = rtt_ms as f64 / 2.0 * LIGHT_KM_PER_MS;
     let distance_km = match (vantage, target) {
         (Some(v), Some(t)) => {
-            Some(haversine_km((v.lat, v.lon), (t.lat, t.lon)) - t.accuracy_km as f64)
+            Some((haversine_km((v.lat, v.lon), (t.lat, t.lon)) - t.accuracy_km as f64).max(0.0))
         }
         _ => None,
     };
@@ -176,7 +184,7 @@ pub fn rtt_verdict(
         Some(d) if impossible => {
             format!("impossible: claimed {d:.0} km away, light-speed bound {bound_km:.0} km")
         }
-        Some(d) => format!("plausible: {d:.0} km within {bound_km:.0} km"),
+        Some(d) => format!("not contradicted: {d:.0} km within {bound_km:.0} km"),
         None => "no coordinates".into(),
     };
     RttVerdict {
@@ -204,7 +212,7 @@ pub struct DiffView {
     /// Rows with at least two values, all equal.
     pub consistent: usize,
     /// Rows whose values differ.
-    pub contradicted: usize,
+    pub differing: usize,
 }
 
 const DIFF_FIELDS: &[&str] = &[
@@ -276,7 +284,7 @@ pub fn diff(members: &[ProbeView]) -> DiffView {
             });
         }
     }
-    let contradicted = rows.iter().filter(|r| r.differs).count();
+    let differing = rows.iter().filter(|r| r.differs).count();
     let consistent = rows
         .iter()
         .filter(|r| !r.differs && r.values.iter().flatten().count() >= 2)
@@ -285,7 +293,7 @@ pub fn diff(members: &[ProbeView]) -> DiffView {
         members: members.iter().map(|m| m.node.clone()).collect(),
         rows,
         consistent,
-        contradicted,
+        differing,
     }
 }
 
@@ -309,7 +317,11 @@ fn judge(g: &mut GroupView, geo: &crate::intel::SharedGeo, target: Option<IpAddr
                     .as_deref()
                     .and_then(|v| v.parse::<IpAddr>().ok()),
             ) {
-                verdicts.push(rtt_verdict(&m.node, rtt, db.coords(&v), tc));
+                let name = match m.vantage_dialled {
+                    true => format!("{} (dialled)", m.node),
+                    false => m.node.clone(),
+                };
+                verdicts.push(rtt_verdict(&name, rtt, db.coords(&v), tc));
             }
         }
     }
@@ -344,6 +356,9 @@ pub struct ProbeView {
     pub state: &'static str,
     pub why: Option<String>,
     pub vantage_ip: Option<String>,
+    /// The result named no vantage address: `vantage_ip` is the address
+    /// this node dialled the scanner at.
+    pub vantage_dialled: bool,
     pub rtt_ms: Option<i64>,
     pub started_at: Option<String>,
     pub ports: Vec<PortView>,
@@ -532,18 +547,16 @@ fn this_node_only(why: &str) -> bool {
 /// why this node's gate refuses the address.
 async fn guard_line(state: &AdminState, ip: &IpAddr) -> Result<String, String> {
     let node = state.recorder.node().map(|n| &**n);
-    let own;
     let prober: &Prober = match (&state.prober, node) {
         (Some(p), _) => p,
         (None, None) => return Err("this node does not probe".into()),
         // A member that does not probe still judges the address with the
         // shared rules: the scanners decide again when asked.
-        (None, Some(n)) => {
+        (None, Some(n)) => state.probe_judge.get_or_init(|| {
             let mut cfg = state.cfg.clone();
             cfg.probe.enabled = true;
-            own = Prober::new(&cfg, Some(n.id()));
-            &own
-        }
+            Prober::new(&cfg, Some(n.id()))
+        }),
     };
     let target = prober.check(&state.store, node, ip).await?;
     let when = async {
@@ -659,13 +672,14 @@ async fn request(
         ));
     };
     let group = new_uid();
-    let pending = |node, name: String, price_mc, outcome| Pending {
+    let pending = |node, name: String, price_mc, dialled, outcome| Pending {
         ip_id: row.id,
         node,
         name,
         at: Instant::now(),
         asked_at: now_ts(),
         price_mc,
+        dialled,
         outcome,
     };
     let remember = |list: Vec<Pending>| {
@@ -687,6 +701,7 @@ async fn request(
             LOCAL,
             "this node".into(),
             0,
+            None,
             Some(Ok(String::new())),
         )]);
         let st = state.clone();
@@ -714,7 +729,7 @@ async fn request(
     remember(
         chosen
             .iter()
-            .map(|v| pending(v.node, v.name.clone(), v.price_mc, None))
+            .map(|v| pending(v.node, v.name.clone(), v.price_mc, v.dialled, None))
             .collect(),
     );
     let ids: Vec<NodeId> = chosen.iter().map(|v| v.node).collect();
@@ -740,7 +755,7 @@ fn pending_state(p: &Pending, now: Instant) -> (&'static str, Option<String>) {
     match &p.outcome {
         Some(Err(why)) => ("declined", Some(why.clone())),
         _ if now.saturating_duration_since(p.at) >= LAPSE_AFTER => {
-            ("lapsed", Some("no result after 15 min".into()))
+            ("lapsed", Some("no result, nothing charged".into()))
         }
         None => ("queued", None),
         Some(Ok(_)) => ("running", None),
@@ -799,6 +814,7 @@ pub async fn groups_for(state: &AdminState, ip_id: i64) -> Vec<GroupView> {
             state: "done",
             why: None,
             vantage_ip: r.vantage_ip,
+            vantage_dialled: false,
             rtt_ms: r.rtt_min_ms,
             started_at: Some(r.started_at.clone()),
             ports,
@@ -808,6 +824,7 @@ pub async fn groups_for(state: &AdminState, ip_id: i64) -> Vec<GroupView> {
                 if r.started_at < g.asked_at {
                     g.asked_at = r.started_at;
                 }
+                g.charged_mc += r.charged_mc.max(0) as u64;
                 g.members.push(member);
             }
             None => groups.push(GroupView {
@@ -818,11 +835,16 @@ pub async fn groups_for(state: &AdminState, ip_id: i64) -> Vec<GroupView> {
                     true => "free".into(),
                     false => String::new(),
                 },
+                cost_kind: "charged",
+                charged_mc: r.charged_mc.max(0) as u64,
                 members: vec![member],
                 diff: None,
                 verdicts: vec![],
             }),
         }
+    }
+    for g in groups.iter_mut().filter(|g| g.charged_mc > 0) {
+        g.cost = crate::credits::show(g.charged_mc);
     }
     let now = Instant::now();
     {
@@ -839,6 +861,8 @@ pub async fn groups_for(state: &AdminState, ip_id: i64) -> Vec<GroupView> {
                         asked_at: list[0].asked_at.clone(),
                         by: "this node".into(),
                         cost: String::new(),
+                        cost_kind: "offered",
+                        charged_mc: 0,
                         members: vec![],
                         diff: None,
                         verdicts: vec![],
@@ -853,9 +877,18 @@ pub async fn groups_for(state: &AdminState, ip_id: i64) -> Vec<GroupView> {
                 0 => "free".into(),
                 mc => crate::credits::show(mc),
             };
+            g.cost_kind = "offered";
             for p in list {
                 let text = id_text(&p.node);
-                if g.members.iter().any(|m| m.node_id == text) {
+                if let Some(m) = g.members.iter_mut().find(|m| m.node_id == text) {
+                    // A scanner without one public address names none: the
+                    // address this node dialled stands in (spec §3).
+                    if m.vantage_ip.is_none()
+                        && let Some(d) = p.dialled
+                    {
+                        m.vantage_ip = Some(d.to_string());
+                        m.vantage_dialled = true;
+                    }
                     continue;
                 }
                 let (st, why) = pending_state(p, now);
@@ -865,6 +898,7 @@ pub async fn groups_for(state: &AdminState, ip_id: i64) -> Vec<GroupView> {
                     state: st,
                     why,
                     vantage_ip: None,
+                    vantage_dialled: false,
                     rtt_ms: None,
                     started_at: None,
                     ports: vec![],
@@ -1154,6 +1188,7 @@ secure_cookies = false
             state: "done",
             why: None,
             vantage_ip: None,
+            vantage_dialled: false,
             rtt_ms: Some(1),
             started_at: None,
             ports: vec![port_view(
@@ -1255,14 +1290,25 @@ secure_cookies = false
                 at: Instant::now(),
                 asked_at: now_ts(),
                 price_mc: 0,
+                dialled: None,
                 outcome: Some(Ok(String::new())),
             }],
         );
+        sqlx::query(
+            "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen, agreed)
+             VALUES (?, 'names-test.example', 'dns', '2026-01-01 00:00:00',
+                     '2026-01-01 00:00:00', 1)",
+        )
+        .bind(id)
+        .execute(&state.store.pool)
+        .await
+        .unwrap();
         let app = crate::admin::full_router(state);
         let (status, _, html) = send(&app, axum::http::Request::get(format!("/ip/{IP}")), "").await;
         assert_eq!(status, 200);
         assert!(!html.contains(r#"data-section="probes""#));
         assert!(!html.contains(r#"data-section="actions""#));
+        assert!(!html.contains("names-test.example"), "names are admin only");
         // The admin sees both.
         let (_, _, html) = send(
             &app,
@@ -1273,6 +1319,7 @@ secure_cookies = false
         assert!(
             html.contains(r#"data-section="probes""#) && html.contains(r#"data-section="actions""#)
         );
+        assert!(html.contains("names-test.example"));
     }
 
     #[tokio::test]
@@ -1287,6 +1334,7 @@ secure_cookies = false
                 at: Instant::now() - Duration::from_secs(16 * 60),
                 asked_at: now_ts(),
                 price_mc: 0,
+                dialled: None,
                 outcome: Some(Ok("uid-1".into())),
             }],
         );

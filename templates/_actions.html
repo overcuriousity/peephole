@@ -1,5 +1,5 @@
 {# The Actions card (admin::probes::ActionsView `a`, address `t.ov.ip.ip`): admin only. Buttons are disabled with the reason, never hidden. #}
-<section class="card" id="actions" data-section="actions">
+<section class="card"{% if first %} id="actions"{% endif %} data-section="actions">
   <div class="card-head"><h2>Actions</h2></div>
   <p class="{% if a.allowed %}muted{% else %}text-warning{% endif %}" data-guard>{{ a.guard_line }}</p>
   <form method="post" action="/admin/lookup/probe" data-probe-form>

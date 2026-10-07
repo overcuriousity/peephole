@@ -578,7 +578,9 @@ pub async fn run_scheduler(
         warn!("no [maxmind] credentials and no GeoLite2 databases: GeoIP enrichment is off");
     }
     let now = tokio::time::Instant::now();
-    let (mut tor_next, mut mm_next, mut rdap_next) = (now, now, now);
+    let (mut tor_next, mut mm_next) = (now, now);
+    // Fresh files from the last run are not downloaded again.
+    let mut rdap_next = now + rdap::Bootstrap::due_in(&cfg.data_dir);
     let (mut tor_backoff, mut mm_backoff) = (TOR_BACKOFF, MAXMIND_BACKOFF);
     let mut rdap_backoff = RDAP_BACKOFF;
     let mut warned = None;
@@ -721,7 +723,8 @@ async fn run_cluster(
     let mut changes = node.subscribe_changes();
     let now = std::time::Instant::now();
     let (mut tor_next, mut mm_next) = (now, now);
-    let mut rdap_next = now;
+    // Fresh files from the last run are not downloaded again.
+    let mut rdap_next = now + rdap::Bootstrap::due_in(&cfg.data_dir);
     let (mut tor_backoff, mut mm_backoff) = (TOR_BACKOFF, MAXMIND_BACKOFF);
     let mut rdap_backoff = RDAP_BACKOFF;
     let mut warned = None;

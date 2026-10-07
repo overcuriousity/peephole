@@ -297,6 +297,17 @@
     });
   });
 
+  // A one-line textarea that also takes a pasted list: Enter submits,
+  // Shift+Enter adds a line.
+  document.querySelectorAll("textarea[data-enter-submits]").forEach(function (ta) {
+    ta.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing && ta.form) {
+        ev.preventDefault();
+        if (ta.form.requestSubmit) { ta.form.requestSubmit(); } else { ta.form.submit(); }
+      }
+    });
+  });
+
   // Probes section: while a probe waits for its result, reload the page
   // when the states the server reports differ from the rendered ones.
   var ps = document.querySelector("[data-probes-src]");

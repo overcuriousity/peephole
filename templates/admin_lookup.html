@@ -5,19 +5,15 @@
 {% let sub = "lookup" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Lookup</h1><p class="muted">What the cluster knows about an address, and what every reachable provider says now.{% if cluster %} Provider answers are paid with credits.{% endif %}</p></div></div>
 <form class="filters card" method="post" action="/admin/lookup">
-  <label>IP address or host name <input name="ip" value="{{ ip }}" placeholder="203.0.113.7, 2001:db8::1 or example.com" required autofocus></label>
+  <label>IP address, host name, or a pasted list <textarea name="ip" rows="1" cols="48" data-enter-submits placeholder="203.0.113.7, 2001:db8::1, example.com, or many addresses and networks" required autofocus>{% if let Some(b) = bulk %}{{ b.text }}{% else %}{{ ip }}{% endif %}</textarea></label>
   <button class="btn btn-primary" type="submit">Look up</button>
   {% if let Some(b) = offer.balance %}
-  <span class="muted">Balance{% if offer.fleet %} of your nodes{% endif %}: <b>{{ b }}</b> credits · this lookup costs up to {{ offer.total }} · <a href="/admin/cluster/credits">credits →</a></span>
+  <span class="muted">Balance{% if offer.fleet %} of your nodes{% endif %}: <b>{{ b }}</b> credits · this lookup costs up to {{ offer.total }}{% if results.len() > 1 %} per address{% endif %} · <a href="/admin/cluster/credits">credits →</a></span>
   {% endif %}
-</form>
-<form class="filters card bulk-lookup" method="post" action="/admin/lookup/bulk">
-  <label>Many addresses or networks, from stored data (no provider is asked) <textarea name="ips" rows="3" cols="60" placeholder="203.0.113.7, 198.51.100.0/24 …">{% if let Some(b) = bulk %}{{ b.text }}{% endif %}</textarea></label>
-  <button class="btn" type="submit">Check stored</button>
 </form>
 {% if let Some(b) = bulk %}
 <section class="card">
-  <div class="card-head"><h2>Stored</h2><span class="muted">{{ b.rows.len() }}{% if b.capped %} (first {{ crate::admin::lookup::BULK_MAX }}){% endif %}</span></div>
+  <div class="card-head"><h2>Stored</h2><span class="muted">{{ b.rows.len() }}{% if b.capped %} (first {{ crate::admin::lookup::BULK_MAX }}){% endif %} · from stored data, no provider is asked</span></div>
   <div class="table-wrap"><table class="table" data-bulk><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th class="num">Requests</th><th>Max sev.</th><th class="num">Abuse</th><th>Last seen</th><th></th></tr></thead><tbody>
   {% for r in b.rows %}<tr><td><a class="mono" href="/ip/{{ r.ip }}">{{ r.ip }}</a></td><td>{{ r.country.as_deref().unwrap_or("—") }}</td><td>{% if let Some(a) = r.asn %}AS{{ a }}{% else %}—{% endif %}</td><td class="num">{{ r.request_count }}</td><td>{{ r.max_severity }}</td><td class="num">{% if let Some(a) = r.abuse_score %}{{ a }}{% else %}—{% endif %}</td><td class="mono">{{ r.last_seen }}</td><td><a href="{{ crate::admin::views::link_href("ip", r.ip.as_str()) }}">links</a> · <a href="/admin/lookup?ip={{ r.ip }}">look up</a></td></tr>{% endfor %}
   {% for m in b.missing %}<tr><td class="mono">{{ m }}</td><td colspan="6" class="muted">not stored</td><td><a href="/admin/lookup?ip={{ m }}">look up</a></td></tr>{% endfor %}
@@ -39,7 +35,7 @@
   {% if !n.errors.is_empty() %}
   <ul class="small">{% for (node, why) in n.errors %}<li><strong>{{ node }}</strong>: {{ why }}</li>{% endfor %}</ul>
   {% endif %}
-  {% if n.capped %}<p class="muted small">Only the first {{ crate::intel::dns::MAX_FOLLOWED }} agreed addresses are looked up below.</p>{% endif %}
+  {% if !n.also.is_empty() %}<p class="small"><strong>Also resolves to</strong> <span class="mono">{{ n.also.join(", ") }}</span> <span class="muted">(not looked up: only the first {{ crate::intel::dns::MAX_FOLLOWED }} agreed addresses are)</span></p>{% endif %}
 </section>
 {% endif %}
 {% if !results.is_empty() %}
@@ -99,7 +95,7 @@
 </section>
 {% endif %}
 {% if let Some(t) = r.target %}
-{% include "_target.html" %}
+{% let first = loop.first %}{% include "_target.html" %}
 {% endif %}
 {% if let Some(n) = r.near %}
 <section class="card"><div class="card-head"><h2>Near it</h2><span class="muted">recorded addresses in <a class="mono" href="/ips?q={{ n.net }}">{{ n.net }}</a>{% if let Some(a) = n.asn %} and in AS{{ a }}{% endif %}</span></div>

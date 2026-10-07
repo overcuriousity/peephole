@@ -28,8 +28,9 @@ const MAX_ERROR: usize = 200;
 /// A host name in its canonical form (lower case, no trailing dot), or
 /// None when the text is not one: it needs a dot, labels of letters,
 /// digits and hyphens up to 63 characters (not starting or ending with a
-/// hyphen), at most 253 characters in all, and it is not an IP address and
-/// carries no scheme. A label with other letters is IDNA-encoded
+/// hyphen), at most 253 characters in all, its last label is not all
+/// digits (the resolver reads `1.2.3` as an IPv4 address), and it is not
+/// an IP address and carries no scheme. A label with other letters is IDNA-encoded
 /// (`xn--` and its punycode, RFC 3492).
 pub fn valid_name(input: &str) -> Option<String> {
     let name = input.trim().trim_end_matches('.').to_lowercase();
@@ -46,6 +47,10 @@ pub fn valid_name(input: &str) -> Option<String> {
         .collect();
     let name = labels?.join(".");
     let ok = name.len() <= 253
+        && !name
+            .rsplit('.')
+            .next()
+            .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
         && name.split('.').all(|l| {
             !l.is_empty()
                 && l.len() <= 63
@@ -425,6 +430,7 @@ mod tests {
             "2001:db8::1",
             "not a host",
             "a..com",
+            "1.2.3",
             "",
         ] {
             assert!(valid_name(bad).is_none(), "{bad}");

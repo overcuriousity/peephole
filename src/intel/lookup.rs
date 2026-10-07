@@ -240,7 +240,7 @@ pub async fn run(
     let cheap = cheap();
     let wanted: Vec<String> = known
         .into_iter()
-        .filter(|p| cheap.contains(p) || ask.contains(p))
+        .filter(|p| cheap.contains(p) || ask.contains(p) || again.contains(p))
         .filter(|p| !stored.iter().any(|s| &s.provider == p))
         .collect();
     let mut answers = crate::credits::pay::ask(node, providers, ip, &wanted).await;

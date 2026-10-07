@@ -84,21 +84,33 @@ impl Bootstrap {
         Ok(Self { services })
     }
 
-    /// The bootstrap in `data_dir` when fresh, else the built-in one.
-    pub fn load(data_dir: &Path) -> Self {
-        let (v4, v6) = (
+    fn files(data_dir: &Path) -> (PathBuf, PathBuf) {
+        (
             data_dir.join("rdap-ipv4.json"),
             data_dir.join("rdap-ipv6.json"),
-        );
-        let fresh = |p: &PathBuf| {
+        )
+    }
+
+    /// How long until the files in `data_dir` are due for a refresh: now
+    /// when either is missing or older than [`BOOTSTRAP_MAX_AGE`].
+    pub fn due_in(data_dir: &Path) -> Duration {
+        let (v4, v6) = Self::files(data_dir);
+        let age = |p: &PathBuf| {
             std::fs::metadata(p)
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age < BOOTSTRAP_MAX_AGE)
         };
-        if fresh(&v4)
-            && fresh(&v6)
+        match (age(&v4), age(&v6)) {
+            (Some(a), Some(b)) => BOOTSTRAP_MAX_AGE.saturating_sub(a.max(b)),
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// The bootstrap in `data_dir` when fresh, else the built-in one.
+    pub fn load(data_dir: &Path) -> Self {
+        let (v4, v6) = Self::files(data_dir);
+        if !Self::due_in(data_dir).is_zero()
             && let (Ok(a), Ok(b)) = (std::fs::read_to_string(&v4), std::fs::read_to_string(&v6))
             && let Ok(boot) = Self::parse(&a, &b)
         {
@@ -232,21 +244,20 @@ impl Rdap {
         let wait = {
             let mut all = self.rirs.lock().unwrap();
             let st = all.entry(base.to_string()).or_default();
-            if let Some(until) = st.paused_until {
-                if until > Instant::now() + Duration::from_secs(30) {
+            let now = Instant::now();
+            // Each caller takes the next slot: a gap after the one before
+            // (which may lie ahead), and not before a pause ends, so the
+            // callers queue behind a `Retry-After`.
+            let mut at = st.last.map_or(now, |t| t + pace_for(base)).max(now);
+            if let Some(until) = st.paused_until.take() {
+                if until > now + Duration::from_secs(30) {
+                    st.paused_until = Some(until);
                     return false;
                 }
-                st.paused_until = None;
-                until.saturating_duration_since(Instant::now())
-            } else {
-                let gap = pace_for(base);
-                let w = st
-                    .last
-                    .map(|t| gap.saturating_sub(t.elapsed()))
-                    .unwrap_or_default();
-                st.last = Some(Instant::now() + w);
-                w
+                at = at.max(until);
             }
+            st.last = Some(at);
+            at - now
         };
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
