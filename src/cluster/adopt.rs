@@ -2,6 +2,7 @@
 //! are signed into its log on the first start in distributed mode, so the
 //! cluster backfills them like any other data.
 use super::Node;
+use super::identity::NodeId;
 use super::record::{FpClaimRec, IpIntelRec, JobStatusRec, Record, ScanJobRec};
 use super::repl;
 use crate::store::data;
@@ -46,19 +47,30 @@ async fn record_for(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resul
             })
         }
         "scan_job" => {
-            let r: Option<(String, i64, String)> = sqlx::query_as(
-                "SELECT i.ip, j.level, j.queued_at FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
-                 WHERE j.uid = ?",
+            type Row = (
+                String,
+                i64,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<Vec<u8>>,
+            );
+            let r: Option<Row> = sqlx::query_as(
+                "SELECT i.ip, j.level, j.queued_at, j.retry_of, j.retry_at, j.failed_by
+                 FROM scan_jobs j JOIN ips i ON i.id = j.ip_id WHERE j.uid = ?",
             )
             .bind(uid)
             .fetch_optional(&mut *conn)
             .await?;
-            r.map(|(ip, level, queued_at)| {
+            r.map(|(ip, level, queued_at, retry_of, retry_at, failed_by)| {
                 Record::ScanJob(ScanJobRec {
                     uid: uid.to_string(),
                     ip,
                     level,
                     queued_at,
+                    retry_of,
+                    retry_at,
+                    failed_by: failed_by.and_then(|b| NodeId::from_slice(&b).ok()),
                 })
             })
         }

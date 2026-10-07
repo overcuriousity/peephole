@@ -1748,6 +1748,8 @@ mod tests {
                 floors: vec![],
                 on_demand: vec![],
                 prices: vec![],
+                public_addrs: vec![],
+                probe_price_mc: None,
             };
             let body = super::super::rpc::cbor::encode(&hb).unwrap();
             let signed = super::super::status::SignedHeartbeat { body, sig: vec![] };
@@ -1995,6 +1997,8 @@ mod tests {
             floors,
             on_demand: vec![],
             prices: vec![],
+            public_addrs: vec![],
+            probe_price_mc: None,
         };
         let body = super::super::rpc::cbor::encode(&hb).unwrap();
         let signed = super::super::status::SignedHeartbeat { body, sig: vec![] };

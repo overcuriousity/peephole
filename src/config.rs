@@ -33,6 +33,8 @@ pub struct Config {
     pub maxmind: Option<MaxmindConfig>,
     #[serde(default)]
     pub scan: ScanConfig,
+    #[serde(default)]
+    pub probe: ProbeConfig,
     /// Distributed mode. Absent: standalone, no RPC listener.
     pub cluster: Option<ClusterConfig>,
     /// How the trap listener records and answers.
@@ -341,6 +343,28 @@ pub struct MaxmindConfig {
     pub license_key: String,
 }
 
+/// Observational probes of scanner addresses (`scan::probe`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProbeConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_probe_parallel")]
+    pub max_parallel: u32,
+}
+
+fn default_probe_parallel() -> u32 {
+    2
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_parallel: default_probe_parallel(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScanConfig {
     #[serde(default = "default_workers")]
@@ -576,6 +600,8 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("scan", "asn_max_per_hour", "20"),
     ("scan", "verify_crawlers", "true"),
     ("scan", "tor_unknown", "\"defer\""),
+    ("probe", "enabled", "true"),
+    ("probe", "max_parallel", "2"),
     ("public", "show_labels", "true"),
     ("public", "delay_minutes", "5"),
     ("public", "jitter_minutes", "5"),

@@ -10,10 +10,11 @@ use crate::store::inspect::IpIntelRow;
 use askama::Template;
 use axum::{
     Router,
-    extract::{Form, Query, State},
+    extract::{Form, RawQuery, State},
     response::Html,
     routing::get,
 };
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -50,21 +51,67 @@ fn chrome() -> Chrome {
 
 /// One provider as it would be asked: by whom, and at what price.
 pub struct QuoteView {
+    /// The provider's name, as the `ask` field carries it.
+    pub provider: String,
     pub label: String,
     pub node: String,
     pub price: String,
 }
 
-/// What the form shows before a lookup: what this node can spend and what
+/// What the page shows about spending: what this node can spend and what
 /// the cluster asks.
 #[derive(Default)]
 pub struct Offer {
     /// The balance in credits (the fleet's, when this node has an owner).
     pub balance: Option<String>,
     pub fleet: bool,
+    /// The cheap tier, asked by every lookup.
     pub quotes: Vec<QuoteView>,
-    /// What a lookup of every provider costs at most.
+    /// What a lookup costs at most: the cheap tier's total.
     pub total: String,
+    /// The providers asked only when told to, with their prices.
+    pub paid: Vec<QuoteView>,
+    /// What asking all of them costs.
+    pub paid_total: String,
+}
+
+impl Offer {
+    /// Split the cluster's quotes (the cheapest of each provider) into the
+    /// cheap tier and the paid providers.
+    pub fn from_quotes(all: &HashMap<String, Vec<crate::credits::pay::Quote>>) -> Offer {
+        let cheap = crate::intel::lookup::cheap();
+        let (mut quotes, mut paid) = (vec![], vec![]);
+        let (mut total, mut paid_total) = (0u64, 0u64);
+        for info in crate::intel::KNOWN_PROVIDERS {
+            let Some(q) = all.get(info.name).and_then(|l| l.first()) else {
+                continue;
+            };
+            let view = QuoteView {
+                provider: info.name.to_string(),
+                label: info.label.to_string(),
+                node: q.server_name.clone(),
+                price: if q.price_mc == 0 {
+                    "free".into()
+                } else {
+                    crate::credits::show(q.price_mc as u64)
+                },
+            };
+            if cheap.iter().any(|c| c == info.name) {
+                total += q.price_mc as u64;
+                quotes.push(view);
+            } else {
+                paid_total += q.price_mc as u64;
+                paid.push(view);
+            }
+        }
+        Offer {
+            quotes,
+            total: crate::credits::show(total),
+            paid,
+            paid_total: crate::credits::show(paid_total),
+            ..Default::default()
+        }
+    }
 }
 
 /// The offer box is information only: when the balance cannot be read, it
@@ -85,29 +132,10 @@ async fn offer(state: &AdminState) -> Offer {
     .await
     .inspect_err(|e| tracing::warn!(?e, "lookup: balance not read"))
     .ok();
-    let all = crate::credits::pay::quotes(node, &state.providers);
-    let mut quotes = vec![];
-    let mut total = 0u64;
-    for info in crate::intel::KNOWN_PROVIDERS {
-        let Some(q) = all.get(info.name).and_then(|l| l.first()) else {
-            continue;
-        };
-        total += q.price_mc as u64;
-        quotes.push(QuoteView {
-            label: info.label.to_string(),
-            node: q.server_name.clone(),
-            price: if q.price_mc == 0 {
-                "free".into()
-            } else {
-                crate::credits::show(q.price_mc as u64)
-            },
-        });
-    }
     Offer {
         balance: balance.map(|(b, _)| crate::credits::show(b)),
         fleet: balance.is_some_and(|(_, fleet)| fleet),
-        quotes,
-        total: crate::credits::show(total),
+        ..Offer::from_quotes(&crate::credits::pay::quotes(node, &state.providers))
     }
 }
 
@@ -137,35 +165,98 @@ pub struct LookupResult {
     pub kept: bool,
 }
 
+/// One address a name resolved to.
+pub struct AddrVote {
+    pub ip: String,
+    pub agreed: bool,
+    /// "agreed by 4 of 5", "only from bob (DE), disputed", …
+    pub verdict: String,
+}
+
+/// A name resolved by several nodes (see [`crate::intel::dns`]).
+pub struct NamesView {
+    pub name: String,
+    /// How far the answer can be trusted, when not by a majority of several.
+    pub note: Option<String>,
+    pub rows: Vec<AddrVote>,
+    /// Every node asked, as "name (country)".
+    pub resolvers: Vec<String>,
+    /// `(node, why)` for every node that did not answer.
+    pub errors: Vec<(String, String)>,
+    /// Agreed addresses past the first [`crate::intel::dns::MAX_FOLLOWED`]:
+    /// not looked up.
+    pub also: Vec<String>,
+}
+
 #[derive(Template)]
 #[template(path = "admin_lookup.html")]
 struct LookupPage {
     chrome: Chrome,
     ip: String,
     error: Option<String>,
-    result: Option<LookupResult>,
+    /// The resolved name, when a name was looked up.
+    names: Option<NamesView>,
+    /// One per address looked up: the address asked for, or the agreed
+    /// addresses of a name.
+    results: Vec<LookupResult>,
     cluster: bool,
     offer: Offer,
     bulk: Option<Bulk>,
 }
 
-#[derive(serde::Deserialize, Default)]
+/// The lookup form. `ask` and `again` may repeat, which the plain form
+/// extractors cannot read, so the fields are taken from the pairs.
+#[derive(Default)]
 pub struct IpForm {
     pub ip: Option<String>,
     /// A provider to ask although the dataset has a fresh answer.
     pub again: Option<String>,
+    /// The paid providers to ask now (`*`: all of them).
+    pub ask: Option<Vec<String>>,
+}
+
+impl IpForm {
+    fn parse(raw: &[u8]) -> IpForm {
+        let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(raw).unwrap_or_default();
+        let mut f = IpForm::default();
+        for (k, v) in pairs {
+            match k.as_str() {
+                "ip" => f.ip = Some(v),
+                "again" => f.again = Some(v),
+                "ask" => f.ask.get_or_insert_with(Vec::new).push(v),
+                _ => {}
+            }
+        }
+        f
+    }
+
+    /// The paid providers named, `*` standing for every one of them.
+    fn asked(&self) -> Vec<String> {
+        let ask = self.ask.as_deref().unwrap_or_default();
+        if ask.iter().any(|a| a == "*") {
+            let cheap = crate::intel::lookup::cheap();
+            return crate::intel::KNOWN_PROVIDERS
+                .iter()
+                .map(|p| p.name.to_string())
+                .filter(|n| !cheap.contains(n))
+                .collect();
+        }
+        ask.iter().filter(|a| !a.is_empty()).cloned().collect()
+    }
 }
 
 async fn page(
     _u: SessionUser,
     State(state): State<Arc<AdminState>>,
-    Query(q): Query<IpForm>,
+    RawQuery(q): RawQuery,
 ) -> AppResult<Html<String>> {
+    let q = IpForm::parse(q.unwrap_or_default().as_bytes());
     render(&LookupPage {
         chrome: chrome(),
         ip: q.ip.unwrap_or_default().trim().to_string(),
         error: None,
-        result: None,
+        names: None,
+        results: vec![],
         cluster: state.recorder.node().is_some(),
         offer: offer(&state).await,
         bulk: None,
@@ -175,16 +266,33 @@ async fn page(
 async fn lookup(
     _u: SessionUser,
     State(state): State<Arc<AdminState>>,
-    Form(f): Form<IpForm>,
+    body: axum::body::Bytes,
 ) -> AppResult<Html<String>> {
+    let f = IpForm::parse(&body);
+    let ask = f.asked();
     let text = f.ip.unwrap_or_default().trim().to_string();
     let cluster = state.recorder.node().is_some();
+    if text.parse::<IpAddr>().is_err() && is_list(&text) {
+        return bulk_page(&state, text).await;
+    }
     let Ok(ip) = text.parse::<IpAddr>() else {
+        let (names, results, error) = match crate::intel::dns::valid_name(&text) {
+            None => (None, vec![], Some("Not an IP address or host name.".into())),
+            Some(name) => match by_name(&state, &name, async |n: &str| {
+                crate::intel::dns::resolve_here(n).await
+            })
+            .await?
+            {
+                Ok((view, results)) => (Some(view), results, None),
+                Err(e) => (None, vec![], Some(e)),
+            },
+        };
         return render(&LookupPage {
             chrome: chrome(),
             ip: text,
-            error: Some("Not an IP address.".into()),
-            result: None,
+            error,
+            names,
+            results,
             cluster,
             offer: offer(&state).await,
             bulk: None,
@@ -192,17 +300,118 @@ async fn lookup(
     };
     let ip = crate::net::canonical(ip);
     let again: Vec<String> = f.again.into_iter().filter(|a| !a.is_empty()).collect();
-    let result = run(&state, ip, &again).await?;
+    let result = run(&state, ip, &ask, &again).await?;
     render(&LookupPage {
         chrome: chrome(),
         ip: ip.to_string(),
         error: None,
-        result: Some(result),
+        names: None,
+        results: vec![result],
         cluster,
         // After the lookup: the balance it left.
         offer: offer(&state).await,
         bulk: None,
     })
+}
+
+/// Resolve `name` with several nodes (`resolve` standing in for this
+/// node's resolver), and look up the first [`crate::intel::dns::MAX_FOLLOWED`]
+/// addresses they agree on (the cheap tier). The inner error: the name
+/// was not resolved or not stored.
+pub async fn by_name(
+    state: &AdminState,
+    name: &str,
+    resolve: impl AsyncFn(&str) -> Result<Vec<IpAddr>, String>,
+) -> AppResult<Result<(NamesView, Vec<LookupResult>), String>> {
+    use crate::intel::dns;
+    let (tally, record) = match dns::lookup_with(&state.recorder, &state.geo, name, resolve).await {
+        Ok(x) => x,
+        Err(e) => return Ok(Err(e)),
+    };
+    let label = |id: &crate::cluster::identity::NodeId| match state.recorder.node() {
+        Some(node) => match dns::describe(node, &state.geo, id) {
+            (n, Some(c)) => format!("{n} ({c})"),
+            (n, None) => n,
+        },
+        None => "this node".to_string(),
+    };
+    let answers = record
+        .as_ref()
+        .map(|r| r.answers.as_slice())
+        .unwrap_or_default();
+    // Agreed addresses past those looked up go under "also resolves to".
+    let past: Vec<IpAddr> = tally
+        .votes
+        .iter()
+        .filter(|v| v.agreed)
+        .skip(dns::MAX_FOLLOWED)
+        .map(|v| v.addr)
+        .collect();
+    let rows = tally
+        .votes
+        .iter()
+        .filter(|v| !past.contains(&v.addr))
+        .map(|v| {
+            let from: Vec<String> = answers
+                .iter()
+                .filter(|(_, a)| {
+                    a.as_ref()
+                        .is_ok_and(|l| l.iter().any(|x| crate::net::canonical(*x) == v.addr))
+                })
+                .map(|(id, _)| label(id))
+                .collect();
+            let verdict = match (v.agreed, v.votes) {
+                (true, n) => format!("agreed by {n} of {}", tally.answered),
+                (false, 1) => format!("only from {}, disputed", from.join(", ")),
+                (false, n) => format!("{n} of {} ({}), disputed", tally.answered, from.join(", ")),
+            };
+            AddrVote {
+                ip: v.addr.to_string(),
+                agreed: v.agreed,
+                verdict,
+            }
+        })
+        .collect();
+    let note = match (state.recorder.node(), tally.answered) {
+        (_, 0) => Some("No resolver answered; nothing was stored.".to_string()),
+        (None, _) => Some("resolved locally, unverified".to_string()),
+        (Some(_), 1) => Some("unverified — single resolver".to_string()),
+        _ => None,
+    };
+    let resolvers = match record.as_ref() {
+        Some(r) => r.answers.iter().map(|(id, _)| label(id)).collect(),
+        None => tally.errors.iter().map(|(id, _)| label(id)).collect(),
+    };
+    let agreed: Vec<IpAddr> = tally
+        .votes
+        .iter()
+        .filter(|v| v.agreed)
+        .map(|v| v.addr)
+        .collect();
+    let followed = futures::future::join_all(
+        agreed
+            .iter()
+            .take(dns::MAX_FOLLOWED)
+            .map(|ip| run(state, *ip, &[], &[])),
+    )
+    .await
+    .into_iter()
+    .collect::<AppResult<Vec<_>>>()?;
+    Ok(Ok((
+        NamesView {
+            name: name.to_string(),
+            note,
+            rows,
+            resolvers,
+            errors: tally
+                .errors
+                .iter()
+                .map(|(id, why)| (label(id), why.clone()))
+                .collect(),
+            also: past.iter().map(IpAddr::to_string).collect(),
+        },
+        followed,
+    )))
 }
 
 fn age(secs: i64) -> String {
@@ -215,8 +424,13 @@ fn age(secs: i64) -> String {
 
 /// Look the address up and arrange the three parts of the page: what the
 /// dataset knows, provider answers from the dataset, and live answers.
-pub async fn run(state: &AdminState, ip: IpAddr, again: &[String]) -> AppResult<LookupResult> {
-    let out = crate::intel::lookup::run(&state.recorder, &state.providers, ip, again).await;
+pub async fn run(
+    state: &AdminState,
+    ip: IpAddr,
+    ask: &[String],
+    again: &[String],
+) -> AppResult<LookupResult> {
+    let out = crate::intel::lookup::run(&state.recorder, &state.providers, ip, ask, again).await;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let label = |p: &str| {
         crate::intel::provider_info(p)
@@ -314,7 +528,16 @@ async fn bulk(
     State(state): State<Arc<AdminState>>,
     Form(f): Form<BulkForm>,
 ) -> AppResult<Html<String>> {
-    let text = f.ips.unwrap_or_default();
+    bulk_page(&state, f.ips.unwrap_or_default()).await
+}
+
+/// Several addresses or a network, as typed or pasted into the one field.
+fn is_list(text: &str) -> bool {
+    text.contains(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        || text.parse::<ipnet::IpNet>().is_ok()
+}
+
+async fn bulk_page(state: &AdminState, text: String) -> AppResult<Html<String>> {
     let (mut addrs, mut nets, mut unreadable) = (vec![], vec![], vec![]);
     for piece in text
         .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
@@ -344,9 +567,10 @@ async fn bulk(
         chrome: chrome(),
         ip: String::new(),
         error: None,
-        result: None,
+        names: None,
+        results: vec![],
         cluster: state.recorder.node().is_some(),
-        offer: offer(&state).await,
+        offer: offer(state).await,
         bulk: Some(Bulk {
             text,
             rows,
@@ -363,6 +587,11 @@ mod tests {
     use tower::ServiceExt;
 
     async fn app() -> (axum::Router, String, tempfile::TempDir) {
+        let (state, cookie, dir) = state().await;
+        (crate::admin::full_router(state), cookie, dir)
+    }
+
+    async fn state() -> (Arc<AdminState>, String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cfg: crate::config::Config = toml::from_str(&format!(
             r#"
@@ -401,7 +630,53 @@ secure_cookies = false
             Arc::new(crate::intel::provider::TorExits(tor)),
         ];
         let state = Arc::new(AdminState::public_only(store, cfg).with_providers(providers));
-        (crate::admin::full_router(state), cookie, dir)
+        (state, cookie, dir)
+    }
+
+    #[tokio::test]
+    async fn a_domain_lookup_shows_votes_and_the_agreed_addresses() {
+        let (state, _cookie, _d) = state().await;
+        let (view, results) = by_name(&state, "www.example.com", async |_: &str| {
+            Ok(vec![
+                "203.0.113.9".parse().unwrap(),
+                "10.0.0.1".parse().unwrap(),
+            ])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let html = LookupPage {
+            chrome: chrome(),
+            ip: "www.example.com".into(),
+            error: None,
+            names: Some(view),
+            results,
+            cluster: false,
+            offer: Offer::default(),
+            bulk: None,
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains("resolved locally, unverified"), "{html}");
+        assert!(html.contains("203.0.113.9") && html.contains("agreed by 1 of 1"));
+        assert!(!html.contains("10.0.0.1"), "a private answer is dropped");
+        assert!(
+            html.contains("Tor exit list"),
+            "the agreed address was looked up"
+        );
+        // The name is in the dataset, and on the address's admin view.
+        let ip = state
+            .store
+            .ip_by_addr("203.0.113.9")
+            .await
+            .unwrap()
+            .unwrap();
+        let names = state.store.names_for_ip(ip.id).await.unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(
+            (names[0].name.as_str(), names[0].agreed),
+            ("www.example.com", true)
+        );
     }
 
     async fn send(
@@ -435,7 +710,7 @@ secure_cookies = false
         )
         .await;
         assert_eq!(status, 200);
-        assert!(html.contains(r#"value="203.0.113.9""#));
+        assert!(html.contains(r#"autofocus>203.0.113.9</textarea>"#));
 
         let post = || {
             axum::http::Request::post("/admin/lookup")
@@ -450,6 +725,8 @@ secure_cookies = false
         // GeoLite2 is not loaded: listed as declined, with the reason.
         assert!(html.contains("MaxMind GeoLite2") && html.contains("not available on this node"));
         assert!(html.contains("no reachable node serves this provider"));
+        // Standalone: nothing paid is offered.
+        assert!(!html.contains(r#"name="ask""#));
 
         let (status, html) = send(&app, post(), "ip=not-an-ip").await;
         assert_eq!(status, 200);
@@ -457,5 +734,43 @@ secure_cookies = false
 
         let (_, html) = send(&app, post(), "ip=2001:DB8::1").await;
         assert!(html.contains("2001:db8::1") && html.contains("not in the dataset"));
+    }
+
+    #[test]
+    fn a_lookup_asks_the_cheap_tier_and_offers_the_rest() {
+        use crate::credits::pay::Quote;
+        let node = crate::cluster::identity::NodeId::from_slice(&[7u8; 32]).unwrap();
+        let quote = |p: &str, mc: u32| {
+            (
+                p.to_string(),
+                vec![Quote {
+                    provider: p.into(),
+                    server: node,
+                    server_name: "n1".into(),
+                    price_mc: mc,
+                }],
+            )
+        };
+        let all: HashMap<_, _> = [
+            quote(crate::intel::TOR, 0),
+            quote(crate::intel::MAXMIND, 10),
+            quote(crate::intel::INTERNETDB, 20),
+            quote(crate::intel::ABUSEIPDB, 100),
+        ]
+        .into();
+        let offer = Offer::from_quotes(&all);
+        assert_eq!(offer.total, "0.03");
+        assert_eq!(offer.quotes.len(), 3);
+        assert_eq!(offer.paid.len(), 1);
+        assert_eq!(offer.paid[0].provider, crate::intel::ABUSEIPDB);
+        assert_eq!(offer.paid[0].price, "0.10");
+        assert_eq!(offer.paid_total, "0.10");
+        let f = IpForm::parse(b"ip=203.0.113.9&ask=abuseipdb&ask=shodan");
+        assert_eq!(f.asked(), ["abuseipdb", "shodan"]);
+        assert!(
+            !IpForm::parse(b"ask=*")
+                .asked()
+                .contains(&crate::intel::TOR.to_string())
+        );
     }
 }

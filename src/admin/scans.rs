@@ -29,7 +29,6 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/scans/{id}/delete", post(scan_delete))
         .route("/admin/queue", get(queue_moved))
         .route("/admin/queue/pace", post(queue_pace))
-        .route("/admin/queue/retry-failed", post(queue_retry_failed))
 }
 
 fn chrome() -> Chrome {
@@ -44,8 +43,6 @@ pub struct ScansQuery {
     pub page: Option<i64>,
     /// Set by the redirect after saving the pace.
     pub saved: Option<String>,
-    /// Set by the redirect after retrying failed jobs: how many.
-    pub retried: Option<String>,
 }
 
 impl ScansQuery {
@@ -99,17 +96,10 @@ async fn page(
     State(st): State<Arc<AdminState>>,
     Query(q): Query<ScansQuery>,
 ) -> AppResult<Html<String>> {
-    let notice = match (
-        &q.saved,
-        q.retried.as_deref().and_then(|n| n.parse::<u64>().ok()),
-    ) {
-        (Some(_), _) => Some("Pace saved. Workers apply it on their next pass.".to_string()),
-        (_, Some(n)) => Some(format!(
-            "{n} failed {} back in the queue.",
-            if n == 1 { "job is" } else { "jobs are" }
-        )),
-        _ => None,
-    };
+    let notice = q
+        .saved
+        .as_ref()
+        .map(|_| "Pace saved. Workers apply it on their next pass.".to_string());
     let pace = pace_view(&st, notice, None).await?;
     render_page(&st, &q, pace).await
 }
@@ -296,18 +286,6 @@ pub(crate) async fn pace_view(
         error,
         not_scanning: st.recorder.node().is_some() && !st.settings.roles().scanner,
     })
-}
-
-/// Retry the last week's failed jobs (one per IP, none with a pending job).
-async fn queue_retry_failed(
-    _u: SessionUser,
-    State(st): State<Arc<AdminState>>,
-) -> AppResult<Redirect> {
-    let n = st.recorder.requeue_failed_everywhere(7).await?;
-    tracing::info!(requeued = n, "retry failed scans");
-    Ok(Redirect::to(&format!(
-        "/admin/scans?status=failed&retried={n}"
-    )))
 }
 
 #[derive(serde::Deserialize)]

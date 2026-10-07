@@ -5,7 +5,9 @@ pub mod hostkeys;
 pub mod nmap_xml;
 pub mod order;
 pub mod pace;
+pub mod probe;
 pub mod profiles;
+pub mod retry;
 pub mod safety;
 pub mod weight;
 
@@ -116,7 +118,7 @@ pub fn audit_argv(
 
 /// Why this scanner will not run a job (now).
 #[derive(Debug, PartialEq)]
-enum Refusal {
+pub(crate) enum Refusal {
     /// Nobody may scan it (non-global address, a cluster member's address,
     /// a Tor exit, a verified crawler).
     Never(String),
@@ -129,7 +131,7 @@ enum Refusal {
 }
 
 impl Refusal {
-    fn reason(&self) -> &str {
+    pub(crate) fn reason(&self) -> &str {
         match self {
             Refusal::Never(w) | Refusal::Mine(w) | Refusal::Defer(w) => w,
         }
@@ -146,7 +148,7 @@ fn over_share(level: i64, exclude: &[u8]) -> bool {
 /// address, and leave anything in this node's `never_scan` to others.
 /// Catches jobs that were queued before an operator edited `never_scan`,
 /// requeued orphans, and admin-requeued failed jobs.
-fn locally_refused(ip: &IpAddr, never: &[ipnet::IpNet]) -> Option<Refusal> {
+pub(crate) fn locally_refused(ip: &IpAddr, never: &[ipnet::IpNet]) -> Option<Refusal> {
     if !crate::net::is_scannable_target(*ip) {
         return Some(Refusal::Never("non-global address".into()));
     }

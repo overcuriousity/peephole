@@ -75,6 +75,10 @@ pub struct HistoryRow {
     pub scan_id: Option<i64>,
     pub os_guess: Option<String>,
     pub open_ports: i64,
+    /// A retry of an earlier failed scan.
+    pub is_retry: bool,
+    /// A failure that was retried (see `scan::retry`).
+    pub retried: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -101,6 +105,26 @@ pub struct RequestDetail {
     pub node: Option<String>,
     /// The start of the fingerprint of the ruleset that classified it.
     pub rules_short: Option<String>,
+}
+
+impl RequestDetail {
+    /// The decoy it was answered with (the name after `decoy:`), if any.
+    pub fn decoy(&self) -> Option<&str> {
+        self.row.answer.as_deref()?.strip_prefix("decoy:")
+    }
+
+    /// The canaries its decoy carried, (kind, value).
+    pub fn served_canaries(&self) -> Vec<(String, String)> {
+        match (self.row.page_token.as_deref(), self.decoy()) {
+            (Some(t), Some(n)) => {
+                crate::canary::served(self.row.decoy_v, t, n, self.row.decoy_in.as_deref())
+                    .into_iter()
+                    .map(|(k, v)| (k.name().to_string(), v))
+                    .collect()
+            }
+            _ => vec![],
+        }
+    }
 }
 
 const SCAN_SELECT: &str =
@@ -228,7 +252,10 @@ impl Store {
                     (SELECT name FROM members m WHERE m.id = j.arbiter) AS arbiter,
                     s.id AS scan_id, s.os_guess,
                     (SELECT COUNT(*) FROM ports p
-                      WHERE s.id IS NOT NULL AND p.scan_id = s.id AND p.state = 'open') AS open_ports
+                      WHERE s.id IS NOT NULL AND p.scan_id = s.id AND p.state = 'open') AS open_ports,
+                    j.retry_of IS NOT NULL AS is_retry,
+                    j.status = 'failed' AND EXISTS (SELECT 1 FROM scan_jobs r
+                      WHERE r.retry_of = COALESCE(j.retry_of, j.uid) AND r.id > j.id) AS retried
              FROM scan_jobs j JOIN ips i ON j.ip_id = i.id
              LEFT JOIN scans s ON s.id = (SELECT MAX(x.id) FROM scans x WHERE x.job_id = j.id AND x.audit_of IS NULL)
              WHERE j.status IN ('done', 'failed', 'superseded', 'refused')",
@@ -654,7 +681,8 @@ mod tests {
         let two = s.active_jobs(2).await.unwrap();
         assert_eq!(two.len(), 2, "the two finished jobs take no rows");
         assert!(two.iter().all(|j| j.status == "queued"));
-        assert_eq!(s.active_jobs(10).await.unwrap().len(), 2);
+        // Plus the retry the seeded failure queued.
+        assert_eq!(s.active_jobs(10).await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -718,7 +746,7 @@ mod tests {
         let q = s.queue_summary(&s.local()).await.unwrap();
         assert_eq!(q.done_24h, 1);
         assert_eq!(q.failed_24h, 1);
-        assert_eq!(q.queued, 0);
+        assert_eq!(q.queued, 1, "the failure's retry");
         assert_eq!(q.scans_last_hour, 2, "done + failed: both were launched");
         let rid: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE ip_id = ?")
             .bind(a)

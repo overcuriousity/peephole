@@ -15,12 +15,17 @@ pub const SSH_HOSTKEY: &str = "ssh-hostkey";
 pub const TLS_CERT: &str = "tls-cert";
 pub const JA4X: &str = "ja4x";
 pub const HASSH: &str = "hassh";
+pub const FAVICON: &str = "favicon";
+pub const JARM: &str = "jarm";
+pub const HTTP_BODY: &str = "http-body";
+pub const HTTP_404: &str = "http-404";
 
 /// One identifier found on one port of a scanned source.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostKey {
     pub port: u16,
-    /// [`SSH_HOSTKEY`], [`TLS_CERT`], [`JA4X`] or [`HASSH`].
+    /// [`SSH_HOSTKEY`], [`TLS_CERT`], [`JA4X`], [`HASSH`], or from probes
+    /// [`FAVICON`], [`JARM`], [`HTTP_BODY`] or [`HTTP_404`].
     pub kind: &'static str,
     /// `SHA256:<base64>` as OpenSSH prints it; the certificate's SHA-256
     /// (hex, of the DER); the JA4X string; the HASSH-server MD5 (hex).
@@ -75,6 +80,34 @@ fn key_attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
         .flatten()
         .find(|a| a.key.as_ref() == name)
         .map(|a| a.value.to_string())
+}
+
+/// The PTR names nmap recorded for the host (`<hostname type="PTR">`),
+/// as valid host names, without repeats. Unparsable input yields what was
+/// found before the error.
+pub fn ptr_names(xml: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    while let Ok(ev) = reader.read_event_into(&mut buf) {
+        match ev {
+            Event::Start(e) | Event::Empty(e)
+                if e.name().as_ref() == "hostname"
+                    && key_attr(&e, "type").as_deref() == Some("PTR") =>
+            {
+                if let Some(n) =
+                    key_attr(&e, "name").and_then(|n| crate::intel::dns::valid_name(&n))
+                    && !out.contains(&n)
+                {
+                    out.push(n);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
 }
 
 /// Every identifier in an nmap XML report. Unparsable input yields what

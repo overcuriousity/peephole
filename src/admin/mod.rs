@@ -14,6 +14,7 @@ pub mod links;
 pub mod lookup;
 pub mod overview;
 pub mod pages;
+pub mod probes;
 pub mod public;
 pub mod scans;
 pub mod search;
@@ -48,6 +49,16 @@ pub struct AdminState {
     pub safety: tokio::sync::Mutex<crate::scan::safety::Safety>,
     /// This node's tarpit, for System › Status; None without a trap here.
     pub tarpit: Option<Arc<crate::trap::tarpit::Tarpit>>,
+    /// This node's prober, when it probes (`scan::probe`).
+    pub prober: Option<Arc<crate::scan::probe::serve::Prober>>,
+    /// GeoLite2, for the countries of the probe vantages.
+    pub geo: crate::intel::SharedGeo,
+    /// Probe requests made here and not yet answered by a result, by
+    /// group uid (`admin::probes`). In memory: a restart forgets them.
+    pub pending_probes: std::sync::Mutex<probes::PendingMap>,
+    /// The gate a member that does not probe judges addresses with, built
+    /// on first use (`admin::probes`).
+    pub probe_judge: std::sync::OnceLock<crate::scan::probe::serve::Prober>,
 }
 
 impl AdminState {
@@ -64,6 +75,7 @@ impl AdminState {
         cfg: Config,
         notifier: crate::events::Notifier,
         pace: crate::scan::pace::SharedPace,
+        geo: crate::intel::SharedGeo,
     ) -> Self {
         Self {
             recorder: store.local(),
@@ -78,7 +90,17 @@ impl AdminState {
             closing: None,
             providers: vec![],
             tarpit: None,
+            prober: None,
+            geo,
+            pending_probes: Default::default(),
+            probe_judge: Default::default(),
         }
+    }
+
+    /// This node's prober (None: it does not probe).
+    pub fn with_prober(mut self, prober: Option<Arc<crate::scan::probe::serve::Prober>>) -> Self {
+        self.prober = prober;
+        self
     }
 
     /// The enrichment providers this node runs.
@@ -116,7 +138,8 @@ impl AdminState {
     pub fn public_only(store: Store, cfg: Config) -> Self {
         let pace =
             crate::scan::pace::SharedPace::new(crate::scan::pace::Pace::from_config(&cfg.scan));
-        Self::new(store, cfg, crate::events::Notifier::new(), pace)
+        let geo = Arc::new(std::sync::RwLock::new(None));
+        Self::new(store, cfg, crate::events::Notifier::new(), pace, geo)
     }
 }
 
@@ -141,6 +164,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(scans::routes())
         .merge(overview::routes())
         .merge(lookup::routes())
+        .merge(probes::routes())
         .merge(cluster::routes())
         .merge(cluster_access::routes())
         .merge(cluster_owner::routes())

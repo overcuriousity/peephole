@@ -1,6 +1,6 @@
 //! The top bar's search box: works out what was typed and opens its page.
 //! An IP, a network, `AS123`, `#<request id>`, a path, or a linking value
-//! (fingerprint, host key, JA4…).
+//! (fingerprint, host key, JA4…), or a host name (the Lookup page).
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppResult, render};
@@ -35,6 +35,8 @@ enum Input {
     Asn(u32),
     Request(i64),
     Path(String),
+    /// A host name: the Lookup page resolves it.
+    Host(String),
     Value(String),
 }
 
@@ -63,6 +65,9 @@ fn classify(q: &str) -> Input {
     if q.starts_with('/') {
         return Input::Path(q.to_string());
     }
+    if let Some(name) = crate::intel::dns::valid_name(q) {
+        return Input::Host(name);
+    }
     Input::Value(q.to_string())
 }
 
@@ -81,7 +86,14 @@ async fn search(
     Query(sq): Query<SearchQuery>,
 ) -> AppResult<Response> {
     let q = sq.q.unwrap_or_default().trim().to_string();
-    let to = match classify(&q) {
+    // A name the links know as a value (a file name such as
+    // `wp-login.php`) is searched as one; any other name goes to Lookup.
+    let input = match classify(&q) {
+        Input::Host(h) if st.store.find_value(&q).await?.is_empty() => Input::Host(h),
+        Input::Host(_) => Input::Value(q.clone()),
+        i => i,
+    };
+    let to = match input {
         Input::Empty => None,
         Input::Ip(ip) => Some(if st.store.ip_by_addr(&ip.to_string()).await?.is_some() {
             format!("/ip/{ip}")
@@ -92,6 +104,7 @@ async fn search(
         Input::Asn(n) => Some(format!("/ips?asn={n}")),
         Input::Request(id) => Some(format!("/admin/requests/{id}")),
         Input::Path(p) => Some(format!("/requests?path={}", urlencode(&p))),
+        Input::Host(h) => Some(format!("/admin/lookup?ip={}", urlencode(&h))),
         Input::Value(v) => {
             let kinds = st.store.find_value(&v).await?;
             match kinds.as_slice() {
@@ -152,6 +165,10 @@ mod tests {
             classify("t13d1516h2_8daaf6152771"),
             Input::Value("t13d1516h2_8daaf6152771".into())
         );
+        assert_eq!(classify("example.com"), Input::Host("example.com".into()));
+        assert_eq!(classify("EXAMPLE.COM."), Input::Host("example.com".into()));
+        assert_eq!(classify("not a host"), Input::Value("not a host".into()));
+        assert_eq!(classify("localhost"), Input::Value("localhost".into()));
         assert_eq!(classify("ASX"), Input::Value("ASX".into()));
         assert_eq!(classify("#x"), Input::Value("#x".into()));
     }

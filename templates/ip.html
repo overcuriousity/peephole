@@ -21,7 +21,7 @@
 </div>
 
 <div class="stack">
-  {% include "_target.html" %}
+  {% let first = true %}{% include "_target.html" %}
 
   {% if can_delete %}
   <section class="card danger-zone">

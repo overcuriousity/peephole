@@ -1,0 +1,21 @@
+{# The Actions card (admin::probes::ActionsView `a`, address `t.ov.ip.ip`): admin only. Buttons are disabled with the reason, never hidden. #}
+<section class="card"{% if first %} id="actions"{% endif %} data-section="actions">
+  <div class="card-head"><h2>Actions</h2></div>
+  <p class="{% if a.allowed %}muted{% else %}text-warning{% endif %}" data-guard>{{ a.guard_line }}</p>
+  <form method="post" action="/admin/lookup/probe" data-probe-form>
+    <input type="hidden" name="ip" value="{{ t.ov.ip.ip }}">
+    {% if a.standalone %}
+    <p class="muted small">Reads what the ports the counter-scan found open present, from this node.</p>
+    {% else %}
+    <ul class="vantages">
+      {% for v in a.vantages %}
+      <li><label><input type="checkbox" name="vantage" value="{{ v.id }}" data-mc="{{ v.price_mc }}"{% if a.ticked(v.id) %} checked{% endif %}{% if !a.allowed %} disabled{% endif %}>
+        {{ v.name }}{% if let Some(c) = v.country %} <span class="muted">{{ c }}</span>{% endif %} · <span class="num">{{ v.price }}</span> credits</label></li>
+      {% endfor %}
+    </ul>
+    <p class="small">Total <span class="num" data-probe-total>{{ a.default_total() }}</span> credits{% if let Some(b) = a.balance %} · balance <span class="num">{{ b }}</span> credits{% endif %}</p>
+    {% endif %}
+    <button class="btn" type="submit"{% if !a.allowed %} disabled title="{{ a.why_not.as_deref().unwrap_or_default() }}"{% endif %}>Probe</button>
+    {% if let Some(w) = a.why_not %}<span class="muted small">{{ w }}</span>{% endif %}
+  </form>
+</section>

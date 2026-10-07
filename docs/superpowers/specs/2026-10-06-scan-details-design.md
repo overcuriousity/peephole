@@ -5,7 +5,7 @@ Date: 2026-10-06 · Status: draft.
 Takes these items from `docs/roadmap.md` (Small follow-ups) and removes
 them there when it is implemented:
 
-- Peer-observed public address
+- Peer-observed public address (peer-observed public address: implemented by the lookup-actions plan)
 - Host keys in the export
 - ETags of scanned sources
 - Reverse DNS of every source

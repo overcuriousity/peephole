@@ -63,8 +63,7 @@
   </table></div>
 </section>
 <section class="card" id="history">
-  <div class="card-head"><h2>History</h2>
-    {% if f.status.as_deref() == Some("failed") %}<form method="post" action="/admin/queue/retry-failed"><button class="btn btn-sm" type="submit">Retry failed (last 7 days, one per IP)</button></form>{% endif %}</div>
+  <div class="card-head"><h2>History</h2></div>
   <form class="filters" method="get" action="/admin/scans#history">
     <label>Status <select name="status"><option value="">any finished</option>
       {% for st in statuses %}<option value="{{ st }}"{% if f.status.as_deref() == Some(st) %} selected{% endif %}>{{ st }}</option>{% endfor %}</select></label>
@@ -79,9 +78,9 @@
         <td class="mono">#{{ r.id }}</td>
         <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
         <td>{{ r.level }}</td>
-        <td><span class="badge badge-status" data-status="{{ r.status }}">{{ r.status }}</span></td>
+        <td><span class="badge badge-status" data-status="{{ r.status }}">{{ r.status }}</span>{% if r.is_retry %} <span class="badge" title="Retry of an earlier failed scan">retry</span>{% endif %}</td>
         <td class="ts">{{ r.finished_at.as_deref().unwrap_or("") }}</td>
-        <td class="wrap">{% if let Some(sid) = r.scan_id %}<a class="mono" href="/admin/scans/{{ sid }}">scan #{{ sid }}</a> · {{ r.open_ports }} open{% if let Some(os) = r.os_guess %} · {{ os }}{% endif %}{% else if let Some(e) = r.error %}<span class="mono">{{ e }}</span>{% endif %}</td>
+        <td class="wrap">{% if let Some(sid) = r.scan_id %}<a class="mono" href="/admin/scans/{{ sid }}">scan #{{ sid }}</a> · {{ r.open_ports }} open{% if let Some(os) = r.os_guess %} · {{ os }}{% endif %}{% else if let Some(e) = r.error %}<span class="mono">{{ e }}</span>{% endif %}{% if r.retried %} · <span class="muted">retried</span>{% endif %}</td>
         <td class="muted">{% if let Some(s) = r.scanner %}{{ s }}{% endif %}{% if let Some(a) = r.arbiter %}<span class="node-via"> via {{ a }}</span>{% endif %}</td>
       </tr>
     {% endfor %}

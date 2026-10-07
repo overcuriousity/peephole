@@ -75,7 +75,10 @@ cloud's metadata service (AWS, Google Cloud, Azure, Hetzner, DigitalOcean;
 one-second timeouts, no outside service) and, when it reports an address
 no interface shows, offers it for `[scan] own_addresses` (never scanned,
 never in the blocklist). It is also the example for the cluster's advertise
-address.
+address. In a cluster, peers report the address they see this node connect
+from; once a sibling or two members agree, it is protected like
+`own_addresses` (System › Status shows it as "Public address (seen by
+peers)").
 
 Unattended installs pass the answers as environment variables:
 
@@ -233,6 +236,11 @@ Configuration lives in `/etc/peephole/config.toml`; restart after editing
 (`systemctl restart peephole`). Scan pace, rescan cooldown and roles are
 runtime settings, changed from **Admin → Cluster** or `peephole settings`
 without a restart.
+
+**Probes.** `[probe] enabled` (default `true`) lets this node's scanner run
+observational probes that admins request; `max_parallel` (default `2`)
+bounds how many run at once. Probes only touch ports a scan already found
+open and obey the same protected-address rules as scans.
 
 **Signature rules** are built into the binary from [`rules/`](../rules/) at
 build time: there is nothing to install or edit on the node, and changing a

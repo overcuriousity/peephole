@@ -173,6 +173,12 @@ the cluster asked for: completed counter-scans.
   saturated. A keyed API costs 1 unit, Shodan InternetDB and GeoLite2 a
   quarter, the Tor exit list nothing. Half of what you pay goes to the
   node that answered, half is destroyed. Your own providers cost the same.
+- **Probes.** An observational probe of the ports a scan found open
+  (headers, certificates, JARM, SSH host keys) costs 4 units times the
+  surge, announced per scanner and paid per vantage; half of each payment
+  is destroyed. The answer comes in two phases: the offer is accepted
+  first, the result arrives when the scanner has finished. An accepted
+  probe with no result lapses after 15 minutes. Nothing is minted.
 - **Your budgets are safe.** Paid lookups take at most
   `[enrichment] on_demand_share` (a fifth by default) of each API budget,
   whatever happens to credits. A provider whose share ran out costs double
@@ -181,7 +187,14 @@ the cluster asked for: completed counter-scans.
   address. A provider answer under 24 hours old is shown instead of asking
   again, free. An answer that was paid for is kept in the dataset when the
   cluster has recorded the address (members can then infer who looked it
-  up); for an address nobody recorded nothing is written anywhere.
+  up); for an address nobody recorded nothing is written anywhere. The
+  cheap tier (the dataset, fresh answers, free providers) runs by itself;
+  paid providers are offered with their prices.
+- **Domains.** A lookup of a domain asks 5 resolvers (nodes of the
+  cluster) and lists each address with its votes; an address stands when
+  most of the resolvers that answered returned it. Disputed names are
+  shown with their votes. Agreed names are replicated as `ip_name`
+  records and appear in the dataset's `names` column.
 - **Your nodes as one.** `Cluster › Ownership › Collect credits here`
   makes one node of yours the collecting node: the others forward what
   they earn and draw from it when a lookup needs more than they hold.
@@ -196,6 +209,8 @@ the cluster asked for: completed counter-scans.
     scanners then scan the address and the inventor earns the trap share
     (at most 0.5 per address and day). `scan.trusted_origins` and blocking
     are the answer.
+  - A majority of colluding resolvers can agree on a wrong address; the
+    per-address votes are shown so a single odd answer stands out.
   - Invented scan results are caught only by audits, and only for sources
     still reachable 30 minutes after the scan arrived.
   - It cannot stop one double spend per node key: the second branch is
@@ -290,6 +305,15 @@ the cluster asked for: completed counter-scans.
   other, only one of them is scanned: the higher level, else the one
   queued first. Arbiters and scanners both apply this, and the other job
   ends as "superseded".
+- A failed scan is retried on its own. The job stays "failed" (the
+  scanner weights and the failure counts read it); its arbiter queues a new
+  job for the same IP and level, marked "retry" on the Scans page. Nobody
+  gets a retry for 10 minutes, doubling per failure up to 2 hours, and the
+  scanner that failed last waits 30 minutes longer, so another scanner
+  gets the first try. Retries stop 24 hours after the first failure, once
+  a scan of the IP at that level or higher succeeds anywhere in the
+  cluster, and never start for an invalid target. A standalone node
+  retries the same way.
 - Every member sees everything the cluster records, including raw requests
   and false-positive claims with their optional contact address. Every
   member can export the whole dataset (`peephole export`, or Admin →

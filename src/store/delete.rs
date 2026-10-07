@@ -400,4 +400,23 @@ mod tests {
         assert_eq!(count(&s, "requests", "ip_id", b).await, 0);
         assert_eq!(count(&s, "fp_claims", "ip_id", b).await, 0);
     }
+
+    #[tokio::test]
+    async fn deleting_an_ip_known_only_by_a_name_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let row = s.upsert_ip("203.0.113.77".parse().unwrap()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen, agreed)
+             VALUES (?, 'named.example', 'dns', '2026-01-01 00:00:00',
+                     '2026-01-01 00:00:00', 1)",
+        )
+        .bind(row.id)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        s.local().delete_ips(&[row.id]).await.unwrap();
+        assert_eq!(count(&s, "ip_names", "ip_id", row.id).await, 0);
+        assert_eq!(count(&s, "ips", "id", row.id).await, 0);
+    }
 }

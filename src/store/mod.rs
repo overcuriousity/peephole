@@ -14,6 +14,7 @@ pub mod inspect;
 pub mod ja4h;
 pub mod links;
 pub mod maintenance;
+pub mod probes;
 pub mod publish;
 pub mod recorder;
 pub mod requests;
@@ -51,6 +52,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0015_forks.sql"),
     include_str!("migrations/0016_credit_scans.sql"),
     include_str!("migrations/0017_scan_audits.sql"),
+    include_str!("migrations/0018_probes.sql"),
+    include_str!("migrations/0019_probe_charged.sql"),
+    include_str!("migrations/0020_scan_retries.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of

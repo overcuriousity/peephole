@@ -154,7 +154,7 @@
       tr.appendChild(cell("mono", "#" + esc(j.id)));
       tr.appendChild(cell("ip", '<a href="/ip/' + esc(j.ip) + '">' + esc(j.ip) + "</a>"));
       tr.appendChild(cell("", esc(j.level)));
-      tr.appendChild(cell("", '<span class="badge badge-status" data-status="' + esc(j.status) + '">' + esc(j.status) + "</span>"));
+      tr.appendChild(cell("", '<span class="badge badge-status" data-status="' + esc(j.status) + '">' + esc(j.status) + "</span>" + (j.retry_at ? ' <span class="badge" title="Retry of a failed scan, not before ' + esc(j.retry_at) + ' UTC">retry</span>' : "")));
       tr.appendChild(cell("ts", esc(j.queued_at)));
       tr.appendChild(cell("ts", esc(j.started_at)));
       tr.appendChild(cell("muted", esc(j.scanner) + (j.arbiter ? '<span class="node-via"> via ' + esc(j.arbiter) + "</span>" : "")));
@@ -282,6 +282,40 @@
       // Oldest first in the batch: inserting each at the top leaves the newest on top.
       rows.forEach(function (r) { rBody.insertBefore(rRow(r), rBody.firstChild); });
       while (rBody.children.length > rMax) rBody.removeChild(rBody.lastChild);
+    });
+  }
+
+  // Actions card: the total of the ticked probe vantages, live.
+  document.querySelectorAll("[data-probe-form]").forEach(function (f) {
+    var out = f.querySelector("[data-probe-total]");
+    if (!out) return;
+    f.addEventListener("change", function () {
+      var mc = 0;
+      f.querySelectorAll("input[data-mc]:checked").forEach(function (c) { mc += parseInt(c.getAttribute("data-mc"), 10) || 0; });
+      var cents = Math.floor((mc + 5) / 10);
+      out.textContent = Math.floor(cents / 100) + "." + String(cents % 100).padStart(2, "0");
+    });
+  });
+
+  // A one-line textarea that also takes a pasted list: Enter submits,
+  // Shift+Enter adds a line.
+  document.querySelectorAll("textarea[data-enter-submits]").forEach(function (ta) {
+    ta.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing && ta.form) {
+        ev.preventDefault();
+        if (ta.form.requestSubmit) { ta.form.requestSubmit(); } else { ta.form.submit(); }
+      }
+    });
+  });
+
+  // Probes section: while a probe waits for its result, reload the page
+  // when the states the server reports differ from the rendered ones.
+  var ps = document.querySelector("[data-probes-src]");
+  if (ps && window.EventSource) {
+    var shown = ps.getAttribute("data-probes-states");
+    var pes = new EventSource(ps.getAttribute("data-probes-src"));
+    pes.addEventListener("probes", function (ev) {
+      if (ev.data !== shown) { pes.close(); location.reload(); }
     });
   }
 

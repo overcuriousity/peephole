@@ -132,6 +132,9 @@ fn job(o: &Origin, uid: &str, ip: &str, level: i64) -> Record {
         ip: ip.into(),
         level,
         queued_at: "2026-10-01 00:00:00".into(),
+        retry_of: None,
+        retry_at: None,
+        failed_by: None,
     })
 }
 

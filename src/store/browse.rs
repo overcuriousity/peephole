@@ -152,6 +152,19 @@ pub struct RequestListRow {
     pub is_tor: bool,
     /// Admin only: the cluster node that recorded it.
     pub node: Option<String>,
+    /// Admin only: it was answered with a decoy that carried canaries.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub canary_served: bool,
+    /// Admin only: a canary it presented ([`crate::canary::hash`]), served
+    /// to another request …
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub canary_used: Option<i64>,
+    /// … namely this one (None: a light row served it).
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub canary_from: Option<i64>,
 }
 
 impl RequestListRow {
@@ -282,6 +295,18 @@ impl Audience {
             Self::Public => "NULL",
         }
     }
+    /// The canary marks of a request row: admin only.
+    fn canary_cols(self) -> String {
+        match self {
+            Self::Admin => format!(
+                ", EXISTS (SELECT 1 FROM canaries c WHERE c.request_id = r.id) AS canary_served,
+                 ({}) AS canary_used, ({}) AS canary_from",
+                CANARY_USED.replace("{}", "t.value_hash"),
+                CANARY_USED.replace("{}", "c.request_id")
+            ),
+            Self::Public => String::new(),
+        }
+    }
     /// `AND`-fragment keeping only the requests this audience may count
     /// (`alias` names a `requests` table): the public sees released rows.
     /// Phrased as a subquery on the partial index `idx_requests_pending`
@@ -329,12 +354,21 @@ impl Audience {
 fn request_row_select(a: Audience) -> String {
     format!(
         "SELECT r.id, r.ts, r.ip_id, i.ip, r.method, r.path, {} AS query,
-                r.severity, r.labels_json, r.owasp_json, i.country, i.is_tor_exit AS is_tor, {} AS node
+                r.severity, r.labels_json, r.owasp_json, i.country, i.is_tor_exit AS is_tor, {} AS node{}
          FROM requests r JOIN ips i ON r.ip_id = i.id",
         a.query_col(),
-        a.node_col()
+        a.node_col(),
+        a.canary_cols()
     )
 }
+
+/// The first canary a request presented that another request (or a light
+/// row) was served: (value hash, serving request) as in
+/// `canaries::REUSE_SELECT`. A full row that served it ranks first.
+const CANARY_USED: &str =
+    "SELECT {} FROM request_tokens t JOIN canaries c ON c.value_hash = t.value_hash
+     WHERE t.request_id = r.id AND (c.request_id IS NULL OR c.request_id != r.id)
+     ORDER BY c.request_id IS NULL, c.ts LIMIT 1";
 
 pub(crate) fn nonempty(s: &Option<String>) -> Option<String> {
     s.as_deref()

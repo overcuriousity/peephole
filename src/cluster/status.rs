@@ -10,6 +10,7 @@ use super::Node;
 use super::identity::NodeId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,8 @@ const GOSSIP_SLACK: usize = 16;
 pub const NEIGHBOUR_WINDOW: Duration = Duration::from_secs(90);
 /// How often a node refreshes its own heartbeat.
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
+/// A report no peer repeated for this long is dropped.
+pub const SEEN_FROM_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Scan pace as published in heartbeats.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -68,6 +71,13 @@ pub struct Heartbeat {
     /// Per provider this node serves: its current price in mc.
     #[serde(default)]
     pub prices: Vec<(String, u32)>,
+    /// The node's public addresses as its peers see them.
+    #[serde(default)]
+    pub public_addrs: Vec<IpAddr>,
+    /// What an observational probe costs at this node, in mc; None when
+    /// it does not probe.
+    #[serde(default)]
+    pub probe_price_mc: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +136,13 @@ pub struct Contact {
     pub inbound: Option<Instant>,
 }
 
+/// Per reporting peer: whether it is a sibling, and when it last reported.
+type SeenBy = HashMap<NodeId, (bool, Instant)>;
+
+/// One reported address: its reporters (and whether each is a sibling),
+/// and whether it is taken.
+pub type SeenReport = (IpAddr, Vec<(NodeId, bool)>, bool);
+
 #[derive(Default)]
 pub struct Status {
     pub local: Mutex<LocalStatus>,
@@ -135,6 +152,9 @@ pub struct Status {
     /// Source addresses members connected from (newest last), so the
     /// scanners never scan them, outbound-only members included.
     peer_ips: Mutex<HashMap<NodeId, Vec<std::net::IpAddr>>>,
+    /// Addresses peers saw this node connect from: per address, who
+    /// reported it (and whether that peer is a sibling) and when last.
+    seen_from: Mutex<HashMap<IpAddr, SeenBy>>,
 }
 
 /// Connection addresses remembered per member.
@@ -164,6 +184,78 @@ impl Status {
             .iter()
             .flat_map(|(id, ips)| ips.iter().map(|ip| (*id, *ip)))
             .collect()
+    }
+
+    /// `reporter` saw this node connect from `ip`.
+    pub fn note_seen_from(&self, reporter: NodeId, sibling: bool, ip: IpAddr) {
+        let ip = crate::net::canonical(ip);
+        if !crate::net::is_scannable_target(ip) {
+            return; // private, loopback, link-local: a LAN or tunnel view
+        }
+        let mut all = self.seen_from.lock().unwrap();
+        all.entry(ip)
+            .or_default()
+            .insert(reporter, (sibling, Instant::now()));
+    }
+
+    /// Whether an address is believed: one sibling or two members say so.
+    /// A node does not know which other members share an owner, so two
+    /// distinct reporters stand in for "two members of different owners".
+    fn taken(reports: &HashMap<NodeId, (bool, Instant)>) -> bool {
+        let live: Vec<_> = reports
+            .values()
+            .filter(|(_, t)| t.elapsed() < SEEN_FROM_TTL)
+            .collect();
+        live.iter().any(|(s, _)| *s) || live.len() >= 2
+    }
+
+    /// Drop reports older than [`SEEN_FROM_TTL`].
+    fn expire_seen_from(all: &mut HashMap<IpAddr, HashMap<NodeId, (bool, Instant)>>) {
+        all.retain(|_, r| {
+            r.retain(|_, (_, t)| t.elapsed() < SEEN_FROM_TTL);
+            !r.is_empty()
+        });
+    }
+
+    /// This node's public addresses: reported by a sibling, or by two
+    /// members. Newest confirmation first.
+    pub fn public_addresses(&self) -> Vec<IpAddr> {
+        let mut all = self.seen_from.lock().unwrap();
+        Self::expire_seen_from(&mut all);
+        let mut v: Vec<(Instant, IpAddr)> = all
+            .iter()
+            .filter(|(_, r)| Self::taken(r))
+            .map(|(ip, r)| (r.values().map(|(_, t)| *t).max().unwrap(), *ip))
+            .collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.0));
+        v.into_iter().map(|(_, ip)| ip).collect()
+    }
+
+    /// Every reported address with its reporters (and whether each is a
+    /// sibling) and whether it is taken; taken ones first.
+    pub fn seen_from_report(&self) -> Vec<SeenReport> {
+        let mut all = self.seen_from.lock().unwrap();
+        Self::expire_seen_from(&mut all);
+        let mut v: Vec<_> = all
+            .iter()
+            .map(|(ip, r)| {
+                let mut who: Vec<_> = r.iter().map(|(id, (s, _))| (*id, *s)).collect();
+                who.sort();
+                (*ip, who, Self::taken(r))
+            })
+            .collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        v
+    }
+
+    /// Shift every seen-from report back by `by`.
+    #[cfg(test)]
+    pub fn age_seen_from(&self, by: Duration) {
+        for r in self.seen_from.lock().unwrap().values_mut() {
+            for (_, t) in r.values_mut() {
+                *t = t.checked_sub(by).unwrap_or(*t);
+            }
+        }
     }
 
     pub fn touch_inbound(&self, peer: NodeId) {
@@ -294,7 +386,8 @@ impl Node {
     /// Build, sign and store this node's current heartbeat.
     pub fn refresh_heartbeat(&self) {
         let local = self.status.local.lock().unwrap().clone();
-        let (on_demand, prices) = self.price_table().announced();
+        let table = self.price_table();
+        let (on_demand, prices) = table.announced();
         let hb = Heartbeat {
             node: self.id(),
             at_ms: self.status.next_at(),
@@ -324,6 +417,8 @@ impl Node {
             },
             on_demand,
             prices,
+            public_addrs: self.status.public_addresses(),
+            probe_price_mc: self.prober().map(|p| p.price(&table)),
         };
         let Ok(body) = super::rpc::cbor::encode(&hb) else {
             return;
@@ -403,6 +498,32 @@ mod tests {
         assert!(ips.contains(&(a, "198.51.100.19".parse().unwrap())));
     }
 
+    #[test]
+    fn one_stranger_is_not_believed_but_a_sibling_or_two_strangers_are() {
+        let st = Status::default();
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        st.note_seen_from(NodeId([1; 32]), false, ip);
+        assert!(st.public_addresses().is_empty(), "one stranger");
+        st.note_seen_from(NodeId([2; 32]), false, ip);
+        assert_eq!(st.public_addresses(), vec![ip], "two strangers");
+        let st = Status::default();
+        st.note_seen_from(NodeId([3; 32]), true, ip);
+        assert_eq!(st.public_addresses(), vec![ip], "one sibling");
+    }
+
+    #[test]
+    fn private_and_mapped_reports_are_ignored_and_old_ones_expire() {
+        let st = Status::default();
+        for bad in ["10.1.2.3", "127.0.0.1", "fe80::1", "::ffff:10.0.0.1"] {
+            st.note_seen_from(NodeId([3; 32]), true, bad.parse().unwrap());
+        }
+        assert!(st.public_addresses().is_empty());
+        let ip: IpAddr = "198.51.100.4".parse().unwrap();
+        st.note_seen_from(NodeId([3; 32]), true, ip);
+        st.age_seen_from(SEEN_FROM_TTL + Duration::from_secs(1)); // test hook: shifts every report back
+        assert!(st.public_addresses().is_empty(), "unconfirmed for 7 days");
+    }
+
     fn signed_hb(
         id: &crate::cluster::identity::Identity,
         at_ms: u64,
@@ -421,6 +542,8 @@ mod tests {
             floors: vec![],
             on_demand: vec![],
             prices: vec![],
+            public_addrs: vec![],
+            probe_price_mc: None,
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = id.sign(&SignedHeartbeat::signing(&body));
@@ -544,6 +667,8 @@ mod tests {
             floors: vec![],
             on_demand: vec![],
             prices: vec![],
+            public_addrs: vec![],
+            probe_price_mc: None,
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = a.sign(&SignedHeartbeat::signing(&body));

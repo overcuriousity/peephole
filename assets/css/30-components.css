@@ -191,3 +191,12 @@ a.tile .hint { color: var(--color-accent); }
 .attention-list { margin: 0; padding-left: 1.1rem; }
 .attention-list li + li { margin-top: 0.25rem; }
 .attention-list li[data-level="warn"]::marker { color: var(--color-warning); }
+/* Actions card and Probes section (admin::probes). */
+.badge-status[data-status="declined"] { background: var(--color-danger-dim); color: var(--color-danger); }
+.badge-status[data-status="lapsed"] { background: var(--color-bg-active); color: var(--color-fg-muted); }
+.text-warning { color: var(--color-warning); }
+.vantages { list-style: none; margin: 0 0 0.5rem; padding: 0; }
+.vantages li + li { margin-top: 0.25rem; }
+.probe-member { display: grid; gap: 0.75rem; margin-bottom: 1rem; }
+.probe-member .intel h4 { margin: 0 0 0.5rem; font-size: var(--text-sm); }
+tr.diff td, p.diff { background: var(--color-warning-dim); }

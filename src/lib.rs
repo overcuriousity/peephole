@@ -137,6 +137,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let tor = Arc::new(RwLock::new(
         intel::tor::TorExitList::load(&cfg.data_dir).unwrap_or_default(),
     ));
+    let rdap: intel::SharedRdap =
+        Arc::new(RwLock::new(intel::rdap::Bootstrap::load(&cfg.data_dir)));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -163,11 +165,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         cfg.clone(),
         geo.clone(),
         tor.clone(),
+        rdap.clone(),
         shutdown_rx.clone(),
     ));
 
     // Results for IPs this or other nodes recorded without them.
-    let providers = intel::providers(&cfg, &store, &geo, &tor);
+    let providers = intel::providers(&cfg, &store, &geo, &tor, &rdap);
     if let Some(n) = &node {
         n.set_lookup_providers(providers.clone());
         n.set_lookup_shares(credits::share::Shares::new(
@@ -180,6 +183,17 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         providers.clone(),
         shutdown_rx.clone(),
     ));
+
+    // Observational probes, for members (paid) and this node's admin.
+    let prober = (cfg.roles.scanner && cfg.probe.enabled).then(|| {
+        Arc::new(scan::probe::serve::Prober::new(
+            &cfg,
+            node.as_ref().map(|n| n.id()),
+        ))
+    });
+    if let (Some(n), Some(p)) = (&node, &prober) {
+        n.set_prober(p.clone());
+    }
 
     // Retention on a standalone node: delete records older than the window.
     // A cluster node lowers its history floor instead (`cluster::history`).
@@ -297,6 +311,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         settings: settings.clone(),
         node: node.clone(),
         providers,
+        prober,
         tarpit: Arc::new(trap::tarpit::Tarpit::of(&cfg)),
         sse: Arc::new(trap::decoy::sse::SseHub::new(&cfg.trap)),
     };
@@ -384,6 +399,8 @@ struct RoleRunner {
     settings: settings::Settings,
     node: Option<Arc<cluster::Node>>,
     providers: intel::Providers,
+    /// Observational probes (scanner role with `probe.enabled`).
+    prober: Option<Arc<scan::probe::serve::Prober>>,
     /// The trap's tarpit: outlives a listener restart, read by the admin.
     tarpit: Arc<trap::tarpit::Tarpit>,
     /// The trap's legacy MCP SSE streams: outlive a listener restart.
@@ -640,10 +657,12 @@ impl RoleRunner {
                 self.cfg.clone(),
                 self.notifier.clone(),
                 self.settings.pace.clone(),
+                self.geo.clone(),
             )
             .with_recorder(self.recorder.clone())
             .with_settings(self.settings.clone())
             .with_providers(self.providers.clone())
+            .with_prober(self.prober.clone())
             .with_tarpit(self.tarpit.clone())
             .with_closing(rx.clone()),
         ));

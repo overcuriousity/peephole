@@ -23,7 +23,7 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    fn origin_bytes(&self) -> Option<Vec<u8>> {
+    pub(crate) fn origin_bytes(&self) -> Option<Vec<u8>> {
         self.origin.map(|o| o.0.to_vec())
     }
 }
@@ -91,6 +91,8 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
         Record::Tombstone(t) => tombstone(conn, ctx, t).await,
         Record::IntelManifest(m) => intel_manifest(conn, ctx, m).await,
         Record::SkipBatch(b) => skip_batch(conn, ctx, b).await,
+        Record::ProbeResult(r) => super::probes::apply_probe_result(conn, ctx, r).await,
+        Record::IpName(r) => super::probes::apply_ip_name(conn, ctx, r).await,
         // Membership and credits are the cluster layer's (`members::apply`,
         // `credits::entries`, `cluster::seal`): no row of the dataset.
         Record::MemberAdd(_)
@@ -106,7 +108,7 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
 
 /// Record kinds a local hide or block keeps out of the tables. Membership,
 /// tombstones and scan-job state still apply, so the cluster stays in step.
-const CONTENT_KINDS: [&str; 8] = [
+const CONTENT_KINDS: [&str; 10] = [
     "request",
     "skip_batch",
     "fingerprint",
@@ -115,6 +117,8 @@ const CONTENT_KINDS: [&str; 8] = [
     "scan_result",
     "scan_audit",
     "ip_intel",
+    "probe_result",
+    "ip_name",
 ];
 
 async fn origin_blocked(conn: &mut SqliteConnection, origin: Option<&NodeId>) -> Result<bool> {
@@ -171,7 +175,7 @@ pub async fn hide(conn: &mut SqliteConnection, uids: &[String]) -> Result<u64> {
 }
 
 /// The tombstone that already deleted this record, if any.
-async fn erased_by(conn: &mut SqliteConnection, uid: &str) -> Result<Option<String>> {
+pub(crate) async fn erased_by(conn: &mut SqliteConnection, uid: &str) -> Result<Option<String>> {
     Ok(
         sqlx::query_scalar("SELECT tombstone_uid FROM tombstoned WHERE uid = ?")
             .bind(uid)
@@ -217,7 +221,7 @@ fn row_ms(ms: i64) -> i64 {
 /// address is stored in its canonical text, so a peer's `::ffff:a.b.c.d` or
 /// upper-case IPv6 finds the same row. `seen` widens the first/last-seen
 /// window; scan records pass None (a scan is not a visit).
-async fn ensure_ip(
+pub(crate) async fn ensure_ip(
     conn: &mut SqliteConnection,
     ip: &str,
     seen: Option<&str>,
@@ -672,8 +676,9 @@ async fn scan_job(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &ScanJobRec) -> 
         return Ok(Effect::Ignored);
     };
     sqlx::query(
-        "INSERT OR IGNORE INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at)
-         VALUES (?,?,?,?,?,?,'queued',?)",
+        "INSERT OR IGNORE INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at,
+                                          retry_of, retry_at, failed_by)
+         VALUES (?,?,?,?,?,?,'queued',?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -682,6 +687,9 @@ async fn scan_job(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &ScanJobRec) -> 
     .bind(ip_id)
     .bind(r.level)
     .bind(&r.queued_at)
+    .bind(&r.retry_of)
+    .bind(&r.retry_at)
+    .bind(r.failed_by.map(|s| s.0.to_vec()))
     .execute(&mut *conn)
     .await?;
     Ok(Effect::Applied)
@@ -1026,15 +1034,17 @@ async fn tombstone(conn: &mut SqliteConnection, ctx: Ctx<'_>, t: &TombstoneRec) 
     }
     let mine: std::collections::HashSet<&str> = own.iter().map(String::as_str).collect();
     let mut ips = std::collections::BTreeSet::new();
-    for table in [
-        "requests",
-        "fp_claims",
-        "fingerprints",
-        "scan_jobs",
-        "scans",
-        "skipped_batches",
+    for (table, col) in [
+        ("requests", "uid"),
+        ("fp_claims", "uid"),
+        ("fingerprints", "uid"),
+        ("scan_jobs", "uid"),
+        ("scans", "uid"),
+        ("skipped_batches", "uid"),
+        ("probes", "uid"),
+        ("ip_names", "record_uid"),
     ] {
-        let sql = format!("SELECT DISTINCT ip_id FROM {table} WHERE uid IN ({{}})");
+        let sql = format!("SELECT DISTINCT ip_id FROM {table} WHERE {col} IN ({{}})");
         for chunk in own.chunks(400) {
             let sql = sql.replace("{}", &placeholders(chunk.len()));
             let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
@@ -1079,10 +1089,13 @@ async fn tombstone(conn: &mut SqliteConnection, ctx: Ctx<'_>, t: &TombstoneRec) 
         "scan_jobs",
         "requests",
         "skipped_batches",
+        // probe_ports and the probe's host_keys cascade.
+        "probes",
     ] {
         let sql = format!("DELETE FROM {table} WHERE uid IN ({{}})");
         for_uids(conn, &sql, &own).await?;
     }
+    for_uids(conn, "DELETE FROM ip_names WHERE record_uid IN ({})", &own).await?;
     for ip_id in ips {
         drop_orphan_ip(conn, ip_id).await?;
     }
@@ -1095,14 +1108,24 @@ pub(crate) async fn drop_orphan_ip(conn: &mut SqliteConnection, ip_id: i64) -> R
         .bind(ip_id)
         .fetch_optional(&mut *conn)
         .await?;
+    // PTR names come from the scans: they go with the last one.
+    sqlx::query(
+        "DELETE FROM ip_names WHERE ip_id = ?1 AND source = 'ptr'
+           AND NOT EXISTS (SELECT 1 FROM scans WHERE ip_id = ?1)",
+    )
+    .bind(ip_id)
+    .execute(&mut *conn)
+    .await?;
     let dropped = sqlx::query(
         "DELETE FROM ips WHERE id = ?1
+           AND NOT EXISTS (SELECT 1 FROM ip_names WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM requests WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM scan_jobs WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM scans WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM fingerprints WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM fp_claims WHERE ip_id = ?1)
-           AND NOT EXISTS (SELECT 1 FROM skipped_batches WHERE ip_id = ?1)",
+           AND NOT EXISTS (SELECT 1 FROM skipped_batches WHERE ip_id = ?1)
+           AND NOT EXISTS (SELECT 1 FROM probes WHERE ip_id = ?1)",
     )
     .bind(ip_id)
     .execute(&mut *conn)
@@ -1181,9 +1204,18 @@ async fn remove_row(
         "scan_job" => "scan_jobs",
         "scan_result" | "scan_audit" => "scans",
         "skip_batch" => "skipped_batches",
+        // probe_ports and the probe's host_keys cascade.
+        "probe_result" => "probes",
+        "ip_name" => "ip_names",
         _ => return Ok(None),
     };
-    let sql = format!("SELECT ip_id FROM {table} WHERE uid = ?");
+    // An ip_names row carries the uid of the newest lookup that set it.
+    let col = if kind == "ip_name" {
+        "record_uid"
+    } else {
+        "uid"
+    };
+    let sql = format!("SELECT ip_id FROM {table} WHERE {col} = ? LIMIT 1");
     let ip_id: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .bind(uid)
         .fetch_optional(&mut *conn)
@@ -1232,11 +1264,24 @@ async fn remove_row(
         }
         _ => {}
     }
-    let sql = format!("DELETE FROM {table} WHERE uid = ?");
+    // One lookup names several addresses: the caller gets one of them,
+    // the others are dropped here once nothing else refers to them.
+    let others: Vec<i64> = if kind == "ip_name" {
+        sqlx::query_scalar("SELECT DISTINCT ip_id FROM ip_names WHERE record_uid = ?")
+            .bind(uid)
+            .fetch_all(&mut *conn)
+            .await?
+    } else {
+        vec![]
+    };
+    let sql = format!("DELETE FROM {table} WHERE {col} = ?");
     sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(uid)
         .execute(&mut *conn)
         .await?;
+    for other in others.into_iter().filter(|o| Some(*o) != ip_id) {
+        drop_orphan_ip(conn, other).await?;
+    }
     Ok(ip_id)
 }
 
@@ -2079,6 +2124,9 @@ mod tests {
                 ip: "203.0.113.7".into(),
                 level: 2,
                 queued_at: now_ts(),
+                retry_of: None,
+                retry_at: None,
+                failed_by: None,
             }),
         )
         .await
@@ -2134,6 +2182,9 @@ mod tests {
             ip: "203.0.113.9".into(),
             level: 2,
             queued_at: now_ts(),
+            retry_of: None,
+            retry_at: None,
+            failed_by: None,
         });
         assert_eq!(
             apply(&mut conn, ctx(&scanner, 1), &job).await.unwrap(),
@@ -2367,6 +2418,9 @@ mod tests {
                 ip: "203.0.113.7".into(),
                 level: 1,
                 queued_at: now_ts(),
+                retry_of: None,
+                retry_at: None,
+                failed_by: None,
             }),
             Record::ScanResult(ScanResultRec {
                 uid: u("scan"),

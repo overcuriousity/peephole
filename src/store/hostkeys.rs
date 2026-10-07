@@ -4,7 +4,9 @@
 
 use super::Store;
 use super::inspect::{MAX_RAW_XML, zstd_decode_capped};
-use crate::scan::hostkeys::{HASSH, JA4X, SSH_HOSTKEY, TLS_CERT, extract};
+use crate::scan::hostkeys::{
+    FAVICON, HASSH, HTTP_404, HTTP_BODY, HostKey, JA4X, JARM, SSH_HOSTKEY, TLS_CERT, extract,
+};
 use anyhow::Result;
 use sqlx::SqliteConnection;
 
@@ -17,6 +19,10 @@ pub struct HostKeyRow {
     pub detail: String,
     /// Distinct other source IPs with the same identifier.
     pub other_ips: i64,
+    /// Set when a probe found it rather than a scan.
+    pub probe_id: Option<i64>,
+    /// When that probe finished.
+    pub probe_at: Option<String>,
 }
 
 impl HostKeyRow {
@@ -48,9 +54,16 @@ pub fn kind_name(kind: &str) -> &'static str {
         TLS_CERT => "TLS certificate",
         JA4X => "JA4X",
         HASSH => "HASSH",
+        FAVICON => "Favicon",
+        JARM => "JARM",
+        HTTP_BODY => "HTTP body",
+        HTTP_404 => "HTTP 404 page",
         _ => "other",
     }
 }
+
+/// Most PTR names kept of one scan.
+const MAX_PTR_NAMES: usize = 16;
 
 /// Read the identifiers out of a stored scan (zstd-compressed nmap XML)
 /// and mark the scan as read. Unreadable XML yields none; only database
@@ -61,14 +74,38 @@ pub(crate) async fn derive(
     ip_id: i64,
     raw_xml: Option<&[u8]>,
 ) -> Result<()> {
-    let keys = match raw_xml.map(|b| zstd_decode_capped(b, MAX_RAW_XML)) {
-        Some(Ok(xml)) => extract(&xml),
+    let (keys, names) = match raw_xml.map(|b| zstd_decode_capped(b, MAX_RAW_XML)) {
+        Some(Ok(xml)) => (extract(&xml), crate::scan::hostkeys::ptr_names(&xml)),
         Some(Err(e)) => {
             tracing::debug!(scan_id, "host keys: scan XML unreadable: {e:#}");
-            vec![]
+            (vec![], vec![])
         }
-        None => vec![],
+        None => (vec![], vec![]),
     };
+    // The PTR names nmap saw: local and derived like the keys, never
+    // replicated on their own.
+    if !names.is_empty() {
+        let seen: Option<String> = sqlx::query_scalar("SELECT finished_at FROM scans WHERE id = ?")
+            .bind(scan_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten();
+        let seen = seen.unwrap_or_else(super::data::now_ts);
+        for name in names.iter().take(MAX_PTR_NAMES) {
+            sqlx::query(
+                "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen, agreed)
+                 VALUES (?1, ?2, 'ptr', ?3, ?3, 1)
+                 ON CONFLICT(ip_id, name, source) DO UPDATE
+                   SET first_seen = min(first_seen, excluded.first_seen),
+                       last_seen = max(last_seen, excluded.last_seen)",
+            )
+            .bind(ip_id)
+            .bind(name)
+            .bind(&seen)
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
     for k in keys {
         sqlx::query(
             "INSERT OR IGNORE INTO host_keys (scan_id, ip_id, port, kind, fingerprint, detail)
@@ -111,10 +148,35 @@ pub(crate) async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
     }
 }
 
+/// Store what a probe found (the same keys a scan's XML yields).
+pub(crate) async fn insert_probe_keys(
+    conn: &mut SqliteConnection,
+    probe_id: i64,
+    ip_id: i64,
+    keys: &[HostKey],
+) -> Result<()> {
+    for k in keys {
+        sqlx::query(
+            "INSERT OR IGNORE INTO host_keys (probe_id, ip_id, port, kind, fingerprint, detail)
+             VALUES (?,?,?,?,?,?)",
+        )
+        .bind(probe_id)
+        .bind(ip_id)
+        .bind(k.port as i64)
+        .bind(k.kind)
+        .bind(&k.fingerprint)
+        .bind(&k.detail)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
 const ROW_SELECT: &str = "SELECT h.kind, h.port, h.fingerprint, MAX(h.detail) AS detail,
         (SELECT COUNT(DISTINCT o.ip_id) FROM host_keys o
-         WHERE o.kind = h.kind AND o.fingerprint = h.fingerprint AND o.ip_id != h.ip_id) AS other_ips
-     FROM host_keys h";
+         WHERE o.kind = h.kind AND o.fingerprint = h.fingerprint AND o.ip_id != h.ip_id) AS other_ips,
+        MAX(h.probe_id) AS probe_id, MAX(p.finished_at) AS probe_at
+     FROM host_keys h LEFT JOIN probes p ON p.id = h.probe_id";
 
 impl Store {
     /// Every identifier any scan found on this IP, once each.
@@ -211,6 +273,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(parsed, 3);
+    }
+
+    #[tokio::test]
+    async fn ptr_names_are_read_from_a_scan_and_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let xml = String::from_utf8(include_bytes!("../../tests/fixtures/nmap-basic.xml").to_vec())
+            .unwrap()
+            .replacen(
+                r#"<status state="up" reason="syn-ack"/>"#,
+                r#"<status state="up" reason="syn-ack"/><hostnames><hostname name="Mail.Example.COM" type="PTR"/><hostname name="user.example.com" type="user"/></hostnames>"#,
+                1,
+            );
+        scan(&s, "192.0.2.7", xml.as_bytes()).await;
+        let ip = s.ip_by_addr("192.0.2.7").await.unwrap().unwrap();
+        let names = s.names_for_ip(ip.id).await.unwrap();
+        assert_eq!(names.len(), 1, "only the PTR name: {names:?}");
+        assert_eq!(
+            (
+                names[0].name.as_str(),
+                names[0].source.as_str(),
+                names[0].agreed
+            ),
+            ("mail.example.com", "ptr", true)
+        );
+        // Read again (the backfill): one row still.
+        sqlx::query("UPDATE scans SET keys_parsed = 0")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        backfill(&s.pool).await.unwrap();
+        assert_eq!(s.names_for_ip(ip.id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

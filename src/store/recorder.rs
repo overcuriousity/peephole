@@ -7,6 +7,7 @@ use super::requests::NewRequest;
 use super::scans::{EnqueueOutcome, ScanJobRow};
 use crate::cluster::Node;
 use crate::cluster::hlc::Hlc;
+use crate::cluster::identity::NodeId;
 use crate::cluster::record::{
     FingerprintRec, FpClaimRec, IpIntelRec, JobStatusRec, PortRec, Record, RequestRec, ScanJobRec,
     ScanResultRec, TombstoneRec,
@@ -68,7 +69,7 @@ impl Recorder {
 
     /// A fresh uid. In a cluster it carries this node's prefix, which binds
     /// the record to its origin (see `NodeId::uid_prefix`).
-    fn uid(&self) -> String {
+    pub(crate) fn uid(&self) -> String {
         match self {
             Recorder::Local(_) => new_uid(),
             Recorder::Cluster(n) => format!("{}{}", n.id().uid_prefix(), new_uid()),
@@ -524,6 +525,9 @@ impl Recorder {
             ip: ip_text,
             level: level as i64,
             queued_at: now_ts(),
+            retry_of: None,
+            retry_at: None,
+            failed_by: None,
         })])
         .await?;
         Ok(EnqueueOutcome::Queued(
@@ -683,6 +687,7 @@ impl Recorder {
         let sql = format!(
             "SELECT id, ip_id, level, status, queued_at, started_at, finished_at, attempts, error
              FROM scan_jobs WHERE status = 'queued' AND {cond}
+               AND (retry_at IS NULL OR retry_at <= datetime('now'))
              ORDER BY level DESC, queued_at ASC LIMIT 1"
         );
         let mut q = sqlx::query_as::<_, ScanJobRow>(sqlx::AssertSqlSafe(sql));
@@ -758,7 +763,7 @@ impl Recorder {
             }));
         }
         records.push(Record::JobStatus(JobStatusRec {
-            job_uid: uid,
+            job_uid: uid.clone(),
             status: if result.is_some() { "done" } else { "failed" }.into(),
             started_at,
             finished_at: Some(now),
@@ -770,7 +775,77 @@ impl Recorder {
             attempts,
             scanner: self.node_id(),
         }));
-        self.write(records).await
+        self.write(records).await?;
+        if result.is_none() {
+            self.retry_failed(&uid, self.node_id()).await?;
+        }
+        Ok(())
+    }
+
+    /// Queue a retry of the failed job `job_uid` this node arbitrates (see
+    /// [`crate::scan::retry`]), `failed_by` the scanner that ran it. Returns
+    /// the retry's uid; None when the failure is not retried: the error rules
+    /// it out, the window is over, or a pending job or a scan done since the
+    /// first failure covers the IP at this level.
+    pub async fn retry_failed(
+        &self,
+        job_uid: &str,
+        failed_by: Option<NodeId>,
+    ) -> Result<Option<String>> {
+        use crate::scan::retry;
+        let pool = &self.store().pool;
+        type Job = (i64, String, i64, String, Option<String>, Option<String>);
+        let job: Option<Job> = sqlx::query_as(
+            "SELECT j.ip_id, i.ip, j.level, j.status, j.error, j.retry_of
+             FROM scan_jobs j JOIN ips i ON i.id = j.ip_id WHERE j.uid = ?",
+        )
+        .bind(job_uid)
+        .fetch_optional(pool)
+        .await?;
+        let Some((ip_id, ip, level, status, error, retry_of)) = job else {
+            return Ok(None);
+        };
+        if status != "failed" || !retry::retryable(error.as_deref()) {
+            return Ok(None);
+        }
+        let root = retry_of.unwrap_or_else(|| job_uid.to_string());
+        let (first, failures): (Option<String>, i64) = sqlx::query_as(
+            "SELECT MIN(finished_at), COUNT(*) FROM scan_jobs
+             WHERE (uid = ?1 OR retry_of = ?1) AND status = 'failed'",
+        )
+        .bind(&root)
+        .fetch_one(pool)
+        .await?;
+        let Some(retry_at) = first
+            .as_deref()
+            .and_then(|f| retry::next_at(f, failures, chrono::Utc::now()))
+        else {
+            return Ok(None);
+        };
+        let covered: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_jobs WHERE ip_id = ? AND level >= ?
+               AND (status IN ('queued','running') OR (status = 'done' AND finished_at >= ?))",
+        )
+        .bind(ip_id)
+        .bind(level)
+        .bind(&first)
+        .fetch_one(pool)
+        .await?;
+        if covered > 0 {
+            return Ok(None);
+        }
+        let uid = self.uid();
+        self.write(vec![Record::ScanJob(ScanJobRec {
+            uid: uid.clone(),
+            ip,
+            level,
+            queued_at: now_ts(),
+            retry_of: Some(root),
+            retry_at: Some(retry_at),
+            failed_by,
+        })])
+        .await?;
+        Ok(Some(uid))
     }
 
     /// Store the result of a scan this node ran for another arbiter's job
@@ -851,45 +926,11 @@ impl Recorder {
         .await
     }
 
-    /// Requeue failed jobs on every arbiter: ours directly, the others'
-    /// by asking them. Returns how many were requeued (as far as known).
-    pub async fn requeue_failed_everywhere(&self, days: i64) -> Result<u64> {
-        let mut n = self.requeue_failed_jobs(days).await?;
-        if let Recorder::Cluster(node) = self {
-            let others: Vec<_> = node
-                .members()
-                .keys()
-                .copied()
-                .filter(|id| *id != node.id())
-                .collect();
-            let asks = others.into_iter().map(|id| {
-                let node = node.clone();
-                async move {
-                    node.request(
-                        id,
-                        crate::cluster::msg::Msg::RequeueFailed { days },
-                        std::time::Duration::from_secs(10),
-                    )
-                    .await
-                }
-            });
-            for r in futures::future::join_all(asks).await {
-                if let Ok(crate::cluster::msg::Msg::RequeueReply { n: m }) = r {
-                    n += m;
-                }
-            }
-        }
-        Ok(n)
-    }
-
-    /// Requeue the jobs selected by `sql` (uid, started_at kept or not).
-    async fn requeue(&self, sql: String, bind_days: Option<String>, clear: bool) -> Result<u64> {
+    /// Requeue the jobs selected by `sql` (uid, finished_at, error, attempts).
+    async fn requeue(&self, sql: String) -> Result<u64> {
         let (_, own) = self.own_jobs();
         type Row = (String, Option<String>, Option<String>, i64);
         let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql));
-        if let Some(d) = bind_days {
-            q = q.bind(d);
-        }
         if let Some(b) = own {
             q = q.bind(b);
         }
@@ -902,8 +943,8 @@ impl Recorder {
                     job_uid: uid,
                     status: "queued".into(),
                     started_at: None,
-                    finished_at: if clear { None } else { finished_at },
-                    error: if clear { None } else { error },
+                    finished_at,
+                    error,
                     attempts,
                     scanner: None,
                 })
@@ -919,34 +960,10 @@ impl Recorder {
     /// otherwise they block their IP from ever being scanned again.
     pub async fn requeue_orphaned_jobs(&self) -> Result<u64> {
         let (cond, _) = self.own_jobs();
-        self.requeue(
-            format!(
-                "SELECT uid, finished_at, error, attempts FROM scan_jobs
+        self.requeue(format!(
+            "SELECT uid, finished_at, error, attempts FROM scan_jobs
                  WHERE status = 'running' AND uid IS NOT NULL AND {cond}"
-            ),
-            None,
-            false,
-        )
-        .await
-    }
-
-    /// Put jobs that failed in the last `days` back in the queue, unless
-    /// their IP already has a pending job. Returns how many were requeued.
-    pub async fn requeue_failed_jobs(&self, days: i64) -> Result<u64> {
-        let (cond, _) = self.own_jobs();
-        self.requeue(
-            format!(
-                "SELECT uid, finished_at, error, attempts FROM scan_jobs
-                 WHERE status = 'failed' AND finished_at > datetime('now', ?) AND uid IS NOT NULL
-                   AND NOT EXISTS (SELECT 1 FROM scan_jobs p WHERE p.ip_id = scan_jobs.ip_id
-                                   AND p.status IN ('queued','running'))
-                   AND id = (SELECT MAX(f.id) FROM scan_jobs f
-                             WHERE f.ip_id = scan_jobs.ip_id AND f.status = 'failed')
-                   AND {cond}"
-            ),
-            Some(format!("-{days} days")),
-            true,
-        )
+        ))
         .await
     }
 
@@ -1097,6 +1114,7 @@ impl Recorder {
             "scan_jobs",
             "scans",
             "skipped_batches",
+            "probes",
         ] {
             let (o, f) = self.split(table, "ip_id", Keys::Ids(ids)).await?;
             own.extend(o);
@@ -1105,9 +1123,15 @@ impl Recorder {
         let deleted = own.len() as u64;
         self.bury(own).await?;
         let hidden = self.hide(foreign).await?;
-        // An IP without any record left (or that never had one) goes too.
+        // An IP without any record left (or that never had one) goes too;
+        // the names that resolved to it are its own rows here and go first,
+        // or they alone would keep it.
         let mut conn = self.store().pool.acquire().await?;
         for id in ids {
+            sqlx::query("DELETE FROM ip_names WHERE ip_id = ?")
+                .bind(id)
+                .execute(&mut *conn)
+                .await?;
             data::drop_orphan_ip(&mut conn, *id).await?;
         }
         Ok(Deleted { deleted, hidden })

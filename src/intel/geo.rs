@@ -19,6 +19,14 @@ pub struct GeoIp {
 #[derive(serde::Deserialize)]
 struct CityRecord {
     country: Option<CountryRecord>,
+    location: Option<LocationRecord>,
+}
+#[derive(serde::Deserialize)]
+struct LocationRecord {
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    #[serde(default)]
+    accuracy_radius: Option<u16>,
 }
 #[derive(serde::Deserialize)]
 struct CountryRecord {
@@ -28,6 +36,13 @@ struct CountryRecord {
 struct AsnRecord {
     autonomous_system_number: Option<u32>,
     autonomous_system_organization: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Coords {
+    pub lat: f64,
+    pub lon: f64,
+    pub accuracy_km: u32,
 }
 
 /// The GeoLite2 editions a node downloads.
@@ -85,6 +100,35 @@ impl GeoIp {
         }
         g
     }
+
+    pub fn coords(&self, ip: &IpAddr) -> Option<Coords> {
+        let rec = self
+            .city
+            .lookup(*ip)
+            .ok()?
+            .decode::<CityRecord>()
+            .ok()
+            .flatten()?;
+        let l = rec.location?;
+        Some(Coords {
+            lat: l.latitude?,
+            lon: l.longitude?,
+            accuracy_km: l.accuracy_radius.unwrap_or(0) as u32,
+        })
+    }
+}
+
+/// Great-circle distance in km between two (lat, lon) points in degrees.
+pub fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (la1, lo1, la2, lo2) = (
+        a.0.to_radians(),
+        a.1.to_radians(),
+        b.0.to_radians(),
+        b.1.to_radians(),
+    );
+    let h = ((la2 - la1) / 2.0).sin().powi(2)
+        + la1.cos() * la2.cos() * ((lo2 - lo1) / 2.0).sin().powi(2);
+    2.0 * 6371.0 * h.sqrt().asin()
 }
 
 /// Download GeoLite2-City and GeoLite2-ASN into `data_dir` (spec §9).
@@ -179,20 +223,24 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
 
+    fn fixtures() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        // Use absolute paths based on the package directory
+        let pkg_dir = std::env::current_dir().unwrap();
+        let city_src = pkg_dir.join("tests/fixtures/GeoLite2-City-Test.mmdb");
+        let asn_src = pkg_dir.join("tests/fixtures/GeoLite2-ASN-Test.mmdb");
+
+        std::fs::copy(&city_src, dir.path().join("GeoLite2-City.mmdb"))
+            .expect("failed to copy GeoLite2-City-Test.mmdb");
+        std::fs::copy(&asn_src, dir.path().join("GeoLite2-ASN.mmdb"))
+            .expect("failed to copy GeoLite2-ASN-Test.mmdb");
+        dir
+    }
+
     // Uses the MaxMind-DB test fixture downloaded by Step 0 below.
     #[test]
     fn lookup_known_ip_from_fixture() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::copy(
-            "tests/fixtures/GeoLite2-City-Test.mmdb",
-            dir.path().join("GeoLite2-City.mmdb"),
-        )
-        .unwrap();
-        std::fs::copy(
-            "tests/fixtures/GeoLite2-ASN-Test.mmdb",
-            dir.path().join("GeoLite2-ASN.mmdb"),
-        )
-        .unwrap();
+        let dir = fixtures();
         let geo = GeoIp::load(dir.path()).unwrap();
         let g = geo.lookup(&"2.125.160.216".parse::<IpAddr>().unwrap());
         assert_eq!(g.country.as_deref(), Some("GB"));
@@ -200,19 +248,27 @@ mod tests {
 
     #[test]
     fn unknown_ip_yields_empty_geo() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::copy(
-            "tests/fixtures/GeoLite2-City-Test.mmdb",
-            dir.path().join("GeoLite2-City.mmdb"),
-        )
-        .unwrap();
-        std::fs::copy(
-            "tests/fixtures/GeoLite2-ASN-Test.mmdb",
-            dir.path().join("GeoLite2-ASN.mmdb"),
-        )
-        .unwrap();
+        let dir = fixtures();
         let geo = GeoIp::load(dir.path()).unwrap();
         let g = geo.lookup(&"10.1.2.3".parse::<IpAddr>().unwrap());
         assert!(g.country.is_none());
+    }
+
+    #[test]
+    fn coordinates_come_with_the_country_and_distances_are_sane() {
+        let dir = fixtures();
+        let g = GeoIp::load(dir.path()).unwrap();
+        let c = g
+            .coords(&"2.125.160.216".parse().unwrap())
+            .expect("the GB test address has a location");
+        assert!(
+            (c.lat - 51.75).abs() < 1.0 && (c.lon + 1.25).abs() < 1.0,
+            "{c:?}"
+        );
+        assert!(c.accuracy_km > 0);
+        assert!(g.coords(&"203.0.113.1".parse().unwrap()).is_none());
+        // Berlin–Paris is about 880 km.
+        let d = haversine_km((52.52, 13.40), (48.86, 2.35));
+        assert!((d - 878.0).abs() < 10.0, "{d}");
     }
 }

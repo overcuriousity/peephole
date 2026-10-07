@@ -38,6 +38,8 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/rpc/v1/inbox", post(inbox))
         .route("/rpc/v1/intel", post(intel_chunk))
         .route("/rpc/v1/lookup", post(lookup))
+        .route("/rpc/v1/probe", post(probe))
+        .route("/rpc/v1/resolve", post(resolve))
         .route_layer(axum::middleware::from_fn_with_state(
             node.clone(),
             require_member,
@@ -213,6 +215,45 @@ async fn lookup(
     Cbor(crate::intel::lookup::serve(&node, peer, &req).await).into_response()
 }
 
+/// A host name resolved for a member by this node's resolver. Free, at
+/// most [`crate::credits::pay::FREE_PER_HOUR`] an hour per asker; it never
+/// scans, probes or stores anything.
+async fn resolve(
+    State(node): State<Arc<Node>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Cbor(req): Cbor<crate::intel::dns::ResolveReq>,
+) -> Response {
+    use crate::intel::dns::{ResolveResp, resolve_here, valid_name};
+    let resp = match valid_name(&req.name) {
+        None => ResolveResp::refused("not a host name"),
+        Some(_) if !node.take_free_resolve(peer) => {
+            ResolveResp::refused("too many resolutions from your node this hour")
+        }
+        Some(name) => match resolve_here(&name).await {
+            Ok(addrs) => ResolveResp { addrs, error: None },
+            Err(e) => ResolveResp::refused(&e),
+        },
+    };
+    Cbor(resp).into_response()
+}
+
+/// An observational probe for a member, paid with the offer it names.
+async fn probe(
+    State(node): State<Arc<Node>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Cbor(req): Cbor<crate::scan::probe::serve::ProbeReq>,
+) -> Response {
+    use crate::scan::probe::serve::ProbeResp;
+    let resp = match node.prober() {
+        Some(p) => p.clone().serve(&node, peer, &req).await,
+        None => ProbeResp::Declined {
+            why: "this node does not probe".into(),
+            price_mc: None,
+        },
+    };
+    Cbor(resp).into_response()
+}
+
 /// Long-poll for messages waiting for the caller.
 async fn inbox(State(node): State<Arc<Node>>, Extension(Peer(peer)): Extension<Peer>) -> Response {
     Cbor(node.take_inbox(peer).await).into_response()
@@ -301,8 +342,16 @@ async fn require_member(
     }
 }
 
-async fn hello(State(node): State<Arc<Node>>, Cbor(theirs): Cbor<Hello>) -> Response {
-    let ours = node.local_hello();
+async fn hello(
+    State(node): State<Arc<Node>>,
+    Extension(server::RemoteAddr(addr)): Extension<server::RemoteAddr>,
+    Cbor(theirs): Cbor<Hello>,
+) -> Response {
+    // Tell the caller where it came from: its peer-observed public address.
+    let ours = Hello {
+        seen_from: Some(addr.ip()),
+        ..node.local_hello()
+    };
     match proto::negotiate(
         (ours.proto_min, ours.proto_max),
         (theirs.proto_min, theirs.proto_max),

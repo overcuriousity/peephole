@@ -783,7 +783,7 @@ fn intel_facts(provider: &str, data: &serde_json::Value) -> Vec<IntelFact> {
 type Fields = &'static [(&'static str, &'static str, bool)];
 
 fn api_fields(provider: &str) -> Option<Fields> {
-    use crate::intel::{ABUSEIPDB, GREYNOISE, INTERNETDB, SHODAN};
+    use crate::intel::{ABUSEIPDB, GREYNOISE, INTERNETDB, RDAP, SHODAN};
     Some(match provider {
         ABUSEIPDB => &[
             ("score", "Abuse score", true),
@@ -824,6 +824,19 @@ fn api_fields(provider: &str) -> Option<Fields> {
             ("riot", "Known benign service", false),
             ("name", "Actor / provider", false),
             ("last_seen", "Last seen scanning", true),
+        ],
+        RDAP => &[
+            ("range", "Range", true),
+            ("cidrs", "CIDRs", true),
+            ("handle", "Handle", true),
+            ("name", "Name", false),
+            ("type", "Type", false),
+            ("country", "Country", false),
+            ("org", "Registrant", false),
+            ("abuse", "Abuse contact", true),
+            ("registered", "Registered", true),
+            ("changed", "Last changed", true),
+            ("fresh", "Fresh block", false),
         ],
         _ => return None,
     })
@@ -961,6 +974,8 @@ pub struct IpAdminData {
     pub canary_links: (i64, i64),
     /// MCP sessions, MCP tool calls and LLM calls the decoys saw from it.
     pub decoys: (i64, i64, i64),
+    /// Names looked up or seen in scans (`ip_names`).
+    pub names: Vec<crate::store::probes::NameRow>,
 }
 
 impl IpAdminData {

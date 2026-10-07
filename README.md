@@ -29,11 +29,15 @@ nmap.
   sampled, but every request still leaves at least a light row (time,
   method, path) or a count.
 - **Enrichment** — MaxMind GeoLite2 country and ASN, the Tor exit list, and
-  optionally AbuseIPDB, Shodan, Shodan InternetDB and GreyNoise, each within
+  optionally AbuseIPDB, Shodan, Shodan InternetDB and GreyNoise, plus RDAP registration data (network,
+  holder, abuse contact), each within
   its own rate budget, refreshed when an IP returns.
 - **Counter-scans** — rate-limited nmap scans in four levels that escalate by
   scope (more ports, `-sV`, `-O`, then safe discovery scripts), never by
-  speed or aggressiveness. From level 2 they read the source's SSH host
+  speed or aggressiveness; that rule governs the automatic counter-scans.
+  On request an admin can also run an *observational probe* of the ports a
+  scan found open (headers, certificates, JARM, SSH host keys), from one
+  scanner or several at once. From level 2 they read the source's SSH host
   keys and TLS certificates, so sources that share one show up as linked.
   Bystanders are spared: one request earns at most a light scan, and
   verified crawlers, Tor exits, your own and `never_scan` networks are
