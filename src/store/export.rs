@@ -122,12 +122,26 @@ pub struct FpOut {
     pub event_blob: Option<Vec<u8>>,
 }
 
+/// An agreed name of an address (`ip_names`).
+#[derive(sqlx::FromRow)]
+pub struct NameOut {
+    pub ip_id: i64,
+    pub name: String,
+    pub source: String,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub votes: i64,
+    pub answered: i64,
+}
+
 /// Everything about the IPs and requests of one page.
 #[derive(Default)]
 pub struct PageContext {
     /// Every lookup per IP, oldest first.
     pub intel: HashMap<String, Vec<IntelOut>>,
     pub scans: HashMap<i64, Vec<(ScanOut, Vec<PortOut>)>>,
+    /// The agreed names per IP id (looked up or PTR), by name.
+    pub names: HashMap<i64, Vec<NameOut>>,
     pub fingerprints: HashMap<String, Vec<FpOut>>,
     /// Per request id: the uids of the rows whose served canaries it
     /// carried (light rows as `<batch uid>#<row>`).
@@ -300,6 +314,17 @@ impl Store {
                 .or_default()
                 .push(f);
         }
+        let names: Vec<NameOut> = sqlx::query_as(
+            "SELECT ip_id, name, source, first_seen, last_seen, votes, answered FROM ip_names
+             WHERE agreed = 1 AND ip_id IN (SELECT value FROM json_each(?))
+             ORDER BY ip_id, name, source",
+        )
+        .bind(json_list(ip_ids))
+        .fetch_all(&self.read)
+        .await?;
+        for n in names {
+            c.names.entry(n.ip_id).or_default().push(n);
+        }
         let claimed: Vec<i64> = sqlx::query_scalar(
             "SELECT DISTINCT ip_id FROM fp_claims WHERE ip_id IN (SELECT value FROM json_each(?))",
         )
@@ -325,5 +350,47 @@ impl Store {
             c.canary_used_from.entry(id).or_default().push(uid);
         }
         Ok(c)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cluster::identity::NodeId;
+    use crate::cluster::record::{IpNameRec, Record};
+    use crate::store::Store;
+    use crate::store::data::{new_uid, now_ts};
+
+    #[tokio::test]
+    async fn agreed_names_are_exported_disputed_ones_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let r = IpNameRec {
+            uid: new_uid(),
+            name: "example.com".into(),
+            at: now_ts(),
+            answers: vec![
+                (NodeId([1; 32]), Ok(vec![ip("203.0.113.1")])),
+                (NodeId([2; 32]), Ok(vec![ip("203.0.113.1")])),
+                (NodeId([3; 32]), Ok(vec![ip("203.0.113.7")])),
+            ],
+            build: String::new(),
+        };
+        store.local().write(vec![Record::IpName(r)]).await.unwrap();
+        let agreed = store.ip_by_addr("203.0.113.1").await.unwrap().unwrap().id;
+        let disputed = store.ip_by_addr("203.0.113.7").await.unwrap().unwrap().id;
+        let c = store
+            .export_context(&[], &[agreed, disputed], &[], &[])
+            .await
+            .unwrap();
+        assert!(!c.names.contains_key(&disputed));
+        let col = crate::export::names_json(&c.names[&agreed]);
+        assert_eq!(col[0]["name"], "example.com");
+        assert_eq!(col[0]["source"], "dns");
+        assert_eq!(
+            (col[0]["votes"].as_i64(), col[0]["answered"].as_i64()),
+            (Some(2), Some(3))
+        );
+        assert!(col[0]["first_seen"].as_str().unwrap().contains('T'));
     }
 }

@@ -4,6 +4,7 @@
 use super::Store;
 use super::data::{Ctx, Effect, ensure_ip, erased_by};
 use super::hostkeys::insert_probe_keys;
+use super::requests::IpRow;
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{IpNameRec, ProbeResultRec};
 use crate::scan::hostkeys::{
@@ -165,14 +166,84 @@ pub(crate) async fn apply_probe_result(
     Ok(Effect::Applied)
 }
 
-/// Filled in by the DNS lookup task; until then the record is accepted
-/// into the log and changes no table.
+/// Names an admin looked up (`intel::dns`). The votes are derived here
+/// from the resolvers' answers, never taken from the sender; addresses
+/// outside global unicast get no row.
 pub(crate) async fn apply_ip_name(
-    _conn: &mut SqliteConnection,
+    conn: &mut SqliteConnection,
     _ctx: Ctx<'_>,
-    _r: &IpNameRec,
+    r: &IpNameRec,
 ) -> Result<Effect> {
-    Ok(Effect::Ignored)
+    use crate::intel::dns;
+    if r.uid.len() > MAX_UID
+        || dns::valid_name(&r.name).as_deref() != Some(r.name.as_str())
+        || r.answers.len() > dns::MAX_RESOLVERS
+        || r.answers
+            .iter()
+            .any(|(_, a)| a.as_ref().is_ok_and(|v| v.len() > dns::MAX_ADDRS))
+        || chrono::NaiveDateTime::parse_from_str(&r.at, "%Y-%m-%d %H:%M:%S").is_err()
+    {
+        return Ok(Effect::Ignored);
+    }
+    if let Some(t) = erased_by(conn, &r.uid).await? {
+        return Ok(Effect::Erased(t));
+    }
+    let t = dns::tally(&r.answers);
+    for v in &t.votes {
+        let Some(ip_id) = ensure_ip(conn, &v.addr.to_string(), None).await? else {
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen)
+             VALUES (?1, ?2, 'dns', ?3, ?3)
+             ON CONFLICT(ip_id, name, source) DO UPDATE
+               SET first_seen = min(first_seen, excluded.first_seen)",
+        )
+        .bind(ip_id)
+        .bind(&r.name)
+        .bind(&r.at)
+        .execute(&mut *conn)
+        .await?;
+        // The newest lookup's votes stand, whatever order records arrive in.
+        sqlx::query(
+            "UPDATE ip_names SET last_seen = ?1, agreed = ?2, asked = ?3, answered = ?4,
+                    votes = ?5, record_uid = ?6
+             WHERE ip_id = ?7 AND name = ?8 AND source = 'dns'
+               AND (last_seen < ?1 OR (last_seen = ?1 AND record_uid <= ?6))",
+        )
+        .bind(&r.at)
+        .bind(v.agreed)
+        .bind(t.asked as i64)
+        .bind(t.answered as i64)
+        .bind(v.votes as i64)
+        .bind(&r.uid)
+        .bind(ip_id)
+        .bind(&r.name)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(Effect::Applied)
+}
+
+/// A name of an address: looked up by an admin (`dns`) or the PTR name of
+/// a scan (`ptr`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct NameRow {
+    pub name: String,
+    pub source: String,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub agreed: bool,
+    pub asked: i64,
+    pub answered: i64,
+    pub votes: i64,
+}
+
+impl NameRow {
+    /// The day it was last seen.
+    pub fn day(&self) -> &str {
+        self.last_seen.get(..10).unwrap_or(&self.last_seen)
+    }
 }
 
 impl Store {
@@ -196,6 +267,41 @@ impl Store {
         .bind(probe_id)
         .fetch_all(&self.read)
         .await?)
+    }
+
+    /// The names of an address, agreed ones first.
+    pub async fn names_for_ip(&self, ip_id: i64) -> Result<Vec<NameRow>> {
+        Ok(sqlx::query_as::<_, NameRow>(
+            "SELECT name, source, first_seen, last_seen, agreed, asked, answered, votes
+             FROM ip_names WHERE ip_id = ?
+             ORDER BY agreed DESC, last_seen DESC, name LIMIT 200",
+        )
+        .bind(ip_id)
+        .fetch_all(&self.read)
+        .await?)
+    }
+
+    /// The addresses a name is known for, agreed ones first.
+    pub async fn ips_named(&self, name: &str) -> Result<Vec<(IpRow, NameRow)>> {
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT ip_id FROM ip_names WHERE name = ? GROUP BY ip_id
+             ORDER BY max(agreed) DESC, max(last_seen) DESC LIMIT 200",
+        )
+        .bind(name)
+        .fetch_all(&self.read)
+        .await?;
+        let mut out = vec![];
+        for ip_id in ids {
+            let ip = sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE id = ?")
+                .bind(ip_id)
+                .fetch_optional(&self.read)
+                .await?;
+            let names = self.names_for_ip(ip_id).await?;
+            if let (Some(ip), Some(n)) = (ip, names.into_iter().find(|n| n.name == name)) {
+                out.push((ip, n));
+            }
+        }
+        Ok(out)
     }
 
     /// Whether `origin` probed `ip` within the last `hours`.
@@ -283,6 +389,93 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn votes_are_derived_locally_not_trusted() {
+        use crate::cluster::record::IpNameRec;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        // A record whose answers name a private address and an address only one of three returned.
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let r = IpNameRec {
+            uid: new_uid(),
+            name: "example.com".into(),
+            at: now_ts(),
+            answers: vec![
+                (NodeId([1; 32]), Ok(vec![ip("203.0.113.1"), ip("10.0.0.1")])),
+                (NodeId([2; 32]), Ok(vec![ip("203.0.113.1")])),
+                (NodeId([3; 32]), Ok(vec![ip("203.0.113.7")])),
+            ],
+            build: String::new(),
+        };
+        let ctx = Ctx {
+            origin: Some(&NodeId([1; 32])),
+            hlc: 5,
+        };
+        let mut conn = store.pool.acquire().await.unwrap();
+        let bad = IpNameRec {
+            name: "Not A Name".into(),
+            ..r.clone()
+        };
+        assert_eq!(
+            apply(&mut conn, ctx, &Record::IpName(bad)).await.unwrap(),
+            Effect::Ignored
+        );
+        assert_eq!(
+            apply(&mut conn, ctx, &Record::IpName(r.clone()))
+                .await
+                .unwrap(),
+            Effect::Applied
+        );
+        drop(conn);
+        let names = |a: &str| {
+            let store = store.clone();
+            let a = a.to_string();
+            async move {
+                match store.ip_by_addr(&a).await.unwrap() {
+                    Some(row) => store.names_for_ip(row.id).await.unwrap(),
+                    None => vec![],
+                }
+            }
+        };
+        let one = names("203.0.113.1").await;
+        assert_eq!(one.len(), 1);
+        assert_eq!(
+            (one[0].agreed, one[0].votes, one[0].answered, one[0].asked),
+            (true, 2, 3, 3)
+        );
+        assert_eq!(one[0].source, "dns");
+        let seven = names("203.0.113.7").await;
+        assert_eq!((seven[0].agreed, seven[0].votes), (false, 1));
+        assert!(store.ip_by_addr("10.0.0.1").await.unwrap().is_none());
+        let named = store.ips_named("example.com").await.unwrap();
+        assert_eq!(named.len(), 2);
+        assert_eq!(named[0].0.ip, "203.0.113.1", "the agreed address first");
+    }
+
+    #[tokio::test]
+    async fn no_answer_at_all_writes_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let rec = store.local();
+        let geo: crate::intel::SharedGeo = std::sync::Arc::new(std::sync::RwLock::new(None));
+        // `.invalid` never resolves (RFC 6761).
+        let (t, r) = crate::intel::dns::lookup(&rec, &geo, "peephole-test.invalid")
+            .await
+            .unwrap();
+        assert_eq!((t.asked, t.answered), (1, 0));
+        assert!(r.is_none());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ip_names")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        let logged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repl_log")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(logged, 0);
     }
 
     #[test]

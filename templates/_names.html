@@ -1,0 +1,4 @@
+{# The names of an address (store::probes::NameRow), admin only: looked up by several resolvers (DNS) or seen by nmap (PTR). #}
+<p class="small names"><strong>Names</strong>
+{% for n in names %}{% if !loop.first %} · {% endif %}<a class="mono" href="/admin/lookup?ip={{ n.name }}">{{ n.name }}</a> <span class="muted">({% if n.source == "ptr" %}PTR from scan, {{ n.day() }}, unverified{% else %}DNS, {% if n.agreed %}agreed{% else %}disputed{% endif %} {{ n.votes }}/{{ n.answered }}, {{ n.day() }}{% endif %})</span>{% endfor %}
+</p>

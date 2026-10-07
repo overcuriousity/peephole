@@ -5,7 +5,7 @@
 {% let sub = "lookup" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Lookup</h1><p class="muted">What the cluster knows about an address, and what every reachable provider says now.{% if cluster %} Provider answers are paid with credits.{% endif %}</p></div></div>
 <form class="filters card" method="post" action="/admin/lookup">
-  <label>IP address <input name="ip" value="{{ ip }}" placeholder="203.0.113.7 or 2001:db8::1" required autofocus></label>
+  <label>IP address or host name <input name="ip" value="{{ ip }}" placeholder="203.0.113.7, 2001:db8::1 or example.com" required autofocus></label>
   <button class="btn btn-primary" type="submit">Look up</button>
   {% if let Some(b) = offer.balance %}
   <span class="muted">Balance{% if offer.fleet %} of your nodes{% endif %}: <b>{{ b }}</b> credits · this lookup costs up to {{ offer.total }} · <a href="/admin/cluster/credits">credits →</a></span>
@@ -27,9 +27,25 @@
 </section>
 {% endif %}
 {% if let Some(e) = error %}<p class="muted">{{ e }}</p>{% endif %}
-{% if let Some(r) = result %}
+{% if let Some(n) = names %}
+<section class="card" id="resolved">
+  <div class="card-head"><h2>Resolved: <span class="mono">{{ n.name }}</span></h2>{% if let Some(note) = n.note %}<span class="muted">{{ note }}</span>{% endif %}</div>
+  {% if n.rows.is_empty() %}<p class="muted">No public address.</p>{% else %}
+  <ul class="small">
+    {% for v in n.rows %}<li>{% if v.agreed %}<a class="mono" href="/admin/lookup?ip={{ v.ip }}">{{ v.ip }}</a>{% else %}<span class="mono">{{ v.ip }}</span>{% endif %} — {{ v.verdict }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% if !n.resolvers.is_empty() %}<p class="muted small">Asked: {{ n.resolvers.join(", ") }}</p>{% endif %}
+  {% if !n.errors.is_empty() %}
+  <ul class="small">{% for (node, why) in n.errors %}<li><strong>{{ node }}</strong>: {{ why }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if n.capped %}<p class="muted small">Only the first {{ crate::intel::dns::MAX_FOLLOWED }} agreed addresses are looked up below.</p>{% endif %}
+</section>
+{% endif %}
+{% if !results.is_empty() %}
 <div class="stack">
-<section class="card" id="answers">
+{% for r in results %}
+<section class="card"{% if loop.first %} id="answers"{% endif %}>
   <div class="card-head"><h2>{{ r.ip }}{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}</h2><span class="muted">{% if r.target.is_some() %}<a href="/ip/{{ r.ip }}">in the dataset →</a>{% else %}not in the dataset{% endif %}</span></div>
   {% if !r.stored.is_empty() %}
   <h3>From the dataset</h3>
@@ -72,7 +88,7 @@
   {% endif %}
 </section>
 {% if !offer.paid.is_empty() %}
-<section class="card" id="ask-more">
+<section class="card"{% if loop.first %} id="ask-more"{% endif %}>
   <div class="card-head"><h2>Ask for more</h2><span class="muted">paid with credits{% if let Some(b) = offer.balance %} · balance <b>{{ b }}</b>{% endif %}</span></div>
   <div class="table-wrap"><table>
     <thead><tr><th>Provider</th><th>Node</th><th class="num">Price (credits)</th><th></th></tr></thead>
@@ -101,6 +117,7 @@
   {% endif %}
 </section>
 {% endif %}
+{% endfor %}
 </div>
 {% endif %}
 {% endblock %}

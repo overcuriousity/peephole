@@ -95,6 +95,7 @@ pub async fn load(
             host_keys: state.store.host_keys_for_ip(ip.id).await?,
             canary_links: state.store.canary_links_for_ip(ip.id).await?,
             decoys: state.store.decoy_counts_for_ip(ip.id).await?,
+            names: state.store.names_for_ip(ip.id).await?,
         })
     } else {
         None

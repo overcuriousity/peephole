@@ -974,6 +974,8 @@ pub struct IpAdminData {
     pub canary_links: (i64, i64),
     /// MCP sessions, MCP tool calls and LLM calls the decoys saw from it.
     pub decoys: (i64, i64, i64),
+    /// Names looked up or seen in scans (`ip_names`).
+    pub names: Vec<crate::store::probes::NameRow>,
 }
 
 impl IpAdminData {

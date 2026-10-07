@@ -165,13 +165,39 @@ pub struct LookupResult {
     pub kept: bool,
 }
 
+/// One address a name resolved to.
+pub struct AddrVote {
+    pub ip: String,
+    pub agreed: bool,
+    /// "agreed by 4 of 5", "only from bob (DE), disputed", …
+    pub verdict: String,
+}
+
+/// A name resolved by several nodes (see [`crate::intel::dns`]).
+pub struct NamesView {
+    pub name: String,
+    /// How far the answer can be trusted, when not by a majority of several.
+    pub note: Option<String>,
+    pub rows: Vec<AddrVote>,
+    /// Every node asked, as "name (country)".
+    pub resolvers: Vec<String>,
+    /// `(node, why)` for every node that did not answer.
+    pub errors: Vec<(String, String)>,
+    /// More addresses were agreed than are looked up.
+    pub capped: bool,
+}
+
 #[derive(Template)]
 #[template(path = "admin_lookup.html")]
 struct LookupPage {
     chrome: Chrome,
     ip: String,
     error: Option<String>,
-    result: Option<LookupResult>,
+    /// The resolved name, when a name was looked up.
+    names: Option<NamesView>,
+    /// One per address looked up: the address asked for, or the agreed
+    /// addresses of a name.
+    results: Vec<LookupResult>,
     cluster: bool,
     offer: Offer,
     bulk: Option<Bulk>,
@@ -228,7 +254,8 @@ async fn page(
         chrome: chrome(),
         ip: q.ip.unwrap_or_default().trim().to_string(),
         error: None,
-        result: None,
+        names: None,
+        results: vec![],
         cluster: state.recorder.node().is_some(),
         offer: offer(&state).await,
         bulk: None,
@@ -245,11 +272,23 @@ async fn lookup(
     let text = f.ip.unwrap_or_default().trim().to_string();
     let cluster = state.recorder.node().is_some();
     let Ok(ip) = text.parse::<IpAddr>() else {
+        let (names, results, error) = match crate::intel::dns::valid_name(&text) {
+            None => (None, vec![], Some("Not an IP address or host name.".into())),
+            Some(name) => match by_name(&state, &name, async |n: &str| {
+                crate::intel::dns::resolve_here(n).await
+            })
+            .await?
+            {
+                Ok((view, results)) => (Some(view), results, None),
+                Err(e) => (None, vec![], Some(e)),
+            },
+        };
         return render(&LookupPage {
             chrome: chrome(),
             ip: text,
-            error: Some("Not an IP address.".into()),
-            result: None,
+            error,
+            names,
+            results,
             cluster,
             offer: offer(&state).await,
             bulk: None,
@@ -262,12 +301,104 @@ async fn lookup(
         chrome: chrome(),
         ip: ip.to_string(),
         error: None,
-        result: Some(result),
+        names: None,
+        results: vec![result],
         cluster,
         // After the lookup: the balance it left.
         offer: offer(&state).await,
         bulk: None,
     })
+}
+
+/// Resolve `name` with several nodes (`resolve` standing in for this
+/// node's resolver), and look up the first [`crate::intel::dns::MAX_FOLLOWED`]
+/// addresses they agree on (the cheap tier). The inner error: the name
+/// was not resolved or not stored.
+pub async fn by_name(
+    state: &AdminState,
+    name: &str,
+    resolve: impl AsyncFn(&str) -> Result<Vec<IpAddr>, String>,
+) -> AppResult<Result<(NamesView, Vec<LookupResult>), String>> {
+    use crate::intel::dns;
+    let (tally, record) = match dns::lookup_with(&state.recorder, &state.geo, name, resolve).await {
+        Ok(x) => x,
+        Err(e) => return Ok(Err(e)),
+    };
+    let label = |id: &crate::cluster::identity::NodeId| match state.recorder.node() {
+        Some(node) => match dns::describe(node, &state.geo, id) {
+            (n, Some(c)) => format!("{n} ({c})"),
+            (n, None) => n,
+        },
+        None => "this node".to_string(),
+    };
+    let answers = record
+        .as_ref()
+        .map(|r| r.answers.as_slice())
+        .unwrap_or_default();
+    let rows = tally
+        .votes
+        .iter()
+        .map(|v| {
+            let from: Vec<String> = answers
+                .iter()
+                .filter(|(_, a)| {
+                    a.as_ref()
+                        .is_ok_and(|l| l.iter().any(|x| crate::net::canonical(*x) == v.addr))
+                })
+                .map(|(id, _)| label(id))
+                .collect();
+            let verdict = match (v.agreed, v.votes) {
+                (true, n) => format!("agreed by {n} of {}", tally.answered),
+                (false, 1) => format!("only from {}, disputed", from.join(", ")),
+                (false, n) => format!("{n} of {} ({}), disputed", tally.answered, from.join(", ")),
+            };
+            AddrVote {
+                ip: v.addr.to_string(),
+                agreed: v.agreed,
+                verdict,
+            }
+        })
+        .collect();
+    let note = match (state.recorder.node(), tally.answered) {
+        (_, 0) => Some("No resolver answered; nothing was stored.".to_string()),
+        (None, _) => Some("resolved locally, unverified".to_string()),
+        (Some(_), 1) => Some("unverified — single resolver".to_string()),
+        _ => None,
+    };
+    let resolvers = match record.as_ref() {
+        Some(r) => r.answers.iter().map(|(id, _)| label(id)).collect(),
+        None => tally.errors.iter().map(|(id, _)| label(id)).collect(),
+    };
+    let agreed: Vec<IpAddr> = tally
+        .votes
+        .iter()
+        .filter(|v| v.agreed)
+        .map(|v| v.addr)
+        .collect();
+    let followed = futures::future::join_all(
+        agreed
+            .iter()
+            .take(dns::MAX_FOLLOWED)
+            .map(|ip| run(state, *ip, &[], &[])),
+    )
+    .await
+    .into_iter()
+    .collect::<AppResult<Vec<_>>>()?;
+    Ok(Ok((
+        NamesView {
+            name: name.to_string(),
+            note,
+            rows,
+            resolvers,
+            errors: tally
+                .errors
+                .iter()
+                .map(|(id, why)| (label(id), why.clone()))
+                .collect(),
+            capped: agreed.len() > dns::MAX_FOLLOWED,
+        },
+        followed,
+    )))
 }
 
 fn age(secs: i64) -> String {
@@ -414,7 +545,8 @@ async fn bulk(
         chrome: chrome(),
         ip: String::new(),
         error: None,
-        result: None,
+        names: None,
+        results: vec![],
         cluster: state.recorder.node().is_some(),
         offer: offer(&state).await,
         bulk: Some(Bulk {
@@ -433,6 +565,11 @@ mod tests {
     use tower::ServiceExt;
 
     async fn app() -> (axum::Router, String, tempfile::TempDir) {
+        let (state, cookie, dir) = state().await;
+        (crate::admin::full_router(state), cookie, dir)
+    }
+
+    async fn state() -> (Arc<AdminState>, String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cfg: crate::config::Config = toml::from_str(&format!(
             r#"
@@ -471,7 +608,53 @@ secure_cookies = false
             Arc::new(crate::intel::provider::TorExits(tor)),
         ];
         let state = Arc::new(AdminState::public_only(store, cfg).with_providers(providers));
-        (crate::admin::full_router(state), cookie, dir)
+        (state, cookie, dir)
+    }
+
+    #[tokio::test]
+    async fn a_domain_lookup_shows_votes_and_the_agreed_addresses() {
+        let (state, _cookie, _d) = state().await;
+        let (view, results) = by_name(&state, "www.example.com", async |_: &str| {
+            Ok(vec![
+                "203.0.113.9".parse().unwrap(),
+                "10.0.0.1".parse().unwrap(),
+            ])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let html = LookupPage {
+            chrome: chrome(),
+            ip: "www.example.com".into(),
+            error: None,
+            names: Some(view),
+            results,
+            cluster: false,
+            offer: Offer::default(),
+            bulk: None,
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains("resolved locally, unverified"), "{html}");
+        assert!(html.contains("203.0.113.9") && html.contains("agreed by 1 of 1"));
+        assert!(!html.contains("10.0.0.1"), "a private answer is dropped");
+        assert!(
+            html.contains("Tor exit list"),
+            "the agreed address was looked up"
+        );
+        // The name is in the dataset, and on the address's admin view.
+        let ip = state
+            .store
+            .ip_by_addr("203.0.113.9")
+            .await
+            .unwrap()
+            .unwrap();
+        let names = state.store.names_for_ip(ip.id).await.unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(
+            (names[0].name.as_str(), names[0].agreed),
+            ("www.example.com", true)
+        );
     }
 
     async fn send(

@@ -62,6 +62,9 @@ pub fn kind_name(kind: &str) -> &'static str {
     }
 }
 
+/// Most PTR names kept of one scan.
+const MAX_PTR_NAMES: usize = 16;
+
 /// Read the identifiers out of a stored scan (zstd-compressed nmap XML)
 /// and mark the scan as read. Unreadable XML yields none; only database
 /// errors fail.
@@ -71,14 +74,38 @@ pub(crate) async fn derive(
     ip_id: i64,
     raw_xml: Option<&[u8]>,
 ) -> Result<()> {
-    let keys = match raw_xml.map(|b| zstd_decode_capped(b, MAX_RAW_XML)) {
-        Some(Ok(xml)) => extract(&xml),
+    let (keys, names) = match raw_xml.map(|b| zstd_decode_capped(b, MAX_RAW_XML)) {
+        Some(Ok(xml)) => (extract(&xml), crate::scan::hostkeys::ptr_names(&xml)),
         Some(Err(e)) => {
             tracing::debug!(scan_id, "host keys: scan XML unreadable: {e:#}");
-            vec![]
+            (vec![], vec![])
         }
-        None => vec![],
+        None => (vec![], vec![]),
     };
+    // The PTR names nmap saw: local and derived like the keys, never
+    // replicated on their own.
+    if !names.is_empty() {
+        let seen: Option<String> = sqlx::query_scalar("SELECT finished_at FROM scans WHERE id = ?")
+            .bind(scan_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten();
+        let seen = seen.unwrap_or_else(super::data::now_ts);
+        for name in names.iter().take(MAX_PTR_NAMES) {
+            sqlx::query(
+                "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen, agreed)
+                 VALUES (?1, ?2, 'ptr', ?3, ?3, 1)
+                 ON CONFLICT(ip_id, name, source) DO UPDATE
+                   SET first_seen = min(first_seen, excluded.first_seen),
+                       last_seen = max(last_seen, excluded.last_seen)",
+            )
+            .bind(ip_id)
+            .bind(name)
+            .bind(&seen)
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
     for k in keys {
         sqlx::query(
             "INSERT OR IGNORE INTO host_keys (scan_id, ip_id, port, kind, fingerprint, detail)
@@ -246,6 +273,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(parsed, 3);
+    }
+
+    #[tokio::test]
+    async fn ptr_names_are_read_from_a_scan_and_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let xml = String::from_utf8(include_bytes!("../../tests/fixtures/nmap-basic.xml").to_vec())
+            .unwrap()
+            .replacen(
+                r#"<status state="up" reason="syn-ack"/>"#,
+                r#"<status state="up" reason="syn-ack"/><hostnames><hostname name="Mail.Example.COM" type="PTR"/><hostname name="user.example.com" type="user"/></hostnames>"#,
+                1,
+            );
+        scan(&s, "192.0.2.7", xml.as_bytes()).await;
+        let ip = s.ip_by_addr("192.0.2.7").await.unwrap().unwrap();
+        let names = s.names_for_ip(ip.id).await.unwrap();
+        assert_eq!(names.len(), 1, "only the PTR name: {names:?}");
+        assert_eq!(
+            (
+                names[0].name.as_str(),
+                names[0].source.as_str(),
+                names[0].agreed
+            ),
+            ("mail.example.com", "ptr", true)
+        );
+        // Read again (the backfill): one row still.
+        sqlx::query("UPDATE scans SET keys_parsed = 0")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        backfill(&s.pool).await.unwrap();
+        assert_eq!(s.names_for_ip(ip.id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

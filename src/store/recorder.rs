@@ -68,7 +68,7 @@ impl Recorder {
 
     /// A fresh uid. In a cluster it carries this node's prefix, which binds
     /// the record to its origin (see `NodeId::uid_prefix`).
-    fn uid(&self) -> String {
+    pub(crate) fn uid(&self) -> String {
         match self {
             Recorder::Local(_) => new_uid(),
             Recorder::Cluster(n) => format!("{}{}", n.id().uid_prefix(), new_uid()),
