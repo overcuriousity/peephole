@@ -271,7 +271,7 @@ impl Arbiter {
                     .is_none_or(|o| delivers(o, now));
             keyed.push((claim_order(price, demoted, load[&s], s), w));
         }
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        keyed.sort_by_key(|k| k.0);
         let waiters: Vec<Waiter> = keyed.into_iter().map(|(_, w)| w).collect();
         // One book for the round; what each funded grant commits is
         // carried to the next, so the budget is never overspent.
