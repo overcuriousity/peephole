@@ -155,7 +155,7 @@
         <td class="path">{{ r.path }}{% if let Some(q) = r.query %}<span class="muted">?{{ q }}</span>{% endif %}</td>
         <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
         <td><span class="chips">{% for l in r.labels() %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp() %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>
-        <td><a class="btn btn-sm btn-ghost" href="/admin/requests/{{ r.id }}">inspect</a></td>
+        <td class="nowrap">{% include "_canary_marks.html" %}<a class="btn btn-sm btn-ghost" href="/admin/requests/{{ r.id }}">inspect</a></td>
       </tr>
     {% endfor %}
     {% if t.page.items.is_empty() %}<tr><td colspan="6" class="empty">No requests recorded.</td></tr>{% endif %}

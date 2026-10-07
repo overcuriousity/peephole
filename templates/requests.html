@@ -55,7 +55,7 @@
       <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
       <td><span class="chips">{% for l in r.labels() %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp() %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>
       {% if !nodes.is_empty() %}<td class="muted">{{ r.node.as_deref().unwrap_or("") }}</td>{% endif %}
-      {% if chrome.authed %}<td><a class="btn btn-sm btn-ghost" href="/admin/requests/{{ r.id }}">inspect</a></td>{% endif %}
+      {% if chrome.authed %}<td class="nowrap">{% include "_canary_marks.html" %}<a class="btn btn-sm btn-ghost" href="/admin/requests/{{ r.id }}">inspect</a></td>{% endif %}
     </tr>
   {% endfor %}
   {% if page.items.is_empty() %}<tr><td colspan="{{ 7 + (!nodes.is_empty()) as usize + can_delete as usize }}" class="empty">No requests match.</td></tr>{% endif %}

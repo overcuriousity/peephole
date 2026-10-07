@@ -531,6 +531,7 @@ async fn admin_routes_redirect_without_session() {
         "/admin/scans/1/xml",
         "/admin/links",
         "/admin/links/canaries",
+        "/admin/links/canaries/served/1",
         "/admin/links/fp/x",
         "/admin/api/links/graph?focus=fp:x",
         "/admin/inbox",
@@ -2359,30 +2360,9 @@ async fn scan_pace_is_adjustable_from_the_scans_page() {
         "an error re-renders the whole Scans page"
     );
 
-    // Retry: the failed job goes back in the queue.
+    // A failure is retried on its own: the scans page shows it, and the
+    // manual retry is gone.
     let job = store.next_queued_job().await.unwrap().unwrap();
-    store
-        .finish_job(job.id, None, Some("host reported down"))
-        .await
-        .unwrap();
-    let resp = client
-        .post(format!("{base}/admin/queue/retry-failed"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    assert!(
-        resp.text()
-            .await
-            .unwrap()
-            .contains("1 failed job is back in the queue")
-    );
-    let status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
-        .bind(job.id)
-        .fetch_one(&store.pool)
-        .await
-        .unwrap();
-    assert_eq!(status, "queued");
     store
         .finish_job(job.id, None, Some("host reported down"))
         .await
@@ -2396,9 +2376,16 @@ async fn scan_pace_is_adjustable_from_the_scans_page() {
         .await
         .unwrap();
     assert!(
-        html.contains("Retry failed") && html.contains("host reported down"),
-        "retry next to the failed filter"
+        html.contains("host reported down") && html.contains("retried"),
+        "the failure and its retry"
     );
+    assert!(!html.contains("Retry failed"));
+    let gone = client
+        .post(format!("{base}/admin/queue/retry-failed"))
+        .send()
+        .await
+        .unwrap();
+    assert!(gone.status().is_client_error(), "{}", gone.status());
 
     // Without a session the endpoint is closed.
     let anon = reqwest::Client::builder()
@@ -2833,6 +2820,37 @@ async fn request_and_ip_pages_show_canary_reuse() {
         .await
         .unwrap();
     assert!(ip.contains("used by 1 other IP"), "{ip}");
+    // Both request rows carry a mark that opens the decoy's canary page.
+    let mark = format!("href=\"/admin/links/canaries/served/{served}\"");
+    assert!(ip.contains(&mark), "served mark");
+    let user_ip = admin
+        .get(format!("{admin_base}/ip/203.0.113.61"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(user_ip.contains(&mark), "used mark");
+    let decoy = admin
+        .get(format!("{admin_base}/admin/links/canaries/served/{served}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(decoy.status(), 200);
+    let decoy = decoy.text().await.unwrap();
+    assert!(
+        decoy.contains(&token)
+            && decoy.contains("203.0.113.61")
+            && decoy.contains(&format!("/admin/requests/{used}")),
+        "{decoy}"
+    );
+    let none = admin
+        .get(format!("{admin_base}/admin/links/canaries/served/{used}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(none.status(), 404, "served no canaries");
     // Nothing of it on the public IP page.
     let public = reqwest::get(format!("{admin_base}/ip/203.0.113.60"))
         .await
@@ -2841,6 +2859,7 @@ async fn request_and_ip_pages_show_canary_reuse() {
         .await
         .unwrap();
     assert!(!public.contains("Canar") && !public.contains(&token));
+    assert!(!public.contains("canary-mark"));
 }
 
 #[tokio::test]

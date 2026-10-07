@@ -1,0 +1,38 @@
+{% extends "layout.html" %}
+{% block title %}peephole — canaries of #{{ d.row.id }}{% endblock %}
+{% block content %}
+{% let sub = "links" %}{% include "_admin_nav.html" %}
+{% let subtab = "canaries" %}{% let tabs = crate::admin::views::LINKS_TABS %}{% let tabs_label = "Links pages" %}{% include "_subtabs.html" %}
+<div class="page-head"><div><h1>Canaries of request #{{ d.row.id }}</h1>
+  <p class="muted">Served in the <span class="mono">{{ d.decoy().unwrap_or_default() }}</span> decoy to <a href="/ip/{{ d.ip }}">{{ d.ip }}</a>{% if let Some(n) = d.node %} by {{ n }}{% endif %} at <span class="mono">{{ d.row.ts.format("%Y-%m-%d %H:%M:%S") }}</span>. <a href="/admin/requests/{{ d.row.id }}">The request</a> · <a href="/admin/links/canaries">all canaries</a></p></div></div>
+<div class="stack">
+<div class="tiles kpis">
+  <div class="tile"><span class="label">Served</span><div class="value">{{ served.len() }}</div></div>
+  <div class="tile"><span class="label">Used again</span><div class="value brand">{{ uses.len() }}</div></div>
+  <div class="tile"><span class="label">IPs that used them</span><div class="value">{{ ips.len() }}</div></div>
+</div>
+<section class="card">
+  <h2>Served</h2>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Kind</th><th>Value</th><th class="num">Uses</th><th></th></tr></thead><tbody>
+  {% for c in served %}<tr><td>{{ c.kind }}</td><td class="mono wrap">{{ c.value }}</td><td class="num">{{ c.uses }}</td><td>{% if c.uses > 0 %}<a href="/admin/links/canary/{{ c.hash }}">graph</a>{% endif %}</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+<section class="card">
+  <div class="card-head"><h2>Used by</h2>{% if uses.len() as i64 >= crate::admin::links::DECOY_USES %}<span class="muted">newest {{ uses.len() }}</span>{% endif %}</div>
+  {% if uses.is_empty() %}<p class="empty">None of these canaries has come back.</p>{% else %}
+  <div class="table-wrap"><table class="table"><thead><tr><th>Request</th><th>IP</th><th>Kind</th><th>Where</th><th>Δt</th></tr></thead><tbody>
+  {% for r in uses %}<tr>
+    <td><a href="/admin/requests/{{ r.used_request_id }}">#{{ r.used_request_id }}</a> · <span class="mono">{{ r.used_ts }}</span>{% if let Some(n) = r.used_node %} · <span class="muted">{{ n }}</span>{% endif %}</td>
+    <td><a class="mono" href="/ip/{{ r.used_ip }}">{{ r.used_ip }}</a>{% if r.same_source %} <span class="badge">same source</span>{% endif %}</td>
+    <td>{{ r.kind }}</td><td class="mono">{{ r.place }}</td><td>{{ crate::admin::views::duration(r.delta_s) }}</td>
+  </tr>{% endfor %}
+  </tbody></table></div>{% endif %}
+</section>
+{% if !ips.is_empty() %}<section class="card">
+  <h2>IPs</h2>
+  <div class="table-wrap"><table class="table"><thead><tr><th>IP</th><th class="num">Uses</th></tr></thead><tbody>
+  {% for (ip, n) in ips %}<tr><td><a class="mono" href="/ip/{{ ip }}">{{ ip }}</a></td><td class="num">{{ n }}</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>{% endif %}
+</div>
+{% endblock %}

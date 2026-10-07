@@ -141,9 +141,6 @@ impl Arbiter {
             } => Some(Msg::CompleteReply {
                 ok: self.complete(from, &job_uid, &status, error).await,
             }),
-            Msg::RequeueFailed { days } => Some(Msg::RequeueReply {
-                n: self.rec.requeue_failed_jobs(days).await.unwrap_or(0),
-            }),
             _ => None,
         }
     }
@@ -260,14 +257,20 @@ impl Arbiter {
                    AND (j.level NOT IN (SELECT value FROM json_each(?))
                         OR j.queued_at < datetime('now', '-{} minutes'))
                    AND j.level NOT IN (SELECT value FROM json_each(?))
+                   AND (j.retry_at IS NULL
+                        OR (j.retry_at <= datetime('now')
+                            AND (j.failed_by IS NULL OR j.failed_by != ?
+                                 OR j.retry_at <= datetime('now', '-{} minutes'))))
                  ORDER BY {} LIMIT 1",
                 super::weight::OVERRIDE_WAIT_MINS,
+                super::retry::LAST_FAILER_WAIT,
                 est.order_by("j", "j.uid"),
             )))
             .bind(&me.0[..])
             .bind(serde_json::to_string(&declined)?)
             .bind(serde_json::to_string(skipped)?)
             .bind(serde_json::to_string(exclude)?)
+            .bind(&scanner.0[..])
             .fetch_optional(&self.node.store.pool)
             .await?;
             let Some(row) = row else {
@@ -403,6 +406,13 @@ impl Arbiter {
         if let Err(e) = self.set_state(uid, status, error, Some(now_ts())).await {
             warn!(?e, job = %uid, "recording job outcome failed");
             return false;
+        }
+        if status == "failed" {
+            match self.rec.retry_failed(uid, Some(scanner)).await {
+                Ok(Some(retry)) => info!(job = %uid, %retry, "failed scan queued for a retry"),
+                Ok(None) => {}
+                Err(e) => warn!(?e, job = %uid, "queueing a retry failed"),
+            }
         }
         true
     }
@@ -851,6 +861,68 @@ mod tests {
         }
         let grant = arbiter.next_job(scanner, &[]).await.unwrap();
         assert_eq!(grant.map(|g| g.level), Some(1));
+    }
+
+    /// A failure reported by a scanner stays failed and queues a retry:
+    /// nobody gets it before its time, then another scanner first; the
+    /// one that failed only after a further wait.
+    #[tokio::test]
+    async fn failed_scans_are_retried_by_another_scanner_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        let ip = store
+            .upsert_ip("203.0.113.81".parse().unwrap())
+            .await
+            .unwrap();
+        Recorder::Cluster(node.clone())
+            .enqueue_scan(ip.id, 3, 24)
+            .await
+            .unwrap();
+        let (a, b) = (node.id(), Identity::generate().unwrap().id);
+        let g = arbiter.next_job(a, &[]).await.unwrap().unwrap();
+        assert!(
+            arbiter
+                .complete(a, &g.job_uid, "failed", Some("nmap exited 1".into()))
+                .await
+        );
+        assert_eq!(status(&store, &g.job_uid).await, "failed");
+        let (retry, retry_of, failed_by): (String, Option<String>, Option<Vec<u8>>) =
+            sqlx::query_as(
+                "SELECT uid, retry_of, failed_by FROM scan_jobs WHERE status = 'queued'",
+            )
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(retry_of.as_deref(), Some(g.job_uid.as_str()));
+        assert_eq!(failed_by.as_deref(), Some(&a.0[..]));
+        assert!(arbiter.next_job(b, &[]).await.unwrap().is_none(), "not yet");
+        let due = |ago: &'static str| {
+            let store = store.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE scan_jobs SET retry_at = datetime('now', ?) WHERE retry_of IS NOT NULL",
+                )
+                .bind(ago)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            }
+        };
+        due("-1 minute").await;
+        assert!(
+            arbiter.next_job(a, &[]).await.unwrap().is_none(),
+            "the failer waits"
+        );
+        let g = arbiter.next_job(b, &[]).await.unwrap().unwrap();
+        assert_eq!(g.job_uid, retry);
+        assert!(arbiter.complete(b, &retry, "later", None).await);
+        assert!(
+            arbiter.next_job(a, &[]).await.unwrap().is_none(),
+            "still waiting"
+        );
+        due("-31 minutes").await;
+        let g = arbiter.next_job(a, &[]).await.unwrap().unwrap();
+        assert_eq!((g.job_uid.as_str(), g.level), (retry.as_str(), 3));
     }
 
     /// "later" requeues the job and skips that scanner for it for a while

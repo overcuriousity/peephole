@@ -182,18 +182,7 @@ async fn request_page(
         Some(j) => st.store.related_by_ja4(j, d.row.ip_id).await?,
         None => (vec![], 0),
     };
-    let name = d
-        .row
-        .answer
-        .as_deref()
-        .and_then(|a| a.strip_prefix("decoy:"));
-    let served = match (d.row.page_token.as_deref(), name) {
-        (Some(t), Some(n)) => crate::canary::served(d.row.decoy_v, t, n, d.row.decoy_in.as_deref())
-            .into_iter()
-            .map(|(k, v)| (k.name().to_string(), v))
-            .collect(),
-        _ => vec![],
-    };
+    let served = d.served_canaries();
     let return_host = d
         .row
         .decoy_site

@@ -47,10 +47,6 @@ impl Store {
         self.local().requeue_orphaned_jobs().await
     }
 
-    pub async fn requeue_failed_jobs(&self, days: i64) -> Result<u64> {
-        self.local().requeue_failed_jobs(days).await
-    }
-
     pub async fn setting_get(&self, key: &str) -> Result<Option<String>> {
         Ok(
             sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
@@ -192,7 +188,8 @@ impl Store {
 pub(crate) const QUEUE_JOB_SQL: &str =
     "SELECT j.id, i.ip, j.level, j.status, j.queued_at, j.started_at, j.finished_at, j.error,
             (SELECT name FROM members m WHERE m.id = j.scanner) AS scanner,
-            (SELECT name FROM members m WHERE m.id = j.arbiter) AS arbiter
+            (SELECT name FROM members m WHERE m.id = j.arbiter) AS arbiter,
+            j.retry_at
      FROM scan_jobs j JOIN ips i ON j.ip_id = i.id";
 
 impl Store {
@@ -256,38 +253,121 @@ mod tests {
         assert_eq!(s.requeue_orphaned_jobs().await.unwrap(), 0);
     }
 
-    #[tokio::test]
-    async fn failed_jobs_can_be_retried_once_per_ip() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
-        let a = s.upsert_ip("203.0.113.20".parse().unwrap()).await.unwrap();
-        let b = s.upsert_ip("203.0.113.21".parse().unwrap()).await.unwrap();
-        // a: two failures (only the latest is retried); b: a failure plus a pending job.
-        for _ in 0..2 {
-            s.enqueue_scan(a.id, 3, 0).await.unwrap();
-            let j = s.next_queued_job().await.unwrap().unwrap();
-            s.finish_job(j.id, None, Some("host reported down"))
-                .await
-                .unwrap();
-        }
-        s.enqueue_scan(b.id, 3, 0).await.unwrap();
-        let j = s.next_queued_job().await.unwrap().unwrap();
-        s.finish_job(j.id, None, Some("timeout")).await.unwrap();
-        sqlx::query("INSERT INTO scan_jobs (uid, ip_id, level, status, queued_at) VALUES ('raw-b', ?, 4, 'queued', datetime('now'))")
-            .bind(b.id)
-            .execute(&s.pool)
-            .await
-            .unwrap();
-
-        assert_eq!(s.requeue_failed_jobs(7).await.unwrap(), 1);
-        let queued: Vec<(i64, Option<String>)> = sqlx::query_as(
-            "SELECT ip_id, error FROM scan_jobs WHERE status = 'queued' ORDER BY id",
+    /// (uid, retry_of, retry_at in the future) of the queued jobs.
+    async fn queued_retries(s: &Store) -> Vec<(String, Option<String>, bool)> {
+        sqlx::query_as(
+            "SELECT uid, retry_of, retry_at > datetime('now') FROM scan_jobs
+             WHERE status = 'queued' ORDER BY id",
         )
         .fetch_all(&s.pool)
         .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_scans_are_retried_after_a_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = s.upsert_ip("203.0.113.20".parse().unwrap()).await.unwrap();
+        s.enqueue_scan(ip.id, 3, 24).await.unwrap();
+        let first = s.next_queued_job().await.unwrap().unwrap();
+        s.finish_job(first.id, None, Some("nmap exited 1"))
+            .await
+            .unwrap();
+        let root: String = sqlx::query_scalar("SELECT uid FROM scan_jobs WHERE id = ?")
+            .bind(first.id)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        // The failure stays on record; a retry waits in the queue.
+        assert_eq!(
+            s.queue_job(first.id).await.unwrap().unwrap().status,
+            "failed"
+        );
+        let q = queued_retries(&s).await;
+        assert_eq!(q.len(), 1);
+        assert_eq!((q[0].1.as_deref(), q[0].2), (Some(root.as_str()), true));
+        assert!(
+            s.next_queued_job().await.unwrap().is_none(),
+            "not before its time"
+        );
+        // Due: it runs at the same level, fails again, and the next retry
+        // still names the first failure, with a longer wait.
+        sqlx::query("UPDATE scan_jobs SET retry_at = datetime('now', '-1 minute')")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let second = s.next_queued_job().await.unwrap().unwrap();
+        assert_eq!(second.level, 3);
+        s.finish_job(second.id, None, Some("timeout after 900 s"))
+            .await
+            .unwrap();
+        let (retry_of, wait): (Option<String>, i64) = sqlx::query_as(
+            "SELECT retry_of, CAST(strftime('%s', retry_at) AS INTEGER) - CAST(strftime('%s', 'now') AS INTEGER)
+             FROM scan_jobs WHERE status = 'queued'",
+        )
+        .fetch_one(&s.pool)
+        .await
         .unwrap();
-        assert_eq!(queued, vec![(a.id, None), (b.id, None)]);
-        assert_eq!(s.requeue_failed_jobs(7).await.unwrap(), 0, "idempotent");
+        assert_eq!(retry_of.as_deref(), Some(root.as_str()));
+        assert!((19 * 60..=20 * 60).contains(&wait), "{wait}");
+    }
+
+    #[tokio::test]
+    async fn retries_stop_on_success_invalid_targets_and_after_a_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let fail = |ip: &'static str, error: &'static str| {
+            let s = s.clone();
+            async move {
+                let ip = s.upsert_ip(ip.parse().unwrap()).await.unwrap();
+                s.enqueue_scan(ip.id, 2, 0).await.unwrap();
+                let j = s.next_queued_job().await.unwrap().unwrap();
+                s.finish_job(j.id, None, Some(error)).await.unwrap();
+                (ip.id, j.id)
+            }
+        };
+        // Invalid target: never retried.
+        fail("203.0.113.30", "invalid target").await;
+        assert!(queued_retries(&s).await.is_empty());
+        // The retry of a failure from over a day ago fails too: the window
+        // is closed.
+        let (_, old) = fail("203.0.113.31", "nmap exited 1").await;
+        sqlx::query("UPDATE scan_jobs SET finished_at = datetime('now', '-25 hours') WHERE id = ?")
+            .bind(old)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE scan_jobs SET retry_at = datetime('now') WHERE status = 'queued'")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let retry = s.next_queued_job().await.unwrap().unwrap();
+        s.finish_job(retry.id, None, Some("nmap exited 1"))
+            .await
+            .unwrap();
+        assert!(queued_retries(&s).await.is_empty(), "past the window");
+        // A scan of the IP at this level or higher succeeded since: done.
+        let (ip, _) = fail("203.0.113.32", "nmap exited 1").await;
+        sqlx::query("DELETE FROM scan_jobs WHERE status = 'queued'")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO scan_jobs (uid, ip_id, level, status, queued_at, finished_at)
+             VALUES ('ok', ?, 3, 'done', datetime('now'), datetime('now'))",
+        )
+        .bind(ip)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let failed: String =
+            sqlx::query_scalar("SELECT uid FROM scan_jobs WHERE ip_id = ? AND status = 'failed'")
+                .bind(ip)
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(s.local().retry_failed(&failed, None).await.unwrap(), None);
     }
 
     #[tokio::test]

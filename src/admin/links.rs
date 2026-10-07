@@ -1,6 +1,7 @@
 //! The Links area: what ties source IPs together. An index of every value
 //! per kind, a page per value (or IP) with its neighbourhood graph, the
-//! canary reuses, and the graph's JSON.
+//! canary reuses, a page per decoy with the canaries it served and their
+//! uses, and the graph's JSON.
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
@@ -22,6 +23,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/admin/links", get(index))
         .route("/admin/links/canaries", get(canaries))
+        .route("/admin/links/canaries/served/{id}", get(decoy_canaries))
         .route("/admin/links/{kind}/{value}", get(item))
         .route("/admin/api/links/graph", get(graph))
         // Moved in the Links rework; the redirects reveal nothing.
@@ -303,5 +305,85 @@ async fn canaries(
             .map(|k| k.name())
             .chain(["legacy"])
             .collect(),
+    })
+}
+
+/// A canary a decoy served and how often it came back.
+pub struct ServedCanary {
+    pub kind: String,
+    pub value: String,
+    /// As the Links pages name it.
+    pub hash: i64,
+    pub uses: usize,
+}
+
+#[derive(Template)]
+#[template(path = "admin_canary_decoy.html")]
+struct DecoyCanariesPage {
+    chrome: Chrome,
+    d: crate::store::inspect::RequestDetail,
+    served: Vec<ServedCanary>,
+    /// Requests that used one of them, newest first.
+    uses: Vec<crate::store::canaries::Reuse>,
+    /// The IPs that used them and how many uses each, most first.
+    ips: Vec<(String, usize)>,
+}
+
+/// Uses listed on a decoy's page.
+pub const DECOY_USES: i64 = 500;
+
+/// One decoy: the canaries it served and every request and IP that used
+/// them again.
+async fn decoy_canaries(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Path(id): Path<i64>,
+) -> AppResult<Html<String>> {
+    let Some(d) = st.store.request_detail(id).await? else {
+        return Err(AppError::NotFound);
+    };
+    let served = d.served_canaries();
+    if served.is_empty() {
+        return Err(AppError::NotFound);
+    }
+    let uses: Vec<_> = st
+        .store
+        .reuses(&crate::store::canaries::ReuseFilter {
+            request: Some(id),
+            range: Range::All,
+            limit: DECOY_USES,
+            ..Default::default()
+        })
+        .await?
+        .into_iter()
+        .filter(|r| r.served_request_id == Some(id))
+        .collect();
+    let served = served
+        .into_iter()
+        .map(|(kind, value)| {
+            let hash = crate::canary::hash(&value);
+            let uses = uses.iter().filter(|r| r.value_hash == hash).count();
+            ServedCanary {
+                kind,
+                value,
+                hash,
+                uses,
+            }
+        })
+        .collect();
+    let mut ips: Vec<(String, usize)> = vec![];
+    for r in &uses {
+        match ips.iter_mut().find(|(ip, _)| *ip == r.used_ip) {
+            Some((_, n)) => *n += 1,
+            None => ips.push((r.used_ip.clone(), 1)),
+        }
+    }
+    ips.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    render(&DecoyCanariesPage {
+        chrome: chrome(),
+        d,
+        served,
+        uses,
+        ips,
     })
 }
