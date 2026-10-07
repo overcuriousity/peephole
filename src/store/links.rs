@@ -1,11 +1,13 @@
 //! What ties source IPs together, for the admin Links pages. Browser
 //! fingerprints, SSH host keys, TLS certificates and reused canaries point
-//! to one operator ("identity"); JA4, JA4H, HASSH and JA4X only to the same
-//! software. Each kind is read as sightings: a value seen on an IP at a
+//! to one operator ("identity"); JA4, JA4H, HASSH, JA4X, favicon, JARM and
+//! page hashes only to the same software. Each kind is read as sightings: a value seen on an IP at a
 //! time, by a node. Admin-only.
 use super::Store;
 use super::browse::{PAGE_SIZE, Page, lenient_i64, nonempty, ts_bound};
-use crate::scan::hostkeys::{HASSH, JA4X, SSH_HOSTKEY, TLS_CERT};
+use crate::scan::hostkeys::{
+    FAVICON, HASSH, HTTP_404, HTTP_BODY, JA4X, JARM, SSH_HOSTKEY, TLS_CERT,
+};
 use anyhow::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
@@ -19,14 +21,22 @@ pub enum LinkKind {
     Ja4h,
     Hassh,
     Ja4x,
+    Favicon,
+    Jarm,
+    HttpBody,
+    Http404,
 }
 
 use LinkKind::*;
 
 impl LinkKind {
-    pub const ALL: [LinkKind; 8] = [Fp, Ssh, Tls, Canary, Ja4, Ja4h, Hassh, Ja4x];
+    pub const ALL: [LinkKind; 12] = [
+        Fp, Ssh, Tls, Canary, Ja4, Ja4h, Hassh, Ja4x, Favicon, Jarm, HttpBody, Http404,
+    ];
     /// The kinds the index lists (canaries have their own tab).
-    pub const LIST: [LinkKind; 7] = [Fp, Ssh, Tls, Ja4, Ja4h, Hassh, Ja4x];
+    pub const LIST: [LinkKind; 11] = [
+        Fp, Ssh, Tls, Ja4, Ja4h, Hassh, Ja4x, Favicon, Jarm, HttpBody, Http404,
+    ];
     pub const IDENTITY: [LinkKind; 4] = [Fp, Ssh, Tls, Canary];
 
     pub fn parse(s: &str) -> Option<Self> {
@@ -44,6 +54,10 @@ impl LinkKind {
             Ja4h => "ja4h",
             Hassh => "hassh",
             Ja4x => "ja4x",
+            Favicon => "favicon",
+            Jarm => "jarm",
+            HttpBody => "http-body",
+            Http404 => "http-404",
         }
     }
 
@@ -57,6 +71,10 @@ impl LinkKind {
             Ja4h => "JA4H",
             Hassh => "HASSH",
             Ja4x => "JA4X",
+            Favicon => "Favicon",
+            Jarm => "JARM",
+            HttpBody => "Page body",
+            Http404 => "404 page",
         }
     }
 
@@ -77,6 +95,10 @@ impl LinkKind {
             Tls => Some(TLS_CERT),
             Hassh => Some(HASSH),
             Ja4x => Some(JA4X),
+            Favicon => Some(FAVICON),
+            Jarm => Some(JARM),
+            HttpBody => Some(HTTP_BODY),
+            Http404 => Some(HTTP_404),
             _ => None,
         }
     }
@@ -94,6 +116,10 @@ impl LinkKind {
             Tls => &TLS_LEGS,
             Hassh => &HASSH_LEGS,
             Ja4x => &JA4X_LEGS,
+            Favicon => &FAVICON_LEGS,
+            Jarm => &JARM_LEGS,
+            HttpBody => &HTTP_BODY_LEGS,
+            Http404 => &HTTP_404_LEGS,
             Canary => &CANARY_LEGS,
         }
     }
@@ -125,6 +151,10 @@ const SSH_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'ssh-hostkey'")];
 const TLS_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'tls-cert'")];
 const HASSH_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'hassh'")];
 const JA4X_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'ja4x'")];
+const FAVICON_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'favicon'")];
+const JARM_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'jarm'")];
+const HTTP_BODY_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'http-body'")];
+const HTTP_404_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'http-404'")];
 
 /// One source of sightings.
 struct Leg {
@@ -920,6 +950,59 @@ mod tests {
             Some(crate::scan::hostkeys::JA4X)
         );
         assert_eq!(LinkKind::parse("ip"), None);
+    }
+
+    /// Two addresses, each with one `host_keys` row of `kind` and `value`
+    /// that a probe stored.
+    async fn two_ips_with_probe_keys(kind: &str, value: &str) -> (Store, i64, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        std::mem::forget(dir);
+        let s = Store::connect(&path).await.unwrap();
+        let mut ids = [0; 2];
+        for (i, a) in ["203.0.113.1", "198.51.100.2"].iter().enumerate() {
+            ids[i] = s.upsert_ip(a.parse().unwrap()).await.unwrap().id;
+            let probe: i64 = sqlx::query_scalar(
+                "INSERT INTO probes (uid, group_uid, ip_id, asker, started_at, finished_at)
+                 VALUES (?, 'g', ?, x'01', datetime('now'), datetime('now')) RETURNING id",
+            )
+            .bind(format!("p{i}"))
+            .bind(ids[i])
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO host_keys (probe_id, ip_id, port, kind, fingerprint)
+                 VALUES (?, ?, 443, ?, ?)",
+            )
+            .bind(probe)
+            .bind(ids[i])
+            .bind(kind)
+            .bind(value)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        (s, ids[0], ids[1])
+    }
+
+    #[tokio::test]
+    async fn probe_hashes_link_addresses_softly() {
+        let (s, a, b) = two_ips_with_probe_keys("favicon", "-1234567").await;
+        let item = s
+            .link_item(LinkKind::Favicon, "-1234567")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.ips, 2);
+        assert!(item.first_seen.is_some(), "time from the probe");
+        let _ = (a, b);
+        assert!(!LinkKind::Favicon.identity());
+        assert!(!LinkKind::Favicon.by_node());
+        assert_eq!(LinkKind::parse("http-404"), Some(LinkKind::Http404));
+        assert_eq!(LinkKind::of_host_kind("jarm"), Some(LinkKind::Jarm));
+        assert!(!LinkKind::IDENTITY.contains(&LinkKind::Jarm));
+        assert!(LinkKind::LIST.contains(&LinkKind::HttpBody));
     }
 
     #[tokio::test]
