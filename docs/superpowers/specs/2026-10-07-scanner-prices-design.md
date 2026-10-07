@@ -42,7 +42,8 @@ Price parameters, defaults of the build (they shape offers only):
 | Parameter | Value | Meaning |
 |---|---|---|
 | `PAID_TARGET` | 0.9 | Share of a scanner's capacity paid work should fill |
-| `PRICE_TOLERANCE` | 1.25 | An arbiter offers at most this times its own copy of a scanner's price |
+| `PRICE_TOLERANCE` | 1.25 | An arbiter offers at most this times its own copy of a scanner's price; a scanner takes no less than its price divided by it |
+| `DELIVERY_MIN` | 0.5 of at least 5 | Share of an arbiter's recent grants a scanner must deliver to be ordered by price (§8) |
 
 The price rule itself (`step`, `PRICE_STEP`, `PRICE_FLOOR`) is unchanged.
 The scan price stays flat per job, whatever the level.
@@ -53,8 +54,9 @@ Every node keeps a price for **every scanner** it counts (live members
 with the scanner role, not blocked or forked here; `price::scanners`),
 and steps each once an hour with the existing rule:
 
-- **Demand**: the scanner's paid scans that ended in the past hour, as
-  the log holds them: the receipts it wrote for scan offers, plus the
+- **Demand**: the scanner's paid scans whose result says they finished
+  in the past hour (the scan's own `finished_at`, not when its receipt
+  arrived), as the log holds them: the scans its receipts name, plus the
   scans it ran of jobs it queued itself (the node that queued the job,
   as the mint's own-job rule identifies it, `earn::Judged::trap`).
 - **Supply**: `PAID_TARGET` × the scans it can do in an hour, as
@@ -99,7 +101,8 @@ groups:
 
 Within each group the order is the urgency order of the market before
 this change (highest response ratio first, `order::ratio_sql`), not price.
-`min_mc` in the claim stays half the scanner's selling price.
+`min_mc` in the claim becomes the scanner's selling price divided by
+`PRICE_TOLERANCE` (was: half of it).
 
 **Arbiter side** (`hand_out`). The scanners that claim within the claim
 window are sorted by the price this arbiter would pay each (§3), cheapest
@@ -113,8 +116,8 @@ granted unpaid otherwise.
 An arbiter offers a scanner `min(announced, own copy × PRICE_TOLERANCE)`,
 rounded down. A scanner that announces less is paid less. A scanner that
 announces more than the tolerance allows is paid the arbiter's figure.
-If that is under the claim's `min_mc` (half the announced price), `fund`
-already grants unpaid.
+If that is under the claim's `min_mc` (the announced price divided by
+`PRICE_TOLERANCE`), `fund` grants unpaid.
 
 So a scanner can always undercut its price, and can never raise it beyond
 what the rule gives from public inputs. A scanner whose price only
@@ -140,7 +143,8 @@ drifted from the arbiter's copy is paid at most a little less.
 A node with `collect_to` set (another node of its fleet):
 
 - **Budget**: `scan_share` × (its own balance + its collecting node's
-  balance), less what its scan offers and own jobs hold and were charged
+  balance divided by the number of nodes of its fleet that forward to
+  it), less what its scan offers and own jobs hold and were charged
   today. Every node computes any member's balance from its log.
 - **Scan float**: once an hour, after the price step, it draws from its
   collecting node what its queued jobs need at the cheapest scanner's
@@ -181,7 +185,47 @@ protocol 4.
 
 This spec is not amended after implementation.
 
-## 8. What this cannot do
+## 8. Attack vectors
+
+Each is mitigated where the design can; what remains is in §9.
+
+- **A cheap scanner that hoards jobs.** A scanner announces the floor,
+  wins every claim round by price, and delivers nothing or hands the jobs
+  back: sensors' scans stall. Today's ordering by load limited this; price
+  ordering alone would not. Mitigation in `hand_out`:
+  - a claimant that already got its announced capacity of jobs from this
+    arbiter in the past hour is ordered after all others;
+  - a claimant that delivered less than half of at least 5 grants of this
+    arbiter in the past 24 hours (failed, lease expired, handed back) is
+    ordered after all others, by load.
+  Leases still return undelivered jobs, as now.
+- **Cherry-picking under a flat price.** A scanner hands back long
+  (level 3, 4) grants and keeps short ones. A handed-back funded grant
+  counts as undelivered for the rule above. `exclude_levels` stays the
+  only honest way to refuse a level, as now.
+- **An arbiter that underpays.** A modified arbiter computes a low
+  reference price. The scanner's `min_mc` is its price divided by
+  `PRICE_TOLERANCE` (not half), so an offer more than that below is
+  granted unpaid, and the scanner orders that arbiter as one that cannot
+  pay for the next hour.
+- **An arbiter that overstates its budget.** It announces a large
+  `scan_budget_mc` to be asked first, then grants unpaid. A scanner counts
+  an arbiter as able to pay only when the arbiter's balance in its own
+  book covers the price. An arbiter whose grant came unpaid although it
+  was asked as able to pay is ordered with those that cannot for the next
+  hour.
+- **Receipt timing.** A scanner holds receipts back and writes them in
+  one hour to make that hour's demand spike. Demand counts scans by when
+  they finished, not when the receipt was written, so holding receipts
+  back moves nothing.
+- **A fleet that counts its balance several times.** Each sibling would
+  see the whole collecting node's balance and fund from it, overspending
+  `scan_share` many times. Each counts its share of it (§5).
+- **Undercutting.** A scanner sells below its rule price to win jobs.
+  This is allowed: buyers gain, and its price then rises by the rule as it
+  fills. It cannot later raise its price faster than the rule allows.
+
+## 9. What this cannot do
 
 - **Understated capacity.** A scanner can announce a lower pace to look
   busier and raise its price. It then runs fewer scans than it could, and
@@ -197,8 +241,17 @@ This spec is not amended after implementation.
   operation.
 - **Own jobs count as load.** A node's own jobs raise its scanner's price
   even when its budget did not cover them.
+- **Capacity withdrawal raises the price.** A scanner that fills itself
+  with its own jobs (invented requests at its own trap), or with paid jobs
+  of a second key of its operator, looks busy and its price rises. This
+  is the same as announcing a lower pace, which an operator can always do:
+  a scanner that sells less of its capacity is scarcer. Others are
+  protected by choosing the cheapest scanner, by `scan_share` bounding
+  what they spend, by the rule bounding how fast a price rises, and by
+  the mint drawing new scanners in. With one scanner it is a monopoly,
+  and that cannot be priced away.
 
-## 9. Testing
+## 10. Testing
 
 - Unit: the price step of one scanner from demand and capacity, including
   a busy scanner rising, an idle one falling to the floor, and a saturated
@@ -210,7 +263,12 @@ This spec is not amended after implementation.
   load).
 - Unit: own-job funding against the budget, held, charged and released
   with `self_mc`; no offer written.
-- Unit: the fleet budget and scan float; `collect` keeps the float.
+- Unit: the fleet budget (the collecting node's balance shared among
+  its forwarding nodes) and scan float; `collect` keeps the float.
+- Unit: the attack mitigations: a claimant over its hourly capacity or
+  under `DELIVERY_MIN` goes last; demand by `finished_at`; an underpaying
+  or unpaid-granting arbiter drops out of the can-pay group for an hour;
+  an arbiter whose book balance is under the price is not asked first.
 - Unit: heartbeat compatibility: a protocol 4 heartbeat decodes, a
   protocol 5 one decodes on protocol 4.
 - Integration (`tests/cluster.rs`): two scanners at different prices, one
