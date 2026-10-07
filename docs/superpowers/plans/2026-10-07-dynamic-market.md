@@ -14,7 +14,8 @@
 
 - Ledger constants (must be identical on every node, build constants): `MINT_PER_DAY` = 1000 credits, `ALLOWANCE_PER_DAY` = 5 credits, `PER_NODE_PER_DAY` = 500 (existing), `LOT_DAYS` = 7 (existing), level weights 1 (levels 1, 2) and 2 (levels 3, 4).
 - Price parameters (build defaults, may differ per node): `PRICE_FLOOR` = 1 mc, `PRICE_STEP` = 0.15, step bounded by `clamp((D − S) / max(S, 1), −3, 3)`.
-- A good with unlimited supply (provider without a daily budget on the serving node, domain resolution) costs 0 and is served without offers under `pay::FREE_PER_HOUR`.
+- Free providers are exactly those that need no account or key: Tor exit list, RDAP, Shodan InternetDB (`ProviderInfo.free = true`). They are served without offers under `pay::FREE_PER_HOUR`; InternetDB's on-demand share still applies. Every other provider (GeoLite2 included) and domain resolution to another node is paid.
+- `[enrichment] offer_per_day` (default 1000): the daily supply of a paid provider without an API budget and of name resolutions on that node.
 - Nothing is burned: a receipt moves the full charged amount to the server.
 - A scan of the scanner's own job (scanner == trap) never counts for the mint.
 - `[credits] scan_share` in the config file, default 0.5, between 0 and 1.
@@ -30,7 +31,7 @@
 2. **A scan that reaches a node after its day closed**: the share moves; a lot that shrank must make later offers cover less, never produce a negative lot. Test in Task 2 (`a_late_scan_shifts_a_closed_day`).
 3. **A scanner that never reports back** (crash mid-scan): the scan offer must hold credits until it lapses after `MAX_RUN_SECS` + margin and then return them; a receipt after that is ignored. Test in Task 1 (`a_job_offer_lapses_after_the_longest_run`).
 4. **A node with zero balance arbitrating jobs**: it must grant unfunded (no offer, no error) and announce 0 bids. Test in Task 4 (`no_budget_grants_without_an_offer`).
-5. **A provider whose budget appears or disappears between refreshes** (key added/removed): the price must switch between 0 and a market price without panicking and the cheap tier must follow. Test in Task 3 (`a_provider_without_budget_is_free_and_with_one_is_priced`).
+5. **A resolver that fails or times out after the offer was written**: the asker must not be charged; the offer is released by a receipt of nothing (or lapses). Test in Task 5 (`a_failed_resolution_charges_nothing`).
 
 ---
 
@@ -225,7 +226,7 @@ Update the module doc ("Half of what is charged ... destroyed" goes) and `pay.rs
 
 - [ ] **Step 5: Fix the remaining expectations and pages**
 
-Run `cargo test --lib credits::` and correct every failing expectation that assumed the half (for example `only_the_first_receipt_from_the_node_offered_to_counts`: balances become `(200, 300)`; recompute each by "the server gets the full charged amount"). In `src/admin/credits.rs` drop `SpentRow.destroyed`, the "Of which destroyed" column in `templates/admin_cluster_credits.html`, the sentence about the destroyed half (replace with "What is charged goes to the node that answered. An offer without an answer lapses after 15 minutes (a scan offer after the longest scan) and costs nothing."), and the destroyed total (`totals` becomes `(earned, circulating)`; template line 77: "In 7 days earned {{ totals.0 }} · in circulation now {{ totals.1 }} credits. …"). In `src/admin/overview.rs` `spending` returns only the charged sum; drop `ClusterFigures.destroyed` and its test value (line ~603); the home tile becomes "Earned / spent" with `{{ c.earned }} / {{ c.spent }}`.
+Run `cargo test --lib credits::` and correct every failing expectation that assumed the half: recompute each by "the server gets the full charged amount, the payer keeps the rest of what the offer held"; remove assertions on `destroyed`. In `src/admin/credits.rs` drop `SpentRow.destroyed`, the "Of which destroyed" column in `templates/admin_cluster_credits.html`, the sentence about the destroyed half (replace with "What is charged goes to the node that answered. An offer without an answer lapses after 15 minutes (a scan offer after the longest scan) and costs nothing."), and the destroyed total (`totals` becomes `(earned, circulating)`; template line 77: "In 7 days earned {{ totals.0 }} · in circulation now {{ totals.1 }} credits. …"). In `src/admin/overview.rs` `spending` returns only the charged sum; drop `ClusterFigures.destroyed` and its test value (line ~603); the home tile becomes "Earned / spent" with `{{ c.earned }} / {{ c.spent }}`.
 
 - [ ] **Step 6: Run the focused tests**
 
@@ -572,10 +573,12 @@ git commit -m "Credits: a fixed daily mint split among scanners, an allowance fo
 **Files:**
 - Modify: `src/credits/price.rs` (rewrite of weights/unit/load/price/Table/refresh; keep `Scanner`, `capacity`, `scanners`)
 - Modify: `src/credits/share.rs` (remove surge and its test)
+- Modify: `src/cluster/rpc/proto.rs` (`MARKET_PROTO`), `src/credits/pay.rs` (`pays_with`)
 - Modify: `src/cluster/mod.rs` (`Node.market: price::Demand`, `scan_bids: AtomicU32`, `scan_share: OnceLock<f64>` with `set_scan_share`/`scan_share`)
 - Modify: `src/cluster/status.rs` (`Heartbeat.scan_price_mc`, `Heartbeat.scan_bids`, `refresh_heartbeat`, test constructions)
 - Modify: `src/credits/pay.rs` (`quotes`, `serve`: price fallback, demand counting)
-- Modify: `src/intel/lookup.rs` (free partition, `cheap`), `src/admin/lookup.rs` (cheap call sites)
+- Modify: `src/intel/mod.rs` (`ProviderInfo.free`), `src/intel/lookup.rs` (free partition, `cheap`)
+- Modify: `src/config.rs` (`EnrichmentConfig.offer_per_day`), `src/lib.rs:176` (`Shares::new`)
 - Modify: `src/scan/probe/serve.rs` (price, slots, demand), `src/admin/credits.rs`, `src/admin/overview.rs`, `templates/admin_cluster_credits.html`, `templates/admin_home.html`
 
 **Interfaces:**
@@ -586,7 +589,12 @@ git commit -m "Credits: a fixed daily mint split among scanners, an allowance fo
   - `price::Demand` with `note(&self, good: &str, n: u32)` and `take(&self) -> (HashMap<String, f64>, f64 /*hours*/)`.
   - `price::Offer { provider, price_mc: u32, on_demand: Option<u32> }`; `price::Table { at_ms, capacity, scan_bids: u32, scan_mc: u32, probe_mc: Option<u32>, offers }` with `price_of`, `announced` as now.
   - `Heartbeat { ..., #[serde(default)] scan_price_mc: Option<u32>, #[serde(default)] scan_bids: u32 }`.
-  - `lookup::cheap(quotes: &HashMap<String, Vec<pay::Quote>>) -> Vec<String>`: providers whose cheapest quote is 0.
+  - `ProviderInfo { ..., free: bool }`; `intel::is_free(name: &str) -> bool`.
+  - `Shares::new(store, share: f64, offer_per_day: u32)`; `Shares::allowance(p)`: budget share with a budget, `None` for a free provider without one, `Some(offer_per_day)` otherwise; `Shares::offer_per_day() -> u32`; `Shares::take_good(good: &str) -> Result<bool>` (counts against `offer_per_day`).
+  - `price::provider_price(free: bool, per_day: u32, current: Option<Mc>, demand: f64, hours: f64) -> Mc`.
+  - `price::RESOLVE: &str = "resolve"`; `Table.resolve_mc: u32`, announced in `prices` as `("resolve", mc)`.
+  - `lookup::cheap() -> Vec<String>`: the free providers (static).
+  - `proto::MARKET_PROTO: u32 = 4`; `pay::pays_with(proto_max: u32) -> bool`.
 
 - [ ] **Step 1: Write the failing price tests** (replace the tests of `price.rs` that use `unit`, `load`, `price`, `weight_milli`; keep `scan_capacity_is_bound_by_workers_or_by_the_hourly_limit` and `a_table_knows_what_it_offers` adapted to the new `Offer`)
 
@@ -628,11 +636,13 @@ git commit -m "Credits: a fixed daily mint split among scanners, an allowance fo
     }
 
     #[test]
-    fn a_provider_without_budget_is_free_and_with_one_is_priced() {
-        assert_eq!(provider_price(None, Some(500), 3.0, 1.0), 0);
-        assert_eq!(provider_price(Some(240), None, 3.0, 1.0), step(PRICE_FLOOR, 3.0, 10.0));
-        assert_eq!(provider_price(Some(240), Some(500), 10.0, 1.0), 500);
-        assert_eq!(provider_price(Some(0), Some(500), 1.0, 1.0), step(500, 1.0, 0.0));
+    fn free_providers_cost_nothing_and_paid_ones_follow_their_supply() {
+        assert_eq!(provider_price(true, 240, Some(500), 3.0, 1.0), 0);
+        assert_eq!(provider_price(false, 240, None, 3.0, 1.0), step(PRICE_FLOOR, 3.0, 10.0));
+        assert_eq!(provider_price(false, 240, Some(500), 10.0, 1.0), 500);
+        assert_eq!(provider_price(false, 0, Some(500), 1.0, 1.0), step(500, 1.0, 0.0));
+        // A generous node (high offer_per_day) gets cheaper under the same demand.
+        assert!(provider_price(false, 24_000, Some(500), 50.0, 1.0) < provider_price(false, 240, Some(500), 50.0, 1.0));
     }
 ```
 
@@ -650,6 +660,8 @@ pub const PRICE_FLOOR: Mc = 1;
 pub const PRICE_STEP: f64 = 0.15;
 pub const SCAN: &str = "scan";
 pub const PROBE: &str = "probe";
+/// A name resolved for another member (`intel::dns`).
+pub const RESOLVE: &str = "resolve";
 /// A probe slot serves this many probes an hour (`PROBE_TIMEOUT` is 2 minutes).
 pub const PROBES_PER_SLOT_HOUR: f64 = 30.0;
 
@@ -671,13 +683,13 @@ pub fn start(announced: &[u32]) -> Mc {
     v[(v.len() - 1) / 2] as Mc
 }
 
-/// A provider's next price here: free without a budget, else a step from
-/// `current` (or the floor) with the on-demand lookups of `hours` as supply.
-pub fn provider_price(on_demand: Option<u32>, current: Option<Mc>, demand: f64, hours: f64) -> Mc {
-    match on_demand {
-        None => 0,
-        Some(per_day) => step(current.unwrap_or(PRICE_FLOOR), demand, per_day as f64 / 24.0 * hours),
+/// A provider's next price here: nothing for a free one, else a step from
+/// `current` (or the floor) with `per_day` spread over `hours` as supply.
+pub fn provider_price(free: bool, per_day: u32, current: Option<Mc>, demand: f64, hours: f64) -> Mc {
+    if free {
+        return 0;
     }
+    step(current.unwrap_or(PRICE_FLOOR), demand, per_day as f64 / 24.0 * hours)
 }
 
 /// Paid requests this node received since the last refresh, per good.
@@ -717,9 +729,13 @@ pub struct Table {
     pub scan_mc: u32,
     /// None: this node does not probe.
     pub probe_mc: Option<u32>,
+    /// What resolving a name for another member costs here.
+    pub resolve_mc: u32,
     pub offers: Vec<Offer>,
 }
 ```
+
+`announced()` appends `(RESOLVE.to_string(), self.resolve_mc)` to the prices when `resolve_mc > 0` (`pay::quotes` ignores it: it keeps only known providers).
 
 Delete `surge_on`, `surge`, `SURGE_MAX` and the surge test from `src/credits/share.rs` and its module-doc sentence about the surge.
 
@@ -754,7 +770,7 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let mut bids: u64 = node.scan_bids.load(std::sync::atomic::Ordering::Relaxed) as u64;
     for id in node.live_members(intel::LIVE_WINDOW) {
         if id == me || left_out.contains(&id) || node.is_blocked(&id)
-            || !members.get(&id).is_some_and(|m| m.proto_max >= crate::cluster::rpc::proto::MARKET_PROTO)
+            || !members.get(&id).is_some_and(|m| super::pay::pays_with(m.proto_max))
         {
             continue;
         }
@@ -776,18 +792,20 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let mut offers = vec![];
     let empty = vec![];
     let providers = node.lookup_providers().unwrap_or(&empty);
+    let offer_per_day = node.lookup_shares().map_or(crate::config::DEFAULT_OFFER_PER_DAY, |s| s.offer_per_day());
     for p in providers.iter().filter(|p| p.ready()) {
+        let free = intel::is_free(p.name());
         let on_demand = node.lookup_shares().and_then(|s| s.allowance(p.as_ref()));
-        let cur = match on_demand {
-            Some(_) => Some(current(node, &old, p.name(), &ann(p.name())).await?),
-            None => None,
-        };
+        let cur = if free { None } else { Some(current(node, &old, p.name(), &ann(p.name())).await?) };
         offers.push(Offer {
             provider: p.name().to_string(),
-            price_mc: provider_price(on_demand, cur, got(p.name()), hours).min(u32::MAX as Mc) as u32,
+            price_mc: provider_price(free, on_demand.unwrap_or(offer_per_day), cur, got(p.name()), hours)
+                .min(u32::MAX as Mc) as u32,
             on_demand,
         });
     }
+    let resolve_cur = current(node, &old, RESOLVE, &ann(RESOLVE)).await?;
+    let resolve_mc = step(resolve_cur, got(RESOLVE), offer_per_day as f64 / 24.0 * hours).min(u32::MAX as Mc) as u32;
     let probe_mc = match node.prober() {
         Some(pr) => {
             let cur = current(node, &old, PROBE, &ann(PROBE)).await?;
@@ -800,10 +818,10 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let scan_mc = step(scan_cur, bids as f64, capacity.per_day / 24.0).min(u32::MAX as Mc) as u32;
     for (good, mc) in offers
         .iter()
-        .filter(|o| o.on_demand.is_some())
+        .filter(|o| o.price_mc > 0)
         .map(|o| (o.provider.as_str(), o.price_mc))
         .chain(probe_mc.map(|m| (PROBE, m)))
-        .chain([(SCAN, scan_mc)])
+        .chain([(SCAN, scan_mc), (RESOLVE, resolve_mc)])
     {
         node.store.intel_set(&price_key(good), &mc.to_string()).await?;
     }
@@ -813,6 +831,7 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         scan_bids: bids.min(u32::MAX as u64) as u32,
         scan_mc,
         probe_mc,
+        resolve_mc,
         offers,
     });
     node.set_price_table(table.clone());
@@ -827,12 +846,31 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         match good {
             SCAN => Some(self.scan_mc).filter(|p| *p > 0),
             PROBE => self.probe_mc,
+            RESOLVE => Some(self.resolve_mc).filter(|p| *p > 0),
             _ => self.offers.iter().find(|o| o.provider == good).map(|o| o.price_mc),
         }
     }
 ```
 
-- [ ] **Step 5: Node fields and heartbeat**
+- [ ] **Step 5: Protocol constant, node fields and heartbeat**
+
+`src/cluster/rpc/proto.rs` (`PROTO_VERSION` stays 3 until Task 6):
+
+```rust
+/// Members from this version count balances with the market's rules
+/// (`credits::mint`): payments go only between them.
+pub const MARKET_PROTO: u32 = 4;
+```
+
+`src/credits/pay.rs`:
+
+```rust
+/// Whether a member announcing `proto_max` counts balances as this node does.
+pub fn pays_with(proto_max: u32) -> bool {
+    proto_max >= crate::cluster::rpc::proto::MARKET_PROTO
+}
+```
+
 
 In `src/cluster/mod.rs` add to `Node` (and its constructor):
 
@@ -885,33 +923,58 @@ and fill them in `refresh_heartbeat`: `scan_price_mc: table.price_of(crate::cred
     }
 ```
 
-- `src/intel/lookup.rs::serve` (offer-less path): partition by budget here:
+- `src/intel/mod.rs`: add `pub free: bool` to `ProviderInfo` ("needs no account or key: answered without credits"); `true` for `TOR`, `RDAP`, `INTERNETDB`, `false` for the others; and
 
 ```rust
-            let budgeted = |n: &String| {
-                node.lookup_shares().zip(providers.iter().find(|p| p.name() == n))
-                    .is_some_and(|(s, p)| s.allowance(p.as_ref()).is_some())
-            };
-            let (paid, free): (Vec<String>, Vec<String>) = served.into_iter().partition(budgeted);
-```
-
-- `cheap` becomes:
-
-```rust
-/// The providers a lookup asks without being told to: those the cheapest
-/// server answers for nothing (no budget there).
-pub fn cheap(quotes: &HashMap<String, Vec<crate::credits::pay::Quote>>) -> Vec<String> {
-    let mut v: Vec<String> = quotes
-        .iter()
-        .filter(|(_, l)| l.first().is_some_and(|q| q.price_mc == 0))
-        .map(|(p, _)| p.clone())
-        .collect();
-    v.sort();
-    v
+/// A provider anyone can ask without an account or key: never paid.
+pub fn is_free(name: &str) -> bool {
+    provider_info(name).is_some_and(|i| i.free)
 }
 ```
 
-Remove `CHEAP_MILLI`. In `run` use `cheap(&crate::credits::pay::quotes(node, providers))`; in `src/admin/lookup.rs::Offer::from_quotes` use `cheap(all)`; `asked` gets the quotes as a parameter (`fn asked(&self, all: &HashMap<String, Vec<Quote>>)`) and its callers pass the quotes they already built. Replace the test `cheap_tier_is_tor_rdap_geolite_and_internetdb` by one that builds quotes (`[("tor", 0), ("abuseipdb", 300), ("rdap", 0)]`) and expects `["rdap", "tor"]`.
+- `src/config.rs`: `EnrichmentConfig.offer_per_day: u32` with `#[serde(default = "default_offer_per_day")]`, `pub const DEFAULT_OFFER_PER_DAY: u32 = 1000;`, doc: "Paid lookups a day this node serves of each provider without an API budget (GeoLite2), and names it resolves a day for other members." Add `("enrichment", "offer_per_day", "1000")` next to the `on_demand_share` entry near line 609 and a test that the default is 1000. `src/lib.rs:176`: pass `cfg.enrichment.offer_per_day` to `Shares::new`.
+
+- `src/credits/share.rs`: `Shares { store, share, offer_per_day }`;
+
+```rust
+    pub fn allowance(&self, p: &dyn Provider) -> Option<u32> {
+        match p.per_day() {
+            Some(d) => Some((d * self.share).floor().clamp(0.0, u32::MAX as f64) as u32),
+            None if crate::intel::is_free(p.name()) => None,
+            None => Some(self.offer_per_day),
+        }
+    }
+
+    pub fn offer_per_day(&self) -> u32 {
+        self.offer_per_day
+    }
+
+    /// Count one paid unit of `good` (a resolution) against
+    /// `offer_per_day`; false when today's are used up.
+    pub async fn take_good(&self, good: &str) -> Result<bool> {
+        self.take_named(good, Some(self.offer_per_day), today()).await
+    }
+```
+
+Move the body of `take_on` into `async fn take_named(&self, name: &str, allowance: Option<u32>, day: NaiveDate) -> Result<bool>` and let `take_on` call it with `p.name()` and `self.allowance(p)`. Update the share tests' `Shares::new(.., 0.2)` calls to pass `1000` and add: a fake provider without a budget and not free gets `Some(1000)`; with name `"tor"` gets `None`.
+
+- `src/intel/lookup.rs::serve` (offer-less path): partition with `crate::intel::is_free`, and for a free provider with a budget (InternetDB) take its share before asking (decline it with "this node's on-demand share of that provider is spent for today" when `take` is false):
+
+```rust
+            let (free, paid): (Vec<String>, Vec<String>) =
+                served.into_iter().partition(|n| crate::intel::is_free(n));
+```
+
+- `cheap` becomes static and `CHEAP_MILLI` goes:
+
+```rust
+/// The providers a lookup asks without being told to: the free ones.
+pub fn cheap() -> Vec<String> {
+    KNOWN_PROVIDERS.iter().filter(|p| p.free).map(|p| p.name.to_string()).collect()
+}
+```
+
+Rename the test `cheap_tier_is_tor_rdap_geolite_and_internetdb` to `cheap_tier_is_tor_rdap_and_internetdb` and drop `MAXMIND` from its expectation. The callers in `src/admin/lookup.rs` stay as they are.
 
 - `src/scan/probe/serve.rs`: `pub fn slots(&self) -> u32 { self.max }`; `price` returns `table.probe_mc.unwrap_or(price::PRICE_FLOOR as u32)`; remove `surging`; where a paid probe request arrives (before its offer is accepted), `node.market.note(price::PROBE, 1)` unless the asker is a sibling (same check as above).
 
@@ -919,14 +982,14 @@ Remove `CHEAP_MILLI`. In `run` use `cheap(&crate::credits::pay::quotes(node, pro
 
 - [ ] **Step 7: Run the focused tests**
 
-Run: `export PATH=$HOME/.cargo/bin:$PATH; cargo test --lib credits:: && cargo test --lib intel::lookup && cargo test --lib cluster::status && cargo test --lib admin::`
+Run: `export PATH=$HOME/.cargo/bin:$PATH; cargo test --lib credits:: && cargo test --lib intel:: && cargo test --lib cluster::status && cargo test --lib config && cargo test --lib admin::`
 Expected: PASS.
 
 - [ ] **Step 8: Commit**
 
 ```bash
 git add -A src templates
-git commit -m "Credits: market prices per good from demand and supply; no weights, unit or surge; unlimited goods are free"
+git commit -m "Credits: market prices per good from demand and supply; no weights, unit or surge; only Tor, RDAP and InternetDB are free; offer_per_day for GeoLite2 and resolution"
 ```
 
 ---
@@ -1063,7 +1126,7 @@ pub fn bids(queued: u32, budget: Mc, price: Mc) -> u32 {
 pub async fn fund(node: &Arc<Node>, scanner: NodeId, job_uid: &str, min_mc: u32) -> Option<(u64, u32)> {
     let me = node.id();
     if scanner == me
-        || !node.members().get(&scanner).is_some_and(|m| m.proto_max >= crate::cluster::rpc::proto::MARKET_PROTO)
+        || !node.members().get(&scanner).is_some_and(|m| super::pay::pays_with(m.proto_max))
     {
         return None;
     }
@@ -1196,16 +1259,217 @@ git commit -m "Scan jobs are paid: arbiters fund grants within scan_share, scann
 
 ---
 
-### Task 5: Protocol gate
+### Task 5: Paid domain resolution
 
 **Files:**
-- Modify: `src/cluster/rpc/proto.rs`, `src/credits/pay.rs` (`quotes`, `accept_offer`), `src/scan/probe/ask.rs` and `src/scan/probe/serve.rs` (wherever a payment checks `OWNER_PROTO`)
-- Test: `tests/cluster.rs` (one end-to-end payment between two market nodes already exists for lookups; extend it as below)
+- Modify: `src/intel/dns.rs` (`ResolveReq`, `choose`, `lookup_with`, `ask`, tests)
+- Modify: `src/cluster/rpc/mod.rs:219-240` (`resolve` handler)
+- Modify: `src/cluster/mod.rs` (remove `take_free_resolve` and `free_resolves`)
 
 **Interfaces:**
-- Produces: `proto::PROTO_VERSION = 4`, `proto::MARKET_PROTO: u32 = 4`.
+- Consumes: `pay::make_offer(node, server, total_mc) -> Result<u64, String>`, `pay::accept_offer(node, peer, offer_seq, price, what, margin_ms) -> Result<Accepted, Declined>`, `pay::release(node, peer, offer_seq)`, `pay::SERVE_MARGIN_MS`, `price::RESOLVE`, `Table::price_of`, `Shares::take_good`, `Node::market`.
+- Produces: `ResolveReq { name, #[serde(default)] offer_seq: Option<u64> }`; `ResolveResp { addrs, error, #[serde(default)] charged_mc: u32 }`; `dns::resolver_price(node: &Node, id: &NodeId) -> Option<u32>`; `dns::serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> ResolveResp`.
 
-- [ ] **Step 1: Write the failing test** (in `src/credits/pay.rs` tests)
+- [ ] **Step 1: Write the failing tests** (in `src/intel/dns.rs` tests)
+
+```rust
+    #[test]
+    fn only_priced_market_resolvers_are_chosen() {
+        let c = |n: u8, priced: bool| (Resolver { id: NodeId([n; 32]), name: format!("n{n}"), sibling: false, country: None }, priced);
+        let kept = keep_priced(vec![c(1, true), c(2, false), c(3, true)]);
+        assert_eq!(kept.iter().map(|r| r.id).collect::<Vec<_>>(), [NodeId([1; 32]), NodeId([3; 32])]);
+    }
+
+    #[test]
+    fn a_failed_resolution_charges_nothing() {
+        assert_eq!(charge_for(&Ok(vec!["203.0.113.9".parse().unwrap()]), 40), 40);
+        assert_eq!(charge_for(&Ok(vec![]), 40), 40, "an empty answer is an answer");
+        assert_eq!(charge_for(&Err("SERVFAIL".into()), 40), 0);
+    }
+
+    #[test]
+    fn a_resolve_request_without_an_offer_encodes_like_before() {
+        #[derive(serde::Serialize)]
+        struct Old { name: String }
+        let new = ResolveReq { name: "example.com".into(), offer_seq: None };
+        assert_eq!(
+            crate::cluster::rpc::cbor::encode(&new).unwrap(),
+            crate::cluster::rpc::cbor::encode(&Old { name: "example.com".into() }).unwrap()
+        );
+    }
+```
+
+- [ ] **Step 2: Run to see them fail**
+
+Run: `export PATH=$HOME/.cargo/bin:$PATH; cargo test --lib intel::dns`
+Expected: compile errors.
+
+- [ ] **Step 3: Request and response**
+
+```rust
+pub struct ResolveReq {
+    pub name: String,
+    /// The asker's offer for this resolution (`credits::pay`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer_seq: Option<u64>,
+}
+
+pub struct ResolveResp {
+    pub addrs: Vec<IpAddr>,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// What the resolver charged, in mc.
+    #[serde(default)]
+    pub charged_mc: u32,
+}
+```
+
+`ResolveResp::refused` sets `charged_mc: 0`.
+
+- [ ] **Step 4: The resolver's side**
+
+```rust
+/// What a resolver charges for `answer` at `price`: an answer (even an
+/// empty one) costs the price, a failure nothing.
+pub fn charge_for(answer: &Result<Vec<IpAddr>, String>, price: u32) -> u32 {
+    if answer.is_ok() { price } else { 0 }
+}
+
+/// Resolve `req.name` for `peer`, paid with the offer it names.
+pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> ResolveResp {
+    use crate::credits::{pay, price};
+    let Some(name) = valid_name(&req.name) else {
+        return ResolveResp::refused("not a host name");
+    };
+    let Some(seq) = req.offer_seq else {
+        return ResolveResp::refused("resolving a name is paid with credits: the request carries no offer");
+    };
+    let sibling = crate::cluster::owner::fleet::siblings(&node.store).await.is_ok_and(|s| s.contains(&peer));
+    if !sibling {
+        node.market.note(price::RESOLVE, 1);
+    }
+    let Some(cost) = node.price_table().price_of(price::RESOLVE) else {
+        pay::release(node, peer, seq).await;
+        return ResolveResp::refused("this node has no resolution price yet; ask again later");
+    };
+    if let Err(d) = pay::accept_offer(node, peer, seq, cost as u64, "resolve", pay::SERVE_MARGIN_MS).await {
+        let why = match d {
+            pay::Declined::Why(w) | pay::Declined::NotCovered(w) => w,
+            pay::Declined::TooLow { why, .. } => why,
+        };
+        return ResolveResp::refused(&why);
+    }
+    let taken = match node.lookup_shares() {
+        Some(s) => s.take_good(price::RESOLVE).await.unwrap_or(false),
+        None => true,
+    };
+    if !taken {
+        pay::release(node, peer, seq).await;
+        return ResolveResp::refused("this node's resolutions for others are used up for today");
+    }
+    let answer = resolve_here(&name).await;
+    let charged = charge_for(&answer, cost);
+    let receipt = crate::cluster::record::Record::CreditReceipt {
+        payer: peer,
+        offer_seq: seq,
+        charged_mc: charged,
+        answered: if charged > 0 { vec![price::RESOLVE.into()] } else { vec![] },
+    };
+    let charged = match crate::cluster::repl::append(node, &[receipt]).await {
+        Ok(_) => charged,
+        Err(e) => {
+            tracing::warn!(?e, "resolve receipt not written");
+            0
+        }
+    };
+    match answer {
+        Ok(addrs) => ResolveResp { addrs, error: None, charged_mc: charged },
+        Err(e) => ResolveResp::refused(&e),
+    }
+}
+```
+
+`src/cluster/rpc/mod.rs::resolve` becomes `Cbor(crate::intel::dns::serve_resolve(&node, peer, &req).await).into_response()` with the doc "A host name resolved for a member, paid with the offer it names; it never scans, probes or stores anything." Remove `take_free_resolve`, the `free_resolves` field and its initialisation from `src/cluster/mod.rs` (`take_free` stays for lookups).
+
+- [ ] **Step 5: The asker's side**
+
+```rust
+/// What `id` announces for resolving a name; None: no price, or it
+/// predates the market.
+pub fn resolver_price(node: &Node, id: &NodeId) -> Option<u32> {
+    let m = node.members().get(id).cloned()?;
+    if !crate::credits::pay::pays_with(m.proto_max) {
+        return None;
+    }
+    node.status
+        .known(id)?
+        .hb
+        .prices
+        .iter()
+        .find(|(g, _)| g == crate::credits::price::RESOLVE)
+        .map(|(_, mc)| *mc)
+        .filter(|mc| *mc > 0)
+}
+
+/// The candidates that can be paid, in their order.
+fn keep_priced(candidates: Vec<(Resolver, bool)>) -> Vec<Resolver> {
+    candidates.into_iter().filter(|(_, priced)| *priced).map(|(r, _)| r).collect()
+}
+```
+
+In `choose`, keep this node and filter the others before `pick`: build `others` as `(resolver(id), resolver_price(node, &id).is_some())` and pass `keep_priced(...)` on. In `ask`, take the price, write the offer, and name it:
+
+```rust
+async fn ask(node: &Arc<Node>, id: NodeId, name: &str) -> (NodeId, Result<Vec<IpAddr>, String>) {
+    let Some(addr) = node.dial_address(&id) else {
+        return (id, Err("cannot be dialled from here".into()));
+    };
+    let Some(price) = resolver_price(node, &id) else {
+        return (id, Err("announces no price for resolving".into()));
+    };
+    let seq = match crate::credits::pay::make_offer(node, id, price as u64).await {
+        Ok(seq) => seq,
+        Err(why) => return (id, Err(why)),
+    };
+    let req = ResolveReq { name: name.to_string(), offer_seq: Some(seq) };
+    let call = node.call::<ResolveReq, ResolveResp>(id, &addr, "/rpc/v1/resolve", &req);
+    let answer = match tokio::time::timeout(crate::intel::lookup::RPC_TIMEOUT, call).await {
+        Err(_) => Err("did not answer in time".into()),
+        Ok(Err(e)) => Err(format!("could not be asked: {e:#}")),
+        Ok(Ok(ResolveResp { error: Some(e), .. })) => Err(e),
+        Ok(Ok(ResolveResp { addrs, .. })) => Ok(addrs),
+    };
+    (id, answer)
+}
+```
+
+A resolver that times out never writes a receipt; the asker's offer lapses after 15 minutes and costs nothing.
+
+- [ ] **Step 6: Run the focused tests**
+
+Run: `export PATH=$HOME/.cargo/bin:$PATH; cargo test --lib intel::dns && cargo test --lib admin::lookup`
+Expected: PASS. (The `admin::lookup` resolve test runs standalone or with no priced members, so only this node answers.)
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A src
+git commit -m "Domain resolution is paid to each other resolver: offer per resolver, charged only for an answer"
+```
+
+---
+
+### Task 6: Protocol gate and the cluster tests
+
+**Files:**
+- Modify: `src/cluster/rpc/proto.rs`, `src/credits/pay.rs` (`quotes`, `accept_offer`, `pays_with`), every payment check on `OWNER_PROTO` in `src/scan/probe/`
+- Modify: `tests/cluster.rs` (`grant_scans` at line ~4877 and the credit tests from line ~4844 to ~5500)
+
+**Interfaces:**
+- Consumes: `proto::MARKET_PROTO`, `pay::pays_with` (Task 3).
+- Produces: `proto::PROTO_VERSION = 4`.
+
+- [ ] **Step 1: Write the failing unit test** (in `src/credits/pay.rs` tests)
 
 ```rust
     #[test]
@@ -1220,80 +1484,197 @@ git commit -m "Scan jobs are paid: arbiters fund grants within scan_share, scann
 - [ ] **Step 2: Run to see it fail**
 
 Run: `export PATH=$HOME/.cargo/bin:$PATH; cargo test --lib credits::pay`
-Expected: compile error (`MARKET_PROTO`, `pays_with`).
+Expected: FAIL on the `PROTO_VERSION` assertion.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement the gate**
 
-`src/cluster/rpc/proto.rs`: `pub const PROTO_VERSION: u32 = 4;` and
+`src/cluster/rpc/proto.rs`: `pub const PROTO_VERSION: u32 = 4;`.
+
+Use `pays_with` in `pay::quotes` instead of `>= OWNER_PROTO`, and at the top of `accept_offer`:
 
 ```rust
-/// Members from this version count balances with the market's rules
-/// (`credits::mint`): payments go only between them.
-pub const MARKET_PROTO: u32 = 4;
+    if !node.members().get(&peer).is_some_and(|m| pays_with(m.proto_max)) {
+        release(node, peer, offer_seq).await;
+        return why("your node predates the market (protocol 4): upgrade it to pay here".into());
+    }
 ```
 
-`src/credits/pay.rs`:
+Run `grep -rn "OWNER_PROTO" src/scan src/credits src/intel` and replace each check that guards a payment or a price with `pays_with(m.proto_max)`.
+
+- [ ] **Step 4: Seed balances with the mint in the cluster tests**
+
+Replace `grant_scans` in `tests/cluster.rs`:
 
 ```rust
-/// Whether a member announcing `proto_max` counts balances as this node does.
-pub fn pays_with(proto_max: u32) -> bool {
-    proto_max >= crate::cluster::rpc::proto::MARKET_PROTO
+/// Counted scans of `node` two days ago (a closed day), for a trap that
+/// is no test node: `node` gets that day's mint, shared with every other
+/// node granted scans in the same test by their numbers of scans.
+async fn grant_scans(on: &[&TestNode], node: NodeId, scans: u32) {
+    use peephole::credits::DAY_MS;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let first = NEXT.fetch_add(scans as u64, std::sync::atomic::Ordering::SeqCst);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let day = now_ms / DAY_MS - 2;
+    let trap = NodeId([0xEE; 32]);
+    for n in on {
+        for i in 0..scans as u64 {
+            let k = first + i;
+            sqlx::query(
+                "INSERT INTO credit_scans
+                   (scan_uid, job_uid, ip, scanner, trap, hlc, level, job_level, args_ok, judged_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 1, 1, 1, datetime('now'))",
+            )
+            .bind(format!("granted-{k}"))
+            .bind(format!("granted-job-{k}"))
+            .bind(format!("100.64.{}.{}", k / 250, k % 250))
+            .bind(&node.0[..])
+            .bind(&trap.0[..])
+            .bind((((day * DAY_MS + 3_600_000 + k) << 16) as i64))
+            .execute(&n.store.pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
+/// What a node granted `scans` of `total` scans in a test holds from the mint.
+fn minted(scans: u64, total: u64) -> u64 {
+    peephole::credits::mint::MINT_PER_DAY * scans / total
 }
 ```
 
-Use it in `quotes` (instead of `>= OWNER_PROTO`) and at the top of `accept_offer` (decline with "your node predates the market (protocol 4): upgrade it to pay here", releasing the offer). Run `grep -rn "OWNER_PROTO" src/scan src/credits src/intel` and replace each check that guards a payment or a price with `pays_with`. `jobs::fund` and `price::refresh` already compare with `MARKET_PROTO`.
+Then run `cargo test --test cluster credit` (and the other names below) and update each expectation:
+- A balance seeded as `10_000` (8 scans) becomes `minted(8, 8)`; where two nodes were granted scans in one test, use `minted(theirs, all)`.
+- A server's gain `cost / 2` becomes `cost`; `a_lookup_answered_by_the_nodes_own_provider_costs_half_net` becomes `..._costs_nothing_net` with `book.balance(&a.id) == minted(8, 8)` and no `destroyed`.
+- `announced_prices_follow_the_clusters_earnings` becomes `announced_prices_follow_demand_and_supply`: after `price::refresh`, the heartbeat of `a` carries a positive price for `abuseipdb` and `maxmind-geolite2` (paid, `offer_per_day` supply) and none above 0 for `tor`; after noting demand far above supply (`na.node.market.note("abuseipdb", 10_000)`) and refreshing again, the `abuseipdb` price rose.
+- `a_paid_lookup_moves_credits_from_the_asker_to_the_server`: `book.balance(&b.id) == cost` (b was granted no scans).
+- `an_old_version_member_is_not_asked_for_paid_lookups`: the old member announces protocol 3.
 
-- [ ] **Step 4: Cluster test**
+Add one test:
 
-Run `grep -n "credit\|offer" tests/cluster.rs | head -40` to find the paid-lookup test. Extend it (or add a test next to it) so that, after a paid lookup between two nodes, the server's balance grew by exactly what the asker's shrank (no half destroyed). Use the helpers that test already uses.
+```rust
+/// A paid lookup moves exactly the price: what the asker loses, the
+/// server gains.
+#[tokio::test]
+async fn a_payment_destroys_nothing() {
+    use peephole::credits::{self, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    let none: peephole::intel::Providers = vec![];
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, "203.0.113.78".parse().unwrap()).await;
+    let cost = answers.iter().find(|x| x.node == "node-bravo").unwrap().charged_mc as u64;
+    assert!(cost > 0);
+    eventually("the receipt arrived", || async {
+        credits::book_fresh(&na.node).await.unwrap().balance(&b.id) == cost
+    })
+    .await;
+    let book = credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(book.balance(&a.id) + book.balance(&b.id), minted(8, 8));
+}
+```
 
 - [ ] **Step 5: Run the focused tests**
 
-Run: `export PATH=$HOME/.cargo/bin:$PATH; cargo test --lib credits::pay && cargo test --test cluster credit`
+Run: `export PATH=$HOME/.cargo/bin:$PATH; cargo test --lib credits::pay && cargo test --test cluster credit && cargo test --test cluster lookup && cargo test --test cluster price && cargo test --test cluster resolve`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add -A src tests
-git commit -m "Protocol 4: payments only between nodes that count with the market's rules"
+git commit -m "Protocol 4: payments only between nodes that count with the market's rules; cluster tests seed balances with the mint"
 ```
 
 ---
 
-### Task 6: The Credits page shows the market
+### Task 7: The Credits page shows the market
 
 **Files:**
 - Modify: `src/admin/credits.rs`, `templates/admin_cluster_credits.html`
 
 **Interfaces:**
-- Consumes: `Book.minted`, `Book.allowances`, `mint::closed`, `mint::end_of`, `price::Table`, `ledger::Tally`.
+- Consumes: `Book.minted`, `Book.allowances`, `mint::closed`, `price::Table` (`scan_mc`, `scan_bids`, `capacity`, `probe_mc`, `resolve_mc`, `offers`), `ledger::Tally.served`.
 
-- [ ] **Step 1: Write the failing render test** (in `src/admin/credits.rs` tests; follow the render-test helpers used by the other admin pages, e.g. `grep -rn "fn render_" src/admin | head`)
+- [ ] **Step 1: Write the failing render test** (in `src/admin/credits.rs` tests)
 
-The test renders `CreditsPage` with: one mint row (`"2026-10-06"`, `"250.00"`), one allowance row, an accruing line for today (`"12 scans counted so far"`), circulation `"812.00"`, a scan price `"0.05"` and one member income row (`mint "250.00"`, `allowance "5.00"`, `sales "1.20"`), and asserts each string appears and that "destroyed" does not.
+```rust
+    #[test]
+    fn the_page_shows_where_credits_come_from() {
+        use askama::Template;
+        let page = CreditsPage {
+            chrome: crate::admin::views::Chrome::new(true, "admin"),
+            balance: "1250.00".into(),
+            held: "0.00".into(),
+            days: vec![],
+            fleet: None,
+            earned: vec![],
+            waiting: 0,
+            spent: vec![],
+            moved: vec![],
+            members: vec![MemberRow {
+                key: "k".into(),
+                name: "node-alpha".into(),
+                balance: "1250.00".into(),
+                earned: "255.00".into(),
+                spent: "0.00".into(),
+                standing: String::new(),
+                minted: "250.00".into(),
+                allowance: "5.00".into(),
+                sales: "1.20".into(),
+            }],
+            totals: ("255.00".into(), "812.00".into()),
+            price: PriceView {
+                scan: "0.05".into(),
+                scan_bids: 3,
+                capacity_per_hour: "40".into(),
+                utilization: "12".into(),
+                probe: None,
+                resolve: "0.01".into(),
+                offers: vec![("MaxMind GeoLite2".into(), "0.02".into(), "1000".into())],
+            },
+            receivers: vec![],
+            income: vec![("2026-10-06".into(), "250.00".into(), "5.00".into())],
+            accruing: (12, true),
+        };
+        let html = page.render().unwrap();
+        for want in ["2026-10-06", "250.00", "5.00", "1.20", "812.00", "0.05", "12 scans counted so far", "1000 credits are split among the scanners"] {
+            assert!(html.contains(want), "{want} missing");
+        }
+        assert!(!html.contains("destroyed"));
+    }
+```
+
+Adjust the field list to the struct's actual fields after Tasks 1–3 (they are the ones named here).
 
 - [ ] **Step 2: Run to see it fail**
 
 Run: `export PATH=$HOME/.cargo/bin:$PATH; cargo test --lib admin::credits`
-Expected: FAIL.
+Expected: compile errors (`income`, `accruing`, `minted`, `resolve`).
 
 - [ ] **Step 3: Implement**
 
-`CreditsPage` gains:
+`CreditsPage` gains `income: Vec<(String, String, String)>` (this node's closed days, newest first: date, its mint share, its allowance, from `book.minted`/`book.allowances` grouped by `day_of(hlc)`) and `accruing: (u32, bool)` (today's counted scans of this node: `book.paid` with `weight > 0`, `scanner == me` and today's day; whether this node recorded a request today, from `mint::active_days(pool, &[me], today, today)`). `MemberRow` gains `minted`, `allowance` (sums over the last 7 days per node) and `sales` (`week_tally(..).served`). `PriceView` gains `resolve` (`show(t.resolve_mc)`).
 
-```rust
-    /// This node's mint and allowance per closed day: `(date, mint, allowance)`.
-    income: Vec<(String, String, String)>,
-    /// Today: scans of this node counted so far, and the allowance pending.
-    accruing: (u32, bool),
-    /// Per member over 7 days: mint, allowance, sales (charged to others).
-    members: Vec<MemberRow>,
+Template: a section "Where credits come from" before the balance tables:
+
+```html
+<p>Every day 1000 credits are split among the scanners by the scans that counted. Every member that earns here and recorded a request gets 5 credits a day. A credit is gone 7 days after the day it was minted; nothing else destroys it.</p>
+<p>Today: {{ accruing.0 }} scans counted so far{% if accruing.1 %}, and the allowance{% endif %}; credited when the day ends (UTC).</p>
+<table>
+  <thead><tr><th>Day</th><th class="num">Mint</th><th class="num">Allowance</th></tr></thead>
+  {% for (d, m, a) in income %}<tr><td>{{ d }}</td><td class="num">{{ m }}</td><td class="num">{{ a }}</td></tr>{% endfor %}
+</table>
 ```
 
-`MemberRow` gets `minted`, `allowance`, `sales` (from `book.minted`/`book.allowances` summed per node over the last 7 days, and `week_tally(..).served`). The template gets a section "Where credits come from" with the two doors and expiry in three sentences:
-"Every day 1000 credits are split among the scanners by the scans that counted. Every member that earns here and recorded a request gets 5 credits a day. A credit is gone 7 days after the day it was minted; nothing else destroys it."
-and the tables above. Today's line: "Today: {{ accruing.0 }} scans counted so far; the share is credited when the day ends (UTC)."
+The members table gets the columns "Mint", "Allowance", "Sales" (7 days). The price list adds "Resolving a name costs **{{ price.resolve }}** credits here."
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -1309,7 +1690,7 @@ git commit -m "Credits page: mint, allowance, income by source and the market's 
 
 ---
 
-### Task 7: Docs and changelog
+### Task 8: Docs and changelog
 
 **Files:**
 - Modify: `docs/cluster.md` (section "Credits: lookups are paid with scans", lines 149–239), `README.md` (line ~105), `CHANGELOG.md` (Unreleased), `docs/superpowers/specs/2026-10-07-dynamic-market-design.md` (status line)
@@ -1319,15 +1700,16 @@ git commit -m "Credits page: mint, allowance, income by source and the market's 
 Title "Credits: a market for the cluster's work". Bullets in the section's existing style, each a bold lead and plain sentences:
 - **Where credits come from.** The daily mint (1000 credits split among scanners by counted scans of the day; levels 3 and 4 count twice; a scan of a node's own job never counts; one counted scan per address in 24 hours, 500 a day per scanner) and the allowance (5 credits a day for every member that earns here and recorded a request that day). Both are credited when the UTC day ends.
 - **Where they go.** A credit is gone 7 days after its day. Payments move the full price.
-- **Prices.** One rule per good, hourly, per node: excess demand raises a price by at most a factor of e^0.45 an hour, excess supply lowers it, never under 0.001 credits. Goods without a supply limit (providers without a budget, name resolution) are free.
+- **Prices.** One rule per good, hourly, per node: excess demand raises a price by at most a factor of e^0.45 an hour, excess supply lowers it, never under 0.001 credits. Free: the Tor exit list, RDAP and Shodan InternetDB (no account or key). Everything else is paid, GeoLite2 included; a provider without an API budget and name resolution use `[enrichment] offer_per_day` (default 1000) as their supply.
+- **Domains.** Each other resolver is paid its announced price; a failed resolution costs nothing; this node's own resolver is free.
 - **Scan jobs.** The arbiter funds its jobs up to `[credits] scan_share` (default half) of its balance; funded jobs are offered to scanners first; the scanner charges on delivery; a scan offer lapses after 12 hours.
-- Keep, updated: conformity and audits, budgets, known addresses, domains, collecting node, two histories.
+- Keep, updated: conformity and audits, budgets, known addresses, collecting node, two histories.
 - **What this cannot do**: replace the trap-share and price-claim items with the spec's §8 items (manufactured requests, two keys of one operator, many keys, free riders, small allowances, no outside value, constants from a simulation); keep the others that still hold.
 - **Upgrading.** Protocol 4: payments only between upgraded nodes; upgrade all nodes together; balances are recounted at start.
 
 - [ ] **Step 2: README and CHANGELOG**
 
-README line on credits: "lookups, probes and scan jobs are paid with credits; scanners earn most of them, every member a little." CHANGELOG under Unreleased, "Changed": the dynamic market in five bullets (mint, allowance, market prices, paid scan jobs, no burn) and "Upgrade all nodes together: protocol 4 pays only between upgraded nodes."
+README line on credits: "lookups, probes and scan jobs are paid with credits; scanners earn most of them, every member a little." CHANGELOG under Unreleased, "Changed": the dynamic market in six bullets (mint, allowance, market prices with `offer_per_day`, paid scan jobs, paid resolution and GeoLite2, no burn) and "Upgrade all nodes together: protocol 4 pays only between upgraded nodes."
 
 - [ ] **Step 3: Spec status**
 

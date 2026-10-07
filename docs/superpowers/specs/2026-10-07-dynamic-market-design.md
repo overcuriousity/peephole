@@ -137,14 +137,25 @@ level against the money supply.
   50 % destruction goes: the server keeps the full charged amount.
 - **Probes.** Priced like a provider named `probe` on each scanner, with
   its probe slots as supply.
-- **Goods without a supply limit cost nothing.** A provider without a
-  daily budget on the serving node (Tor exit list, RDAP, GeoLite2,
-  InternetDB as configured) and domain resolution have unlimited supply,
-  and the market price of an unlimited good is zero. They stay free,
-  served without offers under the existing hourly limit
-  (`pay::FREE_PER_HOUR`): a paid entry pair in the replicated log for
-  every free answer would only bloat the log. The Lookup page runs every
-  free provider by itself.
+- **Free: what needs no setup.** The Tor exit list, RDAP and Shodan
+  InternetDB need no account or key; they stay free, served without
+  offers under the existing hourly limit (`pay::FREE_PER_HOUR`), and the
+  Lookup page runs them by itself. A provider is marked free in
+  `intel::KNOWN_PROVIDERS` (`free: bool`). InternetDB's on-demand share
+  still protects its budget.
+- **Everything else is paid**, GeoLite2 included: its operator set up an
+  account and a key.
+- **Supply without an API budget.** A paid provider without a daily API
+  budget (GeoLite2) and domain resolution use the operator's
+  `[enrichment] offer_per_day` (default 1000) as their daily supply on
+  that node. A node that offers more is cheaper; askers go to the
+  cheapest server first, so many generous nodes lower the price.
+- **Domain resolution** is paid to each other resolver: the asker offers
+  each its announced `resolve` price, the resolver charges it when it
+  answers and nothing when it fails. This node's own resolver costs
+  nothing. Resolvers that announce no price, or predate the market, are
+  not chosen. The free hourly resolution allowance (`take_free_resolve`)
+  goes.
 - **Budgets stay safe.** `[enrichment] on_demand_share` still caps what
   paid lookups take of each API budget; the share is the supply.
 - **Answers already held** (fresh under 24 h, replicated) are shown free.
@@ -161,7 +172,8 @@ with D and S over the last hour:
 | Good | Demand D | Supply S |
 |---|---|---|
 | Scan (one price per node, cluster-wide inputs) | Funded jobs waiting: the sum of the `scan_bids` arbiters announce (new heartbeat field: jobs they would fund at their price now) | Scans an hour the live, counted scanners can do (`price::capacity`, existing) |
-| Provider p on this node | Paid requests for p offered to this node | Its on-demand allowance per hour; without a budget the price is 0 |
+| Paid provider p on this node | Paid requests for p offered to this node | Its on-demand share of the API budget per hour, or `offer_per_day` / 24 without a budget |
+| Resolution on this node | Paid resolve requests to it | `offer_per_day` / 24 |
 | Probe on this scanner | Probe offers to it | Its probe slots × 30 an hour (`PROBE_TIMEOUT` is 2 minutes) |
 
 - **Requests from this node's own siblings** are not counted as demand,
@@ -198,7 +210,7 @@ the same rules; its changelog says so.
   sees for scans and each provider over 7 days, and income by source
   (mint, allowance, sales) for each member. Why a scan did not count
   (existing notes) stays, plus "same owner as the trap".
-- **Config file**: `[credits] scan_share`.
+- **Config file**: `[credits] scan_share`, `[enrichment] offer_per_day`.
 - `docs/cluster.md` Credits section rewritten to the four laws; README
   line on credits; CHANGELOG.
 
@@ -227,6 +239,7 @@ the same rules; its changelog says so.
 
 ## 9. Testing
 
+- Providers: free ones need no offer; GeoLite2 and resolution use `offer_per_day`; a paid resolution is charged only when answered.
 - `earn`: own-job rule, level weights,
   the mint split of a day (shares sum to `MINT_PER_DAY`, empty day mints
   nothing), late scans shifting shares.
