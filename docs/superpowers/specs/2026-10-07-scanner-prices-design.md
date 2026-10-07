@@ -143,8 +143,9 @@ drifted from the arbiter's copy is paid at most a little less.
 A node with `collect_to` set (another node of its fleet):
 
 - **Budget**: `scan_share` × (its own balance + its collecting node's
-  balance divided by the number of nodes of its fleet that forward to
-  it), less what its scan offers and own jobs hold and were charged
+  balance divided by the number of its siblings, `owner::fleet::siblings`;
+  whether a sibling forwards is its own setting and not known here),
+  less what its scan offers and own jobs hold and were charged
   today. Every node computes any member's balance from its log.
 - **Scan float**: once an hour, after the price step, it draws from its
   collecting node what its queued jobs need at the cheapest scanner's
