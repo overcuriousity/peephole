@@ -58,6 +58,9 @@
 # download executes nothing rather than half a script. With PEEPHOLE_NO_MAIN=1
 # sourcing it only defines the helpers above main (tests/deploy-check.sh).
 set -euo pipefail
+# A preset admin password stays a shell variable: no command this script
+# runs gets it in its environment (it reaches peephole on stdin only).
+export -n PEEPHOLE_ADMIN_PASSWORD
 
 # Pull the one-time setup token out of journal output. journalctl's default
 # format prefixes every line with a timestamp/host/unit, so match the UUID
@@ -675,6 +678,11 @@ nginx_preflight() {
         # no interface shows.
         resolved="$(getent ahosts "$PEEPHOLE_DOMAIN" 2>/dev/null | awk '{print $1}' || true)"
         why="$(dns_problem "$PEEPHOLE_DOMAIN" "$resolved" "${if_addrs:-} ${DETECTED_OWN:-} ${OWN_ADDRESSES:-}")"
+        # Without either of the last two (a web-only node is not asked for
+        # them) a public address behind NAT is invisible here.
+        if [[ "$why" == *" points to "* ]] && [ -z "${DETECTED_OWN:-}" ] && [ -z "${OWN_ADDRESSES:-}" ]; then
+            why+=" (behind NAT or port forwarding this check cannot see the public address)"
+        fi
         if [ -n "$why" ]; then
             preflight_problem "$why"
         else
@@ -1050,8 +1058,6 @@ if [ "$upgrade" -ne 1 ]; then
         if [ -n "${PEEPHOLE_ADMIN_PASSWORD:-}" ] && [ "${#PEEPHOLE_ADMIN_PASSWORD}" -lt 12 ]; then
             die "PEEPHOLE_ADMIN_PASSWORD: at least 12 characters"
         fi
-        # Not in the environment of the commands run before it is used.
-        export -n PEEPHOLE_ADMIN_PASSWORD
     fi
     # nginx is set up only where it fronts something peephole serves: the
     # admin site, or a trap behind nginx on this machine (local). Not for a
@@ -1122,6 +1128,16 @@ if [ "$upgrade" -ne 1 ]; then
     toml_safe "${PEEPHOLE_CLUSTER_NAME:-}"; toml_safe "${PEEPHOLE_CLUSTER_LISTEN:-}"; toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"
     toml_safe "${MAXMIND_ACCOUNT_ID:-}"; toml_safe "${MAXMIND_LICENSE_KEY:-}"
     toml_safe "${ABUSEIPDB_API_KEY:-}"; toml_safe "${SHODAN_API_KEY:-}"
+fi
+# A preset password that nothing will use is dropped here.
+if [ -n "${PEEPHOLE_ADMIN_PASSWORD:-}" ]; then
+    if [ "$upgrade" -eq 1 ]; then
+        warn "PEEPHOLE_ADMIN_PASSWORD is ignored: only a first install sets it; on this node use: peephole admin password"
+        unset PEEPHOLE_ADMIN_PASSWORD
+    elif ! has_role web; then
+        warn "PEEPHOLE_ADMIN_PASSWORD is ignored: this node has no web interface"
+        unset PEEPHOLE_ADMIN_PASSWORD
+    fi
 fi
 # The wizard is done (or was skipped on an upgrade); closing an fd that was never opened is harmless.
 exec 3<&-

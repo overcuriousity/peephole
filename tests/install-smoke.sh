@@ -450,6 +450,31 @@ grep -q 'Also allow signing in with a password? \[y/N\]' /tmp/wizard-nginx.log
 if grep -q 'with your password' /tmp/wizard-nginx.log; then echo "password sign-in offered though none was set"; exit 1; fi
 reset_nginx
 
+echo "== wizard password: too short and a mismatch are asked again; the hash is stored"
+reset_install; reset_nginx
+# Web only, the domain preset · password? yes · too short (twice) · two that differ ·
+# the password twice · nginx? no · the rest at its defaults
+# shellcheck disable=SC2016  # quote, backslash, dollar sign and spaces, literally
+wpw='wiz "pass\ $1 ok'
+printf '%s\n' y short short 'longenough-pass-1' 'longenough-pass-2' "$wpw" "$wpw" n > /tmp/answers
+PEEPHOLE_ROLES=web PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard-password.log 2>&1 \
+    || { cat /tmp/wizard-password.log; exit 1; }
+grep -q 'Too short.' /tmp/wizard-password.log
+grep -q 'They differ.' /tmp/wizard-password.log
+if grep -q 'wiz "pass\|longenough' /etc/peephole/config.toml /tmp/wizard-password.log; then
+    echo "the password was written out"; exit 1
+fi
+# shellcheck disable=SC2016  # the dollar signs are literal
+sqlite3 /var/lib/peephole/peephole.db "SELECT value FROM intel_meta WHERE key='admin_password_hash'" | grep -q '^\$argon2id\$'
+[ "$(sqlite3 /var/lib/peephole/peephole.db "SELECT value FROM intel_meta WHERE key='admin_login_method'")" = both ]
+test ! -e /etc/nginx/sites-available/peephole
+
+echo "== unattended password without the web role: ignored, with a warning"
+reset_install
+PEEPHOLE_FRONT=remote PEEPHOLE_ROLES=listener PEEPHOLE_ADMIN_PASSWORD='long enough password' \
+    bash install.sh > /tmp/password-noweb.log 2>&1 || { cat /tmp/password-noweb.log; exit 1; }
+grep -q 'PEEPHOLE_ADMIN_PASSWORD is ignored: this node has no web interface' /tmp/password-noweb.log
+
 echo "== unattended password: hashed, never in the config"
 reset_install
 # shellcheck disable=SC2016  # quote, backslash, dollar sign and spaces, literally
