@@ -4,6 +4,7 @@ pub mod geo;
 pub mod greynoise;
 pub mod lookup;
 pub mod provider;
+pub mod rdap;
 pub mod share;
 pub mod shodan;
 pub mod tor;
@@ -15,6 +16,7 @@ pub const ABUSEIPDB: &str = "abuseipdb";
 pub const SHODAN: &str = "shodan";
 pub const INTERNETDB: &str = "shodan-internetdb";
 pub const GREYNOISE: &str = "greynoise-community";
+pub const RDAP: &str = "rdap";
 
 /// A provider this version knows: results from others are not accepted.
 pub struct ProviderInfo {
@@ -61,6 +63,14 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         redistributable: false,
     },
     ProviderInfo {
+        name: RDAP,
+        label: "RDAP registry",
+        public: false,
+        api: true,
+        tag_prefix: "rdap",
+        redistributable: false,
+    },
+    ProviderInfo {
         name: GREYNOISE,
         label: "GreyNoise Community",
         public: false,
@@ -101,6 +111,7 @@ pub fn tags(provider: &str, data: &serde_json::Map<String, serde_json::Value>) -
         ABUSEIPDB => abuseipdb::tags(data),
         SHODAN | INTERNETDB => shodan::tags(data),
         GREYNOISE => greynoise::tags(data),
+        RDAP => rdap::tags(data),
         _ => vec![],
     }
 }
@@ -116,13 +127,21 @@ use tracing::{debug, info, warn};
 pub type SharedGeo = Arc<RwLock<Option<geo::GeoIp>>>;
 /// Tor exit list shared with the trap.
 pub type SharedTor = Arc<RwLock<tor::TorExitList>>;
+/// RDAP bootstrap shared with the scheduler that refreshes it.
+pub use rdap::SharedRdap;
 
 /// The providers a node was started with.
 pub type Providers = Vec<Arc<dyn provider::Provider>>;
 
 /// The providers this node can run: the local databases always, the API
 /// providers that have a config section (and, for InternetDB, `enabled`).
-pub fn providers(cfg: &Config, store: &Store, geo: &SharedGeo, tor: &SharedTor) -> Providers {
+pub fn providers(
+    cfg: &Config,
+    store: &Store,
+    geo: &SharedGeo,
+    tor: &SharedTor,
+    rdap: &SharedRdap,
+) -> Providers {
     use api::{ApiProvider, Limit, Period};
     let daily = |max: u64| -> Vec<Limit> {
         (max > 0)
@@ -137,6 +156,7 @@ pub fn providers(cfg: &Config, store: &Store, geo: &SharedGeo, tor: &SharedTor) 
     let mut out: Providers = vec![
         Arc::new(provider::MaxMind(geo.clone())),
         Arc::new(provider::TorExits(tor.clone())),
+        Arc::new(rdap::Rdap::with_shared(rdap.clone())),
     ];
     if let Some(a) = &cfg.abuseipdb {
         out.push(Arc::new(ApiProvider::new(
@@ -183,7 +203,7 @@ pub fn providers(cfg: &Config, store: &Store, geo: &SharedGeo, tor: &SharedTor) 
             refresh,
         )));
     }
-    let api: Vec<&str> = out.iter().skip(2).map(|p| p.name()).collect();
+    let api: Vec<&str> = out.iter().skip(3).map(|p| p.name()).collect();
     if !api.is_empty() {
         info!(providers = ?api, "API enrichment providers configured");
     }
@@ -419,6 +439,27 @@ const MAXMIND_BACKOFF: Backoff =
 /// How often a node checks whether its GeoLite2 databases are stale.
 const MAXMIND_CHECK: Duration = Duration::from_secs(3600);
 
+/// RDAP bootstrap: refreshed weekly, retried like the Tor list.
+const RDAP_BACKOFF: Backoff = Backoff::new(Duration::from_secs(60), Duration::from_secs(3600));
+
+/// Fetch the RDAP bootstrap files and swap them into the shared state;
+/// returns when to ask again.
+async fn refresh_rdap(cfg: &Config, rdap: &SharedRdap, backoff: &mut Backoff) -> Duration {
+    match rdap::Bootstrap::refresh(&cfg.data_dir).await {
+        Ok(()) => {
+            *rdap.write().unwrap() = rdap::Bootstrap::load(&cfg.data_dir);
+            info!("rdap bootstrap refreshed");
+            backoff.reset();
+            rdap::BOOTSTRAP_MAX_AGE
+        }
+        Err(e) => {
+            let wait = backoff.fail();
+            warn!(error = %format!("{e:#}"), retry_in_secs = wait.as_secs(), "rdap bootstrap refresh failed; keeping previous");
+            wait
+        }
+    }
+}
+
 /// `intel_meta` key recording one edition's last successful download.
 fn edition_key(edition: &str) -> String {
     format!("maxmind_last_fetch:{edition}")
@@ -525,18 +566,20 @@ pub async fn run_scheduler(
     cfg: Config,
     geo: SharedGeo,
     tor: SharedTor,
+    rdap: SharedRdap,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let store = rec.store().clone();
     if let Recorder::Cluster(node) = &rec {
-        return run_cluster(node.clone(), cfg, geo, tor, shutdown).await;
+        return run_cluster(node.clone(), cfg, geo, tor, rdap, shutdown).await;
     }
     if cfg.maxmind.is_none() && geo.read().unwrap().is_none() {
         warn!("no [maxmind] credentials and no GeoLite2 databases: GeoIP enrichment is off");
     }
     let now = tokio::time::Instant::now();
-    let (mut tor_next, mut mm_next) = (now, now);
+    let (mut tor_next, mut mm_next, mut rdap_next) = (now, now, now);
     let (mut tor_backoff, mut mm_backoff) = (TOR_BACKOFF, MAXMIND_BACKOFF);
+    let mut rdap_backoff = RDAP_BACKOFF;
     let mut warned = None;
     loop {
         let now = tokio::time::Instant::now();
@@ -580,8 +623,11 @@ pub async fn run_scheduler(
                 }
             }
         }
+        if now >= rdap_next {
+            rdap_next = now + refresh_rdap(&cfg, &rdap, &mut rdap_backoff).await;
+        }
         tokio::select! {
-            _ = tokio::time::sleep_until(tor_next.min(mm_next)) => {}
+            _ = tokio::time::sleep_until(tor_next.min(mm_next).min(rdap_next)) => {}
             _ = shutdown.changed() => { break; }
         }
     }
@@ -667,13 +713,16 @@ async fn run_cluster(
     cfg: Config,
     geo: SharedGeo,
     tor: SharedTor,
+    rdap: SharedRdap,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let me = node.id();
     let mut changes = node.subscribe_changes();
     let now = std::time::Instant::now();
     let (mut tor_next, mut mm_next) = (now, now);
+    let mut rdap_next = now;
     let (mut tor_backoff, mut mm_backoff) = (TOR_BACKOFF, MAXMIND_BACKOFF);
+    let mut rdap_backoff = RDAP_BACKOFF;
     let mut warned = None;
     loop {
         changes.borrow_and_update();
@@ -736,6 +785,11 @@ async fn run_cluster(
                     mm_next = std::time::Instant::now() + wait;
                 }
             }
+        }
+        // Every node keeps its own bootstrap fresh; it is small and public.
+        if std::time::Instant::now() >= rdap_next {
+            rdap_next =
+                std::time::Instant::now() + refresh_rdap(&cfg, &rdap, &mut rdap_backoff).await;
         }
         if let Err(e) =
             note_cluster_intel(&node, &cfg.data_dir, cfg.maxmind.is_some(), &manifests).await

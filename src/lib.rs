@@ -137,6 +137,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let tor = Arc::new(RwLock::new(
         intel::tor::TorExitList::load(&cfg.data_dir).unwrap_or_default(),
     ));
+    let rdap: intel::SharedRdap =
+        Arc::new(RwLock::new(intel::rdap::Bootstrap::load(&cfg.data_dir)));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -163,11 +165,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         cfg.clone(),
         geo.clone(),
         tor.clone(),
+        rdap.clone(),
         shutdown_rx.clone(),
     ));
 
     // Results for IPs this or other nodes recorded without them.
-    let providers = intel::providers(&cfg, &store, &geo, &tor);
+    let providers = intel::providers(&cfg, &store, &geo, &tor, &rdap);
     if let Some(n) = &node {
         n.set_lookup_providers(providers.clone());
         n.set_lookup_shares(credits::share::Shares::new(
