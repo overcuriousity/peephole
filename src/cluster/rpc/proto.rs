@@ -10,6 +10,9 @@ pub const PROTO_MIN: u32 = 2;
 /// A node cannot decode a message kind it does not know, so these go only
 /// to members that announce at least this version.
 pub const OWNER_PROTO: u32 = 3;
+/// Members from this version count balances with the market's rules
+/// (`credits::mint`): payments go only between them.
+pub const MARKET_PROTO: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Hello {

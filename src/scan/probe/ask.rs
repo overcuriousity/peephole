@@ -23,10 +23,11 @@ pub struct Vantage {
     pub dialled: Option<IpAddr>,
 }
 
-/// What a probe at `id` costs, as this node knows it.
+/// What a probe at `id` costs, as this node knows it: nothing at this
+/// node (when it probes), what the member announces elsewhere.
 fn price_at(node: &Node, id: &NodeId) -> Option<u32> {
     if *id == node.id() {
-        return Some(node.prober()?.price(&node.price_table()));
+        return node.prober().map(|_| 0);
     }
     node.status.known(id)?.hb.probe_price_mc
 }
@@ -102,7 +103,8 @@ pub struct Asked {
     pub outcome: Result<String, String>,
 }
 
-/// One offer of `price` to `server` and one request naming it.
+/// One offer of `price` to `server` and one request naming it; this
+/// node's own prober is asked without an offer (free).
 async fn offer_once(
     node: &Arc<Node>,
     prober: Option<&Arc<Prober>>,
@@ -116,11 +118,18 @@ async fn offer_once(
         why,
         price_mc: None,
     };
-    let own = match (server == me, prober) {
-        (true, None) => return refused("this node does not probe".into()),
-        (true, Some(p)) => Some(p),
-        (false, _) => None,
-    };
+    if server == me {
+        let Some(p) = prober else {
+            return refused("this node does not probe".into());
+        };
+        let req = ProbeReq {
+            ip: ip.to_string(),
+            group: group.to_string(),
+            offer_seq: None,
+            dialled: None,
+        };
+        return p.serve(node, me, &req).await;
+    }
     let seq = match pay::make_offer(node, server, price).await {
         Ok(seq) => seq,
         Err(why) => return refused(why),
@@ -131,11 +140,8 @@ async fn offer_once(
         offer_seq: Some(seq),
         // As in its `Vantage`: the scanner records it when it has no
         // single public address of its own.
-        dialled: own.is_none().then(|| dialled_ip(node, &server)).flatten(),
+        dialled: dialled_ip(node, &server),
     };
-    if let Some(p) = own {
-        return p.serve(node, me, &req).await;
-    }
     let Some(addr) = node.dial_address(&server) else {
         return refused("the node cannot be dialled from here".into());
     };

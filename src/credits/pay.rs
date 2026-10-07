@@ -2,8 +2,8 @@
 //! `credit_offer` to the server it chose and names that entry in its
 //! request; the server checks the offer against its own book, asks its
 //! providers and writes a `credit_receipt` for what it answered. The
-//! server keeps what it charges. A node's own providers cost the same as
-//! anyone else's.
+//! server keeps what it charges. What a node answers itself is free; what
+//! another node answers is paid, whoever owns it.
 use super::entries::{self, Kind, SealState};
 use super::ledger::OfferState;
 use super::{Mc, price, show};
@@ -20,16 +20,19 @@ use std::time::Duration;
 
 /// How long a server waits for the asker's offer to arrive.
 pub const SERVE_WAIT: Duration = Duration::from_secs(10);
-/// Free lookups (no offer) a member gets an hour.
-pub const FREE_PER_HOUR: usize = 60;
 /// Servers tried for one provider before giving up.
 const MAX_ROUNDS: usize = 3;
 /// A server that turns an offer down names its price; the asker offers it
 /// once more only up to this many times what the server announced. A
-/// price can move within an hour (earnings, load, surge), but the server
+/// price can move between heartbeats, but the server
 /// names it alone: without a bound it could ask for the asker's whole
 /// balance, and the fleet's behind it.
 pub(crate) const RETRY_AT_MOST: Mc = 2;
+
+/// Whether a member announcing `proto_max` counts balances as this node does.
+pub fn pays_with(proto_max: u32) -> bool {
+    proto_max >= crate::cluster::rpc::proto::MARKET_PROTO
+}
 
 /// A node that could answer for a provider, and what it asks.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,21 +60,19 @@ fn cheapest_first(list: &mut [Quote]) {
 }
 
 /// Who could be asked for each provider, cheapest first: this node, if it
-/// serves the provider, and every live member that announces a price for
-/// it and can be asked. Neither this node nor its fleet is preferred.
+/// serves the provider (for nothing: it answers itself), and every live
+/// member that announces a price for it and can be asked (never less than
+/// the floor: what another node answers is paid).
 pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
     let me = node.id();
     let mut out: HashMap<String, Vec<Quote>> = HashMap::new();
-    let table = node.price_table();
     for p in own.iter().filter(|p| p.ready()) {
         let name = p.name();
         out.entry(name.to_string()).or_default().push(Quote {
             provider: name.to_string(),
             server: me,
             server_name: "this node".into(),
-            price_mc: table
-                .price_of(name)
-                .unwrap_or_else(|| price::price(name, table.unit, 1)),
+            price_mc: 0,
         });
     }
     let members = node.members();
@@ -95,7 +96,7 @@ pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
                 provider: provider.clone(),
                 server: id,
                 server_name: m.name.clone(),
-                price_mc: *price_mc,
+                price_mc: (*price_mc).max(price::PRICE_FLOOR as u32),
             });
         }
     }
@@ -414,11 +415,8 @@ pub async fn serve(
         }
     };
     let table = node.price_table();
-    let price_of = |name: &str| -> Mc {
-        table
-            .price_of(name)
-            .unwrap_or_else(|| price::price(name, table.unit, 1)) as Mc
-    };
+    let price_of =
+        |name: &str| -> Mc { table.price_of(name).unwrap_or(price::PRICE_FLOOR as u32) as Mc };
     let shares = node.lookup_shares();
     let provider = |name: &str| providers.iter().find(|p| p.name() == name);
     // Providers whose on-demand share is spent are declined one by one;
@@ -440,6 +438,9 @@ pub async fn serve(
         }
     }
     let total: Mc = asking.iter().map(|n| price_of(n)).sum();
+    for name in &all {
+        node.market.note(name, 1);
+    }
     let acc = match accept_offer(node, peer, offer_seq, total, "lookup", SERVE_MARGIN_MS).await {
         Ok(a) => a,
         Err(Declined::Why(why)) => {
@@ -529,11 +530,10 @@ pub async fn serve(
     resp
 }
 
-/// Offer `total_mc` to `server` for `providers` and ask it once. The
-/// answer carries what it charged; a refusal says why.
+/// Offer `total_mc` to `server` (another node) for `providers` and ask it
+/// once. The answer carries what it charged; a refusal says why.
 pub async fn offer_and_ask(
     node: &Arc<Node>,
-    own: &Providers,
     ip: IpAddr,
     server: NodeId,
     providers: &[String],
@@ -543,7 +543,6 @@ pub async fn offer_and_ask(
         declined: providers.iter().map(|p| (p.clone(), why.clone())).collect(),
         ..Default::default()
     };
-    let me = node.id();
     let seq = match make_offer(node, server, total_mc).await {
         Ok(seq) => seq,
         Err(why) => return decline(why),
@@ -553,10 +552,7 @@ pub async fn offer_and_ask(
         providers: providers.to_vec(),
         offer_seq: Some(seq),
     };
-    let mut resp = if server == me {
-        let _ = own;
-        crate::intel::lookup::serve(node, me, &req).await
-    } else {
+    let mut resp = {
         let Some(addr) = node.dial_address(&server) else {
             return decline("the node cannot be dialled from here".into());
         };
@@ -595,41 +591,14 @@ async fn ask_server(
 ) -> LookupResp {
     let names: Vec<String> = quotes.iter().map(|q| q.provider.clone()).collect();
     let total: Mc = quotes.iter().map(|q| q.price_mc as Mc).sum();
-    let me = node.id();
-    if total == 0 {
-        // Free providers need no offer.
-        let req = LookupReq {
-            ip: ip.to_string(),
-            providers: names.clone(),
-            offer_seq: None,
-        };
-        if server == me {
-            return crate::intel::lookup::local(own, &ip, &names).await;
-        }
-        let Some(addr) = node.dial_address(&server) else {
-            return LookupResp::default();
-        };
-        let call = node.call::<LookupReq, LookupResp>(server, &addr, "/rpc/v1/lookup", &req);
-        return match tokio::time::timeout(crate::intel::lookup::RPC_TIMEOUT, call).await {
-            Ok(Ok(mut r)) => {
-                r.findings.retain(|f| {
-                    names.contains(&f.provider) && provider_info(&f.provider).is_some()
-                });
-                r
-            }
-            _ => LookupResp {
-                declined: names
-                    .iter()
-                    .map(|n| (n.clone(), "could not be asked".into()))
-                    .collect(),
-                ..Default::default()
-            },
-        };
+    if server == node.id() {
+        // What this node answers itself is free: no offer.
+        return crate::intel::lookup::local(own, &ip, &names).await;
     }
-    let first = offer_and_ask(node, own, ip, server, &names, total).await;
+    let first = offer_and_ask(node, ip, server, &names, total).await;
     match retry_price(total, first.price_mc, first.findings.is_empty()) {
         // Its price moved since its heartbeat: offer that, once.
-        Some(p) => offer_and_ask(node, own, ip, server, &names, p).await,
+        Some(p) => offer_and_ask(node, ip, server, &names, p).await,
         None => first,
     }
 }
@@ -642,14 +611,29 @@ pub(crate) fn retry_price(offered: Mc, named: Option<u32>, nothing_answered: boo
     (nothing_answered && p > offered && p <= offered.saturating_mul(RETRY_AT_MOST)).then_some(p)
 }
 
+/// The next server to ask for a provider: the cheapest in `list` not yet
+/// `seen`; another node only when the provider is `picked` to be paid for.
+fn next_server<'a>(
+    list: &'a [Quote],
+    seen: &HashSet<NodeId>,
+    me: NodeId,
+    picked: bool,
+) -> Option<&'a Quote> {
+    list.iter()
+        .find(|q| !seen.contains(&q.server))
+        .filter(|q| q.server == me || picked)
+}
+
 /// The asking side: for each provider in `wanted` that somebody serves,
 /// ask the cheapest server (and the next cheapest when it declines), and
-/// pay what each asks. One answer per server asked.
+/// pay what each asks. Servers other than this node are asked only for
+/// the providers in `paid`. One answer per server asked.
 pub async fn ask(
     node: &Arc<Node>,
     own: &Providers,
     ip: IpAddr,
     wanted: &[String],
+    paid: &[String],
 ) -> Vec<NodeAnswer> {
     let me = node.id();
     let mut remaining: Vec<String> = wanted.to_vec();
@@ -663,7 +647,7 @@ pub async fn ask(
             let seen = tried.entry(p.clone()).or_default();
             let Some(q) = all
                 .get(p)
-                .and_then(|list| list.iter().find(|q| !seen.contains(&q.server)))
+                .and_then(|list| next_server(list, seen, me, paid.contains(p)))
             else {
                 continue;
             };
@@ -773,5 +757,28 @@ mod tests {
             first.insert(same[0].server);
         }
         assert_eq!(first.len(), 2);
+    }
+
+    #[test]
+    fn a_provider_not_picked_is_asked_only_at_this_node() {
+        let me = NodeId([1; 32]);
+        let list = vec![q("rdap", 1, 0), q("rdap", 2, 300)];
+        let none = HashSet::new();
+        let tried: HashSet<NodeId> = [me].into();
+        // Not picked: this node, and no fallback when it gave no answer.
+        assert_eq!(
+            next_server(&list, &none, me, false).map(|q| q.server),
+            Some(me)
+        );
+        assert_eq!(next_server(&list, &tried, me, false), None);
+        // Picked: the member is the fallback.
+        assert_eq!(
+            next_server(&list, &none, me, true).map(|q| q.server),
+            Some(me)
+        );
+        assert_eq!(
+            next_server(&list, &tried, me, true).map(|q| q.server),
+            Some(NodeId([2; 32]))
+        );
     }
 }

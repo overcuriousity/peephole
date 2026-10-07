@@ -176,6 +176,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         n.set_lookup_shares(credits::share::Shares::new(
             store.clone(),
             cfg.enrichment.on_demand_share,
+            cfg.enrichment.offer_per_day,
         ));
     }
     tokio::spawn(intel::enrich_loop(

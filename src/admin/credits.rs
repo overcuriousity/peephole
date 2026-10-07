@@ -104,13 +104,15 @@ struct MemberRow {
 }
 
 struct PriceView {
-    earned_per_day: String,
-    lookups_per_day: String,
+    /// What a funded scan job costs here.
+    scan: String,
+    scan_bids: u32,
+    capacity_per_hour: String,
     utilization: String,
-    load: String,
-    unit: Option<String>,
-    /// `(provider label, price, surge, on-demand a day)`.
-    offers: Vec<(String, String, u32, String)>,
+    /// What a probe costs here; None: this node does not probe.
+    probe: Option<String>,
+    /// `(provider label, price, paid lookups it serves a day)`.
+    offers: Vec<(String, String, String)>,
 }
 
 #[derive(Template)]
@@ -292,25 +294,19 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             .unwrap_or_else(|| p.to_string())
     };
     let price = PriceView {
-        earned_per_day: show(t.earned_per_day),
-        lookups_per_day: format!("{:.0}", t.lookups_per_day),
+        scan: show(t.scan_mc as u64),
+        scan_bids: t.scan_bids,
+        capacity_per_hour: format!("{:.0}", t.capacity.per_day / 24.0),
         utilization: format!("{:.0}", t.capacity.utilization * 100.0),
-        load: format!("{:.2}", t.load),
-        unit: t.unit.map(show),
+        probe: t.probe_mc.map(|m| show(m as u64)),
         offers: t
             .offers
             .iter()
             .map(|o| {
                 (
                     label(&o.provider),
-                    if o.price_mc == 0 {
-                        "free".into()
-                    } else {
-                        show(o.price_mc as u64)
-                    },
-                    o.surge,
-                    o.on_demand
-                        .map_or_else(|| "no limit".to_string(), |n| n.to_string()),
+                    show(o.price_mc as u64),
+                    o.on_demand.to_string(),
                 )
             })
             .collect(),

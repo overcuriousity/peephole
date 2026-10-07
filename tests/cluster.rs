@@ -4785,6 +4785,7 @@ fn serves(
         .set_lookup_shares(peephole::credits::share::Shares::new(
             n.store.clone(),
             share,
+            1000,
         ));
     asked
 }
@@ -5144,14 +5145,13 @@ async fn a_price_above_the_offer_is_declined_and_named() {
         .unwrap();
     assert!(cost > 1);
     price_seen(&na, b.id, "abuseipdb").await;
-    let none: peephole::intel::Providers = vec![];
     let ip = "203.0.113.80".parse().unwrap();
     let wanted = ["abuseipdb".to_string()];
-    let low = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, cost as u64 - 1).await;
+    let low = pay::offer_and_ask(&na.node, ip, b.id, &wanted, cost as u64 - 1).await;
     assert!(low.findings.is_empty());
     assert_eq!((low.price_mc, low.charged_mc), (Some(cost), 0));
     assert_eq!(asked.load(Ordering::SeqCst), 0);
-    let enough = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, cost as u64).await;
+    let enough = pay::offer_and_ask(&na.node, ip, b.id, &wanted, cost as u64).await;
     assert_eq!((enough.findings.len(), enough.charged_mc), (1, cost));
     eventually("a paid once", || async {
         let book = credits::book_fresh(&na.node).await.unwrap();
@@ -5831,14 +5831,13 @@ async fn a_declined_offer_frees_its_credits_for_the_next() {
         .unwrap() as u64;
     assert!(cost > 1 && cost < 600, "{cost}");
     price_seen(&na, b.id, "abuseipdb").await;
-    let none: peephole::intel::Providers = vec![];
     let ip = "203.0.113.81".parse().unwrap();
     let wanted = ["abuseipdb".to_string()];
-    let low = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, cost - 1).await;
+    let low = pay::offer_and_ask(&na.node, ip, b.id, &wanted, cost - 1).await;
     assert_eq!(low.price_mc, Some(cost as u32), "{low:?}");
     // 1250 held: cost - 1 by the first offer. This needs some of it back.
     let more = 1250 - cost + 2;
-    let second = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, more).await;
+    let second = pay::offer_and_ask(&na.node, ip, b.id, &wanted, more).await;
     assert_eq!(
         (second.findings.len(), second.charged_mc as u64),
         (1, cost),
@@ -5868,10 +5867,9 @@ async fn an_offer_declined_for_the_askers_standing_is_released() {
         .execute(&nb.store.pool)
         .await
         .unwrap();
-    let none: peephole::intel::Providers = vec![];
     let ip = "203.0.113.82".parse().unwrap();
     let wanted = ["abuseipdb".to_string()];
-    let r = pay::offer_and_ask(&na.node, &none, ip, b.id, &wanted, cost).await;
+    let r = pay::offer_and_ask(&na.node, ip, b.id, &wanted, cost).await;
     assert!(
         r.findings.is_empty() && r.declined[0].1.contains("not accepted here"),
         "{r:?}"

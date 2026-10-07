@@ -76,17 +76,16 @@
   </table></div>
   <p class="muted">In 7 days earned {{ totals.0 }} · in circulation now {{ totals.1 }} credits. Another node may count differently: it holds other entries, blocks other members, or runs other rules.</p>
 </section>
-<section class="card"><div class="card-head"><h2>What a lookup costs here</h2></div>
+<section class="card"><div class="card-head"><h2>What things cost here</h2></div>
+  <p class="muted">Each price follows demand and supply: it rises when more is asked than this node offers, and falls when less is asked. What this node answers itself is free.</p>
   <ul>
-    <li>The cluster earned <b>{{ price.earned_per_day }}</b> credits a day over the last 7 days.</li>
-    <li>Its members announce <b>{{ price.lookups_per_day }}</b> paid lookups a day (weighted: a keyed API counts 1, Shodan InternetDB and GeoLite2 a quarter).</li>
-    <li>The scanners ran at <b>{{ price.utilization }}%</b> of what they can do: lookups cost <b>{{ price.load }}</b> of the plain price (half when they idle, double when they are saturated).</li>
-    <li>{% if let Some(u) = price.unit %}One weighted lookup costs <b>{{ u }}</b> credits: the price at which a day's earnings buy a day's lookups.{% else %}No member announces lookup capacity: what has no budget is priced at the lowest price.{% endif %}</li>
+    <li>A funded scan job costs <b>{{ price.scan }}</b> credits here ({{ price.scan_bids }} funded jobs waiting; the scanners do {{ price.capacity_per_hour }} an hour, {{ price.utilization }} % used).</li>
+    {% if let Some(p) = price.probe %}<li>A probe for another member costs <b>{{ p }}</b> credits here.</li>{% endif %}
   </ul>
   {% if !price.offers.is_empty() %}
   <div class="table-wrap"><table>
-    <thead><tr><th>Provider served here</th><th class="num">Price (credits)</th><th class="num" title="Doubles after a day on which the on-demand share ran out, halves after a day on which it did not">Surge</th><th class="num">Paid lookups a day</th></tr></thead>
-    <tbody>{% for o in price.offers %}<tr><td>{{ o.0 }}</td><td class="num">{{ o.1 }}</td><td class="num">×{{ o.2 }}</td><td class="num">{{ o.3 }}</td></tr>{% endfor %}</tbody>
+    <thead><tr><th>Provider served here</th><th class="num">Price (credits)</th><th class="num">Paid lookups a day</th></tr></thead>
+    <tbody>{% for o in price.offers %}<tr><td>{{ o.0 }}</td><td class="num">{{ o.1 }}</td><td class="num">{{ o.2 }}</td></tr>{% endfor %}</tbody>
   </table></div>{% endif %}
 </section>
 </div>

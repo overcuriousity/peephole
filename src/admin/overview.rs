@@ -267,12 +267,12 @@ pub struct ClusterFigures {
     pub capacity: (String, String, String, String),
     /// Counted audits of 7 days: agrees, differs, inconclusive.
     pub audits: (u32, u32, u32),
-    /// The unit price with its load factor.
-    pub unit: String,
-    pub load: String,
+    /// What a funded scan job costs here.
+    pub scan: String,
     /// Lowest and highest announced price of a keyed provider.
     pub price_range: Option<(String, String)>,
-    /// Weighted paid lookups a day announced, and lookups served today.
+    /// Paid lookups a day this node and live members offer, and lookups
+    /// served today.
     pub lookups: (String, i64),
     pub forks: usize,
 }
@@ -350,21 +350,30 @@ async fn cluster_figures(
         }
     }
     let t = node.price_table();
-    // What live members ask for a keyed provider.
+    // What this node and live members ask for a keyed provider, and the
+    // paid lookups a day they offer.
+    let is_keyed =
+        |p: &str, mc: u32| mc > 0 && crate::intel::provider_info(p).is_some_and(|i| i.api);
     let mut keyed: Vec<u32> = t
         .offers
         .iter()
-        .filter(|o| crate::credits::price::weight_milli(&o.provider) == 1000)
+        .filter(|o| is_keyed(&o.provider, o.price_mc))
         .map(|o| o.price_mc)
         .collect();
+    let mut offered: u64 = t.offers.iter().map(|o| o.on_demand as u64).sum();
+    let me = node.id();
     for id in node.live_members(crate::intel::LIVE_WINDOW) {
+        if id == me {
+            continue;
+        }
         if let Some(k) = node.status.known(&id) {
             keyed.extend(
                 k.hb.prices
                     .iter()
-                    .filter(|(p, _)| crate::credits::price::weight_milli(p) == 1000)
+                    .filter(|(p, mc)| is_keyed(p, *mc))
                     .map(|(_, mc)| *mc),
             );
+            offered += k.hb.on_demand.iter().map(|(_, n)| *n as u64).sum::<u64>();
         }
     }
     let served_today: i64 = sqlx::query_scalar(
@@ -395,14 +404,13 @@ async fn cluster_figures(
             format!("{:.0}", t.capacity.utilization * 100.0),
         ),
         audits,
-        unit: t.unit.map_or_else(|| "—".into(), show),
-        load: format!("{:.2}", t.load),
+        scan: show(t.scan_mc as u64),
         price_range: keyed
             .iter()
             .min()
             .zip(keyed.iter().max())
             .map(|(lo, hi)| (show(*lo as u64), show(*hi as u64))),
-        lookups: (format!("{:.0}", t.lookups_per_day), served_today),
+        lookups: (offered.to_string(), served_today),
         forks: crate::cluster::seal::forked(&node.store.pool).await?.len(),
     })
 }
