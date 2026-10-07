@@ -137,11 +137,14 @@ level against the money supply.
   50 % destruction goes: the server keeps the full charged amount.
 - **Probes.** Priced like a provider named `probe` on each scanner, with
   its probe slots as supply.
-- **Every provider is paid**, the Tor exit list, RDAP, Shodan InternetDB
-  and GeoLite2 included: each runs on an operator's node, and that work
-  earns. There is no free tier and no free hourly quota: the hourly limit
-  on free lookups (`pay::FREE_PER_HOUR`, `take_free_lookup`) goes, and a
-  request without an offer is declined.
+- **What this node answers itself is free; what another node answers is
+  paid**, whoever owns that node. A lookup with this node's own
+  providers, a probe from its own prober and a resolution by its own
+  resolver write no offer, count as no demand and use no on-demand share.
+  Between nodes every provider is paid, the Tor exit list, RDAP, Shodan
+  InternetDB and GeoLite2 included. There is no free hourly quota: the
+  hourly limit on free lookups (`pay::FREE_PER_HOUR`, `take_free_lookup`)
+  goes, and a request from another node without an offer is declined.
 - **Supply.** A provider with a daily API budget offers its on-demand
   share of it (`[enrichment] on_demand_share`, as now). A provider
   without one (Tor, RDAP, GeoLite2, InternetDB as configured) and domain
@@ -149,8 +152,9 @@ level against the money supply.
   1000) a day on that node. A node that offers more is cheaper; askers go
   to the cheapest server first, so many generous nodes lower the price.
 - **The Lookup page spends nothing by itself.** It shows what the dataset
-  already holds (free) and every provider with its cheapest price, and
-  asks the ones the admin picks ("all" asks every one).
+  already holds and runs this node's own providers (both free), and
+  offers every provider only other nodes have with its cheapest price,
+  asking the ones the admin picks ("all" asks every one).
 - **A node's own enrichment** of recorded addresses with its own
   providers (the background loop) is not a lookup and stays as it is.
 - **Domain resolution** is paid to each other resolver: the asker offers
@@ -179,8 +183,6 @@ with D and S over the last hour:
 | Resolution on this node | Paid resolve requests to it | `offer_per_day` / 24 |
 | Probe on this scanner | Probe offers to it | Its probe slots × 30 an hour (`PROBE_TIMEOUT` is 2 minutes) |
 
-- **Requests from this node's own siblings** are not counted as demand,
-  so an owner cannot pump the price of its own nodes.
 - **A new good** starts at the median price other members announce for
   it, or at the floor.
 - **The weights go**: `weight_milli`, the unit price, the load factor,
@@ -242,7 +244,7 @@ the same rules; its changelog says so.
 
 ## 9. Testing
 
-- Providers: every one needs an offer; one without an API budget and resolution use `offer_per_day`; a paid resolution is charged only when answered; the Lookup page asks only what was picked.
+- Providers: this node's own answer needs no offer; another node's always does; one without an API budget and resolution use `offer_per_day`; a paid resolution is charged only when answered; the Lookup page runs own providers and asks others only when picked.
 - `earn`: own-job rule, level weights,
   the mint split of a day (shares sum to `MINT_PER_DAY`, empty day mints
   nothing), late scans shifting shares.
