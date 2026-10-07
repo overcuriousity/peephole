@@ -243,8 +243,7 @@ impl Prober {
                 };
             }
             Some(offer_seq) => {
-                node.market.note(price::PROBE, 1);
-                match pay::accept_offer(
+                let accepted = pay::accept_offer(
                     node,
                     peer,
                     offer_seq,
@@ -252,8 +251,11 @@ impl Prober {
                     "probe",
                     PROBE_MARGIN.as_millis() as u64,
                 )
-                .await
-                {
+                .await;
+                if pay::counts_as_demand(&accepted) {
+                    node.market.note(price::PROBE, 1);
+                }
+                match accepted {
                     Ok(a) => Some((offer_seq, a)),
                     Err(Declined::TooLow { why, price_mc }) => {
                         return decline(why, Some(price_mc));

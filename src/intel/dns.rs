@@ -183,14 +183,6 @@ pub fn charge_for(answer: &Result<Vec<IpAddr>, String>, price: u32) -> u32 {
     if answer.is_ok() { price } else { 0 }
 }
 
-/// Whether a request whose offer was looked at is demand for resolving:
-/// the offer was found (accepted, or declined only for its amount). A
-/// missing offer, a bad name or any other decline never counts.
-fn counts_as_demand<T>(accepted: &Result<T, crate::credits::pay::Declined>) -> bool {
-    use crate::credits::pay::Declined;
-    !matches!(accepted, Err(Declined::Why(_)))
-}
-
 /// Resolve `req.name` for `peer`, paid with the offer it names.
 pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> ResolveResp {
     use crate::credits::{pay, price};
@@ -215,7 +207,7 @@ pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> 
         pay::SERVE_MARGIN_MS,
     )
     .await;
-    if counts_as_demand(&accepted) {
+    if pay::counts_as_demand(&accepted) {
         node.market.note(price::RESOLVE, 1);
     }
     if let Err(d) = accepted {
@@ -704,21 +696,5 @@ mod tests {
             })
             .unwrap()
         );
-    }
-
-    #[test]
-    fn only_a_found_offer_counts_as_demand() {
-        use crate::credits::pay::Declined;
-        assert!(counts_as_demand(&Ok::<(), _>(())));
-        assert!(counts_as_demand(&Err::<(), _>(Declined::TooLow {
-            why: "x".into(),
-            price_mc: 5
-        })));
-        assert!(counts_as_demand(&Err::<(), _>(Declined::NotCovered(
-            "x".into()
-        ))));
-        assert!(!counts_as_demand(&Err::<(), _>(Declined::Why(
-            "no such offer".into()
-        ))));
     }
 }

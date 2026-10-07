@@ -179,6 +179,13 @@ pub enum Declined {
     NotCovered(String),
 }
 
+/// Whether a request whose offer was looked at is demand for the good:
+/// the offer was found (accepted, or declined only for its amount). A
+/// missing offer, a bad request or any other decline never counts.
+pub fn counts_as_demand<T>(accepted: &Result<T, Declined>) -> bool {
+    !matches!(accepted, Err(Declined::Why(_)))
+}
+
 /// The checks `serve` does on an offer before answering: the asker is of
 /// the market ([`pays_with`]), wait for the entry, is an offer, for me,
 /// seal consistent, not already serving, standing, counts, open,
@@ -446,10 +453,13 @@ pub async fn serve(
         }
     }
     let total: Mc = asking.iter().map(|n| price_of(n)).sum();
-    for name in &all {
-        node.market.note(name, 1);
+    let accepted = accept_offer(node, peer, offer_seq, total, "lookup", SERVE_MARGIN_MS).await;
+    if counts_as_demand(&accepted) {
+        for name in &all {
+            node.market.note(name, 1);
+        }
     }
-    let acc = match accept_offer(node, peer, offer_seq, total, "lookup", SERVE_MARGIN_MS).await {
+    let acc = match accepted {
         Ok(a) => a,
         Err(Declined::Why(why)) => {
             // Not about the amount: every provider asked for hears it.
@@ -689,6 +699,21 @@ pub async fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_found_offer_counts_as_demand() {
+        assert!(counts_as_demand(&Ok::<(), _>(())));
+        assert!(counts_as_demand(&Err::<(), _>(Declined::TooLow {
+            why: "x".into(),
+            price_mc: 5
+        })));
+        assert!(counts_as_demand(&Err::<(), _>(Declined::NotCovered(
+            "x".into()
+        ))));
+        assert!(!counts_as_demand(&Err::<(), _>(Declined::Why(
+            "no such offer".into()
+        ))));
+    }
 
     #[test]
     fn only_market_nodes_are_paid() {
