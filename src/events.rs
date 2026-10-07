@@ -16,6 +16,8 @@ pub struct QueueJob {
     pub scanner: Option<String>,
     /// Distributed mode: the node that hands out this job.
     pub arbiter: Option<String>,
+    /// A retry of a failed scan: not handed out before then.
+    pub retry_at: Option<String>,
 }
 
 #[derive(Clone)]
@@ -61,6 +63,7 @@ mod tests {
             error: None,
             scanner: None,
             arbiter: None,
+            retry_at: None,
         });
         assert_eq!(rx.recv().await.unwrap().id, 1);
         // Overflow the channel (capacity 256) → Lagged.
@@ -76,6 +79,7 @@ mod tests {
                 error: None,
                 scanner: None,
                 arbiter: None,
+                retry_at: None,
             });
         }
         assert!(matches!(

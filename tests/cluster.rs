@@ -2148,6 +2148,9 @@ async fn duplicate_jobs_are_superseded() {
                 ip: ip.into(),
                 level: 2,
                 queued_at: peephole::store::data::now_ts(),
+                retry_of: None,
+                retry_at: None,
+                failed_by: None,
             },
         )])
         .await

@@ -202,6 +202,16 @@ pub struct ScanJobRec {
     pub ip: String,
     pub level: i64,
     pub queued_at: String,
+    /// A retry of a failed scan: the uid of the first failed job of the
+    /// chain (see `scan::retry`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<String>,
+    /// A retry is not handed out before this time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<String>,
+    /// The scanner whose failure queued the retry: it waits longer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_by: Option<NodeId>,
 }
 
 /// A job's state (last write wins by HLC; only the arbiter writes it).

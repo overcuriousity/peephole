@@ -676,8 +676,9 @@ async fn scan_job(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &ScanJobRec) -> 
         return Ok(Effect::Ignored);
     };
     sqlx::query(
-        "INSERT OR IGNORE INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at)
-         VALUES (?,?,?,?,?,?,'queued',?)",
+        "INSERT OR IGNORE INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at,
+                                          retry_of, retry_at, failed_by)
+         VALUES (?,?,?,?,?,?,'queued',?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -686,6 +687,9 @@ async fn scan_job(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &ScanJobRec) -> 
     .bind(ip_id)
     .bind(r.level)
     .bind(&r.queued_at)
+    .bind(&r.retry_of)
+    .bind(&r.retry_at)
+    .bind(r.failed_by.map(|s| s.0.to_vec()))
     .execute(&mut *conn)
     .await?;
     Ok(Effect::Applied)
@@ -2120,6 +2124,9 @@ mod tests {
                 ip: "203.0.113.7".into(),
                 level: 2,
                 queued_at: now_ts(),
+                retry_of: None,
+                retry_at: None,
+                failed_by: None,
             }),
         )
         .await
@@ -2175,6 +2182,9 @@ mod tests {
             ip: "203.0.113.9".into(),
             level: 2,
             queued_at: now_ts(),
+            retry_of: None,
+            retry_at: None,
+            failed_by: None,
         });
         assert_eq!(
             apply(&mut conn, ctx(&scanner, 1), &job).await.unwrap(),
@@ -2408,6 +2418,9 @@ mod tests {
                 ip: "203.0.113.7".into(),
                 level: 1,
                 queued_at: now_ts(),
+                retry_of: None,
+                retry_at: None,
+                failed_by: None,
             }),
             Record::ScanResult(ScanResultRec {
                 uid: u("scan"),

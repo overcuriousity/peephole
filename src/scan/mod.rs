@@ -7,6 +7,7 @@ pub mod order;
 pub mod pace;
 pub mod probe;
 pub mod profiles;
+pub mod retry;
 pub mod safety;
 pub mod weight;
 

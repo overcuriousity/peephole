@@ -73,13 +73,6 @@ pub enum Msg {
     CompleteReply {
         ok: bool,
     },
-    /// Admin → every arbiter: requeue jobs that failed in the last `days`.
-    RequeueFailed {
-        days: i64,
-    },
-    RequeueReply {
-        n: u64,
-    },
     /// Any member → node: what are your runtime settings?
     ConfigGet,
     ConfigState(super::remote::State),

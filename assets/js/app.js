@@ -154,7 +154,7 @@
       tr.appendChild(cell("mono", "#" + esc(j.id)));
       tr.appendChild(cell("ip", '<a href="/ip/' + esc(j.ip) + '">' + esc(j.ip) + "</a>"));
       tr.appendChild(cell("", esc(j.level)));
-      tr.appendChild(cell("", '<span class="badge badge-status" data-status="' + esc(j.status) + '">' + esc(j.status) + "</span>"));
+      tr.appendChild(cell("", '<span class="badge badge-status" data-status="' + esc(j.status) + '">' + esc(j.status) + "</span>" + (j.retry_at ? ' <span class="badge" title="Retry of a failed scan, not before ' + esc(j.retry_at) + ' UTC">retry</span>' : "")));
       tr.appendChild(cell("ts", esc(j.queued_at)));
       tr.appendChild(cell("ts", esc(j.started_at)));
       tr.appendChild(cell("muted", esc(j.scanner) + (j.arbiter ? '<span class="node-via"> via ' + esc(j.arbiter) + "</span>" : "")));
