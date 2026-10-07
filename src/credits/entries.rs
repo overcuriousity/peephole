@@ -262,6 +262,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_scan_offer_keeps_its_job_and_a_long_job_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let (a, b) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let day = 20_000u32;
+        let at = |min: u64| ((day as u64 * crate::credits::DAY_MS + min * 60_000) << 16) | 1;
+        let offer = |job: String| Record::CreditOffer {
+            to: b.id,
+            parts: vec![(day, 200)],
+            seal: Seal::default(),
+            job: Some(job),
+        };
+        let mut conn = store.pool.acquire().await.unwrap();
+        let kept = offer("job".into());
+        let e = WireEntry::sign(&a, 3, at(1), &kept).unwrap();
+        assert!(apply(&mut conn, &e, &kept, SealState::Consistent).await.unwrap());
+        let long = offer("j".repeat(65));
+        let e = WireEntry::sign(&a, 4, at(2), &long).unwrap();
+        assert!(!apply(&mut conn, &e, &long, SealState::Consistent).await.unwrap());
+        // 64 bytes is still a job.
+        let edge = offer("j".repeat(64));
+        let e = WireEntry::sign(&a, 5, at(3), &edge).unwrap();
+        assert!(apply(&mut conn, &e, &edge, SealState::Consistent).await.unwrap());
+        drop(conn);
+        let got = get(&store.pool, &a.id, 3).await.unwrap().unwrap();
+        assert_eq!(
+            got.kind,
+            Kind::Offer {
+                to: b.id,
+                parts: vec![(day, 200)],
+                job: Some("job".into()),
+            }
+        );
+        assert_eq!(get(&store.pool, &a.id, 4).await.unwrap(), None);
+        assert_eq!(since(&store.pool, 0).await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_offer_without_a_job_encodes_like_one_before_jobs() {
+        use crate::cluster::rpc::cbor;
+        #[derive(serde::Serialize)]
+        #[serde(tag = "k", rename_all = "snake_case")]
+        enum Old {
+            CreditOffer {
+                to: NodeId,
+                parts: Vec<(u32, u32)>,
+                seal: Seal,
+            },
+        }
+        let to = Identity::generate().unwrap().id;
+        let parts = vec![(20_000, 250)];
+        let new = Record::CreditOffer {
+            to,
+            parts: parts.clone(),
+            seal: Seal::default(),
+            job: None,
+        };
+        let old = Old::CreditOffer {
+            to,
+            parts,
+            seal: Seal::default(),
+        };
+        assert_eq!(cbor::encode(&new).unwrap(), cbor::encode(&old).unwrap());
+        // What an old node wrote reads as an offer without a job.
+        let back: Record = cbor::decode(&cbor::encode(&old).unwrap()).unwrap();
+        assert!(matches!(back, Record::CreditOffer { job: None, .. }));
+    }
+
+    #[tokio::test]
     async fn payments_are_kept_as_rows_and_broken_ones_are_not() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
