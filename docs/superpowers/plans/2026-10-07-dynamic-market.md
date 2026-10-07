@@ -32,6 +32,7 @@
 2. **A scan that reaches a node after its day closed**: the share moves; a lot that shrank must make later offers cover less, never produce a negative lot. Test in Task 2 (`a_late_scan_shifts_a_closed_day`).
 3. **A scanner that never reports back** (crash mid-scan): the scan offer must hold credits until it lapses after `MAX_RUN_SECS` + margin and then return them; a receipt after that is ignored. Test in Task 1 (`a_job_offer_lapses_after_the_longest_run`).
 4. **A node with zero balance arbitrating jobs**: it must grant unfunded (no offer, no error) and announce 0 bids. Test in Task 4 (`no_budget_grants_without_an_offer`).
+6. **This node's own provider fails during an automatic lookup** (RDAP paused by a registry): nothing may be bought from another node unless the admin picked that provider. Test in Task 3 (`an_automatic_lookup_never_buys_elsewhere`).
 5. **A resolver that fails or times out after the offer was written**: the asker must not be charged; the offer is released by a receipt of nothing (or lapses). Test in Task 5 (`a_failed_resolution_charges_nothing`).
 
 ---
@@ -955,7 +956,19 @@ pub fn cheap(quotes: &HashMap<String, Vec<crate::credits::pay::Quote>>) -> Vec<S
 }
 ```
 
-Remove `CHEAP_MILLI`; in `run` use `cheap(&crate::credits::pay::quotes(node, providers))`. Replace the test `cheap_tier_is_tor_rdap_geolite_and_internetdb` by `cheap_tier_is_what_this_node_answers` (quotes `tor` 0 from this node, `abuseipdb` 300 from a member, `rdap` 0 from this node: `["rdap", "tor"]`).
+Remove `CHEAP_MILLI`; in `run` use `cheap(&crate::credits::pay::quotes(node, providers))`. What `run` asks by itself must never be bought elsewhere: when this node's own provider gives no answer (RDAP paused by a registry, a timeout), `pay::ask` would otherwise go on to the next, paid server. Give `pay::ask` a parameter `paid: &[String]` (the providers the admin picked: `ask` and `again`) and let it try servers other than this node only for those:
+
+```rust
+            let Some(q) = all
+                .get(p)
+                .and_then(|list| list.iter().find(|q| !seen.contains(&q.server)))
+                .filter(|q| q.server == me || paid.contains(p))
+            else {
+                continue;
+            };
+```
+
+`run` passes `&ask` and `&again` joined; other callers of `pay::ask` (`grep -rn "pay::ask(" src`) pass their full list (they ask on purpose). Test in `pay.rs` with the existing quote helpers: a provider quoted by this node (0) and a member (300), not picked, is tried only at this node; picked, the member is the fallback. Replace the test `cheap_tier_is_tor_rdap_geolite_and_internetdb` by `cheap_tier_is_what_this_node_answers` (quotes `tor` 0 from this node, `abuseipdb` 300 from a member, `rdap` 0 from this node: `["rdap", "tor"]`).
 
 - `src/cluster/mod.rs`: remove `take_free_lookup`, `take_free_resolve`, `take_free`, the `free_lookups`/`free_resolves` fields and their initialisation; `src/credits/pay.rs`: remove `FREE_PER_HOUR`. (`src/cluster/rpc/mod.rs::resolve` uses `take_free_resolve` until Task 5: in this task make it refuse every request with "resolving a name is paid with credits: upgrade this node", Task 5 replaces it.)
 

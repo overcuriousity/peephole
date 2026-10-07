@@ -154,7 +154,10 @@ level against the money supply.
 - **The Lookup page spends nothing by itself.** It shows what the dataset
   already holds and runs this node's own providers (both free), and
   offers every provider only other nodes have with its cheapest price,
-  asking the ones the admin picks ("all" asks every one).
+  asking the ones the admin picks ("all" asks every one). When this
+  node's own provider gives no answer (RDAP paused by a registry), the
+  page does not buy it elsewhere by itself: another node is asked only
+  for a provider the admin picked.
 - **A node's own enrichment** of recorded addresses with its own
   providers (the background loop) is not a lookup and stays as it is.
 - **Domain resolution** is paid to each other resolver: the asker offers
