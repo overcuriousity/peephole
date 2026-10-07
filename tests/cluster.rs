@@ -5856,3 +5856,240 @@ async fn an_offer_declined_for_the_askers_standing_is_released() {
     assert_eq!(book.ledger.held(&a.id), 0);
     assert_eq!(book.balance(&a.id), 1250);
 }
+
+/// `accept_offer` names its price when the offer is below it, and frees
+/// the offer at once with a receipt of nothing.
+#[tokio::test]
+async fn accept_offer_declines_a_too_low_offer_naming_the_price() {
+    use peephole::credits::{self, entries, pay};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    let seq = pay::make_offer(&na.node, b.id, 10).await.unwrap();
+    match pay::accept_offer(&nb.node, a.id, seq, 50, "test").await {
+        Err(pay::Declined::TooLow { price_mc, .. }) => assert_eq!(price_mc, 50),
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("a too-low offer was accepted"),
+    }
+    let receipt = entries::since(&nb.store.pool, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|e| {
+            matches!(e.kind, entries::Kind::Receipt { payer, offer_seq, charged_mc: 0, .. }
+                if payer == a.id && offer_seq == seq)
+        });
+    assert!(receipt, "a receipt of nothing");
+    eventually("the offer is free again on the asker", || async {
+        let book = credits::book_fresh(&na.node).await.unwrap();
+        book.ledger.held(&a.id) == 0
+    })
+    .await;
+}
+
+/// A covering offer is accepted once: while it is served, naming it again
+/// is declined.
+#[tokio::test]
+async fn accept_offer_accepts_a_covering_offer() {
+    use peephole::credits::pay;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    let seq = pay::make_offer(&na.node, b.id, 50).await.unwrap();
+    let Ok(acc) = pay::accept_offer(&nb.node, a.id, seq, 50, "test").await else {
+        panic!("a covering offer was declined");
+    };
+    assert_eq!((acc.offered, acc.covered), (50, 50));
+    match pay::accept_offer(&nb.node, a.id, seq, 50, "test").await {
+        Err(pay::Declined::Why(why)) => assert!(why.contains("being served already"), "{why}"),
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("an offer was served twice"),
+    }
+    drop(acc);
+}
+
+/// `make_offer` writes a sealed offer to the server into this node's log.
+#[tokio::test]
+async fn make_offer_writes_a_sealed_offer_to_the_server() {
+    use peephole::credits::{entries, pay};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
+    grant_scans(&[&na], a.id, 8).await;
+    let seq = pay::make_offer(&na.node, b.id, 50).await.unwrap();
+    let e = entries::get(&na.store.pool, &a.id, seq)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(e.kind, entries::Kind::Offer { to, .. } if to == b.id),
+        "{e:?}"
+    );
+}
+
+/// A local web server, the stand-in for a scanner's open port.
+async fn probe_target() -> std::net::SocketAddr {
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(|| async { axum::response::Html("<title>t</title>") }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    addr
+}
+
+/// `n` probes: a prober for this test node that connects to the local
+/// target in place of the probed address.
+fn probes(n: &TestNode, target: std::net::SocketAddr) {
+    let p = peephole::scan::probe::serve::Prober::new(&scan_config(&[], 0.0), Some(n.id()))
+        .connecting_to(target.ip());
+    n.node.set_prober(Arc::new(p));
+}
+
+/// A recorded the address (three requests and a finished counter-scan
+/// with the target's port open); B holds it too.
+async fn recorded_and_scanned(na: &TestNode, nb: &TestNode, ip: &str, port: u16) {
+    let row = na.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+    for path in ["/a", "/b", "/c"] {
+        rec(na)
+            .insert_request(&new_request(row.id, path))
+            .await
+            .unwrap();
+    }
+    rec(na).enqueue_scan(row.id, 2, 24).await.unwrap();
+    let job: String = sqlx::query_scalar("SELECT uid FROM scan_jobs WHERE ip_id = ?")
+        .bind(row.id)
+        .fetch_one(&na.store.pool)
+        .await
+        .unwrap();
+    let res = peephole::scan::nmap_xml::ScanResult {
+        os_guess: None,
+        raw_xml: b"<nmaprun/>".to_vec(),
+        ports: vec![peephole::scan::nmap_xml::PortResult {
+            port,
+            proto: "tcp".into(),
+            state: "open".into(),
+            service: Some("http".into()),
+            product: None,
+            version: None,
+        }],
+    };
+    rec(na)
+        .record_scan_result(&job, ip, 2, &peephole::store::data::now_ts(), &res)
+        .await
+        .unwrap();
+    eventually("b holds the scan", || async {
+        count(
+            &nb.node,
+            &format!("SELECT COUNT(*) FROM scans s JOIN ips i ON i.id = s.ip_id WHERE i.ip = '{ip}'"),
+        )
+        .await
+            == 1
+            && count(
+                &nb.node,
+                &format!(
+                    "SELECT COUNT(*) FROM requests r JOIN ips i ON i.id = r.ip_id WHERE i.ip = '{ip}'"
+                ),
+            )
+            .await
+                == 3
+    })
+    .await;
+}
+
+/// A probe is paid like a lookup: A offers B's announced price, B answers
+/// at once, probes, and appends the result and the receipt together.
+#[tokio::test]
+async fn a_paid_probe_is_accepted_served_and_charged() {
+    use peephole::credits::{self, entries, price};
+    use peephole::scan::probe::ask;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let target = probe_target().await;
+    probes(&nb, target);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    let cost = price::refresh(&nb.node).await.unwrap().probe_mc.unwrap();
+    assert_eq!(cost, price::price(price::PROBE, None, 1));
+    nb.refresh_heartbeat();
+    eventually("a hears b's probe price", || async {
+        na.status
+            .known(&b.id)
+            .is_some_and(|k| k.hb.probe_price_mc == Some(cost))
+    })
+    .await;
+    let ip = "203.0.113.95";
+    recorded_and_scanned(&na, &nb, ip, target.port()).await;
+    let asked = ask::ask(&na.node, None, ip.parse().unwrap(), &[b.id], "group-1").await;
+    assert_eq!(asked.len(), 1);
+    let uid = asked[0].outcome.clone().expect("accepted");
+    let ip_id = na.store.upsert_ip(ip.parse().unwrap()).await.unwrap().id;
+    eventually("a holds b's probe", || async {
+        na.store
+            .probes_for_ip(ip_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.uid == uid && p.origin.as_deref() == Some(&b.id.0[..]))
+    })
+    .await;
+    let probe = na.store.probes_for_ip(ip_id).await.unwrap().remove(0);
+    assert_eq!(probe.group_uid, "group-1");
+    assert_eq!(probe.asker, a.id.0.to_vec());
+    let ports = na.store.probe_ports(probe.id).await.unwrap();
+    assert_eq!(ports[0].outcome, "ok", "{ports:?}");
+    let receipt = entries::since(&na.store.pool, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|e| {
+            e.origin == b.id
+                && matches!(&e.kind, entries::Kind::Receipt { payer, charged_mc, answered, .. }
+                    if *payer == a.id && *charged_mc == cost && answered == &["probe".to_string()])
+        });
+    assert!(receipt, "b's receipt of its price");
+    let book = credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(book.balance(&a.id), 10_000 - cost as u64);
+    assert_eq!(book.ledger.held(&a.id), 0);
+}
+
+/// A probe request naming an offer the scanner never gets is declined,
+/// and nothing is held or charged.
+#[tokio::test]
+async fn a_probe_of_an_unknown_offer_is_declined_with_a_receipt_of_nothing() {
+    use peephole::credits;
+    use peephole::scan::probe::serve::{ProbeReq, ProbeResp};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    probes(&nb, probe_target().await);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    let resp: ProbeResp = na
+        .call(
+            b.id,
+            &b.address(),
+            "/rpc/v1/probe",
+            &ProbeReq {
+                ip: "203.0.113.96".into(),
+                group: "group-2".into(),
+                offer_seq: Some(99999),
+            },
+        )
+        .await
+        .unwrap();
+    match resp {
+        ProbeResp::Declined { why, .. } => assert!(why.contains("did not arrive"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    let book = credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(book.ledger.held(&a.id), 0);
+    assert_eq!(book.balance(&a.id), 10_000);
+}

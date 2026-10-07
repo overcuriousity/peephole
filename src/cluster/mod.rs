@@ -276,6 +276,8 @@ pub struct Node {
     lookup_providers: std::sync::OnceLock<crate::intel::Providers>,
     /// The on-demand share of each provider budget (see `credits::share`).
     lookup_shares: std::sync::OnceLock<crate::credits::share::Shares>,
+    /// This node's observational prober, when it probes (`scan::probe`).
+    prober: std::sync::OnceLock<Arc<crate::scan::probe::serve::Prober>>,
     /// This node's lookup prices, as last computed (`credits::price`).
     price_table: RwLock<Arc<crate::credits::price::Table>>,
     /// The fleet node this node forwards its credits to and draws from
@@ -347,6 +349,7 @@ impl Node {
             providers: RwLock::new(vec![]),
             lookup_providers: Default::default(),
             lookup_shares: Default::default(),
+            prober: Default::default(),
             price_table: Default::default(),
             collect_to: RwLock::new(None),
             free_lookups: Mutex::new(HashMap::new()),
@@ -502,6 +505,16 @@ impl Node {
 
     pub fn lookup_shares(&self) -> Option<&crate::credits::share::Shares> {
         self.lookup_shares.get()
+    }
+
+    pub fn set_prober(&self, p: Arc<crate::scan::probe::serve::Prober>) {
+        let _ = self.prober.set(p);
+    }
+
+    /// The prober members' `/rpc/v1/probe` requests go to; None when this
+    /// node does not probe.
+    pub fn prober(&self) -> Option<&Arc<crate::scan::probe::serve::Prober>> {
+        self.prober.get()
     }
 
     pub fn price_table(&self) -> Arc<crate::credits::price::Table> {

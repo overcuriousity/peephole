@@ -48,6 +48,8 @@ pub struct AdminState {
     pub safety: tokio::sync::Mutex<crate::scan::safety::Safety>,
     /// This node's tarpit, for System › Status; None without a trap here.
     pub tarpit: Option<Arc<crate::trap::tarpit::Tarpit>>,
+    /// This node's prober, when it probes (`scan::probe`).
+    pub prober: Option<Arc<crate::scan::probe::serve::Prober>>,
 }
 
 impl AdminState {
@@ -78,7 +80,14 @@ impl AdminState {
             closing: None,
             providers: vec![],
             tarpit: None,
+            prober: None,
         }
+    }
+
+    /// This node's prober (None: it does not probe).
+    pub fn with_prober(mut self, prober: Option<Arc<crate::scan::probe::serve::Prober>>) -> Self {
+        self.prober = prober;
+        self
     }
 
     /// The enrichment providers this node runs.

@@ -38,6 +38,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/rpc/v1/inbox", post(inbox))
         .route("/rpc/v1/intel", post(intel_chunk))
         .route("/rpc/v1/lookup", post(lookup))
+        .route("/rpc/v1/probe", post(probe))
         .route_layer(axum::middleware::from_fn_with_state(
             node.clone(),
             require_member,
@@ -211,6 +212,23 @@ async fn lookup(
     Cbor(req): Cbor<crate::intel::lookup::LookupReq>,
 ) -> Response {
     Cbor(crate::intel::lookup::serve(&node, peer, &req).await).into_response()
+}
+
+/// An observational probe for a member, paid with the offer it names.
+async fn probe(
+    State(node): State<Arc<Node>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Cbor(req): Cbor<crate::scan::probe::serve::ProbeReq>,
+) -> Response {
+    use crate::scan::probe::serve::ProbeResp;
+    let resp = match node.prober() {
+        Some(p) => p.clone().serve(&node, peer, &req).await,
+        None => ProbeResp::Declined {
+            why: "this node does not probe".into(),
+            price_mc: None,
+        },
+    };
+    Cbor(resp).into_response()
 }
 
 /// Long-poll for messages waiting for the caller.

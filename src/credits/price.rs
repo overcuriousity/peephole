@@ -16,12 +16,17 @@ use std::sync::Arc;
 pub const UNIT_MIN: Mc = 10;
 pub const UNIT_MAX: Mc = 100_000;
 
+/// What an observational probe (`scan::probe`) is priced as.
+pub const PROBE: &str = "probe";
+
 /// The weight of a provider in thousandths: a keyed API 1, Shodan
-/// InternetDB and GeoLite2 a quarter, the Tor exit list and RDAP nothing (free).
+/// InternetDB and GeoLite2 a quarter, the Tor exit list and RDAP nothing
+/// (free). A probe costs four: a scanner's time and its address.
 pub fn weight_milli(provider: &str) -> u32 {
     match provider {
         intel::TOR | intel::RDAP => 0,
         intel::MAXMIND | intel::INTERNETDB => 250,
+        PROBE => 4000,
         _ => 1000,
     }
 }
@@ -165,6 +170,8 @@ pub struct Table {
     pub load: f64,
     pub unit: Option<Mc>,
     pub offers: Vec<Offer>,
+    /// What a probe costs here; None when this node does not probe.
+    pub probe_mc: Option<u32>,
 }
 
 /// `(provider, millicredits)` pairs as a heartbeat carries them.
@@ -329,6 +336,10 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
                 on_demand,
             })
             .collect(),
+        // Doubles while every probe slot is busy.
+        probe_mc: node
+            .prober()
+            .map(|p| price(PROBE, unit, 1 + p.full() as u32)),
     });
     node.set_price_table(table.clone());
     Ok(table)
@@ -438,6 +449,13 @@ mod tests {
         assert_eq!(unit(20_000, 0.0, 0.5), None);
         assert_eq!(price(intel::MAXMIND, None, 1), 2);
         assert_eq!(price(intel::MAXMIND, Some(1), 1), 1);
+    }
+
+    #[test]
+    fn a_probe_costs_four_units_and_doubles_when_the_slots_are_full() {
+        assert_eq!(weight_milli(PROBE), 4000);
+        assert_eq!(price(PROBE, Some(1000), 1), 4000);
+        assert_eq!(price(PROBE, Some(1000), 2), 8000);
     }
 
     #[test]

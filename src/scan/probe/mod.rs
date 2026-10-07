@@ -7,8 +7,11 @@
 //! Every reader takes an absolute deadline and gives up there; the caps
 //! below bound what one probe may cost the probed host and this node.
 
+pub mod ask;
+pub mod gate;
 pub mod http;
 pub mod jarm;
+pub mod serve;
 pub mod ssh;
 pub mod tls;
 
@@ -96,6 +99,7 @@ pub fn printable(bytes: &[u8]) -> String {
 }
 
 /// What the latest counter-scan found open, as the runner takes it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Target {
     pub ip: IpAddr,
     /// Port and nmap's service name, when it gave one.

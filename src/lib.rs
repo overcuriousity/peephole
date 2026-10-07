@@ -184,6 +184,17 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         shutdown_rx.clone(),
     ));
 
+    // Observational probes, for members (paid) and this node's admin.
+    let prober = (cfg.roles.scanner && cfg.probe.enabled).then(|| {
+        Arc::new(scan::probe::serve::Prober::new(
+            &cfg,
+            node.as_ref().map(|n| n.id()),
+        ))
+    });
+    if let (Some(n), Some(p)) = (&node, &prober) {
+        n.set_prober(p.clone());
+    }
+
     // Retention on a standalone node: delete records older than the window.
     // A cluster node lowers its history floor instead (`cluster::history`).
     if cfg.cluster.is_none() && cfg.retention_days > 0 {
@@ -300,6 +311,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         settings: settings.clone(),
         node: node.clone(),
         providers,
+        prober,
         tarpit: Arc::new(trap::tarpit::Tarpit::of(&cfg)),
         sse: Arc::new(trap::decoy::sse::SseHub::new(&cfg.trap)),
     };
@@ -387,6 +399,8 @@ struct RoleRunner {
     settings: settings::Settings,
     node: Option<Arc<cluster::Node>>,
     providers: intel::Providers,
+    /// Observational probes (scanner role with `probe.enabled`).
+    prober: Option<Arc<scan::probe::serve::Prober>>,
     /// The trap's tarpit: outlives a listener restart, read by the admin.
     tarpit: Arc<trap::tarpit::Tarpit>,
     /// The trap's legacy MCP SSE streams: outlive a listener restart.
@@ -647,6 +661,7 @@ impl RoleRunner {
             .with_recorder(self.recorder.clone())
             .with_settings(self.settings.clone())
             .with_providers(self.providers.clone())
+            .with_prober(self.prober.clone())
             .with_tarpit(self.tarpit.clone())
             .with_closing(rx.clone()),
         ));

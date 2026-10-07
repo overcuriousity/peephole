@@ -74,6 +74,10 @@ pub struct Heartbeat {
     /// The node's public addresses as its peers see them.
     #[serde(default)]
     pub public_addrs: Vec<IpAddr>,
+    /// What an observational probe costs at this node, in mc; None when
+    /// it does not probe.
+    #[serde(default)]
+    pub probe_price_mc: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,7 +379,8 @@ impl Node {
     /// Build, sign and store this node's current heartbeat.
     pub fn refresh_heartbeat(&self) {
         let local = self.status.local.lock().unwrap().clone();
-        let (on_demand, prices) = self.price_table().announced();
+        let table = self.price_table();
+        let (on_demand, prices) = table.announced();
         let hb = Heartbeat {
             node: self.id(),
             at_ms: self.status.next_at(),
@@ -406,6 +411,7 @@ impl Node {
             on_demand,
             prices,
             public_addrs: self.status.public_addresses(),
+            probe_price_mc: table.probe_mc,
         };
         let Ok(body) = super::rpc::cbor::encode(&hb) else {
             return;
@@ -530,6 +536,7 @@ mod tests {
             on_demand: vec![],
             prices: vec![],
             public_addrs: vec![],
+            probe_price_mc: None,
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = id.sign(&SignedHeartbeat::signing(&body));
@@ -654,6 +661,7 @@ mod tests {
             on_demand: vec![],
             prices: vec![],
             public_addrs: vec![],
+            probe_price_mc: None,
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = a.sign(&SignedHeartbeat::signing(&body));
