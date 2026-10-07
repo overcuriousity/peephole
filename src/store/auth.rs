@@ -99,7 +99,7 @@ impl Store {
             .await?;
         let has_password = get_meta(&mut tx, PASSWORD_HASH).await?.is_some();
         if m == LoginMethod::Password && !has_password {
-            bail!("no password is set: run peephole admin password first");
+            bail!("no password is set");
         }
         if m == LoginMethod::Passkey && keys == 0 {
             bail!("no passkey is enrolled");
@@ -108,6 +108,12 @@ impl Store {
             bail!("neither a password nor a passkey is set");
         }
         put_meta(&mut tx, LOGIN_METHOD, m.as_str()).await?;
+        if m == LoginMethod::Passkey {
+            // No password sign-in any more: its sessions end.
+            sqlx::query("DELETE FROM sessions WHERE cred_id IS NULL")
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -605,6 +611,18 @@ mod tests {
         assert!(s.delete_credential_guarded(b"k2").await.unwrap());
         assert_eq!(s.login_method().await.unwrap(), LoginMethod::Password);
         assert!(s.load_credentials().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn switching_to_passkey_ends_password_sessions() {
+        let (_dir, s) = test_store().await;
+        s.save_credential(b"k1", "{}", Some("one")).await.unwrap();
+        s.set_password_hash("$argon2id$v=19$x", None).await.unwrap();
+        let pw = s.create_session().await.unwrap();
+        let key = s.create_session_for(Some(b"k1"), None).await.unwrap();
+        s.set_login_method(LoginMethod::Passkey).await.unwrap();
+        assert!(!s.validate_session(&pw).await.unwrap());
+        assert!(s.validate_session(&key).await.unwrap());
     }
 
     #[tokio::test]

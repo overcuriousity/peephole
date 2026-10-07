@@ -66,7 +66,13 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             }
             let method: LoginMethod = args[1].parse()?;
             let store = open_store(arg(2).unwrap_or(default_config)).await?;
-            store.set_login_method(method).await?;
+            store.set_login_method(method).await.map_err(|e| {
+                if e.to_string() == "no password is set" {
+                    anyhow::anyhow!("{e}: run peephole admin password first")
+                } else {
+                    e
+                }
+            })?;
             println!("Sign-in: {}.", method.as_str());
             Ok(())
         }

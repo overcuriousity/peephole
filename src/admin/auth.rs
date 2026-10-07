@@ -109,6 +109,16 @@ fn webauthn_for(cfg: &crate::config::Config) -> Result<Webauthn> {
     builder.build().context("webauthn build")
 }
 
+/// Password checks allowed at once.
+pub const MAX_VERIFIES: usize = 3;
+
+/// A hash nobody knows the password of, verified when none is set so a
+/// request takes as long as a real one.
+fn dummy_phc() -> &'static str {
+    static PHC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PHC.get_or_init(|| crate::admin::password::hash("no such password").unwrap_or_default())
+}
+
 pub fn auth_routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/login", get(login_page))
@@ -182,10 +192,11 @@ async fn render_login(
     error: Option<String>,
 ) -> crate::admin::error::AppResult<Html<String>> {
     let method = state.store.login_method().await.unwrap_or_default();
+    let has_hash = matches!(state.store.password_hash().await, Ok(Some(_)));
     crate::admin::error::render(&LoginPage {
         chrome: crate::admin::views::Chrome::new(authed, ""),
         passkey: method.passkey(),
-        password: method.password(),
+        password: method.password() && has_hash,
         error,
     })
 }
@@ -561,15 +572,23 @@ async fn login_password(
     if !method.password() {
         return (StatusCode::FORBIDDEN, "password sign-in is off").into_response();
     }
-    let phc = state.store.password_hash().await.ok().flatten();
-    let ok = match phc {
-        Some(phc) => {
-            tokio::task::spawn_blocking(move || crate::admin::password::verify(&f.password, &phc))
-                .await
-                .unwrap_or(false)
+    let phc = match state.store.password_hash().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(?e, "could not read the password hash");
+            None
         }
-        None => false,
     };
+    // Too many checks at once: refuse rather than queue (memory, threads).
+    let Ok(_slot) = state.verify_slots.try_acquire() else {
+        return busy();
+    };
+    let found = phc.is_some();
+    let phc = phc.unwrap_or_else(|| dummy_phc().to_string());
+    let ok = tokio::task::spawn_blocking(move || crate::admin::password::verify(&f.password, &phc))
+        .await
+        .unwrap_or(false)
+        && found;
     if !ok {
         tracing::info!("password sign-in rejected");
         return match render_login(&state, false, Some("Wrong password.".into())).await {
@@ -702,6 +721,32 @@ secure_cookies = {secure}
     }
 
     #[tokio::test]
+    async fn password_login_ends_the_session_held_and_is_capped() {
+        let (_d, state, app) = app().await;
+        state
+            .store
+            .save_credential(b"k1", "{}", Some("one"))
+            .await
+            .unwrap();
+        set_pw(&state, PW).await;
+        let form = format!("password={PW}").replace(' ', "+");
+        let old = state.store.create_session().await.unwrap();
+        // All verification slots busy: refused, nothing checked.
+        let held = state
+            .verify_slots
+            .try_acquire_many(MAX_VERIFIES as u32)
+            .unwrap();
+        let (st, set, _) = send(&app, "POST", "/login/password", Some(&old), &form).await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+        assert!(set.is_none());
+        assert!(state.store.validate_session(&old).await.unwrap());
+        drop(held);
+        let (st, _, _) = send(&app, "POST", "/login/password", Some(&old), &form).await;
+        assert_eq!(st, StatusCode::SEE_OTHER);
+        assert!(!state.store.validate_session(&old).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn the_login_page_offers_what_the_method_allows() {
         let (_d, state, app) = app().await;
         let (_, _, page) = send(&app, "GET", "/login", None, "").await;
@@ -711,6 +756,14 @@ secure_cookies = {secure}
             .save_credential(b"k1", "{}", Some("one"))
             .await
             .unwrap();
+        // Keys but no password yet: no password form to probe.
+        state
+            .store
+            .set_login_method(LoginMethod::Both)
+            .await
+            .unwrap();
+        let (_, _, page) = send(&app, "GET", "/login", None, "").await;
+        assert!(page.contains("data-go") && !page.contains("/login/password"));
         set_pw(&state, PW).await;
         state
             .store

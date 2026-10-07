@@ -30,7 +30,7 @@ pub const PUBLIC_BURST: u32 = 60;
 /// `/login/*` and `/enroll/*` POSTs, per client.
 pub const AUTH_PER_MINUTE: u32 = 10;
 pub const AUTH_BURST: u32 = 10;
-/// `/login/start` POSTs from all clients together. Starts within
+/// `/login/start` and `/login/password` POSTs from all clients together. Starts within
 /// [`MIN_CEREMONY_SECS`](crate::store::auth::MIN_CEREMONY_SECS) stay well
 /// under [`MAX_OPEN_CEREMONIES`](crate::store::auth::MAX_OPEN_CEREMONIES), so
 /// at the cap an old one is always there to evict.
@@ -217,7 +217,8 @@ pub async fn enforce(State(state): State<Arc<AdminState>>, req: Request, next: N
     let limits = &state.limits;
     // Sign-in starts from everyone share one budget as well, taken after the
     // client's own so a client over its limit does not spend it.
-    let is_login_start = class == Class::Auth && req.uri().path() == "/login/start";
+    let is_login_start =
+        class == Class::Auth && matches!(req.uri().path(), "/login/start" | "/login/password");
     let global = || !is_login_start || limits.login.allow();
     // No peer address (in-process callers, tests): nothing to key on.
     let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>().copied() else {
