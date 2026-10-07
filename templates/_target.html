@@ -25,6 +25,9 @@
   </div>
 </section>
 
+{% if let Some(a) = t.actions %}{% include "_actions.html" %}{% endif %}
+{% if t.admin.is_some() && !t.probes.is_empty() %}{% include "_probes.html" %}{% endif %}
+
 {% if let Some(adm) = t.admin %}
 <section class="card ip-scans" id="scans" data-section="scans">
   <div class="card-head"><h2>Counter-scans</h2></div>

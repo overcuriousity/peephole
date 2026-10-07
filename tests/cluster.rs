@@ -2488,6 +2488,7 @@ secure_cookies = false
             cfg,
             peephole::events::Notifier::new(),
             n.pace.clone(),
+            Arc::new(std::sync::RwLock::new(None)),
         )
         .with_recorder(Recorder::Cluster(n.node.clone()))
         .with_settings(n.settings.clone()),

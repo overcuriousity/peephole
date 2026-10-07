@@ -285,6 +285,29 @@
     });
   }
 
+  // Actions card: the total of the ticked probe vantages, live.
+  document.querySelectorAll("[data-probe-form]").forEach(function (f) {
+    var out = f.querySelector("[data-probe-total]");
+    if (!out) return;
+    f.addEventListener("change", function () {
+      var mc = 0;
+      f.querySelectorAll("input[data-mc]:checked").forEach(function (c) { mc += parseInt(c.getAttribute("data-mc"), 10) || 0; });
+      var cents = Math.floor((mc + 5) / 10);
+      out.textContent = Math.floor(cents / 100) + "." + String(cents % 100).padStart(2, "0");
+    });
+  });
+
+  // Probes section: while a probe waits for its result, reload the page
+  // when the states the server reports differ from the rendered ones.
+  var ps = document.querySelector("[data-probes-src]");
+  if (ps && window.EventSource) {
+    var shown = ps.getAttribute("data-probes-states");
+    var pes = new EventSource(ps.getAttribute("data-probes-src"));
+    pes.addEventListener("probes", function (ev) {
+      if (ev.data !== shown) { pes.close(); location.reload(); }
+    });
+  }
+
   window.peephole = window.peephole || {};
   window.peephole.ago = ago;
   // Old /admin/fingerprints#<anchor> links land on the Links index after

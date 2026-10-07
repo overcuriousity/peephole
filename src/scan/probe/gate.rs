@@ -48,6 +48,16 @@ impl Gate {
         }
     }
 
+    /// The counter-scan level the requests held here allow for `ip` (the
+    /// Actions card's guard line); None when it cannot be read.
+    pub async fn allowed_level(&self, store: &Store, ip: &IpAddr) -> Option<u8> {
+        let ip_text = crate::net::canonical(*ip).to_string();
+        let ev = guard::evidence(&store.pool, &ip_text, &self.origins, Some(self.classifier))
+            .await
+            .ok()?;
+        Some(ev.allowed_level(&self.cfg.scan.safety))
+    }
+
     /// The address and open ports to probe, or the reason shown to the
     /// asker. Checks, in order: enabled; global address; never_scan;
     /// safety lists (members, own, peer-observed public); Tor exit;

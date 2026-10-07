@@ -657,6 +657,7 @@ impl RoleRunner {
                 self.cfg.clone(),
                 self.notifier.clone(),
                 self.settings.pace.clone(),
+                self.geo.clone(),
             )
             .with_recorder(self.recorder.clone())
             .with_settings(self.settings.clone())

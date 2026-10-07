@@ -26,6 +26,22 @@ pub struct Target {
     pub paged: bool,
     /// Days of history this node keeps; 0: all of it.
     pub window_days: u32,
+    /// The Actions card (admin only).
+    pub actions: Option<crate::admin::probes::ActionsView>,
+    /// Probe requests and results, newest first (admin only).
+    pub probes: Vec<crate::admin::probes::GroupView>,
+}
+
+impl Target {
+    /// `[group, node, state]` of every probe, for the live stream.
+    pub fn probe_states(&self) -> String {
+        crate::admin::probes::states_json(&self.probes)
+    }
+
+    /// A probe still waits for its result.
+    pub fn probes_waiting(&self) -> bool {
+        crate::admin::probes::any_waiting(&self.probes)
+    }
 }
 
 /// Load `ip`'s view. None: the address is in the table but has no
@@ -83,7 +99,16 @@ pub async fn load(
     } else {
         None
     };
+    let (actions, probes) = match (authed, ip.ip.parse::<std::net::IpAddr>()) {
+        (true, Ok(addr)) => (
+            Some(crate::admin::probes::actions_for(state, &addr).await),
+            crate::admin::probes::groups_for(state, ip.id).await,
+        ),
+        _ => (None, vec![]),
+    };
     Ok(Some(Target {
+        actions,
+        probes,
         week_json: serde_json::to_string(&ov.week).unwrap_or_else(|_| "[]".into()),
         calendar_json: serde_json::to_string(&ov.calendar).unwrap_or_else(|_| "[]".into()),
         family_max: ov.families.iter().map(|f| f.count).max().unwrap_or(0),
