@@ -47,8 +47,38 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Failed counter-scans are retried for 24 hours with a growing wait
   (10 min doubling to 2 h; the scanner that failed waits longer); a retry
   stops when a newer scan or a pending job covers the address.
+- Admin: sign in with a password (optional, per node; `peephole admin
+  password`, `peephole admin login-method`). Passkeys stay the default.
+- Cluster: outbound-only members answer paid lookups, resolutions and
+  probes (routed through the outbox).
+- Trap: a PROXY header from a peer outside `trusted_proxies` is named in
+  the log.
+- Installer: asks whether to also allow a password sign-in on the admin
+  site (`PEEPHOLE_ADMIN_PASSWORD`, at least 12 characters; only its hash is
+  stored).
+- Installer: before offering to set up nginx it checks what the setup would
+  stop at (an existing peephole site, other sites on port 443, a default
+  site that is not the stock link, the packages, the admin domain's DNS)
+  and lists what it will change; the default is yes only when every check
+  passes.
 
 ### Changed
+
+- Installer: the scanner is off by default (opt-in, also without a
+  terminal). Unattended installs add `scanner` to `PEEPHOLE_ROLES`.
+- Installer: a preset `PEEPHOLE_TRUSTED_PROXIES` no longer means a proxy
+  elsewhere; unattended installs behind one set `PEEPHOLE_FRONT=remote`.
+- Installer: every node gets a `[cluster]` section; the cluster question is
+  gone and `PEEPHOLE_CLUSTER` is ignored. The node name defaults to the
+  short host name, the address other members dial is required
+  (`PEEPHOLE_CLUSTER_ADVERTISE`, `host:port`; default the admin domain or
+  the public address with port 7443), and the listener follows its port.
+  The invite question names `peephole cluster join <token>` for later.
+- Installer: the Let's Encrypt certificate is requested without a contact
+  email; `PEEPHOLE_ACME_EMAIL` is ignored.
+- Installer: the admin domain is normalised (a scheme, a path and a
+  trailing dot are stripped, upper case is lowered); an IP address is
+  refused.
 
 - The dynamic market replaces the fixed credit rules. A daily mint of 1000
   credits is split among scanners by counted scans (levels 3 and 4 count

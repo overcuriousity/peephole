@@ -4,7 +4,8 @@
 # an older install left alone, database backed up), a failed upgrade that
 # rolls back, the wizard, and what is in front of the trap (nothing, nginx
 # here, a proxy elsewhere) with the port check, the checks of the trusted
-# proxies and the admin domain, the admin password and the nginx checks.
+# proxies and the admin domain, the admin password, the nginx checks and the
+# cluster section every node gets (name, required advertise address).
 # Runs as root in a throwaway Debian/Ubuntu container (CI: ubuntu:24.04).
 # PEEPHOLE_BIN is the release binary (default target/release/peephole).
 set -euo pipefail
@@ -51,6 +52,9 @@ chmod +x /tmp/bin/systemctl
 export PATH="/tmp/bin:$PATH"
 export PEEPHOLE_SKIP_APT=1 PEEPHOLE_SKIP_HEALTH=1 BASE_URL="http://127.0.0.1:8999"
 export MAXMIND_ACCOUNT_ID=1 MAXMIND_LICENSE_KEY=k PEEPHOLE_DOMAIN=peephole.test PEEPHOLE_TRUSTED_PROXIES=10.0.0.0/8
+# Every node publishes a cluster address; the wizard runs unset it and answer.
+export PEEPHOLE_CLUSTER_ADVERTISE=node.test:7443
+NODE_NAME="$(hostname -s 2>/dev/null || hostname)"
 # CI runs in a cloud: its metadata service would add a question to the wizard.
 export PEEPHOLE_METADATA=0
 
@@ -82,6 +86,14 @@ for c in 10.0.0.5 10.0.0.0/24 2001:db8::/64; do
 done
 for c in 10.0.0.0/33 2001:db8::/129 10.0.0.0/x example; do
     if bash install.sh --check-cidr "$c" 2>/dev/null; then echo "CIDR '$c' accepted"; exit 1; fi
+done
+
+echo "== the cluster advertise address is host:port with a port 1-65535"
+for a in node.example:7443 '[2001:db8::1]:7443' 203.0.113.5:7443; do
+    [ "$(bash install.sh --check-advertise "$a")" = ok ] || { echo "advertise '$a' refused"; exit 1; }
+done
+for a in bogus host:0 host:70000 host: :7443 '2001:db8::1:7443' 'two words:7443'; do
+    if bash install.sh --check-advertise "$a" 2>/dev/null; then echo "advertise '$a' accepted"; exit 1; fi
 done
 
 echo "== refuses to install when systemd is not PID 1 (unless overridden)"
@@ -151,6 +163,11 @@ grep -q 'sites-enabled/default' /etc/peephole/nginx.example.conf
 grep -q '^trap_tls_listen = "0.0.0.0:8081"' /etc/peephole/config.toml
 test ! -e /etc/peephole/nginx-stream.example.conf
 grep -q 'ssl_reject_handshake on' /etc/peephole/nginx.example.conf
+# Every node has a cluster section: named after the machine, the listener on the advertised port.
+grep -q '^\[cluster\]' /etc/peephole/config.toml
+grep -q "^node_name = \"${NODE_NAME}\"" /etc/peephole/config.toml
+grep -q '^listen = "0.0.0.0:7443"' /etc/peephole/config.toml
+grep -q '^advertise = "node.test:7443"' /etc/peephole/config.toml
 
 echo "== re-run is a no-op"
 out="$(bash install.sh)"
@@ -246,10 +263,11 @@ reset_install() {
 echo "== wizard: trap only, behind a local nginx (answers typed at the prompts)"
 reset_install
 # trap? yes · scanner? no · web? no · in front: local · own addresses: none ·
-# nginx? no · cluster? no · MaxMind: skip · AbuseIPDB key · Shodan: skip · InternetDB? no
-printf 'y\nn\nn\nlocal\n\nn\n\n\nabuse-key-1\n\nn\n' > /tmp/answers
+# nginx? no · node name: the hostname · advertise · token: none · MaxMind: skip ·
+# AbuseIPDB key · Shodan: skip · InternetDB? no
+printf 'y\nn\nn\nlocal\n\nn\n\ntrap1.example:7443\n\n\nabuse-key-1\n\nn\n' > /tmp/answers
 # PEEPHOLE_TRUSTED_PROXIES stays preset (10.0.0.0/8): the local proxy answer replaces it, with a warning.
-env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN -u PEEPHOLE_CLUSTER_ADVERTISE \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard1.log 2>&1 || { cat /tmp/wizard1.log; exit 1; }
 grep -q 'PEEPHOLE_TRUSTED_PROXIES.*ignored' /tmp/wizard1.log
 # The nginx checks pass here (no domain to resolve): the default would be yes.
@@ -260,9 +278,16 @@ grep -q '^scanner = false' /etc/peephole/config.toml
 grep -q '^web = false' /etc/peephole/config.toml
 grep -q '^trap_listen = "127.0.0.1:8080"' /etc/peephole/config.toml
 grep -q '^trusted_proxies = \["127.0.0.1/32","::1/128"\]' /etc/peephole/config.toml
-if grep -q 'webauthn\|maxmind\|\[cluster\]\|admin_listen' /etc/peephole/config.toml; then
+if grep -q 'webauthn\|maxmind\|admin_listen' /etc/peephole/config.toml; then
     echo "trap-only config has other roles' settings"; cat /etc/peephole/config.toml; exit 1
 fi
+# No cluster question, but a cluster section: the hostname, the typed address,
+# the listener on its port; the token question names the later command.
+grep -q "^node_name = \"${NODE_NAME}\"" /etc/peephole/config.toml
+grep -q '^advertise = "trap1.example:7443"' /etc/peephole/config.toml
+grep -q '^listen = "0.0.0.0:7443"' /etc/peephole/config.toml
+grep -q 'peephole cluster join' /tmp/wizard1.log
+if grep -q 'Take part in a cluster' /tmp/wizard1.log; then echo "the cluster question is still asked"; exit 1; fi
 grep -q '^api_key = "abuse-key-1"' /etc/peephole/config.toml
 if grep -q '\[shodan\]\|\[internetdb\]' /etc/peephole/config.toml; then
     echo "skipped enrichment APIs were configured"; cat /etc/peephole/config.toml; exit 1
@@ -317,24 +342,25 @@ if PEEPHOLE_ROLES=, bash install.sh > /tmp/noroles.log 2>&1; then echo "expected
 grep -q "at least one" /tmp/noroles.log
 test ! -e /usr/local/bin/peephole
 
-echo "== wizard: a value the binary rejects leaves no config behind"
+echo "== wizard: an advertise address without a port is asked again; a listener the binary rejects leaves no config behind"
 reset_install
-# trap? no · scanner? yes · web? no · own addresses: none · cluster? yes · name ·
-# listen "bogus" · advertise (none) · token (none) · MaxMind: skip
-printf 'n\ny\nn\n\ny\nscanner-9\nbogus\n\n\n\n' > /tmp/answers
-if env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
-    PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard-bad.log 2>&1; then
+# trap? no · scanner? yes · web? no · own addresses: none · name · advertise "bogus"
+# (asked again) · advertise · token (none) · MaxMind: skip; the listener "bogus" is preset
+printf 'n\ny\nn\n\nscanner-9\nbogus\nscan9.example:7443\n\n\n' > /tmp/answers
+if env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN -u PEEPHOLE_CLUSTER_ADVERTISE \
+    PEEPHOLE_CLUSTER_LISTEN=bogus PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard-bad.log 2>&1; then
     echo "expected failure"; exit 1
 fi
+grep -q "'bogus' is not host:port with a port 1-65535" /tmp/wizard-bad.log
 grep -q "failed validation" /tmp/wizard-bad.log
 test ! -e /etc/peephole/config.toml
 
 echo "== wizard: re-run after the rejected answer asks again (scanner in a cluster)"
 # No reset: the binary from the failed run is in place.
-# trap? no · scanner? yes · web? no · own addresses: none · cluster? yes · name ·
-# listen (default) · advertise · token (none) · MaxMind: skip
-printf 'n\ny\nn\n\ny\nscanner-9\n\nscan9.example:7443\n\n\n' > /tmp/answers
-env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
+# trap? no · scanner? yes · web? no · own addresses: none · name · advertise ·
+# token (none) · MaxMind: skip
+printf 'n\ny\nn\n\nscanner-9\nscan9.example:7443\n\n\n' > /tmp/answers
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN -u PEEPHOLE_CLUSTER_ADVERTISE \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard4.log 2>&1 || { cat /tmp/wizard4.log; exit 1; }
 if grep -q 'already up to date' /tmp/wizard4.log; then echo "re-run after a failed first install skipped the wizard"; exit 1; fi
 grep -q '^node_name = "scanner-9"' /etc/peephole/config.toml
@@ -437,8 +463,11 @@ echo "== wizard nginx: an unresolvable domain makes the default no"
 reset_install; reset_nginx
 # Web only, the domain preset (peephole.test does not resolve); every answer at its default.
 : > /tmp/answers
-PEEPHOLE_ROLES=web PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard-nginx.log 2>&1 \
+env -u PEEPHOLE_CLUSTER_ADVERTISE PEEPHOLE_ROLES=web PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard-nginx.log 2>&1 \
     || { cat /tmp/wizard-nginx.log; exit 1; }
+# The domain points here (no proxy elsewhere): the advertise default.
+grep -q 'Address other nodes dial (host:port) \[peephole.test:7443\]' /tmp/wizard-nginx.log
+grep -q '^advertise = "peephole.test:7443"' /etc/peephole/config.toml
 grep -q 'does not resolve\|points to' /tmp/wizard-nginx.log
 grep -q 'Port 80 must be reachable' /tmp/wizard-nginx.log
 grep -q 'Set up nginx now? \[y/N\]' /tmp/wizard-nginx.log
@@ -453,12 +482,14 @@ reset_nginx
 echo "== wizard password: too short and a mismatch are asked again; the hash is stored"
 reset_install; reset_nginx
 # Web only, the domain preset · password? yes · too short (twice) · two that differ ·
-# the password twice · nginx? no · the rest at its defaults
+# the password twice · nginx? no · node name: the hostname · advertise · the rest at its defaults
 # shellcheck disable=SC2016  # quote, backslash, dollar sign and spaces, literally
 wpw='wiz "pass\ $1 ok'
-printf '%s\n' y short short 'longenough-pass-1' 'longenough-pass-2' "$wpw" "$wpw" n > /tmp/answers
-PEEPHOLE_ROLES=web PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard-password.log 2>&1 \
+printf '%s\n' y short short 'longenough-pass-1' 'longenough-pass-2' "$wpw" "$wpw" n '' web.example:7444 > /tmp/answers
+env -u PEEPHOLE_CLUSTER_ADVERTISE PEEPHOLE_ROLES=web PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard-password.log 2>&1 \
     || { cat /tmp/wizard-password.log; exit 1; }
+grep -q '^advertise = "web.example:7444"' /etc/peephole/config.toml
+grep -q '^listen = "0.0.0.0:7444"' /etc/peephole/config.toml
 grep -q 'Too short.' /tmp/wizard-password.log
 grep -q 'They differ.' /tmp/wizard-password.log
 if grep -q 'wiz "pass\|longenough' /etc/peephole/config.toml /tmp/wizard-password.log; then
@@ -523,7 +554,7 @@ grep -q '^own_addresses = \["198.51.100.7"\]' /etc/peephole/config.toml
 [ "$(sed -n '/^\[/h; /^own_addresses/{x;p}' /etc/peephole/config.toml)" = "[scan]" ]
 /usr/local/bin/peephole check-config /etc/peephole/config.toml
 test ! -e /etc/peephole/nginx.example.conf
-grep -q 'ports 80 and 443 itself.*Open 80/tcp, 443/tcp$' /tmp/direct.log
+grep -q 'ports 80 and 443 itself.*Open 80/tcp, 443/tcp, 7443/tcp$' /tmp/direct.log
 if grep -qi 'nginx\|trap listener (' /tmp/direct.log; then echo "direct install talks about nginx"; cat /tmp/direct.log; exit 1; fi
 
 echo "== direct with the web role is refused before anything is written (nginx shares 443 by name instead)"
@@ -536,10 +567,12 @@ test ! -e /usr/local/bin/peephole
 
 echo "== wizard: direct with the web role is explained and asked again (default local)"
 reset_install
-# in front: direct (refused) · then the default · own addresses: none; the rest at its defaults
+# in front: direct (refused) · then the default · own addresses: none; the rest at its
+# defaults (advertise: the admin domain, which points here)
 printf 'direct\n\n\n' > /tmp/answers
-PEEPHOLE_ROLES=listener,web PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/direct-web-wizard.log 2>&1 \
+env -u PEEPHOLE_CLUSTER_ADVERTISE PEEPHOLE_ROLES=listener,web PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/direct-web-wizard.log 2>&1 \
     || { cat /tmp/direct-web-wizard.log; exit 1; }
+grep -q '^advertise = "peephole.test:7443"' /etc/peephole/config.toml
 grep -q 'admin site needs it too' /tmp/direct-web-wizard.log
 grep -q '^trap_listen = "127.0.0.1:8080"' /etc/peephole/config.toml
 test -f /etc/peephole/nginx-stream.example.conf
@@ -622,13 +655,39 @@ fi
 grep -q 'port 8080 for the trap listener (127.0.0.1:8080) is in use' /tmp/port-busy.log
 test ! -e /etc/peephole/config.toml
 # in front: local · 127.0.0.1:8081 for the trap? yes · 127.0.0.1:8082 for TLS? yes ·
-# own addresses: none · nginx? no · cluster? no · MaxMind: skip · API keys: skip · InternetDB? no
-printf 'local\ny\ny\n\nn\nn\n\n\n\nn\n' > /tmp/answers
-env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_TRUSTED_PROXIES PEEPHOLE_ROLES=listener \
+# own addresses: none · nginx? no · node name · advertise · token: none · MaxMind: skip ·
+# API keys: skip · InternetDB? no
+printf 'local\ny\ny\n\nn\ntrap-2\ntrap2.example:7443\n\n\n\n\nn\n' > /tmp/answers
+env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_TRUSTED_PROXIES -u PEEPHOLE_CLUSTER_ADVERTISE \
+    PEEPHOLE_ROLES=listener \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/port-offer.log 2>&1 || { cat /tmp/port-offer.log; exit 1; }
 grep -q '^trap_listen = "127.0.0.1:8081"' /etc/peephole/config.toml
 grep -q '^trap_tls_listen = "127.0.0.1:8082"' /etc/peephole/config.toml
 grep -q 'proxy_pass http://127.0.0.1:8081;' /etc/peephole/nginx.example.conf
 grep -q 'proxy_pass 127.0.0.1:8082;' /etc/peephole/nginx-stream.example.conf
+grep -q '^node_name = "trap-2"' /etc/peephole/config.toml
+grep -q '^advertise = "trap2.example:7443"' /etc/peephole/config.toml
 kill "$busy_pid"; wait "$busy_pid" 2>/dev/null || true
+
+echo "== advertise is required: unattended without one or a default stops before anything is written"
+reset_install
+# A proxy elsewhere: the admin domain need not point here, and no public address is known.
+if env -u PEEPHOLE_CLUSTER_ADVERTISE PEEPHOLE_FRONT=remote bash install.sh > /tmp/advertise-none.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q 'missing required setting: PEEPHOLE_CLUSTER_ADVERTISE' /tmp/advertise-none.log
+test ! -e /etc/peephole/config.toml
+test ! -e /usr/local/bin/peephole
+if PEEPHOLE_FRONT=remote PEEPHOLE_CLUSTER_ADVERTISE=bogus bash install.sh > /tmp/advertise-bad.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q "PEEPHOLE_CLUSTER_ADVERTISE: 'bogus' is not host:port" /tmp/advertise-bad.log
+test ! -e /usr/local/bin/peephole
+# The admin domain behind nginx here: its name is the default. PEEPHOLE_CLUSTER=0 is ignored.
+env -u PEEPHOLE_CLUSTER_ADVERTISE PEEPHOLE_ROLES=listener,web PEEPHOLE_FRONT=local PEEPHOLE_CLUSTER=0 \
+    bash install.sh > /tmp/advertise-default.log 2>&1 || { cat /tmp/advertise-default.log; exit 1; }
+grep -q '^\[cluster\]' /etc/peephole/config.toml
+grep -q '^advertise = "peephole.test:7443"' /etc/peephole/config.toml
+grep -q '^listen = "0.0.0.0:7443"' /etc/peephole/config.toml
+grep -q 'other members dial peephole.test:7443' /tmp/advertise-default.log
 echo "== ok"

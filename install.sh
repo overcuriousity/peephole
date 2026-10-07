@@ -27,10 +27,12 @@
 #   PEEPHOLE_TTY       read the wizard's answers from this file instead of the terminal (tests)
 #   PEEPHOLE_ROLES     comma-separated subset of listener,scanner,web (asked when a terminal is
 #                      present; listener,web when there is none: the scanner is opt-in)
-#   PEEPHOLE_CLUSTER=1|0       take part in a cluster (a preset PEEPHOLE_CLUSTER_NAME implies 1)
-#   PEEPHOLE_CLUSTER_NAME      this node's name in the cluster (first install)
-#   PEEPHOLE_CLUSTER_LISTEN    RPC listener (default 0.0.0.0:7443)
-#   PEEPHOLE_CLUSTER_ADVERTISE host:port peers dial (omit for an outbound-only node)
+#   PEEPHOLE_CLUSTER           ignored (every node has a [cluster] section; alone until it joins)
+#   PEEPHOLE_CLUSTER_NAME      this node's name in the cluster (first install; default: hostname -s)
+#   PEEPHOLE_CLUSTER_ADVERTISE host:port other members dial, port 1-65535 (first install;
+#                              required: default <admin domain>:7443 with the web role unless
+#                              PEEPHOLE_FRONT=remote, else <public address>:7443 when one is known)
+#   PEEPHOLE_CLUSTER_LISTEN    RPC listener (default 0.0.0.0:<advertise port>)
 #   PEEPHOLE_JOIN_TOKEN        invite from an existing member; joined before the first start
 #   PEEPHOLE_REMOTE_CONFIG     ignored (config keys were replaced by the ownership key: peephole owner adopt)
 #   PEEPHOLE_ADMIN_PASSWORD  also allow signing in to the admin site with this password, at
@@ -45,8 +47,9 @@
 #   BASE_URL           alternative download base (tests, mirrors)
 #
 # Other entry points: --extract-token (reads journal output on stdin),
-# --check-domain VALUE and --check-cidr VALUE (print the admin domain as the
-# installer stores it / whether a trusted proxy entry is valid; tests),
+# --check-domain VALUE, --check-cidr VALUE and --check-advertise VALUE (print
+# the admin domain as the installer stores it / whether a trusted proxy entry
+# / a cluster advertise address is valid; tests),
 # --check-dns DOMAIN RESOLVED MINE (whether addresses the domain resolves to
 # include one of this machine's, as the nginx preflight decides; tests),
 # --nginx-example and --nginx-stream-example (print the nginx site and the
@@ -145,6 +148,19 @@ normalize_domain() {
 if [ "${1:-}" = "--check-domain" ]; then
     if normalize_domain "${2:-}"; then echo; exit 0; fi
     echo "'${2:-}' is not a host name" >&2; exit 1
+fi
+
+# The address other members dial: host:port, an IPv6 address in brackets,
+# with a port 1-65535.
+valid_advertise() {
+    local port
+    [[ "$1" =~ ^[^[:space:]:]+:[0-9]{1,5}$ || "$1" =~ ^\[[0-9a-fA-F:]+\]:[0-9]{1,5}$ ]] || return 1
+    port=$((10#${1##*:}))
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+if [ "${1:-}" = "--check-advertise" ]; then
+    if valid_advertise "${2:-}"; then echo ok; exit 0; fi
+    echo "'${2:-}' is not host:port with a port 1-65535" >&2; exit 1
 fi
 
 # Why a certificate request for <domain> would fail, judged from the
@@ -1093,24 +1109,45 @@ if [ "$upgrade" -ne 1 ]; then
     else
         PEEPHOLE_NGINX=0
     fi
-    # A preset node name means "yes" (unattended installs from before this
-    # question existed).
-    [ -n "${PEEPHOLE_CLUSTER_NAME:-}" ] && PEEPHOLE_CLUSTER="${PEEPHOLE_CLUSTER:-1}"
-    if [ "$INTERACTIVE" -eq 1 ] && [ -z "${PEEPHOLE_CLUSTER:-}" ]; then
-        say $'\nA cluster shares requests, the scan queue and results between nodes of different operators.\n'
+    # Every node is in a cluster: one without peers and without an invite
+    # runs alone. PEEPHOLE_CLUSTER is ignored.
+    prompt PEEPHOLE_CLUSTER_NAME "This node's name (other operators see it in their admin area)" "$(hostname -s 2>/dev/null || hostname)"
+    # The admin domain points here unless a proxy elsewhere fronts it;
+    # otherwise the public address (interface, metadata, the answer about
+    # addresses no interface shows).
+    advertise_preset="${PEEPHOLE_CLUSTER_ADVERTISE:-}"
+    advertise_default=""
+    if has_role web && [ "${PEEPHOLE_FRONT:-}" != remote ]; then
+        advertise_default="${PEEPHOLE_DOMAIN}:7443"
+    else
+        advertise_host="${PUBLIC_ADDR:-${OWN_ADDRESSES%%,*}}"
+        [[ "$advertise_host" != *:* ]] || advertise_host="[${advertise_host}]"
+        [ -z "$advertise_host" ] || advertise_default="${advertise_host}:7443"
     fi
-    ask_yn PEEPHOLE_CLUSTER "Take part in a cluster (join one now or later, or start one)?" n
-    if [ "$PEEPHOLE_CLUSTER" = 1 ]; then
-        prompt PEEPHOLE_CLUSTER_NAME "This node's name (other operators see it in their admin area)"
-        prompt PEEPHOLE_CLUSTER_LISTEN "Cluster RPC listener" "0.0.0.0:7443"
-        claim_port PEEPHOLE_CLUSTER_LISTEN "cluster RPC listener" 1 "; or set PEEPHOLE_CLUSTER_LISTEN to another address"
-        advertise_example="host:port"
-        [ -n "$PUBLIC_ADDR" ] && advertise_example="host:port, e.g. ${PUBLIC_ADDR}:${PEEPHOLE_CLUSTER_LISTEN##*:}"
-        prompt_optional PEEPHOLE_CLUSTER_ADVERTISE "Address other nodes dial (${advertise_example}; empty: outbound-only, this node dials its peers, which works)"
-        prompt_optional PEEPHOLE_JOIN_TOKEN "Invite token from a member (empty to start a new cluster or join later)"
-        toml_safe "$PEEPHOLE_CLUSTER_NAME"; toml_safe "$PEEPHOLE_CLUSTER_LISTEN"
-        toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"; toml_safe "${PEEPHOLE_JOIN_TOKEN:-}"
+    if [ "$INTERACTIVE" -eq 1 ] && [ -z "$advertise_preset" ]; then
+        say $'\nOther members dial this node at an address you publish. The port must be reachable from the\ninternet; the installer does not change the firewall. To change it later: advertise and listen\nin /etc/peephole/config.toml, then restart peephole.\n'
     fi
+    while :; do
+        prompt PEEPHOLE_CLUSTER_ADVERTISE "Address other nodes dial (host:port)" "$advertise_default"
+        valid_advertise "$PEEPHOLE_CLUSTER_ADVERTISE" && break
+        if [ -n "$advertise_preset" ] || [ "$INTERACTIVE" -ne 1 ]; then
+            die "PEEPHOLE_CLUSTER_ADVERTISE: '${PEEPHOLE_CLUSTER_ADVERTISE}' is not host:port with a port 1-65535"
+        fi
+        say "'${PEEPHOLE_CLUSTER_ADVERTISE}' is not host:port with a port 1-65535"$'\n'
+        PEEPHOLE_CLUSTER_ADVERTISE=""
+    done
+    listen_preset="${PEEPHOLE_CLUSTER_LISTEN:-}"
+    PEEPHOLE_CLUSTER_LISTEN="${PEEPHOLE_CLUSTER_LISTEN:-0.0.0.0:$((10#${PEEPHOLE_CLUSTER_ADVERTISE##*:}))}"
+    claim_port PEEPHOLE_CLUSTER_LISTEN "cluster RPC listener" 1 "; or set PEEPHOLE_CLUSTER_LISTEN to another address"
+    # A listener moved to the next free port is published on that port.
+    if [ -z "$listen_preset" ] && [ "${PEEPHOLE_CLUSTER_LISTEN##*:}" != "$((10#${PEEPHOLE_CLUSTER_ADVERTISE##*:}))" ]; then
+        PEEPHOLE_CLUSTER_ADVERTISE="${PEEPHOLE_CLUSTER_ADVERTISE%:*}:${PEEPHOLE_CLUSTER_LISTEN##*:}"
+        info "Other members dial ${PEEPHOLE_CLUSTER_ADVERTISE} (the listener's port)"
+    fi
+    # A running daemon picks a later join up by itself (it rereads the
+    # members the CLI wrote).
+    prompt_optional PEEPHOLE_JOIN_TOKEN "Invite token from a member (empty to start alone; join later with: peephole cluster join <token>)"
+    toml_safe "${PEEPHOLE_JOIN_TOKEN:-}"
     prompt_optional MAXMIND_ACCOUNT_ID "MaxMind GeoLite2 account ID (https://www.maxmind.com/en/accounts/current/license-key; optional: in a cluster the lookups of a member with credentials are shared, the databases are not)"
     if [ -n "${MAXMIND_ACCOUNT_ID:-}" ]; then
         prompt MAXMIND_LICENSE_KEY "MaxMind GeoLite2 license key"
@@ -1121,7 +1158,7 @@ if [ "$upgrade" -ne 1 ]; then
         say $'\nOptional threat-intel APIs. Every one is optional: leave it empty to skip it. Keys stay on this\nnode; in a cluster the lookup results are shared, so one key serves every member.\n'
     fi
     prompt_optional ABUSEIPDB_API_KEY "AbuseIPDB API key (https://www.abuseipdb.com/account/api; abuse reports per IP, free plan 1000 checks/day)"
-    prompt_optional SHODAN_API_KEY "Shodan API key (https://account.shodan.io; open ports, services and CVEs; host lookups need a membership or paid plan)"
+    prompt_optional SHODAN_API_KEY "Shodan API key (https://account.shodan.io; over the free InternetDB it adds product and version per port, OS, organisation, ISP, ASN, domains, IPv6 and the latest crawl instead of a weekly snapshot; host lookups need a membership or paid plan)"
     ask_yn PEEPHOLE_INTERNETDB "Use Shodan InternetDB (no key; ports, tags and CVEs, weekly data; free for non-commercial use only)?" "$([ "$INTERACTIVE" -eq 1 ] && echo y || echo n)"
     # Values that arrived preset from the environment were not checked by a prompt.
     toml_safe "${PEEPHOLE_DOMAIN:-}"; toml_safe "${PEEPHOLE_TRUSTED_PROXIES:-}"
@@ -1317,19 +1354,13 @@ CONFIG
             echo "# never scanned, never in the blocklist."
             echo "own_addresses = [$(toml_list "$OWN_ADDRESSES")]"
         fi
-        if [ "${PEEPHOLE_CLUSTER:-0}" = 1 ]; then
-            cat <<CONFIG
+        cat <<CONFIG
 
 [cluster]
 node_name = "${PEEPHOLE_CLUSTER_NAME}"
 listen = "${PEEPHOLE_CLUSTER_LISTEN}"
+advertise = "${PEEPHOLE_CLUSTER_ADVERTISE}"
 CONFIG
-            if [ -n "${PEEPHOLE_CLUSTER_ADVERTISE:-}" ]; then
-                echo "advertise = \"${PEEPHOLE_CLUSTER_ADVERTISE}\""
-            else
-                echo "# No advertise address: outbound-only (this node dials its peers)."
-            fi
-        fi
     } > "$new_config"
     "$INSTALL_BIN" check-config "$new_config" \
         || die "generated config failed validation; nothing was written to ${CONFIG_FILE}. Re-run the installer to answer again."
@@ -1348,14 +1379,12 @@ CONFIG
             chmod 0644 "${CONFIG_DIR}/nginx-stream.example.conf"
         fi
     fi
-    if [ "${PEEPHOLE_CLUSTER:-0}" = 1 ]; then
-        info "Node key: $("$INSTALL_BIN" cluster id "$CONFIG_FILE" 2>/dev/null)"
-        if [ -n "${PEEPHOLE_JOIN_TOKEN:-}" ]; then
-            if "$INSTALL_BIN" cluster join "$PEEPHOLE_JOIN_TOKEN" "$CONFIG_FILE"; then
-                info "Joined the cluster"
-            else
-                warn "joining the cluster failed; retry with: peephole cluster join <token>"
-            fi
+    info "Node key: $("$INSTALL_BIN" cluster id "$CONFIG_FILE" 2>/dev/null)"
+    if [ -n "${PEEPHOLE_JOIN_TOKEN:-}" ]; then
+        if "$INSTALL_BIN" cluster join "$PEEPHOLE_JOIN_TOKEN" "$CONFIG_FILE"; then
+            info "Joined the cluster"
+        else
+            warn "joining the cluster failed; retry with: peephole cluster join <token>"
         fi
     fi
     # On stdin, never on the command line: the hash goes into the database
@@ -1598,6 +1627,14 @@ peephole ${new_version} is installed and running.
 Next steps:
 DONE
 trap_listen="$(sed -n 's/^trap_listen *= *"\([^"]*\)".*/\1/p' "$CONFIG_FILE")"
+# The cluster port peers dial, when this node publishes one (a hand-edited
+# outbound-only config does not).
+cluster_port=""
+if grep -q '^advertise' "$CONFIG_FILE"; then
+    cluster_port="$(sed -n '/^\[cluster\]/,/^\[/s/^listen *= *"[^"]*:\([0-9]*\)".*/\1/p' "$CONFIG_FILE")"
+fi
+ufw_active=0
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then ufw_active=1; fi
 if [ "$NGINX_DONE" = 1 ]; then
     echo "  - nginx is configured: ${NGINX_SITE} (generated from ${CONFIG_DIR}/nginx.example.conf)."
     if [ -n "$admin_listen" ]; then
@@ -1632,16 +1669,12 @@ case "${PEEPHOLE_FRONT:-}" in
     direct)
         # The ports to open: the trap's, and the cluster's when peers dial it.
         open_ports=(80 443)
-        if grep -q '^advertise' "$CONFIG_FILE"; then open_ports+=("${PEEPHOLE_CLUSTER_LISTEN##*:}"); fi
+        [ -z "$cluster_port" ] || open_ports+=("$cluster_port")
         echo "  - The trap listens on ports 80 and 443 itself (nothing in front of it). Open $(printf '%s/tcp ' "${open_ports[@]}" | sed 's/ $//; s/ /, /g')"
         echo "    in any firewall in front of this machine (cloud security group, provider firewall)."
-        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        if [ "$ufw_active" = 1 ]; then
             echo "    ufw is active here; the installer did not change it. To open them:"
-            echo "      ufw allow 80/tcp"
-            echo "      ufw allow 443/tcp"
-            if [ "${#open_ports[@]}" -gt 2 ]; then
-                echo "      ufw allow from <other node> to any port ${open_ports[2]} proto tcp   (per node; or ufw allow ${open_ports[2]}/tcp)"
-            fi
+            for open_port in "${open_ports[@]}"; do echo "      ufw allow ${open_port}/tcp"; done
         fi
         ;;
     remote)
@@ -1662,9 +1695,17 @@ case "${PEEPHOLE_FRONT:-}" in
         ;;
 esac
 if grep -q '^\[cluster\]' "$CONFIG_FILE"; then
-    echo "  - Cluster: open the RPC port to the other nodes only."
+    if [ -n "$cluster_port" ]; then
+        echo "  - Cluster: other members dial $(sed -n 's/^advertise *= *"\([^"]*\)".*/\1/p' "$CONFIG_FILE"); port ${cluster_port}/tcp must be reachable"
+        echo "    from the internet (the installer did not change the firewall)."
+        if [ "$ufw_active" = 1 ] && [ "${PEEPHOLE_FRONT:-}" != direct ]; then
+            echo "    ufw is active here. To open it: ufw allow ${cluster_port}/tcp"
+        fi
+    else
+        echo "  - Cluster: outbound-only (no advertise address); this node dials its peers."
+    fi
     echo "    Node key: $("$INSTALL_BIN" cluster id "$CONFIG_FILE" 2>/dev/null)"
-    if grep -q '^advertise' "$CONFIG_FILE"; then
+    if [ -n "$cluster_port" ]; then
         echo "    Invite others with 'peephole cluster invite' (the invite is reusable; limit it with --uses or --ttl)."
     fi
     echo "    Join a cluster with 'peephole cluster join <token>'; leave with 'peephole cluster leave'."

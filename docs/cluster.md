@@ -15,9 +15,21 @@ Every node keeps a full copy of the dataset, so any web node shows the
 whole cluster. Scanners take jobs from any trap; jobs go to the scanner
 with the fewest recent scans.
 
-Enable it with a `[cluster]` section (see
-[`deploy/config.example.toml`](../deploy/config.example.toml)), then add
-nodes:
+The installer writes a `[cluster]` section on every node (see
+[`deploy/config.example.toml`](../deploy/config.example.toml)): a name, the
+listener and the `advertise` address other members dial, whose port must be
+reachable from the internet. A node without an invite runs alone until it
+joins; a running node picks a join up without a restart.
+
+Outbound-only is the fallback for a node nobody can reach (no public
+address, no port forwarding), set by hand: delete `advertise` and set
+`listen` to loopback (`127.0.0.1:7443`), then restart peephole. Such a node
+dials its peers and still syncs both ways, and receives directed messages
+(it fetches them from its peers' outboxes), so it also answers paid
+lookups, DNS resolutions and probes that arrive as such messages. It cannot
+issue invites: a joiner could not reach it.
+
+Then add nodes:
 
 ```sh
 peephole cluster id                       # this node's key
