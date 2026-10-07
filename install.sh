@@ -8,7 +8,9 @@
 #   PEEPHOLE_VERSION   release tag to install (e.g. v0.1.0); default: the rolling "latest" build of master
 #   PEEPHOLE_VERIFY=1|0  1: require a verified GitHub build provenance attestation (needs the gh CLI);
 #                      0: skip it; unset: verify when gh is installed, warn if that fails
-#   MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY, PEEPHOLE_DOMAIN, PEEPHOLE_TRUSTED_PROXIES  (first install)
+#   MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY, PEEPHOLE_TRUSTED_PROXIES  (first install)
+#   PEEPHOLE_DOMAIN    the admin site's host name (first install); a scheme, a path and a
+#                      trailing dot are stripped, upper case is lowered
 #   ABUSEIPDB_API_KEY, SHODAN_API_KEY  optional enrichment APIs (first install)
 #   PEEPHOLE_INTERNETDB=1|0    use Shodan InternetDB, no key, non-commercial use only (first
 #                              install; asked with default yes, off without a terminal)
@@ -16,19 +18,18 @@
 #                      direct: nothing, the trap takes ports 80 and 443 itself (no proxy trusted);
 #                      local: nginx on this machine (loopback trusted, PEEPHOLE_TRUSTED_PROXIES
 #                      ignored); remote: a proxy on another machine (PEEPHOLE_TRUSTED_PROXIES
-#                      required). Default: remote when PEEPHOLE_TRUSTED_PROXIES is set, local with
-#                      the web role or when 80/443 are taken, direct otherwise
+#                      required, addresses or CIDRs). Default: local with the web role or when
+#                      80/443 are taken, direct otherwise; unattended remote installs set it
 #   PEEPHOLE_LOCAL_PROXY=1|0  older form of PEEPHOLE_FRONT: 1 is local, 0 is remote
 #   PEEPHOLE_OWN_ADDRESSES  public addresses no interface shows (1:1 NAT), comma-separated, for
 #                      [scan] own_addresses; default: what the cloud metadata reports, "-" for none
 #   PEEPHOLE_METADATA=1|0  ask the cloud's metadata service for the public address (default 1)
 #   PEEPHOLE_TTY       read the wizard's answers from this file instead of the terminal (tests)
 #   PEEPHOLE_ROLES     comma-separated subset of listener,scanner,web (asked when a terminal is
-#                      present; all three when there is none)
+#                      present; listener,web when there is none: the scanner is opt-in)
 #   PEEPHOLE_CLUSTER=1|0       take part in a cluster (a preset PEEPHOLE_CLUSTER_NAME implies 1)
 #   PEEPHOLE_CLUSTER_NAME      this node's name in the cluster (first install)
-#   PEEPHOLE_CLUSTER_LISTEN    RPC listener (the prompt offers 0.0.0.0:7443; required in an
-#                              unattended cluster install)
+#   PEEPHOLE_CLUSTER_LISTEN    RPC listener (default 0.0.0.0:7443)
 #   PEEPHOLE_CLUSTER_ADVERTISE host:port peers dial (omit for an outbound-only node)
 #   PEEPHOLE_JOIN_TOKEN        invite from an existing member; joined before the first start
 #   PEEPHOLE_REMOTE_CONFIG     ignored (config keys were replaced by the ownership key: peephole owner adopt)
@@ -40,6 +41,8 @@
 #   BASE_URL           alternative download base (tests, mirrors)
 #
 # Other entry points: --extract-token (reads journal output on stdin),
+# --check-domain VALUE and --check-cidr VALUE (print the admin domain as the
+# installer stores it / whether a trusted proxy entry is valid; tests),
 # --nginx-example and --nginx-stream-example (print the nginx site and the
 # top-level stream config for PEEPHOLE_ROLES, PEEPHOLE_DOMAIN and
 # PEEPHOLE_FRONT=local|remote; deploy/nginx.example.conf and
@@ -106,6 +109,34 @@ valid_ipv4() {
     for o in $1; do [ "$((10#$o))" -le 255 ] || return 1; done
 }
 valid_ip() { valid_ipv4 "$1" || { [[ "$1" == *:* ]] && [[ "$1" =~ ^[0-9A-Fa-f:.]+$ ]]; }; }
+
+# An address, or one with a prefix that fits it (/0-32, /0-128 for IPv6).
+valid_cidr() {
+    local a="${1%/*}" p
+    valid_ip "$a" || return 1
+    [[ "$1" == */* ]] || return 0
+    p="${1##*/}"
+    [[ "$p" =~ ^[0-9]{1,3}$ ]] || return 1
+    if [[ "$a" == *:* ]]; then [ "$p" -le 128 ]; else [ "$p" -le 32 ]; fi
+}
+
+# The admin domain as a bare lower-case host name, from what an operator
+# may paste (https://Name.Example/admin/, a trailing dot); fails on anything
+# that is no host name with at least one dot.
+normalize_domain() {
+    local d="${1,,}"
+    d="${d#http://}"; d="${d#https://}"; d="${d%%/*}"; d="${d%.}"
+    [[ "$d" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+    printf '%s' "$d"
+}
+if [ "${1:-}" = "--check-domain" ]; then
+    if normalize_domain "${2:-}"; then echo; exit 0; fi
+    echo "'${2:-}' is not a host name" >&2; exit 1
+fi
+if [ "${1:-}" = "--check-cidr" ]; then
+    if valid_cidr "${2:-}"; then echo ok; exit 0; fi
+    echo "'${2:-}' is not an address or CIDR" >&2; exit 1
+fi
 
 # Not loopback, private, CGNAT or link-local.
 public_ipv4() {
@@ -470,13 +501,18 @@ toml_safe() {
 }
 
 prompt() {
-    # prompt <varname> <message> [default]: a required value.
+    # prompt <varname> <message> [default]: a required value. Without a
+    # terminal the default is taken; without one either, the install stops.
     local var="$1" msg="$2" default="${3:-}" value=""
     if [ -n "${!var:-}" ]; then return 0; fi
-    [ "$INTERACTIVE" -eq 1 ] || die "missing required setting: ${var} (set it as an environment variable for non-interactive installs)"
-    if [ -n "$default" ]; then say "${msg} [${default}]: "; else say "${msg}: "; fi
-    read -r value <&3 || true
-    [ -n "$value" ] || value="$default"
+    if [ "$INTERACTIVE" -ne 1 ]; then
+        [ -n "$default" ] || die "missing required setting: ${var} (set it as an environment variable for non-interactive installs)"
+        value="$default"
+    else
+        if [ -n "$default" ]; then say "${msg} [${default}]: "; else say "${msg}: "; fi
+        read -r value <&3 || true
+        [ -n "$value" ] || value="$default"
+    fi
     [ -n "$value" ] || die "no value provided for ${var}"
     toml_safe "$value"
     printf -v "$var" '%s' "$value"
@@ -682,10 +718,10 @@ if [ "$upgrade" -ne 1 ]; then
         if [ "$INTERACTIVE" -eq 1 ]; then
             say $'\nWhat should this node do? Any combination works; a cluster shares the work.\n'
             ask_yn ROLE_TRAP "Run a trap (catch and record requests that reach no real site)?" y
-            if [ -n "$CLOUD" ]; then
-                say "${cloud_warning} Run the scanner elsewhere (another node of a cluster)."$'\n'
-            fi
-            ask_yn ROLE_SCANNER "Run the scanner (nmap counter-scans, from this machine's address)?" "$([ -n "$CLOUD" ] && echo n || echo y)"
+            # Opt-in: what it gives and what it costs, wherever this runs.
+            say $'\nThe scanner counter-scans addresses that hit a trap and gives the cluster their open ports\nand services. Cost: nmap traffic from this machine\'s address to other people\'s machines.\nThat draws abuse reports, and most hosting and cloud providers forbid scanning in their\nterms and may suspend the account. Run it only where scanning is allowed.\n'
+            [ -z "$CLOUD" ] || say "This machine runs on ${CLOUD}."$'\n'
+            ask_yn ROLE_SCANNER "Run the scanner (nmap counter-scans, from this machine's address)?" n
             say $'The web interface needs a domain whose DNS points here, and HTTPS (WebAuthn). Without one answer no: in a cluster the admin area of another node shows everything.\n'
             ask_yn ROLE_WEB "Have the web interface (public wall of shame and admin area)?" y
             PEEPHOLE_ROLES=""
@@ -693,7 +729,7 @@ if [ "$upgrade" -ne 1 ]; then
             [ "$ROLE_SCANNER" = 1 ] && PEEPHOLE_ROLES="${PEEPHOLE_ROLES:+$PEEPHOLE_ROLES,}scanner"
             [ "$ROLE_WEB" = 1 ] && PEEPHOLE_ROLES="${PEEPHOLE_ROLES:+$PEEPHOLE_ROLES,}web"
         else
-            PEEPHOLE_ROLES="listener,scanner,web"
+            PEEPHOLE_ROLES="listener,web"
         fi
     fi
     PEEPHOLE_ROLES="$(printf '%s' "$PEEPHOLE_ROLES" | tr -d ' ')"
@@ -720,18 +756,20 @@ if [ "$upgrade" -ne 1 ]; then
                 busy="${busy:+$busy, }port ${p}${holder:+ (${holder})}"
             fi
         done
-        # The default: preset trusted proxies mean a proxy elsewhere (what
-        # unattended installs from before this question got). The web role
-        # needs port 443 for the admin site, so nginx shares it by name.
-        if [ -n "${PEEPHOLE_TRUSTED_PROXIES:-}" ]; then front_default=remote
-        elif has_role web || [ -n "$busy" ]; then front_default=local
+        # The default: the web role needs port 443 for the admin site, so
+        # nginx shares it by name. PEEPHOLE_FRONT alone selects remote (a
+        # preset PEEPHOLE_TRUSTED_PROXIES only answers the next question).
+        if has_role web || [ -n "$busy" ]; then front_default=local
         else front_default=direct
         fi
         while :; do
             front="${PEEPHOLE_FRONT:-}"
             if [ -z "$front" ]; then
                 if [ "$INTERACTIVE" -eq 1 ]; then
-                    say $'\nWhat is in front of the trap?\n  direct  nothing: the trap takes ports 80 and 443 itself\n  local   nginx on this machine (it keeps 80/443 and hands the trap what no real site claims)\n  remote  a proxy or load balancer on another machine\n'
+                    say $'\nWhat is in front of the trap?\n\n'
+                    say $'  direct  Nothing: the trap takes ports 80 and 443 itself. Both must be free, and the\n          web interface cannot run on this node.\n\n'
+                    say $'  local   nginx on this machine keeps 80/443. Real sites keep their server blocks; every\n          other name goes to the trap. The installer can set nginx up.\n\n'
+                    say $'  remote  A proxy or load balancer elsewhere sends plain HTTP for unknown names to port 8080,\n          and passes TLS for unknown names through untouched, with a PROXY protocol v2 header,\n          to port 8081. Ports 8080/8081 should be reachable from the proxy only. Its addresses\n          are asked next.\n\n'
                     say "direct, local or remote [${front_default}]: "
                     read -r front <&3 || true
                 fi
@@ -773,17 +811,32 @@ if [ "$upgrade" -ne 1 ]; then
                 fi
                 PEEPHOLE_TRUSTED_PROXIES="127.0.0.1/32,::1/128" ;;
             remote)
-                if [ "$INTERACTIVE" -eq 1 ] && [ -z "${PEEPHOLE_TRUSTED_PROXIES:-}" ]; then
-                    say $'The proxy sends plain HTTP that matches no real site to the trap (port 8080) and passes TLS\nfor unknown names untouched, with a PROXY protocol v2 header, to the TLS trap (port 8081).\nHosts in these ranges are believed about the client address: list only the proxy.\n'
+                proxies_preset="${PEEPHOLE_TRUSTED_PROXIES:-}"
+                if [ "$INTERACTIVE" -eq 1 ] && [ -z "$proxies_preset" ]; then
+                    # Which network the proxy is on: this machine's own.
+                    nets="$(ip -o addr show scope global 2>/dev/null | awk '{print $4}' || true)"
+                    [ -n "$nets" ] || nets="$(local_addresses)"
+                    say $'\nThis machine\'s addresses:\n'"$(printf '%s\n' "$nets" | sed 's/^/  /')"$'\n'
+                    say $'Hosts in these ranges are believed about the client address: list only the proxy.\nAn address (10.0.0.5), a network (10.0.0.0/24), or several, comma-separated.\n'
                 fi
-                prompt PEEPHOLE_TRUSTED_PROXIES "Address(es) of that proxy, as seen from this machine (CIDRs, comma-separated)"
-                # A bare address is that one host.
-                proxies=""
-                for a in $(printf '%s' "$PEEPHOLE_TRUSTED_PROXIES" | tr ',' ' '); do
-                    if [[ "$a" != */* ]] && valid_ip "$a"; then
-                        if [[ "$a" == *:* ]]; then a="${a}/128"; else a="${a}/32"; fi
+                while :; do
+                    prompt PEEPHOLE_TRUSTED_PROXIES "Address(es) of that proxy, as seen from this machine"
+                    # A bare address is that one host.
+                    proxies=""; bad=""
+                    for a in $(printf '%s' "$PEEPHOLE_TRUSTED_PROXIES" | tr ',' ' '); do
+                        valid_cidr "$a" || { bad="$a"; break; }
+                        if [[ "$a" != */* ]]; then
+                            if [[ "$a" == *:* ]]; then a="${a}/128"; else a="${a}/32"; fi
+                        fi
+                        proxies="${proxies:+$proxies,}${a}"
+                    done
+                    [ -z "$bad" ] && [ -n "$proxies" ] && break
+                    [ -n "$bad" ] || bad="$PEEPHOLE_TRUSTED_PROXIES"
+                    if [ -n "$proxies_preset" ] || [ "$INTERACTIVE" -ne 1 ]; then
+                        die "PEEPHOLE_TRUSTED_PROXIES: '${bad}' is not an address or CIDR"
                     fi
-                    proxies="${proxies:+$proxies,}${a}"
+                    say "'${bad}' is not an address or CIDR"$'\n'
+                    PEEPHOLE_TRUSTED_PROXIES=""
                 done
                 PEEPHOLE_TRUSTED_PROXIES="$proxies" ;;
         esac
@@ -801,12 +854,15 @@ if [ "$upgrade" -ne 1 ]; then
     OWN_ADDRESSES=""
     if has_role listener || has_role scanner; then
         OWN_ADDRESSES="${PEEPHOLE_OWN_ADDRESSES:-$DETECTED_OWN}"
-        if [ -z "${PEEPHOLE_OWN_ADDRESSES:-}" ] && [ -n "$DETECTED_OWN" ] && [ "$INTERACTIVE" -eq 1 ]; then
-            say $'\n'"The ${md_provider} metadata gives this machine the public address ${DETECTED_OWN}, which no interface shows (1:1 NAT)."$'\n'
-            say "Public addresses of this machine that its interfaces do not show (comma-separated; - for none) [${DETECTED_OWN}]: "
+        if [ -z "${PEEPHOLE_OWN_ADDRESSES:-}" ] && [ "$INTERACTIVE" -eq 1 ]; then
+            say $'\nThe address this machine is reached at when no interface carries it (1:1 NAT in a cloud,\nport forwarding at home). The node never scans or blocklists it, and its own requests\nthrough the NAT arrive from it.\n'
+            if [ -n "$DETECTED_OWN" ]; then
+                say "The ${md_provider} metadata gives this machine the public address ${DETECTED_OWN}, which no interface shows."$'\n'
+            fi
+            say "Public addresses of this machine that its interfaces do not show (comma-separated; - for none) [${DETECTED_OWN:--}]: "
             answer=""
             read -r answer <&3 || true
-            OWN_ADDRESSES="${answer:-$DETECTED_OWN}"
+            OWN_ADDRESSES="${answer:-${DETECTED_OWN:--}}"
         fi
         [ "$OWN_ADDRESSES" = - ] && OWN_ADDRESSES=""
         OWN_ADDRESSES="$(printf '%s' "$OWN_ADDRESSES" | tr -d ' ')"
@@ -819,7 +875,19 @@ if [ "$upgrade" -ne 1 ]; then
         fi
     fi
     if has_role web; then
-        prompt PEEPHOLE_DOMAIN "Public domain of the admin dashboard (WebAuthn relying party)"
+        domain_preset="${PEEPHOLE_DOMAIN:-}"
+        if [ "$INTERACTIVE" -eq 1 ] && [ -z "$domain_preset" ]; then
+            say $'\nThe admin site signs in with passkeys bound to its domain. Changing it later makes enrolled passkeys unusable.\n'
+        fi
+        while :; do
+            prompt PEEPHOLE_DOMAIN "Public domain of the admin site, without https:// or a path (e.g. peephole.example.net); its DNS must point here"
+            if domain="$(normalize_domain "$PEEPHOLE_DOMAIN")"; then PEEPHOLE_DOMAIN="$domain"; break; fi
+            if [ -n "$domain_preset" ] || [ "$INTERACTIVE" -ne 1 ]; then
+                die "PEEPHOLE_DOMAIN: '${PEEPHOLE_DOMAIN}' is not a host name"
+            fi
+            say "'${PEEPHOLE_DOMAIN}' is not a host name"$'\n'
+            PEEPHOLE_DOMAIN=""
+        done
         claim_port ADMIN_LISTEN "admin listener" 1
     fi
     # A preset node name means "yes" (unattended installs from before this
@@ -1069,7 +1137,7 @@ max_scans_per_hour = 30    # rate cap of this scanner; excess jobs stay queued
 never_scan = [] # extra CIDRs this node's scanner never scans
 CONFIG
         if [ -n "${OWN_ADDRESSES:-}" ]; then
-            echo "# Public address that no interface carries (1:1 NAT, found by install.sh):"
+            echo "# Public address that no interface carries (1:1 NAT, port forwarding):"
             echo "# never scanned, never in the blocklist."
             echo "own_addresses = [$(toml_list "$OWN_ADDRESSES")]"
         fi

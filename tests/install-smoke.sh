@@ -3,7 +3,8 @@
 # no-op re-run, forced upgrades (an edited unit kept, the rules directory of
 # an older install left alone, database backed up), a failed upgrade that
 # rolls back, the wizard, and what is in front of the trap (nothing, nginx
-# here, a proxy elsewhere) with the port check.
+# here, a proxy elsewhere) with the port check, and the checks of the
+# trusted proxies and the admin domain.
 # Runs as root in a throwaway Debian/Ubuntu container (CI: ubuntu:24.04).
 # PEEPHOLE_BIN is the release binary (default target/release/peephole).
 set -euo pipefail
@@ -57,6 +58,19 @@ echo "== token extraction survives journalctl prefixes"
 tok="$(printf 'Sep 30 10:00:00 host peephole[123]: Open /enroll on the admin interface and enter this one-time token:\nSep 30 10:00:00 host peephole[123]: \nSep 30 10:00:00 host peephole[123]:   3f2a1c4e-1111-4222-8333-444455556666\n' | bash install.sh --extract-token)"
 [ "$tok" = "3f2a1c4e-1111-4222-8333-444455556666" ] || { echo "token extraction broken: '$tok'"; exit 1; }
 
+echo "== the admin domain and trusted proxy entries are checked like the wizard checks them"
+[ "$(bash install.sh --check-domain 'https://Peephole.Example.net/admin/')" = peephole.example.net ]
+[ "$(bash install.sh --check-domain 'peephole.example.net.')" = peephole.example.net ]
+for d in 'not a domain' localhost 'bad"domain'; do
+    if bash install.sh --check-domain "$d" 2>/dev/null; then echo "domain '$d' accepted"; exit 1; fi
+done
+for c in 10.0.0.5 10.0.0.0/24 2001:db8::/64; do
+    bash install.sh --check-cidr "$c" >/dev/null || { echo "CIDR '$c' refused"; exit 1; }
+done
+for c in 10.0.0.0/33 2001:db8::/129 10.0.0.0/x example; do
+    if bash install.sh --check-cidr "$c" 2>/dev/null; then echo "CIDR '$c' accepted"; exit 1; fi
+done
+
 echo "== refuses to install when systemd is not PID 1 (unless overridden)"
 if PEEPHOLE_ALLOW_NO_SYSTEMD='' bash install.sh >/tmp/nopid1.log 2>&1; then echo "expected failure"; exit 1; fi
 grep -q "PID 1" /tmp/nopid1.log
@@ -89,7 +103,8 @@ steps_in_order() {
 }
 
 echo "== fresh install"
-bash install.sh > /tmp/fresh.log 2>&1 || { cat /tmp/fresh.log; exit 1; }
+# A preset PEEPHOLE_TRUSTED_PROXIES no longer means remote: PEEPHOLE_FRONT says so.
+PEEPHOLE_FRONT=remote bash install.sh > /tmp/fresh.log 2>&1 || { cat /tmp/fresh.log; exit 1; }
 test -x /usr/local/bin/peephole
 test -f /etc/peephole/config.toml
 # The signature rules are built into the binary: none on disk, none shipped.
@@ -104,6 +119,8 @@ test -f /etc/peephole/config.example.toml
 [ "$(stat -c %a /etc/peephole)" = 750 ] && [ "$(stat -c %a /var/lib/peephole)" = 700 ]
 [ "$(stat -c %a /etc/peephole/config.toml)" = 600 ]
 grep -q '^never_scan = \[\]' /etc/peephole/config.toml
+# The scanner is opt-in: off without a terminal.
+grep -q '^scanner = false' /etc/peephole/config.toml
 # Top level (before the first table), keep everything by default.
 [ "$(grep -m1 -n -E '^(retention_days = 0|\[)' /etc/peephole/config.toml)" = "$(grep -n '^retention_days = 0' /etc/peephole/config.toml)" ]
 grep -q 'commit 0123456789ab' /tmp/fresh.log
@@ -215,9 +232,9 @@ reset_install() {
 
 echo "== wizard: trap only, behind a local nginx (answers typed at the prompts)"
 reset_install
-# trap? yes · scanner? no · web? no · in front: local · cluster? no · MaxMind: skip ·
-# AbuseIPDB key · Shodan: skip · InternetDB? no
-printf 'y\nn\nn\nlocal\n\n\nabuse-key-1\n\nn\n' > /tmp/answers
+# trap? yes · scanner? no · web? no · in front: local · own addresses: none ·
+# cluster? no · MaxMind: skip · AbuseIPDB key · Shodan: skip · InternetDB? no
+printf 'y\nn\nn\nlocal\n\n\n\nabuse-key-1\n\nn\n' > /tmp/answers
 # PEEPHOLE_TRUSTED_PROXIES stays preset (10.0.0.0/8): the local proxy answer replaces it, with a warning.
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard1.log 2>&1 || { cat /tmp/wizard1.log; exit 1; }
@@ -286,9 +303,9 @@ test ! -e /usr/local/bin/peephole
 
 echo "== wizard: a value the binary rejects leaves no config behind"
 reset_install
-# trap? no · scanner? yes · web? no · cluster? yes · name · listen "bogus" ·
-# advertise (none) · token (none) · MaxMind: skip
-printf 'n\ny\nn\ny\nscanner-9\nbogus\n\n\n\n' > /tmp/answers
+# trap? no · scanner? yes · web? no · own addresses: none · cluster? yes · name ·
+# listen "bogus" · advertise (none) · token (none) · MaxMind: skip
+printf 'n\ny\nn\n\ny\nscanner-9\nbogus\n\n\n\n' > /tmp/answers
 if env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard-bad.log 2>&1; then
     echo "expected failure"; exit 1
@@ -298,9 +315,9 @@ test ! -e /etc/peephole/config.toml
 
 echo "== wizard: re-run after the rejected answer asks again (scanner in a cluster)"
 # No reset: the binary from the failed run is in place.
-# trap? no · scanner? yes · web? no · cluster? yes · name · listen (default) ·
-# advertise · token (none) · MaxMind: skip
-printf 'n\ny\nn\ny\nscanner-9\n\nscan9.example:7443\n\n\n' > /tmp/answers
+# trap? no · scanner? yes · web? no · own addresses: none · cluster? yes · name ·
+# listen (default) · advertise · token (none) · MaxMind: skip
+printf 'n\ny\nn\n\ny\nscanner-9\n\nscan9.example:7443\n\n\n' > /tmp/answers
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard4.log 2>&1 || { cat /tmp/wizard4.log; exit 1; }
 if grep -q 'already up to date' /tmp/wizard4.log; then echo "re-run after a failed first install skipped the wizard"; exit 1; fi
@@ -437,8 +454,8 @@ test ! -e /usr/local/bin/peephole
 
 echo "== wizard: direct with the web role is explained and asked again (default local)"
 reset_install
-# in front: direct (refused) · then the default; the rest at its defaults
-printf 'direct\n\n' > /tmp/answers
+# in front: direct (refused) · then the default · own addresses: none; the rest at its defaults
+printf 'direct\n\n\n' > /tmp/answers
 PEEPHOLE_ROLES=listener,web PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/direct-web-wizard.log 2>&1 \
     || { cat /tmp/direct-web-wizard.log; exit 1; }
 grep -q 'admin site needs it too' /tmp/direct-web-wizard.log
@@ -487,6 +504,31 @@ grep -q 'not health-check' /tmp/remote.log
 if grep -q 'rm /etc/nginx/sites-enabled/default' /tmp/remote.log; then echo "remote trap told to set up a local nginx"; exit 1; fi
 /usr/local/bin/peephole check-config /etc/peephole/config.toml
 
+echo "== a bad trusted proxy is refused before anything is written"
+reset_install
+if PEEPHOLE_FRONT=remote PEEPHOLE_ROLES=listener PEEPHOLE_TRUSTED_PROXIES=10.0.0.0/33 \
+    bash install.sh > /tmp/remote-bad.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q "'10.0.0.0/33' is not an address or CIDR" /tmp/remote-bad.log
+test ! -e /etc/peephole/config.toml
+test ! -e /usr/local/bin/peephole
+
+echo "== the admin domain is normalised"
+reset_install
+PEEPHOLE_FRONT=remote PEEPHOLE_DOMAIN='https://Peephole.Example.net/admin/' \
+    bash install.sh > /tmp/domain.log 2>&1 || { cat /tmp/domain.log; exit 1; }
+grep -q '^rp_id = "peephole.example.net"' /etc/peephole/config.toml
+grep -q '^origin = "https://peephole.example.net"' /etc/peephole/config.toml
+grep -q 'server_name peephole.example.net;' /etc/peephole/nginx.example.conf
+reset_install
+if PEEPHOLE_FRONT=remote PEEPHOLE_DOMAIN='not a domain' bash install.sh > /tmp/domain-bad.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q "not a host name" /tmp/domain-bad.log
+test ! -e /etc/peephole/config.toml
+test ! -e /usr/local/bin/peephole
+
 echo "== a taken trap port: unattended stops, the wizard offers the next free ones"
 reset_install
 python3 -m http.server 8080 --bind 127.0.0.1 >/dev/null 2>&1 &
@@ -498,8 +540,8 @@ fi
 grep -q 'port 8080 for the trap listener (127.0.0.1:8080) is in use' /tmp/port-busy.log
 test ! -e /etc/peephole/config.toml
 # in front: local · 127.0.0.1:8081 for the trap? yes · 127.0.0.1:8082 for TLS? yes ·
-# cluster? no · MaxMind: skip · API keys: skip · InternetDB? no
-printf 'local\ny\ny\nn\n\n\n\nn\n' > /tmp/answers
+# own addresses: none · cluster? no · MaxMind: skip · API keys: skip · InternetDB? no
+printf 'local\ny\ny\n\nn\n\n\n\nn\n' > /tmp/answers
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_TRUSTED_PROXIES PEEPHOLE_ROLES=listener \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/port-offer.log 2>&1 || { cat /tmp/port-offer.log; exit 1; }
 grep -q '^trap_listen = "127.0.0.1:8081"' /etc/peephole/config.toml
