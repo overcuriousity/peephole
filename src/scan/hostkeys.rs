@@ -82,6 +82,34 @@ fn key_attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
         .map(|a| a.value.to_string())
 }
 
+/// The PTR names nmap recorded for the host (`<hostname type="PTR">`),
+/// as valid host names, without repeats. Unparsable input yields what was
+/// found before the error.
+pub fn ptr_names(xml: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    while let Ok(ev) = reader.read_event_into(&mut buf) {
+        match ev {
+            Event::Start(e) | Event::Empty(e)
+                if e.name().as_ref() == "hostname"
+                    && key_attr(&e, "type").as_deref() == Some("PTR") =>
+            {
+                if let Some(n) =
+                    key_attr(&e, "name").and_then(|n| crate::intel::dns::valid_name(&n))
+                    && !out.contains(&n)
+                {
+                    out.push(n);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
+}
+
 /// Every identifier in an nmap XML report. Unparsable input yields what
 /// was found before the error: the XML comes from nmap, but the values in
 /// it from the scanned source.

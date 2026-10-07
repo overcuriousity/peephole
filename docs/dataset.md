@@ -122,7 +122,8 @@ Treat them as weak labels, or re-label from `method`, `path`, `query`,
 
 ### Everything else known about the address
 
-Three JSON text columns, identical on every row of the same address. They
+Four JSON text columns: `intel`, `scans` and `names` are identical on every
+row of the same address, `fingerprints` belongs to the row's request. They
 can be large (an nmap XML per scan), so for per-address work take one row
 per `ip` first (`DISTINCT ON`, `group_by(...).first()`).
 
@@ -159,6 +160,21 @@ scan is an audit: the `uid` of the scan it checks. An audit is a scan run
 again by another scanner, not a counter-scan of its own; its `node` and
 `scanner` are the auditing node, and its `status` is its own (`done` once
 it finished), not that of the job it checks.
+
+**`names`**: host names known to point at the address, by name.
+
+```json
+[{"name": "example.com", "source": "dns", "first_seen": "…", "last_seen": "…", "votes": 4, "answered": 5},
+ {"name": "host-7.example.net", "source": "ptr", "first_seen": "…", "last_seen": "…", "votes": 0, "answered": 0}]
+```
+
+`dns`: an admin looked the name up and up to five nodes resolved it; the
+address is listed when more than half of the resolvers that answered
+returned it (`votes` of `answered`; `1` of `1` is a single, unverified
+resolver). Disputed addresses are not exported. `ptr`: the reverse name
+nmap reported in a scan of the address, as the address's own DNS claims it
+(`votes` and `answered` are 0). Names are in ASCII form (`xn--` for
+international ones).
 
 **`fingerprints`**: browser fingerprints the trap page collected from this
 request (`request` rows only, usually empty: scanners rarely run

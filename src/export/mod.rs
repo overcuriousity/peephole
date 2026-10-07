@@ -115,6 +115,8 @@ pub struct ExportRow {
     /// large: nmap XML) rather than copied.
     pub intel: Arc<str>,
     pub scans: Arc<str>,
+    /// The address's agreed names (`ip_names`).
+    pub names: Arc<str>,
     pub fingerprints: Arc<str>,
 }
 
@@ -163,6 +165,7 @@ pub const COLUMNS: &[&str] = &[
     "is_tor",
     "intel",
     "scans",
+    "names",
     "fingerprints",
     "message",
     "datetime",
@@ -247,6 +250,7 @@ impl ExportRow {
     fn size(&self) -> usize {
         512 + self.intel.len()
             + self.scans.len()
+            + self.names.len()
             + self.fingerprints.len()
             + self.path.len()
             + self.query.as_ref().map_or(0, String::len)
@@ -266,13 +270,14 @@ impl ExportRow {
         match column {
             "intel" => Some(&self.intel),
             "scans" => Some(&self.scans),
+            "names" => Some(&self.names),
             "fingerprints" => Some(&self.fingerprints),
             _ => None,
         }
     }
 
     /// The row as JSON, keyed by [`COLUMNS`]; blobs in base64. The JSON
-    /// text columns (`intel`, `scans`, `fingerprints`) are not in it.
+    /// text columns (`intel`, `scans`, `names`, `fingerprints`) are not in it.
     pub fn to_json(&self) -> serde_json::Map<String, Value> {
         let headers: Vec<[&str; 2]> = self
             .headers
@@ -381,7 +386,7 @@ pub fn jsonl_rows(rows: &[ExportRow]) -> String {
         // The JSON text columns go in as they are, not parsed again.
         let small = Value::Object(r.to_json()).to_string();
         out.push_str(&small[..small.len() - 1]);
-        for c in ["intel", "scans", "fingerprints"] {
+        for c in ["intel", "scans", "names", "fingerprints"] {
             out.push_str(&format!(",\"{c}\":"));
             out.push_str(r.json_text(c).unwrap_or("null"));
         }
@@ -426,6 +431,7 @@ fn node_id(origin: &[u8]) -> String {
 struct IpCols {
     intel: Arc<str>,
     scans: Arc<str>,
+    names: Arc<str>,
     /// GeoLite2 and Tor results with their times, oldest first.
     geo: Vec<(i64, Value)>,
     tor: Vec<(i64, bool)>,
@@ -492,9 +498,31 @@ fn ip_cols(ip: &str, ip_id: i64, ctx: &PageContext, opts: &ExportOptions) -> IpC
     IpCols {
         intel: Value::Array(intel).to_string().into(),
         scans: Value::Array(scans).to_string().into(),
+        names: names_json(ctx.names.get(&ip_id).map_or(&[], Vec::as_slice))
+            .to_string()
+            .into(),
         geo,
         tor,
     }
+}
+
+/// The `names` column: an address's agreed names.
+pub(crate) fn names_json(names: &[crate::store::export::NameOut]) -> Value {
+    Value::Array(
+        names
+            .iter()
+            .map(|n| {
+                json!({
+                    "name": n.name,
+                    "source": n.source,
+                    "first_seen": iso8601(&n.first_seen),
+                    "last_seen": iso8601(&n.last_seen),
+                    "votes": n.votes,
+                    "answered": n.answered,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn scan_json(s: &ScanOut, ports: &[crate::store::export::PortOut], opts: &ExportOptions) -> Value {
@@ -565,6 +593,7 @@ fn fill_ip(
 ) {
     row.intel = cols.intel.clone();
     row.scans = cols.scans.clone();
+    row.names = cols.names.clone();
     row.fp_claim = ctx.claimed.contains(&ip_id);
     if opts.mode == Mode::Full
         && let Some(g) = as_of(&cols.geo, row.ts_ms)
@@ -891,6 +920,7 @@ mod tests {
             body: Some(b"a=1".to_vec()),
             intel: "[]".into(),
             scans: "[]".into(),
+            names: "[]".into(),
             fingerprints: "[]".into(),
             ..Default::default()
         }

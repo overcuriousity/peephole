@@ -95,6 +95,7 @@ fn schema() -> SchemaRef {
         flag("is_tor", true),
         s("intel", false),
         s("scans", false),
+        s("names", false),
         s("fingerprints", false),
         s("message", false),
         s("timestamp_desc", false),
@@ -224,6 +225,7 @@ fn batch(schema: SchemaRef, rows: &[ExportRow]) -> Result<RecordBatch> {
         bools(rows.iter().map(|r| r.is_tor)),
         json(|r| &r.intel),
         json(|r| &r.scans),
+        json(|r| &r.names),
         json(|r| &r.fingerprints),
         strs(
             rows.iter()

@@ -23,6 +23,7 @@
     </div>
   {% endfor %}
   </div>
+  {% if let Some(a) = t.admin %}{% if !a.names.is_empty() %}{% let names = a.names %}{% include "_names.html" %}{% endif %}{% endif %}
 </section>
 
 {% if let Some(a) = t.actions %}{% include "_actions.html" %}{% endif %}
