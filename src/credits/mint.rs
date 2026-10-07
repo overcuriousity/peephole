@@ -98,25 +98,26 @@ pub async fn active_days(
     from_day: u32,
     to_day: u32,
 ) -> Result<BTreeSet<(NodeId, u32)>> {
-    let mut out = BTreeSet::new();
-    for m in members {
-        for day in from_day..=to_day {
-            let lo = (day as u64 * DAY_MS) << 16;
-            let hi = end_of(day);
-            let any: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM requests WHERE origin = ? AND hlc BETWEEN ? AND ?)",
-            )
-            .bind(&m.0[..])
-            .bind(crate::cluster::hlc::to_db(lo))
-            .bind(crate::cluster::hlc::to_db(hi))
-            .fetch_one(pool)
-            .await?;
-            if any {
-                out.insert((*m, day));
-            }
-        }
-    }
-    Ok(out)
+    // One pass over the (origin, hlc) index: the HLC's physical part is
+    // its upper 48 bits, in ms; integer division gives the UTC day.
+    let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT DISTINCT origin, (hlc >> 16) / ? FROM requests
+         WHERE origin IS NOT NULL AND hlc BETWEEN ? AND ?",
+    )
+    .bind(DAY_MS as i64)
+    .bind(crate::cluster::hlc::to_db((from_day as u64 * DAY_MS) << 16))
+    .bind(crate::cluster::hlc::to_db(end_of(to_day)))
+    .fetch_all(pool)
+    .await?;
+    let members: BTreeSet<&NodeId> = members.iter().collect();
+    Ok(rows
+        .into_iter()
+        .filter_map(|(origin, day)| {
+            let id = NodeId::from_slice(&origin).ok()?;
+            let day = u32::try_from(day).ok()?;
+            members.contains(&id).then_some((id, day))
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -238,7 +239,8 @@ mod tests {
             .upsert_ip("203.0.113.7".parse().unwrap())
             .await
             .unwrap();
-        for (who, day) in [(1u8, DAY), (1, DAY), (2, DAY + 1)] {
+        // Not a member (4), or outside the days asked (DAY + 2): left out.
+        for (who, day) in [(1u8, DAY), (1, DAY), (2, DAY + 1), (4, DAY), (2, DAY + 2)] {
             sqlx::query("INSERT INTO requests (ts, ip_id, method, path, headers_json, origin, hlc) VALUES ('2026-01-01T00:00:00Z', ?, 'GET', '/', '[]', ?, ?)")
                 .bind(ip.id)
                 .bind(&id(who).0[..])
