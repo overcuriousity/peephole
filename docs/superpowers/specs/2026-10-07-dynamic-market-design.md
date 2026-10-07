@@ -1,6 +1,6 @@
 # Dynamic market: a fixed mint, an allowance, prices from supply and demand
 
-Date: 2026-10-07 · Status: draft.
+Date: 2026-10-07 · Status: implemented.
 
 Replaces the credit rules of "Credits: lookups are paid with scans" in
 `docs/cluster.md` and rewrites that section when implemented. Builds on the

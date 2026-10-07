@@ -146,55 +146,69 @@ can still belong together: they share an **ownership key**.
 Config keys (`cluster.remote_config`, `peephole cluster config-key`) are
 gone. `remote_config` in a config file is ignored.
 
-## Credits: lookups are paid with scans
+## Credits: a market for the cluster's work
 
-A lookup (Admin → Lookup) asks every provider the cluster reaches about one
-address. It is paid with **credits**, and credits are earned by the work
-the cluster asked for: completed counter-scans.
+Services between nodes (lookups, probes, domain resolutions, scan jobs) are
+paid with **credits**. Every price is set by supply and demand; scanners
+earn most of the new money, every member a little.
 
-- **Earning.** A completed scan pays its scanner 1 credit (levels 1, 2) or
-  2 (levels 3, 4) and the trap that queued the job a quarter of that. One
-  paid scan per address in 24 hours, 500 a day per node and role. A credit
-  can be used on the day it was earned and the 6 days after.
-- **What does not earn.** A scan run with your own `scan.level_argv`
-  (no scanner share at that level), a scan no request held on the judging
-  node backs, uptime, recorded requests, audits.
+- **Where credits come from.** Two doors only. The daily mint: 1000
+  credits split among scanners by their counted scans of the UTC day;
+  levels 3 and 4 count twice, levels 1 and 2 once. A scan counts when a
+  request held on the judging node backs it, once per address in 24 hours,
+  500 a day per scanner, with the built-in arguments, and never when the
+  scanner is the trap that queued the job. The allowance: 5 credits a day
+  for every member that earns here and recorded a request that day.
+  Both are credited when the UTC day ends.
+- **Where they go.** A credit is gone 7 days after its day. Nothing else
+  destroys credits: a payment moves the full price.
+- **Prices.** One rule per good, computed hourly on each node: excess
+  demand raises a price by at most a factor of e^0.45 an hour, excess
+  supply lowers it by at most a factor of e^-0.15 an hour, and a price
+  never goes under 0.001 credits. What a node answers itself is free (its
+  own providers, prober, resolver, scanner). What another node answers is
+  paid, whoever owns it, the Tor exit list, RDAP, InternetDB and GeoLite2
+  included; there is no free quota. A provider with an API budget offers
+  its on-demand share (`[enrichment] on_demand_share`); one without, and
+  name resolution, offer `[enrichment] offer_per_day` (default 1000) a
+  day. Askers go to the cheapest server first. The Lookup page runs this
+  node's own providers by itself and asks other nodes only for the
+  providers picked; an automatic lookup never buys from another node.
+- **Domains.** A lookup of a domain asks 5 resolvers (nodes of the
+  cluster) and lists each address with its votes; an address stands when
+  most of the resolvers that answered returned it. Each other resolver is
+  paid its announced price when it answers; a failed resolution costs
+  nothing; this node's own resolver is free. Agreed names are replicated
+  as `ip_name` records and appear in the dataset's `names` column.
+- **Probes.** An observational probe of the ports a scan found open is
+  priced on each scanner like a provider, with its probe slots as supply,
+  and paid per vantage. The offer is accepted first, the result arrives
+  when the scanner has finished; an accepted probe with no result lapses
+  after 15 minutes.
+- **Scan jobs.** The arbiter (the node that queued the job) funds its jobs
+  from its own balance, up to `[credits] scan_share` (default 0.5) of it.
+  Scanners ask arbiters with funded jobs first, best paying first. The
+  scanner charges the offered price when it delivers the result, and
+  nothing when it does not. A scan offer lapses after the longest scan
+  (12 hours plus 2 minutes). Jobs that are not funded are scanned by idle
+  capacity and earn the mint only.
 - **Every node counts for itself**, from its own copy of the log. There is
-  no vote and no shared chain; `Cluster › Credits` shows this node's count
-  and says why a scan was not paid in full.
-- **Conformity.** A member earns on your node only while at least 98 % of
-  its newest 500 requests classify the same with your rules, and its scans
-  stand up to the audits you believe: those of your own nodes. A scanner
-  runs 5 % of the other nodes' fresh scans again (`[credits] audit_share`);
-  audits earn nothing.
-- **Prices** follow what the cluster earns and what it can serve: each
-  serving node computes one unit price an hour (a day's earnings buy a
-  day's lookups), halved while the scanners idle and doubled when they are
-  saturated. A keyed API costs 1 unit, Shodan InternetDB and GeoLite2 a
-  quarter, the Tor exit list nothing. Half of what you pay goes to the
-  node that answered, half is destroyed. Your own providers cost the same.
-- **Probes.** An observational probe of the ports a scan found open
-  (headers, certificates, JARM, SSH host keys) costs 4 units times the
-  surge, announced per scanner and paid per vantage; half of each payment
-  is destroyed. The answer comes in two phases: the offer is accepted
-  first, the result arrives when the scanner has finished. An accepted
-  probe with no result lapses after 15 minutes. Nothing is minted.
+  no vote and no shared chain; `Cluster › Credits` shows this node's
+  balance, the mint, the allowance, income by source, the market's prices,
+  and says why a scan was not counted.
+- **Conformity and audits.** A member earns on your node only while at
+  least 98 % of its newest 500 requests classify the same with your
+  rules, and its scans stand up to the audits you believe: those of your
+  own nodes. A scanner runs 5 % of the other nodes' fresh scans again
+  (`[credits] audit_share`); audits earn nothing.
 - **Your budgets are safe.** Paid lookups take at most
   `[enrichment] on_demand_share` (a fifth by default) of each API budget,
-  whatever happens to credits. A provider whose share ran out costs double
-  the next day.
+  whatever happens to credits.
 - **Known addresses.** A lookup shows everything the dataset holds on the
   address. A provider answer under 24 hours old is shown instead of asking
   again, free. An answer that was paid for is kept in the dataset when the
   cluster has recorded the address (members can then infer who looked it
-  up); for an address nobody recorded nothing is written anywhere. The
-  cheap tier (the dataset, fresh answers, free providers) runs by itself;
-  paid providers are offered with their prices.
-- **Domains.** A lookup of a domain asks 5 resolvers (nodes of the
-  cluster) and lists each address with its votes; an address stands when
-  most of the resolvers that answered returned it. Disputed names are
-  shown with their votes. Agreed names are replicated as `ip_name`
-  records and appear in the dataset's `names` column.
+  up); for an address nobody recorded nothing is written anywhere.
 - **Your nodes as one.** `Cluster › Ownership › Collect credits here`
   makes one node of yours the collecting node: the others forward what
   they earn and draw from it when a lookup needs more than they hold.
@@ -205,25 +219,33 @@ the cluster asked for: completed counter-scans.
   carry seals over its log. Members that hold the proof show "showed two
   histories"; that node's credits are void there for good.
 - **What this cannot do.**
-  - It cannot tell a recorded request nobody sent from a real one. Honest
-    scanners then scan the address and the inventor earns the trap share
-    (at most 0.5 per address and day). `scan.trusted_origins` and blocking
-    are the answer.
+  - It cannot tell a recorded request nobody sent from a real one. Such
+    requests mint nothing, but they create jobs that idle scanners scan
+    for the mint. `scan.trusted_origins` and blocking are the answer.
+  - Two keys of one operator (a trap and a scanner) pass the own-job rule
+    and take a larger share of the fixed mint from honest scanners, up to
+    500 scans a day. Blocking is the answer.
+  - Many node keys each draw the allowance. Joining needs an invite, a
+    member admits at most 20 nodes a day, and each key must first pass the
+    rules agreement.
+  - A free rider (`scan_share = 0`) gets its attackers scanned only by
+    idle capacity; with many of them the scan price understates demand.
+  - A sensor with a small allowance can be priced out of goods that cost
+    more than 7 days of it.
+  - Credits have no outside value: an API node is paid in services of the
+    cluster.
+  - The constants come from an abstract simulation, not from a real
+    cluster; the Credits page shows what is needed to adjust them.
   - A majority of colluding resolvers can agree on a wrong address; the
     per-address votes are shown so a single odd answer stands out.
   - Invented scan results are caught only by audits, and only for sources
     still reachable 30 minutes after the scan arrived.
   - It cannot stop one double spend per node key: the second branch is
     proven and the node's credits are void everywhere afterwards.
-  - Many node keys of one operator are bounded only by each server's
-    on-demand share, not per node.
   - A server can take the price and not answer; you lose that lookup's
     price, and the receipt is public. A server that declines and names a
     higher price is offered it once, up to twice its announced price;
     beyond that the next server is asked.
-  - Announced pace and lookup capacity are claims. Inflated ones lower
-    the price until the surge corrects it; blocked members are not
-    counted.
   - A member that spent its credits and then stops earning here (its
     rules agreement drops below 98 %) loses its earnings of the last 8
     days in every node's count, and the servers it paid lose those
@@ -231,12 +253,13 @@ the cluster asked for: completed counter-scans.
   - A receipt counts when it arrives late; if the lapsed offer was spent
     again elsewhere, the second server is paid less (at most the first
     server's price).
-  - A node that is trap and scanner and whose log lags the clock can date
-    a few days of scans at once, one time per node key.
   - A sibling that was broken into can spend what your collecting node
     holds (credits of at most 7 days); release it.
   - Lookups of recorded addresses are visible to members, with a good
     guess at who asked.
+- **Upgrading.** Protocol 4: payments run only between upgraded nodes, so
+  upgrade all nodes together. Balances are recounted at start under the
+  new rules.
 
 ## Things to know
 
