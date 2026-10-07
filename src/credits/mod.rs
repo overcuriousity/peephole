@@ -223,8 +223,7 @@ pub async fn run(
                 tracing::debug!(?e, "credits: pruning failed");
             }
         }
-        // Every tick (one count and the cached book), so the hourly price
-        // below sees this node's bids.
+        // Every tick (one count and the cached book), for the heartbeat.
         if let Err(e) = jobs::announce_bids(&node).await {
             tracing::debug!(?e, "credits: scan bids not computed");
         }

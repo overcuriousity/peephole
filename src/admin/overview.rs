@@ -417,7 +417,7 @@ async fn cluster_figures(
             format!("{:.0}", t.capacity.utilization * 100.0),
         ),
         audits,
-        scan: show(t.scan_mc as u64),
+        scan: t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64)),
         price_range: keyed
             .iter()
             .min()

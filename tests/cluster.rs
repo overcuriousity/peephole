@@ -6070,7 +6070,7 @@ async fn the_overview_shows_the_clusters_credit_figures() {
     assert!(html.contains(&show(mint / 7)), "earned a day");
     assert!(html.contains("200"), "paid lookups a day");
     assert!(
-        html.contains(&show(t.scan_mc as u64)),
+        html.contains(&t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64))),
         "what a funded scan job costs"
     );
     assert!(html.contains("Forks") && html.contains("Audits"));

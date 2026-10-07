@@ -419,8 +419,8 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             .unwrap_or_else(|| p.to_string())
     };
     let price = PriceView {
-        scan: show(t.scan_mc as u64),
-        scan_bids: t.scan_bids,
+        scan: t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64)),
+        scan_bids: 0,
         capacity_per_hour: format!("{:.0}", (t.capacity.per_day / 24.0).max(0.0)),
         utilization: format!("{:.0}", t.capacity.utilization * 100.0),
         probe: t.probe_mc.map(|m| show(m as u64)),
