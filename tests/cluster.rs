@@ -5272,7 +5272,7 @@ async fn a_paid_lookup_of_a_recorded_address_is_kept_and_then_free_for_everyone(
             .sum::<usize>()
     };
 
-    let first = lookup::run(&rec(&na), &none, ip, &[]).await;
+    let first = lookup::run(&rec(&na), &none, ip, &["abuseipdb".to_string()], &[]).await;
     assert!(first.stored.is_empty());
     assert_eq!(findings(&first), 1, "{:?}", first.answers);
     assert!(first.kept);
@@ -5291,7 +5291,7 @@ async fn a_paid_lookup_of_a_recorded_address_is_kept_and_then_free_for_everyone(
 
     // Another member, without credits, within 24 hours: from the dataset.
     let payments = entries::since(&nc.store.pool, 0).await.unwrap().len();
-    let second = lookup::run(&rec(&nc), &none, ip, &[]).await;
+    let second = lookup::run(&rec(&nc), &none, ip, &["abuseipdb".to_string()], &[]).await;
     assert_eq!(second.stored.len(), 1);
     assert_eq!(second.stored[0].provider, "abuseipdb");
     assert_eq!(second.stored[0].node.as_deref(), Some("node-bravo"));
@@ -5305,7 +5305,14 @@ async fn a_paid_lookup_of_a_recorded_address_is_kept_and_then_free_for_everyone(
     );
 
     // "Ask again" forces a paid lookup of that provider.
-    let again = lookup::run(&rec(&na), &none, ip, &["abuseipdb".to_string()]).await;
+    let again = lookup::run(
+        &rec(&na),
+        &none,
+        ip,
+        &["abuseipdb".to_string()],
+        &["abuseipdb".to_string()],
+    )
+    .await;
     assert!(again.stored.is_empty());
     assert_eq!(findings(&again), 1);
     assert_eq!(asked.load(Ordering::SeqCst), 2);
@@ -5327,7 +5334,7 @@ async fn a_paid_lookup_of_an_unrecorded_address_writes_nothing() {
     price_seen(&na, b.id, "abuseipdb").await;
     let none: peephole::intel::Providers = vec![];
     let ip = "203.0.113.91".parse().unwrap();
-    let out = lookup::run(&rec(&na), &none, ip, &[]).await;
+    let out = lookup::run(&rec(&na), &none, ip, &["abuseipdb".to_string()], &[]).await;
     assert_eq!(
         out.answers
             .iter()
@@ -5360,7 +5367,7 @@ async fn a_paid_lookup_of_an_unrecorded_address_writes_nothing() {
         );
     }
     // And a second lookup pays again: nothing was there to answer from.
-    let out = lookup::run(&rec(&na), &none, ip, &[]).await;
+    let out = lookup::run(&rec(&na), &none, ip, &["abuseipdb".to_string()], &[]).await;
     assert!(out.stored.is_empty());
 }
 
@@ -5507,16 +5514,29 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
 
     let form = text(&admin, format!("{base}/admin/lookup?ip=198.51.100.77")).await;
     assert!(form.contains("Balance") && form.contains("10.00"), "{form}");
-    assert!(form.contains("node-bravo"), "who would be asked");
+    // The cheap tier runs by itself; the paid provider is offered, with
+    // the node that would answer and its price.
+    let cheap = admin
+        .post(format!("{base}/admin/lookup"))
+        .form(&[("ip", "198.51.100.77")])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(cheap.contains("Ask for more"), "{cheap}");
+    assert!(cheap.contains("node-bravo"), "who would be asked");
     assert!(
-        form.contains(&peephole::credits::show(cost as u64)),
+        cheap.contains(&peephole::credits::show(cost as u64)),
         "and at what price"
     );
+    assert!(!cheap.contains("charged"), "nothing paid yet");
 
     let ip_page = text(&admin, format!("{base}/ip/198.51.100.77")).await;
     let result = admin
         .post(format!("{base}/admin/lookup"))
-        .form(&[("ip", "198.51.100.77")])
+        .form(&[("ip", "198.51.100.77"), ("ask", "abuseipdb")])
         .send()
         .await
         .unwrap()
@@ -5576,7 +5596,7 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     .unwrap();
     let unknown = admin
         .post(format!("{base}/admin/lookup"))
-        .form(&[("ip", "198.51.100.78")])
+        .form(&[("ip", "198.51.100.78"), ("ask", "abuseipdb")])
         .send()
         .await
         .unwrap()

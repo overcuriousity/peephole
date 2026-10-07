@@ -424,15 +424,17 @@ pub fn compact(v: &Value, now: DateTime<Utc>) -> Value {
             .flatten()
             .filter_map(|r| r.as_str())
             .collect();
-        if roles.contains(&"registrant") && !m.contains_key("org") {
-            if let Some(fn_) = vcard_text(e, "fn") {
-                put(&mut m, "org", json!(fn_));
-            }
+        if roles.contains(&"registrant")
+            && !m.contains_key("org")
+            && let Some(fn_) = vcard_text(e, "fn")
+        {
+            put(&mut m, "org", json!(fn_));
         }
-        if roles.contains(&"abuse") && !m.contains_key("abuse") {
-            if let Some(mail) = vcard_text(e, "email") {
-                put(&mut m, "abuse", json!(mail));
-            }
+        if roles.contains(&"abuse")
+            && !m.contains_key("abuse")
+            && let Some(mail) = vcard_text(e, "email")
+        {
+            put(&mut m, "abuse", json!(mail));
         }
     }
     if let Some(d) = event_date(v, "registration") {

@@ -3014,6 +3014,7 @@ async fn admin_nav_groups_pages_under_seven_tabs() {
     for want in [
         ">Overview<",
         ">Analytics<",
+        ">Lookup<",
         ">Scans<",
         ">Links<",
         ">Inbox<",
@@ -3026,7 +3027,6 @@ async fn admin_nav_groups_pages_under_seven_tabs() {
         ">Queue<",
         ">Fingerprints<",
         ">Canaries<",
-        ">Lookup<",
         ">Export<",
         ">Keys<",
     ] {

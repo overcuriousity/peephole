@@ -102,16 +102,32 @@ impl GeoIp {
     }
 
     pub fn coords(&self, ip: &IpAddr) -> Option<Coords> {
-        let rec = self.city.lookup(*ip).ok()?.decode::<CityRecord>().ok().flatten()?;
+        let rec = self
+            .city
+            .lookup(*ip)
+            .ok()?
+            .decode::<CityRecord>()
+            .ok()
+            .flatten()?;
         let l = rec.location?;
-        Some(Coords { lat: l.latitude?, lon: l.longitude?, accuracy_km: l.accuracy_radius.unwrap_or(0) as u32 })
+        Some(Coords {
+            lat: l.latitude?,
+            lon: l.longitude?,
+            accuracy_km: l.accuracy_radius.unwrap_or(0) as u32,
+        })
     }
 }
 
 /// Great-circle distance in km between two (lat, lon) points in degrees.
 pub fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
-    let (la1, lo1, la2, lo2) = (a.0.to_radians(), a.1.to_radians(), b.0.to_radians(), b.1.to_radians());
-    let h = ((la2 - la1) / 2.0).sin().powi(2) + la1.cos() * la2.cos() * ((lo2 - lo1) / 2.0).sin().powi(2);
+    let (la1, lo1, la2, lo2) = (
+        a.0.to_radians(),
+        a.1.to_radians(),
+        b.0.to_radians(),
+        b.1.to_radians(),
+    );
+    let h = ((la2 - la1) / 2.0).sin().powi(2)
+        + la1.cos() * la2.cos() * ((lo2 - lo1) / 2.0).sin().powi(2);
     2.0 * 6371.0 * h.sqrt().asin()
 }
 
@@ -214,16 +230,10 @@ mod tests {
         let city_src = pkg_dir.join("tests/fixtures/GeoLite2-City-Test.mmdb");
         let asn_src = pkg_dir.join("tests/fixtures/GeoLite2-ASN-Test.mmdb");
 
-        std::fs::copy(
-            &city_src,
-            dir.path().join("GeoLite2-City.mmdb"),
-        )
-        .expect("failed to copy GeoLite2-City-Test.mmdb");
-        std::fs::copy(
-            &asn_src,
-            dir.path().join("GeoLite2-ASN.mmdb"),
-        )
-        .expect("failed to copy GeoLite2-ASN-Test.mmdb");
+        std::fs::copy(&city_src, dir.path().join("GeoLite2-City.mmdb"))
+            .expect("failed to copy GeoLite2-City-Test.mmdb");
+        std::fs::copy(&asn_src, dir.path().join("GeoLite2-ASN.mmdb"))
+            .expect("failed to copy GeoLite2-ASN-Test.mmdb");
         dir
     }
 
@@ -248,8 +258,13 @@ mod tests {
     fn coordinates_come_with_the_country_and_distances_are_sane() {
         let dir = fixtures();
         let g = GeoIp::load(dir.path()).unwrap();
-        let c = g.coords(&"2.125.160.216".parse().unwrap()).expect("the GB test address has a location");
-        assert!((c.lat - 51.75).abs() < 1.0 && (c.lon + 1.25).abs() < 1.0, "{c:?}");
+        let c = g
+            .coords(&"2.125.160.216".parse().unwrap())
+            .expect("the GB test address has a location");
+        assert!(
+            (c.lat - 51.75).abs() < 1.0 && (c.lon + 1.25).abs() < 1.0,
+            "{c:?}"
+        );
         assert!(c.accuracy_km > 0);
         assert!(g.coords(&"203.0.113.1".parse().unwrap()).is_none());
         // Berlin–Paris is about 880 km.

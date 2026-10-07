@@ -136,6 +136,13 @@ pub struct Contact {
     pub inbound: Option<Instant>,
 }
 
+/// Per reporting peer: whether it is a sibling, and when it last reported.
+type SeenBy = HashMap<NodeId, (bool, Instant)>;
+
+/// One reported address: its reporters (and whether each is a sibling),
+/// and whether it is taken.
+pub type SeenReport = (IpAddr, Vec<(NodeId, bool)>, bool);
+
 #[derive(Default)]
 pub struct Status {
     pub local: Mutex<LocalStatus>,
@@ -147,7 +154,7 @@ pub struct Status {
     peer_ips: Mutex<HashMap<NodeId, Vec<std::net::IpAddr>>>,
     /// Addresses peers saw this node connect from: per address, who
     /// reported it (and whether that peer is a sibling) and when last.
-    seen_from: Mutex<HashMap<IpAddr, HashMap<NodeId, (bool, Instant)>>>,
+    seen_from: Mutex<HashMap<IpAddr, SeenBy>>,
 }
 
 /// Connection addresses remembered per member.
@@ -220,13 +227,13 @@ impl Status {
             .filter(|(_, r)| Self::taken(r))
             .map(|(ip, r)| (r.values().map(|(_, t)| *t).max().unwrap(), *ip))
             .collect();
-        v.sort_by(|a, b| b.0.cmp(&a.0));
+        v.sort_by_key(|x| std::cmp::Reverse(x.0));
         v.into_iter().map(|(_, ip)| ip).collect()
     }
 
     /// Every reported address with its reporters (and whether each is a
     /// sibling) and whether it is taken; taken ones first.
-    pub fn seen_from_report(&self) -> Vec<(IpAddr, Vec<(NodeId, bool)>, bool)> {
+    pub fn seen_from_report(&self) -> Vec<SeenReport> {
         let mut all = self.seen_from.lock().unwrap();
         Self::expire_seen_from(&mut all);
         let mut v: Vec<_> = all
