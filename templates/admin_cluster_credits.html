@@ -75,7 +75,7 @@
 </section>
 <section class="card"><div class="card-head"><h2>Cluster</h2><span class="muted">as this node counts it</span></div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Member</th><th class="num">Credits</th><th class="num">Earned, 7 days</th><th class="num">Spent, 7 days</th><th class="num">Mint</th><th class="num">Allowance</th><th class="num">Sales</th><th></th></tr></thead>
+    <thead><tr><th>Member</th><th class="num">Credits</th><th class="num">Earned, 7 days</th><th class="num">Spent, 7 days</th><th class="num">Mint (7 days)</th><th class="num">Allowance (7 days)</th><th class="num">Sales (7 days)</th><th></th></tr></thead>
     <tbody>{% for m in members %}<tr>
       <td><a href="/admin/cluster/node/{{ m.key }}"><b>{{ m.name }}</b></a></td>
       <td class="num">{{ m.balance }}</td><td class="num">{{ m.earned }}</td><td class="num">{{ m.spent }}</td><td class="num">{{ m.minted }}</td><td class="num">{{ m.allowance }}</td><td class="num">{{ m.sales }}</td>
