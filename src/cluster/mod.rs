@@ -897,6 +897,10 @@ impl Node {
             body: serde_bytes::ByteBuf::from(bytes),
         };
         match self.request(peer, msg, timeout).await? {
+            msg::Msg::RpcReply { body, .. } if !rpc::routed::fits(&body) => bail!(
+                "{path}: reply larger than {} bytes",
+                rpc::routed::MAX_ROUTED_BODY
+            ),
             msg::Msg::RpcReply { status: 200, body } => {
                 rpc::cbor::decode(&body).with_context(|| format!("{path}: undecodable reply"))
             }
@@ -904,7 +908,7 @@ impl Node {
                 "{path}: HTTP {status}: {}",
                 String::from_utf8_lossy(&body[..body.len().min(300)])
             ),
-            other => bail!("{path}: unexpected answer {other:?}"),
+            _ => bail!("{path}: unexpected answer, not an RPC reply"),
         }
     }
 

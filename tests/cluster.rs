@@ -5193,6 +5193,165 @@ async fn an_outbound_only_member_answers_a_routed_call() {
     assert!(format!("{err:#}").contains("404"), "{err:#}");
 }
 
+/// `a`, and `b` outbound-only, joined by invite: `a` has no address for
+/// `b`, which long-polls it.
+async fn outbound_pair() -> (Addr, Addr, TestNode, TestNode) {
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[],
+        Opts {
+            advertise: false,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let token = invite::create(&na, &Default::default()).await.unwrap();
+    invite::join(&nb, &token).await.unwrap();
+    eventually("b long-polls a", || async {
+        na.node.status.polled_recently(&b.id)
+    })
+    .await;
+    assert!(na.node.dial_address(&b.id).is_none());
+    (a, b, na, nb)
+}
+
+/// A server nobody can dial is paid for a lookup like any other.
+#[tokio::test]
+async fn a_paid_lookup_from_an_outbound_only_server() {
+    use peephole::credits::{self, entries, price};
+    use std::sync::atomic::Ordering;
+    let (a, b, na, nb) = outbound_pair().await;
+    let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
+    assert!(cost > 0);
+    market_known(&nb, a.id).await;
+
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.78".parse().unwrap();
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    let from_b = answers
+        .iter()
+        .find(|x| x.node == "node-bravo")
+        .expect("b answered");
+    assert_eq!(from_b.resp.findings.len(), 1, "{answers:?}");
+    assert_eq!(from_b.resp.findings[0].provider, "abuseipdb");
+    assert_eq!(from_b.charged_mc as u64, cost);
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+    eventually("both hold the offer and the receipt", || async {
+        entries::since(&na.store.pool, 0).await.unwrap().len() == 2
+            && entries::since(&nb.store.pool, 0).await.unwrap().len() == 2
+    })
+    .await;
+    for n in [&na, &nb] {
+        let book = credits::book_fresh(&n.node).await.unwrap();
+        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&b.id), cost);
+        assert_eq!(book.ledger.held(&a.id), 0);
+    }
+}
+
+/// A resolver nobody can dial is paid for a name it resolves; a name
+/// nobody resolves charges nothing.
+#[tokio::test]
+async fn a_resolution_by_an_outbound_only_member() {
+    use peephole::credits::{self, entries, price};
+    use peephole::intel::dns;
+    let (a, b, na, nb) = outbound_pair().await;
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    market_known(&nb, a.id).await;
+    let cost = price::refresh(&nb.node)
+        .await
+        .unwrap()
+        .price_of(price::RESOLVE)
+        .unwrap() as u64;
+    eventually("a hears b's resolution price", || async {
+        dns::resolver_price(&na.node, &b.id) == Some(cost as u32)
+    })
+    .await;
+    let geo: peephole::intel::SharedGeo = Default::default();
+    let (t, r) = dns::lookup(&rec(&na), &geo, "1.0x1").await.unwrap();
+    assert_eq!(t.answered, 2, "{t:?}");
+    assert!(r.is_some());
+    eventually("both hold the offer and the receipt", || async {
+        entries::since(&na.store.pool, 0).await.unwrap().len() == 2
+            && entries::since(&nb.store.pool, 0).await.unwrap().len() == 2
+    })
+    .await;
+    for n in [&na, &nb] {
+        let book = credits::book_fresh(&n.node).await.unwrap();
+        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&b.id), cost);
+        assert_eq!(book.ledger.held(&a.id), 0);
+    }
+    // Nobody resolves it: the offer comes back with a receipt of nothing,
+    // which b brings with its own sync.
+    let (t, r) = dns::lookup(&rec(&na), &geo, "nothing.invalid")
+        .await
+        .unwrap();
+    assert_eq!(t.answered, 0, "{t:?}");
+    assert!(r.is_none());
+    eventually("both hold the second offer and its receipt", || async {
+        entries::since(&na.store.pool, 0).await.unwrap().len() == 4
+            && entries::since(&nb.store.pool, 0).await.unwrap().len() == 4
+    })
+    .await;
+    for n in [&na, &nb] {
+        let book = credits::book_fresh(&n.node).await.unwrap();
+        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&b.id), cost);
+        assert_eq!(book.ledger.held(&a.id), 0);
+    }
+}
+
+/// An outbound-only server that stops polling never answers: the asker
+/// says so, and what the offer held is free again once the offer lapses.
+#[tokio::test]
+async fn an_unreachable_outbound_only_server_releases_the_offer() {
+    use peephole::credits::{self, entries, ledger, price};
+    let (a, b, na, nb) = outbound_pair().await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    price::refresh(&nb.node).await.unwrap();
+    let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
+    market_known(&nb, a.id).await;
+    drop(nb);
+
+    let none: peephole::intel::Providers = vec![];
+    let ip = "203.0.113.79".parse().unwrap();
+    let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    let from_b = answers
+        .iter()
+        .find(|x| x.node == "node-bravo")
+        .expect("b was asked");
+    assert!(from_b.resp.findings.is_empty(), "{answers:?}");
+    assert!(
+        from_b.resp.declined.iter().any(|(p, why)| p == "abuseipdb"
+            && (why.contains("did not answer in time") || why.contains("no answer"))),
+        "{answers:?}"
+    );
+    // Held until the offer lapses: nobody writes its receipt.
+    let book = credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(book.ledger.held(&a.id), cost);
+    let earned: Vec<ledger::Earned> = book
+        .minted
+        .iter()
+        .chain(&book.allowances)
+        .cloned()
+        .collect();
+    let all = entries::since(&na.store.pool, 0).await.unwrap();
+    let later = book.now_ms + credits::OFFER_TTL_MS + 1;
+    let lapsed = ledger::run(&earned, &all, &Default::default(), later);
+    assert_eq!(lapsed.held(&a.id), 0);
+    assert_eq!(lapsed.balance(&a.id), minted(8, 8));
+}
+
 /// The asker pays the announced price; the server gets all of it; both
 /// nodes hold the offer and the receipt and arrive at the same balances.
 #[tokio::test]
@@ -6368,6 +6527,60 @@ async fn a_paid_probe_is_accepted_served_and_charged() {
                     if *payer == a.id && *charged_mc == cost && answered == &["probe".to_string()])
         });
     assert!(receipt, "b's receipt of its price");
+    let book = credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(book.balance(&a.id), minted(8, 8) - cost as u64);
+    assert_eq!(book.ledger.held(&a.id), 0);
+}
+
+/// A scanner nobody can dial is offered, asked and paid for a probe
+/// through the outbox it long-polls.
+#[tokio::test]
+async fn a_paid_probe_by_an_outbound_only_scanner() {
+    use peephole::credits::{self, entries, price};
+    use peephole::scan::probe::ask;
+    let (a, b, na, nb) = outbound_pair().await;
+    let target = probe_target().await;
+    probes(&nb, target);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    let table = price::refresh(&nb.node).await.unwrap();
+    let cost = nb.prober().unwrap().price(&table);
+    market_known(&na, b.id).await;
+    market_known(&nb, a.id).await;
+    nb.refresh_heartbeat();
+    eventually("a hears b's probe price", || async {
+        na.status
+            .known(&b.id)
+            .is_some_and(|k| k.hb.probe_price_mc == Some(cost))
+    })
+    .await;
+    let geo: peephole::intel::SharedGeo = Default::default();
+    assert!(ask::vantages(&na.node, &geo).iter().any(|v| v.node == b.id));
+    let ip = "203.0.113.96";
+    recorded_and_scanned(&na, &nb, ip, target.port()).await;
+    let asked = ask::ask(&na.node, None, ip.parse().unwrap(), &[b.id], "group-1").await;
+    assert_eq!(asked.len(), 1);
+    let uid = asked[0].outcome.clone().expect("accepted");
+    let ip_id = na.store.upsert_ip(ip.parse().unwrap()).await.unwrap().id;
+    eventually("a holds b's probe and its receipt", || async {
+        let probe = na
+            .store
+            .probes_for_ip(ip_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.uid == uid && p.origin.as_deref() == Some(&b.id.0[..]));
+        let receipt = entries::since(&na.store.pool, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|e| {
+                e.origin == b.id
+                    && matches!(&e.kind, entries::Kind::Receipt { payer, charged_mc, .. }
+                        if *payer == a.id && *charged_mc == cost)
+            });
+        probe && receipt
+    })
+    .await;
     let book = credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.balance(&a.id), minted(8, 8) - cost as u64);
     assert_eq!(book.ledger.held(&a.id), 0);

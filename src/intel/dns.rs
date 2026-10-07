@@ -338,7 +338,7 @@ pub fn choose(node: &Node, siblings: &HashSet<NodeId>, geo: &SharedGeo) -> Vec<R
     let mut others: Vec<NodeId> = node
         .live_members(crate::intel::LIVE_WINDOW)
         .into_iter()
-        .filter(|id| *id != me && !node.is_blocked(id) && node.dial_address(id).is_some())
+        .filter(|id| *id != me && !node.is_blocked(id))
         .collect();
     others.shuffle(&mut rand::rng());
     let others = keep_priced(
@@ -506,9 +506,6 @@ pub async fn lookup_with(
 
 /// One member's answer.
 async fn ask(node: &Arc<Node>, id: NodeId, name: &str) -> (NodeId, Result<Vec<IpAddr>, String>) {
-    let Some(addr) = node.dial_address(&id) else {
-        return (id, Err("cannot be dialled from here".into()));
-    };
     let Some(price) = resolver_price(node, &id) else {
         return (id, Err("announces no price for resolving".into()));
     };
@@ -520,12 +517,17 @@ async fn ask(node: &Arc<Node>, id: NodeId, name: &str) -> (NodeId, Result<Vec<Ip
         name: name.to_string(),
         offer_seq: Some(seq),
     };
-    let call = node.call::<ResolveReq, ResolveResp>(id, &addr, "/rpc/v1/resolve", &req);
-    let answer = match tokio::time::timeout(crate::intel::lookup::RPC_TIMEOUT, call).await {
-        Err(_) => Err("did not answer in time".into()),
-        Ok(Err(e)) => Err(format!("could not be asked: {e:#}")),
-        Ok(Ok(ResolveResp { error: Some(e), .. })) => Err(e),
-        Ok(Ok(ResolveResp { addrs, .. })) => Ok(addrs),
+    let call = node.call_any::<ResolveReq, ResolveResp>(
+        id,
+        "/rpc/v1/resolve",
+        &req,
+        crate::intel::lookup::RPC_TIMEOUT,
+    );
+    let answer = match call.await {
+        Err(e) if format!("{e:#}").contains("no answer") => Err("did not answer in time".into()),
+        Err(e) => Err(format!("could not be asked: {e:#}")),
+        Ok(ResolveResp { error: Some(e), .. }) => Err(e),
+        Ok(ResolveResp { addrs, .. }) => Ok(addrs),
     };
     (id, answer)
 }

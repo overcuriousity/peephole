@@ -44,7 +44,8 @@ peephole credits send <node> <amount>     # send credits to a member
 
 Nodes talk HTTP/2 over mutual TLS with pinned Ed25519 keys on
 `cluster.listen` (default port 7443). A node without `advertise` is
-outbound-only: it dials its peers and still syncs both ways. Peers can also
+outbound-only: it dials its peers and still syncs both ways. It answers
+paid lookups, resolutions and probes the same way. Peers can also
 be listed under `[[cluster.peers]]` with their key.
 
 ## How trust works
@@ -353,8 +354,8 @@ earn most of the new money, every member a little.
   on_demand_share`), so curiosity cannot spend what the automatic
   enrichment runs on. Paid answers for an address the cluster has
   recorded are kept in the dataset; for any other address nothing is
-  stored. An outbound-only member, and one of an earlier version, cannot
-  be asked.
+  stored. A member of an earlier version cannot be asked; an
+  outbound-only member is asked through the outbox it long-polls.
 - **The blocklist feed** of a web node (`/api/blocklist`) is drawn from
   the whole cluster's requests and never lists a member's addresses
   (published ones, and the ones members connect from).
