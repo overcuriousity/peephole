@@ -4947,7 +4947,7 @@ async fn market_known(on: &TestNode, of: NodeId) {
 /// Raise `n`'s price of `good` to at least `at_least` mc, noting demand
 /// far above its supply before each refresh; returns the price.
 async fn priced(n: &TestNode, good: &str, at_least: u32) -> u32 {
-    loop {
+    for _ in 0..50 {
         n.node.market.note(good, 10_000);
         let p = peephole::credits::price::refresh(&n.node)
             .await
@@ -4957,6 +4957,129 @@ async fn priced(n: &TestNode, good: &str, at_least: u32) -> u32 {
         if p >= at_least {
             return p;
         }
+    }
+    panic!("the price of {good} did not reach {at_least} mc in 50 refreshes");
+}
+
+/// An arbiter funds the grant of its job with an offer naming it; the
+/// scanner delivers and charges the price; both nodes count exactly the
+/// price moved from the arbiter to the scanner.
+#[tokio::test]
+async fn a_funded_scan_job_pays_the_scanner_its_price() {
+    use peephole::credits::{self, entries, ledger::OfferState, price};
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a],
+        Opts {
+            scanner: Some(fake_nmap_args(tools.path())),
+            ..DEFAULT
+        },
+    )
+    .await;
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    market_known(&na, b.id).await;
+    market_known(&nb, a.id).await;
+    na.node.set_scan_share(0.5);
+    // A kept price to start from, so the price is more than the floor.
+    na.store.intel_set("price:scan", "1000").await.unwrap();
+    let cost = price::refresh(&na.node)
+        .await
+        .unwrap()
+        .price_of(price::SCAN)
+        .unwrap() as u64;
+    assert!(cost > 1, "{cost}");
+    enqueue(&na, "198.51.100.41", 2).await;
+    eventually_for(
+        Duration::from_secs(40),
+        "scanned, and both hold the offer and the receipt",
+        || async {
+            let mut all = true;
+            for n in [&na, &nb] {
+                all &= count(n, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 1
+                    && entries::since(&n.store.pool, 0).await.unwrap().len() == 2;
+            }
+            all
+        },
+    )
+    .await;
+    let job: String = sqlx::query_scalar("SELECT uid FROM scan_jobs")
+        .fetch_one(&na.store.pool)
+        .await
+        .unwrap();
+    for n in [&na, &nb] {
+        let book = credits::book_fresh(&n.node).await.unwrap();
+        let o = book
+            .ledger
+            .offers
+            .iter()
+            .find(|o| o.payer == a.id && o.job.is_some())
+            .expect("the scan offer");
+        assert_eq!((o.to, o.job.as_deref()), (b.id, Some(job.as_str())));
+        assert_eq!(o.offered, cost);
+        assert_eq!(o.state, OfferState::Charged { charged: cost });
+        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&b.id), cost);
+        assert_eq!(book.ledger.held(&a.id), 0);
+    }
+}
+
+/// The asker pays a resolver the price it announces for a name it
+/// resolves; a name nobody resolves charges nothing.
+#[tokio::test]
+async fn a_resolution_for_another_member_is_paid_and_a_failed_one_is_free() {
+    use peephole::credits::{self, entries, price};
+    use peephole::intel::dns;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    market_known(&nb, a.id).await;
+    let cost = price::refresh(&nb.node)
+        .await
+        .unwrap()
+        .price_of(price::RESOLVE)
+        .unwrap() as u64;
+    eventually("a hears b's resolution price", || async {
+        dns::resolver_price(&na.node, &b.id) == Some(cost as u32)
+    })
+    .await;
+    let geo: peephole::intel::SharedGeo = Default::default();
+    // The system resolver reads "1.0x1" as the address 1.0.0.1 (inet_aton),
+    // with no DNS: an answer on every host.
+    let (t, r) = dns::lookup(&rec(&na), &geo, "1.0x1").await.unwrap();
+    assert_eq!(t.answered, 2, "{t:?}");
+    assert!(r.is_some());
+    eventually("both hold the offer and the receipt", || async {
+        entries::since(&na.store.pool, 0).await.unwrap().len() == 2
+            && entries::since(&nb.store.pool, 0).await.unwrap().len() == 2
+    })
+    .await;
+    for n in [&na, &nb] {
+        let book = credits::book_fresh(&n.node).await.unwrap();
+        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&b.id), cost);
+        assert_eq!(book.ledger.held(&a.id), 0);
+    }
+    // Nobody resolves it: the offer comes back with a receipt of nothing.
+    let (t, r) = dns::lookup(&rec(&na), &geo, "nothing.invalid").await.unwrap();
+    assert_eq!(t.answered, 0, "{t:?}");
+    assert!(r.is_none());
+    eventually("both hold the second offer and its receipt", || async {
+        entries::since(&na.store.pool, 0).await.unwrap().len() == 4
+            && entries::since(&nb.store.pool, 0).await.unwrap().len() == 4
+    })
+    .await;
+    for n in [&na, &nb] {
+        let book = credits::book_fresh(&n.node).await.unwrap();
+        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&b.id), cost);
+        assert_eq!(book.ledger.held(&a.id), 0);
     }
 }
 
