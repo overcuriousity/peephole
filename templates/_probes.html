@@ -1,0 +1,26 @@
+{# Probe requests and results on one address (admin::probes::GroupView): admin only. #}
+<section class="card" id="probes" data-section="probes"{% if t.probes_waiting() %} data-probes-src="/admin/api/probes?ip={{ t.ov.ip.ip|urlencode }}" data-probes-states="{{ t.probe_states() }}"{% endif %}>
+  <div class="card-head"><h2>Probes</h2><span class="muted small">requests made before a restart show once their result arrives</span></div>
+  {% for g in t.probes %}
+  <h3><span class="mono">{{ g.asked_at }}</span> · by {{ g.by }}{% if g.cost == "free" %} · free{% else if !g.cost.is_empty() %} · offered <span class="num">{{ g.cost }}</span> credits{% endif %}</h3>
+  {% for m in g.members %}
+  <div class="probe-member">
+    <p><b>{{ m.node }}</b> <span class="badge badge-status" data-status="{{ m.state }}">{{ m.state }}</span>{% if let Some(w) = m.why %} <span class="muted">{{ w }}</span>{% endif %}{% if let Some(v) = m.vantage_ip %} · from <span class="mono">{{ v }}</span>{% endif %}{% if let Some(r) = m.rtt_ms %} · RTT <span class="num">{{ r }}</span> ms{% endif %}{% if let Some(s) = m.started_at %} · <span class="mono">{{ s }}</span>{% endif %}</p>
+    {% for p in m.ports %}
+    <div class="intel">
+      <h4><span class="mono">{{ p.port }}/{{ p.protocol }}</span> <span class="badge badge-status" data-status="{% if p.outcome == "ok" %}done{% else %}failed{% endif %}">{{ p.outcome }}</span></h4>
+      {% if !p.facts.is_empty() %}<dl class="kv">{% for f in p.facts %}<dt>{{ f.0 }}</dt><dd{% if !f.2 %} class="plain"{% endif %}>{{ f.1 }}</dd>{% endfor %}</dl>{% endif %}
+      {% if !p.links.is_empty() %}<p class="chips">{% for l in p.links %}<a class="badge badge-label" href="{{ crate::admin::views::link_href(l.0.as_str(), l.1.as_str()) }}">{{ l.0 }}</a>{% endfor %}</p>{% endif %}
+      {% if !p.redirects.is_empty() %}
+      <ol class="small">
+        {% for h in p.redirects %}
+        <li><span class="mono">{{ h.url }}</span>{% if let Some(s) = h.status %} · {{ s }}{% endif %}{% if let Some(l) = h.location %} → <span class="mono">{{ l }}</span>{% endif %}{% if let Some(s) = h.skipped %} · <span class="muted">skipped ({{ s }}{% if let Some(w) = h.why %}: {{ w }}{% endif %})</span>{% endif %}{% if let Some(e) = h.error %} · <span class="muted">{{ e }}</span>{% endif %}</li>
+        {% endfor %}
+      </ol>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endfor %}
+  {% endfor %}
+</section>

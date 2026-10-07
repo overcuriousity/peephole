@@ -101,6 +101,11 @@ impl Prober {
         self.gate.check(store, node, ip).await
     }
 
+    /// The counter-scan level the evidence held here allows for `ip`.
+    pub async fn allowed_level(&self, store: &Store, ip: &IpAddr) -> Option<u8> {
+        self.gate.allowed_level(store, ip).await
+    }
+
     /// What a probe costs here now.
     fn price(&self, node: &Node) -> Mc {
         let table = node.price_table();
