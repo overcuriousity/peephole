@@ -230,16 +230,15 @@ impl IpForm {
         f
     }
 
-    /// The paid providers named, `*` standing for every one that this
-    /// node does not answer itself (see `all`, the cluster's quotes).
-    fn asked(&self, all: &HashMap<String, Vec<crate::credits::pay::Quote>>) -> Vec<String> {
+    /// The providers named, `*` standing for every known one: those this
+    /// node answers itself are asked here first, free, and of members
+    /// only as a fallback.
+    fn asked(&self) -> Vec<String> {
         let ask = self.ask.as_deref().unwrap_or_default();
         if ask.iter().any(|a| a == "*") {
-            let cheap = crate::intel::lookup::cheap(all);
             return crate::intel::KNOWN_PROVIDERS
                 .iter()
                 .map(|p| p.name.to_string())
-                .filter(|n| !cheap.contains(n))
                 .collect();
         }
         ask.iter().filter(|a| !a.is_empty()).cloned().collect()
@@ -270,12 +269,7 @@ async fn lookup(
     body: axum::body::Bytes,
 ) -> AppResult<Html<String>> {
     let f = IpForm::parse(&body);
-    let quotes = state
-        .recorder
-        .node()
-        .map(|n| crate::credits::pay::quotes(n, &state.providers))
-        .unwrap_or_default();
-    let ask = f.asked(&quotes);
+    let ask = f.asked();
     let text = f.ip.unwrap_or_default().trim().to_string();
     let cluster = state.recorder.node().is_some();
     if text.parse::<IpAddr>().is_err() && is_list(&text) {
@@ -774,9 +768,12 @@ secure_cookies = false
         assert_eq!(offer.paid[0].price, "0.10");
         assert_eq!(offer.paid_total, "0.10");
         let f = IpForm::parse(b"ip=203.0.113.9&ask=abuseipdb&ask=shodan");
-        assert_eq!(f.asked(&all), ["abuseipdb", "shodan"]);
-        let every = IpForm::parse(b"ask=*").asked(&all);
-        assert!(!every.contains(&crate::intel::TOR.to_string()));
+        assert_eq!(f.asked(), ["abuseipdb", "shodan"]);
+        // Every known provider, those this node answers itself included
+        // (asked here first, free).
+        let every = IpForm::parse(b"ask=*").asked();
+        assert_eq!(every.len(), crate::intel::KNOWN_PROVIDERS.len());
+        assert!(every.contains(&crate::intel::TOR.to_string()));
         assert!(every.contains(&crate::intel::ABUSEIPDB.to_string()));
         assert!(every.contains(&crate::intel::SHODAN.to_string()));
     }
