@@ -175,22 +175,18 @@ with D and S over the last hour:
 
 Balances are a pure function of the log, so an upgraded node recomputes
 the whole 8-day window under the new rules at start. Ledger constants
-can change later only by a release that every node takes; see the open
-question on activation days below. Old and new nodes
+can change later only by a release that every node takes. Old and new nodes
 count different balances: a new protocol version `MARKET_PROTO`
 (`rpc::proto`, `PROTO_VERSION` 4) gates payments. New nodes neither offer
 to nor serve nodes below it; scans by old scanners still count for the
 mint on new nodes. The changelog tells operators to upgrade all their
 nodes together.
 
-**Open question: activation days.** As written, a release that changes a
-ledger constant changes it at once and for the whole 8-day window, and
-nodes disagree until all have upgraded. The alternative: the build holds
-a schedule of rule sets, each with the UTC day it applies from, and a day
-is always counted with the rules of that day. A release then announces a
-change for a day a week or two ahead, operators upgrade in that time,
-past days never change, and nodes agree throughout as long as they run a
-build that knows the schedule.
+**Later changes** to a ledger constant take effect on upgrade: the
+release changes the rules at once, the node recounts the 8-day window,
+and nodes disagree on balances until every node has upgraded. Such a
+release bumps `PROTO_VERSION`, so payments run only between nodes with
+the same rules; its changelog says so.
 
 ## 7. Pages and docs
 
