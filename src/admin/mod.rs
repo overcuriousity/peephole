@@ -14,6 +14,7 @@ pub mod links;
 pub mod lookup;
 pub mod overview;
 pub mod pages;
+pub mod password;
 pub mod probes;
 pub mod public;
 pub mod scans;

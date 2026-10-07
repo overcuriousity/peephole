@@ -1,5 +1,6 @@
 use super::Store;
-use anyhow::Result;
+use anyhow::{Result, bail};
+use std::str::FromStr;
 
 impl Store {
     pub async fn save_credential(
@@ -44,28 +45,95 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a key only while at least one other remains, atomically, so two
-    /// concurrent deletes cannot both pass a "more than one key" check and
-    /// leave the admin locked out. Returns whether a row was deleted.
-    /// Sessions signed in with the key end with it.
-    pub async fn delete_credential_keeping_last(&self, cred_id: &[u8]) -> Result<bool> {
+    /// Delete a key only while the admin keeps a way in: another key remains,
+    /// or the method is `Both` and a password is set (the method then
+    /// becomes `Password` if no key is left). One immediate transaction, so
+    /// two concurrent deletes cannot both pass the check. Returns whether a
+    /// row was deleted. Sessions signed in with the key end with it.
+    pub async fn delete_credential_guarded(&self, cred_id: &[u8]) -> Result<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let r = sqlx::query(
-            "DELETE FROM credentials
-             WHERE cred_id = ? AND (SELECT COUNT(*) FROM credentials) > 1",
-        )
-        .bind(cred_id)
-        .execute(&mut *tx)
-        .await?;
+        let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credentials")
+            .fetch_one(&mut *tx)
+            .await?;
+        let method = get_meta(&mut tx, LOGIN_METHOD).await?;
+        let method: LoginMethod = method.and_then(|m| m.parse().ok()).unwrap_or_default();
+        let has_password = get_meta(&mut tx, PASSWORD_HASH).await?.is_some();
+        let last = keys <= 1;
+        if last && !(method == LoginMethod::Both && has_password) {
+            return Ok(false);
+        }
+        let r = sqlx::query("DELETE FROM credentials WHERE cred_id = ?")
+            .bind(cred_id)
+            .execute(&mut *tx)
+            .await?;
         let deleted = r.rows_affected() > 0;
         if deleted {
             sqlx::query("DELETE FROM sessions WHERE cred_id = ?")
                 .bind(cred_id)
                 .execute(&mut *tx)
                 .await?;
+            if last {
+                put_meta(&mut tx, LOGIN_METHOD, LoginMethod::Password.as_str()).await?;
+            }
         }
         tx.commit().await?;
         Ok(deleted)
+    }
+
+    /// How the admin signs in (`Passkey` when never set).
+    pub async fn login_method(&self) -> Result<LoginMethod> {
+        Ok(self
+            .intel_get(LOGIN_METHOD)
+            .await?
+            .and_then(|m| m.parse().ok())
+            .unwrap_or_default())
+    }
+
+    /// Choose the sign-in method; refused when it would leave no usable
+    /// sign-in (no password for `Password`, no key for `Passkey`, neither
+    /// for `Both`).
+    pub async fn set_login_method(&self, m: LoginMethod) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credentials")
+            .fetch_one(&mut *tx)
+            .await?;
+        let has_password = get_meta(&mut tx, PASSWORD_HASH).await?.is_some();
+        if m == LoginMethod::Password && !has_password {
+            bail!("no password is set: run peephole admin password first");
+        }
+        if m == LoginMethod::Passkey && keys == 0 {
+            bail!("no passkey is enrolled");
+        }
+        if m == LoginMethod::Both && keys == 0 && !has_password {
+            bail!("neither a password nor a passkey is set");
+        }
+        put_meta(&mut tx, LOGIN_METHOD, m.as_str()).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The admin password as a PHC string, if one is set.
+    pub async fn password_hash(&self) -> Result<Option<String>> {
+        self.intel_get(PASSWORD_HASH).await
+    }
+
+    /// Store the password hash. A `Passkey` method becomes `Both`. Sessions
+    /// not bound to a key (earlier password sign-ins) end, except
+    /// `keep_session`, the caller's own.
+    pub async fn set_password_hash(&self, phc: &str, keep_session: Option<&str>) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        put_meta(&mut tx, PASSWORD_HASH, phc).await?;
+        let current = get_meta(&mut tx, LOGIN_METHOD).await?;
+        let current: LoginMethod = current.and_then(|m| m.parse().ok()).unwrap_or_default();
+        if current == LoginMethod::Passkey {
+            put_meta(&mut tx, LOGIN_METHOD, LoginMethod::Both.as_str()).await?;
+        }
+        sqlx::query("DELETE FROM sessions WHERE cred_id IS NULL AND id_hash != ?")
+            .bind(keep_session.map(token_hash).unwrap_or_default())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// A session not bound to a key (tests and tooling).
@@ -349,6 +417,8 @@ pub const MAX_OPEN_CEREMONIES: i64 = 256;
 pub const MIN_CEREMONY_SECS: i64 = 90;
 /// Lifetime of the first-run setup token.
 pub const SETUP_TOKEN_HOURS: i64 = 24;
+const LOGIN_METHOD: &str = "admin_login_method";
+const PASSWORD_HASH: &str = "admin_password_hash";
 const SETUP_TOKEN_HASH: &str = "webauthn_setup_token_hash";
 const SETUP_TOKEN_EXPIRES: &str = "webauthn_setup_token_expires";
 
@@ -374,8 +444,69 @@ pub fn token_hash(token: &str) -> String {
     data_encoding::HEXLOWER.encode(&Sha256::digest(token.as_bytes()))
 }
 
+/// How the admin signs in on this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoginMethod {
+    #[default]
+    Passkey,
+    Password,
+    Both,
+}
+
+impl LoginMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passkey => "passkey",
+            Self::Password => "password",
+            Self::Both => "both",
+        }
+    }
+    pub fn passkey(self) -> bool {
+        matches!(self, Self::Passkey | Self::Both)
+    }
+    pub fn password(self) -> bool {
+        matches!(self, Self::Password | Self::Both)
+    }
+}
+
+impl FromStr for LoginMethod {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "passkey" => Ok(Self::Passkey),
+            "password" => Ok(Self::Password),
+            "both" => Ok(Self::Both),
+            _ => bail!("login method must be passkey, password or both"),
+        }
+    }
+}
+
+/// Read one `intel_meta` value inside a transaction.
+async fn get_meta(tx: &mut sqlx::SqliteConnection, key: &str) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT value FROM intel_meta WHERE key = ?")
+            .bind(key)
+            .fetch_optional(tx)
+            .await?,
+    )
+}
+
+/// Upsert one `intel_meta` value inside a transaction.
+async fn put_meta(tx: &mut sqlx::SqliteConnection, key: &str, value: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO intel_meta (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(tx)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::LoginMethod;
     use crate::store::Store;
 
     #[tokio::test]
@@ -426,10 +557,54 @@ mod tests {
         let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
         s.save_credential(b"a", "{}", None).await.unwrap();
         s.save_credential(b"b", "{}", None).await.unwrap();
-        assert!(s.delete_credential_keeping_last(b"a").await.unwrap());
+        assert!(s.delete_credential_guarded(b"a").await.unwrap());
         // Only one left: refuse to delete it.
-        assert!(!s.delete_credential_keeping_last(b"b").await.unwrap());
+        assert!(!s.delete_credential_guarded(b"b").await.unwrap());
         assert_eq!(s.load_credentials().await.unwrap().len(), 1);
+    }
+
+    async fn test_store() -> Store {
+        let dir = tempfile::tempdir().unwrap();
+        // The directory must outlive the pool; keep it for the test run.
+        let path = dir.keep().join("t.db");
+        Store::connect(&path).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn login_method_guard_and_last_key() {
+        let s = test_store().await;
+        assert_eq!(s.login_method().await.unwrap(), LoginMethod::Passkey);
+        assert!(
+            s.set_login_method(LoginMethod::Password).await.is_err(),
+            "no password yet"
+        );
+        s.save_credential(b"k1", "{}", Some("one")).await.unwrap();
+        // Last key, method passkey: refused.
+        assert!(!s.delete_credential_guarded(b"k1").await.unwrap());
+        // Both, but no password: still refused.
+        s.set_login_method(LoginMethod::Both).await.unwrap();
+        assert!(!s.delete_credential_guarded(b"k1").await.unwrap());
+        // With a password: the last key goes and the method becomes password.
+        s.set_password_hash("$argon2id$v=19$x", None).await.unwrap();
+        assert!(s.delete_credential_guarded(b"k1").await.unwrap());
+        assert_eq!(s.login_method().await.unwrap(), LoginMethod::Password);
+        assert!(
+            s.set_login_method(LoginMethod::Passkey).await.is_err(),
+            "no key left"
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_a_password_turns_passkey_into_both_and_ends_password_sessions() {
+        let s = test_store().await;
+        let a = s.create_session().await.unwrap();
+        let b = s.create_session().await.unwrap();
+        s.set_password_hash("$argon2id$v=19$x", Some(&b))
+            .await
+            .unwrap();
+        assert_eq!(s.login_method().await.unwrap(), LoginMethod::Both);
+        assert!(!s.validate_session(&a).await.unwrap());
+        assert!(s.validate_session(&b).await.unwrap());
     }
 
     #[tokio::test]
@@ -502,7 +677,7 @@ mod tests {
         assert!(!s.validate_session(&first).await.unwrap(), "replaced");
         assert!(s.validate_session(&second).await.unwrap());
         let with_b = s.create_session_for(Some(b"b"), None).await.unwrap();
-        assert!(s.delete_credential_keeping_last(b"a").await.unwrap());
+        assert!(s.delete_credential_guarded(b"a").await.unwrap());
         assert!(!s.validate_session(&second).await.unwrap(), "key deleted");
         assert!(s.validate_session(&with_b).await.unwrap(), "other key");
     }

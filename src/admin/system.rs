@@ -341,10 +341,9 @@ async fn key_delete(
 ) -> Redirect {
     // SQLite hex() is uppercase; normalize before decoding.
     if let Ok(bytes) = data_encoding::HEXLOWER.decode(f.cred_id.to_lowercase().as_bytes()) {
-        // Never delete the last remaining key (would lock the admin out). The
-        // check and delete are one atomic statement, so two concurrent deletes
-        // cannot both pass and leave zero keys.
-        let _ = state.store.delete_credential_keeping_last(&bytes).await;
+        // Never delete the last way in (would lock the admin out); the check
+        // and delete are one transaction.
+        let _ = state.store.delete_credential_guarded(&bytes).await;
     }
     Redirect::to("/admin/system/keys")
 }
