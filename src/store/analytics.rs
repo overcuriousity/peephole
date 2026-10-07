@@ -153,6 +153,8 @@ impl Store {
                 since,
             )
             .await?;
+        // Counter-scans only: probes are an admin's choice and would bias
+        // the top lists, so the join on scans leaves their keys out.
         let host_key = |kind: &str| {
             format!(
                 "SELECT h.fingerprint AS name, COUNT(*) AS count, COUNT(DISTINCT h.ip_id) AS ips

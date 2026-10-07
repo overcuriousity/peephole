@@ -18,6 +18,8 @@ use sqlx::SqliteConnection;
 const MAX_UID: usize = 64;
 const MAX_PORTS: usize = 16;
 const MAX_DETAIL: usize = 64 * 1024;
+/// Longest protocol, outcome, address source and build text accepted.
+const MAX_SHORT: usize = 64;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ProbeRow {
@@ -32,6 +34,7 @@ pub struct ProbeRow {
     pub started_at: String,
     pub finished_at: String,
     pub rtt_min_ms: Option<i64>,
+    pub charged_mc: i64,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -110,10 +113,19 @@ pub(crate) async fn apply_probe_result(
     ctx: Ctx<'_>,
     r: &ProbeResultRec,
 ) -> Result<Effect> {
+    let date = |d: &str| chrono::NaiveDateTime::parse_from_str(d, "%Y-%m-%d %H:%M:%S").is_ok();
     if r.uid.len() > MAX_UID
         || r.group.len() > MAX_UID
         || r.ports.len() > MAX_PORTS
-        || r.ports.iter().any(|p| p.detail_json.len() > MAX_DETAIL)
+        || r.ports.iter().any(|p| {
+            p.detail_json.len() > MAX_DETAIL
+                || p.protocol.len() > MAX_SHORT
+                || p.outcome.len() > MAX_SHORT
+        })
+        || r.vantage_ip_source.len() > MAX_SHORT
+        || r.build.len() > MAX_SHORT
+        || !date(&r.started_at)
+        || !date(&r.finished_at)
     {
         return Ok(Effect::Ignored);
     }
@@ -128,8 +140,8 @@ pub(crate) async fn apply_probe_result(
     let origin = ctx.origin_bytes().unwrap_or_else(|| r.asker.0.to_vec());
     let res = sqlx::query(
         "INSERT OR IGNORE INTO probes (uid, group_uid, ip_id, origin, hlc, asker, vantage_ip,
-           vantage_ip_source, started_at, finished_at, rtt_min_ms, build)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+           vantage_ip_source, started_at, finished_at, rtt_min_ms, build, charged_mc)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(&r.group)
@@ -143,6 +155,7 @@ pub(crate) async fn apply_probe_result(
     .bind(&r.finished_at)
     .bind(r.rtt_min_ms.map(i64::from))
     .bind(&r.build)
+    .bind(i64::from(r.charged_mc))
     .execute(&mut *conn)
     .await?;
     if res.rows_affected() == 1 {
@@ -251,7 +264,7 @@ impl Store {
     pub async fn probes_for_ip(&self, ip_id: i64) -> Result<Vec<ProbeRow>> {
         Ok(sqlx::query_as::<_, ProbeRow>(
             "SELECT id, uid, group_uid, ip_id, origin, asker, vantage_ip, vantage_ip_source,
-                    started_at, finished_at, rtt_min_ms
+                    started_at, finished_at, rtt_min_ms, charged_mc
              FROM probes WHERE ip_id = ? ORDER BY id DESC LIMIT 200",
         )
         .bind(ip_id)
@@ -341,6 +354,7 @@ mod tests {
                 }).to_string(),
             }],
             build: String::new(),
+            charged_mc: 0,
         }
     }
 
@@ -389,6 +403,61 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn a_probed_ip_survives_its_last_scan_and_goes_with_its_probe() {
+        use crate::cluster::identity::Identity;
+        use crate::cluster::record::{SkipBatchRec, TombstoneRec};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let ctx = |hlc| Ctx {
+            origin: Some(&a),
+            hlc,
+        };
+        let mut conn = store.pool.acquire().await.unwrap();
+        let skip = format!("{}skip", a.uid_prefix());
+        let batch = Record::SkipBatch(SkipBatchRec {
+            build: String::new(),
+            uid: skip.clone(),
+            ip: "203.0.113.9".into(),
+            dropped: 1,
+            rows: vec![],
+        });
+        apply(&mut conn, ctx(1), &batch).await.unwrap();
+        let mut r = rec("203.0.113.9", 7);
+        r.uid = format!("{}probe", a.uid_prefix());
+        apply(&mut conn, ctx(2), &Record::ProbeResult(r.clone()))
+            .await
+            .unwrap();
+        let tomb = |uid: &str, hlc| {
+            Record::Tombstone(TombstoneRec {
+                uid: format!("{}tomb{hlc}", a.uid_prefix()),
+                uids: vec![uid.to_string()],
+                seqs: vec![],
+            })
+        };
+        let n = |sql: &'static str| sqlx::query_scalar::<_, i64>(sql);
+        // The last record besides the probe goes: the probe keeps the IP.
+        apply(&mut conn, ctx(3), &tomb(&skip, 3)).await.unwrap();
+        assert_eq!(
+            n("SELECT COUNT(*) FROM ips")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap(),
+            1
+        );
+        // The probe goes, with its ports and keys, and the IP after it.
+        apply(&mut conn, ctx(4), &tomb(&r.uid, 4)).await.unwrap();
+        for sql in [
+            "SELECT COUNT(*) FROM probes",
+            "SELECT COUNT(*) FROM probe_ports",
+            "SELECT COUNT(*) FROM host_keys",
+            "SELECT COUNT(*) FROM ips",
+        ] {
+            assert_eq!(n(sql).fetch_one(&mut *conn).await.unwrap(), 0, "{sql}");
+        }
     }
 
     #[tokio::test]

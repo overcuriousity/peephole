@@ -1097,6 +1097,7 @@ impl Recorder {
             "scan_jobs",
             "scans",
             "skipped_batches",
+            "probes",
         ] {
             let (o, f) = self.split(table, "ip_id", Keys::Ids(ids)).await?;
             own.extend(o);

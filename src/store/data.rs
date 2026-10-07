@@ -1030,15 +1030,17 @@ async fn tombstone(conn: &mut SqliteConnection, ctx: Ctx<'_>, t: &TombstoneRec) 
     }
     let mine: std::collections::HashSet<&str> = own.iter().map(String::as_str).collect();
     let mut ips = std::collections::BTreeSet::new();
-    for table in [
-        "requests",
-        "fp_claims",
-        "fingerprints",
-        "scan_jobs",
-        "scans",
-        "skipped_batches",
+    for (table, col) in [
+        ("requests", "uid"),
+        ("fp_claims", "uid"),
+        ("fingerprints", "uid"),
+        ("scan_jobs", "uid"),
+        ("scans", "uid"),
+        ("skipped_batches", "uid"),
+        ("probes", "uid"),
+        ("ip_names", "record_uid"),
     ] {
-        let sql = format!("SELECT DISTINCT ip_id FROM {table} WHERE uid IN ({{}})");
+        let sql = format!("SELECT DISTINCT ip_id FROM {table} WHERE {col} IN ({{}})");
         for chunk in own.chunks(400) {
             let sql = sql.replace("{}", &placeholders(chunk.len()));
             let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
@@ -1083,10 +1085,13 @@ async fn tombstone(conn: &mut SqliteConnection, ctx: Ctx<'_>, t: &TombstoneRec) 
         "scan_jobs",
         "requests",
         "skipped_batches",
+        // probe_ports and the probe's host_keys cascade.
+        "probes",
     ] {
         let sql = format!("DELETE FROM {table} WHERE uid IN ({{}})");
         for_uids(conn, &sql, &own).await?;
     }
+    for_uids(conn, "DELETE FROM ip_names WHERE record_uid IN ({})", &own).await?;
     for ip_id in ips {
         drop_orphan_ip(conn, ip_id).await?;
     }
@@ -1115,7 +1120,8 @@ pub(crate) async fn drop_orphan_ip(conn: &mut SqliteConnection, ip_id: i64) -> R
            AND NOT EXISTS (SELECT 1 FROM scans WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM fingerprints WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM fp_claims WHERE ip_id = ?1)
-           AND NOT EXISTS (SELECT 1 FROM skipped_batches WHERE ip_id = ?1)",
+           AND NOT EXISTS (SELECT 1 FROM skipped_batches WHERE ip_id = ?1)
+           AND NOT EXISTS (SELECT 1 FROM probes WHERE ip_id = ?1)",
     )
     .bind(ip_id)
     .execute(&mut *conn)
@@ -1194,9 +1200,18 @@ async fn remove_row(
         "scan_job" => "scan_jobs",
         "scan_result" | "scan_audit" => "scans",
         "skip_batch" => "skipped_batches",
+        // probe_ports and the probe's host_keys cascade.
+        "probe_result" => "probes",
+        "ip_name" => "ip_names",
         _ => return Ok(None),
     };
-    let sql = format!("SELECT ip_id FROM {table} WHERE uid = ?");
+    // An ip_names row carries the uid of the newest lookup that set it.
+    let col = if kind == "ip_name" {
+        "record_uid"
+    } else {
+        "uid"
+    };
+    let sql = format!("SELECT ip_id FROM {table} WHERE {col} = ? LIMIT 1");
     let ip_id: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .bind(uid)
         .fetch_optional(&mut *conn)
@@ -1245,11 +1260,24 @@ async fn remove_row(
         }
         _ => {}
     }
-    let sql = format!("DELETE FROM {table} WHERE uid = ?");
+    // One lookup names several addresses: the caller gets one of them,
+    // the others are dropped here once nothing else refers to them.
+    let others: Vec<i64> = if kind == "ip_name" {
+        sqlx::query_scalar("SELECT DISTINCT ip_id FROM ip_names WHERE record_uid = ?")
+            .bind(uid)
+            .fetch_all(&mut *conn)
+            .await?
+    } else {
+        vec![]
+    };
+    let sql = format!("DELETE FROM {table} WHERE {col} = ?");
     sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(uid)
         .execute(&mut *conn)
         .await?;
+    for other in others.into_iter().filter(|o| Some(*o) != ip_id) {
+        drop_orphan_ip(conn, other).await?;
+    }
     Ok(ip_id)
 }
 

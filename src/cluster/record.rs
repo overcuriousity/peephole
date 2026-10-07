@@ -290,6 +290,14 @@ pub struct ProbeResultRec {
     /// Source commit of the binary that created the record (provenance).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub build: String,
+    /// What the asker was charged: the result and the receipt are one
+    /// batch. Zero for a standalone node's probes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub charged_mc: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A name an admin looked up, with what each node's resolver answered.
