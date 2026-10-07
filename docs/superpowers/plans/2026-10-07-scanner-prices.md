@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Each scanner sells scan jobs at its own price, which follows how busy it is. Arbiters hand each job to the cheapest scanner that asks, at most at a price they compute themselves. A node's own jobs, and nodes collecting credits elsewhere, are funded by the same rule as everyone.
+**Goal:** Each scanner sells scan jobs at its own price, which follows how busy it is. Arbiters hand each job to the cheapest scanner that asks, at most at a price they compute themselves. A node's own jobs are funded by the same rule as everyone's. The collecting node goes: every node keeps what it earns, and a lookup that needs more draws from its siblings, richest first.
 
-**Architecture:** `credits::price` computes, on every node, a price for every scanner from public inputs (paid scans by `finished_at`, announced capacity). A scanner's own copy is its selling price, announced in the heartbeat. Other nodes' copies are their reference prices. `scan::arbiter::hand_out` orders claimants by the price it would pay, and pushes hoarding or non-delivering scanners to the back. `scan::Source::acquire_granted` asks arbiters that can pay first, in urgency order. `credits::jobs` funds offers at the chosen scanner's price, tallies own jobs in `scan_jobs.self_mc`, and counts a share of the collecting node's balance. Protocol 5.
+**Architecture:** `credits::price` computes, on every node, a price for every scanner from public inputs (paid scans by `finished_at`, announced capacity). A scanner's own copy is its selling price, announced in the heartbeat. Other nodes' copies are their reference prices. `scan::arbiter::hand_out` orders claimants by the price it would pay, and pushes hoarding or non-delivering scanners to the back. `scan::Source::acquire_granted` asks arbiters that can pay first, in urgency order. `credits::jobs` funds offers at the chosen scanner's price and tallies own jobs in `scan_jobs.self_mc`. `credits::fleet` loses forwarding; its draw asks siblings richest first. Protocol 5.
 
 **Tech Stack:** Rust 2024, tokio, sqlx (SQLite), serde/CBOR heartbeats, askama templates.
 
@@ -16,6 +16,7 @@
 - The price rule (`step`, `PRICE_STEP` = 0.15, `PRICE_FLOOR` = 1 mc) is unchanged. The scan price is flat per job, whatever the level.
 - Protocol 5 (`SCAN_PRICE_PROTO`). An arbiter funds only scanners with `proto_max >= 5`. Lookups keep `MARKET_PROTO` (4).
 - A scan of a node's own job still earns no mint (`earn::pay` unchanged).
+- Being a sibling has no economic effect except that a lookup may draw from siblings. Scans are paid from the node's own balance only; a sibling's job is paid like anyone's.
 - Specs are not amended after implementation. Docs go to `docs/cluster.md`, CHANGELOG (Unreleased) and code comments.
 - Match surrounding code: comment density, naming (`mc` suffix for millicredits), British-neutral plain English in user-facing text.
 - Every commit ends with:
@@ -39,8 +40,8 @@
 
 **Files:** none (git only).
 
-- [ ] **Step 1:** Wait until PR #49 is merged into `master` (`gh pr view 49 --json state` says `MERGED`).
-- [ ] **Step 2:** In the worktree `../peephole-scanner-prices` (branch `scanner-prices`):
+- [x] **Step 1:** Wait until PR #49 is merged into `master` (`gh pr view 49 --json state` says `MERGED`).
+- [x] **Step 2:** In the worktree `../peephole-scanner-prices` (branch `scanner-prices`):
 
 ```bash
 git fetch origin && git rebase origin/master
@@ -49,7 +50,7 @@ cargo build 2>&1 | tail -3
 
 Expected: rebase clean (the branch only holds the spec and this plan), build OK.
 
-- [ ] **Step 3:** Confirm the migration number: `ls src/store/migrations | tail -2` shows `0022_price_history.sql` as the last. This plan uses `0023_scan_self_mc.sql`. If another migration landed, take the next free number throughout.
+- [ ] **Step 3:** Confirm the migration number: `ls src/store/migrations | tail -2` shows `0022_price_history.sql` as the last. This plan uses `0023_scan_self_mc.sql` and `0024_no_collecting_node.sql`. If another migration landed, take the next free number throughout.
 
 ---
 
@@ -469,7 +470,8 @@ pub async fn announce_budget(node: &Arc<Node>) -> Result<()> {
     .fetch_one(&node.store.pool)
     .await?;
     let book = super::book(node).await?;
-    let left = budget(&book.ledger, &node.id(), node.scan_share());
+    let self_mc = self_committed(&node.store.pool, &node.id()).await?;
+    let left = budget(&book.ledger, &node.id(), node.scan_share(), self_mc);
     node.scan_budget_mc.store(left.min(u32::MAX as Mc) as u32, std::sync::atomic::Ordering::Relaxed);
     node.scan_queued.store(queued.clamp(0, u32::MAX as i64) as u32, std::sync::atomic::Ordering::Relaxed);
     Ok(())
@@ -500,7 +502,7 @@ Run: `cargo test --lib cluster::status credits 2>&1 | tail -5` → pass. Clippy 
 **Interfaces:**
 - Consumes: `price::offer_price`, `Table::reference`, `pay::sells_scans`.
 - Produces:
-  - `pub fn budget(l: &Ledger, me: &NodeId, share: f64, extra: Mc, self_mc: Mc) -> Mc` where `extra` is the fleet's share (Task 6 passes it; 0 until then) and `self_mc` is `self_committed`.
+  - `pub fn budget(l: &Ledger, me: &NodeId, share: f64, self_mc: Mc) -> Mc` where `self_mc` is `self_committed`.
   - `pub async fn self_committed(pool: &SqlitePool, me: &NodeId) -> Result<Mc>`
   - `pub async fn fund(node: &Arc<Node>, funding: &mut Funding, scanner: NodeId, job_uid: &str, min_mc: u32, price: u32) -> Option<(Option<u64>, u32)>`: `Some((Some(seq), price))` for an offer, `Some((None, price))` for an own job funded by the tally, None for unpaid.
   - `pub fn price_for(node: &Node, scanner: &NodeId) -> Option<u32>`: what this arbiter would pay `scanner` (own: its selling price; others: `offer_price(announced, reference)`, None for an older protocol).
@@ -518,14 +520,12 @@ ALTER TABLE scan_jobs ADD COLUMN self_mc INTEGER;
 
 ```rust
 #[test]
-fn the_budget_counts_own_jobs_and_the_fleet_share() {
-    // A balance of 1000 at share 0.5: 500. Own jobs holding 200: 300 left
-    // (the cap counts them: (1000 + 200) × 0.5 - 200 = 400). The fleet's
-    // share adds to the balance the cap is taken of.
+fn the_budget_counts_own_jobs() {
+    // A balance of 1000 at share 0.5: 500. Own jobs holding 200 count
+    // like offers: (1000 + 200) × 0.5 - 200 = 400 left.
     let l = ledger_with_balance(id(1), 1000);
-    assert_eq!(budget(&l, &id(1), 0.5, 0, 0), 500);
-    assert_eq!(budget(&l, &id(1), 0.5, 0, 200), 400);
-    assert_eq!(budget(&l, &id(1), 0.5, 600, 0), 800);
+    assert_eq!(budget(&l, &id(1), 0.5, 0), 500);
+    assert_eq!(budget(&l, &id(1), 0.5, 200), 400);
 }
 
 #[tokio::test]
@@ -556,7 +556,7 @@ async fn own_job_reservations_count_while_running_and_when_done_today() {
 
 `ledger_with_balance` is a test helper to add in the same module, built like the existing test `the_budget_is_a_share_of_what_was_there_today` builds its ledger (`ledger::run` with one `Earned` of `mc` for `node` today). Reuse that test's setup code; do not invent a new ledger API.
 
-Also update the existing `budget(...)` calls in that test to pass `0, 0`.
+Also update the existing `budget(...)` calls in that test to pass `0`.
 
 - [ ] **Step 3: Run, expect failure** (`budget` takes 3 arguments; `self_committed` not found).
 
@@ -566,10 +566,9 @@ Run: `cargo test --lib credits::jobs 2>&1 | tail -5`
 
 ```rust
 /// What `me` may still hold in or pay for its scan jobs today: `share` of
-/// its balance plus `extra` (its share of its collecting node's balance)
-/// plus what its scan offers and own jobs (`self_mc`) hold and were
-/// charged today, minus those.
-pub fn budget(l: &Ledger, me: &NodeId, share: f64, extra: Mc, self_mc: Mc) -> Mc {
+/// its balance plus what its scan offers and own jobs (`self_mc`) hold
+/// and were charged today, minus those.
+pub fn budget(l: &Ledger, me: &NodeId, share: f64, self_mc: Mc) -> Mc {
     let (mut held, mut charged) = (0, 0);
     for o in l.offers.iter().filter(|o| o.payer == *me && o.job.is_some()) {
         match o.state {
@@ -579,7 +578,7 @@ pub fn budget(l: &Ledger, me: &NodeId, share: f64, extra: Mc, self_mc: Mc) -> Mc
         }
     }
     let committed = held + charged + self_mc;
-    let cap = ((l.balance(me) + extra + committed) as f64 * share.clamp(0.0, 1.0)).floor() as Mc;
+    let cap = ((l.balance(me) + committed) as f64 * share.clamp(0.0, 1.0)).floor() as Mc;
     cap.saturating_sub(committed)
 }
 
@@ -646,7 +645,7 @@ pub async fn fund(
             s
         }
     };
-    let left = budget(&book.ledger, &me, node.scan_share(), funding.extra, self_mc)
+    let left = budget(&book.ledger, &me, node.scan_share(), self_mc)
         .saturating_sub(funding.committed);
     if left < price as Mc {
         return None;
@@ -668,7 +667,7 @@ pub async fn fund(
 }
 ```
 
-`Funding` also gets `pub extra: Mc` (0 by default; Task 6 sets it). Remove the old `scanner == me` early return and the `pays_with` check (now in `price_for`).
+Remove the old `scanner == me` early return and the `pays_with` check (now in `price_for`).
 
 `arbiter.rs` `next_job_for`: compute `let price = crate::credits::jobs::price_for(&self.node, &scanner);` and call `fund(&self.node, funding, scanner, &g.job_uid, min_mc, price.unwrap_or(0))`. On `Some((seq, price))` set `g.offer_seq = seq; g.price_mc = price;` (for an own job `offer_seq` stays None and `price_mc` is informational). Keep the log line.
 
@@ -872,7 +871,7 @@ In `acquire_granted`, replace the `funded_first(...)` block and `min_mc`:
         let book = crate::credits::book(node).await?;
         let own_left = match sell {
             Some(_) => crate::credits::jobs::budget(
-                &book.ledger, &me, node.scan_share(), 0,
+                &book.ledger, &me, node.scan_share(),
                 crate::credits::jobs::self_committed(&node.store.pool, &me).await?,
             ),
             None => 0,
@@ -921,38 +920,34 @@ Run: `cargo test --lib scan 2>&1 | tail -5` → pass. Clippy clean.
 
 ---
 
-### Task 6: Scans funded through the collecting node
+### Task 6: No collecting node; a lookup draws from the richest siblings
 
 **Files:**
-- Modify: `src/credits/fleet.rs` (`collect` keeps the float; new `fleet_extra`, `keep_float`)
-- Modify: `src/cluster/mod.rs` (`scan_float_mc: AtomicU64` on `Node`)
-- Modify: `src/credits/jobs.rs` (`announce_budget` and `fund`'s round use `fleet_extra`)
-- Modify: `src/scan/arbiter.rs` (`hand_out` sets `funding.extra`)
-- Modify: `src/credits/mod.rs` (hourly `keep_float` after `price::refresh`)
+- Modify: `src/credits/fleet.rs` (delete `collect`, `COLLECT_EVERY`, the forwarding loop at ~153-179; `draw` asks siblings richest first)
+- Modify: `src/credits/pay.rs:300-315` (`make_offer` calls the new `draw`)
+- Modify: `src/cluster/mod.rs:283-286, 357` (delete `collect_to`)
+- Modify: `src/cluster/msg.rs:130-135` (doc of `CreditDraw`: "a sibling → a sibling")
+- Modify: `src/settings.rs` (delete `KEY_COLLECT_TO`, `collect_to` in `Changes`, `Snapshot`, `Settings`, validation, describe, merge, persistence and the test `the_collecting_node_is_a_runtime_setting`), `src/settings_cli.rs:80-86`
+- Modify: `src/cluster/owner/cmd.rs:128, 307` (status no longer reports it)
+- Modify: `src/admin/cluster_owner.rs` (delete `collect_here` and its route; `:193-215` where the page reads it), `src/admin/cluster.rs:187-206, 909-936, 1183, 1611` (delete `collect_options` and its test)
+- Modify: `templates/admin_cluster_ownership.html:85`, `templates/admin_cluster_node.html:90-92, 130`, `templates/_node_settings.html:7`, `templates/admin_cluster_credits.html:93`
+- Create: `src/store/migrations/0024_no_collecting_node.sql`
+- Modify: `tests/cluster.rs` (delete `collecting_credits_here_tells_the_siblings_and_shows_where_credits_go` and `a_fleet_collects_at_one_node_and_any_of_its_nodes_can_spend`; rewrite `a_node_draws_what_a_lookup_needs_from_its_collecting_node`)
 
 **Interfaces:**
-- Consumes: `fleet::draw`, `owner::fleet::siblings`, `jobs::budget`.
 - Produces:
-  - `pub async fn fleet_extra(node: &Node, book: &Book) -> Mc`: the collecting node's balance divided by the number of siblings; 0 without a collecting node.
-  - `pub fn float_target(queued: u32, cheapest_mc: Option<u32>, budget: Mc) -> Mc`
-  - `pub async fn keep_float(node: &Arc<Node>) -> Result<Mc>`
-  - `pub fn forwardable(have: Mc, float: Mc) -> Mc`
+  - `pub fn draw_order(siblings: &[NodeId], balance: impl Fn(&NodeId) -> Mc) -> Vec<NodeId>`
+  - `pub async fn draw(node: &Arc<Node>, mc: Mc) -> bool` (same signature; asks siblings richest first)
 
-- [ ] **Step 1: Write the failing tests** (in `fleet.rs` tests):
+- [ ] **Step 1: Write the failing unit test** (in `fleet.rs` tests):
 
 ```rust
 #[test]
-fn the_float_is_what_queued_jobs_need_up_to_the_budget() {
-    assert_eq!(float_target(10, Some(50), 10_000), 500);
-    assert_eq!(float_target(10, Some(50), 300), 300, "capped by the budget");
-    assert_eq!(float_target(0, Some(50), 300), 0, "nothing queued");
-    assert_eq!(float_target(10, None, 300), 0, "no scanner sells");
-}
-
-#[test]
-fn collecting_leaves_the_float() {
-    assert_eq!(forwardable(1000, 300), 700);
-    assert_eq!(forwardable(200, 300), 0);
+fn a_lookup_draws_from_the_richest_sibling_first() {
+    let (a, b, c) = (NodeId([1; 32]), NodeId([2; 32]), NodeId([3; 32]));
+    let bal = |n: &NodeId| match n.0[0] { 1 => 50, 2 => 900, _ => 0 };
+    assert_eq!(draw_order(&[a, b, c], bal), vec![b, a], "richest first; nothing to give: not asked");
+    assert!(draw_order(&[], bal).is_empty());
 }
 ```
 
@@ -960,79 +955,102 @@ fn collecting_leaves_the_float() {
 
 Run: `cargo test --lib credits::fleet 2>&1 | tail -5`
 
-- [ ] **Step 3: Implement** in `fleet.rs`:
+- [ ] **Step 3: Implement** in `fleet.rs`. Module doc:
 
 ```rust
-/// What a node needs in hand for its queued jobs at the cheapest
-/// scanner's price, up to its budget.
-pub fn float_target(queued: u32, cheapest_mc: Option<u32>, budget: Mc) -> Mc {
-    cheapest_mc.map_or(0, |p| (queued as Mc * p as Mc).min(budget))
-}
-
-/// What `collect` sends when the node holds `have` and keeps `float`.
-pub fn forwardable(have: Mc, float: Mc) -> Mc {
-    have.saturating_sub(float)
-}
-
-/// This node's share of its collecting node's balance: the balance
-/// divided among its siblings (whether a sibling forwards is its own
-/// setting). 0 without a collecting node.
-pub async fn fleet_extra(node: &Node, book: &super::Book) -> Mc {
-    let me = node.id();
-    let Some(to) = (*node.collect_to.read().unwrap()).filter(|c| *c != me) else {
-        return 0;
-    };
-    let n = crate::cluster::owner::fleet::siblings(&node.store)
-        .await
-        .map_or(1, |s| s.iter().filter(|s| **s != to).count().max(1));
-    book.balance(&to) / n as Mc
-}
-
-/// Hourly: draw from the collecting node what this node's queued jobs
-/// need, and keep that much from being forwarded. Returns the float.
-pub async fn keep_float(node: &Arc<Node>) -> Result<Mc> {
-    if node.collect_to.read().unwrap().is_none_or(|c| c == node.id()) {
-        node.scan_float_mc.store(0, std::sync::atomic::Ordering::Relaxed);
-        return Ok(0);
-    }
-    let book = super::book_fresh(node).await?;
-    let me = node.id();
-    let extra = fleet_extra(node, &book).await;
-    let self_mc = super::jobs::self_committed(&node.store.pool, &me).await?;
-    let left = super::jobs::budget(&book.ledger, &me, node.scan_share(), extra, self_mc);
-    let cheapest = node.price_table().scanners.iter().map(|s| s.price_mc).min();
-    let queued = node.scan_queued.load(std::sync::atomic::Ordering::Relaxed);
-    let float = float_target(queued, cheapest, left);
-    node.scan_float_mc.store(float, std::sync::atomic::Ordering::Relaxed);
-    let have = book.balance(&me);
-    if float > have && !draw(node, float - have).await {
-        tracing::debug!("credits: scan float not drawn; jobs stay unpaid this hour");
-    }
-    Ok(float)
-}
+//! A fleet (the nodes of one owner) proves ownership. Its one economic
+//! effect: a node whose lookup needs more than it holds draws the missing
+//! credits from its siblings, the richest first. Every node keeps what it
+//! earns; scans are paid from the node's own balance only.
 ```
 
-In `collect`: after `let have = book.balance(&me);` insert `let have = forwardable(have, node.scan_float_mc.load(std::sync::atomic::Ordering::Relaxed));` and keep the existing early return on small amounts using this `have`. `spendable_parts(&me, have)` then sends only the excess.
-
-`cluster/mod.rs`: `pub scan_float_mc: std::sync::atomic::AtomicU64,` with doc `/// Credits kept from forwarding for scan offers (`credits::fleet::keep_float`).`, default 0.
-
-`jobs.rs`: in `announce_budget` pass `super::fleet::fleet_extra(node, &book).await` and `self_committed(...)` to `budget`. In `fund`, when `funding.book` is first computed, also set `funding.extra = super::fleet::fleet_extra(node, &b).await;`.
-
-`credits/mod.rs`: right after the hourly `price::refresh` call:
-
 ```rust
-        if ticks % 60 == 1
-            && let Err(e) = fleet::keep_float(&node).await
+/// Siblings to draw from: those holding anything, the richest first
+/// (ties by key, so the order is stable).
+pub fn draw_order(siblings: &[NodeId], balance: impl Fn(&NodeId) -> Mc) -> Vec<NodeId> {
+    let mut v: Vec<(Mc, NodeId)> = siblings
+        .iter()
+        .map(|s| (balance(s), *s))
+        .filter(|(b, _)| *b > 0)
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    v.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Draw `mc` from this node's siblings, the richest first, until it is
+/// covered, and wait for the transfers to arrive. False: no sibling gave
+/// enough.
+pub async fn draw(node: &Arc<Node>, mc: Mc) -> bool {
+    let me = node.id();
+    let Ok(book) = super::book_fresh(node).await else { return false };
+    let start = book.balance(&me);
+    let siblings = crate::cluster::owner::fleet::siblings(&node.store).await.unwrap_or_default();
+    let siblings: Vec<NodeId> = siblings.into_iter().filter(|s| *s != me && !node.is_blocked(s)).collect();
+    let mut missing = mc;
+    for from in draw_order(&siblings, |s| book.balance(s)) {
+        let ask = missing.min(book.balance(&from)).min(u32::MAX as Mc) as u32;
+        let avoid = crate::cluster::owner::cmd::old_relays(node, &from);
+        let sent = match node
+            .request_avoiding(from, Msg::CreditDraw { mc: ask as Mc }, DRAW_WAIT, avoid)
+            .await
         {
-            tracing::debug!(?e, "credits: scan float not kept");
+            Ok(Msg::CreditDrawReply { sent_mc }) => sent_mc,
+            _ => 0,
+        };
+        if sent == 0 {
+            continue;
         }
+        // The transfer is an entry of the sibling's log: fetch it.
+        if let Some(addr) = node.dial_address(&from) {
+            let _ = crate::cluster::sync::reconcile(node, from, &addr, false).await;
+        }
+        missing = missing.saturating_sub(sent);
+        if missing == 0 {
+            break;
+        }
+    }
+    // Wait until the book holds what arrived.
+    let until = tokio::time::Instant::now() + DRAW_WAIT;
+    loop {
+        if let Ok(b) = super::book_fresh(node).await
+            && b.balance(&me) >= start + mc.saturating_sub(missing)
+        {
+            return missing == 0;
+        }
+        if tokio::time::Instant::now() >= until {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
 ```
 
-- [ ] **Step 4: Run tests**
+Check the `CreditDraw { mc }` field type in `msg.rs` and match it (the current code passes `mc` straight through). Keep `serve` unchanged: it already answers siblings only. Delete `collect`, `COLLECT_EVERY`, `receivable` if only `collect` used it (`send` uses it too: keep it then), and the loop that kept `collect_to` in step with settings (`~153-179`) together with its spawn in `main.rs`/`lib.rs` (find it with `grep -rn "fleet::run\|fleet::keep" src`).
 
-Run: `cargo test --lib credits 2>&1 | tail -5` → pass. Clippy clean.
+`pay.rs:306`: the comment becomes `// Draw what is missing from the siblings, the richest first.`; the call stays `super::fleet::draw(node, missing)`.
 
-- [ ] **Step 5: Commit** — `Credits: nodes that collect elsewhere fund scans from a float drawn from the collecting node` plus the trailer.
+Migration `0024_no_collecting_node.sql`:
+
+```sql
+-- Fleets: nothing is forwarded to a collecting node any more; every node
+-- keeps what it earns and a lookup draws from its siblings.
+DELETE FROM settings WHERE key = 'credits.collect_to';
+```
+
+Remove the setting everywhere listed under **Files**. `Changes` and `Snapshot` derive `Deserialize`. Check they do not use `deny_unknown_fields` (`grep -n deny_unknown src/settings.rs src/cluster/owner/cmd.rs`). If they don't, an older sibling sending `collect_to` in an owner command is ignored. If they do, keep the field as `#[serde(default, skip_serializing)] collect_to: Option<String>` with a comment `/// Sent by nodes before fleets lost their collecting node; ignored.`
+
+- [ ] **Step 4: Rewrite the integration test** `a_node_draws_what_a_lookup_needs_from_its_collecting_node` → `a_lookup_draws_from_the_richest_sibling`. Same setup with three siblings a, b, c (adopt c like b). Then:
+  - `grant_scans(&[&na, &nb, &nc, &ns], a.id, 8)` (a is rich);
+  - `grant_scans(&[&na, &nb, &nc, &ns], c.id, 1)` (c is poorer; adjust the expected balances with `minted(8, 9)` and `minted(1, 9)`);
+  - delete the `collect_to` line.
+  
+  Assert the stranger's draw is still unanswered, the lookup on b succeeds, and in `ns`'s book: `book.balance(&a.id) == minted(8, 9) - cost`, `book.balance(&c.id) == minted(1, 9)`, `book.balance(&b.id) == 0`.
+
+- [ ] **Step 5: Run tests**
+
+Run: `cargo test --lib credits::fleet settings 2>&1 | tail -5`, then `cargo test --test cluster a_lookup_draws_from_the_richest_sibling fleet 2>&1 | tail -5` → pass. `grep -rn "collect_to\|collecting node\|Collect credits" src templates tests` → only the migration and, if kept, the ignored serde field. Clippy clean.
+
+- [ ] **Step 6: Commit** — `Fleets: no collecting node; a lookup draws from the richest siblings` plus the trailer.
 
 ---
 
@@ -1171,10 +1189,11 @@ Update the template-rendering unit test in `credits.rs` (~line 678) to the new f
 
 - [ ] **Step 6: Docs.** In `docs/cluster.md`, Credits section:
   - "Prices": scan prices are per scanner. Each scanner's price follows its paid scans of the past hour against 90 % of its capacity. Every node computes every scanner's price from the log and the heartbeats, and pays at most 1.25 times its own figure.
-  - "Scan jobs": the arbiter hands each job to the cheapest scanner asking. A scanner asks arbiters that can pay its price first, in urgency order. A node's own jobs are funded from the same budget without moving credits. A node collecting elsewhere keeps a float drawn from its collecting node. Hoarding scanners (over their hourly capacity, or delivering less than half of 5 recent grants) go last.
+  - "Scan jobs": the arbiter hands each job to the cheapest scanner asking. A scanner asks arbiters that can pay its price first, in urgency order. A node's own jobs are funded from the same budget without moving credits. Hoarding scanners (over their hourly capacity, or delivering less than half of 5 recent grants) go last.
   - "What this cannot do": add understated capacity, a lone dishonest scanner at start, and capacity withdrawal (the spec's §9 items).
   - "Upgrading": `Protocol 5: scan jobs are paid only between nodes on protocol 5; upgrade all nodes together.`
-  - CHANGELOG Unreleased, under "Changed", one bullet per spec section: scanner prices, cheapest scanner, own jobs, collecting node, protocol 5.
+  - Ownership/fleet text in `docs/cluster.md`: remove "Your nodes as one" (collecting node) and the limit about a broken-into sibling spending the collecting node. Instead: "A lookup that needs more than a node holds draws from its siblings, richest first; a sibling broken into can draw from the others."
+  - CHANGELOG Unreleased, under "Changed", one bullet per spec section: scanner prices, cheapest scanner, own jobs, fleets without a collecting node, protocol 5. Under "Removed": `credits.collect_to` and "Collect credits here".
 
 - [ ] **Step 7: Full verification**
 

@@ -21,7 +21,9 @@ busy it is:
   another node or its own.
 - **A node's own jobs follow the same rule as anyone's**: paid when its
   scan budget covers its own scanner's price, unpaid otherwise.
-- **Nodes that collect credits elsewhere can fund scans.**
+- **The collecting node goes.** Every node keeps what it earns. A
+  lookup that needs more draws from the node's siblings, richest first.
+  Being a sibling has no other economic effect.
 - **No node can raise a price by announcing one**: buyers compute every
   scanner's price themselves from public inputs.
 
@@ -30,10 +32,10 @@ waiting against all scan capacity. It ignores how busy any one scanner
 is, so an idle scanner cannot get cheaper; it ignores unpaid jobs; and
 each node's copy drifts, so "best paying first" ranks arbiters by drift.
 Paid jobs always go before unpaid ones, so a scanner's own jobs (never
-paid) and those of nodes that forward their credits (no balance) come
-last and starve under load. Scan funding draws only on the node's own
-balance, so a node whose credits sit at its collecting node funds
-nothing.
+paid) come last and starve under load. A fleet's credits are forwarded
+to a collecting node every 10 minutes and drawn back for lookups: the
+other nodes hold nothing, so they can fund no scan, and money moves
+far more often than lookups need it.
 
 ## Constants
 
@@ -138,22 +140,26 @@ drifted from the arbiter's copy is paid at most a little less.
   elsewhere. Its balance is untouched.
 - Unchanged: a scan of a node's own job earns no mint.
 
-## 5. The collecting node
+## 5. Fleets: no collecting node
 
-A node with `collect_to` set (another node of its fleet):
+A fleet (the nodes of one owner, `owner::fleet::siblings`) proves
+ownership. It has no economic effect except one: a node may take
+credits from its siblings for a lookup.
 
-- **Budget**: `scan_share` × (its own balance + its collecting node's
-  balance divided by the number of its siblings, `owner::fleet::siblings`;
-  whether a sibling forwards is its own setting and not known here),
-  less what its scan offers and own jobs hold and were charged
-  today. Every node computes any member's balance from its log.
-- **Scan float**: once an hour, after the price step, it draws from its
-  collecting node what its queued jobs need at the cheapest scanner's
-  price, up to that budget, less what it holds (`fleet::draw`).
-  `fleet::collect` forwards only what exceeds the float.
-- A draw that fails leaves the node's jobs unpaid until the next hour.
-
-The collecting node itself funds from its own balance as now.
+- **Nothing is forwarded.** Every node keeps what it earns. The
+  collecting node, `credits.collect_to` (setting, CLI, "Collect credits
+  here" on the Ownership page) and `fleet::collect` go.
+- **A lookup that needs more than the node holds** draws the missing
+  amount from its siblings, the richest first (balances from this
+  node's book), then the next, until it is covered or no sibling has
+  more (`fleet::draw`, the existing `CreditDraw` message, asked of one
+  sibling after another).
+- **Scans are funded from the node's own balance only**, by the rules of
+  §2–§4. A sibling's job is an arbiter's job like any other: paid at the
+  scanner's price, and a sibling scanner charges it.
+- **Upgrade.** Nodes stop forwarding. What sits on a former collecting
+  node stays there and is drawn by lookups like any sibling's balance.
+  Nothing is migrated.
 
 ## 6. Protocol and heartbeat
 
@@ -219,9 +225,6 @@ Each is mitigated where the design can; what remains is in §9.
   one hour to make that hour's demand spike. Demand counts scans by when
   they finished, not when the receipt was written, so holding receipts
   back moves nothing.
-- **A fleet that counts its balance several times.** Each sibling would
-  see the whole collecting node's balance and fund from it, overspending
-  `scan_share` many times. Each counts its share of it (§5).
 - **Undercutting.** A scanner sells below its rule price to win jobs.
   This is allowed: buyers gain, and its price then rises by the rule as it
   fills. It cannot later raise its price faster than the rule allows.
@@ -264,8 +267,10 @@ Each is mitigated where the design can; what remains is in §9.
   load).
 - Unit: own-job funding against the budget, held, charged and released
   with `self_mc`; no offer written.
-- Unit: the fleet budget (the collecting node's balance shared among
-  its forwarding nodes) and scan float; `collect` keeps the float.
+- Unit: the order of siblings a lookup draws from (richest first, then
+  the next until covered; none without siblings).
+- Integration: a lookup on a node holding nothing is paid from its
+  richest sibling; nothing is forwarded.
 - Unit: the attack mitigations: a claimant over its hourly capacity or
   under `DELIVERY_MIN` goes last; demand by `finished_at`; an underpaying
   or unpaid-granting arbiter drops out of the can-pay group for an hour;
