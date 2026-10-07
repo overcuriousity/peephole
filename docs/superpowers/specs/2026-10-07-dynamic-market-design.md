@@ -137,19 +137,22 @@ level against the money supply.
   50 % destruction goes: the server keeps the full charged amount.
 - **Probes.** Priced like a provider named `probe` on each scanner, with
   its probe slots as supply.
-- **Free: what needs no setup.** The Tor exit list, RDAP and Shodan
-  InternetDB need no account or key; they stay free, served without
-  offers under the existing hourly limit (`pay::FREE_PER_HOUR`), and the
-  Lookup page runs them by itself. A provider is marked free in
-  `intel::KNOWN_PROVIDERS` (`free: bool`). InternetDB's on-demand share
-  still protects its budget.
-- **Everything else is paid**, GeoLite2 included: its operator set up an
-  account and a key.
-- **Supply without an API budget.** A paid provider without a daily API
-  budget (GeoLite2) and domain resolution use the operator's
-  `[enrichment] offer_per_day` (default 1000) as their daily supply on
-  that node. A node that offers more is cheaper; askers go to the
-  cheapest server first, so many generous nodes lower the price.
+- **Every provider is paid**, the Tor exit list, RDAP, Shodan InternetDB
+  and GeoLite2 included: each runs on an operator's node, and that work
+  earns. There is no free tier and no free hourly quota: the hourly limit
+  on free lookups (`pay::FREE_PER_HOUR`, `take_free_lookup`) goes, and a
+  request without an offer is declined.
+- **Supply.** A provider with a daily API budget offers its on-demand
+  share of it (`[enrichment] on_demand_share`, as now). A provider
+  without one (Tor, RDAP, GeoLite2, InternetDB as configured) and domain
+  resolution offer the operator's `[enrichment] offer_per_day` (default
+  1000) a day on that node. A node that offers more is cheaper; askers go
+  to the cheapest server first, so many generous nodes lower the price.
+- **The Lookup page spends nothing by itself.** It shows what the dataset
+  already holds (free) and every provider with its cheapest price, and
+  asks the ones the admin picks ("all" asks every one).
+- **A node's own enrichment** of recorded addresses with its own
+  providers (the background loop) is not a lookup and stays as it is.
 - **Domain resolution** is paid to each other resolver: the asker offers
   each its announced `resolve` price, the resolver charges it when it
   answers and nothing when it fails. This node's own resolver costs
@@ -239,7 +242,7 @@ the same rules; its changelog says so.
 
 ## 9. Testing
 
-- Providers: free ones need no offer; GeoLite2 and resolution use `offer_per_day`; a paid resolution is charged only when answered.
+- Providers: every one needs an offer; one without an API budget and resolution use `offer_per_day`; a paid resolution is charged only when answered; the Lookup page asks only what was picked.
 - `earn`: own-job rule, level weights,
   the mint split of a day (shares sum to `MINT_PER_DAY`, empty day mints
   nothing), late scans shifting shares.

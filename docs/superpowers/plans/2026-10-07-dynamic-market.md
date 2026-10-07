@@ -14,8 +14,9 @@
 
 - Ledger constants (must be identical on every node, build constants): `MINT_PER_DAY` = 1000 credits, `ALLOWANCE_PER_DAY` = 5 credits, `PER_NODE_PER_DAY` = 500 (existing), `LOT_DAYS` = 7 (existing), level weights 1 (levels 1, 2) and 2 (levels 3, 4).
 - Price parameters (build defaults, may differ per node): `PRICE_FLOOR` = 1 mc, `PRICE_STEP` = 0.15, step bounded by `clamp((D − S) / max(S, 1), −3, 3)`.
-- Free providers are exactly those that need no account or key: Tor exit list, RDAP, Shodan InternetDB (`ProviderInfo.free = true`). They are served without offers under `pay::FREE_PER_HOUR`; InternetDB's on-demand share still applies. Every other provider (GeoLite2 included) and domain resolution to another node is paid.
-- `[enrichment] offer_per_day` (default 1000): the daily supply of a paid provider without an API budget and of name resolutions on that node.
+- Every provider is paid (Tor, RDAP, InternetDB and GeoLite2 included); a request without an offer is declined. `pay::FREE_PER_HOUR`, `take_free_lookup`, `take_free_resolve` and `take_free` go: there is no free hourly quota of anything.
+- `[enrichment] offer_per_day` (default 1000): the daily supply of a provider without an API budget and of name resolutions on that node; a provider with a budget offers its on-demand share as now.
+- The Lookup page asks no provider by itself: only those the admin picks ("all" = every one). A node's own background enrichment is unchanged.
 - Nothing is burned: a receipt moves the full charged amount to the server.
 - A scan of the scanner's own job (scanner == trap) never counts for the mint.
 - `[credits] scan_share` in the config file, default 0.5, between 0 and 1.
@@ -577,7 +578,7 @@ git commit -m "Credits: a fixed daily mint split among scanners, an allowance fo
 - Modify: `src/cluster/mod.rs` (`Node.market: price::Demand`, `scan_bids: AtomicU32`, `scan_share: OnceLock<f64>` with `set_scan_share`/`scan_share`)
 - Modify: `src/cluster/status.rs` (`Heartbeat.scan_price_mc`, `Heartbeat.scan_bids`, `refresh_heartbeat`, test constructions)
 - Modify: `src/credits/pay.rs` (`quotes`, `serve`: price fallback, demand counting)
-- Modify: `src/intel/mod.rs` (`ProviderInfo.free`), `src/intel/lookup.rs` (free partition, `cheap`)
+- Modify: `src/intel/lookup.rs` (offer-less path, `cheap` removed, `run`), `src/admin/lookup.rs` (no cheap tier), `src/cluster/mod.rs` (remove `take_free_lookup`, `free_lookups`, `take_free`)
 - Modify: `src/config.rs` (`EnrichmentConfig.offer_per_day`), `src/lib.rs:176` (`Shares::new`)
 - Modify: `src/scan/probe/serve.rs` (price, slots, demand), `src/admin/credits.rs`, `src/admin/overview.rs`, `templates/admin_cluster_credits.html`, `templates/admin_home.html`
 
@@ -589,11 +590,10 @@ git commit -m "Credits: a fixed daily mint split among scanners, an allowance fo
   - `price::Demand` with `note(&self, good: &str, n: u32)` and `take(&self) -> (HashMap<String, f64>, f64 /*hours*/)`.
   - `price::Offer { provider, price_mc: u32, on_demand: Option<u32> }`; `price::Table { at_ms, capacity, scan_bids: u32, scan_mc: u32, probe_mc: Option<u32>, offers }` with `price_of`, `announced` as now.
   - `Heartbeat { ..., #[serde(default)] scan_price_mc: Option<u32>, #[serde(default)] scan_bids: u32 }`.
-  - `ProviderInfo { ..., free: bool }`; `intel::is_free(name: &str) -> bool`.
-  - `Shares::new(store, share: f64, offer_per_day: u32)`; `Shares::allowance(p)`: budget share with a budget, `None` for a free provider without one, `Some(offer_per_day)` otherwise; `Shares::offer_per_day() -> u32`; `Shares::take_good(good: &str) -> Result<bool>` (counts against `offer_per_day`).
-  - `price::provider_price(free: bool, per_day: u32, current: Option<Mc>, demand: f64, hours: f64) -> Mc`.
+  - `Shares::new(store, share: f64, offer_per_day: u32)`; `Shares::allowance(p) -> u32`: the budget share with a budget, `offer_per_day` without; `Shares::offer_per_day() -> u32`; `Shares::take_good(good: &str) -> Result<bool>` (counts against `offer_per_day`).
+  - `price::Offer.on_demand: u32`.
+  - `price::provider_price(per_day: u32, current: Option<Mc>, demand: f64, hours: f64) -> Mc`.
   - `price::RESOLVE: &str = "resolve"`; `Table.resolve_mc: u32`, announced in `prices` as `("resolve", mc)`.
-  - `lookup::cheap() -> Vec<String>`: the free providers (static).
   - `proto::MARKET_PROTO: u32 = 4`; `pay::pays_with(proto_max: u32) -> bool`.
 
 - [ ] **Step 1: Write the failing price tests** (replace the tests of `price.rs` that use `unit`, `load`, `price`, `weight_milli`; keep `scan_capacity_is_bound_by_workers_or_by_the_hourly_limit` and `a_table_knows_what_it_offers` adapted to the new `Offer`)
@@ -636,13 +636,13 @@ git commit -m "Credits: a fixed daily mint split among scanners, an allowance fo
     }
 
     #[test]
-    fn free_providers_cost_nothing_and_paid_ones_follow_their_supply() {
-        assert_eq!(provider_price(true, 240, Some(500), 3.0, 1.0), 0);
-        assert_eq!(provider_price(false, 240, None, 3.0, 1.0), step(PRICE_FLOOR, 3.0, 10.0));
-        assert_eq!(provider_price(false, 240, Some(500), 10.0, 1.0), 500);
-        assert_eq!(provider_price(false, 0, Some(500), 1.0, 1.0), step(500, 1.0, 0.0));
+    fn every_provider_follows_its_supply() {
+        assert_eq!(provider_price(240, None, 3.0, 1.0), step(PRICE_FLOOR, 3.0, 10.0));
+        assert_eq!(provider_price(240, Some(500), 10.0, 1.0), 500);
+        assert_eq!(provider_price(0, Some(500), 1.0, 1.0), step(500, 1.0, 0.0));
+        assert!(provider_price(240, Some(1), 0.0, 1.0) >= PRICE_FLOOR, "never free");
         // A generous node (high offer_per_day) gets cheaper under the same demand.
-        assert!(provider_price(false, 24_000, Some(500), 50.0, 1.0) < provider_price(false, 240, Some(500), 50.0, 1.0));
+        assert!(provider_price(24_000, Some(500), 50.0, 1.0) < provider_price(240, Some(500), 50.0, 1.0));
     }
 ```
 
@@ -683,12 +683,9 @@ pub fn start(announced: &[u32]) -> Mc {
     v[(v.len() - 1) / 2] as Mc
 }
 
-/// A provider's next price here: nothing for a free one, else a step from
-/// `current` (or the floor) with `per_day` spread over `hours` as supply.
-pub fn provider_price(free: bool, per_day: u32, current: Option<Mc>, demand: f64, hours: f64) -> Mc {
-    if free {
-        return 0;
-    }
+/// A provider's next price here: a step from `current` (or the floor)
+/// with `per_day` spread over `hours` as supply.
+pub fn provider_price(per_day: u32, current: Option<Mc>, demand: f64, hours: f64) -> Mc {
     step(current.unwrap_or(PRICE_FLOOR), demand, per_day as f64 / 24.0 * hours)
 }
 
@@ -794,13 +791,11 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let providers = node.lookup_providers().unwrap_or(&empty);
     let offer_per_day = node.lookup_shares().map_or(crate::config::DEFAULT_OFFER_PER_DAY, |s| s.offer_per_day());
     for p in providers.iter().filter(|p| p.ready()) {
-        let free = intel::is_free(p.name());
-        let on_demand = node.lookup_shares().and_then(|s| s.allowance(p.as_ref()));
-        let cur = if free { None } else { Some(current(node, &old, p.name(), &ann(p.name())).await?) };
+        let on_demand = node.lookup_shares().map_or(offer_per_day, |s| s.allowance(p.as_ref()));
+        let cur = current(node, &old, p.name(), &ann(p.name())).await?;
         offers.push(Offer {
             provider: p.name().to_string(),
-            price_mc: provider_price(free, on_demand.unwrap_or(offer_per_day), cur, got(p.name()), hours)
-                .min(u32::MAX as Mc) as u32,
+            price_mc: provider_price(on_demand, Some(cur), got(p.name()), hours).min(u32::MAX as Mc) as u32,
             on_demand,
         });
     }
@@ -818,7 +813,6 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let scan_mc = step(scan_cur, bids as f64, capacity.per_day / 24.0).min(u32::MAX as Mc) as u32;
     for (good, mc) in offers
         .iter()
-        .filter(|o| o.price_mc > 0)
         .map(|o| (o.provider.as_str(), o.price_mc))
         .chain(probe_mc.map(|m| (PROBE, m)))
         .chain([(SCAN, scan_mc), (RESOLVE, resolve_mc)])
@@ -923,25 +917,17 @@ and fill them in `refresh_heartbeat`: `scan_price_mc: table.price_of(crate::cred
     }
 ```
 
-- `src/intel/mod.rs`: add `pub free: bool` to `ProviderInfo` ("needs no account or key: answered without credits"); `true` for `TOR`, `RDAP`, `INTERNETDB`, `false` for the others; and
-
-```rust
-/// A provider anyone can ask without an account or key: never paid.
-pub fn is_free(name: &str) -> bool {
-    provider_info(name).is_some_and(|i| i.free)
-}
-```
-
-- `src/config.rs`: `EnrichmentConfig.offer_per_day: u32` with `#[serde(default = "default_offer_per_day")]`, `pub const DEFAULT_OFFER_PER_DAY: u32 = 1000;`, doc: "Paid lookups a day this node serves of each provider without an API budget (GeoLite2), and names it resolves a day for other members." Add `("enrichment", "offer_per_day", "1000")` next to the `on_demand_share` entry near line 609 and a test that the default is 1000. `src/lib.rs:176`: pass `cfg.enrichment.offer_per_day` to `Shares::new`.
+- `src/config.rs`: `EnrichmentConfig.offer_per_day: u32` with `#[serde(default = "default_offer_per_day")]`, `pub const DEFAULT_OFFER_PER_DAY: u32 = 1000;`, doc: "Paid lookups a day this node serves of each provider without an API budget (Tor exit list, RDAP, GeoLite2, …), and names it resolves a day for other members." Add `("enrichment", "offer_per_day", "1000")` next to the `on_demand_share` entry near line 609 and a test that the default is 1000. `src/lib.rs:176`: pass `cfg.enrichment.offer_per_day` to `Shares::new`.
 
 - `src/credits/share.rs`: `Shares { store, share, offer_per_day }`;
 
 ```rust
-    pub fn allowance(&self, p: &dyn Provider) -> Option<u32> {
+    /// Paid lookups of `p` this node serves a UTC day: its API budget times
+    /// the share, or `offer_per_day` without a budget.
+    pub fn allowance(&self, p: &dyn Provider) -> u32 {
         match p.per_day() {
-            Some(d) => Some((d * self.share).floor().clamp(0.0, u32::MAX as f64) as u32),
-            None if crate::intel::is_free(p.name()) => None,
-            None => Some(self.offer_per_day),
+            Some(d) => (d * self.share).floor().clamp(0.0, u32::MAX as f64) as u32,
+            None => self.offer_per_day,
         }
     }
 
@@ -952,33 +938,21 @@ pub fn is_free(name: &str) -> bool {
     /// Count one paid unit of `good` (a resolution) against
     /// `offer_per_day`; false when today's are used up.
     pub async fn take_good(&self, good: &str) -> Result<bool> {
-        self.take_named(good, Some(self.offer_per_day), today()).await
+        self.take_named(good, self.offer_per_day, today()).await
     }
 ```
 
-Move the body of `take_on` into `async fn take_named(&self, name: &str, allowance: Option<u32>, day: NaiveDate) -> Result<bool>` and let `take_on` call it with `p.name()` and `self.allowance(p)`. Update the share tests' `Shares::new(.., 0.2)` calls to pass `1000` and add: a fake provider without a budget and not free gets `Some(1000)`; with name `"tor"` gets `None`.
+Move the body of `take_on` into `async fn take_named(&self, name: &str, allowance: u32, day: NaiveDate) -> Result<bool>` (no `None` branch any more) and let `take_on` call it with `p.name()` and `self.allowance(p)`; `spent_on` compares with `self.allowance(p)` directly. `price::Table::announced` maps every offer's `on_demand` (no `filter_map`). Update the share tests' `Shares::new(.., 0.2)` calls to pass `1000` and add: a fake provider without a budget gets `1000`.
 
-- `src/intel/lookup.rs::serve` (offer-less path): partition with `crate::intel::is_free`, and for a free provider with a budget (InternetDB) take its share before asking (decline it with "this node's on-demand share of that provider is spent for today" when `take` is false):
+- `src/intel/lookup.rs::serve`: the offer-less path declines every provider with "lookups are paid with credits: the request carries no offer" (no partition, no `take_free_lookup`). Delete `cheap`, `CHEAP_MILLI` and the test `cheap_tier_is_tor_rdap_geolite_and_internetdb`; in `run`, `wanted` is the providers in `ask` or `again` without a fresh stored answer (no cheap tier). Update the doc comment above `serve` (line ~112) accordingly.
 
-```rust
-            let (free, paid): (Vec<String>, Vec<String>) =
-                served.into_iter().partition(|n| crate::intel::is_free(n));
-```
+- `src/cluster/mod.rs`: remove `take_free_lookup`, `take_free_resolve`, `take_free`, the `free_lookups`/`free_resolves` fields and their initialisation; `src/credits/pay.rs`: remove `FREE_PER_HOUR`. (`src/cluster/rpc/mod.rs::resolve` uses `take_free_resolve` until Task 5: in this task make it refuse every request with "resolving a name is paid with credits: upgrade this node", Task 5 replaces it.)
 
-- `cheap` becomes static and `CHEAP_MILLI` goes:
-
-```rust
-/// The providers a lookup asks without being told to: the free ones.
-pub fn cheap() -> Vec<String> {
-    KNOWN_PROVIDERS.iter().filter(|p| p.free).map(|p| p.name.to_string()).collect()
-}
-```
-
-Rename the test `cheap_tier_is_tor_rdap_geolite_and_internetdb` to `cheap_tier_is_tor_rdap_and_internetdb` and drop `MAXMIND` from its expectation. The callers in `src/admin/lookup.rs` stay as they are.
+- `src/admin/lookup.rs`: `Offer::from_quotes` puts every provider into the paid list (no cheap tier; drop the cheap-tier total and its template text "What a lookup costs at most"); `asked` with `*` returns every known provider. The tests `a_lookup_asks_the_cheap_tier_and_offers_the_rest` (rename to `a_lookup_asks_only_what_was_picked`) and the two that expect "Tor exit list" after a lookup (lines ~664 and ~722) change: nothing is asked unless picked, so they pick `tor` explicitly or expect the provider to be offered with its price instead of answered.
 
 - `src/scan/probe/serve.rs`: `pub fn slots(&self) -> u32 { self.max }`; `price` returns `table.probe_mc.unwrap_or(price::PRICE_FLOOR as u32)`; remove `surging`; where a paid probe request arrives (before its offer is accepted), `node.market.note(price::PROBE, 1)` unless the asker is a sibling (same check as above).
 
-- Pages: `src/admin/credits.rs` `PriceView` becomes `{ scan: String, scan_bids: u32, capacity_per_hour: String, utilization: String, probe: Option<String>, offers: Vec<(String, String, String)> }` (provider label, price or "free", on-demand a day or "no limit"); template list: "A funded scan job costs **{{ price.scan }}** credits here ({{ price.scan_bids }} funded jobs waiting; the scanners do {{ price.capacity_per_hour }} an hour, {{ price.utilization }} % used)." plus the provider table without the surge column. `src/admin/overview.rs`: the keyed range filters `provider_info(p).is_some_and(|i| i.api)` and price > 0; `unit` becomes `scan` (`show(t.scan_mc as u64)`), the home tile "Scan price" with hint "a funded job · keyed lookups {{ lo }}–{{ hi }}".
+- Pages: `src/admin/credits.rs` `PriceView` becomes `{ scan: String, scan_bids: u32, capacity_per_hour: String, utilization: String, probe: Option<String>, offers: Vec<(String, String, String)> }` (provider label, price, paid lookups it serves a day); template list: "A funded scan job costs **{{ price.scan }}** credits here ({{ price.scan_bids }} funded jobs waiting; the scanners do {{ price.capacity_per_hour }} an hour, {{ price.utilization }} % used)." plus the provider table without the surge column. `src/admin/overview.rs`: the keyed range filters `provider_info(p).is_some_and(|i| i.api)` and price > 0; `unit` becomes `scan` (`show(t.scan_mc as u64)`), the home tile "Scan price" with hint "a funded job · keyed lookups {{ lo }}–{{ hi }}".
 
 - [ ] **Step 7: Run the focused tests**
 
@@ -989,7 +963,7 @@ Expected: PASS.
 
 ```bash
 git add -A src templates
-git commit -m "Credits: market prices per good from demand and supply; no weights, unit or surge; only Tor, RDAP and InternetDB are free; offer_per_day for GeoLite2 and resolution"
+git commit -m "Credits: market prices per good from demand and supply; no weights, unit, surge or free tier; offer_per_day for providers without a budget"
 ```
 
 ---
@@ -1264,7 +1238,6 @@ git commit -m "Scan jobs are paid: arbiters fund grants within scan_share, scann
 **Files:**
 - Modify: `src/intel/dns.rs` (`ResolveReq`, `choose`, `lookup_with`, `ask`, tests)
 - Modify: `src/cluster/rpc/mod.rs:219-240` (`resolve` handler)
-- Modify: `src/cluster/mod.rs` (remove `take_free_resolve` and `free_resolves`)
 
 **Interfaces:**
 - Consumes: `pay::make_offer(node, server, total_mc) -> Result<u64, String>`, `pay::accept_offer(node, peer, offer_seq, price, what, margin_ms) -> Result<Accepted, Declined>`, `pay::release(node, peer, offer_seq)`, `pay::SERVE_MARGIN_MS`, `price::RESOLVE`, `Table::price_of`, `Shares::take_good`, `Node::market`.
@@ -1389,7 +1362,7 @@ pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> 
 }
 ```
 
-`src/cluster/rpc/mod.rs::resolve` becomes `Cbor(crate::intel::dns::serve_resolve(&node, peer, &req).await).into_response()` with the doc "A host name resolved for a member, paid with the offer it names; it never scans, probes or stores anything." Remove `take_free_resolve`, the `free_resolves` field and its initialisation from `src/cluster/mod.rs` (`take_free` stays for lookups).
+`src/cluster/rpc/mod.rs::resolve` becomes `Cbor(crate::intel::dns::serve_resolve(&node, peer, &req).await).into_response()` with the doc "A host name resolved for a member, paid with the offer it names; it never scans, probes or stores anything." (`take_free_resolve` was removed in Task 3.)
 
 - [ ] **Step 5: The asker's side**
 
@@ -1549,7 +1522,8 @@ fn minted(scans: u64, total: u64) -> u64 {
 Then run `cargo test --test cluster credit` (and the other names below) and update each expectation:
 - A balance seeded as `10_000` (8 scans) becomes `minted(8, 8)`; where two nodes were granted scans in one test, use `minted(theirs, all)`.
 - A server's gain `cost / 2` becomes `cost`; `a_lookup_answered_by_the_nodes_own_provider_costs_half_net` becomes `..._costs_nothing_net` with `book.balance(&a.id) == minted(8, 8)` and no `destroyed`.
-- `announced_prices_follow_the_clusters_earnings` becomes `announced_prices_follow_demand_and_supply`: after `price::refresh`, the heartbeat of `a` carries a positive price for `abuseipdb` and `maxmind-geolite2` (paid, `offer_per_day` supply) and none above 0 for `tor`; after noting demand far above supply (`na.node.market.note("abuseipdb", 10_000)`) and refreshing again, the `abuseipdb` price rose.
+- `announced_prices_follow_the_clusters_earnings` becomes `announced_prices_follow_demand_and_supply`: after `price::refresh`, the heartbeat of `a` carries a positive price for `abuseipdb` and `maxmind-geolite2`; after noting demand far above supply (`na.node.market.note("abuseipdb", 10_000)`) and refreshing again, the `abuseipdb` price rose.
+- The assertion near line 5185 ("without an offer only free providers answer") becomes: without an offer nothing is answered and every provider is declined with "paid with credits".
 - `a_paid_lookup_moves_credits_from_the_asker_to_the_server`: `book.balance(&b.id) == cost` (b was granted no scans).
 - `an_old_version_member_is_not_asked_for_paid_lookups`: the old member announces protocol 3.
 
@@ -1700,7 +1674,7 @@ git commit -m "Credits page: mint, allowance, income by source and the market's 
 Title "Credits: a market for the cluster's work". Bullets in the section's existing style, each a bold lead and plain sentences:
 - **Where credits come from.** The daily mint (1000 credits split among scanners by counted scans of the day; levels 3 and 4 count twice; a scan of a node's own job never counts; one counted scan per address in 24 hours, 500 a day per scanner) and the allowance (5 credits a day for every member that earns here and recorded a request that day). Both are credited when the UTC day ends.
 - **Where they go.** A credit is gone 7 days after its day. Payments move the full price.
-- **Prices.** One rule per good, hourly, per node: excess demand raises a price by at most a factor of e^0.45 an hour, excess supply lowers it, never under 0.001 credits. Free: the Tor exit list, RDAP and Shodan InternetDB (no account or key). Everything else is paid, GeoLite2 included; a provider without an API budget and name resolution use `[enrichment] offer_per_day` (default 1000) as their supply.
+- **Prices.** One rule per good, hourly, per node: excess demand raises a price by at most a factor of e^0.45 an hour, excess supply lowers it, never under 0.001 credits. Every provider is paid, the Tor exit list, RDAP, InternetDB and GeoLite2 included; there is no free quota. A provider with an API budget offers its on-demand share; one without, and name resolution, offer `[enrichment] offer_per_day` (default 1000) a day. The Lookup page asks only the providers picked.
 - **Domains.** Each other resolver is paid its announced price; a failed resolution costs nothing; this node's own resolver is free.
 - **Scan jobs.** The arbiter funds its jobs up to `[credits] scan_share` (default half) of its balance; funded jobs are offered to scanners first; the scanner charges on delivery; a scan offer lapses after 12 hours.
 - Keep, updated: conformity and audits, budgets, known addresses, collecting node, two histories.
@@ -1709,7 +1683,7 @@ Title "Credits: a market for the cluster's work". Bullets in the section's exist
 
 - [ ] **Step 2: README and CHANGELOG**
 
-README line on credits: "lookups, probes and scan jobs are paid with credits; scanners earn most of them, every member a little." CHANGELOG under Unreleased, "Changed": the dynamic market in six bullets (mint, allowance, market prices with `offer_per_day`, paid scan jobs, paid resolution and GeoLite2, no burn) and "Upgrade all nodes together: protocol 4 pays only between upgraded nodes."
+README line on credits: "lookups, probes and scan jobs are paid with credits; scanners earn most of them, every member a little." CHANGELOG under Unreleased, "Changed": the dynamic market in six bullets (mint, allowance, market prices with `offer_per_day`, paid scan jobs, every provider and resolution paid with no free quota, no burn) and "Upgrade all nodes together: protocol 4 pays only between upgraded nodes."
 
 - [ ] **Step 3: Spec status**
 
