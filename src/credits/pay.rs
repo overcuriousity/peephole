@@ -308,8 +308,7 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
         .await
         .map_err(|e| format!("this node could not read its books: {e:#}"))?;
     if book.ledger.spendable_parts(&me, total_mc).is_none() {
-        // The fleet's balance sits at its collecting node: draw what is
-        // missing, then look again.
+        // Draw what is missing from the siblings, the richest first.
         let missing = total_mc.saturating_sub(book.balance(&me));
         if super::fleet::draw(node, missing).await
             && let Ok(b) = super::book_fresh(node).await

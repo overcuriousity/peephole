@@ -1,22 +1,18 @@
-//! A fleet's one balance. The ledger has node accounts only; a fleet
-//! becomes one entity through two movements between its nodes, both
-//! ordinary transfers: every node forwards what it earns to the fleet's
-//! collecting node, and a node that needs credits draws them from there.
-//! To the rest of the cluster these are transfers like any other.
-use super::{CREDIT, Mc, show};
+//! A fleet (the nodes of one owner) proves ownership. Its one economic
+//! effect: a node whose lookup needs more than it holds draws the missing
+//! credits from its siblings, the richest first. Every node keeps what it
+//! earns; scans are paid from the node's own balance only.
+use super::{Mc, show};
 use crate::cluster::identity::NodeId;
 use crate::cluster::msg::Msg;
 use crate::cluster::record::Record;
 use crate::cluster::{Node, repl};
-use crate::settings::Settings;
 use anyhow::{Result, bail};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// How often a node forwards what it holds.
-pub const COLLECT_EVERY: Duration = Duration::from_secs(600);
-/// How long a node waits for its collecting node, and then for the
-/// transfer to arrive.
+/// How long a node waits for a sibling, and then for the transfers to
+/// arrive.
 pub const DRAW_WAIT: Duration = Duration::from_secs(10);
 
 /// Whether credits can be sent to `to` from here: an active member that
@@ -60,26 +56,6 @@ pub async fn send(node: &Node, to: NodeId, mc: Mc) -> Result<Mc> {
     Ok(mc)
 }
 
-/// Forward everything this node holds to `to`, when it holds at least a
-/// credit or a lot is on its last day. Returns what was sent.
-pub async fn collect(node: &Node, to: NodeId) -> Result<Mc> {
-    if !receivable(node, &to).await? {
-        return Ok(0);
-    }
-    let me = node.id();
-    let book = super::book_fresh(node).await?;
-    let have = book.balance(&me);
-    if have == 0 || (have < CREDIT && book.ledger.expiring_today(&me) == 0) {
-        return Ok(0);
-    }
-    let Some(parts) = book.ledger.spendable_parts(&me, have) else {
-        return Ok(0);
-    };
-    transfer(node, to, parts).await?;
-    tracing::info!(to = %to.short(), credits = %show(have), "credits forwarded to the collecting node");
-    Ok(have)
-}
-
 /// Answer draws: a sibling gets what it asks for, as far as this node's
 /// balance goes. Anyone else gets no answer.
 pub fn serve(node: &Arc<Node>) {
@@ -109,39 +85,64 @@ pub fn serve(node: &Arc<Node>) {
     }));
 }
 
-/// Draw `mc` from this node's collecting node and wait for the transfer
-/// to arrive. False: no collecting node, it did not answer, or it sent
-/// nothing.
+/// Siblings to draw from: those holding anything, the richest first
+/// (ties by key, so the order is stable).
+pub fn draw_order(siblings: &[NodeId], balance: impl Fn(&NodeId) -> Mc) -> Vec<NodeId> {
+    let mut v: Vec<(Mc, NodeId)> = siblings
+        .iter()
+        .map(|s| (balance(s), *s))
+        .filter(|(b, _)| *b > 0)
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    v.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Draw `mc` from this node's siblings, the richest first, until it is
+/// covered, and wait for the transfers to arrive. False: no sibling gave
+/// enough.
 pub async fn draw(node: &Arc<Node>, mc: Mc) -> bool {
     let me = node.id();
-    let Some(from) = (*node.collect_to.read().unwrap()).filter(|c| *c != me) else {
+    let Ok(book) = super::book_fresh(node).await else {
         return false;
     };
-    let before = match super::book_fresh(node).await {
-        Ok(b) => b.balance(&me),
-        Err(_) => return false,
-    };
-    let avoid = crate::cluster::owner::cmd::old_relays(node, &from);
-    let sent = match node
-        .request_avoiding(from, Msg::CreditDraw { mc }, DRAW_WAIT, avoid)
+    let start = book.balance(&me);
+    let siblings = crate::cluster::owner::fleet::siblings(&node.store)
         .await
-    {
-        Ok(Msg::CreditDrawReply { sent_mc }) => sent_mc,
-        _ => 0,
-    };
-    if sent == 0 {
-        return false;
+        .unwrap_or_default();
+    let siblings: Vec<NodeId> = siblings
+        .into_iter()
+        .filter(|s| *s != me && !node.is_blocked(s))
+        .collect();
+    let mut missing = mc;
+    for from in draw_order(&siblings, |s| book.balance(s)) {
+        let ask = missing.min(book.balance(&from));
+        let avoid = crate::cluster::owner::cmd::old_relays(node, &from);
+        let sent = match node
+            .request_avoiding(from, Msg::CreditDraw { mc: ask }, DRAW_WAIT, avoid)
+            .await
+        {
+            Ok(Msg::CreditDrawReply { sent_mc }) => sent_mc,
+            _ => 0,
+        };
+        if sent == 0 {
+            continue;
+        }
+        // The transfer is an entry of the sibling's log: fetch it.
+        if let Some(addr) = node.dial_address(&from) {
+            let _ = crate::cluster::sync::reconcile(node, from, &addr, false).await;
+        }
+        missing = missing.saturating_sub(sent);
+        if missing == 0 {
+            break;
+        }
     }
-    // The transfer is an entry of the collecting node's log: fetch it.
-    if let Some(addr) = node.dial_address(&from) {
-        let _ = crate::cluster::sync::reconcile(node, from, &addr, false).await;
-    }
+    // Wait until the book holds what arrived.
     let until = tokio::time::Instant::now() + DRAW_WAIT;
     loop {
         if let Ok(b) = super::book_fresh(node).await
-            && b.balance(&me) > before
+            && b.balance(&me) >= start + mc.saturating_sub(missing)
         {
-            return true;
+            return missing == 0;
         }
         if tokio::time::Instant::now() >= until {
             return false;
@@ -150,30 +151,23 @@ pub async fn draw(node: &Arc<Node>, mc: Mc) -> bool {
     }
 }
 
-/// Keep the node's collecting node in step with its settings, and forward
-/// what it holds every [`COLLECT_EVERY`].
-pub async fn run(
-    node: Arc<Node>,
-    settings: Settings,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
-    let mut changed = settings.subscribe();
-    let mut next = tokio::time::Instant::now() + COLLECT_EVERY;
-    loop {
-        let to = settings.snapshot().collect_to;
-        *node.collect_to.write().unwrap() = to;
-        if tokio::time::Instant::now() >= next {
-            next = tokio::time::Instant::now() + COLLECT_EVERY;
-            if let Some(to) = to
-                && let Err(e) = collect(&node, to).await
-            {
-                tracing::debug!(?e, "credits not forwarded");
-            }
-        }
-        tokio::select! {
-            _ = tokio::time::sleep_until(next) => {}
-            _ = changed.changed() => {}
-            _ = shutdown.changed() => break,
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lookup_draws_from_the_richest_sibling_first() {
+        let (a, b, c) = (NodeId([1; 32]), NodeId([2; 32]), NodeId([3; 32]));
+        let bal = |n: &NodeId| match n.0[0] {
+            1 => 50,
+            2 => 900,
+            _ => 0,
+        };
+        assert_eq!(
+            draw_order(&[a, b, c], bal),
+            vec![b, a],
+            "richest first; nothing to give: not asked"
+        );
+        assert!(draw_order(&[], bal).is_empty());
     }
 }

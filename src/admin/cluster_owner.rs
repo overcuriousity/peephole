@@ -20,12 +20,6 @@ use std::sync::Arc;
 
 const PAGE: &str = "/admin/cluster/ownership";
 
-/// How long the page waits for its siblings to say where their credits go.
-/// They are asked at once; one that is slower shows "not answered".
-const STATUS_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
-/// A member heard from within this long counts as live (as on Members).
-const LIVE: std::time::Duration = std::time::Duration::from_secs(45);
-
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route(PAGE, get(page))
@@ -37,7 +31,6 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/cluster/ownership/rotate", post(rotate))
         .route("/admin/cluster/ownership/retry", post(retry))
         .route("/admin/cluster/ownership/discard", post(discard))
-        .route("/admin/cluster/ownership/collect-here", post(collect_here))
 }
 
 /// One of the operator's nodes.
@@ -49,8 +42,6 @@ struct NodeRow {
     version: String,
     /// Its balance in this node's book.
     credits: String,
-    /// Where it forwards its credits, in words.
-    collects: String,
     seen: String,
     is_self: bool,
 }
@@ -100,17 +91,7 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
         .map(|m| (m.key.clone(), m.name.clone()))
         .collect();
     let managing = owned.as_ref().is_some_and(|o| o.managing());
-    let collects = if owned.is_some() {
-        let ids: Vec<NodeId> = sibs.iter().filter_map(|k| NodeId::parse(k).ok()).collect();
-        collect_targets(node, &ids).await
-    } else {
-        HashMap::new()
-    };
     let row = |m: &MemberView| NodeRow {
-        collects: NodeId::parse(&m.key)
-            .ok()
-            .and_then(|id| collects.get(&id).cloned())
-            .unwrap_or_default(),
         credits: NodeId::parse(&m.key)
             .map(|id| crate::credits::show(book.balance(&id)))
             .unwrap_or_default(),
@@ -164,66 +145,6 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
         log,
         refused,
     })
-}
-
-/// Where each of the operator's nodes forwards its credits, in words: this
-/// node from its settings, a sibling from its own status (asked only with
-/// the key here, and only when it is live and not blocked here). Also
-/// used by Cluster › Credits.
-pub(crate) async fn collect_targets(
-    node: &Arc<Node>,
-    siblings: &[NodeId],
-) -> HashMap<NodeId, String> {
-    let me = node.id();
-    let members = node.members();
-    let name = |id: &NodeId| {
-        if *id == me {
-            "this node".to_string()
-        } else {
-            members
-                .get(id)
-                .map_or_else(|| id.short(), |m| m.name.clone())
-        }
-    };
-    let words = |to: Option<NodeId>| match to {
-        None => "keeps what it earns".to_string(),
-        Some(t) => format!("forwards to {}", name(&t)),
-    };
-    let mut out = HashMap::new();
-    let own = (*node.collect_to.read().unwrap()).filter(|t| *t != me);
-    out.insert(me, words(own));
-    let Ok(key) = cmd::kept_key(node).await else {
-        for s in siblings {
-            out.insert(*s, "—".into());
-        }
-        return out;
-    };
-    let live = |id: &NodeId| {
-        node.status
-            .known(id)
-            .is_some_and(|k| k.advanced.elapsed() < LIVE)
-    };
-    let asked = futures::future::join_all(siblings.iter().map(|&id| {
-        let key = &key;
-        async move {
-            if !live(&id) || node.is_blocked(&id) {
-                return Err("offline");
-            }
-            match tokio::time::timeout(STATUS_WAIT, cmd::status(node, key, id)).await {
-                Ok(Ok(s)) => Ok(s.collect_to.and_then(|t| NodeId::parse(&t).ok())),
-                _ => Err("not answered"),
-            }
-        }
-    }))
-    .await;
-    for (id, a) in siblings.iter().zip(asked) {
-        let text = match a {
-            Ok(to) => words(to),
-            Err(why) => why.to_string(),
-        };
-        out.insert(*id, text);
-    }
-    out
 }
 
 async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
@@ -380,74 +301,4 @@ async fn discard(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResul
         ),
         None,
     ))
-}
-
-/// Make this node the fleet's collecting node: every sibling that answers
-/// is told to forward its credits here.
-async fn collect_here(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Response> {
-    let node = node(&st)?;
-    let key = match cmd::kept_key(node).await {
-        Ok(k) => k,
-        Err(e) => return Ok(back_to(PAGE, None, Some(format!("{e:#}")))),
-    };
-    // This node keeps what it earns, whatever the siblings answer.
-    let own = crate::settings::Changes {
-        collect_to: Some(String::new()),
-        ..Default::default()
-    };
-    st.settings
-        .apply(&own, None)
-        .await?
-        .map_err(anyhow::Error::msg)?;
-    let me = node.id().to_string();
-    // All at once: a sibling that does not answer costs its timeout once,
-    // not once per sibling after it.
-    // A sibling blocked here is not asked: its answer would not arrive.
-    let (blocked, siblings): (Vec<_>, Vec<_>) = fleet::siblings(&node.store)
-        .await?
-        .into_iter()
-        .partition(|s| node.is_blocked(s));
-    let results = futures::future::join_all(siblings.iter().map(|&sib| {
-        let (key, me) = (&key, me.clone());
-        async move {
-            let st = cmd::status(node, key, sib).await?;
-            let set = cmd::OwnerCmd::Settings {
-                base_version: st.state.version,
-                changes: crate::settings::Changes {
-                    collect_to: Some(me),
-                    ..Default::default()
-                },
-            };
-            match cmd::run(node, key, sib, st.counter, set).await? {
-                Ok(_) => anyhow::Ok(()),
-                Err(e) => anyhow::bail!("{e}"),
-            }
-        }
-    }))
-    .await;
-    let (mut told, mut failed) = (0, vec![]);
-    for sib in blocked {
-        failed.push(format!("{}: blocked here", sib.short()));
-    }
-    for (sib, r) in siblings.iter().zip(results) {
-        match r {
-            Ok(()) => told += 1,
-            Err(e) => failed.push(format!("{}: {e:#}", sib.short())),
-        }
-    }
-    Ok(if failed.is_empty() {
-        back_to(
-            PAGE,
-            Some(format!(
-                "{told} of your nodes now forward their credits to this node."
-            )),
-            None,
-        )
-    } else {
-        back_to(
-            PAGE,
-            None,
-            Some(format!("{told} told; not reached: {}", failed.join("; "))),
-        )
-    })
 }
