@@ -1,17 +1,2 @@
 {# Current filter, carried through bulk-delete forms so the redirect keeps it. #}
-<input type="hidden" name="ip" value="{{ f.ip.as_deref().unwrap_or_default() }}">
-<input type="hidden" name="path" value="{{ f.path.as_deref().unwrap_or_default() }}">
-<input type="hidden" name="label" value="{{ f.label.as_deref().unwrap_or_default() }}">
-<input type="hidden" name="severity" value="{% if let Some(v) = f.severity %}{{ v }}{% endif %}">
-<input type="hidden" name="min_severity" value="{% if let Some(v) = f.min_severity %}{{ v }}{% endif %}">
-<input type="hidden" name="country" value="{{ f.country.as_deref().unwrap_or_default() }}">
-<input type="hidden" name="asn" value="{% if let Some(v) = f.asn %}{{ v }}{% endif %}">
-<input type="hidden" name="from" value="{{ f.from.as_deref().unwrap_or_default() }}">
-<input type="hidden" name="to" value="{{ f.to.as_deref().unwrap_or_default() }}">
-<input type="hidden" name="node" value="{{ f.node.as_deref().unwrap_or_default() }}">
-<input type="hidden" name="ja4h" value="{{ f.ja4h.as_deref().unwrap_or_default() }}">
-<input type="hidden" name="ja4" value="{{ f.ja4.as_deref().unwrap_or_default() }}">
-<input type="hidden" name="ua" value="{{ f.ua.as_deref().unwrap_or_default() }}">
-<input type="hidden" name="method" value="{{ f.method.as_deref().unwrap_or_default() }}">
-<input type="hidden" name="transport" value="{{ f.transport.as_deref().unwrap_or_default() }}">
-<input type="hidden" name="answer" value="{{ f.answer.as_deref().unwrap_or_default() }}">
+{% for (k, v) in hidden %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}

@@ -1,5 +1,6 @@
+{# `keep`: other query pairs, each ending in `&`, that a range switch keeps. #}
 <nav class="seg" aria-label="Time range">
   {% for r in crate::store::stats::Range::ALL %}
-  <a href="{{ base }}?range={{ r.key() }}"{% if r.key() == range.key() %} aria-current="true"{% endif %}>{{ r.key() }}</a>
+  <a href="{{ base }}?{{ keep }}range={{ r.key() }}"{% if r.key() == range.key() %} aria-current="true"{% endif %}>{{ r.key() }}</a>
   {% endfor %}
 </nav>

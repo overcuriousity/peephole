@@ -1,30 +1,15 @@
 {# Everything the dataset holds on one address (admin::target): the IP page and the lookup result both render it. #}
+{% if !t.intel.is_empty() %}
 <section class="card" id="intel" data-section="intel">
   <div class="card-head"><h2>Intelligence</h2>{% if t.admin.is_some() %}<a href="/admin/lookup?ip={{ t.ov.ip.ip }}">look up now →</a>{% endif %}</div>
+  {% let signals = t.signals() %}{% include "_signals.html" %}
   <div class="intel-grid">
-  {% for c in t.intel %}
-    <div class="intel">
-      <h3>{{ c.label }} <span class="mono muted small">{{ c.name }}</span></h3>
-      {% match c.newest %}
-      {% when Some(r) %}
-        <dl class="kv">{% for f in r.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
-        <p class="muted small intel-src">checked <span class="mono">{{ r.fetched_at }}</span>{% if let Some(v) = r.source_version %} · data <span class="mono">{{ v }}</span>{% endif %}{% if let Some(n) = r.node %} · by {{ n }}{% endif %}</p>
-        {% if !c.others.is_empty() %}
-        <details class="small"><summary>{{ c.others.len() }} older or other-node result{% if c.others.len() != 1 %}s{% endif %}</summary>
-          {% for o in c.others %}
-          <dl class="kv">{% for f in o.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
-          <p class="muted small intel-src"><span class="mono">{{ o.fetched_at }}</span>{% if let Some(v) = o.source_version %} · data <span class="mono">{{ v }}</span>{% endif %}{% if let Some(n) = o.node %} · by {{ n }}{% endif %}</p>
-          {% endfor %}
-        </details>
-        {% endif %}
-      {% when None %}
-        <p class="muted">No result yet.</p>
-      {% endmatch %}
-    </div>
-  {% endfor %}
+  {% for c in t.intel %}{% if c.newest.is_some() %}{% let badge = "" %}{% let verb = "checked" %}{% let again = "" %}{% let again_ip = "" %}{% include "_intel_card.html" %}{% endif %}{% endfor %}
   </div>
+  {% let pending = t.pending_intel() %}{% if !pending.is_empty() %}<p class="intel-pending">No result yet: {{ pending }}</p>{% endif %}
   {% if let Some(a) = t.admin %}{% if !a.names.is_empty() %}{% let names = a.names %}{% include "_names.html" %}{% endif %}{% endif %}
 </section>
+{% endif %}
 
 {# `first`: the first target on the page, which carries the section ids. #}
 {% if let Some(a) = t.actions %}{% include "_actions.html" %}{% endif %}
@@ -59,7 +44,7 @@
   <h2>Canaries</h2>
   {% if adm.canary_links.0 > 0 %}<p>Credentials harvested here were used by {{ adm.canary_links.0 }} other IP{% if adm.canary_links.0 != 1 %}s{% endif %}.</p>{% endif %}
   {% if adm.canary_links.1 > 0 %}<p>Used credentials harvested by {{ adm.canary_links.1 }} other IP{% if adm.canary_links.1 != 1 %}s{% endif %}.</p>{% endif %}
-  <p><a href="/admin/links/canaries?ip={{ t.ov.ip.ip }}">Show the reuses</a></p>
+  <p><a href="/admin/links/canaries?range=all&amp;ip={{ t.ov.ip.ip }}">Show the reuses</a></p>
 </section>
 {% endif %}
 {% if adm.decoys.0 > 0 || adm.decoys.1 > 0 || adm.decoys.2 > 0 %}

@@ -249,8 +249,8 @@ async fn members(st: &AdminState, node: &crate::cluster::Node) -> AppResult<Vec<
 /// The "Cluster" row: every figure from this node's view, each linked to
 /// the page that breaks it down.
 pub struct ClusterFigures {
-    /// "11 of 12 members earn here".
-    pub conformity: String,
+    /// Members that earn here, of all active ones.
+    pub conformity: (usize, usize),
     /// The lowest rules agreement among members ("disagree on 3% of 500").
     pub lowest_agreement: String,
     /// Different rules fingerprints the members' newest requests carry.
@@ -386,7 +386,7 @@ async fn cluster_figures(
     .fetch_one(&st.store.read)
     .await?;
     Ok(ClusterFigures {
-        conformity: format!("{earning} of {} members earn here", active.len()),
+        conformity: (earning, active.len()),
         lowest_agreement: lowest,
         rule_sets: rule_sets.len(),
         circulating: show(l.circulating()),

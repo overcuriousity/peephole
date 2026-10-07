@@ -14,26 +14,28 @@
 {% endif %}
 <div class="tiles">
   <a class="tile" href="/requests?from={{ since_24h }}"><span class="label">Requests · 24 h</span><div class="value">{{ requests_24h }}</div><div class="hint">search them →</div></a>
-  <a class="tile" href="/ips"><span class="label">New IPs · 24 h</span><div class="value">{{ new_ips_24h }}</div><div class="hint">all IPs →</div></a>
+  <a class="tile" href="/ips?sort=recent"><span class="label">New IPs · 24 h</span><div class="value">{{ new_ips_24h }}</div><div class="hint">latest seen first →</div></a>
   <a class="tile" href="/admin/scans#pace"><span class="label">Queued / running</span><div class="value">{{ queued }}<span class="muted"> / {{ running }}</span></div></a>
   <a class="tile" href="/admin/scans?status=done#history"><span class="label">Scans done · 24 h</span><div class="value">{{ done_24h }}</div><div class="hint">history →</div></a>
   <a class="tile" href="/admin/inbox"><span class="label">Inbox</span><div class="value">{{ inbox }}</div><div class="hint">claims</div></a>
 </div>
 {% if let Some(c) = cluster %}
-<section class="card" aria-label="Cluster">
+<section class="card cluster-card" aria-label="Cluster">
   <div class="card-head"><h2>Cluster</h2><span class="muted">as this node counts it</span></div>
-  <div class="tiles">
-    <a class="tile" href="/admin/cluster"><span class="label">Conformity</span><div class="value small">{{ c.conformity }}</div><div class="hint">lowest: {{ c.lowest_agreement }}</div></a>
-    <a class="tile" href="/admin/cluster"><span class="label">Rule sets</span><div class="value">{{ c.rule_sets }}</div><div class="hint">fingerprints carried</div></a>
-    <a class="tile" href="/admin/cluster/credits"><span class="label">Credits in circulation</span><div class="value">{{ c.circulating }}</div><div class="hint">{{ c.expiring_today }} expire today</div></a>
-    <a class="tile" href="/admin/cluster/credits"><span class="label">Earned / spent</span><div class="value small">{{ c.earned }} / {{ c.spent }}</div><div class="hint">credits a day, 7-day average</div></a>
-    <a class="tile" href="/admin/scans?status=done#history"><span class="label">Paid scans</span><div class="value small">{{ c.paid_scans.0 }} / {{ c.paid_scans.1 }}</div><div class="hint">a day: levels 1–2 / 3–4</div></a>
-    <a class="tile" href="/admin/scans#scanners"><span class="label">Scan capacity</span><div class="value small">{{ c.capacity.1 }} of {{ c.capacity.0 }}</div><div class="hint">scans a day done of possible · {{ c.capacity.2 }} idle · {{ c.capacity.3 }}%</div></a>
-    <a class="tile" href="/admin/cluster"><span class="label">Audits</span><div class="value small">{{ c.audits.0 }} / {{ c.audits.1 }} / {{ c.audits.2 }}</div><div class="hint">agree / differ / inconclusive, 7 days</div></a>
-    <a class="tile" href="/admin/cluster/credits"><span class="label">Scan price</span><div class="value">{{ c.scan }}</div><div class="hint">a funded job{% if let Some((lo, hi)) = c.price_range %} · keyed lookups {{ lo }}–{{ hi }}{% endif %}</div></a>
-    <a class="tile" href="/admin/lookup"><span class="label">Lookup capacity</span><div class="value">{{ c.lookups.0 }}</div><div class="hint">paid lookups a day · {{ c.lookups.1 }} served today</div></a>
-    <a class="tile" href="/admin/cluster"><span class="label">Forks</span><div class="value">{{ c.forks }}</div><div class="hint">members that showed two histories</div></a>
+  <div class="tiles cluster-kpis">
+    <a class="tile" href="/admin/cluster"><span class="label">Earning members</span><div class="value">{{ c.conformity.0 }}<span class="of">/{{ c.conformity.1 }}</span></div><div class="hint">{{ c.conformity.0 }} of {{ c.conformity.1 }} members earn here · lowest: {{ c.lowest_agreement }}</div></a>
+    <a class="tile" href="/admin/scans#scanners"><span class="label">Scan capacity used</span><div class="value">{{ c.capacity.3 }}<span class="of"> %</span></div><svg class="meter" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true"><rect class="track" width="100" height="4" rx="2"/><rect class="fill" width="{{ c.capacity.3 }}" height="4" rx="2"/></svg><div class="hint">{{ c.capacity.1 }} of {{ c.capacity.0 }} scans a day · {{ c.capacity.2 }} idle</div></a>
+    <a class="tile" href="/admin/cluster/credits"><span class="label">Credits in circulation</span><div class="value">{{ c.circulating }}</div><div class="hint">{{ c.earned }} earned · {{ c.spent }} spent a day (7-day average) · {{ c.expiring_today }} expire today</div></a>
+    <a class="tile" href="/admin/cluster"><span class="label">Audits · 7 days</span><div class="value audits"><span class="ok" title="agree">{{ c.audits.0 }}</span><span class="bad" title="differ">{{ c.audits.1 }}</span><span class="dim" title="inconclusive">{{ c.audits.2 }}</span></div><div class="hint">agree · differ · inconclusive</div></a>
   </div>
+  <dl class="stat-row">
+    <div><dt>Rule sets</dt><dd><a href="/admin/cluster">{{ c.rule_sets }}</a></dd></div>
+    <div><dt>Paid scans a day</dt><dd><a href="/admin/scans?status=done#history">{{ c.paid_scans.0 }} · {{ c.paid_scans.1 }}</a> <span class="muted">levels 1–2 · 3–4</span></dd></div>
+    <div><dt>Scan price</dt><dd><a href="/admin/cluster/credits">{{ c.scan }}</a></dd></div>
+    {% if let Some((lo, hi)) = c.price_range %}<div><dt>Keyed lookups</dt><dd><a href="/admin/cluster/credits">{{ lo }}–{{ hi }}</a></dd></div>{% endif %}
+    <div><dt>Lookup capacity</dt><dd><a href="/admin/lookup">{{ c.lookups.0 }}</a> <span class="muted">a day · {{ c.lookups.1 }} today</span></dd></div>
+    <div{% if c.forks > 0 %} data-alert{% endif %}><dt>Forks</dt><dd><a href="/admin/cluster">{{ c.forks }}</a></dd></div>
+  </dl>
 </section>
 {% endif %}
   <section class="card">

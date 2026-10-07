@@ -1,0 +1,2 @@
+{# A country (`country`: Option<String>, alpha-2) as flag and name, or a dash. #}
+{% if let Some(c) = country %}{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}{% else %}<span class="muted">—</span>{% endif %}

@@ -8,7 +8,7 @@
   <tbody>
   {% for c in claims %}
     <tr><td class="ts">{{ c.ts }}</td><td class="ip"><a href="/ip/{{ c.ip }}">{{ c.ip }}</a></td>
-        <td>{% if let Some(e) = c.contact_email %}<a href="mailto:{{ e }}">{{ e }}</a>{% else %}<span class="muted">none</span>{% endif %}</td>
+        <td>{% if let Some(e) = c.contact_email %}<span class="mono">{{ e }}</span>{% let value = e.as_str() %}{% let what = "address" %}{% let subtle = true %}{% include "_copy.html" %}{% else %}<span class="muted">none</span>{% endif %}</td>
         <td class="muted wrap">{{ c.user_agent }}</td>
         {% if can_delete %}        <td><button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-claim-{{ c.id }}">Delete</button>
           <dialog id="dlg-claim-{{ c.id }}"><h3>Delete this claim?</h3>

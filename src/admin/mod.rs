@@ -18,6 +18,7 @@ pub mod probes;
 pub mod public;
 pub mod scans;
 pub mod search;
+pub mod signals;
 pub mod sse;
 pub mod system;
 pub mod target;

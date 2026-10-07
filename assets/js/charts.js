@@ -22,7 +22,7 @@
   // keeps its size on a phone instead of shrinking with a fixed viewBox.
   function widthOf(host, fallback) { return Math.round(host.clientWidth) || fallback; }
   function empty(host, w, h) { var s = svg(host, w, h); text(s, w / 2, h / 2, "no data in this range", "empty-note", "middle"); }
-  var tip = document.createElement("div"); tip.className = "tooltip"; tip.setAttribute("role", "status"); document.body.appendChild(tip);
+  var tip = document.createElement("div"); tip.className = "tooltip"; tip.setAttribute("aria-hidden", "true"); document.body.appendChild(tip);
   function showTip(ev, html) {
     tip.innerHTML = html; tip.style.display = "block";
     // Keep the tooltip on screen near the right and bottom edges.
@@ -32,13 +32,20 @@
     tip.style.left = Math.max(4, x) + "px"; tip.style.top = Math.max(4, y) + "px";
   }
   function hideTip() { tip.style.display = "none"; }
-  // Hover and keyboard focus show the same tooltip.
+  // Hover shows the tooltip; keyboard and screen-reader users get the
+  // same numbers from the table twin beside each chart.
   function hover(node, html) {
     node.addEventListener("mousemove", function (ev) { showTip(ev, html()); });
     node.addEventListener("mouseleave", hideTip);
-    node.addEventListener("focus", function () { var r = node.getBoundingClientRect(); showTip({ clientX: r.left + r.width / 2, clientY: r.top }, html()); });
-    node.addEventListener("blur", hideTip);
   }
+  // A failed request rejects instead of handing an error page to .json().
+  function get(url, as) {
+    return fetch(url, { credentials: "same-origin" }).then(function (r) {
+      if (!r.ok) throw new Error(url + ": " + r.status);
+      return as === "text" ? r.text() : r.json();
+    });
+  }
+  function failed(host) { if (host) { host.innerHTML = ""; var p = document.createElement("p"); p.className = "empty-note muted"; p.textContent = "Could not load the data. Reload to try again."; host.appendChild(p); } }
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
   function fmt(n) { return Number(n).toLocaleString("en-US"); }
   function compact(n) { return n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M" : n >= 1e4 ? Math.round(n / 1e3) + "k" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n); }
@@ -68,6 +75,8 @@
   }
   function fillBuckets(buckets, range) {
     var spec = { "24h": [24, true], "7d": [168, true], "30d": [30, false] }[range];
+    // "all" is daily from the first day with requests, so quiet days show as gaps.
+    if (range === "all" && buckets.length) spec = [Math.max(0, Math.round((Date.now() - Date.parse(buckets[0].ts + "T00:00:00Z")) / 86400e3)), false];
     if (!spec) return buckets;
     var byKey = {};
     buckets.forEach(function (b) { byKey[b.ts] = b; });
@@ -109,7 +118,7 @@
         else el("rect", { "class": "seg sev-fill-" + j, x: x, y: y + g, width: bw, height: Math.max(h - g, 1) }, s);
       }
       // One hit target per column, the full plot height (bigger than the mark).
-      var hit = el("rect", { "class": "col-hit", x: L + i * slot, y: T, width: slot, height: plotH, tabindex: b.count ? 0 : -1 }, s);
+      var hit = el("rect", { "class": "col-hit", x: L + i * slot, y: T, width: slot, height: plotH }, s);
       hover(hit, function () {
         var rows = [];
         for (var j = 4; j >= 0; j--) if (sev[j]) rows.push("severity " + j + ": <b>" + fmt(sev[j]) + "</b>");
@@ -143,7 +152,7 @@
       var y = 2 + i * rowH, w = Math.max(((W - labelW - valueW) * it.count) / max, 2), label = opts.label ? opts.label(it) : it.name;
       text(s, labelW - 8, y + 16, clip(label, maxChars), "hbar-label", "end");
       el("path", { "class": (opts.cls ? opts.cls(it) : "hbar"), d: rightRounded(labelW, y + 6, w, rowH - 12, 3) }, s);
-      var hit = el("rect", { "class": "col-hit", x: 0, y: y, width: W, height: rowH, tabindex: 0 }, s);
+      var hit = el("rect", { "class": "col-hit", x: 0, y: y, width: W, height: rowH }, s);
       hover(hit, function () { return "<b>" + fmt(it.count) + "</b> · " + esc(label); });
       text(s, labelW + w + 6, y + 16, compact(it.count), "hbar-value");
     });
@@ -178,7 +187,7 @@
     matrix.forEach(function (row, d) {
       text(axis, L - 6, T + d * ch + ch / 2 + 3, DAYS[d], "", "end");
       row.forEach(function (v, h) {
-        var c = el("rect", { "class": "cell", "data-bin": binOf(v, max), x: L + h * cw, y: T + d * ch, width: cw, height: ch, rx: 3, tabindex: v ? 0 : -1 }, s);
+        var c = el("rect", { "class": "cell", "data-bin": binOf(v, max), x: L + h * cw, y: T + d * ch, width: cw, height: ch, rx: 3 }, s);
         hover(c, function () { return "<b>" + fmt(v) + "</b> requests · " + DAYS[d] + " " + pad2(h) + ":00–" + pad2(h) + ":59 UTC"; });
       });
     });
@@ -199,7 +208,7 @@
       rampLegend(legend, max, "IPs");
     };
     if (host.querySelector("svg")) { paint(); return; }
-    fetch(host.getAttribute("data-src")).then(function (r) { return r.text(); }).then(function (svgText) {
+    get(host.getAttribute("data-src"), "text").then(function (svgText) {
       host.innerHTML = svgText;
       host.querySelectorAll(".country").forEach(function (p) {
         var code = p.id;
@@ -212,7 +221,7 @@
         p.addEventListener("click", function () { location.href = "/ips?country=" + code; });
       });
       paint();
-    }).catch(function () {});
+    }).catch(function () { failed(host); });
     function hot(code, on) {
       var path = host.querySelector('[id="' + code + '"]'), list = document.getElementById("map-rank");
       if (path) path.classList.toggle("is-hot", on);
@@ -258,7 +267,7 @@
           lastMonth = t.getUTCMonth();
           if (w < weeks - 2) text(axis, L + w * cell, 10, t.toLocaleString("en-US", { month: "short", timeZone: "UTC" }), "", "start");
         }
-        var r = el("rect", { "class": "day " + (v ? "sev-fill-" + Math.max(0, Math.min(4, v.max_severity)) : "day-empty"), x: L + w * cell, y: T + d * cell, width: cell, height: cell, rx: 2, tabindex: v ? 0 : -1 }, s);
+        var r = el("rect", { "class": "day " + (v ? "sev-fill-" + Math.max(0, Math.min(4, v.max_severity)) : "day-empty"), x: L + w * cell, y: T + d * cell, width: cell, height: cell, rx: 2 }, s);
         (function (key, v) {
           hover(r, function () { return v ? "<b>" + fmt(v.count) + "</b> requests · " + key + "<br>highest severity " + v.max_severity : key + " · no requests"; });
         })(key, v);
@@ -323,22 +332,22 @@
       hbars(hosts.countries, st.top_countries.slice(0, 10), { label: function (i) { return countryName(i.name); } });
     }
     function load() {
-      return fetch("/api/stats?range=" + range).then(function (r) { return r.json(); }).then(function (next) {
+      return get("/api/stats?range=" + range).then(function (next) {
         st = next; buckets = fillBuckets(st.timeline, range);
         drawStats(); drawCountries();
       });
     }
     load().then(function () {
       onWidthChange(function () { drawStats(); drawCountries(); });
-      return fetch("/api/countries").then(function (r) { return r.json(); });
+      return get("/api/countries");
     }).then(function (names) {
       window.peephole.countryNames = names;
       drawCountries();
-      return fetch("/api/map?range=" + range).then(function (r) { return r.json(); });
+      return get("/api/map?range=" + range);
     }).then(function (m) {
       mapData = m;
       map(document.getElementById("map"), document.getElementById("map-legend"), m);
-    }).catch(function () {});
+    }).catch(function () { if (!st) failed(hosts.tl); });
   }
 
   window.peephole = window.peephole || {};
