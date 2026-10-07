@@ -196,8 +196,13 @@ impl Arbiter {
         }
         // Fewest recent scans first; ties broken by key so it is stable.
         waiters.sort_by_key(|(s, _, _, _)| (load[s], *s));
+        // One book for the round; what each funded grant commits is
+        // carried to the next, so the budget is never overspent.
+        let mut funding = crate::credits::jobs::Funding::default();
         for (scanner, exclude, min_mc, tx) in waiters {
-            let grant = self.next_job_for(scanner, &exclude, min_mc).await?;
+            let grant = self
+                .next_job_for(&mut funding, scanner, &exclude, min_mc)
+                .await?;
             if let Some(g) = &grant {
                 *load.get_mut(&scanner).unwrap() += 1;
                 info!(job = %g.job_uid, ip = %g.ip, scanner = %scanner.short(), "scan job granted");
@@ -211,6 +216,7 @@ impl Arbiter {
     /// node's scan budget and `min_mc` allow (`credits::jobs::fund`).
     async fn next_job_for(
         &self,
+        funding: &mut crate::credits::jobs::Funding,
         scanner: NodeId,
         exclude: &[u8],
         min_mc: u32,
@@ -219,7 +225,7 @@ impl Arbiter {
             return Ok(None);
         };
         if let Some((seq, price)) =
-            crate::credits::jobs::fund(&self.node, scanner, &g.job_uid, min_mc).await
+            crate::credits::jobs::fund(&self.node, funding, scanner, &g.job_uid, min_mc).await
         {
             g.offer_seq = Some(seq);
             g.price_mc = price;
@@ -775,7 +781,7 @@ mod tests {
         rec.enqueue_scan(ip.id, 2, 24).await.unwrap();
         let scanner = Identity::generate().unwrap().id;
         let g = arbiter
-            .next_job_for(scanner, &[], 0)
+            .next_job_for(&mut Default::default(), scanner, &[], 0)
             .await
             .unwrap()
             .unwrap();

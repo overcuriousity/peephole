@@ -2,7 +2,7 @@
 //! the scanner that names the job; the scanner charges the offered price
 //! when it delivers the result, and nothing otherwise. What an arbiter
 //! commits to its own jobs is bounded by `[credits] scan_share`.
-use super::ledger::{Ledger, OfferState};
+use super::ledger::{self, Ledger, OfferState};
 use super::{Mc, day_of, price};
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::Record;
@@ -39,12 +39,33 @@ pub fn bids(queued: u32, budget: Mc, price: Mc) -> u32 {
     (budget / price).min(queued as Mc) as u32
 }
 
+/// The oldest lot day a scan offer written at `now_ms` may draw from: a
+/// lot that dies before the offer can be charged (within
+/// [`JOB_OFFER_TTL_MS`](super::JOB_OFFER_TTL_MS)) is left out.
+pub fn first_day_for_job(now_ms: u64) -> u32 {
+    let last = ((now_ms + super::JOB_OFFER_TTL_MS) / super::DAY_MS) as u32;
+    last.saturating_sub(super::LOT_DAYS - 1)
+}
+
+/// What one round of handing out jobs funds from: one book, computed at
+/// the first grant that needs it, and what the offers written since took.
+#[derive(Default)]
+pub struct Funding {
+    book: Option<Arc<super::Book>>,
+    /// This node's lots as the book has them, less what was drawn since.
+    lots: Vec<(u32, Mc)>,
+    /// What the offers written in this round set aside.
+    committed: Mc,
+}
+
 /// Fund the grant of `job_uid` to `scanner` at this node's scan price:
 /// `(offer_seq, price)` once the offer is written. None: its own scanner,
 /// a scanner that predates the market, a price under `min_mc`, or no
-/// budget; the job is granted unfunded.
+/// budget; the job is granted unfunded. `funding` carries the book and
+/// what was committed across the grants of one round.
 pub async fn fund(
     node: &Arc<Node>,
+    funding: &mut Funding,
     scanner: NodeId,
     job_uid: &str,
     min_mc: u32,
@@ -62,21 +83,39 @@ pub async fn fund(
     if price < min_mc {
         return None;
     }
-    let book = super::book_fresh(node).await.ok()?;
-    if budget(&book.ledger, &me, node.scan_share()) < price as Mc {
+    let book = match &funding.book {
+        Some(b) => b.clone(),
+        None => {
+            let b = super::book_fresh(node).await.ok()?;
+            funding.lots = b.ledger.by_day(&me);
+            funding.book = Some(b.clone());
+            b
+        }
+    };
+    let left = budget(&book.ledger, &me, node.scan_share()).saturating_sub(funding.committed);
+    if left < price as Mc {
         return None;
     }
-    let parts = book.ledger.spendable_parts(&me, price as Mc)?;
+    let first_day = first_day_for_job(crate::cluster::hlc::wall_ms());
+    let parts = ledger::parts_from(&funding.lots, price as Mc, first_day)?;
     let job = Some(job_uid.to_string());
     match repl::append_sealing(node, |seal| Record::CreditOffer {
         to: scanner,
-        parts,
+        parts: parts.clone(),
         seal,
         job,
     })
     .await
     {
-        Ok(e) => Some((e.seq, price)),
+        Ok(e) => {
+            funding.committed += price as Mc;
+            for (day, mc) in parts {
+                if let Some(lot) = funding.lots.iter_mut().find(|(d, _)| *d == day) {
+                    lot.1 = lot.1.saturating_sub(mc as Mc);
+                }
+            }
+            Some((e.seq, price))
+        }
         Err(e) => {
             tracing::debug!(?e, job = %job_uid, "scan offer not written; granted unfunded");
             None
@@ -204,6 +243,42 @@ mod tests {
         assert_eq!(budget(&l, &id(1), 0.5), 175);
         assert_eq!(budget(&l, &id(1), 0.0), 0);
         assert_eq!(budget(&l, &id(1), 1.0), 650);
+    }
+
+    #[test]
+    fn a_scan_offer_is_not_funded_from_a_lot_that_dies_before_the_scan_ends() {
+        use crate::credits::{JOB_OFFER_TTL_MS, LOT_DAYS};
+        // Early in the day: every live lot outlives the offer.
+        let early = DAY as u64 * DAY_MS + 60_000;
+        assert_eq!(first_day_for_job(early), DAY - (LOT_DAYS - 1));
+        // Close to midnight: the oldest live lot dies within the offer's
+        // lifetime, so it is left out.
+        let late = (DAY as u64 + 1) * DAY_MS - JOB_OFFER_TTL_MS / 2;
+        assert_eq!(first_day_for_job(late), DAY + 1 - (LOT_DAYS - 1));
+        let earned = [
+            Earned {
+                node: id(1),
+                hlc: at(DAY - (LOT_DAYS - 1), 0),
+                mc: 100,
+            },
+            Earned {
+                node: id(1),
+                hlc: at(DAY, 0),
+                mc: 50,
+            },
+        ];
+        let l = run(&earned, &[], &Default::default(), late);
+        let lots = l.by_day(&id(1));
+        assert_eq!(lots, [(DAY - (LOT_DAYS - 1), 100), (DAY, 50)]);
+        assert_eq!(
+            ledger::parts_from(&lots, 120, first_day_for_job(early)),
+            Some(vec![(DAY - (LOT_DAYS - 1), 100), (DAY, 20)])
+        );
+        assert_eq!(
+            ledger::parts_from(&lots, 50, first_day_for_job(late)),
+            Some(vec![(DAY, 50)])
+        );
+        assert_eq!(ledger::parts_from(&lots, 120, first_day_for_job(late)), None);
     }
 
     #[test]

@@ -105,6 +105,27 @@ pub struct Ledger {
     pub today: u32,
 }
 
+/// The parts of `mc` drawn from `lots` (`(day, mc)`, oldest first as
+/// [`Ledger::by_day`] gives them), oldest first, leaving out the lots of
+/// days before `first_day`; None when they do not hold that much (or
+/// `mc` is nothing).
+pub fn parts_from(lots: &[(u32, Mc)], mc: Mc, first_day: u32) -> Option<Vec<(u32, u32)>> {
+    if mc == 0 {
+        return None;
+    }
+    let mut left = mc;
+    let mut parts = vec![];
+    for &(day, have) in lots.iter().filter(|(day, have)| *day >= first_day && *have > 0) {
+        let take = have.min(left).min(u32::MAX as Mc);
+        parts.push((day, take as u32));
+        left -= take;
+        if left == 0 {
+            return Some(parts);
+        }
+    }
+    None
+}
+
 impl Ledger {
     fn first_live_day(&self) -> u32 {
         self.today.saturating_sub(LOT_DAYS - 1)
@@ -136,20 +157,7 @@ impl Ledger {
     /// The parts of an offer or transfer of `mc` by `node`, oldest lots
     /// first; None when it does not hold that much (or `mc` is nothing).
     pub fn spendable_parts(&self, node: &NodeId, mc: Mc) -> Option<Vec<(u32, u32)>> {
-        if mc == 0 {
-            return None;
-        }
-        let mut left = mc;
-        let mut parts = vec![];
-        for (day, have) in self.by_day(node) {
-            let take = have.min(left).min(u32::MAX as Mc);
-            parts.push((day, take as u32));
-            left -= take;
-            if left == 0 {
-                return Some(parts);
-            }
-        }
-        None
+        parts_from(&self.by_day(node), mc, 0)
     }
 
     pub fn offer(&self, payer: &NodeId, seq: u64) -> Option<&Offer> {
@@ -873,5 +881,12 @@ mod tests {
         assert_eq!(l.spendable_parts(&id(1), 651), None);
         assert_eq!(l.spendable_parts(&id(1), 0), None);
         assert_eq!(l.spendable_parts(&id(2), 1), None);
+        // Lots before a first day are left out.
+        let lots = l.by_day(&id(1));
+        assert_eq!(
+            parts_from(&lots, 180, DAY - 1),
+            Some(vec![(DAY - 1, 50), (DAY, 130)])
+        );
+        assert_eq!(parts_from(&lots, 551, DAY - 1), None);
     }
 }
