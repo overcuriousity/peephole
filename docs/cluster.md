@@ -168,7 +168,11 @@ earn most of the new money, every member a little.
   probe or resolution price counted over a shorter period takes that
   share of a step), a price moves at least 0.001 credits toward the
   imbalance, and it never goes under 0.001 credits. What a node answers
-  itself is free (its own providers, prober, resolver, scanner). What
+  itself is free (its own providers, prober, resolver, scanner). Scan
+  prices are per scanner: each scanner's price follows its paid scans of
+  the past hour against 90 % of its capacity. Every node computes every
+  scanner's price from the log and the heartbeats, and pays at most 1.25
+  times its own figure. What
   another node answers is paid, whoever owns it, the Tor exit list,
   RDAP, InternetDB and GeoLite2 included; there is no free quota. A
   provider with an API budget offers its on-demand share (`[enrichment]
@@ -188,12 +192,15 @@ earn most of the new money, every member a little.
   when the scanner has finished; an accepted probe with no result lapses
   after 15 minutes.
 - **Scan jobs.** The arbiter (the node that queued the job) funds its jobs
-  from its own balance, up to `[credits] scan_share` (default 0.5) of it.
-  Scanners ask arbiters with funded jobs first, best paying first. The
-  scanner charges the offered price when it delivers the result, and
-  nothing when it does not. A scan offer lapses after the longest scan
-  (12 hours plus 2 minutes). Jobs that are not funded are scanned by idle
-  capacity and earn the mint only.
+  from its own balance, up to `[credits] scan_share` (default 0.5) of it,
+  and hands each job to the cheapest scanner asking. A scanner asks
+  arbiters that can pay its price first, in urgency order. A node's own
+  jobs are funded from the same budget without moving credits. Scanners
+  that hoard (over their hourly capacity, or delivering less than half of
+  5 recent grants) go last. The scanner charges the offered price when it
+  delivers the result, and nothing when it does not. A scan offer lapses
+  after the longest scan (12 hours plus 2 minutes). Jobs that are not
+  funded are scanned by idle capacity and earn the mint only.
 - **Every node counts for itself**, from its own copy of the log. There is
   no vote and no shared chain; `Cluster › Credits` shows the market as
   this node sees it: each good's price over 7 days beside the spread
@@ -214,11 +221,9 @@ earn most of the new money, every member a little.
   again, free. An answer that was paid for is kept in the dataset when the
   cluster has recorded the address (members can then infer who looked it
   up); for an address nobody recorded nothing is written anywhere.
-- **Your nodes as one.** `Cluster › Ownership › Collect credits here`
-  makes one node of yours the collecting node: the others forward what
-  they earn and draw from it when a lookup needs more than they hold.
-  Each node can also be pointed there itself: `System › Settings › Collect credits at`
-  or `peephole settings set credits.collect_to <key>`.
+- **Your nodes as one.** Every node keeps what it earns. A lookup that
+  needs more than a node holds draws from its siblings, richest first.
+  Scans are funded from the node's own balance only.
 - **Two histories.** A node that gives two members different entries at
   one position of its log is found out with its next payment: its entries
   carry seals over its log. Members that hold the proof show "showed two
@@ -235,6 +240,17 @@ earn most of the new money, every member a little.
     rules agreement.
   - A free rider (`scan_share = 0`) gets its attackers scanned only by
     idle capacity; with many of them the scan price understates demand.
+  - A scanner can announce a lower pace to look busier and raise its
+    price; it then runs fewer scans than it could, and scans beyond its
+    announced pace show in the log.
+  - A node that joins a cluster whose only scanner announces an inflated
+    price starts its reference price there; from then on it moves only by
+    the rule.
+  - A scanner that fills itself with its own jobs, or with paid jobs of a
+    second key of its operator, looks busy and its price rises: the same
+    as selling less of its capacity. Cheapest-scanner choice, `scan_share`
+    and the bounded rise protect others; with one scanner it is a
+    monopoly.
   - A sensor with a small allowance can be priced out of goods that cost
     more than 7 days of it.
   - Credits have no outside value: an API node is paid in services of the
@@ -258,12 +274,13 @@ earn most of the new money, every member a little.
   - A receipt counts when it arrives late; if the lapsed offer was spent
     again elsewhere, the second server is paid less (at most the first
     server's price).
-  - A sibling that was broken into can spend what your collecting node
-    holds (credits of at most 7 days); release it.
+  - A sibling that was broken into can draw from the others (credits of
+    at most 7 days); release it.
   - Lookups of recorded addresses are visible to members, with a good
     guess at who asked.
 - **Upgrading.** Protocol 4: payments run only between upgraded nodes, so
-  upgrade all nodes together. Balances are recounted at start under the
+  upgrade all nodes together. Protocol 5: scan jobs are paid only between
+  nodes on protocol 5; upgrade all nodes together. Balances are recounted at start under the
   new rules.
 
 ## Things to know

@@ -107,9 +107,14 @@ struct MemberRow {
 }
 
 struct PriceView {
-    /// What a funded scan job costs here.
+    /// This node's selling price; a dash when it does not scan.
     scan: String,
-    scan_bids: u32,
+    /// Its paid scans of the past hour, and its target.
+    scan_paid: String,
+    scan_target: String,
+    /// Every scanner: name, announced price, this node's reference price,
+    /// paid scans of the past hour against its target.
+    scanners: Vec<(String, String, String, String)>,
     capacity_per_hour: String,
     utilization: String,
     /// What a probe costs here; None: this node does not probe.
@@ -413,7 +418,33 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
     };
     let price = PriceView {
         scan: t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64)),
-        scan_bids: 0,
+        scan_paid: t
+            .scanners
+            .iter()
+            .find(|s| s.node == me)
+            .map_or_else(|| "0".into(), |s| format!("{:.0}", s.paid)),
+        scan_target: t
+            .scanners
+            .iter()
+            .find(|s| s.node == me)
+            .map_or_else(|| "0".into(), |s| format!("{:.0}", s.supply)),
+        scanners: t
+            .scanners
+            .iter()
+            .map(|s| {
+                let announced = if s.node == me {
+                    t.sell_mc
+                } else {
+                    node.status.known(&s.node).and_then(|k| k.hb.scan_price_mc)
+                };
+                (
+                    name(&s.node),
+                    announced.map_or_else(|| "–".into(), |m| show(m as u64)),
+                    show(s.price_mc as u64),
+                    format!("{:.0} / {:.0}", s.paid, s.supply),
+                )
+            })
+            .collect(),
         capacity_per_hour: format!("{:.0}", (t.capacity.per_day / 24.0).max(0.0)),
         utilization: format!("{:.0}", t.capacity.utilization * 100.0),
         probe: t.probe_mc.map(|m| show(m as u64)),
@@ -669,7 +700,14 @@ mod tests {
             totals: ("255.00".into(), "812.00".into()),
             price: PriceView {
                 scan: "0.05".into(),
-                scan_bids: 3,
+                scan_paid: "30".into(),
+                scan_target: "36".into(),
+                scanners: vec![(
+                    "node-bravo".into(),
+                    "0.06".into(),
+                    "0.05".into(),
+                    "30 / 36".into(),
+                )],
                 capacity_per_hour: "40".into(),
                 utilization: "12".into(),
                 probe: None,
@@ -703,5 +741,10 @@ mod tests {
             assert!(html.contains(want), "{want} missing");
         }
         assert!(!html.contains("destroyed"));
+        assert!(html.contains("node-bravo") && html.contains("30 / 36"));
+        assert!(html.contains("30 paid of 36 an hour"));
+        let mut page = page;
+        page.price.scan = "–".into();
+        assert!(page.render().unwrap().contains("not a scanner"));
     }
 }

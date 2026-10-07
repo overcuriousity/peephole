@@ -4907,13 +4907,22 @@ async fn a_funded_scan_job_pays_the_scanner_its_price() {
     market_known(&na, b.id).await;
     market_known(&nb, a.id).await;
     na.node.set_scan_share(0.5);
-    // A kept price to start from, so the price is more than the floor.
-    na.store.intel_set("price:scan", "1000").await.unwrap();
-    let cost = price::refresh(&na.node)
+    // A kept copy of b's price on both nodes, so it is more than the floor
+    // and a's reference agrees with b's selling price.
+    let key = format!("price:scan:{}", b.id);
+    na.store.intel_set(&key, "1000").await.unwrap();
+    nb.store.intel_set(&key, "1000").await.unwrap();
+    let sell = price::refresh(&nb.node)
         .await
         .unwrap()
         .price_of(price::SCAN)
-        .unwrap() as u64;
+        .unwrap();
+    price::refresh(&na.node).await.unwrap();
+    eventually("a hears b's selling price", || async {
+        na.node.status.known(&b.id).and_then(|k| k.hb.scan_price_mc) == Some(sell)
+    })
+    .await;
+    let cost = peephole::credits::jobs::price_for(&na.node, &b.id).unwrap() as u64;
     assert!(cost > 1, "{cost}");
     enqueue(&na, "198.51.100.41", 2).await;
     eventually_for(
@@ -4948,6 +4957,101 @@ async fn a_funded_scan_job_pays_the_scanner_its_price() {
         assert_eq!(book.balance(&b.id), cost);
         assert_eq!(book.ledger.held(&a.id), 0);
     }
+}
+
+/// A scanner that announces more than the rule gives is paid the
+/// arbiter's reference price, capped at PRICE_TOLERANCE.
+#[tokio::test]
+async fn an_inflated_scanner_price_is_paid_at_the_reference() {
+    use peephole::credits::{self, price};
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a],
+        Opts {
+            scanner: Some(fake_nmap_args(tools.path())),
+            ..DEFAULT
+        },
+    )
+    .await;
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    market_known(&na, b.id).await;
+    market_known(&nb, a.id).await;
+    na.node.set_scan_share(0.5);
+    let key = format!("price:scan:{}", b.id);
+    na.store.intel_set(&key, "1000").await.unwrap();
+    nb.store.intel_set(&key, "50000").await.unwrap(); // b claims far more
+    let sell = price::refresh(&nb.node)
+        .await
+        .unwrap()
+        .price_of(price::SCAN)
+        .unwrap();
+    let reference = price::refresh(&na.node)
+        .await
+        .unwrap()
+        .reference(&b.id)
+        .unwrap();
+    eventually("a hears b's selling price", || async {
+        na.node.status.known(&b.id).and_then(|k| k.hb.scan_price_mc) == Some(sell)
+    })
+    .await;
+    let paid = credits::jobs::price_for(&na.node, &b.id).unwrap();
+    assert_eq!(
+        paid,
+        (reference as f64 * price::PRICE_TOLERANCE).floor() as u32
+    );
+    assert!(paid < sell);
+}
+
+/// With two scanners asking, the arbiter grants to the cheaper one.
+#[tokio::test]
+async fn the_cheaper_scanner_gets_the_job() {
+    use peephole::credits::price;
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let scanner = || Opts {
+        scanner: Some(fake_nmap_args(tools.path())),
+        ..DEFAULT
+    };
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], scanner()).await;
+    let nc = boot(ic, &c, &[&a, &b], scanner()).await;
+    grant_scans(&[&na, &nb, &nc], a.id, 8).await;
+    for (n, of) in [(&na, b.id), (&na, c.id), (&nb, a.id), (&nc, a.id)] {
+        market_known(n, of).await;
+    }
+    na.node.set_scan_share(0.5);
+    for (who, mc) in [(b.id, "3000"), (c.id, "1000")] {
+        let key = format!("price:scan:{who}");
+        for n in [&na, &nb, &nc] {
+            n.store.intel_set(&key, mc).await.unwrap();
+        }
+    }
+    for n in [&nb, &nc, &na] {
+        price::refresh(&n.node).await.unwrap();
+    }
+    eventually("a hears both prices", || async {
+        [b.id, c.id].iter().all(|s| {
+            na.node
+                .status
+                .known(s)
+                .and_then(|k| k.hb.scan_price_mc)
+                .is_some()
+        })
+    })
+    .await;
+    enqueue(&na, "198.51.100.42", 1).await;
+    eventually_for(Duration::from_secs(40), "scanned", || async {
+        count(&na, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 1
+    })
+    .await;
+    assert_eq!(scans_by(&na, c.id).await, 1, "the cheaper scanner ran it");
 }
 
 /// The asker pays a resolver the price it announces for a name it
