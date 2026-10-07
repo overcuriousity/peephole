@@ -424,6 +424,7 @@ secure_cookies = false
     fn only_public_pages_and_ceremonies_are_limited() {
         use axum::http::Method;
         assert_eq!(classify(&Method::POST, "/login/start"), Class::Auth);
+        assert_eq!(classify(&Method::POST, "/login/password"), Class::Auth);
         assert_eq!(classify(&Method::POST, "/enroll/finish"), Class::Auth);
         assert_eq!(classify(&Method::GET, "/ips"), Class::Public);
         assert_eq!(classify(&Method::GET, "/ip/203.0.113.1"), Class::Public);

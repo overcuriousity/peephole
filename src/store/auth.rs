@@ -59,7 +59,7 @@ impl Store {
         let method: LoginMethod = method.and_then(|m| m.parse().ok()).unwrap_or_default();
         let has_password = get_meta(&mut tx, PASSWORD_HASH).await?.is_some();
         let last = keys <= 1;
-        if last && !(method == LoginMethod::Both && has_password) {
+        if last && !(method != LoginMethod::Passkey && has_password) {
             return Ok(false);
         }
         let r = sqlx::query("DELETE FROM credentials WHERE cred_id = ?")
@@ -563,16 +563,16 @@ mod tests {
         assert_eq!(s.load_credentials().await.unwrap().len(), 1);
     }
 
-    async fn test_store() -> Store {
+    /// A store in a temp dir; keep the guard alive while using the store.
+    async fn test_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        // The directory must outlive the pool; keep it for the test run.
-        let path = dir.keep().join("t.db");
-        Store::connect(&path).await.unwrap()
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        (dir, s)
     }
 
     #[tokio::test]
     async fn login_method_guard_and_last_key() {
-        let s = test_store().await;
+        let (_dir, s) = test_store().await;
         assert_eq!(s.login_method().await.unwrap(), LoginMethod::Passkey);
         assert!(
             s.set_login_method(LoginMethod::Password).await.is_err(),
@@ -595,8 +595,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_last_key_may_go_under_password_when_a_password_exists() {
+        let (_dir, s) = test_store().await;
+        s.save_credential(b"k1", "{}", Some("one")).await.unwrap();
+        s.save_credential(b"k2", "{}", Some("two")).await.unwrap();
+        s.set_password_hash("$argon2id$v=19$x", None).await.unwrap();
+        s.set_login_method(LoginMethod::Password).await.unwrap();
+        assert!(s.delete_credential_guarded(b"k1").await.unwrap());
+        assert!(s.delete_credential_guarded(b"k2").await.unwrap());
+        assert_eq!(s.login_method().await.unwrap(), LoginMethod::Password);
+        assert!(s.load_credentials().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn setting_a_password_turns_passkey_into_both_and_ends_password_sessions() {
-        let s = test_store().await;
+        let (_dir, s) = test_store().await;
         let a = s.create_session().await.unwrap();
         let b = s.create_session().await.unwrap();
         s.set_password_hash("$argon2id$v=19$x", Some(&b))

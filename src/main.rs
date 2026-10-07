@@ -12,6 +12,8 @@ usage: peephole [CONFIG]                 run the daemon (default /etc/peephole/c
        peephole export [OPTIONS] [CONFIG]  the dataset as Parquet, CSV or JSON Lines (--help)
        peephole decoy render UID [CONFIG]  print a stored decoy answer again
        peephole admin reset-token [CONFIG]
+       peephole admin password [--stdin] [CONFIG]
+       peephole admin login-method passkey|password|both [CONFIG]
        peephole db vacuum [CONFIG]
        peephole --version | -V
        peephole --help | -h | help
