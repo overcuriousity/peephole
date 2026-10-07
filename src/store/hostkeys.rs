@@ -4,7 +4,9 @@
 
 use super::Store;
 use super::inspect::{MAX_RAW_XML, zstd_decode_capped};
-use crate::scan::hostkeys::{HASSH, JA4X, SSH_HOSTKEY, TLS_CERT, extract};
+use crate::scan::hostkeys::{
+    FAVICON, HASSH, HTTP_404, HTTP_BODY, HostKey, JA4X, JARM, SSH_HOSTKEY, TLS_CERT, extract,
+};
 use anyhow::Result;
 use sqlx::SqliteConnection;
 
@@ -17,6 +19,10 @@ pub struct HostKeyRow {
     pub detail: String,
     /// Distinct other source IPs with the same identifier.
     pub other_ips: i64,
+    /// Set when a probe found it rather than a scan.
+    pub probe_id: Option<i64>,
+    /// When that probe finished.
+    pub probe_at: Option<String>,
 }
 
 impl HostKeyRow {
@@ -48,6 +54,10 @@ pub fn kind_name(kind: &str) -> &'static str {
         TLS_CERT => "TLS certificate",
         JA4X => "JA4X",
         HASSH => "HASSH",
+        FAVICON => "Favicon",
+        JARM => "JARM",
+        HTTP_BODY => "HTTP body",
+        HTTP_404 => "HTTP 404 page",
         _ => "other",
     }
 }
@@ -111,10 +121,35 @@ pub(crate) async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
     }
 }
 
+/// Store what a probe found (the same keys a scan's XML yields).
+pub(crate) async fn insert_probe_keys(
+    conn: &mut SqliteConnection,
+    probe_id: i64,
+    ip_id: i64,
+    keys: &[HostKey],
+) -> Result<()> {
+    for k in keys {
+        sqlx::query(
+            "INSERT OR IGNORE INTO host_keys (probe_id, ip_id, port, kind, fingerprint, detail)
+             VALUES (?,?,?,?,?,?)",
+        )
+        .bind(probe_id)
+        .bind(ip_id)
+        .bind(k.port as i64)
+        .bind(k.kind)
+        .bind(&k.fingerprint)
+        .bind(&k.detail)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
 const ROW_SELECT: &str = "SELECT h.kind, h.port, h.fingerprint, MAX(h.detail) AS detail,
         (SELECT COUNT(DISTINCT o.ip_id) FROM host_keys o
-         WHERE o.kind = h.kind AND o.fingerprint = h.fingerprint AND o.ip_id != h.ip_id) AS other_ips
-     FROM host_keys h";
+         WHERE o.kind = h.kind AND o.fingerprint = h.fingerprint AND o.ip_id != h.ip_id) AS other_ips,
+        MAX(h.probe_id) AS probe_id, MAX(p.finished_at) AS probe_at
+     FROM host_keys h LEFT JOIN probes p ON p.id = h.probe_id";
 
 impl Store {
     /// Every identifier any scan found on this IP, once each.

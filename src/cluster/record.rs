@@ -6,6 +6,7 @@
 //! alter or forge them, and can forward kinds they do not understand.
 use super::identity::{Identity, NodeId};
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 
 const SIG_DOMAIN: &[u8] = b"peephole-repl-v1\0";
 
@@ -258,6 +259,50 @@ pub struct ScanResultRec {
     pub build: String,
 }
 
+/// One port of an observational probe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbePortRec {
+    pub port: u16,
+    /// `http`, `https`, `ssh`, `tls` or `banner`.
+    pub protocol: String,
+    /// `ok`, `refused`, `timeout` or `error`.
+    pub outcome: String,
+    /// What the probe saw, as JSON (keys read by `store::probes::keys_of`).
+    pub detail_json: String,
+}
+
+/// A finished observational probe of one address (`scan::probe`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeResultRec {
+    pub uid: String,
+    /// Shared by the probes of one lookup.
+    pub group: String,
+    pub ip: String,
+    pub asker: NodeId,
+    /// The address the probe came from, and how it was learned:
+    /// `public`, `dialled` or `local`.
+    pub vantage_ip: Option<IpAddr>,
+    pub vantage_ip_source: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub rtt_min_ms: Option<u32>,
+    pub ports: Vec<ProbePortRec>,
+    /// Source commit of the binary that created the record (provenance).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build: String,
+}
+
+/// A name an admin looked up, with what each node's resolver answered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpNameRec {
+    pub uid: String,
+    pub name: String,
+    pub at: String,
+    pub answers: Vec<(NodeId, Result<Vec<IpAddr>, String>)>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build: String,
+}
+
 /// A finished audit: a scan run again by another scanner to check a
 /// result (see `credits::audit`). Audits earn nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -326,6 +371,8 @@ pub enum Record {
     JobStatus(JobStatusRec),
     JobAdopt(JobAdoptRec),
     ScanResult(ScanResultRec),
+    ProbeResult(ProbeResultRec),
+    IpName(IpNameRec),
     Tombstone(TombstoneRec),
     IntelManifest(IntelManifestRec),
     SkipBatch(SkipBatchRec),
@@ -381,6 +428,8 @@ impl Record {
             Record::JobStatus(_) => "job_status",
             Record::JobAdopt(_) => "job_adopt",
             Record::ScanResult(_) => "scan_result",
+            Record::ProbeResult(_) => "probe_result",
+            Record::IpName(_) => "ip_name",
             Record::Tombstone(_) => "tombstone",
             Record::IntelManifest(_) => "intel_manifest",
             Record::SkipBatch(_) => "skip_batch",
@@ -402,6 +451,8 @@ impl Record {
             Record::Fingerprint(r) => Some(r.uid.clone()),
             Record::ScanJob(r) => Some(r.uid.clone()),
             Record::ScanResult(r) => Some(r.uid.clone()),
+            Record::ProbeResult(r) => Some(r.uid.clone()),
+            Record::IpName(r) => Some(r.uid.clone()),
             Record::Tombstone(r) => Some(r.uid.clone()),
             Record::SkipBatch(r) => Some(r.uid.clone()),
             Record::ScanAudit(r) => Some(r.scan.uid.clone()),

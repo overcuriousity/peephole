@@ -15,12 +15,17 @@ pub const SSH_HOSTKEY: &str = "ssh-hostkey";
 pub const TLS_CERT: &str = "tls-cert";
 pub const JA4X: &str = "ja4x";
 pub const HASSH: &str = "hassh";
+pub const FAVICON: &str = "favicon";
+pub const JARM: &str = "jarm";
+pub const HTTP_BODY: &str = "http-body";
+pub const HTTP_404: &str = "http-404";
 
 /// One identifier found on one port of a scanned source.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostKey {
     pub port: u16,
-    /// [`SSH_HOSTKEY`], [`TLS_CERT`], [`JA4X`] or [`HASSH`].
+    /// [`SSH_HOSTKEY`], [`TLS_CERT`], [`JA4X`], [`HASSH`], or from probes
+    /// [`FAVICON`], [`JARM`], [`HTTP_BODY`] or [`HTTP_404`].
     pub kind: &'static str,
     /// `SHA256:<base64>` as OpenSSH prints it; the certificate's SHA-256
     /// (hex, of the DER); the JA4X string; the HASSH-server MD5 (hex).

@@ -5,7 +5,7 @@
     <tr{% if k.identifies() && k.other_ips > 0 %} class="hk-shared"{% endif %}><td class="mono">{{ k.port }}</td>
         <td>{{ k.kind_name() }}</td>
         <td class="mono hk-fp"><a href="{{ k.link_href() }}">{{ k.fingerprint }}</a>{% let value = k.fingerprint.as_str() %}{% let what = "fingerprint" %}{% let subtle = true %}{% include "_copy.html" %}</td>
-        <td class="hk-detail">{{ k.detail }}</td>
+        <td class="hk-detail">{% if k.probe_id.is_some() %}<span class="muted">from probe{% if let Some(at) = k.probe_at %} · {{ at }}{% endif %}</span> {% endif %}{{ k.detail }}</td>
         <td class="num">{% if k.other_ips == 0 %}<span class="muted">—</span>{% else if k.identifies() %}<a class="badge badge-status" data-status="running" href="{{ k.link_href() }}" title="The same {{ k.kind_name() }} was found on other sources">{{ k.other_ips }} linked</a>{% else %}<span class="muted" title="Same software, not necessarily the same operator">{{ k.other_ips }}</span>{% endif %}</td></tr>
   {% endfor %}
   {% if keys.is_empty() %}<tr><td colspan="5" class="empty">None found (nmap's ssh-hostkey, ssh2-enum-algos and ssl-cert run from level 2).</td></tr>{% endif %}

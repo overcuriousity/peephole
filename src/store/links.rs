@@ -160,14 +160,14 @@ impl Leg {
         }
     }
 
-    /// `host_keys` of one kind; its time is the scan's.
+    /// `host_keys` of one kind; its time is the scan's or the probe's.
     const fn host_key(cond: &'static str) -> Leg {
         Leg {
-            from: "host_keys h JOIN scans s ON s.id = h.scan_id",
+            from: "host_keys h LEFT JOIN scans s ON s.id = h.scan_id LEFT JOIN probes p ON p.id = h.probe_id",
             text: "h.fingerprint",
             col: "h.fingerprint",
             ip: "h.ip_id",
-            ts: "s.finished_at",
+            ts: "COALESCE(s.finished_at, p.finished_at)",
             origin: "NULL",
             cond,
         }
