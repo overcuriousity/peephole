@@ -64,9 +64,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Everything this node knows about credits at one moment: who earns
-/// here, what every judged scan paid, and where every credit is.
+/// here, what each judged scan weighs in its day's mint, and where every
+/// credit is.
 pub struct Book {
     pub ledger: ledger::Ledger,
+    /// Every judged scan with its weight in its day's mint (0: it does
+    /// not count).
     pub paid: Vec<earn::Paid>,
     /// Each scanner's share of each closed day's mint.
     pub minted: Vec<ledger::Earned>,
@@ -116,6 +119,7 @@ pub async fn compute(node: &Node) -> anyhow::Result<Book> {
     let members: Vec<NodeId> = crate::cluster::members::all(&node.store)
         .await?
         .into_iter()
+        .filter(|m| m.active)
         .map(|m| m.id)
         .collect();
     let today = (now_ms / DAY_MS) as u32;

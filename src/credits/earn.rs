@@ -1,8 +1,9 @@
-//! Earning: a completed counter-scan counts for its scanner's share of the
-//! day's mint (`credits::mint`). A node judges each payable scan once, when the requests
-//! behind it have had time to arrive (`judge`, stored in `credit_scans`),
-//! and decides what counts at every recomputation of the ledger (`pay`),
-//! because that depends on the other scans and on who earns here now.
+//! Earning: a completed counter-scan counts for its scanner's share of
+//! the day's mint (`credits::mint`). A node judges each payable scan
+//! once, when the requests behind it have had time to arrive (`judge`,
+//! stored in `credit_scans`), and decides what counts at every
+//! recomputation of the ledger (`pay`), because that depends on the
+//! other scans and on who earns here now.
 use super::DAY_MS;
 use crate::classify::Classifier;
 use crate::cluster::hlc::{self, physical_ms};
