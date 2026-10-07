@@ -3,15 +3,23 @@
 {% block content %}
 {% let sub = "cluster" %}{% include "_admin_nav.html" %}
 {% let subtab = "credits" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
-<div class="page-head"><div><h1>Credits</h1><p class="muted">Earned by completed counter-scans, spent on lookups. Every figure is this node's own count, from its copy of the log.</p></div></div>
+<div class="page-head"><div><h1>Credits</h1><p class="muted">Minted daily among the scanners, spent on lookups and scans. Every figure is this node's own count, from its copy of the log.</p></div></div>
 <div class="stack">
+<section class="card"><div class="card-head"><h2>Where credits come from</h2></div>
+  <p>Every day 1000 credits are split among the scanners by the scans that counted. Every member that earns here and recorded a request gets 5 credits a day. A credit is gone 7 days after the day it was minted; nothing else destroys it.</p>
+  <p>Today: {{ accruing.0 }} scans counted so far{% if accruing.1 %}, and the allowance{% endif %}; credited when the day ends (UTC).</p>
+  {% if !income.is_empty() %}<div class="table-wrap"><table>
+    <thead><tr><th>Day</th><th class="num">Mint</th><th class="num">Allowance</th></tr></thead>
+    <tbody>{% for (d, m, a) in income %}<tr><td class="mono">{{ d }}</td><td class="num">{{ m }}</td><td class="num">{{ a }}</td></tr>{% endfor %}</tbody>
+  </table></div>{% endif %}
+</section>
 <section class="card"><h2>Balance</h2>
   <div class="tiles">
     <div class="tile"><span class="label">This node</span><div class="value">{{ balance }}</div><div class="hint">credits</div></div>
     <div class="tile"><span class="label">Set aside</span><div class="value">{{ held }}</div><div class="hint">in open lookups</div></div>
     {% if let Some((total, _)) = fleet %}<div class="tile"><span class="label">All your nodes</span><div class="value">{{ total }}</div><div class="hint">credits</div></div>{% endif %}
   </div>
-  {% if days.is_empty() %}<p class="muted">Nothing to spend. Credits come from completed counter-scans: the scanner earns 1 (levels 1, 2) or 2 (levels 3, 4), the trap that queued the job a quarter of that.</p>{% else %}
+  {% if days.is_empty() %}<p class="muted">Nothing to spend. Credits come from the daily mint and the allowance, above.</p>{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>Earned on (UTC)</th><th class="num">Credits</th><th>Expires</th></tr></thead>
     <tbody>{% for d in days %}<tr><td class="mono">{{ d.date }}</td><td class="num">{{ d.amount }}</td><td>{{ d.expires }}</td></tr>{% endfor %}</tbody>
@@ -67,10 +75,10 @@
 </section>
 <section class="card"><div class="card-head"><h2>Cluster</h2><span class="muted">as this node counts it</span></div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Member</th><th class="num">Credits</th><th class="num">Earned, 7 days</th><th class="num">Spent, 7 days</th><th></th></tr></thead>
+    <thead><tr><th>Member</th><th class="num">Credits</th><th class="num">Earned, 7 days</th><th class="num">Spent, 7 days</th><th class="num">Mint</th><th class="num">Allowance</th><th class="num">Sales</th><th></th></tr></thead>
     <tbody>{% for m in members %}<tr>
       <td><a href="/admin/cluster/node/{{ m.key }}"><b>{{ m.name }}</b></a></td>
-      <td class="num">{{ m.balance }}</td><td class="num">{{ m.earned }}</td><td class="num">{{ m.spent }}</td>
+      <td class="num">{{ m.balance }}</td><td class="num">{{ m.earned }}</td><td class="num">{{ m.spent }}</td><td class="num">{{ m.minted }}</td><td class="num">{{ m.allowance }}</td><td class="num">{{ m.sales }}</td>
       <td>{% if !m.standing.is_empty() %}<span class="badge badge-status" data-status="running">not earning here: {{ m.standing }}</span>{% endif %}</td>
     </tr>{% endfor %}</tbody>
   </table></div>
@@ -81,6 +89,7 @@
   <ul>
     <li>A funded scan job costs <b>{{ price.scan }}</b> credits here ({{ price.scan_bids }} funded jobs waiting; the scanners do {{ price.capacity_per_hour }} an hour, {{ price.utilization }} % used).</li>
     {% if let Some(p) = price.probe %}<li>A probe for another member costs <b>{{ p }}</b> credits here.</li>{% endif %}
+    <li>Resolving a name costs <b>{{ price.resolve }}</b> credits here.</li>
   </ul>
   {% if !price.offers.is_empty() %}
   <div class="table-wrap"><table>

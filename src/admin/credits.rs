@@ -6,8 +6,8 @@ use crate::admin::cluster::{back_to, node};
 use crate::admin::error::{AppResult, render};
 use crate::admin::views::Chrome;
 use crate::cluster::identity::NodeId;
-use crate::credits::ledger::OfferState;
-use crate::credits::{self, show};
+use crate::credits::ledger::{Earned, OfferState};
+use crate::credits::{self, Mc, mint, show};
 use askama::Template;
 use axum::{
     Router,
@@ -15,7 +15,7 @@ use axum::{
     response::{Html, Response},
     routing::{get, post},
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 const PAGE: &str = "/admin/cluster/credits";
@@ -101,6 +101,11 @@ struct MemberRow {
     spent: String,
     /// Why it does not earn in full here; empty: it does.
     standing: String,
+    /// Its share of the mint and its allowances over the last 7 days.
+    minted: String,
+    allowance: String,
+    /// What it charged others over the last 7 days.
+    sales: String,
 }
 
 struct PriceView {
@@ -111,6 +116,8 @@ struct PriceView {
     utilization: String,
     /// What a probe costs here; None: this node does not probe.
     probe: Option<String>,
+    /// What resolving a name for another member costs here.
+    resolve: String,
     /// `(provider label, price, paid lookups it serves a day)`.
     offers: Vec<(String, String, String)>,
 }
@@ -135,6 +142,11 @@ struct CreditsPage {
     price: PriceView,
     /// `(key, name)` of the members credits can be sent to.
     receivers: Vec<(String, String)>,
+    /// This node's closed days, newest first: `(date, mint share, allowance)`.
+    income: Vec<(String, String, String)>,
+    /// Today: scans of this node counted so far, and whether it recorded a
+    /// request today (so the allowance is due).
+    accruing: (u32, bool),
 }
 
 async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
@@ -266,6 +278,36 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         })
         .collect();
 
+    let mut income: BTreeMap<u32, (Mc, Mc)> = BTreeMap::new();
+    for e in book.minted.iter().filter(|e| e.node == me) {
+        income.entry(credits::day_of(e.hlc)).or_default().0 += e.mc;
+    }
+    for e in book.allowances.iter().filter(|e| e.node == me) {
+        income.entry(credits::day_of(e.hlc)).or_default().1 += e.mc;
+    }
+    let income: Vec<(String, String, String)> = income
+        .into_iter()
+        .rev()
+        .take(credits::LOT_DAYS as usize)
+        .map(|(d, (m, a))| (date_of(d), show(m), show(a)))
+        .collect();
+    let today = (book.now_ms / credits::DAY_MS) as u32;
+    let counted = book
+        .paid
+        .iter()
+        .filter(|p| p.weight > 0 && p.scan.scanner == me && credits::day_of(p.scan.hlc) == today)
+        .count() as u32;
+    let recorded = !mint::active_days(&node.store.pool, &[me], today, today)
+        .await?
+        .is_empty();
+    let accruing = (counted, recorded);
+    let sum_week = |list: &[Earned], id: &NodeId| -> Mc {
+        list.iter()
+            .filter(|e| e.node == *id && e.hlc >= week)
+            .map(|e| e.mc)
+            .sum()
+    };
+
     let mut rows: Vec<MemberRow> = members
         .values()
         .filter(|m| m.active)
@@ -278,6 +320,9 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
                 earned: show(t.earned),
                 spent: show(t.spent),
                 standing: book.standing(&m.id).reasons().join("; "),
+                minted: show(sum_week(&book.minted, &m.id)),
+                allowance: show(sum_week(&book.allowances, &m.id)),
+                sales: show(t.served),
             }
         })
         .collect();
@@ -299,6 +344,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         capacity_per_hour: format!("{:.0}", t.capacity.per_day / 24.0),
         utilization: format!("{:.0}", t.capacity.utilization * 100.0),
         probe: t.probe_mc.map(|m| show(m as u64)),
+        resolve: show(t.resolve_mc as u64),
         offers: t
             .offers
             .iter()
@@ -330,6 +376,8 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         totals,
         price,
         receivers,
+        income,
+        accruing,
     })
 }
 
@@ -375,5 +423,60 @@ mod tests {
         assert_eq!(expires_in(20_732, 20_732), "in 6 days");
         assert_eq!(expires_in(20_727, 20_732), "in 1 day");
         assert_eq!(expires_in(20_726, 20_732), "today");
+    }
+
+    #[test]
+    fn the_page_shows_where_credits_come_from() {
+        let page = CreditsPage {
+            chrome: crate::admin::views::Chrome::new(true, "admin"),
+            balance: "1250.00".into(),
+            held: "0.00".into(),
+            days: vec![],
+            fleet: None,
+            earned: vec![],
+            waiting: 0,
+            spent: vec![],
+            moved: vec![],
+            members: vec![MemberRow {
+                key: "k".into(),
+                name: "node-alpha".into(),
+                balance: "1250.00".into(),
+                earned: "255.00".into(),
+                spent: "0.00".into(),
+                standing: String::new(),
+                minted: "250.00".into(),
+                allowance: "5.00".into(),
+                sales: "1.20".into(),
+            }],
+            totals: ("255.00".into(), "812.00".into()),
+            price: PriceView {
+                scan: "0.05".into(),
+                scan_bids: 3,
+                capacity_per_hour: "40".into(),
+                utilization: "12".into(),
+                probe: None,
+                resolve: "0.01".into(),
+                offers: vec![("MaxMind GeoLite2".into(), "0.02".into(), "1000".into())],
+            },
+            receivers: vec![],
+            income: vec![("2026-10-06".into(), "250.00".into(), "5.00".into())],
+            accruing: (12, true),
+        };
+        // The template states these amounts in words.
+        assert_eq!((mint::MINT_PER_DAY, mint::ALLOWANCE_PER_DAY), (1000_000, 5_000));
+        let html = page.render().unwrap();
+        for want in [
+            "2026-10-06",
+            "250.00",
+            "5.00",
+            "1.20",
+            "812.00",
+            "0.05",
+            "12 scans counted so far",
+            "1000 credits are split among the scanners",
+        ] {
+            assert!(html.contains(want), "{want} missing");
+        }
+        assert!(!html.contains("destroyed"));
     }
 }
