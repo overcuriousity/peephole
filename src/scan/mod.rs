@@ -649,6 +649,24 @@ impl Source {
         arbiter: NodeId,
         g: &Grant,
     ) -> anyhow::Result<Result<Job, Turndown>> {
+        let checked = self.check_grant_here(arbiter, g).await;
+        // An internal error ends the grant too: a funded offer goes back
+        // at once instead of lapsing.
+        if checked.is_err()
+            && let Some(seq) = g.offer_seq
+            && let Some(node) = self.node()
+        {
+            crate::credits::jobs::settle(node, arbiter, seq, 0).await;
+        }
+        checked
+    }
+
+    /// [`Self::check_grant`] without giving a funded offer back on error.
+    async fn check_grant_here(
+        &self,
+        arbiter: NodeId,
+        g: &Grant,
+    ) -> anyhow::Result<Result<Job, Turndown>> {
         let pool = &self.rec.store().pool;
         let Some(level) = valid_level(g.level) else {
             return Ok(Err(("refused", Some("invalid scan level".into()))));
