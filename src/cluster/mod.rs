@@ -283,10 +283,11 @@ pub struct Node {
     /// The fleet node this node forwards its credits to and draws from
     /// (the runtime setting `credits.collect_to`).
     pub collect_to: RwLock<Option<NodeId>>,
-    /// Free lookups served per asking member in the last hour.
-    free_lookups: Mutex<HashMap<NodeId, std::collections::VecDeque<std::time::Instant>>>,
-    /// Name resolutions served per asking member in the last hour.
-    free_resolves: Mutex<HashMap<NodeId, std::collections::VecDeque<std::time::Instant>>>,
+    /// Paid requests counted for this node's prices (`credits::price`).
+    pub market: crate::credits::price::Demand,
+    /// Funded scan jobs this node would grant now (`credits::jobs`).
+    pub scan_bids: std::sync::atomic::AtomicU32,
+    scan_share: std::sync::OnceLock<f64>,
     /// Offers a paid lookup is being served for right now: `(payer,
     /// sequence number)`. An offer is served once.
     pub(crate) serving_offers: Mutex<std::collections::HashSet<(NodeId, u64)>>,
@@ -354,8 +355,9 @@ impl Node {
             prober: Default::default(),
             price_table: Default::default(),
             collect_to: RwLock::new(None),
-            free_lookups: Mutex::new(HashMap::new()),
-            free_resolves: Mutex::new(HashMap::new()),
+            market: Default::default(),
+            scan_bids: Default::default(),
+            scan_share: Default::default(),
             serving_offers: Mutex::new(Default::default()),
             data_dir: p.data_dir,
             status: Default::default(),
@@ -530,16 +532,13 @@ impl Node {
         self.publish_status();
     }
 
-    /// Count one free lookup for `peer`; false when it had
-    /// [`crate::credits::pay::FREE_PER_HOUR`] in the last hour.
-    pub fn take_free_lookup(&self, peer: NodeId) -> bool {
-        take_free(&self.free_lookups, peer)
+    /// `[credits] scan_share`: set once at start.
+    pub fn set_scan_share(&self, share: f64) {
+        let _ = self.scan_share.set(share.clamp(0.0, 1.0));
     }
 
-    /// Count one name resolution for `peer` (`/rpc/v1/resolve`); false
-    /// when it had [`crate::credits::pay::FREE_PER_HOUR`] in the last hour.
-    pub fn take_free_resolve(&self, peer: NodeId) -> bool {
-        take_free(&self.free_resolves, peer)
+    pub fn scan_share(&self) -> f64 {
+        self.scan_share.get().copied().unwrap_or(0.0)
     }
 
     /// The address this node would dial `id` at, if it has one.
@@ -1046,26 +1045,6 @@ async fn heartbeat_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Recei
             _ = shutdown.changed() => break,
         }
     }
-}
-
-/// Count one free request of `peer` in `map`; false when it had
-/// [`crate::credits::pay::FREE_PER_HOUR`] in the last hour.
-fn take_free(
-    map: &Mutex<HashMap<NodeId, std::collections::VecDeque<std::time::Instant>>>,
-    peer: NodeId,
-) -> bool {
-    let hour = Duration::from_secs(3600);
-    let mut all = map.lock().unwrap();
-    all.retain(|_, q| q.back().is_some_and(|t| t.elapsed() < hour));
-    let q = all.entry(peer).or_default();
-    while q.front().is_some_and(|t| t.elapsed() >= hour) {
-        q.pop_front();
-    }
-    if q.len() >= crate::credits::pay::FREE_PER_HOUR {
-        return false;
-    }
-    q.push_back(std::time::Instant::now());
-    true
 }
 
 #[cfg(test)]

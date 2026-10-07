@@ -41,6 +41,17 @@ pub struct Grant {
     pub ip: String,
     pub level: i64,
     pub lease_secs: u64,
+    /// The arbiter's offer that funds this job (`credits::jobs`). Unfunded
+    /// grants encode exactly like those of nodes that predate the market.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer_seq: Option<u64>,
+    /// What the scanner charges for delivering the result.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub price_mc: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -52,6 +63,9 @@ pub enum Msg {
     Claim {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         exclude_levels: Vec<u8>,
+        /// The least a funded job may pay: half the scanner's own scan price.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        min_mc: u32,
     },
     ClaimReply {
         grant: Option<Grant>,
@@ -536,6 +550,7 @@ mod tests {
         use crate::cluster::rpc::cbor::{decode, encode};
         let new_empty = Msg::Claim {
             exclude_levels: vec![],
+            min_mc: 0,
         };
         assert_eq!(encode(&new_empty).unwrap(), encode(&OldMsg::Claim).unwrap());
         assert_eq!(
@@ -544,12 +559,52 @@ mod tests {
         );
         let excl = Msg::Claim {
             exclude_levels: vec![4],
+            min_mc: 25,
         };
         assert_eq!(decode::<Msg>(&encode(&excl).unwrap()).unwrap(), excl);
         assert_eq!(
             decode::<OldMsg>(&encode(&excl).unwrap()).unwrap(),
             OldMsg::Claim
         );
+    }
+
+    /// The grant as nodes before paid scan jobs know it.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct OldGrant {
+        job_uid: String,
+        ip: String,
+        level: i64,
+        lease_secs: u64,
+    }
+
+    /// An unfunded grant encodes exactly like the old one; each side
+    /// decodes the other's.
+    #[test]
+    fn grants_stay_compatible_across_versions() {
+        use crate::cluster::rpc::cbor::{decode, encode};
+        let old = OldGrant {
+            job_uid: "j".into(),
+            ip: "203.0.113.1".into(),
+            level: 2,
+            lease_secs: 120,
+        };
+        let unfunded = Grant {
+            job_uid: "j".into(),
+            ip: "203.0.113.1".into(),
+            level: 2,
+            lease_secs: 120,
+            offer_seq: None,
+            price_mc: 0,
+        };
+        assert_eq!(encode(&unfunded).unwrap(), encode(&old).unwrap());
+        assert_eq!(decode::<Grant>(&encode(&old).unwrap()).unwrap(), unfunded);
+        let funded = Grant {
+            offer_seq: Some(7),
+            price_mc: 40,
+            ..unfunded
+        };
+        assert_eq!(decode::<Grant>(&encode(&funded).unwrap()).unwrap(), funded);
+        assert_eq!(decode::<OldGrant>(&encode(&funded).unwrap()).unwrap(), old);
     }
 
     #[test]
@@ -563,6 +618,7 @@ mod tests {
             in_reply_to: None,
             msg: Msg::Claim {
                 exclude_levels: vec![],
+                min_mc: 0,
             },
         };
         let now = now_ms();

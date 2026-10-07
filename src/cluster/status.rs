@@ -64,8 +64,8 @@ pub struct Heartbeat {
     /// serves nothing below.
     #[serde(default)]
     pub floors: Vec<(NodeId, u64)>,
-    /// Per provider with a budget: paid on-demand lookups this node
-    /// serves a day (see `credits::price`).
+    /// Per provider: paid lookups this node serves a day (see
+    /// `credits::share`).
     #[serde(default)]
     pub on_demand: Vec<(String, u32)>,
     /// Per provider this node serves: its current price in mc.
@@ -78,6 +78,12 @@ pub struct Heartbeat {
     /// it does not probe.
     #[serde(default)]
     pub probe_price_mc: Option<u32>,
+    /// What a funded scan job costs at this node now, in mc.
+    #[serde(default)]
+    pub scan_price_mc: Option<u32>,
+    /// Funded scan jobs this node, as arbiter, would grant now.
+    #[serde(default)]
+    pub scan_bids: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,6 +425,8 @@ impl Node {
             prices,
             public_addrs: self.status.public_addresses(),
             probe_price_mc: self.prober().map(|p| p.price(&table)),
+            scan_price_mc: table.price_of(crate::credits::price::SCAN),
+            scan_bids: self.scan_bids.load(std::sync::atomic::Ordering::Relaxed),
         };
         let Ok(body) = super::rpc::cbor::encode(&hb) else {
             return;
@@ -544,6 +552,8 @@ mod tests {
             prices: vec![],
             public_addrs: vec![],
             probe_price_mc: None,
+            scan_price_mc: None,
+            scan_bids: 0,
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = id.sign(&SignedHeartbeat::signing(&body));
@@ -669,6 +679,8 @@ mod tests {
             prices: vec![],
             public_addrs: vec![],
             probe_price_mc: None,
+            scan_price_mc: None,
+            scan_bids: 0,
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = a.sign(&SignedHeartbeat::signing(&body));

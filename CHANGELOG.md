@@ -50,6 +50,24 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Changed
 
+- The dynamic market replaces the fixed credit rules. A daily mint of 1000
+  credits is split among scanners by counted scans (levels 3 and 4 count
+  twice; a scan of a node's own job never counts); the trap share is gone.
+- Every member that earns here and recorded a request that day gets an
+  allowance of 5 credits.
+- Prices follow supply and demand, hourly, per good: no weights, unit,
+  surge or free tier. Providers without an API budget and name
+  resolution offer `[enrichment] offer_per_day` (default 1000) a day.
+- Scan jobs are paid: the arbiter funds them up to `[credits] scan_share`
+  (default 0.5) of its balance, scanners ask funded arbiters first and
+  charge on delivery.
+- What a node answers itself is free; what another node answers is paid,
+  every provider (Tor exit list, RDAP, InternetDB, GeoLite2) and domain
+  resolution included. There is no free quota; the Lookup page asks other
+  nodes only for the providers picked.
+- Nothing is burned any more: a payment moves its full price. Credits
+  expire 7 days after their day.
+- Upgrade all nodes together: protocol 4 pays only between upgraded nodes.
 - Host keys and certificates may come from a probe as well as a scan;
   `host_keys` is rebuilt with a nullable `scan_id` (migration 0018).
 - The README's "escalate by scope, never by speed" rule now says it

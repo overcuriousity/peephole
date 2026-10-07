@@ -46,6 +46,8 @@ pub enum Kind {
     Offer {
         to: NodeId,
         parts: Vec<(u32, u32)>,
+        /// The scan job it funds; such an offer lapses after the longest scan.
+        job: Option<String>,
     },
     Receipt {
         payer: NodeId,
@@ -103,13 +105,16 @@ pub async fn apply(
         Option<u64>,
         Option<u32>,
         Option<&'a [String]>,
+        Option<&'a str>,
     );
-    let (kind, peer, parts, offer_seq, charged, answered): Cols = match r {
-        Record::CreditOffer { to, parts, .. } if parts_ok(parts, day) => {
-            ("offer", to, parts, None, None, None)
+    let (kind, peer, parts, offer_seq, charged, answered, job_uid): Cols = match r {
+        Record::CreditOffer { to, parts, job, .. }
+            if parts_ok(parts, day) && job.as_ref().is_none_or(|j| j.len() <= 64) =>
+        {
+            ("offer", to, parts, None, None, None, job.as_deref())
         }
         Record::CreditTransfer { to, parts, .. } if *to != e.origin && parts_ok(parts, day) => {
-            ("transfer", to, parts, None, None, None)
+            ("transfer", to, parts, None, None, None, None)
         }
         Record::CreditReceipt {
             payer,
@@ -126,14 +131,15 @@ pub async fn apply(
                 Some(*offer_seq),
                 Some(*charged_mc),
                 Some(answered),
+                None,
             )
         }
         _ => return Ok(false),
     };
     sqlx::query(
         "INSERT OR IGNORE INTO credit_entries
-           (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal)
-         VALUES (?,?,?,?,?,?,?,?,?,?)",
+           (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, job_uid)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&e.origin.0[..])
     .bind(e.seq.min(i64::MAX as u64) as i64)
@@ -145,6 +151,7 @@ pub async fn apply(
     .bind(charged.map(i64::from))
     .bind(answered.map(serde_json::to_string).transpose()?)
     .bind(seal.to_db())
+    .bind(job_uid)
     .execute(&mut *conn)
     .await?;
     Ok(true)
@@ -161,9 +168,11 @@ type Row = (
     Option<i64>,
     Option<String>,
     i64,
+    Option<String>,
 );
 
-const COLUMNS: &str = "origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal";
+const COLUMNS: &str =
+    "origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, job_uid";
 
 fn from_row(r: Row) -> Result<Entry> {
     let peer = NodeId::from_slice(&r.4)?;
@@ -171,6 +180,7 @@ fn from_row(r: Row) -> Result<Entry> {
         "offer" => Kind::Offer {
             to: peer,
             parts: serde_json::from_str(&r.5)?,
+            job: r.10,
         },
         "transfer" => Kind::Transfer {
             to: peer,
@@ -252,6 +262,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_scan_offer_keeps_its_job_and_a_long_job_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let (a, b) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let day = 20_000u32;
+        let at = |min: u64| ((day as u64 * crate::credits::DAY_MS + min * 60_000) << 16) | 1;
+        let offer = |job: String| Record::CreditOffer {
+            to: b.id,
+            parts: vec![(day, 200)],
+            seal: Seal::default(),
+            job: Some(job),
+        };
+        let mut conn = store.pool.acquire().await.unwrap();
+        let kept = offer("job".into());
+        let e = WireEntry::sign(&a, 3, at(1), &kept).unwrap();
+        assert!(
+            apply(&mut conn, &e, &kept, SealState::Consistent)
+                .await
+                .unwrap()
+        );
+        let long = offer("j".repeat(65));
+        let e = WireEntry::sign(&a, 4, at(2), &long).unwrap();
+        assert!(
+            !apply(&mut conn, &e, &long, SealState::Consistent)
+                .await
+                .unwrap()
+        );
+        // 64 bytes is still a job.
+        let edge = offer("j".repeat(64));
+        let e = WireEntry::sign(&a, 5, at(3), &edge).unwrap();
+        assert!(
+            apply(&mut conn, &e, &edge, SealState::Consistent)
+                .await
+                .unwrap()
+        );
+        drop(conn);
+        let got = get(&store.pool, &a.id, 3).await.unwrap().unwrap();
+        assert_eq!(
+            got.kind,
+            Kind::Offer {
+                to: b.id,
+                parts: vec![(day, 200)],
+                job: Some("job".into()),
+            }
+        );
+        assert_eq!(get(&store.pool, &a.id, 4).await.unwrap(), None);
+        assert_eq!(since(&store.pool, 0).await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_offer_without_a_job_encodes_like_one_before_jobs() {
+        use crate::cluster::rpc::cbor;
+        #[derive(serde::Serialize)]
+        #[serde(tag = "k", rename_all = "snake_case")]
+        enum Old {
+            CreditOffer {
+                to: NodeId,
+                parts: Vec<(u32, u32)>,
+                seal: Seal,
+            },
+        }
+        let to = Identity::generate().unwrap().id;
+        let parts = vec![(20_000, 250)];
+        let new = Record::CreditOffer {
+            to,
+            parts: parts.clone(),
+            seal: Seal::default(),
+            job: None,
+        };
+        let old = Old::CreditOffer {
+            to,
+            parts,
+            seal: Seal::default(),
+        };
+        assert_eq!(cbor::encode(&new).unwrap(), cbor::encode(&old).unwrap());
+        // What an old node wrote reads as an offer without a job.
+        let back: Record = cbor::decode(&cbor::encode(&old).unwrap()).unwrap();
+        assert!(matches!(back, Record::CreditOffer { job: None, .. }));
+    }
+
+    #[tokio::test]
     async fn payments_are_kept_as_rows_and_broken_ones_are_not() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
@@ -270,6 +361,7 @@ mod tests {
                 to: b.id,
                 parts: vec![(day - 1, 300), (day, 200)],
                 seal: seal.clone(),
+                job: None,
             },
         );
         let receipt = sign(
@@ -311,6 +403,7 @@ mod tests {
                 to: b.id,
                 parts: vec![(day - 7, 50)],
                 seal: seal.clone(),
+                job: None,
             },
         );
         let other = sign(&a, 8, at(6), &Record::LogSeal { seal });
@@ -343,7 +436,8 @@ mod tests {
                 hlc: at(1),
                 kind: Kind::Offer {
                     to: b.id,
-                    parts: vec![(day - 1, 300), (day, 200)]
+                    parts: vec![(day - 1, 300), (day, 200)],
+                    job: None,
                 },
                 seal: SealState::Consistent,
             }

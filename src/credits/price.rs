@@ -1,9 +1,6 @@
-//! What a lookup costs. A fixed price fits one cluster size only, so the
-//! price follows the two things that set the balance: what the cluster
-//! earns (credits a day, read from the log) and what it can serve
-//! (on-demand lookups a day, announced in heartbeats). The scanners' load
-//! moves it by at most a factor of 2 either way, and each server corrects
-//! for what the formula cannot know with its own surge.
+//! What a good costs here: one rule for every good with limited supply.
+//! Excess demand raises the price, excess supply lowers it, by a bounded
+//! step an hour. A good without a supply limit costs nothing.
 use super::Mc;
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
@@ -12,22 +9,95 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// The unit price stays within 0.01 and 100 credits.
-pub const UNIT_MIN: Mc = 10;
-pub const UNIT_MAX: Mc = 100_000;
-
-/// What an observational probe (`scan::probe`) is priced as.
+pub const PRICE_FLOOR: Mc = 1;
+pub const PRICE_STEP: f64 = 0.15;
+/// A funded scan job (`credits::jobs`).
+pub const SCAN: &str = "scan";
+/// An observational probe (`scan::probe`).
 pub const PROBE: &str = "probe";
+/// A name resolved for another member (`intel::dns`).
+pub const RESOLVE: &str = "resolve";
+/// A probe slot serves this many probes an hour (`PROBE_TIMEOUT` is 2 minutes).
+pub const PROBES_PER_SLOT_HOUR: f64 = 30.0;
 
-/// The weight of a provider in thousandths: a keyed API 1, Shodan
-/// InternetDB and GeoLite2 a quarter, the Tor exit list and RDAP nothing
-/// (free). A probe costs four: a scanner's time and its address.
-pub fn weight_milli(provider: &str) -> u32 {
-    match provider {
-        intel::TOR | intel::RDAP => 0,
-        intel::MAXMIND | intel::INTERNETDB => 250,
-        PROBE => 4000,
-        _ => 1000,
+/// One step of a price from the demand and the supply of a period. A
+/// price moves by at least 1 mc when they differ, so rounding does not
+/// hold a small price where it is.
+pub fn step(price: Mc, demand: f64, supply: f64) -> Mc {
+    scaled_step(price, demand, supply, 1.0)
+}
+
+/// A step of a flow good (demand and supply counted over `hours`): a
+/// period shorter than an hour moves the price by that share of a full
+/// step, so the first refresh after a start does not take a whole one.
+pub fn flow_step(price: Mc, demand: f64, supply: f64, hours: f64) -> Mc {
+    scaled_step(price, demand, supply, hours.clamp(0.0, 1.0))
+}
+
+fn scaled_step(price: Mc, demand: f64, supply: f64, scale: f64) -> Mc {
+    let price = price.max(PRICE_FLOOR);
+    let x = ((demand - supply) / supply.max(1.0)).clamp(-3.0, 3.0);
+    let p = (price as f64 * (PRICE_STEP * scale * x).exp()).round();
+    let p = (p.min(u32::MAX as f64) as Mc).max(PRICE_FLOOR);
+    match p == price {
+        true if x > 0.0 => price.saturating_add(1).min(u32::MAX as Mc),
+        true if x < 0.0 => (price - 1).max(PRICE_FLOOR),
+        _ => p,
+    }
+}
+
+/// Where a good's price starts here: the lower median of what members
+/// announce for it, or the floor.
+pub fn start(announced: &[u32]) -> Mc {
+    let mut v: Vec<u32> = announced.iter().copied().filter(|p| *p > 0).collect();
+    if v.is_empty() {
+        return PRICE_FLOOR;
+    }
+    v.sort_unstable();
+    v[(v.len() - 1) / 2] as Mc
+}
+
+/// A provider's next price here: a step from `current` (or the floor)
+/// with `per_day` spread over `hours` as supply.
+pub fn provider_price(per_day: u32, current: Option<Mc>, demand: f64, hours: f64) -> Mc {
+    flow_step(
+        current.unwrap_or(PRICE_FLOOR),
+        demand,
+        per_day as f64 / 24.0 * hours,
+        hours,
+    )
+}
+
+/// Paid requests this node received since the last refresh, per good.
+pub struct Demand {
+    inner: std::sync::Mutex<(std::time::Instant, HashMap<String, f64>)>,
+}
+
+impl Default for Demand {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new((std::time::Instant::now(), HashMap::new())),
+        }
+    }
+}
+
+impl Demand {
+    pub fn note(&self, good: &str, n: u32) {
+        *self
+            .inner
+            .lock()
+            .unwrap()
+            .1
+            .entry(good.to_string())
+            .or_default() += n as f64;
+    }
+
+    /// The counts and the hours they cover; starts a new period.
+    pub fn take(&self) -> (HashMap<String, f64>, f64) {
+        let mut g = self.inner.lock().unwrap();
+        let hours = (g.0.elapsed().as_secs_f64() / 3600.0).max(1e-6);
+        g.0 = std::time::Instant::now();
+        (std::mem::take(&mut g.1), hours)
     }
 }
 
@@ -119,56 +189,27 @@ pub fn capacity(scanners: &[Scanner]) -> Capacity {
     }
 }
 
-/// Half price while the scanners idle, double when they are saturated.
-pub fn load(utilization: f64) -> f64 {
-    2f64.powf(2.0 * utilization.clamp(0.0, 1.0) - 1.0)
-}
-
-/// The unit price in mc: the price at which what the cluster earns in a
-/// day buys what it can serve in a day (half of every payment survives,
-/// so an earned credit is spent twice on average), moved by the scanners'
-/// load. None: nobody announces lookup capacity.
-pub fn unit(earned_per_day: Mc, lookups_per_day: f64, utilization: f64) -> Option<Mc> {
-    if lookups_per_day <= 0.0 {
-        return None;
-    }
-    let u = earned_per_day as f64 / (0.5 * lookups_per_day) * load(utilization);
-    Some((u.round().clamp(0.0, UNIT_MAX as f64) as Mc).clamp(UNIT_MIN, UNIT_MAX))
-}
-
-/// What one lookup of `provider` costs here, in mc: its weight times the
-/// unit times this node's surge for it, at least 1 mc; nothing for a free
-/// provider. Without a unit, what is served is priced from the floor.
-pub fn price(provider: &str, unit: Option<Mc>, surge: u32) -> u32 {
-    let w = weight_milli(provider) as u64;
-    if w == 0 {
-        return 0;
-    }
-    let p = w * unit.unwrap_or(UNIT_MIN) * surge.max(1) as u64 / 1000;
-    p.clamp(1, u32::MAX as u64) as u32
-}
-
 /// One provider as this node serves it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Offer {
     pub provider: String,
     pub price_mc: u32,
-    pub surge: u32,
-    /// On-demand lookups a day; None: no budget, no limit.
-    pub on_demand: Option<u32>,
+    /// Paid lookups a day it serves (`share::Shares::allowance`).
+    pub on_demand: u32,
 }
 
 /// This node's prices and what they were computed from.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Table {
     pub at_ms: u64,
-    /// What all members earned a day over the last 7 days (E).
-    pub earned_per_day: Mc,
-    /// Weighted on-demand lookups a day the cluster announces (C).
-    pub lookups_per_day: f64,
     pub capacity: Capacity,
-    pub load: f64,
-    pub unit: Option<Mc>,
+    /// Funded scan jobs waiting in the cluster, as arbiters announce them.
+    pub scan_bids: u32,
+    pub scan_mc: u32,
+    /// None: this node does not probe.
+    pub probe_mc: Option<u32>,
+    /// What resolving a name for another member costs here.
+    pub resolve_mc: u32,
     pub offers: Vec<Offer>,
 }
 
@@ -176,24 +217,35 @@ pub struct Table {
 pub type Announced = Vec<(String, u32)>;
 
 impl Table {
-    pub fn price_of(&self, provider: &str) -> Option<u32> {
-        self.offers
-            .iter()
-            .find(|o| o.provider == provider)
-            .map(|o| o.price_mc)
+    pub fn price_of(&self, good: &str) -> Option<u32> {
+        match good {
+            SCAN => Some(self.scan_mc).filter(|p| *p > 0),
+            PROBE => self.probe_mc,
+            RESOLVE => Some(self.resolve_mc).filter(|p| *p > 0),
+            _ => self
+                .offers
+                .iter()
+                .find(|o| o.provider == good)
+                .map(|o| o.price_mc),
+        }
     }
 
     /// What the heartbeat carries: `(on_demand, prices)`.
     pub fn announced(&self) -> (Announced, Announced) {
+        let mut prices: Announced = self
+            .offers
+            .iter()
+            .map(|o| (o.provider.clone(), o.price_mc))
+            .collect();
+        if self.resolve_mc > 0 {
+            prices.push((RESOLVE.to_string(), self.resolve_mc));
+        }
         (
             self.offers
                 .iter()
-                .filter_map(|o| Some((o.provider.clone(), o.on_demand?)))
+                .map(|o| (o.provider.clone(), o.on_demand))
                 .collect(),
-            self.offers
-                .iter()
-                .map(|o| (o.provider.clone(), o.price_mc))
-                .collect(),
+            prices,
         )
     }
 }
@@ -268,8 +320,34 @@ pub async fn scanners(node: &Node, left_out: &HashSet<NodeId>) -> Result<Vec<Sca
     Ok(out)
 }
 
-/// Compute this node's prices from what it holds and hears now, keep
-/// them, and announce them with the next heartbeat.
+/// Kept across restarts.
+fn price_key(good: &str) -> String {
+    format!("price:{good}")
+}
+
+/// Where `good`'s next step starts: the last price here, the kept one,
+/// or what members announce.
+async fn current(node: &Node, old: &Table, good: &str, announced: &[u32]) -> Result<Mc> {
+    if let Some(p) = old.price_of(good).filter(|p| *p > 0) {
+        return Ok(p as Mc);
+    }
+    if let Some(p) = node
+        .store
+        .intel_get(&price_key(good))
+        .await?
+        .and_then(|v| v.parse::<Mc>().ok())
+    {
+        return Ok(p.max(PRICE_FLOOR));
+    }
+    Ok(start(announced))
+}
+
+fn as_mc(p: Mc) -> u32 {
+    p.min(u32::MAX as Mc) as u32
+}
+
+/// Step this node's prices from the demand it counted and the supply it
+/// has, keep them, and announce them with the next heartbeat.
 pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let book = super::book_fresh(node).await?;
     let left_out: HashSet<NodeId> = book
@@ -279,61 +357,99 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         .map(|(id, _)| *id)
         .collect();
     let capacity = capacity(&scanners(node, &left_out).await?);
-    let empty = vec![];
-    let providers = node.lookup_providers().unwrap_or(&empty);
-    let shares = node.lookup_shares();
-    // What this node serves, and what it adds to the cluster's capacity.
-    let mut own: Vec<(String, u32, Option<u32>)> = vec![];
-    let mut weighted: u64 = 0;
-    for p in providers.iter().filter(|p| p.ready()) {
-        let (on_demand, surge) = match shares {
-            Some(s) => (s.allowance(p.as_ref()), s.surge(p.as_ref()).await?),
-            None => (None, 1),
-        };
-        weighted += weight_milli(p.name()) as u64 * on_demand.unwrap_or(0) as u64;
-        own.push((p.name().to_string(), surge, on_demand));
-    }
-    // And every live member that can be asked and is not left out here.
+    let (demand, hours) = node.market.take();
+    let old = node.price_table();
+    // What live members announce, per good (for the start price), and
+    // their scan bids.
     let me = node.id();
     let members = node.members();
+    let mut announced: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut bids: u64 = node.scan_bids.load(std::sync::atomic::Ordering::Relaxed) as u64;
     for id in node.live_members(intel::LIVE_WINDOW) {
-        let askable = id != me
-            && !left_out.contains(&id)
-            && !node.is_blocked(&id)
-            && node.dial_address(&id).is_some()
-            && members
+        if id == me
+            || left_out.contains(&id)
+            || node.is_blocked(&id)
+            || !members
                 .get(&id)
-                .is_some_and(|m| m.proto_max >= crate::cluster::rpc::proto::OWNER_PROTO);
-        if !askable {
+                .is_some_and(|m| super::pay::pays_with(m.proto_max))
+        {
             continue;
         }
-        if let Some(k) = node.status.known(&id) {
-            for (provider, n) in &k.hb.on_demand {
-                if intel::provider_info(provider).is_some() {
-                    weighted += weight_milli(provider) as u64 * *n as u64;
-                }
-            }
+        let Some(k) = node.status.known(&id) else {
+            continue;
+        };
+        for (p, mc) in &k.hb.prices {
+            announced.entry(p.clone()).or_default().push(*mc);
         }
+        if let Some(mc) = k.hb.scan_price_mc {
+            announced.entry(SCAN.into()).or_default().push(mc);
+        }
+        if let Some(mc) = k.hb.probe_price_mc {
+            announced.entry(PROBE.into()).or_default().push(mc);
+        }
+        bids += k.hb.scan_bids as u64;
     }
-    let lookups_per_day = weighted as f64 / 1000.0;
-    let earned_per_day = book.earned_per_day();
-    let unit = unit(earned_per_day, lookups_per_day, capacity.utilization);
+    let none = vec![];
+    let ann = |g: &str| announced.get(g).unwrap_or(&none).clone();
+    let got = |g: &str| demand.get(g).copied().unwrap_or(0.0);
+    let empty = vec![];
+    let providers = node.lookup_providers().unwrap_or(&empty);
+    let offer_per_day = node
+        .lookup_shares()
+        .map_or(crate::config::DEFAULT_OFFER_PER_DAY, |s| s.offer_per_day());
+    let mut offers = vec![];
+    for p in providers.iter().filter(|p| p.ready()) {
+        let on_demand = node
+            .lookup_shares()
+            .map_or(offer_per_day, |s| s.allowance(p.as_ref()));
+        let cur = current(node, &old, p.name(), &ann(p.name())).await?;
+        offers.push(Offer {
+            provider: p.name().to_string(),
+            price_mc: as_mc(provider_price(on_demand, Some(cur), got(p.name()), hours)),
+            on_demand,
+        });
+    }
+    let resolve_cur = current(node, &old, RESOLVE, &ann(RESOLVE)).await?;
+    let resolve_mc = as_mc(flow_step(
+        resolve_cur,
+        got(RESOLVE),
+        offer_per_day as f64 / 24.0 * hours,
+        hours,
+    ));
+    let probe_mc = match node.prober() {
+        Some(pr) => {
+            let cur = current(node, &old, PROBE, &ann(PROBE)).await?;
+            Some(as_mc(flow_step(
+                cur,
+                got(PROBE),
+                pr.slots() as f64 * PROBES_PER_SLOT_HOUR * hours,
+                hours,
+            )))
+        }
+        None => None,
+    };
+    // Funded jobs waiting now (a stock, not a flow over `hours`) against
+    // what the scanners do in an hour: a full step.
+    let scan_cur = current(node, &old, SCAN, &ann(SCAN)).await?;
+    let scan_mc = as_mc(step(scan_cur, bids as f64, capacity.per_day / 24.0));
+    for (good, mc) in offers
+        .iter()
+        .map(|o| (o.provider.as_str(), o.price_mc))
+        .chain(probe_mc.map(|m| (PROBE, m)))
+        .chain([(SCAN, scan_mc), (RESOLVE, resolve_mc)])
+    {
+        node.store
+            .intel_set(&price_key(good), &mc.to_string())
+            .await?;
+    }
     let table = Arc::new(Table {
         at_ms: crate::cluster::hlc::wall_ms(),
-        earned_per_day,
-        lookups_per_day,
-        load: load(capacity.utilization),
         capacity,
-        unit,
-        offers: own
-            .into_iter()
-            .map(|(provider, surge, on_demand)| Offer {
-                price_mc: price(&provider, unit, surge),
-                provider,
-                surge,
-                on_demand,
-            })
-            .collect(),
+        scan_bids: bids.min(u32::MAX as u64) as u32,
+        scan_mc,
+        probe_mc,
+        resolve_mc,
+        offers,
     });
     node.set_price_table(table.clone());
     Ok(table)
@@ -363,15 +479,6 @@ mod tests {
             jobs_7d: jobs,
             ended_24h: day,
         }
-    }
-
-    #[test]
-    fn the_load_factor_runs_from_a_half_to_double() {
-        assert_eq!(load(0.0), 0.5);
-        assert_eq!(load(0.5), 1.0);
-        assert_eq!(load(1.0), 2.0);
-        assert_eq!(load(7.0), 2.0, "bounded");
-        assert_eq!(load(-1.0), 0.5);
     }
 
     #[test]
@@ -419,37 +526,85 @@ mod tests {
     }
 
     #[test]
-    fn the_unit_price_is_what_the_days_earnings_buy_of_the_days_capacity() {
-        // The spec's example: 20 credits a day, 200 weighted lookups a day.
-        assert_eq!(unit(20_000, 200.0, 0.5), Some(200));
-        assert_eq!(unit(20_000, 200.0, 0.0), Some(100), "idle scanners: half");
-        assert_eq!(unit(20_000, 200.0, 1.0), Some(400), "saturated: double");
-        assert_eq!(price(intel::ABUSEIPDB, Some(200), 1), 200);
-        assert_eq!(price(intel::SHODAN, Some(200), 1), 200);
-        assert_eq!(price(intel::GREYNOISE, Some(200), 1), 200);
-        assert_eq!(price(intel::INTERNETDB, Some(200), 1), 50);
-        assert_eq!(price(intel::MAXMIND, Some(200), 1), 50);
-        assert_eq!(price(intel::TOR, Some(200), 8), 0, "free");
-        assert_eq!(price(intel::ABUSEIPDB, Some(200), 4), 800, "surge");
-        // Doubling the earnings doubles the price; doubling the capacity
-        // halves it.
-        assert_eq!(unit(40_000, 200.0, 0.5), Some(400));
-        assert_eq!(unit(20_000, 400.0, 0.5), Some(100));
-        // No earnings yet: the floor. Far too many: the ceiling.
-        assert_eq!(unit(0, 200.0, 0.5), Some(UNIT_MIN));
-        assert_eq!(unit(u64::MAX / 4, 1.0, 1.0), Some(UNIT_MAX));
-        // Nobody announces capacity: no unit; what has no budget is priced
-        // from the floor, and a price is never less than 1 mc.
-        assert_eq!(unit(20_000, 0.0, 0.5), None);
-        assert_eq!(price(intel::MAXMIND, None, 1), 2);
-        assert_eq!(price(intel::MAXMIND, Some(1), 1), 1);
+    fn a_price_follows_the_imbalance_within_a_bounded_step() {
+        assert_eq!(step(1000, 10.0, 10.0), 1000, "balanced");
+        assert!(step(1000, 20.0, 10.0) > 1000);
+        assert!(step(1000, 5.0, 10.0) < 1000);
+        // Up by at most e^(0.15 × 3); down by at most e^(−0.15), as no
+        // demand at all is one supply's worth below it.
+        assert_eq!(
+            step(1000, 1e9, 10.0),
+            (1000.0 * (0.45f64).exp()).round() as Mc
+        );
+        assert_eq!(
+            step(1000, 0.0, 1e9),
+            (1000.0 * (-0.15f64).exp()).round() as Mc
+        );
+        // Excess supply ends at the floor, never below; no supply counts as 1.
+        let mut p = 1000;
+        for _ in 0..200 {
+            p = step(p, 0.0, 50.0);
+        }
+        assert_eq!(p, PRICE_FLOOR);
+        assert_eq!(step(3, 0.0, 50.0), 2, "rounding does not hold it");
+        assert!(step(PRICE_FLOOR, 5.0, 0.0) > PRICE_FLOOR);
     }
 
     #[test]
-    fn a_probe_costs_four_units_and_doubles_while_a_slot_is_busy() {
-        assert_eq!(weight_milli(PROBE), 4000);
-        assert_eq!(price(PROBE, Some(1000), 1), 4000);
-        assert_eq!(price(PROBE, Some(1000), 2), 8000);
+    fn a_short_period_moves_a_flow_price_by_its_share_of_a_step() {
+        // One minute with no demand at all: at most e^(−0.15/60) down,
+        // where a full step would take e^(−0.15).
+        let minute = 1.0 / 60.0;
+        let p = provider_price(240, Some(100_000), 0.0, minute);
+        let bound = (100_000.0 * (-0.15f64 / 60.0).exp()).round() as Mc;
+        assert!(p < 100_000, "it still moves: {p}");
+        assert!(p >= bound, "{p} moved past {bound}");
+        assert!(step(100_000, 0.0, 10.0) < bound - 10_000, "a full step");
+        // An hour or longer: one full step, never more.
+        assert_eq!(flow_step(100_000, 0.0, 10.0, 1.0), step(100_000, 0.0, 10.0));
+        assert_eq!(flow_step(100_000, 0.0, 10.0, 5.0), step(100_000, 0.0, 10.0));
+        // A small price still moves by the 1 mc minimum.
+        assert_eq!(flow_step(5, 0.0, 4.0, minute), 4);
+    }
+
+    #[test]
+    fn a_new_good_starts_at_the_median_announced_or_the_floor() {
+        assert_eq!(start(&[]), PRICE_FLOOR);
+        assert_eq!(start(&[300, 100, 200]), 200);
+        assert_eq!(start(&[100, 400]), 100, "lower median");
+        assert_eq!(start(&[0, 0]), PRICE_FLOOR);
+    }
+
+    #[test]
+    fn demand_is_counted_and_taken() {
+        let d = Demand::default();
+        d.note("abuseipdb", 2);
+        d.note("abuseipdb", 1);
+        d.note(PROBE, 1);
+        let (got, hours) = d.take();
+        assert_eq!(got.get("abuseipdb"), Some(&3.0));
+        assert_eq!(got.get(PROBE), Some(&1.0));
+        assert!(hours > 0.0 && hours < 0.01);
+        assert!(d.take().0.is_empty(), "taken");
+    }
+
+    #[test]
+    fn every_provider_follows_its_supply() {
+        assert_eq!(
+            provider_price(240, None, 3.0, 1.0),
+            step(PRICE_FLOOR, 3.0, 10.0)
+        );
+        assert_eq!(provider_price(240, Some(500), 10.0, 1.0), 500);
+        assert_eq!(provider_price(0, Some(500), 1.0, 1.0), step(500, 1.0, 0.0));
+        assert!(
+            provider_price(240, Some(1), 0.0, 1.0) >= PRICE_FLOOR,
+            "never free"
+        );
+        // A generous node (high offer_per_day) gets cheaper under the same demand.
+        assert!(
+            provider_price(24_000, Some(500), 50.0, 1.0)
+                < provider_price(240, Some(500), 50.0, 1.0)
+        );
     }
 
     #[test]
@@ -459,14 +614,12 @@ mod tests {
                 Offer {
                     provider: intel::ABUSEIPDB.into(),
                     price_mc: 200,
-                    surge: 1,
-                    on_demand: Some(200),
+                    on_demand: 200,
                 },
                 Offer {
                     provider: intel::MAXMIND.into(),
                     price_mc: 50,
-                    surge: 1,
-                    on_demand: None,
+                    on_demand: 1000,
                 },
             ],
             ..Default::default()
@@ -474,7 +627,13 @@ mod tests {
         assert_eq!(t.price_of(intel::ABUSEIPDB), Some(200));
         assert_eq!(t.price_of(intel::SHODAN), None);
         let (on_demand, prices) = t.announced();
-        assert_eq!(on_demand, [(intel::ABUSEIPDB.to_string(), 200)]);
+        assert_eq!(
+            on_demand,
+            [
+                (intel::ABUSEIPDB.to_string(), 200),
+                (intel::MAXMIND.to_string(), 1000)
+            ]
+        );
         assert_eq!(prices.len(), 2);
     }
 }

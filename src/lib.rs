@@ -176,6 +176,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         n.set_lookup_shares(credits::share::Shares::new(
             store.clone(),
             cfg.enrichment.on_demand_share,
+            cfg.enrichment.offer_per_day,
         ));
     }
     tokio::spawn(intel::enrich_loop(
@@ -270,6 +271,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // changes and takeover of silent arbiters' queues (scanners), then the
     // RPC listener and sync loops.
     if let Some(node) = &node {
+        node.set_scan_share(cfg.credits.scan_share);
         scan::arbiter::Arbiter::start(node.clone(), shutdown_rx.clone()).await?;
         cluster::remote::serve(node, settings.clone());
         cluster::owner::fleet::serve(node);

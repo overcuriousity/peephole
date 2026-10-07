@@ -206,7 +206,7 @@ async fn intel_chunk(
     }
 }
 
-/// On-demand enrichment for a member: paid with the offer it names, or free providers only.
+/// On-demand enrichment for a member, paid with the offer it names.
 async fn lookup(
     State(node): State<Arc<Node>>,
     Extension(Peer(peer)): Extension<Peer>,
@@ -215,26 +215,14 @@ async fn lookup(
     Cbor(crate::intel::lookup::serve(&node, peer, &req).await).into_response()
 }
 
-/// A host name resolved for a member by this node's resolver. Free, at
-/// most [`crate::credits::pay::FREE_PER_HOUR`] an hour per asker; it never
-/// scans, probes or stores anything.
+/// A host name resolved for a member, paid with the offer it names; it
+/// never scans, probes or stores anything.
 async fn resolve(
     State(node): State<Arc<Node>>,
     Extension(Peer(peer)): Extension<Peer>,
     Cbor(req): Cbor<crate::intel::dns::ResolveReq>,
 ) -> Response {
-    use crate::intel::dns::{ResolveResp, resolve_here, valid_name};
-    let resp = match valid_name(&req.name) {
-        None => ResolveResp::refused("not a host name"),
-        Some(_) if !node.take_free_resolve(peer) => {
-            ResolveResp::refused("too many resolutions from your node this hour")
-        }
-        Some(name) => match resolve_here(&name).await {
-            Ok(addrs) => ResolveResp { addrs, error: None },
-            Err(e) => ResolveResp::refused(&e),
-        },
-    };
-    Cbor(resp).into_response()
+    Cbor(crate::intel::dns::serve_resolve(&node, peer, &req).await).into_response()
 }
 
 /// An observational probe for a member, paid with the offer it names.

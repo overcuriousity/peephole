@@ -102,10 +102,10 @@ nmap.
   documents its public endpoints at `/api` (linked in the footer).
 - **Lookup** (admin) — everything the dataset holds on one address, and
   every provider the cluster can reach about it, now. In a cluster,
-  lookups are paid with credits that completed counter-scans earn; an
-  answer under 24 hours old comes from the dataset for free, and paid
-  answers about recorded addresses are kept. On a standalone node, your
-  own providers, shown once.
+  lookups, probes and scan jobs are paid with credits; scanners earn most
+  of them, every member a little. An answer under 24 hours old comes from
+  the dataset for free, and paid answers about recorded addresses are
+  kept. On a standalone node, your own providers, shown once.
 - **Cluster** — several operators can share one dataset over mutual TLS:
   requests, the scan queue, results and lookups. Each node runs any mix of
   trap, scanner and web roles and decides for itself whom it trusts. A node

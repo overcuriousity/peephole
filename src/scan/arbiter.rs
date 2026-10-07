@@ -34,7 +34,7 @@ struct Lease {
     expires: Instant,
 }
 
-type Waiter = (NodeId, Vec<u8>, oneshot::Sender<Option<Grant>>);
+type Waiter = (NodeId, Vec<u8>, u32, oneshot::Sender<Option<Grant>>);
 
 pub struct Arbiter {
     node: Arc<Node>,
@@ -128,8 +128,11 @@ impl Arbiter {
 
     async fn handle(self: Arc<Self>, from: NodeId, msg: Msg) -> Option<Msg> {
         match msg {
-            Msg::Claim { exclude_levels } => Some(Msg::ClaimReply {
-                grant: self.claim(from, exclude_levels).await,
+            Msg::Claim {
+                exclude_levels,
+                min_mc,
+            } => Some(Msg::ClaimReply {
+                grant: self.claim(from, exclude_levels, min_mc).await,
             }),
             Msg::Renew { job_uid } => Some(Msg::RenewReply {
                 ok: self.renew(from, &job_uid),
@@ -146,11 +149,16 @@ impl Arbiter {
     }
 
     /// Wait for the claim window, then get a job or nothing.
-    async fn claim(self: &Arc<Self>, scanner: NodeId, exclude: Vec<u8>) -> Option<Grant> {
+    async fn claim(
+        self: &Arc<Self>,
+        scanner: NodeId,
+        exclude: Vec<u8>,
+        min_mc: u32,
+    ) -> Option<Grant> {
         let (tx, rx) = oneshot::channel();
         let first = {
             let mut w = self.waiting.lock().unwrap();
-            w.push((scanner, exclude, tx));
+            w.push((scanner, exclude, min_mc, tx));
             w.len() == 1
         };
         if first {
@@ -181,15 +189,20 @@ impl Arbiter {
         let _g = self.assign.lock().await;
         let mut waiters = std::mem::take(&mut *self.waiting.lock().unwrap());
         let mut load = HashMap::new();
-        for (s, _, _) in &waiters {
+        for (s, _, _, _) in &waiters {
             if !load.contains_key(s) {
                 load.insert(*s, self.scans_last_hour(s).await);
             }
         }
         // Fewest recent scans first; ties broken by key so it is stable.
-        waiters.sort_by_key(|(s, _, _)| (load[s], *s));
-        for (scanner, exclude, tx) in waiters {
-            let grant = self.next_job(scanner, &exclude).await?;
+        waiters.sort_by_key(|(s, _, _, _)| (load[s], *s));
+        // One book for the round; what each funded grant commits is
+        // carried to the next, so the budget is never overspent.
+        let mut funding = crate::credits::jobs::Funding::default();
+        for (scanner, exclude, min_mc, tx) in waiters {
+            let grant = self
+                .next_job_for(&mut funding, scanner, &exclude, min_mc)
+                .await?;
             if let Some(g) = &grant {
                 *load.get_mut(&scanner).unwrap() += 1;
                 info!(job = %g.job_uid, ip = %g.ip, scanner = %scanner.short(), "scan job granted");
@@ -197,6 +210,29 @@ impl Arbiter {
             let _ = tx.send(grant);
         }
         Ok(())
+    }
+
+    /// [`Self::next_job`], funded with an offer to `scanner` when this
+    /// node's scan budget and `min_mc` allow (`credits::jobs::fund`).
+    async fn next_job_for(
+        &self,
+        funding: &mut crate::credits::jobs::Funding,
+        scanner: NodeId,
+        exclude: &[u8],
+        min_mc: u32,
+    ) -> Result<Option<Grant>> {
+        let Some(mut g) = self.next_job(scanner, exclude).await? else {
+            return Ok(None);
+        };
+        if let Some((seq, price)) =
+            crate::credits::jobs::fund(&self.node, funding, scanner, &g.job_uid, min_mc).await
+        {
+            g.offer_seq = Some(seq);
+            g.price_mc = price;
+            info!(job = %g.job_uid, scanner = %scanner.short(),
+                price = %crate::credits::show(price as u64), "scan job funded");
+        }
+        Ok(Some(g))
     }
 
     /// Take our next queued job for `scanner` and mark it running.
@@ -309,6 +345,8 @@ impl Arbiter {
             ip,
             level,
             lease_secs: self.lease.as_secs().max(1),
+            offer_seq: None,
+            price_mc: 0,
         }))
     }
 
@@ -728,6 +766,26 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let arbiter = Arbiter::start(node.clone(), rx).await.unwrap();
         (node, arbiter, store, tx)
+    }
+
+    #[tokio::test]
+    async fn no_budget_grants_without_an_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        node.set_scan_share(1.0);
+        let rec = Recorder::Cluster(node.clone());
+        let ip = store
+            .upsert_ip("203.0.113.94".parse().unwrap())
+            .await
+            .unwrap();
+        rec.enqueue_scan(ip.id, 2, 24).await.unwrap();
+        let scanner = Identity::generate().unwrap().id;
+        let g = arbiter
+            .next_job_for(&mut Default::default(), scanner, &[], 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((g.offer_seq, g.price_mc), (None, 0));
     }
 
     async fn status(store: &crate::store::Store, uid: &str) -> String {

@@ -65,9 +65,9 @@ pub struct Offer {
     /// The balance in credits (the fleet's, when this node has an owner).
     pub balance: Option<String>,
     pub fleet: bool,
-    /// The cheap tier, asked by every lookup.
+    /// This node's own providers (free here), asked by every lookup.
     pub quotes: Vec<QuoteView>,
-    /// What a lookup costs at most: the cheap tier's total.
+    /// What a lookup costs at most: their total.
     pub total: String,
     /// The providers asked only when told to, with their prices.
     pub paid: Vec<QuoteView>,
@@ -76,10 +76,10 @@ pub struct Offer {
 }
 
 impl Offer {
-    /// Split the cluster's quotes (the cheapest of each provider) into the
-    /// cheap tier and the paid providers.
+    /// Split the cluster's quotes (the cheapest of each provider) into
+    /// what this node answers itself and the paid providers.
     pub fn from_quotes(all: &HashMap<String, Vec<crate::credits::pay::Quote>>) -> Offer {
-        let cheap = crate::intel::lookup::cheap();
+        let cheap = crate::intel::lookup::cheap(all);
         let (mut quotes, mut paid) = (vec![], vec![]);
         let (mut total, mut paid_total) = (0u64, 0u64);
         for info in crate::intel::KNOWN_PROVIDERS {
@@ -230,15 +230,15 @@ impl IpForm {
         f
     }
 
-    /// The paid providers named, `*` standing for every one of them.
+    /// The providers named, `*` standing for every known one: those this
+    /// node answers itself are asked here first, free, and of members
+    /// only as a fallback.
     fn asked(&self) -> Vec<String> {
         let ask = self.ask.as_deref().unwrap_or_default();
         if ask.iter().any(|a| a == "*") {
-            let cheap = crate::intel::lookup::cheap();
             return crate::intel::KNOWN_PROVIDERS
                 .iter()
                 .map(|p| p.name.to_string())
-                .filter(|n| !cheap.contains(n))
                 .collect();
         }
         ask.iter().filter(|a| !a.is_empty()).cloned().collect()
@@ -751,15 +751,17 @@ secure_cookies = false
                 }],
             )
         };
+        // This node answers Tor, GeoLite2 and InternetDB itself (free);
+        // AbuseIPDB only a member serves.
         let all: HashMap<_, _> = [
             quote(crate::intel::TOR, 0),
-            quote(crate::intel::MAXMIND, 10),
-            quote(crate::intel::INTERNETDB, 20),
+            quote(crate::intel::MAXMIND, 0),
+            quote(crate::intel::INTERNETDB, 0),
             quote(crate::intel::ABUSEIPDB, 100),
         ]
         .into();
         let offer = Offer::from_quotes(&all);
-        assert_eq!(offer.total, "0.03");
+        assert_eq!(offer.total, crate::credits::show(0));
         assert_eq!(offer.quotes.len(), 3);
         assert_eq!(offer.paid.len(), 1);
         assert_eq!(offer.paid[0].provider, crate::intel::ABUSEIPDB);
@@ -767,10 +769,12 @@ secure_cookies = false
         assert_eq!(offer.paid_total, "0.10");
         let f = IpForm::parse(b"ip=203.0.113.9&ask=abuseipdb&ask=shodan");
         assert_eq!(f.asked(), ["abuseipdb", "shodan"]);
-        assert!(
-            !IpForm::parse(b"ask=*")
-                .asked()
-                .contains(&crate::intel::TOR.to_string())
-        );
+        // Every known provider, those this node answers itself included
+        // (asked here first, free).
+        let every = IpForm::parse(b"ask=*").asked();
+        assert_eq!(every.len(), crate::intel::KNOWN_PROVIDERS.len());
+        assert!(every.contains(&crate::intel::TOR.to_string()));
+        assert!(every.contains(&crate::intel::ABUSEIPDB.to_string()));
+        assert!(every.contains(&crate::intel::SHODAN.to_string()));
     }
 }

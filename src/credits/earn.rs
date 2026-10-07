@@ -1,10 +1,10 @@
-//! Earning: a completed counter-scan pays its scanner and the trap that
-//! queued the job. A node judges each payable scan once, when the requests
-//! behind it have had time to arrive (`judge`, stored in `credit_scans`),
-//! and decides what it pays at every recomputation of the ledger (`pay`),
-//! because that depends on the other scans and on who earns here now.
-use super::ledger::Earned;
-use super::{DAY_MS, Mc};
+//! Earning: a completed counter-scan counts for its scanner's share of
+//! the day's mint (`credits::mint`). A node judges each payable scan
+//! once, when the requests behind it have had time to arrive (`judge`,
+//! stored in `credit_scans`), and decides what counts at every
+//! recomputation of the ledger (`pay`), because that depends on the
+//! other scans and on who earns here now.
+use super::DAY_MS;
 use crate::classify::Classifier;
 use crate::cluster::hlc::{self, physical_ms};
 use crate::cluster::identity::NodeId;
@@ -16,9 +16,9 @@ use std::collections::HashMap;
 /// A scan is judged this long after its result arrived here, so the
 /// requests behind it have had time to replicate.
 pub const JUDGE_AFTER_SECS: i64 = 600;
-/// Paid scans per node, role and UTC day.
+/// Counted scans per scanner and UTC day.
 pub const PER_NODE_PER_DAY: u32 = 500;
-/// One paid scan per IP in this window, cluster-wide. Fixed here, not a
+/// One counted scan per IP in this window, cluster-wide. Fixed here, not a
 /// node's rescan cooldown: that is each node's own setting and can be 0.
 pub const IP_WINDOW_MS: u64 = DAY_MS;
 /// Scans judged per pass.
@@ -211,109 +211,95 @@ pub struct Gates {
     pub no_scanner_share: HashMap<NodeId, String>,
 }
 
-/// What one judged scan pays.
+/// What one judged scan counts for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Paid {
     pub scan: Judged,
-    pub scanner_mc: Mc,
-    pub trap_mc: Mc,
-    /// Why the share is not the full one of the scan's level; empty when
+    /// Its weight in its scanner's share of the day's mint: 0 when it does
+    /// not count.
+    pub weight: u8,
+    /// Why the weight is not the full one of the scan's level; empty when
     /// it is.
-    pub scanner_note: String,
-    pub trap_note: String,
+    pub note: String,
 }
 
-/// `(scanner, trap)` shares of a tier: 1 for levels 1 and 2, 2 for 3 and 4.
-fn tier_shares(tier: u8) -> (Mc, Mc) {
-    match tier {
-        2 => (2000, 500),
-        _ => (1000, 250),
-    }
+/// The weight of a tier: 1 for levels 1 and 2, 2 for 3 and 4.
+fn tier_weight(tier: u8) -> u8 {
+    if tier == 2 { 2 } else { 1 }
 }
 
-/// Decide what every judged scan pays. A pure function of its input: the
-/// scans are walked in the order of their HLCs (then uids), whatever
+/// Decide what every judged scan counts for. A pure function of its input:
+/// the scans are walked in the order of their HLCs (then uids), whatever
 /// order they are given in.
 pub fn pay(scans: &[Judged], gates: &Gates) -> Vec<Paid> {
     let mut order: Vec<&Judged> = scans.iter().collect();
     order.sort_by(|a, b| (a.hlc, &a.scan_uid).cmp(&(b.hlc, &b.scan_uid)));
-    // Per IP: when its 24-hour window opened, and the tier paid in it.
+    // Per IP: when its 24-hour window opened, and the tier counted in it.
     let mut windows: HashMap<&str, (u64, u8)> = HashMap::new();
-    // Paid scans per node, UTC day and role (0 scanner, 1 trap).
-    let mut counts: HashMap<(NodeId, u32, u8), u32> = HashMap::new();
+    // Counted scans per scanner and UTC day.
+    let mut counts: HashMap<(NodeId, u32), u32> = HashMap::new();
     let mut out = Vec::with_capacity(order.len());
     for s in order {
         let mut p = Paid {
             scan: s.clone(),
-            scanner_mc: 0,
-            trap_mc: 0,
-            scanner_note: String::new(),
-            trap_note: String::new(),
+            weight: 0,
+            note: String::new(),
         };
         if s.level == 0 {
-            let why = format!("no request held here backs a scan of {}", s.ip);
-            p.scanner_note = why.clone();
-            p.trap_note = why;
+            p.note = format!("no request held here backs a scan of {}", s.ip);
+            out.push(p);
+            continue;
+        }
+        if s.scanner == s.trap {
+            p.note = "a scan of its own job".into();
             out.push(p);
             continue;
         }
         let tier = if s.level >= 3 { 2 } else { 1 };
         let ms = physical_ms(s.hlc);
         let mut note = String::new();
-        let (scanner, trap) = match windows.get_mut(s.ip.as_str()) {
-            Some((start, paid_tier)) if ms < *start + IP_WINDOW_MS => {
-                if tier > *paid_tier {
-                    let (hi, lo) = (tier_shares(tier), tier_shares(*paid_tier));
-                    *paid_tier = tier;
-                    note = "the difference to the scan this IP was already paid for".into();
-                    (hi.0 - lo.0, hi.1 - lo.1)
+        let weight = match windows.get_mut(s.ip.as_str()) {
+            Some((start, counted_tier)) if ms < *start + IP_WINDOW_MS => {
+                if tier > *counted_tier {
+                    let w = tier_weight(tier) - tier_weight(*counted_tier);
+                    *counted_tier = tier;
+                    note = "the difference to the scan this IP already counted for".into();
+                    w
                 } else {
-                    note = "this IP was already paid within 24 hours".into();
-                    (0, 0)
+                    note = "this IP already counted within 24 hours".into();
+                    0
                 }
             }
             _ => {
                 windows.insert(s.ip.as_str(), (ms, tier));
-                tier_shares(tier)
+                tier_weight(tier)
             }
         };
         if note.is_empty() && s.level < s.job_level {
             note = format!(
-                "paid as level {}: no request held here backs level {}",
+                "counted as level {}: no request held here backs level {}",
                 s.level, s.job_level
             );
         }
-        (p.scanner_mc, p.trap_mc) = (scanner, trap);
-        p.scanner_note = note.clone();
-        p.trap_note = note;
+        p.weight = weight;
+        p.note = note;
         if !s.args_ok {
-            p.scanner_mc = 0;
-            p.scanner_note = "arguments differ from the built-in ones".into();
+            p.weight = 0;
+            p.note = "arguments differ from the built-in ones".into();
         }
         if let Some(why) = gates
             .no_shares
             .get(&s.scanner)
             .or_else(|| gates.no_scanner_share.get(&s.scanner))
         {
-            p.scanner_mc = 0;
-            p.scanner_note = format!("not earning here: {why}");
+            p.weight = 0;
+            p.note = format!("not earning here: {why}");
         }
-        if let Some(why) = gates.no_shares.get(&s.trap) {
-            p.trap_mc = 0;
-            p.trap_note = format!("not earning here: {why}");
-        }
-        let day = super::day_of(s.hlc);
-        for (node, role, mc, why) in [
-            (s.scanner, 0u8, &mut p.scanner_mc, &mut p.scanner_note),
-            (s.trap, 1u8, &mut p.trap_mc, &mut p.trap_note),
-        ] {
-            if *mc == 0 {
-                continue;
-            }
-            let n = counts.entry((node, day, role)).or_insert(0);
+        if p.weight > 0 {
+            let n = counts.entry((s.scanner, super::day_of(s.hlc))).or_insert(0);
             if *n >= PER_NODE_PER_DAY {
-                *mc = 0;
-                *why = "daily limit reached".into();
+                p.weight = 0;
+                p.note = "daily limit reached".into();
             } else {
                 *n += 1;
             }
@@ -321,22 +307,6 @@ pub fn pay(scans: &[Judged], gates: &Gates) -> Vec<Paid> {
         out.push(p);
     }
     out
-}
-
-/// What `paid` gives the ledger: one earning per share that is not nothing.
-pub fn earned(paid: &[Paid]) -> Vec<Earned> {
-    paid.iter()
-        .flat_map(|p| {
-            [(p.scan.scanner, p.scanner_mc), (p.scan.trap, p.trap_mc)]
-                .into_iter()
-                .filter(|(_, mc)| *mc > 0)
-                .map(|(node, mc)| Earned {
-                    node,
-                    hlc: p.scan.hlc,
-                    mc,
-                })
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -369,52 +339,47 @@ mod tests {
         }
     }
 
-    fn shares(p: &Paid) -> (Mc, Mc) {
-        (p.scanner_mc, p.trap_mc)
+    fn weights(p: &[Paid]) -> Vec<u8> {
+        p.iter().map(|p| p.weight).collect()
     }
 
     #[test]
-    fn shares_by_level() {
+    fn weights_by_level_and_no_trap_share() {
         let scans: Vec<Judged> = (1..=4u8)
             .map(|l| scan(l as u32, &format!("203.0.113.{l}"), at(DAY, l as u64), l))
             .collect();
-        let paid = pay(&scans, &Gates::default());
-        let got: Vec<(Mc, Mc)> = paid.iter().map(shares).collect();
-        assert_eq!(got, [(1000, 250), (1000, 250), (2000, 500), (2000, 500)]);
-        assert!(
-            paid.iter()
-                .all(|p| p.scanner_note.is_empty() && p.trap_note.is_empty())
-        );
-        let e = earned(&paid);
-        assert_eq!(e.len(), 8);
-        assert_eq!(
-            e.iter()
-                .filter(|x| x.node == id(1))
-                .map(|x| x.mc)
-                .sum::<Mc>(),
-            6000
-        );
-        assert_eq!(
-            e.iter()
-                .filter(|x| x.node == id(2))
-                .map(|x| x.mc)
-                .sum::<Mc>(),
-            1500
-        );
-        assert_eq!(e[0].hlc, at(DAY, 1), "dated like the scan");
+        let w: Vec<u8> = pay(&scans, &Gates::default())
+            .iter()
+            .map(|p| p.weight)
+            .collect();
+        assert_eq!(w, [1, 1, 2, 2]);
     }
 
     #[test]
-    fn one_paid_scan_per_ip_in_24_hours() {
+    fn a_scan_of_its_own_job_does_not_count() {
+        let mut s = scan(1, "203.0.113.5", at(DAY, 1), 2);
+        s.trap = s.scanner;
+        let p = &pay(&[s], &Gates::default())[0];
+        assert_eq!(p.weight, 0);
+        assert_eq!(p.note, "a scan of its own job");
+        // It does not open the IP's window either.
+        let mut own = scan(1, "203.0.113.5", at(DAY, 1), 2);
+        own.trap = own.scanner;
+        let real = scan(2, "203.0.113.5", at(DAY, 9), 2);
+        assert_eq!(weights(&pay(&[own, real], &Gates::default())), [0, 1]);
+    }
+
+    #[test]
+    fn one_counted_scan_per_ip_in_24_hours() {
         let ip = "203.0.113.9";
         let scans = [
             scan(1, ip, at(DAY, 0), 2),
             // Within the window: nothing.
             scan(2, ip, at(DAY, 600), 1),
-            // A higher tier pays the difference, once.
+            // A higher tier counts the difference, once.
             scan(3, ip, at(DAY, 700), 3),
             scan(4, ip, at(DAY, 800), 4),
-            // 24 hours after the first: paid again (the window did not
+            // 24 hours after the first: counted again (the window did not
             // move with the scans in between).
             scan(5, ip, at(DAY + 1, 0), 1),
             // Another address is not affected.
@@ -422,23 +387,18 @@ mod tests {
         ];
         let paid = pay(&scans, &Gates::default());
         let by_uid = |u: &str| paid.iter().find(|p| p.scan.scan_uid == u).unwrap();
-        assert_eq!(shares(by_uid("s1")), (1000, 250));
-        assert_eq!(shares(by_uid("s2")), (0, 0));
+        assert_eq!(by_uid("s1").weight, 1);
+        assert_eq!(by_uid("s2").weight, 0);
         assert!(
             by_uid("s2")
-                .scanner_note
-                .contains("already paid within 24 hours")
+                .note
+                .contains("already counted within 24 hours")
         );
-        assert!(
-            by_uid("s2")
-                .trap_note
-                .contains("already paid within 24 hours")
-        );
-        assert_eq!(shares(by_uid("s3")), (1000, 250));
-        assert!(by_uid("s3").scanner_note.contains("difference"));
-        assert_eq!(shares(by_uid("s4")), (0, 0));
-        assert_eq!(shares(by_uid("s5")), (1000, 250));
-        assert_eq!(shares(by_uid("s6")), (1000, 250));
+        assert_eq!(by_uid("s3").weight, 1);
+        assert!(by_uid("s3").note.contains("difference"));
+        assert_eq!(by_uid("s4").weight, 0);
+        assert_eq!(by_uid("s5").weight, 1);
+        assert_eq!(by_uid("s6").weight, 1);
         // The result does not depend on the order the scans are given in.
         let mut rev = scans.to_vec();
         rev.reverse();
@@ -446,8 +406,8 @@ mod tests {
     }
 
     #[test]
-    fn the_five_hundred_and_first_scan_of_a_day_pays_nothing_in_that_role() {
-        let mut scans: Vec<Judged> = (0..501u32)
+    fn the_five_hundred_and_first_scan_of_a_day_counts_for_nothing() {
+        let scans: Vec<Judged> = (0..501u32)
             .map(|n| {
                 scan(
                     n,
@@ -457,22 +417,20 @@ mod tests {
                 )
             })
             .collect();
-        // The last one was queued by another trap, which is not at its limit.
-        scans[500].trap = id(3);
         let paid = pay(&scans, &Gates::default());
-        assert_eq!(shares(&paid[499]), (1000, 250));
-        assert_eq!(shares(&paid[500]), (0, 250));
-        assert!(paid[500].scanner_note.contains("daily limit"));
+        assert_eq!(paid[499].weight, 1);
+        assert_eq!(paid[500].weight, 0);
+        assert!(paid[500].note.contains("daily limit"));
         // The next UTC day starts a new count.
         let next = pay(
             &[scan(600, "192.0.2.1", at(DAY + 1, 0), 1)],
             &Gates::default(),
         );
-        assert_eq!(shares(&next[0]), (1000, 250));
+        assert_eq!(next[0].weight, 1);
     }
 
     #[test]
-    fn arguments_evidence_and_gates_take_shares_away() {
+    fn arguments_evidence_and_gates_take_the_weight_away() {
         let mut other_args = scan(1, "203.0.113.1", at(DAY, 1), 2);
         other_args.args_ok = false;
         // Asked for level 4; the requests held here back level 2.
@@ -481,42 +439,27 @@ mod tests {
         let mut none = scan(3, "203.0.113.3", at(DAY, 3), 0);
         none.job_level = 2;
         let paid = pay(&[other_args, capped, none], &Gates::default());
-        assert_eq!(
-            shares(&paid[0]),
-            (0, 250),
-            "the trap is paid, the scanner is not"
-        );
-        assert!(paid[0].scanner_note.contains("arguments differ"));
-        assert!(paid[0].trap_note.is_empty());
-        assert_eq!(
-            shares(&paid[1]),
-            (1000, 250),
-            "paid as the level it is backed for"
-        );
-        assert!(
-            paid[1].scanner_note.contains("backs level 4"),
-            "{}",
-            paid[1].scanner_note
-        );
-        assert_eq!(shares(&paid[2]), (0, 0));
-        assert!(paid[2].scanner_note.contains("no request held here backs"));
-        // A scan that pays nothing opens no window: a real one later does.
+        assert_eq!(weights(&paid), [0, 1, 0]);
+        assert!(paid[0].note.contains("arguments differ"));
+        assert!(paid[1].note.contains("backs level 4"), "{}", paid[1].note);
+        assert!(paid[2].note.contains("no request held here backs"));
+        // A scan that counts nothing opens no window: a real one later does.
         let later = [
             scan(3, "203.0.113.3", at(DAY, 3), 0),
             scan(4, "203.0.113.3", at(DAY, 9), 1),
         ];
-        assert_eq!(shares(&pay(&later, &Gates::default())[1]), (1000, 250));
+        assert_eq!(weights(&pay(&later, &Gates::default())), [0, 1]);
 
         // A node that does not earn here, and one whose audits fail.
         let scans = [scan(1, "203.0.113.1", at(DAY, 1), 3)];
         let mut gates = Gates::default();
         gates
             .no_shares
-            .insert(id(2), "rules: disagree on 12% of 500".into());
+            .insert(id(1), "rules: disagree on 12% of 500".into());
         let p = pay(&scans, &gates);
-        assert_eq!(shares(&p[0]), (2000, 0));
+        assert_eq!(p[0].weight, 0);
         assert!(
-            p[0].trap_note
+            p[0].note
                 .contains("not earning here: rules: disagree on 12% of 500")
         );
         let mut gates = Gates::default();
@@ -524,8 +467,12 @@ mod tests {
             .no_scanner_share
             .insert(id(1), "audits: 3 of 5 differ".into());
         let p = pay(&scans, &gates);
-        assert_eq!(shares(&p[0]), (0, 500));
-        assert!(p[0].scanner_note.contains("audits: 3 of 5 differ"));
+        assert_eq!(p[0].weight, 0);
+        assert!(p[0].note.contains("audits: 3 of 5 differ"));
+        // A gate on the trap does not matter: it earns nothing from a scan.
+        let mut gates = Gates::default();
+        gates.no_shares.insert(id(2), "blocked".into());
+        assert_eq!(pay(&scans, &gates)[0].weight, 2);
         // A gated scan does not use up the daily limit of its node.
         let mut many: Vec<Judged> = (0..500u32)
             .map(|n| {
@@ -541,10 +488,7 @@ mod tests {
             s.args_ok = false;
         }
         many.push(scan(900, "192.0.2.9", at(DAY, 900), 1));
-        assert_eq!(
-            shares(pay(&many, &Gates::default()).last().unwrap()),
-            (1000, 0)
-        );
+        assert_eq!(pay(&many, &Gates::default()).last().unwrap().weight, 1);
     }
 
     /// Rows as replication leaves them for one finished job.

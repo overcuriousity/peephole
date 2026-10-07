@@ -23,14 +23,12 @@ pub struct Earned {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OfferState {
-    /// Written, no receipt yet, not 15 minutes old.
+    /// Written, no receipt yet, not past its lifetime ([`Offer::ttl_ms`]).
     Open,
     Charged {
         charged: Mc,
-        to_server: Mc,
-        destroyed: Mc,
     },
-    /// 15 minutes passed without a receipt: everything went back.
+    /// Its lifetime passed without a receipt: everything went back.
     Lapsed,
 }
 
@@ -51,9 +49,20 @@ pub struct Offer {
     pub state: OfferState,
     /// The providers its receipt names.
     pub answered: Vec<String>,
+    /// The scan job it funds; None: a lookup or probe.
+    pub job: Option<String>,
 }
 
 impl Offer {
+    /// How long it may wait for its receipt.
+    pub fn ttl_ms(&self) -> u64 {
+        if self.job.is_some() {
+            super::JOB_OFFER_TTL_MS
+        } else {
+            OFFER_TTL_MS
+        }
+    }
+
     pub fn held_now(&self) -> Mc {
         self.held.iter().map(|(_, mc)| mc).sum()
     }
@@ -75,10 +84,8 @@ pub struct Tally {
     pub earned: Mc,
     /// Charged to it for lookups.
     pub spent: Mc,
-    /// Its half of what it charged others.
+    /// What it charged others.
     pub served: Mc,
-    /// The half of its payments that went to nobody.
-    pub destroyed: Mc,
     pub sent: Mc,
     pub received: Mc,
 }
@@ -96,6 +103,30 @@ pub struct Ledger {
     pub week: HashMap<NodeId, Tally>,
     /// The UTC day balances are read for.
     pub today: u32,
+}
+
+/// The parts of `mc` drawn from `lots` (`(day, mc)`, oldest first as
+/// [`Ledger::by_day`] gives them), oldest first, leaving out the lots of
+/// days before `first_day`; None when they do not hold that much (or
+/// `mc` is nothing).
+pub fn parts_from(lots: &[(u32, Mc)], mc: Mc, first_day: u32) -> Option<Vec<(u32, u32)>> {
+    if mc == 0 {
+        return None;
+    }
+    let mut left = mc;
+    let mut parts = vec![];
+    for &(day, have) in lots
+        .iter()
+        .filter(|(day, have)| *day >= first_day && *have > 0)
+    {
+        let take = have.min(left).min(u32::MAX as Mc);
+        parts.push((day, take as u32));
+        left -= take;
+        if left == 0 {
+            return Some(parts);
+        }
+    }
+    None
 }
 
 impl Ledger {
@@ -129,20 +160,7 @@ impl Ledger {
     /// The parts of an offer or transfer of `mc` by `node`, oldest lots
     /// first; None when it does not hold that much (or `mc` is nothing).
     pub fn spendable_parts(&self, node: &NodeId, mc: Mc) -> Option<Vec<(u32, u32)>> {
-        if mc == 0 {
-            return None;
-        }
-        let mut left = mc;
-        let mut parts = vec![];
-        for (day, have) in self.by_day(node) {
-            let take = have.min(left).min(u32::MAX as Mc);
-            parts.push((day, take as u32));
-            left -= take;
-            if left == 0 {
-                return Some(parts);
-            }
-        }
-        None
+        parts_from(&self.by_day(node), mc, 0)
     }
 
     pub fn offer(&self, payer: &NodeId, seq: u64) -> Option<&Offer> {
@@ -229,11 +247,11 @@ impl Walk<'_> {
         }
     }
 
-    /// Give back what offers older than 15 minutes still hold.
+    /// Give back what offers past their lifetime still hold.
     fn lapse(&mut self, now_ms: u64) {
         for i in 0..self.l.offers.len() {
             let o = &self.l.offers[i];
-            if o.state != OfferState::Open || now_ms <= physical_ms(o.hlc) + OFFER_TTL_MS {
+            if o.state != OfferState::Open || now_ms <= physical_ms(o.hlc) + o.ttl_ms() {
                 continue;
             }
             let (payer, held) = (o.payer, std::mem::take(&mut self.l.offers[i].held));
@@ -244,7 +262,7 @@ impl Walk<'_> {
         }
     }
 
-    fn offer(&mut self, e: &Entry, to: NodeId, parts: &[(u32, u32)]) {
+    fn offer(&mut self, e: &Entry, to: NodeId, parts: &[(u32, u32)], job: &Option<String>) {
         let mut held = vec![];
         for (day, mc) in parts {
             let lot = self.lot(e.origin, *day);
@@ -265,6 +283,7 @@ impl Walk<'_> {
             held,
             state: OfferState::Open,
             answered: vec![],
+            job: job.clone(),
         });
     }
 
@@ -282,34 +301,24 @@ impl Walk<'_> {
                 && o.to == e.origin
                 && o.state == OfferState::Open
                 && e.hlc > o.hlc
-                && physical_ms(e.hlc) <= physical_ms(o.hlc) + OFFER_TTL_MS
+                && physical_ms(e.hlc) <= physical_ms(o.hlc) + o.ttl_ms()
         }) else {
             return;
         };
         let held = std::mem::take(&mut self.l.offers[i].held);
         let mut left = charged.min(held.iter().map(|(_, mc)| mc).sum());
-        let (paid, mut to_server) = (left, 0);
+        let paid = left;
         for (day, mc) in held {
             let take = mc.min(left);
             left -= take;
-            let half = take / 2;
-            to_server += half;
-            *self.lot(e.origin, day) += half;
+            *self.lot(e.origin, day) += take;
             *self.lot(payer, day) += mc - take;
         }
-        let destroyed = paid - to_server;
         let o = &mut self.l.offers[i];
         o.answered = answered.to_vec();
-        o.state = OfferState::Charged {
-            charged: paid,
-            to_server,
-            destroyed,
-        };
-        self.tally(payer, e.hlc, |t| {
-            t.spent += paid;
-            t.destroyed += destroyed;
-        });
-        self.tally(e.origin, e.hlc, |t| t.served += to_server);
+        o.state = OfferState::Charged { charged: paid };
+        self.tally(payer, e.hlc, |t| t.spent += paid);
+        self.tally(e.origin, e.hlc, |t| t.served += paid);
     }
 
     fn transfer(&mut self, e: &Entry, to: NodeId, parts: &[(u32, u32)]) {
@@ -373,8 +382,8 @@ pub fn run(
                     continue;
                 }
                 match &e.kind {
-                    Kind::Offer { to, parts } if parts_ok(parts, day_of(e.hlc)) => {
-                        w.offer(e, *to, parts)
+                    Kind::Offer { to, parts, job } if parts_ok(parts, day_of(e.hlc)) => {
+                        w.offer(e, *to, parts, job)
                     }
                     Kind::Transfer { to, parts }
                         if *to != e.origin && parts_ok(parts, day_of(e.hlc)) =>
@@ -441,6 +450,20 @@ mod tests {
             Kind::Offer {
                 to: id(to),
                 parts: parts.to_vec(),
+                job: None,
+            },
+        )
+    }
+
+    fn job_offer(origin: u8, seq: u64, hlc: u64, to: u8, parts: &[(u32, u32)]) -> Entry {
+        entry(
+            origin,
+            seq,
+            hlc,
+            Kind::Offer {
+                to: id(to),
+                parts: parts.to_vec(),
+                job: Some(format!("job{seq}")),
             },
         )
     }
@@ -493,9 +516,9 @@ mod tests {
             now(DAY + 7, 60),
         );
         let (all, week) = (l.tally(&id(1)), l.week_tally(&id(1)));
-        assert_eq!((all.earned, all.spent, all.destroyed), (1300, 500, 250));
-        assert_eq!((week.earned, week.spent, week.destroyed), (300, 100, 50));
-        assert_eq!(l.week_tally(&id(2)).served, 50);
+        assert_eq!((all.earned, all.spent), (1300, 500));
+        assert_eq!((week.earned, week.spent), (300, 100));
+        assert_eq!(l.week_tally(&id(2)).served, 100);
     }
 
     #[test]
@@ -509,24 +532,17 @@ mod tests {
             now(DAY, 60),
         );
         assert_eq!(l.balance(&id(1)), 600);
-        assert_eq!(l.balance(&id(2)), 200, "half goes to the server");
+        assert_eq!(l.balance(&id(2)), 400, "the server gets what is charged");
         assert_eq!(l.held(&id(1)), 0);
         let o = l.offer(&id(1), 5).unwrap();
-        assert_eq!(
-            o.state,
-            OfferState::Charged {
-                charged: 400,
-                to_server: 200,
-                destroyed: 200
-            }
-        );
+        assert_eq!(o.state, OfferState::Charged { charged: 400 });
         assert_eq!(o.answered, vec!["abuseipdb".to_string()]);
         let (t1, t2) = (l.tally(&id(1)), l.tally(&id(2)));
-        assert_eq!((t1.earned, t1.spent, t1.destroyed), (1000, 400, 200));
-        assert_eq!(t2.served, 200);
-        assert_eq!(l.circulating(), 800);
-        // The server's half is of the same day's lot as what was paid.
-        assert_eq!(l.by_day(&id(2)), vec![(DAY, 200)]);
+        assert_eq!((t1.earned, t1.spent), (1000, 400));
+        assert_eq!(t2.served, 400);
+        assert_eq!(l.circulating(), 1000);
+        // What the server got is of the same day's lot as what was paid.
+        assert_eq!(l.by_day(&id(2)), vec![(DAY, 400)]);
     }
 
     #[test]
@@ -548,7 +564,7 @@ mod tests {
             ],
             now(DAY, 12),
         );
-        assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (0, 150));
+        assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (0, 300));
         // An offer on nothing holds nothing, and nothing goes below zero.
         let l = ledger(
             &[],
@@ -571,7 +587,7 @@ mod tests {
         );
         // Oldest lot first: all 100 of yesterday, 50 of today.
         assert_eq!(l.by_day(&id(1)), vec![(DAY, 450)]);
-        assert_eq!(l.by_day(&id(2)), vec![(DAY - 1, 50), (DAY, 25)]);
+        assert_eq!(l.by_day(&id(2)), vec![(DAY - 1, 100), (DAY, 50)]);
         // A receipt of nothing frees everything at once.
         let l = ledger(
             &[earn(1, DAY, 0, 500)],
@@ -607,7 +623,7 @@ mod tests {
             &[es[0].clone(), receipt(2, 1, at(DAY, 25), 1, 5, 300)],
             now(DAY, 30),
         );
-        assert_eq!(on_time.balance(&id(2)), 150);
+        assert_eq!(on_time.balance(&id(2)), 300);
         // A receipt dated before its offer does not.
         let early = ledger(
             &earned,
@@ -642,7 +658,7 @@ mod tests {
             now(DAY, 14),
         );
         assert_eq!(l.balance(&id(3)), 0, "not the node the offer was made to");
-        assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (400, 50));
+        assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (400, 100));
         // A receipt that names no offer does nothing.
         let l = ledger(
             &earned,
@@ -653,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn an_offer_to_oneself_costs_half() {
+    fn an_offer_to_oneself_costs_nothing() {
         let l = ledger(
             &[earn(1, DAY, 0, 500)],
             &[
@@ -662,7 +678,7 @@ mod tests {
             ],
             now(DAY, 12),
         );
-        assert_eq!(l.balance(&id(1)), 400);
+        assert_eq!(l.balance(&id(1)), 500);
     }
 
     #[test]
@@ -729,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn halves_round_down_and_the_remainder_is_destroyed() {
+    fn a_receipt_moves_the_full_amount() {
         let l = ledger(
             &[earn(1, DAY - 1, 0, 3), earn(1, DAY, 0, 10)],
             &[
@@ -738,16 +754,53 @@ mod tests {
             ],
             now(DAY, 12),
         );
-        // 3 → 1 to the server, 2 destroyed; 4 → 2 and 2.
-        assert_eq!(l.by_day(&id(2)), vec![(DAY - 1, 1), (DAY, 2)]);
+        assert_eq!(l.by_day(&id(2)), vec![(DAY - 1, 3), (DAY, 4)]);
         assert_eq!(
             l.offer(&id(1), 5).unwrap().state,
-            OfferState::Charged {
-                charged: 7,
-                to_server: 3,
-                destroyed: 4
-            }
+            OfferState::Charged { charged: 7 }
         );
+        assert_eq!((l.tally(&id(1)).spent, l.tally(&id(2)).served), (7, 7));
+    }
+
+    #[test]
+    fn a_job_offer_lapses_after_the_longest_run() {
+        let earned = [earn(1, DAY, 0, 500)];
+        // Charged four hours later: still open, so it counts.
+        let l = ledger(
+            &earned,
+            &[
+                job_offer(1, 5, at(DAY, 10), 2, &[(DAY, 200)]),
+                receipt(2, 1, at(DAY, 250), 1, 5, 200),
+            ],
+            now(DAY, 260),
+        );
+        assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (300, 200));
+        assert_eq!(l.offer(&id(1), 5).unwrap().job.as_deref(), Some("job5"));
+        // Never charged: held until MAX_RUN_SECS + margin, then returned.
+        let lapse_min = 10 + crate::credits::JOB_OFFER_TTL_MS / 60_000;
+        let open = ledger(
+            &earned,
+            &[job_offer(1, 5, at(DAY, 10), 2, &[(DAY, 200)])],
+            now(DAY, lapse_min),
+        );
+        assert_eq!(open.balance(&id(1)), 300);
+        assert_eq!(open.offer(&id(1), 5).unwrap().state, OfferState::Open);
+        let gone = ledger(
+            &earned,
+            &[job_offer(1, 5, at(DAY, 10), 2, &[(DAY, 200)])],
+            now(DAY, lapse_min + 1),
+        );
+        assert_eq!(gone.balance(&id(1)), 500);
+        // A receipt after the lapse is ignored.
+        let late = ledger(
+            &earned,
+            &[
+                job_offer(1, 5, at(DAY, 10), 2, &[(DAY, 200)]),
+                receipt(2, 1, at(DAY, lapse_min + 2), 1, 5, 200),
+            ],
+            now(DAY, lapse_min + 3),
+        );
+        assert_eq!((late.balance(&id(1)), late.balance(&id(2))), (500, 0));
     }
 
     #[test]
@@ -804,10 +857,9 @@ mod tests {
         }
         // And it is what the entries say: nothing appears from nowhere.
         let total: Mc = earned.iter().map(|e| e.mc).sum();
-        let destroyed: Mc = want.tallies.values().map(|t| t.destroyed).sum();
         let all: Mc =
             want.lots.values().sum::<Mc>() + want.offers.iter().map(Offer::held_now).sum::<Mc>();
-        assert_eq!(all + destroyed, total);
+        assert_eq!(all, total);
     }
 
     #[test]
@@ -832,5 +884,12 @@ mod tests {
         assert_eq!(l.spendable_parts(&id(1), 651), None);
         assert_eq!(l.spendable_parts(&id(1), 0), None);
         assert_eq!(l.spendable_parts(&id(2), 1), None);
+        // Lots before a first day are left out.
+        let lots = l.by_day(&id(1));
+        assert_eq!(
+            parts_from(&lots, 180, DAY - 1),
+            Some(vec![(DAY - 1, 50), (DAY, 130)])
+        );
+        assert_eq!(parts_from(&lots, 551, DAY - 1), None);
     }
 }

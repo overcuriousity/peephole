@@ -139,9 +139,9 @@ impl Prober {
             .saturating_sub(self.slots.available_permits().min(u32::MAX as usize) as u32)
     }
 
-    /// A probe is running here (the price doubles).
-    pub fn surging(&self) -> bool {
-        self.busy() >= 1
+    /// Probe slots: probes that can run here at once.
+    pub fn slots(&self) -> u32 {
+        self.max
     }
 
     /// What the gate says of `ip` here: the target, or why not.
@@ -159,12 +159,12 @@ impl Prober {
         self.gate.allowed_level(store, ip).await
     }
 
-    /// What a probe costs here now, at `table`'s unit: double while at
-    /// least one probe slot is busy. Read live by the heartbeat and by
-    /// `serve`, so the announced price and the price an offer is checked
-    /// against are the same.
+    /// What a probe costs here now: `table`'s probe price, or the floor
+    /// before the first refresh. Read by the heartbeat and by `serve`, so
+    /// the announced price and the price an offer is checked against are
+    /// the same.
     pub fn price(&self, table: &price::Table) -> u32 {
-        price::price(price::PROBE, table.unit, 1 + self.surging() as u32)
+        table.probe_mc.unwrap_or(price::PRICE_FLOOR as u32)
     }
 
     /// Run the probe of `t`; a probe that panicked yields an `error` port
@@ -207,7 +207,8 @@ impl Prober {
     }
 
     /// Cluster: validate the offer, gate, take a slot, answer at once,
-    /// then run and append the result and the receipt in one batch.
+    /// then run and append the result and the receipt in one batch. This
+    /// node's own request carries no offer: it is free, and has no receipt.
     pub async fn serve(
         self: &Arc<Self>,
         node: &Arc<Node>,
@@ -225,64 +226,83 @@ impl Prober {
                     .parse::<IpAddr>()
                     .map_err(|_| "not an IP address")
             };
-        let Some(offer_seq) = req.offer_seq else {
-            return match parsed {
-                Err(why) => declined(why, None),
-                Ok(_) => declined(
-                    "probes are paid with credits: the request carries no offer",
-                    Some(price_u32),
-                ),
-            };
-        };
         let decline = |why: String, price_mc: Option<u32>| {
-            tracing::info!(asker = %peer.short(), offer = offer_seq, ip = %req.ip, %why,
+            tracing::info!(asker = %peer.short(), offer = ?req.offer_seq, ip = %req.ip, %why,
                 "probe declined");
             declined(why, price_mc)
         };
-        let acc = match pay::accept_offer(
-            node,
-            peer,
-            offer_seq,
-            price,
-            "probe",
-            PROBE_MARGIN.as_millis() as u64,
-        )
-        .await
-        {
-            Ok(a) => a,
-            Err(Declined::TooLow { why, price_mc }) => return decline(why, Some(price_mc)),
-            Err(Declined::Why(why) | Declined::NotCovered(why)) => return decline(why, None),
+        let paid = match req.offer_seq {
+            None if peer == node.id() => None,
+            None => {
+                return match parsed {
+                    Err(why) => declined(why, None),
+                    Ok(_) => declined(
+                        "probes are paid with credits: the request carries no offer",
+                        Some(price_u32),
+                    ),
+                };
+            }
+            Some(offer_seq) => {
+                let accepted = pay::accept_offer(
+                    node,
+                    peer,
+                    offer_seq,
+                    price,
+                    "probe",
+                    PROBE_MARGIN.as_millis() as u64,
+                )
+                .await;
+                if pay::counts_as_demand(&accepted) {
+                    node.market.note(price::PROBE, 1);
+                }
+                match accepted {
+                    Ok(a) => Some((offer_seq, a)),
+                    Err(Declined::TooLow { why, price_mc }) => {
+                        return decline(why, Some(price_mc));
+                    }
+                    Err(Declined::Why(why) | Declined::NotCovered(why)) => {
+                        return decline(why, None);
+                    }
+                }
+            }
         };
         // Every decline of an accepted offer writes a receipt of nothing.
+        let release = async || {
+            if let Some((offer_seq, _)) = &paid {
+                pay::release(node, peer, *offer_seq).await;
+            }
+        };
         let ip = match parsed {
             Ok(ip) => ip,
             Err(why) => {
-                pay::release(node, peer, offer_seq).await;
+                release().await;
                 return decline(why.into(), None);
             }
         };
         let (target, running) = match self.admit(&node.store, Some(node), &ip).await {
             Ok(t) => t,
             Err(why) => {
-                pay::release(node, peer, offer_seq).await;
+                release().await;
                 return decline(why, None);
             }
         };
         let Ok(permit) = self.slots.clone().try_acquire_owned() else {
-            pay::release(node, peer, offer_seq).await;
+            release().await;
             return decline("all probe slots are busy".into(), Some(price_u32));
         };
+        let charged_mc = if paid.is_some() { price_u32 } else { 0 };
         let uid = format!("{}{}", node.id().uid_prefix(), new_uid());
         let (vantage_ip, vantage_ip_source) = vantage(&node.public_addrs(), peer == node.id(), req);
         let (me, node, group, probe_uid) =
             (self.clone(), node.clone(), req.group.clone(), uid.clone());
         tokio::spawn(async move {
+            let (offer_seq, acc) = paid.unzip();
             // The offer stays "being served", and the address "being
             // probed", until the result and the receipt are written.
             let _held = (permit, acc, running);
             let o = me.run(target).await;
             let ports = o.ports.len();
-            let result = Record::ProbeResult(ProbeResultRec {
+            let mut records = vec![Record::ProbeResult(ProbeResultRec {
                 uid: probe_uid,
                 group,
                 ip: ip.to_string(),
@@ -294,17 +314,19 @@ impl Prober {
                 rtt_min_ms: o.rtt_min_ms,
                 ports: o.ports,
                 build: crate::COMMIT.into(),
-                charged_mc: price_u32,
-            });
-            let receipt = Record::CreditReceipt {
-                payer: peer,
-                offer_seq,
-                charged_mc: price_u32,
-                answered: vec![price::PROBE.into()],
-            };
-            match repl::append(&node, &[result, receipt]).await {
+                charged_mc,
+            })];
+            if let Some(offer_seq) = offer_seq {
+                records.push(Record::CreditReceipt {
+                    payer: peer,
+                    offer_seq,
+                    charged_mc,
+                    answered: vec![price::PROBE.into()],
+                });
+            }
+            match repl::append(&node, &records).await {
                 Ok(_) => tracing::info!(asker = %peer.short(), %ip, ports,
-                    charged = %show(price), "probe served"),
+                    charged = %show(charged_mc as Mc), "probe served"),
                 Err(e) => tracing::warn!(?e, %ip, "probe result and receipt not written"),
             }
         });
@@ -408,20 +430,83 @@ mod tests {
     }
 
     #[test]
-    fn the_price_doubles_while_one_slot_is_busy() {
+    fn the_price_is_the_tables_or_the_floor() {
         let dir = tempfile::tempdir().unwrap();
         let prober = Prober::new(&config_with(dir.path(), ""), None);
-        assert!(prober.max >= 2, "the default has room for a second probe");
+        assert_eq!(prober.slots(), prober.max);
+        assert_eq!(
+            prober.price(&price::Table::default()),
+            price::PRICE_FLOOR as u32
+        );
         let table = price::Table {
-            unit: Some(1000),
+            probe_mc: Some(4000),
             ..Default::default()
         };
         assert_eq!(prober.price(&table), 4000);
-        let one = prober.slots.clone().try_acquire_owned().unwrap();
-        assert_eq!(prober.busy(), 1);
-        assert_eq!(prober.price(&table), 8000, "one busy slot surges");
-        drop(one);
-        assert_eq!(prober.price(&table), 4000);
+    }
+
+    #[tokio::test]
+    async fn this_nodes_own_request_needs_no_offer_and_charges_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let node = Node::open(crate::cluster::NodeParams {
+            identity: crate::cluster::identity::Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store: store.clone(),
+            proto: (1, 1),
+            data_dir: dir.path().to_path_buf(),
+            retention_days: 0,
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        let server = web().await;
+        let addr: IpAddr = "203.0.113.33".parse().unwrap();
+        let ip = store.upsert_ip(addr).await.unwrap();
+        requests(&store, ip.id, 3, 2).await;
+        scanned(&store, &ip.ip, &[(server.port(), "open", Some("http"))]).await;
+        let prober = Arc::new(
+            Prober::new(&config_with(dir.path(), ""), Some(node.id())).connecting_to(server.ip()),
+        );
+        let before = node.own_head.load(std::sync::atomic::Ordering::Relaxed);
+        let req = ProbeReq {
+            ip: addr.to_string(),
+            group: "g".into(),
+            offer_seq: None,
+            dialled: None,
+        };
+        let resp = prober.serve(&node, node.id(), &req).await;
+        assert!(matches!(resp, ProbeResp::Accepted { .. }), "{resp:?}");
+        let mut probes = vec![];
+        for _ in 0..100 {
+            probes = store.probes_for_ip(ip.id).await.unwrap();
+            if !probes.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(probes.len(), 1, "the probe ran");
+        assert_eq!(probes[0].charged_mc, 0);
+        // The result alone: no receipt.
+        assert_eq!(
+            node.own_head.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
+        );
+        // Another node's request without an offer is still declined.
+        let other = NodeId([9; 32]);
+        let resp = prober.serve(&node, other, &req).await;
+        assert!(matches!(resp, ProbeResp::Declined { .. }), "{resp:?}");
     }
 
     #[tokio::test]

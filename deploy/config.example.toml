@@ -96,6 +96,10 @@ refresh_after_days = 30
 # # Cluster only. A scanner runs this share of the other nodes' fresh scans
 # # again to check them (audits earn nothing; 0 = audit nothing).
 # audit_share = 0.05
+# # Cluster only. The share of this node's credits its own scan jobs may hold
+# # or pay for in a day: a funded job pays its scanner on delivery
+# # (0 = grant every job unfunded).
+# scan_share = 0.5
 
 # [abuseipdb]
 # # Abuse reports per IP (https://www.abuseipdb.com/account/api).

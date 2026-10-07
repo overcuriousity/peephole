@@ -129,6 +129,9 @@ fn punycode(input: &[char]) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolveReq {
     pub name: String,
+    /// The asker's offer for this resolution (`credits::pay`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer_seq: Option<u64>,
 }
 
 /// A node's answer: the global addresses its resolver returned, or why
@@ -138,6 +141,9 @@ pub struct ResolveResp {
     pub addrs: Vec<IpAddr>,
     #[serde(default)]
     pub error: Option<String>,
+    /// What the resolver charged, in mc.
+    #[serde(default)]
+    pub charged_mc: u32,
 }
 
 impl ResolveResp {
@@ -145,6 +151,7 @@ impl ResolveResp {
         ResolveResp {
             addrs: vec![],
             error: Some(why.to_string()),
+            charged_mc: 0,
         }
     }
 }
@@ -168,6 +175,113 @@ pub async fn resolve_here(name: &str) -> Result<Vec<IpAddr>, String> {
             Ok(set.into_iter().take(MAX_ADDRS).collect())
         }
     }
+}
+
+/// What a resolver charges for `answer` at `price`: an answer (even an
+/// empty one) costs the price, a failure nothing.
+pub fn charge_for(answer: &Result<Vec<IpAddr>, String>, price: u32) -> u32 {
+    if answer.is_ok() { price } else { 0 }
+}
+
+/// Resolve `req.name` for `peer`, paid with the offer it names.
+pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> ResolveResp {
+    use crate::credits::{pay, price};
+    let Some(name) = valid_name(&req.name) else {
+        // An offer that came with it goes back, as with every refusal.
+        if let Some(seq) = req.offer_seq {
+            pay::release(node, peer, seq).await;
+        }
+        return ResolveResp::refused("not a host name");
+    };
+    let Some(seq) = req.offer_seq else {
+        return ResolveResp::refused(
+            "resolving a name is paid with credits: the request carries no offer",
+        );
+    };
+    let Some(cost) = node.price_table().price_of(price::RESOLVE) else {
+        pay::release(node, peer, seq).await;
+        return ResolveResp::refused("this node has no resolution price yet; ask again later");
+    };
+    let accepted = pay::accept_offer(
+        node,
+        peer,
+        seq,
+        cost as u64,
+        "resolve",
+        pay::SERVE_MARGIN_MS,
+    )
+    .await;
+    if pay::counts_as_demand(&accepted) {
+        node.market.note(price::RESOLVE, 1);
+    }
+    if let Err(d) = accepted {
+        let why = match d {
+            pay::Declined::Why(w) | pay::Declined::NotCovered(w) => w,
+            pay::Declined::TooLow { why, .. } => why,
+        };
+        return ResolveResp::refused(&why);
+    }
+    let taken = match node.lookup_shares() {
+        Some(s) => s.take_good(price::RESOLVE).await.unwrap_or(false),
+        None => true,
+    };
+    if !taken {
+        pay::release(node, peer, seq).await;
+        return ResolveResp::refused("this node's resolutions for others are used up for today");
+    }
+    let answer = resolve_here(&name).await;
+    let charged = charge_for(&answer, cost);
+    let receipt = Record::CreditReceipt {
+        payer: peer,
+        offer_seq: seq,
+        charged_mc: charged,
+        answered: if charged > 0 {
+            vec![price::RESOLVE.into()]
+        } else {
+            vec![]
+        },
+    };
+    let charged = match crate::cluster::repl::append(node, &[receipt]).await {
+        Ok(_) => charged,
+        Err(e) => {
+            tracing::warn!(?e, "resolve receipt not written");
+            0
+        }
+    };
+    match answer {
+        Ok(addrs) => ResolveResp {
+            addrs,
+            error: None,
+            charged_mc: charged,
+        },
+        Err(e) => ResolveResp::refused(&e),
+    }
+}
+
+/// What `id` announces for resolving a name; None: no price, or it
+/// predates the market.
+pub fn resolver_price(node: &Node, id: &NodeId) -> Option<u32> {
+    let m = node.members().get(id).cloned()?;
+    if !crate::credits::pay::pays_with(m.proto_max) {
+        return None;
+    }
+    node.status
+        .known(id)?
+        .hb
+        .prices
+        .iter()
+        .find(|(g, _)| g == crate::credits::price::RESOLVE)
+        .map(|(_, mc)| *mc)
+        .filter(|mc| *mc > 0)
+}
+
+/// The candidates that can be paid, in their order.
+fn keep_priced(candidates: Vec<(Resolver, bool)>) -> Vec<Resolver> {
+    candidates
+        .into_iter()
+        .filter(|(_, priced)| *priced)
+        .map(|(r, _)| r)
+        .collect()
 }
 
 /// A node that may be asked to resolve a name.
@@ -227,7 +341,13 @@ pub fn choose(node: &Node, siblings: &HashSet<NodeId>, geo: &SharedGeo) -> Vec<R
         .filter(|id| *id != me && !node.is_blocked(id) && node.dial_address(id).is_some())
         .collect();
     others.shuffle(&mut rand::rng());
-    let candidates: Vec<Resolver> = std::iter::once(me).chain(others).map(resolver).collect();
+    let others = keep_priced(
+        others
+            .into_iter()
+            .map(|id| (resolver(id), resolver_price(node, &id).is_some()))
+            .collect(),
+    );
+    let candidates: Vec<Resolver> = std::iter::once(resolver(me)).chain(others).collect();
     pick(&candidates, MAX_RESOLVERS)
 }
 
@@ -389,8 +509,16 @@ async fn ask(node: &Arc<Node>, id: NodeId, name: &str) -> (NodeId, Result<Vec<Ip
     let Some(addr) = node.dial_address(&id) else {
         return (id, Err("cannot be dialled from here".into()));
     };
+    let Some(price) = resolver_price(node, &id) else {
+        return (id, Err("announces no price for resolving".into()));
+    };
+    let seq = match crate::credits::pay::make_offer(node, id, price as u64).await {
+        Ok(seq) => seq,
+        Err(why) => return (id, Err(why)),
+    };
     let req = ResolveReq {
         name: name.to_string(),
+        offer_seq: Some(seq),
     };
     let call = node.call::<ResolveReq, ResolveResp>(id, &addr, "/rpc/v1/resolve", &req);
     let answer = match tokio::time::timeout(crate::intel::lookup::RPC_TIMEOUT, call).await {
@@ -514,5 +642,63 @@ mod tests {
         assert_eq!(ids(pick(&all, 8)), [0, 3, 7, 2, 4, 6, 1, 5]);
         assert_eq!(ids(pick(&all[..2], MAX_RESOLVERS)), [0, 1]);
         assert!(pick(&[], MAX_RESOLVERS).is_empty());
+    }
+
+    fn priced_candidate(n: u8, priced: bool) -> (Resolver, bool) {
+        (
+            Resolver {
+                id: NodeId([n; 32]),
+                name: format!("n{n}"),
+                sibling: false,
+                country: None,
+            },
+            priced,
+        )
+    }
+
+    #[test]
+    fn only_priced_market_resolvers_are_chosen() {
+        let kept = keep_priced(vec![
+            priced_candidate(1, true),
+            priced_candidate(2, false),
+            priced_candidate(3, true),
+        ]);
+        assert_eq!(
+            kept.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [NodeId([1; 32]), NodeId([3; 32])]
+        );
+    }
+
+    #[test]
+    fn a_failed_resolution_charges_nothing() {
+        assert_eq!(
+            charge_for(&Ok(vec!["203.0.113.9".parse().unwrap()]), 40),
+            40
+        );
+        assert_eq!(
+            charge_for(&Ok(vec![]), 40),
+            40,
+            "an empty answer is an answer"
+        );
+        assert_eq!(charge_for(&Err("SERVFAIL".into()), 40), 0);
+    }
+
+    #[test]
+    fn a_resolve_request_without_an_offer_encodes_like_before() {
+        #[derive(serde::Serialize)]
+        struct Old {
+            name: String,
+        }
+        let new = ResolveReq {
+            name: "example.com".into(),
+            offer_seq: None,
+        };
+        assert_eq!(
+            crate::cluster::rpc::cbor::encode(&new).unwrap(),
+            crate::cluster::rpc::cbor::encode(&Old {
+                name: "example.com".into()
+            })
+            .unwrap()
+        );
     }
 }

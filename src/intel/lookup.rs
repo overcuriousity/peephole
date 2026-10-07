@@ -10,6 +10,7 @@ use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::store::recorder::Recorder;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,10 +107,10 @@ pub async fn local(providers: &Providers, ip: &IpAddr, wanted: &[String]) -> Loo
     resp
 }
 
-/// Serve a member's request (or this node's own, `peer` being itself)
-/// with this node's providers. With an offer the request is paid
-/// (`credits::pay::serve`); without one only free providers answer, at
-/// most [`crate::credits::pay::FREE_PER_HOUR`] times an hour per asker.
+/// Serve a member's request with this node's providers. Every provider
+/// is paid between nodes: with an offer the request is served
+/// (`credits::pay::serve`); without one every provider is declined. What
+/// this node asks itself goes to [`local`], without an offer.
 pub async fn serve(node: &Arc<Node>, peer: NodeId, req: &LookupReq) -> LookupResp {
     let all = |why: &str| LookupResp {
         declined: vec![("*".into(), why.into())],
@@ -138,31 +139,18 @@ pub async fn serve(node: &Arc<Node>, peer: NodeId, req: &LookupReq) -> LookupRes
         .collect();
     let mut resp = match req.offer_seq {
         Some(seq) => crate::credits::pay::serve(node, providers, peer, ip, served, seq).await,
-        None => {
-            let (free, paid): (Vec<String>, Vec<String>) = served
+        None => LookupResp {
+            declined: served
                 .into_iter()
-                .partition(|n| crate::credits::price::weight_milli(n) == 0);
-            declined.extend(paid.into_iter().map(|n| {
-                (
-                    n,
-                    "lookups of this provider are paid with credits: the request carries no offer"
-                        .into(),
-                )
-            }));
-            if free.is_empty() {
-                LookupResp::default()
-            } else if !node.take_free_lookup(peer) {
-                LookupResp {
-                    declined: free
-                        .into_iter()
-                        .map(|n| (n, "too many free lookups from your node this hour".into()))
-                        .collect(),
-                    ..Default::default()
-                }
-            } else {
-                local(providers, &ip, &free).await
-            }
-        }
+                .map(|n| {
+                    (
+                        n,
+                        "lookups are paid with credits: the request carries no offer".into(),
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        },
     };
     resp.declined.append(&mut declined);
     resp
@@ -189,23 +177,23 @@ pub struct Outcome {
     pub kept: bool,
 }
 
-/// The providers a lookup asks without being told to: those priced at a
-/// quarter of a unit or less (see [`crate::credits::price::weight_milli`]).
-pub fn cheap() -> Vec<String> {
-    KNOWN_PROVIDERS
+/// The providers a lookup asks without being told to: those whose
+/// cheapest quote is 0, i.e. this node's own (free here).
+pub fn cheap(quotes: &HashMap<String, Vec<crate::credits::pay::Quote>>) -> Vec<String> {
+    let mut v: Vec<String> = quotes
         .iter()
-        .filter(|p| crate::credits::price::weight_milli(p.name) <= CHEAP_MILLI)
-        .map(|p| p.name.to_string())
-        .collect()
+        .filter(|(_, l)| l.first().is_some_and(|q| q.price_mc == 0))
+        .map(|(p, _)| p.clone())
+        .collect();
+    v.sort();
+    v
 }
 
-/// Heaviest weight (see [`cheap`]) a lookup asks for by itself.
-pub const CHEAP_MILLI: u32 = 250;
-
-/// Look `ip` up: first in the dataset, then at the providers. The cheap
-/// tier is asked when the dataset lacks a fresh result; `ask` names the
-/// paid providers to ask as well, `again` those to ask although the
-/// dataset has a fresh result.
+/// Look `ip` up: first in the dataset, then at the providers. This
+/// node's own providers (free here) are asked when the dataset lacks a
+/// fresh result; `ask` names the providers to ask as well, `again` those
+/// to ask although the dataset has a fresh result. Only those two are
+/// bought from other nodes.
 pub async fn run(
     rec: &Recorder,
     providers: &Providers,
@@ -237,13 +225,14 @@ pub async fn run(
             vec![]
         }
     };
-    let cheap = cheap();
+    let cheap = cheap(&crate::credits::pay::quotes(node, providers));
     let wanted: Vec<String> = known
         .into_iter()
         .filter(|p| cheap.contains(p) || ask.contains(p) || again.contains(p))
         .filter(|p| !stored.iter().any(|s| &s.provider == p))
         .collect();
-    let mut answers = crate::credits::pay::ask(node, providers, ip, &wanted).await;
+    let paid: Vec<String> = ask.iter().chain(again).cloned().collect();
+    let mut answers = crate::credits::pay::ask(node, providers, ip, &wanted, &paid).await;
     if answers.is_empty() {
         answers.push(NodeAnswer {
             node: "this node".into(),
@@ -380,19 +369,30 @@ mod tests {
     }
 
     #[test]
-    fn cheap_tier_is_tor_rdap_geolite_and_internetdb() {
-        let mut c = cheap();
-        c.sort();
-        let mut want: Vec<String> = [
-            super::super::TOR,
-            super::super::RDAP,
-            super::super::MAXMIND,
-            super::super::INTERNETDB,
+    fn cheap_tier_is_what_this_node_answers() {
+        use crate::credits::pay::Quote;
+        let q = |p: &str, server: u8, price_mc: u32| Quote {
+            provider: p.into(),
+            server: NodeId([server; 32]),
+            server_name: format!("n{server}"),
+            price_mc,
+        };
+        let quotes: HashMap<String, Vec<Quote>> = [
+            (
+                super::super::TOR.to_string(),
+                vec![q(super::super::TOR, 1, 0)],
+            ),
+            (
+                super::super::ABUSEIPDB.to_string(),
+                vec![q(super::super::ABUSEIPDB, 2, 300)],
+            ),
+            (
+                super::super::RDAP.to_string(),
+                vec![q(super::super::RDAP, 1, 0)],
+            ),
         ]
-        .map(String::from)
         .into();
-        want.sort();
-        assert_eq!(c, want);
+        assert_eq!(cheap(&quotes), [super::super::RDAP, super::super::TOR]);
     }
 
     /// A request of a node of an earlier version carries no offer and

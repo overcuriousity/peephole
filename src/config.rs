@@ -73,6 +73,18 @@ pub struct EnrichmentConfig {
     /// taken from this node's budgets.
     #[serde(default = "default_on_demand_share")]
     pub on_demand_share: f64,
+    /// Paid lookups a day this node serves of each provider without an
+    /// API budget (Tor exit list, RDAP, GeoLite2, …), and names it
+    /// resolves a day for other members.
+    #[serde(default = "default_offer_per_day")]
+    pub offer_per_day: u32,
+}
+
+/// See [`EnrichmentConfig::offer_per_day`].
+pub const DEFAULT_OFFER_PER_DAY: u32 = 1000;
+
+fn default_offer_per_day() -> u32 {
+    DEFAULT_OFFER_PER_DAY
 }
 
 fn default_refresh_days() -> f64 {
@@ -88,6 +100,7 @@ impl Default for EnrichmentConfig {
         Self {
             refresh_after_days: default_refresh_days(),
             on_demand_share: default_on_demand_share(),
+            offer_per_day: default_offer_per_day(),
         }
     }
 }
@@ -108,16 +121,25 @@ pub struct CreditsConfig {
     /// them (0 to 1; 0: this node audits nothing).
     #[serde(default = "default_audit_share")]
     pub audit_share: f64,
+    /// Share of this node's credits its own scan jobs may hold or pay for
+    /// in a day (0 to 1; 0: its jobs are granted unfunded).
+    #[serde(default = "default_scan_share")]
+    pub scan_share: f64,
 }
 
 fn default_audit_share() -> f64 {
     0.05
 }
 
+fn default_scan_share() -> f64 {
+    0.5
+}
+
 impl Default for CreditsConfig {
     fn default() -> Self {
         Self {
             audit_share: default_audit_share(),
+            scan_share: default_scan_share(),
         }
     }
 }
@@ -126,6 +148,9 @@ impl CreditsConfig {
     pub fn check(&self) -> anyhow::Result<()> {
         if !(0.0..=1.0).contains(&self.audit_share) {
             anyhow::bail!("credits.audit_share must be between 0 and 1");
+        }
+        if !(0.0..=1.0).contains(&self.scan_share) {
+            anyhow::bail!("credits.scan_share must be between 0 and 1");
         }
         Ok(())
     }
@@ -607,7 +632,9 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("public", "jitter_minutes", "5"),
     ("public", "recent_rows", "50"),
     ("enrichment", "on_demand_share", "0.2"),
+    ("enrichment", "offer_per_day", "1000"),
     ("credits", "audit_share", "0.05"),
+    ("credits", "scan_share", "0.5"),
 ];
 
 /// Sections that are required when their role is on and unused otherwise.
@@ -1514,6 +1541,22 @@ data_dir = "/tmp"
     }
 
     #[test]
+    fn the_scan_share_defaults_to_half_and_is_a_share() {
+        let base = "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert_eq!(cfg.credits.scan_share, 0.5);
+        let cfg: Config = toml::from_str(&format!("{base}[credits]\nscan_share = 0\n")).unwrap();
+        assert_eq!(cfg.credits.scan_share, 0.0);
+        assert!(cfg.credits.check().is_ok());
+        for bad in ["-0.1", "1.5"] {
+            let cfg: Config =
+                toml::from_str(&format!("{base}[credits]\nscan_share = {bad}\n")).unwrap();
+            let err = cfg.credits.check().unwrap_err().to_string();
+            assert_eq!(err, "credits.scan_share must be between 0 and 1", "{bad}");
+        }
+    }
+
+    #[test]
     fn the_on_demand_share_defaults_to_a_fifth() {
         let base = "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n";
         let cfg: Config = toml::from_str(base).unwrap();
@@ -1522,5 +1565,15 @@ data_dir = "/tmp"
         let cfg: Config =
             toml::from_str(&format!("{base}[enrichment]\non_demand_share = 1.5\n")).unwrap();
         assert!(cfg.enrichment.check().is_err());
+    }
+
+    #[test]
+    fn the_offer_per_day_defaults_to_a_thousand() {
+        let base = "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert_eq!(cfg.enrichment.offer_per_day, 1000);
+        let cfg: Config =
+            toml::from_str(&format!("{base}[enrichment]\noffer_per_day = 50\n")).unwrap();
+        assert_eq!(cfg.enrichment.offer_per_day, 50);
     }
 }

@@ -1750,6 +1750,8 @@ mod tests {
                 prices: vec![],
                 public_addrs: vec![],
                 probe_price_mc: None,
+                scan_price_mc: None,
+                scan_bids: 0,
             };
             let body = super::super::rpc::cbor::encode(&hb).unwrap();
             let signed = super::super::status::SignedHeartbeat { body, sig: vec![] };
@@ -1999,6 +2001,8 @@ mod tests {
             prices: vec![],
             public_addrs: vec![],
             probe_price_mc: None,
+            scan_price_mc: None,
+            scan_bids: 0,
         };
         let body = super::super::rpc::cbor::encode(&hb).unwrap();
         let signed = super::super::status::SignedHeartbeat { body, sig: vec![] };

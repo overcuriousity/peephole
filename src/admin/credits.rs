@@ -6,8 +6,8 @@ use crate::admin::cluster::{back_to, node};
 use crate::admin::error::{AppResult, render};
 use crate::admin::views::Chrome;
 use crate::cluster::identity::NodeId;
-use crate::credits::ledger::OfferState;
-use crate::credits::{self, show};
+use crate::credits::ledger::{Earned, OfferState};
+use crate::credits::{self, Mc, mint, show};
 use askama::Template;
 use axum::{
     Router,
@@ -15,7 +15,7 @@ use axum::{
     response::{Html, Response},
     routing::{get, post},
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 const PAGE: &str = "/admin/cluster/credits";
@@ -70,8 +70,8 @@ struct EarnedRow {
     scan: Option<i64>,
     ip: String,
     level: u8,
-    role: &'static str,
-    amount: String,
+    /// "1", "2", or a dash when the scan does not count.
+    counts: String,
     note: String,
 }
 
@@ -81,7 +81,6 @@ struct SpentRow {
     providers: String,
     offered: String,
     charged: String,
-    destroyed: String,
     state: &'static str,
 }
 
@@ -102,16 +101,25 @@ struct MemberRow {
     spent: String,
     /// Why it does not earn in full here; empty: it does.
     standing: String,
+    /// Its share of the mint and its allowances over the last 7 days.
+    minted: String,
+    allowance: String,
+    /// What it charged others over the last 7 days.
+    sales: String,
 }
 
 struct PriceView {
-    earned_per_day: String,
-    lookups_per_day: String,
+    /// What a funded scan job costs here.
+    scan: String,
+    scan_bids: u32,
+    capacity_per_hour: String,
     utilization: String,
-    load: String,
-    unit: Option<String>,
-    /// `(provider label, price, surge, on-demand a day)`.
-    offers: Vec<(String, String, u32, String)>,
+    /// What a probe costs here; None: this node does not probe.
+    probe: Option<String>,
+    /// What resolving a name for another member costs here.
+    resolve: String,
+    /// `(provider label, price, paid lookups it serves a day)`.
+    offers: Vec<(String, String, String)>,
 }
 
 #[derive(Template)]
@@ -129,12 +137,16 @@ struct CreditsPage {
     spent: Vec<SpentRow>,
     moved: Vec<MovedRow>,
     members: Vec<MemberRow>,
-    /// Earned and destroyed over the entries read, and what is in
-    /// circulation now.
-    totals: (String, String, String),
+    /// Earned over the entries read, and what is in circulation now.
+    totals: (String, String),
     price: PriceView,
     /// `(key, name)` of the members credits can be sent to.
     receivers: Vec<(String, String)>,
+    /// This node's closed days, newest first: `(date, mint share, allowance)`.
+    income: Vec<(String, String, String)>,
+    /// Today: scans of this node counted so far, and whether it recorded a
+    /// request today (so the allowance is due).
+    accruing: (u32, bool),
 }
 
 async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
@@ -187,27 +199,25 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
     let week = book.now_ms.saturating_sub(7 * credits::DAY_MS) << 16;
     let mut earned = vec![];
     for p in book.paid.iter().rev().filter(|p| p.scan.hlc >= week) {
-        for (who, role, mc, note) in [
-            (p.scan.scanner, "scanner", p.scanner_mc, &p.scanner_note),
-            (p.scan.trap, "trap", p.trap_mc, &p.trap_note),
-        ] {
-            if who != me || earned.len() >= ROWS {
-                continue;
-            }
-            let scan: Option<i64> = sqlx::query_scalar("SELECT id FROM scans WHERE uid = ?")
-                .bind(&p.scan.scan_uid)
-                .fetch_optional(&st.store.read)
-                .await?;
-            earned.push(EarnedRow {
-                at: when(p.scan.hlc),
-                scan,
-                ip: p.scan.ip.clone(),
-                level: p.scan.job_level,
-                role,
-                amount: show(mc),
-                note: note.clone(),
-            });
+        if p.scan.scanner != me || earned.len() >= ROWS {
+            continue;
         }
+        let scan: Option<i64> = sqlx::query_scalar("SELECT id FROM scans WHERE uid = ?")
+            .bind(&p.scan.scan_uid)
+            .fetch_optional(&st.store.read)
+            .await?;
+        earned.push(EarnedRow {
+            at: when(p.scan.hlc),
+            scan,
+            ip: p.scan.ip.clone(),
+            level: p.scan.job_level,
+            counts: if p.weight == 0 {
+                "\u{2014}".into()
+            } else {
+                p.weight.to_string()
+            },
+            note: p.note.clone(),
+        });
     }
     let waiting: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scans s JOIN scan_jobs j ON j.uid = s.job_uid
@@ -227,17 +237,15 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         .filter(|o| o.payer == me)
         .take(ROWS)
         .map(|o| {
-            let (charged, destroyed, state) = match &o.state {
-                OfferState::Open => (0, 0, "open"),
-                OfferState::Lapsed => (0, 0, "lapsed"),
-                OfferState::Charged {
-                    charged, destroyed, ..
-                } => (
+            let (charged, state) = match &o.state {
+                OfferState::Open => (0, "open"),
+                OfferState::Lapsed => (0, "lapsed"),
+                OfferState::Charged { charged } => (
                     *charged,
-                    *destroyed,
-                    // A server that declines, or whose providers all
-                    // failed, gives the offer back with a receipt of nothing.
-                    if *charged == 0 && o.answered.is_empty() {
+                    // A server that declines, whose providers all failed,
+                    // or a scanner that delivered nothing, gives the offer
+                    // back with a receipt of nothing.
+                    if *charged == 0 {
                         "nothing charged: declined or not answered at the server"
                     } else if o.covered < o.offered {
                         "charged (not fully covered at the server)"
@@ -252,7 +260,6 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
                 providers: o.answered.join(", "),
                 offered: show(o.offered),
                 charged: show(charged),
-                destroyed: show(destroyed),
                 state,
             }
         })
@@ -272,6 +279,36 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         })
         .collect();
 
+    let mut income: BTreeMap<u32, (Mc, Mc)> = BTreeMap::new();
+    for e in book.minted.iter().filter(|e| e.node == me) {
+        income.entry(credits::day_of(e.hlc)).or_default().0 += e.mc;
+    }
+    for e in book.allowances.iter().filter(|e| e.node == me) {
+        income.entry(credits::day_of(e.hlc)).or_default().1 += e.mc;
+    }
+    let income: Vec<(String, String, String)> = income
+        .into_iter()
+        .rev()
+        .take(credits::LOT_DAYS as usize)
+        .map(|(d, (m, a))| (date_of(d), show(m), show(a)))
+        .collect();
+    let today = (book.now_ms / credits::DAY_MS) as u32;
+    let counted = book
+        .paid
+        .iter()
+        .filter(|p| p.weight > 0 && p.scan.scanner == me && credits::day_of(p.scan.hlc) == today)
+        .count() as u32;
+    let recorded = !mint::active_days(&node.store.pool, &[me], today, today)
+        .await?
+        .is_empty();
+    let accruing = (counted, recorded);
+    let sum_week = |list: &[Earned], id: &NodeId| -> Mc {
+        list.iter()
+            .filter(|e| e.node == *id && e.hlc >= week)
+            .map(|e| e.mc)
+            .sum()
+    };
+
     let mut rows: Vec<MemberRow> = members
         .values()
         .filter(|m| m.active)
@@ -284,13 +321,15 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
                 earned: show(t.earned),
                 spent: show(t.spent),
                 standing: book.standing(&m.id).reasons().join("; "),
+                minted: show(sum_week(&book.minted, &m.id)),
+                allowance: show(sum_week(&book.allowances, &m.id)),
+                sales: show(t.served),
             }
         })
         .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     let totals = (
         show(l.week.values().map(|t| t.earned).sum()),
-        show(l.week.values().map(|t| t.destroyed).sum()),
         show(l.circulating()),
     );
 
@@ -301,25 +340,20 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             .unwrap_or_else(|| p.to_string())
     };
     let price = PriceView {
-        earned_per_day: show(t.earned_per_day),
-        lookups_per_day: format!("{:.0}", t.lookups_per_day),
+        scan: show(t.scan_mc as u64),
+        scan_bids: t.scan_bids,
+        capacity_per_hour: format!("{:.0}", t.capacity.per_day / 24.0),
         utilization: format!("{:.0}", t.capacity.utilization * 100.0),
-        load: format!("{:.2}", t.load),
-        unit: t.unit.map(show),
+        probe: t.probe_mc.map(|m| show(m as u64)),
+        resolve: show(t.resolve_mc as u64),
         offers: t
             .offers
             .iter()
             .map(|o| {
                 (
                     label(&o.provider),
-                    if o.price_mc == 0 {
-                        "free".into()
-                    } else {
-                        show(o.price_mc as u64)
-                    },
-                    o.surge,
-                    o.on_demand
-                        .map_or_else(|| "no limit".to_string(), |n| n.to_string()),
+                    show(o.price_mc as u64),
+                    o.on_demand.to_string(),
                 )
             })
             .collect(),
@@ -343,6 +377,8 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         totals,
         price,
         receivers,
+        income,
+        accruing,
     })
 }
 
@@ -388,5 +424,63 @@ mod tests {
         assert_eq!(expires_in(20_732, 20_732), "in 6 days");
         assert_eq!(expires_in(20_727, 20_732), "in 1 day");
         assert_eq!(expires_in(20_726, 20_732), "today");
+    }
+
+    #[test]
+    fn the_page_shows_where_credits_come_from() {
+        let page = CreditsPage {
+            chrome: crate::admin::views::Chrome::new(true, "admin"),
+            balance: "1250.00".into(),
+            held: "0.00".into(),
+            days: vec![],
+            fleet: None,
+            earned: vec![],
+            waiting: 0,
+            spent: vec![],
+            moved: vec![],
+            members: vec![MemberRow {
+                key: "k".into(),
+                name: "node-alpha".into(),
+                balance: "1250.00".into(),
+                earned: "255.00".into(),
+                spent: "0.00".into(),
+                standing: String::new(),
+                minted: "250.00".into(),
+                allowance: "5.00".into(),
+                sales: "1.20".into(),
+            }],
+            totals: ("255.00".into(), "812.00".into()),
+            price: PriceView {
+                scan: "0.05".into(),
+                scan_bids: 3,
+                capacity_per_hour: "40".into(),
+                utilization: "12".into(),
+                probe: None,
+                resolve: "0.01".into(),
+                offers: vec![("MaxMind GeoLite2".into(), "0.02".into(), "1000".into())],
+            },
+            receivers: vec![],
+            income: vec![("2026-10-06".into(), "250.00".into(), "5.00".into())],
+            accruing: (12, true),
+        };
+        // The template states these amounts in words.
+        assert_eq!(
+            (mint::MINT_PER_DAY, mint::ALLOWANCE_PER_DAY),
+            (1_000_000, 5_000)
+        );
+        let html = page.render().unwrap();
+        for want in [
+            "2026-10-06",
+            "250.00",
+            "5.00",
+            "1.20",
+            "812.00",
+            "0.05",
+            "12 scans counted so far",
+            "1000 credits are split among the scanners",
+        ] {
+            assert!(html.contains(want), "{want} missing");
+        }
+        assert!(!html.contains("destroyed"));
     }
 }
