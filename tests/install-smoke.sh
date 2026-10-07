@@ -3,8 +3,8 @@
 # no-op re-run, forced upgrades (an edited unit kept, the rules directory of
 # an older install left alone, database backed up), a failed upgrade that
 # rolls back, the wizard, and what is in front of the trap (nothing, nginx
-# here, a proxy elsewhere) with the port check, and the checks of the
-# trusted proxies and the admin domain.
+# here, a proxy elsewhere) with the port check, the checks of the trusted
+# proxies and the admin domain, the admin password and the nginx checks.
 # Runs as root in a throwaway Debian/Ubuntu container (CI: ubuntu:24.04).
 # PEEPHOLE_BIN is the release binary (default target/release/peephole).
 set -euo pipefail
@@ -61,9 +61,22 @@ tok="$(printf 'Sep 30 10:00:00 host peephole[123]: Open /enroll on the admin int
 echo "== the admin domain and trusted proxy entries are checked like the wizard checks them"
 [ "$(bash install.sh --check-domain 'https://Peephole.Example.net/admin/')" = peephole.example.net ]
 [ "$(bash install.sh --check-domain 'peephole.example.net.')" = peephole.example.net ]
-for d in 'not a domain' localhost 'bad"domain'; do
+label63="$(printf '%063d' 0 | tr 0 a)"
+[ "$(bash install.sh --check-domain "${label63}.example.net")" = "${label63}.example.net" ]
+# An IP address cannot be a passkey's rp_id; a label has at most 63 characters.
+for d in 'not a domain' localhost 'bad"domain' 10.0.0.5 "${label63}a.example.net"; do
     if bash install.sh --check-domain "$d" 2>/dev/null; then echo "domain '$d' accepted"; exit 1; fi
 done
+
+echo "== the nginx check of the admin domain's DNS: one of this machine's addresses, or the reason"
+[ "$(bash install.sh --check-dns peephole.example.net '203.0.113.7 2001:db8::7' '10.0.0.2 203.0.113.7')" = ok ]
+bash install.sh --check-dns peephole.example.net '2001:db8::7' '10.0.0.2,2001:db8::7' >/dev/null
+if bash install.sh --check-dns peephole.test '' '10.0.0.2' 2>/tmp/dns.err; then echo "unresolved domain passed"; exit 1; fi
+grep -q 'peephole.test does not resolve' /tmp/dns.err
+if bash install.sh --check-dns peephole.example.net '198.51.100.1' '10.0.0.2 203.0.113.7' 2>/tmp/dns.err; then
+    echo "domain pointing elsewhere passed"; exit 1
+fi
+grep -q 'points to 198.51.100.1 - not to this machine' /tmp/dns.err
 for c in 10.0.0.5 10.0.0.0/24 2001:db8::/64; do
     bash install.sh --check-cidr "$c" >/dev/null || { echo "CIDR '$c' refused"; exit 1; }
 done
@@ -233,12 +246,15 @@ reset_install() {
 echo "== wizard: trap only, behind a local nginx (answers typed at the prompts)"
 reset_install
 # trap? yes · scanner? no · web? no · in front: local · own addresses: none ·
-# cluster? no · MaxMind: skip · AbuseIPDB key · Shodan: skip · InternetDB? no
-printf 'y\nn\nn\nlocal\n\n\n\nabuse-key-1\n\nn\n' > /tmp/answers
+# nginx? no · cluster? no · MaxMind: skip · AbuseIPDB key · Shodan: skip · InternetDB? no
+printf 'y\nn\nn\nlocal\n\nn\n\n\nabuse-key-1\n\nn\n' > /tmp/answers
 # PEEPHOLE_TRUSTED_PROXIES stays preset (10.0.0.0/8): the local proxy answer replaces it, with a warning.
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard1.log 2>&1 || { cat /tmp/wizard1.log; exit 1; }
 grep -q 'PEEPHOLE_TRUSTED_PROXIES.*ignored' /tmp/wizard1.log
+# The nginx checks pass here (no domain to resolve): the default would be yes.
+grep -q 'no other site listens on port 443' /tmp/wizard1.log
+grep -q 'Set up nginx now? \[Y/n\]' /tmp/wizard1.log
 grep -q '^listener = true' /etc/peephole/config.toml
 grep -q '^scanner = false' /etc/peephole/config.toml
 grep -q '^web = false' /etc/peephole/config.toml
@@ -395,9 +411,11 @@ rm -f /etc/nginx/sites-enabled/shop /etc/nginx/sites-available/shop
 echo "== PEEPHOLE_NGINX=1, certificate refused: nginx left as it was, manual steps printed"
 reset_install; reset_nginx
 touch /tmp/certbot-fail
-PEEPHOLE_NGINX=1 PEEPHOLE_LOCAL_PROXY=1 PEEPHOLE_ACME_EMAIL=ops@peephole.test \
+PEEPHOLE_NGINX=1 PEEPHOLE_LOCAL_PROXY=1 \
     bash install.sh > /tmp/nginx-fail.log 2>&1 || { cat /tmp/nginx-fail.log; exit 1; }
-grep -q -- '-m ops@peephole.test' /tmp/certbot.log
+grep -q -- '--register-unsafely-without-email' /tmp/certbot.log
+# A preset PEEPHOLE_NGINX=1 tries despite the failing DNS check.
+grep -q 'peephole.test does not resolve' /tmp/nginx-fail.log
 grep -q 'no certificate for peephole.test' /tmp/nginx-fail.log
 test ! -e /etc/nginx/sites-available/peephole
 test ! -e /etc/nginx/peephole-stream.conf
@@ -414,6 +432,45 @@ fi
 grep -q 'PEEPHOLE_NGINX=1 needs' /tmp/nginx-refused.log
 test ! -e /usr/local/bin/peephole
 reset_nginx
+
+echo "== wizard nginx: an unresolvable domain makes the default no"
+reset_install; reset_nginx
+# Web only, the domain preset (peephole.test does not resolve); every answer at its default.
+: > /tmp/answers
+PEEPHOLE_ROLES=web PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard-nginx.log 2>&1 \
+    || { cat /tmp/wizard-nginx.log; exit 1; }
+grep -q 'does not resolve\|points to' /tmp/wizard-nginx.log
+grep -q 'Port 80 must be reachable' /tmp/wizard-nginx.log
+grep -q 'Set up nginx now? \[y/N\]' /tmp/wizard-nginx.log
+test ! -e /etc/nginx/sites-available/peephole
+test ! -e /tmp/certbot.log
+grep -q 'certbot certonly --nginx -d peephole.test' /tmp/wizard-nginx.log
+# The password question was answered no: passkeys only.
+grep -q 'Also allow signing in with a password? \[y/N\]' /tmp/wizard-nginx.log
+if grep -q 'with your password' /tmp/wizard-nginx.log; then echo "password sign-in offered though none was set"; exit 1; fi
+reset_nginx
+
+echo "== unattended password: hashed, never in the config"
+reset_install
+# shellcheck disable=SC2016  # quote, backslash, dollar sign and spaces, literally
+pw='pa"ss \ $word 12'
+PEEPHOLE_FRONT=remote PEEPHOLE_ADMIN_PASSWORD="$pw" bash install.sh > /tmp/password.log 2>&1 \
+    || { cat /tmp/password.log; exit 1; }
+if grep -q 'pa"ss' /etc/peephole/config.toml /tmp/password.log; then echo "the password was written out"; exit 1; fi
+# shellcheck disable=SC2016  # the dollar signs are literal
+sqlite3 /var/lib/peephole/peephole.db "SELECT value FROM intel_meta WHERE key='admin_password_hash'" | grep -q '^\$argon2id\$'
+[ "$(sqlite3 /var/lib/peephole/peephole.db "SELECT value FROM intel_meta WHERE key='admin_login_method'")" = both ]
+grep -q 'Sign-in: both' /tmp/password.log
+grep -q 'sign in at https://peephole.test/login with your password' /tmp/password.log
+
+echo "== unattended password: a short one is refused before anything is written"
+reset_install
+if PEEPHOLE_FRONT=remote PEEPHOLE_ADMIN_PASSWORD=short bash install.sh > /tmp/password-short.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q 'PEEPHOLE_ADMIN_PASSWORD: at least 12 characters' /tmp/password-short.log
+test ! -e /etc/peephole/config.toml
+test ! -e /usr/local/bin/peephole
 
 echo "== unattended: a bad join token does not fail the install"
 reset_install
@@ -540,8 +597,8 @@ fi
 grep -q 'port 8080 for the trap listener (127.0.0.1:8080) is in use' /tmp/port-busy.log
 test ! -e /etc/peephole/config.toml
 # in front: local · 127.0.0.1:8081 for the trap? yes · 127.0.0.1:8082 for TLS? yes ·
-# own addresses: none · cluster? no · MaxMind: skip · API keys: skip · InternetDB? no
-printf 'local\ny\ny\n\nn\n\n\n\nn\n' > /tmp/answers
+# own addresses: none · nginx? no · cluster? no · MaxMind: skip · API keys: skip · InternetDB? no
+printf 'local\ny\ny\n\nn\nn\n\n\n\nn\n' > /tmp/answers
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_TRUSTED_PROXIES PEEPHOLE_ROLES=listener \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/port-offer.log 2>&1 || { cat /tmp/port-offer.log; exit 1; }
 grep -q '^trap_listen = "127.0.0.1:8081"' /etc/peephole/config.toml

@@ -33,16 +33,22 @@
 #   PEEPHOLE_CLUSTER_ADVERTISE host:port peers dial (omit for an outbound-only node)
 #   PEEPHOLE_JOIN_TOKEN        invite from an existing member; joined before the first start
 #   PEEPHOLE_REMOTE_CONFIG     ignored (config keys were replaced by the ownership key: peephole owner adopt)
+#   PEEPHOLE_ADMIN_PASSWORD  also allow signing in to the admin site with this password, at
+#                      least 12 characters (first install, web role; it is hashed into the
+#                      database, never written to the config); unset: passkeys only
 #   PEEPHOLE_NGINX=1|0 install and configure nginx (and, with the web role, a Let's Encrypt
-#                      certificate via certbot) after peephole is up (first install; default 0;
-#                      offered for the web role and for a trap behind a local proxy)
-#   PEEPHOLE_ACME_EMAIL        contact address for Let's Encrypt (optional; with PEEPHOLE_NGINX=1)
+#                      certificate via certbot) after peephole is up (first install; offered
+#                      for the web role and for a trap behind a local proxy; asked with
+#                      default yes when its checks pass, 0 without a terminal). The
+#                      certificate is requested without a contact email.
 #   PEEPHOLE_FORCE=1   reinstall even when the installed version matches
 #   BASE_URL           alternative download base (tests, mirrors)
 #
 # Other entry points: --extract-token (reads journal output on stdin),
 # --check-domain VALUE and --check-cidr VALUE (print the admin domain as the
 # installer stores it / whether a trusted proxy entry is valid; tests),
+# --check-dns DOMAIN RESOLVED MINE (whether addresses the domain resolves to
+# include one of this machine's, as the nginx preflight decides; tests),
 # --nginx-example and --nginx-stream-example (print the nginx site and the
 # top-level stream config for PEEPHOLE_ROLES, PEEPHOLE_DOMAIN and
 # PEEPHOLE_FRONT=local|remote; deploy/nginx.example.conf and
@@ -122,16 +128,39 @@ valid_cidr() {
 
 # The admin domain as a bare lower-case host name, from what an operator
 # may paste (https://Name.Example/admin/, a trailing dot); fails on anything
-# that is no host name with at least one dot.
+# that is no host name with at least one dot, on a label longer than 63
+# characters, and on an IP address (a passkey's rp_id cannot be one): the
+# last label is never all digits.
 normalize_domain() {
-    local d="${1,,}"
+    local d="${1,,}" label
     d="${d#http://}"; d="${d#https://}"; d="${d%%/*}"; d="${d%.}"
     [[ "$d" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+    [[ "${d##*.}" =~ ^[0-9]+$ ]] && return 1
+    for label in ${d//./ }; do [ "${#label}" -le 63 ] || return 1; done
     printf '%s' "$d"
 }
 if [ "${1:-}" = "--check-domain" ]; then
     if normalize_domain "${2:-}"; then echo; exit 0; fi
     echo "'${2:-}' is not a host name" >&2; exit 1
+fi
+
+# Why a certificate request for <domain> would fail, judged from the
+# addresses it resolves to and this machine's own (both whitespace- or
+# comma-separated); nothing when one of them is this machine's.
+dns_problem() {
+    local domain="$1" resolved mine
+    resolved="$(printf '%s' "$2" | tr -s '[:space:],' '\n' | sed '/^$/d' | sort -u)"
+    mine="$(printf '%s' "$3" | tr -s '[:space:],' '\n' | sed '/^$/d' | sort -u)"
+    if [ -z "$resolved" ]; then
+        echo "${domain} does not resolve; the certificate request will fail"
+    elif [ -z "$(comm -12 <(printf '%s\n' "$resolved") <(printf '%s\n' "$mine"))" ]; then
+        echo "${domain} points to $(printf '%s' "$resolved" | paste -sd' ' -) - not to this machine; the certificate request will fail"
+    fi
+}
+if [ "${1:-}" = "--check-dns" ]; then
+    why="$(dns_problem "${2:-}" "${3:-}" "${4:-}")"
+    if [ -z "$why" ]; then echo ok; exit 0; fi
+    echo "$why" >&2; exit 1
 fi
 if [ "${1:-}" = "--check-cidr" ]; then
     if valid_cidr "${2:-}"; then echo ok; exit 0; fi
@@ -468,6 +497,10 @@ OLD_RULES_MANIFEST="${DATA_DIR}/.installed-rules.sha256"
 UNIT_MANIFEST="${DATA_DIR}/.installed-unit.sha256"
 # Units earlier installers wrote without recording them: unedited if they match.
 KNOWN_UNIT_SUMS="da20ef8147a9f2a9e704318e80ce381adc7b222fc5b21706bc1f5fd3bd4c5cb2 38da8e128f109b566c222e2b5a44ff486893981057371225ddf1bd7e1d4aa8ae"
+NGINX_SITE=/etc/nginx/sites-available/peephole
+NGINX_LINK=/etc/nginx/sites-enabled/peephole
+NGINX_DEFAULT=/etc/nginx/sites-enabled/default
+NGINX_STREAM=/etc/nginx/peephole-stream.conf
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -574,6 +607,94 @@ claim_port() {
         return 0
     fi
     die "${msg}; free it and run the installer again${hint}"
+}
+
+# --- nginx checks (asked during the questions, set up after the first start) --
+# What setup_nginx would stop at, looked at without changing anything.
+nginx_site_exists() { [ -e "$NGINX_LINK" ] || [ -e "$NGINX_SITE" ] || { stream_trap && [ -e "$NGINX_STREAM" ]; }; }
+# Sites that listen on port 443 themselves, one file per line, when the
+# stream config needs the port: they have to move behind it first (see the
+# stream example).
+nginx_other_443() {
+    stream_trap || return 0
+    grep -lsE '^[[:space:]]*listen[[:space:]]+([^;#[:space:]]*[]:])?443([[:space:];]|$)' /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf || true
+}
+# The packages setup_nginx would install, space-separated.
+nginx_packages_needed() {
+    local need=()
+    command -v nginx >/dev/null 2>&1 || need+=(nginx)
+    # The stream module, where the distribution packages it on its own.
+    if stream_trap && ! dpkg -s libnginx-mod-stream >/dev/null 2>&1 \
+            && apt-cache show libnginx-mod-stream >/dev/null 2>&1; then
+        need+=(libnginx-mod-stream)
+    fi
+    if has_role web && ! command -v certbot >/dev/null 2>&1; then need+=(certbot python3-certbot-nginx); fi
+    echo "${need[*]:-}"
+}
+# Shows each of setup_nginx's checks as ok or the reason it would stop, then
+# what setup_nginx changes. NGINX_PROBLEMS: those reasons, one per line
+# (empty when every check passes). Needs the answers about the front, the
+# domain and this machine's addresses.
+NGINX_PROBLEMS=""
+nginx_preflight() {
+    local others need resolved why
+    NGINX_PROBLEMS=""
+    preflight_ok() { say "  ok  $1"$'\n'; }
+    preflight_problem() { NGINX_PROBLEMS+="${NGINX_PROBLEMS:+$'\n'}$1"; say "  no  $1"$'\n'; }
+    say $'\nBefore setting up nginx:\n'
+    if nginx_site_exists; then
+        preflight_problem "${NGINX_SITE} or ${NGINX_STREAM} already exists; the installer leaves it alone"
+    else
+        preflight_ok "no peephole site in nginx yet"
+    fi
+    if stream_trap; then
+        others="$(nginx_other_443)"
+        if [ -n "$others" ]; then
+            preflight_problem "port 443 is already used by $(printf '%s' "$others" | paste -sd' ' -) - move those sites behind the stream config first"
+        else
+            preflight_ok "no other site listens on port 443"
+        fi
+    fi
+    if has_role listener && [ -e "$NGINX_DEFAULT" ]; then
+        if [ -L "$NGINX_DEFAULT" ]; then
+            preflight_ok "${NGINX_DEFAULT} is a link to a stock site"
+        else
+            preflight_problem "${NGINX_DEFAULT} is not a link to a stock site; the installer leaves it alone"
+        fi
+    fi
+    need="$(nginx_packages_needed)"
+    if [ -z "$need" ]; then
+        preflight_ok "the packages are installed"
+    elif [ "${PEEPHOLE_SKIP_APT:-0}" = 1 ]; then
+        preflight_problem "${need} not installed and PEEPHOLE_SKIP_APT=1"
+    else
+        preflight_ok "packages to install: ${need}"
+    fi
+    if has_role web; then
+        # Interfaces, the metadata's address and the answer about addresses
+        # no interface shows.
+        resolved="$(getent ahosts "$PEEPHOLE_DOMAIN" 2>/dev/null | awk '{print $1}' || true)"
+        why="$(dns_problem "$PEEPHOLE_DOMAIN" "$resolved" "${if_addrs:-} ${DETECTED_OWN:-} ${OWN_ADDRESSES:-}")"
+        if [ -n "$why" ]; then
+            preflight_problem "$why"
+        else
+            preflight_ok "${PEEPHOLE_DOMAIN} points to this machine"
+        fi
+    fi
+    say $'\nThe installer will:\n'
+    [ -z "$need" ] || say "  - install ${need}"$'\n'
+    if has_role web && [ ! -e "/etc/letsencrypt/live/${PEEPHOLE_DOMAIN}/fullchain.pem" ]; then
+        say "  - get a Let's Encrypt certificate for ${PEEPHOLE_DOMAIN} (certbot, no contact email)"$'\n'
+    fi
+    if has_role listener && [ -L "$NGINX_DEFAULT" ]; then
+        say "  - disable the distribution's default site (${NGINX_DEFAULT})"$'\n'
+    fi
+    say "  - write ${NGINX_SITE} from ${CONFIG_DIR}/nginx.example.conf and enable it"$'\n'
+    if stream_trap; then
+        say "  - write ${NGINX_STREAM} and include it in /etc/nginx/nginx.conf (port 443 by name)"$'\n'
+    fi
+    say $'  - test the configuration (nginx -t) and reload nginx\n  If a step fails, everything is put back and the steps to do by hand are printed.\n'
+    if has_role web; then say $'Port 80 must be reachable from the internet for the certificate.\n'; fi
 }
 
 # --- prerequisites (only what is missing) ------------------------------------
@@ -691,10 +812,11 @@ fi
 if [ "$upgrade" -ne 1 ]; then
     # Where this runs. A big cloud forbids scanning others; behind 1:1 NAT
     # (most clouds) no interface carries the public address, which only the
-    # metadata service knows.
+    # metadata service knows (the nginx checks compare the admin domain's DNS
+    # with it too).
     CLOUD="$(cloud_from_dmi /sys/class/dmi/id)"
     md_provider=""; md_addr=""
-    if [ "${PEEPHOLE_METADATA:-1}" = 1 ] && { [ -z "${PEEPHOLE_ROLES:-}" ] || has_role listener || has_role scanner; }; then
+    if [ "${PEEPHOLE_METADATA:-1}" = 1 ]; then
         read -r md_provider md_addr <<<"$(cloud_public_ip)" || true
     fi
     case "$md_provider" in
@@ -820,7 +942,19 @@ if [ "$upgrade" -ne 1 ]; then
                     say $'Hosts in these ranges are believed about the client address: list only the proxy.\nAn address (10.0.0.5), a network (10.0.0.0/24), or several, comma-separated.\n'
                 fi
                 while :; do
-                    prompt PEEPHOLE_TRUSTED_PROXIES "Address(es) of that proxy, as seen from this machine"
+                    if [ "$INTERACTIVE" -eq 1 ] && [ -z "$proxies_preset" ]; then
+                        # No default: an empty answer is asked again.
+                        say "Address(es) of that proxy, as seen from this machine: "
+                        PEEPHOLE_TRUSTED_PROXIES=""
+                        read -r PEEPHOLE_TRUSTED_PROXIES <&3 || [ -n "$PEEPHOLE_TRUSTED_PROXIES" ] \
+                            || die "no value provided for PEEPHOLE_TRUSTED_PROXIES"
+                        if [ -z "$PEEPHOLE_TRUSTED_PROXIES" ]; then
+                            say $'The proxy\'s address is needed: whoever is listed is believed about the client address.\n'
+                            continue
+                        fi
+                    else
+                        prompt PEEPHOLE_TRUSTED_PROXIES "Address(es) of that proxy, as seen from this machine"
+                    fi
                     # A bare address is that one host.
                     proxies=""; bad=""
                     for a in $(printf '%s' "$PEEPHOLE_TRUSTED_PROXIES" | tr ',' ' '); do
@@ -889,6 +1023,69 @@ if [ "$upgrade" -ne 1 ]; then
             PEEPHOLE_DOMAIN=""
         done
         claim_port ADMIN_LISTEN "admin listener" 1
+        # Password sign-in besides passkeys. The password never enters the
+        # config (no toml_safe): it reaches `peephole admin password --stdin`
+        # byte for byte, which stores its hash.
+        if [ -z "${PEEPHOLE_ADMIN_PASSWORD:-}" ] && [ "$INTERACTIVE" -eq 1 ]; then
+            say $'\nSign-in to the admin site: a passkey (security key, phone, password manager) is the\nstronger option; a password works from any browser. Either way the site needs HTTPS.\n'
+            want_password=""
+            ask_yn want_password "Also allow signing in with a password?" n
+            if [ "$want_password" = 1 ]; then
+                while :; do
+                    p1=""; p2=""
+                    say "Admin password (at least 12 characters): "
+                    IFS= read -rs p1 <&3 || [ -n "$p1" ] || die "no admin password given"
+                    say $'\n'
+                    say "Again: "
+                    IFS= read -rs p2 <&3 || [ -n "$p2" ] || die "no admin password given"
+                    say $'\n'
+                    if [ "${#p1}" -lt 12 ]; then say $'Too short.\n'; continue; fi
+                    [ "$p1" = "$p2" ] || { say $'They differ.\n'; continue; }
+                    PEEPHOLE_ADMIN_PASSWORD="$p1"
+                    break
+                done
+                unset p1 p2
+            fi
+        fi
+        if [ -n "${PEEPHOLE_ADMIN_PASSWORD:-}" ] && [ "${#PEEPHOLE_ADMIN_PASSWORD}" -lt 12 ]; then
+            die "PEEPHOLE_ADMIN_PASSWORD: at least 12 characters"
+        fi
+        # Not in the environment of the commands run before it is used.
+        export -n PEEPHOLE_ADMIN_PASSWORD
+    fi
+    # nginx is set up only where it fronts something peephole serves: the
+    # admin site, or a trap behind nginx on this machine (local). Not for a
+    # trap that takes 80/443 itself (direct, never with the web role) or
+    # one behind a proxy elsewhere (remote). Asked here, once the front and
+    # the domain are known; done once peephole is up.
+    nginx_fits=0
+    if has_role listener; then
+        [ "$PEEPHOLE_FRONT" = local ] && nginx_fits=1
+    elif has_role web; then
+        nginx_fits=1
+    fi
+    if [ "$nginx_fits" = 1 ]; then
+        case "${PEEPHOLE_NGINX:-}" in
+            0|n|N|no|No|NO) ;;
+            *)
+                if [ "$INTERACTIVE" -eq 1 ] || [ -n "${PEEPHOLE_NGINX:-}" ]; then
+                    if has_role web; then
+                        say $'\nnginx: the installer can install nginx and certbot, get a Let\'s Encrypt certificate for\nthe admin domain, enable the site and reload nginx. Otherwise it prints the steps at the end.\n'
+                    else
+                        say $'\nnginx: the installer can install nginx, enable the trap catch-all (it replaces the\ndistribution\'s default site) and reload nginx. Otherwise it prints the steps at the end.\n'
+                    fi
+                    nginx_preflight
+                fi ;;
+        esac
+        # Yes by default when every check passes; never without a terminal
+        # unless asked for. A preset 1 tries despite a failing check.
+        nginx_default=n
+        [ "$INTERACTIVE" -eq 1 ] && [ -z "$NGINX_PROBLEMS" ] && nginx_default=y
+        ask_yn PEEPHOLE_NGINX "Set up nginx now?" "$nginx_default"
+    elif [ "${PEEPHOLE_NGINX:-0}" = 1 ]; then
+        die "PEEPHOLE_NGINX=1 needs the web role or a trap behind nginx on this machine (PEEPHOLE_FRONT=local); set up your proxy by hand"
+    else
+        PEEPHOLE_NGINX=0
     fi
     # A preset node name means "yes" (unattended installs from before this
     # question existed).
@@ -920,48 +1117,11 @@ if [ "$upgrade" -ne 1 ]; then
     prompt_optional ABUSEIPDB_API_KEY "AbuseIPDB API key (https://www.abuseipdb.com/account/api; abuse reports per IP, free plan 1000 checks/day)"
     prompt_optional SHODAN_API_KEY "Shodan API key (https://account.shodan.io; open ports, services and CVEs; host lookups need a membership or paid plan)"
     ask_yn PEEPHOLE_INTERNETDB "Use Shodan InternetDB (no key; ports, tags and CVEs, weekly data; free for non-commercial use only)?" "$([ "$INTERACTIVE" -eq 1 ] && echo y || echo n)"
-    # nginx is set up only where it fronts something peephole serves: the
-    # admin site, or a trap behind nginx on this machine (local). Not for a
-    # trap that takes 80/443 itself (direct, never with the web role) or
-    # one behind a proxy elsewhere (remote).
-    nginx_fits=0
-    if has_role listener; then
-        [ "$PEEPHOLE_FRONT" = local ] && nginx_fits=1
-    elif has_role web; then
-        nginx_fits=1
-    fi
-    if [ "$nginx_fits" = 1 ]; then
-        if [ "$INTERACTIVE" -eq 1 ] && [ -z "${PEEPHOLE_NGINX:-}" ]; then
-            if has_role web; then
-                say $'
-nginx: the installer can install nginx and certbot, get a Let\'s Encrypt certificate for
-the admin domain (its DNS must point here and port 80 must be reachable), enable the site and
-reload nginx. Otherwise it prints the steps at the end.
-'
-            else
-                say $'
-nginx: the installer can install nginx, enable the trap catch-all (it replaces the
-distribution\'s default site) and reload nginx. Otherwise it prints the steps at the end.
-'
-            fi
-        fi
-        ask_yn PEEPHOLE_NGINX "Install and configure nginx for peephole now?" n
-        if [ "$PEEPHOLE_NGINX" = 1 ] && has_role web; then
-            prompt_optional PEEPHOLE_ACME_EMAIL "Contact email for Let's Encrypt (expiry notices)"
-        fi
-    elif [ "${PEEPHOLE_NGINX:-0}" = 1 ]; then
-        die "PEEPHOLE_NGINX=1 needs the web role or a trap behind nginx on this machine (PEEPHOLE_FRONT=local); set up your proxy by hand"
-    else
-        PEEPHOLE_NGINX=0
-    fi
     # Values that arrived preset from the environment were not checked by a prompt.
     toml_safe "${PEEPHOLE_DOMAIN:-}"; toml_safe "${PEEPHOLE_TRUSTED_PROXIES:-}"
     toml_safe "${PEEPHOLE_CLUSTER_NAME:-}"; toml_safe "${PEEPHOLE_CLUSTER_LISTEN:-}"; toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"
     toml_safe "${MAXMIND_ACCOUNT_ID:-}"; toml_safe "${MAXMIND_LICENSE_KEY:-}"
     toml_safe "${ABUSEIPDB_API_KEY:-}"; toml_safe "${SHODAN_API_KEY:-}"
-    if [ -n "${PEEPHOLE_ACME_EMAIL:-}" ] && ! [[ "$PEEPHOLE_ACME_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]]; then
-        die "PEEPHOLE_ACME_EMAIL is not an email address: ${PEEPHOLE_ACME_EMAIL}"
-    fi
 fi
 # The wizard is done (or was skipped on an upgrade); closing an fd that was never opened is harmless.
 exec 3<&-
@@ -1182,6 +1342,17 @@ CONFIG
             fi
         fi
     fi
+    # On stdin, never on the command line: the hash goes into the database
+    # and the sign-in becomes passkey or password.
+    PASSWORD_SET=0
+    if has_role web && [ -n "${PEEPHOLE_ADMIN_PASSWORD:-}" ]; then
+        if printf '%s\n' "$PEEPHOLE_ADMIN_PASSWORD" | "$INSTALL_BIN" admin password --stdin "$CONFIG_FILE"; then
+            PASSWORD_SET=1
+        else
+            warn "setting the admin password failed; set it with: peephole admin password"
+        fi
+    fi
+    unset PEEPHOLE_ADMIN_PASSWORD
 fi
 
 # --- systemd -----------------------------------------------------------------
@@ -1304,33 +1475,20 @@ fi
 # function changed and leaves the manual steps in the summary; the install
 # itself has succeeded either way.
 NGINX_DONE=0
-NGINX_SITE=/etc/nginx/sites-available/peephole
-NGINX_LINK=/etc/nginx/sites-enabled/peephole
-NGINX_DEFAULT=/etc/nginx/sites-enabled/default
-NGINX_STREAM=/etc/nginx/peephole-stream.conf
+# The checks below repeat nginx_preflight's: a preset PEEPHOLE_NGINX=1 tries
+# despite a failing one, and the machine may have changed since.
 setup_nginx() {
-    local need=() default_target="" out
-    if [ -e "$NGINX_LINK" ] || [ -e "$NGINX_SITE" ] || { stream_trap && [ -e "$NGINX_STREAM" ]; }; then
+    local need=() default_target="" out others
+    if nginx_site_exists; then
         warn "nginx: ${NGINX_SITE} or ${NGINX_STREAM} already exists; left alone (the steps to do it by hand follow)"
         return 1
     fi
-    if stream_trap; then
-        # Port 443 goes to the stream config; sites that listen on it
-        # themselves have to move behind it first (see the stream example).
-        local others
-        others="$(grep -lsE '^[[:space:]]*listen[[:space:]]+([^;#[:space:]]*[]:])?443([[:space:];]|$)' /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf || true)"
-        if [ -n "$others" ]; then
-            warn "nginx: port 443 is already used by $(printf '%s' "$others" | tr '\n' ' ')- move those sites behind the stream config first (see ${CONFIG_DIR}/nginx-stream.example.conf); left alone"
-            return 1
-        fi
+    others="$(nginx_other_443)"
+    if [ -n "$others" ]; then
+        warn "nginx: port 443 is already used by $(printf '%s' "$others" | paste -sd' ' -) - move those sites behind the stream config first (see ${CONFIG_DIR}/nginx-stream.example.conf); left alone"
+        return 1
     fi
-    command -v nginx >/dev/null 2>&1 || need+=(nginx)
-    # The stream module, where the distribution packages it on its own.
-    if stream_trap && ! dpkg -s libnginx-mod-stream >/dev/null 2>&1 \
-            && apt-cache show libnginx-mod-stream >/dev/null 2>&1; then
-        need+=(libnginx-mod-stream)
-    fi
-    if has_role web && ! command -v certbot >/dev/null 2>&1; then need+=(certbot python3-certbot-nginx); fi
+    read -ra need <<<"$(nginx_packages_needed)" || true
     if [ "${#need[@]}" -gt 0 ]; then
         if [ "${PEEPHOLE_SKIP_APT:-0}" = 1 ]; then
             warn "nginx: ${need[*]} not installed and PEEPHOLE_SKIP_APT=1; skipped"
@@ -1346,11 +1504,11 @@ setup_nginx() {
     systemctl enable --now nginx || { warn "nginx: the service does not start"; return 1; }
     if has_role web && [ ! -e "/etc/letsencrypt/live/${PEEPHOLE_DOMAIN}/fullchain.pem" ]; then
         info "Requesting a Let's Encrypt certificate for ${PEEPHOLE_DOMAIN}"
-        local contact=(--register-unsafely-without-email)
-        [ -n "${PEEPHOLE_ACME_EMAIL:-}" ] && contact=(-m "$PEEPHOLE_ACME_EMAIL")
-        # While the distribution's default site still serves port 80.
+        # While the distribution's default site still serves port 80. No
+        # contact email: Let's Encrypt no longer keeps one with the account
+        # nor writes to it about the certificate.
         if ! certbot certonly --nginx -d "$PEEPHOLE_DOMAIN" --non-interactive --agree-tos \
-                "${contact[@]}" --deploy-hook "systemctl reload nginx"; then
+                --register-unsafely-without-email --deploy-hook "systemctl reload nginx"; then
             warn "nginx: no certificate for ${PEEPHOLE_DOMAIN} (does its DNS point here, is port 80 reachable?)"
             return 1
         fi
@@ -1507,6 +1665,9 @@ if [ -n "$admin_listen" ]; then
     else
         printf '    the one-time setup token is in the service log: journalctl -u peephole | grep -A2 token\n'
         printf '    (or issue a new one: peephole admin reset-token)\n'
+    fi
+    if [ "${PASSWORD_SET:-0}" = 1 ]; then
+        echo "  - Or sign in at https://${PEEPHOLE_DOMAIN}/login with your password."
     fi
 fi
 }

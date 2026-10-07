@@ -91,7 +91,7 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
 Every question has a variable (`PEEPHOLE_ROLES`, `PEEPHOLE_FRONT`,
 `PEEPHOLE_TRUSTED_PROXIES`, `PEEPHOLE_OWN_ADDRESSES`, `PEEPHOLE_CLUSTER`,
 `PEEPHOLE_CLUSTER_NAME`, `PEEPHOLE_JOIN_TOKEN`,
-`PEEPHOLE_NGINX`, `PEEPHOLE_ACME_EMAIL`, …); the head of `install.sh` lists
+`PEEPHOLE_ADMIN_PASSWORD`, `PEEPHOLE_NGINX`, …); the head of `install.sh` lists
 them all. `PEEPHOLE_FRONT=direct|local|remote` answers what is in front of
 the trap. Without it, unattended installs keep what they did before: the
 older `PEEPHOLE_LOCAL_PROXY=1` means local and `0` remote, and a preset
@@ -153,12 +153,17 @@ the old 443 setup. To trap HTTPS there, add `trap_tls_listen =
 `--nginx-stream-example`), put them in place as in the manual steps below and
 restart peephole.
 
-**Automatic setup** (opt-in: answer yes, or `PEEPHOLE_NGINX=1`). Offered for
-the web role and for a trap behind a proxy on the same machine. After
+**Automatic setup** (answer yes, or `PEEPHOLE_NGINX=1`). Offered for
+the web role and for a trap behind a proxy on the same machine. Before the
+question the installer checks what the setup would stop at (an existing
+peephole site, other sites on port 443, a default site that is not the
+stock link, packages it may not install, and whether the admin domain's
+DNS points at this machine) and lists what it will change; the default is
+yes when every check passes. After
 peephole is up, the installer installs nginx (and certbot with the web
 role), gets a Let's Encrypt certificate for the admin domain (its DNS must
-point at the machine and port 80 must be reachable; `PEEPHOLE_ACME_EMAIL`
-sets the contact address), disables the distribution's default site (only
+point at the machine and port 80 must be reachable; no contact email is
+given), disables the distribution's default site (only
 if it is the stock link), enables `/etc/nginx/sites-available/peephole` and,
 with a trap, the stream config, checks it with `nginx -t` and reloads. On a machine without IPv6 the `[::]`
 listeners are left out. If a step fails, the installer puts back what it
