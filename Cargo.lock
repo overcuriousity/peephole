@@ -2306,7 +2306,7 @@ dependencies = [
  "webauthn-authenticator-rs",
  "webauthn-rs",
  "webauthn-rs-proto",
- "x509-parser 0.16.0",
+ "x509-parser 0.18.1",
  "zstd",
 ]
 
