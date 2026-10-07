@@ -11,9 +11,9 @@ use anyhow::Result;
 use std::sync::Arc;
 
 /// What `me` may still hold in or pay for its scan jobs today: `share` of
-/// its balance plus what its scan offers hold and were charged today,
-/// minus those two.
-pub fn budget(l: &Ledger, me: &NodeId, share: f64) -> Mc {
+/// its balance plus what its scan offers and own jobs (`self_mc`) hold
+/// and were charged today, minus those.
+pub fn budget(l: &Ledger, me: &NodeId, share: f64, self_mc: Mc) -> Mc {
     let (mut held, mut charged) = (0, 0);
     for o in l
         .offers
@@ -26,9 +26,43 @@ pub fn budget(l: &Ledger, me: &NodeId, share: f64) -> Mc {
             _ => {}
         }
     }
-    let committed = held + charged;
+    let committed = held + charged + self_mc;
     let cap = ((l.balance(me) + committed) as f64 * share.clamp(0.0, 1.0)).floor() as Mc;
     cap.saturating_sub(committed)
+}
+
+/// What this node's own jobs granted to its own scanner hold (running) or
+/// were charged today (done): they count against the budget like offers.
+/// A job requeued, failed or refused no longer counts.
+pub async fn self_committed(pool: &sqlx::SqlitePool, me: &NodeId) -> Result<Mc> {
+    let n: Option<i64> = sqlx::query_scalar(
+        "SELECT SUM(self_mc) FROM scan_jobs
+         WHERE arbiter = ? AND self_mc > 0
+           AND (status = 'running' OR (status = 'done' AND finished_at >= date('now')))",
+    )
+    .bind(&me.0[..])
+    .fetch_one(pool)
+    .await?;
+    Ok(n.unwrap_or(0).max(0) as Mc)
+}
+
+/// What this node, as arbiter, would pay `scanner` for a job now: its own
+/// scanner its selling price; another scanner what it announces, at most
+/// [`price::PRICE_TOLERANCE`] times this node's copy. None: unpaid.
+pub fn price_for(node: &Node, scanner: &NodeId) -> Option<u32> {
+    let table = node.price_table();
+    if *scanner == node.id() {
+        return table.price_of(price::SCAN);
+    }
+    let k = node.status.known(scanner)?;
+    if !node
+        .members()
+        .get(scanner)
+        .is_some_and(|m| super::pay::sells_scans(m.proto_max))
+    {
+        return None;
+    }
+    price::offer_price(k.hb.scan_price_mc, table.reference(scanner))
 }
 
 /// The oldest lot day a scan offer written at `now_ms` may draw from: a
@@ -48,31 +82,26 @@ pub struct Funding {
     lots: Vec<(u32, Mc)>,
     /// What the offers written in this round set aside.
     committed: Mc,
+    /// What this node's own running and done-today jobs hold, read once.
+    self_mc: Option<Mc>,
 }
 
-/// Fund the grant of `job_uid` to `scanner` at this node's scan price:
-/// `(offer_seq, price)` once the offer is written. None: its own scanner,
-/// a scanner that predates the market, a price under `min_mc`, or no
-/// budget; the job is granted unfunded. `funding` carries the book and
-/// what was committed across the grants of one round.
+/// Fund the grant of `job_uid` to `scanner` at `price` (see [`price_for`]):
+/// `Some((Some(seq), price))` once the offer is written, `Some((None,
+/// price))` for an own job, which the self tally holds against the budget.
+/// None: unpaid, a price under `min_mc`, or no budget; the job is granted
+/// unfunded. `funding` carries the book and what was committed across the
+/// grants of one round.
 pub async fn fund(
     node: &Arc<Node>,
     funding: &mut Funding,
     scanner: NodeId,
     job_uid: &str,
     min_mc: u32,
-) -> Option<(u64, u32)> {
+    price: u32,
+) -> Option<(Option<u64>, u32)> {
     let me = node.id();
-    if scanner == me
-        || !node
-            .members()
-            .get(&scanner)
-            .is_some_and(|m| super::pay::pays_with(m.proto_max))
-    {
-        return None;
-    }
-    let price = node.price_table().price_of(price::SCAN)?;
-    if price < min_mc {
+    if price == 0 || price < min_mc {
         return None;
     }
     let book = match &funding.book {
@@ -84,9 +113,30 @@ pub async fn fund(
             b
         }
     };
-    let left = budget(&book.ledger, &me, node.scan_share()).saturating_sub(funding.committed);
+    let self_mc = match funding.self_mc {
+        Some(s) => s,
+        None => {
+            let s = self_committed(&node.store.pool, &me).await.ok()?;
+            funding.self_mc = Some(s);
+            s
+        }
+    };
+    let left =
+        budget(&book.ledger, &me, node.scan_share(), self_mc).saturating_sub(funding.committed);
     if left < price as Mc {
         return None;
+    }
+    if scanner == me {
+        // Paying oneself moves nothing: the job holds the price against
+        // the budget instead of an offer.
+        sqlx::query("UPDATE scan_jobs SET self_mc = ? WHERE uid = ?")
+            .bind(price as i64)
+            .bind(job_uid)
+            .execute(&node.store.pool)
+            .await
+            .ok()?;
+        funding.committed += price as Mc;
+        return Some((None, price));
     }
     let first_day = first_day_for_job(crate::cluster::hlc::wall_ms());
     let parts = ledger::parts_from(&funding.lots, price as Mc, first_day)?;
@@ -106,7 +156,7 @@ pub async fn fund(
                     lot.1 = lot.1.saturating_sub(mc as Mc);
                 }
             }
-            Some((e.seq, price))
+            Some((Some(e.seq), price))
         }
         Err(e) => {
             tracing::debug!(?e, job = %job_uid, "scan offer not written; granted unfunded");
@@ -139,7 +189,8 @@ pub async fn announce_budget(node: &Arc<Node>) -> Result<()> {
     .fetch_one(&node.store.pool)
     .await?;
     let book = super::book(node).await?;
-    let left = budget(&book.ledger, &node.id(), node.scan_share());
+    let self_mc = self_committed(&node.store.pool, &node.id()).await?;
+    let left = budget(&book.ledger, &node.id(), node.scan_share(), self_mc);
     node.scan_budget_mc.store(
         left.min(u32::MAX as Mc) as u32,
         std::sync::atomic::Ordering::Relaxed,
@@ -233,9 +284,70 @@ mod tests {
             (DAY as u64 * DAY_MS) + 5 * 60_000,
         );
         // balance 650, committed 300: half of 950 is 475, 175 left.
-        assert_eq!(budget(&l, &id(1), 0.5), 175);
-        assert_eq!(budget(&l, &id(1), 0.0), 0);
-        assert_eq!(budget(&l, &id(1), 1.0), 650);
+        assert_eq!(budget(&l, &id(1), 0.5, 0), 175);
+        assert_eq!(budget(&l, &id(1), 0.0, 0), 0);
+        assert_eq!(budget(&l, &id(1), 1.0, 0), 650);
+    }
+
+    #[test]
+    fn the_budget_counts_own_jobs() {
+        // A balance of 1000 at share 0.5: 500. Own jobs holding 200 count
+        // like offers: (1000 + 200) x 0.5 - 200 = 400 left.
+        let l = ledger_with_balance(id(1), 1000);
+        assert_eq!(budget(&l, &id(1), 0.5, 0), 500);
+        assert_eq!(budget(&l, &id(1), 0.5, 200), 400);
+    }
+
+    #[tokio::test]
+    async fn own_job_reservations_count_while_running_and_when_done_today() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let pool = &store.pool;
+        let me = id(1);
+        sqlx::query(
+            "INSERT INTO ips (id, ip, first_seen, last_seen) VALUES (1, '192.0.2.1', '', '')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        for (n, status, finished, mc) in [
+            (1, "running", None, 30),
+            (2, "done", Some("datetime('now')"), 20),
+            (3, "done", Some("datetime('now','-2 days')"), 50),
+            (4, "queued", None, 70), // requeued after its reservation: no longer counts
+            (5, "failed", Some("datetime('now')"), 90),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO scan_jobs (id, ip_id, level, status, queued_at, finished_at, uid, arbiter, self_mc)
+                 VALUES (?, 1, 1, ?, datetime('now'), {}, ?, ?, ?)",
+                finished.unwrap_or("NULL")
+            )))
+            .bind(n)
+            .bind(status)
+            .bind(format!("j{n}"))
+            .bind(&me.0[..])
+            .bind(mc)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(self_committed(pool, &me).await.unwrap(), 50);
+    }
+
+    fn ledger_with_balance(node: NodeId, mc: Mc) -> Ledger {
+        let earned = [Earned {
+            node,
+            hlc: at(DAY, 0),
+            mc,
+        }];
+        run(
+            &earned,
+            &[],
+            &Default::default(),
+            (DAY as u64 * DAY_MS) + 5 * 60_000,
+        )
     }
 
     #[test]
