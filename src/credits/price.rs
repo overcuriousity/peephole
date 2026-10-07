@@ -17,10 +17,10 @@ pub const UNIT_MIN: Mc = 10;
 pub const UNIT_MAX: Mc = 100_000;
 
 /// The weight of a provider in thousandths: a keyed API 1, Shodan
-/// InternetDB and GeoLite2 a quarter, the Tor exit list nothing (free).
+/// InternetDB and GeoLite2 a quarter, the Tor exit list and RDAP nothing (free).
 pub fn weight_milli(provider: &str) -> u32 {
     match provider {
-        intel::TOR => 0,
+        intel::TOR | intel::RDAP => 0,
         intel::MAXMIND | intel::INTERNETDB => 250,
         _ => 1000,
     }
