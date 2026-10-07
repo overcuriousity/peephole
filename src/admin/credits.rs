@@ -463,7 +463,10 @@ mod tests {
             accruing: (12, true),
         };
         // The template states these amounts in words.
-        assert_eq!((mint::MINT_PER_DAY, mint::ALLOWANCE_PER_DAY), (1000_000, 5_000));
+        assert_eq!(
+            (mint::MINT_PER_DAY, mint::ALLOWANCE_PER_DAY),
+            (1000_000, 5_000)
+        );
         let html = page.render().unwrap();
         for want in [
             "2026-10-06",
