@@ -531,6 +531,7 @@ async fn admin_routes_redirect_without_session() {
         "/admin/scans/1/xml",
         "/admin/links",
         "/admin/links/canaries",
+        "/admin/links/canaries/served/1",
         "/admin/links/fp/x",
         "/admin/api/links/graph?focus=fp:x",
         "/admin/inbox",
@@ -2819,6 +2820,37 @@ async fn request_and_ip_pages_show_canary_reuse() {
         .await
         .unwrap();
     assert!(ip.contains("used by 1 other IP"), "{ip}");
+    // Both request rows carry a mark that opens the decoy's canary page.
+    let mark = format!("href=\"/admin/links/canaries/served/{served}\"");
+    assert!(ip.contains(&mark), "served mark");
+    let user_ip = admin
+        .get(format!("{admin_base}/ip/203.0.113.61"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(user_ip.contains(&mark), "used mark");
+    let decoy = admin
+        .get(format!("{admin_base}/admin/links/canaries/served/{served}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(decoy.status(), 200);
+    let decoy = decoy.text().await.unwrap();
+    assert!(
+        decoy.contains(&token)
+            && decoy.contains("203.0.113.61")
+            && decoy.contains(&format!("/admin/requests/{used}")),
+        "{decoy}"
+    );
+    let none = admin
+        .get(format!("{admin_base}/admin/links/canaries/served/{used}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(none.status(), 404, "served no canaries");
     // Nothing of it on the public IP page.
     let public = reqwest::get(format!("{admin_base}/ip/203.0.113.60"))
         .await
@@ -2827,6 +2859,7 @@ async fn request_and_ip_pages_show_canary_reuse() {
         .await
         .unwrap();
     assert!(!public.contains("Canar") && !public.contains(&token));
+    assert!(!public.contains("canary-mark"));
 }
 
 #[tokio::test]

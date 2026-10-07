@@ -218,3 +218,10 @@ tr:hover .copy-btn.subtle, h2:hover .copy-btn.subtle, .copy-btn.subtle:focus-vis
 .link-legend .swatch.group { background: var(--color-bg-elevated); border: 1px dashed var(--color-border-strong); border-radius: 50%; }
 .link-legend .line { display: inline-block; width: 18px; height: 0; border-top: 2px solid var(--color-border-strong); vertical-align: middle; margin-right: 0.3rem; }
 .link-legend .line.soft { border-top-style: dashed; }
+/* Canary marks on request rows: a key that opens the decoy's canary page. */
+.canary-mark { display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem; vertical-align: middle;
+  border-radius: var(--radius-sm); color: var(--color-warning); }
+.canary-mark:hover { background: var(--color-bg-hover); color: var(--color-fg-primary); }
+.canary-mark.used { color: var(--color-danger); }
+.canary-mark svg { width: 0.95rem; height: 0.95rem; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+td.nowrap { white-space: nowrap; }

@@ -574,6 +574,79 @@ mod tests {
         }
     }
 
+    /// Request lists mark a row that served canaries and a row that used
+    /// one (naming the request that served it), for the admin only.
+    #[tokio::test]
+    async fn request_rows_carry_canary_marks_for_the_admin() {
+        use crate::store::browse::Audience;
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        for r in [
+            req(
+                "srv",
+                "2026-10-04 10:00:00",
+                "198.51.100.1",
+                "/.git/config",
+                "[]",
+                "decoy:git-config",
+                Some(1),
+            ),
+            req(
+                "use",
+                "2026-10-04 13:00:00",
+                "198.51.100.2",
+                "/x",
+                &basic("deploy", &git_token("srv")),
+                "404",
+                Some(1),
+            ),
+        ] {
+            apply(&mut conn, ctx, &r).await.unwrap();
+        }
+        drop(conn);
+        let id = |ip: &'static str| {
+            let s = s.clone();
+            async move { s.upsert_ip(ip.parse().unwrap()).await.unwrap().id }
+        };
+        let (srv_ip, use_ip) = (id("198.51.100.1").await, id("198.51.100.2").await);
+        let srv = &s
+            .requests_for_ip(srv_ip, 1, Audience::Admin)
+            .await
+            .unwrap()
+            .items[0];
+        assert!(srv.canary_served);
+        assert_eq!(srv.canary_from, None);
+        let used = &s
+            .requests_for_ip(use_ip, 1, Audience::Admin)
+            .await
+            .unwrap()
+            .items[0];
+        assert!(!used.canary_served);
+        assert_eq!(used.canary_from, Some(srv.id));
+        assert_eq!(
+            used.canary_used,
+            Some(crate::canary::hash(&git_token("srv")))
+        );
+        for ip in [srv_ip, use_ip] {
+            let r = &s
+                .requests_for_ip(ip, 1, Audience::Public)
+                .await
+                .unwrap()
+                .items;
+            assert!(
+                r.iter()
+                    .all(|r| !r.canary_served && r.canary_used.is_none())
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_light_row_decoy_is_traceable() {
         let dir = tempfile::tempdir().unwrap();

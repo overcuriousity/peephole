@@ -107,6 +107,26 @@ pub struct RequestDetail {
     pub rules_short: Option<String>,
 }
 
+impl RequestDetail {
+    /// The decoy it was answered with (the name after `decoy:`), if any.
+    pub fn decoy(&self) -> Option<&str> {
+        self.row.answer.as_deref()?.strip_prefix("decoy:")
+    }
+
+    /// The canaries its decoy carried, (kind, value).
+    pub fn served_canaries(&self) -> Vec<(String, String)> {
+        match (self.row.page_token.as_deref(), self.decoy()) {
+            (Some(t), Some(n)) => {
+                crate::canary::served(self.row.decoy_v, t, n, self.row.decoy_in.as_deref())
+                    .into_iter()
+                    .map(|(k, v)| (k.name().to_string(), v))
+                    .collect()
+            }
+            _ => vec![],
+        }
+    }
+}
+
 const SCAN_SELECT: &str =
     "SELECT s.id, s.ip_id, i.ip, s.level, s.started_at, s.finished_at, s.os_guess,
             s.audit_of, s.audit_result,
