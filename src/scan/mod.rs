@@ -138,23 +138,13 @@ impl Refusal {
     }
 }
 
-/// `arbiters` with those announcing funded jobs (`(scan_bids, scan_price_mc)`
-/// with bids) first, by announced price descending; the rest after, each
-/// group in its given order.
-fn funded_first(
-    arbiters: Vec<NodeId>,
-    announced: impl Fn(&NodeId) -> Option<(u32, u32)>,
-) -> Vec<NodeId> {
-    let mut ranked: Vec<(u8, std::cmp::Reverse<u32>, usize, NodeId)> = arbiters
-        .into_iter()
-        .enumerate()
-        .map(|(i, a)| match announced(&a) {
-            Some((bids, price)) if bids > 0 => (0, std::cmp::Reverse(price), i, a),
-            _ => (1, std::cmp::Reverse(0), i, a),
-        })
-        .collect();
-    ranked.sort_by_key(|(rank, price, i, _)| (*rank, *price, *i));
-    ranked.into_iter().map(|(.., a)| a).collect()
+/// `arbiters` (in urgency order) with those that can pay this scanner's
+/// price first; each group keeps its order. Price differences between
+/// arbiters do not reorder anything: the scanner names the price.
+fn can_pay_first(arbiters: Vec<NodeId>, can_pay: impl Fn(&NodeId) -> bool) -> Vec<NodeId> {
+    let (mut first, rest): (Vec<_>, Vec<_>) = arbiters.into_iter().partition(|a| can_pay(a));
+    first.extend(rest);
+    first
 }
 
 /// A grant at a level this scanner excluded from its claim: an arbiter
@@ -262,6 +252,9 @@ enum Outcome {
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
 /// Skip an arbiter that did not answer for this long.
 const ARBITER_BACKOFF: Duration = Duration::from_secs(30);
+/// An arbiter that announced it could pay but granted unpaid is asked with
+/// the others for this long.
+const DEMOTE_FOR: Duration = Duration::from_secs(3600);
 /// Standalone: a deferred job is looked at again after this long.
 const DEFER_RETRY: Duration = Duration::from_secs(60);
 /// `scan.tor_unknown = "scan"`: how often that is warned about.
@@ -287,6 +280,8 @@ struct Source {
     deferred: std::sync::Mutex<HashMap<i64, Instant>>,
     tor_warned: std::sync::Mutex<Option<Instant>>,
     unreachable: std::sync::Mutex<HashMap<NodeId, Instant>>,
+    /// Arbiters asked as able to pay that granted unpaid: asked with the others until then.
+    demoted: std::sync::Mutex<HashMap<NodeId, Instant>>,
     /// Granted jobs this scanner runs now: IP (canonical) and level. Known
     /// before the job's state replicates anywhere.
     active: std::sync::Mutex<HashMap<IpAddr, u8>>,
@@ -322,6 +317,7 @@ impl Source {
             deferred: Default::default(),
             tor_warned: Default::default(),
             unreachable: Default::default(),
+            demoted: Default::default(),
             active: Default::default(),
             order: order::Cached::new(),
             audits: tokio::sync::Mutex::new(crate::credits::audit::Picker::new(
@@ -542,22 +538,48 @@ impl Source {
             .into_iter()
             .filter_map(|(a, _)| NodeId::from_slice(&a).ok())
             .collect();
-        // Arbiters that announce funded jobs first, the best paying first.
-        // This node's own jobs never pay its own scanner.
+        // Arbiters that can pay this scanner's price first; this node's
+        // own jobs pay from its own scan budget.
         let me = node.id();
-        let arbiters = funded_first(arbiters, |a| {
+        let sell = node.price_table().price_of(crate::credits::price::SCAN);
+        let book = crate::credits::book(node).await?;
+        let own_left = match sell {
+            Some(_) => crate::credits::jobs::budget(
+                &book.ledger,
+                &me,
+                node.scan_share(),
+                crate::credits::jobs::self_committed(&node.store.pool, &me).await?,
+            ),
+            None => 0,
+        };
+        let demoted: HashSet<NodeId> = {
+            let mut d = self.demoted.lock().unwrap();
+            d.retain(|_, until| *until > Instant::now());
+            d.keys().copied().collect()
+        };
+        let can_pay = |a: &NodeId| -> bool {
+            let Some(price) = sell.map(|p| p as u64) else {
+                return false;
+            };
             if *a == me {
-                return None;
+                return own_left >= price;
             }
-            node.status
-                .known(a)
-                .map(|k| (k.hb.scan_queued, k.hb.scan_price_mc.unwrap_or(0)))
-        });
-        let min_mc = node
-            .price_table()
-            .price_of(crate::credits::price::SCAN)
-            .unwrap_or(0)
-            / 2;
+            if demoted.contains(a)
+                || !node
+                    .members()
+                    .get(a)
+                    .is_some_and(|m| crate::credits::pay::sells_scans(m.proto_max))
+            {
+                return false;
+            }
+            node.status.known(a).is_some_and(|k| {
+                k.hb.scan_queued > 0 && (k.hb.scan_budget_mc as u64).min(book.balance(a)) >= price
+            })
+        };
+        let asked_as_paying: HashSet<NodeId> =
+            arbiters.iter().filter(|a| can_pay(a)).copied().collect();
+        let arbiters = can_pay_first(arbiters, can_pay);
+        let min_mc = sell.map_or(0, crate::credits::price::min_take);
         for arbiter in arbiters {
             // No scan work for or from a peer this node blocked.
             if node.is_blocked(&arbiter) {
@@ -595,6 +617,14 @@ impl Source {
                 }
             };
             let Some(g) = grant else { continue };
+            if arbiter != me && g.offer_seq.is_none() && asked_as_paying.contains(&arbiter) {
+                // Announced it could pay, then granted unpaid (or offered
+                // under our least): asked with the others for an hour.
+                self.demoted
+                    .lock()
+                    .unwrap()
+                    .insert(arbiter, Instant::now() + DEMOTE_FOR);
+            }
             if over_share(g.level, exclude) {
                 info!(job = %g.job_uid, target = %g.ip, "scan grant turned down: at the level-4 share");
                 let (node, uid, offer) = (node.clone(), g.job_uid, g.offer_seq);
@@ -2155,20 +2185,16 @@ license_key = "k"
     }
 
     #[test]
-    fn funded_arbiters_are_asked_first_best_paying_first() {
-        let id = |n: u8| NodeId([n; 32]);
-        let order = vec![id(1), id(2), id(3), id(4), id(5)];
-        let announced = |a: &NodeId| match a.0[0] {
-            2 => Some((3, 40)),
-            3 => Some((0, 90)),
-            4 => Some((1, 60)),
-            5 => Some((2, 40)),
-            _ => None,
-        };
-        assert_eq!(
-            funded_first(order, announced),
-            vec![id(4), id(2), id(5), id(1), id(3)]
+    fn arbiters_that_can_pay_are_asked_first_in_urgency_order() {
+        let (a, b, c, d) = (
+            NodeId([1; 32]),
+            NodeId([2; 32]),
+            NodeId([3; 32]),
+            NodeId([4; 32]),
         );
+        // Urgency order a, b, c, d; b and d can pay.
+        let order = can_pay_first(vec![a, b, c, d], |n| *n == b || *n == d);
+        assert_eq!(order, vec![b, d, a, c]);
     }
 
     #[test]
