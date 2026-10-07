@@ -19,6 +19,10 @@ pub struct Hello {
     /// peephole build version, informational.
     pub version: String,
     pub roles: Vec<String>,
+    /// The address the caller's connection came from, as this server saw
+    /// it. Older peers send none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_from: Option<std::net::IpAddr>,
 }
 
 /// Highest protocol version both ranges include.

@@ -80,6 +80,8 @@ impl Safety {
                 self.observed.insert(ip, (who, now));
             }
             prune_observed(&mut self.observed, now);
+            // Addresses peers saw this node connect from protect at once.
+            self.add_public(&node.status.public_addresses());
         }
         let due = if self.retry { RETRY } else { REFRESH };
         if self.built.is_some_and(|t| t.elapsed() < due) {
@@ -131,7 +133,16 @@ impl Safety {
             }
         }
         self.own = own.into_iter().map(crate::net::canonical).collect();
+        if let Some(node) = node {
+            self.add_public(&node.status.public_addresses());
+        }
         self.published = published;
+    }
+
+    /// Count `addrs` (this node's peer-observed public addresses) as its own.
+    pub fn add_public(&mut self, addrs: &[IpAddr]) {
+        self.own
+            .extend(addrs.iter().map(|ip| crate::net::canonical(*ip)));
     }
 
     /// Resolve `host:port` (or a bare host); on failure the previous
@@ -562,6 +573,22 @@ mod tests {
             !m.contains_key(&ip(OBSERVED_MAX as u32 + 1)),
             "the oldest go"
         );
+    }
+
+    #[tokio::test]
+    async fn peer_observed_public_addresses_are_refused_like_own_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "database_path = \"{d}/t.db\"\ndata_dir = \"{d}\"\n",
+            d = dir.path().display()
+        ))
+        .unwrap();
+        let mut s = Safety::new(&cfg);
+        s.refresh(&cfg, None).await;
+        let ip: IpAddr = "203.0.113.77".parse().unwrap();
+        assert!(s.refuses(&ip).is_none());
+        s.add_public(&[ip]);
+        assert_eq!(s.refuses(&ip).as_deref(), Some("this node's own address"));
     }
 
     #[tokio::test]

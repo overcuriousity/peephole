@@ -276,6 +276,13 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
     let (mut pulled, mut pushed) = (0usize, 0usize);
     if hello {
         let h = node.hello(peer, addr).await?;
+        if let Some(ip) = h.seen_from {
+            let sibling = crate::cluster::owner::fleet::siblings(&node.store)
+                .await
+                .map(|s| s.contains(&peer))
+                .unwrap_or(false);
+            node.status.note_seen_from(peer, sibling, ip);
+        }
         node.record_status(peer, &name, Ok(Some(h))).await;
     }
     let ours = repl::heads(&node.store).await?;
