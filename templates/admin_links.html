@@ -6,7 +6,7 @@
 <nav class="seg subnav subtabs kinds" aria-label="Kind of link">
   {% for (k, href, group_start) in kind_tabs %}<a href="{{ href }}"{% if *group_start %} class="group-start"{% endif %} title="{% if k.identity() %}Identity: points to one operator{% else %}Software: points to the same tool, not the same operator{% endif %}"{% if *k == kind %} aria-current="true"{% endif %}>{{ k.name() }}</a>{% endfor %}
 </nav>
-<div class="page-head"><div><h1>Links</h1><p class="muted">What ties source IPs together. Browser fingerprints, SSH host keys and TLS certificates point to one operator; JA4, JA4H, HASSH and JA4X only to the same software. Open a value for its graph.</p></div></div>
+<div class="page-head"><div><h1>Links</h1><p class="muted">What ties source IPs together. Browser fingerprints, SSH host keys and TLS certificates point to one operator; JA4, JA4H, HASSH and JA4X only to the same software. Favicon, JARM, page and 404 hashes say <em>same product</em>, not <em>same operator</em>. Open a value for its graph.</p></div></div>
 <div class="stack">
 {% if let Some(a) = not_found %}<div class="card empty">The old link <span class="mono">{{ a }}</span> no longer matches anything stored.</div>{% endif %}
 <section class="card">
