@@ -80,7 +80,7 @@ pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
         let Some(m) = members.get(&id) else { continue };
         if id == me
             || node.is_blocked(&id)
-            || m.proto_max < crate::cluster::rpc::proto::OWNER_PROTO
+            || !pays_with(m.proto_max)
             || node.dial_address(&id).is_none()
         {
             continue;
@@ -179,10 +179,10 @@ pub enum Declined {
     NotCovered(String),
 }
 
-/// The checks `serve` does on an offer before answering: wait for the
-/// entry, is an offer, for me, seal consistent, not already serving,
-/// standing, counts, open, `margin_ms` left (see [`SERVE_MARGIN_MS`]),
-/// amount covers `price`.
+/// The checks `serve` does on an offer before answering: the asker is of
+/// the market ([`pays_with`]), wait for the entry, is an offer, for me,
+/// seal consistent, not already serving, standing, counts, open,
+/// `margin_ms` left (see [`SERVE_MARGIN_MS`]), amount covers `price`.
 pub async fn accept_offer(
     node: &Arc<Node>,
     peer: NodeId,
@@ -192,6 +192,14 @@ pub async fn accept_offer(
     margin_ms: u64,
 ) -> Result<Accepted, Declined> {
     let why = |w: String| Err(Declined::Why(w));
+    if !node
+        .members()
+        .get(&peer)
+        .is_some_and(|m| pays_with(m.proto_max))
+    {
+        release(node, peer, offer_seq).await;
+        return why("your node predates the market (protocol 4): upgrade it to pay here".into());
+    }
     let Some(entry) = wait_for(node, &peer, offer_seq).await else {
         return why(format!(
             "the offer (entry {offer_seq} of your node's log) did not arrive here"
@@ -681,6 +689,16 @@ pub async fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_market_nodes_are_paid() {
+        assert_eq!(crate::cluster::rpc::proto::MARKET_PROTO, 4);
+        assert!(
+            crate::cluster::rpc::proto::PROTO_VERSION >= crate::cluster::rpc::proto::MARKET_PROTO
+        );
+        assert!(!pays_with(3));
+        assert!(pays_with(4));
+    }
 
     #[test]
     fn an_offer_is_served_only_with_time_left_to_be_charged() {

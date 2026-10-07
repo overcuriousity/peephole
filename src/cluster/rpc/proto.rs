@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Highest protocol version this build speaks.
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 /// Lowest protocol version this build still speaks. Version 1 let any
 /// member revoke others and delete their records; it is not spoken.
 pub const PROTO_MIN: u32 = 2;

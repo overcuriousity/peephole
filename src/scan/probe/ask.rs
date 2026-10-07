@@ -29,6 +29,15 @@ fn price_at(node: &Node, id: &NodeId) -> Option<u32> {
     if *id == node.id() {
         return node.prober().map(|_| 0);
     }
+    // Another node's probe is paid: only a member that counts with the
+    // market's rules can be paid.
+    if !node
+        .members()
+        .get(id)
+        .is_some_and(|m| pay::pays_with(m.proto_max))
+    {
+        return None;
+    }
     node.status.known(id)?.hb.probe_price_mc
 }
 
