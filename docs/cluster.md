@@ -164,14 +164,16 @@ earn most of the new money, every member a little.
   destroys credits: a payment moves the full price.
 - **Prices.** One rule per good, computed hourly on each node: excess
   demand raises a price by at most a factor of e^0.45 an hour, excess
-  supply lowers it by at most a factor of e^-0.15 an hour, and a price
-  never goes under 0.001 credits. What a node answers itself is free (its
-  own providers, prober, resolver, scanner). What another node answers is
-  paid, whoever owns it, the Tor exit list, RDAP, InternetDB and GeoLite2
-  included; there is no free quota. A provider with an API budget offers
-  its on-demand share (`[enrichment] on_demand_share`); one without, and
-  name resolution, offer `[enrichment] offer_per_day` (default 1000) a
-  day. Askers go to the cheapest server first. The Lookup page runs this
+  supply lowers it by at most a factor of e^-0.15 an hour (a lookup,
+  probe or resolution price counted over a shorter period takes that
+  share of a step), a price moves at least 0.001 credits toward the
+  imbalance, and it never goes under 0.001 credits. What a node answers
+  itself is free (its own providers, prober, resolver, scanner). What
+  another node answers is paid, whoever owns it, the Tor exit list,
+  RDAP, InternetDB and GeoLite2 included; there is no free quota. A
+  provider with an API budget offers its on-demand share (`[enrichment]
+  on_demand_share`); one without, and name resolution, offer
+  `[enrichment] offer_per_day` (default 1000) a day. Askers go to the cheapest server first. The Lookup page runs this
   node's own providers by itself and asks other nodes only for the
   providers picked; an automatic lookup never buys from another node.
 - **Domains.** A lookup of a domain asks 5 resolvers (nodes of the
