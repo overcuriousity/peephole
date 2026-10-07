@@ -64,7 +64,7 @@ harm. They are defaults of the build:
 
 | Parameter | Value | Meaning |
 |---|---|---|
-| `PRICE_FLOOR` | 1 mc | No price goes below (the ledger's smallest unit) |
+| `PRICE_FLOOR` | 1 mc | No price of a good with limited supply goes below (the ledger's smallest unit) |
 | `PRICE_STEP` | 0.15 | How fast a price follows the imbalance (§5) |
 
 Ratio, not level, matters: the allowance is about 1/50 of what a scanner
@@ -76,9 +76,10 @@ level against the money supply.
 - **Counted scans.** A scan counts for its scanner under today's rules of
   `earn::pay` (backed by a request held here, one per IP and 24 hours,
   built-in arguments, the scanner's standing, `PER_NODE_PER_DAY`) **and**
-  the new **cross-owner rule**: the scanner and the trap that queued the
-  job are not the same node and not siblings of one owner
-  (`cluster::owner`). Levels 3 and 4 count 2, levels 1 and 2 count 1
+  the new **own-job rule**: the scanner is not the trap that queued the
+  job. (Ownership is not replicated: a node knows only its own siblings,
+  so no node can tell that two other members share an owner; the rule
+  can only be the node key.) Levels 3 and 4 count 2, levels 1 and 2 count 1
   (the work ratio of today's tiers). Funded and unfunded jobs count alike.
 - **The split.** Each scanner gets `MINT_PER_DAY × its count / all
   counts` of day D, dated D (so it lives D … D+6). Every node computes it
@@ -108,18 +109,20 @@ level against the money supply.
 
 - **Funding.** The arbiter (the node that queued or adopted the job)
   funds its jobs from its own balance: by default
-  `[credits] scan_share = 0.5`, i.e. up to half of what it can spend may
-  be held in or paid for its own scan jobs; 0 funds nothing, 1 all. The
-  operator sets it on System › Settings (`credits.scan_share`).
-- **Order.** Funded jobs go first (by response ratio among them, as now),
-  then unfunded ones; a scanner takes unfunded jobs only when it has no
-  funded one. Fairness among claimants stays as it is.
+  `[credits] scan_share = 0.5` in the config file. What its scan offers
+  hold plus what they were charged today may reach that share of its
+  balance plus those two; 0 funds nothing, 1 everything.
+- **Order.** A scanner asks the arbiters that announce funded jobs
+  (`scan_bids` > 0) first, highest scan price first, then the others as
+  now. An arbiter that can fund grants with an offer, otherwise without.
+  Fairness among claimants stays as it is.
 - **Offer and receipt.** On a grant of a funded job the arbiter writes an
   **offer** to the scanner at its scan price (§5); the `Grant` carries the
   price. The scanner writes the **receipt** when it delivers the result,
-  charging at most the offered price; the receipt names `scan`. A scan
-  offer lapses after the job's level timeout (`pace::level_timeout_secs`)
-  plus `SERVE_MARGIN_MS`, not after 15 minutes.
+  charging the offered price for `done` and nothing otherwise; the
+  receipt names `scan`. A scan offer carries the job's uid and lapses
+  after `pace::MAX_RUN_SECS` plus `SERVE_MARGIN_MS`, not after 15
+  minutes.
 - **Declining.** A `Claim` carries the scanner's own scan price; the
   arbiter grants a funded job only at a price of at least half of it, and
   otherwise an unfunded one or nothing. So a scanner is never handed work
@@ -134,13 +137,14 @@ level against the money supply.
   50 % destruction goes: the server keeps the full charged amount.
 - **Probes.** Priced like a provider named `probe` on each scanner, with
   its probe slots as supply.
-- **Domain resolution** costs each resolver's `resolve` price; the free
-  per-hour allowance (`take_free_resolve`) and the free-lookup limit
-  (`pay::FREE_PER_HOUR`) go, since nothing is free; prices limit use.
-- **Providers without a daily budget** (Tor exit list, RDAP, GeoLite2,
-  resolution) have unlimited supply, so their price sits at the floor.
-  The Lookup page keeps running the cheap tier by itself: every provider
-  whose price is at the floor.
+- **Goods without a supply limit cost nothing.** A provider without a
+  daily budget on the serving node (Tor exit list, RDAP, GeoLite2,
+  InternetDB as configured) and domain resolution have unlimited supply,
+  and the market price of an unlimited good is zero. They stay free,
+  served without offers under the existing hourly limit
+  (`pay::FREE_PER_HOUR`): a paid entry pair in the replicated log for
+  every free answer would only bloat the log. The Lookup page runs every
+  free provider by itself.
 - **Budgets stay safe.** `[enrichment] on_demand_share` still caps what
   paid lookups take of each API budget; the share is the supply.
 - **Answers already held** (fresh under 24 h, replicated) are shown free.
@@ -157,12 +161,11 @@ with D and S over the last hour:
 | Good | Demand D | Supply S |
 |---|---|---|
 | Scan (one price per node, cluster-wide inputs) | Funded jobs waiting: the sum of the `scan_bids` arbiters announce (new heartbeat field: jobs they would fund at their price now) | Scans an hour the live, counted scanners can do (`price::capacity`, existing) |
-| Provider p on this node | Paid requests for p offered to this node | Its on-demand allowance per hour; unlimited without a budget |
-| Probe on this scanner | Probe offers to it | Its probe slots an hour |
-| Resolution on this node | Resolve requests to it | Unlimited |
+| Provider p on this node | Paid requests for p offered to this node | Its on-demand allowance per hour; without a budget the price is 0 |
+| Probe on this scanner | Probe offers to it | Its probe slots × 30 an hour (`PROBE_TIMEOUT` is 2 minutes) |
 
-- **Payments within one owner** (siblings) are not counted as demand, so
-  an owner cannot pump its own price.
+- **Requests from this node's own siblings** are not counted as demand,
+  so an owner cannot pump the price of its own nodes.
 - **A new good** starts at the median price other members announce for
   it, or at the floor.
 - **The weights go**: `weight_milli`, the unit price, the load factor,
@@ -195,7 +198,7 @@ the same rules; its changelog says so.
   sees for scans and each provider over 7 days, and income by source
   (mint, allowance, sales) for each member. Why a scan did not count
   (existing notes) stays, plus "same owner as the trap".
-- **System › Settings**: `credits.scan_share`.
+- **Config file**: `[credits] scan_share`.
 - `docs/cluster.md` Credits section rewritten to the four laws; README
   line on credits; CHANGELOG.
 
@@ -204,8 +207,8 @@ the same rules; its changelog says so.
 - **Invented or manufactured requests** cannot be told from real ones.
   They no longer mint anything, but they create jobs that idle scanners
   scan for the mint.
-- **Two unlinked keys of one operator** (a trap and a scanner) pass the
-  cross-owner rule and take a larger share of the fixed mint, at the
+- **Two keys of one operator** (a trap and a scanner) pass the own-job
+  rule and take a larger share of the fixed mint, at the
   expense of honest scanners, up to `PER_NODE_PER_DAY`. Blocking (with
   the admission subtree) is the answer.
 - **Many keys** each draw the allowance. Joining needs an invite, a member
@@ -224,7 +227,7 @@ the same rules; its changelog says so.
 
 ## 9. Testing
 
-- `earn`: cross-owner rule (same node, siblings, unlinked), level weights,
+- `earn`: own-job rule, level weights,
   the mint split of a day (shares sum to `MINT_PER_DAY`, empty day mints
   nothing), late scans shifting shares.
 - Allowance: gates, the active-that-day condition, day dating.
