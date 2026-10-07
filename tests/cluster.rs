@@ -5067,7 +5067,9 @@ async fn a_resolution_for_another_member_is_paid_and_a_failed_one_is_free() {
         assert_eq!(book.ledger.held(&a.id), 0);
     }
     // Nobody resolves it: the offer comes back with a receipt of nothing.
-    let (t, r) = dns::lookup(&rec(&na), &geo, "nothing.invalid").await.unwrap();
+    let (t, r) = dns::lookup(&rec(&na), &geo, "nothing.invalid")
+        .await
+        .unwrap();
     assert_eq!(t.answered, 0, "{t:?}");
     assert!(r.is_none());
     eventually("both hold the second offer and its receipt", || async {

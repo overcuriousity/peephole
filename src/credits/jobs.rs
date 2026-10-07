@@ -278,7 +278,10 @@ mod tests {
             ledger::parts_from(&lots, 50, first_day_for_job(late)),
             Some(vec![(DAY, 50)])
         );
-        assert_eq!(ledger::parts_from(&lots, 120, first_day_for_job(late)), None);
+        assert_eq!(
+            ledger::parts_from(&lots, 120, first_day_for_job(late)),
+            None
+        );
     }
 
     #[test]

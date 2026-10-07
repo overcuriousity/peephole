@@ -115,7 +115,10 @@ pub fn parts_from(lots: &[(u32, Mc)], mc: Mc, first_day: u32) -> Option<Vec<(u32
     }
     let mut left = mc;
     let mut parts = vec![];
-    for &(day, have) in lots.iter().filter(|(day, have)| *day >= first_day && *have > 0) {
+    for &(day, have) in lots
+        .iter()
+        .filter(|(day, have)| *day >= first_day && *have > 0)
+    {
         let take = have.min(left).min(u32::MAX as Mc);
         parts.push((day, take as u32));
         left -= take;

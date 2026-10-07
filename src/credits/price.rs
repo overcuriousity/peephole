@@ -561,14 +561,8 @@ mod tests {
         assert!(p >= bound, "{p} moved past {bound}");
         assert!(step(100_000, 0.0, 10.0) < bound - 10_000, "a full step");
         // An hour or longer: one full step, never more.
-        assert_eq!(
-            flow_step(100_000, 0.0, 10.0, 1.0),
-            step(100_000, 0.0, 10.0)
-        );
-        assert_eq!(
-            flow_step(100_000, 0.0, 10.0, 5.0),
-            step(100_000, 0.0, 10.0)
-        );
+        assert_eq!(flow_step(100_000, 0.0, 10.0, 1.0), step(100_000, 0.0, 10.0));
+        assert_eq!(flow_step(100_000, 0.0, 10.0, 5.0), step(100_000, 0.0, 10.0));
         // A small price still moves by the 1 mc minimum.
         assert_eq!(flow_step(5, 0.0, 4.0, minute), 4);
     }

@@ -277,14 +277,26 @@ mod tests {
         let mut conn = store.pool.acquire().await.unwrap();
         let kept = offer("job".into());
         let e = WireEntry::sign(&a, 3, at(1), &kept).unwrap();
-        assert!(apply(&mut conn, &e, &kept, SealState::Consistent).await.unwrap());
+        assert!(
+            apply(&mut conn, &e, &kept, SealState::Consistent)
+                .await
+                .unwrap()
+        );
         let long = offer("j".repeat(65));
         let e = WireEntry::sign(&a, 4, at(2), &long).unwrap();
-        assert!(!apply(&mut conn, &e, &long, SealState::Consistent).await.unwrap());
+        assert!(
+            !apply(&mut conn, &e, &long, SealState::Consistent)
+                .await
+                .unwrap()
+        );
         // 64 bytes is still a job.
         let edge = offer("j".repeat(64));
         let e = WireEntry::sign(&a, 5, at(3), &edge).unwrap();
-        assert!(apply(&mut conn, &e, &edge, SealState::Consistent).await.unwrap());
+        assert!(
+            apply(&mut conn, &e, &edge, SealState::Consistent)
+                .await
+                .unwrap()
+        );
         drop(conn);
         let got = get(&store.pool, &a.id, 3).await.unwrap().unwrap();
         assert_eq!(
