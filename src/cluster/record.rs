@@ -10,6 +10,69 @@ use std::net::IpAddr;
 
 const SIG_DOMAIN: &[u8] = b"peephole-repl-v1\0";
 
+/// Addresses inside a record as text. The CBOR encoder writes a bare
+/// `IpAddr` in its compact form, but `Record`'s tag buffers the fields and
+/// the buffered decoder expects text, so a record with an address would
+/// never decode on its peers.
+mod ip_text {
+    use super::NodeId;
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::net::IpAddr;
+
+    fn parse<E: Error>(t: &str) -> Result<IpAddr, E> {
+        t.parse().map_err(E::custom)
+    }
+
+    pub mod opt {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(v: &Option<IpAddr>, s: S) -> Result<S::Ok, S::Error> {
+            v.map(|a| a.to_string()).serialize(s)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<IpAddr>, D::Error> {
+            Option::<String>::deserialize(d)?
+                .map(|t| parse(&t))
+                .transpose()
+        }
+    }
+
+    pub mod answers {
+        use super::*;
+
+        type Answers = Vec<(NodeId, Result<Vec<IpAddr>, String>)>;
+        type Wire = Vec<(NodeId, Result<Vec<String>, String>)>;
+
+        pub fn serialize<S: Serializer>(v: &Answers, s: S) -> Result<S::Ok, S::Error> {
+            let w: Wire = v
+                .iter()
+                .map(|(n, r)| {
+                    let r = r
+                        .as_ref()
+                        .map(|a| a.iter().map(IpAddr::to_string).collect())
+                        .map_err(Clone::clone);
+                    (*n, r)
+                })
+                .collect();
+            w.serialize(s)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Answers, D::Error> {
+            Wire::deserialize(d)?
+                .into_iter()
+                .map(|(n, r)| {
+                    let r = match r {
+                        Ok(a) => Ok(a.iter().map(|t| parse(t)).collect::<Result<_, _>>()?),
+                        Err(e) => Err(e),
+                    };
+                    Ok((n, r))
+                })
+                .collect()
+        }
+    }
+}
+
 /// Self-description of a node, as carried in membership records.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemberInfo {
@@ -281,6 +344,7 @@ pub struct ProbeResultRec {
     pub asker: NodeId,
     /// The address the probe came from, and how it was learned:
     /// `public`, `dialled` or `local`.
+    #[serde(with = "ip_text::opt")]
     pub vantage_ip: Option<IpAddr>,
     pub vantage_ip_source: String,
     pub started_at: String,
@@ -306,6 +370,7 @@ pub struct IpNameRec {
     pub uid: String,
     pub name: String,
     pub at: String,
+    #[serde(with = "ip_text::answers")]
     pub answers: Vec<(NodeId, Result<Vec<IpAddr>, String>)>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub build: String,
@@ -607,6 +672,42 @@ impl WireEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records naming addresses decode on the peers they are sent to.
+    #[test]
+    fn records_with_addresses_round_trip() {
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        let b: IpAddr = "2001:db8::1".parse().unwrap();
+        let probe = Record::ProbeResult(ProbeResultRec {
+            uid: "u".into(),
+            group: "g".into(),
+            ip: "203.0.113.1".into(),
+            asker: NodeId([1; 32]),
+            vantage_ip: Some(a),
+            vantage_ip_source: "dialled".into(),
+            started_at: "2026-01-01 00:00:00".into(),
+            finished_at: "2026-01-01 00:00:00".into(),
+            rtt_min_ms: Some(1),
+            ports: vec![],
+            build: String::new(),
+            charged_mc: 5,
+        });
+        let name = Record::IpName(IpNameRec {
+            uid: "n".into(),
+            name: "a.example".into(),
+            at: "2026-01-01 00:00:00".into(),
+            answers: vec![
+                (NodeId([1; 32]), Ok(vec![a, b])),
+                (NodeId([2; 32]), Err("timeout".into())),
+            ],
+            build: String::new(),
+        });
+        for r in [probe, name] {
+            let enc = crate::cluster::rpc::cbor::encode(&r).unwrap();
+            let back: Record = crate::cluster::rpc::cbor::decode(&enc).unwrap();
+            assert_eq!(back, r);
+        }
+    }
 
     /// A record signed before `build` existed encodes without it, so it
     /// still rebuilds byte for byte from its row.
