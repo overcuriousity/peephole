@@ -31,6 +31,7 @@
   <dl class="kv">
     <dt>Version</dt><dd class="mono">{{ chrome.version }}</dd>
     <dt>Rules</dt><dd><span class="mono" title="Fingerprint of the rules built into this binary: {{ rules }}">{{ rules_short }}</span> <span class="muted small">built in</span></dd>
+    {% if let Some(addrs) = public_addrs %}<dt>Public address (seen by peers)</dt><dd>{% if addrs.is_empty() %}<span class="muted">none reported</span>{% endif %}{% for a in addrs %}<div class="mono">{{ a }}</div>{% endfor %}</dd>{% endif %}
     {% if let Some(t) = tarpit %}<dt>Tarpit</dt><dd>{{ t }} <a class="small" href="/requests?answer=tarpit">requests</a></dd>{% endif %}
   </dl>
 </section>

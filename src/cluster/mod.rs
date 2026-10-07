@@ -783,7 +783,14 @@ impl Node {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            seen_from: None,
         }
+    }
+
+    /// This node's public addresses as its peers see them (see
+    /// [`status::Status::public_addresses`]).
+    pub fn public_addrs(&self) -> Vec<std::net::IpAddr> {
+        self.status.public_addresses()
     }
 
     /// HTTP client that only talks to `peer` (its key is pinned in TLS).

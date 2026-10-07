@@ -142,6 +142,35 @@ struct StatusPage {
     rules_short: String,
     /// How full this node's tarpit is; None without a trap here.
     tarpit: Option<String>,
+    /// One line per address peers saw this node connect from; None on a
+    /// standalone node.
+    public_addrs: Option<Vec<String>>,
+}
+
+/// The addresses peers saw this node connect from, as System › Status says
+/// them: who reported each, and whether it is taken.
+fn public_addr_lines(node: &crate::cluster::Node) -> Vec<String> {
+    let members = node.members();
+    node.status
+        .seen_from_report()
+        .into_iter()
+        .map(|(ip, who, taken)| {
+            let names: Vec<String> = who
+                .iter()
+                .map(|(id, _)| {
+                    members
+                        .get(id)
+                        .map(|m| m.name.clone())
+                        .unwrap_or_else(|| id.short())
+                })
+                .collect();
+            let mut line = format!("{ip} ({})", names.join(", "));
+            if !taken {
+                line.push_str(" · reported by one member, not taken");
+            }
+            line
+        })
+        .collect()
 }
 
 /// This node's tarpit, as System › Status says it.
@@ -179,6 +208,7 @@ async fn status(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult
             .take(crate::admin::cluster::SHORT_HASH)
             .collect(),
         tarpit: st.tarpit.as_ref().map(|t| tarpit_line(t.status())),
+        public_addrs: st.recorder.node().map(|n| public_addr_lines(n)),
     })
 }
 

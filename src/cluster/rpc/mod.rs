@@ -301,8 +301,16 @@ async fn require_member(
     }
 }
 
-async fn hello(State(node): State<Arc<Node>>, Cbor(theirs): Cbor<Hello>) -> Response {
-    let ours = node.local_hello();
+async fn hello(
+    State(node): State<Arc<Node>>,
+    Extension(server::RemoteAddr(addr)): Extension<server::RemoteAddr>,
+    Cbor(theirs): Cbor<Hello>,
+) -> Response {
+    // Tell the caller where it came from: its peer-observed public address.
+    let ours = Hello {
+        seen_from: Some(addr.ip()),
+        ..node.local_hello()
+    };
     match proto::negotiate(
         (ours.proto_min, ours.proto_max),
         (theirs.proto_min, theirs.proto_max),
