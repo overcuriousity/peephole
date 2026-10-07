@@ -16,7 +16,7 @@ use crate::cluster::record::{JobStatusRec, Record};
 use crate::store::data::now_ts;
 use crate::store::recorder::Recorder;
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -32,6 +32,47 @@ const LATER_BACKOFF: Duration = Duration::from_secs(180);
 struct Lease {
     scanner: NodeId,
     expires: Instant,
+    /// Whether this arbiter funded the grant (an offer or a self tally):
+    /// only then does a turn-down count against the scanner.
+    funded: bool,
+}
+
+/// A claimant that delivered less than this share of at least
+/// [`DELIVERY_MIN_GRANTS`] grants of this arbiter in the past 24 hours
+/// goes after all others.
+const DELIVERY_MIN: f64 = 0.5;
+const DELIVERY_MIN_GRANTS: usize = 5;
+const DELIVERY_WINDOW: Duration = Duration::from_secs(24 * 3600);
+
+/// Whether a scanner's recent grants of this arbiter came back delivered
+/// often enough (`(when, delivered)` outcomes).
+fn delivers(outcomes: &VecDeque<(Instant, bool)>, now: Instant) -> bool {
+    let recent: Vec<bool> = outcomes
+        .iter()
+        .filter(|(t, _)| now.saturating_duration_since(*t) < DELIVERY_WINDOW)
+        .map(|(_, ok)| *ok)
+        .collect();
+    if recent.len() < DELIVERY_MIN_GRANTS {
+        return true;
+    }
+    recent.iter().filter(|ok| **ok).count() as f64 >= DELIVERY_MIN * recent.len() as f64
+}
+
+/// Whether a scanner already got what it can do in an hour from this
+/// arbiter. Unknown capacity never gates.
+fn over_capacity(granted_last_hour: i64, can_do: Option<f64>) -> bool {
+    can_do.is_some_and(|c| granted_last_hour as f64 >= c.max(1.0))
+}
+
+/// Sort key of a claimant: not demoted first, then the price this
+/// arbiter would pay (unpaid after every price), fewest recent scans, key.
+fn claim_order(
+    price: Option<u32>,
+    demoted: bool,
+    load: i64,
+    id: NodeId,
+) -> (bool, u32, i64, NodeId) {
+    (demoted, price.unwrap_or(u32::MAX), load, id)
 }
 
 type Waiter = (NodeId, Vec<u8>, u32, oneshot::Sender<Option<Grant>>);
@@ -48,6 +89,8 @@ pub struct Arbiter {
     declined: Mutex<HashMap<String, std::collections::HashSet<NodeId>>>,
     /// Scanners that handed a job back for now, until when they are skipped.
     later: Mutex<HashMap<String, HashMap<NodeId, Instant>>>,
+    /// How recent grants to each scanner ended, for [`delivers`].
+    outcomes: Mutex<HashMap<NodeId, VecDeque<(Instant, bool)>>>,
     /// Serializes hand-outs and state writes.
     assign: tokio::sync::Mutex<()>,
 }
@@ -66,6 +109,7 @@ impl Arbiter {
             lease: Duration::from_secs(node.cfg.lease_secs),
             node: node.clone(),
             leases: Mutex::new(HashMap::new()),
+            outcomes: Mutex::new(HashMap::new()),
             waiting: Mutex::new(vec![]),
             order: super::order::Cached::new(),
             declined: Mutex::new(HashMap::new()),
@@ -114,6 +158,7 @@ impl Arbiter {
                         Lease {
                             scanner: s,
                             expires: Instant::now() + self.lease,
+                            funded: false,
                         },
                     );
                 }
@@ -176,26 +221,58 @@ impl Arbiter {
     async fn scans_last_hour(&self, scanner: &NodeId) -> i64 {
         sqlx::query_scalar(
             // Like the scanners' own rate count: a grant turned down ran nothing.
-            "SELECT COUNT(*) FROM scan_jobs WHERE scanner = ? AND started_at > datetime('now','-1 hour')
+            "SELECT COUNT(*) FROM scan_jobs WHERE scanner = ? AND arbiter = ? AND started_at > datetime('now','-1 hour')
                AND status NOT IN ('refused','superseded')",
         )
         .bind(&scanner.0[..])
+        .bind(&self.node.id().0[..])
         .fetch_one(&self.node.store.pool)
         .await
         .unwrap_or(0)
     }
 
+    /// Remember how a grant to `scanner` ended, for [`delivers`].
+    fn note_outcome(&self, scanner: NodeId, delivered: bool) {
+        let now = Instant::now();
+        let mut o = self.outcomes.lock().unwrap();
+        let q = o.entry(scanner).or_default();
+        q.push_back((now, delivered));
+        while q
+            .front()
+            .is_some_and(|(t, _)| now.saturating_duration_since(*t) >= DELIVERY_WINDOW)
+        {
+            q.pop_front();
+        }
+    }
+
     async fn hand_out(&self) -> Result<()> {
         let _g = self.assign.lock().await;
-        let mut waiters = std::mem::take(&mut *self.waiting.lock().unwrap());
+        let waiters = std::mem::take(&mut *self.waiting.lock().unwrap());
         let mut load = HashMap::new();
         for (s, _, _, _) in &waiters {
             if !load.contains_key(s) {
                 load.insert(*s, self.scans_last_hour(s).await);
             }
         }
-        // Fewest recent scans first; ties broken by key so it is stable.
-        waiters.sort_by_key(|(s, _, _, _)| (load[s], *s));
+        // Cheapest first, hoarding and non-delivering scanners last, then
+        // fewest recent scans; ties broken by key so it is stable.
+        let table = self.node.price_table();
+        let now = Instant::now();
+        let mut keyed = vec![];
+        for w in waiters {
+            let s = w.0;
+            let price = crate::credits::jobs::price_for(&self.node, &s);
+            let demoted = over_capacity(load[&s], table.can_do(&s))
+                || !self
+                    .outcomes
+                    .lock()
+                    .unwrap()
+                    .get(&s)
+                    .is_none_or(|o| delivers(o, now));
+            keyed.push((claim_order(price, demoted, load[&s], s), w));
+        }
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        let waiters: Vec<Waiter> = keyed.into_iter().map(|(_, w)| w).collect();
         // One book for the round; what each funded grant commits is
         // carried to the next, so the budget is never overspent.
         let mut funding = crate::credits::jobs::Funding::default();
@@ -237,6 +314,9 @@ impl Arbiter {
         {
             g.offer_seq = seq;
             g.price_mc = price;
+            if let Some(l) = self.leases.lock().unwrap().get_mut(&g.job_uid) {
+                l.funded = g.offer_seq.is_some() || g.price_mc > 0;
+            }
             info!(job = %g.job_uid, scanner = %scanner.short(),
                 price = %crate::credits::show(price as u64), "scan job funded");
         }
@@ -346,6 +426,7 @@ impl Arbiter {
             Lease {
                 scanner,
                 expires: Instant::now() + self.lease,
+                funded: false,
             },
         );
         Ok(Some(Grant {
@@ -429,7 +510,11 @@ impl Arbiter {
             return false;
         }
         let _g = self.assign.lock().await;
-        let holder = self.leases.lock().unwrap().get(uid).map(|l| l.scanner);
+        let (holder, funded) = {
+            let leases = self.leases.lock().unwrap();
+            let l = leases.get(uid);
+            (l.map(|l| l.scanner), l.is_some_and(|l| l.funded))
+        };
         // After an arbiter restart the lease may be gone; the replicated
         // scanner column still says who ran it.
         let ok = match holder {
@@ -441,6 +526,12 @@ impl Arbiter {
             return false;
         }
         self.leases.lock().unwrap().remove(uid);
+        match status {
+            "done" => self.note_outcome(scanner, true),
+            "failed" => self.note_outcome(scanner, false),
+            "later" | "declined" if funded => self.note_outcome(scanner, false),
+            _ => {}
+        }
         if status == "declined" {
             return self.decline(scanner, uid, error).await;
         }
@@ -580,6 +671,7 @@ impl Arbiter {
             .bind(&uid)
             .fetch_one(&self.node.store.pool)
             .await?;
+            self.note_outcome(scanner, has_result > 0);
             if has_result > 0 {
                 self.set_state(&uid, "done", None, Some(now_ts())).await?;
             } else {
@@ -736,6 +828,50 @@ async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Re
 mod tests {
     use super::*;
     use crate::cluster::identity::Identity;
+
+    #[test]
+    fn a_scanner_delivers_unless_it_failed_half_of_five_recent_grants() {
+        let now = Instant::now();
+        let mut o = VecDeque::new();
+        for ok in [false, false, false, false] {
+            o.push_back((now, ok));
+        }
+        assert!(delivers(&o, now), "fewer than 5 grants: no judgement");
+        o.push_back((now, true));
+        assert!(!delivers(&o, now), "1 of 5 delivered");
+        for _ in 0..4 {
+            o.push_back((now, true));
+        }
+        assert!(delivers(&o, now), "5 of 9 delivered");
+        let old = VecDeque::from(vec![(now - Duration::from_secs(25 * 3600), false); 9]);
+        assert!(delivers(&old, now), "only the past 24 hours count");
+    }
+
+    #[test]
+    fn capacity_gate_needs_a_known_capacity() {
+        assert!(!over_capacity(100, None), "unknown capacity never gates");
+        assert!(!over_capacity(9, Some(10.0)));
+        assert!(over_capacity(10, Some(10.0)));
+    }
+
+    #[test]
+    fn claimants_go_cheapest_first_and_demoted_ones_last() {
+        let (a, b, c, d) = (
+            NodeId([1; 32]),
+            NodeId([2; 32]),
+            NodeId([3; 32]),
+            NodeId([4; 32]),
+        );
+        let mut v = vec![
+            claim_order(Some(50), false, 0, a),
+            claim_order(Some(20), false, 9, b),
+            claim_order(Some(5), true, 0, c), // cheapest but hoarding
+            claim_order(None, false, 0, d),   // no price: after the priced ones
+        ];
+        v.sort();
+        let order: Vec<NodeId> = v.into_iter().map(|k| k.3).collect();
+        assert_eq!(order, vec![b, a, d, c]);
+    }
 
     type Setup = (
         Arc<Node>,
