@@ -24,9 +24,20 @@ pub const PROBES_PER_SLOT_HOUR: f64 = 30.0;
 /// price moves by at least 1 mc when they differ, so rounding does not
 /// hold a small price where it is.
 pub fn step(price: Mc, demand: f64, supply: f64) -> Mc {
+    scaled_step(price, demand, supply, 1.0)
+}
+
+/// A step of a flow good (demand and supply counted over `hours`): a
+/// period shorter than an hour moves the price by that share of a full
+/// step, so the first refresh after a start does not take a whole one.
+pub fn flow_step(price: Mc, demand: f64, supply: f64, hours: f64) -> Mc {
+    scaled_step(price, demand, supply, hours.clamp(0.0, 1.0))
+}
+
+fn scaled_step(price: Mc, demand: f64, supply: f64, scale: f64) -> Mc {
     let price = price.max(PRICE_FLOOR);
     let x = ((demand - supply) / supply.max(1.0)).clamp(-3.0, 3.0);
-    let p = (price as f64 * (PRICE_STEP * x).exp()).round();
+    let p = (price as f64 * (PRICE_STEP * scale * x).exp()).round();
     let p = (p.min(u32::MAX as f64) as Mc).max(PRICE_FLOOR);
     match p == price {
         true if x > 0.0 => price.saturating_add(1).min(u32::MAX as Mc),
@@ -49,10 +60,11 @@ pub fn start(announced: &[u32]) -> Mc {
 /// A provider's next price here: a step from `current` (or the floor)
 /// with `per_day` spread over `hours` as supply.
 pub fn provider_price(per_day: u32, current: Option<Mc>, demand: f64, hours: f64) -> Mc {
-    step(
+    flow_step(
         current.unwrap_or(PRICE_FLOOR),
         demand,
         per_day as f64 / 24.0 * hours,
+        hours,
     )
 }
 
@@ -398,23 +410,26 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         });
     }
     let resolve_cur = current(node, &old, RESOLVE, &ann(RESOLVE)).await?;
-    let resolve_mc = as_mc(step(
+    let resolve_mc = as_mc(flow_step(
         resolve_cur,
         got(RESOLVE),
         offer_per_day as f64 / 24.0 * hours,
+        hours,
     ));
     let probe_mc = match node.prober() {
         Some(pr) => {
             let cur = current(node, &old, PROBE, &ann(PROBE)).await?;
-            Some(as_mc(step(
+            Some(as_mc(flow_step(
                 cur,
                 got(PROBE),
                 pr.slots() as f64 * PROBES_PER_SLOT_HOUR * hours,
+                hours,
             )))
         }
         None => None,
     };
-    // Funded jobs waiting now against what the scanners do in an hour.
+    // Funded jobs waiting now (a stock, not a flow over `hours`) against
+    // what the scanners do in an hour: a full step.
     let scan_cur = current(node, &old, SCAN, &ann(SCAN)).await?;
     let scan_mc = as_mc(step(scan_cur, bids as f64, capacity.per_day / 24.0));
     for (good, mc) in offers
@@ -533,6 +548,29 @@ mod tests {
         assert_eq!(p, PRICE_FLOOR);
         assert_eq!(step(3, 0.0, 50.0), 2, "rounding does not hold it");
         assert!(step(PRICE_FLOOR, 5.0, 0.0) > PRICE_FLOOR);
+    }
+
+    #[test]
+    fn a_short_period_moves_a_flow_price_by_its_share_of_a_step() {
+        // One minute with no demand at all: at most e^(−0.15/60) down,
+        // where a full step would take e^(−0.15).
+        let minute = 1.0 / 60.0;
+        let p = provider_price(240, Some(100_000), 0.0, minute);
+        let bound = (100_000.0 * (-0.15f64 / 60.0).exp()).round() as Mc;
+        assert!(p < 100_000, "it still moves: {p}");
+        assert!(p >= bound, "{p} moved past {bound}");
+        assert!(step(100_000, 0.0, 10.0) < bound - 10_000, "a full step");
+        // An hour or longer: one full step, never more.
+        assert_eq!(
+            flow_step(100_000, 0.0, 10.0, 1.0),
+            step(100_000, 0.0, 10.0)
+        );
+        assert_eq!(
+            flow_step(100_000, 0.0, 10.0, 5.0),
+            step(100_000, 0.0, 10.0)
+        );
+        // A small price still moves by the 1 mc minimum.
+        assert_eq!(flow_step(5, 0.0, 4.0, minute), 4);
     }
 
     #[test]
