@@ -280,9 +280,6 @@ pub struct Node {
     prober: std::sync::OnceLock<Arc<crate::scan::probe::serve::Prober>>,
     /// This node's lookup prices, as last computed (`credits::price`).
     price_table: RwLock<Arc<crate::credits::price::Table>>,
-    /// The fleet node this node forwards its credits to and draws from
-    /// (the runtime setting `credits.collect_to`).
-    pub collect_to: RwLock<Option<NodeId>>,
     /// Paid requests counted for this node's prices (`credits::price`).
     pub market: crate::credits::price::Demand,
     /// Funded scan jobs this node would grant now (`credits::jobs`).
@@ -354,7 +351,6 @@ impl Node {
             lookup_shares: Default::default(),
             prober: Default::default(),
             price_table: Default::default(),
-            collect_to: RwLock::new(None),
             market: Default::default(),
             scan_bids: Default::default(),
             scan_share: Default::default(),

@@ -3718,55 +3718,6 @@ async fn rotating_the_key_moves_reachable_siblings_and_retries_the_rest() {
     );
 }
 
-/// "Collect credits here": the siblings that answer forward to this node,
-/// one blocked here is not asked, and the page says where each node's
-/// credits go.
-#[tokio::test]
-async fn collecting_credits_here_tells_the_siblings_and_shows_where_credits_go() {
-    use peephole::cluster::owner::{self, fleet};
-    let (ia, a) = new_node("node-alpha");
-    let (ib, b) = new_node("node-bravo");
-    let (ic, c) = new_node("node-charlie");
-    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
-    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
-    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
-    let key = owner::create(&na.store, a.id).await.unwrap();
-    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
-    owner::adopt(&nc.store, c.id, &key, false).await.unwrap();
-    eventually("a finds b and c", || async {
-        fleet::discover(&na.node).await.unwrap().len() == 2
-    })
-    .await;
-    peephole::cluster::block::block(&na.node, c.id)
-        .await
-        .unwrap();
-    let (admin, base) = admin_on(&na).await;
-    let page = format!("{base}/admin/cluster/ownership");
-    let r = admin
-        .post(format!("{page}/collect-here"))
-        .send()
-        .await
-        .unwrap();
-    assert!(r.status().is_success());
-    assert_eq!(nb.settings.snapshot().collect_to, Some(a.id));
-    assert_eq!(nc.settings.snapshot().collect_to, None, "not asked");
-    assert_eq!(na.settings.snapshot().collect_to, None);
-
-    eventually("b's status reaches the page", || async {
-        let html = text(&admin, page.clone()).await;
-        html.contains("Credits go") && html.contains("forwards to this node")
-    })
-    .await;
-    let html = text(&admin, page.clone()).await;
-    assert!(
-        html.contains("keeps what it earns"),
-        "a keeps its own: {html}"
-    );
-    assert!(html.contains("offline"), "c is not asked: {html}");
-}
-
-/// The Ownership page: create a key (shown once), adopt it on a second
-/// node, see that node listed, see received commands, forget and release.
 #[tokio::test]
 async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
     use peephole::cluster::owner::{self, cmd, fleet};
@@ -3959,10 +3910,6 @@ async fn admin_manages_a_sibling_from_its_page() {
     assert!(html.contains("node-bravo") && html.contains(">yours<"));
     assert!(html.contains("name=\"base_version\" value=\"0\""), "{html}");
     assert!(
-        html.contains("Collect credits at") && html.contains(&format!("value=\"{}\"", a.id)),
-        "this node is offered as b's collecting node: {html}"
-    );
-    assert!(
         !html.contains("Remote configuration"),
         "the old line is gone"
     );
@@ -3981,14 +3928,12 @@ async fn admin_manages_a_sibling_from_its_page() {
             ("cooldown_hours", "12"),
             ("listener", "on"),
             ("web", "on"),
-            ("collect_to", &a.id.to_string()),
         ])
         .send()
         .await
         .unwrap();
     assert!(r.status().is_success());
     let s = nb.settings.snapshot();
-    assert_eq!(s.collect_to, Some(a.id), "b now forwards to a");
     assert_eq!((s.pace.max_workers, s.pace.max_scans_per_hour), (3, 55));
     assert_eq!(s.pace.timeout_secs, 1200);
     assert_eq!(s.cooldown_hours, 12);
@@ -4067,29 +4012,6 @@ async fn admin_manages_a_sibling_from_its_page() {
         .unwrap();
     assert!(r.status().is_success());
     assert_eq!(na.settings.snapshot().cooldown_hours, 6);
-    // Where it forwards its credits is set here too (spec §9), and
-    // cleared with an empty field.
-    let page = text(&admin, format!("{base}/admin/system/settings")).await;
-    assert!(page.contains("name=\"collect_to\""), "{page}");
-    for (to, want) in [(b.id.to_string(), Some(b.id)), (String::new(), None)] {
-        let shown = na.settings.snapshot().version;
-        let r = admin
-            .post(format!("{base}/admin/cluster/settings"))
-            .form(&[
-                ("base_version", shown.to_string()),
-                ("cooldown_hours", "6".into()),
-                ("listener", "on".into()),
-                ("scanner", "on".into()),
-                ("web", "on".into()),
-                ("collect_to", to),
-            ])
-            .send()
-            .await
-            .unwrap();
-        assert!(r.status().is_success());
-        assert_eq!(na.settings.snapshot().collect_to, want);
-    }
-
     // A crafted form cannot aim an owner command at this node itself, or
     // at a member that is not one of the operator's nodes.
     let mine = owner::counter(&na.store).await.unwrap().to_string();
@@ -5590,92 +5512,45 @@ async fn a_paid_lookup_of_an_unrecorded_address_writes_nothing() {
     assert!(out.stored.is_empty());
 }
 
-/// A node forwards what it holds to its collecting node; the credits keep
-/// their day and can be spent there. Less than a credit waits, and
-/// nothing goes to a node that is no member.
-#[tokio::test]
-async fn a_fleet_collects_at_one_node_and_any_of_its_nodes_can_spend() {
-    use peephole::credits::{self, fleet};
-    let (ia, a) = new_node("node-alpha");
-    let (ib, b) = new_node("node-bravo");
-    let na = boot(ia, &a, &[&b], DEFAULT).await;
-    let nb = boot(ib, &b, &[&a], DEFAULT).await;
-    grant_scans(&[&na, &nb], b.id, 4).await;
-    let granted = credits::day_of(nb.hlc.now()) - 2;
-    let all = minted(4, 4);
-
-    let (_, stranger) = new_node("x");
-    assert_eq!(
-        fleet::collect(&nb.node, stranger.id).await.unwrap(),
-        0,
-        "no member"
-    );
-    assert_eq!(fleet::collect(&nb.node, b.id).await.unwrap(), 0, "itself");
-    assert_eq!(fleet::collect(&nb.node, a.id).await.unwrap(), all);
-    eventually("the credits are at a, on both nodes' books", || async {
-        let mut ok = true;
-        for n in [&na, &nb] {
-            let book = credits::book_fresh(&n.node).await.unwrap();
-            ok &= book.balance(&a.id) == all
-                && book.balance(&b.id) == 0
-                && book.ledger.by_day(&a.id) == vec![(granted, all)];
-        }
-        ok
-    })
-    .await;
-    // Sending back half a credit: any node may send to any member.
-    assert_eq!(fleet::send(&na.node, b.id, 500).await.unwrap(), 500);
-    assert!(
-        fleet::send(&na.node, b.id, all).await.is_err(),
-        "more than it holds"
-    );
-    assert!(fleet::send(&na.node, stranger.id, 1).await.is_err());
-    eventually("b holds half a credit", || async {
-        credits::book_fresh(&nb.node).await.unwrap().balance(&b.id) == 500
-    })
-    .await;
-    // Less than a credit, none of it expiring today: it waits.
-    assert_eq!(fleet::collect(&nb.node, a.id).await.unwrap(), 0);
-    // The setting reaches the node that acts on it.
-    let set = peephole::settings::Changes {
-        collect_to: Some(a.id.to_string()),
-        ..Default::default()
-    };
-    nb.settings.apply(&set, None).await.unwrap().unwrap();
-    assert_eq!(nb.settings.snapshot().collect_to, Some(a.id));
-}
-
 /// A node whose balance does not cover a lookup draws the missing amount
-/// from its collecting node, which answers only its own fleet.
+/// from its siblings, the richest first; they answer only their own fleet.
 #[tokio::test]
-async fn a_node_draws_what_a_lookup_needs_from_its_collecting_node() {
+async fn a_lookup_draws_from_the_richest_sibling() {
     use peephole::cluster::msg::Msg;
     use peephole::cluster::owner::{self, fleet as owned};
     use peephole::credits::{self, price};
     let (ia, a) = new_node("node-alpha");
     let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
     let (is, s) = new_node("node-server");
     let (ix, x) = new_node("node-x");
-    let na = boot(ia, &a, &[&b, &s, &x], DEFAULT).await;
-    let nb = boot(ib, &b, &[&a, &s, &x], DEFAULT).await;
-    let ns = boot(is, &s, &[&a, &b, &x], DEFAULT).await;
-    let nx = boot(ix, &x, &[&a, &b, &s], DEFAULT).await;
+    let na = boot(ia, &a, &[&b, &c, &s, &x], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c, &s, &x], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b, &s, &x], DEFAULT).await;
+    let ns = boot(is, &s, &[&a, &b, &c, &x], DEFAULT).await;
+    let nx = boot(ix, &x, &[&a, &b, &c, &s], DEFAULT).await;
     let key = owner::create(&na.store, a.id).await.unwrap();
     owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
-    eventually("a counts b as its own", || async {
-        owned::discover(&na.node).await.unwrap() == vec![b.id]
+    owner::adopt(&nc.store, c.id, &key, false).await.unwrap();
+    eventually("a and b count each other as their own", || async {
+        owned::discover(&na.node).await.unwrap().len() == 2
+            && owned::discover(&nb.node).await.unwrap().len() == 2
     })
     .await;
     serves(&ns, &[("abuseipdb", Some(1000.0))], 0.2);
-    // The fleet's credits sit at a; b holds nothing.
-    grant_scans(&[&na, &nb, &ns], a.id, 8).await;
+    // a is rich, c is poorer, b holds nothing.
+    grant_scans(&[&na, &nb, &nc, &ns], a.id, 8).await;
+    grant_scans(&[&na, &nb, &nc, &ns], c.id, 1).await;
     price::refresh(&ns.node).await.unwrap();
     let cost = price_seen(&nb, s.id, "abuseipdb").await as u64;
     market_known(&ns, b.id).await;
     market_known(&nb, a.id).await;
     market_known(&na, b.id).await;
-    *nb.collect_to.write().unwrap() = Some(a.id);
+    market_known(&nb, c.id).await;
 
+    // The mint's rounding left a with a little more than 8/9.
+    let a_had = credits::book_fresh(&ns.node).await.unwrap().balance(&a.id);
+    assert!(a_had >= minted(8, 9));
     // A stranger's draw is not answered, and moves nothing.
     let asked = nx
         .node
@@ -5690,7 +5565,9 @@ async fn a_node_draws_what_a_lookup_needs_from_its_collecting_node() {
     assert_eq!(found, 1, "{answers:?}");
     eventually("the fleet paid, from a's balance", || async {
         let book = credits::book_fresh(&ns.node).await.unwrap();
-        book.balance(&a.id) == minted(8, 8) - cost && book.balance(&b.id) == 0
+        book.balance(&a.id) == a_had - cost
+            && book.balance(&c.id) == minted(1, 9)
+            && book.balance(&b.id) == 0
     })
     .await;
 }

@@ -15,7 +15,7 @@ use axum::{
     response::{Html, Response},
     routing::{get, post},
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const PAGE: &str = "/admin/cluster/credits";
@@ -60,8 +60,6 @@ struct DayRow {
 struct NodeRow {
     name: String,
     balance: String,
-    /// Where it forwards its credits, as its transfers of the week show.
-    collects: String,
 }
 
 struct EarnedRow {
@@ -254,10 +252,6 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             expires: expires_in(day, l.today),
         })
         .collect();
-    let collects = match siblings.is_empty() {
-        true => HashMap::new(),
-        false => crate::admin::cluster_owner::collect_targets(node, &siblings).await,
-    };
     let fleet = (!siblings.is_empty()).then(|| {
         let all: Vec<NodeId> = std::iter::once(me)
             .chain(siblings.iter().copied())
@@ -268,7 +262,6 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             .map(|id| NodeRow {
                 name: name(id),
                 balance: show(book.balance(id)),
-                collects: collects.get(id).cloned().unwrap_or_default(),
             })
             .collect();
         (show(total), rows)

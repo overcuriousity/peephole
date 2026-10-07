@@ -127,11 +127,11 @@ pub enum Msg {
         error: Option<String>,
         data: Option<super::owner::cmd::OwnerData>,
     },
-    /// Fleet node → its collecting node: send me this much (`credits::fleet`).
+    /// A sibling → a sibling: send me this much (`credits::fleet`).
     CreditDraw {
         mc: u64,
     },
-    /// What the collecting node sent.
+    /// What the sibling sent.
     CreditDrawReply {
         sent_mc: u64,
     },

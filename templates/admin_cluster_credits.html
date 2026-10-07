@@ -87,10 +87,10 @@
   {% if let Some((_, nodes)) = fleet %}
 <div class="ledger-part"><h3>My nodes</h3>
   <div class="table-wrap"><table>
-    <thead><tr><th>Node</th><th class="num">Credits</th><th>Collects</th></tr></thead>
-    <tbody>{% for n in nodes %}<tr><td><b>{{ n.name }}</b></td><td class="num">{{ n.balance }}</td><td>{{ n.collects }}</td></tr>{% endfor %}</tbody>
+    <thead><tr><th>Node</th><th class="num">Credits</th></tr></thead>
+    <tbody>{% for n in nodes %}<tr><td><b>{{ n.name }}</b></td><td class="num">{{ n.balance }}</td></tr>{% endfor %}</tbody>
   </table></div>
-  <p class="muted small">One node can collect what the others earn (<a href="/admin/cluster/ownership">Ownership</a> › Collect credits here); each of them draws from it when a lookup needs more than it holds.</p>
+  <p class="muted small">Every node keeps what it earns. A node whose lookup needs more than it holds draws the rest from the others, the richest first.</p>
 </div>
 {% endif %}
   <details class="ledger-more"><summary>Earned, spent, sent and received</summary>
