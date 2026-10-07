@@ -78,6 +78,14 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   without a result on one line. Lookup shows one card per provider: asked
   now, from the dataset, or what the dataset holds, instead of the same
   provider twice. An "On this page" bar jumps between sections.
+- Cluster › Credits is a market dashboard: each good's price over 7 days
+  (this node's, and the lowest, median and highest that members announce),
+  its demand and supply, a price table with 24-hour change and sparklines,
+  and this node's daily income (mint, allowance, sales) against spending.
+  Prices are snapshotted hourly into `price_history` (migration 0022,
+  local, kept 8 days). The balance moved to an Overview tile (with what
+  expires by tomorrow) and the Lookup page; earned, spent and transfers
+  fold away under "Your credits".
 - The Overview's Cluster card: four headline figures (earning members,
   scan capacity with a meter, credits in circulation, audits) and the
   rest in one row.

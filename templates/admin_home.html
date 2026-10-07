@@ -18,6 +18,7 @@
   <a class="tile" href="/admin/scans#pace"><span class="label">Queued / running</span><div class="value">{{ queued }}<span class="muted"> / {{ running }}</span></div></a>
   <a class="tile" href="/admin/scans?status=done#history"><span class="label">Scans done · 24 h</span><div class="value">{{ done_24h }}</div><div class="hint">history →</div></a>
   <a class="tile" href="/admin/inbox"><span class="label">Inbox</span><div class="value">{{ inbox }}</div><div class="hint">claims</div></a>
+  {% if let Some(c) = cluster %}<a class="tile tile-balance" href="/admin/cluster/credits"><span class="label">Balance{% if c.fleet %} · your nodes{% endif %}</span><div class="value">{{ c.balance }}</div><div class="hint">credits · {{ c.expiring_soon }} expire by tomorrow</div></a>{% endif %}
 </div>
 {% if let Some(c) = cluster %}
 <section class="card cluster-card" aria-label="Cluster">
