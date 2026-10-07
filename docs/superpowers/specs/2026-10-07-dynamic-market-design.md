@@ -45,10 +45,10 @@ never be verified, so they must not mint; scans can, by audit.
 Money in circulation is therefore bounded: at most 7 days of mint plus 7
 days of allowances.
 
-## Protocol constants
+## Protocol constants and price parameters
 
-They must be identical on every node, or balances diverge; they are
-constants of the build, not settings.
+**Ledger constants** decide balances, so every node must use the same
+ones or balances diverge. They are constants of the build:
 
 | Constant | Value | Meaning |
 |---|---|---|
@@ -56,7 +56,15 @@ constants of the build, not settings.
 | `ALLOWANCE_PER_DAY` | 5 credits | Per conforming, active member per UTC day |
 | `PER_NODE_PER_DAY` | 500 (existing) | Counted scans per scanner per day |
 | `LOT_DAYS` | 7 (existing) | Lifetime of a credit |
-| `PRICE_FLOOR` | 1 mc | No price goes below |
+| Level weights | 1 (levels 1, 2), 2 (levels 3, 4) | A scan's weight in the mint split |
+
+**Price parameters** only shape the offers a node makes; a receipt never
+charges more than was offered, so nodes may differ in them without
+harm. They are defaults of the build:
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| `PRICE_FLOOR` | 1 mc | No price goes below (the ledger's smallest unit) |
 | `PRICE_STEP` | 0.15 | How fast a price follows the imbalance (§5) |
 
 Ratio, not level, matters: the allowance is about 1/50 of what a scanner
@@ -163,15 +171,26 @@ with D and S over the last hour:
   announced price stays.
 - Prices are kept across restarts (`intel_kv`, like the share counters).
 
-## 6. Compatibility
+## 6. Compatibility and later changes
 
 Balances are a pure function of the log, so an upgraded node recomputes
-the whole 8-day window under the new rules at start. Old and new nodes
+the whole 8-day window under the new rules at start. Ledger constants
+can change later only by a release that every node takes; see the open
+question on activation days below. Old and new nodes
 count different balances: a new protocol version `MARKET_PROTO`
 (`rpc::proto`, `PROTO_VERSION` 4) gates payments. New nodes neither offer
 to nor serve nodes below it; scans by old scanners still count for the
 mint on new nodes. The changelog tells operators to upgrade all their
 nodes together.
+
+**Open question: activation days.** As written, a release that changes a
+ledger constant changes it at once and for the whole 8-day window, and
+nodes disagree until all have upgraded. The alternative: the build holds
+a schedule of rule sets, each with the UTC day it applies from, and a day
+is always counted with the rules of that day. A release then announces a
+change for a day a week or two ahead, operators upgrade in that time,
+past days never change, and nodes agree throughout as long as they run a
+build that knows the schedule.
 
 ## 7. Pages and docs
 
