@@ -131,24 +131,9 @@ honeypot.
 
 ## Small follow-ups
 
-- **Peer-observed public address.** S–M, medium. A NAT'd node cannot see
-  its public IP; peers report the source address they see on its RPC
-  connections. That replaces `cluster.own_addresses` for NAT'd nodes,
-  records which of our addresses a request reached, and lets the canary
-  return host cover `localhost` and missing Hosts (a new `decoy_v`).
 - **Host keys in the export.** S, medium. Each scan's XML is already
   exported. A parsed `host_keys` list per scan (kind, port, fingerprint,
   detail) saves every dataset user the parsing.
-- **SSH host keys from OpenSSH ≥ 10.** M, medium. nmap 7.92's `ssh-hostkey`
-  cannot complete a key exchange with OpenSSH 10.2 ("No shared KEX
-  methods"), because OpenSSH 10 dropped finite-field Diffie-Hellman from
-  its defaults. `ssh2-enum-algos`, and so HASSH, still works. First check
-  the nmap version the scanner nodes run (Debian 12 ships 7.93). If the
-  limit holds there too, fetch the host key with a minimal key exchange of
-  our own (curve25519; the `russh` client hands over the server key before
-  authentication), one connection per key type. `host_keys` is derived from
-  the stored XML and not replicated, so keys fetched outside nmap need a
-  record of their own on the scan.
 - **ETags of scanned sources.** S, medium. nmap's `http-headers` (in
   `discovery` and `safe`) already runs at levels 3–4, so the `ETag` of each
   HTTP port is in the stored XML; parse it into `host_keys` as a new kind,
@@ -186,8 +171,9 @@ honeypot.
 - **Wall timeline drill-down.** S, low. For admins, each bucket of the
   wall timeline links to `/requests` filtered by that bucket's `from`/`to`,
   as the Analytics charts already do.
-- **Actions on an IP in Lookup.** S–M, medium. An IP result offers to
-  queue a counter-scan at a chosen level and to block the IP.
+- **Queue a counter-scan or block from the Lookup page.** S–M, low. The
+  probe and vantage actions exist; the manual scan queue and the block
+  action do not yet.
 
 ## Not planned
 

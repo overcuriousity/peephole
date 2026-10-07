@@ -237,6 +237,11 @@ Configuration lives in `/etc/peephole/config.toml`; restart after editing
 runtime settings, changed from **Admin → Cluster** or `peephole settings`
 without a restart.
 
+**Probes.** `[probe] enabled` (default `true`) lets this node's scanner run
+observational probes that admins request; `max_parallel` (default `2`)
+bounds how many run at once. Probes only touch ports a scan already found
+open and obey the same protected-address rules as scans.
+
 **Signature rules** are built into the binary from [`rules/`](../rules/) at
 build time: there is nothing to install or edit on the node, and changing a
 rule means changing `rules/*.toml` and building (CI checks every rule loads).
