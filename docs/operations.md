@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
     token;
   - optional **MaxMind GeoLite2** credentials
     (<https://www.maxmind.com/en/accounts/current/license-key>);
-  - optional API keys for **AbuseIPDB**, **Shodan** and **GreyNoise**, and
+  - optional API keys for **AbuseIPDB** and **Shodan**, and
     whether to use **Shodan InternetDB** (no key, non-commercial use only);
   - whether to **set up nginx** for you (see below).
 - Checks that every port the new config listens on is free (from

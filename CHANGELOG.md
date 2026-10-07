@@ -75,6 +75,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Removed
 
+- GreyNoise Community enrichment. An existing `[greynoise]` section is ignored.
 - The manual "Retry failed" action on the Scans page; retries are
   automatic.
 

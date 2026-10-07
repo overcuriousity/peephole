@@ -138,7 +138,7 @@ per `ip` first (`DISTINCT ON`, `group_by(...).first()`).
 ```
 
 Providers: `tor-exits` (`{"exit": true|false}`), `maxmind-geolite2`,
-`abuseipdb`, `shodan`, `shodan-internetdb`, `greynoise-community`. `data`
+`abuseipdb`, `shodan`, `shodan-internetdb`. `data`
 for an API provider is the service's own JSON, so its fields follow that
 service's documentation; an empty object means the service knew nothing.
 
@@ -254,7 +254,7 @@ query or the body) lists the serving row in `canary_used_from`.
 
 **Everything** (the default) includes GeoLite2 results and the API
 providers' answers. Their terms do not allow passing these on: MaxMind's
-GeoLite2 licence and the AbuseIPDB, Shodan and GreyNoise terms bind the
+GeoLite2 licence and the AbuseIPDB and Shodan terms bind the
 account holder. Cluster members hold them as users of the shared dataset;
 a file leaving the cluster should not.
 

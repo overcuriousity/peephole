@@ -216,8 +216,8 @@ reset_install() {
 echo "== wizard: trap only, behind a local nginx (answers typed at the prompts)"
 reset_install
 # trap? yes · scanner? no · web? no · in front: local · cluster? no · MaxMind: skip ·
-# AbuseIPDB key · Shodan: skip · GreyNoise: skip · InternetDB? no
-printf 'y\nn\nn\nlocal\n\n\nabuse-key-1\n\n\nn\n' > /tmp/answers
+# AbuseIPDB key · Shodan: skip · InternetDB? no
+printf 'y\nn\nn\nlocal\n\n\nabuse-key-1\n\nn\n' > /tmp/answers
 # PEEPHOLE_TRUSTED_PROXIES stays preset (10.0.0.0/8): the local proxy answer replaces it, with a warning.
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard1.log 2>&1 || { cat /tmp/wizard1.log; exit 1; }
@@ -231,7 +231,7 @@ if grep -q 'webauthn\|maxmind\|\[cluster\]\|admin_listen' /etc/peephole/config.t
     echo "trap-only config has other roles' settings"; cat /etc/peephole/config.toml; exit 1
 fi
 grep -q '^api_key = "abuse-key-1"' /etc/peephole/config.toml
-if grep -q '\[shodan\]\|\[greynoise\]\|\[internetdb\]' /etc/peephole/config.toml; then
+if grep -q '\[shodan\]\|\[internetdb\]' /etc/peephole/config.toml; then
     echo "skipped enrichment APIs were configured"; cat /etc/peephole/config.toml; exit 1
 fi
 /usr/local/bin/peephole check-config /etc/peephole/config.toml
@@ -499,7 +499,7 @@ grep -q 'port 8080 for the trap listener (127.0.0.1:8080) is in use' /tmp/port-b
 test ! -e /etc/peephole/config.toml
 # in front: local · 127.0.0.1:8081 for the trap? yes · 127.0.0.1:8082 for TLS? yes ·
 # cluster? no · MaxMind: skip · API keys: skip · InternetDB? no
-printf 'local\ny\ny\nn\n\n\n\n\nn\n' > /tmp/answers
+printf 'local\ny\ny\nn\n\n\n\nn\n' > /tmp/answers
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_TRUSTED_PROXIES PEEPHOLE_ROLES=listener \
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/port-offer.log 2>&1 || { cat /tmp/port-offer.log; exit 1; }
 grep -q '^trap_listen = "127.0.0.1:8081"' /etc/peephole/config.toml

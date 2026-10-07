@@ -29,7 +29,7 @@ nmap.
   sampled, but every request still leaves at least a light row (time,
   method, path) or a count.
 - **Enrichment** — MaxMind GeoLite2 country and ASN, the Tor exit list, and
-  optionally AbuseIPDB, Shodan, Shodan InternetDB and GreyNoise, plus RDAP registration data (network,
+  optionally AbuseIPDB, Shodan and Shodan InternetDB, plus RDAP registration data (network,
   holder, abuse contact), each within
   its own rate budget, refreshed when an IP returns.
 - **Counter-scans** — rate-limited nmap scans in four levels that escalate by

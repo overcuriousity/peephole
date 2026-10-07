@@ -382,8 +382,8 @@ earn most of the new money, every member a little.
   credentials is enough; without any, the dataset has no GeoIP data. The Tor
   exit list is public and is fetched by one node for all. Every result
   records which provider and which node it came from (Admin → Export).
-- Threat-intel APIs (AbuseIPDB, Shodan, Shodan InternetDB, GreyNoise
-  Community) work the same way. Every node with a key announces it. One of
+- Threat-intel APIs (AbuseIPDB, Shodan, Shodan InternetDB)
+  work the same way. Every node with a key announces it. One of
   them looks each IP up, newest IPs first, within its own daily or weekly
   budget. The result, with its UTC time, is shared with every member. A node
   whose budget is spent, or whose key is rejected, stops announcing the

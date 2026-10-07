@@ -9,7 +9,7 @@
 #   PEEPHOLE_VERIFY=1|0  1: require a verified GitHub build provenance attestation (needs the gh CLI);
 #                      0: skip it; unset: verify when gh is installed, warn if that fails
 #   MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY, PEEPHOLE_DOMAIN, PEEPHOLE_TRUSTED_PROXIES  (first install)
-#   ABUSEIPDB_API_KEY, SHODAN_API_KEY, GREYNOISE_API_KEY  optional enrichment APIs (first install)
+#   ABUSEIPDB_API_KEY, SHODAN_API_KEY  optional enrichment APIs (first install)
 #   PEEPHOLE_INTERNETDB=1|0    use Shodan InternetDB, no key, non-commercial use only (first
 #                              install; asked with default yes, off without a terminal)
 #   PEEPHOLE_FRONT=direct|local|remote  what is in front of the trap (first install):
@@ -851,7 +851,6 @@ if [ "$upgrade" -ne 1 ]; then
     fi
     prompt_optional ABUSEIPDB_API_KEY "AbuseIPDB API key (https://www.abuseipdb.com/account/api; abuse reports per IP, free plan 1000 checks/day)"
     prompt_optional SHODAN_API_KEY "Shodan API key (https://account.shodan.io; open ports, services and CVEs; host lookups need a membership or paid plan)"
-    prompt_optional GREYNOISE_API_KEY "GreyNoise Community API key (https://viz.greynoise.io/account/api-key; mass-scanner or benign; free keys need a business email, 50 lookups/week)"
     ask_yn PEEPHOLE_INTERNETDB "Use Shodan InternetDB (no key; ports, tags and CVEs, weekly data; free for non-commercial use only)?" "$([ "$INTERACTIVE" -eq 1 ] && echo y || echo n)"
     # nginx is set up only where it fronts something peephole serves: the
     # admin site, or a trap behind nginx on this machine (local). Not for a
@@ -891,7 +890,7 @@ distribution\'s default site) and reload nginx. Otherwise it prints the steps at
     toml_safe "${PEEPHOLE_DOMAIN:-}"; toml_safe "${PEEPHOLE_TRUSTED_PROXIES:-}"
     toml_safe "${PEEPHOLE_CLUSTER_NAME:-}"; toml_safe "${PEEPHOLE_CLUSTER_LISTEN:-}"; toml_safe "${PEEPHOLE_CLUSTER_ADVERTISE:-}"
     toml_safe "${MAXMIND_ACCOUNT_ID:-}"; toml_safe "${MAXMIND_LICENSE_KEY:-}"
-    toml_safe "${ABUSEIPDB_API_KEY:-}"; toml_safe "${SHODAN_API_KEY:-}"; toml_safe "${GREYNOISE_API_KEY:-}"
+    toml_safe "${ABUSEIPDB_API_KEY:-}"; toml_safe "${SHODAN_API_KEY:-}"
     if [ -n "${PEEPHOLE_ACME_EMAIL:-}" ] && ! [[ "$PEEPHOLE_ACME_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]]; then
         die "PEEPHOLE_ACME_EMAIL is not an email address: ${PEEPHOLE_ACME_EMAIL}"
     fi
@@ -1047,13 +1046,6 @@ CONFIG
 
 [shodan]
 api_key = "${SHODAN_API_KEY}"   # host lookups need a membership or paid plan
-CONFIG
-        fi
-        if [ -n "${GREYNOISE_API_KEY:-}" ]; then
-            cat <<CONFIG
-
-[greynoise]
-api_key = "${GREYNOISE_API_KEY}"   # free plan: 50 lookups per week
 CONFIG
         fi
         if [ "${PEEPHOLE_INTERNETDB:-0}" = 1 ]; then

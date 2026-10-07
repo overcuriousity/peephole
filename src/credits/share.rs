@@ -155,7 +155,7 @@ mod tests {
         // A daily budget of 12: two on-demand lookups (2.4, rounded down).
         let daily = Budget("abuseipdb", Some(12.0));
         // A weekly budget of 50 is about 7.14 a day: one.
-        let weekly = Budget("greynoise-community", Some(50.0 / 7.0));
+        let weekly = Budget("weekly-test", Some(50.0 / 7.0));
         let none = Budget("maxmind-geolite2", None);
         assert_eq!(s.allowance(&daily), 2);
         assert_eq!(s.allowance(&weekly), 1);
