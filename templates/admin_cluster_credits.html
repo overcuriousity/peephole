@@ -31,12 +31,12 @@
   {% if waiting > 0 %}<p class="muted">{{ waiting }} scan{% if waiting != 1 %}s{% endif %} not judged yet: a scan is judged ten minutes after it arrives.</p>{% endif %}
   {% if earned.is_empty() %}<p class="muted">Nothing yet.</p>{% else %}
   <div class="table-wrap wide"><table>
-    <thead><tr><th>When</th><th>Scan</th><th>IP</th><th>Level</th><th>As</th><th class="num">Credits</th><th></th></tr></thead>
+    <thead><tr><th>When</th><th>Scan</th><th>IP</th><th>Level</th><th class="num">Counts</th><th>Note</th></tr></thead>
     <tbody>{% for e in earned %}<tr>
       <td class="ts">{{ e.at }}</td>
       <td>{% if let Some(id) = e.scan %}<a class="mono" href="/admin/scans/{{ id }}">scan #{{ id }}</a>{% else %}<span class="muted">not held here</span>{% endif %}</td>
-      <td><a class="mono" href="/ip/{{ e.ip }}">{{ e.ip }}</a></td><td>{{ e.level }}</td><td>{{ e.role }}</td>
-      <td class="num">{{ e.amount }}</td><td class="muted">{{ e.note }}</td>
+      <td><a class="mono" href="/ip/{{ e.ip }}">{{ e.ip }}</a></td><td>{{ e.level }}</td><td class="num">{{ e.counts }}</td>
+      <td class="muted">{{ e.note }}</td>
     </tr>{% endfor %}</tbody>
   </table></div>{% endif %}
 </section>

@@ -326,7 +326,7 @@ async fn cluster_figures(
     let spent = spending(&l.offers, week);
     let (mut low, mut high) = (0u64, 0u64);
     for p in book.paid.iter().filter(|p| in_week(p.scan.hlc)) {
-        if p.scanner_mc + p.trap_mc == 0 {
+        if p.weight == 0 {
             continue;
         }
         if p.scan.level >= 3 {

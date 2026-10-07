@@ -70,8 +70,8 @@ struct EarnedRow {
     scan: Option<i64>,
     ip: String,
     level: u8,
-    role: &'static str,
-    amount: String,
+    /// "1", "2", or a dash when the scan does not count.
+    counts: String,
     note: String,
 }
 
@@ -185,27 +185,25 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
     let week = book.now_ms.saturating_sub(7 * credits::DAY_MS) << 16;
     let mut earned = vec![];
     for p in book.paid.iter().rev().filter(|p| p.scan.hlc >= week) {
-        for (who, role, mc, note) in [
-            (p.scan.scanner, "scanner", p.scanner_mc, &p.scanner_note),
-            (p.scan.trap, "trap", p.trap_mc, &p.trap_note),
-        ] {
-            if who != me || earned.len() >= ROWS {
-                continue;
-            }
-            let scan: Option<i64> = sqlx::query_scalar("SELECT id FROM scans WHERE uid = ?")
-                .bind(&p.scan.scan_uid)
-                .fetch_optional(&st.store.read)
-                .await?;
-            earned.push(EarnedRow {
-                at: when(p.scan.hlc),
-                scan,
-                ip: p.scan.ip.clone(),
-                level: p.scan.job_level,
-                role,
-                amount: show(mc),
-                note: note.clone(),
-            });
+        if p.scan.scanner != me || earned.len() >= ROWS {
+            continue;
         }
+        let scan: Option<i64> = sqlx::query_scalar("SELECT id FROM scans WHERE uid = ?")
+            .bind(&p.scan.scan_uid)
+            .fetch_optional(&st.store.read)
+            .await?;
+        earned.push(EarnedRow {
+            at: when(p.scan.hlc),
+            scan,
+            ip: p.scan.ip.clone(),
+            level: p.scan.job_level,
+            counts: if p.weight == 0 {
+                "\u{2014}".into()
+            } else {
+                p.weight.to_string()
+            },
+            note: p.note.clone(),
+        });
     }
     let waiting: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scans s JOIN scan_jobs j ON j.uid = s.job_uid

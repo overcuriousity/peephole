@@ -72,28 +72,29 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             let from = book.now_ms.saturating_sub(days * super::DAY_MS);
             let recent = |hlc: u64| crate::cluster::hlc::physical_ms(hlc) >= from;
             let mut lines: Vec<(u64, String)> = vec![];
-            for p in book.paid.iter().filter(|p| recent(p.scan.hlc)) {
-                for (who, role, mc, note) in [
-                    (p.scan.scanner, "scanner", p.scanner_mc, &p.scanner_note),
-                    (p.scan.trap, "trap", p.trap_mc, &p.trap_note),
-                ] {
-                    if who == me {
-                        lines.push((
-                            p.scan.hlc,
-                            format!(
-                                "earned   {:>8}  {} level {} as {role}{}",
-                                show(mc),
-                                p.scan.ip,
-                                p.scan.job_level,
-                                if note.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!("  ({note})")
-                                }
-                            ),
-                        ));
-                    }
-                }
+            for p in book
+                .paid
+                .iter()
+                .filter(|p| recent(p.scan.hlc) && p.scan.scanner == me)
+            {
+                lines.push((
+                    p.scan.hlc,
+                    format!(
+                        "counted  {:>8}  {} level {}{}",
+                        if p.weight == 0 {
+                            "-".to_string()
+                        } else {
+                            p.weight.to_string()
+                        },
+                        p.scan.ip,
+                        p.scan.job_level,
+                        if p.note.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  ({})", p.note)
+                        }
+                    ),
+                ));
             }
             for o in book
                 .ledger
@@ -182,20 +183,15 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             );
             let book = super::compute(&node).await?;
             if let Some(p) = book.paid.iter().find(|p| p.scan.scan_uid == j.scan_uid) {
-                for (role, mc, note) in [
-                    ("scanner", p.scanner_mc, &p.scanner_note),
-                    ("trap", p.trap_mc, &p.trap_note),
-                ] {
-                    println!(
-                        "  {role}: {} credits{}",
-                        show(mc),
-                        if note.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" ({note})")
-                        }
-                    );
-                }
+                println!(
+                    "  counts for the scanner's share of the day: {}{}",
+                    p.weight,
+                    if p.note.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", p.note)
+                    }
+                );
             }
         }
         ["send", who, amount] => {

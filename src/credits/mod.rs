@@ -1,4 +1,4 @@
-//! Lookup credits: earned by completed counter-scans, spent on lookups.
+//! Lookup credits: minted daily among the scanners, spent on lookups.
 //! Every node computes every balance for itself, from its own copy of the
 //! log; see "Credits" in docs/cluster.md.
 pub mod audit;
@@ -8,6 +8,7 @@ pub mod entries;
 pub mod fleet;
 pub mod gates;
 pub mod ledger;
+pub mod mint;
 pub mod pay;
 pub mod price;
 pub mod share;
@@ -66,6 +67,9 @@ use std::sync::Arc;
 pub struct Book {
     pub ledger: ledger::Ledger,
     pub paid: Vec<earn::Paid>,
+    /// Each scanner's share of each closed day's mint.
+    pub minted: Vec<ledger::Earned>,
+    pub allowances: Vec<ledger::Earned>,
     /// The members that do not earn in full here.
     pub standings: gates::Standings,
     pub now_ms: u64,
@@ -80,15 +84,15 @@ impl Book {
         self.standings.get(node).cloned().unwrap_or_default()
     }
 
-    /// What all members earned a day over the last 168 hours (the `E` of
-    /// the price formula).
+    /// What was minted and allowed a day over the last 7 days.
     pub fn earned_per_day(&self) -> Mc {
         let from = self.now_ms.saturating_sub(7 * DAY_MS);
         let week: Mc = self
-            .paid
+            .minted
             .iter()
-            .filter(|p| crate::cluster::hlc::physical_ms(p.scan.hlc) >= from)
-            .map(|p| p.scanner_mc + p.trap_mc)
+            .chain(&self.allowances)
+            .filter(|e| crate::cluster::hlc::physical_ms(e.hlc) >= from)
+            .map(|e| e.mc)
             .sum();
         week / 7
     }
@@ -107,16 +111,29 @@ pub async fn compute(node: &Node) -> anyhow::Result<Book> {
     let standings = gates::standings(node).await?;
     let judged = earn::judged_since(&node.store.pool, since).await?;
     let paid = earn::pay(&judged, &gates::to_gates(&standings));
+    let minted = mint::split(&paid, now_ms);
+    let members: Vec<NodeId> = crate::cluster::members::all(&node.store)
+        .await?
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    let today = (now_ms / DAY_MS) as u32;
+    let first = day_of(since);
+    let active = mint::active_days(&node.store.pool, &members, first, today).await?;
+    let allowances = mint::allowances(&active, &standings, now_ms);
+    let earned: Vec<ledger::Earned> = minted.iter().chain(&allowances).cloned().collect();
     let entries = entries::since(&node.store.pool, since).await?;
     let left_out: HashSet<NodeId> = standings
         .iter()
         .filter(|(_, s)| s.left_out())
         .map(|(id, _)| *id)
         .collect();
-    let ledger = ledger::run(&earn::earned(&paid), &entries, &left_out, now_ms);
+    let ledger = ledger::run(&earned, &entries, &left_out, now_ms);
     Ok(Book {
         ledger,
         paid,
+        minted,
+        allowances,
         standings,
         now_ms,
     })
