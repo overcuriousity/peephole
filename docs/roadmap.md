@@ -183,6 +183,11 @@ honeypot.
   the trap listens on 80/443 itself; behind nginx the SYN goes to nginx.
   Shown on the request page and in Analytics. A lowered MSS (around 1380
   for WireGuard, 1360 for OpenVPN) also hints at a tunnel.
+- **Wall timeline drill-down.** S, low. For admins, each bucket of the
+  wall timeline links to `/requests` filtered by that bucket's `from`/`to`,
+  as the Analytics charts already do.
+- **Actions on an IP in Lookup.** S–M, medium. An IP result offers to
+  queue a counter-scan at a chosen level and to block the IP.
 
 ## Not planned
 
