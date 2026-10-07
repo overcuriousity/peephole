@@ -215,13 +215,14 @@ async fn lookup(
     Cbor(crate::intel::lookup::serve(&node, peer, &req).await).into_response()
 }
 
-/// A host name resolved for a member: paid with credits, which this
-/// build does not take for it yet, so every request is refused.
-async fn resolve(Cbor(_req): Cbor<crate::intel::dns::ResolveReq>) -> Response {
-    Cbor(crate::intel::dns::ResolveResp::refused(
-        "resolving a name is paid with credits: upgrade this node",
-    ))
-    .into_response()
+/// A host name resolved for a member, paid with the offer it names; it
+/// never scans, probes or stores anything.
+async fn resolve(
+    State(node): State<Arc<Node>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Cbor(req): Cbor<crate::intel::dns::ResolveReq>,
+) -> Response {
+    Cbor(crate::intel::dns::serve_resolve(&node, peer, &req).await).into_response()
 }
 
 /// An observational probe for a member, paid with the offer it names.
