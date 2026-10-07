@@ -224,10 +224,18 @@ impl Arbiter {
         let Some(mut g) = self.next_job(scanner, exclude).await? else {
             return Ok(None);
         };
-        if let Some((seq, price)) =
-            crate::credits::jobs::fund(&self.node, funding, scanner, &g.job_uid, min_mc).await
+        let price = crate::credits::jobs::price_for(&self.node, &scanner);
+        if let Some((seq, price)) = crate::credits::jobs::fund(
+            &self.node,
+            funding,
+            scanner,
+            &g.job_uid,
+            min_mc,
+            price.unwrap_or(0),
+        )
+        .await
         {
-            g.offer_seq = Some(seq);
+            g.offer_seq = seq;
             g.price_mc = price;
             info!(job = %g.job_uid, scanner = %scanner.short(),
                 price = %crate::credits::show(price as u64), "scan job funded");
