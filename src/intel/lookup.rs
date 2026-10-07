@@ -189,9 +189,30 @@ pub struct Outcome {
     pub kept: bool,
 }
 
-/// Look `ip` up: first in the dataset, then at the providers. `again`
-/// names the providers to ask although the dataset has a fresh result.
-pub async fn run(rec: &Recorder, providers: &Providers, ip: IpAddr, again: &[String]) -> Outcome {
+/// The providers a lookup asks without being told to: those priced at a
+/// quarter of a unit or less (see [`crate::credits::price::weight_milli`]).
+pub fn cheap() -> Vec<String> {
+    KNOWN_PROVIDERS
+        .iter()
+        .filter(|p| crate::credits::price::weight_milli(p.name) <= CHEAP_MILLI)
+        .map(|p| p.name.to_string())
+        .collect()
+}
+
+/// Heaviest weight (see [`cheap`]) a lookup asks for by itself.
+pub const CHEAP_MILLI: u32 = 250;
+
+/// Look `ip` up: first in the dataset, then at the providers. The cheap
+/// tier is asked when the dataset lacks a fresh result; `ask` names the
+/// paid providers to ask as well, `again` those to ask although the
+/// dataset has a fresh result.
+pub async fn run(
+    rec: &Recorder,
+    providers: &Providers,
+    ip: IpAddr,
+    ask: &[String],
+    again: &[String],
+) -> Outcome {
     let known: Vec<String> = KNOWN_PROVIDERS.iter().map(|p| p.name.to_string()).collect();
     let Recorder::Cluster(node) = rec else {
         // Standalone: this node's providers, no credits, nothing stored.
@@ -216,8 +237,10 @@ pub async fn run(rec: &Recorder, providers: &Providers, ip: IpAddr, again: &[Str
             vec![]
         }
     };
+    let cheap = cheap();
     let wanted: Vec<String> = known
         .into_iter()
+        .filter(|p| cheap.contains(p) || ask.contains(p))
         .filter(|p| !stored.iter().any(|s| &s.provider == p))
         .collect();
     let mut answers = crate::credits::pay::ask(node, providers, ip, &wanted).await;
@@ -240,7 +263,7 @@ pub async fn run(rec: &Recorder, providers: &Providers, ip: IpAddr, again: &[Str
 /// holds (see [`run`]).
 pub async fn cluster(rec: &Recorder, providers: &Providers, ip: IpAddr) -> Vec<NodeAnswer> {
     let all: Vec<String> = KNOWN_PROVIDERS.iter().map(|p| p.name.to_string()).collect();
-    run(rec, providers, ip, &all).await.answers
+    run(rec, providers, ip, &all, &all).await.answers
 }
 
 /// Every provider in `wanted` that nobody answered or declined gets a
@@ -354,6 +377,22 @@ mod tests {
         assert_eq!(declined.len(), KNOWN_PROVIDERS.len() - 1);
         assert!(declined.contains(&super::super::SHODAN));
         assert!(!declined.contains(&super::super::TOR));
+    }
+
+    #[test]
+    fn cheap_tier_is_tor_rdap_geolite_and_internetdb() {
+        let mut c = cheap();
+        c.sort();
+        let mut want: Vec<String> = [
+            super::super::TOR,
+            super::super::RDAP,
+            super::super::MAXMIND,
+            super::super::INTERNETDB,
+        ]
+        .map(String::from)
+        .into();
+        want.sort();
+        assert_eq!(c, want);
     }
 
     /// A request of a node of an earlier version carries no offer and

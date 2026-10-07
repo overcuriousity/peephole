@@ -1,6 +1,6 @@
 //! The top bar's search box: works out what was typed and opens its page.
 //! An IP, a network, `AS123`, `#<request id>`, a path, or a linking value
-//! (fingerprint, host key, JA4…).
+//! (fingerprint, host key, JA4…), or a host name (the Lookup page).
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppResult, render};
@@ -35,6 +35,8 @@ enum Input {
     Asn(u32),
     Request(i64),
     Path(String),
+    /// A host name: the Lookup page resolves it.
+    Host(String),
     Value(String),
 }
 
@@ -62,6 +64,9 @@ fn classify(q: &str) -> Input {
     }
     if q.starts_with('/') {
         return Input::Path(q.to_string());
+    }
+    if let Some(name) = crate::intel::dns::valid_name(q) {
+        return Input::Host(name);
     }
     Input::Value(q.to_string())
 }
@@ -92,6 +97,7 @@ async fn search(
         Input::Asn(n) => Some(format!("/ips?asn={n}")),
         Input::Request(id) => Some(format!("/admin/requests/{id}")),
         Input::Path(p) => Some(format!("/requests?path={}", urlencode(&p))),
+        Input::Host(h) => Some(format!("/admin/lookup?ip={}", urlencode(&h))),
         Input::Value(v) => {
             let kinds = st.store.find_value(&v).await?;
             match kinds.as_slice() {
@@ -152,6 +158,10 @@ mod tests {
             classify("t13d1516h2_8daaf6152771"),
             Input::Value("t13d1516h2_8daaf6152771".into())
         );
+        assert_eq!(classify("example.com"), Input::Host("example.com".into()));
+        assert_eq!(classify("EXAMPLE.COM."), Input::Host("example.com".into()));
+        assert_eq!(classify("not a host"), Input::Value("not a host".into()));
+        assert_eq!(classify("localhost"), Input::Value("localhost".into()));
         assert_eq!(classify("ASX"), Input::Value("ASX".into()));
         assert_eq!(classify("#x"), Input::Value("#x".into()));
     }

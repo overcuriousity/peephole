@@ -10,10 +10,11 @@ use crate::store::inspect::IpIntelRow;
 use askama::Template;
 use axum::{
     Router,
-    extract::{Form, Query, State},
+    extract::{Form, RawQuery, State},
     response::Html,
     routing::get,
 };
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -50,21 +51,67 @@ fn chrome() -> Chrome {
 
 /// One provider as it would be asked: by whom, and at what price.
 pub struct QuoteView {
+    /// The provider's name, as the `ask` field carries it.
+    pub provider: String,
     pub label: String,
     pub node: String,
     pub price: String,
 }
 
-/// What the form shows before a lookup: what this node can spend and what
+/// What the page shows about spending: what this node can spend and what
 /// the cluster asks.
 #[derive(Default)]
 pub struct Offer {
     /// The balance in credits (the fleet's, when this node has an owner).
     pub balance: Option<String>,
     pub fleet: bool,
+    /// The cheap tier, asked by every lookup.
     pub quotes: Vec<QuoteView>,
-    /// What a lookup of every provider costs at most.
+    /// What a lookup costs at most: the cheap tier's total.
     pub total: String,
+    /// The providers asked only when told to, with their prices.
+    pub paid: Vec<QuoteView>,
+    /// What asking all of them costs.
+    pub paid_total: String,
+}
+
+impl Offer {
+    /// Split the cluster's quotes (the cheapest of each provider) into the
+    /// cheap tier and the paid providers.
+    pub fn from_quotes(all: &HashMap<String, Vec<crate::credits::pay::Quote>>) -> Offer {
+        let cheap = crate::intel::lookup::cheap();
+        let (mut quotes, mut paid) = (vec![], vec![]);
+        let (mut total, mut paid_total) = (0u64, 0u64);
+        for info in crate::intel::KNOWN_PROVIDERS {
+            let Some(q) = all.get(info.name).and_then(|l| l.first()) else {
+                continue;
+            };
+            let view = QuoteView {
+                provider: info.name.to_string(),
+                label: info.label.to_string(),
+                node: q.server_name.clone(),
+                price: if q.price_mc == 0 {
+                    "free".into()
+                } else {
+                    crate::credits::show(q.price_mc as u64)
+                },
+            };
+            if cheap.iter().any(|c| c == info.name) {
+                total += q.price_mc as u64;
+                quotes.push(view);
+            } else {
+                paid_total += q.price_mc as u64;
+                paid.push(view);
+            }
+        }
+        Offer {
+            quotes,
+            total: crate::credits::show(total),
+            paid,
+            paid_total: crate::credits::show(paid_total),
+            ..Default::default()
+        }
+    }
 }
 
 /// The offer box is information only: when the balance cannot be read, it
@@ -85,29 +132,10 @@ async fn offer(state: &AdminState) -> Offer {
     .await
     .inspect_err(|e| tracing::warn!(?e, "lookup: balance not read"))
     .ok();
-    let all = crate::credits::pay::quotes(node, &state.providers);
-    let mut quotes = vec![];
-    let mut total = 0u64;
-    for info in crate::intel::KNOWN_PROVIDERS {
-        let Some(q) = all.get(info.name).and_then(|l| l.first()) else {
-            continue;
-        };
-        total += q.price_mc as u64;
-        quotes.push(QuoteView {
-            label: info.label.to_string(),
-            node: q.server_name.clone(),
-            price: if q.price_mc == 0 {
-                "free".into()
-            } else {
-                crate::credits::show(q.price_mc as u64)
-            },
-        });
-    }
     Offer {
         balance: balance.map(|(b, _)| crate::credits::show(b)),
         fleet: balance.is_some_and(|(_, fleet)| fleet),
-        quotes,
-        total: crate::credits::show(total),
+        ..Offer::from_quotes(&crate::credits::pay::quotes(node, &state.providers))
     }
 }
 
@@ -149,18 +177,53 @@ struct LookupPage {
     bulk: Option<Bulk>,
 }
 
-#[derive(serde::Deserialize, Default)]
+/// The lookup form. `ask` and `again` may repeat, which the plain form
+/// extractors cannot read, so the fields are taken from the pairs.
+#[derive(Default)]
 pub struct IpForm {
     pub ip: Option<String>,
     /// A provider to ask although the dataset has a fresh answer.
     pub again: Option<String>,
+    /// The paid providers to ask now (`*`: all of them).
+    pub ask: Option<Vec<String>>,
+}
+
+impl IpForm {
+    fn parse(raw: &[u8]) -> IpForm {
+        let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(raw).unwrap_or_default();
+        let mut f = IpForm::default();
+        for (k, v) in pairs {
+            match k.as_str() {
+                "ip" => f.ip = Some(v),
+                "again" => f.again = Some(v),
+                "ask" => f.ask.get_or_insert_with(Vec::new).push(v),
+                _ => {}
+            }
+        }
+        f
+    }
+
+    /// The paid providers named, `*` standing for every one of them.
+    fn asked(&self) -> Vec<String> {
+        let ask = self.ask.as_deref().unwrap_or_default();
+        if ask.iter().any(|a| a == "*") {
+            let cheap = crate::intel::lookup::cheap();
+            return crate::intel::KNOWN_PROVIDERS
+                .iter()
+                .map(|p| p.name.to_string())
+                .filter(|n| !cheap.contains(n))
+                .collect();
+        }
+        ask.iter().filter(|a| !a.is_empty()).cloned().collect()
+    }
 }
 
 async fn page(
     _u: SessionUser,
     State(state): State<Arc<AdminState>>,
-    Query(q): Query<IpForm>,
+    RawQuery(q): RawQuery,
 ) -> AppResult<Html<String>> {
+    let q = IpForm::parse(q.unwrap_or_default().as_bytes());
     render(&LookupPage {
         chrome: chrome(),
         ip: q.ip.unwrap_or_default().trim().to_string(),
@@ -175,8 +238,10 @@ async fn page(
 async fn lookup(
     _u: SessionUser,
     State(state): State<Arc<AdminState>>,
-    Form(f): Form<IpForm>,
+    body: axum::body::Bytes,
 ) -> AppResult<Html<String>> {
+    let f = IpForm::parse(&body);
+    let ask = f.asked();
     let text = f.ip.unwrap_or_default().trim().to_string();
     let cluster = state.recorder.node().is_some();
     let Ok(ip) = text.parse::<IpAddr>() else {
@@ -192,7 +257,7 @@ async fn lookup(
     };
     let ip = crate::net::canonical(ip);
     let again: Vec<String> = f.again.into_iter().filter(|a| !a.is_empty()).collect();
-    let result = run(&state, ip, &again).await?;
+    let result = run(&state, ip, &ask, &again).await?;
     render(&LookupPage {
         chrome: chrome(),
         ip: ip.to_string(),
@@ -215,8 +280,13 @@ fn age(secs: i64) -> String {
 
 /// Look the address up and arrange the three parts of the page: what the
 /// dataset knows, provider answers from the dataset, and live answers.
-pub async fn run(state: &AdminState, ip: IpAddr, again: &[String]) -> AppResult<LookupResult> {
-    let out = crate::intel::lookup::run(&state.recorder, &state.providers, ip, again).await;
+pub async fn run(
+    state: &AdminState,
+    ip: IpAddr,
+    ask: &[String],
+    again: &[String],
+) -> AppResult<LookupResult> {
+    let out = crate::intel::lookup::run(&state.recorder, &state.providers, ip, ask, again).await;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let label = |p: &str| {
         crate::intel::provider_info(p)
@@ -450,6 +520,8 @@ secure_cookies = false
         // GeoLite2 is not loaded: listed as declined, with the reason.
         assert!(html.contains("MaxMind GeoLite2") && html.contains("not available on this node"));
         assert!(html.contains("no reachable node serves this provider"));
+        // Standalone: nothing paid is offered.
+        assert!(!html.contains(r#"name="ask""#));
 
         let (status, html) = send(&app, post(), "ip=not-an-ip").await;
         assert_eq!(status, 200);
@@ -457,5 +529,43 @@ secure_cookies = false
 
         let (_, html) = send(&app, post(), "ip=2001:DB8::1").await;
         assert!(html.contains("2001:db8::1") && html.contains("not in the dataset"));
+    }
+
+    #[test]
+    fn a_lookup_asks_the_cheap_tier_and_offers_the_rest() {
+        use crate::credits::pay::Quote;
+        let node = crate::cluster::identity::NodeId::from_slice(&[7u8; 32]).unwrap();
+        let quote = |p: &str, mc: u32| {
+            (
+                p.to_string(),
+                vec![Quote {
+                    provider: p.into(),
+                    server: node,
+                    server_name: "n1".into(),
+                    price_mc: mc,
+                }],
+            )
+        };
+        let all: HashMap<_, _> = [
+            quote(crate::intel::TOR, 0),
+            quote(crate::intel::MAXMIND, 10),
+            quote(crate::intel::INTERNETDB, 20),
+            quote(crate::intel::ABUSEIPDB, 100),
+        ]
+        .into();
+        let offer = Offer::from_quotes(&all);
+        assert_eq!(offer.total, "0.03");
+        assert_eq!(offer.quotes.len(), 3);
+        assert_eq!(offer.paid.len(), 1);
+        assert_eq!(offer.paid[0].provider, crate::intel::ABUSEIPDB);
+        assert_eq!(offer.paid[0].price, "0.10");
+        assert_eq!(offer.paid_total, "0.10");
+        let f = IpForm::parse(b"ip=203.0.113.9&ask=abuseipdb&ask=shodan");
+        assert_eq!(f.asked(), ["abuseipdb", "shodan"]);
+        assert!(
+            !IpForm::parse(b"ask=*")
+                .asked()
+                .contains(&crate::intel::TOR.to_string())
+        );
     }
 }

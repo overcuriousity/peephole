@@ -11,15 +11,6 @@
   <span class="muted">Balance{% if offer.fleet %} of your nodes{% endif %}: <b>{{ b }}</b> credits · this lookup costs up to {{ offer.total }} · <a href="/admin/cluster/credits">credits →</a></span>
   {% endif %}
 </form>
-{% if !offer.quotes.is_empty() %}
-<details class="card"><summary>Who would be asked, and at what price</summary>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Provider</th><th>Node</th><th class="num">Price (credits)</th></tr></thead>
-    <tbody>{% for q in offer.quotes %}<tr><td>{{ q.label }}</td><td>{{ q.node }}</td><td class="num">{{ q.price }}</td></tr>{% endfor %}</tbody>
-  </table></div>
-  <p class="muted small">Per provider the node with the lowest price answers, your own included. An answer of the last 24 hours in the dataset is shown instead and costs nothing.</p>
-</details>
-{% endif %}
 <form class="filters card bulk-lookup" method="post" action="/admin/lookup/bulk">
   <label>Many addresses or networks, from stored data (no provider is asked) <textarea name="ips" rows="3" cols="60" placeholder="203.0.113.7, 198.51.100.0/24 …">{% if let Some(b) = bulk %}{{ b.text }}{% endif %}</textarea></label>
   <button class="btn" type="submit">Check stored</button>
@@ -80,6 +71,17 @@
   </ul>
   {% endif %}
 </section>
+{% if !offer.paid.is_empty() %}
+<section class="card" id="ask-more">
+  <div class="card-head"><h2>Ask for more</h2><span class="muted">paid with credits{% if let Some(b) = offer.balance %} · balance <b>{{ b }}</b>{% endif %}</span></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Provider</th><th>Node</th><th class="num">Price (credits)</th><th></th></tr></thead>
+    <tbody>{% for q in offer.paid %}<tr><td>{{ q.label }}</td><td>{{ q.node }}</td><td class="num">{{ q.price }}</td><td><form method="post" action="/admin/lookup"><input type="hidden" name="ip" value="{{ r.ip }}"><input type="hidden" name="ask" value="{{ q.provider }}"><button class="btn btn-sm" type="submit">Ask</button></form></td></tr>{% endfor %}</tbody>
+  </table></div>
+  <form method="post" action="/admin/lookup"><input type="hidden" name="ip" value="{{ r.ip }}"><input type="hidden" name="ask" value="*"><button class="btn btn-sm" type="submit">Ask all ({{ offer.paid_total }})</button></form>
+  <p class="muted small">Per provider the node with the lowest price answers, your own included. An answer of the last 24 hours in the dataset is shown instead and costs nothing.</p>
+</section>
+{% endif %}
 {% if let Some(t) = r.target %}
 {% include "_target.html" %}
 {% endif %}

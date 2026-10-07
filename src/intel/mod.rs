@@ -1,5 +1,6 @@
 pub mod abuseipdb;
 pub mod api;
+pub mod dns;
 pub mod geo;
 pub mod greynoise;
 pub mod lookup;
