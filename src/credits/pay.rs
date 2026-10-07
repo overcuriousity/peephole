@@ -718,9 +718,12 @@ mod tests {
     #[test]
     fn only_market_nodes_are_paid() {
         assert_eq!(crate::cluster::rpc::proto::MARKET_PROTO, 4);
-        assert!(
-            crate::cluster::rpc::proto::PROTO_VERSION >= crate::cluster::rpc::proto::MARKET_PROTO
-        );
+        const {
+            assert!(
+                crate::cluster::rpc::proto::PROTO_VERSION
+                    >= crate::cluster::rpc::proto::MARKET_PROTO
+            )
+        };
         assert!(!pays_with(3));
         assert!(pays_with(4));
     }

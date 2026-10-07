@@ -187,6 +187,10 @@ pub fn charge_for(answer: &Result<Vec<IpAddr>, String>, price: u32) -> u32 {
 pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> ResolveResp {
     use crate::credits::{pay, price};
     let Some(name) = valid_name(&req.name) else {
+        // An offer that came with it goes back, as with every refusal.
+        if let Some(seq) = req.offer_seq {
+            pay::release(node, peer, seq).await;
+        }
         return ResolveResp::refused("not a host name");
     };
     let Some(seq) = req.offer_seq else {
