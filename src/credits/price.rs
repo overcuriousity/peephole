@@ -484,8 +484,7 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let capacity = capacity(&scanners(node, &left_out).await?);
     let (demand, hours) = node.market.take();
     let old = node.price_table();
-    // What live members announce, per good (for the start price), and
-    // their scan bids.
+    // What live members announce, per good (for the start price).
     let me = node.id();
     let members = node.members();
     let mut announced: HashMap<String, Vec<u32>> = HashMap::new();

@@ -29,6 +29,11 @@ const MAX_ROUNDS: usize = 3;
 /// balance, and the fleet's behind it.
 pub(crate) const RETRY_AT_MOST: Mc = 2;
 
+/// Whether a member announcing `proto_max` sells scan jobs at its own price.
+pub fn sells_scans(proto_max: u32) -> bool {
+    proto_max >= crate::cluster::rpc::proto::SCAN_PRICE_PROTO
+}
+
 /// Whether a member announcing `proto_max` counts balances as this node does.
 pub fn pays_with(proto_max: u32) -> bool {
     proto_max >= crate::cluster::rpc::proto::MARKET_PROTO
@@ -724,6 +729,7 @@ mod tests {
                     >= crate::cluster::rpc::proto::MARKET_PROTO
             )
         };
+        assert_eq!(crate::cluster::rpc::proto::SCAN_PRICE_PROTO, 5);
         assert!(!pays_with(3));
         assert!(pays_with(4));
     }

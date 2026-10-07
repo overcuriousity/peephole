@@ -78,12 +78,16 @@ pub struct Heartbeat {
     /// it does not probe.
     #[serde(default)]
     pub probe_price_mc: Option<u32>,
-    /// What a funded scan job costs at this node now, in mc.
+    /// What this node sells a funded scan job for, in mc; None when it
+    /// does not scan.
     #[serde(default)]
     pub scan_price_mc: Option<u32>,
-    /// Funded scan jobs this node, as arbiter, would grant now.
+    /// What this node, as arbiter, may still spend on scan jobs now.
     #[serde(default)]
-    pub scan_bids: u32,
+    pub scan_budget_mc: u32,
+    /// Its queued scan jobs.
+    #[serde(default)]
+    pub scan_queued: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,7 +430,10 @@ impl Node {
             public_addrs: self.status.public_addresses(),
             probe_price_mc: self.prober().map(|p| p.price(&table)),
             scan_price_mc: table.price_of(crate::credits::price::SCAN),
-            scan_bids: self.scan_bids.load(std::sync::atomic::Ordering::Relaxed),
+            scan_budget_mc: self
+                .scan_budget_mc
+                .load(std::sync::atomic::Ordering::Relaxed),
+            scan_queued: self.scan_queued.load(std::sync::atomic::Ordering::Relaxed),
         };
         let Ok(body) = super::rpc::cbor::encode(&hb) else {
             return;
@@ -553,11 +560,66 @@ mod tests {
             public_addrs: vec![],
             probe_price_mc: None,
             scan_price_mc: None,
-            scan_bids: 0,
+            scan_budget_mc: 0,
+            scan_queued: 0,
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = id.sign(&SignedHeartbeat::signing(&body));
         (hb, SignedHeartbeat { body, sig })
+    }
+
+    /// The scan fields survive the wire, and decode across protocols 4 and 5.
+    #[test]
+    fn scan_fields_decode_across_protocol_4_and_5() {
+        use crate::cluster::rpc::cbor::{decode, encode};
+        let a = crate::cluster::identity::Identity::generate().unwrap();
+        let (mut hb, _) = signed_hb(&a, 1);
+        hb.scan_budget_mc = 5;
+        hb.scan_queued = 2;
+        let back: Heartbeat = decode(&encode(&hb).unwrap()).unwrap();
+        assert_eq!((back.scan_budget_mc, back.scan_queued), (5, 2));
+        /// The scan fields of a protocol 4 heartbeat.
+        #[derive(serde::Serialize, serde::Deserialize, Default)]
+        struct Old {
+            #[serde(default)]
+            scan_price_mc: Option<u32>,
+            #[serde(default)]
+            scan_bids: u32,
+        }
+        #[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
+        struct New {
+            #[serde(default)]
+            scan_price_mc: Option<u32>,
+            #[serde(default)]
+            scan_budget_mc: u32,
+            #[serde(default)]
+            scan_queued: u32,
+        }
+        let new: New = decode(
+            &encode(&Old {
+                scan_price_mc: Some(7),
+                scan_bids: 3,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            new,
+            New {
+                scan_price_mc: Some(7),
+                ..Default::default()
+            }
+        );
+        let old: Old = decode(
+            &encode(&New {
+                scan_price_mc: None,
+                scan_budget_mc: 5,
+                scan_queued: 2,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!((old.scan_price_mc, old.scan_bids), (None, 0));
     }
 
     /// A heartbeat dated far ahead is refused, and one held from before a
@@ -680,7 +742,8 @@ mod tests {
             public_addrs: vec![],
             probe_price_mc: None,
             scan_price_mc: None,
-            scan_bids: 0,
+            scan_budget_mc: 0,
+            scan_queued: 0,
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = a.sign(&SignedHeartbeat::signing(&body));

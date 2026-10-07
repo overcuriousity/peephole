@@ -31,14 +31,6 @@ pub fn budget(l: &Ledger, me: &NodeId, share: f64) -> Mc {
     cap.saturating_sub(committed)
 }
 
-/// Queued jobs `budget` funds at `price`.
-pub fn bids(queued: u32, budget: Mc, price: Mc) -> u32 {
-    if price == 0 {
-        return 0;
-    }
-    (budget / price).min(queued as Mc) as u32
-}
-
 /// The oldest lot day a scan offer written at `now_ms` may draw from: a
 /// lot that dies before the offer can be charged (within
 /// [`JOB_OFFER_TTL_MS`](super::JOB_OFFER_TTL_MS)) is left out.
@@ -137,9 +129,9 @@ pub async fn settle(node: &Arc<Node>, arbiter: NodeId, offer_seq: u64, charged_m
     }
 }
 
-/// Compute and keep the funded jobs this node would grant now, for the
-/// heartbeat and the scan price.
-pub async fn announce_bids(node: &Arc<Node>) -> Result<u32> {
+/// Compute and keep this node's scan budget left and queued jobs, for
+/// the heartbeat.
+pub async fn announce_budget(node: &Arc<Node>) -> Result<()> {
     let queued: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scan_jobs WHERE status = 'queued' AND arbiter = ?",
     )
@@ -147,15 +139,16 @@ pub async fn announce_bids(node: &Arc<Node>) -> Result<u32> {
     .fetch_one(&node.store.pool)
     .await?;
     let book = super::book(node).await?;
-    let price = node.price_table().price_of(price::SCAN).unwrap_or(0) as Mc;
-    let n = bids(
-        queued.clamp(0, u32::MAX as i64) as u32,
-        budget(&book.ledger, &node.id(), node.scan_share()),
-        price,
+    let left = budget(&book.ledger, &node.id(), node.scan_share());
+    node.scan_budget_mc.store(
+        left.min(u32::MAX as Mc) as u32,
+        std::sync::atomic::Ordering::Relaxed,
     );
-    node.scan_bids
-        .store(n, std::sync::atomic::Ordering::Relaxed);
-    Ok(n)
+    node.scan_queued.store(
+        queued.clamp(0, u32::MAX as i64) as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -282,13 +275,5 @@ mod tests {
             ledger::parts_from(&lots, 120, first_day_for_job(late)),
             None
         );
-    }
-
-    #[test]
-    fn bids_are_what_the_budget_buys_of_the_queue() {
-        assert_eq!(bids(10, 175, 50), 3);
-        assert_eq!(bids(2, 175, 50), 2);
-        assert_eq!(bids(10, 0, 50), 0);
-        assert_eq!(bids(10, 175, 0), 0, "no price, no bid");
     }
 }

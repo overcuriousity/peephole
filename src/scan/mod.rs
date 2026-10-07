@@ -551,7 +551,7 @@ impl Source {
             }
             node.status
                 .known(a)
-                .map(|k| (k.hb.scan_bids, k.hb.scan_price_mc.unwrap_or(0)))
+                .map(|k| (k.hb.scan_queued, k.hb.scan_price_mc.unwrap_or(0)))
         });
         let min_mc = node
             .price_table()
