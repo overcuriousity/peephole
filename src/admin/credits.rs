@@ -81,7 +81,6 @@ struct SpentRow {
     providers: String,
     offered: String,
     charged: String,
-    destroyed: String,
     state: &'static str,
 }
 
@@ -129,9 +128,8 @@ struct CreditsPage {
     spent: Vec<SpentRow>,
     moved: Vec<MovedRow>,
     members: Vec<MemberRow>,
-    /// Earned and destroyed over the entries read, and what is in
-    /// circulation now.
-    totals: (String, String, String),
+    /// Earned over the entries read, and what is in circulation now.
+    totals: (String, String),
     price: PriceView,
     /// `(key, name)` of the members credits can be sent to.
     receivers: Vec<(String, String)>,
@@ -227,14 +225,11 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         .filter(|o| o.payer == me)
         .take(ROWS)
         .map(|o| {
-            let (charged, destroyed, state) = match &o.state {
-                OfferState::Open => (0, 0, "open"),
-                OfferState::Lapsed => (0, 0, "lapsed"),
-                OfferState::Charged {
-                    charged, destroyed, ..
-                } => (
+            let (charged, state) = match &o.state {
+                OfferState::Open => (0, "open"),
+                OfferState::Lapsed => (0, "lapsed"),
+                OfferState::Charged { charged } => (
                     *charged,
-                    *destroyed,
                     // A server that declines, or whose providers all
                     // failed, gives the offer back with a receipt of nothing.
                     if *charged == 0 && o.answered.is_empty() {
@@ -252,7 +247,6 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
                 providers: o.answered.join(", "),
                 offered: show(o.offered),
                 charged: show(charged),
-                destroyed: show(destroyed),
                 state,
             }
         })
@@ -290,7 +284,6 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     let totals = (
         show(l.week.values().map(|t| t.earned).sum()),
-        show(l.week.values().map(|t| t.destroyed).sum()),
         show(l.circulating()),
     );
 

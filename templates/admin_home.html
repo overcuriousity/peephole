@@ -26,7 +26,7 @@
     <a class="tile" href="/admin/cluster"><span class="label">Conformity</span><div class="value small">{{ c.conformity }}</div><div class="hint">lowest: {{ c.lowest_agreement }}</div></a>
     <a class="tile" href="/admin/cluster"><span class="label">Rule sets</span><div class="value">{{ c.rule_sets }}</div><div class="hint">fingerprints carried</div></a>
     <a class="tile" href="/admin/cluster/credits"><span class="label">Credits in circulation</span><div class="value">{{ c.circulating }}</div><div class="hint">{{ c.expiring_today }} expire today</div></a>
-    <a class="tile" href="/admin/cluster/credits"><span class="label">Earned / spent / destroyed</span><div class="value small">{{ c.earned }} / {{ c.spent }} / {{ c.destroyed }}</div><div class="hint">credits a day, 7-day average</div></a>
+    <a class="tile" href="/admin/cluster/credits"><span class="label">Earned / spent</span><div class="value small">{{ c.earned }} / {{ c.spent }}</div><div class="hint">credits a day, 7-day average</div></a>
     <a class="tile" href="/admin/scans?status=done#history"><span class="label">Paid scans</span><div class="value small">{{ c.paid_scans.0 }} / {{ c.paid_scans.1 }}</div><div class="hint">a day: levels 1–2 / 3–4</div></a>
     <a class="tile" href="/admin/scans#scanners"><span class="label">Scan capacity</span><div class="value small">{{ c.capacity.1 }} of {{ c.capacity.0 }}</div><div class="hint">scans a day done of possible · {{ c.capacity.2 }} idle · {{ c.capacity.3 }}%</div></a>
     <a class="tile" href="/admin/cluster"><span class="label">Audits</span><div class="value small">{{ c.audits.0 }} / {{ c.audits.1 }} / {{ c.audits.2 }}</div><div class="hint">agree / differ / inconclusive, 7 days</div></a>

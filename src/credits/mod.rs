@@ -23,6 +23,10 @@ pub const LOT_DAYS: u32 = 7;
 /// An offer without a receipt lapses after this long.
 pub const OFFER_TTL_MS: u64 = 15 * 60 * 1000;
 
+/// A scan offer (`credits::jobs`) lapses after the longest scan and the
+/// margin a server keeps for writing its receipt.
+pub const JOB_OFFER_TTL_MS: u64 = crate::scan::pace::MAX_RUN_SECS * 1000 + pay::SERVE_MARGIN_MS;
+
 /// The UTC day an entry belongs to, from its HLC.
 pub fn day_of(hlc: u64) -> u32 {
     (crate::cluster::hlc::physical_ms(hlc) / DAY_MS) as u32

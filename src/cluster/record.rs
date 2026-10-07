@@ -465,6 +465,10 @@ pub enum Record {
         to: NodeId,
         parts: Vec<(u32, u32)>,
         seal: Seal,
+        /// The scan job this offer funds (`credits::jobs`); such an offer
+        /// lapses after the longest scan, not after 15 minutes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job: Option<String>,
     },
     /// The server's word on an offer: what it charged, and for which
     /// providers. The address looked up is not in it.
@@ -856,6 +860,7 @@ mod tests {
                     to: id.id,
                     parts: vec![(20_000, 250), (20_001, 4_000_000_000)],
                     seal: seal.clone(),
+                    job: None,
                 },
                 "credit_offer",
             ),

@@ -1,9 +1,9 @@
 //! Paying for a lookup. The asking node sets credits aside with a
 //! `credit_offer` to the server it chose and names that entry in its
 //! request; the server checks the offer against its own book, asks its
-//! providers and writes a `credit_receipt` for what it answered. Half of
-//! what is charged goes to the server, half is destroyed. A node's own
-//! providers cost the same as anyone else's.
+//! providers and writes a `credit_receipt` for what it answered. The
+//! server keeps what it charges. A node's own providers cost the same as
+//! anyone else's.
 use super::entries::{self, Kind, SealState};
 use super::ledger::OfferState;
 use super::{Mc, price, show};
@@ -319,6 +319,7 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
         to: server,
         parts,
         seal,
+        job: None,
     })
     .await
     .map_err(|e| format!("the offer could not be written: {e:#}"))?;

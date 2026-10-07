@@ -46,6 +46,8 @@ pub enum Kind {
     Offer {
         to: NodeId,
         parts: Vec<(u32, u32)>,
+        /// The scan job it funds; such an offer lapses after the longest scan.
+        job: Option<String>,
     },
     Receipt {
         payer: NodeId,
@@ -103,13 +105,16 @@ pub async fn apply(
         Option<u64>,
         Option<u32>,
         Option<&'a [String]>,
+        Option<&'a str>,
     );
-    let (kind, peer, parts, offer_seq, charged, answered): Cols = match r {
-        Record::CreditOffer { to, parts, .. } if parts_ok(parts, day) => {
-            ("offer", to, parts, None, None, None)
+    let (kind, peer, parts, offer_seq, charged, answered, job_uid): Cols = match r {
+        Record::CreditOffer { to, parts, job, .. }
+            if parts_ok(parts, day) && job.as_ref().is_none_or(|j| j.len() <= 64) =>
+        {
+            ("offer", to, parts, None, None, None, job.as_deref())
         }
         Record::CreditTransfer { to, parts, .. } if *to != e.origin && parts_ok(parts, day) => {
-            ("transfer", to, parts, None, None, None)
+            ("transfer", to, parts, None, None, None, None)
         }
         Record::CreditReceipt {
             payer,
@@ -126,14 +131,15 @@ pub async fn apply(
                 Some(*offer_seq),
                 Some(*charged_mc),
                 Some(answered),
+                None,
             )
         }
         _ => return Ok(false),
     };
     sqlx::query(
         "INSERT OR IGNORE INTO credit_entries
-           (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal)
-         VALUES (?,?,?,?,?,?,?,?,?,?)",
+           (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, job_uid)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&e.origin.0[..])
     .bind(e.seq.min(i64::MAX as u64) as i64)
@@ -145,6 +151,7 @@ pub async fn apply(
     .bind(charged.map(i64::from))
     .bind(answered.map(serde_json::to_string).transpose()?)
     .bind(seal.to_db())
+    .bind(job_uid)
     .execute(&mut *conn)
     .await?;
     Ok(true)
@@ -161,9 +168,11 @@ type Row = (
     Option<i64>,
     Option<String>,
     i64,
+    Option<String>,
 );
 
-const COLUMNS: &str = "origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal";
+const COLUMNS: &str =
+    "origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, job_uid";
 
 fn from_row(r: Row) -> Result<Entry> {
     let peer = NodeId::from_slice(&r.4)?;
@@ -171,6 +180,7 @@ fn from_row(r: Row) -> Result<Entry> {
         "offer" => Kind::Offer {
             to: peer,
             parts: serde_json::from_str(&r.5)?,
+            job: r.10,
         },
         "transfer" => Kind::Transfer {
             to: peer,
@@ -270,6 +280,7 @@ mod tests {
                 to: b.id,
                 parts: vec![(day - 1, 300), (day, 200)],
                 seal: seal.clone(),
+                job: None,
             },
         );
         let receipt = sign(
@@ -311,6 +322,7 @@ mod tests {
                 to: b.id,
                 parts: vec![(day - 7, 50)],
                 seal: seal.clone(),
+                job: None,
             },
         );
         let other = sign(&a, 8, at(6), &Record::LogSeal { seal });
@@ -343,7 +355,8 @@ mod tests {
                 hlc: at(1),
                 kind: Kind::Offer {
                     to: b.id,
-                    parts: vec![(day - 1, 300), (day, 200)]
+                    parts: vec![(day - 1, 300), (day, 200)],
+                    job: None,
                 },
                 seal: SealState::Consistent,
             }

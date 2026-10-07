@@ -259,7 +259,6 @@ pub struct ClusterFigures {
     /// Per day, 7-day averages.
     pub earned: String,
     pub spent: String,
-    pub destroyed: String,
     pub expiring_today: String,
     /// Paid scans a day, low and high tier.
     pub paid_scans: (String, String),
@@ -278,19 +277,16 @@ pub struct ClusterFigures {
     pub forks: usize,
 }
 
-/// What lookups charged, and the part of it destroyed, over the offers
-/// written since `from_ms`.
-fn spending(offers: &[crate::credits::ledger::Offer], from_ms: u64) -> (u64, u64) {
+/// What lookups charged over the offers written since `from_ms`.
+fn spending(offers: &[crate::credits::ledger::Offer], from_ms: u64) -> u64 {
     offers
         .iter()
         .filter(|o| crate::cluster::hlc::physical_ms(o.hlc) >= from_ms)
         .filter_map(|o| match o.state {
-            crate::credits::ledger::OfferState::Charged {
-                charged, destroyed, ..
-            } => Some((charged, destroyed)),
+            crate::credits::ledger::OfferState::Charged { charged } => Some(charged),
             _ => None,
         })
-        .fold((0, 0), |(c, d), (c2, d2)| (c + c2, d + d2))
+        .sum()
 }
 
 async fn cluster_figures(
@@ -327,7 +323,7 @@ async fn cluster_figures(
     let week = book.now_ms.saturating_sub(7 * crate::credits::DAY_MS);
     let in_week = |hlc: u64| crate::cluster::hlc::physical_ms(hlc) >= week;
     // The ledger walks 8 days of entries: count the last 7.
-    let (spent, destroyed) = spending(&l.offers, week);
+    let spent = spending(&l.offers, week);
     let (mut low, mut high) = (0u64, 0u64);
     for p in book.paid.iter().filter(|p| in_week(p.scan.hlc)) {
         if p.scanner_mc + p.trap_mc == 0 {
@@ -387,7 +383,6 @@ async fn cluster_figures(
         circulating: show(l.circulating()),
         earned: show(book.earned_per_day()),
         spent: per_day(spent),
-        destroyed: per_day(destroyed),
         expiring_today: show(active.iter().map(|m| l.expiring_today(&m.id)).sum::<u64>()),
         paid_scans: (tenth(low), tenth(high)),
         capacity: (
@@ -597,16 +592,13 @@ mod tests {
             offered: charged,
             covered: charged,
             held: vec![],
-            state: OfferState::Charged {
-                charged,
-                to_server: charged / 2,
-                destroyed: charged - charged / 2,
-            },
+            state: OfferState::Charged { charged },
             answered: vec![],
+            job: None,
         };
         // Day 1 lies outside the week that starts on day 2.
         let offers = [offer(1, 1000), offer(2, 400), offer(8, 200)];
-        assert_eq!(spending(&offers, 2 * crate::credits::DAY_MS), (600, 300));
+        assert_eq!(spending(&offers, 2 * crate::credits::DAY_MS), 600);
     }
 
     #[test]

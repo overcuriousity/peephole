@@ -43,13 +43,13 @@
 <section class="card"><div class="card-head"><h2>Spent</h2><span class="muted">lookups this node paid for</span></div>
   {% if spent.is_empty() %}<p class="muted">Nothing yet.</p>{% else %}
   <div class="table-wrap wide"><table>
-    <thead><tr><th>When</th><th>Answered by</th><th>Providers</th><th class="num">Offered</th><th class="num">Charged</th><th class="num">Of which destroyed</th><th>State</th></tr></thead>
+    <thead><tr><th>When</th><th>Answered by</th><th>Providers</th><th class="num">Offered</th><th class="num">Charged</th><th>State</th></tr></thead>
     <tbody>{% for s in spent %}<tr>
       <td class="ts">{{ s.at }}</td><td>{{ s.server }}</td><td class="mono">{{ s.providers }}</td>
-      <td class="num">{{ s.offered }}</td><td class="num">{{ s.charged }}</td><td class="num">{{ s.destroyed }}</td><td>{{ s.state }}</td>
+      <td class="num">{{ s.offered }}</td><td class="num">{{ s.charged }}</td><td>{{ s.state }}</td>
     </tr>{% endfor %}</tbody>
   </table></div>
-  <p class="muted small">Half of what is charged goes to the node that answered; the other half is destroyed. An offer without an answer lapses after 15 minutes and costs nothing.</p>{% endif %}
+  <p class="muted small">What is charged goes to the node that answered. An offer without an answer lapses after 15 minutes (a scan offer after the longest scan) and costs nothing.</p>{% endif %}
 </section>
 <section class="card"><div class="card-head"><h2>Sent and received</h2></div>
   {% if moved.is_empty() %}<p class="muted">No transfers.</p>{% else %}
@@ -74,7 +74,7 @@
       <td>{% if !m.standing.is_empty() %}<span class="badge badge-status" data-status="running">not earning here: {{ m.standing }}</span>{% endif %}</td>
     </tr>{% endfor %}</tbody>
   </table></div>
-  <p class="muted">In 7 days earned {{ totals.0 }} · destroyed {{ totals.1 }} · in circulation now {{ totals.2 }} credits. Another node may count differently: it holds other entries, blocks other members, or runs other rules.</p>
+  <p class="muted">In 7 days earned {{ totals.0 }} · in circulation now {{ totals.1 }} credits. Another node may count differently: it holds other entries, blocks other members, or runs other rules.</p>
 </section>
 <section class="card"><div class="card-head"><h2>What a lookup costs here</h2></div>
   <ul>
