@@ -5,6 +5,61 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Added
+
+- RDAP. A free provider (`rdap`) asks the registries who holds the block an
+  address is in: range, handle, holder, abuse contact, registration and
+  last-change dates; tags `rdap:country:XX` and `rdap:fresh`. Runs in the
+  enrichment loop and in every lookup; one query a second per registry,
+  the IANA bootstrap is built in and refreshed weekly.
+- Observational probes. From the Lookup page or the IP page an admin asks
+  a scanner to read what the ports a counter-scan found open volunteer:
+  HTTP status, headers, title, cookie names, page and 404 hashes, favicon
+  hash; TLS certificate chain, version, ALPN and JARM; SSH banner, HASSH
+  and host key (also from OpenSSH 10); otherwise the banner. Redirects
+  are followed for at most 5 hops, each hop checked against the safety
+  lists and private space. Only ports already found open are touched,
+  never more than 16, 10 s per connection, 120 s per probe, one probe per
+  address and scanner a day. In a cluster a probe is paid with credits
+  (4 units, double while the scanner is busy); the result and the receipt
+  replicate together. `[probe] enabled`, `max_parallel`. Admin-only.
+- Vantages. The same probe from up to four scanners at once, spread over
+  countries, with a field-by-field diff of what each one saw and a
+  light-speed check of each vantage's RTT against the address's GeoLite2
+  location: a claim the RTT makes impossible is flagged.
+- Peer-observed public address. Peers report the address they see a node
+  connect from (`hello`); once a sibling or two members agree it is this
+  node's public address: never scanned, announced in heartbeats, used as
+  the probe's vantage, shown on System › Status.
+- Domains in Lookup. A name is resolved by up to five nodes; an address
+  counts when more than half of those that answered returned it, the
+  rest is shown as disputed. Agreed names are attached to the address
+  (IP page, `names` export column) and replicated. nmap's PTR names from
+  stored scans are shown there too.
+- Lookup is a tab. It runs the cheap providers (Tor, RDAP, GeoLite2,
+  InternetDB) by itself and offers the paid ones with their price; one
+  field takes an address, a name or a pasted list. The top-bar search
+  routes names to it.
+- Links: favicon, JARM, page-body and 404-page hashes from probes, as
+  soft kinds (same product, not the same operator).
+- A page per decoy's served canaries; request rows are marked where
+  canaries were served or used.
+- Failed counter-scans are retried for 24 hours with a growing wait
+  (10 min doubling to 2 h; the scanner that failed waits longer); a retry
+  stops when a newer scan or a pending job covers the address.
+
+### Changed
+
+- Host keys and certificates may come from a probe as well as a scan;
+  `host_keys` is rebuilt with a nullable `scan_id` (migration 0018).
+- The README's "escalate by scope, never by speed" rule now says it
+  governs the automatic counter-scans.
+
+### Removed
+
+- The manual "Retry failed" action on the Scans page; retries are
+  automatic.
+
 ## [0.7.0] - 2026-10-06
 
 ### Added
