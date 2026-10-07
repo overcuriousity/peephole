@@ -19,13 +19,13 @@
     <label>Country <input name="country" size="3" maxlength="2" value="{{ f.country.as_deref().unwrap_or_default() }}"></label>
     <label>Node <input name="node" size="10" value="{{ f.node.as_deref().unwrap_or_default() }}"{% if !kind.by_node() %} disabled title="Scans are not recorded per node"{% endif %}></label>
     <label>Sort <select name="sort"><option value="ips">IPs</option><option value="sightings"{% if f.sort.as_deref() == Some("sightings") %} selected{% endif %}>sightings</option><option value="recent"{% if f.sort.as_deref() == Some("recent") %} selected{% endif %}>last seen</option></select></label>
-    <button>Filter</button>
+    <button class="btn btn-primary" type="submit">Filter</button>
   </form>
   <div class="table-wrap"><table class="table"><thead><tr><th>{{ kind.name() }}</th><th class="num">IPs</th><th class="num">Sightings</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>
   {% for r in page.items %}<tr>
     <td class="mono hk-fp"><a href="{{ crate::admin::views::link_href(kind.key(), r.value.as_str()) }}">{{ r.value }}</a>{% let value = r.value.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}</td>
     <td class="num">{{ r.ips }}</td><td class="num">{{ crate::admin::views::thousands(r.sightings) }}</td>
-    <td class="mono">{{ r.first_seen.as_deref().unwrap_or("—") }}</td><td class="mono">{{ r.last_seen.as_deref().unwrap_or("—") }}</td>
+    <td class="ts">{{ crate::admin::views::when(r.first_seen.as_deref()) }}</td><td class="ts">{{ crate::admin::views::when(r.last_seen.as_deref()) }}</td>
   </tr>{% endfor %}
   {% if page.items.is_empty() %}<tr><td colspan="5" class="empty">Nothing{% if f.shared() %} seen on two or more IPs{% endif %} matches.</td></tr>{% endif %}
   </tbody></table></div>

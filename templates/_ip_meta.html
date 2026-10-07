@@ -1,0 +1,7 @@
+{# Country, network and first/last seen of a recorded address (`t`: admin::target::Target). #}
+<div class="meta">
+  {% if let Some(c) = t.ov.ip.country %}<a href="/ips?country={{ c }}">{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}</a>{% else %}<span class="muted">country unknown</span>{% endif %}
+  {% if let Some(a) = t.ov.ip.asn %}<a href="/ips?asn={{ a }}">{{ t.ov.ip.asn_org.as_deref().unwrap_or("") }} <span class="mono muted">AS{{ a }}</span></a>{% else %}<span class="muted">ASN unknown</span>{% endif %}
+  <span>first seen <span class="mono">{{ crate::admin::views::minute(t.ov.ip.first_seen) }}</span> UTC</span>
+  <span>last seen <span class="mono">{{ crate::admin::views::minute(t.ov.ip.last_seen) }}</span> UTC</span>
+</div>

@@ -5892,6 +5892,32 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
         "{html}"
     );
     assert!(html.contains("Resolving a name costs"));
+    // The market: the hourly refresh left a snapshot per good, with what b
+    // announces for abuseipdb as the members' band (seen by now).
+    price::refresh(&na.node).await.unwrap();
+    let html = text(&admin, page.clone()).await;
+    let rows: Vec<(String, Option<i64>, Option<i64>)> =
+        sqlx::query_as("SELECT good, own_mc, lo_mc FROM price_history ORDER BY good")
+            .fetch_all(&na.store.pool)
+            .await
+            .unwrap();
+    assert!(
+        rows.iter().any(|(g, own, _)| g == "scan" && own.is_some()),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(g, own, lo)| g == "abuseipdb" && own.is_none() && *lo == Some(cost as i64)),
+        "{rows:?}"
+    );
+    assert!(html.contains("data-market=") && html.contains("data-pick-good=\"abuseipdb\""));
+    assert!(html.contains("Money flow") && html.contains("data-flow="));
+    // The balance is on the Overview too.
+    let home = text(&admin, format!("{base}/admin")).await;
+    assert!(
+        home.contains("tile-balance") && home.contains(&credits::show(held - cost)),
+        "{home}"
+    );
 
     // Sending: half a credit to b.
     let r = admin

@@ -1,0 +1,17 @@
+{# One provider card (public::IntelCard `c`). `badge`: "" or the card's source ("Asked now", "From the dataset"); `verb`: "checked" or "looked up"; `again`: "" or the provider an "Ask again" button asks for `again_ip`. #}
+<div class="intel">
+  <div class="intel-head"><h3>{{ c.label }}</h3><span class="intel-id mono">{{ c.name }}</span>{% if !badge.is_empty() %}<span class="intel-badge" data-source="{{ badge }}">{{ badge }}</span>{% endif %}</div>
+  {% if let Some(x) = c.newest %}
+    <dl class="kv">{% for f in x.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
+    <p class="intel-src">{{ verb }} <time datetime="{{ crate::admin::views::stamp(x.fetched_at.as_str()) }}" data-ago title="{{ x.fetched_at }}">{{ crate::admin::views::ago(x.fetched_at.as_str()) }}</time> ago{% if let Some(v) = x.source_version %} · data <span class="mono">{{ v }}</span>{% endif %}{% if let Some(n) = x.node %} · {{ n }}{% endif %}</p>
+    {% if !c.others.is_empty() %}
+    <details class="intel-older"><summary>{{ c.others.len() }} older or other-node result{% if c.others.len() != 1 %}s{% endif %}</summary>
+      {% for o in c.others %}
+      <dl class="kv">{% for f in o.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
+      <p class="intel-src"><span class="mono">{{ crate::admin::views::when(Some(o.fetched_at.as_str())) }}</span>{% if let Some(v) = o.source_version %} · data <span class="mono">{{ v }}</span>{% endif %}{% if let Some(n) = o.node %} · {{ n }}{% endif %}</p>
+      {% endfor %}
+    </details>
+    {% endif %}
+  {% endif %}
+  {% if !again.is_empty() %}<form class="intel-again" method="post" action="/admin/lookup"><input type="hidden" name="ip" value="{{ again_ip }}"><input type="hidden" name="again" value="{{ again }}"><button class="btn btn-sm" type="submit">Ask again</button> <span class="muted">a paid lookup</span></form>{% endif %}
+</div>

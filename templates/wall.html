@@ -8,7 +8,7 @@
     <p class="muted">{{ range.label() }}</p>
     <p class="muted">{% if delay_max == 0 %}{% if chrome.authed %}Live view (signed in); the public sees the same.{% else %}Data shown as recorded.{% endif %}{% else if chrome.authed %}Live view (signed in); the public sees this {{ delay_min }}–{{ delay_max }} min later.{% else %}Data delayed by about {{ delay_min }}–{{ delay_max }} min.{% endif %}</p>
   </div>
-  {% let base = "/" %}{% include "_range.html" %}
+  {% let base = "/" %}{% let keep = String::new() %}{% include "_range.html" %}
 </div>
 {% if stale %}<div class="banner banner-warning">Tor exit list or GeoIP data missing or older than 48 h.</div>{% endif %}
 

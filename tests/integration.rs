@@ -2193,6 +2193,31 @@ async fn bulk_delete_checked_and_filtered() {
         bulk_form.contains("name=\"path\" value=\"/keep\""),
         "bulk form keeps the filter"
     );
+    // Every filter field travels, so "Delete all N" deletes what N counted.
+    let html = client
+        .get(format!("{abase}/requests?path=/keep&session=s1"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let bulk_form = html.split("id=\"bulk-form\"").nth(1).unwrap();
+    assert!(
+        bulk_form.contains("name=\"session\" value=\"s1\""),
+        "bulk form keeps the session"
+    );
+    let all_form = html.split("id=\"dlg-bulk-all\"").nth(1).unwrap();
+    assert!(all_form.contains("name=\"session\" value=\"s1\""));
+    let html = client
+        .get(format!("{abase}/ips?sort=requests&country=DE"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("name=\"sort\" value=\"requests\""));
 
     // Checked rows.
     let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/bulk' LIMIT 2")

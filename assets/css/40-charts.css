@@ -7,8 +7,6 @@
 .chart .hbar-label { fill: var(--color-fg-primary); font-size: 11px; }
 .chart .hbar-value { fill: var(--color-fg-muted); font-size: 11px; font-family: var(--font-mono); }
 .chart .hbar { fill: var(--color-accent-muted); }
-.chart .sev-bar-0 { fill: var(--sev-0); } .chart .sev-bar-1 { fill: var(--sev-1); }
-.chart .sev-bar-2 { fill: var(--sev-2); } .chart .sev-bar-3 { fill: var(--sev-3); } .chart .sev-bar-4 { fill: var(--sev-4); }
 .chart .empty-note { fill: var(--color-fg-muted); font-size: 12px; }
 .map svg { display: block; width: 100%; height: auto; }
 .map .sphere { fill: var(--color-bg-surface); }

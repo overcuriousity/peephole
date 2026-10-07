@@ -195,9 +195,12 @@ earn most of the new money, every member a little.
   (12 hours plus 2 minutes). Jobs that are not funded are scanned by idle
   capacity and earn the mint only.
 - **Every node counts for itself**, from its own copy of the log. There is
-  no vote and no shared chain; `Cluster › Credits` shows this node's
-  balance, the mint, the allowance, income by source, the market's prices,
-  and says why a scan was not counted.
+  no vote and no shared chain; `Cluster › Credits` shows the market as
+  this node sees it: each good's price over 7 days beside the spread
+  members announce, its demand and supply, this node's daily income by
+  source and spending, every member's holdings, and why a scan was not
+  counted. Prices are kept hourly in `price_history` (local, 8 days).
+  The balance itself is on the Overview and the Lookup page.
 - **Conformity and audits.** A member earns on your node only while at
   least 98 % of its newest 500 requests classify the same with your
   rules, and its scans stand up to the audits you believe: those of your

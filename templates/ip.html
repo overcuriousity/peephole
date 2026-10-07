@@ -5,12 +5,7 @@
 <div class="page-head ip-head">
   <div>
     <h1>{{ t.ov.ip.ip }}{% let value = t.ov.ip.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}{% if t.ov.ip.is_tor_exit %} <span class="badge badge-tor">tor exit</span>{% endif %}</h1>
-    <div class="meta">
-      {% if let Some(c) = t.ov.ip.country %}<a href="/ips?country={{ c }}">{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}</a>{% else %}<span class="muted">country unknown</span>{% endif %}
-      {% if let Some(a) = t.ov.ip.asn %}<a href="/ips?asn={{ a }}">{{ t.ov.ip.asn_org.as_deref().unwrap_or("") }} <span class="mono muted">AS{{ a }}</span></a>{% else %}<span class="muted">ASN unknown</span>{% endif %}
-      <span>first seen <span class="mono">{{ crate::admin::views::minute(t.ov.ip.first_seen) }}</span> UTC</span>
-      <span>last seen <span class="mono">{{ crate::admin::views::minute(t.ov.ip.last_seen) }}</span> UTC</span>
-    </div>
+    {% include "_ip_meta.html" %}
   </div>
   <div class="tiles">
     <div class="tile"><span class="label">Requests</span><div class="value">{{ crate::admin::views::thousands(t.ov.request_count) }}</div>{% if let Some(a) = t.admin %}{% if a.skipped > 0 %}<div class="hint">+ {{ a.skipped }} not recorded in full</div>{% endif %}{% endif %}</div>
@@ -20,6 +15,7 @@
   </div>
 </div>
 
+<nav class="section-nav" data-section-nav aria-label="On this page"></nav>
 <div class="stack">
   {% let first = true %}{% include "_target.html" %}
 

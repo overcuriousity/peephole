@@ -47,6 +47,9 @@
   --color-border: #d9d5c9;
   --color-border-strong: #c3beaf;
   --color-border-subtle: #e6e3da;
+  /* Nested panels (provider cards inside a card) and the card lift. */
+  --color-bg-inset: #fbfaf7;
+  --shadow-card: 0 1px 2px rgba(31, 32, 36, 0.05);
 
   --color-accent: #1f6f8b;
   --color-accent-dim: rgba(31, 111, 139, 0.10);
@@ -87,6 +90,8 @@
   --ramp-2: rgba(31, 111, 139, 0.45);
   --ramp-3: rgba(31, 111, 139, 0.70);
   --ramp-4: #1f6f8b;
+  /* Text on the ramp's step 3 (white fails there in light). */
+  --ramp-3-fg: #1f2024;
 
   --grid-texture: none;
   color-scheme: light;
@@ -104,9 +109,11 @@
     --color-fg-secondary: #a0a4b8;
     --color-fg-muted: #8a8ea6;
 
-    --color-border: #22263a;
-    --color-border-strong: #2f3449;
-    --color-border-subtle: #171a26;
+    --color-border: #262b40;
+    --color-border-strong: #353b54;
+    --color-border-subtle: #212536;
+    --color-bg-inset: #12141d;
+    --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 1px 3px rgba(0, 0, 0, 0.35);
 
     --color-accent: #4fd1e0;
     --color-accent-dim: rgba(79, 209, 224, 0.14);
@@ -140,6 +147,7 @@
     --ramp-2: rgba(79, 209, 224, 0.42);
     --ramp-3: rgba(79, 209, 224, 0.68);
     --ramp-4: #4fd1e0;
+    --ramp-3-fg: #0a0b10;
 
     --grid-texture:
       repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 32px),
@@ -157,9 +165,11 @@
   --color-fg-primary: #e4e6ee;
   --color-fg-secondary: #a0a4b8;
   --color-fg-muted: #8a8ea6;
-  --color-border: #22263a;
-  --color-border-strong: #2f3449;
-  --color-border-subtle: #171a26;
+  --color-border: #262b40;
+  --color-border-strong: #353b54;
+  --color-border-subtle: #212536;
+  --color-bg-inset: #12141d;
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 1px 3px rgba(0, 0, 0, 0.35);
   --color-accent: #4fd1e0;
   --color-accent-dim: rgba(79, 209, 224, 0.14);
   --color-accent-muted: rgba(79, 209, 224, 0.35);
@@ -187,6 +197,7 @@
   --ramp-2: rgba(79, 209, 224, 0.42);
   --ramp-3: rgba(79, 209, 224, 0.68);
   --ramp-4: #4fd1e0;
+  --ramp-3-fg: #0a0b10;
   --grid-texture:
     repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 32px),
     repeating-linear-gradient(90deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 32px);

@@ -6,7 +6,15 @@
     var label = btn.querySelector("[data-theme-label]");
     var render = function () {
       var t = document.documentElement.getAttribute("data-theme") || "auto";
-      if (label) label.textContent = t === "auto" ? "Auto" : t === "dark" ? "Dark" : "Light";
+      var name = t === "auto" ? "Auto" : t === "dark" ? "Dark" : "Light";
+      if (label) label.textContent = name;
+      btn.setAttribute("aria-label", "Theme: " + name + " (change)");
+      // The browser chrome follows a forced theme too.
+      document.querySelectorAll('meta[name="theme-color"]').forEach(function (m) {
+        if (!m.hasAttribute("data-media")) m.setAttribute("data-media", m.getAttribute("media") || "");
+        var light = m.getAttribute("data-media").indexOf("light") >= 0;
+        m.setAttribute("media", t === "auto" ? m.getAttribute("data-media") : (t === "light") === light ? "all" : "not all");
+      });
     };
     btn.addEventListener("click", function () {
       var cur = document.documentElement.getAttribute("data-theme") || "auto";
@@ -254,12 +262,15 @@
     var rSet = function (state, label) { if (rLive) { rLive.setAttribute("data-state", state); if (rLabel) rLabel.textContent = label; } };
     var resc = function (s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); };
     var flag = function (cc) { return cc && /^[A-Z]{2}$/.test(cc) ? String.fromCodePoint(0x1f1e6 + cc.charCodeAt(0) - 65, 0x1f1e6 + cc.charCodeAt(1) - 65) : ""; };
+    var names = null;
+    try { names = new Intl.DisplayNames(["en"], { type: "region" }); } catch (e) {}
+    var region = function (cc) { try { return (names && names.of(cc)) || cc; } catch (e) { return cc; } };
     var rRow = function (r) {
       var tr = document.createElement("tr"), sev = Math.max(0, Math.min(4, r.severity | 0));
       tr.setAttribute("data-sev", sev); tr.className = "is-new";
       var chips = (r.labels || []).map(function (l, i) { var f = (r.families || [])[i]; return '<span class="badge badge-label' + (f && f !== "other" ? " badge-cat-" + resc(f) : "") + '">' + resc(l) + "</span>"; }).join("") +
         (r.owasp || []).map(function (o) { return '<span class="badge badge-owasp">' + resc(o) + "</span>"; }).join("");
-      tr.innerHTML = '<td class="ts">' + resc(r.ts) + '</td><td class="ip"><a href="/ip/' + resc(r.ip) + '">' + resc(r.ip) + "</a>" + (r.country ? ' <span class="flag">' + flag(r.country) + "</span>" : "") +
+      tr.innerHTML = '<td class="ts">' + resc(r.ts) + '</td><td class="ip"><a href="/ip/' + resc(r.ip) + '">' + resc(r.ip) + "</a>" + (r.country ? ' <span class="flag" title="' + resc(region(r.country)) + '">' + flag(r.country) + "</span>" : "") +
         '</td><td class="mono">' + resc(r.method) + '</td><td class="path"><a href="/admin/requests/' + resc(r.id) + '">' + resc(r.path) + "</a></td>" +
         '<td><span class="sev sev-' + sev + '" title="severity ' + sev + '">' + sev + '</span></td><td><span class="chips">' + chips + "</span></td>";
       return tr;
@@ -319,11 +330,41 @@
     });
   }
 
+  // "On this page": a pill per section of the IP page or lookup result,
+  // the one in view highlighted.
+  var snav = document.querySelector("[data-section-nav]");
+  if (snav) {
+    var seen = {}, links = [];
+    document.querySelectorAll("[data-section]").forEach(function (sec) {
+      var name = sec.getAttribute("data-section"), h = sec.querySelector("h2");
+      if (seen[name] || !h) return;
+      seen[name] = true;
+      if (!sec.id) sec.id = "s-" + name;
+      var a = document.createElement("a");
+      a.href = "#" + sec.id;
+      a.textContent = name === "intel" ? "Intelligence" : h.firstChild.textContent.trim();
+      snav.appendChild(a);
+      links.push([sec, a]);
+    });
+    if (links.length < 3) { snav.remove(); }
+    else if (window.IntersectionObserver) {
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (!e.isIntersecting) return;
+          links.forEach(function (l) { l[1].toggleAttribute("aria-current", l[0] === e.target); if (l[0] === e.target) l[1].setAttribute("aria-current", "true"); });
+        });
+      }, { rootMargin: "-30% 0px -60% 0px" });
+      links.forEach(function (l) { io.observe(l[0]); });
+    }
+  }
+
   window.peephole = window.peephole || {};
   window.peephole.ago = ago;
   // Old /admin/fingerprints#<anchor> links land on the Links index after
   // the 308 (browsers keep the fragment); the server resolves the anchor.
   if (location.pathname === "/admin/links" && location.hash.length > 1 && !location.search) {
-    location.replace("/admin/links?anchor=" + encodeURIComponent(decodeURIComponent(location.hash.slice(1))));
+    var anchor = location.hash.slice(1);
+    try { anchor = decodeURIComponent(anchor); } catch (e) {}
+    location.replace("/admin/links?anchor=" + encodeURIComponent(anchor));
   }
 })();

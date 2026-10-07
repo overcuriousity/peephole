@@ -72,6 +72,45 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   `host_keys` is rebuilt with a nullable `scan_id` (migration 0018).
 - The README's "escalate by scope, never by speed" rule now says it
   governs the automatic counter-scans.
+- Lookup and the IP page: a signals strip (Tor exit, abuse score with a
+  meter, registry holder, Shodan, CVEs) above the provider cards; the
+  cards pack in columns, say how old each answer is, and list providers
+  without a result on one line. Lookup shows one card per provider: asked
+  now, from the dataset, or what the dataset holds, instead of the same
+  provider twice. An "On this page" bar jumps between sections.
+- Cluster › Credits is a market dashboard: each good's price over 7 days
+  (this node's, and the lowest, median and highest that members announce),
+  its demand and supply, a price table with 24-hour change and sparklines,
+  and this node's daily income (mint, allowance, sales) against spending.
+  Prices are snapshotted hourly into `price_history` (migration 0022,
+  local, kept 8 days). The balance moved to an Overview tile (with what
+  expires by tomorrow) and the Lookup page; earned, spent and transfers
+  fold away under "Your credits".
+- The Overview's Cluster card: four headline figures (earning members,
+  scan capacity with a meter, credits in circulation, audits) and the
+  rest in one row.
+- Dark mode: card and panel borders are visible; nested panels are inset.
+- Times on admin pages read `YYYY-MM-DD HH:MM` in summaries, provider
+  timestamps included; Lookup and Links tables show countries with flag
+  and name and severity as a badge.
+
+### Fixed
+
+- "Delete all N matching" on Requests left out the MCP session filter
+  and could delete far more than N; every filter field now travels with
+  the bulk forms (on IPs the sort too), and the filter form keeps the
+  session and exact-severity filters.
+- Switching the time range on Canaries kept no other filter; the IP
+  page's "Show the reuses" link now covers all time.
+- The Lookup field (a textarea) was unstyled; Filter buttons on Links,
+  Decoys and Canaries were too.
+- A claim's contact address is no longer a `mailto:` link (it is
+  attacker-supplied); it is shown as text with a copy button.
+- Charts: the "all" range shows quiet days as gaps; a failed data load
+  says so; chart cells no longer take hundreds of tab stops inside an
+  image; the tooltip is no longer announced on every mouse move.
+- Contrast: the danger button's hover in dark mode and the OWASP grid's
+  third step in light mode; stronger focus rings on fields.
 
 ### Removed
 
