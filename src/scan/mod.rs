@@ -138,6 +138,52 @@ impl Refusal {
     }
 }
 
+/// A grant handed back "later" for these reasons is no fault of the
+/// scanner: the arbiter does not count it as undelivered.
+pub(crate) const NOT_REPLICATED: &str = "job not replicated here yet";
+pub(crate) const TOR_UNKNOWN: &str = "Tor exit status unknown (no exit list loaded)";
+
+/// What a scanner knows of an arbiter with queued work, for [`can_pay`].
+struct Payer {
+    /// This node itself: its own jobs pay from its own scan budget.
+    own: bool,
+    /// Granted unpaid after announcing it could pay (`DEMOTE_FOR`).
+    demoted: bool,
+    /// It sells and buys scans at scanner prices (`pay::sells_scans`).
+    sells_scans: bool,
+    /// `(scan_queued, scan_budget_mc)` as its heartbeat announces them.
+    announced: Option<(u32, u32)>,
+    /// Its balance in this node's book; None without a book.
+    balance: Option<u64>,
+}
+
+/// Whether an arbiter can pay `sell` (this scanner's price; None: it does
+/// not sell): this node's own jobs from `own_left`, another arbiter from
+/// the budget it announces, at most its balance here.
+fn can_pay(sell: Option<u32>, own_left: u64, a: &Payer) -> bool {
+    let Some(price) = sell.map(u64::from) else {
+        return false;
+    };
+    if a.own {
+        return own_left >= price;
+    }
+    if a.demoted || !a.sells_scans {
+        return false;
+    }
+    match (a.announced, a.balance) {
+        (Some((queued, budget)), Some(balance)) => {
+            queued > 0 && (budget as u64).min(balance) >= price
+        }
+        _ => false,
+    }
+}
+
+/// Whether a grant from another arbiter that was asked as paying, but
+/// came unfunded, demotes it for [`DEMOTE_FOR`].
+fn demotes(own: bool, funded: bool, asked_as_paying: bool) -> bool {
+    !own && !funded && asked_as_paying
+}
+
 /// `arbiters` (in urgency order) with those that can pay this scanner's
 /// price first; each group keeps its order. Price differences between
 /// arbiters do not reorder anything: the scanner names the price.
@@ -369,9 +415,7 @@ impl Source {
                 let s = &self.cfg.scan.safety;
                 match s.tor_unknown {
                     TorUnknown::Defer if hours_since(queued_at) < s.tor_wait_hours as f64 => {
-                        return Ok(Some(Refusal::Defer(
-                            "Tor exit status unknown (no exit list loaded)".into(),
-                        )));
+                        return Ok(Some(Refusal::Defer(TOR_UNKNOWN.into())));
                     }
                     TorUnknown::Defer => {
                         return Ok(Some(Refusal::Never(format!(
@@ -542,39 +586,49 @@ impl Source {
         // own jobs pay from its own scan budget.
         let me = node.id();
         let sell = node.price_table().price_of(crate::credits::price::SCAN);
-        let book = crate::credits::book(node).await?;
-        let own_left = match sell {
-            Some(_) => crate::credits::jobs::budget(
-                &book.ledger,
-                &me,
-                node.scan_share(),
-                crate::credits::jobs::self_committed(&node.store.pool, &me).await?,
-            ),
-            None => 0,
+        // Without a book (or the self tally) no arbiter counts as able to
+        // pay; claiming goes on in urgency order.
+        let book = match crate::credits::book(node).await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                debug!(?e, "no book: no arbiter counts as paying");
+                None
+            }
+        };
+        let own_left = match (sell, &book) {
+            (Some(_), Some(book)) => {
+                match crate::credits::jobs::self_committed(&node.store.pool, &me).await {
+                    Ok(self_mc) => {
+                        crate::credits::jobs::budget(&book.ledger, &me, node.scan_share(), self_mc)
+                    }
+                    Err(e) => {
+                        debug!(?e, "own scan reservations not read");
+                        0
+                    }
+                }
+            }
+            _ => 0,
         };
         let demoted: HashSet<NodeId> = {
             let mut d = self.demoted.lock().unwrap();
             d.retain(|_, until| *until > Instant::now());
             d.keys().copied().collect()
         };
+        let members = node.members();
         let can_pay = |a: &NodeId| -> bool {
-            let Some(price) = sell.map(|p| p as u64) else {
-                return false;
-            };
-            if *a == me {
-                return own_left >= price;
-            }
-            if demoted.contains(a)
-                || !node
-                    .members()
+            let payer = Payer {
+                own: *a == me,
+                demoted: demoted.contains(a),
+                sells_scans: members
                     .get(a)
-                    .is_some_and(|m| crate::credits::pay::sells_scans(m.proto_max))
-            {
-                return false;
-            }
-            node.status.known(a).is_some_and(|k| {
-                k.hb.scan_queued > 0 && (k.hb.scan_budget_mc as u64).min(book.balance(a)) >= price
-            })
+                    .is_some_and(|m| crate::credits::pay::sells_scans(m.proto_max)),
+                announced: node
+                    .status
+                    .known(a)
+                    .map(|k| (k.hb.scan_queued, k.hb.scan_budget_mc)),
+                balance: book.as_ref().map(|b| b.balance(a)),
+            };
+            can_pay(sell, own_left, &payer)
         };
         let asked_as_paying: HashSet<NodeId> =
             arbiters.iter().filter(|a| can_pay(a)).copied().collect();
@@ -617,7 +671,11 @@ impl Source {
                 }
             };
             let Some(g) = grant else { continue };
-            if arbiter != me && g.offer_seq.is_none() && asked_as_paying.contains(&arbiter) {
+            if demotes(
+                arbiter == me,
+                g.offer_seq.is_some(),
+                asked_as_paying.contains(&arbiter),
+            ) {
                 // Announced it could pay, then granted unpaid (or offered
                 // under our least): asked with the others for an hour.
                 self.demoted
@@ -712,7 +770,7 @@ impl Source {
         .fetch_optional(pool)
         .await?;
         let Some((ip_text, job_level, job_arbiter, queued_at)) = row else {
-            return Ok(Err(("later", Some("job not replicated here yet".into()))));
+            return Ok(Err(("later", Some(NOT_REPLICATED.into()))));
         };
         if job_arbiter.as_deref() != Some(&arbiter.0[..]) {
             return Ok(Err((
@@ -2195,6 +2253,69 @@ license_key = "k"
         // Urgency order a, b, c, d; b and d can pay.
         let order = can_pay_first(vec![a, b, c, d], |n| *n == b || *n == d);
         assert_eq!(order, vec![b, d, a, c]);
+    }
+
+    #[test]
+    fn an_arbiter_can_pay_from_its_budget_and_balance_or_its_own_budget() {
+        let other = Payer {
+            own: false,
+            demoted: false,
+            sells_scans: true,
+            announced: Some((3, 500)),
+            balance: Some(800),
+        };
+        assert!(can_pay(Some(500), 0, &other));
+        assert!(!can_pay(Some(501), 0, &other), "over its budget");
+        assert!(!can_pay(None, 0, &other), "this node does not sell");
+        // The budget it announces counts only up to its balance here.
+        let poor = Payer {
+            balance: Some(100),
+            ..other
+        };
+        assert!(!can_pay(Some(200), 0, &poor));
+        let cases = [
+            Payer {
+                announced: Some((0, 500)),
+                ..other
+            }, // nothing queued
+            Payer {
+                demoted: true,
+                ..other
+            },
+            Payer {
+                sells_scans: false,
+                ..other
+            },
+            Payer {
+                announced: None,
+                ..other
+            }, // no heartbeat yet
+            Payer {
+                balance: None,
+                ..other
+            }, // no book
+        ];
+        for p in &cases {
+            assert!(!can_pay(Some(100), 0, p));
+        }
+        // This node's own jobs: its own scan budget left, nothing else.
+        let own = Payer {
+            own: true,
+            demoted: false,
+            sells_scans: false,
+            announced: None,
+            balance: None,
+        };
+        assert!(can_pay(Some(300), 300, &own));
+        assert!(!can_pay(Some(300), 299, &own));
+    }
+
+    #[test]
+    fn an_arbiter_asked_as_paying_that_grants_unpaid_is_demoted() {
+        assert!(demotes(false, false, true));
+        assert!(!demotes(false, true, true), "funded");
+        assert!(!demotes(false, false, false), "not asked as paying");
+        assert!(!demotes(true, false, true), "this node's own jobs");
     }
 
     #[test]

@@ -433,6 +433,14 @@ impl Store {
         Ok(())
     }
 
+    pub async fn intel_delete(&self, key: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM intel_meta WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// What `ip` did in the last hour, counting the request to `path` that
     /// is being classified (it is stored with its verdict, so afterwards).
     /// The IP need not have a row yet. Every row dated in the last hour

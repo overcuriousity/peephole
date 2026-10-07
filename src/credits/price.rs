@@ -28,10 +28,17 @@ pub const PAID_TARGET: f64 = 0.9;
 /// scanner's price; a scanner takes no less than its price divided by it.
 pub const PRICE_TOLERANCE: f64 = 1.25;
 
-/// One scanner's next price: its paid scans of the past hour against
-/// [`PAID_TARGET`] of what it can do in an hour.
-pub fn scanner_step(cur: Mc, paid: f64, can_do_per_hour: f64) -> Mc {
-    step(cur, paid, PAID_TARGET * can_do_per_hour)
+/// One scanner's next price: its paid scans of the past hour, at most
+/// what it can do in an hour, against [`PAID_TARGET`] of that. `hours`
+/// since its last step scale the step like [`flow_step`], so a restart
+/// does not take an extra one.
+pub fn scanner_step(cur: Mc, paid: f64, can_do_per_hour: f64, hours: f64) -> Mc {
+    flow_step(
+        cur,
+        paid.min(can_do_per_hour),
+        PAID_TARGET * can_do_per_hour,
+        hours,
+    )
 }
 
 /// What an arbiter offers a scanner: what it announces, at most
@@ -411,16 +418,19 @@ pub fn charged_jobs(l: &super::ledger::Ledger) -> HashSet<(NodeId, String)> {
 
 /// Each scanner's paid scans that finished in the past hour, by the
 /// scan's own `finished_at` (holding receipts back moves nothing): jobs a
-/// receipt of it charged, and jobs it queued itself.
+/// receipt of it charged, and jobs it queued itself. Only the job's own
+/// scanner counts, each job once, and a scan dated in the future not at
+/// all. (`scanner_step` caps the count at what the scanner can do.)
 pub async fn paid_scans(
     pool: &sqlx::SqlitePool,
     charged: &HashSet<(NodeId, String)>,
 ) -> Result<HashMap<NodeId, u32>> {
     let rows: Vec<(Vec<u8>, String, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT s.origin, s.job_uid, j.origin FROM scans s
-         JOIN scan_jobs j ON j.uid = s.job_uid
+        "SELECT DISTINCT s.origin, s.job_uid, j.origin FROM scans s
+         JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
          WHERE s.audit_of IS NULL AND s.origin IS NOT NULL AND s.job_uid IS NOT NULL
-           AND s.finished_at > datetime('now', '-1 hour')",
+           AND s.finished_at > datetime('now', '-1 hour')
+           AND s.finished_at <= datetime('now')",
     )
     .fetch_all(pool)
     .await?;
@@ -437,34 +447,53 @@ pub async fn paid_scans(
     Ok(out)
 }
 
-/// Kept across restarts: this node's copy of `scanner`'s price.
+/// Kept across restarts: this node's copy of `scanner`'s price, as
+/// `mc@ms` with the time of its last step.
 fn scanner_key(scanner: &NodeId) -> String {
     format!("price:scan:{scanner}")
 }
 
-/// Where a scanner's next step starts: the last copy here, the kept
-/// copy, on upgrade the cluster-wide scan price of the market before
-/// scanner prices, the lower median of what scanners announce, the floor.
+/// A kept copy: its price and, unless it predates them, when it was stepped.
+fn parse_kept(v: &str) -> Option<(Mc, Option<u64>)> {
+    match v.split_once('@') {
+        Some((mc, ms)) => Some((mc.parse().ok()?, ms.parse().ok())),
+        None => Some((v.parse().ok()?, None)),
+    }
+}
+
+/// Hours from `since_ms` to `now_ms` (a full step without a time).
+fn hours_since(since_ms: Option<u64>, now_ms: u64) -> f64 {
+    since_ms.map_or(1.0, |t| now_ms.saturating_sub(t) as f64 / 3_600_000.0)
+}
+
+/// Where a scanner's next step starts, and the hours since its last step:
+/// the last copy here, the kept copy, `legacy` (on upgrade, the
+/// cluster-wide scan price of the market before scanner prices; only for
+/// the scanners counted at the first refresh after it), the lower median
+/// of what scanners announce, the floor.
 async fn scanner_current(
     node: &Node,
     old: &Table,
     scanner: &NodeId,
+    legacy: Option<Mc>,
     announced: &[u32],
-) -> Result<Mc> {
+    now_ms: u64,
+) -> Result<(Mc, f64)> {
     if let Some(p) = old.reference(scanner).filter(|p| *p > 0) {
-        return Ok(p as Mc);
+        return Ok((p as Mc, hours_since(Some(old.at_ms), now_ms)));
     }
-    for key in [scanner_key(scanner), price_key(SCAN)] {
-        if let Some(p) = node
-            .store
-            .intel_get(&key)
-            .await?
-            .and_then(|v| v.parse::<Mc>().ok())
-        {
-            return Ok(p.max(PRICE_FLOOR));
-        }
+    if let Some((p, at)) = node
+        .store
+        .intel_get(&scanner_key(scanner))
+        .await?
+        .and_then(|v| parse_kept(&v))
+    {
+        return Ok((p.max(PRICE_FLOOR), hours_since(at, now_ms)));
     }
-    Ok(start(announced))
+    Ok((
+        legacy.unwrap_or_else(|| start(announced)).max(PRICE_FLOOR),
+        1.0,
+    ))
 }
 
 fn as_mc(p: Mc) -> u32 {
@@ -504,7 +533,12 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         for (p, mc) in &k.hb.prices {
             announced.entry(p.clone()).or_default().push(*mc);
         }
-        if let Some(mc) = k.hb.scan_price_mc {
+        // A protocol-4 node's scan price is the old cluster-wide one.
+        if let Some(mc) = k.hb.scan_price_mc.filter(|_| {
+            members
+                .get(&id)
+                .is_some_and(|m| super::pay::sells_scans(m.proto_max))
+        }) {
             announced.entry(SCAN.into()).or_default().push(mc);
         }
         if let Some(mc) = k.hb.probe_price_mc {
@@ -553,13 +587,23 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     // Every scanner's price, from its paid scans of the past hour against
     // what it can do: the same public inputs on every node.
     let paid = paid_scans(&node.store.pool, &charged_jobs(&book.ledger)).await?;
+    // The cluster-wide scan price of the market before scanner prices
+    // seeds the scanners counted now, once: later ones start from what
+    // scanners announce, like on every node that never had it.
+    let legacy_key = price_key(SCAN);
+    let legacy = node
+        .store
+        .intel_get(&legacy_key)
+        .await?
+        .and_then(|v| v.parse::<Mc>().ok());
+    let now_ms = crate::cluster::hlc::wall_ms();
     let mut scanner_prices = vec![];
     for s in &capacity.scanners {
-        let cur = scanner_current(node, &old, &s.node, &ann(SCAN)).await?;
-        let got = paid.get(&s.node).copied().unwrap_or(0) as f64;
-        let price_mc = as_mc(scanner_step(cur, got, s.can_do));
+        let (cur, hours) = scanner_current(node, &old, &s.node, legacy, &ann(SCAN), now_ms).await?;
+        let got = (paid.get(&s.node).copied().unwrap_or(0) as f64).min(s.can_do);
+        let price_mc = as_mc(scanner_step(cur, got, s.can_do, hours));
         node.store
-            .intel_set(&scanner_key(&s.node), &price_mc.to_string())
+            .intel_set(&scanner_key(&s.node), &format!("{price_mc}@{now_ms}"))
             .await?;
         scanner_prices.push(ScannerPrice {
             node: s.node,
@@ -567,6 +611,9 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
             paid: got,
             supply: PAID_TARGET * s.can_do,
         });
+    }
+    if legacy.is_some() {
+        node.store.intel_delete(&legacy_key).await?;
     }
     let sell_mc = scanner_prices
         .iter()
@@ -840,18 +887,128 @@ mod tests {
     #[test]
     fn a_scanner_price_follows_its_paid_load() {
         // 10 scans an hour possible: the target is 9 paid.
-        let busy = scanner_step(1000, 10.0, 10.0);
+        let busy = scanner_step(1000, 10.0, 10.0, 1.0);
         assert!(busy > 1000, "full of paid work: up ({busy})");
-        let idle = scanner_step(1000, 0.0, 10.0);
+        let idle = scanner_step(1000, 0.0, 10.0, 1.0);
         assert!(idle < 1000, "no paid work: down ({idle})");
         assert_eq!(
-            scanner_step(PRICE_FLOOR, 0.0, 10.0),
+            scanner_step(PRICE_FLOOR, 0.0, 10.0, 1.0),
             PRICE_FLOOR,
             "never under the floor"
         );
         // At the target it holds within a step's rounding.
-        let held = scanner_step(1000, 9.0, 10.0);
+        let held = scanner_step(1000, 9.0, 10.0, 1.0);
         assert!((999..=1001).contains(&held), "{held}");
+        // Paid work never counts past what the scanner can do: scan records
+        // it writes itself raise its price by at most the full-load step.
+        assert_eq!(
+            scanner_step(1000, 1e6, 10.0, 1.0),
+            scanner_step(1000, 10.0, 10.0, 1.0)
+        );
+        // Part of an hour since the last step takes that share of a step;
+        // more than an hour, one full step.
+        let quarter = scanner_step(1000, 0.0, 10.0, 0.25);
+        assert!(idle < quarter && quarter < 1000, "{quarter}");
+        assert_eq!(scanner_step(1000, 0.0, 10.0, 3.0), idle);
+    }
+
+    #[test]
+    fn a_kept_copy_carries_the_time_of_its_last_step() {
+        assert_eq!(parse_kept("120@5000"), Some((120, Some(5000))));
+        assert_eq!(parse_kept("120"), Some((120, None)));
+        assert_eq!(parse_kept("x@5000"), None);
+        assert_eq!(hours_since(Some(0), 1_800_000), 0.5);
+        assert_eq!(hours_since(None, 1_800_000), 1.0, "no time: a full step");
+        assert_eq!(hours_since(Some(9), 5), 0.0, "never negative");
+    }
+
+    async fn test_node() -> (tempfile::TempDir, Arc<Node>) {
+        use crate::cluster::identity::Identity;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let node = Node::open(crate::cluster::NodeParams {
+            identity: Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store,
+            proto: (1, 1),
+            data_dir: dir.path().to_path_buf(),
+            retention_days: 30,
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        (dir, node)
+    }
+
+    #[tokio::test]
+    async fn a_scanner_copy_starts_from_the_kept_one_the_legacy_price_or_the_median() {
+        let (_dir, node) = test_node().await;
+        let (kept, legacy, new) = (id(1), id(2), id(3));
+        let old = Table::default();
+        let now = 10 * 3_600_000;
+        node.store
+            .intel_set(&scanner_key(&kept), &format!("70@{}", now - 900_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            scanner_current(&node, &old, &kept, Some(500), &[40], now)
+                .await
+                .unwrap(),
+            (70, 0.25),
+            "the kept copy and its time win"
+        );
+        assert_eq!(
+            scanner_current(&node, &old, &legacy, Some(500), &[40], now)
+                .await
+                .unwrap(),
+            (500, 1.0),
+            "on upgrade: the legacy price"
+        );
+        assert_eq!(
+            scanner_current(&node, &old, &new, None, &[40, 90, 10], now)
+                .await
+                .unwrap(),
+            (40, 1.0),
+            "later: the lower median announced"
+        );
+        let old = Table {
+            at_ms: now - 3_600_000,
+            scanners: vec![ScannerPrice {
+                node: kept,
+                price_mc: 66,
+                paid: 0.0,
+                supply: 0.0,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            scanner_current(&node, &old, &kept, None, &[], now)
+                .await
+                .unwrap(),
+            (66, 1.0),
+            "the last copy here, an hour ago"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_legacy_scan_price_is_used_at_one_refresh_only() {
+        let (_dir, node) = test_node().await;
+        node.store.intel_set(&price_key(SCAN), "500").await.unwrap();
+        refresh(&node).await.unwrap();
+        assert_eq!(node.store.intel_get(&price_key(SCAN)).await.unwrap(), None);
     }
 
     #[test]
@@ -860,7 +1017,7 @@ mod tests {
         let mut p: Mc = 1;
         for _ in 0..200 {
             let paid = (900.0 / p as f64).min(10.0);
-            p = scanner_step(p, paid, 10.0);
+            p = scanner_step(p, paid, 10.0, 1.0);
         }
         let paid = (900.0 / p as f64).min(10.0);
         assert!(
@@ -906,12 +1063,14 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        // (job uid, queued by, finished minutes ago)
-        for (n, (uid, origin, ago)) in [
-            ("paid", a, 10),   // charged offer: counts
-            ("unpaid", a, 10), // no offer: does not count
-            ("own", s, 20),    // the scanner's own job: counts
-            ("old", a, 90),    // charged, but finished over an hour ago
+        // (job uid, queued by, its scanner, finished minutes ago)
+        for (n, (uid, origin, by, ago)) in [
+            ("paid", a, s, 10),     // charged offer: counts
+            ("unpaid", a, s, 10),   // no offer: does not count
+            ("own", s, s, 20),      // the scanner's own job: counts
+            ("old", a, s, 90),      // charged, but finished over an hour ago
+            ("other", s, a, 10),    // queued by s, but another node's grant
+            ("future", s, s, -600), // dated ahead: never counts
         ]
         .into_iter()
         .enumerate()
@@ -920,16 +1079,25 @@ mod tests {
                 "INSERT INTO scan_jobs (id, ip_id, level, status, queued_at, uid, origin, arbiter, scanner)
                  VALUES (?, 1, 1, 'done', datetime('now','-2 hours'), ?, ?, ?, ?)",
             )
-            .bind(n as i64 + 1).bind(uid).bind(&origin.0[..]).bind(&origin.0[..]).bind(&s.0[..])
+            .bind(n as i64 + 1).bind(uid).bind(&origin.0[..]).bind(&origin.0[..]).bind(&by.0[..])
             .execute(pool).await.unwrap();
             sqlx::query(
                 "INSERT INTO scans (job_id, ip_id, level, started_at, finished_at, uid, origin, job_uid)
                  VALUES (?, 1, 1, datetime('now', ?), datetime('now', ?), ?, ?, ?)",
             )
             .bind(n as i64 + 1)
-            .bind(format!("-{} minutes", ago + 5))
-            .bind(format!("-{ago} minutes"))
+            .bind(format!("{} minutes", -(ago + 5)))
+            .bind(format!("{} minutes", -ago))
             .bind(format!("scan-{uid}")).bind(&s.0[..]).bind(uid)
+            .execute(pool).await.unwrap();
+        }
+        // More scan records of one job count once.
+        for k in 0..3 {
+            sqlx::query(
+                "INSERT INTO scans (job_id, ip_id, level, started_at, finished_at, uid, origin, job_uid)
+                 VALUES (3, 1, 1, datetime('now','-9 minutes'), datetime('now','-8 minutes'), ?, ?, 'own')",
+            )
+            .bind(format!("again-{k}")).bind(&s.0[..])
             .execute(pool).await.unwrap();
         }
         let charged: HashSet<(NodeId, String)> = [(s, "paid".to_string()), (s, "old".to_string())]
@@ -937,6 +1105,7 @@ mod tests {
             .collect();
         let got = paid_scans(pool, &charged).await.unwrap();
         assert_eq!(got.get(&s), Some(&2), "{got:?}");
+        assert_eq!(got.get(&a), None, "{got:?}");
     }
 
     #[test]

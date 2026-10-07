@@ -25,7 +25,7 @@
   {% endif %}
 </section>
 <section class="card"><div class="card-head"><h2>What things cost here</h2></div>
-  <p class="muted">Each price follows demand and supply: it rises when more is asked than this node offers, and falls when less is asked. What this node answers itself is free.</p>
+  <p class="muted">Each price follows demand and supply: it rises when more is asked than this node offers, and falls when less is asked. What this node answers itself is free, though its own scan jobs use up its scan budget.</p>
   <ul>
     <li>This node sells a funded scan job for <b>{{ price.scan }}</b> credits; each scanner prices itself by how busy it is with paid work ({{ price.capacity_per_hour }} scans an hour possible here, {{ price.utilization }} % used).</li>
     {% if let Some(p) = price.probe %}<li>A probe for another member costs <b>{{ p }}</b> credits here.</li>{% endif %}

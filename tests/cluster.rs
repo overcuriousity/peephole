@@ -4957,6 +4957,17 @@ async fn a_funded_scan_job_pays_the_scanner_its_price() {
         assert_eq!(book.balance(&b.id), cost);
         assert_eq!(book.ledger.held(&a.id), 0);
     }
+    // Both nodes count the paid scan for b's price, by when the scan
+    // finished: a receipt held back past the hour moves nothing.
+    for n in [&na, &nb] {
+        let paid = |t: &price::Table| t.scanners.iter().find(|s| s.node == b.id).map(|s| s.paid);
+        assert_eq!(paid(&price::refresh(&n.node).await.unwrap()), Some(1.0));
+        sqlx::query("UPDATE scans SET finished_at = datetime('now', '-2 hours')")
+            .execute(&n.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(paid(&price::refresh(&n.node).await.unwrap()), Some(0.0));
+    }
 }
 
 /// A scanner that announces more than the rule gives is paid the
@@ -5052,6 +5063,25 @@ async fn the_cheaper_scanner_gets_the_job() {
     })
     .await;
     assert_eq!(scans_by(&na, c.id).await, 1, "the cheaper scanner ran it");
+    // c's price rises past b's: the next job goes to b.
+    let key = format!("price:scan:{}", c.id);
+    for n in [&nb, &nc, &na] {
+        n.store.intel_set(&key, "5000").await.unwrap();
+        n.node.set_price_table(Default::default());
+        price::refresh(&n.node).await.unwrap();
+    }
+    eventually("a hears c's new price", || async {
+        let c_mc = na.node.status.known(&c.id).and_then(|k| k.hb.scan_price_mc);
+        let b_mc = na.node.status.known(&b.id).and_then(|k| k.hb.scan_price_mc);
+        c_mc.zip(b_mc).is_some_and(|(c, b)| c > b)
+    })
+    .await;
+    enqueue(&na, "198.51.100.43", 1).await;
+    eventually_for(Duration::from_secs(40), "scanned again", || async {
+        count(&na, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 2
+    })
+    .await;
+    assert_eq!(scans_by(&na, b.id).await, 1, "now b is the cheaper one");
 }
 
 /// The asker pays a resolver the price it announces for a name it
@@ -5869,7 +5899,8 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
     assert!(html.contains(&credits::show(cost)));
     // What things cost here.
     assert!(
-        html.contains("What things cost here") && html.contains("A funded scan job costs"),
+        html.contains("What things cost here")
+            && html.contains("This node sells a funded scan job for"),
         "{html}"
     );
     assert!(html.contains("Resolving a name costs"));
@@ -5882,8 +5913,9 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
             .fetch_all(&na.store.pool)
             .await
             .unwrap();
+    // a does not scan: a scan row without a price of its own.
     assert!(
-        rows.iter().any(|(g, own, _)| g == "scan" && own.is_some()),
+        rows.iter().any(|(g, own, _)| g == "scan" && own.is_none()),
         "{rows:?}"
     );
     assert!(
@@ -6052,7 +6084,7 @@ async fn the_overview_shows_the_clusters_credit_figures() {
     assert!(html.contains("200"), "paid lookups a day");
     assert!(
         html.contains(&t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64))),
-        "what a funded scan job costs"
+        "this node's scan selling price"
     );
     assert!(html.contains("Forks") && html.contains("Audits"));
     assert!(html.contains("0 idle"), "no scanner: nothing idle: {html}");

@@ -168,9 +168,12 @@ earn most of the new money, every member a little.
   probe or resolution price counted over a shorter period takes that
   share of a step), a price moves at least 0.001 credits toward the
   imbalance, and it never goes under 0.001 credits. What a node answers
-  itself is free (its own providers, prober, resolver, scanner). Scan
+  itself is free (its own providers, prober, resolver, scanner), though
+  its own scan jobs use up its scan budget like jobs it buys. Scan
   prices are per scanner: each scanner's price follows its paid scans of
-  the past hour against 90 % of its capacity. Every node computes every
+  the past hour (each job once, by the scanner that ran it, at most its
+  capacity) against 90 % of its capacity, by a step scaled to the time
+  since its last one. Every node computes every
   scanner's price from the log and the heartbeats, and pays at most 1.25
   times its own figure. What
   another node answers is paid, whoever owns it, the Tor exit list,
@@ -221,9 +224,10 @@ earn most of the new money, every member a little.
   again, free. An answer that was paid for is kept in the dataset when the
   cluster has recorded the address (members can then infer who looked it
   up); for an address nobody recorded nothing is written anywhere.
-- **Your nodes as one.** Every node keeps what it earns. A lookup that
-  needs more than a node holds draws from its siblings, richest first.
-  Scans are funded from the node's own balance only.
+- **Your nodes as one.** Every node keeps what it earns. A paid lookup,
+  probe or name resolution that needs more than a node holds draws from
+  its siblings, richest first. Scans are funded from the node's own
+  balance only.
 - **Two histories.** A node that gives two members different entries at
   one position of its log is found out with its next payment: its entries
   carry seals over its log. Members that hold the proof show "showed two
@@ -280,7 +284,10 @@ earn most of the new money, every member a little.
     guess at who asked.
 - **Upgrading.** Protocol 4: payments run only between upgraded nodes, so
   upgrade all nodes together. Protocol 5: scan jobs are paid only between
-  nodes on protocol 5; upgrade all nodes together. Balances are recounted at start under the
+  nodes on protocol 5; upgrade all nodes together. The cluster-wide scan
+  price of protocol 4 seeds the scanners known at the first refresh after
+  the upgrade; scanners that join later start at the median price
+  scanners announce. Balances are recounted at start under the
   new rules.
 
 ## Things to know

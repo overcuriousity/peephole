@@ -11,8 +11,9 @@ use anyhow::Result;
 use std::sync::Arc;
 
 /// What `me` may still hold in or pay for its scan jobs today: `share` of
-/// its balance plus what its scan offers and own jobs (`self_mc`) hold
-/// and were charged today, minus those.
+/// its balance plus what its scan offers hold and were charged today,
+/// minus those and what its own jobs (`self_mc`) hold. Paying oneself
+/// leaves the balance as it is, so `self_mc` is not added back.
 pub fn budget(l: &Ledger, me: &NodeId, share: f64, self_mc: Mc) -> Mc {
     let (mut held, mut charged) = (0, 0);
     for o in l
@@ -26,24 +27,37 @@ pub fn budget(l: &Ledger, me: &NodeId, share: f64, self_mc: Mc) -> Mc {
             _ => {}
         }
     }
-    let committed = held + charged + self_mc;
-    let cap = ((l.balance(me) + committed) as f64 * share.clamp(0.0, 1.0)).floor() as Mc;
-    cap.saturating_sub(committed)
+    let offered = held + charged;
+    let cap = ((l.balance(me) + offered) as f64 * share.clamp(0.0, 1.0)).floor() as Mc;
+    cap.saturating_sub(offered + self_mc)
 }
 
 /// What this node's own jobs granted to its own scanner hold (running) or
 /// were charged today (done): they count against the budget like offers.
-/// A job requeued, failed or refused no longer counts.
+/// A job requeued, failed or refused no longer counts, and a regrant
+/// clears the old reservation (see [`hold_self`]).
 pub async fn self_committed(pool: &sqlx::SqlitePool, me: &NodeId) -> Result<Mc> {
     let n: Option<i64> = sqlx::query_scalar(
         "SELECT SUM(self_mc) FROM scan_jobs
-         WHERE arbiter = ? AND self_mc > 0
+         WHERE arbiter = ? AND scanner = arbiter AND self_mc > 0
            AND (status = 'running' OR (status = 'done' AND finished_at >= date('now')))",
     )
     .bind(&me.0[..])
     .fetch_one(pool)
     .await?;
     Ok(n.unwrap_or(0).max(0) as Mc)
+}
+
+/// What the grant of `job_uid` holds as an own job: `mc`, or nothing
+/// (0). Every grant writes it, so a reservation of an earlier grant of a
+/// requeued job never counts again.
+pub async fn hold_self(pool: &sqlx::SqlitePool, job_uid: &str, mc: u32) -> Result<()> {
+    sqlx::query("UPDATE scan_jobs SET self_mc = NULLIF(?, 0) WHERE uid = ?")
+        .bind(mc as i64)
+        .bind(job_uid)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// What this node, as arbiter, would pay `scanner` for a job now: its own
@@ -101,6 +115,12 @@ pub async fn fund(
     price: u32,
 ) -> Option<(Option<u64>, u32)> {
     let me = node.id();
+    // Whatever an earlier grant of this job reserved is gone; a funded
+    // own grant below writes its own.
+    if let Err(e) = hold_self(&node.store.pool, job_uid, 0).await {
+        tracing::warn!(?e, job = %job_uid, "old own-job reservation not cleared");
+        return None;
+    }
     if price == 0 || price < min_mc {
         return None;
     }
@@ -129,12 +149,7 @@ pub async fn fund(
     if scanner == me {
         // Paying oneself moves nothing: the job holds the price against
         // the budget instead of an offer.
-        sqlx::query("UPDATE scan_jobs SET self_mc = ? WHERE uid = ?")
-            .bind(price as i64)
-            .bind(job_uid)
-            .execute(&node.store.pool)
-            .await
-            .ok()?;
+        hold_self(&node.store.pool, job_uid, price).await.ok()?;
         funding.committed += price as Mc;
         return Some((None, price));
     }
@@ -291,11 +306,14 @@ mod tests {
 
     #[test]
     fn the_budget_counts_own_jobs() {
-        // A balance of 1000 at share 0.5: 500. Own jobs holding 200 count
-        // like offers: (1000 + 200) x 0.5 - 200 = 400 left.
+        // A balance of 1000 at share 0.5: 500. Own jobs holding 200 leave
+        // the balance as it is: 1000 x 0.5 - 200 = 300 left, as after
+        // paying 200 to another scanner ((800 + 200) x 0.5 - 200).
         let l = ledger_with_balance(id(1), 1000);
         assert_eq!(budget(&l, &id(1), 0.5, 0), 500);
-        assert_eq!(budget(&l, &id(1), 0.5, 200), 400);
+        assert_eq!(budget(&l, &id(1), 0.5, 200), 300);
+        // At share 1 own jobs use up the balance too.
+        assert_eq!(budget(&l, &id(1), 1.0, 1000), 0);
     }
 
     #[tokio::test]
@@ -312,28 +330,40 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        for (n, status, finished, mc) in [
-            (1, "running", None, 30),
-            (2, "done", Some("datetime('now')"), 20),
-            (3, "done", Some("datetime('now','-2 days')"), 50),
-            (4, "queued", None, 70), // requeued after its reservation: no longer counts
-            (5, "failed", Some("datetime('now')"), 90),
+        let other = id(2);
+        for (n, status, finished, scanner, mc) in [
+            (1, "running", None, me, 30),
+            (2, "done", Some("datetime('now')"), me, 20),
+            (3, "done", Some("datetime('now','-2 days')"), me, 50),
+            (4, "queued", None, me, 70), // requeued after its reservation: no longer counts
+            (5, "failed", Some("datetime('now')"), me, 90),
+            (6, "running", None, other, 40), // a stale reservation, regranted elsewhere
         ] {
             sqlx::query(sqlx::AssertSqlSafe(format!(
-                "INSERT INTO scan_jobs (id, ip_id, level, status, queued_at, finished_at, uid, arbiter, self_mc)
-                 VALUES (?, 1, 1, ?, datetime('now'), {}, ?, ?, ?)",
+                "INSERT INTO scan_jobs (id, ip_id, level, status, queued_at, finished_at, uid, arbiter, scanner, self_mc)
+                 VALUES (?, 1, 1, ?, datetime('now'), {}, ?, ?, ?, ?)",
                 finished.unwrap_or("NULL")
             )))
             .bind(n)
             .bind(status)
             .bind(format!("j{n}"))
             .bind(&me.0[..])
+            .bind(&scanner.0[..])
             .bind(mc)
             .execute(pool)
             .await
             .unwrap();
         }
         assert_eq!(self_committed(pool, &me).await.unwrap(), 50);
+        // The requeued job runs here again: its grant writes what it holds.
+        sqlx::query("UPDATE scan_jobs SET status = 'running' WHERE uid = 'j4'")
+            .execute(pool)
+            .await
+            .unwrap();
+        hold_self(pool, "j4", 0).await.unwrap();
+        assert_eq!(self_committed(pool, &me).await.unwrap(), 50, "unpaid");
+        hold_self(pool, "j4", 25).await.unwrap();
+        assert_eq!(self_committed(pool, &me).await.unwrap(), 75, "funded anew");
     }
 
     fn ledger_with_balance(node: NodeId, mc: Mc) -> Ledger {
