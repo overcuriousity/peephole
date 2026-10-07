@@ -364,7 +364,7 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let me = node.id();
     let members = node.members();
     let mut announced: HashMap<String, Vec<u32>> = HashMap::new();
-    let mut bids: u64 = node.scan_bids.load(std::sync::atomic::Ordering::Relaxed) as u64;
+    let bids: u64 = 0;
     for id in node.live_members(intel::LIVE_WINDOW) {
         if id == me
             || left_out.contains(&id)
@@ -387,7 +387,6 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         if let Some(mc) = k.hb.probe_price_mc {
             announced.entry(PROBE.into()).or_default().push(mc);
         }
-        bids += k.hb.scan_bids as u64;
     }
     let none = vec![];
     let ann = |g: &str| announced.get(g).unwrap_or(&none).clone();
