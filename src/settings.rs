@@ -299,7 +299,22 @@ impl Settings {
         if all.max_workers == Some(1) {
             all.max_workers = Some(pace::MIN_WORKERS as u32);
         }
-        // Overrides are trusted like the TOML: no prerequisite check here.
+        // An override cannot switch on a role the config file no longer
+        // has the sections for (its listener or `[webauthn]` removed since):
+        // starting it would fail or panic. Only that override is dropped.
+        // The rest are trusted like the TOML (nmap is checked by the scanner).
+        for (want, on, missing) in [
+            (&mut all.listener, s.roles.listener, &self.prereqs.listener),
+            (&mut all.web, s.roles.web, &self.prereqs.web),
+        ] {
+            if *want == Some(true) && !on && missing.is_some() {
+                tracing::warn!(
+                    why = missing.as_deref().unwrap_or_default(),
+                    "a stored role override is ignored"
+                );
+                *want = None;
+            }
+        }
         Ok(validate(s, &all, &Prereqs::default()).unwrap_or(s))
     }
 
@@ -618,6 +633,28 @@ mod tests {
         assert_eq!(snap.pace.max_workers, 2);
         assert_eq!(snap.pace.max_scans_per_hour, 11);
         assert!(!snap.roles.scanner);
+    }
+
+    /// A stored `roles.web = true` does not switch on a web role whose
+    /// `[webauthn]` was removed from the config since.
+    #[tokio::test]
+    async fn a_stored_role_override_needs_the_config_sections() {
+        let (s, store, _d) = open("").await;
+        for (k, v) in [(KEY_ROLE_WEB, "true"), (pace::KEY_PER_HOUR, "11")] {
+            sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
+                .bind(k)
+                .bind(v)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        drop(s);
+        let c = cfg("[roles]\nweb = false\n");
+        let loaded = Settings::load(&store, &c, Prereqs::from_config(&c, true))
+            .await
+            .unwrap();
+        assert!(!loaded.snapshot().roles.web);
+        assert_eq!(loaded.snapshot().pace.max_scans_per_hour, 11);
     }
 
     #[tokio::test]
