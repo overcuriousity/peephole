@@ -25,6 +25,10 @@ pub struct Config {
     /// Obsolete and ignored: the signature rules are built into the binary.
     /// Still accepted so older configs load; see [`Config::obsolete_notes`].
     pub rules_dir: Option<PathBuf>,
+    /// Obsolete and ignored: GreyNoise was dropped as a provider. Read only
+    /// to say so (see [`Config::obsolete_notes`]).
+    #[serde(default)]
+    pub greynoise: Option<toml::Table>,
     #[serde(default)]
     pub trusted_proxies: Vec<IpNet>,
     /// Required with the web role.
@@ -625,6 +629,13 @@ impl Config {
                  if nothing else uses it",
                 dir.display()
             ));
+        }
+        if self.greynoise.is_some() {
+            notes.push(
+                "note: `[greynoise]` is ignored: GreyNoise is no longer a provider; remove the \
+                 section (and its API key)"
+                    .into(),
+            );
         }
         if self.cluster.as_ref().is_some_and(|c| c.remote_config) {
             notes.push(
@@ -1251,6 +1262,18 @@ data_dir = "/tmp"
             notes[0].contains("rules_dir") && notes[0].contains("built into the binary"),
             "{notes:?}"
         );
+    }
+
+    /// A 0.7 config's `[greynoise]` loads and is reported as ignored.
+    #[test]
+    fn greynoise_section_is_reported_as_ignored() {
+        let cfg = parse(&format!(
+            "trap_listen = \"0.0.0.0:1\"\n{BASE}[roles]\nscanner = false\nweb = false\n[greynoise]\napi_key = \"k\"\n"
+        ))
+        .unwrap();
+        let notes = cfg.obsolete_notes();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("[greynoise]"), "{notes:?}");
     }
 
     /// Keep everything unless asked; a window shorter than a week would cut
