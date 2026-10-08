@@ -282,6 +282,8 @@ pub struct Node {
     price_table: RwLock<Arc<crate::credits::price::Table>>,
     /// Paid requests counted for this node's prices (`credits::price`).
     pub market: crate::credits::price::Demand,
+    /// The hourly per-level scanner weights (`scan::weight`).
+    pub weights: crate::scan::weight::Weights,
     /// This node's scan budget left and queued jobs, for the heartbeat
     /// (`credits::jobs::announce_budget`).
     pub scan_budget_mc: std::sync::atomic::AtomicU32,
@@ -354,6 +356,7 @@ impl Node {
             prober: Default::default(),
             price_table: Default::default(),
             market: Default::default(),
+            weights: Default::default(),
             scan_budget_mc: Default::default(),
             scan_queued: Default::default(),
             scan_share: Default::default(),

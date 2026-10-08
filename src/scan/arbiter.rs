@@ -377,12 +377,12 @@ impl Arbiter {
         if scanners.len() < 2 {
             return Ok(vec![]);
         }
-        let t = super::weight::tallies(&self.node.store.pool).await?;
+        let t = &self.node.weights.get(&self.node.store.pool).await?.tallies;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        Ok(super::weight::skipped_levels(&t, scanner, &scanners, now))
+        Ok(super::weight::skipped_levels(t, scanner, &scanners, now))
     }
 
     /// [`Self::next_job`] past the jobs `scanner` handed back, the jobs of
