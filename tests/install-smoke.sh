@@ -162,7 +162,7 @@ if grep -q '^ *http2 on' /etc/peephole/nginx.example.conf; then echo "http2 on n
 grep -q 'sites-enabled/default' /etc/peephole/nginx.example.conf
 # No proxy on this machine: the trap's TLS listener faces the remote proxy,
 # and nginx here keeps 443 for the admin site (no stream config).
-grep -q '^trap_tls_listen = "0.0.0.0:8081"' /etc/peephole/config.toml
+grep -Eq '^trap_tls_listen = "(0\.0\.0\.0|\[::\]):8081"' /etc/peephole/config.toml
 test ! -e /etc/peephole/nginx-stream.example.conf
 grep -q 'ssl_reject_handshake on' /etc/peephole/nginx.example.conf
 # Every node has a cluster section: named after the machine, the listener on the advertised port.
@@ -545,8 +545,8 @@ reset_install
 env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN \
     PEEPHOLE_FRONT=direct PEEPHOLE_ROLES=listener,scanner PEEPHOLE_OWN_ADDRESSES=198.51.100.7 \
     bash install.sh > /tmp/direct.log 2>&1 || { cat /tmp/direct.log; exit 1; }
-grep -q '^trap_listen = "0.0.0.0:80"' /etc/peephole/config.toml
-grep -q '^trap_tls_listen = "0.0.0.0:443"' /etc/peephole/config.toml
+grep -Eq '^trap_listen = "(0\.0\.0\.0|\[::\]):80"' /etc/peephole/config.toml
+grep -Eq '^trap_tls_listen = "(0\.0\.0\.0|\[::\]):443"' /etc/peephole/config.toml
 grep -q '^trusted_proxies = \[\]' /etc/peephole/config.toml
 if grep -q '10\.0\.0\.0/8' /etc/peephole/config.toml; then echo "direct config trusts 10.0.0.0/8"; exit 1; fi
 grep -q 'PEEPHOLE_TRUSTED_PROXIES is ignored' /tmp/direct.log
@@ -599,7 +599,7 @@ echo "== unattended without anything in front preset, nothing on 80/443: direct"
 reset_install
 env -u PEEPHOLE_TRUSTED_PROXIES PEEPHOLE_ROLES=listener \
     bash install.sh > /tmp/default-direct.log 2>&1 || { cat /tmp/default-direct.log; exit 1; }
-grep -q '^trap_listen = "0.0.0.0:80"' /etc/peephole/config.toml
+grep -Eq '^trap_listen = "(0\.0\.0\.0|\[::\]):80"' /etc/peephole/config.toml
 
 echo "== remote needs the proxy's address: no default"
 reset_install
@@ -611,8 +611,8 @@ grep -q 'missing required setting: PEEPHOLE_TRUSTED_PROXIES' /tmp/remote-none.lo
 test ! -e /etc/peephole/config.toml
 PEEPHOLE_FRONT=remote PEEPHOLE_ROLES=listener PEEPHOLE_TRUSTED_PROXIES=192.0.2.10,2001:db8::/64 \
     bash install.sh > /tmp/remote.log 2>&1 || { cat /tmp/remote.log; exit 1; }
-grep -q '^trap_listen = "0.0.0.0:8080"' /etc/peephole/config.toml
-grep -q '^trap_tls_listen = "0.0.0.0:8081"' /etc/peephole/config.toml
+grep -Eq '^trap_listen = "(0\.0\.0\.0|\[::\]):8080"' /etc/peephole/config.toml
+grep -Eq '^trap_tls_listen = "(0\.0\.0\.0|\[::\]):8081"' /etc/peephole/config.toml
 # A bare address is that one host.
 grep -q '^trusted_proxies = \["192.0.2.10/32","2001:db8::/64"\]' /etc/peephole/config.toml
 grep -q 'PROXY protocol v2' /tmp/remote.log

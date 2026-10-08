@@ -58,9 +58,9 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
 
 | Answer | Trap listens on | `trusted_proxies` | nginx |
 |---|---|---|---|
-| `direct`: nothing | `0.0.0.0:80`, `0.0.0.0:443` | `[]` | none |
+| `direct`: nothing | `[::]:80`, `[::]:443` (`0.0.0.0` without IPv6) | `[]` | none |
 | `local`: nginx on this machine | `127.0.0.1:8080`, `127.0.0.1:8081` | loopback | example, optional automatic setup |
-| `remote`: a proxy elsewhere | `0.0.0.0:8080`, `0.0.0.0:8081` | the proxy's addresses (asked, no default) | none for the trap |
+| `remote`: a proxy elsewhere | `[::]:8080`, `[::]:8081` (`0.0.0.0` without IPv6) | the proxy's addresses (asked, no default) | none for the trap |
 
 - **direct** takes the public ports itself (the unit allows
   `CAP_NET_BIND_SERVICE`); open 80 and 443 in any firewall in front of the

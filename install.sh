@@ -898,8 +898,11 @@ if [ "$upgrade" -ne 1 ]; then
     has_role listener || has_role scanner || has_role web || die "enable at least one of trap, scanner and web interface"
     # Without the question (preset roles, no terminal), the warning still.
     if [ -n "$CLOUD" ] && has_role scanner && [ -z "$ROLE_SCANNER" ]; then warn "$cloud_warning"; fi
-    TRAP_LISTEN="0.0.0.0:8080"
-    TRAP_TLS_LISTEN="0.0.0.0:8081"
+    # [::] takes IPv4 too (as ::ffff:a.b.c.d) on a dual-stack host.
+    trap_any=0.0.0.0
+    [ ! -e /proc/net/if_inet6 ] || trap_any="[::]"
+    TRAP_LISTEN="${trap_any}:8080"
+    TRAP_TLS_LISTEN="${trap_any}:8081"
     ADMIN_LISTEN="127.0.0.1:8443"
     if has_role listener; then
         # What is in front of the trap. PEEPHOLE_LOCAL_PROXY is the yes/no
@@ -955,8 +958,8 @@ if [ "$upgrade" -ne 1 ]; then
         PEEPHOLE_LOCAL_PROXY=0
         case "$front" in
             direct)
-                TRAP_LISTEN="0.0.0.0:80"
-                TRAP_TLS_LISTEN="0.0.0.0:443"
+                TRAP_LISTEN="${trap_any}:80"
+                TRAP_TLS_LISTEN="${trap_any}:443"
                 if [ -n "${PEEPHOLE_TRUSTED_PROXIES:-}" ]; then
                     warn "PEEPHOLE_TRUSTED_PROXIES is ignored: nothing is in front of the trap, so no proxy is trusted"
                 fi
