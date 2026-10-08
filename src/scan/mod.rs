@@ -1,12 +1,14 @@
 pub mod arbiter;
 pub mod crawler;
 pub mod guard;
+pub mod handout;
 pub mod hostkeys;
 pub mod nmap_xml;
 pub mod order;
 pub mod pace;
 pub mod probe;
 pub mod profiles;
+pub mod rank;
 pub mod retry;
 pub mod safety;
 pub mod weight;

@@ -6,6 +6,10 @@
 //! that level for stretches of [`HOLD`], a share `1 - weight` of them, so
 //! the better scanners pick those jobs up instead.
 //!
+//! The weights are measured once an hour (see [`Weights`]): the snapshot
+//! of hour H counts the scans finished in the [`WINDOW_HOURS`] before H
+//! and is taken at H + 5 min, so arbiters with the same log agree.
+//!
 //! Recovery is built in: only the last [`WINDOW_HOURS`] count, so old
 //! failures age out; the weight never drops below [`MIN_WEIGHT`], so a
 //! weak scanner keeps taking the odd job and proves itself again; and a job
@@ -18,6 +22,7 @@ use crate::cluster::identity::NodeId;
 use anyhow::Result;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Hours of finished scans a weight is measured over.
@@ -53,18 +58,38 @@ impl Tally {
 
 pub type Tallies = HashMap<(NodeId, i64), Tally>;
 
-/// Finished scans per scanner and level within [`WINDOW_HOURS`], from the
-/// replicated job rows: every node sees the whole cluster's record.
-pub async fn tallies(pool: &SqlitePool) -> Result<Tallies> {
-    let rows: Vec<(Vec<u8>, i64, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+/// When a snapshot is taken after the end of its hour: scans finished
+/// just before the hour have replicated by then.
+const SNAPSHOT_DELAY_SECS: u64 = 300;
+
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// The hour (Unix seconds / 3600) whose snapshot holds at `unix_secs`.
+pub fn due_hour(unix_secs: u64) -> i64 {
+    (unix_secs.saturating_sub(SNAPSHOT_DELAY_SECS) / 3600) as i64
+}
+
+/// Finished scans per scanner and level in the [`WINDOW_HOURS`] before
+/// `hour` (Unix seconds / 3600), from the replicated job rows: every node
+/// with the same rows gets the same tallies.
+pub async fn tallies_before(pool: &SqlitePool, hour: i64) -> Result<Tallies> {
+    let rows: Vec<(Vec<u8>, i64, i64, i64)> = sqlx::query_as(
         "SELECT scanner, level, SUM(status = 'done'),
                 SUM(status = 'failed' AND COALESCE(error, '') NOT LIKE 'timeout%'
                     AND COALESCE(error, '') != 'invalid target')
          FROM scan_jobs
          WHERE scanner IS NOT NULL AND status IN ('done', 'failed')
-           AND finished_at > datetime('now', '-{WINDOW_HOURS} hours')
-         GROUP BY scanner, level"
-    )))
+           AND finished_at >= datetime(?, 'unixepoch')
+           AND finished_at < datetime(?, 'unixepoch')
+         GROUP BY scanner, level",
+    )
+    .bind((hour - WINDOW_HOURS) * 3600)
+    .bind(hour * 3600)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -73,6 +98,34 @@ pub async fn tallies(pool: &SqlitePool) -> Result<Tallies> {
             Some(((NodeId::from_slice(&s).ok()?, level), Tally { ok, failed }))
         })
         .collect())
+}
+
+/// The tallies of the [`WINDOW_HOURS`] before `hour`.
+#[derive(Debug, Default)]
+pub struct Snapshot {
+    pub hour: i64,
+    pub tallies: Tallies,
+}
+
+/// The snapshot in force: the one of the last full hour, taken
+/// [`SNAPSHOT_DELAY_SECS`] after it, and kept until the next is due.
+#[derive(Default)]
+pub struct Weights(tokio::sync::Mutex<Option<Arc<Snapshot>>>);
+
+impl Weights {
+    pub async fn get(&self, pool: &SqlitePool) -> Result<Arc<Snapshot>> {
+        let hour = due_hour(unix_now());
+        let mut g = self.0.lock().await;
+        if let Some(s) = g.as_ref().filter(|s| s.hour == hour) {
+            return Ok(s.clone());
+        }
+        let s = Arc::new(Snapshot {
+            hour,
+            tallies: tallies_before(pool, hour).await?,
+        });
+        *g = Some(s.clone());
+        Ok(s)
+    }
 }
 
 /// `scanner`'s weight at `level`: its success rate over the best rate among
@@ -223,8 +276,57 @@ mod tests {
             .await
             .unwrap();
         }
-        let t = tallies(&s.pool).await.unwrap();
+        let t = tallies_before(&s.pool, due_hour(unix_now()) + 1)
+            .await
+            .unwrap();
         assert_eq!(t[&(id(7), 4)], Tally { ok: 1, failed: 1 });
+    }
+
+    #[test]
+    fn the_snapshot_of_an_hour_is_due_five_minutes_after_it() {
+        let h = 500_000i64;
+        let at = |s: i64| (h * 3600 + s) as u64;
+        assert_eq!(due_hour(at(0)), h - 1);
+        assert_eq!(due_hour(at(299)), h - 1);
+        assert_eq!(due_hour(at(300)), h);
+        assert_eq!(due_hour(at(3599)), h);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_counts_the_24_hours_before_its_hour() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let ip = s.upsert_ip("203.0.113.9".parse().unwrap()).await.unwrap();
+        let h = 500_000i64;
+        // Seconds relative to the start of hour h.
+        for (status, rel) in [
+            ("done", -1i64),
+            ("done", 0),
+            ("done", -24 * 3600),
+            ("failed", -24 * 3600 - 1),
+        ] {
+            sqlx::query(
+                "INSERT INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at,
+                                        error, scanner, finished_at)
+                 VALUES (lower(hex(randomblob(16))), ?3, ?3, 1, ?4, 4, ?1, '2000-01-01 00:00:00',
+                         'nmap exited 1', ?3, datetime(?2, 'unixepoch'))",
+            )
+            .bind(status)
+            .bind(h * 3600 + rel)
+            .bind(&id(7).0[..])
+            .bind(ip.id)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let t = tallies_before(&s.pool, h).await.unwrap();
+        // The second before the hour and exactly 24 h before count; the
+        // hour itself and anything older do not.
+        assert_eq!(t[&(id(7), 4)], Tally { ok: 2, failed: 0 });
+        // The same rows give the same snapshot on any node.
+        assert_eq!(tallies_before(&s.pool, h).await.unwrap(), t);
     }
 
     #[test]

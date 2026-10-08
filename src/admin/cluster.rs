@@ -271,13 +271,14 @@ pub(crate) async fn views(
             .unwrap_or_default()
             .view(ours)
     };
-    let tallies = crate::scan::weight::tallies(&node.store.pool).await?;
+    let snap = node.weights.get(&node.store.pool).await?;
+    let tallies = &snap.tallies;
     // The arbiter's view: the scanners that could take a job now.
     let scanners = crate::scan::arbiter::scanners(node);
     let level_weights = |id: NodeId| {
         (1..=4)
             .filter_map(|l| {
-                let w = crate::scan::weight::weight(&tallies, id, &scanners, l);
+                let w = crate::scan::weight::weight(tallies, id, &scanners, l);
                 let t = tallies.get(&(id, l)).copied().unwrap_or_default();
                 (w < 1.0).then(|| format!("L{l} ×{w:.2} ({} ok, {} failed)", t.ok, t.failed))
             })

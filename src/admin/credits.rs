@@ -112,9 +112,10 @@ struct PriceView {
     /// Its paid scans of the past hour, and its target.
     scan_paid: String,
     scan_target: String,
-    /// Every scanner: name, announced price, this node's reference price,
-    /// paid scans of the past hour against its target.
-    scanners: Vec<(String, String, String, String)>,
+    /// Every scanner, with what one delivered result costs at each level.
+    scanners: Vec<ScannerRow>,
+    /// "Success rates as of 14:00 UTC, next at 15:00."
+    weights_as_of: String,
     capacity_per_hour: String,
     utilization: String,
     /// What a probe costs here; None: this node does not probe.
@@ -123,6 +124,72 @@ struct PriceView {
     resolve: String,
     /// `(provider label, price, paid lookups it serves a day)`.
     offers: Vec<(String, String, String)>,
+}
+
+/// A scanner in the price table.
+struct ScannerRow {
+    name: String,
+    announced: String,
+    /// This node's copy of its price.
+    reference: String,
+    /// Paid scans of the past hour against its target.
+    paid: String,
+    /// Levels 1 to 4.
+    levels: Vec<LevelCell>,
+}
+
+/// What one delivered result at a level costs with a scanner.
+struct LevelCell {
+    price: String,
+    /// How it was reached, for the cell's title.
+    basis: String,
+    /// The cheapest at this level.
+    cheapest: bool,
+}
+
+/// A scanner's price here, and its weight and tally at levels 1 to 4.
+type LevelInputs = (Option<u32>, [(f64, crate::scan::weight::Tally); 4]);
+
+/// Cells of the L1–L4 columns, one row per scanner: its price (what this
+/// node would pay it) over its weight and tally at each level.
+fn level_cells(rows: &[LevelInputs]) -> Vec<Vec<LevelCell>> {
+    use crate::scan::rank::effective;
+    let best: Vec<u32> = (0..4)
+        .map(|l| {
+            rows.iter()
+                .map(|(p, w)| effective(*p, w[l].0))
+                .min()
+                .unwrap_or(u32::MAX)
+        })
+        .collect();
+    rows.iter()
+        .map(|(price, levels)| {
+            levels
+                .iter()
+                .enumerate()
+                .map(|(l, (w, t))| {
+                    let e = effective(*price, *w);
+                    LevelCell {
+                        price: match price {
+                            Some(_) => show(e as Mc),
+                            None => "–".into(),
+                        },
+                        basis: match price {
+                            Some(p) => format!(
+                                "price {} ÷ {:.0} % of the best success rate ({} ok, {} failed, last 24 h)",
+                                show(*p as Mc),
+                                w * 100.0,
+                                t.ok,
+                                t.failed
+                            ),
+                            None => "no price here".into(),
+                        },
+                        cheapest: price.is_some() && e == best[l],
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// One good in the price table: this node's price, its move over 24
@@ -411,6 +478,45 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
     );
 
     let t = node.price_table();
+    let snap = node.weights.get(&node.store.pool).await?;
+    let live = crate::scan::arbiter::scanners(node);
+    let inputs: Vec<_> = t
+        .scanners
+        .iter()
+        .map(|s| {
+            let levels = [1, 2, 3, 4].map(|l| {
+                (
+                    crate::scan::weight::weight(&snap.tallies, s.node, &live, l),
+                    snap.tallies.get(&(s.node, l)).copied().unwrap_or_default(),
+                )
+            });
+            (credits::jobs::price_for(node, &s.node), levels)
+        })
+        .collect();
+    let scanners = t
+        .scanners
+        .iter()
+        .zip(level_cells(&inputs))
+        .map(|(s, levels)| {
+            let announced = if s.node == me {
+                t.sell_mc
+            } else {
+                node.status.known(&s.node).and_then(|k| k.hb.scan_price_mc)
+            };
+            ScannerRow {
+                name: name(&s.node),
+                announced: announced.map_or_else(|| "–".into(), |m| show(m as u64)),
+                reference: show(s.price_mc as u64),
+                paid: format!("{:.0} / {:.0}", s.paid, s.supply),
+                levels,
+            }
+        })
+        .collect();
+    let weights_as_of = format!(
+        "Success rates as of {:02}:00 UTC, next at {:02}:00.",
+        snap.hour.rem_euclid(24),
+        (snap.hour + 1).rem_euclid(24)
+    );
     let label = |p: &str| {
         crate::intel::provider_info(p)
             .map(|i| i.label.to_string())
@@ -428,23 +534,8 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             .iter()
             .find(|s| s.node == me)
             .map_or_else(|| "0".into(), |s| format!("{:.0}", s.supply)),
-        scanners: t
-            .scanners
-            .iter()
-            .map(|s| {
-                let announced = if s.node == me {
-                    t.sell_mc
-                } else {
-                    node.status.known(&s.node).and_then(|k| k.hb.scan_price_mc)
-                };
-                (
-                    name(&s.node),
-                    announced.map_or_else(|| "–".into(), |m| show(m as u64)),
-                    show(s.price_mc as u64),
-                    format!("{:.0} / {:.0}", s.paid, s.supply),
-                )
-            })
-            .collect(),
+        scanners,
+        weights_as_of,
         capacity_per_hour: format!("{:.0}", (t.capacity.per_day / 24.0).max(0.0)),
         utilization: format!("{:.0}", t.capacity.utilization * 100.0),
         probe: t.probe_mc.map(|m| show(m as u64)),
@@ -675,6 +766,30 @@ mod tests {
     }
 
     #[test]
+    fn each_level_shows_the_price_per_delivered_result() {
+        use crate::scan::weight::Tally;
+        let t = Tally { ok: 6, failed: 6 };
+        let cells = level_cells(&[
+            (Some(20), [(1.0, t), (1.0, t), (1.0, t), (0.5, t)]),
+            (Some(30), [(1.0, t), (1.0, t), (1.0, t), (1.0, t)]),
+            (None, [(1.0, t), (1.0, t), (1.0, t), (1.0, t)]),
+        ]);
+        let price = |r: usize, l: usize| cells[r][l].price.as_str();
+        assert_eq!(
+            (price(0, 3), price(1, 3), price(2, 3)),
+            ("0.04", "0.03", "–")
+        );
+        assert!(cells[0][0].cheapest && !cells[1][0].cheapest);
+        assert!(cells[1][3].cheapest && !cells[0][3].cheapest);
+        assert!(!cells[2][0].cheapest, "no price is never the cheapest");
+        assert_eq!(
+            cells[0][3].basis,
+            "price 0.02 ÷ 50 % of the best success rate (6 ok, 6 failed, last 24 h)"
+        );
+        assert_eq!(cells[2][3].basis, "no price here");
+    }
+
+    #[test]
     fn the_page_shows_where_credits_come_from() {
         let page = CreditsPage {
             chrome: crate::admin::views::Chrome::new(true, "admin"),
@@ -702,12 +817,34 @@ mod tests {
                 scan: "0.05".into(),
                 scan_paid: "30".into(),
                 scan_target: "36".into(),
-                scanners: vec![(
-                    "node-bravo".into(),
-                    "0.06".into(),
-                    "0.05".into(),
-                    "30 / 36".into(),
-                )],
+                scanners: vec![ScannerRow {
+                    name: "node-bravo".into(),
+                    announced: "0.06".into(),
+                    reference: "0.05".into(),
+                    paid: "30 / 36".into(),
+                    levels: level_cells(&[
+                        (
+                            Some(50),
+                            [
+                                (1.0, Default::default()),
+                                (0.5, Default::default()),
+                                (1.0, Default::default()),
+                                (1.0, Default::default()),
+                            ],
+                        ),
+                        (
+                            Some(90),
+                            [
+                                (1.0, Default::default()),
+                                (1.0, Default::default()),
+                                (1.0, Default::default()),
+                                (1.0, Default::default()),
+                            ],
+                        ),
+                    ])
+                    .remove(0),
+                }],
+                weights_as_of: "Success rates as of 14:00 UTC, next at 15:00.".into(),
                 capacity_per_hour: "40".into(),
                 utilization: "12".into(),
                 probe: None,
@@ -742,6 +879,10 @@ mod tests {
         }
         assert!(!html.contains("destroyed"));
         assert!(html.contains("node-bravo") && html.contains("30 / 36"));
+        assert!(html.contains("<b>0.05</b>"), "cheapest at L1 in bold");
+        assert!(html.contains(">0.10<"), "L2: 0.05 at half the success rate");
+        assert!(html.contains("per delivered result"));
+        assert!(html.contains("Success rates as of 14:00 UTC, next at 15:00."));
         assert!(html.contains("30 paid of 36 an hour"));
         let mut page = page;
         page.price.scan = "–".into();

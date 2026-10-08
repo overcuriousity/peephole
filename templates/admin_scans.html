@@ -48,7 +48,7 @@
     <thead><tr><th>Scanner</th><th>Workers</th><th>Scans / hour</th><th>Timeout (min)</th><th></th><th class="num" title="From its measured scan times and its pace">Can do / h</th><th class="num" title="Jobs and audits it ended in the last 24 hours">Did / h</th><th>Limited by</th><th>Level weights</th></tr></thead>
     <tbody>{% for m in scanners %}{% include "_cluster_pace_row.html" %}{% endfor %}</tbody>
   </table></div>
-  <p class="muted">0 pauses a scanner. A scanner that fails a scan level more often than the others (last 24 h, timeouts aside) sits that level out for 10-minute stretches, a share of 1 − weight of them, while the others take its jobs; scanners with fewer than 5 scans at a level set no bar. It recovers as old failures age out, and jobs waiting over 30 min go to any scanner.</p>
+  <p class="muted">0 pauses a scanner. Paid jobs go to the scanner that is cheapest per delivered result at the job's level: its price divided by its success rate there (last 24 h, timeouts aside, measured every hour). A job waits up to 30 min for a cheaper live scanner, then goes to whoever asks. A scanner that fails a level often wins it only if its price makes up for it. Unpaid jobs keep the old rule: a scanner that fails a level more than the others sits it out for 10-minute stretches, a share of 1 − weight of them; scanners with fewer than 5 scans at a level set no bar. Hover a scanner in the history for why it got the job.</p>
   </div>
   {% endif %}
   {% if pace.m.failed_24h > 0 %}<p class="muted pace-retry"><a href="/admin/scans?status=failed#history">{{ pace.m.failed_24h }} failed in 24 h →</a></p>{% endif %}
@@ -81,7 +81,7 @@
         <td><span class="badge badge-status" data-status="{{ r.status }}">{{ r.status }}</span>{% if r.is_retry %} <span class="badge" title="Retry of an earlier failed scan">retry</span>{% endif %}</td>
         <td class="ts">{{ r.finished_at.as_deref().unwrap_or("") }}</td>
         <td class="wrap">{% if let Some(sid) = r.scan_id %}<a class="mono" href="/admin/scans/{{ sid }}">scan #{{ sid }}</a> · {{ r.open_ports }} open{% if let Some(os) = r.os_guess %} · {{ os }}{% endif %}{% else if let Some(e) = r.error %}<span class="mono">{{ e }}</span>{% endif %}{% if r.retried %} · <span class="muted">retried</span>{% endif %}</td>
-        <td class="muted">{% if let Some(s) = r.scanner %}{{ s }}{% endif %}{% if let Some(a) = r.arbiter %}<span class="node-via"> via {{ a }}</span>{% endif %}</td>
+        <td class="muted">{% if let Some(s) = r.scanner %}<span{% if let Some(h) = r.handout %} title="{{ h }}"{% endif %}>{{ s }}</span>{% endif %}{% if let Some(a) = r.arbiter %}<span class="node-via"> via {{ a }}</span>{% endif %}</td>
       </tr>
     {% endfor %}
     {% if history.items.is_empty() %}<tr><td colspan="7" class="empty">No finished jobs{% if f.status.is_some() || f.level.is_some() %} match{% endif %}.</td></tr>{% endif %}

@@ -168,6 +168,10 @@ pub async fn book_fresh(node: &Node) -> anyhow::Result<Arc<Book>> {
 
 /// How often the loop judges scans.
 const TICK: std::time::Duration = std::time::Duration::from_secs(60);
+/// Ticks between price refreshes: 10 minutes. Each step is scaled by the
+/// time since the last one, so prices move as fast per hour as with an
+/// hourly refresh, in smaller steps.
+const PRICE_TICKS: u64 = 10;
 
 /// Judge scans as they become due, say in the journal when a member's
 /// standing changes, and drop what is older than the ledger reads.
@@ -228,12 +232,19 @@ pub async fn run(
                 tracing::debug!(?e, "credits: pruning failed");
             }
         }
+        // The scanner weights' hourly snapshot, taken as soon as it is due
+        // (five minutes after the hour) rather than on first use, so every
+        // node takes it at about the same time.
+        if let Err(e) = node.weights.get(&node.store.pool).await {
+            tracing::debug!(?e, "credits: scanner weights not measured");
+        }
         // Every tick (one count and the cached book), for the heartbeat.
         if let Err(e) = jobs::announce_budget(&node).await {
             tracing::debug!(?e, "credits: scan budget not computed");
         }
-        // At the start (once the first heartbeats are in) and every hour.
-        if ticks % 60 == 1
+        // At the start (once the first heartbeats are in) and every
+        // PRICE_TICKS.
+        if ticks % PRICE_TICKS == 1
             && let Err(e) = price::refresh(&node).await
         {
             tracing::debug!(?e, "credits: prices not computed");
@@ -249,6 +260,14 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prices_refresh_every_ten_minutes() {
+        assert_eq!(
+            TICK * PRICE_TICKS as u32,
+            std::time::Duration::from_secs(600)
+        );
+    }
 
     #[test]
     fn days_and_amounts() {

@@ -948,6 +948,19 @@ mod tests {
     }
 
     #[test]
+    fn six_ten_minute_steps_move_a_price_like_one_hourly_step() {
+        for (paid, can_do) in [(0.0, 10.0), (10.0, 10.0), (4.0, 10.0)] {
+            let hourly = scanner_step(1_000_000, paid, can_do, 1.0);
+            let mut p = 1_000_000;
+            for _ in 0..6 {
+                p = scanner_step(p, paid, can_do, 1.0 / 6.0);
+            }
+            let diff = (p as f64 - hourly as f64).abs() / hourly as f64;
+            assert!(diff < 0.002, "paid {paid}: {p} vs {hourly}");
+        }
+    }
+
+    #[test]
     fn a_kept_copy_carries_the_time_of_its_last_step() {
         assert_eq!(parse_kept("120@5000"), Some((120, Some(5000))));
         assert_eq!(parse_kept("120"), Some((120, None)));

@@ -187,11 +187,11 @@ earn most of the new money, every member a little.
   Both are credited when the UTC day ends.
 - **Where they go.** A credit is gone 7 days after its day. Nothing else
   destroys credits: a payment moves the full price.
-- **Prices.** One rule per good, computed hourly on each node: excess
+- **Prices.** One rule per good, computed every 10 minutes on each node: excess
   demand raises a price by at most a factor of e^0.45 an hour, excess
-  supply lowers it by at most a factor of e^-0.15 an hour (a lookup,
-  probe or resolution price counted over a shorter period takes that
-  share of a step), a price moves at least 0.001 credits toward the
+  supply lowers it by at most a factor of e^-0.15 an hour (each step is
+  scaled by the time since the last one, so a 10-minute refresh takes a
+  sixth of an hourly step), a price moves at least 0.001 credits toward the
   imbalance, and it never goes under 0.001 credits. What a node answers
   itself is free (its own providers, prober, resolver, scanner), though
   its own scan jobs use up its scan budget like jobs it buys. Scan
@@ -221,7 +221,28 @@ earn most of the new money, every member a little.
   after 15 minutes.
 - **Scan jobs.** The arbiter (the node that queued the job) funds its jobs
   from its own balance, up to `[credits] scan_share` (default 0.5) of it,
-  and hands each job to the cheapest scanner asking. A scanner asks
+  and hands each job to the scanner asking that is cheapest **per
+  delivered result** at the job's level: its price divided by its success
+  rate there, relative to the best live scanner with at least 5 scans at
+  that level (the level weight, at least 0.1). A failed scan is not paid,
+  so a scanner that fails a level often wins it only if its price makes
+  up for it. The success rates are measured once an hour: the snapshot of
+  hour H counts the scans finished in the 24 hours before H and is taken
+  at H + 5 min, so arbiters with the same log agree. A job is paid to the
+  best claimant the scan budget can pay (one that takes no less than more
+  than its price here is passed over). A paid job waits for a cheaper live
+  scanner (not hoarding, not paused, under its capacity, with a record at
+  that level, and able to take the job: it did not hand it back, and its
+  last claim here neither excluded the level nor asked more than its
+  price) for up to 30 minutes, then goes to whoever asks. A job no
+  claimant can be paid for is idle work: there,
+  a scanner that fails a level more than the others still sits it out
+  for 10-minute stretches, a share of 1 − weight of them. A round reads
+  the queue 200 jobs at a time, up to 5000, past those every claimant
+  handed back; an error ends the round but keeps its grants. Why a
+  job went where is kept by its arbiter in `job_handouts` (local, 8 days)
+  and shown on the scan page and as a title in the Scans history; other
+  nodes say which node handed it out. A scanner asks
   arbiters that can pay its price first, in urgency order. A node's own
   jobs are funded from the same budget without moving credits. Scanners
   that hoard (over their hourly capacity, or delivering less than half of
@@ -234,7 +255,10 @@ earn most of the new money, every member a little.
   this node sees it: each good's price over 7 days beside the spread
   members announce, its demand and supply, this node's daily income by
   source and spending, every member's holdings, and why a scan was not
-  counted. Prices are kept hourly in `price_history` (local, 8 days).
+  counted. Prices are kept hourly in `price_history` (local, 8 days; the
+  last refresh of an hour stands for it). The scanner table shows, per
+  level, what one delivered result costs with each scanner, the cheapest
+  in bold.
   The balance itself is on the Overview and the Lookup page.
 - **Conformity and audits.** A member earns on your node only while at
   least 98 % of its newest 500 requests classify the same with your
