@@ -1315,6 +1315,7 @@ async fn erased_stubs_need_the_origins_tombstone() {
         floors: vec![],
         entries: before.entries.clone(),
         proofs: after.proofs.clone(),
+        membership: vec![],
     };
     strip(&mut forged, &two, Some(tomb.clone()));
     let st = repl::apply_batch(&x, forged).await.unwrap();
@@ -1345,6 +1346,7 @@ async fn erased_stubs_need_the_origins_tombstone() {
         floors: vec![],
         entries: after.entries.clone(),
         proofs: after.proofs.clone(),
+        membership: vec![],
     };
     let e = relabel
         .entries
@@ -1362,6 +1364,7 @@ async fn erased_stubs_need_the_origins_tombstone() {
     // No proof, a proof from another origin, a stub without a uid: rejected.
     let stub_only = Batch {
         bounds: vec![],
+        membership: vec![],
         floors: vec![],
         entries: after.entries.clone(),
         proofs: vec![],
@@ -1369,6 +1372,7 @@ async fn erased_stubs_need_the_origins_tombstone() {
     let other = Identity::generate().unwrap();
     let wrong_origin = Batch {
         bounds: vec![],
+        membership: vec![],
         floors: vec![],
         entries: after.entries.clone(),
         proofs: vec![
@@ -1390,6 +1394,7 @@ async fn erased_stubs_need_the_origins_tombstone() {
         floors: vec![],
         entries: after.entries.clone(),
         proofs: after.proofs.clone(),
+        membership: vec![],
     };
     no_uid
         .entries

@@ -416,6 +416,7 @@ async fn an_admission_after_a_gap_in_the_sponsors_history_counts() {
         proofs: vec![],
         floors: vec![(a.key(), 5)],
         bounds: vec![],
+        membership: vec![],
     };
     let st = repl::apply_batch_with(&w, batch, |_| true).await.unwrap();
     assert_eq!(st.applied, 2, "{st:?}");
