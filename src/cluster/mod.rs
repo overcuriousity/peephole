@@ -449,6 +449,25 @@ impl Node {
         }
     }
 
+    /// [`Node::bootstrap`] for a CLI process: the roles stay what this node
+    /// last announced (the daemon announces the roles it actually runs,
+    /// after runtime overrides), not the config file's.
+    pub async fn bootstrap_keeping_roles(&self) -> Result<()> {
+        let announced = members::all(&self.store)
+            .await?
+            .into_iter()
+            .find(|m| m.id == self.id() && m.info_hlc > 0);
+        if let Some(m) = announced {
+            let has = |n: &str| m.roles.iter().any(|r| r == n);
+            *self.roles.write().unwrap() = Roles {
+                listener: has("listener"),
+                scanner: has("scanner"),
+                web: has("web"),
+            };
+        }
+        self.bootstrap().await
+    }
+
     /// Publish our own description and vouch for configured peers.
     /// Configured peers are only added when never seen before, so a
     /// revocation is not undone by a config that still lists the peer.

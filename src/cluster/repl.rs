@@ -1657,6 +1657,55 @@ mod tests {
         }
     }
 
+    /// A CLI process opening the node keeps the roles the daemon announced
+    /// (here: the scanner switched off at runtime), not the config file's.
+    #[tokio::test]
+    async fn a_cli_bootstrap_keeps_the_announced_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("node.key");
+        let open = || async {
+            let store = crate::store::Store::connect(&dir.path().join("t.db"))
+                .await
+                .unwrap();
+            super::Node::open(super::super::NodeParams {
+                identity: Identity::load_or_create(&key).unwrap(),
+                cluster: crate::config::ClusterConfig {
+                    node_name: "n".into(),
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    advertise: None,
+                    key_path: None,
+                    takeover_hours: 6.0,
+                    lease_secs: 120,
+                    remote_config: false,
+                    origin_quota_mb: 20 * 1024,
+                    peers: vec![],
+                },
+                roles: Default::default(),
+                store,
+                proto: (1, 1),
+                data_dir: dir.path().to_path_buf(),
+                retention_days: 0,
+            })
+            .await
+            .unwrap()
+        };
+        let daemon = open().await;
+        daemon.bootstrap().await.unwrap();
+        let mut running = crate::config::Roles::default();
+        running.scanner = false;
+        daemon.set_roles(running).await.unwrap();
+
+        let cli = open().await;
+        cli.bootstrap_keeping_roles().await.unwrap();
+        let me = super::super::members::all(&cli.store)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == cli.id())
+            .unwrap();
+        assert_eq!(me.roles, ["listener", "web"]);
+    }
+
     #[tokio::test]
     async fn a_member_whose_dial_fails_is_asked_through_its_outbox() {
         let (_d, node) = test_node(0).await;
