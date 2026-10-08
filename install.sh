@@ -463,6 +463,9 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host \$http_host;
         proxy_set_header X-Forwarded-For \$remote_addr;
+        # The trap streams some answers (the MCP decoy's event stream, the
+        # tarpit's drip): pass each byte on as it comes.
+        proxy_buffering off;
     }
 }
 NGINX
