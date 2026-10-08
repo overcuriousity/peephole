@@ -125,7 +125,8 @@ a default stops the install before anything is written:
   `remote` (the domain then points here), else the public address (an
   interface's, the metadata's or `PEEPHOLE_OWN_ADDRESSES`) with port 7443.
   `PEEPHOLE_CLUSTER_NAME` defaults to the short host name and
-  `PEEPHOLE_CLUSTER_LISTEN` to `0.0.0.0:<advertise port>`.
+  `PEEPHOLE_CLUSTER_LISTEN` to `[::]:<advertise port>` (both address
+  families; `0.0.0.0:<advertise port>` without IPv6).
   `PEEPHOLE_CLUSTER` is ignored.
 - `PEEPHOLE_ADMIN_PASSWORD` reaches peephole on stdin only (never on a
   command line or in a child's environment); `PEEPHOLE_NGINX=1` sets nginx
@@ -137,8 +138,9 @@ a default stops the install before anything is written:
 installer does not change the firewall (with `ufw` active, the summary
 prints the `ufw allow` command). To change it later, edit `advertise` and
 `listen` in `[cluster]` of `/etc/peephole/config.toml` and restart
-peephole. A node that cannot be reached at all can run outbound-only, by
-hand (see [cluster.md](cluster.md)).
+peephole. If the wizard moves the listener to a free port, the advertised
+port follows it. A node that cannot be reached at all can run
+outbound-only, by hand (see [cluster.md](cluster.md)).
 
 Published binaries are built on Ubuntu 22.04 and run on Debian 12 / Ubuntu
 22.04 or newer (glibc ≥ 2.35).
@@ -273,6 +275,8 @@ peephole --help                                   # commands and arguments
 peephole check-config /etc/peephole/config.toml   # validate config and nmap; show the built-in rules
 peephole settings show|set|reset                  # runtime settings (pace, cooldown, roles)
 peephole admin reset-token                        # new one-time admin setup token
+peephole admin password [--stdin]                 # set or change the admin password
+peephole admin login-method passkey|password|both # how the admin signs in
 peephole export -o data.parquet                   # the dataset (--format, --from, --redistributable, --help)
 peephole db vacuum                                # shrink the database file (stop the service first)
 ```
@@ -305,6 +309,15 @@ restart without an enrolled key prints a new one once it has expired, and
 lost, or every key is. Further keys are enrolled from **Admin → Keys**. Admin
 sessions last at most 12 hours and end after an hour without use, on logout,
 on the next sign-in, or when the key they signed in with is deleted.
+
+The sign-in method is `passkey` (the default), `password` or `both`, chosen
+under **Admin → Keys** or with `peephole admin login-method`. A method that
+would leave no way in is refused: `password` needs a password set,
+`passkey` an enrolled key, `both` at least one of them. `peephole admin
+password` sets or changes the password from the shell (it also turns
+`passkey` into `both`), and is the way back in when the password is lost.
+Password sessions end when the password changes or the method becomes
+`passkey`.
 
 **Dataset.** `peephole export` writes every request with everything known
 about it and its IP as Parquet (default), CSV or Timesketch JSON Lines, to

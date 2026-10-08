@@ -68,7 +68,7 @@ nmap.
   `[a-z0-9._:/-]{1,64}` and were asked by at least 2 IPs (else "other").
   Rule labels, and the families and OWASP tags derived from them, can be
   hidden too.
-- **Admin area** (FIDO2 security keys only, no passwords) — request search
+- **Admin area** (FIDO2 security keys; optionally a password) — request search
   and inspection (with the same IP's and same JA4's other requests), a live
   feed of new requests, analytics (top paths, user agents, JA4, methods,
   open ports, products, OS guesses, abuse scores; every row opens the

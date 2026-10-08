@@ -50,7 +50,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Admin: sign in with a password (optional, per node; `peephole admin
   password`, `peephole admin login-method`). Passkeys stay the default.
 - Cluster: outbound-only members answer paid lookups, resolutions and
-  probes (routed through the outbox).
+  probes (routed through the outbox; protocol 6: the member and the node
+  whose outbox it polls must run it; older outbound-only members are not
+  asked).
 - Trap: a PROXY header from a peer outside `trusted_proxies` is named in
   the log.
 - Installer: asks whether to also allow a password sign-in on the admin
@@ -79,7 +81,6 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Installer: the admin domain is normalised (a scheme, a path and a
   trailing dot are stripped, upper case is lowered); an IP address is
   refused.
-
 - The dynamic market replaces the fixed credit rules. A daily mint of 1000
   credits is split among scanners by counted scans (levels 3 and 4 count
   twice; a scan of a node's own job never counts); the trap share is gone.
@@ -111,6 +112,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Protocol 5: scan jobs are paid only between nodes on protocol 5; upgrade
   all nodes together. Heartbeats carry `scan_budget_mc` and `scan_queued`;
   `scan_bids` is gone.
+- Protocol 6: outbound-only members on protocol 6 answer paid lookups,
+  resolutions and probes through their outbox; nodes on earlier versions
+  are neither asked that way nor used to relay it. Upgrade all nodes
+  together.
 - Credits page: the scan tile shows this node's selling price, and a table
   lists every scanner's announced and reference price.
 - Host keys and certificates may come from a probe as well as a scan;

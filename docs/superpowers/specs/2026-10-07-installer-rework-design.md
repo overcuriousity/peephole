@@ -287,7 +287,9 @@ probes. Directed messages already reach it (outbox + long-poll).
 - `credits::fleet` keeps its dial-only reconcile (a message already carries
   the draw; the reconcile is an optimisation).
 - Protocol: v4 is not deployed; the new variants go into it. Members that
-  cannot decode them do not exist yet.
+  cannot decode them do not exist yet. *Superseded by the decision of
+  2026-10-08: routed RPC bumps the cluster protocol to 6; only members on
+  6 are asked through their outbox, and older members do not relay it.*
 - Docs: `docs/cluster.md` (the "cannot be asked" sentence goes).
 - Tests: a lookup, a resolve and a probe answered by a node with no
   address; the path allow-list; the size cap.
