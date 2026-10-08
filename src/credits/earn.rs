@@ -144,6 +144,36 @@ pub async fn judge(j: &Judge<'_>, min_age_secs: i64) -> Result<usize> {
     Ok(n)
 }
 
+/// Judge again the arguments of the scans in the ledger window judged
+/// not built-in: an older build does not know this build's argument lists
+/// (a newer level 2), and a judgment stands once made. Only a judgment an
+/// older build made can change, so once per start is enough. Returns how
+/// many now pass.
+pub async fn rejudge_args(pool: &SqlitePool) -> Result<usize> {
+    let rows: Vec<(String, i64, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT c.scan_uid, c.job_level, s.raw_xml
+         FROM credit_scans c JOIN scans s ON s.uid = c.scan_uid
+         WHERE c.args_ok = 0 AND c.hlc >= ?",
+    )
+    .bind(hlc::to_db(super::window_start(hlc::wall_ms())))
+    .fetch_all(pool)
+    .await?;
+    let mut n = 0;
+    for (uid, job_level, raw_xml) in rows {
+        let level = job_level.clamp(0, 4) as u8;
+        if command_line(raw_xml.as_deref())
+            .is_some_and(|line| crate::scan::profiles::args_ok(&line, level))
+        {
+            n += sqlx::query("UPDATE credit_scans SET args_ok = 1 WHERE scan_uid = ?")
+                .bind(&uid)
+                .execute(pool)
+                .await?
+                .rows_affected() as usize;
+        }
+    }
+    Ok(n)
+}
+
 type JudgedRow = (
     String,
     String,
@@ -742,5 +772,44 @@ mod tests {
         assert_eq!(one("nope".into()).await.unwrap(), None);
 
         assert_eq!(prune(&store.pool, u64::MAX >> 1).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn arguments_an_older_build_rejected_are_judged_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let cfg: crate::config::Config = toml::from_str(
+            "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n",
+        )
+        .unwrap();
+        let argv = crate::scan::nmap_argv(2, &"203.0.113.7".parse().unwrap(), &cfg, 600).unwrap();
+        let ours = finished_scan(
+            &store,
+            "203.0.113.7",
+            2,
+            &format!("nmap {}", argv.join(" ")),
+            1,
+        )
+        .await;
+        let own = finished_scan(&store, "203.0.113.8", 2, "nmap -A -oX - 203.0.113.8", 2).await;
+        let origins = guard::Origins::Any;
+        let j = Judge {
+            pool: &store.pool,
+            origins: &origins,
+            classifier: Classifier::builtin(),
+        };
+        assert_eq!(judge(&j, 60).await.unwrap(), 2);
+        // As a build before this level-2 list left it.
+        sqlx::query("UPDATE credit_scans SET args_ok = 0")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rejudge_args(&store.pool).await.unwrap(), 1);
+        let ok = |uid: String| {
+            let pool = store.pool.clone();
+            async move { judged_one(&pool, &uid).await.unwrap().unwrap().args_ok }
+        };
+        assert!(ok(ours).await);
+        assert!(!ok(own).await);
     }
 }
