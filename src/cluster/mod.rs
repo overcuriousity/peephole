@@ -548,18 +548,29 @@ impl Node {
             .map(|(_, _, addr)| addr)
     }
 
-    /// Whether this node can ask `id` an RPC: it dials it, or `id` speaks
-    /// routed RPC and a route avoiding members too old to relay it exists.
+    /// The address this node dials `id` at, unless dialling it failed last
+    /// time: its sync loop retries with backoff, and requests meanwhile go
+    /// through its outbox rather than wait out a timeout each.
+    pub fn working_dial_address(&self, id: &NodeId) -> Option<String> {
+        self.dial_address(id).filter(|_| !self.dial_failing(id))
+    }
+
+    /// Whether `id` speaks routed RPC and a route avoiding members too old
+    /// to relay it exists.
+    fn routed_callable(&self, id: &NodeId) -> bool {
+        self.members()
+            .get(id)
+            .is_some_and(|m| m.proto_max >= rpc::proto::ROUTED_PROTO)
+            && self.routable(
+                id,
+                &owner::cmd::old_relays(self, id, rpc::proto::ROUTED_PROTO),
+            )
+    }
+
+    /// Whether this node can ask `id` an RPC: it dials it (and that did not
+    /// fail last time), or it can route the request (see `call_any`).
     pub fn can_call(&self, id: &NodeId) -> bool {
-        self.dial_address(id).is_some()
-            || (self
-                .members()
-                .get(id)
-                .is_some_and(|m| m.proto_max >= rpc::proto::ROUTED_PROTO)
-                && self.routable(
-                    id,
-                    &owner::cmd::old_relays(self, id, rpc::proto::ROUTED_PROTO),
-                ))
+        self.working_dial_address(id).is_some() || self.routed_callable(id)
     }
 
     /// Enrichment providers this node can query right now.
@@ -893,7 +904,11 @@ impl Node {
         body: &Req,
         timeout: Duration,
     ) -> Result<Resp> {
-        if let Some(addr) = self.dial_address(&peer) {
+        // A member whose dial keeps failing is asked through its outbox
+        // when it can be; otherwise the dial is tried anyway.
+        if let Some(addr) = self.dial_address(&peer)
+            && (!self.dial_failing(&peer) || !self.routed_callable(&peer))
+        {
             return tokio::time::timeout(timeout, self.call(peer, &addr, path, body))
                 .await
                 .map_err(|_| {

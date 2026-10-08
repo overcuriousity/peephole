@@ -132,7 +132,7 @@ pub async fn draw(node: &Arc<Node>, mc: Mc) -> bool {
             continue;
         }
         // The transfer is an entry of the sibling's log: fetch it.
-        if let Some(addr) = node.dial_address(&from) {
+        if let Some(addr) = node.working_dial_address(&from) {
             let _ = crate::cluster::sync::reconcile(node, from, &addr, false).await;
         }
         missing = missing.saturating_sub(sent);

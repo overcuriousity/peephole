@@ -1657,6 +1657,27 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_member_whose_dial_fails_is_asked_through_its_outbox() {
+        let (_d, node) = test_node(0).await;
+        let x = Identity::generate().unwrap();
+        let mut m = info(x.id, "x");
+        m.address = Some("x.example.net:7443".into());
+        m.proto_max = super::super::rpc::proto::ROUTED_PROTO;
+        super::append(&node, &[Record::MemberAdd(m)]).await.unwrap();
+        assert!(node.can_call(&x.id));
+        assert!(node.working_dial_address(&x.id).is_some());
+
+        node.record_status(x.id, "x", Err("connection refused".into()))
+            .await;
+        assert_eq!(node.working_dial_address(&x.id), None);
+        // Neither dialled nor polling: nothing would answer an offer.
+        assert!(!node.can_call(&x.id));
+        // It polls its outbox here: asked that way.
+        node.status.touch_inbound(x.id);
+        assert!(node.can_call(&x.id));
+    }
+
     fn now_hlc(n: u64) -> u64 {
         (super::hlc::wall_ms() << 16) + n
     }

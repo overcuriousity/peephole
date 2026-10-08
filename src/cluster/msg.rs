@@ -367,7 +367,7 @@ impl Node {
 
     /// Whether dialling `id` failed last time (it is retried by its sync
     /// loop with backoff, not by every message).
-    fn dial_failing(&self, id: &NodeId) -> bool {
+    pub(crate) fn dial_failing(&self, id: &NodeId) -> bool {
         self.peer_status
             .read()
             .unwrap()

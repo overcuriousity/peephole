@@ -337,7 +337,7 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
     // So the offer is there before the request. A server nobody can dial
     // pulls it with its own long-poll.
     if server != me
-        && let Some(addr) = node.dial_address(&server)
+        && let Some(addr) = node.working_dial_address(&server)
         && let Err(e) = crate::cluster::sync::reconcile(node, server, &addr, false).await
     {
         tracing::debug!(
@@ -586,7 +586,7 @@ pub async fn offer_and_ask(
         // dial pushes its receipt with its own sync.
         if r.findings.is_empty()
             && r.charged_mc == 0
-            && let Some(addr) = node.dial_address(&server)
+            && let Some(addr) = node.working_dial_address(&server)
             && let Err(e) = crate::cluster::sync::reconcile(node, server, &addr, false).await
         {
             tracing::debug!(?e, "sync after a declined offer failed");

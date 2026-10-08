@@ -172,7 +172,7 @@ async fn offer_once(
     // the offer held is free for the next one. A scanner nobody can dial
     // pushes its receipt with its own sync.
     if matches!(resp, ProbeResp::Declined { .. })
-        && let Some(addr) = node.dial_address(&server)
+        && let Some(addr) = node.working_dial_address(&server)
         && let Err(e) = crate::cluster::sync::reconcile(node, server, &addr, false).await
     {
         tracing::debug!(?e, "sync after a declined probe offer failed");
