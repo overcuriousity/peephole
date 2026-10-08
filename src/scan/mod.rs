@@ -1,6 +1,7 @@
 pub mod arbiter;
 pub mod crawler;
 pub mod guard;
+pub mod handout;
 pub mod hostkeys;
 pub mod nmap_xml;
 pub mod order;
