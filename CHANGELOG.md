@@ -5,6 +5,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-08
+
 ### Added
 
 - RDAP. A free provider (`rdap`) asks the registries who holds the block an
@@ -98,7 +100,6 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   nodes only for the providers picked.
 - Nothing is burned any more: a payment moves its full price. Credits
   expire 7 days after their day.
-- Upgrade all nodes together: protocol 4 pays only between upgraded nodes.
 - Scan prices are per scanner. Each scanner's price follows its paid scans
   of the past hour against 90 % of its capacity; every node computes every
   scanner's price from the log and pays at most 1.25 times its own figure.
@@ -109,13 +110,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   jobs it buys elsewhere, without moving credits.
 - Fleets have no collecting node: every node keeps what it earns, and a
   lookup that needs more draws from the node's siblings, richest first.
-- Protocol 5: scan jobs are paid only between nodes on protocol 5; upgrade
-  all nodes together. Heartbeats carry `scan_budget_mc` and `scan_queued`;
-  `scan_bids` is gone.
-- Protocol 6: outbound-only members on protocol 6 answer paid lookups,
-  resolutions and probes through their outbox; nodes on earlier versions
-  are neither asked that way nor used to relay it. Upgrade all nodes
-  together.
+- Heartbeats carry `scan_budget_mc` and `scan_queued`; `scan_bids` is
+  gone.
 - Credits page: the scan tile shows this node's selling price, and a table
   lists every scanner's announced and reference price.
 - Host keys and certificates may come from a probe as well as a scan;
@@ -169,6 +165,25 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - GreyNoise Community enrichment. An existing `[greynoise]` section is ignored.
 - The manual "Retry failed" action on the Scans page; retries are
   automatic.
+
+### Upgrading
+
+- The cluster protocol goes from 3 to 6. Upgrade all members soon after
+  each other: credits move only between nodes on protocol 4 or later, scan
+  jobs are paid only between nodes on protocol 5 or later, and an
+  outbound-only member answers paid lookups, resolutions and probes only
+  once it and the node whose outbox it polls run protocol 6.
+- Migrations 0018–0024 run on the first start. Fleets keep no collecting
+  node: `credits.collect_to` is dropped, and every node keeps what it
+  earns.
+- `[greynoise]` sections are ignored and can be removed.
+- Existing installs keep their config; the installer's new questions apply
+  to first installs only. Scripts that install unattended: add `scanner`
+  to `PEEPHOLE_ROLES` to keep the scanner, set `PEEPHOLE_FRONT=remote` where
+  a preset `PEEPHOLE_TRUSTED_PROXIES` meant a proxy elsewhere, and set
+  `PEEPHOLE_CLUSTER_ADVERTISE` (required now unless the admin domain or a
+  public address gives a default). `PEEPHOLE_CLUSTER` and
+  `PEEPHOLE_ACME_EMAIL` are ignored.
 
 ## [0.7.0] - 2026-10-06
 
@@ -548,6 +563,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 First release.
 
+[0.8.0]: https://github.com/overcuriousity/peephole/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/overcuriousity/peephole/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/overcuriousity/peephole/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/overcuriousity/peephole/compare/v0.5.0...v0.5.1
