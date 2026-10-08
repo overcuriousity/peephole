@@ -505,7 +505,9 @@ mod tests {
             labels_json: "[]".into(),
             page_token: Some(uuid::Uuid::new_v4().to_string()),
             answer: Some(answer.into()),
-            decoy_v: answer.starts_with("decoy:").then_some(2),
+            decoy_v: answer
+                .starts_with("decoy:")
+                .then_some(crate::canary::DECOY_V),
             decoy_site: answer.starts_with("decoy:").then(|| "shop".to_string()),
             decoy_in: (!din.is_empty()).then(|| din.to_string()),
             ..Default::default()

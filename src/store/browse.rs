@@ -1713,17 +1713,19 @@ mod tests {
             .fetch_all(&s.pool)
             .await
             .unwrap();
-        for (id, name, agreed) in [
-            (ids[0], "crawl-1.googlebot.com", 1),
-            (ids[1], "xay.example.net", 0),
-            (ids[1], "xay.test", 1),
+        for (id, name, source, agreed) in [
+            (ids[0], "crawl-1.googlebot.com", "rdns", 1),
+            (ids[1], "xay.example.net", "rdns", 0),
+            (ids[1], "xay.test", "rdns", 1),
+            (ids[0], "mail.hoster.example", "ptr", 1),
         ] {
             sqlx::query(
                 "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen, agreed)
-                 VALUES (?, ?, 'rdns', '2026-10-08 10:00:00', '2026-10-08 10:00:00', ?)",
+                 VALUES (?, ?, ?, '2026-10-08 10:00:00', '2026-10-08 10:00:00', ?)",
             )
             .bind(id)
             .bind(name)
+            .bind(source)
             .bind(agreed)
             .execute(&s.pool)
             .await
@@ -1749,6 +1751,11 @@ mod tests {
             "disputed names do not count"
         );
         assert_eq!(n("xay", Audience::Admin).await, 1, "an agreed name matches");
+        assert_eq!(
+            n("hoster", Audience::Admin).await,
+            1,
+            "nmap's PTR names too"
+        );
         assert_eq!(
             n("x_y", Audience::Admin).await,
             0,

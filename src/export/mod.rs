@@ -1404,7 +1404,10 @@ mod tests {
             && k["fingerprint"].as_str().unwrap().starts_with("SHA256:")
             && k["port"].as_i64().is_some()));
         assert!(keys.iter().any(|k| k["kind"] == "tls-cert"));
-        assert!(keys[0].get("scan_id").is_none(), "internal id not exported");
+        assert!(
+            keys.iter().all(|k| k.get("scan_id").is_none()),
+            "internal id not exported"
+        );
     }
 
     /// An audit is exported as the auditor's scan, not as a second scan by

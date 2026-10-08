@@ -180,8 +180,7 @@ pub fn xml_args(xml: &[u8]) -> Option<String> {
                 }
                 return e.attributes().flatten().find_map(|a| {
                     (a.key.as_ref() == "args").then(|| {
-                        #[allow(deprecated)]
-                        a.unescape_value()
+                        a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                             .map(|c| c.into_owned())
                             .unwrap_or_else(|_| a.value.clone().into_owned())
                     })

@@ -180,8 +180,9 @@ returned it (`votes` of `answered`; `1` of `1` is a single, unverified
 resolver). Disputed addresses are not exported. `ptr`: the reverse name
 nmap reported in a scan of the address, as the address's own DNS claims it
 (`votes` and `answered` are 0). `rdns`: this node's reverse lookup of the
-address: a PTR name that resolves back to it (forward-confirmed). Each node
-looks up on its own, so two nodes' exports can differ here; `votes` and
+address: a PTR name that resolves back to it (forward-confirmed; names in
+special-use zones such as `.local`, `.internal` or `.test` are not looked
+up). Each node looks up on its own, so two nodes' exports can differ here; `votes` and
 `answered` are 0. Names are in ASCII form (`xn--` for
 international ones).
 
@@ -233,11 +234,13 @@ appended when more bytes are needed, and each byte mapped to
 | `db-password`, `redis-password`, `mail-password`, `admin-password` | 20 characters of `A–Za–z0–9` |
 | `git-token` | 40 lowercase hex characters |
 | `wp-session` | 43 characters of `A–Za–z0–9` (the token part of the WordPress login cookie) |
-| `etag` | 32 lowercase hex characters (decoy version 3: the `ETag` header of the web decoys answering 200; found again in `If-None-Match`) |
+| `etag` | hex of 16 bytes: 32 lowercase hex characters (decoy version 3: the `ETag` header of the web decoys answering 200; found again in `If-None-Match`) |
 
 `.env` carries `app-key`, the three passwords, `aws-key`, `aws-secret` and
 `admin-password`; `.git/config` carries `git-token`; `decoy:wp-login-ok`
-sets a cookie with `wp-session`.
+sets a cookie with `wp-session`. From version 3, the decoys `dotenv`,
+`git-config`, `git-head`, `wp-login`, `wp-login-failed`, `wp-admin`,
+`admin`, `phpinfo` and `git-refs` also carry an `etag`.
 
 The node's site is `<word>.internal`, where `word` is
 `WORDS[SHA-256("peephole-site-v1\0" || node_id)[0] mod 32]` (`node_id`

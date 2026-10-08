@@ -68,8 +68,8 @@ pub fn kind_name(kind: &str) -> &'static str {
 const MAX_PTR_NAMES: usize = 16;
 
 /// Read the identifiers out of a stored scan (zstd-compressed nmap XML)
-/// and mark the scan as read at `HOSTKEYS_V`. Unreadable XML yields none; only database
-/// errors fail.
+/// and mark the scan as read at `HOSTKEYS_V`. Unreadable XML yields none;
+/// only database errors fail.
 pub(crate) async fn derive(
     conn: &mut SqliteConnection,
     scan_id: i64,

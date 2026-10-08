@@ -98,8 +98,7 @@ fn text_attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
         .flatten()
         .find(|a| a.key.as_ref() == name)
         .map(|a| {
-            #[allow(deprecated)]
-            a.unescape_value()
+            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map(|c| c.into_owned())
                 .unwrap_or_else(|_| a.value.to_string())
         })
