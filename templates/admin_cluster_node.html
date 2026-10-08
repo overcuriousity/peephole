@@ -36,7 +36,7 @@
     <dt>History</dt><dd>{{ m.history }}</dd>
     {% if m.scanner %}<dt>Scans running</dt><dd>{{ m.active_scans }}</dd>{% endif %}
     {% for i in m.issues() %}<dt>Issue</dt><dd><span class="badge badge-status" data-status="running">{{ i }}</span></dd>{% endfor %}
-    {% if m.skew.is_some() %}<dt></dt><dd class="muted small">Run NTP on every node: scan cooldowns compare timestamps from different nodes.</dd>{% endif %}
+    {% if m.skew.is_some() %}<dt>Clock</dt><dd class="muted small">Run NTP on every node: scan cooldowns compare timestamps from different nodes.</dd>{% endif %}
   </dl>
 </section>
 <section class="card"><h2>Rules</h2>

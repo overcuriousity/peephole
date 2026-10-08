@@ -274,6 +274,17 @@ pub(crate) fn qs_without_page(pairs: &[(&str, Option<String>)]) -> String {
     out
 }
 
+/// The set fields of a filter, for hidden inputs that carry it through a
+/// form: the same pairs as the query string, so neither can miss a field.
+pub(crate) fn hidden_fields(
+    pairs: Vec<(&'static str, Option<String>)>,
+) -> Vec<(&'static str, String)> {
+    pairs
+        .into_iter()
+        .filter_map(|(k, v)| v.filter(|s| !s.is_empty()).map(|v| (k, v)))
+        .collect()
+}
+
 pub(crate) fn urlencode(s: &str) -> String {
     let mut o = String::new();
     for b in s.bytes() {
@@ -295,6 +306,8 @@ struct IpsPage {
     chips: Vec<Chip>,
     page: Arc<Page<IpSummary>>,
     qs: String,
+    /// The filter as hidden inputs for the bulk-delete forms.
+    hidden: Vec<(&'static str, String)>,
     /// Rows matching the filter across all pages; `Some` only with a session.
     bulk_total: Option<i64>,
     /// Admin on a standalone node: rows can be deleted.
@@ -520,6 +533,7 @@ async fn ips(
         chrome: Chrome::new(authed, "ips"),
         count_max,
         qs: ip_qs(&f),
+        hidden: hidden_fields(ip_pairs(&f)),
         chips: chips("/ips", &ip_pairs(&f)),
         f,
         page,
@@ -643,6 +657,8 @@ struct RequestsPage {
     shortcuts: Vec<Shortcut>,
     page: Page<RequestListRow>,
     qs: String,
+    /// The filter as hidden inputs for the bulk-delete forms.
+    hidden: Vec<(&'static str, String)>,
     bulk_total: Option<crate::store::browse::Count>,
     /// Standalone node: rows can be deleted.
     can_delete: bool,
@@ -670,6 +686,7 @@ async fn requests(
     render(&RequestsPage {
         chrome: Chrome::new(true, "requests"),
         chips: chips("/requests", &request_pairs(&f)),
+        hidden: hidden_fields(request_pairs(&f)),
         shortcuts: request_shortcuts(&f, chrono::Utc::now().naive_utc()),
         f,
         page,
@@ -840,6 +857,10 @@ fn api_fields(provider: &str) -> Option<Fields> {
 fn fact_text(key: &str, v: &serde_json::Value) -> String {
     use serde_json::Value;
     match v {
+        // A provider's RFC 3339 time, in the page's own form.
+        Value::String(s) if chrono::DateTime::parse_from_rfc3339(s).is_ok() => {
+            format!("{} UTC", crate::admin::views::minute(s.as_str()))
+        }
         Value::String(s) => s.clone(),
         Value::Bool(b) => if *b { "yes" } else { "no" }.to_string(),
         Value::Array(items) if key == "services" => items
@@ -1781,7 +1802,10 @@ show_labels = {show_labels}
         let (app, _d) = app(true).await;
         let html = get(&app, "/ip/203.0.113.9").await;
         assert!(html.contains("Tor exit list") && html.contains("MaxMind GeoLite2"));
-        assert_eq!(html.matches("No result yet").count(), 2);
+        // Providers without a result share one line, each named.
+        let pending = html.split("No result yet: ").nth(1).unwrap();
+        let pending = &pending[..pending.find('<').unwrap()];
+        assert_eq!(pending.split(", ").count(), 2, "{pending}");
     }
 
     fn row(provider: &str, data: &str, node: Option<&str>) -> IpIntelRow {
@@ -1861,6 +1885,21 @@ show_labels = {show_labels}
         );
         assert_eq!(f[0].value, "22/tcp OpenSSH 8.9p1 · 443/tcp");
         assert_eq!(f[1].value, "2: CVE-1, CVE-2");
+    }
+
+    #[test]
+    fn provider_timestamps_read_like_the_page() {
+        let f = intel_facts(
+            crate::intel::ABUSEIPDB,
+            &serde_json::json!({"last_reported_at": "2026-10-04T02:07:49+00:00"}),
+        );
+        assert_eq!(f[0].value, "2026-10-04 02:07 UTC");
+        // A plain date stays as it is.
+        let f = intel_facts(
+            crate::intel::RDAP,
+            &serde_json::json!({"registered": "2017-10-18"}),
+        );
+        assert_eq!(f[0].value, "2017-10-18");
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod earn;
 pub mod entries;
 pub mod fleet;
 pub mod gates;
+pub mod history;
 pub mod jobs;
 pub mod ledger;
 pub mod mint;

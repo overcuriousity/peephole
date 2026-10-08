@@ -256,6 +256,18 @@ pub struct CanaryQuery {
     pub ip: Option<String>,
 }
 
+impl CanaryQuery {
+    /// The filter without the range, ending in `&`: the range links keep it.
+    pub fn keep(&self) -> String {
+        crate::admin::public::qs_without_page(&[
+            ("kind", self.kind.clone()),
+            ("node", self.node.clone()),
+            ("source", self.source.clone()),
+            ("ip", self.ip.clone()),
+        ])
+    }
+}
+
 #[derive(Template)]
 #[template(path = "admin_canaries.html")]
 struct CanariesPage {

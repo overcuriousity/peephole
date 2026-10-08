@@ -442,6 +442,60 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
             .intel_set(&price_key(good), &mc.to_string())
             .await?;
     }
+    // The hour's snapshot for the Credits page: demand and supply per hour.
+    let per_hour = |n: f64| if hours > 0.0 { n / hours } else { 0.0 };
+    let mut goods: Vec<(&str, Option<u32>, f64, f64)> = offers
+        .iter()
+        .map(|o| {
+            (
+                o.provider.as_str(),
+                Some(o.price_mc),
+                per_hour(got(&o.provider)),
+                o.on_demand as f64 / 24.0,
+            )
+        })
+        .collect();
+    goods.push((SCAN, Some(scan_mc), bids as f64, capacity.per_day / 24.0));
+    goods.push((
+        RESOLVE,
+        Some(resolve_mc),
+        per_hour(got(RESOLVE)),
+        offer_per_day as f64 / 24.0,
+    ));
+    if let Some(pr) = node.prober() {
+        goods.push((
+            PROBE,
+            probe_mc,
+            per_hour(got(PROBE)),
+            pr.slots() as f64 * PROBES_PER_SLOT_HOUR,
+        ));
+    }
+    // Goods only members announce (a provider this node does not serve).
+    for g in announced.keys() {
+        if !goods.iter().any(|(x, ..)| x == g) {
+            goods.push((g.as_str(), None, 0.0, 0.0));
+        }
+    }
+    let hour = super::history::hour_of(crate::cluster::hlc::wall_ms());
+    let points: Vec<super::history::Point> = goods
+        .into_iter()
+        .map(|(good, own, demand, supply)| {
+            let (lo_mc, median_mc, hi_mc) = super::history::spread(&ann(good));
+            super::history::Point {
+                hour,
+                good: good.to_string(),
+                own_mc: own.map(i64::from),
+                lo_mc,
+                median_mc,
+                hi_mc,
+                demand,
+                supply,
+            }
+        })
+        .collect();
+    if let Err(e) = super::history::record(&node.store.pool, &points).await {
+        tracing::debug!(?e, "credits: price history not written");
+    }
     let table = Arc::new(Table {
         at_ms: crate::cluster::hlc::wall_ms(),
         capacity,

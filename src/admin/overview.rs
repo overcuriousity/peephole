@@ -249,8 +249,8 @@ async fn members(st: &AdminState, node: &crate::cluster::Node) -> AppResult<Vec<
 /// The "Cluster" row: every figure from this node's view, each linked to
 /// the page that breaks it down.
 pub struct ClusterFigures {
-    /// "11 of 12 members earn here".
-    pub conformity: String,
+    /// Members that earn here, of all active ones.
+    pub conformity: (usize, usize),
     /// The lowest rules agreement among members ("disagree on 3% of 500").
     pub lowest_agreement: String,
     /// Different rules fingerprints the members' newest requests carry.
@@ -275,6 +275,11 @@ pub struct ClusterFigures {
     /// served today.
     pub lookups: (String, i64),
     pub forks: usize,
+    /// This node's balance, or with an owner its nodes' together.
+    pub balance: String,
+    pub fleet: bool,
+    /// Of it, what expires today or tomorrow.
+    pub expiring_soon: String,
 }
 
 /// What lookups charged over the offers written since `from_ms`.
@@ -338,6 +343,14 @@ async fn cluster_figures(
     let tenth = |n: u64| format!("{:.1}", n as f64 / 7.0);
     let mut auditors = crate::cluster::owner::fleet::siblings(&node.store).await?;
     auditors.push(node.id());
+    // Balance of this node and its siblings, and what of it is about to go.
+    let balance: u64 = auditors.iter().map(|id| book.balance(id)).sum();
+    let expiring_soon: u64 = auditors
+        .iter()
+        .flat_map(|id| l.by_day(id))
+        .filter(|(day, _)| day + crate::credits::LOT_DAYS <= l.today + 2)
+        .map(|(_, mc)| mc)
+        .sum();
     let mut audits = (0, 0, 0);
     for c in crate::credits::audit::counts(&node.store.pool, week << 16).await? {
         if !auditors.contains(&c.auditor) {
@@ -386,7 +399,7 @@ async fn cluster_figures(
     .fetch_one(&st.store.read)
     .await?;
     Ok(ClusterFigures {
-        conformity: format!("{earning} of {} members earn here", active.len()),
+        conformity: (earning, active.len()),
         lowest_agreement: lowest,
         rule_sets: rule_sets.len(),
         circulating: show(l.circulating()),
@@ -395,8 +408,8 @@ async fn cluster_figures(
         expiring_today: show(active.iter().map(|m| l.expiring_today(&m.id)).sum::<u64>()),
         paid_scans: (tenth(low), tenth(high)),
         capacity: (
-            format!("{:.0}", t.capacity.per_day),
-            format!("{:.0}", t.capacity.used_per_day),
+            format!("{:.0}", t.capacity.per_day.max(0.0)),
+            format!("{:.0}", t.capacity.used_per_day.max(0.0)),
             format!(
                 "{:.0}",
                 (t.capacity.per_day - t.capacity.used_per_day).max(0.0)
@@ -412,6 +425,9 @@ async fn cluster_figures(
             .map(|(lo, hi)| (show(*lo as u64), show(*hi as u64))),
         lookups: (offered.to_string(), served_today),
         forks: crate::cluster::seal::forked(&node.store.pool).await?.len(),
+        balance: show(balance),
+        fleet: auditors.len() > 1,
+        expiring_soon: show(expiring_soon),
     })
 }
 

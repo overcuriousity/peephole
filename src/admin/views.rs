@@ -98,8 +98,15 @@ pub trait Stamp {
     fn utc(&self) -> Option<chrono::NaiveDateTime>;
 }
 impl Stamp for str {
+    /// SQLite's `YYYY-MM-DD HH:MM:SS`, or RFC 3339 (intel, scans).
     fn utc(&self) -> Option<chrono::NaiveDateTime> {
-        chrono::NaiveDateTime::parse_from_str(self, "%Y-%m-%d %H:%M:%S").ok()
+        chrono::NaiveDateTime::parse_from_str(self, "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .or_else(|| {
+                chrono::DateTime::parse_from_rfc3339(self)
+                    .ok()
+                    .map(|t| t.naive_utc())
+            })
     }
 }
 impl Stamp for String {
@@ -148,6 +155,18 @@ pub fn minute<S: Stamp>(ts: S) -> String {
     ts.utc()
         .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default()
+}
+
+/// `YYYY-MM-DD HH:MM` (UTC) for a summary time on admin pages; an
+/// unparsable value is shown as it is, a missing one as a dash.
+pub fn when(ts: Option<&str>) -> String {
+    match ts {
+        None => "—".into(),
+        Some(t) => match minute(t) {
+            m if m.is_empty() => t.to_string(),
+            m => m,
+        },
+    }
 }
 
 /// Longest path "Recent requests" shows, "…" included.
@@ -293,6 +312,13 @@ mod tests {
     fn minute_and_public_path() {
         assert_eq!(minute("2026-10-05 12:34:56"), "2026-10-05 12:34");
         assert_eq!(minute("garbage"), "");
+        // Intel and scan times come as RFC 3339.
+        assert_eq!(minute("2026-10-07T19:07:20Z"), "2026-10-07 19:07");
+        assert_eq!(minute("2026-10-04T02:07:49+00:00"), "2026-10-04 02:07");
+        assert_eq!(minute("2026-10-04T04:07:49+02:00"), "2026-10-04 02:07");
+        assert_eq!(when(Some("2026-10-07T19:07:20Z")), "2026-10-07 19:07");
+        assert_eq!(when(Some("soon")), "soon");
+        assert_eq!(when(None), "—");
         assert_eq!(public_path("/short"), "/short");
         let long = format!("/{}", "a".repeat(100));
         let cut = public_path(&long);

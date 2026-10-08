@@ -42,6 +42,23 @@ impl Target {
     pub fn probes_waiting(&self) -> bool {
         crate::admin::probes::any_waiting(&self.probes)
     }
+
+    pub fn signals(&self) -> Vec<crate::admin::signals::Signal> {
+        crate::admin::signals::of(&self.intel)
+    }
+
+    /// Providers without a result, as "A, B".
+    pub fn pending_intel(&self) -> String {
+        pending(self.intel.iter())
+    }
+}
+
+pub fn pending<'a>(cards: impl Iterator<Item = &'a IntelCard>) -> String {
+    cards
+        .filter(|c| c.newest.is_none())
+        .map(|c| c.label)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Load `ip`'s view. None: the address is in the table but has no

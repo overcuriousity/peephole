@@ -146,6 +146,84 @@ pub struct StoredView {
     pub age: String,
 }
 
+/// Where a provider card on the Lookup page comes from.
+pub enum GridSource {
+    /// Asked just now (paid, or free from this node).
+    Fresh,
+    /// An answer of the last 24 hours from the dataset, shown free.
+    Stored { provider: String, age: String },
+    /// What the dataset holds, however old; `newest` None: nothing yet.
+    Held,
+}
+
+pub struct GridCard {
+    pub card: IntelCard,
+    pub source: GridSource,
+}
+
+/// One card per provider: the fresh answer, else the stored one, else
+/// what the dataset holds. Providers in the dataset's order, then the
+/// rest; answered ones first, the rest are listed as waiting.
+pub fn merge_grid(
+    fresh: Vec<IntelCard>,
+    stored: Vec<StoredView>,
+    held: Vec<IntelCard>,
+) -> Vec<GridCard> {
+    let mut fresh: Vec<Option<IntelCard>> = fresh.into_iter().map(Some).collect();
+    let mut stored: Vec<Option<StoredView>> = stored.into_iter().map(Some).collect();
+    let mut take_fresh = |name: &str| {
+        fresh
+            .iter_mut()
+            .find(|c| c.as_ref().is_some_and(|c| c.name == name))
+            .and_then(Option::take)
+    };
+    let mut take_stored = |name: &str| {
+        stored
+            .iter_mut()
+            .find(|c| c.as_ref().is_some_and(|c| c.card.name == name))
+            .and_then(Option::take)
+    };
+    let mut out: Vec<GridCard> = held
+        .into_iter()
+        .map(|h| {
+            if let Some(mut f) = take_fresh(&h.name) {
+                f.others.extend(h.newest);
+                f.others.extend(h.others);
+                GridCard {
+                    card: f,
+                    source: GridSource::Fresh,
+                }
+            } else if let Some(s) = take_stored(&h.name) {
+                GridCard {
+                    card: s.card,
+                    source: GridSource::Stored {
+                        provider: s.provider,
+                        age: s.age,
+                    },
+                }
+            } else {
+                GridCard {
+                    card: h,
+                    source: GridSource::Held,
+                }
+            }
+        })
+        .collect();
+    out.extend(fresh.into_iter().flatten().map(|card| GridCard {
+        card,
+        source: GridSource::Fresh,
+    }));
+    out.extend(stored.into_iter().flatten().map(|s| GridCard {
+        card: s.card,
+        source: GridSource::Stored {
+            provider: s.provider,
+            age: s.age,
+        },
+    }));
+    out.sort_by_key(|g| g.card.newest.is_none());
+    out
+}
+
 /// The result for one address.
 pub struct LookupResult {
     pub ip: String,
@@ -153,16 +231,28 @@ pub struct LookupResult {
     pub target: Option<crate::admin::target::Target>,
     /// For an address the dataset does not hold: what is near it.
     pub near: Option<crate::admin::target::Neighbourhood>,
-    /// Provider answers from the dataset (under 24 hours old).
-    pub stored: Vec<StoredView>,
-    /// Answers asked for now, with the node that served and its charge.
-    pub cards: Vec<IntelCard>,
+    /// One card per provider: asked now, from the dataset under 24 hours,
+    /// or what the dataset holds (its Intelligence section, moved here).
+    pub grid: Vec<GridCard>,
+    /// Some provider was asked now.
+    pub asked: bool,
     /// `(node, charged)` for every node that charged something.
     pub charges: Vec<(String, String)>,
     /// `(provider label, node, why)` for every provider without an answer.
     pub declined: Vec<(String, String, String)>,
     /// A serving node kept the answers in the dataset.
     pub kept: bool,
+}
+
+impl LookupResult {
+    pub fn signals(&self) -> Vec<crate::admin::signals::Signal> {
+        crate::admin::signals::of(self.grid.iter().map(|g| &g.card))
+    }
+
+    /// Providers without a result, as "A, B".
+    pub fn pending(&self) -> String {
+        crate::admin::target::pending(self.grid.iter().map(|g| &g.card))
+    }
 }
 
 /// One address a name resolved to.
@@ -456,11 +546,11 @@ pub async fn run(
         }
     }
     // Cards only for providers that answered; the rest is listed below.
-    let cards = intel_cards(rows, true)
+    let cards: Vec<IntelCard> = intel_cards(rows, true)
         .into_iter()
         .filter(|c| c.newest.is_some())
         .collect();
-    let stored = out
+    let stored: Vec<StoredView> = out
         .stored
         .iter()
         .flat_map(|s| {
@@ -505,15 +595,20 @@ pub async fn run(
         Ok::<_, AppError>((target, near))
     }
     .await;
-    let (target, near) = held
+    let (mut target, near) = held
         .inspect_err(|e| tracing::warn!(?e, %ip, "lookup: dataset not read"))
+        .unwrap_or_default();
+    let asked = !cards.is_empty();
+    let held_cards = target
+        .as_mut()
+        .map(|t| std::mem::take(&mut t.intel))
         .unwrap_or_default();
     Ok(LookupResult {
         ip: ip.to_string(),
         target,
         near,
-        stored,
-        cards,
+        grid: merge_grid(cards, stored, held_cards),
+        asked,
         charges,
         declined,
         kept: out.kept,
@@ -584,6 +679,43 @@ async fn bulk_page(state: &AdminState, text: String) -> AppResult<Html<String>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn card(name: &str, answered: bool) -> IntelCard {
+        IntelCard {
+            label: "L",
+            name: name.into(),
+            newest: answered.then(|| crate::admin::public::IntelResult {
+                facts: vec![],
+                fetched_at: format!("{name}-at"),
+                source_version: None,
+                node: None,
+            }),
+            others: vec![],
+        }
+    }
+
+    #[test]
+    fn grid_prefers_fresh_then_stored_then_held() {
+        let held = vec![card("tor", true), card("rdap", true), card("shodan", false)];
+        let fresh = vec![card("rdap", true), card("abuse", true)];
+        let stored = vec![StoredView {
+            card: card("shodan", true),
+            provider: "shodan".into(),
+            age: "2 h".into(),
+        }];
+        let g = merge_grid(fresh, stored, held);
+        let names: Vec<_> = g.iter().map(|c| c.card.name.as_str()).collect();
+        assert_eq!(names, ["tor", "rdap", "shodan", "abuse"]);
+        assert!(matches!(g[0].source, GridSource::Held));
+        assert!(matches!(g[1].source, GridSource::Fresh));
+        // The held answer a fresh one replaces stays, as an older result.
+        assert_eq!(g[1].card.others.len(), 1);
+        assert!(matches!(&g[2].source, GridSource::Stored { age, .. } if age == "2 h"));
+        assert!(matches!(g[3].source, GridSource::Fresh));
+        // Answered first, then the providers without a result.
+        let g = merge_grid(vec![], vec![], vec![card("a", false), card("b", true)]);
+        assert_eq!(g[0].card.name, "b");
+    }
     use tower::ServiceExt;
 
     async fn app() -> (axum::Router, String, tempfile::TempDir) {

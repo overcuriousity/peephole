@@ -15,6 +15,7 @@
   <h2>Served</h2>
   <div class="table-wrap"><table class="table"><thead><tr><th>Kind</th><th>Value</th><th class="num">Uses</th><th></th></tr></thead><tbody>
   {% for c in served %}<tr><td>{{ c.kind }}</td><td class="mono wrap">{{ c.value }}</td><td class="num">{{ c.uses }}</td><td>{% if c.uses > 0 %}<a href="/admin/links/canary/{{ c.hash }}">graph</a>{% endif %}</td></tr>{% endfor %}
+  {% if served.is_empty() %}<tr><td colspan="4" class="empty">No canary served.</td></tr>{% endif %}
   </tbody></table></div>
 </section>
 <section class="card">
@@ -32,6 +33,7 @@
   <h2>IPs</h2>
   <div class="table-wrap"><table class="table"><thead><tr><th>IP</th><th class="num">Uses</th></tr></thead><tbody>
   {% for (ip, n) in ips %}<tr><td><a class="mono" href="/ip/{{ ip }}">{{ ip }}</a></td><td class="num">{{ n }}</td></tr>{% endfor %}
+  {% if ips.is_empty() %}<tr><td colspan="2" class="empty">None.</td></tr>{% endif %}
   </tbody></table></div>
 </section>{% endif %}
 </div>

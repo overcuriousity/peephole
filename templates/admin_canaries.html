@@ -3,7 +3,7 @@
 {% block content %}
 {% let sub = "links" %}{% include "_admin_nav.html" %}
 {% let subtab = "canaries" %}{% let tabs = crate::admin::views::LINKS_TABS %}{% let tabs_label = "Links pages" %}{% include "_subtabs.html" %}
-<div class="page-head"><div><h1>Canaries</h1><p class="muted">Credentials served in decoys and the requests that used them again. The period is when they were served.</p></div>{% let base = "/admin/links/canaries" %}{% include "_range.html" %}</div>
+<div class="page-head"><div><h1>Canaries</h1><p class="muted">Credentials served in decoys and the requests that used them again. The period is when they were served.</p></div>{% let base = "/admin/links/canaries" %}{% let keep = q.keep() %}{% include "_range.html" %}</div>
 <div class="stack">
 <div class="tiles kpis">
   <div class="tile"><span class="label">Served</span><div class="value">{{ crate::admin::views::thousands(sum.served) }}</div></div>
@@ -21,7 +21,7 @@
     <label>Node <input name="node" value="{{ q.node.as_deref().unwrap_or_default() }}"></label>
     <label>Source <select name="source"><option value="">any</option><option value="other"{% if q.source.as_deref() == Some("other") %} selected{% endif %}>different</option><option value="same"{% if q.source.as_deref() == Some("same") %} selected{% endif %}>same</option></select></label>
     <label>IP <input name="ip" value="{{ q.ip.as_deref().unwrap_or_default() }}"></label>
-    <button>Filter</button>
+    <button class="btn btn-primary" type="submit">Filter</button>
   </form>
   {% if reuses.is_empty() %}<p class="empty">No canary has been used again{% if range.since().is_some() %} in this period{% endif %}.</p>{% else %}
   <div class="table-wrap"><table class="table"><thead><tr><th>Harvested</th><th>Used</th><th>Kind</th><th>Canary</th><th>Where</th><th>Δt</th></tr></thead><tbody>

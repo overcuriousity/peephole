@@ -4,7 +4,7 @@
 {% let sub = "analytics" %}{% include "_admin_nav.html" %}
 <div class="page-head">
   <div><h1>Analytics</h1><p class="muted">{{ range.label() }} · canary reuse: <a href="/admin/links/canaries?range={{ range.key() }}">Canaries</a></p></div>
-  {% let base = "/admin/analytics" %}{% include "_range.html" %}
+  {% let base = "/admin/analytics" %}{% let keep = String::new() %}{% include "_range.html" %}
 </div>
 
 <div class="tiles">

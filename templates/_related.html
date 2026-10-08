@@ -1,4 +1,5 @@
 <div class="table-wrap"><table>
+  <thead><tr><th>Time (UTC)</th>{% if show_ip %}<th>IP</th>{% endif %}<th>Request</th><th>Sev</th></tr></thead>
   <tbody>
   {% for r in rows %}
     <tr data-sev="{{ r.severity }}">
@@ -8,6 +9,6 @@
       <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
     </tr>
   {% endfor %}
-  {% if rows.is_empty() %}<tr><td class="empty">None.</td></tr>{% endif %}
+  {% if rows.is_empty() %}<tr><td colspan="{% if show_ip %}4{% else %}3{% endif %}" class="empty">None.</td></tr>{% endif %}
   </tbody>
 </table></div>
