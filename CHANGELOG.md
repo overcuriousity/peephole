@@ -25,6 +25,14 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   the IP directory's new Name filter. `[enrichment] reverse_dns = false`
   turns it off.
 
+### Fixed
+
+- A node whose own rows were deleted by hand in the database stopped
+  serving its log at the first of them, and every member that joined
+  later stalled there and saw only that node. Such entries are now
+  written off as deleted (hourly, warning "own log entries had lost their
+  rows"), and new members sync past them.
+
 ## [0.9.0] - 2026-10-08
 
 ### Changed

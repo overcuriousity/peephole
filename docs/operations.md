@@ -351,6 +351,14 @@ default; `retention_days = N` (top level, at least 7) keeps only the last N
 days on this node: a standalone node deletes older requests and scan results,
 a cluster node drops its old copies and history (see docs/cluster.md).
 
+Never delete rows in the database by hand; delete in the admin area or set
+`retention_days`. A cluster node keeps its own requests, fingerprints and
+scan results only as rows and serves its log from them, so a row deleted by
+hand leaves an entry nobody can serve, and members that join later stop
+there. Within an hour the node writes such entries off as deleted (warning
+"own log entries had lost their rows"): the cluster then deletes those
+records everywhere, and new members sync past them.
+
 ### Public pages are delayed
 
 The wall, the IP directory, IP pages, `/api/stats`, `/api/map` and

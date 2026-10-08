@@ -1132,6 +1132,9 @@ async fn maintenance_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Rec
             if let Err(e) = repl::compact(&node).await {
                 warn!(?e, "log compaction failed");
             }
+            if let Err(e) = repl::write_off_lost(&node).await {
+                warn!(?e, "writing off entries without rows failed");
+            }
         }
         // Five minutes after start, then daily: drop history outside this
         // node's window (a no-op when it keeps everything).

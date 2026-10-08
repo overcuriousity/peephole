@@ -1298,6 +1298,85 @@ pub(crate) async fn reset_head(conn: &mut SqliteConnection, origin: &NodeId) -> 
     Ok(())
 }
 
+/// Setting that remembers the last [`write_off_lost`] that found anything:
+/// `"<count> <unix seconds>"`, for the Cluster page.
+pub const LOST_ROWS_KEY: &str = "repl.lost_rows";
+
+/// Records written off per tombstone.
+const LOST_CHUNK: usize = 500;
+
+/// This node's own row-backed entries whose row is gone although the entry
+/// gave up its payload for it: rows deleted outside peephole (by hand in the
+/// database). Nobody can serve such an entry any more, so every node that
+/// fetches this log from the start would stop at the first one for good.
+/// They are written off with a tombstone of their own, and served from then
+/// on like any deleted record (stub plus proof). Returns how many.
+pub async fn write_off_lost(node: &Node) -> Result<usize> {
+    let me = node.id();
+    // Candidates by a cheap anti-join; `rebuild` has the final word.
+    let mut candidates: Vec<(i64, String, String)> = vec![];
+    for (kind, table) in [
+        ("request", "requests"),
+        ("fingerprint", "fingerprints"),
+        ("scan_result", "scans"),
+        ("skip_batch", "skipped_batches"),
+    ] {
+        debug_assert!(ROW_BACKED.contains(&kind));
+        let sql = format!(
+            "SELECT l.seq, l.kind, l.uid FROM repl_log l
+             WHERE l.origin = ? AND l.kind = ? AND l.uid IS NOT NULL
+               AND l.payload IS NULL AND l.erased_by IS NULL
+               AND NOT EXISTS (SELECT 1 FROM {table} t JOIN ips i ON i.id = t.ip_id
+                               WHERE t.uid = l.uid)"
+        );
+        candidates.extend(
+            sqlx::query_as::<_, (i64, String, String)>(sqlx::AssertSqlSafe(sql))
+                .bind(&me.0[..])
+                .bind(kind)
+                .fetch_all(&node.store.pool)
+                .await?,
+        );
+    }
+    candidates.sort();
+    let mut lost: Vec<(String, u64)> = vec![];
+    {
+        let mut conn = node.store.pool.acquire().await?;
+        for (seq, kind, uid) in candidates {
+            if data::rebuild(&mut conn, &kind, &uid).await?.is_none() {
+                lost.push((uid, seq as u64));
+            }
+        }
+    }
+    if lost.is_empty() {
+        return Ok(0);
+    }
+    let records: Vec<Record> = lost
+        .chunks(LOST_CHUNK)
+        .map(|c| {
+            let (uids, seqs) = c.iter().cloned().unzip();
+            Record::Tombstone(super::record::TombstoneRec {
+                uid: format!("{}{}", me.uid_prefix(), data::new_uid()),
+                uids,
+                seqs,
+            })
+        })
+        .collect();
+    append(node, &records).await?;
+    warn!(
+        records = lost.len(),
+        first_seq = lost[0].1,
+        "own log entries had lost their rows (deleted outside peephole); written off as deleted so new members can sync"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    node.store
+        .setting_set(LOST_ROWS_KEY, &format!("{} {now}", lost.len()))
+        .await?;
+    Ok(lost.len())
+}
+
 /// Drop what is safe to drop: tombstones held as proofs that have since
 /// arrived in their origin's log (the log copy serves as proof). Returns
 /// how many rows went.
@@ -2160,6 +2239,88 @@ mod tests {
         assert_eq!(
             super::advertised(ours, &purged, &Default::default()),
             vec![(a, 5)]
+        );
+    }
+
+    /// A request row deleted by hand in the database (not through a
+    /// tombstone) left its entry with neither payload nor row: this node
+    /// stopped serving its own log there, and every member that joined
+    /// later stalled at it for good. The entry is written off as deleted
+    /// and the log behind it reaches a new member.
+    #[tokio::test]
+    async fn an_own_entry_whose_row_was_deleted_by_hand_is_written_off() {
+        let (_d, node) = test_node(0).await;
+        let own = |n: u32, path: &str| {
+            Record::Request(Box::new(super::super::record::RequestRec {
+                uid: format!("{}{n}", node.id().uid_prefix()),
+                ts: "2026-10-01 00:00:00".into(),
+                ip: "203.0.113.20".into(),
+                method: "GET".into(),
+                path: path.into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            }))
+        };
+        super::append(&node, &[own(1, "/lost"), own(2, "/after")])
+            .await
+            .unwrap();
+        let (lost_seq, no_payload): (i64, bool) = sqlx::query_as(
+            "SELECT seq, payload IS NULL FROM repl_log WHERE uid = ? AND kind = 'request'",
+        )
+        .bind(format!("{}1", node.id().uid_prefix()))
+        .fetch_one(&node.store.pool)
+        .await
+        .unwrap();
+        assert!(no_payload, "the row carries it");
+        sqlx::query("DELETE FROM requests WHERE path = '/lost'")
+            .execute(&node.store.pool)
+            .await
+            .unwrap();
+        let served = |node: std::sync::Arc<super::Node>| async move {
+            super::entries_after(&node.store, &[(node.id(), 0)], 0, 100, 1 << 20)
+                .await
+                .unwrap()
+        };
+        let before = served(node.clone()).await;
+        assert!(
+            before.entries.iter().all(|e| (e.seq as i64) < lost_seq),
+            "serving stops at the lost entry"
+        );
+
+        assert_eq!(super::write_off_lost(&node).await.unwrap(), 1);
+        assert_eq!(super::write_off_lost(&node).await.unwrap(), 0, "once");
+        assert!(
+            node.store
+                .setting_get(super::LOST_ROWS_KEY)
+                .await
+                .unwrap()
+                .is_some_and(|v| v.starts_with("1 "))
+        );
+
+        let batch = served(node.clone()).await;
+        let stub = batch
+            .entries
+            .iter()
+            .find(|e| e.seq as i64 == lost_seq)
+            .expect("served now");
+        assert!(stub.payload.is_none() && stub.erased_by.is_some());
+        assert_eq!(batch.proofs.len(), 1, "with its tombstone");
+
+        // A member joining now takes the whole log.
+        let (_d2, joiner) = test_node(0).await;
+        super::append(&joiner, &[Record::MemberAdd(info(node.id(), "n"))])
+            .await
+            .unwrap();
+        let st = super::apply_batch(&joiner, batch).await.unwrap();
+        assert_eq!(st.rejected, 0, "{st:?}");
+        assert_eq!(paths(&joiner).await, ["/after"]);
+        let head = super::heads(&joiner.store).await.unwrap();
+        let ours = super::heads(&node.store).await.unwrap();
+        assert_eq!(
+            head.iter().find(|h| h.0 == node.id()),
+            ours.iter().find(|h| h.0 == node.id()),
+            "caught up"
         );
     }
 }
