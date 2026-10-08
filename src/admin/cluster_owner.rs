@@ -108,10 +108,21 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
     let (mut nodes, mut others) = (vec![], vec![]);
     if owned.is_some() {
         nodes.push(row(&me));
+        // Candidates to claim: active, not blocked, and on a version that
+        // knows ownership.
+        let rows = node.members();
+        let claimable = |m: &MemberView| {
+            m.active
+                && !m.blocked
+                && NodeId::parse(&m.key).is_ok_and(|id| {
+                    rows.get(&id)
+                        .is_some_and(|r| r.proto_max >= crate::cluster::rpc::proto::OWNER_PROTO)
+                })
+        };
         for m in &members {
             if sibs.contains(&m.key) {
                 nodes.push(row(m));
-            } else {
+            } else if claimable(m) {
                 others.push(row(m));
             }
         }

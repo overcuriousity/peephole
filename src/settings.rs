@@ -216,6 +216,8 @@ pub struct Settings {
     changed: tokio::sync::watch::Sender<u64>,
     /// Serializes writers in this process.
     lock: Arc<tokio::sync::Mutex<()>>,
+    /// A role override was ignored and said so (once, not every reload).
+    warned_ignored: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn defaults(cfg: &Config) -> Snapshot {
@@ -240,6 +242,7 @@ impl Settings {
             version: Arc::new(AtomicU64::new(0)),
             changed: tokio::sync::watch::channel(0).0,
             lock: Default::default(),
+            warned_ignored: Default::default(),
         }
     }
 
@@ -308,10 +311,13 @@ impl Settings {
             (&mut all.web, s.roles.web, &self.prereqs.web),
         ] {
             if *want == Some(true) && !on && missing.is_some() {
-                tracing::warn!(
-                    why = missing.as_deref().unwrap_or_default(),
-                    "a stored role override is ignored"
-                );
+                // Reloaded every few seconds: say it once per process.
+                if !self.warned_ignored.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        why = missing.as_deref().unwrap_or_default(),
+                        "a stored role override is ignored (peephole settings reset to drop it)"
+                    );
+                }
                 *want = None;
             }
         }

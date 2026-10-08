@@ -640,7 +640,7 @@ impl Config {
         if self.cluster.as_ref().is_some_and(|c| c.remote_config) {
             notes.push(
                 "note: `cluster.remote_config` is ignored: config keys were replaced by the \
-                 ownership key (peephole owner new, peephole owner adopt); remove the key"
+                 ownership key (peephole owner new, peephole owner claim); remove the key"
                     .into(),
             );
         }
@@ -886,7 +886,7 @@ impl Config {
             for p in &c.peers {
                 crate::cluster::identity::NodeId::parse(&p.public_key)
                     .with_context(|| format!("cluster.peers `{}`: public_key", p.name))?;
-                if !crate::cluster::members::valid_address(&p.address) {
+                if !p.address.contains(':') {
                     bail!("cluster.peers `{}`: address must be host:port", p.name);
                 }
             }

@@ -3751,11 +3751,13 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
     let html = text(&admin_a, page_a.clone()).await;
     assert!(!html.contains("peephole-own1:"), "shown once");
     assert!(html.contains("the key is kept here"), "{html}");
-    // b is a member, not claimed yet: listed with how to claim it.
-    assert!(
-        html.contains("Other members") && html.contains("node-bravo"),
-        "{html}"
-    );
+    // b is a member, not claimed yet: listed with how to claim it (once
+    // it described itself: its version knows ownership).
+    eventually("a lists b as a member to claim", || async {
+        let html = text(&admin_a, page_a.clone()).await;
+        html.contains("Other members") && html.contains("node-bravo")
+    })
+    .await;
     // A second create does not replace the owner.
     let before = owner::load(&na.store, a.id).await.unwrap().unwrap().id;
     admin_a

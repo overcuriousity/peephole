@@ -83,6 +83,16 @@ has_role() { [[ ",${PEEPHOLE_ROLES}," == *",$1,"* ]]; }
 # TLS for unknown names through to the trap (which reads the handshake
 # itself): a trap behind a local proxy.
 stream_trap() { has_role listener && [ "${PEEPHOLE_LOCAL_PROXY:-0}" = 1 ]; }
+# The wildcard address for a listener on both families: [::] takes IPv4
+# too (as ::ffff:a.b.c.d) where the kernel has IPv6 and does not make
+# IPv6 sockets IPv6-only by default (net.ipv6.bindv6only); 0.0.0.0 else.
+any_addr() {
+    if [ -e /proc/net/if_inet6 ] && [ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 0)" = 0 ]; then
+        echo "[::]"
+    else
+        echo 0.0.0.0
+    fi
+}
 # Where nginx itself terminates TLS for the admin domain behind the stream
 # config (claimed with the node's ports, so the admin listener avoids it).
 NGINX_ADMIN_TLS="127.0.0.1:8444"
@@ -118,6 +128,17 @@ port_in_use() {
 port_holder() {
     command -v ss >/dev/null 2>&1 || return 0
     ss -Htlnp "sport = :$1" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)",pid=\([0-9]*\).*/\1 (pid \2)/p' | head -1
+}
+
+# Whether nginx holds <port>: ss names it, or (without ss) nginx runs.
+nginx_holds() {
+    local holder
+    holder="$(port_holder "$1")"
+    if [ -n "$holder" ]; then
+        [[ "$holder" == nginx* ]]
+    else
+        pgrep -x nginx >/dev/null 2>&1
+    fi
 }
 
 valid_ipv4() {
@@ -901,9 +922,7 @@ if [ "$upgrade" -ne 1 ]; then
     has_role listener || has_role scanner || has_role web || die "enable at least one of trap, scanner and web interface"
     # Without the question (preset roles, no terminal), the warning still.
     if [ -n "$CLOUD" ] && has_role scanner && [ -z "$ROLE_SCANNER" ]; then warn "$cloud_warning"; fi
-    # [::] takes IPv4 too (as ::ffff:a.b.c.d) on a dual-stack host.
-    trap_any=0.0.0.0
-    [ ! -e /proc/net/if_inet6 ] || trap_any="[::]"
+    trap_any="$(any_addr)"
     TRAP_LISTEN="${trap_any}:8080"
     TRAP_TLS_LISTEN="${trap_any}:8081"
     ADMIN_LISTEN="127.0.0.1:8443"
@@ -1077,7 +1096,15 @@ if [ "$upgrade" -ne 1 ]; then
         done
         # nginx's own TLS listener for the admin domain first: the admin
         # listener, moved off a busy 8443, must not land on it.
-        if stream_trap; then claim_port NGINX_ADMIN_TLS "nginx TLS listener of the admin domain" 1; fi
+        # Held by nginx already (other sites moved behind the stream config,
+        # or an earlier setup): that is where it belongs.
+        if stream_trap; then
+            if port_in_use 127.0.0.1 "${NGINX_ADMIN_TLS##*:}" && nginx_holds "${NGINX_ADMIN_TLS##*:}"; then
+                CLAIMED_PORTS+="${NGINX_ADMIN_TLS##*:} "
+            else
+                claim_port NGINX_ADMIN_TLS "nginx TLS listener of the admin domain" 1
+            fi
+        fi
         claim_port ADMIN_LISTEN "admin listener" 1
         # Password sign-in besides passkeys. The password never enters the
         # config (no toml_safe): it reaches `peephole admin password --stdin`
@@ -1171,9 +1198,7 @@ if [ "$upgrade" -ne 1 ]; then
         PEEPHOLE_CLUSTER_ADVERTISE=""
     done
     listen_preset="${PEEPHOLE_CLUSTER_LISTEN:-}"
-    # Both address families where the kernel has IPv6 ([::] takes IPv4 too).
-    listen_any=0.0.0.0
-    [ ! -e /proc/net/if_inet6 ] || listen_any="[::]"
+    listen_any="$(any_addr)"
     PEEPHOLE_CLUSTER_LISTEN="${PEEPHOLE_CLUSTER_LISTEN:-${listen_any}:$((10#${PEEPHOLE_CLUSTER_ADVERTISE##*:}))}"
     claim_port PEEPHOLE_CLUSTER_LISTEN "cluster RPC listener" 1 "; or set PEEPHOLE_CLUSTER_LISTEN to another address"
     # A listener moved to the next free port is published on that port.
