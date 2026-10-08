@@ -135,25 +135,40 @@ pub(crate) async fn derive(
     Ok(())
 }
 
-/// Read the scans stored before `host_keys` existed, by an older build
-/// sharing the database, or by an older parser. A batch at a time; returns how many were read.
-pub(crate) async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
+/// Scans read per write transaction by [`backfill`].
+const BACKFILL_BATCH: i64 = 50;
+/// Pause between [`backfill`]'s transactions, so the trap's and
+/// replication's writes get the lock in between.
+const BACKFILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Read the scans whose `keys_parsed` is below `below`: stored before
+/// `host_keys` existed, by an older build sharing the database, or by an
+/// older parser. Walks the table once by id, a short transaction per batch
+/// with a pause after it. Returns how many were read.
+pub async fn backfill(pool: &sqlx::SqlitePool, below: i64) -> Result<u64> {
     let mut done = 0;
+    let mut after = 0i64;
     loop {
-        let rows: Vec<(i64, i64, Option<Vec<u8>>)> =
-            sqlx::query_as("SELECT id, ip_id, raw_xml FROM scans WHERE keys_parsed < ? LIMIT 50")
-                .bind(HOSTKEYS_V)
-                .fetch_all(pool)
-                .await?;
-        if rows.is_empty() {
+        let rows: Vec<(i64, i64, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT id, ip_id, raw_xml FROM scans WHERE keys_parsed < ? AND id > ?
+             ORDER BY id LIMIT ?",
+        )
+        .bind(below)
+        .bind(after)
+        .bind(BACKFILL_BATCH)
+        .fetch_all(pool)
+        .await?;
+        let Some((last, _, _)) = rows.last() else {
             return Ok(done);
-        }
-        let mut tx = pool.begin().await?;
+        };
+        after = *last;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         for (id, ip_id, xml) in &rows {
             derive(&mut tx, *id, *ip_id, xml.as_deref()).await?;
         }
         tx.commit().await?;
         done += rows.len() as u64;
+        tokio::time::sleep(BACKFILL_PAUSE).await;
     }
 }
 
@@ -312,7 +327,7 @@ mod tests {
             .execute(&s.pool)
             .await
             .unwrap();
-        backfill(&s.pool).await.unwrap();
+        backfill(&s.pool, HOSTKEYS_V).await.unwrap();
         assert_eq!(s.names_for_ip(ip.id).await.unwrap().len(), 1);
     }
 
@@ -335,9 +350,43 @@ mod tests {
             .execute(&s.pool)
             .await
             .unwrap();
-        assert_eq!(backfill(&s.pool).await.unwrap(), 1);
+        assert_eq!(backfill(&s.pool, HOSTKEYS_V).await.unwrap(), 1);
         assert_eq!(s.host_keys_for_scan(id).await.unwrap().len(), 5);
-        assert_eq!(backfill(&s.pool).await.unwrap(), 0, "each scan once");
+        assert_eq!(
+            backfill(&s.pool, HOSTKEYS_V).await.unwrap(),
+            0,
+            "each scan once"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_reads_only_scans_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let s = Store::connect(&path).await.unwrap();
+        let xml = include_bytes!("../../tests/fixtures/nmap-hostkeys.xml");
+        let (old, never) = (
+            scan(&s, "192.0.2.7", xml).await,
+            scan(&s, "192.0.2.8", xml).await,
+        );
+        for (id, v) in [(old, 1), (never, 0)] {
+            sqlx::query("UPDATE scans SET keys_parsed = ? WHERE id = ?")
+                .bind(v)
+                .bind(id)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        s.pool.close().await;
+        s.read.close().await;
+        // The version reparse is left to the backfill task.
+        let s = Store::connect(&path).await.unwrap();
+        let v: Vec<i64> = sqlx::query_scalar("SELECT keys_parsed FROM scans ORDER BY id")
+            .fetch_all(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(v, vec![1, HOSTKEYS_V]);
+        assert_eq!(backfill(&s.pool, HOSTKEYS_V).await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -377,8 +426,12 @@ mod tests {
             .execute(&s.pool)
             .await
             .unwrap();
-        assert_eq!(backfill(&s.pool).await.unwrap(), 1);
-        assert_eq!(backfill(&s.pool).await.unwrap(), 0, "each scan once");
+        assert_eq!(backfill(&s.pool, HOSTKEYS_V).await.unwrap(), 1);
+        assert_eq!(
+            backfill(&s.pool, HOSTKEYS_V).await.unwrap(),
+            0,
+            "each scan once"
+        );
         let rows = s.host_keys_for_scan(id).await.unwrap();
         assert_eq!(
             rows.iter().filter(|r| r.kind == HTTP_ETAG).count(),

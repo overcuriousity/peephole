@@ -242,6 +242,18 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             }
         }
     });
+    // Host keys of scans read by an older parser (HOSTKEYS_V); new scans
+    // are read as stored.
+    tokio::spawn({
+        let pool = store.pool.clone();
+        async move {
+            match store::hostkeys::backfill(&pool, scan::hostkeys::HOSTKEYS_V).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(scans = n, "host keys: read stored scans again"),
+                Err(e) => tracing::warn!(error = %e, "host keys: backfill failed"),
+            }
+        }
+    });
     // JA4H of rows stored before this build; new rows get it as written.
     tokio::spawn({
         let pool = store.pool.clone();

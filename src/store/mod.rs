@@ -106,7 +106,9 @@ impl Store {
             .with_context(|| path.display().to_string())?;
         migrate(&pool, MIGRATIONS).await?;
         backfill_ip_keys(&pool).await?;
-        hostkeys::backfill(&pool).await?;
+        // Scans never read at all (stored before `host_keys`); a newer
+        // parser's reparse runs as a task once the node serves.
+        hostkeys::backfill(&pool, 1).await?;
         let search = ensure_search_index(&pool).await;
         let read_opts = SqliteConnectOptions::new()
             .filename(path)
