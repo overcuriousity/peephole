@@ -54,7 +54,9 @@ export PEEPHOLE_SKIP_APT=1 PEEPHOLE_SKIP_HEALTH=1 BASE_URL="http://127.0.0.1:899
 export MAXMIND_ACCOUNT_ID=1 MAXMIND_LICENSE_KEY=k PEEPHOLE_DOMAIN=peephole.test PEEPHOLE_TRUSTED_PROXIES=10.0.0.0/8
 # Every node publishes a cluster address; the wizard runs unset it and answer.
 export PEEPHOLE_CLUSTER_ADVERTISE=node.test:7443
-NODE_NAME="$(hostname -s 2>/dev/null || hostname)"
+NODE_NAME="$(hostname -s 2>/dev/null || hostname 2>/dev/null || uname -n)"
+# The cluster listener's default address: both families where IPv6 is on.
+if [ -e /proc/net/if_inet6 ]; then LISTEN_ANY='[::]'; else LISTEN_ANY=0.0.0.0; fi
 # CI runs in a cloud: its metadata service would add a question to the wizard.
 export PEEPHOLE_METADATA=0
 
@@ -92,7 +94,7 @@ echo "== the cluster advertise address is host:port with a port 1-65535"
 for a in node.example:7443 '[2001:db8::1]:7443' 203.0.113.5:7443; do
     [ "$(bash install.sh --check-advertise "$a")" = ok ] || { echo "advertise '$a' refused"; exit 1; }
 done
-for a in bogus host:0 host:70000 host: :7443 '2001:db8::1:7443' 'two words:7443'; do
+for a in bogus host:0 host:70000 host: :7443 '2001:db8::1:7443' 'two words:7443' 'a/b:80' '[::]:80' '[:]:80'; do
     if bash install.sh --check-advertise "$a" 2>/dev/null; then echo "advertise '$a' accepted"; exit 1; fi
 done
 
@@ -166,7 +168,7 @@ grep -q 'ssl_reject_handshake on' /etc/peephole/nginx.example.conf
 # Every node has a cluster section: named after the machine, the listener on the advertised port.
 grep -q '^\[cluster\]' /etc/peephole/config.toml
 grep -q "^node_name = \"${NODE_NAME}\"" /etc/peephole/config.toml
-grep -q '^listen = "0.0.0.0:7443"' /etc/peephole/config.toml
+grep -qxF "listen = \"${LISTEN_ANY}:7443\"" /etc/peephole/config.toml
 grep -q '^advertise = "node.test:7443"' /etc/peephole/config.toml
 
 echo "== re-run is a no-op"
@@ -285,7 +287,7 @@ fi
 # the listener on its port; the token question names the later command.
 grep -q "^node_name = \"${NODE_NAME}\"" /etc/peephole/config.toml
 grep -q '^advertise = "trap1.example:7443"' /etc/peephole/config.toml
-grep -q '^listen = "0.0.0.0:7443"' /etc/peephole/config.toml
+grep -qxF "listen = \"${LISTEN_ANY}:7443\"" /etc/peephole/config.toml
 grep -q 'peephole cluster join' /tmp/wizard1.log
 if grep -q 'Take part in a cluster' /tmp/wizard1.log; then echo "the cluster question is still asked"; exit 1; fi
 grep -q '^api_key = "abuse-key-1"' /etc/peephole/config.toml
@@ -364,7 +366,7 @@ env -u MAXMIND_ACCOUNT_ID -u MAXMIND_LICENSE_KEY -u PEEPHOLE_DOMAIN -u PEEPHOLE_
     PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard4.log 2>&1 || { cat /tmp/wizard4.log; exit 1; }
 if grep -q 'already up to date' /tmp/wizard4.log; then echo "re-run after a failed first install skipped the wizard"; exit 1; fi
 grep -q '^node_name = "scanner-9"' /etc/peephole/config.toml
-grep -q '^listen = "0.0.0.0:7443"' /etc/peephole/config.toml
+grep -qxF "listen = \"${LISTEN_ANY}:7443\"" /etc/peephole/config.toml
 grep -q '^advertise = "scan9.example:7443"' /etc/peephole/config.toml
 # The InternetDB question was not answered: its default (yes) applies.
 grep -q '^\[internetdb\]' /etc/peephole/config.toml
@@ -688,6 +690,6 @@ env -u PEEPHOLE_CLUSTER_ADVERTISE PEEPHOLE_ROLES=listener,web PEEPHOLE_FRONT=loc
     bash install.sh > /tmp/advertise-default.log 2>&1 || { cat /tmp/advertise-default.log; exit 1; }
 grep -q '^\[cluster\]' /etc/peephole/config.toml
 grep -q '^advertise = "peephole.test:7443"' /etc/peephole/config.toml
-grep -q '^listen = "0.0.0.0:7443"' /etc/peephole/config.toml
+grep -qxF "listen = \"${LISTEN_ANY}:7443\"" /etc/peephole/config.toml
 grep -q 'other members dial peephole.test:7443' /tmp/advertise-default.log
 echo "== ok"

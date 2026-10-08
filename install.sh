@@ -28,11 +28,13 @@
 #   PEEPHOLE_ROLES     comma-separated subset of listener,scanner,web (asked when a terminal is
 #                      present; listener,web when there is none: the scanner is opt-in)
 #   PEEPHOLE_CLUSTER           ignored (every node has a [cluster] section; alone until it joins)
-#   PEEPHOLE_CLUSTER_NAME      this node's name in the cluster (first install; default: hostname -s)
+#   PEEPHOLE_CLUSTER_NAME      this node's name in the cluster (first install; default: the short
+#                              host name)
 #   PEEPHOLE_CLUSTER_ADVERTISE host:port other members dial, port 1-65535 (first install;
 #                              required: default <admin domain>:7443 with the web role unless
 #                              PEEPHOLE_FRONT=remote, else <public address>:7443 when one is known)
-#   PEEPHOLE_CLUSTER_LISTEN    RPC listener (default 0.0.0.0:<advertise port>)
+#   PEEPHOLE_CLUSTER_LISTEN    RPC listener (default [::]:<advertise port> with IPv6, else
+#                              0.0.0.0:<advertise port>)
 #   PEEPHOLE_JOIN_TOKEN        invite from an existing member; joined before the first start
 #   PEEPHOLE_REMOTE_CONFIG     ignored (config keys were replaced by the ownership key: peephole owner adopt)
 #   PEEPHOLE_ADMIN_PASSWORD  also allow signing in to the admin site with this password, at
@@ -150,11 +152,19 @@ if [ "${1:-}" = "--check-domain" ]; then
     echo "'${2:-}' is not a host name" >&2; exit 1
 fi
 
+# Characters (not bytes) in $1, as peephole counts a password's length.
+char_count() { local LC_ALL=C.UTF-8; printf '%s' "${#1}"; }
+
 # The address other members dial: host:port, an IPv6 address in brackets,
 # with a port 1-65535.
 valid_advertise() {
     local port
-    [[ "$1" =~ ^[^[:space:]:]+:[0-9]{1,5}$ || "$1" =~ ^\[[0-9a-fA-F:]+\]:[0-9]{1,5}$ ]] || return 1
+    if [[ "$1" =~ ^\[[0-9a-fA-F:]+\]:[0-9]{1,5}$ ]]; then
+        # Not all colons: [::] is no address to dial.
+        [[ "${1%:*}" =~ [0-9a-fA-F] ]] || return 1
+    else
+        [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?:[0-9]{1,5}$ ]] || return 1
+    fi
     port=$((10#${1##*:}))
     [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
@@ -988,6 +998,16 @@ if [ "$upgrade" -ne 1 ]; then
                         fi
                         proxies="${proxies:+$proxies,}${a}"
                     done
+                    # A /0 prefix believes every client about its own address.
+                    if [ -z "$bad" ] && [[ ",${proxies}," == */0,* ]]; then
+                        if [ -n "$proxies_preset" ] || [ "$INTERACTIVE" -ne 1 ]; then
+                            warn "PEEPHOLE_TRUSTED_PROXIES: a /0 prefix trusts every address: any client can set its own address"
+                        else
+                            say $'A /0 prefix trusts every address: any client can set its own address.\n'
+                            PEEPHOLE_TRUSTED_PROXIES=""
+                            continue
+                        fi
+                    fi
                     [ -z "$bad" ] && [ -n "$proxies" ] && break
                     [ -n "$bad" ] || bad="$PEEPHOLE_TRUSTED_PROXIES"
                     if [ -n "$proxies_preset" ] || [ "$INTERACTIVE" -ne 1 ]; then
@@ -1063,7 +1083,7 @@ if [ "$upgrade" -ne 1 ]; then
                     say "Again: "
                     IFS= read -rs p2 <&3 || [ -n "$p2" ] || die "no admin password given"
                     say $'\n'
-                    if [ "${#p1}" -lt 12 ]; then say $'Too short.\n'; continue; fi
+                    if [ "$(char_count "$p1")" -lt 12 ]; then say $'Too short.\n'; continue; fi
                     [ "$p1" = "$p2" ] || { say $'They differ.\n'; continue; }
                     PEEPHOLE_ADMIN_PASSWORD="$p1"
                     break
@@ -1071,8 +1091,10 @@ if [ "$upgrade" -ne 1 ]; then
                 unset p1 p2
             fi
         fi
-        if [ -n "${PEEPHOLE_ADMIN_PASSWORD:-}" ] && [ "${#PEEPHOLE_ADMIN_PASSWORD}" -lt 12 ]; then
-            die "PEEPHOLE_ADMIN_PASSWORD: at least 12 characters"
+        if [ -n "${PEEPHOLE_ADMIN_PASSWORD:-}" ]; then
+            # One line reaches `--stdin`: a line break would cut it short.
+            [[ "$PEEPHOLE_ADMIN_PASSWORD" != *$'\n'* ]] || die "PEEPHOLE_ADMIN_PASSWORD: no line breaks"
+            [ "$(char_count "$PEEPHOLE_ADMIN_PASSWORD")" -ge 12 ] || die "PEEPHOLE_ADMIN_PASSWORD: at least 12 characters"
         fi
     fi
     # nginx is set up only where it fronts something peephole serves: the
@@ -1111,7 +1133,7 @@ if [ "$upgrade" -ne 1 ]; then
     fi
     # Every node is in a cluster: one without peers and without an invite
     # runs alone. PEEPHOLE_CLUSTER is ignored.
-    prompt PEEPHOLE_CLUSTER_NAME "This node's name (other operators see it in their admin area)" "$(hostname -s 2>/dev/null || hostname)"
+    prompt PEEPHOLE_CLUSTER_NAME "This node's name (other operators see it in their admin area)" "$(hostname -s 2>/dev/null || hostname 2>/dev/null || uname -n)"
     # The admin domain points here unless a proxy elsewhere fronts it;
     # otherwise the public address (interface, metadata, the answer about
     # addresses no interface shows).
@@ -1137,7 +1159,10 @@ if [ "$upgrade" -ne 1 ]; then
         PEEPHOLE_CLUSTER_ADVERTISE=""
     done
     listen_preset="${PEEPHOLE_CLUSTER_LISTEN:-}"
-    PEEPHOLE_CLUSTER_LISTEN="${PEEPHOLE_CLUSTER_LISTEN:-0.0.0.0:$((10#${PEEPHOLE_CLUSTER_ADVERTISE##*:}))}"
+    # Both address families where the kernel has IPv6 ([::] takes IPv4 too).
+    listen_any=0.0.0.0
+    [ ! -e /proc/net/if_inet6 ] || listen_any="[::]"
+    PEEPHOLE_CLUSTER_LISTEN="${PEEPHOLE_CLUSTER_LISTEN:-${listen_any}:$((10#${PEEPHOLE_CLUSTER_ADVERTISE##*:}))}"
     claim_port PEEPHOLE_CLUSTER_LISTEN "cluster RPC listener" 1 "; or set PEEPHOLE_CLUSTER_LISTEN to another address"
     # A listener moved to the next free port is published on that port.
     if [ -z "$listen_preset" ] && [ "${PEEPHOLE_CLUSTER_LISTEN##*:}" != "$((10#${PEEPHOLE_CLUSTER_ADVERTISE##*:}))" ]; then
@@ -1146,7 +1171,7 @@ if [ "$upgrade" -ne 1 ]; then
     fi
     # A running daemon picks a later join up by itself (it rereads the
     # members the CLI wrote).
-    prompt_optional PEEPHOLE_JOIN_TOKEN "Invite token from a member (empty to start alone; join later with: peephole cluster join <token>)"
+    prompt_optional PEEPHOLE_JOIN_TOKEN "Invite token from a member (join later with: peephole cluster join <token>)"
     toml_safe "${PEEPHOLE_JOIN_TOKEN:-}"
     prompt_optional MAXMIND_ACCOUNT_ID "MaxMind GeoLite2 account ID (https://www.maxmind.com/en/accounts/current/license-key; optional: in a cluster the lookups of a member with credentials are shared, the databases are not)"
     if [ -n "${MAXMIND_ACCOUNT_ID:-}" ]; then
@@ -1158,7 +1183,7 @@ if [ "$upgrade" -ne 1 ]; then
         say $'\nOptional threat-intel APIs. Every one is optional: leave it empty to skip it. Keys stay on this\nnode; in a cluster the lookup results are shared, so one key serves every member.\n'
     fi
     prompt_optional ABUSEIPDB_API_KEY "AbuseIPDB API key (https://www.abuseipdb.com/account/api; abuse reports per IP, free plan 1000 checks/day)"
-    prompt_optional SHODAN_API_KEY "Shodan API key (https://account.shodan.io; over the free InternetDB it adds product and version per port, OS, organisation, ISP, ASN, domains, IPv6 and the latest crawl instead of a weekly snapshot; host lookups need a membership or paid plan)"
+    prompt_optional SHODAN_API_KEY "Shodan API key (https://account.shodan.io; over the free InternetDB it adds product and version per port, OS, organisation, ISP, ASN, domains, IPv6 and the latest crawl (dated) instead of a weekly snapshot; commercial use as your plan allows; host lookups need a membership or paid plan)"
     ask_yn PEEPHOLE_INTERNETDB "Use Shodan InternetDB (no key; ports, tags and CVEs, weekly data; free for non-commercial use only)?" "$([ "$INTERACTIVE" -eq 1 ] && echo y || echo n)"
     # Values that arrived preset from the environment were not checked by a prompt.
     toml_safe "${PEEPHOLE_DOMAIN:-}"; toml_safe "${PEEPHOLE_TRUSTED_PROXIES:-}"
