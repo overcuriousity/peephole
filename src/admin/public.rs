@@ -365,6 +365,7 @@ pub(crate) fn public_ip_filter(f: &IpFilter, show_labels: bool) -> IpFilter {
         port: None,
         product: None,
         os: None,
+        name: None,
     }
 }
 
@@ -385,6 +386,7 @@ fn ip_pairs(f: &IpFilter) -> Vec<(&'static str, Option<String>)> {
         ("port", f.port.clone()),
         ("product", f.product.clone()),
         ("os", f.os.clone()),
+        ("name", f.name.clone()),
     ]
 }
 
@@ -483,6 +485,7 @@ fn filter_label(k: &str) -> &'static str {
         "port" => "Open port",
         "product" => "Product",
         "os" => "OS guess",
+        "name" => "Name",
         _ => "Filter",
     }
 }

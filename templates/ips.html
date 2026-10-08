@@ -20,6 +20,7 @@
   <label>Open port <input name="port" size="7" value="{{ f.port.as_deref().unwrap_or_default() }}" placeholder="22/tcp"></label>
   <label>Product <input name="product" size="14" value="{{ f.product.as_deref().unwrap_or_default() }}"></label>
   <label>OS guess <input name="os" size="12" value="{{ f.os.as_deref().unwrap_or_default() }}"></label>
+  <label>Name <input name="name" size="14" value="{{ f.name.as_deref().unwrap_or_default() }}" placeholder="example.net"></label>
   <label>Not yet by <select name="nointel"><option value="">any</option>{% for (n, l) in api_providers %}<option value="{{ n }}"{% if f.nointel.as_deref() == Some(n) %} selected{% endif %}>{{ l }}</option>{% endfor %}</select></label>
   {% endif %}
   <label>Sort <select name="sort">

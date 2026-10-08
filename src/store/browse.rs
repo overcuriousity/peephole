@@ -83,6 +83,9 @@ pub struct IpFilter {
     pub product: Option<String>,
     /// Admin only: nmap's OS guess in any stored scan.
     pub os: Option<String>,
+    /// Admin only: an agreed name of the address (looked up, PTR or
+    /// reverse DNS) contains this text.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -488,6 +491,14 @@ fn ip_filter_sql(f: &IpFilter, a: Audience) -> Option<IpFilterSql> {
                 "EXISTS (SELECT 1 FROM scans s WHERE s.ip_id = i.id AND s.os_guess = ?)".into(),
             );
             binds.push(v);
+        }
+        if let Some(v) = nonempty(&f.name) {
+            wheres.push(
+                "EXISTS (SELECT 1 FROM ip_names n WHERE n.ip_id = i.id AND n.agreed = 1
+                   AND n.name LIKE ? ESCAPE '\\')"
+                    .into(),
+            );
+            binds.push(format!("%{}%", like_escape(&v.to_ascii_lowercase())));
         }
     }
     let where_sql = if wheres.is_empty() {
@@ -1693,6 +1704,44 @@ mod tests {
             all,
             "admin only"
         );
+    }
+
+    #[tokio::test]
+    async fn ips_are_found_by_name_for_the_admin_only() {
+        let s = seeded().await;
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM ips ORDER BY id LIMIT 2")
+            .fetch_all(&s.pool)
+            .await
+            .unwrap();
+        for (id, name, agreed) in [
+            (ids[0], "crawl-1.googlebot.com", 1),
+            (ids[1], "xay.example.net", 0),
+        ] {
+            sqlx::query(
+                "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen, agreed)
+                 VALUES (?, ?, 'rdns', '2026-10-08 10:00:00', '2026-10-08 10:00:00', ?)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(agreed)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let n = |name: &str, a: Audience| {
+            let s = s.clone();
+            let f = IpFilter {
+                name: Some(name.into()),
+                ..Default::default()
+            };
+            async move { s.list_ips_as(&f, a).await.unwrap().items.len() }
+        };
+        assert_eq!(n("googlebot", Audience::Admin).await, 1);
+        assert_eq!(n("GoogleBot", Audience::Admin).await, 1, "names are lower-case");
+        assert_eq!(n("example.net", Audience::Admin).await, 0, "disputed names do not count");
+        assert_eq!(n("x_y", Audience::Admin).await, 0, "LIKE wildcards are literal");
+        let all = s.list_ips_as(&IpFilter::default(), Audience::Public).await.unwrap().items.len();
+        assert_eq!(n("googlebot", Audience::Public).await, all, "admin only");
     }
 
     #[tokio::test]
