@@ -123,9 +123,6 @@ pub struct Status {
     /// The node's credits as it counts them itself, in mc.
     #[serde(default)]
     pub balance_mc: u64,
-    /// Where it forwards its credits (a node key), if anywhere.
-    #[serde(default)]
-    pub collect_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -304,7 +301,6 @@ async fn status_of(node: &Node, settings: &Settings) -> Result<Status> {
             .await
             .map(|b| b.balance(&node.id()))
             .unwrap_or(0),
-        collect_to: settings.snapshot().collect_to.map(|id| id.to_string()),
     })
 }
 

@@ -98,6 +98,21 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Nothing is burned any more: a payment moves its full price. Credits
   expire 7 days after their day.
 - Upgrade all nodes together: protocol 4 pays only between upgraded nodes.
+- Scan prices are per scanner. Each scanner's price follows its paid scans
+  of the past hour against 90 % of its capacity; every node computes every
+  scanner's price from the log and pays at most 1.25 times its own figure.
+- The arbiter hands each scan job to the cheapest scanner asking. Scanners
+  ask arbiters that can pay first; a scanner over its hourly capacity or
+  delivering under half of its recent grants goes last.
+- A node's own scan jobs are funded from the same `scan_share` budget as
+  jobs it buys elsewhere, without moving credits.
+- Fleets have no collecting node: every node keeps what it earns, and a
+  lookup that needs more draws from the node's siblings, richest first.
+- Protocol 5: scan jobs are paid only between nodes on protocol 5; upgrade
+  all nodes together. Heartbeats carry `scan_budget_mc` and `scan_queued`;
+  `scan_bids` is gone.
+- Credits page: the scan tile shows this node's selling price, and a table
+  lists every scanner's announced and reference price.
 - Host keys and certificates may come from a probe as well as a scan;
   `host_keys` is rebuilt with a nullable `scan_id` (migration 0018).
 - The README's "escalate by scope, never by speed" rule now says it
@@ -144,6 +159,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Removed
 
+- `credits.collect_to`, the setting and the "Collect credits here" action
+  on the Ownership page.
 - GreyNoise Community enrichment. An existing `[greynoise]` section is ignored.
 - The manual "Retry failed" action on the Scans page; retries are
   automatic.

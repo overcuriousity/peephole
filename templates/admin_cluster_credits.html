@@ -9,7 +9,7 @@
 <div class="tiles kpis market-kpis">
   <div class="tile"><span class="label">In circulation</span><div class="value">{{ totals.1 }}</div><div class="hint">credits · {{ totals.0 }} earned in 7 days</div></div>
   <div class="tile"><span class="label">Minted today</span><div class="value">{{ accruing.0 }}<span class="of"> scans</span></div><div class="hint">counted for this node so far · split when the day ends (UTC)</div></div>
-  <div class="tile"><span class="label">Scan price</span><div class="value">{{ price.scan }}{% if let Some((c, trend)) = scan_change %} <span class="delta-chip" data-trend="{{ trend }}">{{ c }}</span>{% endif %}</div><div class="hint">a funded job · {{ price.scan_bids }} waiting</div></div>
+  <div class="tile"><span class="label">Scan price</span><div class="value">{{ price.scan }}{% if let Some((c, trend)) = scan_change %} <span class="delta-chip" data-trend="{{ trend }}">{{ c }}</span>{% endif %}</div><div class="hint">{% if price.scan == "–" %}not a scanner{% else %}its selling price · {{ price.scan_paid }} paid of {{ price.scan_target }} an hour{% endif %}</div></div>
   <div class="tile"><span class="label">Scan capacity used</span><div class="value">{{ price.utilization }}<span class="of"> %</span></div><svg class="meter" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true"><rect class="track" width="100" height="4" rx="2"/><rect class="fill" width="{{ price.utilization }}" height="4" rx="2"/></svg><div class="hint">{{ price.capacity_per_hour }} scans an hour possible</div></div>
 </div>
 <section class="card market" id="market">
@@ -25,9 +25,9 @@
   {% endif %}
 </section>
 <section class="card"><div class="card-head"><h2>What things cost here</h2></div>
-  <p class="muted">Each price follows demand and supply: it rises when more is asked than this node offers, and falls when less is asked. What this node answers itself is free.</p>
+  <p class="muted">Each price follows demand and supply: it rises when more is asked than this node offers, and falls when less is asked. What this node answers itself is free, though its own scan jobs use up its scan budget.</p>
   <ul>
-    <li>A funded scan job costs <b>{{ price.scan }}</b> credits here ({{ price.scan_bids }} funded jobs waiting; the scanners do {{ price.capacity_per_hour }} an hour, {{ price.utilization }} % used).</li>
+    <li>This node sells a funded scan job for <b>{{ price.scan }}</b> credits; each scanner prices itself by how busy it is with paid work ({{ price.capacity_per_hour }} scans an hour possible here, {{ price.utilization }} % used).</li>
     {% if let Some(p) = price.probe %}<li>A probe for another member costs <b>{{ p }}</b> credits here.</li>{% endif %}
     <li>Resolving a name costs <b>{{ price.resolve }}</b> credits here.</li>
   </ul>
@@ -44,6 +44,11 @@
     </tr>{% endfor %}</tbody>
   </table></div>
   {% endif %}
+  {% if !price.scanners.is_empty() %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Scanner</th><th class="num">Announces</th><th class="num">Reference here</th><th class="num">Paid / target an hour</th></tr></thead>
+    <tbody>{% for s in price.scanners %}<tr><td>{{ s.0 }}</td><td class="num">{{ s.1 }}</td><td class="num">{{ s.2 }}</td><td class="num">{{ s.3 }}</td></tr>{% endfor %}</tbody>
+  </table></div>{% endif %}
   {% if !price.offers.is_empty() %}
   <div class="table-wrap"><table>
     <thead><tr><th>Provider served here</th><th class="num">Price (credits)</th><th class="num">Paid lookups a day</th></tr></thead>
@@ -87,10 +92,10 @@
   {% if let Some((_, nodes)) = fleet %}
 <div class="ledger-part"><h3>My nodes</h3>
   <div class="table-wrap"><table>
-    <thead><tr><th>Node</th><th class="num">Credits</th><th>Collects</th></tr></thead>
-    <tbody>{% for n in nodes %}<tr><td><b>{{ n.name }}</b></td><td class="num">{{ n.balance }}</td><td>{{ n.collects }}</td></tr>{% endfor %}</tbody>
+    <thead><tr><th>Node</th><th class="num">Credits</th></tr></thead>
+    <tbody>{% for n in nodes %}<tr><td><b>{{ n.name }}</b></td><td class="num">{{ n.balance }}</td></tr>{% endfor %}</tbody>
   </table></div>
-  <p class="muted small">One node can collect what the others earn (<a href="/admin/cluster/ownership">Ownership</a> › Collect credits here); each of them draws from it when a lookup needs more than it holds.</p>
+  <p class="muted small">Every node keeps what it earns. A node whose lookup needs more than it holds draws the rest from the others, the richest first.</p>
 </div>
 {% endif %}
   <details class="ledger-more"><summary>Earned, spent, sent and received</summary>

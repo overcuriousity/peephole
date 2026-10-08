@@ -29,6 +29,11 @@ const MAX_ROUNDS: usize = 3;
 /// balance, and the fleet's behind it.
 pub(crate) const RETRY_AT_MOST: Mc = 2;
 
+/// Whether a member announcing `proto_max` sells scan jobs at its own price.
+pub fn sells_scans(proto_max: u32) -> bool {
+    proto_max >= crate::cluster::rpc::proto::SCAN_PRICE_PROTO
+}
+
 /// Whether a member announcing `proto_max` counts balances as this node does.
 pub fn pays_with(proto_max: u32) -> bool {
     proto_max >= crate::cluster::rpc::proto::MARKET_PROTO
@@ -299,8 +304,7 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
         .await
         .map_err(|e| format!("this node could not read its books: {e:#}"))?;
     if book.ledger.spendable_parts(&me, total_mc).is_none() {
-        // The fleet's balance sits at its collecting node: draw what is
-        // missing, then look again.
+        // Draw what is missing from the siblings, the richest first.
         let missing = total_mc.saturating_sub(book.balance(&me));
         if super::fleet::draw(node, missing).await
             && let Ok(b) = super::book_fresh(node).await
@@ -716,6 +720,7 @@ mod tests {
                     >= crate::cluster::rpc::proto::MARKET_PROTO
             )
         };
+        assert_eq!(crate::cluster::rpc::proto::SCAN_PRICE_PROTO, 5);
         assert!(!pays_with(3));
         assert!(pays_with(4));
     }

@@ -267,7 +267,8 @@ pub struct ClusterFigures {
     pub capacity: (String, String, String, String),
     /// Counted audits of 7 days: agrees, differs, inconclusive.
     pub audits: (u32, u32, u32),
-    /// What a funded scan job costs here.
+    /// This node's selling price of a funded scan job; a dash when it
+    /// does not scan.
     pub scan: String,
     /// Lowest and highest announced price of a keyed provider.
     pub price_range: Option<(String, String)>,
@@ -417,7 +418,7 @@ async fn cluster_figures(
             format!("{:.0}", t.capacity.utilization * 100.0),
         ),
         audits,
-        scan: show(t.scan_mc as u64),
+        scan: t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64)),
         price_range: keyed
             .iter()
             .min()
