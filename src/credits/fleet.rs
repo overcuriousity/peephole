@@ -116,7 +116,11 @@ pub async fn draw(node: &Arc<Node>, mc: Mc) -> bool {
     let mut missing = mc;
     for from in draw_order(&siblings, |s| book.balance(s)) {
         let ask = missing.min(book.balance(&from));
-        let avoid = crate::cluster::owner::cmd::old_relays(node, &from);
+        let avoid = crate::cluster::owner::cmd::old_relays(
+            node,
+            &from,
+            crate::cluster::rpc::proto::OWNER_PROTO,
+        );
         let sent = match node
             .request_avoiding(from, Msg::CreditDraw { mc: ask }, DRAW_WAIT, avoid)
             .await

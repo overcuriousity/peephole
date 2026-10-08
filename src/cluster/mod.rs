@@ -548,6 +548,20 @@ impl Node {
             .map(|(_, _, addr)| addr)
     }
 
+    /// Whether this node can ask `id` an RPC: it dials it, or `id` speaks
+    /// routed RPC and a route avoiding members too old to relay it exists.
+    pub fn can_call(&self, id: &NodeId) -> bool {
+        self.dial_address(id).is_some()
+            || (self
+                .members()
+                .get(id)
+                .is_some_and(|m| m.proto_max >= rpc::proto::ROUTED_PROTO)
+                && self.routable(
+                    id,
+                    &owner::cmd::old_relays(self, id, rpc::proto::ROUTED_PROTO),
+                ))
+    }
+
     /// Enrichment providers this node can query right now.
     pub fn providers(&self) -> Vec<String> {
         self.providers.read().unwrap().clone()
@@ -882,7 +896,18 @@ impl Node {
         if let Some(addr) = self.dial_address(&peer) {
             return tokio::time::timeout(timeout, self.call(peer, &addr, path, body))
                 .await
-                .map_err(|_| anyhow::anyhow!("{path}: no answer within {timeout:?}"))?;
+                .map_err(|_| {
+                    anyhow::Error::new(msg::NoAnswer(timeout)).context(path.to_string())
+                })?;
+        }
+        let members = self.members();
+        if let Some(m) = members.get(&peer)
+            && m.proto_max < rpc::proto::ROUTED_PROTO
+        {
+            bail!(
+                "{path}: {} runs a version that cannot be asked through its outbox",
+                m.name
+            );
         }
         let bytes = rpc::cbor::encode(body)?;
         if !rpc::routed::fits(&bytes) {
@@ -895,7 +920,12 @@ impl Node {
             path: path.into(),
             body: serde_bytes::ByteBuf::from(bytes),
         };
-        match self.request(peer, msg, timeout).await? {
+        let avoid = owner::cmd::old_relays(self, &peer, rpc::proto::ROUTED_PROTO);
+        let answer = self
+            .request_avoiding(peer, msg, timeout, avoid)
+            .await
+            .with_context(|| path.to_string())?;
+        match answer {
             msg::Msg::RpcReply { body, .. } if !rpc::routed::fits(&body) => bail!(
                 "{path}: reply larger than {} bytes",
                 rpc::routed::MAX_ROUTED_BODY

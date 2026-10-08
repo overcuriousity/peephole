@@ -83,7 +83,7 @@ pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
     let members = node.members();
     for id in node.live_members(crate::intel::LIVE_WINDOW) {
         let Some(m) = members.get(&id) else { continue };
-        if id == me || node.is_blocked(&id) || !pays_with(m.proto_max) {
+        if id == me || node.is_blocked(&id) || !pays_with(m.proto_max) || !node.can_call(&id) {
             continue;
         }
         let Some(k) = node.status.known(&id) else {
@@ -300,6 +300,11 @@ pub async fn accept_offer(
 /// number.
 pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Result<u64, String> {
     let me = node.id();
+    // Checked before the offer is written: an offer nobody can be asked
+    // to serve would stay held for 15 minutes.
+    if server != me && !node.can_call(&server) {
+        return Err("the node cannot be reached from here".into());
+    }
     let mut book = super::book_fresh(node)
         .await
         .map_err(|e| format!("this node could not read its books: {e:#}"))?;
@@ -571,7 +576,7 @@ pub async fn offer_and_ask(
         );
         let r = match call.await {
             Ok(r) => r,
-            Err(e) if format!("{e:#}").contains("no answer") => {
+            Err(e) if e.downcast_ref::<crate::cluster::msg::NoAnswer>().is_some() => {
                 return decline("did not answer in time".into());
             }
             Err(e) => return decline(format!("could not be asked: {e:#}")),
@@ -721,6 +726,13 @@ mod tests {
             )
         };
         assert_eq!(crate::cluster::rpc::proto::SCAN_PRICE_PROTO, 5);
+        assert_eq!(crate::cluster::rpc::proto::ROUTED_PROTO, 6);
+        const {
+            assert!(
+                crate::cluster::rpc::proto::PROTO_VERSION
+                    >= crate::cluster::rpc::proto::ROUTED_PROTO
+            )
+        };
         assert!(!pays_with(3));
         assert!(pays_with(4));
     }

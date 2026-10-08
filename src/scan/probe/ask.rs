@@ -42,8 +42,9 @@ fn price_at(node: &Node, id: &NodeId) -> Option<u32> {
     node.status.known(id)?.hb.probe_price_mc
 }
 
-/// The address this node dials `id` at, when that is an IP; for a member
-/// nobody can dial, the first public address it announces.
+/// The address this node dials `id` at, when that is an IP; otherwise
+/// (dialled by name, or nobody can dial it) the first public address it
+/// announces.
 fn dialled_ip(node: &Node, id: &NodeId) -> Option<IpAddr> {
     node.dial_address(id)
         .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
@@ -57,7 +58,7 @@ pub fn vantages(node: &Node, geo: &SharedGeo) -> Vec<Vantage> {
     let me = node.id();
     let mut out = vec![];
     for id in node.live_members(crate::intel::LIVE_WINDOW) {
-        if id != me && node.is_blocked(&id) {
+        if id != me && (node.is_blocked(&id) || !node.can_call(&id)) {
             continue;
         }
         let Some(price_mc) = price_at(node, &id) else {
@@ -162,7 +163,7 @@ async fn offer_once(
     );
     let resp = match call.await {
         Ok(r) => r,
-        Err(e) if format!("{e:#}").contains("no answer") => {
+        Err(e) if e.downcast_ref::<crate::cluster::msg::NoAnswer>().is_some() => {
             return refused("did not answer in time".into());
         }
         Err(e) => return refused(format!("could not be asked: {e:#}")),

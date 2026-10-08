@@ -606,16 +606,17 @@ async fn send(
         cmd: serde_bytes::ByteBuf::from(bytes),
         sig: serde_bytes::ByteBuf::from(sig),
     };
-    node.request_avoiding(target, msg, TIMEOUT, old_relays(node, &target))
+    node.request_avoiding(target, msg, TIMEOUT, old_relays(node, &target, OWNER_PROTO))
         .await
 }
 
-/// Members that cannot pass an owner message on: a node cannot read, and
-/// so cannot relay, a kind of message it does not know.
-pub(crate) fn old_relays(node: &Node, target: &NodeId) -> Vec<NodeId> {
+/// Members below `min_proto` cannot pass a message of that version on: a
+/// node cannot read, and so cannot relay, a kind of message it does not
+/// know. Known limit: the avoid list steers only the first hop.
+pub(crate) fn old_relays(node: &Node, target: &NodeId, min_proto: u32) -> Vec<NodeId> {
     node.members()
         .iter()
-        .filter(|(id, m)| *id != target && m.proto_max < OWNER_PROTO)
+        .filter(|(id, m)| *id != target && m.proto_max < min_proto)
         .map(|(id, _)| *id)
         .collect()
 }

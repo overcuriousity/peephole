@@ -5408,6 +5408,113 @@ async fn an_unreachable_outbound_only_server_releases_the_offer() {
     assert_eq!(lapsed.balance(&a.id), minted(8, 8));
 }
 
+/// An outbound-only member older than routed RPC cannot be asked through
+/// its outbox: it is offered for nothing, a call to it fails at once, and
+/// no offer is written for it.
+#[tokio::test]
+async fn an_old_outbound_only_member_is_not_asked() {
+    use peephole::cluster::rpc::proto;
+    use peephole::credits::{entries, pay, price};
+    use peephole::intel::dns;
+    use peephole::intel::lookup::{LookupReq, LookupResp};
+    use peephole::scan::probe::ask;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[],
+        Opts {
+            proto: Some((proto::PROTO_MIN, proto::ROUTED_PROTO - 1)),
+            advertise: false,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let token = invite::create(&na, &Default::default()).await.unwrap();
+    invite::join(&nb, &token).await.unwrap();
+    eventually("b long-polls a", || async {
+        na.node.status.polled_recently(&b.id)
+    })
+    .await;
+    assert!(na.node.dial_address(&b.id).is_none());
+    let target = probe_target().await;
+    probes(&nb, target);
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    let table = price::refresh(&nb.node).await.unwrap();
+    let probe_mc = nb.prober().unwrap().price(&table);
+    market_known(&na, b.id).await;
+    nb.refresh_heartbeat();
+    price_seen(&na, b.id, "abuseipdb").await;
+    eventually("a hears b's probe and resolution prices", || async {
+        na.status
+            .known(&b.id)
+            .is_some_and(|k| k.hb.probe_price_mc == Some(probe_mc))
+            && dns::resolver_price(&na.node, &b.id).is_some()
+    })
+    .await;
+    assert_eq!(
+        na.members().get(&b.id).map(|m| m.proto_max),
+        Some(proto::ROUTED_PROTO - 1)
+    );
+    assert!(!na.node.can_call(&b.id));
+
+    let none: peephole::intel::Providers = vec![];
+    let quoted = pay::quotes(&na.node, &none);
+    assert!(
+        quoted.values().flatten().all(|q| q.server != b.id),
+        "{quoted:?}"
+    );
+    let geo: peephole::intel::SharedGeo = Default::default();
+    let resolvers = dns::choose(&na.node, &Default::default(), &geo);
+    assert!(resolvers.iter().all(|r| r.id != b.id));
+    assert!(ask::vantages(&na.node, &geo).iter().all(|v| v.node != b.id));
+
+    let req = LookupReq {
+        ip: "203.0.113.80".into(),
+        providers: vec![],
+        offer_seq: None,
+    };
+    let started = std::time::Instant::now();
+    let err = na
+        .node
+        .call_any::<_, LookupResp>(b.id, "/rpc/v1/lookup", &req, Duration::from_secs(20))
+        .await
+        .unwrap_err();
+    let err = format!("{err:#}");
+    assert!(started.elapsed() < Duration::from_secs(2), "{err}");
+    assert!(err.contains("cannot be asked through its outbox"), "{err}");
+    assert!(!err.contains("no answer"), "{err}");
+
+    let ip = "203.0.113.80".parse().unwrap();
+    peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
+    dns::lookup(&rec(&na), &geo, "1.0x1").await.unwrap();
+    assert_eq!(entries::since(&na.store.pool, 0).await.unwrap().len(), 0);
+}
+
+/// A routed request too large for a message is refused before it is sent.
+#[tokio::test]
+async fn an_oversized_routed_call_is_refused_before_sending() {
+    use peephole::intel::lookup::{LookupReq, LookupResp};
+    let (_a, b, na, _nb) = outbound_pair().await;
+    let req = LookupReq {
+        ip: "x".repeat((1 << 20) + 1),
+        providers: vec![],
+        offer_seq: None,
+    };
+    let err = na
+        .node
+        .call_any::<_, LookupResp>(b.id, "/rpc/v1/lookup", &req, Duration::from_secs(20))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("request larger than"),
+        "{err:#}"
+    );
+}
+
 /// The asker pays the announced price; the server gets all of it; both
 /// nodes hold the offer and the receipt and arrive at the same balances.
 #[tokio::test]

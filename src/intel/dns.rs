@@ -338,7 +338,7 @@ pub fn choose(node: &Node, siblings: &HashSet<NodeId>, geo: &SharedGeo) -> Vec<R
     let mut others: Vec<NodeId> = node
         .live_members(crate::intel::LIVE_WINDOW)
         .into_iter()
-        .filter(|id| *id != me && !node.is_blocked(id))
+        .filter(|id| *id != me && !node.is_blocked(id) && node.can_call(id))
         .collect();
     others.shuffle(&mut rand::rng());
     let others = keep_priced(
@@ -524,7 +524,9 @@ async fn ask(node: &Arc<Node>, id: NodeId, name: &str) -> (NodeId, Result<Vec<Ip
         crate::intel::lookup::RPC_TIMEOUT,
     );
     let answer = match call.await {
-        Err(e) if format!("{e:#}").contains("no answer") => Err("did not answer in time".into()),
+        Err(e) if e.downcast_ref::<crate::cluster::msg::NoAnswer>().is_some() => {
+            Err("did not answer in time".into())
+        }
         Err(e) => Err(format!("could not be asked: {e:#}")),
         Ok(ResolveResp { error: Some(e), .. }) => Err(e),
         Ok(ResolveResp { addrs, .. }) => Ok(addrs),
