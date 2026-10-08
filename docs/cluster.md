@@ -60,6 +60,13 @@ Nodes talk HTTP/2 over mutual TLS with pinned Ed25519 keys on
 outbound-only: it dials its peers and still syncs both ways. Peers can
 also be listed under `[[cluster.peers]]` with their key.
 
+A joining node learns the members first: the inviter's reply carries
+every member's signed admission and description, and every sync batch
+sends the membership entries ahead of the data. Each is checked against
+its signer, who must be trusted already, so an inviter can leave members
+out but cannot add anyone; whatever it leaves out arrives from the other
+members.
+
 ## How trust works
 
 - **Nobody can remove a node.** A node leaves by itself. A member that

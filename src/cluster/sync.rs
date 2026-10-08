@@ -63,6 +63,12 @@ pub struct Batch {
     /// is (older than its window).
     #[serde(default)]
     pub bounds: Vec<WireEntry>,
+    /// Membership entries of the wanted origins past what was asked for,
+    /// also those beyond this batch: the receiver learns who is in the
+    /// cluster before the data in between arrives
+    /// (`repl::apply_membership_ahead`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub membership: Vec<WireEntry>,
 }
 
 impl From<Vec<WireEntry>> for Batch {

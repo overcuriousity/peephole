@@ -369,12 +369,124 @@ pub async fn entries_after(
             proofs.push(p);
         }
     }
+    // Membership ahead of the data: a few small entries per origin, so the
+    // receiver trusts the members it would otherwise only learn about once
+    // the whole history in front of their admissions has arrived.
+    let mut membership = vec![];
+    for (origin, after) in wants {
+        if purged.contains(origin) || membership.len() >= MEMBERSHIP_AHEAD {
+            continue;
+        }
+        let sent = out
+            .iter()
+            .filter(|e| e.origin == *origin)
+            .map(|e| e.seq)
+            .max()
+            .unwrap_or(0)
+            .max(*after)
+            .min(i64::MAX as u64);
+        let rows: Vec<LogRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by FROM repl_log
+             WHERE origin = ? AND seq > ? AND kind IN {} AND payload IS NOT NULL
+             ORDER BY seq LIMIT ?",
+            super::history::MEMBERSHIP_SQL
+        )))
+        .bind(&origin.0[..])
+        .bind(sent as i64)
+        .bind((MEMBERSHIP_AHEAD - membership.len()) as i64)
+        .fetch_all(&mut *conn)
+        .await?;
+        for r in rows {
+            membership.push(from_row(r)?);
+        }
+    }
     Ok(Batch {
         entries: out,
         proofs,
         floors: declared,
         bounds,
+        membership,
     })
+}
+
+/// Most membership entries sent ahead in one batch.
+const MEMBERSHIP_AHEAD: usize = 2000;
+
+/// Every membership entry this node holds with its payload, oldest first:
+/// the cluster's membership for a node that is just joining.
+pub async fn membership_entries(store: &crate::store::Store) -> Result<Vec<WireEntry>> {
+    let rows: Vec<LogRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT origin, seq, hlc, kind, uid, payload, sig, erased_by FROM repl_log
+         WHERE kind IN {} AND payload IS NOT NULL ORDER BY hlc LIMIT ?",
+        super::history::MEMBERSHIP_SQL
+    )))
+    .bind(MEMBERSHIP_AHEAD as i64)
+    .fetch_all(&store.pool)
+    .await?;
+    rows.into_iter().map(from_row).collect()
+}
+
+/// Apply membership entries before the log in front of them arrives: only
+/// their effect on the member list (`members::apply`, which takes them
+/// again harmlessly when they arrive in order), not the log entry, so each
+/// origin's log stays gap-free. Each must be signed by its origin, and its
+/// origin trusted here, perhaps through an admission earlier in the same
+/// list. Returns how many were taken.
+pub async fn apply_membership_ahead(node: &Node, entries: &[WireEntry]) -> Result<usize> {
+    let me = node.id();
+    let mut todo: Vec<&WireEntry> = entries
+        .iter()
+        .filter(|e| {
+            e.origin != me
+                && e.payload.is_some()
+                && super::history::MEMBERSHIP.contains(&e.kind.as_str())
+        })
+        .collect();
+    if todo.is_empty() {
+        return Ok(0);
+    }
+    todo.sort_by_key(|e| (e.hlc, e.seq));
+    let guard = node.apply_lock.lock().await;
+    let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut taken = 0;
+    loop {
+        let mut rest = vec![];
+        let before = taken;
+        for e in todo {
+            if is_purged(&mut tx, &e.origin).await? || hlc::ahead(e.hlc, hlc::wall_ms()) {
+                continue;
+            }
+            let held: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM repl_log WHERE origin = ? AND seq = ?")
+                    .bind(&e.origin.0[..])
+                    .bind(e.seq.min(i64::MAX as u64) as i64)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if held > 0 {
+                continue;
+            }
+            if !trusted(node, &mut tx, &e.origin).await? {
+                rest.push(e);
+                continue;
+            }
+            let Some(r) = e.record().filter(|_| e.verify()) else {
+                continue;
+            };
+            super::members::apply(node, &mut tx, e, &r, hlc::to_db(e.hlc) as u64).await?;
+            taken += 1;
+        }
+        todo = rest;
+        if taken == before || todo.is_empty() {
+            break;
+        }
+    }
+    tx.commit().await?;
+    drop(guard);
+    if taken > 0 {
+        node.reload_members().await?;
+        node.notify_changed();
+    }
+    Ok(taken)
 }
 
 /// `origin`'s entry `seq` with its signed payload (rebuilt from its row if
@@ -672,7 +784,11 @@ pub async fn apply_batch_with(
         proofs,
         floors,
         bounds,
+        membership,
     } = batch.into();
+    // Members first, so their entries in this batch apply instead of
+    // waiting (parked, or refused once their parking space is full).
+    apply_membership_ahead(node, &membership).await?;
     // Where each origin may start here, if past what is held. Each bound is
     // looked up by the start it proves and verified at most once.
     let since = node.since_hlc();
@@ -2322,5 +2438,105 @@ mod tests {
             ours.iter().find(|h| h.0 == node.id()),
             "caught up"
         );
+    }
+
+    /// A node that joined through `a` knew only `a` until `a`'s whole
+    /// history in front of its admission of `b` had arrived; `b`'s entries
+    /// were parked meanwhile and, past the parking limit, refused. Now the
+    /// first batch carries `a`'s membership entries ahead of the data, and
+    /// `b` is a member at once.
+    #[tokio::test]
+    async fn members_arrive_ahead_of_the_history_in_front_of_them() {
+        let (_da, a) = test_node(0).await;
+        let b = Identity::generate().unwrap();
+        let reqs: Vec<Record> = (0..5)
+            .map(|n| {
+                Record::Request(Box::new(super::super::record::RequestRec {
+                    uid: format!("{}{n}", a.id().uid_prefix()),
+                    ts: "2026-10-01 00:00:00".into(),
+                    ip: "203.0.113.20".into(),
+                    method: "GET".into(),
+                    path: format!("/{n}"),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    ..Default::default()
+                }))
+            })
+            .collect();
+        super::append(&a, &reqs).await.unwrap();
+        super::append(&a, &[Record::MemberAdd(info(b.id, "b"))])
+            .await
+            .unwrap();
+        let b_says =
+            WireEntry::sign(&b, 1, now_hlc(1), &Record::MemberUpdate(info(b.id, "b"))).unwrap();
+
+        let (_dj, joiner) = test_node(0).await;
+        super::append(&joiner, &[Record::MemberAdd(info(a.id(), "a"))])
+            .await
+            .unwrap();
+        let admitted = |node: std::sync::Arc<super::Node>, id: NodeId| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM members WHERE id = ? AND admitted_hlc > 0",
+            )
+            .bind(&id.0[..])
+            .fetch_one(&node.store.pool)
+            .await
+            .unwrap()
+                == 1
+        };
+
+        // Two entries of a's log: the admission of b is far behind them.
+        let mut batch = super::entries_after(&a.store, &[(a.id(), 0)], 0, 2, 1 << 20)
+            .await
+            .unwrap();
+        assert!(batch.entries.iter().all(|e| e.kind != "member_add"));
+        assert!(batch.membership.iter().any(|e| e.kind == "member_add"));
+        batch.entries.push(b_says);
+        let st = super::apply_batch(&joiner, batch).await.unwrap();
+        assert!(admitted(joiner.clone(), b.id).await, "b is known at once");
+        assert_eq!(st.parked, 0, "b's own entry applies: {st:?}");
+        assert!(joiner.members().contains_key(&b.id));
+
+        // The rest of a's log still arrives in order, admission included.
+        let rest = super::entries_after(&a.store, &[(a.id(), 0)], 0, 100, 1 << 20)
+            .await
+            .unwrap();
+        let st = super::apply_batch(&joiner, rest).await.unwrap();
+        assert_eq!(st.rejected, 0, "{st:?}");
+        assert!(admitted(joiner.clone(), b.id).await);
+        let held: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repl_log WHERE origin = ? AND kind = 'member_add'",
+        )
+        .bind(&a.id().0[..])
+        .fetch_one(&joiner.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(held, 1, "the admission is in the log, in its place");
+
+        // The join reply carries the same.
+        let all = super::membership_entries(&a.store).await.unwrap();
+        assert!(
+            all.iter()
+                .any(|e| e.kind == "member_add" && e.origin == a.id())
+        );
+    }
+
+    /// Membership sent ahead is taken only from trusted, signed origins: a
+    /// stranger cannot admit itself, nor be admitted by another stranger.
+    #[tokio::test]
+    async fn membership_ahead_needs_a_trusted_signer() {
+        let (_d, node) = test_node(0).await;
+        let (x, y) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let x_adds_y =
+            WireEntry::sign(&x, 1, now_hlc(1), &Record::MemberAdd(info(y.id, "y"))).unwrap();
+        let mut forged = x_adds_y.clone();
+        forged.origin = node.id();
+        assert_eq!(
+            super::apply_membership_ahead(&node, &[x_adds_y, forged])
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(!node.members().contains_key(&y.id));
     }
 }

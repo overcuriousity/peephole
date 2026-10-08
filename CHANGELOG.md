@@ -32,6 +32,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   later stalled there and saw only that node. Such entries are now
   written off as deleted (hourly, warning "own log entries had lost their
   rows"), and new members sync past them.
+- A new member knows the whole cluster at once. Before, it learned of the
+  other members only from its inviter's log, after all of the inviter's
+  history in front of each admission had arrived; until then it saw only
+  the inviter, and the others' entries were parked or refused. The join
+  reply now carries every member's signed admission, and each sync batch
+  sends the membership entries ahead of the data.
 
 ## [0.9.0] - 2026-10-08
 

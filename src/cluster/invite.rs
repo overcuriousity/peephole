@@ -35,6 +35,11 @@ pub struct JoinReq {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JoinResp {
     pub info: MemberInfo,
+    /// The inviter's signed membership entries of every member, so the
+    /// joiner knows the whole cluster at once instead of only once the
+    /// inviter's history in front of each admission has arrived.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub membership: Vec<super::record::WireEntry>,
 }
 
 fn hash(secret: &[u8]) -> String {
@@ -200,6 +205,14 @@ pub async fn join(node: &Node, token: &str) -> Result<MemberInfo> {
                 repl::append(node, &[Record::MemberAdd(info.clone())]).await?;
                 super::set_detached(&node.store, None).await?;
                 node.reload_members().await?;
+                // The rest of the cluster, vouched for by the inviter (whom
+                // we trust now); the sync catches up on anything left out.
+                if let Err(e) = repl::apply_membership_ahead(node, &resp.membership).await {
+                    tracing::warn!(
+                        ?e,
+                        "the inviter's member list was not taken; sync catches up"
+                    );
+                }
                 return Ok(info);
             }
             Err(e) => last_err = Some(e.context(format!("joining via {addr}"))),
@@ -290,6 +303,9 @@ pub async fn redeem(node: &Node, peer: NodeId, req: JoinReq) -> Result<JoinResp,
     }
     Ok(JoinResp {
         info: node.self_info(),
+        membership: repl::membership_entries(&node.store)
+            .await
+            .unwrap_or_default(),
     })
 }
 
