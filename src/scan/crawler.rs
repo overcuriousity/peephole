@@ -19,6 +19,10 @@
 //!   timeout there is our resolver's trouble, not a trick), cached only as
 //!   long as a failed lookup.
 //!
+//! The PTR and forward lookups also serve reverse DNS of every source
+//! (`intel::rdns`, `confirmed_names`), which keeps any forward-confirmed
+//! name, crawler or not.
+//!
 //! The PTR query goes to the first `nameserver` in `/etc/resolv.conf` (the
 //! standard library has no reverse lookup); forward lookups use tokio's
 //! resolver (the system's `getaddrinfo`).
@@ -64,13 +68,13 @@ const CACHE_FAILED: Duration = Duration::from_secs(600);
 const CACHE_MAX: usize = 10_000;
 
 /// Forward lookup of a host name (tokio's resolver; replaced in tests).
-type Forward = std::sync::Arc<
+pub(crate) type Forward = std::sync::Arc<
     dyn Fn(String) -> futures::future::BoxFuture<'static, std::io::Result<Vec<IpAddr>>>
         + Send
         + Sync,
 >;
 
-fn system_forward() -> Forward {
+pub(crate) fn system_forward() -> Forward {
     std::sync::Arc::new(|name: String| {
         Box::pin(async move {
             Ok(tokio::net::lookup_host((name.as_str(), 0))
@@ -79,6 +83,13 @@ fn system_forward() -> Forward {
                 .collect())
         })
     })
+}
+
+/// The first `nameserver` of `/etc/resolv.conf`, where PTR queries go.
+pub(crate) fn system_resolver() -> Option<SocketAddr> {
+    std::fs::read_to_string("/etc/resolv.conf")
+        .ok()
+        .and_then(|t| nameserver(&t))
 }
 
 pub struct Crawlers {
@@ -92,10 +103,7 @@ pub struct Crawlers {
 impl Crawlers {
     /// The built-in domains plus `extra`, asking the system resolver.
     pub fn new(extra: &[String]) -> Self {
-        let resolver = std::fs::read_to_string("/etc/resolv.conf")
-            .ok()
-            .and_then(|t| nameserver(&t));
-        Self::with_resolver(extra, resolver)
+        Self::with_resolver(extra, system_resolver())
     }
 
     pub fn with_resolver(extra: &[String], resolver: Option<SocketAddr>) -> Self {
@@ -174,6 +182,43 @@ impl Crawlers {
                 .is_some_and(|p| p.ends_with('.'))
         })
     }
+}
+
+/// Most PTR names of one address checked forward.
+const MAX_NAMES: usize = 4;
+
+/// The PTR names of `ip` that resolve back to it, as valid host names, in
+/// the order the reverse zone gave them. Err when the PTR lookup fails or
+/// times out; a name whose forward lookup fails or times out is left out
+/// (unlike the crawler check, nothing is exempted here, so there is no
+/// fail-safe to keep).
+pub(crate) async fn confirmed_names(
+    resolver: SocketAddr,
+    forward: &Forward,
+    ip: IpAddr,
+) -> anyhow::Result<Vec<String>> {
+    let ip = crate::net::canonical(ip);
+    let names = tokio::time::timeout(LOOKUP_TIMEOUT, ptr(resolver, ip))
+        .await
+        .map_err(|_| anyhow::anyhow!("reverse lookup timed out"))??;
+    let mut valid: Vec<String> = vec![];
+    for n in names
+        .iter()
+        .filter_map(|n| crate::intel::dns::valid_name(n))
+    {
+        if !valid.contains(&n) {
+            valid.push(n);
+        }
+    }
+    let mut out = vec![];
+    for name in valid.into_iter().take(MAX_NAMES) {
+        if let Ok(Ok(addrs)) = tokio::time::timeout(LOOKUP_TIMEOUT, forward(name.clone())).await
+            && addrs.into_iter().any(|a| crate::net::canonical(a) == ip)
+        {
+            out.push(name);
+        }
+    }
+    Ok(out)
 }
 
 /// The first `nameserver` of a resolv.conf.
@@ -317,6 +362,7 @@ fn read_name(m: &[u8], mut at: usize) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::testing::*;
     use super::*;
 
     #[test]
@@ -359,29 +405,6 @@ mod tests {
         assert!(!c.is_crawler_domain("googlebot.com.attacker.net"));
     }
 
-    /// A reply as a resolver sends it: the question, then a PTR answer
-    /// whose name is a compression pointer to the question.
-    fn reply(id: u16, rcode: u8, ptr_name: Option<&str>) -> Vec<u8> {
-        let mut m = query(id, "1.66.249.66.in-addr.arpa");
-        m[2] = 0x81;
-        m[3] = 0x80 | rcode;
-        if let Some(name) = ptr_name {
-            m[7] = 1;
-            m.extend_from_slice(&[0xc0, 12]); // name: the question's
-            m.extend_from_slice(&TYPE_PTR.to_be_bytes());
-            m.extend_from_slice(&[0, 1, 0, 0, 0x0e, 0x10]);
-            let mut rdata = vec![];
-            for label in name.split('.') {
-                rdata.push(label.len() as u8);
-                rdata.extend_from_slice(label.as_bytes());
-            }
-            rdata.push(0);
-            m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-            m.extend_from_slice(&rdata);
-        }
-        m
-    }
-
     #[test]
     fn ptr_replies_parse() {
         assert_eq!(
@@ -406,31 +429,6 @@ mod tests {
         assert!(parse_ptr_reply(&looped).is_err());
     }
 
-    /// A fake resolver on localhost answering every PTR query with the
-    /// name in `answer`; returns its address.
-    async fn fake_resolver(answer: std::sync::Arc<Mutex<Option<String>>>) -> SocketAddr {
-        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = sock.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            loop {
-                let (_, from) = sock.recv_from(&mut buf).await.unwrap();
-                let id = u16::from_be_bytes([buf[0], buf[1]]);
-                let name = answer.lock().unwrap().clone();
-                match name {
-                    Some(n) if n == "TIMEOUT" => {}
-                    Some(n) => {
-                        let _ = sock.send_to(&reply(id, 0, Some(&n)), from).await;
-                    }
-                    None => {
-                        let _ = sock.send_to(&reply(id, 3, None), from).await;
-                    }
-                }
-            }
-        });
-        addr
-    }
-
     /// Forward lookups: `*.real.googlebot.com` resolves to 198.51.100.7,
     /// `*.real.censys-scanner.com` to 198.51.100.9, `*.slow.googlebot.com`
     /// never answers, anything else does not exist.
@@ -448,6 +446,56 @@ mod tests {
                 }
             })
         })
+    }
+
+    #[tokio::test]
+    async fn confirmed_names_checks_every_name() {
+        let run = |name: Option<&str>, ip: &str| {
+            let answer = std::sync::Arc::new(Mutex::new(name.map(str::to_string)));
+            let ip: IpAddr = ip.parse().unwrap();
+            async move {
+                let r = fake_resolver(answer).await;
+                confirmed_names(r, &fake_forward(), ip).await
+            }
+        };
+        // Any domain counts here, not only crawlers, once it resolves back.
+        assert_eq!(
+            run(Some("crawl-1.real.googlebot.com"), "198.51.100.7")
+                .await
+                .unwrap(),
+            vec!["crawl-1.real.googlebot.com".to_string()]
+        );
+        assert!(
+            run(Some("crawl-1.real.googlebot.com"), "198.51.100.8")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            run(Some("host.example.net"), "198.51.100.7")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            run(None, "198.51.100.7").await.unwrap().is_empty(),
+            "NXDOMAIN"
+        );
+        assert!(
+            run(Some("198.51.100.7"), "198.51.100.7")
+                .await
+                .unwrap()
+                .is_empty(),
+            "an address is no name"
+        );
+        assert!(run(Some("TIMEOUT"), "198.51.100.7").await.is_err());
+        assert!(
+            run(Some("x.slow.googlebot.com"), "198.51.100.7")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a forward timeout is no confirmation here"
+        );
     }
 
     async fn check(name: Option<&str>, ip: &str) -> Option<String> {
@@ -570,5 +618,61 @@ mod tests {
         assert!(c.confirmed(ip).await.is_some());
         let until = c.cache.lock().unwrap()[&ip].0;
         assert!(until <= Instant::now() + CACHE_FAILED);
+    }
+}
+
+/// A fake PTR resolver for tests here and in `intel::rdns`.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{TYPE_PTR, query};
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    /// A reply as a resolver sends it: the question, then a PTR answer
+    /// whose name is a compression pointer to the question.
+    pub(crate) fn reply(id: u16, rcode: u8, ptr_name: Option<&str>) -> Vec<u8> {
+        let mut m = query(id, "1.66.249.66.in-addr.arpa");
+        m[2] = 0x81;
+        m[3] = 0x80 | rcode;
+        if let Some(name) = ptr_name {
+            m[7] = 1;
+            m.extend_from_slice(&[0xc0, 12]); // name: the question's
+            m.extend_from_slice(&TYPE_PTR.to_be_bytes());
+            m.extend_from_slice(&[0, 1, 0, 0, 0x0e, 0x10]);
+            let mut rdata = vec![];
+            for label in name.split('.') {
+                rdata.push(label.len() as u8);
+                rdata.extend_from_slice(label.as_bytes());
+            }
+            rdata.push(0);
+            m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            m.extend_from_slice(&rdata);
+        }
+        m
+    }
+
+    /// A fake resolver on localhost answering every PTR query with the
+    /// name in `answer`; returns its address.
+    pub(crate) async fn fake_resolver(answer: Arc<Mutex<Option<String>>>) -> SocketAddr {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let (_, from) = sock.recv_from(&mut buf).await.unwrap();
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                let name = answer.lock().unwrap().clone();
+                match name {
+                    Some(n) if n == "TIMEOUT" => {}
+                    Some(n) => {
+                        let _ = sock.send_to(&reply(id, 0, Some(&n)), from).await;
+                    }
+                    None => {
+                        let _ = sock.send_to(&reply(id, 3, None), from).await;
+                    }
+                }
+            }
+        });
+        addr
     }
 }

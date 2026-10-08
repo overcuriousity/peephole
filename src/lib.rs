@@ -191,6 +191,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         providers.clone(),
         shutdown_rx.clone(),
     ));
+    // Reverse DNS of the sources, forward-confirmed, kept on this node.
+    tokio::spawn(intel::rdns::run(
+        store.clone(),
+        cfg.enrichment.reverse_dns,
+        shutdown_rx.clone(),
+    ));
 
     // Observational probes, for members (paid) and this node's admin.
     let prober = (cfg.roles.scanner && cfg.probe.enabled).then(|| {

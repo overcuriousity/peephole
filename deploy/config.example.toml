@@ -88,6 +88,10 @@ license_key = "testkey"
 # is never looked up again. 0 = never again.
 refresh_after_days = 30
 
+# Look up each source's reverse DNS name (only names that resolve back to
+# the address count), when first seen and when it returns a day later.
+# reverse_dns = true
+
 # Cluster only: the part of each API provider's budget that paid lookups of
 # other members (and your own on-demand lookups) may use. 0.2 = a fifth.
 # on_demand_share = 0.2
