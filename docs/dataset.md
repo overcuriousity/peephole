@@ -148,13 +148,18 @@ service's documentation; an empty object means the service knew nothing.
 [{"uid": "…", "audit_of": null, "level": 2, "status": "done", "started_at": "…", "finished_at": "…",
   "node": "alice", "node_id": "…", "build": "…", "scanner": "carol", "os_guess": "Linux 5.x",
   "ports": [{"port": 22, "proto": "tcp", "state": "open", "service": "ssh", "product": "OpenSSH", "version": "9.6"}],
+  "host_keys": [{"kind": "ssh-hostkey", "port": 22, "fingerprint": "SHA256:…", "detail": "ed25519 256"}],
   "xml": "<?xml …>  the full nmap output"}]
 ```
 
 `level` 1 to 4 (more ports, service versions, OS detection, safe scripts);
 `node` queued it, `scanner` ran it. From level 2 the XML carries the
-source's SSH host keys, SSH algorithm lists and TLS certificates
-(`ssh-hostkey`, `ssh2-enum-algos`, `ssl-cert`).
+source's SSH host keys, SSH algorithm lists, TLS certificates and HTTP
+headers (`ssh-hostkey`, `ssh2-enum-algos`, `ssl-cert`, `http-headers`).
+`host_keys`: what peephole read from the XML: `ssh-hostkey` (OpenSSH's
+`SHA256:` fingerprint), `tls-cert` (SHA-256 of the DER), `ja4x`, `hassh`
+(HASSH-server) and `http-etag` (the ETag as sent; for nginx's form the
+detail gives the file's modification date and size).
 `uid` is the scan's identifier in the cluster. `audit_of` is set when the
 scan is an audit: the `uid` of the scan it checks. An audit is a scan run
 again by another scanner, not a counter-scan of its own; its `node` and
@@ -165,7 +170,8 @@ it finished), not that of the job it checks.
 
 ```json
 [{"name": "example.com", "source": "dns", "first_seen": "…", "last_seen": "…", "votes": 4, "answered": 5},
- {"name": "host-7.example.net", "source": "ptr", "first_seen": "…", "last_seen": "…", "votes": 0, "answered": 0}]
+ {"name": "host-7.example.net", "source": "ptr", "first_seen": "…", "last_seen": "…", "votes": 0, "answered": 0},
+ {"name": "scanner-3.hoster.example", "source": "rdns", "first_seen": "…", "last_seen": "…", "votes": 0, "answered": 0}]
 ```
 
 `dns`: an admin looked the name up and up to five nodes resolved it; the
@@ -173,7 +179,10 @@ address is listed when more than half of the resolvers that answered
 returned it (`votes` of `answered`; `1` of `1` is a single, unverified
 resolver). Disputed addresses are not exported. `ptr`: the reverse name
 nmap reported in a scan of the address, as the address's own DNS claims it
-(`votes` and `answered` are 0). Names are in ASCII form (`xn--` for
+(`votes` and `answered` are 0). `rdns`: this node's reverse lookup of the
+address: a PTR name that resolves back to it (forward-confirmed). Each node
+looks up on its own, so two nodes' exports can differ here; `votes` and
+`answered` are 0. Names are in ASCII form (`xn--` for
 international ones).
 
 **`fingerprints`**: browser fingerprints the trap page collected from this
@@ -224,6 +233,7 @@ appended when more bytes are needed, and each byte mapped to
 | `db-password`, `redis-password`, `mail-password`, `admin-password` | 20 characters of `A–Za–z0–9` |
 | `git-token` | 40 lowercase hex characters |
 | `wp-session` | 43 characters of `A–Za–z0–9` (the token part of the WordPress login cookie) |
+| `etag` | 32 lowercase hex characters (decoy version 3: the `ETag` header of the web decoys answering 200; found again in `If-None-Match`) |
 
 `.env` carries `app-key`, the three passwords, `aws-key`, `aws-secret` and
 `admin-password`; `.git/config` carries `git-token`; `decoy:wp-login-ok`

@@ -38,7 +38,7 @@ nmap.
   On request an admin can also run an *observational probe* of the ports a
   scan found open (headers, certificates, JARM, SSH host keys), from one
   scanner or several at once. From level 2 they read the source's SSH host
-  keys and TLS certificates, so sources that share one show up as linked.
+  keys, TLS certificates and HTTP ETags, so sources that share one show up as linked.
   Bystanders are spared: one request earns at most a light scan, and
   verified crawlers, Tor exits, your own and `never_scan` networks are
   never scanned; per-network, per-ASN and queue budgets stop floods.

@@ -5,6 +5,26 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Added
+
+- Host keys in the export: each scan in the `scans` column lists its
+  `host_keys` (kind, port, fingerprint, detail), so nobody has to parse
+  the XML for them.
+- ETags of scanned sources. Level 2 also runs nmap's `http-headers`; each
+  HTTP port's `ETag` is a new soft link kind (`http-etag`, "same file",
+  never "same operator"), and nginx's form is dated. Stored scans are read
+  again once at startup. The previous level-2 list still earns.
+- ETags as a return marker. Decoy version 3 answers the web decoys that
+  return 200 with an ETag derived from the request, a canary of kind
+  `etag`: a client that sends it back in `If-None-Match`, from any
+  address, is a canary reuse.
+- Reverse DNS of every source. Each node looks up the PTR names of the
+  addresses that sent requests and keeps those that resolve back
+  (`ip_names` source `rdns`), when first seen and when the source returns
+  a day later. Shown on the IP page, in the `names` export column, and as
+  the IP directory's new Name filter. `[enrichment] reverse_dns = false`
+  turns it off.
+
 ## [0.9.0] - 2026-10-08
 
 ### Changed
