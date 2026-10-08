@@ -228,13 +228,18 @@ earn most of the new money, every member a little.
   so a scanner that fails a level often wins it only if its price makes
   up for it. The success rates are measured once an hour: the snapshot of
   hour H counts the scans finished in the 24 hours before H and is taken
-  at H + 5 min, so arbiters with the same log agree. A paid job waits for
-  a cheaper live scanner (not hoarding, under its capacity, with a record
-  at that level, and able to take the job) for up to 30 minutes, then
-  goes to whoever asks. A job that cannot be funded is idle work: there,
+  at H + 5 min, so arbiters with the same log agree. A job is paid to the
+  best claimant the scan budget can pay (one that takes no less than more
+  than its price here is passed over). A paid job waits for a cheaper live
+  scanner (not hoarding, not paused, under its capacity, with a record at
+  that level, and able to take the job: it did not hand it back, and its
+  last claim here neither excluded the level nor asked more than its
+  price) for up to 30 minutes, then goes to whoever asks. A job no
+  claimant can be paid for is idle work: there,
   a scanner that fails a level more than the others still sits it out
   for 10-minute stretches, a share of 1 − weight of them. A round reads
-  at most 500 queued jobs, past those every claimant handed back. Why a
+  the queue 200 jobs at a time, up to 5000, past those every claimant
+  handed back; an error ends the round but keeps its grants. Why a
   job went where is kept by its arbiter in `job_handouts` (local, 8 days)
   and shown on the scan page and as a title in the Scans history; other
   nodes say which node handed it out. A scanner asks

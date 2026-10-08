@@ -593,7 +593,9 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("Given to Fast for 0.03 per delivered result (price 0.03, 100 % at L4).")
+            Some(
+                "Given to Fast for 0.03 per delivered result (price 0.03, 100 % of the best success rate at L4)."
+            )
         );
         let theirs = scanned(&store, "j2", OTHER).await;
         assert_eq!(

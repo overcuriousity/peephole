@@ -17,8 +17,14 @@ pub enum Reason {
     Cheapest,
     /// Paid, after the job waited out the reserve.
     Override,
-    /// The scan budget did not cover it.
+    /// Unpaid: the scan budget did not cover it.
     Unpaid,
+    /// Unpaid: the best scanner asking has no price here.
+    NoPrice,
+    /// Unpaid: the best scanner asking takes more than its price here.
+    BelowMin,
+    /// Unpaid: the offer could not be written.
+    OfferFailed,
 }
 
 impl Reason {
@@ -27,7 +33,15 @@ impl Reason {
             Reason::Cheapest => "cheapest",
             Reason::Override => "override",
             Reason::Unpaid => "unpaid",
+            Reason::NoPrice => "no_price",
+            Reason::BelowMin => "below_min",
+            Reason::OfferFailed => "offer_failed",
         }
+    }
+
+    /// Whether the grant went unpaid.
+    pub fn unpaid(self) -> bool {
+        !matches!(self, Reason::Cheapest | Reason::Override)
     }
 
     fn parse(s: &str) -> Option<Self> {
@@ -35,6 +49,9 @@ impl Reason {
             "cheapest" => Reason::Cheapest,
             "override" => Reason::Override,
             "unpaid" => Reason::Unpaid,
+            "no_price" => Reason::NoPrice,
+            "below_min" => Reason::BelowMin,
+            "offer_failed" => Reason::OfferFailed,
             _ => return None,
         })
     }
@@ -154,7 +171,7 @@ pub fn describe(h: &Handout, name: &dyn Fn(&NodeId) -> String) -> String {
         Reason::Cheapest => {
             let price = h.price_mc.map_or_else(|| "–".into(), |p| show(p as u64));
             let mut t = format!(
-                "Given to {s} for {eff} per delivered result (price {price}, {:.0} % at L{}).",
+                "Given to {s} for {eff} per delivered result (price {price}, {:.0} % of the best success rate at L{}).",
                 h.rate * 100.0,
                 h.level
             );
@@ -170,13 +187,19 @@ pub fn describe(h: &Handout, name: &dyn Fn(&NodeId) -> String) -> String {
             "Waited {} min, then went to whoever asked: {s}, {eff} per delivered result.",
             h.waited_secs / 60
         ),
-        Reason::Unpaid => {
+        unpaid => {
+            let why = match unpaid {
+                Reason::NoPrice => "the best scanner asking has no price here yet",
+                Reason::BelowMin => "the price here is under what the best scanner asking takes",
+                Reason::OfferFailed => "the offer could not be written",
+                _ => "the scan budget did not cover it",
+            };
             let sat = if h.sat_out > 0 {
                 format!(" (scanners weak at L{} sat out by the old rule)", h.level)
             } else {
                 String::new()
             };
-            format!("Unpaid: the scan budget did not cover it; went to {s}{sat}.")
+            format!("Unpaid: {why}; went to {s}{sat}.")
         }
     }
 }
@@ -217,14 +240,14 @@ mod tests {
         };
         assert_eq!(
             describe(&h, &name),
-            "Given to Fast for 0.03 per delivered result (price 0.03, 100 % at L4). \
+            "Given to Fast for 0.03 per delivered result (price 0.03, 100 % of the best success rate at L4). \
              Next best: Flaky, 0.04. Waited 12 min for Fast."
         );
         h.waited_secs = 0;
         h.next = None;
         assert_eq!(
             describe(&h, &name),
-            "Given to Fast for 0.03 per delivered result (price 0.03, 100 % at L4)."
+            "Given to Fast for 0.03 per delivered result (price 0.03, 100 % of the best success rate at L4)."
         );
         let o = Handout {
             scanner: flaky,
@@ -255,6 +278,32 @@ mod tests {
             describe(&u, &name),
             "Unpaid: the scan budget did not cover it; went to Flaky."
         );
+        for (reason, text) in [
+            (
+                Reason::NoPrice,
+                "Unpaid: the best scanner asking has no price here yet; went to Flaky.",
+            ),
+            (
+                Reason::BelowMin,
+                "Unpaid: the price here is under what the best scanner asking takes; went to Flaky.",
+            ),
+            (
+                Reason::OfferFailed,
+                "Unpaid: the offer could not be written; went to Flaky.",
+            ),
+        ] {
+            assert_eq!(
+                describe(
+                    &Handout {
+                        reason,
+                        ..u.clone()
+                    },
+                    &name
+                ),
+                text
+            );
+            assert_eq!(Reason::parse(reason.as_str()), Some(reason));
+        }
     }
 
     #[tokio::test]

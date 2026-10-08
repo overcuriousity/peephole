@@ -14,7 +14,8 @@ CREATE TABLE job_handouts (
   next_scanner BLOB,            -- the next best claimant, if any
   next_effective_mc INTEGER,
   waited_secs INTEGER NOT NULL, -- held for the reserve, or queued (override)
-  reason TEXT NOT NULL,         -- cheapest, override, unpaid
+  reason TEXT NOT NULL,         -- cheapest, override; unpaid: unpaid (budget),
+                                -- no_price, below_min, offer_failed
   sat_out INTEGER NOT NULL DEFAULT 0  -- unpaid: claimants that sat the level out
 );
 CREATE INDEX job_handouts_job ON job_handouts(job_uid, id);

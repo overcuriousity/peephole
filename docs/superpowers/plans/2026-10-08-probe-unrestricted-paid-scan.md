@@ -458,7 +458,7 @@ git commit -m "Probes: no evidence or scan requirement; well-known-port fallback
 ### Task 4: A `manual` marker on scan jobs
 
 **Files:**
-- Create: `src/store/migrations/0026_manual_scan_jobs.sql`
+- Create: `src/store/migrations/0027_manual_scan_jobs.sql`
 - Modify: `src/store/mod.rs:63` (append to `MIGRATIONS`)
 - Modify: `src/cluster/record.rs:263-278` (`ScanJobRec` gains `manual`)
 - Modify: `src/store/data.rs:678-694` (`scan_job` INSERT binds `manual`)
@@ -511,7 +511,7 @@ Expected: FAIL to compile — `enqueue_manual` and the `manual` column do not ex
 
 - [ ] **Step 3: Implement**
 
-Create `src/store/migrations/0026_manual_scan_jobs.sql`:
+Create `src/store/migrations/0027_manual_scan_jobs.sql`:
 
 ```sql
 -- A scan an admin bought from the Actions card: the scanners skip their
@@ -523,7 +523,7 @@ ALTER TABLE scan_jobs ADD COLUMN manual INTEGER NOT NULL DEFAULT 0;
 In `src/store/mod.rs`, append after the `0025_rdns.sql` line in `MIGRATIONS`:
 
 ```rust
-    include_str!("migrations/0026_manual_scan_jobs.sql"),
+    include_str!("migrations/0027_manual_scan_jobs.sql"),
 ```
 
 In `src/cluster/record.rs`, add to `ScanJobRec`, after `failed_by`:
@@ -598,7 +598,7 @@ Expected: PASS (including the schema-version tests, which read `MIGRATIONS.len()
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/migrations/0026_manual_scan_jobs.sql src/store/mod.rs src/cluster/record.rs src/store/data.rs src/store/recorder.rs src/cluster/adopt.rs tests/cluster.rs tests/cluster_limits.rs
+git add src/store/migrations/0027_manual_scan_jobs.sql src/store/mod.rs src/cluster/record.rs src/store/data.rs src/store/recorder.rs src/cluster/adopt.rs tests/cluster.rs tests/cluster_limits.rs
 git commit -m "Scans: a manual marker for bought scan jobs"
 ```
 
@@ -707,7 +707,7 @@ git commit -m "Scans: bought jobs skip the evidence re-check, never the prefligh
 
 **Files:**
 - Modify: `src/credits/jobs.rs` (new `level_factor`, after `price_for` at line 80)
-- Modify: `src/scan/arbiter.rs:326-337` (`next_job_for` scales the price of manual jobs)
+- Modify: `src/scan/arbiter.rs` (`Arbiter::round` and `Arbiter::queued`: manual jobs are funded at the level-scaled price; reliability pricing replaced `next_job_for` with a job-major round)
 
 **Interfaces:**
 - Consumes: Task 4's `scan_jobs.manual`.
@@ -747,11 +747,7 @@ In `src/scan/arbiter.rs`'s `mod tests`, add after `an_own_job_is_funded_by_a_res
             .enqueue_manual(ip.id, 3)
             .await
             .unwrap();
-        let g = arbiter
-            .next_job_for(&mut Default::default(), node.id(), &[], 0)
-            .await
-            .unwrap()
-            .unwrap();
+        let g = arbiter.next_job(node.id(), &[], 0).await.unwrap();
         assert_eq!((g.offer_seq, g.price_mc), (None, 300 * 16));
         assert_eq!(self_mc(&store, &g.job_uid).await, Some(300 * 16));
     }
@@ -776,24 +772,22 @@ pub fn level_factor(level: i64) -> u32 {
 }
 ```
 
-In `src/scan/arbiter.rs`'s `next_job_for`, replace:
+In `src/scan/arbiter.rs`:
+
+- `Queued` gets `manual: bool`; `Arbiter::queued` selects `j.manual` (after `j.failed_by`) and the `QueuedRow` tuple grows by a `bool`.
+- In `Arbiter::round`, right after `let level = job.level;`, add:
 
 ```rust
-        let price = crate::credits::jobs::price_for(&self.node, &scanner);
+                // A bought job pays every scanner 4^(level-1) times its
+                // price: the ranking and the reserve are unchanged by it.
+                let factor = match job.manual {
+                    true => crate::credits::jobs::level_factor(level),
+                    false => 1,
+                };
 ```
 
-with:
-
-```rust
-        let manual: i64 = sqlx::query_scalar("SELECT manual FROM scan_jobs WHERE uid = ?")
-            .bind(&g.job_uid)
-            .fetch_one(&self.node.store.pool)
-            .await?;
-        let price = crate::credits::jobs::price_for(&self.node, &scanner).map(|p| match manual {
-            0 => p,
-            _ => p.saturating_mul(crate::credits::jobs::level_factor(g.level)),
-        });
-```
+- In the `payee` loop, pass `p.saturating_mul(factor)` to `affordable` instead of `p`.
+- In the `self.grant(...)` call, pass `paid.then_some(bid.price).flatten().map(|p| p.saturating_mul(factor))`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 

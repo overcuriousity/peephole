@@ -176,7 +176,7 @@ fn level_cells(rows: &[LevelInputs]) -> Vec<Vec<LevelCell>> {
                         },
                         basis: match price {
                             Some(p) => format!(
-                                "price {} ÷ success {:.0} % ({} ok, {} failed, last 24 h)",
+                                "price {} ÷ {:.0} % of the best success rate ({} ok, {} failed, last 24 h)",
                                 show(*p as Mc),
                                 w * 100.0,
                                 t.ok,
@@ -784,7 +784,7 @@ mod tests {
         assert!(!cells[2][0].cheapest, "no price is never the cheapest");
         assert_eq!(
             cells[0][3].basis,
-            "price 0.02 ÷ success 50 % (6 ok, 6 failed, last 24 h)"
+            "price 0.02 ÷ 50 % of the best success rate (6 ok, 6 failed, last 24 h)"
         );
         assert_eq!(cells[2][3].basis, "no price here");
     }

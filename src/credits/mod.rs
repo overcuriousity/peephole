@@ -232,6 +232,12 @@ pub async fn run(
                 tracing::debug!(?e, "credits: pruning failed");
             }
         }
+        // The scanner weights' hourly snapshot, taken as soon as it is due
+        // (five minutes after the hour) rather than on first use, so every
+        // node takes it at about the same time.
+        if let Err(e) = node.weights.get(&node.store.pool).await {
+            tracing::debug!(?e, "credits: scanner weights not measured");
+        }
         // Every tick (one count and the cached book), for the heartbeat.
         if let Err(e) = jobs::announce_budget(&node).await {
             tracing::debug!(?e, "credits: scan budget not computed");

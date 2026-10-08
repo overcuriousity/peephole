@@ -135,6 +135,8 @@ pub struct Arbiter {
     declined: Mutex<HashMap<String, std::collections::HashSet<NodeId>>>,
     /// Scanners that handed a job back for now, until when they are skipped.
     later: Mutex<HashMap<String, HashMap<NodeId, Instant>>>,
+    /// Each scanner's last claim here: `(levels excluded, least price)`.
+    last_claim: Mutex<HashMap<NodeId, (Vec<u8>, u32)>>,
     /// Paid jobs waiting for a cheaper scanner (the reserve), since when.
     held: Mutex<HashMap<String, Instant>>,
     /// How recent grants to each scanner ended, for [`delivers`].
@@ -159,6 +161,7 @@ impl Arbiter {
             leases: Mutex::new(HashMap::new()),
             outcomes: Mutex::new(HashMap::new()),
             held: Mutex::new(HashMap::new()),
+            last_claim: Mutex::new(HashMap::new()),
             waiting: Mutex::new(vec![]),
             order: super::order::Cached::new(),
             declined: Mutex::new(HashMap::new()),
@@ -367,6 +370,15 @@ impl Arbiter {
                 e.insert(self.stand(&s, &table).await);
             }
         }
+        // What each scanner asked for last: a scanner not asking now keeps
+        // its level exclusions and least price for the reserve.
+        let last = {
+            let mut l = self.last_claim.lock().unwrap();
+            for c in claims {
+                l.insert(c.id, (c.exclude.clone(), c.min_mc));
+            }
+            l.clone()
+        };
         let back = self.handed_back();
         // What no claimant would take stays in the queue unread.
         let nobody: Vec<&String> = back
@@ -422,19 +434,27 @@ impl Arbiter {
                 }
                 bids.sort_by_key(|(_, b)| rank::order(b));
                 let overdue = job.waited_secs >= OVERRIDE_WAIT_MINS * 60;
-                let (top_claim, top) = &bids[0];
-                let paid = match top.price {
-                    Some(p) => {
-                        crate::credits::jobs::affordable(
+                // The best claimant this round's book can pay: paid jobs go
+                // to it; with none, the job is idle work.
+                let mut payee = None;
+                for (k, (ci, b)) in bids.iter().enumerate() {
+                    if let Some(p) = b.price
+                        && crate::credits::jobs::affordable(
                             &self.node,
                             &mut funding,
-                            claims[*top_claim].min_mc,
+                            claims[*ci].min_mc,
                             p,
                         )
                         .await
+                    {
+                        payee = Some(k);
+                        break;
                     }
-                    None => false,
-                };
+                }
+                let paid = payee.is_some();
+                let pick = payee.unwrap_or(0);
+                let top = bids[pick].1.clone();
+                let bids_top_claim = bids[0].0;
                 let (reason, waited, sat_out) = if paid {
                     let standby: Vec<Standby> = scanners
                         .iter()
@@ -442,7 +462,10 @@ impl Arbiter {
                             !stands[*s].demoted
                                 && !table.can_do(s).is_some_and(|c| c < 1.0)
                                 && takes(s)
-                                && !claims.iter().any(|c| c.id == **s && excludes(c))
+                                && !last.get(*s).is_some_and(|(x, min_mc)| {
+                                    x.contains(&(level as u8))
+                                        || stands[*s].price.is_some_and(|p| p < *min_mc)
+                                })
                         })
                         .map(|s| {
                             let t = snap.tallies.get(&(*s, level)).copied().unwrap_or_default();
@@ -483,7 +506,13 @@ impl Arbiter {
                     if bids.is_empty() {
                         continue;
                     }
-                    (Reason::Unpaid, 0, (n - bids.len()) as i64)
+                    // Why nothing was paid, as the best claimant saw it.
+                    let why = match top.price {
+                        None => Reason::NoPrice,
+                        Some(p) if p < claims[bids_top_claim].min_mc => Reason::BelowMin,
+                        Some(_) => Reason::Unpaid,
+                    };
+                    (why, 0, (n - bids.len()) as i64)
                 };
                 // Another arbiter queued the same IP and its job ranks first, or
                 // a scan of it is running: the scanners would turn this one down.
@@ -507,10 +536,17 @@ impl Arbiter {
                     gone += 1;
                     continue;
                 }
-                let (i, bid) = bids[0].clone();
-                let next = match reason {
-                    Reason::Unpaid => None,
-                    _ => bids.get(1).map(|(_, b)| (b.id, b.effective())),
+                let (i, bid) = if paid {
+                    bids[pick].clone()
+                } else {
+                    bids[0].clone()
+                };
+                let next = match reason.unpaid() {
+                    true => None,
+                    false => bids
+                        .iter()
+                        .find(|(_, b)| b.id != bid.id)
+                        .map(|(_, b)| (b.id, b.effective())),
                 };
                 let c = &claims[i];
                 let g = match self
@@ -530,17 +566,22 @@ impl Arbiter {
                     st.load += 1;
                 }
                 info!(job = %g.job_uid, ip = %g.ip, scanner = %c.id.short(), "scan job granted");
+                let funded = g.offer_seq.is_some() || g.price_mc > 0;
                 let h = Handout {
                     job_uid: g.job_uid.clone(),
                     scanner: c.id,
                     level,
-                    paid: g.offer_seq.is_some() || g.price_mc > 0,
+                    paid: funded,
                     price_mc: bid.price,
                     rate: bid.weight,
                     effective_mc: bid.effective(),
                     next,
                     waited_secs: waited,
-                    reason,
+                    reason: if paid && !funded {
+                        Reason::OfferFailed
+                    } else {
+                        reason
+                    },
                     sat_out,
                 };
                 if let Err(e) = super::handout::record(pool, &h).await {
@@ -1820,6 +1861,7 @@ mod tests {
             "over capacity",
             "excludes",
             "paused",
+            "excluded before",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (node, arbiter, store, _tx) = setup(dir.path()).await;
@@ -1869,6 +1911,10 @@ mod tests {
                     .unwrap();
                 }
                 "excludes" => claims.push(claim_of(fast, &[4])),
+                "excluded before" => {
+                    // Fast last asked without level 4; it is busy now.
+                    assert!(arbiter.round(&[claim_of(fast, &[4])]).await.unwrap()[0].is_none());
+                }
                 _ => {}
             }
             let got = arbiter.round(&claims).await.unwrap();
@@ -2010,5 +2056,58 @@ mod tests {
         let l1 = queue(&node, &store, 1, 1).await;
         let g = arbiter.next_job(flaky, &[], 0).await.unwrap();
         assert_eq!(g.job_uid, l1);
+    }
+
+    /// When the best claimant cannot be paid (it takes no less than more
+    /// than its price here), the next one that can is paid.
+    #[tokio::test]
+    async fn a_fundable_claimant_is_paid_when_the_best_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        let (fast, flaky) = fast_and_flaky(&node, &store).await;
+        let uid = queue(&node, &store, 4, 4).await;
+        let picky = Claimant {
+            min_mc: 1000,
+            ..claim_of(fast, &[])
+        };
+        let got = arbiter.round(&[picky, claim_of(flaky, &[])]).await.unwrap();
+        assert!(got[0].is_none());
+        let g = got[1].as_ref().unwrap();
+        assert_eq!((g.job_uid.as_str(), g.price_mc), (uid.as_str(), 20));
+        let h = handout_of(&store, &uid).await;
+        assert_eq!(h.reason, crate::scan::handout::Reason::Cheapest);
+    }
+
+    /// The next best is another scanner, not a second claim of the same.
+    #[tokio::test]
+    async fn the_next_best_is_another_scanner() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        let (fast, flaky) = fast_and_flaky(&node, &store).await;
+        let uid = queue(&node, &store, 4, 4).await;
+        arbiter
+            .round(&[
+                claim_of(fast, &[]),
+                claim_of(fast, &[]),
+                claim_of(flaky, &[]),
+            ])
+            .await
+            .unwrap();
+        let h = handout_of(&store, &uid).await;
+        assert_eq!((h.scanner, h.next.map(|n| n.0)), (fast, Some(flaky)));
+    }
+
+    /// An unpaid grant says why it is unpaid.
+    #[tokio::test]
+    async fn an_unpaid_grant_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        let uid = queue(&node, &store, 2, 2).await;
+        let other = Identity::generate().unwrap().id;
+        arbiter.next_job(other, &[], 0).await.unwrap();
+        assert_eq!(
+            handout_of(&store, &uid).await.reason,
+            crate::scan::handout::Reason::NoPrice
+        );
     }
 }
