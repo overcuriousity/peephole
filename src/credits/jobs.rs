@@ -100,6 +100,39 @@ pub struct Funding {
     self_mc: Option<Mc>,
 }
 
+/// Whether this round's book can fund a grant at `price` to a scanner
+/// taking no less than `min_mc`. Reads the book and the own-job tally
+/// into `funding` the first time; writes nothing.
+pub async fn affordable(node: &Arc<Node>, funding: &mut Funding, min_mc: u32, price: u32) -> bool {
+    if price == 0 || price < min_mc {
+        return false;
+    }
+    let me = node.id();
+    if funding.book.is_none() {
+        let Ok(b) = super::book_fresh(node).await else {
+            return false;
+        };
+        funding.lots = b.ledger.by_day(&me);
+        funding.book = Some(b);
+    }
+    let self_mc = match funding.self_mc {
+        Some(s) => s,
+        None => {
+            let Ok(s) = self_committed(&node.store.pool, &me).await else {
+                return false;
+            };
+            funding.self_mc = Some(s);
+            s
+        }
+    };
+    let Some(book) = &funding.book else {
+        return false;
+    };
+    let left =
+        budget(&book.ledger, &me, node.scan_share(), self_mc).saturating_sub(funding.committed);
+    left >= price as Mc
+}
+
 /// Fund the grant of `job_uid` to `scanner` at `price` (see [`price_for`]):
 /// `Some((Some(seq), price))` once the offer is written, `Some((None,
 /// price))` for an own job, which the self tally holds against the budget.
@@ -121,29 +154,7 @@ pub async fn fund(
         tracing::warn!(?e, job = %job_uid, "old own-job reservation not cleared");
         return None;
     }
-    if price == 0 || price < min_mc {
-        return None;
-    }
-    let book = match &funding.book {
-        Some(b) => b.clone(),
-        None => {
-            let b = super::book_fresh(node).await.ok()?;
-            funding.lots = b.ledger.by_day(&me);
-            funding.book = Some(b.clone());
-            b
-        }
-    };
-    let self_mc = match funding.self_mc {
-        Some(s) => s,
-        None => {
-            let s = self_committed(&node.store.pool, &me).await.ok()?;
-            funding.self_mc = Some(s);
-            s
-        }
-    };
-    let left =
-        budget(&book.ledger, &me, node.scan_share(), self_mc).saturating_sub(funding.committed);
-    if left < price as Mc {
+    if !affordable(node, funding, min_mc, price).await {
         return None;
     }
     if scanner == me {

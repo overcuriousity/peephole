@@ -39,7 +39,12 @@ impl Bid {
 /// Not demoted first, then cheapest per delivered result, then fewest
 /// recent scans, then key.
 pub fn rank(bids: &mut [Bid]) {
-    bids.sort_by_key(|b| (b.demoted, b.effective(), b.load, b.id));
+    bids.sort_by_key(order);
+}
+
+/// The sort key of [`rank`].
+pub fn order(b: &Bid) -> (bool, u32, i64, NodeId) {
+    (b.demoted, b.effective(), b.load, b.id)
 }
 
 /// A live scanner, not demoted and under its capacity, that could take
