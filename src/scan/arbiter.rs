@@ -80,10 +80,13 @@ fn undelivered(status: &str, why: Option<&str>) -> bool {
 
 type Waiter = (NodeId, Vec<u8>, u32, oneshot::Sender<Option<Grant>>);
 
-/// Queued jobs a round reads at most. Jobs every claimant handed back, or
-/// whose level every claimant excludes, are not read at all; jobs held
-/// for a cheaper scanner are, so the bound is generous.
-const ROUND_JOBS: i64 = 500;
+/// Queued jobs a round reads at most, a page of [`ROUND_PAGE`] at a time
+/// until every claim has a job. Jobs every claimant handed back, or whose
+/// level every claimant excludes, are not read at all; jobs held for a
+/// cheaper scanner are, so a long held backlog does not hide the work
+/// behind it.
+const ROUND_JOBS: i64 = 5000;
+const ROUND_PAGE: i64 = 200;
 
 /// One claim of a round: who asks, the levels it takes none of, and the
 /// least it takes for a funded job.
@@ -374,149 +377,194 @@ impl Arbiter {
         let excluded: Vec<u8> = (1..=4u8)
             .filter(|l| claims.iter().all(|c| c.exclude.contains(l)))
             .collect();
-        let jobs = self.queued(&nobody, &excluded).await?;
         let mut funding = crate::credits::jobs::Funding::default();
-        for job in jobs {
-            if out.iter().all(Option::is_some) {
-                break;
-            }
-            let level = job.level;
-            let takes = |id: &NodeId| {
-                !back.get(&job.uid).is_some_and(|by| by.contains(id))
-                    && !(job.failed_by == Some(*id) && !job.failer_may)
-            };
-            let excludes = |c: &Claimant| c.exclude.contains(&(level as u8));
-            let mut bids: Vec<(usize, Bid)> = claims
-                .iter()
-                .enumerate()
-                .filter(|(i, c)| out[*i].is_none() && !excludes(c) && takes(&c.id))
-                .map(|(i, c)| {
-                    let st = &stands[&c.id];
-                    let bid = Bid {
-                        id: c.id,
-                        price: st.price,
-                        weight: weight::weight(&snap.tallies, c.id, &scanners, level),
-                        demoted: st.demoted,
-                        load: st.load,
-                    };
-                    (i, bid)
-                })
-                .collect();
-            if bids.is_empty() {
-                continue;
-            }
-            // Another arbiter queued the same IP and its job ranks first, or
-            // a scan of it is running: the scanners would turn this one down.
-            if let Some(other) = super::outranked_by(pool, &job.uid).await? {
-                info!(job = %job.uid, ip = %job.ip, by = %other, "scan job superseded by another job for the same IP");
-                let why = format!("job {other} for this IP ranks first");
-                self.set_state(&job.uid, "superseded", Some(why), Some(now_ts()))
-                    .await?;
-                continue;
-            }
-            bids.sort_by_key(|(_, b)| rank::order(b));
-            let overdue = job.waited_secs >= OVERRIDE_WAIT_MINS * 60;
-            let (top_claim, top) = &bids[0];
-            let paid = match top.price {
-                Some(p) => {
-                    crate::credits::jobs::affordable(
-                        &self.node,
-                        &mut funding,
-                        claims[*top_claim].min_mc,
-                        p,
-                    )
-                    .await
+        let mut offset = 0;
+        'pages: while offset < ROUND_JOBS && !out.iter().all(Option::is_some) {
+            let jobs = match self.queued(&nobody, &excluded, offset).await {
+                Ok(j) => j,
+                Err(e) => {
+                    warn!(?e, "handing out scan jobs stopped");
+                    break;
                 }
-                None => false,
             };
-            let (reason, waited, sat_out) = if paid {
-                let standby: Vec<Standby> = scanners
+            let read = jobs.len() as i64;
+            // Jobs granted or superseded leave the queue: the next page starts
+            // that many earlier.
+            let mut gone = 0;
+            for job in jobs {
+                if out.iter().all(Option::is_some) {
+                    break 'pages;
+                }
+                let level = job.level;
+                let takes = |id: &NodeId| {
+                    !back.get(&job.uid).is_some_and(|by| by.contains(id))
+                        && !(job.failed_by == Some(*id) && !job.failer_may)
+                };
+                let excludes = |c: &Claimant| c.exclude.contains(&(level as u8));
+                let mut bids: Vec<(usize, Bid)> = claims
                     .iter()
-                    .filter(|s| {
-                        !stands[*s].demoted
-                            && takes(s)
-                            && !claims.iter().any(|c| c.id == **s && excludes(c))
-                    })
-                    .map(|s| {
-                        let t = snap.tallies.get(&(*s, level)).copied().unwrap_or_default();
-                        Standby {
-                            id: *s,
-                            price: stands[s].price,
-                            weight: weight::weight(&snap.tallies, *s, &scanners, level),
-                            sample: t.ok + t.failed,
-                        }
+                    .enumerate()
+                    .filter(|(i, c)| out[*i].is_none() && !excludes(c) && takes(&c.id))
+                    .map(|(i, c)| {
+                        let st = &stands[&c.id];
+                        let bid = Bid {
+                            id: c.id,
+                            price: st.price,
+                            weight: weight::weight(&snap.tallies, c.id, &scanners, level),
+                            demoted: st.demoted,
+                            load: st.load,
+                        };
+                        (i, bid)
                     })
                     .collect();
-                match rank::waits(top.effective(), rank::reserve(&standby), job.waited_secs) {
-                    Wait::Hold => {
-                        self.held
-                            .lock()
-                            .unwrap()
-                            .entry(job.uid.clone())
-                            .or_insert_with(Instant::now);
-                        continue;
-                    }
-                    Wait::Go => {
-                        let held = self.held.lock().unwrap().get(&job.uid).copied();
-                        let w = held.map_or(0, |t| t.elapsed().as_secs() as i64);
-                        (Reason::Cheapest, w, 0)
-                    }
-                    Wait::Override => (Reason::Override, job.waited_secs, 0),
-                }
-            } else {
-                // Idle work has no price to compare: the sit-out draws stay.
-                let n = bids.len();
-                if !overdue {
-                    let now = weight::unix_now();
-                    bids.retain(|(_, b)| {
-                        !weight::skipped_levels(&snap.tallies, b.id, &scanners, now)
-                            .contains(&level)
-                    });
-                }
                 if bids.is_empty() {
                     continue;
                 }
-                (Reason::Unpaid, 0, (n - bids.len()) as i64)
-            };
-            let (i, bid) = bids[0].clone();
-            let next = match reason {
-                Reason::Unpaid => None,
-                _ => bids.get(1).map(|(_, b)| (b.id, b.effective())),
-            };
-            let c = &claims[i];
-            let g = self
-                .grant(&mut funding, c, &job, paid.then_some(bid.price).flatten())
-                .await?;
-            self.held.lock().unwrap().remove(&job.uid);
-            if let Some(st) = stands.get_mut(&c.id) {
-                st.load += 1;
+                bids.sort_by_key(|(_, b)| rank::order(b));
+                let overdue = job.waited_secs >= OVERRIDE_WAIT_MINS * 60;
+                let (top_claim, top) = &bids[0];
+                let paid = match top.price {
+                    Some(p) => {
+                        crate::credits::jobs::affordable(
+                            &self.node,
+                            &mut funding,
+                            claims[*top_claim].min_mc,
+                            p,
+                        )
+                        .await
+                    }
+                    None => false,
+                };
+                let (reason, waited, sat_out) = if paid {
+                    let standby: Vec<Standby> = scanners
+                        .iter()
+                        .filter(|s| {
+                            !stands[*s].demoted
+                                && !table.can_do(s).is_some_and(|c| c < 1.0)
+                                && takes(s)
+                                && !claims.iter().any(|c| c.id == **s && excludes(c))
+                        })
+                        .map(|s| {
+                            let t = snap.tallies.get(&(*s, level)).copied().unwrap_or_default();
+                            Standby {
+                                id: *s,
+                                price: stands[s].price,
+                                weight: weight::weight(&snap.tallies, *s, &scanners, level),
+                                sample: t.ok + t.failed,
+                            }
+                        })
+                        .collect();
+                    match rank::waits(top.effective(), rank::reserve(&standby), job.waited_secs) {
+                        Wait::Hold => {
+                            self.held
+                                .lock()
+                                .unwrap()
+                                .entry(job.uid.clone())
+                                .or_insert_with(Instant::now);
+                            continue;
+                        }
+                        Wait::Go => {
+                            let held = self.held.lock().unwrap().get(&job.uid).copied();
+                            let w = held.map_or(0, |t| t.elapsed().as_secs() as i64);
+                            (Reason::Cheapest, w, 0)
+                        }
+                        Wait::Override => (Reason::Override, job.waited_secs, 0),
+                    }
+                } else {
+                    // Idle work has no price to compare: the sit-out draws stay.
+                    let n = bids.len();
+                    if !overdue {
+                        let now = weight::unix_now();
+                        bids.retain(|(_, b)| {
+                            !weight::skipped_levels(&snap.tallies, b.id, &scanners, now)
+                                .contains(&level)
+                        });
+                    }
+                    if bids.is_empty() {
+                        continue;
+                    }
+                    (Reason::Unpaid, 0, (n - bids.len()) as i64)
+                };
+                // Another arbiter queued the same IP and its job ranks first, or
+                // a scan of it is running: the scanners would turn this one down.
+                let other = match super::outranked_by(pool, &job.uid).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        warn!(?e, job = %job.uid, "handing out scan jobs stopped");
+                        break 'pages;
+                    }
+                };
+                if let Some(other) = other {
+                    info!(job = %job.uid, ip = %job.ip, by = %other, "scan job superseded by another job for the same IP");
+                    let why = format!("job {other} for this IP ranks first");
+                    if let Err(e) = self
+                        .set_state(&job.uid, "superseded", Some(why), Some(now_ts()))
+                        .await
+                    {
+                        warn!(?e, job = %job.uid, "handing out scan jobs stopped");
+                        break 'pages;
+                    }
+                    gone += 1;
+                    continue;
+                }
+                let (i, bid) = bids[0].clone();
+                let next = match reason {
+                    Reason::Unpaid => None,
+                    _ => bids.get(1).map(|(_, b)| (b.id, b.effective())),
+                };
+                let c = &claims[i];
+                let g = match self
+                    .grant(&mut funding, c, &job, paid.then_some(bid.price).flatten())
+                    .await
+                {
+                    Ok(g) => g,
+                    Err(e) => {
+                        // The grants made so far still go out.
+                        warn!(?e, job = %job.uid, "handing out scan jobs stopped");
+                        break 'pages;
+                    }
+                };
+                gone += 1;
+                self.held.lock().unwrap().remove(&job.uid);
+                if let Some(st) = stands.get_mut(&c.id) {
+                    st.load += 1;
+                }
+                info!(job = %g.job_uid, ip = %g.ip, scanner = %c.id.short(), "scan job granted");
+                let h = Handout {
+                    job_uid: g.job_uid.clone(),
+                    scanner: c.id,
+                    level,
+                    paid: g.offer_seq.is_some() || g.price_mc > 0,
+                    price_mc: bid.price,
+                    rate: bid.weight,
+                    effective_mc: bid.effective(),
+                    next,
+                    waited_secs: waited,
+                    reason,
+                    sat_out,
+                };
+                if let Err(e) = super::handout::record(pool, &h).await {
+                    tracing::debug!(?e, job = %h.job_uid, "hand-out not recorded");
+                }
+                out[i] = Some(g);
             }
-            info!(job = %g.job_uid, ip = %g.ip, scanner = %c.id.short(), "scan job granted");
-            let h = Handout {
-                job_uid: g.job_uid.clone(),
-                scanner: c.id,
-                level,
-                paid: g.offer_seq.is_some() || g.price_mc > 0,
-                price_mc: bid.price,
-                rate: bid.weight,
-                effective_mc: bid.effective(),
-                next,
-                waited_secs: waited,
-                reason,
-                sat_out,
-            };
-            if let Err(e) = super::handout::record(pool, &h).await {
-                tracing::debug!(?e, job = %h.job_uid, "hand-out not recorded");
+            if read < ROUND_PAGE {
+                break;
             }
-            out[i] = Some(g);
+            offset += read - gone;
         }
         Ok(out)
     }
 
-    /// This arbiter's queued jobs that are due, highest response ratio
-    /// first, at most [`ROUND_JOBS`], past `nobody` (uids every claimant
+    /// A page of this arbiter's queued jobs that are due, highest response
+    /// ratio first, from `offset`, past `nobody` (uids every claimant
     /// handed back) and the `excluded` levels (every claimant's).
-    async fn queued(&self, nobody: &[&String], excluded: &[u8]) -> Result<Vec<Queued>> {
+    async fn queued(
+        &self,
+        nobody: &[&String],
+        excluded: &[u8],
+        offset: i64,
+    ) -> Result<Vec<Queued>> {
         let est = self.order.get(&self.node.store.pool).await;
         let rows: Vec<QueuedRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT j.uid, i.ip, j.level, j.attempts, j.failed_by,
@@ -527,7 +575,7 @@ impl Arbiter {
                    AND j.uid NOT IN (SELECT value FROM json_each(?))
                    AND j.level NOT IN (SELECT value FROM json_each(?))
                    AND (j.retry_at IS NULL OR j.retry_at <= datetime('now'))
-                 ORDER BY {} LIMIT {ROUND_JOBS}",
+                 ORDER BY {} LIMIT {ROUND_PAGE} OFFSET {offset}",
             super::retry::LAST_FAILER_WAIT,
             est.order_by("j", "j.uid"),
         )))
@@ -1771,6 +1819,7 @@ mod tests {
             "no record",
             "over capacity",
             "excludes",
+            "paused",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (node, arbiter, store, _tx) = setup(dir.path()).await;
@@ -1778,7 +1827,11 @@ mod tests {
             node.set_scan_share(0.5);
             let fast = remote_scanner(&node, 30).await;
             let flaky = remote_scanner(&node, 20).await;
-            let fast_can_do = if case == "over capacity" { 1.0 } else { 100.0 };
+            let fast_can_do = match case {
+                "over capacity" => 1.0,
+                "paused" => 0.0,
+                _ => 100.0,
+            };
             references(&node, &[(fast, 30, fast_can_do), (flaky, 20, 100.0)]);
             history(&store, fast, 4, if case == "no record" { 4 } else { 10 }, 0).await;
             history(&store, flaky, 4, 2, 10).await;
@@ -1901,5 +1954,61 @@ mod tests {
         let held = arbiter.held.lock().unwrap();
         assert!(!held.contains_key("gone"));
         assert!(held.contains_key("fresh"));
+    }
+
+    /// A failure late in a round does not lose the grants made before it.
+    #[tokio::test]
+    async fn grants_made_before_an_error_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        let first = queue(&node, &store, 1, 2).await;
+        let second = queue(&node, &store, 2, 2).await;
+        sqlx::query("UPDATE scan_jobs SET queued_at = datetime('now', '-5 minutes') WHERE uid = ?")
+            .bind(&first)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER boom BEFORE UPDATE ON scan_jobs WHEN NEW.uid = '{second}'
+             BEGIN SELECT RAISE(ABORT, 'boom'); END"
+        )))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let other = Identity::generate().unwrap().id;
+        let got = arbiter
+            .round(&[claim_of(other, &[]), claim_of(other, &[])])
+            .await
+            .unwrap();
+        assert_eq!(got[0].as_ref().map(|g| g.job_uid.clone()), Some(first));
+        assert!(got[1].is_none());
+    }
+
+    /// A backlog of held jobs longer than a page does not hide the work
+    /// behind it.
+    #[tokio::test]
+    async fn a_long_held_backlog_does_not_hide_cheaper_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        let (_fast, flaky) = fast_and_flaky(&node, &store).await;
+        let ip = store
+            .upsert_ip("198.51.100.200".parse().unwrap())
+            .await
+            .unwrap();
+        for _ in 0..(ROUND_PAGE + 50) {
+            sqlx::query(
+                "INSERT INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at)
+                 VALUES (lower(hex(randomblob(16))), ?1, ?1, 1, ?2, 4, 'queued',
+                         datetime('now', '-20 minutes'))",
+            )
+            .bind(&node.id().0[..])
+            .bind(ip.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        let l1 = queue(&node, &store, 1, 1).await;
+        let g = arbiter.next_job(flaky, &[], 0).await.unwrap();
+        assert_eq!(g.job_uid, l1);
     }
 }
