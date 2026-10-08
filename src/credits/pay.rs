@@ -83,11 +83,7 @@ pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
     let members = node.members();
     for id in node.live_members(crate::intel::LIVE_WINDOW) {
         let Some(m) = members.get(&id) else { continue };
-        if id == me
-            || node.is_blocked(&id)
-            || !pays_with(m.proto_max)
-            || node.dial_address(&id).is_none()
-        {
+        if id == me || node.is_blocked(&id) || !pays_with(m.proto_max) || !node.can_call(&id) {
             continue;
         }
         let Some(k) = node.status.known(&id) else {
@@ -304,6 +300,11 @@ pub async fn accept_offer(
 /// number.
 pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Result<u64, String> {
     let me = node.id();
+    // Checked before the offer is written: an offer nobody can be asked
+    // to serve would stay held for 15 minutes.
+    if server != me && !node.can_call(&server) {
+        return Err("the node cannot be reached from here".into());
+    }
     let mut book = super::book_fresh(node)
         .await
         .map_err(|e| format!("this node could not read its books: {e:#}"))?;
@@ -325,16 +326,6 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
             show(total_mc.saturating_sub(have))
         ));
     };
-    // Checked before the offer is written: an offer nobody can be asked
-    // to serve would stay held for 15 minutes.
-    let addr = if server != me {
-        match node.dial_address(&server) {
-            Some(a) => Some(a),
-            None => return Err("the node cannot be dialled from here".into()),
-        }
-    } else {
-        None
-    };
     let offer = repl::append_sealing(node, |seal| Record::CreditOffer {
         to: server,
         parts,
@@ -343,14 +334,16 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
     })
     .await
     .map_err(|e| format!("the offer could not be written: {e:#}"))?;
-    if let Some(addr) = addr {
-        // So the offer is there before the request.
-        if let Err(e) = crate::cluster::sync::reconcile(node, server, &addr, false).await {
-            tracing::debug!(
-                ?e,
-                "sync before a paid request failed; the server waits for the offer"
-            );
-        }
+    // So the offer is there before the request. A server nobody can dial
+    // pulls it with its own long-poll.
+    if server != me
+        && let Some(addr) = node.dial_address(&server)
+        && let Err(e) = crate::cluster::sync::reconcile(node, server, &addr, false).await
+    {
+        tracing::debug!(
+            ?e,
+            "sync before a paid request failed; the server waits for the offer"
+        );
     }
     Ok(offer.seq)
 }
@@ -575,21 +568,25 @@ pub async fn offer_and_ask(
         offer_seq: Some(seq),
     };
     let mut resp = {
-        let Some(addr) = node.dial_address(&server) else {
-            return decline("the node cannot be dialled from here".into());
-        };
-        let call = node.call::<LookupReq, LookupResp>(server, &addr, "/rpc/v1/lookup", &req);
-        let r = match tokio::time::timeout(crate::intel::lookup::RPC_TIMEOUT + SERVE_WAIT, call)
-            .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return decline(format!("could not be asked: {e:#}")),
-            Err(_) => return decline("did not answer in time".into()),
+        let call = node.call_any::<LookupReq, LookupResp>(
+            server,
+            "/rpc/v1/lookup",
+            &req,
+            crate::intel::lookup::RPC_TIMEOUT + SERVE_WAIT,
+        );
+        let r = match call.await {
+            Ok(r) => r,
+            Err(e) if e.downcast_ref::<crate::cluster::msg::NoAnswer>().is_some() => {
+                return decline("did not answer in time".into());
+            }
+            Err(e) => return decline(format!("could not be asked: {e:#}")),
         };
         // A declined offer comes with a receipt of nothing: fetch it, so
-        // what the offer held is free for the next one.
+        // what the offer held is free for the next one. A server nobody can
+        // dial pushes its receipt with its own sync.
         if r.findings.is_empty()
             && r.charged_mc == 0
+            && let Some(addr) = node.dial_address(&server)
             && let Err(e) = crate::cluster::sync::reconcile(node, server, &addr, false).await
         {
             tracing::debug!(?e, "sync after a declined offer failed");
@@ -729,6 +726,13 @@ mod tests {
             )
         };
         assert_eq!(crate::cluster::rpc::proto::SCAN_PRICE_PROTO, 5);
+        assert_eq!(crate::cluster::rpc::proto::ROUTED_PROTO, 6);
+        const {
+            assert!(
+                crate::cluster::rpc::proto::PROTO_VERSION
+                    >= crate::cluster::rpc::proto::ROUTED_PROTO
+            )
+        };
         assert!(!pays_with(3));
         assert!(pays_with(4));
     }

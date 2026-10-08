@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Highest protocol version this build speaks.
-pub const PROTO_VERSION: u32 = 5;
+pub const PROTO_VERSION: u32 = 6;
 /// Lowest protocol version this build still speaks. Version 1 let any
 /// member revoke others and delete their records; it is not spoken.
 pub const PROTO_MIN: u32 = 2;
@@ -16,6 +16,10 @@ pub const SCAN_PRICE_PROTO: u32 = 5;
 /// Members from this version count balances with the market's rules
 /// (`credits::mint`): payments go only between them.
 pub const MARKET_PROTO: u32 = 4;
+/// Members from this version answer `Msg::Rpc` sent through their outbox;
+/// older ones cannot decode or relay it, so neither the target nor any
+/// relay or outbox holder on the way may be older.
+pub const ROUTED_PROTO: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Hello {

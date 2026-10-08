@@ -30,10 +30,11 @@ pub const PUBLIC_BURST: u32 = 60;
 /// `/login/*` and `/enroll/*` POSTs, per client.
 pub const AUTH_PER_MINUTE: u32 = 10;
 pub const AUTH_BURST: u32 = 10;
-/// `/login/start` POSTs from all clients together. Starts within
-/// [`MIN_CEREMONY_SECS`](crate::store::auth::MIN_CEREMONY_SECS) stay well
-/// under [`MAX_OPEN_CEREMONIES`](crate::store::auth::MAX_OPEN_CEREMONIES), so
-/// at the cap an old one is always there to evict.
+/// `/login/start` and `/login/password` POSTs from all clients together.
+/// Starts within [`MIN_CEREMONY_SECS`](crate::store::auth::MIN_CEREMONY_SECS)
+/// stay well under
+/// [`MAX_OPEN_CEREMONIES`](crate::store::auth::MAX_OPEN_CEREMONIES), so at
+/// the cap an old one is always there to evict.
 pub const LOGIN_PER_MINUTE: u32 = 120;
 pub const LOGIN_BURST: u32 = 30;
 const _: () = assert!(
@@ -217,8 +218,9 @@ pub async fn enforce(State(state): State<Arc<AdminState>>, req: Request, next: N
     let limits = &state.limits;
     // Sign-in starts from everyone share one budget as well, taken after the
     // client's own so a client over its limit does not spend it.
-    let is_login_start = class == Class::Auth && req.uri().path() == "/login/start";
-    let global = || !is_login_start || limits.login.allow();
+    let is_sign_in =
+        class == Class::Auth && matches!(req.uri().path(), "/login/start" | "/login/password");
+    let global = || !is_sign_in || limits.login.allow();
     // No peer address (in-process callers, tests): nothing to key on.
     let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>().copied() else {
         if !global() {
@@ -413,6 +415,11 @@ secure_cookies = false
             refused.is_some_and(|i| i >= LOGIN_BURST - AUTH_BURST),
             "{refused:?}"
         );
+        // Password sign-ins share it.
+        let r = call("POST", "/login/password", Some("192.0.2.251"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 429);
         // Other ceremony endpoints are not in it.
         let r = call("POST", "/login/finish", Some("192.0.2.250"))
             .await
@@ -424,6 +431,7 @@ secure_cookies = false
     fn only_public_pages_and_ceremonies_are_limited() {
         use axum::http::Method;
         assert_eq!(classify(&Method::POST, "/login/start"), Class::Auth);
+        assert_eq!(classify(&Method::POST, "/login/password"), Class::Auth);
         assert_eq!(classify(&Method::POST, "/enroll/finish"), Class::Auth);
         assert_eq!(classify(&Method::GET, "/ips"), Class::Public);
         assert_eq!(classify(&Method::GET, "/ip/203.0.113.1"), Class::Public);

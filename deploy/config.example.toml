@@ -119,14 +119,6 @@ refresh_after_days = 30
 # enabled = true
 # daily_limit = 0           # 0 = no local cap
 
-# [greynoise]
-# # GreyNoise Community: mass scanner or known benign service
-# # (https://viz.greynoise.io/account/api-key; free keys need a business
-# # email). Without a key: 10 lookups per day; with a free key: 50 per week.
-# api_key = ""
-# daily_limit = 10          # override the defaults above
-# weekly_limit = 50
-
 [scan]
 max_workers = 2            # concurrent nmap subprocesses (2–16)
 timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admin queue page)
@@ -203,16 +195,19 @@ tor_wait_hours = 6
 # recent_rows = 50     # rows of the wall's "Recent requests" (last 24 h)
 
 # Distributed mode: share requests, scan queue, results and intel with other
-# nodes (docs/cluster.md). Absent: standalone. The node key is
-# created on first start; print it with `peephole cluster id`. Add nodes with
-# the reusable invite from `peephole cluster invite` and
-# `peephole cluster join <token>`, or list them below. Nobody can remove a
-# member; a node leaves with `peephole cluster leave`. Open `listen` to the
-# other nodes only.
+# nodes (docs/cluster.md). The installer writes this section on every node;
+# without peers or an invite the node runs alone. Absent: standalone. The
+# node key is created on first start; print it with `peephole cluster id`.
+# Add nodes with the reusable invite from `peephole cluster invite` and
+# `peephole cluster join <token>` (a running node picks the join up), or list
+# them below. Nobody can remove a member; a node leaves with
+# `peephole cluster leave`. The advertised port must be reachable from the
+# internet. Changing listen or advertise takes a restart.
 # [cluster]
-# node_name = "server-a"            # shown in the admin UI only
+# node_name = "server-a"            # shown in the admin UI only (installer: the host name)
 # listen    = "0.0.0.0:7443"        # RPC listener (mutual TLS, pinned keys)
-# advertise = "a.example.net:7443"  # how peers reach us; omit if outbound-only
+# advertise = "a.example.net:7443"  # host:port other members dial. Outbound-only, for a node
+#                                   # nobody can reach: delete it and set listen to 127.0.0.1:7443
 # takeover_hours = 6                # adopt an unreachable node's queued jobs after
 # lease_secs     = 120              # scan lease, renewed while nmap runs
 # origin_quota_mb = 20480           # stop storing a member's entries beyond this (0 = no limit)

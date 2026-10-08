@@ -55,6 +55,10 @@ const REFUSAL_TRACKED: usize = 1024;
 /// When each trusted proxy was last warned about.
 static REFUSALS_WARNED: LazyLock<Mutex<HashMap<IpAddr, Instant>>> = LazyLock::new(Default::default);
 
+/// When each untrusted peer was last warned about.
+static UNTRUSTED_WARNED: LazyLock<Mutex<HashMap<IpAddr, Instant>>> =
+    LazyLock::new(Default::default);
+
 /// Whether a refusal from `peer` is worth a warning now (see
 /// [`REFUSAL_WARN_EVERY`]); records it if so.
 fn warn_refusal_now(warned: &mut HashMap<IpAddr, Instant>, peer: IpAddr, now: Instant) -> bool {
@@ -355,6 +359,22 @@ pub async fn serve_trap_with(
                             }
                             return;
                         }
+                        // Most likely the operator's own proxy, missing from
+                        // trusted_proxies.
+                        Err(Unusable::UntrustedProxy) => {
+                            if warn_refusal_now(
+                                &mut UNTRUSTED_WARNED.lock().unwrap(),
+                                peer.ip(),
+                                Instant::now(),
+                            ) {
+                                warn!(%peer, "trap: a PROXY header from a peer that is not in \
+                                      trusted_proxies; if it is your proxy, add it there \
+                                      (warned once an hour)");
+                            } else {
+                                debug!(%peer, "trap: PROXY header from an untrusted peer");
+                            }
+                            return;
+                        }
                         Err(Unusable::Other) => {
                             debug!(%peer, "trap: no usable PROXY header or ClientHello");
                             return;
@@ -389,6 +409,8 @@ pub async fn serve_trap_with(
 enum Unusable {
     /// A trusted proxy's PROXY header was refused, and why.
     Proxy(&'static str),
+    /// A PROXY header from a peer outside `trusted_proxies`.
+    UntrustedProxy,
     /// No ClientHello, or the connection ended or timed out first.
     Other,
 }
@@ -435,6 +457,17 @@ async fn preface(
                         fill(&mut stream, &mut buf).await.ok_or(Unusable::Other)?
                     }
                 }
+            }
+        } else {
+            // Read on only while the bytes so far could still begin a PROXY
+            // header; a ClientHello (0x16) leaves at once, undelayed.
+            while buf.len() < proxy_proto::SIG_V2.len()
+                && (proxy_proto::SIG_V2.starts_with(&buf) || b"PROXY ".starts_with(&buf))
+            {
+                fill(&mut stream, &mut buf).await.ok_or(Unusable::Other)?;
+            }
+            if buf.starts_with(b"PROXY ") || buf.starts_with(&proxy_proto::SIG_V2[..]) {
+                return Err(Unusable::UntrustedProxy);
             }
         }
         let mut hello = tls_hello::HelloParser::default();
@@ -595,6 +628,44 @@ async fn serve_conn<I>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        (client, l.accept().await.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn a_proxy_header_from_an_untrusted_peer_is_named() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, server) = tcp_pair().await;
+        client
+            .write_all(b"PROXY TCP4 203.0.113.1 10.0.0.1 1234 443\r\n")
+            .await
+            .unwrap();
+        assert!(matches!(
+            preface(server, false).await,
+            Err(Unusable::UntrustedProxy)
+        ));
+        // Split across reads.
+        let (mut client, server) = tcp_pair().await;
+        let sig = proxy_proto::SIG_V2;
+        client.write_all(&sig[..5]).await.unwrap();
+        let task = tokio::spawn(preface(server, false));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.write_all(&sig[5..]).await.unwrap();
+        assert!(matches!(task.await.unwrap(), Err(Unusable::UntrustedProxy)));
+        // A v1 header split inside its first word.
+        let (mut client, server) = tcp_pair().await;
+        client.write_all(b"PRO").await.unwrap();
+        let task = tokio::spawn(preface(server, false));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client
+            .write_all(b"XY TCP4 203.0.113.1 10.0.0.1 1 443\r\n")
+            .await
+            .unwrap();
+        assert!(matches!(task.await.unwrap(), Err(Unusable::UntrustedProxy)));
+    }
 
     #[test]
     fn a_configured_certificate_is_loaded_and_a_broken_one_refused() {

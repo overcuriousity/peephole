@@ -3,7 +3,7 @@
 //! when the service fails or says "too many requests", and a skip list for
 //! addresses that must not or cannot be asked. Each service only builds its
 //! request and turns the answer into a compact result (see
-//! [`super::abuseipdb`], [`super::shodan`], [`super::greynoise`]).
+//! [`super::abuseipdb`], [`super::shodan`]).
 //!
 //! Keys stay in the request: nothing here logs a URL (the Shodan key is a
 //! query parameter), and response bodies are never logged or stored raw.

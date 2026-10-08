@@ -411,9 +411,9 @@ mod tests {
         .unwrap();
         rec.record_lookup(
             ip,
-            crate::intel::GREYNOISE,
+            crate::intel::SHODAN,
             None,
-            serde_json::json!({"noise": true, "riot": false, "classification": "malicious"}),
+            serde_json::json!({"tags": ["vpn", "scanner"]}),
         )
         .await
         .unwrap();
@@ -432,24 +432,21 @@ mod tests {
             .unwrap();
         assert_eq!(score, Some(90));
         let tags = s.intel_tags().await.unwrap();
-        assert!(
-            tags.contains(&"greynoise:malicious".to_string()),
-            "{tags:?}"
-        );
-        assert!(tags.contains(&"greynoise:noise".to_string()));
+        assert!(tags.contains(&"shodan:vpn".to_string()), "{tags:?}");
+        assert!(tags.contains(&"shodan:scanner".to_string()));
         assert!(
             !tags.contains(&"abuseipdb:SSH".to_string()),
             "older result's tag is gone"
         );
         let f = crate::store::browse::IpFilter {
-            tag: Some("greynoise:malicious".into()),
+            tag: Some("shodan:vpn".into()),
             min_abuse: Some(50),
-            intel: Some(crate::intel::GREYNOISE.into()),
+            intel: Some(crate::intel::SHODAN.into()),
             ..Default::default()
         };
         assert_eq!(s.list_ips(&f).await.unwrap().items.len(), 1);
         let f = crate::store::browse::IpFilter {
-            nointel: Some(crate::intel::SHODAN.into()),
+            nointel: Some(crate::intel::RDAP.into()),
             sort: Some("abuse".into()),
             ..Default::default()
         };

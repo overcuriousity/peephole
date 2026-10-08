@@ -70,7 +70,7 @@ pub struct IpFilter {
     /// Admin only (the public filter drops these): minimum AbuseIPDB score.
     #[serde(default, deserialize_with = "lenient_i64")]
     pub min_abuse: Option<i64>,
-    /// Admin only: a provider tag (`shodan:vpn`, `greynoise:malicious`, …).
+    /// Admin only: a provider tag (`shodan:vpn`, `abuseipdb:…`).
     pub tag: Option<String>,
     /// Admin only: has a result from this provider.
     pub intel: Option<String>,

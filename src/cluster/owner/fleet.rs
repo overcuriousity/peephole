@@ -148,7 +148,7 @@ async fn greet(node: &Arc<Node>, only: Option<&[NodeId]>) -> Result<Vec<NodeId>>
             tag: serde_bytes::ByteBuf::from(hello_tag(&owned.id, &me, to).to_vec()),
             cert: serde_bytes::ByteBuf::from(owned.cert.clone()),
         };
-        let avoid = super::cmd::old_relays(node, to);
+        let avoid = super::cmd::old_relays(node, to, OWNER_PROTO);
         async move {
             let answer = node
                 .request_avoiding(*to, hello, HELLO_TIMEOUT, avoid)

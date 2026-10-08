@@ -82,7 +82,9 @@
   var wa = document.querySelector("[data-webauthn]");
   if (wa) {
     var mode = wa.getAttribute("data-webauthn"), msg = wa.querySelector("[data-msg]");
-    wa.querySelector("[data-go]").addEventListener("click", async function () {
+    // A password-only login page has no security-key button.
+    var go = wa.querySelector("[data-go]");
+    if (go) go.addEventListener("click", async function () {
       msg.textContent = "";
       try {
         if (mode === "login") {

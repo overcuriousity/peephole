@@ -29,7 +29,7 @@ nmap.
   sampled, but every request still leaves at least a light row (time,
   method, path) or a count.
 - **Enrichment** — MaxMind GeoLite2 country and ASN, the Tor exit list, and
-  optionally AbuseIPDB, Shodan, Shodan InternetDB and GreyNoise, plus RDAP registration data (network,
+  optionally AbuseIPDB, Shodan and Shodan InternetDB, plus RDAP registration data (network,
   holder, abuse contact), each within
   its own rate budget, refreshed when an IP returns.
 - **Counter-scans** — rate-limited nmap scans in four levels that escalate by
@@ -68,7 +68,7 @@ nmap.
   `[a-z0-9._:/-]{1,64}` and were asked by at least 2 IPs (else "other").
   Rule labels, and the families and OWASP tags derived from them, can be
   hidden too.
-- **Admin area** (FIDO2 security keys only, no passwords) — request search
+- **Admin area** (FIDO2 security keys; optionally a password) — request search
   and inspection (with the same IP's and same JA4's other requests), a live
   feed of new requests, analytics (top paths, user agents, JA4, methods,
   open ports, products, OS guesses, abuse scores; every row opens the
@@ -132,10 +132,13 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
 ```
 
 The installer verifies the download, asks which roles the node runs (trap,
-scanner, web interface), what is in front of the trap (nothing, so it takes
-ports 80 and 443 itself; nginx on the machine; or a proxy elsewhere), the
-admin domain, cluster membership and optional API keys, checks the ports are
-free, writes `/etc/peephole/config.toml`, and starts a systemd service.
+scanner, web interface; the scanner is opt-in), what is in front of the trap
+(nothing, so it takes ports 80 and 443 itself; nginx on the machine; or a
+proxy elsewhere), the admin domain and an optional admin password, the
+node's name and the address other cluster members dial (every node can join
+a cluster, now or later), an optional invite token and optional API keys,
+checks the ports are free, writes `/etc/peephole/config.toml`, and starts a
+systemd service.
 On request it also installs nginx with a Let's Encrypt certificate; otherwise
 it writes a matching nginx example and prints the steps. Re-running it
 upgrades in place and rolls back if the new version does not start.

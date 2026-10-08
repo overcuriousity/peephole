@@ -548,6 +548,20 @@ impl Node {
             .map(|(_, _, addr)| addr)
     }
 
+    /// Whether this node can ask `id` an RPC: it dials it, or `id` speaks
+    /// routed RPC and a route avoiding members too old to relay it exists.
+    pub fn can_call(&self, id: &NodeId) -> bool {
+        self.dial_address(id).is_some()
+            || (self
+                .members()
+                .get(id)
+                .is_some_and(|m| m.proto_max >= rpc::proto::ROUTED_PROTO)
+                && self.routable(
+                    id,
+                    &owner::cmd::old_relays(self, id, rpc::proto::ROUTED_PROTO),
+                ))
+    }
+
     /// Enrichment providers this node can query right now.
     pub fn providers(&self) -> Vec<String> {
         self.providers.read().unwrap().clone()
@@ -870,6 +884,63 @@ impl Node {
         rpc::cbor::decode(&bytes).with_context(|| format!("{path}: undecodable reply"))
     }
 
+    /// Like [`Node::call`], also for a member nobody can dial: then the
+    /// request goes as a message (only [`rpc::routed::ROUTED_PATHS`]).
+    pub async fn call_any<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+        self: &Arc<Self>,
+        peer: NodeId,
+        path: &str,
+        body: &Req,
+        timeout: Duration,
+    ) -> Result<Resp> {
+        if let Some(addr) = self.dial_address(&peer) {
+            return tokio::time::timeout(timeout, self.call(peer, &addr, path, body))
+                .await
+                .map_err(|_| {
+                    anyhow::Error::new(msg::NoAnswer(timeout)).context(path.to_string())
+                })?;
+        }
+        let members = self.members();
+        if let Some(m) = members.get(&peer)
+            && m.proto_max < rpc::proto::ROUTED_PROTO
+        {
+            bail!(
+                "{path}: {} runs a version that cannot be asked through its outbox",
+                m.name
+            );
+        }
+        let bytes = rpc::cbor::encode(body)?;
+        if !rpc::routed::fits(&bytes) {
+            bail!(
+                "{path}: request larger than {} bytes",
+                rpc::routed::MAX_ROUTED_BODY
+            );
+        }
+        let msg = msg::Msg::Rpc {
+            path: path.into(),
+            body: serde_bytes::ByteBuf::from(bytes),
+        };
+        let avoid = owner::cmd::old_relays(self, &peer, rpc::proto::ROUTED_PROTO);
+        let answer = self
+            .request_avoiding(peer, msg, timeout, avoid)
+            .await
+            .with_context(|| path.to_string())?;
+        match answer {
+            msg::Msg::RpcReply { body, .. } if !rpc::routed::fits(&body) => bail!(
+                "{path}: reply larger than {} bytes",
+                rpc::routed::MAX_ROUTED_BODY
+            ),
+            msg::Msg::RpcReply { status: 200, body } => {
+                rpc::cbor::decode(&body).with_context(|| format!("{path}: undecodable reply"))
+            }
+            msg::Msg::RpcReply { status, body } => bail!(
+                "{path}: HTTP {status}: {}",
+                String::from_utf8_lossy(&body[..body.len().min(300)])
+            ),
+            _ => bail!("{path}: unexpected answer, not an RPC reply"),
+        }
+    }
+
     /// Exchange `hello` with a peer; errors on protocol mismatch.
     pub async fn hello(&self, peer: NodeId, address: &str) -> Result<Hello> {
         let (status, bytes) = self
@@ -975,6 +1046,7 @@ pub async fn start(
         "cluster rpc listener up"
     );
     let tls = tls::server_config(&node.cert)?;
+    rpc::routed::serve(&node);
     tokio::spawn(rpc::server::serve(
         listener,
         tls,

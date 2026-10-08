@@ -15,9 +15,22 @@ Every node keeps a full copy of the dataset, so any web node shows the
 whole cluster. Scanners take jobs from any trap; jobs go to the scanner
 with the fewest recent scans.
 
-Enable it with a `[cluster]` section (see
-[`deploy/config.example.toml`](../deploy/config.example.toml)), then add
-nodes:
+The installer writes a `[cluster]` section on every node (see
+[`deploy/config.example.toml`](../deploy/config.example.toml)): a name, the
+listener and the `advertise` address other members dial, whose port must be
+reachable from the internet. A node without an invite runs alone until it
+joins; a running node picks a join up without a restart.
+
+Outbound-only is the fallback for a node nobody can reach (no public
+address, no port forwarding), set by hand: delete `advertise` and set
+`listen` to loopback (`127.0.0.1:7443`), then restart peephole. Such a node
+dials its peers and still syncs both ways, and receives directed messages
+(it fetches them from its peers' outboxes), so from protocol 6 it also
+answers paid lookups, DNS resolutions and probes that arrive as such
+messages: it and the member whose outbox it polls must run protocol 6. It
+cannot issue invites: a joiner could not reach it.
+
+Then add nodes:
 
 ```sh
 peephole cluster id                       # this node's key
@@ -44,8 +57,8 @@ peephole credits send <node> <amount>     # send credits to a member
 
 Nodes talk HTTP/2 over mutual TLS with pinned Ed25519 keys on
 `cluster.listen` (default port 7443). A node without `advertise` is
-outbound-only: it dials its peers and still syncs both ways. Peers can also
-be listed under `[[cluster.peers]]` with their key.
+outbound-only: it dials its peers and still syncs both ways. Peers can
+also be listed under `[[cluster.peers]]` with their key.
 
 ## How trust works
 
@@ -288,7 +301,10 @@ earn most of the new money, every member a little.
   price of protocol 4 seeds the scanners known at the first refresh after
   the upgrade; scanners that join later start at the median price
   scanners announce. Balances are recounted at start under the
-  new rules.
+  new rules. Protocol 6: outbound-only members are asked paid lookups,
+  resolutions and probes through their outbox only when they and the
+  member whose outbox they poll run protocol 6; older outbound-only
+  members are not asked until they upgrade.
 
 ## Things to know
 
@@ -380,8 +396,8 @@ earn most of the new money, every member a little.
   on_demand_share`), so curiosity cannot spend what the automatic
   enrichment runs on. Paid answers for an address the cluster has
   recorded are kept in the dataset; for any other address nothing is
-  stored. An outbound-only member, and one of an earlier version, cannot
-  be asked.
+  stored. A member of an earlier version cannot be asked; from protocol
+  6 an outbound-only member is asked through the outbox it long-polls.
 - **The blocklist feed** of a web node (`/api/blocklist`) is drawn from
   the whole cluster's requests and never lists a member's addresses
   (published ones, and the ones members connect from).
@@ -409,8 +425,8 @@ earn most of the new money, every member a little.
   credentials is enough; without any, the dataset has no GeoIP data. The Tor
   exit list is public and is fetched by one node for all. Every result
   records which provider and which node it came from (Admin → Export).
-- Threat-intel APIs (AbuseIPDB, Shodan, Shodan InternetDB, GreyNoise
-  Community) work the same way. Every node with a key announces it. One of
+- Threat-intel APIs (AbuseIPDB, Shodan, Shodan InternetDB)
+  work the same way. Every node with a key announces it. One of
   them looks each IP up, newest IPs first, within its own daily or weekly
   budget. The result, with its UTC time, is shared with every member. A node
   whose budget is spent, or whose key is rejected, stops announcing the

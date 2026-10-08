@@ -109,11 +109,19 @@ fn webauthn_for(cfg: &crate::config::Config) -> Result<Webauthn> {
     builder.build().context("webauthn build")
 }
 
+/// Password checks allowed at once.
+pub const MAX_VERIFIES: usize = 3;
+
+/// A hash nobody knows the password of, verified when none is set so a
+/// request takes as long as a real one (made once with `password::hash`).
+const DUMMY_PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$1+M9O+UgGF/mBHjQrx/Mag$2Zo8y2Txjn+t4vTml5CqtqPDb+ilJMk6j89jzN1FbUc";
+
 pub fn auth_routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/login", get(login_page))
         .route("/login/start", post(login_start))
         .route("/login/finish", post(login_finish))
+        .route("/login/password", post(login_password))
         .route("/enroll", get(enroll_page))
         .route("/enroll/start", post(enroll_start))
         .route("/enroll/finish", post(enroll_finish))
@@ -163,6 +171,9 @@ fn busy() -> Response {
 #[template(path = "login.html")]
 struct LoginPage {
     chrome: crate::admin::views::Chrome,
+    passkey: bool,
+    password: bool,
+    error: Option<String>,
 }
 
 #[derive(askama::Template)]
@@ -171,12 +182,27 @@ struct EnrollPage {
     chrome: crate::admin::views::Chrome,
 }
 
-async fn login_page(
-    crate::admin::public::MaybeUser(authed): crate::admin::public::MaybeUser,
+/// The login page for the chosen sign-in method.
+async fn render_login(
+    state: &AdminState,
+    authed: bool,
+    error: Option<String>,
 ) -> crate::admin::error::AppResult<Html<String>> {
+    let method = state.store.login_method().await.unwrap_or_default();
+    let has_hash = matches!(state.store.password_hash().await, Ok(Some(_)));
     crate::admin::error::render(&LoginPage {
         chrome: crate::admin::views::Chrome::new(authed, ""),
+        passkey: method.passkey(),
+        password: method.password() && has_hash,
+        error,
     })
+}
+
+async fn login_page(
+    State(state): State<Arc<AdminState>>,
+    crate::admin::public::MaybeUser(authed): crate::admin::public::MaybeUser,
+) -> crate::admin::error::AppResult<Html<String>> {
+    render_login(&state, authed, None).await
 }
 async fn enroll_page(
     crate::admin::public::MaybeUser(authed): crate::admin::public::MaybeUser,
@@ -393,7 +419,17 @@ async fn enroll_finish(
     }
 }
 
+/// Refusal when the sign-in method leaves security keys out.
+async fn passkey_off(state: &AdminState) -> Option<Response> {
+    let method = state.store.login_method().await.unwrap_or_default();
+    (!method.passkey())
+        .then(|| (StatusCode::FORBIDDEN, "security-key sign-in is off").into_response())
+}
+
 async fn login_start(State(state): State<Arc<AdminState>>, jar: CookieJar) -> Response {
+    if let Some(off) = passkey_off(&state).await {
+        return off;
+    }
     let creds = state.store.load_credentials().await.unwrap_or_default();
     let passkeys: Vec<Passkey> = creds
         .into_iter()
@@ -446,6 +482,9 @@ async fn login_finish(
     jar: CookieJar,
     Json(body): Json<LoginFinish>,
 ) -> Response {
+    if let Some(off) = passkey_off(&state).await {
+        return off;
+    }
     let cfg = &state.cfg;
     let Some(cookie) = jar.get(ceremony_cookie_name(cfg)) else {
         return (StatusCode::BAD_REQUEST, "no login in progress").into_response();
@@ -528,6 +567,60 @@ async fn login_finish(
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct PasswordLogin {
+    password: String,
+}
+
+/// Sign in with the admin password (methods `password` and `both`).
+async fn login_password(
+    State(state): State<Arc<AdminState>>,
+    jar: CookieJar,
+    axum::Form(f): axum::Form<PasswordLogin>,
+) -> Response {
+    let method = state.store.login_method().await.unwrap_or_default();
+    if !method.password() {
+        return (StatusCode::FORBIDDEN, "password sign-in is off").into_response();
+    }
+    let phc = match state.store.password_hash().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(?e, "could not read the password hash");
+            None
+        }
+    };
+    // Too many checks at once: refuse rather than queue (memory, threads).
+    let Ok(_slot) = state.verify_slots.try_acquire() else {
+        return busy();
+    };
+    let found = phc.is_some();
+    let phc = phc.unwrap_or_else(|| DUMMY_PHC.to_string());
+    let ok = tokio::task::spawn_blocking(move || crate::admin::password::verify(&f.password, &phc))
+        .await
+        .unwrap_or(false)
+        && found;
+    if !ok {
+        tracing::info!("password sign-in rejected");
+        return match render_login(&state, false, Some("Wrong password.".into())).await {
+            Ok(page) => (StatusCode::UNAUTHORIZED, page).into_response(),
+            Err(e) => e.into_response(),
+        };
+    }
+    // A session the browser held before ends now.
+    let old = session_token(&state, &jar);
+    match state.store.create_session_for(None, old.as_deref()).await {
+        Ok(token) => (
+            jar.add(session_cookie(&state.cfg, token)),
+            Redirect::to("/admin"),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(?e, "could not create session");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
 async fn logout(State(state): State<Arc<AdminState>>, jar: CookieJar) -> Response {
     if let Some(t) = session_token(&state, &jar) {
         let _ = state.store.destroy_session(&t).await;
@@ -557,6 +650,246 @@ secure_cookies = {secure}
 "#
         ))
         .unwrap()
+    }
+
+    use crate::store::auth::LoginMethod;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use tower::ServiceExt;
+
+    const PW: &str = "correct horse battery";
+
+    /// The admin app on a fresh database (plain-http cookies).
+    async fn app() -> (tempfile::TempDir, Arc<AdminState>, axum::Router) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(false);
+        c.database_path = dir.path().join("t.db");
+        let store = Store::connect(&c.database_path).await.unwrap();
+        let state = Arc::new(AdminState::public_only(store, c));
+        let router = crate::admin::full_router(state.clone());
+        (dir, state, router)
+    }
+
+    /// One request; `body` is form-encoded, `cookie` a session token.
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, Option<String>, String) {
+        let peer: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let mut b = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .extension(ConnectInfo(peer))
+            .header("content-type", "application/x-www-form-urlencoded");
+        if let Some(t) = cookie {
+            b = b.header("cookie", format!("peephole_session={t}"));
+        }
+        let r = app
+            .clone()
+            .oneshot(b.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = r.status();
+        let set = r
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .map(|v| v.to_str().unwrap().to_string());
+        let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        (status, set, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn set_pw(state: &AdminState, pw: &str) {
+        let phc = crate::admin::password::hash(pw).unwrap();
+        state.store.set_password_hash(&phc, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn password_login_follows_the_method() {
+        let (_d, state, app) = app().await;
+        let form = format!("password={PW}").replace(' ', "+");
+        let (st, set, _) = send(&app, "POST", "/login/password", None, &form).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "method passkey");
+        assert!(set.is_none());
+        state
+            .store
+            .save_credential(b"k1", "{}", Some("one"))
+            .await
+            .unwrap();
+        set_pw(&state, PW).await;
+        assert_eq!(state.store.login_method().await.unwrap(), LoginMethod::Both);
+        let (st, set, body) = send(&app, "POST", "/login/password", None, "password=nope").await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        assert!(set.is_none());
+        assert!(body.contains("Wrong password."), "{body}");
+        let (st, set, _) = send(&app, "POST", "/login/password", None, &form).await;
+        assert_eq!(st, StatusCode::SEE_OTHER);
+        let set = set.expect("session cookie");
+        assert!(set.starts_with("peephole_session="), "{set}");
+        // Password only: no security-key ceremony starts.
+        state
+            .store
+            .set_login_method(LoginMethod::Password)
+            .await
+            .unwrap();
+        let (st, _, body) = send(&app, "POST", "/login/start", None, "").await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        assert!(body.contains("security-key sign-in is off"), "{body}");
+    }
+
+    #[test]
+    fn the_dummy_hash_parses() {
+        assert!(argon2::PasswordHash::new(DUMMY_PHC).is_ok());
+    }
+
+    #[tokio::test]
+    async fn password_login_ends_the_session_held_and_is_capped() {
+        let (_d, state, app) = app().await;
+        state
+            .store
+            .save_credential(b"k1", "{}", Some("one"))
+            .await
+            .unwrap();
+        set_pw(&state, PW).await;
+        let form = format!("password={PW}").replace(' ', "+");
+        let old = state.store.create_session().await.unwrap();
+        // All verification slots busy: refused, nothing checked.
+        let held = state
+            .verify_slots
+            .try_acquire_many(MAX_VERIFIES as u32)
+            .unwrap();
+        let (st, set, _) = send(&app, "POST", "/login/password", Some(&old), &form).await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+        assert!(set.is_none());
+        assert!(state.store.validate_session(&old).await.unwrap());
+        drop(held);
+        let (st, _, _) = send(&app, "POST", "/login/password", Some(&old), &form).await;
+        assert_eq!(st, StatusCode::SEE_OTHER);
+        assert!(!state.store.validate_session(&old).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_login_page_offers_what_the_method_allows() {
+        let (_d, state, app) = app().await;
+        let (_, _, page) = send(&app, "GET", "/login", None, "").await;
+        assert!(page.contains("data-go") && !page.contains("/login/password"));
+        state
+            .store
+            .save_credential(b"k1", "{}", Some("one"))
+            .await
+            .unwrap();
+        // Keys but no password yet: no password form to probe.
+        state
+            .store
+            .set_login_method(LoginMethod::Both)
+            .await
+            .unwrap();
+        let (_, _, page) = send(&app, "GET", "/login", None, "").await;
+        assert!(page.contains("data-go") && !page.contains("/login/password"));
+        set_pw(&state, PW).await;
+        state
+            .store
+            .set_login_method(LoginMethod::Password)
+            .await
+            .unwrap();
+        let (_, _, page) = send(&app, "GET", "/login", None, "").await;
+        assert!(page.contains("/login/password") && !page.contains("data-go"));
+        state
+            .store
+            .set_login_method(LoginMethod::Both)
+            .await
+            .unwrap();
+        let (_, _, page) = send(&app, "GET", "/login", None, "").await;
+        assert!(page.contains("/login/password") && page.contains("data-go"));
+    }
+
+    #[tokio::test]
+    async fn the_keys_page_changes_sign_in_and_password() {
+        let (_d, state, app) = app().await;
+        state
+            .store
+            .save_credential(b"k1", "{}", Some("one"))
+            .await
+            .unwrap();
+        let me = state.store.create_session().await.unwrap();
+        // No password yet: the guard refuses, the method stays.
+        let (st, _, page) = send(
+            &app,
+            "POST",
+            "/admin/system/signin",
+            Some(&me),
+            "method=password",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(page.contains("no password is set"), "{page}");
+        assert_eq!(
+            state.store.login_method().await.unwrap(),
+            LoginMethod::Passkey
+        );
+        // Too short, then mismatched.
+        let (_, _, page) = send(
+            &app,
+            "POST",
+            "/admin/system/password",
+            Some(&me),
+            "new=short&again=short",
+        )
+        .await;
+        assert!(page.contains("at least 12 characters"), "{page}");
+        let (_, _, page) = send(
+            &app,
+            "POST",
+            "/admin/system/password",
+            Some(&me),
+            "new=aaaaaaaaaaaaaa&again=bbbbbbbbbbbbbb",
+        )
+        .await;
+        assert!(page.contains("differ"), "{page}");
+        assert!(state.store.password_hash().await.unwrap().is_none());
+        // Quote and backslash survive the form.
+        let tricky = "pa\"ss\\word 12345";
+        let enc = "pa%22ss%5Cword+12345";
+        let (_, _, page) = send(
+            &app,
+            "POST",
+            "/admin/system/password",
+            Some(&me),
+            &format!("new={enc}&again={enc}"),
+        )
+        .await;
+        assert!(page.contains("Password saved."), "{page}");
+        let first = state.store.password_hash().await.unwrap().unwrap();
+        assert!(crate::admin::password::verify(tricky, &first));
+        // The admin stayed signed in; the method moved to both.
+        assert!(state.store.validate_session(&me).await.unwrap());
+        assert_eq!(state.store.login_method().await.unwrap(), LoginMethod::Both);
+        // Changing needs the current password.
+        let (_, _, page) = send(
+            &app,
+            "POST",
+            "/admin/system/password",
+            Some(&me),
+            "current=wrong&new=another+password+1&again=another+password+1",
+        )
+        .await;
+        assert!(page.contains("current password is wrong"), "{page}");
+        assert_eq!(state.store.password_hash().await.unwrap().unwrap(), first);
+        let (_, _, page) = send(
+            &app,
+            "POST",
+            "/admin/system/password",
+            Some(&me),
+            &format!("current={enc}&new=another+password+1&again=another+password+1"),
+        )
+        .await;
+        assert!(page.contains("Password saved."), "{page}");
+        assert_ne!(state.store.password_hash().await.unwrap().unwrap(), first);
+        // The only key may go while a password stands in for it.
+        let (_, _, page) = send(&app, "GET", "/admin/system/keys", Some(&me), "").await;
+        assert!(page.contains("/admin/keys/delete"), "{page}");
     }
 
     #[test]

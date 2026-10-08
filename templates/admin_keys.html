@@ -5,6 +5,26 @@
 {% let subtab = "keys" %}{% let tabs = crate::admin::views::SYSTEM_TABS %}{% let tabs_label = "System pages" %}{% include "_subtabs.html" %}
 <div class="page-head"><div><h1>Security keys</h1><p class="muted">Keep at least two.</p></div>
   <a class="btn btn-primary" href="/enroll">Enroll another key</a></div>
+{% if let Some(n) = notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
+{% if let Some(e) = error %}<div class="banner banner-warning">{{ e }}</div>{% endif %}
+<section class="card">
+  <div class="card-head"><h2>Sign-in</h2><span class="muted">{{ method }}</span></div>
+  <div class="stack">
+    <form method="post" action="/admin/system/signin" class="stack">
+      <label><input type="radio" name="method" value="passkey"{% if method == "passkey" %} checked{% endif %}> Security key only</label>
+      <label><input type="radio" name="method" value="password"{% if method == "password" %} checked{% endif %}> Password only</label>
+      <label><input type="radio" name="method" value="both"{% if method == "both" %} checked{% endif %}> Security key or password</label>
+      <div><button class="btn" type="submit">Save</button></div>
+    </form>
+    <form method="post" action="/admin/system/password" class="stack">
+      <input type="text" name="username" value="admin" autocomplete="username" hidden>
+      {% if has_password %}<label>Current password <input type="password" name="current" autocomplete="current-password" required></label>{% endif %}
+      <label>New password <input type="password" name="new" autocomplete="new-password" minlength="12" required></label>
+      <label>New password again <input type="password" name="again" autocomplete="new-password" minlength="12" required></label>
+      <div><button class="btn" type="submit">{% if has_password %}Change password{% else %}Set password{% endif %}</button></div>
+    </form>
+  </div>
+</section>
 <div class="table-wrap"><table>
   <thead><tr><th>Credential</th><th>Label</th><th>Created</th><th></th></tr></thead>
   <tbody>

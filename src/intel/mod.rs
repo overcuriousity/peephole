@@ -2,7 +2,6 @@ pub mod abuseipdb;
 pub mod api;
 pub mod dns;
 pub mod geo;
-pub mod greynoise;
 pub mod lookup;
 pub mod provider;
 pub mod rdap;
@@ -16,7 +15,6 @@ pub const TOR: &str = "tor-exits";
 pub const ABUSEIPDB: &str = "abuseipdb";
 pub const SHODAN: &str = "shodan";
 pub const INTERNETDB: &str = "shodan-internetdb";
-pub const GREYNOISE: &str = "greynoise-community";
 pub const RDAP: &str = "rdap";
 
 /// A provider this version knows: results from others are not accepted.
@@ -72,14 +70,6 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         redistributable: false,
     },
     ProviderInfo {
-        name: GREYNOISE,
-        label: "GreyNoise Community",
-        public: false,
-        api: true,
-        tag_prefix: "greynoise",
-        redistributable: false,
-    },
-    ProviderInfo {
         name: SHODAN,
         label: "Shodan",
         public: false,
@@ -111,7 +101,6 @@ pub fn tags(provider: &str, data: &serde_json::Map<String, serde_json::Value>) -
     match provider {
         ABUSEIPDB => abuseipdb::tags(data),
         SHODAN | INTERNETDB => shodan::tags(data),
-        GREYNOISE => greynoise::tags(data),
         RDAP => rdap::tags(data),
         _ => vec![],
     }
@@ -189,18 +178,6 @@ pub fn providers(
             },
             store.clone(),
             daily(i.daily_limit),
-            refresh,
-        )));
-    }
-    if let Some(g) = &cfg.greynoise {
-        let key = g.api_key.trim();
-        out.push(Arc::new(ApiProvider::new(
-            greynoise::GreyNoise {
-                base: greynoise::BASE.into(),
-                key: (!key.is_empty()).then(|| key.to_string()),
-            },
-            store.clone(),
-            g.limits(),
             refresh,
         )));
     }
@@ -811,6 +788,11 @@ async fn run_cluster(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_removed_provider_is_unknown() {
+        assert!(provider_info("greynoise-community").is_none());
+    }
 
     #[test]
     fn backoff_doubles_up_to_its_cap_and_resets() {

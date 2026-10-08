@@ -53,7 +53,6 @@ pub struct Config {
     pub abuseipdb: Option<AbuseIpDbConfig>,
     pub shodan: Option<ShodanConfig>,
     pub internetdb: Option<InternetDbConfig>,
-    pub greynoise: Option<GreyNoiseConfig>,
     /// Keep records and replication history of the last this many days on
     /// this node only; other nodes keep theirs. 0 (default): keep everything.
     /// At least 7 when set.
@@ -194,33 +193,6 @@ pub struct InternetDbConfig {
     /// Lookups per UTC day; 0 = no local cap.
     #[serde(default)]
     pub daily_limit: u64,
-}
-
-/// `[greynoise]`: GreyNoise Community. The key is optional; without one
-/// the allowance is far smaller.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GreyNoiseConfig {
-    #[serde(default)]
-    pub api_key: String,
-    /// Default: 10 without a key, none with one.
-    pub daily_limit: Option<u64>,
-    /// Default: 50 with a key (the free plan), none without.
-    pub weekly_limit: Option<u64>,
-}
-
-impl GreyNoiseConfig {
-    /// The budgets this node keeps to: what is configured, else the free
-    /// plan's (with a key 50 a week, without 10 a day).
-    pub fn limits(&self) -> Vec<crate::intel::api::Limit> {
-        use crate::intel::api::{Limit, Period};
-        let keyed = !self.api_key.trim().is_empty();
-        let daily = self.daily_limit.or((!keyed).then_some(10));
-        let weekly = self.weekly_limit.or(keyed.then_some(50));
-        [(Period::Day, daily), (Period::Week, weekly)]
-            .into_iter()
-            .filter_map(|(period, max)| max.filter(|m| *m > 0).map(|max| Limit { period, max }))
-            .collect()
-    }
 }
 
 /// `[public]`: what anonymous visitors see.
@@ -792,10 +764,6 @@ impl Config {
                 self.abuseipdb.as_ref().map(|a| a.api_key.as_str()),
             ),
             ("shodan", self.shodan.as_ref().map(|s| s.api_key.as_str())),
-            (
-                "greynoise",
-                self.greynoise.as_ref().map(|g| g.api_key.as_str()),
-            ),
         ] {
             // Keys go into headers and URLs.
             if key.is_some_and(|k| k.chars().any(|c| !c.is_ascii_graphic())) {
@@ -1471,7 +1439,7 @@ data_dir = "/tmp"
     fn api_providers_are_off_unless_configured() {
         let cfg = parse(&format!("{BASE}[roles]\nlistener = false\nweb = false\n")).unwrap();
         assert!(cfg.abuseipdb.is_none() && cfg.shodan.is_none());
-        assert!(cfg.internetdb.is_none() && cfg.greynoise.is_none());
+        assert!(cfg.internetdb.is_none());
         assert_eq!(cfg.enrichment.refresh_after_days, 30.0);
     }
 
@@ -1500,30 +1468,12 @@ data_dir = "/tmp"
     }
 
     #[test]
-    fn greynoise_budgets_follow_the_free_plan_unless_set() {
-        use crate::intel::api::{Limit, Period};
-        let g = |toml: &str| -> GreyNoiseConfig { toml::from_str(toml).unwrap() };
-        assert_eq!(
-            g("").limits(),
-            [Limit {
-                period: Period::Day,
-                max: 10
-            }]
-        );
-        assert_eq!(
-            g("api_key = \"k\"").limits(),
-            [Limit {
-                period: Period::Week,
-                max: 50
-            }]
-        );
-        assert_eq!(
-            g("api_key = \"k\"\ndaily_limit = 20\nweekly_limit = 0").limits(),
-            [Limit {
-                period: Period::Day,
-                max: 20
-            }]
-        );
+    fn an_old_greynoise_section_is_ignored() {
+        let cfg = parse(&format!(
+            "{BASE}[roles]\nlistener = false\nweb = false\n\n[greynoise]\napi_key = \"k\"\n"
+        ))
+        .unwrap();
+        assert!(cfg.abuseipdb.is_none() && cfg.shodan.is_none());
     }
 
     #[test]

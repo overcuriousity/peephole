@@ -19,7 +19,8 @@ pub struct Vantage {
     pub price_mc: u32,
     /// Where its public address is, as this node's GeoLite2 places it.
     pub country: Option<String>,
-    /// The address this node dials it at, when that is an IP.
+    /// The address this node dials it at, when that is an IP; else the
+    /// first public address it announces.
     pub dialled: Option<IpAddr>,
 }
 
@@ -41,11 +42,14 @@ fn price_at(node: &Node, id: &NodeId) -> Option<u32> {
     node.status.known(id)?.hb.probe_price_mc
 }
 
-/// The address this node dials `id` at, when that is an IP.
+/// The address this node dials `id` at, when that is an IP; otherwise
+/// (dialled by name, or nobody can dial it) the first public address it
+/// announces.
 fn dialled_ip(node: &Node, id: &NodeId) -> Option<IpAddr> {
     node.dial_address(id)
         .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
         .map(|a| a.ip())
+        .or_else(|| node.status.known(id)?.hb.public_addrs.first().copied())
 }
 
 /// Live scanners announcing a probe price (this node included when it
@@ -54,7 +58,7 @@ pub fn vantages(node: &Node, geo: &SharedGeo) -> Vec<Vantage> {
     let me = node.id();
     let mut out = vec![];
     for id in node.live_members(crate::intel::LIVE_WINDOW) {
-        if id != me && (node.is_blocked(&id) || node.dial_address(&id).is_none()) {
+        if id != me && (node.is_blocked(&id) || !node.can_call(&id)) {
             continue;
         }
         let Some(price_mc) = price_at(node, &id) else {
@@ -151,19 +155,24 @@ async fn offer_once(
         // single public address of its own.
         dialled: dialled_ip(node, &server),
     };
-    let Some(addr) = node.dial_address(&server) else {
-        return refused("the node cannot be dialled from here".into());
+    let call = node.call_any::<ProbeReq, ProbeResp>(
+        server,
+        "/rpc/v1/probe",
+        &req,
+        crate::intel::lookup::RPC_TIMEOUT + SERVE_WAIT,
+    );
+    let resp = match call.await {
+        Ok(r) => r,
+        Err(e) if e.downcast_ref::<crate::cluster::msg::NoAnswer>().is_some() => {
+            return refused("did not answer in time".into());
+        }
+        Err(e) => return refused(format!("could not be asked: {e:#}")),
     };
-    let call = node.call::<ProbeReq, ProbeResp>(server, &addr, "/rpc/v1/probe", &req);
-    let resp =
-        match tokio::time::timeout(crate::intel::lookup::RPC_TIMEOUT + SERVE_WAIT, call).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return refused(format!("could not be asked: {e:#}")),
-            Err(_) => return refused("did not answer in time".into()),
-        };
     // A declined offer comes with a receipt of nothing: fetch it, so what
-    // the offer held is free for the next one.
+    // the offer held is free for the next one. A scanner nobody can dial
+    // pushes its receipt with its own sync.
     if matches!(resp, ProbeResp::Declined { .. })
+        && let Some(addr) = node.dial_address(&server)
         && let Err(e) = crate::cluster::sync::reconcile(node, server, &addr, false).await
     {
         tracing::debug!(?e, "sync after a declined probe offer failed");

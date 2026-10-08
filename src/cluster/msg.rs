@@ -7,6 +7,7 @@
 //! Requests carry an id; the answer comes back as a separate message.
 use super::Node;
 use super::identity::NodeId;
+use super::rpc::proto::ROUTED_PROTO;
 use anyhow::{Context, Result, bail};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,12 @@ const MAX_AHEAD: Duration = Duration::from_secs(300);
 const OUTBOX_TTL: Duration = Duration::from_secs(120);
 /// Messages waiting in one peer's outbox; older ones are dropped first.
 const MAX_OUTBOX: usize = 256;
+/// Bytes of messages waiting in one peer's outbox; older ones are dropped
+/// first.
+const MAX_OUTBOX_BYTES: usize = 32 << 20;
+/// Bytes of messages handed over by one inbox poll; the rest wait for the
+/// next.
+const MAX_INBOX_BYTES: usize = 16 << 20;
 /// Messages being routed at once; more are refused (the sender retries).
 pub const MAX_ROUTING: usize = 256;
 /// A heartbeat listing more neighbours than this contributes none.
@@ -135,6 +142,17 @@ pub enum Msg {
     CreditDrawReply {
         sent_mc: u64,
     },
+    /// A paid call to a member nobody can dial (`rpc::routed`); `body` is
+    /// the CBOR request a direct call would POST to `path`.
+    Rpc {
+        path: String,
+        body: serde_bytes::ByteBuf,
+    },
+    /// Its answer: the HTTP status a direct call would get, and the body.
+    RpcReply {
+        status: u16,
+        body: serde_bytes::ByteBuf,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +238,18 @@ pub struct Messaging {
     handlers: Mutex<Vec<Handler>>,
 }
 
+/// No answer came back in time.
+#[derive(Debug)]
+pub struct NoAnswer(pub Duration);
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no answer within {:?}", self.0)
+    }
+}
+
+impl std::error::Error for NoAnswer {}
+
 enum Hop {
     Dial(NodeId, String),
     Outbox(NodeId),
@@ -254,7 +284,8 @@ impl Node {
             .unwrap()
             .insert(id.clone(), (to, tx));
         let mut rx = rx;
-        let no_answer = || anyhow::anyhow!("no answer from {} within {timeout:?}", to.short());
+        let no_answer =
+            || anyhow::Error::new(NoAnswer(timeout)).context(format!("asked {}", to.short()));
         let out = match self.route_avoiding(env.clone(), avoid.clone()).await {
             Ok(hop) => match tokio::time::timeout(timeout / 2, &mut rx).await {
                 Ok(r) => r.map_err(|_| anyhow::anyhow!("request dropped")),
@@ -319,6 +350,12 @@ impl Node {
                         q.pop_front();
                     }
                     q.push_back((env, Instant::now()));
+                    let mut bytes: usize = q.iter().map(|(e, _)| e.body.len()).sum();
+                    while bytes > MAX_OUTBOX_BYTES
+                        && let Some((e, _)) = q.pop_front()
+                    {
+                        bytes -= e.body.len();
+                    }
                     drop(all);
                     node.msg.outbox_changed.notify_waiters();
                     Ok(Some(peer))
@@ -336,6 +373,11 @@ impl Node {
             .unwrap()
             .get(id)
             .is_some_and(|s| s.last_error.is_some())
+    }
+
+    /// Whether a message to `id` has a first hop, none of them in `avoid`.
+    pub(crate) fn routable(&self, id: &NodeId, avoid: &[NodeId]) -> bool {
+        self.next_hop(id, avoid).is_some()
     }
 
     fn next_hop(&self, to: &NodeId, avoid: &[NodeId]) -> Option<Hop> {
@@ -461,9 +503,15 @@ impl Node {
         tokio::spawn(async move {
             for h in handlers {
                 if let Some(answer) = h(b.from, b.msg.clone()).await {
+                    // An RPC answer must not pass members too old to relay it.
+                    let avoid = if matches!(answer, Msg::RpcReply { .. }) {
+                        super::owner::cmd::old_relays(&node, &b.from, ROUTED_PROTO)
+                    } else {
+                        vec![]
+                    };
                     match Envelope::seal(&node, b.from, Some(b.id.clone()), answer) {
                         Ok((_, env)) => {
-                            if let Err(e) = node.route(env).await {
+                            if let Err(e) = node.route_avoiding(env, avoid).await {
                                 debug!(to = %b.from.short(), ?e, "reply not delivered");
                             }
                         }
@@ -486,7 +534,7 @@ impl Node {
                 if let Some(q) = all.get_mut(&peer) {
                     q.retain(|(_, t)| t.elapsed() < OUTBOX_TTL);
                     if !q.is_empty() {
-                        return q.drain(..).map(|(e, _)| e).collect();
+                        return drain_budget(q, MAX_INBOX_BYTES);
                     }
                 }
             }
@@ -496,6 +544,21 @@ impl Node {
             }
         }
     }
+}
+
+/// Takes messages from the front of `q` up to `budget` bytes of bodies
+/// (always at least one); the rest stay queued.
+fn drain_budget(q: &mut VecDeque<(Envelope, Instant)>, budget: usize) -> Vec<Envelope> {
+    let mut out = vec![];
+    let mut bytes = 0;
+    while let Some((e, _)) = q.front() {
+        if !out.is_empty() && bytes + e.body.len() > budget {
+            break;
+        }
+        bytes += e.body.len();
+        out.extend(q.pop_front().map(|(e, _)| e));
+    }
+    out
 }
 
 /// Collect messages a dialable peer holds for us, and route each.
@@ -534,6 +597,27 @@ pub async fn inbox_loop(node: Arc<Node>, peer: NodeId, addr: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_inbox_poll_takes_at_most_its_budget() {
+        let env = |n: usize| {
+            (
+                Envelope {
+                    body: vec![0; n],
+                    sig: vec![],
+                    hops: 0,
+                },
+                Instant::now(),
+            )
+        };
+        let mut q: VecDeque<_> = [env(6), env(4), env(3)].into();
+        assert_eq!(drain_budget(&mut q, 10).len(), 2);
+        assert_eq!(q.len(), 1);
+        // One message larger than the budget still goes, alone.
+        let mut q: VecDeque<_> = [env(20), env(1)].into();
+        assert_eq!(drain_budget(&mut q, 10).len(), 1);
+        assert_eq!(q.len(), 1);
+    }
 
     /// The claim as nodes before `exclude_levels` know it.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]

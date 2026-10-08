@@ -47,9 +47,40 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Failed counter-scans are retried for 24 hours with a growing wait
   (10 min doubling to 2 h; the scanner that failed waits longer); a retry
   stops when a newer scan or a pending job covers the address.
+- Admin: sign in with a password (optional, per node; `peephole admin
+  password`, `peephole admin login-method`). Passkeys stay the default.
+- Cluster: outbound-only members answer paid lookups, resolutions and
+  probes (routed through the outbox; protocol 6: the member and the node
+  whose outbox it polls must run it; older outbound-only members are not
+  asked).
+- Trap: a PROXY header from a peer outside `trusted_proxies` is named in
+  the log.
+- Installer: asks whether to also allow a password sign-in on the admin
+  site (`PEEPHOLE_ADMIN_PASSWORD`, at least 12 characters; only its hash is
+  stored).
+- Installer: before offering to set up nginx it checks what the setup would
+  stop at (an existing peephole site, other sites on port 443, a default
+  site that is not the stock link, the packages, the admin domain's DNS)
+  and lists what it will change; the default is yes only when every check
+  passes.
 
 ### Changed
 
+- Installer: the scanner is off by default (opt-in, also without a
+  terminal). Unattended installs add `scanner` to `PEEPHOLE_ROLES`.
+- Installer: a preset `PEEPHOLE_TRUSTED_PROXIES` no longer means a proxy
+  elsewhere; unattended installs behind one set `PEEPHOLE_FRONT=remote`.
+- Installer: every node gets a `[cluster]` section; the cluster question is
+  gone and `PEEPHOLE_CLUSTER` is ignored. The node name defaults to the
+  short host name, the address other members dial is required
+  (`PEEPHOLE_CLUSTER_ADVERTISE`, `host:port`; default the admin domain or
+  the public address with port 7443), and the listener follows its port.
+  The invite question names `peephole cluster join <token>` for later.
+- Installer: the Let's Encrypt certificate is requested without a contact
+  email; `PEEPHOLE_ACME_EMAIL` is ignored.
+- Installer: the admin domain is normalised (a scheme, a path and a
+  trailing dot are stripped, upper case is lowered); an IP address is
+  refused.
 - The dynamic market replaces the fixed credit rules. A daily mint of 1000
   credits is split among scanners by counted scans (levels 3 and 4 count
   twice; a scan of a node's own job never counts); the trap share is gone.
@@ -81,6 +112,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Protocol 5: scan jobs are paid only between nodes on protocol 5; upgrade
   all nodes together. Heartbeats carry `scan_budget_mc` and `scan_queued`;
   `scan_bids` is gone.
+- Protocol 6: outbound-only members on protocol 6 answer paid lookups,
+  resolutions and probes through their outbox; nodes on earlier versions
+  are neither asked that way nor used to relay it. Upgrade all nodes
+  together.
 - Credits page: the scan tile shows this node's selling price, and a table
   lists every scanner's announced and reference price.
 - Host keys and certificates may come from a probe as well as a scan;
@@ -131,6 +166,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 - `credits.collect_to`, the setting and the "Collect credits here" action
   on the Ownership page.
+- GreyNoise Community enrichment. An existing `[greynoise]` section is ignored.
 - The manual "Retry failed" action on the Scans page; retries are
   automatic.
 

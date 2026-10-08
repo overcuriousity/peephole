@@ -14,6 +14,7 @@ pub mod links;
 pub mod lookup;
 pub mod overview;
 pub mod pages;
+pub mod password;
 pub mod probes;
 pub mod public;
 pub mod scans;
@@ -60,6 +61,8 @@ pub struct AdminState {
     /// The gate a member that does not probe judges addresses with, built
     /// on first use (`admin::probes`).
     pub probe_judge: std::sync::OnceLock<crate::scan::probe::serve::Prober>,
+    /// Password checks running at once (each takes ~19 MiB and a thread).
+    pub verify_slots: tokio::sync::Semaphore,
 }
 
 impl AdminState {
@@ -95,6 +98,7 @@ impl AdminState {
             geo,
             pending_probes: Default::default(),
             probe_judge: Default::default(),
+            verify_slots: tokio::sync::Semaphore::new(auth::MAX_VERIFIES),
         }
     }
 

@@ -14,7 +14,7 @@
   <label>Tor <select name="tor"><option value="">any</option><option value="1"{% if f.tor.as_deref() == Some("1") %} selected{% endif %}>exits only</option></select></label>
   {% if chrome.authed %}
   <label>Min abuse score <input name="min_abuse" type="number" min="0" max="100" size="4" value="{% if let Some(a) = f.min_abuse %}{{ a }}{% endif %}"></label>
-  <label>Intel tag <input name="tag" list="intel-tags" value="{{ f.tag.as_deref().unwrap_or_default() }}" placeholder="greynoise:malicious"></label>
+  <label>Intel tag <input name="tag" list="intel-tags" value="{{ f.tag.as_deref().unwrap_or_default() }}" placeholder="shodan:vpn"></label>
   <datalist id="intel-tags">{% for t in tags %}<option value="{{ t }}">{% endfor %}</datalist>
   <label>Looked up by <select name="intel"><option value="">any</option>{% for (n, l) in api_providers %}<option value="{{ n }}"{% if f.intel.as_deref() == Some(n) %} selected{% endif %}>{{ l }}</option>{% endfor %}</select></label>
   <label>Open port <input name="port" size="7" value="{{ f.port.as_deref().unwrap_or_default() }}" placeholder="22/tcp"></label>

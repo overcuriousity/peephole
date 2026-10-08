@@ -1,8 +1,10 @@
 //! System: this node's intel feeds, settings, admin keys and export.
 use crate::admin::AdminState;
-use crate::admin::auth::SessionUser;
+use crate::admin::auth::{SessionUser, session_token};
 use crate::admin::error::{AppResult, render};
+use crate::admin::password;
 use crate::admin::views::Chrome;
+use crate::store::auth::LoginMethod;
 use crate::store::stats::intel_stale;
 use askama::Template;
 use axum::{
@@ -12,6 +14,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use axum_extra::extract::CookieJar;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,6 +24,8 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/system/settings", get(settings))
         .route("/admin/system/keys", get(keys))
         .route("/admin/keys/delete", post(key_delete))
+        .route("/admin/system/signin", post(signin))
+        .route("/admin/system/password", post(password))
         .route("/admin/system/export", get(export_page))
         .route("/admin/export/download", get(export_download))
         // Moved pages; old bookmarks keep working.
@@ -307,9 +312,22 @@ struct KeysPage {
     chrome: Chrome,
     keys: Vec<KeyRow>,
     can_delete: bool,
+    method: &'static str,
+    has_password: bool,
+    notice: Option<String>,
+    error: Option<String>,
 }
 
 async fn keys(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
+    keys_page(&st, None, None).await
+}
+
+/// The keys page, with the outcome of a sign-in change if there was one.
+async fn keys_page(
+    st: &AdminState,
+    notice: Option<String>,
+    error: Option<String>,
+) -> AppResult<Html<String>> {
     let keys: Vec<KeyRow> = st
         .store
         .list_credential_labels()
@@ -322,11 +340,77 @@ async fn keys(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             created,
         })
         .collect();
+    let method = st.store.login_method().await?;
+    let has_password = st.store.password_hash().await?.is_some();
     render(&KeysPage {
         chrome: chrome(),
-        can_delete: keys.len() > 1,
+        // The last key may go while a password stands in for it.
+        can_delete: keys.len() > 1 || (has_password && method != LoginMethod::Passkey),
         keys,
+        method: method.as_str(),
+        has_password,
+        notice,
+        error,
     })
+}
+
+#[derive(serde::Deserialize)]
+pub struct SigninForm {
+    method: String,
+}
+
+async fn signin(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    Form(f): Form<SigninForm>,
+) -> AppResult<Html<String>> {
+    let set = match f.method.parse::<LoginMethod>() {
+        Ok(m) => st.store.set_login_method(m).await,
+        Err(e) => Err(e),
+    };
+    match set {
+        Ok(()) => keys_page(&st, Some("Sign-in method saved.".into()), None).await,
+        Err(e) => keys_page(&st, None, Some(e.to_string())).await,
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct PasswordForm {
+    current: Option<String>,
+    new: String,
+    again: String,
+}
+
+async fn password(
+    _u: SessionUser,
+    State(st): State<Arc<AdminState>>,
+    jar: CookieJar,
+    Form(f): Form<PasswordForm>,
+) -> AppResult<Html<String>> {
+    let fail = |m: &str| keys_page(&st, None, Some(m.to_string()));
+    if let Some(phc) = st.store.password_hash().await? {
+        let current = f.current.unwrap_or_default();
+        let ok = tokio::task::spawn_blocking(move || password::verify(&current, &phc))
+            .await
+            .unwrap_or(false);
+        if !ok {
+            return fail("The current password is wrong.").await;
+        }
+    }
+    if f.new != f.again {
+        return fail("The two new passwords differ.").await;
+    }
+    if let Err(why) = password::check_new(&f.new) {
+        return fail(&format!("The new password needs {why}.")).await;
+    }
+    let new = f.new;
+    let phc = tokio::task::spawn_blocking(move || password::hash(&new))
+        .await
+        .map_err(|e| anyhow::anyhow!("hashing task: {e}"))??;
+    // The admin stays signed in; other password sessions end.
+    let keep = session_token(&st, &jar);
+    st.store.set_password_hash(&phc, keep.as_deref()).await?;
+    keys_page(&st, Some("Password saved.".into()), None).await
 }
 
 #[derive(serde::Deserialize)]
@@ -341,10 +425,9 @@ async fn key_delete(
 ) -> Redirect {
     // SQLite hex() is uppercase; normalize before decoding.
     if let Ok(bytes) = data_encoding::HEXLOWER.decode(f.cred_id.to_lowercase().as_bytes()) {
-        // Never delete the last remaining key (would lock the admin out). The
-        // check and delete are one atomic statement, so two concurrent deletes
-        // cannot both pass and leave zero keys.
-        let _ = state.store.delete_credential_keeping_last(&bytes).await;
+        // Never delete the last way in (would lock the admin out); the check
+        // and delete are one transaction.
+        let _ = state.store.delete_credential_guarded(&bytes).await;
     }
     Redirect::to("/admin/system/keys")
 }

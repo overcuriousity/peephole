@@ -800,7 +800,7 @@ fn intel_facts(provider: &str, data: &serde_json::Value) -> Vec<IntelFact> {
 type Fields = &'static [(&'static str, &'static str, bool)];
 
 fn api_fields(provider: &str) -> Option<Fields> {
-    use crate::intel::{ABUSEIPDB, GREYNOISE, INTERNETDB, RDAP, SHODAN};
+    use crate::intel::{ABUSEIPDB, INTERNETDB, RDAP, SHODAN};
     Some(match provider {
         ABUSEIPDB => &[
             ("score", "Abuse score", true),
@@ -834,13 +834,6 @@ fn api_fields(provider: &str) -> Option<Fields> {
             ("hostnames", "Hostnames", true),
             ("tags", "Tags", false),
             ("vulns", "CVEs", true),
-        ],
-        GREYNOISE => &[
-            ("classification", "Classification", false),
-            ("noise", "Mass-scanning", false),
-            ("riot", "Known benign service", false),
-            ("name", "Actor / provider", false),
-            ("last_seen", "Last seen scanning", true),
         ],
         RDAP => &[
             ("range", "Range", true),
@@ -1892,8 +1885,6 @@ show_labels = {show_labels}
         );
         assert_eq!(f[0].value, "22/tcp OpenSSH 8.9p1 · 443/tcp");
         assert_eq!(f[1].value, "2: CVE-1, CVE-2");
-        let f = intel_facts(crate::intel::GREYNOISE, &serde_json::json!({}));
-        assert_eq!(f[0].label, "Result");
     }
 
     #[test]

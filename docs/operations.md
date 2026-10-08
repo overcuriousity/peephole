@@ -17,20 +17,35 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
   it), and prints the commit the binary was built from.
 - Installs the binary to `/usr/local/bin/peephole`; the signature rules are
   built into it.
-- Asks what this node should do:
-  - run a **trap**, the **scanner**, the **web interface**, in any combination;
-    the web interface needs a domain whose DNS points at the machine and
-    HTTPS (WebAuthn), so without one answer no: in a cluster the admin area
-    of another node shows everything;
-  - with a trap, **what is in front of it** (see below);
-  - the public domain of the admin area (with the web interface);
-  - whether to take part in a **cluster**: node name, addresses, an invite
-    token;
-  - optional **MaxMind GeoLite2** credentials
-    (<https://www.maxmind.com/en/accounts/current/license-key>);
-  - optional API keys for **AbuseIPDB**, **Shodan** and **GreyNoise**, and
-    whether to use **Shodan InternetDB** (no key, non-commercial use only);
-  - whether to **set up nginx** for you (see below).
+- On a first install, asks (an upgrade asks nothing), in this order:
+  1. what this node runs: a **trap**, the **scanner** (opt-in, default no:
+     nmap counter-scans draw abuse reports, and most hosting providers forbid
+     them), the **web interface**, in any combination; the web interface
+     needs a domain whose DNS points at the machine and HTTPS (WebAuthn), so
+     without one answer no: in a cluster the admin area of another node
+     shows everything;
+  2. with a trap, **what is in front of it** (see below), and for `remote`
+     the proxy's addresses;
+  3. with a trap or the scanner, public addresses of the machine that no
+     interface shows (1:1 NAT, port forwarding);
+  4. with the web interface, the public **domain** of the admin area (a
+     scheme, a path and a trailing dot are stripped) and whether to **also
+     allow signing in with a password** besides passkeys (at least 12
+     characters; only its hash is stored, in the database);
+  5. whether to **set up nginx** for you (see below);
+  6. the **cluster**: this node's name (default: the short host name), the
+     **address other members dial** (`host:port`, required; see below) and
+     an optional invite token. Every node gets a `[cluster]` section; one
+     without an invite runs alone until it joins one later with
+     `peephole cluster join <token>` (a running daemon picks the join up,
+     no restart needed);
+  7. optional **MaxMind GeoLite2** credentials
+     (<https://www.maxmind.com/en/accounts/current/license-key>);
+  8. optional API keys for **AbuseIPDB** and **Shodan** (over the free
+     InternetDB a key adds product and version per port, OS, organisation,
+     ISP, ASN, domains, IPv6 and the latest crawl; host lookups need a
+     membership or a paid plan), and whether to use **Shodan InternetDB**
+     (no key, weekly data, non-commercial use only).
 - Checks that every port the new config listens on is free (from
   `/proc/net/tcp`, so it works without `ss`). Interactive installs are
   offered the next free port; unattended ones stop before anything is
@@ -49,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
 
 - **direct** takes the public ports itself (the unit allows
   `CAP_NET_BIND_SERVICE`); open 80 and 443 in any firewall in front of the
-  machine, and the cluster port if it is advertised. When `ufw` is active,
+  machine, and the cluster port. When `ufw` is active,
   the installer prints the `ufw allow` commands (it does not run them). It is
   the default when nothing listens on 80/443 and there is no web role.
 - **direct is refused with the web role**: the admin site needs port 443
@@ -67,14 +82,14 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
 
 **Cloud machines.** On AWS, Google Cloud, Azure, Alibaba Cloud and Oracle
 Cloud (recognised from the DMI data or the metadata service) the installer
-warns before the scanner question and defaults it to no: their acceptable
-use policies forbid scanning others, and the abuse reports counter-scans
-draw risk suspension of the account. Behind 1:1 NAT no interface carries
+names the provider before the scanner question: their acceptable use
+policies forbid scanning others, and the abuse reports counter-scans draw
+risk suspension of the account. Behind 1:1 NAT no interface carries
 the public address; with a trap or the scanner, the installer asks the
 cloud's metadata service (AWS, Google Cloud, Azure, Hetzner, DigitalOcean;
 one-second timeouts, no outside service) and, when it reports an address
 no interface shows, offers it for `[scan] own_addresses` (never scanned,
-never in the blocklist). It is also the example for the cluster's advertise
+never in the blocklist). It is also a default for the cluster's advertise
 address. In a cluster, peers report the address they see this node connect
 from; once a sibling or two members agree, it is protected like
 `own_addresses` (System › Status shows it as "Public address (seen by
@@ -89,16 +104,43 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
 ```
 
 Every question has a variable (`PEEPHOLE_ROLES`, `PEEPHOLE_FRONT`,
-`PEEPHOLE_TRUSTED_PROXIES`, `PEEPHOLE_OWN_ADDRESSES`, `PEEPHOLE_CLUSTER`,
-`PEEPHOLE_CLUSTER_NAME`, `PEEPHOLE_JOIN_TOKEN`,
-`PEEPHOLE_NGINX`, `PEEPHOLE_ACME_EMAIL`, …); the head of `install.sh` lists
-them all. `PEEPHOLE_FRONT=direct|local|remote` answers what is in front of
-the trap. Without it, unattended installs keep what they did before: the
-older `PEEPHOLE_LOCAL_PROXY=1` means local and `0` remote, and a preset
-`PEEPHOLE_TRUSTED_PROXIES` alone means remote; with none of these, the
-default above applies (local with the web role or 80/443 taken, else
-direct). `PEEPHOLE_OWN_ADDRESSES` overrides the metadata's address (`-` for
-none); `PEEPHOLE_METADATA=0` skips asking the metadata service.
+`PEEPHOLE_TRUSTED_PROXIES`, `PEEPHOLE_OWN_ADDRESSES`,
+`PEEPHOLE_CLUSTER_NAME`, `PEEPHOLE_CLUSTER_ADVERTISE`, `PEEPHOLE_JOIN_TOKEN`,
+`PEEPHOLE_ADMIN_PASSWORD`, `PEEPHOLE_NGINX`, …); the head of `install.sh` lists
+them all. Without a terminal a question takes its default, and one without
+a default stops the install before anything is written:
+
+- `PEEPHOLE_ROLES` defaults to `listener,web`: the scanner runs only when
+  `scanner` is in the list.
+- `PEEPHOLE_FRONT=direct|local|remote` answers what is in front of the
+  trap; the older `PEEPHOLE_LOCAL_PROXY=1` means local and `0` remote. A
+  preset `PEEPHOLE_TRUSTED_PROXIES` no longer means remote: set
+  `PEEPHOLE_FRONT=remote` (the proxies are then required). Without either,
+  the default above applies (local with the web role or 80/443 taken, else
+  direct).
+- `PEEPHOLE_OWN_ADDRESSES` overrides the metadata's address (`-` for
+  none); `PEEPHOLE_METADATA=0` skips asking the metadata service.
+- `PEEPHOLE_CLUSTER_ADVERTISE` is required unless it has a default: the
+  admin domain with port 7443 for the web role when the front is not
+  `remote` (the domain then points here), else the public address (an
+  interface's, the metadata's or `PEEPHOLE_OWN_ADDRESSES`) with port 7443.
+  `PEEPHOLE_CLUSTER_NAME` defaults to the short host name and
+  `PEEPHOLE_CLUSTER_LISTEN` to `[::]:<advertise port>` (both address
+  families; `0.0.0.0:<advertise port>` without IPv6).
+  `PEEPHOLE_CLUSTER` is ignored.
+- `PEEPHOLE_ADMIN_PASSWORD` reaches peephole on stdin only (never on a
+  command line or in a child's environment); `PEEPHOLE_NGINX=1` sets nginx
+  up even when a check fails; `PEEPHOLE_ACME_EMAIL` is ignored (the
+  certificate is requested without a contact email).
+
+**The cluster address.** Other members dial this node at the advertised
+`host:port`, so that port must be reachable from the internet; the
+installer does not change the firewall (with `ufw` active, the summary
+prints the `ufw allow` command). To change it later, edit `advertise` and
+`listen` in `[cluster]` of `/etc/peephole/config.toml` and restart
+peephole. If the wizard moves the listener to a free port, the advertised
+port follows it. A node that cannot be reached at all can run
+outbound-only, by hand (see [cluster.md](cluster.md)).
 
 Published binaries are built on Ubuntu 22.04 and run on Debian 12 / Ubuntu
 22.04 or newer (glibc ≥ 2.35).
@@ -153,12 +195,17 @@ the old 443 setup. To trap HTTPS there, add `trap_tls_listen =
 `--nginx-stream-example`), put them in place as in the manual steps below and
 restart peephole.
 
-**Automatic setup** (opt-in: answer yes, or `PEEPHOLE_NGINX=1`). Offered for
-the web role and for a trap behind a proxy on the same machine. After
+**Automatic setup** (answer yes, or `PEEPHOLE_NGINX=1`). Offered for
+the web role and for a trap behind a proxy on the same machine. Before the
+question the installer checks what the setup would stop at (an existing
+peephole site, other sites on port 443, a default site that is not the
+stock link, packages it may not install, and whether the admin domain's
+DNS points at this machine) and lists what it will change; the default is
+yes when every check passes. After
 peephole is up, the installer installs nginx (and certbot with the web
 role), gets a Let's Encrypt certificate for the admin domain (its DNS must
-point at the machine and port 80 must be reachable; `PEEPHOLE_ACME_EMAIL`
-sets the contact address), disables the distribution's default site (only
+point at the machine and port 80 must be reachable; no contact email is
+given), disables the distribution's default site (only
 if it is the stock link), enables `/etc/nginx/sites-available/peephole` and,
 with a trap, the stream config, checks it with `nginx -t` and reloads. On a machine without IPv6 the `[::]`
 listeners are left out. If a step fails, the installer puts back what it
@@ -228,6 +275,8 @@ peephole --help                                   # commands and arguments
 peephole check-config /etc/peephole/config.toml   # validate config and nmap; show the built-in rules
 peephole settings show|set|reset                  # runtime settings (pace, cooldown, roles)
 peephole admin reset-token                        # new one-time admin setup token
+peephole admin password [--stdin]                 # set or change the admin password
+peephole admin login-method passkey|password|both # how the admin signs in
 peephole export -o data.parquet                   # the dataset (--format, --from, --redistributable, --help)
 peephole db vacuum                                # shrink the database file (stop the service first)
 ```
@@ -260,6 +309,15 @@ restart without an enrolled key prints a new one once it has expired, and
 lost, or every key is. Further keys are enrolled from **Admin → Keys**. Admin
 sessions last at most 12 hours and end after an hour without use, on logout,
 on the next sign-in, or when the key they signed in with is deleted.
+
+The sign-in method is `passkey` (the default), `password` or `both`, chosen
+under **Admin → Keys** or with `peephole admin login-method`. A method that
+would leave no way in is refused: `password` needs a password set,
+`passkey` an enrolled key, `both` at least one of them. `peephole admin
+password` sets or changes the password from the shell (it also turns
+`passkey` into `both`), and is the way back in when the password is lost.
+Password sessions end when the password changes or the method becomes
+`passkey`.
 
 **Dataset.** `peephole export` writes every request with everything known
 about it and its IP as Parquet (default), CSV or Timesketch JSON Lines, to

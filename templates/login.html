@@ -4,7 +4,15 @@
 <div class="card auth-card" data-webauthn="login">
   <img src="/assets/logo.svg?v={{ chrome.stamp }}" alt="">
   <h1>Admin login</h1>
-  <button class="btn btn-primary btn-block" type="button" data-go>Authenticate with security key</button>
+  {% if let Some(e) = error %}<div class="banner banner-warning">{{ e }}</div>{% endif %}
+  {% if passkey %}<button class="btn btn-primary btn-block" type="button" data-go>Authenticate with security key</button>{% endif %}
+  {% if password %}
+  <form method="post" action="/login/password" class="stack">
+    <input type="text" name="username" value="admin" autocomplete="username" hidden>
+    <label>Password <input type="password" name="password" autocomplete="current-password" required></label>
+    <button class="btn{% if !passkey %} btn-primary{% endif %} btn-block" type="submit">Sign in with password</button>
+  </form>
+  {% endif %}
   <div class="status" data-msg></div>
 </div>
 {% endblock %}
