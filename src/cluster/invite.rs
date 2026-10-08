@@ -257,20 +257,54 @@ pub async fn redeem(node: &Node, peer: NodeId, req: JoinReq) -> Result<JoinResp,
     let Some(invite) = invite else {
         return Err((403, "invalid, revoked, exhausted or expired invite".into()));
     };
-    sqlx::query(
-        "INSERT INTO invite_uses (invite_id, node, used_at) VALUES (?, ?, datetime('now'))",
-    )
-    .bind(invite)
-    .bind(&peer.0[..])
-    .execute(&node.store.pool)
-    .await
-    .map_err(|e| internal(e.into()))?;
-    repl::append(node, &[Record::MemberAdd(req.info)])
-        .await
-        .map_err(internal)?;
+    let used: Result<()> = async {
+        sqlx::query(
+            "INSERT INTO invite_uses (invite_id, node, used_at) VALUES (?, ?, datetime('now'))",
+        )
+        .bind(invite)
+        .bind(&peer.0[..])
+        .execute(&node.store.pool)
+        .await?;
+        repl::append(node, &[Record::MemberAdd(req.info)]).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = used {
+        // Nobody joined: give the use back (the log append has its own
+        // transaction, so this cannot be one with it).
+        give_back(&node.store, invite, &peer).await;
+        return Err(internal(e));
+    }
     Ok(JoinResp {
         info: node.self_info(),
     })
+}
+
+/// Undo one use of `invite` by `peer` whose admission was not written.
+async fn give_back(store: &crate::store::Store, invite: i64, peer: &NodeId) {
+    let undo = async {
+        let mut tx = store.pool.begin().await?;
+        sqlx::query("UPDATE invites SET uses = uses - 1 WHERE id = ? AND uses > 0")
+            .bind(invite)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM invite_uses WHERE rowid = (SELECT MAX(rowid) FROM invite_uses
+             WHERE invite_id = ? AND node = ?)",
+        )
+        .bind(invite)
+        .bind(&peer.0[..])
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
+    };
+    if let Err(e) = undo.await {
+        tracing::warn!(
+            ?e,
+            invite,
+            "a failed join still counts as a use of its invite"
+        );
+    }
 }
 
 /// An invite as the UI and CLI list it.
@@ -382,5 +416,35 @@ mod tests {
         assert_eq!(p(Some("0"), Some("0")).unwrap(), (None, None));
         assert_eq!(p(Some("never"), Some("3")).unwrap(), (None, Some(3)));
         assert!(p(Some("soon"), None).is_err());
+    }
+
+    /// A join that was not written gives its use back: the counter and
+    /// the record of who used it.
+    #[tokio::test]
+    async fn a_failed_join_gives_its_use_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let peer = super::super::identity::Identity::generate().unwrap().id;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO invites (secret_hash, label, created_at, max_uses, uses)
+             VALUES (x'00', '', datetime('now'), 10, 1) RETURNING id",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO invite_uses (invite_id, node, used_at) VALUES (?, ?, datetime('now'))",
+        )
+        .bind(id)
+        .bind(&peer.0[..])
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        give_back(&store, id, &peer).await;
+        let row = &list(&store).await.unwrap()[0];
+        assert_eq!(row.uses, 0);
+        assert!(row.joined.is_empty());
     }
 }
