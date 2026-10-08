@@ -491,8 +491,8 @@ fn ownership_key_is_created_adopted_and_released_from_the_shell() {
     let (ok, _, err) = run(&a, &["new"], None);
     assert!(!ok && err.contains("already has an owner"), "{err}");
 
-    // The key never goes on the command line: adopt reads standard input.
-    let (ok, _, err) = run(&b, &["adopt"], Some(&format!("{key}\n")));
+    // The key never goes on the command line: claim reads standard input.
+    let (ok, _, err) = run(&b, &["claim"], Some(&format!("{key}\n")));
     assert!(ok, "{err}");
     let (_, shown, _) = run(&b, &["show"], None);
     assert!(

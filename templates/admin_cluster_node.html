@@ -136,7 +136,7 @@
     <dialog id="dlg-owner-leave"><h3>Have {{ m.name }} leave the cluster?</h3><p class="muted">Its syncing stops; its data stays there. Rejoining needs an invite, entered on the node itself.</p>
       <form method="post" action="/admin/cluster/node/{{ m.key }}/owner" class="actions"><input type="hidden" name="counter" value="{{ status.counter }}"><input type="hidden" name="action" value="leave"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Leave</button></form></dialog>
     <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-owner-release">Release</button>
-    <dialog id="dlg-owner-release"><h3>Release {{ m.name }}?</h3><p class="muted">It has no owner afterwards. To manage it again, adopt it on the node itself.</p>
+    <dialog id="dlg-owner-release"><h3>Release {{ m.name }}?</h3><p class="muted">It has no owner afterwards. To manage it again, claim it on the node itself.</p>
       <form method="post" action="/admin/cluster/node/{{ m.key }}/owner" class="actions"><input type="hidden" name="counter" value="{{ status.counter }}"><input type="hidden" name="action" value="release"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Release</button></form></dialog>
   </div>
 {% endmatch %}

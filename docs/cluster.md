@@ -44,7 +44,7 @@ peephole cluster block --subtree <node>   # ... and every node it admitted, tran
 peephole cluster purge <node>             # delete a blocked peer's data here, stop relaying it
 peephole cluster leave                    # this node leaves; it keeps its data
 peephole owner new                        # an ownership key for your nodes; this node keeps it
-peephole owner adopt                      # on each other node of yours: reads the key from standard input
+peephole owner claim                      # on each other node of yours: reads the key from standard input (alias: adopt)
 peephole owner show                       # this node's owner and the nodes that share it
 peephole owner forget-key [--force]       # this node no longer keeps the key; it stays owned
 peephole owner release                    # this node has no owner afterwards
@@ -106,14 +106,19 @@ also be listed under `[[cluster.peers]]` with their key.
 Operators in a cluster need not know each other. The nodes of one operator
 can still belong together: they share an **ownership key**.
 
-- **Create it once** (`peephole owner new`, or Cluster › Ownership) and
-  **enter it on each of your other nodes** (`peephole owner adopt`, or the
-  same page there). The key is shown once; `adopt` reads it from standard
-  input so it does not end up in the shell history.
+- **Create it once** on your first node (`peephole owner new`, or Cluster ›
+  Ownership › "Your first node?") and **claim each of your other nodes**
+  with it, on that node (`peephole owner claim`, or Cluster › Ownership ›
+  "Already have a key?" there). A node cannot be claimed from another one:
+  whoever claims it needs its admin site or shell. The key is shown once;
+  `claim` reads it from standard input so it does not end up in the shell
+  history. The Ownership page of a claimed node lists the members not
+  claimed with its key.
 - A node stores the owner's public half and a certificate for itself. The
-  key itself stays only where you choose to keep it (`--keep`, or the
-  checkbox): those are your **managing nodes**. A scanner that gets broken
-  into cannot take over your other nodes if it does not keep the key.
+  key itself stays only where you choose to keep it (`--keep`, or "Also
+  manage my other nodes from here"): those are your **managing nodes**. A
+  scanner that gets broken into cannot take over your other nodes if it
+  does not keep the key.
 - Your nodes find each other on their own and are marked "yours" on the
   cluster pages. Nothing about ownership is replicated: other operators'
   nodes cannot verify who owns what, though a member that relays the
@@ -129,7 +134,7 @@ can still belong together: they share an **ownership key**.
 - **A leaked key**: rotate it on a managing node (Cluster › Ownership).
   Every node of yours that answers takes the new key; for the rest the page
   offers to retry. On a node you cannot reach that way, run
-  `peephole owner adopt` locally. The new key is stored before the first
+  `peephole owner claim` locally. The new key is stored before the first
   node is told, so a rotation that was cut short is finished from the same
   page with the same key. A rotation also removes the kept key from your
   other managing nodes: enter the new one there again if they should keep

@@ -9,9 +9,12 @@ use crate::store::Store;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
-pub const USAGE: &str = "usage: peephole owner new [CONFIG]
-       peephole owner adopt [--keep] [CONFIG]   (reads the key from standard input;
-                                                 --keep: manage other nodes from here)
+pub const USAGE: &str =
+    "usage: peephole owner new [CONFIG]           (on your first node: creates the key)
+       peephole owner claim [--keep] [CONFIG]   (on each other node: reads the key from
+                                                 standard input; --keep: also manage your
+                                                 other nodes from here. `adopt` is the
+                                                 same command)
        peephole owner show [CONFIG]
        peephole owner forget-key [--force] [CONFIG]
                                                 (the node stays owned; --force: also
@@ -68,12 +71,15 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             p => pos.push(p),
         }
     }
-    let sub = *pos.first().context(USAGE)?;
+    let sub = match *pos.first().context(USAGE)? {
+        "adopt" => "claim",
+        s => s,
+    };
     if pos.len() > 2 {
         bail!("unexpected argument '{}'\n\n{USAGE}", pos[2]);
     }
-    if keep && sub != "adopt" {
-        bail!("--keep belongs to `adopt`\n\n{USAGE}");
+    if keep && sub != "claim" {
+        bail!("--keep belongs to `claim`\n\n{USAGE}");
     }
     if force && sub != "forget-key" {
         bail!("--force belongs to `forget-key`\n\n{USAGE}");
@@ -96,17 +102,17 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             println!("{}", key.encode());
             eprintln!(
                 "this is the ownership key, shown once. Whoever holds it controls every node \
-                 it is entered on. Enter it on your other nodes with: peephole owner adopt"
+                 it is entered on. Claim your other nodes with it, on each: peephole owner claim"
             );
         }
-        "adopt" => {
+        "claim" => {
             let line = read_key()?;
             let key = OwnerKey::parse(&line)?;
             super::adopt(&store, me, &key, keep).await?;
             // As it is now: a key this node already kept stays kept.
             let kept = super::load(&store, me).await?.is_some_and(|o| o.managing());
             println!(
-                "this node is now owned by {} ({})",
+                "this node is now claimed with owner key {} ({})",
                 key.id.short(),
                 if kept {
                     "key kept here"
@@ -177,7 +183,7 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                     eprintln!(
                         "warning: {stranded}. The keys kept for the rotation are deleted too; \
                          give those nodes their owner again on the nodes themselves: \
-                         peephole owner adopt"
+                         peephole owner claim"
                     );
                 }
             } else {

@@ -5,6 +5,15 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Changed
+
+- Ownership is about claiming nodes: an unclaimed node's Ownership page
+  offers "Your first node?" (create the key) and "Already have a key?"
+  (claim this node, choosing between being managed only and also managing
+  the others), the key is shown with the next steps, and a claimed node
+  lists the members not claimed with its key. `peephole owner claim`
+  replaces `peephole owner adopt`, which stays as an alias.
+
 ### Fixed
 
 - Cluster: a member whose dial keeps failing (behind NAT, port closed) is
