@@ -1691,8 +1691,10 @@ mod tests {
         };
         let daemon = open().await;
         daemon.bootstrap().await.unwrap();
-        let mut running = crate::config::Roles::default();
-        running.scanner = false;
+        let running = crate::config::Roles {
+            scanner: false,
+            ..Default::default()
+        };
         daemon.set_roles(running).await.unwrap();
 
         let cli = open().await;
