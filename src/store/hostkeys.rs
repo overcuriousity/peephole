@@ -149,6 +149,9 @@ pub async fn backfill(pool: &sqlx::SqlitePool, below: i64) -> Result<u64> {
     let mut done = 0;
     let mut after = 0i64;
     loop {
+        // Selected under the write lock: a scan deleted (a tombstone, an IP
+        // delete) between reading and writing would leave a dangling key.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows: Vec<(i64, i64, Option<Vec<u8>>)> = sqlx::query_as(
             "SELECT id, ip_id, raw_xml FROM scans WHERE keys_parsed < ? AND id > ?
              ORDER BY id LIMIT ?",
@@ -156,13 +159,12 @@ pub async fn backfill(pool: &sqlx::SqlitePool, below: i64) -> Result<u64> {
         .bind(below)
         .bind(after)
         .bind(BACKFILL_BATCH)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
         let Some((last, _, _)) = rows.last() else {
             return Ok(done);
         };
         after = *last;
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         for (id, ip_id, xml) in &rows {
             derive(&mut tx, *id, *ip_id, xml.as_deref()).await?;
         }

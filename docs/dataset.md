@@ -182,8 +182,8 @@ nmap reported in a scan of the address, as the address's own DNS claims it
 (`votes` and `answered` are 0). `rdns`: this node's reverse lookup of the
 address: a PTR name that resolves back to it (forward-confirmed; names in
 special-use zones such as `.local`, `.internal` or `.test` are not looked
-up). Each node looks up on its own, so two nodes' exports can differ here; `votes` and
-`answered` are 0. Names are in ASCII form (`xn--` for
+up). Each node looks up on its own, so two nodes' exports can differ
+here; `votes` and `answered` are 0. Names are in ASCII form (`xn--` for
 international ones).
 
 **`fingerprints`**: browser fingerprints the trap page collected from this
