@@ -185,7 +185,28 @@ impl Crawlers {
 }
 
 /// Most PTR names of one address checked forward.
-const MAX_NAMES: usize = 4;
+pub(crate) const MAX_NAMES: usize = 4;
+
+/// Special-use and local zones (RFC 6761, 6762, 7686, 8375, ICANN's
+/// `internal`): a forward lookup there asks this host's own network, not
+/// the source's.
+const SPECIAL_USE: [&str; 8] = [
+    "local",
+    "localhost",
+    "internal",
+    "lan",
+    "home.arpa",
+    "invalid",
+    "test",
+    "onion",
+];
+
+/// `name` (lower-case, no trailing dot) lies in a [`SPECIAL_USE`] zone.
+fn special_use(name: &str) -> bool {
+    SPECIAL_USE
+        .iter()
+        .any(|z| name == *z || name.strip_suffix(z).is_some_and(|p| p.ends_with('.')))
+}
 
 /// The PTR names of `ip` that resolve back to it, as valid host names, in
 /// the order the reverse zone gave them. Err when the PTR lookup fails or
@@ -205,6 +226,7 @@ pub(crate) async fn confirmed_names(
     for n in names
         .iter()
         .filter_map(|n| crate::intel::dns::valid_name(n))
+        .filter(|n| !special_use(n))
     {
         if !valid.contains(&n) {
             valid.push(n);
@@ -212,7 +234,10 @@ pub(crate) async fn confirmed_names(
     }
     let mut out = vec![];
     for name in valid.into_iter().take(MAX_NAMES) {
-        if let Ok(Ok(addrs)) = tokio::time::timeout(LOOKUP_TIMEOUT, forward(name.clone())).await
+        // Absolute: a search domain must not complete a name the source's
+        // reverse zone chose.
+        if let Ok(Ok(addrs)) =
+            tokio::time::timeout(LOOKUP_TIMEOUT, forward(format!("{name}."))).await
             && addrs.into_iter().any(|a| crate::net::canonical(a) == ip)
         {
             out.push(name);
@@ -431,10 +456,17 @@ mod tests {
 
     /// Forward lookups: `*.real.googlebot.com` resolves to 198.51.100.7,
     /// `*.real.censys-scanner.com` to 198.51.100.9, `*.slow.googlebot.com`
-    /// never answers, anything else does not exist.
+    /// never answers, anything else does not exist; a trailing dot is
+    /// ignored. Except: relative `short.example` and absolute `*.internal.`
+    /// resolve to 198.51.100.7 (a search domain, a local zone).
     fn fake_forward() -> Forward {
         std::sync::Arc::new(|name: String| {
             Box::pin(async move {
+                // A relative name a search domain would complete.
+                if name == "short.example" || name.ends_with(".internal.") {
+                    return Ok(vec!["198.51.100.7".parse().unwrap()]);
+                }
+                let name = name.trim_end_matches('.');
                 if name.ends_with(".real.googlebot.com") {
                     Ok(vec!["198.51.100.7".parse().unwrap()])
                 } else if name.ends_with(".real.censys-scanner.com") {
@@ -496,6 +528,16 @@ mod tests {
                 .is_empty(),
             "a forward timeout is no confirmation here"
         );
+        for (name, why) in [
+            ("short.example", "looked up as an absolute name"),
+            ("printer.internal", "a special-use name"),
+            ("under_score.real.googlebot.com", "not a host name"),
+        ] {
+            assert!(
+                run(Some(name), "198.51.100.7").await.unwrap().is_empty(),
+                "{why}"
+            );
+        }
     }
 
     async fn check(name: Option<&str>, ip: &str) -> Option<String> {

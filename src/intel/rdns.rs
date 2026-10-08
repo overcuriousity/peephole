@@ -16,6 +16,8 @@ const BATCH: i64 = 50;
 const PARALLEL: usize = 4;
 /// Between passes.
 const EVERY: Duration = Duration::from_secs(60);
+/// After a full batch: more are likely due (the backlog after an upgrade).
+const AGAIN: Duration = Duration::from_secs(1);
 
 /// Look up the sources that are due, `BATCH` at a time, until shutdown.
 /// Off when `enabled` is false or no resolver is configured.
@@ -29,13 +31,20 @@ pub async fn run(store: Store, enabled: bool, mut shutdown: tokio::sync::watch::
     };
     let forward = system_forward();
     loop {
-        match pass(&store, resolver, &forward).await {
-            Ok(0) => {}
-            Ok(n) => tracing::debug!(sources = n, "reverse DNS: looked up"),
-            Err(e) => tracing::warn!(error = %e, "reverse DNS: pass failed"),
-        }
+        let wait = match pass(&store, resolver, &forward).await {
+            Ok(n) if n as i64 == BATCH => AGAIN,
+            Ok(0) => EVERY,
+            Ok(n) => {
+                tracing::debug!(sources = n, "reverse DNS: looked up");
+                EVERY
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "reverse DNS: pass failed");
+                EVERY
+            }
+        };
         tokio::select! {
-            _ = tokio::time::sleep(EVERY) => {}
+            _ = tokio::time::sleep(wait) => {}
             r = shutdown.changed() => if r.is_err() { return },
         }
         if *shutdown.borrow() {
@@ -72,8 +81,11 @@ pub(crate) async fn pass(
         .buffer_unordered(PARALLEL)
         .collect()
         .await;
+    // One source's failure does not lose the rest of the batch.
     for (id, names) in found {
-        store.record_rdns(id, &names).await?;
+        if let Err(e) = store.record_rdns(id, &names).await {
+            tracing::warn!(ip_id = id, error = %e, "reverse DNS: not stored");
+        }
     }
     Ok(n)
 }
@@ -106,7 +118,7 @@ mod tests {
         let resolver = fake_resolver(Arc::new(Mutex::new(Some("host-7.example.net".into())))).await;
         let forward: Forward = Arc::new(|name: String| {
             Box::pin(async move {
-                if name == "host-7.example.net" {
+                if name.trim_end_matches('.') == "host-7.example.net" {
                     Ok(vec!["198.51.100.7".parse().unwrap()])
                 } else {
                     Err(std::io::Error::other("no such host"))

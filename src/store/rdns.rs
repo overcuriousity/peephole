@@ -4,8 +4,8 @@
 use super::Store;
 use anyhow::Result;
 
-/// Most names kept of one lookup (`crawler::confirmed_names` checks 4).
-const MAX_NAMES: usize = 4;
+// Most names kept of one lookup: as many as the lookup checks.
+use crate::scan::crawler::MAX_NAMES;
 
 impl Store {
     /// Sources due a reverse lookup, most recently seen first: never looked
@@ -23,14 +23,15 @@ impl Store {
     }
 
     /// Store what a lookup found (possibly nothing) and when it ran.
-    /// Names no longer found keep their row; `last_seen` dates them.
+    /// Names no longer found keep their row; `last_seen` dates them. An IP
+    /// deleted while it was looked up gets nothing.
     pub async fn record_rdns(&self, ip_id: i64, names: &[String]) -> Result<()> {
         let now = super::data::now_ts();
         let mut tx = self.pool.begin().await?;
         for name in names.iter().take(MAX_NAMES) {
             sqlx::query(
                 "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen, agreed)
-                 VALUES (?1, ?2, 'rdns', ?3, ?3, 1)
+                 SELECT ?1, ?2, 'rdns', ?3, ?3, 1 WHERE EXISTS (SELECT 1 FROM ips WHERE id = ?1)
                  ON CONFLICT(ip_id, name, source) DO UPDATE SET last_seen = excluded.last_seen",
             )
             .bind(ip_id)
@@ -153,5 +154,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 0, "the name kept nothing alive");
+        // A lookup that finishes after its IP went stores nothing.
+        s.record_rdns(id, &["host-7.example.net".into()])
+            .await
+            .unwrap();
+        assert!(s.names_for_ip(id).await.unwrap().is_empty());
     }
 }
