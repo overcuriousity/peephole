@@ -54,7 +54,7 @@ is needed (the column already holds integers; existing 1s are below 2).
 previous level-2 list is appended to `profiles::ACCEPTED` so scans from
 nodes not yet upgraded still earn.
 
-**Links.** A new soft `LinkKind::HttpEtag` (key `etag`, name "HTTP ETag")
+**Links.** A new soft `LinkKind::HttpEtag` (key `http-etag`, name "HTTP ETag")
 beside Favicon and JARM: listed on Links, never in `IDENTITY`, shown on
 the IP and scan pages beside the host keys. Distro default pages share an
 ETag across thousands of hosts; like the other soft kinds it says "same
