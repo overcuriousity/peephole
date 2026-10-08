@@ -491,7 +491,7 @@ printf '%s\n' y short short 'longenough-pass-1' 'longenough-pass-2' "$wpw" "$wpw
 env -u PEEPHOLE_CLUSTER_ADVERTISE PEEPHOLE_ROLES=web PEEPHOLE_TTY=/tmp/answers bash install.sh > /tmp/wizard-password.log 2>&1 \
     || { cat /tmp/wizard-password.log; exit 1; }
 grep -q '^advertise = "web.example:7444"' /etc/peephole/config.toml
-grep -q '^listen = "0.0.0.0:7444"' /etc/peephole/config.toml
+grep -qxF "listen = \"${LISTEN_ANY}:7444\"" /etc/peephole/config.toml
 grep -q 'Too short.' /tmp/wizard-password.log
 grep -q 'They differ.' /tmp/wizard-password.log
 if grep -q 'wiz "pass\|longenough' /etc/peephole/config.toml /tmp/wizard-password.log; then
