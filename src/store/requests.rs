@@ -432,10 +432,7 @@ mod tests {
             .unwrap();
         assert_eq!(score, Some(90));
         let tags = s.intel_tags().await.unwrap();
-        assert!(
-            tags.contains(&"shodan:vpn".to_string()),
-            "{tags:?}"
-        );
+        assert!(tags.contains(&"shodan:vpn".to_string()), "{tags:?}");
         assert!(tags.contains(&"shodan:scanner".to_string()));
         assert!(
             !tags.contains(&"abuseipdb:SSH".to_string()),

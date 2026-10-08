@@ -655,6 +655,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         client.write_all(&sig[5..]).await.unwrap();
         assert!(matches!(task.await.unwrap(), Err(Unusable::UntrustedProxy)));
+        // A v1 header split inside its first word.
+        let (mut client, server) = tcp_pair().await;
+        client.write_all(b"PRO").await.unwrap();
+        let task = tokio::spawn(preface(server, false));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client
+            .write_all(b"XY TCP4 203.0.113.1 10.0.0.1 1 443\r\n")
+            .await
+            .unwrap();
+        assert!(matches!(task.await.unwrap(), Err(Unusable::UntrustedProxy)));
     }
 
     #[test]

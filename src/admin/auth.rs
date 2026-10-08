@@ -113,11 +113,8 @@ fn webauthn_for(cfg: &crate::config::Config) -> Result<Webauthn> {
 pub const MAX_VERIFIES: usize = 3;
 
 /// A hash nobody knows the password of, verified when none is set so a
-/// request takes as long as a real one.
-fn dummy_phc() -> &'static str {
-    static PHC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PHC.get_or_init(|| crate::admin::password::hash("no such password").unwrap_or_default())
-}
+/// request takes as long as a real one (made once with `password::hash`).
+const DUMMY_PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$1+M9O+UgGF/mBHjQrx/Mag$2Zo8y2Txjn+t4vTml5CqtqPDb+ilJMk6j89jzN1FbUc";
 
 pub fn auth_routes() -> Router<Arc<AdminState>> {
     Router::new()
@@ -422,7 +419,17 @@ async fn enroll_finish(
     }
 }
 
+/// Refusal when the sign-in method leaves security keys out.
+async fn passkey_off(state: &AdminState) -> Option<Response> {
+    let method = state.store.login_method().await.unwrap_or_default();
+    (!method.passkey())
+        .then(|| (StatusCode::FORBIDDEN, "security-key sign-in is off").into_response())
+}
+
 async fn login_start(State(state): State<Arc<AdminState>>, jar: CookieJar) -> Response {
+    if let Some(off) = passkey_off(&state).await {
+        return off;
+    }
     let creds = state.store.load_credentials().await.unwrap_or_default();
     let passkeys: Vec<Passkey> = creds
         .into_iter()
@@ -475,6 +482,9 @@ async fn login_finish(
     jar: CookieJar,
     Json(body): Json<LoginFinish>,
 ) -> Response {
+    if let Some(off) = passkey_off(&state).await {
+        return off;
+    }
     let cfg = &state.cfg;
     let Some(cookie) = jar.get(ceremony_cookie_name(cfg)) else {
         return (StatusCode::BAD_REQUEST, "no login in progress").into_response();
@@ -584,7 +594,7 @@ async fn login_password(
         return busy();
     };
     let found = phc.is_some();
-    let phc = phc.unwrap_or_else(|| dummy_phc().to_string());
+    let phc = phc.unwrap_or_else(|| DUMMY_PHC.to_string());
     let ok = tokio::task::spawn_blocking(move || crate::admin::password::verify(&f.password, &phc))
         .await
         .unwrap_or(false)
@@ -718,6 +728,20 @@ secure_cookies = {secure}
         assert_eq!(st, StatusCode::SEE_OTHER);
         let set = set.expect("session cookie");
         assert!(set.starts_with("peephole_session="), "{set}");
+        // Password only: no security-key ceremony starts.
+        state
+            .store
+            .set_login_method(LoginMethod::Password)
+            .await
+            .unwrap();
+        let (st, _, body) = send(&app, "POST", "/login/start", None, "").await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        assert!(body.contains("security-key sign-in is off"), "{body}");
+    }
+
+    #[test]
+    fn the_dummy_hash_parses() {
+        assert!(argon2::PasswordHash::new(DUMMY_PHC).is_ok());
     }
 
     #[tokio::test]

@@ -91,8 +91,10 @@ async fn open_store(config: &str) -> Result<Store> {
 
 /// The password from one line of stdin: only the line ending is removed.
 fn stdin_password(input: &str) -> &str {
-    let line = input.strip_suffix('\n').unwrap_or(input);
-    line.strip_suffix('\r').unwrap_or(line)
+    match input.strip_suffix('\n') {
+        Some(line) => line.strip_suffix('\r').unwrap_or(line),
+        None => input,
+    }
 }
 
 /// A fresh one-time setup token, replacing any earlier one (unused or
@@ -112,6 +114,7 @@ mod tests {
         assert_eq!(stdin_password("pw\n"), "pw");
         assert_eq!(stdin_password("pw\r\n"), "pw");
         assert_eq!(stdin_password(" spaced pw \n"), " spaced pw ");
+        assert_eq!(stdin_password("pw\r"), "pw\r");
     }
 
     #[tokio::test]
