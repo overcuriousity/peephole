@@ -567,16 +567,29 @@ impl Node {
             .map(|(_, _, addr)| addr)
     }
 
-    /// The address this node dials `id` at, unless dialling it failed last
-    /// time: its sync loop retries with backoff, and requests meanwhile go
-    /// through its outbox rather than wait out a timeout each.
-    pub fn working_dial_address(&self, id: &NodeId) -> Option<String> {
-        self.dial_address(id).filter(|_| !self.dial_failing(id))
+    /// Sync with `peer` around a request (an offer it must hold, a receipt
+    /// to fetch), when this node dials it. A dial that failed last time is
+    /// still tried (the peer may be back), but only briefly when the peer
+    /// polls its outbox here: it then pulls what it needs itself, and the
+    /// request does not wait out a dial timeout.
+    pub async fn sync_around_request(&self, peer: NodeId) -> Result<()> {
+        let Some(addr) = self.dial_address(&peer) else {
+            return Ok(());
+        };
+        let sync = sync::reconcile(self, peer, &addr, false);
+        if self.dial_failing(&peer) && self.routed_callable(&peer) {
+            match tokio::time::timeout(QUICK_SYNC, sync).await {
+                Ok(r) => r.map(|_| ()),
+                Err(_) => Ok(()),
+            }
+        } else {
+            sync.await.map(|_| ())
+        }
     }
 
     /// Whether `id` speaks routed RPC and a route avoiding members too old
     /// to relay it exists.
-    fn routed_callable(&self, id: &NodeId) -> bool {
+    pub(crate) fn routed_callable(&self, id: &NodeId) -> bool {
         self.members()
             .get(id)
             .is_some_and(|m| m.proto_max >= rpc::proto::ROUTED_PROTO)
@@ -586,10 +599,11 @@ impl Node {
             )
     }
 
-    /// Whether this node can ask `id` an RPC: it dials it (and that did not
-    /// fail last time), or it can route the request (see `call_any`).
+    /// Whether this node can ask `id` an RPC: it dials it, or it can route
+    /// the request. A dial that failed last time still counts (the peer
+    /// may be back); `call_any` routes around it when it can.
     pub fn can_call(&self, id: &NodeId) -> bool {
-        self.working_dial_address(id).is_some() || self.routed_callable(id)
+        self.dial_address(id).is_some() || self.routed_callable(id)
     }
 
     /// Enrichment providers this node can query right now.
@@ -1062,6 +1076,9 @@ impl Node {
         }
     }
 }
+
+/// How long [`Node::sync_around_request`] tries a failing dial.
+const QUICK_SYNC: Duration = Duration::from_secs(2);
 
 /// Bind the RPC listener and start the sync loops. Returns the bound address.
 pub async fn start(

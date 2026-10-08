@@ -1717,16 +1717,18 @@ mod tests {
         m.proto_max = super::super::rpc::proto::ROUTED_PROTO;
         super::append(&node, &[Record::MemberAdd(m)]).await.unwrap();
         assert!(node.can_call(&x.id));
-        assert!(node.working_dial_address(&x.id).is_some());
 
         node.record_status(x.id, "x", Err("connection refused".into()))
             .await;
-        assert_eq!(node.working_dial_address(&x.id), None);
-        // Neither dialled nor polling: nothing would answer an offer.
-        assert!(!node.can_call(&x.id));
-        // It polls its outbox here: asked that way.
+        // Not polling: the dial is tried anyway (it may be back).
+        assert!(node.can_call(&x.id) && !node.routed_callable(&x.id));
+        // It polls its outbox here: `call_any` asks it that way, and a
+        // sync around a request gives up on the dial quickly.
         node.status.touch_inbound(x.id);
-        assert!(node.can_call(&x.id));
+        assert!(node.routed_callable(&x.id));
+        let t = std::time::Instant::now();
+        let _ = node.sync_around_request(x.id).await;
+        assert!(t.elapsed() <= super::super::QUICK_SYNC + std::time::Duration::from_secs(1));
     }
 
     fn now_hlc(n: u64) -> u64 {
