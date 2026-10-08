@@ -5,6 +5,35 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Fixed
+
+- Cluster: a member whose dial keeps failing (behind NAT, port closed) is
+  asked paid lookups, probes and resolutions through its outbox instead of
+  timing out on the dial while the offer holds credits.
+- Installer: nginx no longer buffers the trap's streamed answers (the MCP
+  decoy's event stream, the tarpit's drip).
+- Installer: without nginx in front (`direct`, `remote`) the trap listens
+  on `[::]` where the host has IPv6, so IPv6 clients are recorded.
+- Installer: an admin listener moved off a busy 8443 no longer lands on
+  nginx's own TLS port for the admin domain (8444).
+- Cluster CLI commands no longer re-announce the config file's roles over
+  the ones the daemon runs.
+- `check-config` refuses a `cluster.advertise` or peer address that is
+  not `host:port` and a `node_name` members would rewrite; the name is
+  taken trimmed.
+- A stored `roles.web` or `roles.listener` override no longer switches on
+  a role whose config sections are gone (the web role panicked on every
+  session request without `[webauthn]`).
+- Scanner: a failed lease renewal is retried several times before the
+  lease runs out, instead of once at expiry (a duplicate scan).
+- A join that fails after the invite was checked gives its use back.
+- A credit draw asks only siblings on the market rules (protocol 4+).
+- A failed hourly price refresh keeps the hour's demand.
+- `check-config` names an obsolete `[greynoise]` section; obsolete-key
+  notes are logged once at start.
+- `deploy/config.example.toml` documents `[probe]` and
+  `[enrichment] offer_per_day`.
+
 ## [0.8.0] - 2026-10-08
 
 ### Added
@@ -23,7 +52,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   lists and private space. Only ports already found open are touched,
   never more than 16, 10 s per connection, 120 s per probe, one probe per
   address and scanner a day. In a cluster a probe is paid with credits
-  (4 units, double while the scanner is busy); the result and the receipt
+  at the scanner's market price for probes; the result and the receipt
   replicate together. `[probe] enabled`, `max_parallel`. Admin-only.
 - Vantages. The same probe from up to four scanners at once, spread over
   countries, with a field-by-field diff of what each one saw and a
@@ -38,8 +67,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   rest is shown as disputed. Agreed names are attached to the address
   (IP page, `names` export column) and replicated. nmap's PTR names from
   stored scans are shown there too.
-- Lookup is a tab. It runs the cheap providers (Tor, RDAP, GeoLite2,
-  InternetDB) by itself and offers the paid ones with their price; one
+- Lookup is a tab. It runs the providers this node answers itself (free)
+  by itself and offers the others with their price; one
   field takes an address, a name or a pasted list. The top-bar search
   routes names to it.
 - Links: favicon, JARM, page-body and 404-page hashes from probes, as
@@ -52,9 +81,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Admin: sign in with a password (optional, per node; `peephole admin
   password`, `peephole admin login-method`). Passkeys stay the default.
 - Cluster: outbound-only members answer paid lookups, resolutions and
-  probes (routed through the outbox; protocol 6: the member and the node
-  whose outbox it polls must run it; older outbound-only members are not
-  asked).
+  probes, routed through the outbox (protocol 6, see Upgrading).
 - Trap: a PROXY header from a peer outside `trusted_proxies` is named in
   the log.
 - Installer: asks whether to also allow a password sign-in on the admin
@@ -110,8 +137,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   jobs it buys elsewhere, without moving credits.
 - Fleets have no collecting node: every node keeps what it earns, and a
   lookup that needs more draws from the node's siblings, richest first.
-- Heartbeats carry `scan_budget_mc` and `scan_queued`; `scan_bids` is
-  gone.
+- Heartbeats carry `scan_budget_mc` and `scan_queued`.
 - Credits page: the scan tile shows this node's selling price, and a table
   lists every scanner's announced and reference price.
 - Host keys and certificates may come from a probe as well as a scan;
@@ -172,18 +198,22 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   each other: credits move only between nodes on protocol 4 or later, scan
   jobs are paid only between nodes on protocol 5 or later, and an
   outbound-only member answers paid lookups, resolutions and probes only
-  once it and the node whose outbox it polls run protocol 6.
-- Migrations 0018–0024 run on the first start. Fleets keep no collecting
-  node: `credits.collect_to` is dropped, and every node keeps what it
-  earns.
-- `[greynoise]` sections are ignored and can be removed.
+  once it, the node whose outbox it polls and every member relaying to it
+  run protocol 6.
+- Migrations 0018–0024 run on the first start, and balances are recounted
+  from the log under the market rules: balances from 0.7 change at once
+  (no trap share, burn or scanner-1/2 earnings; mint and allowance
+  instead).
 - Existing installs keep their config; the installer's new questions apply
   to first installs only. Scripts that install unattended: add `scanner`
   to `PEEPHOLE_ROLES` to keep the scanner, set `PEEPHOLE_FRONT=remote` where
   a preset `PEEPHOLE_TRUSTED_PROXIES` meant a proxy elsewhere, and set
-  `PEEPHOLE_CLUSTER_ADVERTISE` (required now unless the admin domain or a
-  public address gives a default). `PEEPHOLE_CLUSTER` and
-  `PEEPHOLE_ACME_EMAIL` are ignored.
+  `PEEPHOLE_CLUSTER_ADVERTISE` unless a default applies (the admin domain
+  with the web role and nginx or the trap on this machine; otherwise a
+  detected public address). An install that was standalone with
+  `PEEPHOLE_CLUSTER=0` or without a terminal is now a cluster node: its
+  RPC listener takes port 7443 (or the advertise port) on all interfaces,
+  so firewall it if other members should not reach it.
 
 ## [0.7.0] - 2026-10-06
 
