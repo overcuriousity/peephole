@@ -83,6 +83,9 @@ has_role() { [[ ",${PEEPHOLE_ROLES}," == *",$1,"* ]]; }
 # TLS for unknown names through to the trap (which reads the handshake
 # itself): a trap behind a local proxy.
 stream_trap() { has_role listener && [ "${PEEPHOLE_LOCAL_PROXY:-0}" = 1 ]; }
+# Where nginx itself terminates TLS for the admin domain behind the stream
+# config (claimed with the node's ports, so the admin listener avoids it).
+NGINX_ADMIN_TLS="127.0.0.1:8444"
 
 # --- what the machine has (questions; top level so tests can source them) ---
 
@@ -283,14 +286,14 @@ nginx_stream_example() {
     echo "# learns the client's address from the PROXY protocol header."
     echo "#"
     echo "# Other HTTPS sites on this nginx must move behind it too: add a line"
-    echo "# \"<their name> 127.0.0.1:8444;\" to the map and change their \"listen 443 ssl\""
-    echo "# to \"listen 127.0.0.1:8444 ssl proxy_protocol;\" plus \"set_real_ip_from"
+    echo "# \"<their name> ${NGINX_ADMIN_TLS};\" to the map and change their \"listen 443 ssl\""
+    echo "# to \"listen ${NGINX_ADMIN_TLS} ssl proxy_protocol;\" plus \"set_real_ip_from"
     echo "# 127.0.0.1; real_ip_header proxy_protocol;\" (as the admin site has)."
     if has_role web; then
         cat <<NGINX
 stream {
     map \$ssl_preread_server_name \$peephole_upstream {
-        ${PEEPHOLE_DOMAIN} 127.0.0.1:8444;
+        ${PEEPHOLE_DOMAIN} ${NGINX_ADMIN_TLS};
         default 127.0.0.1:${tls_port};
     }
     server {
@@ -352,7 +355,7 @@ NGINX
     # hands this domain's connections here with a PROXY protocol header.
     # Works on every nginx; 1.25.1+ warns it is deprecated. There,
     # "listen ... ssl proxy_protocol;" plus "http2 on;" is the newer form.
-    listen 127.0.0.1:8444 ssl http2 proxy_protocol;
+    listen ${NGINX_ADMIN_TLS} ssl http2 proxy_protocol;
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
 NGINX
@@ -1072,6 +1075,9 @@ if [ "$upgrade" -ne 1 ]; then
             say "'${PEEPHOLE_DOMAIN}' is not a host name"$'\n'
             PEEPHOLE_DOMAIN=""
         done
+        # nginx's own TLS listener for the admin domain first: the admin
+        # listener, moved off a busy 8443, must not land on it.
+        if stream_trap; then claim_port NGINX_ADMIN_TLS "nginx TLS listener of the admin domain" 1; fi
         claim_port ADMIN_LISTEN "admin listener" 1
         # Password sign-in besides passkeys. The password never enters the
         # config (no toml_safe): it reaches `peephole admin password --stdin`
