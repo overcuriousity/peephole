@@ -544,6 +544,7 @@ fn scan_json(s: &ScanOut, ports: &[crate::store::export::PortOut], opts: &Export
         "scanner": s.scanner.as_deref().map(|id| node_name(&opts.names, id)),
         "os_guess": s.os_guess,
         "ports": ports,
+        "host_keys": s.host_keys,
         "xml": xml,
     })
 }
@@ -1370,6 +1371,40 @@ mod tests {
             "canary values are not exported"
         );
         assert!(COLUMNS.contains(&"decoy_v") && COLUMNS.contains(&"canary_used_from"));
+    }
+
+    #[tokio::test]
+    async fn scans_export_their_host_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let row = s.upsert_ip("192.0.2.7".parse().unwrap()).await.unwrap();
+        s.insert_request(&NewRequest {
+            ip_id: row.id,
+            method: "GET".into(),
+            path: "/".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        s.enqueue_scan(row.id, 2, 0).await.unwrap();
+        let job = s.next_queued_job().await.unwrap().unwrap();
+        let res = crate::scan::nmap_xml::parse_nmap_xml(include_bytes!(
+            "../../tests/fixtures/nmap-hostkeys.xml"
+        ))
+        .unwrap();
+        s.finish_job(job.id, Some(&res), None).await.unwrap();
+
+        let out = text(&collect(&s, ExportFilter::default(), Format::Jsonl).await);
+        let r: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        let keys = r["scans"][0]["host_keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 5, "{keys:?}");
+        assert!(keys.iter().any(|k| k["kind"] == "ssh-hostkey"
+            && k["fingerprint"].as_str().unwrap().starts_with("SHA256:")
+            && k["port"].as_i64().is_some()));
+        assert!(keys.iter().any(|k| k["kind"] == "tls-cert"));
+        assert!(keys[0].get("scan_id").is_none(), "internal id not exported");
     }
 
     /// An audit is exported as the auditor's scan, not as a second scan by
