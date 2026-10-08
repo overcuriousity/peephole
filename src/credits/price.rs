@@ -126,13 +126,39 @@ impl Demand {
             .or_default() += n as f64;
     }
 
-    /// The counts and the hours they cover; starts a new period.
-    pub fn take(&self) -> (HashMap<String, f64>, f64) {
-        let mut g = self.inner.lock().unwrap();
-        let hours = (g.0.elapsed().as_secs_f64() / 3600.0).max(1e-6);
-        g.0 = std::time::Instant::now();
-        (std::mem::take(&mut g.1), hours)
+    /// The counts so far and the hours they cover, left in place: the
+    /// period ends with [`Demand::consume`] once they were used, so a
+    /// refresh that fails loses none of them.
+    pub fn peek(&self) -> Counted {
+        let g = self.inner.lock().unwrap();
+        let now = std::time::Instant::now();
+        Counted {
+            hours: ((now - g.0).as_secs_f64() / 3600.0).max(1e-6),
+            counts: g.1.clone(),
+            at: now,
+        }
     }
+
+    /// End the period `c` covers; what was noted since stays for the next.
+    pub fn consume(&self, c: &Counted) {
+        let mut g = self.inner.lock().unwrap();
+        for (good, n) in &c.counts {
+            if let Some(v) = g.1.get_mut(good) {
+                *v -= n;
+                if *v <= 0.0 {
+                    g.1.remove(good);
+                }
+            }
+        }
+        g.0 = g.0.max(c.at);
+    }
+}
+
+/// What [`Demand::peek`] saw.
+pub struct Counted {
+    pub counts: HashMap<String, f64>,
+    pub hours: f64,
+    at: std::time::Instant,
 }
 
 /// What is known of one scanner: its pace as its heartbeat announces it,
@@ -511,7 +537,8 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         .map(|(id, _)| *id)
         .collect();
     let capacity = capacity(&scanners(node, &left_out).await?);
-    let (demand, hours) = node.market.take();
+    let counted = node.market.peek();
+    let (demand, hours) = (&counted.counts, counted.hours);
     let old = node.price_table();
     // What live members announce, per good (for the start price).
     let me = node.id();
@@ -699,6 +726,7 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         offers,
     });
     node.set_price_table(table.clone());
+    node.market.consume(&counted);
     Ok(table)
 }
 
@@ -828,11 +856,18 @@ mod tests {
         d.note("abuseipdb", 2);
         d.note("abuseipdb", 1);
         d.note(PROBE, 1);
-        let (got, hours) = d.take();
-        assert_eq!(got.get("abuseipdb"), Some(&3.0));
-        assert_eq!(got.get(PROBE), Some(&1.0));
-        assert!(hours > 0.0 && hours < 0.01);
-        assert!(d.take().0.is_empty(), "taken");
+        let c = d.peek();
+        assert_eq!(c.counts.get("abuseipdb"), Some(&3.0));
+        assert_eq!(c.counts.get(PROBE), Some(&1.0));
+        assert!(c.hours > 0.0 && c.hours < 0.01);
+        // Not used (a refresh failed): still there.
+        assert_eq!(d.peek().counts.get(PROBE), Some(&1.0));
+        // Used: gone, but what was noted meanwhile stays.
+        d.note(PROBE, 2);
+        d.consume(&c);
+        let left = d.peek().counts;
+        assert_eq!(left.get(PROBE), Some(&2.0));
+        assert_eq!(left.get("abuseipdb"), None);
     }
 
     #[test]
