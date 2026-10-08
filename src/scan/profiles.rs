@@ -13,9 +13,10 @@ use quick_xml::events::Event;
 /// prerules), or flood (`dos`); those categories are excluded.
 pub const SCRIPTS: &str = "(discovery or safe) and not (intrusive or broadcast or external or dos)";
 /// Level 2 names its scripts: the source's own identifiers (SSH host keys
-/// and algorithm lists, the TLS certificate), each one handshake with a
-/// port nmap already found open, all in `safe`.
-pub const IDENTITY_SCRIPTS: &str = "ssh-hostkey,ssh2-enum-algos,ssl-cert";
+/// and algorithm lists, the TLS certificate, the HTTP headers with their
+/// ETag), each one handshake or request to a port nmap already found
+/// open, all in `safe`.
+pub const IDENTITY_SCRIPTS: &str = "ssh-hostkey,ssh2-enum-algos,ssl-cert,http-headers";
 
 /// The built-in arguments of a level, without the target. `udp`: level 4
 /// also scans the top UDP ports (`scan.level4_udp`). None for a level
@@ -84,7 +85,23 @@ pub fn builtin(level: u8, udp: bool) -> Option<Vec<String>> {
 /// their level. A release that changes a list appends the old one here
 /// and removes it two releases later, so a rolling upgrade costs nobody
 /// their earnings.
-pub const ACCEPTED: &[(u8, &[&str])] = &[];
+pub const ACCEPTED: &[(u8, &[&str])] = &[
+    // Level 2 before `http-headers` (0.9.0 and earlier).
+    (
+        2,
+        &[
+            "-Pn",
+            "-sS",
+            "-sV",
+            "-O",
+            "-T3",
+            "--top-ports",
+            "1000",
+            "--script",
+            "ssh-hostkey,ssh2-enum-algos,ssl-cert",
+        ],
+    ),
+];
 
 /// A command line as words: split at whitespace, quotes dropped (nmap
 /// versions differ in whether they quote an argument with spaces; the
@@ -252,6 +269,17 @@ mod tests {
             !args_ok_among(line, 2, &[(1, old)]),
             "accepted for its level only"
         );
+    }
+
+    #[test]
+    fn level_2_reads_http_headers_and_the_previous_list_still_earns() {
+        let l2 = builtin(2, false).unwrap();
+        assert!(l2.last().unwrap().ends_with(",http-headers"), "{l2:?}");
+        let old = "nmap -Pn -sS -sV -O -T3 --top-ports 1000 --script \
+                   ssh-hostkey,ssh2-enum-algos,ssl-cert --host-timeout 900s \
+                   --script-timeout 570s -oX - 203.0.113.7";
+        assert!(args_ok(old, 2));
+        assert!(!args_ok(old, 3), "accepted for level 2 only");
     }
 
     #[test]

@@ -1021,7 +1021,8 @@ rp_name = "x"
                 if !expr.contains(' ') {
                     for script in expr.split(',') {
                         assert!(
-                            ["ssh-hostkey", "ssh2-enum-algos", "ssl-cert"].contains(&script),
+                            ["ssh-hostkey", "ssh2-enum-algos", "ssl-cert", "http-headers"]
+                                .contains(&script),
                             "level {level}: {script} is not on the safe list"
                         );
                     }
