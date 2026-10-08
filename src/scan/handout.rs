@@ -182,7 +182,7 @@ pub fn describe(h: &Handout, name: &dyn Fn(&NodeId) -> String) -> String {
 }
 
 /// Member names as this node knows them; a short key otherwise.
-pub fn names(node: &Node) -> impl Fn(&NodeId) -> String + use<> {
+pub fn names(node: &Node) -> impl Fn(&NodeId) -> String + Send + Sync + use<> {
     let m = node.members();
     move |id| m.get(id).map_or_else(|| id.short(), |r| r.name.clone())
 }

@@ -65,6 +65,7 @@ pub struct JobFilter {
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct HistoryRow {
     pub id: i64,
+    pub uid: String,
     pub ip: String,
     pub level: i64,
     pub status: String,
@@ -79,6 +80,9 @@ pub struct HistoryRow {
     pub is_retry: bool,
     /// A failure that was retried (see `scan::retry`).
     pub retried: bool,
+    /// Why this node, as arbiter, gave the job to its scanner.
+    #[sqlx(skip)]
+    pub handout: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -247,7 +251,7 @@ impl Store {
             .as_deref()
             .filter(|s| FINISHED_STATUSES.contains(s));
         let mut sql = String::from(
-            "SELECT j.id, i.ip, j.level, j.status, j.finished_at, j.error,
+            "SELECT j.id, j.uid, i.ip, j.level, j.status, j.finished_at, j.error,
                     (SELECT name FROM members m WHERE m.id = j.scanner) AS scanner,
                     (SELECT name FROM members m WHERE m.id = j.arbiter) AS arbiter,
                     s.id AS scan_id, s.os_guess,
