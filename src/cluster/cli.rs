@@ -73,7 +73,7 @@ pub(crate) async fn open(config: &str) -> Result<(Config, Arc<Node>)> {
     let store = Store::connect(&cfg.database_path).await?;
     let node = Node::open(NodeParams::from_config(&cfg, store)?).await?;
     // Make sure our own description exists before acting for the cluster.
-    node.bootstrap().await?;
+    node.bootstrap_keeping_roles().await?;
     Ok((cfg, node))
 }
 

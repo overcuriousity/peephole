@@ -97,6 +97,25 @@ pub fn draw_order(siblings: &[NodeId], balance: impl Fn(&NodeId) -> Mc) -> Vec<N
     v.into_iter().map(|(_, s)| s).collect()
 }
 
+/// The siblings a draw may ask: members whose transfers count under this
+/// node's rules (an older one would cost [`DRAW_WAIT`] for nothing), less
+/// those `skip` names (this node, blocked ones).
+fn drawable(
+    siblings: Vec<NodeId>,
+    members: &std::collections::HashMap<NodeId, crate::cluster::members::MemberRow>,
+    skip: impl Fn(&NodeId) -> bool,
+) -> Vec<NodeId> {
+    siblings
+        .into_iter()
+        .filter(|s| !skip(s))
+        .filter(|s| {
+            members
+                .get(s)
+                .is_some_and(|m| super::pay::pays_with(m.proto_max))
+        })
+        .collect()
+}
+
 /// Draw `mc` from this node's siblings, the richest first, until it is
 /// covered, and wait for the transfers to arrive. False: no sibling gave
 /// enough.
@@ -109,10 +128,9 @@ pub async fn draw(node: &Arc<Node>, mc: Mc) -> bool {
     let siblings = crate::cluster::owner::fleet::siblings(&node.store)
         .await
         .unwrap_or_default();
-    let siblings: Vec<NodeId> = siblings
-        .into_iter()
-        .filter(|s| *s != me && !node.is_blocked(s))
-        .collect();
+    let siblings = drawable(siblings, &node.members(), |s| {
+        *s == me || node.is_blocked(s)
+    });
     let mut missing = mc;
     for from in draw_order(&siblings, |s| book.balance(s)) {
         let ask = missing.min(book.balance(&from));
@@ -132,9 +150,7 @@ pub async fn draw(node: &Arc<Node>, mc: Mc) -> bool {
             continue;
         }
         // The transfer is an entry of the sibling's log: fetch it.
-        if let Some(addr) = node.dial_address(&from) {
-            let _ = crate::cluster::sync::reconcile(node, from, &addr, false).await;
-        }
+        let _ = node.sync_around_request(from).await;
         missing = missing.saturating_sub(sent);
         if missing == 0 {
             break;
@@ -173,5 +189,37 @@ mod tests {
             "richest first; nothing to give: not asked"
         );
         assert!(draw_order(&[], bal).is_empty());
+    }
+
+    #[test]
+    fn a_draw_skips_siblings_on_older_rules() {
+        use crate::cluster::members::{MemberRow, Standing};
+        let row = |id: NodeId, proto_max| MemberRow {
+            id,
+            name: String::new(),
+            address: None,
+            roles: vec![],
+            proto_min: 1,
+            proto_max,
+            sponsor: id,
+            active: true,
+            standing: Standing::Active,
+            info_hlc: 1,
+            last_entry_hlc: 1,
+            remote_config: false,
+        };
+        let (me, old, new, gone) = (
+            NodeId([1; 32]),
+            NodeId([2; 32]),
+            NodeId([3; 32]),
+            NodeId([4; 32]),
+        );
+        let members = [(me, row(me, 6)), (old, row(old, 3)), (new, row(new, 4))]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            drawable(vec![me, old, new, gone], &members, |s| *s == me),
+            [new]
+        );
     }
 }

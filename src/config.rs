@@ -25,6 +25,10 @@ pub struct Config {
     /// Obsolete and ignored: the signature rules are built into the binary.
     /// Still accepted so older configs load; see [`Config::obsolete_notes`].
     pub rules_dir: Option<PathBuf>,
+    /// Obsolete and ignored: GreyNoise was dropped as a provider. Read only
+    /// to say so (see [`Config::obsolete_notes`]).
+    #[serde(default)]
+    pub greynoise: Option<toml::Table>,
     #[serde(default)]
     pub trusted_proxies: Vec<IpNet>,
     /// Required with the web role.
@@ -626,10 +630,17 @@ impl Config {
                 dir.display()
             ));
         }
+        if self.greynoise.is_some() {
+            notes.push(
+                "note: `[greynoise]` is ignored: GreyNoise is no longer a provider; remove the \
+                 section (and its API key)"
+                    .into(),
+            );
+        }
         if self.cluster.as_ref().is_some_and(|c| c.remote_config) {
             notes.push(
                 "note: `cluster.remote_config` is ignored: config keys were replaced by the \
-                 ownership key (peephole owner new, peephole owner adopt); remove the key"
+                 ownership key (peephole owner new, peephole owner claim); remove the key"
                     .into(),
             );
         }
@@ -684,7 +695,12 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Config = toml::from_str(&text).context("parsing config.toml")?;
+        let mut cfg: Config = toml::from_str(&text).context("parsing config.toml")?;
+        // The cluster stores the name trimmed; a configured one with spaces
+        // around it would look changed on every start.
+        if let Some(c) = &mut cfg.cluster {
+            c.node_name = c.node_name.trim().to_string();
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -848,6 +864,18 @@ impl Config {
         if let Some(c) = &self.cluster {
             if c.node_name.trim().is_empty() {
                 bail!("cluster.node_name must be set");
+            }
+            // Members drop or refuse what fails these checks (see
+            // `members::sanitize`, `invite::redeem`).
+            if !crate::cluster::members::valid_name(c.node_name.trim()) {
+                bail!("cluster.node_name must be 1-64 characters, none of them control characters");
+            }
+            if let Some(a) = &c.advertise
+                && !crate::cluster::members::valid_address(a)
+            {
+                bail!(
+                    "cluster.advertise `{a}` must be host:port (a DNS name or IP address and a port)"
+                );
             }
             if !(10..=86_400).contains(&c.lease_secs) {
                 bail!("cluster.lease_secs must be between 10 and 86400");
@@ -1236,6 +1264,18 @@ data_dir = "/tmp"
         );
     }
 
+    /// A 0.7 config's `[greynoise]` loads and is reported as ignored.
+    #[test]
+    fn greynoise_section_is_reported_as_ignored() {
+        let cfg = parse(&format!(
+            "trap_listen = \"0.0.0.0:1\"\n{BASE}[roles]\nscanner = false\nweb = false\n[greynoise]\napi_key = \"k\"\n"
+        ))
+        .unwrap();
+        let notes = cfg.obsolete_notes();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("[greynoise]"), "{notes:?}");
+    }
+
     /// Keep everything unless asked; a window shorter than a week would cut
     /// into replication lag.
     #[test]
@@ -1338,6 +1378,42 @@ data_dir = "/tmp"
         let c = cfg.cluster.unwrap();
         assert_eq!(c.takeover_hours, 2.0);
         assert_eq!(c.lease_secs, 120);
+    }
+
+    /// What members would drop or refuse is refused here, and a name is
+    /// taken trimmed (as the cluster stores it).
+    #[test]
+    fn cluster_advertise_and_name_are_checked() {
+        let cluster = |extra: &str| {
+            format!(
+                "{BASE}[roles]\nlistener = false\nweb = false\n[cluster]\nlisten = \"0.0.0.0:7443\"\n{extra}"
+            )
+        };
+        let e = parse(&cluster(
+            "node_name = \"n\"\nadvertise = \"a.example.net\"\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("host:port"), "{e}");
+        assert!(
+            parse(&cluster(
+                "node_name = \"n\"\nadvertise = \"a.example.net:7443\"\n"
+            ))
+            .is_ok()
+        );
+        assert!(
+            parse(&cluster(
+                "node_name = \"n\"\nadvertise = \"[2001:db8::1]:7443\"\n"
+            ))
+            .is_ok()
+        );
+        let long = "x".repeat(65);
+        assert!(parse(&cluster(&format!("node_name = \"{long}\"\n"))).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, cluster("node_name = \"n \"\n")).unwrap();
+        assert_eq!(Config::load(&path).unwrap().cluster.unwrap().node_name, "n");
     }
 
     /// The annotated example parses and states the defaults.

@@ -3731,7 +3731,7 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
     let page_b = format!("{base_b}/admin/cluster/ownership");
 
     let html = text(&admin_a, page_a.clone()).await;
-    assert!(html.contains("No owner"), "{html}");
+    assert!(html.contains("Not claimed"), "{html}");
     assert!(html.contains("Ownership</a>"), "the tab is there");
 
     // Create: the key is on the answer, and nowhere afterwards.
@@ -3750,7 +3750,14 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
         .expect("the key is shown");
     let html = text(&admin_a, page_a.clone()).await;
     assert!(!html.contains("peephole-own1:"), "shown once");
-    assert!(html.contains("key kept here"), "{html}");
+    assert!(html.contains("the key is kept here"), "{html}");
+    // b is a member, not claimed yet: listed with how to claim it (once
+    // it described itself: its version knows ownership).
+    eventually("a lists b as a member to claim", || async {
+        let html = text(&admin_a, page_a.clone()).await;
+        html.contains("Other members") && html.contains("node-bravo")
+    })
+    .await;
     // A second create does not replace the owner.
     let before = owner::load(&na.store, a.id).await.unwrap().unwrap().id;
     admin_a
@@ -3773,13 +3780,13 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
     assert!(owner::load(&nb.store, b.id).await.unwrap().is_none());
     let r = admin_b
         .post(format!("{page_b}/adopt"))
-        .form(&[("key", key.as_str())])
+        .form(&[("key", key.as_str()), ("keep", "no")])
         .send()
         .await
         .unwrap();
     assert!(r.status().is_success());
     let html = text(&admin_b, page_b.clone()).await;
-    assert!(html.contains("key not kept here"), "{html}");
+    assert!(html.contains("the key is not kept here"), "{html}");
 
     // a lists b under My nodes; b lists what a told it to do.
     eventually("a finds b", || async {
@@ -3828,14 +3835,14 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
         .await
         .unwrap();
     let html = text(&admin_a, page_a.clone()).await;
-    assert!(html.contains("key not kept here"), "{html}");
+    assert!(html.contains("the key is not kept here"), "{html}");
     admin_b
         .post(format!("{page_b}/release"))
         .send()
         .await
         .unwrap();
     let html = text(&admin_b, page_b).await;
-    assert!(html.contains("No owner"), "{html}");
+    assert!(html.contains("Not claimed"), "{html}");
 }
 
 /// A node of an earlier version sends a config key request: it is told

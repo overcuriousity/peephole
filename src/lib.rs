@@ -96,8 +96,15 @@ pub fn geolite_loads(cfg: &config::Config) -> bool {
 pub async fn run(config_path: PathBuf) -> Result<()> {
     // Startup validation (spec §12).
     let (cfg, summary) = check_config(&config_path).await?;
-    info!(version = VERSION, "{summary}");
-    for note in cfg.obsolete_notes() {
+    // Obsolete keys are warned about; the summary has them too (for
+    // check-config), so they are left out of its log line.
+    let obsolete = cfg.obsolete_notes();
+    let summary: Vec<&str> = summary
+        .lines()
+        .filter(|l| !obsolete.iter().any(|n| n == l))
+        .collect();
+    info!(version = VERSION, "{}", summary.join("\n"));
+    for note in &obsolete {
         warn!("{note}");
     }
     std::fs::create_dir_all(&cfg.data_dir)?;

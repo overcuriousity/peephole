@@ -3,27 +3,44 @@
 {% block content %}
 {% let sub = "cluster" %}{% include "_admin_nav.html" %}
 {% let subtab = "ownership" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
-<div class="page-head"><div><h1>Ownership</h1><p class="muted">One key for all your nodes. Enter it on each; manage them from the ones that keep it.</p></div></div>
+<div class="page-head"><div><h1>Ownership</h1><p class="muted">Claim your nodes with one ownership key: create it on one node, then claim each other node with it. Nodes that keep the key manage the others.</p></div></div>
 <div class="stack">
 {% if let Some(k) = shown_key %}
 <section class="card"><h2>Ownership key</h2>
   <div class="banner banner-warning">Whoever holds this key controls every node it is entered on. Keep it somewhere safe; this page does not show it again unless you ask.</div>
   <pre class="panel mono break" data-copy>{{ k }}</pre>
-  <p class="muted">Enter it on your other nodes: Cluster › Ownership there, or <code>peephole owner adopt</code>.</p>
+  <h3>Next, on each of your other nodes</h3>
+  <ol>
+    <li>Open its admin site, Cluster › Ownership, and paste this key under <b>Already have a key?</b> (on the command line: <code>peephole owner claim</code>).</li>
+    <li>Choose there whether that node also manages the others. Keep the key on as few nodes as you need: a node that keeps it can change all of them.</li>
+    <li>Claimed nodes appear under <b>My nodes</b> here within a few minutes.</li>
+  </ol>
 </section>
 {% endif %}
 <section class="card"><h2>This node</h2>
 {% match owner %}
 {% when None %}
-  <p><b>No owner.</b> <span class="muted">Nobody can change this node from another node.</span></p>
-  <form method="post" action="/admin/cluster/ownership/create"><button class="btn btn-primary" type="submit">Create key</button> <span class="muted small">on your first node; it keeps the key</span></form>
-  <form method="post" action="/admin/cluster/ownership/adopt" class="filters">
-    <label>Ownership key <input name="key" size="60" class="mono" autocomplete="off" required></label>
-    <label class="check"><input type="checkbox" name="keep"> Manage my other nodes from here (keeps the key on this node)</label>
-    <button class="btn" type="submit">Adopt with a key</button>
-  </form>
+  <p><b>Not claimed.</b> <span class="muted">Nobody can change this node from another node.</span></p>
+  <div class="grid-2">
+    <div>
+      <h3>Your first node?</h3>
+      <p class="muted">Create the ownership key here. This node keeps it and manages every node you claim with it.</p>
+      <form method="post" action="/admin/cluster/ownership/create"><button class="btn btn-primary" type="submit">Create key</button></form>
+    </div>
+    <div>
+      <h3>Already have a key?</h3>
+      <p class="muted">Paste the key you created on your first node to claim this one.</p>
+      <form method="post" action="/admin/cluster/ownership/adopt" class="stack">
+        <label>Ownership key <input name="key" size="60" class="mono" autocomplete="off" required></label>
+        <label><input type="radio" name="keep" value="no" checked> Only be managed <span class="muted small">(the key is not kept here; best for scanners and exposed nodes)</span></label>
+        <label><input type="radio" name="keep" value="yes"> Also manage my other nodes from here <span class="muted small">(the key is kept here)</span></label>
+        <div><button class="btn btn-primary" type="submit">Claim this node</button></div>
+      </form>
+    </div>
+  </div>
 {% when Some(o) %}
-  <p>Owned by <span class="mono">{{ o }}</span> · {% if managing %}<b>key kept here</b>{% else %}key not kept here{% endif %}</p>
+  <p><b>Claimed</b> with owner key <span class="mono">{{ o }}</span> <span class="muted small">(the same on all your nodes)</span></p>
+  <p>{% if managing %}<b>Manages your other nodes:</b> the key is kept here.{% else %}<b>Managed only:</b> the key is not kept here; change this node from one that keeps it.{% endif %}</p>
   <div class="row">
     {% if managing %}
     <form method="post" action="/admin/cluster/ownership/show-key"><button class="btn btn-sm" type="submit">Show key</button></form>
@@ -43,12 +60,13 @@
     <dialog id="dlg-release"><h3>Release this node?</h3><p class="muted">It has no owner afterwards and cannot be managed from your other nodes.</p>
       <form method="post" action="/admin/cluster/ownership/release" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Release</button></form></dialog>
   </div>
-  <details><summary>Adopt with another key</summary>
-    <p class="muted">Replaces the current owner of this node.</p>
-    <form method="post" action="/admin/cluster/ownership/adopt" class="filters">
+  <details><summary>{% if managing %}Claim with another key{% else %}Manage your other nodes from here, or claim with another key{% endif %}</summary>
+    <p class="muted">{% if !managing %}Paste the same key and choose to manage, to keep it here. {% endif %}Another key replaces the current owner of this node.</p>
+    <form method="post" action="/admin/cluster/ownership/adopt" class="stack">
       <label>Ownership key <input name="key" size="60" class="mono" autocomplete="off" required></label>
-      <label class="check"><input type="checkbox" name="keep"> Keep the key on this node</label>
-      <button class="btn" type="submit">Adopt</button>
+      <label><input type="radio" name="keep" value="no"{% if !managing %} checked{% endif %}> Only be managed</label>
+      <label><input type="radio" name="keep" value="yes"{% if managing %} checked{% endif %}> Also manage my other nodes from here</label>
+      <div><button class="btn" type="submit">Claim this node</button></div>
     </form>
   </details>
 {% endmatch %}
@@ -66,7 +84,7 @@
   <div class="row">
     <form method="post" action="/admin/cluster/ownership/retry"><button class="btn btn-sm btn-primary" type="submit">Retry</button></form>
     <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-discard">Give up on them</button>
-    <dialog id="dlg-discard"><h3>Delete the previous key?</h3><p class="muted">These nodes are then no longer yours until you adopt them again on the node itself.</p>
+    <dialog id="dlg-discard"><h3>Delete the previous key?</h3><p class="muted">These nodes are then no longer yours until you claim them again on the node itself.</p>
       <form method="post" action="/admin/cluster/ownership/discard" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Delete previous key</button></form></dialog>
   </div>
 </section>
@@ -81,8 +99,15 @@
       <td>{{ n.roles }}</td><td class="mono">{{ n.version }}</td><td class="num">{{ n.credits }}</td><td>{{ n.seen }}</td>
     </tr>{% endfor %}</tbody>
   </table></div>
-  {% if nodes.len() == 1 %}<p class="muted">No other node with this key was found yet. Nodes are looked for every few minutes, and at once when a member comes online.</p>{% endif %}
+  {% if nodes.len() == 1 %}<p class="muted">No other node with this key was found yet. Claim your other nodes with the key on each of them; they are looked for every few minutes, and at once when a member comes online.</p>{% endif %}
 </section>
+{% if !others.is_empty() %}
+<section class="card">
+  <div class="card-head"><h2>Other members</h2><span class="muted">not claimed with this key</span></div>
+  <p class="muted">If one of these is yours, claim it on that node: its Cluster › Ownership page, or <code>peephole owner claim</code> there. A node cannot be claimed from here.</p>
+  <ul>{% for n in others %}<li><a href="/admin/cluster/node/{{ n.key }}"><b>{{ n.name }}</b></a> <span class="mono muted">{{ n.short }}</span></li>{% endfor %}</ul>
+</section>
+{% endif %}
 {% endif %}
 <section class="card">
   <div class="card-head"><h2>Commands received</h2><span class="muted">what your managing nodes told this node to do, newest first (UTC)</span></div>

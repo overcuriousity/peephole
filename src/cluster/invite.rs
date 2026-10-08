@@ -257,20 +257,66 @@ pub async fn redeem(node: &Node, peer: NodeId, req: JoinReq) -> Result<JoinResp,
     let Some(invite) = invite else {
         return Err((403, "invalid, revoked, exhausted or expired invite".into()));
     };
-    sqlx::query(
-        "INSERT INTO invite_uses (invite_id, node, used_at) VALUES (?, ?, datetime('now'))",
+    let use_row: Result<i64> = sqlx::query_scalar(
+        "INSERT INTO invite_uses (invite_id, node, used_at) VALUES (?, ?, datetime('now'))
+         RETURNING rowid",
     )
     .bind(invite)
     .bind(&peer.0[..])
-    .execute(&node.store.pool)
+    .fetch_one(&node.store.pool)
     .await
-    .map_err(|e| internal(e.into()))?;
-    repl::append(node, &[Record::MemberAdd(req.info)])
-        .await
-        .map_err(internal)?;
+    .map_err(Into::into);
+    let added = match &use_row {
+        Ok(_) => repl::append(node, &[Record::MemberAdd(req.info)])
+            .await
+            .map(|_| ()),
+        Err(_) => Ok(()),
+    };
+    if let Err(e) = use_row
+        .as_ref()
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("{e:#}"))
+        .and(added)
+    {
+        // The log append has its own transaction, and may fail after it
+        // committed: only a join that was not written gives its use back.
+        let admitted = super::members::all(&node.store)
+            .await
+            .is_ok_and(|all| all.iter().any(|m| m.id == peer && m.active));
+        if !admitted {
+            give_back(&node.store, invite, use_row.ok()).await;
+        }
+        return Err(internal(e));
+    }
     Ok(JoinResp {
         info: node.self_info(),
     })
+}
+
+/// Undo one use of `invite` whose admission was not written, and the
+/// `invite_uses` row it added (when it got that far).
+async fn give_back(store: &crate::store::Store, invite: i64, use_row: Option<i64>) {
+    let undo = async {
+        let mut tx = store.pool.begin().await?;
+        sqlx::query("UPDATE invites SET uses = uses - 1 WHERE id = ? AND uses > 0")
+            .bind(invite)
+            .execute(&mut *tx)
+            .await?;
+        if let Some(row) = use_row {
+            sqlx::query("DELETE FROM invite_uses WHERE rowid = ?")
+                .bind(row)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await
+    };
+    if let Err(e) = undo.await {
+        tracing::warn!(
+            ?e,
+            invite,
+            "a failed join still counts as a use of its invite"
+        );
+    }
 }
 
 /// An invite as the UI and CLI list it.
@@ -382,5 +428,46 @@ mod tests {
         assert_eq!(p(Some("0"), Some("0")).unwrap(), (None, None));
         assert_eq!(p(Some("never"), Some("3")).unwrap(), (None, Some(3)));
         assert!(p(Some("soon"), None).is_err());
+    }
+
+    /// A join that was not written gives its use back: the counter and
+    /// the record of who used it.
+    #[tokio::test]
+    async fn a_failed_join_gives_its_use_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let peer = super::super::identity::Identity::generate().unwrap().id;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO invites (secret_hash, label, created_at, max_uses, uses)
+             VALUES (x'00', '', datetime('now'), 10, 2) RETURNING id",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let mut rows = vec![];
+        for _ in 0..2 {
+            let r: i64 = sqlx::query_scalar(
+                "INSERT INTO invite_uses (invite_id, node, used_at)
+                 VALUES (?, ?, datetime('now')) RETURNING rowid",
+            )
+            .bind(id)
+            .bind(&peer.0[..])
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+            rows.push(r);
+        }
+        // The second try's append failed: its row goes, the first stays.
+        give_back(&store, id, Some(rows[1])).await;
+        let row = &list(&store).await.unwrap()[0];
+        assert_eq!(row.uses, 1);
+        assert_eq!(row.joined, [peer]);
+        // A try whose row was never written only gives the count back.
+        give_back(&store, id, None).await;
+        let row = &list(&store).await.unwrap()[0];
+        assert_eq!(row.uses, 0);
+        assert_eq!(row.joined, [peer]);
     }
 }

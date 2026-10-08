@@ -6,7 +6,7 @@ const USAGE: &str = "\
 usage: peephole [CONFIG]                 run the daemon (default /etc/peephole/config.toml)
        peephole check-config [CONFIG]    validate config and nmap; show the built-in rules
        peephole cluster (id|invite|invites|invite-revoke|join|members|status|agreement|block|unblock|purge|leave) …
-       peephole owner (new|adopt|show|forget-key|release) …    the ownership key on this node
+       peephole owner (new|claim|show|forget-key|release) …    the ownership key on this node
        peephole credits [log|members|why|send] …             this node's credits (--help)
        peephole settings (show|set|reset) …
        peephole export [OPTIONS] [CONFIG]  the dataset as Parquet, CSV or JSON Lines (--help)

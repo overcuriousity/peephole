@@ -1153,23 +1153,27 @@ async fn run_scan(
         return run.await;
     };
     let renew = async {
-        let every = (*lease / 3).max(Duration::from_millis(200));
+        let (every, wait, retry) = renew_timing(*lease);
+        let mut next = every;
         loop {
-            tokio::time::sleep(every).await;
+            tokio::time::sleep(next).await;
             let renewed = node
                 .request(
                     *arbiter,
                     Msg::Renew {
                         job_uid: uid.clone(),
                     },
-                    every,
+                    wait,
                 )
                 .await;
-            // An unreachable arbiter is not a refusal: keep scanning; it
-            // requeues the job if the lease runs out.
-            if let Ok(Msg::RenewReply { ok: false }) = renewed {
-                return;
-            }
+            next = match renewed {
+                Ok(Msg::RenewReply { ok: false }) => return,
+                Ok(Msg::RenewReply { ok: true }) => every,
+                // An unreachable arbiter is not a refusal: keep scanning and
+                // try again soon, several times before the lease runs out;
+                // the arbiter requeues the job only once it has.
+                _ => retry,
+            };
         }
     };
     tokio::select! {
@@ -1179,6 +1183,19 @@ async fn run_scan(
             Outcome::Abandoned
         }
     }
+}
+
+/// How a scanner renews a lease of `lease`: every quarter of it, each
+/// attempt waiting at most an eighth, a failed one retried after a
+/// sixteenth. A renewal that fails once leaves several more tries before
+/// the lease runs out (three quarters of it after the last success).
+fn renew_timing(lease: Duration) -> (Duration, Duration, Duration) {
+    let floor = Duration::from_millis(100);
+    (
+        (lease / 4).max(floor),
+        (lease / 8).max(floor),
+        (lease / 16).max(floor),
+    )
 }
 
 /// One running level-4 scan, counted while it lives.
@@ -1365,6 +1382,21 @@ license_key = "k"
         let path = dir.join("c.toml");
         std::fs::write(&path, toml).unwrap();
         Config::load(&path).unwrap()
+    }
+
+    /// After one good renewal, an arbiter that stops answering is asked at
+    /// least three more times before the lease it granted runs out.
+    #[test]
+    fn a_failed_renewal_is_retried_before_the_lease_expires() {
+        for lease in [Duration::from_secs(10), Duration::from_secs(120)] {
+            let (every, wait, retry) = renew_timing(lease);
+            let (mut t, mut tries) = (every, 0);
+            while t + wait < lease {
+                tries += 1;
+                t += wait + retry;
+            }
+            assert!(tries >= 3, "{lease:?}: {tries} tries");
+        }
     }
 
     #[test]

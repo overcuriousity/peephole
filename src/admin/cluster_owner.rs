@@ -65,6 +65,8 @@ struct OwnershipPage {
     /// The key itself: after creating or rotating it, or when asked for.
     shown_key: Option<String>,
     nodes: Vec<NodeRow>,
+    /// Members not claimed with this node's key (when it has one).
+    others: Vec<NodeRow>,
     /// Nodes still on the previous key after a rotation: name, and why
     /// each was not moved when last tried.
     pending: Vec<(String, String)>,
@@ -103,10 +105,27 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
         seen: m.last_seen.clone(),
         is_self: m.is_self,
     };
-    let mut nodes = vec![];
+    let (mut nodes, mut others) = (vec![], vec![]);
     if owned.is_some() {
         nodes.push(row(&me));
-        nodes.extend(members.iter().filter(|m| sibs.contains(&m.key)).map(row));
+        // Candidates to claim: active, not blocked, and on a version that
+        // knows ownership.
+        let rows = node.members();
+        let claimable = |m: &MemberView| {
+            m.active
+                && !m.blocked
+                && NodeId::parse(&m.key).is_ok_and(|id| {
+                    rows.get(&id)
+                        .is_some_and(|r| r.proto_max >= crate::cluster::rpc::proto::OWNER_PROTO)
+                })
+        };
+        for m in &members {
+            if sibs.contains(&m.key) {
+                nodes.push(row(m));
+            } else if claimable(m) {
+                others.push(row(m));
+            }
+        }
     }
     // A name is the member's own choice: the key's fingerprint goes with it.
     let who = |id: &NodeId| match names.get(&id.to_string()) {
@@ -140,6 +159,7 @@ async fn render_page(st: &AdminState, shown_key: Option<String>) -> AppResult<Ht
         managing,
         shown_key,
         nodes,
+        others,
         pending,
         unfinished: owner::rotation_unfinished(&node.store).await?,
         log,
@@ -168,7 +188,7 @@ async fn create(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult
         return Ok(back_to(
             PAGE,
             None,
-            Some("This node already has an owner. Release it first.".into()),
+            Some("This node is already claimed. Release it first.".into()),
         ));
     }
     let key = owner::create(&node.store, node.id()).await?;
@@ -178,7 +198,7 @@ async fn create(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult
 #[derive(serde::Deserialize)]
 struct AdoptForm {
     key: String,
-    /// Ticked: this node keeps the key and manages the others.
+    /// "yes": this node keeps the key and manages the others.
     keep: Option<String>,
 }
 
@@ -192,11 +212,20 @@ async fn adopt(
         Ok(k) => k,
         Err(e) => return Ok(back_to(PAGE, None, Some(format!("{e:#}")))),
     };
-    owner::adopt(&node.store, node.id(), &key, f.keep.is_some()).await?;
+    owner::adopt(
+        &node.store,
+        node.id(),
+        &key,
+        f.keep.as_deref() == Some("yes"),
+    )
+    .await?;
     discover_soon(node);
     Ok(back_to(
         PAGE,
-        Some(format!("This node is now owned by {}.", key.id.short())),
+        Some(format!(
+            "This node is now claimed with owner key {}. Your other nodes find it within a few minutes.",
+            key.id.short()
+        )),
         None,
     ))
 }
@@ -296,7 +325,7 @@ async fn discard(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResul
     Ok(back_to(
         PAGE,
         Some(
-            "The previous key is deleted. Nodes still on it are no longer yours until you adopt them again."
+            "The previous key is deleted. Nodes still on it are no longer yours until you claim them again."
                 .into(),
         ),
         None,
