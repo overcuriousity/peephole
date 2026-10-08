@@ -5,6 +5,22 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Changed
+
+- Scan jobs go to the scanner that is cheapest per delivered result at
+  the job's level: its price divided by its success rate there. A failed
+  scan is not paid, so a cheap scanner that fails a level often no longer
+  wins it. A paid job waits up to 30 minutes for a cheaper live scanner,
+  then goes to whoever asks. Unpaid jobs keep the sit-out rule.
+- Scanner success rates (level weights) are measured once an hour, five
+  minutes after the hour, over the 24 hours before it.
+- Prices are refreshed every 10 minutes instead of every hour, in steps
+  scaled to the time, so they move as fast per hour as before.
+- Cluster › Credits shows, per scanner, what one delivered result costs
+  at each level (L1–L4), the cheapest in bold.
+- The scan page says why its job went to its scanner ("Handed out"), and
+  the Scans history shows the same as a title on the scanner's name.
+
 ### Added
 
 - Host keys in the export: each scan in the `scans` column lists its
