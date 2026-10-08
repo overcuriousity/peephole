@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 
 /// Version of the decoy templates this build serves (`requests.decoy_v`).
 /// A change to any template or to [`value`] bumps it.
-pub const DECOY_V: i64 = 2;
+pub const DECOY_V: i64 = 3;
 
 const B32: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -23,6 +23,8 @@ pub enum Kind {
     WpSession,
     /// An MCP session id (Mcp-Session-Id, legacy ?sessionId=).
     McpSession,
+    /// The ETag a web decoy answers with (version 3).
+    Etag,
     /// A version-0 value (`canary-<ref>` and its variants).
     Legacy,
 }
@@ -52,6 +54,7 @@ impl Kind {
             Kind::GitToken => "git-token",
             Kind::WpSession => "wp-session",
             Kind::McpSession => "mcp-session",
+            Kind::Etag => "etag",
             Kind::Legacy => "legacy",
         }
     }
@@ -97,6 +100,7 @@ pub fn value(page_token: &str, kind: Kind) -> String {
         }
         Kind::GitToken => pick(&stream(page_token, kind, 40), HEX),
         Kind::WpSession => pick(&stream(page_token, kind, 43), ALNUM),
+        Kind::Etag => data_encoding::HEXLOWER.encode(&stream(page_token, kind, 16)),
         Kind::McpSession => {
             let h: String = stream(page_token, kind, 16)
                 .iter()
@@ -119,6 +123,20 @@ pub fn value(page_token: &str, kind: Kind) -> String {
 pub fn v0_ref(page_token: &str) -> String {
     page_token.chars().filter(|c| *c != '-').take(12).collect()
 }
+
+/// The web decoys that answer with an ETag from version 3: the ones that
+/// answer 200 (a client revalidating sends it back in `If-None-Match`).
+pub const ETAG_DECOYS: [&str; 9] = [
+    "dotenv",
+    "git-config",
+    "git-head",
+    "wp-login",
+    "wp-login-failed",
+    "wp-admin",
+    "admin",
+    "phpinfo",
+    "git-refs",
+];
 
 /// The canaries a decoy answer carried. `decoy` is the answer without its
 /// `decoy:` prefix; `decoy_v` None is version 0; `decoy_in` is the row's
@@ -179,12 +197,18 @@ pub fn served(
                 _ => vec![],
             }
         }
-        1 | 2 => match decoy {
-            "dotenv" => v(&DOTENV),
-            "git-config" => v(&[Kind::GitToken]),
-            "wp-login-ok" => v(&[Kind::WpSession]),
-            _ => vec![],
-        },
+        1..=3 => {
+            let mut out = match decoy {
+                "dotenv" => v(&DOTENV),
+                "git-config" => v(&[Kind::GitToken]),
+                "wp-login-ok" => v(&[Kind::WpSession]),
+                _ => vec![],
+            };
+            if ver >= 3 && ETAG_DECOYS.contains(&decoy) {
+                out.extend(v(&[Kind::Etag]));
+            }
+            out
+        }
         _ => vec![],
     }
 }
@@ -236,6 +260,24 @@ mod tests {
         assert!(g.len() == 40 && all(&g, "0123456789abcdef"), "{g}");
         let w = value(TOK, Kind::WpSession);
         assert!(w.len() == 43 && all(&w, alnum), "{w}");
+    }
+
+    #[test]
+    fn etag_canary_is_served_from_version_3() {
+        let e = value(TOK, Kind::Etag);
+        assert!(e.len() == 32 && all(&e, "0123456789abcdef"), "{e}");
+        let has = |v, name| served(v, TOK, name, None).iter().any(|(k, _)| *k == Kind::Etag);
+        for name in ETAG_DECOYS {
+            assert!(has(Some(3), name), "{name}");
+            assert!(!has(Some(2), name) && !has(Some(1), name), "{name}: not before v3");
+        }
+        assert!(!has(Some(3), "git-pack") && !has(Some(3), "wp-login-ok"));
+        // The other canaries of a v3 answer are those of v2.
+        let v3: Vec<_> = served(Some(3), TOK, "dotenv", None)
+            .into_iter()
+            .filter(|(k, _)| *k != Kind::Etag)
+            .collect();
+        assert_eq!(v3, served(Some(2), TOK, "dotenv", None));
     }
 
     #[test]

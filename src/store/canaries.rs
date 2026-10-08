@@ -574,6 +574,50 @@ mod tests {
         }
     }
 
+    /// A client that revalidates sends a decoy's ETag back in
+    /// `If-None-Match`: an ordinary canary reuse.
+    #[tokio::test]
+    async fn an_etag_sent_back_is_a_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let etag = crate::canary::value(&format!("{TOK}-srv"), crate::canary::Kind::Etag);
+        let serve = req(
+            "srv",
+            "2026-10-04 10:00:00",
+            "198.51.100.1",
+            "/.env",
+            "[]",
+            "decoy:dotenv",
+            Some(3),
+        );
+        let using = req(
+            "use",
+            "2026-10-04 13:00:00",
+            "198.51.100.2",
+            "/.env",
+            &format!(r#"[["if-none-match","\"{etag}\""]]"#),
+            "not-found",
+            None,
+        );
+        let old = req(
+            "old",
+            "2026-10-04 09:00:00",
+            "198.51.100.3",
+            "/.env",
+            "[]",
+            "decoy:dotenv",
+            Some(2),
+        );
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx { origin: None, hlc: 1 };
+        for r in [&old, &serve, &using] {
+            apply(&mut conn, ctx, r).await.unwrap();
+        }
+        assert_eq!(reuses(&s.pool).await, vec![("srv".into(), "use".into())]);
+    }
+
     /// Request lists mark a row that served canaries and a row that used
     /// one (naming the request that served it), for the admin only.
     #[tokio::test]

@@ -315,7 +315,7 @@ async fn canaries(
         kinds: crate::canary::Kind::ALL_V1
             .iter()
             .map(|k| k.name())
-            .chain(["legacy"])
+            .chain(["etag", "legacy"])
             .collect(),
     })
 }
