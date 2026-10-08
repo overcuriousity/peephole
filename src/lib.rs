@@ -191,6 +191,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         providers.clone(),
         shutdown_rx.clone(),
     ));
+    // Reverse DNS of the sources, forward-confirmed, kept on this node.
+    tokio::spawn(intel::rdns::run(
+        store.clone(),
+        cfg.enrichment.reverse_dns,
+        shutdown_rx.clone(),
+    ));
 
     // Observational probes, for members (paid) and this node's admin.
     let prober = (cfg.roles.scanner && cfg.probe.enabled).then(|| {
@@ -233,6 +239,18 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(rows = n, "canaries: parsed stored rows"),
                 Err(e) => tracing::warn!(error = %e, "canaries: backfill failed"),
+            }
+        }
+    });
+    // Host keys of scans read by an older parser (HOSTKEYS_V); new scans
+    // are read as stored.
+    tokio::spawn({
+        let pool = store.pool.clone();
+        async move {
+            match store::hostkeys::backfill(&pool, scan::hostkeys::HOSTKEYS_V).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(scans = n, "host keys: read stored scans again"),
+                Err(e) => tracing::warn!(error = %e, "host keys: backfill failed"),
             }
         }
     });

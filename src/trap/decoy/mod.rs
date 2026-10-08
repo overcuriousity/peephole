@@ -6,14 +6,15 @@
 //! any stored decoy row can be rendered again byte for byte
 //! (`peephole decoy render`). Version 1 serves canaries derived from the
 //! page token ([`crate::canary`]); version 0 (rows with no `decoy_v`)
-//! served `canary-<ref>`.
+//! served `canary-<ref>`. Version 3 adds an ETag canary to the web decoys
+//! that answer 200.
 pub mod ai;
 pub mod llm;
 pub mod mcp;
 pub mod sse;
 
 use crate::canary::site;
-use crate::canary::{Kind, v0_ref, value};
+use crate::canary::{ETAG_DECOYS, Kind, v0_ref, value};
 
 /// What a decoy is rendered from: all of it stored with the row.
 pub struct Input<'a> {
@@ -127,7 +128,7 @@ pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
             return llm::render(inp, &d, n);
         }
     }
-    let (status, headers, body): (u16, Vec<(&'static str, String)>, String) = match inp.v {
+    let (status, mut headers, body): (u16, Vec<(&'static str, String)>, String) = match inp.v {
         0 => {
             let r = v0_ref(inp.page_token);
             match name {
@@ -140,7 +141,7 @@ pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
                 _ => return None,
             }
         }
-        1 | 2 => {
+        1..=3 => {
             let word = inp.word;
             let site_name = format!("{word}.internal");
             match name {
@@ -186,6 +187,9 @@ pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
         }
         _ => return None,
     };
+    if inp.v >= 3 && ETAG_DECOYS.contains(&name) {
+        headers.push(("etag", format!("\"{}\"", value(inp.page_token, Kind::Etag))));
+    }
     Some(Decoy {
         name: name.to_string(),
         status,
@@ -772,6 +776,17 @@ mod tests {
             (1, "GET", "/git/x.git/info/refs", "git-refs"),
             (1, "POST", "/git/x.git/git-upload-pack", "git-pack"),
             (1, "GET", "/phpinfo.php", "phpinfo"),
+            (3, "GET", "/.env", "dotenv"),
+            (3, "GET", "/.git/config", "git-config"),
+            (3, "GET", "/.git/HEAD", "git-head"),
+            (3, "GET", "/wp-login.php", "wp-login"),
+            (3, "POST", "/wp-login.php", "wp-login-failed"),
+            (3, "GET", "/wp-admin/", "wp-admin"),
+            (3, "GET", "/admin/", "admin"),
+            (3, "GET", "/git/x.git/info/refs", "git-refs"),
+            (3, "GET", "/phpinfo.php", "phpinfo"),
+            (3, "POST", "/wp-login.php", "wp-login-ok"),
+            (3, "POST", "/git/x.git/git-upload-pack", "git-pack"),
         ];
         for (v, m, p, name) in cases {
             let d = render(&inp(*v, Some("203.0.113.7"), m, p), name).unwrap();

@@ -5,6 +5,7 @@ pub mod geo;
 pub mod lookup;
 pub mod provider;
 pub mod rdap;
+pub mod rdns;
 pub mod share;
 pub mod shodan;
 pub mod tor;

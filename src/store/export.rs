@@ -94,6 +94,20 @@ pub struct ScanOut {
     pub build: String,
     pub uid: Option<String>,
     pub audit_of: Option<String>,
+    /// Read separately, by scan.
+    #[sqlx(skip)]
+    pub host_keys: Vec<KeyOut>,
+}
+
+/// A host key, certificate or other identifier a scan found (`host_keys`).
+#[derive(sqlx::FromRow, serde::Serialize)]
+pub struct KeyOut {
+    #[serde(skip)]
+    pub scan_id: i64,
+    pub port: i64,
+    pub kind: String,
+    pub fingerprint: String,
+    pub detail: String,
 }
 
 #[derive(sqlx::FromRow, serde::Serialize)]
@@ -296,8 +310,21 @@ impl Store {
         for p in rows {
             ports.entry(p.scan_id).or_default().push(p);
         }
-        for s in scans {
+        let mut keys: HashMap<i64, Vec<KeyOut>> = HashMap::new();
+        let rows: Vec<KeyOut> = sqlx::query_as(
+            "SELECT scan_id, port, kind, fingerprint, detail FROM host_keys
+             WHERE scan_id IN (SELECT value FROM json_each(?))
+             ORDER BY scan_id, port, kind, fingerprint",
+        )
+        .bind(json_list(&scan_ids))
+        .fetch_all(&self.read)
+        .await?;
+        for k in rows {
+            keys.entry(k.scan_id).or_default().push(k);
+        }
+        for mut s in scans {
             let p = ports.remove(&s.id).unwrap_or_default();
+            s.host_keys = keys.remove(&s.id).unwrap_or_default();
             c.scans.entry(s.ip_id).or_default().push((s, p));
         }
         let fps: Vec<FpOut> = sqlx::query_as(

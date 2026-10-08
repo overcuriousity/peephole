@@ -88,6 +88,10 @@ license_key = "testkey"
 # is never looked up again. 0 = never again.
 refresh_after_days = 30
 
+# Look up each source's reverse DNS name (only names that resolve back to
+# the address count), when first seen and when it returns a day later.
+# reverse_dns = true
+
 # Cluster only: the part of each API provider's budget that paid lookups of
 # other members (and your own on-demand lookups) may use. 0.2 = a fifth.
 # on_demand_share = 0.2
@@ -188,11 +192,11 @@ tor_wait_hours = 6
 # Severity escalates by scope (ports, -sV, -O, discovery/safe
 # scripts that neither contact third parties nor broadcast). Level 2 runs
 # ssh-hostkey, ssh2-enum-algos and ssl-cert for the source's host keys and
-# certificates; an override without them loses those. nmap gets a
-# --host-timeout just under timeout_secs and a --script-timeout. Optional
-# per-level argv overrides below; {target} is NOT used — the target IP is
-# appended as the final argument. A script selector with spaces is one
-# element. Example:
+# certificates, and http-headers for its HTTP ETag; an override without
+# them loses those. nmap gets a --host-timeout just under timeout_secs and
+# a --script-timeout. Optional per-level argv overrides below; {target} is
+# NOT used — the target IP is appended as the final argument. A script
+# selector with spaces is one element. Example:
 # A scanner that sets its own arguments for a level earns no scanner share for scans at that level (lookup credits).
 # [scan.level_argv]
 # 2 = ["-Pn", "-sS", "-sV", "-T3", "--top-ports", "2000"]

@@ -179,6 +179,11 @@ pub async fn run(
     let origins = crate::scan::guard::Origins::from_config(&cfg.scan.safety, Some(node.id()));
     let mut known: gates::Standings = Default::default();
     let mut ticks = 0u64;
+    match earn::rejudge_args(&node.store.pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(scans = n, "credits: arguments judged again"),
+        Err(e) => tracing::warn!(?e, "credits: judging arguments again failed"),
+    }
     loop {
         let judge = earn::Judge {
             pool: &node.store.pool,

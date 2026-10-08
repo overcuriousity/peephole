@@ -8,4 +8,4 @@ pub mod derive;
 pub mod site;
 pub mod tokens;
 
-pub use derive::{DECOY_V, Kind, hash, served, v0_ref, value};
+pub use derive::{DECOY_V, ETAG_DECOYS, Kind, hash, served, v0_ref, value};

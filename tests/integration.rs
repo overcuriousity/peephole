@@ -2801,16 +2801,28 @@ async fn request_and_ip_pages_show_canary_reuse() {
         .send()
         .await
         .unwrap();
+    c.get(format!("{base}/nothing"))
+        .header("x-forwarded-for", "203.0.113.62")
+        .send()
+        .await
+        .unwrap();
     let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
     let (admin, admin_base) = enrolled_admin_client(store.clone(), cfg).await;
-    let served: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/.git/config'")
-        .fetch_one(&store.pool)
-        .await
-        .unwrap();
-    let used: i64 = sqlx::query_scalar("SELECT id FROM requests WHERE path = '/x'")
-        .fetch_one(&store.pool)
-        .await
-        .unwrap();
+    let id_of = |path: &'static str| {
+        let pool = store.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT id FROM requests WHERE path = ?")
+                .bind(path)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let (served, used, plain) = (
+        id_of("/.git/config").await,
+        id_of("/x").await,
+        id_of("/nothing").await,
+    );
     let page = admin
         .get(format!("{admin_base}/admin/requests/{served}"))
         .send()
@@ -2870,8 +2882,23 @@ async fn request_and_ip_pages_show_canary_reuse() {
             && decoy.contains(&format!("/admin/requests/{used}")),
         "{decoy}"
     );
-    let none = admin
+    // Basic auth on /x got the admin decoy, which serves its own ETag
+    // canary (version 3): a page of its own, no reuse on it.
+    let own = admin
         .get(format!("{admin_base}/admin/links/canaries/served/{used}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(own.status(), 200);
+    let own = own.text().await.unwrap();
+    assert!(
+        own.contains("<td>etag</td>")
+            && !own.contains(&token)
+            && own.contains("None of these canaries has come back."),
+        "{own}"
+    );
+    let none = admin
+        .get(format!("{admin_base}/admin/links/canaries/served/{plain}"))
         .send()
         .await
         .unwrap();

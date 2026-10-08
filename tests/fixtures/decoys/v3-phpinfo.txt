@@ -1,0 +1,24 @@
+200
+content-type: text/html; charset=UTF-8
+etag: "cbd9acc5b5ddeabc9f817a4a01cfde01"
+
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+<title>PHP 7.4.33 - phpinfo()</title><meta name="ROBOTS" content="NOINDEX,NOFOLLOW,NOARCHIVE" /></head>
+<body><div class="center">
+<table><tr class="h"><td><h1 class="p">PHP Version 7.4.33</h1></td></tr></table>
+<table>
+<tr><td class="e">System </td><td class="v">Linux dashboard 5.10.0-28-amd64 #1 SMP Debian 5.10.209-2 x86_64 </td></tr>
+<tr><td class="e">Build Date </td><td class="v">Nov 21 2023 19:07:44 </td></tr>
+<tr><td class="e">Server API </td><td class="v">Apache 2.0 Handler </td></tr>
+<tr><td class="e">Loaded Configuration File </td><td class="v">/etc/php/7.4/apache2/php.ini </td></tr>
+<tr><td class="e">PHP API </td><td class="v">20190902 </td></tr>
+<tr><td class="e">Zend Extension Build </td><td class="v">API320190902,NTS </td></tr>
+<tr><td class="e">Registered PHP Streams </td><td class="v">https, ftps, compress.zlib, php, file, glob, data, http, ftp, phar </td></tr>
+<tr><td class="e">allow_url_fopen </td><td class="v">On </td></tr>
+<tr><td class="e">disable_functions </td><td class="v">no value </td></tr>
+<tr><td class="e">DOCUMENT_ROOT </td><td class="v">/var/www/html </td></tr>
+<tr><td class="e">SERVER_SOFTWARE </td><td class="v">Apache/2.4.57 (Debian) </td></tr>
+</table>
+</div></body></html>

@@ -81,6 +81,10 @@ pub struct EnrichmentConfig {
     /// resolves a day for other members.
     #[serde(default = "default_offer_per_day")]
     pub offer_per_day: u32,
+    /// Look up the forward-confirmed reverse DNS name of every source, when
+    /// first seen and when it returns a day later (`intel::rdns`).
+    #[serde(default = "default_true")]
+    pub reverse_dns: bool,
 }
 
 /// See [`EnrichmentConfig::offer_per_day`].
@@ -104,6 +108,7 @@ impl Default for EnrichmentConfig {
             refresh_after_days: default_refresh_days(),
             on_demand_share: default_on_demand_share(),
             offer_per_day: default_offer_per_day(),
+            reverse_dns: true,
         }
     }
 }
@@ -609,6 +614,7 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("public", "recent_rows", "50"),
     ("enrichment", "on_demand_share", "0.2"),
     ("enrichment", "offer_per_day", "1000"),
+    ("enrichment", "reverse_dns", "true"),
     ("credits", "audit_share", "0.05"),
     ("credits", "scan_share", "0.5"),
 ];
@@ -1021,7 +1027,8 @@ rp_name = "x"
                 if !expr.contains(' ') {
                     for script in expr.split(',') {
                         assert!(
-                            ["ssh-hostkey", "ssh2-enum-algos", "ssl-cert"].contains(&script),
+                            ["ssh-hostkey", "ssh2-enum-algos", "ssl-cert", "http-headers"]
+                                .contains(&script),
                             "level {level}: {script} is not on the safe list"
                         );
                     }

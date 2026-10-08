@@ -5,7 +5,8 @@
 use super::Store;
 use super::inspect::{MAX_RAW_XML, zstd_decode_capped};
 use crate::scan::hostkeys::{
-    FAVICON, HASSH, HTTP_404, HTTP_BODY, HostKey, JA4X, JARM, SSH_HOSTKEY, TLS_CERT, extract,
+    FAVICON, HASSH, HOSTKEYS_V, HTTP_404, HTTP_BODY, HTTP_ETAG, HostKey, JA4X, JARM, SSH_HOSTKEY,
+    TLS_CERT, extract,
 };
 use anyhow::Result;
 use sqlx::SqliteConnection;
@@ -58,6 +59,7 @@ pub fn kind_name(kind: &str) -> &'static str {
         JARM => "JARM",
         HTTP_BODY => "HTTP body",
         HTTP_404 => "HTTP 404 page",
+        HTTP_ETAG => "HTTP ETag",
         _ => "other",
     }
 }
@@ -66,8 +68,8 @@ pub fn kind_name(kind: &str) -> &'static str {
 const MAX_PTR_NAMES: usize = 16;
 
 /// Read the identifiers out of a stored scan (zstd-compressed nmap XML)
-/// and mark the scan as read. Unreadable XML yields none; only database
-/// errors fail.
+/// and mark the scan as read at `HOSTKEYS_V`. Unreadable XML yields none;
+/// only database errors fail.
 pub(crate) async fn derive(
     conn: &mut SqliteConnection,
     scan_id: i64,
@@ -106,6 +108,11 @@ pub(crate) async fn derive(
             .await?;
         }
     }
+    // Read again (a newer HOSTKEYS_V): what an older parse left goes.
+    sqlx::query("DELETE FROM host_keys WHERE scan_id = ?")
+        .bind(scan_id)
+        .execute(&mut *conn)
+        .await?;
     for k in keys {
         sqlx::query(
             "INSERT OR IGNORE INTO host_keys (scan_id, ip_id, port, kind, fingerprint, detail)
@@ -120,31 +127,50 @@ pub(crate) async fn derive(
         .execute(&mut *conn)
         .await?;
     }
-    sqlx::query("UPDATE scans SET keys_parsed = 1 WHERE id = ?")
+    sqlx::query("UPDATE scans SET keys_parsed = ? WHERE id = ?")
+        .bind(HOSTKEYS_V)
         .bind(scan_id)
         .execute(&mut *conn)
         .await?;
     Ok(())
 }
 
-/// Read the scans stored before `host_keys` existed, or by an older build
-/// sharing the database. A batch at a time; returns how many were read.
-pub(crate) async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
+/// Scans read per write transaction by [`backfill`].
+const BACKFILL_BATCH: i64 = 50;
+/// Pause between [`backfill`]'s transactions, so the trap's and
+/// replication's writes get the lock in between.
+const BACKFILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Read the scans whose `keys_parsed` is below `below`: stored before
+/// `host_keys` existed, by an older build sharing the database, or by an
+/// older parser. Walks the table once by id, a short transaction per batch
+/// with a pause after it. Returns how many were read.
+pub async fn backfill(pool: &sqlx::SqlitePool, below: i64) -> Result<u64> {
     let mut done = 0;
+    let mut after = 0i64;
     loop {
-        let rows: Vec<(i64, i64, Option<Vec<u8>>)> =
-            sqlx::query_as("SELECT id, ip_id, raw_xml FROM scans WHERE keys_parsed = 0 LIMIT 50")
-                .fetch_all(pool)
-                .await?;
-        if rows.is_empty() {
+        // Selected under the write lock: a scan deleted (a tombstone, an IP
+        // delete) between reading and writing would leave a dangling key.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let rows: Vec<(i64, i64, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT id, ip_id, raw_xml FROM scans WHERE keys_parsed < ? AND id > ?
+             ORDER BY id LIMIT ?",
+        )
+        .bind(below)
+        .bind(after)
+        .bind(BACKFILL_BATCH)
+        .fetch_all(&mut *tx)
+        .await?;
+        let Some((last, _, _)) = rows.last() else {
             return Ok(done);
-        }
-        let mut tx = pool.begin().await?;
+        };
+        after = *last;
         for (id, ip_id, xml) in &rows {
             derive(&mut tx, *id, *ip_id, xml.as_deref()).await?;
         }
         tx.commit().await?;
         done += rows.len() as u64;
+        tokio::time::sleep(BACKFILL_PAUSE).await;
     }
 }
 
@@ -268,7 +294,7 @@ mod tests {
         assert_eq!((a.hassh.len(), a.ja4x.len()), (1, 1));
         assert_eq!((a.hassh[0].ips, a.ja4x[0].ips), (2, 2));
 
-        let parsed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scans WHERE keys_parsed = 1")
+        let parsed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scans WHERE keys_parsed = 2")
             .fetch_one(&s.pool)
             .await
             .unwrap();
@@ -303,7 +329,7 @@ mod tests {
             .execute(&s.pool)
             .await
             .unwrap();
-        backfill(&s.pool).await.unwrap();
+        backfill(&s.pool, HOSTKEYS_V).await.unwrap();
         assert_eq!(s.names_for_ip(ip.id).await.unwrap().len(), 1);
     }
 
@@ -326,9 +352,113 @@ mod tests {
             .execute(&s.pool)
             .await
             .unwrap();
-        assert_eq!(backfill(&s.pool).await.unwrap(), 1);
+        assert_eq!(backfill(&s.pool, HOSTKEYS_V).await.unwrap(), 1);
         assert_eq!(s.host_keys_for_scan(id).await.unwrap().len(), 5);
-        assert_eq!(backfill(&s.pool).await.unwrap(), 0, "each scan once");
+        assert_eq!(
+            backfill(&s.pool, HOSTKEYS_V).await.unwrap(),
+            0,
+            "each scan once"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_reads_only_scans_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let s = Store::connect(&path).await.unwrap();
+        let xml = include_bytes!("../../tests/fixtures/nmap-hostkeys.xml");
+        let (old, never) = (
+            scan(&s, "192.0.2.7", xml).await,
+            scan(&s, "192.0.2.8", xml).await,
+        );
+        for (id, v) in [(old, 1), (never, 0)] {
+            sqlx::query("UPDATE scans SET keys_parsed = ? WHERE id = ?")
+                .bind(v)
+                .bind(id)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        s.pool.close().await;
+        s.read.close().await;
+        // The version reparse is left to the backfill task.
+        let s = Store::connect(&path).await.unwrap();
+        let v: Vec<i64> = sqlx::query_scalar("SELECT keys_parsed FROM scans ORDER BY id")
+            .fetch_all(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(v, vec![1, HOSTKEYS_V]);
+        assert_eq!(backfill(&s.pool, HOSTKEYS_V).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn reparse_replaces_scan_keys_and_keeps_probe_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let id = scan(
+            &s,
+            "192.0.2.7",
+            include_bytes!("../../tests/fixtures/nmap-http-headers.xml"),
+        )
+        .await;
+        let ip_id: i64 = sqlx::query_scalar("SELECT ip_id FROM scans WHERE id = ?")
+            .bind(id)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        let probe: i64 = sqlx::query_scalar(
+            "INSERT INTO probes (uid, group_uid, ip_id, asker, started_at, finished_at)
+             VALUES ('p', 'g', ?, x'01', datetime('now'), datetime('now')) RETURNING id",
+        )
+        .bind(ip_id)
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO host_keys (probe_id, ip_id, port, kind, fingerprint)
+             VALUES (?, ?, 443, 'jarm', 'j')",
+        )
+        .bind(probe)
+        .bind(ip_id)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        // As a build before ETags left it: read, but at version 1.
+        sqlx::query("UPDATE scans SET keys_parsed = 1")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(backfill(&s.pool, HOSTKEYS_V).await.unwrap(), 1);
+        assert_eq!(
+            backfill(&s.pool, HOSTKEYS_V).await.unwrap(),
+            0,
+            "each scan once"
+        );
+        let rows = s.host_keys_for_scan(id).await.unwrap();
+        assert_eq!(
+            rows.iter().filter(|r| r.kind == HTTP_ETAG).count(),
+            2,
+            "{rows:?}"
+        );
+        assert_eq!(rows[0].kind_name(), "HTTP ETag");
+        assert!(rows.iter().all(|r| !r.identifies()));
+        assert!(
+            rows[0]
+                .link_href()
+                .starts_with("/admin/links/http-etag/%22")
+        );
+        let probe_keys: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM host_keys WHERE probe_id IS NOT NULL")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(probe_keys, 1, "a scan's reparse leaves probe keys alone");
+        let v: i64 = sqlx::query_scalar("SELECT keys_parsed FROM scans WHERE id = ?")
+            .bind(id)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(v, HOSTKEYS_V);
     }
 
     #[tokio::test]

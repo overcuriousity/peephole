@@ -131,28 +131,6 @@ honeypot.
 
 ## Small follow-ups
 
-- **Host keys in the export.** S, medium. Each scan's XML is already
-  exported. A parsed `host_keys` list per scan (kind, port, fingerprint,
-  detail) saves every dataset user the parsing.
-- **ETags of scanned sources.** S, medium. nmap's `http-headers` (in
-  `discovery` and `safe`) already runs at levels 3–4, so the `ETag` of each
-  HTTP port is in the stored XML; parse it into `host_keys` as a new kind,
-  reparsing old scans via `keys_parsed`. Optionally add `http-headers` to
-  level 2's named scripts. A shared ETag means the same file with the same
-  mtime and size (one image, one kit), but distro default pages share it
-  across thousands of hosts: a soft, rarity-weighted edge for item 2, never
-  a hard one. nginx ETags also date the file, roughly when the box was set
-  up. Shown on the IP page beside the host keys.
-- **ETags as a return marker.** S, low. Decoys answer with an ETag derived
-  from the request, like a canary; an `If-None-Match` carrying it from
-  another IP links the two. Only caching clients (browsers, headless
-  Chrome) send it back, so first count how many recorded requests carry
-  `If-None-Match` at all.
-- **Reverse DNS of every source.** S, medium. Store the forward-confirmed
-  PTR name per IP (the lookup `scan/crawler.rs` already does), refreshed
-  when the IP returns. It often names the hoster or a research scanner.
-  Shown on the IP page and in the IP directory filter (admin); a `ptr`
-  column in the dataset.
 - **VPN and relay exits.** M, high. Scanning a VPN exit scans the VPN
   company, a bystander, as with Tor exits. Load X4BNet's `lists_vpn` (MIT,
   ASN-derived) the way the Tor list is loaded. Listed IPs are never

@@ -16,6 +16,7 @@ pub mod links;
 pub mod maintenance;
 pub mod probes;
 pub mod publish;
+pub mod rdns;
 pub mod recorder;
 pub mod requests;
 pub mod scans;
@@ -59,6 +60,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0022_price_history.sql"),
     include_str!("migrations/0023_scan_self_mc.sql"),
     include_str!("migrations/0024_no_collecting_node.sql"),
+    include_str!("migrations/0025_rdns.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
@@ -104,7 +106,9 @@ impl Store {
             .with_context(|| path.display().to_string())?;
         migrate(&pool, MIGRATIONS).await?;
         backfill_ip_keys(&pool).await?;
-        hostkeys::backfill(&pool).await?;
+        // Scans never read at all (stored before `host_keys`); a newer
+        // parser's reparse runs as a task once the node serves.
+        hostkeys::backfill(&pool, 1).await?;
         let search = ensure_search_index(&pool).await;
         let read_opts = SqliteConnectOptions::new()
             .filename(path)

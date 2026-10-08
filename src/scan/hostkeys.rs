@@ -1,8 +1,10 @@
 //! Identifiers of the scanned source itself, from nmap's script output:
 //! SSH host keys (`ssh-hostkey`), TLS certificates (`ssl-cert`) and the SSH
-//! server's algorithm lists (`ssh2-enum-algos`). A host key or certificate
-//! found on several sources ties them to one operator (or one firmware
-//! image); HASSH-server and JA4X name the software, not the operator.
+//! server's algorithm lists (`ssh2-enum-algos`), and the ETags of
+//! `http-headers`. A host key or certificate found on several sources ties
+//! them to one operator (or one firmware image); HASSH-server and JA4X name
+//! the software, not the operator; an ETag, the same file, not the same
+//! operator.
 //!
 //! Derived from the stored XML on every node, so they need no replication
 //! of their own and older scans can be parsed after the fact.
@@ -19,13 +21,20 @@ pub const FAVICON: &str = "favicon";
 pub const JARM: &str = "jarm";
 pub const HTTP_BODY: &str = "http-body";
 pub const HTTP_404: &str = "http-404";
+pub const HTTP_ETAG: &str = "http-etag";
+/// Version of what `extract` reads (`scans.keys_parsed`). A change bumps
+/// it, and the backfill reads every stored scan again.
+pub const HOSTKEYS_V: i64 = 2;
+/// Longest ETag kept, in characters.
+const MAX_ETAG: usize = 128;
 
 /// One identifier found on one port of a scanned source.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostKey {
     pub port: u16,
     /// [`SSH_HOSTKEY`], [`TLS_CERT`], [`JA4X`], [`HASSH`], or from probes
-    /// [`FAVICON`], [`JARM`], [`HTTP_BODY`] or [`HTTP_404`].
+    /// [`FAVICON`], [`JARM`], [`HTTP_BODY`] or [`HTTP_404`]; from `http-headers`
+    /// [`HTTP_ETAG`].
     pub kind: &'static str,
     /// `SHA256:<base64>` as OpenSSH prints it; the certificate's SHA-256
     /// (hex, of the DER); the JA4X string; the HASSH-server MD5 (hex).
@@ -82,6 +91,19 @@ fn key_attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
         .map(|a| a.value.to_string())
 }
 
+/// Like `key_attr`, with the XML escapes resolved (nmap writes newlines as
+/// `&#xa;` and quotes as `&quot;` in `output`).
+fn text_attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.as_ref() == name)
+        .map(|a| {
+            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| a.value.to_string())
+        })
+}
+
 /// The PTR names nmap recorded for the host (`<hostname type="PTR">`),
 /// as valid host names, without repeats. Unparsable input yields what was
 /// found before the error.
@@ -132,7 +154,15 @@ pub fn extract(xml: &[u8]) -> Vec<HostKey> {
                 }
                 "script" if port > 0 => {
                     let id = key_attr(&e, "id").unwrap_or_default();
-                    if matches!(id.as_str(), "ssh-hostkey" | "ssl-cert" | "ssh2-enum-algos") {
+                    if id == "http-headers"
+                        && let Some(o) = text_attr(&e, "output")
+                    {
+                        etags(port, &o, &mut out);
+                    }
+                    if matches!(
+                        id.as_str(),
+                        "ssh-hostkey" | "ssl-cert" | "ssh2-enum-algos" | "http-headers"
+                    ) {
                         script = Some(id);
                         stack = vec![(None, vec![])];
                     }
@@ -141,6 +171,15 @@ pub fn extract(xml: &[u8]) -> Vec<HostKey> {
                 "elem" if script.is_some() => text = Some((key_attr(&e, "key"), String::new())),
                 _ => {}
             },
+            Event::Empty(e)
+                if port > 0
+                    && e.name().as_ref() == "script"
+                    && key_attr(&e, "id").as_deref() == Some("http-headers") =>
+            {
+                if let Some(o) = text_attr(&e, "output") {
+                    etags(port, &o, &mut out);
+                }
+            }
             Event::Empty(e) if script.is_some() && e.name().as_ref() == "elem" => {
                 if let Some(top) = stack.last_mut() {
                     top.1.push(Node::Elem {
@@ -192,6 +231,7 @@ pub fn extract(xml: &[u8]) -> Vec<HostKey> {
                         match id.as_str() {
                             "ssh-hostkey" => ssh_hostkeys(port, &root, &mut out),
                             "ssl-cert" => tls_cert(port, &root, &mut out),
+                            "http-headers" => etags(port, &texts(&root).join("\n"), &mut out),
                             _ => hassh(port, &root, &mut out),
                         }
                     }
@@ -342,9 +382,102 @@ fn hassh(port: u16, root: &[Node], out: &mut Vec<HostKey>) {
     });
 }
 
+/// The `ETag` lines of an `http-headers` result, once per port and value.
+fn etags(port: u16, text: &str, out: &mut Vec<HostKey>) {
+    for line in text.lines() {
+        let Some((name, value)) = line.trim().split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("etag") {
+            continue;
+        }
+        let value: String = value.trim().chars().take(MAX_ETAG).collect();
+        if value.is_empty()
+            || out
+                .iter()
+                .any(|k| k.kind == HTTP_ETAG && k.port == port && k.fingerprint == value)
+        {
+            continue;
+        }
+        out.push(HostKey {
+            port,
+            kind: HTTP_ETAG,
+            detail: nginx_detail(&value),
+            fingerprint: value,
+        });
+    }
+}
+
+/// nginx's ETag is `"<mtime hex>-<size hex>"`: when the first part is a
+/// plausible time (2000 to tomorrow), when the file was written and its
+/// size. Empty for any other form.
+fn nginx_detail(etag: &str) -> String {
+    let v = etag.strip_prefix("W/").unwrap_or(etag).trim_matches('"');
+    let Some((t, n)) = v.split_once('-') else {
+        return String::new();
+    };
+    let hex = |s: &str| !s.is_empty() && s.len() <= 16 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    if !hex(t) || !hex(n) {
+        return String::new();
+    }
+    let (Ok(t), Ok(n)) = (i64::from_str_radix(t, 16), u64::from_str_radix(n, 16)) else {
+        return String::new();
+    };
+    let tomorrow = chrono::Utc::now().timestamp() + 86_400;
+    if !(946_684_800..=tomorrow).contains(&t) {
+        return String::new();
+    }
+    match chrono::DateTime::from_timestamp(t, 0) {
+        Some(d) => format!("nginx: modified {}, {n} bytes", d.format("%Y-%m-%d")),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn etags_are_read_from_http_headers() {
+        let keys = extract(include_bytes!("../../tests/fixtures/nmap-http-headers.xml"));
+        let etags: Vec<_> = keys.iter().filter(|k| k.kind == HTTP_ETAG).collect();
+        assert_eq!(etags.len(), 2, "{etags:?}");
+        assert_eq!(etags[0].port, 80);
+        assert_eq!(etags[0].fingerprint, "\"5e9efe7d-264\"");
+        assert_eq!(etags[0].detail, "nginx: modified 2020-04-21, 612 bytes");
+        assert_eq!(etags[1].port, 8080);
+        assert_eq!(etags[1].fingerprint, "W/\"2aa6-5f3c9a4b1e2c0\"");
+        assert_eq!(etags[1].detail, "", "Apache's size-mtime form is not dated");
+    }
+
+    #[test]
+    fn etag_lines_are_capped_and_malformed_ones_skipped() {
+        let mut out = vec![];
+        let long = "a".repeat(400);
+        etags(
+            80,
+            &format!("no colon here\nETag:\n  X-ETag: \"nope\"\nETag: \"{long}\"\n"),
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].fingerprint.chars().count(), MAX_ETAG);
+    }
+
+    #[test]
+    fn nginx_etags_are_dated_when_plausible() {
+        assert_eq!(
+            nginx_detail("\"5e9efe7d-264\""),
+            "nginx: modified 2020-04-21, 612 bytes"
+        );
+        assert_eq!(
+            nginx_detail("W/\"5e9efe7d-264\""),
+            "nginx: modified 2020-04-21, 612 bytes"
+        );
+        assert_eq!(nginx_detail("\"1-2\""), "", "before 2000");
+        assert_eq!(nginx_detail("\"ffffffff-2\""), "", "far future");
+        assert_eq!(nginx_detail("\"abc\""), "");
+        assert_eq!(nginx_detail("\"5e9efe7d-zz\""), "");
+    }
 
     #[test]
     fn host_keys_certificates_and_hassh_from_a_scan() {

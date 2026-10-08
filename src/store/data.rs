@@ -1116,6 +1116,14 @@ pub(crate) async fn drop_orphan_ip(conn: &mut SqliteConnection, ip_id: i64) -> R
     .bind(ip_id)
     .execute(&mut *conn)
     .await?;
+    // Reverse DNS names come from the requests: they go with the last one.
+    sqlx::query(
+        "DELETE FROM ip_names WHERE ip_id = ?1 AND source = 'rdns'
+           AND NOT EXISTS (SELECT 1 FROM requests WHERE ip_id = ?1)",
+    )
+    .bind(ip_id)
+    .execute(&mut *conn)
+    .await?;
     let dropped = sqlx::query(
         "DELETE FROM ips WHERE id = ?1
            AND NOT EXISTS (SELECT 1 FROM ip_names WHERE ip_id = ?1)

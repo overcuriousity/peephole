@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -Pn -sS -sV -O -T3 --top-ports 1000 --script ssh-hostkey,ssh2-enum-algos,ssl-cert,http-headers -oX - 192.0.2.7" start="1760000000" startstr="" version="7.94" xmloutputversion="1.05">
+<host starttime="1760000000" endtime="1760000100"><status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="192.0.2.7" addrtype="ipv4"/>
+<hostnames></hostnames>
+<ports>
+<port protocol="tcp" portid="80"><state state="open" reason="syn-ack" reason_ttl="52"/><service name="http" product="nginx" version="1.18.0" method="probed" conf="10"/><script id="http-headers" output="&#xa;  Server: nginx/1.18.0 (Ubuntu)&#xa;  Date: Wed, 08 Oct 2025 10:00:00 GMT&#xa;  Content-Type: text/html&#xa;  Content-Length: 612&#xa;  Last-Modified: Tue, 21 Apr 2020 14:09:01 GMT&#xa;  Connection: close&#xa;  ETag: &quot;5e9efe7d-264&quot;&#xa;  Accept-Ranges: bytes&#xa;  &#xa;  (Request type: HEAD)&#xa;"/></port>
+<port protocol="tcp" portid="8080"><state state="open" reason="syn-ack" reason_ttl="52"/><service name="http-proxy" method="table" conf="3"/><script id="http-headers" output="&#xa;  Server: Apache&#xa;  ETag: W/&quot;2aa6-5f3c9a4b1e2c0&quot;&#xa;"><elem>Server: Apache</elem><elem>etag: W/&quot;2aa6-5f3c9a4b1e2c0&quot;</elem></script></port>
+</ports>
+</host>
+<runstats><finished time="1760000100" timestr="" summary="" elapsed="100" exit="success"/><hosts up="1" down="0" total="1"/></runstats>
+</nmaprun>

@@ -123,10 +123,7 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
 /// `&`, `<`, `"`, which arrive XML-escaped; store them decoded so the admin
 /// view and CSV/Parquet exports do not show `&amp;` etc.
 fn unescape_attr(a: &quick_xml::events::attributes::Attribute) -> String {
-    // normalized_value() requires quick-xml's private XmlVersion enum, so the
-    // public entry point is unescape_value() (deprecated only as an alias).
-    #[allow(deprecated)]
-    a.unescape_value()
+    a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
         .map(|c| c.into_owned())
         .unwrap_or_else(|_| a.value.clone().into_owned())
 }
