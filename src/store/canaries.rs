@@ -611,7 +611,10 @@ mod tests {
             Some(2),
         );
         let mut conn = s.pool.acquire().await.unwrap();
-        let ctx = Ctx { origin: None, hlc: 1 };
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
         for r in [&old, &serve, &using] {
             apply(&mut conn, ctx, r).await.unwrap();
         }

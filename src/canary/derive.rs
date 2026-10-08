@@ -266,10 +266,17 @@ mod tests {
     fn etag_canary_is_served_from_version_3() {
         let e = value(TOK, Kind::Etag);
         assert!(e.len() == 32 && all(&e, "0123456789abcdef"), "{e}");
-        let has = |v, name| served(v, TOK, name, None).iter().any(|(k, _)| *k == Kind::Etag);
+        let has = |v, name| {
+            served(v, TOK, name, None)
+                .iter()
+                .any(|(k, _)| *k == Kind::Etag)
+        };
         for name in ETAG_DECOYS {
             assert!(has(Some(3), name), "{name}");
-            assert!(!has(Some(2), name) && !has(Some(1), name), "{name}: not before v3");
+            assert!(
+                !has(Some(2), name) && !has(Some(1), name),
+                "{name}: not before v3"
+            );
         }
         assert!(!has(Some(3), "git-pack") && !has(Some(3), "wp-login-ok"));
         // The other canaries of a v3 answer are those of v2.

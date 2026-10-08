@@ -1738,11 +1738,28 @@ mod tests {
             async move { s.list_ips_as(&f, a).await.unwrap().items.len() }
         };
         assert_eq!(n("googlebot", Audience::Admin).await, 1);
-        assert_eq!(n("GoogleBot", Audience::Admin).await, 1, "names are lower-case");
-        assert_eq!(n("example.net", Audience::Admin).await, 0, "disputed names do not count");
+        assert_eq!(
+            n("GoogleBot", Audience::Admin).await,
+            1,
+            "names are lower-case"
+        );
+        assert_eq!(
+            n("example.net", Audience::Admin).await,
+            0,
+            "disputed names do not count"
+        );
         assert_eq!(n("xay", Audience::Admin).await, 1, "an agreed name matches");
-        assert_eq!(n("x_y", Audience::Admin).await, 0, "LIKE wildcards are literal");
-        let all = s.list_ips_as(&IpFilter::default(), Audience::Public).await.unwrap().items.len();
+        assert_eq!(
+            n("x_y", Audience::Admin).await,
+            0,
+            "LIKE wildcards are literal"
+        );
+        let all = s
+            .list_ips_as(&IpFilter::default(), Audience::Public)
+            .await
+            .unwrap()
+            .items
+            .len();
         assert_eq!(n("googlebot", Audience::Public).await, all, "admin only");
     }
 
