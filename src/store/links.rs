@@ -6,7 +6,7 @@
 use super::Store;
 use super::browse::{PAGE_SIZE, Page, lenient_i64, nonempty, ts_bound};
 use crate::scan::hostkeys::{
-    FAVICON, HASSH, HTTP_404, HTTP_BODY, JA4X, JARM, SSH_HOSTKEY, TLS_CERT,
+    FAVICON, HASSH, HTTP_404, HTTP_BODY, HTTP_ETAG, JA4X, JARM, SSH_HOSTKEY, TLS_CERT,
 };
 use anyhow::Result;
 
@@ -25,17 +25,18 @@ pub enum LinkKind {
     Jarm,
     HttpBody,
     Http404,
+    HttpEtag,
 }
 
 use LinkKind::*;
 
 impl LinkKind {
-    pub const ALL: [LinkKind; 12] = [
-        Fp, Ssh, Tls, Canary, Ja4, Ja4h, Hassh, Ja4x, Favicon, Jarm, HttpBody, Http404,
+    pub const ALL: [LinkKind; 13] = [
+        Fp, Ssh, Tls, Canary, Ja4, Ja4h, Hassh, Ja4x, Favicon, Jarm, HttpBody, Http404, HttpEtag,
     ];
     /// The kinds the index lists (canaries have their own tab).
-    pub const LIST: [LinkKind; 11] = [
-        Fp, Ssh, Tls, Ja4, Ja4h, Hassh, Ja4x, Favicon, Jarm, HttpBody, Http404,
+    pub const LIST: [LinkKind; 12] = [
+        Fp, Ssh, Tls, Ja4, Ja4h, Hassh, Ja4x, Favicon, Jarm, HttpBody, Http404, HttpEtag,
     ];
     pub const IDENTITY: [LinkKind; 4] = [Fp, Ssh, Tls, Canary];
 
@@ -58,6 +59,7 @@ impl LinkKind {
             Jarm => "jarm",
             HttpBody => "http-body",
             Http404 => "http-404",
+            HttpEtag => "http-etag",
         }
     }
 
@@ -75,6 +77,7 @@ impl LinkKind {
             Jarm => "JARM",
             HttpBody => "Page body",
             Http404 => "404 page",
+            HttpEtag => "HTTP ETag",
         }
     }
 
@@ -99,6 +102,7 @@ impl LinkKind {
             Jarm => Some(JARM),
             HttpBody => Some(HTTP_BODY),
             Http404 => Some(HTTP_404),
+            HttpEtag => Some(HTTP_ETAG),
             _ => None,
         }
     }
@@ -120,6 +124,7 @@ impl LinkKind {
             Jarm => &JARM_LEGS,
             HttpBody => &HTTP_BODY_LEGS,
             Http404 => &HTTP_404_LEGS,
+            HttpEtag => &HTTP_ETAG_LEGS,
             Canary => &CANARY_LEGS,
         }
     }
@@ -155,6 +160,7 @@ const FAVICON_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'favicon'")];
 const JARM_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'jarm'")];
 const HTTP_BODY_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'http-body'")];
 const HTTP_404_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'http-404'")];
+const HTTP_ETAG_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'http-etag'")];
 
 /// One source of sightings.
 struct Leg {
@@ -1000,6 +1006,11 @@ mod tests {
         assert!(!LinkKind::Favicon.identity());
         assert!(!LinkKind::Favicon.by_node());
         assert_eq!(LinkKind::parse("http-404"), Some(LinkKind::Http404));
+        assert!(!LinkKind::HttpEtag.identity());
+        assert_eq!(
+            LinkKind::of_host_kind("http-etag"),
+            Some(LinkKind::HttpEtag)
+        );
         assert_eq!(LinkKind::of_host_kind("jarm"), Some(LinkKind::Jarm));
         assert!(!LinkKind::IDENTITY.contains(&LinkKind::Jarm));
         assert!(LinkKind::LIST.contains(&LinkKind::HttpBody));
