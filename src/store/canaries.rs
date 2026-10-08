@@ -187,10 +187,102 @@ pub async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
         .fetch_all(pool)
         .await?;
         if ids.is_empty() && batches.is_empty() {
-            return Ok(done);
+            return Ok(done + backfill_unserved(pool).await?);
         }
         after_req = ids.last().copied().unwrap_or(after_req);
         after_batch = batches.last().copied().unwrap_or(after_batch);
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        for id in &ids {
+            derive_request(&mut tx, *id).await?;
+        }
+        for id in &batches {
+            derive_batch(&mut tx, *id).await?;
+        }
+        tx.commit().await?;
+        done += (ids.len() + batches.len()) as u64;
+        tokio::time::sleep(BACKFILL_PAUSE).await;
+    }
+}
+
+/// A candidate of [`backfill_unserved`]: its id (request or batch) and
+/// what [`crate::canary::served`] needs.
+type Unserved = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+);
+
+/// Derive again the decoy rows of version 3 or later that have no canary
+/// although this build serves some for them. A build older than a row's
+/// version serves none for it yet marks it parsed with the same
+/// [`TOKENS_V`], so [`backfill`]'s version walk never comes back to it.
+/// Checked per row (a light batch may mix versions); rows this build
+/// serves nothing for (git-pack, a newer version) are skipped, so each
+/// start re-derives only what is missing.
+async fn backfill_unserved(pool: &sqlx::SqlitePool) -> Result<u64> {
+    // 3: the first version older builds do not know (versions 1 and 2
+    // were re-derived by migration 0009 and are known to every node now).
+    const SQL_REQ: &str = "
+        SELECT r.id, r.page_token, r.answer, r.decoy_v, r.decoy_in FROM requests r
+        WHERE r.answer LIKE 'decoy:%' AND r.decoy_v >= 3 AND r.id > ?
+          AND NOT EXISTS (SELECT 1 FROM canaries c WHERE c.request_id = r.id)
+        ORDER BY r.id LIMIT ?";
+    const SQL_BATCH: &str = "
+        SELECT x.batch_id, x.page_token, x.answer, x.decoy_v, x.decoy_in FROM (
+            SELECT s.batch_id, s.page_token, s.answer, s.decoy_v, s.decoy_in,
+                   ROW_NUMBER() OVER (PARTITION BY s.batch_id ORDER BY s.rowid) AS pos
+            FROM skipped_requests s WHERE s.batch_id BETWEEN ? AND ?) x
+        WHERE x.answer LIKE 'decoy:%' AND x.decoy_v >= 3
+          AND NOT EXISTS (SELECT 1 FROM canaries c
+                          WHERE c.batch_id = x.batch_id AND c.skip_row = x.pos)
+        ORDER BY x.batch_id";
+    let serves = |(_, tok, answer, v, d_in): &Unserved| {
+        let (Some(tok), Some(name)) = (
+            tok.as_deref(),
+            answer.as_deref().and_then(|a| a.strip_prefix("decoy:")),
+        ) else {
+            return false;
+        };
+        !crate::canary::served(*v, tok, name, d_in.as_deref()).is_empty()
+    };
+    let mut done = 0;
+    let (mut after_req, mut after_batch) = (0i64, 0i64);
+    loop {
+        let reqs: Vec<Unserved> = sqlx::query_as(SQL_REQ)
+            .bind(after_req)
+            .bind(BACKFILL_BATCH)
+            .fetch_all(pool)
+            .await?;
+        // Batches are paged by id, not by row, so a batch is never split.
+        let page: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM skipped_batches WHERE id > ? ORDER BY id LIMIT ?")
+                .bind(after_batch)
+                .bind(BACKFILL_BATCH)
+                .fetch_all(pool)
+                .await?;
+        let rows: Vec<Unserved> = match (page.first(), page.last()) {
+            (Some(lo), Some(hi)) => {
+                sqlx::query_as(SQL_BATCH)
+                    .bind(lo)
+                    .bind(hi)
+                    .fetch_all(pool)
+                    .await?
+            }
+            _ => vec![],
+        };
+        if reqs.is_empty() && page.is_empty() {
+            return Ok(done);
+        }
+        after_req = reqs.last().map_or(after_req, |r| r.0);
+        after_batch = page.last().copied().unwrap_or(after_batch);
+        let ids: Vec<i64> = reqs.iter().filter(|r| serves(r)).map(|r| r.0).collect();
+        let mut batches: Vec<i64> = rows.iter().filter(|r| serves(r)).map(|r| r.0).collect();
+        batches.dedup();
+        if ids.is_empty() && batches.is_empty() {
+            continue;
+        }
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         for id in &ids {
             derive_request(&mut tx, *id).await?;
@@ -860,6 +952,75 @@ mod tests {
             1,
             "re-parsing does not duplicate"
         );
+    }
+
+    #[tokio::test]
+    async fn backfill_derives_version_3_rows_an_older_build_marked_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        for (uid, answer) in [("adm", "decoy:admin"), ("pack", "decoy:git-pack")] {
+            apply(
+                &mut conn,
+                ctx,
+                &req(
+                    uid,
+                    "2026-10-04 10:00:00",
+                    "198.51.100.1",
+                    "/admin",
+                    "[]",
+                    answer,
+                    Some(3),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        let row = |answer: &str| SkipRow {
+            ts_ms: 1_791_000_000_000,
+            method: "GET".into(),
+            path: "/admin".into(),
+            page_token: Some("light-token".into()),
+            host: None,
+            answer: Some(answer.into()),
+            decoy_v: Some(3),
+            decoy_site: None,
+            held_ms: None,
+            decoy_in: None,
+        };
+        apply(
+            &mut conn,
+            ctx,
+            &Record::SkipBatch(SkipBatchRec {
+                uid: "b1".into(),
+                ip: "198.51.100.3".into(),
+                dropped: 0,
+                rows: vec![row("decoy:dotenv"), row("decoy:admin")],
+                build: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        let all = derived(&s.pool).await;
+        // An older build serves nothing for version 3 yet marks the rows
+        // parsed; a batch's other rows may still have theirs (mixed
+        // versions), so the check is per row.
+        sqlx::query(
+            "DELETE FROM canaries WHERE request_id IS NOT NULL OR (batch_id IS NOT NULL AND skip_row = 2)",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!(backfill(&s.pool).await.unwrap(), 2);
+        assert_eq!(derived(&s.pool).await, all);
+        assert_eq!(backfill(&s.pool).await.unwrap(), 0, "git-pack serves none");
     }
 
     #[tokio::test]
