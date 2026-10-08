@@ -183,8 +183,6 @@ pub struct SettingsView {
     pub listener_missing: String,
     pub scanner_missing: String,
     pub web_missing: String,
-    /// In a cluster: the node it forwards its credits to ("" = none).
-    pub collect_to: Option<String>,
 }
 
 impl SettingsView {
@@ -200,10 +198,6 @@ impl SettingsView {
             listener_missing: p.listener.clone().unwrap_or_default(),
             scanner_missing: p.scanner.clone().unwrap_or_default(),
             web_missing: p.web.clone().unwrap_or_default(),
-            collect_to: st
-                .recorder
-                .node()
-                .map(|_| s.collect_to.map(|id| id.to_string()).unwrap_or_default()),
         }
     }
 }
@@ -904,9 +898,6 @@ struct SettingsForm {
     listener: Option<String>,
     scanner: Option<String>,
     web: Option<String>,
-    /// The node this one (or the sibling the form is for) forwards its
-    /// credits to; "" = none. Absent: unchanged.
-    collect_to: Option<String>,
 }
 
 impl SettingsForm {
@@ -933,7 +924,6 @@ impl SettingsForm {
             listener: Some(self.listener.is_some()),
             scanner: Some(self.scanner.is_some()),
             web: Some(self.web.is_some()),
-            collect_to: self.collect_to.clone(),
         })
     }
 }
@@ -987,9 +977,6 @@ enum Remote {
         blocked: Vec<(String, String)>,
         /// `(key, name)` of the members it could be told to block.
         peers: Vec<(String, String)>,
-        /// `(key, name)` of the operator's other nodes it can forward its
-        /// credits to (this node first).
-        fleet: Vec<(String, String)>,
     },
     /// Asked; no answer.
     Silent(String),
@@ -1084,36 +1071,6 @@ fn asks_remote(m: &MemberView) -> bool {
     !m.is_self && m.managed && m.live && !m.blocked
 }
 
-/// Where a sibling can be told to forward its credits: this node and the
-/// other siblings. The node it forwards to now is always among them, also
-/// when it is no sibling here (still on the previous key after a rotation,
-/// not found again yet), so saving the form does not quietly change it.
-fn collect_options(all: &[MemberView], target: &str, now: Option<&str>) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = all
-        .iter()
-        .filter(|x| (x.is_self || x.sibling) && x.key != target)
-        .map(|x| {
-            let name = if x.is_self {
-                "this node".into()
-            } else {
-                x.name.clone()
-            };
-            (x.key.clone(), name)
-        })
-        .collect();
-    if let Some(now) = now.filter(|n| !n.is_empty() && !out.iter().any(|(k, _)| k == n)) {
-        let name = all
-            .iter()
-            .find(|x| x.key == now)
-            .map_or_else(|| now.chars().take(20).collect(), |x| x.name.clone());
-        out.push((
-            now.to_string(),
-            format!("{name} (not one of your nodes here)"),
-        ));
-    }
-    out
-}
-
 async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
     let node = node(st)?;
     let Ok(id) = NodeId::parse(key) else {
@@ -1180,7 +1137,6 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
                         .filter(|x| !blocked.iter().any(|(k, _)| *k == x.key))
                         .map(|x| (x.key.clone(), x.name.clone()))
                         .collect(),
-                    fleet: collect_options(&all, &m.key, st.collect_to.as_deref()),
                     blocked,
                     status: Box::new(st),
                 }
@@ -1603,33 +1559,6 @@ mod tests {
                 "not earning here: rules: disagree on 12% of 500",
             ]
         );
-    }
-
-    /// The node a sibling forwards to stays selectable, so a save that
-    /// changes something else does not clear it.
-    #[test]
-    fn the_current_collecting_node_is_always_an_option() {
-        let view = |key: &str, is_self: bool, sibling: bool| MemberView {
-            key: key.into(),
-            name: format!("n-{key}"),
-            is_self,
-            sibling,
-            ..Default::default()
-        };
-        let all = [
-            view("me", true, false),
-            view("b", false, true),
-            view("c", false, false),
-        ];
-        let keys = |o: Vec<(String, String)>| o.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
-        assert_eq!(keys(collect_options(&all, "b", None)), ["me"]);
-        assert_eq!(keys(collect_options(&all, "b", Some("me"))), ["me"]);
-        let o = collect_options(&all, "b", Some("c"));
-        assert_eq!(
-            o[1],
-            ("c".into(), "n-c (not one of your nodes here)".into())
-        );
-        assert_eq!(keys(collect_options(&all, "b", Some(""))), ["me"]);
     }
 
     #[test]

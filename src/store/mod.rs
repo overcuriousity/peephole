@@ -57,6 +57,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0020_scan_retries.sql"),
     include_str!("migrations/0021_market.sql"),
     include_str!("migrations/0022_price_history.sql"),
+    include_str!("migrations/0023_scan_self_mc.sql"),
+    include_str!("migrations/0024_no_collecting_node.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
@@ -428,6 +430,14 @@ impl Store {
         .bind(value)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn intel_delete(&self, key: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM intel_meta WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
