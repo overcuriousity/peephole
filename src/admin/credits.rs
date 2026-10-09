@@ -7,7 +7,7 @@ use crate::admin::error::{AppResult, render};
 use crate::admin::views::Chrome;
 use crate::cluster::identity::NodeId;
 use crate::credits::ledger::{Earned, OfferState};
-use crate::credits::{self, Mc, mint, show};
+use crate::credits::{self, Mc, show};
 use askama::Template;
 use axum::{
     Router,
@@ -62,17 +62,6 @@ struct NodeRow {
     balance: String,
 }
 
-struct EarnedRow {
-    at: String,
-    /// The scan's page, when the scan is held here.
-    scan: Option<i64>,
-    ip: String,
-    level: u8,
-    /// "1", "2", or a dash when the scan does not count.
-    counts: String,
-    note: String,
-}
-
 struct SpentRow {
     at: String,
     server: String,
@@ -99,9 +88,8 @@ struct MemberRow {
     spent: String,
     /// Why it does not earn in full here; empty: it does.
     standing: String,
-    /// Its share of the mint and its allowances over the last 7 days.
-    minted: String,
-    allowance: String,
+    /// Its pool shares credited here over the last 7 days.
+    pool: String,
     /// What it charged others over the last 7 days.
     sales: String,
 }
@@ -213,8 +201,7 @@ struct GoodRow {
 #[derive(serde::Serialize, Default, Debug, PartialEq)]
 struct FlowDay {
     day: String,
-    mint: f64,
-    allowance: f64,
+    pool: f64,
     sales: f64,
     spent: f64,
 }
@@ -273,9 +260,6 @@ struct CreditsPage {
     days: Vec<DayRow>,
     /// This node has an owner: its nodes and their total.
     fleet: Option<(String, Vec<NodeRow>)>,
-    earned: Vec<EarnedRow>,
-    /// Scans that wait to be judged.
-    waiting: i64,
     spent: Vec<SpentRow>,
     moved: Vec<MovedRow>,
     members: Vec<MemberRow>,
@@ -284,11 +268,11 @@ struct CreditsPage {
     price: PriceView,
     /// `(key, name)` of the members credits can be sent to.
     receivers: Vec<(String, String)>,
-    /// This node's closed days, newest first: `(date, mint share, allowance)`.
-    income: Vec<(String, String, String)>,
-    /// Today: scans of this node counted so far, and whether it recorded a
-    /// request today (so the allowance is due).
-    accruing: (u32, bool),
+    /// This node's credited days, newest first: `(date, pool share)`.
+    income: Vec<(String, String)>,
+    /// Today: this node's up hours so far, and whether it is an advertised
+    /// listener (so it can earn a pool share).
+    today_up: (u32, bool),
     /// Every good this node prices or members announce.
     goods: Vec<GoodRow>,
     /// The scan price's move over 24 hours.
@@ -342,39 +326,6 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
 
     // The ledger walks 8 days (a lot's life and one): the page says 7.
     let week = book.now_ms.saturating_sub(7 * credits::DAY_MS) << 16;
-    let mut earned = vec![];
-    for p in book.paid.iter().rev().filter(|p| p.scan.hlc >= week) {
-        if p.scan.scanner != me || earned.len() >= ROWS {
-            continue;
-        }
-        let scan: Option<i64> = sqlx::query_scalar("SELECT id FROM scans WHERE uid = ?")
-            .bind(&p.scan.scan_uid)
-            .fetch_optional(&st.store.read)
-            .await?;
-        earned.push(EarnedRow {
-            at: when(p.scan.hlc),
-            scan,
-            ip: p.scan.ip.clone(),
-            level: p.scan.job_level,
-            counts: if p.weight == 0 {
-                "\u{2014}".into()
-            } else {
-                p.weight.to_string()
-            },
-            note: p.note.clone(),
-        });
-    }
-    let waiting: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scans s JOIN scan_jobs j ON j.uid = s.job_uid
-         WHERE j.status = 'done' AND s.origin = j.scanner AND s.audit_of IS NULL
-           AND (j.scanner = ?1 OR j.origin = ?1) AND MAX(s.hlc, COALESCE(j.hlc, 0)) >= ?2
-           AND NOT EXISTS (SELECT 1 FROM credit_scans c WHERE c.job_uid = j.uid)",
-    )
-    .bind(&me.0[..])
-    .bind(crate::cluster::hlc::to_db(week))
-    .fetch_one(&st.store.read)
-    .await?;
-
     let spent = l
         .offers
         .iter()
@@ -424,29 +375,21 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         })
         .collect();
 
-    let mut income: BTreeMap<u32, (Mc, Mc)> = BTreeMap::new();
-    for e in book.minted.iter().filter(|e| e.node == me) {
-        income.entry(credits::day_of(e.hlc)).or_default().0 += e.mc;
+    let mut income: BTreeMap<u32, Mc> = BTreeMap::new();
+    for e in book.pool.iter().filter(|e| e.node == me) {
+        *income.entry(credits::day_of(e.hlc)).or_default() += e.mc;
     }
-    for e in book.allowances.iter().filter(|e| e.node == me) {
-        income.entry(credits::day_of(e.hlc)).or_default().1 += e.mc;
-    }
-    let income: Vec<(String, String, String)> = income
+    let income: Vec<(String, String)> = income
         .into_iter()
         .rev()
         .take(credits::LOT_DAYS as usize)
-        .map(|(d, (m, a))| (date_of(d), show(m), show(a)))
+        .map(|(d, mc)| (date_of(d), show(mc)))
         .collect();
     let today = (book.now_ms / credits::DAY_MS) as u32;
-    let counted = book
-        .paid
-        .iter()
-        .filter(|p| p.weight > 0 && p.scan.scanner == me && credits::day_of(p.scan.hlc) == today)
-        .count() as u32;
-    let recorded = !mint::active_days(&node.store.pool, &[me], today, today)
-        .await?
-        .is_empty();
-    let accruing = (counted, recorded);
+    let today_up = (
+        book.up_hours(&me, today),
+        node.cfg.advertise.is_some() && node.roles().listener,
+    );
     let sum_week = |list: &[Earned], id: &NodeId| -> Mc {
         list.iter()
             .filter(|e| e.node == *id && e.hlc >= week)
@@ -466,8 +409,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
                 earned: show(t.earned),
                 spent: show(t.spent),
                 standing: book.standing(&m.id).reasons().join("; "),
-                minted: show(sum_week(&book.minted, &m.id)),
-                allowance: show(sum_week(&book.allowances, &m.id)),
+                pool: show(sum_week(&book.pool, &m.id)),
                 sales: show(t.served),
             }
         })
@@ -632,14 +574,9 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         })
         .collect();
     let cr = |mc: Mc| mc as f64 / 1000.0;
-    for e in book.minted.iter().filter(|e| e.node == me) {
+    for e in book.pool.iter().filter(|e| e.node == me) {
         if let Some(f) = flow.get_mut(&credits::day_of(e.hlc)) {
-            f.mint += cr(e.mc);
-        }
-    }
-    for e in book.allowances.iter().filter(|e| e.node == me) {
-        if let Some(f) = flow.get_mut(&credits::day_of(e.hlc)) {
-            f.allowance += cr(e.mc);
+            f.pool += cr(e.mc);
         }
     }
     for o in &l.offers {
@@ -670,8 +607,6 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         held: show(l.held(&me)),
         days,
         fleet,
-        earned,
-        waiting,
         spent,
         moved,
         members: rows,
@@ -679,7 +614,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         price,
         receivers,
         income,
-        accruing,
+        today_up,
         goods,
         scan_change,
         market_json,
@@ -799,19 +734,16 @@ mod tests {
             held: "0.00".into(),
             days: vec![],
             fleet: None,
-            earned: vec![],
-            waiting: 0,
             spent: vec![],
             moved: vec![],
             members: vec![MemberRow {
                 key: "k".into(),
                 name: "node-alpha".into(),
                 balance: "1250.00".into(),
-                earned: "255.00".into(),
+                earned: "250.00".into(),
                 spent: "0.00".into(),
                 standing: String::new(),
-                minted: "250.00".into(),
-                allowance: "5.00".into(),
+                pool: "250.00".into(),
                 sales: "1.20".into(),
             }],
             totals: ("255.00".into(), "812.00".into()),
@@ -854,28 +786,28 @@ mod tests {
                 offers: vec![("MaxMind GeoLite2".into(), "0.02".into(), "1000".into())],
             },
             receivers: vec![],
-            income: vec![("2026-10-06".into(), "250.00".into(), "5.00".into())],
-            accruing: (12, true),
+            income: vec![("2026-10-06".into(), "250.00".into())],
+            today_up: (5, true),
             goods: vec![],
             scan_change: None,
             market_json: "{}".into(),
             flow_json: "[]".into(),
         };
-        // The template states these amounts in words.
+        // The template states these in words.
         assert_eq!(
-            (mint::MINT_PER_DAY, mint::ALLOWANCE_PER_DAY),
-            (1_000_000, 5_000)
+            (credits::pool::POOL_PER_DAY, credits::reach::MIN_UP_HOURS),
+            (1_000_000, 12)
         );
         let html = page.render().unwrap();
         for want in [
             "2026-10-06",
             "250.00",
-            "5.00",
             "1.20",
             "812.00",
             "0.05",
-            "12 scans counted so far",
-            "1000 credits are split among the scanners",
+            "5 hours up today",
+            "1000 credits are split evenly",
+            "12 of the day's 24 hours",
         ] {
             assert!(html.contains(want), "{want} missing");
         }

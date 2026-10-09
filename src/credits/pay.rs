@@ -31,12 +31,12 @@ pub(crate) const RETRY_AT_MOST: Mc = 2;
 
 /// Whether a member announcing `proto_max` sells scan jobs at its own price.
 pub fn sells_scans(proto_max: u32) -> bool {
-    proto_max >= crate::cluster::rpc::proto::SCAN_PRICE_PROTO
+    proto_max >= crate::cluster::rpc::proto::ECONOMY_PROTO
 }
 
 /// Whether a member announcing `proto_max` counts balances as this node does.
 pub fn pays_with(proto_max: u32) -> bool {
-    proto_max >= crate::cluster::rpc::proto::MARKET_PROTO
+    proto_max >= crate::cluster::rpc::proto::ECONOMY_PROTO
 }
 
 /// A node that could answer for a provider, and what it asks.
@@ -130,6 +130,7 @@ pub(crate) async fn release(node: &Arc<Node>, peer: NodeId, offer_seq: u64) {
         offer_seq,
         charged_mc: 0,
         answered: vec![],
+        economy: crate::cluster::record::ECONOMY,
     };
     if let Err(e) = repl::append(node, &[receipt]).await {
         tracing::debug!(?e, "receipt not written");
@@ -209,7 +210,7 @@ pub async fn accept_offer(
         .is_some_and(|m| pays_with(m.proto_max))
     {
         release(node, peer, offer_seq).await;
-        return why("your node predates the market (protocol 4): upgrade it to pay here".into());
+        return why("your node predates the credits of protocol 7: upgrade it to pay here".into());
     }
     let Some(entry) = wait_for(node, &peer, offer_seq).await else {
         return why(format!(
@@ -334,6 +335,7 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
         parts,
         seal,
         job: None,
+        economy: crate::cluster::record::ECONOMY,
     })
     .await
     .map_err(|e| format!("the offer could not be written: {e:#}"))?;
@@ -502,6 +504,7 @@ pub async fn serve(
         offer_seq,
         charged_mc: charged.min(u32::MAX as Mc) as u32,
         answered: answered.clone(),
+        economy: crate::cluster::record::ECONOMY,
     };
     match repl::append(node, &[receipt]).await {
         Ok(_) => resp.charged_mc = charged.min(u32::MAX as Mc) as u32,
@@ -777,14 +780,13 @@ mod tests {
 
     #[test]
     fn only_market_nodes_are_paid() {
-        assert_eq!(crate::cluster::rpc::proto::MARKET_PROTO, 4);
+        assert_eq!(crate::cluster::rpc::proto::ECONOMY_PROTO, 7);
         const {
             assert!(
                 crate::cluster::rpc::proto::PROTO_VERSION
-                    >= crate::cluster::rpc::proto::MARKET_PROTO
+                    >= crate::cluster::rpc::proto::ECONOMY_PROTO
             )
         };
-        assert_eq!(crate::cluster::rpc::proto::SCAN_PRICE_PROTO, 5);
         assert_eq!(crate::cluster::rpc::proto::ROUTED_PROTO, 6);
         const {
             assert!(
@@ -792,8 +794,8 @@ mod tests {
                     >= crate::cluster::rpc::proto::ROUTED_PROTO
             )
         };
-        assert!(!pays_with(3));
-        assert!(pays_with(4));
+        assert!(!pays_with(6) && !sells_scans(6));
+        assert!(pays_with(7) && sells_scans(7));
     }
 
     #[test]

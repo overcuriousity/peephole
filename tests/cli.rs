@@ -553,7 +553,10 @@ fn credits_from_the_shell() {
     let (ok, out, _) = run(&["members"]);
     assert!(ok && out.contains("n1") && out.contains("0.00"), "{out}");
     let (ok, _, err) = run(&["why", "no-such-scan"]);
-    assert!(!ok && err.contains("not judged"), "{err}");
+    assert!(
+        !ok && err.contains("usage: peephole credits"),
+        "gone: {err}"
+    );
     let (ok, _, err) = run(&["send", "n1", "1"]);
     assert!(
         !ok && err.contains("not a member credits can be sent to"),

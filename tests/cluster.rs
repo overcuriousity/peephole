@@ -1235,7 +1235,7 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
 }
 
 async fn batch_of(n: &Node, origin: NodeId) -> peephole::cluster::sync::Batch {
-    repl::entries_after(&n.store, &[(origin, 0)], 0, 10_000, usize::MAX)
+    repl::entries_after(&n.store, &[(origin, 0)], 0, 10_000, usize::MAX, false)
         .await
         .unwrap()
 }
@@ -4279,6 +4279,7 @@ async fn credit_entries_replicate_into_every_nodes_table() {
             to: b.id,
             parts: vec![(today, 250)],
             seal: Seal::default(),
+            economy: peephole::cluster::record::ECONOMY,
         }],
     )
     .await
@@ -4318,6 +4319,7 @@ async fn sealed_payments_check_out_on_the_other_node() {
         to: b.id,
         parts: vec![(today, 10)],
         seal,
+        economy: peephole::cluster::record::ECONOMY,
     };
     let first = repl::append_sealing(&na, transfer).await.unwrap();
     let second = repl::append_sealing(&na, transfer).await.unwrap();
@@ -4381,6 +4383,7 @@ async fn a_node_that_shows_two_histories_is_proven_and_marked_everywhere() {
         offer_seq: 1,
         charged_mc: charged,
         answered: vec![],
+        economy: peephole::cluster::record::ECONOMY,
     };
     let (for_b, for_c) = (sign(2, &receipt(1)), sign(2, &receipt(2)));
     repl::apply_batch(&nb, vec![e1.clone(), for_b.clone()])
@@ -4451,199 +4454,6 @@ fn fake_nmap_args(dir: &std::path::Path) -> std::path::PathBuf {
     .unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     p
-}
-
-/// Judge every payable scan held on `n` now (the node's own loop waits
-/// ten minutes for the requests behind a scan).
-async fn judge_now(n: &TestNode) -> usize {
-    let origins = peephole::scan::guard::Origins::Any;
-    let j = peephole::credits::earn::Judge {
-        pool: &n.store.pool,
-        origins: &origins,
-        classifier: peephole::classify::Classifier::builtin(),
-    };
-    peephole::credits::earn::judge(&j, 0).await.unwrap()
-}
-
-/// A scanner completes a scan for another node's trap: the scan counts
-/// for the scanner in every node's book, and the day's mint goes to it
-/// once the day is closed; the trap gets no share.
-#[tokio::test]
-async fn a_completed_scan_counts_for_the_scanner_in_every_nodes_book() {
-    use peephole::credits;
-    let tools = tempfile::tempdir().unwrap();
-    let (ia, a) = new_node("a");
-    let (ib, b) = new_node("b");
-    let (ic, c) = new_node("c");
-    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
-    let nb = boot(
-        ib,
-        &b,
-        &[&a, &c],
-        Opts {
-            scanner: Some(fake_nmap_args(tools.path())),
-            ..DEFAULT
-        },
-    )
-    .await;
-    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
-    enqueue(&na, "198.51.100.40", 2).await;
-    eventually_for(
-        Duration::from_secs(40),
-        "scanned, and everyone has it all",
-        || async {
-            let mut all = true;
-            for n in [&na, &nb, &nc] {
-                all &= count(n, "SELECT COUNT(*) FROM scans").await == 1
-                    && count(n, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 1
-                    && count(n, "SELECT COUNT(*) FROM requests").await == 3;
-            }
-            all
-        },
-    )
-    .await;
-    for n in [&na, &nb, &nc] {
-        assert_eq!(judge_now(n).await, 1);
-        let book = credits::book_fresh(&n.node).await.unwrap();
-        assert_eq!(book.paid.len(), 1);
-        assert!(book.paid[0].scan.args_ok && book.paid[0].scan.level == 2);
-        assert!(book.paid[0].weight > 0, "it counts");
-        // Today is open: nothing is minted yet.
-        assert_eq!(book.balance(&b.id), 0);
-        assert_eq!(book.balance(&a.id), 0);
-        // Once the day is closed, the scanner gets the whole mint.
-        assert_eq!(mint_of(&book, b.id), mint_total(&book));
-        assert!(mint_total(&book) > 0);
-        assert_eq!(mint_of(&book, a.id), 0, "no trap share");
-        assert_eq!(mint_of(&book, c.id), 0);
-        assert!(book.standing(&b.id).earns());
-    }
-    // A member blocked here earns nothing here; elsewhere it still does.
-    peephole::cluster::block::block(&nc.node, b.id)
-        .await
-        .unwrap();
-    let book = credits::book_fresh(&nc.node).await.unwrap();
-    assert_eq!(mint_of(&book, b.id), 0);
-    assert!(book.standing(&b.id).blocked);
-    let book = credits::book_fresh(&na.node).await.unwrap();
-    assert!(mint_of(&book, b.id) > 0);
-}
-
-/// A stand-in nmap that reports a host with no open port, whatever the
-/// target: a scanner that makes its results up.
-fn fake_nmap_empty(dir: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let p = dir.join("fake-nmap-empty");
-    std::fs::write(
-        &p,
-        "#!/bin/sh\nfor a; do t=$a; done\ncat <<EOF\n<?xml version=\"1.0\"?>\n\
-         <nmaprun scanner=\"nmap\" args=\"nmap $*\" start=\"1\" version=\"7.94\">\n\
-         <host><status state=\"up\"/><address addr=\"$t\" addrtype=\"ipv4\"/>\
-         <ports></ports></host>\n</nmaprun>\nEOF\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-    p
-}
-
-/// A scanner that audits everything finds another scanner's results made
-/// up. That scanner then earns no scanner share where those audits count:
-/// at the auditor and in its fleet, and at nobody else.
-#[tokio::test]
-async fn audits_of_made_up_results_stop_a_scanners_shares_where_they_count() {
-    use peephole::cluster::owner::{self, fleet};
-    use peephole::credits::{self, audit};
-    let tools = tempfile::tempdir().unwrap();
-    let (ia, a) = new_node("a");
-    let (i_f, f) = new_node("f");
-    let (ib, b) = new_node("b");
-    let (is, s) = new_node("s");
-    let (ic, c) = new_node("c");
-    let na = boot(ia, &a, &[&f, &b, &s, &c], DEFAULT).await;
-    let _nf = boot(
-        i_f,
-        &f,
-        &[&a, &b, &s, &c],
-        Opts {
-            scanner: Some(fake_nmap_empty(tools.path())),
-            ..DEFAULT
-        },
-    )
-    .await;
-    let nb = boot(
-        ib,
-        &b,
-        &[&a, &f, &s, &c],
-        Opts {
-            scanner: Some(fake_nmap_args(tools.path())),
-            audit_share: 1.0,
-            ..DEFAULT
-        },
-    )
-    .await;
-    let ns = boot(is, &s, &[&a, &f, &b, &c], DEFAULT).await;
-    let nc = boot(ic, &c, &[&a, &f, &b, &s], DEFAULT).await;
-    let key = owner::create(&nb.store, b.id).await.unwrap();
-    owner::adopt(&ns.store, s.id, &key, false).await.unwrap();
-    eventually("s knows b as one of its own", || async {
-        fleet::discover(&ns.node).await.unwrap() == vec![b.id]
-    })
-    .await;
-
-    for i in 0..16 {
-        enqueue(&na, &format!("198.51.100.{}", 60 + i), 1).await;
-    }
-    eventually_for(Duration::from_secs(60), "all sixteen scanned", || async {
-        count(&na, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 16
-    })
-    .await;
-    let by_f = scans_by(&na, f.id).await;
-    assert!(by_f >= 5, "f ran {by_f} of 16 scans");
-    eventually_for(
-        Duration::from_secs(60),
-        "b ran f's scans again, and everyone holds the audits",
-        || async {
-            let mut all = true;
-            for n in [&nb, &ns, &nc] {
-                all &= count(n, "SELECT COUNT(*) FROM scans WHERE audit_of IS NOT NULL").await
-                    == by_f
-                    && count(n, "SELECT COUNT(*) FROM scans WHERE audit_of IS NULL").await == 16;
-            }
-            all
-        },
-    )
-    .await;
-    for n in [&nb, &ns, &nc] {
-        assert_eq!(judge_now(n).await, 16);
-        audit::settle(&n.store.pool).await.unwrap();
-        assert_eq!(
-            count(
-                n,
-                "SELECT COUNT(*) FROM scans WHERE audit_result = 'differs'"
-            )
-            .await,
-            by_f,
-            "nothing reported, a port found"
-        );
-    }
-    for n in [&nb, &ns] {
-        let book = credits::book_fresh(&n.node).await.unwrap();
-        let st = book.standing(&f.id);
-        assert_eq!(st.audits, Some((by_f as u32, by_f as u32)));
-        assert!(st.earns() && !st.earns_as_scanner());
-        // The honest scanner gets the whole mint; the trap no share.
-        assert_eq!(mint_of(&book, f.id), 0);
-        assert_eq!(mint_of(&book, b.id), mint_total(&book));
-        assert_eq!(mint_of(&book, a.id), 0);
-    }
-    // c is not of b's fleet: b's audits are shown there, they do not count.
-    let book = credits::book_fresh(&nc.node).await.unwrap();
-    assert_eq!(book.standing(&f.id).audits, None);
-    assert!(mint_of(&book, f.id) > 0 && mint_of(&book, b.id) > 0);
-    assert_eq!(
-        mint_of(&book, f.id) + mint_of(&book, b.id),
-        mint_total(&book)
-    );
 }
 
 /// A provider a test node serves: a name the cluster knows, an optional
@@ -4768,7 +4578,7 @@ async fn an_old_version_member_is_not_asked_for_paid_lookups() {
     let old = Opts {
         proto: Some((
             peephole::cluster::rpc::proto::PROTO_MIN,
-            peephole::cluster::rpc::proto::MARKET_PROTO - 1,
+            peephole::cluster::rpc::proto::ECONOMY_PROTO - 1,
         )),
         ..DEFAULT
     };
@@ -4790,64 +4600,175 @@ async fn an_old_version_member_is_not_asked_for_paid_lookups() {
     assert_eq!(servers, vec![c.id], "only the member of the market");
 }
 
-/// Counted scans of `node` two days ago (a closed day), for a trap that
-/// is no test node: `node` gets that day's mint, shared with every other
-/// node granted scans in the same test by their numbers of scans.
-async fn grant_scans(on: &[&TestNode], node: NodeId, scans: u32) {
-    use peephole::credits::DAY_MS;
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let first = NEXT.fetch_add(scans as u64, std::sync::atomic::Ordering::SeqCst);
-    let now_ms = std::time::SystemTime::now()
+/// Wall-clock milliseconds since the epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_millis() as u64;
-    let day = now_ms / DAY_MS - 2;
-    let trap = NodeId([0xEE; 32]);
+        .as_millis() as u64
+}
+
+/// The day two days back: closed, and its lot alive for 4 more days.
+fn pool_day() -> u32 {
+    (now_ms() / peephole::credits::DAY_MS) as u32 - 2
+}
+
+/// Make `listeners` the verified listeners of [`pool_day`] on every node
+/// in `on`: each gets its share of that day's pool.
+async fn fund_listeners(on: &[&TestNode], listeners: &[NodeId]) {
     for n in on {
-        for i in 0..scans as u64 {
-            let k = first + i;
-            sqlx::query(
-                "INSERT INTO credit_scans
-                   (scan_uid, job_uid, ip, scanner, trap, hlc, level, job_level, args_ok, judged_at)
-                 VALUES (?, ?, ?, ?, ?, ?, 1, 1, 1, datetime('now'))",
-            )
-            .bind(format!("granted-{k}"))
-            .bind(format!("granted-job-{k}"))
-            .bind(format!("100.64.{}.{}", k / 250, k % 250))
-            .bind(&node.0[..])
-            .bind(&trap.0[..])
-            .bind(((day * DAY_MS + 3_600_000 + k) << 16) as i64)
-            .execute(&n.store.pool)
+        peephole::credits::pool::testing::report_all_day(&n.store.pool, pool_day(), listeners)
             .await
             .unwrap();
-        }
     }
 }
 
-/// What a node granted `scans` of `total` scans in a test holds from the mint.
-fn minted(scans: u64, total: u64) -> u64 {
-    peephole::credits::mint::MINT_PER_DAY * scans / total
-}
-
-/// What `id` gets of the mint for the counted scans `book` holds, once
-/// their days are closed.
-fn mint_of(book: &peephole::credits::Book, id: NodeId) -> u64 {
-    let later = book.now_ms + 3 * peephole::credits::DAY_MS;
-    peephole::credits::mint::split(&book.paid, later)
+/// What `id` holds from the pool when `listeners` share it.
+fn share(listeners: &[NodeId], id: NodeId) -> u64 {
+    peephole::credits::pool::split(pool_day(), &listeners.iter().copied().collect())
         .iter()
         .filter(|e| e.node == id)
         .map(|e| e.mc)
         .sum()
 }
 
-/// All of the mint for the counted scans `book` holds, once their days
-/// are closed.
-fn mint_total(book: &peephole::credits::Book) -> u64 {
-    let later = book.now_ms + 3 * peephole::credits::DAY_MS;
-    peephole::credits::mint::split(&book.paid, later)
-        .iter()
-        .map(|e| e.mc)
-        .sum()
+/// The pool goes to the advertised listeners that were reached, not to
+/// an outbound-only member, and every node credits the same shares.
+#[tokio::test]
+async fn the_pool_reaches_reached_listeners_only() {
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (io, o) = new_node("node-oscar");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let no = boot(
+        io,
+        &o,
+        &[],
+        Opts {
+            advertise: false,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let token = invite::create(&na, &Default::default()).await.unwrap();
+    invite::join(&no, &token).await.unwrap();
+    // Real reports for the current hour: rounds run, then each node
+    // reports the hour as if it had ended.
+    let next_hour = now_ms() + 3_600_000;
+    eventually("everyone synced with a and b", || async {
+        [&na, &nb, &no]
+            .iter()
+            .all(|n| n.node.status.reached_recently(&a.id) || n.node.id() == a.id)
+            && [&na, &no]
+                .iter()
+                .all(|n| n.node.status.reached_recently(&b.id))
+    })
+    .await;
+    for n in [&na, &nb, &no] {
+        peephole::credits::reach::report_due(&n.node, next_hour)
+            .await
+            .unwrap();
+    }
+    let hour = peephole::credits::reach::hour_of(now_ms());
+    let day = hour / 24;
+    eventually("every node counts a and b up this hour, o not", || async {
+        let mut ok = true;
+        for n in [&na, &nb, &no] {
+            let book = peephole::credits::book_fresh(&n.node).await.unwrap();
+            ok &= book.up_hours(&a.id, day) == 1
+                && book.up_hours(&b.id, day) == 1
+                && book.up_hours(&o.id, day) == 0;
+        }
+        ok
+    })
+    .await;
+    // A whole day up: o is up too, but has no address, so no share.
+    fund_listeners(&[&na, &nb, &no], &[a.id, b.id, o.id]).await;
+    for n in [&na, &nb, &no] {
+        let book = peephole::credits::book_fresh(&n.node).await.unwrap();
+        assert_eq!(book.balance(&a.id), share(&[a.id, b.id], a.id));
+        assert_eq!(book.balance(&b.id), share(&[a.id, b.id], b.id));
+        assert_eq!(book.balance(&o.id), 0);
+    }
+}
+
+/// A member below protocol 7 is neither paid nor charged: it is not
+/// quoted, and an offer it makes moves nothing.
+#[tokio::test]
+async fn a_protocol_six_member_is_neither_paid_nor_charged() {
+    use peephole::cluster::rpc::proto;
+    use peephole::credits::pay;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a],
+        Opts {
+            proto: Some((proto::PROTO_MIN, proto::ECONOMY_PROTO - 1)),
+            ..DEFAULT
+        },
+    )
+    .await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.5);
+    fund_listeners(&[&na, &nb], &[a.id, b.id]).await;
+    nb.node.refresh_heartbeat();
+    eventually("a knows b's protocol", || async {
+        na.members()
+            .get(&b.id)
+            .is_some_and(|m| m.proto_max == proto::ECONOMY_PROTO - 1)
+    })
+    .await;
+    let none: peephole::intel::Providers = vec![];
+    assert!(
+        pay::quotes(&na.node, &none)
+            .values()
+            .flatten()
+            .all(|q| q.server != b.id),
+        "not paid"
+    );
+    // b offers a: a declines (and frees it); nothing moves.
+    let seq = pay::make_offer(&nb.node, a.id, 100).await.unwrap();
+    let declined =
+        pay::accept_offer(&na.node, b.id, seq, 100, "lookup", pay::SERVE_MARGIN_MS).await;
+    assert!(matches!(declined, Err(pay::Declined::Why(w)) if w.contains("protocol 7")));
+    let book = peephole::credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(
+        book.balance(&a.id),
+        share(&[a.id, b.id], a.id),
+        "not charged to b's benefit"
+    );
+}
+
+/// Payments of the economy before protocol 7 are kept and move nothing.
+#[tokio::test]
+async fn old_economy_entries_move_nothing() {
+    use peephole::cluster::record::{Record, Seal};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
+    // An old-economy transfer from a to b, as protocol 6 wrote it.
+    peephole::cluster::repl::append_sealing(&na.node, |seal: Seal| Record::CreditTransfer {
+        to: b.id,
+        parts: vec![(pool_day(), 500_000)],
+        seal,
+        economy: 0,
+    })
+    .await
+    .unwrap();
+    eventually("b holds a's entry", || async {
+        count(&nb, "SELECT COUNT(*) FROM credit_entries WHERE economy = 0").await == 1
+    })
+    .await;
+    for n in [&na, &nb] {
+        let book = peephole::credits::book_fresh(&n.node).await.unwrap();
+        assert_eq!(book.balance(&a.id), share(&[a.id], a.id));
+        assert_eq!(book.balance(&b.id), 0);
+    }
 }
 
 /// Until `on` knows that `of` speaks the market's protocol: payments go
@@ -4898,7 +4819,7 @@ async fn a_funded_scan_job_pays_the_scanner_its_price() {
         },
     )
     .await;
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     market_known(&na, b.id).await;
     market_known(&nb, a.id).await;
     na.node.set_scan_share(0.5);
@@ -4948,7 +4869,7 @@ async fn a_funded_scan_job_pays_the_scanner_its_price() {
         assert_eq!((o.to, o.job.as_deref()), (b.id, Some(job.as_str())));
         assert_eq!(o.offered, cost);
         assert_eq!(o.state, OfferState::Charged { charged: cost });
-        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&a.id), share(&[a.id], a.id) - cost);
         assert_eq!(book.balance(&b.id), cost);
         assert_eq!(book.ledger.held(&a.id), 0);
     }
@@ -4984,7 +4905,7 @@ async fn a_job_is_granted_at_zero_and_funded_once_the_price_rises() {
         },
     )
     .await;
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     market_known(&na, b.id).await;
     market_known(&nb, a.id).await;
     na.node.set_scan_share(0.5);
@@ -5065,7 +4986,7 @@ async fn an_inflated_scanner_price_is_paid_at_the_reference() {
         },
     )
     .await;
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     market_known(&na, b.id).await;
     market_known(&nb, a.id).await;
     na.node.set_scan_share(0.5);
@@ -5109,7 +5030,7 @@ async fn the_cheaper_scanner_gets_the_job() {
     let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
     let nb = boot(ib, &b, &[&a, &c], scanner()).await;
     let nc = boot(ic, &c, &[&a, &b], scanner()).await;
-    grant_scans(&[&na, &nb, &nc], a.id, 8).await;
+    fund_listeners(&[&na, &nb, &nc], &[a.id]).await;
     for (n, of) in [(&na, b.id), (&na, c.id), (&nb, a.id), (&nc, a.id)] {
         market_known(n, of).await;
     }
@@ -5170,7 +5091,7 @@ async fn a_resolution_for_another_member_is_paid_and_a_failed_one_is_free() {
     let (ib, b) = new_node("node-bravo");
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     market_known(&nb, a.id).await;
     let cost = priced(&nb, price::RESOLVE, 1).await as u64;
     eventually("a hears b's resolution price", || async {
@@ -5190,7 +5111,7 @@ async fn a_resolution_for_another_member_is_paid_and_a_failed_one_is_free() {
     .await;
     for n in [&na, &nb] {
         let book = credits::book_fresh(&n.node).await.unwrap();
-        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&a.id), share(&[a.id], a.id) - cost);
         assert_eq!(book.balance(&b.id), cost);
         assert_eq!(book.ledger.held(&a.id), 0);
     }
@@ -5207,7 +5128,7 @@ async fn a_resolution_for_another_member_is_paid_and_a_failed_one_is_free() {
     .await;
     for n in [&na, &nb] {
         let book = credits::book_fresh(&n.node).await.unwrap();
-        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&a.id), share(&[a.id], a.id) - cost);
         assert_eq!(book.balance(&b.id), cost);
         assert_eq!(book.ledger.held(&a.id), 0);
     }
@@ -5360,7 +5281,7 @@ async fn a_paid_lookup_from_an_outbound_only_server() {
     use std::sync::atomic::Ordering;
     let (a, b, na, nb) = outbound_pair().await;
     let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     priced(&nb, "abuseipdb", 1).await;
     let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
     assert!(cost > 0);
@@ -5385,7 +5306,7 @@ async fn a_paid_lookup_from_an_outbound_only_server() {
     .await;
     for n in [&na, &nb] {
         let book = credits::book_fresh(&n.node).await.unwrap();
-        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&a.id), share(&[a.id], a.id) - cost);
         assert_eq!(book.balance(&b.id), cost);
         assert_eq!(book.ledger.held(&a.id), 0);
     }
@@ -5398,7 +5319,7 @@ async fn a_resolution_by_an_outbound_only_member() {
     use peephole::credits::{self, entries, price};
     use peephole::intel::dns;
     let (a, b, na, nb) = outbound_pair().await;
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     market_known(&nb, a.id).await;
     let cost = priced(&nb, price::RESOLVE, 1).await as u64;
     eventually("a hears b's resolution price", || async {
@@ -5416,7 +5337,7 @@ async fn a_resolution_by_an_outbound_only_member() {
     .await;
     for n in [&na, &nb] {
         let book = credits::book_fresh(&n.node).await.unwrap();
-        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&a.id), share(&[a.id], a.id) - cost);
         assert_eq!(book.balance(&b.id), cost);
         assert_eq!(book.ledger.held(&a.id), 0);
     }
@@ -5434,7 +5355,7 @@ async fn a_resolution_by_an_outbound_only_member() {
     .await;
     for n in [&na, &nb] {
         let book = credits::book_fresh(&n.node).await.unwrap();
-        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&a.id), share(&[a.id], a.id) - cost);
         assert_eq!(book.balance(&b.id), cost);
         assert_eq!(book.ledger.held(&a.id), 0);
     }
@@ -5447,7 +5368,7 @@ async fn an_unreachable_outbound_only_server_releases_the_offer() {
     use peephole::credits::{self, entries, ledger, price};
     let (a, b, na, nb) = outbound_pair().await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     price::refresh(&nb.node).await.unwrap();
     let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
     market_known(&nb, a.id).await;
@@ -5469,17 +5390,12 @@ async fn an_unreachable_outbound_only_server_releases_the_offer() {
     // Held until the offer lapses: nobody writes its receipt.
     let book = credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.ledger.held(&a.id), cost);
-    let earned: Vec<ledger::Earned> = book
-        .minted
-        .iter()
-        .chain(&book.allowances)
-        .cloned()
-        .collect();
+    let earned: Vec<ledger::Earned> = book.pool.clone();
     let all = entries::since(&na.store.pool, 0).await.unwrap();
     let later = book.now_ms + credits::OFFER_TTL_MS + 1;
     let lapsed = ledger::run(&earned, &all, &Default::default(), later);
     assert_eq!(lapsed.held(&a.id), 0);
-    assert_eq!(lapsed.balance(&a.id), minted(8, 8));
+    assert_eq!(lapsed.balance(&a.id), share(&[a.id], a.id));
 }
 
 /// An outbound-only member older than routed RPC cannot be asked through
@@ -5516,17 +5432,25 @@ async fn an_old_outbound_only_member_is_not_asked() {
     let target = probe_target().await;
     probes(&nb, target);
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     let table = price::refresh(&nb.node).await.unwrap();
     let probe_mc = nb.prober().unwrap().price(&table);
-    market_known(&na, b.id).await;
+    eventually("a knows b's protocol", || async {
+        na.members()
+            .get(&b.id)
+            .is_some_and(|m| m.proto_max == proto::ROUTED_PROTO - 1)
+    })
+    .await;
     nb.refresh_heartbeat();
     price_seen(&na, b.id, "abuseipdb").await;
     eventually("a hears b's probe and resolution prices", || async {
-        na.status
-            .known(&b.id)
-            .is_some_and(|k| k.hb.probe_price_mc == Some(probe_mc))
-            && dns::resolver_price(&na.node, &b.id).is_some()
+        na.status.known(&b.id).is_some_and(|k| {
+            k.hb.probe_price_mc == Some(probe_mc)
+                && k.hb
+                    .prices
+                    .iter()
+                    .any(|(g, _)| g == peephole::credits::price::RESOLVE)
+        })
     })
     .await;
     assert_eq!(
@@ -5605,7 +5529,7 @@ async fn a_paid_lookup_moves_credits_from_the_asker_to_the_server() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     priced(&nb, "abuseipdb", 1).await;
     let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
     assert!(cost > 0);
@@ -5630,7 +5554,7 @@ async fn a_paid_lookup_moves_credits_from_the_asker_to_the_server() {
     .await;
     for n in [&na, &nb] {
         let book = credits::book_fresh(&n.node).await.unwrap();
-        assert_eq!(book.balance(&a.id), minted(8, 8) - cost);
+        assert_eq!(book.balance(&a.id), share(&[a.id], a.id) - cost);
         assert_eq!(book.balance(&b.id), cost);
         assert_eq!(book.ledger.held(&a.id), 0);
     }
@@ -5684,7 +5608,7 @@ async fn an_asker_without_credits_is_declined_with_the_reason() {
     assert_eq!(asked.load(Ordering::SeqCst), 0);
 
     // 2. Credits only this node counts (the server judged no such scans).
-    grant_scans(&[&na], a.id, 4).await;
+    fund_listeners(&[&na], &[a.id]).await;
     let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
     assert!(
         why(&answers, "abuseipdb").contains("not covered here"),
@@ -5695,14 +5619,14 @@ async fn an_asker_without_credits_is_declined_with_the_reason() {
         "the receipt of nothing frees the credits at once",
         || async {
             let book = credits::book_fresh(&na.node).await.unwrap();
-            book.balance(&a.id) == minted(4, 4) && book.ledger.held(&a.id) == 0
+            book.balance(&a.id) == share(&[a.id], a.id) && book.ledger.held(&a.id) == 0
         },
     )
     .await;
 
     // 3. The server counts them too: served, and the share of the day is
     // used up by that one lookup.
-    grant_scans(&[&nb], a.id, 4).await;
+    fund_listeners(&[&nb], &[a.id]).await;
     let answers = peephole::intel::lookup::cluster(&rec(&na), &none, ip).await;
     assert_eq!(
         answers.iter().map(|x| x.resp.findings.len()).sum::<usize>(),
@@ -5733,7 +5657,7 @@ async fn a_lookup_answered_by_the_nodes_own_provider_is_free() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let _nb = boot(ib, &b, &[&a], DEFAULT).await;
     serves(&na, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na], a.id, 8).await;
+    fund_listeners(&[&na], &[a.id]).await;
     price::refresh(&na.node).await.unwrap();
     let own = na.lookup_providers().unwrap().clone();
     let answers =
@@ -5742,7 +5666,7 @@ async fn a_lookup_answered_by_the_nodes_own_provider_is_free() {
     assert_eq!(answers[0].resp.findings.len(), 1, "{answers:?}");
     assert_eq!(answers[0].charged_mc, 0);
     let book = credits::book_fresh(&na.node).await.unwrap();
-    assert_eq!(book.balance(&a.id), minted(8, 8));
+    assert_eq!(book.balance(&a.id), share(&[a.id], a.id));
     assert!(
         entries::since(&na.store.pool, 0).await.unwrap().is_empty(),
         "no offer, no receipt"
@@ -5759,7 +5683,7 @@ async fn a_payment_destroys_nothing() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     priced(&nb, "abuseipdb", 1).await;
     price_seen(&na, b.id, "abuseipdb").await;
     market_known(&nb, a.id).await;
@@ -5777,7 +5701,10 @@ async fn a_payment_destroys_nothing() {
     })
     .await;
     let book = credits::book_fresh(&na.node).await.unwrap();
-    assert_eq!(book.balance(&a.id) + book.balance(&b.id), minted(8, 8));
+    assert_eq!(
+        book.balance(&a.id) + book.balance(&b.id),
+        share(&[a.id], a.id)
+    );
 }
 
 /// Review focus: the server's price moved after the asker read it. The
@@ -5792,7 +5719,7 @@ async fn a_price_above_the_offer_is_declined_and_named() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     let cost = priced(&nb, "abuseipdb", 2).await;
     assert!(cost > 1);
     price_seen(&na, b.id, "abuseipdb").await;
@@ -5807,7 +5734,7 @@ async fn a_price_above_the_offer_is_declined_and_named() {
     assert_eq!((enough.findings.len(), enough.charged_mc), (1, cost));
     eventually("a paid once", || async {
         let book = credits::book_fresh(&na.node).await.unwrap();
-        book.balance(&a.id) == minted(8, 8) - cost as u64 && book.ledger.held(&a.id) == 0
+        book.balance(&a.id) == share(&[a.id], a.id) - cost as u64 && book.ledger.held(&a.id) == 0
     })
     .await;
     // An offer is served once: naming it again gets nothing.
@@ -5976,7 +5903,7 @@ async fn a_paid_lookup_of_a_recorded_address_is_kept_and_then_free_for_everyone(
     let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
     let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
     let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     priced(&nb, "abuseipdb", 1).await;
     price_seen(&na, b.id, "abuseipdb").await;
     market_known(&nb, a.id).await;
@@ -6061,7 +5988,7 @@ async fn a_paid_lookup_of_an_unrecorded_address_writes_nothing() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     priced(&nb, "abuseipdb", 1).await;
     price_seen(&na, b.id, "abuseipdb").await;
     market_known(&nb, a.id).await;
@@ -6130,9 +6057,20 @@ async fn a_lookup_draws_from_the_richest_sibling() {
     })
     .await;
     serves(&ns, &[("abuseipdb", Some(1000.0))], 0.2);
-    // a is rich, c is poorer, b holds nothing.
-    grant_scans(&[&na, &nb, &nc, &ns], a.id, 8).await;
-    grant_scans(&[&na, &nb, &nc, &ns], c.id, 1).await;
+    // a is rich, c is poorer (a sent it some), b holds nothing.
+    fund_listeners(&[&na, &nb, &nc, &ns], &[a.id]).await;
+    let pool = share(&[a.id], a.id);
+    let to_c = 100 * credits::CREDIT;
+    eventually("a holds its share of the pool", || async {
+        credits::book_fresh(&na.node).await.unwrap().balance(&a.id) == pool
+    })
+    .await;
+    credits::fleet::send(&na.node, c.id, to_c).await.unwrap();
+    eventually("s counts what a sent c", || async {
+        let book = credits::book_fresh(&ns.node).await.unwrap();
+        book.balance(&a.id) == pool - to_c && book.balance(&c.id) == to_c
+    })
+    .await;
     price::refresh(&ns.node).await.unwrap();
     let cost = price_seen(&nb, s.id, "abuseipdb").await as u64;
     market_known(&ns, b.id).await;
@@ -6140,9 +6078,7 @@ async fn a_lookup_draws_from_the_richest_sibling() {
     market_known(&na, b.id).await;
     market_known(&nb, c.id).await;
 
-    // The mint's rounding left a with a little more than 8/9.
-    let a_had = credits::book_fresh(&ns.node).await.unwrap().balance(&a.id);
-    assert!(a_had >= minted(8, 9));
+    let a_had = pool - to_c;
     // A stranger's draw is not answered, and moves nothing.
     let asked = nx
         .node
@@ -6158,7 +6094,7 @@ async fn a_lookup_draws_from_the_richest_sibling() {
     eventually("the fleet paid, from a's balance", || async {
         let book = credits::book_fresh(&ns.node).await.unwrap();
         book.balance(&a.id) == a_had - cost
-            && book.balance(&c.id) == minted(1, 9)
+            && book.balance(&c.id) == to_c
             && book.balance(&b.id) == 0
     })
     .await;
@@ -6192,7 +6128,7 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     )
     .await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     priced(&nb, "abuseipdb", 1).await;
     let cost = price_seen(&na, b.id, "abuseipdb").await;
     market_known(&nb, a.id).await;
@@ -6206,7 +6142,7 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
 
     let form = text(&admin, format!("{base}/admin/lookup?ip=198.51.100.77")).await;
     assert!(
-        form.contains("Balance") && form.contains(&peephole::credits::show(minted(8, 8))),
+        form.contains("Balance") && form.contains(&peephole::credits::show(share(&[a.id], a.id))),
         "{form}"
     );
     // The cheap tier runs by itself; the paid provider is offered, with
@@ -6312,7 +6248,7 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
 }
 
 /// The Credits page: where credits come from, what this node holds, what
-/// it earned and spent, what everyone holds, and what things cost here.
+/// it spent, what everyone holds, and what things cost here.
 #[tokio::test]
 async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
     use peephole::credits::{self, price};
@@ -6321,14 +6257,14 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     priced(&nb, "abuseipdb", 1).await;
     price::refresh(&na.node).await.unwrap();
     let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
     market_known(&nb, a.id).await;
     let none: peephole::intel::Providers = vec![];
     peephole::intel::lookup::cluster(&rec(&na), &none, "203.0.113.99".parse().unwrap()).await;
-    let held = minted(8, 8);
+    let held = share(&[a.id], a.id);
     eventually("the receipt is back", || async {
         let book = credits::book_fresh(&na.node).await.unwrap();
         book.balance(&a.id) == held - cost && book.ledger.held(&a.id) == 0
@@ -6342,13 +6278,11 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
         html.contains(&credits::show(held - cost)),
         "the balance: {html}"
     );
-    // Minted two days ago: it lasts the 4 days after today.
+    // The pool of two days ago: it lasts the 4 days after today.
     assert!(html.contains("in 4 days"), "{html}");
-    // Where it came from: the day's mint.
+    // Where it came from: the day's pool.
     assert!(html.contains("Where credits come from"));
-    assert!(html.contains(&credits::show(held)), "the mint: {html}");
-    // Earned: the granted scans.
-    assert!(html.contains("Earned") && html.contains("100.64."));
+    assert!(html.contains(&credits::show(held)), "the pool: {html}");
     // Spent: one lookup at b, charged in full to b.
     assert!(html.contains("Spent") && html.contains("node-bravo") && html.contains("charged"));
     assert!(html.contains("abuseipdb"));
@@ -6426,12 +6360,20 @@ async fn a_members_page_says_whether_it_earns_here() {
     let (ib, b) = new_node("node-bravo");
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let _nb = boot(ib, &b, &[&a], DEFAULT).await;
-    grant_scans(&[&na], b.id, 4).await;
+    fund_listeners(&[&na], &[b.id]).await;
+    eventually("a credits b's share of the pool", || async {
+        peephole::credits::book_fresh(&na.node)
+            .await
+            .unwrap()
+            .balance(&b.id)
+            == share(&[b.id], b.id)
+    })
+    .await;
     let (admin, base) = admin_on(&na).await;
     let page = format!("{base}/admin/cluster/node/{}", b.id);
     let html = text(&admin, page.clone()).await;
     assert!(
-        html.contains("Credits") && html.contains(&peephole::credits::show(minted(4, 4))),
+        html.contains("Credits") && html.contains(&peephole::credits::show(share(&[b.id], b.id))),
         "{html}"
     );
     assert!(
@@ -6529,15 +6471,15 @@ async fn the_overview_shows_the_clusters_credit_figures() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let _nb = boot(ib, &b, &[&a], DEFAULT).await;
     serves(&na, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na], a.id, 112).await;
+    fund_listeners(&[&na], &[a.id]).await;
     let t = price::refresh(&na.node).await.unwrap();
     let (admin, base) = admin_on(&na).await;
     let html = text(&admin, format!("{base}/admin")).await;
     assert!(html.contains("2 of 2 members earn here"), "{html}");
     let show = peephole::credits::show;
-    let mint = peephole::credits::mint::MINT_PER_DAY;
-    assert!(html.contains(&show(mint)), "credits in circulation");
-    assert!(html.contains(&show(mint / 7)), "earned a day");
+    let pool = peephole::credits::pool::POOL_PER_DAY;
+    assert!(html.contains(&show(pool)), "credits in circulation");
+    assert!(html.contains(&show(pool / 7)), "earned a day");
     assert!(html.contains("200"), "paid lookups a day");
     assert!(
         html.contains(&t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64))),
@@ -6557,8 +6499,8 @@ async fn a_declined_offer_frees_its_credits_for_the_next() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na, &nb], a.id, 1).await;
-    let held = minted(1, 1);
+    fund_listeners(&[&na, &nb], &[a.id]).await;
+    let held = share(&[a.id], a.id);
     let cost = priced(&nb, "abuseipdb", 2).await as u64;
     assert!(cost > 1 && cost < held / 2, "{cost}");
     price_seen(&na, b.id, "abuseipdb").await;
@@ -6587,7 +6529,7 @@ async fn an_offer_declined_for_the_askers_standing_is_released() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
-    grant_scans(&[&na, &nb], a.id, 1).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     let cost = priced(&nb, "abuseipdb", 1).await as u64;
     price_seen(&na, b.id, "abuseipdb").await;
     market_known(&nb, a.id).await;
@@ -6605,7 +6547,7 @@ async fn an_offer_declined_for_the_askers_standing_is_released() {
     );
     let book = credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.ledger.held(&a.id), 0);
-    assert_eq!(book.balance(&a.id), minted(1, 1));
+    assert_eq!(book.balance(&a.id), share(&[a.id], a.id));
 }
 
 /// `accept_offer` names its price when the offer is below it, and frees
@@ -6617,7 +6559,7 @@ async fn accept_offer_declines_a_too_low_offer_naming_the_price() {
     let (ib, b) = new_node("node-bravo");
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     market_known(&nb, a.id).await;
     let seq = pay::make_offer(&na.node, b.id, 10).await.unwrap();
     match pay::accept_offer(&nb.node, a.id, seq, 50, "test", pay::SERVE_MARGIN_MS).await {
@@ -6650,7 +6592,7 @@ async fn accept_offer_accepts_a_covering_offer() {
     let (ib, b) = new_node("node-bravo");
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     market_known(&nb, a.id).await;
     let seq = pay::make_offer(&na.node, b.id, 50).await.unwrap();
     let Ok(acc) = pay::accept_offer(&nb.node, a.id, seq, 50, "test", pay::SERVE_MARGIN_MS).await
@@ -6674,7 +6616,7 @@ async fn make_offer_writes_a_sealed_offer_to_the_server() {
     let (ib, b) = new_node("node-bravo");
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let _nb = boot(ib, &b, &[&a], DEFAULT).await;
-    grant_scans(&[&na], a.id, 8).await;
+    fund_listeners(&[&na], &[a.id]).await;
     let seq = pay::make_offer(&na.node, b.id, 50).await.unwrap();
     let e = entries::get(&na.store.pool, &a.id, seq)
         .await
@@ -6770,7 +6712,7 @@ async fn a_paid_probe_is_accepted_served_and_charged() {
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     let target = probe_target().await;
     probes(&nb, target);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     priced(&nb, price::PROBE, 1).await;
     let table = nb.node.price_table();
     let cost = nb.prober().unwrap().price(&table);
@@ -6820,7 +6762,7 @@ async fn a_paid_probe_is_accepted_served_and_charged() {
         });
     assert!(receipt, "b's receipt of its price");
     let book = credits::book_fresh(&na.node).await.unwrap();
-    assert_eq!(book.balance(&a.id), minted(8, 8) - cost as u64);
+    assert_eq!(book.balance(&a.id), share(&[a.id], a.id) - cost as u64);
     assert_eq!(book.ledger.held(&a.id), 0);
 }
 
@@ -6833,7 +6775,7 @@ async fn a_paid_probe_by_an_outbound_only_scanner() {
     let (a, b, na, nb) = outbound_pair().await;
     let target = probe_target().await;
     probes(&nb, target);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     priced(&nb, price::PROBE, 1).await;
     let table = nb.node.price_table();
     let cost = nb.prober().unwrap().price(&table);
@@ -6875,7 +6817,7 @@ async fn a_paid_probe_by_an_outbound_only_scanner() {
     })
     .await;
     let book = credits::book_fresh(&na.node).await.unwrap();
-    assert_eq!(book.balance(&a.id), minted(8, 8) - cost as u64);
+    assert_eq!(book.balance(&a.id), share(&[a.id], a.id) - cost as u64);
     assert_eq!(book.ledger.held(&a.id), 0);
 }
 
@@ -6890,7 +6832,7 @@ async fn a_probe_of_an_unknown_offer_is_declined_with_a_receipt_of_nothing() {
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     probes(&nb, probe_target().await);
-    grant_scans(&[&na, &nb], a.id, 8).await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
     market_known(&nb, a.id).await;
     let resp: ProbeResp = na
         .call(
@@ -6912,5 +6854,5 @@ async fn a_probe_of_an_unknown_offer_is_declined_with_a_receipt_of_nothing() {
     }
     let book = credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.ledger.held(&a.id), 0);
-    assert_eq!(book.balance(&a.id), minted(8, 8));
+    assert_eq!(book.balance(&a.id), share(&[a.id], a.id));
 }

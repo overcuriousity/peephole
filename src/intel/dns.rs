@@ -273,6 +273,7 @@ pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> 
                 } else {
                     vec![]
                 },
+                economy: crate::cluster::record::ECONOMY,
             };
             match crate::cluster::repl::append(node, &[receipt]).await {
                 Ok(_) => charged,

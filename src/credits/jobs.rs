@@ -198,6 +198,7 @@ pub async fn fund(
         parts: parts.clone(),
         seal,
         job,
+        economy: crate::cluster::record::ECONOMY,
     })
     .await
     {
@@ -225,6 +226,7 @@ pub async fn settle(node: &Arc<Node>, arbiter: NodeId, offer_seq: u64, charged_m
         offer_seq,
         charged_mc,
         answered: vec![price::SCAN.into()],
+        economy: crate::cluster::record::ECONOMY,
     };
     if let Err(e) = repl::append(node, &[receipt]).await {
         tracing::warn!(?e, "scan receipt not written");

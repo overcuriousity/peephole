@@ -521,6 +521,7 @@ mod tests {
             offer_seq: seq,
             charged_mc: 0,
             answered: vec![],
+            economy: crate::cluster::record::ECONOMY,
         };
         WireEntry::sign(id, seq, (1_000 + seq) << 16, &r).unwrap()
     }
@@ -773,6 +774,7 @@ mod tests {
                 offer_seq: 1,
                 charged_mc: charged,
                 answered: vec![],
+                economy: crate::cluster::record::ECONOMY,
             };
             WireEntry::sign(id, seq, 5 << 16, &r).unwrap()
         };

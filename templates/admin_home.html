@@ -31,7 +31,6 @@
   </div>
   <dl class="stat-row">
     <div><dt>Rule sets</dt><dd><a href="/admin/cluster">{{ c.rule_sets }}</a></dd></div>
-    <div><dt>Paid scans a day</dt><dd><a href="/admin/scans?status=done#history">{{ c.paid_scans.0 }} · {{ c.paid_scans.1 }}</a> <span class="muted">levels 1–2 · 3–4</span></dd></div>
     <div><dt>Scan price</dt><dd><a href="/admin/cluster/credits">{{ c.scan }}</a></dd></div>
     {% if let Some((lo, hi)) = c.price_range %}<div><dt>Keyed lookups</dt><dd><a href="/admin/cluster/credits">{{ lo }}–{{ hi }}</a></dd></div>{% endif %}
     <div><dt>Lookup capacity</dt><dd><a href="/admin/lookup">{{ c.lookups.0 }}</a> <span class="muted">a day · {{ c.lookups.1 }} today</span></dd></div>

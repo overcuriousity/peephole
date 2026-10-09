@@ -4,7 +4,6 @@
 //! showed two histories earns nothing at all. The gates are evaluated at
 //! each recomputation, not stored: a member that agrees again (after an
 //! upgrade, typically) earns again.
-use super::earn::Gates;
 use crate::classify::stored::{Agreement, agreement};
 use crate::cluster::identity::NodeId;
 use crate::cluster::{Node, members};
@@ -198,19 +197,6 @@ pub async fn standings(node: &Node) -> Result<Standings> {
     Ok(out)
 }
 
-/// The gates as the paying walk takes them.
-pub fn to_gates(s: &Standings) -> Gates {
-    let mut g = Gates::default();
-    for (id, st) in s {
-        if !st.earns() {
-            g.no_shares.insert(*id, st.reasons().join("; "));
-        } else if !st.earns_as_scanner() {
-            g.no_scanner_share.insert(*id, st.reasons().join("; "));
-        }
-    }
-    g
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,18 +245,5 @@ mod tests {
                 "showed two histories (at entry 7 of its log)"
             ]
         );
-
-        let (x, y, z) = (NodeId([1; 32]), NodeId([2; 32]), NodeId([3; 32]));
-        let all: Standings = [(x, rules), (y, audits), (z, fine)].into();
-        let g = to_gates(&all);
-        assert_eq!(
-            g.no_shares.get(&x).map(String::as_str),
-            Some("rules: disagree on 12% of 500")
-        );
-        assert_eq!(
-            g.no_scanner_share.get(&y).map(String::as_str),
-            Some("audits: 3 of 5 differ")
-        );
-        assert!(!g.no_shares.contains_key(&z) && !g.no_scanner_share.contains_key(&z));
     }
 }

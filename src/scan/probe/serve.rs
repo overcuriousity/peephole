@@ -321,6 +321,7 @@ impl Prober {
                     offer_seq,
                     charged_mc,
                     answered: vec![price::PROBE.into()],
+                    economy: crate::cluster::record::ECONOMY,
                 });
             }
             match repl::append(&node, &records).await {

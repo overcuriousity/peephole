@@ -102,6 +102,9 @@ async fn pull(
         req.since_hlc,
         req.max_entries.clamp(1, 5 * BATCH_ENTRIES),
         req.max_bytes.clamp(1, 4 * BATCH_BYTES),
+        node.members()
+            .get(&peer)
+            .is_some_and(|m| m.proto_max < proto::ECONOMY_PROTO),
     )
     .await
     {

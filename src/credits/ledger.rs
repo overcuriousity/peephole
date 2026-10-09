@@ -1,24 +1,40 @@
-//! The ledger: every balance, from what scans earned and what the log
-//! says about payments. A pure function of its input, so every node that
-//! holds the same entries and judges the same scans arrives at the same
-//! balances, in whatever order the entries reached it.
+//! The ledger: every balance, from the pool credited to the verified
+//! listeners (`credits::pool`) and what the log says about payments. A
+//! pure function of its input, so every node that holds the same entries
+//! and counts the same reach reports arrives at the same balances, in
+//! whatever order the entries reached it.
 //!
-//! A credit belongs to a lot: a node and the UTC day it was earned. It
-//! keeps its lot when it changes hands and is gone 7 days after the scan
-//! that created it.
+//! A credit belongs to a lot: a node and the UTC day of the pool it came
+//! from. It keeps its lot when it changes hands and is gone 7 days after
+//! that day.
 use super::entries::{Entry, Kind, parts_ok};
 use super::{DAY_MS, LOT_DAYS, Mc, OFFER_TTL_MS, day_of};
 use crate::cluster::hlc::physical_ms;
 use crate::cluster::identity::NodeId;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// Credits a completed scan gave a node (`earn::pay` decides how many).
+/// A pool share credited to a node; its HLC dates the lot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Earned {
     pub node: NodeId,
-    /// The HLC of the scan result: it dates the lot.
+    /// The last instant of the pool's day (`pool::end_of`).
     pub hlc: u64,
     pub mc: Mc,
+}
+
+/// Who this node does not pay in full: the gates, as the ledger applies
+/// them.
+#[derive(Debug, Clone, Default)]
+pub struct Gates {
+    /// Blocked here, or shown to have two histories: hold nothing, and
+    /// their entries move nothing.
+    pub left_out: HashSet<NodeId>,
+    /// Members that do not earn here (failing the rules gate, or left
+    /// out): their receipts move nothing.
+    pub no_sales: HashSet<NodeId>,
+    /// Scanners failing the audit gates here: their receipts for scan jobs
+    /// move nothing.
+    pub no_scan_sales: HashSet<NodeId>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -228,7 +244,7 @@ impl Step<'_> {
 
 struct Walk<'a> {
     l: Ledger,
-    left_out: &'a HashSet<NodeId>,
+    gates: &'a Gates,
     /// The HLC the last 7 days start at.
     week_from: u64,
 }
@@ -295,6 +311,9 @@ impl Walk<'_> {
         charged: Mc,
         answered: &[String],
     ) {
+        if self.gates.no_sales.contains(&e.origin) {
+            return;
+        }
         let Some(i) = self.l.offers.iter().position(|o| {
             o.payer == payer
                 && o.seq == offer_seq
@@ -305,6 +324,10 @@ impl Walk<'_> {
         }) else {
             return;
         };
+        // A scanner failing the audit gates here is not paid for scans.
+        if self.l.offers[i].job.is_some() && self.gates.no_scan_sales.contains(&e.origin) {
+            return;
+        }
         let held = std::mem::take(&mut self.l.offers[i].held);
         let mut left = charged.min(held.iter().map(|(_, mc)| mc).sum());
         let paid = left;
@@ -342,16 +365,12 @@ impl Walk<'_> {
     }
 }
 
-/// Walk what was earned and every payment in order, and return where
-/// every credit is at `now_ms`. Nodes in `left_out` (blocked here, or
-/// shown to have two histories) earn nothing and their entries move
-/// nothing; what others sent them is lost.
-pub fn run(
-    earned: &[Earned],
-    entries: &[Entry],
-    left_out: &HashSet<NodeId>,
-    now_ms: u64,
-) -> Ledger {
+/// Walk the pool shares and every payment in order, and return where
+/// every credit is at `now_ms`. Members in `gates.left_out` hold nothing
+/// and their entries move nothing (what others sent them is lost); the
+/// receipts of those in `no_sales`, and the scan receipts of those in
+/// `no_scan_sales`, move nothing (their offers lapse back).
+pub fn run(earned: &[Earned], entries: &[Entry], gates: &Gates, now_ms: u64) -> Ledger {
     let mut steps: Vec<Step> = earned
         .iter()
         .map(Step::Earn)
@@ -363,14 +382,14 @@ pub fn run(
             today: (now_ms / DAY_MS) as u32,
             ..Default::default()
         },
-        left_out,
+        gates,
         week_from: now_ms.saturating_sub(7 * DAY_MS) << 16,
     };
     for step in steps {
         match step {
             Step::Earn(e) => {
                 w.lapse(physical_ms(e.hlc));
-                if w.left_out.contains(&e.node) {
+                if w.gates.left_out.contains(&e.node) {
                     continue;
                 }
                 *w.lot(e.node, day_of(e.hlc)) += e.mc;
@@ -378,7 +397,7 @@ pub fn run(
             }
             Step::Entry(e) => {
                 w.lapse(physical_ms(e.hlc));
-                if w.left_out.contains(&e.origin) {
+                if w.gates.left_out.contains(&e.origin) {
                     continue;
                 }
                 match &e.kind {
@@ -404,7 +423,8 @@ pub fn run(
     }
     w.lapse(now_ms);
     // A node left out shows no balance, whatever was sent to it.
-    w.l.lots.retain(|(node, _), _| !left_out.contains(node));
+    w.l.lots
+        .retain(|(node, _), _| !gates.left_out.contains(node));
     w.l
 }
 
@@ -499,7 +519,7 @@ mod tests {
     }
 
     fn ledger(earned: &[Earned], entries: &[Entry], now_ms: u64) -> Ledger {
-        run(earned, entries, &HashSet::new(), now_ms)
+        run(earned, entries, &Gates::default(), now_ms)
     }
 
     /// The walk covers 8 days; the week's tallies count only the last 7.
@@ -811,7 +831,10 @@ mod tests {
             offer(1, 5, at(DAY, 10), 2, &[(DAY, 300)]),
             receipt(2, 2, at(DAY, 11), 1, 5, 300),
         ];
-        let out: HashSet<NodeId> = [id(2)].into();
+        let out = Gates {
+            left_out: [id(2)].into(),
+            ..Default::default()
+        };
         let l = run(&earned, &entries, &out, now(DAY, 30));
         assert_eq!(l.balance(&id(2)), 0, "blocked or forked: nothing");
         assert_eq!(l.balance(&id(3)), 0, "its transfers move nothing");
@@ -822,6 +845,51 @@ mod tests {
         let sent = [transfer(1, 6, at(DAY, 12), 2, &[(DAY, 100)])];
         let l = run(&earned, &sent, &out, now(DAY, 30));
         assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (900, 0));
+    }
+
+    #[test]
+    fn the_receipts_of_a_member_that_does_not_earn_here_move_nothing() {
+        // 1 pays 2 for a lookup; 2 fails the rules gate here.
+        let earned = [earn(1, DAY, 0, 1000)];
+        let entries = [
+            offer(1, 1, at(DAY, 1), 2, &[(DAY, 300)]),
+            receipt(2, 1, at(DAY, 2), 1, 1, 300),
+        ];
+        let gates = Gates {
+            no_sales: [id(2)].into(),
+            ..Default::default()
+        };
+        let l = run(&earned, &entries, &gates, now(DAY, 3));
+        assert_eq!(
+            (l.balance(&id(1)), l.balance(&id(2))),
+            (700, 0),
+            "held, not paid"
+        );
+        let l = run(&earned, &entries, &gates, now(DAY, 20));
+        assert_eq!(l.balance(&id(1)), 1000, "lapsed back to the payer");
+        assert_eq!(l.offers[0].state, OfferState::Lapsed);
+    }
+
+    #[test]
+    fn a_scanner_failing_the_audit_gates_is_not_paid_for_scans_but_for_lookups() {
+        let earned = [earn(1, DAY, 0, 1000)];
+        let entries = [
+            job_offer(1, 1, at(DAY, 1), 2, &[(DAY, 100)]),
+            receipt(2, 1, at(DAY, 2), 1, 1, 100),
+            offer(1, 2, at(DAY, 3), 2, &[(DAY, 50)]),
+            receipt(2, 2, at(DAY, 4), 1, 2, 50),
+        ];
+        let gates = Gates {
+            no_scan_sales: [id(2)].into(),
+            ..Default::default()
+        };
+        let l = run(&earned, &entries, &gates, now(DAY, 5));
+        assert_eq!(l.balance(&id(2)), 50, "the lookup only");
+        assert_eq!(
+            l.offers[0].state,
+            OfferState::Open,
+            "the scan offer waits to lapse"
+        );
     }
 
     /// Review focus: entries reach nodes in different orders.

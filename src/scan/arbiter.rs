@@ -1143,21 +1143,20 @@ mod tests {
         (node, arbiter, store, tx)
     }
 
-    /// Credits for `node`: the whole mint of a day two days back.
+    /// Credits for `node`: the whole pool of the day two days back.
     async fn give_credits(store: &crate::store::Store, node: NodeId) {
-        use crate::credits::DAY_MS;
-        let day = crate::cluster::hlc::wall_ms() / DAY_MS - 2;
+        let day = (crate::cluster::hlc::wall_ms() / crate::credits::DAY_MS) as u32 - 2;
         sqlx::query(
-            "INSERT INTO credit_scans
-               (scan_uid, job_uid, ip, scanner, trap, hlc, level, job_level, args_ok, judged_at)
-             VALUES ('given', 'given-job', '100.64.0.1', ?, ?, ?, 1, 1, 1, datetime('now'))",
+            "UPDATE members SET address = '198.51.100.1:7443',
+               roles_json = '[\"listener\",\"scanner\"]' WHERE id = ?",
         )
         .bind(&node.0[..])
-        .bind(&[0xEE; 32][..])
-        .bind(((day * DAY_MS + 3_600_000) << 16) as i64)
         .execute(&store.pool)
         .await
         .unwrap();
+        crate::credits::pool::testing::report_all_day(&store.pool, day, &[node])
+            .await
+            .unwrap();
     }
 
     /// This node as a scanner selling at `sell_mc`.
@@ -1630,7 +1629,7 @@ mod tests {
         )
         .bind(&id.0[..])
         .bind(format!("s-{price_mc}"))
-        .bind(crate::cluster::rpc::proto::SCAN_PRICE_PROTO as i64)
+        .bind(crate::cluster::rpc::proto::ECONOMY_PROTO as i64)
         .bind(now as i64)
         .bind(role)
         .execute(&node.store.pool)
