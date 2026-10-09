@@ -136,6 +136,9 @@ echo "== fresh install"
 # A preset PEEPHOLE_TRUSTED_PROXIES no longer means remote: PEEPHOLE_FRONT says so.
 PEEPHOLE_FRONT=remote bash install.sh > /tmp/fresh.log 2>&1 || { cat /tmp/fresh.log; exit 1; }
 test -x /usr/local/bin/peephole
+# The local test release has no attestation: that is said, with or without gh.
+if command -v gh >/dev/null 2>&1; then expect="could not verify the provenance"; else expect="provenance is not verified"; fi
+grep -q "$expect" /tmp/fresh.log
 test -f /etc/peephole/config.toml
 # The signature rules are built into the binary: none on disk, none shipped.
 test ! -e /etc/peephole/rules

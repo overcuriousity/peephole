@@ -7,7 +7,7 @@
 # Re-running upgrades an existing installation. Environment overrides:
 #   PEEPHOLE_VERSION   release tag to install (e.g. v0.1.0); default: the rolling "latest" build of master
 #   PEEPHOLE_VERIFY=1|0  1: require a verified GitHub build provenance attestation (needs the gh CLI);
-#                      0: skip it; unset: verify when gh is installed, warn if that fails
+#                      0: skip it; unset: verify when gh is installed, warn if that fails or gh is missing
 #   MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY, PEEPHOLE_TRUSTED_PROXIES  (first install)
 #   PEEPHOLE_DOMAIN    the admin site's host name (first install); a scheme, a path and a
 #                      trailing dot are stripped, upper case is lowered
@@ -832,6 +832,10 @@ if [ "$verify" != 0 ]; then
         fi
     elif [ "$verify" = 1 ]; then
         die "PEEPHOLE_VERIFY=1 needs the GitHub CLI (gh) to verify the provenance attestation"
+    else
+        # The checksum comes from the same server as the tarball: it shows
+        # the download is intact, not who built it.
+        warn "the build provenance is not verified (the GitHub CLI, gh, is not installed); relying on the checksum from the same server. Install gh and set PEEPHOLE_VERIFY=1 to require it, or PEEPHOLE_VERIFY=0 to skip it."
     fi
 fi
 

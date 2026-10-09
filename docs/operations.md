@@ -14,7 +14,8 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
 - Downloads the build for the machine (x86_64 or aarch64) and verifies its
   checksum. With the GitHub CLI (`gh`) installed it also verifies the build's
   provenance attestation (`PEEPHOLE_VERIFY=1` makes that required, `0` skips
-  it), and prints the commit the binary was built from.
+  it); without `gh` it warns that the provenance is not verified. It prints
+  the commit the binary was built from.
 - Installs the binary to `/usr/local/bin/peephole`; the signature rules are
   built into it.
 - On a first install, asks (an upgrade asks nothing), in this order:

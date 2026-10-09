@@ -92,6 +92,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   scheduler, enrichment, the cluster's loops, …) stopped silently while the
   node went on reporting healthy. Such a panic now stops peephole with an
   error, and systemd starts it again.
+- The installer warns when it cannot verify the build provenance because
+  the GitHub CLI is missing, instead of relying on the checksum (from the
+  same server) without a word, and says how to require or skip the check.
 
 ## [0.10.0] - 2026-10-09
 
