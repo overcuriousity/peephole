@@ -1524,7 +1524,10 @@ wait_healthy() {
 
 # Put back what this run changed: binary, unit and, if the new version
 # migrated it, the database. The rules of an older version stay in
-# ${CONFIG_DIR}/rules (never touched), so it finds them again.
+# ${CONFIG_DIR}/rules (never touched), so it finds them again. A cluster
+# node keeps its database: the backup would rewind its signed log, and the
+# entries it signs next would fork from those its peers hold (the older
+# version reads a newer schema all the same).
 rollback() {
     systemctl stop peephole || true
     mv -f "${INSTALL_BIN}.prev" "$INSTALL_BIN"
@@ -1534,9 +1537,13 @@ rollback() {
     fi
     if [ -e "${backup}/unit.sha256" ]; then cp -p "${backup}/unit.sha256" "$UNIT_MANIFEST"; else rm -f "$UNIT_MANIFEST"; fi
     if [ -n "$DB_BACKUP" ] && [ "$(schema_version "$DB_PATH")" != "$DB_SCHEMA" ]; then
-        warn "the new version changed the database schema; restoring ${DB_BACKUP} (requests recorded since the backup are lost)"
-        rm -f "${DB_PATH}-wal" "${DB_PATH}-shm"
-        install -m 0600 "$DB_BACKUP" "$DB_PATH"
+        if grep -q '^\[cluster\]' "$CONFIG_FILE"; then
+            warn "the new version changed the database schema; keeping it, since restoring would rewind this cluster node's log (the backup stays in ${DB_BACKUP})"
+        else
+            warn "the new version changed the database schema; restoring ${DB_BACKUP} (requests recorded since the backup are lost)"
+            rm -f "${DB_PATH}-wal" "${DB_PATH}-shm"
+            install -m 0600 "$DB_BACKUP" "$DB_PATH"
+        fi
     fi
 }
 

@@ -57,6 +57,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Cluster: a sync long-poll listing more than 10000 origins is refused,
   and the rest are looked up in constant time on each change while it is
   held open, instead of searched through.
+- A failed upgrade no longer restores the database of a node with a
+  `[cluster]` section: the backup rewound the node's signed log, and the
+  entries it signed next forked from its peers' copies, which marked it
+  forked for good. The installer keeps the migrated database (the older
+  version reads it) and says where the backup is.
 
 ## [0.10.0] - 2026-10-09
 

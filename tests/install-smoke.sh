@@ -221,7 +221,7 @@ if grep -q 'no longer used' /tmp/unit.log; then echo "rules notice repeated"; ex
 test -d /etc/peephole/rules
 [ "$(find /var/lib/peephole -name 'backup-*.db' | wc -l)" = 2 ]
 
-echo "== a new version that does not start is rolled back: binary, unit and database"
+echo "== a new version that does not start is rolled back: binary and unit; a cluster node keeps its database"
 rm -f /etc/systemd/system/peephole.service.new
 cp -p /etc/systemd/system/peephole.service /tmp/unit.before
 echo '# broken release' >> "/tmp/$ASSET/deploy/peephole.service"
@@ -230,12 +230,26 @@ touch /tmp/fail-start
 if PEEPHOLE_FORCE=1 bash install.sh > /tmp/rollback.log 2>&1; then echo "expected failure"; cat /tmp/rollback.log; exit 1; fi
 grep -q 'rolled back' /tmp/rollback.log
 grep -q 'running again' /tmp/rollback.log
-grep -q 'restoring /var/lib/peephole/backup-' /tmp/rollback.log
+grep -q 'keeping it, since restoring would rewind' /tmp/rollback.log
+if grep -q 'restoring /var/lib/peephole/backup-' /tmp/rollback.log; then echo "cluster node's database restored"; exit 1; fi
 cmp /tmp/unit.before /etc/systemd/system/peephole.service
 test ! -e /etc/systemd/system/peephole.service.new
 test ! -e /usr/local/bin/peephole.prev
-[ "$(sqlite3 /var/lib/peephole/peephole.db 'PRAGMA user_version')" = 5 ]
+[ "$(sqlite3 /var/lib/peephole/peephole.db 'PRAGMA user_version')" = 999 ]
+kept="$(sed -n 's/.*the backup stays in \(\/var\/lib\/peephole\/backup-[^)]*\.db\)).*/\1/p' /tmp/rollback.log)"
+[ "$(sqlite3 "$kept" 'PRAGMA user_version')" = 5 ]
 /usr/local/bin/peephole --version
+
+echo "== a node without a [cluster] section gets its database back"
+cp -p /etc/peephole/config.toml /tmp/config.cluster
+sed -i '/^\[cluster\]/,$d' /etc/peephole/config.toml
+sqlite3 /var/lib/peephole/peephole.db 'PRAGMA user_version = 5'
+touch /tmp/fail-start
+if PEEPHOLE_FORCE=1 bash install.sh > /tmp/rollback.log 2>&1; then echo "expected failure"; cat /tmp/rollback.log; exit 1; fi
+grep -q 'running again' /tmp/rollback.log
+grep -q 'restoring /var/lib/peephole/backup-' /tmp/rollback.log
+[ "$(sqlite3 /var/lib/peephole/peephole.db 'PRAGMA user_version')" = 5 ]
+cp -p /tmp/config.cluster /etc/peephole/config.toml
 
 echo "== forced re-run with wizard variables set leaves config and nginx example alone"
 md5sum /etc/peephole/config.toml /etc/peephole/nginx.example.conf > /tmp/before.md5

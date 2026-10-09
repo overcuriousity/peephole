@@ -248,7 +248,10 @@ existing config with the new binary, backs up the database
 waits for `/healthz` (or for systemd to report the service up). If the new
 version does not come up, it rolls back the binary, the unit and — when the
 new version changed its schema — the database, then checks the old version
-is running again.
+is running again. A node with a `[cluster]` section keeps its database (the
+older version reads the newer schema): the backup would rewind its signed
+log, and what it signed next would contradict what its peers already hold,
+which marks it forked. The installer names the backup it kept instead.
 
 0.1.0 starts the schema afresh: it refuses a database written by an earlier
 (pre-release) build, and says so in the journal. Stop peephole, move the
