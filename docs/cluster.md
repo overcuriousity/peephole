@@ -68,7 +68,11 @@ every member's signed admission and description, and every sync batch
 sends the membership entries ahead of the data. Each is checked against
 its signer, who must be trusted already, so an inviter can leave members
 out but cannot add anyone; whatever it leaves out arrives from the other
-members.
+members. An entry sent ahead must also keep its signer's order: it lies
+past the signer's log held here and is dated after its latest entry held,
+after the admissions of it taken ahead before, and after the entries of
+it before it in the same list. Otherwise it waits for the log in front
+of it.
 
 ## How trust works
 

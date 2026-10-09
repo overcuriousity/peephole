@@ -125,16 +125,7 @@ async fn push(
     Extension(Peer(peer)): Extension<Peer>,
     Cbor(batch): Cbor<Batch>,
 ) -> Response {
-    // Floors and bounds: at most one per origin asked for in an honest batch.
-    if [
-        batch.entries.len(),
-        batch.proofs.len(),
-        batch.floors.len(),
-        batch.bounds.len(),
-    ]
-    .iter()
-    .any(|n| *n > 5 * BATCH_ENTRIES)
-    {
+    if batch.too_large() {
         return (StatusCode::PAYLOAD_TOO_LARGE, "too many entries").into_response();
     }
     let kinds = super::traffic::Kinds::of(&batch.entries);
@@ -304,6 +295,9 @@ async fn inbox(State(node): State<Arc<Node>>, Extension(Peer(peer)): Extension<P
 
 /// Long-poll: answer as soon as we hold something the caller lacks.
 async fn wait(State(node): State<Arc<Node>>, Cbor(req): Cbor<WaitReq>) -> Response {
+    let Some(req) = super::history::Waiting::new(req) else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "too many origins").into_response();
+    };
     let mut changes = node.subscribe_changes();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(WAIT_SECS);
     loop {

@@ -33,6 +33,30 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   error left the key working while the page looked as if it was gone.
   The keys page now says whether the key was deleted, was the last way
   in, was not found, or could not be deleted.
+- Cluster: membership entries sent ahead of the log must keep their
+  signer's order (past its log held, dated after its latest entry and
+  its earlier admissions). Before, a member could sign admissions at
+  made-up sequences dated back over weeks and push them, admitting far
+  more than 20 nodes a day on every node it reached.
+- Cluster: the membership sent ahead in a push, a pull reply or a join
+  reply is taken up to 2000 entries, as many as an honest one carries (a
+  longer push is refused), and each is looked at twice at most. Before, a
+  peer could send any number and hold the database's write lock for a
+  time growing with its square.
+- Cluster: a push to a peer goes on only while the peer takes entries of
+  the origins pushed, for 64 batches at most per round. Before, a member
+  answering each push with a head for a made-up origin kept the push
+  going forever and held one of the 8 sync slots.
+- Cluster: directed messages are told apart by sender and id, ids longer
+  than 64 bytes are refused, a sender's ids are remembered up to 16384,
+  and at most 256 requests are handled at once. Before, a member could
+  fill a node's memory with made-up ids or handlers left waiting.
+- Cluster: an outbound-only node counts a relay lease for an hour at
+  most, whatever end the relay answers, so a relay claiming a lease
+  without end is still renewed or replaced in time.
+- Cluster: a sync long-poll listing more than 10000 origins is refused,
+  and the rest are looked up in constant time on each change while it is
+  held open, instead of searched through.
 
 ## [0.10.0] - 2026-10-09
 

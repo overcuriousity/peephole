@@ -71,6 +71,22 @@ pub struct Batch {
     pub membership: Vec<WireEntry>,
 }
 
+impl Batch {
+    /// Longer than any honest batch (floors and bounds: at most one per
+    /// origin asked for); a pushed one like that is refused.
+    pub fn too_large(&self) -> bool {
+        [
+            self.entries.len(),
+            self.proofs.len(),
+            self.floors.len(),
+            self.bounds.len(),
+        ]
+        .iter()
+        .any(|n| *n > 5 * BATCH_ENTRIES)
+            || self.membership.len() > repl::MEMBERSHIP_AHEAD
+    }
+}
+
 impl From<Vec<WireEntry>> for Batch {
     fn from(entries: Vec<WireEntry>) -> Self {
         Self {
@@ -262,6 +278,23 @@ fn note_own_acked(node: &Node, theirs: &Heads) {
     );
 }
 
+/// Most batches pushed to a peer in one round (the next round goes on);
+/// a peer that takes an entry at a time cannot hold a sync slot for long.
+const PUSH_ROUNDS: usize = 64;
+
+/// The new heads of the origins pushed (`wants`: origin, their head)
+/// that a peer answering `after` took entries of, or None if it took none.
+/// Its heads of other origins say nothing about the push: a peer making
+/// them up must not keep it going.
+fn taken_heads(wants: &[(NodeId, u64)], after: &Heads) -> Option<Heads> {
+    let after = repl::head_map(after);
+    let taken: Heads = wants
+        .iter()
+        .filter_map(|(o, t)| after.get(o).filter(|s| *s > t).map(|s| (*o, *s)))
+        .collect();
+    (!taken.is_empty()).then_some(taken)
+}
+
 /// A random duration below `max`.
 fn jitter(max: Duration) -> Duration {
     let mut b = [0u8; 4];
@@ -382,7 +415,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         history::floors(&mut conn).await?
     };
     let peer_windowed = node.peer_since_hlc(&peer) > 0;
-    loop {
+    for _ in 0..PUSH_ROUNDS {
         let ours = repl::heads(&node.store).await?;
         let wants: Vec<_> = ours
             .iter()
@@ -408,25 +441,78 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             break;
         }
         let after: Heads = node.call(peer, addr, "/rpc/v1/push", &batch).await?;
-        if !repl::ahead_of_map(&after, &theirs) {
+        let Some(took) = taken_heads(&wants, &after) else {
             break; // they accepted nothing (e.g. a gap on their side)
-        }
+        };
         note_own_acked(node, &after);
-        let after = repl::head_map(&after);
+        theirs.extend(took);
         // What they took: entries up to their new head of each origin.
         let taken = super::traffic::Kinds::of(
             batch
                 .entries
                 .iter()
-                .filter(|e| e.seq <= after.get(&e.origin).copied().unwrap_or(0)),
+                .filter(|e| e.seq <= theirs.get(&e.origin).copied().unwrap_or(0)),
         );
         pushed += taken.total() as usize;
         node.traffic.sent(peer, &name, &taken);
-        theirs = after;
     }
     node.record_status(peer, &name, Ok(None)).await;
     if pulled + pushed > 0 {
         debug!(peer = %name, pulled, pushed, ms = started.elapsed().as_millis() as u64, "sync round");
     }
     Ok(stuck)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::identity::Identity;
+    use crate::cluster::record::{MemberInfo, Record};
+
+    /// A pushed batch is refused when any of its lists is longer than an
+    /// honest one, the membership sent ahead included.
+    #[test]
+    fn a_batch_longer_than_an_honest_one_is_too_large() {
+        let id = Identity::generate().unwrap();
+        let e = WireEntry::sign(
+            &id,
+            1,
+            1 << 16,
+            &Record::MemberUpdate(MemberInfo {
+                id: id.id,
+                name: "m".into(),
+                address: None,
+                roles: vec![],
+                proto_min: 1,
+                proto_max: 1,
+                remote_config: false,
+            }),
+        )
+        .unwrap();
+        let fine = Batch {
+            entries: vec![e.clone(); 5 * BATCH_ENTRIES],
+            membership: vec![e.clone(); repl::MEMBERSHIP_AHEAD],
+            ..Default::default()
+        };
+        assert!(!fine.too_large());
+        let long = Batch {
+            membership: vec![e; repl::MEMBERSHIP_AHEAD + 1],
+            ..Default::default()
+        };
+        assert!(long.too_large());
+    }
+
+    /// A push goes on only while the peer takes entries of the origins
+    /// pushed: heads it adds for made-up origins do not count.
+    #[test]
+    fn a_push_goes_on_only_for_what_the_peer_took() {
+        let (a, b, junk) = (NodeId([1; 32]), NodeId([2; 32]), NodeId([9; 32]));
+        let wants = vec![(a, 3), (b, 0)];
+        assert_eq!(taken_heads(&wants, &vec![(a, 3), (junk, 1)]), None);
+        assert_eq!(taken_heads(&wants, &vec![(a, 2), (b, 0)]), None);
+        assert_eq!(
+            taken_heads(&wants, &vec![(a, 3), (b, 7), (junk, 1)]),
+            Some(vec![(b, 7)])
+        );
+    }
 }

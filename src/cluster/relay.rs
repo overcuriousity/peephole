@@ -102,8 +102,17 @@ impl Leased {
             .collect()
     }
 
-    pub fn set(&self, relay: NodeId, until_ms: u64) {
-        self.0.lock().unwrap().insert(relay, until_ms);
+    /// `relay` leased this node until `until_ms`, but no longer than an
+    /// hour from the end of the lease held there, or from now (what a
+    /// relay grants): an answer dated further would never be renewed.
+    pub fn set(&self, relay: NodeId, until_ms: u64, now_ms: u64) {
+        let mut l = self.0.lock().unwrap();
+        let from = l
+            .get(&relay)
+            .copied()
+            .filter(|u| *u > now_ms)
+            .unwrap_or(now_ms);
+        l.insert(relay, until_ms.min(from.saturating_add(LEASE_MS)));
     }
 
     /// Drop `relay`, which no longer holds this node's lease (it
@@ -265,7 +274,7 @@ pub async fn lease_once(node: &Arc<Node>) -> usize {
             break;
         }
         if let Some(until) = ask(node, relay, p).await {
-            node.leased.set(relay, until);
+            node.leased.set(relay, until, super::hlc::wall_ms());
             took += 1;
         }
     }
@@ -386,12 +395,32 @@ mod tests {
     fn a_lessee_renews_what_ends_within_five_minutes() {
         let l = Leased::default();
         let t = 1_000_000_000u64;
-        l.set(id(1), t + LEASE_MS);
-        l.set(id(2), t + RENEW_BEFORE_MS - 1);
+        l.set(id(1), t + LEASE_MS, t);
+        l.set(id(2), t + RENEW_BEFORE_MS - 1, t);
         assert_eq!(l.relays(t), [id(1), id(2)]);
         assert_eq!(l.keep(t), [id(1)], "2 is due a renewal");
         assert_eq!(l.relays(t + RENEW_BEFORE_MS), [id(1)], "2 ran out");
         assert!(l.forget(&id(1)) && !l.forget(&id(1)));
         assert!(l.relays(t).is_empty());
+    }
+
+    /// A relay's answer counts for an hour from the end of the lease held
+    /// there, or from now, as a relay grants it: one answering a later end
+    /// (forever) is still renewed, or replaced, in time.
+    #[test]
+    fn a_lease_lasts_no_longer_than_an_hour_whatever_the_relay_says() {
+        let l = Leased::default();
+        let t = 1_000_000_000u64;
+        l.set(id(1), u64::MAX, t);
+        assert_eq!(l.keep(t + LEASE_MS - RENEW_BEFORE_MS), Vec::<NodeId>::new());
+        assert!(l.relays(t + LEASE_MS).is_empty());
+        // A renewal before the end adds an hour to it.
+        l.set(id(2), t + LEASE_MS, t);
+        let renewed = t + LEASE_MS - RENEW_BEFORE_MS;
+        l.set(id(2), t + 2 * LEASE_MS, renewed);
+        assert_eq!(l.keep(t + 2 * LEASE_MS - RENEW_BEFORE_MS - 1), [id(2)]);
+        // A shorter answer stands.
+        l.set(id(3), t + 60_000, t);
+        assert!(l.relays(t + 60_000).iter().all(|r| *r != id(3)));
     }
 }
