@@ -93,7 +93,11 @@ never in the blocklist). It is also a default for the cluster's advertise
 address. In a cluster, peers report the address they see this node connect
 from; once a sibling or two members agree, it is protected like
 `own_addresses` (System › Status shows it as "Public address (seen by
-peers)").
+peers)"). That address is kept in memory only: `peephole export` removes
+the configured and interface addresses from the scans it writes, not the
+peer-observed one, so a node behind NAT should set `scan.own_addresses`;
+the admin download and admin export remove the peer-observed addresses
+too.
 
 Unattended installs pass the answers as environment variables:
 

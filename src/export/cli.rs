@@ -110,6 +110,10 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
     let store = Store::connect(&cfg.database_path).await?;
     let names = member_names(&store).await;
     // This node's own addresses and names, kept out of the served XML.
+    // Without a running node this is the configured and interface
+    // addresses only: the address peers saw this node connect from lives
+    // in the running node's memory, so a node behind NAT should set
+    // `scan.own_addresses`. The admin download and export remove it too.
     let mut safety = crate::scan::safety::Safety::new(&cfg);
     safety.refresh(&cfg, None).await;
     let own = safety.own_identity();

@@ -195,11 +195,16 @@ Before a scanner signs a `scan_result` or `scan_audit`, it replaces in the
 raw XML each of the following with `[scanner]`:
 
 - each own global address, as nmap prints it (IPv4 dotted; IPv6 in nmap's
-  compressed form), where the bytes before and after are not part of an
-  address (`[0-9A-Fa-f.:]`), so `87.123.41.5` does not match inside
-  `87.123.41.56`;
+  compressed form): an IPv4 address where the bytes before and after are
+  not digits or `.`, an IPv6 address where they are not hex digits, `.`
+  or `:`. So `87.123.41.5` does not match inside `87.123.41.56`, and
+  `87.123.41.5:25` is scrubbed;
 - each own name, compared case-insensitively, where the bytes before and
   after are not part of a name (`[A-Za-z0-9.-]`).
+
+For both, a `.` right after the match ends it when the byte after that `.`
+is not part of the token, so `at 87.123.41.5.` and `host.example.net.` are
+scrubbed.
 
 When the scan's target is itself one of the own addresses, nothing is
 scrubbed: that scan is about this node, and the safety list refuses it

@@ -1534,6 +1534,8 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         finished_at: r.7,
                         os_guess: r.8,
                         raw_xml: r.9,
+                        // Unreachable fallback: the column is written
+                        // from a `u16`.
                         scrubbed: u16::try_from(r.10).unwrap_or(u16::MAX),
                         ports: ports
                             .into_iter()

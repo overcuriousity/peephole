@@ -182,7 +182,11 @@ it finished), not that of the job it checks.
 `scrubbed`: how many times the scanner replaced its own address or name
 with `[scanner]` in `xml` before signing the scan (0 for scans from before
 0.10.0). The exporting node also removes its own addresses and names from
-every scan's `xml` as it writes the file.
+every scan's `xml` as it writes the file. `peephole export` removes the
+configured and interface addresses only, not the address peers saw the
+node connect from, so a node behind NAT should set `scan.own_addresses`
+(the installer offers it); the admin download and admin export remove the
+peer-observed addresses too.
 
 **`names`**: host names known to point at the address, by name.
 

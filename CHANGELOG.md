@@ -23,6 +23,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Levels 3 and 4 no longer run nmap's `http-comments-displayer`: it
   copied every HTML comment it found, binary files included, and was most
   of some scans' XML. Scans run with the previous list still earn.
+- During a rolling upgrade, a scan scrubbed by a current scanner relays
+  only through current members: an older member rebuilds the record
+  without the count, and the signature no longer matches. The gap heals
+  once every member has upgraded.
 
 ### Added
 
