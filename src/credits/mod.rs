@@ -132,10 +132,22 @@ pub async fn compute(node: &Node) -> anyhow::Result<Book> {
             .map(|(id, _)| *id)
             .collect()
     };
+    // The done status of the scan jobs whose offers the window can hold.
+    let done: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT uid, status_hlc FROM scan_jobs
+         WHERE status = 'done' AND uid IS NOT NULL AND status_hlc >= ?",
+    )
+    .bind(crate::cluster::hlc::to_db(since))
+    .fetch_all(&node.store.pool)
+    .await?;
     let gates = ledger::Gates {
         left_out: set(&|s| s.left_out()),
         no_sales: set(&|s| !s.earns()),
         no_scan_sales: set(&|s| !s.earns_as_scanner()),
+        done: done
+            .into_iter()
+            .map(|(uid, h)| (uid, crate::cluster::hlc::from_db(h)))
+            .collect(),
     };
     let members: Vec<crate::cluster::members::MemberRow> =
         crate::cluster::members::all(&node.store)

@@ -43,6 +43,20 @@ pub struct Gates {
     /// Scanners failing the audit gates here: they keep none of what their
     /// receipts for scan jobs brought them.
     pub no_scan_sales: HashSet<NodeId>,
+    /// The HLC of each scan job's done status as the log holds it, by job
+    /// uid: a receipt for the job's offer dated at or after it moves
+    /// nothing ([`charged_in_time`]).
+    pub done: HashMap<String, u64>,
+}
+
+/// Whether a scan receipt dated `receipt_hlc` counts against its job's
+/// done status `done_hlc` (None: none held yet): only one written before
+/// it. The done status designates the scan for an audit
+/// (`credits::audit::seed`), so a scanner charging after it could charge
+/// only the scans it sees are not designated. `credits::audit::job_paid`
+/// applies the same rule.
+pub fn charged_in_time(receipt_hlc: u64, done_hlc: Option<u64>) -> bool {
+    done_hlc.is_none_or(|d| receipt_hlc < d)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -367,6 +381,13 @@ impl Walk<'_> {
         }) else {
             return;
         };
+        // A scan receipt written after the job's done status pays nothing;
+        // the offer lapses back.
+        if let Some(job) = &self.l.offers[i].job
+            && !charged_in_time(e.hlc, self.gates.done.get(job).copied())
+        {
+            return;
+        }
         // A member failing a gate here keeps none of this sale: noted, and
         // settled at the end of the walk.
         let gated = self.gates.no_sales.contains(&e.origin)
@@ -938,6 +959,62 @@ mod tests {
             now(DAY, lapse_min + 3),
         );
         assert_eq!((late.balance(&id(1)), late.balance(&id(2))), (500, 0));
+    }
+
+    /// A scan receipt dated at or after its job's done status moves
+    /// nothing: the done status designates the scan for an audit, and a
+    /// scanner charging after it could charge only the scans it sees are
+    /// not designated. The offer lapses back to the arbiter.
+    #[test]
+    fn a_scan_receipt_after_the_jobs_done_status_pays_nothing() {
+        let earned = [earn(1, DAY, 0, 1000)];
+        // job1, offered at minute 1, charged at minute 5.
+        let entries = [
+            job_offer(1, 1, at(DAY, 1), 2, &[(DAY, 100)]),
+            receipt(2, 1, at(DAY, 5), 1, 1, 100),
+        ];
+        let done_at = |min: u64| Gates {
+            done: [("job1".to_string(), at(DAY, min))].into(),
+            ..Default::default()
+        };
+        // Done before the receipt, or at its instant: unpaid, held until
+        // the offer lapses, then the arbiter's again.
+        for done in [
+            done_at(4),
+            Gates {
+                done: [("job1".to_string(), at(DAY, 5))].into(),
+                ..Default::default()
+            },
+        ] {
+            let l = run(&earned, &entries, &done, now(DAY, 6));
+            assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (900, 0));
+            assert_eq!(l.offers[0].state, OfferState::Open);
+            let lapsed = now(DAY, 2 + crate::credits::JOB_OFFER_TTL_MS / 60_000);
+            let l = run(&earned, &entries, &done, lapsed);
+            assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (1000, 0));
+            assert_eq!(l.offers[0].state, OfferState::Lapsed);
+            conserved(&l, &earned);
+        }
+        // Charged before the done status: paid.
+        let l = run(&earned, &entries, &done_at(6), now(DAY, 7));
+        assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (900, 100));
+        assert_eq!(l.offers[0].state, OfferState::Charged { charged: 100 });
+        // No done status held yet: paid; once one dated earlier arrives,
+        // the count says unpaid.
+        let l = run(&earned, &entries, &Gates::default(), now(DAY, 7));
+        assert_eq!(l.balance(&id(2)), 100);
+        let l = run(&earned, &entries, &done_at(3), now(DAY, 7));
+        assert_eq!(l.balance(&id(2)), 0);
+        // A lookup receipt is no scan receipt, whatever is done.
+        let lookup = [
+            offer(1, 1, at(DAY, 1), 2, &[(DAY, 100)]),
+            receipt(2, 1, at(DAY, 5), 1, 1, 100),
+        ];
+        let l = run(&earned, &lookup, &done_at(3), now(DAY, 7));
+        assert_eq!(l.balance(&id(2)), 100);
+        assert!(charged_in_time(at(DAY, 5), Some(at(DAY, 6))));
+        assert!(!charged_in_time(at(DAY, 5), Some(at(DAY, 5))));
+        assert!(charged_in_time(at(DAY, 5), None));
     }
 
     #[test]

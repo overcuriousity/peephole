@@ -310,8 +310,10 @@ audits and relay leases. The supply is fixed; prices follow sales.
   of the job and the arbiter's done status, which the scanner cannot steer
   or know before it has published the result and charged for it: it
   writes its receipt before it reports the job done, and a receipt dated
-  after the done status does not make a job paid (scanners below protocol
-  8 charge after it, so their scans are not designated); the same hash ranks the
+  at or after the job's done status (as the log holds it) moves nothing,
+  so the offer lapses back to the arbiter (a receipt counts while no done
+  status is held; the count changes once one dated earlier arrives); the
+  same hash ranks the
   scan's three auditors among the scanners admitted by then. The scanner
   buys the audit from the first of them that is reachable and priced (an
   auditor declines an audit it would not run, and the scanner asks the
@@ -419,8 +421,9 @@ audits and relay leases. The supply is fixed; prices follow sales.
   protocol 7 until it upgrades.
 
   Protocol 8 changes how the credits are counted, so upgrade all members
-  together: a scanner charges before it reports a job done (the scans of
-  older scanners are not designated for audits), only members of
+  together: a scanner charges before it reports a job done, and a scan
+  receipt dated after the job's done status pays nothing (a scanner of
+  protocol 7 charges after it, so it is not paid for scans), only members of
   protocol 8 audit level 5, and a member that does not earn here keeps
   none of its income at the end of the count instead of losing its sales
   over the whole window. A node of protocol 7 counts those balances

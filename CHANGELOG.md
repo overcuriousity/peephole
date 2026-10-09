@@ -38,11 +38,14 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   same host key still settles it, unless the scan claims more than twice
   as many open ports as the audit found.
 - Protocol 8: a scanner writes its scan receipt before it reports the
-  job done, and only a receipt dated before the arbiter's done status
-  makes the job paid and its scan designable for an audit. The done
-  status designates the scan, so a scanner charging after it could
-  charge nothing for exactly the scans that were designated. Jobs of
-  scanners below protocol 8 (which charge after) are not designated.
+  job done, and a scan receipt dated at or after the job's done status
+  (as the log holds it) moves no credits: the offer lapses back to the
+  arbiter. The done status designates the scan for an audit, so a
+  scanner charging after it could charge nothing for exactly the scans
+  that were designated, or skip designation altogether. A receipt counts
+  while no done status is held; once one dated earlier arrives, the
+  count says unpaid. Scanners below protocol 8 charge after the done
+  status, so they are not paid for scans until they upgrade.
 - A member that does not earn on a node (rules or audit gates) is
   credited its sales and pool shares there as before the gate, so the
   members it paid keep what they received; what it still holds of that

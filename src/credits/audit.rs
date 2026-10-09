@@ -535,8 +535,8 @@ fn counted_receipt(economy: &str, ttl: &str) -> String {
 /// `done_hlc`. Only the scans of paid jobs are designated: a scanner paid
 /// nothing for a job may hold nothing to buy its audit with. The scanner
 /// charges before it reports the job done; a receipt written after the
-/// done status (which designates) could be withheld for the scans it
-/// designates, so it never makes a job paid.
+/// done status (which designates) moves nothing in the ledger either
+/// ([`crate::credits::ledger::charged_in_time`]).
 pub async fn job_paid(
     pool: &SqlitePool,
     job_uid: &str,
