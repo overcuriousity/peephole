@@ -15,7 +15,7 @@ use axum::{
     extract::{Query, State},
     response::{
         Response,
-        sse::{Event, KeepAlive, Sse},
+        sse::{Event, Sse},
     },
     routing::{get, post},
 };
@@ -23,7 +23,6 @@ use futures::stream::Stream;
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// A scan of an address this fresh needs no buying: the result stands.
 pub const FRESH_HOURS: i64 = 24;
@@ -229,11 +228,6 @@ async fn buy(
     }
 }
 
-/// How often the stream looks again without a log change.
-const POLL: Duration = Duration::from_secs(3);
-/// How often the stream re-checks the session.
-const SESSION_EVERY: Duration = Duration::from_secs(30);
-
 /// `[id, status]` per job: what the stream compares.
 pub fn states_json(jobs: &[crate::events::QueueJob]) -> String {
     let v: Vec<(i64, &str)> = jobs.iter().map(|j| (j.id, j.status.as_str())).collect();
@@ -280,95 +274,15 @@ async fn stream(
             .map(|r| r.id),
         Err(_) => None,
     };
-    Sse::new(events(state, ip_id, session)).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    )
-}
-
-fn events(
-    state: Arc<AdminState>,
-    ip_id: Option<i64>,
-    session: Option<String>,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    struct St {
-        state: Arc<AdminState>,
-        ip_id: Option<i64>,
-        session: Option<String>,
-        changes: Option<tokio::sync::watch::Receiver<u64>>,
-        last: Option<String>,
-        done: bool,
-        next_check: tokio::time::Instant,
-    }
-    let changes = state.recorder.node().map(|n| n.subscribe_changes());
-    futures::stream::unfold(
-        St {
-            state,
-            ip_id,
-            session,
-            changes,
-            last: None,
-            done: false,
-            next_check: tokio::time::Instant::now() + SESSION_EVERY,
-        },
-        |mut st| async move {
-            if st.done {
-                return None;
+    crate::admin::sse::watch(state, session, "scan-jobs", move |state| async move {
+        match ip_id {
+            Some(id) => {
+                let jobs = state.store.jobs_for_ip(id, 20).await.unwrap_or_default();
+                (states_json(&jobs), any_waiting(&state.store, id).await)
             }
-            loop {
-                if st.last.is_some() {
-                    let closing = async {
-                        match st.state.closing.clone() {
-                            Some(mut rx) => {
-                                let _ = rx.wait_for(|v| *v).await;
-                            }
-                            None => std::future::pending().await,
-                        }
-                    };
-                    let changed = async {
-                        match st.changes.as_mut() {
-                            Some(rx) => {
-                                if rx.changed().await.is_err() {
-                                    std::future::pending::<()>().await;
-                                }
-                            }
-                            None => std::future::pending().await,
-                        }
-                    };
-                    tokio::select! {
-                        _ = closing => return None,
-                        _ = changed => {}
-                        _ = tokio::time::sleep(POLL) => {}
-                    }
-                }
-                if tokio::time::Instant::now() >= st.next_check {
-                    st.next_check = tokio::time::Instant::now() + SESSION_EVERY;
-                    if let Some(id) = &st.session
-                        && !st.state.store.validate_session(id).await.unwrap_or(false)
-                    {
-                        return None;
-                    }
-                }
-                let jobs = match st.ip_id {
-                    Some(id) => st.state.store.jobs_for_ip(id, 20).await.unwrap_or_default(),
-                    None => vec![],
-                };
-                let states = states_json(&jobs);
-                // The last event once nothing waits: the page reloads and
-                // opens no new stream.
-                st.done = match st.ip_id {
-                    Some(id) => !any_waiting(&st.state.store, id).await,
-                    None => true,
-                };
-                if st.last.as_deref() != Some(&states) || st.done {
-                    st.last = Some(states.clone());
-                    let ev = Event::default().event("scan-jobs").data(states);
-                    return Some((Ok(ev), st));
-                }
-            }
-        },
-    )
+            None => (states_json(&[]), false),
+        }
+    })
 }
 
 #[cfg(test)]
