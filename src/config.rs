@@ -916,10 +916,10 @@ impl Config {
     /// full-range level caps retransmissions so filtered ports don't stretch
     /// a scan past the timeout.
     ///
-    /// None for a level outside 1..=4: there is no preset to fall back on,
+    /// None for a level outside 1..=5: there is no preset to fall back on,
     /// and an empty argv would run nmap's own default scan.
     pub fn default_level_argv(&self, level: u8) -> Option<Vec<String>> {
-        if !(1..=4).contains(&level) {
+        if !(1..=5).contains(&level) {
             return None;
         }
         if let Some(custom) = self.scan.level_argv.get(&level) {
