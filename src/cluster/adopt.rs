@@ -54,15 +54,16 @@ async fn record_for(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resul
                 Option<String>,
                 Option<String>,
                 Option<Vec<u8>>,
+                i64,
             );
             let r: Option<Row> = sqlx::query_as(
-                "SELECT i.ip, j.level, j.queued_at, j.retry_of, j.retry_at, j.failed_by
+                "SELECT i.ip, j.level, j.queued_at, j.retry_of, j.retry_at, j.failed_by, j.manual
                  FROM scan_jobs j JOIN ips i ON i.id = j.ip_id WHERE j.uid = ?",
             )
             .bind(uid)
             .fetch_optional(&mut *conn)
             .await?;
-            r.map(|(ip, level, queued_at, retry_of, retry_at, failed_by)| {
+            r.map(|(ip, level, queued_at, retry_of, retry_at, failed_by, manual)| {
                 Record::ScanJob(ScanJobRec {
                     uid: uid.to_string(),
                     ip,
@@ -71,6 +72,7 @@ async fn record_for(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resul
                     retry_of,
                     retry_at,
                     failed_by: failed_by.and_then(|b| NodeId::from_slice(&b).ok()),
+                    manual: manual != 0,
                 })
             })
         }

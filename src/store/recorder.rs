@@ -528,6 +528,33 @@ impl Recorder {
             retry_of: None,
             retry_at: None,
             failed_by: None,
+            manual: false,
+        })])
+        .await?;
+        Ok(EnqueueOutcome::Queued(
+            self.id_by_uid("scan_jobs", &uid).await?,
+        ))
+    }
+
+    /// A scan an admin bought on the Actions card: queued without the
+    /// cooldown, evidence or budget checks (those are the automatic
+    /// queue's); the marker lets every scanner skip its evidence
+    /// re-check and the arbiter fund it at the level-scaled price.
+    pub async fn enqueue_manual(&self, ip_id: i64, level: u8) -> Result<EnqueueOutcome> {
+        if !(1..=4).contains(&level) {
+            return Ok(EnqueueOutcome::Suppressed);
+        }
+        let ip_text = self.ip_of(ip_id).await?;
+        let uid = self.uid();
+        self.write(vec![Record::ScanJob(ScanJobRec {
+            uid: uid.clone(),
+            ip: ip_text,
+            level: level as i64,
+            queued_at: now_ts(),
+            retry_of: None,
+            retry_at: None,
+            failed_by: None,
+            manual: true,
         })])
         .await?;
         Ok(EnqueueOutcome::Queued(
@@ -795,15 +822,15 @@ impl Recorder {
     ) -> Result<Option<String>> {
         use crate::scan::retry;
         let pool = &self.store().pool;
-        type Job = (i64, String, i64, String, Option<String>, Option<String>);
+        type Job = (i64, String, i64, String, Option<String>, Option<String>, i64);
         let job: Option<Job> = sqlx::query_as(
-            "SELECT j.ip_id, i.ip, j.level, j.status, j.error, j.retry_of
+            "SELECT j.ip_id, i.ip, j.level, j.status, j.error, j.retry_of, j.manual
              FROM scan_jobs j JOIN ips i ON i.id = j.ip_id WHERE j.uid = ?",
         )
         .bind(job_uid)
         .fetch_optional(pool)
         .await?;
-        let Some((ip_id, ip, level, status, error, retry_of)) = job else {
+        let Some((ip_id, ip, level, status, error, retry_of, manual)) = job else {
             return Ok(None);
         };
         if status != "failed" || !retry::retryable(error.as_deref()) {
@@ -844,6 +871,7 @@ impl Recorder {
             retry_of: Some(root),
             retry_at: Some(retry_at),
             failed_by,
+            manual: manual != 0,
         })])
         .await?;
         Ok(Some(uid))
@@ -1272,6 +1300,27 @@ pub struct Deleted {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_manual_job_ignores_the_cooldown_and_is_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let rec = store.local();
+        let ip = store
+            .upsert_ip("203.0.113.60".parse().unwrap())
+            .await
+            .unwrap();
+        let first = rec.enqueue_manual(ip.id, 2).await.unwrap();
+        assert!(matches!(first, EnqueueOutcome::Queued(_)));
+        let second = rec.enqueue_manual(ip.id, 2).await.unwrap();
+        assert!(matches!(second, EnqueueOutcome::Queued(_)));
+        let manual: i64 = sqlx::query_scalar("SELECT manual FROM scan_jobs WHERE ip_id = ?")
+            .bind(ip.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(manual, 1);
+    }
 
     fn req(ip_id: i64) -> NewRequest {
         NewRequest {
