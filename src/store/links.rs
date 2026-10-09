@@ -4,7 +4,7 @@
 //! page hashes only to the same software. Each kind is read as sightings: a value seen on an IP at a
 //! time, by a node. Admin-only.
 use super::Store;
-use super::browse::{PAGE_SIZE, Page, lenient_i64, nonempty, ts_bound};
+use super::browse::{PAGE_SIZE, Page, lenient_i64, like_escape, nonempty, offset, ts_bound};
 use crate::scan::hostkeys::{
     FAVICON, HASSH, HTTP_404, HTTP_BODY, HTTP_ETAG, JA4X, JARM, SSH_HOSTKEY, TLS_CERT,
 };
@@ -268,11 +268,7 @@ fn sightings(kind: LinkKind, w: &Where) -> (String, Vec<String>) {
         }
         if let Some(p) = &w.prefix {
             sql.push_str(&format!(" AND {} LIKE ? ESCAPE '\\'", l.text));
-            let esc = p
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            binds.push(format!("{esc}%"));
+            binds.push(format!("{}%", like_escape(p)));
         }
         if let Some(i) = w.ip_id {
             sql.push_str(&format!(" AND {} = ?", l.ip));
@@ -407,7 +403,7 @@ impl Store {
                     MIN(ts) AS first_seen, MAX(ts) AS last_seen
              FROM ({s}) GROUP BY v{having} ORDER BY {order} LIMIT {} OFFSET {}",
             PAGE_SIZE + 1,
-            (page as i64 - 1) * PAGE_SIZE
+            offset(page)
         );
         let mut q = sqlx::query_as::<_, LinkRow>(sqlx::AssertSqlSafe(sql));
         for b in &binds {

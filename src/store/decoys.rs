@@ -2,7 +2,7 @@
 //! AI": over full rows with an MCP or LLM decoy answer. Sessions are
 //! linked by the `mcp-session` canary and the tokens of later requests.
 use super::Store;
-use super::browse::{Audience, PAGE_SIZE, Page};
+use super::browse::{Audience, PAGE_SIZE, Page, offset};
 use super::stats::{Named, Range};
 use anyhow::Result;
 
@@ -175,7 +175,7 @@ impl Store {
              WHERE r.decoy_in IS NOT NULL AND r.answer IN ('decoy:mcp:tools/call', 'decoy:mcp:resources/read'){w}{tw}
              ORDER BY r.id DESC LIMIT {} OFFSET {}",
             PAGE_SIZE + 1,
-            i64::from(page - 1) * PAGE_SIZE
+            offset(page)
         )));
         if let Some(m) = since {
             q = q.bind(m);
@@ -267,7 +267,7 @@ impl Store {
                 'decoy:llm:responses', 'decoy:llm:messages', 'decoy:llm:complete'){w}
              ORDER BY r.id DESC LIMIT {} OFFSET {}",
             PAGE_SIZE + 1,
-            i64::from(page - 1) * PAGE_SIZE
+            offset(page)
         )));
         if let Some(m) = since {
             q = q.bind(m);

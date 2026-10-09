@@ -769,30 +769,10 @@ impl Recorder {
         let now = now_ts();
         let mut records = vec![];
         if let Some(res) = result {
-            records.push(Record::ScanResult(ScanResultRec {
-                build: crate::COMMIT.into(),
-                uid: self.uid(),
-                job_uid: uid.clone(),
-                ip,
-                level,
-                started_at: started_at.clone().unwrap_or_else(|| now.clone()),
-                finished_at: Some(now.clone()),
-                os_guess: res.os_guess.clone(),
-                raw_xml: Some(zstd::encode_all(res.raw_xml.as_slice(), 3)?),
-                scrubbed: res.scrubbed,
-                ports: res
-                    .ports
-                    .iter()
-                    .map(|p| PortRec {
-                        port: p.port as i64,
-                        proto: p.proto.clone(),
-                        state: p.state.clone(),
-                        service: p.service.clone(),
-                        product: p.product.clone(),
-                        version: p.version.clone(),
-                    })
-                    .collect(),
-            }));
+            let started = started_at.as_deref().unwrap_or(&now);
+            records.push(Record::ScanResult(
+                self.scan_rec(&uid, &ip, level, started, &now, res)?,
+            ));
         }
         records.push(Record::JobStatus(JobStatusRec {
             job_uid: uid.clone(),
@@ -899,14 +879,29 @@ impl Recorder {
         started_at: &str,
         res: &ScanResult,
     ) -> Result<()> {
-        self.write(vec![Record::ScanResult(ScanResultRec {
+        let rec = self.scan_rec(job_uid, ip, level, started_at, &now_ts(), res)?;
+        self.write(vec![Record::ScanResult(rec)]).await
+    }
+
+    /// A scan result as recorded: this node's uid and build, the XML
+    /// compressed.
+    fn scan_rec(
+        &self,
+        job_uid: &str,
+        ip: &str,
+        level: i64,
+        started_at: &str,
+        finished_at: &str,
+        res: &ScanResult,
+    ) -> Result<ScanResultRec> {
+        Ok(ScanResultRec {
             build: crate::COMMIT.into(),
             uid: self.uid(),
             job_uid: job_uid.to_string(),
             ip: ip.to_string(),
             level,
             started_at: started_at.to_string(),
-            finished_at: Some(now_ts()),
+            finished_at: Some(finished_at.to_string()),
             os_guess: res.os_guess.clone(),
             raw_xml: Some(zstd::encode_all(res.raw_xml.as_slice(), 3)?),
             scrubbed: res.scrubbed,
@@ -922,8 +917,7 @@ impl Recorder {
                     version: p.version.clone(),
                 })
                 .collect(),
-        })])
-        .await
+        })
     }
 
     /// Publish an audit: this node's own scan of `ip`, run to check the
@@ -937,33 +931,11 @@ impl Recorder {
         started_at: &str,
         res: &ScanResult,
     ) -> Result<()> {
+        let scan = self.scan_rec(job_uid, ip, level, started_at, &now_ts(), res)?;
         self.write(vec![Record::ScanAudit(Box::new(
             crate::cluster::record::ScanAuditRec {
                 audit_of: audit_of.to_string(),
-                scan: ScanResultRec {
-                    build: crate::COMMIT.into(),
-                    uid: self.uid(),
-                    job_uid: job_uid.to_string(),
-                    ip: ip.to_string(),
-                    level,
-                    started_at: started_at.to_string(),
-                    finished_at: Some(now_ts()),
-                    os_guess: res.os_guess.clone(),
-                    raw_xml: Some(zstd::encode_all(res.raw_xml.as_slice(), 3)?),
-                    scrubbed: res.scrubbed,
-                    ports: res
-                        .ports
-                        .iter()
-                        .map(|p| PortRec {
-                            port: p.port as i64,
-                            proto: p.proto.clone(),
-                            state: p.state.clone(),
-                            service: p.service.clone(),
-                            product: p.product.clone(),
-                            version: p.version.clone(),
-                        })
-                        .collect(),
-                },
+                scan,
             },
         ))])
         .await
