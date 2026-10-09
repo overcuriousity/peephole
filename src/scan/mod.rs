@@ -766,14 +766,14 @@ impl Source {
         let Ok(ip) = g.ip.parse::<IpAddr>() else {
             return Ok(Err(("failed", Some("invalid target".into()))));
         };
-        let row: Option<(String, i64, Option<Vec<u8>>, String)> = sqlx::query_as(
-            "SELECT i.ip, j.level, j.arbiter, j.queued_at FROM scan_jobs j
+        let row: Option<(String, i64, Option<Vec<u8>>, String, i64)> = sqlx::query_as(
+            "SELECT i.ip, j.level, j.arbiter, j.queued_at, j.manual FROM scan_jobs j
              JOIN ips i ON i.id = j.ip_id WHERE j.uid = ?",
         )
         .bind(&g.job_uid)
         .fetch_optional(pool)
         .await?;
-        let Some((ip_text, job_level, job_arbiter, queued_at)) = row else {
+        let Some((ip_text, job_level, job_arbiter, queued_at, manual)) = row else {
             return Ok(Err(("later", Some(NOT_REPLICATED.into()))));
         };
         if job_arbiter.as_deref() != Some(&arbiter.0[..]) {
@@ -805,22 +805,26 @@ impl Source {
             let why = Some(format!("this scanner is scanning the IP at level {l}"));
             return Ok(Err((if l >= level { "superseded" } else { "later" }, why)));
         }
-        let ev = guard::evidence(pool, &ip_text, &self.origins, Some(self.classifier)).await?;
-        let allowed = ev.allowed_level(&self.cfg.scan.safety);
-        if allowed < level {
-            if ev.max_level < level {
+        // A bought (manual) job skips the evidence rule; the preflight's
+        // safety checks below apply to it all the same.
+        if manual == 0 {
+            let ev = guard::evidence(pool, &ip_text, &self.origins, Some(self.classifier)).await?;
+            let allowed = ev.allowed_level(&self.cfg.scan.safety);
+            if allowed < level {
+                if ev.max_level < level {
+                    let why = format!(
+                        "no request here asks for level {level} (highest: {})",
+                        ev.max_level
+                    );
+                    return Ok(Err(("declined", Some(why))));
+                }
+                // More requests may still arrive or replicate here.
                 let why = format!(
-                    "no request here asks for level {level} (highest: {})",
-                    ev.max_level
+                    "level {level} needs more evidence ({} request(s); thin evidence allows {allowed})",
+                    ev.requests
                 );
-                return Ok(Err(("declined", Some(why))));
+                return Ok(Err(("later", Some(why))));
             }
-            // More requests may still arrive or replicate here.
-            let why = format!(
-                "level {level} needs more evidence ({} request(s); thin evidence allows {allowed})",
-                ev.requests
-            );
-            return Ok(Err(("later", Some(why))));
         }
         match self.preflight(&ip, &ip_text, &queued_at).await? {
             Some(Refusal::Never(why)) => return Ok(Err(("refused", Some(why)))),
@@ -2290,6 +2294,26 @@ license_key = "k"
         let (status, why) = r.err().unwrap();
         assert_eq!(status, "declined");
         assert!(why.unwrap().contains("highest: 1"));
+    }
+
+    /// A bought (manual) job needs no evidence: the scanner's own rules
+    /// never enter into it; the safety preflight still applies.
+    #[tokio::test]
+    async fn a_manual_grant_runs_without_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, source, store) = cluster_source(dir.path(), "").await;
+        let rec = Recorder::Cluster(node.clone());
+        let ip = store
+            .upsert_ip("203.0.113.75".parse().unwrap())
+            .await
+            .unwrap();
+        rec.enqueue_manual(ip.id, 4).await.unwrap();
+        let uid = job_uid(&store, ip.id).await;
+        let r = source
+            .check_grant(node.id(), &grant(&uid, &ip.ip, 4))
+            .await
+            .unwrap();
+        assert!(r.is_ok(), "a bought scan runs with no requests held");
     }
 
     /// A grant for an IP this scanner is scanning now, or for a job that
