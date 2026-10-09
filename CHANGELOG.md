@@ -78,6 +78,13 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   connection while it held the write lock; with the pool busy it waited for
   one while blocking every writer, the trap's included. It reads within its
   own transaction now.
+- One unusable saved runtime setting no longer discards all the others
+  (e.g. after `peephole settings reset roles.scanner` left
+  `roles.listener = false` with no role on, the saved `scan.max_workers`
+  was dropped too, without a word): only that setting is ignored, with a
+  warning. `peephole settings reset` refuses a reset that would leave
+  another saved setting unusable, and a change that would bring back one
+  ignored so far.
 
 ## [0.10.0] - 2026-10-09
 

@@ -160,6 +160,9 @@ pub fn validate(current: Snapshot, c: &Changes, prereqs: &Prereqs) -> Result<Sna
     Ok(s)
 }
 
+/// Stored overrides left out, by key, with why.
+type Dropped = Vec<(&'static str, String)>;
+
 /// One remote settings change, as the owner sees it.
 #[derive(Debug, Clone)]
 pub struct AuditRow {
@@ -180,7 +183,7 @@ pub struct Settings {
     changed: tokio::sync::watch::Sender<u64>,
     /// Serializes writers in this process.
     lock: Arc<tokio::sync::Mutex<()>>,
-    /// A role override was ignored and said so (once, not every reload).
+    /// A stored override was ignored and said so (once, not every reload).
     warned_ignored: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -239,12 +242,13 @@ impl Settings {
         self.changed.subscribe()
     }
 
-    /// The settings as the database has them: defaults plus overrides. The
-    /// overrides are judged together (switching one role off and another on
-    /// is fine as a whole); if the build would refuse them, the defaults
-    /// stand. Read on `conn`: a writer passes its transaction, so it never
-    /// waits for a second connection while it holds the write lock.
-    async fn stored(&self, conn: &mut sqlx::SqliteConnection) -> Result<Snapshot> {
+    /// The settings as the database has them: defaults plus overrides, and
+    /// the overrides left out. The overrides are judged together (switching
+    /// one role off and another on is fine as a whole); one the build would
+    /// refuse is left out with why, the rest still count. Read on `conn`: a
+    /// writer passes its transaction, so it never waits for a second
+    /// connection while it holds the write lock.
+    async fn stored(&self, conn: &mut sqlx::SqliteConnection) -> Result<(Snapshot, Dropped)> {
         let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value FROM settings")
             .fetch_all(&mut *conn)
             .await?;
@@ -264,26 +268,62 @@ impl Settings {
         if all.max_workers == Some(1) {
             all.max_workers = Some(pace::MIN_WORKERS as u32);
         }
+        let mut dropped = Dropped::new();
         // An override cannot switch on a role the config file no longer
         // has the sections for (its listener or `[webauthn]` removed since):
-        // starting it would fail or panic. Only that override is dropped.
-        // The rest are trusted like the TOML (nmap is checked by the scanner).
-        for (want, on, missing) in [
-            (&mut all.listener, s.roles.listener, &self.prereqs.listener),
-            (&mut all.web, s.roles.web, &self.prereqs.web),
+        // starting it would fail or panic. The rest are trusted like the
+        // TOML (nmap is checked by the scanner).
+        for (want, on, missing, key) in [
+            (
+                &mut all.listener,
+                s.roles.listener,
+                &self.prereqs.listener,
+                KEY_ROLE_LISTENER,
+            ),
+            (&mut all.web, s.roles.web, &self.prereqs.web, KEY_ROLE_WEB),
         ] {
-            if *want == Some(true) && !on && missing.is_some() {
-                // Reloaded every few seconds: say it once per process.
-                if !self.warned_ignored.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        why = missing.as_deref().unwrap_or_default(),
-                        "a stored role override is ignored (peephole settings reset to drop it)"
-                    );
-                }
+            if *want == Some(true)
+                && !on
+                && let Some(why) = missing
+            {
+                dropped.push((key, why.clone()));
                 *want = None;
             }
         }
-        Ok(validate(s, &all, &Prereqs::default()).unwrap_or(s))
+        let none = Prereqs::default();
+        let workers = Changes {
+            max_workers: all.max_workers,
+            ..Default::default()
+        };
+        if let Err(why) = validate(s, &workers, &none) {
+            dropped.push((pace::KEY_WORKERS, why));
+            all.max_workers = None;
+        }
+        // No role left on: the overrides switching one off go (the TOML has
+        // one on).
+        if let Err(why) = validate(s, &all, &none) {
+            for (want, key) in [
+                (&mut all.listener, KEY_ROLE_LISTENER),
+                (&mut all.scanner, KEY_ROLE_SCANNER),
+                (&mut all.web, KEY_ROLE_WEB),
+            ] {
+                if *want == Some(false) {
+                    dropped.push((key, why.clone()));
+                    *want = None;
+                }
+            }
+        }
+        // Reloaded every few seconds: say it once per process.
+        if !dropped.is_empty() && !self.warned_ignored.swap(true, Ordering::Relaxed) {
+            for (key, why) in &dropped {
+                tracing::warn!(
+                    key,
+                    why,
+                    "a stored runtime setting is ignored (`peephole settings reset {key}` drops it)"
+                );
+            }
+        }
+        Ok((validate(s, &all, &none).unwrap_or(s), dropped))
     }
 
     fn adopt(&self, s: Snapshot) {
@@ -299,7 +339,7 @@ impl Settings {
         // Under the writers' lock: a write committed and adopted between
         // the read and the adopt would otherwise be rolled back in memory.
         let _g = self.lock.lock().await;
-        let s = self.stored(&mut *self.store.pool.acquire().await?).await?;
+        let (s, _) = self.stored(&mut *self.store.pool.acquire().await?).await?;
         if s == self.snapshot() {
             return Ok(false);
         }
@@ -345,7 +385,7 @@ impl Settings {
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
         // Judge against the database, not this process's memory: the CLI or
         // another handle may have written since.
-        let current = self.stored(&mut tx).await?;
+        let (current, ignored) = self.stored(&mut tx).await?;
         if let Some(b) = base
             && b != current.version
         {
@@ -374,6 +414,17 @@ impl Settings {
         next.version = current.version + 1;
         self.set(&mut tx, KEY_VERSION, next.version.to_string())
             .await?;
+        // The stored set must give what was judged: a stored override
+        // ignored so far must not apply again with it.
+        let (after, _) = self.stored(&mut tx).await?;
+        if after != next {
+            let back: Vec<&str> = ignored.iter().map(|(k, _)| *k).collect();
+            return Ok(Err(format!(
+                "a saved setting ignored so far would apply again with this change ({}); \
+                 `peephole settings reset KEY` drops it",
+                back.join(", ")
+            )));
+        }
         if let Some(by) = by {
             sqlx::query(
                 "INSERT INTO config_audit (at, by, changes) VALUES (datetime('now'), ?, ?)",
@@ -400,7 +451,8 @@ impl Settings {
         }
         let _g = self.lock.lock().await;
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let version = self.stored(&mut tx).await?.version + 1;
+        let (before, ignored) = self.stored(&mut tx).await?;
+        let version = before.version + 1;
         for k in KEYS {
             if key.is_none_or(|only| only == k) {
                 sqlx::query("DELETE FROM settings WHERE key = ?")
@@ -410,7 +462,14 @@ impl Settings {
             }
         }
         self.set(&mut tx, KEY_VERSION, version.to_string()).await?;
-        let s = self.stored(&mut tx).await?;
+        // The overrides kept must still be usable without the reset ones.
+        let (s, dropped) = self.stored(&mut tx).await?;
+        if let Some((k, why)) = dropped.iter().find(|d| !ignored.contains(d)) {
+            return Ok(Err(format!(
+                "resetting {} would leave {k} unusable ({why}); reset {k} too",
+                key.unwrap_or("all runtime settings")
+            )));
+        }
         tx.commit().await?;
         self.adopt(s);
         Ok(Ok(version))
@@ -672,6 +731,81 @@ mod tests {
         assert!(end.roles.scanner);
         assert_eq!(end.pace.max_workers, 3);
         assert!(s.reset(Some("no.such.key")).await.unwrap().is_err());
+    }
+
+    async fn store_rows(store: &crate::store::Store, rows: &[(&str, &str)]) {
+        for (k, v) in rows {
+            sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
+                .bind(k)
+                .bind(v)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A stored override the build refuses is left out alone: the others
+    /// still count.
+    #[tokio::test]
+    async fn an_unusable_stored_override_drops_only_itself() {
+        let only_trap = "[roles]\nscanner = false\nweb = false\n";
+        let (s, store, _d) = open(only_trap).await;
+        // No role would be left on: the listener override goes, not the workers.
+        store_rows(
+            &store,
+            &[(KEY_ROLE_LISTENER, "false"), (pace::KEY_WORKERS, "3")],
+        )
+        .await;
+        assert!(s.reload().await.unwrap());
+        let now = s.snapshot();
+        assert!(now.roles.listener);
+        assert_eq!(now.pace.max_workers, 3);
+        // An out-of-range worker count goes; the role overrides stay.
+        let (s, store, _d) = open("").await;
+        store_rows(
+            &store,
+            &[(pace::KEY_WORKERS, "999"), (KEY_ROLE_WEB, "false")],
+        )
+        .await;
+        assert!(s.reload().await.unwrap());
+        let now = s.snapshot();
+        assert_eq!(now.pace.max_workers, 2);
+        assert!(!now.roles.web);
+    }
+
+    /// A reset that would leave the other overrides unusable is refused,
+    /// and so is a write that would bring back an override ignored so far.
+    #[tokio::test]
+    async fn resets_and_writes_keep_the_stored_overrides_usable() {
+        let only_trap = "[roles]\nscanner = false\nweb = false\n";
+        let (s, store, _d) = open(only_trap).await;
+        let swap = Changes {
+            listener: Some(false),
+            scanner: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(s.apply(&swap, None).await.unwrap(), Ok(1));
+        let e = s.reset(Some(KEY_ROLE_SCANNER)).await.unwrap().unwrap_err();
+        assert!(e.contains(KEY_ROLE_LISTENER), "{e}");
+        let again = Settings::load(&store, &cfg(only_trap), Prereqs::default())
+            .await
+            .unwrap()
+            .snapshot();
+        assert_eq!((again.roles.scanner, again.version), (true, 1));
+        assert_eq!(s.reset(None).await.unwrap(), Ok(2));
+        // An ignored `roles.listener = false` would apply again once the
+        // scanner is on: refused, nothing written.
+        store_rows(&store, &[(KEY_ROLE_LISTENER, "false")]).await;
+        s.reload().await.unwrap();
+        assert!(s.snapshot().roles.listener);
+        let on = Changes {
+            scanner: Some(true),
+            ..Default::default()
+        };
+        let e = s.apply(&on, None).await.unwrap().unwrap_err();
+        assert!(e.contains(KEY_ROLE_LISTENER), "{e}");
+        assert!(!s.snapshot().roles.scanner);
+        assert_eq!(s.snapshot().version, 2);
     }
 
     /// A write reads the settings in its own transaction: holding the write
