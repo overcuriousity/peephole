@@ -25,8 +25,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Domains and reverse names are quorum goods: `min(9, ⌊n/2⌋+1)` of the
   cheapest nodes are asked. The reverse names of a source are bought by
   the node that recorded it and replicated with their agreement.
-- Scanners buy audits of their designated scans (1 in 20, drawn from the
-  log) from ranked auditors, and are not funded while they owe them.
+- Scanners buy audits of their designated scans (1 in 20 scans of paid
+  jobs, drawn from the log) from ranked auditors, and are not funded while
+  they owe them.
 
 - The Actions card is laid out anew: probe vantages as chips, the four
   scan levels side by side. Every button shows its cost ("Probe · 0.04

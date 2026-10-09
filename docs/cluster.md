@@ -29,7 +29,8 @@ relays from reachable members (an hour at a time, at their relay price,
 renewed 5 minutes before the end) and fetches its directed messages from
 their outboxes only; members reach it through the relays its heartbeat
 lists. Without a lease it still syncs and receives the answers to its own
-requests, but it cannot be asked for anything paid. It gets no share of the
+requests, but it cannot be asked anything, paid or not (remote config and
+owner commands included), until it leases a relay. It gets no share of the
 daily pool: only members anyone can reach do. It cannot issue invites: a joiner could not reach it.
 
 Then add nodes:
@@ -182,13 +183,14 @@ audits and relay leases. The supply is fixed; prices follow sales.
 - **Where credits come from.** One door: the daily pool. At the end of
   each UTC day 1000 credits are split evenly among that day's verified
   listeners: members with the listener role and an advertised address that
-  were up in at least 12 of the day's 24 hours (and run protocol 7); the
+  were up in at least 12 of the day's 24 hours (and ran protocol 7 that
+  day: they wrote a `reach_report` for an hour of it); the
   remainder, 0.001 each, goes to the lowest keys; the pool is credited an
   hour after midnight. Up means reported: every member writes one
   `reach_report` an hour naming the advertised members it completed a sync
   round with, and a member is up in an hour when more than half of that
   hour's reports from other advertised members (not blocked or left out
-  here) name it; outbound-only members' reports do not count. A member
+  here) name it; outbound-only members write none. A member
   that does not earn on your node gets no share there, and its share goes
   to nobody. `peephole credits uptime` lists each member's hours.
 - **Where they go.** Nowhere: nothing burns. A credit keeps its day when
@@ -246,8 +248,7 @@ audits and relay leases. The supply is fixed; prices follow sales.
   rates are measured once an hour: the snapshot of hour H counts the scans
   finished in the 24 hours before H and is taken at H + 5 min, so arbiters
   with the same log agree. A job is paid to the best claimant the scan budget
-  can pay (one that takes no less than more than its price here is passed
-  over). A paid job waits for a cheaper live scanner (not hoarding, not
+  can pay (one that takes more than its price here is passed over). A paid job waits for a cheaper live scanner (not hoarding, not
   paused, under its capacity, with a record at that level, and able to take
   the job: it did not hand it back, and its last claim here neither excluded
   the level nor asked more than its price) for up to 30 minutes, then goes to
@@ -278,22 +279,29 @@ audits and relay leases. The supply is fixed; prices follow sales.
 - **Conformity and audits.** A member earns on your node only while at least
   98 % of its newest 500 requests classify the same with your rules, and its
   scans stand up to the audits you believe: those of your own nodes. One in 20
-  scans of jobs granted by another arbiter is designated for a bought audit by
-  a hash of the job and the arbiter's done status, which the scanner cannot
-  steer or know before it has published the result; the same hash ranks the
-  scan's three auditors among the scanners. The scanner buys the audit from
-  the first of them that is reachable and priced (an auditor declines an audit
-  it would not run, and the scanner asks the next); the auditor is paid when
-  it publishes the audit, and releases stale offers. A scanner with two or
+  scans of paid jobs (granted by another arbiter and charged for; a job
+  granted at zero owes no audit) is designated for a bought audit by a hash
+  of the job and the arbiter's done status, which the scanner cannot steer
+  or know before it has published the result; the same hash ranks the
+  scan's three auditors among the scanners admitted by then. The scanner
+  buys the audit from the first of them that is reachable and priced (an
+  auditor declines an audit it would not run, and the scanner asks the
+  next; one that names a higher price is offered it once), and tries again
+  while the scan is in its 30-minute window; the auditor is paid when it
+  publishes the audit, and releases stale offers. A scanner with two or
   more designated scans of 7 days unaudited and under 80 % bought is not
   funded by arbiters, and its scan receipts count for nothing, until it
-  catches up. Each scanner also re-runs `[credits] audit_share` (5 %) of other
+  catches up; a designated scan with no auditor to buy from is not
+  counted. Each scanner also re-runs `[credits] audit_share` (5 %) of other
   nodes' fresh scans unpaid, own jobs and small scanners included.
 - **Relays.** An advertised node sells relay leases (`[cluster] relay_slots`,
   16 at a time): an hour of holding an outbox for an outbound-only member. It
   holds outboxes only for members with an address or a lease, and refuses at
   once (so the sender takes the next relay) a member that holds no lease with
-  it. Only granted leases count as relay demand.
+  it. Only granted leases count as relay demand. An outbound-only member
+  without a lease collects the answers to its own requests, but nobody can
+  ask it anything (remote config and owner commands included) until it
+  leases a relay.
 - **Your budgets are safe.** Paid lookups take at most
   `[enrichment] on_demand_share` (a fifth by default) of each API budget,
   whatever happens to credits.
@@ -337,6 +345,14 @@ audits and relay leases. The supply is fixed; prices follow sales.
     steer which scans are designated.
   - Reach reports are self-asserted: a majority of members colluding can
     call a listener down, or one up.
+  - The pool's rules on role and address, and the ranking of auditors by
+    role, protocol and standing, are read from the member records as held
+    now, not as they were on the day or at the scan: a member that drops
+    the listener role or its address loses the days it already qualified
+    for, until they are credited, and a scanner that leaves takes its
+    place among the auditors of earlier scans with it. Whether a listener
+    ran protocol 7 is read from its reports, and an auditor must have been
+    admitted by the scan's done status, so neither changes after the fact.
   - Credits have no outside value: an API node is paid in services of the
     cluster.
   - The constants come from an abstract simulation, not from a real

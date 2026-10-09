@@ -32,7 +32,7 @@
     <li>Resolving a name costs <b>{{ price.resolve }}</b> credits here.</li>
     <li>Reverse names cost <b>{{ price.rdns }}</b> credits here.</li>
     {% if let Some(r) = price.relay %}<li>A relay lease (an hour) costs <b>{{ r }}</b> credits here.</li>{% endif %}
-    <li>1 in 20 scans of granted jobs is designated for an audit the scanner buys from auditors the log ranks; this node also checks {{ price.audit_share }} % of other nodes' fresh scans unpaid.</li>
+    <li>1 in 20 scans of paid jobs is designated for an audit the scanner buys from auditors the log ranks; this node also checks {{ price.audit_share }} % of other nodes' fresh scans unpaid.</li>
   </ul>
   {% if !goods.is_empty() %}
   <div class="table-wrap"><table class="price-table">
