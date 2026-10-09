@@ -33,6 +33,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   error left the key working while the page looked as if it was gone.
   The keys page now says whether the key was deleted, was the last way
   in, was not found, or could not be deleted.
+- Cluster: membership entries sent ahead of the log must keep their
+  signer's order (past its log held, dated after its latest entry and
+  its earlier admissions). Before, a member could sign admissions at
+  made-up sequences dated back over weeks and push them, admitting far
+  more than 20 nodes a day on every node it reached.
 
 ## [0.10.0] - 2026-10-09
 

@@ -445,7 +445,8 @@ pub async fn membership_entries(store: &crate::store::Store) -> Result<Vec<WireE
 /// again harmlessly when they arrive in order), not the log entry, so each
 /// origin's log stays gap-free. Each must be signed by its origin, and its
 /// origin trusted here, perhaps through an admission earlier in the same
-/// list. Returns how many were taken.
+/// list, and keep its origin's order like an entry of the log would (see
+/// [`ahead_in_order`]). Returns how many were taken.
 pub async fn apply_membership_ahead(node: &Node, entries: &[WireEntry]) -> Result<usize> {
     let me = node.id();
     let mut todo: Vec<&WireEntry> = entries
@@ -463,6 +464,8 @@ pub async fn apply_membership_ahead(node: &Node, entries: &[WireEntry]) -> Resul
     let guard = node.apply_lock.lock().await;
     let mut tx = node.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     let mut taken = 0;
+    // The last entry taken of each origin: (seq, hlc).
+    let mut last: HashMap<NodeId, (u64, u64)> = HashMap::new();
     loop {
         let mut rest = vec![];
         let before = taken;
@@ -470,23 +473,18 @@ pub async fn apply_membership_ahead(node: &Node, entries: &[WireEntry]) -> Resul
             if is_purged(&mut tx, &e.origin).await? || hlc::ahead(e.hlc, hlc::wall_ms()) {
                 continue;
             }
-            let held: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM repl_log WHERE origin = ? AND seq = ?")
-                    .bind(&e.origin.0[..])
-                    .bind(e.seq.min(i64::MAX as u64) as i64)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if held > 0 {
-                continue;
-            }
             if !trusted(node, &mut tx, &e.origin).await? {
                 rest.push(e);
+                continue;
+            }
+            if !ahead_in_order(&mut tx, e, last.get(&e.origin).copied()).await? {
                 continue;
             }
             let Some(r) = e.record().filter(|_| e.verify()) else {
                 continue;
             };
             super::members::apply(node, &mut tx, e, &r, hlc::to_db(e.hlc) as u64).await?;
+            last.insert(e.origin, (e.seq, e.hlc));
             taken += 1;
         }
         todo = rest;
@@ -501,6 +499,33 @@ pub async fn apply_membership_ahead(node: &Node, entries: &[WireEntry]) -> Resul
         node.notify_changed();
     }
     Ok(taken)
+}
+
+/// Whether a membership entry sent ahead keeps its origin's order: past
+/// the log held of it, dated after the latest entry held in order (as
+/// [`in_order`] judges entries of the log), after its admissions taken
+/// ahead before, and after `last`, the entry of it taken just before in
+/// the same list, in sequence too. Otherwise a member could sign entries
+/// at made-up sequences, dated back past what is held, and admit more than
+/// [`super::members::ADMISSIONS_PER_DAY`]: the daily count holds every
+/// earlier admission only while each sponsor's admissions rise.
+async fn ahead_in_order(
+    conn: &mut SqliteConnection,
+    e: &WireEntry,
+    last: Option<(u64, u64)>,
+) -> Result<bool> {
+    if last.is_some_and(|(seq, at)| e.seq <= seq || e.hlc <= at) {
+        return Ok(false);
+    }
+    if e.seq <= log_head(conn, &e.origin).await? || !in_order(conn, e).await? {
+        return Ok(false);
+    }
+    let admitted: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(hlc) FROM sponsorships WHERE sponsor = ?")
+            .bind(&e.origin.0[..])
+            .fetch_one(&mut *conn)
+            .await?;
+    Ok(admitted.is_none_or(|a| hlc::to_db(e.hlc) > a))
 }
 
 /// `origin`'s entry `seq` with its signed payload (rebuilt from its row if
@@ -2669,5 +2694,53 @@ mod tests {
             0
         );
         assert!(!node.members().contains_key(&y.id));
+    }
+
+    /// Membership sent ahead keeps its origin's order: a member cannot sign
+    /// admissions at made-up sequences dated before what is held of it (or
+    /// before what it admitted ahead earlier), which would escape the daily
+    /// admission limit.
+    #[tokio::test]
+    async fn membership_ahead_keeps_its_origin_in_order() {
+        let (_d, node) = test_node(0).await;
+        let m = Identity::generate().unwrap();
+        super::append(&node, &[Record::MemberAdd(info(m.id, "m"))])
+            .await
+            .unwrap();
+        let base = super::hlc::wall_ms() - 2 * 3_600_000;
+        let at = |minutes: u64| (base + minutes * 60_000) << 16;
+        let alive = WireEntry::sign(&m, 1, at(60), &Record::MemberUpdate(info(m.id, "m"))).unwrap();
+        let st = super::apply_batch(&node, vec![alive]).await.unwrap();
+        assert_eq!(st.applied, 1, "{st:?}");
+        let far = 1_000_000_000_000u64;
+        let sybils: Vec<Identity> = (0..5).map(|_| Identity::generate().unwrap()).collect();
+        let add = |seq: u64, hlc: u64, s: &Identity| {
+            WireEntry::sign(&m, seq, hlc, &Record::MemberAdd(info(s.id, "s"))).unwrap()
+        };
+        // Dated before m's latest held entry.
+        let early = add(far, at(30), &sybils[0]);
+        // In order: taken.
+        let fine = add(far + 2, at(70), &sybils[1]);
+        // A lower sequence dated after it, in the same list.
+        let swapped = add(far + 1, at(75), &sybils[3]);
+        // Its own sequence again.
+        let again = add(far + 2, at(80), &sybils[2]);
+        let taken = super::apply_membership_ahead(&node, &[early, fine, swapped, again])
+            .await
+            .unwrap();
+        assert_eq!(taken, 1);
+        // Dated before the admission taken ahead earlier.
+        let later = add(far + 4, at(68), &sybils[4]);
+        assert_eq!(
+            super::apply_membership_ahead(&node, &[later])
+                .await
+                .unwrap(),
+            0
+        );
+        let members = node.members();
+        let admitted: Vec<usize> = (0..5)
+            .filter(|i| members.contains_key(&sybils[*i].id))
+            .collect();
+        assert_eq!(admitted, [1]);
     }
 }
