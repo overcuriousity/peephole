@@ -7061,6 +7061,39 @@ async fn a_designated_scan_is_audited_by_its_auditor() {
     backed(&nx, ip).await;
     assert_eq!(audit::buy(&ns.node, "scan-d").await, Ok(x.id));
     assert_eq!(nx.node.audit_queue.lock().unwrap().len(), 1, "x queued it");
+    // Asked again with the queued offer: refused, and nothing released.
+    let seq: i64 = sqlx::query_scalar(
+        "SELECT MAX(seq) FROM credit_entries WHERE origin = ? AND audit_uid = 'scan-d'",
+    )
+    .bind(&s.id.0[..])
+    .fetch_one(&ns.store.pool)
+    .await
+    .unwrap();
+    let again = Msg::AuditReq {
+        scan_uid: "scan-d".into(),
+        offer_seq: seq as u64,
+    };
+    let reply = ns.node.request(x.id, again, Duration::from_secs(10)).await;
+    assert!(
+        matches!(
+            &reply,
+            Ok(Msg::AuditReply { accepted: false, why: Some(w) })
+                if w == "this audit is queued already"
+        ),
+        "{reply:?}"
+    );
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM credit_entries
+         WHERE kind = 'receipt' AND origin = ? AND peer = ? AND offer_seq = ?",
+    )
+    .bind(&x.id.0[..])
+    .bind(&s.id.0[..])
+    .bind(seq)
+    .fetch_one(&nx.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(receipts, 0, "the queued offer is not released");
+    assert_eq!(nx.node.audit_queue.lock().unwrap().len(), 1);
     // a is no scanner, so no auditor of it.
     let req = Msg::AuditReq {
         scan_uid: "scan-d".into(),

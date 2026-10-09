@@ -486,8 +486,9 @@ pub fn owes(designated: u32, bought: u32) -> Option<(u32, u32)> {
 /// Per scanner: its scans designated over the last 7 days (leaving out
 /// the newest [`crate::credits::AUDIT_OFFER_TTL_MS`], whose audits may
 /// still run), and how many of them it bought: an audit by one of the
-/// scan's [`auditors`] (by `members` as held here), with a charged audit
-/// offer from the scanner to that auditor naming the scan.
+/// scan's [`auditors`] (by `members` as held here), with an audit offer
+/// from the scanner to that auditor naming the scan that its first
+/// receipt (the one the ledger counts) charged.
 pub async fn obligations(
     pool: &SqlitePool,
     members: &[MemberRow],
@@ -513,6 +514,12 @@ pub async fn obligations(
         "SELECT o.audit_uid, o.peer FROM credit_entries o
          JOIN credit_entries r ON r.kind = 'receipt' AND r.economy = 2 AND r.charged_mc > 0
               AND r.origin = o.peer AND r.peer = o.origin AND r.offer_seq = o.seq
+              -- The first receipt for the offer: the one the ledger counts.
+              AND NOT EXISTS (SELECT 1 FROM credit_entries f
+                              WHERE f.kind = 'receipt' AND f.economy = 2
+                                AND f.origin = r.origin AND f.peer = r.peer
+                                AND f.offer_seq = r.offer_seq
+                                AND (f.hlc < r.hlc OR (f.hlc = r.hlc AND f.seq < r.seq)))
          JOIN scans a ON a.audit_of = o.audit_uid AND a.origin = o.peer
          WHERE o.kind = 'offer' AND o.economy = 2 AND o.audit_uid IS NOT NULL",
     )
@@ -651,6 +658,11 @@ pub fn serve(node: &Arc<Node>) {
 
 async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Result<(), String> {
     use crate::credits::{JOB_OFFER_TTL_MS, entries, pay, price};
+    // Asked again with an offer whose audit waits or runs here: turned
+    // down before anything could release that offer.
+    if node.audit_queue.lock().unwrap().holds((peer, seq)) {
+        return Err("this audit is queued already".into());
+    }
     let refuse = async |why: &str| {
         pay::release(node, peer, seq).await;
         Err(why.to_string())
@@ -1044,6 +1056,94 @@ mod tests {
         let got = obligations(pool, &members, now).await.unwrap();
         assert_eq!(got.get(&s), Some(&(3, 1)), "{got:?}");
         assert_eq!(owes(3, 1), Some((1, 3)));
+        // A receipt of nothing for the same offer came first: the ledger
+        // counts that one, so the audit was not bought.
+        sqlx::query(
+            "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, economy)
+             VALUES (?1, 0, ?2, 'receipt', ?3, '[]', 1, 0, '[]', 0, 2)",
+        )
+        .bind(&auditor.0[..])
+        .bind(hlc::to_db(day_ago(1)))
+        .bind(&s.0[..])
+        .execute(pool)
+        .await
+        .unwrap();
+        let got = obligations(pool, &members, now).await.unwrap();
+        assert_eq!(got.get(&s), Some(&(3, 0)), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn stale_audit_offers_to_this_node_are_released_unless_their_audit_waits_or_runs() {
+        use crate::cluster::identity::Identity;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let node = Node::open(crate::cluster::NodeParams {
+            identity: Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store,
+            proto: (1, 1),
+            data_dir: dir.path().to_path_buf(),
+            retention_days: 30,
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        let pool = &node.store.pool;
+        let now = hlc::wall_ms();
+        let payer = id(1);
+        // (seq, minutes ago, audit uid)
+        let offers = [
+            (1i64, 60u64, Some("stale")),
+            (2, 60, Some("queued")),
+            (3, 10, Some("fresh")),
+            (4, 60, None),
+        ];
+        for (seq, mins, audit) in offers {
+            let at = (now - mins * 60_000) << 16;
+            let parts = format!("[[{},10]]", crate::credits::day_of(at));
+            sqlx::query(
+                "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, seal, economy, audit_uid)
+                 VALUES (?1, ?2, ?3, 'offer', ?4, ?5, 1, 2, ?6)",
+            )
+            .bind(&payer.0[..])
+            .bind(seq)
+            .bind(hlc::to_db(at))
+            .bind(&node.id().0[..])
+            .bind(parts)
+            .bind(audit)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        assert!(node.audit_queue.lock().unwrap().push(Task {
+            scan_uid: "queued".into(),
+            job_uid: "job".into(),
+            ip: "203.0.113.5".into(),
+            level: 2,
+            deadline_ms: now + 60_000,
+            offer: Some((payer, 2, 10)),
+        }));
+        assert_eq!(release_stale(&node).await, 1);
+        let released: Vec<i64> = sqlx::query_scalar(
+            "SELECT offer_seq FROM credit_entries WHERE kind = 'receipt' AND origin = ? AND peer = ?",
+        )
+        .bind(&node.id().0[..])
+        .bind(&payer.0[..])
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(released, [1], "only the stale audit offer nothing holds");
     }
 
     /// A scan row with one open port per entry of `ports`.
