@@ -20,6 +20,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   at each level (L1–L4), the cheapest in bold.
 - The scan page says why its job went to its scanner ("Handed out"), and
   the Scans history shows the same as a title on the scanner's name.
+- Levels 3 and 4 no longer run nmap's `http-comments-displayer`: it
+  copied every HTML comment it found, binary files included, and was most
+  of some scans' XML. Scans run with the previous list still earn.
 
 ### Added
 
