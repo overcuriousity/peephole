@@ -111,6 +111,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   all) put off every node's next lookup of that address with that
   provider for good. Its fetch time is now held to the time of its log
   entry, as for shared intel files.
+- Cluster: a member's light row dated 1970 (or before year 1) moved the
+  address's first sighting there for good, and its canaries with it.
+  Times before 2000 are now held to 2000-01-01, as times from the future
+  are held to the present.
 
 ## [0.10.0] - 2026-10-09
 

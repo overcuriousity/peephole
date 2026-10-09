@@ -201,15 +201,24 @@ type PortRow = (
 const MAX_AHEAD: chrono::TimeDelta =
     chrono::TimeDelta::milliseconds(crate::cluster::hlc::MAX_DRIFT_MS as i64);
 
+/// The earliest time a row may carry (2000-01-01 00:00:00 UTC, before any
+/// trap ran). A time of 0, or of a year before 1, would become the IP's
+/// first sighting for good, or not decode as a time at all.
+const EARLIEST_MS: i64 = 946_684_800_000;
+
 /// A record's `ts` as stored: None unless in the rows' format (peers can
 /// send anything; garbage would break every read that decodes the column
-/// as a time), and no later than [`MAX_AHEAD`] from now (a fast clock would
-/// keep its rows "recent" and out of retention).
+/// as a time), no earlier than [`EARLIEST_MS`], and no later than
+/// [`MAX_AHEAD`] from now (a fast clock would keep its rows "recent" and
+/// out of retention).
 fn row_ts(ts: &str) -> Option<String> {
     let t = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").ok()?;
+    let earliest = chrono::DateTime::from_timestamp_millis(EARLIEST_MS)?.naive_utc();
     let limit = chrono::Utc::now().naive_utc() + MAX_AHEAD;
-    Some(if t > limit {
-        limit.format("%Y-%m-%d %H:%M:%S").to_string()
+    Some(if t > limit || t < earliest {
+        t.clamp(earliest, limit)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
     } else {
         ts.to_string()
     })
@@ -217,7 +226,10 @@ fn row_ts(ts: &str) -> Option<String> {
 
 /// [`row_ts`] for a light row's milliseconds.
 fn row_ms(ms: i64) -> i64 {
-    ms.min(chrono::Utc::now().timestamp_millis() + MAX_AHEAD.num_milliseconds())
+    ms.clamp(
+        EARLIEST_MS,
+        chrono::Utc::now().timestamp_millis() + MAX_AHEAD.num_milliseconds(),
+    )
 }
 
 /// The IP's row id, creating the row if needed (None: not an address). The
@@ -2472,7 +2484,7 @@ mod tests {
                 ip: "203.0.113.7".into(),
                 dropped: 0,
                 rows: vec![SkipRow {
-                    ts_ms: 1,
+                    ts_ms: 1_791_000_000_000,
                     method: "GET".into(),
                     path: "/".into(),
                     ..Default::default()
@@ -2539,9 +2551,9 @@ mod tests {
             ip: "203.0.113.7".into(),
             dropped: 5,
             rows: vec![
-                row(1000, "/a"),
-                row(1500, "/b"),
-                row(2000, &"x".repeat(3000)),
+                row(1_791_000_001_000, "/a"),
+                row(1_791_000_001_500, "/b"),
+                row(1_791_000_002_000, &"x".repeat(3000)),
             ],
         });
         assert_eq!(apply(&mut conn, ctx, &b).await.unwrap(), Effect::Applied);
@@ -2555,7 +2567,7 @@ mod tests {
                 "SELECT first_ms + last_ms + dropped FROM skipped_batches"
             )
             .await,
-            3005
+            3_582_000_003_005
         );
         assert_eq!(
             count(&mut conn, "SELECT MAX(length(path)) FROM skipped_requests").await,
@@ -2607,7 +2619,11 @@ mod tests {
             uid: format!("{}skip", a.uid_prefix()),
             ip: "203.0.113.7".into(),
             dropped: 2,
-            rows: vec![row(2000, "/b"), row(1000, "/a"), row(1000, "/a")],
+            rows: vec![
+                row(1_791_000_002_000, "/b"),
+                row(1_791_000_001_000, "/a"),
+                row(1_791_000_001_000, "/a"),
+            ],
         });
         assert_eq!(apply(&mut conn, ctx, &b).await.unwrap(), Effect::Applied);
         let rebuilt = rebuild(&mut conn, "skip_batch", &b.uid().unwrap())
@@ -2666,6 +2682,60 @@ mod tests {
             rows,
         });
         assert_eq!(apply(&mut conn, ctx, &b).await.unwrap(), Effect::Ignored);
+    }
+
+    /// Times from before any trap ran (0, or a year before 1) are held to
+    /// the earliest one: the IP's first sighting stays its own, and every
+    /// time decodes.
+    #[tokio::test]
+    async fn times_from_before_any_trap_are_held_to_the_earliest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let row = |ts_ms| SkipRow {
+            ts_ms,
+            method: "GET".into(),
+            path: "/".into(),
+            ..Default::default()
+        };
+        let b = Record::SkipBatch(SkipBatchRec {
+            build: String::new(),
+            uid: format!("{}old", a.uid_prefix()),
+            ip: "203.0.113.8".into(),
+            dropped: 0,
+            rows: vec![row(0), row(-62_200_000_000_000)],
+        });
+        assert_eq!(apply(&mut conn, ctx, &b).await.unwrap(), Effect::Applied);
+        let Record::Request(mut r) = request(&format!("{}old", a.uid_prefix()), "/") else {
+            unreachable!()
+        };
+        r.ip = "203.0.113.9".into();
+        r.ts = "1970-01-01 00:00:00".into();
+        assert_eq!(
+            apply(&mut conn, ctx, &Record::Request(r)).await.unwrap(),
+            Effect::Applied
+        );
+        let first: Vec<String> = sqlx::query_scalar("SELECT first_seen FROM ips ORDER BY ip")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(first, ["2000-01-01 00:00:00", "2000-01-01 00:00:00"]);
+        for sql in [
+            "SELECT COUNT(*) FROM skipped_requests WHERE ts_ms < 946684800000",
+            "SELECT COUNT(*) FROM skipped_batches WHERE first_ms < 946684800000",
+            "SELECT COUNT(*) FROM requests WHERE ts < '2000-01-01 00:00:00'",
+        ] {
+            assert_eq!(count(&mut conn, sql).await, 0, "{sql}");
+        }
+        // The IP rows decode as times.
+        for ip in ["203.0.113.8", "203.0.113.9"] {
+            assert!(store.ip_by_addr(ip).await.unwrap().is_some());
+        }
     }
 
     #[tokio::test]
