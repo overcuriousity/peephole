@@ -99,8 +99,7 @@ pub fn level_factor(level: i64) -> u32 {
 /// lot that dies before the offer can be charged (within
 /// [`JOB_OFFER_TTL_MS`](super::JOB_OFFER_TTL_MS)) is left out.
 pub fn first_day_for_job(now_ms: u64) -> u32 {
-    let last = ((now_ms + super::JOB_OFFER_TTL_MS) / super::DAY_MS) as u32;
-    last.saturating_sub(super::LOT_DAYS - 1)
+    ledger::first_day_for(now_ms, super::JOB_OFFER_TTL_MS)
 }
 
 /// What one round of handing out jobs funds from: one book, computed at

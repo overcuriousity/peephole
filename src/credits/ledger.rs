@@ -149,6 +149,14 @@ pub fn parts_from(lots: &[(u32, Mc)], mc: Mc, first_day: u32) -> Option<Vec<(u32
     None
 }
 
+/// The oldest lot day an offer written at `now_ms` that lives `ttl_ms`
+/// may draw from: a lot that dies before the offer can be charged is left
+/// out (a receipt would hand the server credits already gone).
+pub fn first_day_for(now_ms: u64, ttl_ms: u64) -> u32 {
+    let last = ((now_ms + ttl_ms) / DAY_MS) as u32;
+    last.saturating_sub(LOT_DAYS - 1)
+}
+
 impl Ledger {
     fn first_live_day(&self) -> u32 {
         self.today.saturating_sub(LOT_DAYS - 1)

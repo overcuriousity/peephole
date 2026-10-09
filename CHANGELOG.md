@@ -173,6 +173,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   node now writes its offers and transfers one at a time, each from what
   the ones before left, and draws from its siblings once at a time. A
   scanner runs a funded job only when its offer is covered in full.
+- A lookup, probe, relay or audit offer could draw from a lot that died
+  before the offer was charged, so the server received credits already
+  gone. Every offer now leaves out the lots that die within its lifetime,
+  as scan offers did.
 - An audit counted as bought on the strength of a receipt the ledger
   ignores (dated before its offer, or after the offer lapsed); it now
   takes the receipt the ledger counts, as paid scan jobs already did.

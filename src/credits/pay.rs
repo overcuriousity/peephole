@@ -345,6 +345,18 @@ impl Spending {
     }
 }
 
+/// The oldest lot day an offer written at `now_ms` may draw from: one
+/// buying an audit lives [`super::AUDIT_OFFER_TTL_MS`], any other
+/// [`super::OFFER_TTL_MS`] ([`super::ledger::first_day_for`]).
+fn offer_first_day(now_ms: u64, audit: bool) -> u32 {
+    let ttl = if audit {
+        super::AUDIT_OFFER_TTL_MS
+    } else {
+        super::OFFER_TTL_MS
+    };
+    super::ledger::first_day_for(now_ms, ttl)
+}
+
 /// What `lots` hold from `first_day` on.
 fn available(lots: &[(u32, Mc)], first_day: u32) -> Mc {
     lots.iter()
@@ -363,8 +375,9 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
 
 /// [`make_offer`], naming the scan an audit it buys checks (`audit`).
 /// Offers are written one at a time, each from the lots the ones before
-/// left ([`Spending`]); one that needs more than the node holds draws
-/// the rest from its siblings, one draw at a time.
+/// left ([`Spending`]) that outlive it ([`offer_first_day`]); one that
+/// needs more than the node holds draws the rest from its siblings, one
+/// draw at a time.
 pub async fn make_offer_for(
     node: &Arc<Node>,
     server: NodeId,
@@ -377,7 +390,7 @@ pub async fn make_offer_for(
     if server != me && !node.can_call(&server) {
         return Err("the node cannot be reached from here".into());
     }
-    let first_day = 0;
+    let first_day = offer_first_day(crate::cluster::hlc::wall_ms(), audit.is_some());
     let books = |e: anyhow::Error| format!("this node could not read its books: {e:#}");
     let mut drew = false;
     loop {
@@ -920,6 +933,27 @@ mod tests {
         let counts = node.market.peek().counts;
         assert_eq!(counts.get("abuseipdb"), None, "priced, no offer");
         assert_eq!(counts.get("rdap"), Some(&1.0), "free");
+    }
+
+    /// A lookup, probe or relay offer lives 15 minutes, an audit offer
+    /// more than 12 hours: neither draws from a lot that dies first.
+    #[test]
+    fn an_offer_is_not_drawn_from_a_lot_that_dies_before_it_can_be_charged() {
+        use crate::credits::{AUDIT_OFFER_TTL_MS, DAY_MS, LOT_DAYS};
+        let day = 20_000u32;
+        let oldest = day - (LOT_DAYS - 1);
+        let at = |ms: u64| day as u64 * DAY_MS + ms;
+        // Early in the day: every live lot outlives either offer.
+        assert_eq!(offer_first_day(at(60_000), false), oldest);
+        assert_eq!(offer_first_day(at(60_000), true), oldest);
+        // Ten minutes before midnight: the oldest lot dies within a lookup
+        // offer's lifetime.
+        let late = at(DAY_MS - 10 * 60_000);
+        assert_eq!(offer_first_day(late, false), oldest + 1);
+        // Half an audit offer's lifetime before midnight: the same.
+        let noon = at(DAY_MS - AUDIT_OFFER_TTL_MS / 2);
+        assert_eq!(offer_first_day(noon, false), oldest);
+        assert_eq!(offer_first_day(noon, true), oldest + 1);
     }
 
     #[test]

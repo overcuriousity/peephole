@@ -206,7 +206,8 @@ audits and relay leases. The supply is fixed; prices follow sales.
   to nobody. `peephole credits uptime` lists each member's hours.
 - **Where they go.** Nowhere: nothing burns. A credit keeps its day when
   it changes hands and is gone 7 days after it, so at most six pools are
-  in circulation. Sellers keep what they charge.
+  in circulation. Sellers keep what they charge. An offer never draws
+  from a lot that dies before the offer can be charged.
 - **Prices.** One rule for every good, on each node every 10 minutes: a
   good that sold since the last refresh (or whose every slot is taken)
   gets dearer by at most a factor of e^0.45 an hour; one that sold nothing
