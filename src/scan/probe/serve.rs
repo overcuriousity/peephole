@@ -153,12 +153,12 @@ impl Prober {
         self.gate.check(store, node, ip).await
     }
 
-    /// What a probe costs here now: `table`'s probe price, or the floor
+    /// What a probe costs here now: `table`'s probe price, or 0
     /// before the first refresh. Read by the heartbeat and by `serve`, so
     /// the announced price and the price an offer is checked against are
     /// the same.
     pub fn price(&self, table: &price::Table) -> u32 {
-        table.probe_mc.unwrap_or(price::PRICE_FLOOR as u32)
+        table.probe_mc.unwrap_or(0)
     }
 
     /// Run the probe of `t`; a probe that panicked yields an `error` port
@@ -428,14 +428,11 @@ mod tests {
     }
 
     #[test]
-    fn the_price_is_the_tables_or_the_floor() {
+    fn the_price_is_the_tables_or_zero() {
         let dir = tempfile::tempdir().unwrap();
         let prober = Prober::new(&config_with(dir.path(), ""), None);
         assert_eq!(prober.slots(), prober.max);
-        assert_eq!(
-            prober.price(&price::Table::default()),
-            price::PRICE_FLOOR as u32
-        );
+        assert_eq!(prober.price(&price::Table::default()), 0);
         let table = price::Table {
             probe_mc: Some(4000),
             ..Default::default()

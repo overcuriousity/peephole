@@ -257,6 +257,7 @@ fn good_label(good: &str) -> String {
         credits::price::SCAN => "Scan job".into(),
         credits::price::PROBE => "Probe".into(),
         credits::price::RESOLVE => "Name resolution".into(),
+        credits::price::RDNS => "Reverse names".into(),
         p => crate::intel::provider_info(p)
             .map(|i| i.label.to_string())
             .unwrap_or_else(|| p.to_string()),
@@ -562,7 +563,8 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         credits::price::SCAN => 0,
         credits::price::PROBE => 1,
         credits::price::RESOLVE => 2,
-        _ => 3,
+        credits::price::RDNS => 3,
+        _ => 4,
     };
     let mut keys: Vec<&String> = by_good.keys().collect();
     keys.sort_by_key(|k| (rank(k), good_label(k)));

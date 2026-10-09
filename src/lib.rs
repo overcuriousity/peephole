@@ -325,6 +325,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             node.clone(),
             shutdown_rx.clone(),
         ));
+        // Serve at the kept prices until the first refresh steps them.
+        credits::price::load_kept(node).await?;
         cluster::start(node.clone(), shutdown_rx.clone()).await?;
         tokio::spawn(forward_job_events(
             node.clone(),

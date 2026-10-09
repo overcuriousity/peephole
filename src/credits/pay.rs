@@ -6,7 +6,7 @@
 //! another node answers is paid, whoever owns it.
 use super::entries::{self, Kind, SealState};
 use super::ledger::OfferState;
-use super::{Mc, price, show};
+use super::{Mc, show};
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::Record;
 use crate::cluster::{Node, repl};
@@ -429,8 +429,7 @@ pub async fn serve(
         }
     };
     let table = node.price_table();
-    let price_of =
-        |name: &str| -> Mc { table.price_of(name).unwrap_or(price::PRICE_FLOOR as u32) as Mc };
+    let price_of = |name: &str| -> Mc { table.price_of(name).unwrap_or(0) as Mc };
     let shares = node.lookup_shares();
     let provider = |name: &str| providers.iter().find(|p| p.name() == name);
     // Providers whose on-demand share is spent are declined one by one;

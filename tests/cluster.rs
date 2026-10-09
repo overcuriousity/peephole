@@ -5091,11 +5091,7 @@ async fn a_resolution_for_another_member_is_paid_and_a_failed_one_is_free() {
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     grant_scans(&[&na, &nb], a.id, 8).await;
     market_known(&nb, a.id).await;
-    let cost = price::refresh(&nb.node)
-        .await
-        .unwrap()
-        .price_of(price::RESOLVE)
-        .unwrap() as u64;
+    let cost = priced(&nb, price::RESOLVE, 1).await as u64;
     eventually("a hears b's resolution price", || async {
         dns::resolver_price(&na.node, &b.id) == Some(cost as u32)
     })
@@ -5151,6 +5147,11 @@ async fn announced_prices_follow_demand_and_supply() {
         &[("abuseipdb", Some(1000.0)), ("maxmind-geolite2", None)],
         0.2,
     );
+    // Prices have no floor: what sold nothing is free, what sold leaves 0.
+    let t = price::refresh(&na.node).await.unwrap();
+    assert_eq!(t.price_of("abuseipdb"), Some(0));
+    na.node.market.note("abuseipdb", 10);
+    na.node.market.note("maxmind-geolite2", 10);
     let t = price::refresh(&na.node).await.unwrap();
     let first = t.price_of("abuseipdb").unwrap();
     assert!(first > 0);
@@ -5171,6 +5172,7 @@ async fn announced_prices_follow_demand_and_supply() {
     .await;
     // Demand far above supply: the price rises.
     na.node.market.note("abuseipdb", 10_000);
+    na.node.market.note("maxmind-geolite2", 10);
     let t = price::refresh(&na.node).await.unwrap();
     let risen = t.price_of("abuseipdb").unwrap();
     assert!(risen > first, "{first} then {risen}");
@@ -5273,12 +5275,12 @@ async fn outbound_pair() -> (Addr, Addr, TestNode, TestNode) {
 /// A server nobody can dial is paid for a lookup like any other.
 #[tokio::test]
 async fn a_paid_lookup_from_an_outbound_only_server() {
-    use peephole::credits::{self, entries, price};
+    use peephole::credits::{self, entries};
     use std::sync::atomic::Ordering;
     let (a, b, na, nb) = outbound_pair().await;
     let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
     grant_scans(&[&na, &nb], a.id, 8).await;
-    price::refresh(&nb.node).await.unwrap();
+    priced(&nb, "abuseipdb", 1).await;
     let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
     assert!(cost > 0);
     market_known(&nb, a.id).await;
@@ -5317,11 +5319,7 @@ async fn a_resolution_by_an_outbound_only_member() {
     let (a, b, na, nb) = outbound_pair().await;
     grant_scans(&[&na, &nb], a.id, 8).await;
     market_known(&nb, a.id).await;
-    let cost = price::refresh(&nb.node)
-        .await
-        .unwrap()
-        .price_of(price::RESOLVE)
-        .unwrap() as u64;
+    let cost = priced(&nb, price::RESOLVE, 1).await as u64;
     eventually("a hears b's resolution price", || async {
         dns::resolver_price(&na.node, &b.id) == Some(cost as u32)
     })
@@ -5519,7 +5517,7 @@ async fn an_oversized_routed_call_is_refused_before_sending() {
 /// nodes hold the offer and the receipt and arrive at the same balances.
 #[tokio::test]
 async fn a_paid_lookup_moves_credits_from_the_asker_to_the_server() {
-    use peephole::credits::{self, entries, price};
+    use peephole::credits::{self, entries};
     use std::sync::atomic::Ordering;
     let (ia, a) = new_node("node-alpha");
     let (ib, b) = new_node("node-bravo");
@@ -5527,7 +5525,7 @@ async fn a_paid_lookup_moves_credits_from_the_asker_to_the_server() {
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
     grant_scans(&[&na, &nb], a.id, 8).await;
-    price::refresh(&nb.node).await.unwrap();
+    priced(&nb, "abuseipdb", 1).await;
     let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
     assert!(cost > 0);
     market_known(&nb, a.id).await;
@@ -5568,7 +5566,7 @@ async fn a_paid_lookup_moves_credits_from_the_asker_to_the_server() {
 /// provider and still serves what has no budget.
 #[tokio::test]
 async fn an_asker_without_credits_is_declined_with_the_reason() {
-    use peephole::credits::{self, entries, price};
+    use peephole::credits::{self, entries};
     use std::sync::atomic::Ordering;
     let (ia, a) = new_node("node-alpha");
     let (ib, b) = new_node("node-bravo");
@@ -5580,7 +5578,7 @@ async fn an_asker_without_credits_is_declined_with_the_reason() {
         &[("abuseipdb", Some(5.0)), ("maxmind-geolite2", None)],
         0.2,
     );
-    price::refresh(&nb.node).await.unwrap();
+    priced(&nb, "abuseipdb", 1).await;
     price_seen(&na, b.id, "abuseipdb").await;
     market_known(&nb, a.id).await;
     let none: peephole::intel::Providers = vec![];
@@ -5674,14 +5672,14 @@ async fn a_lookup_answered_by_the_nodes_own_provider_is_free() {
 /// server gains.
 #[tokio::test]
 async fn a_payment_destroys_nothing() {
-    use peephole::credits::{self, price};
+    use peephole::credits::{self};
     let (ia, a) = new_node("node-alpha");
     let (ib, b) = new_node("node-bravo");
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
     grant_scans(&[&na, &nb], a.id, 8).await;
-    price::refresh(&nb.node).await.unwrap();
+    priced(&nb, "abuseipdb", 1).await;
     price_seen(&na, b.id, "abuseipdb").await;
     market_known(&nb, a.id).await;
     let none: peephole::intel::Providers = vec![];
@@ -5887,7 +5885,7 @@ async fn a_member_of_an_earlier_version_is_not_asked() {
 /// dataset: no offer, nobody asked. "Ask again" pays.
 #[tokio::test]
 async fn a_paid_lookup_of_a_recorded_address_is_kept_and_then_free_for_everyone() {
-    use peephole::credits::{entries, price};
+    use peephole::credits::entries;
     use peephole::intel::lookup;
     use std::sync::atomic::Ordering;
     let (ia, a) = new_node("node-alpha");
@@ -5898,7 +5896,7 @@ async fn a_paid_lookup_of_a_recorded_address_is_kept_and_then_free_for_everyone(
     let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
     let asked = serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
     grant_scans(&[&na, &nb], a.id, 8).await;
-    price::refresh(&nb.node).await.unwrap();
+    priced(&nb, "abuseipdb", 1).await;
     price_seen(&na, b.id, "abuseipdb").await;
     market_known(&nb, a.id).await;
     // c's trap recorded a request from the address.
@@ -5975,7 +5973,7 @@ async fn a_paid_lookup_of_a_recorded_address_is_kept_and_then_free_for_everyone(
 /// nothing about the address is written on any node.
 #[tokio::test]
 async fn a_paid_lookup_of_an_unrecorded_address_writes_nothing() {
-    use peephole::credits::{entries, price};
+    use peephole::credits::entries;
     use peephole::intel::lookup;
     let (ia, a) = new_node("node-alpha");
     let (ib, b) = new_node("node-bravo");
@@ -5983,7 +5981,7 @@ async fn a_paid_lookup_of_an_unrecorded_address_writes_nothing() {
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
     grant_scans(&[&na, &nb], a.id, 8).await;
-    price::refresh(&nb.node).await.unwrap();
+    priced(&nb, "abuseipdb", 1).await;
     price_seen(&na, b.id, "abuseipdb").await;
     market_known(&nb, a.id).await;
     let none: peephole::intel::Providers = vec![];
@@ -6098,7 +6096,6 @@ fn sections(html: &str) -> Vec<String> {
 /// and what was charged.
 #[tokio::test]
 async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page() {
-    use peephole::credits::price;
     let tools = tempfile::tempdir().unwrap();
     let (ia, a) = new_node("node-alpha");
     let (ib, b) = new_node("node-bravo");
@@ -6115,7 +6112,7 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     .await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
     grant_scans(&[&na, &nb], a.id, 8).await;
-    price::refresh(&nb.node).await.unwrap();
+    priced(&nb, "abuseipdb", 1).await;
     let cost = price_seen(&na, b.id, "abuseipdb").await;
     market_known(&nb, a.id).await;
     // A recorded address with requests and a finished scan.
@@ -6244,7 +6241,7 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
     grant_scans(&[&na, &nb], a.id, 8).await;
-    price::refresh(&nb.node).await.unwrap();
+    priced(&nb, "abuseipdb", 1).await;
     price::refresh(&na.node).await.unwrap();
     let cost = price_seen(&na, b.id, "abuseipdb").await as u64;
     market_known(&nb, a.id).await;
@@ -6503,18 +6500,14 @@ async fn a_declined_offer_frees_its_credits_for_the_next() {
 /// released at once: what it held is free again on the asker.
 #[tokio::test]
 async fn an_offer_declined_for_the_askers_standing_is_released() {
-    use peephole::credits::{self, pay, price};
+    use peephole::credits::{self, pay};
     let (ia, a) = new_node("node-alpha");
     let (ib, b) = new_node("node-bravo");
     let na = boot(ia, &a, &[&b], DEFAULT).await;
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
     grant_scans(&[&na, &nb], a.id, 1).await;
-    let cost = price::refresh(&nb.node)
-        .await
-        .unwrap()
-        .price_of("abuseipdb")
-        .unwrap() as u64;
+    let cost = priced(&nb, "abuseipdb", 1).await as u64;
     price_seen(&na, b.id, "abuseipdb").await;
     market_known(&nb, a.id).await;
     sqlx::query("INSERT INTO forked (origin, seq, found_at) VALUES (?, 7, datetime('now'))")
@@ -6697,10 +6690,11 @@ async fn a_paid_probe_is_accepted_served_and_charged() {
     let target = probe_target().await;
     probes(&nb, target);
     grant_scans(&[&na, &nb], a.id, 8).await;
-    let table = price::refresh(&nb.node).await.unwrap();
+    priced(&nb, price::PROBE, 1).await;
+    let table = nb.node.price_table();
     let cost = nb.prober().unwrap().price(&table);
     assert_eq!(Some(cost), table.probe_mc);
-    assert!(cost as u64 >= price::PRICE_FLOOR);
+    assert!(cost >= 1);
     market_known(&na, b.id).await;
     market_known(&nb, a.id).await;
     nb.refresh_heartbeat();
@@ -6759,7 +6753,8 @@ async fn a_paid_probe_by_an_outbound_only_scanner() {
     let target = probe_target().await;
     probes(&nb, target);
     grant_scans(&[&na, &nb], a.id, 8).await;
-    let table = price::refresh(&nb.node).await.unwrap();
+    priced(&nb, price::PROBE, 1).await;
+    let table = nb.node.price_table();
     let cost = nb.prober().unwrap().price(&table);
     market_known(&na, b.id).await;
     market_known(&nb, a.id).await;
