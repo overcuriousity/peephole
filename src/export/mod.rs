@@ -47,6 +47,10 @@ pub struct ExportOptions {
     pub mode: Mode,
     /// Node names by node id, for the `node` columns.
     pub names: HashMap<Vec<u8>, String>,
+    /// This node's own addresses and names, removed from every scan's XML
+    /// as it is served (`scan::scrub`): scans signed before scrubbing
+    /// existed still carry them.
+    pub own: crate::scan::scrub::Own,
 }
 
 /// One exported row. See [`COLUMNS`] for the order in CSV.
@@ -529,7 +533,7 @@ fn scan_json(s: &ScanOut, ports: &[crate::store::export::PortOut], opts: &Export
     let xml = s.raw_xml.as_ref().and_then(|b| {
         crate::store::inspect::zstd_decode_capped(b, crate::store::inspect::MAX_RAW_XML)
             .ok()
-            .map(|x| String::from_utf8_lossy(&x).into_owned())
+            .map(|x| String::from_utf8_lossy(&opts.own.apply(&x)).into_owned())
     });
     json!({
         "level": s.level,
@@ -543,6 +547,7 @@ fn scan_json(s: &ScanOut, ports: &[crate::store::export::PortOut], opts: &Export
         "build": s.build,
         "scanner": s.scanner.as_deref().map(|id| node_name(&opts.names, id)),
         "os_guess": s.os_guess,
+        "scrubbed": s.scrubbed,
         "ports": ports,
         "host_keys": s.host_keys,
         "facts": s.facts,
@@ -1003,6 +1008,59 @@ mod tests {
 
     fn text(parts: &[axum::body::Bytes]) -> String {
         parts.iter().map(|b| String::from_utf8_lossy(b)).collect()
+    }
+
+    #[tokio::test]
+    async fn served_xml_scrubs_this_nodes_own_address() {
+        use futures::TryStreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let row = s.upsert_ip("192.0.2.7".parse().unwrap()).await.unwrap();
+        s.insert_request(&NewRequest {
+            ip_id: row.id,
+            method: "GET".into(),
+            path: "/".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        s.enqueue_scan(row.id, 2, 0).await.unwrap();
+        let job = s.next_queued_job().await.unwrap().unwrap();
+        // A scan stored by a build before scrubbing: the greeting is in it.
+        let xml = String::from_utf8(include_bytes!("../../tests/fixtures/nmap-basic.xml").to_vec())
+            .unwrap()
+            .replacen(
+                "</port>",
+                r#"<script id="smtp-commands" output="Hello scanner-5.example.net [198.51.100.5]"/></port>"#,
+                1,
+            );
+        let res = crate::scan::nmap_xml::parse_nmap_xml(xml.as_bytes()).unwrap();
+        s.finish_job(job.id, Some(&res), None).await.unwrap();
+
+        let opts = ExportOptions {
+            mode: Mode::Full,
+            names: HashMap::new(),
+            own: crate::scan::scrub::Own {
+                addrs: vec!["198.51.100.5".parse().unwrap()],
+                names: vec!["scanner-5.example.net".into()],
+            },
+        };
+        let parts: Vec<axum::body::Bytes> =
+            stream_requests(s.clone(), ExportFilter::default(), Format::Jsonl, opts)
+                .try_collect()
+                .await
+                .unwrap();
+        let out = text(&parts);
+        let r: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        let served = r["scans"][0]["xml"].as_str().unwrap();
+        assert!(served.contains("Hello [scanner] [[scanner]]"), "{served}");
+        assert!(!served.contains("198.51.100.5"));
+        assert_eq!(r["scans"][0]["scrubbed"], 0, "as the scanner signed it");
+        // The stored XML is untouched: only what is served changes.
+        let stored = s.scan_raw_xml(1).await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&stored).contains("198.51.100.5"));
     }
 
     #[tokio::test]

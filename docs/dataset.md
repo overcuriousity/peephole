@@ -179,6 +179,10 @@ scan is an audit: the `uid` of the scan it checks. An audit is a scan run
 again by another scanner, not a counter-scan of its own; its `node` and
 `scanner` are the auditing node, and its `status` is its own (`done` once
 it finished), not that of the job it checks.
+`scrubbed`: how many times the scanner replaced its own address or name
+with `[scanner]` in `xml` before signing the scan (0 for scans from before
+0.10.0). The exporting node also removes its own addresses and names from
+every scan's `xml` as it writes the file.
 
 **`names`**: host names known to point at the address, by name.
 

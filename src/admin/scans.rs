@@ -483,6 +483,7 @@ async fn scan_xml(
     let Some(xml) = st.store.scan_raw_xml(id).await? else {
         return Err(AppError::NotFound);
     };
+    let xml = st.own_identity().await.apply(&xml);
     Ok((
         [
             (header::CONTENT_TYPE, "application/xml".to_string()),

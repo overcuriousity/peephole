@@ -94,6 +94,7 @@ pub struct ScanOut {
     pub build: String,
     pub uid: Option<String>,
     pub audit_of: Option<String>,
+    pub scrubbed: i64,
     /// Read separately, by scan.
     #[sqlx(skip)]
     pub host_keys: Vec<KeyOut>,
@@ -316,7 +317,7 @@ impl Store {
                     CASE WHEN s.audit_of IS NULL THEN j.status
                          WHEN s.finished_at IS NOT NULL THEN 'done' END AS status,
                     CASE WHEN s.audit_of IS NULL THEN j.scanner ELSE s.origin END AS scanner,
-                    s.origin, s.build, s.uid, s.audit_of
+                    s.origin, s.build, s.uid, s.audit_of, s.scrubbed
              FROM scans s LEFT JOIN scan_jobs j ON j.id = s.job_id
              WHERE s.ip_id IN (SELECT value FROM json_each(?)) ORDER BY s.id",
         )

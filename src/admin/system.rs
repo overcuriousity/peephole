@@ -284,7 +284,11 @@ async fn export_download(
         state.store.clone(),
         filter,
         format,
-        crate::export::ExportOptions { mode, names },
+        crate::export::ExportOptions {
+            mode,
+            names,
+            own: state.own_identity().await,
+        },
     ));
     (
         [
