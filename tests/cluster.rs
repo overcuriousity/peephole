@@ -5170,8 +5170,8 @@ async fn announced_prices_follow_demand_and_supply() {
         seen(first)
     })
     .await;
-    // Demand far above supply: the price rises.
-    na.node.market.note("abuseipdb", 10_000);
+    // Sold again: the price rises.
+    na.node.market.note("abuseipdb", 10);
     na.node.market.note("maxmind-geolite2", 10);
     let t = price::refresh(&na.node).await.unwrap();
     let risen = t.price_of("abuseipdb").unwrap();
@@ -5672,7 +5672,7 @@ async fn a_lookup_answered_by_the_nodes_own_provider_is_free() {
 /// server gains.
 #[tokio::test]
 async fn a_payment_destroys_nothing() {
-    use peephole::credits::{self};
+    use peephole::credits;
     let (ia, a) = new_node("node-alpha");
     let (ib, b) = new_node("node-bravo");
     let na = boot(ia, &a, &[&b], DEFAULT).await;

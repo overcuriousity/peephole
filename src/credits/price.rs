@@ -392,18 +392,22 @@ fn price_key(good: &str) -> String {
     format!("price:{good}")
 }
 
-/// Where `good`'s next step starts: the last price here, the kept one,
-/// or what members announce.
-async fn current(node: &Node, old: &Table, good: &str, announced: &[u32]) -> Result<Mc> {
-    if let Some(p) = old.price_of(good) {
-        return Ok(p as Mc);
-    }
-    if let Some(p) = node
+/// The price of `good` this node kept across restarts.
+async fn kept_price(node: &Node, good: &str) -> Result<Option<Mc>> {
+    Ok(node
         .store
         .intel_get(&price_key(good))
         .await?
-        .and_then(|v| v.parse::<Mc>().ok())
-    {
+        .and_then(|v| v.parse::<Mc>().ok()))
+}
+
+/// Where `good`'s next step starts: the last price here (of a table a
+/// refresh made), the kept one, or what members announce.
+async fn current(node: &Node, old: &Table, good: &str, announced: &[u32]) -> Result<Mc> {
+    if let Some(p) = old.price_of(good).filter(|_| old.at_ms > 0) {
+        return Ok(p as Mc);
+    }
+    if let Some(p) = kept_price(node, good).await? {
         return Ok(p);
     }
     Ok(start(announced))
@@ -421,9 +425,9 @@ pub async fn granted_scans(pool: &sqlx::SqlitePool) -> Result<HashMap<NodeId, Ve
          JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
          WHERE s.audit_of IS NULL AND s.origin IS NOT NULL AND s.job_uid IS NOT NULL
            AND j.arbiter IS NOT s.origin
-           AND s.finished_at > datetime('now', '-1 hour')
-           AND s.finished_at <= datetime('now')
-         GROUP BY s.origin, s.job_uid",
+         GROUP BY s.origin, s.job_uid
+         HAVING MIN(s.finished_at) > datetime('now', '-1 hour')
+            AND MIN(s.finished_at) <= datetime('now')",
     )
     .fetch_all(pool)
     .await?;
@@ -506,25 +510,13 @@ fn as_mc(p: Mc) -> u32 {
 /// Seed this node's table from the prices it kept, so a restart serves
 /// at them until the first refresh steps them.
 pub async fn load_kept(node: &Node) -> Result<()> {
-    let kept = |good: &str| {
-        let store = node.store.clone();
-        let key = price_key(good);
-        async move {
-            store
-                .intel_get(&key)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|v| v.parse::<Mc>().ok())
-        }
-    };
     let mut t = Table {
-        resolve_mc: kept(RESOLVE).await.map_or(0, as_mc),
-        rdns_mc: kept(RDNS).await.map_or(0, as_mc),
+        resolve_mc: kept_price(node, RESOLVE).await?.map_or(0, as_mc),
+        rdns_mc: kept_price(node, RDNS).await?.map_or(0, as_mc),
         ..Default::default()
     };
     if node.prober().is_some() {
-        t.probe_mc = kept(PROBE).await.map(as_mc);
+        t.probe_mc = kept_price(node, PROBE).await?.map(as_mc);
     }
     for p in node
         .lookup_providers()
@@ -532,7 +524,7 @@ pub async fn load_kept(node: &Node) -> Result<()> {
         .flatten()
         .filter(|p| p.ready())
     {
-        if let Some(mc) = kept(p.name()).await {
+        if let Some(mc) = kept_price(node, p.name()).await? {
             t.offers.push(Offer {
                 provider: p.name().to_string(),
                 price_mc: as_mc(mc),
@@ -970,6 +962,24 @@ mod tests {
         assert_eq!(start(&[100, 400]), 100, "lower median");
         assert_eq!(start(&[0, 0]), 0);
         assert_eq!(start(&[0, 400]), 0, "a free announcement counts");
+    }
+
+    #[tokio::test]
+    async fn a_node_without_a_refreshed_table_starts_from_what_members_announce() {
+        let (_dir, node) = test_node().await;
+        let old = Table::default();
+        assert_eq!(
+            current(&node, &old, RESOLVE, &[300, 100, 200])
+                .await
+                .unwrap(),
+            200
+        );
+        node.store.intel_set(&price_key(RDNS), "9").await.unwrap();
+        assert_eq!(
+            current(&node, &old, RDNS, &[300]).await.unwrap(),
+            9,
+            "kept wins"
+        );
     }
 
     #[tokio::test]
