@@ -38,6 +38,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   its earlier admissions). Before, a member could sign admissions at
   made-up sequences dated back over weeks and push them, admitting far
   more than 20 nodes a day on every node it reached.
+- Cluster: the membership sent ahead in a push, a pull reply or a join
+  reply is taken up to 2000 entries, as many as an honest one carries (a
+  longer push is refused), and each is looked at twice at most. Before, a
+  peer could send any number and hold the database's write lock for a
+  time growing with its square.
 
 ## [0.10.0] - 2026-10-09
 

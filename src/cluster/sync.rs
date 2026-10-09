@@ -71,6 +71,22 @@ pub struct Batch {
     pub membership: Vec<WireEntry>,
 }
 
+impl Batch {
+    /// Longer than any honest batch (floors and bounds: at most one per
+    /// origin asked for); a pushed one like that is refused.
+    pub fn too_large(&self) -> bool {
+        [
+            self.entries.len(),
+            self.proofs.len(),
+            self.floors.len(),
+            self.bounds.len(),
+        ]
+        .iter()
+        .any(|n| *n > 5 * BATCH_ENTRIES)
+            || self.membership.len() > repl::MEMBERSHIP_AHEAD
+    }
+}
+
 impl From<Vec<WireEntry>> for Batch {
     fn from(entries: Vec<WireEntry>) -> Self {
         Self {
@@ -429,4 +445,44 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         debug!(peer = %name, pulled, pushed, ms = started.elapsed().as_millis() as u64, "sync round");
     }
     Ok(stuck)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::identity::Identity;
+    use crate::cluster::record::{MemberInfo, Record};
+
+    /// A pushed batch is refused when any of its lists is longer than an
+    /// honest one, the membership sent ahead included.
+    #[test]
+    fn a_batch_longer_than_an_honest_one_is_too_large() {
+        let id = Identity::generate().unwrap();
+        let e = WireEntry::sign(
+            &id,
+            1,
+            1 << 16,
+            &Record::MemberUpdate(MemberInfo {
+                id: id.id,
+                name: "m".into(),
+                address: None,
+                roles: vec![],
+                proto_min: 1,
+                proto_max: 1,
+                remote_config: false,
+            }),
+        )
+        .unwrap();
+        let fine = Batch {
+            entries: vec![e.clone(); 5 * BATCH_ENTRIES],
+            membership: vec![e.clone(); repl::MEMBERSHIP_AHEAD],
+            ..Default::default()
+        };
+        assert!(!fine.too_large());
+        let long = Batch {
+            membership: vec![e; repl::MEMBERSHIP_AHEAD + 1],
+            ..Default::default()
+        };
+        assert!(long.too_large());
+    }
 }

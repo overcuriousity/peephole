@@ -125,16 +125,7 @@ async fn push(
     Extension(Peer(peer)): Extension<Peer>,
     Cbor(batch): Cbor<Batch>,
 ) -> Response {
-    // Floors and bounds: at most one per origin asked for in an honest batch.
-    if [
-        batch.entries.len(),
-        batch.proofs.len(),
-        batch.floors.len(),
-        batch.bounds.len(),
-    ]
-    .iter()
-    .any(|n| *n > 5 * BATCH_ENTRIES)
-    {
+    if batch.too_large() {
         return (StatusCode::PAYLOAD_TOO_LARGE, "too many entries").into_response();
     }
     let kinds = super::traffic::Kinds::of(&batch.entries);

@@ -424,7 +424,7 @@ pub async fn entries_after(
 }
 
 /// Most membership entries sent ahead in one batch.
-const MEMBERSHIP_AHEAD: usize = 2000;
+pub(crate) const MEMBERSHIP_AHEAD: usize = 2000;
 
 /// Every membership entry this node holds with its payload, oldest first:
 /// the cluster's membership for a node that is just joining.
@@ -446,11 +446,13 @@ pub async fn membership_entries(store: &crate::store::Store) -> Result<Vec<WireE
 /// origin's log stays gap-free. Each must be signed by its origin, and its
 /// origin trusted here, perhaps through an admission earlier in the same
 /// list, and keep its origin's order like an entry of the log would (see
-/// [`ahead_in_order`]). Returns how many were taken.
+/// [`ahead_in_order`]). Only the first [`MEMBERSHIP_AHEAD`] are looked at,
+/// as many as an honest list carries. Returns how many were taken.
 pub async fn apply_membership_ahead(node: &Node, entries: &[WireEntry]) -> Result<usize> {
     let me = node.id();
     let mut todo: Vec<&WireEntry> = entries
         .iter()
+        .take(MEMBERSHIP_AHEAD)
         .filter(|e| {
             e.origin != me
                 && e.payload.is_some()
@@ -466,15 +468,18 @@ pub async fn apply_membership_ahead(node: &Node, entries: &[WireEntry]) -> Resul
     let mut taken = 0;
     // The last entry taken of each origin: (seq, hlc).
     let mut last: HashMap<NodeId, (u64, u64)> = HashMap::new();
-    loop {
-        let mut rest = vec![];
-        let before = taken;
+    // Entries of origins not trusted (yet), by origin: looked at again only
+    // once an entry taken admits their origin, so each is looked at twice
+    // at most.
+    let mut waiting: HashMap<NodeId, Vec<&WireEntry>> = HashMap::new();
+    while !todo.is_empty() {
+        let mut admitted = vec![];
         for e in todo {
             if is_purged(&mut tx, &e.origin).await? || hlc::ahead(e.hlc, hlc::wall_ms()) {
                 continue;
             }
             if !trusted(node, &mut tx, &e.origin).await? {
-                rest.push(e);
+                waiting.entry(e.origin).or_default().push(e);
                 continue;
             }
             if !ahead_in_order(&mut tx, e, last.get(&e.origin).copied()).await? {
@@ -483,14 +488,20 @@ pub async fn apply_membership_ahead(node: &Node, entries: &[WireEntry]) -> Resul
             let Some(r) = e.record().filter(|_| e.verify()) else {
                 continue;
             };
+            if let Record::MemberAdd(info) = &r {
+                admitted.push(info.id);
+            }
             super::members::apply(node, &mut tx, e, &r, hlc::to_db(e.hlc) as u64).await?;
             last.insert(e.origin, (e.seq, e.hlc));
             taken += 1;
         }
-        todo = rest;
-        if taken == before || todo.is_empty() {
-            break;
+        todo = vec![];
+        for id in admitted {
+            if waiting.contains_key(&id) && trusted(node, &mut tx, &id).await? {
+                todo.extend(waiting.remove(&id).unwrap_or_default());
+            }
         }
+        todo.sort_by_key(|e| (e.hlc, e.seq));
     }
     tx.commit().await?;
     drop(guard);
@@ -2694,6 +2705,55 @@ mod tests {
             0
         );
         assert!(!node.members().contains_key(&y.id));
+    }
+
+    /// Membership sent ahead is taken up to what an honest batch carries,
+    /// whoever sent the list (a pushed batch, a pull reply, a join reply).
+    #[tokio::test]
+    async fn membership_ahead_takes_at_most_a_batch() {
+        let (_d, node) = test_node(0).await;
+        let m = Identity::generate().unwrap();
+        super::append(&node, &[Record::MemberAdd(info(m.id, "m"))])
+            .await
+            .unwrap();
+        let base = super::hlc::wall_ms() - 3_600_000;
+        let list: Vec<WireEntry> = (1..=super::MEMBERSHIP_AHEAD as u64 + 1)
+            .map(|n| {
+                let me = Record::MemberUpdate(info(m.id, &format!("m{n}")));
+                WireEntry::sign(&m, n, (base + n) << 16, &me).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            super::apply_membership_ahead(&node, &list).await.unwrap(),
+            super::MEMBERSHIP_AHEAD
+        );
+    }
+
+    /// An admission earlier in the list makes its member's entries count,
+    /// also those dated before it.
+    #[tokio::test]
+    async fn membership_ahead_follows_admissions_in_any_order() {
+        let (_d, node) = test_node(0).await;
+        let (m, x, y) = (
+            Identity::generate().unwrap(),
+            Identity::generate().unwrap(),
+            Identity::generate().unwrap(),
+        );
+        super::append(&node, &[Record::MemberAdd(info(m.id, "m"))])
+            .await
+            .unwrap();
+        let base = super::hlc::wall_ms() - 3_600_000;
+        let x_adds_y =
+            WireEntry::sign(&x, 2, base << 16, &Record::MemberAdd(info(y.id, "y"))).unwrap();
+        let m_adds_x =
+            WireEntry::sign(&m, 2, (base + 1) << 16, &Record::MemberAdd(info(x.id, "x"))).unwrap();
+        assert_eq!(
+            super::apply_membership_ahead(&node, &[x_adds_y, m_adds_x])
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(node.members().contains_key(&y.id));
     }
 
     /// Membership sent ahead keeps its origin's order: a member cannot sign
