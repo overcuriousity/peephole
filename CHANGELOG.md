@@ -157,6 +157,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - The Decoys page fetched a row per LLM decoy request of the range (the
   whole history for "all time") on every view, only to count them. The
   database counts them now.
+- An audit counted as bought on the strength of a receipt the ledger
+  ignores (dated before its offer, or after the offer lapsed); it now
+  takes the receipt the ledger counts, as paid scan jobs already did.
 
 ## [0.10.0] - 2026-10-09
 

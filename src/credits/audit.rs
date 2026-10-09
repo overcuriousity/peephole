@@ -501,33 +501,44 @@ fn economy() -> i64 {
     i64::from(crate::cluster::record::ECONOMY)
 }
 
+/// The SQL condition under which the receipt `r` is the one the ledger
+/// counts for the offer `o` (`credits::ledger`): written by the node offered
+/// to, dated after the offer and no later than its lifetime (the parameter
+/// `ttl`, in ms) after it, and the first such. `economy` names the
+/// parameter holding the economy.
+fn counted_receipt(economy: &str, ttl: &str) -> String {
+    format!(
+        "r.kind = 'receipt' AND r.economy = {economy}
+         AND r.origin = o.peer AND r.peer = o.origin AND r.offer_seq = o.seq
+         AND r.hlc > o.hlc AND (r.hlc >> 16) <= (o.hlc >> 16) + {ttl}
+         AND NOT EXISTS (SELECT 1 FROM credit_entries f
+                         WHERE f.kind = 'receipt' AND f.economy = {economy}
+                           AND f.origin = r.origin AND f.peer = r.peer
+                           AND f.offer_seq = r.offer_seq
+                           AND f.hlc > o.hlc AND (f.hlc >> 16) <= (o.hlc >> 16) + {ttl}
+                           AND (f.hlc < r.hlc OR (f.hlc = r.hlc AND f.seq < r.seq)))"
+    )
+}
+
 /// Whether the job `job_uid` that `arbiter` granted to `scanner` was paid
-/// for: an offer of the arbiter funding it whose first receipt the ledger
-/// counts (dated after the offer, and before it lapsed after
-/// [`crate::credits::JOB_OFFER_TTL_MS`]) charged something. Only the scans of paid jobs are
-/// designated: a scanner paid nothing for a job may hold nothing to buy
-/// its audit with.
+/// for: an offer of the arbiter funding it whose receipt the ledger counts
+/// ([`counted_receipt`], within [`crate::credits::JOB_OFFER_TTL_MS`])
+/// charged something. Only the scans of paid jobs are designated: a
+/// scanner paid nothing for a job may hold nothing to buy its audit with.
 pub async fn job_paid(
     pool: &SqlitePool,
     job_uid: &str,
     arbiter: &[u8],
     scanner: &[u8],
 ) -> Result<bool> {
-    Ok(sqlx::query_scalar(
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT EXISTS (
            SELECT 1 FROM credit_entries o
-           JOIN credit_entries r ON r.kind = 'receipt' AND r.economy = ?4 AND r.charged_mc > 0
-                AND r.origin = o.peer AND r.peer = o.origin AND r.offer_seq = o.seq
-                AND r.hlc > o.hlc AND (r.hlc >> 16) <= (o.hlc >> 16) + ?5
-                AND NOT EXISTS (SELECT 1 FROM credit_entries f
-                                WHERE f.kind = 'receipt' AND f.economy = ?4
-                                  AND f.origin = r.origin AND f.peer = r.peer
-                                  AND f.offer_seq = r.offer_seq
-                                  AND f.hlc > o.hlc AND (f.hlc >> 16) <= (o.hlc >> 16) + ?5
-                                  AND (f.hlc < r.hlc OR (f.hlc = r.hlc AND f.seq < r.seq)))
+           JOIN credit_entries r ON r.charged_mc > 0 AND {}
            WHERE o.kind = 'offer' AND o.economy = ?4 AND o.job_uid = ?1
              AND o.origin = ?2 AND o.peer = ?3)",
-    )
+        counted_receipt("?4", "?5")
+    )))
     .bind(job_uid)
     .bind(arbiter)
     .bind(scanner)
@@ -543,7 +554,7 @@ pub async fn job_paid(
 /// those with no auditor to buy from), and how many of them it bought: an
 /// audit by one of the scan's [`auditors`] (by `members` as held here),
 /// with an audit offer from the scanner to that auditor naming the scan
-/// that its first receipt (the one the ledger counts) charged.
+/// that the receipt the ledger counts ([`counted_receipt`]) charged.
 pub async fn obligations(
     pool: &SqlitePool,
     members: &[MemberRow],
@@ -566,20 +577,15 @@ pub async fn obligations(
     .fetch_all(pool)
     .await?;
     // (scan uid, auditor) of every audit the scanner paid its auditor for.
-    let paid: Vec<(String, Vec<u8>)> = sqlx::query_as(
+    let paid: Vec<(String, Vec<u8>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT o.audit_uid, o.peer FROM credit_entries o
-         JOIN credit_entries r ON r.kind = 'receipt' AND r.economy = ?1 AND r.charged_mc > 0
-              AND r.origin = o.peer AND r.peer = o.origin AND r.offer_seq = o.seq
-              -- The first receipt for the offer: the one the ledger counts.
-              AND NOT EXISTS (SELECT 1 FROM credit_entries f
-                              WHERE f.kind = 'receipt' AND f.economy = ?1
-                                AND f.origin = r.origin AND f.peer = r.peer
-                                AND f.offer_seq = r.offer_seq
-                                AND (f.hlc < r.hlc OR (f.hlc = r.hlc AND f.seq < r.seq)))
+         JOIN credit_entries r ON r.charged_mc > 0 AND {}
          JOIN scans a ON a.audit_of = o.audit_uid AND a.origin = o.peer
          WHERE o.kind = 'offer' AND o.economy = ?1 AND o.audit_uid IS NOT NULL",
-    )
+        counted_receipt("?1", "?2")
+    )))
     .bind(economy())
+    .bind(crate::credits::AUDIT_OFFER_TTL_MS as i64)
     .fetch_all(pool)
     .await?;
     let paid: std::collections::HashSet<(String, Vec<u8>)> = paid.into_iter().collect();
@@ -1254,7 +1260,7 @@ mod tests {
                 "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, economy)
                  VALUES (?1, 1, ?2, 'receipt', ?3, '[]', ?4, 4, '[\"audit\"]', 0, 2)",
             )
-            .bind(&by.0[..]).bind(hlc::to_db(day_ago(0))).bind(&s.0[..]).bind(n + 1)
+            .bind(&by.0[..]).bind(hlc::to_db(day_ago(0) + 2)).bind(&s.0[..]).bind(n + 1)
             .execute(pool).await.unwrap();
         }
         let got = obligations(pool, &members, now).await.unwrap();
@@ -1267,7 +1273,7 @@ mod tests {
              VALUES (?1, 0, ?2, 'receipt', ?3, '[]', 1, 0, '[]', 0, 2)",
         )
         .bind(&auditor.0[..])
-        .bind(hlc::to_db(day_ago(1)))
+        .bind(hlc::to_db(day_ago(0) + 1))
         .bind(&s.0[..])
         .execute(pool)
         .await
@@ -1277,6 +1283,56 @@ mod tests {
         // Alone, the scanner has no auditor: nothing is owed.
         let alone = obligations(pool, &members[..1], now).await.unwrap();
         assert_eq!(alone.get(&s), None, "{alone:?}");
+    }
+
+    /// An audit receipt counts as bought only where the ledger counts it:
+    /// dated after its offer and before the offer lapsed.
+    #[tokio::test]
+    async fn an_audit_receipt_the_ledger_ignores_buys_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let pool = &store.pool;
+        let (s, arbiter, auditor) = (id(1), id(9), id(2));
+        let members = [scanner_member(1, 7), scanner_member(2, 7)];
+        let ttl = crate::credits::AUDIT_OFFER_TTL_MS;
+        let day = 86_400_000;
+        let offer_ms = hlc::wall_ms() - day;
+        // (name, receipt dated this many ms after the offer, bought)
+        let cases = [
+            ("early", -1i64, false),
+            ("late", ttl as i64 + 1, false),
+            ("in-time", ttl as i64, true),
+        ];
+        for (n, (name, after, _)) in cases.iter().enumerate() {
+            let scan = designated_job(pool, arbiter, s, name, day).await;
+            pay_job(pool, arbiter, s, &format!("job-{name}"), 100 + n as i64, 5).await;
+            sqlx::query(
+                "INSERT INTO scans (ip_id, level, started_at, finished_at, uid, origin, job_uid, audit_of, hlc, job_id)
+                 VALUES (1, 2, datetime('now'), datetime('now'), ?1, ?2, ?3, ?4, ?5,
+                         (SELECT id FROM scan_jobs WHERE uid = ?3))",
+            )
+            .bind(format!("audit-{name}")).bind(&auditor.0[..]).bind(format!("job-{name}")).bind(&scan).bind(hlc::to_db(offer_ms << 16))
+            .execute(pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, seal, economy, audit_uid)
+                 VALUES (?1, ?2, ?3, 'offer', ?4, '[]', 1, 2, ?5)",
+            )
+            .bind(&s.0[..]).bind(n as i64 + 1).bind(hlc::to_db(offer_ms << 16)).bind(&auditor.0[..]).bind(&scan)
+            .execute(pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, economy)
+                 VALUES (?1, ?2, ?3, 'receipt', ?4, '[]', ?2, 4, '[\"audit\"]', 0, 2)",
+            )
+            .bind(&auditor.0[..]).bind(n as i64 + 1)
+            .bind(hlc::to_db(((offer_ms as i64 + after) as u64) << 16)).bind(&s.0[..])
+            .execute(pool).await.unwrap();
+        }
+        let got = obligations(pool, &members, hlc::wall_ms()).await.unwrap();
+        assert_eq!(
+            got.get(&s),
+            Some(&(3, 1)),
+            "only the receipt in time: {got:?}"
+        );
     }
 
     /// The arbiter's offer funding `job` of `scanner`, and the scanner's
