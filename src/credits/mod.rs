@@ -13,6 +13,7 @@ pub mod ledger;
 pub mod mint;
 pub mod pay;
 pub mod price;
+pub mod reach;
 pub mod share;
 
 /// Millicredits: 1 credit = 1000 mc. Sums are `u64`, amounts on the wire
@@ -189,6 +190,10 @@ pub async fn run(
         Err(e) => tracing::warn!(?e, "credits: judging arguments again failed"),
     }
     loop {
+        // The hours that ended since the last tick, once each.
+        if let Err(e) = reach::report_due(&node, crate::cluster::hlc::wall_ms()).await {
+            tracing::debug!(?e, "credits: reach report not written");
+        }
         let judge = earn::Judge {
             pool: &node.store.pool,
             origins: &origins,
@@ -225,7 +230,13 @@ pub async fn run(
             let pool = &node.store.pool;
             if let Err(e) = async {
                 entries::prune(pool, before).await?;
-                earn::prune(pool, before).await
+                earn::prune(pool, before).await?;
+                let hours = (LOT_DAYS + 1) * 24;
+                reach::prune(
+                    pool,
+                    reach::hour_of(crate::cluster::hlc::wall_ms()).saturating_sub(hours),
+                )
+                .await
             }
             .await
             {

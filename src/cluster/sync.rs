@@ -164,6 +164,9 @@ async fn peer_loop(
             reconcile(&node, peer, &addr, hello_due).await
         };
         node.traffic.round(peer, &name, round.is_ok());
+        if round.is_ok() {
+            node.reach.note(peer, super::hlc::wall_ms());
+        }
         match round {
             Ok(stuck) => {
                 if hello_due {

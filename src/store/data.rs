@@ -93,6 +93,7 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
         Record::SkipBatch(b) => skip_batch(conn, ctx, b).await,
         Record::ProbeResult(r) => super::probes::apply_probe_result(conn, ctx, r).await,
         Record::IpName(r) => super::probes::apply_ip_name(conn, ctx, r).await,
+        Record::ReachReport(r) => crate::credits::reach::apply(conn, ctx, r).await,
         // Membership and credits are the cluster layer's (`members::apply`,
         // `credits::entries`, `cluster::seal`): no row of the dataset.
         Record::MemberAdd(_)

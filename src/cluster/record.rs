@@ -388,6 +388,15 @@ fn is_zero_u16(n: &u16) -> bool {
     *n == 0
 }
 
+/// The advertised members the origin completed a sync round with during
+/// one UTC hour (`credits::reach`). One per origin and hour.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReachReportRec {
+    /// Hours since the Unix epoch, UTC.
+    pub hour: u32,
+    pub reached: Vec<NodeId>,
+}
+
 /// A name an admin looked up, with what each node's resolver answered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IpNameRec {
@@ -509,6 +518,7 @@ pub enum Record {
         b: Box<WireEntry>,
     },
     ScanAudit(Box<ScanAuditRec>),
+    ReachReport(ReachReportRec),
 }
 
 /// Kinds whose payload is not stored in the log but rebuilt from their row
@@ -540,6 +550,7 @@ impl Record {
             Record::LogSeal { .. } => "log_seal",
             Record::ForkProof { .. } => "fork_proof",
             Record::ScanAudit(_) => "scan_audit",
+            Record::ReachReport(_) => "reach_report",
         }
     }
 
@@ -700,6 +711,21 @@ impl WireEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reach_report_round_trips() {
+        let r = Record::ReachReport(ReachReportRec {
+            hour: 490_000,
+            reached: vec![NodeId([1; 32]), NodeId([2; 32])],
+        });
+        let bytes = crate::cluster::rpc::cbor::encode(&r).unwrap();
+        assert_eq!(
+            crate::cluster::rpc::cbor::decode::<Record>(&bytes).unwrap(),
+            r
+        );
+        assert_eq!(r.kind(), "reach_report");
+        assert_eq!(r.uid(), None);
+    }
 
     /// Records naming addresses decode on the peers they are sent to.
     #[test]

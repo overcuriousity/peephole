@@ -280,6 +280,9 @@ pub struct Node {
     prober: std::sync::OnceLock<Arc<crate::scan::probe::serve::Prober>>,
     /// This node's lookup prices, as last computed (`credits::price`).
     price_table: RwLock<Arc<crate::credits::price::Table>>,
+    /// The advertised members this node reached, per hour, until reported
+    /// (`credits::reach`).
+    pub reach: crate::credits::reach::Tracker,
     /// Paid requests counted for this node's prices (`credits::price`).
     pub market: crate::credits::price::Demand,
     /// The hourly per-level scanner weights (`scan::weight`).
@@ -355,6 +358,7 @@ impl Node {
             lookup_shares: Default::default(),
             prober: Default::default(),
             price_table: Default::default(),
+            reach: Default::default(),
             market: Default::default(),
             weights: Default::default(),
             scan_budget_mc: Default::default(),

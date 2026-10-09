@@ -12,6 +12,7 @@ pub const USAGE: &str = "usage: peephole credits [CONFIG]                     ba
        peephole credits log [--days N] [CONFIG]     earned, spent, sent, received
        peephole credits members [CONFIG]            every member's balance and standing
        peephole credits why SCAN [CONFIG]           how this node judged one scan (its uid)
+       peephole credits uptime [CONFIG]             each member's reported hours up, 7 days
        peephole credits send NODE AMOUNT [CONFIG]   NODE: name, fingerprint or key";
 
 fn config_path(arg: &str) -> bool {
@@ -66,6 +67,37 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                     show(mc)
                 );
             }
+        }
+        ["uptime"] => {
+            let now = crate::cluster::hlc::wall_ms();
+            let today = (now / super::DAY_MS) as u32;
+            let days: Vec<u32> = (today.saturating_sub(6)..=today).collect();
+            let reports = super::reach::since(&node.store.pool, days[0] * 24).await?;
+            let mut left_out: std::collections::HashSet<_> =
+                crate::cluster::block::list(&node.store)
+                    .await?
+                    .into_iter()
+                    .collect();
+            left_out.extend(crate::cluster::seal::forked_set(&node.store.pool).await?);
+            let all: Vec<members::MemberRow> = members::all(&node.store)
+                .await?
+                .into_iter()
+                .filter(|m| m.active)
+                .collect();
+            let ids: Vec<_> = all.iter().map(|m| m.id).collect();
+            let ignored = super::reach::ignored(&all, &left_out);
+            let up = super::reach::uptime(&reports, &ids, &ignored);
+            let verified = days
+                .iter()
+                .map(|d| (*d, super::reach::verified(&all, &up, *d)))
+                .collect();
+            let names: Vec<_> = all.iter().map(|m| (m.id, m.name.clone())).collect();
+            for line in super::reach::uptime_lines(&names, &up, &verified, &days) {
+                println!("{line}");
+            }
+            println!(
+                "hours up a day (UTC); * a verified listener: advertised, up 12 hours or more"
+            );
         }
         ["log"] => {
             let book = super::compute(&node).await?;
