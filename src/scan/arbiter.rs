@@ -335,7 +335,10 @@ impl Arbiter {
             .get(scanner)
             .is_none_or(|o| delivers(o, Instant::now()));
         Stand {
-            price: if book.is_some_and(|b| !b.standing(scanner).earns_as_scanner()) {
+            // This node's own scanner sells nothing to it: no audits owed.
+            price: if *scanner != self.node.id()
+                && book.is_some_and(|b| !b.standing(scanner).earns_as_scanner())
+            {
                 None
             } else {
                 crate::credits::jobs::price_for(&self.node, scanner)

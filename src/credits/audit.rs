@@ -214,34 +214,72 @@ pub struct Task {
     pub offer: Option<(NodeId, u64, u32)>,
 }
 
-/// Bought audits waiting for a free worker; handed out before unpaid picks.
+/// An offer that bought an audit: its payer and sequence number.
+pub type OfferRef = (NodeId, u64);
+
+/// Bought audits waiting for a free worker, handed out before unpaid
+/// picks, and the offers of those running now.
 #[derive(Default)]
-pub struct Queue(VecDeque<Task>);
+pub struct Queue {
+    waiting: VecDeque<Task>,
+    running: std::collections::HashSet<OfferRef>,
+}
 
 impl Queue {
     /// Queue a bought audit; false when [`MAX_WAITING`] wait already.
     pub fn push(&mut self, t: Task) -> bool {
-        if self.0.len() >= MAX_WAITING {
+        if self.waiting.len() >= MAX_WAITING {
             return false;
         }
-        self.0.push_back(t);
+        self.waiting.push_back(t);
         true
     }
 
+    /// Audits waiting.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.waiting.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.waiting.is_empty()
     }
 
-    /// The next one still in time and not at a level in `exclude`.
+    /// Whether the audit `offer` bought waits or runs here.
+    pub fn holds(&self, offer: OfferRef) -> bool {
+        self.running.contains(&offer)
+            || self
+                .waiting
+                .iter()
+                .any(|t| t.offer.is_some_and(|(p, q, _)| (p, q) == offer))
+    }
+
+    /// The next one still in time and not at a level in `exclude`; it
+    /// counts as running until [`Queue::end`] or [`Queue::put_back`].
     pub fn take(&mut self, exclude: &[u8]) -> Option<Task> {
         let now = hlc::wall_ms();
-        self.0.retain(|t| t.deadline_ms > now);
-        let i = self.0.iter().position(|t| !exclude.contains(&t.level))?;
-        self.0.remove(i)
+        self.waiting.retain(|t| t.deadline_ms > now);
+        let i = self
+            .waiting
+            .iter()
+            .position(|t| !exclude.contains(&t.level))?;
+        let t = self.waiting.remove(i)?;
+        if let Some((p, q, _)) = t.offer {
+            self.running.insert((p, q));
+        }
+        Some(t)
+    }
+
+    /// A taken audit that cannot start yet: first in line again.
+    pub fn put_back(&mut self, t: Task) {
+        if let Some((p, q, _)) = t.offer {
+            self.running.remove(&(p, q));
+        }
+        self.waiting.push_front(t);
+    }
+
+    /// The audit `offer` bought ended, or was dropped.
+    pub fn end(&mut self, offer: OfferRef) {
+        self.running.remove(&offer);
     }
 }
 
@@ -502,6 +540,53 @@ pub async fn obligations(
     Ok(out)
 }
 
+/// Whether this node's scan workers would run an audit of an address
+/// (parsed, as stored) at a level now: None, or why not. Registered by
+/// `scan::run_workers` in [`Node::audit_check`].
+pub type Check = Arc<
+    dyn Fn(
+            std::net::IpAddr,
+            String,
+            u8,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Release the open audit offers made to this node that can no longer be
+/// accepted ([`AUDIT_WINDOW_MS`] after they were written) and whose audit
+/// neither waits nor runs here, so their payers have them back at once
+/// rather than when they lapse. Returns how many.
+pub async fn release_stale(node: &Arc<Node>) -> usize {
+    use crate::credits::ledger::OfferState;
+    let Ok(book) = crate::credits::book(node).await else {
+        return 0;
+    };
+    let (me, now) = (node.id(), hlc::wall_ms());
+    let stale: Vec<OfferRef> = book
+        .ledger
+        .offers
+        .iter()
+        .filter(|o| {
+            o.to == me
+                && o.audit.is_some()
+                && o.state == OfferState::Open
+                && now > hlc::physical_ms(o.hlc) + AUDIT_WINDOW_MS
+        })
+        .map(|o| (o.payer, o.seq))
+        .collect();
+    let mut released = 0;
+    for offer in stale {
+        let busy = node.audit_queue.lock().unwrap().holds(offer)
+            || node.serving_offers.lock().unwrap().contains(&offer);
+        if !busy {
+            crate::credits::pay::release(node, offer.0, offer.1).await;
+            released += 1;
+        }
+    }
+    released
+}
+
 /// `(scanner, job uid, ip, level, done HLC)` of the scan `scan_uid` held
 /// here, once its job is done; waits up to `SERVE_WAIT` for it to arrive.
 async fn scan_of(node: &Node, scan_uid: &str) -> Option<(NodeId, String, String, u8, u64)> {
@@ -565,7 +650,7 @@ pub fn serve(node: &Arc<Node>) {
 }
 
 async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Result<(), String> {
-    use crate::credits::{entries, pay, price};
+    use crate::credits::{JOB_OFFER_TTL_MS, entries, pay, price};
     let refuse = async |why: &str| {
         pay::release(node, peer, seq).await;
         Err(why.to_string())
@@ -577,31 +662,34 @@ async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Resul
         return refuse("the scan or its done job is not held here").await;
     };
     let s = seed(&job_uid, done);
-    let members = crate::cluster::members::all(&node.store)
-        .await
-        .map_err(|e| format!("{e:#}"))?;
+    let members = match crate::cluster::members::all(&node.store).await {
+        Ok(m) => m,
+        Err(e) => return refuse(&format!("this node could not read its members: {e:#}")).await,
+    };
     if scanner != peer || !(1..=4).contains(&level) || !designated(&s) {
         return refuse("not a designated scan of the asker").await;
     }
     if !auditors(&s, &members, &scanner).contains(&node.id()) {
         return refuse("this node is not among the scan's auditors").await;
     }
-    // Asked twice with one offer: the first answer stands.
-    if node
-        .audit_queue
-        .lock()
-        .unwrap()
-        .0
-        .iter()
-        .any(|t| t.offer.is_some_and(|(p, q, _)| p == peer && q == seq))
-    {
-        return Err("this audit is queued already".into());
+    // What would keep a worker here from running it: declined now, so the
+    // scanner asks its next auditor.
+    let check = node.audit_check.lock().unwrap().clone();
+    let Some(check) = check else {
+        return refuse("this node runs no scan workers").await;
+    };
+    let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+        return refuse("the scan's address does not parse").await;
+    };
+    if let Some(why) = check(addr, ip.clone(), level).await {
+        return refuse(&format!("this node does not scan that address now: {why}")).await;
     }
     let least = price::min_take(node.price_table().price_of(price::SCAN).unwrap_or(0)) as u64;
-    // Room for the wait, the longest scan and the receipt.
-    let margin = AUDIT_WINDOW_MS + crate::scan::pace::MAX_RUN_SECS * 1000 + 60_000;
-    let offered = match pay::accept_offer(node, peer, seq, least, "audit", margin).await {
-        Ok(a) => a.offered,
+    // Accepted until AUDIT_WINDOW_MS after the offer was written: an audit
+    // started by then ends, with its receipt, within the offer's lifetime.
+    let accepted = match pay::accept_offer(node, peer, seq, least, "audit", JOB_OFFER_TTL_MS).await
+    {
+        Ok(a) => a,
         Err(pay::Declined::Why(w) | pay::Declined::NotCovered(w)) => return Err(w),
         Err(pay::Declined::TooLow { why, .. }) => return Err(why),
     };
@@ -626,13 +714,25 @@ async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Resul
         job_uid,
         ip,
         level,
-        deadline_ms: hlc::wall_ms() + AUDIT_WINDOW_MS,
-        offer: Some((peer, seq, offered.min(u32::MAX as u64) as u32)),
+        deadline_ms: hlc::physical_ms(accepted.hlc) + AUDIT_WINDOW_MS,
+        offer: Some((peer, seq, accepted.offered.min(u32::MAX as u64) as u32)),
     };
-    if !node.audit_queue.lock().unwrap().push(task) {
-        return refuse("this scanner has too many audits waiting").await;
+    // Checked and queued at once, while the offer still counts as served:
+    // asked twice with one offer, the first answer stands.
+    let queued = {
+        let mut q = node.audit_queue.lock().unwrap();
+        if q.holds((peer, seq)) {
+            Some(false)
+        } else {
+            q.push(task).then_some(true)
+        }
+    };
+    drop(accepted);
+    match queued {
+        Some(true) => Ok(()),
+        Some(false) => Err("this audit is queued already".into()),
+        None => refuse("this scanner has too many audits waiting").await,
     }
-    Ok(())
 }
 
 /// Buy the audit of this node's designated scan `scan_uid` from its
@@ -698,7 +798,9 @@ pub async fn buy_due(node: &Arc<Node>) -> usize {
          JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
          WHERE s.origin = ?1 AND s.audit_of IS NULL AND s.uid IS NOT NULL
            AND s.level BETWEEN 1 AND 4 AND j.status = 'done'
-           AND j.arbiter IS NOT NULL AND j.arbiter != ?1 AND j.status_hlc >= ?2",
+           AND j.arbiter IS NOT NULL AND j.arbiter != ?1 AND j.status_hlc >= ?2
+           AND NOT EXISTS (SELECT 1 FROM credit_entries o
+                           WHERE o.origin = ?1 AND o.audit_uid = s.uid AND o.economy = 2)",
     )
     .bind(&me.0[..])
     .bind(since)
@@ -864,6 +966,17 @@ mod tests {
         assert_eq!(q.take(&[4]).map(|t| t.scan_uid), Some("two".into()));
         assert_eq!(q.take(&[4]), None, "level 4 excluded, the late one dropped");
         assert_eq!(q.take(&[]).map(|t| t.scan_uid), Some("four".into()));
+        // Taken, it runs until it ends; put back, it is first in line.
+        let offer = (id(1), 7);
+        assert!(q.holds(offer) && q.is_empty());
+        q.end(offer);
+        assert!(!q.holds(offer));
+        assert!(q.push(task("next", 2, now + 60_000)));
+        let t = q.take(&[]).unwrap();
+        q.put_back(t);
+        assert!(q.push(task("last", 2, now + 60_000)));
+        assert!(q.holds(offer), "waiting");
+        assert_eq!(q.take(&[]).map(|t| t.scan_uid), Some("next".into()));
     }
 
     #[tokio::test]

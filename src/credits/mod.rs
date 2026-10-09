@@ -198,6 +198,7 @@ const PRICE_TICKS: u64 = 10;
 pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut known: gates::Standings = Default::default();
     let mut ticks = 0u64;
+    let buying = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
         // The hours that ended since the last tick, once each.
         if let Err(e) = reach::report_due(&node, crate::cluster::hlc::wall_ms()).await {
@@ -224,8 +225,17 @@ pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<boo
             }
             Err(e) => tracing::debug!(?e, "credits: standings not evaluated"),
         }
-        // Audits of this node's designated scans that are due.
-        audit::buy_due(&node).await;
+        // Audits of this node's designated scans that are due, bought
+        // aside (each may wait on three auditors); one run at a time.
+        if !buying.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let (node, buying) = (node.clone(), buying.clone());
+            tokio::spawn(async move {
+                audit::buy_due(&node).await;
+                buying.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        // Audit offers to this node that can no longer be served.
+        audit::release_stale(&node).await;
         if ticks.is_multiple_of(60) {
             // A scan older than the audit window is never due again.
             {

@@ -446,51 +446,97 @@ impl Source {
         }
     }
 
+    /// Why this scanner would not run an audit of `ip` (stored as
+    /// `ip_text`) at `level` now, if it would not: an audit obeys
+    /// everything a scan does (never_scan, members' addresses, Tor exits,
+    /// crawlers, the evidence held here) except the rescan cooldown. An
+    /// auditor asks this before it accepts a bought audit.
+    async fn audit_refusal(
+        &self,
+        ip: &IpAddr,
+        ip_text: &str,
+        level: u8,
+    ) -> anyhow::Result<Option<String>> {
+        let now = crate::store::data::now_ts();
+        if let Some(r) = self.preflight(ip, ip_text, &now).await? {
+            return Ok(Some(r.reason().to_string()));
+        }
+        let pool = &self.rec.store().pool;
+        let ev = guard::evidence(pool, ip_text, &self.origins, Some(self.classifier)).await?;
+        if ev.allowed_level(&self.cfg.scan.safety) < level {
+            return Ok(Some(
+                "the requests held here do not back a scan at this level".into(),
+            ));
+        }
+        Ok(None)
+    }
+
     /// The next audit this scanner can start, a bought one before an
-    /// unpaid pick: an audit obeys everything a scan does (never_scan,
-    /// members' addresses, Tor exits, crawlers, the evidence held here)
-    /// except the rescan cooldown. A bought audit not run writes nothing:
-    /// its offer lapses.
+    /// unpaid pick, that [`Source::audit_refusal`] lets through. A bought
+    /// audit of an address scanned here now waits its turn; one refused
+    /// writes nothing: its offer is released by `credits::audit`.
     async fn next_audit(&self, exclude: &[u8]) -> anyhow::Result<Option<Job>> {
         let Some(node) = self.node() else {
             return Ok(None);
         };
-        let pool = &node.store.pool;
         let mut picker = self.audits.lock().await;
-        picker.poll(pool, &node.id()).await?;
+        picker.poll(&node.store.pool, &node.id()).await?;
+        let (mut busy, mut found, mut failed) = (vec![], None, None);
         loop {
             let bought = node.audit_queue.lock().unwrap().take(exclude);
             let Some(t) = bought.or_else(|| picker.take(exclude)) else {
                 break;
             };
+            let end = |t: &crate::credits::audit::Task| {
+                if let Some((p, q, _)) = t.offer {
+                    node.audit_queue.lock().unwrap().end((p, q));
+                }
+            };
             let Ok(ip) = t.ip.parse::<IpAddr>() else {
+                end(&t);
                 continue;
             };
             let key = crate::net::canonical(ip);
             if self.active.lock().unwrap().contains_key(&key) {
+                if t.offer.is_some() {
+                    busy.push(t);
+                }
                 continue;
             }
-            let now = crate::store::data::now_ts();
-            if let Some(r) = self.preflight(&ip, &t.ip, &now).await? {
-                debug!(target = %ip, why = r.reason(), "audit not run");
-                continue;
-            }
-            let ev = guard::evidence(pool, &t.ip, &self.origins, Some(self.classifier)).await?;
-            if ev.allowed_level(&self.cfg.scan.safety) < t.level {
-                debug!(target = %ip, level = t.level, "audit not run: the requests held here do not back it");
-                continue;
+            match self.audit_refusal(&ip, &t.ip, t.level).await {
+                Ok(None) => {}
+                Ok(Some(why)) => {
+                    debug!(target = %ip, %why, "audit not run");
+                    end(&t);
+                    continue;
+                }
+                Err(e) => {
+                    end(&t);
+                    failed = Some(e);
+                    break;
+                }
             }
             self.active.lock().unwrap().insert(key, t.level);
-            return Ok(Some(Job::Audit {
+            found = Some(Job::Audit {
                 of: t.scan_uid,
                 job_uid: t.job_uid,
                 ip,
                 level: t.level,
-                started_at: now,
+                started_at: crate::store::data::now_ts(),
                 offer: t.offer,
-            }));
+            });
+            break;
         }
-        Ok(None)
+        {
+            let mut q = node.audit_queue.lock().unwrap();
+            for t in busy.into_iter().rev() {
+                q.put_back(t);
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(found),
+        }
     }
 
     /// Standalone: our queue's next job that passes the pre-flight checks.
@@ -919,39 +965,46 @@ impl Source {
                     offer,
                 },
                 node,
-            ) => match outcome {
-                Outcome::Done(res) => {
-                    if let Err(e) = self
-                        .rec
-                        .record_scan_audit(
-                            of,
-                            job_uid,
-                            &ip.to_string(),
-                            *level as i64,
-                            started_at,
-                            &res,
-                        )
-                        .await
-                    {
-                        warn!(audit_of = %of, ?e, "could not record audit");
-                    } else if let (Some((payer, seq, price)), Some(node)) = (offer, node) {
-                        // A bought audit, published: charge its offer.
-                        let receipt = crate::cluster::record::Record::CreditReceipt {
-                            payer: *payer,
-                            offer_seq: *seq,
-                            charged_mc: *price,
-                            answered: vec![crate::credits::price::AUDIT.into()],
-                            economy: crate::cluster::record::ECONOMY,
-                        };
-                        if let Err(e) = crate::cluster::repl::append(node, &[receipt]).await {
-                            warn!(audit_of = %of, ?e, "audit receipt not written");
+            ) => {
+                match outcome {
+                    Outcome::Done(res) => {
+                        if let Err(e) = self
+                            .rec
+                            .record_scan_audit(
+                                of,
+                                job_uid,
+                                &ip.to_string(),
+                                *level as i64,
+                                started_at,
+                                &res,
+                            )
+                            .await
+                        {
+                            warn!(audit_of = %of, ?e, "could not record audit");
+                        } else if let (Some((payer, seq, price)), Some(node)) = (offer, node) {
+                            // A bought audit, published: charge its offer.
+                            let receipt = crate::cluster::record::Record::CreditReceipt {
+                                payer: *payer,
+                                offer_seq: *seq,
+                                charged_mc: *price,
+                                answered: vec![crate::credits::price::AUDIT.into()],
+                                economy: crate::cluster::record::ECONOMY,
+                            };
+                            if let Err(e) = crate::cluster::repl::append(node, &[receipt]).await {
+                                warn!(audit_of = %of, ?e, "audit receipt not written");
+                            }
                         }
                     }
+                    // A failed audit says nothing: it is not published.
+                    Outcome::Failed(e) => debug!(audit_of = %of, error = %e, "audit scan failed"),
+                    Outcome::Abandoned => {}
                 }
-                // A failed audit says nothing: it is not published.
-                Outcome::Failed(e) => debug!(audit_of = %of, error = %e, "audit scan failed"),
-                Outcome::Abandoned => {}
-            },
+                // Charged, or (failed, abandoned) left for `credits::audit`
+                // to release.
+                if let (Some((payer, seq, _)), Some(node)) = (offer, node) {
+                    node.audit_queue.lock().unwrap().end((*payer, *seq));
+                }
+            }
             (
                 Job::Granted {
                     arbiter,
@@ -1286,6 +1339,23 @@ pub async fn run_workers(
         pace.clone(),
         classifier,
     ));
+    // An auditor asks before it accepts a bought audit (`credits::audit`).
+    if let Some(node) = source.node() {
+        let weak = Arc::downgrade(&source);
+        let check: crate::credits::audit::Check = Arc::new(move |ip, ip_text, level| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let Some(source) = weak.upgrade() else {
+                    return Some("this node's scan workers stopped".to_string());
+                };
+                match source.audit_refusal(&ip, &ip_text, level).await {
+                    Ok(why) => why,
+                    Err(e) => Some(format!("{e:#}")),
+                }
+            })
+        });
+        *node.audit_check.lock().unwrap() = Some(check);
+    }
     // Level-4 scans running now (see `L4Slot`).
     let running_l4 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut joinset = tokio::task::JoinSet::new();

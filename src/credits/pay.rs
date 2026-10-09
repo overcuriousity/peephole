@@ -164,6 +164,8 @@ impl Drop for Serving {
 /// the offer counts as being served: a second request naming it is
 /// declined.
 pub struct Accepted {
+    /// When the offer was written.
+    pub hlc: u64,
     pub offered: Mc,
     pub covered: Mc,
     pub book: Arc<super::Book>,
@@ -269,7 +271,7 @@ pub async fn accept_offer(
         release(node, peer, offer_seq).await;
         return why("the offer lapses before it could be charged; offer again".into());
     }
-    let (offered, covered) = (offer.offered, offer.covered);
+    let (hlc, offered, covered) = (offer.hlc, offer.offered, offer.covered);
     if price > offered {
         release(node, peer, offer_seq).await;
         return Err(Declined::TooLow {
@@ -291,6 +293,7 @@ pub async fn accept_offer(
     }
     tracing::debug!(asker = %peer.short(), offer = offer_seq, what, "offer accepted");
     Ok(Accepted {
+        hlc,
         offered,
         covered,
         book,

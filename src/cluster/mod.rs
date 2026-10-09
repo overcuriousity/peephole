@@ -300,6 +300,9 @@ pub struct Node {
     pub audit_queue: Mutex<crate::credits::audit::Queue>,
     /// This node's designated scans whose audit it tried to buy.
     pub audits_tried: Mutex<std::collections::HashSet<String>>,
+    /// What would keep this node's scan workers from running an audit
+    /// (`credits::audit::Check`); None while no workers run.
+    pub audit_check: Mutex<Option<crate::credits::audit::Check>>,
     pub data_dir: std::path::PathBuf,
     /// Contacts and heartbeats (ephemeral).
     pub status: status::Status,
@@ -373,6 +376,7 @@ impl Node {
             serving_offers: Mutex::new(Default::default()),
             audit_queue: Default::default(),
             audits_tried: Default::default(),
+            audit_check: Default::default(),
             data_dir: p.data_dir,
             status: Default::default(),
             msg: Default::default(),
