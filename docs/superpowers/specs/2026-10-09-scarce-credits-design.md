@@ -56,7 +56,10 @@ daily pool.
   ignored, as are reports for hours more than 25 hours back or in the
   future). A member is up in hour h when more than half of the reports for
   h, from distinct reporters that are not blocked or left out here, name
-  it. A reporter never counts for itself.
+  it. A reporter never counts for itself, and only members with an
+  advertised address in their member record count as reporters
+  (revised: outbound-only keys cost nothing to run, so they could
+  otherwise outvote the reachable members).
 - The supply during any day is six pools: the lots of the six previous
   days. The pool of day d is dated `end_of(d)` and lives on days d..d+6.
 - The old mint, the judge, the counted-scan weights, `credit_scans`,
@@ -78,7 +81,9 @@ signal per good is:
 
 - **Sold** anything in the period: it served a request for the good, paid
   or free (the existing demand counter, `market.note`), ran a scan job it
-  was granted, or accepted a lease. Raise by the full step.
+  was granted by another arbiter, or accepted a lease. A scanner's own jobs
+  count neither as sales nor toward its capacity (revised: otherwise it
+  could raise its own price by queuing work for itself). Raise by the full step.
 - Sold nothing: lower by the full step.
 - At capacity (the existing demand-over-supply signal: scans against 90 % of
   what it can do, lookups against the on-demand share, probes against slots,

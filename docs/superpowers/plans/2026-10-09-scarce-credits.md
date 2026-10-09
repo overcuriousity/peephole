@@ -14,7 +14,7 @@
 
 - `POOL_PER_DAY = 1000 credits` (1 000 000 mc); the supply is six pools; nothing mints, nothing burns; a lot lives on its day and the 6 after.
 - A verified listener of day d: listener role and an advertised address in its member record, up in at least 12 of the day's 24 hours.
-- Up in hour h: more than half of the reports for h, from distinct reporters other than the member and not blocked or left out here, name it.
+- Up in hour h: more than half of the reports for h, from distinct reporters other than the member, not blocked or left out here, and with an advertised address, name it (spec §1, revised).
 - Reach reports: one per origin per hour (later ones ignored); a report for an hour after the one its entry is written in, or more than 25 hours before it, is ignored.
 - Prices: `u32` mc, may be 0, no floor; per hour at most ×e^0.45 up and ×e^-0.15 down, scaled by the hours since the last refresh (at most 1), and at least 1 mc toward the signal; refreshed every 10 minutes.
 - Quorum: `q = min(9, ⌊n/2⌋ + 1)`, n = reachable members announcing a price for the good, this node included; standalone q = 1. `IpNameRec.answers` and `RdnsRec.answers` hold at most 9.
@@ -40,7 +40,7 @@ Each is the narrowest reading that keeps the spec's decisions intact; an impleme
 4. **Gates in the new ledger.** A member failing the rules gate gets no pool share here and its receipts move nothing; a scanner failing the audit gates (differing audits or audits owed) has its scan-job receipts move nothing. A receipt that moves nothing leaves its offer open until it lapses back to the payer.
 5. **A day's pool is credited 1 hour after UTC midnight**, so the reports for hour 23 have arrived.
 6. **A node reports every hour it was running in**, also when it reached nobody; it never reports an hour before its start.
-7. **A scanner's "sold"** is a scan of a job granted to it that finished since this node last stepped its price; "at capacity" is its granted scans of the past hour at 90 % of what it can do (the existing target).
+7. **A scanner's "sold"** is a scan of a job granted to it by another arbiter that finished since this node last stepped its price; "at capacity" is such scans of the past hour at 90 % of what it can do (the existing target). Its own jobs count for neither (spec §2, revised).
 8. **Before the first refresh** a good the price table lacks is priced 0 by the seller, as probes already do; an advertised node announces its relay price (0 until its first refresh).
 9. **Outboxes** are held only for members with an advertised address or a current relay lease.
 
@@ -99,6 +99,7 @@ Every member writes one replicated `reach_report` per UTC hour naming the advert
   - `reach::Report { reporter: NodeId, hour: u32, reached: BTreeSet<NodeId> }`, `reach::since(pool, from_hour: u32) -> Result<Vec<Report>>`, `reach::prune(pool, before_hour: u32) -> Result<u64>`
   - `reach::Uptime = BTreeMap<(NodeId, u32 /*day*/), u32 /*hours*/>`, `reach::up(reports: &[&Report], member: &NodeId, ignored: &HashSet<NodeId>) -> bool`, `reach::uptime(reports: &[Report], members: &[NodeId], ignored: &HashSet<NodeId>) -> Uptime`
   - `reach::verified(members: &[MemberRow], uptime: &Uptime, day: u32) -> BTreeSet<NodeId>`
+  - `reach::ignored(members: &[MemberRow], left_out: &HashSet<NodeId>) -> HashSet<NodeId>`: reporters that do not count (left out here, or members without an advertised address).
   - `reach::Tracker` with `note_alive(&self, now_ms)`, `note(&self, peer: NodeId, now_ms)`, `take_due(&self, now_ms) -> Vec<(u32, Vec<NodeId>)>`; `Node.reach: reach::Tracker`
   - `reach::report_due(node: &Arc<Node>, now_ms: u64) -> Result<usize>`
   - `reach::uptime_lines(names: &[(NodeId, String)], uptime: &Uptime, verified: &BTreeMap<u32, BTreeSet<NodeId>>, days: &[u32]) -> Vec<String>`
@@ -236,6 +237,17 @@ mod tests {
         assert_eq!(up.get(&(id(1), day)), Some(&2));
         assert_eq!(up.get(&(id(1), day + 1)), Some(&1));
         assert_eq!(up.get(&(id(2), day)), None, "nobody reported 2");
+    }
+
+    #[test]
+    fn outbound_only_and_left_out_reporters_do_not_count() {
+        let members = [member(1, true, true), member(2, true, false), member(3, true, true)];
+        let ignored = ignored(&members, &[id(3)].into());
+        assert_eq!(ignored, [id(2), id(3)].into());
+        // 2 (outbound-only) names 1, 3 (left out) names 1, 4 (advertised) does not.
+        let rs = [report(2, 7, &[1]), report(3, 7, &[1]), report(4, 7, &[])];
+        let refs: Vec<&Report> = rs.iter().collect();
+        assert!(!up(&refs, &id(1), &ignored), "0 of the 1 report that counts");
     }
 
     #[test]
@@ -509,6 +521,19 @@ pub fn verified(members: &[MemberRow], uptime: &Uptime, day: u32) -> BTreeSet<No
         .collect()
 }
 
+/// The reporters whose reports do not count here: those left out here
+/// (blocked, or shown two histories), and members without an advertised
+/// address (nobody can check what such a key reports, and keys that cost
+/// nothing to run must not outvote the reachable members).
+pub fn ignored(members: &[MemberRow], left_out: &HashSet<NodeId>) -> HashSet<NodeId> {
+    members
+        .iter()
+        .filter(|m| m.address.is_none())
+        .map(|m| m.id)
+        .chain(left_out.iter().copied())
+        .collect()
+}
+
 /// The advertised members this node completed a sync round with, per
 /// hour this process ran in, until the hour is reported.
 #[derive(Default)]
@@ -659,6 +684,7 @@ In `src/credits/cli.rs`, add to `USAGE`: `       peephole credits uptime [CONFIG
                 .filter(|m| m.active)
                 .collect();
             let ids: Vec<_> = all.iter().map(|m| m.id).collect();
+            let ignored = super::reach::ignored(&all, &ignored);
             let up = super::reach::uptime(&reports, &ids, &ignored);
             let verified = days
                 .iter()
@@ -1337,9 +1363,9 @@ In `src/credits/price.rs` tests, delete `a_price_follows_the_imbalance_within_a_
         .unwrap();
         // (job uid, queued by, its scanner, finished minutes ago)
         for (n, (uid, origin, by, ago)) in [
-            ("paid", a, s, 10),     // granted to s: counts
+            ("paid", a, s, 10),     // granted to s by a: counts
             ("free", a, s, 10),     // granted at zero: counts too
-            ("own", s, s, 20),      // the scanner's own job: counts
+            ("own", s, s, 20),      // the scanner's own job: no sale
             ("old", a, s, 90),      // finished over an hour ago
             ("other", s, a, 10),    // granted to a, but s wrote the scan
             ("future", s, s, -600), // dated ahead: never counts
@@ -1373,7 +1399,7 @@ In `src/credits/price.rs` tests, delete `a_price_follows_the_imbalance_within_a_
             .execute(pool).await.unwrap();
         }
         let got = granted_scans(pool).await.unwrap();
-        assert_eq!(got.get(&s).map(Vec::len), Some(3), "{got:?}");
+        assert_eq!(got.get(&s).map(Vec::len), Some(2), "{got:?}");
         assert_eq!(got.get(&a), None, "{got:?}");
         let now = crate::cluster::hlc::wall_ms();
         assert!(got[&s].iter().all(|t| *t <= now && *t + 3_600_000 >= now));
@@ -1462,15 +1488,18 @@ pub fn start(announced: &[u32]) -> Mc {
 Replace `charged_jobs` and `paid_scans` with:
 
 ```rust
-/// The scans of jobs granted to each scanner that finished in the past
-/// hour, as wall-clock ms by the scan's own `finished_at`: one per job
-/// (its scanner's first record), none dated in the future. Granted at
-/// any price, zero included: a sale.
+/// The scans of jobs granted to each scanner by another arbiter that
+/// finished in the past hour, as wall-clock ms by the scan's own
+/// `finished_at`: one per job (its scanner's first record), none dated in
+/// the future. Granted at any price, zero included: a sale. A scanner's
+/// own jobs are no sale and do not fill its capacity, or it could raise
+/// its own price by queuing work for itself.
 pub async fn granted_scans(pool: &sqlx::SqlitePool) -> Result<HashMap<NodeId, Vec<u64>>> {
     let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
         "SELECT s.origin, MIN(s.finished_at) FROM scans s
          JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
          WHERE s.audit_of IS NULL AND s.origin IS NOT NULL AND s.job_uid IS NOT NULL
+           AND j.arbiter IS NOT s.origin
            AND s.finished_at > datetime('now', '-1 hour')
            AND s.finished_at <= datetime('now')
          GROUP BY s.origin, s.job_uid",
@@ -1547,7 +1576,7 @@ In `refresh`, replace everything from `let none = vec![];` down to (and includin
         Some(_) => Some(next(current(node, &old, PROBE, &ann(PROBE)).await?, PROBE)),
         None => None,
     };
-    // Every scanner's price, from the scans of jobs granted to it: the
+    // Every scanner's price, from the scans of jobs other arbiters granted it: the
     // same public inputs on every node.
     let granted = granted_scans(&node.store.pool).await?;
 ```
@@ -2789,7 +2818,7 @@ pub async fn compute(node: &Node) -> anyhow::Result<Book> {
             .collect();
     let ids: Vec<NodeId> = members.iter().map(|m| m.id).collect();
     let reports = reach::since(&node.store.pool, first * 24).await?;
-    let uptime = reach::uptime(&reports, &ids, &gates.left_out);
+    let uptime = reach::uptime(&reports, &ids, &reach::ignored(&members, &gates.left_out));
     let listeners: BTreeMap<u32, BTreeSet<NodeId>> = (first..=today)
         .map(|d| (d, reach::verified(&members, &uptime, d)))
         .collect();
@@ -5043,9 +5072,9 @@ Run `bash -n install.sh` and `tests/install-smoke.sh` if it runs offline (read i
 "Credits: a market for the cluster's work" — replace the lede and the first bullets with:
 
 - Lede: "Everything the cluster does for a member is a good that member buys with **credits**: lookups, name resolutions, reverse names, probes, scan jobs, audits and relay leases. The supply is fixed; prices follow sales."
-- **Where credits come from.** "One door: the daily pool. At the end of each UTC day 1000 credits are split evenly among that day's verified listeners — members with the listener role and an advertised address that were up in at least 12 of the day's 24 hours — the remainder 0.001 each to the lowest keys, credited an hour after midnight. Up means reported: every member writes one `reach_report` an hour naming the advertised members it completed a sync round with, and a member is up in an hour when more than half of that hour's reports from others (not blocked here) name it. A member that does not earn on your node gets no share there, and its share goes to nobody. `peephole credits uptime` lists each member's hours."
+- **Where credits come from.** "One door: the daily pool. At the end of each UTC day 1000 credits are split evenly among that day's verified listeners — members with the listener role and an advertised address that were up in at least 12 of the day's 24 hours — the remainder 0.001 each to the lowest keys, credited an hour after midnight. Up means reported: every member writes one `reach_report` an hour naming the advertised members it completed a sync round with, and a member is up in an hour when more than half of that hour's reports from other advertised members (not blocked here) name it; outbound-only members' reports do not count. A member that does not earn on your node gets no share there, and its share goes to nobody. `peephole credits uptime` lists each member's hours."
 - **Where they go.** "Nowhere: nothing burns. A credit keeps its day when it changes hands and is gone 7 days after it, so at most six pools are in circulation. Sellers keep what they charge."
-- **Prices.** "One rule for every good, on each node every 10 minutes: a good that sold since the last refresh (or whose every slot is taken) gets dearer by at most a factor of e^0.45 an hour; one that sold nothing gets cheaper by e^-0.15 an hour; each step is scaled by the time since the last and moves at least 0.001 credits. There is no floor: a good nobody buys becomes free, and a free good that is used costs 0.001 at the next refresh. A request may carry no offer: the server answers what it prices at zero and declines the rest naming the price, which the asker may offer once. Scan prices are per scanner, computed by every node from the scans of jobs granted to it; an arbiter pays at most 1.25 times its own figure."
+- **Prices.** "One rule for every good, on each node every 10 minutes: a good that sold since the last refresh (or whose every slot is taken) gets dearer by at most a factor of e^0.45 an hour; one that sold nothing gets cheaper by e^-0.15 an hour; each step is scaled by the time since the last and moves at least 0.001 credits. There is no floor: a good nobody buys becomes free, and a free good that is used costs 0.001 at the next refresh. A request may carry no offer: the server answers what it prices at zero and declines the rest naming the price, which the asker may offer once. Scan prices are per scanner, computed by every node from the scans of jobs other arbiters granted it (its own jobs are no sales); an arbiter pays at most 1.25 times its own figure."
 - **Domains and reverse names.** "Quorum goods: `q = min(9, ⌊n/2⌋+1)` nodes are asked, n being the reachable members announcing a price (this node included): this node and the q−1 cheapest, other operators and new countries first among equals. An answer stands when more than half of those that answered gave it. Only the node that recorded a source buys its reverse names (forward-confirmed PTR names); the answers replicate as `rdns_name` records and every node keeps the names with their agreement."
 - **Scan jobs.** Delete the idle-work and unfunded sentences ("A job no claimant can be paid for is idle work: there, … stretches, a share of 1 − weight of them." and "Jobs that are not funded are scanned by idle capacity and earn the mint only."); add "Every grant is funded, at zero or above: a scanner priced at 0 is granted without an offer. A job no claimant can be paid for waits. `scan_share = 0` funds only free scanners."
 - **Conformity and audits.** "…its scans stand up to the audits you believe: those of your own nodes. One in 20 scans of jobs granted by another arbiter is designated for a bought audit by a hash of the job and the arbiter's done status, which the scanner cannot steer or know before it has published the result; the same hash ranks the scan's three auditors among the scanners. The scanner buys the audit from the first of them that is reachable and priced; the auditor is paid when it publishes the audit. A scanner with two or more designated scans of 7 days unaudited and under 80 % bought is not funded by arbiters, and its scan receipts count for nothing, until it catches up. Each scanner also re-runs `[credits] audit_share` (5 %) of other nodes' fresh scans unpaid, own jobs and small scanners included."
