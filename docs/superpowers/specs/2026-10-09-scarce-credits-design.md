@@ -29,7 +29,7 @@ a good that member buys; non-scanner nodes get real ways to earn.
 | Allowance | Only verified listeners: advertised, listener role, reachable in at least 12 of 24 hours by hourly peer reports. Outbound-only members get none. |
 | Quorum | Reverse DNS and resolution ask min(9, ⌊n/2⌋+1) nodes; majority of answers stands. Anything not from an external provider needs a quorum. |
 | Probes | Stay scanner-gated: a scanner defines itself by exposing itself. |
-| Audits | A scanner buys peer review of its own successful scans from other scanners. |
+| Audits | A scanner buys peer review of its scans from other scanners; which scans and which auditors are drawn from the log, not chosen by the scanner (revised). Unpaid random checks stay. |
 | Relays | Outbound-only members lease outbox hosting from reachable members, two at a time. |
 | Not in this round | Automatic enrichment stays free. Reachability checks, history service, Tor fetching, more providers, claim verification: later specs. |
 
@@ -145,30 +145,56 @@ standalone node keeps its own loop as today.
 
 ## 4. Paid audits
 
-The auditor-side picker goes. After each successful scan of a granted job
-at level 1 to 4, the scanner buys an audit with probability `[credits]
-audit_share` (default 0.05): it picks the cheapest live scanner outside its
-fleet that announces a scan price (ties at random), offers that price with a
-`CreditOffer` whose new `audit: Option<String>` field names the scan uid,
-and sends `AuditReq { scan_uid, job_uid, ip, level, offer_seq }` as a
-directed message. The auditor runs the audit as today (same arguments,
-within 30 minutes of the scan), publishes `ScanAuditRec`, and writes the
-receipt (`answered: ["audit"]`) when the result is published. A failed or
-late audit charges nothing and the offer lapses.
+Revised 2026-10-09: in the first version the scanner chose which of its
+scans were audited and by whom, so it could fake most results and buy
+audits only of the honest ones, from a friend. Now neither choice is the
+scanner's.
 
-**Obligation.** From the log, every node counts per scanner over the last 7
-days its successful scans of granted jobs and the audits it bought of them
-(a `ScanAuditRec` whose audited scan is the scanner's, with a charged audit
-offer from the scanner to the auditor). A scanner with at least 20
-successful scans earns as a scanner only while bought audits cover at least
-5 % of them. `Standing` gains `audits_owed: Option<(u32, u32)>` (bought,
-required). A scanner that fails it is not funded by arbiters, and in each
+**Which scans.** A successful scan of a job granted by another arbiter
+(own jobs are left out: they pay nobody), at level 1 to 4, is
+**designated** for audit when `SHA-256("peephole-audit\0" || job uid ||
+the HLC of the arbiter's done status)` read as a fraction is below
+`AUDIT_RATE = 0.05`, a protocol constant. The arbiter writes the done
+status only after the scan result is published, so the scanner has
+committed to every result before it can know which one is checked, and it
+cannot redraw. Every node computes the same designation from the log.
+
+**By whom.** The auditors of a designated scan are ranked by
+`SHA-256(seed || auditor key)`, seed as above, over the active members with
+the scanner role at protocol 7 other than the scanner. The scanner offers
+the first of them that is live and announces a scan price, at that price (at
+least 1 mc), with a `CreditOffer` whose new `audit: Option<String>` field
+names the scan uid, and sends `AuditReq { scan_uid, job_uid, ip, level,
+offer_seq }` as a directed message; when it declines or cannot be reached,
+the second, then the third. An auditor accepts only a scan for which it is
+among the first three. It runs the audit as today (same arguments, within
+30 minutes of the scan), publishes `ScanAuditRec`, and writes the receipt
+(`answered: ["audit"]`) when the result is published. A failed or late
+audit charges nothing and the offer lapses.
+
+**Obligation.** From the log, every node counts per scanner the scans
+designated in the last 7 days (leaving out the most recent
+`AUDIT_OFFER_TTL`, whose audits may still be running) and how many of them
+it bought: a `ScanAuditRec` by one of the scan's first three auditors, with
+a charged audit offer from the scanner to it. A scanner fails when at least
+2 designated scans have no bought audit and it bought fewer than 80 % of
+them. `Standing` gains `audits_owed: Option<(u32, u32)>` (bought,
+designated). A scanner that fails it is not funded by arbiters, and in each
 node's ledger its scan receipts move nothing while it fails, as with the
-rules gate, so it earns nothing from scans until it catches up. The differ gate is unchanged: a node
-believes only the audits made by itself and its fleet.
+rules gate, so it earns nothing from scans until it catches up. The differ
+gate is unchanged: a node believes only the audits made by itself and its
+fleet.
 
-Known limit: the audited scanner picks its auditor, so it can keep choosing
-one cheap friend. The fleet exclusion is the only guard.
+**Unpaid checks stay.** The auditor-side picker of today stays: each
+scanner re-runs `[credits] audit_share` (default 0.05) of other nodes' fresh
+scans on its own, unpaid. It covers own jobs and small scanners, and feeds
+the differ gate of the auditor's fleet.
+
+Known limits: a member's fleet is private, so a sibling of the scanner can
+rank among its first three auditors (with n scanners and k siblings, about
+3k/n of the designated scans) and approve whatever it is sent; the unpaid
+checks of the other operators are the guard. An arbiter colluding with its
+scanner can choose its done-status HLC and steer the designation.
 
 ## 5. Relay leases
 
@@ -234,15 +260,15 @@ follows the sales rule and is announced in the heartbeat's `prices` under
 
 Unit tests: pool split with remainder; hourly reach tally, the majority
 rule and the 12-hour rule; quorum size; the sales step at zero, when sold,
-when idle and at capacity; affordability at zero; the audit obligation and
-its 20-scan minimum; the economy filter in the ledger.
+when idle and at capacity; affordability at zero; the audit designation
+and auditor ranking, the obligation and its 2-missing / 80 % rule; the economy filter in the ledger.
 
 Cluster tests, one per behaviour: the pool reaches reached listeners only
 and not an outbound-only member; a zero-priced lookup is served without an
 offer and a priced one is declined naming the price; a job is granted at
 zero and funded once the price rises; reverse names are bought from q nodes
 and agreed names replicate with their flag; a scanner that buys no audits
-stops being funded; an outbound-only member with a lease is asked through
+of its designated scans stops being funded; an outbound-only member with a lease is asked through
 its relay and one without is not; a protocol-6 member is neither paid nor
 charged; old-economy entries move nothing.
 

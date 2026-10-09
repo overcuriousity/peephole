@@ -18,7 +18,7 @@
 - Reach reports: one per origin per hour (later ones ignored); a report for an hour after the one its entry is written in, or more than 25 hours before it, is ignored.
 - Prices: `u32` mc, may be 0, no floor; per hour at most ×e^0.45 up and ×e^-0.15 down, scaled by the hours since the last refresh (at most 1), and at least 1 mc toward the signal; refreshed every 10 minutes.
 - Quorum: `q = min(9, ⌊n/2⌋ + 1)`, n = reachable members announcing a price for the good, this node included; standalone q = 1. `IpNameRec.answers` and `RdnsRec.answers` hold at most 9.
-- Audits: `[credits] audit_share` (default 0.05) is the chance a scanner buys an audit of a successful granted scan at level 1–4; an audit starts within 30 minutes; a scanner with ≥ 20 successful scans of granted jobs in 7 days must have bought audits of ≥ 5 % of them.
+- Audits (spec §4, revised): a scan of a job granted by another arbiter, level 1–4, is designated when `SHA-256("peephole-audit\0" || job uid || done-status HLC)` as a fraction is below `AUDIT_RATE = 0.05` (a protocol constant); its auditors are the first 3 active protocol-7 scanners other than the scanner ranked by `SHA-256(seed || key)`; an audit starts within 30 minutes; a scanner fails when ≥ 2 designated scans of 7 days lack a bought audit and it bought < 80 %. `[credits] audit_share` (default 0.05) keeps its meaning: the unpaid auditor-side checks.
 - Relays: a lease is one hour; `[cluster] relay_slots` default 16; a lessee holds two, renewing 5 minutes before expiry.
 - `PROTO_VERSION = 7`, `ECONOMY_PROTO = 7`; `pays_with` and `sells_scans` require 7. Economy-2 entries carry `economy: 2` and are signed under `peephole-repl-v2\0`.
 - No recount, no migration of balances: old `credit_entries` rows stay and are ignored.
@@ -36,7 +36,7 @@ Each is the narrowest reading that keeps the spec's decisions intact; an impleme
 
 1. **"Relayed only to protocol-7 members."** The log cannot skip positions, so the serving side of sync stops an origin's stream for a peer below protocol 7 at that origin's first entry that only protocol 7 knows (a `reach_report`, an `rdns_name`, or an economy-2 credit entry). The peer catches up after it upgrades.
 2. **"Seals signed under a new domain string."** The signature of an economy-2 `credit_offer`, `credit_receipt` or `credit_transfer` (and therefore its digest in the seal chain) uses the domain `peephole-repl-v2\0`. The `Seal` digest rule itself is unchanged: a protocol-6 node checking a changed digest rule would mark the protocol-7 node as having shown two histories, permanently. A protocol-6 node that is handed such an entry anyway rejects its signature and retries later; nothing is marked.
-3. **Audit offers are at least 1 mc.** The obligation counts only charged audit offers, and an offer of nothing cannot be written; an audit of a scanner priced at 0 is offered 1 mc.
+3. **Audit offers are at least 1 mc.** The obligation counts only charged audit offers, and an offer of nothing cannot be written; an audit by an auditor priced at 0 is offered 1 mc.
 4. **Gates in the new ledger.** A member failing the rules gate gets no pool share here and its receipts move nothing; a scanner failing the audit gates (differing audits or audits owed) has its scan-job receipts move nothing. A receipt that moves nothing leaves its offer open until it lapses back to the payer.
 5. **A day's pool is credited 1 hour after UTC midnight**, so the reports for hour 23 have arrived.
 6. **A node reports every hour it was running in**, also when it reached nobody; it never reports an hour before its start.
@@ -1583,6 +1583,45 @@ Fix the old floor references:
 - `tests/cluster.rs` `a_paid_probe_is_accepted_served_and_charged`: replace `assert!(cost as u64 >= price::PRICE_FLOOR);` by first raising the scanner's probe price with `priced(&nb, price::PROBE, 1).await` (use the scanner's `TestNode`) and asserting `cost >= 1`.
 
 `grep -rn "PRICE_FLOOR\|flow_step\|scanner_step\|provider_price\|paid_scans\|charged_jobs" src tests` must print nothing.
+
+A restart must not make every good free until the first refresh (a minute later). Add, and call from `src/lib.rs` right after the cluster node is opened (before `cluster::start`):
+
+```rust
+/// Seed this node's table from the prices it kept, so a restart serves
+/// at them until the first refresh steps them.
+pub async fn load_kept(node: &Node) -> Result<()> {
+    let kept = |good: &str| {
+        let store = node.store.clone();
+        let key = price_key(good);
+        async move { store.intel_get(&key).await.ok().flatten().and_then(|v| v.parse::<Mc>().ok()) }
+    };
+    let mut t = Table::default();
+    t.resolve_mc = kept(RESOLVE).await.map_or(0, as_mc);
+    t.rdns_mc = kept(RDNS).await.map_or(0, as_mc);
+    if node.prober().is_some() {
+        t.probe_mc = kept(PROBE).await.map(as_mc);
+    }
+    for p in node.lookup_providers().into_iter().flatten().filter(|p| p.ready()) {
+        if let Some(mc) = kept(p.name()).await {
+            t.offers.push(Offer {
+                provider: p.name().to_string(),
+                price_mc: as_mc(mc),
+                on_demand: node
+                    .lookup_shares()
+                    .map_or(crate::config::DEFAULT_OFFER_PER_DAY, |s| s.allowance(p.as_ref())),
+            });
+        }
+    }
+    let me = node.id();
+    if let Some((mc, _)) = node.store.intel_get(&scanner_key(&me)).await?.and_then(|v| parse_kept(&v)) {
+        t.sell_mc = Some(as_mc(mc));
+    }
+    node.set_price_table(Arc::new(t));
+    Ok(())
+}
+```
+
+(`at_ms` stays 0, so the first refresh takes a full step from the kept prices, as it does today. Call it after the prober and the lookup providers are set on the node; Task 9 adds `relay_mc` here too. Test: in `price.rs`'s tests, keep `price:resolve = 40` on a `test_node`, call `load_kept`, and assert `node.price_table().price_of(RESOLVE) == Some(40)`.)
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -3608,57 +3647,107 @@ git commit -m "Lookup: reverse names are bought from a quorum and replicated wit
 
 ---
 
-### Task 8: Paid audits and the audit obligation
+### Task 8: Paid audits of designated scans, and the obligation
 
-The auditor-side picker goes. After each successful scan of a granted job at level 1–4, the scanner buys an audit with probability `[credits] audit_share`: from the cheapest live scanner outside its fleet that announces a scan price (ties at random), with a `CreditOffer` whose `audit` names the scan uid (at least 1 mc, Decision 3), and a directed `AuditReq`. The auditor runs the audit as today, publishes `ScanAuditRec` and then writes the receipt (`answered: ["audit"]`); a failed or late audit charges nothing and the offer lapses. Every node counts per scanner, over 7 days, its successful scans of granted jobs and the audits it bought of them; a scanner with ≥ 20 such scans must have bought audits of ≥ 5 %. One that fails is not funded by arbiters, and its scan receipts move nothing in each node's ledger (Task 6's `no_scan_sales`).
+Neither which scans are audited nor by whom is the scanner's choice (spec §4, revised). A successful scan of a job granted by another arbiter, at level 1–4, is **designated** when `SHA-256("peephole-audit\0" || job uid || HLC of the arbiter's done status)`, read as a fraction, is below `AUDIT_RATE = 0.05`; its auditors are ranked by `SHA-256(seed || key)` over the active protocol-7 scanners other than the scanner. The scanner buys the audit from the first of them that is live and priced (then the second, the third), with a `CreditOffer` whose `audit` names the scan (at least 1 mc, Decision 3) and an `AuditReq`; an auditor accepts only a designated scan it ranks among the first three for, runs it as today, publishes `ScanAuditRec`, then charges (`answered: ["audit"]`). Every node counts per scanner the designated scans of the last 7 days (minus the newest `AUDIT_OFFER_TTL_MS`) and the bought ones; a scanner fails when at least 2 have no bought audit and it bought under 80 %. One that fails is not funded by arbiters, and its scan receipts move nothing in each node's ledger (Task 6's `no_scan_sales`). The unpaid auditor-side `Picker` stays as it is.
 
 **Files:**
 - Modify: `src/cluster/record.rs` (`CreditOffer.audit`)
 - Modify: `src/store/migrations/0029_scarce_credits.sql` (append `audit_uid`)
 - Modify: `src/credits/entries.rs` (`Kind::Offer.audit`, column)
 - Modify: `src/credits/ledger.rs` (`Offer.audit`, `ttl_ms`)
-- Modify: `src/credits/mod.rs` (`AUDIT_OFFER_TTL_MS`)
-- Modify: `src/credits/pay.rs` (`make_offer_for`, `time_left` by the offer's own lifetime)
-- Modify: `src/credits/audit.rs` (`Picker` → `Queue`, `serve`, `buy`, `pick_auditor`, `owes`, `obligations`; tests)
+- Modify: `src/credits/mod.rs` (`AUDIT_OFFER_TTL_MS`; `run` calls `audit::buy_due` each tick)
+- Modify: `src/credits/pay.rs` (`make_offer_for`; `time_left` by the offer's own lifetime)
+- Modify: `src/credits/audit.rs` (designation, ranking, `Queue`, `serve`, `buy`, `buy_due`, `owes`, `obligations`; the `Picker` stays; tests)
 - Modify: `src/credits/gates.rs` (`Standing.audits_owed`)
 - Modify: `src/cluster/msg.rs` (`Msg::AuditReq`, `Msg::AuditReply`)
-- Modify: `src/cluster/mod.rs` (`Node.audit_queue`)
-- Modify: `src/scan/mod.rs` (`Source.audits` goes; `next_audit` reads the node's queue; `Job::Audit.offer`; buying after a granted scan; the receipt after an audit)
-- Modify: `src/store/recorder.rs:890` (`record_scan_result` returns the scan's uid)
+- Modify: `src/cluster/mod.rs` (`Node.audit_queue`, `Node.audits_tried`)
+- Modify: `src/scan/mod.rs` (`next_audit` takes bought audits before unpaid picks; `Job::Audit.offer`; the receipt after a bought audit)
 - Modify: `src/scan/arbiter.rs` (`stand`: no price for a scanner that does not earn as one)
 - Modify: `src/lib.rs`, `tests/cluster.rs` `boot_in` (`credits::audit::serve(&node)`)
 - Test: `src/credits/audit.rs`, `src/credits/gates.rs`, `tests/cluster.rs`
 
 **Interfaces:**
-- Consumes: Task 5 (`Arbiter::stand`, funded grants), Task 6 (`ECONOMY`, `ledger::Gates.no_scan_sales`, `Book.standing`).
+- Consumes: Task 5 (`Arbiter::stand`, funded grants), Task 6 (`ECONOMY`, `ECONOMY_PROTO`, `ledger::Gates.no_scan_sales`, `Book.standing`, `entries::get` reads economy 2 only).
 - Produces:
   - `Record::CreditOffer { …, audit: Option<String> }` (`#[serde(default, skip_serializing_if = "Option::is_none")]`); `entries::Kind::Offer { to, parts, job, audit }`; `ledger::Offer.audit: Option<String>`.
   - `credits::AUDIT_OFFER_TTL_MS: u64 = audit::AUDIT_WINDOW_MS + JOB_OFFER_TTL_MS`.
   - `pay::make_offer_for(node, server, total_mc: Mc, audit: Option<String>) -> Result<u64, String>` (`make_offer` = `make_offer_for(…, None)`).
-  - `Msg::AuditReq { scan_uid: String, job_uid: String, ip: String, level: u8, offer_seq: u64 }`, `Msg::AuditReply { accepted: bool, why: Option<String> }`.
-  - `audit::Task { scan_uid, job_uid, ip, level, deadline_ms, payer: NodeId, offer_seq: u64, price_mc: u32 }`, `audit::Queue` (`push`, `take`, `started`, `started_last_hour`), `Node.audit_queue: Mutex<audit::Queue>`.
-  - `audit::serve(node: &Arc<Node>)`, `audit::buy(node: &Arc<Node>, scan_uid: String, job_uid: String, ip: String, level: u8) -> Result<NodeId, String>`.
-  - `audit::AUDIT_MIN_SCANS: u32 = 20`, `audit::owes(scans: u32, bought: u32) -> Option<(u32, u32)>` (bought, required), `audit::obligations(pool, since_hlc) -> Result<HashMap<NodeId, (u32 /*scans*/, u32 /*bought*/)>>`.
+  - `Msg::AuditReq { scan_uid: String, offer_seq: u64 }`, `Msg::AuditReply { accepted: bool, why: Option<String> }`.
+  - `audit::{AUDIT_RATE: f64 = 0.05, AUDITORS: usize = 3}`, `audit::seed(job_uid: &str, done_hlc: u64) -> [u8; 32]`, `audit::designated(seed: &[u8; 32]) -> bool`, `audit::auditors(seed: &[u8; 32], members: &[MemberRow], scanner: &NodeId) -> Vec<NodeId>` (the first [`AUDITORS`], best first).
+  - `audit::Task { scan_uid, job_uid, ip, level, deadline_ms, offer: Option<(NodeId, u64, u32)> }` (None: an unpaid pick), `audit::Queue` (`push`, `take`), `Node.audit_queue: Mutex<audit::Queue>`, `Node.audits_tried: Mutex<HashSet<String>>`.
+  - `audit::serve(node: &Arc<Node>)`, `audit::buy(node: &Arc<Node>, scan_uid: &str) -> Result<NodeId, String>`, `audit::buy_due(node: &Arc<Node>) -> usize`.
+  - `audit::owes(designated: u32, bought: u32) -> Option<(u32, u32)>` (bought, designated), `audit::obligations(pool, members: &[MemberRow], now_ms: u64) -> Result<HashMap<NodeId, (u32 /*designated*/, u32 /*bought*/)>>`.
   - `gates::Standing.audits_owed: Option<(u32, u32)>`; `earns_as_scanner()` is false while it is set.
-  - `Recorder::record_scan_result(...) -> Result<String>` (the uid).
 
 - [ ] **Step 1: Write the failing tests**
 
-In `src/credits/audit.rs` tests, delete `fresh_scans_of_other_nodes_are_picked_by_chance`, `a_burst_of_scans_is_read_whole`, `the_audit_window_starts_no_earlier_than_the_scan_arrived` and the `finished` helper, and add:
+In `src/credits/audit.rs` tests (the `Picker` tests stay):
 
 ```rust
-    #[test]
-    fn a_scanner_owes_audits_of_one_in_twenty_from_twenty_scans() {
-        assert_eq!(owes(19, 0), None, "too few to owe");
-        assert_eq!(owes(20, 0), Some((0, 1)));
-        assert_eq!(owes(20, 1), None);
-        assert_eq!(owes(41, 2), Some((2, 3)), "5 % of 41 is 2.05: 3");
-        assert_eq!(owes(41, 3), None);
-        assert_eq!(owes(0, 0), None);
+    fn scanner_member(n: u8, proto: u32) -> crate::cluster::members::MemberRow {
+        crate::cluster::members::MemberRow {
+            id: id(n),
+            name: format!("n{n}"),
+            address: Some(format!("198.51.100.{n}:7443")),
+            roles: vec!["scanner".into()],
+            proto_min: 2,
+            proto_max: proto,
+            sponsor: id(n),
+            active: true,
+            standing: crate::cluster::members::Standing::Active,
+            info_hlc: 0,
+            last_entry_hlc: 0,
+            remote_config: false,
+        }
     }
 
     #[test]
-    fn the_queue_hands_out_audits_in_time_and_not_at_excluded_levels() {
+    fn about_one_scan_in_twenty_is_designated_and_nobody_chooses_which() {
+        let n = (0..20_000u64)
+            .filter(|h| designated(&seed("job-x", *h << 16)))
+            .count();
+        assert!((800..1200).contains(&n), "{n} of 20000");
+        // The same job and done status: the same answer everywhere.
+        assert_eq!(seed("job-x", 7), seed("job-x", 7));
+        assert_ne!(seed("job-x", 7), seed("job-y", 7));
+        assert_ne!(seed("job-x", 7), seed("job-x", 8));
+    }
+
+    #[test]
+    fn the_auditors_are_ranked_by_the_seed_never_the_scanner() {
+        let members = [
+            scanner_member(1, 7),
+            scanner_member(2, 7),
+            scanner_member(3, 7),
+            scanner_member(4, 7),
+            scanner_member(5, 6), // too old to be paid
+        ];
+        let s = seed("job-x", 7);
+        let got = auditors(&s, &members, &id(1));
+        assert_eq!(got.len(), AUDITORS);
+        assert!(!got.contains(&id(1)), "never the scanner itself");
+        assert!(!got.contains(&id(5)));
+        assert_eq!(got, auditors(&s, &members, &id(1)), "deterministic");
+        // Another seed, another order (for some seed among a few).
+        assert!((8..40u64).any(|h| auditors(&seed("job-x", h), &members, &id(1)) != got));
+        let mut listener = scanner_member(6, 7);
+        listener.roles = vec!["listener".into()];
+        assert!(!auditors(&s, &[listener], &id(1)).contains(&id(6)), "not a scanner");
+    }
+
+    #[test]
+    fn a_scanner_owes_when_two_designated_scans_lack_an_audit_and_it_bought_under_80_percent() {
+        assert_eq!(owes(0, 0), None);
+        assert_eq!(owes(1, 0), None, "one miss is forgiven");
+        assert_eq!(owes(2, 0), Some((0, 2)));
+        assert_eq!(owes(10, 8), None, "80 %");
+        assert_eq!(owes(10, 7), Some((7, 10)));
+        assert_eq!(owes(20, 17), None, "three misses, but 85 %");
+    }
+
+    #[test]
+    fn bought_audits_are_handed_out_first_and_late_ones_dropped() {
         let now = hlc::wall_ms();
         let task = |uid: &str, level: u8, deadline_ms: u64| Task {
             scan_uid: uid.into(),
@@ -3666,9 +3755,7 @@ In `src/credits/audit.rs` tests, delete `fresh_scans_of_other_nodes_are_picked_b
             ip: "203.0.113.5".into(),
             level,
             deadline_ms,
-            payer: id(1),
-            offer_seq: 7,
-            price_mc: 3,
+            offer: Some((id(1), 7, 3)),
         };
         let mut q = Queue::default();
         assert!(q.push(task("late", 2, now - 1)));
@@ -3677,126 +3764,198 @@ In `src/credits/audit.rs` tests, delete `fresh_scans_of_other_nodes_are_picked_b
         assert_eq!(q.take(&[4]).map(|t| t.scan_uid), Some("two".into()));
         assert_eq!(q.take(&[4]), None, "level 4 excluded, the late one dropped");
         assert_eq!(q.take(&[]).map(|t| t.scan_uid), Some("four".into()));
-        q.started();
-        assert_eq!(q.started_last_hour(), 1);
     }
 
     #[tokio::test]
-    async fn bought_audits_are_counted_for_the_scanner_that_bought_them() {
+    async fn the_obligation_counts_designated_scans_and_audits_bought_from_their_auditors() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
         let pool = &store.pool;
-        let (s, auditor) = (id(1), id(2));
+        let (s, arbiter, auditor, stranger) = (id(1), id(9), id(2), id(3));
+        let members = [scanner_member(1, 7), scanner_member(2, 7)];
         sqlx::query("INSERT INTO ips (id, ip, first_seen, last_seen) VALUES (1, '192.0.2.1', '', '')")
             .execute(pool)
             .await
             .unwrap();
-        let now = (hlc::wall_ms() << 16) as i64;
-        // Three granted scans of s; the first audited by `auditor`, paid;
-        // the second audited, but the offer was never charged.
-        for n in 1..=3i64 {
+        let now = hlc::wall_ms();
+        let day_ago = |extra: u64| ((now - 86_400_000 - extra) << 16) | 1;
+        // Three done jobs of another arbiter whose done status designates them.
+        let mut hlcs = vec![];
+        let mut h = 0u64;
+        while hlcs.len() < 3 {
+            if designated(&seed(&format!("job-{}", hlcs.len()), day_ago(h))) {
+                hlcs.push(day_ago(h));
+            }
+            h += 1;
+        }
+        for (n, done) in hlcs.iter().enumerate() {
             sqlx::query(
-                "INSERT INTO scan_jobs (id, ip_id, level, status, queued_at, uid, origin, arbiter, scanner)
-                 VALUES (?1, 1, 2, 'done', datetime('now'), ?2, ?3, ?3, ?3)",
+                "INSERT INTO scan_jobs (ip_id, level, status, queued_at, uid, origin, arbiter, scanner, status_hlc)
+                 VALUES (1, 2, 'done', datetime('now'), ?1, ?2, ?2, ?3, ?4)",
             )
-            .bind(n).bind(format!("job-{n}")).bind(&s.0[..])
+            .bind(format!("job-{n}")).bind(&arbiter.0[..]).bind(&s.0[..]).bind(hlc::to_db(*done))
             .execute(pool).await.unwrap();
             sqlx::query(
-                "INSERT INTO scans (job_id, ip_id, level, started_at, finished_at, uid, origin, job_uid, hlc)
-                 VALUES (?1, 1, 2, datetime('now'), datetime('now'), ?2, ?3, ?4, ?5)",
+                "INSERT INTO scans (ip_id, level, started_at, finished_at, uid, origin, job_uid, hlc)
+                 VALUES (1, 2, datetime('now'), datetime('now'), ?1, ?2, ?3, ?4)",
             )
-            .bind(n).bind(format!("scan-{n}")).bind(&s.0[..]).bind(format!("job-{n}")).bind(now)
+            .bind(format!("scan-{n}")).bind(&s.0[..]).bind(format!("job-{n}")).bind(hlc::to_db(*done))
             .execute(pool).await.unwrap();
         }
-        for n in 1..=2i64 {
+        // scan-0: audited by its auditor, paid. scan-1: audited by a node
+        // that is no auditor of it, paid. scan-2: not audited.
+        for (n, by) in [(0i64, auditor), (1, stranger)] {
             sqlx::query(
                 "INSERT INTO scans (ip_id, level, started_at, finished_at, uid, origin, job_uid, audit_of, hlc)
                  VALUES (1, 2, datetime('now'), datetime('now'), ?1, ?2, ?3, ?4, ?5)",
             )
-            .bind(format!("audit-{n}")).bind(&auditor.0[..]).bind(format!("job-{n}")).bind(format!("scan-{n}")).bind(now)
+            .bind(format!("audit-{n}")).bind(&by.0[..]).bind(format!("job-{n}")).bind(format!("scan-{n}")).bind(hlc::to_db(day_ago(0)))
             .execute(pool).await.unwrap();
             sqlx::query(
                 "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, seal, economy, audit_uid)
                  VALUES (?1, ?2, ?3, 'offer', ?4, '[]', 1, 2, ?5)",
             )
-            .bind(&s.0[..]).bind(n).bind(now).bind(&auditor.0[..]).bind(format!("scan-{n}"))
+            .bind(&s.0[..]).bind(n + 1).bind(hlc::to_db(day_ago(0))).bind(&by.0[..]).bind(format!("scan-{n}"))
+            .execute(pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, economy)
+                 VALUES (?1, 1, ?2, 'receipt', ?3, '[]', ?4, 4, '[\"audit\"]', 0, 2)",
+            )
+            .bind(&by.0[..]).bind(hlc::to_db(day_ago(0))).bind(&s.0[..]).bind(n + 1)
             .execute(pool).await.unwrap();
         }
-        sqlx::query(
-            "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, economy)
-             VALUES (?1, 1, ?2, 'receipt', ?3, '[]', 1, 4, '[\"audit\"]', 0, 2)",
-        )
-        .bind(&auditor.0[..]).bind(now).bind(&s.0[..])
-        .execute(pool).await.unwrap();
-        let got = obligations(pool, 0).await.unwrap();
+        let got = obligations(pool, &members, now).await.unwrap();
         assert_eq!(got.get(&s), Some(&(3, 1)), "{got:?}");
-        assert_eq!(got.get(&auditor), None, "audits are no scans of granted jobs");
+        assert_eq!(owes(3, 1), Some((1, 3)));
     }
 ```
 
-(Check the `scans` columns this inserts against `0001_initial.sql` and later migrations — `hlc` and `audit_of` exist — and adjust nullable columns the schema requires.)
+(Check the `scans` columns the inserts use against the schema and add any `NOT NULL` column it requires. With members 1 and 2 only, scanner 2 is the only possible auditor of scanner 1's scans.)
 
-In `src/credits/gates.rs`'s `standing_says_who_earns_and_why_not`, add:
+In `src/credits/gates.rs`'s `standing_says_who_earns_and_why_not`:
 
 ```rust
         let owing = Standing {
-            audits_owed: Some((0, 2)),
+            audits_owed: Some((1, 3)),
             ..Default::default()
         };
         assert!(owing.earns() && !owing.earns_as_scanner());
-        assert_eq!(owing.reasons(), ["audits: bought 0 of 2 required"]);
+        assert_eq!(owing.reasons(), ["audits: bought 1 of 3 designated"]);
 ```
 
-In `tests/cluster.rs`, after the funded-job tests:
+In `tests/cluster.rs`:
 
 ```rust
-/// A scanner with 20 scans of granted jobs in 7 days and no bought audit
-/// owes audits: arbiters stop funding it, so it is granted nothing.
+/// A scan designated for audit is bought from its first auditor, which
+/// queues it; a node that is no auditor of it declines.
 #[tokio::test]
-async fn a_scanner_that_buys_no_audits_stops_being_funded() {
+async fn a_designated_scan_is_audited_by_its_auditor() {
+    use peephole::credits::audit;
     let tools = tempfile::tempdir().unwrap();
     let (ia, a) = new_node("node-alpha");
     let (is, s) = new_node("node-sierra");
-    let na = boot(ia, &a, &[&s], DEFAULT).await;
+    let (ix, x) = new_node("node-xray");
+    let scanner = || Opts {
+        scanner: Some(fake_nmap_args(tools.path())),
+        workers: 0,
+        ..DEFAULT
+    };
+    let na = boot(ia, &a, &[&s, &x], DEFAULT).await;
+    let ns = boot(is, &s, &[&a, &x], scanner()).await;
+    let nx = boot(ix, &x, &[&a, &s], scanner()).await;
+    fund_listeners(&[&na, &ns, &nx], &[s.id]).await;
+    market_known(&ns, x.id).await;
+    eventually("s hears x's scan price", || async {
+        ns.node.status.known(&x.id).is_some_and(|k| k.hb.scan_price_mc.is_some())
+    })
+    .await;
+    // A done job of a, scanned by s, whose done status designates it; on
+    // s and x alike (as replication would leave it).
+    let now = peephole::cluster::hlc::wall_ms();
+    let done = (0u64..)
+        .map(|i| ((now - i) << 16) | 1)
+        .find(|h| audit::designated(&audit::seed("job-d", *h)))
+        .unwrap();
+    for n in [&ns, &nx] {
+        let ip = n.store.upsert_ip("198.51.100.70".parse().unwrap()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO scan_jobs (ip_id, level, status, queued_at, uid, origin, arbiter, scanner, status_hlc)
+             VALUES (?1, 2, 'done', datetime('now'), 'job-d', ?2, ?2, ?3, ?4)",
+        )
+        .bind(ip.id).bind(&a.id.0[..]).bind(&s.id.0[..]).bind(peephole::cluster::hlc::to_db(done))
+        .execute(&n.store.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO scans (ip_id, level, started_at, finished_at, uid, origin, job_uid, hlc)
+             VALUES (?1, 2, datetime('now'), datetime('now'), 'scan-d', ?2, 'job-d', ?3)",
+        )
+        .bind(ip.id).bind(&s.id.0[..]).bind(peephole::cluster::hlc::to_db(done))
+        .execute(&n.store.pool).await.unwrap();
+    }
+    assert_eq!(audit::buy(&ns.node, "scan-d").await, Ok(x.id));
+    assert_eq!(nx.node.audit_queue.lock().unwrap().len(), 1, "x queued it");
+    // a is no scanner, so no auditor of it.
+    let req = peephole::cluster::msg::Msg::AuditReq {
+        scan_uid: "scan-d".into(),
+        offer_seq: 1,
+    };
+    let reply = ns.node.request(a.id, req, Duration::from_secs(10)).await;
+    assert!(
+        !matches!(reply, Ok(peephole::cluster::msg::Msg::AuditReply { accepted: true, .. })),
+        "{reply:?}"
+    );
+}
+
+/// A scanner that buys no audits of its designated scans owes them:
+/// arbiters stop funding it, so it is granted nothing.
+#[tokio::test]
+async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funded() {
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("node-alpha");
+    let (is, s) = new_node("node-sierra");
+    let (ix, x) = new_node("node-xray");
+    let na = boot(ia, &a, &[&s, &x], DEFAULT).await;
     let ns = boot(
         is,
         &s,
-        &[&a],
+        &[&a, &x],
         Opts {
             scanner: Some(fake_nmap_args(tools.path())),
             ..DEFAULT
         },
     )
     .await;
+    // x is another scanner: the auditor s should have bought from.
+    let _nx = boot(ix, &x, &[&a, &s], Opts { scanner: Some(fake_nmap_args(tools.path())), workers: 0, ..DEFAULT }).await;
     market_known(&na, s.id).await;
-    // At first it is granted (at 0, nothing owed).
-    enqueue(&na, "198.51.100.61", 1).await;
-    eventually_for(Duration::from_secs(40), "the first job is done", || async {
-        count(&na, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 1
-    })
-    .await;
-    // Twenty more scans of granted jobs, none of them audited.
-    let now = (peephole::cluster::hlc::wall_ms() << 16) as i64;
-    let ip_id: i64 = sqlx::query_scalar("SELECT ip_id FROM scan_jobs LIMIT 1")
-        .fetch_one(&na.store.pool)
-        .await
-        .unwrap();
-    for n in 0..20 {
+    // Three designated scans of a's jobs by s, a day old, none audited.
+    let now = peephole::cluster::hlc::wall_ms();
+    let ip = na.store.upsert_ip("198.51.100.61".parse().unwrap()).await.unwrap();
+    let mut found = 0;
+    for i in 0u64.. {
+        let done = ((now - 86_400_000 - i) << 16) | 1;
+        let job = format!("owed-job-{found}");
+        if !peephole::credits::audit::designated(&peephole::credits::audit::seed(&job, done)) {
+            continue;
+        }
         sqlx::query(
-            "INSERT INTO scan_jobs (ip_id, level, status, queued_at, uid, origin, arbiter, scanner)
-             VALUES (?1, 1, 'done', datetime('now'), ?2, ?3, ?3, ?4)",
+            "INSERT INTO scan_jobs (ip_id, level, status, queued_at, uid, origin, arbiter, scanner, status_hlc)
+             VALUES (?1, 1, 'done', datetime('now'), ?2, ?3, ?3, ?4, ?5)",
         )
-        .bind(ip_id).bind(format!("owed-job-{n}")).bind(&a.id.0[..]).bind(&s.id.0[..])
+        .bind(ip.id).bind(&job).bind(&a.id.0[..]).bind(&s.id.0[..]).bind(peephole::cluster::hlc::to_db(done))
         .execute(&na.store.pool).await.unwrap();
         sqlx::query(
             "INSERT INTO scans (ip_id, level, started_at, finished_at, uid, origin, job_uid, hlc)
              VALUES (?1, 1, datetime('now'), datetime('now'), ?2, ?3, ?4, ?5)",
         )
-        .bind(ip_id).bind(format!("owed-scan-{n}")).bind(&s.id.0[..]).bind(format!("owed-job-{n}")).bind(now)
+        .bind(ip.id).bind(format!("owed-scan-{found}")).bind(&s.id.0[..]).bind(&job).bind(peephole::cluster::hlc::to_db(done))
         .execute(&na.store.pool).await.unwrap();
+        found += 1;
+        if found == 3 {
+            break;
+        }
     }
     let book = peephole::credits::book_fresh(&na.node).await.unwrap();
-    assert_eq!(book.standing(&s.id).audits_owed, Some((0, 2)), "21 scans: 2 required");
+    assert_eq!(book.standing(&s.id).audits_owed, Some((0, 3)));
     enqueue(&na, "198.51.100.62", 1).await;
     tokio::time::sleep(Duration::from_secs(8)).await;
     assert_eq!(
@@ -3807,12 +3966,12 @@ async fn a_scanner_that_buys_no_audits_stops_being_funded() {
 }
 ```
 
-(The book is cached for 10 s; the arbiter reads `credits::book`, which `book_fresh` just refreshed.)
+(`Opts.workers: 0` keeps a scanner from claiming jobs while it has the scanner role; check that `run_workers` with no workers still announces the role. The book is cached for 10 s; the arbiter reads `credits::book`, which `book_fresh` just refreshed. Add `Queue::len` for the first test.)
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `cargo test --lib credits::audit credits::gates` and `cargo test --test cluster a_scanner_that_buys_no_audits`
-Expected: compile errors (`owes`, `Queue`, `obligations`, `audits_owed`).
+Run: `cargo test --lib credits::audit credits::gates` and `cargo test --test cluster designated`
+Expected: compile errors (`seed`, `designated`, `auditors`, `owes`, `Queue`, `obligations`, `audits_owed`).
 
 - [ ] **Step 3: The offer of an audit**
 
@@ -3821,6 +3980,7 @@ Expected: compile errors (`owes`, `Queue`, `obligations`, `audits_owed`).
 ```sql
 -- The scan an audit offer pays for (`credits::audit`).
 ALTER TABLE credit_entries ADD COLUMN audit_uid TEXT;
+CREATE INDEX idx_credit_entries_audit ON credit_entries(audit_uid) WHERE audit_uid IS NOT NULL;
 ```
 
 `Record::CreditOffer` gains, before `economy`:
@@ -3856,18 +4016,155 @@ pub const AUDIT_OFFER_TTL_MS: u64 = audit::AUDIT_WINDOW_MS + JOB_OFFER_TTL_MS;
 
 `src/credits/pay.rs`: rename the body of `make_offer` to `make_offer_for(node, server, total_mc, audit: Option<String>)` writing `audit` into the `CreditOffer`, and keep `pub async fn make_offer(node, server, total_mc) -> Result<u64, String> { make_offer_for(node, server, total_mc, None).await }`. In `accept_offer`, check time against the offer's own lifetime: `fn time_left(hlc: u64, ttl_ms: u64, now_ms: u64, margin_ms: u64) -> bool { now_ms + margin_ms <= physical_ms(hlc) + ttl_ms }`, called with `offer.ttl_ms()`; its unit test passes `OFFER_TTL_MS`.
 
-- [ ] **Step 4: Selling audits**
+- [ ] **Step 4: Designation, ranking, obligation**
+
+`src/credits/audit.rs`: module doc — "Audits: a second look at a scan. … A share of the scans of granted jobs is designated for audit by a hash of the log the scanner cannot steer (`designated`), and the scanner buys each such audit from auditors ranked by the same hash (`auditors`, `buy`); every node counts whether it did (`obligations`). Each scanner also re-runs a share of others' fresh scans unpaid (`Picker`). A node believes, for the differ gate, the audits it made itself and those of its own fleet."
+
+```rust
+/// The share of scans of granted jobs designated for a bought audit; a
+/// protocol constant, so every node designates the same scans.
+pub const AUDIT_RATE: f64 = 0.05;
+/// Auditors that may sell the audit of one designated scan.
+pub const AUDITORS: usize = 3;
+
+/// What designates a scan and ranks its auditors: a hash of its job and
+/// the HLC of the arbiter's done status, which the arbiter writes after
+/// the result is published.
+pub fn seed(job_uid: &str, done_hlc: u64) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"peephole-audit\0");
+    h.update(job_uid.as_bytes());
+    h.update(done_hlc.to_be_bytes());
+    h.finalize().into()
+}
+
+/// Whether the scan of `seed` is designated for a bought audit.
+pub fn designated(seed: &[u8; 32]) -> bool {
+    let x = u64::from_be_bytes(seed[..8].try_into().expect("8 bytes"));
+    (x as f64) < AUDIT_RATE * (u64::MAX as f64 + 1.0)
+}
+
+/// The auditors of a designated scan, best first: the active scanners of
+/// protocol 7 other than `scanner`, ranked by `SHA-256(seed || key)`; the
+/// first [`AUDITORS`].
+pub fn auditors(seed: &[u8; 32], members: &[MemberRow], scanner: &NodeId) -> Vec<NodeId> {
+    use sha2::{Digest, Sha256};
+    let mut ranked: Vec<([u8; 32], NodeId)> = members
+        .iter()
+        .filter(|m| {
+            m.active
+                && m.id != *scanner
+                && m.proto_max >= crate::cluster::rpc::proto::ECONOMY_PROTO
+                && m.roles.iter().any(|r| r == "scanner")
+        })
+        .map(|m| {
+            let mut h = Sha256::new();
+            h.update(seed);
+            h.update(m.id.0);
+            (h.finalize().into(), m.id)
+        })
+        .collect();
+    ranked.sort();
+    ranked.into_iter().take(AUDITORS).map(|(_, id)| id).collect()
+}
+
+/// `(bought, designated)` when a scanner's designated scans lack a bought
+/// audit twice or more and it bought fewer than 80 % of them.
+pub fn owes(designated: u32, bought: u32) -> Option<(u32, u32)> {
+    let missing = designated.saturating_sub(bought);
+    (missing >= 2 && u64::from(bought) * 5 < u64::from(designated) * 4)
+        .then_some((bought, designated))
+}
+
+/// Per scanner: its scans designated over the last 7 days (leaving out
+/// the newest [`crate::credits::AUDIT_OFFER_TTL_MS`], whose audits may
+/// still run), and how many of them it bought: an audit by one of the
+/// scan's [`auditors`] (by `members` as held here), with a charged audit
+/// offer from the scanner to that auditor naming the scan.
+pub async fn obligations(
+    pool: &SqlitePool,
+    members: &[MemberRow],
+    now_ms: u64,
+) -> Result<HashMap<NodeId, (u32, u32)>> {
+    let from = hlc::to_db(now_ms.saturating_sub(7 * crate::credits::DAY_MS) << 16);
+    let to = hlc::to_db(now_ms.saturating_sub(crate::credits::AUDIT_OFFER_TTL_MS) << 16);
+    // (scanner, scan uid, job uid, done HLC)
+    let scans: Vec<(Vec<u8>, String, String, i64)> = sqlx::query_as(
+        "SELECT s.origin, s.uid, j.uid, j.status_hlc FROM scans s
+         JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
+         WHERE s.audit_of IS NULL AND s.origin IS NOT NULL AND s.uid IS NOT NULL
+           AND s.level BETWEEN 1 AND 4 AND j.status = 'done'
+           AND j.arbiter IS NOT NULL AND j.arbiter != s.origin
+           AND j.status_hlc >= ? AND j.status_hlc < ?",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await?;
+    // (scan uid, auditor) of every audit the scanner paid its auditor for.
+    let paid: Vec<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT o.audit_uid, o.peer FROM credit_entries o
+         JOIN credit_entries r ON r.kind = 'receipt' AND r.economy = 2 AND r.charged_mc > 0
+              AND r.origin = o.peer AND r.peer = o.origin AND r.offer_seq = o.seq
+         JOIN scans a ON a.audit_of = o.audit_uid AND a.origin = o.peer
+         WHERE o.kind = 'offer' AND o.economy = 2 AND o.audit_uid IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let paid: std::collections::HashSet<(String, Vec<u8>)> = paid.into_iter().collect();
+    let mut out: HashMap<NodeId, (u32, u32)> = HashMap::new();
+    for (scanner, scan_uid, job_uid, done) in scans {
+        let Ok(scanner) = NodeId::from_slice(&scanner) else { continue };
+        let s = seed(&job_uid, hlc::from_db(done));
+        if !designated(&s) {
+            continue;
+        }
+        let e = out.entry(scanner).or_default();
+        e.0 += 1;
+        if auditors(&s, members, &scanner)
+            .iter()
+            .any(|a| paid.contains(&(scan_uid.clone(), a.0.to_vec())))
+        {
+            e.1 += 1;
+        }
+    }
+    Ok(out)
+}
+```
+
+(`MemberRow` is `crate::cluster::members::MemberRow`; `hlc::from_db`/`to_db` are the existing converters.)
+
+`src/credits/gates.rs`: `Standing` gains
+
+```rust
+    /// `(bought, designated)` audits of its designated scans over 7 days,
+    /// when it bought too few (`credits::audit::owes`).
+    pub audits_owed: Option<(u32, u32)>,
+```
+
+`earns_as_scanner`: `self.earns() && self.audits.is_none() && self.audits_owed.is_none()`; `reasons` adds `format!("audits: bought {b} of {d} designated")`; `standings` adds, after the differ gate:
+
+```rust
+    let all = crate::cluster::members::all(&node.store).await?;
+    let now = crate::cluster::hlc::wall_ms();
+    for (scanner, (designated, bought)) in super::audit::obligations(&node.store.pool, &all, now).await? {
+        if let Some(o) = super::audit::owes(designated, bought) {
+            out.entry(scanner).or_default().audits_owed = Some(o);
+        }
+    }
+```
+
+- [ ] **Step 5: Buying and selling**
 
 `src/cluster/msg.rs`, at the end of `Msg`:
 
 ```rust
-    /// Scanner → scanner: audit my scan `scan_uid` (of job `job_uid`, `ip`
-    /// at `level`), paid with my offer `offer_seq` (`credits::audit`).
+    /// Scanner → its auditor: audit my designated scan `scan_uid`, paid
+    /// with my offer `offer_seq` (`credits::audit`). The auditor reads the
+    /// scan from its own copy of the log.
     AuditReq {
         scan_uid: String,
-        job_uid: String,
-        ip: String,
-        level: u8,
         offer_seq: u64,
     },
     AuditReply {
@@ -3876,99 +4173,120 @@ pub const AUDIT_OFFER_TTL_MS: u64 = audit::AUDIT_WINDOW_MS + JOB_OFFER_TTL_MS;
     },
 ```
 
-`src/cluster/mod.rs`: `pub audit_queue: Mutex<crate::credits::audit::Queue>,` initialised `Default::default()`.
+`src/cluster/mod.rs`: `pub audit_queue: Mutex<crate::credits::audit::Queue>,` and `pub audits_tried: Mutex<std::collections::HashSet<String>>,` (both `Default::default()`).
 
-`src/credits/audit.rs`: update the module doc ("…A scanner buys a share of audits of its own fresh scans from other scanners (`buy`); the auditor runs them (`serve`, `Queue`)… a node believes the audits it made itself and those of its own fleet; every node counts whether a scanner bought enough (`obligations`)."). Replace `Picker`, `chance`'s use in `poll`, `ms_of`, `audit_from` and `POLL_BATCH` with:
+`src/credits/audit.rs`, beside the `Picker`:
 
 ```rust
-/// A bought audit waiting for a free worker.
+/// A scan to run again: an unpaid pick (`offer` None) or a bought audit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub scan_uid: String,
     pub job_uid: String,
     pub ip: String,
     pub level: u8,
-    /// Wall-clock ms after which it is dropped (the offer then lapses).
+    /// Wall-clock ms after which it is dropped.
     pub deadline_ms: u64,
-    /// The scanner that bought it, its offer and what it offered.
-    pub payer: NodeId,
-    pub offer_seq: u64,
-    pub price_mc: u32,
+    /// Who bought it, its offer and what it offered.
+    pub offer: Option<(NodeId, u64, u32)>,
 }
 
-/// The audits this scanner sold and has not started.
+/// Bought audits waiting for a free worker; handed out before unpaid picks.
 #[derive(Default)]
-pub struct Queue {
-    queue: VecDeque<Task>,
-    /// When this scanner started its audits of the last hour.
-    started: VecDeque<Instant>,
-}
+pub struct Queue(VecDeque<Task>);
 
 impl Queue {
     /// Queue a bought audit; false when [`MAX_WAITING`] wait already.
     pub fn push(&mut self, t: Task) -> bool {
-        if self.queue.len() >= MAX_WAITING {
+        if self.0.len() >= MAX_WAITING {
             return false;
         }
-        self.queue.push_back(t);
+        self.0.push_back(t);
         true
     }
-    // `take`, `started` and `started_last_hour` as on the old `Picker`.
-}
 
-/// Whether to buy an audit of a fresh scan: with probability `share`, from
-/// this node's own random source.
-pub fn chance(share: f64) -> bool { /* the existing body */ }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The next one still in time and not at a level in `exclude`.
+    pub fn take(&mut self, exclude: &[u8]) -> Option<Task> {
+        let now = hlc::wall_ms();
+        self.0.retain(|t| t.deadline_ms > now);
+        let i = self.0.iter().position(|t| !exclude.contains(&t.level))?;
+        self.0.remove(i)
+    }
+}
 ```
 
-and add:
+The `Picker`'s own `Task` becomes this `Task` with `offer: None` (its `take` returns it); `started`/`started_last_hour` stay on the `Picker`, which also counts bought audits started (the worker calls `started()` for both).
 
 ```rust
-/// Answer bought audits: check the offer, queue the audit.
+/// `(scanner, job uid, ip, level, done HLC)` of the scan `scan_uid` held
+/// here, once its job is done; waits up to `SERVE_WAIT` for it to arrive.
+async fn scan_of(node: &Node, scan_uid: &str) -> Option<(NodeId, String, String, u8, u64)> {
+    let until = tokio::time::Instant::now() + crate::credits::pay::SERVE_WAIT;
+    loop {
+        let row: Option<(Vec<u8>, String, String, i64, i64)> = sqlx::query_as(
+            "SELECT s.origin, j.uid, i.ip, s.level, j.status_hlc FROM scans s
+             JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
+             JOIN ips i ON i.id = s.ip_id
+             WHERE s.uid = ? AND s.audit_of IS NULL AND j.status = 'done'
+               AND j.arbiter IS NOT NULL AND j.arbiter != s.origin",
+        )
+        .bind(scan_uid)
+        .fetch_optional(&node.store.pool)
+        .await
+        .ok()
+        .flatten();
+        if let Some((s, job, ip, level, done)) = row {
+            return Some((NodeId::from_slice(&s).ok()?, job, ip, u8::try_from(level).ok()?, hlc::from_db(done)));
+        }
+        if tokio::time::Instant::now() >= until {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Answer bought audits: check the scan, the ranking and the offer, then
+/// queue the audit.
 pub fn serve(node: &Arc<Node>) {
     let weak = Arc::downgrade(node);
     node.on_message(Arc::new(move |from, msg| {
         let weak = weak.clone();
         Box::pin(async move {
-            let Msg::AuditReq { scan_uid, job_uid, ip, level, offer_seq } = msg else {
+            let Msg::AuditReq { scan_uid, offer_seq } = msg else {
                 return None;
             };
             let node = weak.upgrade()?;
-            let reply = match sell(&node, from, scan_uid, job_uid, ip, level, offer_seq).await {
+            Some(match sell(&node, from, &scan_uid, offer_seq).await {
                 Ok(()) => Msg::AuditReply { accepted: true, why: None },
                 Err(why) => Msg::AuditReply { accepted: false, why: Some(why) },
-            };
-            Some(reply)
+            })
         })
     }));
 }
 
-/// Take an audit `peer` buys with its offer `seq`, or say why not (the
-/// offer is freed then).
-async fn sell(
-    node: &Arc<Node>,
-    peer: NodeId,
-    scan_uid: String,
-    job_uid: String,
-    ip: String,
-    level: u8,
-    seq: u64,
-) -> Result<(), String> {
+async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Result<(), String> {
     use crate::credits::{entries, pay, price};
     let refuse = async |why: &str| {
         pay::release(node, peer, seq).await;
         Err(why.to_string())
     };
-    if !node.roles().scanner {
-        return refuse("this node does not scan").await;
+    if !node.roles().scanner || scan_uid.is_empty() || scan_uid.len() > 128 {
+        return refuse("this node audits no such scan").await;
     }
-    let valid = (1..=4).contains(&level)
-        && !scan_uid.is_empty()
-        && scan_uid.len() <= 128
-        && job_uid.len() <= 128
-        && ip.parse::<std::net::IpAddr>().is_ok_and(crate::net::is_scannable_target);
-    if !valid {
-        return refuse("not an audit of a scan").await;
+    let Some((scanner, job_uid, ip, level, done)) = scan_of(node, scan_uid).await else {
+        return refuse("the scan or its done job is not held here").await;
+    };
+    let s = seed(&job_uid, done);
+    let members = crate::cluster::members::all(&node.store).await.map_err(|e| format!("{e:#}"))?;
+    if scanner != peer || !(1..=4).contains(&level) || !designated(&s) {
+        return refuse("not a designated scan of the asker").await;
+    }
+    if !auditors(&s, &members, &scanner).contains(&node.id()) {
+        return refuse("this node is not among the scan's auditors").await;
     }
     let least = price::min_take(node.price_table().price_of(price::SCAN).unwrap_or(0)) as u64;
     // Room for the wait, the longest scan and the receipt.
@@ -3987,14 +4305,12 @@ async fn sell(
         return refuse("the offer is for another scan").await;
     }
     let task = Task {
-        scan_uid,
+        scan_uid: scan_uid.to_string(),
         job_uid,
         ip,
         level,
         deadline_ms: hlc::wall_ms() + AUDIT_WINDOW_MS,
-        payer: peer,
-        offer_seq: seq,
-        price_mc: parts.iter().map(|(_, mc)| *mc).sum(),
+        offer: Some((peer, seq, parts.iter().map(|(_, mc)| *mc).sum())),
     };
     if !node.audit_queue.lock().unwrap().push(task) {
         return refuse("this scanner has too many audits waiting").await;
@@ -4002,164 +4318,98 @@ async fn sell(
     Ok(())
 }
 
-/// The cheapest live scanner outside this node's fleet that announces a
-/// scan price (equal prices at random), and that price.
-async fn pick_auditor(node: &Node) -> Option<(NodeId, u32)> {
-    let mut fleet = crate::cluster::owner::fleet::siblings(&node.store).await.unwrap_or_default();
-    fleet.push(node.id());
-    let members = node.members();
-    let mut best: Option<(u32, u32, NodeId)> = None;
-    for id in node.live_members(crate::scan::arbiter::LIVE_WINDOW) {
-        if fleet.contains(&id) || node.is_blocked(&id) || !node.can_call(&id) {
-            continue;
-        }
-        if !members.get(&id).is_some_and(|m| crate::credits::pay::sells_scans(m.proto_max)) {
-            continue;
-        }
-        let Some(k) = node.status.known(&id) else { continue };
-        if !k.hb.roles.iter().any(|r| r == "scanner") {
-            continue;
-        }
-        let Some(price) = k.hb.scan_price_mc else { continue };
-        let mut r = [0u8; 4];
-        let _ = aws_lc_rs::rand::fill(&mut r);
-        let key = (price, u32::from_le_bytes(r), id);
-        if best.as_ref().is_none_or(|b| (key.0, key.1) < (b.0, b.1)) {
-            best = Some(key);
-        }
+/// Buy the audit of this node's designated scan `scan_uid` from its
+/// auditors in rank order: the first that is live, announces a scan price
+/// and accepts, at that price (at least 1 mc). Returns the auditor.
+pub async fn buy(node: &Arc<Node>, scan_uid: &str) -> Result<NodeId, String> {
+    let me = node.id();
+    let Some((scanner, job_uid, _, _, done)) = scan_of(node, scan_uid).await else {
+        return Err("the scan or its done job is not held here".into());
+    };
+    if scanner != me {
+        return Err("not this node's scan".into());
     }
-    best.map(|(price, _, id)| (id, price))
-}
-
-/// Buy an audit of this node's scan `scan_uid` from [`pick_auditor`]'s
-/// choice, offering its price (at least 1 mc: only a charged offer counts
-/// as bought). Returns the auditor.
-pub async fn buy(
-    node: &Arc<Node>,
-    scan_uid: String,
-    job_uid: String,
-    ip: String,
-    level: u8,
-) -> Result<NodeId, String> {
-    let (auditor, price) = pick_auditor(node)
+    let s = seed(&job_uid, done);
+    if !designated(&s) {
+        return Err("not designated".into());
+    }
+    let members = crate::cluster::members::all(&node.store).await.map_err(|e| format!("{e:#}"))?;
+    let mut last = "no auditor is reachable".to_string();
+    for auditor in auditors(&s, &members, &me) {
+        let live = node.live_members(crate::scan::arbiter::LIVE_WINDOW).contains(&auditor);
+        let price = node.status.known(&auditor).and_then(|k| k.hb.scan_price_mc);
+        let (true, Some(price)) = (live && node.can_call(&auditor), price) else {
+            continue;
+        };
+        let offer_seq = match crate::credits::pay::make_offer_for(
+            node,
+            auditor,
+            price.max(1) as u64,
+            Some(scan_uid.to_string()),
+        )
         .await
-        .ok_or_else(|| "no other operator's scanner sells audits".to_string())?;
-    let offer_seq = crate::credits::pay::make_offer_for(
-        node,
-        auditor,
-        price.max(1) as u64,
-        Some(scan_uid.clone()),
-    )
-    .await?;
-    let req = Msg::AuditReq { scan_uid, job_uid, ip, level, offer_seq };
-    match node.request(auditor, req, std::time::Duration::from_secs(30)).await {
-        Ok(Msg::AuditReply { accepted: true, .. }) => Ok(auditor),
-        Ok(Msg::AuditReply { why, .. }) => Err(why.unwrap_or_else(|| "declined".into())),
-        Ok(_) => Err("unexpected answer".into()),
-        Err(e) => Err(format!("could not be asked: {e:#}")),
+        {
+            Ok(seq) => seq,
+            Err(why) => return Err(why),
+        };
+        let req = Msg::AuditReq { scan_uid: scan_uid.to_string(), offer_seq };
+        match node.request(auditor, req, std::time::Duration::from_secs(30)).await {
+            Ok(Msg::AuditReply { accepted: true, .. }) => return Ok(auditor),
+            Ok(Msg::AuditReply { why, .. }) => last = why.unwrap_or_else(|| "declined".into()),
+            Ok(_) => last = "unexpected answer".into(),
+            Err(e) => last = format!("could not be asked: {e:#}"),
+        }
     }
-}
-```
-
-(Imports: `crate::cluster::{Node, msg::Msg}`, `std::sync::Arc`.)
-
-Obligations:
-
-```rust
-/// A scanner with at least this many successful scans of granted jobs in
-/// 7 days must have bought audits of 1 in 20 of them.
-pub const AUDIT_MIN_SCANS: u32 = 20;
-
-/// `(bought, required)` when a scanner with `scans` successful scans of
-/// granted jobs bought too few audits of them; None when it owes nothing.
-pub fn owes(scans: u32, bought: u32) -> Option<(u32, u32)> {
-    let required = scans.div_ceil(20);
-    (scans >= AUDIT_MIN_SCANS && bought < required).then_some((bought, required))
+    Err(last)
 }
 
-/// Per scanner, its successful scans of granted jobs at levels 1 to 4
-/// dated `since_hlc` or later, and the audits of them it bought: an audit
-/// (by another node) of its scan, with a charged audit offer from it to
-/// that auditor naming the scan.
-pub async fn obligations(pool: &SqlitePool, since_hlc: u64) -> Result<HashMap<NodeId, (u32, u32)>> {
-    let since = hlc::to_db(since_hlc);
-    let scans: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-        "SELECT s.origin, COUNT(*) FROM scans s
+/// Buy the audits of this node's designated scans whose done status
+/// arrived within the audit window and that it has not tried yet.
+/// Returns how many it bought.
+pub async fn buy_due(node: &Arc<Node>) -> usize {
+    let me = node.id();
+    let since = hlc::to_db(hlc::wall_ms().saturating_sub(AUDIT_WINDOW_MS) << 16);
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT s.uid, j.uid, j.status_hlc FROM scans s
          JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
-         WHERE s.audit_of IS NULL AND s.origin IS NOT NULL
-           AND s.level BETWEEN 1 AND 4 AND s.hlc >= ?
-         GROUP BY s.origin",
+         WHERE s.origin = ?1 AND s.audit_of IS NULL AND s.uid IS NOT NULL
+           AND s.level BETWEEN 1 AND 4 AND j.status = 'done'
+           AND j.arbiter IS NOT NULL AND j.arbiter != ?1 AND j.status_hlc >= ?2",
     )
+    .bind(&me.0[..])
     .bind(since)
-    .fetch_all(pool)
-    .await?;
-    let bought: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-        "SELECT o.origin, COUNT(DISTINCT o.audit_uid) FROM credit_entries o
-         JOIN credit_entries r ON r.kind = 'receipt' AND r.economy = 2 AND r.charged_mc > 0
-              AND r.origin = o.peer AND r.peer = o.origin AND r.offer_seq = o.seq
-         JOIN scans s ON s.uid = o.audit_uid AND s.origin = o.origin AND s.audit_of IS NULL
-         JOIN scans a ON a.audit_of = s.uid AND a.origin = o.peer
-         WHERE o.kind = 'offer' AND o.economy = 2 AND o.audit_uid IS NOT NULL AND s.hlc >= ?
-         GROUP BY o.origin",
-    )
-    .bind(since)
-    .fetch_all(pool)
-    .await?;
-    let mut out: HashMap<NodeId, (u32, u32)> = HashMap::new();
-    for (id, n) in scans {
-        if let Ok(id) = NodeId::from_slice(&id) {
-            out.entry(id).or_default().0 = n.clamp(0, u32::MAX as i64) as u32;
+    .fetch_all(&node.store.pool)
+    .await
+    .unwrap_or_default();
+    let mut bought = 0;
+    for (scan_uid, job_uid, done) in rows {
+        if !designated(&seed(&job_uid, hlc::from_db(done)))
+            || !node.audits_tried.lock().unwrap().insert(scan_uid.clone())
+        {
+            continue;
+        }
+        match buy(node, &scan_uid).await {
+            Ok(by) => {
+                tracing::info!(scan = %scan_uid, auditor = %by.short(), "audit bought");
+                bought += 1;
+            }
+            Err(why) => tracing::info!(scan = %scan_uid, %why, "designated scan not audited"),
         }
     }
-    for (id, n) in bought {
-        if let Ok(id) = NodeId::from_slice(&id) {
-            out.entry(id).or_default().1 = n.clamp(0, u32::MAX as i64) as u32;
-        }
-    }
-    Ok(out)
+    bought
 }
 ```
 
-(The receipt's timing against the offer's lifetime is the ledger's business; counting the charged pair is enough here.)
+`audits_tried` is pruned with the hourly prune in `credits::run` (clear it when it holds more than 10 000 uids: a scan older than the window is never due again). `credits::run` calls `audit::buy_due(&node).await;` every tick.
 
-`src/credits/gates.rs`: `Standing` gains
-
-```rust
-    /// `(bought, required)` audits of its own scans over 7 days, when it
-    /// bought too few (`credits::audit::owes`).
-    pub audits_owed: Option<(u32, u32)>,
-```
-
-`earns_as_scanner`: `self.earns() && self.audits.is_none() && self.audits_owed.is_none()`; `reasons` adds `format!("audits: bought {b} of {r} required")`; `standings` adds, after the differ gate:
-
-```rust
-    for (scanner, (scans, bought)) in super::audit::obligations(&node.store.pool, week).await? {
-        if let Some(o) = super::audit::owes(scans, bought) {
-            out.entry(scanner).or_default().audits_owed = Some(o);
-        }
-    }
-```
-
-- [ ] **Step 5: The scanner buys, the auditor runs and charges**
-
-`src/store/recorder.rs`: `record_scan_result` returns `Result<String>`, the uid it wrote (`let uid = self.uid();` before building the record). Fix its callers (`let _ =` where the uid is not needed).
+- [ ] **Step 6: The auditor runs and charges; arbiters stop funding**
 
 `src/scan/mod.rs`:
-- Delete `Source.audits` and its initialiser. `next_audit` takes from `node.audit_queue` (`let t = { node.audit_queue.lock().unwrap().take(exclude) }` in the loop — never hold the std lock across an `await`); on start `node.audit_queue.lock().unwrap().started()`. The worker loop's rate cap uses `source.audits_started_last_hour()`:
+- `next_audit`: first `let bought = node.audit_queue.lock().unwrap().take(exclude);` (never hold the std lock across an `await`), then the picker as today; the checks after (`active`, `preflight`, evidence) apply to both. `picker.started()` for both.
+- `Job::Audit` gains `offer: Option<(NodeId, u64, u32)>` from the task.
+- `finish`, `Job::Audit` with `Outcome::Done`: after `record_scan_audit` succeeds and when `offer` is `Some((payer, seq, price))`,
 
 ```rust
-    /// Audits started in the last hour (they count against the hourly cap).
-    fn audits_started_last_hour(&self) -> i64 {
-        self.node()
-            .map_or(0, |n| n.audit_queue.lock().unwrap().started_last_hour())
-    }
-```
-
-- `Job::Audit` gains `offer: (NodeId, u64, u32)` (payer, offer, price), set from the task.
-- `finish`, `Job::Audit` with `Outcome::Done`: after `record_scan_audit` succeeds,
-
-```rust
-                        let (payer, seq, price) = *offer;
                         let receipt = Record::CreditReceipt {
                             payer,
                             offer_seq: seq,
@@ -4172,33 +4422,22 @@ pub async fn obligations(pool: &SqlitePool, since_hlc: u64) -> Result<HashMap<No
                         }
 ```
 
-  (a failed or abandoned audit writes nothing: the offer lapses). Add `pub const AUDIT: &str = "audit";` to `credits::price` next to `SCAN`.
-- `finish`, `Job::Granted` with `Outcome::Done`: when `record_scan_result` returns `Ok(scan_uid)` and `(1..=4).contains(level)` and `crate::credits::audit::chance(self.cfg.credits.audit_share)`, spawn
+  (a bought audit that fails, is abandoned or is not run writes nothing: the offer lapses). Add `pub const AUDIT: &str = "audit";` to `credits::price` next to `SCAN`.
 
-```rust
-                            let (node, job_uid, ip, level) = (node.clone(), uid.clone(), ip.to_string(), *level);
-                            tokio::spawn(async move {
-                                match crate::credits::audit::buy(&node, scan_uid, job_uid, ip, level).await {
-                                    Ok(by) => debug!(auditor = %by.short(), "audit bought"),
-                                    Err(why) => debug!(%why, "no audit bought"),
-                                }
-                            });
-```
+`src/scan/arbiter.rs` `round`: read `let book = crate::credits::book(&self.node).await.ok();` once and pass it to `stand`: `price: if book.as_ref().is_some_and(|b| !b.standing(scanner).earns_as_scanner()) { None } else { crate::credits::jobs::price_for(&self.node, scanner) },` (doc: "None: unpaid here, or a scanner that does not earn as one (it owes audits, or its audits differ): it is not funded").
 
-`src/scan/arbiter.rs` `round`: read `let book = crate::credits::book(&self.node).await.ok();` once, and `stand` takes it: `price: if book.as_ref().is_some_and(|b| !b.standing(scanner).earns_as_scanner()) { None } else { crate::credits::jobs::price_for(&self.node, scanner) },` (doc: "None: unpaid here, or a scanner that does not earn as one (it owes audits, or its audits differ): it is not funded").
+`src/lib.rs`: `credits::audit::serve(&node)` where the other cluster handlers are registered (with `credits::fleet::serve`); `tests/cluster.rs` `boot_in`: `peephole::credits::audit::serve(&node);` after `peephole::credits::fleet::serve(&node);`. `[credits] audit_share` keeps its meaning (the unpaid checks).
 
-`src/lib.rs`: call `credits::audit::serve(&node)` where the other cluster handlers are registered (with `credits::fleet::serve`); `tests/cluster.rs` `boot_in`: `peephole::credits::audit::serve(&node);` after `peephole::credits::fleet::serve(&node);`. `src/config.rs` and `deploy/config.example.toml`'s doc for `audit_share`: "the chance a scanner buys an audit of each of its scans of granted jobs at levels 1–4 from another operator's scanner (0: buys none; a scanner with 20 such scans a week must have bought audits of 1 in 20)".
+- [ ] **Step 7: Run the tests to verify they pass**
 
-- [ ] **Step 6: Run the tests to verify they pass**
-
-Run: `cargo test --lib credits scan cluster::msg config` and `cargo test --test cluster a_scanner_that_buys_no_audits a_funded_scan_job`
+Run: `cargo test --lib credits scan cluster::msg` and `cargo test --test cluster designated a_funded_scan_job audits`
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add -A src tests deploy
-git commit -m "Credits: scanners buy audits of their own scans; too few, and they are not funded"
+git add -A src tests
+git commit -m "Credits: designated scans are audited by ranked auditors; owed audits stop funding"
 ```
 
 ---
@@ -4713,7 +4952,7 @@ In `route_avoiding`, a relay that fails or refuses is skipped for the next:
     };
 ```
 
-keep it (`price_key(RELAY)`), add a history row (`(RELAY, relay_mc, per_hour(got(RELAY)), node.cfg.relay_slots as f64)` when advertised) and set it in the `Table`. `src/admin/credits.rs` `good_label`: `credits::price::RELAY => "Relay lease".into()`.
+keep it (`price_key(RELAY)`; `load_kept` seeds `relay_mc` from it when advertised), add a history row (`(RELAY, relay_mc, per_hour(got(RELAY)), node.cfg.relay_slots as f64)` when advertised) and set it in the `Table`. `src/admin/credits.rs` `good_label`: `credits::price::RELAY => "Relay lease".into()`.
 
 `src/cluster/rpc/mod.rs`: `.route("/rpc/v1/relay", post(relay))` calling `crate::cluster::relay::serve(&node, peer, &req)`; `src/cluster/rpc/routed.rs`: `ROUTED_PATHS` gains `"/rpc/v1/relay"` with its arm in `answer`, and the routed test asserts it. `src/lib.rs`: in cluster mode, `tokio::spawn(cluster::relay::run(node.clone(), shutdown_rx.clone()));` next to `credits::run`.
 
@@ -4758,7 +4997,7 @@ In `src/admin/credits.rs`, `MemberRow` gains `up: String` ("hours up today, as r
             "qualifies",
             "Reverse names cost <b>0.00</b>",
             "A relay lease (an hour) costs <b>0.01</b>",
-            "buys audits of 5 % of its scans",
+            "checks 5 % of other nodes' fresh scans unpaid",
         ] {
             assert!(html.contains(want), "{want} missing");
         }
@@ -4784,7 +5023,7 @@ Template:
 - "What things cost here", after the resolution line:
   `<li>Reverse names cost <b>{{ price.rdns }}</b> credits here.</li>`
   `{% if let Some(r) = price.relay %}<li>A relay lease (an hour) costs <b>{{ r }}</b> credits here.</li>{% endif %}`
-  `<li>This node buys audits of {{ price.audit_share }} % of its scans from other operators' scanners.</li>`
+  `<li>1 in 20 scans of granted jobs is designated for an audit the scanner buys from auditors the log ranks; this node also checks {{ price.audit_share }} % of other nodes' fresh scans unpaid.</li>`
 - Its lead paragraph: "Each price follows sales: it rises while the good sells (or every slot is taken) and falls while it does not, down to nothing. What this node answers itself is free, though its own scan jobs use up its scan budget."
 
 - [ ] **Step 4: Installer**
@@ -4809,9 +5048,9 @@ Run `bash -n install.sh` and `tests/install-smoke.sh` if it runs offline (read i
 - **Prices.** "One rule for every good, on each node every 10 minutes: a good that sold since the last refresh (or whose every slot is taken) gets dearer by at most a factor of e^0.45 an hour; one that sold nothing gets cheaper by e^-0.15 an hour; each step is scaled by the time since the last and moves at least 0.001 credits. There is no floor: a good nobody buys becomes free, and a free good that is used costs 0.001 at the next refresh. A request may carry no offer: the server answers what it prices at zero and declines the rest naming the price, which the asker may offer once. Scan prices are per scanner, computed by every node from the scans of jobs granted to it; an arbiter pays at most 1.25 times its own figure."
 - **Domains and reverse names.** "Quorum goods: `q = min(9, ⌊n/2⌋+1)` nodes are asked, n being the reachable members announcing a price (this node included): this node and the q−1 cheapest, other operators and new countries first among equals. An answer stands when more than half of those that answered gave it. Only the node that recorded a source buys its reverse names (forward-confirmed PTR names); the answers replicate as `rdns_name` records and every node keeps the names with their agreement."
 - **Scan jobs.** Delete the idle-work and unfunded sentences ("A job no claimant can be paid for is idle work: there, … stretches, a share of 1 − weight of them." and "Jobs that are not funded are scanned by idle capacity and earn the mint only."); add "Every grant is funded, at zero or above: a scanner priced at 0 is granted without an offer. A job no claimant can be paid for waits. `scan_share = 0` funds only free scanners."
-- **Conformity and audits.** "…its scans stand up to the audits you believe: those of your own nodes. A scanner buys audits of `[credits] audit_share` (5 %) of its successful scans of granted jobs from the cheapest scanner of another operator; the auditor is paid when it publishes the audit. A scanner with 20 such scans in 7 days must have bought audits of at least 5 % of them; until it has, arbiters do not fund it and its scan receipts count for nothing."
+- **Conformity and audits.** "…its scans stand up to the audits you believe: those of your own nodes. One in 20 scans of jobs granted by another arbiter is designated for a bought audit by a hash of the job and the arbiter's done status, which the scanner cannot steer or know before it has published the result; the same hash ranks the scan's three auditors among the scanners. The scanner buys the audit from the first of them that is reachable and priced; the auditor is paid when it publishes the audit. A scanner with two or more designated scans of 7 days unaudited and under 80 % bought is not funded by arbiters, and its scan receipts count for nothing, until it catches up. Each scanner also re-runs `[credits] audit_share` (5 %) of other nodes' fresh scans unpaid, own jobs and small scanners included."
 - **Relays.** "An advertised node sells relay leases (`[cluster] relay_slots`, 16 at a time): an hour of holding an outbox for an outbound-only member. It holds outboxes only for members with an address or a lease."
-- "What this cannot do": delete the items about the mint, the allowance, idle scanners and "a sensor with a small allowance"; replace "A member that spent its credits and then stops earning here…" with "A member that stops earning here (rules or audits) is credited no pool share and paid for no sales here until it earns again; offers to it lapse back to their payers."; add "A scanner picks its own auditor, so it can keep choosing one cheap friend outside its fleet; the fleet exclusion is the only guard." and "Reach reports are self-asserted: a majority of members colluding can call a listener down, or one up."
+- "What this cannot do": delete the items about the mint, the allowance, idle scanners and "a sensor with a small allowance"; replace "A member that spent its credits and then stops earning here…" with "A member that stops earning here (rules or audits) is credited no pool share and paid for no sales here until it earns again; offers to it lapse back to their payers."; add "Fleets are private, so a sibling of a scanner can rank among its auditors and approve what it is sent; the unpaid checks of other operators are the guard. An arbiter colluding with its scanner can steer which scans are designated." and "Reach reports are self-asserted: a majority of members colluding can call a listener down, or one up."
 - **Upgrading.** Add first: "Protocol 7 is a clean cut: the credits of protocol 7 (payments carrying `economy` 2, signed under their own domain) are the only ones counted; earlier payments are kept and ignored, balances start at zero, and the first money is the first pool after a day with 12 reported hours. Upgrade all members in one sitting: a member below protocol 7 is not paid, funded or charged, and is served no entries of protocol 7 until it upgrades."
 
 The command list near line 55 gains `peephole credits uptime               # members' reported hours up, 7 days` and loses `credits why`.
@@ -4822,10 +5061,9 @@ The command list near line 55 gains `peephole credits uptime               # mem
 
 ```toml
 # [credits]
-# # Cluster only. The chance a scanner buys an audit of each of its scans
-# # of granted jobs at levels 1-4 from another operator's scanner. A scanner
-# # with 20 such scans a week must have bought audits of 1 in 20, or it is
-# # not funded (0 = buy none).
+# # Cluster only. A scanner runs this share of the other nodes' fresh scans
+# # again to check them, unpaid (0 = check nothing). Bought audits of
+# # designated scans do not depend on it.
 # audit_share = 0.05
 # # Cluster only. The share of this node's credits its own scan jobs may hold
 # # or pay for in a day: a funded job pays its scanner on delivery
@@ -4850,7 +5088,7 @@ and under the `[cluster]` example: `# relay_slots = 16        # relay leases sol
   member's reported hours.
 ```
 
-and under Changed/Added: prices follow sales with no floor (zero-priced goods free without an offer); every scan job is funded, no idle work; domains and reverse names are quorum goods (`min(9, ⌊n/2⌋+1)` of the cheapest); reverse names of a source are bought by the node that recorded it and replicated with their agreement; scanners buy audits of their own scans (`audit_share` changes meaning); outbound-only members lease relays (`[cluster] relay_slots`). Remove or reword the Unreleased lines this release contradicts ("Unpaid jobs keep the sit-out rule.", "Scans run with the previous list still earn.").
+and under Changed/Added: prices follow sales with no floor (zero-priced goods free without an offer); every scan job is funded, no idle work; domains and reverse names are quorum goods (`min(9, ⌊n/2⌋+1)` of the cheapest); reverse names of a source are bought by the node that recorded it and replicated with their agreement; scanners buy audits of their designated scans (1 in 20, drawn from the log) from ranked auditors, and are not funded while they owe them; outbound-only members lease relays (`[cluster] relay_slots`). Remove or reword the Unreleased lines this release contradicts ("Unpaid jobs keep the sit-out rule.", "Scans run with the previous list still earn.").
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
