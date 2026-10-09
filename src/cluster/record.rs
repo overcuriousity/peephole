@@ -751,9 +751,18 @@ impl WireEntry {
 
     /// Whether only members of protocol 7 may be served this entry.
     pub fn needs_economy_proto(&self) -> bool {
-        ECONOMY_KINDS.contains(&self.kind.as_str())
-            || (CREDIT_KINDS.contains(&self.kind.as_str())
-                && self.record().is_some_and(|r| r.economy() == ECONOMY))
+        let kind = self.kind.as_str();
+        if ECONOMY_KINDS.contains(&kind) {
+            return true;
+        }
+        if !CREDIT_KINDS.contains(&kind) && kind != "fork_proof" {
+            return false;
+        }
+        match self.record() {
+            Some(Record::ForkProof { a, b }) => a.needs_economy_proto() || b.needs_economy_proto(),
+            Some(r) => r.economy() == ECONOMY,
+            None => false,
+        }
     }
 }
 
@@ -815,6 +824,21 @@ mod tests {
         };
         assert!(!under_old.verify());
         assert_eq!(offer(ECONOMY).economy(), ECONOMY);
+        // A proof of two histories carrying such a payment needs it too.
+        let proof = |x: &WireEntry| {
+            WireEntry::sign(
+                &id,
+                5,
+                10 << 16,
+                &Record::ForkProof {
+                    a: Box::new(x.clone()),
+                    b: Box::new(old.clone()),
+                },
+            )
+            .unwrap()
+        };
+        assert!(proof(&new).needs_economy_proto());
+        assert!(!proof(&old).needs_economy_proto());
         assert_eq!(
             Record::LogSeal {
                 seal: Seal::default()

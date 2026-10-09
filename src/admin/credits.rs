@@ -806,6 +806,7 @@ mod tests {
             "812.00",
             "0.05",
             "5 hours up today",
+            "12 hours earn today's pool share",
             "1000 credits are split evenly",
             "12 of the day's 24 hours",
         ] {

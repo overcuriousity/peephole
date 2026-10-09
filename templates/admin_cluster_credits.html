@@ -8,7 +8,7 @@
 <div class="stack">
 <div class="tiles kpis market-kpis">
   <div class="tile"><span class="label">In circulation</span><div class="value">{{ totals.1 }}</div><div class="hint">credits · {{ totals.0 }} earned in 7 days</div></div>
-  <div class="tile"><span class="label">Up today</span><div class="value">{{ today_up.0 }}<span class="of"> hours</span></div><div class="hint">{% if today_up.1 %}reported by the members · 12 earn today's pool share{% else %}not an advertised listener: no pool share{% endif %}</div></div>
+  <div class="tile"><span class="label">Up today</span><div class="value">{{ today_up.0 }}<span class="of"> hours</span></div><div class="hint">{% if today_up.1 %}reported by the members · 12 hours earn today's pool share{% else %}not an advertised listener: no pool share{% endif %}</div></div>
   <div class="tile"><span class="label">Scan price</span><div class="value">{{ price.scan }}{% if let Some((c, trend)) = scan_change %} <span class="delta-chip" data-trend="{{ trend }}">{{ c }}</span>{% endif %}</div><div class="hint">{% if price.scan == "–" %}not a scanner{% else %}its selling price · {{ price.scan_paid }} paid of {{ price.scan_target }} an hour{% endif %}</div></div>
   <div class="tile"><span class="label">Scan capacity used</span><div class="value">{{ price.utilization }}<span class="of"> %</span></div><svg class="meter" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true"><rect class="track" width="100" height="4" rx="2"/><rect class="fill" width="{{ price.utilization }}" height="4" rx="2"/></svg><div class="hint">{{ price.capacity_per_hour }} scans an hour possible</div></div>
 </div>

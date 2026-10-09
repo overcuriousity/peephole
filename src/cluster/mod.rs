@@ -802,6 +802,17 @@ impl Node {
         self.members.read().unwrap().clone()
     }
 
+    /// Whether sync serves `peer` as an older member (each origin up to
+    /// its first entry only protocol 7 knows): anyone not known here as a
+    /// member of protocol 7. A joining node is served so until it is
+    /// listed, then catches up.
+    pub fn old_peer(&self, peer: &NodeId) -> bool {
+        !self
+            .members()
+            .get(peer)
+            .is_some_and(|m| m.proto_max >= rpc::proto::ECONOMY_PROTO)
+    }
+
     /// Active members we can dial: `(id, name, address)`. None while this
     /// node is detached from its cluster.
     pub fn dial_targets(&self) -> Vec<(NodeId, String, String)> {

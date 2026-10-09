@@ -401,9 +401,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             node.peer_since_hlc(&peer),
             BATCH_ENTRIES,
             BATCH_BYTES,
-            node.members()
-                .get(&peer)
-                .is_some_and(|m| m.proto_max < super::rpc::proto::ECONOMY_PROTO),
+            node.old_peer(&peer),
         )
         .await?;
         if batch.entries.is_empty() {

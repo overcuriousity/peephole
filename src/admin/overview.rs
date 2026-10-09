@@ -377,8 +377,9 @@ async fn cluster_figures(
     }
     let served_today: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM credit_entries
-         WHERE kind = 'receipt' AND charged_mc > 0 AND economy = 2 AND hlc >= ?",
+         WHERE kind = 'receipt' AND charged_mc > 0 AND economy = ? AND hlc >= ?",
     )
+    .bind(i64::from(crate::cluster::record::ECONOMY))
     .bind(crate::cluster::hlc::to_db(
         (book.now_ms / crate::credits::DAY_MS * crate::credits::DAY_MS) << 16,
     ))

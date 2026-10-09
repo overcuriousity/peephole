@@ -284,8 +284,14 @@ pub async fn entries_after(
             start = start.max(super::history::cut(&mut conn, origin, start, since_hlc).await?);
         }
         if start > after + 1 {
+            let bound = signed_entry(&mut conn, origin, start - 1).await?;
+            // An older member could not verify a bound only protocol 7
+            // knows: this origin waits until it upgrades.
+            if old_peer && bound.as_ref().is_some_and(|b| b.needs_economy_proto()) {
+                continue;
+            }
             declared.push((*origin, start));
-            if let Some(b) = signed_entry(&mut conn, origin, start - 1).await? {
+            if let Some(b) = bound {
                 bounds.push(b);
             }
         }
@@ -2320,8 +2326,6 @@ mod tests {
         assert!(!node.keeps_more_elsewhere(&m.id, &other, 0));
     }
 
-    /// A peer asking from the very end of the range gets nothing, not a
-    /// panic or a wrapped query.
     /// An older member is served each origin up to its first entry only
     /// protocol 7 knows, never past it (no gap); a protocol-7 member gets all.
     #[tokio::test]
@@ -2434,6 +2438,8 @@ mod tests {
         );
     }
 
+    /// A peer asking from the very end of the range gets nothing, not a
+    /// panic or a wrapped query.
     #[tokio::test]
     async fn entries_after_the_last_sequence_are_none() {
         let (_d, node) = test_node(0).await;
