@@ -156,7 +156,8 @@ service's documentation; an empty object means the service knew nothing.
   "xml": "<?xml …>  the full nmap output"}]
 ```
 
-`level` 1 to 4 (more ports, service versions, OS detection, safe scripts);
+`level` 1 to 4 for queued scans (more ports, service versions, OS detection, safe scripts);
+a bought scan may be level 5 (vulnerability scripts);
 `node` queued it, `scanner` ran it. From level 2 the XML carries the
 source's SSH host keys, SSH algorithm lists, TLS certificates and HTTP
 headers (`ssh-hostkey`, `ssh2-enum-algos`, `ssl-cert`, `http-headers`).

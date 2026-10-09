@@ -289,7 +289,7 @@ Configuration lives in `/etc/peephole/config.toml`; restart after editing
 (`systemctl restart peephole`). The number of scan workers and the roles
 are runtime settings, changed from **Admin → Scans** and **Admin → System**
 or `peephole settings` without a restart. The rest of the scan pace is
-fixed: a scan times out after 30 minutes (level 4 after 2 hours), and an
+fixed: a scan times out after 30 minutes (levels 4 and 5 after 2 hours), and an
 address is scanned again at the same level after 24 hours at the earliest.
 
 **Probes.** `[probe] enabled` (default `true`) lets this node's scanner run
@@ -300,10 +300,12 @@ when there is none — takes at most two minutes, and obeys the same
 protected-address rules as scans.
 
 **Bought scans.** The Actions card also sells a counter-scan of level
-1–4: level 1 costs the cluster's cheapest scanner offer, each level above
-four times the previous. The job goes through the normal queue, paid like
-any other; a finished scan of the same level less than 24 hours old is
-shown instead of selling a new one.
+1–5: level 1 costs the cluster's cheapest scanner offer, each level above
+four times the previous. Level 5 runs the `vuln` scripts (minus the ones
+that ask third parties) on the top 1000 ports and is sold only here — the
+automatic queue never reaches it. The job goes through the normal queue,
+paid like any other; a finished scan of the same level less than 24 hours
+old is shown instead of selling a new one.
 
 **Signature rules** are built into the binary from [`rules/`](../rules/) at
 build time: there is nothing to install or edit on the node, and changing a

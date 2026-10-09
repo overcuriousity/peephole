@@ -5,6 +5,14 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Added
+
+- Scan level 5, sold on the Actions card at 256 times the level-1 price:
+  nmap's `vuln` scripts (minus `external`) on the top 1000 ports. Only an
+  admin's bought scan reaches it; the automatic queue stays within levels
+  1–4. Level 5 shares level 4's worker budget and two-hour timeout, and is
+  granted only to cluster members of protocol 8 and up.
+
 ## [0.10.0] - 2026-10-09
 
 ### Breaking

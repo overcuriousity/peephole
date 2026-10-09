@@ -139,10 +139,10 @@ refresh_after_days = 30
 [scan]
 max_workers = 2            # concurrent nmap subprocesses (2–16); the only pacing knob
 #                            (also on the admin Scans page). Fixed: a scan times out after
-#                            30 min (level 4: 2 h), an address is rescanned at the same
+#                            30 min (levels 4–5: 2 h), an address is rescanned at the same
 #                            level after 24 h at the earliest (one level upgrade allowed).
-level4_max_share = 0.5     # at most this share of max_workers runs level 4 at once (at least one)
-min_rate = 300             # level 4 sends at least this many probes per second (--min-rate);
+level4_max_share = 0.5     # at most this share of max_workers runs levels 4 and 5 at once (at least one)
+min_rate = 300             # levels 4 and 5 send at least this many probes per second (--min-rate);
 #                            lower it on a node behind a home router
 level4_udp = false         # level 4 also scans the top 50 UDP ports
 never_scan = [] # extra CIDRs this node's scanner never scans (own infra, monitoring); other cluster scanners are not bound by it

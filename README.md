@@ -32,7 +32,7 @@ nmap.
   optionally AbuseIPDB, Shodan and Shodan InternetDB, plus RDAP registration data (network,
   holder, abuse contact), each within
   its own rate budget, refreshed when an IP returns.
-- **Counter-scans** — rate-limited nmap scans in four levels that escalate by
+- **Counter-scans** — rate-limited nmap scans in four automatic levels that escalate by
   scope (more ports, `-sV`, `-O`, then safe discovery scripts), never by
   speed or aggressiveness; that rule governs the automatic counter-scans.
   On request an admin can also run an *observational probe* of the ports a
@@ -40,7 +40,8 @@ nmap.
   scanner or several at once. From level 2 they read the source's SSH host
   keys, TLS certificates and HTTP ETags, so sources that share one show up as linked.
   The admin can also buy a full counter-scan of level 1–4 from the
-  cluster's cheapest scanner, four times the price per level.
+  cluster's cheapest scanner, four times the price per level — or a level-5
+  scan, which runs nmap's vulnerability scripts (never queued automatically).
   Bystanders are spared: one request earns at most a light scan, and
   verified crawlers, Tor exits, your own and `never_scan` networks are
   never scanned; per-network, per-ASN and queue budgets stop floods.
