@@ -56,8 +56,7 @@ pub struct Prober {
     gate: Gate,
     slots: Arc<tokio::sync::Semaphore>,
     max: u32,
-    /// Addresses being probed now: the gate's cooldown only sees finished
-    /// probes.
+    /// Addresses being probed now: one probe per address at a time.
     running: Mutex<HashSet<IpAddr>>,
     /// Tests only: where the probe connects instead of the probed address.
     connect_to: Option<IpAddr>,

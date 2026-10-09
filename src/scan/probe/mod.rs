@@ -36,8 +36,6 @@ pub const MAX_RESPONSE: usize = 256 * 1024;
 pub const MAX_FAVICON: usize = 100 * 1024;
 /// HTTP redirect hops fetched, the first request included.
 pub const MAX_REDIRECTS: usize = 5;
-/// How long one node leaves an address alone after probing it.
-pub const PROBE_COOLDOWN_HOURS: i64 = 24;
 
 /// Largest banner kept.
 const MAX_BANNER: usize = 1024;

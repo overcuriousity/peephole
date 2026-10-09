@@ -5,7 +5,6 @@ use super::Store;
 use super::data::{Ctx, Effect, ensure_ip, erased_by};
 use super::hostkeys::insert_probe_keys;
 use super::requests::IpRow;
-use crate::cluster::identity::NodeId;
 use crate::cluster::record::{IpNameRec, ProbeResultRec};
 use crate::scan::hostkeys::{
     FAVICON, HASSH, HTTP_404, HTTP_BODY, HostKey, JARM, SSH_HOSTKEY, TLS_CERT,
@@ -135,8 +134,8 @@ pub(crate) async fn apply_probe_result(
     let Some(ip_id) = ensure_ip(conn, &r.ip, None).await? else {
         return Ok(Effect::Ignored);
     };
-    // Standalone nodes have no origin: the asker stands in, so
-    // `probed_recently` works there too.
+    // Standalone nodes have no origin: the asker stands in as the
+    // probe's origin.
     let origin = ctx.origin_bytes().unwrap_or_else(|| r.asker.0.to_vec());
     let res = sqlx::query(
         "INSERT OR IGNORE INTO probes (uid, group_uid, ip_id, origin, hlc, asker, vantage_ip,
@@ -316,20 +315,6 @@ impl Store {
         }
         Ok(out)
     }
-
-    /// Whether `origin` probed `ip` within the last `hours`.
-    pub async fn probed_recently(&self, ip: &str, origin: &NodeId, hours: i64) -> Result<bool> {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM probes p JOIN ips i ON i.id = p.ip_id
-             WHERE i.ip = ? AND p.origin = ? AND p.finished_at > datetime('now', ?)",
-        )
-        .bind(ip)
-        .bind(&origin.0[..])
-        .bind(format!("-{hours} hours"))
-        .fetch_one(&self.read)
-        .await?;
-        Ok(n > 0)
-    }
 }
 
 #[cfg(test)]
@@ -391,18 +376,6 @@ mod tests {
         for k in ["tls-cert", "favicon", "jarm", "http-body"] {
             assert!(kinds.contains(&k), "{kinds:?}");
         }
-        assert!(
-            store
-                .probed_recently("203.0.113.9", &NodeId([7; 32]), 24)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !store
-                .probed_recently("203.0.113.9", &NodeId([8; 32]), 24)
-                .await
-                .unwrap()
-        );
     }
 
     #[tokio::test]

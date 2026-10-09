@@ -537,7 +537,7 @@ pub fn port_view(port: i64, protocol: &str, outcome: &str, detail: &Value) -> Po
 /// Reasons that concern this node only: in a cluster the other scanners
 /// judge for themselves.
 fn this_node_only(why: &str) -> bool {
-    why.starts_with("this node probed") || why == "probes are off on this node"
+    why == "probes are off on this node"
 }
 
 /// "Counter-scan found N open ports (date) · evidence allows level L", or

@@ -2,9 +2,8 @@
 //! counter-scan obeys (non-global addresses, `never_scan`, the members'
 //! and the operator's lists, Tor exits, verified crawlers, the evidence
 //! held here), and three of its own: the evidence allows level 2, the
-//! latest finished counter-scan found an open port, and this node did not
-//! probe the address in the last 24 hours.
-use super::{PROBE_COOLDOWN_HOURS, Target};
+//! latest finished counter-scan found an open port.
+use super::Target;
 use crate::classify::Classifier;
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
@@ -28,8 +27,6 @@ pub struct Gate {
     origins: guard::Origins,
     classifier: &'static Classifier,
     cfg: Config,
-    /// The origin this node's probes are recorded under.
-    me: NodeId,
 }
 
 impl Gate {
@@ -44,7 +41,6 @@ impl Gate {
             origins: guard::Origins::from_config(s, me),
             classifier: Classifier::builtin(),
             cfg: cfg.clone(),
-            me: me.unwrap_or(LOCAL),
         }
     }
 
@@ -62,7 +58,7 @@ impl Gate {
     /// asker. Checks, in order: enabled; global address; never_scan;
     /// safety lists (members, own, peer-observed public); Tor exit;
     /// verified crawler; evidence allows ≥ 2; latest finished scan has ≥ 1
-    /// open port; not probed by this node in 24 h.
+    /// open port.
     pub async fn check(
         &self,
         store: &Store,
@@ -131,20 +127,6 @@ impl Gate {
             .collect();
         if ports.is_empty() {
             return Err("the latest counter-scan found no open port".into());
-        }
-        let ago: Option<i64> = sqlx::query_scalar(
-            "SELECT CAST(ROUND((julianday('now') - julianday(MAX(p.finished_at))) * 24) AS INTEGER)
-             FROM probes p JOIN ips i ON i.id = p.ip_id
-             WHERE i.ip = ? AND p.origin = ? AND p.finished_at > datetime('now', ?)",
-        )
-        .bind(&ip_text)
-        .bind(&self.me.0[..])
-        .bind(format!("-{PROBE_COOLDOWN_HOURS} hours"))
-        .fetch_one(&store.pool)
-        .await
-        .map_err(|e| internal(e.into()))?;
-        if let Some(h) = ago {
-            return Err(format!("this node probed the address {} h ago", h.max(0)));
         }
         Ok(Target { ip, ports })
     }
@@ -295,7 +277,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_gate_enforces_the_24_hour_cooldown() {
+    async fn a_gate_allows_probing_the_same_address_again() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path()).await;
         let gate = Gate::new(&config_with(dir.path(), ""), None);
@@ -303,12 +285,12 @@ pub(crate) mod tests {
         let ip = store.upsert_ip(addr).await.unwrap();
         requests(&store, ip.id, 3, 2).await;
         scanned(&store, &ip.ip, &[(22, "open", Some("ssh"))]).await;
-        assert!(gate.check(&store, None, &addr).await.is_ok());
+        // A probe of this address by this node finished a minute ago.
         sqlx::query(
             "INSERT INTO probes (uid, group_uid, ip_id, origin, hlc, asker, vantage_ip_source,
                started_at, finished_at, build)
-             VALUES ('p1', 'g1', ?, ?, 0, ?, 'local', datetime('now', '-3 hours'),
-               datetime('now', '-3 hours'), '')",
+             VALUES ('p1', 'g1', ?, ?, 0, ?, 'local', datetime('now'),
+               datetime('now'), '')",
         )
         .bind(ip.id)
         .bind(&LOCAL.0[..])
@@ -316,7 +298,6 @@ pub(crate) mod tests {
         .execute(&store.pool)
         .await
         .unwrap();
-        let err = gate.check(&store, None, &addr).await.unwrap_err();
-        assert!(err.contains("probed the address 3 h ago"), "{err}");
+        assert!(gate.check(&store, None, &addr).await.is_ok());
     }
 }
