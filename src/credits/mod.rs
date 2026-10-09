@@ -137,7 +137,7 @@ pub async fn compute(node: &Node) -> anyhow::Result<Book> {
             .collect();
     let ids: Vec<NodeId> = members.iter().map(|m| m.id).collect();
     let reports = reach::since(&node.store.pool, first * 24).await?;
-    let uptime = reach::uptime(&reports, &ids, &reach::ignored(&members, &gates.left_out));
+    let uptime = reach::uptime(&reports, &ids, &reach::reporters(&members, &gates.left_out));
     let listeners: BTreeMap<u32, BTreeSet<NodeId>> = (first..=today)
         .map(|d| (d, reach::verified(&members, &uptime, d)))
         .collect();

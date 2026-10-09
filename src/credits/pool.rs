@@ -57,14 +57,27 @@ pub mod testing {
     use crate::cluster::identity::NodeId;
 
     /// Make `listeners` up in every hour of `day` on this store: a
-    /// reporter that is no member names them in each hour (merged with
-    /// what it named before).
+    /// reporter, made an advertised member of this store so its reports
+    /// count, names them in each hour (merged with what it named before).
     pub async fn report_all_day(
         pool: &sqlx::SqlitePool,
         day: u32,
         listeners: &[NodeId],
     ) -> anyhow::Result<()> {
         let reporter = NodeId([0xEE; 32]);
+        let now = crate::cluster::hlc::wall_ms() << 16;
+        sqlx::query(
+            "INSERT INTO members (id, name, address, roles_json, proto_min, proto_max, sponsor,
+                                  info_hlc, admitted_hlc)
+             VALUES (?1, 'pool-reporter', '192.0.2.238:7443', '[]', ?2, ?3, ?1, ?4, ?4)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&reporter.0[..])
+        .bind(crate::cluster::rpc::proto::PROTO_MIN as i64)
+        .bind(crate::cluster::rpc::proto::PROTO_VERSION as i64)
+        .bind(crate::cluster::hlc::to_db(now))
+        .execute(pool)
+        .await?;
         let blob: Vec<u8> = listeners.iter().flat_map(|n| n.0).collect();
         for hour in day * 24..(day + 1) * 24 {
             sqlx::query(

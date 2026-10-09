@@ -4614,12 +4614,15 @@ fn pool_day() -> u32 {
 }
 
 /// Make `listeners` the verified listeners of [`pool_day`] on every node
-/// in `on`: each gets its share of that day's pool.
+/// in `on`: each gets its share of that day's pool. The reporter becomes
+/// a member of each (see `report_all_day`).
 async fn fund_listeners(on: &[&TestNode], listeners: &[NodeId]) {
     for n in on {
         peephole::credits::pool::testing::report_all_day(&n.store.pool, pool_day(), listeners)
             .await
             .unwrap();
+        // The reporter is a member row now: in the cache too.
+        n.node.reload_members().await.unwrap();
     }
 }
 
@@ -4656,6 +4659,8 @@ async fn the_pool_reaches_reached_listeners_only() {
     // Real reports for the current hour: rounds run, then each node
     // reports the hour as if it had ended.
     let next_hour = now_ms() + 3_600_000;
+    let hour = peephole::credits::reach::hour_of(next_hour) - 1;
+    let day = hour / 24;
     eventually("everyone synced with a and b", || async {
         [&na, &nb, &no]
             .iter()
@@ -4670,8 +4675,6 @@ async fn the_pool_reaches_reached_listeners_only() {
             .await
             .unwrap();
     }
-    let hour = peephole::credits::reach::hour_of(now_ms());
-    let day = hour / 24;
     eventually("every node counts a and b up this hour, o not", || async {
         let mut ok = true;
         for n in [&na, &nb, &no] {
@@ -4693,8 +4696,8 @@ async fn the_pool_reaches_reached_listeners_only() {
     }
 }
 
-/// A member below protocol 7 is neither paid nor charged: it is not
-/// quoted, and an offer it makes moves nothing.
+/// A member below protocol 7 is neither paid nor charged: it gets no pool
+/// share, it is not quoted, and an offer it makes moves nothing.
 #[tokio::test]
 async fn a_protocol_six_member_is_neither_paid_nor_charged() {
     use peephole::cluster::rpc::proto;
@@ -4729,17 +4732,32 @@ async fn a_protocol_six_member_is_neither_paid_nor_charged() {
             .all(|q| q.server != b.id),
         "not paid"
     );
-    // b offers a: a declines (and frees it); nothing moves.
-    let seq = pay::make_offer(&nb.node, a.id, 100).await.unwrap();
+    // b holds nothing to offer (no pool share below protocol 7), so its
+    // offer is written by hand: a declines it, and nothing moves.
+    let seq = peephole::cluster::repl::append_sealing(&nb.node, |seal| {
+        peephole::cluster::record::Record::CreditOffer {
+            to: a.id,
+            parts: vec![(pool_day(), 100)],
+            seal,
+            job: None,
+            economy: peephole::cluster::record::ECONOMY,
+        }
+    })
+    .await
+    .unwrap()
+    .seq;
     let declined =
         pay::accept_offer(&na.node, b.id, seq, 100, "lookup", pay::SERVE_MARGIN_MS).await;
     assert!(matches!(declined, Err(pay::Declined::Why(w)) if w.contains("protocol 7")));
-    let book = peephole::credits::book_fresh(&na.node).await.unwrap();
-    assert_eq!(
-        book.balance(&a.id),
-        share(&[a.id, b.id], a.id),
-        "not charged to b's benefit"
-    );
+    // b is below protocol 7: no pool share, and its offer moved nothing.
+    eventually("a counts b's offer and moves nothing", || async {
+        let book = peephole::credits::book_fresh(&na.node).await.unwrap();
+        book.ledger.offer(&b.id, seq).is_some()
+            && book.ledger.held(&b.id) == 0
+            && book.balance(&b.id) == 0
+            && book.balance(&a.id) == share(&[a.id], a.id)
+    })
+    .await;
 }
 
 /// Payments of the economy before protocol 7 are kept and move nothing.
@@ -6475,7 +6493,8 @@ async fn the_overview_shows_the_clusters_credit_figures() {
     let t = price::refresh(&na.node).await.unwrap();
     let (admin, base) = admin_on(&na).await;
     let html = text(&admin, format!("{base}/admin")).await;
-    assert!(html.contains("2 of 2 members earn here"), "{html}");
+    // a, b, and the reporter `fund_listeners` made a member here.
+    assert!(html.contains("3 of 3 members earn here"), "{html}");
     let show = peephole::credits::show;
     let pool = peephole::credits::pool::POOL_PER_DAY;
     assert!(html.contains(&show(pool)), "credits in circulation");

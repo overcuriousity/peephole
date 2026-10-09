@@ -1147,9 +1147,10 @@ mod tests {
     async fn give_credits(store: &crate::store::Store, node: NodeId) {
         let day = (crate::cluster::hlc::wall_ms() / crate::credits::DAY_MS) as u32 - 2;
         sqlx::query(
-            "UPDATE members SET address = '198.51.100.1:7443',
+            "UPDATE members SET address = '198.51.100.1:7443', proto_max = ?,
                roles_json = '[\"listener\",\"scanner\"]' WHERE id = ?",
         )
+        .bind(crate::cluster::rpc::proto::ECONOMY_PROTO as i64)
         .bind(&node.0[..])
         .execute(&store.pool)
         .await

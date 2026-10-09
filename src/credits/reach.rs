@@ -1,10 +1,10 @@
 //! Who could be reached, hour by hour. Every member writes one
 //! `reach_report` per UTC hour naming the advertised members it completed
 //! a sync round with in that hour. A member is up in an hour when more
-//! than half of that hour's reports, from others not left out here, name
-//! it; an advertised listener up for at least [`MIN_UP_HOURS`] of a UTC
-//! day is a verified listener of that day and shares its pool
-//! (`credits::pool`).
+//! than half of that hour's reports, from other active members with an
+//! advertised address not left out here, name it; an advertised listener
+//! of protocol 7 up for at least [`MIN_UP_HOURS`] of a UTC day is a
+//! verified listener of that day and shares its pool (`credits::pool`).
 use crate::cluster::Node;
 use crate::cluster::hlc;
 use crate::cluster::identity::NodeId;
@@ -116,11 +116,12 @@ pub async fn prune(pool: &SqlitePool, before_hour: u32) -> Result<u64> {
 pub type Uptime = BTreeMap<(NodeId, u32), u32>;
 
 /// Whether `member` was up in the hour of `reports`: more than half of
-/// those from reporters other than itself and not in `ignored` name it.
-pub fn up(reports: &[&Report], member: &NodeId, ignored: &HashSet<NodeId>) -> bool {
+/// those from `reporters` (the counted ones, [`reporters`]) other than
+/// itself name it.
+pub fn up(reports: &[&Report], member: &NodeId, reporters: &HashSet<NodeId>) -> bool {
     let counted: Vec<&&Report> = reports
         .iter()
-        .filter(|r| r.reporter != *member && !ignored.contains(&r.reporter))
+        .filter(|r| r.reporter != *member && reporters.contains(&r.reporter))
         .collect();
     let named = counted
         .iter()
@@ -130,8 +131,8 @@ pub fn up(reports: &[&Report], member: &NodeId, ignored: &HashSet<NodeId>) -> bo
 }
 
 /// The up hours of `members` per day, from `reports` (one per reporter
-/// and hour counts; `ignored`: reporters blocked or left out here).
-pub fn uptime(reports: &[Report], members: &[NodeId], ignored: &HashSet<NodeId>) -> Uptime {
+/// and hour counts, and only those of `reporters`, [`reporters`]).
+pub fn uptime(reports: &[Report], members: &[NodeId], reporters: &HashSet<NodeId>) -> Uptime {
     let mut by_hour: BTreeMap<u32, Vec<&Report>> = BTreeMap::new();
     let mut seen: HashSet<(NodeId, u32)> = HashSet::new();
     for r in reports {
@@ -144,7 +145,7 @@ pub fn uptime(reports: &[Report], members: &[NodeId], ignored: &HashSet<NodeId>)
         // The reporters that count, and how many of them name each member.
         let mut named: HashMap<&NodeId, usize> = HashMap::new();
         let mut counted: Vec<&Report> = vec![];
-        for r in rs.iter().filter(|r| !ignored.contains(&r.reporter)) {
+        for r in rs.iter().filter(|r| reporters.contains(&r.reporter)) {
             counted.push(r);
             for n in &r.reached {
                 *named.entry(n).or_default() += 1;
@@ -167,27 +168,30 @@ pub fn uptime(reports: &[Report], members: &[NodeId], ignored: &HashSet<NodeId>)
     out
 }
 
-/// The verified listeners of `day`: the listener role and an advertised
-/// address in their member record, up at least [`MIN_UP_HOURS`] that day.
+/// The verified listeners of `day`: the listener role, an advertised
+/// address and protocol 7 in their member record (a member below it is
+/// not paid until it upgrades, and a pool share is a payment), up at
+/// least [`MIN_UP_HOURS`] that day.
 pub fn verified(members: &[MemberRow], uptime: &Uptime, day: u32) -> BTreeSet<NodeId> {
     members
         .iter()
         .filter(|m| m.active && m.address.is_some() && m.roles.iter().any(|r| r == "listener"))
+        .filter(|m| crate::credits::pay::pays_with(m.proto_max))
         .filter(|m| uptime.get(&(m.id, day)).copied().unwrap_or(0) >= MIN_UP_HOURS)
         .map(|m| m.id)
         .collect()
 }
 
-/// The reporters whose reports do not count here: those left out here
-/// (blocked, or shown two histories), and members without an advertised
-/// address (nobody can check what such a key reports, and keys that cost
-/// nothing to run must not outvote the reachable members).
-pub fn ignored(members: &[MemberRow], left_out: &HashSet<NodeId>) -> HashSet<NodeId> {
+/// The reporters whose reports count here: active members with an
+/// advertised address in their member record, not left out here (blocked,
+/// or shown two histories). Nobody can check what a key without an
+/// address reports, and keys that cost nothing to run must not outvote the
+/// reachable members; a non-member's report counts for nothing.
+pub fn reporters(members: &[MemberRow], left_out: &HashSet<NodeId>) -> HashSet<NodeId> {
     members
         .iter()
-        .filter(|m| m.address.is_none())
+        .filter(|m| m.active && m.address.is_some() && !left_out.contains(&m.id))
         .map(|m| m.id)
-        .chain(left_out.iter().copied())
         .collect()
 }
 
@@ -339,7 +343,7 @@ mod tests {
 
     #[test]
     fn up_needs_more_than_half_of_the_other_reporters() {
-        let none = HashSet::new();
+        let none: HashSet<NodeId> = [id(1), id(2), id(3), id(4)].into();
         let rs = [report(2, 7, &[1]), report(3, 7, &[1]), report(4, 7, &[])];
         let refs: Vec<&Report> = rs.iter().collect();
         assert!(up(&refs, &id(1), &none), "2 of 3");
@@ -357,9 +361,9 @@ mod tests {
         let rs = [report(1, 7, &[1]), report(2, 7, &[1]), report(3, 7, &[])];
         let refs: Vec<&Report> = rs.iter().collect();
         // Its own report is left out: 1 of 2 others.
-        assert!(!up(&refs, &id(1), &HashSet::new()));
-        // Reporter 3 is blocked here: 1 of 1.
-        assert!(up(&refs, &id(1), &[id(3)].into()));
+        assert!(!up(&refs, &id(1), &[id(1), id(2), id(3)].into()));
+        // Reporter 3 does not count here: 1 of 1.
+        assert!(up(&refs, &id(1), &[id(1), id(2)].into()));
     }
 
     #[test]
@@ -372,44 +376,70 @@ mod tests {
             report(2, h + 1, &[1]),
             report(2, h + 24, &[1]), // the next day
         ];
-        let up = uptime(&reports, &[id(1), id(2)], &HashSet::new());
+        let up = uptime(&reports, &[id(1), id(2)], &[id(1), id(2)].into());
         assert_eq!(up.get(&(id(1), day)), Some(&2));
         assert_eq!(up.get(&(id(1), day + 1)), Some(&1));
         assert_eq!(up.get(&(id(2), day)), None, "nobody reported 2");
     }
 
     #[test]
-    fn outbound_only_and_left_out_reporters_do_not_count() {
+    fn only_advertised_active_members_not_left_out_count_as_reporters() {
+        let mut gone = member(5, true, true);
+        gone.active = false;
         let members = [
             member(1, true, true),
             member(2, true, false),
             member(3, true, true),
+            member(4, false, true),
+            gone,
         ];
-        let ignored = ignored(&members, &[id(3)].into());
-        assert_eq!(ignored, [id(2), id(3)].into());
-        // 2 (outbound-only) names 1, 3 (left out) names 1, 4 (advertised) does not.
-        let rs = [report(2, 7, &[1]), report(3, 7, &[1]), report(4, 7, &[])];
+        let counted = reporters(&members, &[id(3)].into());
+        assert_eq!(counted, [id(1), id(4)].into());
+        // 2 (outbound-only), 3 (left out) and 5 (departed) name 1; 4
+        // (advertised) does not.
+        let rs = [
+            report(2, 7, &[1]),
+            report(3, 7, &[1]),
+            report(5, 7, &[1]),
+            report(4, 7, &[]),
+        ];
         let refs: Vec<&Report> = rs.iter().collect();
         assert!(
-            !up(&refs, &id(1), &ignored),
+            !up(&refs, &id(1), &counted),
             "0 of the 1 report that counts"
         );
     }
 
     #[test]
-    fn a_verified_listener_is_an_advertised_listener_up_twelve_hours() {
+    fn a_non_members_report_does_not_count() {
+        let members = [member(1, true, true), member(4, true, true)];
+        let counted = reporters(&members, &HashSet::new());
+        // 9 is no member: its report naming 1 counts for nothing.
+        let rs = [report(9, 7, &[1]), report(4, 7, &[])];
+        let refs: Vec<&Report> = rs.iter().collect();
+        assert!(!up(&refs, &id(1), &counted));
+        let up = uptime(&rs, &[id(1)], &counted);
+        assert_eq!(up.get(&(id(1), 0)), None);
+    }
+
+    #[test]
+    fn a_verified_listener_is_an_advertised_protocol_seven_listener_up_twelve_hours() {
         let day = 20_000u32;
         let mut up = Uptime::new();
         for n in [1u8, 2, 3, 4] {
             up.insert((id(n), day), 12);
         }
         up.insert((id(5), day), 11);
+        up.insert((id(6), day), 24);
+        let mut old = member(6, true, true);
+        old.proto_max = crate::cluster::rpc::proto::ECONOMY_PROTO - 1;
         let members = [
             member(1, true, true),
             member(2, false, true), // not a listener
             member(3, true, false), // outbound-only
             member(4, true, true),
             member(5, true, true), // 11 hours
+            old,                   // below protocol 7
         ];
         assert_eq!(verified(&members, &up, day), [id(1), id(4)].into());
         assert!(verified(&members, &up, day + 1).is_empty());
