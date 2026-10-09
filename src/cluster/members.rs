@@ -265,21 +265,31 @@ pub fn valid_address(addr: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }
 
-/// Whether the origin of `e` may admit `member` at `at`: it has not left,
-/// was not pruned before writing this (no sign of life for the prune window
-/// before it), and stays within [`ADMISSIONS_PER_DAY`]. Each sponsor's
-/// admissions arrive in its own log order, with rising HLCs (an entry dated
-/// before the previous one is never applied, see `repl::in_order`), so the
-/// window holds every earlier admission and the verdict is the same on
-/// every node.
+/// Whether the origin of `e` may admit `member` at `at`, and the HLC the
+/// admission counts at: `at`, or the sponsor's own admission if `at` is
+/// earlier (see [`admitted_since`]), so a member cannot date admissions
+/// back past its own and spread them over days it was not in the cluster.
+/// The sponsor has not left, was not pruned before writing this (no sign
+/// of life for the prune window before it), and stays within
+/// [`ADMISSIONS_PER_DAY`]. Each sponsor's admissions arrive in its own log
+/// order, with rising HLCs (an entry dated before the previous one is never
+/// applied, see `repl::in_order`), so the window holds every earlier
+/// admission and the verdict is the same on every node. One case is not:
+/// the sponsor's own admission is the earliest held here, and a node that
+/// holds only a later one (the earlier not arrived yet) counts the
+/// admissions in between at that later one.
 async fn may_sponsor(
     node: &Node,
     conn: &mut SqliteConnection,
     e: &WireEntry,
     member: &NodeId,
     at: u64,
-) -> Result<bool> {
+) -> Result<Option<u64>> {
     let sponsor = e.origin;
+    let at = match admitted_since(node, conn, &sponsor).await? {
+        Some(since) => at.max(since),
+        None => at,
+    };
     if sponsor != node.id() {
         let row: Option<(i64, Option<i64>)> =
             sqlx::query_as("SELECT admitted_hlc, revoked_hlc FROM members WHERE id = ?")
@@ -287,13 +297,13 @@ async fn may_sponsor(
                 .fetch_optional(&mut *conn)
                 .await?;
         let Some((admitted, revoked)) = row else {
-            return Ok(false);
+            return Ok(None);
         };
         let admitted = super::hlc::from_db(admitted);
         if revoked.is_some_and(|l| super::hlc::from_db(l) >= admitted) {
             warn!(sponsor = %sponsor.short(), member = %member.short(),
                   "ignored member_add by a node that left");
-            return Ok(false);
+            return Ok(None);
         }
         // Its previous sign of life: the entry before this one, or its
         // admission.
@@ -322,7 +332,7 @@ async fn may_sponsor(
         if !gap && super::hlc::physical_ms(at).saturating_sub(evidence) > PRUNE_AFTER_MS {
             warn!(sponsor = %sponsor.short(), member = %member.short(),
                   "ignored member_add by a node that was pruned");
-            return Ok(false);
+            return Ok(None);
         }
     }
     let known: i64 =
@@ -332,7 +342,7 @@ async fn may_sponsor(
             .fetch_one(&mut *conn)
             .await?;
     if known > 0 {
-        return Ok(true);
+        return Ok(Some(at));
     }
     let since = at.saturating_sub(DAY_MS << 16);
     let recent: i64 = sqlx::query_scalar(
@@ -346,9 +356,41 @@ async fn may_sponsor(
     if recent >= ADMISSIONS_PER_DAY {
         warn!(sponsor = %sponsor.short(), member = %member.short(),
               "ignored member_add over the sponsor's daily admission limit");
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(true)
+    Ok(Some(at))
+}
+
+/// When `sponsor` was admitted, as far as this node holds: its earliest
+/// admission (as counted, see [`may_sponsor`]). This node's own admission
+/// of a node it vouched for does not count: that node was a member before
+/// (this node's inviter, a configured peer), and is dated by the others'
+/// admissions of it. None: no admission held (a founder, or a node only
+/// this one vouched for).
+async fn admitted_since(
+    node: &Node,
+    conn: &mut SqliteConnection,
+    sponsor: &NodeId,
+) -> Result<Option<u64>> {
+    let since: Option<i64> = sqlx::query_scalar(
+        "SELECT MIN(hlc) FROM sponsorships WHERE member = ?1
+           AND NOT (sponsor = ?2 AND EXISTS (SELECT 1 FROM vouched WHERE id = ?1))",
+    )
+    .bind(&sponsor.0[..])
+    .bind(&node.id().0[..])
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(since.map(super::hlc::from_db))
+}
+
+/// Mark `id` as a node this one admits as a member already (its inviter,
+/// a configured peer), before admitting it: see [`may_sponsor`].
+pub async fn vouch(conn: &mut SqliteConnection, id: &NodeId) -> Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO vouched (id) VALUES (?)")
+        .bind(&id.0[..])
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 /// Whether this node may admit `member` now (checked before an invite is
@@ -371,7 +413,9 @@ pub async fn can_admit(node: &Node, member: &NodeId) -> Result<bool> {
         sig: None,
         erased_by: None,
     };
-    may_sponsor(node, &mut conn, &probe, member, probe.hlc).await
+    Ok(may_sponsor(node, &mut conn, &probe, member, probe.hlc)
+        .await?
+        .is_some())
 }
 
 /// The nodes `root` admitted, the nodes those admitted, and so on (not
@@ -422,9 +466,10 @@ pub async fn apply(
                 return Ok(true);
             }
             let info = &sanitize(info);
-            if !may_sponsor(node, conn, e, &info.id, at).await? {
+            // Counted at the sponsor's own admission if dated before it.
+            let Some(at) = may_sponsor(node, conn, e, &info.id, at).await? else {
                 return Ok(true);
-            }
+            };
             sqlx::query(
                 "INSERT OR IGNORE INTO sponsorships (sponsor, member, hlc) VALUES (?, ?, ?)",
             )

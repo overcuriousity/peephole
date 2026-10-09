@@ -338,6 +338,84 @@ async fn invited_member_propagates_cluster_wide() {
     .await;
 }
 
+/// A new member signs admissions dated back over weeks, one a day, past
+/// its own admission: every node counts them at that admission, so no
+/// more than the daily limit stand anywhere.
+#[tokio::test]
+async fn a_new_member_cannot_backdate_admissions_past_the_daily_limit() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let m = Identity::generate().unwrap();
+    let info = |id: NodeId| peephole::cluster::record::MemberInfo {
+        id,
+        name: "m".into(),
+        address: None,
+        roles: vec![],
+        proto_min: 2,
+        proto_max: 2,
+        remote_config: false,
+    };
+    repl::append(&na, &[Record::MemberAdd(info(m.id))])
+        .await
+        .unwrap();
+    let day = 24 * 3_600_000u64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let adds: Vec<WireEntry> = (0..25u64)
+        .map(|i| {
+            let s = Identity::generate().unwrap();
+            let at = (now - (25 - i) * day) << 16;
+            WireEntry::sign(&m, i + 1, at, &Record::MemberAdd(info(s.id))).unwrap()
+        })
+        .collect();
+    let st = repl::apply_batch(&na, adds).await.unwrap();
+    assert_eq!(st.applied, 25, "{st:?}");
+    let m_hex = data_encoding::HEXUPPER.encode(&m.id.0);
+    let logged = format!("SELECT COUNT(*) FROM repl_log WHERE hex(origin) = '{m_hex}'");
+    eventually("b holds m's log", || async {
+        count(&nb, &logged).await == 25
+    })
+    .await;
+    let sponsored = format!("SELECT COUNT(*) FROM sponsorships WHERE hex(sponsor) = '{m_hex}'");
+    assert_eq!(count(&na, &sponsored).await, members::ADMISSIONS_PER_DAY);
+    assert_eq!(count(&nb, &sponsored).await, members::ADMISSIONS_PER_DAY);
+}
+
+/// A node that ran alone before joining brings what it recorded then.
+#[tokio::test]
+async fn history_from_before_the_join_reaches_the_cluster() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ic, c) = new_node("c");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let nc = boot(ic, &c, &[], DEFAULT).await;
+    let ip = nc
+        .store
+        .upsert_ip("192.0.2.77".parse().unwrap())
+        .await
+        .unwrap();
+    rec(&nc)
+        .insert_request(&new_request(ip.id, "/before-join"))
+        .await
+        .unwrap();
+    let token = invite::create(&nb, &Default::default()).await.unwrap();
+    invite::join(&nc, &token).await.unwrap();
+    eventually("a holds c's request from before the join", || async {
+        count(
+            &na,
+            "SELECT COUNT(*) FROM requests WHERE path = '/before-join'",
+        )
+        .await
+            == 1
+    })
+    .await;
+}
+
 /// C has no advertise address: nobody can dial it, yet its records reach
 /// A (via B or by C pushing), and A's reach C.
 #[tokio::test]

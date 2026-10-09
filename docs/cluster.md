@@ -83,7 +83,14 @@ of it.
   revoked: by default after a week or 10 uses (`--ttl 0` / `--uses 0`
   lift a limit). Whoever holds a usable invite can join and cannot be
   removed afterwards. A member admits at most 20 new nodes a day; a node
-  that left admits nobody.
+  that left admits nobody. From protocol 8, an admission dated before its
+  sponsor's own admission (the earliest a node holds) counts as made at
+  it, for that limit and the date it is kept with, so a new member cannot
+  spread admissions over days before it joined. A node's own admission of
+  its inviter or of a configured peer does not date them: they were
+  members before. A node that holds only a later admission of a sponsor
+  (its earlier one not arrived yet) counts the admissions in between at
+  that later one, and may then judge the limit differently from the rest.
 - **Blocking is local.** A node that blocks a peer stops talking to it and
   shows none of its records. It still stores and relays them, so other
   nodes are unaffected. `--subtree` (or "Block with all it admitted" on
