@@ -145,6 +145,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   could take any amount of memory. An address's scans now carry at most
   16 MiB of XML, newest first, and a page at most 64 MiB; a scan left out
   says `"xml_omitted": true` (a new field, see the dataset docs).
+- The Decoys page fetched a row per LLM decoy request of the range (the
+  whole history for "all time") on every view, only to count them. The
+  database counts them now.
 
 ## [0.10.0] - 2026-10-09
 
