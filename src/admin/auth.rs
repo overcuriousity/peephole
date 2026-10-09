@@ -109,7 +109,7 @@ fn webauthn_for(cfg: &crate::config::Config) -> Result<Webauthn> {
     builder.build().context("webauthn build")
 }
 
-/// Password checks allowed at once.
+/// Password checks (and hashes, on a change) allowed at once.
 pub const MAX_VERIFIES: usize = 3;
 
 /// A hash nobody knows the password of, verified when none is set so a
@@ -794,6 +794,23 @@ secure_cookies = {secure}
         let (st, _, _) = send(&app, "POST", "/login/password", Some(&old), &form).await;
         assert_eq!(st, StatusCode::SEE_OTHER);
         assert!(!state.store.validate_session(&old).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_password_change_takes_a_verification_slot() {
+        let (_d, state, app) = app().await;
+        let me = state.store.create_session().await.unwrap();
+        let form = "new=a+long+password+1&again=a+long+password+1";
+        let held = state
+            .verify_slots
+            .try_acquire_many(MAX_VERIFIES as u32)
+            .unwrap();
+        let (_, _, page) = send(&app, "POST", "/admin/system/password", Some(&me), form).await;
+        assert!(page.contains("Too many password checks"), "{page}");
+        assert!(state.store.password_hash().await.unwrap().is_none());
+        drop(held);
+        let (_, _, page) = send(&app, "POST", "/admin/system/password", Some(&me), form).await;
+        assert!(page.contains("Password saved."), "{page}");
     }
 
     #[tokio::test]

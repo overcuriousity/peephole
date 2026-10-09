@@ -392,6 +392,11 @@ async fn password(
     Form(f): Form<PasswordForm>,
 ) -> AppResult<Html<String>> {
     let fail = |m: &str| keys_page(&st, None, Some(m.to_string()));
+    // Argon2 runs below (check, then hash) share the sign-in cap: refuse
+    // rather than queue.
+    let Ok(_slot) = st.verify_slots.try_acquire() else {
+        return fail("Too many password checks at once; try again in a minute.").await;
+    };
     if let Some(phc) = st.store.password_hash().await? {
         let current = f.current.unwrap_or_default();
         let ok = tokio::task::spawn_blocking(move || password::verify(&current, &phc))

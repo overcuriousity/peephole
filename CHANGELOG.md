@@ -24,6 +24,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   a switch to security keys only could still get a session. The session
   now starts only if the password checked is still the stored one and
   password sign-in is still on.
+- Admin: changing the password was neither rate-limited nor counted
+  against the cap on concurrent password checks, so a stolen session
+  could guess the current password in parallel and start any number of
+  Argon2 jobs. It now has the sign-in endpoints' per-client limit and
+  takes one of their check slots.
 
 ## [0.10.0] - 2026-10-09
 
