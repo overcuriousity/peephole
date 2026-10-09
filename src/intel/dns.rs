@@ -1,8 +1,8 @@
 //! Host names: what the admin may type into the Lookup box, and how a name
-//! is resolved by a quorum of nodes (`quorum`), the cheapest first. Each resolver's answer is kept in
-//! an `ip_name` record; every node derives the per-address votes from those
-//! answers itself (see `store::probes::apply_ip_name`), so a tally is never
-//! taken on trust.
+//! is resolved by a quorum of nodes (`quorum`), the cheapest first. Each
+//! resolver's answer is kept in an `ip_name` record; every node derives the
+//! per-address votes from those answers itself (see
+//! `store::probes::apply_ip_name`), so a tally is never taken on trust.
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{IpNameRec, Record};
@@ -775,6 +775,15 @@ mod tests {
 
     fn ids(v: Vec<Resolver>) -> Vec<u8> {
         v.iter().map(|r| r.id.0[0]).collect()
+    }
+
+    #[tokio::test]
+    async fn a_node_alone_chooses_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = bare_node(dir.path()).await;
+        let geo: SharedGeo = Default::default();
+        let chosen = choose(&node, &HashSet::new(), &geo, crate::credits::price::RESOLVE);
+        assert_eq!(chosen.iter().map(|r| r.id).collect::<Vec<_>>(), [node.id()]);
     }
 
     #[test]
