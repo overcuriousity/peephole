@@ -126,6 +126,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   (`::ffff:203.0.113.7`), in the IP search, the request filter, Links, the
   bulk lookup or an IP's page, found nothing; it now finds the IPv4
   address it maps.
+- Requests of one source arriving at once could each queue a scan job; the
+  duplicates took queue places and /24 and ASN budget until superseded.
+  Automatic enqueues now check and write one at a time.
 
 ## [0.10.0] - 2026-10-09
 

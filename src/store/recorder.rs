@@ -428,6 +428,10 @@ impl Recorder {
             }
             return Ok(EnqueueOutcome::Suppressed);
         }
+        // One at a time: requests arriving together would each pass the
+        // checks below before any wrote its job, and queue duplicates that
+        // count against the queue and the budgets.
+        let _one = self.store().enqueue.lock().await;
         let cooldown_hours = policy.cooldown_hours;
         let pool = &self.store().pool;
         let ip_text = self.ip_of(ip_id).await?;
@@ -1387,6 +1391,36 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(both, (2, 2));
+    }
+
+    /// Requests of one IP arriving at once queue one job, not one each.
+    #[tokio::test]
+    async fn concurrent_enqueues_queue_one_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let rec = store.local();
+        let ip = store
+            .upsert_ip("203.0.113.61".parse().unwrap())
+            .await
+            .unwrap();
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let rec = rec.clone();
+                tokio::spawn(async move { rec.enqueue_scan(ip.id, 2, 24).await.unwrap() })
+            })
+            .collect();
+        let mut queued = 0;
+        for t in tasks {
+            if matches!(t.await.unwrap(), EnqueueOutcome::Queued(_)) {
+                queued += 1;
+            }
+        }
+        assert_eq!(queued, 1);
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(jobs, 1);
     }
 
     fn req(ip_id: i64) -> NewRequest {

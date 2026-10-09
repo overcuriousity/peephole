@@ -83,6 +83,10 @@ pub struct Store {
     pub read: sqlx::SqlitePool,
     /// Whether the trigram index over request paths and queries exists.
     search_index: Arc<AtomicBool>,
+    /// Held from an automatic enqueue's checks to its write
+    /// (`Recorder::enqueue_scan_with`). The write may be a replicated
+    /// append, so one transaction cannot cover both.
+    pub(crate) enqueue: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Store {
@@ -129,6 +133,7 @@ impl Store {
             pool,
             read,
             search_index: Arc::new(AtomicBool::new(search)),
+            enqueue: Default::default(),
         })
     }
 
