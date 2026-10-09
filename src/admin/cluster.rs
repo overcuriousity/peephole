@@ -62,7 +62,6 @@ pub struct MemberView {
     pub live: bool,
     pub scanner: bool,
     pub pace: Option<PaceInfo>,
-    pub timeout_min: String,
     /// Scan levels it is weighted down at, against the other scanners
     /// (see `scan::weight`); "" when none.
     pub level_weights: String,
@@ -175,7 +174,6 @@ struct ClusterPage {
 /// This node's runtime settings as its own page shows them.
 pub struct SettingsView {
     pub version: u64,
-    pub cooldown_hours: i64,
     pub listener: bool,
     pub scanner: bool,
     pub web: bool,
@@ -191,7 +189,6 @@ impl SettingsView {
         let p = st.settings.prereqs();
         Self {
             version: s.version,
-            cooldown_hours: s.cooldown_hours,
             listener: s.roles.listener,
             scanner: s.roles.scanner,
             web: s.roles.web,
@@ -351,9 +348,6 @@ pub(crate) async fn views(
             last_seen,
             live,
             scanner: m.roles.iter().any(|r| r == "scanner"),
-            timeout_min: pace
-                .map(|p| format!("{}", p.timeout_secs / 60))
-                .unwrap_or_default(),
             level_weights: level_weights(m.id),
             pace,
             active_scans: if is_self {
@@ -413,7 +407,6 @@ pub(crate) async fn views(
         live: true,
         scanner: node.roles().scanner,
         pace: None,
-        timeout_min: String::new(),
         level_weights: String::new(),
         active_scans: 0,
         lag: "—".into(),
@@ -893,9 +886,6 @@ struct SettingsForm {
     counter: Option<u64>,
     base_version: Option<u64>,
     max_workers: Option<String>,
-    max_scans_per_hour: Option<String>,
-    timeout_minutes: Option<String>,
-    cooldown_hours: Option<String>,
     listener: Option<String>,
     scanner: Option<String>,
     web: Option<String>,
@@ -912,16 +902,8 @@ impl SettingsForm {
                     .map_err(|_| format!("{what} must be a number")),
             }
         }
-        let timeout_secs = match num::<f64>(&self.timeout_minutes, "timeout")? {
-            Some(m) if !m.is_finite() || m <= 0.0 => return Err("timeout must be positive".into()),
-            Some(m) => Some((m * 60.0).round() as u64),
-            None => None,
-        };
         Ok(crate::settings::Changes {
             max_workers: num(&self.max_workers, "workers")?,
-            max_scans_per_hour: num(&self.max_scans_per_hour, "scans per hour")?,
-            timeout_secs,
-            cooldown_hours: num(&self.cooldown_hours, "cooldown")?,
             listener: Some(self.listener.is_some()),
             scanner: Some(self.scanner.is_some()),
             web: Some(self.web.is_some()),
@@ -971,8 +953,6 @@ enum Remote {
     /// Asked, and it answered.
     Settings {
         status: Box<crate::cluster::owner::cmd::Status>,
-        timeout_min: String,
-        rec: Option<(u32, i64, String)>,
         has: (bool, bool, bool),
         /// `(key, name)` of the peers it blocks.
         blocked: Vec<(String, String)>,
@@ -1106,13 +1086,6 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
         };
         match asked.await {
             Ok(st) => {
-                let minutes = |secs: u64| {
-                    if secs.is_multiple_of(60) {
-                        (secs / 60).to_string()
-                    } else {
-                        format!("{:.1}", secs as f64 / 60.0)
-                    }
-                };
                 let has = |r: &str| st.state.roles.iter().any(|x| x == r);
                 let name_of = |k: &str| {
                     all.iter()
@@ -1126,11 +1099,6 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
                     .map(|b| (b.to_string(), name_of(&b.to_string())))
                     .collect();
                 Remote::Settings {
-                    timeout_min: minutes(st.state.pace.timeout_secs),
-                    rec: st
-                        .state
-                        .recommended
-                        .map(|p| (p.max_workers, p.max_scans_per_hour, minutes(p.timeout_secs))),
                     has: (has("listener"), has("scanner"), has("web")),
                     peers: all
                         .iter()
@@ -1352,8 +1320,6 @@ async fn node_owner(
 struct PaceForm {
     key: String,
     max_workers: String,
-    max_scans_per_hour: String,
-    timeout_minutes: String,
 }
 
 /// Where the scanner pace table lives.
@@ -1381,33 +1347,18 @@ async fn set_pace(
             )),
         ));
     }
-    let parsed = (
-        f.max_workers.trim().parse::<u32>(),
-        f.max_scans_per_hour.trim().parse::<i64>(),
-        f.timeout_minutes.trim().parse::<f64>(),
-    );
-    let (Ok(w), Ok(h), Ok(t)) = parsed else {
+    let Ok(w) = f.max_workers.trim().parse::<u32>() else {
         return Ok(back_to(
             SCANNERS,
             None,
-            Some("pace values must be numbers".into()),
+            Some("workers must be a number".into()),
         ));
     };
-    if !t.is_finite() || t <= 0.0 {
-        return Ok(back_to(
-            SCANNERS,
-            None,
-            Some("timeout must be positive".into()),
-        ));
-    }
-    let timeout_secs = (t * 60.0).round() as u64;
     let outcome = st
         .settings
         .apply(
             &crate::settings::Changes {
                 max_workers: Some(w),
-                max_scans_per_hour: Some(h),
-                timeout_secs: Some(timeout_secs),
                 ..Default::default()
             },
             None,
@@ -1415,11 +1366,8 @@ async fn set_pace(
         .await?
         .map(|_| ());
     if outcome.is_ok() {
-        node.status.local.lock().unwrap().pace = Some(PaceInfo {
-            max_workers: w,
-            max_scans_per_hour: h,
-            timeout_secs,
-        });
+        node.status.local.lock().unwrap().pace =
+            Some(crate::cluster::remote::pace_info(st.pace.get()));
         node.publish_status();
     }
     Ok(match outcome {

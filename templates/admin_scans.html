@@ -6,12 +6,12 @@
 <div class="page-head"><div><h1>Scans</h1><p class="muted">Pace, the live queue, and every finished job.</p></div></div>
 {% if let Some(n) = pace.notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
 {% if let Some(e) = pace.error %}<div class="banner banner-warning">Pace not saved: {{ e }}</div>{% endif %}
-{% if pace.timeouts_high %}<div class="banner banner-warning">{{ pace.timeout_share }} of scans in 24 h hit the {{ pace.timeout_min }} min timeout; recommended: {{ pace.rec_timeout_min }} min.</div>{% endif %}
+{% if pace.timeouts_high %}<div class="banner banner-warning">{{ pace.timeout_share }} of scans in 24 h hit the timeout ({{ pace.timeout_min }} min, level 4: {{ pace.level4_timeout_min }} min).</div>{% endif %}
 {% if pace.growing %}<div class="banner banner-warning">The queue grew by about {{ pace.net }} jobs per hour over the last {{ pace.drain_window_h }} h.</div>{% endif %}
 {% if pace.not_scanning %}<div class="banner banner-warning">This node does not scan; its own pace does nothing. {% if scanners.is_empty() %}No member has the scanner role: turn it on under <a href="/admin/system/settings">System › Settings</a> or on a member's page.{% else %}Scanners are paced in <a href="#scanners">Scanners</a> below.{% endif %}</div>{% endif %}
 <div class="stack">
 <section class="card pace" id="pace">
-  <div class="card-head"><h2>Pace</h2><span class="muted">{% if pace.paused %}scanning paused{% else %}{{ pace.cadence }}{% endif %}</span></div>
+  <div class="card-head"><h2>Pace</h2><span class="muted">{% if pace.paused %}scanning paused{% else %}{{ pace.current.max_workers }} workers{% endif %}</span></div>
   <div class="tiles">
     <div class="tile"><span class="label">Backlog</span><div class="value">{{ pace.m.backlog }}</div><div class="hint">oldest waiting {{ pace.oldest }}</div></div>
     <div class="tile"><span class="label">Arrivals / h</span><div class="value">{{ pace.arrival }}</div><div class="hint">{{ pace.m.arrivals_1h }} last hour · {{ pace.m.arrivals_24h }} last 24 h</div></div>
@@ -24,28 +24,16 @@
     <div><span class="label">Queued per hour · last 24 h</span><div class="sparkline" data-sparkline="{{ pace.arrivals_json }}"></div></div>
     <div><span class="label">Finished per hour · last 24 h</span><div class="sparkline" data-sparkline="{{ pace.completions_json }}"></div></div>
   </div>
-  <div class="grid-2">
-    <form class="filters pace-form" method="post" action="/admin/queue/pace">
-      <label>Workers <input type="number" name="max_workers" min="0" max="{{ pace.max_workers }}" value="{{ pace.current.max_workers }}" required></label>
-      <label>Scans per hour <input type="number" name="max_scans_per_hour" min="0" max="{{ pace.max_per_hour }}" value="{{ pace.current.max_scans_per_hour }}" required></label>
-      <label>Timeout (min) <input type="number" name="timeout_minutes" min="{{ pace.min_timeout_min }}" max="{{ pace.max_timeout_min }}" step="any" value="{{ pace.timeout_min }}" required></label>
-      <button class="btn btn-primary" type="submit">Save pace</button>
-      <p class="muted pace-note">0 pauses scanning; otherwise at least 2. At most {{ pace.level4_cap }} at once on level 4. Level 4 timeout: {{ pace.level4_timeout_min }} min.</p>
-    </form>
-    <form class="pace-rec" method="post" action="/admin/queue/pace">
-      <input type="hidden" name="max_workers" value="{{ pace.rec.max_workers }}">
-      <input type="hidden" name="max_scans_per_hour" value="{{ pace.rec.max_scans_per_hour }}">
-      <input type="hidden" name="timeout_minutes" value="{{ pace.rec_timeout_min }}">
-      <p><strong>Recommended{% if pace.cluster_note.is_some() %} for this node{% endif %}:</strong> {{ pace.rec.max_workers }} workers, {{ pace.rec.max_scans_per_hour }} scans per hour ({{ pace.rec_cadence }}), {{ pace.rec_timeout_min }} min timeout.</p>
-      <p class="muted">Arrivals + 25 %, backlog cleared within a day{% if pace.cluster_note.is_some() %}, split over the live scanners{% endif %}.</p>
-      {% if pace.rec_differs %}<button class="btn" type="submit">Apply recommendation</button>{% else %}<p class="muted">The current pace matches.</p>{% endif %}
-    </form>
-  </div>
+  <form class="filters pace-form" method="post" action="/admin/queue/pace">
+    <label>Workers <input type="number" name="max_workers" min="0" max="{{ pace.max_workers }}" value="{{ pace.current.max_workers }}" required></label>
+    <button class="btn btn-primary" type="submit">Save</button>
+    <p class="muted pace-note">0 pauses scanning; otherwise at least 2. At most {{ pace.level4_cap }} at once on level 4. A scan times out after {{ pace.timeout_min }} min (level 4: {{ pace.level4_timeout_min }} min); an address is scanned again at the same level after 24 h at the earliest.</p>
+  </form>
   {% if !scanners.is_empty() %}
   <div id="scanners">
   <h3>Scanners</h3>
   <div class="table-wrap"><table>
-    <thead><tr><th>Scanner</th><th>Workers</th><th>Scans / hour</th><th>Timeout (min)</th><th></th><th class="num" title="From its measured scan times and its pace">Can do / h</th><th class="num" title="Jobs and audits it ended in the last 24 hours">Did / h</th><th>Limited by</th><th>Level weights</th></tr></thead>
+    <thead><tr><th>Scanner</th><th>Workers</th><th></th><th class="num" title="From its measured scan times and its pace">Can do / h</th><th class="num" title="Jobs and audits it ended in the last 24 hours">Did / h</th><th>Limited by</th><th>Level weights</th></tr></thead>
     <tbody>{% for m in scanners %}{% include "_cluster_pace_row.html" %}{% endfor %}</tbody>
   </table></div>
   <p class="muted">0 pauses a scanner. Paid jobs go to the scanner that is cheapest per delivered result at the job's level: its price divided by its success rate there (last 24 h, timeouts aside, measured every hour). A job waits up to 30 min for a cheaper live scanner, then goes to whoever asks. A scanner that fails a level often wins it only if its price makes up for it. Unpaid jobs keep the old rule: a scanner that fails a level more than the others sits it out for 10-minute stretches, a share of 1 − weight of them; scanners with fewer than 5 scans at a level set no bar. Hover a scanner in the history for why it got the job.</p>

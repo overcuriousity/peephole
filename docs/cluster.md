@@ -130,8 +130,8 @@ can still belong together: they share an **ownership key**.
   cluster pages. Nothing about ownership is replicated: other operators'
   nodes cannot verify who owns what, though a member that relays the
   messages can see which nodes answered each other.
-- From a managing node you can change a sibling's scan pace, rescan
-  cooldown and roles, block, unblock and purge peers there, revoke its
+- From a managing node you can change a sibling's scan workers and
+  roles, block, unblock and purge peers there, revoke its
   invites, have it leave the cluster, and release it. Each of your nodes
   lists the commands it received (Cluster › Ownership).
 - **Not possible from outside**, also for the owner: creating an invite

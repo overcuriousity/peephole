@@ -172,8 +172,8 @@ Configuration lives in `/etc/peephole/config.toml`
 ([annotated reference](deploy/config.example.toml)). The signature rules
 ([`rules/`](rules/)) ship inside the binary, so every node of a build
 classifies alike and each request records which rules it was classified
-with; changing them means a new build. Scan pace, rescan cooldown and roles
-can also be changed at runtime from the admin area.
+with; changing them means a new build. The number of scan workers and the
+roles can also be changed at runtime from the admin area.
 
 ## License
 

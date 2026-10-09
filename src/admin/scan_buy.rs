@@ -31,12 +31,38 @@ pub const FRESH_HOURS: i64 = 24;
 /// One level's offer on the Actions card.
 pub struct ScanOffer {
     pub level: u8,
+    /// What the level scans, for the button's title.
+    pub about: &'static str,
     /// "from 1.23 credits" in a cluster, "free" standalone; empty when no
     /// live scanner announces a price.
     pub price: String,
     /// A finished scan of exactly this level under [`FRESH_HOURS`] old
     /// (its finish date): no new scan is sold.
     pub fresh: Option<String>,
+    /// That scan's id, for the link to its result.
+    pub fresh_id: Option<i64>,
+    /// "queued" or "running": a job of this level is on its way.
+    pub waiting: Option<&'static str>,
+}
+
+impl ScanOffer {
+    /// How long ago the fresh scan finished: "3 h".
+    pub fn fresh_ago(&self) -> String {
+        self.fresh
+            .as_deref()
+            .map(crate::admin::views::ago)
+            .unwrap_or_default()
+    }
+}
+
+/// What each level scans (`scan::profiles::builtin`).
+fn about(level: u8) -> &'static str {
+    match level {
+        1 => "top 100 ports, light version detection",
+        2 => "top 1000 ports, versions, OS, host keys and certificates",
+        3 => "top 1000 ports, versions, OS, traceroute, safe scripts",
+        _ => "every port, versions, OS, traceroute, safe scripts",
+    }
 }
 
 /// Whether `ts` (a store timestamp) is less than [`FRESH_HOURS`] old.
@@ -50,6 +76,7 @@ fn fresh_enough(ts: &str) -> bool {
 /// The four levels' offers for `ip_id`.
 pub async fn offers_for(state: &AdminState, ip_id: i64) -> Vec<ScanOffer> {
     let scans = state.store.scans_for_ip(ip_id).await.unwrap_or_default();
+    let jobs = state.store.jobs_for_ip(ip_id, 20).await.unwrap_or_default();
     let node = state.recorder.node();
     let cheapest = node.and_then(|n| n.price_table().scanners.iter().map(|s| s.price_mc).min());
     (1u8..=4)
@@ -57,8 +84,18 @@ pub async fn offers_for(state: &AdminState, ip_id: i64) -> Vec<ScanOffer> {
             let fresh = scans
                 .iter()
                 .filter(|s| s.level == level as i64 && s.audit_of.is_none())
-                .filter_map(|s| s.finished_at.clone())
-                .find(|f| fresh_enough(f));
+                .filter_map(|s| Some((s.id, s.finished_at.clone()?)))
+                .find(|(_, f)| fresh_enough(f));
+            // Running wins over queued when both are there.
+            let waiting = jobs
+                .iter()
+                .filter(|j| j.level == level as i64)
+                .filter_map(|j| match j.status.as_str() {
+                    "running" => Some("running"),
+                    "queued" => Some("queued"),
+                    _ => None,
+                })
+                .min_by_key(|s| *s != "running");
             let price = match (node.is_some(), cheapest) {
                 (false, _) => "free".into(),
                 (true, Some(c)) => format!(
@@ -71,8 +108,11 @@ pub async fn offers_for(state: &AdminState, ip_id: i64) -> Vec<ScanOffer> {
             };
             ScanOffer {
                 level,
+                about: about(level),
                 price,
-                fresh,
+                fresh_id: fresh.as_ref().map(|f| f.0),
+                fresh: fresh.map(|f| f.1),
+                waiting,
             }
         })
         .collect()
@@ -119,7 +159,7 @@ async fn buy(
         return Ok(redirect_with_error("/admin/lookup", "Not an IP address."));
     };
     let ip = crate::net::canonical(ip);
-    let back = format!("/ip/{ip}#scans");
+    let back = format!("/ip/{ip}#actions");
     let Some(level) = form.level.parse::<i64>().ok().and_then(valid_level) else {
         return Ok(redirect_with_error(&back, "No scan: not a scan level."));
     };
@@ -411,12 +451,48 @@ secure_cookies = false
         let offers = offers_for(&state, ip_id).await;
         let l2 = offers.iter().find(|o| o.level == 2).unwrap();
         assert!(l2.fresh.is_some(), "the level-2 scan just finished");
+        let scan_id: i64 = sqlx::query_scalar("SELECT id FROM scans WHERE ip_id = ?")
+            .bind(ip_id)
+            .fetch_one(&state.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(l2.fresh_id, Some(scan_id), "links to that result");
+        assert!(l2.fresh_ago().ends_with(" s"), "{}", l2.fresh_ago());
         assert!(
             offers
                 .iter()
                 .filter(|o| o.level != 2)
-                .all(|o| o.fresh.is_none())
+                .all(|o| o.fresh.is_none() && o.fresh_id.is_none())
         );
+    }
+
+    /// A level with a job on its way says so: queued, then running.
+    #[tokio::test]
+    async fn an_offer_shows_its_job_on_the_way() {
+        let (state, _c, ip_id, _d) = state().await;
+        assert!(
+            offers_for(&state, ip_id)
+                .await
+                .iter()
+                .all(|o| o.waiting.is_none())
+        );
+        state.recorder.enqueue_manual(ip_id, 3).await.unwrap();
+        let waiting = |offers: &[ScanOffer]| -> Vec<(u8, Option<&'static str>)> {
+            offers.iter().map(|o| (o.level, o.waiting)).collect()
+        };
+        let offers = offers_for(&state, ip_id).await;
+        assert_eq!(
+            waiting(&offers),
+            vec![(1, None), (2, None), (3, Some("queued")), (4, None)]
+        );
+        sqlx::query("UPDATE scan_jobs SET status = 'running' WHERE ip_id = ?")
+            .bind(ip_id)
+            .execute(&state.store.pool)
+            .await
+            .unwrap();
+        let offers = offers_for(&state, ip_id).await;
+        assert_eq!(offers[2].waiting, Some("running"));
+        assert_eq!(offers[2].about, about(3));
     }
 
     #[tokio::test]
@@ -455,7 +531,10 @@ secure_cookies = false
             .await
             .unwrap();
         assert_eq!(r.status(), 303);
-        assert_eq!(r.headers()["location"], format!("/ip/{IP}#scans").as_str());
+        assert_eq!(
+            r.headers()["location"],
+            format!("/ip/{IP}#actions").as_str()
+        );
         let n: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE ip_id = ? AND level = 9")
                 .bind(ip_id)

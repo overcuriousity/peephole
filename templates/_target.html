@@ -4,7 +4,7 @@
   <div class="card-head"><h2>Intelligence</h2>{% if t.admin.is_some() %}<a href="/admin/lookup?ip={{ t.ov.ip.ip }}">look up now →</a>{% endif %}</div>
   {% let signals = t.signals() %}{% include "_signals.html" %}
   <div class="intel-grid">
-  {% for c in t.intel %}{% if c.newest.is_some() %}{% let badge = "" %}{% let verb = "checked" %}{% let again = "" %}{% let again_ip = "" %}{% include "_intel_card.html" %}{% endif %}{% endfor %}
+  {% for c in t.intel %}{% if c.newest.is_some() %}{% let badge = "" %}{% let verb = "checked" %}{% let again = "" %}{% let again_ip = "" %}{% let again_price = String::new() %}{% include "_intel_card.html" %}{% endif %}{% endfor %}
   </div>
   {% let pending = t.pending_intel() %}{% if !pending.is_empty() %}<p class="intel-pending">No result yet: {{ pending }}</p>{% endif %}
   {% if let Some(a) = t.admin %}{% if !a.names.is_empty() %}{% let names = a.names %}{% include "_names.html" %}{% endif %}{% endif %}
@@ -27,7 +27,7 @@
   {% endif %}
   {% if adm.scans.is_empty() %}<p class="muted">{% if adm.jobs.is_empty() %}Never queued for a counter-scan.{% else %}No completed scan yet.{% endif %}</p>{% endif %}
   {% for sc in adm.scans %}
-    <h3>Level {{ sc.s.level }}{% if sc.s.audit_of.is_some() %} <span class="badge badge-status" data-status="queued">audit{% if let Some(r) = sc.s.audit_result %}: {{ r }}{% endif %}</span>{% endif %} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {{ sc.s.os_guess.as_deref().unwrap_or("OS unknown") }} · {{ sc.s.open_ports }} open{% if !sc.serves.is_empty() %} · {{ sc.serves }}{% endif %}{% if !sc.host.is_empty() %} · {{ sc.host }}{% endif %}
+    <h3 id="scan-{{ sc.s.id }}">Level {{ sc.s.level }}{% if sc.s.audit_of.is_some() %} <span class="badge badge-status" data-status="queued">audit{% if let Some(r) = sc.s.audit_result %}: {{ r }}{% endif %}</span>{% endif %} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {{ sc.s.os_guess.as_deref().unwrap_or("OS unknown") }} · {{ sc.s.open_ports }} open{% if !sc.serves.is_empty() %} · {{ sc.serves }}{% endif %}{% if !sc.host.is_empty() %} · {{ sc.host }}{% endif %}
       {% if let Some(n) = sc.s.node %}· <span class="muted">{{ n }}</span> {% endif %}· <a href="/admin/scans/{{ sc.s.id }}">details</a> · <a href="/admin/scans/{{ sc.s.id }}/xml">raw XML</a></h3>
     {% let ports = sc.ports %}{% include "_ports.html" %}
   {% endfor %}

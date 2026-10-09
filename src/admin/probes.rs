@@ -673,7 +673,7 @@ async fn request(
         return Ok(redirect_with_error("/admin/lookup", "Not an IP address."));
     };
     let ip = crate::net::canonical(ip);
-    let back = format!("/ip/{ip}#probes");
+    let back = format!("/ip/{ip}#actions");
     let Some(row) = state.store.ip_by_addr(&ip.to_string()).await? else {
         return Ok(redirect_with_error(
             &format!("/admin/lookup?ip={ip}"),
@@ -927,6 +927,25 @@ pub fn states_json(groups: &[GroupView]) -> String {
         })
         .collect();
     serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())
+}
+
+/// The newest request with a member still waiting: `(answered, asked)`,
+/// e.g. `(1, 3)` while two of three vantages have not answered.
+pub fn progress(groups: &[GroupView]) -> Option<(usize, usize)> {
+    let g = groups
+        .iter()
+        .filter(|g| {
+            g.members
+                .iter()
+                .any(|m| matches!(m.state, "queued" | "running"))
+        })
+        .max_by(|a, b| a.asked_at.cmp(&b.asked_at))?;
+    let waiting = g
+        .members
+        .iter()
+        .filter(|m| matches!(m.state, "queued" | "running"))
+        .count();
+    Some((g.members.len() - waiting, g.members.len()))
 }
 
 /// Some member still waits for its result.
@@ -1330,6 +1349,158 @@ secure_cookies = false
         until(&mut body, r#"["g1","","done"]"#).await;
     }
 
+    /// `_actions.html` alone, around a loaded target.
+    #[derive(askama::Template)]
+    #[template(source = r#"{% include "_actions.html" %}"#, ext = "html")]
+    struct ActionsCard {
+        t: crate::admin::target::Target,
+        a: ActionsView,
+        first: bool,
+    }
+
+    fn offer(level: u8) -> crate::admin::scan_buy::ScanOffer {
+        crate::admin::scan_buy::ScanOffer {
+            level,
+            about: "some ports",
+            price: "from 0.06 credits".into(),
+            fresh: None,
+            fresh_id: None,
+            waiting: None,
+        }
+    }
+
+    fn pending_member(node: &str, state: &'static str) -> ProbeView {
+        ProbeView {
+            node: node.into(),
+            node_id: node.into(),
+            state,
+            why: None,
+            vantage_ip: None,
+            vantage_dialled: false,
+            rtt_ms: None,
+            started_at: None,
+            ports: vec![],
+        }
+    }
+
+    /// Every button carries its cost or its state: a probe on its way, a
+    /// fresh level linking to its result, a level queued, one without a
+    /// scanner, one to buy.
+    #[tokio::test]
+    async fn every_action_button_shows_its_cost_or_its_state() {
+        use askama::Template;
+        let (state, _c, _id, _d) = state(Some(8080), "").await;
+        let row = state.store.ip_by_addr(IP).await.unwrap().unwrap();
+        let t = crate::admin::target::load(&state, &row, true, 1, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let vantage = |id: &str, mc: u32| VantageView {
+            id: id.into(),
+            name: format!("node-{id}"),
+            country: Some("DE".into()),
+            price: crate::credits::show(mc as u64),
+            price_mc: mc,
+        };
+        let mut scans = vec![offer(1), offer(2), offer(3), offer(4)];
+        scans[1].fresh = Some("2026-10-09 10:00:00".into());
+        scans[1].fresh_id = Some(42);
+        scans[2].waiting = Some("queued");
+        scans[3].price = String::new();
+        let a = ActionsView {
+            guard_line: "No open port known here".into(),
+            allowed: true,
+            why_not: None,
+            vantages: vec![vantage("a", 20), vantage("b", 30), vantage("c", 50)],
+            default: vec!["a".into(), "b".into()],
+            balance: Some("515.46".into()),
+            standalone: false,
+            scans,
+        };
+        let html = ActionsCard { t, a, first: true }.render().unwrap();
+        assert!(
+            html.contains(r#"data-busy="Asking…">Probe · <span class="num" data-probe-total>0.05</span> credits"#),
+            "the probe button carries the ticked total: {html}"
+        );
+        assert!(
+            html.contains(r#"<b>L1</b><span>from 0.06 credits</span>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r##"href="#scan-42""##) && html.contains("<b>L2 ✓</b><span>done "),
+            "a fresh level links to its result: {html}"
+        );
+        assert!(
+            html.contains(r#"<span class="spin" aria-hidden="true"></span>queued</span>"#),
+            "{html}"
+        );
+        assert!(html.contains("<b>L4</b><span>no scanner</span>"), "{html}");
+        assert!(html.contains("balance <span class=\"num\">515.46</span>"));
+        assert!(html.contains("data-flash-here"));
+
+        // While a probe waits, its button says how far it got.
+        let mut t = crate::admin::target::load(&state, &row, true, 1, true)
+            .await
+            .unwrap()
+            .unwrap();
+        t.probes = vec![GroupView {
+            group: "g1".into(),
+            asked_at: "2026-10-09 13:00:37".into(),
+            by: "this node".into(),
+            cost: "0.05".into(),
+            cost_kind: "offered",
+            charged_mc: 0,
+            members: vec![
+                pending_member("a", "done"),
+                pending_member("b", "running"),
+                pending_member("c", "queued"),
+            ],
+            diff: None,
+            verdicts: vec![],
+        }];
+        let a = ActionsView {
+            guard_line: String::new(),
+            allowed: true,
+            why_not: None,
+            vantages: vec![],
+            default: vec![],
+            balance: None,
+            standalone: true,
+            scans: vec![],
+        };
+        let html = ActionsCard { t, a, first: true }.render().unwrap();
+        assert!(html.contains("Probing · 1 of 3 in"), "{html}");
+        assert!(
+            !html.contains("data-busy=\"Asking…\""),
+            "no second probe meanwhile"
+        );
+    }
+
+    #[test]
+    fn progress_counts_the_newest_waiting_request() {
+        let group = |asked: &str, states: &[&'static str]| GroupView {
+            group: asked.into(),
+            asked_at: asked.into(),
+            by: String::new(),
+            cost: String::new(),
+            cost_kind: "offered",
+            charged_mc: 0,
+            members: states.iter().map(|s| pending_member("x", s)).collect(),
+            diff: None,
+            verdicts: vec![],
+        };
+        assert_eq!(progress(&[]), None);
+        assert_eq!(progress(&[group("1", &["done", "declined"])]), None);
+        assert_eq!(
+            progress(&[
+                group("1", &["queued"]),
+                group("2", &["done", "running"]),
+                group("0", &["done"]),
+            ]),
+            Some((1, 2))
+        );
+    }
+
     #[test]
     fn a_timed_out_port_is_not_a_difference() {
         let d = diff(&[member("a", "ok", "aa"), member("b", "timeout", "bb")]);
@@ -1385,7 +1556,7 @@ secure_cookies = false
         )
         .await;
         assert_eq!(status, 303);
-        assert_eq!(headers["location"], format!("/ip/{IP}#probes").as_str());
+        assert_eq!(headers["location"], format!("/ip/{IP}#actions").as_str());
         let mut html = String::new();
         for _ in 0..100 {
             (_, _, html) = send(

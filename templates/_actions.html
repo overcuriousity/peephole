@@ -1,36 +1,46 @@
-{# The Actions card (admin::probes::ActionsView `a`, address `t.ov.ip.ip`): admin only. Buttons are disabled with the reason, never hidden. #}
-<section class="card"{% if first %} id="actions"{% endif %} data-section="actions">
-  <div class="card-head"><h2>Actions</h2></div>
-  <p class="{% if a.allowed %}muted{% else %}text-warning{% endif %}" data-guard>{{ a.guard_line }}</p>
-  <form method="post" action="/admin/lookup/probe" data-probe-form>
+{# The Actions card (admin::probes::ActionsView `a`, target `t`): admin only. Every button carries its cost or why it does nothing now; never hidden. #}
+<section class="card actions-card"{% if first %} id="actions"{% endif %} data-section="actions">
+  <div class="card-head"><h2>Actions</h2>{% if let Some(b) = a.balance %}<span class="muted">balance <span class="num">{{ b }}</span> credits</span>{% endif %}</div>
+  <p class="{% if a.allowed %}muted{% else %}text-warning{% endif %} small" data-guard>{{ a.guard_line }}</p>
+  <div data-flash-here></div>
+
+  <form class="action-block" method="post" action="/admin/lookup/probe" data-probe-form>
     <input type="hidden" name="ip" value="{{ t.ov.ip.ip }}">
-    {% if a.standalone %}
-    <p class="muted small">Reads what the ports the counter-scan found open present, from this node.</p>
-    {% else %}
-    <ul class="vantages">
+    <h3 class="action-label">Probe <span class="muted">· read what the ports present{% if a.standalone %}, from this node{% endif %}</span></h3>
+    {% if !a.standalone %}
+    <div class="vantage-chips">
       {% for v in a.vantages %}
-      <li><label><input type="checkbox" name="vantage" value="{{ v.id }}" data-mc="{{ v.price_mc }}"{% if a.ticked(v.id) %} checked{% endif %}{% if !a.allowed %} disabled{% endif %}>
-        {{ v.name }}{% if let Some(c) = v.country %} <span class="muted">{{ c }}</span>{% endif %} · <span class="num">{{ v.price }}</span> credits</label></li>
+      <label class="vantage-chip"><input type="checkbox" name="vantage" value="{{ v.id }}" data-mc="{{ v.price_mc }}"{% if a.ticked(v.id) %} checked{% endif %}{% if !a.allowed %} disabled{% endif %}><span>{{ v.name }}</span>{% if let Some(c) = v.country %}<span class="muted">{{ c }}</span>{% endif %}<span class="num">{{ v.price }}</span></label>
       {% endfor %}
-    </ul>
-    <p class="small">Total <span class="num" data-probe-total>{{ a.default_total() }}</span> credits{% if let Some(b) = a.balance %} · balance <span class="num">{{ b }}</span> credits{% endif %}</p>
+    </div>
     {% endif %}
-    <button class="btn" type="submit"{% if !a.allowed %} disabled title="{{ a.why_not.as_deref().unwrap_or_default() }}"{% endif %}>Probe</button>
-    {% if let Some(w) = a.why_not %}<span class="muted small">{{ w }}</span>{% endif %}
-  </form>
-  <form method="post" action="/admin/lookup/scan">
-    <input type="hidden" name="ip" value="{{ t.ov.ip.ip }}">
-    <p class="muted small">Counter-scan this address now{% if a.standalone %}, from this node{% endif %}. A result of the same level less than a day old costs nothing.</p>
-    <p>
-      {% for o in a.scans %}
-      {% if let Some(f) = o.fresh %}
-      <button class="btn" type="button" disabled title="Level {{ o.level }} finished {{ f }}: fresh results cost nothing">L{{ o.level }}</button>
-      {% else if o.price.is_empty() %}
-      <button class="btn" type="button" disabled title="No live scanner announces a price">L{{ o.level }}</button>
+    <div class="action-row">
+      {% if let Some((done, asked)) = t.probe_progress() %}
+      <button class="btn action-btn busy" type="button" disabled><span class="spin" aria-hidden="true"></span>Probing · {{ done }} of {{ asked }} in</button>
+      {% else if !a.allowed %}
+      <button class="btn action-btn" type="button" disabled title="{{ a.why_not.as_deref().unwrap_or_default() }}">Probe</button>
       {% else %}
-      <button class="btn" type="submit" name="level" value="{{ o.level }}">L{{ o.level }} · {{ o.price }}</button>
+      <button class="btn btn-primary action-btn" type="submit" data-busy="Asking…">Probe · {% if a.standalone %}free{% else %}<span class="num" data-probe-total>{{ a.default_total() }}</span> credits{% endif %}</button>
+      {% endif %}
+      {% if let Some(w) = a.why_not %}<span class="muted small">{{ w }}</span>{% endif %}
+    </div>
+  </form>
+
+  <form class="action-block" method="post" action="/admin/lookup/scan">
+    <input type="hidden" name="ip" value="{{ t.ov.ip.ip }}">
+    <h3 class="action-label">Counter-scan <span class="muted">· {% if a.standalone %}from this node; {% endif %}a result of the same level less than a day old is shown instead</span></h3>
+    <div class="level-grid">
+      {% for o in a.scans %}
+      {% if let Some(w) = o.waiting %}
+      <button class="btn level-btn busy" type="button" disabled title="L{{ o.level }}: {{ o.about }}"><b>L{{ o.level }}</b><span><span class="spin" aria-hidden="true"></span>{{ w }}</span></button>
+      {% else if let Some(id) = o.fresh_id %}
+      <a class="btn level-btn done" href="#scan-{{ id }}" title="L{{ o.level }}: {{ o.about }}. Finished {{ o.fresh.as_deref().unwrap_or_default() }}: a fresh result, nothing to buy"><b>L{{ o.level }} ✓</b><span>done {{ o.fresh_ago() }} ago · view</span></a>
+      {% else if o.price.is_empty() %}
+      <button class="btn level-btn" type="button" disabled title="L{{ o.level }}: {{ o.about }}. No live scanner announces a price"><b>L{{ o.level }}</b><span>no scanner</span></button>
+      {% else %}
+      <button class="btn level-btn" type="submit" name="level" value="{{ o.level }}" data-busy="Queuing…" title="L{{ o.level }}: {{ o.about }}"><b>L{{ o.level }}</b><span>{{ o.price }}</span></button>
       {% endif %}
       {% endfor %}
-    </p>
+    </div>
   </form>
 </section>

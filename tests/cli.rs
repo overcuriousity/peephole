@@ -290,21 +290,25 @@ web = false
             String::from_utf8_lossy(&o.stderr)
         )
     };
-    let out = run(&["set", "scan.rescan_cooldown_hours", "48"]);
+    let out = run(&["set", "scan.max_workers", "5"]);
     assert!(out.status.success(), "{}", text(&out));
     let shown = text(&run(&["show"]));
     assert!(
-        shown.contains("scan.rescan_cooldown_hours")
-            && shown.contains("48")
-            && shown.contains("override"),
+        shown.contains("scan.max_workers") && shown.contains("5") && shown.contains("override"),
         "{shown}"
+    );
+    // A key earlier versions had is refused.
+    assert!(
+        !run(&["set", "scan.rescan_cooldown_hours", "48"])
+            .status
+            .success()
     );
     // The only role cannot be switched off; an unknown key is refused.
     let out = run(&["set", "roles.listener", "false"]);
     assert!(!out.status.success());
     assert!(text(&out).contains("at least one role"), "{}", text(&out));
     assert!(!run(&["set", "scan.level_argv", "x"]).status.success());
-    let out = run(&["reset", "scan.rescan_cooldown_hours"]);
+    let out = run(&["reset", "scan.max_workers"]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(!text(&run(&["show"])).contains("override"));
 }

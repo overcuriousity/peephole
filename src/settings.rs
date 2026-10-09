@@ -1,5 +1,5 @@
 //! Runtime settings: the values an operator may change while the node runs
-//! (scan pace, rescan cooldown, roles). The TOML gives the defaults; rows in
+//! (scan workers, roles). The TOML gives the defaults; rows in
 //! the `settings` table override them. Every change, from the local admin
 //! UI, the CLI or the owner, goes through [`Settings::apply`].
 use crate::cluster::identity::NodeId;
@@ -11,32 +11,26 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-pub const KEY_COOLDOWN: &str = "scan.rescan_cooldown_hours";
 pub const KEY_ROLE_LISTENER: &str = "roles.listener";
 pub const KEY_ROLE_SCANNER: &str = "roles.scanner";
 pub const KEY_ROLE_WEB: &str = "roles.web";
 const KEY_VERSION: &str = "settings.version";
-/// Longest rescan cooldown (one year).
-pub const MAX_COOLDOWN_HOURS: i64 = 24 * 365;
 
-/// Every key a runtime override can use.
-pub const KEYS: [&str; 7] = [
+/// Every key a runtime override can use. Rows of keys earlier versions
+/// had (the hourly start cap, the scan timeout, the rescan cooldown) are
+/// ignored.
+pub const KEYS: [&str; 4] = [
     pace::KEY_WORKERS,
-    pace::KEY_PER_HOUR,
-    pace::KEY_TIMEOUT,
-    KEY_COOLDOWN,
     KEY_ROLE_LISTENER,
     KEY_ROLE_SCANNER,
     KEY_ROLE_WEB,
 ];
 
-/// A set of changes; absent fields stay as they are.
+/// A set of changes; absent fields stay as they are. Fields an earlier
+/// version sends that this one no longer has are ignored.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Changes {
     pub max_workers: Option<u32>,
-    pub max_scans_per_hour: Option<i64>,
-    pub timeout_secs: Option<u64>,
-    pub cooldown_hours: Option<i64>,
     pub listener: Option<bool>,
     pub scanner: Option<bool>,
     pub web: Option<bool>,
@@ -54,15 +48,6 @@ impl Changes {
         if let Some(x) = self.max_workers {
             v.push(format!("workers={x}"));
         }
-        if let Some(x) = self.max_scans_per_hour {
-            v.push(format!("scans/h={x}"));
-        }
-        if let Some(x) = self.timeout_secs {
-            v.push(format!("timeout={x}s"));
-        }
-        if let Some(x) = self.cooldown_hours {
-            v.push(format!("cooldown={x}h"));
-        }
         if let Some(x) = self.listener {
             v.push(format!("listener={}", on(x)));
         }
@@ -78,9 +63,6 @@ impl Changes {
     /// Take over every field `other` sets.
     pub fn merge(&mut self, other: Self) {
         self.max_workers = other.max_workers.or(self.max_workers);
-        self.max_scans_per_hour = other.max_scans_per_hour.or(self.max_scans_per_hour);
-        self.timeout_secs = other.timeout_secs.or(self.timeout_secs);
-        self.cooldown_hours = other.cooldown_hours.or(self.cooldown_hours);
         self.listener = other.listener.or(self.listener);
         self.scanner = other.scanner.or(self.scanner);
         self.web = other.web.or(self.web);
@@ -102,9 +84,6 @@ impl Changes {
         let mut c = Self::default();
         match key {
             pace::KEY_WORKERS => c.max_workers = Some(num()?.clamp(0, u32::MAX as i64) as u32),
-            pace::KEY_PER_HOUR => c.max_scans_per_hour = Some(num()?),
-            pace::KEY_TIMEOUT => c.timeout_secs = Some(num()?.max(0) as u64),
-            KEY_COOLDOWN => c.cooldown_hours = Some(num()?),
             KEY_ROLE_LISTENER => c.listener = Some(flag()?),
             KEY_ROLE_SCANNER => c.scanner = Some(flag()?),
             KEY_ROLE_WEB => c.web = Some(flag()?),
@@ -150,7 +129,6 @@ impl Prereqs {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Snapshot {
     pub pace: Pace,
-    pub cooldown_hours: i64,
     pub roles: Roles,
     pub version: u64,
 }
@@ -161,21 +139,7 @@ pub fn validate(current: Snapshot, c: &Changes, prereqs: &Prereqs) -> Result<Sna
     if let Some(x) = c.max_workers {
         s.pace.max_workers = x as usize;
     }
-    if let Some(x) = c.max_scans_per_hour {
-        s.pace.max_scans_per_hour = x;
-    }
-    if let Some(x) = c.timeout_secs {
-        s.pace.timeout_secs = x;
-    }
     s.pace.validate()?;
-    if let Some(x) = c.cooldown_hours {
-        if !(0..=MAX_COOLDOWN_HOURS).contains(&x) {
-            return Err(format!(
-                "rescan cooldown must be between 0 and {MAX_COOLDOWN_HOURS} hours"
-            ));
-        }
-        s.cooldown_hours = x;
-    }
     for (new, cur, missing, name) in [
         (c.listener, &mut s.roles.listener, &prereqs.listener, "trap"),
         (c.scanner, &mut s.roles.scanner, &prereqs.scanner, "scanner"),
@@ -222,8 +186,7 @@ pub struct Settings {
 
 fn defaults(cfg: &Config) -> Snapshot {
     Snapshot {
-        pace: Pace::from_config(&cfg.scan),
-        cooldown_hours: cfg.scan.rescan_cooldown_hours,
+        pace: Pace::new(cfg.scan.max_workers),
         roles: cfg.roles,
         version: 0,
     }
@@ -249,7 +212,6 @@ impl Settings {
     pub async fn load(store: &Store, cfg: &Config, prereqs: Prereqs) -> Result<Self> {
         let d = defaults(cfg);
         let pace = SharedPace::new(d.pace);
-        pace.set_cooldown_hours(d.cooldown_hours);
         let mut s = Self::with_pace(store.clone(), cfg, pace);
         s.prereqs = Arc::new(prereqs);
         s.reload().await?;
@@ -259,7 +221,6 @@ impl Settings {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             pace: self.pace.get(),
-            cooldown_hours: self.pace.cooldown_hours(),
             roles: self.roles(),
             version: self.version.load(Ordering::Relaxed),
         }
@@ -326,7 +287,6 @@ impl Settings {
 
     fn adopt(&self, s: Snapshot) {
         self.pace.replace(s.pace);
-        self.pace.set_cooldown_hours(s.cooldown_hours);
         *self.roles.write().unwrap() = s.roles;
         self.version.store(s.version, Ordering::Relaxed);
         self.changed.send_replace(s.version);
@@ -402,12 +362,6 @@ impl Settings {
         }
         for (key, value) in [
             (pace::KEY_WORKERS, c.max_workers.map(|v| v.to_string())),
-            (
-                pace::KEY_PER_HOUR,
-                c.max_scans_per_hour.map(|v| v.to_string()),
-            ),
-            (pace::KEY_TIMEOUT, c.timeout_secs.map(|v| v.to_string())),
-            (KEY_COOLDOWN, c.cooldown_hours.map(|v| v.to_string())),
             (KEY_ROLE_LISTENER, c.listener.map(|v| v.to_string())),
             (KEY_ROLE_SCANNER, c.scanner.map(|v| v.to_string())),
             (KEY_ROLE_WEB, c.web.map(|v| v.to_string())),
@@ -492,12 +446,7 @@ mod tests {
 
     fn snap(roles: (bool, bool, bool)) -> Snapshot {
         Snapshot {
-            pace: Pace {
-                max_workers: 2,
-                max_scans_per_hour: 30,
-                timeout_secs: 1800,
-            },
-            cooldown_hours: 24,
+            pace: Pace::new(2),
             roles: Roles {
                 listener: roles.0,
                 scanner: roles.1,
@@ -513,15 +462,13 @@ mod tests {
             snap((true, true, false)),
             &Changes {
                 max_workers: Some(4),
-                cooldown_hours: Some(48),
                 ..Default::default()
             },
             &Prereqs::default(),
         )
         .unwrap();
         assert_eq!(out.pace.max_workers, 4);
-        assert_eq!(out.pace.max_scans_per_hour, 30);
-        assert_eq!(out.cooldown_hours, 48);
+        assert!(out.roles.scanner);
         assert_eq!(out.version, 7, "validate does not bump the version");
     }
 
@@ -535,13 +482,6 @@ mod tests {
                     ..Default::default()
                 },
                 "workers",
-            ),
-            (
-                Changes {
-                    cooldown_hours: Some(-1),
-                    ..Default::default()
-                },
-                "cooldown",
             ),
             (
                 Changes {
@@ -599,6 +539,7 @@ mod tests {
         let c = Changes::from_key_value("scan.max_workers", "3").unwrap();
         assert_eq!(c.describe(), "workers=3");
         assert!(Changes::from_key_value("scan.level_argv", "x").is_err());
+        assert!(Changes::from_key_value("scan.rescan_cooldown_hours", "48").is_err());
         assert!(Changes::from_key_value("roles.web", "maybe").is_err());
         assert!(Changes::default().is_empty());
     }
@@ -615,13 +556,16 @@ mod tests {
     }
 
     /// A stored single worker (from before the minimum of 2) is raised to 2
-    /// on load; the other saved overrides, roles included, survive.
+    /// on load; the other saved overrides, roles included, survive, and
+    /// rows of keys earlier versions had are ignored.
     #[tokio::test]
     async fn a_stored_single_worker_is_raised_and_other_overrides_survive() {
         let (s, store, _d) = open("").await;
         for (k, v) in [
             (pace::KEY_WORKERS, "1"),
-            (pace::KEY_PER_HOUR, "11"),
+            ("scan.max_scans_per_hour", "11"),
+            ("scan.timeout_secs", "60"),
+            ("scan.rescan_cooldown_hours", "0"),
             (KEY_ROLE_SCANNER, "false"),
         ] {
             sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
@@ -636,9 +580,9 @@ mod tests {
             .await
             .unwrap();
         let snap = loaded.snapshot();
-        assert_eq!(snap.pace.max_workers, 2);
-        assert_eq!(snap.pace.max_scans_per_hour, 11);
+        assert_eq!(snap.pace, Pace::new(2));
         assert!(!snap.roles.scanner);
+        assert_eq!(loaded.pace.cooldown_hours(), pace::COOLDOWN_HOURS);
     }
 
     /// A stored `roles.web = true` does not switch on a web role whose
@@ -646,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn a_stored_role_override_needs_the_config_sections() {
         let (s, store, _d) = open("").await;
-        for (k, v) in [(KEY_ROLE_WEB, "true"), (pace::KEY_PER_HOUR, "11")] {
+        for (k, v) in [(KEY_ROLE_WEB, "true"), (pace::KEY_WORKERS, "3")] {
             sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
                 .bind(k)
                 .bind(v)
@@ -660,19 +604,18 @@ mod tests {
             .await
             .unwrap();
         assert!(!loaded.snapshot().roles.web);
-        assert_eq!(loaded.snapshot().pace.max_scans_per_hour, 11);
+        assert_eq!(loaded.snapshot().pace.max_workers, 3);
     }
 
     #[tokio::test]
     async fn overrides_persist_bump_the_version_and_reset_to_toml() {
-        let (s, store, _d) =
-            open("[roles]\nweb = false\n[scan]\nrescan_cooldown_hours = 12\n").await;
+        let (s, store, _d) = open("[roles]\nweb = false\n[scan]\nmax_workers = 3\n").await;
         let before = s.snapshot();
-        assert_eq!((before.cooldown_hours, before.version), (12, 0));
+        assert_eq!((before.pace.max_workers, before.version), (3, 0));
         let v = s
             .apply(
                 &Changes {
-                    cooldown_hours: Some(48),
+                    max_workers: Some(4),
                     scanner: Some(false),
                     ..Default::default()
                 },
@@ -682,13 +625,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(v, 1);
-        assert_eq!(s.pace.cooldown_hours(), 48);
+        assert_eq!(s.pace.get().max_workers, 4);
         assert!(!s.roles().scanner);
         // A second handle on the same database (the CLI, or a restart) sees it.
         let again = Settings::load(&store, &cfg("[roles]\nweb = false\n"), Prereqs::default())
             .await
             .unwrap();
-        assert_eq!(again.snapshot().cooldown_hours, 48);
+        assert_eq!(again.snapshot().pace.max_workers, 4);
         assert_eq!(again.snapshot().version, 1);
         // A refused change persists nothing.
         let e = s
@@ -720,12 +663,13 @@ mod tests {
         assert_eq!(s.snapshot().pace.max_workers, 5);
         assert!(!s.reload().await.unwrap());
         // Reset one key, then all.
-        s.reset(Some(KEY_COOLDOWN)).await.unwrap().unwrap();
-        assert_eq!(s.snapshot().cooldown_hours, 12);
+        s.reset(Some(pace::KEY_WORKERS)).await.unwrap().unwrap();
+        assert_eq!(s.snapshot().pace.max_workers, 3);
+        assert!(!s.snapshot().roles.scanner);
         s.reset(None).await.unwrap().unwrap();
         let end = s.snapshot();
         assert!(end.roles.scanner);
-        assert_eq!(end.pace.max_workers, 2);
+        assert_eq!(end.pace.max_workers, 3);
         assert!(s.reset(Some("no.such.key")).await.unwrap().is_err());
     }
 
@@ -734,7 +678,7 @@ mod tests {
         let (s, _store, _d) = open("").await;
         let who = crate::cluster::identity::Identity::generate().unwrap().id;
         let c = Changes {
-            max_scans_per_hour: Some(77),
+            max_workers: Some(7),
             ..Default::default()
         };
         assert_eq!(s.apply_at(0, &c, Some(who)).await.unwrap(), Ok(1));
@@ -743,7 +687,7 @@ mod tests {
         let audit = s.audit(10).await.unwrap();
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].by, Some(who));
-        assert_eq!(audit[0].changes, "scans/h=77");
+        assert_eq!(audit[0].changes, "workers=7");
         // An empty change proves the caller may configure; it changes nothing.
         assert_eq!(
             s.apply_at(1, &Changes::default(), Some(who)).await.unwrap(),

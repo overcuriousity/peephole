@@ -160,7 +160,6 @@ async fn boot_in(
         .unwrap();
     let pace = peephole::scan::pace::SharedPace::new(peephole::scan::pace::Pace {
         max_workers: o.workers,
-        max_scans_per_hour: 3600,
         timeout_secs: 60,
     });
     let settings = peephole::settings::Settings::with_pace(
@@ -2030,7 +2029,6 @@ async fn silent_arbiters_queue_is_taken_over() {
             &nb.store,
             peephole::scan::pace::Pace {
                 max_workers: peephole::scan::pace::MIN_WORKERS,
-                max_scans_per_hour: 3600,
                 timeout_secs: 60,
             },
         )
@@ -2649,19 +2647,14 @@ async fn admin_cluster_page_and_private_attribution() {
     // Remote pace from the UI.
     let r = admin
         .post(format!("{base}/admin/cluster/pace"))
-        .form(&[
-            ("key", b.id.to_string()),
-            ("max_workers", "2".into()),
-            ("max_scans_per_hour", "77".into()),
-            ("timeout_minutes", "15".into()),
-        ])
+        .form(&[("key", b.id.to_string()), ("max_workers", "7".into())])
         .send()
         .await
         .unwrap();
     assert!(r.status().is_success());
     assert_ne!(
-        nb.pace.get().max_scans_per_hour,
-        77,
+        nb.pace.get().max_workers,
+        7,
         "the pace of another node is not changed from the pace row"
     );
     // Invites are shown once.
@@ -3386,7 +3379,7 @@ async fn a_managing_node_changes_a_siblings_settings() {
     let faster = cmd::OwnerCmd::Settings {
         base_version: 0,
         changes: Changes {
-            max_scans_per_hour: Some(77),
+            max_workers: Some(7),
             ..Default::default()
         },
     };
@@ -3395,12 +3388,12 @@ async fn a_managing_node_changes_a_siblings_settings() {
         .unwrap()
         .unwrap();
     assert!(note.contains("version 1"), "{note}");
-    assert_eq!(nb.pace.get().max_scans_per_hour, 77);
+    assert_eq!(nb.pace.get().max_workers, 7);
     assert_eq!(owner::counter(&nb.store).await.unwrap(), 1);
     let log = cmd::log_rows(&nb.store, 10).await.unwrap();
     assert_eq!(log.len(), 1, "status is not logged");
     assert_eq!(log[0].from, a.id);
-    assert!(log[0].command.contains("scans/h=77"), "{}", log[0].command);
+    assert!(log[0].command.contains("workers=7"), "{}", log[0].command);
 
     // The same counter again (a replay, or a second manager): refused.
     let e = cmd::run(&na.node, &key, b.id, 0, faster.clone())
@@ -3456,7 +3449,7 @@ async fn a_managing_node_changes_a_siblings_settings() {
     // ... and lists it among the refused attempts.
     let refused = cmd::refused_rows(&nd.store, 10).await.unwrap();
     assert!(
-        refused[0].command.contains("scans/h=77") && refused[0].result.contains("no owner"),
+        refused[0].command.contains("workers=7") && refused[0].result.contains("no owner"),
         "{refused:?}"
     );
 }
@@ -3497,7 +3490,7 @@ async fn owner_commands_reach_an_outbound_only_sibling() {
     let slower = cmd::OwnerCmd::Settings {
         base_version: 0,
         changes: Changes {
-            cooldown_hours: Some(48),
+            max_workers: Some(5),
             ..Default::default()
         },
     };
@@ -3505,10 +3498,10 @@ async fn owner_commands_reach_an_outbound_only_sibling() {
         matches!(
             cmd::run(&na.node, &key, b.id, 0, slower.clone()).await,
             Ok(Ok(_))
-        ) || nb.settings.snapshot().cooldown_hours == 48
+        ) || nb.settings.snapshot().pace.max_workers == 5
     })
     .await;
-    assert_eq!(nb.settings.snapshot().cooldown_hours, 48);
+    assert_eq!(nb.settings.snapshot().pace.max_workers, 5);
     assert_eq!(owner::counter(&nb.store).await.unwrap(), 1, "applied once");
     // The same command sent again through the relay: refused.
     let e = cmd::run(&na.node, &key, b.id, 0, slower)
@@ -3813,7 +3806,7 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
         cmd::OwnerCmd::Settings {
             base_version: 0,
             changes: peephole::settings::Changes {
-                cooldown_hours: Some(12),
+                max_workers: Some(6),
                 ..Default::default()
             },
         },
@@ -3823,7 +3816,7 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
     .unwrap();
     let html = text(&admin_b, page_b.clone()).await;
     assert!(
-        html.contains("Commands received") && html.contains("settings: cooldown=12h"),
+        html.contains("Commands received") && html.contains("settings: workers=6"),
         "{html}"
     );
     assert!(html.contains("node-alpha"), "who sent it");
@@ -3936,9 +3929,6 @@ async fn admin_manages_a_sibling_from_its_page() {
             ("counter", counter_on(&html).as_str()),
             ("base_version", "0"),
             ("max_workers", "3"),
-            ("max_scans_per_hour", "55"),
-            ("timeout_minutes", "20"),
-            ("cooldown_hours", "12"),
             ("listener", "on"),
             ("web", "on"),
         ])
@@ -3947,9 +3937,7 @@ async fn admin_manages_a_sibling_from_its_page() {
         .unwrap();
     assert!(r.status().is_success());
     let s = nb.settings.snapshot();
-    assert_eq!((s.pace.max_workers, s.pace.max_scans_per_hour), (3, 55));
-    assert_eq!(s.pace.timeout_secs, 1200);
-    assert_eq!(s.cooldown_hours, 12);
+    assert_eq!(s.pace.max_workers, 3);
     assert!(
         s.roles.listener && s.roles.web && !s.roles.scanner,
         "unchecked role is off"
@@ -3958,17 +3946,12 @@ async fn admin_manages_a_sibling_from_its_page() {
     // The pace row cannot change b behind the version check.
     let r = admin
         .post(format!("{base}/admin/cluster/pace"))
-        .form(&[
-            ("key", b.id.to_string()),
-            ("max_workers", "1".into()),
-            ("max_scans_per_hour", "11".into()),
-            ("timeout_minutes", "5".into()),
-        ])
+        .form(&[("key", b.id.to_string()), ("max_workers", "4".into())])
         .send()
         .await
         .unwrap();
     assert!(r.status().is_success());
-    assert_eq!(nb.settings.snapshot().pace.max_scans_per_hour, 55);
+    assert_eq!(nb.settings.snapshot().pace.max_workers, 3);
 
     // An owner action: b blocks c, and the page then lists it.
     let html = text(&admin, b_page.clone()).await;
@@ -4015,7 +3998,6 @@ async fn admin_manages_a_sibling_from_its_page() {
         .post(format!("{base}/admin/cluster/settings"))
         .form(&[
             ("base_version", shown.to_string()),
-            ("cooldown_hours", "6".into()),
             ("listener", "on".into()),
             ("scanner", "on".into()),
             ("web", "on".into()),
@@ -4024,7 +4006,7 @@ async fn admin_manages_a_sibling_from_its_page() {
         .await
         .unwrap();
     assert!(r.status().is_success());
-    assert_eq!(na.settings.snapshot().cooldown_hours, 6);
+    assert_eq!(na.settings.snapshot().version, shown + 1);
     // A crafted form cannot aim an owner command at this node itself, or
     // at a member that is not one of the operator's nodes.
     let mine = owner::counter(&na.store).await.unwrap().to_string();
@@ -4099,7 +4081,7 @@ async fn a_node_without_the_key_shows_its_siblings_read_only() {
             vec![
                 ("counter", "0"),
                 ("base_version", "0"),
-                ("cooldown_hours", "1"),
+                ("max_workers", "3"),
                 ("listener", "on"),
             ],
         ),

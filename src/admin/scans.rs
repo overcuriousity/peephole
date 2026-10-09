@@ -6,7 +6,7 @@ use crate::admin::pages::{deleted_msg, deletes_allowed, redirect_with_notice};
 use crate::admin::views::Chrome;
 use crate::cluster::identity::NodeId;
 use crate::events::QueueJob;
-use crate::scan::pace::{self, Pace, QueueMetrics, recommend};
+use crate::scan::pace::{self, Pace, QueueMetrics, report};
 use crate::store::browse::{Page, page_num};
 use crate::store::inspect::{FINISHED_STATUSES, HistoryRow, JobFilter, PortRow, ScanSummary};
 use askama::Template;
@@ -139,11 +139,9 @@ async fn queue_moved(Query(q): Query<ScansQuery>) -> Redirect {
     }
 }
 
-/// Queue growth, current pace and the recommendation, pre-formatted.
+/// Queue growth and the current pace, pre-formatted.
 pub(crate) struct PaceView {
     pub(crate) current: Pace,
-    pub(crate) rec: Pace,
-    pub(crate) rec_differs: bool,
     pub(crate) paused: bool,
     pub(crate) growing: bool,
     pub(crate) m: QueueMetrics,
@@ -156,20 +154,14 @@ pub(crate) struct PaceView {
     pub(crate) cluster_note: Option<String>,
     pub(crate) net: String,
     pub(crate) drain: String,
-    pub(crate) cadence: String,
-    pub(crate) rec_cadence: String,
     pub(crate) scan_secs: String,
     pub(crate) scan_secs_measured: bool,
     pub(crate) oldest: String,
     pub(crate) arrivals_json: String,
     pub(crate) completions_json: String,
     pub(crate) max_workers: usize,
-    pub(crate) max_per_hour: i64,
+    /// The fixed scan limits, e.g. "30" and "120".
     pub(crate) timeout_min: String,
-    pub(crate) rec_timeout_min: String,
-    pub(crate) min_timeout_min: u64,
-    pub(crate) max_timeout_min: u64,
-    /// Level-4 limit at the current timeout, e.g. "120".
     pub(crate) level4_timeout_min: String,
     /// Most level-4 scans at once at the current worker count.
     pub(crate) level4_cap: usize,
@@ -183,7 +175,12 @@ pub(crate) struct PaceView {
     pub(crate) not_scanning: bool,
 }
 
-/// Seconds as minutes for the form: "15", or "1.5" when not whole.
+/// Share of finished scans above which hitting the timeout is pointed out
+/// (with at least [`TIMEOUTS_MIN_SCANS`] finished in 24 h).
+const TIMEOUTS_HIGH: f64 = 0.10;
+const TIMEOUTS_MIN_SCANS: i64 = 3;
+
+/// Seconds as minutes: "15", or "1.5" when not whole.
 fn minutes(secs: u64) -> String {
     if secs.is_multiple_of(60) {
         (secs / 60).to_string()
@@ -210,13 +207,6 @@ fn fmt_secs(secs: f64) -> String {
     }
 }
 
-fn cadence(p: Pace) -> String {
-    match p.interval() {
-        Some(d) => format!("one start every {}", fmt_secs(d.as_secs_f64())),
-        None => "paused".into(),
-    }
-}
-
 pub(crate) async fn pace_view(
     st: &AdminState,
     notice: Option<String>,
@@ -230,11 +220,9 @@ pub(crate) async fn pace_view(
         .node()
         .map(|n| pace::others(n, scan_secs))
         .unwrap_or_default();
-    let r = recommend(&m, current, others);
+    let r = report(&m, current.max_workers, others);
     Ok(PaceView {
         current,
-        rec: r.pace,
-        rec_differs: r.pace != current,
         paused: current.paused(),
         growing: r.growing(),
         arrival: fmt_rate(r.arrival_per_hour),
@@ -260,8 +248,6 @@ pub(crate) async fn pace_view(
             Some(h) => fmt_secs(h * 3600.0),
             None => "never at this pace".into(),
         },
-        cadence: cadence(current),
-        rec_cadence: cadence(r.pace),
         scan_secs: m
             .avg_scan_secs
             .map(fmt_secs)
@@ -273,21 +259,13 @@ pub(crate) async fn pace_view(
             .unwrap_or_else(|| "—".into()),
         arrivals_json: serde_json::to_string(&m.hourly_arrivals).unwrap_or_default(),
         completions_json: serde_json::to_string(&m.hourly_completions).unwrap_or_default(),
+        timeouts_high: m.completed_24h >= TIMEOUTS_MIN_SCANS && r.timeout_share > TIMEOUTS_HIGH,
         m,
         max_workers: pace::MAX_WORKERS,
-        max_per_hour: pace::MAX_PER_HOUR,
         timeout_min: minutes(current.timeout_secs),
-        rec_timeout_min: minutes(r.pace.timeout_secs),
-        min_timeout_min: pace::MIN_TIMEOUT / 60,
-        max_timeout_min: pace::MAX_TIMEOUT / 60,
-        level4_timeout_min: minutes(pace::level_timeout_secs(
-            current.timeout_secs,
-            4,
-            st.cfg.scan.level4_timeout_factor,
-        )),
+        level4_timeout_min: minutes(pace::level_timeout_secs(current.timeout_secs, 4)),
         level4_cap: pace::level4_cap(current.max_workers, st.cfg.scan.level4_max_share),
         timeout_share: format!("{:.0}%", r.timeout_share * 100.0),
-        timeouts_high: r.pace.timeout_secs > current.timeout_secs,
         notice,
         error,
         not_scanning: st.recorder.node().is_some() && !st.settings.roles().scanner,
@@ -297,9 +275,6 @@ pub(crate) async fn pace_view(
 #[derive(serde::Deserialize)]
 struct PaceForm {
     max_workers: String,
-    max_scans_per_hour: String,
-    /// Minutes; absent keeps the current timeout.
-    timeout_minutes: Option<String>,
 }
 
 async fn queue_pace(
@@ -307,40 +282,19 @@ async fn queue_pace(
     State(st): State<Arc<AdminState>>,
     Form(form): Form<PaceForm>,
 ) -> AppResult<Response> {
-    let parsed = form
-        .max_workers
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .zip(form.max_scans_per_hour.trim().parse::<i64>().ok())
-        .zip(match form.timeout_minutes.as_deref().map(str::trim) {
-            None | Some("") => Some(st.pace.get().timeout_secs),
-            Some(m) => m
-                .parse::<f64>()
-                .ok()
-                .filter(|m| m.is_finite() && *m > 0.0)
-                .map(|m| (m * 60.0).round() as u64),
-        })
-        .map(|((w, h), t)| Pace {
-            max_workers: w as usize,
-            max_scans_per_hour: h,
-            timeout_secs: t,
-        });
-    let outcome = match parsed {
-        Some(p) => st
+    let outcome = match form.max_workers.trim().parse::<u32>() {
+        Ok(w) => st
             .settings
             .apply(
                 &crate::settings::Changes {
-                    max_workers: Some(p.max_workers as u32),
-                    max_scans_per_hour: Some(p.max_scans_per_hour),
-                    timeout_secs: Some(p.timeout_secs),
+                    max_workers: Some(w),
                     ..Default::default()
                 },
                 None,
             )
             .await?
             .map(|_| ()),
-        None => Err("workers, scans per hour and timeout must be numbers".into()),
+        Err(_) => Err("workers must be a number".into()),
     };
     match outcome {
         Ok(()) => Ok(Redirect::to("/admin/scans?saved=1").into_response()),

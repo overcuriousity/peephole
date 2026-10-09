@@ -4,14 +4,12 @@
   {% match m.pace %}{% when Some(p) %}
   {% if m.is_self %}
   <td><input form="pace-{{ m.short }}" type="number" name="max_workers" aria-label="Workers" min="0" max="16" value="{{ p.max_workers }}" size="3" required></td>
-  <td><input form="pace-{{ m.short }}" type="number" name="max_scans_per_hour" aria-label="Scans per hour" min="0" max="3600" value="{{ p.max_scans_per_hour }}" size="5" required></td>
-  <td><input form="pace-{{ m.short }}" type="number" name="timeout_minutes" aria-label="Timeout in minutes" min="1" max="240" step="any" value="{{ m.timeout_min }}" size="4" required></td>
   <td><button form="pace-{{ m.short }}" class="btn btn-sm" type="submit">Save</button></td>
   {% else %}
-  <td>{{ p.max_workers }}</td><td>{{ p.max_scans_per_hour }}</td><td>{{ m.timeout_min }}</td>
+  <td>{{ p.max_workers }}</td>
   <td>{% if m.managed %}<a class="btn btn-sm" href="/admin/cluster/node/{{ m.key }}">Configure</a>{% endif %}</td>
   {% endif %}
-  {% when None %}<td colspan="4" class="muted">pace not reported yet</td>{% endmatch %}
+  {% when None %}<td colspan="2" class="muted">pace not reported yet</td>{% endmatch %}
   <td class="num">{{ m.can_do }}</td><td class="num">{{ m.did }}</td><td>{{ m.limited_by }}</td>
   <td>{% if m.level_weights.is_empty() %}<span class="muted">full</span>{% else %}{{ m.level_weights }}{% endif %}</td>
 </tr>

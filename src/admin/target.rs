@@ -43,6 +43,11 @@ impl Target {
         crate::admin::probes::any_waiting(&self.probes)
     }
 
+    /// The newest probe still waiting: `(answered, asked)`.
+    pub fn probe_progress(&self) -> Option<(usize, usize)> {
+        crate::admin::probes::progress(&self.probes)
+    }
+
     /// `[id, status]` of every scan job, for the live stream.
     pub fn scan_states(&self) -> String {
         let jobs = self

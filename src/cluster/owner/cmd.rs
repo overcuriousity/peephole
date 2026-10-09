@@ -293,7 +293,7 @@ async fn status_of(node: &Node, settings: &Settings) -> Result<Status> {
         .collect();
     Ok(Status {
         counter: super::counter(&node.store).await?,
-        state: remote::state(node, settings).await,
+        state: remote::state(settings),
         build: crate::VERSION.to_string(),
         blocked: crate::cluster::block::list(&node.store).await?,
         invites,

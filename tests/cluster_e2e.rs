@@ -110,7 +110,6 @@ listener = false
 web = false
 [scan]
 max_workers = 2
-max_scans_per_hour = 600
 # No Tor list and no DNS in tests.
 tor_unknown = "scan"
 verify_crawlers = false

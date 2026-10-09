@@ -1581,9 +1581,6 @@ account_id = "1"
 license_key = "k"
 [scan]
 max_workers = 2
-timeout_secs = 60
-rescan_cooldown_hours = 24
-max_scans_per_hour = 100
 # No Tor list and no DNS in tests.
 tor_unknown = "scan"
 verify_crawlers = false
@@ -2310,8 +2307,12 @@ async fn scan_pace_is_adjustable_from_the_scans_page() {
         .unwrap();
     assert_eq!(page.status(), 200);
     let html = page.text().await.unwrap();
-    assert!(html.contains("Save pace"), "pace form on queue page");
-    assert!(html.contains("Recommended:"));
+    assert!(
+        html.contains("name=\"max_workers\""),
+        "pace form on queue page"
+    );
+    assert!(!html.contains("Recommended"), "no pace recommendation");
+    assert!(!html.contains("max_scans_per_hour") && !html.contains("timeout_minutes"));
     assert!(html.contains("Arrivals / h"));
     assert!(
         html.contains("data-queue") && html.contains("History"),
@@ -2320,25 +2321,17 @@ async fn scan_pace_is_adjustable_from_the_scans_page() {
 
     let resp = client
         .post(format!("{base}/admin/queue/pace"))
-        .form(&[
-            ("max_workers", "4"),
-            ("max_scans_per_hour", "90"),
-            ("timeout_minutes", "45"),
-        ])
+        .form(&[("max_workers", "4")])
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "redirect followed back to the queue");
     let html = resp.text().await.unwrap();
     assert!(html.contains("Pace saved"));
-    assert!(html.contains("name=\"timeout_minutes\"") && html.contains("value=\"45\""));
     let p = state.pace.get();
-    assert_eq!(
-        (p.max_workers, p.max_scans_per_hour, p.timeout_secs),
-        (4, 90, 2700)
-    );
+    assert_eq!(p, peephole::scan::pace::Pace::new(4));
     // Persisted: a fresh load (as on restart) sees the admin's values.
-    let reloaded = peephole::scan::pace::SharedPace::load(&store, &state.cfg.scan)
+    let reloaded = peephole::scan::pace::SharedPace::load(&store, state.cfg.scan.max_workers)
         .await
         .unwrap()
         .get();
@@ -2346,7 +2339,7 @@ async fn scan_pace_is_adjustable_from_the_scans_page() {
 
     let bad = client
         .post(format!("{base}/admin/queue/pace"))
-        .form(&[("max_workers", "999"), ("max_scans_per_hour", "90")])
+        .form(&[("max_workers", "999")])
         .send()
         .await
         .unwrap();
@@ -2356,7 +2349,7 @@ async fn scan_pace_is_adjustable_from_the_scans_page() {
     // 2^32 must not wrap to 0 workers (paused scanning).
     let bad = client
         .post(format!("{base}/admin/queue/pace"))
-        .form(&[("max_workers", "4294967296"), ("max_scans_per_hour", "90")])
+        .form(&[("max_workers", "4294967296")])
         .send()
         .await
         .unwrap();
@@ -2364,19 +2357,7 @@ async fn scan_pace_is_adjustable_from_the_scans_page() {
     assert_eq!(state.pace.get(), p);
     let bad = client
         .post(format!("{base}/admin/queue/pace"))
-        .form(&[
-            ("max_workers", "2"),
-            ("max_scans_per_hour", "90"),
-            ("timeout_minutes", "0.5"),
-        ])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(bad.status(), 400, "timeout below the minimum");
-    assert_eq!(state.pace.get(), p);
-    let bad = client
-        .post(format!("{base}/admin/queue/pace"))
-        .form(&[("max_workers", "x"), ("max_scans_per_hour", "90")])
+        .form(&[("max_workers", "x")])
         .send()
         .await
         .unwrap();
@@ -2420,7 +2401,7 @@ async fn scan_pace_is_adjustable_from_the_scans_page() {
         .build()
         .unwrap()
         .post(format!("{base}/admin/queue/pace"))
-        .form(&[("max_workers", "1"), ("max_scans_per_hour", "1")])
+        .form(&[("max_workers", "1")])
         .send()
         .await
         .unwrap();
@@ -3438,7 +3419,7 @@ async fn scans_history_pages_link_back_to_scans() {
     let (client, base) = enrolled_admin_client(store, cfg).await;
     let bad = client
         .post(format!("{base}/admin/queue/pace"))
-        .form(&[("max_workers", "x"), ("max_scans_per_hour", "90")])
+        .form(&[("max_workers", "x")])
         .send()
         .await
         .unwrap();

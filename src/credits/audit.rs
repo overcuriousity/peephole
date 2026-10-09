@@ -10,7 +10,6 @@ use crate::cluster::identity::NodeId;
 use anyhow::Result;
 use sqlx::SqlitePool;
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::time::Instant;
 
 /// How an audit compares with the scan it checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -211,8 +210,6 @@ pub struct Picker {
     /// The newest scan row looked at; None before the first look.
     last_id: Option<i64>,
     queue: VecDeque<Task>,
-    /// When this scanner started its audits of the last hour.
-    started: VecDeque<Instant>,
 }
 
 fn chance(share: f64) -> bool {
@@ -254,7 +251,6 @@ impl Picker {
             share,
             last_id: None,
             queue: VecDeque::new(),
-            started: VecDeque::new(),
         }
     }
 
@@ -342,19 +338,6 @@ impl Picker {
             .iter()
             .position(|t| !exclude.contains(&t.level))?;
         self.queue.remove(i)
-    }
-
-    /// An audit was started: it counts against the scanner's hourly limit.
-    pub fn started(&mut self) {
-        self.started.push_back(Instant::now());
-    }
-
-    pub fn started_last_hour(&mut self) -> i64 {
-        let hour = std::time::Duration::from_secs(3600);
-        while self.started.front().is_some_and(|t| t.elapsed() >= hour) {
-            self.started.pop_front();
-        }
-        self.started.len() as i64
     }
 }
 
@@ -587,11 +570,6 @@ mod tests {
         all.poll(&store.pool, &me).await.unwrap();
         all.queue[0].deadline_ms = hlc::wall_ms() - 1;
         assert!(all.take(&[]).is_none());
-
-        assert_eq!(all.started_last_hour(), 0);
-        all.started();
-        all.started();
-        assert_eq!(all.started_last_hour(), 2);
     }
 
     /// A burst larger than one look is read over several: the mark does

@@ -7,7 +7,7 @@
 <form class="lookup-bar card" method="post" action="/admin/lookup">
   <label class="visually-hidden" for="lookup-q">IP address, host name, or a pasted list</label>
   <textarea id="lookup-q" class="mono" name="ip" rows="1" data-enter-submits placeholder="203.0.113.7, 2001:db8::1, example.com, or a pasted list" required autofocus>{% if let Some(b) = bulk %}{{ b.text }}{% else %}{{ ip }}{% endif %}</textarea>
-  <button class="btn btn-primary" type="submit">Look up</button>
+  <button class="btn btn-primary" type="submit" data-busy="Looking up…">Look up{% if offer.balance.is_some() %} · up to <span class="num">{{ offer.total }}</span> credits{% if results.len() > 1 %} each{% endif %}{% endif %}</button>
   {% if let Some(b) = offer.balance %}
   <a class="balance-chip" href="/admin/cluster/credits" title="Credits{% if offer.fleet %} of all your nodes{% endif %}"><span class="label">Balance</span><b class="num">{{ b }}</b><span class="muted">this lookup up to {{ offer.total }}{% if results.len() > 1 %} each{% endif %}</span></a>
   {% endif %}
@@ -56,9 +56,9 @@
   <div class="intel-grid">
   {% for g in r.grid %}{% if g.card.newest.is_some() %}{% let c = g.card %}
     {% match g.source %}
-    {% when crate::admin::lookup::GridSource::Fresh %}{% let badge = "Asked now" %}{% let verb = "looked up" %}{% let again = "" %}{% let again_ip = "" %}{% include "_intel_card.html" %}
-    {% when crate::admin::lookup::GridSource::Stored with { provider, age } %}{% let badge = "From the dataset" %}{% let verb = "fetched" %}{% let again = provider.as_str() %}{% let again_ip = r.ip.as_str() %}{% include "_intel_card.html" %}
-    {% when crate::admin::lookup::GridSource::Held %}{% let badge = "" %}{% let verb = "checked" %}{% let again = "" %}{% let again_ip = "" %}{% include "_intel_card.html" %}
+    {% when crate::admin::lookup::GridSource::Fresh %}{% let badge = "Asked now" %}{% let verb = "looked up" %}{% let again = "" %}{% let again_ip = "" %}{% let again_price = String::new() %}{% include "_intel_card.html" %}
+    {% when crate::admin::lookup::GridSource::Stored with { provider, age } %}{% let badge = "From the dataset" %}{% let verb = "fetched" %}{% let again = provider.as_str() %}{% let again_ip = r.ip.as_str() %}{% let again_price = offer.price_of(provider) %}{% include "_intel_card.html" %}
+    {% when crate::admin::lookup::GridSource::Held %}{% let badge = "" %}{% let verb = "checked" %}{% let again = "" %}{% let again_ip = "" %}{% let again_price = String::new() %}{% include "_intel_card.html" %}
     {% endmatch %}
   {% endif %}{% endfor %}
   </div>
@@ -82,9 +82,9 @@
   <div class="card-head"><h2>Ask for more</h2><span class="muted">paid with credits{% if let Some(b) = offer.balance %} · balance <b>{{ b }}</b>{% endif %}</span></div>
   <div class="table-wrap"><table>
     <thead><tr><th>Provider</th><th>Node</th><th class="num">Price (credits)</th><th></th></tr></thead>
-    <tbody>{% for q in offer.paid %}<tr><td>{{ q.label }}</td><td>{{ q.node }}</td><td class="num">{{ q.price }}</td><td><form method="post" action="/admin/lookup"><input type="hidden" name="ip" value="{{ r.ip }}"><input type="hidden" name="ask" value="{{ q.provider }}"><button class="btn btn-sm" type="submit">Ask</button></form></td></tr>{% endfor %}</tbody>
+    <tbody>{% for q in offer.paid %}<tr><td>{{ q.label }}</td><td>{{ q.node }}</td><td class="num">{{ q.price }}</td><td><form method="post" action="/admin/lookup"><input type="hidden" name="ip" value="{{ r.ip }}"><input type="hidden" name="ask" value="{{ q.provider }}"><button class="btn btn-sm" type="submit" data-busy="Asking…">Ask · {{ q.price }}</button></form></td></tr>{% endfor %}</tbody>
   </table></div>
-  <form method="post" action="/admin/lookup"><input type="hidden" name="ip" value="{{ r.ip }}"><input type="hidden" name="ask" value="*"><button class="btn btn-sm" type="submit">Ask all ({{ offer.paid_total }})</button></form>
+  <form method="post" action="/admin/lookup"><input type="hidden" name="ip" value="{{ r.ip }}"><input type="hidden" name="ask" value="*"><button class="btn btn-sm" type="submit" data-busy="Asking…">Ask all · {{ offer.paid_total }} credits</button></form>
   <p class="muted small">Per provider the node with the lowest price answers, your own included. An answer of the last 24 hours in the dataset is shown instead and costs nothing.</p>
 </section>
 {% endif %}

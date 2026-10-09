@@ -69,11 +69,18 @@
     if (!fm) return;
     document.cookie = f[0] + "=; Path=/; Max-Age=0; SameSite=Strict";
     var main = document.querySelector("main");
+    // Next to the action when the redirect points at a card that has a
+    // place for it (the Actions card), else at the top of the page.
+    var at = null;
+    if (location.hash.length > 1) {
+      var card = document.getElementById(location.hash.slice(1));
+      at = card && card.querySelector("[data-flash-here]");
+    }
     if (main) {
       var note = document.createElement("div");
       note.className = "banner banner-" + f[1];
       try { note.textContent = decodeURIComponent(fm[1].replace(/\+/g, " ")); } catch (e) { note.textContent = ""; }
-      if (note.textContent) main.insertBefore(note, main.firstChild);
+      if (note.textContent) { if (at) { at.appendChild(note); } else { main.insertBefore(note, main.firstChild); } }
     }
   });
   // WebAuthn ceremonies (moved out of inline scripts for CSP).
@@ -298,15 +305,52 @@
     });
   }
 
-  // Actions card: the total of the ticked probe vantages, live.
+  // Actions card: the total of the ticked probe vantages, live, on the
+  // button; with none ticked the button does nothing.
   document.querySelectorAll("[data-probe-form]").forEach(function (f) {
     var out = f.querySelector("[data-probe-total]");
     if (!out) return;
+    var go = out.closest("button");
     f.addEventListener("change", function () {
-      var mc = 0;
-      f.querySelectorAll("input[data-mc]:checked").forEach(function (c) { mc += parseInt(c.getAttribute("data-mc"), 10) || 0; });
+      var mc = 0, n = 0;
+      f.querySelectorAll("input[data-mc]:checked").forEach(function (c) { mc += parseInt(c.getAttribute("data-mc"), 10) || 0; n++; });
       var cents = Math.floor((mc + 5) / 10);
       out.textContent = Math.floor(cents / 100) + "." + String(cents % 100).padStart(2, "0");
+      if (go) { go.disabled = n === 0; go.title = n === 0 ? "Pick at least one scanner" : ""; }
+    });
+  });
+
+  // A button that starts something (`data-busy="Asking…"`) says so at
+  // once: it spins and every submit button of its form is disabled, so a
+  // second click cannot send the request again. Disabled after the submit
+  // event, when the form's values (the button's own included) are taken.
+  document.addEventListener("submit", function (e) {
+    if (e.defaultPrevented) return;
+    var f = e.target, b = e.submitter || f.querySelector("[data-busy]");
+    if (!b || !b.hasAttribute("data-busy")) return;
+    setTimeout(function () {
+      f.querySelectorAll("button[type=submit], button:not([type])").forEach(function (x) {
+        x.setAttribute("data-was", x.innerHTML);
+        x.disabled = true;
+      });
+      b.setAttribute("aria-busy", "true");
+      var spin = document.createElement("span");
+      spin.className = "spin"; spin.setAttribute("aria-hidden", "true");
+      var label = document.createElement("span");
+      label.textContent = b.getAttribute("data-busy");
+      // A two-line button (the scan levels) keeps its first line.
+      var keep = b.querySelector("b");
+      b.textContent = "";
+      if (keep) { b.appendChild(keep); var line = document.createElement("span"); line.appendChild(spin); line.appendChild(label); b.appendChild(line); } else { b.appendChild(spin); b.appendChild(label); }
+    }, 0);
+  });
+  // Back to a page from the history cache: the buttons as they were.
+  window.addEventListener("pageshow", function (e) {
+    if (!e.persisted) return;
+    document.querySelectorAll("button[data-was]").forEach(function (x) {
+      x.innerHTML = x.getAttribute("data-was");
+      x.removeAttribute("data-was"); x.removeAttribute("aria-busy");
+      x.disabled = false;
     });
   });
 

@@ -484,7 +484,6 @@ impl Source {
                 debug!(target = %ip, level = t.level, "audit not run: the requests held here do not back it");
                 continue;
             }
-            picker.started();
             self.active.lock().unwrap().insert(key, t.level);
             return Ok(Some(Job::Audit {
                 of: t.scan_uid,
@@ -1299,7 +1298,6 @@ pub async fn run_workers(
     // Level-4 scans running now (see `L4Slot`).
     let running_l4 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut joinset = tokio::task::JoinSet::new();
-    let mut last_start: Option<tokio::time::Instant> = None;
     loop {
         if *shutdown.borrow() {
             break;
@@ -1312,32 +1310,14 @@ pub async fn run_workers(
             *node.status.local.lock().unwrap() = crate::cluster::status::LocalStatus {
                 pace: Some(crate::cluster::status::PaceInfo {
                     max_workers: p.max_workers as u32,
-                    max_scans_per_hour: p.max_scans_per_hour,
+                    // Read by nodes of earlier versions only.
+                    max_scans_per_hour: pace::ANNOUNCED_PER_HOUR,
                     timeout_secs: p.timeout_secs,
                 }),
                 active_scans: joinset.len() as u32,
             };
         }
         while joinset.len() < p.max_workers {
-            // Cadence: space starts evenly instead of bursting up to the cap.
-            let Some(interval) = p.interval() else { break };
-            if last_start.is_some_and(|t| t.elapsed() < interval) {
-                break;
-            }
-            // Rate cap (spec §5), also across restarts; per scanner.
-            match rec.jobs_started_last_hour().await {
-                Ok(n)
-                    if n + source.audits.lock().await.started_last_hour()
-                        >= p.max_scans_per_hour =>
-                {
-                    break;
-                }
-                Err(e) => {
-                    warn!(?e, "rate cap check failed");
-                    break;
-                }
-                _ => {}
-            }
             let cap = pace::level4_cap(p.max_workers, cfg.scan.level4_max_share);
             let exclude: Vec<u8> = if running_l4.load(std::sync::atomic::Ordering::SeqCst) >= cap {
                 vec![4]
@@ -1366,12 +1346,7 @@ pub async fn run_workers(
             if let Some(j) = source.queue_row(&job).await {
                 notifier.publish(j);
             }
-            last_start = Some(tokio::time::Instant::now());
-            let limit = pace::level_timeout_secs(
-                p.timeout_secs,
-                job.level(),
-                cfg.scan.level4_timeout_factor,
-            );
+            let limit = pace::level_timeout_secs(p.timeout_secs, job.level());
             let argv = match &job {
                 Job::Audit { .. } => audit_argv(job.level(), &job.ip(), &cfg, limit),
                 _ => nmap_argv(job.level(), &job.ip(), &cfg, limit),
@@ -1733,7 +1708,6 @@ license_key = "k"
         let (tx, rx) = tokio::sync::watch::channel(false);
         let p = pace::SharedPace::new(pace::Pace {
             max_workers: cfg.scan.max_workers,
-            max_scans_per_hour: 3600,
             timeout_secs: 60,
         });
         let pool = tokio::spawn(run_workers(
@@ -1778,7 +1752,6 @@ license_key = "k"
         store.enqueue_scan(ip.id, 1, 24).await.unwrap();
         let p = pace::SharedPace::new(pace::Pace {
             max_workers: 1,
-            max_scans_per_hour: 3600,
             timeout_secs: 1,
         });
         let (tx, rx) = tokio::sync::watch::channel(false);
@@ -2577,7 +2550,6 @@ license_key = "k"
         let (tx, rx) = tokio::sync::watch::channel(false);
         let p = pace::SharedPace::new(pace::Pace {
             max_workers: 2,
-            max_scans_per_hour: 3600,
             timeout_secs: 60,
         });
         let pool = tokio::spawn(run_workers(

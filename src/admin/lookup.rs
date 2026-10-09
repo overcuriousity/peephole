@@ -114,6 +114,22 @@ impl Offer {
     }
 }
 
+impl Offer {
+    /// What asking `provider` costs: "free", "0.10 credits", or "" when no
+    /// quote is known (standalone).
+    pub fn price_of(&self, provider: &str) -> String {
+        self.quotes
+            .iter()
+            .chain(&self.paid)
+            .find(|q| q.provider == provider)
+            .map(|q| match q.price.as_str() {
+                "free" => "free".to_string(),
+                p => format!("{p} credits"),
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// The offer box is information only: when the balance cannot be read, it
 /// is left out and the page (and an answer already paid for) still shows.
 async fn offer(state: &AdminState) -> Offer {
@@ -899,6 +915,10 @@ secure_cookies = false
         assert_eq!(offer.paid[0].provider, crate::intel::ABUSEIPDB);
         assert_eq!(offer.paid[0].price, "0.10");
         assert_eq!(offer.paid_total, "0.10");
+        // What an "Ask again" button shows.
+        assert_eq!(offer.price_of(crate::intel::ABUSEIPDB), "0.10 credits");
+        assert_eq!(offer.price_of(crate::intel::TOR), "free");
+        assert_eq!(offer.price_of("nope"), "");
         let f = IpForm::parse(b"ip=203.0.113.9&ask=abuseipdb&ask=shodan");
         assert_eq!(f.asked(), ["abuseipdb", "shodan"]);
         // Every known provider, those this node answers itself included

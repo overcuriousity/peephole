@@ -363,7 +363,6 @@ impl TrapState {
         let classifier = Classifier::builtin();
         let pace =
             crate::scan::pace::SharedPace::new(crate::scan::pace::Pace::from_config(&cfg.scan));
-        pace.set_cooldown_hours(cfg.scan.rescan_cooldown_hours);
         Self {
             pace,
             recorder: store.local(),

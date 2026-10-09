@@ -1401,11 +1401,7 @@ CONFIG
         cat <<CONFIG
 
 [scan]
-max_workers = 2            # concurrent nmap subprocesses
-timeout_secs = 1800        # per-scan wall-clock timeout (adjustable in the admin queue page)
-level4_timeout_factor = 4  # level 4 (all ports, -sV -O, scripts) gets this many times timeout_secs, at most 12 h
-rescan_cooldown_hours = 24 # per-IP rescan cooldown (one level upgrade allowed)
-max_scans_per_hour = 30    # rate cap of this scanner; excess jobs stay queued
+max_workers = 2            # concurrent nmap subprocesses (also on the admin Scans page)
 # Non-global addresses (loopback, private, link-local, …) are never scanned,
 # so list public ranges only: your own servers, monitoring, upstream, e.g.
 # never_scan = ["203.0.113.0/24", "2001:db8::/32"]
@@ -1573,6 +1569,10 @@ if [ "$upgrade" -eq 1 ]; then
             warn "rules_dir in ${CONFIG_FILE} is ignored; remove that line"
         fi
         rm -f "$OLD_RULES_MANIFEST"
+    fi
+    # Pacing keys earlier installs wrote; only scan.max_workers paces now.
+    if grep -Eq '^(timeout_secs|level4_timeout_factor|rescan_cooldown_hours|max_scans_per_hour) *=' "$CONFIG_FILE" 2>/dev/null; then
+        warn "timeout_secs, level4_timeout_factor, rescan_cooldown_hours and max_scans_per_hour in ${CONFIG_FILE} are ignored now (fixed: 30 min scan timeout, 2 h at level 4, 24 h rescan cooldown, no hourly cap); remove those lines"
     fi
     exit 0
 fi

@@ -7,6 +7,23 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Changed
 
+- The Actions card is laid out anew: probe vantages as chips, the four
+  scan levels side by side. Every button shows its cost ("Probe · 0.04
+  credits", "L4 · from 0.06 credits", "Look up · up to 0.12 credits", "Ask
+  again · 0.10 credits") or why it does nothing now: a probe on its way
+  says how many vantages answered, a level with a job says queued or
+  running, a level with a result less than a day old links to it. A
+  clicked button spins and cannot be sent twice, and the notice after a
+  probe or a scan shows on the card.
+- Only the number of scan workers paces scanning; it stays configurable
+  (`scan.max_workers`, the Scans page). The hourly start cap is gone, a
+  scan times out after 30 minutes (level 4 after 2 hours), and the rescan
+  cooldown is 24 hours. `scan.timeout_secs`, `scan.level4_timeout_factor`,
+  `scan.rescan_cooldown_hours` and `scan.max_scans_per_hour` are ignored
+  (`check-config` says so), as are runtime overrides of them saved
+  earlier. The pace recommendation is gone. Nodes of earlier versions in
+  the same cluster are told the fixed values.
+
 - Probes are no longer capped at 16 ports, need neither level-2 evidence
   nor a finished counter-scan (without one they read the well-known ports
   22, 80, 443, 8080 and 8443), and the same address can be probed again

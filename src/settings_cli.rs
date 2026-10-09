@@ -34,47 +34,26 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
         Some("show") => {
             let (cfg, s) = open(config(1)).await?;
             let now = s.snapshot();
-            let toml = Settings::with_pace(
-                Store::connect(&cfg.database_path).await?,
-                &cfg,
-                crate::scan::pace::SharedPace::new(crate::scan::pace::Pace::from_config(&cfg.scan)),
-            );
-            let base = toml.snapshot();
             let src = |changed: bool| if changed { "override" } else { "config file" };
             println!("version {}", now.version);
             for (key, value, changed) in [
                 (
                     KEYS[0],
                     now.pace.max_workers.to_string(),
-                    now.pace.max_workers != base.pace.max_workers,
+                    now.pace.max_workers != cfg.scan.max_workers,
                 ),
                 (
                     KEYS[1],
-                    now.pace.max_scans_per_hour.to_string(),
-                    now.pace.max_scans_per_hour != base.pace.max_scans_per_hour,
-                ),
-                (
-                    KEYS[2],
-                    now.pace.timeout_secs.to_string(),
-                    now.pace.timeout_secs != base.pace.timeout_secs,
-                ),
-                (
-                    KEYS[3],
-                    now.cooldown_hours.to_string(),
-                    now.cooldown_hours != cfg.scan.rescan_cooldown_hours,
-                ),
-                (
-                    KEYS[4],
                     now.roles.listener.to_string(),
                     now.roles.listener != cfg.roles.listener,
                 ),
                 (
-                    KEYS[5],
+                    KEYS[2],
                     now.roles.scanner.to_string(),
                     now.roles.scanner != cfg.roles.scanner,
                 ),
                 (
-                    KEYS[6],
+                    KEYS[3],
                     now.roles.web.to_string(),
                     now.roles.web != cfg.roles.web,
                 ),

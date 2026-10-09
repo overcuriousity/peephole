@@ -375,12 +375,17 @@ impl Default for ProbeConfig {
 pub struct ScanConfig {
     #[serde(default = "default_workers")]
     pub max_workers: usize,
-    #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,
-    /// Level 4 (every port, -sV -O, scripts) runs this many times
-    /// `timeout_secs`, capped at 12 h.
-    #[serde(default = "default_level4_timeout_factor")]
-    pub level4_timeout_factor: u32,
+    /// Obsolete and ignored: the scan timeout, the level-4 factor, the
+    /// rescan cooldown and the hourly start cap are fixed now (see
+    /// `scan::pace`). Read only to say so ([`Config::obsolete_notes`]).
+    #[serde(default)]
+    pub timeout_secs: Option<toml::Value>,
+    #[serde(default)]
+    pub level4_timeout_factor: Option<toml::Value>,
+    #[serde(default)]
+    pub rescan_cooldown_hours: Option<toml::Value>,
+    #[serde(default)]
+    pub max_scans_per_hour: Option<toml::Value>,
     /// Share of `max_workers` that may run level-4 scans at once (rounded
     /// down, at least one), so shorter levels never wait behind them.
     #[serde(default = "default_level4_share")]
@@ -393,10 +398,6 @@ pub struct ScanConfig {
     /// Level 4 also scans the top 50 UDP ports.
     #[serde(default)]
     pub level4_udp: bool,
-    #[serde(default = "default_cooldown")]
-    pub rescan_cooldown_hours: i64,
-    #[serde(default = "default_rate")]
-    pub max_scans_per_hour: i64,
     #[serde(default)]
     pub never_scan: Vec<IpNet>,
     /// More addresses of this node, never scanned and never in the
@@ -541,9 +542,6 @@ fn default_nmap_path() -> String {
 fn default_workers() -> usize {
     2
 }
-fn default_level4_timeout_factor() -> u32 {
-    2
-}
 fn default_level4_share() -> f64 {
     0.5
 }
@@ -551,28 +549,17 @@ fn default_min_rate() -> u32 {
     300
 }
 
-fn default_timeout() -> u64 {
-    // Base limit; level 4 gets level4_timeout_factor times this.
-    1800
-}
-fn default_cooldown() -> i64 {
-    24
-}
-fn default_rate() -> i64 {
-    30
-}
-
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             max_workers: default_workers(),
-            timeout_secs: default_timeout(),
-            level4_timeout_factor: default_level4_timeout_factor(),
+            timeout_secs: None,
+            level4_timeout_factor: None,
+            rescan_cooldown_hours: None,
+            max_scans_per_hour: None,
             level4_max_share: default_level4_share(),
             min_rate: default_min_rate(),
             level4_udp: false,
-            rescan_cooldown_hours: default_cooldown(),
-            max_scans_per_hour: default_rate(),
             never_scan: vec![],
             own_addresses: vec![],
             level_argv: Default::default(),
@@ -592,13 +579,9 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("", "retention_days", "0"),
     ("webauthn", "secure_cookies", "true"),
     ("scan", "max_workers", "2"),
-    ("scan", "timeout_secs", "1800"),
-    ("scan", "level4_timeout_factor", "2"),
     ("scan", "level4_max_share", "0.5"),
     ("scan", "min_rate", "300"),
     ("scan", "level4_udp", "false"),
-    ("scan", "rescan_cooldown_hours", "24"),
-    ("scan", "max_scans_per_hour", "30"),
     ("scan", "never_scan", "[]"),
     ("scan", "single_request_max_level", "2"),
     ("scan", "prefix_max_scans", "4"),
@@ -649,6 +632,28 @@ impl Config {
                  ownership key (peephole owner new, peephole owner claim); remove the key"
                     .into(),
             );
+        }
+        let s = &self.scan;
+        let fixed: Vec<String> = [
+            ("timeout_secs", s.timeout_secs.is_some()),
+            ("level4_timeout_factor", s.level4_timeout_factor.is_some()),
+            ("rescan_cooldown_hours", s.rescan_cooldown_hours.is_some()),
+            ("max_scans_per_hour", s.max_scans_per_hour.is_some()),
+        ]
+        .into_iter()
+        .filter(|(_, set)| *set)
+        .map(|(key, _)| format!("`scan.{key}`"))
+        .collect();
+        if !fixed.is_empty() {
+            let (keys, plural) = match fixed.len() {
+                1 => (format!("{} is", fixed[0]), ""),
+                _ => (format!("{} are", fixed.join(", ")), "s"),
+            };
+            notes.push(format!(
+                "note: {keys} ignored: scans time out after 30 min (level 4 after 2 h), an \
+                 address is rescanned at the same level after 24 h at the earliest, and only \
+                 scan.max_workers paces scanning; remove the key{plural}"
+            ));
         }
         notes
     }
@@ -807,38 +812,11 @@ impl Config {
                 crate::scan::pace::MAX_WORKERS
             );
         }
-        if !(crate::scan::pace::MIN_TIMEOUT..=crate::scan::pace::MAX_TIMEOUT)
-            .contains(&s.timeout_secs)
-        {
-            bail!(
-                "scan.timeout_secs must be between {} and {}",
-                crate::scan::pace::MIN_TIMEOUT,
-                crate::scan::pace::MAX_TIMEOUT
-            );
-        }
-        if !(1..=crate::scan::pace::MAX_LEVEL4_FACTOR).contains(&s.level4_timeout_factor) {
-            bail!(
-                "scan.level4_timeout_factor must be between 1 and {}",
-                crate::scan::pace::MAX_LEVEL4_FACTOR
-            );
-        }
         if !(s.level4_max_share > 0.0 && s.level4_max_share <= 1.0) {
             bail!("scan.level4_max_share must be above 0 and at most 1");
         }
         if !(MIN_RATE..=MAX_RATE).contains(&s.min_rate) {
             bail!("scan.min_rate must be between {MIN_RATE} and {MAX_RATE}");
-        }
-        if !(0..=crate::settings::MAX_COOLDOWN_HOURS).contains(&s.rescan_cooldown_hours) {
-            bail!(
-                "scan.rescan_cooldown_hours must be between 0 and {}",
-                crate::settings::MAX_COOLDOWN_HOURS
-            );
-        }
-        if !(1..=crate::scan::pace::MAX_PER_HOUR).contains(&s.max_scans_per_hour) {
-            bail!(
-                "scan.max_scans_per_hour must be between 1 and {}",
-                crate::scan::pace::MAX_PER_HOUR
-            );
         }
         for (level, argv) in &s.level_argv {
             if !(1..=4).contains(level) {
@@ -1209,7 +1187,6 @@ data_dir = "/tmp"
         assert_eq!(s.level4_max_share, 0.5);
         assert_eq!(s.min_rate, 300);
         assert!(!s.level4_udp);
-        assert_eq!(s.level4_timeout_factor, 2);
     }
 
     #[test]
@@ -1268,6 +1245,37 @@ data_dir = "/tmp"
         assert!(
             notes[0].contains("rules_dir") && notes[0].contains("built into the binary"),
             "{notes:?}"
+        );
+    }
+
+    /// The pacing keys that are fixed now still load and are reported as
+    /// ignored in one note, whatever their value.
+    #[test]
+    fn fixed_pacing_keys_are_reported_as_ignored() {
+        let cfg = parse(&format!(
+            "{BASE}[roles]\nlistener = false\nweb = false\n[scan]\ntimeout_secs = 900\n\
+             level4_timeout_factor = 4\nrescan_cooldown_hours = -1\nmax_scans_per_hour = 30\n"
+        ))
+        .unwrap();
+        let notes = cfg.obsolete_notes();
+        assert_eq!(
+            notes,
+            ["note: `scan.timeout_secs`, `scan.level4_timeout_factor`, \
+              `scan.rescan_cooldown_hours`, `scan.max_scans_per_hour` are ignored: scans time \
+              out after 30 min (level 4 after 2 h), an address is rescanned at the same level \
+              after 24 h at the earliest, and only scan.max_workers paces scanning; remove the \
+              keys"]
+        );
+        let one = parse(&format!(
+            "{BASE}[roles]\nlistener = false\nweb = false\n[scan]\nmax_scans_per_hour = 30\n"
+        ))
+        .unwrap()
+        .obsolete_notes();
+        assert!(
+            one.len() == 1
+                && one[0].starts_with("note: `scan.max_scans_per_hour` is ignored")
+                && one[0].ends_with("remove the key"),
+            "{one:?}"
         );
     }
 
@@ -1484,8 +1492,6 @@ data_dir = "/tmp"
             "trusted_origins = [\"nope\"]",
             "never_scan_dir = \"/nonexistent/never_scan.d\"",
             "level_argv = { 2 = [] }",
-            "rescan_cooldown_hours = -1",
-            "rescan_cooldown_hours = 8761",
         ] {
             let e = parse(&format!(
                 "{BASE}[roles]\nlistener = false\nweb = false\n[scan]\n{bad}\n"

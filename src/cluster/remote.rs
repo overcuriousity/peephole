@@ -26,43 +26,33 @@ pub struct State {
     pub open: bool,
     pub version: u64,
     pub pace: PaceInfo,
+    /// Always [`crate::scan::pace::COOLDOWN_HOURS`]: kept so nodes of
+    /// earlier versions decode the answer.
     pub cooldown_hours: i64,
     pub roles: Vec<String>,
-    /// What the node's own queue metrics suggest (scanners only).
+    /// Always None: pace recommendations are gone. Kept so nodes of earlier
+    /// versions decode the answer.
     pub recommended: Option<PaceInfo>,
 }
 
 pub fn pace_info(p: crate::scan::pace::Pace) -> PaceInfo {
     PaceInfo {
         max_workers: p.max_workers as u32,
-        max_scans_per_hour: p.max_scans_per_hour,
+        max_scans_per_hour: crate::scan::pace::ANNOUNCED_PER_HOUR,
         timeout_secs: p.timeout_secs,
     }
 }
 
 /// This node's settings, as it reports them.
-pub async fn state(node: &Node, settings: &Settings) -> State {
+pub fn state(settings: &Settings) -> State {
     let s = settings.snapshot();
-    let recommended = match (s.roles.scanner, node.store.queue_metrics().await) {
-        (true, Ok(m)) => {
-            let others = crate::scan::pace::others(
-                node,
-                m.avg_scan_secs
-                    .unwrap_or(crate::scan::pace::DEFAULT_SCAN_SECS),
-            );
-            Some(pace_info(
-                crate::scan::pace::recommend(&m, s.pace, others).pace,
-            ))
-        }
-        _ => None,
-    };
     State {
         open: false,
         version: s.version,
         pace: pace_info(s.pace),
-        cooldown_hours: s.cooldown_hours,
+        cooldown_hours: crate::scan::pace::COOLDOWN_HOURS,
         roles: s.roles.names().into_iter().map(str::to_string).collect(),
-        recommended,
+        recommended: None,
     }
 }
 
@@ -72,9 +62,10 @@ pub fn serve(node: &Arc<Node>, settings: Settings) {
     node.on_message(Arc::new(move |_from, msg| {
         let (settings, weak) = (settings.clone(), weak.clone());
         Box::pin(async move {
-            let node = weak.upgrade()?;
+            // Only while the node runs.
+            weak.upgrade()?;
             match msg {
-                Msg::ConfigGet => Some(Msg::ConfigState(state(&node, &settings).await)),
+                Msg::ConfigGet => Some(Msg::ConfigState(state(&settings))),
                 Msg::ConfigSet { .. } => Some(Msg::ConfigSetReply {
                     version: None,
                     error: Some(CONFIG_KEY_GONE.into()),

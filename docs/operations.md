@@ -277,7 +277,7 @@ journalctl -u peephole -f                         # logs (incl. FIDO2 enrollment
 peephole --version                                # installed build and its commit
 peephole --help                                   # commands and arguments
 peephole check-config /etc/peephole/config.toml   # validate config and nmap; show the built-in rules
-peephole settings show|set|reset                  # runtime settings (pace, cooldown, roles)
+peephole settings show|set|reset                  # runtime settings (scan workers, roles)
 peephole admin reset-token                        # new one-time admin setup token
 peephole admin password [--stdin]                 # set or change the admin password
 peephole admin login-method passkey|password|both # how the admin signs in
@@ -286,9 +286,11 @@ peephole db vacuum                                # shrink the database file (st
 ```
 
 Configuration lives in `/etc/peephole/config.toml`; restart after editing
-(`systemctl restart peephole`). Scan pace, rescan cooldown and roles are
-runtime settings, changed from **Admin → Cluster** or `peephole settings`
-without a restart.
+(`systemctl restart peephole`). The number of scan workers and the roles
+are runtime settings, changed from **Admin → Scans** and **Admin → System**
+or `peephole settings` without a restart. The rest of the scan pace is
+fixed: a scan times out after 30 minutes (level 4 after 2 hours), and an
+address is scanned again at the same level after 24 hours at the earliest.
 
 **Probes.** `[probe] enabled` (default `true`) lets this node's scanner run
 observational probes that admins request; `max_parallel` (default `2`)
