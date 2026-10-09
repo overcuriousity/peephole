@@ -78,9 +78,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          command: check ${{ matrix.checks }}
+      # The pinned release binary, checksum-verified. Not the Docker action:
+      # Docker Hub rate-limits unauthenticated pulls and blocked releases.
+      - name: Install cargo-deny
+        run: |
+          v=0.20.2
+          a="cargo-deny-$v-x86_64-unknown-linux-musl"
+          curl -fsSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/$v/$a.tar.gz" -o deny.tgz
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  deny.tgz" | sha256sum -c -
+          tar -xzf deny.tgz "$a/cargo-deny"
+          mv "$a/cargo-deny" cargo-deny
+      - name: cargo deny check
+        run: ./cargo-deny check ${{ matrix.checks }}
 
   msrv:
     name: MSRV (rust-version in Cargo.toml)
@@ -155,9 +164,9 @@ jobs:
           retention-days: 14
 
   installer:
-    name: install.sh smoke (ubuntu:24.04 container)
+    name: install.sh smoke (ubuntu-24.04)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -169,12 +178,10 @@ jobs:
           path: dist
       - name: Unpack the release binary
         run: tar -xzf dist/peephole-x86_64-unknown-linux-gnu.tar.gz -C dist
-      # The container's glibc must be >= the build host's (22.04); 24.04 is.
-      - name: run installer smoke test in ubuntu:24.04
-        run: >-
-          docker run --rm -v "$PWD":/src -w /src
-          -e PEEPHOLE_BIN=dist/peephole-x86_64-unknown-linux-gnu/peephole
-          ubuntu:24.04 bash tests/install-smoke.sh
+      # No container: Docker Hub rate-limits unauthenticated pulls and blocked
+      # releases. The runner's glibc (24.04) is >= the build host's (22.04).
+      - name: run installer smoke test
+        run: sudo PEEPHOLE_BIN=dist/peephole-x86_64-unknown-linux-gnu/peephole bash tests/install-smoke.sh
 
   publish-latest:
     name: publish the rolling "latest" prerelease

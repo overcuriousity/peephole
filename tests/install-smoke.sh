@@ -6,7 +6,7 @@
 # here, a proxy elsewhere) with the port check, the checks of the trusted
 # proxies and the admin domain, the admin password, the nginx checks and the
 # cluster section every node gets (name, required advertise address).
-# Runs as root in a throwaway Debian/Ubuntu container (CI: ubuntu:24.04).
+# Runs as root on a throwaway Debian/Ubuntu host (CI: an ubuntu-24.04 runner).
 # PEEPHOLE_BIN is the release binary (default target/release/peephole).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -99,9 +99,12 @@ for a in bogus host:0 host:70000 host: :7443 '2001:db8::1:7443' 'two words:7443'
 done
 
 echo "== refuses to install when systemd is not PID 1 (unless overridden)"
-if PEEPHOLE_ALLOW_NO_SYSTEMD='' bash install.sh >/tmp/nopid1.log 2>&1; then echo "expected failure"; exit 1; fi
-grep -q "PID 1" /tmp/nopid1.log
-export PEEPHOLE_ALLOW_NO_SYSTEMD=1
+# Only checkable where systemd is not PID 1 (a container); on a real runner it is.
+if [ "$(cat /proc/1/comm)" != systemd ]; then
+    if PEEPHOLE_ALLOW_NO_SYSTEMD='' bash install.sh >/tmp/nopid1.log 2>&1; then echo "expected failure"; exit 1; fi
+    grep -q "PID 1" /tmp/nopid1.log
+    export PEEPHOLE_ALLOW_NO_SYSTEMD=1
+fi
 
 echo "== a version that is not a release tag is refused"
 if PEEPHOLE_VERSION=../evil bash install.sh >/tmp/badver.log 2>&1; then echo "expected failure"; exit 1; fi
