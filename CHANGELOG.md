@@ -5,7 +5,28 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Breaking
+
+- Protocol 7: a new economy of credits. The daily mint, the allowance and
+  the judging of scans are gone; 1000 credits a day are split among the
+  members anyone can reach (advertised listeners up 12 of 24 hours, by
+  hourly reach reports). Balances start at zero: payments of earlier
+  versions are kept but no longer counted. Upgrade every member in one
+  sitting; a member below protocol 7 is neither paid nor charged.
+- `peephole credits why` is gone; `peephole credits uptime` lists each
+  member's reported hours.
+
 ### Changed
+
+- Prices follow sales and have no floor: a good nobody buys becomes free,
+  and a good priced at zero is served without an offer.
+- Every scan job is funded; there is no idle work. A job no claimant can
+  be paid for waits.
+- Domains and reverse names are quorum goods: `min(9, ⌊n/2⌋+1)` of the
+  cheapest nodes are asked. The reverse names of a source are bought by
+  the node that recorded it and replicated with their agreement.
+- Scanners buy audits of their designated scans (1 in 20, drawn from the
+  log) from ranked auditors, and are not funded while they owe them.
 
 - The Actions card is laid out anew: probe vantages as chips, the four
   scan levels side by side. Every button shows its cost ("Probe · 0.04
@@ -32,7 +53,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   the job's level: its price divided by its success rate there. A failed
   scan is not paid, so a cheap scanner that fails a level often no longer
   wins it. A paid job waits up to 30 minutes for a cheaper live scanner,
-  then goes to whoever asks. Unpaid jobs keep the sit-out rule.
+  then goes to whoever asks.
 - Scanner success rates (level weights) are measured once an hour, five
   minutes after the hour, over the 24 hours before it.
 - Prices are refreshed every 10 minutes instead of every hour, in steps
@@ -43,7 +64,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   the Scans history shows the same as a title on the scanner's name.
 - Levels 3 and 4 no longer run nmap's `http-comments-displayer`: it
   copied every HTML comment it found, binary files included, and was most
-  of some scans' XML. Scans run with the previous list still earn.
+  of some scans' XML. Scans run with the previous list are still accepted.
 - During a rolling upgrade, a scan scrubbed by a current scanner relays
   only through current members: an older member rebuilds the record
   without the count, and the signature no longer matches. The gap heals
@@ -51,6 +72,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Added
 
+- Outbound-only members lease relays from reachable members (`[cluster]
+  relay_slots` on the relay side) to be asked for paid goods.
 - The Actions card sells a counter-scan of level 1–4: level 1 at the
   cluster's cheapest scanner offer, four times that per level above. The
   job runs through the normal queue and appears live on the IP page; a
@@ -80,7 +103,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - ETags of scanned sources. Level 2 also runs nmap's `http-headers`; each
   HTTP port's `ETag` is a new soft link kind (`http-etag`, "same file",
   never "same operator"), and nginx's form is dated. Stored scans are read
-  again once at startup. The previous level-2 list still earns.
+  again once at startup. The previous level-2 list is still accepted.
 - ETags as a return marker. Decoy version 3 answers the web decoys that
   return 200 with an ETag derived from the request, a canary of kind
   `etag`: a client that sends it back in `If-None-Match`, from any

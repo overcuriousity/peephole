@@ -110,11 +110,12 @@ refresh_after_days = 30
 
 # [credits]
 # # Cluster only. A scanner runs this share of the other nodes' fresh scans
-# # again to check them (audits earn nothing; 0 = audit nothing).
+# # again to check them, unpaid (0 = check nothing). Bought audits of
+# # designated scans do not depend on it.
 # audit_share = 0.05
 # # Cluster only. The share of this node's credits its own scan jobs may hold
 # # or pay for in a day: a funded job pays its scanner on delivery
-# # (0 = grant every job unfunded).
+# # (0 = fund only scanners priced at zero).
 # scan_share = 0.5
 
 # [abuseipdb]
@@ -225,6 +226,7 @@ tor_wait_hours = 6
 #                                   # nobody can reach: delete it and set listen to 127.0.0.1:7443
 # takeover_hours = 6                # adopt an unreachable node's queued jobs after
 # lease_secs     = 120              # scan lease, renewed while nmap runs
+# relay_slots = 16                  # relay leases sold at a time to outbound-only members (advertised nodes only)
 # origin_quota_mb = 20480           # stop storing a member's entries beyond this (0 = no limit)
 #
 # [[cluster.peers]]

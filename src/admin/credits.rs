@@ -92,6 +92,10 @@ struct MemberRow {
     pool: String,
     /// What it charged others over the last 7 days.
     sales: String,
+    /// Hours up today, as reported.
+    up: String,
+    /// An advertised listener up `MIN_UP_HOURS` today.
+    qualifies: bool,
 }
 
 struct PriceView {
@@ -110,6 +114,12 @@ struct PriceView {
     probe: Option<String>,
     /// What resolving a name for another member costs here.
     resolve: String,
+    /// What reverse names cost here.
+    rdns: String,
+    /// What a relay lease costs here; None: not advertised.
+    relay: Option<String>,
+    /// The percent of other nodes' fresh scans checked unpaid.
+    audit_share: String,
     /// `(provider label, price, paid lookups it serves a day)`.
     offers: Vec<(String, String, String)>,
 }
@@ -403,6 +413,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         .filter(|m| m.active)
         .map(|m| {
             let t = l.week_tally(&m.id);
+            let up = book.up_hours(&m.id, today);
             MemberRow {
                 key: m.id.to_string(),
                 name: name(&m.id),
@@ -412,6 +423,10 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
                 standing: book.standing(&m.id).reasons().join("; "),
                 pool: show(sum_week(&book.pool, &m.id)),
                 sales: show(t.served),
+                up: up.to_string(),
+                qualifies: m.address.is_some()
+                    && m.roles.iter().any(|r| r == "listener")
+                    && up >= credits::reach::MIN_UP_HOURS,
             }
         })
         .collect();
@@ -484,6 +499,9 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         utilization: format!("{:.0}", t.capacity.utilization * 100.0),
         probe: t.probe_mc.map(|m| show(m as u64)),
         resolve: show(t.resolve_mc as u64),
+        rdns: show(t.rdns_mc as u64),
+        relay: crate::cluster::relay::price(node).map(|m| show(m as u64)),
+        audit_share: format!("{:.0}", st.cfg.credits.audit_share * 100.0),
         offers: t
             .offers
             .iter()
@@ -746,6 +764,8 @@ mod tests {
                 standing: String::new(),
                 pool: "250.00".into(),
                 sales: "1.20".into(),
+                up: "14".into(),
+                qualifies: true,
             }],
             totals: ("255.00".into(), "812.00".into()),
             price: PriceView {
@@ -784,6 +804,9 @@ mod tests {
                 utilization: "12".into(),
                 probe: None,
                 resolve: "0.01".into(),
+                rdns: "0.00".into(),
+                relay: Some("0.01".into()),
+                audit_share: "5".into(),
                 offers: vec![("MaxMind GeoLite2".into(), "0.02".into(), "1000".into())],
             },
             receivers: vec![],
@@ -810,6 +833,11 @@ mod tests {
             "12 hours earn today's pool share",
             "1000 credits are split evenly",
             "12 of the day's 24 hours",
+            "14 h",
+            "qualifies",
+            "Reverse names cost <b>0.00</b>",
+            "A relay lease (an hour) costs <b>0.01</b>",
+            "checks 5 % of other nodes' fresh scans unpaid",
         ] {
             assert!(html.contains(want), "{want} missing");
         }
@@ -823,5 +851,10 @@ mod tests {
         let mut page = page;
         page.price.scan = "–".into();
         assert!(page.render().unwrap().contains("not a scanner"));
+        page.members[0].qualifies = false;
+        page.price.relay = None;
+        let html = page.render().unwrap();
+        assert!(html.contains("does not qualify"));
+        assert!(!html.contains("A relay lease"));
     }
 }

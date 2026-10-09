@@ -6543,6 +6543,8 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
         "{html}"
     );
     assert!(html.contains("Resolving a name costs"));
+    assert!(html.contains("Reverse names cost") && html.contains("Up today"));
+    assert!(html.contains("also checks 5 % of other nodes' fresh scans unpaid"));
     // The market: the hourly refresh left a snapshot per good, with what b
     // announces for abuseipdb as the members' band (seen by now).
     price::refresh(&na.node).await.unwrap();

@@ -1186,7 +1186,7 @@ if [ "$upgrade" -ne 1 ]; then
         [ -z "$advertise_host" ] || advertise_default="${advertise_host}:7443"
     fi
     if [ "$INTERACTIVE" -eq 1 ] && [ -z "$advertise_preset" ]; then
-        say $'\nOther members dial this node at an address you publish. The port must be reachable from the\ninternet; the installer does not change the firewall. To change it later: advertise and listen\nin /etc/peephole/config.toml, then restart peephole.\n'
+        say $'\nOther members dial this node at an address you publish. The port must be reachable from the\ninternet; the installer does not change the firewall. A node nobody can reach gets no daily\nallowance of credits, earns only by scanning or by selling lookups and names, and must lease a\nrelay from a reachable member to be asked for anything paid. To change it later: advertise and\nlisten in /etc/peephole/config.toml, then restart peephole.\n'
     fi
     while :; do
         prompt PEEPHOLE_CLUSTER_ADVERTISE "Address other nodes dial (host:port)" "$advertise_default"
