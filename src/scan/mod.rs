@@ -147,6 +147,7 @@ impl Refusal {
 /// scanner: the arbiter does not count it as undelivered.
 pub(crate) const NOT_REPLICATED: &str = "job not replicated here yet";
 pub(crate) const TOR_UNKNOWN: &str = "Tor exit status unknown (no exit list loaded)";
+pub(crate) const OFFER_SHORT: &str = "the job's offer is not held or not covered here";
 
 /// What a scanner knows of an arbiter with queued work, for [`can_pay`].
 #[derive(Clone, Copy)]
@@ -880,6 +881,14 @@ impl Source {
         if let Some(other) = outranked_by(pool, &g.job_uid).await? {
             let why = format!("job {other} for this IP ranks first");
             return Ok(Err(("superseded", Some(why))));
+        }
+        // A funded job runs only when its offer covers the price here: what
+        // the receipt charges is then what the ledger moves.
+        if let (Some(seq), Some(node)) = (g.offer_seq, self.node())
+            && g.price_mc > 0
+            && !crate::credits::jobs::offer_covers(node, arbiter, seq, &g.job_uid, g.price_mc).await
+        {
+            return Ok(Err(("later", Some(OFFER_SHORT.into()))));
         }
         Ok(Ok(Job::Granted {
             arbiter,
@@ -2367,6 +2376,56 @@ license_key = "k"
             .await
             .unwrap();
         assert!(r.is_ok(), "a bought scan runs with no requests held");
+    }
+
+    /// A funded grant runs only when its offer covers the price here: a
+    /// scanner charging an offer the arbiter's lots do not hold would be
+    /// paid less than it charged.
+    #[tokio::test]
+    async fn a_grant_whose_offer_is_not_covered_comes_back_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, source, store) = cluster_source(dir.path(), "").await;
+        let rec = Recorder::Cluster(node.clone());
+        let ip = store
+            .upsert_ip("203.0.113.78".parse().unwrap())
+            .await
+            .unwrap();
+        rec.enqueue_manual(ip.id, 2).await.unwrap();
+        let uid = job_uid(&store, ip.id).await;
+        // Another arbiter's job, funded with an offer on a lot it does not
+        // hold.
+        let arbiter = NodeId([7; 32]);
+        sqlx::query("UPDATE scan_jobs SET arbiter = ? WHERE uid = ?")
+            .bind(&arbiter.0[..])
+            .bind(&uid)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let at = crate::cluster::hlc::wall_ms() << 16;
+        sqlx::query(
+            "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, seal, economy, job_uid)
+             VALUES (?1, 4, ?2, 'offer', ?3, ?4, 1, 2, ?5)",
+        )
+        .bind(&arbiter.0[..])
+        .bind(crate::cluster::hlc::to_db(at))
+        .bind(&node.id().0[..])
+        .bind(format!("[[{},10]]", crate::credits::day_of(at)))
+        .bind(&uid)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let g = Grant {
+            offer_seq: Some(4),
+            price_mc: 10,
+            ..grant(&uid, &ip.ip, 2)
+        };
+        let (status, why) = source
+            .check_grant(arbiter, &g)
+            .await
+            .unwrap()
+            .err()
+            .unwrap();
+        assert_eq!((status, why.as_deref()), ("later", Some(OFFER_SHORT)));
     }
 
     /// An audit of a bought job (level 5 among them: no request asks for

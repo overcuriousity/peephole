@@ -301,6 +301,58 @@ pub async fn accept_offer(
     })
 }
 
+/// How long [`Spending`] remembers an entry: longer than any book that
+/// funds offers lives (a round of handing out jobs keeps one).
+const SPENDING_KEPT: Duration = Duration::from_secs(3600);
+
+/// This node's own offers and transfers written lately, with the parts
+/// they named. A book computed before one was written still shows those
+/// credits in the lots; [`Spending::lots`] leaves them out. Kept in
+/// [`Node::spending`], which every writer of an offer or a transfer holds
+/// from reading its lots until the entry is written and noted, so two
+/// never name the same credits.
+#[derive(Default)]
+pub struct Spending {
+    written: Vec<Written>,
+}
+
+/// An entry [`Spending`] remembers: its sequence number, when it was
+/// written, and the parts it named.
+type Written = (u64, std::time::Instant, Vec<(u32, u32)>);
+
+impl Spending {
+    /// `me`'s live lots as `book` has them, less what its own entries
+    /// written after the book took, oldest first.
+    pub fn lots(&self, book: &super::Book, me: &NodeId) -> Vec<(u32, Mc)> {
+        let mut lots = book.ledger.by_day(me);
+        for (_, _, parts) in self.written.iter().filter(|(seq, ..)| *seq > book.own_head) {
+            for (day, mc) in parts {
+                if let Some(lot) = lots.iter_mut().find(|(d, _)| d == day) {
+                    lot.1 = lot.1.saturating_sub(*mc as Mc);
+                }
+            }
+        }
+        lots.retain(|(_, mc)| *mc > 0);
+        lots
+    }
+
+    /// Note an entry of this node's written with `parts`.
+    pub fn wrote(&mut self, seq: u64, parts: &[(u32, u32)]) {
+        self.written
+            .retain(|(_, at, _)| at.elapsed() < SPENDING_KEPT);
+        self.written
+            .push((seq, std::time::Instant::now(), parts.to_vec()));
+    }
+}
+
+/// What `lots` hold from `first_day` on.
+fn available(lots: &[(u32, Mc)], first_day: u32) -> Mc {
+    lots.iter()
+        .filter(|(day, _)| *day >= first_day)
+        .map(|(_, mc)| mc)
+        .sum()
+}
+
 /// The asker's side of writing one offer: the balance (drawing from the
 /// fleet), a sealed `CreditOffer` of `total_mc` to `server`, and a sync so
 /// the server holds it before it is named. Returns the offer's sequence
@@ -310,6 +362,9 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
 }
 
 /// [`make_offer`], naming the scan an audit it buys checks (`audit`).
+/// Offers are written one at a time, each from the lots the ones before
+/// left ([`Spending`]); one that needs more than the node holds draws
+/// the rest from its siblings, one draw at a time.
 pub async fn make_offer_for(
     node: &Arc<Node>,
     server: NodeId,
@@ -322,48 +377,62 @@ pub async fn make_offer_for(
     if server != me && !node.can_call(&server) {
         return Err("the node cannot be reached from here".into());
     }
-    let mut book = super::book_fresh(node)
-        .await
-        .map_err(|e| format!("this node could not read its books: {e:#}"))?;
-    if book.ledger.spendable_parts(&me, total_mc).is_none() {
-        // Draw what is missing from the siblings, the richest first.
-        let missing = total_mc.saturating_sub(book.balance(&me));
-        if super::fleet::draw(node, missing).await
-            && let Ok(b) = super::book_fresh(node).await
-        {
-            book = b;
+    let first_day = 0;
+    let books = |e: anyhow::Error| format!("this node could not read its books: {e:#}");
+    let mut drew = false;
+    loop {
+        let have = {
+            let mut spending = node.spending.lock().await;
+            let book = super::book_fresh(node).await.map_err(books)?;
+            let lots = spending.lots(&book, &me);
+            if let Some(parts) = super::ledger::parts_from(&lots, total_mc, first_day) {
+                let offer = repl::append_sealing(node, |seal| Record::CreditOffer {
+                    to: server,
+                    parts: parts.clone(),
+                    seal,
+                    job: None,
+                    audit,
+                    economy: crate::cluster::record::ECONOMY,
+                })
+                .await
+                .map_err(|e| format!("the offer could not be written: {e:#}"))?;
+                spending.wrote(offer.seq, &parts);
+                drop(spending);
+                // So the offer is there before the request. A server nobody
+                // can dial pulls it with its own long-poll.
+                if server != me
+                    && let Err(e) = node.sync_around_request(server).await
+                {
+                    tracing::debug!(
+                        ?e,
+                        "sync before a paid request failed; the server waits for the offer"
+                    );
+                }
+                return Ok(offer.seq);
+            }
+            available(&lots, first_day)
+        };
+        if drew {
+            return Err(format!(
+                "this node holds {} credits; this costs {} ({} missing)",
+                show(have),
+                show(total_mc),
+                show(total_mc.saturating_sub(have))
+            ));
+        }
+        drew = true;
+        // Draw what is missing from the siblings, the richest first. An
+        // offer that waited for another's draw may need none any more.
+        let _one = node.drawing.lock().await;
+        let have = {
+            let spending = node.spending.lock().await;
+            let book = super::book_fresh(node).await.map_err(books)?;
+            available(&spending.lots(&book, &me), first_day)
+        };
+        if have < total_mc {
+            super::fleet::draw(node, total_mc - have).await;
         }
     }
-    let Some(parts) = book.ledger.spendable_parts(&me, total_mc) else {
-        let have = book.balance(&me);
-        return Err(format!(
-            "this node holds {} credits; this costs {} ({} missing)",
-            show(have),
-            show(total_mc),
-            show(total_mc.saturating_sub(have))
-        ));
-    };
-    let offer = repl::append_sealing(node, |seal| Record::CreditOffer {
-        to: server,
-        parts,
-        seal,
-        job: None,
-        audit,
-        economy: crate::cluster::record::ECONOMY,
-    })
-    .await
-    .map_err(|e| format!("the offer could not be written: {e:#}"))?;
-    // So the offer is there before the request. A server nobody can dial
-    // pulls it with its own long-poll.
-    if server != me
-        && let Err(e) = node.sync_around_request(server).await
-    {
-        tracing::debug!(
-            ?e,
-            "sync before a paid request failed; the server waits for the offer"
-        );
-    }
-    Ok(offer.seq)
 }
 
 /// A provider result the dataset holds.

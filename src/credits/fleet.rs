@@ -29,19 +29,10 @@ async fn receivable(node: &Node, to: &NodeId) -> Result<bool> {
         .contains(to))
 }
 
-async fn transfer(node: &Node, to: NodeId, parts: Vec<(u32, u32)>) -> Result<()> {
-    repl::append_sealing(node, |seal| Record::CreditTransfer {
-        to,
-        parts,
-        seal,
-        economy: crate::cluster::record::ECONOMY,
-    })
-    .await?;
-    Ok(())
-}
-
 /// Send `mc` to `to`, oldest lots first. No fee. Refused when this node
-/// does not hold that much, or `to` cannot receive.
+/// does not hold that much, or `to` cannot receive. Like an offer, it
+/// draws from the lots the entries written before it left
+/// ([`super::pay::Spending`]).
 pub async fn send(node: &Node, to: NodeId, mc: Mc) -> Result<Mc> {
     if !receivable(node, &to).await? {
         bail!(
@@ -49,15 +40,26 @@ pub async fn send(node: &Node, to: NodeId, mc: Mc) -> Result<Mc> {
             to.short()
         );
     }
+    let me = node.id();
+    let mut spending = node.spending.lock().await;
     let book = super::book_fresh(node).await?;
-    let Some(parts) = book.ledger.spendable_parts(&node.id(), mc) else {
+    let lots = spending.lots(&book, &me);
+    let Some(parts) = super::ledger::parts_from(&lots, mc, 0) else {
         bail!(
             "this node holds {} credits, not {}",
-            show(book.balance(&node.id())),
+            show(lots.iter().map(|(_, mc)| mc).sum()),
             show(mc)
         );
     };
-    transfer(node, to, parts).await?;
+    let e = repl::append_sealing(node, |seal| Record::CreditTransfer {
+        to,
+        parts: parts.clone(),
+        seal,
+        economy: crate::cluster::record::ECONOMY,
+    })
+    .await?;
+    spending.wrote(e.seq, &parts);
+    drop(spending);
     tracing::info!(to = %to.short(), credits = %show(mc), "credits sent");
     Ok(mc)
 }

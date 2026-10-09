@@ -7739,3 +7739,48 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
     })
     .await;
 }
+
+/// Offers written at once (a quorum of name servers asked together) do not
+/// draw the same credits: each is covered in full, the next lot taking
+/// over where the oldest runs out. A scan offer of a round whose book
+/// predates them is covered too.
+#[tokio::test]
+async fn offers_written_at_once_are_each_covered() {
+    use peephole::credits::{self, jobs, pay};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
+    // Two lots; all but 5 mc of the older one held by an offer.
+    for day in [pool_day() - 1, pool_day()] {
+        peephole::credits::pool::testing::report_all_day(&na.store.pool, day, &[a.id])
+            .await
+            .unwrap();
+    }
+    na.node.reload_members().await.unwrap();
+    let lots = credits::book_fresh(&na.node)
+        .await
+        .unwrap()
+        .ledger
+        .by_day(&a.id);
+    assert_eq!((lots.len(), lots[0].0), (2, pool_day() - 1), "{lots:?}");
+    pay::make_offer(&na.node, b.id, lots[0].1 - 5)
+        .await
+        .unwrap();
+    // A round of handing out jobs reads its book now.
+    na.node.set_scan_share(1.0);
+    let mut funding = jobs::Funding::default();
+    assert!(jobs::affordable(&na.node, &mut funding, 0, 4).await);
+    let seqs = futures::future::join_all((0..8).map(|_| pay::make_offer(&na.node, b.id, 3))).await;
+    let (job_seq, price) = jobs::fund(&na.node, &mut funding, b.id, "job-x", 0, 4)
+        .await
+        .unwrap();
+    assert_eq!(price, 4);
+    let book = credits::book_fresh(&na.node).await.unwrap();
+    for seq in seqs {
+        let o = book.ledger.offer(&a.id, seq.unwrap()).unwrap();
+        assert_eq!((o.offered, o.covered), (3, 3), "{o:?}");
+    }
+    let o = book.ledger.offer(&a.id, job_seq.unwrap()).unwrap();
+    assert_eq!((o.offered, o.covered), (4, 4), "{o:?}");
+}

@@ -80,6 +80,9 @@ pub struct Book {
     /// The members that do not earn in full here.
     pub standings: gates::Standings,
     pub now_ms: u64,
+    /// The highest sequence number among this node's own entries the
+    /// ledger read: an own entry written later is not in this book.
+    pub own_head: u64,
 }
 
 impl Book {
@@ -155,6 +158,13 @@ pub async fn compute(node: &Node) -> anyhow::Result<Book> {
         .filter(|e| !gates.no_sales.contains(&e.node))
         .collect();
     let entries = entries::since(&node.store.pool, since).await?;
+    let me = node.id();
+    let own_head = entries
+        .iter()
+        .filter(|e| e.origin == me)
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0);
     let ledger = ledger::run(&pool, &entries, &gates, now_ms);
     Ok(Book {
         ledger,
@@ -163,6 +173,7 @@ pub async fn compute(node: &Node) -> anyhow::Result<Book> {
         uptime,
         standings,
         now_ms,
+        own_head,
     })
 }
 

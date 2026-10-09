@@ -166,6 +166,13 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   reverse-name resolution, a probe) counted as demand, so anyone could
   raise a server's prices for free; only goods answered free or paid for
   count now.
+- Offers written together (a domain asked of up to nine resolvers, a
+  round of scan jobs while a lookup is paid) named the same oldest
+  credits, so most came out under-covered and were declined although the
+  node held enough, and each could draw from the fleet on its own. A
+  node now writes its offers and transfers one at a time, each from what
+  the ones before left, and draws from its siblings once at a time. A
+  scanner runs a funded job only when its offer is covered in full.
 - An audit counted as bought on the strength of a receipt the ledger
   ignores (dated before its offer, or after the offer lapsed); it now
   takes the receipt the ledger counts, as paid scan jobs already did.

@@ -277,8 +277,10 @@ audits and relay leases. The supply is fixed; prices follow sales.
   scanner asks arbiters that can pay its price first, in urgency order. A
   node's own jobs are funded from the same budget without moving credits.
   Scanners that hoard (over their hourly capacity, or delivering less than
-  half of 5 recent grants) go last. The scanner charges the offered price when
-  it delivers the result, and nothing when it does not. A scan offer lapses
+  half of 5 recent grants) go last. A scanner runs a funded job only when
+  its book holds the offer and counts it covered in full; otherwise it hands
+  the job back for later (no fault of the scanner). The scanner charges the
+  offered price when it delivers the result, and nothing when it does not. A scan offer lapses
   after the longest scan (12 hours plus 2 minutes). Every grant is funded, at
   zero or above: a scanner priced at 0 is granted without an offer.
   `scan_share = 0` funds only free scanners.
@@ -332,7 +334,10 @@ audits and relay leases. The supply is fixed; prices follow sales.
   up); for an address nobody recorded nothing is written anywhere.
 - **Your nodes as one.** Every node keeps what it earns. A paid lookup,
   probe or name resolution that needs more than a node holds draws from
-  its siblings, richest first. Scans are funded from the node's own
+  its siblings, richest first (one draw at a time). A node writes its
+  offers and transfers one at a time, each from what the ones before
+  left, so offers made together (a quorum of resolvers, the scan jobs of
+  a round) never name the same credits. Scans are funded from the node's own
   balance only.
 - **Two histories.** A node that gives two members different entries at
   one position of its log is found out with its next payment: its entries
