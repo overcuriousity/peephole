@@ -5769,9 +5769,79 @@ async fn a_price_above_the_offer_is_declined_and_named() {
     assert!(
         free.declined
             .iter()
-            .all(|(_, why)| why.contains("paid with credits")),
+            .all(|(_, why)| why.contains("the request carries no offer")),
         "{free:?}"
     );
+}
+
+/// A provider priced at zero is answered without an offer and costs
+/// nothing; one with a price is declined naming it, and the asker's offer
+/// of that price is served.
+#[tokio::test]
+async fn a_zero_priced_lookup_is_served_without_an_offer() {
+    use peephole::credits::{pay, price};
+    use peephole::intel::lookup::{LookupReq, LookupResp};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    serves(
+        &nb,
+        &[("abuseipdb", Some(1000.0)), ("shodan", Some(1000.0))],
+        0.5,
+    );
+    nb.node.set_price_table(std::sync::Arc::new(price::Table {
+        offers: vec![
+            price::Offer {
+                provider: "abuseipdb".into(),
+                price_mc: 0,
+                on_demand: 500,
+            },
+            price::Offer {
+                provider: "shodan".into(),
+                price_mc: 7,
+                on_demand: 500,
+            },
+        ],
+        ..Default::default()
+    }));
+    let ask = |providers: &[&str]| LookupReq {
+        ip: "203.0.113.81".into(),
+        providers: providers.iter().map(|p| p.to_string()).collect(),
+        offer_seq: None,
+    };
+    let resp: LookupResp = na
+        .call(
+            b.id,
+            &b.address(),
+            "/rpc/v1/lookup",
+            &ask(&["abuseipdb", "shodan"]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.findings.len(), 1, "{resp:?}");
+    assert_eq!(resp.findings[0].provider, "abuseipdb");
+    assert_eq!((resp.charged_mc, resp.price_mc), (0, Some(7)));
+    assert!(
+        resp.declined
+            .iter()
+            .any(|(p, why)| p == "shodan" && why.contains("the request carries no offer")),
+        "{resp:?}"
+    );
+    // Nothing was written: no offer, no receipt.
+    assert!(
+        peephole::credits::entries::since(&nb.store.pool, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // The asker's side: a quote of zero is asked without an offer.
+    nb.node.refresh_heartbeat();
+    price_seen(&na, b.id, "abuseipdb").await;
+    let wanted = ["abuseipdb".to_string()];
+    let free =
+        pay::offer_and_ask(&na.node, "203.0.113.82".parse().unwrap(), b.id, &wanted, 0).await;
+    assert_eq!((free.findings.len(), free.charged_mc), (1, 0));
 }
 
 /// A member that speaks only the protocol before credits is never asked

@@ -108,8 +108,9 @@ pub async fn local(providers: &Providers, ip: &IpAddr, wanted: &[String]) -> Loo
 }
 
 /// Serve a member's request with this node's providers. Every provider
-/// is paid between nodes: with an offer the request is served
-/// (`credits::pay::serve`); without one every provider is declined. What
+/// is priced: with an offer the request is served
+/// (`credits::pay::serve`); without one, what this node prices at zero is
+/// answered free and the rest is declined naming its price. What
 /// this node asks itself goes to [`local`], without an offer.
 pub async fn serve(node: &Arc<Node>, peer: NodeId, req: &LookupReq) -> LookupResp {
     let all = |why: &str| LookupResp {
@@ -139,18 +140,7 @@ pub async fn serve(node: &Arc<Node>, peer: NodeId, req: &LookupReq) -> LookupRes
         .collect();
     let mut resp = match req.offer_seq {
         Some(seq) => crate::credits::pay::serve(node, providers, peer, ip, served, seq).await,
-        None => LookupResp {
-            declined: served
-                .into_iter()
-                .map(|n| {
-                    (
-                        n,
-                        "lookups are paid with credits: the request carries no offer".into(),
-                    )
-                })
-                .collect(),
-            ..Default::default()
-        },
+        None => crate::credits::pay::serve_free(node, providers, peer, ip, served).await,
     };
     resp.declined.append(&mut declined);
     resp
@@ -177,12 +167,13 @@ pub struct Outcome {
     pub kept: bool,
 }
 
-/// The providers a lookup asks without being told to: those whose
-/// cheapest quote is 0, i.e. this node's own (free here).
-pub fn cheap(quotes: &HashMap<String, Vec<crate::credits::pay::Quote>>) -> Vec<String> {
+/// The providers a lookup asks without being told to: those this node
+/// serves itself (free here). A member's zero price is listed under "Ask
+/// for more", at "free", and asked only when picked.
+pub fn cheap(me: NodeId, quotes: &HashMap<String, Vec<crate::credits::pay::Quote>>) -> Vec<String> {
     let mut v: Vec<String> = quotes
         .iter()
-        .filter(|(_, l)| l.first().is_some_and(|q| q.price_mc == 0))
+        .filter(|(_, l)| l.iter().any(|q| q.server == me))
         .map(|(p, _)| p.clone())
         .collect();
     v.sort();
@@ -225,7 +216,7 @@ pub async fn run(
             vec![]
         }
     };
-    let cheap = cheap(&crate::credits::pay::quotes(node, providers));
+    let cheap = cheap(node.id(), &crate::credits::pay::quotes(node, providers));
     let wanted: Vec<String> = known
         .into_iter()
         .filter(|p| cheap.contains(p) || ask.contains(p) || again.contains(p))
@@ -377,6 +368,7 @@ mod tests {
             server_name: format!("n{server}"),
             price_mc,
         };
+        let me = NodeId([1; 32]);
         let quotes: HashMap<String, Vec<Quote>> = [
             (
                 super::super::TOR.to_string(),
@@ -386,13 +378,19 @@ mod tests {
                 super::super::ABUSEIPDB.to_string(),
                 vec![q(super::super::ABUSEIPDB, 2, 300)],
             ),
+            // A member's zero price: free, but asked only when told to.
+            (
+                super::super::SHODAN.to_string(),
+                vec![q(super::super::SHODAN, 2, 0)],
+            ),
+            // This node and a member both at zero, the member first.
             (
                 super::super::RDAP.to_string(),
-                vec![q(super::super::RDAP, 1, 0)],
+                vec![q(super::super::RDAP, 2, 0), q(super::super::RDAP, 1, 0)],
             ),
         ]
         .into();
-        assert_eq!(cheap(&quotes), [super::super::RDAP, super::super::TOR]);
+        assert_eq!(cheap(me, &quotes), [super::super::RDAP, super::super::TOR]);
     }
 
     /// A request of a node of an earlier version carries no offer and

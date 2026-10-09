@@ -77,13 +77,21 @@ pub struct Offer {
 
 impl Offer {
     /// Split the cluster's quotes (the cheapest of each provider) into
-    /// what this node answers itself and the paid providers.
-    pub fn from_quotes(all: &HashMap<String, Vec<crate::credits::pay::Quote>>) -> Offer {
-        let cheap = crate::intel::lookup::cheap(all);
+    /// what this node answers itself and the others (`me` is this node).
+    pub fn from_quotes(
+        me: crate::cluster::identity::NodeId,
+        all: &HashMap<String, Vec<crate::credits::pay::Quote>>,
+    ) -> Offer {
+        let cheap = crate::intel::lookup::cheap(me, all);
         let (mut quotes, mut paid) = (vec![], vec![]);
         let (mut total, mut paid_total) = (0u64, 0u64);
         for info in crate::intel::KNOWN_PROVIDERS {
-            let Some(q) = all.get(info.name).and_then(|l| l.first()) else {
+            // This node's own quote when it serves the provider itself,
+            // otherwise the cheapest.
+            let Some(q) = all
+                .get(info.name)
+                .and_then(|l| l.iter().find(|q| q.server == me).or(l.first()))
+            else {
                 continue;
             };
             let view = QuoteView {
@@ -151,7 +159,10 @@ async fn offer(state: &AdminState) -> Offer {
     Offer {
         balance: balance.map(|(b, _)| crate::credits::show(b)),
         fleet: balance.is_some_and(|(_, fleet)| fleet),
-        ..Offer::from_quotes(&crate::credits::pay::quotes(node, &state.providers))
+        ..Offer::from_quotes(
+            node.id(),
+            &crate::credits::pay::quotes(node, &state.providers),
+        )
     }
 }
 
@@ -888,12 +899,13 @@ secure_cookies = false
     fn a_lookup_asks_the_cheap_tier_and_offers_the_rest() {
         use crate::credits::pay::Quote;
         let node = crate::cluster::identity::NodeId::from_slice(&[7u8; 32]).unwrap();
-        let quote = |p: &str, mc: u32| {
+        let member = crate::cluster::identity::NodeId::from_slice(&[8u8; 32]).unwrap();
+        let quote = |p: &str, mc: u32, server| {
             (
                 p.to_string(),
                 vec![Quote {
                     provider: p.into(),
-                    server: node,
+                    server,
                     server_name: "n1".into(),
                     price_mc: mc,
                 }],
@@ -902,18 +914,25 @@ secure_cookies = false
         // This node answers Tor, GeoLite2 and InternetDB itself (free);
         // AbuseIPDB only a member serves.
         let all: HashMap<_, _> = [
-            quote(crate::intel::TOR, 0),
-            quote(crate::intel::MAXMIND, 0),
-            quote(crate::intel::INTERNETDB, 0),
-            quote(crate::intel::ABUSEIPDB, 100),
+            quote(crate::intel::TOR, 0, node),
+            quote(crate::intel::MAXMIND, 0, node),
+            quote(crate::intel::INTERNETDB, 0, node),
+            quote(crate::intel::ABUSEIPDB, 100, member),
+            // A member's zero price is listed as free, but not asked by itself.
+            quote(crate::intel::SHODAN, 0, member),
         ]
         .into();
-        let offer = Offer::from_quotes(&all);
+        let offer = Offer::from_quotes(node, &all);
         assert_eq!(offer.total, crate::credits::show(0));
         assert_eq!(offer.quotes.len(), 3);
-        assert_eq!(offer.paid.len(), 1);
-        assert_eq!(offer.paid[0].provider, crate::intel::ABUSEIPDB);
-        assert_eq!(offer.paid[0].price, "0.10");
+        assert_eq!(offer.paid.len(), 2);
+        assert_eq!(offer.price_of(crate::intel::SHODAN), "free");
+        let abuse = offer
+            .paid
+            .iter()
+            .find(|q| q.provider == crate::intel::ABUSEIPDB)
+            .unwrap();
+        assert_eq!(abuse.price, "0.10");
         assert_eq!(offer.paid_total, "0.10");
         // What an "Ask again" button shows.
         assert_eq!(offer.price_of(crate::intel::ABUSEIPDB), "0.10 credits");

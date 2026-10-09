@@ -201,7 +201,8 @@ impl Prober {
 
     /// Cluster: validate the offer, gate, take a slot, answer at once,
     /// then run and append the result and the receipt in one batch. This
-    /// node's own request carries no offer: it is free, and has no receipt.
+    /// node's own request, and any request while the probe price is 0,
+    /// carries no offer: it is free and has no receipt.
     pub async fn serve(
         self: &Arc<Self>,
         node: &Arc<Node>,
@@ -226,7 +227,12 @@ impl Prober {
         };
         let paid = match req.offer_seq {
             None if peer == node.id() => None,
+            None if price_u32 == 0 => {
+                node.market.note(price::PROBE, 1);
+                None
+            }
             None => {
+                node.market.note(price::PROBE, 1);
                 return match parsed {
                     Err(why) => declined(why, None),
                     Ok(_) => declined(
@@ -494,10 +500,42 @@ mod tests {
             node.own_head.load(std::sync::atomic::Ordering::Relaxed),
             before + 1
         );
-        // Another node's request without an offer is still declined.
+        // Another node's request without an offer: declined at a price,
+        // naming it ...
         let other = NodeId([9; 32]);
+        node.set_price_table(Arc::new(price::Table {
+            probe_mc: Some(5),
+            ..Default::default()
+        }));
         let resp = prober.serve(&node, other, &req).await;
-        assert!(matches!(resp, ProbeResp::Declined { .. }), "{resp:?}");
+        assert_eq!(
+            resp,
+            ProbeResp::Declined {
+                why: "probes are paid with credits: the request carries no offer".into(),
+                price_mc: Some(5),
+            }
+        );
+        // ... and served free at zero, with no receipt.
+        node.set_price_table(Arc::new(price::Table {
+            probe_mc: Some(0),
+            ..Default::default()
+        }));
+        let before = node.own_head.load(std::sync::atomic::Ordering::Relaxed);
+        let resp = prober.serve(&node, other, &req).await;
+        assert!(matches!(resp, ProbeResp::Accepted { .. }), "{resp:?}");
+        for _ in 0..100 {
+            if store.probes_for_ip(ip.id).await.unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let probes = store.probes_for_ip(ip.id).await.unwrap();
+        assert_eq!((probes.len(), probes[0].charged_mc), (2, 0));
+        assert_eq!(
+            node.own_head.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "the result alone"
+        );
     }
 
     #[tokio::test]

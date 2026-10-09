@@ -143,14 +143,17 @@ async fn offer_once(
         };
         return p.serve(node, me, &req).await;
     }
-    let seq = match pay::make_offer(node, server, price).await {
-        Ok(seq) => seq,
-        Err(why) => return refused(why),
+    let offer_seq = match price {
+        0 => None,
+        p => match pay::make_offer(node, server, p).await {
+            Ok(seq) => Some(seq),
+            Err(why) => return refused(why),
+        },
     };
     let req = ProbeReq {
         ip: ip.to_string(),
         group: group.to_string(),
-        offer_seq: Some(seq),
+        offer_seq,
         // As in its `Vantage`: the scanner records it when it has no
         // single public address of its own.
         dialled: dialled_ip(node, &server),
@@ -171,7 +174,8 @@ async fn offer_once(
     // A declined offer comes with a receipt of nothing: fetch it, so what
     // the offer held is free for the next one. A scanner nobody can dial
     // pushes its receipt with its own sync.
-    if matches!(resp, ProbeResp::Declined { .. })
+    if offer_seq.is_some()
+        && matches!(resp, ProbeResp::Declined { .. })
         && let Err(e) = node.sync_around_request(server).await
     {
         tracing::debug!(?e, "sync after a declined probe offer failed");

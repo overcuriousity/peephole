@@ -144,6 +144,9 @@ pub struct ResolveResp {
     /// What the resolver charged, in mc.
     #[serde(default)]
     pub charged_mc: u32,
+    /// Its price, when the request offered less (or nothing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_mc: Option<u32>,
 }
 
 impl ResolveResp {
@@ -152,6 +155,15 @@ impl ResolveResp {
             addrs: vec![],
             error: Some(why.to_string()),
             charged_mc: 0,
+            price_mc: None,
+        }
+    }
+
+    /// Declined for its price, which it names.
+    pub fn priced(why: &str, price_mc: u32) -> ResolveResp {
+        ResolveResp {
+            price_mc: Some(price_mc),
+            ..ResolveResp::refused(why)
         }
     }
 }
@@ -193,59 +205,73 @@ pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> 
         }
         return ResolveResp::refused("not a host name");
     };
-    let Some(seq) = req.offer_seq else {
-        return ResolveResp::refused(
-            "resolving a name is paid with credits: the request carries no offer",
-        );
+    let cost = node.price_table().price_of(price::RESOLVE).unwrap_or(0);
+    node.market.note(price::RESOLVE, 1);
+    let seq = match req.offer_seq {
+        Some(seq) => Some(seq),
+        None if cost == 0 => None,
+        None => {
+            return ResolveResp::priced(
+                &format!(
+                    "resolving a name costs {} credits here now; the request carries no offer",
+                    crate::credits::show(cost as u64)
+                ),
+                cost,
+            );
+        }
     };
-    let Some(cost) = node.price_table().price_of(price::RESOLVE) else {
-        pay::release(node, peer, seq).await;
-        return ResolveResp::refused("this node has no resolution price yet; ask again later");
-    };
-    let accepted = pay::accept_offer(
-        node,
-        peer,
-        seq,
-        cost as u64,
-        "resolve",
-        pay::SERVE_MARGIN_MS,
-    )
-    .await;
-    if pay::counts_as_demand(&accepted) {
-        node.market.note(price::RESOLVE, 1);
-    }
-    if let Err(d) = accepted {
-        let why = match d {
-            pay::Declined::Why(w) | pay::Declined::NotCovered(w) => w,
-            pay::Declined::TooLow { why, .. } => why,
-        };
-        return ResolveResp::refused(&why);
+    if let Some(seq) = seq {
+        let accepted = pay::accept_offer(
+            node,
+            peer,
+            seq,
+            cost as u64,
+            "resolve",
+            pay::SERVE_MARGIN_MS,
+        )
+        .await;
+        match accepted {
+            Ok(_) => {}
+            Err(pay::Declined::TooLow { why, price_mc }) => {
+                return ResolveResp::priced(&why, price_mc);
+            }
+            Err(pay::Declined::Why(w) | pay::Declined::NotCovered(w)) => {
+                return ResolveResp::refused(&w);
+            }
+        }
     }
     let taken = match node.lookup_shares() {
         Some(s) => s.take_good(price::RESOLVE).await.unwrap_or(false),
         None => true,
     };
     if !taken {
-        pay::release(node, peer, seq).await;
+        if let Some(seq) = seq {
+            pay::release(node, peer, seq).await;
+        }
         return ResolveResp::refused("this node's resolutions for others are used up for today");
     }
     let answer = resolve_here(&name).await;
-    let charged = charge_for(&answer, cost);
-    let receipt = Record::CreditReceipt {
-        payer: peer,
-        offer_seq: seq,
-        charged_mc: charged,
-        answered: if charged > 0 {
-            vec![price::RESOLVE.into()]
-        } else {
-            vec![]
-        },
-    };
-    let charged = match crate::cluster::repl::append(node, &[receipt]).await {
-        Ok(_) => charged,
-        Err(e) => {
-            tracing::warn!(?e, "resolve receipt not written");
-            0
+    let charged = match seq {
+        None => 0,
+        Some(seq) => {
+            let charged = charge_for(&answer, cost);
+            let receipt = Record::CreditReceipt {
+                payer: peer,
+                offer_seq: seq,
+                charged_mc: charged,
+                answered: if charged > 0 {
+                    vec![price::RESOLVE.into()]
+                } else {
+                    vec![]
+                },
+            };
+            match crate::cluster::repl::append(node, &[receipt]).await {
+                Ok(_) => charged,
+                Err(e) => {
+                    tracing::warn!(?e, "resolve receipt not written");
+                    0
+                }
+            }
         }
     };
     match answer {
@@ -253,13 +279,14 @@ pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> 
             addrs,
             error: None,
             charged_mc: charged,
+            price_mc: None,
         },
         Err(e) => ResolveResp::refused(&e),
     }
 }
 
-/// What `id` announces for resolving a name; None: no price, or it
-/// predates the market.
+/// What `id` announces for resolving a name (0: free); None: no price, or
+/// it predates the market.
 pub fn resolver_price(node: &Node, id: &NodeId) -> Option<u32> {
     let m = node.members().get(id).cloned()?;
     if !crate::credits::pay::pays_with(m.proto_max) {
@@ -272,7 +299,6 @@ pub fn resolver_price(node: &Node, id: &NodeId) -> Option<u32> {
         .iter()
         .find(|(g, _)| g == crate::credits::price::RESOLVE)
         .map(|(_, mc)| *mc)
-        .filter(|mc| *mc > 0)
 }
 
 /// The candidates that can be paid, in their order.
@@ -504,18 +530,41 @@ pub async fn lookup_with(
     Ok((t, Some(r)))
 }
 
-/// One member's answer.
+/// One member's answer: asked without an offer at a zero price, with one
+/// otherwise; a decline naming a higher price is offered that once.
 async fn ask(node: &Arc<Node>, id: NodeId, name: &str) -> (NodeId, Result<Vec<IpAddr>, String>) {
     let Some(price) = resolver_price(node, &id) else {
         return (id, Err("announces no price for resolving".into()));
     };
-    let seq = match crate::credits::pay::make_offer(node, id, price as u64).await {
-        Ok(seq) => seq,
-        Err(why) => return (id, Err(why)),
+    let mut resp = ask_once(node, id, name, price as u64).await;
+    if let Ok(r) = &resp
+        && r.error.is_some()
+        && let Some(p) = crate::credits::pay::retry_price(price as u64, r.price_mc, true)
+    {
+        resp = ask_once(node, id, name, p).await;
+    }
+    let answer = match resp {
+        Err(e) => Err(e),
+        Ok(ResolveResp { error: Some(e), .. }) => Err(e),
+        Ok(ResolveResp { addrs, .. }) => Ok(addrs),
+    };
+    (id, answer)
+}
+
+/// One request to `id`, with an offer of `price` unless it is 0.
+async fn ask_once(
+    node: &Arc<Node>,
+    id: NodeId,
+    name: &str,
+    price: u64,
+) -> Result<ResolveResp, String> {
+    let offer_seq = match price {
+        0 => None,
+        p => Some(crate::credits::pay::make_offer(node, id, p).await?),
     };
     let req = ResolveReq {
         name: name.to_string(),
-        offer_seq: Some(seq),
+        offer_seq,
     };
     let call = node.call_any::<ResolveReq, ResolveResp>(
         id,
@@ -523,15 +572,13 @@ async fn ask(node: &Arc<Node>, id: NodeId, name: &str) -> (NodeId, Result<Vec<Ip
         &req,
         crate::intel::lookup::RPC_TIMEOUT,
     );
-    let answer = match call.await {
+    match call.await {
         Err(e) if e.downcast_ref::<crate::cluster::msg::NoAnswer>().is_some() => {
             Err("did not answer in time".into())
         }
         Err(e) => Err(format!("could not be asked: {e:#}")),
-        Ok(ResolveResp { error: Some(e), .. }) => Err(e),
-        Ok(ResolveResp { addrs, .. }) => Ok(addrs),
-    };
-    (id, answer)
+        Ok(r) => Ok(r),
+    }
 }
 
 #[cfg(test)]

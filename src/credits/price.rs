@@ -310,7 +310,7 @@ impl Table {
         match good {
             SCAN => self.sell_mc,
             PROBE => self.probe_mc,
-            RESOLVE => Some(self.resolve_mc).filter(|p| *p > 0),
+            RESOLVE => Some(self.resolve_mc),
             _ => self
                 .offers
                 .iter()
@@ -326,9 +326,7 @@ impl Table {
             .iter()
             .map(|o| (o.provider.clone(), o.price_mc))
             .collect();
-        if self.resolve_mc > 0 {
-            prices.push((RESOLVE.to_string(), self.resolve_mc));
-        }
+        prices.push((RESOLVE.to_string(), self.resolve_mc));
         (
             self.offers
                 .iter()
@@ -916,7 +914,10 @@ mod tests {
                 (intel::MAXMIND.to_string(), 1000)
             ]
         );
-        assert_eq!(prices.len(), 2);
+        // The resolution price is always announced, also at 0.
+        assert_eq!(prices.len(), 3);
+        assert!(prices.contains(&(RESOLVE.to_string(), 0)));
+        assert_eq!(t.price_of(RESOLVE), Some(0));
     }
 
     #[test]
