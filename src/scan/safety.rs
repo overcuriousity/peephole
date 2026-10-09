@@ -198,8 +198,9 @@ impl Safety {
     }
 
     /// The forward-confirmed PTR names of the own global addresses, once a
-    /// day. A failed lookup keeps the previous names and is tried again at
-    /// the next refresh.
+    /// day. A failed lookup keeps the previous names, adds what the other
+    /// lookups found, and is tried again at the next refresh; only a pass
+    /// without failures replaces the list.
     async fn refresh_names(&mut self) {
         let Some((resolver, forward)) = self.dns.clone() else {
             return;
@@ -224,7 +225,15 @@ impl Safety {
                 }
             }
         }
-        if failed && names.is_empty() {
+        if failed {
+            // Keep what failed to answer: the previous names, and what was
+            // found this time; try again at the next refresh.
+            for n in names {
+                if !self.own_names.contains(&n) {
+                    self.own_names.push(n);
+                }
+            }
+            self.names_at = None;
             return;
         }
         self.own_names = names;
@@ -686,6 +695,95 @@ mod tests {
         *answer.lock().unwrap() = Some("other.example.net".into());
         s.refresh_names().await;
         assert_eq!(s.own_names(), vec!["scanner-5.example.net".to_string()]);
+    }
+
+    /// A fake PTR resolver answering per address, by the first label of
+    /// the question (the last octet of an IPv4 address): a name, or
+    /// SERVFAIL when the map has None or nothing for it.
+    async fn per_address_resolver(
+        answers: std::sync::Arc<std::sync::Mutex<HashMap<String, Option<String>>>>,
+    ) -> SocketAddr {
+        use crate::scan::crawler::testing::reply;
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let (_, from) = sock.recv_from(&mut buf).await.unwrap();
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                let len = buf[12] as usize;
+                let label = String::from_utf8_lossy(&buf[13..13 + len]).into_owned();
+                let name = answers.lock().unwrap().get(&label).cloned().flatten();
+                let msg = match name {
+                    Some(n) => reply(id, 0, Some(&n)),
+                    None => reply(id, 2, None),
+                };
+                let _ = sock.send_to(&msg, from).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_failed_own_name_lookup_keeps_the_previous_names() {
+        use std::sync::{Arc, Mutex};
+        let cfg = cfg_with("[scan]\nown_addresses = [\"198.51.100.5\", \"198.51.100.6\"]\n");
+        let mut s = Safety::new(&cfg);
+        let answers: Arc<Mutex<HashMap<String, Option<String>>>> = Arc::new(Mutex::new(
+            [
+                ("5".to_string(), Some("scanner-5.example.net".to_string())),
+                ("6".to_string(), Some("scanner-6.example.net".to_string())),
+            ]
+            .into(),
+        ));
+        let resolver = per_address_resolver(answers.clone()).await;
+        let forward: crate::scan::crawler::Forward = Arc::new(|name: String| {
+            Box::pin(async move {
+                match name.trim_end_matches('.') {
+                    "scanner-5.example.net" | "scanner-5b.example.net" => {
+                        Ok(vec!["198.51.100.5".parse().unwrap()])
+                    }
+                    "scanner-6.example.net" => Ok(vec!["198.51.100.6".parse().unwrap()]),
+                    _ => Err(std::io::Error::other("no such host")),
+                }
+            })
+        });
+        s.set_dns(resolver, forward);
+        s.refresh(&cfg, None).await;
+        assert_eq!(
+            s.own_names(),
+            vec![
+                "scanner-5.example.net".to_string(),
+                "scanner-6.example.net".to_string()
+            ]
+        );
+        // The lookup for .5 fails while .6 still answers: .5's name stays,
+        // nothing twice, and the next refresh tries again.
+        answers.lock().unwrap().insert("5".into(), None);
+        s.names_at = None;
+        s.refresh_names().await;
+        assert_eq!(
+            s.own_names(),
+            vec![
+                "scanner-5.example.net".to_string(),
+                "scanner-6.example.net".to_string()
+            ]
+        );
+        assert!(s.names_at.is_none(), "retried at the next refresh");
+        // A fully successful pass replaces the list.
+        answers
+            .lock()
+            .unwrap()
+            .insert("5".into(), Some("scanner-5b.example.net".into()));
+        s.refresh_names().await;
+        assert_eq!(
+            s.own_names(),
+            vec![
+                "scanner-5b.example.net".to_string(),
+                "scanner-6.example.net".to_string()
+            ]
+        );
+        assert!(s.names_at.is_some());
     }
 
     #[test]
