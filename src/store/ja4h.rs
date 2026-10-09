@@ -27,9 +27,6 @@ pub(crate) fn derive(
 
 /// Rows read per write transaction by [`backfill`] (heads are up to 64 KiB).
 const BACKFILL_BATCH: i64 = 100;
-/// Pause between [`backfill`]'s transactions, so the trap's and
-/// replication's writes get the lock in between.
-const BACKFILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// The rows [`backfill`] has left, through `idx_requests_ja4h_pending`
 /// (which holds only those).
@@ -39,35 +36,40 @@ const PENDING: &str = "SELECT id, raw_head, transport, via_proxy FROM requests
 /// A pending row: id, head, transport, via proxy.
 type Pending = (i64, Vec<u8>, Option<String>, Option<bool>);
 
-/// Derive the JA4H of the rows stored before this build (or marked for a
-/// new derivation), a batch at a time, each batch its own short write
-/// transaction with a pause after it. Walks the pending rows once by id.
-/// Returns how many rows were read.
-pub async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
-    let (mut done, mut after) = (0, 0i64);
-    loop {
-        let rows: Vec<Pending> = sqlx::query_as(PENDING)
-            .bind(after)
-            .bind(BACKFILL_BATCH)
-            .fetch_all(pool)
+fn write_pending<'c>(
+    conn: &'c mut sqlx::SqliteConnection,
+    r: &'c Pending,
+    ja4h: Option<String>,
+) -> super::backfill::WriteFut<'c> {
+    Box::pin(async move {
+        sqlx::query("UPDATE requests SET ja4h = ?, ja4h_v = ? WHERE id = ?")
+            .bind(ja4h)
+            .bind(JA4H_V)
+            .bind(r.0)
+            .execute(&mut *conn)
             .await?;
-        let Some((last, ..)) = rows.last() else {
-            return Ok(done);
-        };
-        after = *last;
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        for (id, head, transport, via_proxy) in &rows {
-            sqlx::query("UPDATE requests SET ja4h = ?, ja4h_v = ? WHERE id = ?")
-                .bind(derive(Some(head), transport.as_deref(), *via_proxy))
-                .bind(JA4H_V)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        done += rows.len() as u64;
-        tokio::time::sleep(BACKFILL_PAUSE).await;
-    }
+        Ok(())
+    })
+}
+
+/// Derive the JA4H of the rows stored before this build (or marked for a
+/// new derivation), [`BACKFILL_BATCH`] at a time (see
+/// [`super::backfill`]). Returns how many rows were read.
+pub async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
+    super::backfill::run(
+        pool,
+        super::backfill::Walk {
+            pending: PENDING,
+            below: None,
+            batch: BACKFILL_BATCH,
+            id: |r: &Pending| r.0,
+            derive: |(_, head, transport, via_proxy): &Pending| {
+                derive(Some(head), transport.as_deref(), *via_proxy)
+            },
+            write: write_pending,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

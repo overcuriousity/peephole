@@ -100,6 +100,54 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - The installer warns when it cannot verify the build provenance because
   the GitHub CLI is missing, instead of relying on the checksum (from the
   same server) without a word, and says how to require or skip the check.
+### Fixed
+
+- Bulk deletes (requests or IPs, "all matching") wrote every tombstone in
+  one transaction and held the database for as long as that took; the
+  trap's writes waiting behind it timed out and requests were lost. They
+  now commit 500 records at a time, with a pause in between, like
+  retention.
+- Cluster: a member's lookup result dated in the future (or not dated at
+  all) put off every node's next lookup of that address with that
+  provider for good. Its fetch time is now held to the time of its log
+  entry, as for shared intel files.
+- Cluster: a member's light row dated 1970 (or before year 1) moved the
+  address's first sighting there for good, and its canaries with it.
+  Times before 2000 are now held to 2000-01-01, as times from the future
+  are held to the present.
+- A deleted IP's public page was served from the cache for up to ten
+  minutes, each view logging "cache refresh failed". It now answers
+  "not found" from the first refresh after the delete.
+- Cluster: deleting an IP left the names this node had looked up for it
+  (domain and reverse lookups) on the other nodes, and they kept the IP
+  and its lookups there. The lookups are now deleted with it, everywhere;
+  a domain lookup goes as a whole, with the names it gave other addresses.
+- Searching for an IPv4 address written as mapped IPv6
+  (`::ffff:203.0.113.7`), in the IP search, the request filter, Links, the
+  bulk lookup or an IP's page, found nothing; it now finds the IPv4
+  address it maps.
+- Requests of one source arriving at once could each queue a scan job; the
+  duplicates took queue places and /24 and ASN budget until superseded.
+  Automatic enqueues now check and write one at a time.
+- The dashboard's timeline and its families and OWASP tags read every
+  request row in full for the 30-day and all-time ranges, every five
+  minutes. A new index covers both (migration 0031; it is built once, at
+  the first start after the upgrade).
+- A domain looked up again kept the addresses an earlier lookup agreed on
+  as agreed, though the newer lookup no longer returned them; they stayed
+  in the "agreed name" search and the dataset's `names`. The newest lookup
+  of a name now stands alone, whichever order the lookups arrive in.
+- Re-reading stored scans after an upgrade (host keys, scan facts)
+  decompressed and parsed each batch's nmap XML while holding the database
+  write lock. The XML is now read before the lock is taken.
+- Dataset export: the scans of every address on a page were held with
+  their whole nmap XML (up to 64 MiB each), so an address scanned often
+  could take any amount of memory. An address's scans now carry at most
+  16 MiB of XML, newest first, and a page at most 64 MiB; a scan left out
+  says `"xml_omitted": true` (a new field, see the dataset docs).
+- The Decoys page fetched a row per LLM decoy request of the range (the
+  whole history for "all time") on every view, only to count them. The
+  database counts them now.
 
 ## [0.10.0] - 2026-10-09
 

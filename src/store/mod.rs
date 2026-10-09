@@ -1,5 +1,6 @@
 pub mod analytics;
 pub mod auth;
+mod backfill;
 pub mod blocklist;
 pub mod browse;
 pub mod canaries;
@@ -67,6 +68,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0028_manual_scan_jobs.sql"),
     include_str!("migrations/0029_scarce_credits.sql"),
     include_str!("migrations/0030_vouched.sql"),
+    include_str!("migrations/0031_stats_index.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
@@ -83,6 +85,10 @@ pub struct Store {
     pub read: sqlx::SqlitePool,
     /// Whether the trigram index over request paths and queries exists.
     search_index: Arc<AtomicBool>,
+    /// Held from an automatic enqueue's checks to its write
+    /// (`Recorder::enqueue_scan_with`). The write may be a replicated
+    /// append, so one transaction cannot cover both.
+    pub(crate) enqueue: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Store {
@@ -129,6 +135,7 @@ impl Store {
             pool,
             read,
             search_index: Arc::new(AtomicBool::new(search)),
+            enqueue: Default::default(),
         })
     }
 

@@ -76,14 +76,31 @@ pub(crate) async fn derive(
     ip_id: i64,
     raw_xml: Option<&[u8]>,
 ) -> Result<()> {
-    let (keys, names) = match raw_xml.map(|b| zstd_decode_capped(b, MAX_RAW_XML)) {
+    store(conn, scan_id, ip_id, read(scan_id, raw_xml)).await
+}
+
+/// What a scan's XML yields: its identifiers, and its PTR names.
+type Read = (Vec<HostKey>, Vec<String>);
+
+/// The identifiers and PTR names in a stored scan's XML (no database).
+fn read(scan_id: i64, raw_xml: Option<&[u8]>) -> Read {
+    match raw_xml.map(|b| zstd_decode_capped(b, MAX_RAW_XML)) {
         Some(Ok(xml)) => (extract(&xml), crate::scan::hostkeys::ptr_names(&xml)),
         Some(Err(e)) => {
             tracing::debug!(scan_id, "host keys: scan XML unreadable: {e:#}");
             (vec![], vec![])
         }
         None => (vec![], vec![]),
-    };
+    }
+}
+
+/// Store what [`read`] found and mark the scan as read at `HOSTKEYS_V`.
+async fn store(
+    conn: &mut SqliteConnection,
+    scan_id: i64,
+    ip_id: i64,
+    (keys, names): Read,
+) -> Result<()> {
     // The PTR names nmap saw: local and derived like the keys, never
     // replicated on their own.
     if !names.is_empty() {
@@ -137,41 +154,43 @@ pub(crate) async fn derive(
 
 /// Scans read per write transaction by [`backfill`].
 const BACKFILL_BATCH: i64 = 50;
-/// Pause between [`backfill`]'s transactions, so the trap's and
-/// replication's writes get the lock in between.
-const BACKFILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// A scan [`backfill`] reads: id, uid, IP, XML.
+type Pending = (i64, Option<String>, i64, Option<Vec<u8>>);
+
+/// Store a backfilled scan's identifiers, unless the scan was deleted (a
+/// tombstone, an IP delete) since it was read: its keys and names would
+/// dangle.
+fn write_pending<'c>(
+    conn: &'c mut SqliteConnection,
+    (id, uid, ip_id, _): &'c Pending,
+    read: Read,
+) -> super::backfill::WriteFut<'c> {
+    Box::pin(async move {
+        if super::scans::scan_is(conn, *id, uid.as_deref()).await? {
+            store(conn, *id, *ip_id, read).await?;
+        }
+        Ok(())
+    })
+}
 
 /// Read the scans whose `keys_parsed` is below `below`: stored before
 /// `host_keys` existed, by an older build sharing the database, or by an
-/// older parser. Walks the table once by id, a short transaction per batch
-/// with a pause after it. Returns how many were read.
+/// older parser (see [`super::backfill`]). Returns how many were read.
 pub async fn backfill(pool: &sqlx::SqlitePool, below: i64) -> Result<u64> {
-    let mut done = 0;
-    let mut after = 0i64;
-    loop {
-        // Selected under the write lock: a scan deleted (a tombstone, an IP
-        // delete) between reading and writing would leave a dangling key.
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        let rows: Vec<(i64, i64, Option<Vec<u8>>)> = sqlx::query_as(
-            "SELECT id, ip_id, raw_xml FROM scans WHERE keys_parsed < ? AND id > ?
-             ORDER BY id LIMIT ?",
-        )
-        .bind(below)
-        .bind(after)
-        .bind(BACKFILL_BATCH)
-        .fetch_all(&mut *tx)
-        .await?;
-        let Some((last, _, _)) = rows.last() else {
-            return Ok(done);
-        };
-        after = *last;
-        for (id, ip_id, xml) in &rows {
-            derive(&mut tx, *id, *ip_id, xml.as_deref()).await?;
-        }
-        tx.commit().await?;
-        done += rows.len() as u64;
-        tokio::time::sleep(BACKFILL_PAUSE).await;
-    }
+    super::backfill::run(
+        pool,
+        super::backfill::Walk {
+            pending: "SELECT id, uid, ip_id, raw_xml FROM scans
+                      WHERE keys_parsed < ? AND id > ? ORDER BY id LIMIT ?",
+            below: Some(below),
+            batch: BACKFILL_BATCH,
+            id: |r: &Pending| r.0,
+            derive: |r: &Pending| read(r.0, r.3.as_deref()),
+            write: write_pending,
+        },
+    )
+    .await
 }
 
 /// Store what a probe found (the same keys a scan's XML yields).
@@ -359,6 +378,35 @@ mod tests {
             0,
             "each scan once"
         );
+    }
+
+    /// The backfill reads a scan's XML outside the write lock; a scan
+    /// deleted by the time it writes gets nothing, so no key dangles.
+    #[tokio::test]
+    async fn a_scan_deleted_while_backfilled_gets_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let id = scan(
+            &s,
+            "192.0.2.7",
+            include_bytes!("../../tests/fixtures/nmap-hostkeys.xml"),
+        )
+        .await;
+        let row: Pending = sqlx::query_as("SELECT id, uid, ip_id, raw_xml FROM scans WHERE id = ?")
+            .bind(id)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        let found = read(row.0, row.3.as_deref());
+        assert_eq!(found.0.len(), 5);
+        s.local().delete_scan(id).await.unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        write_pending(&mut conn, &row, found).await.unwrap();
+        let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM host_keys")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(keys, 0);
     }
 
     #[tokio::test]

@@ -428,6 +428,10 @@ impl Recorder {
             }
             return Ok(EnqueueOutcome::Suppressed);
         }
+        // One at a time: requests arriving together would each pass the
+        // checks below before any wrote its job, and queue duplicates that
+        // count against the queue and the budgets.
+        let _one = self.store().enqueue.lock().await;
         let cooldown_hours = policy.cooldown_hours;
         let pool = &self.store().pool;
         let ip_text = self.ip_of(ip_id).await?;
@@ -765,30 +769,10 @@ impl Recorder {
         let now = now_ts();
         let mut records = vec![];
         if let Some(res) = result {
-            records.push(Record::ScanResult(ScanResultRec {
-                build: crate::COMMIT.into(),
-                uid: self.uid(),
-                job_uid: uid.clone(),
-                ip,
-                level,
-                started_at: started_at.clone().unwrap_or_else(|| now.clone()),
-                finished_at: Some(now.clone()),
-                os_guess: res.os_guess.clone(),
-                raw_xml: Some(zstd::encode_all(res.raw_xml.as_slice(), 3)?),
-                scrubbed: res.scrubbed,
-                ports: res
-                    .ports
-                    .iter()
-                    .map(|p| PortRec {
-                        port: p.port as i64,
-                        proto: p.proto.clone(),
-                        state: p.state.clone(),
-                        service: p.service.clone(),
-                        product: p.product.clone(),
-                        version: p.version.clone(),
-                    })
-                    .collect(),
-            }));
+            let started = started_at.as_deref().unwrap_or(&now);
+            records.push(Record::ScanResult(
+                self.scan_rec(&uid, &ip, level, started, &now, res)?,
+            ));
         }
         records.push(Record::JobStatus(JobStatusRec {
             job_uid: uid.clone(),
@@ -895,14 +879,29 @@ impl Recorder {
         started_at: &str,
         res: &ScanResult,
     ) -> Result<()> {
-        self.write(vec![Record::ScanResult(ScanResultRec {
+        let rec = self.scan_rec(job_uid, ip, level, started_at, &now_ts(), res)?;
+        self.write(vec![Record::ScanResult(rec)]).await
+    }
+
+    /// A scan result as recorded: this node's uid and build, the XML
+    /// compressed.
+    fn scan_rec(
+        &self,
+        job_uid: &str,
+        ip: &str,
+        level: i64,
+        started_at: &str,
+        finished_at: &str,
+        res: &ScanResult,
+    ) -> Result<ScanResultRec> {
+        Ok(ScanResultRec {
             build: crate::COMMIT.into(),
             uid: self.uid(),
             job_uid: job_uid.to_string(),
             ip: ip.to_string(),
             level,
             started_at: started_at.to_string(),
-            finished_at: Some(now_ts()),
+            finished_at: Some(finished_at.to_string()),
             os_guess: res.os_guess.clone(),
             raw_xml: Some(zstd::encode_all(res.raw_xml.as_slice(), 3)?),
             scrubbed: res.scrubbed,
@@ -918,8 +917,7 @@ impl Recorder {
                     version: p.version.clone(),
                 })
                 .collect(),
-        })])
-        .await
+        })
     }
 
     /// Publish an audit: this node's own scan of `ip`, run to check the
@@ -933,33 +931,11 @@ impl Recorder {
         started_at: &str,
         res: &ScanResult,
     ) -> Result<()> {
+        let scan = self.scan_rec(job_uid, ip, level, started_at, &now_ts(), res)?;
         self.write(vec![Record::ScanAudit(Box::new(
             crate::cluster::record::ScanAuditRec {
                 audit_of: audit_of.to_string(),
-                scan: ScanResultRec {
-                    build: crate::COMMIT.into(),
-                    uid: self.uid(),
-                    job_uid: job_uid.to_string(),
-                    ip: ip.to_string(),
-                    level,
-                    started_at: started_at.to_string(),
-                    finished_at: Some(now_ts()),
-                    os_guess: res.os_guess.clone(),
-                    raw_xml: Some(zstd::encode_all(res.raw_xml.as_slice(), 3)?),
-                    scrubbed: res.scrubbed,
-                    ports: res
-                        .ports
-                        .iter()
-                        .map(|p| PortRec {
-                            port: p.port as i64,
-                            proto: p.proto.clone(),
-                            state: p.state.clone(),
-                            service: p.service.clone(),
-                            product: p.product.clone(),
-                            version: p.version.clone(),
-                        })
-                        .collect(),
-                },
+                scan,
             },
         ))])
         .await
@@ -1053,9 +1029,13 @@ impl Recorder {
         Ok((own, other))
     }
 
-    /// Delete records this node originated, everywhere.
+    /// Delete records this node originated, everywhere: a tombstone per
+    /// [`TOMB_CHUNK`] uids, each its own write transaction, [`PRUNE_PAUSE`]
+    /// apart (a bulk delete in one transaction outlasted the busy timeout
+    /// of the trap's writes waiting for the lock). Each tombstone names its
+    /// own uids with their positions, so it stands alone.
     async fn bury(&self, uids: Vec<String>) -> Result<()> {
-        let mut records = vec![];
+        let mut wrote = false;
         for c in uids.chunks(TOMB_CHUNK) {
             let (uids, seqs) = match self {
                 Recorder::Local(_) => (c.to_vec(), vec![]),
@@ -1082,31 +1062,36 @@ impl Recorder {
             if uids.is_empty() {
                 continue;
             }
-            records.push(Record::Tombstone(TombstoneRec {
+            if std::mem::replace(&mut wrote, true) {
+                tokio::time::sleep(PRUNE_PAUSE).await;
+            }
+            self.write(vec![Record::Tombstone(TombstoneRec {
                 uid: self.uid(),
                 uids,
                 seqs,
-            }));
-        }
-        if !records.is_empty() {
-            self.write(records).await?;
+            })])
+            .await?;
         }
         Ok(())
     }
 
     /// Records other nodes originated cannot be deleted from here: they are
-    /// hidden on this node only.
+    /// hidden on this node only, [`TOMB_CHUNK`] per write transaction,
+    /// [`PRUNE_PAUSE`] apart.
     async fn hide(&self, uids: Vec<String>) -> Result<u64> {
         let Recorder::Cluster(n) = self else {
             return Ok(0);
         };
-        if uids.is_empty() {
-            return Ok(0);
+        let mut hidden = 0;
+        for (i, c) in uids.chunks(TOMB_CHUNK).enumerate() {
+            if i > 0 {
+                tokio::time::sleep(PRUNE_PAUSE).await;
+            }
+            let _g = n.apply_lock.lock().await;
+            let mut tx = n.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+            hidden += data::hide(&mut tx, c).await?;
+            tx.commit().await?;
         }
-        let _g = n.apply_lock.lock().await;
-        let mut tx = n.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let hidden = data::hide(&mut tx, &uids).await?;
-        tx.commit().await?;
         Ok(hidden)
     }
 
@@ -1128,8 +1113,10 @@ impl Recorder {
             .split("fingerprints", "request_uid", Keys::Uids(&all))
             .await?;
         let (deleted, hidden) = (reqs.len() as u64, foreign.len() as u64);
-        self.bury([reqs, claims, fps].concat()).await?;
-        // Children first: hiding a request unlinks its fingerprints.
+        // Children first, in both: a delete cut short between two
+        // tombstones leaves no claim or fingerprint behind its request, and
+        // hiding a request unlinks its fingerprints.
+        self.bury([fps, claims, reqs].concat()).await?;
         self.hide([their_fps, their_claims, foreign].concat())
             .await?;
         Ok(Deleted { deleted, hidden })
@@ -1159,6 +1146,7 @@ impl Recorder {
             own.extend(o);
             foreign.extend(f);
         }
+        own.extend(self.own_lookups(ids).await?);
         let deleted = own.len() as u64;
         self.bury(own).await?;
         let hidden = self.hide(foreign).await?;
@@ -1174,6 +1162,52 @@ impl Recorder {
             data::drop_orphan_ip(&mut conn, *id).await?;
         }
         Ok(Deleted { deleted, hidden })
+    }
+
+    /// Uids of this node's name lookups (`ip_name`, `rdns_name`) that gave
+    /// a name to one of these IPs. Their rows on other nodes would keep the
+    /// IP there. A lookup goes as a whole: the names it gave other
+    /// addresses go with it. None on a standalone node: its name rows are
+    /// its own and [`Recorder::delete_ips`] removes them directly.
+    async fn own_lookups(&self, ids: &[i64]) -> Result<Vec<String>> {
+        let Recorder::Cluster(n) = self else {
+            return Ok(vec![]);
+        };
+        let mut addrs = std::collections::HashSet::new();
+        for id in ids {
+            if let Some(ip) = self.find_ip(*id).await?
+                && let Ok(a) = ip.parse::<std::net::IpAddr>()
+            {
+                addrs.insert(crate::net::canonical(a));
+            }
+        }
+        if addrs.is_empty() {
+            return Ok(vec![]);
+        }
+        let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT uid, payload FROM repl_log
+             WHERE origin = ? AND kind IN ('ip_name', 'rdns_name')
+               AND uid IS NOT NULL AND payload IS NOT NULL AND erased_by IS NULL",
+        )
+        .bind(n.id().0.to_vec())
+        .fetch_all(&n.store.pool)
+        .await?;
+        let names = |r: Record| match r {
+            Record::IpName(r) => crate::intel::dns::tally(&r.answers)
+                .votes
+                .iter()
+                .any(|v| addrs.contains(&v.addr)),
+            Record::RdnsName(r) => {
+                r.ip.parse::<std::net::IpAddr>()
+                    .is_ok_and(|a| addrs.contains(&crate::net::canonical(a)))
+            }
+            _ => false,
+        };
+        Ok(rows
+            .into_iter()
+            .filter(|(_, p)| crate::cluster::rpc::cbor::decode::<Record>(p).is_ok_and(names))
+            .map(|(uid, _)| uid)
+            .collect())
     }
 
     pub async fn delete_scan(&self, id: i64) -> Result<Deleted> {
@@ -1331,6 +1365,36 @@ mod tests {
         assert_eq!(both, (2, 2));
     }
 
+    /// Requests of one IP arriving at once queue one job, not one each.
+    #[tokio::test]
+    async fn concurrent_enqueues_queue_one_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let rec = store.local();
+        let ip = store
+            .upsert_ip("203.0.113.61".parse().unwrap())
+            .await
+            .unwrap();
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let rec = rec.clone();
+                tokio::spawn(async move { rec.enqueue_scan(ip.id, 2, 24).await.unwrap() })
+            })
+            .collect();
+        let mut queued = 0;
+        for t in tasks {
+            if matches!(t.await.unwrap(), EnqueueOutcome::Queued(_)) {
+                queued += 1;
+            }
+        }
+        assert_eq!(queued, 1);
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(jobs, 1);
+    }
+
     fn req(ip_id: i64) -> NewRequest {
         NewRequest {
             ip_id,
@@ -1424,5 +1488,42 @@ mod tests {
             .unwrap();
         assert_eq!(left, [new.unwrap()]);
         assert!(rec.prune_older_than(90).await.unwrap().is_empty());
+    }
+
+    /// A bulk delete commits a tombstone at a time: readers see it part
+    /// done, and the trap writes in between.
+    #[tokio::test]
+    async fn bulk_deletes_commit_in_short_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let rec = store.local();
+        let ip = store
+            .upsert_ip("198.51.100.41".parse().unwrap())
+            .await
+            .unwrap();
+        let n = TOMB_CHUNK * 3;
+        let mut ids = vec![];
+        for _ in 0..n {
+            ids.push(rec.insert_request(&req(ip.id)).await.unwrap());
+        }
+        let count = async || -> i64 {
+            sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+                .fetch_one(&store.read)
+                .await
+                .unwrap()
+        };
+        let deleting = tokio::spawn({
+            let rec = rec.clone();
+            async move { rec.delete_requests(&ids).await.unwrap() }
+        });
+        let mut partial = false;
+        while !deleting.is_finished() {
+            let left = count().await;
+            partial |= left > 0 && left < n as i64;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(deleting.await.unwrap().deleted, n as u64);
+        assert!(partial, "committed in one transaction");
+        assert_eq!(count().await, 0);
     }
 }

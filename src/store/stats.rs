@@ -637,12 +637,7 @@ impl Store {
     /// Request counts per UTC hour (`%Y-%m-%dT%H:00`) and severity, oldest
     /// first.
     async fn hourly_by_severity(&self, r: Range, a: Audience) -> Result<Vec<(String, i64, i64)>> {
-        let (w, since) = r.ts_clause("r.ts");
-        let w = w + &a.released("r");
-        let sql = format!(
-            "SELECT strftime('%Y-%m-%dT%H:00', r.ts) AS h, r.severity, COUNT(*) FROM requests r
-             WHERE 1=1{w} GROUP BY h, r.severity ORDER BY h"
-        );
+        let (sql, since) = hourly_sql(r, a);
         let rows = bind_since!(
             sqlx::query_as::<_, (Option<String>, i64, i64)>(sqlx::AssertSqlSafe(sql.as_str())),
             since
@@ -684,12 +679,7 @@ impl Store {
     /// lists first (few distinct combinations), so each request counts once
     /// per family or tag without unpacking every row's JSON.
     async fn families_and_owasp(&self, r: Range, a: Audience) -> Result<(Vec<Named>, Vec<Named>)> {
-        let (w, since) = r.ts_clause("r.ts");
-        let w = w + &a.released("r");
-        let sql = format!(
-            "SELECT r.labels_json, r.owasp_json, COUNT(*) FROM requests r
-             WHERE 1=1{w} GROUP BY r.labels_json, r.owasp_json"
-        );
+        let (sql, since) = families_sql(r, a);
         let rows = bind_since!(
             sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql.as_str())),
             since
@@ -756,6 +746,30 @@ impl Store {
             max,
         })
     }
+}
+
+/// [`Store::hourly_by_severity`]'s query and its bind. It reads only
+/// `idx_requests_stats`, not the rows.
+fn hourly_sql(r: Range, a: Audience) -> (String, Option<&'static str>) {
+    let (w, since) = r.ts_clause("r.ts");
+    let w = w + &a.released("r");
+    let sql = format!(
+        "SELECT strftime('%Y-%m-%dT%H:00', r.ts) AS h, r.severity, COUNT(*) FROM requests r
+         WHERE 1=1{w} GROUP BY h, r.severity ORDER BY h"
+    );
+    (sql, since)
+}
+
+/// [`Store::families_and_owasp`]'s query and its bind. It reads only
+/// `idx_requests_stats`, not the rows.
+fn families_sql(r: Range, a: Audience) -> (String, Option<&'static str>) {
+    let (w, since) = r.ts_clause("r.ts");
+    let w = w + &a.released("r");
+    let sql = format!(
+        "SELECT r.labels_json, r.owasp_json, COUNT(*) FROM requests r
+         WHERE 1=1{w} GROUP BY r.labels_json, r.owasp_json"
+    );
+    (sql, since)
 }
 
 /// Warn when Tor/MaxMind data is missing or older than 48h (original spec §9).
@@ -883,6 +897,10 @@ where
             let mut map = inner.lock().unwrap_or_else(|p| p.into_inner());
             match result {
                 Ok(v) => Self::insert(&mut map, max, key, Arc::new(v)),
+                // The row was deleted: the next caller finds out.
+                Err(e) if e.is::<Gone>() => {
+                    map.remove(&key);
+                }
                 Err(e) => {
                     tracing::warn!(?e, "cache refresh failed; serving the stale value");
                     if let Some(entry) = map.get_mut(&key) {
@@ -1314,6 +1332,36 @@ mod tests {
         assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
+    /// A refresh that finds the row gone drops the stale value: the next
+    /// caller learns it is gone instead of being served it for minutes.
+    #[tokio::test]
+    async fn a_refresh_that_finds_the_row_gone_evicts_it() {
+        let c: SwrCache<u8, usize> = SwrCache::new(4);
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ttl = Duration::from_millis(20);
+        let f = {
+            let gone = gone.clone();
+            move || -> BoxFut<usize> {
+                let gone = gone.load(std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    if gone {
+                        Err(anyhow::Error::new(Gone))
+                    } else {
+                        Ok(1)
+                    }
+                })
+            }
+        };
+        assert_eq!(*c.get(1, ttl, &f).await.unwrap(), 1);
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Stale: served once while the refresh finds it gone.
+        assert_eq!(*c.get(1, ttl, &f).await.unwrap(), 1);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let e = c.get(1, ttl, &f).await.unwrap_err();
+        assert!(e.is::<Gone>(), "{e:#}");
+    }
+
     #[tokio::test]
     async fn all_time_stats_come_from_the_read_models() {
         let s = seeded().await;
@@ -1395,6 +1443,39 @@ mod tests {
         assert_eq!(get(&st.owasp, "A03:2021"), Some(1));
         assert_eq!(get(&st.owasp, "OAT-018"), Some(3));
         assert_eq!(st.owasp[0].name, "OAT-018", "most frequent first");
+    }
+
+    /// The timeline and the families read an index, never the rows (whose
+    /// headers and bodies make a full scan slow), for every range and
+    /// audience.
+    #[tokio::test]
+    async fn timeline_and_families_read_only_an_index() {
+        let s = seeded().await;
+        for r in Range::ALL {
+            for a in [Audience::Admin, Audience::Public] {
+                for (sql, since) in [hourly_sql(r, a), families_sql(r, a)] {
+                    let plan: Vec<(i64, i64, i64, String)> = bind_since!(
+                        sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}"))),
+                        since
+                    )
+                    .fetch_all(&s.read)
+                    .await
+                    .unwrap();
+                    let reads: Vec<&str> = plan
+                        .iter()
+                        .map(|p| p.3.as_str())
+                        .filter(|d| d.starts_with("SCAN r ") || d.starts_with("SEARCH r "))
+                        .collect();
+                    assert!(!reads.is_empty(), "{plan:?}");
+                    for d in reads {
+                        assert!(
+                            d.contains("COVERING INDEX idx_requests_stats"),
+                            "{r:?} {a:?}: {d}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

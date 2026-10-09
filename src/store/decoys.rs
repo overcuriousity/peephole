@@ -2,7 +2,7 @@
 //! AI": over full rows with an MCP or LLM decoy answer. Sessions are
 //! linked by the `mcp-session` canary and the tokens of later requests.
 use super::Store;
-use super::browse::{Audience, PAGE_SIZE, Page};
+use super::browse::{Audience, PAGE_SIZE, Page, offset};
 use super::stats::{Named, Range};
 use anyhow::Result;
 
@@ -175,7 +175,7 @@ impl Store {
              WHERE r.decoy_in IS NOT NULL AND r.answer IN ('decoy:mcp:tools/call', 'decoy:mcp:resources/read'){w}{tw}
              ORDER BY r.id DESC LIMIT {} OFFSET {}",
             PAGE_SIZE + 1,
-            i64::from(page - 1) * PAGE_SIZE
+            offset(page)
         )));
         if let Some(m) = since {
             q = q.bind(m);
@@ -198,9 +198,13 @@ impl Store {
             q = q.bind(m);
         }
         let by_api = q.fetch_all(&self.read).await?;
-        let mut q = sqlx::query_as::<_, (String, Option<String>)>(sqlx::AssertSqlSafe(format!(
-            "SELECT r.answer, json_extract(r.decoy_in, '$.model') {base}"
-        )));
+        // Counted in SQL per endpoint and model (few distinct pairs), not a
+        // row per request: the range may be the whole history.
+        let mut q = sqlx::query_as::<_, (String, Option<String>, i64)>(sqlx::AssertSqlSafe(
+            format!(
+                "SELECT r.answer, json_extract(r.decoy_in, '$.model'), COUNT(*) {base} GROUP BY 1, 2"
+            ),
+        ));
         if let Some(m) = since {
             q = q.bind(m);
         }
@@ -208,22 +212,22 @@ impl Store {
             by_api,
             ..Default::default()
         };
-        for (answer, model) in q.fetch_all(&self.read).await? {
+        for (answer, model, n) in q.fetch_all(&self.read).await? {
             match answer.trim_start_matches("decoy:llm:") {
-                "tags" | "models" if model.is_none() => s.listings += 1,
+                "tags" | "models" if model.is_none() => s.listings += n,
                 "chat" | "generate" | "chat-completions" | "completions" | "responses"
                 | "messages" | "complete" => {
-                    s.calls += 1;
+                    s.calls += n;
                     if model
                         .as_deref()
                         .is_some_and(crate::trap::decoy::llm::listed)
                     {
-                        s.listed += 1
+                        s.listed += n
                     } else {
-                        s.unlisted += 1
+                        s.unlisted += n
                     }
                 }
-                "pull" => s.pulls += 1,
+                "pull" => s.pulls += n,
                 _ => {}
             }
         }
@@ -263,7 +267,7 @@ impl Store {
                 'decoy:llm:responses', 'decoy:llm:messages', 'decoy:llm:complete'){w}
              ORDER BY r.id DESC LIMIT {} OFFSET {}",
             PAGE_SIZE + 1,
-            i64::from(page - 1) * PAGE_SIZE
+            offset(page)
         )));
         if let Some(m) = since {
             q = q.bind(m);
@@ -776,10 +780,35 @@ mod tests {
             r#"{"model":"deepseek-r1:671b","messages":[{"role":"user","content":"hi"}]}"#,
         )
         .await;
+        // Counted per request, also where endpoint and model repeat.
+        for _ in 0..2 {
+            req(
+                &s,
+                "8.8.4.4",
+                "/v1/chat/completions",
+                "decoy:llm:chat-completions",
+                r#"{"api":"openai","ep":"chat-completions","model":"gpt-4o"}"#,
+                &[],
+                None,
+                "",
+            )
+            .await;
+        }
+        req(
+            &s,
+            "8.8.4.4",
+            "/api/pull",
+            "decoy:llm:pull",
+            r#"{"api":"ollama","ep":"pull","model":"llama3"}"#,
+            &[],
+            None,
+            "",
+        )
+        .await;
         let sum = s.llm_summary(Range::All).await.unwrap();
         assert_eq!(
-            (sum.listings, sum.calls, sum.listed, sum.unlisted),
-            (1, 2, 1, 1)
+            (sum.listings, sum.calls, sum.listed, sum.unlisted, sum.pulls),
+            (1, 4, 3, 1, 1)
         );
         let models = s.llm_models(Range::All).await.unwrap();
         assert!(

@@ -235,7 +235,7 @@ fn parse_q(q: &str) -> IpQuery {
         return IpQuery::Prefix(String::new());
     }
     if let Ok(ip) = q.parse::<IpAddr>() {
-        return IpQuery::Exact(ip.to_string());
+        return IpQuery::Exact(crate::net::canonical(ip).to_string());
     }
     if let Ok(net) = q.parse::<IpNet>() {
         return IpQuery::Net(net);
@@ -635,12 +635,13 @@ fn request_filter_sql(f: &RequestFilter, a: Audience, indexed: bool) -> (String,
     (sql, binds)
 }
 
-/// IPs are stored in canonical form (`IpAddr::to_string`); match user input
-/// like `2001:DB8:0::1` against that. Non-IPs pass through unchanged.
+/// IPs are stored in canonical form (`net::canonical`, as text); match user
+/// input like `2001:DB8:0::1` or `::ffff:203.0.113.7` against that. Non-IPs
+/// pass through unchanged.
 pub fn canonical_ip(v: &str) -> String {
     v.trim()
         .parse::<IpAddr>()
-        .map(|ip| ip.to_string())
+        .map(|ip| crate::net::canonical(ip).to_string())
         .unwrap_or_else(|_| v.trim().to_string())
 }
 
@@ -703,7 +704,7 @@ impl Store {
         let mut binds = vec![];
         for a in addrs {
             ors.push("i.ip = ?".to_string());
-            binds.push(a.to_string());
+            binds.push(crate::net::canonical(*a).to_string());
         }
         for n in nets {
             let (lo, hi) = super::net_key_range(n);
@@ -849,7 +850,7 @@ impl Store {
             return Ok(None);
         };
         Ok(sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE ip = ?")
-            .bind(ip.to_string())
+            .bind(crate::net::canonical(ip).to_string())
             .fetch_optional(&self.read)
             .await?)
     }
@@ -1063,7 +1064,11 @@ mod ts_tests {
         use super::canonical_ip;
         assert_eq!(canonical_ip(" 2001:DB8:0::1 "), "2001:db8::1");
         assert_eq!(canonical_ip("203.0.113.1"), "203.0.113.1");
+        assert_eq!(canonical_ip("::ffff:203.0.113.1"), "203.0.113.1");
         assert_eq!(canonical_ip("not-an-ip"), "not-an-ip");
+        assert!(
+            matches!(super::parse_q(" ::ffff:203.0.113.1 "), super::IpQuery::Exact(ip) if ip == "203.0.113.1")
+        );
     }
 }
 
@@ -1344,6 +1349,9 @@ mod tests {
         assert!(s.ip_by_addr("hello").await.unwrap().is_none());
         assert!(s.ip_by_addr("203.0.113.77").await.unwrap().is_none());
         let ip = s.ip_by_addr("203.0.113.1").await.unwrap().unwrap();
+        // A mapped IPv4 address is the IPv4 address it maps.
+        let mapped = s.ip_by_addr("::ffff:203.0.113.1").await.unwrap().unwrap();
+        assert_eq!(mapped.id, ip.id);
         let ov = s.ip_overview(ip.id).await.unwrap().unwrap();
         assert_eq!(ov.request_count, 3);
         assert_eq!(ov.max_severity, 3);

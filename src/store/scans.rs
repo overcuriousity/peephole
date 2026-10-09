@@ -13,6 +13,22 @@ pub enum EnqueueOutcome {
     Throttled(&'static str),
 }
 
+/// Whether scan `id` is still the scan read as `uid` (not deleted since,
+/// its id not taken by another).
+pub(crate) async fn scan_is(
+    conn: &mut sqlx::SqliteConnection,
+    id: i64,
+    uid: Option<&str>,
+) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM scans WHERE id = ? AND uid IS ?)")
+            .bind(id)
+            .bind(uid)
+            .fetch_one(&mut *conn)
+            .await?,
+    )
+}
+
 #[derive(sqlx::FromRow)]
 pub struct ScanJobRow {
     pub id: i64,

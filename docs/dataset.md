@@ -153,7 +153,7 @@ service's documentation; an empty object means the service knew nothing.
   "host_keys": [{"kind": "ssh-hostkey", "port": 22, "fingerprint": "SHA256:…", "detail": "ed25519 256"}],
   "facts": [{"port": 80, "proto": "tcp", "kind": "http.title", "value": "PentAGI"},
             {"port": null, "proto": null, "kind": "smb.server", "value": "WIN-344VU98D3RU"}],
-  "xml": "<?xml …>  the full nmap output"}]
+  "xml": "<?xml …>  the full nmap output", "xml_omitted": false}]
 ```
 
 `level` 1 to 4 for queued scans (more ports, service versions, OS detection, safe scripts);
@@ -188,6 +188,11 @@ configured and interface addresses only, not the address peers saw the
 node connect from, so a node behind NAT should set `scan.own_addresses`
 (the installer offers it); the admin download and admin export remove the
 peer-observed addresses too.
+`xml_omitted`: the XML was left out to bound the export's memory. An
+address's scans carry at most 16 MiB of XML, newest first, and the
+addresses on one page of 5000 rows at most 64 MiB together; past that,
+`xml` is null. A scan with no stored or no readable XML has `xml` null and
+`xml_omitted` false.
 
 **`names`**: host names known to point at the address, by name.
 

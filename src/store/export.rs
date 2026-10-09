@@ -86,8 +86,15 @@ pub struct ScanOut {
     pub started_at: String,
     pub finished_at: Option<String>,
     pub os_guess: Option<String>,
-    /// zstd-compressed, as stored.
-    pub raw_xml: Option<Vec<u8>>,
+    /// Length of the stored (zstd-compressed) XML.
+    pub xml_len: Option<i64>,
+    /// The XML, decompressed: read separately, within [`MAX_IP_XML`] and
+    /// [`MAX_PAGE_XML`]. None without one, unreadable, or omitted.
+    #[sqlx(skip)]
+    pub xml: Option<Vec<u8>>,
+    /// The XML was left out: over the address's or the page's budget.
+    #[sqlx(skip)]
+    pub xml_omitted: bool,
     pub status: Option<String>,
     pub scanner: Option<Vec<u8>>,
     pub origin: Option<Vec<u8>>,
@@ -188,6 +195,28 @@ pub struct PageContext {
     pub canary_used_from: HashMap<i64, Vec<String>>,
     /// IPs that filed a false-positive claim.
     pub claimed: HashSet<i64>,
+}
+
+/// Most scan XML (decompressed) exported per address, newest scans first
+/// ...
+pub const MAX_IP_XML: u64 = 16 * 1024 * 1024;
+/// ... and per page of rows (an address's scans repeat on each of its
+/// rows, but are held once per page). Beyond, a scan's XML is left out.
+pub const MAX_PAGE_XML: u64 = 64 * 1024 * 1024;
+
+/// A scan's stored XML decompressed: None if unreadable, Err past `limit`
+/// bytes.
+fn decode_within(data: &[u8], limit: u64) -> Result<Option<Vec<u8>>, ()> {
+    use std::io::Read;
+    let Ok(dec) = zstd::stream::Decoder::new(data) else {
+        return Ok(None);
+    };
+    let mut out = Vec::new();
+    match dec.take(limit + 1).read_to_end(&mut out) {
+        Ok(n) if n as u64 > limit => Err(()),
+        Ok(_) => Ok(Some(out)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// `[a, b, …]` as JSON, for `IN (SELECT value FROM json_each(?))`.
@@ -310,10 +339,11 @@ impl Store {
         for i in intel {
             c.intel.entry(i.ip.clone()).or_default().push(i);
         }
-        let scans: Vec<ScanOut> = sqlx::query_as(
+        let mut scans: Vec<ScanOut> = sqlx::query_as(
             // An audit carries the job of the scan it checks: its scanner
             // is the auditor, and it is done once it has finished.
-            "SELECT s.id, s.ip_id, s.level, s.started_at, s.finished_at, s.os_guess, s.raw_xml,
+            "SELECT s.id, s.ip_id, s.level, s.started_at, s.finished_at, s.os_guess,
+                    length(s.raw_xml) AS xml_len,
                     CASE WHEN s.audit_of IS NULL THEN j.status
                          WHEN s.finished_at IS NOT NULL THEN 'done' END AS status,
                     CASE WHEN s.audit_of IS NULL THEN j.scanner ELSE s.origin END AS scanner,
@@ -324,6 +354,7 @@ impl Store {
         .bind(json_list(ip_ids))
         .fetch_all(&self.read)
         .await?;
+        self.read_xml(&mut scans, ip_ids).await?;
         let scan_ids: Vec<i64> = scans.iter().map(|s| s.id).collect();
         let mut ports: HashMap<i64, Vec<PortOut>> = HashMap::new();
         let rows: Vec<PortOut> = sqlx::query_as(
@@ -421,6 +452,49 @@ impl Store {
             c.canary_used_from.entry(id).or_default().push(uid);
         }
         Ok(c)
+    }
+
+    /// Fill in the XML of `scans`, one scan at a time: per address (in the
+    /// page's order) its newest scans first, until [`MAX_IP_XML`] or
+    /// [`MAX_PAGE_XML`] is used up; the rest are marked omitted.
+    async fn read_xml(&self, scans: &mut [ScanOut], ip_ids: &[i64]) -> Result<()> {
+        let mut by_ip: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (i, s) in scans.iter().enumerate() {
+            by_ip.entry(s.ip_id).or_default().push(i);
+        }
+        let mut page_left = MAX_PAGE_XML;
+        for ip_id in ip_ids {
+            let Some(idx) = by_ip.remove(ip_id) else {
+                continue;
+            };
+            let mut ip_left = MAX_IP_XML;
+            for i in idx.into_iter().rev() {
+                let s = &mut scans[i];
+                let Some(len) = s.xml_len else { continue };
+                let limit = ip_left.min(page_left);
+                // The compressed XML is no bigger than what it holds.
+                if len as u64 > limit {
+                    s.xml_omitted = true;
+                    continue;
+                }
+                let raw: Option<Vec<u8>> =
+                    sqlx::query_scalar("SELECT raw_xml FROM scans WHERE id = ?")
+                        .bind(s.id)
+                        .fetch_optional(&self.read)
+                        .await?
+                        .flatten();
+                match raw.as_deref().map(|b| decode_within(b, limit)) {
+                    Some(Ok(xml)) => {
+                        let n = xml.as_ref().map_or(0, |x| x.len() as u64);
+                        (ip_left, page_left) = (ip_left - n, page_left - n);
+                        s.xml = xml;
+                    }
+                    Some(Err(())) => s.xml_omitted = true,
+                    None => {}
+                }
+            }
+        }
+        Ok(())
     }
 }
 
