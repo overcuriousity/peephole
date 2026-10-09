@@ -37,7 +37,8 @@ data_dir = "/var/lib/peephole"
 # Proxies whose X-Forwarded-For header is trusted for the real client IP.
 # Every host in these ranges is believed about the client address: list only
 # the proxy (nginx on this machine: ["127.0.0.1/32", "::1/128"]; nothing in
-# front of the trap: []).
+# front of the trap: []). A /0 prefix is refused; one wider than an IPv4 /8
+# or an IPv6 /32 is warned about.
 trusted_proxies = ["10.0.0.5/32"]
 
 # Trap listener behaviour. All optional; the defaults are shown.

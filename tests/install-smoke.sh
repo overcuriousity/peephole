@@ -86,7 +86,7 @@ grep -q 'points to 198.51.100.1 - not to this machine' /tmp/dns.err
 for c in 10.0.0.5 10.0.0.0/24 2001:db8::/64; do
     bash install.sh --check-cidr "$c" >/dev/null || { echo "CIDR '$c' refused"; exit 1; }
 done
-for c in 10.0.0.0/33 2001:db8::/129 10.0.0.0/x example; do
+for c in 10.0.0.0/33 2001:db8::/129 10.0.0.0/x example 0.0.0.0/0 ::/0 10.0.0.0/00; do
     if bash install.sh --check-cidr "$c" 2>/dev/null; then echo "CIDR '$c' accepted"; exit 1; fi
 done
 
@@ -645,6 +645,14 @@ if PEEPHOLE_FRONT=remote PEEPHOLE_ROLES=listener PEEPHOLE_TRUSTED_PROXIES=10.0.0
     echo "expected failure"; exit 1
 fi
 grep -q "'10.0.0.0/33' is not an address or CIDR" /tmp/remote-bad.log
+test ! -e /etc/peephole/config.toml
+test ! -e /usr/local/bin/peephole
+# A /0 prefix believes every client about its own address: refused, not warned about.
+if PEEPHOLE_FRONT=remote PEEPHOLE_ROLES=listener PEEPHOLE_TRUSTED_PROXIES=192.0.2.10,::/0 \
+    bash install.sh > /tmp/remote-zero.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q "'::/0' trusts every address" /tmp/remote-zero.log
 test ! -e /etc/peephole/config.toml
 test ! -e /usr/local/bin/peephole
 

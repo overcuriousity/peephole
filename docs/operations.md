@@ -78,7 +78,9 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
   unknown names untouched, with a PROXY protocol v2 header, to
   `trap_tls_listen`; no health checks on the TLS backend (a `LOCAL` header
   is refused). Hosts in `trusted_proxies` are believed about the client
-  address, so list only the proxy (a bare address means that one host).
+  address, so list only the proxy (a bare address means that one host). A
+  `/0` prefix is refused (by the installer and by peephole); a range wider
+  than an IPv4 `/8` or an IPv6 `/32` loads with a warning.
 
 **Cloud machines.** On AWS, Google Cloud, Azure, Alibaba Cloud and Oracle
 Cloud (recognised from the DMI data or the metadata service) the installer

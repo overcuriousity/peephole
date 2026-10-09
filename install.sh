@@ -158,6 +158,17 @@ valid_cidr() {
     if [[ "$a" == *:* ]]; then [ "$p" -le 128 ]; else [ "$p" -le 32 ]; fi
 }
 
+# Why an entry of trusted_proxies is refused (nothing: it is fine). A /0
+# prefix would believe every client about its own address (peephole
+# refuses it too).
+proxy_problem() {
+    if ! valid_cidr "$1"; then
+        echo "is not an address or CIDR"
+    elif [[ "$1" == */* ]] && [ "$((10#${1##*/}))" -eq 0 ]; then
+        echo "trusts every address (a /0 prefix): any client could set its own address"
+    fi
+}
+
 # The admin domain as a bare lower-case host name, from what an operator
 # may paste (https://Name.Example/admin/, a trailing dot); fails on anything
 # that is no host name with at least one dot, on a label longer than 63
@@ -216,8 +227,9 @@ if [ "${1:-}" = "--check-dns" ]; then
     echo "$why" >&2; exit 1
 fi
 if [ "${1:-}" = "--check-cidr" ]; then
-    if valid_cidr "${2:-}"; then echo ok; exit 0; fi
-    echo "'${2:-}' is not an address or CIDR" >&2; exit 1
+    why="$(proxy_problem "${2:-}")"
+    if [ -z "$why" ]; then echo ok; exit 0; fi
+    echo "'${2:-}' ${why}" >&2; exit 1
 fi
 
 # Not loopback, private, CGNAT or link-local.
@@ -1018,30 +1030,21 @@ if [ "$upgrade" -ne 1 ]; then
                         prompt PEEPHOLE_TRUSTED_PROXIES "Address(es) of that proxy, as seen from this machine"
                     fi
                     # A bare address is that one host.
-                    proxies=""; bad=""
+                    proxies=""; bad=""; why="is not an address or CIDR"
                     for a in $(printf '%s' "$PEEPHOLE_TRUSTED_PROXIES" | tr ',' ' '); do
-                        valid_cidr "$a" || { bad="$a"; break; }
+                        problem="$(proxy_problem "$a")"
+                        [ -z "$problem" ] || { bad="$a"; why="$problem"; break; }
                         if [[ "$a" != */* ]]; then
                             if [[ "$a" == *:* ]]; then a="${a}/128"; else a="${a}/32"; fi
                         fi
                         proxies="${proxies:+$proxies,}${a}"
                     done
-                    # A /0 prefix believes every client about its own address.
-                    if [ -z "$bad" ] && [[ ",${proxies}," == */0,* ]]; then
-                        if [ -n "$proxies_preset" ] || [ "$INTERACTIVE" -ne 1 ]; then
-                            warn "PEEPHOLE_TRUSTED_PROXIES: a /0 prefix trusts every address: any client can set its own address"
-                        else
-                            say $'A /0 prefix trusts every address: any client can set its own address.\n'
-                            PEEPHOLE_TRUSTED_PROXIES=""
-                            continue
-                        fi
-                    fi
                     [ -z "$bad" ] && [ -n "$proxies" ] && break
                     [ -n "$bad" ] || bad="$PEEPHOLE_TRUSTED_PROXIES"
                     if [ -n "$proxies_preset" ] || [ "$INTERACTIVE" -ne 1 ]; then
-                        die "PEEPHOLE_TRUSTED_PROXIES: '${bad}' is not an address or CIDR"
+                        die "PEEPHOLE_TRUSTED_PROXIES: '${bad}' ${why}"
                     fi
-                    say "'${bad}' is not an address or CIDR"$'\n'
+                    say "'${bad}' ${why}"$'\n'
                     PEEPHOLE_TRUSTED_PROXIES=""
                 done
                 PEEPHOLE_TRUSTED_PROXIES="$proxies" ;;

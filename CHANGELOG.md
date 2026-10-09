@@ -20,6 +20,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   about it by its full path, e.g. `scan.never_scan_directory`. It still
   loads. `check-config` also points out the optional `scan.own_addresses`,
   `scan.never_scan_dir` and `scan.trusted_origins` when they are not set.
+- `trusted_proxies` refuses a `/0` prefix, which believed every client about
+  its own address (and let it have this node scan whom it named); the
+  installer refuses it too instead of warning. A range wider than an IPv4
+  `/8` or an IPv6 `/32` loads with a warning.
 
 ### Fixed
 

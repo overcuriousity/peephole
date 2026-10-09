@@ -694,6 +694,25 @@ impl Config {
         }
         notes
     }
+
+    /// `trusted_proxies` entries wider than an IPv4 /8 or an IPv6 /32:
+    /// allowed (validation refuses only /0), but every address in them is
+    /// believed about the client address.
+    pub fn trusted_proxy_notes(&self) -> Vec<String> {
+        self.trusted_proxies
+            .iter()
+            .filter(|p| match p {
+                IpNet::V4(n) => n.prefix_len() < 8,
+                IpNet::V6(n) => n.prefix_len() < 32,
+            })
+            .map(|p| {
+                format!(
+                    "warning: trusted_proxies `{p}` is a wide range: every address in it is \
+                     believed about the client address; list the proxy only"
+                )
+            })
+            .collect()
+    }
 }
 
 pub fn optional_key_notes(path: &Path) -> Vec<String> {
@@ -821,6 +840,12 @@ impl Config {
         }
         if !(1..=200).contains(&p.recent_rows) {
             bail!("public.recent_rows must be between 1 and 200");
+        }
+        // A peer in trusted_proxies is believed about the client address
+        // (X-Forwarded-For, PROXY headers): with /0 any client could name
+        // any address, and have this node record and scan it.
+        if let Some(p) = self.trusted_proxies.iter().find(|p| p.prefix_len() == 0) {
+            bail!("trusted_proxies: `{p}` trusts every address; list the proxy only");
         }
         let r = self.roles;
         if !(r.listener || r.scanner || r.web) {
@@ -1530,6 +1555,29 @@ data_dir = "/tmp"
             assert!(e.to_string().contains("own_addresses"), "{e}");
         }
         assert!(scan("\"nat.example\"").is_err(), "addresses, not names");
+    }
+
+    /// A trusted proxy believes the client address a peer names: /0 would
+    /// let any client name anyone (and have the scanner scan it). A wide
+    /// range loads, with a warning.
+    #[test]
+    fn trusted_proxies_are_not_everyone() {
+        let proxies = |list: &str| {
+            parse(&format!(
+                "{BASE}trusted_proxies = [{list}]\n[roles]\nlistener = false\nweb = false\n"
+            ))
+        };
+        for bad in ["\"0.0.0.0/0\"", "\"::/0\"", "\"10.0.0.0/8\", \"::/0\""] {
+            let e = proxies(bad).unwrap_err();
+            assert!(e.to_string().contains("trusted_proxies"), "{e}");
+        }
+        let wide = proxies("\"10.0.0.0/7\", \"2001:db8::/31\", \"192.0.2.0/24\"").unwrap();
+        let notes = wide.trusted_proxy_notes().join("\n");
+        assert!(notes.contains("`10.0.0.0/7`"), "{notes}");
+        assert!(notes.contains("`2001:db8::/31`"), "{notes}");
+        assert!(!notes.contains("192.0.2.0/24"), "{notes}");
+        let narrow = proxies("\"10.0.0.0/8\", \"2001:db8::/32\"").unwrap();
+        assert!(narrow.trusted_proxy_notes().is_empty());
     }
 
     #[test]

@@ -35,8 +35,7 @@ pub const COMMIT: &str = env!("PEEPHOLE_COMMIT");
 /// one line, then notes (the built-in rules, keys that do nothing).
 pub async fn check_config(config_path: &std::path::Path) -> Result<(config::Config, String)> {
     let cfg = config::Config::load(config_path).context("config")?;
-    let mut notes = config::unknown_key_notes(config_path);
-    notes.extend(cfg.obsolete_notes());
+    let mut notes = config_warnings(&cfg, config_path);
     notes.extend(config::optional_key_notes(config_path));
     let mut summary = format!("ok: config (roles: {})", cfg.roles.names().join(", "));
     // Built into the binary: the same on every start and every node of
@@ -87,6 +86,16 @@ pub async fn check_config(config_path: &std::path::Path) -> Result<(config::Conf
     Ok((cfg, summary))
 }
 
+/// What the config sets that loads but deserves a warning: unknown keys,
+/// keys that do nothing any more, wide trusted proxies. `check-config`
+/// prints them; the daemon logs them as warnings.
+fn config_warnings(cfg: &config::Config, config_path: &std::path::Path) -> Vec<String> {
+    let mut warnings = config::unknown_key_notes(config_path);
+    warnings.extend(cfg.obsolete_notes());
+    warnings.extend(cfg.trusted_proxy_notes());
+    warnings
+}
+
 /// Whether this node loads the GeoLite2 databases in its data dir. A cluster
 /// node needs its own `[maxmind]` credentials: files copied from peers by
 /// older builds are not used, so nobody serves a frozen copy.
@@ -97,10 +106,9 @@ pub fn geolite_loads(cfg: &config::Config) -> bool {
 pub async fn run(config_path: PathBuf) -> Result<()> {
     // Startup validation (spec §12).
     let (cfg, summary) = check_config(&config_path).await?;
-    // Unknown and obsolete keys are warned about; the summary has them too
-    // (for check-config), so they are left out of its log line.
-    let mut warned = config::unknown_key_notes(&config_path);
-    warned.extend(cfg.obsolete_notes());
+    // Config warnings are logged as such; the summary has them too (for
+    // check-config), so they are left out of its log line.
+    let warned = config_warnings(&cfg, &config_path);
     let summary: Vec<&str> = summary
         .lines()
         .filter(|l| !warned.iter().any(|n| n == l))
