@@ -147,7 +147,7 @@ impl Store {
 
     /// A session not bound to a key (tests and tooling).
     pub async fn create_session(&self) -> Result<String> {
-        let token = self.create_session_for(None, None).await?;
+        let token = self.start_session(Basis::Unbound, None).await?;
         token.ok_or_else(|| anyhow::anyhow!("an unbound session is never refused"))
     }
 
@@ -158,7 +158,30 @@ impl Store {
     /// so a key deleted mid-sign-in starts no session.
     pub async fn create_session_for(
         &self,
-        cred_id: Option<&[u8]>,
+        cred_id: &[u8],
+        replacing: Option<&str>,
+    ) -> Result<Option<String>> {
+        self.start_session(Basis::Key(cred_id), replacing).await
+    }
+
+    /// Start a password session (see [`Self::create_session_for`]) for a
+    /// password checked against `phc`. `None` unless password sign-in is
+    /// still on and `phc` still the stored hash: a method switch or password
+    /// change that landed during the (slow) check ended the password
+    /// sessions, and must end this one too.
+    pub async fn create_password_session(
+        &self,
+        phc: &str,
+        replacing: Option<&str>,
+    ) -> Result<Option<String>> {
+        self.start_session(Basis::Password(phc), replacing).await
+    }
+
+    /// Insert a session once `basis` still holds, in one immediate
+    /// transaction with the check.
+    async fn start_session(
+        &self,
+        basis: Basis<'_>,
         replacing: Option<&str>,
     ) -> Result<Option<String>> {
         // Opportunistic cleanup of stale rows; cheap and keeps the tables bounded.
@@ -169,15 +192,22 @@ impl Store {
             uuid::Uuid::new_v4().simple()
         );
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(id) = cred_id {
-            let enrolled: bool =
+        let holds = match basis {
+            Basis::Unbound => true,
+            Basis::Key(id) => {
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM credentials WHERE cred_id = ?)")
                     .bind(id)
                     .fetch_one(&mut *tx)
-                    .await?;
-            if !enrolled {
-                return Ok(None);
+                    .await?
             }
+            Basis::Password(phc) => {
+                let method = get_meta(&mut tx, LOGIN_METHOD).await?;
+                let method: LoginMethod = method.and_then(|m| m.parse().ok()).unwrap_or_default();
+                method.password() && get_meta(&mut tx, PASSWORD_HASH).await?.as_deref() == Some(phc)
+            }
+        };
+        if !holds {
+            return Ok(None);
         }
         if let Some(old) = replacing {
             sqlx::query("DELETE FROM sessions WHERE id_hash = ?")
@@ -185,6 +215,10 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
+        let cred_id = match basis {
+            Basis::Key(id) => Some(id),
+            Basis::Unbound | Basis::Password(_) => None,
+        };
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO sessions (id_hash, cred_id, created_at, last_seen, expires_at)
              VALUES (?, ?, datetime('now'), datetime('now'), datetime('now', '+{SESSION_HOURS} hours'))"
@@ -446,6 +480,17 @@ const PASSWORD_HASH: &str = "admin_password_hash";
 const SETUP_TOKEN_HASH: &str = "webauthn_setup_token_hash";
 const SETUP_TOKEN_EXPIRES: &str = "webauthn_setup_token_expires";
 
+/// What a new session rests on, re-checked as it starts.
+#[derive(Clone, Copy)]
+enum Basis<'a> {
+    /// Nothing (tests and tooling).
+    Unbound,
+    /// This key, still enrolled.
+    Key(&'a [u8]),
+    /// The password with this stored hash, password sign-in still on.
+    Password(&'a str),
+}
+
 /// The first-run setup token, as far as the database knows.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SetupToken {
@@ -646,11 +691,7 @@ mod tests {
         s.save_credential(b"k1", "{}", Some("one")).await.unwrap();
         s.set_password_hash("$argon2id$v=19$x", None).await.unwrap();
         let pw = s.create_session().await.unwrap();
-        let key = s
-            .create_session_for(Some(b"k1"), None)
-            .await
-            .unwrap()
-            .unwrap();
+        let key = s.create_session_for(b"k1", None).await.unwrap().unwrap();
         s.set_login_method(LoginMethod::Passkey).await.unwrap();
         assert!(!s.validate_session(&pw).await.unwrap());
         assert!(s.validate_session(&key).await.unwrap());
@@ -667,6 +708,39 @@ mod tests {
         assert_eq!(s.login_method().await.unwrap(), LoginMethod::Both);
         assert!(!s.validate_session(&a).await.unwrap());
         assert!(s.validate_session(&b).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_password_session_needs_the_password_it_checked() {
+        let (_dir, s) = test_store().await;
+        s.save_credential(b"k1", "{}", None).await.unwrap();
+        s.set_password_hash("$argon2id$v=19$old", None)
+            .await
+            .unwrap();
+        assert!(
+            s.create_password_session("$argon2id$v=19$old", None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Changed while the old one was being checked: no session.
+        s.set_password_hash("$argon2id$v=19$new", None)
+            .await
+            .unwrap();
+        assert!(
+            s.create_password_session("$argon2id$v=19$old", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Password sign-in switched off meanwhile: none either.
+        s.set_login_method(LoginMethod::Passkey).await.unwrap();
+        assert!(
+            s.create_password_session("$argon2id$v=19$new", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -731,23 +805,15 @@ mod tests {
         let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
         s.save_credential(b"a", "{}", None).await.unwrap();
         s.save_credential(b"b", "{}", None).await.unwrap();
-        let first = s
-            .create_session_for(Some(b"a"), None)
-            .await
-            .unwrap()
-            .unwrap();
+        let first = s.create_session_for(b"a", None).await.unwrap().unwrap();
         let second = s
-            .create_session_for(Some(b"a"), Some(&first))
+            .create_session_for(b"a", Some(&first))
             .await
             .unwrap()
             .unwrap();
         assert!(!s.validate_session(&first).await.unwrap(), "replaced");
         assert!(s.validate_session(&second).await.unwrap());
-        let with_b = s
-            .create_session_for(Some(b"b"), None)
-            .await
-            .unwrap()
-            .unwrap();
+        let with_b = s.create_session_for(b"b", None).await.unwrap().unwrap();
         assert!(s.delete_credential_guarded(b"a").await.unwrap());
         assert!(!s.validate_session(&second).await.unwrap(), "key deleted");
         assert!(s.validate_session(&with_b).await.unwrap(), "other key");
@@ -783,18 +849,9 @@ mod tests {
                 .is_some()
         );
         // No session starts for a key that is gone.
-        assert!(
-            s.create_session_for(Some(b"a"), None)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(s.create_session_for(b"a", None).await.unwrap().is_none());
         // A session whose key row is gone is not honoured.
-        let with_b = s
-            .create_session_for(Some(b"b"), None)
-            .await
-            .unwrap()
-            .unwrap();
+        let with_b = s.create_session_for(b"b", None).await.unwrap().unwrap();
         sqlx::query("DELETE FROM credentials WHERE cred_id = ?")
             .bind(&b"b"[..])
             .execute(&s.pool)

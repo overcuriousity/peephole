@@ -20,6 +20,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   session. Deleting a key now ends every open sign-in, a session starts
   only while its key is enrolled, and a session whose key is gone is
   no longer honoured.
+- Admin: a password sign-in whose check overlapped a password change or
+  a switch to security keys only could still get a session. The session
+  now starts only if the password checked is still the stored one and
+  password sign-in is still on.
 
 ## [0.10.0] - 2026-10-09
 

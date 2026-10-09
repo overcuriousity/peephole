@@ -398,7 +398,7 @@ async fn enroll_finish(
             let old = session_token(&state, &jar);
             match state
                 .store
-                .create_session_for(Some(passkey.cred_id()), old.as_deref())
+                .create_session_for(passkey.cred_id(), old.as_deref())
                 .await
             {
                 Ok(Some(token)) => (
@@ -546,11 +546,7 @@ async fn login_finish(
             // session the browser held before ends now.
             let old = session_token(&state, &jar);
             let used: &[u8] = result.cred_id();
-            match state
-                .store
-                .create_session_for(Some(used), old.as_deref())
-                .await
-            {
+            match state.store.create_session_for(used, old.as_deref()).await {
                 Ok(Some(token)) => (
                     clear_ceremony(cfg, jar.add(session_cookie(cfg, token))),
                     StatusCode::OK,
@@ -611,6 +607,7 @@ async fn login_password(
     };
     let found = phc.is_some();
     let phc = phc.unwrap_or_else(|| DUMMY_PHC.to_string());
+    let checked = phc.clone();
     let ok = tokio::task::spawn_blocking(move || crate::admin::password::verify(&f.password, &phc))
         .await
         .unwrap_or(false)
@@ -622,15 +619,27 @@ async fn login_password(
             Err(e) => e.into_response(),
         };
     }
-    // A session the browser held before ends now.
+    // A session the browser held before ends now. None if the password
+    // changed or password sign-in went off while it was being checked.
     let old = session_token(&state, &jar);
-    match state.store.create_session_for(None, old.as_deref()).await {
+    match state
+        .store
+        .create_password_session(&checked, old.as_deref())
+        .await
+    {
         Ok(Some(token)) => (
             jar.add(session_cookie(&state.cfg, token)),
             Redirect::to("/admin"),
         )
             .into_response(),
-        Ok(None) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
+        Ok(None) => {
+            tracing::info!("password sign-in overtaken by a sign-in change");
+            let why = "The sign-in settings changed meanwhile; try again.";
+            match render_login(&state, false, Some(why.into())).await {
+                Ok(page) => (StatusCode::CONFLICT, page).into_response(),
+                Err(e) => e.into_response(),
+            }
+        }
         Err(e) => {
             tracing::warn!(?e, "could not create session");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
