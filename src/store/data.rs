@@ -1220,11 +1220,11 @@ async fn remove_row(
         "skip_batch" => "skipped_batches",
         // probe_ports and the probe's host_keys cascade.
         "probe_result" => "probes",
-        "ip_name" => "ip_names",
+        "ip_name" | "rdns_name" => "ip_names",
         _ => return Ok(None),
     };
     // An ip_names row carries the uid of the newest lookup that set it.
-    let col = if kind == "ip_name" {
+    let col = if matches!(kind, "ip_name" | "rdns_name") {
         "record_uid"
     } else {
         "uid"
@@ -1280,7 +1280,7 @@ async fn remove_row(
     }
     // One lookup names several addresses: the caller gets one of them,
     // the others are dropped here once nothing else refers to them.
-    let others: Vec<i64> = if kind == "ip_name" {
+    let others: Vec<i64> = if matches!(kind, "ip_name" | "rdns_name") {
         sqlx::query_scalar("SELECT DISTINCT ip_id FROM ip_names WHERE record_uid = ?")
             .bind(uid)
             .fetch_all(&mut *conn)

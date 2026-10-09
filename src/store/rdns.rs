@@ -96,6 +96,17 @@ pub(crate) async fn apply_rdns(
         .execute(&mut *conn)
         .await?;
     }
+    // A newer tally no longer agrees names it omits (the rows stay).
+    sqlx::query(
+        "UPDATE ip_names SET agreed = 0
+         WHERE ip_id = ?1 AND source = 'rdns'
+           AND (last_seen < ?2 OR (last_seen = ?2 AND record_uid < ?3))",
+    )
+    .bind(ip_id)
+    .bind(&r.at)
+    .bind(&r.uid)
+    .execute(&mut *conn)
+    .await?;
     Ok(Effect::Applied)
 }
 
@@ -295,6 +306,56 @@ mod tests {
             "{got:?}"
         );
         assert!(names.iter().all(|n| n.source == "rdns"));
+    }
+
+    #[tokio::test]
+    async fn a_newer_record_clears_the_agreement_of_names_it_omits_and_erasing_removes_rows() {
+        use crate::cluster::identity::NodeId;
+        use crate::cluster::record::RdnsRec;
+        use crate::store::data::{Ctx, Effect};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let origin = NodeId([1; 32]);
+        let rec = |n: u8, at: &str, name: &str| RdnsRec {
+            uid: format!("{}u{n}", origin.uid_prefix()),
+            ip: "198.51.100.9".into(),
+            at: at.into(),
+            answers: vec![(origin, Ok(vec![name.into()]))],
+            build: String::new(),
+        };
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: Some(&origin),
+            hlc: 5,
+        };
+        let old = rec(1, "2026-10-09 12:00:00", "old.example.net");
+        let new = rec(2, "2026-10-10 12:00:00", "new.example.net");
+        for r in [&old, &new] {
+            assert_eq!(
+                apply_rdns(&mut conn, ctx, r).await.unwrap(),
+                Effect::Applied
+            );
+        }
+        let ip = crate::store::data::ensure_ip(&mut conn, "198.51.100.9", None)
+            .await
+            .unwrap()
+            .unwrap();
+        let agreed = async |conn: &mut sqlx::SqliteConnection, name: &str| -> Option<bool> {
+            sqlx::query_scalar("SELECT agreed FROM ip_names WHERE ip_id = ? AND name = ?")
+                .bind(ip)
+                .bind(name)
+                .fetch_optional(&mut *conn)
+                .await
+                .unwrap()
+        };
+        assert_eq!(agreed(&mut conn, "old.example.net").await, Some(false));
+        assert_eq!(agreed(&mut conn, "new.example.net").await, Some(true));
+        // Erasing the newest record removes its rows.
+        crate::store::data::unmaterialize(&mut conn, "rdns_name", &new.uid)
+            .await
+            .unwrap();
+        assert_eq!(agreed(&mut conn, "new.example.net").await, None);
+        assert_eq!(agreed(&mut conn, "old.example.net").await, Some(false));
     }
 
     #[tokio::test]

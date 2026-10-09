@@ -226,12 +226,22 @@ async fn ask_rdns(
     }
 }
 
-/// Clip an answer to what a record may hold.
+/// Clip an answer to what a record may hold: names normalised, those that
+/// are not valid host names dropped (one would make every node ignore the
+/// record), at most `MAX_NAMES`.
 fn clip(a: Result<Vec<String>, String>) -> Result<Vec<String>, String> {
     match a {
-        Ok(mut v) => {
-            v.truncate(MAX_NAMES);
-            Ok(v)
+        Ok(v) => {
+            let mut names: Vec<String> = Vec::new();
+            for n in v {
+                if let Some(n) = crate::intel::dns::valid_name(&n)
+                    && !names.contains(&n)
+                {
+                    names.push(n);
+                }
+            }
+            names.truncate(MAX_NAMES);
+            Ok(names)
         }
         Err(e) => Err(e.chars().take(MAX_ERROR).collect()),
     }
@@ -281,10 +291,11 @@ pub async fn buy_pass(
             answers,
             build: crate::COMMIT.into(),
         };
-        if let Err(e) = rec.write(vec![Record::RdnsName(r)]).await {
-            tracing::warn!(%ip, ?e, "reverse names not written");
+        // Only a written record counts as looked up; else the next pass retries.
+        match rec.write(vec![Record::RdnsName(r)]).await {
+            Ok(()) => node.store.mark_rdns(ip_id).await?,
+            Err(e) => tracing::warn!(%ip, ?e, "reverse names not written"),
         }
-        node.store.mark_rdns(ip_id).await?;
     }
     Ok(n)
 }
@@ -381,6 +392,19 @@ pub(crate) async fn pass(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answers_are_cleaned_before_they_are_recorded() {
+        let got = clip(Ok(vec![
+            "Host.Example.NET.".into(),
+            "BAD_NAME.".into(),
+            "192.0.2.1".into(),
+            "host.example.net".into(),
+        ]));
+        assert_eq!(got, Ok(vec!["host.example.net".to_string()]));
+        assert_eq!(clip(Ok(vec!["_x".into()])), Ok(vec![]));
+        assert_eq!(clip(Err("e".repeat(300))).unwrap_err().len(), MAX_ERROR);
+    }
     use crate::scan::crawler::testing::fake_resolver;
     use std::sync::{Arc, Mutex};
 

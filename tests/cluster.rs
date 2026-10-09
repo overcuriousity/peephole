@@ -6894,8 +6894,11 @@ async fn reverse_names_are_bought_from_a_quorum_and_replicate_with_their_flag() 
         })
     };
     na.node.set_rdns_lookup(fake(&["host.example.net"]));
-    nb.node
-        .set_rdns_lookup(fake(&["host.example.net", "alias.example.net"]));
+    nb.node.set_rdns_lookup(fake(&[
+        "host.example.net",
+        "alias.example.net",
+        "BAD_NAME.",
+    ]));
     nc.node.set_rdns_lookup(fake(&["other.example.net"]));
     // c asks more than b: the quorum of 2 is a and b.
     nc.node.set_price_table(std::sync::Arc::new(price::Table {
