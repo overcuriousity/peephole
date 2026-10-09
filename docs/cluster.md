@@ -238,6 +238,8 @@ audits and relay leases. The supply is fixed; prices follow sales.
   bought (manual) job at the scanner's price times 4^(level−1), and the
   scanners skip their evidence re-check for it — the safety preflight
   (protected addresses, Tor exits, verified crawlers) still applies.
+  Level 5 (the vulnerability scripts) is granted only to members of
+  protocol 8 and up; older members are never asked.
 - **Scan jobs.** The arbiter (the node that queued the job) funds its jobs
   from its own balance, up to `[credits] scan_share` (default 0.5) of it, and
   hands each job to the scanner asking that is cheapest **per delivered

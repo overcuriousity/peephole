@@ -19,16 +19,16 @@ const REFRESH: Duration = Duration::from_secs(60);
 
 /// Minutes a scan of each level keeps a worker busy; index `level - 1`.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Estimates(pub [f64; 4]);
+pub struct Estimates(pub [f64; 5]);
 
 impl Estimates {
-    pub const DEFAULT: Estimates = Estimates([5.0, 5.0, 5.0, 20.0]);
+    pub const DEFAULT: Estimates = Estimates([5.0, 5.0, 5.0, 20.0, 20.0]);
 
     /// From `(level, jobs, mean minutes)` rows.
     pub fn from_rows(rows: &[(i64, i64, Option<f64>)]) -> Self {
         let mut e = Self::DEFAULT;
         for &(level, n, mean) in rows {
-            let Some(i) = usize::try_from(level - 1).ok().filter(|i| *i < 4) else {
+            let Some(i) = usize::try_from(level - 1).ok().filter(|i| *i < 5) else {
                 continue;
             };
             if n < MIN_SAMPLE {
@@ -57,7 +57,7 @@ impl Estimates {
     }
 
     fn est(&self, level: u8) -> f64 {
-        self.0[(level.clamp(1, 4) - 1) as usize]
+        self.0[(level.clamp(1, 5) - 1) as usize]
     }
 
     /// Response ratio of a job of `level` that has waited `waited_min`.
@@ -69,10 +69,10 @@ impl Estimates {
     /// SQL expression for the response ratio of the `scan_jobs` row `alias`.
     /// The estimates are our own floats, so they are inlined, not bound.
     pub fn ratio_sql(&self, alias: &str) -> String {
-        let [a, b, c, d] = self.0;
+        let [a, b, c, d, e] = self.0;
         let est = format!(
             "(CASE {alias}.level WHEN 1 THEN {a:.4} WHEN 2 THEN {b:.4} \
-             WHEN 3 THEN {c:.4} ELSE {d:.4} END)"
+             WHEN 3 THEN {c:.4} WHEN 4 THEN {d:.4} ELSE {e:.4} END)"
         );
         format!(
             "((MAX(0.0, (julianday('now') - julianday({alias}.queued_at)) * 1440.0) + {est}) / {est})"
@@ -133,6 +133,7 @@ mod tests {
         assert_eq!(e.0[0], 5.0, "4 jobs are too few");
         assert_eq!(e.0[3], 13.0);
         assert_eq!(e.0[1], Estimates::DEFAULT.0[1]);
+        assert_eq!(e.0[4], Estimates::DEFAULT.0[4]);
     }
 
     /// NULL averages and skewed (negative) durations clamp
@@ -145,7 +146,7 @@ mod tests {
             (3, 50, Some(f64::NAN)),
             (4, 50, Some(10_000.0)),
         ]);
-        assert_eq!(e.0, [FLOOR_MIN, 5.0, 5.0, CEIL_MIN]);
+        assert_eq!(e.0, [FLOOR_MIN, 5.0, 5.0, CEIL_MIN, 20.0]);
     }
 
     #[test]
@@ -154,6 +155,16 @@ mod tests {
         assert!(e.ratio(2, 5.0) > e.ratio(4, 10.0));
         assert!(e.ratio(4, 60.0) > e.ratio(2, 5.0));
         assert_eq!(e.ratio(4, 40.0), e.ratio(2, 10.0));
+    }
+
+    #[test]
+    fn level_5_has_its_own_estimate() {
+        let e = Estimates::from_rows(&[(5, 9, Some(45.0))]);
+        assert_eq!(e.0[4], 45.0);
+        assert_eq!(e.ratio(5, 45.0), 2.0);
+        // The SQL expression agrees (level 5 is the ELSE branch).
+        let sql = e.ratio_sql("j");
+        assert!(sql.contains("WHEN 4 THEN 20.0000 ELSE 45.0000"), "{sql}");
     }
 
     /// The SQL expression orders rows exactly like `ratio`.

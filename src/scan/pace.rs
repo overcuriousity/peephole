@@ -15,8 +15,8 @@ pub const MAX_WORKERS: usize = 16;
 /// the other keeps the shorter levels moving (0 still pauses).
 pub const MIN_WORKERS: usize = 2;
 
-/// Level-4 scans one scanner runs at once: `share` of its workers, rounded
-/// down, but at least one while it scans at all.
+/// Heavy scans (levels 4 and 5) one scanner runs at once: `share` of its
+/// workers, rounded down, but at least one while it scans at all.
 pub fn level4_cap(workers: usize, share: f64) -> usize {
     if workers == 0 {
         return 0;
@@ -32,8 +32,8 @@ pub const DRAIN_WINDOW_HOURS: i64 = 6;
 
 /// Wall-clock limit of one scan of levels 1 to 3.
 pub const SCAN_TIMEOUT_SECS: u64 = 1800;
-/// Level 4 scans every port with version, OS and script detection: it gets
-/// this many times the base limit.
+/// Level 4 scans every port with version, OS and script detection, and
+/// level 5 runs the vuln scripts: they get this many times the base limit.
 pub const LEVEL4_TIMEOUT_FACTOR: u64 = 4;
 /// Hours within which an IP is not scanned again at the same level.
 pub const COOLDOWN_HOURS: i64 = 24;
@@ -46,7 +46,7 @@ pub const MAX_RUN_SECS: u64 = 12 * 3600;
 /// [`MAX_RUN_SECS`]): it neither shields its IP nor blocks a takeover.
 pub const STALE_RUNNING_HOURS: u64 = MAX_RUN_SECS / 3600 + 1;
 
-/// Wall-clock limit of one scan at `level`: level 4 gets
+/// Wall-clock limit of one scan at `level`: levels 4 and 5 get
 /// [`LEVEL4_TIMEOUT_FACTOR`] times `base`, capped at [`MAX_RUN_SECS`].
 pub fn level_timeout_secs(base: u64, level: u8) -> u64 {
     if level >= 4 {
@@ -412,6 +412,13 @@ mod tests {
         assert_eq!(level4_cap(2, 0.1), 1, "never 0 while scanning");
         assert_eq!(level4_cap(2, 1.0), 2);
         assert_eq!(level4_cap(0, 0.5), 0, "paused");
+    }
+
+    #[test]
+    fn level_5_gets_the_heavy_scan_timeout() {
+        assert_eq!(level_timeout_secs(60, 3), 60);
+        assert_eq!(level_timeout_secs(60, 4), 240);
+        assert_eq!(level_timeout_secs(60, 5), 240);
     }
 
     /// A stored 1 from before the minimum is raised to 2; the hourly cap

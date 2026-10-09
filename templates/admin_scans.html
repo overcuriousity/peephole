@@ -6,7 +6,7 @@
 <div class="page-head"><div><h1>Scans</h1><p class="muted">Pace, the live queue, and every finished job.</p></div></div>
 {% if let Some(n) = pace.notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
 {% if let Some(e) = pace.error %}<div class="banner banner-warning">Pace not saved: {{ e }}</div>{% endif %}
-{% if pace.timeouts_high %}<div class="banner banner-warning">{{ pace.timeout_share }} of scans in 24 h hit the timeout ({{ pace.timeout_min }} min, level 4: {{ pace.level4_timeout_min }} min).</div>{% endif %}
+{% if pace.timeouts_high %}<div class="banner banner-warning">{{ pace.timeout_share }} of scans in 24 h hit the timeout ({{ pace.timeout_min }} min, levels 4–5: {{ pace.level4_timeout_min }} min).</div>{% endif %}
 {% if pace.growing %}<div class="banner banner-warning">The queue grew by about {{ pace.net }} jobs per hour over the last {{ pace.drain_window_h }} h.</div>{% endif %}
 {% if pace.not_scanning %}<div class="banner banner-warning">This node does not scan; its own pace does nothing. {% if scanners.is_empty() %}No member has the scanner role: turn it on under <a href="/admin/system/settings">System › Settings</a> or on a member's page.{% else %}Scanners are paced in <a href="#scanners">Scanners</a> below.{% endif %}</div>{% endif %}
 <div class="stack">
@@ -27,7 +27,7 @@
   <form class="filters pace-form" method="post" action="/admin/queue/pace">
     <label>Workers <input type="number" name="max_workers" min="0" max="{{ pace.max_workers }}" value="{{ pace.current.max_workers }}" required></label>
     <button class="btn btn-primary" type="submit">Save</button>
-    <p class="muted pace-note">0 pauses scanning; otherwise at least 2. At most {{ pace.level4_cap }} at once on level 4. A scan times out after {{ pace.timeout_min }} min (level 4: {{ pace.level4_timeout_min }} min); an address is scanned again at the same level after 24 h at the earliest.</p>
+    <p class="muted pace-note">0 pauses scanning; otherwise at least 2. At most {{ pace.level4_cap }} at once on levels 4 and 5. A scan times out after {{ pace.timeout_min }} min (levels 4–5: {{ pace.level4_timeout_min }} min); an address is scanned again at the same level after 24 h at the earliest.</p>
   </form>
   {% if !scanners.is_empty() %}
   <div id="scanners">

@@ -826,8 +826,8 @@ impl Config {
             bail!("scan.min_rate must be between {MIN_RATE} and {MAX_RATE}");
         }
         for (level, argv) in &s.level_argv {
-            if !(1..=4).contains(level) {
-                bail!("scan.level_argv: level {level} is out of range (1..=4)");
+            if !(1..=5).contains(level) {
+                bail!("scan.level_argv: level {level} is out of range (1..=5)");
             }
             if argv.is_empty() {
                 bail!("scan.level_argv: level {level} is empty (nmap would run its default scan)");
@@ -840,8 +840,8 @@ impl Config {
         {
             bail!("scan.own_addresses: `{a}` is not a host address");
         }
-        if !(1..=4).contains(&s.safety.single_request_max_level) {
-            bail!("scan.single_request_max_level must be between 1 and 4");
+        if !(1..=5).contains(&s.safety.single_request_max_level) {
+            bail!("scan.single_request_max_level must be between 1 and 5");
         }
         for o in s.safety.trusted_origins.iter().flatten() {
             crate::cluster::identity::NodeId::parse(o)
@@ -909,17 +909,19 @@ impl Config {
     /// so hosts that drop probes cannot stretch a full-range scan. Severity escalates
     /// by *scope* — more ports, service (`-sV`) and OS (`-O`) detection, then
     /// discovery/safe scripts — not by speed or aggressiveness, so a higher level
-    /// maps to a more thorough but still defensible scan.
+    /// maps to a more thorough but still defensible scan. Level 5 is the one
+    /// exception, and it is never queued automatically: a bought scan runs
+    /// the `vuln` scripts (`profiles::VULN_SCRIPTS`).
     ///
     /// `-Pn`: the target just connected to us, so it is up; nmap's own
     /// discovery probes are often filtered and would report it down. The
     /// full-range level caps retransmissions so filtered ports don't stretch
     /// a scan past the timeout.
     ///
-    /// None for a level outside 1..=4: there is no preset to fall back on,
+    /// None for a level outside 1..=5: there is no preset to fall back on,
     /// and an empty argv would run nmap's own default scan.
     pub fn default_level_argv(&self, level: u8) -> Option<Vec<String>> {
-        if !(1..=4).contains(&level) {
+        if !(1..=5).contains(&level) {
             return None;
         }
         if let Some(custom) = self.scan.level_argv.get(&level) {
@@ -972,7 +974,7 @@ license_key = "k"
 "#,
         )
         .unwrap();
-        for level in 1..=4 {
+        for level in 1..=5 {
             let argv = cfg.default_level_argv(level).unwrap();
             assert!(argv.iter().any(|a| a == "-Pn"), "level {level}: {argv:?}");
         }
@@ -1047,14 +1049,26 @@ rp_name = "x"
         assert!(has(4, "-p-"));
     }
 
-    /// No level outside 1..=4 gets an argv: an empty one would run nmap's
+    /// No level outside 1..=5 gets an argv: an empty one would run nmap's
     /// own default scan.
     #[test]
     fn levels_outside_the_presets_have_no_argv() {
         let cfg: Config = toml::from_str("database_path = \"/x\"\ndata_dir = \"/x\"\n").unwrap();
-        for level in [0, 5, 9, 255] {
+        for level in [0, 6, 9, 255] {
             assert_eq!(cfg.default_level_argv(level), None, "level {level}");
         }
+    }
+
+    /// Level 5 is the exception: it runs the vuln category, minus the
+    /// scripts that ask third parties. Only an admin's bought scan reaches
+    /// it; the automatic queue's levels (rule weights) stay within 1..=4.
+    #[test]
+    fn level_5_is_intrusive_by_design() {
+        let cfg: Config = toml::from_str("database_path = \"/x\"\ndata_dir = \"/x\"\n").unwrap();
+        let argv = cfg.default_level_argv(5).unwrap();
+        let i = argv.iter().position(|a| a == "--script").unwrap();
+        assert_eq!(argv[i + 1], "vuln and not external");
+        assert!(!argv.iter().any(|a| a == "-p-"), "the level-3 port set");
     }
 
     #[test]
@@ -1495,7 +1509,7 @@ data_dir = "/tmp"
         // are refused.
         for bad in [
             "single_request_max_level = 0",
-            "single_request_max_level = 5",
+            "single_request_max_level = 6",
             "trusted_origins = [\"nope\"]",
             "never_scan_dir = \"/nonexistent/never_scan.d\"",
             "level_argv = { 2 = [] }",

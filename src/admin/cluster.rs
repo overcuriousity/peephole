@@ -273,7 +273,7 @@ pub(crate) async fn views(
     // The arbiter's view: the scanners that could take a job now.
     let scanners = crate::scan::arbiter::scanners(node);
     let level_weights = |id: NodeId| {
-        (1..=4)
+        (1..=5)
             .filter_map(|l| {
                 let w = crate::scan::weight::weight(tallies, id, &scanners, l);
                 let t = tallies.get(&(id, l)).copied().unwrap_or_default();

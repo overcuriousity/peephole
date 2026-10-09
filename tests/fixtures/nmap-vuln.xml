@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<nmaprun scanner="nmap" args="nmap -Pn -sS -sV -O -T3 --top-ports 1000 --traceroute --script &quot;vuln and not external&quot; --host-timeout 1710s --script-timeout 570s --min-rate 300 -oX - 203.0.113.7" start="1">
+<host><address addr="203.0.113.7" addrtype="ipv4"/>
+<ports>
+<port protocol="tcp" portid="80"><state state="open"/><service name="http" product="Apache httpd" version="2.4.49"/>
+<script id="http-vuln-cve-2021-41773" output="VULNERABLE: Path traversal (CVE-2021-41773) - probe from 198.51.100.5 succeeded"><table><elem key="state">VULNERABLE</elem></table></script>
+</port>
+<port protocol="tcp" portid="443"><state state="open"/><service name="https"/></port>
+</ports>
+</host>
+</nmaprun>

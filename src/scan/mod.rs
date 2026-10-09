@@ -34,11 +34,11 @@ pub const MAX_STDOUT: usize = 16 * 1024 * 1024;
 /// Start of nmap's stderr kept for the error message (the rest is drained).
 const MAX_STDERR: usize = 64 * 1024;
 
-/// A scan level as stored or granted, if it is one (1..=4). Anything else is
-/// refused rather than truncated: `5 as u8`, or 260 truncated to 4, must
+/// A scan level as stored or granted, if it is one (1..=5). Anything else is
+/// refused rather than truncated: `6 as u8`, or 260 truncated to 4, must
 /// not pick a preset.
 pub fn valid_level(level: i64) -> Option<u8> {
-    u8::try_from(level).ok().filter(|l| (1..=4).contains(l))
+    u8::try_from(level).ok().filter(|l| (1..=5).contains(l))
 }
 
 /// nmap's own per-host limit, just under the job timeout so nmap reports
@@ -50,7 +50,8 @@ fn host_timeout_secs(timeout_secs: u64) -> u64 {
 }
 
 /// `argv` (a level's list) with what every run adds: the timeouts, the
-/// rate floor of level 4, `-6`, XML on standard output and the target.
+/// rate floor of levels 4 and 5, `-6`, XML on standard output and the
+/// target.
 fn complete(
     mut argv: Vec<String>,
     level: u8,
@@ -70,9 +71,9 @@ fn complete(
         argv.push("--script-timeout".into());
         argv.push(format!("{}s", (host_timeout / 3).clamp(30, 600)));
     }
-    // Level 4 scans every port: a floor on the send rate keeps hosts that
-    // drop probes from slowing nmap's adaptive timing to a crawl.
-    if level == 4
+    // Levels 4 and 5 are the heavy scans: a floor on the send rate keeps
+    // hosts that drop probes from slowing nmap's adaptive timing to a crawl.
+    if level >= 4
         && !argv
             .iter()
             .any(|a| a == "--min-rate" || a.starts_with("--min-rate="))
@@ -92,7 +93,7 @@ fn complete(
 }
 
 /// nmap argv (after the binary name) for a level and target (spec §5).
-/// None for a level outside 1..=4.
+/// None for a level outside 1..=5.
 pub fn nmap_argv(
     level: u8,
     target: &IpAddr,
@@ -1300,7 +1301,7 @@ fn renew_timing(lease: Duration) -> (Duration, Duration, Duration) {
     )
 }
 
-/// One running level-4 scan, counted while it lives.
+/// One running heavy scan (level 4 or 5), counted while it lives.
 struct L4Slot(Arc<std::sync::atomic::AtomicUsize>);
 
 impl L4Slot {
@@ -1356,7 +1357,7 @@ pub async fn run_workers(
         });
         *node.audit_check.lock().unwrap() = Some(check);
     }
-    // Level-4 scans running now (see `L4Slot`).
+    // Heavy scans (levels 4 and 5) running now (see `L4Slot`).
     let running_l4 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut joinset = tokio::task::JoinSet::new();
     loop {
@@ -1381,7 +1382,7 @@ pub async fn run_workers(
         while joinset.len() < p.max_workers {
             let cap = pace::level4_cap(p.max_workers, cfg.scan.level4_max_share);
             let exclude: Vec<u8> = if running_l4.load(std::sync::atomic::Ordering::SeqCst) >= cap {
-                vec![4]
+                vec![4, 5]
             } else {
                 vec![]
             };
@@ -1403,7 +1404,7 @@ pub async fn run_workers(
                     }
                 },
             };
-            let l4 = (job.level() == 4).then(|| L4Slot::take(&running_l4));
+            let l4 = (job.level() >= 4).then(|| L4Slot::take(&running_l4));
             if let Some(j) = source.queue_row(&job).await {
                 notifier.publish(j);
             }
@@ -1420,7 +1421,7 @@ pub async fn run_workers(
                 let _l4 = l4;
                 let outcome = match argv {
                     Some(argv) => run_scan(&source2, &job, argv, nmap, timeout).await,
-                    // Unreachable: acquire only hands out levels 1..=4.
+                    // Unreachable: acquire only hands out levels 1..=5.
                     None => Outcome::Failed("invalid scan level".into()),
                 };
                 if let Outcome::Done(_) = &outcome {
@@ -1551,10 +1552,10 @@ license_key = "k"
         assert_eq!(argv.iter().filter(|a| *a == "--host-timeout").count(), 1);
     }
 
-    /// --min-rate at level 4 only, from the config, and an
+    /// --min-rate at levels 4 and 5 only, from the config, and an
     /// operator's own value is kept.
     #[test]
-    fn min_rate_is_added_at_level_4_only() {
+    fn min_rate_is_added_at_levels_4_and_5_only() {
         let dir = tempfile::tempdir().unwrap();
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         let cfg = config_with(dir.path(), "min_rate = 120\n");
@@ -1563,8 +1564,10 @@ license_key = "k"
                 .position(|a| a == flag)
                 .map(|i| argv[i + 1].clone())
         };
-        let a4 = nmap_argv(4, &ip, &cfg, 3600).unwrap();
-        assert_eq!(after(&a4, "--min-rate").as_deref(), Some("120"));
+        for l in [4, 5] {
+            let a = nmap_argv(l, &ip, &cfg, 3600).unwrap();
+            assert_eq!(after(&a, "--min-rate").as_deref(), Some("120"), "level {l}");
+        }
         for l in 1..=3 {
             assert!(
                 !nmap_argv(l, &ip, &cfg, 1800)
@@ -1602,20 +1605,21 @@ license_key = "k"
         assert_eq!(describe_exit(&exited), "exit 1");
     }
 
-    /// Levels are 1..=4: nothing else gets an argv, nothing is truncated.
+    /// Levels are 1..=5: nothing else gets an argv, nothing is truncated.
     #[test]
-    fn levels_outside_1_to_4_are_refused() {
+    fn levels_outside_1_to_5_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(dir.path());
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
-        for l in [0u8, 5, 255] {
+        for l in [0u8, 6, 255] {
             assert!(nmap_argv(l, &ip, &cfg, 1800).is_none(), "level {l}");
         }
         for (l, ok) in [
             (0, None),
             (1, Some(1)),
             (4, Some(4)),
-            (5, None),
+            (5, Some(5)),
+            (6, None),
             (260, None),
             (-1, None),
         ] {
@@ -2578,15 +2582,16 @@ license_key = "k"
         assert_eq!(source.acquire(&[]).await.unwrap().unwrap().level(), 4);
     }
 
-    /// A fake nmap that records how many level-4 scans (argv has -p-) run
-    /// at once, holding each for `secs`.
+    /// A fake nmap that records how many heavy scans (level 4 or 5: argv has
+    /// -p- or the vuln selector) run at once, holding each for `secs`.
     fn counting_nmap(dir: &std::path::Path, secs: &str) -> PathBuf {
         let fake = fake_nmap(dir); // writes nmap.xml next to it
         std::fs::write(
             &fake,
             format!(
                 "#!/bin/sh\nd=\"$(dirname \"$0\")\"\n\
-                 case \" $* \" in *\" -p- \"*) mkdir -p \"$d/l4\"; touch \"$d/l4/$$\"; \
+                 case \" $* \" in *\" -p- \"*|*\" vuln and not external \"*) mkdir -p \"$d/l4\"; \
+                 touch \"$d/l4/$$\"; \
                  ls \"$d/l4\" | wc -l >> \"$d/l4-seen\"; sleep {secs}; rm \"$d/l4/$$\";; esac\n\
                  cat \"$d/nmap.xml\"\n"
             ),
@@ -2595,16 +2600,16 @@ license_key = "k"
         fake
     }
 
-    /// With 2 workers at most one level-4 scan runs, the other worker keeps
-    /// the shorter levels moving, and a queue of only level-4 jobs still
-    /// drains.
+    /// With 2 workers at most one heavy scan (level 4 or 5) runs, the other
+    /// worker keeps the shorter levels moving, and a queue of only heavy
+    /// jobs still drains.
     #[tokio::test]
-    async fn level4_never_takes_more_than_its_share() {
+    async fn heavy_scans_never_take_more_than_their_share() {
         let dir = tempfile::tempdir().unwrap();
         let fake = counting_nmap(dir.path(), "1.5");
         let cfg = test_config(dir.path());
         let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
-        for (i, level) in [4, 4, 2, 2].into_iter().enumerate() {
+        for (i, level) in [4, 5, 2, 2].into_iter().enumerate() {
             let ip = store
                 .upsert_ip(format!("198.51.100.{}", 80 + i).parse().unwrap())
                 .await
@@ -2634,6 +2639,6 @@ license_key = "k"
             .map(|n| n.parse::<u32>().unwrap())
             .max()
             .unwrap();
-        assert_eq!(max, 1, "two level-4 scans ran at once: {seen:?}");
+        assert_eq!(max, 1, "two heavy scans ran at once: {seen:?}");
     }
 }

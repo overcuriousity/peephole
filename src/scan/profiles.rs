@@ -21,10 +21,16 @@ pub const SCRIPTS: &str = "(discovery or safe) and not (intrusive or broadcast o
 /// ETag), each one handshake or request to a port nmap already found
 /// open, all in `safe`.
 pub const IDENTITY_SCRIPTS: &str = "ssh-hostkey,ssh2-enum-algos,ssl-cert,http-headers";
+/// Level 5 runs the `vuln` category — checks that probe a service for a
+/// known vulnerability — but not the ones that ask third parties
+/// (`external`: whois, ASN and CVE-API lookups). Unlike every other level
+/// it is deliberately intrusive; only an admin's bought scan reaches it,
+/// never the automatic queue.
+pub const VULN_SCRIPTS: &str = "vuln and not external";
 
 /// The built-in arguments of a level, without the target. `udp`: level 4
 /// also scans the top UDP ports (`scan.level4_udp`). None for a level
-/// outside 1..=4.
+/// outside 1..=5.
 pub fn builtin(level: u8, udp: bool) -> Option<Vec<String>> {
     let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<String>>();
     Some(match level {
@@ -81,6 +87,18 @@ pub fn builtin(level: u8, udp: bool) -> Option<Vec<String>> {
             ]));
             v
         }
+        5 => s(&[
+            "-Pn",
+            "-sS",
+            "-sV",
+            "-O",
+            "-T3",
+            "--top-ports",
+            "1000",
+            "--traceroute",
+            "--script",
+            VULN_SCRIPTS,
+        ]),
         _ => return None,
     })
 }
@@ -251,10 +269,24 @@ mod tests {
     }
 
     #[test]
+    fn level_5_runs_the_vuln_category_without_external_lookups() {
+        let argv = builtin(5, false).unwrap();
+        assert_eq!(builtin(5, true).unwrap(), argv, "no UDP variant at level 5");
+        let i = argv.iter().position(|a| a == "--script").unwrap();
+        assert_eq!(argv[i + 1], "vuln and not external");
+        assert!(argv.contains(&"--top-ports".to_string()));
+        assert!(!argv.iter().any(|a| a == "-p-"), "the level-3 port set");
+        let plain = cfg("");
+        let line = command_line(&plain, 5, "203.0.113.7");
+        assert!(args_ok(&line, 5), "{line}");
+        assert!(!args_ok(&line, 4), "level 5's list is not level 4's");
+    }
+
+    #[test]
     fn every_built_in_level_is_recognized_with_every_tunable_set() {
         let plain = cfg("");
         let tuned = cfg("min_rate = 1000\nlevel4_udp = true");
-        for level in 1..=4u8 {
+        for level in 1..=5u8 {
             for (c, target) in [
                 (&plain, "203.0.113.7"),
                 (&tuned, "203.0.113.7"),

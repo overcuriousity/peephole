@@ -664,7 +664,7 @@ mod tests {
         let job = queued(rec.enqueue_scan_with(ip.id, 4, &policy).await.unwrap());
         assert_eq!(level_of(&store, job).await.0, 4);
         // Not a level: not queued.
-        for bad in [0, 5, 200] {
+        for bad in [0, 6, 200] {
             assert_eq!(
                 rec.enqueue_scan_with(ip.id, bad, &policy).await.unwrap(),
                 EnqueueOutcome::Suppressed

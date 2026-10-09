@@ -79,7 +79,7 @@ pub struct ActionsView {
     pub default: Vec<String>,
     pub balance: Option<String>,
     pub standalone: bool,
-    /// The four scan levels' offers (`admin::scan_buy`).
+    /// The scan levels' offers (`admin::scan_buy`).
     pub scans: Vec<crate::admin::scan_buy::ScanOffer>,
 }
 

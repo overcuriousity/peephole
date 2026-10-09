@@ -391,7 +391,7 @@ impl Picker {
                 continue;
             };
             let deadline_ms = ended + AUDIT_WINDOW_MS;
-            if now >= deadline_ms || !(1..=4).contains(&level) || !chance(self.share) {
+            if now >= deadline_ms || !(1..=5).contains(&level) || !chance(self.share) {
                 continue;
             }
             if self.queue.len() < MAX_WAITING {
@@ -554,7 +554,7 @@ pub async fn obligations(
         "SELECT s.origin, s.uid, j.uid, j.arbiter, j.status_hlc FROM scans s
          JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
          WHERE s.audit_of IS NULL AND s.origin IS NOT NULL AND s.uid IS NOT NULL
-           AND s.level BETWEEN 1 AND 4 AND j.status = 'done'
+           AND s.level BETWEEN 1 AND 5 AND j.status = 'done'
            AND j.arbiter IS NOT NULL AND j.arbiter != s.origin
            AND j.status_hlc >= ? AND j.status_hlc < ?",
     )
@@ -783,7 +783,7 @@ async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Resul
         Ok(m) => m,
         Err(e) => return refuse(&format!("this node could not read its members: {e:#}")).await,
     };
-    if scanner != peer || !(1..=4).contains(&level) || !designated(&s) {
+    if scanner != peer || !(1..=5).contains(&level) || !designated(&s) {
         return refuse("not a designated scan of the asker").await;
     }
     if !auditors(&s, &members, &scanner, done).contains(&node.id()) {
@@ -950,7 +950,7 @@ async fn due(pool: &SqlitePool, me: &NodeId, since_ms: u64) -> Result<Vec<String
         "SELECT s.uid, j.uid, j.arbiter, j.status_hlc FROM scans s
          JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
          WHERE s.origin = ?1 AND s.audit_of IS NULL AND s.uid IS NOT NULL
-           AND s.level BETWEEN 1 AND 4 AND j.status = 'done'
+           AND s.level BETWEEN 1 AND 5 AND j.status = 'done'
            AND j.arbiter IS NOT NULL AND j.arbiter != ?1 AND j.status_hlc >= ?2
            AND NOT EXISTS (SELECT 1 FROM credit_entries o
                            WHERE o.origin = ?1 AND o.audit_uid = s.uid

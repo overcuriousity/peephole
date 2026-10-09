@@ -88,9 +88,10 @@ pub fn price_for(node: &Node, scanner: &NodeId) -> Option<u32> {
 }
 
 /// The factor a bought (manual) job's level scales its funding price by:
-/// 4^(level-1) — level 1 at the scanner's price, level 4 at 64 times it.
+/// 4^(level-1) — level 1 at the scanner's price, level 4 at 64 and level 5
+/// at 256 times it.
 pub fn level_factor(level: i64) -> u32 {
-    1u32.checked_shl(2 * level.clamp(1, 4) as u32 - 2)
+    1u32.checked_shl(2 * level.clamp(1, 5) as u32 - 2)
         .unwrap_or(u32::MAX)
 }
 
@@ -270,6 +271,8 @@ mod tests {
         assert_eq!(level_factor(2), 4);
         assert_eq!(level_factor(3), 16);
         assert_eq!(level_factor(4), 64);
+        assert_eq!(level_factor(5), 256);
+        assert_eq!(level_factor(9), 256, "clamped at the highest level");
     }
 
     const DAY: u32 = 20_000;

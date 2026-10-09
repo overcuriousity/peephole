@@ -138,6 +138,21 @@ mod tests {
     }
 
     #[test]
+    fn vuln_script_output_is_scrubbed_and_still_parses() {
+        let xml = std::fs::read("tests/fixtures/nmap-vuln.xml").unwrap();
+        let (out, n) = scrub(&xml, &[ip("198.51.100.5")], &[]);
+        assert_eq!(n, 1);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("probe from [scanner] succeeded"), "{text}");
+        assert!(!text.contains("198.51.100.5"));
+        // The vuln <script> elements are not parsed into ports, but the
+        // ports themselves survive.
+        let parsed = crate::scan::nmap_xml::parse_nmap_xml(text.as_bytes()).unwrap();
+        assert_eq!(parsed.ports.len(), 2);
+        assert_eq!(parsed.ports[0].port, 80);
+    }
+
+    #[test]
     fn own_addresses_and_names_become_the_mark_and_are_counted() {
         let xml = r#"<script id="smtp-commands" output="mail.example.org Hello i577b2938.versanet.de [87.123.41.56], pleased"/>"#;
         let (out, n) = run(xml, &["87.123.41.56"], &["i577b2938.versanet.de"]);
