@@ -448,14 +448,16 @@ impl Source {
     }
 
     /// Why this scanner would not run an audit of `ip` (stored as
-    /// `ip_text`) at `level` now, if it would not: an audit obeys
-    /// everything a scan does (never_scan, members' addresses, Tor exits,
-    /// crawlers, the evidence held here) except the rescan cooldown. An
-    /// auditor asks this before it accepts a bought audit.
+    /// `ip_text`) at `level` now, of a scan of the job `job_uid`, if it
+    /// would not: an audit obeys everything a scan does (never_scan,
+    /// members' addresses, Tor exits, crawlers, the evidence held here,
+    /// which a bought job skips) except the rescan cooldown. An auditor
+    /// asks this before it accepts a bought audit.
     async fn audit_refusal(
         &self,
         ip: &IpAddr,
         ip_text: &str,
+        job_uid: &str,
         level: u8,
     ) -> anyhow::Result<Option<String>> {
         let now = crate::store::data::now_ts();
@@ -463,6 +465,15 @@ impl Source {
             return Ok(Some(r.reason().to_string()));
         }
         let pool = &self.rec.store().pool;
+        // A bought (manual) job was scanned without evidence (level 5
+        // only so): its audit needs none either.
+        let manual: Option<i64> = sqlx::query_scalar("SELECT manual FROM scan_jobs WHERE uid = ?")
+            .bind(job_uid)
+            .fetch_optional(pool)
+            .await?;
+        if manual.is_some_and(|m| m != 0) {
+            return Ok(None);
+        }
         let ev = guard::evidence(pool, ip_text, &self.origins, Some(self.classifier)).await?;
         if ev.allowed_level(&self.cfg.scan.safety) < level {
             return Ok(Some(
@@ -504,7 +515,7 @@ impl Source {
                 }
                 continue;
             }
-            match self.audit_refusal(&ip, &t.ip, t.level).await {
+            match self.audit_refusal(&ip, &t.ip, &t.job_uid, t.level).await {
                 Ok(None) => {}
                 Ok(Some(why)) => {
                     debug!(target = %ip, %why, "audit not run");
@@ -1343,13 +1354,13 @@ pub async fn run_workers(
     // An auditor asks before it accepts a bought audit (`credits::audit`).
     if let Some(node) = source.node() {
         let weak = Arc::downgrade(&source);
-        let check: crate::credits::audit::Check = Arc::new(move |ip, ip_text, level| {
+        let check: crate::credits::audit::Check = Arc::new(move |ip, ip_text, job_uid, level| {
             let weak = weak.clone();
             Box::pin(async move {
                 let Some(source) = weak.upgrade() else {
                     return Some("this node's scan workers stopped".to_string());
                 };
-                match source.audit_refusal(&ip, &ip_text, level).await {
+                match source.audit_refusal(&ip, &ip_text, &job_uid, level).await {
                     Ok(why) => why,
                     Err(e) => Some(format!("{e:#}")),
                 }
@@ -2356,6 +2367,41 @@ license_key = "k"
             .await
             .unwrap();
         assert!(r.is_ok(), "a bought scan runs with no requests held");
+    }
+
+    /// An audit of a bought job (level 5 among them: no request asks for
+    /// it) needs no evidence, as the bought scan did not; an audit of an
+    /// automatic job does.
+    #[tokio::test]
+    async fn an_audit_of_a_bought_job_needs_no_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, source, store) = cluster_source(dir.path(), "").await;
+        let rec = Recorder::Cluster(node.clone());
+        let ip = store
+            .upsert_ip("203.0.113.76".parse().unwrap())
+            .await
+            .unwrap();
+        let addr: IpAddr = ip.ip.parse().unwrap();
+        rec.enqueue_manual(ip.id, 5).await.unwrap();
+        let bought = job_uid(&store, ip.id).await;
+        assert_eq!(
+            source
+                .audit_refusal(&addr, &ip.ip, &bought, 5)
+                .await
+                .unwrap(),
+            None
+        );
+        let other = store
+            .upsert_ip("203.0.113.77".parse().unwrap())
+            .await
+            .unwrap();
+        rec.enqueue_scan(other.id, 2, 24).await.unwrap();
+        let auto = job_uid(&store, other.id).await;
+        let why = source
+            .audit_refusal(&other.ip.parse().unwrap(), &other.ip, &auto, 2)
+            .await
+            .unwrap();
+        assert!(why.is_some_and(|w| w.contains("do not back")));
     }
 
     /// A grant for an IP this scanner is scanning now, or for a job that

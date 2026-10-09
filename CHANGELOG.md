@@ -157,6 +157,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - The Decoys page fetched a row per LLM decoy request of the range (the
   whole history for "all time") on every view, only to count them. The
   database counts them now.
+- Level-5 scans could not be audited: auditors applied the evidence
+  re-check, which never backs level 5, and protocol-7 scanners were
+  ranked among their auditors. An audit of a bought job now skips the
+  evidence re-check as the scan did, and only protocol-8 scanners audit
+  level 5 (protocol 8).
 - An audit counted as bought on the strength of a receipt the ledger
   ignores (dated before its offer, or after the offer lapsed); it now
   takes the receipt the ledger counts, as paid scan jobs already did.

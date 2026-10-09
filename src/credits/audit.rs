@@ -449,8 +449,9 @@ pub fn designated(seed: &[u8; 32]) -> bool {
     (x as f64) < AUDIT_RATE * (u64::MAX as f64 + 1.0)
 }
 
-/// The auditors of a designated scan, best first: the active scanners of
-/// protocol 7 other than `scanner` admitted no later than the job's done
+/// The auditors of a designated scan at `level`, best first: the active
+/// scanners of protocol 7 (of protocol 8 for level 5, which older ones do
+/// not run) other than `scanner` admitted no later than the job's done
 /// status `done_hlc`, ranked by `SHA-256(seed || key)`; the first
 /// [`AUDITORS`]. A member admitted later cannot join the ranking of a
 /// scan after the fact. Roles, protocol and standing are read from the
@@ -460,15 +461,22 @@ pub fn auditors(
     members: &[MemberRow],
     scanner: &NodeId,
     done_hlc: u64,
+    level: u8,
 ) -> Vec<NodeId> {
+    use crate::cluster::rpc::proto::{ECONOMY_PROTO, VULN_SCAN_PROTO};
     use sha2::{Digest, Sha256};
+    let proto = if level >= 5 {
+        VULN_SCAN_PROTO
+    } else {
+        ECONOMY_PROTO
+    };
     let mut ranked: Vec<([u8; 32], NodeId)> = members
         .iter()
         .filter(|m| {
             m.active
                 && m.id != *scanner
                 && m.admitted_hlc <= done_hlc
-                && m.proto_max >= crate::cluster::rpc::proto::ECONOMY_PROTO
+                && m.proto_max >= proto
                 && m.roles.iter().any(|r| r == "scanner")
         })
         .map(|m| {
@@ -562,10 +570,10 @@ pub async fn obligations(
 ) -> Result<HashMap<NodeId, (u32, u32)>> {
     let from = hlc::to_db(now_ms.saturating_sub(7 * crate::credits::DAY_MS) << 16);
     let to = hlc::to_db(now_ms.saturating_sub(crate::credits::AUDIT_OFFER_TTL_MS) << 16);
-    // (scanner, scan uid, job uid, arbiter, done HLC)
-    type Row = (Vec<u8>, String, String, Vec<u8>, i64);
+    // (scanner, scan uid, job uid, arbiter, done HLC, level)
+    type Row = (Vec<u8>, String, String, Vec<u8>, i64, i64);
     let scans: Vec<Row> = sqlx::query_as(
-        "SELECT s.origin, s.uid, j.uid, j.arbiter, j.status_hlc FROM scans s
+        "SELECT s.origin, s.uid, j.uid, j.arbiter, j.status_hlc, s.level FROM scans s
          JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
          WHERE s.audit_of IS NULL AND s.origin IS NOT NULL AND s.uid IS NOT NULL
            AND s.level BETWEEN 1 AND 5 AND j.status = 'done'
@@ -590,7 +598,7 @@ pub async fn obligations(
     .await?;
     let paid: std::collections::HashSet<(String, Vec<u8>)> = paid.into_iter().collect();
     let mut out: HashMap<NodeId, (u32, u32)> = HashMap::new();
-    for (scanner_key, scan_uid, job_uid, arbiter, done) in scans {
+    for (scanner_key, scan_uid, job_uid, arbiter, done, level) in scans {
         let Ok(scanner) = NodeId::from_slice(&scanner_key) else {
             continue;
         };
@@ -600,7 +608,7 @@ pub async fn obligations(
             continue;
         }
         // A scan with nobody to buy its audit from is owed nothing.
-        let ranked = auditors(&s, members, &scanner, done);
+        let ranked = auditors(&s, members, &scanner, done, level.clamp(1, 5) as u8);
         if ranked.is_empty() || !job_paid(pool, &job_uid, &arbiter, &scanner_key).await? {
             continue;
         }
@@ -617,11 +625,12 @@ pub async fn obligations(
 }
 
 /// Whether this node's scan workers would run an audit of an address
-/// (parsed, as stored) at a level now: None, or why not. Registered by
-/// `scan::run_workers` in [`Node::audit_check`].
+/// (parsed, as stored) of a scan of a job (its uid) at a level now: None,
+/// or why not. Registered by `scan::run_workers` in [`Node::audit_check`].
 pub type Check = Arc<
     dyn Fn(
             std::net::IpAddr,
+            String,
             String,
             u8,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
@@ -795,7 +804,7 @@ async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Resul
     if scanner != peer || !(1..=5).contains(&level) || !designated(&s) {
         return refuse("not a designated scan of the asker").await;
     }
-    if !auditors(&s, &members, &scanner, done).contains(&node.id()) {
+    if !auditors(&s, &members, &scanner, done, level).contains(&node.id()) {
         return refuse("this node is not among the scan's auditors").await;
     }
     // What would keep a worker here from running it: declined now, so the
@@ -807,7 +816,7 @@ async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Resul
     let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
         return refuse("the scan's address does not parse").await;
     };
-    if let Some(why) = check(addr, ip.clone(), level).await {
+    if let Some(why) = check(addr, ip.clone(), job_uid.clone(), level).await {
         return refuse(&format!("this node does not scan that address now: {why}")).await;
     }
     let least = price::min_take(node.price_table().price_of(price::SCAN).unwrap_or(0)) as u64;
@@ -873,7 +882,7 @@ async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Resul
 /// Returns the auditor.
 pub async fn buy(node: &Arc<Node>, scan_uid: &str) -> Result<NodeId, String> {
     let me = node.id();
-    let Some((scanner, job_uid, _, _, done)) = scan_of(node, scan_uid).await else {
+    let Some((scanner, job_uid, _, level, done)) = scan_of(node, scan_uid).await else {
         return Err("the scan or its paid, done job is not held here".into());
     };
     if scanner != me {
@@ -887,7 +896,7 @@ pub async fn buy(node: &Arc<Node>, scan_uid: &str) -> Result<NodeId, String> {
         .await
         .map_err(|e| format!("{e:#}"))?;
     let mut last = "no auditor is reachable".to_string();
-    for auditor in auditors(&s, &members, &me, done) {
+    for auditor in auditors(&s, &members, &me, done, level) {
         let live = node
             .live_members(crate::intel::LIVE_WINDOW)
             .contains(&auditor);
@@ -1132,19 +1141,36 @@ mod tests {
             scanner_member(5, 6), // too old to be paid
         ];
         let s = seed("job-x", 7);
-        let got = auditors(&s, &members, &id(1), 7);
+        let got = auditors(&s, &members, &id(1), 7, 2);
         assert_eq!(got.len(), AUDITORS);
         assert!(!got.contains(&id(1)), "never the scanner itself");
         assert!(!got.contains(&id(5)));
-        assert_eq!(got, auditors(&s, &members, &id(1), 7), "deterministic");
+        assert_eq!(got, auditors(&s, &members, &id(1), 7, 2), "deterministic");
         // Another seed, another order (for some seed among a few).
-        assert!((8..40u64).any(|h| auditors(&seed("job-x", h), &members, &id(1), h) != got));
+        assert!((8..40u64).any(|h| auditors(&seed("job-x", h), &members, &id(1), h, 2) != got));
         let mut listener = scanner_member(6, 7);
         listener.roles = vec!["listener".into()];
         assert!(
-            !auditors(&s, &[listener], &id(1), 7).contains(&id(6)),
+            !auditors(&s, &[listener], &id(1), 7, 2).contains(&id(6)),
             "not a scanner"
         );
+    }
+
+    /// Level 5 is known from protocol 8 on: older scanners would decline
+    /// its audit, so they are not ranked for it.
+    #[test]
+    fn a_level_5_scan_is_audited_by_scanners_that_know_level_5() {
+        let p = crate::cluster::rpc::proto::VULN_SCAN_PROTO;
+        let members = [
+            scanner_member(1, p),
+            scanner_member(2, p - 1),
+            scanner_member(3, p),
+            scanner_member(4, p - 1),
+        ];
+        let s = seed("job-x", 7);
+        assert_eq!(auditors(&s, &members, &id(1), 7, 5), [id(3)]);
+        let low = auditors(&s, &members, &id(1), 7, 4);
+        assert_eq!(low.len(), 3, "{low:?}");
     }
 
     #[test]
@@ -1153,8 +1179,8 @@ mod tests {
         late.admitted_hlc = 100;
         let members = [scanner_member(1, 7), late, scanner_member(3, 7)];
         let s = seed("job-x", 50);
-        assert_eq!(auditors(&s, &members, &id(1), 50), [id(3)]);
-        let all = auditors(&s, &members, &id(1), 100);
+        assert_eq!(auditors(&s, &members, &id(1), 50, 2), [id(3)]);
+        let all = auditors(&s, &members, &id(1), 100, 2);
         assert!(all.contains(&id(2)) && all.contains(&id(3)), "{all:?}");
     }
 
