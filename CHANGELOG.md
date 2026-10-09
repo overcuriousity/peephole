@@ -133,6 +133,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   request row in full for the 30-day and all-time ranges, every five
   minutes. A new index covers both (migration 0031; it is built once, at
   the first start after the upgrade).
+- A domain looked up again kept the addresses an earlier lookup agreed on
+  as agreed, though the newer lookup no longer returned them; they stayed
+  in the "agreed name" search and the dataset's `names`. The newest lookup
+  of a name now stands alone, whichever order the lookups arrive in.
 
 ## [0.10.0] - 2026-10-09
 

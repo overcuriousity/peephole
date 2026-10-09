@@ -201,6 +201,17 @@ pub(crate) async fn apply_ip_name(
         return Ok(Effect::Erased(t));
     }
     let t = dns::tally(&r.answers);
+    // Agreement belongs to the newest lookup of the name only, whatever
+    // the arrival order: an older one agrees nothing once a newer is here.
+    let superseded: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM ip_names WHERE name = ?1 AND source = 'dns'
+           AND (last_seen > ?2 OR (last_seen = ?2 AND record_uid > ?3)))",
+    )
+    .bind(&r.name)
+    .bind(&r.at)
+    .bind(&r.uid)
+    .fetch_one(&mut *conn)
+    .await?;
     for v in &t.votes {
         let Some(ip_id) = ensure_ip(conn, &v.addr.to_string(), None).await? else {
             continue;
@@ -224,7 +235,7 @@ pub(crate) async fn apply_ip_name(
                AND (last_seen < ?1 OR (last_seen = ?1 AND record_uid <= ?6))",
         )
         .bind(&r.at)
-        .bind(v.agreed)
+        .bind(v.agreed && !superseded)
         .bind(t.asked as i64)
         .bind(t.answered as i64)
         .bind(v.votes as i64)
@@ -234,6 +245,18 @@ pub(crate) async fn apply_ip_name(
         .execute(&mut *conn)
         .await?;
     }
+    // A newer lookup no longer agrees the addresses it omits (the rows
+    // stay).
+    sqlx::query(
+        "UPDATE ip_names SET agreed = 0
+         WHERE name = ?1 AND source = 'dns'
+           AND (last_seen < ?2 OR (last_seen = ?2 AND record_uid < ?3))",
+    )
+    .bind(&r.name)
+    .bind(&r.at)
+    .bind(&r.uid)
+    .execute(&mut *conn)
+    .await?;
     Ok(Effect::Applied)
 }
 
@@ -494,6 +517,53 @@ mod tests {
         let named = store.ips_named("example.com").await.unwrap();
         assert_eq!(named.len(), 2);
         assert_eq!(named[0].0.ip, "203.0.113.1", "the agreed address first");
+    }
+
+    /// A newer lookup of a name no longer agrees the addresses it omits,
+    /// whichever arrives first.
+    #[tokio::test]
+    async fn the_newest_lookup_of_a_name_stands_in_any_order() {
+        use crate::cluster::record::IpNameRec;
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let lookup = |at: &str, addr: &str| IpNameRec {
+            uid: new_uid(),
+            name: "x.example".into(),
+            at: at.into(),
+            answers: vec![
+                (NodeId([1; 32]), Ok(vec![ip(addr)])),
+                (NodeId([2; 32]), Ok(vec![ip(addr)])),
+            ],
+            build: String::new(),
+        };
+        let r1 = lookup("2026-10-01 09:00:00", "203.0.113.1");
+        let r2 = lookup("2026-10-01 10:00:00", "203.0.113.2");
+        for order in [[&r1, &r2], [&r2, &r1]] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+            let ctx = Ctx {
+                origin: Some(&NodeId([1; 32])),
+                hlc: 5,
+            };
+            let mut conn = store.pool.acquire().await.unwrap();
+            for r in order {
+                let r = Record::IpName(r.clone());
+                assert_eq!(apply(&mut conn, ctx, &r).await.unwrap(), Effect::Applied);
+            }
+            let agreed: Vec<String> = sqlx::query_scalar(
+                "SELECT i.ip FROM ip_names n JOIN ips i ON i.id = n.ip_id
+                 WHERE n.name = 'x.example' AND n.agreed = 1",
+            )
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+            assert_eq!(agreed, ["203.0.113.2"], "{:?} first", order[0].at);
+            // Both addresses keep their row.
+            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ip_names")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(rows, 2);
+        }
     }
 
     #[tokio::test]
