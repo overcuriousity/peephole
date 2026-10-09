@@ -1074,8 +1074,9 @@ mod tests {
         addr
     }
 
-    /// A standalone admin with a prober aimed at `connect`; `IP` holds
-    /// three level-2 requests, and `scan` adds a finished scan of `port`.
+    /// A standalone admin with a prober aimed at `connect`; `IP` is in the
+    /// dataset, `scan` adds a finished scan of that port, and `extra` is
+    /// appended to the `[scan]` config.
     async fn state(
         scan: Option<u16>,
         extra: &str,

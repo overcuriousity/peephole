@@ -559,4 +559,30 @@ mod tests {
             Effect::Applied
         );
     }
+
+    #[tokio::test]
+    async fn a_peer_record_over_the_bound_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut r = rec("203.0.113.10", 7);
+        r.ports = (0u16..1025)
+            .map(|i| ProbePortRec {
+                port: 1000 + i,
+                protocol: "banner".into(),
+                outcome: "ok".into(),
+                detail_json: "{}".into(),
+            })
+            .collect();
+        let ctx = Ctx {
+            origin: Some(&NodeId([7; 32])),
+            hlc: 5,
+        };
+        let mut conn = store.pool.acquire().await.unwrap();
+        assert_eq!(
+            apply(&mut conn, ctx, &Record::ProbeResult(r))
+                .await
+                .unwrap(),
+            Effect::Ignored
+        );
+    }
 }

@@ -1322,12 +1322,13 @@ mod tests {
         assert!(matches!(first, EnqueueOutcome::Queued(_)));
         let second = rec.enqueue_manual(ip.id, 2).await.unwrap();
         assert!(matches!(second, EnqueueOutcome::Queued(_)));
-        let manual: i64 = sqlx::query_scalar("SELECT manual FROM scan_jobs WHERE ip_id = ?")
-            .bind(ip.id)
-            .fetch_one(&store.pool)
-            .await
-            .unwrap();
-        assert_eq!(manual, 1);
+        let both: (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*), SUM(manual) FROM scan_jobs WHERE ip_id = ?")
+                .bind(ip.id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(both, (2, 2));
     }
 
     fn req(ip_id: i64) -> NewRequest {

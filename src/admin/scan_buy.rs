@@ -456,6 +456,33 @@ secure_cookies = false
             .unwrap();
         assert_eq!(r.status(), 303);
         assert_eq!(r.headers()["location"], format!("/ip/{IP}#scans").as_str());
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE ip_id = ? AND level = 9")
+                .bind(ip_id)
+                .fetch_one(&state.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 0, "no job at a level that is not offered");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_level_does_not_block_a_different_level() {
+        let (state, cookie, ip_id, _d) = state().await;
+        scanned(&state.store, IP, &[(80, "open", Some("http"))]).await;
+        let app = crate::admin::full_router(state.clone());
+        let r = app
+            .oneshot(post(&cookie, &format!("ip={IP}&level=3")))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 303);
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_jobs WHERE ip_id = ? AND level = 3 AND manual = 1",
+        )
+        .bind(ip_id)
+        .fetch_one(&state.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "a fresh level-2 result does not block level 3");
     }
 
     #[tokio::test]
@@ -555,5 +582,33 @@ secure_cookies = false
             .await
             .unwrap_or_else(|_| panic!("no scan-jobs event in {seen:?}"));
         assert!(seen.contains("queued"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn the_stream_ends_once_nothing_waits() {
+        use futures::StreamExt;
+        let (state, cookie, _ip_id, _d) = state().await;
+        let app = crate::admin::full_router(state.clone());
+        let r = app
+            .oneshot(
+                axum::http::Request::get(format!("/admin/api/scan-jobs?ip={IP}"))
+                    .header("cookie", &cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let mut body = r.into_body().into_data_stream();
+        let mut seen = String::new();
+        let read = async {
+            while let Some(Ok(chunk)) = body.next().await {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(15), read)
+            .await
+            .unwrap_or_else(|_| panic!("the stream never closed: {seen:?}"));
+        assert!(seen.contains("event: scan-jobs"), "{seen}");
     }
 }
