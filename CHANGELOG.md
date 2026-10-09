@@ -137,6 +137,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   as agreed, though the newer lookup no longer returned them; they stayed
   in the "agreed name" search and the dataset's `names`. The newest lookup
   of a name now stands alone, whichever order the lookups arrive in.
+- Re-reading stored scans after an upgrade (host keys, scan facts)
+  decompressed and parsed each batch's nmap XML while holding the database
+  write lock. The XML is now read before the lock is taken.
 
 ## [0.10.0] - 2026-10-09
 

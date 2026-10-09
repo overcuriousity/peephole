@@ -32,14 +32,23 @@ pub(crate) async fn derive(
     scan_id: i64,
     raw_xml: Option<&[u8]>,
 ) -> Result<()> {
-    let f = match raw_xml.map(|b| zstd_decode_capped(b, MAX_RAW_XML)) {
+    store(conn, scan_id, read(scan_id, raw_xml)).await
+}
+
+/// The facts in a stored scan's XML (no database).
+fn read(scan_id: i64, raw_xml: Option<&[u8]>) -> Facts {
+    match raw_xml.map(|b| zstd_decode_capped(b, MAX_RAW_XML)) {
         Some(Ok(xml)) => extract(&xml),
         Some(Err(e)) => {
             tracing::debug!(scan_id, "scan facts: scan XML unreadable: {e:#}");
             Facts::default()
         }
         None => Facts::default(),
-    };
+    }
+}
+
+/// Store what [`read`] found and mark the scan as read at `FACTS_V`.
+async fn store(conn: &mut SqliteConnection, scan_id: i64, f: Facts) -> Result<()> {
     for p in &f.ports {
         let cpe = (!p.cpe.is_empty()).then(|| serde_json::to_string(&p.cpe).unwrap_or_default());
         sqlx::query(
@@ -84,38 +93,42 @@ pub(crate) async fn derive(
 
 /// Scans read per write transaction by [`backfill`].
 const BACKFILL_BATCH: i64 = 50;
-/// Pause between [`backfill`]'s transactions, so the trap's and
-/// replication's writes get the lock in between.
-const BACKFILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// A scan [`backfill`] reads: id, uid, XML.
+type Pending = (i64, Option<String>, Option<Vec<u8>>);
+
+/// Store a backfilled scan's facts, unless the scan was deleted since it
+/// was read.
+fn write_pending<'c>(
+    conn: &'c mut SqliteConnection,
+    (id, uid, _): &'c Pending,
+    facts: Facts,
+) -> super::backfill::WriteFut<'c> {
+    Box::pin(async move {
+        if super::scans::scan_is(conn, *id, uid.as_deref()).await? {
+            store(conn, *id, facts).await?;
+        }
+        Ok(())
+    })
+}
 
 /// Read the scans whose `facts_parsed` is below `below`: stored before
 /// `scan_facts` existed, by an older build sharing the database, or by an
-/// older parser. Walks the table once by id, a short transaction per
-/// batch with a pause after it. Returns how many were read.
+/// older parser (see [`super::backfill`]). Returns how many were read.
 pub async fn backfill(pool: &sqlx::SqlitePool, below: i64) -> Result<u64> {
-    let mut done = 0;
-    let mut after = 0i64;
-    loop {
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        let rows: Vec<(i64, Option<Vec<u8>>)> = sqlx::query_as(
-            "SELECT id, raw_xml FROM scans WHERE facts_parsed < ? AND id > ? ORDER BY id LIMIT ?",
-        )
-        .bind(below)
-        .bind(after)
-        .bind(BACKFILL_BATCH)
-        .fetch_all(&mut *tx)
-        .await?;
-        let Some((last, _)) = rows.last() else {
-            return Ok(done);
-        };
-        after = *last;
-        for (id, xml) in &rows {
-            derive(&mut tx, *id, xml.as_deref()).await?;
-        }
-        tx.commit().await?;
-        done += rows.len() as u64;
-        tokio::time::sleep(BACKFILL_PAUSE).await;
-    }
+    super::backfill::run(
+        pool,
+        super::backfill::Walk {
+            pending: "SELECT id, uid, raw_xml FROM scans
+                      WHERE facts_parsed < ? AND id > ? ORDER BY id LIMIT ?",
+            below: Some(below),
+            batch: BACKFILL_BATCH,
+            id: |r: &Pending| r.0,
+            derive: |r: &Pending| read(r.0, r.2.as_deref()),
+            write: write_pending,
+        },
+    )
+    .await
 }
 
 /// Give each port its facts, matched on port number and protocol (`facts`

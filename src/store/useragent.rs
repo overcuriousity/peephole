@@ -35,42 +35,43 @@ pub(crate) fn derive(headers_json: &str) -> String {
 
 /// Rows read per write transaction by [`backfill`].
 const BACKFILL_BATCH: i64 = 500;
-/// Pause between [`backfill`]'s transactions, so the trap's and
-/// replication's writes get the lock in between.
-const BACKFILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// The rows [`backfill`] has left, through `idx_requests_ua_pending`.
 const PENDING: &str =
     "SELECT id, headers_json FROM requests WHERE ua_v = 0 AND id > ? ORDER BY id LIMIT ?";
 
-/// Derive the User-Agent of the rows stored before this build, a batch at a
-/// time, each batch its own short write transaction with a pause after it.
-/// Returns how many rows were read.
-pub async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
-    let (mut done, mut after) = (0, 0i64);
-    loop {
-        let rows: Vec<(i64, String)> = sqlx::query_as(PENDING)
-            .bind(after)
-            .bind(BACKFILL_BATCH)
-            .fetch_all(pool)
+fn write_pending<'c>(
+    conn: &'c mut sqlx::SqliteConnection,
+    r: &'c (i64, String),
+    ua: String,
+) -> super::backfill::WriteFut<'c> {
+    Box::pin(async move {
+        sqlx::query("UPDATE requests SET user_agent = ?, ua_v = ? WHERE id = ?")
+            .bind(ua)
+            .bind(UA_V)
+            .bind(r.0)
+            .execute(&mut *conn)
             .await?;
-        let Some((last, _)) = rows.last() else {
-            return Ok(done);
-        };
-        after = *last;
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        for (id, headers) in &rows {
-            sqlx::query("UPDATE requests SET user_agent = ?, ua_v = ? WHERE id = ?")
-                .bind(derive(headers))
-                .bind(UA_V)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        done += rows.len() as u64;
-        tokio::time::sleep(BACKFILL_PAUSE).await;
-    }
+        Ok(())
+    })
+}
+
+/// Derive the User-Agent of the rows stored before this build,
+/// [`BACKFILL_BATCH`] at a time (see [`super::backfill`]). Returns how many
+/// rows were read.
+pub async fn backfill(pool: &sqlx::SqlitePool) -> Result<u64> {
+    super::backfill::run(
+        pool,
+        super::backfill::Walk {
+            pending: PENDING,
+            below: None,
+            batch: BACKFILL_BATCH,
+            id: |r: &(i64, String)| r.0,
+            derive: |r: &(i64, String)| derive(&r.1),
+            write: write_pending,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 pub mod analytics;
 pub mod auth;
+mod backfill;
 pub mod blocklist;
 pub mod browse;
 pub mod canaries;
