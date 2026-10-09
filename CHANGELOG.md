@@ -100,6 +100,13 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - The installer warns when it cannot verify the build provenance because
   the GitHub CLI is missing, instead of relying on the checksum (from the
   same server) without a word, and says how to require or skip the check.
+### Fixed
+
+- Bulk deletes (requests or IPs, "all matching") wrote every tombstone in
+  one transaction and held the database for as long as that took; the
+  trap's writes waiting behind it timed out and requests were lost. They
+  now commit 500 records at a time, with a pause in between, like
+  retention.
 
 ## [0.10.0] - 2026-10-09
 

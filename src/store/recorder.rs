@@ -1053,9 +1053,13 @@ impl Recorder {
         Ok((own, other))
     }
 
-    /// Delete records this node originated, everywhere.
+    /// Delete records this node originated, everywhere: a tombstone per
+    /// [`TOMB_CHUNK`] uids, each its own write transaction, [`PRUNE_PAUSE`]
+    /// apart (a bulk delete in one transaction outlasted the busy timeout
+    /// of the trap's writes waiting for the lock). Each tombstone names its
+    /// own uids with their positions, so it stands alone.
     async fn bury(&self, uids: Vec<String>) -> Result<()> {
-        let mut records = vec![];
+        let mut wrote = false;
         for c in uids.chunks(TOMB_CHUNK) {
             let (uids, seqs) = match self {
                 Recorder::Local(_) => (c.to_vec(), vec![]),
@@ -1082,31 +1086,36 @@ impl Recorder {
             if uids.is_empty() {
                 continue;
             }
-            records.push(Record::Tombstone(TombstoneRec {
+            if std::mem::replace(&mut wrote, true) {
+                tokio::time::sleep(PRUNE_PAUSE).await;
+            }
+            self.write(vec![Record::Tombstone(TombstoneRec {
                 uid: self.uid(),
                 uids,
                 seqs,
-            }));
-        }
-        if !records.is_empty() {
-            self.write(records).await?;
+            })])
+            .await?;
         }
         Ok(())
     }
 
     /// Records other nodes originated cannot be deleted from here: they are
-    /// hidden on this node only.
+    /// hidden on this node only, [`TOMB_CHUNK`] per write transaction,
+    /// [`PRUNE_PAUSE`] apart.
     async fn hide(&self, uids: Vec<String>) -> Result<u64> {
         let Recorder::Cluster(n) = self else {
             return Ok(0);
         };
-        if uids.is_empty() {
-            return Ok(0);
+        let mut hidden = 0;
+        for (i, c) in uids.chunks(TOMB_CHUNK).enumerate() {
+            if i > 0 {
+                tokio::time::sleep(PRUNE_PAUSE).await;
+            }
+            let _g = n.apply_lock.lock().await;
+            let mut tx = n.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+            hidden += data::hide(&mut tx, c).await?;
+            tx.commit().await?;
         }
-        let _g = n.apply_lock.lock().await;
-        let mut tx = n.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let hidden = data::hide(&mut tx, &uids).await?;
-        tx.commit().await?;
         Ok(hidden)
     }
 
@@ -1128,8 +1137,10 @@ impl Recorder {
             .split("fingerprints", "request_uid", Keys::Uids(&all))
             .await?;
         let (deleted, hidden) = (reqs.len() as u64, foreign.len() as u64);
-        self.bury([reqs, claims, fps].concat()).await?;
-        // Children first: hiding a request unlinks its fingerprints.
+        // Children first, in both: a delete cut short between two
+        // tombstones leaves no claim or fingerprint behind its request, and
+        // hiding a request unlinks its fingerprints.
+        self.bury([fps, claims, reqs].concat()).await?;
         self.hide([their_fps, their_claims, foreign].concat())
             .await?;
         Ok(Deleted { deleted, hidden })
@@ -1424,5 +1435,42 @@ mod tests {
             .unwrap();
         assert_eq!(left, [new.unwrap()]);
         assert!(rec.prune_older_than(90).await.unwrap().is_empty());
+    }
+
+    /// A bulk delete commits a tombstone at a time: readers see it part
+    /// done, and the trap writes in between.
+    #[tokio::test]
+    async fn bulk_deletes_commit_in_short_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let rec = store.local();
+        let ip = store
+            .upsert_ip("198.51.100.41".parse().unwrap())
+            .await
+            .unwrap();
+        let n = TOMB_CHUNK * 3;
+        let mut ids = vec![];
+        for _ in 0..n {
+            ids.push(rec.insert_request(&req(ip.id)).await.unwrap());
+        }
+        let count = async || -> i64 {
+            sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+                .fetch_one(&store.read)
+                .await
+                .unwrap()
+        };
+        let deleting = tokio::spawn({
+            let rec = rec.clone();
+            async move { rec.delete_requests(&ids).await.unwrap() }
+        });
+        let mut partial = false;
+        while !deleting.is_finished() {
+            let left = count().await;
+            partial |= left > 0 && left < n as i64;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(deleting.await.unwrap().deleted, n as u64);
+        assert!(partial, "committed in one transaction");
+        assert_eq!(count().await, 0);
     }
 }
