@@ -67,7 +67,18 @@ pub(crate) async fn apply_rdns(
         return Ok(Effect::Ignored);
     };
     let (answered, names) = tally_names(&r.answers);
+    // Agreement belongs to the newest record only, whatever the arrival order.
+    let superseded: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM ip_names WHERE ip_id = ?1 AND source = 'rdns'
+           AND (last_seen > ?2 OR (last_seen = ?2 AND record_uid > ?3)))",
+    )
+    .bind(ip_id)
+    .bind(&r.at)
+    .bind(&r.uid)
+    .fetch_one(&mut *conn)
+    .await?;
     for (name, votes, agreed) in names {
+        let agreed = agreed && !superseded;
         sqlx::query(
             "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen)
              VALUES (?1, ?2, 'rdns', ?3, ?3)
@@ -350,6 +361,27 @@ mod tests {
         };
         assert_eq!(agreed(&mut conn, "old.example.net").await, Some(false));
         assert_eq!(agreed(&mut conn, "new.example.net").await, Some(true));
+        // The reverse arrival order ends the same.
+        let dir2 = tempfile::tempdir().unwrap();
+        let s2 = Store::connect(&dir2.path().join("t.db")).await.unwrap();
+        let mut c2 = s2.pool.acquire().await.unwrap();
+        for r in [&new, &old] {
+            apply_rdns(&mut c2, ctx, r).await.unwrap();
+        }
+        let ip2 = crate::store::data::ensure_ip(&mut c2, "198.51.100.9", None)
+            .await
+            .unwrap()
+            .unwrap();
+        for (name, want) in [("old.example.net", false), ("new.example.net", true)] {
+            let got: bool =
+                sqlx::query_scalar("SELECT agreed FROM ip_names WHERE ip_id = ? AND name = ?")
+                    .bind(ip2)
+                    .bind(name)
+                    .fetch_one(&mut *c2)
+                    .await
+                    .unwrap();
+            assert_eq!(got, want, "{name} applied newest first");
+        }
         // Erasing the newest record removes its rows.
         crate::store::data::unmaterialize(&mut conn, "rdns_name", &new.uid)
             .await
