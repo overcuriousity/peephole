@@ -5,6 +5,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-09
+
 ### Breaking
 
 - Protocol 7: a new economy of credits. The daily mint, the allowance and
@@ -12,7 +14,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   members anyone can reach (advertised listeners up 12 of 24 hours, by
   hourly reach reports). Balances start at zero: payments of earlier
   versions are kept but no longer counted. Upgrade every member in one
-  sitting; a member below protocol 7 is neither paid nor charged.
+  sitting; a member below protocol 7 is neither paid nor charged, and is
+  served no entries of protocol 7 until it upgrades.
 - `peephole credits why` is gone; `peephole credits uptime` lists each
   member's reported hours.
 
@@ -27,8 +30,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   the node that recorded it and replicated with their agreement.
 - Scanners buy audits of their designated scans (1 in 20 scans of paid
   jobs, drawn from the log) from ranked auditors, and are not funded while
-  they owe them.
-
+  they owe them. Each scanner still re-checks `[credits] audit_share` of
+  other nodes' fresh scans unpaid.
+- An outbound-only member gets no share of the daily pool and, without a
+  relay lease, cannot be asked anything (remote config and owner commands
+  included); answers to its own requests still reach it.
 - The Actions card is laid out anew: probe vantages as chips, the four
   scan levels side by side. Every button shows its cost ("Probe · 0.04
   credits", "L4 · from 0.06 credits", "Look up · up to 0.12 credits", "Ask
@@ -45,7 +51,6 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   (`check-config` says so), as are runtime overrides of them saved
   earlier. The pace recommendation is gone. Nodes of earlier versions in
   the same cluster are told the fixed values.
-
 - Probes are no longer capped at 16 ports, need neither level-2 evidence
   nor a finished counter-scan (without one they read the well-known ports
   22, 80, 443, 8080 and 8443), and the same address can be probed again
@@ -53,8 +58,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Scan jobs go to the scanner that is cheapest per delivered result at
   the job's level: its price divided by its success rate there. A failed
   scan is not paid, so a cheap scanner that fails a level often no longer
-  wins it. A paid job waits up to 30 minutes for a cheaper live scanner,
-  then goes to whoever asks.
+  wins it. A job waits up to 30 minutes for a cheaper live scanner, then
+  goes to whoever asks.
 - Scanner success rates (level weights) are measured once an hour, five
   minutes after the hour, over the 24 hours before it.
 - Prices are refreshed every 10 minutes instead of every hour, in steps
@@ -73,8 +78,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Added
 
-- Outbound-only members lease relays from reachable members (`[cluster]
-  relay_slots` on the relay side) to be asked for paid goods.
+- Outbound-only members lease two relays an hour from reachable members,
+  which sell them (`[cluster] relay_slots`, 16 at a time); members reach
+  an outbound-only member through the relays its heartbeat lists.
 - The Actions card sells a counter-scan of level 1–4: level 1 at the
   cluster's cheapest scanner offer, four times that per level above. The
   job runs through the normal queue and appears live on the IP page; a
@@ -109,10 +115,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   return 200 with an ETag derived from the request, a canary of kind
   `etag`: a client that sends it back in `If-None-Match`, from any
   address, is a canary reuse.
-- Reverse DNS of every source. Each node looks up the PTR names of the
-  addresses that sent requests and keeps those that resolve back
-  (`ip_names` source `rdns`), when first seen and when the source returns
-  a day later. Shown on the IP page, in the `names` export column, and as
+- Reverse DNS of every source: the PTR names of the addresses that sent
+  requests that resolve back (`ip_names` source `rdns`), looked up when
+  first seen and when the source returns a day later. A standalone node
+  looks them up itself; in a cluster the node that recorded the source
+  buys them from a quorum and every node keeps them with their agreement
+  (agreed or disputed, votes of answers). Shown on the IP page, in the `names` export column, and as
   the IP directory's new Name filter. `[enrichment] reverse_dns = false`
   turns it off.
 
@@ -729,6 +737,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 First release.
 
+[0.10.0]: https://github.com/overcuriousity/peephole/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/overcuriousity/peephole/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/overcuriousity/peephole/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/overcuriousity/peephole/compare/v0.6.0...v0.7.0
