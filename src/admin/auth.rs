@@ -109,7 +109,7 @@ fn webauthn_for(cfg: &crate::config::Config) -> Result<Webauthn> {
     builder.build().context("webauthn build")
 }
 
-/// Password checks allowed at once.
+/// Password checks (and hashes, on a change) allowed at once.
 pub const MAX_VERIFIES: usize = 3;
 
 /// A hash nobody knows the password of, verified when none is set so a
@@ -398,12 +398,18 @@ async fn enroll_finish(
             let old = session_token(&state, &jar);
             match state
                 .store
-                .create_session_for(Some(passkey.cred_id()), old.as_deref())
+                .create_session_for(passkey.cred_id(), old.as_deref())
                 .await
             {
-                Ok(token) => (
+                Ok(Some(token)) => (
                     clear_ceremony(cfg, jar.add(session_cookie(cfg, token))),
                     StatusCode::OK,
+                )
+                    .into_response(),
+                Ok(None) => (
+                    StatusCode::FORBIDDEN,
+                    clear_ceremony(cfg, jar),
+                    "the key was deleted meanwhile",
                 )
                     .into_response(),
                 Err(e) => {
@@ -536,19 +542,25 @@ async fn login_finish(
                 }
             }
             // The session belongs to the key used (deleting the key ends
-            // it); a session the browser held before ends now.
+            // it; a key deleted since this sign-in started gets none); a
+            // session the browser held before ends now.
             let old = session_token(&state, &jar);
             let used: &[u8] = result.cred_id();
-            match state
-                .store
-                .create_session_for(Some(used), old.as_deref())
-                .await
-            {
-                Ok(token) => (
+            match state.store.create_session_for(used, old.as_deref()).await {
+                Ok(Some(token)) => (
                     clear_ceremony(cfg, jar.add(session_cookie(cfg, token))),
                     StatusCode::OK,
                 )
                     .into_response(),
+                Ok(None) => {
+                    tracing::info!("passkey sign-in with a deleted key rejected");
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        clear_ceremony(cfg, jar),
+                        "authentication failed",
+                    )
+                        .into_response()
+                }
                 Err(e) => {
                     tracing::warn!(?e, "could not create session");
                     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -595,6 +607,7 @@ async fn login_password(
     };
     let found = phc.is_some();
     let phc = phc.unwrap_or_else(|| DUMMY_PHC.to_string());
+    let checked = phc.clone();
     let ok = tokio::task::spawn_blocking(move || crate::admin::password::verify(&f.password, &phc))
         .await
         .unwrap_or(false)
@@ -606,14 +619,27 @@ async fn login_password(
             Err(e) => e.into_response(),
         };
     }
-    // A session the browser held before ends now.
+    // A session the browser held before ends now. None if the password
+    // changed or password sign-in went off while it was being checked.
     let old = session_token(&state, &jar);
-    match state.store.create_session_for(None, old.as_deref()).await {
-        Ok(token) => (
+    match state
+        .store
+        .create_password_session(&checked, old.as_deref())
+        .await
+    {
+        Ok(Some(token)) => (
             jar.add(session_cookie(&state.cfg, token)),
             Redirect::to("/admin"),
         )
             .into_response(),
+        Ok(None) => {
+            tracing::info!("password sign-in overtaken by a sign-in change");
+            let why = "The sign-in settings changed meanwhile; try again.";
+            match render_login(&state, false, Some(why.into())).await {
+                Ok(page) => (StatusCode::CONFLICT, page).into_response(),
+                Err(e) => e.into_response(),
+            }
+        }
         Err(e) => {
             tracing::warn!(?e, "could not create session");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -771,6 +797,23 @@ secure_cookies = {secure}
     }
 
     #[tokio::test]
+    async fn a_password_change_takes_a_verification_slot() {
+        let (_d, state, app) = app().await;
+        let me = state.store.create_session().await.unwrap();
+        let form = "new=a+long+password+1&again=a+long+password+1";
+        let held = state
+            .verify_slots
+            .try_acquire_many(MAX_VERIFIES as u32)
+            .unwrap();
+        let (_, _, page) = send(&app, "POST", "/admin/system/password", Some(&me), form).await;
+        assert!(page.contains("Too many password checks"), "{page}");
+        assert!(state.store.password_hash().await.unwrap().is_none());
+        drop(held);
+        let (_, _, page) = send(&app, "POST", "/admin/system/password", Some(&me), form).await;
+        assert!(page.contains("Password saved."), "{page}");
+    }
+
+    #[tokio::test]
     async fn the_login_page_offers_what_the_method_allows() {
         let (_d, state, app) = app().await;
         let (_, _, page) = send(&app, "GET", "/login", None, "").await;
@@ -890,6 +933,52 @@ secure_cookies = {secure}
         // The only key may go while a password stands in for it.
         let (_, _, page) = send(&app, "GET", "/admin/system/keys", Some(&me), "").await;
         assert!(page.contains("/admin/keys/delete"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_key_says_what_happened() {
+        let (_d, state, app) = app().await;
+        for id in [b"k1", b"k2"] {
+            state.store.save_credential(id, "{}", None).await.unwrap();
+        }
+        let me = state.store.create_session().await.unwrap();
+        let flash = |form: &'static str| {
+            let app = app.clone();
+            let me = me.clone();
+            async move {
+                let (st, set, _) = send(&app, "POST", "/admin/keys/delete", Some(&me), form).await;
+                assert_eq!(st, StatusCode::SEE_OTHER);
+                set.unwrap_or_default()
+            }
+        };
+        // "k1" and "k2" in hex; SQLite's hex() is uppercase.
+        let c = flash("cred_id=zz").await;
+        assert!(c.starts_with("peephole_flash_error=No+such+key"), "{c}");
+        let c = flash("cred_id=ffff").await;
+        assert!(c.starts_with("peephole_flash_error=No+such+key"), "{c}");
+        let c = flash("cred_id=6B31").await;
+        assert!(c.starts_with("peephole_flash=Key+deleted"), "{c}");
+        let c = flash("cred_id=6b32").await;
+        assert!(c.starts_with("peephole_flash_error=The+last+key"), "{c}");
+        // A storage failure is reported, not taken for a deletion.
+        state
+            .store
+            .save_credential(b"k3", "{}", None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER keep_keys BEFORE DELETE ON credentials
+             BEGIN SELECT RAISE(ABORT, 'locked'); END",
+        )
+        .execute(&state.store.pool)
+        .await
+        .unwrap();
+        let c = flash("cred_id=6b33").await;
+        assert!(
+            c.starts_with("peephole_flash_error=Could+not+delete"),
+            "{c}"
+        );
+        assert_eq!(state.store.load_credentials().await.unwrap().len(), 2);
     }
 
     #[test]

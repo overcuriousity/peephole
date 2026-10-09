@@ -1,14 +1,17 @@
 //! Live scan queue for the admin area. Snapshot on connect, then one event
 //! per job transition from the broadcast notifier; a periodic snapshot and
-//! a lag-triggered snapshot keep long-lived clients honest.
+//! a lag-triggered snapshot keep long-lived clients honest. Also the other
+//! admin streams: the wall's request feed and [`watch`], which the Actions
+//! card's probe and scan-job states use.
 use crate::admin::{AdminState, auth::SessionUser};
 use crate::events::QueueJob;
 use axum::{
     extract::State,
-    response::sse::{Event, KeepAlive, Sse},
+    response::sse::{Event, KeepAlive, KeepAliveStream, Sse},
 };
 use futures::stream::Stream;
 use std::convert::Infallible;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
@@ -55,6 +58,123 @@ async fn closing(state: &AdminState) {
 /// Forced-resync / session-recheck cadence.
 const SNAPSHOT_EVERY: Duration = Duration::from_secs(30);
 
+/// Whether the stream's session (if it had one) has ended: a logout or
+/// expiry ends the stream instead of streaming admin data to a dead
+/// session.
+async fn session_ended(state: &AdminState, session: &Option<String>) -> bool {
+    match session {
+        Some(id) => !state.store.validate_session(id).await.unwrap_or(false),
+        None => false,
+    }
+}
+
+/// [`session_ended`], asked at most every [`SNAPSHOT_EVERY`].
+struct SessionCheck {
+    session: Option<String>,
+    next: tokio::time::Instant,
+}
+
+impl SessionCheck {
+    fn new(session: Option<String>) -> Self {
+        Self {
+            session,
+            next: tokio::time::Instant::now() + SNAPSHOT_EVERY,
+        }
+    }
+
+    async fn ended(&mut self, state: &AdminState) -> bool {
+        if tokio::time::Instant::now() < self.next {
+            return false;
+        }
+        self.next = tokio::time::Instant::now() + SNAPSHOT_EVERY;
+        session_ended(state, &self.session).await
+    }
+}
+
+/// The SSE response for an admin stream, kept alive through proxies.
+fn sse<S>(stream: S) -> Sse<KeepAliveStream<S>>
+where
+    S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
+{
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    )
+}
+
+/// How often [`watch`] looks again without a log change.
+const WATCH_POLL: Duration = Duration::from_secs(3);
+
+/// A stream of `event`s carrying what `load` returns, `(states, waiting)`:
+/// the states whenever they change, looked at again on each cluster-log
+/// change or every [`WATCH_POLL`]. The last event goes out once nothing is
+/// `waiting`: the page reloads and opens no new stream.
+pub fn watch<F, Fut>(
+    state: Arc<AdminState>,
+    session: Option<String>,
+    event: &'static str,
+    load: F,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
+where
+    F: Fn(Arc<AdminState>) -> Fut + Send + 'static,
+    Fut: Future<Output = (String, bool)> + Send,
+{
+    struct St<F> {
+        state: Arc<AdminState>,
+        check: SessionCheck,
+        changes: Option<tokio::sync::watch::Receiver<u64>>,
+        load: F,
+        last: Option<String>,
+        done: bool,
+    }
+    let changes = state.recorder.node().map(|n| n.subscribe_changes());
+    sse(futures::stream::unfold(
+        St {
+            state,
+            check: SessionCheck::new(session),
+            changes,
+            load,
+            last: None,
+            done: false,
+        },
+        move |mut st| async move {
+            if st.done {
+                return None;
+            }
+            loop {
+                if st.last.is_some() {
+                    let changed = async {
+                        match st.changes.as_mut() {
+                            Some(rx) => {
+                                if rx.changed().await.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        _ = closing(&st.state) => return None,
+                        _ = changed => {}
+                        _ = tokio::time::sleep(WATCH_POLL) => {}
+                    }
+                }
+                if st.check.ended(&st.state).await {
+                    return None;
+                }
+                let (states, waiting) = (st.load)(st.state.clone()).await;
+                st.done = !waiting;
+                if st.last.as_deref() != Some(&states) || st.done {
+                    st.last = Some(states.clone());
+                    let ev = Event::default().event(event).data(states);
+                    return Some((Ok(ev), st));
+                }
+            }
+        },
+    ))
+}
+
 pub async fn queue_stream(
     _u: SessionUser,
     jar: axum_extra::extract::CookieJar,
@@ -63,11 +183,7 @@ pub async fn queue_stream(
     let rx = state.notifier.subscribe();
     // The session id, so the long-lived stream can notice logout/expiry.
     let session = crate::admin::auth::session_token(&state, &jar);
-    Sse::new(async_stream(state, rx, session)).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    )
+    sse(async_stream(state, rx, session))
 }
 
 fn async_stream(
@@ -109,11 +225,7 @@ fn async_stream(
                 _ = closing(&st.state) => return None,
                 _ = tokio::time::sleep_until(st.next_snapshot) => {
                     st.next_snapshot = tokio::time::Instant::now() + SNAPSHOT_EVERY;
-                    // Re-check the session so a logout or expiry ends the stream
-                    // instead of streaming queue data to a dead session.
-                    if let Some(id) = &st.session
-                        && !st.state.store.validate_session(id).await.unwrap_or(false)
-                    {
+                    if session_ended(&st.state, &st.session).await {
                         return None;
                     }
                     snapshot_or_comment(&st.state).await
@@ -152,11 +264,7 @@ pub async fn recent_stream(
         Some(a) => a,
         None => state.store.max_request_id().await.unwrap_or(0),
     };
-    Sse::new(recent_events(state, after, session)).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    )
+    sse(recent_events(state, after, session))
 }
 
 fn recent_events(
@@ -167,15 +275,13 @@ fn recent_events(
     struct St {
         state: Arc<AdminState>,
         after: i64,
-        session: Option<String>,
-        next_check: tokio::time::Instant,
+        check: SessionCheck,
     }
     futures::stream::unfold(
         St {
             state,
             after,
-            session,
-            next_check: tokio::time::Instant::now() + SNAPSHOT_EVERY,
+            check: SessionCheck::new(session),
         },
         |mut st| async move {
             loop {
@@ -183,14 +289,8 @@ fn recent_events(
                     _ = closing(&st.state) => return None,
                     _ = tokio::time::sleep(RECENT_POLL) => {}
                 }
-                if tokio::time::Instant::now() >= st.next_check {
-                    st.next_check = tokio::time::Instant::now() + SNAPSHOT_EVERY;
-                    // A logout or expiry ends the stream, as for the queue.
-                    if let Some(id) = &st.session
-                        && !st.state.store.validate_session(id).await.unwrap_or(false)
-                    {
-                        return None;
-                    }
+                if st.check.ended(&st.state).await {
+                    return None;
                 }
                 match st.state.store.requests_after(st.after, RECENT_BATCH).await {
                     Ok(rows) if !rows.is_empty() => {
@@ -213,9 +313,8 @@ mod tests {
     use super::*;
     use futures::StreamExt;
 
-    #[tokio::test]
-    async fn store_error_yields_comment_not_empty_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
+    /// A standalone admin on a fresh database in `dir`.
+    async fn admin(dir: &tempfile::TempDir) -> (crate::config::Config, crate::store::Store) {
         let cfg_text = format!(
             r#"
 trap_listen = "127.0.0.1:0"
@@ -238,6 +337,13 @@ license_key = "k"
         let store = crate::store::Store::connect(&cfg.database_path)
             .await
             .unwrap();
+        (cfg, store)
+    }
+
+    #[tokio::test]
+    async fn store_error_yields_comment_not_empty_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, store) = admin(&dir).await;
         store.pool.close().await; // every query now fails
         let state = Arc::new(AdminState::public_only(store, cfg));
         let rx = state.notifier.subscribe();
@@ -246,5 +352,41 @@ license_key = "k"
         let dbg = format!("{first:?}");
         assert!(!dbg.contains("event: snapshot"), "{dbg}");
         assert!(dbg.contains(": snapshot unavailable"), "{dbg}");
+    }
+
+    #[tokio::test]
+    async fn watch_sends_changes_and_ends_once_nothing_waits() {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, store) = admin(&dir).await;
+        let state = Arc::new(AdminState::public_only(store, cfg));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        // Waiting, unchanged (no event), then settled.
+        let sse = watch(state, None, "states", move |_| {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match n {
+                    0 | 1 => ("[1]".to_string(), true),
+                    _ => ("[2]".to_string(), false),
+                }
+            }
+        });
+        let body = sse.into_response().into_body();
+        let all = tokio::time::timeout(
+            Duration::from_secs(20),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await
+        .expect("the stream ends")
+        .unwrap();
+        let all = String::from_utf8_lossy(&all);
+        assert_eq!(all.matches("event: states").count(), 2, "{all}");
+        assert!(
+            all.contains("data: [1]") && all.contains("data: [2]"),
+            "{all}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }

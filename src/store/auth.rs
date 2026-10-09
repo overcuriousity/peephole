@@ -41,6 +41,7 @@ impl Store {
         ] {
             sqlx::query(sql).bind(cred_id).execute(&mut *tx).await?;
         }
+        end_open_sign_ins(&mut tx).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -48,10 +49,19 @@ impl Store {
     /// Delete a key only while the admin keeps a way in: another key remains,
     /// or the method is `Both` and a password is set (the method then
     /// becomes `Password` if no key is left). One immediate transaction, so
-    /// two concurrent deletes cannot both pass the check. Returns whether a
-    /// row was deleted. Sessions signed in with the key end with it.
-    pub async fn delete_credential_guarded(&self, cred_id: &[u8]) -> Result<bool> {
+    /// two concurrent deletes cannot both pass the check. Sessions signed
+    /// in with the key end with it, and so do open sign-ins (their
+    /// allowed-key lists may name it).
+    pub async fn delete_credential_guarded(&self, cred_id: &[u8]) -> Result<KeyDeletion> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM credentials WHERE cred_id = ?)")
+                .bind(cred_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            return Ok(KeyDeletion::NotFound);
+        }
         let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credentials")
             .fetch_one(&mut *tx)
             .await?;
@@ -60,24 +70,20 @@ impl Store {
         let has_password = get_meta(&mut tx, PASSWORD_HASH).await?.is_some();
         let last = keys <= 1;
         if last && !(method != LoginMethod::Passkey && has_password) {
-            return Ok(false);
+            return Ok(KeyDeletion::LastWayIn);
         }
-        let r = sqlx::query("DELETE FROM credentials WHERE cred_id = ?")
-            .bind(cred_id)
-            .execute(&mut *tx)
-            .await?;
-        let deleted = r.rows_affected() > 0;
-        if deleted {
-            sqlx::query("DELETE FROM sessions WHERE cred_id = ?")
-                .bind(cred_id)
-                .execute(&mut *tx)
-                .await?;
-            if last {
-                put_meta(&mut tx, LOGIN_METHOD, LoginMethod::Password.as_str()).await?;
-            }
+        for sql in [
+            "DELETE FROM credentials WHERE cred_id = ?",
+            "DELETE FROM sessions WHERE cred_id = ?",
+        ] {
+            sqlx::query(sql).bind(cred_id).execute(&mut *tx).await?;
+        }
+        end_open_sign_ins(&mut tx).await?;
+        if last {
+            put_meta(&mut tx, LOGIN_METHOD, LoginMethod::Password.as_str()).await?;
         }
         tx.commit().await?;
-        Ok(deleted)
+        Ok(KeyDeletion::Deleted)
     }
 
     /// How the admin signs in (`Passkey` when never set).
@@ -144,17 +150,43 @@ impl Store {
 
     /// A session not bound to a key (tests and tooling).
     pub async fn create_session(&self) -> Result<String> {
-        self.create_session_for(None, None).await
+        let token = self.start_session(Basis::Unbound, None).await?;
+        token.ok_or_else(|| anyhow::anyhow!("an unbound session is never refused"))
     }
 
     /// Start a session for the key `cred_id` (deleting the key ends it) and
     /// end `replacing`, the session the browser held before, if any. Returns
-    /// the token for the cookie; only its SHA-256 is stored.
+    /// the token for the cookie; only its SHA-256 is stored. `None` when the
+    /// key is no longer enrolled: checked in the transaction that inserts,
+    /// so a key deleted mid-sign-in starts no session.
     pub async fn create_session_for(
         &self,
-        cred_id: Option<&[u8]>,
+        cred_id: &[u8],
         replacing: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
+        self.start_session(Basis::Key(cred_id), replacing).await
+    }
+
+    /// Start a password session (see [`Self::create_session_for`]) for a
+    /// password checked against `phc`. `None` unless password sign-in is
+    /// still on and `phc` still the stored hash: a method switch or password
+    /// change that landed during the (slow) check ended the password
+    /// sessions, and must end this one too.
+    pub async fn create_password_session(
+        &self,
+        phc: &str,
+        replacing: Option<&str>,
+    ) -> Result<Option<String>> {
+        self.start_session(Basis::Password(phc), replacing).await
+    }
+
+    /// Insert a session once `basis` still holds, in one immediate
+    /// transaction with the check.
+    async fn start_session(
+        &self,
+        basis: Basis<'_>,
+        replacing: Option<&str>,
+    ) -> Result<Option<String>> {
         // Opportunistic cleanup of stale rows; cheap and keeps the tables bounded.
         let _ = self.prune_expired_auth().await;
         let token = format!(
@@ -162,13 +194,34 @@ impl Store {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let holds = match basis {
+            Basis::Unbound => true,
+            Basis::Key(id) => {
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM credentials WHERE cred_id = ?)")
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await?
+            }
+            Basis::Password(phc) => {
+                let method = get_meta(&mut tx, LOGIN_METHOD).await?;
+                let method: LoginMethod = method.and_then(|m| m.parse().ok()).unwrap_or_default();
+                method.password() && get_meta(&mut tx, PASSWORD_HASH).await?.as_deref() == Some(phc)
+            }
+        };
+        if !holds {
+            return Ok(None);
+        }
         if let Some(old) = replacing {
             sqlx::query("DELETE FROM sessions WHERE id_hash = ?")
                 .bind(token_hash(old))
                 .execute(&mut *tx)
                 .await?;
         }
+        let cred_id = match basis {
+            Basis::Key(id) => Some(id),
+            Basis::Unbound | Basis::Password(_) => None,
+        };
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO sessions (id_hash, cred_id, created_at, last_seen, expires_at)
              VALUES (?, ?, datetime('now'), datetime('now'), datetime('now', '+{SESSION_HOURS} hours'))"
@@ -178,7 +231,7 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(token)
+        Ok(Some(token))
     }
 
     /// Delete expired sessions (absolute or idle) and WebAuthn ceremony states.
@@ -265,15 +318,17 @@ impl Store {
         .await?)
     }
 
-    /// Whether `token` is a live session: within its absolute lifetime and
-    /// used within the idle timeout. Use slides the idle timeout (at most
-    /// one write a minute per session).
+    /// Whether `token` is a live session: within its absolute lifetime,
+    /// used within the idle timeout, and its key (if any) still enrolled.
+    /// Use slides the idle timeout (at most one write a minute per session).
     pub async fn validate_session(&self, token: &str) -> Result<bool> {
         let hash = token_hash(token);
         let row: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT last_seen < datetime('now', '-60 seconds') FROM sessions
              WHERE id_hash = ? AND expires_at > datetime('now')
-               AND last_seen > datetime('now', '-{SESSION_IDLE_MINUTES} minutes')"
+               AND last_seen > datetime('now', '-{SESSION_IDLE_MINUTES} minutes')
+               AND (cred_id IS NULL
+                    OR EXISTS (SELECT 1 FROM credentials c WHERE c.cred_id = sessions.cred_id))"
         )))
         .bind(&hash)
         .fetch_optional(&self.pool)
@@ -428,6 +483,27 @@ const PASSWORD_HASH: &str = "admin_password_hash";
 const SETUP_TOKEN_HASH: &str = "webauthn_setup_token_hash";
 const SETUP_TOKEN_EXPIRES: &str = "webauthn_setup_token_expires";
 
+/// What [`Store::delete_credential_guarded`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyDeletion {
+    Deleted,
+    /// Refused: the key is the admin's last way in.
+    LastWayIn,
+    /// No such key (deleted meanwhile, or never enrolled).
+    NotFound,
+}
+
+/// What a new session rests on, re-checked as it starts.
+#[derive(Clone, Copy)]
+enum Basis<'a> {
+    /// Nothing (tests and tooling).
+    Unbound,
+    /// This key, still enrolled.
+    Key(&'a [u8]),
+    /// The password with this stored hash, password sign-in still on.
+    Password(&'a str),
+}
+
 /// The first-run setup token, as far as the database knows.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SetupToken {
@@ -497,6 +573,15 @@ async fn get_meta(tx: &mut sqlx::SqliteConnection, key: &str) -> Result<Option<S
     )
 }
 
+/// End every open sign-in ceremony: each holds the allowed-key list from its
+/// start, which may name a key just deleted.
+async fn end_open_sign_ins(tx: &mut sqlx::SqliteConnection) -> Result<()> {
+    sqlx::query("DELETE FROM webauthn_states WHERE kind = 'auth'")
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
 /// Upsert one `intel_meta` value inside a transaction.
 async fn put_meta(tx: &mut sqlx::SqliteConnection, key: &str, value: &str) -> Result<()> {
     sqlx::query(
@@ -512,7 +597,7 @@ async fn put_meta(tx: &mut sqlx::SqliteConnection, key: &str, value: &str) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::LoginMethod;
+    use super::{KeyDeletion, LoginMethod};
     use crate::store::Store;
 
     #[tokio::test]
@@ -563,9 +648,15 @@ mod tests {
         let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
         s.save_credential(b"a", "{}", None).await.unwrap();
         s.save_credential(b"b", "{}", None).await.unwrap();
-        assert!(s.delete_credential_guarded(b"a").await.unwrap());
+        assert_eq!(
+            s.delete_credential_guarded(b"a").await.unwrap(),
+            KeyDeletion::Deleted
+        );
         // Only one left: refuse to delete it.
-        assert!(!s.delete_credential_guarded(b"b").await.unwrap());
+        assert_eq!(
+            s.delete_credential_guarded(b"b").await.unwrap(),
+            KeyDeletion::LastWayIn
+        );
         assert_eq!(s.load_credentials().await.unwrap().len(), 1);
     }
 
@@ -586,13 +677,22 @@ mod tests {
         );
         s.save_credential(b"k1", "{}", Some("one")).await.unwrap();
         // Last key, method passkey: refused.
-        assert!(!s.delete_credential_guarded(b"k1").await.unwrap());
+        assert_eq!(
+            s.delete_credential_guarded(b"k1").await.unwrap(),
+            KeyDeletion::LastWayIn
+        );
         // Both, but no password: still refused.
         s.set_login_method(LoginMethod::Both).await.unwrap();
-        assert!(!s.delete_credential_guarded(b"k1").await.unwrap());
+        assert_eq!(
+            s.delete_credential_guarded(b"k1").await.unwrap(),
+            KeyDeletion::LastWayIn
+        );
         // With a password: the last key goes and the method becomes password.
         s.set_password_hash("$argon2id$v=19$x", None).await.unwrap();
-        assert!(s.delete_credential_guarded(b"k1").await.unwrap());
+        assert_eq!(
+            s.delete_credential_guarded(b"k1").await.unwrap(),
+            KeyDeletion::Deleted
+        );
         assert_eq!(s.login_method().await.unwrap(), LoginMethod::Password);
         assert!(
             s.set_login_method(LoginMethod::Passkey).await.is_err(),
@@ -607,8 +707,14 @@ mod tests {
         s.save_credential(b"k2", "{}", Some("two")).await.unwrap();
         s.set_password_hash("$argon2id$v=19$x", None).await.unwrap();
         s.set_login_method(LoginMethod::Password).await.unwrap();
-        assert!(s.delete_credential_guarded(b"k1").await.unwrap());
-        assert!(s.delete_credential_guarded(b"k2").await.unwrap());
+        assert_eq!(
+            s.delete_credential_guarded(b"k1").await.unwrap(),
+            KeyDeletion::Deleted
+        );
+        assert_eq!(
+            s.delete_credential_guarded(b"k2").await.unwrap(),
+            KeyDeletion::Deleted
+        );
         assert_eq!(s.login_method().await.unwrap(), LoginMethod::Password);
         assert!(s.load_credentials().await.unwrap().is_empty());
     }
@@ -619,7 +725,7 @@ mod tests {
         s.save_credential(b"k1", "{}", Some("one")).await.unwrap();
         s.set_password_hash("$argon2id$v=19$x", None).await.unwrap();
         let pw = s.create_session().await.unwrap();
-        let key = s.create_session_for(Some(b"k1"), None).await.unwrap();
+        let key = s.create_session_for(b"k1", None).await.unwrap().unwrap();
         s.set_login_method(LoginMethod::Passkey).await.unwrap();
         assert!(!s.validate_session(&pw).await.unwrap());
         assert!(s.validate_session(&key).await.unwrap());
@@ -636,6 +742,39 @@ mod tests {
         assert_eq!(s.login_method().await.unwrap(), LoginMethod::Both);
         assert!(!s.validate_session(&a).await.unwrap());
         assert!(s.validate_session(&b).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_password_session_needs_the_password_it_checked() {
+        let (_dir, s) = test_store().await;
+        s.save_credential(b"k1", "{}", None).await.unwrap();
+        s.set_password_hash("$argon2id$v=19$old", None)
+            .await
+            .unwrap();
+        assert!(
+            s.create_password_session("$argon2id$v=19$old", None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Changed while the old one was being checked: no session.
+        s.set_password_hash("$argon2id$v=19$new", None)
+            .await
+            .unwrap();
+        assert!(
+            s.create_password_session("$argon2id$v=19$old", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Password sign-in switched off meanwhile: none either.
+        s.set_login_method(LoginMethod::Passkey).await.unwrap();
+        assert!(
+            s.create_password_session("$argon2id$v=19$new", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -700,17 +839,65 @@ mod tests {
         let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
         s.save_credential(b"a", "{}", None).await.unwrap();
         s.save_credential(b"b", "{}", None).await.unwrap();
-        let first = s.create_session_for(Some(b"a"), None).await.unwrap();
+        let first = s.create_session_for(b"a", None).await.unwrap().unwrap();
         let second = s
-            .create_session_for(Some(b"a"), Some(&first))
+            .create_session_for(b"a", Some(&first))
             .await
+            .unwrap()
             .unwrap();
         assert!(!s.validate_session(&first).await.unwrap(), "replaced");
         assert!(s.validate_session(&second).await.unwrap());
-        let with_b = s.create_session_for(Some(b"b"), None).await.unwrap();
-        assert!(s.delete_credential_guarded(b"a").await.unwrap());
+        let with_b = s.create_session_for(b"b", None).await.unwrap().unwrap();
+        assert_eq!(
+            s.delete_credential_guarded(b"a").await.unwrap(),
+            KeyDeletion::Deleted
+        );
         assert!(!s.validate_session(&second).await.unwrap(), "key deleted");
         assert!(s.validate_session(&with_b).await.unwrap(), "other key");
+    }
+
+    #[tokio::test]
+    async fn a_deleted_key_cannot_start_or_keep_a_session() {
+        let (_dir, s) = test_store().await;
+        s.save_credential(b"a", "{}", None).await.unwrap();
+        s.save_credential(b"b", "{}", None).await.unwrap();
+        // A sign-in started while the key was enrolled ends with the key.
+        let open = s
+            .put_webauthn_state("auth", "{}", None)
+            .await
+            .unwrap()
+            .unwrap();
+        let enroll = s
+            .put_webauthn_state("reg", "{}", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.delete_credential_guarded(b"a").await.unwrap(),
+            KeyDeletion::Deleted
+        );
+        assert!(
+            s.take_webauthn_state(&open, "auth")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.take_webauthn_state(&enroll, "reg")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // No session starts for a key that is gone.
+        assert!(s.create_session_for(b"a", None).await.unwrap().is_none());
+        // A session whose key row is gone is not honoured.
+        let with_b = s.create_session_for(b"b", None).await.unwrap().unwrap();
+        sqlx::query("DELETE FROM credentials WHERE cred_id = ?")
+            .bind(&b"b"[..])
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert!(!s.validate_session(&with_b).await.unwrap());
     }
 
     #[tokio::test]

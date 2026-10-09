@@ -2,9 +2,10 @@
 use crate::admin::AdminState;
 use crate::admin::auth::{SessionUser, session_token};
 use crate::admin::error::{AppResult, render};
+use crate::admin::pages::{redirect_with_error, redirect_with_notice};
 use crate::admin::password;
 use crate::admin::views::Chrome;
-use crate::store::auth::LoginMethod;
+use crate::store::auth::{KeyDeletion, LoginMethod};
 use crate::store::stats::intel_stale;
 use askama::Template;
 use axum::{
@@ -392,6 +393,11 @@ async fn password(
     Form(f): Form<PasswordForm>,
 ) -> AppResult<Html<String>> {
     let fail = |m: &str| keys_page(&st, None, Some(m.to_string()));
+    // Argon2 runs below (check, then hash) share the sign-in cap: refuse
+    // rather than queue.
+    let Ok(_slot) = st.verify_slots.try_acquire() else {
+        return fail("Too many password checks at once; try again in a minute.").await;
+    };
     if let Some(phc) = st.store.password_hash().await? {
         let current = f.current.unwrap_or_default();
         let ok = tokio::task::spawn_blocking(move || password::verify(&current, &phc))
@@ -426,14 +432,26 @@ async fn key_delete(
     _u: SessionUser,
     State(state): State<Arc<AdminState>>,
     Form(f): Form<KeyDeleteForm>,
-) -> Redirect {
+) -> Response {
+    const KEYS: &str = "/admin/system/keys";
     // SQLite hex() is uppercase; normalize before decoding.
-    if let Ok(bytes) = data_encoding::HEXLOWER.decode(f.cred_id.to_lowercase().as_bytes()) {
-        // Never delete the last way in (would lock the admin out); the check
-        // and delete are one transaction.
-        let _ = state.store.delete_credential_guarded(&bytes).await;
+    let Ok(bytes) = data_encoding::HEXLOWER.decode(f.cred_id.to_lowercase().as_bytes()) else {
+        return redirect_with_error(KEYS, "No such key.");
+    };
+    // Never delete the last way in (would lock the admin out); the check
+    // and delete are one transaction.
+    match state.store.delete_credential_guarded(&bytes).await {
+        Ok(KeyDeletion::Deleted) => redirect_with_notice(KEYS, "Key deleted."),
+        Ok(KeyDeletion::LastWayIn) => redirect_with_error(
+            KEYS,
+            "The last key stays: it is the only way to sign in. Set a password and allow it first.",
+        ),
+        Ok(KeyDeletion::NotFound) => redirect_with_error(KEYS, "No such key."),
+        Err(e) => {
+            tracing::warn!(?e, "could not delete a key");
+            redirect_with_error(KEYS, &format!("Could not delete the key: {e:#}"))
+        }
     }
-    Redirect::to("/admin/system/keys")
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 //! Per-client rate limits on the web listener: anonymous traffic to the
-//! public pages and the unauthenticated WebAuthn endpoints (each sign-in
-//! attempt stores a ceremony). Token buckets in memory, keyed by the client
+//! public pages, the unauthenticated WebAuthn endpoints (each sign-in
+//! attempt stores a ceremony) and the password checks (sign-in, and the
+//! current password a change asks for). Token buckets in memory, keyed by the client
 //! address (an IPv6 client by its /64, or its /48 for the ceremonies),
 //! resolved with the same `X-Forwarded-For` logic as the trap. Sign-in
 //! starts also share one global bucket, so many sources together cannot
@@ -27,7 +28,7 @@ use std::time::Instant;
 /// Public pages: sustained requests per minute and burst, per client.
 pub const PUBLIC_PER_MINUTE: u32 = 120;
 pub const PUBLIC_BURST: u32 = 60;
-/// `/login/*` and `/enroll/*` POSTs, per client.
+/// `/login/*`, `/enroll/*` and password-change POSTs, per client.
 pub const AUTH_PER_MINUTE: u32 = 10;
 pub const AUTH_BURST: u32 = 10;
 /// `/login/start` and `/login/password` POSTs from all clients together.
@@ -164,7 +165,7 @@ impl Limits {
 
 #[derive(Debug, PartialEq)]
 enum Class {
-    /// Unauthenticated WebAuthn ceremony endpoints.
+    /// Unauthenticated WebAuthn ceremony endpoints and password checks.
     Auth,
     /// Public pages and their JSON.
     Public,
@@ -174,7 +175,9 @@ enum Class {
 
 fn classify(method: &axum::http::Method, path: &str) -> Class {
     if method == axum::http::Method::POST
-        && (path.starts_with("/login/") || path.starts_with("/enroll/"))
+        && (path.starts_with("/login/")
+            || path.starts_with("/enroll/")
+            || path == "/admin/system/password")
     {
         return Class::Auth;
     }
@@ -433,6 +436,11 @@ secure_cookies = false
         assert_eq!(classify(&Method::POST, "/login/start"), Class::Auth);
         assert_eq!(classify(&Method::POST, "/login/password"), Class::Auth);
         assert_eq!(classify(&Method::POST, "/enroll/finish"), Class::Auth);
+        // Changing the password checks the current one.
+        assert_eq!(
+            classify(&Method::POST, "/admin/system/password"),
+            Class::Auth
+        );
         assert_eq!(classify(&Method::GET, "/ips"), Class::Public);
         assert_eq!(classify(&Method::GET, "/ip/203.0.113.1"), Class::Public);
         assert_eq!(classify(&Method::GET, "/api/stats"), Class::Public);
