@@ -61,7 +61,12 @@ pub struct Found {
 }
 
 /// Compare an audit with the scan it checks. A pure function of the two
-/// stored results.
+/// stored results. They agree when at least half of the ports the audit
+/// found open, and at least half of those the scan reported open, are open
+/// in both: a scan that claims every port open contains whatever the
+/// audit finds, but most of its claim is not there. The same host key or
+/// certificate on a port open in both settles it, as long as the scan
+/// claims at most twice as many open ports as the audit found.
 pub fn compare(original: &Found, audit: &Found) -> Outcome {
     if audit.open_tcp.is_empty() {
         return Outcome::Inconclusive;
@@ -72,15 +77,11 @@ pub fn compare(original: &Found, audit: &Found) -> Outcome {
             && original.open_tcp.contains(&k.0)
             && audit.open_tcp.contains(&k.0)
     });
-    if same_key {
+    if same_key && original.open_tcp.len() <= 2 * audit.open_tcp.len() {
         return Outcome::Agrees;
     }
-    let reported = audit
-        .open_tcp
-        .iter()
-        .filter(|p| original.open_tcp.contains(p))
-        .count();
-    if reported * 2 >= audit.open_tcp.len() {
+    let common = audit.open_tcp.intersection(&original.open_tcp).count();
+    if common * 2 >= audit.open_tcp.len() && common * 2 >= original.open_tcp.len() {
         Outcome::Agrees
     } else {
         Outcome::Differs
@@ -1026,11 +1027,15 @@ mod tests {
         // The audit found no open port: the source may be gone.
         assert_eq!(compare(&original, &none), Inconclusive);
         assert_eq!(compare(&none, &none), Inconclusive);
-        // Half of what the audit found open was reported: agrees.
-        assert_eq!(compare(&original, &found(&[22, 8080], &[])), Agrees);
+        // At least half of what each side found open is open in both:
+        // agrees, with a port changed since.
+        assert_eq!(compare(&original, &found(&[22, 80, 8080], &[])), Agrees);
         assert_eq!(compare(&original, &found(&[22, 80, 443], &[])), Agrees);
-        // Less than half: differs.
+        assert_eq!(compare(&original, &found(&[22, 80], &[])), Agrees);
+        // Less than half of the audit's: differs.
         assert_eq!(compare(&original, &found(&[22, 8080, 8443], &[])), Differs);
+        // Less than half of the scan's: it reported more than is there.
+        assert_eq!(compare(&original, &found(&[22], &[])), Differs);
         // Nothing reported, something found: a made-up result.
         assert_eq!(compare(&none, &found(&[22], &[])), Differs);
         // The same host key on a port open in both settles it, whatever
@@ -1043,6 +1048,23 @@ mod tests {
         // The same key reported for a port that is not open in both.
         let elsewhere = found(&[2222, 1, 2], &[(2222, "ssh-hostkey", "aa")]);
         assert_eq!(compare(&original, &elsewhere), Differs);
+        // A made-up "everything open" always contains what the audit
+        // finds; it does not agree.
+        let all_open = found(&(1..=65535).collect::<Vec<_>>(), &[]);
+        assert_eq!(compare(&all_open, &found(&[22, 80], &[])), Differs);
+        let top_1000 = found(&(1..=1000).collect::<Vec<_>>(), &[]);
+        assert_eq!(compare(&top_1000, &found(&[22, 80, 443], &[])), Differs);
+        // Honest, with a little churn on a busy host: agrees.
+        let busy = found(&[21, 22, 25, 80, 110, 143, 443, 993], &[]);
+        let later = found(&[21, 22, 25, 80, 110, 143, 443, 8443], &[]);
+        assert_eq!(compare(&busy, &later), Agrees);
+        // The same key settles it while the scan claims at most twice as
+        // many open ports as the audit found.
+        let key = [(22, "ssh-hostkey", "aa")];
+        let modest = found(&[22, 80, 443, 8080, 8443, 9000], &key);
+        assert_eq!(compare(&modest, &found(&[22, 3000, 3001], &key)), Agrees);
+        let huge = found(&(1..=1000).collect::<Vec<_>>(), &key);
+        assert_eq!(compare(&huge, &found(&[22, 3000, 3001], &key)), Differs);
         for o in [Agrees, Differs, Inconclusive] {
             assert_eq!(Outcome::parse(o.as_str()), Some(o));
         }

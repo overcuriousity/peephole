@@ -291,7 +291,12 @@ audits and relay leases. The supply is fixed; prices follow sales.
   and the Lookup page.
 - **Conformity and audits.** A member earns on your node only while at least
   98 % of its newest 500 requests classify the same with your rules, and its
-  scans stand up to the audits you believe: those of your own nodes. One in 20
+  scans stand up to the audits you believe: those of your own nodes. An
+  audit agrees with a scan when at least half of the ports the audit found
+  open, and at least half of those the scan reported open, are open in
+  both (a scan that claims every port open does not agree); the same host
+  key or certificate on a port open in both settles it, unless the scan
+  claims more than twice as many open ports as the audit found. One in 20
   scans of paid jobs (granted by another arbiter and charged for; a job
   granted at zero owes no audit) is designated for a bought audit by a hash
   of the job and the arbiter's done status, which the scanner cannot steer

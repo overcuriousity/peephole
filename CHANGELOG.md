@@ -32,6 +32,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   new member could otherwise date admissions back over weeks it was not in
   the cluster, 20 for each day. A node's own admission of its inviter or
   a configured peer does not date them: they were members before.
+- An audit agrees with a scan only when at least half of the ports each
+  of them found open are open in both: a scan reporting every port (or
+  the top 1000) open no longer agrees with whatever the audit finds. The
+  same host key still settles it, unless the scan claims more than twice
+  as many open ports as the audit found.
 
 ### Fixed
 
