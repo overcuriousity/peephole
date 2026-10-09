@@ -107,6 +107,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   trap's writes waiting behind it timed out and requests were lost. They
   now commit 500 records at a time, with a pause in between, like
   retention.
+- Cluster: a member's lookup result dated in the future (or not dated at
+  all) put off every node's next lookup of that address with that
+  provider for good. Its fetch time is now held to the time of its log
+  entry, as for shared intel files.
 
 ## [0.10.0] - 2026-10-09
 

@@ -439,6 +439,9 @@ async fn ip_intel(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpIntelRec) -> 
     {
         return Ok(Effect::Ignored);
     }
+    // The newest fetch time schedules the next lookup (`intel_candidates`):
+    // one from the future would put it off for good, on every node.
+    let fetched_at = fetched_at(&r.fetched_at, ctx);
     // The lookup history keeps every result, also the ones replaced below.
     sqlx::query(
         "INSERT OR IGNORE INTO ip_intel_log
@@ -449,7 +452,7 @@ async fn ip_intel(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpIntelRec) -> 
     .bind(&r.provider)
     .bind(ctx.origin_bytes().unwrap_or_default())
     .bind(ctx.hlc as i64)
-    .bind(&r.fetched_at)
+    .bind(&fetched_at)
     .bind(&r.source_version)
     .bind(&r.data_json)
     .bind(&r.build)
@@ -468,7 +471,7 @@ async fn ip_intel(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpIntelRec) -> 
     .bind(&r.provider)
     .bind(ctx.origin_bytes().unwrap_or_default())
     .bind(ctx.hlc as i64)
-    .bind(&r.fetched_at)
+    .bind(&fetched_at)
     .bind(&r.source_version)
     .bind(&r.data_json)
     .bind(&r.build)
@@ -914,6 +917,21 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// A fetch time as stored: the claimed one, unless it is no time in the
+/// rows' format or later than the entry (a claim nobody can check); then
+/// the entry's own time.
+fn fetched_at(claimed: &str, ctx: Ctx<'_>) -> String {
+    let entry_ts = chrono::DateTime::from_timestamp_millis(
+        crate::cluster::hlc::physical_ms(ctx.hlc).min(i64::MAX as u64) as i64,
+    )
+    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+    .unwrap_or_else(now_ts);
+    match chrono::NaiveDateTime::parse_from_str(claimed, "%Y-%m-%d %H:%M:%S") {
+        Ok(_) if claimed <= entry_ts.as_str() => claimed.to_string(),
+        _ => entry_ts,
+    }
+}
+
 /// The newest announced version of an intel file, per origin (by HLC);
 /// `intel::share::manifests` picks the newest of the nodes not blocked.
 async fn intel_manifest(
@@ -929,18 +947,8 @@ async fn intel_manifest(
     {
         return Ok(Effect::Ignored);
     }
-    // A fetch time later than the entry is a claim nobody can
-    // check: it would make an old list look fresh and hold off refetches.
-    let entry_ts = chrono::DateTime::from_timestamp_millis(
-        crate::cluster::hlc::physical_ms(ctx.hlc).min(i64::MAX as u64) as i64,
-    )
-    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-    .unwrap_or_else(now_ts);
-    let fetched_at = match chrono::NaiveDateTime::parse_from_str(&m.fetched_at, "%Y-%m-%d %H:%M:%S")
-    {
-        Ok(_) if m.fetched_at <= entry_ts => m.fetched_at.clone(),
-        _ => entry_ts,
-    };
+    // It would make an old list look fresh and hold off refetches.
+    let fetched_at = fetched_at(&m.fetched_at, ctx);
     sqlx::query(
         "INSERT INTO intel_files (kind, origin, sha256, size, fetched_at, hlc) VALUES (?,?,?,?,?,?)
          ON CONFLICT(kind, origin) DO UPDATE SET sha256 = excluded.sha256, size = excluded.size,
@@ -2819,6 +2827,43 @@ mod tests {
         .unwrap();
         assert_eq!(eff, Effect::Ignored);
         assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM ip_intel").await, 0);
+    }
+
+    /// A lookup's fetch time is held to its entry's time: one from the
+    /// future, or no time at all, would put off every node's next lookup
+    /// of the address for good.
+    #[tokio::test]
+    async fn a_lookup_is_no_newer_than_its_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let a = Identity::generate().unwrap().id;
+        // 2026-10-01 12:00:00 UTC.
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1_790_856_000_000 << 16,
+        };
+        for (ip, fetched_at, stored) in [
+            ("203.0.113.1", "9999-12-31 00:00:00", "2026-10-01 12:00:00"),
+            ("203.0.113.2", "zzz", "2026-10-01 12:00:00"),
+            ("203.0.113.3", "2026-10-01 11:00:00", "2026-10-01 11:00:00"),
+        ] {
+            let Record::IpIntel(mut r) = intel(ip, crate::intel::TOR, r#"{"exit":true}"#) else {
+                unreachable!()
+            };
+            r.fetched_at = fetched_at.into();
+            apply(&mut conn, ctx, &Record::IpIntel(r)).await.unwrap();
+            for table in ["ip_intel", "ip_intel_log"] {
+                let got: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT fetched_at FROM {table} WHERE ip = ?"
+                )))
+                .bind(ip)
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+                assert_eq!(got, stored, "{table}: {fetched_at}");
+            }
+        }
     }
 
     /// An announced file is named by its SHA-256 in lowercase hex, nothing
