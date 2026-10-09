@@ -4737,6 +4737,14 @@ async fn a_protocol_six_member_is_neither_paid_nor_charged() {
     .await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.5);
     fund_listeners(&[&na, &nb], &[a.id, b.id]).await;
+    // A member below protocol 7 writes no reach reports.
+    for n in [&na, &nb] {
+        sqlx::query("DELETE FROM reach_reports WHERE origin = ?")
+            .bind(&b.id.0[..])
+            .execute(&n.store.pool)
+            .await
+            .unwrap();
+    }
     nb.node.refresh_heartbeat();
     eventually("a knows b's protocol", || async {
         na.members()

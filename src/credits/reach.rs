@@ -3,8 +3,9 @@
 //! a sync round with in that hour. A member is up in an hour when more
 //! than half of that hour's reports, from other active members with an
 //! advertised address not left out here, name it; an advertised listener
-//! of protocol 7 up for at least [`MIN_UP_HOURS`] of a UTC day is a
-//! verified listener of that day and shares its pool (`credits::pool`).
+//! that ran protocol 7 that day (it reported an hour of it) and was up for
+//! at least [`MIN_UP_HOURS`] of a UTC day is a verified listener of that
+//! day and shares its pool (`credits::pool`).
 use crate::cluster::Node;
 use crate::cluster::hlc;
 use crate::cluster::identity::NodeId;
@@ -168,15 +169,33 @@ pub fn uptime(reports: &[Report], members: &[NodeId], reporters: &HashSet<NodeId
     out
 }
 
-/// The verified listeners of `day`: the listener role, an advertised
-/// address and protocol 7 in their member record (a member below it is
-/// not paid until it upgrades, and a pool share is a payment), up at
-/// least [`MIN_UP_HOURS`] that day.
-pub fn verified(members: &[MemberRow], uptime: &Uptime, day: u32) -> BTreeSet<NodeId> {
+/// The members that reported an hour of `day` ([`reported_on`]): they ran
+/// protocol 7 that day, since only it writes reports.
+pub fn reported_on(reports: &[Report], day: u32) -> HashSet<NodeId> {
+    reports
+        .iter()
+        .filter(|r| r.hour / 24 == day)
+        .map(|r| r.reporter)
+        .collect()
+}
+
+/// The verified listeners of `day`: the listener role and an advertised
+/// address in their member record, protocol 7 that day (they are among
+/// `reported`, [`reported_on`]: a member below it is not paid until it
+/// upgrades, and a pool share is a payment), up at least
+/// [`MIN_UP_HOURS`] that day. The protocol is read from the log, so a
+/// day's listeners stay what they were; role and address are read from
+/// the member records as held now.
+pub fn verified(
+    members: &[MemberRow],
+    uptime: &Uptime,
+    reported: &HashSet<NodeId>,
+    day: u32,
+) -> BTreeSet<NodeId> {
     members
         .iter()
         .filter(|m| m.active && m.address.is_some() && m.roles.iter().any(|r| r == "listener"))
-        .filter(|m| crate::credits::pay::pays_with(m.proto_max))
+        .filter(|m| reported.contains(&m.id))
         .filter(|m| uptime.get(&(m.id, day)).copied().unwrap_or(0) >= MIN_UP_HOURS)
         .map(|m| m.id)
         .collect()
@@ -245,11 +264,16 @@ impl Tracker {
 }
 
 /// Write this node's report of every hour that ended (at most
-/// [`MAX_BACK_HOURS`] back). Returns how many were written.
+/// [`MAX_BACK_HOURS`] back). Returns how many were written. A node
+/// without an advertised address writes none: its reports would never
+/// count ([`reporters`]).
 pub async fn report_due(node: &Arc<Node>, now_ms: u64) -> Result<usize> {
     node.reach.note_alive(now_ms);
     let now = hour_of(now_ms);
     let taken = node.reach.take_due(now_ms);
+    if node.cfg.advertise.is_none() {
+        return Ok(0);
+    }
     let records: Vec<Record> = taken
         .iter()
         .filter(|(h, _)| h.saturating_add(MAX_BACK_HOURS) >= now)
@@ -424,26 +448,50 @@ mod tests {
     }
 
     #[test]
-    fn a_verified_listener_is_an_advertised_protocol_seven_listener_up_twelve_hours() {
+    fn a_verified_listener_is_an_advertised_listener_that_reported_that_day_up_twelve_hours() {
         let day = 20_000u32;
         let mut up = Uptime::new();
-        for n in [1u8, 2, 3, 4] {
+        for n in [1u8, 2, 3, 4, 6] {
             up.insert((id(n), day), 12);
         }
         up.insert((id(5), day), 11);
-        up.insert((id(6), day), 24);
-        let mut old = member(6, true, true);
-        old.proto_max = crate::cluster::rpc::proto::ECONOMY_PROTO - 1;
         let members = [
             member(1, true, true),
             member(2, false, true), // not a listener
             member(3, true, false), // outbound-only
             member(4, true, true),
             member(5, true, true), // 11 hours
-            old,                   // below protocol 7
+            member(6, true, true), // wrote no report that day: below protocol 7
         ];
-        assert_eq!(verified(&members, &up, day), [id(1), id(4)].into());
-        assert!(verified(&members, &up, day + 1).is_empty());
+        // 1 reported the day's first hour, 4 its last; 6 only the day before.
+        let reports = [
+            report(1, day * 24, &[]),
+            report(2, day * 24, &[]),
+            report(3, day * 24, &[]),
+            report(4, day * 24 + 23, &[]),
+            report(5, day * 24 + 1, &[]),
+            report(6, day * 24 - 1, &[]),
+        ];
+        let reported = reported_on(&reports, day);
+        assert_eq!(reported, [id(1), id(2), id(3), id(4), id(5)].into());
+        assert_eq!(
+            verified(&members, &up, &reported, day),
+            [id(1), id(4)].into()
+        );
+        assert!(verified(&members, &up, &reported, day + 1).is_empty());
+        // What a member's record says of its protocol now changes nothing.
+        let mut upgraded = members.clone();
+        upgraded[5].proto_max = 99;
+        let mut downgraded = members.clone();
+        downgraded[0].proto_max = 6;
+        assert_eq!(
+            verified(&upgraded, &up, &reported, day),
+            [id(1), id(4)].into()
+        );
+        assert_eq!(
+            verified(&downgraded, &up, &reported, day),
+            [id(1), id(4)].into()
+        );
     }
 
     #[test]
@@ -535,7 +583,7 @@ mod tests {
         assert_eq!(t.take_due(ms(11, 1)), vec![(10, vec![id(2), id(3)])]);
     }
 
-    async fn test_node() -> (tempfile::TempDir, Arc<Node>) {
+    async fn test_node(advertise: Option<&str>) -> (tempfile::TempDir, Arc<Node>) {
         use crate::cluster::identity::Identity;
         let dir = tempfile::tempdir().unwrap();
         let store = crate::store::Store::connect(&dir.path().join("t.db"))
@@ -546,7 +594,7 @@ mod tests {
             cluster: crate::config::ClusterConfig {
                 node_name: "n".into(),
                 listen: "127.0.0.1:0".parse().unwrap(),
-                advertise: None,
+                advertise: advertise.map(String::from),
                 key_path: None,
                 takeover_hours: 6.0,
                 lease_secs: 120,
@@ -569,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn report_due_writes_the_ended_hour_once() {
-        let (_dir, node) = test_node().await;
+        let (_dir, node) = test_node(Some("198.51.100.1:7443")).await;
         let now = crate::cluster::hlc::wall_ms();
         let hour = hour_of(now) - 1;
         let before = (hour as u64) * HOUR_MS + 5;
@@ -592,6 +640,18 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(kinds.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_outbound_only_node_writes_no_reports() {
+        let (_dir, node) = test_node(None).await;
+        let now = crate::cluster::hlc::wall_ms();
+        let before = (hour_of(now) as u64 - 1) * HOUR_MS + 5;
+        node.reach.note_alive(before);
+        node.reach.note(id(7), before);
+        assert_eq!(report_due(&node, now).await.unwrap(), 0);
+        assert!(since(&node.store.pool, 0).await.unwrap().is_empty());
+        assert!(node.reach.take_due(now).is_empty(), "nothing piles up");
     }
 
     #[test]

@@ -58,8 +58,10 @@ pub mod testing {
 
     /// Make `listeners` up in every hour of `day` on this store: a
     /// reporter, made an advertised member of this store so its reports
-    /// count, names them in each hour (merged with what it named before).
-    /// Its address refuses at once, so nothing waits to dial it.
+    /// count, names them in each hour (merged with what it named before),
+    /// and each listener reports the day's first hour, naming the others
+    /// (unless it reported it already), as protocol 7 does. The reporter's
+    /// address refuses at once, so nothing waits to dial it.
     pub async fn report_all_day(
         pool: &sqlx::SqlitePool,
         day: u32,
@@ -87,6 +89,16 @@ pub mod testing {
             )
             .bind(&reporter.0[..])
             .bind(hour as i64)
+            .bind(&blob)
+            .execute(pool)
+            .await?;
+        }
+        for l in listeners {
+            sqlx::query(
+                "INSERT OR IGNORE INTO reach_reports (origin, hour, reached) VALUES (?, ?, ?)",
+            )
+            .bind(&l.0[..])
+            .bind((day * 24) as i64)
             .bind(&blob)
             .execute(pool)
             .await?;

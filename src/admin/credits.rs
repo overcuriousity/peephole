@@ -94,7 +94,7 @@ struct MemberRow {
     sales: String,
     /// Hours up today, as reported.
     up: String,
-    /// An advertised listener up `MIN_UP_HOURS` today.
+    /// A verified listener today, as the pool counts it.
     qualifies: bool,
 }
 
@@ -424,9 +424,10 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
                 pool: show(sum_week(&book.pool, &m.id)),
                 sales: show(t.served),
                 up: up.to_string(),
-                qualifies: m.address.is_some()
-                    && m.roles.iter().any(|r| r == "listener")
-                    && up >= credits::reach::MIN_UP_HOURS,
+                qualifies: book
+                    .listeners
+                    .get(&today)
+                    .is_some_and(|v| v.contains(&m.id)),
             }
         })
         .collect();

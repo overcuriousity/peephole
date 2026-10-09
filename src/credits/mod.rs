@@ -143,7 +143,10 @@ pub async fn compute(node: &Node) -> anyhow::Result<Book> {
     let reports = reach::since(&node.store.pool, first * 24).await?;
     let uptime = reach::uptime(&reports, &ids, &reach::reporters(&members, &gates.left_out));
     let listeners: BTreeMap<u32, BTreeSet<NodeId>> = (first..=today)
-        .map(|d| (d, reach::verified(&members, &uptime, d)))
+        .map(|d| {
+            let reported = reach::reported_on(&reports, d);
+            (d, reach::verified(&members, &uptime, &reported, d))
+        })
         .collect();
     // A member that does not earn here is not credited here, and its
     // share is not given to anyone else.

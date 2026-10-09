@@ -81,7 +81,7 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 println!("{line}");
             }
             println!(
-                "hours up a day (UTC); * a verified listener: advertised, up 12 hours or more"
+                "hours up a day (UTC); * a verified listener: advertised, listener role, protocol 7, up 12 hours or more"
             );
         }
         ["log"] => {
