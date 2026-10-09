@@ -401,7 +401,7 @@ impl Arbiter {
             .filter(|(_, by)| claims.iter().all(|c| by.contains(&c.id)))
             .map(|(uid, _)| uid)
             .collect();
-        let excluded: Vec<u8> = (1..=4u8)
+        let excluded: Vec<u8> = (1..=5u8)
             .filter(|l| claims.iter().all(|c| c.exclude.contains(l)))
             .collect();
         let mut funding = crate::credits::jobs::Funding::default();
