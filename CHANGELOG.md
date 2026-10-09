@@ -140,6 +140,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Re-reading stored scans after an upgrade (host keys, scan facts)
   decompressed and parsed each batch's nmap XML while holding the database
   write lock. The XML is now read before the lock is taken.
+- Dataset export: the scans of every address on a page were held with
+  their whole nmap XML (up to 64 MiB each), so an address scanned often
+  could take any amount of memory. An address's scans now carry at most
+  16 MiB of XML, newest first, and a page at most 64 MiB; a scan left out
+  says `"xml_omitted": true` (a new field, see the dataset docs).
 
 ## [0.10.0] - 2026-10-09
 

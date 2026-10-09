@@ -530,11 +530,10 @@ pub(crate) fn names_json(names: &[crate::store::export::NameOut]) -> Value {
 }
 
 fn scan_json(s: &ScanOut, ports: &[crate::store::export::PortOut], opts: &ExportOptions) -> Value {
-    let xml = s.raw_xml.as_ref().and_then(|b| {
-        crate::store::inspect::zstd_decode_capped(b, crate::store::inspect::MAX_RAW_XML)
-            .ok()
-            .map(|x| String::from_utf8_lossy(&opts.own.apply(&x)).into_owned())
-    });
+    let xml = s
+        .xml
+        .as_ref()
+        .map(|x| String::from_utf8_lossy(&opts.own.apply(x)).into_owned());
     json!({
         "level": s.level,
         "uid": s.uid,
@@ -552,6 +551,7 @@ fn scan_json(s: &ScanOut, ports: &[crate::store::export::PortOut], opts: &Export
         "host_keys": s.host_keys,
         "facts": s.facts,
         "xml": xml,
+        "xml_omitted": s.xml_omitted,
     })
 }
 
@@ -788,9 +788,11 @@ async fn next_rows(
 }
 
 /// Every row matching `f`, recorded requests then light rows, each oldest
-/// first, as a stream of file chunks. Nothing is capped: rows are read page
+/// first, as a stream of file chunks. No row is capped: rows are read page
 /// by page and written out as they come, so memory stays bounded whatever
-/// the size.
+/// the size. The scan XML a page holds is bounded too
+/// ([`crate::store::export::MAX_IP_XML`], `MAX_PAGE_XML`); beyond, a scan
+/// says `xml_omitted`.
 pub fn stream_requests(
     store: Store,
     f: ExportFilter,
@@ -1734,6 +1736,76 @@ mod tests {
         assert!(
             reader.metadata().num_row_groups() > 1,
             "row groups bounded by size"
+        );
+    }
+
+    /// An address's scan XML is exported up to MAX_IP_XML, newest scans
+    /// first; older ones say they were left out, so memory per page stays
+    /// bounded however many scans an address has.
+    #[tokio::test]
+    async fn scan_xml_per_address_is_bounded() {
+        use crate::store::export::MAX_IP_XML;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let row = s.upsert_ip("203.0.113.6".parse().unwrap()).await.unwrap();
+        s.insert_request(&NewRequest {
+            ip_id: row.id,
+            method: "GET".into(),
+            path: "/".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        s.enqueue_scan(row.id, 2, 0).await.unwrap();
+        let job = s.next_queued_job().await.unwrap().unwrap();
+        let res = crate::scan::nmap_xml::parse_nmap_xml(include_bytes!(
+            "../../tests/fixtures/nmap-basic.xml"
+        ))
+        .unwrap();
+        s.finish_job(job.id, Some(&res), None).await.unwrap();
+        // Three scans of 0.4 x MAX_IP_XML each: two fit.
+        let big = |c: &str| {
+            let n = (MAX_IP_XML as usize * 2 / 5) / c.len();
+            zstd::encode_all(c.repeat(n).as_bytes(), 3).unwrap()
+        };
+        sqlx::query("UPDATE scans SET raw_xml = ?, uid = 's1'")
+            .bind(big("<a/>"))
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        for (uid, c) in [("s2", "<b/>"), ("s3", "<c/>")] {
+            sqlx::query(
+                "INSERT INTO scans (uid, job_id, job_uid, ip_id, level, started_at, raw_xml)
+                 SELECT ?, job_id, job_uid, ip_id, level, started_at, ? FROM scans WHERE uid = 's1'",
+            )
+            .bind(uid)
+            .bind(big(c))
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let out = text(&collect(&s, ExportFilter::default(), Format::Jsonl).await);
+        let r: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        let scans = r["scans"].as_array().unwrap();
+        let got: Vec<_> = scans
+            .iter()
+            .map(|x| {
+                (
+                    x["uid"].as_str().unwrap(),
+                    x["xml"].as_str().map(|x| &x[..4]),
+                    x["xml_omitted"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("s1", None, true),
+                ("s2", Some("<b/>"), false),
+                ("s3", Some("<c/>"), false)
+            ]
         );
     }
 
