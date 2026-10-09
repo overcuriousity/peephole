@@ -35,6 +35,33 @@ pub fn servable(floor: u64, receiver_head: u64, receiver_windowed: bool) -> bool
     receiver_windowed || floor <= receiver_head.saturating_add(1)
 }
 
+/// Origins a `/wait` may list, in its heads and its refusals each: far
+/// more than a cluster has.
+pub const MAX_WAIT_ORIGINS: usize = 10_000;
+
+/// A `/wait` from a peer, looked up quickly: it is checked again on every
+/// change here while it is held open.
+pub struct Waiting {
+    theirs: super::repl::HeadMap,
+    refused: std::collections::HashSet<NodeId>,
+    windowed: bool,
+}
+
+impl Waiting {
+    /// None if the request lists more than [`MAX_WAIT_ORIGINS`] heads or
+    /// refusals.
+    pub fn new(req: super::sync::WaitReq) -> Option<Self> {
+        if req.heads.len() > MAX_WAIT_ORIGINS || req.refused.len() > MAX_WAIT_ORIGINS {
+            return None;
+        }
+        Some(Self {
+            theirs: super::repl::head_map(&req.heads),
+            refused: req.refused.into_iter().collect(),
+            windowed: req.windowed,
+        })
+    }
+}
+
 /// Whether a `/wait` from a peer is answered at once: this node holds
 /// entries the peer lacks, of an origin it has not purged, the peer does
 /// not refuse, and it can serve the peer.
@@ -42,11 +69,10 @@ pub fn wait_ready(
     ours: &super::repl::Heads,
     floors: &Floors,
     purged: &std::collections::HashSet<NodeId>,
-    req: &super::sync::WaitReq,
+    req: &Waiting,
 ) -> bool {
-    let theirs = super::repl::head_map(&req.heads);
     ours.iter().any(|(o, head)| {
-        let t = theirs.get(o).copied().unwrap_or(0);
+        let t = req.theirs.get(o).copied().unwrap_or(0);
         t < *head
             && !purged.contains(o)
             && !req.refused.contains(o)
@@ -307,10 +333,13 @@ mod tests {
             Identity::generate().unwrap().id,
         );
         let ours = vec![(a, 10), (b, 3)];
-        let req = |heads: Vec<(NodeId, u64)>, refused: Vec<NodeId>, windowed| WaitReq {
-            heads,
-            refused,
-            windowed,
+        let req = |heads: Vec<(NodeId, u64)>, refused: Vec<NodeId>, windowed| {
+            Waiting::new(WaitReq {
+                heads,
+                refused,
+                windowed,
+            })
+            .unwrap()
         };
         let none = Floors::new();
         let nothing = HashSet::new();
@@ -364,5 +393,20 @@ mod tests {
             &nothing,
             &req(vec![(a, 7), (b, 3)], vec![], false)
         ));
+    }
+
+    /// A `/wait` listing more origins than any cluster has is refused: it
+    /// would be looked through on every change for as long as it is held.
+    #[test]
+    fn a_wait_lists_only_so_many_origins() {
+        let a = Identity::generate().unwrap().id;
+        let req = |heads: usize, refused: usize| WaitReq {
+            heads: vec![(a, 1); heads],
+            refused: vec![a; refused],
+            windowed: false,
+        };
+        assert!(Waiting::new(req(MAX_WAIT_ORIGINS, MAX_WAIT_ORIGINS)).is_some());
+        assert!(Waiting::new(req(MAX_WAIT_ORIGINS + 1, 0)).is_none());
+        assert!(Waiting::new(req(0, MAX_WAIT_ORIGINS + 1)).is_none());
     }
 }

@@ -295,6 +295,9 @@ async fn inbox(State(node): State<Arc<Node>>, Extension(Peer(peer)): Extension<P
 
 /// Long-poll: answer as soon as we hold something the caller lacks.
 async fn wait(State(node): State<Arc<Node>>, Cbor(req): Cbor<WaitReq>) -> Response {
+    let Some(req) = super::history::Waiting::new(req) else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "too many origins").into_response();
+    };
     let mut changes = node.subscribe_changes();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(WAIT_SECS);
     loop {

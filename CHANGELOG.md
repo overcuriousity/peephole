@@ -54,6 +54,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Cluster: an outbound-only node counts a relay lease for an hour at
   most, whatever end the relay answers, so a relay claiming a lease
   without end is still renewed or replaced in time.
+- Cluster: a sync long-poll listing more than 10000 origins is refused,
+  and the rest are looked up in constant time on each change while it is
+  held open, instead of searched through.
 
 ## [0.10.0] - 2026-10-09
 
