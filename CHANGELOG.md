@@ -115,6 +115,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   address's first sighting there for good, and its canaries with it.
   Times before 2000 are now held to 2000-01-01, as times from the future
   are held to the present.
+- A deleted IP's public page was served from the cache for up to ten
+  minutes, each view logging "cache refresh failed". It now answers
+  "not found" from the first refresh after the delete.
 
 ## [0.10.0] - 2026-10-09
 

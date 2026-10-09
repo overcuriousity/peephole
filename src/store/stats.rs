@@ -883,6 +883,10 @@ where
             let mut map = inner.lock().unwrap_or_else(|p| p.into_inner());
             match result {
                 Ok(v) => Self::insert(&mut map, max, key, Arc::new(v)),
+                // The row was deleted: the next caller finds out.
+                Err(e) if e.is::<Gone>() => {
+                    map.remove(&key);
+                }
                 Err(e) => {
                     tracing::warn!(?e, "cache refresh failed; serving the stale value");
                     if let Some(entry) = map.get_mut(&key) {
@@ -1312,6 +1316,36 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(*c.get(1, ttl, &f).await.unwrap(), 2);
         assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A refresh that finds the row gone drops the stale value: the next
+    /// caller learns it is gone instead of being served it for minutes.
+    #[tokio::test]
+    async fn a_refresh_that_finds_the_row_gone_evicts_it() {
+        let c: SwrCache<u8, usize> = SwrCache::new(4);
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ttl = Duration::from_millis(20);
+        let f = {
+            let gone = gone.clone();
+            move || -> BoxFut<usize> {
+                let gone = gone.load(std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    if gone {
+                        Err(anyhow::Error::new(Gone))
+                    } else {
+                        Ok(1)
+                    }
+                })
+            }
+        };
+        assert_eq!(*c.get(1, ttl, &f).await.unwrap(), 1);
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Stale: served once while the refresh finds it gone.
+        assert_eq!(*c.get(1, ttl, &f).await.unwrap(), 1);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let e = c.get(1, ttl, &f).await.unwrap_err();
+        assert!(e.is::<Gone>(), "{e:#}");
     }
 
     #[tokio::test]
