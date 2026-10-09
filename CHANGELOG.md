@@ -43,6 +43,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   longer push is refused), and each is looked at twice at most. Before, a
   peer could send any number and hold the database's write lock for a
   time growing with its square.
+- Cluster: a push to a peer goes on only while the peer takes entries of
+  the origins pushed, for 64 batches at most per round. Before, a member
+  answering each push with a head for a made-up origin kept the push
+  going forever and held one of the 8 sync slots.
 
 ## [0.10.0] - 2026-10-09
 
