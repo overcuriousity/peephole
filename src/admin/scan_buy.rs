@@ -9,9 +9,21 @@ use crate::admin::error::AppResult;
 use crate::admin::pages::{redirect_with_error, redirect_with_notice};
 use crate::scan::valid_level;
 use crate::store::scans::EnqueueOutcome;
-use axum::{Router, body::Bytes, extract::State, response::Response, routing::post};
+use axum::{
+    Router,
+    body::Bytes,
+    extract::{Query, State},
+    response::{
+        Response,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{get, post},
+};
+use futures::stream::Stream;
+use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A scan of an address this fresh needs no buying: the result stands.
 pub const FRESH_HOURS: i64 = 24;
@@ -67,7 +79,9 @@ pub async fn offers_for(state: &AdminState, ip_id: i64) -> Vec<ScanOffer> {
 }
 
 pub fn routes() -> Router<Arc<AdminState>> {
-    Router::new().route("/admin/lookup/scan", post(buy))
+    Router::new()
+        .route("/admin/lookup/scan", post(buy))
+        .route("/admin/api/scan-jobs", get(stream))
 }
 
 /// The form: the address and the level.
@@ -172,6 +186,148 @@ async fn buy(
             "No scan: the job was not queued.",
         )),
     }
+}
+
+/// How often the stream looks again without a log change.
+const POLL: Duration = Duration::from_secs(3);
+/// How often the stream re-checks the session.
+const SESSION_EVERY: Duration = Duration::from_secs(30);
+
+/// `[id, status]` per job: what the stream compares.
+pub fn states_json(jobs: &[crate::events::QueueJob]) -> String {
+    let v: Vec<(i64, &str)> = jobs.iter().map(|j| (j.id, j.status.as_str())).collect();
+    serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())
+}
+
+/// A job is still on its way, or a recently done one's result has not
+/// landed here yet (the scanner and the arbiter write separately).
+pub async fn any_waiting(store: &crate::store::Store, ip_id: i64) -> bool {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_jobs j WHERE j.ip_id = ?
+           AND (j.status IN ('queued','running')
+                OR (j.status = 'done' AND j.finished_at > datetime('now', '-2 days')
+                    AND NOT EXISTS (SELECT 1 FROM scans s WHERE s.job_uid = j.uid)))",
+    )
+    .bind(ip_id)
+    .fetch_one(&store.pool)
+    .await
+    .unwrap_or(0);
+    n > 0
+}
+
+#[derive(serde::Deserialize)]
+pub struct JobsQuery {
+    ip: String,
+}
+
+/// GET /admin/api/scan-jobs?ip=…: a `scan-jobs` event with the states
+/// whenever they change, while a job waits for its result.
+async fn stream(
+    _u: SessionUser,
+    jar: axum_extra::extract::CookieJar,
+    State(state): State<Arc<AdminState>>,
+    Query(q): Query<JobsQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let session = crate::admin::auth::session_token(&state, &jar);
+    let ip_id = match q.ip.trim().parse::<IpAddr>() {
+        Ok(ip) => state
+            .store
+            .ip_by_addr(&crate::net::canonical(ip).to_string())
+            .await
+            .ok()
+            .flatten()
+            .map(|r| r.id),
+        Err(_) => None,
+    };
+    Sse::new(events(state, ip_id, session)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    )
+}
+
+fn events(
+    state: Arc<AdminState>,
+    ip_id: Option<i64>,
+    session: Option<String>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    struct St {
+        state: Arc<AdminState>,
+        ip_id: Option<i64>,
+        session: Option<String>,
+        changes: Option<tokio::sync::watch::Receiver<u64>>,
+        last: Option<String>,
+        done: bool,
+        next_check: tokio::time::Instant,
+    }
+    let changes = state.recorder.node().map(|n| n.subscribe_changes());
+    futures::stream::unfold(
+        St {
+            state,
+            ip_id,
+            session,
+            changes,
+            last: None,
+            done: false,
+            next_check: tokio::time::Instant::now() + SESSION_EVERY,
+        },
+        |mut st| async move {
+            if st.done {
+                return None;
+            }
+            loop {
+                if st.last.is_some() {
+                    let closing = async {
+                        match st.state.closing.clone() {
+                            Some(mut rx) => {
+                                let _ = rx.wait_for(|v| *v).await;
+                            }
+                            None => std::future::pending().await,
+                        }
+                    };
+                    let changed = async {
+                        match st.changes.as_mut() {
+                            Some(rx) => {
+                                if rx.changed().await.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        _ = closing => return None,
+                        _ = changed => {}
+                        _ = tokio::time::sleep(POLL) => {}
+                    }
+                }
+                if tokio::time::Instant::now() >= st.next_check {
+                    st.next_check = tokio::time::Instant::now() + SESSION_EVERY;
+                    if let Some(id) = &st.session
+                        && !st.state.store.validate_session(id).await.unwrap_or(false)
+                    {
+                        return None;
+                    }
+                }
+                let jobs = match st.ip_id {
+                    Some(id) => st.state.store.jobs_for_ip(id, 20).await.unwrap_or_default(),
+                    None => vec![],
+                };
+                let states = states_json(&jobs);
+                // The last event once nothing waits: the page reloads and
+                // opens no new stream.
+                st.done = match st.ip_id {
+                    Some(id) => !any_waiting(&st.state.store, id).await,
+                    None => true,
+                };
+                if st.last.as_deref() != Some(&states) || st.done {
+                    st.last = Some(states.clone());
+                    let ev = Event::default().event("scan-jobs").data(states);
+                    return Some((Ok(ev), st));
+                }
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -319,5 +475,85 @@ secure_cookies = false
                 .await
                 .unwrap();
         assert_eq!(n, 0, "the fresh level-2 result stands");
+    }
+
+    #[test]
+    fn job_states_are_id_status_pairs() {
+        let j = |id, status: &str| crate::events::QueueJob {
+            id,
+            ip: IP.into(),
+            level: 2,
+            status: status.into(),
+            queued_at: String::new(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            scanner: None,
+            arbiter: None,
+            retry_at: None,
+        };
+        assert_eq!(
+            states_json(&[j(3, "queued"), j(2, "done")]),
+            "[[3,\"queued\"],[2,\"done\"]]"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_until_the_result_lands() {
+        let (state, _c, ip_id, _d) = state().await;
+        let store = &state.store;
+        assert!(!any_waiting(store, ip_id).await);
+        state.recorder.enqueue_manual(ip_id, 2).await.unwrap();
+        assert!(any_waiting(store, ip_id).await, "queued");
+        sqlx::query(
+            "UPDATE scan_jobs SET status = 'done', finished_at = datetime('now') WHERE ip_id = ?",
+        )
+        .bind(ip_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(any_waiting(store, ip_id).await, "done, result not here yet");
+        sqlx::query(
+            "INSERT INTO scans (job_id, ip_id, level, started_at, finished_at, uid, origin, job_uid)
+             SELECT id, ip_id, level, datetime('now'), datetime('now'), 's1', NULL, uid
+             FROM scan_jobs WHERE ip_id = ?",
+        )
+        .bind(ip_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(!any_waiting(store, ip_id).await, "the result landed");
+    }
+
+    #[tokio::test]
+    async fn the_stream_reports_the_job_states() {
+        use futures::StreamExt;
+        let (state, cookie, ip_id, _d) = state().await;
+        state.recorder.enqueue_manual(ip_id, 2).await.unwrap();
+        let app = crate::admin::full_router(state.clone());
+        let r = app
+            .oneshot(
+                axum::http::Request::get(format!("/admin/api/scan-jobs?ip={IP}"))
+                    .header("cookie", &cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let mut body = r.into_body().into_data_stream();
+        let mut seen = String::new();
+        let read = async {
+            while let Some(Ok(chunk)) = body.next().await {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+                if seen.contains("event: scan-jobs") {
+                    return;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), read)
+            .await
+            .unwrap_or_else(|_| panic!("no scan-jobs event in {seen:?}"));
+        assert!(seen.contains("queued"), "{seen}");
     }
 }
