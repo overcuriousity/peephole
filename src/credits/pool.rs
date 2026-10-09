@@ -59,6 +59,7 @@ pub mod testing {
     /// Make `listeners` up in every hour of `day` on this store: a
     /// reporter, made an advertised member of this store so its reports
     /// count, names them in each hour (merged with what it named before).
+    /// Its address refuses at once, so nothing waits to dial it.
     pub async fn report_all_day(
         pool: &sqlx::SqlitePool,
         day: u32,
@@ -69,7 +70,7 @@ pub mod testing {
         sqlx::query(
             "INSERT INTO members (id, name, address, roles_json, proto_min, proto_max, sponsor,
                                   info_hlc, admitted_hlc)
-             VALUES (?1, 'pool-reporter', '192.0.2.238:7443', '[]', ?2, ?3, ?1, ?4, ?4)
+             VALUES (?1, 'pool-reporter', '127.0.0.1:1', '[]', ?2, ?3, ?1, ?4, ?4)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(&reporter.0[..])
