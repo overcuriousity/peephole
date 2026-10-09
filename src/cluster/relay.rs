@@ -59,6 +59,7 @@ impl Leases {
     }
 
     /// End `id`'s lease here at once: messages for it are refused.
+    #[doc(hidden)] // For tests: a lease otherwise only runs out.
     pub fn end(&self, id: &NodeId) {
         self.0.lock().unwrap().remove(id);
     }
@@ -80,7 +81,7 @@ impl Leases {
 
 /// The leases this node took as a lessee: relay → end (ms).
 #[derive(Default)]
-pub struct Leased(Mutex<BTreeMap<NodeId, u64>>);
+pub struct Leased(Mutex<BTreeMap<NodeId, u64>>, tokio::sync::Notify);
 
 impl Leased {
     /// Its relays now.
@@ -104,7 +105,21 @@ impl Leased {
     pub fn set(&self, relay: NodeId, until_ms: u64) {
         self.0.lock().unwrap().insert(relay, until_ms);
     }
+
+    /// Drop `relay`, which no longer holds this node's lease (it
+    /// restarted): [`lease_once`] replaces it.
+    pub fn forget(&self, relay: &NodeId) -> bool {
+        let gone = self.0.lock().unwrap().remove(relay).is_some();
+        if gone {
+            self.1.notify_waiters();
+        }
+        gone
+    }
 }
+
+/// What a relay answers, at once, to a message or an inbox poll of a
+/// member that lists it but holds no lease there.
+pub const NO_LEASE: &str = "no relay lease here";
 
 /// What a lease costs here; None: this node is not advertised (it can
 /// relay nothing). 0 before the first price refresh.
@@ -136,7 +151,6 @@ pub async fn serve(node: &Arc<Node>, peer: NodeId, req: &RelayReq) -> RelayResp 
         return declined("a lease is one hour".into(), None);
     }
     let now = super::hlc::wall_ms();
-    node.market.note(price::RELAY, 1);
     if !node.relay_leases.holds(&peer, now)
         && node.relay_leases.current(now) >= node.cfg.relay_slots as usize
     {
@@ -179,6 +193,9 @@ pub async fn serve(node: &Arc<Node>, peer: NodeId, req: &RelayReq) -> RelayResp 
             }
         }
     }
+    // A sale: only a lease granted counts as demand (a full house counts
+    // as at capacity in `credits::price`).
+    node.market.note(price::RELAY, 1);
     let until_ms = node.relay_leases.grant(peer, now);
     tracing::info!(lessee = %peer.short(), charged = %show(cost as Mc), "relay leased");
     RelayResp::Accepted { until_ms }
@@ -266,6 +283,7 @@ pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<boo
         let wait = Duration::from_secs(if short { 5 } else { 60 });
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
+            _ = node.leased.1.notified() => {}
             _ = shutdown.changed() => break,
         }
     }
@@ -300,6 +318,67 @@ mod tests {
         assert!(!l.holds(&id(1), renewed + 6));
     }
 
+    async fn relay_node(slots: u32) -> (tempfile::TempDir, Arc<Node>) {
+        use crate::cluster::identity::Identity;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let node = Node::open(crate::cluster::NodeParams {
+            identity: Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: Some("127.0.0.1:1".into()),
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                relay_slots: slots,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store,
+            proto: (1, 1),
+            data_dir: dir.path().to_path_buf(),
+            retention_days: 30,
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        (dir, node)
+    }
+
+    /// Only a lease granted is a sale: a declined request moves no price.
+    #[tokio::test]
+    async fn a_declined_lease_request_is_no_sale() {
+        let (_dir, node) = relay_node(1).await;
+        let req = RelayReq {
+            hours: 1,
+            offer_seq: None,
+        };
+        let sold = || node.market.peek().counts.get(price::RELAY).copied();
+        node.relay_leases.grant(id(8), super::super::hlc::wall_ms());
+        let full = serve(&node, id(7), &req).await;
+        assert!(matches!(full, RelayResp::Declined { .. }), "{full:?}");
+        let long = serve(
+            &node,
+            id(7),
+            &RelayReq {
+                hours: 2,
+                ..req.clone()
+            },
+        )
+        .await;
+        assert!(matches!(long, RelayResp::Declined { .. }), "{long:?}");
+        assert_eq!(sold(), None, "declined: no demand");
+        node.relay_leases.end(&id(8));
+        let got = serve(&node, id(7), &req).await;
+        assert!(matches!(got, RelayResp::Accepted { .. }), "{got:?}");
+        assert_eq!(sold(), Some(1.0));
+    }
+
     #[test]
     fn a_lessee_renews_what_ends_within_five_minutes() {
         let l = Leased::default();
@@ -309,5 +388,7 @@ mod tests {
         assert_eq!(l.relays(t), [id(1), id(2)]);
         assert_eq!(l.keep(t), [id(1)], "2 is due a renewal");
         assert_eq!(l.relays(t + RENEW_BEFORE_MS), [id(1)], "2 ran out");
+        assert!(l.forget(&id(1)) && !l.forget(&id(1)));
+        assert!(l.relays(t).is_empty());
     }
 }

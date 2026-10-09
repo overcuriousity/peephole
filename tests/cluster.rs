@@ -5396,6 +5396,60 @@ async fn a_message_takes_the_next_relay_when_the_first_refuses() {
     );
 }
 
+/// An outbound-only member without a lease cannot be asked, but gets the
+/// answers to what it asks.
+#[tokio::test]
+async fn an_outbound_only_member_without_a_lease_gets_its_answers() {
+    use peephole::cluster::msg::Msg;
+    let (ia, a) = new_node("node-alpha");
+    let (ip, p) = new_node("node-papa");
+    let na = boot(ia, &a, &[], DEFAULT).await;
+    let np = boot(
+        ip,
+        &p,
+        &[],
+        Opts {
+            advertise: false,
+            lease: false,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let token = invite::create(&na, &Default::default()).await.unwrap();
+    invite::join(&np, &token).await.unwrap();
+    eventually("p reached a", || async {
+        na.node.status.polled_recently(&p.id)
+    })
+    .await;
+    let answer = np
+        .node
+        .request(a.id, Msg::ConfigGet, Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert!(matches!(answer, Msg::ConfigState(_)), "{answer:?}");
+    assert!(!na.node.can_call(&p.id));
+}
+
+/// A relay that lost a lessee's lease (it restarted) refuses its inbox
+/// poll; the lessee drops it and leases again.
+#[tokio::test]
+async fn a_lessee_leases_again_from_a_relay_that_lost_its_lease() {
+    let (_a, b, na, _nb) = outbound_pair().await;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    assert!(na.node.relay_leases.holds(&b.id, now()));
+    na.node.relay_leases.end(&b.id);
+    // At b's next inbox poll (one long-poll at most).
+    eventually_for(Duration::from_secs(40), "b leased a again", || async {
+        na.node.relay_leases.holds(&b.id, now())
+    })
+    .await;
+}
+
 /// An outbound-only member with a lease is asked through its relay; one
 /// without a lease cannot be asked at all.
 #[tokio::test]

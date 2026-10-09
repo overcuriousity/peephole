@@ -247,6 +247,9 @@ pub struct Messaging {
     /// checked so a relaying member that merely saw the id cannot forge the
     /// answer in the real destination's place.
     replies: Mutex<HashMap<String, (NodeId, tokio::sync::oneshot::Sender<Msg>)>>,
+    /// Wakes an outbound-only node's inbox polls when it asks something:
+    /// it collects the answer also where it holds no relay lease.
+    asking: tokio::sync::Notify,
     handlers: Mutex<Vec<Handler>>,
 }
 
@@ -317,6 +320,7 @@ impl Node {
             .lock()
             .unwrap()
             .insert(id.clone(), (to, tx));
+        self.msg.asking.notify_waiters();
         let mut rx = rx;
         let no_answer =
             || anyhow::Error::new(NoAnswer(timeout)).context(format!("asked {}", to.short()));
@@ -367,7 +371,7 @@ impl Node {
             if env.hops >= MAX_HOPS {
                 bail!("message to {} exceeded {MAX_HOPS} hops", body.to.short());
             }
-            match node.next_hop(&body.to, &avoid) {
+            match node.next_hop(&body.to, &avoid, body.in_reply_to.is_some()) {
                 Some(Hop::Dial(peer, addr)) => {
                     match node.call::<_, bool>(peer, &addr, "/rpc/v1/msg", &env).await {
                         Ok(_) => Ok(Some(peer)),
@@ -425,10 +429,13 @@ impl Node {
 
     /// Whether a message to `id` has a first hop, none of them in `avoid`.
     pub(crate) fn routable(&self, id: &NodeId, avoid: &[NodeId]) -> bool {
-        self.next_hop(id, avoid).is_some()
+        self.next_hop(id, avoid, false).is_some()
     }
 
-    fn next_hop(&self, to: &NodeId, avoid: &[NodeId]) -> Option<Hop> {
+    /// The first hop towards `to`. A `reply` (an answer to a request of
+    /// `to`) may wait in an outbox here for a member that polls it without
+    /// a lease; only requests need one.
+    fn next_hop(&self, to: &NodeId, avoid: &[NodeId], reply: bool) -> Option<Hop> {
         let dial: HashMap<NodeId, String> = self
             .dial_targets()
             .into_iter()
@@ -444,7 +451,10 @@ impl Node {
         if !relays.is_empty() && !dial.contains_key(to) {
             let now = super::hlc::wall_ms();
             let holds = self.relay_leases.holds(to, now) && self.status.polled_recently(to);
-            return relay_hop(&self.id(), to, &relays, &dial, avoid, holds);
+            let hop = relay_hop(&self.id(), to, &relays, &dial, avoid, holds);
+            if hop.is_some() || !reply {
+                return hop;
+            }
         }
         let via = |id: &NodeId, fresh_only: bool| -> Option<Hop> {
             if avoid.contains(id) {
@@ -459,7 +469,7 @@ impl Node {
             {
                 return Some(Hop::Dial(*id, addr.clone()));
             }
-            (self.status.polled_recently(id) && self.holds_outbox_for(id))
+            (self.status.polled_recently(id) && (reply && id == to || self.holds_outbox_for(id)))
                 .then_some(Hop::Outbox(*id))
         };
         // Direct delivery first.
@@ -632,11 +642,16 @@ fn drain_budget(q: &mut VecDeque<(Envelope, Instant)>, budget: usize) -> Vec<Env
 pub async fn inbox_loop(node: Arc<Node>, peer: NodeId, addr: String) {
     let mut backoff = Duration::from_secs(1);
     loop {
-        // An outbound-only node collects only at the relays it leases.
+        // An outbound-only node collects at the relays it leases, and
+        // anywhere while it waits for answers to its own requests.
         if node.cfg.advertise.is_none()
             && !node.leased.relays(super::hlc::wall_ms()).contains(&peer)
+            && node.msg.replies.lock().unwrap().is_empty()
         {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                _ = node.msg.asking.notified() => {}
+            }
             continue;
         }
         match node
@@ -660,7 +675,13 @@ pub async fn inbox_loop(node: Arc<Node>, peer: NodeId, addr: String) {
                     });
                 }
             }
-            Err(_) => {
+            Err(e) => {
+                // The relay lost this node's lease (it restarted): lease
+                // another.
+                if format!("{e:#}").contains(super::relay::NO_LEASE) && node.leased.forget(&peer) {
+                    debug!(relay = %peer.short(), "relay holds no lease of ours; dropped");
+                    node.publish_status();
+                }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
