@@ -36,6 +36,13 @@ const MAX_OUTBOX_BYTES: usize = 32 << 20;
 const MAX_INBOX_BYTES: usize = 16 << 20;
 /// Messages being routed at once; more are refused (the sender retries).
 pub const MAX_ROUTING: usize = 256;
+/// Longest message id taken; ours are 32 characters.
+const MAX_ID_LEN: usize = 64;
+/// Message ids remembered per sender (see [`Seen`]); more messages of it
+/// within the window are dropped.
+const MAX_SEEN_PER_SENDER: usize = 16_384;
+/// Requests handled at once; more are dropped (the sender's times out).
+const MAX_HANDLING: usize = 256;
 /// A heartbeat listing more neighbours than this contributes none.
 const MAX_NEIGHBOURS: usize = 256;
 /// How long a peer's inbox long-poll is held open.
@@ -243,7 +250,8 @@ pub type Handler = Arc<dyn Fn(NodeId, Msg) -> BoxFuture<'static, Option<Msg>> + 
 
 #[derive(Default)]
 pub struct Messaging {
-    seen: Mutex<HashMap<String, Instant>>,
+    seen: Mutex<Seen>,
+    handling: HandlerSlots,
     outbox: Mutex<HashMap<NodeId, VecDeque<(Envelope, Instant)>>>,
     pub outbox_changed: tokio::sync::Notify,
     /// request id -> (expected responder, reply channel). The responder is
@@ -254,6 +262,60 @@ pub struct Messaging {
     /// it collects the answer also where it holds no relay lease.
     asking: tokio::sync::Notify,
     handlers: Mutex<Vec<Handler>>,
+}
+
+/// Ids of the messages each sender's duplicates are recognized by, for
+/// twice [`MAX_AGE`] (a fresh message never outlives that).
+#[derive(Default)]
+struct Seen {
+    by: HashMap<NodeId, HashMap<String, Instant>>,
+    swept: Option<Instant>,
+}
+
+/// Request handlers running at once, over all senders.
+struct HandlerSlots(Arc<tokio::sync::Semaphore>);
+
+impl Default for HandlerSlots {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(MAX_HANDLING)))
+    }
+}
+
+impl Messaging {
+    /// Whether this is the first time `from`'s message `id` arrives. An id
+    /// longer than [`MAX_ID_LEN`], or one past [`MAX_SEEN_PER_SENDER`] of
+    /// the same sender, counts as seen (the message is dropped).
+    fn first_sight(&self, from: NodeId, id: &str) -> bool {
+        if id.len() > MAX_ID_LEN {
+            return false;
+        }
+        let keep = MAX_AGE * 2;
+        let mut seen = self.seen.lock().unwrap();
+        if seen.swept.is_none_or(|t| t.elapsed() >= MAX_AGE) {
+            seen.by.retain(|_, ids| {
+                ids.retain(|_, t| t.elapsed() < keep);
+                !ids.is_empty()
+            });
+            seen.swept = Some(Instant::now());
+        }
+        let ids = seen.by.entry(from).or_default();
+        if ids.contains_key(id) {
+            return false;
+        }
+        if ids.len() >= MAX_SEEN_PER_SENDER {
+            ids.retain(|_, t| t.elapsed() < keep);
+            if ids.len() >= MAX_SEEN_PER_SENDER {
+                return false;
+            }
+        }
+        ids.insert(id.to_string(), Instant::now());
+        true
+    }
+
+    /// Room to run a request handler, if fewer than [`MAX_HANDLING`] run.
+    fn handler_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.handling.0.clone().try_acquire_owned().ok()
+    }
 }
 
 /// No answer came back in time.
@@ -555,12 +617,8 @@ impl Node {
         if !b.fresh() {
             return debug!(from = %b.from.short(), "stale or future-dated message dropped");
         }
-        {
-            let mut seen = self.msg.seen.lock().unwrap();
-            seen.retain(|_, t| t.elapsed() < MAX_AGE * 2);
-            if seen.insert(b.id.clone(), Instant::now()).is_some() {
-                return; // duplicate
-            }
+        if !self.msg.first_sight(b.from, &b.id) {
+            return; // duplicate, or an id not taken
         }
         if let Some(rid) = &b.in_reply_to {
             let mut replies = self.msg.replies.lock().unwrap();
@@ -577,10 +635,14 @@ impl Node {
             }
             return;
         }
+        let Some(slot) = self.msg.handler_slot() else {
+            return debug!(from = %b.from.short(), "too many requests in hand; message dropped");
+        };
         let handlers = self.msg.handlers.lock().unwrap().clone();
         let node = self.clone();
         // Handlers may wait (claim window); never block the caller.
         tokio::spawn(async move {
+            let _slot = slot;
             for h in handlers {
                 if let Some(answer) = h(b.from, b.msg.clone()).await {
                     // An answer must not pass members too old to relay it.
@@ -737,6 +799,36 @@ mod tests {
         let mut q: VecDeque<_> = [env(20), env(1)].into();
         assert_eq!(drain_budget(&mut q, 10).len(), 1);
         assert_eq!(q.len(), 1);
+    }
+
+    /// The duplicate filter keeps ids per sender, refuses long ones, and
+    /// holds only so many of one sender: a member cannot fill this node's
+    /// memory with made-up ids, nor shadow another sender's.
+    #[test]
+    fn the_duplicate_filter_is_bounded_per_sender() {
+        let m = Messaging::default();
+        let (a, b) = (NodeId([1; 32]), NodeId([2; 32]));
+        assert!(m.first_sight(a, "x"));
+        assert!(!m.first_sight(a, "x"), "a duplicate");
+        assert!(m.first_sight(b, "x"), "another sender's id");
+        assert!(!m.first_sight(a, &"y".repeat(MAX_ID_LEN + 1)));
+        for n in 1..MAX_SEEN_PER_SENDER {
+            assert!(m.first_sight(a, &n.to_string()));
+        }
+        assert!(!m.first_sight(a, "one too many"));
+        assert!(m.first_sight(b, "y"), "the others go on");
+    }
+
+    /// Requests are handled only so many at once; more are dropped (the
+    /// sender's request times out) instead of piling up.
+    #[test]
+    fn handlers_run_only_so_many_at_once() {
+        let m = Messaging::default();
+        let held: Vec<_> = (0..MAX_HANDLING).map(|_| m.handler_slot()).collect();
+        assert!(held.iter().all(Option::is_some));
+        assert!(m.handler_slot().is_none());
+        drop(held);
+        assert!(m.handler_slot().is_some());
     }
 
     /// The claim as nodes before `exclude_levels` know it.

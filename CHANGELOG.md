@@ -47,6 +47,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   the origins pushed, for 64 batches at most per round. Before, a member
   answering each push with a head for a made-up origin kept the push
   going forever and held one of the 8 sync slots.
+- Cluster: directed messages are told apart by sender and id, ids longer
+  than 64 bytes are refused, a sender's ids are remembered up to 16384,
+  and at most 256 requests are handled at once. Before, a member could
+  fill a node's memory with made-up ids or handlers left waiting.
 
 ## [0.10.0] - 2026-10-09
 
