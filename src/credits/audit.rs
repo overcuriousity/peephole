@@ -433,7 +433,7 @@ pub const AUDITORS: usize = 3;
 
 /// What designates a scan and ranks its auditors: a hash of its job and
 /// the HLC of the arbiter's done status, which the arbiter writes after
-/// the result is published.
+/// the result is published and the scanner charged ([`job_paid`]).
 pub fn seed(job_uid: &str, done_hlc: u64) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -531,18 +531,23 @@ fn counted_receipt(economy: &str, ttl: &str) -> String {
 /// Whether the job `job_uid` that `arbiter` granted to `scanner` was paid
 /// for: an offer of the arbiter funding it whose receipt the ledger counts
 /// ([`counted_receipt`], within [`crate::credits::JOB_OFFER_TTL_MS`])
-/// charged something. Only the scans of paid jobs are designated: a
-/// scanner paid nothing for a job may hold nothing to buy its audit with.
+/// charged something, and is dated before the arbiter's done status
+/// `done_hlc`. Only the scans of paid jobs are designated: a scanner paid
+/// nothing for a job may hold nothing to buy its audit with. The scanner
+/// charges before it reports the job done; a receipt written after the
+/// done status (which designates) could be withheld for the scans it
+/// designates, so it never makes a job paid.
 pub async fn job_paid(
     pool: &SqlitePool,
     job_uid: &str,
     arbiter: &[u8],
     scanner: &[u8],
+    done_hlc: u64,
 ) -> Result<bool> {
     Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT EXISTS (
            SELECT 1 FROM credit_entries o
-           JOIN credit_entries r ON r.charged_mc > 0 AND {}
+           JOIN credit_entries r ON r.charged_mc > 0 AND r.hlc < ?6 AND {}
            WHERE o.kind = 'offer' AND o.economy = ?4 AND o.job_uid = ?1
              AND o.origin = ?2 AND o.peer = ?3)",
         counted_receipt("?4", "?5")
@@ -552,6 +557,7 @@ pub async fn job_paid(
     .bind(scanner)
     .bind(economy())
     .bind(crate::credits::JOB_OFFER_TTL_MS as i64)
+    .bind(hlc::to_db(done_hlc))
     .fetch_one(pool)
     .await?)
 }
@@ -609,7 +615,7 @@ pub async fn obligations(
         }
         // A scan with nobody to buy its audit from is owed nothing.
         let ranked = auditors(&s, members, &scanner, done, level.clamp(1, 5) as u8);
-        if ranked.is_empty() || !job_paid(pool, &job_uid, &arbiter, &scanner_key).await? {
+        if ranked.is_empty() || !job_paid(pool, &job_uid, &arbiter, &scanner_key, done).await? {
             continue;
         }
         let e = out.entry(scanner).or_default();
@@ -701,9 +707,11 @@ async fn scan_of(node: &Node, scan_uid: &str) -> Option<(NodeId, String, String,
         .ok()
         .flatten();
         let paid = match &row {
-            Some((s, job, .., arbiter)) => job_paid(&node.store.pool, job, arbiter, s)
-                .await
-                .unwrap_or(false),
+            Some((s, job, _, _, done, arbiter)) => {
+                job_paid(&node.store.pool, job, arbiter, s, hlc::from_db(*done))
+                    .await
+                    .unwrap_or(false)
+            }
             None => false,
         };
         if let Some((s, job, ip, level, done, _)) = row.filter(|_| paid) {
@@ -985,8 +993,9 @@ async fn due(pool: &SqlitePool, me: &NodeId, since_ms: u64) -> Result<Vec<String
     .await?;
     let mut out = vec![];
     for (scan_uid, job_uid, arbiter, done) in rows {
-        if designated(&seed(&job_uid, hlc::from_db(done)))
-            && job_paid(pool, &job_uid, &arbiter, &me.0).await?
+        let done = hlc::from_db(done);
+        if designated(&seed(&job_uid, done))
+            && job_paid(pool, &job_uid, &arbiter, &me.0, done).await?
         {
             out.push(scan_uid);
         }
@@ -1443,20 +1452,33 @@ mod tests {
         let (s, arbiter) = (id(1), id(9));
         let members = [scanner_member(1, 7), scanner_member(2, 7)];
         let day = 86_400_000;
+        let now = hlc::wall_ms() << 16;
         designated_job(pool, arbiter, s, "free", day).await;
         designated_job(pool, arbiter, s, "zero", day).await;
         pay_job(pool, arbiter, s, "job-zero", 1, 0).await;
         let got = obligations(pool, &members, hlc::wall_ms()).await.unwrap();
         assert_eq!(got.get(&s), None, "{got:?}");
-        assert!(!job_paid(pool, "job-zero", &arbiter.0, &s.0).await.unwrap());
+        assert!(
+            !job_paid(pool, "job-zero", &arbiter.0, &s.0, now)
+                .await
+                .unwrap()
+        );
         designated_job(pool, arbiter, s, "paid", day).await;
         pay_job(pool, arbiter, s, "job-paid", 2, 5).await;
-        assert!(job_paid(pool, "job-paid", &arbiter.0, &s.0).await.unwrap());
+        assert!(
+            job_paid(pool, "job-paid", &arbiter.0, &s.0, now)
+                .await
+                .unwrap()
+        );
         // Paid by another arbiter than the job's, or to another scanner:
         // not this job's payment.
-        assert!(!job_paid(pool, "job-paid", &id(8).0, &s.0).await.unwrap());
         assert!(
-            !job_paid(pool, "job-paid", &arbiter.0, &id(2).0)
+            !job_paid(pool, "job-paid", &id(8).0, &s.0, now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !job_paid(pool, "job-paid", &arbiter.0, &id(2).0, now)
                 .await
                 .unwrap()
         );
@@ -1481,13 +1503,28 @@ mod tests {
                     .unwrap();
             }
         }
-        assert!(!job_paid(pool, "job-early", &arbiter.0, &s.0).await.unwrap());
-        assert!(!job_paid(pool, "job-late", &arbiter.0, &s.0).await.unwrap());
         assert!(
-            job_paid(pool, "job-in-time", &arbiter.0, &s.0)
+            !job_paid(pool, "job-early", &arbiter.0, &s.0, now)
                 .await
                 .unwrap()
         );
+        assert!(
+            !job_paid(pool, "job-late", &arbiter.0, &s.0, now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            job_paid(pool, "job-in-time", &arbiter.0, &s.0, now)
+                .await
+                .unwrap()
+        );
+        // A receipt written after the arbiter's done status does not count:
+        // the scanner could see whether the scan was designated first.
+        let receipt = (1_000_000 + ttl) << 16;
+        for (done, paid) in [(receipt, false), (receipt + 1, true)] {
+            let got = job_paid(pool, "job-in-time", &arbiter.0, &s.0, done);
+            assert_eq!(got.await.unwrap(), paid, "done at {done}");
+        }
     }
 
     /// A scan is due for a purchase while no audit offer for it is open or

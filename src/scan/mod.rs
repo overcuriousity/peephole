@@ -1038,9 +1038,11 @@ impl Source {
                 },
                 Some(node),
             ) => {
-                let delivered = match outcome {
+                // (status reported, error) once the receipt is written; None:
+                // the lease is lost, nothing delivered, the offer freed.
+                let report = match outcome {
                     Outcome::Done(res) => {
-                        if let Err(e) = self
+                        match self
                             .rec
                             .record_scan_result(
                                 uid,
@@ -1051,24 +1053,31 @@ impl Source {
                             )
                             .await
                         {
-                            warn!(job = %uid, ?e, "could not record scan result");
-                            Self::report(node, *arbiter, uid, "failed", Some(e.to_string())).await;
-                            false
-                        } else {
-                            Self::report(node, *arbiter, uid, "done", None).await;
-                            true
+                            Err(e) => {
+                                warn!(job = %uid, ?e, "could not record scan result");
+                                Some(("failed", Some(e.to_string())))
+                            }
+                            Ok(_) => Some(("done", None)),
                         }
                     }
-                    Outcome::Failed(e) => {
-                        Self::report(node, *arbiter, uid, "failed", Some(e)).await;
-                        false
-                    }
-                    // The lease is lost: nothing delivered, the offer freed.
-                    Outcome::Abandoned => false,
+                    Outcome::Failed(e) => Some(("failed", Some(e))),
+                    Outcome::Abandoned => None,
                 };
+                // The receipt comes before the done status, and reaches the
+                // arbiter first: the done status designates the scan for an
+                // audit, and a receipt written after it does not make the
+                // job paid (`credits::audit::job_paid`), so the scanner
+                // cannot charge only the scans it sees are not designated.
                 if let Some((seq, price)) = offer {
+                    let delivered = matches!(report, Some(("done", _)));
                     let charged = if delivered { *price } else { 0 };
                     crate::credits::jobs::settle(node, *arbiter, *seq, charged).await;
+                    if delivered && let Err(e) = node.sync_around_request(*arbiter).await {
+                        debug!(job = %uid, ?e, "sync of the scan receipt failed");
+                    }
+                }
+                if let Some((status, error)) = report {
+                    Self::report(node, *arbiter, uid, status, error).await;
                 }
             }
             _ => {}

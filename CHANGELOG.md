@@ -37,6 +37,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   the top 1000) open no longer agrees with whatever the audit finds. The
   same host key still settles it, unless the scan claims more than twice
   as many open ports as the audit found.
+- Protocol 8: a scanner writes its scan receipt before it reports the
+  job done, and only a receipt dated before the arbiter's done status
+  makes the job paid and its scan designable for an audit. The done
+  status designates the scan, so a scanner charging after it could
+  charge nothing for exactly the scans that were designated. Jobs of
+  scanners below protocol 8 (which charge after) are not designated.
 - A scanner owes audits (and is not funded) only once four of its
   designated scans of 7 days lack a bought audit and it bought fewer than
   60 % of them (was two and 80 %): an honest scanner whose ranked auditors

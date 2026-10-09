@@ -281,7 +281,8 @@ audits and relay leases. The supply is fixed; prices follow sales.
   half of 5 recent grants) go last. A scanner runs a funded job only when
   its book holds the offer and counts it covered in full; otherwise it hands
   the job back for later (no fault of the scanner). The scanner charges the
-  offered price when it delivers the result, and nothing when it does not. A scan offer lapses
+  offered price when it delivers the result, before it reports the job
+  done, and nothing when it does not. A scan offer lapses
   after the longest scan (12 hours plus 2 minutes). Every grant is funded, at
   zero or above: a scanner priced at 0 is granted without an offer.
   `scan_share = 0` funds only free scanners.
@@ -305,7 +306,10 @@ audits and relay leases. The supply is fixed; prices follow sales.
   scans of paid jobs (granted by another arbiter and charged for; a job
   granted at zero owes no audit) is designated for a bought audit by a hash
   of the job and the arbiter's done status, which the scanner cannot steer
-  or know before it has published the result; the same hash ranks the
+  or know before it has published the result and charged for it: it
+  writes its receipt before it reports the job done, and a receipt dated
+  after the done status does not make a job paid (scanners below protocol
+  8 charge after it, so their scans are not designated); the same hash ranks the
   scan's three auditors among the scanners admitted by then. The scanner
   buys the audit from the first of them that is reachable and priced (an
   auditor declines an audit it would not run, and the scanner asks the

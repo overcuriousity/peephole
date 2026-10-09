@@ -5061,6 +5061,20 @@ async fn a_funded_scan_job_pays_the_scanner_its_price() {
         assert_eq!(book.balance(&b.id), cost);
         assert_eq!(book.ledger.held(&a.id), 0);
     }
+    // The scanner charged before it reported the job done: the job counts
+    // as paid against the done status that designates its scan.
+    let done: i64 = sqlx::query_scalar("SELECT status_hlc FROM scan_jobs WHERE uid = ?")
+        .bind(&job)
+        .fetch_one(&na.store.pool)
+        .await
+        .unwrap();
+    let done = peephole::cluster::hlc::from_db(done);
+    assert!(
+        peephole::credits::audit::job_paid(&na.store.pool, &job, &a.id.0, &b.id.0, done)
+            .await
+            .unwrap(),
+        "the receipt is dated before the done status"
+    );
     // Both nodes count the paid scan for b's price, by when the scan
     // finished: a receipt held back past the hour moves nothing.
     for n in [&na, &nb] {
@@ -7339,11 +7353,20 @@ async fn reverse_names_are_bought_from_a_quorum_and_replicate_with_their_flag() 
 }
 
 /// `arbiter`'s offer funding `job` of `scanner` (sequence `seq`), and the
-/// scanner's receipt charging 5 mc for it a moment later, written on each
-/// of `on`: the job was paid for, so its scan may be designated.
-async fn paid_job(on: &[&TestNode], arbiter: NodeId, scanner: NodeId, job: &str, seq: i64) {
-    let at = peephole::cluster::hlc::to_db(now_ms() << 16);
-    let receipt_at = at + 1;
+/// scanner's receipt charging 5 mc for it a moment later, both dated just
+/// before the job's done status `done`, written on each of `on`: the job
+/// was paid for, so its scan may be designated.
+async fn paid_job(
+    on: &[&TestNode],
+    arbiter: NodeId,
+    scanner: NodeId,
+    job: &str,
+    seq: i64,
+    done: u64,
+) {
+    let done_ms = peephole::cluster::hlc::physical_ms(done);
+    let at = peephole::cluster::hlc::to_db((done_ms - 2) << 16);
+    let receipt_at = peephole::cluster::hlc::to_db((done_ms - 1) << 16);
     for n in on {
         sqlx::query(
             "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, seal, economy, job_uid)
@@ -7432,7 +7455,7 @@ async fn designated_scan(
         .await
         .unwrap();
     }
-    paid_job(on, arbiter, scanner, job, 1_000_000).await;
+    paid_job(on, arbiter, scanner, job, 1_000_000, done).await;
     admitted_long_ago(on).await;
     done
 }
@@ -7677,6 +7700,7 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
         .await
         .unwrap();
     let mut found = 0;
+    let mut dones = vec![];
     for i in 0u64.. {
         let done = ((now - 86_400_000 - i) << 16) | 1;
         let job = format!("owed-job-{found}");
@@ -7697,6 +7721,7 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
         .bind(ip.id).bind(format!("owed-scan-{found}")).bind(&s.id.0[..]).bind(&job).bind(peephole::cluster::hlc::to_db(done))
         .execute(&na.store.pool).await.unwrap();
         found += 1;
+        dones.push(done);
         if found == 4 {
             break;
         }
@@ -7706,8 +7731,9 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
     // credits could not buy one.
     let book = peephole::credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.standing(&s.id).audits_owed, None);
-    for i in 0..4 {
-        paid_job(&[&na], a.id, s.id, &format!("owed-job-{i}"), 1_000_000 + i).await;
+    for (i, done) in dones.into_iter().enumerate() {
+        let job = format!("owed-job-{i}");
+        paid_job(&[&na], a.id, s.id, &job, 1_000_000 + i as i64, done).await;
     }
     let book = peephole::credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.standing(&s.id).audits_owed, Some((0, 4)));
