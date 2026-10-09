@@ -278,12 +278,15 @@ pub async fn lease_once(node: &Arc<Node>) -> usize {
 /// Keep this outbound-only node's relays leased, until shutdown.
 pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     loop {
+        // Registered before `lease_once`: a relay forgotten meanwhile
+        // still wakes this loop.
+        let lost = node.leased.1.notified();
         lease_once(&node).await;
         let short = node.leased.relays(super::hlc::wall_ms()).len() < WANTED;
         let wait = Duration::from_secs(if short { 5 } else { 60 });
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
-            _ = node.leased.1.notified() => {}
+            _ = lost => {}
             _ = shutdown.changed() => break,
         }
     }

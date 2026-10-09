@@ -286,11 +286,13 @@ async fn relay_lease(
 /// Long-poll for messages waiting for the caller.
 async fn inbox(State(node): State<Arc<Node>>, Extension(Peer(peer)): Extension<Peer>) -> Response {
     // A lessee that lists this node holds no lease here (it restarted):
-    // told at once, it leases another relay.
-    if node
-        .status
-        .known(&peer)
-        .is_some_and(|k| k.hb.relays.contains(&node.id()))
+    // told at once, it leases another relay. Answers already queued for
+    // it here are handed over first.
+    if !node.has_queued(&peer)
+        && node
+            .status
+            .known(&peer)
+            .is_some_and(|k| k.hb.relays.contains(&node.id()))
         && !node
             .relay_leases
             .holds(&peer, crate::cluster::hlc::wall_ms())

@@ -600,6 +600,19 @@ impl Node {
         });
     }
 
+    /// Whether messages wait here for `peer`.
+    pub fn has_queued(&self, peer: &NodeId) -> bool {
+        self.msg
+            .outbox
+            .lock()
+            .unwrap()
+            .get_mut(peer)
+            .is_some_and(|q| {
+                q.retain(|(_, t)| t.elapsed() < OUTBOX_TTL);
+                !q.is_empty()
+            })
+    }
+
     /// Messages waiting for `peer` (it long-polls us); waits up to
     /// [`INBOX_WAIT`] for one to arrive.
     pub async fn take_inbox(&self, peer: NodeId) -> Vec<Envelope> {
@@ -642,6 +655,9 @@ fn drain_budget(q: &mut VecDeque<(Envelope, Instant)>, budget: usize) -> Vec<Env
 pub async fn inbox_loop(node: Arc<Node>, peer: NodeId, addr: String) {
     let mut backoff = Duration::from_secs(1);
     loop {
+        // Registered before the check: a request made meanwhile still
+        // wakes it.
+        let asking = node.msg.asking.notified();
         // An outbound-only node collects at the relays it leases, and
         // anywhere while it waits for answers to its own requests.
         if node.cfg.advertise.is_none()
@@ -650,7 +666,7 @@ pub async fn inbox_loop(node: Arc<Node>, peer: NodeId, addr: String) {
         {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-                _ = node.msg.asking.notified() => {}
+                _ = asking => {}
             }
             continue;
         }
