@@ -212,6 +212,7 @@ mod tests {
             standing: Standing::Active,
             info_hlc: 1,
             last_entry_hlc: 1,
+            admitted_hlc: 0,
             remote_config: false,
         };
         let (me, old, new, gone) = (

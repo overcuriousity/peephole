@@ -164,6 +164,9 @@ pub enum Msg {
     AuditReply {
         accepted: bool,
         why: Option<String>,
+        /// What the audit costs there, when the offer was too low.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        price_mc: Option<u32>,
     },
 }
 
@@ -580,11 +583,17 @@ impl Node {
         tokio::spawn(async move {
             for h in handlers {
                 if let Some(answer) = h(b.from, b.msg.clone()).await {
-                    // An RPC answer must not pass members too old to relay it.
-                    let avoid = if matches!(answer, Msg::RpcReply { .. }) {
-                        super::owner::cmd::old_relays(&node, &b.from, ROUTED_PROTO)
-                    } else {
-                        vec![]
+                    // An answer must not pass members too old to relay it.
+                    let avoid = match answer {
+                        Msg::RpcReply { .. } => {
+                            super::owner::cmd::old_relays(&node, &b.from, ROUTED_PROTO)
+                        }
+                        Msg::AuditReply { .. } => super::owner::cmd::old_relays(
+                            &node,
+                            &b.from,
+                            super::rpc::proto::ECONOMY_PROTO,
+                        ),
+                        _ => vec![],
                     };
                     match Envelope::seal(&node, b.from, Some(b.id.clone()), answer) {
                         Ok((_, env)) => {

@@ -21,3 +21,5 @@ ALTER TABLE credit_entries ADD COLUMN audit_uid TEXT;
 CREATE INDEX idx_credit_entries_audit ON credit_entries(audit_uid) WHERE audit_uid IS NOT NULL;
 -- Done jobs by their done status (`credits::audit` obligations, buy_due).
 CREATE INDEX idx_scan_jobs_status_hlc ON scan_jobs(status, status_hlc);
+-- The offer funding a job (`credits::audit::job_paid`).
+CREATE INDEX idx_credit_entries_job ON credit_entries(job_uid) WHERE job_uid IS NOT NULL;

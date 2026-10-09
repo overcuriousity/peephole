@@ -7189,9 +7189,57 @@ async fn reverse_names_are_bought_from_a_quorum_and_replicate_with_their_flag() 
     );
 }
 
+/// `arbiter`'s offer funding `job` of `scanner` (sequence `seq`), and the
+/// scanner's receipt charging 5 mc for it, written on each of `on`: the
+/// job was paid for, so its scan may be designated.
+async fn paid_job(on: &[&TestNode], arbiter: NodeId, scanner: NodeId, job: &str, seq: i64) {
+    let at = peephole::cluster::hlc::to_db(now_ms() << 16);
+    for n in on {
+        sqlx::query(
+            "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, seal, economy, job_uid)
+             VALUES (?1, ?2, ?3, 'offer', ?4, '[]', 0, 2, ?5)",
+        )
+        .bind(&arbiter.0[..])
+        .bind(seq)
+        .bind(at)
+        .bind(&scanner.0[..])
+        .bind(job)
+        .execute(&n.store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, economy)
+             VALUES (?1, ?2, ?3, 'receipt', ?4, '[]', ?2, 5, '[\"scan\"]', 0, 2)",
+        )
+        .bind(&scanner.0[..])
+        .bind(seq)
+        .bind(at)
+        .bind(&arbiter.0[..])
+        .execute(&n.store.pool)
+        .await
+        .unwrap();
+    }
+}
+
+/// Date every member's admission on each of `on` two days back: the tests
+/// date their scans back, and only members admitted by a scan's done
+/// status audit it.
+async fn admitted_long_ago(on: &[&TestNode]) {
+    let at = peephole::cluster::hlc::to_db((now_ms() - 2 * 86_400_000) << 16);
+    for n in on {
+        sqlx::query("UPDATE members SET admitted_hlc = ? WHERE admitted_hlc > 0")
+            .bind(at)
+            .execute(&n.store.pool)
+            .await
+            .unwrap();
+        n.node.reload_members().await.unwrap();
+    }
+}
+
 /// A done job `job` of `arbiter`, scanned by `scanner` as `scan` of `ip`,
 /// whose done status (at or before `from_ms`) designates it, written on
-/// each of `on` (as replication would leave it). Returns the done HLC.
+/// each of `on` (as replication would leave it), and paid for
+/// ([`paid_job`]). Returns the done HLC.
 async fn designated_scan(
     on: &[&TestNode],
     arbiter: NodeId,
@@ -7234,6 +7282,8 @@ async fn designated_scan(
         .await
         .unwrap();
     }
+    paid_job(on, arbiter, scanner, job, 1_000_000).await;
+    admitted_long_ago(on).await;
     done
 }
 
@@ -7289,7 +7339,37 @@ async fn a_designated_scan_is_audited_by_its_auditor() {
     );
     assert!(nx.node.audit_queue.lock().unwrap().is_empty());
     backed(&nx, ip).await;
+    // x takes more now than its heartbeat says: it declines naming its
+    // price, and s offers that once.
+    let announced = ns
+        .node
+        .status
+        .known(&x.id)
+        .and_then(|k| k.hb.scan_price_mc)
+        .unwrap();
+    let least = 2 * announced.max(1);
+    let sell = (0u32..)
+        .find(|v| peephole::credits::price::min_take(*v) == least)
+        .unwrap();
+    nx.node
+        .set_price_table(std::sync::Arc::new(peephole::credits::price::Table {
+            sell_mc: Some(sell),
+            ..(*nx.node.price_table()).clone()
+        }));
+    let offers =
+        "SELECT COUNT(*) FROM credit_entries WHERE kind = 'offer' AND audit_uid = 'scan-d'";
+    let before = count(&ns, offers).await;
     assert_eq!(audit::buy(&ns.node, "scan-d").await, Ok(x.id));
+    assert_eq!(count(&ns, offers).await, before + 2, "offered again");
+    let last: i64 = sqlx::query_scalar(
+        "SELECT (SELECT SUM(json_extract(p.value, '$[1]')) FROM json_each(o.parts) p)
+         FROM credit_entries o WHERE o.kind = 'offer' AND o.audit_uid = 'scan-d'
+         ORDER BY o.seq DESC LIMIT 1",
+    )
+    .fetch_one(&ns.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(last, least as i64, "at the price x named");
     assert_eq!(nx.node.audit_queue.lock().unwrap().len(), 1, "x queued it");
     // Asked again with the queued offer: refused, and nothing released.
     let seq: i64 = sqlx::query_scalar(
@@ -7307,7 +7387,7 @@ async fn a_designated_scan_is_audited_by_its_auditor() {
     assert!(
         matches!(
             &reply,
-            Ok(Msg::AuditReply { accepted: false, why: Some(w) })
+            Ok(Msg::AuditReply { accepted: false, why: Some(w), .. })
                 if w == "this audit is queued already"
         ),
         "{reply:?}"
@@ -7333,7 +7413,7 @@ async fn a_designated_scan_is_audited_by_its_auditor() {
     assert!(
         matches!(
             &reply,
-            Ok(Msg::AuditReply { accepted: false, why: Some(w) })
+            Ok(Msg::AuditReply { accepted: false, why: Some(w), .. })
                 if w == "this node audits no such scan"
         ),
         "{reply:?}"
@@ -7399,8 +7479,9 @@ async fn a_bought_audit_is_run_charged_and_counted_everywhere() {
     assert!(nx.node.audit_queue.lock().unwrap().is_empty());
 }
 
-/// A scanner that buys no audits of its designated scans owes them:
-/// arbiters stop funding it, so it is granted nothing.
+/// A scanner that buys no audits of its designated scans of paid jobs owes
+/// them: arbiters stop funding it, so it is granted nothing. Zero-priced
+/// jobs owe nothing.
 #[tokio::test]
 async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funded() {
     let tools = tempfile::tempdir().unwrap();
@@ -7431,6 +7512,13 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
     )
     .await;
     market_known(&na, s.id).await;
+    // x must be known as a scanner of protocol 7: s's auditor.
+    eventually("a knows x scans", || async {
+        na.members().get(&x.id).is_some_and(|m| {
+            peephole::credits::pay::pays_with(m.proto_max) && m.roles.iter().any(|r| r == "scanner")
+        })
+    })
+    .await;
     // Three designated scans of a's jobs by s, a day old, none audited.
     let now = now_ms();
     let ip = na
@@ -7462,6 +7550,14 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
         if found == 3 {
             break;
         }
+    }
+    admitted_long_ago(&[&na]).await;
+    // Granted at no price, the jobs owe no audit: a scanner without
+    // credits could not buy one.
+    let book = peephole::credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(book.standing(&s.id).audits_owed, None);
+    for i in 0..3 {
+        paid_job(&[&na], a.id, s.id, &format!("owed-job-{i}"), 1_000_000 + i).await;
     }
     let book = peephole::credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.standing(&s.id).audits_owed, Some((0, 3)));

@@ -337,6 +337,7 @@ mod tests {
             standing: Standing::Active,
             info_hlc: 0,
             last_entry_hlc: 0,
+            admitted_hlc: 0,
             remote_config: false,
         }
     }

@@ -87,6 +87,8 @@ pub struct MemberRow {
     pub standing: Standing,
     /// HLC of the latest self-description (0: never described itself).
     pub info_hlc: u64,
+    /// HLC of its latest admission (0: not admitted).
+    pub admitted_hlc: u64,
     /// HLC of the newest log entry this member signed (0: none held).
     pub last_entry_hlc: u64,
     /// Unused since ownership replaced config keys; always false in new records.
@@ -133,6 +135,7 @@ fn from_row(r: Row, now_ms: u64) -> Result<MemberRow> {
         proto_max: r.5 as u32,
         sponsor: NodeId::from_slice(&r.6)?,
         info_hlc: r.7 as u64,
+        admitted_hlc: super::hlc::from_db(r.8),
         active: standing == Standing::Active,
         standing,
         last_entry_hlc,
