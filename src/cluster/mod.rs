@@ -278,6 +278,7 @@ pub struct Node {
     lookup_shares: std::sync::OnceLock<crate::credits::share::Shares>,
     /// This node's observational prober, when it probes (`scan::probe`).
     prober: std::sync::OnceLock<Arc<crate::scan::probe::serve::Prober>>,
+    rdns_lookup: std::sync::OnceLock<crate::intel::rdns::RdnsLookup>,
     /// This node's lookup prices, as last computed (`credits::price`).
     price_table: RwLock<Arc<crate::credits::price::Table>>,
     /// The advertised members this node reached, per hour, until reported
@@ -357,6 +358,7 @@ impl Node {
             lookup_providers: Default::default(),
             lookup_shares: Default::default(),
             prober: Default::default(),
+            rdns_lookup: Default::default(),
             price_table: Default::default(),
             reach: Default::default(),
             market: Default::default(),
@@ -545,6 +547,16 @@ impl Node {
     /// node does not probe.
     pub fn prober(&self) -> Option<&Arc<crate::scan::probe::serve::Prober>> {
         self.prober.get()
+    }
+
+    /// Tests: answer reverse lookups with `f` instead of the system resolver.
+    #[doc(hidden)]
+    pub fn set_rdns_lookup(&self, f: crate::intel::rdns::RdnsLookup) {
+        let _ = self.rdns_lookup.set(f);
+    }
+
+    pub fn rdns_lookup(&self) -> Option<&crate::intel::rdns::RdnsLookup> {
+        self.rdns_lookup.get()
     }
 
     pub fn price_table(&self) -> Arc<crate::credits::price::Table> {

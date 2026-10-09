@@ -41,6 +41,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/rpc/v1/lookup", post(lookup))
         .route("/rpc/v1/probe", post(probe))
         .route("/rpc/v1/resolve", post(resolve))
+        .route("/rpc/v1/rdns", post(rdns))
         .route_layer(axum::middleware::from_fn_with_state(
             node.clone(),
             require_member,
@@ -225,6 +226,16 @@ async fn resolve(
     Cbor(req): Cbor<crate::intel::dns::ResolveReq>,
 ) -> Response {
     Cbor(crate::intel::dns::serve_resolve(&node, peer, &req).await).into_response()
+}
+
+/// A source's reverse names for a member, free at zero or paid with the
+/// offer it names.
+async fn rdns(
+    State(node): State<Arc<Node>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Cbor(req): Cbor<crate::intel::rdns::RdnsReq>,
+) -> Response {
+    Cbor(crate::intel::rdns::serve_rdns(&node, peer, &req).await).into_response()
 }
 
 /// An observational probe for a member, paid with the offer it names.

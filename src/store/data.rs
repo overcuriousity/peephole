@@ -93,6 +93,7 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
         Record::SkipBatch(b) => skip_batch(conn, ctx, b).await,
         Record::ProbeResult(r) => super::probes::apply_probe_result(conn, ctx, r).await,
         Record::IpName(r) => super::probes::apply_ip_name(conn, ctx, r).await,
+        Record::RdnsName(r) => super::rdns::apply_rdns(conn, ctx, r).await,
         Record::ReachReport(r) => crate::credits::reach::apply(conn, ctx, r).await,
         // Membership and credits are the cluster layer's (`members::apply`,
         // `credits::entries`, `cluster::seal`): no row of the dataset.
@@ -109,7 +110,7 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
 
 /// Record kinds a local hide or block keeps out of the tables. Membership,
 /// tombstones and scan-job state still apply, so the cluster stays in step.
-const CONTENT_KINDS: [&str; 10] = [
+const CONTENT_KINDS: [&str; 11] = [
     "request",
     "skip_batch",
     "fingerprint",
@@ -120,6 +121,7 @@ const CONTENT_KINDS: [&str; 10] = [
     "ip_intel",
     "probe_result",
     "ip_name",
+    "rdns_name",
 ];
 
 async fn origin_blocked(conn: &mut SqliteConnection, origin: Option<&NodeId>) -> Result<bool> {

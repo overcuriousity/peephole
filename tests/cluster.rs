@@ -6875,3 +6875,81 @@ async fn a_probe_of_an_unknown_offer_is_declined_with_a_receipt_of_nothing() {
     assert_eq!(book.ledger.held(&a.id), 0);
     assert_eq!(book.balance(&a.id), share(&[a.id], a.id));
 }
+
+/// The node that recorded a source buys its reverse names from itself
+/// and the cheapest other member (q = 2 of 3); the agreed name and the
+/// disputed one replicate with their flags.
+#[tokio::test]
+async fn reverse_names_are_bought_from_a_quorum_and_replicate_with_their_flag() {
+    use peephole::credits::price;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let na = boot(ia, &a, &[&b, &c], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a, &c], DEFAULT).await;
+    let nc = boot(ic, &c, &[&a, &b], DEFAULT).await;
+    let fake = |names: &'static [&'static str]| -> peephole::intel::rdns::RdnsLookup {
+        std::sync::Arc::new(move |_ip| {
+            Box::pin(async move { Ok(names.iter().map(|n| n.to_string()).collect()) })
+        })
+    };
+    na.node.set_rdns_lookup(fake(&["host.example.net"]));
+    nb.node
+        .set_rdns_lookup(fake(&["host.example.net", "alias.example.net"]));
+    nc.node.set_rdns_lookup(fake(&["other.example.net"]));
+    // c asks more than b: the quorum of 2 is a and b.
+    nc.node.set_price_table(std::sync::Arc::new(price::Table {
+        rdns_mc: 5,
+        ..Default::default()
+    }));
+    for n in [&na, &nb, &nc] {
+        n.node.refresh_heartbeat();
+    }
+    eventually("a hears both prices", || async {
+        peephole::intel::dns::member_price(&na.node, &b.id, price::RDNS) == Some(0)
+            && peephole::intel::dns::member_price(&na.node, &c.id, price::RDNS) == Some(5)
+    })
+    .await;
+    record(&na, "198.51.100.90", "/x").await;
+    let geo: peephole::intel::SharedGeo = Default::default();
+    assert_eq!(
+        peephole::intel::rdns::buy_pass(&na.node, &geo)
+            .await
+            .unwrap(),
+        1
+    );
+    let q = "SELECT COUNT(*) FROM ip_names n JOIN ips i ON i.id = n.ip_id
+             WHERE i.ip = '198.51.100.90' AND n.source = 'rdns'";
+    for n in [&na, &nb, &nc] {
+        eventually("the names replicate", || async {
+            count(
+                n,
+                &format!("{q} AND n.name = 'host.example.net' AND n.agreed = 1 AND n.votes = 2"),
+            )
+            .await
+                == 1
+                && count(
+                    n,
+                    &format!("{q} AND n.name = 'alias.example.net' AND n.agreed = 0"),
+                )
+                .await
+                    == 1
+                && count(n, &format!("{q} AND n.name = 'other.example.net'")).await == 0
+        })
+        .await;
+    }
+    // Bought once: due again only when the source returns a day later.
+    assert_eq!(
+        peephole::intel::rdns::buy_pass(&na.node, &geo)
+            .await
+            .unwrap(),
+        0
+    );
+    // b and c do not buy a's source.
+    assert_eq!(
+        peephole::intel::rdns::buy_pass(&nb.node, &geo)
+            .await
+            .unwrap(),
+        0
+    );
+}

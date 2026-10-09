@@ -18,7 +18,7 @@ const SIG_DOMAIN_V2: &[u8] = b"peephole-repl-v2\0";
 pub const ECONOMY: u8 = 2;
 /// Kinds only protocol 7 knows. Sync serves an older member an origin's
 /// entries up to the first of these (or of a payment of [`ECONOMY`]).
-pub const ECONOMY_KINDS: &[&str] = &["reach_report"];
+pub const ECONOMY_KINDS: &[&str] = &["reach_report", "rdns_name"];
 const CREDIT_KINDS: [&str; 3] = ["credit_offer", "credit_receipt", "credit_transfer"];
 
 fn is_zero_u8(n: &u8) -> bool {
@@ -431,6 +431,19 @@ pub struct IpNameRec {
     pub build: String,
 }
 
+/// The reverse names of a source, as the quorum the recording node bought
+/// them from answered (`intel::rdns`): forward-confirmed PTR names, or why
+/// there are none. Every node tallies the answers itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RdnsRec {
+    pub uid: String,
+    pub ip: String,
+    pub at: String,
+    pub answers: Vec<(NodeId, Result<Vec<String>, String>)>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build: String,
+}
+
 /// A finished audit: a scan run again by another scanner to check a
 /// result (see `credits::audit`). Audits earn nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -501,6 +514,7 @@ pub enum Record {
     ScanResult(ScanResultRec),
     ProbeResult(ProbeResultRec),
     IpName(IpNameRec),
+    RdnsName(RdnsRec),
     Tombstone(TombstoneRec),
     IntelManifest(IntelManifestRec),
     SkipBatch(SkipBatchRec),
@@ -572,6 +586,7 @@ impl Record {
             Record::ScanResult(_) => "scan_result",
             Record::ProbeResult(_) => "probe_result",
             Record::IpName(_) => "ip_name",
+            Record::RdnsName(_) => "rdns_name",
             Record::Tombstone(_) => "tombstone",
             Record::IntelManifest(_) => "intel_manifest",
             Record::SkipBatch(_) => "skip_batch",
@@ -596,6 +611,7 @@ impl Record {
             Record::ScanResult(r) => Some(r.uid.clone()),
             Record::ProbeResult(r) => Some(r.uid.clone()),
             Record::IpName(r) => Some(r.uid.clone()),
+            Record::RdnsName(r) => Some(r.uid.clone()),
             Record::Tombstone(r) => Some(r.uid.clone()),
             Record::SkipBatch(r) => Some(r.uid.clone()),
             Record::ScanAudit(r) => Some(r.scan.uid.clone()),

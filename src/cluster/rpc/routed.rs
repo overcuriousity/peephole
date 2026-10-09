@@ -10,7 +10,12 @@ use serde_bytes::ByteBuf;
 use std::sync::Arc;
 
 /// The calls that may arrive as messages: paid answers, nothing that syncs.
-pub const ROUTED_PATHS: [&str; 3] = ["/rpc/v1/lookup", "/rpc/v1/resolve", "/rpc/v1/probe"];
+pub const ROUTED_PATHS: [&str; 4] = [
+    "/rpc/v1/lookup",
+    "/rpc/v1/resolve",
+    "/rpc/v1/probe",
+    "/rpc/v1/rdns",
+];
 /// Largest request or answer body sent as a message (outboxes are in memory).
 pub const MAX_ROUTED_BODY: usize = 1 << 20;
 
@@ -73,6 +78,10 @@ async fn answer(
             let req: crate::intel::dns::ResolveReq = cbor::decode(body)?;
             cbor::encode(&crate::intel::dns::serve_resolve(node, peer, &req).await)
         }
+        "/rpc/v1/rdns" => {
+            let req: crate::intel::rdns::RdnsReq = cbor::decode(body)?;
+            cbor::encode(&crate::intel::rdns::serve_rdns(node, peer, &req).await)
+        }
         "/rpc/v1/probe" => {
             let req: ProbeReq = cbor::decode(body)?;
             cbor::encode(&probe_answer(node, peer, &req).await)
@@ -101,6 +110,7 @@ mod tests {
         assert!(
             allowed("/rpc/v1/lookup") && allowed("/rpc/v1/resolve") && allowed("/rpc/v1/probe")
         );
+        assert!(allowed("/rpc/v1/rdns"));
         for p in [
             "/rpc/v1/push",
             "/rpc/v1/pull",

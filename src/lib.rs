@@ -194,6 +194,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // Reverse DNS of the sources, forward-confirmed, kept on this node.
     tokio::spawn(intel::rdns::run(
         store.clone(),
+        node.clone(),
+        geo.clone(),
         cfg.enrichment.reverse_dns,
         shutdown_rx.clone(),
     ));

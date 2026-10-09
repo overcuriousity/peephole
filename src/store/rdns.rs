@@ -1,11 +1,103 @@
-//! Reverse DNS names of the sources (`intel::rdns`): which addresses are
-//! due a lookup, and storing what one found. Local to this node, like
-//! nmap's PTR names: never replicated.
+//! Reverse DNS names of the sources (`intel::rdns`). In a cluster the node
+//! that recorded a source buys its names from a quorum and replicates the
+//! answers (`rdns_name`); every node tallies them. A standalone node looks
+//! up on its own.
 use super::Store;
+use crate::cluster::identity::NodeId;
 use anyhow::Result;
 
 // Most names kept of one lookup: as many as the lookup checks.
 use crate::scan::crawler::MAX_NAMES;
+
+/// Per name, how many of those that answered gave it, and whether that
+/// is more than half; most votes first. A node's second answer counts for
+/// nothing; a failure is no answer.
+pub fn tally_names(
+    answers: &[(NodeId, Result<Vec<String>, String>)],
+) -> (usize, Vec<(String, usize, bool)>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut votes: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut answered = 0;
+    for (id, a) in answers {
+        if !seen.insert(*id) {
+            continue;
+        }
+        let Ok(names) = a else { continue };
+        answered += 1;
+        let distinct: std::collections::BTreeSet<&String> = names.iter().collect();
+        for n in distinct {
+            *votes.entry(n.clone()).or_default() += 1;
+        }
+    }
+    let mut out: Vec<(String, usize, bool)> = votes
+        .into_iter()
+        .map(|(n, v)| (n, v, v * 2 > answered))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    (answered, out)
+}
+
+/// Keep a reverse-name record: every name with its votes and flag; the
+/// newest record's tally stands.
+pub(crate) async fn apply_rdns(
+    conn: &mut sqlx::SqliteConnection,
+    _ctx: super::data::Ctx<'_>,
+    r: &crate::cluster::record::RdnsRec,
+) -> Result<super::data::Effect> {
+    use super::data::Effect;
+    let ok_name = |n: &String| crate::intel::dns::valid_name(n).as_deref() == Some(n.as_str());
+    if r.uid.len() > 128
+        || r.answers.len() > crate::intel::dns::MAX_QUORUM
+        || !r
+            .ip
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(crate::net::is_scannable_target)
+        || r.answers.iter().any(|(_, a)| match a {
+            Ok(v) => v.len() > MAX_NAMES || !v.iter().all(ok_name),
+            Err(e) => e.len() > 200,
+        })
+        || chrono::NaiveDateTime::parse_from_str(&r.at, "%Y-%m-%d %H:%M:%S").is_err()
+    {
+        return Ok(Effect::Ignored);
+    }
+    if let Some(t) = super::data::erased_by(conn, &r.uid).await? {
+        return Ok(Effect::Erased(t));
+    }
+    let Some(ip_id) = super::data::ensure_ip(conn, &r.ip, None).await? else {
+        return Ok(Effect::Ignored);
+    };
+    let (answered, names) = tally_names(&r.answers);
+    for (name, votes, agreed) in names {
+        sqlx::query(
+            "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen)
+             VALUES (?1, ?2, 'rdns', ?3, ?3)
+             ON CONFLICT(ip_id, name, source) DO UPDATE
+               SET first_seen = min(first_seen, excluded.first_seen)",
+        )
+        .bind(ip_id)
+        .bind(&name)
+        .bind(&r.at)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "UPDATE ip_names SET last_seen = ?1, agreed = ?2, asked = ?3, answered = ?4,
+                    votes = ?5, record_uid = ?6
+             WHERE ip_id = ?7 AND name = ?8 AND source = 'rdns'
+               AND (last_seen < ?1 OR (last_seen = ?1 AND record_uid <= ?6))",
+        )
+        .bind(&r.at)
+        .bind(agreed)
+        .bind(r.answers.len() as i64)
+        .bind(answered as i64)
+        .bind(votes as i64)
+        .bind(&r.uid)
+        .bind(ip_id)
+        .bind(&name)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(Effect::Applied)
+}
 
 impl Store {
     /// Sources due a reverse lookup, most recently seen first: never looked
@@ -20,6 +112,34 @@ impl Store {
         .bind(limit)
         .fetch_all(&self.read)
         .await?)
+    }
+
+    /// This node's own sources due a reverse lookup: the first request held
+    /// for them is its own (`origin` is this node, or none: recorded before
+    /// it joined), never looked up or seen again a day after the last time.
+    pub async fn rdns_due_own(&self, limit: i64, me: &NodeId) -> Result<Vec<(i64, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT i.id, i.ip FROM ips i
+             WHERE i.request_count > 0
+               AND (i.rdns_at IS NULL OR i.last_seen > datetime(i.rdns_at, '+1 day'))
+               AND (SELECT r.origin IS NULL OR r.origin = ?1 FROM requests r
+                    WHERE r.ip_id = i.id ORDER BY r.id LIMIT 1)
+             ORDER BY i.last_seen DESC LIMIT ?2",
+        )
+        .bind(&me.0[..])
+        .bind(limit)
+        .fetch_all(&self.read)
+        .await?)
+    }
+
+    /// The source was looked up now (whatever was found).
+    pub async fn mark_rdns(&self, ip_id: i64) -> Result<()> {
+        sqlx::query("UPDATE ips SET rdns_at = ? WHERE id = ?")
+            .bind(super::data::now_ts())
+            .bind(ip_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Store what a lookup found (possibly nothing) and when it ran.
@@ -68,6 +188,113 @@ mod tests {
         .await
         .unwrap();
         row.id
+    }
+
+    #[test]
+    fn a_reverse_name_stands_with_more_than_half_of_those_that_answered() {
+        use crate::cluster::identity::NodeId;
+        let id = |n: u8| NodeId([n; 32]);
+        let answers = vec![
+            (id(1), Ok(vec!["host.example.net".to_string()])),
+            (
+                id(2),
+                Ok(vec!["host.example.net".into(), "alias.example.net".into()]),
+            ),
+            (id(3), Err("timed out".to_string())),
+            (id(2), Ok(vec!["alias.example.net".into()])), // a second answer counts for nothing
+        ];
+        let (answered, names) = tally_names(&answers);
+        assert_eq!(answered, 2);
+        assert_eq!(
+            names,
+            vec![
+                ("host.example.net".to_string(), 2, true),
+                ("alias.example.net".to_string(), 1, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn only_this_nodes_own_sources_are_due_for_buying() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mine = source(&s, "198.51.100.7").await;
+        let theirs = source(&s, "198.51.100.8").await;
+        let me = crate::cluster::identity::NodeId([1; 32]);
+        let other = crate::cluster::identity::NodeId([2; 32]);
+        for (ip_id, origin) in [(mine, me), (theirs, other)] {
+            sqlx::query("UPDATE requests SET origin = ? WHERE ip_id = ?")
+                .bind(&origin.0[..])
+                .bind(ip_id)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        let due: Vec<i64> = s
+            .rdns_due_own(10, &me)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(due, [mine]);
+        s.mark_rdns(mine).await.unwrap();
+        assert!(s.rdns_due_own(10, &me).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reverse_name_record_keeps_every_name_with_its_flag() {
+        use crate::cluster::identity::NodeId;
+        use crate::cluster::record::RdnsRec;
+        use crate::store::data::{Ctx, Effect};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let origin = NodeId([1; 32]);
+        let r = RdnsRec {
+            uid: format!("{}u1", origin.uid_prefix()),
+            ip: "198.51.100.9".into(),
+            at: "2026-10-09 12:00:00".into(),
+            answers: vec![
+                (NodeId([1; 32]), Ok(vec!["host.example.net".into()])),
+                (
+                    NodeId([2; 32]),
+                    Ok(vec!["host.example.net".into(), "alias.example.net".into()]),
+                ),
+            ],
+            build: String::new(),
+        };
+        let mut conn = s.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: Some(&origin),
+            hlc: 5,
+        };
+        assert_eq!(
+            apply_rdns(&mut conn, ctx, &r).await.unwrap(),
+            Effect::Applied
+        );
+        let mut bad = r.clone();
+        bad.answers = (0..10).map(|i| (NodeId([i; 32]), Ok(vec![]))).collect();
+        assert_eq!(
+            apply_rdns(&mut conn, ctx, &bad).await.unwrap(),
+            Effect::Ignored,
+            "over the quorum"
+        );
+        drop(conn);
+        let ip = s.upsert_ip("198.51.100.9".parse().unwrap()).await.unwrap();
+        let names = s.names_for_ip(ip.id).await.unwrap();
+        let got: Vec<(String, bool, i64, i64)> = names
+            .iter()
+            .map(|n| (n.name.clone(), n.agreed, n.votes, n.answered))
+            .collect();
+        assert!(
+            got.contains(&("host.example.net".into(), true, 2, 2)),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&("alias.example.net".into(), false, 1, 2)),
+            "{got:?}"
+        );
+        assert!(names.iter().all(|n| n.source == "rdns"));
     }
 
     #[tokio::test]
