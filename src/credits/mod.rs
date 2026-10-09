@@ -72,7 +72,8 @@ use std::sync::Arc;
 /// when, whose pool shares it credits, and where every credit is.
 pub struct Book {
     pub ledger: ledger::Ledger,
-    /// The pool shares this node credits (members that earn here).
+    /// The pool shares this node credits; what a member that does not earn
+    /// here still holds of its shares is burned (`ledger::run`).
     pub pool: Vec<ledger::Earned>,
     /// The verified listeners of each day the window reads.
     pub listeners: BTreeMap<u32, BTreeSet<NodeId>>,
@@ -151,12 +152,9 @@ pub async fn compute(node: &Node) -> anyhow::Result<Book> {
             (d, reach::verified(&members, &uptime, &reported, d))
         })
         .collect();
-    // A member that does not earn here is not credited here, and its
-    // share is not given to anyone else.
-    let pool: Vec<ledger::Earned> = pool::credited(&listeners, now_ms)
-        .into_iter()
-        .filter(|e| !gates.no_sales.contains(&e.node))
-        .collect();
+    // A member that does not earn here is credited all the same, so what
+    // it paid stays paid; the ledger burns what it still holds of it.
+    let pool = pool::credited(&listeners, now_ms);
     let entries = entries::since(&node.store.pool, since).await?;
     let me = node.id();
     let own_head = entries

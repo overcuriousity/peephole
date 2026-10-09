@@ -43,6 +43,13 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   status designates the scan, so a scanner charging after it could
   charge nothing for exactly the scans that were designated. Jobs of
   scanners below protocol 8 (which charge after) are not designated.
+- A member that does not earn on a node (rules or audit gates) is
+  credited its sales and pool shares there as before the gate, so the
+  members it paid keep what they received; what it still holds of that
+  income goes back to its buyers by what each paid, and the pool's part
+  is burned. Before, its receipts were dropped over the whole 8-day
+  window, so its own payments came out uncovered and third parties lost
+  credits they had already been paid.
 - A scanner owes audits (and is not funded) only once four of its
   designated scans of 7 days lack a bought audit and it bought fewer than
   60 % of them (was two and 80 %): an honest scanner whose ranked auditors

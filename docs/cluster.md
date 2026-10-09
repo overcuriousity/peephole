@@ -202,9 +202,11 @@ audits and relay leases. The supply is fixed; prices follow sales.
   round with, and a member is up in an hour when more than half of that
   hour's reports from other advertised members (not blocked or left out
   here) name it; outbound-only members write none. A member
-  that does not earn on your node gets no share there, and its share goes
-  to nobody. `peephole credits uptime` lists each member's hours.
-- **Where they go.** Nowhere: nothing burns. A credit keeps its day when
+  that does not earn on your node is credited its share there, but keeps
+  none of it (see the last of "What this cannot do"). `peephole credits
+  uptime` lists each member's hours.
+- **Where they go.** Nowhere: nothing burns but what a member that does
+  not earn here still holds of its pool shares. A credit keeps its day when
   it changes hands and is gone 7 days after it, so at most six pools are
   in circulation. Sellers keep what they charge. An offer never draws
   from a lot that dies before the offer can be charged.
@@ -317,8 +319,8 @@ audits and relay leases. The supply is fixed; prices follow sales.
   while the scan is in its 30-minute window; the auditor is paid when it
   publishes the audit, and releases stale offers. A scanner with four or
   more designated scans of 7 days unaudited and under 60 % bought is not
-  funded by arbiters, and its scan receipts count for nothing, until it
-  catches up; a designated scan with no auditor to buy from is not
+  funded by arbiters, and keeps none of what its scan receipts brought it,
+  until it catches up; a designated scan with no auditor to buy from is not
   counted. Each scanner also re-runs `[credits] audit_share` (5 %) of other
   nodes' fresh scans unpaid, own jobs and small scanners included.
 - **Relays.** An advertised node sells relay leases (`[cluster] relay_slots`,
@@ -397,9 +399,17 @@ audits and relay leases. The supply is fixed; prices follow sales.
     price, and the receipt is public. A server that declines and names a
     higher price is offered it once, up to twice its announced price;
     beyond that the next server is asked.
-  - A member that stops earning here (rules or audits) is credited no
-    pool share and paid for no sales here until it earns again; offers to
-    it lapse back to their payers.
+  - A member that stops earning here (rules or audits) keeps none of
+    its income here until it earns again: its sales (scan sales only,
+    for the audit gates) and pool shares of the last 8 days. The gates
+    are read as they stand now and applied to the whole window, but
+    whatever the member paid stays paid, so nobody it paid loses
+    anything: at the end of the count the member gives up the least of
+    its balance and that income, from its oldest credits. Of that, the
+    sales' share of the income goes back to the buyers, by what each
+    paid (odd thousandths to the lowest keys), and the pool's share is
+    burned. Members are settled in key order, so a refund to a buyer
+    that does not earn either is settled again in its turn.
 - **Upgrading.** Protocol 7 is a clean cut: the credits of protocol 7
   (payments carrying `economy` 2, signed under their own domain) are the
   only ones counted; earlier payments are kept and ignored, balances start
