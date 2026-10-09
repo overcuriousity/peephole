@@ -19,6 +19,9 @@ pub const ECONOMY: u8 = 2;
 /// Kinds only protocol 7 knows. Sync serves an older member an origin's
 /// entries up to the first of these (or of a payment of [`ECONOMY`]).
 pub const ECONOMY_KINDS: &[&str] = &["reach_report", "rdns_name"];
+/// Most answers an `ip_name` entry may carry for a node below protocol 7
+/// (its resolvers were at most 5).
+pub const OLD_MAX_ANSWERS: usize = 5;
 const CREDIT_KINDS: [&str; 3] = ["credit_offer", "credit_receipt", "credit_transfer"];
 
 fn is_zero_u8(n: &u8) -> bool {
@@ -775,6 +778,12 @@ impl WireEntry {
         if ECONOMY_KINDS.contains(&kind) {
             return true;
         }
+        if kind == "ip_name" {
+            // Older nodes ignore a name with more answers than they asked
+            // resolvers, for good: it waits until they upgrade.
+            return matches!(self.record(), Some(Record::IpName(r))
+                if r.answers.len() > OLD_MAX_ANSWERS);
+        }
         if !CREDIT_KINDS.contains(&kind) && kind != "fork_proof" {
             return false;
         }
@@ -867,6 +876,26 @@ mod tests {
             .economy(),
             0
         );
+    }
+
+    #[test]
+    fn a_name_with_more_answers_than_older_nodes_take_needs_protocol_seven() {
+        let id = crate::cluster::identity::Identity::generate().unwrap();
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        let name = |n: u8| {
+            let rec = Record::IpName(IpNameRec {
+                uid: format!("n{n}"),
+                name: "a.example".into(),
+                at: "2026-01-01 00:00:00".into(),
+                answers: (0..n).map(|i| (NodeId([i; 32]), Ok(vec![a]))).collect(),
+                build: String::new(),
+            });
+            WireEntry::sign(&id, 4, 9 << 16, &rec).unwrap()
+        };
+        assert!(!name(1).needs_economy_proto());
+        assert!(!name(OLD_MAX_ANSWERS as u8).needs_economy_proto());
+        assert!(name(OLD_MAX_ANSWERS as u8 + 1).needs_economy_proto());
+        assert!(name(9).needs_economy_proto());
     }
 
     /// Records naming addresses decode on the peers they are sent to.
