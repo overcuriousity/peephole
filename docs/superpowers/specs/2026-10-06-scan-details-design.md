@@ -1,14 +1,12 @@
 # Scan details: what a source serves and what it is called
 
-Date: 2026-10-06 · Status: draft.
+Date: 2026-10-06 · Status: sections 4 to 6 open.
 
-Takes these items from `docs/roadmap.md` (Small follow-ups) and removes
-them there when it is implemented:
-
-- Peer-observed public address (peer-observed public address: implemented by the lookup-actions plan)
-- Host keys in the export
-- ETags of scanned sources
-- Reverse DNS of every source
+Sections 1 to 3 of the original (the peer-observed public address, reverse
+DNS of every source, host keys and ETags in the export) shipped with the
+lookup-actions plan and PR #53 and were removed from this document on
+2026-10-09. What remains: the facts parsed from a scan (4), the scanner's
+own address kept out of its scans (5) and the script selection (6).
 
 ## Goal
 
@@ -47,13 +45,10 @@ The same export showed two problems, and this spec fixes them:
 Success:
 
 - The scan page and the IP page show what a source serves and what it calls
-  itself, from fields nmap writes as structure, and its forward-confirmed
-  reverse DNS name.
+  itself, from fields nmap writes as structure.
 - Scans stored before this release show the same after an upgrade.
-- A NAT'd node knows its public address from its peers, never scans or
-  blocklists it, and keeps it and its name out of new scans.
-- The export carries host keys, ETags and the facts below per scan, and a
-  `ptr` per source.
+- A node keeps its public addresses and their names out of new scans.
+- The export carries the facts below per scan.
 - New scans contain no `http-comments-displayer` output.
 - Nothing is parsed from prose, and there is no list of strings to match
   against.
@@ -85,125 +80,6 @@ stays in the raw XML.
 
 Scrubbing follows the same rule: it replaces exact values this node knows
 about itself, not patterns.
-
-## 1. Peer-observed public address
-
-### Learning it
-
-The RPC server already knows each caller's source address (`RemoteAddr`;
-`status.note_peer_ip` keeps it for the scan safety list).
-
-- The `hello` answer gains an optional field `seen_from: Option<IpAddr>`: the
-  address the caller's connection came from, as this server saw it.
-- `Hello` is a CBOR map, so a peer of an earlier build ignores the field and
-  sends none. No protocol version change.
-
-A node takes a reported address as its own **public address** when either:
-
-- a sibling reports it (same owner key: one of the operator's own nodes); or
-- two members of different owners report it.
-
-One stranger's report is not enough: a member could otherwise name an
-attacker's address, and this node would never scan it.
-
-An address must be a global unicast address, after `net::canonical`. A
-private, loopback or link-local report is the peer seeing this node over a
-LAN or a tunnel; it is ignored.
-
-Public addresses are kept in memory with when they were last confirmed. An
-address no peer has reported for 7 days is dropped. They are listed on
-System › Status as "Public address (seen by peers)", with who reported each.
-
-### What it is used for
-
-- **The safety list.** Public addresses join this node's own addresses in
-  `scan::safety` (with the interfaces, listeners, `cluster.advertise` and
-  `scan.own_addresses`). They are never scanned and never on the blocklist.
-  `scan.own_addresses` stays, for a standalone node and for a route peers
-  do not see (scans leaving by another uplink). Its doc says that peers
-  fill it in for a NAT'd node.
-- **Scrubbing scans** (section 5).
-- **Which of our addresses a request reached.** A request gains `reached`:
-  the trap's local address when that address is global. Otherwise (behind
-  NAT) it is the public address, when this node has exactly one; otherwise
-  none. Shown on the request page. A `reached` column in the dataset.
-- **Canary return host.** A decoy builds canary URLs from the request's
-  `Host`. When that is missing, `localhost` or a private address, it uses
-  the node's fixed site name today, which the client cannot reach
-  (`canary::site::return_host`). With one public address known, it uses
-  that address instead, so a canary can come back. This is a new decoy
-  version: the next `decoy_v`, recorded on the request as every version is.
-
-## 2. Reverse DNS of every source
-
-Each node looks up the **forward-confirmed PTR name** of every source it
-records: the PTR record of the IP, then the name's A/AAAA records, kept only
-when they contain the IP. This is the lookup `scan::crawler` already does;
-it moves into a shared module both use, with the crawler cache.
-
-- **When:** after a request from an IP is recorded, when its last check is
-  older than 24 hours (refreshed when the IP returns). The lookup runs in
-  the background, at most 8 at once, and never delays recording. A failed
-  or timed-out lookup is retried after the next request, at most once an
-  hour.
-- **Stored:** on `ips`: `ptr TEXT` (the confirmed name, or NULL) and
-  `ptr_checked_at`. Local, not replicated. Every node looks up for itself,
-  as with the crawler check, so two nodes can briefly disagree.
-- **Shown:**
-  - on the IP page, under the address;
-  - as a filter in the IP directory (admin; a typed name part, matched
-    against `ptr`);
-  - as a `ptr` column in the dataset.
-
-  Not on public pages.
-- **Cost:** the reverse zone's operator sees a query from this node's
-  resolver, as it already does for every source the crawler check looks at.
-
-nmap's own `<hostnames>` PTR names are not parsed: this lookup covers every
-source, scanned or not, and confirms the name.
-
-## 3. Host keys, ETags and scan facts in the export
-
-### Host keys in the export
-
-Scans in the export gain `host_keys`: the rows `store::hostkeys` derives
-for that scan, as `{kind, port, fingerprint, detail}`. This covers SSH host
-keys, certificates, JA4X, HASSH, and ETags below. `docs/dataset.md`
-documents the kinds. A dataset user then never parses the XML for them.
-
-### ETags of scanned sources
-
-nmap's `http-headers` (in `discovery` and `safe`) runs at levels 3 and 4,
-so each HTTP port's response headers are in the stored XML. **Level 2 adds
-it to its named scripts**: one request per HTTP port nmap already found
-open, `safe`, in the spirit of `IDENTITY_SCRIPTS`.
-
-**How the ETag is read.** `http-headers` writes no structured output; its
-`output` is the server's header block, one header per line. That is the
-single exception to the rule above, kept narrow:
-
-- the output is read as HTTP header lines (`name: value`, leading spaces
-  dropped);
-- a line whose field name is `ETag`, compared case-insensitively (RFC 9110
-  field names), gives the value. The first such line wins.
-- nothing else in that output is read, and no other script's output is
-  read this way. A line that is not `name: value` is skipped.
-
-The value is kept as sent, quotes and `W/` included, and cut at 256 bytes.
-
-**Where it goes.** The ETag becomes a `host_keys` kind (`http-etag`), derived
-like the others and reparsed for old scans through `keys_parsed`. It is a
-software-like kind like JA4X and HASSH (`identifies()` is false): a shared
-ETag means the same file with the same mtime and size. That can be one kit
-on many hosts, but a distro's default page shares it across thousands. So it
-gets a Links item page like JA4X, a soft edge in the graph, and is never
-shown as a host identity. It sits beside the host keys on the IP and scan
-pages.
-
-### Scan facts
-
-The fields below go into the export too: scans gain `facts`, as `{port,
-proto, kind, value}`.
 
 ## 4. What is parsed from the scan
 
@@ -263,9 +139,7 @@ One migration, the next free number:
   - `smb.server`, `smb.domain`, `smb.fqdn`, `smb.domain_dns`,
     `smb.forest_dns`, `smb.workgroup`, `smb.os`, `smb.lanmanager`.
 - `scans` gains `facts_parsed INTEGER NOT NULL DEFAULT 0`, like
-  `keys_parsed`.
-- `ips` gains `ptr` and `ptr_checked_at` (section 2).
-- `requests` gains `reached` (section 1).
+  `keys_parsed`, and `scrubbed INTEGER NOT NULL DEFAULT 0` (section 5).
 
 Facts are **derived, never replicated.** Each node derives them from the
 scan's raw XML when it stores the scan, on the same path as host keys
@@ -295,7 +169,6 @@ Limits:
 
 **IP page.**
 
-- The reverse DNS name sits under the address.
 - Each counter-scan's heading gains a one-line summary of what the source
   serves, taken from the newest scan that has it: distinct titles and
   servers, at most three, each with its port (`8443 PentAGI · 9000 MinIO ·
@@ -312,10 +185,11 @@ ETag links anywhere (its Links page). Nothing is a URL the page fetches:
 ### Scrubbing
 
 A node's **own addresses** for this purpose are the safety list's own
-addresses (section 1): interfaces, listeners, `cluster.advertise`,
-`scan.own_addresses` and the peer-observed public addresses. Its **own
-names** are the forward-confirmed PTR names of the global ones, from the
-lookup in section 2, refreshed daily.
+addresses (`scan::safety::Safety`): interfaces, listeners,
+`cluster.advertise`, `scan.own_addresses` and the peer-observed public
+addresses. Its **own names** are the forward-confirmed PTR names of the
+global ones, looked up as the reverse DNS of sources is
+(`scan::crawler::confirmed_names`), refreshed daily.
 
 Before a scanner signs a `scan_result` or `scan_audit`, it replaces in the
 raw XML each of the following with `[scanner]`:
@@ -368,48 +242,21 @@ binary files: unbounded text that is of no use for analysis. The other
 large scripts in the data (`fingerprint-strings`, `port-states`,
 `http-useragent-tester`) are a few KB each and stay.
 
-Level 2: `profiles::IDENTITY_SCRIPTS` gains `http-headers` (section 3).
-
-Both change what "built-in arguments" means for lookup credits
+This changes what "built-in arguments" means for lookup credits
 (`credits::earn`: a scan run with other arguments earns no scanner share).
-The old lists for levels 2, 3 and 4 go into `profiles::ACCEPTED`, as that
-constant's doc says, and are removed two releases later. A scanner on the
+The old lists for levels 3 and 4 go into `profiles::ACCEPTED`, as that
+constant's doc says (level 2's is there already), and are removed two
+releases later. A scanner on the
 previous release keeps its earnings during a rolling upgrade.
 `scan.level_argv` overrides are untouched.
 
 ## Tests
 
-- **Peer-observed address:**
-  - one stranger's `seen_from` is not taken;
-  - one sibling's is, and so are two members of different owners;
-  - a private or loopback report is ignored;
-  - a `hello` without the field (an older peer) changes nothing;
-  - an address unconfirmed for 7 days is dropped;
-  - a taken address is on the safety list: never scanned, never
-    blocklisted.
-- **`reached`:** a global local address; behind NAT with one public
-  address; with none.
-- **Canary return host:** a missing or `localhost` Host with a public
-  address known gives that address, with the new `decoy_v`; without one,
-  the site name as before.
-- **Reverse DNS:**
-  - a PTR whose name resolves back is stored;
-  - one that does not is NULL;
-  - a timeout does not delay recording;
-  - the 24-hour refresh and the hourly retry.
 - **Parsing**, from XML fixtures cut from real scans (anonymised):
   - every field in section 4, present and absent;
   - a script with only `output` text yields nothing;
   - `http-grep` and `fcrdns` yield nothing;
   - the per-scan cap and the value cap.
-- **ETag:**
-  - from `http-headers` output, case-insensitive;
-  - the first of two lines wins;
-  - a line without `name: value` is skipped;
-  - quotes and `W/` are kept;
-  - the 256-byte cut;
-  - old scans gain it through `keys_parsed`;
-  - `identifies()` is false.
 - **Backfill:** a scan stored before the migration gets its facts and
   `facts_parsed = 1`, once. Two nodes holding the same scan derive the
   same rows.
@@ -424,9 +271,9 @@ previous release keeps its earnings during a rolling upgrade.
     old scans.
 - **`profiles`:**
   - the new built-in lists are `args_ok`;
-  - the old ones for levels 2 to 4 are too, through `ACCEPTED`;
+  - the old ones for levels 3 and 4 are too, through `ACCEPTED`;
   - a list with `http-comments-displayer` added back by hand is not.
-- **Export:** `host_keys`, `facts`, `ptr` and `reached` are present.
+- **Export:** `facts`, the port details and `scrubbed` are present.
 
 ## Not in this spec
 
