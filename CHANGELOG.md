@@ -37,6 +37,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   the top 1000) open no longer agrees with whatever the audit finds. The
   same host key still settles it, unless the scan claims more than twice
   as many open ports as the audit found.
+- A scanner owes audits (and is not funded) only once four of its
+  designated scans of 7 days lack a bought audit and it bought fewer than
+  60 % of them (was two and 80 %): an honest scanner whose ranked auditors
+  are all offline or decline now and then is not cut off.
 
 ### Fixed
 

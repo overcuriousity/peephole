@@ -306,8 +306,8 @@ audits and relay leases. The supply is fixed; prices follow sales.
   auditor declines an audit it would not run, and the scanner asks the
   next; one that names a higher price is offered it once), and tries again
   while the scan is in its 30-minute window; the auditor is paid when it
-  publishes the audit, and releases stale offers. A scanner with two or
-  more designated scans of 7 days unaudited and under 80 % bought is not
+  publishes the audit, and releases stale offers. A scanner with four or
+  more designated scans of 7 days unaudited and under 60 % bought is not
   funded by arbiters, and its scan receipts count for nothing, until it
   catches up; a designated scan with no auditor to buy from is not
   counted. Each scanner also re-runs `[credits] audit_share` (5 %) of other

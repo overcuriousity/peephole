@@ -7669,7 +7669,7 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
         })
     })
     .await;
-    // Three designated scans of a's jobs by s, a day old, none audited.
+    // Four designated scans of a's jobs by s, a day old, none audited.
     let now = now_ms();
     let ip = na
         .store
@@ -7697,7 +7697,7 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
         .bind(ip.id).bind(format!("owed-scan-{found}")).bind(&s.id.0[..]).bind(&job).bind(peephole::cluster::hlc::to_db(done))
         .execute(&na.store.pool).await.unwrap();
         found += 1;
-        if found == 3 {
+        if found == 4 {
             break;
         }
     }
@@ -7706,11 +7706,11 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
     // credits could not buy one.
     let book = peephole::credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.standing(&s.id).audits_owed, None);
-    for i in 0..3 {
+    for i in 0..4 {
         paid_job(&[&na], a.id, s.id, &format!("owed-job-{i}"), 1_000_000 + i).await;
     }
     let book = peephole::credits::book_fresh(&na.node).await.unwrap();
-    assert_eq!(book.standing(&s.id).audits_owed, Some((0, 3)));
+    assert_eq!(book.standing(&s.id).audits_owed, Some((0, 4)));
     enqueue(&na, "198.51.100.62", 1).await;
     tokio::time::sleep(Duration::from_secs(8)).await;
     assert_eq!(

@@ -487,10 +487,12 @@ pub fn auditors(
 }
 
 /// `(bought, designated)` when a scanner's designated scans lack a bought
-/// audit twice or more and it bought fewer than 80 % of them.
+/// audit four times or more and it bought fewer than 60 % of them. An
+/// honest scanner misses one now and then (every auditor ranked for a scan
+/// may be offline or decline it); one that skips its audits misses most.
 pub fn owes(designated: u32, bought: u32) -> Option<(u32, u32)> {
     let missing = designated.saturating_sub(bought);
-    (missing >= 2 && u64::from(bought) * 5 < u64::from(designated) * 4)
+    (missing >= 4 && u64::from(bought) * 5 < u64::from(designated) * 3)
         .then_some((bought, designated))
 }
 
@@ -1151,13 +1153,14 @@ mod tests {
     }
 
     #[test]
-    fn a_scanner_owes_when_two_designated_scans_lack_an_audit_and_it_bought_under_80_percent() {
+    fn a_scanner_owes_when_four_designated_scans_lack_an_audit_and_it_bought_under_60_percent() {
         assert_eq!(owes(0, 0), None);
-        assert_eq!(owes(1, 0), None, "one miss is forgiven");
-        assert_eq!(owes(2, 0), Some((0, 2)));
-        assert_eq!(owes(10, 8), None, "80 %");
-        assert_eq!(owes(10, 7), Some((7, 10)));
-        assert_eq!(owes(20, 17), None, "three misses, but 85 %");
+        assert_eq!(owes(3, 0), None, "three misses are forgiven");
+        assert_eq!(owes(4, 0), Some((0, 4)));
+        assert_eq!(owes(10, 6), None, "60 %");
+        assert_eq!(owes(10, 5), Some((5, 10)));
+        assert_eq!(owes(20, 13), None, "seven misses, but 65 %");
+        assert_eq!(owes(12, 7), Some((7, 12)), "58 %");
     }
 
     #[test]
@@ -1256,7 +1259,7 @@ mod tests {
         }
         let got = obligations(pool, &members, now).await.unwrap();
         assert_eq!(got.get(&s), Some(&(3, 1)), "{got:?}");
-        assert_eq!(owes(3, 1), Some((1, 3)));
+        assert_eq!(owes(3, 1), None, "two misses: not owed yet");
         // A receipt of nothing for the same offer came first: the ledger
         // counts that one, so the audit was not bought.
         sqlx::query(
