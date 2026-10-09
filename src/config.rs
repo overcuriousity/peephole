@@ -558,6 +558,23 @@ impl ScanConfig {
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| self.nmap_path.clone())
     }
+
+    /// The first line of `nmap --version`, or why nmap cannot run: the one
+    /// check of whether this node can scan.
+    pub async fn nmap_version(&self) -> anyhow::Result<String> {
+        let nmap = self.nmap();
+        let out = tokio::process::Command::new(&nmap)
+            .arg("--version")
+            .output()
+            .await
+            .with_context(|| format!("nmap not found at {nmap} — install nmap"))?;
+        anyhow::ensure!(out.status.success(), "nmap --version failed");
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("nmap")
+            .to_string())
+    }
 }
 
 pub const MIN_RATE: u32 = 50;

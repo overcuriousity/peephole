@@ -88,6 +88,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   warning. `peephole settings reset` refuses a reset that would leave
   another saved setting unusable, and a change that would bring back one
   ignored so far.
+- A background task that panicked (the public-page publisher, the intel
+  scheduler, enrichment, the cluster's loops, …) stopped silently while the
+  node went on reporting healthy. Such a panic now stops peephole with an
+  error, and systemd starts it again.
 
 ## [0.10.0] - 2026-10-09
 

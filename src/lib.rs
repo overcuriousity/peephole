@@ -47,19 +47,7 @@ pub async fn check_config(config_path: &std::path::Path) -> Result<(config::Conf
         &rules.fingerprint()[..12]
     ));
     if cfg.roles.scanner {
-        let nmap = cfg.scan.nmap();
-        let out = tokio::process::Command::new(&nmap)
-            .arg("--version")
-            .output()
-            .await
-            .with_context(|| format!("nmap not found at {nmap} — install nmap"))?;
-        anyhow::ensure!(out.status.success(), "nmap --version failed");
-        let nmap_line = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or("nmap")
-            .to_string();
-        summary.push_str(&format!(", {nmap_line}"));
+        summary.push_str(&format!(", {}", cfg.scan.nmap_version().await?));
     }
     if cfg.cluster.is_some() {
         let path = cfg.node_key_path();
@@ -175,16 +163,22 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         None => store.local(),
     };
 
+    // Tasks beside the roles; one that panics stops the node (below).
+    let mut background = Background::default();
+
     // Daily intel: the scheduler refreshes the files and swaps the shared
     // state after each successful fetch, so the trap sees fresh data.
-    tokio::spawn(intel::run_scheduler(
-        recorder.clone(),
-        cfg.clone(),
-        geo.clone(),
-        tor.clone(),
-        rdap.clone(),
-        shutdown_rx.clone(),
-    ));
+    background.spawn(
+        "intel scheduler",
+        intel::run_scheduler(
+            recorder.clone(),
+            cfg.clone(),
+            geo.clone(),
+            tor.clone(),
+            rdap.clone(),
+            shutdown_rx.clone(),
+        ),
+    );
 
     // Results for IPs this or other nodes recorded without them.
     let providers = intel::providers(&cfg, &store, &geo, &tor, &rdap);
@@ -196,19 +190,21 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             cfg.enrichment.offer_per_day,
         ));
     }
-    tokio::spawn(intel::enrich_loop(
-        recorder.clone(),
-        providers.clone(),
-        shutdown_rx.clone(),
-    ));
+    background.spawn(
+        "enrichment",
+        intel::enrich_loop(recorder.clone(), providers.clone(), shutdown_rx.clone()),
+    );
     // Reverse DNS of the sources, forward-confirmed, kept on this node.
-    tokio::spawn(intel::rdns::run(
-        store.clone(),
-        node.clone(),
-        geo.clone(),
-        cfg.enrichment.reverse_dns,
-        shutdown_rx.clone(),
-    ));
+    background.spawn(
+        "reverse dns",
+        intel::rdns::run(
+            store.clone(),
+            node.clone(),
+            geo.clone(),
+            cfg.enrichment.reverse_dns,
+            shutdown_rx.clone(),
+        ),
+    );
 
     // Observational probes, for members (paid) and this node's admin.
     let prober = (cfg.roles.scanner && cfg.probe.enabled).then(|| {
@@ -224,82 +220,48 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // Retention on a standalone node: delete records older than the window.
     // A cluster node lowers its history floor instead (`cluster::history`).
     if cfg.cluster.is_none() && cfg.retention_days > 0 {
-        tokio::spawn(run_retention(
-            recorder.clone(),
-            cfg.retention_days,
-            shutdown_rx.clone(),
-        ));
+        background.spawn(
+            "retention",
+            run_retention(recorder.clone(), cfg.retention_days, shutdown_rx.clone()),
+        );
     }
 
     // Housekeeping on every node: expired sessions and ceremonies, planner
     // statistics, freed pages; local tombstones on a standalone node.
-    tokio::spawn(store::maintenance::run(
-        store.clone(),
-        cfg.cluster.is_none(),
-        shutdown_rx.clone(),
-    ));
+    background.spawn(
+        "maintenance",
+        store::maintenance::run(store.clone(), cfg.cluster.is_none(), shutdown_rx.clone()),
+    );
 
     // Release delayed requests to the public pages.
-    tokio::spawn(store::publish::run(store.clone(), shutdown_rx.clone()));
+    background.spawn(
+        "publisher",
+        store::publish::run(store.clone(), shutdown_rx.clone()),
+    );
 
-    // Canaries and tokens of rows stored before this build (or by an older
-    // tokenizer); new rows are derived as they are written.
-    tokio::spawn({
+    // What rows and scans stored before this build lack; new ones get it
+    // as written. Canaries and tokens (or by an older tokenizer), host keys
+    // and facts of scans read by an older parser (HOSTKEYS_V, FACTS_V),
+    // JA4H, User-Agent.
+    background.backfill("canaries", "parsed stored rows", {
         let pool = store.pool.clone();
-        async move {
-            match store::canaries::backfill(&pool).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(rows = n, "canaries: parsed stored rows"),
-                Err(e) => tracing::warn!(error = %e, "canaries: backfill failed"),
-            }
-        }
+        async move { store::canaries::backfill(&pool).await }
     });
-    // Host keys of scans read by an older parser (HOSTKEYS_V); new scans
-    // are read as stored.
-    tokio::spawn({
+    background.backfill("host keys", "read stored scans again", {
         let pool = store.pool.clone();
-        async move {
-            match store::hostkeys::backfill(&pool, scan::hostkeys::HOSTKEYS_V).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(scans = n, "host keys: read stored scans again"),
-                Err(e) => tracing::warn!(error = %e, "host keys: backfill failed"),
-            }
-        }
+        async move { store::hostkeys::backfill(&pool, scan::hostkeys::HOSTKEYS_V).await }
     });
-    // Facts of scans stored before this build or read by an older parser
-    // (FACTS_V); new scans are read as stored.
-    tokio::spawn({
+    background.backfill("scan facts", "read stored scans", {
         let pool = store.pool.clone();
-        async move {
-            match store::facts::backfill(&pool, scan::facts::FACTS_V).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(scans = n, "scan facts: read stored scans"),
-                Err(e) => tracing::warn!(error = %e, "scan facts: backfill failed"),
-            }
-        }
+        async move { store::facts::backfill(&pool, scan::facts::FACTS_V).await }
     });
-    // JA4H of rows stored before this build; new rows get it as written.
-    tokio::spawn({
+    background.backfill("ja4h", "derived stored rows", {
         let pool = store.pool.clone();
-        async move {
-            match store::ja4h::backfill(&pool).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(rows = n, "ja4h: derived stored rows"),
-                Err(e) => tracing::warn!(error = %e, "ja4h: backfill failed"),
-            }
-        }
+        async move { store::ja4h::backfill(&pool).await }
     });
-
-    // User-Agent of rows stored before this build; new rows get it as written.
-    tokio::spawn({
+    background.backfill("user-agent", "derived stored rows", {
         let pool = store.pool.clone();
-        async move {
-            match store::useragent::backfill(&pool).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(rows = n, "user-agent: derived stored rows"),
-                Err(e) => tracing::warn!(error = %e, "user-agent: backfill failed"),
-            }
-        }
+        async move { store::useragent::backfill(&pool).await }
     });
 
     // Queue change notifications: trap + workers publish, admin SSE subscribes.
@@ -307,11 +269,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
 
     // Runtime settings: config defaults, overridden from the admin UI, the
     // CLI or the owner.
-    let nmap_ok = tokio::process::Command::new(cfg.scan.nmap())
-        .arg("--version")
-        .output()
-        .await
-        .is_ok_and(|o| o.status.success());
+    let nmap_ok = cfg.scan.nmap_version().await.is_ok();
     let settings =
         settings::Settings::load(&store, &cfg, settings::Prereqs::from_config(&cfg, nmap_ok))
             .await?;
@@ -325,29 +283,34 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         cluster::remote::serve(node, settings.clone());
         cluster::owner::fleet::serve(node);
         cluster::owner::cmd::serve(node, settings.clone());
-        tokio::spawn(cluster::owner::fleet::run(
-            node.clone(),
-            shutdown_rx.clone(),
-        ));
-        tokio::spawn(cluster::seal::run(node.clone(), shutdown_rx.clone()));
-        tokio::spawn(credits::run(node.clone(), shutdown_rx.clone()));
+        background.spawn(
+            "fleet",
+            cluster::owner::fleet::run(node.clone(), shutdown_rx.clone()),
+        );
+        background.spawn(
+            "seal",
+            cluster::seal::run(node.clone(), shutdown_rx.clone()),
+        );
+        background.spawn("credits", credits::run(node.clone(), shutdown_rx.clone()));
         // Does nothing unless this node is outbound-only.
-        tokio::spawn(cluster::relay::run(node.clone(), shutdown_rx.clone()));
+        background.spawn(
+            "relay",
+            cluster::relay::run(node.clone(), shutdown_rx.clone()),
+        );
         credits::fleet::serve(node);
         credits::audit::serve(node);
         // Does nothing unless this node currently scans.
-        tokio::spawn(scan::arbiter::takeover_loop(
-            node.clone(),
-            shutdown_rx.clone(),
-        ));
+        background.spawn(
+            "takeover",
+            scan::arbiter::takeover_loop(node.clone(), shutdown_rx.clone()),
+        );
         // Serve at the kept prices until the first refresh steps them.
         credits::price::load_kept(node).await?;
         cluster::start(node.clone(), shutdown_rx.clone()).await?;
-        tokio::spawn(forward_job_events(
-            node.clone(),
-            notifier.clone(),
-            shutdown_rx.clone(),
-        ));
+        background.spawn(
+            "job events",
+            forward_job_events(node.clone(), notifier.clone(), shutdown_rx.clone()),
+        );
     }
 
     // Roles run under a supervisor that starts and stops them when the
@@ -374,11 +337,76 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // Listeners are bound: `systemctl start` (Type=notify) returns now.
     sd_notify::ready();
     let supervisor = tokio::spawn(roles.supervise(running, shutdown_rx.clone()));
-    shutdown_signal().await;
-    info!("shutting down");
+    // A task that panicked stops the node with an error: systemd starts it
+    // again (Restart=on-failure), where it would otherwise go on reporting
+    // healthy without, say, its publisher.
+    let failed = tokio::select! {
+        _ = shutdown_signal() => None,
+        e = background.panicked() => Some(e),
+    };
+    match &failed {
+        None => info!("shutting down"),
+        Some(e) => error!("{e}; shutting down"),
+    }
     let _ = shutdown_tx.send(true);
     let _ = supervisor.await;
-    Ok(())
+    failed.map_or(Ok(()), Err)
+}
+
+/// Tasks beside the roles, kept so that one that panics is noticed.
+#[derive(Default)]
+struct Background {
+    tasks: tokio::task::JoinSet<()>,
+    /// Each task's name, and whether its panic stops the node.
+    names: std::collections::HashMap<tokio::task::Id, (&'static str, bool)>,
+}
+
+impl Background {
+    /// A task that runs until shutdown, or ends by itself when it has
+    /// nothing to do (switched off). If it panics, the node stops.
+    fn spawn(&mut self, name: &'static str, task: impl Future<Output = ()> + Send + 'static) {
+        let id = self.tasks.spawn(task).id();
+        self.names.insert(id, (name, true));
+    }
+
+    /// A pass over stored rows that ends when done, logged as `name: done`.
+    /// A failure or panic is logged only: the node works without it, and
+    /// the next start tries again.
+    fn backfill(
+        &mut self,
+        name: &'static str,
+        done: &'static str,
+        pass: impl Future<Output = Result<u64>> + Send + 'static,
+    ) {
+        let id = self
+            .tasks
+            .spawn(async move {
+                match pass.await {
+                    Ok(0) => {}
+                    Ok(n) => info!(count = n, "{name}: {done}"),
+                    Err(e) => warn!(error = %e, "{name}: backfill failed"),
+                }
+            })
+            .id();
+        self.names.insert(id, (name, false));
+    }
+
+    /// The first panic that stops the node; never returns without one.
+    async fn panicked(&mut self) -> anyhow::Error {
+        while let Some(ended) = self.tasks.join_next_with_id().await {
+            let (id, panic) = match ended {
+                Ok((id, ())) => (id, None),
+                Err(e) => (e.id(), e.is_panic().then_some(e)),
+            };
+            let (name, fatal) = self.names.remove(&id).unwrap_or(("?", true));
+            match panic {
+                Some(e) if fatal => return anyhow::anyhow!("background task {name} panicked: {e}"),
+                Some(e) => error!(task = name, error = %e, "backfill panicked"),
+                None => {}
+            }
+        }
+        std::future::pending().await
+    }
 }
 
 /// How often the daemon re-reads settings another process (the CLI) may
@@ -867,6 +895,27 @@ mod tests {
         assert!(geolite_loads(&cfg("")));
         assert!(!geolite_loads(&cfg(cluster)));
         assert!(geolite_loads(&cfg(&format!("{maxmind}{cluster}"))));
+    }
+
+    /// A background task that panics is named and stops the node; one that
+    /// ends by itself (switched off) does not, nor does a failed backfill.
+    #[tokio::test]
+    async fn a_panicking_background_task_is_fatal() {
+        let soon = std::time::Duration::from_millis(300);
+        let mut bg = Background::default();
+        bg.spawn("reverse dns", async {});
+        bg.backfill("canaries", "parsed stored rows", async {
+            panic!("backfill bug")
+        });
+        bg.backfill("ja4h", "derived stored rows", async {
+            anyhow::bail!("no table")
+        });
+        assert!(tokio::time::timeout(soon, bg.panicked()).await.is_err());
+        bg.spawn("publisher", async { panic!("publisher bug") });
+        let e = tokio::time::timeout(soon, bg.panicked())
+            .await
+            .expect("the panic is noticed");
+        assert!(e.to_string().contains("publisher"), "{e}");
     }
 
     #[test]
