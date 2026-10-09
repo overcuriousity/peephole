@@ -95,6 +95,7 @@ mod tests {
             s.finish_job(
                 job,
                 Some(&ScanResult {
+                    scrubbed: 0,
                     os_guess: Some("Linux".into()),
                     raw_xml: b"<nmaprun/>".to_vec(),
                     ports: vec![PortResult {

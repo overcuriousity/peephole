@@ -330,6 +330,11 @@ pub struct ScanResultRec {
     /// left out when unset, like every field added later.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub build: String,
+    /// How many times the scanner replaced its own address or name in
+    /// `raw_xml` before signing (`scan::scrub`); left out when 0, so older
+    /// peers see nothing new.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub scrubbed: u16,
 }
 
 /// One port of an observational probe.
@@ -371,6 +376,10 @@ pub struct ProbeResultRec {
 }
 
 fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_u16(n: &u16) -> bool {
     *n == 0
 }
 

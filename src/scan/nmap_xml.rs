@@ -17,6 +17,9 @@ pub struct ScanResult {
     pub os_guess: Option<String>,
     pub ports: Vec<PortResult>,
     pub raw_xml: Vec<u8>,
+    /// How many times the scanner replaced its own address or name in
+    /// `raw_xml` (`scan::scrub`); 0 until it has.
+    pub scrubbed: u16,
 }
 
 pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
@@ -116,6 +119,7 @@ pub fn parse_nmap_xml(xml: &[u8]) -> Result<ScanResult> {
         os_guess,
         ports,
         raw_xml: xml.to_vec(),
+        scrubbed: 0,
     })
 }
 

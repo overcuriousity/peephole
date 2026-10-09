@@ -22,6 +22,9 @@ pub struct ScanSummary {
     pub audit_of: Option<String>,
     /// How the audit compares with the scan it checks, once compared here.
     pub audit_result: Option<String>,
+    /// How many times the scanner removed its own address or name from
+    /// the XML.
+    pub scrubbed: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -173,7 +176,7 @@ impl RequestDetail {
 
 const SCAN_SELECT: &str =
     "SELECT s.id, s.ip_id, i.ip, s.level, s.started_at, s.finished_at, s.os_guess,
-            s.audit_of, s.audit_result,
+            s.audit_of, s.audit_result, s.scrubbed,
             (SELECT COUNT(*) FROM ports p WHERE p.scan_id = s.id AND p.state = 'open') AS open_ports,
             (SELECT name FROM members m WHERE m.id = s.origin) AS node
      FROM scans s JOIN ips i ON s.ip_id = i.id";
@@ -635,6 +638,7 @@ mod tests {
         s.finish_job(
             job,
             Some(&ScanResult {
+                scrubbed: 0,
                 os_guess: Some("Linux 5".into()),
                 raw_xml: b"<nmaprun/>".to_vec(),
                 ports: vec![

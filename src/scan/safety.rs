@@ -17,12 +17,13 @@
 //! so an operator can spot the shielding.
 use crate::cluster::Node;
 use crate::config::Config;
+use crate::scan::crawler::{Forward, confirmed_names, system_forward, system_resolver};
 use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Rebuild the address sets this often.
 const REFRESH: Duration = Duration::from_secs(300);
@@ -35,6 +36,11 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 const OBSERVED_KEEP: Duration = Duration::from_secs(7 * 24 * 3600);
 /// ... or, beyond this many, oldest first.
 const OBSERVED_MAX: usize = 4096;
+/// Own names are looked up again this long after the last successful
+/// lookup ...
+const NAMES_REFRESH: Duration = Duration::from_secs(24 * 3600);
+/// ... for at most this many own global addresses.
+const NAMES_MAX_ADDRS: usize = 8;
 
 pub struct Safety {
     /// Host names (`host:port`) resolved before, kept when a lookup fails.
@@ -49,6 +55,13 @@ pub struct Safety {
     built: Option<Instant>,
     retry: bool,
     lists: Lists,
+    /// Where own names are looked up: the system resolver and a forward
+    /// lookup; None when reverse DNS is off (`enrichment.reverse_dns`),
+    /// no nameserver is configured, or in tests (set with `set_dns`).
+    dns: Option<(SocketAddr, Forward)>,
+    /// The forward-confirmed PTR names of this node's global addresses.
+    own_names: Vec<String>,
+    names_at: Option<Instant>,
 }
 
 impl Safety {
@@ -61,6 +74,12 @@ impl Safety {
             built: None,
             retry: false,
             lists: Lists::new(cfg.scan.safety.never_scan_dir.clone()),
+            dns: (!cfg!(test) && cfg.enrichment.reverse_dns)
+                .then(system_resolver)
+                .flatten()
+                .map(|r| (r, system_forward())),
+            own_names: vec![],
+            names_at: None,
         }
     }
 
@@ -137,6 +156,79 @@ impl Safety {
             self.add_public(&node.status.public_addresses());
         }
         self.published = published;
+        self.refresh_names().await;
+    }
+
+    /// This node's global addresses: the ones a scanned host can see.
+    pub fn own_global(&self) -> Vec<IpAddr> {
+        let mut v: Vec<IpAddr> = self
+            .own
+            .iter()
+            .copied()
+            .filter(|ip| crate::net::is_scannable_target(*ip))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Whether `ip` is one of this node's own addresses.
+    pub fn is_own(&self, ip: &IpAddr) -> bool {
+        self.own.contains(&crate::net::canonical(*ip))
+    }
+
+    /// The forward-confirmed PTR names of this node's global addresses.
+    pub fn own_names(&self) -> Vec<String> {
+        self.own_names.clone()
+    }
+
+    /// Addresses and names to scrub from served scans.
+    pub fn own_identity(&self) -> crate::scan::scrub::Own {
+        crate::scan::scrub::Own {
+            addrs: self.own_global(),
+            names: self.own_names(),
+        }
+    }
+
+    /// Look own names up with `resolver` and `forward` instead of the
+    /// system's, at the next refresh.
+    #[cfg(test)]
+    pub(crate) fn set_dns(&mut self, resolver: SocketAddr, forward: Forward) {
+        self.dns = Some((resolver, forward));
+        self.names_at = None;
+    }
+
+    /// The forward-confirmed PTR names of the own global addresses, once a
+    /// day. A failed lookup keeps the previous names and is tried again at
+    /// the next refresh.
+    async fn refresh_names(&mut self) {
+        let Some((resolver, forward)) = self.dns.clone() else {
+            return;
+        };
+        if self.names_at.is_some_and(|t| t.elapsed() < NAMES_REFRESH) {
+            return;
+        }
+        let mut names: Vec<String> = vec![];
+        let mut failed = false;
+        for ip in self.own_global().into_iter().take(NAMES_MAX_ADDRS) {
+            match confirmed_names(resolver, &forward, ip).await {
+                Ok(found) => {
+                    for n in found {
+                        if !names.contains(&n) {
+                            names.push(n);
+                        }
+                    }
+                }
+                Err(e) => {
+                    failed = true;
+                    debug!(%ip, error = %e, "own reverse DNS failed; keeping the previous names");
+                }
+            }
+        }
+        if failed && names.is_empty() {
+            return;
+        }
+        self.own_names = names;
+        self.names_at = Some(Instant::now());
     }
 
     /// Count `addrs` (this node's peer-observed public addresses) as its own.
@@ -548,6 +640,52 @@ mod tests {
         assert!(s.refuses(&"203.0.113.81".parse().unwrap()).is_none());
         // Kept out of the blocklist's networks too.
         assert!(s.overlaps(&"198.51.100.0/24".parse().unwrap()));
+    }
+
+    fn cfg_with(extra: &str) -> Config {
+        let dir = tempfile::tempdir().unwrap();
+        toml::from_str(&format!(
+            "database_path = \"{d}/t.db\"\ndata_dir = \"{d}\"\n{extra}",
+            d = dir.path().display()
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn own_names_are_the_forward_confirmed_ptr_of_own_global_addresses() {
+        use crate::scan::crawler::testing::fake_resolver;
+        use std::sync::{Arc, Mutex};
+        let cfg = cfg_with("[scan]\nown_addresses = [\"198.51.100.5\", \"10.0.0.5\"]\n");
+        let mut s = Safety::new(&cfg);
+        assert!(s.own_names().is_empty());
+        let answer = Arc::new(Mutex::new(Some("scanner-5.example.net".to_string())));
+        let resolver = fake_resolver(answer.clone()).await;
+        let forward: crate::scan::crawler::Forward = Arc::new(|name: String| {
+            Box::pin(async move {
+                if name.trim_end_matches('.') == "scanner-5.example.net" {
+                    Ok(vec!["198.51.100.5".parse().unwrap()])
+                } else {
+                    Err(std::io::Error::other("no such host"))
+                }
+            })
+        });
+        s.set_dns(resolver, forward);
+        s.refresh(&cfg, None).await;
+        assert!(s.own_global().contains(&"198.51.100.5".parse().unwrap()));
+        assert!(
+            !s.own_global().contains(&"10.0.0.5".parse().unwrap()),
+            "private: not global"
+        );
+        assert_eq!(s.own_names(), vec!["scanner-5.example.net".to_string()]);
+        assert!(s.is_own(&"198.51.100.5".parse().unwrap()));
+        assert!(!s.is_own(&"198.51.100.6".parse().unwrap()));
+        let own = s.own_identity();
+        assert_eq!(own.names, s.own_names());
+        assert!(own.addrs.contains(&"198.51.100.5".parse().unwrap()));
+        // Looked up once a day: a changed answer is not seen yet.
+        *answer.lock().unwrap() = Some("other.example.net".into());
+        s.refresh_names().await;
+        assert_eq!(s.own_names(), vec!["scanner-5.example.net".to_string()]);
     }
 
     #[test]

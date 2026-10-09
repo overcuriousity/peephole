@@ -26,6 +26,16 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Added
 
+- The scanner's own address stays out of its scans. A scanned mail server
+  greets the client by address and name, and nmap kept that in the XML
+  that is signed, replicated and exported. Before signing, a scanner now
+  replaces its own global addresses (interfaces, listeners, `advertise`,
+  `scan.own_addresses`, the addresses peers saw it from) and their
+  forward-confirmed names with `[scanner]`; the scan page says how often.
+  Scans signed before this release cannot be changed; each node removes
+  its own addresses and names from them when it serves the XML or the
+  export, so a node's own old scans leave it clean. Other members'
+  addresses in old scans stay (a purge removes a record everywhere).
 - Host keys in the export: each scan in the `scans` column lists its
   `host_keys` (kind, port, fingerprint, detail), so nobody has to parse
   the XML for them.

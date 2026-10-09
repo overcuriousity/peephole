@@ -648,6 +648,7 @@ mod tests {
                 node: None,
                 audit_of: None,
                 audit_result: None,
+                scrubbed: 0,
             },
             ports: vec![],
             keys: vec![],

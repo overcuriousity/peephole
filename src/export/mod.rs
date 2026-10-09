@@ -1148,6 +1148,7 @@ mod tests {
         s.finish_job(
             job,
             Some(&crate::scan::nmap_xml::ScanResult {
+                scrubbed: 0,
                 os_guess: Some("Linux".into()),
                 raw_xml: b"<nmaprun>XML</nmaprun>".to_vec(),
                 ports: vec![crate::scan::nmap_xml::PortResult {
@@ -1574,6 +1575,7 @@ mod tests {
         s.finish_job(
             job,
             Some(&crate::scan::nmap_xml::ScanResult {
+                scrubbed: 0,
                 os_guess: None,
                 raw_xml: xml.into_bytes(),
                 ports: vec![],

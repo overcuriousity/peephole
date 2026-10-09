@@ -205,6 +205,7 @@ pub(crate) mod tests {
     /// A finished counter-scan of `ip` with these `(port, state, service)`.
     pub(crate) async fn scanned(store: &Store, ip: &str, ports: &[(u16, &str, Option<&str>)]) {
         let res = ScanResult {
+            scrubbed: 0,
             os_guess: None,
             raw_xml: b"<nmaprun/>".to_vec(),
             ports: ports
