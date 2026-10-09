@@ -51,6 +51,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   than 64 bytes are refused, a sender's ids are remembered up to 16384,
   and at most 256 requests are handled at once. Before, a member could
   fill a node's memory with made-up ids or handlers left waiting.
+- Cluster: an outbound-only node counts a relay lease for an hour at
+  most, whatever end the relay answers, so a relay claiming a lease
+  without end is still renewed or replaced in time.
 
 ## [0.10.0] - 2026-10-09
 
