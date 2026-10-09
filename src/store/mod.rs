@@ -8,6 +8,7 @@ pub mod data;
 pub mod decoys;
 pub mod delete;
 pub mod export;
+pub mod facts;
 pub mod fingerprints;
 pub mod hostkeys;
 pub mod inspect;

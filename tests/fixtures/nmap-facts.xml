@@ -14,5 +14,6 @@
 </ports>
 <hostscript><script id="smb-os-discovery" output="&#xa;  OS: Windows Server 2019 Standard 17763"><elem key="os">Windows Server 2019 Standard 17763</elem><elem key="lanmanager">Windows Server 2019 Standard 6.3</elem><elem key="server">WIN-344VU98D3RU\x00</elem><elem key="domain">WORKGROUP\x00</elem><elem key="workgroup">WORKGROUP\x00</elem><elem key="fqdn">WIN-344VU98D3RU</elem><elem key="domain_dns">corp.example</elem><elem key="forest_dns">corp.example</elem><elem key="date">2026-10-06T10:00:00</elem></script><script id="fcrdns" output="FAIL (No PTR record)"><table key="192.0.2.7"><elem key="status">fail</elem></table></script></hostscript>
 <os><osmatch name="Linux 5.X" accuracy="95" line="1"/></os>
+</host>
 <runstats><finished time="1760000100" timestr="" summary="" elapsed="100" exit="success"/><hosts up="1" down="0" total="1"/></runstats>
 </nmaprun>

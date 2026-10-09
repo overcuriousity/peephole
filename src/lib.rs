@@ -254,6 +254,18 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             }
         }
     });
+    // Facts of scans stored before this build or read by an older parser
+    // (FACTS_V); new scans are read as stored.
+    tokio::spawn({
+        let pool = store.pool.clone();
+        async move {
+            match store::facts::backfill(&pool, scan::facts::FACTS_V).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(scans = n, "scan facts: read stored scans"),
+                Err(e) => tracing::warn!(error = %e, "scan facts: backfill failed"),
+            }
+        }
+    });
     // JA4H of rows stored before this build; new rows get it as written.
     tokio::spawn({
         let pool = store.pool.clone();

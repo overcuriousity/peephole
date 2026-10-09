@@ -899,6 +899,7 @@ async fn scan_result(
             .await?;
         }
         super::hostkeys::derive(conn, scan_id, ip_id, r.raw_xml.as_deref()).await?;
+        super::facts::derive(conn, scan_id, r.raw_xml.as_deref()).await?;
     }
     Ok(Effect::Applied)
 }
