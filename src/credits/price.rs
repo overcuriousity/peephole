@@ -17,6 +17,8 @@ pub const AUDIT: &str = "audit";
 pub const PROBE: &str = "probe";
 /// A name resolved for another member (`intel::dns`).
 pub const RESOLVE: &str = "resolve";
+/// An hour of outbox hosting for an outbound-only member (`cluster::relay`).
+pub const RELAY: &str = "relay";
 /// A probe slot serves this many probes an hour (`PROBE_TIMEOUT` is 2 minutes).
 pub const PROBES_PER_SLOT_HOUR: f64 = 30.0;
 
@@ -272,6 +274,8 @@ pub struct Table {
     pub resolve_mc: u32,
     /// What looking up a source's reverse names for another member costs here.
     pub rdns_mc: u32,
+    /// What a relay lease costs here; None: this node is not advertised.
+    pub relay_mc: Option<u32>,
     pub offers: Vec<Offer>,
 }
 
@@ -302,6 +306,7 @@ impl Table {
             PROBE => self.probe_mc,
             RESOLVE => Some(self.resolve_mc),
             RDNS => Some(self.rdns_mc),
+            RELAY => self.relay_mc,
             _ => self
                 .offers
                 .iter()
@@ -319,6 +324,9 @@ impl Table {
             .collect();
         prices.push((RESOLVE.to_string(), self.resolve_mc));
         prices.push((RDNS.to_string(), self.rdns_mc));
+        if let Some(mc) = self.relay_mc {
+            prices.push((RELAY.to_string(), mc));
+        }
         (
             self.offers
                 .iter()
@@ -530,6 +538,9 @@ pub async fn load_kept(node: &Node) -> Result<()> {
     if node.prober().is_some() {
         t.probe_mc = kept_price(node, PROBE).await?.map(as_mc);
     }
+    if node.cfg.advertise.is_some() {
+        t.relay_mc = kept_price(node, RELAY).await?.map(as_mc);
+    }
     for p in node
         .lookup_providers()
         .into_iter()
@@ -636,6 +647,16 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         Some(_) => Some(next(current(node, &old, PROBE, &ann(PROBE)).await?, PROBE)),
         None => None,
     };
+    // A relay sells leases; it is at capacity when every slot is leased.
+    let relay_mc = match node.cfg.advertise {
+        Some(_) => {
+            let cur = current(node, &old, RELAY, &ann(RELAY)).await?;
+            let full = node.relay_leases.current(crate::cluster::hlc::wall_ms())
+                >= node.cfg.relay_slots as usize;
+            Some(as_mc(sales_step(cur, got(RELAY) > 0.0 || full, hours)))
+        }
+        None => None,
+    };
     // Every scanner's price, from the scans of jobs other arbiters granted it: the
     // same public inputs on every node.
     let granted = granted_scans(&node.store.pool).await?;
@@ -677,6 +698,7 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         .iter()
         .map(|o| (o.provider.as_str(), o.price_mc))
         .chain(probe_mc.map(|m| (PROBE, m)))
+        .chain(relay_mc.map(|m| (RELAY, m)))
         .chain([(RESOLVE, resolve_mc), (RDNS, rdns_mc)])
     {
         node.store
@@ -723,6 +745,14 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
             pr.slots() as f64 * PROBES_PER_SLOT_HOUR,
         ));
     }
+    if relay_mc.is_some() {
+        goods.push((
+            RELAY,
+            relay_mc,
+            per_hour(got(RELAY)),
+            node.cfg.relay_slots as f64,
+        ));
+    }
     // Goods only members announce (a provider this node does not serve).
     for g in announced.keys() {
         if !goods.iter().any(|(x, ..)| x == g) {
@@ -757,6 +787,7 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         probe_mc,
         resolve_mc,
         rdns_mc,
+        relay_mc,
         offers,
     });
     node.set_price_table(table.clone());
@@ -1090,6 +1121,7 @@ mod tests {
                 lease_secs: 120,
                 remote_config: false,
                 origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
                 peers: vec![],
             },
             roles: Default::default(),

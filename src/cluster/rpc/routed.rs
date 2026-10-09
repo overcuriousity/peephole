@@ -10,11 +10,12 @@ use serde_bytes::ByteBuf;
 use std::sync::Arc;
 
 /// The calls that may arrive as messages: paid answers, nothing that syncs.
-pub const ROUTED_PATHS: [&str; 4] = [
+pub const ROUTED_PATHS: [&str; 5] = [
     "/rpc/v1/lookup",
     "/rpc/v1/resolve",
     "/rpc/v1/probe",
     "/rpc/v1/rdns",
+    "/rpc/v1/relay",
 ];
 /// Largest request or answer body sent as a message (outboxes are in memory).
 pub const MAX_ROUTED_BODY: usize = 1 << 20;
@@ -86,6 +87,10 @@ async fn answer(
             let req: ProbeReq = cbor::decode(body)?;
             cbor::encode(&probe_answer(node, peer, &req).await)
         }
+        "/rpc/v1/relay" => {
+            let req: crate::cluster::relay::RelayReq = cbor::decode(body)?;
+            cbor::encode(&crate::cluster::relay::serve(node, peer, &req).await)
+        }
         _ => anyhow::bail!("not routable"),
     }
 }
@@ -111,6 +116,7 @@ mod tests {
             allowed("/rpc/v1/lookup") && allowed("/rpc/v1/resolve") && allowed("/rpc/v1/probe")
         );
         assert!(allowed("/rpc/v1/rdns"));
+        assert!(allowed("/rpc/v1/relay"));
         for p in [
             "/rpc/v1/push",
             "/rpc/v1/pull",

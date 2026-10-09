@@ -88,6 +88,8 @@ struct Opts {
     retention_days: u32,
     /// Share of other nodes' fresh scans this scanner audits.
     audit_share: f64,
+    /// An outbound-only node leases relays (`cluster::relay::run`).
+    lease: bool,
 }
 
 const DEFAULT: Opts = Opts {
@@ -100,6 +102,7 @@ const DEFAULT: Opts = Opts {
     workers: 1,
     retention_days: 0,
     audit_share: 0.0,
+    lease: true,
 };
 
 async fn boot(identity: Identity, me: &Addr, peers: &[&Addr], o: Opts) -> TestNode {
@@ -125,6 +128,7 @@ async fn boot_in(
         lease_secs: o.lease_secs,
         remote_config: false,
         origin_quota_mb: 20 * 1024,
+        relay_slots: 16,
         peers: peers
             .iter()
             .map(|p| PeerConfig {
@@ -187,7 +191,11 @@ async fn boot_in(
             peephole::classify::Classifier::builtin(),
         ))
     });
+    let relay_rx = rx.clone();
     cluster::start(node.clone(), rx).await.unwrap();
+    if !o.advertise && o.lease {
+        tokio::spawn(peephole::cluster::relay::run(node.clone(), relay_rx));
+    }
     TestNode {
         node,
         dir,
@@ -716,6 +724,7 @@ async fn a_node_offline_for_over_30_days_starts_detached() {
                 lease_secs: 120,
                 remote_config: false,
                 origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
                 peers: vec![PeerConfig {
                     name: "a".into(),
                     address: a.address(),
@@ -942,6 +951,7 @@ async fn forged_entries_are_rejected_and_unknown_origins_parked() {
             lease_secs: 120,
             remote_config: false,
             origin_quota_mb: 20 * 1024,
+            relay_slots: 16,
             peers: vec![PeerConfig {
                 name: "a".into(),
                 address: "127.0.0.1:1".into(),
@@ -1214,6 +1224,7 @@ async fn offline_node(peers: &[&Addr]) -> (Arc<Node>, tempfile::TempDir) {
             lease_secs: 120,
             remote_config: false,
             origin_quota_mb: 20 * 1024,
+            relay_slots: 16,
             peers: peers
                 .iter()
                 .map(|p| PeerConfig {
@@ -2214,6 +2225,14 @@ async fn outbound_only_scanner_drains_the_queue() {
     )
     .await
     .unwrap();
+    // Grants reach c through the relay it leases.
+    eventually("c leased a relay and a knows it", || async {
+        na.node
+            .status
+            .known(&c.id)
+            .is_some_and(|k| !k.hb.relays.is_empty())
+    })
+    .await;
     enqueue(&na, "203.0.113.90", 2).await;
     eventually_for(Duration::from_secs(20), "c scanned a's job", || async {
         scans_by(&na, c.id).await == 1
@@ -5249,6 +5268,13 @@ async fn an_outbound_only_member_answers_a_routed_call() {
     })
     .await;
     assert!(na.node.dial_address(&b.id).is_none());
+    eventually("b leased a relay and a knows it", || async {
+        na.node
+            .status
+            .known(&b.id)
+            .is_some_and(|k| !k.hb.relays.is_empty())
+    })
+    .await;
     let req = LookupReq {
         ip: "203.0.113.5".into(),
         providers: vec![],
@@ -5291,7 +5317,155 @@ async fn outbound_pair() -> (Addr, Addr, TestNode, TestNode) {
     })
     .await;
     assert!(na.node.dial_address(&b.id).is_none());
+    eventually("b leased a relay and a knows it", || async {
+        na.node
+            .status
+            .known(&b.id)
+            .is_some_and(|k| !k.hb.relays.is_empty())
+    })
+    .await;
     (a, b, na, nb)
+}
+
+/// A message for an outbound-only member goes through its next relay
+/// when the first refuses it, at once.
+#[tokio::test]
+async fn a_message_takes_the_next_relay_when_the_first_refuses() {
+    use peephole::intel::lookup::{LookupReq, LookupResp};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let (ic, c) = new_node("node-charlie");
+    let (io, o) = new_node("node-oscar");
+    let nodes = [
+        boot(ia, &a, &[&b, &c], DEFAULT).await,
+        boot(ib, &b, &[&a, &c], DEFAULT).await,
+        boot(ic, &c, &[&a, &b], DEFAULT).await,
+    ];
+    let no = boot(
+        io,
+        &o,
+        &[],
+        Opts {
+            advertise: false,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let token = invite::create(&nodes[0], &Default::default())
+        .await
+        .unwrap();
+    invite::join(&no, &token).await.unwrap();
+    // o leases two of the three; all three know which.
+    let relays = |n: &TestNode| {
+        n.node
+            .status
+            .known(&o.id)
+            .map(|k| k.hb.relays)
+            .unwrap_or_default()
+    };
+    for n in &nodes {
+        eventually("o leased two relays and every node knows it", || async {
+            relays(n).len() == 2
+        })
+        .await;
+    }
+    let listed = relays(&nodes[0]);
+    let ids = nodes.each_ref().map(|n| n.node.id());
+    let s = ids.iter().position(|id| !listed.contains(id)).unwrap();
+    let f = ids.iter().position(|id| *id == listed[0]).unwrap();
+    // The first listed relay no longer holds o's lease: it refuses.
+    nodes[f].node.relay_leases.end(&o.id);
+    let sender = &nodes[s];
+    let asked = std::time::Instant::now();
+    let req = LookupReq {
+        ip: "203.0.113.6".into(),
+        providers: vec![],
+        offer_seq: None,
+    };
+    let resp: LookupResp = sender
+        .node
+        .call_any(o.id, "/rpc/v1/lookup", &req, Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert!(resp.findings.is_empty());
+    // Not the resend after half the timeout: the refusal came at once.
+    assert!(
+        asked.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        asked.elapsed()
+    );
+}
+
+/// An outbound-only member with a lease is asked through its relay; one
+/// without a lease cannot be asked at all.
+#[tokio::test]
+async fn only_an_outbound_only_member_with_a_lease_can_be_asked() {
+    use peephole::credits::pay;
+    let (ia, a) = new_node("node-alpha");
+    let (io, o) = new_node("node-oscar");
+    let (ip, p) = new_node("node-papa");
+    let na = boot(ia, &a, &[], DEFAULT).await;
+    let no = boot(
+        io,
+        &o,
+        &[],
+        Opts {
+            advertise: false,
+            ..DEFAULT
+        },
+    )
+    .await;
+    let np = boot(
+        ip,
+        &p,
+        &[],
+        Opts {
+            advertise: false,
+            lease: false,
+            ..DEFAULT
+        },
+    )
+    .await;
+    // Admitted by invite, as `outbound_pair` does.
+    for n in [&no, &np] {
+        let token = invite::create(&na, &Default::default()).await.unwrap();
+        invite::join(n, &token).await.unwrap();
+    }
+    serves(&no, &[("abuseipdb", Some(1000.0))], 0.5);
+    serves(&np, &[("abuseipdb", Some(1000.0))], 0.5);
+    // Both announce a price for it (nothing sold yet: 0).
+    for n in [&no, &np] {
+        peephole::credits::price::refresh(&n.node).await.unwrap();
+    }
+    eventually("o leased a and a knows it", || async {
+        na.node
+            .status
+            .known(&o.id)
+            .is_some_and(|k| k.hb.relays == vec![a.id])
+    })
+    .await;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(na.node.relay_leases.holds(&o.id, now_ms));
+    price_seen(&na, o.id, "abuseipdb").await;
+    let wanted = ["abuseipdb".to_string()];
+    let got = pay::offer_and_ask(&na.node, "203.0.113.83".parse().unwrap(), o.id, &wanted, 0).await;
+    assert_eq!(got.findings.len(), 1, "{got:?}");
+    // p syncs (a knows its heartbeat) but leased nothing: not callable.
+    eventually("a knows p", || async {
+        na.node.status.known(&p.id).is_some()
+    })
+    .await;
+    assert!(!na.node.can_call(&p.id));
+    let none: peephole::intel::Providers = vec![];
+    assert!(
+        pay::quotes(&na.node, &none)
+            .values()
+            .flatten()
+            .all(|q| q.server != p.id)
+    );
 }
 
 /// A server nobody can dial is paid for a lookup like any other.

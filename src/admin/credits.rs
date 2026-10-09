@@ -245,6 +245,7 @@ fn good_label(good: &str) -> String {
         credits::price::PROBE => "Probe".into(),
         credits::price::RESOLVE => "Name resolution".into(),
         credits::price::RDNS => "Reverse names".into(),
+        credits::price::RELAY => "Relay lease".into(),
         p => crate::intel::provider_info(p)
             .map(|i| i.label.to_string())
             .unwrap_or_else(|| p.to_string()),

@@ -88,6 +88,7 @@ async fn offline(peers: &[&Origin], retention_days: u32) -> (Arc<Node>, tempfile
         lease_secs: 120,
         remote_config: false,
         origin_quota_mb: 20 * 1024,
+        relay_slots: 16,
         peers: peers
             .iter()
             .enumerate()

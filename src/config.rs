@@ -266,6 +266,10 @@ pub struct ClusterConfig {
     /// (this node's own entries are exempt). 0: no limit.
     #[serde(default = "default_origin_quota_mb")]
     pub origin_quota_mb: u64,
+    /// Relay leases this node sells at a time to outbound-only members
+    /// (only an advertised node relays).
+    #[serde(default = "default_relay_slots")]
+    pub relay_slots: u32,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
 }
@@ -278,6 +282,9 @@ fn default_lease_secs() -> u64 {
 }
 fn default_origin_quota_mb() -> u64 {
     20 * 1024
+}
+fn default_relay_slots() -> u32 {
+    16
 }
 
 /// `[[cluster.peers]]`: a node this one vouches for and dials.

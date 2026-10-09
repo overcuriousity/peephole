@@ -42,6 +42,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/rpc/v1/probe", post(probe))
         .route("/rpc/v1/resolve", post(resolve))
         .route("/rpc/v1/rdns", post(rdns))
+        .route("/rpc/v1/relay", post(relay))
         .route_layer(axum::middleware::from_fn_with_state(
             node.clone(),
             require_member,
@@ -179,6 +180,17 @@ async fn message(State(node): State<Arc<Node>>, Cbor(mut env): Cbor<Envelope>) -
     if !body.fresh() {
         return (StatusCode::BAD_REQUEST, "stale or future-dated message").into_response();
     }
+    // A relay refuses at once a message for a member that lists it but
+    // holds no lease here, so the sender tries its next relay.
+    if body.to != node.id()
+        && node
+            .status
+            .known(&body.to)
+            .is_some_and(|k| k.hb.relays.contains(&node.id()))
+        && !node.routable(&body.to, &[])
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no relay lease here").into_response();
+    }
     let Ok(permit) = node.route_slots.clone().try_acquire_owned() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response();
     };
@@ -245,6 +257,15 @@ async fn probe(
     Cbor(req): Cbor<crate::scan::probe::serve::ProbeReq>,
 ) -> Response {
     Cbor(routed::probe_answer(&node, peer, &req).await).into_response()
+}
+
+/// A relay lease for an outbound-only member (`cluster::relay`).
+async fn relay(
+    State(node): State<Arc<Node>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Cbor(req): Cbor<crate::cluster::relay::RelayReq>,
+) -> Response {
+    Cbor(crate::cluster::relay::serve(&node, peer, &req).await).into_response()
 }
 
 /// Long-poll for messages waiting for the caller.

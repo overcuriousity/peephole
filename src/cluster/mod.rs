@@ -11,6 +11,7 @@ pub mod members;
 pub mod msg;
 pub mod owner;
 pub mod record;
+pub mod relay;
 pub mod remote;
 pub mod repl;
 pub mod rpc;
@@ -286,6 +287,10 @@ pub struct Node {
     pub reach: crate::credits::reach::Tracker,
     /// Paid requests counted for this node's prices (`credits::price`).
     pub market: crate::credits::price::Demand,
+    /// The relay leases this node sells to outbound-only members.
+    pub relay_leases: relay::Leases,
+    /// The relay leases this outbound-only node took.
+    pub leased: relay::Leased,
     /// The hourly per-level scanner weights (`scan::weight`).
     pub weights: crate::scan::weight::Weights,
     /// This node's scan budget left and queued jobs, for the heartbeat
@@ -369,6 +374,8 @@ impl Node {
             price_table: Default::default(),
             reach: Default::default(),
             market: Default::default(),
+            relay_leases: Default::default(),
+            leased: Default::default(),
             weights: Default::default(),
             scan_budget_mc: Default::default(),
             scan_queued: Default::default(),
@@ -616,12 +623,20 @@ impl Node {
         }
     }
 
-    /// Whether `id` speaks routed RPC and a route avoiding members too old
-    /// to relay it exists.
+    /// Whether `id` speaks routed RPC, has an address or lists relays, and
+    /// a route avoiding members too old to relay it exists.
     pub(crate) fn routed_callable(&self, id: &NodeId) -> bool {
+        // An outbound-only member without relays cannot be asked.
+        let reached = |m: &MemberRow| {
+            m.address.is_some()
+                || self
+                    .status
+                    .known(id)
+                    .is_some_and(|k| !k.hb.relays.is_empty())
+        };
         self.members()
             .get(id)
-            .is_some_and(|m| m.proto_max >= rpc::proto::ROUTED_PROTO)
+            .is_some_and(|m| m.proto_max >= rpc::proto::ROUTED_PROTO && reached(m))
             && self.routable(
                 id,
                 &owner::cmd::old_relays(self, id, rpc::proto::ROUTED_PROTO),

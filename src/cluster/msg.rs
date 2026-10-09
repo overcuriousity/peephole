@@ -262,9 +262,31 @@ impl std::fmt::Display for NoAnswer {
 
 impl std::error::Error for NoAnswer {}
 
-enum Hop {
+#[derive(Debug, PartialEq)]
+pub(crate) enum Hop {
     Dial(NodeId, String),
     Outbox(NodeId),
+}
+
+/// The first hop of a message for `to`, an outbound-only member leasing
+/// `relays`: this node's outbox when it is one of them and `holds` its
+/// lease (else none: it refuses), otherwise the first listed relay this
+/// node can dial that is not in `avoid`.
+pub(crate) fn relay_hop(
+    me: &NodeId,
+    to: &NodeId,
+    relays: &[NodeId],
+    dial: &HashMap<NodeId, String>,
+    avoid: &[NodeId],
+    holds: bool,
+) -> Option<Hop> {
+    if relays.contains(me) {
+        return holds.then_some(Hop::Outbox(*to));
+    }
+    relays
+        .iter()
+        .filter(|r| !avoid.contains(r))
+        .find_map(|r| dial.get(r).map(|a| Hop::Dial(*r, a.clone())))
 }
 
 impl Node {
@@ -347,8 +369,22 @@ impl Node {
             }
             match node.next_hop(&body.to, &avoid) {
                 Some(Hop::Dial(peer, addr)) => {
-                    let _: bool = node.call(peer, &addr, "/rpc/v1/msg", &env).await?;
-                    Ok(Some(peer))
+                    match node.call::<_, bool>(peer, &addr, "/rpc/v1/msg", &env).await {
+                        Ok(_) => Ok(Some(peer)),
+                        // A relay that fails or refuses: the next one.
+                        Err(e)
+                            if node
+                                .status
+                                .known(&body.to)
+                                .is_some_and(|k| k.hb.relays.contains(&peer)) =>
+                        {
+                            debug!(relay = %peer.short(), ?e, "relay failed; trying the next");
+                            let mut avoid = avoid;
+                            avoid.push(peer);
+                            node.route_avoiding(env, avoid).await
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 Some(Hop::Outbox(peer)) => {
                     let mut all = node.msg.outbox.lock().unwrap();
@@ -399,6 +435,17 @@ impl Node {
             .filter(|(id, _, _)| !avoid.contains(id))
             .map(|(id, _, addr)| (id, addr))
             .collect();
+        // An outbound-only member is reached through the relays it leases.
+        let relays = self
+            .status
+            .known(to)
+            .map(|k| k.hb.relays)
+            .unwrap_or_default();
+        if !relays.is_empty() && !dial.contains_key(to) {
+            let now = super::hlc::wall_ms();
+            let holds = self.relay_leases.holds(to, now) && self.status.polled_recently(to);
+            return relay_hop(&self.id(), to, &relays, &dial, avoid, holds);
+        }
         let via = |id: &NodeId, fresh_only: bool| -> Option<Hop> {
             if avoid.contains(id) {
                 return None;
@@ -412,7 +459,8 @@ impl Node {
             {
                 return Some(Hop::Dial(*id, addr.clone()));
             }
-            self.status.polled_recently(id).then_some(Hop::Outbox(*id))
+            (self.status.polled_recently(id) && self.holds_outbox_for(id))
+                .then_some(Hop::Outbox(*id))
         };
         // Direct delivery first.
         if let Some(h) = via(to, true) {
@@ -475,6 +523,13 @@ impl Node {
         }
         // Last resort: dial the destination even without recent contact.
         via(to, false)
+    }
+
+    /// Whether this node keeps an outbox for `id`: it has an address
+    /// (it collects here when its dial fails), or leased this node.
+    fn holds_outbox_for(&self, id: &NodeId) -> bool {
+        self.members().get(id).is_some_and(|m| m.address.is_some())
+            || self.relay_leases.holds(id, super::hlc::wall_ms())
     }
 
     async fn deliver(self: &Arc<Self>, b: Body) {
@@ -577,6 +632,13 @@ fn drain_budget(q: &mut VecDeque<(Envelope, Instant)>, budget: usize) -> Vec<Env
 pub async fn inbox_loop(node: Arc<Node>, peer: NodeId, addr: String) {
     let mut backoff = Duration::from_secs(1);
     loop {
+        // An outbound-only node collects only at the relays it leases.
+        if node.cfg.advertise.is_none()
+            && !node.leased.relays(super::hlc::wall_ms()).contains(&peer)
+        {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
         match node
             .call::<_, Vec<Envelope>>(peer, &addr, "/rpc/v1/inbox", &true)
             .await
@@ -701,6 +763,43 @@ mod tests {
         };
         assert_eq!(decode::<Grant>(&encode(&funded).unwrap()).unwrap(), funded);
         assert_eq!(decode::<OldGrant>(&encode(&funded).unwrap()).unwrap(), old);
+    }
+
+    #[test]
+    fn an_outbound_only_member_is_reached_through_its_relays_in_turn() {
+        let id = |n: u8| NodeId([n; 32]);
+        let (me, to) = (id(1), id(9));
+        let dial: HashMap<NodeId, String> =
+            [(id(2), "a:1".to_string()), (id(3), "b:1".to_string())].into();
+        let hop = |relays: &[NodeId], avoid: &[NodeId], holds: bool| {
+            relay_hop(&me, &to, relays, &dial, avoid, holds)
+        };
+        assert_eq!(
+            hop(&[id(2), id(3)], &[], false),
+            Some(Hop::Dial(id(2), "a:1".into()))
+        );
+        assert_eq!(
+            hop(&[id(2), id(3)], &[id(2)], false),
+            Some(Hop::Dial(id(3), "b:1".into())),
+            "the first refused"
+        );
+        assert_eq!(
+            hop(&[id(2), id(3)], &[id(2), id(3)], false),
+            None,
+            "both refused: no route"
+        );
+        assert_eq!(
+            hop(&[id(4)], &[], false),
+            None,
+            "a relay this node cannot dial"
+        );
+        // This node is one of its relays: its outbox, while the lease holds.
+        assert_eq!(hop(&[me, id(2)], &[], true), Some(Hop::Outbox(to)));
+        assert_eq!(
+            hop(&[me, id(2)], &[], false),
+            None,
+            "no lease from it: refused"
+        );
     }
 
     #[test]
