@@ -8,9 +8,10 @@
 //! claimant that is cheapest per delivered result at its level (see
 //! `rank`): its price over its success rate there (see `weight`). Equal
 //! prices go to the claimant that ran the fewest scans in the last hour.
-//! A paid job waits for a cheaper live scanner up to
-//! `weight::OVERRIDE_WAIT_MINS`; an unpaid job goes by the old sit-out
-//! draws. Why each job went where is kept in `handout`.
+//! Every grant is funded, at zero or above; a job no claimant can be paid
+//! for waits. A job waits for a cheaper live scanner up to
+//! `weight::OVERRIDE_WAIT_MINS`. Why each job went where is kept in
+//! `handout`.
 use super::handout::{Handout, Reason};
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
@@ -35,9 +36,6 @@ const LATER_BACKOFF: Duration = Duration::from_secs(180);
 struct Lease {
     scanner: NodeId,
     expires: Instant,
-    /// Whether this arbiter funded the grant (an offer or a self tally):
-    /// only then does a turn-down count against the scanner.
-    funded: bool,
 }
 
 /// A claimant that delivered less than this share of at least
@@ -67,7 +65,7 @@ fn over_capacity(granted_last_hour: i64, can_do: Option<f64>) -> bool {
     can_do.is_some_and(|c| granted_last_hour as f64 >= c.max(1.0))
 }
 
-/// Whether a funded grant handed back with `status` and `why` counts as
+/// Whether a grant handed back with `status` and `why` counts as
 /// not delivered: every turn-down, except "later" for a reason that is no
 /// fault of the scanner (the job has not replicated there yet, or its
 /// Tor exit list is not loaded).
@@ -98,7 +96,9 @@ pub(crate) struct Claimant {
 
 /// How a scanner stands with this arbiter at the start of a round.
 struct Stand {
-    /// What this arbiter would pay it; None: unpaid.
+    /// What this arbiter would pay it; None: it cannot be granted (unpaid
+    /// here, or a scanner that does not earn as one, because it owes
+    /// audits or its audits differ: it is not funded).
     price: Option<u32>,
     /// Over its hourly capacity here, or not delivering enough grants.
     demoted: bool,
@@ -212,7 +212,6 @@ impl Arbiter {
                         Lease {
                             scanner: s,
                             expires: Instant::now() + self.lease,
-                            funded: false,
                         },
                     );
                 }
@@ -322,7 +321,12 @@ impl Arbiter {
     }
 
     /// How `scanner` stands with this arbiter now.
-    async fn stand(&self, scanner: &NodeId, table: &crate::credits::price::Table) -> Stand {
+    async fn stand(
+        &self,
+        scanner: &NodeId,
+        table: &crate::credits::price::Table,
+        book: Option<&crate::credits::Book>,
+    ) -> Stand {
         let (all, here) = self.scans_last_hour(scanner).await;
         let delivering = self
             .outcomes
@@ -331,7 +335,14 @@ impl Arbiter {
             .get(scanner)
             .is_none_or(|o| delivers(o, Instant::now()));
         Stand {
-            price: crate::credits::jobs::price_for(&self.node, scanner),
+            // This node's own scanner sells nothing to it: no audits owed.
+            price: if *scanner != self.node.id()
+                && book.is_some_and(|b| !b.standing(scanner).earns_as_scanner())
+            {
+                None
+            } else {
+                crate::credits::jobs::price_for(&self.node, scanner)
+            },
             demoted: over_capacity(here, table.can_do(scanner)) || !delivering,
             load: all,
         }
@@ -351,12 +362,13 @@ impl Arbiter {
 
     /// One round: the queued jobs in order (highest response ratio first),
     /// each to the eligible claim cheapest per delivered result at its
-    /// level (see `rank`). A paid job waits for a cheaper live scanner up
-    /// to `weight::OVERRIDE_WAIT_MINS`; an unpaid one goes by the old
-    /// sit-out draws. One job per claim; the result is in claim order.
+    /// level (see `rank`) that this round's book can pay; a job nobody can
+    /// be paid for waits. A job waits for a cheaper live scanner up to
+    /// `weight::OVERRIDE_WAIT_MINS`. One job per claim; the result is in
+    /// claim order.
     async fn round(&self, claims: &[Claimant]) -> Result<Vec<Option<Grant>>> {
         use super::rank::{self, Bid, Standby, Wait};
-        use super::weight::{self, OVERRIDE_WAIT_MINS};
+        use super::weight;
         let _g = self.assign.lock().await;
         let mut out: Vec<Option<Grant>> = claims.iter().map(|_| None).collect();
         if claims.is_empty() {
@@ -366,10 +378,11 @@ impl Arbiter {
         let table = self.node.price_table();
         let snap = self.node.weights.get(pool).await?;
         let scanners = self.scanners();
+        let book = crate::credits::book(&self.node).await.ok();
         let mut stands: HashMap<NodeId, Stand> = HashMap::new();
         for s in claims.iter().map(|c| c.id).chain(scanners.iter().copied()) {
             if let std::collections::hash_map::Entry::Vacant(e) = stands.entry(s) {
-                e.insert(self.stand(&s, &table).await);
+                e.insert(self.stand(&s, &table, book.as_deref()).await);
             }
         }
         // What each scanner asked for last: a scanner not asking now keeps
@@ -441,9 +454,8 @@ impl Arbiter {
                     continue;
                 }
                 bids.sort_by_key(|(_, b)| rank::order(b));
-                let overdue = job.waited_secs >= OVERRIDE_WAIT_MINS * 60;
-                // The best claimant this round's book can pay: paid jobs go
-                // to it; with none, the job is idle work.
+                // The best claimant this round's book can pay; with none,
+                // the job waits for the next round.
                 let mut payee = None;
                 for (k, (ci, b)) in bids.iter().enumerate() {
                     if let Some(p) = b.price
@@ -459,32 +471,30 @@ impl Arbiter {
                         break;
                     }
                 }
-                let paid = payee.is_some();
-                let pick = payee.unwrap_or(0);
+                let Some(pick) = payee else { continue };
                 let top = bids[pick].1.clone();
-                let bids_top_claim = bids[0].0;
-                let (reason, waited, sat_out) = if paid {
-                    let standby: Vec<Standby> = scanners
-                        .iter()
-                        .filter(|s| {
-                            !stands[*s].demoted
-                                && !table.can_do(s).is_some_and(|c| c < 1.0)
-                                && takes(s)
-                                && !last.get(*s).is_some_and(|(x, min_mc)| {
-                                    x.contains(&(level as u8))
-                                        || stands[*s].price.is_some_and(|p| p < *min_mc)
-                                })
-                        })
-                        .map(|s| {
-                            let t = snap.tallies.get(&(*s, level)).copied().unwrap_or_default();
-                            Standby {
-                                id: *s,
-                                price: stands[s].price,
-                                weight: weight::weight(&snap.tallies, *s, &scanners, level),
-                                sample: t.ok + t.failed,
-                            }
-                        })
-                        .collect();
+                let standby: Vec<Standby> = scanners
+                    .iter()
+                    .filter(|s| {
+                        !stands[*s].demoted
+                            && !table.can_do(s).is_some_and(|c| c < 1.0)
+                            && takes(s)
+                            && !last.get(*s).is_some_and(|(x, min_mc)| {
+                                x.contains(&(level as u8))
+                                    || stands[*s].price.is_some_and(|p| p < *min_mc)
+                            })
+                    })
+                    .map(|s| {
+                        let t = snap.tallies.get(&(*s, level)).copied().unwrap_or_default();
+                        Standby {
+                            id: *s,
+                            price: stands[s].price,
+                            weight: weight::weight(&snap.tallies, *s, &scanners, level),
+                            sample: t.ok + t.failed,
+                        }
+                    })
+                    .collect();
+                let (reason, waited) =
                     match rank::waits(top.effective(), rank::reserve(&standby), job.waited_secs) {
                         Wait::Hold => {
                             self.held
@@ -496,32 +506,13 @@ impl Arbiter {
                         }
                         Wait::Go => {
                             let held = self.held.lock().unwrap().get(&job.uid).copied();
-                            let w = held.map_or(0, |t| t.elapsed().as_secs() as i64);
-                            (Reason::Cheapest, w, 0)
+                            (
+                                Reason::Cheapest,
+                                held.map_or(0, |t| t.elapsed().as_secs() as i64),
+                            )
                         }
-                        Wait::Override => (Reason::Override, job.waited_secs, 0),
-                    }
-                } else {
-                    // Idle work has no price to compare: the sit-out draws stay.
-                    let n = bids.len();
-                    if !overdue {
-                        let now = weight::unix_now();
-                        bids.retain(|(_, b)| {
-                            !weight::skipped_levels(&snap.tallies, b.id, &scanners, now)
-                                .contains(&level)
-                        });
-                    }
-                    if bids.is_empty() {
-                        continue;
-                    }
-                    // Why nothing was paid, as the best claimant saw it.
-                    let why = match top.price {
-                        None => Reason::NoPrice,
-                        Some(p) if p < claims[bids_top_claim].min_mc => Reason::BelowMin,
-                        Some(_) => Reason::Unpaid,
+                        Wait::Override => (Reason::Override, job.waited_secs),
                     };
-                    (why, 0, (n - bids.len()) as i64)
-                };
                 // Another arbiter queued the same IP and its job ranks first, or
                 // a scan of it is running: the scanners would turn this one down.
                 let other = match super::outranked_by(pool, &job.uid).await {
@@ -544,31 +535,17 @@ impl Arbiter {
                     gone += 1;
                     continue;
                 }
-                let (i, bid) = if paid {
-                    bids[pick].clone()
-                } else {
-                    bids[0].clone()
-                };
-                let next = match reason.unpaid() {
-                    true => None,
-                    false => bids
-                        .iter()
-                        .find(|(_, b)| b.id != bid.id)
-                        .map(|(_, b)| (b.id, b.effective())),
-                };
+                let (i, bid) = bids[pick].clone();
+                let next = bids
+                    .iter()
+                    .find(|(_, b)| b.id != bid.id)
+                    .map(|(_, b)| (b.id, b.effective()));
                 let c = &claims[i];
-                let g = match self
-                    .grant(
-                        &mut funding,
-                        c,
-                        &job,
-                        paid.then_some(bid.price)
-                            .flatten()
-                            .map(|p| p.saturating_mul(factor)),
-                    )
-                    .await
-                {
-                    Ok(g) => g,
+                let price = bid.price.unwrap_or(0).saturating_mul(factor);
+                let g = match self.grant(&mut funding, c, &job, price).await {
+                    Ok(Some(g)) => g,
+                    // The offer could not be written: the job stays queued.
+                    Ok(None) => continue,
                     Err(e) => {
                         // The grants made so far still go out.
                         warn!(?e, job = %job.uid, "handing out scan jobs stopped");
@@ -581,23 +558,16 @@ impl Arbiter {
                     st.load += 1;
                 }
                 info!(job = %g.job_uid, ip = %g.ip, scanner = %c.id.short(), "scan job granted");
-                let funded = g.offer_seq.is_some() || g.price_mc > 0;
                 let h = Handout {
                     job_uid: g.job_uid.clone(),
                     scanner: c.id,
                     level,
-                    paid: funded,
                     price_mc: bid.price,
                     rate: bid.weight,
                     effective_mc: bid.effective(),
                     next,
                     waited_secs: waited,
-                    reason: if paid && !funded {
-                        Reason::OfferFailed
-                    } else {
-                        reason
-                    },
-                    sat_out,
+                    reason,
                 };
                 if let Err(e) = super::handout::record(pool, &h).await {
                     tracing::debug!(?e, job = %h.job_uid, "hand-out not recorded");
@@ -657,15 +627,29 @@ impl Arbiter {
             .collect())
     }
 
-    /// Mark `job` running for `claim`'s scanner under a lease, and fund it
-    /// at `price` when it is paid.
+    /// Fund `job` for `claim`'s scanner at `price` and mark it running
+    /// under a lease. None: the offer could not be written; the job stays
+    /// queued. (If the state write fails after an offer was written, the
+    /// offer lapses unanswered: nothing is charged.)
     async fn grant(
         &self,
         funding: &mut crate::credits::jobs::Funding,
         claim: &Claimant,
         job: &Queued,
-        price: Option<u32>,
-    ) -> Result<Grant> {
+        price: u32,
+    ) -> Result<Option<Grant>> {
+        let Some((offer_seq, price)) = crate::credits::jobs::fund(
+            &self.node,
+            funding,
+            claim.id,
+            &job.uid,
+            claim.min_mc,
+            price,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
         self.rec
             .write(vec![Record::JobStatus(JobStatusRec {
                 job_uid: job.uid.clone(),
@@ -682,41 +666,20 @@ impl Arbiter {
             Lease {
                 scanner: claim.id,
                 expires: Instant::now() + self.lease,
-                funded: false,
             },
         );
-        let mut g = Grant {
+        if price > 0 {
+            info!(job = %job.uid, scanner = %claim.id.short(),
+                price = %crate::credits::show(price as u64), "scan job funded");
+        }
+        Ok(Some(Grant {
             job_uid: job.uid.clone(),
             ip: job.ip.clone(),
             level: job.level,
             lease_secs: self.lease.as_secs().max(1),
-            offer_seq: None,
-            price_mc: 0,
-        };
-        let pool = &self.node.store.pool;
-        let funded = match price {
-            Some(p) => {
-                crate::credits::jobs::fund(&self.node, funding, claim.id, &job.uid, claim.min_mc, p)
-                    .await
-            }
-            None => {
-                // An earlier grant's own-job reservation is gone.
-                if let Err(e) = crate::credits::jobs::hold_self(pool, &job.uid, 0).await {
-                    warn!(?e, job = %job.uid, "old own-job reservation not cleared");
-                }
-                None
-            }
-        };
-        if let Some((seq, price)) = funded {
-            g.offer_seq = seq;
-            g.price_mc = price;
-            if let Some(l) = self.leases.lock().unwrap().get_mut(&g.job_uid) {
-                l.funded = true;
-            }
-            info!(job = %g.job_uid, scanner = %claim.id.short(),
-                price = %crate::credits::show(price as u64), "scan job funded");
-        }
-        Ok(g)
+            offer_seq,
+            price_mc: price,
+        }))
     }
 
     fn renew(&self, scanner: NodeId, job_uid: &str) -> bool {
@@ -790,11 +753,7 @@ impl Arbiter {
             return false;
         }
         let _g = self.assign.lock().await;
-        let (holder, funded) = {
-            let leases = self.leases.lock().unwrap();
-            let l = leases.get(uid);
-            (l.map(|l| l.scanner), l.is_some_and(|l| l.funded))
-        };
+        let holder = self.leases.lock().unwrap().get(uid).map(|l| l.scanner);
         // After an arbiter restart the lease may be gone; the replicated
         // scanner column still says who ran it.
         let ok = match holder {
@@ -809,7 +768,8 @@ impl Arbiter {
         match status {
             "done" => self.note_outcome(scanner, true),
             "failed" => self.note_outcome(scanner, false),
-            "later" | "declined" if funded && undelivered(status, error.as_deref()) => {
+            // Every grant is funded: a turn-down counts against the scanner.
+            "later" | "declined" if undelivered(status, error.as_deref()) => {
                 self.note_outcome(scanner, false)
             }
             _ => {}
@@ -1017,9 +977,11 @@ pub async fn takeover_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Re
 /// - is blocked here (scanners here skip it, so its jobs would be stranded;
 ///   any scanner node that blocked it adopts, whatever its rank),
 /// - has been silent for `window` (lowest live scanner only), or
-/// - keeps running but has not touched a job for `window` while this
-///   node's scanner has idle workers (lowest live scanner only): an
-///   arbiter that never hands its jobs out.
+/// - keeps running but has left a job marked running for `window` while
+///   this node's scanner has idle workers (lowest live scanner only): a
+///   grant whose scan cannot still be running. A live arbiter's queued
+///   jobs stay with it: one that no claimant can be paid for waits for
+///   its arbiter's funds, not for another node's.
 async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Result<()> {
     let me = node.id();
     if !node.roles().scanner {
@@ -1077,14 +1039,16 @@ async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Re
             .fetch_all(&node.store.pool)
             .await?
         } else if lowest && idle {
-            // A running job of a live arbiter may be a long level-4 scan
-            // whose lease is renewed without touching the job row: take it
-            // only once no scan can still be running.
+            // Only stale running jobs of a live arbiter: its queued jobs
+            // wait for its own funding (adopting them would have this node
+            // pay for them). A running job may be a long level-4 scan whose
+            // lease is renewed without touching the job row: take it only
+            // once no scan can still be running.
             sqlx::query_scalar(
                 "SELECT uid FROM scan_jobs WHERE arbiter = ?
                    AND MAX(COALESCE(hlc, 0), status_hlc) < ?
-                   AND (status = 'queued' OR (status = 'running'
-                        AND (started_at IS NULL OR started_at < datetime('now', ?))))
+                   AND status = 'running'
+                   AND (started_at IS NULL OR started_at < datetime('now', ?))
                  LIMIT 500",
             )
             .bind(&a)
@@ -1172,6 +1136,7 @@ mod tests {
                 lease_secs: 120,
                 remote_config: false,
                 origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
                 peers: vec![],
             },
             roles: Default::default(),
@@ -1183,42 +1148,32 @@ mod tests {
         .await
         .unwrap();
         node.bootstrap().await.unwrap();
+        // Its scanner runs (it sells at 0 before its first refresh).
+        node.status.local.lock().unwrap().pace = Some(crate::cluster::status::PaceInfo {
+            max_workers: 2,
+            max_scans_per_hour: 60,
+            timeout_secs: 600,
+        });
         let (tx, rx) = tokio::sync::watch::channel(false);
         let arbiter = Arbiter::start(node.clone(), rx).await.unwrap();
         (node, arbiter, store, tx)
     }
 
-    #[tokio::test]
-    async fn no_budget_grants_without_an_offer() {
-        let dir = tempfile::tempdir().unwrap();
-        let (node, arbiter, store, _tx) = setup(dir.path()).await;
-        node.set_scan_share(1.0);
-        let rec = Recorder::Cluster(node.clone());
-        let ip = store
-            .upsert_ip("203.0.113.94".parse().unwrap())
-            .await
-            .unwrap();
-        rec.enqueue_scan(ip.id, 2, 24).await.unwrap();
-        let scanner = Identity::generate().unwrap().id;
-        let g = arbiter.next_job(scanner, &[], 0).await.unwrap();
-        assert_eq!((g.offer_seq, g.price_mc), (None, 0));
-    }
-
-    /// Credits for `node`: the whole mint of a day two days back.
+    /// Credits for `node`: the whole pool of the day two days back.
     async fn give_credits(store: &crate::store::Store, node: NodeId) {
-        use crate::credits::DAY_MS;
-        let day = crate::cluster::hlc::wall_ms() / DAY_MS - 2;
+        let day = (crate::cluster::hlc::wall_ms() / crate::credits::DAY_MS) as u32 - 2;
         sqlx::query(
-            "INSERT INTO credit_scans
-               (scan_uid, job_uid, ip, scanner, trap, hlc, level, job_level, args_ok, judged_at)
-             VALUES ('given', 'given-job', '100.64.0.1', ?, ?, ?, 1, 1, 1, datetime('now'))",
+            "UPDATE members SET address = '198.51.100.1:7443', proto_max = ?,
+               roles_json = '[\"listener\",\"scanner\"]' WHERE id = ?",
         )
+        .bind(crate::cluster::rpc::proto::ECONOMY_PROTO as i64)
         .bind(&node.0[..])
-        .bind(&[0xEE; 32][..])
-        .bind(((day * DAY_MS + 3_600_000) << 16) as i64)
         .execute(&store.pool)
         .await
         .unwrap();
+        crate::credits::pool::testing::report_all_day(&store.pool, day, &[node])
+            .await
+            .unwrap();
     }
 
     /// This node as a scanner selling at `sell_mc`.
@@ -1293,8 +1248,8 @@ mod tests {
     }
 
     /// A requeued own job's reservation never counts again: not when it
-    /// is granted to another scanner, not when it is granted to this one
-    /// unpaid.
+    /// is granted to another scanner, not when this one is over its budget
+    /// (the job waits).
     #[tokio::test]
     async fn a_regranted_job_drops_its_old_reservation() {
         use crate::credits::jobs::self_committed;
@@ -1320,23 +1275,23 @@ mod tests {
             arbiter.set_state(uid, "queued", None, None).await.unwrap();
         }
         assert_eq!(self_committed(&store.pool, &me).await.unwrap(), 0);
-        // Regranted to another scanner (unpaid: no reference here) ...
-        let other = Identity::generate().unwrap().id;
+        // Regranted to another scanner (priced at 0 here) ...
+        let other = zero_scanner(&node).await;
         let g = arbiter.next_job(other, &[], 0).await.unwrap();
-        assert_eq!(status(&store, &g.job_uid).await, "running");
-        assert_eq!(self_mc(&store, &g.job_uid).await, None);
-        // ... and to this scanner at a price over its budget.
-        selling(&node, u32::MAX);
-        let g = arbiter.next_job(me, &[], 0).await.unwrap();
         assert_eq!((g.offer_seq, g.price_mc), (None, 0));
         assert_eq!(status(&store, &g.job_uid).await, "running");
+        assert_eq!(self_mc(&store, &g.job_uid).await, None);
+        // ... and not to this scanner at a price over its budget: the
+        // other job waits, and its old reservation still counts for nothing.
+        selling(&node, u32::MAX);
+        assert!(arbiter.next_job(me, &[], 0).await.is_none());
         assert_eq!(self_committed(&store.pool, &me).await.unwrap(), 0);
     }
 
-    /// A claimant without a reference price here is granted unpaid and
-    /// goes after one with a price.
+    /// A claimant without a reference price here is not granted: the
+    /// job goes to one with a price, or waits.
     #[tokio::test]
-    async fn a_scanner_without_a_reference_goes_after_a_priced_one() {
+    async fn a_scanner_without_a_reference_is_not_granted() {
         let dir = tempfile::tempdir().unwrap();
         let (node, arbiter, store, _tx) = setup(dir.path()).await;
         give_credits(&store, node.id()).await;
@@ -1358,7 +1313,7 @@ mod tests {
         });
         assert!(theirs.is_none());
         assert_eq!(mine.map(|g| g.price_mc), Some(300));
-        // Alone, it is granted unpaid.
+        // Alone, it is not granted: the job waits.
         Recorder::Cluster(node.clone())
             .enqueue_scan(
                 store
@@ -1371,8 +1326,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let g = arbiter.claim(other, vec![], 0).await.unwrap();
-        assert_eq!((g.offer_seq, g.price_mc), (None, 0));
+        assert!(arbiter.claim(other, vec![], 0).await.is_none());
     }
 
     async fn status(store: &crate::store::Store, uid: &str) -> String {
@@ -1407,7 +1361,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (node, arbiter, store, _tx) = setup(dir.path()).await;
         let rec = Recorder::Cluster(node.clone());
-        let scanner = Identity::generate().unwrap().id;
+        let scanner = zero_scanner(&node).await;
         let ip = store
             .upsert_ip("203.0.113.82".parse().unwrap())
             .await
@@ -1447,7 +1401,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let scanner = Identity::generate().unwrap().id;
+        let scanner = zero_scanner(&node).await;
         let urgent: Vec<String> = sqlx::query_scalar("SELECT uid FROM scan_jobs WHERE level = 3")
             .fetch_all(&store.pool)
             .await
@@ -1478,7 +1432,7 @@ mod tests {
             .enqueue_scan(ip.id, 3, 24)
             .await
             .unwrap();
-        let (a, b) = (node.id(), Identity::generate().unwrap().id);
+        let (a, b) = (node.id(), zero_scanner(&node).await);
         let g = arbiter.next_job(a, &[], 0).await.unwrap();
         assert!(
             arbiter
@@ -1536,7 +1490,7 @@ mod tests {
             .enqueue_scan(ip.id, 2, 24)
             .await
             .unwrap();
-        let (a, b) = (node.id(), Identity::generate().unwrap().id);
+        let (a, b) = (node.id(), zero_scanner(&node).await);
         let g = arbiter.next_job(a, &[], 0).await.unwrap();
         let why = Some("Tor exit status unknown (no exit list loaded)".into());
         assert!(arbiter.complete(a, &g.job_uid, "later", why).await);
@@ -1577,7 +1531,7 @@ mod tests {
             .enqueue_scan(ip.id, 2, 24)
             .await
             .unwrap();
-        let a = Identity::generate().unwrap().id;
+        let a = zero_scanner(&node).await;
         let g = arbiter.next_job(a, &[], 0).await.unwrap();
         let why = Some("never_scan 203.0.113.0/24".into());
         assert!(arbiter.complete(a, &g.job_uid, "declined", why).await);
@@ -1600,7 +1554,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (node, arbiter, store, _tx) = setup(dir.path()).await;
         let rec = Recorder::Cluster(node.clone());
-        let scanner = Identity::generate().unwrap().id;
+        let scanner = zero_scanner(&node).await;
         let a = store
             .upsert_ip("203.0.113.90".parse().unwrap())
             .await
@@ -1630,7 +1584,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (node, arbiter, store, _tx) = setup(dir.path()).await;
             let rec = Recorder::Cluster(node.clone());
-            let scanner = Identity::generate().unwrap().id;
+            let scanner = zero_scanner(&node).await;
             let a = store
                 .upsert_ip("203.0.113.92".parse().unwrap())
                 .await
@@ -1677,17 +1631,24 @@ mod tests {
     /// A member with the scanner role, heard from just now, announcing
     /// `price_mc` for a scan job.
     async fn remote_scanner(node: &Node, price_mc: u32) -> NodeId {
+        remote_member(node, "scanner", price_mc).await
+    }
+
+    /// A member with `role`, heard from just now, announcing `price_mc`
+    /// for a scan job.
+    async fn remote_member(node: &Node, role: &str, price_mc: u32) -> NodeId {
         let id = Identity::generate().unwrap().id;
         let now = crate::cluster::hlc::wall_ms() << 16;
         sqlx::query(
             "INSERT INTO members (id, name, roles_json, proto_min, proto_max, sponsor,
                                   info_hlc, admitted_hlc)
-             VALUES (?1, ?2, '[\"scanner\"]', 1, ?3, ?1, ?4, ?4)",
+             VALUES (?1, ?2, json_array(?5), 1, ?3, ?1, ?4, ?4)",
         )
         .bind(&id.0[..])
         .bind(format!("s-{price_mc}"))
-        .bind(crate::cluster::rpc::proto::SCAN_PRICE_PROTO as i64)
+        .bind(crate::cluster::rpc::proto::ECONOMY_PROTO as i64)
         .bind(now as i64)
+        .bind(role)
         .execute(&node.store.pool)
         .await
         .unwrap();
@@ -1696,7 +1657,7 @@ mod tests {
             node: id,
             at_ms: crate::cluster::hlc::wall_ms(),
             neighbours: vec![],
-            roles: vec!["scanner".into()],
+            roles: vec![role.into()],
             version: String::new(),
             pace: None,
             active_scans: 0,
@@ -1711,6 +1672,7 @@ mod tests {
             scan_price_mc: Some(price_mc),
             scan_budget_mc: 0,
             scan_queued: 0,
+            relays: vec![],
         };
         let signed = crate::cluster::status::SignedHeartbeat {
             body: vec![],
@@ -1848,8 +1810,8 @@ mod tests {
         );
         let h = handout_of(&store, &l4).await;
         assert_eq!(
-            (h.scanner, h.paid, h.reason),
-            (fast, true, crate::scan::handout::Reason::Cheapest)
+            (h.scanner, h.reason),
+            (fast, crate::scan::handout::Reason::Cheapest)
         );
         assert_eq!(h.next.map(|n| n.0), Some(flaky));
         assert!(h.next.unwrap().1 > h.effective_mc);
@@ -1965,50 +1927,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unpaid_job_skips_scanners_sitting_its_level_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let (node, arbiter, store, _tx) = setup(dir.path()).await;
-        // No credits: nothing is paid. Flaky fails nearly every level-4
-        // scan (weight 0.1); Slow has no price here, so ranks after it.
-        let flaky = remote_scanner(&node, 20).await;
-        let slow = remote_scanner(&node, 30).await;
-        references(&node, &[(flaky, 20, 100.0)]);
-        history(&store, flaky, 4, 0, 40).await;
-        history(&store, slow, 4, 10, 0).await;
-        let uid = queue(&node, &store, 4, 4).await;
-        let before = crate::scan::weight::draw(flaky, 4, crate::scan::weight::unix_now());
-        let got = arbiter
-            .round(&[claim_of(flaky, &[]), claim_of(slow, &[])])
-            .await
-            .unwrap();
-        let after = crate::scan::weight::draw(flaky, 4, crate::scan::weight::unix_now());
-        let offers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credit_entries")
-            .fetch_one(&store.pool)
-            .await
-            .unwrap();
-        assert_eq!(offers, 0, "the funding check writes nothing");
-        let h = handout_of(&store, &uid).await;
-        assert_eq!(
-            (h.paid, h.reason),
-            (false, crate::scan::handout::Reason::Unpaid)
-        );
-        if before == after {
-            if before >= crate::scan::weight::MIN_WEIGHT {
-                assert!(got[0].is_none(), "Flaky sits level 4 out");
-                assert_eq!((h.scanner, h.sat_out), (slow, 1));
-            } else {
-                assert_eq!((h.scanner, h.sat_out), (flaky, 0));
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn two_claims_of_one_scanner_get_two_jobs() {
         let dir = tempfile::tempdir().unwrap();
         let (node, arbiter, store, _tx) = setup(dir.path()).await;
         let a = queue(&node, &store, 1, 2).await;
         let b = queue(&node, &store, 2, 2).await;
-        let other = Identity::generate().unwrap().id;
+        let other = zero_scanner(&node).await;
         let got = arbiter
             .round(&[claim_of(other, &[]), claim_of(other, &[])])
             .await
@@ -2059,7 +1983,7 @@ mod tests {
         .execute(&store.pool)
         .await
         .unwrap();
-        let other = Identity::generate().unwrap().id;
+        let other = zero_scanner(&node).await;
         let got = arbiter
             .round(&[claim_of(other, &[]), claim_of(other, &[])])
             .await
@@ -2135,17 +2059,124 @@ mod tests {
         assert_eq!((h.scanner, h.next.map(|n| n.0)), (fast, Some(flaky)));
     }
 
-    /// An unpaid grant says why it is unpaid.
+    /// A member scanner priced at 0, with this node's copy of its price:
+    /// granted at zero, without credits.
+    async fn zero_scanner(node: &Node) -> NodeId {
+        use crate::credits::price::{Limit, ScannerCapacity, ScannerPrice};
+        let id = remote_scanner(node, 0).await;
+        let mut t = (*node.price_table()).clone();
+        t.scanners.push(ScannerPrice {
+            node: id,
+            price_mc: 0,
+            paid: 0.0,
+            supply: 0.0,
+        });
+        t.capacity.scanners.push(ScannerCapacity {
+            node: id,
+            can_do: 100.0,
+            did: 0.0,
+            limited_by: Limit::PerHour,
+        });
+        node.set_price_table(Arc::new(t));
+        id
+    }
+
     #[tokio::test]
-    async fn an_unpaid_grant_says_why() {
+    async fn a_zero_priced_scanner_is_granted_without_an_offer() {
         let dir = tempfile::tempdir().unwrap();
         let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        let free = zero_scanner(&node).await;
         let uid = queue(&node, &store, 2, 2).await;
-        let other = Identity::generate().unwrap().id;
-        arbiter.next_job(other, &[], 0).await.unwrap();
+        let g = arbiter.next_job(free, &[], 0).await.unwrap();
         assert_eq!(
-            handout_of(&store, &uid).await.reason,
-            crate::scan::handout::Reason::NoPrice
+            (g.job_uid.as_str(), g.offer_seq, g.price_mc),
+            (uid.as_str(), None, 0)
         );
+        let h = handout_of(&store, &uid).await;
+        assert_eq!(h.reason, crate::scan::handout::Reason::Cheapest);
+    }
+
+    #[tokio::test]
+    async fn a_scanner_announcing_zero_is_granted_before_this_node_has_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        // No `references`: this node has no copy of its price yet.
+        let fresh = remote_scanner(&node, 0).await;
+        let pricey = remote_scanner(&node, 40).await;
+        let uid = queue(&node, &store, 2, 2).await;
+        assert!(
+            arbiter.next_job(pricey, &[], 0).await.is_none(),
+            "40 cannot be capped yet"
+        );
+        let g = arbiter.next_job(fresh, &[], 0).await.unwrap();
+        assert_eq!((g.job_uid.as_str(), g.price_mc), (uid.as_str(), 0));
+    }
+
+    #[tokio::test]
+    async fn a_job_nobody_can_be_paid_for_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        // Priced, but this node holds no credits; and one without a price here.
+        let priced = remote_scanner(&node, 30).await;
+        references(&node, &[(priced, 30, 100.0)]);
+        let unknown = Identity::generate().unwrap().id;
+        let uid = queue(&node, &store, 2, 2).await;
+        let got = arbiter
+            .round(&[claim_of(priced, &[]), claim_of(unknown, &[])])
+            .await
+            .unwrap();
+        assert!(got.iter().all(Option::is_none), "{got:?}");
+        assert_eq!(status(&store, &uid).await, "queued");
+    }
+
+    /// The lowest idle scanner adopts a live arbiter's stale running job,
+    /// whose scan cannot still be running, but not its stale queued job:
+    /// that waits for its arbiter's funding.
+    #[tokio::test]
+    async fn a_live_arbiters_queued_jobs_are_not_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _arbiter, store, _tx) = setup(dir.path()).await;
+        let live = remote_member(&node, "listener", 0).await;
+        let ip = store
+            .upsert_ip("198.51.100.77".parse().unwrap())
+            .await
+            .unwrap();
+        let old = format!("-{} hours", crate::scan::pace::STALE_RUNNING_HOURS + 1);
+        for (uid, status, started) in [("q", "queued", None), ("r", "running", Some(&old))] {
+            sqlx::query(
+                "INSERT INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at,
+                                        started_at, scanner)
+                 VALUES (?1, ?2, ?2, 1, ?3, 2, ?4, datetime('now', '-1 day'),
+                         datetime('now', ?5), CASE WHEN ?5 IS NULL THEN NULL ELSE ?2 END)",
+            )
+            .bind(uid)
+            .bind(&live.0[..])
+            .bind(ip.id)
+            .bind(status)
+            .bind(started)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        takeover_once(
+            &node,
+            &Recorder::Cluster(node.clone()),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let arbiter_of = |uid: &'static str| {
+            let store = store.clone();
+            async move {
+                let a: Vec<u8> = sqlx::query_scalar("SELECT arbiter FROM scan_jobs WHERE uid = ?")
+                    .bind(uid)
+                    .fetch_one(&store.pool)
+                    .await
+                    .unwrap();
+                NodeId::from_slice(&a).unwrap()
+            }
+        };
+        assert_eq!(arbiter_of("q").await, live, "queued: waits for its arbiter");
+        assert_eq!(arbiter_of("r").await, node.id(), "stale running: adopted");
     }
 }

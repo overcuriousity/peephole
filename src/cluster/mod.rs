@@ -11,6 +11,7 @@ pub mod members;
 pub mod msg;
 pub mod owner;
 pub mod record;
+pub mod relay;
 pub mod remote;
 pub mod repl;
 pub mod rpc;
@@ -278,10 +279,18 @@ pub struct Node {
     lookup_shares: std::sync::OnceLock<crate::credits::share::Shares>,
     /// This node's observational prober, when it probes (`scan::probe`).
     prober: std::sync::OnceLock<Arc<crate::scan::probe::serve::Prober>>,
+    rdns_lookup: std::sync::OnceLock<crate::intel::rdns::RdnsLookup>,
     /// This node's lookup prices, as last computed (`credits::price`).
     price_table: RwLock<Arc<crate::credits::price::Table>>,
+    /// The advertised members this node reached, per hour, until reported
+    /// (`credits::reach`).
+    pub reach: crate::credits::reach::Tracker,
     /// Paid requests counted for this node's prices (`credits::price`).
     pub market: crate::credits::price::Demand,
+    /// The relay leases this node sells to outbound-only members.
+    pub relay_leases: relay::Leases,
+    /// The relay leases this outbound-only node took.
+    pub leased: relay::Leased,
     /// The hourly per-level scanner weights (`scan::weight`).
     pub weights: crate::scan::weight::Weights,
     /// This node's scan budget left and queued jobs, for the heartbeat
@@ -292,6 +301,13 @@ pub struct Node {
     /// Offers a paid lookup is being served for right now: `(payer,
     /// sequence number)`. An offer is served once.
     pub(crate) serving_offers: Mutex<std::collections::HashSet<(NodeId, u64)>>,
+    /// Bought audits waiting for a free worker (`credits::audit`).
+    pub audit_queue: Mutex<crate::credits::audit::Queue>,
+    /// This node's designated scans whose audit it tried to buy.
+    pub audits_tried: Mutex<std::collections::HashSet<String>>,
+    /// What would keep this node's scan workers from running an audit
+    /// (`credits::audit::Check`); None while no workers run.
+    pub audit_check: Mutex<Option<crate::credits::audit::Check>>,
     pub data_dir: std::path::PathBuf,
     /// Contacts and heartbeats (ephemeral).
     pub status: status::Status,
@@ -354,13 +370,20 @@ impl Node {
             lookup_providers: Default::default(),
             lookup_shares: Default::default(),
             prober: Default::default(),
+            rdns_lookup: Default::default(),
             price_table: Default::default(),
+            reach: Default::default(),
             market: Default::default(),
+            relay_leases: Default::default(),
+            leased: Default::default(),
             weights: Default::default(),
             scan_budget_mc: Default::default(),
             scan_queued: Default::default(),
             scan_share: Default::default(),
             serving_offers: Mutex::new(Default::default()),
+            audit_queue: Default::default(),
+            audits_tried: Default::default(),
+            audit_check: Default::default(),
             data_dir: p.data_dir,
             status: Default::default(),
             msg: Default::default(),
@@ -543,6 +566,16 @@ impl Node {
         self.prober.get()
     }
 
+    /// Tests: answer reverse lookups with `f` instead of the system resolver.
+    #[doc(hidden)]
+    pub fn set_rdns_lookup(&self, f: crate::intel::rdns::RdnsLookup) {
+        let _ = self.rdns_lookup.set(f);
+    }
+
+    pub fn rdns_lookup(&self) -> Option<&crate::intel::rdns::RdnsLookup> {
+        self.rdns_lookup.get()
+    }
+
     pub fn price_table(&self) -> Arc<crate::credits::price::Table> {
         self.price_table.read().unwrap().clone()
     }
@@ -590,12 +623,20 @@ impl Node {
         }
     }
 
-    /// Whether `id` speaks routed RPC and a route avoiding members too old
-    /// to relay it exists.
+    /// Whether `id` speaks routed RPC, has an address or lists relays, and
+    /// a route avoiding members too old to relay it exists.
     pub(crate) fn routed_callable(&self, id: &NodeId) -> bool {
+        // An outbound-only member without relays cannot be asked.
+        let reached = |m: &MemberRow| {
+            m.address.is_some()
+                || self
+                    .status
+                    .known(id)
+                    .is_some_and(|k| !k.hb.relays.is_empty())
+        };
         self.members()
             .get(id)
-            .is_some_and(|m| m.proto_max >= rpc::proto::ROUTED_PROTO)
+            .is_some_and(|m| m.proto_max >= rpc::proto::ROUTED_PROTO && reached(m))
             && self.routable(
                 id,
                 &owner::cmd::old_relays(self, id, rpc::proto::ROUTED_PROTO),
@@ -796,6 +837,17 @@ impl Node {
 
     pub fn members(&self) -> Arc<HashMap<NodeId, MemberRow>> {
         self.members.read().unwrap().clone()
+    }
+
+    /// Whether sync serves `peer` as an older member (each origin up to
+    /// its first entry only protocol 7 knows): anyone not known here as a
+    /// member of protocol 7. A joining node is served so until it is
+    /// listed, then catches up.
+    pub fn old_peer(&self, peer: &NodeId) -> bool {
+        !self
+            .members()
+            .get(peer)
+            .is_some_and(|m| m.proto_max >= rpc::proto::ECONOMY_PROTO)
     }
 
     /// Active members we can dial: `(id, name, address)`. None while this

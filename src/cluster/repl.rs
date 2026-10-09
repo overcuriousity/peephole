@@ -244,12 +244,17 @@ pub async fn refused_origins(node: &Node) -> Result<HashSet<NodeId>> {
 /// keeps a window (`since_hlc > 0`) at the first entry inside it, whichever
 /// is later. When that is past what was asked for, the membership entries
 /// before it go along and `floors` says where the full history starts.
+///
+/// `old_peer`: an older member: each origin stops at its first entry only
+/// protocol 7 knows (`WireEntry::needs_economy_proto`), so it never sees a
+/// gap; it catches up once it upgrades.
 pub async fn entries_after(
     store: &crate::store::Store,
     wants: &[(NodeId, u64)],
     since_hlc: u64,
     max_entries: usize,
     max_bytes: usize,
+    old_peer: bool,
 ) -> Result<Batch> {
     let mut conn = store.pool.acquire().await?;
     let purged = purged_set(&mut conn).await?;
@@ -279,8 +284,14 @@ pub async fn entries_after(
             start = start.max(super::history::cut(&mut conn, origin, start, since_hlc).await?);
         }
         if start > after + 1 {
+            let bound = signed_entry(&mut conn, origin, start - 1).await?;
+            // An older member could not verify a bound only protocol 7
+            // knows: this origin waits until it upgrades.
+            if old_peer && bound.as_ref().is_some_and(|b| b.needs_economy_proto()) {
+                continue;
+            }
             declared.push((*origin, start));
-            if let Some(b) = signed_entry(&mut conn, origin, start - 1).await? {
+            if let Some(b) = bound {
                 bounds.push(b);
             }
         }
@@ -320,6 +331,9 @@ pub async fn entries_after(
             .chain(parked.into_iter().map(Ok));
         for e in candidates {
             let mut e = e?;
+            if old_peer && e.needs_economy_proto() {
+                break;
+            }
             if e.payload.is_none() && e.erased_by.is_none() {
                 // Row-backed: rebuild the signed payload from the row.
                 let rebuilt = match &e.uid {
@@ -1761,6 +1775,7 @@ mod tests {
                 lease_secs: 120,
                 remote_config: false,
                 origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
                 peers: vec![],
             },
             roles: Default::default(),
@@ -1826,6 +1841,7 @@ mod tests {
                 lease_secs: 120,
                 remote_config: false,
                 origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
                 peers: vec![],
             },
             roles: Default::default(),
@@ -1873,6 +1889,7 @@ mod tests {
                     lease_secs: 120,
                     remote_config: false,
                     origin_quota_mb: 20 * 1024,
+                    relay_slots: 16,
                     peers: vec![],
                 },
                 roles: Default::default(),
@@ -2022,6 +2039,7 @@ mod tests {
                 scan_price_mc: None,
                 scan_budget_mc: 0,
                 scan_queued: 0,
+                relays: vec![],
             };
             let body = super::super::rpc::cbor::encode(&hb).unwrap();
             let signed = super::super::status::SignedHeartbeat { body, sig: vec![] };
@@ -2172,7 +2190,7 @@ mod tests {
         // Still unknown after a restart's retry.
         super::apply_unknown_kinds(&node).await.unwrap();
 
-        let batch = super::entries_after(&node.store, &[(a.id, 0)], 0, 100, 1 << 20)
+        let batch = super::entries_after(&node.store, &[(a.id, 0)], 0, 100, 1 << 20, false)
             .await
             .unwrap();
         let sent = batch
@@ -2274,6 +2292,7 @@ mod tests {
             scan_price_mc: None,
             scan_budget_mc: 0,
             scan_queued: 0,
+            relays: vec![],
         };
         let body = super::super::rpc::cbor::encode(&hb).unwrap();
         let signed = super::super::status::SignedHeartbeat { body, sig: vec![] };
@@ -2312,12 +2331,124 @@ mod tests {
         assert!(!node.keeps_more_elsewhere(&m.id, &other, 0));
     }
 
+    /// An older member is served each origin up to its first entry only
+    /// protocol 7 knows, never past it (no gap); a protocol-7 member gets all.
+    #[tokio::test]
+    async fn an_older_member_is_not_served_entries_of_protocol_seven() {
+        use crate::cluster::record::{ReachReportRec, Record};
+        let (_d, node) = test_node(0).await;
+        let first = super::append(
+            &node,
+            &[Record::LogSeal {
+                seal: Default::default(),
+            }],
+        )
+        .await
+        .unwrap();
+        super::append(
+            &node,
+            &[Record::ReachReport(ReachReportRec {
+                hour: crate::credits::reach::hour_of(crate::cluster::hlc::wall_ms()),
+                reached: vec![],
+            })],
+        )
+        .await
+        .unwrap();
+        let wants = [(node.id(), first[0].seq - 1)];
+        let old = super::entries_after(&node.store, &wants, 0, 100, 1 << 20, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            old.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [first[0].seq]
+        );
+        let new = super::entries_after(&node.store, &wants, 0, 100, 1 << 20, false)
+            .await
+            .unwrap();
+        assert_eq!(new.entries.len(), 2);
+    }
+
+    /// Payments of the economy before are served to an older member; the
+    /// first payment of protocol 7's economy cuts its stream like a reach
+    /// report, and what follows either cut (of any kind) waits.
+    #[tokio::test]
+    async fn an_older_member_gets_old_payments_up_to_the_first_new_one() {
+        use crate::cluster::record::{ECONOMY, ReachReportRec, Record};
+        let (_d, node) = test_node(0).await;
+        let day = crate::credits::day_of(crate::cluster::hlc::wall_ms() << 16);
+        let to = NodeId([7; 32]);
+        let transfer = |economy: u8| {
+            move |seal| Record::CreditTransfer {
+                to,
+                parts: vec![(day, 5)],
+                seal,
+                economy,
+            }
+        };
+        async fn seal(node: &super::Node) -> u64 {
+            let bare = [Record::LogSeal {
+                seal: Default::default(),
+            }];
+            super::append(node, &bare).await.unwrap()[0].seq
+        }
+        let s1 = seal(&node).await;
+        let old = super::append_sealing(&node, transfer(0)).await.unwrap().seq;
+        let report = super::append(
+            &node,
+            &[Record::ReachReport(ReachReportRec {
+                hour: crate::credits::reach::hour_of(crate::cluster::hlc::wall_ms()),
+                reached: vec![],
+            })],
+        )
+        .await
+        .unwrap()[0]
+            .seq;
+        let s2 = seal(&node).await;
+        let new = super::append_sealing(&node, transfer(ECONOMY))
+            .await
+            .unwrap()
+            .seq;
+        let s3 = seal(&node).await;
+        async fn served(node: &super::Node, after: u64, old_peer: bool) -> Vec<u64> {
+            super::entries_after(
+                &node.store,
+                &[(node.id(), after)],
+                0,
+                100,
+                1 << 20,
+                old_peer,
+            )
+            .await
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.seq)
+            .collect()
+        }
+        assert_eq!(
+            served(&node, s1 - 1, true).await,
+            [s1, old],
+            "up to the report"
+        );
+        assert_eq!(
+            served(&node, report, true).await,
+            [s2],
+            "up to the new payment"
+        );
+        assert_eq!(served(&node, new, true).await, [s3]);
+        assert_eq!(
+            served(&node, s1 - 1, false).await,
+            [s1, old, report, s2, new, s3],
+            "a protocol-7 member gets everything"
+        );
+    }
+
     /// A peer asking from the very end of the range gets nothing, not a
     /// panic or a wrapped query.
     #[tokio::test]
     async fn entries_after_the_last_sequence_are_none() {
         let (_d, node) = test_node(0).await;
-        let b = super::entries_after(&node.store, &[(node.id(), u64::MAX)], 0, 10, 1 << 20)
+        let b = super::entries_after(&node.store, &[(node.id(), u64::MAX)], 0, 10, 1 << 20, false)
             .await
             .unwrap();
         assert!(b.entries.is_empty() && b.floors.is_empty());
@@ -2394,7 +2525,7 @@ mod tests {
             .await
             .unwrap();
         let served = |node: std::sync::Arc<super::Node>| async move {
-            super::entries_after(&node.store, &[(node.id(), 0)], 0, 100, 1 << 20)
+            super::entries_after(&node.store, &[(node.id(), 0)], 0, 100, 1 << 20, false)
                 .await
                 .unwrap()
         };
@@ -2486,7 +2617,7 @@ mod tests {
         };
 
         // Two entries of a's log: the admission of b is far behind them.
-        let mut batch = super::entries_after(&a.store, &[(a.id(), 0)], 0, 2, 1 << 20)
+        let mut batch = super::entries_after(&a.store, &[(a.id(), 0)], 0, 2, 1 << 20, false)
             .await
             .unwrap();
         assert!(batch.entries.iter().all(|e| e.kind != "member_add"));
@@ -2498,7 +2629,7 @@ mod tests {
         assert!(joiner.members().contains_key(&b.id));
 
         // The rest of a's log still arrives in order, admission included.
-        let rest = super::entries_after(&a.store, &[(a.id(), 0)], 0, 100, 1 << 20)
+        let rest = super::entries_after(&a.store, &[(a.id(), 0)], 0, 100, 1 << 20, false)
             .await
             .unwrap();
         let st = super::apply_batch(&joiner, rest).await.unwrap();

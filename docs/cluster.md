@@ -24,11 +24,14 @@ joins; a running node picks a join up without a restart.
 Outbound-only is the fallback for a node nobody can reach (no public
 address, no port forwarding), set by hand: delete `advertise` and set
 `listen` to loopback (`127.0.0.1:7443`), then restart peephole. Such a node
-dials its peers and still syncs both ways, and receives directed messages
-(it fetches them from its peers' outboxes), so from protocol 6 it also
-answers paid lookups, DNS resolutions and probes that arrive as such
-messages: it and the member whose outbox it polls must run protocol 6. It
-cannot issue invites: a joiner could not reach it.
+dials its peers and still syncs both ways. From protocol 7 it leases two
+relays from reachable members (an hour at a time, at their relay price,
+renewed 5 minutes before the end) and fetches its directed messages from
+their outboxes only; members reach it through the relays its heartbeat
+lists. Without a lease it still syncs and receives the answers to its own
+requests, but it cannot be asked anything, paid or not (remote config and
+owner commands included), until it leases a relay. It gets no share of the
+daily pool: only members anyone can reach do. It cannot issue invites: a joiner could not reach it.
 
 Then add nodes:
 
@@ -51,7 +54,7 @@ peephole owner release                    # this node has no owner afterwards
 peephole credits                          # this node's credits, by day
 peephole credits log [--days N]           # earned, spent, sent, received (up to 7 days)
 peephole credits members                  # every member's balance and whether it earns here
-peephole credits why <scan>               # how this node judged one scan, and what it paid
+peephole credits uptime                  # members' reported hours up, 7 days
 peephole credits send <node> <amount>     # send credits to a member
 ```
 
@@ -173,47 +176,59 @@ gone. `remote_config` in a config file is ignored.
 
 ## Credits: a market for the cluster's work
 
-Services between nodes (lookups, probes, domain resolutions, scan jobs) are
-paid with **credits**. Every price is set by supply and demand; scanners
-earn most of the new money, every member a little.
+Everything the cluster does for a member is a good that member buys with
+**credits**: lookups, name resolutions, reverse names, probes, scan jobs,
+audits and relay leases. The supply is fixed; prices follow sales.
 
-- **Where credits come from.** Two doors only. The daily mint: 1000
-  credits split among scanners by their counted scans of the UTC day;
-  levels 3 and 4 count twice, levels 1 and 2 once. A scan counts when a
-  request held on the judging node backs it, once per address in 24 hours,
-  500 a day per scanner, with the built-in arguments, and never when the
-  scanner is the trap that queued the job. The allowance: 5 credits a day
-  for every member that earns here and recorded a request that day.
-  Both are credited when the UTC day ends.
-- **Where they go.** A credit is gone 7 days after its day. Nothing else
-  destroys credits: a payment moves the full price.
-- **Prices.** One rule per good, computed every 10 minutes on each node: excess
-  demand raises a price by at most a factor of e^0.45 an hour, excess
-  supply lowers it by at most a factor of e^-0.15 an hour (each step is
-  scaled by the time since the last one, so a 10-minute refresh takes a
-  sixth of an hourly step), a price moves at least 0.001 credits toward the
-  imbalance, and it never goes under 0.001 credits. What a node answers
-  itself is free (its own providers, prober, resolver, scanner), though
-  its own scan jobs use up its scan budget like jobs it buys. Scan
-  prices are per scanner: each scanner's price follows its paid scans of
-  the past hour (each job once, by the scanner that ran it, at most its
-  capacity) against 90 % of its capacity, by a step scaled to the time
-  since its last one. Every node computes every
-  scanner's price from the log and the heartbeats, and pays at most 1.25
-  times its own figure. What
-  another node answers is paid, whoever owns it, the Tor exit list,
-  RDAP, InternetDB and GeoLite2 included; there is no free quota. A
-  provider with an API budget offers its on-demand share (`[enrichment]
-  on_demand_share`); one without, and name resolution, offer
-  `[enrichment] offer_per_day` (default 1000) a day. Askers go to the cheapest server first. The Lookup page runs this
-  node's own providers by itself and asks other nodes only for the
-  providers picked; an automatic lookup never buys from another node.
-- **Domains.** A lookup of a domain asks 5 resolvers (nodes of the
-  cluster) and lists each address with its votes; an address stands when
-  most of the resolvers that answered returned it. Each other resolver is
-  paid its announced price when it answers; a failed resolution costs
-  nothing; this node's own resolver is free. Agreed names are replicated
-  as `ip_name` records and appear in the dataset's `names` column.
+- **Where credits come from.** One door: the daily pool. At the end of
+  each UTC day 1000 credits are split evenly among that day's verified
+  listeners: members with the listener role and an advertised address that
+  were up in at least 12 of the day's 24 hours (and ran protocol 7 that
+  day: they wrote a `reach_report` for an hour of it); the
+  remainder, 0.001 each, goes to the lowest keys; the pool is credited an
+  hour after midnight. Up means reported: every member writes one
+  `reach_report` an hour naming the advertised members it completed a sync
+  round with, and a member is up in an hour when more than half of that
+  hour's reports from other advertised members (not blocked or left out
+  here) name it; outbound-only members write none. A member
+  that does not earn on your node gets no share there, and its share goes
+  to nobody. `peephole credits uptime` lists each member's hours.
+- **Where they go.** Nowhere: nothing burns. A credit keeps its day when
+  it changes hands and is gone 7 days after it, so at most six pools are
+  in circulation. Sellers keep what they charge.
+- **Prices.** One rule for every good, on each node every 10 minutes: a
+  good that sold since the last refresh (or whose every slot is taken)
+  gets dearer by at most a factor of e^0.45 an hour; one that sold nothing
+  gets cheaper by e^-0.15 an hour; each step is scaled by the time since
+  the last (so a 10-minute refresh takes a sixth of an hourly step) and
+  moves at least 0.001 credits. There is no floor: a good nobody buys
+  becomes free, and a free good that is used costs 0.001 at the next
+  refresh. A request may carry no offer: the server answers what it prices
+  at zero and declines the rest naming the price, which the asker may offer
+  once. What a node answers itself is free (its own providers, prober,
+  resolver, scanner), though its own scan jobs use up its scan budget like
+  jobs it buys. Scan prices are per scanner, computed by every node from
+  the scans of jobs other arbiters granted it (its own jobs are no sales);
+  an arbiter pays at most 1.25 times its own figure. What another node
+  answers is paid, whoever owns it, the Tor exit list, RDAP, InternetDB
+  and GeoLite2 included; there is no free quota. A provider with an API
+  budget offers its on-demand share (`[enrichment] on_demand_share`); one
+  without, and name resolution, offer `[enrichment] offer_per_day`
+  (default 1000) a day. Askers go to the cheapest server first. The Lookup
+  page runs this node's own providers by itself and asks other nodes only
+  for the providers picked; an automatic lookup never buys from another
+  node.
+- **Domains and reverse names.** Quorum goods: `q = min(9, ⌊n/2⌋+1)`
+  nodes are asked, n being the reachable members announcing a price (this
+  node included): this node and the q−1 cheapest, other operators and new
+  countries first among equals. A lookup of a domain lists each address
+  with its votes; an answer stands when more than half of those that
+  answered gave it. Each other node is paid its announced price when it
+  answers; a failed resolution costs nothing; this node's own resolver is
+  free. Agreed names are replicated as `ip_name` records and appear in the
+  dataset's `names` column. Only the node that recorded a source buys its
+  reverse names (forward-confirmed PTR names); the answers replicate as
+  `rdns_name` records and every node keeps the names with their agreement.
 - **Probes.** An observational probe of the ports a scan found open is
   priced on each scanner like a provider, with its probe slots as supply,
   and paid per vantage. The offer is accepted first, the result arrives
@@ -224,51 +239,69 @@ earn most of the new money, every member a little.
   scanners skip their evidence re-check for it — the safety preflight
   (protected addresses, Tor exits, verified crawlers) still applies.
 - **Scan jobs.** The arbiter (the node that queued the job) funds its jobs
-  from its own balance, up to `[credits] scan_share` (default 0.5) of it,
-  and hands each job to the scanner asking that is cheapest **per
-  delivered result** at the job's level: its price divided by its success
-  rate there, relative to the best live scanner with at least 5 scans at
-  that level (the level weight, at least 0.1). A failed scan is not paid,
-  so a scanner that fails a level often wins it only if its price makes
-  up for it. The success rates are measured once an hour: the snapshot of
-  hour H counts the scans finished in the 24 hours before H and is taken
-  at H + 5 min, so arbiters with the same log agree. A job is paid to the
-  best claimant the scan budget can pay (one that takes no less than more
-  than its price here is passed over). A paid job waits for a cheaper live
-  scanner (not hoarding, not paused, under its capacity, with a record at
-  that level, and able to take the job: it did not hand it back, and its
-  last claim here neither excluded the level nor asked more than its
-  price) for up to 30 minutes, then goes to whoever asks. A job no
-  claimant can be paid for is idle work: there,
-  a scanner that fails a level more than the others still sits it out
-  for 10-minute stretches, a share of 1 − weight of them. A round reads
-  the queue 200 jobs at a time, up to 5000, past those every claimant
-  handed back; an error ends the round but keeps its grants. Why a
-  job went where is kept by its arbiter in `job_handouts` (local, 8 days)
-  and shown on the scan page and as a title in the Scans history; other
-  nodes say which node handed it out. A scanner asks
-  arbiters that can pay its price first, in urgency order. A node's own
-  jobs are funded from the same budget without moving credits. Scanners
-  that hoard (over their hourly capacity, or delivering less than half of
-  5 recent grants) go last. The scanner charges the offered price when it
-  delivers the result, and nothing when it does not. A scan offer lapses
-  after the longest scan (12 hours plus 2 minutes). Jobs that are not
-  funded are scanned by idle capacity and earn the mint only.
-- **Every node counts for itself**, from its own copy of the log. There is
-  no vote and no shared chain; `Cluster › Credits` shows the market as
-  this node sees it: each good's price over 7 days beside the spread
-  members announce, its demand and supply, this node's daily income by
-  source and spending, every member's holdings, and why a scan was not
-  counted. Prices are kept hourly in `price_history` (local, 8 days; the
-  last refresh of an hour stands for it). The scanner table shows, per
-  level, what one delivered result costs with each scanner, the cheapest
-  in bold.
-  The balance itself is on the Overview and the Lookup page.
-- **Conformity and audits.** A member earns on your node only while at
-  least 98 % of its newest 500 requests classify the same with your
-  rules, and its scans stand up to the audits you believe: those of your
-  own nodes. A scanner runs 5 % of the other nodes' fresh scans again
-  (`[credits] audit_share`); audits earn nothing.
+  from its own balance, up to `[credits] scan_share` (default 0.5) of it, and
+  hands each job to the scanner asking that is cheapest **per delivered
+  result** at the job's level: its price divided by its success rate there,
+  relative to the best live scanner with at least 5 scans at that level (the
+  level weight, at least 0.1). A failed scan is not paid, so a scanner that
+  fails a level often wins it only if its price makes up for it. The success
+  rates are measured once an hour: the snapshot of hour H counts the scans
+  finished in the 24 hours before H and is taken at H + 5 min, so arbiters
+  with the same log agree. A job is paid to the best claimant the scan budget
+  can pay (one that takes more than its price here is passed over). A paid job waits for a cheaper live scanner (not hoarding, not
+  paused, under its capacity, with a record at that level, and able to take
+  the job: it did not hand it back, and its last claim here neither excluded
+  the level nor asked more than its price) for up to 30 minutes, then goes to
+  whoever asks. A job no claimant can be paid for waits, also when its arbiter
+  is live; takeover adopts only the stale running jobs of a live arbiter
+  (queued ones only from blocked or silent arbiters). A round reads the queue
+  200 jobs at a time, up to 5000, past those every claimant handed back; an
+  error ends the round but keeps its grants. Why a job went where is kept by
+  its arbiter in `job_handouts` (local, 8 days) and shown on the scan page and
+  as a title in the Scans history; other nodes say which node handed it out. A
+  scanner asks arbiters that can pay its price first, in urgency order. A
+  node's own jobs are funded from the same budget without moving credits.
+  Scanners that hoard (over their hourly capacity, or delivering less than
+  half of 5 recent grants) go last. The scanner charges the offered price when
+  it delivers the result, and nothing when it does not. A scan offer lapses
+  after the longest scan (12 hours plus 2 minutes). Every grant is funded, at
+  zero or above: a scanner priced at 0 is granted without an offer.
+  `scan_share = 0` funds only free scanners.
+- **Every node counts for itself**, from its own copy of the log. There is no
+  vote and no shared chain; `Cluster › Credits` shows the market as this node
+  sees it: each good's price over 7 days beside the spread members announce,
+  its demand and supply, this node's daily income by source and spending,
+  every member's holdings and reported hours up. Prices are kept hourly in
+  `price_history` (local, 8 days; the last refresh of an hour stands for it).
+  The scanner table shows, per level, what one delivered result costs with
+  each scanner, the cheapest in bold. The balance itself is on the Overview
+  and the Lookup page.
+- **Conformity and audits.** A member earns on your node only while at least
+  98 % of its newest 500 requests classify the same with your rules, and its
+  scans stand up to the audits you believe: those of your own nodes. One in 20
+  scans of paid jobs (granted by another arbiter and charged for; a job
+  granted at zero owes no audit) is designated for a bought audit by a hash
+  of the job and the arbiter's done status, which the scanner cannot steer
+  or know before it has published the result; the same hash ranks the
+  scan's three auditors among the scanners admitted by then. The scanner
+  buys the audit from the first of them that is reachable and priced (an
+  auditor declines an audit it would not run, and the scanner asks the
+  next; one that names a higher price is offered it once), and tries again
+  while the scan is in its 30-minute window; the auditor is paid when it
+  publishes the audit, and releases stale offers. A scanner with two or
+  more designated scans of 7 days unaudited and under 80 % bought is not
+  funded by arbiters, and its scan receipts count for nothing, until it
+  catches up; a designated scan with no auditor to buy from is not
+  counted. Each scanner also re-runs `[credits] audit_share` (5 %) of other
+  nodes' fresh scans unpaid, own jobs and small scanners included.
+- **Relays.** An advertised node sells relay leases (`[cluster] relay_slots`,
+  16 at a time): an hour of holding an outbox for an outbound-only member. It
+  holds outboxes only for members with an address or a lease, and refuses at
+  once (so the sender takes the next relay) a member that holds no lease with
+  it. Only granted leases count as relay demand. An outbound-only member
+  without a lease collects the answers to its own requests, but nobody can
+  ask it anything (remote config and owner commands included) until it
+  leases a relay.
 - **Your budgets are safe.** Paid lookups take at most
   `[enrichment] on_demand_share` (a fifth by default) of each API budget,
   whatever happens to credits.
@@ -286,17 +319,15 @@ earn most of the new money, every member a little.
   carry seals over its log. Members that hold the proof show "showed two
   histories"; that node's credits are void there for good.
 - **What this cannot do.**
-  - It cannot tell a recorded request nobody sent from a real one. Such
-    requests mint nothing, but they create jobs that idle scanners scan
-    for the mint. `scan.trusted_origins` and blocking are the answer.
-  - Two keys of one operator (a trap and a scanner) pass the own-job rule
-    and take a larger share of the fixed mint from honest scanners, up to
-    500 scans a day. Blocking is the answer.
-  - Many node keys each draw the allowance. Joining needs an invite, a
-    member admits at most 20 nodes a day, and each key must first pass the
-    rules agreement.
+  - It cannot tell a recorded request nobody sent from a real one; such
+    requests create jobs that scanners scan. `scan.trusted_origins` and
+    blocking are the answer.
+  - Many node keys each need an invite, a member admits at most 20 nodes a
+    day, and each key must first pass the rules agreement; but a pool share
+    goes to every verified listener, so listeners cost an address and 12
+    reported hours a day.
   - A free rider (`scan_share = 0`) gets its attackers scanned only by
-    idle capacity; with many of them the scan price understates demand.
+    scanners priced at zero.
   - A scanner can announce a lower pace to look busier and raise its
     price; it then runs fewer scans than it could, and scans beyond its
     announced pace show in the log.
@@ -308,8 +339,20 @@ earn most of the new money, every member a little.
     as selling less of its capacity. Cheapest-scanner choice, `scan_share`
     and the bounded rise protect others; with one scanner it is a
     monopoly.
-  - A sensor with a small allowance can be priced out of goods that cost
-    more than 7 days of it.
+  - Fleets are private, so a sibling of a scanner can rank among its
+    auditors and approve what it is sent; the unpaid checks of other
+    operators are the guard. An arbiter colluding with its scanner can
+    steer which scans are designated.
+  - Reach reports are self-asserted: a majority of members colluding can
+    call a listener down, or one up.
+  - The pool's rules on role and address, and the ranking of auditors by
+    role, protocol and standing, are read from the member records as held
+    now, not as they were on the day or at the scan: a member that drops
+    the listener role or its address loses the days it already qualified
+    for, until they are credited, and a scanner that leaves takes its
+    place among the auditors of earlier scans with it. Whether a listener
+    ran protocol 7 is read from its reports, and an auditor must have been
+    admitted by the scan's done status, so neither changes after the fact.
   - Credits have no outside value: an API node is paid in services of the
     cluster.
   - The constants come from an abstract simulation, not from a real
@@ -324,27 +367,31 @@ earn most of the new money, every member a little.
     price, and the receipt is public. A server that declines and names a
     higher price is offered it once, up to twice its announced price;
     beyond that the next server is asked.
-  - A member that spent its credits and then stops earning here (its
-    rules agreement drops below 98 %) loses its earnings of the last 8
-    days in every node's count, and the servers it paid lose those
-    receipts with them, until it earns again.
-  - A receipt counts when it arrives late; if the lapsed offer was spent
-    again elsewhere, the second server is paid less (at most the first
-    server's price).
-  - A sibling that was broken into can draw from the others (credits of
-    at most 7 days); release it.
-  - Lookups of recorded addresses are visible to members, with a good
-    guess at who asked.
-- **Upgrading.** Protocol 4: payments run only between upgraded nodes, so
-  upgrade all nodes together. Protocol 5: scan jobs are paid only between
-  nodes on protocol 5; upgrade all nodes together. The cluster-wide scan
-  price of protocol 4 seeds the scanners known at the first refresh after
-  the upgrade; scanners that join later start at the median price
-  scanners announce. Balances are recounted at start under the
-  new rules. Protocol 6: outbound-only members are asked paid lookups,
-  resolutions and probes through their outbox only when they and the
-  member whose outbox they poll run protocol 6; older outbound-only
-  members are not asked until they upgrade.
+  - A member that stops earning here (rules or audits) is credited no
+    pool share and paid for no sales here until it earns again; offers to
+    it lapse back to their payers.
+- **Upgrading.** Protocol 7 is a clean cut: the credits of protocol 7
+  (payments carrying `economy` 2, signed under their own domain) are the
+  only ones counted; earlier payments are kept and ignored, balances start
+  at zero, and the first money is the first pool after a day with 12
+  reported hours. Upgrade all members in one sitting: a member below
+  protocol 7 is not paid, funded or charged, and is served no entries of
+  protocol 7 until it upgrades.
+
+  Earlier protocols: Protocol 4: payments run only between upgraded nodes,
+  so upgrade all nodes together.
+
+  Protocol 5: scan jobs are paid only between nodes on protocol 5; upgrade
+  all nodes together. The cluster-wide scan price of protocol 4 seeded the
+  scanners known at the first refresh after the upgrade; scanners that
+  joined later started at the median price scanners announce. Balances
+  were recounted at start under the new rules (protocol 5 only; since
+  protocol 7 nothing is recounted).
+
+  Protocol 6: outbound-only members are asked paid lookups, resolutions and
+  probes through their outbox only when they and the member whose outbox
+  they poll run protocol 6; older outbound-only members are not asked
+  until they upgrade.
 
 ## Things to know
 

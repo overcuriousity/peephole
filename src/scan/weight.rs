@@ -2,9 +2,9 @@
 //! of a given level far more often than others (a host that cannot run
 //! nmap's OS or script detection, a network that drops full port sweeps).
 //! The arbiter gives such a scanner a lower weight at that level, measured
-//! against the best live scanner with a record there, and has it sit out
-//! that level for stretches of [`HOLD`], a share `1 - weight` of them, so
-//! the better scanners pick those jobs up instead.
+//! against the best live scanner with a record there: its price buys a
+//! result only that often (see `rank`), so the better scanners pick those
+//! jobs up instead.
 //!
 //! The weights are measured once an hour (see [`Weights`]): the snapshot
 //! of hour H counts the scans finished in the [`WINDOW_HOURS`] before H
@@ -23,7 +23,6 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Hours of finished scans a weight is measured over.
 pub const WINDOW_HOURS: i64 = 24;
@@ -37,10 +36,6 @@ pub const OVERRIDE_WAIT_MINS: i64 = 30;
 /// Finished scans at a level before a scanner sets the bar for the others
 /// there: one that is idle, paused or new does not make the rest look bad.
 pub const MIN_SAMPLE: i64 = 5;
-/// How long one decision to sit a level out (or not) holds. Scanners claim
-/// every few seconds when idle, so a fresh draw per claim would let a weak
-/// scanner take the level's jobs almost at once anyway.
-pub const HOLD: Duration = Duration::from_secs(600);
 
 /// Finished scans of one scanner at one level within [`WINDOW_HOURS`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -144,38 +139,6 @@ pub fn weight(t: &Tallies, scanner: NodeId, scanners: &[NodeId], level: i64) -> 
         .map(Tally::rate)
         .fold(own, f64::max);
     (own / best).clamp(MIN_WEIGHT, 1.0)
-}
-
-/// The draw that decides whether `scanner` sits `level` out during the
-/// stretch of [`HOLD`] containing `unix_secs`: uniform in [0, 1), and the
-/// same on every node, so all arbiters agree without sharing any state
-/// (with rolls of their own, a scanner turned away by one would just be
-/// served by the next).
-pub fn draw(scanner: NodeId, level: i64, unix_secs: u64) -> f64 {
-    let mut b = Vec::with_capacity(48);
-    b.extend_from_slice(&scanner.0);
-    b.extend_from_slice(&level.to_le_bytes());
-    b.extend_from_slice(&(unix_secs / HOLD.as_secs()).to_le_bytes());
-    let d = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &b);
-    let n = u32::from_le_bytes(d.as_ref()[..4].try_into().unwrap());
-    n as f64 / (u32::MAX as f64 + 1.0)
-}
-
-/// The levels `scanner` sits out at `unix_secs`: those with weight `w < 1`
-/// whose [`draw`] comes in at or above `w`, so a share `1 - w` of the
-/// stretches. Back at full weight, it sits out nothing.
-pub fn skipped_levels(
-    t: &Tallies,
-    scanner: NodeId,
-    scanners: &[NodeId],
-    unix_secs: u64,
-) -> Vec<i64> {
-    (1..=4)
-        .filter(|l| {
-            let w = weight(t, scanner, scanners, *l);
-            w < 1.0 && draw(scanner, *l, unix_secs) >= w
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -327,36 +290,5 @@ mod tests {
         assert_eq!(t[&(id(7), 4)], Tally { ok: 2, failed: 0 });
         // The same rows give the same snapshot on any node.
         assert_eq!(tallies_before(&s.pool, h).await.unwrap(), t);
-    }
-
-    #[test]
-    fn a_decision_holds_for_a_stretch_and_follows_the_weight() {
-        let all = [id(1), id(2)];
-        let ts = t(&[(1, 4, 0, 4), (2, 4, 10, 0)]); // weight 0.5 at level 4
-        let hold = HOLD.as_secs();
-        // Within one stretch the decision stands; it is the draw's.
-        let start = 1_000 * hold;
-        let sat = draw(id(1), 4, start) >= 0.5;
-        for at in [start, start + 1, start + hold - 1] {
-            assert_eq!(draw(id(1), 4, at), draw(id(1), 4, start));
-            assert_eq!(skipped_levels(&ts, id(1), &all, at) == vec![4], sat);
-        }
-        // Over many stretches it sits out about half of them.
-        let n = 2000u64;
-        let out = (0..n)
-            .filter(|i| !skipped_levels(&ts, id(1), &all, i * hold).is_empty())
-            .count() as f64;
-        assert!((out / n as f64 - 0.5).abs() < 0.05, "{out}");
-        // The good scanner, or the weak one recovered, never sits out.
-        let ok = t(&[(1, 4, 10, 0), (2, 4, 10, 0)]);
-        for i in 0..50 {
-            assert!(skipped_levels(&ts, id(2), &all, i * hold).is_empty());
-            assert!(skipped_levels(&ok, id(1), &all, i * hold).is_empty());
-        }
-        // Draws are in [0, 1) and differ per level and scanner.
-        let d = draw(id(1), 4, start);
-        assert!((0.0..1.0).contains(&d));
-        assert_ne!(d, draw(id(1), 3, start));
-        assert_ne!(d, draw(id(2), 4, start));
     }
 }

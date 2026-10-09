@@ -88,6 +88,7 @@ async fn offline(peers: &[&Origin], retention_days: u32) -> (Arc<Node>, tempfile
         lease_secs: 120,
         remote_config: false,
         origin_quota_mb: 20 * 1024,
+        relay_slots: 16,
         peers: peers
             .iter()
             .enumerate()
@@ -260,9 +261,16 @@ async fn serve(
     after: u64,
     since_hlc: u64,
 ) -> (Vec<u64>, Vec<(NodeId, u64)>) {
-    let b = repl::entries_after(&n.store, &[(origin, after)], since_hlc, 1000, usize::MAX)
-        .await
-        .unwrap();
+    let b = repl::entries_after(
+        &n.store,
+        &[(origin, after)],
+        since_hlc,
+        1000,
+        usize::MAX,
+        false,
+    )
+    .await
+    .unwrap();
     (b.entries.iter().map(|e| e.seq).collect(), b.floors)
 }
 
@@ -313,7 +321,7 @@ async fn windowed_holder() -> (Origin, Arc<Node>, tempfile::TempDir) {
 }
 
 async fn batch_from(n: &Node, origin: NodeId, after: u64) -> peephole::cluster::sync::Batch {
-    repl::entries_after(&n.store, &[(origin, after)], 0, 1000, usize::MAX)
+    repl::entries_after(&n.store, &[(origin, after)], 0, 1000, usize::MAX, false)
         .await
         .unwrap()
 }
@@ -435,7 +443,7 @@ async fn an_admission_after_a_gap_in_the_sponsors_history_counts() {
 async fn the_floor_moves_before_the_membership_below_it() {
     let (a, x, _d) = windowed_holder().await;
     let (w, _e) = offline(&[&a], 7).await;
-    let cut_short = repl::entries_after(&x.store, &[(a.key(), 0)], 0, 1, usize::MAX)
+    let cut_short = repl::entries_after(&x.store, &[(a.key(), 0)], 0, 1, usize::MAX, false)
         .await
         .unwrap();
     assert_eq!(cut_short.entries.len(), 1);
@@ -471,7 +479,7 @@ async fn a_jump_needs_proof_or_permission() {
     let (f, _g) = offline(&[&a], 0).await;
     apply(&f, old_and_new(&mut a)).await;
     let week = history::window_hlc(7, wall_ms());
-    let proven = repl::entries_after(&f.store, &[(a.key(), 0)], week, 1000, usize::MAX)
+    let proven = repl::entries_after(&f.store, &[(a.key(), 0)], week, 1000, usize::MAX, false)
         .await
         .unwrap();
     assert_eq!(proven.bounds.len(), 1);

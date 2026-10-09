@@ -1,7 +1,9 @@
 //! Paying for scan jobs. An arbiter funds a job it grants with an offer to
 //! the scanner that names the job; the scanner charges the offered price
 //! when it delivers the result, and nothing otherwise. What an arbiter
-//! commits to its own jobs is bounded by `[credits] scan_share`.
+//! commits to its own jobs is bounded by `[credits] scan_share`. Every
+//! grant is funded: at the scanner's price, which may be 0 (then without
+//! an offer).
 use super::ledger::{self, Ledger, OfferState};
 use super::{Mc, day_of, price};
 use crate::cluster::identity::NodeId;
@@ -61,12 +63,15 @@ pub async fn hold_self(pool: &sqlx::SqlitePool, job_uid: &str, mc: u32) -> Resul
 }
 
 /// What this node, as arbiter, would pay `scanner` for a job now: its own
-/// scanner its selling price; another scanner what it announces, at most
-/// [`price::PRICE_TOLERANCE`] times this node's copy. None: unpaid.
+/// scanner its selling price (0 before the first refresh); another
+/// scanner what it announces, at most [`price::PRICE_TOLERANCE`] times
+/// this node's copy, or an announced 0 while there is no copy yet. None:
+/// not a scanner of the market, or a price that cannot be capped yet; it
+/// cannot be granted the job.
 pub fn price_for(node: &Node, scanner: &NodeId) -> Option<u32> {
     let table = node.price_table();
     if *scanner == node.id() {
-        return table.price_of(price::SCAN);
+        return price::own_scan_price(node, &table);
     }
     let k = node.status.known(scanner)?;
     if !node
@@ -76,7 +81,10 @@ pub fn price_for(node: &Node, scanner: &NodeId) -> Option<u32> {
     {
         return None;
     }
-    price::offer_price(k.hb.scan_price_mc, table.reference(scanner))
+    match table.reference(scanner) {
+        Some(r) => price::offer_price(k.hb.scan_price_mc, Some(r)),
+        None => k.hb.scan_price_mc.filter(|p| *p == 0),
+    }
 }
 
 /// The factor a bought (manual) job's level scales its funding price by:
@@ -108,11 +116,15 @@ pub struct Funding {
 }
 
 /// Whether this round's book can fund a grant at `price` to a scanner
-/// taking no less than `min_mc`. Reads the book and the own-job tally
-/// into `funding` the first time; writes nothing.
+/// taking no less than `min_mc`: a price of 0 always (it needs no book).
+/// Reads the book and the own-job tally into `funding` the first time;
+/// writes nothing.
 pub async fn affordable(node: &Arc<Node>, funding: &mut Funding, min_mc: u32, price: u32) -> bool {
-    if price == 0 || price < min_mc {
+    if price < min_mc {
         return false;
+    }
+    if price == 0 {
+        return true;
     }
     let me = node.id();
     if funding.book.is_none() {
@@ -142,10 +154,11 @@ pub async fn affordable(node: &Arc<Node>, funding: &mut Funding, min_mc: u32, pr
 
 /// Fund the grant of `job_uid` to `scanner` at `price` (see [`price_for`]):
 /// `Some((Some(seq), price))` once the offer is written, `Some((None,
-/// price))` for an own job, which the self tally holds against the budget.
-/// None: unpaid, a price under `min_mc`, or no budget; the job is granted
-/// unfunded. `funding` carries the book and what was committed across the
-/// grants of one round.
+/// price))` for an own job, which the self tally holds against the budget,
+/// and `Some((None, 0))` at a zero price: granted free, without an offer.
+/// None: a price under `min_mc`, no budget, or the offer could not be
+/// written; the job is not granted. `funding` carries the book and what
+/// was committed across the grants of one round.
 pub async fn fund(
     node: &Arc<Node>,
     funding: &mut Funding,
@@ -160,6 +173,12 @@ pub async fn fund(
     if let Err(e) = hold_self(&node.store.pool, job_uid, 0).await {
         tracing::warn!(?e, job = %job_uid, "old own-job reservation not cleared");
         return None;
+    }
+    if price < min_mc {
+        return None;
+    }
+    if price == 0 {
+        return Some((None, 0));
     }
     if !affordable(node, funding, min_mc, price).await {
         return None;
@@ -179,6 +198,8 @@ pub async fn fund(
         parts: parts.clone(),
         seal,
         job,
+        audit: None,
+        economy: crate::cluster::record::ECONOMY,
     })
     .await
     {
@@ -192,7 +213,7 @@ pub async fn fund(
             Some((Some(e.seq), price))
         }
         Err(e) => {
-            tracing::debug!(?e, job = %job_uid, "scan offer not written; granted unfunded");
+            tracing::debug!(?e, job = %job_uid, "scan offer not written; job not granted");
             None
         }
     }
@@ -206,6 +227,7 @@ pub async fn settle(node: &Arc<Node>, arbiter: NodeId, offer_seq: u64, charged_m
         offer_seq,
         charged_mc,
         answered: vec![price::SCAN.into()],
+        economy: crate::cluster::record::ECONOMY,
     };
     if let Err(e) = repl::append(node, &[receipt]).await {
         tracing::warn!(?e, "scan receipt not written");
@@ -283,6 +305,7 @@ mod tests {
                     to: id(2),
                     parts: vec![(DAY, 200)],
                     job: Some("a".into()),
+                    audit: None,
                 },
             ),
             e(
@@ -304,6 +327,7 @@ mod tests {
                     to: id(2),
                     parts: vec![(DAY, 100)],
                     job: Some("b".into()),
+                    audit: None,
                 },
             ),
             // A lookup offer is not a scan offer.
@@ -315,6 +339,7 @@ mod tests {
                     to: id(3),
                     parts: vec![(DAY, 50)],
                     job: None,
+                    audit: None,
                 },
             ),
         ];
@@ -387,9 +412,70 @@ mod tests {
             .await
             .unwrap();
         hold_self(pool, "j4", 0).await.unwrap();
-        assert_eq!(self_committed(pool, &me).await.unwrap(), 50, "unpaid");
+        assert_eq!(
+            self_committed(pool, &me).await.unwrap(),
+            50,
+            "reservation cleared"
+        );
         hold_self(pool, "j4", 25).await.unwrap();
         assert_eq!(self_committed(pool, &me).await.unwrap(), 75, "funded anew");
+    }
+
+    #[tokio::test]
+    async fn a_zero_price_is_affordable_without_credits_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let node = crate::cluster::Node::open(crate::cluster::NodeParams {
+            identity: crate::cluster::identity::Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store: store.clone(),
+            proto: (2, 2),
+            data_dir: dir.path().to_path_buf(),
+            retention_days: 0,
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        node.set_scan_share(0.0);
+        let mut f = Funding::default();
+        assert!(
+            affordable(&node, &mut f, 0, 0).await,
+            "free, even with a share of 0"
+        );
+        assert!(!affordable(&node, &mut f, 0, 1).await, "no credits");
+        assert!(
+            !affordable(&node, &mut f, 5, 0).await,
+            "under the scanner's least"
+        );
+        let other = crate::cluster::identity::Identity::generate().unwrap().id;
+        assert_eq!(
+            fund(&node, &mut f, other, "job-1", 0, 0).await,
+            Some((None, 0))
+        );
+        assert_eq!(
+            fund(&node, &mut f, node.id(), "job-2", 0, 0).await,
+            Some((None, 0))
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credit_entries")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "no offer written");
+        assert_eq!(self_committed(&store.pool, &node.id()).await.unwrap(), 0);
     }
 
     fn ledger_with_balance(node: NodeId, mc: Mc) -> Ledger {

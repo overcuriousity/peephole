@@ -1,18 +1,18 @@
-//! Lookup credits: minted daily among the scanners, spent on lookups.
-//! Every node computes every balance for itself, from its own copy of the
-//! log; see "Credits" in docs/cluster.md.
+//! Lookup credits: a fixed pool a day for the verified listeners, earned
+//! by selling goods, spent on goods. Every node computes every balance for
+//! itself, from its own copy of the log; see "Credits" in docs/cluster.md.
 pub mod audit;
 pub mod cli;
-pub mod earn;
 pub mod entries;
 pub mod fleet;
 pub mod gates;
 pub mod history;
 pub mod jobs;
 pub mod ledger;
-pub mod mint;
 pub mod pay;
+pub mod pool;
 pub mod price;
+pub mod reach;
 pub mod share;
 
 /// Millicredits: 1 credit = 1000 mc. Sums are `u64`, amounts on the wire
@@ -29,6 +29,10 @@ pub const OFFER_TTL_MS: u64 = 15 * 60 * 1000;
 /// A scan offer (`credits::jobs`) lapses after the longest scan and the
 /// margin a server keeps for writing its receipt.
 pub const JOB_OFFER_TTL_MS: u64 = crate::scan::pace::MAX_RUN_SECS * 1000 + pay::SERVE_MARGIN_MS;
+
+/// An audit offer lapses after the time an audit may wait to start, the
+/// longest scan and the margin for the receipt.
+pub const AUDIT_OFFER_TTL_MS: u64 = audit::AUDIT_WINDOW_MS + JOB_OFFER_TTL_MS;
 
 /// The UTC day an entry belongs to, from its HLC.
 pub fn day_of(hlc: u64) -> u32 {
@@ -61,20 +65,18 @@ pub fn parse_amount(s: &str) -> Option<Mc> {
 
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
-/// Everything this node knows about credits at one moment: who earns
-/// here, what each judged scan weighs in its day's mint, and where every
-/// credit is.
+/// Everything this node knows about credits at one moment: who was up
+/// when, whose pool shares it credits, and where every credit is.
 pub struct Book {
     pub ledger: ledger::Ledger,
-    /// Every judged scan with its weight in its day's mint (0: it does
-    /// not count).
-    pub paid: Vec<earn::Paid>,
-    /// Each scanner's share of each closed day's mint.
-    pub minted: Vec<ledger::Earned>,
-    pub allowances: Vec<ledger::Earned>,
+    /// The pool shares this node credits (members that earn here).
+    pub pool: Vec<ledger::Earned>,
+    /// The verified listeners of each day the window reads.
+    pub listeners: BTreeMap<u32, BTreeSet<NodeId>>,
+    pub uptime: reach::Uptime,
     /// The members that do not earn in full here.
     pub standings: gates::Standings,
     pub now_ms: u64,
@@ -89,22 +91,26 @@ impl Book {
         self.standings.get(node).cloned().unwrap_or_default()
     }
 
-    /// What was minted and allowed a day over the last 7 days.
-    pub fn earned_per_day(&self) -> Mc {
+    /// What the pool credited here a day over the last 7 days.
+    pub fn pool_per_day(&self) -> Mc {
         let from = self.now_ms.saturating_sub(7 * DAY_MS);
         let week: Mc = self
-            .minted
+            .pool
             .iter()
-            .chain(&self.allowances)
             .filter(|e| crate::cluster::hlc::physical_ms(e.hlc) >= from)
             .map(|e| e.mc)
             .sum();
         week / 7
     }
+
+    /// `node`'s up hours on `day`, as reported.
+    pub fn up_hours(&self, node: &NodeId, day: u32) -> u32 {
+        self.uptime.get(&(*node, day)).copied().unwrap_or(0)
+    }
 }
 
-/// The HLC from which scans and payments are read at `now_ms`: the 7 days
-/// lots live, and one more for the 24-hour window of each IP.
+/// The HLC from which payments and reports are read at `now_ms`: the 7
+/// days lots live, and one more.
 pub fn window_start(now_ms: u64) -> u64 {
     now_ms.saturating_sub((LOT_DAYS as u64 + 1) * DAY_MS) << 16
 }
@@ -113,33 +119,48 @@ pub fn window_start(now_ms: u64) -> u64 {
 pub async fn compute(node: &Node) -> anyhow::Result<Book> {
     let now_ms = crate::cluster::hlc::wall_ms();
     let since = window_start(now_ms);
+    let (first, today) = (day_of(since), (now_ms / DAY_MS) as u32);
     let standings = gates::standings(node).await?;
-    let judged = earn::judged_since(&node.store.pool, since).await?;
-    let paid = earn::pay(&judged, &gates::to_gates(&standings));
-    let minted = mint::split(&paid, now_ms);
-    let members: Vec<NodeId> = crate::cluster::members::all(&node.store)
-        .await?
+    let set = |f: &dyn Fn(&gates::Standing) -> bool| -> HashSet<NodeId> {
+        standings
+            .iter()
+            .filter(|(_, s)| f(s))
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    let gates = ledger::Gates {
+        left_out: set(&|s| s.left_out()),
+        no_sales: set(&|s| !s.earns()),
+        no_scan_sales: set(&|s| !s.earns_as_scanner()),
+    };
+    let members: Vec<crate::cluster::members::MemberRow> =
+        crate::cluster::members::all(&node.store)
+            .await?
+            .into_iter()
+            .filter(|m| m.active)
+            .collect();
+    let ids: Vec<NodeId> = members.iter().map(|m| m.id).collect();
+    let reports = reach::since(&node.store.pool, first * 24).await?;
+    let uptime = reach::uptime(&reports, &ids, &reach::reporters(&members, &gates.left_out));
+    let listeners: BTreeMap<u32, BTreeSet<NodeId>> = (first..=today)
+        .map(|d| {
+            let reported = reach::reported_on(&reports, d);
+            (d, reach::verified(&members, &uptime, &reported, d))
+        })
+        .collect();
+    // A member that does not earn here is not credited here, and its
+    // share is not given to anyone else.
+    let pool: Vec<ledger::Earned> = pool::credited(&listeners, now_ms)
         .into_iter()
-        .filter(|m| m.active)
-        .map(|m| m.id)
+        .filter(|e| !gates.no_sales.contains(&e.node))
         .collect();
-    let today = (now_ms / DAY_MS) as u32;
-    let first = day_of(since);
-    let active = mint::active_days(&node.store.pool, &members, first, today).await?;
-    let allowances = mint::allowances(&active, &standings, now_ms);
-    let earned: Vec<ledger::Earned> = minted.iter().chain(&allowances).cloned().collect();
     let entries = entries::since(&node.store.pool, since).await?;
-    let left_out: HashSet<NodeId> = standings
-        .iter()
-        .filter(|(_, s)| s.left_out())
-        .map(|(id, _)| *id)
-        .collect();
-    let ledger = ledger::run(&earned, &entries, &left_out, now_ms);
+    let ledger = ledger::run(&pool, &entries, &gates, now_ms);
     Ok(Book {
         ledger,
-        paid,
-        minted,
-        allowances,
+        pool,
+        listeners,
+        uptime,
         standings,
         now_ms,
     })
@@ -166,38 +187,25 @@ pub async fn book_fresh(node: &Node) -> anyhow::Result<Arc<Book>> {
     Ok(b)
 }
 
-/// How often the loop judges scans.
+/// How often the loop runs.
 const TICK: std::time::Duration = std::time::Duration::from_secs(60);
 /// Ticks between price refreshes: 10 minutes. Each step is scaled by the
 /// time since the last one, so prices move as fast per hour as with an
 /// hourly refresh, in smaller steps.
 const PRICE_TICKS: u64 = 10;
 
-/// Judge scans as they become due, say in the journal when a member's
-/// standing changes, and drop what is older than the ledger reads.
-pub async fn run(
-    node: Arc<Node>,
-    cfg: crate::config::Config,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
-    let origins = crate::scan::guard::Origins::from_config(&cfg.scan.safety, Some(node.id()));
+/// Report the hours that ended, settle audits, buy the audits of this
+/// node's designated scans, say in the journal when a
+/// member's standing changes, refresh prices and drop what is older than
+/// the ledger reads.
+pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut known: gates::Standings = Default::default();
     let mut ticks = 0u64;
-    match earn::rejudge_args(&node.store.pool).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(scans = n, "credits: arguments judged again"),
-        Err(e) => tracing::warn!(?e, "credits: judging arguments again failed"),
-    }
+    let buying = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
-        let judge = earn::Judge {
-            pool: &node.store.pool,
-            origins: &origins,
-            classifier: crate::classify::Classifier::builtin(),
-        };
-        match earn::judge(&judge, earn::JUDGE_AFTER_SECS).await {
-            Ok(0) => {}
-            Ok(n) => tracing::debug!(scans = n, "credits: scans judged"),
-            Err(e) => tracing::warn!(?e, "credits: judging scans failed"),
+        // The hours that ended since the last tick, once each.
+        if let Err(e) = reach::report_due(&node, crate::cluster::hlc::wall_ms()).await {
+            tracing::debug!(?e, "credits: reach report not written");
         }
         if let Err(e) = audit::settle(&node.store.pool).await {
             tracing::debug!(?e, "credits: comparing audits failed");
@@ -220,12 +228,35 @@ pub async fn run(
             }
             Err(e) => tracing::debug!(?e, "credits: standings not evaluated"),
         }
+        // Audits of this node's designated scans that are due, bought
+        // aside (each may wait on three auditors); one run at a time.
+        if !buying.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let (node, buying) = (node.clone(), buying.clone());
+            tokio::spawn(async move {
+                audit::buy_due(&node).await;
+                buying.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        // Audit offers to this node that can no longer be served.
+        audit::release_stale(&node).await;
         if ticks.is_multiple_of(60) {
+            // A scan older than the audit window is never due again.
+            {
+                let mut tried = node.audits_tried.lock().unwrap();
+                if tried.len() > 10_000 {
+                    tried.clear();
+                }
+            }
             let before = window_start(crate::cluster::hlc::wall_ms());
             let pool = &node.store.pool;
             if let Err(e) = async {
                 entries::prune(pool, before).await?;
-                earn::prune(pool, before).await
+                let hours = (LOT_DAYS + 1) * 24;
+                reach::prune(
+                    pool,
+                    reach::hour_of(crate::cluster::hlc::wall_ms()).saturating_sub(hours),
+                )
+                .await
             }
             .await
             {

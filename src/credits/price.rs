@@ -1,6 +1,6 @@
-//! What a good costs here: one rule for every good with limited supply.
-//! Excess demand raises the price, excess supply lowers it, by a bounded
-//! step an hour. A good without a supply limit costs nothing.
+//! What a good costs here: one rule for every good. A good that sold in
+//! the last period gets dearer, one that sold nothing cheaper, by a
+//! bounded step an hour, down to nothing.
 use super::Mc;
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
@@ -9,41 +9,39 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-pub const PRICE_FLOOR: Mc = 1;
-pub const PRICE_STEP: f64 = 0.15;
 /// A funded scan job (`credits::jobs`).
 pub const SCAN: &str = "scan";
+/// A bought audit of a designated scan (`credits::audit`).
+pub const AUDIT: &str = "audit";
 /// An observational probe (`scan::probe`).
 pub const PROBE: &str = "probe";
 /// A name resolved for another member (`intel::dns`).
 pub const RESOLVE: &str = "resolve";
+/// An hour of outbox hosting for an outbound-only member (`cluster::relay`).
+pub const RELAY: &str = "relay";
 /// A probe slot serves this many probes an hour (`PROBE_TIMEOUT` is 2 minutes).
 pub const PROBES_PER_SLOT_HOUR: f64 = 30.0;
 
-/// Share of a scanner's capacity paid work should fill. A scanner fetches
-/// work only when a worker is free, so paid work never exceeds its
-/// capacity: with a target of 1 its price could only fall.
+/// Share of a scanner's capacity at which it counts as at capacity: its
+/// price rises whatever it sold.
 pub const PAID_TARGET: f64 = 0.9;
 /// An arbiter offers a scanner at most this times its own copy of the
 /// scanner's price; a scanner takes no less than its price divided by it.
 pub const PRICE_TOLERANCE: f64 = 1.25;
 
-/// One scanner's next price: its paid scans of the past hour, at most
-/// what it can do in an hour, against [`PAID_TARGET`] of that. `hours`
-/// since its last step scale the step like [`flow_step`], so a restart
-/// does not take an extra one.
-pub fn scanner_step(cur: Mc, paid: f64, can_do_per_hour: f64, hours: f64) -> Mc {
-    flow_step(
-        cur,
-        paid.min(can_do_per_hour),
-        PAID_TARGET * can_do_per_hour,
-        hours,
-    )
+/// What this node sells a scan job for: its price, or 0 before its first
+/// refresh while it runs a scanner (with a pace), as a prober does. None:
+/// it does not scan.
+pub fn own_scan_price(node: &Node, table: &Table) -> Option<u32> {
+    table.price_of(SCAN).or_else(|| {
+        let scans = node.roles().scanner && node.status.local.lock().unwrap().pace.is_some();
+        scans.then_some(0)
+    })
 }
 
 /// What an arbiter offers a scanner: what it announces, at most
 /// [`PRICE_TOLERANCE`] times this node's own copy. None: not a scanner,
-/// or no copy here yet; the job is granted unpaid.
+/// or no copy here yet; the price cannot be capped.
 pub fn offer_price(announced: Option<u32>, reference: Option<u32>) -> Option<u32> {
     let cap = (reference? as f64 * PRICE_TOLERANCE).floor() as u32;
     Some(announced?.min(cap))
@@ -54,52 +52,44 @@ pub fn min_take(sell_mc: u32) -> u32 {
     (sell_mc as f64 / PRICE_TOLERANCE).floor() as u32
 }
 
-/// One step of a price from the demand and the supply of a period. A
-/// price moves by at least 1 mc when they differ, so rounding does not
-/// hold a small price where it is.
-pub fn step(price: Mc, demand: f64, supply: f64) -> Mc {
-    scaled_step(price, demand, supply, 1.0)
-}
+/// Per hour a price rises at most by e^0.45 and falls by e^-0.15 (the
+/// sizes of the market before the sales rule).
+pub const RAISE_PER_HOUR: f64 = 0.45;
+pub const LOWER_PER_HOUR: f64 = 0.15;
+/// Reverse names of a source looked up for another member (`intel::rdns`).
+pub const RDNS: &str = "rdns";
 
-/// A step of a flow good (demand and supply counted over `hours`): a
-/// period shorter than an hour moves the price by that share of a full
-/// step, so the first refresh after a start does not take a whole one.
-pub fn flow_step(price: Mc, demand: f64, supply: f64, hours: f64) -> Mc {
-    scaled_step(price, demand, supply, hours.clamp(0.0, 1.0))
-}
-
-fn scaled_step(price: Mc, demand: f64, supply: f64, scale: f64) -> Mc {
-    let price = price.max(PRICE_FLOOR);
-    let x = ((demand - supply) / supply.max(1.0)).clamp(-3.0, 3.0);
-    let p = (price as f64 * (PRICE_STEP * scale * x).exp()).round();
-    let p = (p.min(u32::MAX as f64) as Mc).max(PRICE_FLOOR);
-    match p == price {
-        true if x > 0.0 => price.saturating_add(1).min(u32::MAX as Mc),
-        true if x < 0.0 => (price - 1).max(PRICE_FLOOR),
+/// One step of a price `hours` after the last: up when the good sold in
+/// that period (or is at capacity), down when it sold nothing. A period
+/// shorter than an hour takes that share of the hour's step, a longer one
+/// a full step. The price moves by at least 1 mc, which is what lifts a
+/// used good off zero; it never goes below zero. No floor.
+pub fn sales_step(price: Mc, raise: bool, hours: f64) -> Mc {
+    let scale = hours.clamp(0.0, 1.0);
+    let rate = if raise {
+        RAISE_PER_HOUR
+    } else {
+        -LOWER_PER_HOUR
+    };
+    let p = (price as f64 * (rate * scale).exp())
+        .round()
+        .min(u32::MAX as f64) as Mc;
+    match (raise, p == price) {
+        (true, true) => price.saturating_add(1).min(u32::MAX as Mc),
+        (false, true) => price.saturating_sub(1),
         _ => p,
     }
 }
 
 /// Where a good's price starts here: the lower median of what members
-/// announce for it, or the floor.
+/// announce for it, free ones included; 0 when nobody does.
 pub fn start(announced: &[u32]) -> Mc {
-    let mut v: Vec<u32> = announced.iter().copied().filter(|p| *p > 0).collect();
+    let mut v = announced.to_vec();
     if v.is_empty() {
-        return PRICE_FLOOR;
+        return 0;
     }
     v.sort_unstable();
     v[(v.len() - 1) / 2] as Mc
-}
-
-/// A provider's next price here: a step from `current` (or the floor)
-/// with `per_day` spread over `hours` as supply.
-pub fn provider_price(per_day: u32, current: Option<Mc>, demand: f64, hours: f64) -> Mc {
-    flow_step(
-        current.unwrap_or(PRICE_FLOOR),
-        demand,
-        per_day as f64 / 24.0 * hours,
-        hours,
-    )
 }
 
 /// Paid requests this node received since the last refresh, per good.
@@ -282,6 +272,10 @@ pub struct Table {
     pub probe_mc: Option<u32>,
     /// What resolving a name for another member costs here.
     pub resolve_mc: u32,
+    /// What looking up a source's reverse names for another member costs here.
+    pub rdns_mc: u32,
+    /// What a relay lease costs here; None: this node is not advertised.
+    pub relay_mc: Option<u32>,
     pub offers: Vec<Offer>,
 }
 
@@ -310,7 +304,9 @@ impl Table {
         match good {
             SCAN => self.sell_mc,
             PROBE => self.probe_mc,
-            RESOLVE => Some(self.resolve_mc).filter(|p| *p > 0),
+            RESOLVE => Some(self.resolve_mc),
+            RDNS => Some(self.rdns_mc),
+            RELAY => self.relay_mc,
             _ => self
                 .offers
                 .iter()
@@ -326,8 +322,10 @@ impl Table {
             .iter()
             .map(|o| (o.provider.clone(), o.price_mc))
             .collect();
-        if self.resolve_mc > 0 {
-            prices.push((RESOLVE.to_string(), self.resolve_mc));
+        prices.push((RESOLVE.to_string(), self.resolve_mc));
+        prices.push((RDNS.to_string(), self.rdns_mc));
+        if let Some(mc) = self.relay_mc {
+            prices.push((RELAY.to_string(), mc));
         }
         (
             self.offers
@@ -414,63 +412,69 @@ fn price_key(good: &str) -> String {
     format!("price:{good}")
 }
 
-/// Where `good`'s next step starts: the last price here, the kept one,
-/// or what members announce.
-async fn current(node: &Node, old: &Table, good: &str, announced: &[u32]) -> Result<Mc> {
-    if let Some(p) = old.price_of(good).filter(|p| *p > 0) {
-        return Ok(p as Mc);
-    }
-    if let Some(p) = node
+/// The price of `good` this node kept across restarts.
+async fn kept_price(node: &Node, good: &str) -> Result<Option<Mc>> {
+    Ok(node
         .store
         .intel_get(&price_key(good))
         .await?
-        .and_then(|v| v.parse::<Mc>().ok())
-    {
-        return Ok(p.max(PRICE_FLOOR));
+        .and_then(|v| v.parse::<Mc>().ok()))
+}
+
+/// Where `good`'s next step starts: the last price here (of a table a
+/// refresh made), the kept one, or what members announce.
+async fn current(node: &Node, old: &Table, good: &str, announced: &[u32]) -> Result<Mc> {
+    if let Some(p) = old.price_of(good).filter(|_| old.at_ms > 0) {
+        return Ok(p as Mc);
+    }
+    if let Some(p) = kept_price(node, good).await? {
+        return Ok(p);
     }
     Ok(start(announced))
 }
 
-/// The scan jobs a receipt charged, by the scanner that charged them.
-pub fn charged_jobs(l: &super::ledger::Ledger) -> HashSet<(NodeId, String)> {
-    l.offers
-        .iter()
-        .filter(
-            |o| matches!(o.state, super::ledger::OfferState::Charged { charged } if charged > 0),
-        )
-        .filter_map(|o| Some((o.to, o.job.clone()?)))
-        .collect()
-}
-
-/// Each scanner's paid scans that finished in the past hour, by the
-/// scan's own `finished_at` (holding receipts back moves nothing): jobs a
-/// receipt of it charged, and jobs it queued itself. Only the job's own
-/// scanner counts, each job once, and a scan dated in the future not at
-/// all. (`scanner_step` caps the count at what the scanner can do.)
-pub async fn paid_scans(
-    pool: &sqlx::SqlitePool,
-    charged: &HashSet<(NodeId, String)>,
-) -> Result<HashMap<NodeId, u32>> {
-    let rows: Vec<(Vec<u8>, String, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT DISTINCT s.origin, s.job_uid, j.origin FROM scans s
+/// The scans of jobs granted to each scanner by another arbiter that
+/// finished in the past hour, as wall-clock ms by the scan's own
+/// `finished_at`: one per job (its scanner's first record), none dated in
+/// the future. Granted at any price, zero included: a sale. A scanner's
+/// own jobs are no sale and do not fill its capacity, or it could raise
+/// its own price by queuing work for itself.
+pub async fn granted_scans(pool: &sqlx::SqlitePool) -> Result<HashMap<NodeId, Vec<u64>>> {
+    let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
+        "SELECT s.origin, MIN(s.finished_at) FROM scans s
          JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
          WHERE s.audit_of IS NULL AND s.origin IS NOT NULL AND s.job_uid IS NOT NULL
-           AND s.finished_at > datetime('now', '-1 hour')
-           AND s.finished_at <= datetime('now')",
+           AND j.arbiter IS NOT s.origin
+         GROUP BY s.origin, s.job_uid
+         HAVING MIN(s.finished_at) > datetime('now', '-1 hour')
+            AND MIN(s.finished_at) <= datetime('now')",
     )
     .fetch_all(pool)
     .await?;
-    let mut out: HashMap<NodeId, u32> = HashMap::new();
-    for (scanner, job, queued_by) in rows {
-        let Ok(scanner) = NodeId::from_slice(&scanner) else {
+    let mut out: HashMap<NodeId, Vec<u64>> = HashMap::new();
+    for (scanner, finished) in rows {
+        let (Ok(scanner), Ok(t)) = (
+            NodeId::from_slice(&scanner),
+            chrono::NaiveDateTime::parse_from_str(&finished, "%Y-%m-%d %H:%M:%S"),
+        ) else {
             continue;
         };
-        let own = queued_by.as_deref() == Some(&scanner.0[..]);
-        if own || charged.contains(&(scanner, job)) {
-            *out.entry(scanner).or_default() += 1;
-        }
+        out.entry(scanner)
+            .or_default()
+            .push(t.and_utc().timestamp_millis().max(0) as u64);
     }
     Ok(out)
+}
+
+/// Whether a scanner's price rises: a scan of a job granted to it ended
+/// in the last `period_ms`, or its granted scans of the past hour reach
+/// [`PAID_TARGET`] of what it can do (at capacity).
+pub fn scanner_raises(finished: &[u64], now_ms: u64, period_ms: u64, can_do: f64) -> bool {
+    let sold = finished
+        .iter()
+        .any(|t| t.saturating_add(period_ms) >= now_ms);
+    let full = can_do > 0.0 && finished.len() as f64 >= PAID_TARGET * can_do;
+    sold || full
 }
 
 /// Kept across restarts: this node's copy of `scanner`'s price, as
@@ -496,7 +500,7 @@ fn hours_since(since_ms: Option<u64>, now_ms: u64) -> f64 {
 /// the last copy here, the kept copy, `legacy` (on upgrade, the
 /// cluster-wide scan price of the market before scanner prices; only for
 /// the scanners counted at the first refresh after it), the lower median
-/// of what scanners announce, the floor.
+/// of what scanners announce, 0.
 async fn scanner_current(
     node: &Node,
     old: &Table,
@@ -505,7 +509,7 @@ async fn scanner_current(
     announced: &[u32],
     now_ms: u64,
 ) -> Result<(Mc, f64)> {
-    if let Some(p) = old.reference(scanner).filter(|p| *p > 0) {
+    if let Some(p) = old.reference(scanner) {
         return Ok((p as Mc, hours_since(Some(old.at_ms), now_ms)));
     }
     if let Some((p, at)) = node
@@ -514,16 +518,58 @@ async fn scanner_current(
         .await?
         .and_then(|v| parse_kept(&v))
     {
-        return Ok((p.max(PRICE_FLOOR), hours_since(at, now_ms)));
+        return Ok((p, hours_since(at, now_ms)));
     }
-    Ok((
-        legacy.unwrap_or_else(|| start(announced)).max(PRICE_FLOOR),
-        1.0,
-    ))
+    Ok((legacy.unwrap_or_else(|| start(announced)), 1.0))
 }
 
 fn as_mc(p: Mc) -> u32 {
     p.min(u32::MAX as Mc) as u32
+}
+
+/// Seed this node's table from the prices it kept, so a restart serves
+/// at them until the first refresh steps them.
+pub async fn load_kept(node: &Node) -> Result<()> {
+    let mut t = Table {
+        resolve_mc: kept_price(node, RESOLVE).await?.map_or(0, as_mc),
+        rdns_mc: kept_price(node, RDNS).await?.map_or(0, as_mc),
+        ..Default::default()
+    };
+    if node.prober().is_some() {
+        t.probe_mc = kept_price(node, PROBE).await?.map(as_mc);
+    }
+    if node.cfg.advertise.is_some() {
+        t.relay_mc = kept_price(node, RELAY).await?.map(as_mc);
+    }
+    for p in node
+        .lookup_providers()
+        .into_iter()
+        .flatten()
+        .filter(|p| p.ready())
+    {
+        if let Some(mc) = kept_price(node, p.name()).await? {
+            t.offers.push(Offer {
+                provider: p.name().to_string(),
+                price_mc: as_mc(mc),
+                on_demand: node
+                    .lookup_shares()
+                    .map_or(crate::config::DEFAULT_OFFER_PER_DAY, |s| {
+                        s.allowance(p.as_ref())
+                    }),
+            });
+        }
+    }
+    let me = node.id();
+    if let Some((mc, _)) = node
+        .store
+        .intel_get(&scanner_key(&me))
+        .await?
+        .and_then(|v| parse_kept(&v))
+    {
+        t.sell_mc = Some(as_mc(mc));
+    }
+    node.set_price_table(Arc::new(t));
+    Ok(())
 }
 
 /// Step this node's prices from the demand it counted and the supply it
@@ -575,6 +621,9 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let none = vec![];
     let ann = |g: &str| announced.get(g).unwrap_or(&none).clone();
     let got = |g: &str| demand.get(g).copied().unwrap_or(0.0);
+    // A good that was asked for sold (a request beyond the supply is a
+    // sale too), so it rises; one nobody asked for falls.
+    let next = |cur: Mc, good: &str| as_mc(sales_step(cur, got(good) > 0.0, hours));
     let empty = vec![];
     let providers = node.lookup_providers().unwrap_or(&empty);
     let offer_per_day = node
@@ -588,32 +637,29 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         let cur = current(node, &old, p.name(), &ann(p.name())).await?;
         offers.push(Offer {
             provider: p.name().to_string(),
-            price_mc: as_mc(provider_price(on_demand, Some(cur), got(p.name()), hours)),
+            price_mc: next(cur, p.name()),
             on_demand,
         });
     }
-    let resolve_cur = current(node, &old, RESOLVE, &ann(RESOLVE)).await?;
-    let resolve_mc = as_mc(flow_step(
-        resolve_cur,
-        got(RESOLVE),
-        offer_per_day as f64 / 24.0 * hours,
-        hours,
-    ));
+    let resolve_mc = next(current(node, &old, RESOLVE, &ann(RESOLVE)).await?, RESOLVE);
+    let rdns_mc = next(current(node, &old, RDNS, &ann(RDNS)).await?, RDNS);
     let probe_mc = match node.prober() {
-        Some(pr) => {
-            let cur = current(node, &old, PROBE, &ann(PROBE)).await?;
-            Some(as_mc(flow_step(
-                cur,
-                got(PROBE),
-                pr.slots() as f64 * PROBES_PER_SLOT_HOUR * hours,
-                hours,
-            )))
+        Some(_) => Some(next(current(node, &old, PROBE, &ann(PROBE)).await?, PROBE)),
+        None => None,
+    };
+    // A relay sells leases; it is at capacity when every slot is leased.
+    let relay_mc = match node.cfg.advertise {
+        Some(_) => {
+            let cur = current(node, &old, RELAY, &ann(RELAY)).await?;
+            let full = node.relay_leases.current(crate::cluster::hlc::wall_ms())
+                >= node.cfg.relay_slots as usize;
+            Some(as_mc(sales_step(cur, got(RELAY) > 0.0 || full, hours)))
         }
         None => None,
     };
-    // Every scanner's price, from its paid scans of the past hour against
-    // what it can do: the same public inputs on every node.
-    let paid = paid_scans(&node.store.pool, &charged_jobs(&book.ledger)).await?;
+    // Every scanner's price, from the scans of jobs other arbiters granted it: the
+    // same public inputs on every node.
+    let granted = granted_scans(&node.store.pool).await?;
     // The cluster-wide scan price of the market before scanner prices
     // seeds the scanners counted now, once: later ones start from what
     // scanners announce, like on every node that never had it.
@@ -627,15 +673,17 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let mut scanner_prices = vec![];
     for s in &capacity.scanners {
         let (cur, hours) = scanner_current(node, &old, &s.node, legacy, &ann(SCAN), now_ms).await?;
-        let got = (paid.get(&s.node).copied().unwrap_or(0) as f64).min(s.can_do);
-        let price_mc = as_mc(scanner_step(cur, got, s.can_do, hours));
+        let finished = granted.get(&s.node).map(Vec::as_slice).unwrap_or(&[]);
+        let period_ms = (hours.clamp(0.0, 1.0) * 3_600_000.0) as u64;
+        let raise = scanner_raises(finished, now_ms, period_ms, s.can_do);
+        let price_mc = as_mc(sales_step(cur, raise, hours));
         node.store
             .intel_set(&scanner_key(&s.node), &format!("{price_mc}@{now_ms}"))
             .await?;
         scanner_prices.push(ScannerPrice {
             node: s.node,
             price_mc,
-            paid: got,
+            paid: (finished.len() as f64).min(s.can_do),
             supply: PAID_TARGET * s.can_do,
         });
     }
@@ -650,7 +698,8 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         .iter()
         .map(|o| (o.provider.as_str(), o.price_mc))
         .chain(probe_mc.map(|m| (PROBE, m)))
-        .chain([(RESOLVE, resolve_mc)])
+        .chain(relay_mc.map(|m| (RELAY, m)))
+        .chain([(RESOLVE, resolve_mc), (RDNS, rdns_mc)])
     {
         node.store
             .intel_set(&price_key(good), &mc.to_string())
@@ -682,12 +731,26 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         per_hour(got(RESOLVE)),
         offer_per_day as f64 / 24.0,
     ));
+    goods.push((
+        RDNS,
+        Some(rdns_mc),
+        per_hour(got(RDNS)),
+        offer_per_day as f64 / 24.0,
+    ));
     if let Some(pr) = node.prober() {
         goods.push((
             PROBE,
             probe_mc,
             per_hour(got(PROBE)),
             pr.slots() as f64 * PROBES_PER_SLOT_HOUR,
+        ));
+    }
+    if relay_mc.is_some() {
+        goods.push((
+            RELAY,
+            relay_mc,
+            per_hour(got(RELAY)),
+            node.cfg.relay_slots as f64,
         ));
     }
     // Goods only members announce (a provider this node does not serve).
@@ -723,6 +786,8 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         scanners: scanner_prices,
         probe_mc,
         resolve_mc,
+        rdns_mc,
+        relay_mc,
         offers,
     });
     node.set_price_table(table.clone());
@@ -801,53 +866,177 @@ mod tests {
     }
 
     #[test]
-    fn a_price_follows_the_imbalance_within_a_bounded_step() {
-        assert_eq!(step(1000, 10.0, 10.0), 1000, "balanced");
-        assert!(step(1000, 20.0, 10.0) > 1000);
-        assert!(step(1000, 5.0, 10.0) < 1000);
-        // Up by at most e^(0.15 × 3); down by at most e^(−0.15), as no
-        // demand at all is one supply's worth below it.
+    fn a_price_rises_when_it_sold_and_falls_when_it_did_not() {
+        let up = |h: f64| (1000.0 * (RAISE_PER_HOUR * h).exp()).round() as Mc;
+        let down = |h: f64| (1000.0 * (-LOWER_PER_HOUR * h).exp()).round() as Mc;
+        assert_eq!(sales_step(1000, true, 1.0), up(1.0));
+        assert_eq!(sales_step(1000, false, 1.0), down(1.0));
         assert_eq!(
-            step(1000, 1e9, 10.0),
-            (1000.0 * (0.45f64).exp()).round() as Mc
+            sales_step(1000, true, 1.0 / 6.0),
+            up(1.0 / 6.0),
+            "ten minutes"
         );
         assert_eq!(
-            step(1000, 0.0, 1e9),
-            (1000.0 * (-0.15f64).exp()).round() as Mc
+            sales_step(1000, false, 5.0),
+            down(1.0),
+            "never more than a full step"
         );
-        // Excess supply ends at the floor, never below; no supply counts as 1.
-        let mut p = 1000;
-        for _ in 0..200 {
-            p = step(p, 0.0, 50.0);
+    }
+
+    #[test]
+    fn a_price_has_no_floor_and_a_used_good_leaves_zero() {
+        let mut p: Mc = 1000;
+        for _ in 0..1000 {
+            p = sales_step(p, false, 1.0 / 6.0);
         }
-        assert_eq!(p, PRICE_FLOOR);
-        assert_eq!(step(3, 0.0, 50.0), 2, "rounding does not hold it");
-        assert!(step(PRICE_FLOOR, 5.0, 0.0) > PRICE_FLOOR);
+        assert_eq!(p, 0, "unsold for long enough: free");
+        assert_eq!(sales_step(0, false, 1.0), 0, "never below 0");
+        assert_eq!(
+            sales_step(0, true, 1.0 / 6.0),
+            1,
+            "sold at 0: up by at least 1 mc"
+        );
+        assert_eq!(
+            sales_step(3, false, 1.0 / 6.0),
+            2,
+            "rounding does not hold it"
+        );
+        assert_eq!(sales_step(u32::MAX as Mc, true, 1.0), u32::MAX as Mc);
     }
 
     #[test]
-    fn a_short_period_moves_a_flow_price_by_its_share_of_a_step() {
-        // One minute with no demand at all: at most e^(−0.15/60) down,
-        // where a full step would take e^(−0.15).
-        let minute = 1.0 / 60.0;
-        let p = provider_price(240, Some(100_000), 0.0, minute);
-        let bound = (100_000.0 * (-0.15f64 / 60.0).exp()).round() as Mc;
-        assert!(p < 100_000, "it still moves: {p}");
-        assert!(p >= bound, "{p} moved past {bound}");
-        assert!(step(100_000, 0.0, 10.0) < bound - 10_000, "a full step");
-        // An hour or longer: one full step, never more.
-        assert_eq!(flow_step(100_000, 0.0, 10.0, 1.0), step(100_000, 0.0, 10.0));
-        assert_eq!(flow_step(100_000, 0.0, 10.0, 5.0), step(100_000, 0.0, 10.0));
-        // A small price still moves by the 1 mc minimum.
-        assert_eq!(flow_step(5, 0.0, 4.0, minute), 4);
+    fn six_ten_minute_steps_move_a_price_like_one_hourly_step() {
+        for raise in [true, false] {
+            let hourly = sales_step(1_000_000, raise, 1.0);
+            let mut p = 1_000_000;
+            for _ in 0..6 {
+                p = sales_step(p, raise, 1.0 / 6.0);
+            }
+            let diff = (p as f64 - hourly as f64).abs() / hourly as f64;
+            assert!(diff < 0.002, "raise {raise}: {p} vs {hourly}");
+        }
     }
 
     #[test]
-    fn a_new_good_starts_at_the_median_announced_or_the_floor() {
-        assert_eq!(start(&[]), PRICE_FLOOR);
+    fn a_scanner_rises_when_a_granted_scan_ended_in_the_period_or_at_capacity() {
+        let (now, min) = (10 * 3_600_000u64, 60_000u64);
+        assert!(
+            scanner_raises(&[now - 5 * min], now, 10 * min, 10.0),
+            "sold in the period"
+        );
+        assert!(
+            !scanner_raises(&[now - 30 * min], now, 10 * min, 10.0),
+            "sold before it"
+        );
+        let nine: Vec<u64> = (0..9).map(|i| now - (20 + i) * min).collect();
+        assert!(
+            scanner_raises(&nine, now, 10 * min, 10.0),
+            "90 % of capacity in the hour"
+        );
+        assert!(!scanner_raises(&nine[..8], now, 10 * min, 10.0));
+        assert!(
+            !scanner_raises(&[], now, 10 * min, 0.0),
+            "a paused scanner sells nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn granted_scans_count_each_job_once_by_finish_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let pool = &store.pool;
+        let (s, a) = (id(1), id(2));
+        sqlx::query(
+            "INSERT INTO ips (id, ip, first_seen, last_seen) VALUES (1, '192.0.2.1', '', '')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        // (job uid, queued by, its scanner, finished minutes ago)
+        for (n, (uid, origin, by, ago)) in [
+            ("paid", a, s, 10),     // granted to s by a: counts
+            ("free", a, s, 10),     // granted at zero: counts too
+            ("own", s, s, 20),      // the scanner's own job: no sale
+            ("old", a, s, 90),      // finished over an hour ago
+            ("other", s, a, 10),    // granted to a, but s wrote the scan
+            ("future", s, s, -600), // dated ahead: never counts
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO scan_jobs (id, ip_id, level, status, queued_at, uid, origin, arbiter, scanner)
+                 VALUES (?, 1, 1, 'done', datetime('now','-2 hours'), ?, ?, ?, ?)",
+            )
+            .bind(n as i64 + 1).bind(uid).bind(&origin.0[..]).bind(&origin.0[..]).bind(&by.0[..])
+            .execute(pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO scans (job_id, ip_id, level, started_at, finished_at, uid, origin, job_uid)
+                 VALUES (?, 1, 1, datetime('now', ?), datetime('now', ?), ?, ?, ?)",
+            )
+            .bind(n as i64 + 1)
+            .bind(format!("{} minutes", -(ago + 5)))
+            .bind(format!("{} minutes", -ago))
+            .bind(format!("scan-{uid}")).bind(&s.0[..]).bind(uid)
+            .execute(pool).await.unwrap();
+        }
+        // More scan records of one job count once.
+        for k in 0..3 {
+            sqlx::query(
+                "INSERT INTO scans (job_id, ip_id, level, started_at, finished_at, uid, origin, job_uid)
+                 VALUES (3, 1, 1, datetime('now','-9 minutes'), datetime('now','-8 minutes'), ?, ?, 'own')",
+            )
+            .bind(format!("again-{k}")).bind(&s.0[..])
+            .execute(pool).await.unwrap();
+        }
+        let got = granted_scans(pool).await.unwrap();
+        assert_eq!(got.get(&s).map(Vec::len), Some(2), "{got:?}");
+        assert_eq!(got.get(&a), None, "{got:?}");
+        let now = crate::cluster::hlc::wall_ms();
+        assert!(got[&s].iter().all(|t| *t <= now && *t + 3_600_000 >= now));
+    }
+
+    #[test]
+    fn a_new_good_starts_at_the_lower_median_announced_or_zero() {
+        assert_eq!(start(&[]), 0);
         assert_eq!(start(&[300, 100, 200]), 200);
         assert_eq!(start(&[100, 400]), 100, "lower median");
-        assert_eq!(start(&[0, 0]), PRICE_FLOOR);
+        assert_eq!(start(&[0, 0]), 0);
+        assert_eq!(start(&[0, 400]), 0, "a free announcement counts");
+    }
+
+    #[tokio::test]
+    async fn a_node_without_a_refreshed_table_starts_from_what_members_announce() {
+        let (_dir, node) = test_node().await;
+        let old = Table::default();
+        assert_eq!(
+            current(&node, &old, RESOLVE, &[300, 100, 200])
+                .await
+                .unwrap(),
+            200
+        );
+        node.store.intel_set(&price_key(RDNS), "9").await.unwrap();
+        assert_eq!(
+            current(&node, &old, RDNS, &[300]).await.unwrap(),
+            9,
+            "kept wins"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_seeds_the_table_from_kept_prices() {
+        let (_dir, node) = test_node().await;
+        node.store
+            .intel_set(&price_key(RESOLVE), "40")
+            .await
+            .unwrap();
+        node.store.intel_set(&price_key(RDNS), "7").await.unwrap();
+        load_kept(&node).await.unwrap();
+        let t = node.price_table();
+        assert_eq!(t.price_of(RESOLVE), Some(40));
+        assert_eq!(t.price_of(RDNS), Some(7));
     }
 
     #[test]
@@ -868,25 +1057,6 @@ mod tests {
         let left = d.peek().counts;
         assert_eq!(left.get(PROBE), Some(&2.0));
         assert_eq!(left.get("abuseipdb"), None);
-    }
-
-    #[test]
-    fn every_provider_follows_its_supply() {
-        assert_eq!(
-            provider_price(240, None, 3.0, 1.0),
-            step(PRICE_FLOOR, 3.0, 10.0)
-        );
-        assert_eq!(provider_price(240, Some(500), 10.0, 1.0), 500);
-        assert_eq!(provider_price(0, Some(500), 1.0, 1.0), step(500, 1.0, 0.0));
-        assert!(
-            provider_price(240, Some(1), 0.0, 1.0) >= PRICE_FLOOR,
-            "never free"
-        );
-        // A generous node (high offer_per_day) gets cheaper under the same demand.
-        assert!(
-            provider_price(24_000, Some(500), 50.0, 1.0)
-                < provider_price(240, Some(500), 50.0, 1.0)
-        );
     }
 
     #[test]
@@ -916,48 +1086,12 @@ mod tests {
                 (intel::MAXMIND.to_string(), 1000)
             ]
         );
-        assert_eq!(prices.len(), 2);
-    }
-
-    #[test]
-    fn a_scanner_price_follows_its_paid_load() {
-        // 10 scans an hour possible: the target is 9 paid.
-        let busy = scanner_step(1000, 10.0, 10.0, 1.0);
-        assert!(busy > 1000, "full of paid work: up ({busy})");
-        let idle = scanner_step(1000, 0.0, 10.0, 1.0);
-        assert!(idle < 1000, "no paid work: down ({idle})");
-        assert_eq!(
-            scanner_step(PRICE_FLOOR, 0.0, 10.0, 1.0),
-            PRICE_FLOOR,
-            "never under the floor"
-        );
-        // At the target it holds within a step's rounding.
-        let held = scanner_step(1000, 9.0, 10.0, 1.0);
-        assert!((999..=1001).contains(&held), "{held}");
-        // Paid work never counts past what the scanner can do: scan records
-        // it writes itself raise its price by at most the full-load step.
-        assert_eq!(
-            scanner_step(1000, 1e6, 10.0, 1.0),
-            scanner_step(1000, 10.0, 10.0, 1.0)
-        );
-        // Part of an hour since the last step takes that share of a step;
-        // more than an hour, one full step.
-        let quarter = scanner_step(1000, 0.0, 10.0, 0.25);
-        assert!(idle < quarter && quarter < 1000, "{quarter}");
-        assert_eq!(scanner_step(1000, 0.0, 10.0, 3.0), idle);
-    }
-
-    #[test]
-    fn six_ten_minute_steps_move_a_price_like_one_hourly_step() {
-        for (paid, can_do) in [(0.0, 10.0), (10.0, 10.0), (4.0, 10.0)] {
-            let hourly = scanner_step(1_000_000, paid, can_do, 1.0);
-            let mut p = 1_000_000;
-            for _ in 0..6 {
-                p = scanner_step(p, paid, can_do, 1.0 / 6.0);
-            }
-            let diff = (p as f64 - hourly as f64).abs() / hourly as f64;
-            assert!(diff < 0.002, "paid {paid}: {p} vs {hourly}");
-        }
+        // The resolution price is always announced, also at 0.
+        assert_eq!(prices.len(), 4);
+        assert!(prices.contains(&(RESOLVE.to_string(), 0)));
+        assert!(prices.contains(&(RDNS.to_string(), 0)));
+        assert_eq!(t.price_of(RDNS), Some(0));
+        assert_eq!(t.price_of(RESOLVE), Some(0));
     }
 
     #[test]
@@ -987,6 +1121,7 @@ mod tests {
                 lease_secs: 120,
                 remote_config: false,
                 origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
                 peers: vec![],
             },
             roles: Default::default(),
@@ -1060,21 +1195,6 @@ mod tests {
     }
 
     #[test]
-    fn a_saturated_scanner_settles_near_the_target() {
-        // Paid demand falls as the price rises: buyers with 900 mc an hour.
-        let mut p: Mc = 1;
-        for _ in 0..200 {
-            let paid = (900.0 / p as f64).min(10.0);
-            p = scanner_step(p, paid, 10.0, 1.0);
-        }
-        let paid = (900.0 / p as f64).min(10.0);
-        assert!(
-            (8.0..=10.0).contains(&paid),
-            "settles near 9 paid of 10 ({paid} at {p})"
-        );
-    }
-
-    #[test]
     fn an_offer_is_the_announced_price_capped_by_the_reference() {
         assert_eq!(offer_price(Some(100), Some(100)), Some(100));
         assert_eq!(
@@ -1091,69 +1211,10 @@ mod tests {
         assert_eq!(
             offer_price(Some(100), None),
             None,
-            "no reference yet: unpaid"
+            "no reference yet: not capped"
         );
         assert_eq!(min_take(125), 100);
         assert_eq!(min_take(1), 0);
-    }
-
-    #[tokio::test]
-    async fn paid_scans_count_charged_jobs_and_own_jobs_by_finish_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::connect(&dir.path().join("t.db"))
-            .await
-            .unwrap();
-        let pool = &store.pool;
-        let (s, a) = (id(1), id(2));
-        sqlx::query(
-            "INSERT INTO ips (id, ip, first_seen, last_seen) VALUES (1, '192.0.2.1', '', '')",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        // (job uid, queued by, its scanner, finished minutes ago)
-        for (n, (uid, origin, by, ago)) in [
-            ("paid", a, s, 10),     // charged offer: counts
-            ("unpaid", a, s, 10),   // no offer: does not count
-            ("own", s, s, 20),      // the scanner's own job: counts
-            ("old", a, s, 90),      // charged, but finished over an hour ago
-            ("other", s, a, 10),    // queued by s, but another node's grant
-            ("future", s, s, -600), // dated ahead: never counts
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            sqlx::query(
-                "INSERT INTO scan_jobs (id, ip_id, level, status, queued_at, uid, origin, arbiter, scanner)
-                 VALUES (?, 1, 1, 'done', datetime('now','-2 hours'), ?, ?, ?, ?)",
-            )
-            .bind(n as i64 + 1).bind(uid).bind(&origin.0[..]).bind(&origin.0[..]).bind(&by.0[..])
-            .execute(pool).await.unwrap();
-            sqlx::query(
-                "INSERT INTO scans (job_id, ip_id, level, started_at, finished_at, uid, origin, job_uid)
-                 VALUES (?, 1, 1, datetime('now', ?), datetime('now', ?), ?, ?, ?)",
-            )
-            .bind(n as i64 + 1)
-            .bind(format!("{} minutes", -(ago + 5)))
-            .bind(format!("{} minutes", -ago))
-            .bind(format!("scan-{uid}")).bind(&s.0[..]).bind(uid)
-            .execute(pool).await.unwrap();
-        }
-        // More scan records of one job count once.
-        for k in 0..3 {
-            sqlx::query(
-                "INSERT INTO scans (job_id, ip_id, level, started_at, finished_at, uid, origin, job_uid)
-                 VALUES (3, 1, 1, datetime('now','-9 minutes'), datetime('now','-8 minutes'), ?, ?, 'own')",
-            )
-            .bind(format!("again-{k}")).bind(&s.0[..])
-            .execute(pool).await.unwrap();
-        }
-        let charged: HashSet<(NodeId, String)> = [(s, "paid".to_string()), (s, "old".to_string())]
-            .into_iter()
-            .collect();
-        let got = paid_scans(pool, &charged).await.unwrap();
-        assert_eq!(got.get(&s), Some(&2), "{got:?}");
-        assert_eq!(got.get(&a), None, "{got:?}");
     }
 
     #[test]

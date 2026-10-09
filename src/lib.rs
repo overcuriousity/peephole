@@ -194,6 +194,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // Reverse DNS of the sources, forward-confirmed, kept on this node.
     tokio::spawn(intel::rdns::run(
         store.clone(),
+        node.clone(),
+        geo.clone(),
         cfg.enrichment.reverse_dns,
         shutdown_rx.clone(),
     ));
@@ -318,13 +320,18 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             shutdown_rx.clone(),
         ));
         tokio::spawn(cluster::seal::run(node.clone(), shutdown_rx.clone()));
-        tokio::spawn(credits::run(node.clone(), cfg.clone(), shutdown_rx.clone()));
+        tokio::spawn(credits::run(node.clone(), shutdown_rx.clone()));
+        // Does nothing unless this node is outbound-only.
+        tokio::spawn(cluster::relay::run(node.clone(), shutdown_rx.clone()));
         credits::fleet::serve(node);
+        credits::audit::serve(node);
         // Does nothing unless this node currently scans.
         tokio::spawn(scan::arbiter::takeover_loop(
             node.clone(),
             shutdown_rx.clone(),
         ));
+        // Serve at the kept prices until the first refresh steps them.
+        credits::price::load_kept(node).await?;
         cluster::start(node.clone(), shutdown_rx.clone()).await?;
         tokio::spawn(forward_job_events(
             node.clone(),

@@ -260,8 +260,6 @@ pub struct ClusterFigures {
     pub earned: String,
     pub spent: String,
     pub expiring_today: String,
-    /// Paid scans a day, low and high tier.
-    pub paid_scans: (String, String),
     /// Scans a day the scanners can do, did, and the utilization in %.
     /// Scans a day: possible, done, idle; and the utilization in %.
     pub capacity: (String, String, String, String),
@@ -327,21 +325,8 @@ async fn cluster_figures(
     let l = &book.ledger;
     let per_day = |total: u64| show(total / 7);
     let week = book.now_ms.saturating_sub(7 * crate::credits::DAY_MS);
-    let in_week = |hlc: u64| crate::cluster::hlc::physical_ms(hlc) >= week;
     // The ledger walks 8 days of entries: count the last 7.
     let spent = spending(&l.offers, week);
-    let (mut low, mut high) = (0u64, 0u64);
-    for p in book.paid.iter().filter(|p| in_week(p.scan.hlc)) {
-        if p.weight == 0 {
-            continue;
-        }
-        if p.scan.level >= 3 {
-            high += 1;
-        } else {
-            low += 1;
-        }
-    }
-    let tenth = |n: u64| format!("{:.1}", n as f64 / 7.0);
     let mut auditors = crate::cluster::owner::fleet::siblings(&node.store).await?;
     auditors.push(node.id());
     // Balance of this node and its siblings, and what of it is about to go.
@@ -392,8 +377,9 @@ async fn cluster_figures(
     }
     let served_today: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM credit_entries
-         WHERE kind = 'receipt' AND charged_mc > 0 AND hlc >= ?",
+         WHERE kind = 'receipt' AND charged_mc > 0 AND economy = ? AND hlc >= ?",
     )
+    .bind(i64::from(crate::cluster::record::ECONOMY))
     .bind(crate::cluster::hlc::to_db(
         (book.now_ms / crate::credits::DAY_MS * crate::credits::DAY_MS) << 16,
     ))
@@ -404,10 +390,9 @@ async fn cluster_figures(
         lowest_agreement: lowest,
         rule_sets: rule_sets.len(),
         circulating: show(l.circulating()),
-        earned: show(book.earned_per_day()),
+        earned: show(book.pool_per_day()),
         spent: per_day(spent),
         expiring_today: show(active.iter().map(|m| l.expiring_today(&m.id)).sum::<u64>()),
-        paid_scans: (tenth(low), tenth(high)),
         capacity: (
             format!("{:.0}", t.capacity.per_day.max(0.0)),
             format!("{:.0}", t.capacity.used_per_day.max(0.0)),
@@ -620,6 +605,7 @@ mod tests {
             state: OfferState::Charged { charged },
             answered: vec![],
             job: None,
+            audit: None,
         };
         // Day 1 lies outside the week that starts on day 2.
         let offers = [offer(1, 1000), offer(2, 400), offer(8, 200)];

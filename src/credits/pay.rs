@@ -6,7 +6,7 @@
 //! another node answers is paid, whoever owns it.
 use super::entries::{self, Kind, SealState};
 use super::ledger::OfferState;
-use super::{Mc, price, show};
+use super::{Mc, show};
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::Record;
 use crate::cluster::{Node, repl};
@@ -31,12 +31,12 @@ pub(crate) const RETRY_AT_MOST: Mc = 2;
 
 /// Whether a member announcing `proto_max` sells scan jobs at its own price.
 pub fn sells_scans(proto_max: u32) -> bool {
-    proto_max >= crate::cluster::rpc::proto::SCAN_PRICE_PROTO
+    proto_max >= crate::cluster::rpc::proto::ECONOMY_PROTO
 }
 
 /// Whether a member announcing `proto_max` counts balances as this node does.
 pub fn pays_with(proto_max: u32) -> bool {
-    proto_max >= crate::cluster::rpc::proto::MARKET_PROTO
+    proto_max >= crate::cluster::rpc::proto::ECONOMY_PROTO
 }
 
 /// A node that could answer for a provider, and what it asks.
@@ -64,10 +64,13 @@ fn cheapest_first(list: &mut [Quote]) {
     }
 }
 
+/// Why a provider whose on-demand share is used up is declined.
+const SHARE_SPENT: &str = "this node's on-demand share of that provider is spent for today";
+
 /// Who could be asked for each provider, cheapest first: this node, if it
 /// serves the provider (for nothing: it answers itself), and every live
-/// member that announces a price for it and can be asked (never less than
-/// the floor: what another node answers is paid).
+/// member that announces a price for it and can be asked (at the price it
+/// announces, which may be 0).
 pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
     let me = node.id();
     let mut out: HashMap<String, Vec<Quote>> = HashMap::new();
@@ -97,7 +100,7 @@ pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
                 provider: provider.clone(),
                 server: id,
                 server_name: m.name.clone(),
-                price_mc: (*price_mc).max(price::PRICE_FLOOR as u32),
+                price_mc: *price_mc,
             });
         }
     }
@@ -113,10 +116,10 @@ pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
 /// request that takes longer passes its own margin to [`accept_offer`].
 pub const SERVE_MARGIN_MS: u64 = 2 * 60 * 1000;
 
-/// Whether an offer dated `hlc` can still be charged when served `now_ms`
-/// by a request that takes up to `margin_ms`.
-fn time_left(hlc: u64, now_ms: u64, margin_ms: u64) -> bool {
-    now_ms + margin_ms <= crate::cluster::hlc::physical_ms(hlc) + super::OFFER_TTL_MS
+/// Whether an offer dated `hlc` that lives `ttl_ms` can still be charged
+/// when served `now_ms` by a request that takes up to `margin_ms`.
+fn time_left(hlc: u64, ttl_ms: u64, now_ms: u64, margin_ms: u64) -> bool {
+    now_ms + margin_ms <= crate::cluster::hlc::physical_ms(hlc) + ttl_ms
 }
 
 /// Write a receipt of nothing for `peer`'s offer `offer_seq`: it frees
@@ -127,6 +130,7 @@ pub(crate) async fn release(node: &Arc<Node>, peer: NodeId, offer_seq: u64) {
         offer_seq,
         charged_mc: 0,
         answered: vec![],
+        economy: crate::cluster::record::ECONOMY,
     };
     if let Err(e) = repl::append(node, &[receipt]).await {
         tracing::debug!(?e, "receipt not written");
@@ -160,6 +164,8 @@ impl Drop for Serving {
 /// the offer counts as being served: a second request naming it is
 /// declined.
 pub struct Accepted {
+    /// When the offer was written.
+    pub hlc: u64,
     pub offered: Mc,
     pub covered: Mc,
     pub book: Arc<super::Book>,
@@ -206,7 +212,7 @@ pub async fn accept_offer(
         .is_some_and(|m| pays_with(m.proto_max))
     {
         release(node, peer, offer_seq).await;
-        return why("your node predates the market (protocol 4): upgrade it to pay here".into());
+        return why("your node predates the credits of protocol 7: upgrade it to pay here".into());
     }
     let Some(entry) = wait_for(node, &peer, offer_seq).await else {
         return why(format!(
@@ -261,11 +267,11 @@ pub async fn accept_offer(
     if offer.state != OfferState::Open {
         return why("the offer is used up, or older than 15 minutes".into());
     }
-    if !time_left(offer.hlc, book.now_ms, margin_ms) {
+    if !time_left(offer.hlc, offer.ttl_ms(), book.now_ms, margin_ms) {
         release(node, peer, offer_seq).await;
         return why("the offer lapses before it could be charged; offer again".into());
     }
-    let (offered, covered) = (offer.offered, offer.covered);
+    let (hlc, offered, covered) = (offer.hlc, offer.offered, offer.covered);
     if price > offered {
         release(node, peer, offer_seq).await;
         return Err(Declined::TooLow {
@@ -287,6 +293,7 @@ pub async fn accept_offer(
     }
     tracing::debug!(asker = %peer.short(), offer = offer_seq, what, "offer accepted");
     Ok(Accepted {
+        hlc,
         offered,
         covered,
         book,
@@ -299,6 +306,16 @@ pub async fn accept_offer(
 /// the server holds it before it is named. Returns the offer's sequence
 /// number.
 pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Result<u64, String> {
+    make_offer_for(node, server, total_mc, None).await
+}
+
+/// [`make_offer`], naming the scan an audit it buys checks (`audit`).
+pub async fn make_offer_for(
+    node: &Arc<Node>,
+    server: NodeId,
+    total_mc: Mc,
+    audit: Option<String>,
+) -> Result<u64, String> {
     let me = node.id();
     // Checked before the offer is written: an offer nobody can be asked
     // to serve would stay held for 15 minutes.
@@ -331,6 +348,8 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
         parts,
         seal,
         job: None,
+        audit,
+        economy: crate::cluster::record::ECONOMY,
     })
     .await
     .map_err(|e| format!("the offer could not be written: {e:#}"))?;
@@ -426,8 +445,7 @@ pub async fn serve(
         }
     };
     let table = node.price_table();
-    let price_of =
-        |name: &str| -> Mc { table.price_of(name).unwrap_or(price::PRICE_FLOOR as u32) as Mc };
+    let price_of = |name: &str| -> Mc { table.price_of(name).unwrap_or(0) as Mc };
     let shares = node.lookup_shares();
     let provider = |name: &str| providers.iter().find(|p| p.name() == name);
     // Providers whose on-demand share is spent are declined one by one;
@@ -440,10 +458,7 @@ pub async fn serve(
             _ => false,
         };
         if spent {
-            declined.push((
-                name,
-                "this node's on-demand share of that provider is spent for today".to_string(),
-            ));
+            declined.push((name, SHARE_SPENT.to_string()));
         } else {
             asking.push(name);
         }
@@ -484,10 +499,7 @@ pub async fn serve(
         if taken {
             ask_now.push(name);
         } else {
-            declined.push((
-                name,
-                "this node's on-demand share of that provider is spent for today".to_string(),
-            ));
+            declined.push((name, SHARE_SPENT.to_string()));
         }
     }
     let mut resp = if ask_now.is_empty() {
@@ -506,6 +518,7 @@ pub async fn serve(
         offer_seq,
         charged_mc: charged.min(u32::MAX as Mc) as u32,
         answered: answered.clone(),
+        economy: crate::cluster::record::ECONOMY,
     };
     match repl::append(node, &[receipt]).await {
         Ok(_) => resp.charged_mc = charged.min(u32::MAX as Mc) as u32,
@@ -520,26 +533,84 @@ pub async fn serve(
     // What was paid for is kept for everyone when the cluster has
     // recorded the address, exactly as the automatic enrichment would
     // write it; for an address nobody recorded nothing is written.
-    if !resp.findings.is_empty() && recorded(&node.store.pool, &ip).await {
-        let rec = crate::store::recorder::Recorder::Cluster(node.clone());
-        let text = crate::net::canonical(ip).to_string();
-        let mut all = true;
-        for f in &resp.findings {
-            let version = f.source_version.as_deref();
-            let written = if provider_info(&f.provider).is_some_and(|i| i.api) {
-                rec.record_lookup(&text, &f.provider, version, f.data.clone())
-                    .await
-            } else {
-                rec.record_intel(&text, &f.provider, version, f.data.clone())
-                    .await
-            };
-            if let Err(e) = written {
-                tracing::warn!(provider = %f.provider, ?e, "paid lookup result not kept");
-                all = false;
-            }
-        }
-        resp.kept = all;
+    keep_if_recorded(node, ip, &mut resp).await;
+    resp.declined.append(&mut declined);
+    resp
+}
+
+/// Keep `resp`'s answers in the dataset when the cluster recorded `ip`.
+async fn keep_if_recorded(node: &Arc<Node>, ip: IpAddr, resp: &mut LookupResp) {
+    if resp.findings.is_empty() || !recorded(&node.store.pool, &ip).await {
+        return;
     }
+    let rec = crate::store::recorder::Recorder::Cluster(node.clone());
+    let text = crate::net::canonical(ip).to_string();
+    let mut all = true;
+    for f in &resp.findings {
+        let version = f.source_version.as_deref();
+        let written = if provider_info(&f.provider).is_some_and(|i| i.api) {
+            rec.record_lookup(&text, &f.provider, version, f.data.clone())
+                .await
+        } else {
+            rec.record_intel(&text, &f.provider, version, f.data.clone())
+                .await
+        };
+        if let Err(e) = written {
+            tracing::warn!(provider = %f.provider, ?e, "lookup result not kept");
+            all = false;
+        }
+    }
+    resp.kept = all;
+}
+
+/// The serving side of a request without an offer: what this node prices
+/// at zero now is answered free (it still takes the on-demand share and
+/// counts as demand); the rest is declined naming its price, so the asker
+/// may offer it.
+pub async fn serve_free(
+    node: &Arc<Node>,
+    providers: &Providers,
+    peer: NodeId,
+    ip: IpAddr,
+    served: Vec<String>,
+) -> LookupResp {
+    let table = node.price_table();
+    let shares = node.lookup_shares();
+    let provider = |name: &str| providers.iter().find(|p| p.name() == name);
+    let (mut free, mut declined, mut priced) = (vec![], vec![], 0 as Mc);
+    for name in served {
+        node.market.note(&name, 1);
+        let price = table.price_of(&name).unwrap_or(0);
+        if price > 0 {
+            priced += price as Mc;
+            declined.push((
+                name,
+                format!(
+                    "this costs {} credits here now; the request carries no offer",
+                    show(price as Mc)
+                ),
+            ));
+            continue;
+        }
+        let taken = match (shares, provider(&name)) {
+            (Some(s), Some(p)) => s.take(p.as_ref()).await.unwrap_or(false),
+            _ => true,
+        };
+        match taken {
+            true => free.push(name),
+            false => declined.push((name, SHARE_SPENT.to_string())),
+        }
+    }
+    let mut resp = if free.is_empty() {
+        LookupResp::default()
+    } else {
+        crate::intel::lookup::local(providers, &ip, &free).await
+    };
+    if priced > 0 {
+        resp.price_mc = Some(priced.min(u32::MAX as Mc) as u32);
+    }
+    tracing::info!(asker = %peer.short(), providers = %free.join(","), "free lookup served");
+    keep_if_recorded(node, ip, &mut resp).await;
     resp.declined.append(&mut declined);
     resp
 }
@@ -557,14 +628,18 @@ pub async fn offer_and_ask(
         declined: providers.iter().map(|p| (p.clone(), why.clone())).collect(),
         ..Default::default()
     };
-    let seq = match make_offer(node, server, total_mc).await {
-        Ok(seq) => seq,
-        Err(why) => return decline(why),
+    // A zero price is asked without an offer.
+    let offer_seq = match total_mc {
+        0 => None,
+        mc => match make_offer(node, server, mc).await {
+            Ok(seq) => Some(seq),
+            Err(why) => return decline(why),
+        },
     };
     let req = LookupReq {
         ip: ip.to_string(),
         providers: providers.to_vec(),
-        offer_seq: Some(seq),
+        offer_seq,
     };
     let mut resp = {
         let call = node.call_any::<LookupReq, LookupResp>(
@@ -583,7 +658,8 @@ pub async fn offer_and_ask(
         // A declined offer comes with a receipt of nothing: fetch it, so
         // what the offer held is free for the next one. A server nobody can
         // dial pushes its receipt with its own sync.
-        if r.findings.is_empty()
+        if offer_seq.is_some()
+            && r.findings.is_empty()
             && r.charged_mc == 0
             && let Err(e) = node.sync_around_request(server).await
         {
@@ -622,10 +698,12 @@ async fn ask_server(
 
 /// What to offer a server that turned down `offered` naming `named`: its
 /// price when that is higher, but at most [`RETRY_AT_MOST`] times the
-/// offer. None: do not offer again (the next server is asked instead).
+/// offer (one mc for a request without an offer). None: do not offer
+/// again (the next server is asked instead).
 pub(crate) fn retry_price(offered: Mc, named: Option<u32>, nothing_answered: bool) -> Option<Mc> {
     let p = named? as Mc;
-    (nothing_answered && p > offered && p <= offered.saturating_mul(RETRY_AT_MOST)).then_some(p)
+    let bound = offered.max(1).saturating_mul(RETRY_AT_MOST);
+    (nothing_answered && p > offered && p <= bound).then_some(p)
 }
 
 /// The next server to ask for a provider: the cheapest in `list` not yet
@@ -716,14 +794,13 @@ mod tests {
 
     #[test]
     fn only_market_nodes_are_paid() {
-        assert_eq!(crate::cluster::rpc::proto::MARKET_PROTO, 4);
+        assert_eq!(crate::cluster::rpc::proto::ECONOMY_PROTO, 7);
         const {
             assert!(
                 crate::cluster::rpc::proto::PROTO_VERSION
-                    >= crate::cluster::rpc::proto::MARKET_PROTO
+                    >= crate::cluster::rpc::proto::ECONOMY_PROTO
             )
         };
-        assert_eq!(crate::cluster::rpc::proto::SCAN_PRICE_PROTO, 5);
         assert_eq!(crate::cluster::rpc::proto::ROUTED_PROTO, 6);
         const {
             assert!(
@@ -731,8 +808,8 @@ mod tests {
                     >= crate::cluster::rpc::proto::ROUTED_PROTO
             )
         };
-        assert!(!pays_with(3));
-        assert!(pays_with(4));
+        assert!(!pays_with(6) && !sells_scans(6));
+        assert!(pays_with(7) && sells_scans(7));
     }
 
     #[test]
@@ -741,15 +818,16 @@ mod tests {
         let now = 1_000 * min;
         let made = |ago: u64| (now - ago) << 16;
         let m = SERVE_MARGIN_MS;
-        assert!(time_left(made(0), now, m));
-        assert!(time_left(made(10 * min), now, m));
+        let ttl = crate::credits::OFFER_TTL_MS;
+        assert!(time_left(made(0), ttl, now, m));
+        assert!(time_left(made(10 * min), ttl, now, m));
         // Its receipt would be written after the offer lapsed: ignored
         // everywhere, the server unpaid.
-        assert!(!time_left(made(14 * min), now, m));
-        assert!(!time_left(made(20 * min), now, m));
+        assert!(!time_left(made(14 * min), ttl, now, m));
+        assert!(!time_left(made(20 * min), ttl, now, m));
         // A longer request needs more of the offer left.
-        assert!(time_left(made(12 * min), now, m));
-        assert!(!time_left(made(12 * min), now, 3 * min + 1));
+        assert!(time_left(made(12 * min), ttl, now, m));
+        assert!(!time_left(made(12 * min), ttl, now, 3 * min + 1));
     }
 
     #[test]
@@ -781,6 +859,19 @@ mod tests {
             "something was answered"
         );
         assert_eq!(retry_price(500, None, true), None);
+    }
+
+    #[test]
+    fn a_zero_offer_is_retried_at_a_small_named_price_only() {
+        assert_eq!(retry_price(0, Some(1), true), Some(1));
+        assert_eq!(retry_price(0, Some(2), true), Some(2), "twice of one mc");
+        assert_eq!(retry_price(0, Some(3), true), None);
+        assert_eq!(retry_price(0, None, true), None);
+        assert_eq!(
+            retry_price(0, Some(1), false),
+            None,
+            "something was answered"
+        );
     }
 
     fn q(provider: &str, server: u8, price_mc: u32) -> Quote {

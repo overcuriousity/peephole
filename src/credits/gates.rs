@@ -4,7 +4,6 @@
 //! showed two histories earns nothing at all. The gates are evaluated at
 //! each recomputation, not stored: a member that agrees again (after an
 //! upgrade, typically) earns again.
-use super::earn::Gates;
 use crate::classify::stored::{Agreement, agreement};
 use crate::cluster::identity::NodeId;
 use crate::cluster::{Node, members};
@@ -129,6 +128,9 @@ pub struct Standing {
     /// Counted audits of the last 7 days as `(conclusive, differing)`,
     /// when they fail the gate (`credits::audit`).
     pub audits: Option<(u32, u32)>,
+    /// `(bought, designated)` audits of its designated scans over 7 days,
+    /// when it bought too few (`credits::audit::owes`).
+    pub audits_owed: Option<(u32, u32)>,
 }
 
 impl Standing {
@@ -138,7 +140,7 @@ impl Standing {
     }
 
     pub fn earns_as_scanner(&self) -> bool {
-        self.earns() && self.audits.is_none()
+        self.earns() && self.audits.is_none() && self.audits_owed.is_none()
     }
 
     /// Out of the ledger altogether: no balance, and its payments move
@@ -161,6 +163,9 @@ impl Standing {
         }
         if let Some((conclusive, differing)) = self.audits {
             v.push(format!("audits: {differing} of {conclusive} differ"));
+        }
+        if let Some((b, d)) = self.audits_owed {
+            v.push(format!("audits: bought {b} of {d} designated"));
         }
         v
     }
@@ -195,20 +200,17 @@ pub async fn standings(node: &Node) -> Result<Standings> {
             out.entry(scanner).or_default().audits = Some((conclusive, differing));
         }
     }
-    Ok(out)
-}
-
-/// The gates as the paying walk takes them.
-pub fn to_gates(s: &Standings) -> Gates {
-    let mut g = Gates::default();
-    for (id, st) in s {
-        if !st.earns() {
-            g.no_shares.insert(*id, st.reasons().join("; "));
-        } else if !st.earns_as_scanner() {
-            g.no_scanner_share.insert(*id, st.reasons().join("; "));
+    // Audits of designated scans the scanner should have bought.
+    let all = members::all(&node.store).await?;
+    let now = crate::cluster::hlc::wall_ms();
+    for (scanner, (designated, bought)) in
+        super::audit::obligations(&node.store.pool, &all, now).await?
+    {
+        if let Some(o) = super::audit::owes(designated, bought) {
+            out.entry(scanner).or_default().audits_owed = Some(o);
         }
     }
-    g
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -246,6 +248,12 @@ mod tests {
         };
         assert!(audits.earns() && !audits.earns_as_scanner());
         assert_eq!(audits.reasons(), ["audits: 3 of 5 differ"]);
+        let owing = Standing {
+            audits_owed: Some((1, 3)),
+            ..Default::default()
+        };
+        assert!(owing.earns() && !owing.earns_as_scanner());
+        assert_eq!(owing.reasons(), ["audits: bought 1 of 3 designated"]);
         let gone = Standing {
             blocked: true,
             forked: Some(7),
@@ -259,18 +267,5 @@ mod tests {
                 "showed two histories (at entry 7 of its log)"
             ]
         );
-
-        let (x, y, z) = (NodeId([1; 32]), NodeId([2; 32]), NodeId([3; 32]));
-        let all: Standings = [(x, rules), (y, audits), (z, fine)].into();
-        let g = to_gates(&all);
-        assert_eq!(
-            g.no_shares.get(&x).map(String::as_str),
-            Some("rules: disagree on 12% of 500")
-        );
-        assert_eq!(
-            g.no_scanner_share.get(&y).map(String::as_str),
-            Some("audits: 3 of 5 differ")
-        );
-        assert!(!g.no_shares.contains_key(&z) && !g.no_scanner_share.contains_key(&z));
     }
 }

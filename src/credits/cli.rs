@@ -9,9 +9,9 @@ use crate::credits::ledger::OfferState;
 use anyhow::{Context, Result, bail};
 
 pub const USAGE: &str = "usage: peephole credits [CONFIG]                     balance, by day
-       peephole credits log [--days N] [CONFIG]     earned, spent, sent, received
+       peephole credits log [--days N] [CONFIG]     pool shares, spent, sent, received
        peephole credits members [CONFIG]            every member's balance and standing
-       peephole credits why SCAN [CONFIG]           how this node judged one scan (its uid)
+       peephole credits uptime [CONFIG]             each member's reported hours up, 7 days
        peephole credits send NODE AMOUNT [CONFIG]   NODE: name, fingerprint or key";
 
 fn config_path(arg: &str) -> bool {
@@ -67,33 +67,32 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 );
             }
         }
+        ["uptime"] => {
+            let book = super::compute(&node).await?;
+            let today = (book.now_ms / super::DAY_MS) as u32;
+            let days: Vec<u32> = (today.saturating_sub(6)..=today).collect();
+            let all: Vec<members::MemberRow> = members::all(&node.store)
+                .await?
+                .into_iter()
+                .filter(|m| m.active)
+                .collect();
+            let names: Vec<_> = all.iter().map(|m| (m.id, m.name.clone())).collect();
+            for line in super::reach::uptime_lines(&names, &book.uptime, &book.listeners, &days) {
+                println!("{line}");
+            }
+            println!(
+                "hours up a day (UTC); * a verified listener: advertised, listener role, protocol 7, up 12 hours or more"
+            );
+        }
         ["log"] => {
             let book = super::compute(&node).await?;
             let from = book.now_ms.saturating_sub(days * super::DAY_MS);
             let recent = |hlc: u64| crate::cluster::hlc::physical_ms(hlc) >= from;
             let mut lines: Vec<(u64, String)> = vec![];
-            for p in book
-                .paid
-                .iter()
-                .filter(|p| recent(p.scan.hlc) && p.scan.scanner == me)
-            {
+            for e in book.pool.iter().filter(|e| e.node == me && recent(e.hlc)) {
                 lines.push((
-                    p.scan.hlc,
-                    format!(
-                        "counted  {:>8}  {} level {}{}",
-                        if p.weight == 0 {
-                            "-".to_string()
-                        } else {
-                            p.weight.to_string()
-                        },
-                        p.scan.ip,
-                        p.scan.job_level,
-                        if p.note.is_empty() {
-                            String::new()
-                        } else {
-                            format!("  ({})", p.note)
-                        }
-                    ),
+                    e.hlc,
+                    format!("pool     {:>8}  this node's share of the day", show(e.mc)),
                 ));
             }
             for o in book
@@ -151,45 +150,6 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                         "earns here".to_string()
                     } else {
                         format!("not earning here: {}", reasons.join("; "))
-                    }
-                );
-            }
-        }
-        ["why", scan] => {
-            let Some(j) = super::earn::judged_one(&node.store.pool, scan).await? else {
-                bail!(
-                    "scan `{scan}` is not judged here (unknown, not payable, or it arrived less \
-                     than ten minutes ago)"
-                );
-            };
-            println!(
-                "scan {} of {} by {} for the trap {}",
-                j.scan_uid,
-                j.ip,
-                name(&j.scanner),
-                name(&j.trap)
-            );
-            println!(
-                "  job level {}, paid as level {} (what the requests held here back)",
-                j.job_level, j.level
-            );
-            println!(
-                "  arguments: {}",
-                if j.args_ok {
-                    "the built-in ones"
-                } else {
-                    "not the built-in ones (no scanner share)"
-                }
-            );
-            let book = super::compute(&node).await?;
-            if let Some(p) = book.paid.iter().find(|p| p.scan.scan_uid == j.scan_uid) {
-                println!(
-                    "  counts for the scanner's share of the day: {}{}",
-                    p.weight,
-                    if p.note.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", p.note)
                     }
                 );
             }

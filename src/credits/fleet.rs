@@ -30,7 +30,13 @@ async fn receivable(node: &Node, to: &NodeId) -> Result<bool> {
 }
 
 async fn transfer(node: &Node, to: NodeId, parts: Vec<(u32, u32)>) -> Result<()> {
-    repl::append_sealing(node, |seal| Record::CreditTransfer { to, parts, seal }).await?;
+    repl::append_sealing(node, |seal| Record::CreditTransfer {
+        to,
+        parts,
+        seal,
+        economy: crate::cluster::record::ECONOMY,
+    })
+    .await?;
     Ok(())
 }
 
@@ -206,6 +212,7 @@ mod tests {
             standing: Standing::Active,
             info_hlc: 1,
             last_entry_hlc: 1,
+            admitted_hlc: 0,
             remote_config: false,
         };
         let (me, old, new, gone) = (
@@ -214,7 +221,8 @@ mod tests {
             NodeId([3; 32]),
             NodeId([4; 32]),
         );
-        let members = [(me, row(me, 6)), (old, row(old, 3)), (new, row(new, 4))]
+        let p = crate::cluster::rpc::proto::ECONOMY_PROTO;
+        let members = [(me, row(me, p)), (old, row(old, p - 1)), (new, row(new, p))]
             .into_iter()
             .collect();
         assert_eq!(

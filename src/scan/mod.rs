@@ -148,11 +148,10 @@ pub(crate) const NOT_REPLICATED: &str = "job not replicated here yet";
 pub(crate) const TOR_UNKNOWN: &str = "Tor exit status unknown (no exit list loaded)";
 
 /// What a scanner knows of an arbiter with queued work, for [`can_pay`].
+#[derive(Clone, Copy)]
 struct Payer {
     /// This node itself: its own jobs pay from its own scan budget.
     own: bool,
-    /// Granted unpaid after announcing it could pay (`DEMOTE_FOR`).
-    demoted: bool,
     /// It sells and buys scans at scanner prices (`pay::sells_scans`).
     sells_scans: bool,
     /// `(scan_queued, scan_budget_mc)` as its heartbeat announces them.
@@ -171,7 +170,7 @@ fn can_pay(sell: Option<u32>, own_left: u64, a: &Payer) -> bool {
     if a.own {
         return own_left >= price;
     }
-    if a.demoted || !a.sells_scans {
+    if !a.sells_scans {
         return false;
     }
     match (a.announced, a.balance) {
@@ -180,12 +179,6 @@ fn can_pay(sell: Option<u32>, own_left: u64, a: &Payer) -> bool {
         }
         _ => false,
     }
-}
-
-/// Whether a grant from another arbiter that was asked as paying, but
-/// came unfunded, demotes it for [`DEMOTE_FOR`].
-fn demotes(own: bool, funded: bool, asked_as_paying: bool) -> bool {
-    !own && !funded && asked_as_paying
 }
 
 /// `arbiters` (in urgency order) with those that can pay this scanner's
@@ -272,6 +265,9 @@ enum Job {
         ip: IpAddr,
         level: u8,
         started_at: String,
+        /// Who bought it, its offer and what it offered; None: an unpaid
+        /// pick.
+        offer: Option<(NodeId, u64, u32)>,
     },
 }
 
@@ -302,9 +298,6 @@ enum Outcome {
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
 /// Skip an arbiter that did not answer for this long.
 const ARBITER_BACKOFF: Duration = Duration::from_secs(30);
-/// An arbiter that announced it could pay but granted unpaid is asked with
-/// the others for this long.
-const DEMOTE_FOR: Duration = Duration::from_secs(3600);
 /// Standalone: a deferred job is looked at again after this long.
 const DEFER_RETRY: Duration = Duration::from_secs(60);
 /// `scan.tor_unknown = "scan"`: how often that is warned about.
@@ -330,8 +323,6 @@ struct Source {
     deferred: std::sync::Mutex<HashMap<i64, Instant>>,
     tor_warned: std::sync::Mutex<Option<Instant>>,
     unreachable: std::sync::Mutex<HashMap<NodeId, Instant>>,
-    /// Arbiters asked as able to pay that granted unpaid: asked with the others until then.
-    demoted: std::sync::Mutex<HashMap<NodeId, Instant>>,
     /// Granted jobs this scanner runs now: IP (canonical) and level. Known
     /// before the job's state replicates anywhere.
     active: std::sync::Mutex<HashMap<IpAddr, u8>>,
@@ -367,7 +358,6 @@ impl Source {
             deferred: Default::default(),
             tor_warned: Default::default(),
             unreachable: Default::default(),
-            demoted: Default::default(),
             active: Default::default(),
             order: order::Cached::new(),
             audits: tokio::sync::Mutex::new(crate::credits::audit::Picker::new(
@@ -456,44 +446,97 @@ impl Source {
         }
     }
 
-    /// The next audit this scanner can start: an audit obeys everything a
-    /// scan does (never_scan, members' addresses, Tor exits, crawlers, the
-    /// evidence held here) except the rescan cooldown.
+    /// Why this scanner would not run an audit of `ip` (stored as
+    /// `ip_text`) at `level` now, if it would not: an audit obeys
+    /// everything a scan does (never_scan, members' addresses, Tor exits,
+    /// crawlers, the evidence held here) except the rescan cooldown. An
+    /// auditor asks this before it accepts a bought audit.
+    async fn audit_refusal(
+        &self,
+        ip: &IpAddr,
+        ip_text: &str,
+        level: u8,
+    ) -> anyhow::Result<Option<String>> {
+        let now = crate::store::data::now_ts();
+        if let Some(r) = self.preflight(ip, ip_text, &now).await? {
+            return Ok(Some(r.reason().to_string()));
+        }
+        let pool = &self.rec.store().pool;
+        let ev = guard::evidence(pool, ip_text, &self.origins, Some(self.classifier)).await?;
+        if ev.allowed_level(&self.cfg.scan.safety) < level {
+            return Ok(Some(
+                "the requests held here do not back a scan at this level".into(),
+            ));
+        }
+        Ok(None)
+    }
+
+    /// The next audit this scanner can start, a bought one before an
+    /// unpaid pick, that [`Source::audit_refusal`] lets through. A bought
+    /// audit of an address scanned here now waits its turn; one refused
+    /// writes nothing: its offer is released by `credits::audit`.
     async fn next_audit(&self, exclude: &[u8]) -> anyhow::Result<Option<Job>> {
         let Some(node) = self.node() else {
             return Ok(None);
         };
-        let pool = &node.store.pool;
         let mut picker = self.audits.lock().await;
-        picker.poll(pool, &node.id()).await?;
-        while let Some(t) = picker.take(exclude) {
+        picker.poll(&node.store.pool, &node.id()).await?;
+        let (mut busy, mut found, mut failed) = (vec![], None, None);
+        loop {
+            let bought = node.audit_queue.lock().unwrap().take(exclude);
+            let Some(t) = bought.or_else(|| picker.take(exclude)) else {
+                break;
+            };
+            let end = |t: &crate::credits::audit::Task| {
+                if let Some((p, q, _)) = t.offer {
+                    node.audit_queue.lock().unwrap().end((p, q));
+                }
+            };
             let Ok(ip) = t.ip.parse::<IpAddr>() else {
+                end(&t);
                 continue;
             };
             let key = crate::net::canonical(ip);
             if self.active.lock().unwrap().contains_key(&key) {
+                if t.offer.is_some() {
+                    busy.push(t);
+                }
                 continue;
             }
-            let now = crate::store::data::now_ts();
-            if let Some(r) = self.preflight(&ip, &t.ip, &now).await? {
-                debug!(target = %ip, why = r.reason(), "audit not run");
-                continue;
-            }
-            let ev = guard::evidence(pool, &t.ip, &self.origins, Some(self.classifier)).await?;
-            if ev.allowed_level(&self.cfg.scan.safety) < t.level {
-                debug!(target = %ip, level = t.level, "audit not run: the requests held here do not back it");
-                continue;
+            match self.audit_refusal(&ip, &t.ip, t.level).await {
+                Ok(None) => {}
+                Ok(Some(why)) => {
+                    debug!(target = %ip, %why, "audit not run");
+                    end(&t);
+                    continue;
+                }
+                Err(e) => {
+                    end(&t);
+                    failed = Some(e);
+                    break;
+                }
             }
             self.active.lock().unwrap().insert(key, t.level);
-            return Ok(Some(Job::Audit {
+            found = Some(Job::Audit {
                 of: t.scan_uid,
                 job_uid: t.job_uid,
                 ip,
                 level: t.level,
-                started_at: now,
-            }));
+                started_at: crate::store::data::now_ts(),
+                offer: t.offer,
+            });
+            break;
         }
-        Ok(None)
+        {
+            let mut q = node.audit_queue.lock().unwrap();
+            for t in busy.into_iter().rev() {
+                q.put_back(t);
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(found),
+        }
     }
 
     /// Standalone: our queue's next job that passes the pre-flight checks.
@@ -588,7 +631,8 @@ impl Source {
         // Arbiters that can pay this scanner's price first; this node's
         // own jobs pay from its own scan budget.
         let me = node.id();
-        let sell = node.price_table().price_of(crate::credits::price::SCAN);
+        // Before its first refresh it sells at 0, as its heartbeat says.
+        let sell = crate::credits::price::own_scan_price(node, &node.price_table());
         // Without a book (or the self tally) no arbiter counts as able to
         // pay; claiming goes on in urgency order.
         let book = match crate::credits::book(node).await {
@@ -612,16 +656,10 @@ impl Source {
             }
             _ => 0,
         };
-        let demoted: HashSet<NodeId> = {
-            let mut d = self.demoted.lock().unwrap();
-            d.retain(|_, until| *until > Instant::now());
-            d.keys().copied().collect()
-        };
         let members = node.members();
         let can_pay = |a: &NodeId| -> bool {
             let payer = Payer {
                 own: *a == me,
-                demoted: demoted.contains(a),
                 sells_scans: members
                     .get(a)
                     .is_some_and(|m| crate::credits::pay::sells_scans(m.proto_max)),
@@ -633,8 +671,6 @@ impl Source {
             };
             can_pay(sell, own_left, &payer)
         };
-        let asked_as_paying: HashSet<NodeId> =
-            arbiters.iter().filter(|a| can_pay(a)).copied().collect();
         let arbiters = can_pay_first(arbiters, can_pay);
         let min_mc = sell.map_or(0, crate::credits::price::min_take);
         for arbiter in arbiters {
@@ -674,18 +710,6 @@ impl Source {
                 }
             };
             let Some(g) = grant else { continue };
-            if demotes(
-                arbiter == me,
-                g.offer_seq.is_some(),
-                asked_as_paying.contains(&arbiter),
-            ) {
-                // Announced it could pay, then granted unpaid (or offered
-                // under our least): asked with the others for an hour.
-                self.demoted
-                    .lock()
-                    .unwrap()
-                    .insert(arbiter, Instant::now() + DEMOTE_FOR);
-            }
             if over_share(g.level, exclude) {
                 info!(job = %g.job_uid, target = %g.ip, "scan grant turned down: at the level-4 share");
                 let (node, uid, offer) = (node.clone(), g.job_uid, g.offer_seq);
@@ -938,29 +962,49 @@ impl Source {
                     ip,
                     level,
                     started_at,
+                    offer,
                 },
-                _,
-            ) => match outcome {
-                Outcome::Done(res) => {
-                    if let Err(e) = self
-                        .rec
-                        .record_scan_audit(
-                            of,
-                            job_uid,
-                            &ip.to_string(),
-                            *level as i64,
-                            started_at,
-                            &res,
-                        )
-                        .await
-                    {
-                        warn!(audit_of = %of, ?e, "could not record audit");
+                node,
+            ) => {
+                match outcome {
+                    Outcome::Done(res) => {
+                        if let Err(e) = self
+                            .rec
+                            .record_scan_audit(
+                                of,
+                                job_uid,
+                                &ip.to_string(),
+                                *level as i64,
+                                started_at,
+                                &res,
+                            )
+                            .await
+                        {
+                            warn!(audit_of = %of, ?e, "could not record audit");
+                        } else if let (Some((payer, seq, price)), Some(node)) = (offer, node) {
+                            // A bought audit, published: charge its offer.
+                            let receipt = crate::cluster::record::Record::CreditReceipt {
+                                payer: *payer,
+                                offer_seq: *seq,
+                                charged_mc: *price,
+                                answered: vec![crate::credits::price::AUDIT.into()],
+                                economy: crate::cluster::record::ECONOMY,
+                            };
+                            if let Err(e) = crate::cluster::repl::append(node, &[receipt]).await {
+                                warn!(audit_of = %of, ?e, "audit receipt not written");
+                            }
+                        }
                     }
+                    // A failed audit says nothing: it is not published.
+                    Outcome::Failed(e) => debug!(audit_of = %of, error = %e, "audit scan failed"),
+                    Outcome::Abandoned => {}
                 }
-                // A failed audit says nothing: it is not published.
-                Outcome::Failed(e) => debug!(audit_of = %of, error = %e, "audit scan failed"),
-                Outcome::Abandoned => {}
-            },
+                // Charged, or (failed, abandoned) left for `credits::audit`
+                // to release.
+                if let (Some((payer, seq, _)), Some(node)) = (offer, node) {
+                    node.audit_queue.lock().unwrap().end((*payer, *seq));
+                }
+            }
             (
                 Job::Granted {
                     arbiter,
@@ -1295,6 +1339,23 @@ pub async fn run_workers(
         pace.clone(),
         classifier,
     ));
+    // An auditor asks before it accepts a bought audit (`credits::audit`).
+    if let Some(node) = source.node() {
+        let weak = Arc::downgrade(&source);
+        let check: crate::credits::audit::Check = Arc::new(move |ip, ip_text, level| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let Some(source) = weak.upgrade() else {
+                    return Some("this node's scan workers stopped".to_string());
+                };
+                match source.audit_refusal(&ip, &ip_text, level).await {
+                    Ok(why) => why,
+                    Err(e) => Some(format!("{e:#}")),
+                }
+            })
+        });
+        *node.audit_check.lock().unwrap() = Some(check);
+    }
     // Level-4 scans running now (see `L4Slot`).
     let running_l4 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut joinset = tokio::task::JoinSet::new();
@@ -2110,6 +2171,7 @@ license_key = "k"
                 remote_config: false,
                 peers: vec![],
                 origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
             },
             roles: Default::default(),
             store: store.clone(),
@@ -2431,7 +2493,6 @@ license_key = "k"
     fn an_arbiter_can_pay_from_its_budget_and_balance_or_its_own_budget() {
         let other = Payer {
             own: false,
-            demoted: false,
             sells_scans: true,
             announced: Some((3, 500)),
             balance: Some(800),
@@ -2451,10 +2512,6 @@ license_key = "k"
                 ..other
             }, // nothing queued
             Payer {
-                demoted: true,
-                ..other
-            },
-            Payer {
                 sells_scans: false,
                 ..other
             },
@@ -2473,7 +2530,6 @@ license_key = "k"
         // This node's own jobs: its own scan budget left, nothing else.
         let own = Payer {
             own: true,
-            demoted: false,
             sells_scans: false,
             announced: None,
             balance: None,
@@ -2483,11 +2539,19 @@ license_key = "k"
     }
 
     #[test]
-    fn an_arbiter_asked_as_paying_that_grants_unpaid_is_demoted() {
-        assert!(demotes(false, false, true));
-        assert!(!demotes(false, true, true), "funded");
-        assert!(!demotes(false, false, false), "not asked as paying");
-        assert!(!demotes(true, false, true), "this node's own jobs");
+    fn an_arbiter_can_pay_a_zero_price_from_nothing() {
+        let other = Payer {
+            own: false,
+            sells_scans: true,
+            announced: Some((1, 0)),
+            balance: Some(0),
+        };
+        assert!(can_pay(Some(0), 0, &other));
+        let idle = Payer {
+            announced: Some((0, 0)),
+            ..other
+        };
+        assert!(!can_pay(Some(0), 0, &idle), "nothing queued");
     }
 
     #[test]

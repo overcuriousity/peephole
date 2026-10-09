@@ -138,8 +138,7 @@ a.tile:hover .label { color: var(--color-accent); }
 .price-table td a:hover { color: var(--color-accent); }
 .spark-cell { width: 7rem; }
 .spark-cell .sparkline, .spark-cell .sparkline svg { height: 1.5rem; }
-.flow-chart .k-mint, .flow-legend .k-mint { fill: var(--color-accent); background: var(--color-accent); }
-.flow-chart .k-allowance, .flow-legend .k-allowance { fill: var(--color-accent-muted); background: var(--color-accent-muted); }
+.flow-chart .k-pool, .flow-legend .k-pool { fill: var(--color-accent); background: var(--color-accent); }
 .flow-chart .k-sales, .flow-legend .k-sales { fill: var(--color-success); background: var(--color-success); }
 .flow-chart .k-spent, .flow-legend .k-spent { fill: var(--color-brand); background: var(--color-brand); }
 .ledger-part { margin-top: 1.25rem; }

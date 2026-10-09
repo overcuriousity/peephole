@@ -389,32 +389,32 @@
     draw(); onWidthChange(draw);
   }
 
-  // This node's money per day: income stacked (mint, allowance, sales)
-  // beside what it spent. [{day, mint, allowance, sales, spent}]
+  // This node's money per day: income stacked (pool, sales) beside what
+  // it spent. [{day, pool, sales, spent}]
   function flow(host, days) {
     var W = Math.max(widthOf(host, 500), 240), H = 180, L = 46, B = 22, T = 8;
     var max = 0;
-    days.forEach(function (d) { max = Math.max(max, d.mint + d.allowance + d.sales, d.spent); });
+    days.forEach(function (d) { max = Math.max(max, d.pool + d.sales, d.spent); });
     if (!max) return empty(host, W, H);
     var s = svg(host, W, H), top = niceMax(max), plotH = H - B - T, slot = (W - L) / days.length, bw = Math.min(18, slot / 3);
     var grid = el("g", { "class": "grid" }, s), axis = el("g", { "class": "axis" }, s);
     [0, 0.5, 1].forEach(function (f) { var y = T + plotH - f * plotH; el("line", { x1: L, x2: W, y1: y, y2: y }, grid); text(axis, L - 6, y + 3, compact(Math.round(f * top)), "", "end"); });
     days.forEach(function (d, i) {
       var x = L + i * slot + slot / 2 - bw - 1, y = T + plotH;
-      [["mint", d.mint], ["allowance", d.allowance], ["sales", d.sales]].forEach(function (k) {
+      [["pool", d.pool], ["sales", d.sales]].forEach(function (k) {
         if (!k[1]) return;
         var h = Math.max((k[1] / top) * plotH, 1); y -= h;
         el("rect", { "class": "seg k-" + k[0], x: x, y: y, width: bw, height: h }, s);
       });
       if (d.spent) { var h2 = Math.max((d.spent / top) * plotH, 1); el("rect", { "class": "seg k-spent", x: x + bw + 2, y: T + plotH - h2, width: bw, height: h2 }, s); }
       var hit = el("rect", { "class": "col-hit", x: L + i * slot, y: T, width: slot, height: plotH }, s);
-      hover(hit, function () { return "<b>" + esc(d.day) + "</b><br>mint " + cr(d.mint) + " · allowance " + cr(d.allowance) + " · sales " + cr(d.sales) + "<br>spent <b>" + cr(d.spent) + "</b>"; });
+      hover(hit, function () { return "<b>" + esc(d.day) + "</b><br>pool " + cr(d.pool) + " · sales " + cr(d.sales) + "<br>spent <b>" + cr(d.spent) + "</b>"; });
       text(axis, L + i * slot + slot / 2, H - 6, d.day, "", "middle");
     });
     var twin = document.querySelector("[data-flow-table]");
     if (twin) {
-      var t = "<table><caption>This node's credits per day</caption><tr><th>Day</th><th>Mint</th><th>Allowance</th><th>Sales</th><th>Spent</th></tr>";
-      days.forEach(function (d) { t += "<tr><td>" + esc(d.day) + "</td><td>" + cr(d.mint) + "</td><td>" + cr(d.allowance) + "</td><td>" + cr(d.sales) + "</td><td>" + cr(d.spent) + "</td></tr>"; });
+      var t = "<table><caption>This node's credits per day</caption><tr><th>Day</th><th>Pool</th><th>Sales</th><th>Spent</th></tr>";
+      days.forEach(function (d) { t += "<tr><td>" + esc(d.day) + "</td><td>" + cr(d.pool) + "</td><td>" + cr(d.sales) + "</td><td>" + cr(d.spent) + "</td></tr>"; });
       twin.innerHTML = t + "</table>";
     }
   }

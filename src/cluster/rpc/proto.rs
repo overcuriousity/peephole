@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Highest protocol version this build speaks.
-pub const PROTO_VERSION: u32 = 6;
+pub const PROTO_VERSION: u32 = 7;
 /// Lowest protocol version this build still speaks. Version 1 let any
 /// member revoke others and delete their records; it is not spoken.
 pub const PROTO_MIN: u32 = 2;
@@ -10,12 +10,11 @@ pub const PROTO_MIN: u32 = 2;
 /// A node cannot decode a message kind it does not know, so these go only
 /// to members that announce at least this version.
 pub const OWNER_PROTO: u32 = 3;
-/// Scanners sell scan jobs at their own prices (`credits::price`); an
-/// arbiter funds only scanners at this protocol or later.
-pub const SCAN_PRICE_PROTO: u32 = 5;
-/// Members from this version count balances with the market's rules
-/// (`credits::mint`): payments go only between them.
-pub const MARKET_PROTO: u32 = 4;
+/// Members from this version count the credits of protocol 7 (a fixed
+/// supply, `credits::pool`) and sell scans at their own prices: payments,
+/// funded jobs and every paid good run only between them, and sync
+/// withholds protocol-7-only entries from older members.
+pub const ECONOMY_PROTO: u32 = 7;
 /// Members from this version answer `Msg::Rpc` sent through their outbox;
 /// older ones cannot decode or relay it, so neither the target nor any
 /// relay or outbox holder on the way may be older.

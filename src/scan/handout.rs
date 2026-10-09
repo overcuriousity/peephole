@@ -13,18 +13,10 @@ const KEEP_DAYS: i64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
-    /// Paid, to the cheapest per delivered result.
+    /// To the cheapest per delivered result.
     Cheapest,
-    /// Paid, after the job waited out the reserve.
+    /// After the job waited out the reserve.
     Override,
-    /// Unpaid: the scan budget did not cover it.
-    Unpaid,
-    /// Unpaid: the best scanner asking has no price here.
-    NoPrice,
-    /// Unpaid: the best scanner asking takes more than its price here.
-    BelowMin,
-    /// Unpaid: the offer could not be written.
-    OfferFailed,
 }
 
 impl Reason {
@@ -32,39 +24,26 @@ impl Reason {
         match self {
             Reason::Cheapest => "cheapest",
             Reason::Override => "override",
-            Reason::Unpaid => "unpaid",
-            Reason::NoPrice => "no_price",
-            Reason::BelowMin => "below_min",
-            Reason::OfferFailed => "offer_failed",
         }
     }
 
-    /// Whether the grant went unpaid.
-    pub fn unpaid(self) -> bool {
-        !matches!(self, Reason::Cheapest | Reason::Override)
-    }
-
+    /// None for a reason of the old rules (an unpaid grant), so such a
+    /// record is not shown; they are gone within [`KEEP_DAYS`].
     fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "cheapest" => Reason::Cheapest,
             "override" => Reason::Override,
-            "unpaid" => Reason::Unpaid,
-            "no_price" => Reason::NoPrice,
-            "below_min" => Reason::BelowMin,
-            "offer_failed" => Reason::OfferFailed,
             _ => return None,
         })
     }
 }
 
-/// One grant of a job and why.
+/// One grant of a job and why. Every grant is funded, at zero or above.
 #[derive(Debug, Clone)]
 pub struct Handout {
     pub job_uid: String,
     pub scanner: NodeId,
     pub level: i64,
-    /// Whether the grant was funded.
-    pub paid: bool,
     pub price_mc: Option<u32>,
     /// The scanner's weight at the level.
     pub rate: f64,
@@ -75,11 +54,10 @@ pub struct Handout {
     /// or queued ([`Reason::Override`]).
     pub waited_secs: i64,
     pub reason: Reason,
-    /// Unpaid: claimants that sat the level out by the old rule.
-    pub sat_out: i64,
 }
 
-/// Keep `h`, and drop records older than [`KEEP_DAYS`].
+/// Keep `h`, and drop records older than [`KEEP_DAYS`]. The `paid` and
+/// `sat_out` columns of the old rules are written as 1 and 0.
 pub async fn record(pool: &SqlitePool, h: &Handout) -> Result<()> {
     sqlx::query(
         "INSERT INTO job_handouts (job_uid, scanner, level, paid, price_mc, rate, effective_mc,
@@ -89,7 +67,7 @@ pub async fn record(pool: &SqlitePool, h: &Handout) -> Result<()> {
     .bind(&h.job_uid)
     .bind(&h.scanner.0[..])
     .bind(h.level)
-    .bind(h.paid)
+    .bind(true)
     .bind(h.price_mc.map(i64::from))
     .bind(h.rate)
     .bind(h.effective_mc as i64)
@@ -97,7 +75,7 @@ pub async fn record(pool: &SqlitePool, h: &Handout) -> Result<()> {
     .bind(h.next.map(|(_, e)| e as i64))
     .bind(h.waited_secs)
     .bind(h.reason.as_str())
-    .bind(h.sat_out)
+    .bind(0i64)
     .execute(pool)
     .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -112,7 +90,6 @@ type Row = (
     String,
     Vec<u8>,
     i64,
-    bool,
     Option<i64>,
     f64,
     i64,
@@ -120,7 +97,6 @@ type Row = (
     Option<i64>,
     i64,
     String,
-    i64,
 );
 
 /// The latest grant of each of `job_uids` recorded here.
@@ -129,8 +105,8 @@ pub async fn latest(pool: &SqlitePool, job_uids: &[String]) -> Result<HashMap<St
         return Ok(HashMap::new());
     }
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT job_uid, scanner, level, paid, price_mc, rate, effective_mc,
-                next_scanner, next_effective_mc, waited_secs, reason, sat_out
+        "SELECT job_uid, scanner, level, price_mc, rate, effective_mc,
+                next_scanner, next_effective_mc, waited_secs, reason
          FROM job_handouts WHERE id IN (
            SELECT MAX(id) FROM job_handouts
            WHERE job_uid IN (SELECT value FROM json_each(?)) GROUP BY job_uid)",
@@ -146,17 +122,15 @@ pub async fn latest(pool: &SqlitePool, job_uids: &[String]) -> Result<HashMap<St
                 job_uid: r.0,
                 scanner: NodeId::from_slice(&r.1).ok()?,
                 level: r.2,
-                paid: r.3,
-                price_mc: r.4.map(mc),
-                rate: r.5,
-                effective_mc: mc(r.6),
-                next: match (r.7, r.8) {
+                price_mc: r.3.map(mc),
+                rate: r.4,
+                effective_mc: mc(r.5),
+                next: match (r.6, r.7) {
                     (Some(s), Some(e)) => Some((NodeId::from_slice(&s).ok()?, mc(e))),
                     _ => None,
                 },
-                waited_secs: r.9,
-                reason: Reason::parse(&r.10)?,
-                sat_out: r.11,
+                waited_secs: r.8,
+                reason: Reason::parse(&r.9)?,
             };
             Some((h.job_uid.clone(), h))
         })
@@ -187,20 +161,6 @@ pub fn describe(h: &Handout, name: &dyn Fn(&NodeId) -> String) -> String {
             "Waited {} min, then went to whoever asked: {s}, {eff} per delivered result.",
             h.waited_secs / 60
         ),
-        unpaid => {
-            let why = match unpaid {
-                Reason::NoPrice => "the best scanner asking has no price here yet",
-                Reason::BelowMin => "the price here is under what the best scanner asking takes",
-                Reason::OfferFailed => "the offer could not be written",
-                _ => "the scan budget did not cover it",
-            };
-            let sat = if h.sat_out > 0 {
-                format!(" (scanners weak at L{} sat out by the old rule)", h.level)
-            } else {
-                String::new()
-            };
-            format!("Unpaid: {why}; went to {s}{sat}.")
-        }
     }
 }
 
@@ -229,14 +189,12 @@ mod tests {
             job_uid: "j".into(),
             scanner: fast,
             level: 4,
-            paid: true,
             price_mc: Some(30),
             rate: 1.0,
             effective_mc: 30,
             next: Some((flaky, 40)),
             waited_secs: 720,
             reason: Reason::Cheapest,
-            sat_out: 0,
         };
         assert_eq!(
             describe(&h, &name),
@@ -262,47 +220,8 @@ mod tests {
             describe(&o, &name),
             "Waited 30 min, then went to whoever asked: Flaky, 0.04 per delivered result."
         );
-        let u = Handout {
-            paid: false,
-            reason: Reason::Unpaid,
-            sat_out: 2,
-            ..o.clone()
-        };
-        assert_eq!(
-            describe(&u, &name),
-            "Unpaid: the scan budget did not cover it; went to Flaky \
-             (scanners weak at L4 sat out by the old rule)."
-        );
-        let u = Handout { sat_out: 0, ..u };
-        assert_eq!(
-            describe(&u, &name),
-            "Unpaid: the scan budget did not cover it; went to Flaky."
-        );
-        for (reason, text) in [
-            (
-                Reason::NoPrice,
-                "Unpaid: the best scanner asking has no price here yet; went to Flaky.",
-            ),
-            (
-                Reason::BelowMin,
-                "Unpaid: the price here is under what the best scanner asking takes; went to Flaky.",
-            ),
-            (
-                Reason::OfferFailed,
-                "Unpaid: the offer could not be written; went to Flaky.",
-            ),
-        ] {
-            assert_eq!(
-                describe(
-                    &Handout {
-                        reason,
-                        ..u.clone()
-                    },
-                    &name
-                ),
-                text
-            );
-            assert_eq!(Reason::parse(reason.as_str()), Some(reason));
+        for r in [Reason::Cheapest, Reason::Override] {
+            assert_eq!(Reason::parse(r.as_str()), Some(r));
         }
     }
 
@@ -316,14 +235,12 @@ mod tests {
             job_uid: uid.into(),
             scanner: NodeId([1; 32]),
             level: 2,
-            paid: true,
             price_mc: Some(eff),
             rate: 1.0,
             effective_mc: eff,
             next: Some((NodeId([2; 32]), eff + 1)),
             waited_secs: 0,
             reason: Reason::Cheapest,
-            sat_out: 0,
         };
         record(&s.pool, &h("old", 1)).await.unwrap();
         sqlx::query("UPDATE job_handouts SET at = datetime('now', '-9 days')")
@@ -337,5 +254,11 @@ mod tests {
         assert_eq!(got["a"].next, Some((NodeId([2; 32]), 21)));
         assert_eq!(got["a"].reason, Reason::Cheapest);
         assert!(!got.contains_key("old"), "pruned after 8 days");
+        // A grant of the old rules (unpaid) is not shown.
+        sqlx::query("UPDATE job_handouts SET reason = 'unpaid' WHERE job_uid = 'a'")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert!(latest(&s.pool, &["a".into()]).await.unwrap().is_empty());
     }
 }

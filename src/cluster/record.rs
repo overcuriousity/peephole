@@ -9,6 +9,31 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 const SIG_DOMAIN: &[u8] = b"peephole-repl-v1\0";
+/// Payments of the credits of protocol 7 (`economy` [`ECONOMY`]) are
+/// signed under their own domain: no older node takes one for a payment
+/// of the economy it counts.
+const SIG_DOMAIN_V2: &[u8] = b"peephole-repl-v2\0";
+/// The economy of protocol 7's credits (`credits::pool`). Payments
+/// without it are of the economy before, which nothing reads any more.
+pub const ECONOMY: u8 = 2;
+/// Kinds only protocol 7 knows. Sync serves an older member an origin's
+/// entries up to the first of these (or of a payment of [`ECONOMY`]).
+pub const ECONOMY_KINDS: &[&str] = &["reach_report", "rdns_name"];
+/// Most answers an `ip_name` entry may carry for a node below protocol 7
+/// (its resolvers were at most 5).
+pub const OLD_MAX_ANSWERS: usize = 5;
+const CREDIT_KINDS: [&str; 3] = ["credit_offer", "credit_receipt", "credit_transfer"];
+
+fn is_zero_u8(n: &u8) -> bool {
+    *n == 0
+}
+
+/// The signing domain of an entry of `kind` carrying `payload`.
+fn domain(kind: &str, payload: &[u8]) -> &'static [u8] {
+    let new = CREDIT_KINDS.contains(&kind)
+        && super::rpc::cbor::decode::<Record>(payload).is_ok_and(|r| r.economy() == ECONOMY);
+    if new { SIG_DOMAIN_V2 } else { SIG_DOMAIN }
+}
 
 /// Addresses inside a record as text. The CBOR encoder writes a bare
 /// `IpAddr` in its compact form, but `Record`'s tag buffers the fields and
@@ -388,6 +413,15 @@ fn is_zero_u16(n: &u16) -> bool {
     *n == 0
 }
 
+/// The advertised members the origin completed a sync round with during
+/// one UTC hour (`credits::reach`). One per origin and hour.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReachReportRec {
+    /// Hours since the Unix epoch, UTC.
+    pub hour: u32,
+    pub reached: Vec<NodeId>,
+}
+
 /// A name an admin looked up, with what each node's resolver answered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IpNameRec {
@@ -396,6 +430,19 @@ pub struct IpNameRec {
     pub at: String,
     #[serde(with = "ip_text::answers")]
     pub answers: Vec<(NodeId, Result<Vec<IpAddr>, String>)>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build: String,
+}
+
+/// The reverse names of a source, as the quorum the recording node bought
+/// them from answered (`intel::rdns`): forward-confirmed PTR names, or why
+/// there are none. Every node tallies the answers itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RdnsRec {
+    pub uid: String,
+    pub ip: String,
+    pub at: String,
+    pub answers: Vec<(NodeId, Result<Vec<String>, String>)>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub build: String,
 }
@@ -470,6 +517,7 @@ pub enum Record {
     ScanResult(ScanResultRec),
     ProbeResult(ProbeResultRec),
     IpName(IpNameRec),
+    RdnsName(RdnsRec),
     Tombstone(TombstoneRec),
     IntelManifest(IntelManifestRec),
     SkipBatch(SkipBatchRec),
@@ -483,6 +531,13 @@ pub enum Record {
         /// lapses after the longest scan, not after 15 minutes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job: Option<String>,
+        /// The scan an audit this offer buys checks (`credits::audit`);
+        /// such an offer lives as long as an audit may take.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audit: Option<String>,
+        /// [`ECONOMY`] for the credits of protocol 7; absent (0) before.
+        #[serde(default, skip_serializing_if = "is_zero_u8")]
+        economy: u8,
     },
     /// The server's word on an offer: what it charged, and for which
     /// providers. The address looked up is not in it.
@@ -491,12 +546,18 @@ pub enum Record {
         offer_seq: u64,
         charged_mc: u32,
         answered: Vec<String>,
+        /// [`ECONOMY`] for the credits of protocol 7; absent (0) before.
+        #[serde(default, skip_serializing_if = "is_zero_u8")]
+        economy: u8,
     },
     /// Credits sent to another node.
     CreditTransfer {
         to: NodeId,
         parts: Vec<(u32, u32)>,
         seal: Seal,
+        /// [`ECONOMY`] for the credits of protocol 7; absent (0) before.
+        #[serde(default, skip_serializing_if = "is_zero_u8")]
+        economy: u8,
     },
     /// A seal with nothing else to say (written when many entries have
     /// none yet).
@@ -509,6 +570,7 @@ pub enum Record {
         b: Box<WireEntry>,
     },
     ScanAudit(Box<ScanAuditRec>),
+    ReachReport(ReachReportRec),
 }
 
 /// Kinds whose payload is not stored in the log but rebuilt from their row
@@ -531,6 +593,7 @@ impl Record {
             Record::ScanResult(_) => "scan_result",
             Record::ProbeResult(_) => "probe_result",
             Record::IpName(_) => "ip_name",
+            Record::RdnsName(_) => "rdns_name",
             Record::Tombstone(_) => "tombstone",
             Record::IntelManifest(_) => "intel_manifest",
             Record::SkipBatch(_) => "skip_batch",
@@ -540,6 +603,7 @@ impl Record {
             Record::LogSeal { .. } => "log_seal",
             Record::ForkProof { .. } => "fork_proof",
             Record::ScanAudit(_) => "scan_audit",
+            Record::ReachReport(_) => "reach_report",
         }
     }
 
@@ -554,10 +618,21 @@ impl Record {
             Record::ScanResult(r) => Some(r.uid.clone()),
             Record::ProbeResult(r) => Some(r.uid.clone()),
             Record::IpName(r) => Some(r.uid.clone()),
+            Record::RdnsName(r) => Some(r.uid.clone()),
             Record::Tombstone(r) => Some(r.uid.clone()),
             Record::SkipBatch(r) => Some(r.uid.clone()),
             Record::ScanAudit(r) => Some(r.scan.uid.clone()),
             _ => None,
+        }
+    }
+
+    /// The economy a payment belongs to; 0 for everything else.
+    pub fn economy(&self) -> u8 {
+        match self {
+            Record::CreditOffer { economy, .. }
+            | Record::CreditReceipt { economy, .. }
+            | Record::CreditTransfer { economy, .. } => *economy,
+            _ => 0,
         }
     }
 }
@@ -588,8 +663,9 @@ fn signing_bytes(
     payload: &[u8],
 ) -> Vec<u8> {
     let uid = uid.unwrap_or("");
-    let mut m = Vec::with_capacity(SIG_DOMAIN.len() + 52 + kind.len() + uid.len() + payload.len());
-    m.extend_from_slice(SIG_DOMAIN);
+    let d = domain(kind, payload);
+    let mut m = Vec::with_capacity(d.len() + 52 + kind.len() + uid.len() + payload.len());
+    m.extend_from_slice(d);
     m.extend_from_slice(&origin.0);
     m.extend_from_slice(&seq.to_be_bytes());
     m.extend_from_slice(&hlc.to_be_bytes());
@@ -695,11 +771,132 @@ impl WireEntry {
         // disagree with what was actually signed.
         (r.kind() == self.kind && r.uid() == self.uid).then_some(r)
     }
+
+    /// Whether only members of protocol 7 may be served this entry.
+    pub fn needs_economy_proto(&self) -> bool {
+        let kind = self.kind.as_str();
+        if ECONOMY_KINDS.contains(&kind) {
+            return true;
+        }
+        if kind == "ip_name" {
+            // Older nodes ignore a name with more answers than they asked
+            // resolvers, for good: it waits until they upgrade.
+            return matches!(self.record(), Some(Record::IpName(r))
+                if r.answers.len() > OLD_MAX_ANSWERS);
+        }
+        if !CREDIT_KINDS.contains(&kind) && kind != "fork_proof" {
+            return false;
+        }
+        match self.record() {
+            Some(Record::ForkProof { a, b }) => a.needs_economy_proto() || b.needs_economy_proto(),
+            Some(r) => r.economy() == ECONOMY,
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reach_report_round_trips() {
+        let r = Record::ReachReport(ReachReportRec {
+            hour: 490_000,
+            reached: vec![NodeId([1; 32]), NodeId([2; 32])],
+        });
+        let bytes = crate::cluster::rpc::cbor::encode(&r).unwrap();
+        assert_eq!(
+            crate::cluster::rpc::cbor::decode::<Record>(&bytes).unwrap(),
+            r
+        );
+        assert_eq!(r.kind(), "reach_report");
+        assert_eq!(r.uid(), None);
+    }
+
+    #[test]
+    fn payments_of_the_new_economy_are_signed_under_their_own_domain() {
+        let id = crate::cluster::identity::Identity::generate().unwrap();
+        let offer = |economy: u8| Record::CreditOffer {
+            to: NodeId([3; 32]),
+            parts: vec![(20_000, 5)],
+            seal: Seal::default(),
+            job: None,
+            audit: None,
+            economy,
+        };
+        let new = WireEntry::sign(&id, 4, 9 << 16, &offer(ECONOMY)).unwrap();
+        let old = WireEntry::sign(&id, 4, 9 << 16, &offer(0)).unwrap();
+        assert!(new.verify() && old.verify());
+        assert_ne!(new.digest(), old.digest());
+        assert!(new.needs_economy_proto() && !old.needs_economy_proto());
+        // The same payload under the old domain does not verify: no older
+        // node takes it for a payment of the economy it counts.
+        let forged = WireEntry {
+            sig: old.sig.clone(),
+            payload: new.payload.clone(),
+            ..new.clone()
+        };
+        assert!(!forged.verify());
+        // Nor does the new payload signed under the old domain.
+        let v2 = signing_bytes(
+            &id.id,
+            4,
+            9 << 16,
+            "credit_offer",
+            None,
+            new.payload.as_ref().unwrap(),
+        );
+        let v1 = [SIG_DOMAIN, &v2[SIG_DOMAIN_V2.len()..]].concat();
+        let under_old = WireEntry {
+            sig: Some(id.sign(&v1)),
+            ..new.clone()
+        };
+        assert!(!under_old.verify());
+        assert_eq!(offer(ECONOMY).economy(), ECONOMY);
+        // A proof of two histories carrying such a payment needs it too.
+        let proof = |x: &WireEntry| {
+            WireEntry::sign(
+                &id,
+                5,
+                10 << 16,
+                &Record::ForkProof {
+                    a: Box::new(x.clone()),
+                    b: Box::new(old.clone()),
+                },
+            )
+            .unwrap()
+        };
+        assert!(proof(&new).needs_economy_proto());
+        assert!(!proof(&old).needs_economy_proto());
+        assert_eq!(
+            Record::LogSeal {
+                seal: Seal::default()
+            }
+            .economy(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_name_with_more_answers_than_older_nodes_take_needs_protocol_seven() {
+        let id = crate::cluster::identity::Identity::generate().unwrap();
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        let name = |n: u8| {
+            let rec = Record::IpName(IpNameRec {
+                uid: format!("n{n}"),
+                name: "a.example".into(),
+                at: "2026-01-01 00:00:00".into(),
+                answers: (0..n).map(|i| (NodeId([i; 32]), Ok(vec![a]))).collect(),
+                build: String::new(),
+            });
+            WireEntry::sign(&id, 4, 9 << 16, &rec).unwrap()
+        };
+        assert!(!name(1).needs_economy_proto());
+        assert!(!name(OLD_MAX_ANSWERS as u8).needs_economy_proto());
+        assert!(name(OLD_MAX_ANSWERS as u8 + 1).needs_economy_proto());
+        assert!(name(9).needs_economy_proto());
+    }
 
     /// Records naming addresses decode on the peers they are sent to.
     #[test]
@@ -875,6 +1072,8 @@ mod tests {
                     parts: vec![(20_000, 250), (20_001, 4_000_000_000)],
                     seal: seal.clone(),
                     job: None,
+                    audit: None,
+                    economy: ECONOMY,
                 },
                 "credit_offer",
             ),
@@ -884,6 +1083,7 @@ mod tests {
                     offer_seq: 12,
                     charged_mc: 200,
                     answered: vec!["shodan".into()],
+                    economy: ECONOMY,
                 },
                 "credit_receipt",
             ),
@@ -892,6 +1092,7 @@ mod tests {
                     to: id.id,
                     parts: vec![(20_000, 1)],
                     seal: seal.clone(),
+                    economy: 0,
                 },
                 "credit_transfer",
             ),

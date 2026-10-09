@@ -4,11 +4,11 @@
 {% block content %}
 {% let sub = "cluster" %}{% include "_admin_nav.html" %}
 {% let subtab = "credits" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
-<div class="page-head"><div><h1>Credits</h1><p class="muted">Minted daily among the scanners, spent on lookups and scans. Every figure is this node's own count, from its copy of the log.</p></div></div>
+<div class="page-head"><div><h1>Credits</h1><p class="muted">A fixed pool a day for the members anyone can reach, earned by selling goods, spent on goods. Every figure is this node's own count, from its copy of the log.</p></div></div>
 <div class="stack">
 <div class="tiles kpis market-kpis">
   <div class="tile"><span class="label">In circulation</span><div class="value">{{ totals.1 }}</div><div class="hint">credits · {{ totals.0 }} earned in 7 days</div></div>
-  <div class="tile"><span class="label">Minted today</span><div class="value">{{ accruing.0 }}<span class="of"> scans</span></div><div class="hint">counted for this node so far · split when the day ends (UTC)</div></div>
+  <div class="tile"><span class="label">Up today</span><div class="value">{{ today_up.0 }}<span class="of"> hours</span></div><div class="hint">{% if today_up.1 %}reported by the members · 12 hours earn today's pool share{% else %}not an advertised listener: no pool share{% endif %}</div></div>
   <div class="tile"><span class="label">Scan price</span><div class="value">{{ price.scan }}{% if let Some((c, trend)) = scan_change %} <span class="delta-chip" data-trend="{{ trend }}">{{ c }}</span>{% endif %}</div><div class="hint">{% if price.scan == "–" %}not a scanner{% else %}its selling price · {{ price.scan_paid }} paid of {{ price.scan_target }} an hour{% endif %}</div></div>
   <div class="tile"><span class="label">Scan capacity used</span><div class="value">{{ price.utilization }}<span class="of"> %</span></div><svg class="meter" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true"><rect class="track" width="100" height="4" rx="2"/><rect class="fill" width="{{ price.utilization }}" height="4" rx="2"/></svg><div class="hint">{{ price.capacity_per_hour }} scans an hour possible</div></div>
 </div>
@@ -25,11 +25,14 @@
   {% endif %}
 </section>
 <section class="card"><div class="card-head"><h2>What things cost here</h2></div>
-  <p class="muted">Each price follows demand and supply: it rises when more is asked than this node offers, and falls when less is asked. What this node answers itself is free, though its own scan jobs use up its scan budget.</p>
+  <p class="muted">Each price follows sales: it rises while the good sells (or every slot is taken) and falls while it does not, down to nothing. What this node answers itself is free, though its own scan jobs use up its scan budget.</p>
   <ul>
     <li>This node sells a funded scan job for <b>{{ price.scan }}</b> credits; each scanner prices itself by how busy it is with paid work ({{ price.capacity_per_hour }} scans an hour possible here, {{ price.utilization }} % used).</li>
     {% if let Some(p) = price.probe %}<li>A probe for another member costs <b>{{ p }}</b> credits here.</li>{% endif %}
     <li>Resolving a name costs <b>{{ price.resolve }}</b> credits here.</li>
+    <li>Reverse names cost <b>{{ price.rdns }}</b> credits here.</li>
+    {% if let Some(r) = price.relay %}<li>A relay lease (an hour) costs <b>{{ r }}</b> credits here.</li>{% endif %}
+    <li>1 in 20 scans of paid jobs is designated for an audit the scanner buys from auditors the log ranks; this node also checks {{ price.audit_share }} % of other nodes' fresh scans unpaid.</li>
   </ul>
   {% if !goods.is_empty() %}
   <div class="table-wrap"><table class="price-table">
@@ -59,31 +62,32 @@
 <div class="grid-2 market-split">
 <section class="card"><div class="card-head"><h2>Money flow</h2><span class="muted">this node, last 7 days (UTC)</span></div>
   <div class="chart flow-chart" data-flow="{{ flow_json }}" role="img" aria-label="This node's income and spending per day"></div>
-  <div class="legend flow-legend" aria-hidden="true"><span><i class="swatch k-mint"></i>mint</span><span><i class="swatch k-allowance"></i>allowance</span><span><i class="swatch k-sales"></i>sales</span><span><i class="swatch k-spent"></i>spent</span></div>
+  <div class="legend flow-legend" aria-hidden="true"><span><i class="swatch k-pool"></i>pool</span><span><i class="swatch k-sales"></i>sales</span><span><i class="swatch k-spent"></i>spent</span></div>
   <div class="visually-hidden" data-flow-table></div>
 </section>
 <section class="card"><div class="card-head"><h2>Where credits come from</h2></div>
-  <p>Every day 1000 credits are split among the scanners by the scans that counted. Every member that earns here and recorded a request gets 5 credits a day. A credit is gone 7 days after the day it was minted; nothing else destroys it.</p>
-  <p>Today: {{ accruing.0 }} scans counted so far{% if accruing.1 %}, and the allowance{% endif %}; credited when the day ends (UTC).</p>
+  <p>Every day 1000 credits are split evenly among the members anyone can reach: advertised listeners that at least half of the members reached in at least 12 of the day's 24 hours. Nothing else creates credits and nothing destroys them; a credit is gone 7 days after the day of its pool. Everything else is earned by selling: lookups, names, probes, scans, audits and relays.</p>
+  <p>This node: {{ today_up.0 }} hours up today so far; the day's pool is credited an hour after it ends (UTC).</p>
   {% if !income.is_empty() %}<div class="table-wrap"><table>
-    <thead><tr><th>Day</th><th class="num">Mint</th><th class="num">Allowance</th></tr></thead>
-    <tbody>{% for (d, m, a) in income %}<tr><td class="mono">{{ d }}</td><td class="num">{{ m }}</td><td class="num">{{ a }}</td></tr>{% endfor %}</tbody>
+    <thead><tr><th>Day</th><th class="num">Pool</th></tr></thead>
+    <tbody>{% for (d, p) in income %}<tr><td class="mono">{{ d }}</td><td class="num">{{ p }}</td></tr>{% endfor %}</tbody>
   </table></div>{% endif %}
 </section>
 </div>
 <section class="card"><div class="card-head"><h2>Cluster</h2><span class="muted">as this node counts it</span></div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Member</th><th class="num">Credits</th><th class="num">Earned, 7 days</th><th class="num">Spent, 7 days</th><th class="num">Mint (7 days)</th><th class="num">Allowance (7 days)</th><th class="num">Sales (7 days)</th><th></th></tr></thead>
+    <thead><tr><th>Member</th><th class="num">Credits</th><th class="num">Earned, 7 days</th><th class="num">Spent, 7 days</th><th class="num">Pool (7 days)</th><th class="num">Sales (7 days)</th><th class="num" title="Hours up today, as the members report; 12 earn the day's pool share">Up today</th><th></th></tr></thead>
     <tbody>{% for m in members %}<tr>
       <td><a href="/admin/cluster/node/{{ m.key }}"><b>{{ m.name }}</b></a></td>
-      <td class="num">{{ m.balance }}</td><td class="num">{{ m.earned }}</td><td class="num">{{ m.spent }}</td><td class="num">{{ m.minted }}</td><td class="num">{{ m.allowance }}</td><td class="num">{{ m.sales }}</td>
+      <td class="num">{{ m.balance }}</td><td class="num">{{ m.earned }}</td><td class="num">{{ m.spent }}</td><td class="num">{{ m.pool }}</td><td class="num">{{ m.sales }}</td>
+      <td class="num">{{ m.up }} h {% if m.qualifies %}<span class="badge" data-status="done">qualifies</span>{% else %}<span class="muted small">does not qualify</span>{% endif %}</td>
       <td>{% if !m.standing.is_empty() %}<span class="badge badge-status" data-status="running">not earning here: {{ m.standing }}</span>{% endif %}</td>
     </tr>{% endfor %}</tbody>
   </table></div>
   <p class="muted">In 7 days earned {{ totals.0 }} · in circulation now {{ totals.1 }} credits. Another node may count differently: it holds other entries, blocks other members, or runs other rules.</p>
 </section>
 <section class="card" id="ledger"><div class="card-head"><h2>Your credits</h2><span class="muted">this node: <b class="num">{{ balance }}</b> · set aside <span class="num">{{ held }}</span> in open lookups{% if let Some((total, _)) = fleet %} · all your nodes: <b class="num">{{ total }}</b>{% endif %}</span></div>
-  {% if days.is_empty() %}<p class="muted">Nothing to spend. Credits come from the daily mint and the allowance, above.</p>{% else %}
+  {% if days.is_empty() %}<p class="muted">Nothing to spend. Credits come from the daily pool, above, and from sales.</p>{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>Earned on (UTC)</th><th class="num">Credits</th><th>Expires</th></tr></thead>
     <tbody>{% for d in days %}<tr><td class="mono">{{ d.date }}</td><td class="num">{{ d.amount }}</td><td>{{ d.expires }}</td></tr>{% endfor %}</tbody>
@@ -100,19 +104,6 @@
 </div>
 {% endif %}
   <details class="ledger-more"><summary>Earned, spent, sent and received</summary>
-  <div class="ledger-part"><div class="card-head"><h3>Earned</h3><span class="muted">last 7 days, newest first (UTC)</span></div>
-  {% if waiting > 0 %}<p class="muted">{{ waiting }} scan{% if waiting != 1 %}s{% endif %} not judged yet: a scan is judged ten minutes after it arrives.</p>{% endif %}
-  {% if earned.is_empty() %}<p class="muted">Nothing yet.</p>{% else %}
-  <div class="table-wrap wide"><table>
-    <thead><tr><th>When</th><th>Scan</th><th>IP</th><th>Level</th><th class="num">Counts</th><th>Note</th></tr></thead>
-    <tbody>{% for e in earned %}<tr>
-      <td class="ts">{{ e.at }}</td>
-      <td>{% if let Some(id) = e.scan %}<a class="mono" href="/admin/scans/{{ id }}">scan #{{ id }}</a>{% else %}<span class="muted">not held here</span>{% endif %}</td>
-      <td><a class="mono" href="/ip/{{ e.ip }}">{{ e.ip }}</a></td><td>{{ e.level }}</td><td class="num">{{ e.counts }}</td>
-      <td class="muted">{{ e.note }}</td>
-    </tr>{% endfor %}</tbody>
-  </table></div>{% endif %}
-</div>
   <div class="ledger-part"><div class="card-head"><h3>Spent</h3><span class="muted">lookups this node paid for</span></div>
   {% if spent.is_empty() %}<p class="muted">Nothing yet.</p>{% else %}
   <div class="table-wrap wide"><table>

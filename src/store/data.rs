@@ -93,6 +93,8 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
         Record::SkipBatch(b) => skip_batch(conn, ctx, b).await,
         Record::ProbeResult(r) => super::probes::apply_probe_result(conn, ctx, r).await,
         Record::IpName(r) => super::probes::apply_ip_name(conn, ctx, r).await,
+        Record::RdnsName(r) => super::rdns::apply_rdns(conn, ctx, r).await,
+        Record::ReachReport(r) => crate::credits::reach::apply(conn, ctx, r).await,
         // Membership and credits are the cluster layer's (`members::apply`,
         // `credits::entries`, `cluster::seal`): no row of the dataset.
         Record::MemberAdd(_)
@@ -108,7 +110,7 @@ pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Res
 
 /// Record kinds a local hide or block keeps out of the tables. Membership,
 /// tombstones and scan-job state still apply, so the cluster stays in step.
-const CONTENT_KINDS: [&str; 10] = [
+const CONTENT_KINDS: [&str; 11] = [
     "request",
     "skip_batch",
     "fingerprint",
@@ -119,6 +121,7 @@ const CONTENT_KINDS: [&str; 10] = [
     "ip_intel",
     "probe_result",
     "ip_name",
+    "rdns_name",
 ];
 
 async fn origin_blocked(conn: &mut SqliteConnection, origin: Option<&NodeId>) -> Result<bool> {
@@ -1217,11 +1220,11 @@ async fn remove_row(
         "skip_batch" => "skipped_batches",
         // probe_ports and the probe's host_keys cascade.
         "probe_result" => "probes",
-        "ip_name" => "ip_names",
+        "ip_name" | "rdns_name" => "ip_names",
         _ => return Ok(None),
     };
     // An ip_names row carries the uid of the newest lookup that set it.
-    let col = if kind == "ip_name" {
+    let col = if matches!(kind, "ip_name" | "rdns_name") {
         "record_uid"
     } else {
         "uid"
@@ -1277,7 +1280,7 @@ async fn remove_row(
     }
     // One lookup names several addresses: the caller gets one of them,
     // the others are dropped here once nothing else refers to them.
-    let others: Vec<i64> = if kind == "ip_name" {
+    let others: Vec<i64> = if matches!(kind, "ip_name" | "rdns_name") {
         sqlx::query_scalar("SELECT DISTINCT ip_id FROM ip_names WHERE record_uid = ?")
             .bind(uid)
             .fetch_all(&mut *conn)

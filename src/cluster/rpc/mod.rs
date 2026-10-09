@@ -7,6 +7,7 @@ pub mod server;
 use super::Node;
 use super::invite::{self, JoinReq};
 use super::msg::Envelope;
+use super::relay;
 use super::repl;
 use super::status::SignedHeartbeat;
 use super::sync::{BATCH_BYTES, BATCH_ENTRIES, Batch, PullReq, WAIT_SECS, WaitReq};
@@ -41,6 +42,8 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/rpc/v1/lookup", post(lookup))
         .route("/rpc/v1/probe", post(probe))
         .route("/rpc/v1/resolve", post(resolve))
+        .route("/rpc/v1/rdns", post(rdns))
+        .route("/rpc/v1/relay", post(relay_lease))
         .route_layer(axum::middleware::from_fn_with_state(
             node.clone(),
             require_member,
@@ -102,6 +105,7 @@ async fn pull(
         req.since_hlc,
         req.max_entries.clamp(1, 5 * BATCH_ENTRIES),
         req.max_bytes.clamp(1, 4 * BATCH_BYTES),
+        node.old_peer(&peer),
     )
     .await
     {
@@ -177,6 +181,31 @@ async fn message(State(node): State<Arc<Node>>, Cbor(mut env): Cbor<Envelope>) -
     if !body.fresh() {
         return (StatusCode::BAD_REQUEST, "stale or future-dated message").into_response();
     }
+    // A request this node cannot pass on is refused at once, so the
+    // sender tries its next relay or gives up without waiting: one for a
+    // member that lists this node as a relay but holds no lease here, or
+    // for an outbound-only member without relays. Answers are excepted
+    // (they wait in the asker's outbox here, see `msg`).
+    if body.to != node.id() && body.in_reply_to.is_none() && !node.routable(&body.to, &[]) {
+        let relays = node
+            .status
+            .known(&body.to)
+            .map(|k| k.hb.relays)
+            .unwrap_or_default();
+        let now = crate::cluster::hlc::wall_ms();
+        if relays.contains(&node.id()) && !node.relay_leases.holds(&body.to, now) {
+            return (StatusCode::SERVICE_UNAVAILABLE, relay::NO_LEASE).into_response();
+        }
+        if relays.contains(&node.id())
+            || relays.is_empty()
+                && node
+                    .members()
+                    .get(&body.to)
+                    .is_some_and(|m| m.address.is_none())
+        {
+            return (StatusCode::SERVICE_UNAVAILABLE, "no route to that member").into_response();
+        }
+    }
     let Ok(permit) = node.route_slots.clone().try_acquire_owned() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response();
     };
@@ -226,6 +255,16 @@ async fn resolve(
     Cbor(crate::intel::dns::serve_resolve(&node, peer, &req).await).into_response()
 }
 
+/// A source's reverse names for a member, free at zero or paid with the
+/// offer it names.
+async fn rdns(
+    State(node): State<Arc<Node>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Cbor(req): Cbor<crate::intel::rdns::RdnsReq>,
+) -> Response {
+    Cbor(crate::intel::rdns::serve_rdns(&node, peer, &req).await).into_response()
+}
+
 /// An observational probe for a member, paid with the offer it names.
 async fn probe(
     State(node): State<Arc<Node>>,
@@ -235,8 +274,31 @@ async fn probe(
     Cbor(routed::probe_answer(&node, peer, &req).await).into_response()
 }
 
+/// A relay lease for an outbound-only member (`cluster::relay`).
+async fn relay_lease(
+    State(node): State<Arc<Node>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Cbor(req): Cbor<crate::cluster::relay::RelayReq>,
+) -> Response {
+    Cbor(crate::cluster::relay::serve(&node, peer, &req).await).into_response()
+}
+
 /// Long-poll for messages waiting for the caller.
 async fn inbox(State(node): State<Arc<Node>>, Extension(Peer(peer)): Extension<Peer>) -> Response {
+    // A lessee that lists this node holds no lease here (it restarted):
+    // told at once, it leases another relay. Answers already queued for
+    // it here are handed over first.
+    if !node.has_queued(&peer)
+        && node
+            .status
+            .known(&peer)
+            .is_some_and(|k| k.hb.relays.contains(&node.id()))
+        && !node
+            .relay_leases
+            .holds(&peer, crate::cluster::hlc::wall_ms())
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, relay::NO_LEASE).into_response();
+    }
     Cbor(node.take_inbox(peer).await).into_response()
 }
 

@@ -88,6 +88,9 @@ pub struct Heartbeat {
     /// Its queued scan jobs.
     #[serde(default)]
     pub scan_queued: u32,
+    /// The relays this outbound-only node leases (`cluster::relay`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<NodeId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,7 +400,14 @@ impl Node {
     pub fn refresh_heartbeat(&self) {
         let local = self.status.local.lock().unwrap().clone();
         let table = self.price_table();
-        let (on_demand, prices) = table.announced();
+        let (on_demand, mut prices) = table.announced();
+        if let Some(p) = super::relay::price(self)
+            && !prices
+                .iter()
+                .any(|(g, _)| g == crate::credits::price::RELAY)
+        {
+            prices.push((crate::credits::price::RELAY.to_string(), p));
+        }
         let hb = Heartbeat {
             node: self.id(),
             at_ms: self.status.next_at(),
@@ -429,11 +439,12 @@ impl Node {
             prices,
             public_addrs: self.status.public_addresses(),
             probe_price_mc: self.prober().map(|p| p.price(&table)),
-            scan_price_mc: table.price_of(crate::credits::price::SCAN),
+            scan_price_mc: crate::credits::price::own_scan_price(self, &table),
             scan_budget_mc: self
                 .scan_budget_mc
                 .load(std::sync::atomic::Ordering::Relaxed),
             scan_queued: self.scan_queued.load(std::sync::atomic::Ordering::Relaxed),
+            relays: self.leased.relays(super::hlc::wall_ms()),
         };
         let Ok(body) = super::rpc::cbor::encode(&hb) else {
             return;
@@ -562,6 +573,7 @@ mod tests {
             scan_price_mc: None,
             scan_budget_mc: 0,
             scan_queued: 0,
+            relays: vec![],
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = id.sign(&SignedHeartbeat::signing(&body));
@@ -677,6 +689,7 @@ mod tests {
                 lease_secs: 120,
                 remote_config: false,
                 origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
                 peers: vec![],
             },
             roles: Default::default(),
@@ -744,6 +757,7 @@ mod tests {
             scan_price_mc: None,
             scan_budget_mc: 0,
             scan_queued: 0,
+            relays: vec![],
         };
         let body = crate::cluster::rpc::cbor::encode(&hb).unwrap();
         let sig = a.sign(&SignedHeartbeat::signing(&body));

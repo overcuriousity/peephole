@@ -2,10 +2,13 @@
 //! kept as rows when their log entry is applied, so the ledger reads a
 //! week of them without walking the log. A row is the entry as it was
 //! signed; whether it moves anything is the ledger's business.
+//!
+//! Only payments of protocol 7's economy are read; older rows are kept
+//! and ignored.
 use super::day_of;
 use crate::cluster::hlc;
 use crate::cluster::identity::NodeId;
-use crate::cluster::record::{Record, WireEntry};
+use crate::cluster::record::{ECONOMY, Record, WireEntry};
 use anyhow::Result;
 use sqlx::{SqliteConnection, SqlitePool};
 
@@ -48,6 +51,8 @@ pub enum Kind {
         parts: Vec<(u32, u32)>,
         /// The scan job it funds; such an offer lapses after the longest scan.
         job: Option<String>,
+        /// The scan an audit it buys checks (`credits::audit`).
+        audit: Option<String>,
     },
     Receipt {
         payer: NodeId,
@@ -106,21 +111,39 @@ pub async fn apply(
         Option<u32>,
         Option<&'a [String]>,
         Option<&'a str>,
+        Option<&'a str>,
     );
-    let (kind, peer, parts, offer_seq, charged, answered, job_uid): Cols = match r {
-        Record::CreditOffer { to, parts, job, .. }
-            if parts_ok(parts, day) && job.as_ref().is_none_or(|j| j.len() <= 64) =>
+    let (kind, peer, parts, offer_seq, charged, answered, job_uid, audit_uid): Cols = match r {
+        Record::CreditOffer {
+            to,
+            parts,
+            job,
+            audit,
+            ..
+        } if parts_ok(parts, day)
+            && job.as_ref().is_none_or(|j| j.len() <= 64)
+            && audit.as_ref().is_none_or(|a| a.len() <= 128) =>
         {
-            ("offer", to, parts, None, None, None, job.as_deref())
+            (
+                "offer",
+                to,
+                parts,
+                None,
+                None,
+                None,
+                job.as_deref(),
+                audit.as_deref(),
+            )
         }
         Record::CreditTransfer { to, parts, .. } if *to != e.origin && parts_ok(parts, day) => {
-            ("transfer", to, parts, None, None, None, None)
+            ("transfer", to, parts, None, None, None, None, None)
         }
         Record::CreditReceipt {
             payer,
             offer_seq,
             charged_mc,
             answered,
+            ..
         } if answered.len() <= MAX_ANSWERED
             && answered.iter().all(|a| a.len() <= MAX_PROVIDER_LEN) =>
         {
@@ -132,14 +155,16 @@ pub async fn apply(
                 Some(*charged_mc),
                 Some(answered),
                 None,
+                None,
             )
         }
         _ => return Ok(false),
     };
     sqlx::query(
         "INSERT OR IGNORE INTO credit_entries
-           (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, job_uid)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+           (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, job_uid,
+            economy, audit_uid)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&e.origin.0[..])
     .bind(e.seq.min(i64::MAX as u64) as i64)
@@ -152,6 +177,8 @@ pub async fn apply(
     .bind(answered.map(serde_json::to_string).transpose()?)
     .bind(seal.to_db())
     .bind(job_uid)
+    .bind(i64::from(r.economy()))
+    .bind(audit_uid)
     .execute(&mut *conn)
     .await?;
     Ok(true)
@@ -169,10 +196,11 @@ type Row = (
     Option<String>,
     i64,
     Option<String>,
+    Option<String>,
 );
 
-const COLUMNS: &str =
-    "origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, job_uid";
+const COLUMNS: &str = "origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, \
+     job_uid, audit_uid";
 
 fn from_row(r: Row) -> Result<Entry> {
     let peer = NodeId::from_slice(&r.4)?;
@@ -181,6 +209,7 @@ fn from_row(r: Row) -> Result<Entry> {
             to: peer,
             parts: serde_json::from_str(&r.5)?,
             job: r.10,
+            audit: r.11,
         },
         "transfer" => Kind::Transfer {
             to: peer,
@@ -207,8 +236,10 @@ fn from_row(r: Row) -> Result<Entry> {
 /// them: by HLC, then origin, then sequence number.
 pub async fn since(pool: &SqlitePool, from_hlc: u64) -> Result<Vec<Entry>> {
     let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM credit_entries WHERE hlc >= ? ORDER BY hlc, origin, seq"
+        "SELECT {COLUMNS} FROM credit_entries WHERE economy = ? AND hlc >= ?
+         ORDER BY hlc, origin, seq"
     )))
+    .bind(i64::from(ECONOMY))
     .bind(hlc::to_db(from_hlc))
     .fetch_all(pool)
     .await?;
@@ -217,10 +248,11 @@ pub async fn since(pool: &SqlitePool, from_hlc: u64) -> Result<Vec<Entry>> {
 
 pub async fn get(pool: &SqlitePool, origin: &NodeId, seq: u64) -> Result<Option<Entry>> {
     let row: Option<Row> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM credit_entries WHERE origin = ? AND seq = ?"
+        "SELECT {COLUMNS} FROM credit_entries WHERE origin = ? AND seq = ? AND economy = ?"
     )))
     .bind(&origin.0[..])
     .bind(seq.min(i64::MAX as u64) as i64)
+    .bind(i64::from(ECONOMY))
     .fetch_optional(pool)
     .await?;
     row.map(from_row).transpose()
@@ -239,7 +271,7 @@ pub async fn prune(pool: &SqlitePool, before_hlc: u64) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::cluster::identity::Identity;
-    use crate::cluster::record::Seal;
+    use crate::cluster::record::{ECONOMY, Seal};
     use crate::store::Store;
 
     #[test]
@@ -273,6 +305,8 @@ mod tests {
             parts: vec![(day, 200)],
             seal: Seal::default(),
             job: Some(job),
+            audit: None,
+            economy: ECONOMY,
         };
         let mut conn = store.pool.acquire().await.unwrap();
         let kept = offer("job".into());
@@ -305,10 +339,51 @@ mod tests {
                 to: b.id,
                 parts: vec![(day, 200)],
                 job: Some("job".into()),
+                audit: None,
             }
         );
         assert_eq!(get(&store.pool, &a.id, 4).await.unwrap(), None);
         assert_eq!(since(&store.pool, 0).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn only_payments_of_the_new_economy_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let (a, b) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let day = 20_000u32;
+        let at = |min: u64| ((day as u64 * crate::credits::DAY_MS + min * 60_000) << 16) | 1;
+        let offer = |economy: u8| Record::CreditOffer {
+            to: b.id,
+            parts: vec![(day, 200)],
+            seal: Seal::default(),
+            job: None,
+            audit: None,
+            economy,
+        };
+        let mut conn = store.pool.acquire().await.unwrap();
+        for (seq, economy) in [(1, 0u8), (2, crate::cluster::record::ECONOMY)] {
+            let r = offer(economy);
+            let e = WireEntry::sign(&a, seq, at(seq), &r).unwrap();
+            assert!(
+                apply(&mut conn, &e, &r, SealState::Consistent)
+                    .await
+                    .unwrap()
+            );
+        }
+        drop(conn);
+        let read = since(&store.pool, 0).await.unwrap();
+        assert_eq!(
+            read.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [2],
+            "the old one is kept, not read"
+        );
+        assert_eq!(get(&store.pool, &a.id, 1).await.unwrap(), None);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credit_entries")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
     }
 
     #[test]
@@ -330,6 +405,8 @@ mod tests {
             parts: parts.clone(),
             seal: Seal::default(),
             job: None,
+            audit: None,
+            economy: 0,
         };
         let old = Old::CreditOffer {
             to,
@@ -362,6 +439,8 @@ mod tests {
                 parts: vec![(day - 1, 300), (day, 200)],
                 seal: seal.clone(),
                 job: None,
+                audit: None,
+                economy: ECONOMY,
             },
         );
         let receipt = sign(
@@ -373,6 +452,7 @@ mod tests {
                 offer_seq: 4,
                 charged_mc: 400,
                 answered: vec!["abuseipdb".into()],
+                economy: ECONOMY,
             },
         );
         let transfer = sign(
@@ -383,6 +463,7 @@ mod tests {
                 to: b.id,
                 parts: vec![(day, 50)],
                 seal: seal.clone(),
+                economy: ECONOMY,
             },
         );
         let to_self = sign(
@@ -393,6 +474,7 @@ mod tests {
                 to: a.id,
                 parts: vec![(day, 50)],
                 seal: seal.clone(),
+                economy: ECONOMY,
             },
         );
         let stale = sign(
@@ -404,6 +486,8 @@ mod tests {
                 parts: vec![(day - 7, 50)],
                 seal: seal.clone(),
                 job: None,
+                audit: None,
+                economy: ECONOMY,
             },
         );
         let other = sign(&a, 8, at(6), &Record::LogSeal { seal });
@@ -438,6 +522,7 @@ mod tests {
                     to: b.id,
                     parts: vec![(day - 1, 300), (day, 200)],
                     job: None,
+                    audit: None,
                 },
                 seal: SealState::Consistent,
             }

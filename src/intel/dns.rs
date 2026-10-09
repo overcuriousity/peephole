@@ -1,8 +1,8 @@
 //! Host names: what the admin may type into the Lookup box, and how a name
-//! is resolved by several nodes at once. Each resolver's answer is kept in
-//! an `ip_name` record; every node derives the per-address votes from those
-//! answers itself (see `store::probes::apply_ip_name`), so a tally is never
-//! taken on trust.
+//! is resolved by a quorum of nodes (`quorum`), the cheapest first. Each
+//! resolver's answer is kept in an `ip_name` record; every node derives the
+//! per-address votes from those answers itself (see
+//! `store::probes::apply_ip_name`), so a tally is never taken on trust.
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{IpNameRec, Record};
@@ -14,8 +14,17 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Most nodes asked to resolve one name (this node included).
-pub const MAX_RESOLVERS: usize = 5;
+/// Most nodes asked for a quorum good (a name resolved, a source's
+/// reverse names), this node included.
+pub const MAX_QUORUM: usize = 9;
+
+/// How many nodes a quorum good asks: a majority of the `n` reachable
+/// members announcing a price for it (this node included), at most
+/// [`MAX_QUORUM`]; alone, 1.
+pub fn quorum(n: usize) -> usize {
+    (n / 2 + 1).min(MAX_QUORUM)
+}
+
 /// Most agreed addresses of a name that are looked up in turn.
 pub const MAX_FOLLOWED: usize = 16;
 /// Most addresses kept of one resolver's answer.
@@ -144,6 +153,9 @@ pub struct ResolveResp {
     /// What the resolver charged, in mc.
     #[serde(default)]
     pub charged_mc: u32,
+    /// Its price, when the request offered less (or nothing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_mc: Option<u32>,
 }
 
 impl ResolveResp {
@@ -152,6 +164,15 @@ impl ResolveResp {
             addrs: vec![],
             error: Some(why.to_string()),
             charged_mc: 0,
+            price_mc: None,
+        }
+    }
+
+    /// Declined for its price, which it names.
+    pub fn priced(why: &str, price_mc: u32) -> ResolveResp {
+        ResolveResp {
+            price_mc: Some(price_mc),
+            ..ResolveResp::refused(why)
         }
     }
 }
@@ -193,59 +214,74 @@ pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> 
         }
         return ResolveResp::refused("not a host name");
     };
-    let Some(seq) = req.offer_seq else {
-        return ResolveResp::refused(
-            "resolving a name is paid with credits: the request carries no offer",
-        );
+    let cost = node.price_table().price_of(price::RESOLVE).unwrap_or(0);
+    node.market.note(price::RESOLVE, 1);
+    let seq = match req.offer_seq {
+        Some(seq) => Some(seq),
+        None if cost == 0 => None,
+        None => {
+            return ResolveResp::priced(
+                &format!(
+                    "resolving a name costs {} credits here now; the request carries no offer",
+                    crate::credits::show(cost as u64)
+                ),
+                cost,
+            );
+        }
     };
-    let Some(cost) = node.price_table().price_of(price::RESOLVE) else {
-        pay::release(node, peer, seq).await;
-        return ResolveResp::refused("this node has no resolution price yet; ask again later");
-    };
-    let accepted = pay::accept_offer(
-        node,
-        peer,
-        seq,
-        cost as u64,
-        "resolve",
-        pay::SERVE_MARGIN_MS,
-    )
-    .await;
-    if pay::counts_as_demand(&accepted) {
-        node.market.note(price::RESOLVE, 1);
-    }
-    if let Err(d) = accepted {
-        let why = match d {
-            pay::Declined::Why(w) | pay::Declined::NotCovered(w) => w,
-            pay::Declined::TooLow { why, .. } => why,
-        };
-        return ResolveResp::refused(&why);
+    if let Some(seq) = seq {
+        let accepted = pay::accept_offer(
+            node,
+            peer,
+            seq,
+            cost as u64,
+            "resolve",
+            pay::SERVE_MARGIN_MS,
+        )
+        .await;
+        match accepted {
+            Ok(_) => {}
+            Err(pay::Declined::TooLow { why, price_mc }) => {
+                return ResolveResp::priced(&why, price_mc);
+            }
+            Err(pay::Declined::Why(w) | pay::Declined::NotCovered(w)) => {
+                return ResolveResp::refused(&w);
+            }
+        }
     }
     let taken = match node.lookup_shares() {
         Some(s) => s.take_good(price::RESOLVE).await.unwrap_or(false),
         None => true,
     };
     if !taken {
-        pay::release(node, peer, seq).await;
+        if let Some(seq) = seq {
+            pay::release(node, peer, seq).await;
+        }
         return ResolveResp::refused("this node's resolutions for others are used up for today");
     }
     let answer = resolve_here(&name).await;
-    let charged = charge_for(&answer, cost);
-    let receipt = Record::CreditReceipt {
-        payer: peer,
-        offer_seq: seq,
-        charged_mc: charged,
-        answered: if charged > 0 {
-            vec![price::RESOLVE.into()]
-        } else {
-            vec![]
-        },
-    };
-    let charged = match crate::cluster::repl::append(node, &[receipt]).await {
-        Ok(_) => charged,
-        Err(e) => {
-            tracing::warn!(?e, "resolve receipt not written");
-            0
+    let charged = match seq {
+        None => 0,
+        Some(seq) => {
+            let charged = charge_for(&answer, cost);
+            let receipt = Record::CreditReceipt {
+                payer: peer,
+                offer_seq: seq,
+                charged_mc: charged,
+                answered: if charged > 0 {
+                    vec![price::RESOLVE.into()]
+                } else {
+                    vec![]
+                },
+                economy: crate::cluster::record::ECONOMY,
+            };
+            match crate::cluster::repl::append(node, &[receipt]).await {
+                Ok(_) => charged,
+                Err(e) => {
+                    tracing::warn!(?e, "resolve receipt not written");
+                    0
+                }
+            }
         }
     };
     match answer {
@@ -253,14 +289,15 @@ pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> 
             addrs,
             error: None,
             charged_mc: charged,
+            price_mc: None,
         },
         Err(e) => ResolveResp::refused(&e),
     }
 }
 
-/// What `id` announces for resolving a name; None: no price, or it
+/// What `id` announces for `good` (0: free); None: no price, or it
 /// predates the market.
-pub fn resolver_price(node: &Node, id: &NodeId) -> Option<u32> {
+pub fn member_price(node: &Node, id: &NodeId, good: &str) -> Option<u32> {
     let m = node.members().get(id).cloned()?;
     if !crate::credits::pay::pays_with(m.proto_max) {
         return None;
@@ -270,18 +307,13 @@ pub fn resolver_price(node: &Node, id: &NodeId) -> Option<u32> {
         .hb
         .prices
         .iter()
-        .find(|(g, _)| g == crate::credits::price::RESOLVE)
+        .find(|(g, _)| g == good)
         .map(|(_, mc)| *mc)
-        .filter(|mc| *mc > 0)
 }
 
-/// The candidates that can be paid, in their order.
-fn keep_priced(candidates: Vec<(Resolver, bool)>) -> Vec<Resolver> {
-    candidates
-        .into_iter()
-        .filter(|(_, priced)| *priced)
-        .map(|(r, _)| r)
-        .collect()
+/// What `id` announces for resolving a name.
+pub fn resolver_price(node: &Node, id: &NodeId) -> Option<u32> {
+    member_price(node, id, crate::credits::price::RESOLVE)
 }
 
 /// A node that may be asked to resolve a name.
@@ -321,9 +353,15 @@ pub fn describe(node: &Node, geo: &SharedGeo, id: &NodeId) -> (String, Option<St
     (name, country)
 }
 
-/// Up to [`MAX_RESOLVERS`]: this node, then random live members
-/// preferring non-siblings and unseen countries.
-pub fn choose(node: &Node, siblings: &HashSet<NodeId>, geo: &SharedGeo) -> Vec<Resolver> {
+/// The nodes asked for `good`: this node, then the [`quorum`]'s other
+/// members among the live, callable members that announce a price for
+/// it, cheapest first (see [`pick_cheapest`]).
+pub fn choose(
+    node: &Node,
+    siblings: &HashSet<NodeId>,
+    geo: &SharedGeo,
+    good: &str,
+) -> Vec<Resolver> {
     use rand::seq::SliceRandom;
     let me = node.id();
     let resolver = |id: NodeId| {
@@ -340,44 +378,53 @@ pub fn choose(node: &Node, siblings: &HashSet<NodeId>, geo: &SharedGeo) -> Vec<R
         .into_iter()
         .filter(|id| *id != me && !node.is_blocked(id) && node.can_call(id))
         .collect();
+    // Equal prices in random order, so no member is preferred.
     others.shuffle(&mut rand::rng());
-    let others = keep_priced(
-        others
-            .into_iter()
-            .map(|id| (resolver(id), resolver_price(node, &id).is_some()))
-            .collect(),
-    );
-    let candidates: Vec<Resolver> = std::iter::once(resolver(me)).chain(others).collect();
-    pick(&candidates, MAX_RESOLVERS)
+    let priced: Vec<(Resolver, u32)> = others
+        .into_iter()
+        .filter_map(|id| Some((resolver(id), member_price(node, &id, good)?)))
+        .collect();
+    let q = quorum(priced.len() + 1);
+    pick_cheapest(resolver(me), &priced, q)
 }
 
-/// The first candidate (this node), then up to `n` in all: non-siblings
-/// before siblings, and within each a new country before a seen one;
-/// otherwise in the candidates' order.
-pub fn pick(candidates: &[Resolver], n: usize) -> Vec<Resolver> {
-    let Some((first, rest)) = candidates.split_first() else {
-        return vec![];
-    };
-    let mut out = vec![first.clone()];
-    let mut seen: HashSet<&str> = first.country.as_deref().into_iter().collect();
-    for (sibling, fresh) in [(false, true), (false, false), (true, true), (true, false)] {
-        for c in rest {
-            if out.len() >= n {
-                return out;
+/// `first` (this node), then up to `n` in all of `rest`, cheapest first;
+/// among equal prices non-siblings before siblings, and within each a new
+/// country before a seen one, otherwise in `rest`'s order.
+pub fn pick_cheapest(first: Resolver, rest: &[(Resolver, u32)], n: usize) -> Vec<Resolver> {
+    let mut rest: Vec<&(Resolver, u32)> = rest.iter().collect();
+    // Stable: equal prices keep their (shuffled) order.
+    rest.sort_by_key(|(_, p)| *p);
+    let mut seen: HashSet<String> = first.country.iter().cloned().collect();
+    let mut out = vec![first];
+    let mut i = 0;
+    while i < rest.len() && out.len() < n {
+        let price = rest[i].1;
+        let tier: Vec<&Resolver> = rest[i..]
+            .iter()
+            .take_while(|(_, p)| *p == price)
+            .map(|(r, _)| r)
+            .collect();
+        i += tier.len();
+        for (sibling, fresh) in [(false, true), (false, false), (true, true), (true, false)] {
+            for c in &tier {
+                if out.len() >= n {
+                    return out;
+                }
+                if c.sibling != sibling || out.iter().any(|o| o.id == c.id) {
+                    continue;
+                }
+                if fresh && !c.country.as_deref().is_some_and(|x| !seen.contains(x)) {
+                    continue;
+                }
+                if let Some(x) = &c.country {
+                    seen.insert(x.clone());
+                }
+                out.push((*c).clone());
             }
-            if c.sibling != sibling || out.iter().any(|o| o.id == c.id) {
-                continue;
-            }
-            if fresh && !c.country.as_deref().is_some_and(|x| !seen.contains(x)) {
-                continue;
-            }
-            if let Some(x) = c.country.as_deref() {
-                seen.insert(x);
-            }
-            out.push(c.clone());
         }
     }
-    out.truncate(n);
+    out.truncate(n.max(1));
     out
 }
 
@@ -477,7 +524,7 @@ pub async fn lookup_with(
                 .collect();
             let me = node.id();
             let remote = futures::future::join_all(
-                choose(node, &siblings, geo)
+                choose(node, &siblings, geo, crate::credits::price::RESOLVE)
                     .into_iter()
                     .filter(|r| r.id != me)
                     .map(|r| ask(node, r.id, &name)),
@@ -504,18 +551,48 @@ pub async fn lookup_with(
     Ok((t, Some(r)))
 }
 
-/// One member's answer.
+/// One member's answer: asked without an offer at a zero price, with one
+/// otherwise; a decline naming a higher price is offered that once.
 async fn ask(node: &Arc<Node>, id: NodeId, name: &str) -> (NodeId, Result<Vec<IpAddr>, String>) {
     let Some(price) = resolver_price(node, &id) else {
         return (id, Err("announces no price for resolving".into()));
     };
-    let seq = match crate::credits::pay::make_offer(node, id, price as u64).await {
-        Ok(seq) => seq,
-        Err(why) => return (id, Err(why)),
+    let mut resp = ask_once(node, id, name, price as u64).await;
+    if let Ok(r) = &resp
+        && r.error.is_some()
+        && let Some(p) = crate::credits::pay::retry_price(price as u64, r.price_mc, true)
+    {
+        // A declined offer comes with a receipt of nothing: fetch it, so
+        // what the first offer held is free for the next one.
+        if price > 0
+            && let Err(e) = node.sync_around_request(id).await
+        {
+            tracing::debug!(?e, "sync after a declined resolve offer failed");
+        }
+        resp = ask_once(node, id, name, p).await;
+    }
+    let answer = match resp {
+        Err(e) => Err(e),
+        Ok(ResolveResp { error: Some(e), .. }) => Err(e),
+        Ok(ResolveResp { addrs, .. }) => Ok(addrs),
+    };
+    (id, answer)
+}
+
+/// One request to `id`, with an offer of `price` unless it is 0.
+async fn ask_once(
+    node: &Arc<Node>,
+    id: NodeId,
+    name: &str,
+    price: u64,
+) -> Result<ResolveResp, String> {
+    let offer_seq = match price {
+        0 => None,
+        p => Some(crate::credits::pay::make_offer(node, id, p).await?),
     };
     let req = ResolveReq {
         name: name.to_string(),
-        offer_seq: Some(seq),
+        offer_seq,
     };
     let call = node.call_any::<ResolveReq, ResolveResp>(
         id,
@@ -523,20 +600,88 @@ async fn ask(node: &Arc<Node>, id: NodeId, name: &str) -> (NodeId, Result<Vec<Ip
         &req,
         crate::intel::lookup::RPC_TIMEOUT,
     );
-    let answer = match call.await {
+    match call.await {
         Err(e) if e.downcast_ref::<crate::cluster::msg::NoAnswer>().is_some() => {
             Err("did not answer in time".into())
         }
         Err(e) => Err(format!("could not be asked: {e:#}")),
-        Ok(ResolveResp { error: Some(e), .. }) => Err(e),
-        Ok(ResolveResp { addrs, .. }) => Ok(addrs),
-    };
-    (id, answer)
+        Ok(r) => Ok(r),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn bare_node(dir: &std::path::Path) -> Arc<Node> {
+        let store = crate::store::Store::connect(&dir.join("t.db"))
+            .await
+            .unwrap();
+        let node = Node::open(crate::cluster::NodeParams {
+            identity: crate::cluster::identity::Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store,
+            proto: (1, 1),
+            data_dir: dir.to_path_buf(),
+            retention_days: 0,
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        node
+    }
+
+    /// A resolution without an offer: at a price it is declined naming it;
+    /// at zero it is served free, with no receipt. (The name is under
+    /// `.invalid`, so the resolver answers with an error, never a network
+    /// result: the free path is shown by reaching it.)
+    #[tokio::test]
+    async fn a_resolution_without_an_offer_is_free_only_at_zero() {
+        use crate::credits::price;
+        let dir = tempfile::tempdir().unwrap();
+        let node = bare_node(dir.path()).await;
+        let other = NodeId([9; 32]);
+        let req = ResolveReq {
+            name: "example.invalid".into(),
+            offer_seq: None,
+        };
+        let head = || node.own_head.load(std::sync::atomic::Ordering::Relaxed);
+        node.set_price_table(Arc::new(price::Table {
+            resolve_mc: 5,
+            ..Default::default()
+        }));
+        let before = head();
+        let resp = serve_resolve(&node, other, &req).await;
+        assert_eq!(resp.price_mc, Some(5), "{resp:?}");
+        assert!(
+            resp.error
+                .as_deref()
+                .unwrap()
+                .contains("the request carries no offer"),
+            "{resp:?}"
+        );
+        assert_eq!((resp.charged_mc, head()), (0, before));
+        node.set_price_table(Arc::new(price::Table::default()));
+        let resp = serve_resolve(&node, other, &req).await;
+        assert_eq!((resp.price_mc, resp.charged_mc), (None, 0), "{resp:?}");
+        assert!(
+            !resp.error.unwrap_or_default().contains("no offer"),
+            "the resolver was reached"
+        );
+        assert_eq!(head(), before, "no receipt");
+    }
 
     #[test]
     fn names_are_validated_and_normalised() {
@@ -621,16 +766,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolvers_prefer_non_siblings_and_new_countries() {
-        let r = |i: u8, sibling: bool, country: Option<&str>| Resolver {
+    fn r(i: u8, sibling: bool, country: Option<&str>) -> Resolver {
+        Resolver {
             id: NodeId([i; 32]),
             name: format!("n{i}"),
             sibling,
             country: country.map(str::to_string),
-        };
-        let all = [
-            r(0, false, Some("DE")),
+        }
+    }
+
+    fn ids(v: Vec<Resolver>) -> Vec<u8> {
+        v.iter().map(|r| r.id.0[0]).collect()
+    }
+
+    #[tokio::test]
+    async fn a_node_alone_chooses_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = bare_node(dir.path()).await;
+        let geo: SharedGeo = Default::default();
+        let chosen = choose(&node, &HashSet::new(), &geo, crate::credits::price::RESOLVE);
+        assert_eq!(chosen.iter().map(|r| r.id).collect::<Vec<_>>(), [node.id()]);
+    }
+
+    #[test]
+    fn the_quorum_is_a_majority_of_the_priced_members_and_at_most_nine() {
+        for (n, q) in [
+            (0, 1),
+            (1, 1),
+            (2, 2),
+            (3, 2),
+            (4, 3),
+            (5, 3),
+            (16, 9),
+            (17, 9),
+            (100, 9),
+        ] {
+            assert_eq!(quorum(n), q, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn at_one_price_resolvers_prefer_non_siblings_and_new_countries() {
+        let rest: Vec<(Resolver, u32)> = [
             r(1, true, Some("FR")),
             r(2, false, Some("DE")),
             r(3, false, Some("US")),
@@ -638,39 +815,35 @@ mod tests {
             r(5, true, Some("JP")),
             r(6, false, Some("US")),
             r(7, false, Some("BR")),
-        ];
-        let ids = |v: Vec<Resolver>| v.iter().map(|r| r.id.0[0]).collect::<Vec<_>>();
+        ]
+        .into_iter()
+        .map(|c| (c, 0))
+        .collect();
+        let me = || r(0, false, Some("DE"));
         // This node; new countries among non-siblings; then the other non-siblings.
-        assert_eq!(ids(pick(&all, MAX_RESOLVERS)), [0, 3, 7, 2, 4]);
+        assert_eq!(ids(pick_cheapest(me(), &rest, 5)), [0, 3, 7, 2, 4]);
         // Siblings only when nothing else is left, a new country first.
-        assert_eq!(ids(pick(&all, 8)), [0, 3, 7, 2, 4, 6, 1, 5]);
-        assert_eq!(ids(pick(&all[..2], MAX_RESOLVERS)), [0, 1]);
-        assert!(pick(&[], MAX_RESOLVERS).is_empty());
-    }
-
-    fn priced_candidate(n: u8, priced: bool) -> (Resolver, bool) {
-        (
-            Resolver {
-                id: NodeId([n; 32]),
-                name: format!("n{n}"),
-                sibling: false,
-                country: None,
-            },
-            priced,
-        )
+        assert_eq!(ids(pick_cheapest(me(), &rest, 8)), [0, 3, 7, 2, 4, 6, 1, 5]);
+        assert_eq!(ids(pick_cheapest(me(), &rest[..1], 5)), [0, 1]);
+        assert_eq!(ids(pick_cheapest(me(), &[], 3)), [0], "alone");
     }
 
     #[test]
-    fn only_priced_market_resolvers_are_chosen() {
-        let kept = keep_priced(vec![
-            priced_candidate(1, true),
-            priced_candidate(2, false),
-            priced_candidate(3, true),
-        ]);
+    fn the_cheapest_are_asked_first_and_diversity_breaks_ties() {
+        let rest = [
+            (r(7, false, Some("BR")), 9),
+            (r(4, false, None), 3),
+            (r(2, false, Some("DE")), 1),
+            (r(3, false, Some("US")), 1),
+        ];
+        let me = || r(0, false, Some("DE"));
         assert_eq!(
-            kept.iter().map(|r| r.id).collect::<Vec<_>>(),
-            [NodeId([1; 32]), NodeId([3; 32])]
+            ids(pick_cheapest(me(), &rest, 3)),
+            [0, 3, 2],
+            "at 1: the new country first"
         );
+        assert_eq!(ids(pick_cheapest(me(), &rest, 4)), [0, 3, 2, 4]);
+        assert_eq!(ids(pick_cheapest(me(), &rest, 9)), [0, 3, 2, 4, 7]);
     }
 
     #[test]

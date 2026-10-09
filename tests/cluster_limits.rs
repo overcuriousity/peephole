@@ -89,6 +89,7 @@ async fn offline(
         lease_secs: 120,
         remote_config: false,
         origin_quota_mb: 20 * 1024,
+        relay_slots: 16,
         peers: peers
             .iter()
             .enumerate()
@@ -254,7 +255,7 @@ async fn backdated_entries_take_no_effect() {
     assert_eq!(log_state(&x, a.key(), backdated.1).await, 4);
     // Kept and relayed: the log has no gap, and every node judges the
     // same entries the same way.
-    let relayed = repl::entries_after(&x.store, &[(a.key(), 0)], 0, 1000, usize::MAX)
+    let relayed = repl::entries_after(&x.store, &[(a.key(), 0)], 0, 1000, usize::MAX, false)
         .await
         .unwrap();
     assert_eq!(relayed.entries.len(), limit + 2);
@@ -354,16 +355,16 @@ async fn job_takeovers_are_judged_locally() {
     apply(&x, vec![by_b.clone()]).await;
     apply(&x, vec![by_c.clone()]).await;
     // Y gets the same history in the other order.
-    let a_log = repl::entries_after(&x.store, &[(a.key(), 0)], 0, 100, usize::MAX)
+    let a_log = repl::entries_after(&x.store, &[(a.key(), 0)], 0, 100, usize::MAX, false)
         .await
         .unwrap();
     apply(&y, a_log.entries).await;
     apply(&y, vec![stale]).await;
-    let c_log = repl::entries_after(&x.store, &[(c.key(), 0)], 0, 100, usize::MAX)
+    let c_log = repl::entries_after(&x.store, &[(c.key(), 0)], 0, 100, usize::MAX, false)
         .await
         .unwrap();
     apply(&y, c_log.entries).await;
-    let b_log = repl::entries_after(&x.store, &[(b.key(), 0)], 0, 100, usize::MAX)
+    let b_log = repl::entries_after(&x.store, &[(b.key(), 0)], 0, 100, usize::MAX, false)
         .await
         .unwrap();
     apply(&y, b_log.entries).await;
@@ -501,7 +502,7 @@ async fn parking_for_unknown_nodes_is_bounded_and_expires() {
     let cap = repl::PARK_UNTRUSTED_ENTRIES as usize;
     assert_eq!((st.parked, st.rejected), (cap, 150 - cap), "{st:?}");
     assert!(repl::refused_origins(&x).await.unwrap().contains(&u.key()));
-    let relayed = repl::entries_after(&x.store, &[(u.key(), 0)], 0, 10_000, usize::MAX)
+    let relayed = repl::entries_after(&x.store, &[(u.key(), 0)], 0, 10_000, usize::MAX, false)
         .await
         .unwrap();
     assert_eq!(relayed.entries.len(), cap);
@@ -551,7 +552,7 @@ async fn quota_and_purge() {
     let st = apply(&x, vec![a.now(request(&a, "r3"))]).await;
     assert_eq!(st.rejected, 1);
     assert!(
-        repl::entries_after(&x.store, &[(a.key(), 0)], 0, 100, usize::MAX)
+        repl::entries_after(&x.store, &[(a.key(), 0)], 0, 100, usize::MAX, false)
             .await
             .unwrap()
             .entries

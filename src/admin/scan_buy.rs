@@ -191,7 +191,7 @@ async fn buy(
         ));
     }
     // In a cluster the scan budget must cover the level-scaled cheapest
-    // price; otherwise the job would silently run unfunded.
+    // price; otherwise the job would silently wait in the queue.
     if let Some(node) = state.recorder.node() {
         let Some(cheapest) = node.price_table().scanners.iter().map(|s| s.price_mc).min() else {
             return Ok(redirect_with_error(
