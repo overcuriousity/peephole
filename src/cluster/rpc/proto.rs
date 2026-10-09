@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Highest protocol version this build speaks.
-pub const PROTO_VERSION: u32 = 7;
+pub const PROTO_VERSION: u32 = 8;
 /// Lowest protocol version this build still speaks. Version 1 let any
 /// member revoke others and delete their records; it is not spoken.
 pub const PROTO_MIN: u32 = 2;
@@ -19,6 +19,11 @@ pub const ECONOMY_PROTO: u32 = 7;
 /// older ones cannot decode or relay it, so neither the target nor any
 /// relay or outbox holder on the way may be older.
 pub const ROUTED_PROTO: u32 = 6;
+/// First version that knows scan level 5 (the `vuln` scripts). An arbiter
+/// grants a level-5 job only to claimants announcing at least this version:
+/// older nodes refuse the grant as an invalid scan level, so the job would
+/// bounce instead of waiting for a capable scanner.
+pub const VULN_SCAN_PROTO: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Hello {

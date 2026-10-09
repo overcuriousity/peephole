@@ -94,6 +94,22 @@ pub(crate) struct Claimant {
     pub min_mc: u32,
 }
 
+/// Claimants that would refuse a level-5 grant (their build predates
+/// `VULN_SCAN_PROTO`) get 5 among their exclusions, so a level-5 job waits
+/// for a capable scanner. A claimant without a member record is not gated:
+/// claims arrive from authenticated members only.
+fn gate_level5(claims: &mut [Claimant], protos: &std::collections::HashMap<NodeId, u32>) {
+    for c in claims.iter_mut() {
+        if protos
+            .get(&c.id)
+            .is_some_and(|p| *p < crate::cluster::rpc::proto::VULN_SCAN_PROTO)
+            && !c.exclude.contains(&5)
+        {
+            c.exclude.push(5);
+        }
+    }
+}
+
 /// How a scanner stands with this arbiter at the start of a round.
 struct Stand {
     /// What this arbiter would pay it; None: it cannot be granted (unpaid
@@ -305,7 +321,7 @@ impl Arbiter {
 
     async fn hand_out(&self) -> Result<()> {
         let waiters = std::mem::take(&mut *self.waiting.lock().unwrap());
-        let claims: Vec<Claimant> = waiters
+        let mut claims: Vec<Claimant> = waiters
             .iter()
             .map(|(id, exclude, min_mc, _)| Claimant {
                 id: *id,
@@ -313,6 +329,12 @@ impl Arbiter {
                 min_mc: *min_mc,
             })
             .collect();
+        let protos = crate::cluster::members::all(&self.node.store)
+            .await?
+            .into_iter()
+            .map(|m| (m.id, m.proto_max))
+            .collect();
+        gate_level5(&mut claims, &protos);
         let grants = self.round(&claims).await?;
         for ((.., tx), grant) in waiters.into_iter().zip(grants) {
             let _ = tx.send(grant);
@@ -1626,6 +1648,36 @@ mod tests {
             exclude: exclude.to_vec(),
             min_mc: 0,
         }
+    }
+
+    #[test]
+    fn level_5_jobs_skip_claimants_that_predate_vuln_scan_proto() {
+        let capable = crate::cluster::rpc::proto::VULN_SCAN_PROTO;
+        let mut claims = vec![
+            claim_of(NodeId([1; 32]), &[]),
+            claim_of(NodeId([2; 32]), &[]),
+            claim_of(NodeId([3; 32]), &[5]),
+        ];
+        let protos: std::collections::HashMap<NodeId, u32> =
+            [(NodeId([1; 32]), capable - 1), (NodeId([2; 32]), capable)]
+                .into_iter()
+                .collect();
+        gate_level5(&mut claims, &protos);
+        assert!(
+            claims[0].exclude.contains(&5),
+            "protocol {} excludes 5",
+            capable - 1
+        );
+        assert!(!claims[1].exclude.contains(&5), "capable");
+        assert!(
+            !claims[2].exclude.contains(&6),
+            "an unknown claimant is not gated"
+        );
+        assert_eq!(
+            claims[2].exclude.iter().filter(|l| **l == 5).count(),
+            1,
+            "not pushed twice"
+        );
     }
 
     /// A member with the scanner role, heard from just now, announcing
