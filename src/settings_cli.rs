@@ -32,33 +32,13 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
     };
     match arg(0) {
         Some("show") => {
-            let (cfg, s) = open(config(1)).await?;
+            let (_, s) = open(config(1)).await?;
             let now = s.snapshot();
             let src = |changed: bool| if changed { "override" } else { "config file" };
             println!("version {}", now.version);
-            for (key, value, changed) in [
-                (
-                    KEYS[0],
-                    now.pace.max_workers.to_string(),
-                    now.pace.max_workers != cfg.scan.max_workers,
-                ),
-                (
-                    KEYS[1],
-                    now.roles.listener.to_string(),
-                    now.roles.listener != cfg.roles.listener,
-                ),
-                (
-                    KEYS[2],
-                    now.roles.scanner.to_string(),
-                    now.roles.scanner != cfg.roles.scanner,
-                ),
-                (
-                    KEYS[3],
-                    now.roles.web.to_string(),
-                    now.roles.web != cfg.roles.web,
-                ),
-            ] {
-                println!("{key:<28} {value:<8} ({})", src(changed));
+            let file = Changes::from(s.defaults()).pairs();
+            for ((key, value), (_, from_file)) in Changes::from(now).pairs().into_iter().zip(file) {
+                println!("{key:<28} {value:<8} ({})", src(value != from_file));
             }
         }
         Some("set") => {

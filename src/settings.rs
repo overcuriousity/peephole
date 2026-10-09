@@ -68,33 +68,85 @@ impl Changes {
         self.web = other.web.or(self.web);
     }
 
+    /// Which key is which field: the one place that says so, in the order
+    /// of [`KEYS`].
+    fn fields(&mut self) -> [(&'static str, Field<'_>); 4] {
+        [
+            (pace::KEY_WORKERS, Field::Number(&mut self.max_workers)),
+            (KEY_ROLE_LISTENER, Field::Flag(&mut self.listener)),
+            (KEY_ROLE_SCANNER, Field::Flag(&mut self.scanner)),
+            (KEY_ROLE_WEB, Field::Flag(&mut self.web)),
+        ]
+    }
+
+    /// The fields this set gives, as `(key, value)` the way the CLI takes
+    /// them and the settings table stores them.
+    pub fn pairs(&self) -> Vec<(&'static str, String)> {
+        let mut c = self.clone();
+        c.fields()
+            .into_iter()
+            .filter_map(|(key, f)| f.value().map(|v| (key, v)))
+            .collect()
+    }
+
     /// One `key value` pair from the CLI.
     pub fn from_key_value(key: &str, value: &str) -> Result<Self, String> {
-        let num = || {
-            value
-                .trim()
-                .parse::<i64>()
-                .map_err(|_| format!("{key}: `{value}` is not a number"))
-        };
-        let flag = || match value.trim() {
-            "true" | "on" | "1" => Ok(true),
-            "false" | "off" | "0" => Ok(false),
-            _ => Err(format!("{key}: use true or false")),
-        };
         let mut c = Self::default();
-        match key {
-            pace::KEY_WORKERS => c.max_workers = Some(num()?.clamp(0, u32::MAX as i64) as u32),
-            KEY_ROLE_LISTENER => c.listener = Some(flag()?),
-            KEY_ROLE_SCANNER => c.scanner = Some(flag()?),
-            KEY_ROLE_WEB => c.web = Some(flag()?),
-            _ => {
-                return Err(format!(
-                    "`{key}` is not a runtime setting (one of: {})",
-                    KEYS.join(", ")
-                ));
+        let Some((_, field)) = c.fields().into_iter().find(|(k, _)| *k == key) else {
+            return Err(format!(
+                "`{key}` is not a runtime setting (one of: {})",
+                KEYS.join(", ")
+            ));
+        };
+        field.parse(key, value)?;
+        Ok(c)
+    }
+}
+
+/// Every setting of `s`, as a change (what `peephole settings show` lists).
+impl From<Snapshot> for Changes {
+    fn from(s: Snapshot) -> Self {
+        Self {
+            max_workers: Some(s.pace.max_workers as u32),
+            listener: Some(s.roles.listener),
+            scanner: Some(s.roles.scanner),
+            web: Some(s.roles.web),
+        }
+    }
+}
+
+/// A field of [`Changes`], by its type.
+enum Field<'a> {
+    Number(&'a mut Option<u32>),
+    Flag(&'a mut Option<bool>),
+}
+
+impl Field<'_> {
+    fn value(&self) -> Option<String> {
+        match self {
+            Field::Number(v) => v.map(|v| v.to_string()),
+            Field::Flag(v) => v.map(|v| v.to_string()),
+        }
+    }
+
+    fn parse(self, key: &str, value: &str) -> Result<(), String> {
+        match self {
+            Field::Number(v) => {
+                let n = value
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| format!("{key}: `{value}` is not a number"))?;
+                *v = Some(n.clamp(0, u32::MAX as i64) as u32);
+            }
+            Field::Flag(v) => {
+                *v = Some(match value.trim() {
+                    "true" | "on" | "1" => true,
+                    "false" | "off" | "0" => false,
+                    _ => return Err(format!("{key}: use true or false")),
+                });
             }
         }
-        Ok(c)
+        Ok(())
     }
 }
 
@@ -227,6 +279,11 @@ impl Settings {
             roles: self.roles(),
             version: self.version.load(Ordering::Relaxed),
         }
+    }
+
+    /// The config file's values: what a reset goes back to.
+    pub fn defaults(&self) -> Snapshot {
+        self.defaults
     }
 
     pub fn roles(&self) -> Roles {
@@ -401,15 +458,8 @@ impl Settings {
         if c.is_empty() {
             return Ok(Ok(current.version));
         }
-        for (key, value) in [
-            (pace::KEY_WORKERS, c.max_workers.map(|v| v.to_string())),
-            (KEY_ROLE_LISTENER, c.listener.map(|v| v.to_string())),
-            (KEY_ROLE_SCANNER, c.scanner.map(|v| v.to_string())),
-            (KEY_ROLE_WEB, c.web.map(|v| v.to_string())),
-        ] {
-            if let Some(v) = value {
-                self.set(&mut tx, key, v).await?;
-            }
+        for (key, value) in c.pairs() {
+            self.set(&mut tx, key, value).await?;
         }
         next.version = current.version + 1;
         self.set(&mut tx, KEY_VERSION, next.version.to_string())
@@ -602,6 +652,25 @@ mod tests {
         assert!(Changes::from_key_value("scan.rescan_cooldown_hours", "48").is_err());
         assert!(Changes::from_key_value("roles.web", "maybe").is_err());
         assert!(Changes::default().is_empty());
+    }
+
+    /// Every key maps to one field and back, the way the settings table
+    /// stores it; a snapshot lists every key with its value.
+    #[test]
+    fn every_key_is_one_field() {
+        for (key, value) in [
+            (pace::KEY_WORKERS, "3"),
+            (KEY_ROLE_LISTENER, "false"),
+            (KEY_ROLE_SCANNER, "true"),
+            (KEY_ROLE_WEB, "false"),
+        ] {
+            let c = Changes::from_key_value(key, value).unwrap();
+            assert_eq!(c.pairs(), [(key, value.to_string())]);
+        }
+        let all = Changes::from(snap((true, false, true)));
+        let keys: Vec<&str> = all.pairs().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, KEYS);
+        assert_eq!(all.pairs()[2], (KEY_ROLE_SCANNER, "false".to_string()));
     }
 
     async fn open(extra: &str) -> (Settings, crate::store::Store, tempfile::TempDir) {
