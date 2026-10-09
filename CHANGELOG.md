@@ -129,6 +129,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Requests of one source arriving at once could each queue a scan job; the
   duplicates took queue places and /24 and ASN budget until superseded.
   Automatic enqueues now check and write one at a time.
+- The dashboard's timeline and its families and OWASP tags read every
+  request row in full for the 30-day and all-time ranges, every five
+  minutes. A new index covers both (migration 0031; it is built once, at
+  the first start after the upgrade).
 
 ## [0.10.0] - 2026-10-09
 
