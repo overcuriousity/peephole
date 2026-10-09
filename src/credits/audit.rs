@@ -499,8 +499,9 @@ fn economy() -> i64 {
 }
 
 /// Whether the job `job_uid` that `arbiter` granted to `scanner` was paid
-/// for: an offer of the arbiter funding it whose first receipt (the one
-/// the ledger counts) charged something. Only the scans of paid jobs are
+/// for: an offer of the arbiter funding it whose first receipt the ledger
+/// counts (dated after the offer, and before it lapsed after
+/// [`crate::credits::JOB_OFFER_TTL_MS`]) charged something. Only the scans of paid jobs are
 /// designated: a scanner paid nothing for a job may hold nothing to buy
 /// its audit with.
 pub async fn job_paid(
@@ -514,10 +515,12 @@ pub async fn job_paid(
            SELECT 1 FROM credit_entries o
            JOIN credit_entries r ON r.kind = 'receipt' AND r.economy = ?4 AND r.charged_mc > 0
                 AND r.origin = o.peer AND r.peer = o.origin AND r.offer_seq = o.seq
+                AND r.hlc > o.hlc AND (r.hlc >> 16) <= (o.hlc >> 16) + ?5
                 AND NOT EXISTS (SELECT 1 FROM credit_entries f
                                 WHERE f.kind = 'receipt' AND f.economy = ?4
                                   AND f.origin = r.origin AND f.peer = r.peer
                                   AND f.offer_seq = r.offer_seq
+                                  AND f.hlc > o.hlc AND (f.hlc >> 16) <= (o.hlc >> 16) + ?5
                                   AND (f.hlc < r.hlc OR (f.hlc = r.hlc AND f.seq < r.seq)))
            WHERE o.kind = 'offer' AND o.economy = ?4 AND o.job_uid = ?1
              AND o.origin = ?2 AND o.peer = ?3)",
@@ -526,6 +529,7 @@ pub async fn job_paid(
     .bind(arbiter)
     .bind(scanner)
     .bind(economy())
+    .bind(crate::credits::JOB_OFFER_TTL_MS as i64)
     .fetch_one(pool)
     .await?)
 }
@@ -1351,6 +1355,32 @@ mod tests {
         );
         let got = obligations(pool, &members, hlc::wall_ms()).await.unwrap();
         assert_eq!(got.get(&s), Some(&(1, 0)), "{got:?}");
+        // Receipts the ledger ignores pay nothing: one dated before the
+        // offer, one after it lapsed.
+        let ttl = crate::credits::JOB_OFFER_TTL_MS;
+        for (job, seq, receipt_ms) in [
+            ("job-early", 3i64, 999_999u64),
+            ("job-late", 4, 1_000_000 + ttl + 1),
+            ("job-in-time", 5, 1_000_000 + ttl),
+        ] {
+            pay_job(pool, arbiter, s, job, seq, 5).await;
+            for (origin, at) in [(arbiter, 1_000_000u64), (s, receipt_ms)] {
+                sqlx::query("UPDATE credit_entries SET hlc = ? WHERE origin = ? AND seq = ?")
+                    .bind(hlc::to_db(at << 16))
+                    .bind(&origin.0[..])
+                    .bind(seq)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(!job_paid(pool, "job-early", &arbiter.0, &s.0).await.unwrap());
+        assert!(!job_paid(pool, "job-late", &arbiter.0, &s.0).await.unwrap());
+        assert!(
+            job_paid(pool, "job-in-time", &arbiter.0, &s.0)
+                .await
+                .unwrap()
+        );
     }
 
     /// A scan is due for a purchase while no audit offer for it is open or

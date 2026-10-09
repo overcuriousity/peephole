@@ -4737,14 +4737,6 @@ async fn a_protocol_six_member_is_neither_paid_nor_charged() {
     .await;
     serves(&nb, &[("abuseipdb", Some(1000.0))], 0.5);
     fund_listeners(&[&na, &nb], &[a.id, b.id]).await;
-    // A member below protocol 7 writes no reach reports.
-    for n in [&na, &nb] {
-        sqlx::query("DELETE FROM reach_reports WHERE origin = ?")
-            .bind(&b.id.0[..])
-            .execute(&n.store.pool)
-            .await
-            .unwrap();
-    }
     nb.node.refresh_heartbeat();
     eventually("a knows b's protocol", || async {
         na.members()
@@ -4780,6 +4772,14 @@ async fn a_protocol_six_member_is_neither_paid_nor_charged() {
     assert!(matches!(declined, Err(pay::Declined::Why(w)) if w.contains("protocol 7")));
     // b is below protocol 7: no pool share, and its offer moved nothing.
     eventually("a counts b's offer and moves nothing", || async {
+        // A member below protocol 7 writes no reach reports; this test
+        // node runs the current code, whose reports are dropped before
+        // each look (also any written when an hour ends meanwhile).
+        sqlx::query("DELETE FROM reach_reports WHERE origin = ?")
+            .bind(&b.id.0[..])
+            .execute(&na.store.pool)
+            .await
+            .unwrap();
         let book = peephole::credits::book_fresh(&na.node).await.unwrap();
         book.ledger.offer(&b.id, seq).is_some()
             && book.ledger.held(&b.id) == 0
@@ -7198,10 +7198,11 @@ async fn reverse_names_are_bought_from_a_quorum_and_replicate_with_their_flag() 
 }
 
 /// `arbiter`'s offer funding `job` of `scanner` (sequence `seq`), and the
-/// scanner's receipt charging 5 mc for it, written on each of `on`: the
-/// job was paid for, so its scan may be designated.
+/// scanner's receipt charging 5 mc for it a moment later, written on each
+/// of `on`: the job was paid for, so its scan may be designated.
 async fn paid_job(on: &[&TestNode], arbiter: NodeId, scanner: NodeId, job: &str, seq: i64) {
     let at = peephole::cluster::hlc::to_db(now_ms() << 16);
+    let receipt_at = at + 1;
     for n in on {
         sqlx::query(
             "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, seal, economy, job_uid)
@@ -7221,7 +7222,7 @@ async fn paid_job(on: &[&TestNode], arbiter: NodeId, scanner: NodeId, job: &str,
         )
         .bind(&scanner.0[..])
         .bind(seq)
-        .bind(at)
+        .bind(receipt_at)
         .bind(&arbiter.0[..])
         .execute(&n.store.pool)
         .await
