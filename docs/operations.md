@@ -289,7 +289,9 @@ peephole db vacuum                                # shrink the database file (st
 ```
 
 Configuration lives in `/etc/peephole/config.toml`; restart after editing
-(`systemctl restart peephole`). The number of scan workers and the roles
+(`systemctl restart peephole`). A key peephole does not know (misspelled,
+or from a newer version) is ignored with a warning in the startup log and in
+`check-config`, which names it by its full path (`scan.never_scan_directory`). The number of scan workers and the roles
 are runtime settings, changed from **Admin → Scans** and **Admin → System**
 or `peephole settings` without a restart. The rest of the scan pace is
 fixed: a scan times out after 30 minutes (levels 4 and 5 after 2 hours), and an

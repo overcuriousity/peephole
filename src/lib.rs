@@ -35,7 +35,8 @@ pub const COMMIT: &str = env!("PEEPHOLE_COMMIT");
 /// one line, then notes (the built-in rules, keys that do nothing).
 pub async fn check_config(config_path: &std::path::Path) -> Result<(config::Config, String)> {
     let cfg = config::Config::load(config_path).context("config")?;
-    let mut notes = cfg.obsolete_notes();
+    let mut notes = config::unknown_key_notes(config_path);
+    notes.extend(cfg.obsolete_notes());
     notes.extend(config::optional_key_notes(config_path));
     let mut summary = format!("ok: config (roles: {})", cfg.roles.names().join(", "));
     // Built into the binary: the same on every start and every node of
@@ -96,15 +97,16 @@ pub fn geolite_loads(cfg: &config::Config) -> bool {
 pub async fn run(config_path: PathBuf) -> Result<()> {
     // Startup validation (spec §12).
     let (cfg, summary) = check_config(&config_path).await?;
-    // Obsolete keys are warned about; the summary has them too (for
-    // check-config), so they are left out of its log line.
-    let obsolete = cfg.obsolete_notes();
+    // Unknown and obsolete keys are warned about; the summary has them too
+    // (for check-config), so they are left out of its log line.
+    let mut warned = config::unknown_key_notes(&config_path);
+    warned.extend(cfg.obsolete_notes());
     let summary: Vec<&str> = summary
         .lines()
-        .filter(|l| !obsolete.iter().any(|n| n == l))
+        .filter(|l| !warned.iter().any(|n| n == l))
         .collect();
     info!(version = VERSION, "{}", summary.join("\n"));
-    for note in &obsolete {
+    for note in &warned {
         warn!("{note}");
     }
     std::fs::create_dir_all(&cfg.data_dir)?;

@@ -13,6 +13,14 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   1–4. Level 5 shares level 4's worker budget and two-hour timeout, and is
   granted only to cluster members of protocol 8 and up.
 
+### Changed
+
+- A config key peephole does not know (misspelled, or from a newer version)
+  is no longer ignored silently: the startup log and `check-config` warn
+  about it by its full path, e.g. `scan.never_scan_directory`. It still
+  loads. `check-config` also points out the optional `scan.own_addresses`,
+  `scan.never_scan_dir` and `scan.trusted_origins` when they are not set.
+
 ### Fixed
 
 - Admin: a security key deleted while a sign-in with it was under way
