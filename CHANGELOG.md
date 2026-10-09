@@ -7,6 +7,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Changed
 
+- Probes are no longer capped at 16 ports, need neither level-2 evidence
+  nor a finished counter-scan (without one they read the well-known ports
+  22, 80, 443, 8080 and 8443), and the same address can be probed again
+  right away. The safety rules are unchanged.
 - Scan jobs go to the scanner that is cheapest per delivered result at
   the job's level: its price divided by its success rate there. A failed
   scan is not paid, so a cheap scanner that fails a level often no longer
@@ -30,6 +34,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Added
 
+- The Actions card sells a counter-scan of level 1–4: level 1 at the
+  cluster's cheapest scanner offer, four times that per level above. The
+  job runs through the normal queue and appears live on the IP page; a
+  result of the same level less than 24 hours old stands instead of a new
+  purchase.
 - What a scanned source serves and calls itself. Each port of a scan
   shows what `-sV` added (extra info, OS and device type, the announced
   host name, CPEs) and the fixed fields of a few scripts: page title and

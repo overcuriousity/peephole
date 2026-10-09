@@ -39,6 +39,8 @@ nmap.
   scan found open (headers, certificates, JARM, SSH host keys), from one
   scanner or several at once. From level 2 they read the source's SSH host
   keys, TLS certificates and HTTP ETags, so sources that share one show up as linked.
+  The admin can also buy a full counter-scan of level 1–4 from the
+  cluster's cheapest scanner, four times the price per level.
   Bystanders are spared: one request earns at most a light scan, and
   verified crawlers, Tor exits, your own and `never_scan` networks are
   never scanned; per-network, per-ASN and queue budgets stop floods.
