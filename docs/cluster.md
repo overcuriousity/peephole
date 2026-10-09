@@ -216,7 +216,8 @@ audits and relay leases. The supply is fixed; prices follow sales.
   becomes free, and a free good that is used costs 0.001 at the next
   refresh. A request may carry no offer: the server answers what it prices
   at zero and declines the rest naming the price, which the asker may offer
-  once. What a node answers itself is free (its own providers, prober,
+  once. Only what is paid for or answered free counts as a sale: asking
+  for a priced good without an offer moves no price. What a node answers itself is free (its own providers, prober,
   resolver, scanner), though its own scan jobs use up its scan budget like
   jobs it buys. Scan prices are per scanner, computed by every node from
   the scans of jobs other arbiters granted it (its own jobs are no sales);

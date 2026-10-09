@@ -162,6 +162,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   ranked among their auditors. An audit of a bought job now skips the
   evidence re-check as the scan did, and only protocol-8 scanners audit
   level 5 (protocol 8).
+- A request without an offer for a priced good (a lookup, a name or
+  reverse-name resolution, a probe) counted as demand, so anyone could
+  raise a server's prices for free; only goods answered free or paid for
+  count now.
 - An audit counted as bought on the strength of a receipt the ledger
   ignores (dated before its offer, or after the offer lapsed); it now
   takes the receipt the ledger counts, as paid scan jobs already did.

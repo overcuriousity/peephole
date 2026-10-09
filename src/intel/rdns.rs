@@ -98,7 +98,8 @@ pub async fn serve_rdns(
         return RdnsResp::refused("not a public address", None);
     };
     let cost = node.price_table().price_of(price::RDNS).unwrap_or(0);
-    node.market.note(price::RDNS, 1);
+    // Demand: a free request, or one whose offer was found
+    // (`pay::counts_as_demand`); asking at a price without one is not.
     if req.offer_seq.is_none() && cost > 0 {
         return RdnsResp::refused(
             &format!(
@@ -108,8 +109,16 @@ pub async fn serve_rdns(
             Some(cost),
         );
     }
+    if req.offer_seq.is_none() {
+        node.market.note(price::RDNS, 1);
+    }
     if let Some(seq) = req.offer_seq {
-        match pay::accept_offer(node, peer, seq, cost as u64, "rdns", pay::SERVE_MARGIN_MS).await {
+        let accepted =
+            pay::accept_offer(node, peer, seq, cost as u64, "rdns", pay::SERVE_MARGIN_MS).await;
+        if pay::counts_as_demand(&accepted) {
+            node.market.note(price::RDNS, 1);
+        }
+        match accepted {
             Ok(_) => {}
             Err(pay::Declined::TooLow { why, price_mc }) => {
                 return RdnsResp::refused(&why, Some(price_mc));
@@ -407,6 +416,50 @@ mod tests {
     }
     use crate::scan::crawler::testing::fake_resolver;
     use std::sync::{Arc, Mutex};
+
+    /// A request without an offer at a price is declined naming it, and is
+    /// no demand: asking without paying cannot raise the price.
+    #[tokio::test]
+    async fn a_priced_request_without_an_offer_is_no_demand() {
+        use crate::credits::price;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let node = crate::cluster::Node::open(crate::cluster::NodeParams {
+            identity: crate::cluster::identity::Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store,
+            proto: (1, 1),
+            data_dir: dir.path().to_path_buf(),
+            retention_days: 0,
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        node.set_price_table(Arc::new(price::Table {
+            rdns_mc: 5,
+            ..Default::default()
+        }));
+        let req = RdnsReq {
+            ip: "198.51.100.9".into(),
+            offer_seq: None,
+        };
+        let peer = crate::cluster::identity::NodeId([9; 32]);
+        let resp = serve_rdns(&node, peer, &req).await;
+        assert_eq!(resp.price_mc, Some(5), "{resp:?}");
+        assert_eq!(node.market.peek().counts.get(price::RDNS), None);
+    }
 
     #[tokio::test]
     async fn a_pass_stores_confirmed_names_and_marks_every_source() {

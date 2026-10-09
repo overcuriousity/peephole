@@ -566,7 +566,9 @@ async fn keep_if_recorded(node: &Arc<Node>, ip: IpAddr, resp: &mut LookupResp) {
 /// The serving side of a request without an offer: what this node prices
 /// at zero now is answered free (it still takes the on-demand share and
 /// counts as demand); the rest is declined naming its price, so the asker
-/// may offer it.
+/// may offer it. A priced good asked for without an offer is no demand
+/// ([`counts_as_demand`]): asking costs nothing, so counting it would let
+/// anyone raise a server's prices for free.
 pub async fn serve_free(
     node: &Arc<Node>,
     providers: &Providers,
@@ -579,7 +581,6 @@ pub async fn serve_free(
     let provider = |name: &str| providers.iter().find(|p| p.name() == name);
     let (mut free, mut declined, mut priced) = (vec![], vec![], 0 as Mc);
     for name in served {
-        node.market.note(&name, 1);
         let price = table.price_of(&name).unwrap_or(0);
         if price > 0 {
             priced += price as Mc;
@@ -592,6 +593,7 @@ pub async fn serve_free(
             ));
             continue;
         }
+        node.market.note(&name, 1);
         let taken = match (shares, provider(&name)) {
             (Some(s), Some(p)) => s.take(p.as_ref()).await.unwrap_or(false),
             _ => true,
@@ -790,6 +792,65 @@ mod tests {
         assert!(!counts_as_demand(&Err::<(), _>(Declined::Why(
             "no such offer".into()
         ))));
+    }
+
+    async fn test_node() -> (tempfile::TempDir, Arc<Node>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let node = Node::open(crate::cluster::NodeParams {
+            identity: crate::cluster::identity::Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store,
+            proto: (1, 1),
+            data_dir: dir.path().to_path_buf(),
+            retention_days: 0,
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        (dir, node)
+    }
+
+    /// A request without an offer is demand only for what is answered
+    /// free: asking for a priced good without paying cannot raise its
+    /// price.
+    #[tokio::test]
+    async fn a_request_without_an_offer_is_demand_only_for_free_goods() {
+        let (_dir, node) = test_node().await;
+        node.set_price_table(Arc::new(super::super::price::Table {
+            offers: vec![super::super::price::Offer {
+                provider: "abuseipdb".into(),
+                price_mc: 5,
+                on_demand: 100,
+            }],
+            ..Default::default()
+        }));
+        let resp = serve_free(
+            &node,
+            &vec![],
+            NodeId([9; 32]),
+            "203.0.113.5".parse().unwrap(),
+            vec!["abuseipdb".into(), "rdap".into()],
+        )
+        .await;
+        assert_eq!(resp.price_mc, Some(5));
+        let counts = node.market.peek().counts;
+        assert_eq!(counts.get("abuseipdb"), None, "priced, no offer");
+        assert_eq!(counts.get("rdap"), Some(&1.0), "free");
     }
 
     #[test]
