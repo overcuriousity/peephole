@@ -935,6 +935,52 @@ secure_cookies = {secure}
         assert!(page.contains("/admin/keys/delete"), "{page}");
     }
 
+    #[tokio::test]
+    async fn deleting_a_key_says_what_happened() {
+        let (_d, state, app) = app().await;
+        for id in [b"k1", b"k2"] {
+            state.store.save_credential(id, "{}", None).await.unwrap();
+        }
+        let me = state.store.create_session().await.unwrap();
+        let flash = |form: &'static str| {
+            let app = app.clone();
+            let me = me.clone();
+            async move {
+                let (st, set, _) = send(&app, "POST", "/admin/keys/delete", Some(&me), form).await;
+                assert_eq!(st, StatusCode::SEE_OTHER);
+                set.unwrap_or_default()
+            }
+        };
+        // "k1" and "k2" in hex; SQLite's hex() is uppercase.
+        let c = flash("cred_id=zz").await;
+        assert!(c.starts_with("peephole_flash_error=No+such+key"), "{c}");
+        let c = flash("cred_id=ffff").await;
+        assert!(c.starts_with("peephole_flash_error=No+such+key"), "{c}");
+        let c = flash("cred_id=6B31").await;
+        assert!(c.starts_with("peephole_flash=Key+deleted"), "{c}");
+        let c = flash("cred_id=6b32").await;
+        assert!(c.starts_with("peephole_flash_error=The+last+key"), "{c}");
+        // A storage failure is reported, not taken for a deletion.
+        state
+            .store
+            .save_credential(b"k3", "{}", None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER keep_keys BEFORE DELETE ON credentials
+             BEGIN SELECT RAISE(ABORT, 'locked'); END",
+        )
+        .execute(&state.store.pool)
+        .await
+        .unwrap();
+        let c = flash("cred_id=6b33").await;
+        assert!(
+            c.starts_with("peephole_flash_error=Could+not+delete"),
+            "{c}"
+        );
+        assert_eq!(state.store.load_credentials().await.unwrap().len(), 2);
+    }
+
     #[test]
     fn behind_tls_cookies_use_the_host_prefix() {
         let c = session_cookie(&cfg(true), "t".into()).to_string();

@@ -29,6 +29,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   could guess the current password in parallel and start any number of
   Argon2 jobs. It now has the sign-in endpoints' per-client limit and
   takes one of their check slots.
+- Admin: deleting a key said nothing when it did not happen; a database
+  error left the key working while the page looked as if it was gone.
+  The keys page now says whether the key was deleted, was the last way
+  in, was not found, or could not be deleted.
 
 ## [0.10.0] - 2026-10-09
 
