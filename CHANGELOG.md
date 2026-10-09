@@ -122,6 +122,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   (domain and reverse lookups) on the other nodes, and they kept the IP
   and its lookups there. The lookups are now deleted with it, everywhere;
   a domain lookup goes as a whole, with the names it gave other addresses.
+- Searching for an IPv4 address written as mapped IPv6
+  (`::ffff:203.0.113.7`), in the IP search, the request filter, Links, the
+  bulk lookup or an IP's page, found nothing; it now finds the IPv4
+  address it maps.
 
 ## [0.10.0] - 2026-10-09
 
