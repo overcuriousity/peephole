@@ -61,7 +61,8 @@ fn about(level: u8) -> &'static str {
         1 => "top 100 ports, light version detection",
         2 => "top 1000 ports, versions, OS, host keys and certificates",
         3 => "top 1000 ports, versions, OS, traceroute, safe scripts",
-        _ => "every port, versions, OS, traceroute, safe scripts",
+        4 => "every port, versions, OS, traceroute, safe scripts",
+        _ => "top 1000 ports, versions, OS, traceroute, vulnerability scripts",
     }
 }
 
@@ -73,13 +74,13 @@ fn fresh_enough(ts: &str) -> bool {
     ts > cutoff.as_str()
 }
 
-/// The four levels' offers for `ip_id`.
+/// The five levels' offers for `ip_id`.
 pub async fn offers_for(state: &AdminState, ip_id: i64) -> Vec<ScanOffer> {
     let scans = state.store.scans_for_ip(ip_id).await.unwrap_or_default();
     let jobs = state.store.jobs_for_ip(ip_id, 20).await.unwrap_or_default();
     let node = state.recorder.node();
     let cheapest = node.and_then(|n| n.price_table().scanners.iter().map(|s| s.price_mc).min());
-    (1u8..=4)
+    (1u8..=5)
         .map(|level| {
             let fresh = scans
                 .iter()
@@ -441,7 +442,7 @@ secure_cookies = false
     async fn standalone_offers_are_free_and_a_fresh_result_stands() {
         let (state, _c, ip_id, _d) = state().await;
         let offers = offers_for(&state, ip_id).await;
-        assert_eq!(offers.len(), 4);
+        assert_eq!(offers.len(), 5);
         assert!(
             offers
                 .iter()
@@ -483,7 +484,13 @@ secure_cookies = false
         let offers = offers_for(&state, ip_id).await;
         assert_eq!(
             waiting(&offers),
-            vec![(1, None), (2, None), (3, Some("queued")), (4, None)]
+            vec![
+                (1, None),
+                (2, None),
+                (3, Some("queued")),
+                (4, None),
+                (5, None)
+            ]
         );
         sqlx::query("UPDATE scan_jobs SET status = 'running' WHERE ip_id = ?")
             .bind(ip_id)

@@ -49,10 +49,10 @@
   {% endif %}
   {% if !price.scanners.is_empty() %}
   <div class="table-wrap"><table>
-    <thead><tr><th>Scanner</th><th class="num">Announces</th><th class="num">Reference here</th><th class="num">Paid / target an hour</th>{% for l in 1..=4 %}<th class="num" title="Credits per delivered result at level {{ l }}">L{{ l }}</th>{% endfor %}</tr></thead>
+    <thead><tr><th>Scanner</th><th class="num">Announces</th><th class="num">Reference here</th><th class="num">Paid / target an hour</th>{% for l in 1..=5 %}<th class="num" title="Credits per delivered result at level {{ l }}">L{{ l }}</th>{% endfor %}</tr></thead>
     <tbody>{% for s in price.scanners %}<tr><td>{{ s.name }}</td><td class="num">{{ s.announced }}</td><td class="num">{{ s.reference }}</td><td class="num">{{ s.paid }}</td>{% for c in s.levels %}<td class="num" title="{{ c.basis }}">{% if c.cheapest %}<b>{{ c.price }}</b>{% else %}{{ c.price }}{% endif %}</td>{% endfor %}</tr>{% endfor %}</tbody>
   </table></div>
-  <p class="muted small">L1 to L4: what one delivered result costs per level, the price divided by the scanner's success rate there against the best live scanner. A failed scan is not paid, so jobs go to the cheapest per delivered result. {{ price.weights_as_of }}</p>{% endif %}
+  <p class="muted small">L1 to L5: what one delivered result costs per level, the price divided by the scanner's success rate there against the best live scanner. A failed scan is not paid, so jobs go to the cheapest per delivered result. {{ price.weights_as_of }}</p>{% endif %}
   {% if !price.offers.is_empty() %}
   <div class="table-wrap"><table>
     <thead><tr><th>Provider served here</th><th class="num">Price (credits)</th><th class="num">Paid lookups a day</th></tr></thead>

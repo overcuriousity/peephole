@@ -145,14 +145,14 @@ struct LevelCell {
     cheapest: bool,
 }
 
-/// A scanner's price here, and its weight and tally at levels 1 to 4.
-type LevelInputs = (Option<u32>, [(f64, crate::scan::weight::Tally); 4]);
+/// A scanner's price here, and its weight and tally at levels 1 to 5.
+type LevelInputs = (Option<u32>, [(f64, crate::scan::weight::Tally); 5]);
 
-/// Cells of the L1–L4 columns, one row per scanner: its price (what this
+/// Cells of the L1–L5 columns, one row per scanner: its price (what this
 /// node would pay it) over its weight and tally at each level.
 fn level_cells(rows: &[LevelInputs]) -> Vec<Vec<LevelCell>> {
     use crate::scan::rank::effective;
-    let best: Vec<u32> = (0..4)
+    let best: Vec<u32> = (0..5)
         .map(|l| {
             rows.iter()
                 .map(|(p, w)| effective(*p, w[l].0))
@@ -444,7 +444,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         .scanners
         .iter()
         .map(|s| {
-            let levels = [1, 2, 3, 4].map(|l| {
+            let levels = [1, 2, 3, 4, 5].map(|l| {
                 (
                     crate::scan::weight::weight(&snap.tallies, s.node, &live, l),
                     snap.tallies.get(&(s.node, l)).copied().unwrap_or_default(),
@@ -727,9 +727,9 @@ mod tests {
         use crate::scan::weight::Tally;
         let t = Tally { ok: 6, failed: 6 };
         let cells = level_cells(&[
-            (Some(20), [(1.0, t), (1.0, t), (1.0, t), (0.5, t)]),
-            (Some(30), [(1.0, t), (1.0, t), (1.0, t), (1.0, t)]),
-            (None, [(1.0, t), (1.0, t), (1.0, t), (1.0, t)]),
+            (Some(20), [(1.0, t), (1.0, t), (1.0, t), (0.5, t), (1.0, t)]),
+            (Some(30), [(1.0, t), (1.0, t), (1.0, t), (1.0, t), (1.0, t)]),
+            (None, [(1.0, t), (1.0, t), (1.0, t), (1.0, t), (1.0, t)]),
         ]);
         let price = |r: usize, l: usize| cells[r][l].price.as_str();
         assert_eq!(
@@ -786,11 +786,13 @@ mod tests {
                                 (0.5, Default::default()),
                                 (1.0, Default::default()),
                                 (1.0, Default::default()),
+                                (1.0, Default::default()),
                             ],
                         ),
                         (
                             Some(90),
                             [
+                                (1.0, Default::default()),
                                 (1.0, Default::default()),
                                 (1.0, Default::default()),
                                 (1.0, Default::default()),
