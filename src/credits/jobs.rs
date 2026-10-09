@@ -198,6 +198,7 @@ pub async fn fund(
         parts: parts.clone(),
         seal,
         job,
+        audit: None,
         economy: crate::cluster::record::ECONOMY,
     })
     .await
@@ -304,6 +305,7 @@ mod tests {
                     to: id(2),
                     parts: vec![(DAY, 200)],
                     job: Some("a".into()),
+                    audit: None,
                 },
             ),
             e(
@@ -325,6 +327,7 @@ mod tests {
                     to: id(2),
                     parts: vec![(DAY, 100)],
                     job: Some("b".into()),
+                    audit: None,
                 },
             ),
             // A lookup offer is not a scan offer.
@@ -336,6 +339,7 @@ mod tests {
                     to: id(3),
                     parts: vec![(DAY, 50)],
                     job: None,
+                    audit: None,
                 },
             ),
         ];

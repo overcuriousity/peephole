@@ -67,12 +67,16 @@ pub struct Offer {
     pub answered: Vec<String>,
     /// The scan job it funds; None: a lookup or probe.
     pub job: Option<String>,
+    /// The scan an audit it buys checks (`credits::audit`).
+    pub audit: Option<String>,
 }
 
 impl Offer {
     /// How long it may wait for its receipt.
     pub fn ttl_ms(&self) -> u64 {
-        if self.job.is_some() {
+        if self.audit.is_some() {
+            super::AUDIT_OFFER_TTL_MS
+        } else if self.job.is_some() {
             super::JOB_OFFER_TTL_MS
         } else {
             OFFER_TTL_MS
@@ -278,7 +282,14 @@ impl Walk<'_> {
         }
     }
 
-    fn offer(&mut self, e: &Entry, to: NodeId, parts: &[(u32, u32)], job: &Option<String>) {
+    fn offer(
+        &mut self,
+        e: &Entry,
+        to: NodeId,
+        parts: &[(u32, u32)],
+        job: &Option<String>,
+        audit: &Option<String>,
+    ) {
         let mut held = vec![];
         for (day, mc) in parts {
             let lot = self.lot(e.origin, *day);
@@ -300,6 +311,7 @@ impl Walk<'_> {
             state: OfferState::Open,
             answered: vec![],
             job: job.clone(),
+            audit: audit.clone(),
         });
     }
 
@@ -401,9 +413,12 @@ pub fn run(earned: &[Earned], entries: &[Entry], gates: &Gates, now_ms: u64) -> 
                     continue;
                 }
                 match &e.kind {
-                    Kind::Offer { to, parts, job } if parts_ok(parts, day_of(e.hlc)) => {
-                        w.offer(e, *to, parts, job)
-                    }
+                    Kind::Offer {
+                        to,
+                        parts,
+                        job,
+                        audit,
+                    } if parts_ok(parts, day_of(e.hlc)) => w.offer(e, *to, parts, job, audit),
                     Kind::Transfer { to, parts }
                         if *to != e.origin && parts_ok(parts, day_of(e.hlc)) =>
                     {
@@ -471,6 +486,7 @@ mod tests {
                 to: id(to),
                 parts: parts.to_vec(),
                 job: None,
+                audit: None,
             },
         )
     }
@@ -484,6 +500,7 @@ mod tests {
                 to: id(to),
                 parts: parts.to_vec(),
                 job: Some(format!("job{seq}")),
+                audit: None,
             },
         )
     }

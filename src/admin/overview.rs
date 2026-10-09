@@ -605,6 +605,7 @@ mod tests {
             state: OfferState::Charged { charged },
             answered: vec![],
             job: None,
+            audit: None,
         };
         // Day 1 lies outside the week that starts on day 2.
         let offers = [offer(1, 1000), offer(2, 400), offer(8, 200)];

@@ -265,6 +265,9 @@ enum Job {
         ip: IpAddr,
         level: u8,
         started_at: String,
+        /// Who bought it, its offer and what it offered; None: an unpaid
+        /// pick.
+        offer: Option<(NodeId, u64, u32)>,
     },
 }
 
@@ -443,9 +446,11 @@ impl Source {
         }
     }
 
-    /// The next audit this scanner can start: an audit obeys everything a
-    /// scan does (never_scan, members' addresses, Tor exits, crawlers, the
-    /// evidence held here) except the rescan cooldown.
+    /// The next audit this scanner can start, a bought one before an
+    /// unpaid pick: an audit obeys everything a scan does (never_scan,
+    /// members' addresses, Tor exits, crawlers, the evidence held here)
+    /// except the rescan cooldown. A bought audit not run writes nothing:
+    /// its offer lapses.
     async fn next_audit(&self, exclude: &[u8]) -> anyhow::Result<Option<Job>> {
         let Some(node) = self.node() else {
             return Ok(None);
@@ -453,7 +458,11 @@ impl Source {
         let pool = &node.store.pool;
         let mut picker = self.audits.lock().await;
         picker.poll(pool, &node.id()).await?;
-        while let Some(t) = picker.take(exclude) {
+        loop {
+            let bought = node.audit_queue.lock().unwrap().take(exclude);
+            let Some(t) = bought.or_else(|| picker.take(exclude)) else {
+                break;
+            };
             let Ok(ip) = t.ip.parse::<IpAddr>() else {
                 continue;
             };
@@ -478,6 +487,7 @@ impl Source {
                 ip,
                 level: t.level,
                 started_at: now,
+                offer: t.offer,
             }));
         }
         Ok(None)
@@ -906,8 +916,9 @@ impl Source {
                     ip,
                     level,
                     started_at,
+                    offer,
                 },
-                _,
+                node,
             ) => match outcome {
                 Outcome::Done(res) => {
                     if let Err(e) = self
@@ -923,6 +934,18 @@ impl Source {
                         .await
                     {
                         warn!(audit_of = %of, ?e, "could not record audit");
+                    } else if let (Some((payer, seq, price)), Some(node)) = (offer, node) {
+                        // A bought audit, published: charge its offer.
+                        let receipt = crate::cluster::record::Record::CreditReceipt {
+                            payer: *payer,
+                            offer_seq: *seq,
+                            charged_mc: *price,
+                            answered: vec![crate::credits::price::AUDIT.into()],
+                            economy: crate::cluster::record::ECONOMY,
+                        };
+                        if let Err(e) = crate::cluster::repl::append(node, &[receipt]).await {
+                            warn!(audit_of = %of, ?e, "audit receipt not written");
+                        }
                     }
                 }
                 // A failed audit says nothing: it is not published.

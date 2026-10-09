@@ -128,6 +128,9 @@ pub struct Standing {
     /// Counted audits of the last 7 days as `(conclusive, differing)`,
     /// when they fail the gate (`credits::audit`).
     pub audits: Option<(u32, u32)>,
+    /// `(bought, designated)` audits of its designated scans over 7 days,
+    /// when it bought too few (`credits::audit::owes`).
+    pub audits_owed: Option<(u32, u32)>,
 }
 
 impl Standing {
@@ -137,7 +140,7 @@ impl Standing {
     }
 
     pub fn earns_as_scanner(&self) -> bool {
-        self.earns() && self.audits.is_none()
+        self.earns() && self.audits.is_none() && self.audits_owed.is_none()
     }
 
     /// Out of the ledger altogether: no balance, and its payments move
@@ -160,6 +163,9 @@ impl Standing {
         }
         if let Some((conclusive, differing)) = self.audits {
             v.push(format!("audits: {differing} of {conclusive} differ"));
+        }
+        if let Some((b, d)) = self.audits_owed {
+            v.push(format!("audits: bought {b} of {d} designated"));
         }
         v
     }
@@ -192,6 +198,16 @@ pub async fn standings(node: &Node) -> Result<Standings> {
     for (scanner, (conclusive, differing)) in super::audit::counted(&counts, &auditors) {
         if super::audit::audits_fail(conclusive, differing) {
             out.entry(scanner).or_default().audits = Some((conclusive, differing));
+        }
+    }
+    // Audits of designated scans the scanner should have bought.
+    let all = members::all(&node.store).await?;
+    let now = crate::cluster::hlc::wall_ms();
+    for (scanner, (designated, bought)) in
+        super::audit::obligations(&node.store.pool, &all, now).await?
+    {
+        if let Some(o) = super::audit::owes(designated, bought) {
+            out.entry(scanner).or_default().audits_owed = Some(o);
         }
     }
     Ok(out)
@@ -232,6 +248,12 @@ mod tests {
         };
         assert!(audits.earns() && !audits.earns_as_scanner());
         assert_eq!(audits.reasons(), ["audits: 3 of 5 differ"]);
+        let owing = Standing {
+            audits_owed: Some((1, 3)),
+            ..Default::default()
+        };
+        assert!(owing.earns() && !owing.earns_as_scanner());
+        assert_eq!(owing.reasons(), ["audits: bought 1 of 3 designated"]);
         let gone = Standing {
             blocked: true,
             forked: Some(7),

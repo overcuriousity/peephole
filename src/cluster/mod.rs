@@ -296,6 +296,10 @@ pub struct Node {
     /// Offers a paid lookup is being served for right now: `(payer,
     /// sequence number)`. An offer is served once.
     pub(crate) serving_offers: Mutex<std::collections::HashSet<(NodeId, u64)>>,
+    /// Bought audits waiting for a free worker (`credits::audit`).
+    pub audit_queue: Mutex<crate::credits::audit::Queue>,
+    /// This node's designated scans whose audit it tried to buy.
+    pub audits_tried: Mutex<std::collections::HashSet<String>>,
     pub data_dir: std::path::PathBuf,
     /// Contacts and heartbeats (ephemeral).
     pub status: status::Status,
@@ -367,6 +371,8 @@ impl Node {
             scan_queued: Default::default(),
             scan_share: Default::default(),
             serving_offers: Mutex::new(Default::default()),
+            audit_queue: Default::default(),
+            audits_tried: Default::default(),
             data_dir: p.data_dir,
             status: Default::default(),
             msg: Default::default(),

@@ -1,15 +1,25 @@
 //! Audits: a second look at a scan. Signatures settle what nodes say to
 //! each other and re-running settles computations over shared data;
 //! whether a scan really ran is a statement about the outside world, and
-//! only looking again can check it. A scanner re-runs a share of the
-//! other nodes' fresh scans (`Picker`), the two results are compared
-//! (`compare`), and a node believes the audits it made itself and those
-//! of its own fleet.
+//! only looking again can check it. The two results are compared
+//! (`compare`).
+//!
+//! A share of the scans of granted jobs is designated for audit by a hash
+//! of the log the scanner cannot steer (`designated`), and the scanner
+//! buys each such audit from auditors ranked by the same hash
+//! (`auditors`, `buy`); every node counts whether it did (`obligations`).
+//! Each scanner also re-runs a share of others' fresh scans unpaid
+//! (`Picker`). A node believes, for the differ gate, the audits it made
+//! itself and those of its own fleet.
+use crate::cluster::Node;
 use crate::cluster::hlc;
 use crate::cluster::identity::NodeId;
+use crate::cluster::members::MemberRow;
+use crate::cluster::msg::Msg;
 use anyhow::Result;
 use sqlx::SqlitePool;
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 
 /// How an audit compares with the scan it checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -191,15 +201,48 @@ pub const AUDIT_WINDOW_MS: u64 = 30 * 60 * 1000;
 /// Audits waiting for a free worker.
 const MAX_WAITING: usize = 1000;
 
-/// A scan of another node to run again.
+/// A scan to run again: an unpaid pick (`offer` None) or a bought audit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub scan_uid: String,
     pub job_uid: String,
     pub ip: String,
     pub level: u8,
-    /// Wall-clock milliseconds after which it is dropped.
+    /// Wall-clock ms after which it is dropped.
     pub deadline_ms: u64,
+    /// Who bought it, its offer and what it offered.
+    pub offer: Option<(NodeId, u64, u32)>,
+}
+
+/// Bought audits waiting for a free worker; handed out before unpaid picks.
+#[derive(Default)]
+pub struct Queue(VecDeque<Task>);
+
+impl Queue {
+    /// Queue a bought audit; false when [`MAX_WAITING`] wait already.
+    pub fn push(&mut self, t: Task) -> bool {
+        if self.0.len() >= MAX_WAITING {
+            return false;
+        }
+        self.0.push_back(t);
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The next one still in time and not at a level in `exclude`.
+    pub fn take(&mut self, exclude: &[u8]) -> Option<Task> {
+        let now = hlc::wall_ms();
+        self.0.retain(|t| t.deadline_ms > now);
+        let i = self.0.iter().position(|t| !exclude.contains(&t.level))?;
+        self.0.remove(i)
+    }
 }
 
 /// Chooses the scans this scanner audits: each fresh scan of another node
@@ -319,6 +362,7 @@ impl Picker {
                     ip,
                     level: level as u8,
                     deadline_ms,
+                    offer: None,
                 });
             }
         }
@@ -339,6 +383,344 @@ impl Picker {
             .position(|t| !exclude.contains(&t.level))?;
         self.queue.remove(i)
     }
+}
+
+/// The share of scans of granted jobs designated for a bought audit; a
+/// protocol constant, so every node designates the same scans.
+pub const AUDIT_RATE: f64 = 0.05;
+/// Auditors that may sell the audit of one designated scan.
+pub const AUDITORS: usize = 3;
+
+/// What designates a scan and ranks its auditors: a hash of its job and
+/// the HLC of the arbiter's done status, which the arbiter writes after
+/// the result is published.
+pub fn seed(job_uid: &str, done_hlc: u64) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"peephole-audit\0");
+    h.update(job_uid.as_bytes());
+    h.update(done_hlc.to_be_bytes());
+    h.finalize().into()
+}
+
+/// Whether the scan of `seed` is designated for a bought audit.
+pub fn designated(seed: &[u8; 32]) -> bool {
+    let x = u64::from_be_bytes(seed[..8].try_into().expect("8 bytes"));
+    (x as f64) < AUDIT_RATE * (u64::MAX as f64 + 1.0)
+}
+
+/// The auditors of a designated scan, best first: the active scanners of
+/// protocol 7 other than `scanner`, ranked by `SHA-256(seed || key)`; the
+/// first [`AUDITORS`].
+pub fn auditors(seed: &[u8; 32], members: &[MemberRow], scanner: &NodeId) -> Vec<NodeId> {
+    use sha2::{Digest, Sha256};
+    let mut ranked: Vec<([u8; 32], NodeId)> = members
+        .iter()
+        .filter(|m| {
+            m.active
+                && m.id != *scanner
+                && m.proto_max >= crate::cluster::rpc::proto::ECONOMY_PROTO
+                && m.roles.iter().any(|r| r == "scanner")
+        })
+        .map(|m| {
+            let mut h = Sha256::new();
+            h.update(seed);
+            h.update(m.id.0);
+            (h.finalize().into(), m.id)
+        })
+        .collect();
+    ranked.sort();
+    ranked
+        .into_iter()
+        .take(AUDITORS)
+        .map(|(_, id)| id)
+        .collect()
+}
+
+/// `(bought, designated)` when a scanner's designated scans lack a bought
+/// audit twice or more and it bought fewer than 80 % of them.
+pub fn owes(designated: u32, bought: u32) -> Option<(u32, u32)> {
+    let missing = designated.saturating_sub(bought);
+    (missing >= 2 && u64::from(bought) * 5 < u64::from(designated) * 4)
+        .then_some((bought, designated))
+}
+
+/// Per scanner: its scans designated over the last 7 days (leaving out
+/// the newest [`crate::credits::AUDIT_OFFER_TTL_MS`], whose audits may
+/// still run), and how many of them it bought: an audit by one of the
+/// scan's [`auditors`] (by `members` as held here), with a charged audit
+/// offer from the scanner to that auditor naming the scan.
+pub async fn obligations(
+    pool: &SqlitePool,
+    members: &[MemberRow],
+    now_ms: u64,
+) -> Result<HashMap<NodeId, (u32, u32)>> {
+    let from = hlc::to_db(now_ms.saturating_sub(7 * crate::credits::DAY_MS) << 16);
+    let to = hlc::to_db(now_ms.saturating_sub(crate::credits::AUDIT_OFFER_TTL_MS) << 16);
+    // (scanner, scan uid, job uid, done HLC)
+    let scans: Vec<(Vec<u8>, String, String, i64)> = sqlx::query_as(
+        "SELECT s.origin, s.uid, j.uid, j.status_hlc FROM scans s
+         JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
+         WHERE s.audit_of IS NULL AND s.origin IS NOT NULL AND s.uid IS NOT NULL
+           AND s.level BETWEEN 1 AND 4 AND j.status = 'done'
+           AND j.arbiter IS NOT NULL AND j.arbiter != s.origin
+           AND j.status_hlc >= ? AND j.status_hlc < ?",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await?;
+    // (scan uid, auditor) of every audit the scanner paid its auditor for.
+    let paid: Vec<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT o.audit_uid, o.peer FROM credit_entries o
+         JOIN credit_entries r ON r.kind = 'receipt' AND r.economy = 2 AND r.charged_mc > 0
+              AND r.origin = o.peer AND r.peer = o.origin AND r.offer_seq = o.seq
+         JOIN scans a ON a.audit_of = o.audit_uid AND a.origin = o.peer
+         WHERE o.kind = 'offer' AND o.economy = 2 AND o.audit_uid IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let paid: std::collections::HashSet<(String, Vec<u8>)> = paid.into_iter().collect();
+    let mut out: HashMap<NodeId, (u32, u32)> = HashMap::new();
+    for (scanner, scan_uid, job_uid, done) in scans {
+        let Ok(scanner) = NodeId::from_slice(&scanner) else {
+            continue;
+        };
+        let s = seed(&job_uid, hlc::from_db(done));
+        if !designated(&s) {
+            continue;
+        }
+        let e = out.entry(scanner).or_default();
+        e.0 += 1;
+        if auditors(&s, members, &scanner)
+            .iter()
+            .any(|a| paid.contains(&(scan_uid.clone(), a.0.to_vec())))
+        {
+            e.1 += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// `(scanner, job uid, ip, level, done HLC)` of the scan `scan_uid` held
+/// here, once its job is done; waits up to `SERVE_WAIT` for it to arrive.
+async fn scan_of(node: &Node, scan_uid: &str) -> Option<(NodeId, String, String, u8, u64)> {
+    let until = tokio::time::Instant::now() + crate::credits::pay::SERVE_WAIT;
+    loop {
+        let row: Option<(Vec<u8>, String, String, i64, i64)> = sqlx::query_as(
+            "SELECT s.origin, j.uid, i.ip, s.level, j.status_hlc FROM scans s
+             JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
+             JOIN ips i ON i.id = s.ip_id
+             WHERE s.uid = ? AND s.audit_of IS NULL AND j.status = 'done'
+               AND j.arbiter IS NOT NULL AND j.arbiter != s.origin",
+        )
+        .bind(scan_uid)
+        .fetch_optional(&node.store.pool)
+        .await
+        .ok()
+        .flatten();
+        if let Some((s, job, ip, level, done)) = row {
+            return Some((
+                NodeId::from_slice(&s).ok()?,
+                job,
+                ip,
+                u8::try_from(level).ok()?,
+                hlc::from_db(done),
+            ));
+        }
+        if tokio::time::Instant::now() >= until {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Answer bought audits: check the scan, the ranking and the offer, then
+/// queue the audit.
+pub fn serve(node: &Arc<Node>) {
+    let weak = Arc::downgrade(node);
+    node.on_message(Arc::new(move |from, msg| {
+        let weak = weak.clone();
+        Box::pin(async move {
+            let Msg::AuditReq {
+                scan_uid,
+                offer_seq,
+            } = msg
+            else {
+                return None;
+            };
+            let node = weak.upgrade()?;
+            Some(match sell(&node, from, &scan_uid, offer_seq).await {
+                Ok(()) => Msg::AuditReply {
+                    accepted: true,
+                    why: None,
+                },
+                Err(why) => Msg::AuditReply {
+                    accepted: false,
+                    why: Some(why),
+                },
+            })
+        })
+    }));
+}
+
+async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Result<(), String> {
+    use crate::credits::{entries, pay, price};
+    let refuse = async |why: &str| {
+        pay::release(node, peer, seq).await;
+        Err(why.to_string())
+    };
+    if !node.roles().scanner || scan_uid.is_empty() || scan_uid.len() > 128 {
+        return refuse("this node audits no such scan").await;
+    }
+    let Some((scanner, job_uid, ip, level, done)) = scan_of(node, scan_uid).await else {
+        return refuse("the scan or its done job is not held here").await;
+    };
+    let s = seed(&job_uid, done);
+    let members = crate::cluster::members::all(&node.store)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    if scanner != peer || !(1..=4).contains(&level) || !designated(&s) {
+        return refuse("not a designated scan of the asker").await;
+    }
+    if !auditors(&s, &members, &scanner).contains(&node.id()) {
+        return refuse("this node is not among the scan's auditors").await;
+    }
+    // Asked twice with one offer: the first answer stands.
+    if node
+        .audit_queue
+        .lock()
+        .unwrap()
+        .0
+        .iter()
+        .any(|t| t.offer.is_some_and(|(p, q, _)| p == peer && q == seq))
+    {
+        return Err("this audit is queued already".into());
+    }
+    let least = price::min_take(node.price_table().price_of(price::SCAN).unwrap_or(0)) as u64;
+    // Room for the wait, the longest scan and the receipt.
+    let margin = AUDIT_WINDOW_MS + crate::scan::pace::MAX_RUN_SECS * 1000 + 60_000;
+    let offered = match pay::accept_offer(node, peer, seq, least, "audit", margin).await {
+        Ok(a) => a.offered,
+        Err(pay::Declined::Why(w) | pay::Declined::NotCovered(w)) => return Err(w),
+        Err(pay::Declined::TooLow { why, .. }) => return Err(why),
+    };
+    let named = entries::get(&node.store.pool, &peer, seq)
+        .await
+        .ok()
+        .flatten();
+    let Some(entries::Entry {
+        kind: entries::Kind::Offer {
+            audit: Some(of), ..
+        },
+        ..
+    }) = named
+    else {
+        return refuse("the offer buys no audit").await;
+    };
+    if of != scan_uid {
+        return refuse("the offer is for another scan").await;
+    }
+    let task = Task {
+        scan_uid: scan_uid.to_string(),
+        job_uid,
+        ip,
+        level,
+        deadline_ms: hlc::wall_ms() + AUDIT_WINDOW_MS,
+        offer: Some((peer, seq, offered.min(u32::MAX as u64) as u32)),
+    };
+    if !node.audit_queue.lock().unwrap().push(task) {
+        return refuse("this scanner has too many audits waiting").await;
+    }
+    Ok(())
+}
+
+/// Buy the audit of this node's designated scan `scan_uid` from its
+/// auditors in rank order: the first that is live, announces a scan price
+/// and accepts, at that price (at least 1 mc). Returns the auditor.
+pub async fn buy(node: &Arc<Node>, scan_uid: &str) -> Result<NodeId, String> {
+    let me = node.id();
+    let Some((scanner, job_uid, _, _, done)) = scan_of(node, scan_uid).await else {
+        return Err("the scan or its done job is not held here".into());
+    };
+    if scanner != me {
+        return Err("not this node's scan".into());
+    }
+    let s = seed(&job_uid, done);
+    if !designated(&s) {
+        return Err("not designated".into());
+    }
+    let members = crate::cluster::members::all(&node.store)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let mut last = "no auditor is reachable".to_string();
+    for auditor in auditors(&s, &members, &me) {
+        let live = node
+            .live_members(crate::intel::LIVE_WINDOW)
+            .contains(&auditor);
+        let price = node.status.known(&auditor).and_then(|k| k.hb.scan_price_mc);
+        let (true, Some(price)) = (live && node.can_call(&auditor), price) else {
+            continue;
+        };
+        // At least 1 mc: only charged audit offers count as bought.
+        let offer_seq = crate::credits::pay::make_offer_for(
+            node,
+            auditor,
+            price.max(1) as u64,
+            Some(scan_uid.to_string()),
+        )
+        .await?;
+        let req = Msg::AuditReq {
+            scan_uid: scan_uid.to_string(),
+            offer_seq,
+        };
+        match node
+            .request(auditor, req, std::time::Duration::from_secs(30))
+            .await
+        {
+            Ok(Msg::AuditReply { accepted: true, .. }) => return Ok(auditor),
+            Ok(Msg::AuditReply { why, .. }) => last = why.unwrap_or_else(|| "declined".into()),
+            Ok(_) => last = "unexpected answer".into(),
+            Err(e) => last = format!("could not be asked: {e:#}"),
+        }
+    }
+    Err(last)
+}
+
+/// Buy the audits of this node's designated scans whose done status
+/// arrived within the audit window and that it has not tried yet.
+/// Returns how many it bought.
+pub async fn buy_due(node: &Arc<Node>) -> usize {
+    let me = node.id();
+    let since = hlc::to_db(hlc::wall_ms().saturating_sub(AUDIT_WINDOW_MS) << 16);
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT s.uid, j.uid, j.status_hlc FROM scans s
+         JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
+         WHERE s.origin = ?1 AND s.audit_of IS NULL AND s.uid IS NOT NULL
+           AND s.level BETWEEN 1 AND 4 AND j.status = 'done'
+           AND j.arbiter IS NOT NULL AND j.arbiter != ?1 AND j.status_hlc >= ?2",
+    )
+    .bind(&me.0[..])
+    .bind(since)
+    .fetch_all(&node.store.pool)
+    .await
+    .unwrap_or_default();
+    let mut bought = 0;
+    for (scan_uid, job_uid, done) in rows {
+        if !designated(&seed(&job_uid, hlc::from_db(done)))
+            || !node.audits_tried.lock().unwrap().insert(scan_uid.clone())
+        {
+            continue;
+        }
+        match buy(node, &scan_uid).await {
+            Ok(by) => {
+                tracing::info!(scan = %scan_uid, auditor = %by.short(), "audit bought");
+                bought += 1;
+            }
+            Err(why) => tracing::info!(scan = %scan_uid, %why, "designated scan not audited"),
+        }
+    }
+    bought
 }
 
 #[cfg(test)]
@@ -398,6 +780,157 @@ mod tests {
 
     fn id(n: u8) -> NodeId {
         NodeId([n; 32])
+    }
+
+    fn scanner_member(n: u8, proto: u32) -> crate::cluster::members::MemberRow {
+        crate::cluster::members::MemberRow {
+            id: id(n),
+            name: format!("n{n}"),
+            address: Some(format!("198.51.100.{n}:7443")),
+            roles: vec!["scanner".into()],
+            proto_min: 2,
+            proto_max: proto,
+            sponsor: id(n),
+            active: true,
+            standing: crate::cluster::members::Standing::Active,
+            info_hlc: 0,
+            last_entry_hlc: 0,
+            remote_config: false,
+        }
+    }
+
+    #[test]
+    fn about_one_scan_in_twenty_is_designated_and_nobody_chooses_which() {
+        let n = (0..20_000u64)
+            .filter(|h| designated(&seed("job-x", *h << 16)))
+            .count();
+        assert!((800..1200).contains(&n), "{n} of 20000");
+        // The same job and done status: the same answer everywhere.
+        assert_eq!(seed("job-x", 7), seed("job-x", 7));
+        assert_ne!(seed("job-x", 7), seed("job-y", 7));
+        assert_ne!(seed("job-x", 7), seed("job-x", 8));
+    }
+
+    #[test]
+    fn the_auditors_are_ranked_by_the_seed_never_the_scanner() {
+        let members = [
+            scanner_member(1, 7),
+            scanner_member(2, 7),
+            scanner_member(3, 7),
+            scanner_member(4, 7),
+            scanner_member(5, 6), // too old to be paid
+        ];
+        let s = seed("job-x", 7);
+        let got = auditors(&s, &members, &id(1));
+        assert_eq!(got.len(), AUDITORS);
+        assert!(!got.contains(&id(1)), "never the scanner itself");
+        assert!(!got.contains(&id(5)));
+        assert_eq!(got, auditors(&s, &members, &id(1)), "deterministic");
+        // Another seed, another order (for some seed among a few).
+        assert!((8..40u64).any(|h| auditors(&seed("job-x", h), &members, &id(1)) != got));
+        let mut listener = scanner_member(6, 7);
+        listener.roles = vec!["listener".into()];
+        assert!(
+            !auditors(&s, &[listener], &id(1)).contains(&id(6)),
+            "not a scanner"
+        );
+    }
+
+    #[test]
+    fn a_scanner_owes_when_two_designated_scans_lack_an_audit_and_it_bought_under_80_percent() {
+        assert_eq!(owes(0, 0), None);
+        assert_eq!(owes(1, 0), None, "one miss is forgiven");
+        assert_eq!(owes(2, 0), Some((0, 2)));
+        assert_eq!(owes(10, 8), None, "80 %");
+        assert_eq!(owes(10, 7), Some((7, 10)));
+        assert_eq!(owes(20, 17), None, "three misses, but 85 %");
+    }
+
+    #[test]
+    fn bought_audits_are_handed_out_first_and_late_ones_dropped() {
+        let now = hlc::wall_ms();
+        let task = |uid: &str, level: u8, deadline_ms: u64| Task {
+            scan_uid: uid.into(),
+            job_uid: format!("job-{uid}"),
+            ip: "203.0.113.5".into(),
+            level,
+            deadline_ms,
+            offer: Some((id(1), 7, 3)),
+        };
+        let mut q = Queue::default();
+        assert!(q.push(task("late", 2, now - 1)));
+        assert!(q.push(task("four", 4, now + 60_000)));
+        assert!(q.push(task("two", 2, now + 60_000)));
+        assert_eq!(q.take(&[4]).map(|t| t.scan_uid), Some("two".into()));
+        assert_eq!(q.take(&[4]), None, "level 4 excluded, the late one dropped");
+        assert_eq!(q.take(&[]).map(|t| t.scan_uid), Some("four".into()));
+    }
+
+    #[tokio::test]
+    async fn the_obligation_counts_designated_scans_and_audits_bought_from_their_auditors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let pool = &store.pool;
+        let (s, arbiter, auditor, stranger) = (id(1), id(9), id(2), id(3));
+        let members = [scanner_member(1, 7), scanner_member(2, 7)];
+        sqlx::query(
+            "INSERT INTO ips (id, ip, first_seen, last_seen) VALUES (1, '192.0.2.1', '', '')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let now = hlc::wall_ms();
+        let day_ago = |extra: u64| ((now - 86_400_000 - extra) << 16) | 1;
+        // Three done jobs of another arbiter whose done status designates them.
+        let mut hlcs = vec![];
+        let mut h = 0u64;
+        while hlcs.len() < 3 {
+            if designated(&seed(&format!("job-{}", hlcs.len()), day_ago(h))) {
+                hlcs.push(day_ago(h));
+            }
+            h += 1;
+        }
+        for (n, done) in hlcs.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO scan_jobs (ip_id, level, status, queued_at, uid, origin, arbiter, scanner, status_hlc)
+                 VALUES (1, 2, 'done', datetime('now'), ?1, ?2, ?2, ?3, ?4)",
+            )
+            .bind(format!("job-{n}")).bind(&arbiter.0[..]).bind(&s.0[..]).bind(hlc::to_db(*done))
+            .execute(pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO scans (ip_id, level, started_at, finished_at, uid, origin, job_uid, hlc, job_id)
+                 VALUES (1, 2, datetime('now'), datetime('now'), ?1, ?2, ?3, ?4,
+                         (SELECT id FROM scan_jobs WHERE uid = ?3))",
+            )
+            .bind(format!("scan-{n}")).bind(&s.0[..]).bind(format!("job-{n}")).bind(hlc::to_db(*done))
+            .execute(pool).await.unwrap();
+        }
+        // scan-0: audited by its auditor, paid. scan-1: audited by a node
+        // that is no auditor of it, paid. scan-2: not audited.
+        for (n, by) in [(0i64, auditor), (1, stranger)] {
+            sqlx::query(
+                "INSERT INTO scans (ip_id, level, started_at, finished_at, uid, origin, job_uid, audit_of, hlc, job_id)
+                 VALUES (1, 2, datetime('now'), datetime('now'), ?1, ?2, ?3, ?4, ?5,
+                         (SELECT id FROM scan_jobs WHERE uid = ?3))",
+            )
+            .bind(format!("audit-{n}")).bind(&by.0[..]).bind(format!("job-{n}")).bind(format!("scan-{n}")).bind(hlc::to_db(day_ago(0)))
+            .execute(pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, seal, economy, audit_uid)
+                 VALUES (?1, ?2, ?3, 'offer', ?4, '[]', 1, 2, ?5)",
+            )
+            .bind(&s.0[..]).bind(n + 1).bind(hlc::to_db(day_ago(0))).bind(&by.0[..]).bind(format!("scan-{n}"))
+            .execute(pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, economy)
+                 VALUES (?1, 1, ?2, 'receipt', ?3, '[]', ?4, 4, '[\"audit\"]', 0, 2)",
+            )
+            .bind(&by.0[..]).bind(hlc::to_db(day_ago(0))).bind(&s.0[..]).bind(n + 1)
+            .execute(pool).await.unwrap();
+        }
+        let got = obligations(pool, &members, now).await.unwrap();
+        assert_eq!(got.get(&s), Some(&(3, 1)), "{got:?}");
+        assert_eq!(owes(3, 1), Some((1, 3)));
     }
 
     /// A scan row with one open port per entry of `ports`.

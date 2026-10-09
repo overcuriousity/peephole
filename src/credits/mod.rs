@@ -30,6 +30,10 @@ pub const OFFER_TTL_MS: u64 = 15 * 60 * 1000;
 /// margin a server keeps for writing its receipt.
 pub const JOB_OFFER_TTL_MS: u64 = crate::scan::pace::MAX_RUN_SECS * 1000 + pay::SERVE_MARGIN_MS;
 
+/// An audit offer lapses after the time an audit may wait to start, the
+/// longest scan and the margin for the receipt.
+pub const AUDIT_OFFER_TTL_MS: u64 = audit::AUDIT_WINDOW_MS + JOB_OFFER_TTL_MS;
+
 /// The UTC day an entry belongs to, from its HLC.
 pub fn day_of(hlc: u64) -> u32 {
     (crate::cluster::hlc::physical_ms(hlc) / DAY_MS) as u32
@@ -187,7 +191,8 @@ const TICK: std::time::Duration = std::time::Duration::from_secs(60);
 /// hourly refresh, in smaller steps.
 const PRICE_TICKS: u64 = 10;
 
-/// Report the hours that ended, settle audits, say in the journal when a
+/// Report the hours that ended, settle audits, buy the audits of this
+/// node's designated scans, say in the journal when a
 /// member's standing changes, refresh prices and drop what is older than
 /// the ledger reads.
 pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -219,7 +224,16 @@ pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<boo
             }
             Err(e) => tracing::debug!(?e, "credits: standings not evaluated"),
         }
+        // Audits of this node's designated scans that are due.
+        audit::buy_due(&node).await;
         if ticks.is_multiple_of(60) {
+            // A scan older than the audit window is never due again.
+            {
+                let mut tried = node.audits_tried.lock().unwrap();
+                if tried.len() > 10_000 {
+                    tried.clear();
+                }
+            }
             let before = window_start(crate::cluster::hlc::wall_ms());
             let pool = &node.store.pool;
             if let Err(e) = async {

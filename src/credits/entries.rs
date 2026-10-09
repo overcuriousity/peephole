@@ -51,6 +51,8 @@ pub enum Kind {
         parts: Vec<(u32, u32)>,
         /// The scan job it funds; such an offer lapses after the longest scan.
         job: Option<String>,
+        /// The scan an audit it buys checks (`credits::audit`).
+        audit: Option<String>,
     },
     Receipt {
         payer: NodeId,
@@ -109,15 +111,32 @@ pub async fn apply(
         Option<u32>,
         Option<&'a [String]>,
         Option<&'a str>,
+        Option<&'a str>,
     );
-    let (kind, peer, parts, offer_seq, charged, answered, job_uid): Cols = match r {
-        Record::CreditOffer { to, parts, job, .. }
-            if parts_ok(parts, day) && job.as_ref().is_none_or(|j| j.len() <= 64) =>
+    let (kind, peer, parts, offer_seq, charged, answered, job_uid, audit_uid): Cols = match r {
+        Record::CreditOffer {
+            to,
+            parts,
+            job,
+            audit,
+            ..
+        } if parts_ok(parts, day)
+            && job.as_ref().is_none_or(|j| j.len() <= 64)
+            && audit.as_ref().is_none_or(|a| a.len() <= 128) =>
         {
-            ("offer", to, parts, None, None, None, job.as_deref())
+            (
+                "offer",
+                to,
+                parts,
+                None,
+                None,
+                None,
+                job.as_deref(),
+                audit.as_deref(),
+            )
         }
         Record::CreditTransfer { to, parts, .. } if *to != e.origin && parts_ok(parts, day) => {
-            ("transfer", to, parts, None, None, None, None)
+            ("transfer", to, parts, None, None, None, None, None)
         }
         Record::CreditReceipt {
             payer,
@@ -136,6 +155,7 @@ pub async fn apply(
                 Some(*charged_mc),
                 Some(answered),
                 None,
+                None,
             )
         }
         _ => return Ok(false),
@@ -143,8 +163,8 @@ pub async fn apply(
     sqlx::query(
         "INSERT OR IGNORE INTO credit_entries
            (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, job_uid,
-            economy)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            economy, audit_uid)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&e.origin.0[..])
     .bind(e.seq.min(i64::MAX as u64) as i64)
@@ -158,6 +178,7 @@ pub async fn apply(
     .bind(seal.to_db())
     .bind(job_uid)
     .bind(i64::from(r.economy()))
+    .bind(audit_uid)
     .execute(&mut *conn)
     .await?;
     Ok(true)
@@ -175,10 +196,11 @@ type Row = (
     Option<String>,
     i64,
     Option<String>,
+    Option<String>,
 );
 
-const COLUMNS: &str =
-    "origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, job_uid";
+const COLUMNS: &str = "origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, \
+     job_uid, audit_uid";
 
 fn from_row(r: Row) -> Result<Entry> {
     let peer = NodeId::from_slice(&r.4)?;
@@ -187,6 +209,7 @@ fn from_row(r: Row) -> Result<Entry> {
             to: peer,
             parts: serde_json::from_str(&r.5)?,
             job: r.10,
+            audit: r.11,
         },
         "transfer" => Kind::Transfer {
             to: peer,
@@ -282,6 +305,7 @@ mod tests {
             parts: vec![(day, 200)],
             seal: Seal::default(),
             job: Some(job),
+            audit: None,
             economy: ECONOMY,
         };
         let mut conn = store.pool.acquire().await.unwrap();
@@ -315,6 +339,7 @@ mod tests {
                 to: b.id,
                 parts: vec![(day, 200)],
                 job: Some("job".into()),
+                audit: None,
             }
         );
         assert_eq!(get(&store.pool, &a.id, 4).await.unwrap(), None);
@@ -333,6 +358,7 @@ mod tests {
             parts: vec![(day, 200)],
             seal: Seal::default(),
             job: None,
+            audit: None,
             economy,
         };
         let mut conn = store.pool.acquire().await.unwrap();
@@ -379,6 +405,7 @@ mod tests {
             parts: parts.clone(),
             seal: Seal::default(),
             job: None,
+            audit: None,
             economy: 0,
         };
         let old = Old::CreditOffer {
@@ -412,6 +439,7 @@ mod tests {
                 parts: vec![(day - 1, 300), (day, 200)],
                 seal: seal.clone(),
                 job: None,
+                audit: None,
                 economy: ECONOMY,
             },
         );
@@ -458,6 +486,7 @@ mod tests {
                 parts: vec![(day - 7, 50)],
                 seal: seal.clone(),
                 job: None,
+                audit: None,
                 economy: ECONOMY,
             },
         );
@@ -493,6 +522,7 @@ mod tests {
                     to: b.id,
                     parts: vec![(day - 1, 300), (day, 200)],
                     job: None,
+                    audit: None,
                 },
                 seal: SealState::Consistent,
             }

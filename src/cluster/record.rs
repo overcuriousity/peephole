@@ -528,6 +528,10 @@ pub enum Record {
         /// lapses after the longest scan, not after 15 minutes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job: Option<String>,
+        /// The scan an audit this offer buys checks (`credits::audit`);
+        /// such an offer lives as long as an audit may take.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audit: Option<String>,
         /// [`ECONOMY`] for the credits of protocol 7; absent (0) before.
         #[serde(default, skip_serializing_if = "is_zero_u8")]
         economy: u8,
@@ -809,6 +813,7 @@ mod tests {
             parts: vec![(20_000, 5)],
             seal: Seal::default(),
             job: None,
+            audit: None,
             economy,
         };
         let new = WireEntry::sign(&id, 4, 9 << 16, &offer(ECONOMY)).unwrap();
@@ -1038,6 +1043,7 @@ mod tests {
                     parts: vec![(20_000, 250), (20_001, 4_000_000_000)],
                     seal: seal.clone(),
                     job: None,
+                    audit: None,
                     economy: ECONOMY,
                 },
                 "credit_offer",

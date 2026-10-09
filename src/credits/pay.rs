@@ -116,10 +116,10 @@ pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
 /// request that takes longer passes its own margin to [`accept_offer`].
 pub const SERVE_MARGIN_MS: u64 = 2 * 60 * 1000;
 
-/// Whether an offer dated `hlc` can still be charged when served `now_ms`
-/// by a request that takes up to `margin_ms`.
-fn time_left(hlc: u64, now_ms: u64, margin_ms: u64) -> bool {
-    now_ms + margin_ms <= crate::cluster::hlc::physical_ms(hlc) + super::OFFER_TTL_MS
+/// Whether an offer dated `hlc` that lives `ttl_ms` can still be charged
+/// when served `now_ms` by a request that takes up to `margin_ms`.
+fn time_left(hlc: u64, ttl_ms: u64, now_ms: u64, margin_ms: u64) -> bool {
+    now_ms + margin_ms <= crate::cluster::hlc::physical_ms(hlc) + ttl_ms
 }
 
 /// Write a receipt of nothing for `peer`'s offer `offer_seq`: it frees
@@ -265,7 +265,7 @@ pub async fn accept_offer(
     if offer.state != OfferState::Open {
         return why("the offer is used up, or older than 15 minutes".into());
     }
-    if !time_left(offer.hlc, book.now_ms, margin_ms) {
+    if !time_left(offer.hlc, offer.ttl_ms(), book.now_ms, margin_ms) {
         release(node, peer, offer_seq).await;
         return why("the offer lapses before it could be charged; offer again".into());
     }
@@ -303,6 +303,16 @@ pub async fn accept_offer(
 /// the server holds it before it is named. Returns the offer's sequence
 /// number.
 pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Result<u64, String> {
+    make_offer_for(node, server, total_mc, None).await
+}
+
+/// [`make_offer`], naming the scan an audit it buys checks (`audit`).
+pub async fn make_offer_for(
+    node: &Arc<Node>,
+    server: NodeId,
+    total_mc: Mc,
+    audit: Option<String>,
+) -> Result<u64, String> {
     let me = node.id();
     // Checked before the offer is written: an offer nobody can be asked
     // to serve would stay held for 15 minutes.
@@ -335,6 +345,7 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
         parts,
         seal,
         job: None,
+        audit,
         economy: crate::cluster::record::ECONOMY,
     })
     .await
@@ -804,15 +815,16 @@ mod tests {
         let now = 1_000 * min;
         let made = |ago: u64| (now - ago) << 16;
         let m = SERVE_MARGIN_MS;
-        assert!(time_left(made(0), now, m));
-        assert!(time_left(made(10 * min), now, m));
+        let ttl = crate::credits::OFFER_TTL_MS;
+        assert!(time_left(made(0), ttl, now, m));
+        assert!(time_left(made(10 * min), ttl, now, m));
         // Its receipt would be written after the offer lapsed: ignored
         // everywhere, the server unpaid.
-        assert!(!time_left(made(14 * min), now, m));
-        assert!(!time_left(made(20 * min), now, m));
+        assert!(!time_left(made(14 * min), ttl, now, m));
+        assert!(!time_left(made(20 * min), ttl, now, m));
         // A longer request needs more of the offer left.
-        assert!(time_left(made(12 * min), now, m));
-        assert!(!time_left(made(12 * min), now, 3 * min + 1));
+        assert!(time_left(made(12 * min), ttl, now, m));
+        assert!(!time_left(made(12 * min), ttl, now, 3 * min + 1));
     }
 
     #[test]

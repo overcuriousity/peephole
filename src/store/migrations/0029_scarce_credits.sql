@@ -16,3 +16,6 @@ ALTER TABLE credit_entries ADD COLUMN economy INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX idx_credit_entries_economy_hlc ON credit_entries(economy, hlc);
 -- The judge and its counted scans are gone.
 DROP TABLE credit_scans;
+-- The scan an audit offer pays for (`credits::audit`).
+ALTER TABLE credit_entries ADD COLUMN audit_uid TEXT;
+CREATE INDEX idx_credit_entries_audit ON credit_entries(audit_uid) WHERE audit_uid IS NOT NULL;

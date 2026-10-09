@@ -154,6 +154,17 @@ pub enum Msg {
         status: u16,
         body: serde_bytes::ByteBuf,
     },
+    /// Scanner → its auditor: audit my designated scan `scan_uid`, paid
+    /// with my offer `offer_seq` (`credits::audit`). The auditor reads the
+    /// scan from its own copy of the log.
+    AuditReq {
+        scan_uid: String,
+        offer_seq: u64,
+    },
+    AuditReply {
+        accepted: bool,
+        why: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

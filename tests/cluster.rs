@@ -171,6 +171,7 @@ async fn boot_in(
     cluster::owner::fleet::serve(&node);
     cluster::owner::cmd::serve(&node, settings.clone());
     peephole::credits::fleet::serve(&node);
+    peephole::credits::audit::serve(&node);
     let workers = o.scanner.as_ref().map(|nmap| {
         tokio::spawn(peephole::scan::arbiter::takeover_loop(
             node.clone(),
@@ -4740,6 +4741,7 @@ async fn a_protocol_six_member_is_neither_paid_nor_charged() {
             parts: vec![(pool_day(), 100)],
             seal,
             job: None,
+            audit: None,
             economy: peephole::cluster::record::ECONOMY,
         }
     })
@@ -6954,5 +6956,154 @@ async fn reverse_names_are_bought_from_a_quorum_and_replicate_with_their_flag() 
             .await
             .unwrap(),
         0
+    );
+}
+
+/// A scan designated for audit is bought from its first auditor, which
+/// queues it; a node that is no auditor of it declines.
+#[tokio::test]
+async fn a_designated_scan_is_audited_by_its_auditor() {
+    use peephole::credits::audit;
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("node-alpha");
+    let (is, s) = new_node("node-sierra");
+    let (ix, x) = new_node("node-xray");
+    let scanner = || Opts {
+        scanner: Some(fake_nmap_args(tools.path())),
+        workers: 0,
+        ..DEFAULT
+    };
+    let na = boot(ia, &a, &[&s, &x], DEFAULT).await;
+    let ns = boot(is, &s, &[&a, &x], scanner()).await;
+    let nx = boot(ix, &x, &[&a, &s], scanner()).await;
+    fund_listeners(&[&na, &ns, &nx], &[s.id]).await;
+    market_known(&ns, x.id).await;
+    eventually("s hears x's scan price", || async {
+        ns.node
+            .status
+            .known(&x.id)
+            .is_some_and(|k| k.hb.scan_price_mc.is_some())
+    })
+    .await;
+    // A done job of a, scanned by s, whose done status designates it; on
+    // s and x alike (as replication would leave it).
+    let now = now_ms();
+    let done = (0u64..)
+        .map(|i| ((now - i) << 16) | 1)
+        .find(|h| audit::designated(&audit::seed("job-d", *h)))
+        .unwrap();
+    for n in [&ns, &nx] {
+        let ip = n
+            .store
+            .upsert_ip("198.51.100.70".parse().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO scan_jobs (ip_id, level, status, queued_at, uid, origin, arbiter, scanner, status_hlc)
+             VALUES (?1, 2, 'done', datetime('now'), 'job-d', ?2, ?2, ?3, ?4)",
+        )
+        .bind(ip.id).bind(&a.id.0[..]).bind(&s.id.0[..]).bind(peephole::cluster::hlc::to_db(done))
+        .execute(&n.store.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO scans (ip_id, level, started_at, finished_at, uid, origin, job_uid, hlc, job_id)
+             VALUES (?1, 2, datetime('now'), datetime('now'), 'scan-d', ?2, 'job-d', ?3,
+                     (SELECT id FROM scan_jobs WHERE uid = 'job-d'))",
+        )
+        .bind(ip.id).bind(&s.id.0[..]).bind(peephole::cluster::hlc::to_db(done))
+        .execute(&n.store.pool).await.unwrap();
+    }
+    assert_eq!(audit::buy(&ns.node, "scan-d").await, Ok(x.id));
+    assert_eq!(nx.node.audit_queue.lock().unwrap().len(), 1, "x queued it");
+    // a is no scanner, so no auditor of it.
+    let req = peephole::cluster::msg::Msg::AuditReq {
+        scan_uid: "scan-d".into(),
+        offer_seq: 1,
+    };
+    let reply = ns.node.request(a.id, req, Duration::from_secs(10)).await;
+    assert!(
+        !matches!(
+            reply,
+            Ok(peephole::cluster::msg::Msg::AuditReply { accepted: true, .. })
+        ),
+        "{reply:?}"
+    );
+}
+
+/// A scanner that buys no audits of its designated scans owes them:
+/// arbiters stop funding it, so it is granted nothing.
+#[tokio::test]
+async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funded() {
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("node-alpha");
+    let (is, s) = new_node("node-sierra");
+    let (ix, x) = new_node("node-xray");
+    let na = boot(ia, &a, &[&s, &x], DEFAULT).await;
+    let _ns = boot(
+        is,
+        &s,
+        &[&a, &x],
+        Opts {
+            scanner: Some(fake_nmap_args(tools.path())),
+            ..DEFAULT
+        },
+    )
+    .await;
+    // x is another scanner: the auditor s should have bought from.
+    let _nx = boot(
+        ix,
+        &x,
+        &[&a, &s],
+        Opts {
+            scanner: Some(fake_nmap_args(tools.path())),
+            workers: 0,
+            ..DEFAULT
+        },
+    )
+    .await;
+    market_known(&na, s.id).await;
+    // Three designated scans of a's jobs by s, a day old, none audited.
+    let now = now_ms();
+    let ip = na
+        .store
+        .upsert_ip("198.51.100.61".parse().unwrap())
+        .await
+        .unwrap();
+    let mut found = 0;
+    for i in 0u64.. {
+        let done = ((now - 86_400_000 - i) << 16) | 1;
+        let job = format!("owed-job-{found}");
+        if !peephole::credits::audit::designated(&peephole::credits::audit::seed(&job, done)) {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO scan_jobs (ip_id, level, status, queued_at, uid, origin, arbiter, scanner, status_hlc)
+             VALUES (?1, 1, 'done', datetime('now'), ?2, ?3, ?3, ?4, ?5)",
+        )
+        .bind(ip.id).bind(&job).bind(&a.id.0[..]).bind(&s.id.0[..]).bind(peephole::cluster::hlc::to_db(done))
+        .execute(&na.store.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO scans (ip_id, level, started_at, finished_at, uid, origin, job_uid, hlc, job_id)
+             VALUES (?1, 1, datetime('now'), datetime('now'), ?2, ?3, ?4, ?5,
+                     (SELECT id FROM scan_jobs WHERE uid = ?4))",
+        )
+        .bind(ip.id).bind(format!("owed-scan-{found}")).bind(&s.id.0[..]).bind(&job).bind(peephole::cluster::hlc::to_db(done))
+        .execute(&na.store.pool).await.unwrap();
+        found += 1;
+        if found == 3 {
+            break;
+        }
+    }
+    let book = peephole::credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(book.standing(&s.id).audits_owed, Some((0, 3)));
+    enqueue(&na, "198.51.100.62", 1).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_eq!(
+        count(
+            &na,
+            "SELECT COUNT(*) FROM scan_jobs WHERE status = 'queued'"
+        )
+        .await,
+        1,
+        "not funded, not granted"
     );
 }

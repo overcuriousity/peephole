@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 /// A funded scan job (`credits::jobs`).
 pub const SCAN: &str = "scan";
+/// A bought audit of a designated scan (`credits::audit`).
+pub const AUDIT: &str = "audit";
 /// An observational probe (`scan::probe`).
 pub const PROBE: &str = "probe";
 /// A name resolved for another member (`intel::dns`).

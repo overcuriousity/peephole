@@ -96,7 +96,9 @@ pub(crate) struct Claimant {
 
 /// How a scanner stands with this arbiter at the start of a round.
 struct Stand {
-    /// What this arbiter would pay it; None: it cannot be granted.
+    /// What this arbiter would pay it; None: it cannot be granted (unpaid
+    /// here, or a scanner that does not earn as one, because it owes
+    /// audits or its audits differ: it is not funded).
     price: Option<u32>,
     /// Over its hourly capacity here, or not delivering enough grants.
     demoted: bool,
@@ -319,7 +321,12 @@ impl Arbiter {
     }
 
     /// How `scanner` stands with this arbiter now.
-    async fn stand(&self, scanner: &NodeId, table: &crate::credits::price::Table) -> Stand {
+    async fn stand(
+        &self,
+        scanner: &NodeId,
+        table: &crate::credits::price::Table,
+        book: Option<&crate::credits::Book>,
+    ) -> Stand {
         let (all, here) = self.scans_last_hour(scanner).await;
         let delivering = self
             .outcomes
@@ -328,7 +335,11 @@ impl Arbiter {
             .get(scanner)
             .is_none_or(|o| delivers(o, Instant::now()));
         Stand {
-            price: crate::credits::jobs::price_for(&self.node, scanner),
+            price: if book.is_some_and(|b| !b.standing(scanner).earns_as_scanner()) {
+                None
+            } else {
+                crate::credits::jobs::price_for(&self.node, scanner)
+            },
             demoted: over_capacity(here, table.can_do(scanner)) || !delivering,
             load: all,
         }
@@ -364,10 +375,11 @@ impl Arbiter {
         let table = self.node.price_table();
         let snap = self.node.weights.get(pool).await?;
         let scanners = self.scanners();
+        let book = crate::credits::book(&self.node).await.ok();
         let mut stands: HashMap<NodeId, Stand> = HashMap::new();
         for s in claims.iter().map(|c| c.id).chain(scanners.iter().copied()) {
             if let std::collections::hash_map::Entry::Vacant(e) = stands.entry(s) {
-                e.insert(self.stand(&s, &table).await);
+                e.insert(self.stand(&s, &table, book.as_deref()).await);
             }
         }
         // What each scanner asked for last: a scanner not asking now keeps
