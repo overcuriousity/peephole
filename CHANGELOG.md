@@ -74,6 +74,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   entries it signed next forked from its peers' copies, which marked it
   forked for good. The installer keeps the migrated database (the older
   version reads it) and says where the backup is.
+- A runtime settings change read the stored settings on a second database
+  connection while it held the write lock; with the pool busy it waited for
+  one while blocking every writer, the trap's included. It reads within its
+  own transaction now.
 
 ## [0.10.0] - 2026-10-09
 

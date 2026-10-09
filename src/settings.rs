@@ -242,10 +242,11 @@ impl Settings {
     /// The settings as the database has them: defaults plus overrides. The
     /// overrides are judged together (switching one role off and another on
     /// is fine as a whole); if the build would refuse them, the defaults
-    /// stand.
-    async fn stored(&self) -> Result<Snapshot> {
+    /// stand. Read on `conn`: a writer passes its transaction, so it never
+    /// waits for a second connection while it holds the write lock.
+    async fn stored(&self, conn: &mut sqlx::SqliteConnection) -> Result<Snapshot> {
         let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value FROM settings")
-            .fetch_all(&self.store.pool)
+            .fetch_all(&mut *conn)
             .await?;
         let mut s = self.defaults;
         let mut all = Changes::default();
@@ -298,7 +299,7 @@ impl Settings {
         // Under the writers' lock: a write committed and adopted between
         // the read and the adopt would otherwise be rolled back in memory.
         let _g = self.lock.lock().await;
-        let s = self.stored().await?;
+        let s = self.stored(&mut *self.store.pool.acquire().await?).await?;
         if s == self.snapshot() {
             return Ok(false);
         }
@@ -344,7 +345,7 @@ impl Settings {
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
         // Judge against the database, not this process's memory: the CLI or
         // another handle may have written since.
-        let current = self.stored().await?;
+        let current = self.stored(&mut tx).await?;
         if let Some(b) = base
             && b != current.version
         {
@@ -399,7 +400,7 @@ impl Settings {
         }
         let _g = self.lock.lock().await;
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let version = self.stored().await?.version + 1;
+        let version = self.stored(&mut tx).await?.version + 1;
         for k in KEYS {
             if key.is_none_or(|only| only == k) {
                 sqlx::query("DELETE FROM settings WHERE key = ?")
@@ -409,8 +410,8 @@ impl Settings {
             }
         }
         self.set(&mut tx, KEY_VERSION, version.to_string()).await?;
+        let s = self.stored(&mut tx).await?;
         tx.commit().await?;
-        let s = self.stored().await?;
         self.adopt(s);
         Ok(Ok(version))
     }
@@ -671,6 +672,34 @@ mod tests {
         assert!(end.roles.scanner);
         assert_eq!(end.pace.max_workers, 3);
         assert!(s.reset(Some("no.such.key")).await.unwrap().is_err());
+    }
+
+    /// A write reads the settings in its own transaction: holding the write
+    /// lock, it never waits for a second connection the busy pool cannot
+    /// give (every other writer would wait behind it).
+    #[tokio::test]
+    async fn writes_need_one_connection_only() {
+        let (s, store, _d) = open("").await;
+        let mut held = vec![];
+        while held.len() + 1 < store.pool.options().get_max_connections() as usize {
+            held.push(store.pool.acquire().await.unwrap());
+        }
+        let c = Changes {
+            max_workers: Some(3),
+            ..Default::default()
+        };
+        let quick = std::time::Duration::from_secs(5);
+        let applied = tokio::time::timeout(quick, s.apply(&c, None)).await;
+        assert_eq!(
+            applied.expect("apply waited for a connection").unwrap(),
+            Ok(1)
+        );
+        let reset = tokio::time::timeout(quick, s.reset(None)).await;
+        assert_eq!(
+            reset.expect("reset waited for a connection").unwrap(),
+            Ok(2)
+        );
+        assert_eq!(s.snapshot().pace.max_workers, 2);
     }
 
     #[tokio::test]
