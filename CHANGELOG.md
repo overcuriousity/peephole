@@ -24,6 +24,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   its own address (and let it have this node scan whom it named); the
   installer refuses it too instead of warning. A range wider than an IPv4
   `/8` or an IPv6 `/32` loads with a warning.
+- `cluster.takeover_hours` must be between 1 and 720: a window of minutes
+  handed jobs of arbiters that were merely slow to others, which scanned
+  them twice.
 
 ### Fixed
 

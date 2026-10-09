@@ -982,8 +982,10 @@ impl Config {
             if !(10..=86_400).contains(&c.lease_secs) {
                 bail!("cluster.lease_secs must be between 10 and 86400");
             }
-            if !c.takeover_hours.is_finite() || c.takeover_hours <= 0.0 {
-                bail!("cluster.takeover_hours must be a positive, finite number");
+            // Shorter, a member's jobs would move while its arbiter is merely
+            // slow (and be scanned twice); longer, a dead arbiter's jobs wait weeks.
+            if !(1.0..=720.0).contains(&c.takeover_hours) {
+                bail!("cluster.takeover_hours must be between 1 and 720");
             }
             for p in &c.peers {
                 crate::cluster::identity::NodeId::parse(&p.public_key)
@@ -1617,6 +1619,25 @@ data_dir = "/tmp"
         let c = cfg.cluster.unwrap();
         assert_eq!(c.takeover_hours, 2.0);
         assert_eq!(c.lease_secs, 120);
+    }
+
+    /// A takeover window of minutes would hand live arbiters' jobs to
+    /// others (scans run twice); one of ages would overflow.
+    #[test]
+    fn takeover_hours_are_bounded() {
+        let hours = |h: &str| {
+            parse(&format!(
+                "{BASE}[roles]\nlistener = false\nweb = false\n[cluster]\nnode_name = \"n\"\n\
+                 listen = \"0.0.0.0:7443\"\ntakeover_hours = {h}\n"
+            ))
+        };
+        for bad in ["0.0001", "0.5", "0", "-1", "nan", "inf", "721", "1e300"] {
+            let e = hours(bad).unwrap_err();
+            assert!(e.to_string().contains("takeover_hours"), "{bad}: {e}");
+        }
+        for good in ["1", "6", "720"] {
+            assert!(hours(good).is_ok(), "{good}");
+        }
     }
 
     /// What members would drop or refuse is refused here, and a name is

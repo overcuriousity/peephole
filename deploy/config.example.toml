@@ -225,7 +225,7 @@ tor_wait_hours = 6
 # listen    = "0.0.0.0:7443"        # RPC listener (mutual TLS, pinned keys)
 # advertise = "a.example.net:7443"  # host:port other members dial. Outbound-only, for a node
 #                                   # nobody can reach: delete it and set listen to 127.0.0.1:7443
-# takeover_hours = 6                # adopt an unreachable node's queued jobs after
+# takeover_hours = 6                # adopt an unreachable node's queued jobs after (1-720)
 # lease_secs     = 120              # scan lease, renewed while nmap runs
 # relay_slots = 16                  # relay leases sold at a time to outbound-only members (advertised nodes only)
 # origin_quota_mb = 20480           # stop storing a member's entries beyond this (0 = no limit)
