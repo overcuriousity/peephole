@@ -79,6 +79,8 @@ pub struct ActionsView {
     pub default: Vec<String>,
     pub balance: Option<String>,
     pub standalone: bool,
+    /// The four scan levels' offers (`admin::scan_buy`).
+    pub scans: Vec<crate::admin::scan_buy::ScanOffer>,
 }
 
 pub struct VantageView {
@@ -631,6 +633,10 @@ pub async fn actions_for(state: &AdminState, ip: &IpAddr) -> ActionsView {
         (!standalone && vantages.is_empty())
             .then(|| "no live scanner announces a probe price".to_string())
     });
+    let scans = match state.store.ip_by_addr(&ip.to_string()).await {
+        Ok(Some(row)) => crate::admin::scan_buy::offers_for(state, row.id).await,
+        _ => vec![],
+    };
     ActionsView {
         guard_line,
         allowed: why_not.is_none(),
@@ -639,6 +645,7 @@ pub async fn actions_for(state: &AdminState, ip: &IpAddr) -> ActionsView {
         default,
         balance,
         standalone,
+        scans,
     }
 }
 
