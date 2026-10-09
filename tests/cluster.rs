@@ -3226,7 +3226,9 @@ async fn seqs_of(n: &Node, o: NodeId) -> Vec<i64> {
 }
 
 /// Sync rounds all of `nodes` run over a few quiet seconds. A loop that
-/// re-syncs without pause runs hundreds, even on a slow machine.
+/// re-syncs without pause runs hundreds, even on a slow machine. The rounds
+/// still settling what came just before (slow on a loaded machine) are
+/// left out: counting starts a second later.
 async fn quiet_rounds(nodes: &[&Node]) -> u64 {
     let total = || {
         nodes
@@ -3234,6 +3236,7 @@ async fn quiet_rounds(nodes: &[&Node]) -> u64 {
             .map(|n| n.sync_rounds.load(std::sync::atomic::Ordering::Relaxed))
             .sum::<u64>()
     };
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let before = total();
     tokio::time::sleep(Duration::from_secs(3)).await;
     total() - before
