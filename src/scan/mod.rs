@@ -1148,15 +1148,32 @@ async fn run_scan(
 impl Source {
     /// Replace this node's own global addresses and names in the scan's
     /// XML (`scan::scrub`), unless the target is one of them: that scan is
-    /// about this node.
+    /// about this node. The safety lock is held only to read the lists;
+    /// the pass over the XML (up to `MAX_RAW_XML`) runs on a blocking
+    /// thread, so other workers' preflights and the probe gate do not wait
+    /// for it.
     async fn scrub(&self, target: &IpAddr, res: &mut nmap_xml::ScanResult) {
-        let s = self.safety.lock().await;
-        if s.is_own(target) {
-            return;
+        let (addrs, names) = {
+            let s = self.safety.lock().await;
+            if s.is_own(target) {
+                return;
+            }
+            (s.own_global(), s.own_names())
+        };
+        let raw = std::mem::take(&mut res.raw_xml);
+        match tokio::task::spawn_blocking(move || scrub::scrub(&raw, &addrs, &names)).await {
+            Ok((xml, n)) => {
+                res.raw_xml = xml;
+                res.scrubbed = n;
+            }
+            // `scrub` does not panic; if it ever did, fail as loudly as the
+            // inline call would have.
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            // Cancelled, which happens only when the runtime shuts down
+            // before the task starts: the XML is left empty rather than
+            // unscrubbed.
+            Err(_) => {}
         }
-        let (xml, n) = scrub::scrub(&res.raw_xml, &s.own_global(), &s.own_names());
-        res.raw_xml = xml;
-        res.scrubbed = n;
     }
 }
 

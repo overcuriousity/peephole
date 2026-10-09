@@ -31,8 +31,13 @@ fn name_byte(b: u8) -> bool {
 
 /// `xml` with every own address (as nmap prints it: IPv4 dotted, IPv6
 /// compressed) and every own name (case-insensitively) replaced by
-/// [`MARK`] where the bytes before and after are not part of an address
-/// or a name (an IPv4 address may be followed by `:port`), and how many replacements were made (saturating).
+/// [`MARK`], and how many replacements were made (saturating). A match
+/// counts where the bytes around it cannot continue the token, and which
+/// bytes can depends on the kind: digits and `.` for IPv4 (so `:port` may
+/// follow), hex digits, `.` and `:` for IPv6, letters, digits, `.` and
+/// `-` for a name. A `.` right after the match ends it when the byte after
+/// that `.` cannot continue the token, so a root dot or a full stop
+/// (`at 87.123.41.5.`, `host.example.net.`) does not hide it.
 pub fn scrub(xml: &[u8], addrs: &[IpAddr], names: &[String]) -> (Vec<u8>, u16) {
     let mut out = xml.to_vec();
     let mut n: u32 = 0;
@@ -46,9 +51,20 @@ pub fn scrub(xml: &[u8], addrs: &[IpAddr], names: &[String]) -> (Vec<u8>, u16) {
     (out, n.min(u16::MAX as u32) as u16)
 }
 
+/// Whether a token ending before `buf[end]` ends there: nothing follows,
+/// a byte `part` rejects follows, or a `.` follows that is itself followed
+/// by nothing or by a byte `part` rejects.
+fn ends(buf: &[u8], end: usize, part: fn(u8) -> bool) -> bool {
+    match buf.get(end) {
+        None => true,
+        Some(b'.') => buf.get(end + 1).is_none_or(|&b| !part(b)),
+        Some(&b) => !part(b),
+    }
+}
+
 /// Replace each occurrence of `pat` in `buf` that is not surrounded by
-/// bytes `part` accepts; case-insensitively when `ci`. An empty pattern
-/// matches nothing.
+/// bytes `part` accepts (see [`ends`] for the byte after); case-insensitively
+/// when `ci`. An empty pattern matches nothing.
 fn replace(buf: &mut Vec<u8>, pat: &[u8], ci: bool, part: fn(u8) -> bool) -> u32 {
     if pat.is_empty() {
         return 0;
@@ -68,7 +84,7 @@ fn replace(buf: &mut Vec<u8>, pat: &[u8], ci: bool, part: fn(u8) -> bool) -> u32
                 }
             }
             && !(i > 0 && part(buf[i - 1]))
-            && !(end < buf.len() && part(buf[end]));
+            && ends(buf, end, part);
         if hit {
             out.extend_from_slice(MARK.as_bytes());
             n += 1;
@@ -92,6 +108,7 @@ pub struct Own {
 }
 
 impl Own {
+    /// Whether there is nothing to scrub: no address and no name known.
     pub fn is_empty(&self) -> bool {
         self.addrs.is_empty() && self.names.is_empty()
     }
@@ -166,6 +183,30 @@ mod tests {
         assert_eq!(
             out,
             "[scanner], mail.host.example.net, host.example.net-1, ([scanner])"
+        );
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn a_trailing_dot_ends_the_token() {
+        let (out, n) = run(
+            "at 87.123.41.5. and 87.123.41.56 and 87.123.41.5.7 and 2001:db8::1. end",
+            &["87.123.41.5", "2001:db8::1"],
+            &[],
+        );
+        assert_eq!(
+            out,
+            "at [scanner]. and 87.123.41.56 and 87.123.41.5.7 and [scanner]. end"
+        );
+        assert_eq!(n, 2);
+        let (out, n) = run(
+            "Hello host.example.net. mail.host.example.net host.example.net.org host.example.net.",
+            &[],
+            &["host.example.net"],
+        );
+        assert_eq!(
+            out,
+            "Hello [scanner]. mail.host.example.net host.example.net.org [scanner]."
         );
         assert_eq!(n, 2);
     }
