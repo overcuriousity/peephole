@@ -14,7 +14,8 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
 - Downloads the build for the machine (x86_64 or aarch64) and verifies its
   checksum. With the GitHub CLI (`gh`) installed it also verifies the build's
   provenance attestation (`PEEPHOLE_VERIFY=1` makes that required, `0` skips
-  it), and prints the commit the binary was built from.
+  it); without `gh` it warns that the provenance is not verified. It prints
+  the commit the binary was built from.
 - Installs the binary to `/usr/local/bin/peephole`; the signature rules are
   built into it.
 - On a first install, asks (an upgrade asks nothing), in this order:
@@ -78,7 +79,9 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
   unknown names untouched, with a PROXY protocol v2 header, to
   `trap_tls_listen`; no health checks on the TLS backend (a `LOCAL` header
   is refused). Hosts in `trusted_proxies` are believed about the client
-  address, so list only the proxy (a bare address means that one host).
+  address, so list only the proxy (a bare address means that one host). A
+  `/0` prefix is refused (by the installer and by peephole); a range wider
+  than an IPv4 `/8` or an IPv6 `/32` loads with a warning.
 
 **Cloud machines.** On AWS, Google Cloud, Azure, Alibaba Cloud and Oracle
 Cloud (recognised from the DMI data or the metadata service) the installer
@@ -248,7 +251,10 @@ existing config with the new binary, backs up the database
 waits for `/healthz` (or for systemd to report the service up). If the new
 version does not come up, it rolls back the binary, the unit and — when the
 new version changed its schema — the database, then checks the old version
-is running again.
+is running again. A node with a `[cluster]` section keeps its database (the
+older version reads the newer schema): the backup would rewind its signed
+log, and what it signed next would contradict what its peers already hold,
+which marks it forked. The installer names the backup it kept instead.
 
 0.1.0 starts the schema afresh: it refuses a database written by an earlier
 (pre-release) build, and says so in the journal. Stop peephole, move the
@@ -286,7 +292,9 @@ peephole db vacuum                                # shrink the database file (st
 ```
 
 Configuration lives in `/etc/peephole/config.toml`; restart after editing
-(`systemctl restart peephole`). The number of scan workers and the roles
+(`systemctl restart peephole`). A key peephole does not know (misspelled,
+or from a newer version) is ignored with a warning in the startup log and in
+`check-config`, which names it by its full path (`scan.never_scan_directory`). The number of scan workers and the roles
 are runtime settings, changed from **Admin → Scans** and **Admin → System**
 or `peephole settings` without a restart. The rest of the scan pace is
 fixed: a scan times out after 30 minutes (levels 4 and 5 after 2 hours), and an

@@ -35,7 +35,7 @@ pub struct Config {
     pub webauthn: Option<WebauthnConfig>,
     /// Optional: without credentials GeoIP enrichment is unavailable.
     pub maxmind: Option<MaxmindConfig>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "scan_section")]
     pub scan: ScanConfig,
     #[serde(default)]
     pub probe: ProbeConfig,
@@ -414,15 +414,42 @@ pub struct ScanConfig {
     pub own_addresses: Vec<std::net::IpAddr>,
     /// Optional per-level argv overrides. The target IP is appended as the
     /// final argument (there is no `{target}` placeholder).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "level_keys")]
     pub level_argv: std::collections::HashMap<u8, Vec<String>>,
     /// The nmap program, looked up in PATH unless it contains a slash.
     /// `PEEPHOLE_NMAP_PATH` in the environment overrides it; see [`ScanConfig::nmap`].
     #[serde(default = "default_nmap_path")]
     pub nmap_path: String,
-    /// Scan safety knobs (see [`ScanSafety`]); flattened into `[scan]`.
-    #[serde(flatten)]
+    /// Scan safety knobs (see [`ScanSafety`]): keys of `[scan]` too, read
+    /// from the same table by [`scan_section`]. (Not `#[serde(flatten)]`:
+    /// that hides misspelled keys from [`unknown_key_notes`].)
+    #[serde(skip)]
     pub safety: ScanSafety,
+}
+
+/// `[scan]`: [`ScanConfig`] and its [`ScanSafety`], both from one table.
+fn scan_section<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ScanConfig, D::Error> {
+    use serde::de::Error;
+    let table = toml::Table::deserialize(d)?;
+    let mut scan = ScanConfig::deserialize(table.clone()).map_err(D::Error::custom)?;
+    scan.safety = ScanSafety::deserialize(table).map_err(D::Error::custom)?;
+    Ok(scan)
+}
+
+/// `[scan.level_argv]`: TOML keys are strings, these are levels. (Read from
+/// a table, see [`scan_section`], a key no longer becomes a number by itself.)
+fn level_keys<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::HashMap<u8, Vec<String>>, D::Error> {
+    use serde::de::Error;
+    std::collections::HashMap::<String, Vec<String>>::deserialize(d)?
+        .into_iter()
+        .map(|(k, argv)| {
+            k.parse()
+                .map(|level| (level, argv))
+                .map_err(|_| D::Error::custom(format!("scan.level_argv: `{k}` is not a level")))
+        })
+        .collect()
 }
 
 /// `[scan]` keys that keep counter-scans away from bystanders and bound
@@ -531,6 +558,23 @@ impl ScanConfig {
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| self.nmap_path.clone())
     }
+
+    /// The first line of `nmap --version`, or why nmap cannot run: the one
+    /// check of whether this node can scan.
+    pub async fn nmap_version(&self) -> anyhow::Result<String> {
+        let nmap = self.nmap();
+        let out = tokio::process::Command::new(&nmap)
+            .arg("--version")
+            .output()
+            .await
+            .with_context(|| format!("nmap not found at {nmap} — install nmap"))?;
+        anyhow::ensure!(out.status.success(), "nmap --version failed");
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("nmap")
+            .to_string())
+    }
 }
 
 pub const MIN_RATE: u32 = 50;
@@ -590,6 +634,9 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("scan", "min_rate", "300"),
     ("scan", "level4_udp", "false"),
     ("scan", "never_scan", "[]"),
+    ("scan", "own_addresses", "[]"),
+    ("scan", "never_scan_dir", "none"),
+    ("scan", "trusted_origins", "none: any member"),
     ("scan", "single_request_max_level", "2"),
     ("scan", "prefix_max_scans", "4"),
     ("scan", "max_queued", "5000"),
@@ -664,6 +711,25 @@ impl Config {
         }
         notes
     }
+
+    /// `trusted_proxies` entries wider than an IPv4 /8 or an IPv6 /32:
+    /// allowed (validation refuses only /0), but every address in them is
+    /// believed about the client address.
+    pub fn trusted_proxy_notes(&self) -> Vec<String> {
+        self.trusted_proxies
+            .iter()
+            .filter(|p| match p {
+                IpNet::V4(n) => n.prefix_len() < 8,
+                IpNet::V6(n) => n.prefix_len() < 32,
+            })
+            .map(|p| {
+                format!(
+                    "warning: trusted_proxies `{p}` is a wide range: every address in it is \
+                     believed about the client address; list the proxy only"
+                )
+            })
+            .collect()
+    }
 }
 
 pub fn optional_key_notes(path: &Path) -> Vec<String> {
@@ -709,6 +775,62 @@ pub fn optional_key_notes(path: &Path) -> Vec<String> {
     notes
 }
 
+/// One warning per key the file sets that this build does not read, named
+/// by its full path (`scan.never_scan_directory`): a misspelled key leaves
+/// the default in force. Not an error, so a config written for a newer
+/// build still loads. Unparsable files yield none; `load` reports those.
+pub fn unknown_key_notes(path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return vec![];
+    };
+    unknown_keys(&text)
+        .into_iter()
+        .map(|k| format!("warning: unknown key `{k}` is ignored (misspelled?)"))
+        .collect()
+}
+
+fn unknown_keys(text: &str) -> Vec<String> {
+    let Ok(doc) = text.parse::<toml::Table>() else {
+        return vec![];
+    };
+    let mut keys = ignored_keys::<Config>(&doc);
+    // `[scan]` is read twice (see `scan_section`): a key is unknown when
+    // neither half reads it.
+    if let Some(toml::Value::Table(scan)) = doc.get("scan") {
+        let safety = ignored_keys::<ScanSafety>(scan);
+        keys.extend(
+            ignored_keys::<ScanConfig>(scan)
+                .into_iter()
+                .filter(|k| safety.contains(k))
+                .map(|k| format!("scan.{k}")),
+        );
+    }
+    keys
+}
+
+/// The paths of `table` that deserializing a `T` leaves unread.
+fn ignored_keys<T: serde::de::DeserializeOwned>(table: &toml::Table) -> Vec<String> {
+    fn dotted(p: &serde_ignored::Path) -> String {
+        use serde_ignored::Path;
+        let (parent, own) = match p {
+            Path::Root => return String::new(),
+            Path::Seq { parent, index } => (parent, index.to_string()),
+            Path::Map { parent, key } => (parent, key.clone()),
+            Path::Some { parent }
+            | Path::NewtypeStruct { parent }
+            | Path::NewtypeVariant { parent } => return dotted(parent),
+        };
+        match dotted(parent) {
+            p if p.is_empty() => own,
+            p => format!("{p}.{own}"),
+        }
+    }
+    let mut keys = vec![];
+    // Errors are `load`'s to report; the keys seen up to one still count.
+    let _ = serde_ignored::deserialize::<_, _, T>(table.clone(), |p| keys.push(dotted(&p)));
+    keys
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text =
@@ -735,6 +857,12 @@ impl Config {
         }
         if !(1..=200).contains(&p.recent_rows) {
             bail!("public.recent_rows must be between 1 and 200");
+        }
+        // A peer in trusted_proxies is believed about the client address
+        // (X-Forwarded-For, PROXY headers): with /0 any client could name
+        // any address, and have this node record and scan it.
+        if let Some(p) = self.trusted_proxies.iter().find(|p| p.prefix_len() == 0) {
+            bail!("trusted_proxies: `{p}` trusts every address; list the proxy only");
         }
         let r = self.roles;
         if !(r.listener || r.scanner || r.web) {
@@ -871,8 +999,10 @@ impl Config {
             if !(10..=86_400).contains(&c.lease_secs) {
                 bail!("cluster.lease_secs must be between 10 and 86400");
             }
-            if !c.takeover_hours.is_finite() || c.takeover_hours <= 0.0 {
-                bail!("cluster.takeover_hours must be a positive, finite number");
+            // Shorter, a member's jobs would move while its arbiter is merely
+            // slow (and be scanned twice); longer, a dead arbiter's jobs wait weeks.
+            if !(1.0..=720.0).contains(&c.takeover_hours) {
+                bail!("cluster.takeover_hours must be between 1 and 720");
             }
             for p in &c.peers {
                 crate::cluster::identity::NodeId::parse(&p.public_key)
@@ -1361,6 +1491,75 @@ data_dir = "/tmp"
         assert!(!notes.contains("scan.retention_days"), "{notes}");
     }
 
+    /// A misspelled key loads (it is warned about, not refused), and every
+    /// unknown key is named by its full path, those of `[scan]` included.
+    #[test]
+    fn unknown_keys_are_named_by_their_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        let text = format!(
+            "{BASE}bogus = 1\n[roles]\nlistener = false\nweb = false\n\
+             [scan]\nmax_workers = 3\nprefix_max_scans = 2\nnever_scan_directory = \"/x\"\n\
+             [public]\nshow_lables = true\n\
+             [cluster]\nnode_name = \"n\"\nlisten = \"0.0.0.0:7443\"\nlease_sec = 30\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.scan.max_workers, 3);
+        assert_eq!(cfg.scan.safety.prefix_max_scans, 2);
+        let peer = "[[cluster.peers]]\nname = \"p\"\npublic_key = \"k\"\naddress = \"p:1\"\n";
+        std::fs::write(&path, format!("{text}{peer}adress = \"x\"\n")).unwrap();
+        let notes = unknown_key_notes(&path);
+        let joined = notes.join("\n");
+        for key in [
+            "bogus",
+            "scan.never_scan_directory",
+            "public.show_lables",
+            "cluster.lease_sec",
+            "cluster.peers.0.adress",
+        ] {
+            assert!(
+                notes.iter().any(|n| n.contains(&format!("`{key}`"))),
+                "{key}: {joined}"
+            );
+        }
+        assert_eq!(notes.len(), 5, "{joined}");
+    }
+
+    /// The annotated example sets no key this build does not know.
+    #[test]
+    fn example_config_has_no_unknown_keys() {
+        let notes = unknown_key_notes(Path::new("deploy/config.example.toml"));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// A wrong type under `[scan]` still names the key.
+    #[test]
+    fn scan_type_errors_name_the_key() {
+        let e = with_scan("prefix_max_scans = \"x\"").unwrap_err();
+        assert!(format!("{e:#}").contains("prefix_max_scans"), "{e:#}");
+        let e = with_scan("max_workers = \"x\"").unwrap_err();
+        assert!(format!("{e:#}").contains("max_workers"), "{e:#}");
+    }
+
+    #[test]
+    fn scan_lists_and_the_never_scan_dir_are_among_the_optional_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, format!("{BASE}[scan]\nmax_workers = 2\n")).unwrap();
+        let notes = optional_key_notes(&path).join("\n");
+        for key in [
+            "scan.own_addresses",
+            "scan.never_scan_dir",
+            "scan.trusted_origins",
+        ] {
+            assert!(
+                notes.contains(&format!("`{key}` not set")),
+                "{key}: {notes}"
+            );
+        }
+    }
+
     #[test]
     fn own_addresses_must_be_host_addresses() {
         let scan = |list: &str| {
@@ -1375,6 +1574,29 @@ data_dir = "/tmp"
             assert!(e.to_string().contains("own_addresses"), "{e}");
         }
         assert!(scan("\"nat.example\"").is_err(), "addresses, not names");
+    }
+
+    /// A trusted proxy believes the client address a peer names: /0 would
+    /// let any client name anyone (and have the scanner scan it). A wide
+    /// range loads, with a warning.
+    #[test]
+    fn trusted_proxies_are_not_everyone() {
+        let proxies = |list: &str| {
+            parse(&format!(
+                "{BASE}trusted_proxies = [{list}]\n[roles]\nlistener = false\nweb = false\n"
+            ))
+        };
+        for bad in ["\"0.0.0.0/0\"", "\"::/0\"", "\"10.0.0.0/8\", \"::/0\""] {
+            let e = proxies(bad).unwrap_err();
+            assert!(e.to_string().contains("trusted_proxies"), "{e}");
+        }
+        let wide = proxies("\"10.0.0.0/7\", \"2001:db8::/31\", \"192.0.2.0/24\"").unwrap();
+        let notes = wide.trusted_proxy_notes().join("\n");
+        assert!(notes.contains("`10.0.0.0/7`"), "{notes}");
+        assert!(notes.contains("`2001:db8::/31`"), "{notes}");
+        assert!(!notes.contains("192.0.2.0/24"), "{notes}");
+        let narrow = proxies("\"10.0.0.0/8\", \"2001:db8::/32\"").unwrap();
+        assert!(narrow.trusted_proxy_notes().is_empty());
     }
 
     #[test]
@@ -1414,6 +1636,25 @@ data_dir = "/tmp"
         let c = cfg.cluster.unwrap();
         assert_eq!(c.takeover_hours, 2.0);
         assert_eq!(c.lease_secs, 120);
+    }
+
+    /// A takeover window of minutes would hand live arbiters' jobs to
+    /// others (scans run twice); one of ages would overflow.
+    #[test]
+    fn takeover_hours_are_bounded() {
+        let hours = |h: &str| {
+            parse(&format!(
+                "{BASE}[roles]\nlistener = false\nweb = false\n[cluster]\nnode_name = \"n\"\n\
+                 listen = \"0.0.0.0:7443\"\ntakeover_hours = {h}\n"
+            ))
+        };
+        for bad in ["0.0001", "0.5", "0", "-1", "nan", "inf", "721", "1e300"] {
+            let e = hours(bad).unwrap_err();
+            assert!(e.to_string().contains("takeover_hours"), "{bad}: {e}");
+        }
+        for good in ["1", "6", "720"] {
+            assert!(hours(good).is_ok(), "{good}");
+        }
     }
 
     /// What members would drop or refuse is refused here, and a name is

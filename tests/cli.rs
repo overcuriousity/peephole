@@ -104,6 +104,8 @@ data_dir = "{d}"
 [roles]
 scanner = false
 web = false
+[public]
+show_lables = false
 "#,
             d = dir.path().display()
         ),
@@ -122,6 +124,11 @@ web = false
     );
     assert!(stdout.contains("roles: listener"), "{stdout}");
     assert!(!stdout.contains("webauthn"), "{stdout}");
+    // A misspelled key is warned about, not refused.
+    assert!(
+        stdout.contains("warning: unknown key `public.show_lables`"),
+        "{stdout}"
+    );
 }
 
 #[test]

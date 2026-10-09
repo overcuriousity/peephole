@@ -7,7 +7,7 @@
 # Re-running upgrades an existing installation. Environment overrides:
 #   PEEPHOLE_VERSION   release tag to install (e.g. v0.1.0); default: the rolling "latest" build of master
 #   PEEPHOLE_VERIFY=1|0  1: require a verified GitHub build provenance attestation (needs the gh CLI);
-#                      0: skip it; unset: verify when gh is installed, warn if that fails
+#                      0: skip it; unset: verify when gh is installed, warn if that fails or gh is missing
 #   MAXMIND_ACCOUNT_ID, MAXMIND_LICENSE_KEY, PEEPHOLE_TRUSTED_PROXIES  (first install)
 #   PEEPHOLE_DOMAIN    the admin site's host name (first install); a scheme, a path and a
 #                      trailing dot are stripped, upper case is lowered
@@ -158,6 +158,17 @@ valid_cidr() {
     if [[ "$a" == *:* ]]; then [ "$p" -le 128 ]; else [ "$p" -le 32 ]; fi
 }
 
+# Why an entry of trusted_proxies is refused (nothing: it is fine). A /0
+# prefix would believe every client about its own address (peephole
+# refuses it too).
+proxy_problem() {
+    if ! valid_cidr "$1"; then
+        echo "is not an address or CIDR"
+    elif [[ "$1" == */* ]] && [ "$((10#${1##*/}))" -eq 0 ]; then
+        echo "trusts every address (a /0 prefix): any client could set its own address"
+    fi
+}
+
 # The admin domain as a bare lower-case host name, from what an operator
 # may paste (https://Name.Example/admin/, a trailing dot); fails on anything
 # that is no host name with at least one dot, on a label longer than 63
@@ -216,8 +227,9 @@ if [ "${1:-}" = "--check-dns" ]; then
     echo "$why" >&2; exit 1
 fi
 if [ "${1:-}" = "--check-cidr" ]; then
-    if valid_cidr "${2:-}"; then echo ok; exit 0; fi
-    echo "'${2:-}' is not an address or CIDR" >&2; exit 1
+    why="$(proxy_problem "${2:-}")"
+    if [ -z "$why" ]; then echo ok; exit 0; fi
+    echo "'${2:-}' ${why}" >&2; exit 1
 fi
 
 # Not loopback, private, CGNAT or link-local.
@@ -820,6 +832,10 @@ if [ "$verify" != 0 ]; then
         fi
     elif [ "$verify" = 1 ]; then
         die "PEEPHOLE_VERIFY=1 needs the GitHub CLI (gh) to verify the provenance attestation"
+    else
+        # The checksum comes from the same server as the tarball: it shows
+        # the download is intact, not who built it.
+        warn "the build provenance is not verified (the GitHub CLI, gh, is not installed); relying on the checksum from the same server. Install gh and set PEEPHOLE_VERIFY=1 to require it, or PEEPHOLE_VERIFY=0 to skip it."
     fi
 fi
 
@@ -1018,30 +1034,21 @@ if [ "$upgrade" -ne 1 ]; then
                         prompt PEEPHOLE_TRUSTED_PROXIES "Address(es) of that proxy, as seen from this machine"
                     fi
                     # A bare address is that one host.
-                    proxies=""; bad=""
+                    proxies=""; bad=""; why="is not an address or CIDR"
                     for a in $(printf '%s' "$PEEPHOLE_TRUSTED_PROXIES" | tr ',' ' '); do
-                        valid_cidr "$a" || { bad="$a"; break; }
+                        problem="$(proxy_problem "$a")"
+                        [ -z "$problem" ] || { bad="$a"; why="$problem"; break; }
                         if [[ "$a" != */* ]]; then
                             if [[ "$a" == *:* ]]; then a="${a}/128"; else a="${a}/32"; fi
                         fi
                         proxies="${proxies:+$proxies,}${a}"
                     done
-                    # A /0 prefix believes every client about its own address.
-                    if [ -z "$bad" ] && [[ ",${proxies}," == */0,* ]]; then
-                        if [ -n "$proxies_preset" ] || [ "$INTERACTIVE" -ne 1 ]; then
-                            warn "PEEPHOLE_TRUSTED_PROXIES: a /0 prefix trusts every address: any client can set its own address"
-                        else
-                            say $'A /0 prefix trusts every address: any client can set its own address.\n'
-                            PEEPHOLE_TRUSTED_PROXIES=""
-                            continue
-                        fi
-                    fi
                     [ -z "$bad" ] && [ -n "$proxies" ] && break
                     [ -n "$bad" ] || bad="$PEEPHOLE_TRUSTED_PROXIES"
                     if [ -n "$proxies_preset" ] || [ "$INTERACTIVE" -ne 1 ]; then
-                        die "PEEPHOLE_TRUSTED_PROXIES: '${bad}' is not an address or CIDR"
+                        die "PEEPHOLE_TRUSTED_PROXIES: '${bad}' ${why}"
                     fi
-                    say "'${bad}' is not an address or CIDR"$'\n'
+                    say "'${bad}' ${why}"$'\n'
                     PEEPHOLE_TRUSTED_PROXIES=""
                 done
                 PEEPHOLE_TRUSTED_PROXIES="$proxies" ;;
@@ -1524,7 +1531,10 @@ wait_healthy() {
 
 # Put back what this run changed: binary, unit and, if the new version
 # migrated it, the database. The rules of an older version stay in
-# ${CONFIG_DIR}/rules (never touched), so it finds them again.
+# ${CONFIG_DIR}/rules (never touched), so it finds them again. A cluster
+# node keeps its database: the backup would rewind its signed log, and the
+# entries it signs next would fork from those its peers hold (the older
+# version reads a newer schema all the same).
 rollback() {
     systemctl stop peephole || true
     mv -f "${INSTALL_BIN}.prev" "$INSTALL_BIN"
@@ -1534,9 +1544,13 @@ rollback() {
     fi
     if [ -e "${backup}/unit.sha256" ]; then cp -p "${backup}/unit.sha256" "$UNIT_MANIFEST"; else rm -f "$UNIT_MANIFEST"; fi
     if [ -n "$DB_BACKUP" ] && [ "$(schema_version "$DB_PATH")" != "$DB_SCHEMA" ]; then
-        warn "the new version changed the database schema; restoring ${DB_BACKUP} (requests recorded since the backup are lost)"
-        rm -f "${DB_PATH}-wal" "${DB_PATH}-shm"
-        install -m 0600 "$DB_BACKUP" "$DB_PATH"
+        if grep -q '^\[cluster\]' "$CONFIG_FILE"; then
+            warn "the new version changed the database schema; keeping it, since restoring would rewind this cluster node's log (the backup stays in ${DB_BACKUP})"
+        else
+            warn "the new version changed the database schema; restoring ${DB_BACKUP} (requests recorded since the backup are lost)"
+            rm -f "${DB_PATH}-wal" "${DB_PATH}-shm"
+            install -m 0600 "$DB_BACKUP" "$DB_PATH"
+        fi
     fi
 }
 

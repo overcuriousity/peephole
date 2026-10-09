@@ -86,7 +86,7 @@ grep -q 'points to 198.51.100.1 - not to this machine' /tmp/dns.err
 for c in 10.0.0.5 10.0.0.0/24 2001:db8::/64; do
     bash install.sh --check-cidr "$c" >/dev/null || { echo "CIDR '$c' refused"; exit 1; }
 done
-for c in 10.0.0.0/33 2001:db8::/129 10.0.0.0/x example; do
+for c in 10.0.0.0/33 2001:db8::/129 10.0.0.0/x example 0.0.0.0/0 ::/0 10.0.0.0/00; do
     if bash install.sh --check-cidr "$c" 2>/dev/null; then echo "CIDR '$c' accepted"; exit 1; fi
 done
 
@@ -136,6 +136,9 @@ echo "== fresh install"
 # A preset PEEPHOLE_TRUSTED_PROXIES no longer means remote: PEEPHOLE_FRONT says so.
 PEEPHOLE_FRONT=remote bash install.sh > /tmp/fresh.log 2>&1 || { cat /tmp/fresh.log; exit 1; }
 test -x /usr/local/bin/peephole
+# The local test release has no attestation: that is said, with or without gh.
+if command -v gh >/dev/null 2>&1; then expect="could not verify the provenance"; else expect="provenance is not verified"; fi
+grep -q "$expect" /tmp/fresh.log
 test -f /etc/peephole/config.toml
 # The signature rules are built into the binary: none on disk, none shipped.
 test ! -e /etc/peephole/rules
@@ -221,7 +224,7 @@ if grep -q 'no longer used' /tmp/unit.log; then echo "rules notice repeated"; ex
 test -d /etc/peephole/rules
 [ "$(find /var/lib/peephole -name 'backup-*.db' | wc -l)" = 2 ]
 
-echo "== a new version that does not start is rolled back: binary, unit and database"
+echo "== a new version that does not start is rolled back: binary and unit; a cluster node keeps its database"
 rm -f /etc/systemd/system/peephole.service.new
 cp -p /etc/systemd/system/peephole.service /tmp/unit.before
 echo '# broken release' >> "/tmp/$ASSET/deploy/peephole.service"
@@ -230,12 +233,26 @@ touch /tmp/fail-start
 if PEEPHOLE_FORCE=1 bash install.sh > /tmp/rollback.log 2>&1; then echo "expected failure"; cat /tmp/rollback.log; exit 1; fi
 grep -q 'rolled back' /tmp/rollback.log
 grep -q 'running again' /tmp/rollback.log
-grep -q 'restoring /var/lib/peephole/backup-' /tmp/rollback.log
+grep -q 'keeping it, since restoring would rewind' /tmp/rollback.log
+if grep -q 'restoring /var/lib/peephole/backup-' /tmp/rollback.log; then echo "cluster node's database restored"; exit 1; fi
 cmp /tmp/unit.before /etc/systemd/system/peephole.service
 test ! -e /etc/systemd/system/peephole.service.new
 test ! -e /usr/local/bin/peephole.prev
-[ "$(sqlite3 /var/lib/peephole/peephole.db 'PRAGMA user_version')" = 5 ]
+[ "$(sqlite3 /var/lib/peephole/peephole.db 'PRAGMA user_version')" = 999 ]
+kept="$(sed -n 's/.*the backup stays in \(\/var\/lib\/peephole\/backup-[^)]*\.db\)).*/\1/p' /tmp/rollback.log)"
+[ "$(sqlite3 "$kept" 'PRAGMA user_version')" = 5 ]
 /usr/local/bin/peephole --version
+
+echo "== a node without a [cluster] section gets its database back"
+cp -p /etc/peephole/config.toml /tmp/config.cluster
+sed -i '/^\[cluster\]/,$d' /etc/peephole/config.toml
+sqlite3 /var/lib/peephole/peephole.db 'PRAGMA user_version = 5'
+touch /tmp/fail-start
+if PEEPHOLE_FORCE=1 bash install.sh > /tmp/rollback.log 2>&1; then echo "expected failure"; cat /tmp/rollback.log; exit 1; fi
+grep -q 'running again' /tmp/rollback.log
+grep -q 'restoring /var/lib/peephole/backup-' /tmp/rollback.log
+[ "$(sqlite3 /var/lib/peephole/peephole.db 'PRAGMA user_version')" = 5 ]
+cp -p /tmp/config.cluster /etc/peephole/config.toml
 
 echo "== forced re-run with wizard variables set leaves config and nginx example alone"
 md5sum /etc/peephole/config.toml /etc/peephole/nginx.example.conf > /tmp/before.md5
@@ -631,6 +648,14 @@ if PEEPHOLE_FRONT=remote PEEPHOLE_ROLES=listener PEEPHOLE_TRUSTED_PROXIES=10.0.0
     echo "expected failure"; exit 1
 fi
 grep -q "'10.0.0.0/33' is not an address or CIDR" /tmp/remote-bad.log
+test ! -e /etc/peephole/config.toml
+test ! -e /usr/local/bin/peephole
+# A /0 prefix believes every client about its own address: refused, not warned about.
+if PEEPHOLE_FRONT=remote PEEPHOLE_ROLES=listener PEEPHOLE_TRUSTED_PROXIES=192.0.2.10,::/0 \
+    bash install.sh > /tmp/remote-zero.log 2>&1; then
+    echo "expected failure"; exit 1
+fi
+grep -q "'::/0' trusts every address" /tmp/remote-zero.log
 test ! -e /etc/peephole/config.toml
 test ! -e /usr/local/bin/peephole
 

@@ -68,33 +68,85 @@ impl Changes {
         self.web = other.web.or(self.web);
     }
 
+    /// Which key is which field: the one place that says so, in the order
+    /// of [`KEYS`].
+    fn fields(&mut self) -> [(&'static str, Field<'_>); 4] {
+        [
+            (pace::KEY_WORKERS, Field::Number(&mut self.max_workers)),
+            (KEY_ROLE_LISTENER, Field::Flag(&mut self.listener)),
+            (KEY_ROLE_SCANNER, Field::Flag(&mut self.scanner)),
+            (KEY_ROLE_WEB, Field::Flag(&mut self.web)),
+        ]
+    }
+
+    /// The fields this set gives, as `(key, value)` the way the CLI takes
+    /// them and the settings table stores them.
+    pub fn pairs(&self) -> Vec<(&'static str, String)> {
+        let mut c = self.clone();
+        c.fields()
+            .into_iter()
+            .filter_map(|(key, f)| f.value().map(|v| (key, v)))
+            .collect()
+    }
+
     /// One `key value` pair from the CLI.
     pub fn from_key_value(key: &str, value: &str) -> Result<Self, String> {
-        let num = || {
-            value
-                .trim()
-                .parse::<i64>()
-                .map_err(|_| format!("{key}: `{value}` is not a number"))
-        };
-        let flag = || match value.trim() {
-            "true" | "on" | "1" => Ok(true),
-            "false" | "off" | "0" => Ok(false),
-            _ => Err(format!("{key}: use true or false")),
-        };
         let mut c = Self::default();
-        match key {
-            pace::KEY_WORKERS => c.max_workers = Some(num()?.clamp(0, u32::MAX as i64) as u32),
-            KEY_ROLE_LISTENER => c.listener = Some(flag()?),
-            KEY_ROLE_SCANNER => c.scanner = Some(flag()?),
-            KEY_ROLE_WEB => c.web = Some(flag()?),
-            _ => {
-                return Err(format!(
-                    "`{key}` is not a runtime setting (one of: {})",
-                    KEYS.join(", ")
-                ));
+        let Some((_, field)) = c.fields().into_iter().find(|(k, _)| *k == key) else {
+            return Err(format!(
+                "`{key}` is not a runtime setting (one of: {})",
+                KEYS.join(", ")
+            ));
+        };
+        field.parse(key, value)?;
+        Ok(c)
+    }
+}
+
+/// Every setting of `s`, as a change (what `peephole settings show` lists).
+impl From<Snapshot> for Changes {
+    fn from(s: Snapshot) -> Self {
+        Self {
+            max_workers: Some(s.pace.max_workers as u32),
+            listener: Some(s.roles.listener),
+            scanner: Some(s.roles.scanner),
+            web: Some(s.roles.web),
+        }
+    }
+}
+
+/// A field of [`Changes`], by its type.
+enum Field<'a> {
+    Number(&'a mut Option<u32>),
+    Flag(&'a mut Option<bool>),
+}
+
+impl Field<'_> {
+    fn value(&self) -> Option<String> {
+        match self {
+            Field::Number(v) => v.map(|v| v.to_string()),
+            Field::Flag(v) => v.map(|v| v.to_string()),
+        }
+    }
+
+    fn parse(self, key: &str, value: &str) -> Result<(), String> {
+        match self {
+            Field::Number(v) => {
+                let n = value
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| format!("{key}: `{value}` is not a number"))?;
+                *v = Some(n.clamp(0, u32::MAX as i64) as u32);
+            }
+            Field::Flag(v) => {
+                *v = Some(match value.trim() {
+                    "true" | "on" | "1" => true,
+                    "false" | "off" | "0" => false,
+                    _ => return Err(format!("{key}: use true or false")),
+                });
             }
         }
-        Ok(c)
+        Ok(())
     }
 }
 
@@ -160,6 +212,9 @@ pub fn validate(current: Snapshot, c: &Changes, prereqs: &Prereqs) -> Result<Sna
     Ok(s)
 }
 
+/// Stored overrides left out, by key, with why.
+type Dropped = Vec<(&'static str, String)>;
+
 /// One remote settings change, as the owner sees it.
 #[derive(Debug, Clone)]
 pub struct AuditRow {
@@ -180,7 +235,7 @@ pub struct Settings {
     changed: tokio::sync::watch::Sender<u64>,
     /// Serializes writers in this process.
     lock: Arc<tokio::sync::Mutex<()>>,
-    /// A role override was ignored and said so (once, not every reload).
+    /// A stored override was ignored and said so (once, not every reload).
     warned_ignored: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -226,6 +281,11 @@ impl Settings {
         }
     }
 
+    /// The config file's values: what a reset goes back to.
+    pub fn defaults(&self) -> Snapshot {
+        self.defaults
+    }
+
     pub fn roles(&self) -> Roles {
         *self.roles.read().unwrap()
     }
@@ -239,13 +299,15 @@ impl Settings {
         self.changed.subscribe()
     }
 
-    /// The settings as the database has them: defaults plus overrides. The
-    /// overrides are judged together (switching one role off and another on
-    /// is fine as a whole); if the build would refuse them, the defaults
-    /// stand.
-    async fn stored(&self) -> Result<Snapshot> {
+    /// The settings as the database has them: defaults plus overrides, and
+    /// the overrides left out. The overrides are judged together (switching
+    /// one role off and another on is fine as a whole); one the build would
+    /// refuse is left out with why, the rest still count. Read on `conn`: a
+    /// writer passes its transaction, so it never waits for a second
+    /// connection while it holds the write lock.
+    async fn stored(&self, conn: &mut sqlx::SqliteConnection) -> Result<(Snapshot, Dropped)> {
         let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value FROM settings")
-            .fetch_all(&self.store.pool)
+            .fetch_all(&mut *conn)
             .await?;
         let mut s = self.defaults;
         let mut all = Changes::default();
@@ -263,26 +325,62 @@ impl Settings {
         if all.max_workers == Some(1) {
             all.max_workers = Some(pace::MIN_WORKERS as u32);
         }
+        let mut dropped = Dropped::new();
         // An override cannot switch on a role the config file no longer
         // has the sections for (its listener or `[webauthn]` removed since):
-        // starting it would fail or panic. Only that override is dropped.
-        // The rest are trusted like the TOML (nmap is checked by the scanner).
-        for (want, on, missing) in [
-            (&mut all.listener, s.roles.listener, &self.prereqs.listener),
-            (&mut all.web, s.roles.web, &self.prereqs.web),
+        // starting it would fail or panic. The rest are trusted like the
+        // TOML (nmap is checked by the scanner).
+        for (want, on, missing, key) in [
+            (
+                &mut all.listener,
+                s.roles.listener,
+                &self.prereqs.listener,
+                KEY_ROLE_LISTENER,
+            ),
+            (&mut all.web, s.roles.web, &self.prereqs.web, KEY_ROLE_WEB),
         ] {
-            if *want == Some(true) && !on && missing.is_some() {
-                // Reloaded every few seconds: say it once per process.
-                if !self.warned_ignored.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        why = missing.as_deref().unwrap_or_default(),
-                        "a stored role override is ignored (peephole settings reset to drop it)"
-                    );
-                }
+            if *want == Some(true)
+                && !on
+                && let Some(why) = missing
+            {
+                dropped.push((key, why.clone()));
                 *want = None;
             }
         }
-        Ok(validate(s, &all, &Prereqs::default()).unwrap_or(s))
+        let none = Prereqs::default();
+        let workers = Changes {
+            max_workers: all.max_workers,
+            ..Default::default()
+        };
+        if let Err(why) = validate(s, &workers, &none) {
+            dropped.push((pace::KEY_WORKERS, why));
+            all.max_workers = None;
+        }
+        // No role left on: the overrides switching one off go (the TOML has
+        // one on).
+        if let Err(why) = validate(s, &all, &none) {
+            for (want, key) in [
+                (&mut all.listener, KEY_ROLE_LISTENER),
+                (&mut all.scanner, KEY_ROLE_SCANNER),
+                (&mut all.web, KEY_ROLE_WEB),
+            ] {
+                if *want == Some(false) {
+                    dropped.push((key, why.clone()));
+                    *want = None;
+                }
+            }
+        }
+        // Reloaded every few seconds: say it once per process.
+        if !dropped.is_empty() && !self.warned_ignored.swap(true, Ordering::Relaxed) {
+            for (key, why) in &dropped {
+                tracing::warn!(
+                    key,
+                    why,
+                    "a stored runtime setting is ignored (`peephole settings reset {key}` drops it)"
+                );
+            }
+        }
+        Ok((validate(s, &all, &none).unwrap_or(s), dropped))
     }
 
     fn adopt(&self, s: Snapshot) {
@@ -298,7 +396,7 @@ impl Settings {
         // Under the writers' lock: a write committed and adopted between
         // the read and the adopt would otherwise be rolled back in memory.
         let _g = self.lock.lock().await;
-        let s = self.stored().await?;
+        let (s, _) = self.stored(&mut *self.store.pool.acquire().await?).await?;
         if s == self.snapshot() {
             return Ok(false);
         }
@@ -344,7 +442,7 @@ impl Settings {
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
         // Judge against the database, not this process's memory: the CLI or
         // another handle may have written since.
-        let current = self.stored().await?;
+        let (current, ignored) = self.stored(&mut tx).await?;
         if let Some(b) = base
             && b != current.version
         {
@@ -360,19 +458,23 @@ impl Settings {
         if c.is_empty() {
             return Ok(Ok(current.version));
         }
-        for (key, value) in [
-            (pace::KEY_WORKERS, c.max_workers.map(|v| v.to_string())),
-            (KEY_ROLE_LISTENER, c.listener.map(|v| v.to_string())),
-            (KEY_ROLE_SCANNER, c.scanner.map(|v| v.to_string())),
-            (KEY_ROLE_WEB, c.web.map(|v| v.to_string())),
-        ] {
-            if let Some(v) = value {
-                self.set(&mut tx, key, v).await?;
-            }
+        for (key, value) in c.pairs() {
+            self.set(&mut tx, key, value).await?;
         }
         next.version = current.version + 1;
         self.set(&mut tx, KEY_VERSION, next.version.to_string())
             .await?;
+        // The stored set must give what was judged: a stored override
+        // ignored so far must not apply again with it.
+        let (after, _) = self.stored(&mut tx).await?;
+        if after != next {
+            let back: Vec<&str> = ignored.iter().map(|(k, _)| *k).collect();
+            return Ok(Err(format!(
+                "a saved setting ignored so far would apply again with this change ({}); \
+                 `peephole settings reset KEY` drops it",
+                back.join(", ")
+            )));
+        }
         if let Some(by) = by {
             sqlx::query(
                 "INSERT INTO config_audit (at, by, changes) VALUES (datetime('now'), ?, ?)",
@@ -399,7 +501,8 @@ impl Settings {
         }
         let _g = self.lock.lock().await;
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let version = self.stored().await?.version + 1;
+        let (before, ignored) = self.stored(&mut tx).await?;
+        let version = before.version + 1;
         for k in KEYS {
             if key.is_none_or(|only| only == k) {
                 sqlx::query("DELETE FROM settings WHERE key = ?")
@@ -409,8 +512,15 @@ impl Settings {
             }
         }
         self.set(&mut tx, KEY_VERSION, version.to_string()).await?;
+        // The overrides kept must still be usable without the reset ones.
+        let (s, dropped) = self.stored(&mut tx).await?;
+        if let Some((k, why)) = dropped.iter().find(|d| !ignored.contains(d)) {
+            return Ok(Err(format!(
+                "resetting {} would leave {k} unusable ({why}); reset {k} too",
+                key.unwrap_or("all runtime settings")
+            )));
+        }
         tx.commit().await?;
-        let s = self.stored().await?;
         self.adopt(s);
         Ok(Ok(version))
     }
@@ -544,6 +654,25 @@ mod tests {
         assert!(Changes::default().is_empty());
     }
 
+    /// Every key maps to one field and back, the way the settings table
+    /// stores it; a snapshot lists every key with its value.
+    #[test]
+    fn every_key_is_one_field() {
+        for (key, value) in [
+            (pace::KEY_WORKERS, "3"),
+            (KEY_ROLE_LISTENER, "false"),
+            (KEY_ROLE_SCANNER, "true"),
+            (KEY_ROLE_WEB, "false"),
+        ] {
+            let c = Changes::from_key_value(key, value).unwrap();
+            assert_eq!(c.pairs(), [(key, value.to_string())]);
+        }
+        let all = Changes::from(snap((true, false, true)));
+        let keys: Vec<&str> = all.pairs().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, KEYS);
+        assert_eq!(all.pairs()[2], (KEY_ROLE_SCANNER, "false".to_string()));
+    }
+
     async fn open(extra: &str) -> (Settings, crate::store::Store, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::store::Store::connect(&dir.path().join("t.db"))
@@ -671,6 +800,109 @@ mod tests {
         assert!(end.roles.scanner);
         assert_eq!(end.pace.max_workers, 3);
         assert!(s.reset(Some("no.such.key")).await.unwrap().is_err());
+    }
+
+    async fn store_rows(store: &crate::store::Store, rows: &[(&str, &str)]) {
+        for (k, v) in rows {
+            sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
+                .bind(k)
+                .bind(v)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A stored override the build refuses is left out alone: the others
+    /// still count.
+    #[tokio::test]
+    async fn an_unusable_stored_override_drops_only_itself() {
+        let only_trap = "[roles]\nscanner = false\nweb = false\n";
+        let (s, store, _d) = open(only_trap).await;
+        // No role would be left on: the listener override goes, not the workers.
+        store_rows(
+            &store,
+            &[(KEY_ROLE_LISTENER, "false"), (pace::KEY_WORKERS, "3")],
+        )
+        .await;
+        assert!(s.reload().await.unwrap());
+        let now = s.snapshot();
+        assert!(now.roles.listener);
+        assert_eq!(now.pace.max_workers, 3);
+        // An out-of-range worker count goes; the role overrides stay.
+        let (s, store, _d) = open("").await;
+        store_rows(
+            &store,
+            &[(pace::KEY_WORKERS, "999"), (KEY_ROLE_WEB, "false")],
+        )
+        .await;
+        assert!(s.reload().await.unwrap());
+        let now = s.snapshot();
+        assert_eq!(now.pace.max_workers, 2);
+        assert!(!now.roles.web);
+    }
+
+    /// A reset that would leave the other overrides unusable is refused,
+    /// and so is a write that would bring back an override ignored so far.
+    #[tokio::test]
+    async fn resets_and_writes_keep_the_stored_overrides_usable() {
+        let only_trap = "[roles]\nscanner = false\nweb = false\n";
+        let (s, store, _d) = open(only_trap).await;
+        let swap = Changes {
+            listener: Some(false),
+            scanner: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(s.apply(&swap, None).await.unwrap(), Ok(1));
+        let e = s.reset(Some(KEY_ROLE_SCANNER)).await.unwrap().unwrap_err();
+        assert!(e.contains(KEY_ROLE_LISTENER), "{e}");
+        let again = Settings::load(&store, &cfg(only_trap), Prereqs::default())
+            .await
+            .unwrap()
+            .snapshot();
+        assert_eq!((again.roles.scanner, again.version), (true, 1));
+        assert_eq!(s.reset(None).await.unwrap(), Ok(2));
+        // An ignored `roles.listener = false` would apply again once the
+        // scanner is on: refused, nothing written.
+        store_rows(&store, &[(KEY_ROLE_LISTENER, "false")]).await;
+        s.reload().await.unwrap();
+        assert!(s.snapshot().roles.listener);
+        let on = Changes {
+            scanner: Some(true),
+            ..Default::default()
+        };
+        let e = s.apply(&on, None).await.unwrap().unwrap_err();
+        assert!(e.contains(KEY_ROLE_LISTENER), "{e}");
+        assert!(!s.snapshot().roles.scanner);
+        assert_eq!(s.snapshot().version, 2);
+    }
+
+    /// A write reads the settings in its own transaction: holding the write
+    /// lock, it never waits for a second connection the busy pool cannot
+    /// give (every other writer would wait behind it).
+    #[tokio::test]
+    async fn writes_need_one_connection_only() {
+        let (s, store, _d) = open("").await;
+        let mut held = vec![];
+        while held.len() + 1 < store.pool.options().get_max_connections() as usize {
+            held.push(store.pool.acquire().await.unwrap());
+        }
+        let c = Changes {
+            max_workers: Some(3),
+            ..Default::default()
+        };
+        let quick = std::time::Duration::from_secs(5);
+        let applied = tokio::time::timeout(quick, s.apply(&c, None)).await;
+        assert_eq!(
+            applied.expect("apply waited for a connection").unwrap(),
+            Ok(1)
+        );
+        let reset = tokio::time::timeout(quick, s.reset(None)).await;
+        assert_eq!(
+            reset.expect("reset waited for a connection").unwrap(),
+            Ok(2)
+        );
+        assert_eq!(s.snapshot().pace.max_workers, 2);
     }
 
     #[tokio::test]

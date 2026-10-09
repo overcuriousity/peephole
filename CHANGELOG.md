@@ -13,6 +13,21 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   1–4. Level 5 shares level 4's worker budget and two-hour timeout, and is
   granted only to cluster members of protocol 8 and up.
 
+### Changed
+
+- A config key peephole does not know (misspelled, or from a newer version)
+  is no longer ignored silently: the startup log and `check-config` warn
+  about it by its full path, e.g. `scan.never_scan_directory`. It still
+  loads. `check-config` also points out the optional `scan.own_addresses`,
+  `scan.never_scan_dir` and `scan.trusted_origins` when they are not set.
+- `trusted_proxies` refuses a `/0` prefix, which believed every client about
+  its own address (and let it have this node scan whom it named); the
+  installer refuses it too instead of warning. A range wider than an IPv4
+  `/8` or an IPv6 `/32` loads with a warning.
+- `cluster.takeover_hours` must be between 1 and 720: a window of minutes
+  handed jobs of arbiters that were merely slow to others, which scanned
+  them twice.
+
 ### Fixed
 
 - Admin: a security key deleted while a sign-in with it was under way
@@ -57,6 +72,29 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Cluster: a sync long-poll listing more than 10000 origins is refused,
   and the rest are looked up in constant time on each change while it is
   held open, instead of searched through.
+- A failed upgrade no longer restores the database of a node with a
+  `[cluster]` section: the backup rewound the node's signed log, and the
+  entries it signed next forked from its peers' copies, which marked it
+  forked for good. The installer keeps the migrated database (the older
+  version reads it) and says where the backup is.
+- A runtime settings change read the stored settings on a second database
+  connection while it held the write lock; with the pool busy it waited for
+  one while blocking every writer, the trap's included. It reads within its
+  own transaction now.
+- One unusable saved runtime setting no longer discards all the others
+  (e.g. after `peephole settings reset roles.scanner` left
+  `roles.listener = false` with no role on, the saved `scan.max_workers`
+  was dropped too, without a word): only that setting is ignored, with a
+  warning. `peephole settings reset` refuses a reset that would leave
+  another saved setting unusable, and a change that would bring back one
+  ignored so far.
+- A background task that panicked (the public-page publisher, the intel
+  scheduler, enrichment, the cluster's loops, …) stopped silently while the
+  node went on reporting healthy. Such a panic now stops peephole with an
+  error, and systemd starts it again.
+- The installer warns when it cannot verify the build provenance because
+  the GitHub CLI is missing, instead of relying on the checksum (from the
+  same server) without a word, and says how to require or skip the check.
 
 ## [0.10.0] - 2026-10-09
 
