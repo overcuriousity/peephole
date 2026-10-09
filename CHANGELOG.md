@@ -13,6 +13,14 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   1–4. Level 5 shares level 4's worker budget and two-hour timeout, and is
   granted only to cluster members of protocol 8 and up.
 
+### Fixed
+
+- Admin: a security key deleted while a sign-in with it was under way
+  (up to ten minutes) could still finish that sign-in and get a full
+  session. Deleting a key now ends every open sign-in, a session starts
+  only while its key is enrolled, and a session whose key is gone is
+  no longer honoured.
+
 ## [0.10.0] - 2026-10-09
 
 ### Breaking

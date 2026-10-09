@@ -401,9 +401,15 @@ async fn enroll_finish(
                 .create_session_for(Some(passkey.cred_id()), old.as_deref())
                 .await
             {
-                Ok(token) => (
+                Ok(Some(token)) => (
                     clear_ceremony(cfg, jar.add(session_cookie(cfg, token))),
                     StatusCode::OK,
+                )
+                    .into_response(),
+                Ok(None) => (
+                    StatusCode::FORBIDDEN,
+                    clear_ceremony(cfg, jar),
+                    "the key was deleted meanwhile",
                 )
                     .into_response(),
                 Err(e) => {
@@ -536,7 +542,8 @@ async fn login_finish(
                 }
             }
             // The session belongs to the key used (deleting the key ends
-            // it); a session the browser held before ends now.
+            // it; a key deleted since this sign-in started gets none); a
+            // session the browser held before ends now.
             let old = session_token(&state, &jar);
             let used: &[u8] = result.cred_id();
             match state
@@ -544,11 +551,20 @@ async fn login_finish(
                 .create_session_for(Some(used), old.as_deref())
                 .await
             {
-                Ok(token) => (
+                Ok(Some(token)) => (
                     clear_ceremony(cfg, jar.add(session_cookie(cfg, token))),
                     StatusCode::OK,
                 )
                     .into_response(),
+                Ok(None) => {
+                    tracing::info!("passkey sign-in with a deleted key rejected");
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        clear_ceremony(cfg, jar),
+                        "authentication failed",
+                    )
+                        .into_response()
+                }
                 Err(e) => {
                     tracing::warn!(?e, "could not create session");
                     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -609,11 +625,12 @@ async fn login_password(
     // A session the browser held before ends now.
     let old = session_token(&state, &jar);
     match state.store.create_session_for(None, old.as_deref()).await {
-        Ok(token) => (
+        Ok(Some(token)) => (
             jar.add(session_cookie(&state.cfg, token)),
             Redirect::to("/admin"),
         )
             .into_response(),
+        Ok(None) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
         Err(e) => {
             tracing::warn!(?e, "could not create session");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
