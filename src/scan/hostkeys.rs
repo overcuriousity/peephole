@@ -139,6 +139,7 @@ pub fn ptr_names(xml: &[u8]) -> Vec<String> {
 /// root first. Unparsable input ends the walk: what was found before the
 /// error has been reported. The XML comes from nmap, but the values in it
 /// from the scanned source.
+#[allow(clippy::type_complexity)]
 pub(crate) fn walk_scripts(
     xml: &[u8],
     wanted: &[&str],

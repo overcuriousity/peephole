@@ -1,5 +1,6 @@
 pub mod arbiter;
 pub mod crawler;
+pub mod facts;
 pub mod guard;
 pub mod handout;
 pub mod hostkeys;
