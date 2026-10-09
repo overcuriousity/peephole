@@ -555,26 +555,31 @@ async fn guard_line(state: &AdminState, ip: &IpAddr) -> Result<String, String> {
             Prober::new(&cfg, Some(n.id()))
         }),
     };
-    let target = prober.check(&state.store, node, ip).await?;
-    let when = async {
+    prober.check(&state.store, node, ip).await?;
+    let found = async {
         let row = state.store.ip_by_addr(&ip.to_string()).await.ok()??;
         let scans = state.store.scans_for_ip(row.id).await.ok()?;
-        scans
+        let scan = scans
             .into_iter()
-            .find(|s| s.finished_at.is_some() && s.audit_of.is_none())?
-            .finished_at
+            .find(|s| s.finished_at.is_some() && s.audit_of.is_none())?;
+        let ports = state.store.ports_for_scan(scan.id).await.ok()?;
+        let n = ports
+            .iter()
+            .filter(|p| p.state == "open" && p.proto == "tcp")
+            .count();
+        Some((n, scan.finished_at.unwrap_or_default()))
     }
-    .await
-    .unwrap_or_default();
-    let n = target.ports.len();
-    let level = match prober.allowed_level(&state.store, ip).await {
-        Some(l) => format!("level {l}"),
-        None => "a probe".to_string(),
-    };
-    Ok(format!(
-        "Counter-scan found {n} open port{} ({when}) · evidence allows {level}",
-        if n == 1 { "" } else { "s" }
-    ))
+    .await;
+    Ok(match found {
+        Some((n, when)) if n > 0 => format!(
+            "Counter-scan found {n} open port{} ({when})",
+            if n == 1 { "" } else { "s" }
+        ),
+        _ => format!(
+            "No open port known here; probing the {} well-known ports",
+            crate::scan::probe::WELL_KNOWN_PORTS.len()
+        ),
+    })
 }
 
 /// The balance in credits (the fleet's, when this node has an owner).
@@ -1040,7 +1045,7 @@ fn events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::probe::gate::tests::{requests, scanned};
+    use crate::scan::probe::gate::tests::scanned;
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -1064,7 +1069,10 @@ mod tests {
 
     /// A standalone admin with a prober aimed at `connect`; `IP` holds
     /// three level-2 requests, and `scan` adds a finished scan of `port`.
-    async fn state(scan: Option<u16>) -> (Arc<AdminState>, String, i64, tempfile::TempDir) {
+    async fn state(
+        scan: Option<u16>,
+        extra: &str,
+    ) -> (Arc<AdminState>, String, i64, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cfg: crate::config::Config = toml::from_str(&format!(
             r#"
@@ -1077,6 +1085,7 @@ scanner = false
 [scan]
 tor_unknown = "scan"
 verify_crawlers = false
+{extra}
 [webauthn]
 rp_id = "localhost"
 origin = "https://localhost"
@@ -1084,14 +1093,14 @@ rp_name = "t"
 secure_cookies = false
 "#,
             db = dir.path().join("t.db").display(),
-            d = dir.path().display()
+            d = dir.path().display(),
+            extra = extra
         ))
         .unwrap();
         let store = crate::store::Store::connect(&cfg.database_path)
             .await
             .unwrap();
         let ip = store.upsert_ip(IP.parse().unwrap()).await.unwrap();
-        requests(&store, ip.id, 3, 2).await;
         if let Some(port) = scan {
             scanned(&store, IP, &[(port, "open", Some("http"))]).await;
         }
@@ -1213,7 +1222,7 @@ secure_cookies = false
     #[tokio::test]
     async fn the_diff_and_a_contradicted_claim_render() {
         use askama::Template;
-        let (state, _c, _id, _d) = state(Some(8080)).await;
+        let (state, _c, _id, _d) = state(Some(8080), "").await;
         let row = state.store.ip_by_addr(IP).await.unwrap().unwrap();
         let mut t = crate::admin::target::load(&state, &row, true, 1, true)
             .await
@@ -1258,7 +1267,7 @@ secure_cookies = false
     async fn the_stream_sends_the_states_again_when_a_result_arrives() {
         use futures::StreamExt;
         let server = web().await;
-        let (state, cookie, id, _d) = state(Some(server.port())).await;
+        let (state, cookie, id, _d) = state(Some(server.port()), "").await;
         state.pending_probes.lock().unwrap().insert(
             "g1".into(),
             vec![Pending {
@@ -1321,23 +1330,34 @@ secure_cookies = false
 
     #[tokio::test]
     async fn the_actions_card_explains_why_a_probe_is_unavailable() {
-        let (state, _c, _id, _d) = state(None).await;
+        let (state, _c, _id, _d) = state(None, "never_scan = [\"203.0.113.40/32\"]").await;
         let a = actions_for(&state, &IP.parse().unwrap()).await;
         assert!(!a.allowed);
         let why = a.why_not.unwrap();
-        assert!(why.contains("no finished counter-scan"), "{why}");
+        assert!(why.contains("never_scan"), "{why}");
         assert!(a.guard_line.contains(&why));
     }
 
     #[tokio::test]
+    async fn the_actions_card_announces_the_well_known_fallback() {
+        let (state, _c, _id, _d) = state(None, "").await;
+        let a = actions_for(&state, &IP.parse().unwrap()).await;
+        assert!(a.allowed, "{:?}", a.why_not);
+        assert_eq!(
+            a.guard_line,
+            "No open port known here; probing the 5 well-known ports"
+        );
+    }
+
+    #[tokio::test]
     async fn the_actions_card_offers_the_local_probe_standalone() {
-        let (state, _c, _id, _d) = state(Some(8080)).await;
+        let (state, _c, _id, _d) = state(Some(8080), "").await;
         let a = actions_for(&state, &IP.parse().unwrap()).await;
         assert!(a.allowed, "{:?}", a.why_not);
         assert!(a.standalone && a.vantages.is_empty());
         assert!(
             a.guard_line.starts_with("Counter-scan found 1 open port (")
-                && a.guard_line.ends_with("evidence allows level 2"),
+                && !a.guard_line.contains("evidence"),
             "{}",
             a.guard_line
         );
@@ -1346,7 +1366,7 @@ secure_cookies = false
     #[tokio::test]
     async fn requesting_a_probe_standalone_redirects_and_a_result_appears() {
         let server = web().await;
-        let (state, cookie, _id, _d) = state(Some(server.port())).await;
+        let (state, cookie, _id, _d) = state(Some(server.port()), "").await;
         let app = crate::admin::full_router(state);
         let (status, headers, _) = send(
             &app,
@@ -1378,7 +1398,7 @@ secure_cookies = false
 
     #[tokio::test]
     async fn the_public_ip_page_shows_neither_card() {
-        let (state, cookie, id, _d) = state(Some(8080)).await;
+        let (state, cookie, id, _d) = state(Some(8080), "").await;
         state.pending_probes.lock().unwrap().insert(
             "g1".into(),
             vec![Pending {
@@ -1391,6 +1411,20 @@ secure_cookies = false
                 outcome: Some(Ok(String::new())),
             }],
         );
+        // The public IP page exists once the address has a request.
+        state
+            .store
+            .local()
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: id,
+                method: "GET".into(),
+                path: "/x".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen, agreed)
              VALUES (?, 'names-test.example', 'dns', '2026-01-01 00:00:00',
@@ -1421,7 +1455,7 @@ secure_cookies = false
 
     #[tokio::test]
     async fn an_accepted_probe_without_a_result_lapses() {
-        let (state, _c, id, _d) = state(Some(8080)).await;
+        let (state, _c, id, _d) = state(Some(8080), "").await;
         state.pending_probes.lock().unwrap().insert(
             "g1".into(),
             vec![Pending {

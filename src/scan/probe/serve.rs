@@ -153,11 +153,6 @@ impl Prober {
         self.gate.check(store, node, ip).await
     }
 
-    /// The counter-scan level the evidence held here allows for `ip`.
-    pub async fn allowed_level(&self, store: &Store, ip: &IpAddr) -> Option<u8> {
-        self.gate.allowed_level(store, ip).await
-    }
-
     /// What a probe costs here now: `table`'s probe price, or the floor
     /// before the first refresh. Read by the heartbeat and by `serve`, so
     /// the announced price and the price an offer is checked against are
@@ -370,7 +365,7 @@ impl Prober {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::probe::gate::tests::{config_with, requests, scanned};
+    use crate::scan::probe::gate::tests::{config_with, scanned};
 
     async fn web() -> std::net::SocketAddr {
         let app = axum::Router::new().route(
@@ -390,7 +385,6 @@ mod tests {
         let server = web().await;
         let addr: IpAddr = "203.0.113.30".parse().unwrap();
         let ip = store.upsert_ip(addr).await.unwrap();
-        requests(&store, ip.id, 3, 2).await;
         scanned(&store, &ip.ip, &[(server.port(), "open", Some("http"))]).await;
         let prober =
             Arc::new(Prober::new(&config_with(dir.path(), ""), None).connecting_to(server.ip()));
@@ -472,7 +466,6 @@ mod tests {
         let server = web().await;
         let addr: IpAddr = "203.0.113.33".parse().unwrap();
         let ip = store.upsert_ip(addr).await.unwrap();
-        requests(&store, ip.id, 3, 2).await;
         scanned(&store, &ip.ip, &[(server.port(), "open", Some("http"))]).await;
         let prober = Arc::new(
             Prober::new(&config_with(dir.path(), ""), Some(node.id())).connecting_to(server.ip()),
@@ -513,7 +506,6 @@ mod tests {
         let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
         let addr: IpAddr = "203.0.113.32".parse().unwrap();
         let ip = store.upsert_ip(addr).await.unwrap();
-        requests(&store, ip.id, 3, 2).await;
         scanned(&store, &ip.ip, &[(8080, "open", Some("http"))]).await;
         let prober = Arc::new(Prober::new(&config_with(dir.path(), ""), None));
         let first = prober.admit(&store, None, &addr).await.unwrap();
@@ -531,10 +523,12 @@ mod tests {
         let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
         let addr: IpAddr = "203.0.113.31".parse().unwrap();
         let ip = store.upsert_ip(addr).await.unwrap();
-        requests(&store, ip.id, 3, 2).await;
-        let prober = Arc::new(Prober::new(&config_with(dir.path(), ""), None));
+        let prober = Arc::new(Prober::new(
+            &config_with(dir.path(), "never_scan = [\"203.0.113.31/32\"]"),
+            None,
+        ));
         let err = prober.run_local(&store, addr, "g1").await.unwrap_err();
-        assert!(err.contains("no finished counter-scan"), "{err}");
+        assert!(err.contains("never_scan"), "{err}");
         assert!(store.probes_for_ip(ip.id).await.unwrap().is_empty());
     }
 }

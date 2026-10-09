@@ -37,6 +37,16 @@ pub const MAX_FAVICON: usize = 100 * 1024;
 /// HTTP redirect hops fetched, the first request included.
 pub const MAX_REDIRECTS: usize = 5;
 
+/// The ports a probe reads when no counter-scan found any open: the
+/// well-known ones, each with the service name `protocol_for` expects.
+pub const WELL_KNOWN_PORTS: [(u16, &str); 5] = [
+    (22, "ssh"),
+    (80, "http"),
+    (443, "https"),
+    (8080, "http"),
+    (8443, "https"),
+];
+
 /// Largest banner kept.
 const MAX_BANNER: usize = 1024;
 /// Silence that ends a banner.
