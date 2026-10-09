@@ -148,11 +148,10 @@ pub(crate) const NOT_REPLICATED: &str = "job not replicated here yet";
 pub(crate) const TOR_UNKNOWN: &str = "Tor exit status unknown (no exit list loaded)";
 
 /// What a scanner knows of an arbiter with queued work, for [`can_pay`].
+#[derive(Clone, Copy)]
 struct Payer {
     /// This node itself: its own jobs pay from its own scan budget.
     own: bool,
-    /// Granted unpaid after announcing it could pay (`DEMOTE_FOR`).
-    demoted: bool,
     /// It sells and buys scans at scanner prices (`pay::sells_scans`).
     sells_scans: bool,
     /// `(scan_queued, scan_budget_mc)` as its heartbeat announces them.
@@ -171,7 +170,7 @@ fn can_pay(sell: Option<u32>, own_left: u64, a: &Payer) -> bool {
     if a.own {
         return own_left >= price;
     }
-    if a.demoted || !a.sells_scans {
+    if !a.sells_scans {
         return false;
     }
     match (a.announced, a.balance) {
@@ -180,12 +179,6 @@ fn can_pay(sell: Option<u32>, own_left: u64, a: &Payer) -> bool {
         }
         _ => false,
     }
-}
-
-/// Whether a grant from another arbiter that was asked as paying, but
-/// came unfunded, demotes it for [`DEMOTE_FOR`].
-fn demotes(own: bool, funded: bool, asked_as_paying: bool) -> bool {
-    !own && !funded && asked_as_paying
 }
 
 /// `arbiters` (in urgency order) with those that can pay this scanner's
@@ -302,9 +295,6 @@ enum Outcome {
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
 /// Skip an arbiter that did not answer for this long.
 const ARBITER_BACKOFF: Duration = Duration::from_secs(30);
-/// An arbiter that announced it could pay but granted unpaid is asked with
-/// the others for this long.
-const DEMOTE_FOR: Duration = Duration::from_secs(3600);
 /// Standalone: a deferred job is looked at again after this long.
 const DEFER_RETRY: Duration = Duration::from_secs(60);
 /// `scan.tor_unknown = "scan"`: how often that is warned about.
@@ -330,8 +320,6 @@ struct Source {
     deferred: std::sync::Mutex<HashMap<i64, Instant>>,
     tor_warned: std::sync::Mutex<Option<Instant>>,
     unreachable: std::sync::Mutex<HashMap<NodeId, Instant>>,
-    /// Arbiters asked as able to pay that granted unpaid: asked with the others until then.
-    demoted: std::sync::Mutex<HashMap<NodeId, Instant>>,
     /// Granted jobs this scanner runs now: IP (canonical) and level. Known
     /// before the job's state replicates anywhere.
     active: std::sync::Mutex<HashMap<IpAddr, u8>>,
@@ -367,7 +355,6 @@ impl Source {
             deferred: Default::default(),
             tor_warned: Default::default(),
             unreachable: Default::default(),
-            demoted: Default::default(),
             active: Default::default(),
             order: order::Cached::new(),
             audits: tokio::sync::Mutex::new(crate::credits::audit::Picker::new(
@@ -612,16 +599,10 @@ impl Source {
             }
             _ => 0,
         };
-        let demoted: HashSet<NodeId> = {
-            let mut d = self.demoted.lock().unwrap();
-            d.retain(|_, until| *until > Instant::now());
-            d.keys().copied().collect()
-        };
         let members = node.members();
         let can_pay = |a: &NodeId| -> bool {
             let payer = Payer {
                 own: *a == me,
-                demoted: demoted.contains(a),
                 sells_scans: members
                     .get(a)
                     .is_some_and(|m| crate::credits::pay::sells_scans(m.proto_max)),
@@ -633,8 +614,6 @@ impl Source {
             };
             can_pay(sell, own_left, &payer)
         };
-        let asked_as_paying: HashSet<NodeId> =
-            arbiters.iter().filter(|a| can_pay(a)).copied().collect();
         let arbiters = can_pay_first(arbiters, can_pay);
         let min_mc = sell.map_or(0, crate::credits::price::min_take);
         for arbiter in arbiters {
@@ -674,18 +653,6 @@ impl Source {
                 }
             };
             let Some(g) = grant else { continue };
-            if demotes(
-                arbiter == me,
-                g.offer_seq.is_some(),
-                asked_as_paying.contains(&arbiter),
-            ) {
-                // Announced it could pay, then granted unpaid (or offered
-                // under our least): asked with the others for an hour.
-                self.demoted
-                    .lock()
-                    .unwrap()
-                    .insert(arbiter, Instant::now() + DEMOTE_FOR);
-            }
             if over_share(g.level, exclude) {
                 info!(job = %g.job_uid, target = %g.ip, "scan grant turned down: at the level-4 share");
                 let (node, uid, offer) = (node.clone(), g.job_uid, g.offer_seq);
@@ -2431,7 +2398,6 @@ license_key = "k"
     fn an_arbiter_can_pay_from_its_budget_and_balance_or_its_own_budget() {
         let other = Payer {
             own: false,
-            demoted: false,
             sells_scans: true,
             announced: Some((3, 500)),
             balance: Some(800),
@@ -2451,10 +2417,6 @@ license_key = "k"
                 ..other
             }, // nothing queued
             Payer {
-                demoted: true,
-                ..other
-            },
-            Payer {
                 sells_scans: false,
                 ..other
             },
@@ -2473,7 +2435,6 @@ license_key = "k"
         // This node's own jobs: its own scan budget left, nothing else.
         let own = Payer {
             own: true,
-            demoted: false,
             sells_scans: false,
             announced: None,
             balance: None,
@@ -2483,11 +2444,19 @@ license_key = "k"
     }
 
     #[test]
-    fn an_arbiter_asked_as_paying_that_grants_unpaid_is_demoted() {
-        assert!(demotes(false, false, true));
-        assert!(!demotes(false, true, true), "funded");
-        assert!(!demotes(false, false, false), "not asked as paying");
-        assert!(!demotes(true, false, true), "this node's own jobs");
+    fn an_arbiter_can_pay_a_zero_price_from_nothing() {
+        let other = Payer {
+            own: false,
+            sells_scans: true,
+            announced: Some((1, 0)),
+            balance: Some(0),
+        };
+        assert!(can_pay(Some(0), 0, &other));
+        let idle = Payer {
+            announced: Some((0, 0)),
+            ..other
+        };
+        assert!(!can_pay(Some(0), 0, &idle), "nothing queued");
     }
 
     #[test]

@@ -130,7 +130,7 @@ pub struct CreditsConfig {
     #[serde(default = "default_audit_share")]
     pub audit_share: f64,
     /// Share of this node's credits its own scan jobs may hold or pay for
-    /// in a day (0 to 1; 0: its jobs are granted unfunded).
+    /// in a day (0 to 1; 0: only scanners priced at 0 take its jobs).
     #[serde(default = "default_scan_share")]
     pub scan_share: f64,
 }

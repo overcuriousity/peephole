@@ -48,8 +48,9 @@ pub struct Grant {
     pub ip: String,
     pub level: i64,
     pub lease_secs: u64,
-    /// The arbiter's offer that funds this job (`credits::jobs`). Unfunded
-    /// grants encode exactly like those of nodes that predate the market.
+    /// The arbiter's offer that funds this job (`credits::jobs`). A grant
+    /// at 0 has none and encodes exactly like those of nodes that predate
+    /// the market.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offer_seq: Option<u64>,
     /// What the scanner charges for delivering the result.

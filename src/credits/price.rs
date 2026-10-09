@@ -27,7 +27,7 @@ pub const PRICE_TOLERANCE: f64 = 1.25;
 
 /// What an arbiter offers a scanner: what it announces, at most
 /// [`PRICE_TOLERANCE`] times this node's own copy. None: not a scanner,
-/// or no copy here yet; the job is granted unpaid.
+/// or no copy here yet; the price cannot be capped.
 pub fn offer_price(announced: Option<u32>, reference: Option<u32>) -> Option<u32> {
     let cap = (reference? as f64 * PRICE_TOLERANCE).floor() as u32;
     Some(announced?.min(cap))
@@ -1167,7 +1167,7 @@ mod tests {
         assert_eq!(
             offer_price(Some(100), None),
             None,
-            "no reference yet: unpaid"
+            "no reference yet: not capped"
         );
         assert_eq!(min_take(125), 100);
         assert_eq!(min_take(1), 0);

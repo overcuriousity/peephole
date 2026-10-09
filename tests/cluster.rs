@@ -4965,6 +4965,71 @@ async fn a_funded_scan_job_pays_the_scanner_its_price() {
     }
 }
 
+/// A scanner priced at 0 is granted the job without an offer; once its
+/// price has risen, the next job is funded with one.
+#[tokio::test]
+async fn a_job_is_granted_at_zero_and_funded_once_the_price_rises() {
+    use peephole::credits::{self, entries, ledger::OfferState, price};
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a],
+        Opts {
+            scanner: Some(fake_nmap_args(tools.path())),
+            ..DEFAULT
+        },
+    )
+    .await;
+    grant_scans(&[&na, &nb], a.id, 8).await;
+    market_known(&na, b.id).await;
+    market_known(&nb, a.id).await;
+    na.node.set_scan_share(0.5);
+    let key = format!("price:scan:{}", b.id);
+    for n in [&na, &nb] {
+        n.store.intel_set(&key, "0").await.unwrap();
+        price::refresh(&n.node).await.unwrap();
+    }
+    eventually("a hears b's price of 0", || async {
+        na.node.status.known(&b.id).and_then(|k| k.hb.scan_price_mc) == Some(0)
+    })
+    .await;
+    enqueue(&na, "198.51.100.43", 2).await;
+    eventually_for(Duration::from_secs(40), "scanned at zero", || async {
+        count(&na, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 1
+    })
+    .await;
+    assert!(
+        entries::since(&na.store.pool, 0).await.unwrap().is_empty(),
+        "no offer"
+    );
+    // The price rises: the next job is funded. (A refreshed table steps
+    // from its own copy, so the kept one is loaded as after a restart.)
+    for n in [&na, &nb] {
+        n.store.intel_set(&key, "1000").await.unwrap();
+        price::load_kept(&n.node).await.unwrap();
+        price::refresh(&n.node).await.unwrap();
+    }
+    let sell = nb.node.price_table().price_of(price::SCAN).unwrap();
+    eventually("a hears b's new price", || async {
+        na.node.status.known(&b.id).and_then(|k| k.hb.scan_price_mc) == Some(sell)
+    })
+    .await;
+    enqueue(&na, "198.51.100.44", 2).await;
+    eventually_for(Duration::from_secs(40), "scanned and charged", || async {
+        let book = credits::book_fresh(&na.node).await.unwrap();
+        book.ledger.offers.iter().any(|o| {
+            o.payer == a.id
+                && o.job.is_some()
+                && matches!(o.state, OfferState::Charged { charged } if charged > 0)
+        })
+    })
+    .await;
+}
+
 /// A scanner that announces more than the rule gives is paid the
 /// arbiter's reference price, capped at PRICE_TOLERANCE.
 #[tokio::test]

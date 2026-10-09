@@ -521,14 +521,12 @@ mod tests {
             job_uid: uid.into(),
             scanner: FAST,
             level: 4,
-            paid: true,
             price_mc: Some(30),
             rate: 1.0,
             effective_mc: 30,
             next: None,
             waited_secs: 0,
             reason: Reason::Cheapest,
-            sat_out: 0,
         }
     }
 
