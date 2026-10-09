@@ -352,7 +352,8 @@ mod tests {
             let old = line.replace(" or http-comments-displayer)", ")");
             assert_ne!(old, line);
             assert!(args_ok(&old, level), "previous list, level {level}: {old}");
-            assert!(!args_ok(&old, 5 - level), "accepted for its level only");
+            let other = if level == 3 { 4 } else { 3 };
+            assert!(!args_ok(&old, other), "accepted for its level only");
             // Put back by hand: another list.
             let by_hand = line.replace(
                 "or http-comments-displayer)",

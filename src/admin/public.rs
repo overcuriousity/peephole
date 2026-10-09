@@ -1352,6 +1352,62 @@ show_labels = {show_labels}
         )
     }
 
+    /// `state` with `198.51.100.5` as an own address and a level-3 scan
+    /// of 203.0.113.9 from the facts fixture whose SMTP greeting names that
+    /// address, as a scan stored before scrubbing would; and the scan's id.
+    async fn scanned_state() -> (Arc<AdminState>, tempfile::TempDir, i64) {
+        let (st, dir) = state_with(
+            true,
+            "delay_minutes = 0\njitter_minutes = 0\n[scan]\nown_addresses = [\"198.51.100.5\"]",
+        )
+        .await;
+        let ip = st.store.ip_by_addr("203.0.113.9").await.unwrap().unwrap();
+        st.store.enqueue_scan(ip.id, 3, 0).await.unwrap();
+        let job = st.store.next_queued_job().await.unwrap().unwrap();
+        let xml = String::from_utf8(include_bytes!("../../tests/fixtures/nmap-facts.xml").to_vec())
+            .unwrap()
+            .replacen(
+                "</port>",
+                r#"<script id="smtp-commands" output="Hello [198.51.100.5]"/></port>"#,
+                1,
+            );
+        let res = crate::scan::nmap_xml::parse_nmap_xml(xml.as_bytes()).unwrap();
+        st.store.finish_job(job.id, Some(&res), None).await.unwrap();
+        let id = st.store.scans_for_ip(ip.id).await.unwrap()[0].id;
+        (st, dir, id)
+    }
+
+    #[tokio::test]
+    async fn the_ip_page_heads_each_scan_with_what_it_serves_and_its_windows_names() {
+        let (st, _d, _) = scanned_state().await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, html) = get_with(&app, "/ip/203.0.113.9", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            html.contains(
+                " · 80 PentAGI &#38; friends · 80 nginx/1.18.0 · 8443 MinIO Console · WIN-344VU98D3RU · WORKGROUP"
+            ),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_xml_and_the_admin_export_leave_out_this_nodes_address() {
+        let (st, _d, id) = scanned_state().await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, xml) = get_with(&app, &format!("/admin/scans/{id}/xml"), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(xml.contains("Hello [[scanner]]"), "{xml}");
+        assert!(!xml.contains("198.51.100.5"));
+        let (status, export) =
+            get_with(&app, "/admin/export/download?format=jsonl", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(export.contains("Hello [[scanner]]"), "{export}");
+        assert!(!export.contains("198.51.100.5"));
+    }
+
     async fn get_with(app: &axum::Router, path: &str, cookie: Option<&str>) -> (u16, String) {
         let mut req = axum::http::Request::get(path);
         if let Some(c) = cookie {
