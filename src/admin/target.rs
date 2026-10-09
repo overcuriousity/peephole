@@ -96,11 +96,18 @@ pub async fn load(
         let found = state.store.scans_for_ip(ip.id).await?;
         let ids: Vec<i64> = found.iter().map(|s| s.id).collect();
         let mut ports = state.store.ports_for_scans(&ids).await?;
+        let mut host = state.store.host_facts_for_scans(&ids).await?;
         let scans = found
             .into_iter()
-            .map(|s| ScanWithPorts {
-                ports: ports.remove(&s.id).unwrap_or_default(),
-                s,
+            .map(|s| {
+                let ports = ports.remove(&s.id).unwrap_or_default();
+                let host_facts = host.remove(&s.id).unwrap_or_default();
+                ScanWithPorts {
+                    serves: crate::store::facts::serves(&ports),
+                    host: crate::store::facts::windows_names(&host_facts, &ports),
+                    ports,
+                    s,
+                }
             })
             .collect();
         Some(IpAdminData {

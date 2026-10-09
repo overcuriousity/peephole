@@ -748,6 +748,7 @@ impl Recorder {
                 finished_at: Some(now.clone()),
                 os_guess: res.os_guess.clone(),
                 raw_xml: Some(zstd::encode_all(res.raw_xml.as_slice(), 3)?),
+                scrubbed: res.scrubbed,
                 ports: res
                     .ports
                     .iter()
@@ -868,6 +869,7 @@ impl Recorder {
             finished_at: Some(now_ts()),
             os_guess: res.os_guess.clone(),
             raw_xml: Some(zstd::encode_all(res.raw_xml.as_slice(), 3)?),
+            scrubbed: res.scrubbed,
             ports: res
                 .ports
                 .iter()
@@ -908,6 +910,7 @@ impl Recorder {
                     finished_at: Some(now_ts()),
                     os_guess: res.os_guess.clone(),
                     raw_xml: Some(zstd::encode_all(res.raw_xml.as_slice(), 3)?),
+                    scrubbed: res.scrubbed,
                     ports: res
                         .ports
                         .iter()

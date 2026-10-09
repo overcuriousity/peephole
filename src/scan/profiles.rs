@@ -10,8 +10,12 @@ use quick_xml::events::Event;
 /// element. `discovery` and `safe` also hold scripts that would leak the
 /// target to third parties (`external`: whois, ASN and geolocation
 /// lookups), broadcast on the scanner's own network (`broadcast`
-/// prerules), or flood (`dos`); those categories are excluded.
-pub const SCRIPTS: &str = "(discovery or safe) and not (intrusive or broadcast or external or dos)";
+/// prerules), or flood (`dos`); those categories are excluded. So is one
+/// script by name: `http-comments-displayer` spiders up to 20 pages per
+/// HTTP port and copies every comment it finds, binary files it misreads
+/// included, unbounded text of no use for analysis (198 KB of one 266 KB
+/// scan in the 2026-10-06 export).
+pub const SCRIPTS: &str = "(discovery or safe) and not (intrusive or broadcast or external or dos or http-comments-displayer)";
 /// Level 2 names its scripts: the source's own identifiers (SSH host keys
 /// and algorithm lists, the TLS certificate, the HTTP headers with their
 /// ETag), each one handshake or request to a port nmap already found
@@ -101,7 +105,41 @@ pub const ACCEPTED: &[(u8, &[&str])] = &[
             "ssh-hostkey,ssh2-enum-algos,ssl-cert",
         ],
     ),
+    // Levels 3 and 4 with `http-comments-displayer` (0.9.0 and earlier).
+    (
+        3,
+        &[
+            "-Pn",
+            "-sS",
+            "-sV",
+            "-O",
+            "-T3",
+            "--top-ports",
+            "1000",
+            "--traceroute",
+            "--script",
+            OLD_SCRIPTS,
+        ],
+    ),
+    (
+        4,
+        &[
+            "-Pn",
+            "-sS",
+            "-sV",
+            "-O",
+            "-T3",
+            "--max-retries",
+            "1",
+            "--traceroute",
+            "--script",
+            OLD_SCRIPTS,
+        ],
+    ),
 ];
+
+/// The level 3 and 4 script list of 0.9.0 and earlier.
+const OLD_SCRIPTS: &str = "(discovery or safe) and not (intrusive or broadcast or external or dos)";
 
 /// A command line as words: split at whitespace, quotes dropped (nmap
 /// versions differ in whether they quote an argument with spaces; the
@@ -158,7 +196,8 @@ fn args_ok_among(command_line: &str, level: u8, accepted: &[(u8, &[&str])]) -> b
     built_in.is_some_and(|b| b == got)
         || accepted
             .iter()
-            .any(|(l, list)| *l == level && list.iter().copied().eq(got.iter().map(String::as_str)))
+            .filter(|(l, _)| *l == level)
+            .any(|(_, list)| normalize(&words(&list.join(" ")), level) == got)
 }
 
 /// Whether `command_line` (the `args` nmap wrote into its XML) is a
@@ -297,5 +336,34 @@ mod tests {
             xml_args(&fixture).as_deref(),
             Some("nmap -sS -sV -oX - 198.51.100.23")
         );
+    }
+
+    #[test]
+    fn levels_3_and_4_leave_out_http_comments_displayer_and_the_previous_lists_still_earn() {
+        assert!(
+            SCRIPTS.ends_with("or http-comments-displayer)"),
+            "{SCRIPTS}"
+        );
+        let plain = cfg("");
+        for level in [3u8, 4] {
+            let line = command_line(&plain, level, "203.0.113.7");
+            assert!(args_ok(&line, level), "{line}");
+            // The list of 0.9.0 and earlier, as nmap recorded it.
+            let old = line.replace(" or http-comments-displayer)", ")");
+            assert_ne!(old, line);
+            assert!(args_ok(&old, level), "previous list, level {level}: {old}");
+            let other = if level == 3 { 4 } else { 3 };
+            assert!(!args_ok(&old, other), "accepted for its level only");
+            // Put back by hand: another list.
+            let by_hand = line.replace(
+                "or http-comments-displayer)",
+                "or http-comments-displayer) or http-comments-displayer",
+            );
+            assert!(!args_ok(&by_hand, level));
+        }
+        let udp = cfg("level4_udp = true");
+        let old_udp =
+            command_line(&udp, 4, "203.0.113.7").replace(" or http-comments-displayer)", ")");
+        assert!(args_ok(&old_udp, 4), "{old_udp}");
     }
 }

@@ -863,8 +863,8 @@ async fn scan_result(
     };
     let res = sqlx::query(
         "INSERT OR IGNORE INTO scans (uid, origin, hlc, job_id, job_uid, ip_id, level, started_at,
-           finished_at, os_guess, raw_xml, build, audit_of)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           finished_at, os_guess, raw_xml, build, audit_of, scrubbed)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -879,6 +879,7 @@ async fn scan_result(
     .bind(&r.raw_xml)
     .bind(&r.build)
     .bind(audit_of)
+    .bind(r.scrubbed as i64)
     .execute(&mut *conn)
     .await?;
     if res.rows_affected() == 1 {
@@ -899,6 +900,7 @@ async fn scan_result(
             .await?;
         }
         super::hostkeys::derive(conn, scan_id, ip_id, r.raw_xml.as_deref()).await?;
+        super::facts::derive(conn, scan_id, r.raw_xml.as_deref()).await?;
     }
     Ok(Effect::Applied)
 }
@@ -1352,6 +1354,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
         Option<String>,
         Option<String>,
         Option<Vec<u8>>,
+        i64,
     );
     Ok(match kind {
         "request" => {
@@ -1505,7 +1508,7 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
         "scan_result" => {
             let r: Option<Scan> = sqlx::query_as(
                 "SELECT s.id, s.build, s.uid, s.job_uid, i.ip, s.level, s.started_at,
-                        s.finished_at, s.os_guess, s.raw_xml
+                        s.finished_at, s.os_guess, s.raw_xml, s.scrubbed
                  FROM scans s JOIN ips i ON i.id = s.ip_id WHERE s.uid = ?",
             )
             .bind(uid)
@@ -1531,6 +1534,9 @@ pub async fn rebuild(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resu
                         finished_at: r.7,
                         os_guess: r.8,
                         raw_xml: r.9,
+                        // Unreachable fallback: the column is written
+                        // from a `u16`.
+                        scrubbed: u16::try_from(r.10).unwrap_or(u16::MAX),
                         ports: ports
                             .into_iter()
                             .map(|p| PortRec {
@@ -2143,6 +2149,7 @@ mod tests {
             &mut conn,
             ctx(4),
             &Record::ScanResult(ScanResultRec {
+                scrubbed: 0,
                 build: String::new(),
                 uid: "scan".into(),
                 job_uid: "job".into(),
@@ -2199,6 +2206,7 @@ mod tests {
             Effect::Applied
         );
         let scan = |uid: &str, job: &str| ScanResultRec {
+            scrubbed: 0,
             build: String::new(),
             uid: uid.into(),
             job_uid: job.into(),
@@ -2296,6 +2304,7 @@ mod tests {
             .unwrap();
         let mut conn = store.pool.acquire().await.unwrap();
         let res = ScanResultRec {
+            scrubbed: 0,
             build: String::new(),
             uid: new_uid(),
             job_uid: "job-not-here-yet".into(),
@@ -2431,6 +2440,7 @@ mod tests {
                 failed_by: None,
             }),
             Record::ScanResult(ScanResultRec {
+                scrubbed: 2,
                 uid: u("scan"),
                 job_uid: u("job"),
                 ip: "203.0.113.7".into(),

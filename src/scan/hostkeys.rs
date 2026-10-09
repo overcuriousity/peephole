@@ -46,7 +46,7 @@ pub struct HostKey {
 
 /// Structured script output: nmap's `<table>` and `<elem>`.
 #[derive(Debug)]
-enum Node {
+pub(crate) enum Node {
     Table {
         key: Option<String>,
         children: Vec<Node>,
@@ -57,14 +57,14 @@ enum Node {
     },
 }
 
-fn elem<'a>(nodes: &'a [Node], name: &str) -> Option<&'a str> {
+pub(crate) fn elem<'a>(nodes: &'a [Node], name: &str) -> Option<&'a str> {
     nodes.iter().find_map(|n| match n {
         Node::Elem { key: Some(k), text } if k == name => Some(text.as_str()),
         _ => None,
     })
 }
 
-fn table<'a>(nodes: &'a [Node], name: &str) -> Option<&'a [Node]> {
+pub(crate) fn table<'a>(nodes: &'a [Node], name: &str) -> Option<&'a [Node]> {
     nodes.iter().find_map(|n| match n {
         Node::Table {
             key: Some(k),
@@ -74,7 +74,7 @@ fn table<'a>(nodes: &'a [Node], name: &str) -> Option<&'a [Node]> {
     })
 }
 
-fn texts(nodes: &[Node]) -> Vec<&str> {
+pub(crate) fn texts(nodes: &[Node]) -> Vec<&str> {
     nodes
         .iter()
         .filter_map(|n| match n {
@@ -84,7 +84,7 @@ fn texts(nodes: &[Node]) -> Vec<&str> {
         .collect()
 }
 
-fn key_attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
+pub(crate) fn key_attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
     e.attributes()
         .flatten()
         .find(|a| a.key.as_ref() == name)
@@ -132,16 +132,42 @@ pub fn ptr_names(xml: &[u8]) -> Vec<String> {
     out
 }
 
-/// Every identifier in an nmap XML report. Unparsable input yields what
-/// was found before the error: the XML comes from nmap, but the values in
-/// it from the scanned source.
-pub fn extract(xml: &[u8]) -> Vec<HostKey> {
-    let mut out = vec![];
+/// Append what an entity or character reference in text stands for: the
+/// character of `&#..;`, or one of XML's five named entities. Any other
+/// name (nmap writes none) appends nothing.
+pub(crate) fn push_ref(s: &mut String, r: &quick_xml::events::BytesRef) {
+    match r.resolve_char_ref() {
+        Ok(Some(c)) => s.push(c),
+        _ => s.push_str(match &**r {
+            "amp" => "&",
+            "lt" => "<",
+            "gt" => ">",
+            "quot" => "\"",
+            "apos" => "'",
+            _ => "",
+        }),
+    }
+}
+
+/// What `walk_scripts` calls per script: port, protocol, id, `output`,
+/// structured output.
+pub(crate) type ScriptVisit<'a> = dyn FnMut(u16, &str, &str, Option<&str>, &[Node]) + 'a;
+
+/// Walk every `<script>` of an nmap report whose id is in `wanted`, port
+/// scripts and host scripts (`<hostscript>`, reported with port 0) alike,
+/// and call `f` once per script with the port, its protocol (`tcp` when
+/// nmap names none, and for host scripts), the id, the `output`
+/// attribute and the structured output (`<table>` and `<elem>`) under it,
+/// root first. Unparsable input ends the walk: what was found before the
+/// error has been reported. The XML comes from nmap, but the values in it
+/// from the scanned source.
+pub(crate) fn walk_scripts(xml: &[u8], wanted: &[&str], f: &mut ScriptVisit<'_>) {
     let mut reader = Reader::from_reader(xml);
     let mut buf = Vec::new();
     let mut port: u16 = 0;
-    // Inside a script we read: its id and the open tables, root first.
-    let mut script: Option<String> = None;
+    let mut proto = String::from("tcp");
+    // Inside a wanted script: its id and output, and the open tables.
+    let mut script: Option<(String, Option<String>)> = None;
     let mut stack: Vec<(Option<String>, Vec<Node>)> = vec![];
     let mut text: Option<(Option<String>, String)> = None;
     while let Ok(ev) = reader.read_event_into(&mut buf) {
@@ -150,20 +176,13 @@ pub fn extract(xml: &[u8]) -> Vec<HostKey> {
                 "port" => {
                     port = key_attr(&e, "portid")
                         .and_then(|p| p.parse().ok())
-                        .unwrap_or(0)
+                        .unwrap_or(0);
+                    proto = key_attr(&e, "protocol").unwrap_or_else(|| "tcp".into());
                 }
-                "script" if port > 0 => {
+                "script" => {
                     let id = key_attr(&e, "id").unwrap_or_default();
-                    if id == "http-headers"
-                        && let Some(o) = text_attr(&e, "output")
-                    {
-                        etags(port, &o, &mut out);
-                    }
-                    if matches!(
-                        id.as_str(),
-                        "ssh-hostkey" | "ssl-cert" | "ssh2-enum-algos" | "http-headers"
-                    ) {
-                        script = Some(id);
+                    if wanted.contains(&id.as_str()) {
+                        script = Some((id, text_attr(&e, "output")));
                         stack = vec![(None, vec![])];
                     }
                 }
@@ -171,23 +190,23 @@ pub fn extract(xml: &[u8]) -> Vec<HostKey> {
                 "elem" if script.is_some() => text = Some((key_attr(&e, "key"), String::new())),
                 _ => {}
             },
-            Event::Empty(e)
-                if port > 0
-                    && e.name().as_ref() == "script"
-                    && key_attr(&e, "id").as_deref() == Some("http-headers") =>
-            {
-                if let Some(o) = text_attr(&e, "output") {
-                    etags(port, &o, &mut out);
+            Event::Empty(e) => match e.name().as_ref() {
+                "script" => {
+                    let id = key_attr(&e, "id").unwrap_or_default();
+                    if wanted.contains(&id.as_str()) {
+                        f(port, &proto, &id, text_attr(&e, "output").as_deref(), &[]);
+                    }
                 }
-            }
-            Event::Empty(e) if script.is_some() && e.name().as_ref() == "elem" => {
-                if let Some(top) = stack.last_mut() {
-                    top.1.push(Node::Elem {
-                        key: key_attr(&e, "key"),
-                        text: String::new(),
-                    });
+                "elem" if script.is_some() => {
+                    if let Some(top) = stack.last_mut() {
+                        top.1.push(Node::Elem {
+                            key: key_attr(&e, "key"),
+                            text: String::new(),
+                        });
+                    }
                 }
-            }
+                _ => {}
+            },
             Event::Text(t) => {
                 if let Some((_, s)) = text.as_mut() {
                     s.push_str(&t);
@@ -200,21 +219,14 @@ pub fn extract(xml: &[u8]) -> Vec<HostKey> {
             }
             Event::GeneralRef(r) => {
                 if let Some((_, s)) = text.as_mut() {
-                    match r.resolve_char_ref() {
-                        Ok(Some(c)) => s.push(c),
-                        _ => s.push_str(match &*r {
-                            "amp" => "&",
-                            "lt" => "<",
-                            "gt" => ">",
-                            "quot" => "\"",
-                            "apos" => "'",
-                            _ => "",
-                        }),
-                    }
+                    push_ref(s, &r);
                 }
             }
             Event::End(e) => match e.name().as_ref() {
-                "port" => port = 0,
+                "port" => {
+                    port = 0;
+                    proto = "tcp".into();
+                }
                 "elem" => {
                     if let (Some((key, s)), Some(top)) = (text.take(), stack.last_mut()) {
                         top.1.push(Node::Elem { key, text: s });
@@ -227,13 +239,8 @@ pub fn extract(xml: &[u8]) -> Vec<HostKey> {
                     }
                 }
                 "script" => {
-                    if let (Some(id), Some((_, root))) = (script.take(), stack.pop()) {
-                        match id.as_str() {
-                            "ssh-hostkey" => ssh_hostkeys(port, &root, &mut out),
-                            "ssl-cert" => tls_cert(port, &root, &mut out),
-                            "http-headers" => etags(port, &texts(&root).join("\n"), &mut out),
-                            _ => hassh(port, &root, &mut out),
-                        }
+                    if let (Some((id, output)), Some((_, root))) = (script.take(), stack.pop()) {
+                        f(port, &proto, &id, output.as_deref(), &root);
                     }
                     stack.clear();
                 }
@@ -244,6 +251,32 @@ pub fn extract(xml: &[u8]) -> Vec<HostKey> {
         }
         buf.clear();
     }
+}
+
+/// Every identifier in an nmap XML report. Unparsable input yields what
+/// was found before the error.
+pub fn extract(xml: &[u8]) -> Vec<HostKey> {
+    let mut out = vec![];
+    walk_scripts(
+        xml,
+        &["ssh-hostkey", "ssl-cert", "ssh2-enum-algos", "http-headers"],
+        &mut |port, _proto, id, output, root| {
+            if port == 0 {
+                return;
+            }
+            match id {
+                "ssh-hostkey" => ssh_hostkeys(port, root, &mut out),
+                "ssl-cert" => tls_cert(port, root, &mut out),
+                "http-headers" => {
+                    if let Some(o) = output {
+                        etags(port, o, &mut out);
+                    }
+                    etags(port, &texts(root).join("\n"), &mut out);
+                }
+                _ => hassh(port, root, &mut out),
+            }
+        },
+    );
     out
 }
 
@@ -564,6 +597,80 @@ mod tests {
         let ja4x = tls.iter().find(|k| k.kind == JA4X).unwrap();
         // CN only, on both sides; SKI, AKI and basic constraints.
         assert_eq!(ja4x.fingerprint, "7022c563de38_7022c563de38_795797892f9c");
+    }
+
+    #[test]
+    fn the_walker_reports_port_and_host_scripts_with_their_output_and_tree() {
+        let xml = br#"<nmaprun><host>
+<ports>
+<port protocol="tcp" portid="80"><script id="http-title" output="T"><elem key="title">T</elem></script>
+<script id="other" output="x"/><script id="http-server-header" output="nginx"/></port>
+<port protocol="udp" portid="53"><script id="dns-nsid" output="n"/></port>
+</ports>
+<hostscript><script id="smb-os-discovery" output="o"><elem key="os">Windows</elem><table key="t"><elem>v</elem></table></script></hostscript>
+</host></nmaprun>"#;
+        let mut seen: Vec<(u16, String, String, Option<String>, usize)> = vec![];
+        walk_scripts(
+            xml,
+            &[
+                "http-title",
+                "http-server-header",
+                "dns-nsid",
+                "smb-os-discovery",
+            ],
+            &mut |port, proto, id, output, root| {
+                seen.push((
+                    port,
+                    proto.to_string(),
+                    id.to_string(),
+                    output.map(str::to_string),
+                    root.len(),
+                ));
+            },
+        );
+        assert_eq!(
+            seen,
+            vec![
+                (80, "tcp".into(), "http-title".into(), Some("T".into()), 1),
+                (
+                    80,
+                    "tcp".into(),
+                    "http-server-header".into(),
+                    Some("nginx".into()),
+                    0
+                ),
+                (53, "udp".into(), "dns-nsid".into(), Some("n".into()), 0),
+                (
+                    0,
+                    "tcp".into(),
+                    "smb-os-discovery".into(),
+                    Some("o".into()),
+                    2
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_walk_cut_mid_script_reports_what_came_before() {
+        let xml = br#"<nmaprun><host><ports>
+<port protocol="tcp" portid="80"><script id="http-title" output="T"><elem key="title">T</elem></script></port>
+<port protocol="tcp" portid="443"><script id="http-title" output="U"><elem key="title">U</elem></scr"#;
+        let mut seen: Vec<(u16, String)> = vec![];
+        walk_scripts(xml, &["http-title"], &mut |port, _, id, _, _| {
+            seen.push((port, id.to_string()))
+        });
+        assert_eq!(seen, vec![(80, "http-title".into())]);
+        // A mismatched end tag is a parse error: the walk ends there.
+        let bad = br#"<nmaprun><host><ports>
+<port protocol="tcp" portid="80"><script id="http-title" output="T"><elem key="title">T</elem></script></port>
+<port protocol="tcp" portid="443"><script id="http-title" output="U"><elem key="title">U</table></script></port>
+</ports></host></nmaprun>"#;
+        let mut seen: Vec<(u16, String)> = vec![];
+        walk_scripts(bad, &["http-title"], &mut |port, _, id, _, _| {
+            seen.push((port, id.to_string()))
+        });
+        assert_eq!(seen, vec![(80, "http-title".into())]);
     }
 
     #[test]

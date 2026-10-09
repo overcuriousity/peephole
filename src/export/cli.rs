@@ -109,6 +109,14 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
     let cfg = Config::load(Path::new(a.config.as_deref().unwrap_or(default_config)))?;
     let store = Store::connect(&cfg.database_path).await?;
     let names = member_names(&store).await;
+    // This node's own addresses and names, kept out of the served XML.
+    // Without a running node this is the configured and interface
+    // addresses only: the address peers saw this node connect from lives
+    // in the running node's memory, so a node behind NAT should set
+    // `scan.own_addresses`. The admin download and export remove it too.
+    let mut safety = crate::scan::safety::Safety::new(&cfg);
+    safety.refresh(&cfg, None).await;
+    let own = safety.own_identity();
     let mut out: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = match &a.output {
         Some(p) => Box::new(
             tokio::fs::File::create(p)
@@ -117,7 +125,7 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
         ),
         None => Box::new(tokio::io::stdout()),
     };
-    let (rows, bytes) = write(store, &a, names, &mut out).await?;
+    let (rows, bytes) = write(store, &a, names, own, &mut out).await?;
     if a.output.is_some() {
         eprintln!(
             "exported {rows} row{} ({} MiB) as {}",
@@ -134,6 +142,7 @@ pub async fn write(
     store: Store,
     a: &Args,
     names: HashMap<Vec<u8>, String>,
+    own: crate::scan::scrub::Own,
     out: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
 ) -> Result<(u64, u64)> {
     use tokio::io::AsyncWriteExt;
@@ -144,6 +153,7 @@ pub async fn write(
         ExportOptions {
             mode: a.mode,
             names,
+            own,
         },
     );
     let mut stream = std::pin::pin!(counted.0);
@@ -270,9 +280,15 @@ mod tests {
                 ..Args::default()
             };
             let mut buf: Vec<u8> = vec![];
-            let (rows, bytes) = write(store.clone(), &a, HashMap::new(), &mut buf)
-                .await
-                .unwrap();
+            let (rows, bytes) = write(
+                store.clone(),
+                &a,
+                HashMap::new(),
+                Default::default(),
+                &mut buf,
+            )
+            .await
+            .unwrap();
             assert_eq!(rows, 0);
             assert_eq!(bytes as usize, buf.len());
             assert!(

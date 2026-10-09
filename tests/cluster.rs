@@ -6591,6 +6591,7 @@ async fn recorded_and_scanned(na: &TestNode, nb: &TestNode, ip: &str, port: u16)
         .await
         .unwrap();
     let res = peephole::scan::nmap_xml::ScanResult {
+        scrubbed: 0,
         os_guess: None,
         raw_xml: b"<nmaprun/>".to_vec(),
         ports: vec![peephole::scan::nmap_xml::PortResult {

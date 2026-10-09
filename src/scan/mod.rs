@@ -1,5 +1,6 @@
 pub mod arbiter;
 pub mod crawler;
+pub mod facts;
 pub mod guard;
 pub mod handout;
 pub mod hostkeys;
@@ -11,6 +12,7 @@ pub mod profiles;
 pub mod rank;
 pub mod retry;
 pub mod safety;
+pub mod scrub;
 pub mod weight;
 
 use crate::classify::Classifier;
@@ -1127,9 +1129,57 @@ fn signal_desc(sig: i32) -> (String, Option<&'static str>) {
     }
 }
 
+/// Run nmap for `job` (`run_leased`), then keep this node's own addresses
+/// and names out of the result's XML before it is signed.
+async fn run_scan(
+    source: &Source,
+    job: &Job,
+    argv: Vec<String>,
+    nmap: PathBuf,
+    timeout: Duration,
+) -> Outcome {
+    let mut outcome = run_leased(source, job, argv, nmap, timeout).await;
+    if let Outcome::Done(res) = &mut outcome {
+        source.scrub(&job.ip(), res).await;
+    }
+    outcome
+}
+
+impl Source {
+    /// Replace this node's own global addresses and names in the scan's
+    /// XML (`scan::scrub`), unless the target is one of them: that scan is
+    /// about this node. The safety lock is held only to read the lists;
+    /// the pass over the XML (up to `MAX_RAW_XML`) runs on a blocking
+    /// thread, so other workers' preflights and the probe gate do not wait
+    /// for it.
+    async fn scrub(&self, target: &IpAddr, res: &mut nmap_xml::ScanResult) {
+        let (addrs, names) = {
+            let s = self.safety.lock().await;
+            if s.is_own(target) {
+                return;
+            }
+            (s.own_global(), s.own_names())
+        };
+        let raw = std::mem::take(&mut res.raw_xml);
+        match tokio::task::spawn_blocking(move || scrub::scrub(&raw, &addrs, &names)).await {
+            Ok((xml, n)) => {
+                res.raw_xml = xml;
+                res.scrubbed = n;
+            }
+            // `scrub` does not panic; if it ever did, fail as loudly as the
+            // inline call would have.
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            // Cancelled, which happens only when the runtime shuts down
+            // before the task starts: the XML is left empty rather than
+            // unscrubbed.
+            Err(_) => {}
+        }
+    }
+}
+
 /// Run nmap for `job`; in a cluster, renew the lease meanwhile and give up
 /// if the arbiter says it is no longer ours.
-async fn run_scan(
+async fn run_leased(
     source: &Source,
     job: &Job,
     argv: Vec<String>,
@@ -1821,6 +1871,94 @@ license_key = "k"
         assert_eq!(ports, 3);
         let mut f = std::fs::File::create("/dev/null").unwrap();
         f.write_all(b"").unwrap(); // keeps Write import used
+    }
+
+    #[tokio::test]
+    async fn worker_scrubs_its_own_address_from_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_nmap(dir.path());
+        // The fixture, with a greeting that names the scanner.
+        let xml = std::fs::read_to_string("tests/fixtures/nmap-basic.xml").unwrap().replacen(
+            "</port>",
+            r#"<script id="smtp-commands" output="mail Hello scanner-5.example.net [198.51.100.5], 198.51.100.50 pleased"/></port>"#,
+            1,
+        );
+        std::fs::write(dir.path().join("nmap.xml"), xml).unwrap();
+        let cfg = config_with(
+            dir.path(),
+            "tor_unknown = \"scan\"\nverify_crawlers = false\nown_addresses = [\"198.51.100.5\"]\n",
+        );
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = store
+            .upsert_ip("198.51.100.23".parse().unwrap())
+            .await
+            .unwrap();
+        store.enqueue_scan(ip.id, 2, 24).await.unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
+        let pool = tokio::spawn(run_workers(
+            store.local(),
+            cfg,
+            p,
+            fake,
+            rx,
+            crate::events::Notifier::new(),
+            Classifier::builtin(),
+        ));
+        wait_for_scans(&store, 1).await;
+        tx.send(true).unwrap();
+        pool.await.unwrap();
+        let (scrubbed, raw): (i64, Vec<u8>) = sqlx::query_as("SELECT scrubbed, raw_xml FROM scans")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(scrubbed, 1);
+        let xml = String::from_utf8(zstd::decode_all(raw.as_slice()).unwrap()).unwrap();
+        assert!(
+            xml.contains("Hello scanner-5.example.net [[scanner]], 198.51.100.50"),
+            "{xml}"
+        );
+        assert!(!xml.contains("[198.51.100.5]"));
+        assert!(xml.contains("198.51.100.23"), "the target stays");
+        assert!(
+            xml.contains("args=\"nmap -sS -sV -oX - 198.51.100.23\""),
+            "the args line stays"
+        );
+        let ports: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ports")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(ports, 3, "ports as before");
+        let s = store.scan_by_id(1).await.unwrap().unwrap();
+        assert_eq!(s.scrubbed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_scan_of_an_own_address_is_not_scrubbed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_with(
+            dir.path(),
+            "tor_unknown = \"scan\"\nverify_crawlers = false\nown_addresses = [\"198.51.100.5\"]\n",
+        );
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
+        let source = Source::new(store.local(), cfg.clone(), p, Classifier::builtin());
+        source.safety.lock().await.refresh(&cfg, None).await;
+        let xml = b"<nmaprun><host><ports><port protocol=\"tcp\" portid=\"25\"><state state=\"open\"/><script id=\"banner\" output=\"hi 198.51.100.5\"/></port></ports></host></nmaprun>";
+        let mut res = nmap_xml::parse_nmap_xml(xml).unwrap();
+        source
+            .scrub(&"198.51.100.5".parse().unwrap(), &mut res)
+            .await;
+        assert_eq!(
+            (res.scrubbed, res.raw_xml.as_slice()),
+            (0, &xml[..]),
+            "about this node"
+        );
+        source
+            .scrub(&"198.51.100.23".parse().unwrap(), &mut res)
+            .await;
+        assert_eq!(res.scrubbed, 1);
+        assert!(String::from_utf8_lossy(&res.raw_xml).contains("hi [scanner]"));
     }
 
     async fn status_of(store: &Store, ip: &str) -> (String, Option<String>, Option<String>) {

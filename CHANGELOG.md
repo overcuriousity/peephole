@@ -20,9 +20,34 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   at each level (L1–L4), the cheapest in bold.
 - The scan page says why its job went to its scanner ("Handed out"), and
   the Scans history shows the same as a title on the scanner's name.
+- Levels 3 and 4 no longer run nmap's `http-comments-displayer`: it
+  copied every HTML comment it found, binary files included, and was most
+  of some scans' XML. Scans run with the previous list still earn.
+- During a rolling upgrade, a scan scrubbed by a current scanner relays
+  only through current members: an older member rebuilds the record
+  without the count, and the signature no longer matches. The gap heals
+  once every member has upgraded.
 
 ### Added
 
+- What a scanned source serves and calls itself. Each port of a scan
+  shows what `-sV` added (extra info, OS and device type, the announced
+  host name, CPEs) and the fixed fields of a few scripts: page title and
+  redirect, `Server` header, login realm, Windows computer and domain
+  names from RDP and SMB, SOCKS methods, DNS server id. The scan page has
+  a Host card, each scan's heading on the IP page a one-line summary, and
+  the export carries the port fields and a `facts` list per scan. Nothing
+  is parsed from prose. Stored scans are read once at startup.
+- The scanner's own address stays out of its scans. A scanned mail server
+  greets the client by address and name, and nmap kept that in the XML
+  that is signed, replicated and exported. Before signing, a scanner now
+  replaces its own global addresses (interfaces, listeners, `advertise`,
+  `scan.own_addresses`, the addresses peers saw it from) and their
+  forward-confirmed names with `[scanner]`; the scan page says how often.
+  Scans signed before this release cannot be changed; each node removes
+  its own addresses and names from them when it serves the XML or the
+  export, so a node's own old scans leave it clean. Other members'
+  addresses in old scans stay (a purge removes a record everywhere).
 - Host keys in the export: each scan in the `scans` column lists its
   `host_keys` (kind, port, fingerprint, detail), so nobody has to parse
   the XML for them.

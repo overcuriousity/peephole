@@ -762,6 +762,7 @@ async fn admin_pages_and_deletes_with_session() {
             .finish_job(
                 job.id,
                 Some(&peephole::scan::nmap_xml::ScanResult {
+                    scrubbed: 0,
                     os_guess: Some("Linux".into()),
                     // Both IPs show the same host keys and certificate.
                     raw_xml: [
@@ -1886,6 +1887,7 @@ async fn public_ip_page_shows_aggregates_but_hides_requests_and_admin_data() {
         .finish_job(
             job,
             Some(&peephole::scan::nmap_xml::ScanResult {
+                scrubbed: 0,
                 os_guess: Some("OSGUESSMARKER".into()),
                 raw_xml: b"<nmaprun/>".to_vec(),
                 ports: vec![peephole::scan::nmap_xml::PortResult {

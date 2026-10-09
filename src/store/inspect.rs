@@ -22,6 +22,9 @@ pub struct ScanSummary {
     pub audit_of: Option<String>,
     /// How the audit compares with the scan it checks, once compared here.
     pub audit_result: Option<String>,
+    /// How many times the scanner removed its own address or name from
+    /// the XML.
+    pub scrubbed: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -32,6 +35,49 @@ pub struct PortRow {
     pub service: Option<String>,
     pub product: Option<String>,
     pub version: Option<String>,
+    /// What `-sV` added (`scan::facts`): free text after the version, the
+    /// OS and device type it implies, the host name the service announced.
+    pub extrainfo: Option<String>,
+    pub ostype: Option<String>,
+    pub devicetype: Option<String>,
+    pub hostname: Option<String>,
+    /// The CPEs as stored: a JSON array, or NULL.
+    pub cpe: Option<String>,
+    /// Script facts on this port (`scan_facts`), read separately.
+    #[sqlx(skip)]
+    pub facts: Vec<super::facts::FactRow>,
+}
+
+impl PortRow {
+    /// The CPEs nmap named for the service, in its order; none when the
+    /// column is NULL or not a JSON array of strings.
+    pub fn cpes(&self) -> Vec<String> {
+        self.cpe
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default()
+    }
+
+    /// Product, version and extra info, the ones set, joined with spaces
+    /// on one line (`OpenSSH 9.6p1 Ubuntu Linux; protocol 2.0`).
+    pub fn described(&self) -> String {
+        [&self.product, &self.version, &self.extrainfo]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// OS type, device type and announced host name, the ones set, joined.
+    pub fn system(&self) -> String {
+        [&self.ostype, &self.devicetype, &self.hostname]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -133,7 +179,7 @@ impl RequestDetail {
 
 const SCAN_SELECT: &str =
     "SELECT s.id, s.ip_id, i.ip, s.level, s.started_at, s.finished_at, s.os_guess,
-            s.audit_of, s.audit_result,
+            s.audit_of, s.audit_result, s.scrubbed,
             (SELECT COUNT(*) FROM ports p WHERE p.scan_id = s.id AND p.state = 'open') AS open_ports,
             (SELECT name FROM members m WHERE m.id = s.origin) AS node
      FROM scans s JOIN ips i ON s.ip_id = i.id";
@@ -296,12 +342,20 @@ impl Store {
     }
 
     pub async fn ports_for_scan(&self, scan_id: i64) -> Result<Vec<PortRow>> {
-        Ok(sqlx::query_as::<_, PortRow>(
-            "SELECT port, proto, state, service, product, version FROM ports WHERE scan_id = ? ORDER BY port",
+        let mut ports = sqlx::query_as::<_, PortRow>(
+            "SELECT port, proto, state, service, product, version, extrainfo, ostype, devicetype,
+                    hostname, cpe
+             FROM ports WHERE scan_id = ? ORDER BY port",
         )
         .bind(scan_id)
         .fetch_all(&self.read)
-        .await?)
+        .await?;
+        let facts = self.facts_for_scans(&[scan_id]).await?;
+        super::facts::attach(
+            &mut ports,
+            facts.get(&scan_id).map(Vec::as_slice).unwrap_or(&[]),
+        );
+        Ok(ports)
     }
 
     /// Decompressed nmap XML, or `None` when the scan does not exist.
@@ -325,38 +379,31 @@ impl Store {
         &self,
         scan_ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, Vec<PortRow>>> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            scan_id: i64,
+            #[sqlx(flatten)]
+            port: PortRow,
+        }
         let mut out: std::collections::HashMap<i64, Vec<PortRow>> = Default::default();
         for chunk in scan_ids.chunks(400) {
             let sql = format!(
-                "SELECT scan_id, port, proto, state, service, product, version FROM ports
+                "SELECT scan_id, port, proto, state, service, product, version, extrainfo,
+                        ostype, devicetype, hostname, cpe FROM ports
                  WHERE scan_id IN ({}) ORDER BY scan_id, port",
                 vec!["?"; chunk.len()].join(",")
-            );
-            type Row = (
-                i64,
-                i64,
-                String,
-                String,
-                Option<String>,
-                Option<String>,
-                Option<String>,
             );
             let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 q = q.bind(id);
             }
-            for (scan_id, port, proto, state, service, product, version) in
-                q.fetch_all(&self.read).await?
-            {
-                out.entry(scan_id).or_default().push(PortRow {
-                    port,
-                    proto,
-                    state,
-                    service,
-                    product,
-                    version,
-                });
+            for r in q.fetch_all(&self.read).await? {
+                out.entry(r.scan_id).or_default().push(r.port);
             }
+        }
+        let facts = self.facts_for_scans(scan_ids).await?;
+        for (id, ports) in out.iter_mut() {
+            super::facts::attach(ports, facts.get(id).map(Vec::as_slice).unwrap_or(&[]));
         }
         Ok(out)
     }
@@ -594,6 +641,7 @@ mod tests {
         s.finish_job(
             job,
             Some(&ScanResult {
+                scrubbed: 0,
                 os_guess: Some("Linux 5".into()),
                 raw_xml: b"<nmaprun/>".to_vec(),
                 ports: vec![

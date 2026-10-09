@@ -1653,6 +1653,7 @@ mod tests {
         s.finish_job(
             job.id,
             Some(&crate::scan::nmap_xml::ScanResult {
+                scrubbed: 0,
                 os_guess: Some("Linux 5.X".into()),
                 raw_xml: vec![],
                 ports: vec![port(22, "open", Some("OpenSSH")), port(23, "closed", None)],

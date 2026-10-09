@@ -66,6 +66,16 @@ pub struct AdminState {
 }
 
 impl AdminState {
+    /// This node's own addresses and names, to scrub from served scans
+    /// (`scan::scrub`); the safety list is refreshed first, as the
+    /// blocklist feed does.
+    pub async fn own_identity(&self) -> crate::scan::scrub::Own {
+        let mut s = self.safety.lock().await;
+        s.refresh(&self.cfg, self.recorder.node().map(|n| &**n))
+            .await;
+        s.own_identity()
+    }
+
     /// Records can be deleted from the admin only on a standalone node. In
     /// a cluster the data belongs to the cluster: retention prunes it.
     pub fn can_delete(&self) -> bool {
