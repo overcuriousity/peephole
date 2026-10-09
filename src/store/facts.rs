@@ -8,15 +8,17 @@ use anyhow::Result;
 use sqlx::SqliteConnection;
 use std::collections::HashMap;
 
-/// One fact as the pages show it. `port` None: about the host.
-#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+/// One fact as the pages show it. `port` and `proto` None: about the host.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FactRow {
     pub port: Option<i64>,
+    pub proto: Option<String>,
     pub kind: String,
     pub value: String,
 }
 
 impl FactRow {
+    /// The label a page shows before the value (`Title`, `Computer`).
     pub fn label(&self) -> &'static str {
         kind_label(&self.kind)
     }
@@ -116,13 +118,13 @@ pub async fn backfill(pool: &sqlx::SqlitePool, below: i64) -> Result<u64> {
     }
 }
 
-/// Give each port its facts (`facts` are one scan's, host facts included
-/// and left alone).
+/// Give each port its facts, matched on port number and protocol (`facts`
+/// are one scan's, host facts included and left alone).
 pub(crate) fn attach(ports: &mut [PortRow], facts: &[FactRow]) {
     for p in ports {
         p.facts = facts
             .iter()
-            .filter(|f| f.port == Some(p.port))
+            .filter(|f| f.port == Some(p.port) && f.proto.as_deref() == Some(p.proto.as_str()))
             .cloned()
             .collect();
     }
@@ -134,22 +136,37 @@ impl Store {
         &self,
         scan_ids: &[i64],
     ) -> Result<HashMap<i64, Vec<FactRow>>> {
+        self.read_facts(scan_ids, "").await
+    }
+
+    /// The facts of each scan, by scan id, with `filter` (a fixed SQL
+    /// condition starting with `AND`, or empty) on top of the scan ids.
+    async fn read_facts(
+        &self,
+        scan_ids: &[i64],
+        filter: &'static str,
+    ) -> Result<HashMap<i64, Vec<FactRow>>> {
         let mut out: HashMap<i64, Vec<FactRow>> = HashMap::new();
         for chunk in scan_ids.chunks(400) {
             let sql = format!(
-                "SELECT scan_id, port, kind, value FROM scan_facts WHERE scan_id IN ({})
+                "SELECT scan_id, port, proto, kind, value FROM scan_facts
+                 WHERE scan_id IN ({}) {filter}
                  ORDER BY scan_id, port IS NOT NULL, port, id",
                 vec!["?"; chunk.len()].join(",")
             );
-            let mut q =
-                sqlx::query_as::<_, (i64, Option<i64>, String, String)>(sqlx::AssertSqlSafe(sql));
+            let mut q = sqlx::query_as::<_, (i64, Option<i64>, Option<String>, String, String)>(
+                sqlx::AssertSqlSafe(sql),
+            );
             for id in chunk {
                 q = q.bind(id);
             }
-            for (scan_id, port, kind, value) in q.fetch_all(&self.read).await? {
-                out.entry(scan_id)
-                    .or_default()
-                    .push(FactRow { port, kind, value });
+            for (scan_id, port, proto, kind, value) in q.fetch_all(&self.read).await? {
+                out.entry(scan_id).or_default().push(FactRow {
+                    port,
+                    proto,
+                    kind,
+                    value,
+                });
             }
         }
         Ok(out)
@@ -164,15 +181,13 @@ impl Store {
             .unwrap_or_default())
     }
 
+    /// The facts about the host itself of each scan, by scan id; scans
+    /// without any are left out.
     pub async fn host_facts_for_scans(
         &self,
         scan_ids: &[i64],
     ) -> Result<HashMap<i64, Vec<FactRow>>> {
-        let mut all = self.facts_for_scans(scan_ids).await?;
-        for v in all.values_mut() {
-            v.retain(|f| f.port.is_none());
-        }
-        Ok(all)
+        self.read_facts(scan_ids, "AND port IS NULL").await
     }
 }
 
@@ -266,6 +281,19 @@ mod tests {
             vec!["http.title", "http.redirect", "http.server", "http.auth"]
         );
         assert_eq!(http.facts[0].label(), "Title");
+        // tcp/53 and udp/53: each row has only its own facts.
+        let dns = |proto: &str| {
+            ports
+                .iter()
+                .find(|p| p.port == 53 && p.proto == proto)
+                .unwrap_or_else(|| panic!("53/{proto} in {ports:?}"))
+                .facts
+                .iter()
+                .map(|f| format!("{} {}", f.proto.as_deref().unwrap_or("-"), f.value))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(dns("tcp"), vec!["tcp 9.18.1", "tcp ns1"]);
+        assert_eq!(dns("udp"), vec!["udp ns1-udp"]);
         let host = s.host_facts_for_scan(id).await.unwrap();
         assert_eq!(host.len(), 8, "{host:?}");
         assert!(host.iter().all(|f| f.port.is_none()));
@@ -368,6 +396,7 @@ mod tests {
     fn the_ip_page_summaries() {
         let fact = |port: Option<i64>, kind: &str, value: &str| FactRow {
             port,
+            proto: port.map(|_| "tcp".into()),
             kind: kind.into(),
             value: value.into(),
         };

@@ -640,6 +640,7 @@ mod tests {
     fn the_scan_page_shows_details_facts_and_the_host_card() {
         let fact = |port: Option<i64>, kind: &str, value: &str| crate::store::facts::FactRow {
             port,
+            proto: port.map(|_| "tcp".into()),
             kind: kind.into(),
             value: value.into(),
         };

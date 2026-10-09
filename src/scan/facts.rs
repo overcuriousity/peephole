@@ -5,7 +5,7 @@
 //! whose key is data (`http-grep`, `fcrdns`). Derived from the stored XML
 //! on every node (`store::facts`), like host keys, so nothing is
 //! replicated and older scans can be read after the fact.
-use super::hostkeys::{Node, elem, key_attr, table, walk_scripts};
+use super::hostkeys::{Node, elem, key_attr, push_ref, table, walk_scripts};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
@@ -132,6 +132,8 @@ pub struct Fact {
     pub value: String,
 }
 
+/// What `extract` finds in one scan: the `-sV` details of each port that
+/// has any, and the script facts in document order, at most `MAX_FACTS`.
 #[derive(Debug, Default)]
 pub struct Facts {
     pub ports: Vec<PortDetail>,
@@ -161,20 +163,12 @@ fn smb_value(s: &str) -> Option<String> {
 /// Everything in an nmap XML report that section 4 of the spec names.
 /// Unparsable input yields what was found before the error.
 pub fn extract(xml: &[u8]) -> Facts {
-    let (details, protos) = port_details(xml);
     let mut out = Facts {
-        ports: details,
+        ports: port_details(xml),
         facts: vec![],
     };
-    walk_scripts(xml, &SCRIPTS, &mut |port, id, _output, root| {
-        let at = (port > 0).then(|| {
-            let proto = protos
-                .iter()
-                .find(|(p, _)| *p == port)
-                .map(|(_, pr)| pr.clone())
-                .unwrap_or_else(|| "tcp".into());
-            (port, proto)
-        });
+    walk_scripts(xml, &SCRIPTS, &mut |port, proto, id, _output, root| {
+        let at = (port > 0).then(|| (port, proto.to_string()));
         let mut push = |kind: &'static str, v: Option<String>| {
             if let Some(value) = v {
                 out.facts.push(Fact {
@@ -240,10 +234,9 @@ pub fn extract(xml: &[u8]) -> Facts {
 }
 
 /// The `<service>` attributes and `<cpe>` texts of every port that has
-/// any, and the protocol of every port.
-fn port_details(xml: &[u8]) -> (Vec<PortDetail>, Vec<(u16, String)>) {
+/// any.
+fn port_details(xml: &[u8]) -> Vec<PortDetail> {
     let mut out = vec![];
-    let mut protos = vec![];
     let mut reader = Reader::from_reader(xml);
     let mut buf = Vec::new();
     let mut cur: Option<PortDetail> = None;
@@ -255,9 +248,6 @@ fn port_details(xml: &[u8]) -> (Vec<PortDetail>, Vec<(u16, String)>) {
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(0);
                 let proto = key_attr(e, "protocol").unwrap_or_else(|| "tcp".into());
-                if port > 0 {
-                    protos.push((port, proto.clone()));
-                }
                 cur = Some(PortDetail {
                     port,
                     proto,
@@ -289,6 +279,11 @@ fn port_details(xml: &[u8]) -> (Vec<PortDetail>, Vec<(u16, String)>) {
                     s.push_str(&t);
                 }
             }
+            Event::GeneralRef(r) => {
+                if let Some(s) = cpe.as_mut() {
+                    push_ref(s, &r);
+                }
+            }
             Event::End(ref e) => match e.name().as_ref() {
                 "cpe" => {
                     if let (Some(s), Some(p)) = (cpe.take(), cur.as_mut())
@@ -312,7 +307,7 @@ fn port_details(xml: &[u8]) -> (Vec<PortDetail>, Vec<(u16, String)>) {
         }
         buf.clear();
     }
-    (out, protos)
+    out
 }
 
 /// The label a page shows before a value of `kind`.
@@ -344,11 +339,17 @@ mod tests {
 
     const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/nmap-facts.xml");
 
-    fn values<'a>(f: &'a Facts, kind: &str) -> Vec<(Option<u16>, &'a str)> {
+    /// The (port, protocol) and value of every fact of `kind`.
+    fn values<'a>(f: &'a Facts, kind: &str) -> Vec<(Option<(u16, &'a str)>, &'a str)> {
         f.facts
             .iter()
             .filter(|x| x.kind == kind)
-            .map(|x| (x.port.as_ref().map(|p| p.0), x.value.as_str()))
+            .map(|x| {
+                (
+                    x.port.as_ref().map(|p| (p.0, p.1.as_str())),
+                    x.value.as_str(),
+                )
+            })
             .collect()
     }
 
@@ -374,53 +375,61 @@ mod tests {
         assert_eq!(
             values(&f, HTTP_TITLE),
             vec![
-                (Some(80), "PentAGI & friends"),
-                (Some(8443), "MinIO Console")
+                (Some((80, "tcp")), "PentAGI & friends"),
+                (Some((8443, "tcp")), "MinIO Console")
             ]
         );
         assert_eq!(
             values(&f, HTTP_REDIRECT),
-            vec![(Some(80), "http://192.0.2.7/login")]
+            vec![(Some((80, "tcp")), "http://192.0.2.7/login")]
         );
-        assert_eq!(values(&f, HTTP_SERVER), vec![(Some(80), "nginx/1.18.0")]);
+        assert_eq!(
+            values(&f, HTTP_SERVER),
+            vec![(Some((80, "tcp")), "nginx/1.18.0")]
+        );
         assert_eq!(
             values(&f, HTTP_AUTH),
-            vec![(Some(80), "Basic realm=\"bifrost\"")]
+            vec![(Some((80, "tcp")), "Basic realm=\"bifrost\"")]
         );
         assert_eq!(
             values(&f, NTLM_NETBIOS_COMPUTER),
-            vec![(Some(3389), "WIN-344VU98D3RU")]
+            vec![(Some((3389, "tcp")), "WIN-344VU98D3RU")]
         );
         assert_eq!(
             values(&f, NTLM_NETBIOS_DOMAIN),
-            vec![(Some(3389), "WORKGROUP")]
+            vec![(Some((3389, "tcp")), "WORKGROUP")]
         );
         assert_eq!(
             values(&f, NTLM_DNS_COMPUTER),
-            vec![(Some(3389), "WIN-344VU98D3RU")]
+            vec![(Some((3389, "tcp")), "WIN-344VU98D3RU")]
         );
         assert_eq!(
             values(&f, NTLM_DNS_DOMAIN),
-            vec![(Some(3389), "WIN-344VU98D3RU")]
+            vec![(Some((3389, "tcp")), "WIN-344VU98D3RU")]
         );
         assert_eq!(
             values(&f, NTLM_DNS_TREE),
-            vec![(Some(3389), "corp.example")]
+            vec![(Some((3389, "tcp")), "corp.example")]
         );
         assert_eq!(
             values(&f, NTLM_PRODUCT_VERSION),
-            vec![(Some(3389), "10.0.17763")]
+            vec![(Some((3389, "tcp")), "10.0.17763")]
         );
         assert_eq!(
             values(&f, SOCKS_METHOD),
             vec![
-                (Some(1080), "No authentication"),
-                (Some(1080), "Username and password")
+                (Some((1080, "tcp")), "No authentication"),
+                (Some((1080, "tcp")), "Username and password")
             ]
         );
         assert_eq!(
             values(&f, DNS_NSID),
-            vec![(Some(53), "9.18.1"), (Some(53), "ns1")]
+            vec![
+                (Some((53, "tcp")), "9.18.1"),
+                (Some((53, "tcp")), "ns1"),
+                (Some((53, "udp")), "ns1-udp")
+            ],
+            "the same port number on udp keeps its own protocol"
         );
         assert_eq!(values(&f, SMB_SERVER), vec![(None, "WIN-344VU98D3RU")]);
         assert_eq!(values(&f, SMB_DOMAIN), vec![(None, "WORKGROUP")]);
@@ -451,8 +460,8 @@ mod tests {
             assert!(!all.contains(&absent), "{absent} in {all:?}");
         }
         assert!(f.facts.iter().all(|x| x.kind != "Target_Name"));
-        // 2 titles, 1 redirect, 1 server, 1 login, 6 NTLM, 2 SOCKS, 2 NSID, 8 SMB.
-        assert_eq!(f.facts.len(), 23, "{:?}", f.facts);
+        // 2 titles, 1 redirect, 1 server, 1 login, 6 NTLM, 2 SOCKS, 3 NSID, 8 SMB.
+        assert_eq!(f.facts.len(), 24, "{:?}", f.facts);
     }
 
     #[test]
@@ -509,10 +518,38 @@ mod tests {
 
     #[test]
     fn unparsable_input_yields_what_came_before() {
-        let cut = &FIXTURE[..FIXTURE.len() / 2];
-        let f = extract(cut);
-        assert!(!f.ports.is_empty() || !f.facts.is_empty());
+        // Cut inside port 80's line: ports 22 and 53 are whole.
+        let at = FIXTURE
+            .windows(br#"portid="80""#.len())
+            .position(|w| w == br#"portid="80""#)
+            .unwrap();
+        let f = extract(&FIXTURE[..at]);
+        assert_eq!(f.ports.len(), 1, "port 22's details: {:?}", f.ports);
+        assert_eq!(
+            values(&f, DNS_NSID),
+            vec![(Some((53, "tcp")), "9.18.1"), (Some((53, "tcp")), "ns1")]
+        );
+        assert_eq!(f.facts.len(), 2, "{:?}", f.facts);
         assert!(extract(b"not xml").facts.is_empty());
+    }
+
+    #[test]
+    fn a_login_without_params_is_the_scheme_and_smb_values_without_nul_are_kept() {
+        let xml = br#"<nmaprun><host><ports><port protocol="tcp" portid="80"><script id="http-auth" output="x"><table><elem key="scheme">Negotiate</elem></table></script></port></ports>
+<hostscript><script id="smb-os-discovery" output="o"><elem key="server">SRV-1</elem></script></hostscript></host></nmaprun>"#;
+        let f = extract(xml);
+        assert_eq!(
+            values(&f, HTTP_AUTH),
+            vec![(Some((80, "tcp")), "Negotiate")]
+        );
+        assert_eq!(values(&f, SMB_SERVER), vec![(None, "SRV-1")]);
+    }
+
+    #[test]
+    fn a_cpe_keeps_its_escaped_characters() {
+        let xml = br#"<nmaprun><host><ports><port protocol="tcp" portid="80"><service name="http"><cpe>cpe:/a:a&amp;b:c&#x21;</cpe></service></port></ports></host></nmaprun>"#;
+        let f = extract(xml);
+        assert_eq!(f.ports[0].cpe, vec!["cpe:/a:a&b:c!"]);
     }
 
     #[test]

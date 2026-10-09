@@ -49,6 +49,8 @@ pub struct PortRow {
 }
 
 impl PortRow {
+    /// The CPEs nmap named for the service, in its order; none when the
+    /// column is NULL or not a JSON array of strings.
     pub fn cpes(&self) -> Vec<String> {
         self.cpe
             .as_deref()
@@ -56,7 +58,8 @@ impl PortRow {
             .unwrap_or_default()
     }
 
-    /// Product, version and extra info on one line.
+    /// Product, version and extra info, the ones set, joined with spaces
+    /// on one line (`OpenSSH 9.6p1 Ubuntu Linux; protocol 2.0`).
     pub fn described(&self) -> String {
         [&self.product, &self.version, &self.extrainfo]
             .into_iter()
