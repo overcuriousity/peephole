@@ -72,8 +72,9 @@ jobs:
       matrix:
         checks: [advisories, bans licenses sources]
     # A new advisory against a dependency shows up here without blocking
-    # unrelated work; licenses, bans and sources must pass.
-    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    # unrelated work, but it blocks a versioned release (a v* tag: the
+    # publish job needs this one); licenses, bans and sources must pass.
+    continue-on-error: ${{ matrix.checks == 'advisories' && !startsWith(github.ref, 'refs/tags/v') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
