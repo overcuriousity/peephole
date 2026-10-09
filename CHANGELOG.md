@@ -27,6 +27,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - `cluster.takeover_hours` must be between 1 and 720: a window of minutes
   handed jobs of arbiters that were merely slow to others, which scanned
   them twice.
+- Protocol 8: an admission dated before its sponsor's own admission counts
+  as made at it, for the 20-a-day limit and the date it is kept with. A
+  new member could otherwise date admissions back over weeks it was not in
+  the cluster, 20 for each day. A node's own admission of its inviter or
+  a configured peer does not date them: they were members before.
 
 ### Fixed
 

@@ -202,6 +202,9 @@ pub async fn join(node: &Node, token: &str) -> Result<MemberInfo> {
                 if info.address.is_none() {
                     info.address = Some(addr.clone());
                 }
+                // The inviter was a member before this node: this node's
+                // admission of it does not date it.
+                super::members::vouch(&mut *node.store.pool.acquire().await?, &info.id).await?;
                 repl::append(node, &[Record::MemberAdd(info.clone())]).await?;
                 super::set_detached(&node.store, None).await?;
                 node.reload_members().await?;

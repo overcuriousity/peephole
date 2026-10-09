@@ -2756,6 +2756,108 @@ mod tests {
         assert!(node.members().contains_key(&y.id));
     }
 
+    /// How many members `sponsor` admitted here.
+    async fn sponsored(node: &super::Node, sponsor: &NodeId) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM sponsorships WHERE sponsor = ?")
+            .bind(&sponsor.0[..])
+            .fetch_one(&node.store.pool)
+            .await
+            .unwrap()
+    }
+
+    /// `n` admissions signed by `by`, at sequences from `seq`, one a day
+    /// going back from `days` days ago.
+    fn backdated_adds(by: &Identity, seq: u64, n: u64, days: u64) -> Vec<WireEntry> {
+        let now = super::hlc::wall_ms();
+        (0..n)
+            .map(|i| {
+                let s = Identity::generate().unwrap();
+                let at = (now - (days - i) * 24 * 3_600_000) << 16;
+                WireEntry::sign(by, seq + i, at, &Record::MemberAdd(info(s.id, "s"))).unwrap()
+            })
+            .collect()
+    }
+
+    /// A new member's admissions dated before its own admission count as
+    /// made at it: dating them back over weeks admits no more than the
+    /// daily limit, in its log or sent ahead of it.
+    #[tokio::test]
+    async fn admissions_dated_before_the_sponsors_own_count_at_it() {
+        let (_d, node) = test_node(0).await;
+        let m = Identity::generate().unwrap();
+        super::append(&node, &[Record::MemberAdd(info(m.id, "m"))])
+            .await
+            .unwrap();
+        let st = super::apply_batch(&node, backdated_adds(&m, 1, 25, 25))
+            .await
+            .unwrap();
+        assert_eq!(st.applied, 25, "{st:?}");
+        assert_eq!(
+            sponsored(&node, &m.id).await,
+            super::super::members::ADMISSIONS_PER_DAY
+        );
+
+        let (_d, node) = test_node(0).await;
+        super::append(&node, &[Record::MemberAdd(info(m.id, "m"))])
+            .await
+            .unwrap();
+        super::apply_membership_ahead(&node, &backdated_adds(&m, 1, 25, 25))
+            .await
+            .unwrap();
+        assert!(sponsored(&node, &m.id).await <= super::super::members::ADMISSIONS_PER_DAY);
+    }
+
+    /// A node this one vouched for as a member already (its inviter, a
+    /// configured peer) is not dated by that: its earlier admissions stand.
+    #[tokio::test]
+    async fn vouched_members_keep_their_earlier_admissions() {
+        let (_d, node) = test_node(0).await;
+        let a = Identity::generate().unwrap();
+        {
+            let mut conn = node.store.pool.acquire().await.unwrap();
+            super::super::members::vouch(&mut conn, &a.id)
+                .await
+                .unwrap();
+        }
+        super::append(&node, &[Record::MemberAdd(info(a.id, "a"))])
+            .await
+            .unwrap();
+        let st = super::apply_batch(&node, backdated_adds(&a, 1, 25, 25))
+            .await
+            .unwrap();
+        assert_eq!(st.applied, 25, "{st:?}");
+        assert_eq!(sponsored(&node, &a.id).await, 25, "one a day, all stand");
+    }
+
+    /// Founders that admitted each other days apart (configured peers
+    /// booted apart) stay members wherever their admissions arrive first.
+    #[tokio::test]
+    async fn founders_admitted_days_apart_stay_members() {
+        let (_d, node) = test_node(0).await;
+        let (a, b) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        super::append(&node, &[Record::MemberAdd(info(b.id, "b"))])
+            .await
+            .unwrap();
+        let b_adds_a =
+            WireEntry::sign(&b, 1, now_hlc(1), &Record::MemberAdd(info(a.id, "a"))).unwrap();
+        let a_adds_b = WireEntry::sign(
+            &a,
+            1,
+            (super::hlc::wall_ms() - 3 * 24 * 3_600_000) << 16,
+            &Record::MemberAdd(info(b.id, "b")),
+        )
+        .unwrap();
+        super::apply_batch(&node, vec![b_adds_a]).await.unwrap();
+        let st = super::apply_batch(&node, vec![a_adds_b]).await.unwrap();
+        assert_eq!(st.applied, 1, "{st:?}");
+        assert_eq!(
+            sponsored(&node, &a.id).await,
+            1,
+            "a's admission of b stands"
+        );
+        assert!(trusted(&node, &a.id).await && trusted(&node, &b.id).await);
+    }
+
     /// Membership sent ahead keeps its origin's order: a member cannot sign
     /// admissions at made-up sequences dated before what is held of it (or
     /// before what it admitted ahead earlier), which would escape the daily

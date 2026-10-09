@@ -515,6 +515,9 @@ impl Node {
         }
         for p in &self.cfg.peers {
             let id = NodeId::parse(&p.public_key)?;
+            // A configured peer may have been a member long before this
+            // node: this node's admission of it does not date it.
+            members::vouch(&mut *self.store.pool.acquire().await?, &id).await?;
             match all.iter().find(|m| m.id == id) {
                 None => records.push(Record::MemberAdd(MemberInfo {
                     id,
