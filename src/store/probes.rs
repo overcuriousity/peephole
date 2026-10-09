@@ -189,7 +189,7 @@ pub(crate) async fn apply_ip_name(
     use crate::intel::dns;
     if r.uid.len() > MAX_UID
         || dns::valid_name(&r.name).as_deref() != Some(r.name.as_str())
-        || r.answers.len() > dns::MAX_RESOLVERS
+        || r.answers.len() > dns::MAX_QUORUM
         || r.answers
             .iter()
             .any(|(_, a)| a.as_ref().is_ok_and(|v| v.len() > dns::MAX_ADDRS))

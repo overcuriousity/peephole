@@ -5463,7 +5463,12 @@ async fn an_old_outbound_only_member_is_not_asked() {
         "{quoted:?}"
     );
     let geo: peephole::intel::SharedGeo = Default::default();
-    let resolvers = dns::choose(&na.node, &Default::default(), &geo);
+    let resolvers = dns::choose(
+        &na.node,
+        &Default::default(),
+        &geo,
+        peephole::credits::price::RESOLVE,
+    );
     assert!(resolvers.iter().all(|r| r.id != b.id));
     assert!(ask::vantages(&na.node, &geo).iter().all(|v| v.node != b.id));
 

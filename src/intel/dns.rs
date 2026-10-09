@@ -1,5 +1,5 @@
 //! Host names: what the admin may type into the Lookup box, and how a name
-//! is resolved by several nodes at once. Each resolver's answer is kept in
+//! is resolved by a quorum of nodes (`quorum`), the cheapest first. Each resolver's answer is kept in
 //! an `ip_name` record; every node derives the per-address votes from those
 //! answers itself (see `store::probes::apply_ip_name`), so a tally is never
 //! taken on trust.
@@ -14,8 +14,17 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Most nodes asked to resolve one name (this node included).
-pub const MAX_RESOLVERS: usize = 5;
+/// Most nodes asked for a quorum good (a name resolved, a source's
+/// reverse names), this node included.
+pub const MAX_QUORUM: usize = 9;
+
+/// How many nodes a quorum good asks: a majority of the `n` reachable
+/// members announcing a price for it (this node included), at most
+/// [`MAX_QUORUM`]; alone, 1.
+pub fn quorum(n: usize) -> usize {
+    (n / 2 + 1).min(MAX_QUORUM)
+}
+
 /// Most agreed addresses of a name that are looked up in turn.
 pub const MAX_FOLLOWED: usize = 16;
 /// Most addresses kept of one resolver's answer.
@@ -285,9 +294,9 @@ pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> 
     }
 }
 
-/// What `id` announces for resolving a name (0: free); None: no price, or
-/// it predates the market.
-pub fn resolver_price(node: &Node, id: &NodeId) -> Option<u32> {
+/// What `id` announces for `good` (0: free); None: no price, or it
+/// predates the market.
+pub fn member_price(node: &Node, id: &NodeId, good: &str) -> Option<u32> {
     let m = node.members().get(id).cloned()?;
     if !crate::credits::pay::pays_with(m.proto_max) {
         return None;
@@ -297,17 +306,13 @@ pub fn resolver_price(node: &Node, id: &NodeId) -> Option<u32> {
         .hb
         .prices
         .iter()
-        .find(|(g, _)| g == crate::credits::price::RESOLVE)
+        .find(|(g, _)| g == good)
         .map(|(_, mc)| *mc)
 }
 
-/// The candidates that can be paid, in their order.
-fn keep_priced(candidates: Vec<(Resolver, bool)>) -> Vec<Resolver> {
-    candidates
-        .into_iter()
-        .filter(|(_, priced)| *priced)
-        .map(|(r, _)| r)
-        .collect()
+/// What `id` announces for resolving a name.
+pub fn resolver_price(node: &Node, id: &NodeId) -> Option<u32> {
+    member_price(node, id, crate::credits::price::RESOLVE)
 }
 
 /// A node that may be asked to resolve a name.
@@ -347,9 +352,15 @@ pub fn describe(node: &Node, geo: &SharedGeo, id: &NodeId) -> (String, Option<St
     (name, country)
 }
 
-/// Up to [`MAX_RESOLVERS`]: this node, then random live members
-/// preferring non-siblings and unseen countries.
-pub fn choose(node: &Node, siblings: &HashSet<NodeId>, geo: &SharedGeo) -> Vec<Resolver> {
+/// The nodes asked for `good`: this node, then the [`quorum`]'s other
+/// members among the live, callable members that announce a price for
+/// it, cheapest first (see [`pick_cheapest`]).
+pub fn choose(
+    node: &Node,
+    siblings: &HashSet<NodeId>,
+    geo: &SharedGeo,
+    good: &str,
+) -> Vec<Resolver> {
     use rand::seq::SliceRandom;
     let me = node.id();
     let resolver = |id: NodeId| {
@@ -366,44 +377,53 @@ pub fn choose(node: &Node, siblings: &HashSet<NodeId>, geo: &SharedGeo) -> Vec<R
         .into_iter()
         .filter(|id| *id != me && !node.is_blocked(id) && node.can_call(id))
         .collect();
+    // Equal prices in random order, so no member is preferred.
     others.shuffle(&mut rand::rng());
-    let others = keep_priced(
-        others
-            .into_iter()
-            .map(|id| (resolver(id), resolver_price(node, &id).is_some()))
-            .collect(),
-    );
-    let candidates: Vec<Resolver> = std::iter::once(resolver(me)).chain(others).collect();
-    pick(&candidates, MAX_RESOLVERS)
+    let priced: Vec<(Resolver, u32)> = others
+        .into_iter()
+        .filter_map(|id| Some((resolver(id), member_price(node, &id, good)?)))
+        .collect();
+    let q = quorum(priced.len() + 1);
+    pick_cheapest(resolver(me), &priced, q)
 }
 
-/// The first candidate (this node), then up to `n` in all: non-siblings
-/// before siblings, and within each a new country before a seen one;
-/// otherwise in the candidates' order.
-pub fn pick(candidates: &[Resolver], n: usize) -> Vec<Resolver> {
-    let Some((first, rest)) = candidates.split_first() else {
-        return vec![];
-    };
-    let mut out = vec![first.clone()];
-    let mut seen: HashSet<&str> = first.country.as_deref().into_iter().collect();
-    for (sibling, fresh) in [(false, true), (false, false), (true, true), (true, false)] {
-        for c in rest {
-            if out.len() >= n {
-                return out;
+/// `first` (this node), then up to `n` in all of `rest`, cheapest first;
+/// among equal prices non-siblings before siblings, and within each a new
+/// country before a seen one, otherwise in `rest`'s order.
+pub fn pick_cheapest(first: Resolver, rest: &[(Resolver, u32)], n: usize) -> Vec<Resolver> {
+    let mut rest: Vec<&(Resolver, u32)> = rest.iter().collect();
+    // Stable: equal prices keep their (shuffled) order.
+    rest.sort_by_key(|(_, p)| *p);
+    let mut seen: HashSet<String> = first.country.iter().cloned().collect();
+    let mut out = vec![first];
+    let mut i = 0;
+    while i < rest.len() && out.len() < n {
+        let price = rest[i].1;
+        let tier: Vec<&Resolver> = rest[i..]
+            .iter()
+            .take_while(|(_, p)| *p == price)
+            .map(|(r, _)| r)
+            .collect();
+        i += tier.len();
+        for (sibling, fresh) in [(false, true), (false, false), (true, true), (true, false)] {
+            for c in &tier {
+                if out.len() >= n {
+                    return out;
+                }
+                if c.sibling != sibling || out.iter().any(|o| o.id == c.id) {
+                    continue;
+                }
+                if fresh && !c.country.as_deref().is_some_and(|x| !seen.contains(x)) {
+                    continue;
+                }
+                if let Some(x) = &c.country {
+                    seen.insert(x.clone());
+                }
+                out.push((*c).clone());
             }
-            if c.sibling != sibling || out.iter().any(|o| o.id == c.id) {
-                continue;
-            }
-            if fresh && !c.country.as_deref().is_some_and(|x| !seen.contains(x)) {
-                continue;
-            }
-            if let Some(x) = c.country.as_deref() {
-                seen.insert(x);
-            }
-            out.push(c.clone());
         }
     }
-    out.truncate(n);
+    out.truncate(n.max(1));
     out
 }
 
@@ -503,7 +523,7 @@ pub async fn lookup_with(
                 .collect();
             let me = node.id();
             let remote = futures::future::join_all(
-                choose(node, &siblings, geo)
+                choose(node, &siblings, geo, crate::credits::price::RESOLVE)
                     .into_iter()
                     .filter(|r| r.id != me)
                     .map(|r| ask(node, r.id, &name)),
@@ -744,16 +764,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolvers_prefer_non_siblings_and_new_countries() {
-        let r = |i: u8, sibling: bool, country: Option<&str>| Resolver {
+    fn r(i: u8, sibling: bool, country: Option<&str>) -> Resolver {
+        Resolver {
             id: NodeId([i; 32]),
             name: format!("n{i}"),
             sibling,
             country: country.map(str::to_string),
-        };
-        let all = [
-            r(0, false, Some("DE")),
+        }
+    }
+
+    fn ids(v: Vec<Resolver>) -> Vec<u8> {
+        v.iter().map(|r| r.id.0[0]).collect()
+    }
+
+    #[test]
+    fn the_quorum_is_a_majority_of_the_priced_members_and_at_most_nine() {
+        for (n, q) in [
+            (0, 1),
+            (1, 1),
+            (2, 2),
+            (3, 2),
+            (4, 3),
+            (5, 3),
+            (16, 9),
+            (17, 9),
+            (100, 9),
+        ] {
+            assert_eq!(quorum(n), q, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn at_one_price_resolvers_prefer_non_siblings_and_new_countries() {
+        let rest: Vec<(Resolver, u32)> = [
             r(1, true, Some("FR")),
             r(2, false, Some("DE")),
             r(3, false, Some("US")),
@@ -761,39 +804,35 @@ mod tests {
             r(5, true, Some("JP")),
             r(6, false, Some("US")),
             r(7, false, Some("BR")),
-        ];
-        let ids = |v: Vec<Resolver>| v.iter().map(|r| r.id.0[0]).collect::<Vec<_>>();
+        ]
+        .into_iter()
+        .map(|c| (c, 0))
+        .collect();
+        let me = || r(0, false, Some("DE"));
         // This node; new countries among non-siblings; then the other non-siblings.
-        assert_eq!(ids(pick(&all, MAX_RESOLVERS)), [0, 3, 7, 2, 4]);
+        assert_eq!(ids(pick_cheapest(me(), &rest, 5)), [0, 3, 7, 2, 4]);
         // Siblings only when nothing else is left, a new country first.
-        assert_eq!(ids(pick(&all, 8)), [0, 3, 7, 2, 4, 6, 1, 5]);
-        assert_eq!(ids(pick(&all[..2], MAX_RESOLVERS)), [0, 1]);
-        assert!(pick(&[], MAX_RESOLVERS).is_empty());
-    }
-
-    fn priced_candidate(n: u8, priced: bool) -> (Resolver, bool) {
-        (
-            Resolver {
-                id: NodeId([n; 32]),
-                name: format!("n{n}"),
-                sibling: false,
-                country: None,
-            },
-            priced,
-        )
+        assert_eq!(ids(pick_cheapest(me(), &rest, 8)), [0, 3, 7, 2, 4, 6, 1, 5]);
+        assert_eq!(ids(pick_cheapest(me(), &rest[..1], 5)), [0, 1]);
+        assert_eq!(ids(pick_cheapest(me(), &[], 3)), [0], "alone");
     }
 
     #[test]
-    fn only_priced_market_resolvers_are_chosen() {
-        let kept = keep_priced(vec![
-            priced_candidate(1, true),
-            priced_candidate(2, false),
-            priced_candidate(3, true),
-        ]);
+    fn the_cheapest_are_asked_first_and_diversity_breaks_ties() {
+        let rest = [
+            (r(7, false, Some("BR")), 9),
+            (r(4, false, None), 3),
+            (r(2, false, Some("DE")), 1),
+            (r(3, false, Some("US")), 1),
+        ];
+        let me = || r(0, false, Some("DE"));
         assert_eq!(
-            kept.iter().map(|r| r.id).collect::<Vec<_>>(),
-            [NodeId([1; 32]), NodeId([3; 32])]
+            ids(pick_cheapest(me(), &rest, 3)),
+            [0, 3, 2],
+            "at 1: the new country first"
         );
+        assert_eq!(ids(pick_cheapest(me(), &rest, 4)), [0, 3, 2, 4]);
+        assert_eq!(ids(pick_cheapest(me(), &rest, 9)), [0, 3, 2, 4, 7]);
     }
 
     #[test]
