@@ -16,7 +16,7 @@ use sqlx::SqliteConnection;
 
 /// Bounds on what a peer may send.
 const MAX_UID: usize = 64;
-const MAX_PORTS: usize = 16;
+const MAX_PORTS: usize = 1024;
 const MAX_DETAIL: usize = 64 * 1024;
 /// Longest protocol, outcome, address source and build text accepted.
 const MAX_SHORT: usize = 64;
@@ -558,6 +558,32 @@ mod tests {
         assert!(
             keys.iter().all(|k| k.kind != "http-body"),
             "not a sha256 hex"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_may_send_more_than_sixteen_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut r = rec("203.0.113.10", 7);
+        r.ports = (0u16..17)
+            .map(|i| ProbePortRec {
+                port: 1000 + i,
+                protocol: "banner".into(),
+                outcome: "ok".into(),
+                detail_json: "{}".into(),
+            })
+            .collect();
+        let ctx = Ctx {
+            origin: Some(&NodeId([7; 32])),
+            hlc: 5,
+        };
+        let mut conn = store.pool.acquire().await.unwrap();
+        assert_eq!(
+            apply(&mut conn, ctx, &Record::ProbeResult(r))
+                .await
+                .unwrap(),
+            Effect::Applied
         );
     }
 }

@@ -192,7 +192,6 @@ impl Prober {
                     ports: wanted
                         .ports
                         .iter()
-                        .take(super::MAX_PORTS)
                         .map(|(port, service)| ProbePortRec {
                             port: *port,
                             protocol: super::protocol_for(*port, service.as_deref()).into(),
