@@ -418,6 +418,14 @@ audits and relay leases. The supply is fixed; prices follow sales.
   protocol 7 is not paid, funded or charged, and is served no entries of
   protocol 7 until it upgrades.
 
+  Protocol 8 changes how the credits are counted, so upgrade all members
+  together: a scanner charges before it reports a job done (the scans of
+  older scanners are not designated for audits), only members of
+  protocol 8 audit level 5, and a member that does not earn here keeps
+  none of its income at the end of the count instead of losing its sales
+  over the whole window. A node of protocol 7 counts those balances
+  differently.
+
   Earlier protocols: Protocol 4: payments run only between upgraded nodes,
   so upgrade all nodes together.
 
