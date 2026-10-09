@@ -682,7 +682,8 @@ async fn ask_server(
 
 /// What to offer a server that turned down `offered` naming `named`: its
 /// price when that is higher, but at most [`RETRY_AT_MOST`] times the
-/// offer (one mc for a request without an offer). None: do not offer again (the next server is asked instead).
+/// offer (one mc for a request without an offer). None: do not offer
+/// again (the next server is asked instead).
 pub(crate) fn retry_price(offered: Mc, named: Option<u32>, nothing_answered: bool) -> Option<Mc> {
     let p = named? as Mc;
     let bound = offered.max(1).saturating_mul(RETRY_AT_MOST);

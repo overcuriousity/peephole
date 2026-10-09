@@ -541,6 +541,13 @@ async fn ask(node: &Arc<Node>, id: NodeId, name: &str) -> (NodeId, Result<Vec<Ip
         && r.error.is_some()
         && let Some(p) = crate::credits::pay::retry_price(price as u64, r.price_mc, true)
     {
+        // A declined offer comes with a receipt of nothing: fetch it, so
+        // what the first offer held is free for the next one.
+        if price > 0
+            && let Err(e) = node.sync_around_request(id).await
+        {
+            tracing::debug!(?e, "sync after a declined resolve offer failed");
+        }
         resp = ask_once(node, id, name, p).await;
     }
     let answer = match resp {
@@ -584,6 +591,75 @@ async fn ask_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn bare_node(dir: &std::path::Path) -> Arc<Node> {
+        let store = crate::store::Store::connect(&dir.join("t.db"))
+            .await
+            .unwrap();
+        let node = Node::open(crate::cluster::NodeParams {
+            identity: crate::cluster::identity::Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store,
+            proto: (1, 1),
+            data_dir: dir.to_path_buf(),
+            retention_days: 0,
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        node
+    }
+
+    /// A resolution without an offer: at a price it is declined naming it;
+    /// at zero it is served free, with no receipt. (The name is under
+    /// `.invalid`, so the resolver answers with an error, never a network
+    /// result: the free path is shown by reaching it.)
+    #[tokio::test]
+    async fn a_resolution_without_an_offer_is_free_only_at_zero() {
+        use crate::credits::price;
+        let dir = tempfile::tempdir().unwrap();
+        let node = bare_node(dir.path()).await;
+        let other = NodeId([9; 32]);
+        let req = ResolveReq {
+            name: "example.invalid".into(),
+            offer_seq: None,
+        };
+        let head = || node.own_head.load(std::sync::atomic::Ordering::Relaxed);
+        node.set_price_table(Arc::new(price::Table {
+            resolve_mc: 5,
+            ..Default::default()
+        }));
+        let before = head();
+        let resp = serve_resolve(&node, other, &req).await;
+        assert_eq!(resp.price_mc, Some(5), "{resp:?}");
+        assert!(
+            resp.error
+                .as_deref()
+                .unwrap()
+                .contains("the request carries no offer"),
+            "{resp:?}"
+        );
+        assert_eq!((resp.charged_mc, head()), (0, before));
+        node.set_price_table(Arc::new(price::Table::default()));
+        let resp = serve_resolve(&node, other, &req).await;
+        assert_eq!((resp.price_mc, resp.charged_mc), (None, 0), "{resp:?}");
+        assert!(
+            !resp.error.unwrap_or_default().contains("no offer"),
+            "the resolver was reached"
+        );
+        assert_eq!(head(), before, "no receipt");
+    }
 
     #[test]
     fn names_are_validated_and_normalised() {
