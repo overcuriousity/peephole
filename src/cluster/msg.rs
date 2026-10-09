@@ -662,7 +662,7 @@ mod tests {
         lease_secs: u64,
     }
 
-    /// An unfunded grant encodes exactly like the old one; each side
+    /// A grant at 0 encodes exactly like the old one; each side
     /// decodes the other's.
     #[test]
     fn grants_stay_compatible_across_versions() {
@@ -673,7 +673,7 @@ mod tests {
             level: 2,
             lease_secs: 120,
         };
-        let unfunded = Grant {
+        let free = Grant {
             job_uid: "j".into(),
             ip: "203.0.113.1".into(),
             level: 2,
@@ -681,12 +681,12 @@ mod tests {
             offer_seq: None,
             price_mc: 0,
         };
-        assert_eq!(encode(&unfunded).unwrap(), encode(&old).unwrap());
-        assert_eq!(decode::<Grant>(&encode(&old).unwrap()).unwrap(), unfunded);
+        assert_eq!(encode(&free).unwrap(), encode(&old).unwrap());
+        assert_eq!(decode::<Grant>(&encode(&old).unwrap()).unwrap(), free);
         let funded = Grant {
             offer_seq: Some(7),
             price_mc: 40,
-            ..unfunded
+            ..free
         };
         assert_eq!(decode::<Grant>(&encode(&funded).unwrap()).unwrap(), funded);
         assert_eq!(decode::<OldGrant>(&encode(&funded).unwrap()).unwrap(), old);

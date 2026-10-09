@@ -71,9 +71,7 @@ pub async fn hold_self(pool: &sqlx::SqlitePool, job_uid: &str, mc: u32) -> Resul
 pub fn price_for(node: &Node, scanner: &NodeId) -> Option<u32> {
     let table = node.price_table();
     if *scanner == node.id() {
-        return table
-            .price_of(price::SCAN)
-            .or_else(|| node.roles().scanner.then_some(0));
+        return price::own_scan_price(node, &table);
     }
     let k = node.status.known(scanner)?;
     if !node
@@ -408,7 +406,11 @@ mod tests {
             .await
             .unwrap();
         hold_self(pool, "j4", 0).await.unwrap();
-        assert_eq!(self_committed(pool, &me).await.unwrap(), 50, "unpaid");
+        assert_eq!(
+            self_committed(pool, &me).await.unwrap(),
+            50,
+            "reservation cleared"
+        );
         hold_self(pool, "j4", 25).await.unwrap();
         assert_eq!(self_committed(pool, &me).await.unwrap(), 75, "funded anew");
     }

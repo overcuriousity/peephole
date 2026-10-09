@@ -25,6 +25,16 @@ pub const PAID_TARGET: f64 = 0.9;
 /// scanner's price; a scanner takes no less than its price divided by it.
 pub const PRICE_TOLERANCE: f64 = 1.25;
 
+/// What this node sells a scan job for: its price, or 0 before its first
+/// refresh while it runs a scanner (with a pace), as a prober does. None:
+/// it does not scan.
+pub fn own_scan_price(node: &Node, table: &Table) -> Option<u32> {
+    table.price_of(SCAN).or_else(|| {
+        let scans = node.roles().scanner && node.status.local.lock().unwrap().pace.is_some();
+        scans.then_some(0)
+    })
+}
+
 /// What an arbiter offers a scanner: what it announces, at most
 /// [`PRICE_TOLERANCE`] times this node's own copy. None: not a scanner,
 /// or no copy here yet; the price cannot be capped.

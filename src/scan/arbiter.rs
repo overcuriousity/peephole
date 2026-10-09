@@ -962,9 +962,11 @@ pub async fn takeover_loop(node: Arc<Node>, mut shutdown: tokio::sync::watch::Re
 /// - is blocked here (scanners here skip it, so its jobs would be stranded;
 ///   any scanner node that blocked it adopts, whatever its rank),
 /// - has been silent for `window` (lowest live scanner only), or
-/// - keeps running but has not touched a job for `window` while this
-///   node's scanner has idle workers (lowest live scanner only): an
-///   arbiter that never hands its jobs out.
+/// - keeps running but has left a job marked running for `window` while
+///   this node's scanner has idle workers (lowest live scanner only): a
+///   grant whose scan cannot still be running. A live arbiter's queued
+///   jobs stay with it: one that no claimant can be paid for waits for
+///   its arbiter's funds, not for another node's.
 async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Result<()> {
     let me = node.id();
     if !node.roles().scanner {
@@ -1022,14 +1024,16 @@ async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Re
             .fetch_all(&node.store.pool)
             .await?
         } else if lowest && idle {
-            // A running job of a live arbiter may be a long level-4 scan
-            // whose lease is renewed without touching the job row: take it
-            // only once no scan can still be running.
+            // Only stale running jobs of a live arbiter: its queued jobs
+            // wait for its own funding (adopting them would have this node
+            // pay for them). A running job may be a long level-4 scan whose
+            // lease is renewed without touching the job row: take it only
+            // once no scan can still be running.
             sqlx::query_scalar(
                 "SELECT uid FROM scan_jobs WHERE arbiter = ?
                    AND MAX(COALESCE(hlc, 0), status_hlc) < ?
-                   AND (status = 'queued' OR (status = 'running'
-                        AND (started_at IS NULL OR started_at < datetime('now', ?))))
+                   AND status = 'running'
+                   AND (started_at IS NULL OR started_at < datetime('now', ?))
                  LIMIT 500",
             )
             .bind(&a)
@@ -1128,6 +1132,12 @@ mod tests {
         .await
         .unwrap();
         node.bootstrap().await.unwrap();
+        // Its scanner runs (it sells at 0 before its first refresh).
+        node.status.local.lock().unwrap().pace = Some(crate::cluster::status::PaceInfo {
+            max_workers: 2,
+            max_scans_per_hour: 60,
+            timeout_secs: 600,
+        });
         let (tx, rx) = tokio::sync::watch::channel(false);
         let arbiter = Arbiter::start(node.clone(), rx).await.unwrap();
         (node, arbiter, store, tx)
@@ -1605,17 +1615,24 @@ mod tests {
     /// A member with the scanner role, heard from just now, announcing
     /// `price_mc` for a scan job.
     async fn remote_scanner(node: &Node, price_mc: u32) -> NodeId {
+        remote_member(node, "scanner", price_mc).await
+    }
+
+    /// A member with `role`, heard from just now, announcing `price_mc`
+    /// for a scan job.
+    async fn remote_member(node: &Node, role: &str, price_mc: u32) -> NodeId {
         let id = Identity::generate().unwrap().id;
         let now = crate::cluster::hlc::wall_ms() << 16;
         sqlx::query(
             "INSERT INTO members (id, name, roles_json, proto_min, proto_max, sponsor,
                                   info_hlc, admitted_hlc)
-             VALUES (?1, ?2, '[\"scanner\"]', 1, ?3, ?1, ?4, ?4)",
+             VALUES (?1, ?2, json_array(?5), 1, ?3, ?1, ?4, ?4)",
         )
         .bind(&id.0[..])
         .bind(format!("s-{price_mc}"))
         .bind(crate::cluster::rpc::proto::SCAN_PRICE_PROTO as i64)
         .bind(now as i64)
+        .bind(role)
         .execute(&node.store.pool)
         .await
         .unwrap();
@@ -1624,7 +1641,7 @@ mod tests {
             node: id,
             at_ms: crate::cluster::hlc::wall_ms(),
             neighbours: vec![],
-            roles: vec!["scanner".into()],
+            roles: vec![role.into()],
             version: String::new(),
             pace: None,
             active_scans: 0,
@@ -2093,5 +2110,56 @@ mod tests {
             .unwrap();
         assert!(got.iter().all(Option::is_none), "{got:?}");
         assert_eq!(status(&store, &uid).await, "queued");
+    }
+
+    /// The lowest idle scanner adopts a live arbiter's stale running job,
+    /// whose scan cannot still be running, but not its stale queued job:
+    /// that waits for its arbiter's funding.
+    #[tokio::test]
+    async fn a_live_arbiters_queued_jobs_are_not_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _arbiter, store, _tx) = setup(dir.path()).await;
+        let live = remote_member(&node, "listener", 0).await;
+        let ip = store
+            .upsert_ip("198.51.100.77".parse().unwrap())
+            .await
+            .unwrap();
+        let old = format!("-{} hours", crate::scan::pace::STALE_RUNNING_HOURS + 1);
+        for (uid, status, started) in [("q", "queued", None), ("r", "running", Some(&old))] {
+            sqlx::query(
+                "INSERT INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at,
+                                        started_at, scanner)
+                 VALUES (?1, ?2, ?2, 1, ?3, 2, ?4, datetime('now', '-1 day'),
+                         datetime('now', ?5), CASE WHEN ?5 IS NULL THEN NULL ELSE ?2 END)",
+            )
+            .bind(uid)
+            .bind(&live.0[..])
+            .bind(ip.id)
+            .bind(status)
+            .bind(started)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        takeover_once(
+            &node,
+            &Recorder::Cluster(node.clone()),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let arbiter_of = |uid: &'static str| {
+            let store = store.clone();
+            async move {
+                let a: Vec<u8> = sqlx::query_scalar("SELECT arbiter FROM scan_jobs WHERE uid = ?")
+                    .bind(uid)
+                    .fetch_one(&store.pool)
+                    .await
+                    .unwrap();
+                NodeId::from_slice(&a).unwrap()
+            }
+        };
+        assert_eq!(arbiter_of("q").await, live, "queued: waits for its arbiter");
+        assert_eq!(arbiter_of("r").await, node.id(), "stale running: adopted");
     }
 }

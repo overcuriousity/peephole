@@ -429,10 +429,7 @@ impl Node {
             prices,
             public_addrs: self.status.public_addresses(),
             probe_price_mc: self.prober().map(|p| p.price(&table)),
-            // A scanner sells free until its first refresh, as a prober does.
-            scan_price_mc: table
-                .price_of(crate::credits::price::SCAN)
-                .or_else(|| (self.roles().scanner && local.pace.is_some()).then_some(0)),
+            scan_price_mc: crate::credits::price::own_scan_price(self, &table),
             scan_budget_mc: self
                 .scan_budget_mc
                 .load(std::sync::atomic::Ordering::Relaxed),

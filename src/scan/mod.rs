@@ -575,7 +575,8 @@ impl Source {
         // Arbiters that can pay this scanner's price first; this node's
         // own jobs pay from its own scan budget.
         let me = node.id();
-        let sell = node.price_table().price_of(crate::credits::price::SCAN);
+        // Before its first refresh it sells at 0, as its heartbeat says.
+        let sell = crate::credits::price::own_scan_price(node, &node.price_table());
         // Without a book (or the self tally) no arbiter counts as able to
         // pay; claiming goes on in urgency order.
         let book = match crate::credits::book(node).await {

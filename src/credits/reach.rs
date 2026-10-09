@@ -93,8 +93,10 @@ pub async fn since(pool: &SqlitePool, from_hour: u32) -> Result<Vec<Report>> {
                 reporter: NodeId::from_slice(&origin).ok()?,
                 hour: u32::try_from(hour).ok()?,
                 reached: reached
-                    .chunks_exact(32)
-                    .filter_map(|c| NodeId::from_slice(c).ok())
+                    .as_chunks::<32>()
+                    .0
+                    .iter()
+                    .map(|c| NodeId(*c))
                     .collect(),
             })
         })

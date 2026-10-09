@@ -4999,12 +4999,28 @@ async fn a_job_is_granted_at_zero_and_funded_once_the_price_rises() {
     .await;
     enqueue(&na, "198.51.100.43", 2).await;
     eventually_for(Duration::from_secs(40), "scanned at zero", || async {
+        // The result too: both count the sale when they step b's price.
         count(&na, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 1
+            && count(&na, "SELECT COUNT(*) FROM scans").await == 1
     })
     .await;
     assert!(
         entries::since(&na.store.pool, 0).await.unwrap().is_empty(),
         "no offer"
+    );
+    // Granted at its price of 0, not as idle work.
+    let first: String = sqlx::query_scalar("SELECT uid FROM scan_jobs")
+        .fetch_one(&na.store.pool)
+        .await
+        .unwrap();
+    let h = peephole::scan::handout::latest(&na.store.pool, std::slice::from_ref(&first))
+        .await
+        .unwrap()
+        .remove(&first)
+        .expect("a record of the grant");
+    assert_eq!(
+        (h.scanner, h.price_mc, h.reason),
+        (b.id, Some(0), peephole::scan::handout::Reason::Cheapest)
     );
     // The price rises: the next job is funded. (A refreshed table steps
     // from its own copy, so the kept one is loaded as after a restart.)
