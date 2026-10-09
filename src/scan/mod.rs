@@ -11,6 +11,7 @@ pub mod profiles;
 pub mod rank;
 pub mod retry;
 pub mod safety;
+pub mod scrub;
 pub mod weight;
 
 use crate::classify::Classifier;
