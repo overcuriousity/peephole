@@ -822,7 +822,15 @@ impl Recorder {
     ) -> Result<Option<String>> {
         use crate::scan::retry;
         let pool = &self.store().pool;
-        type Job = (i64, String, i64, String, Option<String>, Option<String>, i64);
+        type Job = (
+            i64,
+            String,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+        );
         let job: Option<Job> = sqlx::query_as(
             "SELECT j.ip_id, i.ip, j.level, j.status, j.error, j.retry_of, j.manual
              FROM scan_jobs j JOIN ips i ON i.id = j.ip_id WHERE j.uid = ?",

@@ -63,18 +63,20 @@ async fn record_for(conn: &mut SqliteConnection, kind: &str, uid: &str) -> Resul
             .bind(uid)
             .fetch_optional(&mut *conn)
             .await?;
-            r.map(|(ip, level, queued_at, retry_of, retry_at, failed_by, manual)| {
-                Record::ScanJob(ScanJobRec {
-                    uid: uid.to_string(),
-                    ip,
-                    level,
-                    queued_at,
-                    retry_of,
-                    retry_at,
-                    failed_by: failed_by.and_then(|b| NodeId::from_slice(&b).ok()),
-                    manual: manual != 0,
-                })
-            })
+            r.map(
+                |(ip, level, queued_at, retry_of, retry_at, failed_by, manual)| {
+                    Record::ScanJob(ScanJobRec {
+                        uid: uid.to_string(),
+                        ip,
+                        level,
+                        queued_at,
+                        retry_of,
+                        retry_at,
+                        failed_by: failed_by.and_then(|b| NodeId::from_slice(&b).ok()),
+                        manual: manual != 0,
+                    })
+                },
+            )
         }
         _ => None,
     })
