@@ -106,8 +106,8 @@ struct Stand {
     load: i64,
 }
 
-/// `(uid, ip, level, attempts, failed_by, failer_may, waited_secs)`.
-type QueuedRow = (String, String, i64, i64, Option<Vec<u8>>, bool, i64);
+/// `(uid, ip, level, attempts, failed_by, manual, failer_may, waited_secs)`.
+type QueuedRow = (String, String, i64, i64, Option<Vec<u8>>, bool, bool, i64);
 
 /// A queued job as a round sees it.
 struct Queued {
@@ -117,6 +117,8 @@ struct Queued {
     attempts: i64,
     /// The scanner that failed its last try, if it is a retry.
     failed_by: Option<NodeId>,
+    /// Whether it was bought (a manual job), not queued by the sweep.
+    manual: bool,
     /// Whether that scanner may have it again.
     failer_may: bool,
     /// Seconds since it was queued.
@@ -408,6 +410,12 @@ impl Arbiter {
                     break 'pages;
                 }
                 let level = job.level;
+                // A bought job pays every scanner 4^(level-1) times its
+                // price: the ranking and the reserve are unchanged by it.
+                let factor = match job.manual {
+                    true => crate::credits::jobs::level_factor(level),
+                    false => 1,
+                };
                 let takes = |id: &NodeId| {
                     !back.get(&job.uid).is_some_and(|by| by.contains(id))
                         && !(job.failed_by == Some(*id) && !job.failer_may)
@@ -443,7 +451,7 @@ impl Arbiter {
                             &self.node,
                             &mut funding,
                             claims[*ci].min_mc,
-                            p,
+                            p.saturating_mul(factor),
                         )
                         .await
                     {
@@ -550,7 +558,14 @@ impl Arbiter {
                 };
                 let c = &claims[i];
                 let g = match self
-                    .grant(&mut funding, c, &job, paid.then_some(bid.price).flatten())
+                    .grant(
+                        &mut funding,
+                        c,
+                        &job,
+                        paid.then_some(bid.price)
+                            .flatten()
+                            .map(|p| p.saturating_mul(factor)),
+                    )
                     .await
                 {
                     Ok(g) => g,
@@ -608,7 +623,7 @@ impl Arbiter {
     ) -> Result<Vec<Queued>> {
         let est = self.order.get(&self.node.store.pool).await;
         let rows: Vec<QueuedRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT j.uid, i.ip, j.level, j.attempts, j.failed_by,
+            "SELECT j.uid, i.ip, j.level, j.attempts, j.failed_by, j.manual,
                         j.retry_at IS NULL OR j.retry_at <= datetime('now', '-{} minutes'),
                         CAST((julianday('now') - julianday(j.queued_at)) * 86400 AS INTEGER)
                  FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
@@ -628,12 +643,13 @@ impl Arbiter {
         Ok(rows
             .into_iter()
             .map(
-                |(uid, ip, level, attempts, failed_by, failer_may, waited_secs)| Queued {
+                |(uid, ip, level, attempts, failed_by, manual, failer_may, waited_secs)| Queued {
                     uid,
                     ip,
                     level,
                     attempts,
                     failed_by: failed_by.and_then(|f| NodeId::from_slice(&f).ok()),
+                    manual,
                     failer_may,
                     waited_secs,
                 },
@@ -1252,6 +1268,28 @@ mod tests {
                 .unwrap(),
             300
         );
+    }
+
+    /// A bought (manual) job is funded at the scanner's price times
+    /// 4^(level-1) — level 3 at 16 times.
+    #[tokio::test]
+    async fn a_manual_job_is_funded_at_the_level_scaled_price() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, arbiter, store, _tx) = setup(dir.path()).await;
+        give_credits(&store, node.id()).await;
+        node.set_scan_share(1.0);
+        selling(&node, 300);
+        let ip = store
+            .upsert_ip("203.0.113.98".parse().unwrap())
+            .await
+            .unwrap();
+        Recorder::Cluster(node.clone())
+            .enqueue_manual(ip.id, 3)
+            .await
+            .unwrap();
+        let g = arbiter.next_job(node.id(), &[], 0).await.unwrap();
+        assert_eq!((g.offer_seq, g.price_mc), (None, 300 * 16));
+        assert_eq!(self_mc(&store, &g.job_uid).await, Some(300 * 16));
     }
 
     /// A requeued own job's reservation never counts again: not when it
