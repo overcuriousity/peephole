@@ -638,8 +638,8 @@ async fn fingerprint(
     Ok(Effect::Applied)
 }
 
-/// Highest scan level (the nmap presets are 1..=4).
-pub const MAX_SCAN_LEVEL: i64 = 4;
+/// Highest scan level (the nmap presets are 1..=5).
+pub const MAX_SCAN_LEVEL: i64 = 5;
 /// Scan jobs one origin may queue per hour (by HLC); more are not applied.
 pub const SCAN_JOBS_PER_HOUR: i64 = 2000;
 

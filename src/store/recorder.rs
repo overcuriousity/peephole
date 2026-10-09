@@ -422,7 +422,7 @@ impl Recorder {
         level: u8,
         policy: &EnqueuePolicy,
     ) -> Result<EnqueueOutcome> {
-        if !(1..=4).contains(&level) {
+        if !(1..=5).contains(&level) {
             if level != 0 {
                 tracing::warn!(level, "scan level out of range; not queued");
             }
@@ -541,7 +541,7 @@ impl Recorder {
     /// queue's); the marker lets every scanner skip its evidence
     /// re-check and the arbiter fund it at the level-scaled price.
     pub async fn enqueue_manual(&self, ip_id: i64, level: u8) -> Result<EnqueueOutcome> {
-        if !(1..=4).contains(&level) {
+        if !(1..=5).contains(&level) {
             return Ok(EnqueueOutcome::Suppressed);
         }
         let ip_text = self.ip_of(ip_id).await?;

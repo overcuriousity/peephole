@@ -34,11 +34,11 @@ pub const MAX_STDOUT: usize = 16 * 1024 * 1024;
 /// Start of nmap's stderr kept for the error message (the rest is drained).
 const MAX_STDERR: usize = 64 * 1024;
 
-/// A scan level as stored or granted, if it is one (1..=4). Anything else is
-/// refused rather than truncated: `5 as u8`, or 260 truncated to 4, must
+/// A scan level as stored or granted, if it is one (1..=5). Anything else is
+/// refused rather than truncated: `6 as u8`, or 260 truncated to 4, must
 /// not pick a preset.
 pub fn valid_level(level: i64) -> Option<u8> {
-    u8::try_from(level).ok().filter(|l| (1..=4).contains(l))
+    u8::try_from(level).ok().filter(|l| (1..=5).contains(l))
 }
 
 /// nmap's own per-host limit, just under the job timeout so nmap reports
@@ -92,7 +92,7 @@ fn complete(
 }
 
 /// nmap argv (after the binary name) for a level and target (spec §5).
-/// None for a level outside 1..=4.
+/// None for a level outside 1..=5.
 pub fn nmap_argv(
     level: u8,
     target: &IpAddr,
@@ -1420,7 +1420,7 @@ pub async fn run_workers(
                 let _l4 = l4;
                 let outcome = match argv {
                     Some(argv) => run_scan(&source2, &job, argv, nmap, timeout).await,
-                    // Unreachable: acquire only hands out levels 1..=4.
+                    // Unreachable: acquire only hands out levels 1..=5.
                     None => Outcome::Failed("invalid scan level".into()),
                 };
                 if let Outcome::Done(_) = &outcome {
@@ -1602,20 +1602,21 @@ license_key = "k"
         assert_eq!(describe_exit(&exited), "exit 1");
     }
 
-    /// Levels are 1..=4: nothing else gets an argv, nothing is truncated.
+    /// Levels are 1..=5: nothing else gets an argv, nothing is truncated.
     #[test]
-    fn levels_outside_1_to_4_are_refused() {
+    fn levels_outside_1_to_5_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(dir.path());
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
-        for l in [0u8, 5, 255] {
+        for l in [0u8, 6, 255] {
             assert!(nmap_argv(l, &ip, &cfg, 1800).is_none(), "level {l}");
         }
         for (l, ok) in [
             (0, None),
             (1, Some(1)),
             (4, Some(4)),
-            (5, None),
+            (5, Some(5)),
+            (6, None),
             (260, None),
             (-1, None),
         ] {
