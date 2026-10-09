@@ -766,7 +766,10 @@ impl Source {
         let Ok(ip) = g.ip.parse::<IpAddr>() else {
             return Ok(Err(("failed", Some("invalid target".into()))));
         };
-        let row: Option<(String, i64, Option<Vec<u8>>, String, i64)> = sqlx::query_as(
+        // (ip, level, arbiter, queued_at, manual) — a type alias so clippy's
+        // type_complexity lint stays happy now that the row carries `manual`.
+        type GrantRow = (String, i64, Option<Vec<u8>>, String, i64);
+        let row: Option<GrantRow> = sqlx::query_as(
             "SELECT i.ip, j.level, j.arbiter, j.queued_at, j.manual FROM scan_jobs j
              JOIN ips i ON i.id = j.ip_id WHERE j.uid = ?",
         )
