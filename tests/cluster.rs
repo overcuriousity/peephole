@@ -1591,6 +1591,66 @@ async fn deletes_reach_only_the_deleters_own_records() {
     .await;
 }
 
+/// Deleting an IP deletes the name lookups this node recorded for it
+/// everywhere: on other nodes they no longer keep the IP.
+#[tokio::test]
+async fn deleting_an_ip_deletes_its_names_everywhere() {
+    use peephole::cluster::record::{IpNameRec, RdnsRec};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let addr: std::net::IpAddr = "203.0.113.67".parse().unwrap();
+    let ip = na.store.upsert_ip(addr).await.unwrap();
+    rec(&na)
+        .insert_request(&new_request(ip.id, "/named"))
+        .await
+        .unwrap();
+    let prefix = na.id().uid_prefix();
+    let now = peephole::store::data::now_ts();
+    let answers = vec![(NodeId([1; 32]), Ok(vec![addr])), (na.id(), Ok(vec![addr]))];
+    rec(&na)
+        .write(vec![
+            Record::IpName(IpNameRec {
+                uid: format!("{prefix}name"),
+                name: "named.example".into(),
+                at: now.clone(),
+                answers,
+                build: String::new(),
+            }),
+            Record::RdnsName(RdnsRec {
+                uid: format!("{prefix}rdns"),
+                ip: addr.to_string(),
+                at: now,
+                answers: vec![(na.id(), Ok(vec!["named.example".into()]))],
+                build: String::new(),
+            }),
+        ])
+        .await
+        .unwrap();
+    eventually("b has both names", || async {
+        count(&nb, "SELECT COUNT(*) FROM ip_names").await == 2
+    })
+    .await;
+
+    let out = rec(&na).delete_ips(&[ip.id]).await.unwrap();
+    assert_eq!(out.deleted, 3, "the request and both lookups");
+    eventually("the ip and its names are gone on b", || async {
+        count(&nb, "SELECT COUNT(*) FROM ip_names").await == 0
+            && count(&nb, "SELECT COUNT(*) FROM ips").await == 0
+    })
+    .await;
+    assert_eq!(
+        count(
+            &na,
+            "SELECT COUNT(*) FROM repl_log
+             WHERE kind IN ('ip_name', 'rdns_name') AND erased_by IS NULL",
+        )
+        .await,
+        0
+    );
+}
+
 /// Deleting another node's record hides it here and nowhere else, and this
 /// node keeps relaying it.
 #[tokio::test]

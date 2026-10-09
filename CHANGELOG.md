@@ -118,6 +118,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - A deleted IP's public page was served from the cache for up to ten
   minutes, each view logging "cache refresh failed". It now answers
   "not found" from the first refresh after the delete.
+- Cluster: deleting an IP left the names this node had looked up for it
+  (domain and reverse lookups) on the other nodes, and they kept the IP
+  and its lookups there. The lookups are now deleted with it, everywhere;
+  a domain lookup goes as a whole, with the names it gave other addresses.
 
 ## [0.10.0] - 2026-10-09
 

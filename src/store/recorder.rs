@@ -1170,6 +1170,7 @@ impl Recorder {
             own.extend(o);
             foreign.extend(f);
         }
+        own.extend(self.own_lookups(ids).await?);
         let deleted = own.len() as u64;
         self.bury(own).await?;
         let hidden = self.hide(foreign).await?;
@@ -1185,6 +1186,52 @@ impl Recorder {
             data::drop_orphan_ip(&mut conn, *id).await?;
         }
         Ok(Deleted { deleted, hidden })
+    }
+
+    /// Uids of this node's name lookups (`ip_name`, `rdns_name`) that gave
+    /// a name to one of these IPs. Their rows on other nodes would keep the
+    /// IP there. A lookup goes as a whole: the names it gave other
+    /// addresses go with it. None on a standalone node: its name rows are
+    /// its own and [`Recorder::delete_ips`] removes them directly.
+    async fn own_lookups(&self, ids: &[i64]) -> Result<Vec<String>> {
+        let Recorder::Cluster(n) = self else {
+            return Ok(vec![]);
+        };
+        let mut addrs = std::collections::HashSet::new();
+        for id in ids {
+            if let Some(ip) = self.find_ip(*id).await?
+                && let Ok(a) = ip.parse::<std::net::IpAddr>()
+            {
+                addrs.insert(crate::net::canonical(a));
+            }
+        }
+        if addrs.is_empty() {
+            return Ok(vec![]);
+        }
+        let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT uid, payload FROM repl_log
+             WHERE origin = ? AND kind IN ('ip_name', 'rdns_name')
+               AND uid IS NOT NULL AND payload IS NOT NULL AND erased_by IS NULL",
+        )
+        .bind(n.id().0.to_vec())
+        .fetch_all(&n.store.pool)
+        .await?;
+        let names = |r: Record| match r {
+            Record::IpName(r) => crate::intel::dns::tally(&r.answers)
+                .votes
+                .iter()
+                .any(|v| addrs.contains(&v.addr)),
+            Record::RdnsName(r) => {
+                r.ip.parse::<std::net::IpAddr>()
+                    .is_ok_and(|a| addrs.contains(&crate::net::canonical(a)))
+            }
+            _ => false,
+        };
+        Ok(rows
+            .into_iter()
+            .filter(|(_, p)| crate::cluster::rpc::cbor::decode::<Record>(p).is_ok_and(names))
+            .map(|(uid, _)| uid)
+            .collect())
     }
 
     pub async fn delete_scan(&self, id: i64) -> Result<Deleted> {
