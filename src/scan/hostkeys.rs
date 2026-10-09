@@ -132,6 +132,10 @@ pub fn ptr_names(xml: &[u8]) -> Vec<String> {
     out
 }
 
+/// What `walk_scripts` calls per script: port, id, `output`, structured
+/// output.
+pub(crate) type ScriptVisit<'a> = dyn FnMut(u16, &str, Option<&str>, &[Node]) + 'a;
+
 /// Walk every `<script>` of an nmap report whose id is in `wanted`, port
 /// scripts and host scripts (`<hostscript>`, reported with port 0) alike,
 /// and call `f` once per script with the port, the id, the `output`
@@ -139,12 +143,7 @@ pub fn ptr_names(xml: &[u8]) -> Vec<String> {
 /// root first. Unparsable input ends the walk: what was found before the
 /// error has been reported. The XML comes from nmap, but the values in it
 /// from the scanned source.
-#[allow(clippy::type_complexity)]
-pub(crate) fn walk_scripts(
-    xml: &[u8],
-    wanted: &[&str],
-    f: &mut dyn FnMut(u16, &str, Option<&str>, &[Node]),
-) {
+pub(crate) fn walk_scripts(xml: &[u8], wanted: &[&str], f: &mut ScriptVisit<'_>) {
     let mut reader = Reader::from_reader(xml);
     let mut buf = Vec::new();
     let mut port: u16 = 0;
