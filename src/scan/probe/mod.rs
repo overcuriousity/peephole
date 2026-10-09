@@ -26,8 +26,6 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
 
-/// Open ports read per probe (the lowest-numbered ones).
-pub const MAX_PORTS: usize = 16;
 /// Longest any one connection (and the reading on it) may take.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest a whole probe may take.
@@ -38,8 +36,16 @@ pub const MAX_RESPONSE: usize = 256 * 1024;
 pub const MAX_FAVICON: usize = 100 * 1024;
 /// HTTP redirect hops fetched, the first request included.
 pub const MAX_REDIRECTS: usize = 5;
-/// How long one node leaves an address alone after probing it.
-pub const PROBE_COOLDOWN_HOURS: i64 = 24;
+
+/// The ports a probe reads when no counter-scan found any open: the
+/// well-known ones, each with the service name `protocol_for` expects.
+pub const WELL_KNOWN_PORTS: [(u16, &str); 5] = [
+    (22, "ssh"),
+    (80, "http"),
+    (443, "https"),
+    (8080, "http"),
+    (8443, "https"),
+];
 
 /// Largest banner kept.
 const MAX_BANNER: usize = 1024;
@@ -256,7 +262,7 @@ async fn probe_port(
     }
 }
 
-/// Read the open ports of `t` (the lowest [`MAX_PORTS`]) one after another,
+/// Read the open ports of `t`, lowest-numbered first, one after another,
 /// each by its protocol, and measure the round-trip time. A port reached
 /// after [`PROBE_TIMEOUT`] is recorded `timeout` without connecting.
 pub async fn run_probe(t: &Target, guard: &(dyn Fn(&IpAddr) -> Option<String> + Sync)) -> Outcome {
@@ -264,7 +270,6 @@ pub async fn run_probe(t: &Target, guard: &(dyn Fn(&IpAddr) -> Option<String> + 
     let probe_end = Instant::now() + PROBE_TIMEOUT;
     let mut ports: Vec<&(u16, Option<String>)> = t.ports.iter().collect();
     ports.sort_by_key(|(p, _)| *p);
-    ports.truncate(MAX_PORTS);
 
     let rtt = match ports.first() {
         Some((p, _)) => rtt_min_ms(t.ip, *p, probe_end).await,
@@ -404,5 +409,24 @@ mod tests {
         assert_eq!(protocol_for(80, None), "http");
         assert_eq!(protocol_for(993, Some("ssl/imap")), "tls");
         assert_eq!(protocol_for(25, Some("smtp")), "banner");
+    }
+
+    #[tokio::test]
+    async fn a_probe_reads_every_open_port_not_just_the_first_sixteen() {
+        // 17 closed ports: each is recorded, none is truncated away.
+        let ports: Vec<u16> = (0..17)
+            .map(|_| {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let p = l.local_addr().unwrap().port();
+                drop(l);
+                p
+            })
+            .collect();
+        let t = Target {
+            ip: "127.0.0.1".parse().unwrap(),
+            ports: ports.iter().map(|p| (*p, None)).collect(),
+        };
+        let out = run_probe(&t, &|_| None).await;
+        assert_eq!(out.ports.len(), 17);
     }
 }

@@ -17,6 +17,7 @@ pub mod pages;
 pub mod password;
 pub mod probes;
 pub mod public;
+pub mod scan_buy;
 pub mod scans;
 pub mod search;
 pub mod signals;
@@ -180,6 +181,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(overview::routes())
         .merge(lookup::routes())
         .merge(probes::routes())
+        .merge(scan_buy::routes())
         .merge(cluster::routes())
         .merge(cluster_access::routes())
         .merge(cluster_owner::routes())

@@ -1,21 +1,15 @@
-//! What must hold before this node probes an address: the checks a
+//! What must hold before this node probes an address: the same checks a
 //! counter-scan obeys (non-global addresses, `never_scan`, the members'
-//! and the operator's lists, Tor exits, verified crawlers, the evidence
-//! held here), and three of its own: the evidence allows level 2, the
-//! latest finished counter-scan found an open port, and this node did not
-//! probe the address in the last 24 hours.
-use super::{PROBE_COOLDOWN_HOURS, Target};
-use crate::classify::Classifier;
+//! and the operator's lists, Tor exits, verified crawlers). The ports read
+//! are the open ones of the latest finished counter-scan, or the
+//! well-known ones when there is none.
+use super::Target;
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::config::Config;
 use crate::scan::{crawler, guard, locally_refused, safety};
 use crate::store::Store;
 use std::net::IpAddr;
-
-/// The level of evidence a probe needs: the requests held here must
-/// allow at least a level-2 counter-scan.
-pub const PROBE_LEVEL: u8 = 2;
 
 /// Who a standalone node's probes are by (it has no key): the asker and
 /// origin of its `probe_result` records.
@@ -26,10 +20,7 @@ pub struct Gate {
     crawlers: Option<crawler::Crawlers>,
     tor: std::sync::Mutex<guard::TorView>,
     origins: guard::Origins,
-    classifier: &'static Classifier,
     cfg: Config,
-    /// The origin this node's probes are recorded under.
-    me: NodeId,
 }
 
 impl Gate {
@@ -42,27 +33,15 @@ impl Gate {
                 .then(|| crawler::Crawlers::new(&s.crawler_domains)),
             tor: std::sync::Mutex::new(guard::TorView::new(&cfg.data_dir)),
             origins: guard::Origins::from_config(s, me),
-            classifier: Classifier::builtin(),
             cfg: cfg.clone(),
-            me: me.unwrap_or(LOCAL),
         }
     }
 
-    /// The counter-scan level the requests held here allow for `ip` (the
-    /// Actions card's guard line); None when it cannot be read.
-    pub async fn allowed_level(&self, store: &Store, ip: &IpAddr) -> Option<u8> {
-        let ip_text = crate::net::canonical(*ip).to_string();
-        let ev = guard::evidence(&store.pool, &ip_text, &self.origins, Some(self.classifier))
-            .await
-            .ok()?;
-        Some(ev.allowed_level(&self.cfg.scan.safety))
-    }
-
-    /// The address and open ports to probe, or the reason shown to the
-    /// asker. Checks, in order: enabled; global address; never_scan;
-    /// safety lists (members, own, peer-observed public); Tor exit;
-    /// verified crawler; evidence allows ≥ 2; latest finished scan has ≥ 1
-    /// open port; not probed by this node in 24 h.
+    /// The address and ports to probe, or the reason shown to the asker.
+    /// Checks, in order: enabled; global address; `never_scan`; safety
+    /// lists (members, own, peer-observed public); Tor exit; verified
+    /// crawler. The ports are the latest finished scan's open ones, or the
+    /// well-known ones.
     pub async fn check(
         &self,
         store: &Store,
@@ -101,51 +80,34 @@ impl Gate {
         {
             return Err(format!("verified crawler ({name})"));
         }
-        let ev = guard::evidence(&store.pool, &ip_text, &self.origins, Some(self.classifier))
-            .await
-            .map_err(internal)?;
-        let allowed = ev.allowed_level(&self.cfg.scan.safety);
-        if allowed < PROBE_LEVEL {
-            return Err(format!(
-                "the requests held here allow level {allowed}, a probe needs {PROBE_LEVEL}"
-            ));
-        }
-        let no_scan = || "no finished counter-scan of this address here".to_string();
-        let Some(row) = store.ip_by_addr(&ip_text).await.map_err(internal)? else {
-            return Err(no_scan());
+        let known: Vec<(u16, Option<String>)> =
+            match store.ip_by_addr(&ip_text).await.map_err(internal)? {
+                Some(row) => {
+                    let scans = store.scans_for_ip(row.id).await.map_err(internal)?;
+                    match scans
+                        .iter()
+                        .find(|s| s.finished_at.is_some() && s.audit_of.is_none())
+                    {
+                        Some(scan) => store
+                            .ports_for_scan(scan.id)
+                            .await
+                            .map_err(internal)?
+                            .into_iter()
+                            .filter(|p| p.state == "open" && p.proto == "tcp")
+                            .filter_map(|p| Some((u16::try_from(p.port).ok()?, p.service)))
+                            .collect(),
+                        None => vec![],
+                    }
+                }
+                None => vec![],
+            };
+        let ports = match known.is_empty() {
+            true => super::WELL_KNOWN_PORTS
+                .iter()
+                .map(|(p, s)| (*p, Some((*s).to_string())))
+                .collect(),
+            false => known,
         };
-        let scans = store.scans_for_ip(row.id).await.map_err(internal)?;
-        let Some(scan) = scans
-            .iter()
-            .find(|s| s.finished_at.is_some() && s.audit_of.is_none())
-        else {
-            return Err(no_scan());
-        };
-        let ports: Vec<(u16, Option<String>)> = store
-            .ports_for_scan(scan.id)
-            .await
-            .map_err(internal)?
-            .into_iter()
-            .filter(|p| p.state == "open" && p.proto == "tcp")
-            .filter_map(|p| Some((u16::try_from(p.port).ok()?, p.service)))
-            .collect();
-        if ports.is_empty() {
-            return Err("the latest counter-scan found no open port".into());
-        }
-        let ago: Option<i64> = sqlx::query_scalar(
-            "SELECT CAST(ROUND((julianday('now') - julianday(MAX(p.finished_at))) * 24) AS INTEGER)
-             FROM probes p JOIN ips i ON i.id = p.ip_id
-             WHERE i.ip = ? AND p.origin = ? AND p.finished_at > datetime('now', ?)",
-        )
-        .bind(&ip_text)
-        .bind(&self.me.0[..])
-        .bind(format!("-{PROBE_COOLDOWN_HOURS} hours"))
-        .fetch_one(&store.pool)
-        .await
-        .map_err(|e| internal(e.into()))?;
-        if let Some(h) = ago {
-            return Err(format!("this node probed the address {} h ago", h.max(0)));
-        }
         Ok(Target { ip, ports })
     }
 
@@ -179,27 +141,6 @@ pub(crate) mod tests {
             dir = dir.display()
         ))
         .unwrap()
-    }
-
-    /// `n` requests the shipped rules put at level 2 (or 1 below).
-    pub(crate) async fn requests(store: &Store, ip_id: i64, n: usize, level: i64) {
-        let path = if level >= 2 { "/.env" } else { "/x" };
-        for _ in 0..n {
-            store
-                .local()
-                .insert_request(&crate::store::requests::NewRequest {
-                    ip_id,
-                    method: "GET".into(),
-                    path: path.into(),
-                    headers_json: "[]".into(),
-                    labels_json: "[\"probe\"]".into(),
-                    severity: level,
-                    scan_level: level,
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-        }
     }
 
     /// A finished counter-scan of `ip` with these `(port, state, service)`.
@@ -258,34 +199,36 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_gate_needs_an_open_port_in_a_finished_scan() {
+    async fn a_gate_reads_the_scans_open_ports_or_the_well_known_ones() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path()).await;
         let gate = Gate::new(&config_with(dir.path(), ""), None);
         let addr: IpAddr = "203.0.113.20".parse().unwrap();
         let ip = store.upsert_ip(addr).await.unwrap();
-        requests(&store, ip.id, 3, 2).await;
-        let err = gate.check(&store, None, &addr).await.unwrap_err();
-        assert!(err.contains("no finished counter-scan"), "{err}");
+        // Never scanned: the well-known fallback.
+        let t = gate.check(&store, None, &addr).await.unwrap();
+        assert_eq!(t.ports.len(), crate::scan::probe::WELL_KNOWN_PORTS.len());
+        assert_eq!(t.ports[0], (22, Some("ssh".to_string())));
+        // A scan with only closed ports: still the fallback.
         scanned(&store, &ip.ip, &[(22, "closed", Some("ssh"))]).await;
-        let err = gate.check(&store, None, &addr).await.unwrap_err();
-        assert!(err.contains("no open port"), "{err}");
+        let t = gate.check(&store, None, &addr).await.unwrap();
+        assert_eq!(t.ports.len(), crate::scan::probe::WELL_KNOWN_PORTS.len());
+        // An open port: the scan's.
         scanned(&store, &ip.ip, &[(22, "open", Some("ssh"))]).await;
         let t = gate.check(&store, None, &addr).await.unwrap();
         assert_eq!(t.ports, [(22, Some("ssh".to_string()))]);
     }
 
     #[tokio::test]
-    async fn a_gate_refuses_thin_evidence_and_protected_addresses() {
+    async fn a_gate_refuses_protected_addresses_but_not_thin_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path()).await;
         let addr: IpAddr = "203.0.113.21".parse().unwrap();
         let ip = store.upsert_ip(addr).await.unwrap();
         scanned(&store, &ip.ip, &[(22, "open", Some("ssh"))]).await;
-        requests(&store, ip.id, 1, 1).await;
+        // No requests held at all: probed anyway.
         let gate = Gate::new(&config_with(dir.path(), ""), None);
-        let err = gate.check(&store, None, &addr).await.unwrap_err();
-        assert!(err.contains("allow level 1"), "{err}");
+        assert!(gate.check(&store, None, &addr).await.is_ok());
         let covered = Gate::new(
             &config_with(dir.path(), "never_scan = [\"203.0.113.0/24\"]"),
             None,
@@ -295,20 +238,19 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_gate_enforces_the_24_hour_cooldown() {
+    async fn a_gate_allows_probing_the_same_address_again() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path()).await;
         let gate = Gate::new(&config_with(dir.path(), ""), None);
         let addr: IpAddr = "203.0.113.22".parse().unwrap();
         let ip = store.upsert_ip(addr).await.unwrap();
-        requests(&store, ip.id, 3, 2).await;
         scanned(&store, &ip.ip, &[(22, "open", Some("ssh"))]).await;
-        assert!(gate.check(&store, None, &addr).await.is_ok());
+        // A probe of this address by this node finished a minute ago.
         sqlx::query(
             "INSERT INTO probes (uid, group_uid, ip_id, origin, hlc, asker, vantage_ip_source,
                started_at, finished_at, build)
-             VALUES ('p1', 'g1', ?, ?, 0, ?, 'local', datetime('now', '-3 hours'),
-               datetime('now', '-3 hours'), '')",
+             VALUES ('p1', 'g1', ?, ?, 0, ?, 'local', datetime('now'),
+               datetime('now'), '')",
         )
         .bind(ip.id)
         .bind(&LOCAL.0[..])
@@ -316,7 +258,6 @@ pub(crate) mod tests {
         .execute(&store.pool)
         .await
         .unwrap();
-        let err = gate.check(&store, None, &addr).await.unwrap_err();
-        assert!(err.contains("probed the address 3 h ago"), "{err}");
+        assert!(gate.check(&store, None, &addr).await.is_ok());
     }
 }

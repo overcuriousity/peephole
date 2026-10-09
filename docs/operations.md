@@ -292,8 +292,16 @@ without a restart.
 
 **Probes.** `[probe] enabled` (default `true`) lets this node's scanner run
 observational probes that admins request; `max_parallel` (default `2`)
-bounds how many run at once. Probes only touch ports a scan already found
-open and obey the same protected-address rules as scans.
+bounds how many run at once. A probe reads the open ports of the address's
+latest counter-scan — or the well-known ones (22, 80, 443, 8080, 8443)
+when there is none — takes at most two minutes, and obeys the same
+protected-address rules as scans.
+
+**Bought scans.** The Actions card also sells a counter-scan of level
+1–4: level 1 costs the cluster's cheapest scanner offer, each level above
+four times the previous. The job goes through the normal queue, paid like
+any other; a finished scan of the same level less than 24 hours old is
+shown instead of selling a new one.
 
 **Signature rules** are built into the binary from [`rules/`](../rules/) at
 build time: there is nothing to install or edit on the node, and changing a

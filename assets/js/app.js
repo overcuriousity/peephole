@@ -332,6 +332,17 @@
     });
   }
 
+  // Counter-scans card: while a job waits for its result, reload the page
+  // when the states the server reports differ from the rendered ones.
+  var sj = document.querySelector("[data-scans-src]");
+  if (sj && window.EventSource) {
+    var shownJobs = sj.getAttribute("data-scans-states");
+    var sjes = new EventSource(sj.getAttribute("data-scans-src"));
+    sjes.addEventListener("scan-jobs", function (ev) {
+      if (ev.data !== shownJobs) { sjes.close(); location.reload(); }
+    });
+  }
+
   // "On this page": a pill per section of the IP page or lookup result,
   // the one in view highlighted.
   var snav = document.querySelector("[data-section-nav]");

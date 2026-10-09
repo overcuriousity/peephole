@@ -79,6 +79,13 @@ pub fn price_for(node: &Node, scanner: &NodeId) -> Option<u32> {
     price::offer_price(k.hb.scan_price_mc, table.reference(scanner))
 }
 
+/// The factor a bought (manual) job's level scales its funding price by:
+/// 4^(level-1) — level 1 at the scanner's price, level 4 at 64 times it.
+pub fn level_factor(level: i64) -> u32 {
+    1u32.checked_shl(2 * level.clamp(1, 4) as u32 - 2)
+        .unwrap_or(u32::MAX)
+}
+
 /// The oldest lot day a scan offer written at `now_ms` may draw from: a
 /// lot that dies before the offer can be charged (within
 /// [`JOB_OFFER_TTL_MS`](super::JOB_OFFER_TTL_MS)) is left out.
@@ -234,6 +241,14 @@ mod tests {
     use crate::credits::DAY_MS;
     use crate::credits::entries::{Entry, Kind, SealState};
     use crate::credits::ledger::{Earned, run};
+
+    #[test]
+    fn the_level_factor_is_four_to_the_level_minus_one() {
+        assert_eq!(level_factor(1), 1);
+        assert_eq!(level_factor(2), 4);
+        assert_eq!(level_factor(3), 16);
+        assert_eq!(level_factor(4), 64);
+    }
 
     const DAY: u32 = 20_000;
     fn id(n: u8) -> NodeId {

@@ -43,6 +43,25 @@ impl Target {
         crate::admin::probes::any_waiting(&self.probes)
     }
 
+    /// `[id, status]` of every scan job, for the live stream.
+    pub fn scan_states(&self) -> String {
+        let jobs = self
+            .admin
+            .as_ref()
+            .map(|a| a.jobs.clone())
+            .unwrap_or_default();
+        crate::admin::scan_buy::states_json(&jobs)
+    }
+
+    /// A scan job is still on its way.
+    pub fn scans_waiting(&self) -> bool {
+        self.admin.as_ref().is_some_and(|a| {
+            a.jobs
+                .iter()
+                .any(|j| matches!(j.status.as_str(), "queued" | "running"))
+        })
+    }
+
     pub fn signals(&self) -> Vec<crate::admin::signals::Signal> {
         crate::admin::signals::of(&self.intel)
     }

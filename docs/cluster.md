@@ -219,6 +219,10 @@ earn most of the new money, every member a little.
   and paid per vantage. The offer is accepted first, the result arrives
   when the scanner has finished; an accepted probe with no result lapses
   after 15 minutes.
+  The Actions card sells counter-scans the same way: the arbiter funds a
+  bought (manual) job at the scanner's price times 4^(level−1), and the
+  scanners skip their evidence re-check for it — the safety preflight
+  (protected addresses, Tor exits, verified crawlers) still applies.
 - **Scan jobs.** The arbiter (the node that queued the job) funds its jobs
   from its own balance, up to `[credits] scan_share` (default 0.5) of it,
   and hands each job to the scanner asking that is cheapest **per

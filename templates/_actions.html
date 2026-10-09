@@ -18,4 +18,19 @@
     <button class="btn" type="submit"{% if !a.allowed %} disabled title="{{ a.why_not.as_deref().unwrap_or_default() }}"{% endif %}>Probe</button>
     {% if let Some(w) = a.why_not %}<span class="muted small">{{ w }}</span>{% endif %}
   </form>
+  <form method="post" action="/admin/lookup/scan">
+    <input type="hidden" name="ip" value="{{ t.ov.ip.ip }}">
+    <p class="muted small">Counter-scan this address now{% if a.standalone %}, from this node{% endif %}. A result of the same level less than a day old costs nothing.</p>
+    <p>
+      {% for o in a.scans %}
+      {% if let Some(f) = o.fresh %}
+      <button class="btn" type="button" disabled title="Level {{ o.level }} finished {{ f }}: fresh results cost nothing">L{{ o.level }}</button>
+      {% else if o.price.is_empty() %}
+      <button class="btn" type="button" disabled title="No live scanner announces a price">L{{ o.level }}</button>
+      {% else %}
+      <button class="btn" type="submit" name="level" value="{{ o.level }}">L{{ o.level }} · {{ o.price }}</button>
+      {% endif %}
+      {% endfor %}
+    </p>
+  </form>
 </section>

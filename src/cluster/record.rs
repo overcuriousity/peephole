@@ -275,6 +275,11 @@ pub struct ScanJobRec {
     /// The scanner whose failure queued the retry: it waits longer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_by: Option<NodeId>,
+    /// Bought by an admin from the Actions card: the evidence rule does
+    /// not apply (the safety preflight does); funded at the level-scaled
+    /// price (`credits::jobs::level_factor`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manual: bool,
 }
 
 /// A job's state (last write wins by HLC; only the arbiter writes it).

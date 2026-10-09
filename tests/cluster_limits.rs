@@ -135,6 +135,7 @@ fn job(o: &Origin, uid: &str, ip: &str, level: i64) -> Record {
         retry_of: None,
         retry_at: None,
         failed_by: None,
+        manual: false,
     })
 }
 

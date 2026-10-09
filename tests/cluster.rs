@@ -2156,6 +2156,7 @@ async fn duplicate_jobs_are_superseded() {
                 retry_of: None,
                 retry_at: None,
                 failed_by: None,
+                manual: false,
             },
         )])
         .await
