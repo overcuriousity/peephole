@@ -16,5 +16,6 @@
   {% endif %}
 </div></div>
 <section class="card"><h2>Ports</h2>{% include "_ports.html" %}</section>
+{% if !host_facts.is_empty() %}<section class="card"><h2>Host</h2><p>{% for f in host_facts %}{% if !loop.first %} · {% endif %}<strong>{{ f.label() }}</strong> {{ f.value }}{% endfor %}</p></section>{% endif %}
 <section class="card"><h2>Host keys and certificates</h2>{% include "_host_keys.html" %}</section>
 {% endblock %}

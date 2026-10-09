@@ -359,6 +359,8 @@ struct ScanPage {
     s: ScanSummary,
     ports: Vec<PortRow>,
     keys: Vec<crate::store::hostkeys::HostKeyRow>,
+    /// Facts about the host as a whole (SMB, for one).
+    host_facts: Vec<crate::store::facts::FactRow>,
     can_delete: bool,
     /// When this scan is an audit: the page of the scan it checks.
     audit_of: Option<i64>,
@@ -458,6 +460,7 @@ async fn scan_page(
         s,
         ports,
         keys: st.store.host_keys_for_scan(id).await?,
+        host_facts: st.store.host_facts_for_scan(id).await?,
         can_delete: st.can_delete(),
         audit_of,
         audits: audits
@@ -633,6 +636,75 @@ mod tests {
     }
 
     #[test]
+    fn the_scan_page_shows_details_facts_and_the_host_card() {
+        let fact = |port: Option<i64>, kind: &str, value: &str| crate::store::facts::FactRow {
+            port,
+            kind: kind.into(),
+            value: value.into(),
+        };
+        let page = ScanPage {
+            chrome: chrome(),
+            s: ScanSummary {
+                id: 1,
+                ip_id: 1,
+                ip: "203.0.113.7".into(),
+                level: 3,
+                started_at: String::new(),
+                finished_at: None,
+                os_guess: None,
+                open_ports: 1,
+                node: None,
+                audit_of: None,
+                audit_result: None,
+                scrubbed: 0,
+            },
+            ports: vec![PortRow {
+                port: 80,
+                proto: "tcp".into(),
+                state: "open".into(),
+                service: Some("http".into()),
+                product: Some("nginx".into()),
+                version: Some("1.18.0".into()),
+                extrainfo: Some("Ubuntu".into()),
+                ostype: Some("Linux".into()),
+                devicetype: None,
+                hostname: Some("host-7.example.net".into()),
+                cpe: Some(r#"["cpe:/a:nginx:nginx:1.18.0"]"#.into()),
+                facts: vec![
+                    fact(Some(80), "http.title", "PentAGI <b>&</b> friends"),
+                    fact(Some(80), "http.redirect", "http://203.0.113.7/login"),
+                ],
+            }],
+            keys: vec![],
+            host_facts: vec![
+                fact(None, "smb.server", "WIN-1"),
+                fact(None, "smb.domain", "CORP"),
+            ],
+            can_delete: false,
+            audit_of: None,
+            audits: vec![],
+            handed_out: None,
+        };
+        let html = page.render().unwrap();
+        for s in [
+            "nginx 1.18.0 Ubuntu",
+            "Linux · host-7.example.net",
+            "cpe:/a:nginx:nginx:1.18.0",
+            "Title</strong> PentAGI &#60;b&#62;&#38;&#60;/b&#62; friends",
+            "Redirects to</strong> http://203.0.113.7/login",
+            "<h2>Host</h2>",
+            "Computer</strong> WIN-1",
+            "Domain</strong> CORP",
+        ] {
+            assert!(html.contains(s), "missing {s:?} in\n{html}");
+        }
+        assert!(
+            !html.contains("href=\"http://203.0.113.7/login\""),
+            "a redirect is text, not a link"
+        );
+    }
+
+    #[test]
     fn the_scan_page_shows_the_hand_out_line() {
         let page = |handed_out: Option<String>| ScanPage {
             chrome: chrome(),
@@ -652,6 +724,7 @@ mod tests {
             },
             ports: vec![],
             keys: vec![],
+            host_facts: vec![],
             can_delete: false,
             audit_of: None,
             audits: vec![],

@@ -1,11 +1,16 @@
+{# The ports of one scan (store::inspect::PortRow), with what -sV and the scripts said about each. #}
 <div class="table-wrap wide"><table>
-  <thead><tr><th>Port</th><th>State</th><th>Service</th><th>Product</th><th>Version</th></tr></thead>
+  <thead><tr><th>Port</th><th>State</th><th>Service</th><th>Details</th></tr></thead>
   <tbody>
   {% for p in ports %}
     <tr><td class="mono">{{ p.port }}/{{ p.proto }}</td>
         <td><span class="badge badge-status" data-status="{% if p.state == "open" %}done{% else %}queued{% endif %}">{{ p.state }}</span></td>
-        <td>{{ p.service.as_deref().unwrap_or("") }}</td><td>{{ p.product.as_deref().unwrap_or("") }}</td><td>{{ p.version.as_deref().unwrap_or("") }}</td></tr>
+        <td>{{ p.service.as_deref().unwrap_or("") }}</td>
+        <td>{{ p.described() }}
+          {% let system = p.system() %}{% if !system.is_empty() %}<div class="muted">{{ system }}</div>{% endif %}
+          {% let cpes = p.cpes() %}{% if !cpes.is_empty() %}<div class="muted mono small">{{ cpes.join(" ") }}</div>{% endif %}
+          {% for f in p.facts %}<div class="small"><strong>{{ f.label() }}</strong> {{ f.value }}</div>{% endfor %}</td></tr>
   {% endfor %}
-  {% if ports.is_empty() %}<tr><td colspan="5" class="empty">No ports recorded.</td></tr>{% endif %}
+  {% if ports.is_empty() %}<tr><td colspan="4" class="empty">No ports recorded.</td></tr>{% endif %}
   </tbody>
 </table></div>

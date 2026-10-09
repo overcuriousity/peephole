@@ -703,6 +703,10 @@ async fn requests(
 pub struct ScanWithPorts {
     pub s: ScanSummary,
     pub ports: Vec<PortRow>,
+    /// What the source serves, from this scan (`store::facts::serves`).
+    pub serves: String,
+    /// Its Windows computer name and domain, when known.
+    pub host: String,
 }
 
 /// One fact a provider reported, ready to show.

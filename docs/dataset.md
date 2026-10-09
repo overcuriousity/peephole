@@ -147,8 +147,12 @@ service's documentation; an empty object means the service knew nothing.
 ```json
 [{"uid": "…", "audit_of": null, "level": 2, "status": "done", "started_at": "…", "finished_at": "…",
   "node": "alice", "node_id": "…", "build": "…", "scanner": "carol", "os_guess": "Linux 5.x",
-  "ports": [{"port": 22, "proto": "tcp", "state": "open", "service": "ssh", "product": "OpenSSH", "version": "9.6"}],
+  "ports": [{"port": 22, "proto": "tcp", "state": "open", "service": "ssh", "product": "OpenSSH", "version": "9.6",
+             "extrainfo": "Ubuntu Linux; protocol 2.0", "ostype": "Linux", "devicetype": null,
+             "hostname": "host-7.example.net", "cpe": ["cpe:/a:openbsd:openssh:9.6p1"]}],
   "host_keys": [{"kind": "ssh-hostkey", "port": 22, "fingerprint": "SHA256:…", "detail": "ed25519 256"}],
+  "facts": [{"port": 80, "proto": "tcp", "kind": "http.title", "value": "PentAGI"},
+            {"port": null, "proto": null, "kind": "smb.server", "value": "WIN-344VU98D3RU"}],
   "xml": "<?xml …>  the full nmap output"}]
 ```
 
@@ -160,6 +164,16 @@ headers (`ssh-hostkey`, `ssh2-enum-algos`, `ssl-cert`, `http-headers`).
 `SHA256:` fingerprint), `tls-cert` (SHA-256 of the DER), `ja4x`, `hassh`
 (HASSH-server) and `http-etag` (the ETag as sent; for nginx's form the
 detail gives the file's modification date and size).
+`ports[].extrainfo`, `ostype`, `devicetype`, `hostname` and `cpe` are what
+nmap's `-sV` wrote beyond product and version. `facts`: what the source
+serves and calls itself, read from the fixed fields of a few scripts, never
+from their prose: `http.title`, `http.redirect`, `http.server`, `http.auth`
+(`Basic realm="…"`), `ntlm.netbios_computer`, `ntlm.netbios_domain`,
+`ntlm.dns_computer`, `ntlm.dns_domain`, `ntlm.dns_tree`,
+`ntlm.product_version` (RDP), `socks.method`, `dns.nsid`, and from the SMB
+host script `smb.server`, `smb.domain`, `smb.fqdn`, `smb.domain_dns`,
+`smb.forest_dns`, `smb.workgroup`, `smb.os`, `smb.lanmanager` (`port`
+null). Values are cut at 512 bytes; at most 64 per scan.
 `uid` is the scan's identifier in the cluster. `audit_of` is set when the
 scan is an audit: the `uid` of the scan it checks. An audit is a scan run
 again by another scanner, not a counter-scan of its own; its `node` and

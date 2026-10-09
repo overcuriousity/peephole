@@ -26,6 +26,14 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Added
 
+- What a scanned source serves and calls itself. Each port of a scan
+  shows what `-sV` added (extra info, OS and device type, the announced
+  host name, CPEs) and the fixed fields of a few scripts: page title and
+  redirect, `Server` header, login realm, Windows computer and domain
+  names from RDP and SMB, SOCKS methods, DNS server id. The scan page has
+  a Host card, each scan's heading on the IP page a one-line summary, and
+  the export carries the port fields and a `facts` list per scan. Nothing
+  is parsed from prose. Stored scans are read once at startup.
 - The scanner's own address stays out of its scans. A scanned mail server
   greets the client by address and name, and nmap kept that in the XML
   that is signed, replicated and exported. Before signing, a scanner now

@@ -545,6 +545,7 @@ fn scan_json(s: &ScanOut, ports: &[crate::store::export::PortOut], opts: &Export
         "os_guess": s.os_guess,
         "ports": ports,
         "host_keys": s.host_keys,
+        "facts": s.facts,
         "xml": xml,
     })
 }
@@ -1372,6 +1373,70 @@ mod tests {
             "canary values are not exported"
         );
         assert!(COLUMNS.contains(&"decoy_v") && COLUMNS.contains(&"canary_used_from"));
+    }
+
+    #[tokio::test]
+    async fn scans_export_their_facts_and_port_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let row = s.upsert_ip("192.0.2.7".parse().unwrap()).await.unwrap();
+        s.insert_request(&NewRequest {
+            ip_id: row.id,
+            method: "GET".into(),
+            path: "/".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        s.enqueue_scan(row.id, 3, 0).await.unwrap();
+        let job = s.next_queued_job().await.unwrap().unwrap();
+        let res = crate::scan::nmap_xml::parse_nmap_xml(include_bytes!(
+            "../../tests/fixtures/nmap-facts.xml"
+        ))
+        .unwrap();
+        s.finish_job(job.id, Some(&res), None).await.unwrap();
+
+        let out = text(&collect(&s, ExportFilter::default(), Format::Jsonl).await);
+        let r: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        let scan = &r["scans"][0];
+        let ssh = scan["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["port"] == 22)
+            .unwrap();
+        assert_eq!(ssh["extrainfo"], "Ubuntu Linux; protocol 2.0");
+        assert_eq!(ssh["ostype"], "Linux");
+        assert_eq!(ssh["hostname"], "host-7.example.net");
+        assert_eq!(ssh["cpe"].as_array().unwrap().len(), 2);
+        let http = scan["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["port"] == 80)
+            .unwrap();
+        assert!(http["cpe"].as_array().unwrap().is_empty());
+        assert!(http["extrainfo"].is_null());
+        let facts = scan["facts"].as_array().unwrap();
+        assert!(
+            facts.iter().any(|f| f["kind"] == "http.title"
+                && f["port"] == 80
+                && f["proto"] == "tcp"
+                && f["value"] == "PentAGI & friends"),
+            "{facts:?}"
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|f| f["kind"] == "smb.server" && f["port"].is_null()),
+            "{facts:?}"
+        );
+        assert!(
+            facts.iter().all(|f| f.get("scan_id").is_none()),
+            "internal id not exported"
+        );
     }
 
     #[tokio::test]

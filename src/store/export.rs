@@ -97,6 +97,9 @@ pub struct ScanOut {
     /// Read separately, by scan.
     #[sqlx(skip)]
     pub host_keys: Vec<KeyOut>,
+    /// Read separately, by scan.
+    #[sqlx(skip)]
+    pub facts: Vec<FactOut>,
 }
 
 /// A host key, certificate or other identifier a scan found (`host_keys`).
@@ -120,6 +123,28 @@ pub struct PortOut {
     pub service: Option<String>,
     pub product: Option<String>,
     pub version: Option<String>,
+    pub extrainfo: Option<String>,
+    pub ostype: Option<String>,
+    pub devicetype: Option<String>,
+    pub hostname: Option<String>,
+    /// As stored: a JSON array, or NULL.
+    #[serde(skip)]
+    #[sqlx(rename = "cpe")]
+    pub cpe_json: Option<String>,
+    /// The CPEs, filled from `cpe_json` after the read.
+    #[sqlx(skip)]
+    pub cpe: Vec<String>,
+}
+
+/// One fact a scan found (`scan_facts`). `port` null: about the host.
+#[derive(sqlx::FromRow, serde::Serialize)]
+pub struct FactOut {
+    #[serde(skip)]
+    pub scan_id: i64,
+    pub port: Option<i64>,
+    pub proto: Option<String>,
+    pub kind: String,
+    pub value: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -301,13 +326,19 @@ impl Store {
         let scan_ids: Vec<i64> = scans.iter().map(|s| s.id).collect();
         let mut ports: HashMap<i64, Vec<PortOut>> = HashMap::new();
         let rows: Vec<PortOut> = sqlx::query_as(
-            "SELECT scan_id, port, proto, state, service, product, version FROM ports
+            "SELECT scan_id, port, proto, state, service, product, version,
+                    extrainfo, ostype, devicetype, hostname, cpe FROM ports
              WHERE scan_id IN (SELECT value FROM json_each(?)) ORDER BY scan_id, port",
         )
         .bind(json_list(&scan_ids))
         .fetch_all(&self.read)
         .await?;
-        for p in rows {
+        for mut p in rows {
+            p.cpe = p
+                .cpe_json
+                .as_deref()
+                .and_then(|j| serde_json::from_str(j).ok())
+                .unwrap_or_default();
             ports.entry(p.scan_id).or_default().push(p);
         }
         let mut keys: HashMap<i64, Vec<KeyOut>> = HashMap::new();
@@ -322,9 +353,21 @@ impl Store {
         for k in rows {
             keys.entry(k.scan_id).or_default().push(k);
         }
+        let mut facts: HashMap<i64, Vec<FactOut>> = HashMap::new();
+        let rows: Vec<FactOut> = sqlx::query_as(
+            "SELECT scan_id, port, proto, kind, value FROM scan_facts
+             WHERE scan_id IN (SELECT value FROM json_each(?)) ORDER BY scan_id, port IS NOT NULL, port, id",
+        )
+        .bind(json_list(&scan_ids))
+        .fetch_all(&self.read)
+        .await?;
+        for f in rows {
+            facts.entry(f.scan_id).or_default().push(f);
+        }
         for mut s in scans {
             let p = ports.remove(&s.id).unwrap_or_default();
             s.host_keys = keys.remove(&s.id).unwrap_or_default();
+            s.facts = facts.remove(&s.id).unwrap_or_default();
             c.scans.entry(s.ip_id).or_default().push((s, p));
         }
         let fps: Vec<FpOut> = sqlx::query_as(
