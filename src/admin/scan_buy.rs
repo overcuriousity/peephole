@@ -55,7 +55,7 @@ impl ScanOffer {
 }
 
 /// What each level scans (`scan::profiles::builtin`).
-fn about(level: u8) -> &'static str {
+pub fn about(level: u8) -> &'static str {
     match level {
         1 => "top 100 ports, light version detection",
         2 => "top 1000 ports, versions, OS, host keys and certificates",
@@ -78,7 +78,7 @@ pub async fn offers_for(state: &AdminState, ip_id: i64) -> Vec<ScanOffer> {
     let scans = state.store.scans_for_ip(ip_id).await.unwrap_or_default();
     let jobs = state.store.jobs_for_ip(ip_id, 20).await.unwrap_or_default();
     let node = state.recorder.node();
-    let cheapest = node.and_then(|n| n.price_table().scanners.iter().map(|s| s.price_mc).min());
+    let table = node.map(|n| n.price_table());
     (1u8..=5)
         .map(|level| {
             let fresh = scans
@@ -96,15 +96,12 @@ pub async fn offers_for(state: &AdminState, ip_id: i64) -> Vec<ScanOffer> {
                     _ => None,
                 })
                 .min_by_key(|s| *s != "running");
-            let price = match (node.is_some(), cheapest) {
-                (false, _) => "free".into(),
-                (true, Some(c)) => format!(
-                    "from {} credits",
-                    crate::credits::show(
-                        c as u64 * crate::credits::jobs::level_factor(level as i64) as u64
-                    )
-                ),
-                (true, None) => String::new(),
+            let price = match &table {
+                None => "free".into(),
+                Some(t) => match price_range(&t.scanners, level) {
+                    Some(p) => format!("from {} credits", crate::credits::show(p.floor_mc)),
+                    None => String::new(),
+                },
             };
             ScanOffer {
                 level,
@@ -146,6 +143,105 @@ impl BuyForm {
     }
 }
 
+/// What a scan costs, level-scaled, in millicredits: the cheapest live
+/// scanner's price (what the Actions card offers and the budget must
+/// cover) and the dearest's (the arbiter pays whichever scanner wins the
+/// job). Both 0 standalone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Price {
+    pub floor_mc: u64,
+    pub max_mc: u64,
+}
+
+/// Why no scan of a level is sold now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotSold {
+    /// A job of the level is "queued" or "running".
+    OnItsWay(&'static str),
+    /// A finished scan of the level under [`FRESH_HOURS`] old: its finish
+    /// date and its id.
+    Fresh(String, i64),
+    /// No live scanner announces a price.
+    NoPrice,
+    /// The scan budget does not cover the floor price.
+    NoBudget,
+}
+
+/// The level-scaled price range over `scanners`; None without any.
+pub fn price_range(scanners: &[crate::credits::price::ScannerPrice], level: u8) -> Option<Price> {
+    let factor = crate::credits::jobs::level_factor(level as i64) as u64;
+    let min = scanners.iter().map(|s| s.price_mc).min()?;
+    let max = scanners.iter().map(|s| s.price_mc).max()?;
+    Some(Price {
+        floor_mc: min as u64 * factor,
+        max_mc: max as u64 * factor,
+    })
+}
+
+/// Whether a level-`level` scan of `ip_id` is sold now, and at what price:
+/// the checks of the Actions card's buy button (`POST /admin/lookup/scan`)
+/// and of the machine API's quote and buy alike. A job of the level on its
+/// way or a fresh result of it sells nothing; in a cluster the scan budget
+/// must cover the floor price, otherwise the job would silently wait in
+/// the queue.
+pub async fn sale(
+    state: &AdminState,
+    ip_id: i64,
+    level: u8,
+) -> anyhow::Result<Result<Price, NotSold>> {
+    let jobs = state.store.jobs_for_ip(ip_id, 20).await?;
+    if let Some(j) = jobs
+        .iter()
+        .filter(|j| j.level == level as i64)
+        .find(|j| matches!(j.status.as_str(), "queued" | "running"))
+    {
+        let waiting = if j.status == "running" {
+            "running"
+        } else {
+            "queued"
+        };
+        return Ok(Err(NotSold::OnItsWay(waiting)));
+    }
+    let fresh = offers_for(state, ip_id)
+        .await
+        .into_iter()
+        .find(|o| o.level == level)
+        .and_then(|o| Some((o.fresh?, o.fresh_id?)));
+    if let Some((at, id)) = fresh {
+        return Ok(Err(NotSold::Fresh(at, id)));
+    }
+    let Some(node) = state.recorder.node() else {
+        return Ok(Ok(Price {
+            floor_mc: 0,
+            max_mc: 0,
+        }));
+    };
+    let Some(price) = price_range(&node.price_table().scanners, level) else {
+        return Ok(Err(NotSold::NoPrice));
+    };
+    let book = crate::credits::book(node).await?;
+    let self_mc = crate::credits::jobs::self_committed(&state.store.pool, &node.id()).await?;
+    let left = crate::credits::jobs::budget(&book.ledger, &node.id(), node.scan_share(), self_mc);
+    if (left as u64) < price.floor_mc {
+        return Ok(Err(NotSold::NoBudget));
+    }
+    Ok(Ok(price))
+}
+
+/// Queue a marked level-`level` job for `ip_id` and tell the queue view.
+/// Its id; None when the queue did not take it.
+pub async fn enqueue(state: &AdminState, ip_id: i64, level: u8) -> anyhow::Result<Option<i64>> {
+    match state.recorder.enqueue_manual(ip_id, level).await? {
+        EnqueueOutcome::Queued(id) => {
+            if let Ok(Some(job)) = state.store.queue_job(id).await {
+                state.notifier.publish(job);
+            }
+            Ok(Some(id))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// POST /admin/lookup/scan: queue a marked job, then back to the IP
 /// page's Counter-scans section. A job of this level already on its way,
 /// or a fresh result of it, sells nothing.
@@ -169,59 +265,39 @@ async fn buy(
             "No scan: the address is not in the dataset.",
         ));
     };
-    let jobs = state.store.jobs_for_ip(row.id, 20).await?;
-    if jobs
-        .iter()
-        .any(|j| j.level == level as i64 && matches!(j.status.as_str(), "queued" | "running"))
-    {
-        return Ok(redirect_with_notice(
-            &back,
-            &format!("A level {level} scan of this address is already on its way."),
-        ));
-    }
-    let fresh = offers_for(&state, row.id)
-        .await
-        .into_iter()
-        .find(|o| o.level == level)
-        .and_then(|o| o.fresh);
-    if let Some(fresh) = fresh {
-        return Ok(redirect_with_notice(
-            &back,
-            &format!("No new scan: the level {level} scan of {fresh} is less than a day old."),
-        ));
-    }
-    // In a cluster the scan budget must cover the level-scaled cheapest
-    // price; otherwise the job would silently wait in the queue.
-    if let Some(node) = state.recorder.node() {
-        let Some(cheapest) = node.price_table().scanners.iter().map(|s| s.price_mc).min() else {
+    match sale(&state, row.id, level).await? {
+        Err(NotSold::OnItsWay(_)) => {
+            return Ok(redirect_with_notice(
+                &back,
+                &format!("A level {level} scan of this address is already on its way."),
+            ));
+        }
+        Err(NotSold::Fresh(fresh, _)) => {
+            return Ok(redirect_with_notice(
+                &back,
+                &format!("No new scan: the level {level} scan of {fresh} is less than a day old."),
+            ));
+        }
+        Err(NotSold::NoPrice) => {
             return Ok(redirect_with_error(
                 &back,
                 "No scan: no live scanner announces a price.",
             ));
-        };
-        let price = cheapest as u64 * crate::credits::jobs::level_factor(level as i64) as u64;
-        let book = crate::credits::book(node).await?;
-        let self_mc = crate::credits::jobs::self_committed(&state.store.pool, &node.id()).await?;
-        let left =
-            crate::credits::jobs::budget(&book.ledger, &node.id(), node.scan_share(), self_mc);
-        if (left as u64) < price {
+        }
+        Err(NotSold::NoBudget) => {
             return Ok(redirect_with_error(
                 &back,
                 "No scan: the scan budget does not cover this.",
             ));
         }
+        Ok(_) => {}
     }
-    match state.recorder.enqueue_manual(row.id, level).await? {
-        EnqueueOutcome::Queued(id) => {
-            if let Ok(Some(job)) = state.store.queue_job(id).await {
-                state.notifier.publish(job);
-            }
-            Ok(redirect_with_notice(
-                &back,
-                &format!("Level {level} scan queued; the result appears below when it is in."),
-            ))
-        }
-        _ => Ok(redirect_with_error(
+    match enqueue(&state, row.id, level).await? {
+        Some(_) => Ok(redirect_with_notice(
+            &back,
+            &format!("Level {level} scan queued; the result appears below when it is in."),
+        )),
+        None => Ok(redirect_with_error(
             &back,
             "No scan: the job was not queued.",
         )),
@@ -286,7 +362,7 @@ async fn stream(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::admin::AdminState;
     use crate::scan::probe::gate::tests::scanned;
@@ -339,6 +415,32 @@ secure_cookies = false
             .header("content-type", "application/x-www-form-urlencoded")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
+    }
+
+    #[test]
+    fn a_price_ranges_from_the_cheapest_to_the_dearest_scanner_level_scaled() {
+        let sp = |price_mc| crate::credits::price::ScannerPrice {
+            node: crate::scan::probe::gate::LOCAL,
+            price_mc,
+            paid: 0.0,
+            supply: 0.0,
+        };
+        assert_eq!(price_range(&[], 1), None);
+        let scanners = [sp(320), sp(80), sp(160)];
+        assert_eq!(
+            price_range(&scanners, 1),
+            Some(Price {
+                floor_mc: 80,
+                max_mc: 320
+            })
+        );
+        assert_eq!(
+            price_range(&scanners, 3),
+            Some(Price {
+                floor_mc: 80 * 16,
+                max_mc: 320 * 16
+            })
+        );
     }
 
     #[test]
