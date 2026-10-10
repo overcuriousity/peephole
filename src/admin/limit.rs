@@ -177,7 +177,10 @@ fn classify(method: &axum::http::Method, path: &str) -> Class {
     if method == axum::http::Method::POST
         && (path.starts_with("/login/")
             || path.starts_with("/enroll/")
-            || path == "/admin/system/password")
+            || path == "/admin/system/password"
+            // Anonymous by design (the pairing code is the credential), so
+            // it gets the sign-in endpoints' tighter per-client budget.
+            || path == "/api/v1/pair")
     {
         return Class::Auth;
     }
@@ -203,13 +206,24 @@ fn client_key(ip: IpAddr, class: &Class) -> IpAddr {
     }
 }
 
-fn too_many() -> Response {
-    (
+fn too_many(path: &str) -> Response {
+    let base = (
         axum::http::StatusCode::TOO_MANY_REQUESTS,
         [(axum::http::header::RETRY_AFTER, "30")],
-        "too many requests; slow down",
-    )
-        .into_response()
+    );
+    // API clients get the JSON error shape (docs/api-v1.md), browsers prose.
+    if path.starts_with("/api/") {
+        (
+            base.0,
+            base.1,
+            axum::Json(serde_json::json!({
+                "error": {"code": "rate_limited", "message": "too many requests; slow down"}
+            })),
+        )
+            .into_response()
+    } else {
+        (base.0, base.1, "too many requests; slow down").into_response()
+    }
 }
 
 /// Middleware enforcing [`Limits`].
@@ -218,16 +232,17 @@ pub async fn enforce(State(state): State<Arc<AdminState>>, req: Request, next: N
     if class == Class::Free {
         return next.run(req).await;
     }
+    let path = req.uri().path().to_string();
     let limits = &state.limits;
     // Sign-in starts from everyone share one budget as well, taken after the
     // client's own so a client over its limit does not spend it.
     let is_sign_in =
-        class == Class::Auth && matches!(req.uri().path(), "/login/start" | "/login/password");
+        class == Class::Auth && matches!(path.as_str(), "/login/start" | "/login/password");
     let global = || !is_sign_in || limits.login.allow();
     // No peer address (in-process callers, tests): nothing to key on.
     let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>().copied() else {
         if !global() {
-            return too_many();
+            return too_many(&path);
         }
         return next.run(req).await;
     };
@@ -241,7 +256,7 @@ pub async fn enforce(State(state): State<Arc<AdminState>>, req: Request, next: N
             );
         }
         if !global() {
-            return too_many();
+            return too_many(&path);
         }
         return next.run(req).await;
     }
@@ -261,7 +276,7 @@ pub async fn enforce(State(state): State<Arc<AdminState>>, req: Request, next: N
             return next.run(req).await;
         }
     }
-    too_many()
+    too_many(&path)
 }
 
 #[cfg(test)]
@@ -376,6 +391,12 @@ secure_cookies = false
         assert!(r.headers().contains_key(axum::http::header::RETRY_AFTER));
         // Security headers still apply to the refusal.
         assert!(r.headers().contains_key("x-content-type-options"));
+        // API paths refuse in the JSON error shape.
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "rate_limited", "{v}");
         let r = call("GET", "/api/countries", Some("203.0.113.2"))
             .await
             .unwrap();
@@ -441,6 +462,9 @@ secure_cookies = false
             classify(&Method::POST, "/admin/system/password"),
             Class::Auth
         );
+        // Pairing is anonymous (the code is the credential): sign-in budget.
+        assert_eq!(classify(&Method::POST, "/api/v1/pair"), Class::Auth);
+        assert_eq!(classify(&Method::GET, "/api/v1/pair"), Class::Public);
         assert_eq!(classify(&Method::GET, "/ips"), Class::Public);
         assert_eq!(classify(&Method::GET, "/ip/203.0.113.1"), Class::Public);
         assert_eq!(classify(&Method::GET, "/api/stats"), Class::Public);

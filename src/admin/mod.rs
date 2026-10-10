@@ -1,3 +1,4 @@
+pub mod api_v1;
 pub mod assets;
 pub mod auth;
 pub mod blocklist;
@@ -8,6 +9,7 @@ pub mod cluster_owner;
 pub mod countries;
 pub mod credits;
 pub mod decoys;
+pub mod devices;
 pub mod error;
 pub mod limit;
 pub mod links;
@@ -186,6 +188,8 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(cluster_access::routes())
         .merge(cluster_owner::routes())
         .merge(credits::routes())
+        .merge(devices::routes())
+        .merge(api_v1::routes())
         .fallback(error::not_found)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -221,8 +225,10 @@ async fn security_headers(
             .into_response();
     }
     // Admin/auth pages must not sit in a shared or back/forward cache after
-    // logout (invite tokens, request bodies, headers).
+    // logout (invite tokens, request bodies, headers); the machine API's
+    // JSON is bearer-gated and just as little cacheable.
     let sensitive = path.starts_with("/admin")
+        || path.starts_with("/api/")
         || path.starts_with("/login")
         || path.starts_with("/enroll")
         || path == "/logout"

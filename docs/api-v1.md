@@ -98,10 +98,10 @@ Every non-2xx response is JSON:
 
 | status | code           | when                                              |
 | ------ | -------------- | ------------------------------------------------- |
-| 400    | `invalid`      | malformed body, bad address, bad cursor           |
+| 400    | `invalid`      | malformed body, bad address, bad cursor, bad limit |
 | 401    | `unauthorized` | no/expired/revoked token, dead pairing code       |
 | 403    | `forbidden`    | token lacks the required scope                    |
-| 404    | `not_found`    | address not in the dataset                        |
+| 404    | `not_found`    | address not in the dataset, unknown `/api/v1` path |
 | 429    | `rate_limited` | per-IP limit hit (`Retry-After` header is set)    |
 | 500    | `internal`     | storage failure; message is generic, never a leak |
 
@@ -120,7 +120,8 @@ IPs page shows.
   prefix. Empty lists everything.
 - `cursor` — opaque continuation token from the previous page's
   `next_cursor`. A cursor is bound to the `q` it was issued with.
-- `limit` — page size, default 50, max 100.
+- `limit` — page size, default 50; above 100 it clamps to 100, and 0 or a
+  non-number is a `400`.
 
 `200`:
 
@@ -169,7 +170,7 @@ the API serves stored data only).
   "intel": {
     "abuseipdb": { "fetched_at": "…", "data": { } },
     "shodan": null,
-    "internetdb": { "fetched_at": "…", "data": { } },
+    "shodan-internetdb": { "fetched_at": "…", "data": { } },
     "rdap": { "fetched_at": "…", "data": { } }
   },
   "scans": [
@@ -188,9 +189,11 @@ the API serves stored data only).
 }
 ```
 
-- `intel` — newest stored answer per provider (`data` is the provider's
-  parsed JSON as stored; `null` when the provider never answered). Tor is not
-  an entry here: `is_tor` comes from the exit list the node loads.
+- `intel` — newest stored answer per provider, keyed by the provider's
+  stored name (`abuseipdb`, `maxmind-geolite2`, `shodan`,
+  `shodan-internetdb`, `rdap`; a known provider that never answered is
+  `null`). `data` is the provider's parsed JSON as stored. Tor is not an
+  entry here: `is_tor` comes from the exit list the node loads.
 - `scans` — newest first: ports found open by nmap scans of the address.
 - `names` — names for the address (rDNS, resolved lookups, scan banners),
   each with its source and whether several resolvers agreed.

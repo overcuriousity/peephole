@@ -659,13 +659,23 @@ fn is_list(text: &str) -> bool {
         || text.parse::<ipnet::IpNet>().is_ok()
 }
 
-async fn bulk_page(state: &AdminState, text: String) -> AppResult<Html<String>> {
+/// What a bulk lookup reads from stored data, without the pasted text.
+pub struct BulkRead {
+    pub rows: Vec<crate::store::browse::IpSummary>,
+    pub missing: Vec<String>,
+    pub unreadable: Vec<String>,
+    pub capped: bool,
+}
+
+/// The bulk lookup itself, shared by the admin page and `/api/v1/lookup`:
+/// the first [`BULK_MAX`] pieces, each an address or a network, matched
+/// against stored data only.
+pub async fn bulk_read<'a>(
+    state: &AdminState,
+    pieces: impl Iterator<Item = &'a str>,
+) -> anyhow::Result<BulkRead> {
     let (mut addrs, mut nets, mut unreadable) = (vec![], vec![], vec![]);
-    for piece in text
-        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-        .filter(|p| !p.is_empty())
-        .take(BULK_MAX)
-    {
+    for piece in pieces.filter(|p| !p.is_empty()).take(BULK_MAX) {
         if let Ok(ip) = piece.parse::<IpAddr>() {
             addrs.push(crate::net::canonical(ip));
         } else if let Ok(n) = piece.parse::<ipnet::IpNet>() {
@@ -685,6 +695,25 @@ async fn bulk_page(state: &AdminState, text: String) -> AppResult<Html<String>> 
         .map(IpAddr::to_string)
         .filter(|a| !rows.iter().any(|r| &r.ip == a))
         .collect();
+    Ok(BulkRead {
+        rows,
+        missing,
+        unreadable,
+        capped,
+    })
+}
+
+async fn bulk_page(state: &AdminState, text: String) -> AppResult<Html<String>> {
+    let BulkRead {
+        rows,
+        missing,
+        unreadable,
+        capped,
+    } = bulk_read(
+        state,
+        text.split(|c: char| c.is_whitespace() || c == ',' || c == ';'),
+    )
+    .await?;
     render(&LookupPage {
         chrome: chrome(),
         ip: String::new(),
