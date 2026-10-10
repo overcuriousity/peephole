@@ -340,6 +340,42 @@ impl RttVerdict {
         self.distance_km
             .map_or("-".into(), |d| format!("{d:.0} km"))
     }
+
+    /// The verdict alone, without its numbers (those have their own columns).
+    pub fn kind(&self) -> &'static str {
+        match self.distance_km {
+            Some(_) if self.impossible => "impossible",
+            Some(_) => "not contradicted",
+            None => "no coordinates",
+        }
+    }
+}
+
+impl DiffRow {
+    /// The value every vantage that saw the field agrees on.
+    pub fn shared(&self) -> &str {
+        self.values
+            .iter()
+            .flatten()
+            .next()
+            .map_or("-", |v| v.as_str())
+    }
+
+    /// How many vantages saw the field.
+    pub fn seen(&self) -> usize {
+        self.values.iter().flatten().count()
+    }
+
+    /// Whether vantage `i` saw something other than the most common value,
+    /// when one value was seen more than once (a tie marks nobody).
+    pub fn odd(&self, i: usize) -> bool {
+        let Some(Some(v)) = self.values.get(i) else {
+            return false;
+        };
+        let count = |x: &String| self.values.iter().flatten().filter(|y| *y == x).count();
+        let top = self.values.iter().flatten().map(count).max().unwrap_or(0);
+        top > 1 && count(v) < top
+    }
 }
 
 /// One vantage of a request.
@@ -1198,6 +1234,23 @@ secure_cookies = false
         assert!(leaf.differs);
         assert_eq!(leaf.values, vec![Some("aa".into()), Some("bb".into())]);
         assert!(d.consistent >= 2, "status and server");
+    }
+
+    #[test]
+    fn the_odd_value_out_is_marked() {
+        let row = |values: &[Option<&str>]| DiffRow {
+            port: 443,
+            field: "tls.leaf_sha256".into(),
+            values: values.iter().map(|v| v.map(String::from)).collect(),
+            differs: true,
+        };
+        let r = row(&[Some("aa"), Some("aa"), Some("bb"), None]);
+        assert_eq!(
+            (0..4).map(|i| r.odd(i)).collect::<Vec<_>>(),
+            [false, false, true, false]
+        );
+        let tie = row(&[Some("aa"), Some("bb")]);
+        assert!(!tie.odd(0) && !tie.odd(1), "a tie marks nobody");
     }
 
     /// `_probes.html` alone, around a loaded target.

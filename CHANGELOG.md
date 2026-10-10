@@ -28,6 +28,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Changed
 
+- The Probes card on an address is easier to read: the location and
+  fingerprint checks each open with a one-line verdict, the verdict column
+  shows "impossible" or "not contradicted" as a pill, fields that differ
+  get their own table with the odd vantage out highlighted, fields that
+  agree fold into one value-and-count table, and each vantage's ports sit
+  in a card grid.
 - The public page is called "Public dashboard" (nav: "Dashboard") instead of
   "Wall of shame". Its address and the `[public]` settings are unchanged.
 - New logo: a door peephole whose ring carries three cluster members. It
