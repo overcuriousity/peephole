@@ -571,6 +571,7 @@ impl Source {
                     "SELECT j.id, i.ip, j.level, j.queued_at FROM scan_jobs j
                  LEFT JOIN ips i ON i.id = j.ip_id
                  WHERE j.status = 'queued' AND j.arbiter IS NULL
+                   AND (j.retry_at IS NULL OR j.retry_at <= datetime('now'))
                    AND j.id NOT IN (SELECT value FROM json_each(?))
                    AND j.level NOT IN (SELECT value FROM json_each(?))
                  ORDER BY {} LIMIT 1",
@@ -630,6 +631,7 @@ impl Source {
         let arbiters: Vec<(Vec<u8>, f64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT j.arbiter, MAX({}) AS r FROM scan_jobs j
              WHERE j.status = 'queued' AND j.arbiter IS NOT NULL
+               AND (j.retry_at IS NULL OR j.retry_at <= datetime('now'))
                AND j.level NOT IN (SELECT value FROM json_each(?))
              GROUP BY j.arbiter ORDER BY r DESC, MIN(j.queued_at) ASC",
             est.ratio_sql("j")
@@ -2083,6 +2085,45 @@ license_key = "k"
         assert!(error.unwrap().contains("never_scan"));
         assert_eq!(store.local().jobs_started_last_hour().await.unwrap(), 1);
         assert!(source.acquire(&[]).await.unwrap().is_none());
+    }
+
+    /// A failed scan's retry waits for its `retry_at`: the standalone
+    /// queue once took it at once, and a broken nmap failed the same
+    /// addresses several times a second (MIK-82).
+    #[tokio::test]
+    async fn a_failed_scan_is_not_retried_before_its_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_with(
+            dir.path(),
+            "tor_unknown = \"scan\"\nverify_crawlers = false\n",
+        );
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let ip = store
+            .upsert_ip("203.0.113.70".parse().unwrap())
+            .await
+            .unwrap();
+        store.enqueue_scan(ip.id, 2, 24).await.unwrap();
+        let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
+        let source = Source::new(store.local(), cfg, p, Classifier::builtin());
+        let job = source.acquire(&[]).await.unwrap().expect("the first try");
+        source.finish(&job, Outcome::Failed("exit 1".into())).await;
+        let (queued, waiting): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(retry_at > datetime('now')), 0)
+             FROM scan_jobs WHERE status = 'queued'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!((queued, waiting), (1, 1), "one retry, not yet due");
+        assert!(source.acquire(&[]).await.unwrap().is_none());
+        sqlx::query(
+            "UPDATE scan_jobs SET retry_at = datetime('now', '-1 minute') WHERE status = 'queued'",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let retry = source.acquire(&[]).await.unwrap().expect("the due retry");
+        assert_eq!(retry.ip().to_string(), "203.0.113.70");
     }
 
     fn write_tor_list(dir: &std::path::Path, extra: &str) {

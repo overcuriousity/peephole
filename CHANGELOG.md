@@ -78,6 +78,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Fixed
 
+- Scans: a standalone node ran a failed scan's retry at once instead of
+  after its delay (10 minutes, doubling to 2 hours), so a broken nmap
+  failed the same addresses several times a second for as long as it
+  stayed broken. Retries now wait; a cluster scanner also no longer asks
+  an arbiter whose queued jobs are all retries not yet due.
 - Admin: a security key deleted while a sign-in with it was under way
   (up to ten minutes) could still finish that sign-in and get a full
   session. Deleting a key now ends every open sign-in, a session starts
