@@ -1,0 +1,43 @@
+{% extends "layout.html" %}
+{% block title %}peephole — devices{% endblock %}
+{% block content %}
+{% let sub = "devices" %}{% include "_admin_nav.html" %}
+<div class="page-head"><div><h1>Devices</h1><p class="muted">Phones and tools paired with this node's machine API (<span class="mono">/api/v1</span>).</p></div></div>
+<div class="stack">
+<section class="card">
+  <div class="card-head"><h2>Pair a device</h2></div>
+  {% if let Some(p) = pair %}
+  <p>Scan with the app within {{ p.minutes }} minutes. The code works once; it is never stored, only its hash is.</p>
+  <div>{{ p.qr|safe }}</div>
+  <pre class="mono">{{ p.payload }}</pre>
+  <p class="muted">Scopes: <span class="mono">{{ p.scopes }}</span></p>
+  <form method="get" action="/admin/devices"><button class="btn" type="submit">Done</button></form>
+  {% else %}
+  <form method="post" action="/admin/devices/pair" class="stack">
+    <p class="muted">The <span class="mono">read</span> scope is always granted: every <span class="mono">GET</span> under <span class="mono">/api/v1</span> and <span class="mono">POST /api/v1/lookup</span>.</p>
+    <label><input type="checkbox" name="act" value="1"> Also grant <span class="mono">act</span> (reserved; no endpoint needs it yet)</label>
+    <div><button class="btn btn-primary" type="submit">Pair a device</button></div>
+  </form>
+  {% endif %}
+</section>
+<section class="card">
+  <div class="card-head"><h2>Paired devices</h2></div>
+  {% if devices.is_empty() %}<p class="muted">No devices paired yet.</p>{% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Name</th><th>Scopes</th><th>Paired by</th><th>Created</th><th>Last seen</th><th></th></tr></thead>
+    <tbody>{% for d in devices %}
+      <tr>
+        <td>{{ d.name }}</td><td class="mono">{{ d.scopes }}</td><td>{{ d.paired_by }}</td>
+        <td class="ts">{{ d.created_at }}</td><td class="ts">{{ d.last_seen_at }}</td>
+        <td>{% if d.revoked() %}<span class="badge badge-status" data-status="failed" title="{{ d.revoked_at.as_deref().unwrap_or_default() }}">revoked</span>{% else %}
+          <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-dev-{{ loop.index }}">Revoke</button>
+          <dialog id="dlg-dev-{{ loop.index }}"><h3>Revoke "{{ d.name }}"?</h3><p class="muted">Its token stops working at once. Pair again for a new one.</p>
+            <form method="post" action="/admin/devices/revoke" class="actions"><input type="hidden" name="id" value="{{ d.id }}">
+              <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Revoke</button></form></dialog>
+        {% endif %}</td>
+      </tr>
+    {% endfor %}</tbody>
+  </table></div>{% endif %}
+</section>
+</div>
+{% endblock %}

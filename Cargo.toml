@@ -37,6 +37,8 @@ md-5 = "0.11"
 # Only the Arrow writer/reader, and zstd for the exported Parquet files.
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 quick-xml = "0.42"
+# The pairing QR, rendered server-side as SVG (no image codecs, no JS).
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = "0.10"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 regex = "1"

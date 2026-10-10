@@ -8,6 +8,7 @@ pub mod cli;
 pub mod data;
 pub mod decoys;
 pub mod delete;
+pub mod devices;
 pub mod export;
 pub mod facts;
 pub mod fingerprints;
@@ -69,6 +70,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0029_scarce_credits.sql"),
     include_str!("migrations/0030_vouched.sql"),
     include_str!("migrations/0031_stats_index.sql"),
+    include_str!("migrations/0032_devices.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of

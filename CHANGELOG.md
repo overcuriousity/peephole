@@ -12,6 +12,13 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   admin's bought scan reaches it; the automatic queue stays within levels
   1–4. Level 5 shares level 4's worker budget and two-hour timeout, and is
   granted only to cluster members of protocol 8 and up.
+- The machine API `/api/v1` for the companion app (docs/api-v1.md): devices
+  pair from Admin → Devices with a single-use code in a QR (5-minute TTL,
+  SHA-256 at rest) and then talk bearer-token JSON — paged IP search, one
+  address's full record, and bulk stored-data lookup. Device tokens are
+  256-bit, hashed at rest, revocable per device. The new optional config
+  key `api_tls_spki_sha256` pins the admin origin's TLS key in the pairing
+  QR.
 
 ### Changed
 
