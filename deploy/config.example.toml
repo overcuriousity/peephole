@@ -62,6 +62,11 @@ trusted_proxies = ["10.0.0.5/32"]
 # mcp_sse_per_source = 2      # ...from one source (IPv6 by /64)
 # mcp_sse_hold_secs = 300     # longest a stream is held
 
+# Base64 of the SHA-256 of the TLS certificate's SubjectPublicKeyInfo that
+# nginx serves on the admin origin. Device pairing QRs carry it so the
+# companion app can pin the key. Unset: the app uses ordinary PKI validation.
+# api_tls_spki_sha256 = "…"
+
 [webauthn]
 # Public domain the dashboard is reached at through nginx (FIDO2 relying party).
 rp_id = "peephole.example.net"

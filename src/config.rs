@@ -33,6 +33,10 @@ pub struct Config {
     pub trusted_proxies: Vec<IpNet>,
     /// Required with the web role.
     pub webauthn: Option<WebauthnConfig>,
+    /// Base64 of the SHA-256 of the TLS certificate's SubjectPublicKeyInfo
+    /// the admin origin serves; carried in device pairing QRs so the app can
+    /// pin it (peephole terminates no TLS itself, it sits behind a proxy).
+    pub api_tls_spki_sha256: Option<String>,
     /// Optional: without credentials GeoIP enrichment is unavailable.
     pub maxmind: Option<MaxmindConfig>,
     #[serde(default, deserialize_with = "scan_section")]
@@ -628,6 +632,7 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("roles", "web", "true"),
     ("", "trusted_proxies", "[]"),
     ("", "retention_days", "0"),
+    ("", "api_tls_spki_sha256", "none: no key pin in pairing QRs"),
     ("webauthn", "secure_cookies", "true"),
     ("scan", "max_workers", "2"),
     ("scan", "level4_max_share", "0.5"),
