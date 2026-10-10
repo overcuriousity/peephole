@@ -11,6 +11,9 @@ pub enum EnqueueOutcome {
     Suppressed,
     /// Not queued: a queue budget is used up (`scan::guard`).
     Throttled(&'static str),
+    /// Not queued: a manual job of the level is already "queued" or
+    /// "running" (which of the two).
+    OnItsWay(&'static str),
 }
 
 /// Whether scan `id` is still the scan read as `uid` (not deleted since,

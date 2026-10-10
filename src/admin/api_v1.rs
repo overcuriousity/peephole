@@ -664,8 +664,9 @@ async fn scan_buy(
         Err(e) => return internal(e),
     }
     let id = match crate::admin::scan_buy::enqueue(&state, ip_id, level).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
+        Ok(Ok(id)) => id,
+        Ok(Err(Some(n))) => return not_sold(n),
+        Ok(Err(None)) => {
             return err(
                 StatusCode::CONFLICT,
                 "not_queued",
@@ -676,7 +677,14 @@ async fn scan_buy(
     };
     let job_id = format!("s_{id}");
     let mc = quote.credits_mc as u64;
+    // The job and its audit entry are written apart (in a cluster the job
+    // goes to the replication log): without the entry, the job goes too.
     if let Err(r) = audit(&state, &device, "scan", &ip, mc, &job_id).await {
+        match state.recorder.withdraw_job(id, "audit write failed").await {
+            Ok(true) => {}
+            Ok(false) => tracing::error!(job_id, "unaudited scan job already taken; not withdrawn"),
+            Err(e) => tracing::error!(job_id, "unaudited scan job not withdrawn: {e:#}"),
+        }
         return *r;
     }
     let (credits, credits_mc) = credits(mc);
@@ -1420,6 +1428,111 @@ mod tests {
             html.contains("Recent actions") && html.contains(&job_id) && html.contains("Pixel 8"),
             "{html}"
         );
+    }
+
+    #[tokio::test]
+    async fn two_purchases_at_once_queue_one_scan() {
+        let (state, _cookie, ip_id, _d) = crate::admin::scan_buy::tests::state().await;
+        let app = crate::admin::full_router(state.clone());
+        let token = device(&state, "read,act", "Pixel 8").await;
+        let quote = || {
+            send(
+                &app,
+                authed(
+                    "GET",
+                    &format!("/api/v1/ips/{SCAN_IP}/scan/quote?level=2"),
+                    &token,
+                ),
+            )
+        };
+        // Both quoted before either is spent: both pass `sale`.
+        let ((s1, q1), (s2, q2)) = (quote().await, quote().await);
+        assert_eq!((s1, s2), (StatusCode::OK, StatusCode::OK), "{q1} {q2}");
+        let buy = |q: &serde_json::Value| {
+            send(
+                &app,
+                authed_json(
+                    "POST",
+                    &format!("/api/v1/ips/{SCAN_IP}/scan"),
+                    &token,
+                    serde_json::json!({"quote_id": q["quote_id"]}),
+                ),
+            )
+        };
+        let ((s1, v1), (s2, v2)) = tokio::join!(buy(&q1), buy(&q2));
+        let mut codes = [s1.as_u16(), s2.as_u16()];
+        codes.sort();
+        assert_eq!(codes, [202, 409], "{v1} {v2}");
+        let refused = if s1 == StatusCode::CONFLICT { v1 } else { v2 };
+        assert_eq!(refused["error"]["code"], "on_its_way", "{refused}");
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE ip_id = ?")
+            .bind(ip_id)
+            .fetch_one(&state.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(jobs, 1);
+        assert_eq!(jobs_and_actions(&state).await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_scan_without_its_audit_entry_is_withdrawn() {
+        let (state, _cookie, ip_id, _d) = crate::admin::scan_buy::tests::state().await;
+        let app = crate::admin::full_router(state.clone());
+        let token = device(&state, "read,act", "Pixel 8").await;
+        let (st, q) = send(
+            &app,
+            authed(
+                "GET",
+                &format!("/api/v1/ips/{SCAN_IP}/scan/quote?level=3"),
+                &token,
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{q}");
+        sqlx::query(
+            "CREATE TRIGGER no_audit BEFORE INSERT ON device_actions
+             BEGIN SELECT RAISE(ABORT, 'audit down'); END",
+        )
+        .execute(&state.store.pool)
+        .await
+        .unwrap();
+        let (st, v) = send(
+            &app,
+            authed_json(
+                "POST",
+                &format!("/api/v1/ips/{SCAN_IP}/scan"),
+                &token,
+                serde_json::json!({"quote_id": q["quote_id"]}),
+            ),
+        )
+        .await;
+        assert_eq!(st, 500, "{v}");
+        let jobs: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, error FROM scan_jobs WHERE ip_id = ?")
+                .bind(ip_id)
+                .fetch_all(&state.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            jobs,
+            vec![("refused".into(), Some("dropped: audit write failed".into()))],
+            "nothing left queued"
+        );
+        // Withdrawn, it is not on its way: a new quote sells.
+        sqlx::query("DROP TRIGGER no_audit")
+            .execute(&state.store.pool)
+            .await
+            .unwrap();
+        let (st, q) = send(
+            &app,
+            authed(
+                "GET",
+                &format!("/api/v1/ips/{SCAN_IP}/scan/quote?level=3"),
+                &token,
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{q}");
     }
 
     #[tokio::test]

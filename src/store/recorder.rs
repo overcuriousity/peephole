@@ -544,9 +544,29 @@ impl Recorder {
     /// cooldown, evidence or budget checks (those are the automatic
     /// queue's); the marker lets every scanner skip its evidence
     /// re-check and the arbiter fund it at the level-scaled price.
+    /// A job of the level already queued or running takes no second one:
+    /// purchases arriving together (two quotes, the API and the form)
+    /// would otherwise each queue, and each be charged.
     pub async fn enqueue_manual(&self, ip_id: i64, level: u8) -> Result<EnqueueOutcome> {
         if !(1..=5).contains(&level) {
             return Ok(EnqueueOutcome::Suppressed);
+        }
+        let _one = self.store().enqueue.lock().await;
+        let pending: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM scan_jobs WHERE ip_id = ? AND level = ?
+               AND status IN ('queued','running')
+             ORDER BY status = 'running' DESC LIMIT 1",
+        )
+        .bind(ip_id)
+        .bind(level as i64)
+        .fetch_optional(&self.store().pool)
+        .await?;
+        if let Some(status) = pending {
+            return Ok(EnqueueOutcome::OnItsWay(if status == "running" {
+                "running"
+            } else {
+                "queued"
+            }));
         }
         let ip_text = self.ip_of(ip_id).await?;
         let uid = self.uid();
@@ -564,6 +584,36 @@ impl Recorder {
         Ok(EnqueueOutcome::Queued(
             self.id_by_uid("scan_jobs", &uid).await?,
         ))
+    }
+
+    /// Take back queued job `job_id` (refused, `dropped: {why}`, so it
+    /// holds no cooldown). False when it is no longer queued.
+    pub async fn withdraw_job(&self, job_id: i64, why: &str) -> Result<bool> {
+        let row: Option<(Option<String>, String, i64)> =
+            sqlx::query_as("SELECT uid, status, attempts FROM scan_jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_optional(&self.store().pool)
+                .await?;
+        let Some((Some(uid), status, attempts)) = row else {
+            return Ok(false);
+        };
+        if status != "queued" {
+            return Ok(false);
+        }
+        self.status(
+            &uid.clone(),
+            JobStatusRec {
+                job_uid: uid,
+                status: "refused".into(),
+                started_at: None,
+                finished_at: Some(now_ts()),
+                error: Some(format!("dropped: {why}")),
+                attempts,
+                scanner: None,
+            },
+        )
+        .await?;
+        Ok(true)
     }
 
     /// Why a new job for this IP does not fit the queue budgets, if it does
@@ -1354,6 +1404,16 @@ mod tests {
             .unwrap();
         let first = rec.enqueue_manual(ip.id, 2).await.unwrap();
         assert!(matches!(first, EnqueueOutcome::Queued(_)));
+        // While the first is queued a second is on its way, not queued.
+        let dup = rec.enqueue_manual(ip.id, 2).await.unwrap();
+        assert!(matches!(dup, EnqueueOutcome::OnItsWay("queued")));
+        // Done, it holds the cooldown; a manual job ignores that.
+        sqlx::query("UPDATE scan_jobs SET status = 'done', finished_at = ? WHERE ip_id = ?")
+            .bind(now_ts())
+            .bind(ip.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
         let second = rec.enqueue_manual(ip.id, 2).await.unwrap();
         assert!(matches!(second, EnqueueOutcome::Queued(_)));
         let both: (i64, i64) =
