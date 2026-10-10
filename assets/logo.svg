@@ -1,5 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="512" height="512">
   <title>peephole</title>
+  <!-- colours are attributes, so the mark still draws where inline style is blocked; the style only adds dark mode -->
   <style>
     .ink { fill: #1f2024 }
     .line { stroke: #1f2024 }
@@ -18,11 +19,11 @@
     </mask>
   </defs>
   <!-- the door viewer: ring, lens, pupil -->
-  <circle class="line" cx="32" cy="32" r="22" fill="none" stroke-width="6" mask="url(#gaps)"/>
-  <circle class="ink" cx="32" cy="32" r="13" opacity="0.14"/>
+  <circle class="line" cx="32" cy="32" r="22" fill="none" stroke="#1f2024" stroke-width="6" mask="url(#gaps)"/>
+  <circle class="ink" cx="32" cy="32" r="13" fill="#1f2024" opacity="0.14"/>
   <circle cx="32" cy="32" r="7" fill="#b30000"/>
   <!-- three cluster members on the ring -->
-  <circle class="line" cx="32" cy="10" r="5" fill="none" stroke-width="3"/>
-  <circle class="line" cx="51" cy="43" r="5" fill="none" stroke-width="3"/>
-  <circle class="line" cx="13" cy="43" r="5" fill="none" stroke-width="3"/>
+  <circle class="line" cx="32" cy="10" r="5" fill="none" stroke="#1f2024" stroke-width="3"/>
+  <circle class="line" cx="51" cy="43" r="5" fill="none" stroke="#1f2024" stroke-width="3"/>
+  <circle class="line" cx="13" cy="43" r="5" fill="none" stroke="#1f2024" stroke-width="3"/>
 </svg>

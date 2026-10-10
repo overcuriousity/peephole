@@ -28,8 +28,8 @@ member's intelligence providers.
 ## How it works
 
 - **A trap behind your web server.** peephole is the fallback for every
-  request no real site claims, and records it in full, over HTTPS with the
-  raw TLS ClientHello and its JA4 fingerprint.
+  request no real site claims, and records it with headers and body, over
+  HTTPS also the raw TLS ClientHello and its JA4 fingerprint.
 - **Classified and enriched.** Signature rules built into the binary give
   each request labels and a severity from 0 to 4; the source gets its
   country, ASN, Tor status and registration data, and optionally AbuseIPDB
@@ -38,7 +38,7 @@ member's intelligence providers.
   sources with nmap, escalating by scope and never touching bystanders; a
   tarpit holds exploit senders, and decoys hand out canary credentials
   that give away whoever reuses them.
-- **Shared without trust.** Every node holds the same signed dataset,
+- **Shared without trust.** Every node holds a copy of one signed dataset,
   checks what it receives, and decides for itself whom it trusts; nobody
   can be removed, only blocked locally. → [Protocol](docs/protocol.md)
 - **Paid in credits.** Work one member does for another is bought with

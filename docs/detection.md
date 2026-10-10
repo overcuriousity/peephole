@@ -1,7 +1,6 @@
 # Detection
 
-What happens to a request between arriving at the trap and being stored:
-it is classified against rules built into the binary, its source address is
+What happens to a request once it reaches the trap: it is classified against rules built into the binary, its source address is
 enriched from public and optional commercial sources, and a source that did
 enough gets counter-scanned, held in the tarpit, or fed canary credentials
 that give it away when it comes back.
@@ -97,8 +96,8 @@ and looked up again when the address returns:
 An address is looked up again only when it comes back, after 30 days, then
 45, 67.5, … (`[enrichment] refresh_after_days`). Every result records which
 provider and which node it came from, and every lookup is kept in a history
-(Admin → Export → full lookup history). The results of the commercial
-providers are admin-only: the IP page shows them, and the IP list filters by
+(Admin → Export → full lookup history). The results of AbuseIPDB, Shodan
+and Shodan InternetDB are admin-only: the IP page shows them, and the IP list filters by
 abuse score, provider tag and "looked up / not yet".
 
 An admin can also look any address up on demand, through every provider
@@ -111,8 +110,10 @@ A node with the scanner role answers reconnaissance with an nmap scan of
 the source. The scanner role is opt-in: counter-scans draw abuse reports,
 and most hosting providers forbid them (see [Risks](overview.md#risks)).
 
-Levels escalate by scope, never by speed or aggressiveness (every level
-runs `-T3`):
+The automatic levels (1–4) escalate by scope, never by speed or
+aggressiveness; every built-in level runs `-T3` (an operator can override a
+level's arguments with `[scan.level_argv]`). Level 5 is deliberately
+intrusive and only ever bought:
 
 | Level | Scans |
 |---|---|
@@ -130,7 +131,8 @@ HTTP ETags, so sources that share one show up as linked (Admin → Links).
 - One request earns at most a light scan.
 - Verified crawlers and research scanners, Tor exits, the node's own
   addresses and `never_scan` networks are never scanned; neither are the
-  addresses of cluster members.
+  addresses of cluster members. `never_scan` applies on the node that sets
+  it only: other members' scanners may still scan those addresses.
 - Per-network, per-ASN and queue budgets stop floods.
 
 **On request**, an admin can also:
@@ -149,7 +151,7 @@ For an hour after a source's request reaches severity 4, its requests get a
 slow-drip `200` that holds them up to 10 minutes, from a bounded pool of its
 own; the time held is recorded (`held_ms`). Bystander and `never_scan`
 networks are never held. The settings are in
-[Day to day](operations.md#day-to-day).
+[Tarpit and decoy streams](operations.md#tarpit-and-decoy-streams).
 
 ### Canaries
 

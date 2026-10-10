@@ -2,9 +2,8 @@
 
 How a peephole cluster works, and why a member need not trust the others.
 This page is for contributors and for operators who want to check the rules
-before they join. Nothing here is decided by a central server or a vote:
-every node computes every rule for itself, from its own copy of the signed
-log. For the commands, see
+before they join. There is no central server and no shared chain: every node
+computes every rule for itself, from its own copy of the signed log. For the commands, see
 [Cluster administration](operations.md#cluster-administration); for the
 short version, the [overview](overview.md).
 
@@ -13,15 +12,17 @@ short version, the [overview](overview.md).
 - **Rules come from signed log data, not from what peers claim.** Where a
   rule can be computed from entries a member signed, it is; a peer's word
   about itself counts only where nothing better exists, and those places
-  are listed under [What this cannot do](#what-this-cannot-do).
+  are named on this page (most under
+  [What this cannot do](#what-this-cannot-do)).
 - **Every node judges for itself.** Two nodes with the same log reach the
   same result; a node that sees less, or blocks a member, may judge
   differently, and nobody can overrule it.
-- **A fleet is ownership only.** One operator's nodes can be managed
-  together ([Ownership](#ownership)), but they get no economic privilege:
-  siblings may draw on each other's balance for a paid lookup
-  ([Accounting](#accounting)), and otherwise the market prices, funds and
-  audits every key alike.
+- **A fleet is mostly ownership.** One operator's nodes can be managed
+  together ([Ownership](#ownership)). In the market two things differ:
+  siblings may draw on each other's balance for a paid lookup, probe or name
+  resolution ([Accounting](#accounting)), and a node believes only the
+  audits of its own fleet ([Conformity and audits](#conformity-and-audits)).
+  Otherwise the market prices and funds every key alike.
 
 ## Membership and trust
 
@@ -36,9 +37,10 @@ combination of three roles, set in `[roles]`:
 | `scanner` | runs nmap for jobs from any trap | nmap |
 | `web` | public dashboard and admin area | `admin_listen`, `[webauthn]` |
 
-Every node keeps a full copy of the dataset, so any web node shows the
-whole cluster. Scanners take jobs from any trap; jobs go to the scanner
-with the fewest recent scans.
+Every node keeps a full copy of the dataset (or the window it keeps), so
+any web node shows the whole cluster. Scanners take jobs from any trap;
+jobs go to the scanner that is cheapest per delivered result (see
+[Scan jobs](#scan-jobs)).
 
 A joining node learns the members first: the inviter's reply carries
 every member's signed admission and description, and every sync batch
@@ -88,8 +90,9 @@ of it.
 - **Known limitation:** the admission limit (20 new members a day per
   sponsor) is judged by the sponsor's own timestamps. A member key that
   dates all of its entries in the past from its very first one can spread
-  admissions over past days and so admit more. Only members can do this;
-  block a member you do not trust.
+  admissions over past days and so admit more. Since protocol 8 those days
+  reach back no further than the member's own admission (see above). Only
+  members can do this; block a member you do not trust.
 
 ## Replication
 

@@ -379,7 +379,7 @@ nginx_example() {
 # limit_req_zone belongs to the http context, where sites-enabled/ is included.
 limit_req_zone \$binary_remote_addr zone=peephole_auth:10m rate=30r/m;
 
-# --- Admin area and wall of shame (TLS) --------------------------------------
+# --- Admin area and public dashboard (TLS) ----------------------------------
 server {
 NGINX
         if stream_trap; then
@@ -922,7 +922,7 @@ if [ "$upgrade" -ne 1 ]; then
             [ -z "$CLOUD" ] || say "This machine runs on ${CLOUD}."$'\n'
             ask_yn ROLE_SCANNER "Run the scanner (nmap counter-scans, from this machine's address)?" n
             say $'The web interface needs a domain whose DNS points here, and HTTPS (WebAuthn). Without one answer no: in a cluster the admin area of another node shows everything.\n'
-            ask_yn ROLE_WEB "Have the web interface (public wall of shame and admin area)?" y
+            ask_yn ROLE_WEB "Have the web interface (public dashboard and admin area)?" y
             PEEPHOLE_ROLES=""
             [ "$ROLE_TRAP" = 1 ] && PEEPHOLE_ROLES="listener"
             [ "$ROLE_SCANNER" = 1 ] && PEEPHOLE_ROLES="${PEEPHOLE_ROLES:+$PEEPHOLE_ROLES,}scanner"

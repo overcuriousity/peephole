@@ -388,6 +388,18 @@ there. Within an hour the node writes such entries off as deleted (warning
 "own log entries had lost their rows"): the cluster then deletes those
 records everywhere, and new members sync past them.
 
+**Admin area.** Request search and inspection (with the same IP's and the
+same JA4's other requests), a live feed of new requests, analytics (top
+paths, user agents, JA4, methods, open ports, products, OS guesses, abuse
+scores; every row opens the matching requests or IPs), a search box for
+IPs, networks, AS numbers, requests, paths and fingerprints, per-IP pages
+with every enrichment result and counter-scan, the scan pace with the live
+queue and every finished job, a "needs attention" list on the Overview, a
+Links area (every browser fingerprint, SSH host key, TLS certificate, JA4,
+JA4H, HASSH and JA4X, filterable, each with a graph of the IPs it was seen
+on and what else links them), canary reuse, the false-positive inbox,
+deletion (standalone nodes only) and the dataset export.
+
 ### Public pages are delayed
 
 The public dashboard, the IP directory, IP pages, `/api/stats`, `/api/map` and
@@ -445,7 +457,7 @@ peephole credits send <node> <amount>     # send credits to a member
 ```
 
 `peephole cluster join <token>` or Admin → Cluster joins with an invite
-from any member. How membership, invites and blocking work:
+from a member. How membership, invites and blocking work:
 [Membership and trust](protocol.md#membership-and-trust). What the credits
 commands count: [Credits](protocol.md#credits).
 

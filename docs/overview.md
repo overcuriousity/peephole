@@ -25,9 +25,10 @@ A node runs any mix of three roles:
 | scanner | counter-scans and probes sources, for jobs from any trap | nmap, and a hosting provider that allows it; opt-in |
 | web | the public dashboard and the admin area | a domain pointing at the machine, HTTPS, a FIDO2 security key (or a password) |
 
-In a cluster a node need not run all three: a trap-only node is enough,
-since any member's web node shows the whole cluster. Roles can be switched
-at runtime. Setting a node up: [Install](operations.md#install).
+In a cluster a node need not run all three: a trap-only node can join, and
+your own web node, or one you can sign in to, shows the whole cluster. The
+admin area and the blocklist feed come with the web role. Roles can be
+switched at runtime. Setting a node up: [Install](operations.md#install).
 
 ## What a node does
 
@@ -69,11 +70,13 @@ dark themes.
 
 Nodes form a cluster over mutual TLS and share one dataset: every request,
 the scan queue, scan results, lookups and what is known about each address.
-Every node keeps a full copy, so any web node shows the whole cluster.
+Every node keeps a full copy (or the last N days of it), so any web node
+shows the whole cluster.
 
 - **No central server, no trust required.** Every entry is signed by the
   node that wrote it, and every node checks what it receives and decides
-  for itself whom it trusts. Joining takes an invite from any member.
+  for itself whom it trusts. Joining takes an invite from a member that
+  others can reach.
 - **Nobody can be removed.** A node leaves by itself, or is pruned after 30
   days without a sign of life. Instead, each node can block any member
   locally: it stops talking to it and stops showing its records, and other
@@ -82,8 +85,9 @@ Every node keeps a full copy, so any web node shows the whole cluster.
   included, and can export the whole dataset. A node may keep only the last
   N days while others keep the whole history.
 - **One operator, several nodes.** Your own nodes can share an ownership
-  key and be managed from one place. Ownership gives them no advantage in
-  the cluster.
+  key and be managed from one place. In the market they may pool their
+  credits for paid lookups, probes and name resolutions, and each trusts
+  its own fleet's audits; nothing else differs.
 
 How it works and what it cannot prevent:
 [Membership and trust](protocol.md#membership-and-trust).

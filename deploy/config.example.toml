@@ -5,7 +5,7 @@
 # [roles]
 # listener = true   # trap listener (needs trap_listen)
 # scanner  = true   # nmap counter-scans (needs nmap)
-# web      = true   # wall of shame + admin area (needs admin_listen, [webauthn])
+# web      = true   # public dashboard + admin area (needs admin_listen, [webauthn])
 
 # Trap listener: your reverse proxy sends requests that match no real site here.
 # With nothing in front, the trap takes the public ports itself:
@@ -203,7 +203,7 @@ tor_wait_hours = 6
 # 2 = ["-Pn", "-sS", "-sV", "-T3", "--top-ports", "2000"]
 # 3 = ["-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000", "--script", "(discovery or safe) and not (intrusive or broadcast or external or dos)"]
 
-# What anonymous visitors of the wall of shame see.
+# What anonymous visitors of the public dashboard see.
 # [public]
 # show_labels = true   # rule labels (coarse categories of what an IP requested):
 #                      # per-IP chips, the label filter and the label chart
