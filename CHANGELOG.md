@@ -19,6 +19,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   256-bit, hashed at rest, revocable per device. The new optional config
   key `api_tls_spki_sha256` pins the admin origin's TLS key in the pairing
   QR.
+- `/api/v1` act endpoints for devices paired with the `act` scope: start a
+  probe, quote and buy a counter-scan (a quote is bound to the device,
+  address, level and price, lives 2 minutes and is spent once; a refused
+  buy queues and charges nothing), and poll the job. They run the Actions
+  card's own checks. Every queued job is audited and listed under Recent
+  actions on Admin → Devices.
 
 ### Changed
 
