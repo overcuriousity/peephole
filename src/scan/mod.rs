@@ -147,6 +147,7 @@ impl Refusal {
 /// scanner: the arbiter does not count it as undelivered.
 pub(crate) const NOT_REPLICATED: &str = "job not replicated here yet";
 pub(crate) const TOR_UNKNOWN: &str = "Tor exit status unknown (no exit list loaded)";
+pub(crate) const OFFER_SHORT: &str = "the job's offer is not held or not covered here";
 
 /// What a scanner knows of an arbiter with queued work, for [`can_pay`].
 #[derive(Clone, Copy)]
@@ -448,14 +449,16 @@ impl Source {
     }
 
     /// Why this scanner would not run an audit of `ip` (stored as
-    /// `ip_text`) at `level` now, if it would not: an audit obeys
-    /// everything a scan does (never_scan, members' addresses, Tor exits,
-    /// crawlers, the evidence held here) except the rescan cooldown. An
-    /// auditor asks this before it accepts a bought audit.
+    /// `ip_text`) at `level` now, of a scan of the job `job_uid`, if it
+    /// would not: an audit obeys everything a scan does (never_scan,
+    /// members' addresses, Tor exits, crawlers, the evidence held here,
+    /// which a bought job skips) except the rescan cooldown. An auditor
+    /// asks this before it accepts a bought audit.
     async fn audit_refusal(
         &self,
         ip: &IpAddr,
         ip_text: &str,
+        job_uid: &str,
         level: u8,
     ) -> anyhow::Result<Option<String>> {
         let now = crate::store::data::now_ts();
@@ -463,6 +466,15 @@ impl Source {
             return Ok(Some(r.reason().to_string()));
         }
         let pool = &self.rec.store().pool;
+        // A bought (manual) job was scanned without evidence (level 5
+        // only so): its audit needs none either.
+        let manual: Option<i64> = sqlx::query_scalar("SELECT manual FROM scan_jobs WHERE uid = ?")
+            .bind(job_uid)
+            .fetch_optional(pool)
+            .await?;
+        if manual.is_some_and(|m| m != 0) {
+            return Ok(None);
+        }
         let ev = guard::evidence(pool, ip_text, &self.origins, Some(self.classifier)).await?;
         if ev.allowed_level(&self.cfg.scan.safety) < level {
             return Ok(Some(
@@ -504,7 +516,7 @@ impl Source {
                 }
                 continue;
             }
-            match self.audit_refusal(&ip, &t.ip, t.level).await {
+            match self.audit_refusal(&ip, &t.ip, &t.job_uid, t.level).await {
                 Ok(None) => {}
                 Ok(Some(why)) => {
                     debug!(target = %ip, %why, "audit not run");
@@ -870,6 +882,14 @@ impl Source {
             let why = format!("job {other} for this IP ranks first");
             return Ok(Err(("superseded", Some(why))));
         }
+        // A funded job runs only when its offer covers the price here: what
+        // the receipt charges is then what the ledger moves.
+        if let (Some(seq), Some(node)) = (g.offer_seq, self.node())
+            && g.price_mc > 0
+            && !crate::credits::jobs::offer_covers(node, arbiter, seq, &g.job_uid, g.price_mc).await
+        {
+            return Ok(Err(("later", Some(OFFER_SHORT.into()))));
+        }
         Ok(Ok(Job::Granted {
             arbiter,
             uid: g.job_uid.clone(),
@@ -1018,9 +1038,11 @@ impl Source {
                 },
                 Some(node),
             ) => {
-                let delivered = match outcome {
+                // (status reported, error) once the receipt is written; None:
+                // the lease is lost, nothing delivered, the offer freed.
+                let report = match outcome {
                     Outcome::Done(res) => {
-                        if let Err(e) = self
+                        match self
                             .rec
                             .record_scan_result(
                                 uid,
@@ -1031,24 +1053,31 @@ impl Source {
                             )
                             .await
                         {
-                            warn!(job = %uid, ?e, "could not record scan result");
-                            Self::report(node, *arbiter, uid, "failed", Some(e.to_string())).await;
-                            false
-                        } else {
-                            Self::report(node, *arbiter, uid, "done", None).await;
-                            true
+                            Err(e) => {
+                                warn!(job = %uid, ?e, "could not record scan result");
+                                Some(("failed", Some(e.to_string())))
+                            }
+                            Ok(_) => Some(("done", None)),
                         }
                     }
-                    Outcome::Failed(e) => {
-                        Self::report(node, *arbiter, uid, "failed", Some(e)).await;
-                        false
-                    }
-                    // The lease is lost: nothing delivered, the offer freed.
-                    Outcome::Abandoned => false,
+                    Outcome::Failed(e) => Some(("failed", Some(e))),
+                    Outcome::Abandoned => None,
                 };
+                // The receipt comes before the done status, and reaches the
+                // arbiter first: the done status designates the scan for an
+                // audit, and a receipt written after it does not make the
+                // job paid (`credits::audit::job_paid`), so the scanner
+                // cannot charge only the scans it sees are not designated.
                 if let Some((seq, price)) = offer {
+                    let delivered = matches!(report, Some(("done", _)));
                     let charged = if delivered { *price } else { 0 };
                     crate::credits::jobs::settle(node, *arbiter, *seq, charged).await;
+                    if delivered && let Err(e) = node.sync_around_request(*arbiter).await {
+                        debug!(job = %uid, ?e, "sync of the scan receipt failed");
+                    }
+                }
+                if let Some((status, error)) = report {
+                    Self::report(node, *arbiter, uid, status, error).await;
                 }
             }
             _ => {}
@@ -1343,13 +1372,13 @@ pub async fn run_workers(
     // An auditor asks before it accepts a bought audit (`credits::audit`).
     if let Some(node) = source.node() {
         let weak = Arc::downgrade(&source);
-        let check: crate::credits::audit::Check = Arc::new(move |ip, ip_text, level| {
+        let check: crate::credits::audit::Check = Arc::new(move |ip, ip_text, job_uid, level| {
             let weak = weak.clone();
             Box::pin(async move {
                 let Some(source) = weak.upgrade() else {
                     return Some("this node's scan workers stopped".to_string());
                 };
-                match source.audit_refusal(&ip, &ip_text, level).await {
+                match source.audit_refusal(&ip, &ip_text, &job_uid, level).await {
                     Ok(why) => why,
                     Err(e) => Some(format!("{e:#}")),
                 }
@@ -2356,6 +2385,91 @@ license_key = "k"
             .await
             .unwrap();
         assert!(r.is_ok(), "a bought scan runs with no requests held");
+    }
+
+    /// A funded grant runs only when its offer covers the price here: a
+    /// scanner charging an offer the arbiter's lots do not hold would be
+    /// paid less than it charged.
+    #[tokio::test]
+    async fn a_grant_whose_offer_is_not_covered_comes_back_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, source, store) = cluster_source(dir.path(), "").await;
+        let rec = Recorder::Cluster(node.clone());
+        let ip = store
+            .upsert_ip("203.0.113.78".parse().unwrap())
+            .await
+            .unwrap();
+        rec.enqueue_manual(ip.id, 2).await.unwrap();
+        let uid = job_uid(&store, ip.id).await;
+        // Another arbiter's job, funded with an offer on a lot it does not
+        // hold.
+        let arbiter = NodeId([7; 32]);
+        sqlx::query("UPDATE scan_jobs SET arbiter = ? WHERE uid = ?")
+            .bind(&arbiter.0[..])
+            .bind(&uid)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let at = crate::cluster::hlc::wall_ms() << 16;
+        sqlx::query(
+            "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, seal, economy, job_uid)
+             VALUES (?1, 4, ?2, 'offer', ?3, ?4, 1, 2, ?5)",
+        )
+        .bind(&arbiter.0[..])
+        .bind(crate::cluster::hlc::to_db(at))
+        .bind(&node.id().0[..])
+        .bind(format!("[[{},10]]", crate::credits::day_of(at)))
+        .bind(&uid)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let g = Grant {
+            offer_seq: Some(4),
+            price_mc: 10,
+            ..grant(&uid, &ip.ip, 2)
+        };
+        let (status, why) = source
+            .check_grant(arbiter, &g)
+            .await
+            .unwrap()
+            .err()
+            .unwrap();
+        assert_eq!((status, why.as_deref()), ("later", Some(OFFER_SHORT)));
+    }
+
+    /// An audit of a bought job (level 5 among them: no request asks for
+    /// it) needs no evidence, as the bought scan did not; an audit of an
+    /// automatic job does.
+    #[tokio::test]
+    async fn an_audit_of_a_bought_job_needs_no_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, source, store) = cluster_source(dir.path(), "").await;
+        let rec = Recorder::Cluster(node.clone());
+        let ip = store
+            .upsert_ip("203.0.113.76".parse().unwrap())
+            .await
+            .unwrap();
+        let addr: IpAddr = ip.ip.parse().unwrap();
+        rec.enqueue_manual(ip.id, 5).await.unwrap();
+        let bought = job_uid(&store, ip.id).await;
+        assert_eq!(
+            source
+                .audit_refusal(&addr, &ip.ip, &bought, 5)
+                .await
+                .unwrap(),
+            None
+        );
+        let other = store
+            .upsert_ip("203.0.113.77".parse().unwrap())
+            .await
+            .unwrap();
+        rec.enqueue_scan(other.id, 2, 24).await.unwrap();
+        let auto = job_uid(&store, other.id).await;
+        let why = source
+            .audit_refusal(&other.ip.parse().unwrap(), &other.ip, &auto, 2)
+            .await
+            .unwrap();
+        assert!(why.is_some_and(|w| w.contains("do not back")));
     }
 
     /// A grant for an IP this scanner is scanning now, or for a job that

@@ -202,11 +202,14 @@ audits and relay leases. The supply is fixed; prices follow sales.
   round with, and a member is up in an hour when more than half of that
   hour's reports from other advertised members (not blocked or left out
   here) name it; outbound-only members write none. A member
-  that does not earn on your node gets no share there, and its share goes
-  to nobody. `peephole credits uptime` lists each member's hours.
-- **Where they go.** Nowhere: nothing burns. A credit keeps its day when
+  that does not earn on your node is credited its share there, but keeps
+  none of it (see the last of "What this cannot do"). `peephole credits
+  uptime` lists each member's hours.
+- **Where they go.** Nowhere: nothing burns but what a member that does
+  not earn here still holds of its pool shares. A credit keeps its day when
   it changes hands and is gone 7 days after it, so at most six pools are
-  in circulation. Sellers keep what they charge.
+  in circulation. Sellers keep what they charge. An offer never draws
+  from a lot that dies before the offer can be charged.
 - **Prices.** One rule for every good, on each node every 10 minutes: a
   good that sold since the last refresh (or whose every slot is taken)
   gets dearer by at most a factor of e^0.45 an hour; one that sold nothing
@@ -216,7 +219,8 @@ audits and relay leases. The supply is fixed; prices follow sales.
   becomes free, and a free good that is used costs 0.001 at the next
   refresh. A request may carry no offer: the server answers what it prices
   at zero and declines the rest naming the price, which the asker may offer
-  once. What a node answers itself is free (its own providers, prober,
+  once. Only what is paid for or answered free counts as a sale: asking
+  for a priced good without an offer moves no price. What a node answers itself is free (its own providers, prober,
   resolver, scanner), though its own scan jobs use up its scan budget like
   jobs it buys. Scan prices are per scanner, computed by every node from
   the scans of jobs other arbiters granted it (its own jobs are no sales);
@@ -247,10 +251,11 @@ audits and relay leases. The supply is fixed; prices follow sales.
   after 15 minutes.
   The Actions card sells counter-scans the same way: the arbiter funds a
   bought (manual) job at the scanner's price times 4^(level−1), and the
-  scanners skip their evidence re-check for it — the safety preflight
-  (protected addresses, Tor exits, verified crawlers) still applies.
-  Level 5 (the vulnerability scripts) is granted only to members of
-  protocol 8 and up; older members are never asked.
+  scanners skip their evidence re-check for it, as do its auditors — the
+  safety preflight (protected addresses, Tor exits, verified crawlers)
+  still applies. Level 5 (the vulnerability scripts) is granted only to
+  members of protocol 8 and up, and only they rank among the auditors of
+  a level-5 scan; older members are never asked.
 - **Scan jobs.** The arbiter (the node that queued the job) funds its jobs
   from its own balance, up to `[credits] scan_share` (default 0.5) of it, and
   hands each job to the scanner asking that is cheapest **per delivered
@@ -275,8 +280,11 @@ audits and relay leases. The supply is fixed; prices follow sales.
   scanner asks arbiters that can pay its price first, in urgency order. A
   node's own jobs are funded from the same budget without moving credits.
   Scanners that hoard (over their hourly capacity, or delivering less than
-  half of 5 recent grants) go last. The scanner charges the offered price when
-  it delivers the result, and nothing when it does not. A scan offer lapses
+  half of 5 recent grants) go last. A scanner runs a funded job only when
+  its book holds the offer and counts it covered in full; otherwise it hands
+  the job back for later (no fault of the scanner). The scanner charges the
+  offered price when it delivers the result, before it reports the job
+  done, and nothing when it does not. A scan offer lapses
   after the longest scan (12 hours plus 2 minutes). Every grant is funded, at
   zero or above: a scanner priced at 0 is granted without an offer.
   `scan_share = 0` funds only free scanners.
@@ -291,20 +299,30 @@ audits and relay leases. The supply is fixed; prices follow sales.
   and the Lookup page.
 - **Conformity and audits.** A member earns on your node only while at least
   98 % of its newest 500 requests classify the same with your rules, and its
-  scans stand up to the audits you believe: those of your own nodes. One in 20
+  scans stand up to the audits you believe: those of your own nodes. An
+  audit agrees with a scan when at least half of the ports the audit found
+  open, and at least half of those the scan reported open, are open in
+  both (a scan that claims every port open does not agree); the same host
+  key or certificate on a port open in both settles it, unless the scan
+  claims more than twice as many open ports as the audit found. One in 20
   scans of paid jobs (granted by another arbiter and charged for; a job
   granted at zero owes no audit) is designated for a bought audit by a hash
   of the job and the arbiter's done status, which the scanner cannot steer
-  or know before it has published the result; the same hash ranks the
+  or know before it has published the result and charged for it: it
+  writes its receipt before it reports the job done, and a receipt dated
+  at or after the job's done status (as the log holds it) moves nothing,
+  so the offer lapses back to the arbiter (a receipt counts while no done
+  status is held; the count changes once one dated earlier arrives); the
+  same hash ranks the
   scan's three auditors among the scanners admitted by then. The scanner
   buys the audit from the first of them that is reachable and priced (an
   auditor declines an audit it would not run, and the scanner asks the
   next; one that names a higher price is offered it once), and tries again
   while the scan is in its 30-minute window; the auditor is paid when it
-  publishes the audit, and releases stale offers. A scanner with two or
-  more designated scans of 7 days unaudited and under 80 % bought is not
-  funded by arbiters, and its scan receipts count for nothing, until it
-  catches up; a designated scan with no auditor to buy from is not
+  publishes the audit, and releases stale offers. A scanner with four or
+  more designated scans of 7 days unaudited and under 60 % bought is not
+  funded by arbiters, and keeps none of what its scan receipts brought it,
+  until it catches up; a designated scan with no auditor to buy from is not
   counted. Each scanner also re-runs `[credits] audit_share` (5 %) of other
   nodes' fresh scans unpaid, own jobs and small scanners included.
 - **Relays.** An advertised node sells relay leases (`[cluster] relay_slots`,
@@ -325,7 +343,10 @@ audits and relay leases. The supply is fixed; prices follow sales.
   up); for an address nobody recorded nothing is written anywhere.
 - **Your nodes as one.** Every node keeps what it earns. A paid lookup,
   probe or name resolution that needs more than a node holds draws from
-  its siblings, richest first. Scans are funded from the node's own
+  its siblings, richest first (one draw at a time). A node writes its
+  offers and transfers one at a time, each from what the ones before
+  left, so offers made together (a quorum of resolvers, the scan jobs of
+  a round) never name the same credits. Scans are funded from the node's own
   balance only.
 - **Two histories.** A node that gives two members different entries at
   one position of its log is found out with its next payment: its entries
@@ -380,9 +401,17 @@ audits and relay leases. The supply is fixed; prices follow sales.
     price, and the receipt is public. A server that declines and names a
     higher price is offered it once, up to twice its announced price;
     beyond that the next server is asked.
-  - A member that stops earning here (rules or audits) is credited no
-    pool share and paid for no sales here until it earns again; offers to
-    it lapse back to their payers.
+  - A member that stops earning here (rules or audits) keeps none of
+    its income here until it earns again: its sales (scan sales only,
+    for the audit gates) and pool shares of the last 8 days. The gates
+    are read as they stand now and applied to the whole window, but
+    whatever the member paid stays paid, so nobody it paid loses
+    anything: at the end of the count the member gives up the least of
+    its balance and that income, from its oldest credits. Of that, the
+    sales' share of the income goes back to the buyers, by what each
+    paid (odd thousandths to the lowest keys), and the pool's share is
+    burned. Members are settled in key order, so a refund to a buyer
+    that does not earn either is settled again in its turn.
 - **Upgrading.** Protocol 7 is a clean cut: the credits of protocol 7
   (payments carrying `economy` 2, signed under their own domain) are the
   only ones counted; earlier payments are kept and ignored, balances start
@@ -390,6 +419,15 @@ audits and relay leases. The supply is fixed; prices follow sales.
   reported hours. Upgrade all members in one sitting: a member below
   protocol 7 is not paid, funded or charged, and is served no entries of
   protocol 7 until it upgrades.
+
+  Protocol 8 changes how the credits are counted, so upgrade all members
+  together: a scanner charges before it reports a job done, and a scan
+  receipt dated after the job's done status pays nothing (a scanner of
+  protocol 7 charges after it, so it is not paid for scans), only members of
+  protocol 8 audit level 5, and a member that does not earn here keeps
+  none of its income at the end of the count instead of losing its sales
+  over the whole window. A node of protocol 7 counts those balances
+  differently.
 
   Earlier protocols: Protocol 4: payments run only between upgraded nodes,
   so upgrade all nodes together.

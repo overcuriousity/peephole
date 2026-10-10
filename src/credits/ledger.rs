@@ -7,6 +7,13 @@
 //! A credit belongs to a lot: a node and the UTC day of the pool it came
 //! from. It keeps its lot when it changes hands and is gone 7 days after
 //! that day.
+//!
+//! The gates (who does not earn here) are read as they stand now and
+//! applied to the whole walk, but only at its end: a gated member's sales
+//! and pool shares settle like anyone's, so whoever it paid keeps that.
+//! What it still holds of that income at the end goes back to the payers
+//! of those sales, by what each paid, and the pool's part is burned
+//! ([`Walk::claw_back`]).
 use super::entries::{Entry, Kind, parts_ok};
 use super::{DAY_MS, LOT_DAYS, Mc, OFFER_TTL_MS, day_of};
 use crate::cluster::hlc::physical_ms;
@@ -30,11 +37,26 @@ pub struct Gates {
     /// their entries move nothing.
     pub left_out: HashSet<NodeId>,
     /// Members that do not earn here (failing the rules gate, or left
-    /// out): their receipts move nothing.
+    /// out): they keep none of what their receipts and pool shares
+    /// brought them ([`Walk::claw_back`]).
     pub no_sales: HashSet<NodeId>,
-    /// Scanners failing the audit gates here: their receipts for scan jobs
-    /// move nothing.
+    /// Scanners failing the audit gates here: they keep none of what their
+    /// receipts for scan jobs brought them.
     pub no_scan_sales: HashSet<NodeId>,
+    /// The HLC of each scan job's done status as the log holds it, by job
+    /// uid: a receipt for the job's offer dated at or after it moves
+    /// nothing ([`charged_in_time`]).
+    pub done: HashMap<String, u64>,
+}
+
+/// Whether a scan receipt dated `receipt_hlc` counts against its job's
+/// done status `done_hlc` (None: none held yet): only one written before
+/// it. The done status designates the scan for an audit
+/// (`credits::audit::seed`), so a scanner charging after it could charge
+/// only the scans it sees are not designated. `credits::audit::job_paid`
+/// applies the same rule.
+pub fn charged_in_time(receipt_hlc: u64, done_hlc: Option<u64>) -> bool {
+    done_hlc.is_none_or(|d| receipt_hlc < d)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +130,11 @@ pub struct Tally {
     pub served: Mc,
     pub sent: Mc,
     pub received: Mc,
+    /// Taken back at the end of the walk: what it held of the income a
+    /// gate denies it ([`Gates`]).
+    pub withheld: Mc,
+    /// Given back to it as the payer of a gated member's sales.
+    pub refunded: Mc,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,6 +150,9 @@ pub struct Ledger {
     pub week: HashMap<NodeId, Tally>,
     /// The UTC day balances are read for.
     pub today: u32,
+    /// What gated members still held of their pool shares at the end of
+    /// the walk: gone, given to nobody.
+    pub burned: Mc,
 }
 
 /// The parts of `mc` drawn from `lots` (`(day, mc)`, oldest first as
@@ -147,6 +177,14 @@ pub fn parts_from(lots: &[(u32, Mc)], mc: Mc, first_day: u32) -> Option<Vec<(u32
         }
     }
     None
+}
+
+/// The oldest lot day an offer written at `now_ms` that lives `ttl_ms`
+/// may draw from: a lot that dies before the offer can be charged is left
+/// out (a receipt would hand the server credits already gone).
+pub fn first_day_for(now_ms: u64, ttl_ms: u64) -> u32 {
+    let last = ((now_ms + ttl_ms) / DAY_MS) as u32;
+    last.saturating_sub(LOT_DAYS - 1)
 }
 
 impl Ledger {
@@ -246,11 +284,21 @@ impl Step<'_> {
     }
 }
 
+/// The income a gate denies one member, as the walk settled it.
+#[derive(Default)]
+struct Gated {
+    /// Its pool shares.
+    pool: Mc,
+    /// What its gated receipts moved to it, by payer.
+    paid_by: BTreeMap<NodeId, Mc>,
+}
+
 struct Walk<'a> {
     l: Ledger,
     gates: &'a Gates,
     /// The HLC the last 7 days start at.
     week_from: u64,
+    gated: BTreeMap<NodeId, Gated>,
 }
 
 impl Walk<'_> {
@@ -323,9 +371,6 @@ impl Walk<'_> {
         charged: Mc,
         answered: &[String],
     ) {
-        if self.gates.no_sales.contains(&e.origin) {
-            return;
-        }
         let Some(i) = self.l.offers.iter().position(|o| {
             o.payer == payer
                 && o.seq == offer_seq
@@ -336,10 +381,17 @@ impl Walk<'_> {
         }) else {
             return;
         };
-        // A scanner failing the audit gates here is not paid for scans.
-        if self.l.offers[i].job.is_some() && self.gates.no_scan_sales.contains(&e.origin) {
+        // A scan receipt written after the job's done status pays nothing;
+        // the offer lapses back.
+        if let Some(job) = &self.l.offers[i].job
+            && !charged_in_time(e.hlc, self.gates.done.get(job).copied())
+        {
             return;
         }
+        // A member failing a gate here keeps none of this sale: noted, and
+        // settled at the end of the walk.
+        let gated = self.gates.no_sales.contains(&e.origin)
+            || (self.l.offers[i].job.is_some() && self.gates.no_scan_sales.contains(&e.origin));
         let held = std::mem::take(&mut self.l.offers[i].held);
         let mut left = charged.min(held.iter().map(|(_, mc)| mc).sum());
         let paid = left;
@@ -354,6 +406,69 @@ impl Walk<'_> {
         o.state = OfferState::Charged { charged: paid };
         self.tally(payer, e.hlc, |t| t.spent += paid);
         self.tally(e.origin, e.hlc, |t| t.served += paid);
+        if gated && paid > 0 && payer != e.origin {
+            let g = self.gated.entry(e.origin).or_default();
+            *g.paid_by.entry(payer).or_default() += paid;
+        }
+    }
+
+    /// At the end of the walk, take from each gated member, in key order,
+    /// what it still holds of the income its gates deny it: the least of
+    /// its balance and that income, from its oldest lots. Of that, the
+    /// receipts' share of the income goes back to their payers, split by
+    /// what each paid (the odd millicredits to the lowest keys), and the
+    /// pool's share is burned. Whatever it spent stays spent. A refund to a
+    /// gated payer counts in that payer's balance when its turn comes.
+    fn claw_back(&mut self, now_ms: u64) {
+        let hlc = now_ms << 16;
+        for (node, g) in std::mem::take(&mut self.gated) {
+            if self.gates.left_out.contains(&node) {
+                continue;
+            }
+            let receipts: Mc = g.paid_by.values().sum();
+            let income = receipts + g.pool;
+            let take = self.l.balance(&node).min(income);
+            if take == 0 {
+                continue;
+            }
+            let part = |of: Mc, n: Mc, d: Mc| (of as u128 * n as u128 / d as u128) as Mc;
+            let refund = part(take, receipts, income);
+            // Each payer's part (the odd millicredits to the lowest keys),
+            // then the burn (None).
+            let mut out: Vec<(Option<NodeId>, Mc)> = g
+                .paid_by
+                .iter()
+                .map(|(p, mc)| (Some(*p), part(refund, *mc, receipts)))
+                .collect();
+            let odd = refund - out.iter().map(|(_, mc)| mc).sum::<Mc>();
+            for (_, mc) in out.iter_mut().take(odd as usize) {
+                *mc += 1;
+            }
+            out.push((None, take - refund));
+            // From the oldest lots, keeping their days.
+            let mut lots = self.l.by_day(&node);
+            let mut i = 0;
+            for (to, mut mc) in out {
+                if let Some(p) = to {
+                    self.tally(p, hlc, |t| t.refunded += mc);
+                }
+                while mc > 0 && i < lots.len() {
+                    let day = lots[i].0;
+                    let t = lots[i].1.min(mc);
+                    lots[i].1 -= t;
+                    mc -= t;
+                    *self.lot(node, day) -= t;
+                    match to {
+                        Some(p) => *self.lot(p, day) += t,
+                        None => self.l.burned += t,
+                    }
+                    if lots[i].1 == 0 {
+                        i += 1;
+                    }
+                }
+            }
+            self.tally(node, hlc, |t| t.withheld += take);
+        }
     }
 
     fn transfer(&mut self, e: &Entry, to: NodeId, parts: &[(u32, u32)]) {
@@ -379,9 +494,10 @@ impl Walk<'_> {
 
 /// Walk the pool shares and every payment in order, and return where
 /// every credit is at `now_ms`. Members in `gates.left_out` hold nothing
-/// and their entries move nothing (what others sent them is lost); the
-/// receipts of those in `no_sales`, and the scan receipts of those in
-/// `no_scan_sales`, move nothing (their offers lapse back).
+/// and their entries move nothing (what others sent them is lost); those
+/// in `no_sales` keep none of their receipts and pool shares, those in
+/// `no_scan_sales` none of their scan receipts, as far as they still hold
+/// them at the end ([`Walk::claw_back`]).
 pub fn run(earned: &[Earned], entries: &[Entry], gates: &Gates, now_ms: u64) -> Ledger {
     let mut steps: Vec<Step> = earned
         .iter()
@@ -396,6 +512,7 @@ pub fn run(earned: &[Earned], entries: &[Entry], gates: &Gates, now_ms: u64) -> 
         },
         gates,
         week_from: now_ms.saturating_sub(7 * DAY_MS) << 16,
+        gated: BTreeMap::new(),
     };
     for step in steps {
         match step {
@@ -406,6 +523,9 @@ pub fn run(earned: &[Earned], entries: &[Entry], gates: &Gates, now_ms: u64) -> 
                 }
                 *w.lot(e.node, day_of(e.hlc)) += e.mc;
                 w.tally(e.node, e.hlc, |t| t.earned += e.mc);
+                if w.gates.no_sales.contains(&e.node) {
+                    w.gated.entry(e.node).or_default().pool += e.mc;
+                }
             }
             Step::Entry(e) => {
                 w.lapse(physical_ms(e.hlc));
@@ -437,6 +557,7 @@ pub fn run(earned: &[Earned], entries: &[Entry], gates: &Gates, now_ms: u64) -> 
         }
     }
     w.lapse(now_ms);
+    w.claw_back(now_ms);
     // A node left out shows no balance, whatever was sent to it.
     w.l.lots
         .retain(|(node, _), _| !gates.left_out.contains(node));
@@ -840,6 +961,62 @@ mod tests {
         assert_eq!((late.balance(&id(1)), late.balance(&id(2))), (500, 0));
     }
 
+    /// A scan receipt dated at or after its job's done status moves
+    /// nothing: the done status designates the scan for an audit, and a
+    /// scanner charging after it could charge only the scans it sees are
+    /// not designated. The offer lapses back to the arbiter.
+    #[test]
+    fn a_scan_receipt_after_the_jobs_done_status_pays_nothing() {
+        let earned = [earn(1, DAY, 0, 1000)];
+        // job1, offered at minute 1, charged at minute 5.
+        let entries = [
+            job_offer(1, 1, at(DAY, 1), 2, &[(DAY, 100)]),
+            receipt(2, 1, at(DAY, 5), 1, 1, 100),
+        ];
+        let done_at = |min: u64| Gates {
+            done: [("job1".to_string(), at(DAY, min))].into(),
+            ..Default::default()
+        };
+        // Done before the receipt, or at its instant: unpaid, held until
+        // the offer lapses, then the arbiter's again.
+        for done in [
+            done_at(4),
+            Gates {
+                done: [("job1".to_string(), at(DAY, 5))].into(),
+                ..Default::default()
+            },
+        ] {
+            let l = run(&earned, &entries, &done, now(DAY, 6));
+            assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (900, 0));
+            assert_eq!(l.offers[0].state, OfferState::Open);
+            let lapsed = now(DAY, 2 + crate::credits::JOB_OFFER_TTL_MS / 60_000);
+            let l = run(&earned, &entries, &done, lapsed);
+            assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (1000, 0));
+            assert_eq!(l.offers[0].state, OfferState::Lapsed);
+            conserved(&l, &earned);
+        }
+        // Charged before the done status: paid.
+        let l = run(&earned, &entries, &done_at(6), now(DAY, 7));
+        assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (900, 100));
+        assert_eq!(l.offers[0].state, OfferState::Charged { charged: 100 });
+        // No done status held yet: paid; once one dated earlier arrives,
+        // the count says unpaid.
+        let l = run(&earned, &entries, &Gates::default(), now(DAY, 7));
+        assert_eq!(l.balance(&id(2)), 100);
+        let l = run(&earned, &entries, &done_at(3), now(DAY, 7));
+        assert_eq!(l.balance(&id(2)), 0);
+        // A lookup receipt is no scan receipt, whatever is done.
+        let lookup = [
+            offer(1, 1, at(DAY, 1), 2, &[(DAY, 100)]),
+            receipt(2, 1, at(DAY, 5), 1, 1, 100),
+        ];
+        let l = run(&earned, &lookup, &done_at(3), now(DAY, 7));
+        assert_eq!(l.balance(&id(2)), 100);
+        assert!(charged_in_time(at(DAY, 5), Some(at(DAY, 6))));
+        assert!(!charged_in_time(at(DAY, 5), Some(at(DAY, 5))));
+        assert!(charged_in_time(at(DAY, 5), None));
+    }
+
     #[test]
     fn entries_and_earnings_of_a_node_left_out_do_not_count() {
         let earned = [earn(1, DAY, 0, 1000), earn(2, DAY, 0, 1000)];
@@ -864,31 +1041,132 @@ mod tests {
         assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (900, 0));
     }
 
+    /// Every credit the pool made is in a lot, held by an open offer,
+    /// burned, or of an expired lot: nothing appears or vanishes otherwise.
+    fn conserved(l: &Ledger, earned: &[Earned]) {
+        let total: Mc = earned.iter().map(|e| e.mc).sum();
+        let all: Mc = l.lots.values().sum::<Mc>()
+            + l.offers.iter().map(Offer::held_now).sum::<Mc>()
+            + l.burned;
+        assert_eq!(all, total, "conserved");
+    }
+
+    /// The gate applies to the whole walk: a gated seller's sales settle as
+    /// they were made, so whoever it paid keeps that; what it still holds
+    /// of them at the end goes back to its payers.
     #[test]
-    fn the_receipts_of_a_member_that_does_not_earn_here_move_nothing() {
-        // 1 pays 2 for a lookup; 2 fails the rules gate here.
+    fn a_gated_sellers_unspent_income_goes_back_to_its_payers() {
+        // 1 pays 2 500 for a lookup; 2 pays 3 300; 2 fails the rules gate.
         let earned = [earn(1, DAY, 0, 1000)];
         let entries = [
-            offer(1, 1, at(DAY, 1), 2, &[(DAY, 300)]),
-            receipt(2, 1, at(DAY, 2), 1, 1, 300),
+            offer(1, 1, at(DAY, 1), 2, &[(DAY, 500)]),
+            receipt(2, 1, at(DAY, 2), 1, 1, 500),
+            offer(2, 2, at(DAY, 3), 3, &[(DAY, 300)]),
+            receipt(3, 1, at(DAY, 4), 2, 2, 300),
         ];
         let gates = Gates {
             no_sales: [id(2)].into(),
             ..Default::default()
         };
-        let l = run(&earned, &entries, &gates, now(DAY, 3));
+        let l = run(&earned, &entries, &gates, now(DAY, 5));
+        assert_eq!(l.balance(&id(3)), 300, "the one it paid keeps it");
+        assert_eq!(l.balance(&id(1)), 700, "the payer gets back the rest");
+        assert_eq!(l.balance(&id(2)), 0, "the gated seller keeps none");
+        assert_eq!(l.offers[0].state, OfferState::Charged { charged: 500 });
         assert_eq!(
-            (l.balance(&id(1)), l.balance(&id(2))),
-            (700, 0),
-            "held, not paid"
+            (l.tally(&id(1)).refunded, l.tally(&id(2)).withheld),
+            (200, 200)
         );
-        let l = run(&earned, &entries, &gates, now(DAY, 20));
-        assert_eq!(l.balance(&id(1)), 1000, "lapsed back to the payer");
-        assert_eq!(l.offers[0].state, OfferState::Lapsed);
+        assert_eq!(l.burned, 0);
+        conserved(&l, &earned);
+        // It spent nothing: the payer has it all back.
+        let l = run(&earned, &entries[..2], &gates, now(DAY, 5));
+        assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (1000, 0));
+        conserved(&l, &earned);
+        // While its offer is open what it holds stays with it; once the
+        // offer lapses back, the walk takes that too.
+        let l = run(&earned, &entries[..3], &gates, now(DAY, 5));
+        assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (700, 0));
+        assert_eq!(l.held(&id(2)), 300);
+        let l = run(&earned, &entries[..3], &gates, now(DAY, 30));
+        assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (1000, 0));
+        conserved(&l, &earned);
+    }
+
+    /// Several payers share what is given back by what each paid; the
+    /// odd millicredits go to the lowest keys.
+    #[test]
+    fn what_goes_back_is_shared_by_what_each_payer_paid() {
+        let earned = [earn(1, DAY, 0, 1000), earn(4, DAY, 0, 1000)];
+        let entries = [
+            offer(1, 1, at(DAY, 1), 2, &[(DAY, 300)]),
+            receipt(2, 1, at(DAY, 2), 1, 1, 300),
+            offer(4, 1, at(DAY, 3), 2, &[(DAY, 100)]),
+            receipt(2, 2, at(DAY, 4), 4, 1, 100),
+            transfer(2, 3, at(DAY, 5), 3, &[(DAY, 200)]),
+        ];
+        let gates = Gates {
+            no_sales: [id(2)].into(),
+            ..Default::default()
+        };
+        let l = run(&earned, &entries, &gates, now(DAY, 6));
+        assert_eq!(l.balance(&id(1)), 700 + 150);
+        assert_eq!(l.balance(&id(4)), 900 + 50);
+        assert_eq!((l.balance(&id(2)), l.balance(&id(3))), (0, 200));
+        conserved(&l, &earned);
+        // 2 mc back to three payers of 1 mc each: the two lowest keys.
+        let earned = [
+            earn(1, DAY, 0, 10),
+            earn(4, DAY, 0, 10),
+            earn(5, DAY, 0, 10),
+        ];
+        let mut entries = vec![];
+        for (n, payer) in [1u8, 4, 5].into_iter().enumerate() {
+            let at_min = 1 + 2 * n as u64;
+            entries.push(offer(payer, 1, at(DAY, at_min), 2, &[(DAY, 1)]));
+            entries.push(receipt(2, n as u64 + 1, at(DAY, at_min + 1), payer, 1, 1));
+        }
+        entries.push(transfer(2, 9, at(DAY, 10), 3, &[(DAY, 1)]));
+        let l = run(&earned, &entries, &gates, now(DAY, 11));
+        assert_eq!(
+            (l.balance(&id(1)), l.balance(&id(4)), l.balance(&id(5))),
+            (10, 10, 9)
+        );
+        conserved(&l, &earned);
+    }
+
+    /// A gated member's pool share is credited, so what it paid stays paid;
+    /// what it still holds of it at the end is burned, given to nobody.
+    #[test]
+    fn a_gated_members_unspent_pool_share_is_burned() {
+        let earned = [earn(2, DAY, 0, 400)];
+        let entries = [transfer(2, 1, at(DAY, 1), 3, &[(DAY, 100)])];
+        let gates = Gates {
+            no_sales: [id(2)].into(),
+            ..Default::default()
+        };
+        let l = run(&earned, &entries, &gates, now(DAY, 2));
+        assert_eq!((l.balance(&id(2)), l.balance(&id(3))), (0, 100));
+        assert_eq!(l.burned, 300);
+        conserved(&l, &earned);
+        // Pool and sales both gated: what is left is split by their shares
+        // of the gated income, the sales' part back to the payer.
+        let earned = [earn(2, DAY, 0, 400), earn(1, DAY, 0, 1000)];
+        let entries = [
+            offer(1, 1, at(DAY, 1), 2, &[(DAY, 500)]),
+            receipt(2, 1, at(DAY, 2), 1, 1, 500),
+            transfer(2, 2, at(DAY, 3), 3, &[(DAY, 300)]),
+        ];
+        let l = run(&earned, &entries, &gates, now(DAY, 4));
+        // Left 600 of 900 gated: 500/900 of it (333) back, the rest burned.
+        assert_eq!(l.balance(&id(1)), 500 + 333);
+        assert_eq!((l.balance(&id(2)), l.balance(&id(3))), (0, 300));
+        assert_eq!(l.burned, 267);
+        conserved(&l, &earned);
     }
 
     #[test]
-    fn a_scanner_failing_the_audit_gates_is_not_paid_for_scans_but_for_lookups() {
+    fn a_scanner_failing_the_audit_gates_keeps_its_lookup_sales_only() {
         let earned = [earn(1, DAY, 0, 1000)];
         let entries = [
             job_offer(1, 1, at(DAY, 1), 2, &[(DAY, 100)]),
@@ -902,11 +1180,9 @@ mod tests {
         };
         let l = run(&earned, &entries, &gates, now(DAY, 5));
         assert_eq!(l.balance(&id(2)), 50, "the lookup only");
-        assert_eq!(
-            l.offers[0].state,
-            OfferState::Open,
-            "the scan offer waits to lapse"
-        );
+        assert_eq!(l.balance(&id(1)), 950, "the scan's price back");
+        assert_eq!(l.offers[0].state, OfferState::Charged { charged: 100 });
+        conserved(&l, &earned);
     }
 
     /// Review focus: entries reach nodes in different orders.
@@ -945,6 +1221,18 @@ mod tests {
         let all: Mc =
             want.lots.values().sum::<Mc>() + want.offers.iter().map(Offer::held_now).sum::<Mc>();
         assert_eq!(all, total);
+        // With a gated seller: the same in any order, and still conserved.
+        let gates = Gates {
+            no_sales: [id(2)].into(),
+            ..Default::default()
+        };
+        let want = run(&earned, &entries, &gates, now(DAY, 50));
+        let (mut e2, mut g2) = (entries.clone(), earned.clone());
+        e2.reverse();
+        g2.reverse();
+        let got = run(&g2, &e2, &gates, now(DAY, 50));
+        assert_eq!((got.lots, got.burned), (want.lots.clone(), want.burned));
+        conserved(&want, &earned);
     }
 
     #[test]

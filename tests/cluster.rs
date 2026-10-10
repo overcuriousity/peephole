@@ -5061,6 +5061,20 @@ async fn a_funded_scan_job_pays_the_scanner_its_price() {
         assert_eq!(book.balance(&b.id), cost);
         assert_eq!(book.ledger.held(&a.id), 0);
     }
+    // The scanner charged before it reported the job done: the job counts
+    // as paid against the done status that designates its scan.
+    let done: i64 = sqlx::query_scalar("SELECT status_hlc FROM scan_jobs WHERE uid = ?")
+        .bind(&job)
+        .fetch_one(&na.store.pool)
+        .await
+        .unwrap();
+    let done = peephole::cluster::hlc::from_db(done);
+    assert!(
+        peephole::credits::audit::job_paid(&na.store.pool, &job, &a.id.0, &b.id.0, done)
+            .await
+            .unwrap(),
+        "the receipt is dated before the done status"
+    );
     // Both nodes count the paid scan for b's price, by when the scan
     // finished: a receipt held back past the hour moves nothing.
     for n in [&na, &nb] {
@@ -7339,11 +7353,20 @@ async fn reverse_names_are_bought_from_a_quorum_and_replicate_with_their_flag() 
 }
 
 /// `arbiter`'s offer funding `job` of `scanner` (sequence `seq`), and the
-/// scanner's receipt charging 5 mc for it a moment later, written on each
-/// of `on`: the job was paid for, so its scan may be designated.
-async fn paid_job(on: &[&TestNode], arbiter: NodeId, scanner: NodeId, job: &str, seq: i64) {
-    let at = peephole::cluster::hlc::to_db(now_ms() << 16);
-    let receipt_at = at + 1;
+/// scanner's receipt charging 5 mc for it a moment later, both dated just
+/// before the job's done status `done`, written on each of `on`: the job
+/// was paid for, so its scan may be designated.
+async fn paid_job(
+    on: &[&TestNode],
+    arbiter: NodeId,
+    scanner: NodeId,
+    job: &str,
+    seq: i64,
+    done: u64,
+) {
+    let done_ms = peephole::cluster::hlc::physical_ms(done);
+    let at = peephole::cluster::hlc::to_db((done_ms - 2) << 16);
+    let receipt_at = peephole::cluster::hlc::to_db((done_ms - 1) << 16);
     for n in on {
         sqlx::query(
             "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, seal, economy, job_uid)
@@ -7432,7 +7455,7 @@ async fn designated_scan(
         .await
         .unwrap();
     }
-    paid_job(on, arbiter, scanner, job, 1_000_000).await;
+    paid_job(on, arbiter, scanner, job, 1_000_000, done).await;
     admitted_long_ago(on).await;
     done
 }
@@ -7669,7 +7692,7 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
         })
     })
     .await;
-    // Three designated scans of a's jobs by s, a day old, none audited.
+    // Four designated scans of a's jobs by s, a day old, none audited.
     let now = now_ms();
     let ip = na
         .store
@@ -7677,6 +7700,7 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
         .await
         .unwrap();
     let mut found = 0;
+    let mut dones = vec![];
     for i in 0u64.. {
         let done = ((now - 86_400_000 - i) << 16) | 1;
         let job = format!("owed-job-{found}");
@@ -7697,7 +7721,8 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
         .bind(ip.id).bind(format!("owed-scan-{found}")).bind(&s.id.0[..]).bind(&job).bind(peephole::cluster::hlc::to_db(done))
         .execute(&na.store.pool).await.unwrap();
         found += 1;
-        if found == 3 {
+        dones.push(done);
+        if found == 4 {
             break;
         }
     }
@@ -7706,11 +7731,12 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
     // credits could not buy one.
     let book = peephole::credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.standing(&s.id).audits_owed, None);
-    for i in 0..3 {
-        paid_job(&[&na], a.id, s.id, &format!("owed-job-{i}"), 1_000_000 + i).await;
+    for (i, done) in dones.into_iter().enumerate() {
+        let job = format!("owed-job-{i}");
+        paid_job(&[&na], a.id, s.id, &job, 1_000_000 + i as i64, done).await;
     }
     let book = peephole::credits::book_fresh(&na.node).await.unwrap();
-    assert_eq!(book.standing(&s.id).audits_owed, Some((0, 3)));
+    assert_eq!(book.standing(&s.id).audits_owed, Some((0, 4)));
     enqueue(&na, "198.51.100.62", 1).await;
     tokio::time::sleep(Duration::from_secs(8)).await;
     assert_eq!(
@@ -7738,4 +7764,49 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
             == 0
     })
     .await;
+}
+
+/// Offers written at once (a quorum of name servers asked together) do not
+/// draw the same credits: each is covered in full, the next lot taking
+/// over where the oldest runs out. A scan offer of a round whose book
+/// predates them is covered too.
+#[tokio::test]
+async fn offers_written_at_once_are_each_covered() {
+    use peephole::credits::{self, jobs, pay};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let _nb = boot(ib, &b, &[&a], DEFAULT).await;
+    // Two lots; all but 5 mc of the older one held by an offer.
+    for day in [pool_day() - 1, pool_day()] {
+        peephole::credits::pool::testing::report_all_day(&na.store.pool, day, &[a.id])
+            .await
+            .unwrap();
+    }
+    na.node.reload_members().await.unwrap();
+    let lots = credits::book_fresh(&na.node)
+        .await
+        .unwrap()
+        .ledger
+        .by_day(&a.id);
+    assert_eq!((lots.len(), lots[0].0), (2, pool_day() - 1), "{lots:?}");
+    pay::make_offer(&na.node, b.id, lots[0].1 - 5)
+        .await
+        .unwrap();
+    // A round of handing out jobs reads its book now.
+    na.node.set_scan_share(1.0);
+    let mut funding = jobs::Funding::default();
+    assert!(jobs::affordable(&na.node, &mut funding, 0, 4).await);
+    let seqs = futures::future::join_all((0..8).map(|_| pay::make_offer(&na.node, b.id, 3))).await;
+    let (job_seq, price) = jobs::fund(&na.node, &mut funding, b.id, "job-x", 0, 4)
+        .await
+        .unwrap();
+    assert_eq!(price, 4);
+    let book = credits::book_fresh(&na.node).await.unwrap();
+    for seq in seqs {
+        let o = book.ledger.offer(&a.id, seq.unwrap()).unwrap();
+        assert_eq!((o.offered, o.covered), (3, 3), "{o:?}");
+    }
+    let o = book.ledger.offer(&a.id, job_seq.unwrap()).unwrap();
+    assert_eq!((o.offered, o.covered), (4, 4), "{o:?}");
 }

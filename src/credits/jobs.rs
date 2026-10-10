@@ -99,17 +99,16 @@ pub fn level_factor(level: i64) -> u32 {
 /// lot that dies before the offer can be charged (within
 /// [`JOB_OFFER_TTL_MS`](super::JOB_OFFER_TTL_MS)) is left out.
 pub fn first_day_for_job(now_ms: u64) -> u32 {
-    let last = ((now_ms + super::JOB_OFFER_TTL_MS) / super::DAY_MS) as u32;
-    last.saturating_sub(super::LOT_DAYS - 1)
+    ledger::first_day_for(now_ms, super::JOB_OFFER_TTL_MS)
 }
 
 /// What one round of handing out jobs funds from: one book, computed at
-/// the first grant that needs it, and what the offers written since took.
+/// the first grant that needs it. What every offer or transfer of this
+/// node written since took from its lots, in this round or not, is left
+/// out of them ([`super::pay::Spending`]).
 #[derive(Default)]
 pub struct Funding {
     book: Option<Arc<super::Book>>,
-    /// This node's lots as the book has them, less what was drawn since.
-    lots: Vec<(u32, Mc)>,
     /// What the offers written in this round set aside.
     committed: Mc,
     /// What this node's own running and done-today jobs hold, read once.
@@ -132,7 +131,6 @@ pub async fn affordable(node: &Arc<Node>, funding: &mut Funding, min_mc: u32, pr
         let Ok(b) = super::book_fresh(node).await else {
             return false;
         };
-        funding.lots = b.ledger.by_day(&me);
         funding.book = Some(b);
     }
     let self_mc = match funding.self_mc {
@@ -192,7 +190,9 @@ pub async fn fund(
         return Some((None, price));
     }
     let first_day = first_day_for_job(crate::cluster::hlc::wall_ms());
-    let parts = ledger::parts_from(&funding.lots, price as Mc, first_day)?;
+    let mut spending = node.spending.lock().await;
+    let lots = spending.lots(funding.book.as_ref()?, &me);
+    let parts = ledger::parts_from(&lots, price as Mc, first_day)?;
     let job = Some(job_uid.to_string());
     match repl::append_sealing(node, |seal| Record::CreditOffer {
         to: scanner,
@@ -206,11 +206,7 @@ pub async fn fund(
     {
         Ok(e) => {
             funding.committed += price as Mc;
-            for (day, mc) in parts {
-                if let Some(lot) = funding.lots.iter_mut().find(|(d, _)| *d == day) {
-                    lot.1 = lot.1.saturating_sub(mc as Mc);
-                }
-            }
+            spending.wrote(e.seq, &parts);
             Some((Some(e.seq), price))
         }
         Err(e) => {
@@ -218,6 +214,43 @@ pub async fn fund(
             None
         }
     }
+}
+
+/// The scanner's side of a funded job before it runs: whether `arbiter`'s
+/// offer `seq` is held here, made to this node for `job_uid`, open, and
+/// covers `price` in this node's book. A scanner that charged an offer the
+/// arbiter's lots do not hold would be paid less than it charged. An
+/// offer not held yet is fetched from the arbiter and waited for up to
+/// [`super::pay::SERVE_WAIT`].
+pub async fn offer_covers(
+    node: &Arc<Node>,
+    arbiter: NodeId,
+    seq: u64,
+    job_uid: &str,
+    price: u32,
+) -> bool {
+    let pool = &node.store.pool;
+    if !matches!(super::entries::get(pool, &arbiter, seq).await, Ok(Some(_))) {
+        if let Err(e) = node.sync_around_request(arbiter).await {
+            tracing::debug!(?e, "sync for a scan offer failed; waiting for it");
+        }
+        let until = tokio::time::Instant::now() + super::pay::SERVE_WAIT;
+        while !matches!(super::entries::get(pool, &arbiter, seq).await, Ok(Some(_))) {
+            if tokio::time::Instant::now() >= until {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+    let Ok(book) = super::book_fresh(node).await else {
+        return false;
+    };
+    book.ledger.offer(&arbiter, seq).is_some_and(|o| {
+        o.to == node.id()
+            && o.job.as_deref() == Some(job_uid)
+            && o.state == OfferState::Open
+            && o.covered >= price as Mc
+    })
 }
 
 /// The scanner's receipt for a funded job: the price for a delivered

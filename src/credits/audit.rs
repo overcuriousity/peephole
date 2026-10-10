@@ -61,7 +61,12 @@ pub struct Found {
 }
 
 /// Compare an audit with the scan it checks. A pure function of the two
-/// stored results.
+/// stored results. They agree when at least half of the ports the audit
+/// found open, and at least half of those the scan reported open, are open
+/// in both: a scan that claims every port open contains whatever the
+/// audit finds, but most of its claim is not there. The same host key or
+/// certificate on a port open in both settles it, as long as the scan
+/// claims at most twice as many open ports as the audit found.
 pub fn compare(original: &Found, audit: &Found) -> Outcome {
     if audit.open_tcp.is_empty() {
         return Outcome::Inconclusive;
@@ -72,15 +77,11 @@ pub fn compare(original: &Found, audit: &Found) -> Outcome {
             && original.open_tcp.contains(&k.0)
             && audit.open_tcp.contains(&k.0)
     });
-    if same_key {
+    if same_key && original.open_tcp.len() <= 2 * audit.open_tcp.len() {
         return Outcome::Agrees;
     }
-    let reported = audit
-        .open_tcp
-        .iter()
-        .filter(|p| original.open_tcp.contains(p))
-        .count();
-    if reported * 2 >= audit.open_tcp.len() {
+    let common = audit.open_tcp.intersection(&original.open_tcp).count();
+    if common * 2 >= audit.open_tcp.len() && common * 2 >= original.open_tcp.len() {
         Outcome::Agrees
     } else {
         Outcome::Differs
@@ -432,7 +433,7 @@ pub const AUDITORS: usize = 3;
 
 /// What designates a scan and ranks its auditors: a hash of its job and
 /// the HLC of the arbiter's done status, which the arbiter writes after
-/// the result is published.
+/// the result is published and the scanner charged ([`job_paid`]).
 pub fn seed(job_uid: &str, done_hlc: u64) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -448,8 +449,9 @@ pub fn designated(seed: &[u8; 32]) -> bool {
     (x as f64) < AUDIT_RATE * (u64::MAX as f64 + 1.0)
 }
 
-/// The auditors of a designated scan, best first: the active scanners of
-/// protocol 7 other than `scanner` admitted no later than the job's done
+/// The auditors of a designated scan at `level`, best first: the active
+/// scanners of protocol 7 (of protocol 8 for level 5, which older ones do
+/// not run) other than `scanner` admitted no later than the job's done
 /// status `done_hlc`, ranked by `SHA-256(seed || key)`; the first
 /// [`AUDITORS`]. A member admitted later cannot join the ranking of a
 /// scan after the fact. Roles, protocol and standing are read from the
@@ -459,15 +461,22 @@ pub fn auditors(
     members: &[MemberRow],
     scanner: &NodeId,
     done_hlc: u64,
+    level: u8,
 ) -> Vec<NodeId> {
+    use crate::cluster::rpc::proto::{ECONOMY_PROTO, VULN_SCAN_PROTO};
     use sha2::{Digest, Sha256};
+    let proto = if level >= 5 {
+        VULN_SCAN_PROTO
+    } else {
+        ECONOMY_PROTO
+    };
     let mut ranked: Vec<([u8; 32], NodeId)> = members
         .iter()
         .filter(|m| {
             m.active
                 && m.id != *scanner
                 && m.admitted_hlc <= done_hlc
-                && m.proto_max >= crate::cluster::rpc::proto::ECONOMY_PROTO
+                && m.proto_max >= proto
                 && m.roles.iter().any(|r| r == "scanner")
         })
         .map(|m| {
@@ -486,10 +495,12 @@ pub fn auditors(
 }
 
 /// `(bought, designated)` when a scanner's designated scans lack a bought
-/// audit twice or more and it bought fewer than 80 % of them.
+/// audit four times or more and it bought fewer than 60 % of them. An
+/// honest scanner misses one now and then (every auditor ranked for a scan
+/// may be offline or decline it); one that skips its audits misses most.
 pub fn owes(designated: u32, bought: u32) -> Option<(u32, u32)> {
     let missing = designated.saturating_sub(bought);
-    (missing >= 2 && u64::from(bought) * 5 < u64::from(designated) * 4)
+    (missing >= 4 && u64::from(bought) * 5 < u64::from(designated) * 3)
         .then_some((bought, designated))
 }
 
@@ -498,38 +509,55 @@ fn economy() -> i64 {
     i64::from(crate::cluster::record::ECONOMY)
 }
 
+/// The SQL condition under which the receipt `r` is the one the ledger
+/// counts for the offer `o` (`credits::ledger`): written by the node offered
+/// to, dated after the offer and no later than its lifetime (the parameter
+/// `ttl`, in ms) after it, and the first such. `economy` names the
+/// parameter holding the economy.
+fn counted_receipt(economy: &str, ttl: &str) -> String {
+    format!(
+        "r.kind = 'receipt' AND r.economy = {economy}
+         AND r.origin = o.peer AND r.peer = o.origin AND r.offer_seq = o.seq
+         AND r.hlc > o.hlc AND (r.hlc >> 16) <= (o.hlc >> 16) + {ttl}
+         AND NOT EXISTS (SELECT 1 FROM credit_entries f
+                         WHERE f.kind = 'receipt' AND f.economy = {economy}
+                           AND f.origin = r.origin AND f.peer = r.peer
+                           AND f.offer_seq = r.offer_seq
+                           AND f.hlc > o.hlc AND (f.hlc >> 16) <= (o.hlc >> 16) + {ttl}
+                           AND (f.hlc < r.hlc OR (f.hlc = r.hlc AND f.seq < r.seq)))"
+    )
+}
+
 /// Whether the job `job_uid` that `arbiter` granted to `scanner` was paid
-/// for: an offer of the arbiter funding it whose first receipt the ledger
-/// counts (dated after the offer, and before it lapsed after
-/// [`crate::credits::JOB_OFFER_TTL_MS`]) charged something. Only the scans of paid jobs are
-/// designated: a scanner paid nothing for a job may hold nothing to buy
-/// its audit with.
+/// for: an offer of the arbiter funding it whose receipt the ledger counts
+/// ([`counted_receipt`], within [`crate::credits::JOB_OFFER_TTL_MS`])
+/// charged something, and is dated before the arbiter's done status
+/// `done_hlc`. Only the scans of paid jobs are designated: a scanner paid
+/// nothing for a job may hold nothing to buy its audit with. The scanner
+/// charges before it reports the job done; a receipt written after the
+/// done status (which designates) moves nothing in the ledger either
+/// ([`crate::credits::ledger::charged_in_time`]).
 pub async fn job_paid(
     pool: &SqlitePool,
     job_uid: &str,
     arbiter: &[u8],
     scanner: &[u8],
+    done_hlc: u64,
 ) -> Result<bool> {
-    Ok(sqlx::query_scalar(
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT EXISTS (
            SELECT 1 FROM credit_entries o
-           JOIN credit_entries r ON r.kind = 'receipt' AND r.economy = ?4 AND r.charged_mc > 0
-                AND r.origin = o.peer AND r.peer = o.origin AND r.offer_seq = o.seq
-                AND r.hlc > o.hlc AND (r.hlc >> 16) <= (o.hlc >> 16) + ?5
-                AND NOT EXISTS (SELECT 1 FROM credit_entries f
-                                WHERE f.kind = 'receipt' AND f.economy = ?4
-                                  AND f.origin = r.origin AND f.peer = r.peer
-                                  AND f.offer_seq = r.offer_seq
-                                  AND f.hlc > o.hlc AND (f.hlc >> 16) <= (o.hlc >> 16) + ?5
-                                  AND (f.hlc < r.hlc OR (f.hlc = r.hlc AND f.seq < r.seq)))
+           JOIN credit_entries r ON r.charged_mc > 0 AND r.hlc < ?6 AND {}
            WHERE o.kind = 'offer' AND o.economy = ?4 AND o.job_uid = ?1
              AND o.origin = ?2 AND o.peer = ?3)",
-    )
+        counted_receipt("?4", "?5")
+    )))
     .bind(job_uid)
     .bind(arbiter)
     .bind(scanner)
     .bind(economy())
     .bind(crate::credits::JOB_OFFER_TTL_MS as i64)
+    .bind(hlc::to_db(done_hlc))
     .fetch_one(pool)
     .await?)
 }
@@ -540,7 +568,7 @@ pub async fn job_paid(
 /// those with no auditor to buy from), and how many of them it bought: an
 /// audit by one of the scan's [`auditors`] (by `members` as held here),
 /// with an audit offer from the scanner to that auditor naming the scan
-/// that its first receipt (the one the ledger counts) charged.
+/// that the receipt the ledger counts ([`counted_receipt`]) charged.
 pub async fn obligations(
     pool: &SqlitePool,
     members: &[MemberRow],
@@ -548,10 +576,10 @@ pub async fn obligations(
 ) -> Result<HashMap<NodeId, (u32, u32)>> {
     let from = hlc::to_db(now_ms.saturating_sub(7 * crate::credits::DAY_MS) << 16);
     let to = hlc::to_db(now_ms.saturating_sub(crate::credits::AUDIT_OFFER_TTL_MS) << 16);
-    // (scanner, scan uid, job uid, arbiter, done HLC)
-    type Row = (Vec<u8>, String, String, Vec<u8>, i64);
+    // (scanner, scan uid, job uid, arbiter, done HLC, level)
+    type Row = (Vec<u8>, String, String, Vec<u8>, i64, i64);
     let scans: Vec<Row> = sqlx::query_as(
-        "SELECT s.origin, s.uid, j.uid, j.arbiter, j.status_hlc FROM scans s
+        "SELECT s.origin, s.uid, j.uid, j.arbiter, j.status_hlc, s.level FROM scans s
          JOIN scan_jobs j ON j.uid = s.job_uid AND j.scanner = s.origin
          WHERE s.audit_of IS NULL AND s.origin IS NOT NULL AND s.uid IS NOT NULL
            AND s.level BETWEEN 1 AND 5 AND j.status = 'done'
@@ -563,25 +591,20 @@ pub async fn obligations(
     .fetch_all(pool)
     .await?;
     // (scan uid, auditor) of every audit the scanner paid its auditor for.
-    let paid: Vec<(String, Vec<u8>)> = sqlx::query_as(
+    let paid: Vec<(String, Vec<u8>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT o.audit_uid, o.peer FROM credit_entries o
-         JOIN credit_entries r ON r.kind = 'receipt' AND r.economy = ?1 AND r.charged_mc > 0
-              AND r.origin = o.peer AND r.peer = o.origin AND r.offer_seq = o.seq
-              -- The first receipt for the offer: the one the ledger counts.
-              AND NOT EXISTS (SELECT 1 FROM credit_entries f
-                              WHERE f.kind = 'receipt' AND f.economy = ?1
-                                AND f.origin = r.origin AND f.peer = r.peer
-                                AND f.offer_seq = r.offer_seq
-                                AND (f.hlc < r.hlc OR (f.hlc = r.hlc AND f.seq < r.seq)))
+         JOIN credit_entries r ON r.charged_mc > 0 AND {}
          JOIN scans a ON a.audit_of = o.audit_uid AND a.origin = o.peer
          WHERE o.kind = 'offer' AND o.economy = ?1 AND o.audit_uid IS NOT NULL",
-    )
+        counted_receipt("?1", "?2")
+    )))
     .bind(economy())
+    .bind(crate::credits::AUDIT_OFFER_TTL_MS as i64)
     .fetch_all(pool)
     .await?;
     let paid: std::collections::HashSet<(String, Vec<u8>)> = paid.into_iter().collect();
     let mut out: HashMap<NodeId, (u32, u32)> = HashMap::new();
-    for (scanner_key, scan_uid, job_uid, arbiter, done) in scans {
+    for (scanner_key, scan_uid, job_uid, arbiter, done, level) in scans {
         let Ok(scanner) = NodeId::from_slice(&scanner_key) else {
             continue;
         };
@@ -591,8 +614,8 @@ pub async fn obligations(
             continue;
         }
         // A scan with nobody to buy its audit from is owed nothing.
-        let ranked = auditors(&s, members, &scanner, done);
-        if ranked.is_empty() || !job_paid(pool, &job_uid, &arbiter, &scanner_key).await? {
+        let ranked = auditors(&s, members, &scanner, done, level.clamp(1, 5) as u8);
+        if ranked.is_empty() || !job_paid(pool, &job_uid, &arbiter, &scanner_key, done).await? {
             continue;
         }
         let e = out.entry(scanner).or_default();
@@ -608,11 +631,12 @@ pub async fn obligations(
 }
 
 /// Whether this node's scan workers would run an audit of an address
-/// (parsed, as stored) at a level now: None, or why not. Registered by
-/// `scan::run_workers` in [`Node::audit_check`].
+/// (parsed, as stored) of a scan of a job (its uid) at a level now: None,
+/// or why not. Registered by `scan::run_workers` in [`Node::audit_check`].
 pub type Check = Arc<
     dyn Fn(
             std::net::IpAddr,
+            String,
             String,
             u8,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
@@ -683,9 +707,11 @@ async fn scan_of(node: &Node, scan_uid: &str) -> Option<(NodeId, String, String,
         .ok()
         .flatten();
         let paid = match &row {
-            Some((s, job, .., arbiter)) => job_paid(&node.store.pool, job, arbiter, s)
-                .await
-                .unwrap_or(false),
+            Some((s, job, _, _, done, arbiter)) => {
+                job_paid(&node.store.pool, job, arbiter, s, hlc::from_db(*done))
+                    .await
+                    .unwrap_or(false)
+            }
             None => false,
         };
         if let Some((s, job, ip, level, done, _)) = row.filter(|_| paid) {
@@ -786,7 +812,7 @@ async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Resul
     if scanner != peer || !(1..=5).contains(&level) || !designated(&s) {
         return refuse("not a designated scan of the asker").await;
     }
-    if !auditors(&s, &members, &scanner, done).contains(&node.id()) {
+    if !auditors(&s, &members, &scanner, done, level).contains(&node.id()) {
         return refuse("this node is not among the scan's auditors").await;
     }
     // What would keep a worker here from running it: declined now, so the
@@ -798,7 +824,7 @@ async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Resul
     let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
         return refuse("the scan's address does not parse").await;
     };
-    if let Some(why) = check(addr, ip.clone(), level).await {
+    if let Some(why) = check(addr, ip.clone(), job_uid.clone(), level).await {
         return refuse(&format!("this node does not scan that address now: {why}")).await;
     }
     let least = price::min_take(node.price_table().price_of(price::SCAN).unwrap_or(0)) as u64;
@@ -864,7 +890,7 @@ async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Resul
 /// Returns the auditor.
 pub async fn buy(node: &Arc<Node>, scan_uid: &str) -> Result<NodeId, String> {
     let me = node.id();
-    let Some((scanner, job_uid, _, _, done)) = scan_of(node, scan_uid).await else {
+    let Some((scanner, job_uid, _, level, done)) = scan_of(node, scan_uid).await else {
         return Err("the scan or its paid, done job is not held here".into());
     };
     if scanner != me {
@@ -878,7 +904,7 @@ pub async fn buy(node: &Arc<Node>, scan_uid: &str) -> Result<NodeId, String> {
         .await
         .map_err(|e| format!("{e:#}"))?;
     let mut last = "no auditor is reachable".to_string();
-    for auditor in auditors(&s, &members, &me, done) {
+    for auditor in auditors(&s, &members, &me, done, level) {
         let live = node
             .live_members(crate::intel::LIVE_WINDOW)
             .contains(&auditor);
@@ -967,8 +993,9 @@ async fn due(pool: &SqlitePool, me: &NodeId, since_ms: u64) -> Result<Vec<String
     .await?;
     let mut out = vec![];
     for (scan_uid, job_uid, arbiter, done) in rows {
-        if designated(&seed(&job_uid, hlc::from_db(done)))
-            && job_paid(pool, &job_uid, &arbiter, &me.0).await?
+        let done = hlc::from_db(done);
+        if designated(&seed(&job_uid, done))
+            && job_paid(pool, &job_uid, &arbiter, &me.0, done).await?
         {
             out.push(scan_uid);
         }
@@ -1026,11 +1053,15 @@ mod tests {
         // The audit found no open port: the source may be gone.
         assert_eq!(compare(&original, &none), Inconclusive);
         assert_eq!(compare(&none, &none), Inconclusive);
-        // Half of what the audit found open was reported: agrees.
-        assert_eq!(compare(&original, &found(&[22, 8080], &[])), Agrees);
+        // At least half of what each side found open is open in both:
+        // agrees, with a port changed since.
+        assert_eq!(compare(&original, &found(&[22, 80, 8080], &[])), Agrees);
         assert_eq!(compare(&original, &found(&[22, 80, 443], &[])), Agrees);
-        // Less than half: differs.
+        assert_eq!(compare(&original, &found(&[22, 80], &[])), Agrees);
+        // Less than half of the audit's: differs.
         assert_eq!(compare(&original, &found(&[22, 8080, 8443], &[])), Differs);
+        // Less than half of the scan's: it reported more than is there.
+        assert_eq!(compare(&original, &found(&[22], &[])), Differs);
         // Nothing reported, something found: a made-up result.
         assert_eq!(compare(&none, &found(&[22], &[])), Differs);
         // The same host key on a port open in both settles it, whatever
@@ -1043,6 +1074,23 @@ mod tests {
         // The same key reported for a port that is not open in both.
         let elsewhere = found(&[2222, 1, 2], &[(2222, "ssh-hostkey", "aa")]);
         assert_eq!(compare(&original, &elsewhere), Differs);
+        // A made-up "everything open" always contains what the audit
+        // finds; it does not agree.
+        let all_open = found(&(1..=65535).collect::<Vec<_>>(), &[]);
+        assert_eq!(compare(&all_open, &found(&[22, 80], &[])), Differs);
+        let top_1000 = found(&(1..=1000).collect::<Vec<_>>(), &[]);
+        assert_eq!(compare(&top_1000, &found(&[22, 80, 443], &[])), Differs);
+        // Honest, with a little churn on a busy host: agrees.
+        let busy = found(&[21, 22, 25, 80, 110, 143, 443, 993], &[]);
+        let later = found(&[21, 22, 25, 80, 110, 143, 443, 8443], &[]);
+        assert_eq!(compare(&busy, &later), Agrees);
+        // The same key settles it while the scan claims at most twice as
+        // many open ports as the audit found.
+        let key = [(22, "ssh-hostkey", "aa")];
+        let modest = found(&[22, 80, 443, 8080, 8443, 9000], &key);
+        assert_eq!(compare(&modest, &found(&[22, 3000, 3001], &key)), Agrees);
+        let huge = found(&(1..=1000).collect::<Vec<_>>(), &key);
+        assert_eq!(compare(&huge, &found(&[22, 3000, 3001], &key)), Differs);
         for o in [Agrees, Differs, Inconclusive] {
             assert_eq!(Outcome::parse(o.as_str()), Some(o));
         }
@@ -1102,19 +1150,36 @@ mod tests {
             scanner_member(5, 6), // too old to be paid
         ];
         let s = seed("job-x", 7);
-        let got = auditors(&s, &members, &id(1), 7);
+        let got = auditors(&s, &members, &id(1), 7, 2);
         assert_eq!(got.len(), AUDITORS);
         assert!(!got.contains(&id(1)), "never the scanner itself");
         assert!(!got.contains(&id(5)));
-        assert_eq!(got, auditors(&s, &members, &id(1), 7), "deterministic");
+        assert_eq!(got, auditors(&s, &members, &id(1), 7, 2), "deterministic");
         // Another seed, another order (for some seed among a few).
-        assert!((8..40u64).any(|h| auditors(&seed("job-x", h), &members, &id(1), h) != got));
+        assert!((8..40u64).any(|h| auditors(&seed("job-x", h), &members, &id(1), h, 2) != got));
         let mut listener = scanner_member(6, 7);
         listener.roles = vec!["listener".into()];
         assert!(
-            !auditors(&s, &[listener], &id(1), 7).contains(&id(6)),
+            !auditors(&s, &[listener], &id(1), 7, 2).contains(&id(6)),
             "not a scanner"
         );
+    }
+
+    /// Level 5 is known from protocol 8 on: older scanners would decline
+    /// its audit, so they are not ranked for it.
+    #[test]
+    fn a_level_5_scan_is_audited_by_scanners_that_know_level_5() {
+        let p = crate::cluster::rpc::proto::VULN_SCAN_PROTO;
+        let members = [
+            scanner_member(1, p),
+            scanner_member(2, p - 1),
+            scanner_member(3, p),
+            scanner_member(4, p - 1),
+        ];
+        let s = seed("job-x", 7);
+        assert_eq!(auditors(&s, &members, &id(1), 7, 5), [id(3)]);
+        let low = auditors(&s, &members, &id(1), 7, 4);
+        assert_eq!(low.len(), 3, "{low:?}");
     }
 
     #[test]
@@ -1123,19 +1188,20 @@ mod tests {
         late.admitted_hlc = 100;
         let members = [scanner_member(1, 7), late, scanner_member(3, 7)];
         let s = seed("job-x", 50);
-        assert_eq!(auditors(&s, &members, &id(1), 50), [id(3)]);
-        let all = auditors(&s, &members, &id(1), 100);
+        assert_eq!(auditors(&s, &members, &id(1), 50, 2), [id(3)]);
+        let all = auditors(&s, &members, &id(1), 100, 2);
         assert!(all.contains(&id(2)) && all.contains(&id(3)), "{all:?}");
     }
 
     #[test]
-    fn a_scanner_owes_when_two_designated_scans_lack_an_audit_and_it_bought_under_80_percent() {
+    fn a_scanner_owes_when_four_designated_scans_lack_an_audit_and_it_bought_under_60_percent() {
         assert_eq!(owes(0, 0), None);
-        assert_eq!(owes(1, 0), None, "one miss is forgiven");
-        assert_eq!(owes(2, 0), Some((0, 2)));
-        assert_eq!(owes(10, 8), None, "80 %");
-        assert_eq!(owes(10, 7), Some((7, 10)));
-        assert_eq!(owes(20, 17), None, "three misses, but 85 %");
+        assert_eq!(owes(3, 0), None, "three misses are forgiven");
+        assert_eq!(owes(4, 0), Some((0, 4)));
+        assert_eq!(owes(10, 6), None, "60 %");
+        assert_eq!(owes(10, 5), Some((5, 10)));
+        assert_eq!(owes(20, 13), None, "seven misses, but 65 %");
+        assert_eq!(owes(12, 7), Some((7, 12)), "58 %");
     }
 
     #[test]
@@ -1229,12 +1295,12 @@ mod tests {
                 "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, economy)
                  VALUES (?1, 1, ?2, 'receipt', ?3, '[]', ?4, 4, '[\"audit\"]', 0, 2)",
             )
-            .bind(&by.0[..]).bind(hlc::to_db(day_ago(0))).bind(&s.0[..]).bind(n + 1)
+            .bind(&by.0[..]).bind(hlc::to_db(day_ago(0) + 2)).bind(&s.0[..]).bind(n + 1)
             .execute(pool).await.unwrap();
         }
         let got = obligations(pool, &members, now).await.unwrap();
         assert_eq!(got.get(&s), Some(&(3, 1)), "{got:?}");
-        assert_eq!(owes(3, 1), Some((1, 3)));
+        assert_eq!(owes(3, 1), None, "two misses: not owed yet");
         // A receipt of nothing for the same offer came first: the ledger
         // counts that one, so the audit was not bought.
         sqlx::query(
@@ -1242,7 +1308,7 @@ mod tests {
              VALUES (?1, 0, ?2, 'receipt', ?3, '[]', 1, 0, '[]', 0, 2)",
         )
         .bind(&auditor.0[..])
-        .bind(hlc::to_db(day_ago(1)))
+        .bind(hlc::to_db(day_ago(0) + 1))
         .bind(&s.0[..])
         .execute(pool)
         .await
@@ -1252,6 +1318,56 @@ mod tests {
         // Alone, the scanner has no auditor: nothing is owed.
         let alone = obligations(pool, &members[..1], now).await.unwrap();
         assert_eq!(alone.get(&s), None, "{alone:?}");
+    }
+
+    /// An audit receipt counts as bought only where the ledger counts it:
+    /// dated after its offer and before the offer lapsed.
+    #[tokio::test]
+    async fn an_audit_receipt_the_ledger_ignores_buys_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let pool = &store.pool;
+        let (s, arbiter, auditor) = (id(1), id(9), id(2));
+        let members = [scanner_member(1, 7), scanner_member(2, 7)];
+        let ttl = crate::credits::AUDIT_OFFER_TTL_MS;
+        let day = 86_400_000;
+        let offer_ms = hlc::wall_ms() - day;
+        // (name, receipt dated this many ms after the offer, bought)
+        let cases = [
+            ("early", -1i64, false),
+            ("late", ttl as i64 + 1, false),
+            ("in-time", ttl as i64, true),
+        ];
+        for (n, (name, after, _)) in cases.iter().enumerate() {
+            let scan = designated_job(pool, arbiter, s, name, day).await;
+            pay_job(pool, arbiter, s, &format!("job-{name}"), 100 + n as i64, 5).await;
+            sqlx::query(
+                "INSERT INTO scans (ip_id, level, started_at, finished_at, uid, origin, job_uid, audit_of, hlc, job_id)
+                 VALUES (1, 2, datetime('now'), datetime('now'), ?1, ?2, ?3, ?4, ?5,
+                         (SELECT id FROM scan_jobs WHERE uid = ?3))",
+            )
+            .bind(format!("audit-{name}")).bind(&auditor.0[..]).bind(format!("job-{name}")).bind(&scan).bind(hlc::to_db(offer_ms << 16))
+            .execute(pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, seal, economy, audit_uid)
+                 VALUES (?1, ?2, ?3, 'offer', ?4, '[]', 1, 2, ?5)",
+            )
+            .bind(&s.0[..]).bind(n as i64 + 1).bind(hlc::to_db(offer_ms << 16)).bind(&auditor.0[..]).bind(&scan)
+            .execute(pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO credit_entries (origin, seq, hlc, kind, peer, parts, offer_seq, charged_mc, answered, seal, economy)
+                 VALUES (?1, ?2, ?3, 'receipt', ?4, '[]', ?2, 4, '[\"audit\"]', 0, 2)",
+            )
+            .bind(&auditor.0[..]).bind(n as i64 + 1)
+            .bind(hlc::to_db(((offer_ms as i64 + after) as u64) << 16)).bind(&s.0[..])
+            .execute(pool).await.unwrap();
+        }
+        let got = obligations(pool, &members, hlc::wall_ms()).await.unwrap();
+        assert_eq!(
+            got.get(&s),
+            Some(&(3, 1)),
+            "only the receipt in time: {got:?}"
+        );
     }
 
     /// The arbiter's offer funding `job` of `scanner`, and the scanner's
@@ -1336,20 +1452,33 @@ mod tests {
         let (s, arbiter) = (id(1), id(9));
         let members = [scanner_member(1, 7), scanner_member(2, 7)];
         let day = 86_400_000;
+        let now = hlc::wall_ms() << 16;
         designated_job(pool, arbiter, s, "free", day).await;
         designated_job(pool, arbiter, s, "zero", day).await;
         pay_job(pool, arbiter, s, "job-zero", 1, 0).await;
         let got = obligations(pool, &members, hlc::wall_ms()).await.unwrap();
         assert_eq!(got.get(&s), None, "{got:?}");
-        assert!(!job_paid(pool, "job-zero", &arbiter.0, &s.0).await.unwrap());
+        assert!(
+            !job_paid(pool, "job-zero", &arbiter.0, &s.0, now)
+                .await
+                .unwrap()
+        );
         designated_job(pool, arbiter, s, "paid", day).await;
         pay_job(pool, arbiter, s, "job-paid", 2, 5).await;
-        assert!(job_paid(pool, "job-paid", &arbiter.0, &s.0).await.unwrap());
+        assert!(
+            job_paid(pool, "job-paid", &arbiter.0, &s.0, now)
+                .await
+                .unwrap()
+        );
         // Paid by another arbiter than the job's, or to another scanner:
         // not this job's payment.
-        assert!(!job_paid(pool, "job-paid", &id(8).0, &s.0).await.unwrap());
         assert!(
-            !job_paid(pool, "job-paid", &arbiter.0, &id(2).0)
+            !job_paid(pool, "job-paid", &id(8).0, &s.0, now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !job_paid(pool, "job-paid", &arbiter.0, &id(2).0, now)
                 .await
                 .unwrap()
         );
@@ -1374,13 +1503,28 @@ mod tests {
                     .unwrap();
             }
         }
-        assert!(!job_paid(pool, "job-early", &arbiter.0, &s.0).await.unwrap());
-        assert!(!job_paid(pool, "job-late", &arbiter.0, &s.0).await.unwrap());
         assert!(
-            job_paid(pool, "job-in-time", &arbiter.0, &s.0)
+            !job_paid(pool, "job-early", &arbiter.0, &s.0, now)
                 .await
                 .unwrap()
         );
+        assert!(
+            !job_paid(pool, "job-late", &arbiter.0, &s.0, now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            job_paid(pool, "job-in-time", &arbiter.0, &s.0, now)
+                .await
+                .unwrap()
+        );
+        // A receipt written after the arbiter's done status does not count:
+        // the scanner could see whether the scan was designated first.
+        let receipt = (1_000_000 + ttl) << 16;
+        for (done, paid) in [(receipt, false), (receipt + 1, true)] {
+            let got = job_paid(pool, "job-in-time", &arbiter.0, &s.0, done);
+            assert_eq!(got.await.unwrap(), paid, "done at {done}");
+        }
     }
 
     /// A scan is due for a purchase while no audit offer for it is open or

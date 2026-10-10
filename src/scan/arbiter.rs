@@ -67,11 +67,14 @@ fn over_capacity(granted_last_hour: i64, can_do: Option<f64>) -> bool {
 
 /// Whether a grant handed back with `status` and `why` counts as
 /// not delivered: every turn-down, except "later" for a reason that is no
-/// fault of the scanner (the job has not replicated there yet, or its
-/// Tor exit list is not loaded).
+/// fault of the scanner (the job or its offer has not replicated there
+/// yet, the offer is not covered, or its Tor exit list is not loaded).
 fn undelivered(status: &str, why: Option<&str>) -> bool {
     match status {
-        "later" => !matches!(why, Some(super::NOT_REPLICATED | super::TOR_UNKNOWN)),
+        "later" => !matches!(
+            why,
+            Some(super::NOT_REPLICATED | super::TOR_UNKNOWN | super::OFFER_SHORT)
+        ),
         _ => status == "declined",
     }
 }
@@ -1130,6 +1133,7 @@ mod tests {
     fn hand_backs_for_reasons_outside_the_scanner_are_not_undelivered() {
         assert!(!undelivered("later", Some(super::super::NOT_REPLICATED)));
         assert!(!undelivered("later", Some(super::super::TOR_UNKNOWN)));
+        assert!(!undelivered("later", Some(super::super::OFFER_SHORT)));
         assert!(undelivered("later", Some("level 2 needs more evidence")));
         assert!(undelivered("later", None));
         assert!(undelivered("declined", Some(super::super::NOT_REPLICATED)));

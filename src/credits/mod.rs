@@ -72,7 +72,8 @@ use std::sync::Arc;
 /// when, whose pool shares it credits, and where every credit is.
 pub struct Book {
     pub ledger: ledger::Ledger,
-    /// The pool shares this node credits (members that earn here).
+    /// The pool shares this node credits; what a member that does not earn
+    /// here still holds of its shares is burned (`ledger::run`).
     pub pool: Vec<ledger::Earned>,
     /// The verified listeners of each day the window reads.
     pub listeners: BTreeMap<u32, BTreeSet<NodeId>>,
@@ -80,6 +81,9 @@ pub struct Book {
     /// The members that do not earn in full here.
     pub standings: gates::Standings,
     pub now_ms: u64,
+    /// The highest sequence number among this node's own entries the
+    /// ledger read: an own entry written later is not in this book.
+    pub own_head: u64,
 }
 
 impl Book {
@@ -128,10 +132,22 @@ pub async fn compute(node: &Node) -> anyhow::Result<Book> {
             .map(|(id, _)| *id)
             .collect()
     };
+    // The done status of the scan jobs whose offers the window can hold.
+    let done: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT uid, status_hlc FROM scan_jobs
+         WHERE status = 'done' AND uid IS NOT NULL AND status_hlc >= ?",
+    )
+    .bind(crate::cluster::hlc::to_db(since))
+    .fetch_all(&node.store.pool)
+    .await?;
     let gates = ledger::Gates {
         left_out: set(&|s| s.left_out()),
         no_sales: set(&|s| !s.earns()),
         no_scan_sales: set(&|s| !s.earns_as_scanner()),
+        done: done
+            .into_iter()
+            .map(|(uid, h)| (uid, crate::cluster::hlc::from_db(h)))
+            .collect(),
     };
     let members: Vec<crate::cluster::members::MemberRow> =
         crate::cluster::members::all(&node.store)
@@ -148,13 +164,17 @@ pub async fn compute(node: &Node) -> anyhow::Result<Book> {
             (d, reach::verified(&members, &uptime, &reported, d))
         })
         .collect();
-    // A member that does not earn here is not credited here, and its
-    // share is not given to anyone else.
-    let pool: Vec<ledger::Earned> = pool::credited(&listeners, now_ms)
-        .into_iter()
-        .filter(|e| !gates.no_sales.contains(&e.node))
-        .collect();
+    // A member that does not earn here is credited all the same, so what
+    // it paid stays paid; the ledger burns what it still holds of it.
+    let pool = pool::credited(&listeners, now_ms);
     let entries = entries::since(&node.store.pool, since).await?;
+    let me = node.id();
+    let own_head = entries
+        .iter()
+        .filter(|e| e.origin == me)
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0);
     let ledger = ledger::run(&pool, &entries, &gates, now_ms);
     Ok(Book {
         ledger,
@@ -163,6 +183,7 @@ pub async fn compute(node: &Node) -> anyhow::Result<Book> {
         uptime,
         standings,
         now_ms,
+        own_head,
     })
 }
 

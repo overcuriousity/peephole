@@ -301,6 +301,12 @@ pub struct Node {
     /// Offers a paid lookup is being served for right now: `(payer,
     /// sequence number)`. An offer is served once.
     pub(crate) serving_offers: Mutex<std::collections::HashSet<(NodeId, u64)>>,
+    /// This node's own offers and transfers written lately; held by every
+    /// writer of one from reading its lots until the entry is written
+    /// (`credits::pay::Spending`).
+    pub(crate) spending: tokio::sync::Mutex<crate::credits::pay::Spending>,
+    /// Held while this node draws from its siblings: one draw at a time.
+    pub(crate) drawing: tokio::sync::Mutex<()>,
     /// Bought audits waiting for a free worker (`credits::audit`).
     pub audit_queue: Mutex<crate::credits::audit::Queue>,
     /// This node's designated scans whose audit it tried to buy.
@@ -381,6 +387,8 @@ impl Node {
             scan_queued: Default::default(),
             scan_share: Default::default(),
             serving_offers: Mutex::new(Default::default()),
+            spending: Default::default(),
+            drawing: Default::default(),
             audit_queue: Default::default(),
             audits_tried: Default::default(),
             audit_check: Default::default(),

@@ -215,10 +215,14 @@ pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> 
         return ResolveResp::refused("not a host name");
     };
     let cost = node.price_table().price_of(price::RESOLVE).unwrap_or(0);
-    node.market.note(price::RESOLVE, 1);
+    // Demand: a free request, or one whose offer was found
+    // (`pay::counts_as_demand`); asking at a price without one is not.
     let seq = match req.offer_seq {
         Some(seq) => Some(seq),
-        None if cost == 0 => None,
+        None if cost == 0 => {
+            node.market.note(price::RESOLVE, 1);
+            None
+        }
         None => {
             return ResolveResp::priced(
                 &format!(
@@ -239,6 +243,9 @@ pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> 
             pay::SERVE_MARGIN_MS,
         )
         .await;
+        if pay::counts_as_demand(&accepted) {
+            node.market.note(price::RESOLVE, 1);
+        }
         match accepted {
             Ok(_) => {}
             Err(pay::Declined::TooLow { why, price_mc }) => {
@@ -663,8 +670,17 @@ mod tests {
             ..Default::default()
         }));
         let before = head();
+        let demand = || {
+            node.market
+                .peek()
+                .counts
+                .get(price::RESOLVE)
+                .copied()
+                .unwrap_or(0.0)
+        };
         let resp = serve_resolve(&node, other, &req).await;
         assert_eq!(resp.price_mc, Some(5), "{resp:?}");
+        assert_eq!(demand(), 0.0, "a request without an offer is no demand");
         assert!(
             resp.error
                 .as_deref()
@@ -681,6 +697,7 @@ mod tests {
             "the resolver was reached"
         );
         assert_eq!(head(), before, "no receipt");
+        assert_eq!(demand(), 1.0, "served free: demand");
     }
 
     #[test]

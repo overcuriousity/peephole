@@ -301,6 +301,70 @@ pub async fn accept_offer(
     })
 }
 
+/// How long [`Spending`] remembers an entry: longer than any book that
+/// funds offers lives (a round of handing out jobs keeps one).
+const SPENDING_KEPT: Duration = Duration::from_secs(3600);
+
+/// This node's own offers and transfers written lately, with the parts
+/// they named. A book computed before one was written still shows those
+/// credits in the lots; [`Spending::lots`] leaves them out. Kept in
+/// [`Node::spending`], which every writer of an offer or a transfer holds
+/// from reading its lots until the entry is written and noted, so two
+/// never name the same credits.
+#[derive(Default)]
+pub struct Spending {
+    written: Vec<Written>,
+}
+
+/// An entry [`Spending`] remembers: its sequence number, when it was
+/// written, and the parts it named.
+type Written = (u64, std::time::Instant, Vec<(u32, u32)>);
+
+impl Spending {
+    /// `me`'s live lots as `book` has them, less what its own entries
+    /// written after the book took, oldest first.
+    pub fn lots(&self, book: &super::Book, me: &NodeId) -> Vec<(u32, Mc)> {
+        let mut lots = book.ledger.by_day(me);
+        for (_, _, parts) in self.written.iter().filter(|(seq, ..)| *seq > book.own_head) {
+            for (day, mc) in parts {
+                if let Some(lot) = lots.iter_mut().find(|(d, _)| d == day) {
+                    lot.1 = lot.1.saturating_sub(*mc as Mc);
+                }
+            }
+        }
+        lots.retain(|(_, mc)| *mc > 0);
+        lots
+    }
+
+    /// Note an entry of this node's written with `parts`.
+    pub fn wrote(&mut self, seq: u64, parts: &[(u32, u32)]) {
+        self.written
+            .retain(|(_, at, _)| at.elapsed() < SPENDING_KEPT);
+        self.written
+            .push((seq, std::time::Instant::now(), parts.to_vec()));
+    }
+}
+
+/// The oldest lot day an offer written at `now_ms` may draw from: one
+/// buying an audit lives [`super::AUDIT_OFFER_TTL_MS`], any other
+/// [`super::OFFER_TTL_MS`] ([`super::ledger::first_day_for`]).
+fn offer_first_day(now_ms: u64, audit: bool) -> u32 {
+    let ttl = if audit {
+        super::AUDIT_OFFER_TTL_MS
+    } else {
+        super::OFFER_TTL_MS
+    };
+    super::ledger::first_day_for(now_ms, ttl)
+}
+
+/// What `lots` hold from `first_day` on.
+fn available(lots: &[(u32, Mc)], first_day: u32) -> Mc {
+    lots.iter()
+        .filter(|(day, _)| *day >= first_day)
+        .map(|(_, mc)| mc)
+        .sum()
+}
+
 /// The asker's side of writing one offer: the balance (drawing from the
 /// fleet), a sealed `CreditOffer` of `total_mc` to `server`, and a sync so
 /// the server holds it before it is named. Returns the offer's sequence
@@ -310,6 +374,10 @@ pub async fn make_offer(node: &Arc<Node>, server: NodeId, total_mc: Mc) -> Resul
 }
 
 /// [`make_offer`], naming the scan an audit it buys checks (`audit`).
+/// Offers are written one at a time, each from the lots the ones before
+/// left ([`Spending`]) that outlive it ([`offer_first_day`]); one that
+/// needs more than the node holds draws the rest from its siblings, one
+/// draw at a time.
 pub async fn make_offer_for(
     node: &Arc<Node>,
     server: NodeId,
@@ -322,48 +390,62 @@ pub async fn make_offer_for(
     if server != me && !node.can_call(&server) {
         return Err("the node cannot be reached from here".into());
     }
-    let mut book = super::book_fresh(node)
-        .await
-        .map_err(|e| format!("this node could not read its books: {e:#}"))?;
-    if book.ledger.spendable_parts(&me, total_mc).is_none() {
-        // Draw what is missing from the siblings, the richest first.
-        let missing = total_mc.saturating_sub(book.balance(&me));
-        if super::fleet::draw(node, missing).await
-            && let Ok(b) = super::book_fresh(node).await
-        {
-            book = b;
+    let first_day = offer_first_day(crate::cluster::hlc::wall_ms(), audit.is_some());
+    let books = |e: anyhow::Error| format!("this node could not read its books: {e:#}");
+    let mut drew = false;
+    loop {
+        let have = {
+            let mut spending = node.spending.lock().await;
+            let book = super::book_fresh(node).await.map_err(books)?;
+            let lots = spending.lots(&book, &me);
+            if let Some(parts) = super::ledger::parts_from(&lots, total_mc, first_day) {
+                let offer = repl::append_sealing(node, |seal| Record::CreditOffer {
+                    to: server,
+                    parts: parts.clone(),
+                    seal,
+                    job: None,
+                    audit,
+                    economy: crate::cluster::record::ECONOMY,
+                })
+                .await
+                .map_err(|e| format!("the offer could not be written: {e:#}"))?;
+                spending.wrote(offer.seq, &parts);
+                drop(spending);
+                // So the offer is there before the request. A server nobody
+                // can dial pulls it with its own long-poll.
+                if server != me
+                    && let Err(e) = node.sync_around_request(server).await
+                {
+                    tracing::debug!(
+                        ?e,
+                        "sync before a paid request failed; the server waits for the offer"
+                    );
+                }
+                return Ok(offer.seq);
+            }
+            available(&lots, first_day)
+        };
+        if drew {
+            return Err(format!(
+                "this node holds {} credits; this costs {} ({} missing)",
+                show(have),
+                show(total_mc),
+                show(total_mc.saturating_sub(have))
+            ));
+        }
+        drew = true;
+        // Draw what is missing from the siblings, the richest first. An
+        // offer that waited for another's draw may need none any more.
+        let _one = node.drawing.lock().await;
+        let have = {
+            let spending = node.spending.lock().await;
+            let book = super::book_fresh(node).await.map_err(books)?;
+            available(&spending.lots(&book, &me), first_day)
+        };
+        if have < total_mc {
+            super::fleet::draw(node, total_mc - have).await;
         }
     }
-    let Some(parts) = book.ledger.spendable_parts(&me, total_mc) else {
-        let have = book.balance(&me);
-        return Err(format!(
-            "this node holds {} credits; this costs {} ({} missing)",
-            show(have),
-            show(total_mc),
-            show(total_mc.saturating_sub(have))
-        ));
-    };
-    let offer = repl::append_sealing(node, |seal| Record::CreditOffer {
-        to: server,
-        parts,
-        seal,
-        job: None,
-        audit,
-        economy: crate::cluster::record::ECONOMY,
-    })
-    .await
-    .map_err(|e| format!("the offer could not be written: {e:#}"))?;
-    // So the offer is there before the request. A server nobody can dial
-    // pulls it with its own long-poll.
-    if server != me
-        && let Err(e) = node.sync_around_request(server).await
-    {
-        tracing::debug!(
-            ?e,
-            "sync before a paid request failed; the server waits for the offer"
-        );
-    }
-    Ok(offer.seq)
 }
 
 /// A provider result the dataset holds.
@@ -566,7 +648,9 @@ async fn keep_if_recorded(node: &Arc<Node>, ip: IpAddr, resp: &mut LookupResp) {
 /// The serving side of a request without an offer: what this node prices
 /// at zero now is answered free (it still takes the on-demand share and
 /// counts as demand); the rest is declined naming its price, so the asker
-/// may offer it.
+/// may offer it. A priced good asked for without an offer is no demand
+/// ([`counts_as_demand`]): asking costs nothing, so counting it would let
+/// anyone raise a server's prices for free.
 pub async fn serve_free(
     node: &Arc<Node>,
     providers: &Providers,
@@ -579,7 +663,6 @@ pub async fn serve_free(
     let provider = |name: &str| providers.iter().find(|p| p.name() == name);
     let (mut free, mut declined, mut priced) = (vec![], vec![], 0 as Mc);
     for name in served {
-        node.market.note(&name, 1);
         let price = table.price_of(&name).unwrap_or(0);
         if price > 0 {
             priced += price as Mc;
@@ -592,6 +675,7 @@ pub async fn serve_free(
             ));
             continue;
         }
+        node.market.note(&name, 1);
         let taken = match (shares, provider(&name)) {
             (Some(s), Some(p)) => s.take(p.as_ref()).await.unwrap_or(false),
             _ => true,
@@ -790,6 +874,86 @@ mod tests {
         assert!(!counts_as_demand(&Err::<(), _>(Declined::Why(
             "no such offer".into()
         ))));
+    }
+
+    async fn test_node() -> (tempfile::TempDir, Arc<Node>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let node = Node::open(crate::cluster::NodeParams {
+            identity: crate::cluster::identity::Identity::generate().unwrap(),
+            cluster: crate::config::ClusterConfig {
+                node_name: "n".into(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                advertise: None,
+                key_path: None,
+                takeover_hours: 6.0,
+                lease_secs: 120,
+                remote_config: false,
+                origin_quota_mb: 20 * 1024,
+                relay_slots: 16,
+                peers: vec![],
+            },
+            roles: Default::default(),
+            store,
+            proto: (1, 1),
+            data_dir: dir.path().to_path_buf(),
+            retention_days: 0,
+        })
+        .await
+        .unwrap();
+        node.bootstrap().await.unwrap();
+        (dir, node)
+    }
+
+    /// A request without an offer is demand only for what is answered
+    /// free: asking for a priced good without paying cannot raise its
+    /// price.
+    #[tokio::test]
+    async fn a_request_without_an_offer_is_demand_only_for_free_goods() {
+        let (_dir, node) = test_node().await;
+        node.set_price_table(Arc::new(super::super::price::Table {
+            offers: vec![super::super::price::Offer {
+                provider: "abuseipdb".into(),
+                price_mc: 5,
+                on_demand: 100,
+            }],
+            ..Default::default()
+        }));
+        let resp = serve_free(
+            &node,
+            &vec![],
+            NodeId([9; 32]),
+            "203.0.113.5".parse().unwrap(),
+            vec!["abuseipdb".into(), "rdap".into()],
+        )
+        .await;
+        assert_eq!(resp.price_mc, Some(5));
+        let counts = node.market.peek().counts;
+        assert_eq!(counts.get("abuseipdb"), None, "priced, no offer");
+        assert_eq!(counts.get("rdap"), Some(&1.0), "free");
+    }
+
+    /// A lookup, probe or relay offer lives 15 minutes, an audit offer
+    /// more than 12 hours: neither draws from a lot that dies first.
+    #[test]
+    fn an_offer_is_not_drawn_from_a_lot_that_dies_before_it_can_be_charged() {
+        use crate::credits::{AUDIT_OFFER_TTL_MS, DAY_MS, LOT_DAYS};
+        let day = 20_000u32;
+        let oldest = day - (LOT_DAYS - 1);
+        let at = |ms: u64| day as u64 * DAY_MS + ms;
+        // Early in the day: every live lot outlives either offer.
+        assert_eq!(offer_first_day(at(60_000), false), oldest);
+        assert_eq!(offer_first_day(at(60_000), true), oldest);
+        // Ten minutes before midnight: the oldest lot dies within a lookup
+        // offer's lifetime.
+        let late = at(DAY_MS - 10 * 60_000);
+        assert_eq!(offer_first_day(late, false), oldest + 1);
+        // Half an audit offer's lifetime before midnight: the same.
+        let noon = at(DAY_MS - AUDIT_OFFER_TTL_MS / 2);
+        assert_eq!(offer_first_day(noon, false), oldest);
+        assert_eq!(offer_first_day(noon, true), oldest + 1);
     }
 
     #[test]

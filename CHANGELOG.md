@@ -32,6 +32,32 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   new member could otherwise date admissions back over weeks it was not in
   the cluster, 20 for each day. A node's own admission of its inviter or
   a configured peer does not date them: they were members before.
+- An audit agrees with a scan only when at least half of the ports each
+  of them found open are open in both: a scan reporting every port (or
+  the top 1000) open no longer agrees with whatever the audit finds. The
+  same host key still settles it, unless the scan claims more than twice
+  as many open ports as the audit found.
+- Protocol 8: a scanner writes its scan receipt before it reports the
+  job done, and a scan receipt dated at or after the job's done status
+  (as the log holds it) moves no credits: the offer lapses back to the
+  arbiter. The done status designates the scan for an audit, so a
+  scanner charging after it could charge nothing for exactly the scans
+  that were designated, or skip designation altogether. A receipt counts
+  while no done status is held; once one dated earlier arrives, the
+  count says unpaid. Scanners below protocol 8 charge after the done
+  status, so they are not paid for scans until they upgrade.
+- A member that does not earn on a node (rules or audit gates) is
+  credited its sales and pool shares there as before the gate, so the
+  members it paid keep what they received; what it still holds of that
+  income goes back to its buyers by what each paid, and the pool's part
+  is burned. Before, its receipts were dropped over the whole 8-day
+  window, so its own payments came out uncovered and third parties lost
+  credits they had already been paid. Every node must count alike:
+  protocol 8.
+- A scanner owes audits (and is not funded) only once four of its
+  designated scans of 7 days lack a bought audit and it bought fewer than
+  60 % of them (was two and 80 %): an honest scanner whose ranked auditors
+  are all offline or decline now and then is not cut off.
 
 ### Fixed
 
@@ -100,8 +126,6 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - The installer warns when it cannot verify the build provenance because
   the GitHub CLI is missing, instead of relying on the checksum (from the
   same server) without a word, and says how to require or skip the check.
-### Fixed
-
 - Bulk deletes (requests or IPs, "all matching") wrote every tombstone in
   one transaction and held the database for as long as that took; the
   trap's writes waiting behind it timed out and requests were lost. They
@@ -148,6 +172,29 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - The Decoys page fetched a row per LLM decoy request of the range (the
   whole history for "all time") on every view, only to count them. The
   database counts them now.
+- Level-5 scans could not be audited: auditors applied the evidence
+  re-check, which never backs level 5, and protocol-7 scanners were
+  ranked among their auditors. An audit of a bought job now skips the
+  evidence re-check as the scan did, and only protocol-8 scanners audit
+  level 5 (protocol 8).
+- A request without an offer for a priced good (a lookup, a name or
+  reverse-name resolution, a probe) counted as demand, so anyone could
+  raise a server's prices for free; only goods answered free or paid for
+  count now.
+- Offers written together (a domain asked of up to nine resolvers, a
+  round of scan jobs while a lookup is paid) named the same oldest
+  credits, so most came out under-covered and were declined although the
+  node held enough, and each could draw from the fleet on its own. A
+  node now writes its offers and transfers one at a time, each from what
+  the ones before left, and draws from its siblings once at a time. A
+  scanner runs a funded job only when its offer is covered in full.
+- A lookup, probe, relay or audit offer could draw from a lot that died
+  before the offer was charged, so the server received credits already
+  gone. Every offer now leaves out the lots that die within its lifetime,
+  as scan offers did.
+- An audit counted as bought on the strength of a receipt the ledger
+  ignores (dated before its offer, or after the offer lapsed); it now
+  takes the receipt the ledger counts, as paid scan jobs already did.
 
 ## [0.10.0] - 2026-10-09
 

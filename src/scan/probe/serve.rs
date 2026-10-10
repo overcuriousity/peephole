@@ -231,8 +231,9 @@ impl Prober {
                 node.market.note(price::PROBE, 1);
                 None
             }
+            // Asking at a price without an offer is no demand
+            // (`pay::counts_as_demand`).
             None => {
-                node.market.note(price::PROBE, 1);
                 return match parsed {
                     Err(why) => declined(why, None),
                     Ok(_) => declined(
@@ -506,6 +507,14 @@ mod tests {
             probe_mc: Some(5),
             ..Default::default()
         }));
+        let demand = || {
+            node.market
+                .peek()
+                .counts
+                .get(price::PROBE)
+                .copied()
+                .unwrap_or(0.0)
+        };
         let resp = prober.serve(&node, other, &req).await;
         assert_eq!(
             resp,
@@ -514,6 +523,7 @@ mod tests {
                 price_mc: Some(5),
             }
         );
+        assert_eq!(demand(), 0.0, "a request without an offer is no demand");
         // ... and served free at zero, with no receipt.
         node.set_price_table(Arc::new(price::Table {
             probe_mc: Some(0),
@@ -530,6 +540,7 @@ mod tests {
         }
         let probes = store.probes_for_ip(ip.id).await.unwrap();
         assert_eq!((probes.len(), probes[0].charged_mc), (2, 0));
+        assert_eq!(demand(), 1.0, "served free: demand");
         assert_eq!(
             node.own_head.load(std::sync::atomic::Ordering::Relaxed),
             before + 1,
