@@ -5,7 +5,7 @@
 {% if standalone %}
 <div class="page-head"><div><h1>Cluster</h1></div></div>
 <section class="card"><h2>Standalone</h2>
-  <p>To join, add a <code>[cluster]</code> section to <code>config.toml</code> and restart. See <a href="https://github.com/overcuriousity/peephole/blob/master/docs/cluster.md">docs/cluster.md</a>.</p>
+  <p>To join, add a <code>[cluster]</code> section to <code>config.toml</code> and restart. See <a href="https://github.com/overcuriousity/peephole/blob/master/docs/operations.md#cluster-administration">Cluster administration</a>.</p>
   <p class="muted">Cooldown and roles: <a href="/admin/system/settings">System › Settings</a>. Scan pace: <a href="/admin/scans#pace">Scans</a>.</p></section>
 {% else %}
 {% let subtab = "members" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
