@@ -23,6 +23,7 @@ one UI label.
   abuse-report warning stays, in a risks section.
 - **"Wall of shame" → "Public dashboard"**, in the docs and in the UI:
   - `templates/wall.html`: the title and the h1.
+  - The nav link in `templates/layout.html`: "Wall" becomes "Dashboard".
   - The comments in `src/store/stats.rs` and `src/config.rs`.
   - The comments in `tests/integration.rs` (lines ~408 and ~2033).
 
@@ -97,7 +98,11 @@ If `docs/protocol.md` exceeds about 600 lines, it becomes `docs/protocol/`
 with one page per topic (membership and trust, replication, ownership,
 credits) and an index. Otherwise it stays one file.
 
-Deleted: `docs/cluster.md`, `docs/scanners.md`. Before deleting them, grep
+Retired: `docs/cluster.md` and `docs/scanners.md` shrink to short stubs that
+point to the pages that replaced them. They are not deleted: admin pages on
+nodes already running v0.10 and older link to
+`blob/master/docs/cluster.md`, and old CHANGELOG entries mention both files.
+Before retiring them, grep
 `src/`, `templates/`, `deploy/`, `install.sh`, `rules/`, `tests/` and the
 remaining docs for links or mentions of either file, and repoint each one
 (e.g. `src/scan/crawler.rs` likely refers to `scanners.md`).
@@ -126,8 +131,8 @@ repointed).
      Unreleased → Changed.
   2. The new logo (`assets/logo.svg`), with a CHANGELOG entry.
   3. One commit per new or rewritten page.
-  4. Deleting `cluster.md` and `scanners.md`, and repointing every link to
-     them.
+  4. Turning `cluster.md` and `scanners.md` into stubs, and repointing every
+     link to them.
 - One PR. I watch CI myself, fix every review finding (minor ones included)
   before merging, and merge only when CI is green.
 
@@ -136,7 +141,8 @@ repointed).
 - A script resolves every relative link and anchor in `README.md` and
   `docs/*.md`.
 - `grep -rni` finds no `cluster.md`, `scanners.md` or "wall of shame" outside
-  `docs/superpowers/` and earlier CHANGELOG entries.
+  `docs/superpowers/`, earlier CHANGELOG entries, and the two stubs
+  themselves.
 - `cargo test` passes.
 - The new logo is rendered to PNG at 16, 32 and 160 px on a light and a dark
   background (with `rsvg-convert`, or headless Chromium if that is missing)
