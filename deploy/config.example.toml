@@ -5,7 +5,7 @@
 # [roles]
 # listener = true   # trap listener (needs trap_listen)
 # scanner  = true   # nmap counter-scans (needs nmap)
-# web      = true   # wall of shame + admin area (needs admin_listen, [webauthn])
+# web      = true   # public dashboard + admin area (needs admin_listen, [webauthn])
 
 # Trap listener: your reverse proxy sends requests that match no real site here.
 # With nothing in front, the trap takes the public ports itself:
@@ -28,7 +28,7 @@ data_dir = "/var/lib/peephole"
 # Keep records and history of the last N days on this node only; 0 (default)
 # keeps everything. At least 7. In a cluster the other nodes keep theirs: this
 # node drops its old copies and log entries and serves only what it holds,
-# members keeping everything serve the rest (see docs/cluster.md).
+# members keeping everything serve the rest (see docs/protocol.md).
 # retention_days = 0
 
 # The signature rules (rules/*.toml in the source) are built into the binary;
@@ -203,7 +203,7 @@ tor_wait_hours = 6
 # 2 = ["-Pn", "-sS", "-sV", "-T3", "--top-ports", "2000"]
 # 3 = ["-Pn", "-sS", "-sV", "-O", "-T3", "--top-ports", "1000", "--script", "(discovery or safe) and not (intrusive or broadcast or external or dos)"]
 
-# What anonymous visitors of the wall of shame see.
+# What anonymous visitors of the public dashboard see.
 # [public]
 # show_labels = true   # rule labels (coarse categories of what an IP requested):
 #                      # per-IP chips, the label filter and the label chart
@@ -212,7 +212,7 @@ tor_wait_hours = 6
 # recent_rows = 50     # rows of the wall's "Recent requests" (last 24 h)
 
 # Distributed mode: share requests, scan queue, results and intel with other
-# nodes (docs/cluster.md). The installer writes this section on every node;
+# nodes (docs/protocol.md). The installer writes this section on every node;
 # without peers or an invite the node runs alone. Absent: standalone. The
 # node key is created on first start; print it with `peephole cluster id`.
 # Add nodes with the reusable invite from `peephole cluster invite` and

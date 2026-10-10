@@ -187,7 +187,7 @@ public_key = "{a}"
             .unwrap()
     };
     assert_eq!(scanner, b_key.id.0.to_vec());
-    // The public wall on A counts the request.
+    // The public dashboard on A counts the request.
     let stats: serde_json::Value = client
         .get(format!("http://127.0.0.1:{admin}/api/stats"))
         .send()

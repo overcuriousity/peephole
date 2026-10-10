@@ -405,9 +405,12 @@ async fn wall_shows_aggregates_not_payloads() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let html = resp.text().await.unwrap();
-    // The IP is named (wall of shame) and "Recent requests" lists paths,
+    // The IP is named (public dashboard) and "Recent requests" lists paths,
     // but never bodies, headers or query strings.
     assert!(html.contains("203.0.113.99"));
+    assert!(html.contains("<h1>Public dashboard</h1>"));
+    assert!(html.contains(">Dashboard</a>"));
+    assert!(!html.to_lowercase().contains("wall of shame"));
     assert!(html.contains("href=\"/ip/203.0.113.99\""));
     assert!(html.contains("Recent requests"));
     assert!(html.contains("/wp-login.php"));
@@ -415,8 +418,23 @@ async fn wall_shows_aggregates_not_payloads() {
     assert!(!html.contains("HEADER-MARKER"));
     assert!(
         !html.contains("Recent activity"),
-        "public wall has no live recent-activity card"
+        "public dashboard has no live recent-activity card"
     );
+    // The API page and error pages call the public page by its name too.
+    let api = reqwest::get(format!("{admin_base}/api"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(api.contains("The public dashboard's numbers as JSON"));
+    let missing = reqwest::get(format!("{admin_base}/ip/not-an-address"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(missing.contains("Back to the dashboard"));
     assert!(html.contains("Last 7 days"));
     assert!(html.contains("data-range=\"7d\""));
     assert!(html.contains("id=\"map\""));
@@ -2030,7 +2048,7 @@ async fn public_directory_is_public_but_request_search_is_admin() {
             .unwrap();
     }
     let base = spawn_admin_with(store.clone(), dir.path()).await;
-    // The IP directory stays public (named-and-shamed).
+    // The IP directory stays public.
     let html = reqwest::get(format!("{base}/ips"))
         .await
         .unwrap()

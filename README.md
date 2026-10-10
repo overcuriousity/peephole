@@ -1,160 +1,49 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="peephole logo — a bloodshot eye peeping through a hole in a wall" width="160">
+  <img src="assets/logo.svg" alt="peephole logo: a door peephole whose ring carries three member nodes" width="160">
 </p>
 
 # peephole
 
-A scan-the-scanners honeypot. peephole runs as the fallback vhost behind your
-web stack: every request that matches no real site — vulnerability scanners,
-exploit probes, internet-wide background noise — lands in the trap, is
-classified and enriched, and the interesting sources get **scanned back** with
-nmap.
+*A cooperative honeypot network that no member has to trust.*
 
 [![CI](https://github.com/overcuriousity/peephole/actions/workflows/ci.yml/badge.svg)](https://github.com/overcuriousity/peephole/actions/workflows/ci.yml)
+
+peephole is a honeypot you run behind your web server, and a network of
+such honeypots that share what they see. Each node catches the requests
+that reach none of your real sites — vulnerability scanners, exploit
+probes, background noise — classifies and enriches them, and can
+investigate the sources. Nodes join a cluster over mutual TLS and
+replicate one signed dataset. Operators need not know or trust each
+other: every claim is checked against signed data, and shared work
+(enrichment, lookups, scans) is paid in credits earned by doing work. In
+return for running a node you get the cluster's blocklist for your real
+sites, the whole dataset for your own analysis, and lookups through every
+member's intelligence providers.
 
 > [!WARNING]
 > Counter-scanning is legally restricted in some jurisdictions, and scanning
 > back can get your address reported for abuse — to your hosting provider
 > among others. Check what applies to you before you deploy.
 
-## Features
+## How it works
 
-- **Trap** — records every request that reaches no real site, with headers
-  and body, the raw request head as received, how it was answered and, over
-  HTTPS, the raw TLS ClientHello and its JA4 fingerprint; and classifies it
-  against TOML signature rules built into the binary — sixteen families from `sqli`,
-  `rce` and path traversal to SSRF, webshells, deserialization and
-  AI-infrastructure probes, each tagged with its OWASP reference (Top 10
-  2021 class or Automated Threat) — into a severity 0–4. Floods are
-  sampled, but every request still leaves at least a light row (time,
-  method, path) or a count.
-- **Enrichment** — MaxMind GeoLite2 country and ASN, the Tor exit list, and
-  optionally AbuseIPDB, Shodan and Shodan InternetDB, plus RDAP registration data (network,
-  holder, abuse contact), each within
-  its own rate budget, refreshed when an IP returns.
-- **Counter-scans** — rate-limited nmap scans in four automatic levels that escalate by
-  scope (more ports, `-sV`, `-O`, then safe discovery scripts), never by
-  speed or aggressiveness; that rule governs the automatic counter-scans.
-  On request an admin can also run an *observational probe* of the ports a
-  scan found open (headers, certificates, JARM, SSH host keys), from one
-  scanner or several at once. From level 2 they read the source's SSH host
-  keys, TLS certificates and HTTP ETags, so sources that share one show up as linked.
-  The admin can also buy a full counter-scan of level 1–4 from the
-  cluster's cheapest scanner, four times the price per level — or a level-5
-  scan, which runs nmap's vulnerability scripts (never queued automatically).
-  Bystanders are spared: one request earns at most a light scan, and
-  verified crawlers, Tor exits, your own and `never_scan` networks are
-  never scanned; per-network, per-ASN and queue budgets stop floods.
-- **Tarpit** — for an hour after a source's request reaches severity 4,
-  its requests get a slow-drip `200` that holds them up to 10 minutes, from
-  a bounded pool of its own; the time held is recorded. Bystander and
-  `never_scan` networks are never held.
-- **Canaries** — decoys for the probes scanners send first (`.env`,
-  `.git/config`, wp-login, phpinfo) serve realistic credentials derived
-  from the request, with links back to the trap. When a harvested
-  credential comes back, from any address to any node, the admin names the
-  request that harvested it and the time in between.
-- **Wall of shame** (public) — aggregate statistics per time range, shown
-  after a delay (`[public] delay_minutes` plus up to `jitter_minutes` more,
-  5 + 0–5 min by default) so the wall cannot be used to watch a scan live:
-  trends against the previous period, scanner time wasted in the tarpit, requests over time
-  by severity, a weekday × hour heatmap of the last 7 days, attack families and an OWASP Top 10 /
-  Automated Threats map, a world map, top IPs and networks, the ports most
-  often found open on the scanned sources, and a searchable IP directory
-  (exact, prefix or CIDR). Each IP has its activity calendar, rank and
-  neighbours (same /24 and ASN). The wall lists the latest requests as method
-  and path only (no query string, cut at 80 characters). Bodies, headers,
-  query strings and fingerprints are never public. Of the scan results only
-  per-port counts of distinct IPs are, and a port only once it was found open
-  on at least three. The card "What they asked our fake AI" shows only our
-  own tool names and model names that are lowercased, match
-  `[a-z0-9._:/-]{1,64}` and were asked by at least 2 IPs (else "other").
-  Rule labels, and the families and OWASP tags derived from them, can be
-  hidden too.
-- **Admin area** (FIDO2 security keys; optionally a password) — request search
-  and inspection (with the same IP's and same JA4's other requests), a live
-  feed of new requests, analytics (top paths, user agents, JA4, methods,
-  open ports, products, OS guesses, abuse scores; every row opens the
-  matching requests or IPs), a search box for IPs, networks, AS numbers,
-  requests, paths and fingerprints, per-IP pages with every
-  enrichment result and counter-scan, the scan pace with the live queue and
-  every finished job, a "needs attention" list on the Overview, a Links
-  area (every browser fingerprint, SSH host key, TLS certificate, JA4, JA4H,
-  HASSH and JA4X, filterable, each with a graph of the IPs it was seen on and
-  what else links them), canary reuse, the
-  false-positive inbox, deletion, and the dataset export: every request with
-  everything known about it and its IP (enrichment history, scans,
-  fingerprints) as typed Parquet, CSV or Timesketch JSONL, optionally
-  without the results whose terms forbid passing them on. Every row says
-  which node recorded it, by name and key, and which build it ran.
-- **Dataset** — the whole thing as typed Parquet (or CSV / Timesketch JSON
-  Lines): every request with headers, body, raw head, ClientHello and JA4,
-  rule labels and severity, every enrichment lookup, counter-scan and
-  fingerprint, plus which node and build recorded it. `peephole export`
-  streams it from any node, a web node offers it under Admin → Export, and
-  a "redistributable" mode strips the results whose terms forbid passing
-  them on. Column by column in [docs/dataset.md](docs/dataset.md): built
-  for machine learning on real scanner traffic.
-- **Blocklist feed** (public) — `GET /api/blocklist` lists the addresses
-  that sent requests of severity 3 or more in the last 24 hours, as released after the publication delay (parameters
-  `hours`, `min_severity`, `networks=1` to collapse busy /24s), one per
-  line, for nginx `deny`, nftables, ipset, fail2ban or CrowdSec. In a
-  cluster it is drawn from every member's trap, so one node's catch
-  protects everybody's real sites. Tor exits, verified crawlers, cluster
-  members and the node's own networks are never listed. Every node
-  documents its public endpoints at `/api` (linked in the footer).
-- **Lookup** (admin) — everything the dataset holds on one address, and
-  every provider the cluster can reach about it, now. In a cluster,
-  lookups, names, probes and scan jobs are goods bought with credits: a
-  fixed pool a day goes to the members anyone can reach, and everything
-  else is earned by selling. An answer under 24 hours old comes from
-  the dataset for free, and paid answers about recorded addresses are
-  kept. On a standalone node, your own providers, shown once.
-- **Cluster** — several operators can share one dataset over mutual TLS:
-  requests, the scan queue, results and lookups. Each node runs any mix of
-  trap, scanner and web roles and decides for itself whom it trusts. A node
-  may keep only the last N days (`retention_days`) while others keep the
-  whole history. See [docs/cluster.md](docs/cluster.md).
-- **Self-contained** — one binary with SQLite; fonts, scripts and the map are
-  built in, light and dark themes, no external requests from the web pages.
-
-## Running a node
-
-Each node earns its keep for its operator: the blocklist feed built from
-every member's trap for their own real sites, the whole dataset for their
-own analysis or research, pooled enrichment (one member's MaxMind, AbuseIPDB
-or Shodan key enriches everyone's view), and on-demand lookups of any
-address through the cluster's providers. The trap itself also keeps scanner
-noise out of the real sites' logs.
-
-## Install
-
-On a fresh Debian 12 / Ubuntu 22.04 or newer machine (x86_64 or aarch64):
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/install.sh | sudo bash
-```
-
-The installer verifies the download, asks which roles the node runs (trap,
-scanner, web interface; the scanner is opt-in), what is in front of the trap
-(nothing, so it takes ports 80 and 443 itself; nginx on the machine; or a
-proxy elsewhere), the admin domain and an optional admin password, the
-node's name and the address other cluster members dial (every node can join
-a cluster, now or later), an optional invite token and optional API keys,
-checks the ports are free, writes `/etc/peephole/config.toml`, and starts a
-systemd service.
-On request it also installs nginx with a Let's Encrypt certificate; otherwise
-it writes a matching nginx example and prints the steps. Re-running it
-upgrades in place and rolls back if the new version does not start.
-
-Then open `https://<your-domain>/enroll` and register your first security key
-with the one-time token the installer prints.
-
-Details — unattended installs, the nginx setup, upgrades, day-to-day commands,
-building from source and releases — are in
-[docs/operations.md](docs/operations.md).
-
-## How it fits
+- **A trap behind your web server.** peephole is the fallback for every
+  request no real site claims, and records it with headers and body, over
+  HTTPS also the raw TLS ClientHello and its JA4 fingerprint.
+- **Classified and enriched.** Signature rules built into the binary give
+  each request labels and a severity from 0 to 4; the source gets its
+  country, ASN, Tor status and registration data, and optionally AbuseIPDB
+  and Shodan results. → [Detection](docs/detection.md)
+- **Investigated, carefully.** An opt-in scanner role counter-scans
+  sources with nmap, escalating by scope and never touching bystanders; a
+  tarpit holds exploit senders, and decoys hand out canary credentials
+  that give away whoever reuses them.
+- **Shared without trust.** Every node holds a copy of one signed dataset,
+  checks what it receives, and decides for itself whom it trusts; nobody
+  can be removed, only blocked locally. → [Protocol](docs/protocol.md)
+- **Paid in credits.** Work one member does for another is bought with
+  credits from a fixed daily pool and from selling. →
+  [Credits](docs/overview.md#credits)
 
 ```
 internet ──► nginx ──────────► (real sites)
@@ -167,15 +56,61 @@ internet ──► nginx ──────────► (real sites)
 ```
 
 On port 443 nginx routes by server name without decrypting, so the trap
-terminates TLS itself and keeps the raw ClientHello and its JA4 fingerprint.
-A trap-only node can also go without nginx and listen on 80 and 443 itself.
+terminates TLS itself. A trap-only node can also go without nginx and
+listen on 80 and 443 itself. It is one binary with SQLite; its web pages
+make no external requests.
 
-Configuration lives in `/etc/peephole/config.toml`
-([annotated reference](deploy/config.example.toml)). The signature rules
-([`rules/`](rules/)) ship inside the binary, so every node of a build
-classifies alike and each request records which rules it was classified
-with; changing them means a new build. The number of scan workers and the
-roles can also be changed at runtime from the admin area.
+## What you put in, what you get back
+
+You put in a machine with a trap in front of or behind your web server,
+and optionally a scanner, a web interface and API keys (MaxMind, AbuseIPDB,
+Shodan) that then enrich everybody's view.
+
+You get back:
+
+- **a blocklist** (`/api/blocklist`) drawn from every member's trap, for
+  nginx, nftables, ipset, fail2ban or CrowdSec in front of your real sites;
+- **the whole dataset** — every request with everything known about it and
+  its source — as typed Parquet, CSV or Timesketch JSON Lines
+  ([Dataset](docs/dataset.md));
+- **lookups** of any address through every provider the cluster can reach;
+- **a public dashboard** of what your cluster sees, delayed and aggregated
+  ([What is public](docs/overview.md#what-is-public));
+- scanner noise kept out of your real sites' logs.
+
+## Risks
+
+The scanner role is opt-in, and abuse reports go to the provider of the
+node that scanned, not the trap's. The public dashboard names the addresses
+that probed you. More in [Risks](docs/overview.md#risks).
+
+## Install
+
+On a fresh Debian 12 / Ubuntu 22.04 or newer machine (x86_64 or aarch64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/install.sh | sudo bash
+```
+
+The installer verifies the download, asks which roles the node runs, what
+is in front of the trap, the admin domain, the node's cluster name and
+address, and an optional invite token and API keys, then starts a systemd
+service; it can also set up nginx with a Let's Encrypt certificate.
+Re-running it upgrades in place and rolls back if the new version does not
+start. Then open `https://<your-domain>/enroll` and register your first
+security key with the one-time token the installer prints. Details:
+[Install](docs/operations.md#install).
+
+## Documentation
+
+| Page | For |
+|---|---|
+| [Overview](docs/overview.md) | deciding whether to run a node |
+| [Protocol](docs/protocol.md) | how the cluster works, and why you need not trust it |
+| [Dataset](docs/dataset.md) | using the exported data |
+| [Operations](docs/operations.md) | installing and running a node |
+| [Detection](docs/detection.md) | rules, enrichment, counter-scans |
+| [Roadmap](docs/roadmap.md) | what is next |
 
 ## License
 

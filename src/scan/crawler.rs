@@ -2,7 +2,7 @@
 //! search engine, link preview or feed fetcher that follows a link to the
 //! trap looks like a probe, and so does a research scanner (Censys, LeakIX,
 //! Shodan) that documents its addresses; a counter-scan would hit the
-//! service's operator, not an attacker. See docs/scanners.md.
+//! service's operator, not an attacker. See docs/detection.md.
 //!
 //! A crawler is recognised by forward-confirmed reverse DNS: the IP's PTR
 //! name lies under a known crawler domain *and* that name resolves back to
@@ -50,7 +50,7 @@ pub const DOMAINS: &[&str] = &[
     "crawl.baidu.jp",
     "petalsearch.com",
     "crawl.amazonbot.amazon",
-    // Verified research scanners (docs/scanners.md): Censys, LeakIX, Shodan.
+    // Verified research scanners (docs/detection.md): Censys, LeakIX, Shodan.
     // Their operators publish these reverse zones; anything merely claiming
     // the UA (zgrab and friends) stays scannable.
     "censys-scanner.com",

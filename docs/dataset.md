@@ -1,8 +1,14 @@
 # The dataset
 
-Every request a trap recorded, with everything peephole knows about it and
-its source, as one table. In a cluster every node holds the whole dataset
-(or its last `retention_days`), so any operator can export it:
+Real scanner traffic, labelled: every request a trap recorded, with
+everything peephole knows about it and its source, as one table. In a
+cluster it is drawn from every member's trap, and every node holds all of
+it (or its last `retention_days`), so any operator can export it.
+
+It is meant for research and machine learning on what scanners actually
+send, and for an operator's own analysis. Every row says which node
+recorded it, by name and key, and which build it ran, so provenance
+survives the file leaving the node.
 
 ```sh
 peephole export -o peephole.parquet                      # everything, typed Parquet
@@ -104,7 +110,7 @@ Treat them as weak labels, or re-label from `method`, `path`, `query`,
 
 | Column | Type | Meaning |
 |---|---|---|
-| `labels` | list of string | Labels that matched: rule labels (`sqli`, `rce`, `path-traversal`, `ssrf`, `webshell`, `scanner-ua`, `ai-infra-probe`, … one family per file in `rules/`) and behavioural labels from code (`probe`, `path-scanner`, `form-interaction`, …); see the taxonomy in [operations.md](operations.md#classification-taxonomy) |
+| `labels` | list of string | Labels that matched: rule labels (`sqli`, `rce`, `path-traversal`, `ssrf`, `webshell`, `scanner-ua`, `ai-infra-probe`, … one family per file in `rules/`) and behavioural labels from code (`probe`, `path-scanner`, `form-interaction`, …); see the taxonomy in [detection.md](detection.md#classification) |
 | `owasp` | list of string | OWASP tags of the matching rules: a Top 10 2021 class (`A03:2021`) for payload families, an Automated Threat (`OAT-014`) for scanning behaviour. Behavioural labels carry none |
 | `severity` | int? | 0 (noise) to 4 (exploit attempt); the highest of the matching rules. Null on light rows |
 | `scan_level` | int? | Counter-scan level this request earned (0: none, 1 to 4); weak tells alone (`probe`, `path-scanner`, `php-probe`) cap it at 1 whatever the severity |

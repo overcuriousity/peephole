@@ -15,6 +15,10 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Changed
 
+- The public page is called "Public dashboard" (nav: "Dashboard") instead of
+  "Wall of shame". Its address and the `[public]` settings are unchanged.
+- New logo: a door peephole whose ring carries three cluster members. It
+  follows the system's light or dark theme.
 - A config key peephole does not know (misspelled, or from a newer version)
   is no longer ignored silently: the startup log and `check-config` warn
   about it by its full path, e.g. `scan.never_scan_directory`. It still

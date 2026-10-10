@@ -1,6 +1,6 @@
 //! Lookup credits: a fixed pool a day for the verified listeners, earned
 //! by selling goods, spent on goods. Every node computes every balance for
-//! itself, from its own copy of the log; see "Credits" in docs/cluster.md.
+//! itself, from its own copy of the log; see "Credits" in docs/protocol.md.
 pub mod audit;
 pub mod cli;
 pub mod entries;

@@ -671,7 +671,7 @@ struct RequestsPage {
 }
 
 /// Admin-only: the full request search (timestamps, query strings, bodies,
-/// headers) identifies individual clients. The public wall lists only a
+/// headers) identifies individual clients. The public dashboard lists only a
 /// delayed, query-free tail of recent requests.
 async fn requests(
     _u: SessionUser,

@@ -7,9 +7,9 @@ Shipped items move to the [changelog](../CHANGELOG.md).
 tests and docs. **Benefit**: what it adds for an operator, for the dataset,
 or both.
 
-Every item names where it shows up. The public wall only ever shows
+Every item names where it shows up. The public dashboard only ever shows
 aggregates: no request contents, no fingerprints, no single scan results
-(see the README's privacy rules). Everything else goes to the admin area.
+(see [What is public](overview.md#what-is-public)). Everything else goes to the admin area.
 
 ## Evidence from the running cluster
 
@@ -52,7 +52,7 @@ Measured on the real cluster, 30 days, before this roadmap (2026-10-04):
 
 - **Admin:** an Uploads page (hash, size, type, source IP) and per upload a
   timeline of the requests sent to it.
-- **Public wall:** a "webshells dropped" tile and counts per command verb.
+- **Public dashboard:** a "webshells dropped" tile and counts per command verb.
 
 ### 2. Campaign clustering
 
@@ -81,7 +81,7 @@ so every node arrives at the same campaigns. Every edge says why it exists.
   and a campaign page with its member IPs, its evidence edges with their
   reasons, a timeline, and the graph (the fingerprints graph, generalized).
   The IP page shows "member of campaign #N".
-- **Public wall:** "Campaigns this period": size, ASN and country spread,
+- **Public dashboard:** "Campaigns this period": size, ASN and country spread,
   and paths per campaign, as aggregates without fingerprints.
 - **Dataset:** a `campaign` column.
 
@@ -102,7 +102,7 @@ so every node arrives at the same campaigns. Every edge says why it exists.
 
 - **Admin:** a "New paths" view (first seen, distinct IPs, campaigns), a
   badge on the live feed, and an optional webhook or ntfy push.
-- **Public wall:** a count of new path shapes this period (paths themselves
+- **Public dashboard:** a count of new path shapes this period (paths themselves
   are request contents, so not public).
 
 ### 4. Personas per node or hostname (opt-in)
@@ -126,7 +126,7 @@ honeypot.
 **Shown:**
 
 - **Admin:** Analytics follow-up rate and family mix per persona.
-- **Public wall:** attack mix per persona.
+- **Public dashboard:** attack mix per persona.
 - **Dataset:** a `persona` column.
 
 ## Small follow-ups
@@ -146,8 +146,8 @@ honeypot.
   the trap listens on 80/443 itself; behind nginx the SYN goes to nginx.
   Shown on the request page and in Analytics. A lowered MSS (around 1380
   for WireGuard, 1360 for OpenVPN) also hints at a tunnel.
-- **Wall timeline drill-down.** S, low. For admins, each bucket of the
-  wall timeline links to `/requests` filtered by that bucket's `from`/`to`,
+- **Dashboard timeline drill-down.** S, low. For admins, each bucket of the
+  dashboard timeline links to `/requests` filtered by that bucket's `from`/`to`,
   as the Analytics charts already do.
 - **Queue a counter-scan or block from the Lookup page.** S–M, low. The
   probe and vantage actions exist; the manual scan queue and the block

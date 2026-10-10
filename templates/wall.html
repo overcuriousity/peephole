@@ -1,10 +1,10 @@
 {% extends "layout.html" %}
-{% block title %}peephole — wall of shame{% endblock %}
+{% block title %}peephole — public dashboard{% endblock %}
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
 <div class="page-head wall-head" data-range="{{ range.key() }}" id="wall">
   <div>
-    <h1>Wall of shame</h1>
+    <h1>Public dashboard</h1>
     <p class="muted">{{ range.label() }}</p>
     <p class="muted">{% if delay_max == 0 %}{% if chrome.authed %}Live view (signed in); the public sees the same.{% else %}Data shown as recorded.{% endif %}{% else if chrome.authed %}Live view (signed in); the public sees this {{ delay_min }}–{{ delay_max }} min later.{% else %}Data delayed by about {{ delay_min }}–{{ delay_max }} min.{% endif %}</p>
   </div>
