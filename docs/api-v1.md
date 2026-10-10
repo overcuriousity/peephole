@@ -252,6 +252,28 @@ Every call that queues something writes an audit entry: when, the device
 job id. Admins see the newest 50 under **Recent actions** on
 Admin → Devices.
 
+### `GET /api/v1/ips/{addr}/probe/vantages`
+
+What a probe of the address would ask and cost, so the app can show the
+total before it commits: the live scanners and default pick of the
+Actions card. Spends nothing and writes no audit entry.
+
+`200`:
+
+```json
+{
+  "vantages": [
+    { "id": "…", "name": "fra-1", "country": "DE", "credits": "0.10", "credits_mc": 100, "default": true }
+  ]
+}
+```
+
+Cheapest first. `default` marks the card's default pick; send the ticked
+ids as `vantages` to the probe. Standalone it is one free entry, the node
+itself (`"name": "this node"`). `404` when the address is not in the
+dataset; `422 refused` when the probe would be refused (the gate, no live
+scanner announcing a price, or a node that does not probe).
+
 ### `POST /api/v1/ips/{addr}/probe`
 
 Body (optional): `{ "vantages": ["<node id>", …] }`. Without it, the
