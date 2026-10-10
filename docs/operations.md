@@ -1,10 +1,12 @@
 # Operations
 
-Installing, upgrading and running a peephole node. For the cluster, see
-[cluster.md](cluster.md); every config key is annotated in
+Installing, upgrading and running a peephole node, and administering its
+place in a cluster. What a node is and whether to run one: the
+[overview](overview.md). How the cluster's rules work: the
+[protocol](protocol.md). Every config key is annotated in
 [`deploy/config.example.toml`](../deploy/config.example.toml).
 
-## What the installer does
+## Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/install.sh | sudo bash
@@ -55,7 +57,48 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/inst
   to `/etc/peephole/nginx.example.conf`, and installs and starts a systemd
   service.
 
-### What is in front of the trap
+Unattended installs pass the answers as environment variables:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/install.sh | \
+  sudo MAXMIND_ACCOUNT_ID=123456 MAXMIND_LICENSE_KEY=yourkey \
+       PEEPHOLE_DOMAIN=peephole.example.net PEEPHOLE_NGINX=1 bash
+```
+
+Every question has a variable (`PEEPHOLE_ROLES`, `PEEPHOLE_FRONT`,
+`PEEPHOLE_TRUSTED_PROXIES`, `PEEPHOLE_OWN_ADDRESSES`,
+`PEEPHOLE_CLUSTER_NAME`, `PEEPHOLE_CLUSTER_ADVERTISE`, `PEEPHOLE_JOIN_TOKEN`,
+`PEEPHOLE_ADMIN_PASSWORD`, `PEEPHOLE_NGINX`, …); the head of `install.sh` lists
+them all. Without a terminal a question takes its default, and one without
+a default stops the install before anything is written:
+
+- `PEEPHOLE_ROLES` defaults to `listener,web`: the scanner runs only when
+  `scanner` is in the list.
+- `PEEPHOLE_FRONT=direct|local|remote` answers what is in front of the
+  trap; the older `PEEPHOLE_LOCAL_PROXY=1` means local and `0` remote. A
+  preset `PEEPHOLE_TRUSTED_PROXIES` no longer means remote: set
+  `PEEPHOLE_FRONT=remote` (the proxies are then required). Without either,
+  the default above applies (local with the web role or 80/443 taken, else
+  direct).
+- `PEEPHOLE_OWN_ADDRESSES` overrides the metadata's address (`-` for
+  none); `PEEPHOLE_METADATA=0` skips asking the metadata service.
+- `PEEPHOLE_CLUSTER_ADVERTISE` is required unless it has a default: the
+  admin domain with port 7443 for the web role when the front is not
+  `remote` (the domain then points here), else the public address (an
+  interface's, the metadata's or `PEEPHOLE_OWN_ADDRESSES`) with port 7443.
+  `PEEPHOLE_CLUSTER_NAME` defaults to the short host name and
+  `PEEPHOLE_CLUSTER_LISTEN` to `[::]:<advertise port>` (both address
+  families; `0.0.0.0:<advertise port>` without IPv6).
+  `PEEPHOLE_CLUSTER` is ignored.
+- `PEEPHOLE_ADMIN_PASSWORD` reaches peephole on stdin only (never on a
+  command line or in a child's environment); `PEEPHOLE_NGINX=1` sets nginx
+  up even when a check fails; `PEEPHOLE_ACME_EMAIL` is ignored (the
+  certificate is requested without a contact email).
+
+Published binaries are built on Ubuntu 22.04 and run on Debian 12 / Ubuntu
+22.04 or newer (glibc ≥ 2.35).
+
+## In front of the trap
 
 | Answer | Trap listens on | `trusted_proxies` | nginx |
 |---|---|---|---|
@@ -102,44 +145,6 @@ peer-observed one, so a node behind NAT should set `scan.own_addresses`;
 the admin download and admin export remove the peer-observed addresses
 too.
 
-Unattended installs pass the answers as environment variables:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/overcuriousity/peephole/master/install.sh | \
-  sudo MAXMIND_ACCOUNT_ID=123456 MAXMIND_LICENSE_KEY=yourkey \
-       PEEPHOLE_DOMAIN=peephole.example.net PEEPHOLE_NGINX=1 bash
-```
-
-Every question has a variable (`PEEPHOLE_ROLES`, `PEEPHOLE_FRONT`,
-`PEEPHOLE_TRUSTED_PROXIES`, `PEEPHOLE_OWN_ADDRESSES`,
-`PEEPHOLE_CLUSTER_NAME`, `PEEPHOLE_CLUSTER_ADVERTISE`, `PEEPHOLE_JOIN_TOKEN`,
-`PEEPHOLE_ADMIN_PASSWORD`, `PEEPHOLE_NGINX`, …); the head of `install.sh` lists
-them all. Without a terminal a question takes its default, and one without
-a default stops the install before anything is written:
-
-- `PEEPHOLE_ROLES` defaults to `listener,web`: the scanner runs only when
-  `scanner` is in the list.
-- `PEEPHOLE_FRONT=direct|local|remote` answers what is in front of the
-  trap; the older `PEEPHOLE_LOCAL_PROXY=1` means local and `0` remote. A
-  preset `PEEPHOLE_TRUSTED_PROXIES` no longer means remote: set
-  `PEEPHOLE_FRONT=remote` (the proxies are then required). Without either,
-  the default above applies (local with the web role or 80/443 taken, else
-  direct).
-- `PEEPHOLE_OWN_ADDRESSES` overrides the metadata's address (`-` for
-  none); `PEEPHOLE_METADATA=0` skips asking the metadata service.
-- `PEEPHOLE_CLUSTER_ADVERTISE` is required unless it has a default: the
-  admin domain with port 7443 for the web role when the front is not
-  `remote` (the domain then points here), else the public address (an
-  interface's, the metadata's or `PEEPHOLE_OWN_ADDRESSES`) with port 7443.
-  `PEEPHOLE_CLUSTER_NAME` defaults to the short host name and
-  `PEEPHOLE_CLUSTER_LISTEN` to `[::]:<advertise port>` (both address
-  families; `0.0.0.0:<advertise port>` without IPv6).
-  `PEEPHOLE_CLUSTER` is ignored.
-- `PEEPHOLE_ADMIN_PASSWORD` reaches peephole on stdin only (never on a
-  command line or in a child's environment); `PEEPHOLE_NGINX=1` sets nginx
-  up even when a check fails; `PEEPHOLE_ACME_EMAIL` is ignored (the
-  certificate is requested without a contact email).
-
 **The cluster address.** Other members dial this node at the advertised
 `host:port`, so that port must be reachable from the internet; the
 installer does not change the firewall (with `ufw` active, the summary
@@ -147,10 +152,8 @@ prints the `ufw allow` command). To change it later, edit `advertise` and
 `listen` in `[cluster]` of `/etc/peephole/config.toml` and restart
 peephole. If the wizard moves the listener to a free port, the advertised
 port follows it. A node that cannot be reached at all can run
-outbound-only, by hand (see [cluster.md](cluster.md)).
-
-Published binaries are built on Ubuntu 22.04 and run on Debian 12 / Ubuntu
-22.04 or newer (glibc ≥ 2.35).
+outbound-only, by hand (see
+[Cluster administration](#cluster-administration)).
 
 ## nginx
 
@@ -324,7 +327,8 @@ stores. Installs from before this change had the rules in
 `/etc/peephole/rules` and `rules_dir` in the config: both are now ignored
 (peephole logs a warning, `check-config` a note, and the installer says so
 once on upgrade). The installer leaves that directory in place; remove it and
-the `rules_dir` line when you like.
+the `rules_dir` line when you like. What the rules flag, and how
+severity maps to counter-scans: [Detection](detection.md#classification).
 
 **Admin keys and sessions.** The first FIDO2 key is enrolled at `/enroll` with
 a one-time setup token from the service log. It is valid for 24 hours; a
@@ -357,7 +361,7 @@ pages: one address (or prefix) per line, requests of severity 3+ in the
 last 24 hours by default, with `?hours=`, `?min_severity=` and
 `?networks=1`. Recomputed at most once a minute. Exclusions: Tor exits,
 addresses a scanner refused as a verified crawler or research scanner
-([docs/scanners.md](scanners.md)), cluster members'
+([exempt scanners](detection.md#scanners-we-do-not-counter-scan)), cluster members'
 addresses, this node's own addresses (with `scan.own_addresses`, e.g. its
 public address behind 1:1 NAT) and `scan.never_scan`. For nginx:
 
@@ -373,7 +377,8 @@ Databases created before that feature hand pages back only after a one-time
 (needs free disk space of about the database's size). Everything is kept by
 default; `retention_days = N` (top level, at least 7) keeps only the last N
 days on this node: a standalone node deletes older requests and scan results,
-a cluster node drops its old copies and history (see docs/cluster.md).
+a cluster node drops its old copies and history (see
+[Retention windows](protocol.md#retention-windows)).
 
 Never delete rows in the database by hand; delete in the admin area or set
 `retention_days`. A cluster node keeps its own requests, fingerprints and
@@ -385,10 +390,10 @@ records everywhere, and new members sync past them.
 
 ### Public pages are delayed
 
-The wall, the IP directory, IP pages, `/api/stats`, `/api/map` and
+The public dashboard, the IP directory, IP pages, `/api/stats`, `/api/map` and
 `/api/blocklist` show a request only after `[public] delay_minutes` plus
 a random 0 to `jitter_minutes` (5 + 0–5 min by default), counted from when
-this node stored it. Someone probing an address and watching the wall can't
+this node stored it. Someone probing an address and watching the dashboard can't
 tell from the timing whether it was one of yours. Signed-in admins see
 everything at once; the live feed is on the admin Overview. A changed delay
 applies to requests stored after the restart. Setting both to 0 publishes
@@ -407,6 +412,81 @@ Both hold a connection open and take a place from a pool, in `[trap]`:
 
 A full pool answers with the trap 404. The AI decoy routes (MCP, LLM
 gateway) skip the tarpit.
+
+## Cluster administration
+
+The installer writes a `[cluster]` section on every node (see
+[`deploy/config.example.toml`](../deploy/config.example.toml)): a name, the
+listener and the `advertise` address other members dial, whose port must be
+reachable from the internet. A node without an invite runs alone until it
+joins; a running node picks a join up without a restart.
+
+```sh
+peephole cluster id                       # this node's key
+peephole cluster invite --label friends   # on a member: a reusable invite (a week, 10 uses)
+peephole cluster invites                  # list them; invite-revoke <id> closes one
+peephole cluster join <token>             # on the new node; or Admin → Cluster
+peephole cluster members                  # who is in, and their standing
+peephole cluster agreement <node>         # its requests our rules classify differently
+peephole cluster block <node>             # this node ignores a peer (unblock undoes it)
+peephole cluster block --subtree <node>   # ... and every node it admitted, transitively
+peephole cluster purge <node>             # delete a blocked peer's data here, stop relaying it
+peephole cluster leave                    # this node leaves; it keeps its data
+peephole owner new                        # an ownership key for your nodes; this node keeps it
+peephole owner claim                      # on each other node of yours: reads the key from standard input (alias: adopt)
+peephole owner show                       # this node's owner and the nodes that share it
+peephole owner forget-key [--force]       # this node no longer keeps the key; it stays owned
+peephole owner release                    # this node has no owner afterwards
+peephole credits                          # this node's credits, by day
+peephole credits log [--days N]           # earned, spent, sent, received (up to 7 days)
+peephole credits members                  # every member's balance and whether it earns here
+peephole credits uptime                  # members' reported hours up, 7 days
+peephole credits send <node> <amount>     # send credits to a member
+```
+
+`peephole cluster join <token>` or Admin → Cluster joins with an invite
+from any member. How membership, invites and blocking work:
+[Membership and trust](protocol.md#membership-and-trust). What the credits
+commands count: [Credits](protocol.md#credits).
+
+**Clocks.** Run NTP on every node: cooldowns and the 30-day prune compare
+timestamps written by different nodes, and entries dated more than 5
+minutes ahead of a node's clock wait there until it catches up. The Members
+table's Issues column flags clock differences.
+
+**Outbound-only.** For a node nobody can reach (no public address, no port
+forwarding): delete `advertise` and set `listen` to loopback
+(`127.0.0.1:7443`) in `[cluster]`, then restart peephole. What such a node
+can and cannot do: [Relays and outbound-only nodes](protocol.md#relays-and-outbound-only-nodes).
+
+**Ownership.** To manage several of your own nodes together:
+
+1. On your first node, create the key: `peephole owner new`, or Cluster ›
+   Ownership › "Your first node?". The key is shown once. That node keeps
+   it, which makes it a managing node.
+2. On each other node of yours, claim it there: `peephole owner claim`
+   (reads the key from standard input, so it stays out of the shell
+   history), or Cluster › Ownership › "Already have a key?". A node cannot
+   be claimed from another one: whoever claims it needs its admin site or
+   shell. Pass `--keep` (or tick "Also manage my other nodes from here") to
+   make it a managing node too.
+3. From a managing node, change a sibling's scan workers and roles, block,
+   unblock and purge peers there, revoke its invites, have it leave, or
+   release it. Each node lists the commands it received under Cluster ›
+   Ownership.
+4. If the key leaks, rotate it on a managing node (Cluster › Ownership).
+   `peephole owner forget-key` makes a node stop keeping the key (it stays
+   owned); `peephole owner release` leaves it without an owner.
+
+What the key can and cannot do, rotation in detail and what relaying
+members see: [Ownership](protocol.md#ownership).
+
+**Logs.** In the journal (`journalctl -u peephole`), each peer that exchanged
+anything gets one `cluster traffic in the last minute` line: sync rounds
+(and how many failed), entries received and applied, entries sent, each
+by kind (`12 (request 10, scan_job 2)`). Peers becoming reachable or
+unreachable are logged as they happen. `RUST_LOG=peephole=debug` (in a
+drop-in, `systemctl edit peephole`) adds a line per sync round.
 
 ## Building and releases
 
@@ -430,48 +510,3 @@ whose files are replaced in place. Pushing a tag `v<version>` publishes an
 immutable release the same way; the tag must equal the `version` in
 `Cargo.toml` (`v0.1.0` for `0.1.0`), which CI checks. Verify a download with
 `gh attestation verify <tarball> --repo overcuriousity/peephole`.
-
-## Classification taxonomy
-
-Rules live in `rules/*.toml` (built into the binary), one file per family; each rule has a weight,
-a label and an `owasp` tag. The weight (1–4) is the request's severity and
-drives the counter-scan level:
-
-| Weight | Meaning | Labels |
-|---|---|---|
-| 1 | single weak tell | `probe` (behavioural floor), `php-probe` |
-| 2 | automated reconnaissance | `scanner-ua`, `research-scanner`, `sensitive-path`, `path-scanner`, `ai-infra-probe`, `api-recon`, `proxy-probe`, `unusual-method`, `automation` |
-| 3 | exploit-adjacent | `form-interaction`, `write-method`, `xss`, `crlf-injection`, `webshell-probe`, `app-probe`, `cloud-infra-probe`, `credential-attack`, `mcp-probe`, `graphql-introspection`, `appliance-probe`, `iot-probe`, `inhuman-behavior` |
-| 4 | unambiguous exploit / post-exploitation | `sqli`, `rce`, `path-traversal`, `ssrf`, `ssti`, `nosqli`, `xxe`, `deserialization`, `webshell`, `mcp-abuse` |
-
-The counter-scan level is the weight, with one cap: a request whose labels
-only say someone looked (`probe`, `path-scanner`, `php-probe`) earns at
-most a level-1 scan, whatever its severity — a lone drive-by probe does
-not warrant a top-1000-port scan. Anything more specific scans at the
-weight, capped at 4. `severity` itself is not capped: it records what was
-seen.
-
-The `owasp` tag is a Top-10 2021 class (`A03:2021`) for payload families or
-an Automated Threat (`OAT-014`) for scanning behaviour. Tags are stored on
-the request row (`owasp_json`), shown as badges next to the labels in the
-web UI, and included in exports. A typo'd tag fails the build's tests.
-Behavioural labels (`probe`, `path-scanner`, `form-interaction`, …) come
-from code, not rule files, and carry no tag.
-
-Label badge colours follow the family: blue = reconnaissance (any
-`*-probe` label, plus `scanner-ua`/`research-scanner`/`path-scanner`/
-`api-recon`/`graphql-introspection`), green = exposure (`sensitive-path`:
-secrets, config, repos, dumps, admin and debug pages), red = injection,
-violet = execution/impact, orange = interaction, solid = post-exploitation,
-grey = automation tells (including `proxy-probe`), neutral accent =
-everything else. New labels need no UI work: a `something-probe` label is
-blue automatically, everything unknown is neutral.
-
-The wall's "What they were after" counts each request once per family it
-touched. `path-scanner` and `php-probe` say how a request came, not what
-it was after, so they count (as reconnaissance) only when no other label
-names a family; "other" likewise only when nothing else applies.
-
-Weight rationale when adding rules: would you counter-scan a source that
-did *only* this? Recon gets 2, anything that touches an exploit gets 4
-only when the payload itself is unambiguous.
