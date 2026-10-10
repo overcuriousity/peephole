@@ -16,7 +16,7 @@ one UI label.
 - **Positioning:** cooperative network first. The single-node honeypot is the
   entry point, not the headline.
 - **Tagline:** *A cooperative honeypot network that no member has to trust.*
-- **Logo:** unchanged (the bloodshot eye stays; a redesign is out of scope).
+- **Logo:** replaced; see "Logo" below.
 - **Counter-scanning:** one capability among several, stated soberly with its
   safeguards: bystanders are never scanned, levels escalate by scope and
   never by aggressiveness, the scanner role is opt-in. The legal and
@@ -32,6 +32,37 @@ one UI label.
   protocol readers and contributors, dataset consumers, running operators.
 - **Tone:** sober and factual, in the existing house style: short
   declarative sentences, no marketing vocabulary, examples given as commands.
+
+## Logo
+
+Concept "A1, door viewer ring" replaces the bloodshot eye in
+`assets/logo.svg`. It is a door peephole seen head-on, with three member
+nodes on its ring.
+
+**Geometry** (`viewBox="0 0 64 64"`, no background tile):
+- The ring: a circle at (32, 32) with radius 22 and stroke width 6.
+- The lens: a circle with radius 13, filled with the ink colour at opacity 0.14.
+- The pupil: a circle with radius 7, in brand red `#b30000`.
+- Three hollow member nodes, each with radius 5 and stroke width 3, at
+  (32, 10), (51, 43) and (13, 43).
+
+**Hollow nodes are truly transparent.** A mask cuts the ring away under each
+node, instead of painting the node with a fill that copies the background.
+That way the mark sits cleanly on any background, including GitHub's and the
+browser's.
+
+**Theming:** a single file. A `<style>` inside the SVG sets the ink colour to
+`#1f2024`, and to `#e8e6df` under `@media (prefers-color-scheme: dark)`. This
+follows the operating system's theme, not the in-app theme toggle, which an
+`<img>` or favicon cannot see; that is acceptable.
+
+**Known trade-off:** at 16 px the nodes blend into the ring, so the favicon
+reads as a ring with a red pupil. That was accepted when A1 was chosen.
+
+**Where it is used:** the same file serves as the favicon (`layout.html`), the
+login image (`login.html`) and the README header. It stays embedded via
+`src/admin/assets.rs`. The README alt text changes to "peephole logo: a door
+peephole whose ring carries three member nodes".
 
 ## Pitch paragraph (README, under the tagline)
 
@@ -72,8 +103,8 @@ remaining docs for links or mentions of either file, and repoint each one
 (e.g. `src/scan/crawler.rs` likely refers to `scanners.md`).
 
 Out of scope and untouched: `docs/superpowers/`, existing CHANGELOG entries,
-`deploy/config.example.toml` content (only links in it may be repointed), and
-the logo.
+and `deploy/config.example.toml` content (only links in it may be
+repointed).
 
 ## Accuracy rules
 
@@ -93,8 +124,9 @@ the logo.
 - Commits, in order:
   1. The UI label change, with its comments and a CHANGELOG entry under
      Unreleased → Changed.
-  2. One commit per new or rewritten page.
-  3. Deleting `cluster.md` and `scanners.md`, and repointing every link to
+  2. The new logo (`assets/logo.svg`), with a CHANGELOG entry.
+  3. One commit per new or rewritten page.
+  4. Deleting `cluster.md` and `scanners.md`, and repointing every link to
      them.
 - One PR. I watch CI myself, fix every review finding (minor ones included)
   before merging, and merge only when CI is green.
@@ -106,6 +138,9 @@ the logo.
 - `grep -rni` finds no `cluster.md`, `scanners.md` or "wall of shame" outside
   `docs/superpowers/` and earlier CHANGELOG entries.
 - `cargo test` passes.
+- The new logo is rendered to PNG at 16, 32 and 160 px on a light and a dark
+  background (with `rsvg-convert`, or headless Chromium if that is missing)
+  and the images are looked at.
 - Every inventory item is ticked: placed on a page, or on the cut list.
 - A newcomer read of the README: the first screen answers what this is, why
   you would run it, and what it costs or risks.
