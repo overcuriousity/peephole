@@ -344,9 +344,11 @@ A job this device queued. Any other id, another device's included, is
 }
 ```
 
-- `scan`: `status` is `queued`, `running`, `done` or `failed`. `result` is
-  `null` until the scan lands, then the shape of `scans[]` in
-  `GET /api/v1/ips/{addr}`.
+- `scan`: `status` is `queued`, `running`, `done` or `failed`. A job the
+  queue gave up on (`superseded` by another, `refused`, or withdrawn because
+  its audit entry could not be written) reports `failed`. `result` is
+  `null` until the scan lands, then the shape of
+  `scans[]` in `GET /api/v1/ips/{addr}`.
 - `probe`: `status` is `running` while a vantage is queued or running,
   then `done`. `result` is `{ "vantages": [{ "node", "name", "state",
   "why", "rtt_ms", "ports": [{ "port", "protocol", "outcome", "detail" }] }] }`;

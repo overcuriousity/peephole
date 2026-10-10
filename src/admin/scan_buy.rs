@@ -229,16 +229,23 @@ pub async fn sale(
 }
 
 /// Queue a marked level-`level` job for `ip_id` and tell the queue view.
-/// Its id; None when the queue did not take it.
-pub async fn enqueue(state: &AdminState, ip_id: i64, level: u8) -> anyhow::Result<Option<i64>> {
+/// Its id; otherwise why not: [`NotSold::OnItsWay`] when a job of the
+/// level got there first (the check of [`sale`] again, under the queue's
+/// lock), None when the queue did not take it for another reason.
+pub async fn enqueue(
+    state: &AdminState,
+    ip_id: i64,
+    level: u8,
+) -> anyhow::Result<Result<i64, Option<NotSold>>> {
     match state.recorder.enqueue_manual(ip_id, level).await? {
         EnqueueOutcome::Queued(id) => {
             if let Ok(Some(job)) = state.store.queue_job(id).await {
                 state.notifier.publish(job);
             }
-            Ok(Some(id))
+            Ok(Ok(id))
         }
-        _ => Ok(None),
+        EnqueueOutcome::OnItsWay(status) => Ok(Err(Some(NotSold::OnItsWay(status)))),
+        _ => Ok(Err(None)),
     }
 }
 
@@ -293,11 +300,15 @@ async fn buy(
         Ok(_) => {}
     }
     match enqueue(&state, row.id, level).await? {
-        Some(_) => Ok(redirect_with_notice(
+        Ok(_) => Ok(redirect_with_notice(
             &back,
             &format!("Level {level} scan queued; the result appears below when it is in."),
         )),
-        None => Ok(redirect_with_error(
+        Err(Some(NotSold::OnItsWay(_))) => Ok(redirect_with_notice(
+            &back,
+            &format!("A level {level} scan of this address is already on its way."),
+        )),
+        Err(_) => Ok(redirect_with_error(
             &back,
             "No scan: the job was not queued.",
         )),
