@@ -152,6 +152,14 @@ honeypot.
 - **Queue a counter-scan or block from the Lookup page.** S–M, low. The
   probe and vantage actions exist; the manual scan queue and the block
   action do not yet.
+- **Name lookups over `/api/v1`.** S, high for the Android app.
+  `/admin/lookup` already resolves a hostname with several nodes;
+  `/api/v1/lookup` takes IPs only. It should accept names, and URLs
+  reduced to their host, through the same code. That is the server half of
+  item 1 in the [app roadmap](https://github.com/overcuriousity/peephole-android/blob/main/docs/roadmap.md).
+- **Cluster log polish.** S–M, low. The owner found the cluster log
+  "a bit un-polished" (feedback on the Android app, 2026-10-10). The admin
+  cluster pages get a UX pass first, then the fixes.
 
 ## Not planned
 
