@@ -1,74 +1,28 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="512" height="512">
   <title>peephole</title>
+  <style>
+    .ink { fill: #1f2024 }
+    .line { stroke: #1f2024 }
+    @media (prefers-color-scheme: dark) {
+      .ink { fill: #e8e6df }
+      .line { stroke: #e8e6df }
+    }
+  </style>
   <defs>
-    <!-- sickly, irritated eyeball: yellowed white, inflamed toward the corners -->
-    <radialGradient id="sclera" cx="62%" cy="48%" r="70%">
-      <stop offset="0" stop-color="#f4ead0"/>
-      <stop offset="0.55" stop-color="#ead7b0"/>
-      <stop offset="0.85" stop-color="#e2a48c"/>
-      <stop offset="1" stop-color="#c8544a"/>
-    </radialGradient>
-    <radialGradient id="iris" cx="45%" cy="45%" r="60%">
-      <stop offset="0" stop-color="#8a6a1e"/>
-      <stop offset="0.7" stop-color="#4f3a10"/>
-      <stop offset="1" stop-color="#22180a"/>
-    </radialGradient>
-    <radialGradient id="dark" cx="50%" cy="50%" r="50%">
-      <stop offset="0.55" stop-color="#2a1210"/>
-      <stop offset="1" stop-color="#0b0606"/>
-    </radialGradient>
-    <radialGradient id="skin" cx="50%" cy="50%" r="50%">
-      <stop offset="0.6" stop-color="#5a2a22"/>
-      <stop offset="0.85" stop-color="#3a1814"/>
-      <stop offset="1" stop-color="#3a1814" stop-opacity="0"/>
-    </radialGradient>
-    <!-- the lid opening, squeezed against the hole -->
-    <clipPath id="lids">
-      <path d="M108 262 C 170 172, 352 160, 418 244 C 360 334, 178 346, 108 262 Z"/>
-    </clipPath>
-    <clipPath id="hole">
-      <path id="holepath" d="M262 52 L296 104 L352 78 L362 138 L424 132 L408 190 L466 218 L428 262 L470 312 L410 330 L420 392 L358 384 L338 446 L290 410 L246 458 L218 404 L156 426 L158 364 L94 356 L118 300 L50 268 L104 228 L64 172 L132 166 L124 104 L188 120 L204 62 Z"/>
-    </clipPath>
+    <!-- cut the ring away under each member node, so the nodes stay hollow on any background -->
+    <mask id="gaps" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+      <rect width="64" height="64" fill="#fff"/>
+      <circle cx="32" cy="10" r="5" fill="#000"/>
+      <circle cx="51" cy="43" r="5" fill="#000"/>
+      <circle cx="13" cy="43" r="5" fill="#000"/>
+    </mask>
   </defs>
-
-  <!-- dirty plaster wall -->
-  <rect width="512" height="512" rx="48" fill="#cfc4ae"/>
-  <path d="M0 96 L70 120 L60 150 M512 410 L440 396 L452 440 M380 0 L372 40 L396 58" fill="none" stroke="#a89a80" stroke-width="5" stroke-linecap="round"/>
-
-  <!-- broken edge of the hole, then its dark inside -->
-  <use href="#holepath" fill="#7a6a54" transform="translate(256 256) scale(1.06) translate(-256 -256)"/>
-  <use href="#holepath" fill="url(#dark)"/>
-
-  <g clip-path="url(#hole)">
-    <!-- swollen, bruised skin around the eye -->
-    <ellipse cx="262" cy="258" rx="205" ry="138" fill="url(#skin)"/>
-    <ellipse cx="262" cy="306" rx="150" ry="52" fill="#4a1e1a" opacity="0.8"/>
-    <!-- red, raw lid rim -->
-    <path d="M100 262 C 168 160, 360 148, 428 244 C 364 346, 172 356, 100 262 Z" fill="#a8322a"/>
-
-    <g clip-path="url(#lids)">
-      <rect x="90" y="140" width="350" height="230" fill="url(#sclera)"/>
-      <!-- veins crawling in from the corners toward the iris -->
-      <g fill="none" stroke="#b0141c" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M110 262 C 150 250, 180 236, 214 236 C 236 236, 252 228, 268 222" stroke-width="7"/>
-        <path d="M150 248 C 162 226, 186 214, 206 200" stroke-width="4"/>
-        <path d="M176 238 C 190 246, 206 262, 230 266" stroke-width="3.5"/>
-        <path d="M112 272 C 152 284, 186 300, 222 300 C 240 300, 252 292, 270 286" stroke-width="6"/>
-        <path d="M168 290 C 176 312, 196 322, 214 330" stroke-width="3.5"/>
-        <path d="M200 300 C 206 286, 222 276, 238 278" stroke-width="2.5"/>
-        <path d="M130 258 C 150 270, 156 282, 160 296" stroke-width="2.5"/>
-        <path d="M228 206 C 238 216, 252 214, 262 206" stroke-width="2.5"/>
-        <path d="M414 248 C 400 240, 388 230, 382 214" stroke-width="5"/>
-        <path d="M410 260 C 398 276, 392 292, 380 304" stroke-width="4"/>
-        <path d="M394 236 C 404 222, 404 210, 398 198" stroke-width="2.5"/>
-      </g>
-      <!-- iris strained hard toward the hole's edge, pupil blown wide -->
-      <circle cx="334" cy="250" r="66" fill="url(#iris)"/>
-      <circle cx="334" cy="250" r="66" fill="none" stroke="#120c06" stroke-width="6"/>
-      <circle cx="334" cy="250" r="36" fill="#050303"/>
-      <circle cx="316" cy="230" r="10" fill="#fffaf0" opacity="0.9"/>
-      <!-- the upper lid's shadow on the eyeball -->
-      <path d="M90 230 C 170 170, 350 160, 440 220 L440 140 L90 140 Z" fill="#3a1410" opacity="0.35"/>
-    </g>
-  </g>
+  <!-- the door viewer: ring, lens, pupil -->
+  <circle class="line" cx="32" cy="32" r="22" fill="none" stroke-width="6" mask="url(#gaps)"/>
+  <circle class="ink" cx="32" cy="32" r="13" opacity="0.14"/>
+  <circle cx="32" cy="32" r="7" fill="#b30000"/>
+  <!-- three cluster members on the ring -->
+  <circle class="line" cx="32" cy="10" r="5" fill="none" stroke-width="3"/>
+  <circle class="line" cx="51" cy="43" r="5" fill="none" stroke-width="3"/>
+  <circle class="line" cx="13" cy="43" r="5" fill="none" stroke-width="3"/>
 </svg>
