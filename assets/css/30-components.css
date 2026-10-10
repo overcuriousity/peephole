@@ -216,6 +216,40 @@ a.tile .hint { color: var(--color-accent); }
 .spin { display: inline-block; width: 0.75em; height: 0.75em; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; flex: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spin { animation-duration: 2.4s; } }
-.probe-member { display: grid; gap: 0.75rem; margin-bottom: 1rem; }
-.probe-member .intel h4 { margin: 0 0 0.5rem; font-size: var(--text-sm); }
-tr.diff td, p.diff { background: var(--color-warning-dim); }
+.probe-group + .probe-group { margin-top: 1.5rem; padding-top: 1.25rem; border-top: 1px solid var(--color-border); }
+.probe-group-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 0.6rem; margin-bottom: 0.25rem; }
+.probe-group-head h3 { margin: 0; font-size: var(--text-md); }
+.probe-group-head .badge { align-self: center; }
+.probe-group-count { margin-left: auto; }
+.probe-label { margin: 1.1rem 0 0.5rem; font-size: var(--text-xs); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-fg-secondary); }
+.probe-label .muted { margin-left: 0.4rem; text-transform: none; letter-spacing: 0; font-weight: 400; }
+.callout { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.15rem 0.6rem; margin: 0 0 0.6rem; padding: 0.55rem 0.85rem; border: 1px solid var(--color-border-subtle); border-left-width: 3px; border-radius: var(--radius-md); background: var(--color-bg-surface); font-size: var(--text-sm); }
+.callout b::first-letter { text-transform: uppercase; }
+.callout .muted { font-size: var(--text-xs); }
+.callout-warning { border-left-color: var(--color-warning); background: var(--color-warning-dim); }
+.callout-warning b { color: var(--color-warning); }
+.callout-ok { border-left-color: var(--color-success); background: var(--color-success-dim); }
+.callout-ok b { color: var(--color-success); font-weight: 500; }
+tr.diff td { background: var(--color-warning-dim); }
+tr.diff td:first-child { box-shadow: inset 3px 0 0 var(--color-warning); }
+.probe-diff td.mono { overflow-wrap: anywhere; min-width: 8rem; }
+.probe-diff td:nth-child(-n+2) { white-space: nowrap; }
+.probe-diff td.odd { color: var(--color-warning); font-weight: 600; }
+.probe-verdicts td.num, .probe-verdicts th.num, .probe-diff td.num, .probe-diff th.num { white-space: nowrap; }
+.verdict { display: inline-block; padding: 0.05rem 0.45rem; border-radius: 999px; font-size: var(--text-xs); font-weight: 500; white-space: nowrap; background: var(--color-bg-active); color: var(--color-fg-secondary); cursor: help; }
+.verdict[data-verdict="impossible"] { background: var(--color-warning-dim); color: var(--color-warning); box-shadow: inset 0 0 0 1px var(--color-warning); }
+.verdict[data-verdict="not contradicted"] { background: var(--color-success-dim); color: var(--color-success); }
+.probe-more { margin: 0.5rem 0 0; }
+.probe-more > summary { cursor: pointer; width: fit-content; color: var(--color-fg-secondary); font-size: var(--text-xs); font-weight: 500; }
+.probe-more > summary:hover { color: var(--color-accent); }
+.probe-more[open] > summary { margin-bottom: 0.5rem; }
+.probe-members { list-style: none; margin: 0; padding: 0; border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-bg-inset); }
+.probe-member { padding: 0.6rem 0.9rem; }
+.probe-member + .probe-member { border-top: 1px solid var(--color-border-subtle); }
+.probe-member-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.5rem; font-size: var(--text-sm); }
+.probe-meta { display: inline-flex; flex-wrap: wrap; gap: 0.25rem 0.9rem; margin-left: auto; color: var(--color-fg-secondary); font-size: var(--text-xs); }
+.probe-meta .mono { color: var(--color-fg-primary); }
+.probe-member .probe-more { margin-top: 0.35rem; }
+.probe-ports { display: grid; grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr)); gap: 0.6rem; }
+.probe-ports .intel { margin: 0; background: var(--color-bg-elevated); }
+.probe-ports .intel h4 { display: flex; align-items: center; gap: 0.5rem; margin: 0 0 0.5rem; font-size: var(--text-sm); }
