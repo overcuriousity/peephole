@@ -306,7 +306,7 @@ pub struct Roles {
     /// nmap workers that run counter-scans.
     #[serde(default = "default_true")]
     pub scanner: bool,
-    /// Public wall of shame and the FIDO2 admin area.
+    /// Public dashboard and the FIDO2 admin area.
     #[serde(default = "default_true")]
     pub web: bool,
 }

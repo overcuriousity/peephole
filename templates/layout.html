@@ -18,7 +18,7 @@
   <div class="topbar-row">
     <a class="brand" href="/"><img src="/assets/logo.svg?v={{ chrome.stamp }}" alt=""><span>peephole</span></a>
     <nav class="nav" aria-label="Primary">
-      <a href="/"{% if chrome.active == "wall" %} aria-current="page"{% endif %}>Wall</a>
+      <a href="/"{% if chrome.active == "wall" %} aria-current="page"{% endif %}>Dashboard</a>
       <a href="/ips"{% if chrome.active == "ips" %} aria-current="page"{% endif %}>IPs</a>
       {% if chrome.authed %}<a href="/requests"{% if chrome.active == "requests" %} aria-current="page"{% endif %}>Requests</a>{% endif %}
       {% if chrome.authed %}<a href="/admin"{% if chrome.active == "admin" %} aria-current="page"{% endif %}>Admin</a>{% endif %}

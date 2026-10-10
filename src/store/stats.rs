@@ -1,4 +1,4 @@
-//! Aggregates for the public wall of shame, per time range, plus a short
+//! Aggregates for the public dashboard, per time range, plus a short
 //! TTL cache so anonymous traffic cannot hammer SQLite.
 use super::Store;
 use super::browse::Audience;
