@@ -24,10 +24,10 @@ chars), and only their SHA-256 is stored. Each token carries scopes:
 | scope  | meaning                                          |
 | ------ | ------------------------------------------------ |
 | `read` | every `GET` under `/api/v1`, `POST /api/v1/lookup` |
-| `act`  | reserved for act endpoints (not in v1)           |
+| `act`  | start probes, buy counter-scans, read their jobs (spends credits) |
 
-`read` is always granted at pairing; `act` is optional and has no effect in
-v1 (no endpoint requires it yet). A missing or wrong scope is `403`.
+`read` is always granted at pairing; `act` is optional (a checkbox on the
+pairing form). A missing or wrong scope is `403`.
 
 ### Pairing
 
@@ -101,7 +101,9 @@ Every non-2xx response is JSON:
 | 400    | `invalid`      | malformed body, bad address, bad cursor, bad limit |
 | 401    | `unauthorized` | no/expired/revoked token, dead pairing code       |
 | 403    | `forbidden`    | token lacks the required scope                    |
-| 404    | `not_found`    | address not in the dataset, unknown `/api/v1` path |
+| 404    | `not_found`    | address not in the dataset, unknown `/api/v1` path, a job not this device's |
+| 409    | see below      | a scan is not sold, or a quote cannot be spent    |
+| 422    | `refused`      | the probe gate refuses the address (reason in `message`) |
 | 429    | `rate_limited` | per-IP limit hit (`Retry-After` header is set)    |
 | 500    | `internal`     | storage failure; message is generic, never a leak |
 
@@ -109,7 +111,8 @@ Secrets (tokens, codes) never appear in error bodies or logs.
 
 ## Endpoints
 
-All require `Authorization: Bearer <token>` with scope `read`.
+All require `Authorization: Bearer <token>` with scope `read`; the
+[act endpoints](#act-endpoints) need `act` too.
 
 ### `GET /api/v1/ips?q=&cursor=&limit=`
 
@@ -231,6 +234,128 @@ credits are spent.
   that are neither an address nor a network; `capped` — more than 500
   stored rows matched, the list is truncated.
 
+## Act endpoints
+
+Probes and paid counter-scans, the same actions as the Actions card on the
+admin IP page, and with the same checks (target rules, probes off, live
+scanners, scan budget, a fresh or queued scan of the level): both run the
+shared code in `admin::probes::start` and `admin::scan_buy::sale`. Every
+endpoint here needs scope `act`; a `read`-only token is `403`. They sit
+under the per-client rate limit of all `/api/*` paths (`429` past it).
+
+Credits are given twice: as a decimal string in credits, as the admin UI
+prints them (`"1.28"`, `"0.00"` standalone, where nothing costs anything),
+and as integer millicredits (`*_mc`).
+
+Every call that queues something writes an audit entry: when, the device
+(id and name), who paired it, the action, the target, the credits and the
+job id. Admins see the newest 50 under **Recent actions** on
+Admin → Devices.
+
+### `POST /api/v1/ips/{addr}/probe`
+
+Body (optional): `{ "vantages": ["<node id>", …] }`. Without it, the
+default pick of the Actions card. Ids that are not live scanners are
+ignored; none left is `422`. Standalone the node probes itself and
+`vantages` is ignored.
+
+`202`:
+
+```json
+{
+  "job_id": "p_…",
+  "credits": "0.30",
+  "credits_mc": 300,
+  "vantages": [{ "id": "…", "name": "fra-1", "country": "DE", "credits_mc": 100 }]
+}
+```
+
+`credits` is the sum of the asked scanners' probe prices (what the card
+offers); a vantage that declines or lapses is not charged. `404` when the
+address is not in the dataset; `422 refused` when the gate refuses it.
+
+### `GET /api/v1/ips/{addr}/scan/quote?level=1..5`
+
+`200`:
+
+```json
+{
+  "quote_id": "q_…",
+  "credits": "1.28",
+  "credits_mc": 1280,
+  "credits_max": "2.56",
+  "credits_max_mc": 2560,
+  "expires_at": "2026-10-10T16:05:00Z",
+  "offer": { "level": 3, "about": "top 1000 ports, versions, OS, traceroute, safe scripts" }
+}
+```
+
+- The quote is bound to the device, the address, the level and
+  `credits_mc`. It lives 2 minutes and is spent once.
+- `credits` is the floor: the cheapest live scanner's price × 4^(level-1),
+  the "from X credits" of the Actions card and what the scan budget must
+  cover. The arbiter pays whichever scanner wins the job, so the charge
+  lies between `credits` and `credits_max` (the dearest live scanner's
+  price × the same factor). Show the range.
+- A bad `level` is `400`.
+
+When there is nothing to buy, `409` and no quote, with one of these codes:
+
+| code         | when                                                      |
+| ------------ | --------------------------------------------------------- |
+| `fresh`      | a scan of this level under 24 h old; the error carries `scan_id` and `scanned_at` |
+| `on_its_way` | a job of this level is queued or running (`status`)       |
+| `no_price`   | no live scanner announces a price                         |
+| `no_budget`  | the scan budget does not cover the floor                  |
+
+### `POST /api/v1/ips/{addr}/scan`
+
+Body: `{ "quote_id": "q_…" }`. The quote is spent first (atomically,
+once), then the checks of the quote run again.
+
+`202`: `{ "job_id": "s_…", "credits": "1.28", "credits_mc": 1280 }`
+
+Each of these is `409` and **queues nothing and charges nothing** (a scan
+is charged when a scanner runs its job):
+
+| code             | when                                                     |
+| ---------------- | -------------------------------------------------------- |
+| `quote_invalid`  | unknown, another device's, expired or already spent      |
+| `quote_mismatch` | the quote is for another address                         |
+| `price_changed`  | the floor moved since the quote: get a new one           |
+| `fresh`, `on_its_way`, `no_price`, `no_budget` | as for the quote, now  |
+| `not_queued`     | the scan queue did not take the job (a queue budget)     |
+
+### `GET /api/v1/jobs/{job_id}`
+
+A job this device queued. Any other id, another device's included, is
+`404`. Poll with backoff (2 s or more); there is no push in v1.
+
+`200`:
+
+```json
+{
+  "job_id": "s_42",
+  "kind": "scan",
+  "ip": "203.0.113.9",
+  "status": "done",
+  "created_at": "2026-10-10T16:03:12Z",
+  "result": { "scanned_at": "…", "ports": [{ "port": 22, "service": "ssh", "product": "OpenSSH" }] }
+}
+```
+
+- `scan`: `status` is `queued`, `running`, `done` or `failed`. `result` is
+  `null` until the scan lands, then the shape of `scans[]` in
+  `GET /api/v1/ips/{addr}`.
+- `probe`: `status` is `running` while a vantage is queued or running,
+  then `done`. `result` is `{ "vantages": [{ "node", "name", "state",
+  "why", "rtt_ms", "ports": [{ "port", "protocol", "outcome", "detail" }] }] }`;
+  `state` is `queued`, `running`, `done`, `declined` (with `why`) or
+  `lapsed` (no result in 15 minutes, nothing charged). `node` is the
+  scanner's id, empty standalone. Requests the node has not heard back on
+  are kept in memory: after a restart, a vantage shows once its result
+  arrives.
+
 ## Security notes (for reviewers)
 
 - Pairing codes: 192-bit random, SHA-256 at rest, 5-minute TTL, single-use
@@ -243,5 +368,10 @@ credits are spent.
   tests.
 - `/api/v1/pair` is anonymous by design (the code is the credential) and is
   rate-limited per client IP like the login endpoints.
+- Act endpoints: the `act` scope is checked in the extractor before any
+  handler runs. A scan is bought only with a quote of the same device,
+  spent by one `DELETE … RETURNING`, so a quote cannot be replayed or
+  used by a second device. The audit log copies the device's name and
+  pairing admin, so entries stay as they were after a revocation.
 - CSP is unchanged: the QR is rendered server-side as inline SVG in the
   pairing page (`img-src 'self' data:` already permits it), no new JS.

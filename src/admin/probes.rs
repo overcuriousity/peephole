@@ -656,9 +656,112 @@ fn settle(state: &AdminState, group: &str, node: NodeId, outcome: Result<String,
     }
 }
 
+/// A probe request under way: its group uid and the scanners asked (none
+/// standalone, where this node runs it).
+pub struct Started {
+    pub group: String,
+    pub asked: Vec<VantageView>,
+}
+
+/// Start a probe of `ip` (in the dataset as `ip_id`): in a cluster, ask
+/// the `picked` live scanners (None: the Actions card's default pick);
+/// standalone, run it here. The gate is this node's, as the Actions card
+/// judges it. Err: why not. Nothing waits for a probe.
+pub async fn start(
+    state: &Arc<AdminState>,
+    ip: IpAddr,
+    ip_id: i64,
+    picked: Option<&[String]>,
+) -> Result<Started, String> {
+    let node = state.recorder.node().cloned();
+    if let Err(why) = guard_line(state, &ip).await
+        && (node.is_none() || !this_node_only(&why))
+    {
+        return Err(why);
+    }
+    let group = new_uid();
+    let pending = |node, name: String, price_mc, outcome| Pending {
+        ip_id,
+        node,
+        name,
+        at: Instant::now(),
+        asked_at: now_ts(),
+        price_mc,
+        outcome,
+    };
+    let remember = |list: Vec<Pending>| {
+        let mut map = state.pending_probes.lock().unwrap();
+        map.retain(|_, l| l.iter().any(|p| p.at.elapsed() < FORGET_AFTER));
+        map.insert(group.clone(), list);
+    };
+    let Some(node) = node else {
+        let Some(prober) = state.prober.clone() else {
+            return Err("this node does not probe".into());
+        };
+        remember(vec![pending(
+            LOCAL,
+            "this node".into(),
+            0,
+            Some(Ok(String::new())),
+        )]);
+        let st = state.clone();
+        let g = group.clone();
+        tokio::spawn(async move {
+            if let Err(why) = prober.run_local(&st.store, ip, &g).await {
+                settle(&st, &g, LOCAL, Err(why));
+            }
+        });
+        return Ok(Started {
+            group,
+            asked: vec![],
+        });
+    };
+    let all = ask::vantages(&node, &state.geo);
+    let default;
+    let picked: Vec<String> = match picked {
+        Some(p) => p.to_vec(),
+        None => {
+            default = ask::default_pick(&all, DEFAULT_VANTAGES);
+            default.iter().map(NodeId::to_string).collect()
+        }
+    };
+    let chosen: Vec<&ask::Vantage> = all
+        .iter()
+        .filter(|v| picked.iter().any(|f| *f == v.node.to_string()))
+        .collect();
+    if chosen.is_empty() {
+        return Err("pick at least one live scanner".into());
+    }
+    remember(
+        chosen
+            .iter()
+            .map(|v| pending(v.node, v.name.clone(), v.price_mc, None))
+            .collect(),
+    );
+    let asked = chosen
+        .iter()
+        .map(|v| VantageView {
+            id: v.node.to_string(),
+            name: v.name.clone(),
+            country: v.country.clone(),
+            price: crate::credits::show(v.price_mc as u64),
+            price_mc: v.price_mc,
+        })
+        .collect();
+    let ids: Vec<NodeId> = chosen.iter().map(|v| v.node).collect();
+    let st = state.clone();
+    let g = group.clone();
+    tokio::spawn(async move {
+        let prober = st.prober.clone();
+        for a in ask::ask(&node, prober.as_ref(), ip, &ids, &g).await {
+            settle(&st, &g, a.node, a.outcome);
+        }
+    });
+    Ok(Started { group, asked })
+}
+
 /// POST /admin/lookup/probe: offer and ask (cluster) or run here
-/// (standalone), then back to the IP page's Probes section. Nothing waits
-/// for a probe.
+/// (standalone), then back to the IP page's Probes section.
 async fn request(
     _u: SessionUser,
     State(state): State<Arc<AdminState>>,
@@ -676,81 +779,23 @@ async fn request(
             "No probe: the address is not in the dataset.",
         ));
     };
-    let group = new_uid();
-    let pending = |node, name: String, price_mc, outcome| Pending {
-        ip_id: row.id,
-        node,
-        name,
-        at: Instant::now(),
-        asked_at: now_ts(),
-        price_mc,
-        outcome,
-    };
-    let remember = |list: Vec<Pending>| {
-        let mut map = state.pending_probes.lock().unwrap();
-        map.retain(|_, l| l.iter().any(|p| p.at.elapsed() < FORGET_AFTER));
-        map.insert(group.clone(), list);
-    };
-    let Some(node) = state.recorder.node().cloned() else {
-        let Some(prober) = state.prober.clone() else {
-            return Ok(redirect_with_error(
-                &back,
-                "No probe: this node does not probe.",
-            ));
-        };
-        if let Err(why) = prober.check(&state.store, None, &ip).await {
-            return Ok(redirect_with_error(&back, &format!("No probe: {why}")));
-        }
-        remember(vec![pending(
-            LOCAL,
-            "this node".into(),
-            0,
-            Some(Ok(String::new())),
-        )]);
-        let st = state.clone();
-        tokio::spawn(async move {
-            if let Err(why) = prober.run_local(&st.store, ip, &group).await {
-                settle(&st, &group, LOCAL, Err(why));
-            }
-        });
-        return Ok(redirect_with_notice(
+    match start(&state, ip, row.id, Some(&form.vantage)).await {
+        Err(why) => Ok(redirect_with_error(&back, &format!("No probe: {why}"))),
+        Ok(s) if s.asked.is_empty() => Ok(redirect_with_notice(
             &back,
             "Probe started; the result appears below when it is in.",
-        ));
-    };
-    let all = ask::vantages(&node, &state.geo);
-    let chosen: Vec<&ask::Vantage> = all
-        .iter()
-        .filter(|v| form.vantage.iter().any(|f| *f == v.node.to_string()))
-        .collect();
-    if chosen.is_empty() {
-        return Ok(redirect_with_error(
-            &back,
-            "No probe: pick at least one live scanner.",
-        ));
-    }
-    remember(
-        chosen
-            .iter()
-            .map(|v| pending(v.node, v.name.clone(), v.price_mc, None))
-            .collect(),
-    );
-    let ids: Vec<NodeId> = chosen.iter().map(|v| v.node).collect();
-    let n = ids.len();
-    let st = state.clone();
-    tokio::spawn(async move {
-        let prober = st.prober.clone();
-        for a in ask::ask(&node, prober.as_ref(), ip, &ids, &group).await {
-            settle(&st, &group, a.node, a.outcome);
+        )),
+        Ok(s) => {
+            let n = s.asked.len();
+            Ok(redirect_with_notice(
+                &back,
+                &format!(
+                    "Probe asked of {n} scanner{}; results appear below as they come in.",
+                    if n == 1 { "" } else { "s" }
+                ),
+            ))
         }
-    });
-    Ok(redirect_with_notice(
-        &back,
-        &format!(
-            "Probe asked of {n} scanner{}; results appear below as they come in.",
-            if n == 1 { "" } else { "s" }
-        ),
-    ))
+    }
 }
 
 /// The state of a request without a result.
@@ -986,15 +1031,15 @@ async fn stream(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::scan::probe::gate::tests::scanned;
     use serde_json::json;
     use tower::ServiceExt;
 
-    const IP: &str = "203.0.113.40";
+    pub(crate) const IP: &str = "203.0.113.40";
 
-    async fn web() -> std::net::SocketAddr {
+    pub(crate) async fn web() -> std::net::SocketAddr {
         let app = axum::Router::new().route(
             "/",
             axum::routing::get(|| async {
@@ -1013,7 +1058,7 @@ mod tests {
     /// A standalone admin with a prober aimed at `connect`; `IP` is in the
     /// dataset, `scan` adds a finished scan of that port, and `extra` is
     /// appended to the `[scan]` config.
-    async fn state(
+    pub(crate) async fn state(
         scan: Option<u16>,
         extra: &str,
     ) -> (Arc<AdminState>, String, i64, tempfile::TempDir) {
