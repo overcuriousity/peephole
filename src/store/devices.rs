@@ -192,6 +192,139 @@ impl Store {
     }
 }
 
+/// Seconds a scan quote may be spent.
+pub const QUOTE_SECS: i64 = 120;
+
+/// A quoted counter-scan, as stored.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Quote {
+    pub id: String,
+    pub device_id: String,
+    pub addr: String,
+    pub level: i64,
+    pub credits_mc: i64,
+    pub expires_at: String,
+}
+
+/// One act call that queued something (the audit log).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DeviceAction {
+    pub at: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub paired_by: String,
+    /// "probe" or "scan".
+    pub action: String,
+    pub target: String,
+    pub credits_mc: i64,
+    pub job_id: String,
+}
+
+impl DeviceAction {
+    /// The credits as the admin shows them.
+    pub fn credits(&self) -> String {
+        crate::credits::show(self.credits_mc.max(0) as u64)
+    }
+}
+
+impl Store {
+    /// Quote a level-`level` scan of `addr` at `credits_mc` to `device`,
+    /// spendable for [`QUOTE_SECS`]. Expired quotes are swept here.
+    pub async fn create_quote(
+        &self,
+        device_id: &str,
+        addr: &str,
+        level: u8,
+        credits_mc: u64,
+    ) -> Result<Quote> {
+        sqlx::query("DELETE FROM scan_quotes WHERE expires_at <= datetime('now')")
+            .execute(&self.pool)
+            .await?;
+        let id = format!("q_{}", random_b64url(18));
+        Ok(sqlx::query_as::<_, Quote>(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO scan_quotes (id, device_id, addr, level, credits_mc, expires_at)
+             VALUES (?, ?, ?, ?, ?, datetime('now', '+{QUOTE_SECS} seconds'))
+             RETURNING id, device_id, addr, level, credits_mc, expires_at"
+        )))
+        .bind(&id)
+        .bind(device_id)
+        .bind(addr)
+        .bind(level as i64)
+        .bind(credits_mc as i64)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Spend quote `id` of `device`: deleted in the statement that reads
+    /// it, so it is spent at most once. None: unknown, another device's,
+    /// expired or spent already.
+    pub async fn spend_quote(&self, id: &str, device_id: &str) -> Result<Option<Quote>> {
+        Ok(sqlx::query_as::<_, Quote>(
+            "DELETE FROM scan_quotes
+             WHERE id = ? AND device_id = ? AND expires_at > datetime('now')
+             RETURNING id, device_id, addr, level, credits_mc, expires_at",
+        )
+        .bind(id)
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Log what `device` queued.
+    pub async fn record_device_action(
+        &self,
+        device: &Device,
+        action: &str,
+        target: &str,
+        credits_mc: u64,
+        job_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO device_actions
+               (at, device_id, device_name, paired_by, action, target, credits_mc, job_id)
+             VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&device.id)
+        .bind(&device.name)
+        .bind(&device.paired_by)
+        .bind(action)
+        .bind(target)
+        .bind(credits_mc as i64)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The action that queued `job_id`, if `device_id` made it: a device
+    /// reads back its own jobs only.
+    pub async fn device_action(
+        &self,
+        device_id: &str,
+        job_id: &str,
+    ) -> Result<Option<DeviceAction>> {
+        Ok(sqlx::query_as::<_, DeviceAction>(
+            "SELECT at, device_id, device_name, paired_by, action, target, credits_mc, job_id
+             FROM device_actions WHERE job_id = ? AND device_id = ?",
+        )
+        .bind(job_id)
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// The newest `limit` actions of every device (the admin Devices page).
+    pub async fn recent_device_actions(&self, limit: i64) -> Result<Vec<DeviceAction>> {
+        Ok(sqlx::query_as::<_, DeviceAction>(
+            "SELECT at, device_id, device_name, paired_by, action, target, credits_mc, job_id
+             FROM device_actions ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.read)
+        .await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
