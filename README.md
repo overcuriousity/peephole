@@ -20,6 +20,11 @@ return for running a node you get the cluster's blocklist for your real
 sites, the whole dataset for your own analysis, and lookups through every
 member's intelligence providers.
 
+> [!WARNING]
+> Counter-scanning is legally restricted in some jurisdictions, and scanning
+> back can get your address reported for abuse — to your hosting provider
+> among others. Check what applies to you before you deploy.
+
 ## How it works
 
 - **A trap behind your web server.** peephole is the fallback for every
@@ -74,11 +79,6 @@ You get back:
 - scanner noise kept out of your real sites' logs.
 
 ## Risks
-
-> [!WARNING]
-> Counter-scanning is legally restricted in some jurisdictions, and scanning
-> back can get your address reported for abuse — to your hosting provider
-> among others. Check what applies to you before you deploy.
 
 The scanner role is opt-in, and abuse reports go to the provider of the
 node that scanned, not the trap's. The public dashboard names the addresses
