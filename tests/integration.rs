@@ -418,8 +418,23 @@ async fn wall_shows_aggregates_not_payloads() {
     assert!(!html.contains("HEADER-MARKER"));
     assert!(
         !html.contains("Recent activity"),
-        "public wall has no live recent-activity card"
+        "public dashboard has no live recent-activity card"
     );
+    // The API page and error pages call the public page by its name too.
+    let api = reqwest::get(format!("{admin_base}/api"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(api.contains("The public dashboard's numbers as JSON"));
+    let missing = reqwest::get(format!("{admin_base}/ip/not-an-address"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(missing.contains("Back to the dashboard"));
     assert!(html.contains("Last 7 days"));
     assert!(html.contains("data-range=\"7d\""));
     assert!(html.contains("id=\"map\""));
