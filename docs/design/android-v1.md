@@ -21,11 +21,12 @@ reference named in the brief: `templates/admin_lookup.html`,
 and the token sheet `assets/css/00-tokens.css`. Where a choice below departs
 from the web admin's current behaviour, it's called out explicitly with why.
 
-`docs/api-v1.md` (MIK-3/A) hasn't landed. Every field list below is a
-best-effort read of the MIK-3 plan and the web admin's own data model;
-items that are guesses, not confirmed fields, are marked **(TBD — api-v1)**.
-None of this blocks the visual/interaction design; it does mean the
-Engineer should treat field names as placeholders, not a contract.
+`docs/api-v1.md` (MIK-20, PR #67) is the contract for pairing, revocation,
+the IP list/detail and stored-data lookup; where this doc and that file
+disagree, the API doc wins. The act-scoped surfaces (probe, scan quote and
+confirm, jobs, self-revoke) are MIK-22 and not specified yet; items there
+that are guesses, not confirmed fields, are marked **(TBD — api-v1)** and
+the Engineer should treat their field names as placeholders.
 
 ## 1. Principles carried over from the web admin
 
@@ -178,7 +179,7 @@ defined once so it reads identically everywhere (recognition over recall).
 | **error** | Inline banner, `errorContainer`/`error`, the *actual* message from the instance (never a generic "something went wrong") + a **Retry** button. Matches the web admin's `<p class="muted">{{ e }}</p>` pattern but promoted to a visible banner, since mobile has no persistent surrounding chrome to carry a muted aside. |
 | **offline** | A persistent top banner ("No connection to this instance — showing the last sync, {time} ago") on top of the last cached screen, not a full-screen takeover, so a technical reader can keep reading what they already pulled. Actions that need the network (lookup, probe, scan, pair) disable with "offline" as the reason string, per §1. |
 | **401 — revoked** | Full-screen interstitial, not a banner: the pairing itself is gone. "This device's pairing with {instance name} was revoked. Pair again to continue." + **Pair again** button + **Remove instance** button. Returns to Instance List if dismissed. This is deliberately heavier than a banner because every other action on this instance is now meaningless until re-paired. |
-| **403 — no act-scope** | Inline, local to the control, not full-screen: the device *is* paired and can read, just can't spend/act. "Your pairing is read-only on this instance." next to the disabled Lookup-paid/Probe/Scan controls, same place a price or disabled-reason normally sits. Browsing (IP list, IP detail, free lookups) stays fully usable. **(TBD — api-v1: exact scope name and whether it's binary read/act or finer-grained; designed here as a single `act` boolean gate per MIK-3's "any authenticated peephole admin" framing.)** |
+| **403 — no act-scope** | Inline, local to the control, not full-screen: the device *is* paired and can read, just can't spend/act. "Your pairing is read-only on this instance." next to the disabled Lookup-paid/Probe/Scan controls, same place a price or disabled-reason normally sits. Browsing (IP list, IP detail, free lookups) stays fully usable. The scope is binary (api-v1 §Authentication: `read` always, `act` optional), so this is the one disabled-reason string everywhere; there are no per-capability variants. |
 
 ## 6. Screens
 
@@ -271,13 +272,12 @@ anything is stored)
 │                               │
 │  sentry.example.org          │ ← origin, exactly as the admin reports it
 │  Device name shown there:    │
-│  "Alice's Pixel"              │ ← editable before confirm
+│  "Alice's Pixel"              │ ← editable before confirm, 1–80 chars
 │                               │
-│  This grants this app read   │
-│  access to this instance's   │
-│  data. Paid actions need a   │
-│  separate act permission     │
-│  granted by its admin.       │
+│  This instance's admin chose │
+│  this pairing's permissions  │
+│  (read, or read + act).      │
+│  🔒 Certificate pinned        │ ← only when the QR has tls_spki_sha256
 │                               │
 │  [ Cancel ]      [ Confirm ] │
 └──────────────────────────────┘
@@ -293,7 +293,24 @@ and device name").
 - error here: "This QR code isn't a peephole pairing code" (malformed/wrong
   payload) → back to scan, no silent retry.
 - offline: "Can't reach {origin} to complete pairing" + **Retry**; the scan
-  result is held, not discarded, so retry doesn't mean re-scanning.
+  result is held, not discarded, so retry doesn't mean re-scanning. The
+  code lives 5 minutes (api-v1 §Pairing), so the held result is dropped
+  once it is older than that, with the expired-code message below.
+- 401 from `POST /api/v1/pair` (code expired, already used, or unknown —
+  the code is dead either way): "This pairing code has expired or was
+  already used. Make a new one on {origin}'s Devices page." → back to
+  scan. A retry after a timed-out request can land here too, since the
+  first attempt may have consumed the code; same message, no special case.
+- 429: "Too many pairing attempts. Try again in {Retry-After}." Confirm
+  disables for that long, with the countdown as its disabled reason.
+- TLS pin mismatch (QR carries `tls_spki_sha256` and the served
+  certificate doesn't match): hard stop, `error` colours, "{origin} is not
+  presenting the certificate this QR code was made for. Nothing was
+  stored." + **Back to scan**. No "continue anyway" — that would make the
+  pin pointless.
+- On success the account is labelled with the response's `instance_name`,
+  with the origin underneath; the stored scopes come from the response,
+  not from the QR.
 
 ### 6.3 IP list + search
 
@@ -453,9 +470,14 @@ rely on).
   address → "No provider answered." (verbatim parity) per address block.
 - error: inline per-address ("No public address." / an unreadable line
   echoed back, same as `n.rows.is_empty()`/`unreadable` handling).
-- offline: whole screen's primary action disables; stored-only results
-  (bulk "from stored data") remain usable since they need no network call
-  — same distinction the web admin already draws.
+- offline: whole screen's primary action disables, the stored-data lookup
+  included — it asks no provider and costs nothing, but it is still a call
+  to the instance (`POST /api/v1/lookup`); the data is not on the phone.
+  Results already on screen stay readable under the offline banner.
+- bulk paste follows the API's shape: `missing` addresses render as
+  "— not stored", `unreadable` lines are echoed back as such, and
+  `capped: true` shows "More than 500 stored matches — showing the first
+  500." above the table, the web admin's 500-address cap.
 - 401: interstitial.
 - 403: paid "Ask for more"/"Ask again" rows disable with "read-only
   pairing"; free/stored lookups keep working if MIK-3 defines any lookup as
@@ -558,11 +580,9 @@ double-checks the Fitts's-Law-easy "just tap confirm" habit).
 
 If the balance shown is lower than the cost, the Confirm button is still
 shown (never hidden, §1) but disabled, with "Not enough credits" as the
-reason and a link to the instance's credit/top-up surface **(TBD —
-api-v1/MIK-3 plan: whether credits can be bought in-app at all; the brief's
-out-of-scope list only excludes "one-tap buy" for the scan action itself,
-not a credits top-up flow in general, so this is left as a question for
-CTO rather than assumed either way)**.
+reason and "Top up in the web admin." as plain text. There is no in-app
+top-up in v1 (decided 2026-10-10); this screen is the app's only money
+surface.
 
 **States**
 - loading: cost block shows a skeleton while the quote is being fetched
@@ -632,7 +652,8 @@ polling stops when backgrounded.
 │ ←  sentry.example.org         │
 ├──────────────────────────────┤
 │ Device name                   │
-│ Alice's Pixel            [✎]  │
+│ Alice's Pixel                 │ ← read-only after pairing (no
+│                                │   rename endpoint in api-v1)
 │                                │
 │ Paired                        │
 │ 2026-09-14 · read + act       │
@@ -641,10 +662,6 @@ polling stops when backgrounded.
 │ set by this instance's admin, │
 │ not by this app.              │
 │                                │
-│ Notifications          [off ▾]│  (TBD — out of scope: push is excluded
-│                                │   for v1; this row may not exist yet —
-│                                │   left here only as a placeholder the
-│                                │   Engineer should drop, not build)
 ├──────────────────────────────┤
 │        [ Unpair device ]      │ ← btn-danger equivalent
 └──────────────────────────────┘
@@ -654,16 +671,27 @@ dialog (`data-confirm` + a dialog restating the consequence) since it's
 local and cheap to undo (re-pair), unlike a scan spend — an `AlertDialog`
 is the right weight here, consistently with §2's distinction.
 
+There is no notifications row: push is out of scope for v1, so the row is
+dropped rather than shipped as a dead toggle (decided 2026-10-10).
+
+Unpair always clears the token and instance locally. When the instance
+offers a device self-revoke endpoint (MIK-22 decides; **TBD — api-v1**),
+the app calls it first, best effort. The local clear is the fallback, not
+the only path: a token deleted only on the phone stays valid on the
+instance until an admin revokes it on Admin → Devices. So whenever the
+server revoke did not happen (no endpoint, offline, or it failed), the
+confirmation says so: "Removed from this device. {instance} still lists
+it on its Devices page until an admin revokes it there."
+
 **States**
 - loading: skeleton for the two info rows.
 - empty: n/a (always has at least the pairing info).
-- error: unpair request failed → inline error in the dialog, dialog stays
-  open, no silent failure.
-- offline: unpair disables ("offline" — unpairing is itself a call to the
-  instance to invalidate the credential, per MIK-3's pairing model
-  **(TBD — api-v1: confirm unpair is server-invalidated, not purely
-  local; designed here assuming it is, since a purely local "forget" would
-  leave a stale credential valid against the instance)**).
+- error: server revoke failed → the local clear still happens, and the
+  confirmation carries the "still lists it" message above with the
+  instance's actual error. No silent failure, and no dialog that traps
+  the user on a device they asked to forget.
+- offline: Unpair stays enabled (the local clear needs no network); the
+  confirmation carries the "still lists it" message.
 - 401: still reachable (this is the one screen a revoked pairing *should*
   open to, from the interstitial's "Remove instance" button) — shows
   "Already revoked by {instance}" instead of the normal paired-info block,
@@ -698,20 +726,16 @@ is the right weight here, consistently with §2's distinction.
   Compose's motion-reduction signal — the countdown still updates its
   number, just without an animated sweep.
 
-## 8. Open questions for CTO / Engineer (not blocking, tracked here)
+## 8. Decisions (were open questions; Head, 2026-10-10, confirmed in CTO review)
 
-1. Exact shape of the `act` scope (§5, §6.4, §6.9) — binary or
-   per-capability (lookup vs probe vs scan priced differently)? Affects
-   whether §6 needs three disabled-reason strings or one.
-2. Whether credits can be topped up in-app at all (§6.7) — out of scope
-   only excludes one-tap *scan* purchase, not a top-up surface broadly.
-3. Server-side invalidation on unpair (§6.9) — confirm before Engineer
-   builds the local-only fallback path as anything but a true fallback.
-4. Notification settings row (§6.9) sketched then flagged as probably
-   premature, since push is explicitly out of scope for v1 — recommend
-   dropping it from v1 entirely rather than shipping a dead toggle; left
-   in the wireframe only so the removal is a visible decision, not a
-   silent omission.
+1. `act` scope is binary (`read` always, `act` optional, one grant), so
+   §5 has one disabled-reason string for 403.
+2. No in-app credit top-up in v1; the web admin handles it (§6.7). The
+   cost-confirm screen is the only money surface.
+3. Unpair: local clear always, plus a best-effort server self-revoke if
+   MIK-22 adds an endpoint for it (§6.9). Admin-side revoke already exists
+   (Admin → Devices, `401` afterwards).
+4. Notifications row dropped from v1 (§6.9).
 
 ## 9. Still outstanding
 
