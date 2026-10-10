@@ -38,13 +38,19 @@ struct DevicesPage {
     chrome: Chrome,
     devices: Vec<crate::store::devices::Device>,
     pair: Option<Pairing>,
+    /// What devices queued, newest first.
+    actions: Vec<crate::store::devices::DeviceAction>,
 }
+
+/// Rows of the Recent actions table.
+const RECENT_ACTIONS: i64 = 50;
 
 async fn render_page(state: &AdminState, pair: Option<Pairing>) -> AppResult<Html<String>> {
     render(&DevicesPage {
         chrome: Chrome::new(true, "admin"),
         devices: state.store.list_devices().await?,
         pair,
+        actions: state.store.recent_device_actions(RECENT_ACTIONS).await?,
     })
 }
 
@@ -54,7 +60,7 @@ async fn page(_u: SessionUser, State(state): State<Arc<AdminState>>) -> AppResul
 
 #[derive(serde::Deserialize)]
 pub struct PairForm {
-    /// Checkbox: grant the (reserved) `act` scope too. `read` always is.
+    /// Checkbox: grant the `act` scope too (probes, scans). `read` always is.
     act: Option<String>,
 }
 

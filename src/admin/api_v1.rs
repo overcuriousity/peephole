@@ -4,16 +4,19 @@
 //! and never here. Every answer is JSON, errors included
 //! (`{error:{code,message}}`, see `docs/api-v1.md`).
 use crate::admin::AdminState;
+use crate::admin::scan_buy::NotSold;
 use crate::store::browse::{IpFilter, IpSummary};
 use crate::store::devices::Device;
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{FromRequestParts, Path, Query, State},
     http::{StatusCode, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
@@ -22,6 +25,10 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/api/v1/ips", get(ips))
         .route("/api/v1/ips/{addr}", get(ip_detail))
         .route("/api/v1/lookup", post(lookup))
+        .route("/api/v1/ips/{addr}/probe", post(probe))
+        .route("/api/v1/ips/{addr}/scan/quote", get(scan_quote))
+        .route("/api/v1/ips/{addr}/scan", post(scan_buy))
+        .route("/api/v1/jobs/{job_id}", get(job))
         // Unknown API paths answer in the API's error shape, not the HTML 404.
         .route("/api/v1/{*rest}", axum::routing::any(not_found))
 }
@@ -31,10 +38,10 @@ async fn not_found() -> Response {
 }
 
 /// The error shape: every non-2xx of `/api/v1` is this JSON.
-pub fn err(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+pub fn err(status: StatusCode, code: &'static str, message: impl std::fmt::Display) -> Response {
     (
         status,
-        Json(json!({"error": {"code": code, "message": message}})),
+        Json(json!({"error": {"code": code, "message": message.to_string()}})),
     )
         .into_response()
 }
@@ -81,6 +88,28 @@ impl FromRequestParts<Arc<AdminState>> for DeviceAuth {
             )),
             Err(e) => Err(internal(e)),
         }
+    }
+}
+
+/// A device token with the `act` scope too: what the endpoints that queue
+/// work (and read it back) take. Without it, 403.
+pub struct ActAuth(pub Device);
+
+impl FromRequestParts<Arc<AdminState>> for ActAuth {
+    type Rejection = Response;
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AdminState>,
+    ) -> Result<Self, Self::Rejection> {
+        let DeviceAuth(d) = DeviceAuth::from_request_parts(parts, state).await?;
+        if !d.has_scope("act") {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "the token lacks the act scope",
+            ));
+        }
+        Ok(ActAuth(d))
     }
 }
 
@@ -389,6 +418,388 @@ async fn lookup(
         "capped": read.capped,
     }))
     .into_response()
+}
+
+/// A path address and its dataset row id: 400 when it is not an address,
+/// 404 when it is not in the dataset.
+async fn row_of(state: &AdminState, addr: &str) -> Result<(IpAddr, i64), Box<Response>> {
+    let Ok(ip) = addr.trim().parse::<IpAddr>() else {
+        return Err(Box::new(err(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            "not an IP address",
+        )));
+    };
+    let ip = crate::net::canonical(ip);
+    match state.store.ip_by_addr(&ip.to_string()).await {
+        Ok(Some(row)) => Ok((ip, row.id)),
+        Ok(None) => Err(Box::new(err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such address in the dataset",
+        ))),
+        Err(e) => Err(Box::new(internal(e))),
+    }
+}
+
+/// Credits as the API gives them: the decimal string and the integer
+/// millicredits.
+fn credits(mc: u64) -> (String, u64) {
+    (crate::credits::show(mc), mc)
+}
+
+/// Log what `device` queued; a failed write is an internal error, so no
+/// act call answers 202 without its audit entry.
+async fn audit(
+    state: &AdminState,
+    device: &Device,
+    action: &str,
+    target: &str,
+    credits_mc: u64,
+    job_id: &str,
+) -> Result<(), Box<Response>> {
+    state
+        .store
+        .record_device_action(device, action, target, credits_mc, job_id)
+        .await
+        .map_err(|e| Box::new(internal(e)))
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct ProbeBody {
+    vantages: Option<Vec<String>>,
+}
+
+/// POST /api/v1/ips/{addr}/probe: the probe of the Actions card
+/// (`probes::start`), the default pick unless `vantages` names others.
+async fn probe(
+    ActAuth(device): ActAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(addr): Path<String>,
+    body: Bytes,
+) -> Response {
+    let b: ProbeBody = match body.iter().all(u8::is_ascii_whitespace) {
+        true => ProbeBody::default(),
+        false => match serde_json::from_slice(&body) {
+            Ok(b) => b,
+            Err(_) => return err(StatusCode::BAD_REQUEST, "invalid", "malformed body"),
+        },
+    };
+    let (ip, ip_id) = match row_of(&state, &addr).await {
+        Ok(r) => r,
+        Err(r) => return *r,
+    };
+    let started = match crate::admin::probes::start(&state, ip, ip_id, b.vantages.as_deref()).await
+    {
+        Ok(s) => s,
+        Err(why) => return err(StatusCode::UNPROCESSABLE_ENTITY, "refused", why),
+    };
+    let mc: u64 = started.asked.iter().map(|v| v.price_mc as u64).sum();
+    let job_id = format!("p_{}", started.group);
+    if let Err(r) = audit(&state, &device, "probe", &ip.to_string(), mc, &job_id).await {
+        return *r;
+    }
+    let (credits, credits_mc) = credits(mc);
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "job_id": job_id,
+            "credits": credits,
+            "credits_mc": credits_mc,
+            "vantages": started.asked.iter().map(|v| json!({
+                "id": v.id,
+                "name": v.name,
+                "country": v.country,
+                "credits_mc": v.price_mc,
+            })).collect::<Vec<_>>(),
+        })),
+    )
+        .into_response()
+}
+
+/// 409 for a scan that is not sold (`scan_buy::sale`).
+fn not_sold(n: NotSold) -> Response {
+    let conflict = |code: &'static str, message: &str, extra: Value| {
+        let mut e = json!({"code": code, "message": message});
+        if let (Some(e), Value::Object(x)) = (e.as_object_mut(), extra) {
+            e.extend(x);
+        }
+        (StatusCode::CONFLICT, Json(json!({"error": e}))).into_response()
+    };
+    match n {
+        NotSold::Fresh(at, scan_id) => conflict(
+            "fresh",
+            "a scan of this level is less than a day old",
+            json!({"scan_id": scan_id, "scanned_at": rfc3339(at.as_str())}),
+        ),
+        NotSold::OnItsWay(status) => conflict(
+            "on_its_way",
+            "a scan of this level is already on its way",
+            json!({"status": status}),
+        ),
+        NotSold::NoPrice => conflict("no_price", "no live scanner announces a price", json!({})),
+        NotSold::NoBudget => conflict(
+            "no_budget",
+            "the scan budget does not cover this",
+            json!({}),
+        ),
+    }
+}
+
+/// The level of a query or body: 1-5, else a 400.
+fn level_of(v: Option<&str>) -> Result<u8, Box<Response>> {
+    v.and_then(|l| l.trim().parse::<i64>().ok())
+        .and_then(crate::scan::valid_level)
+        .ok_or_else(|| Box::new(err(StatusCode::BAD_REQUEST, "invalid", "level must be 1-5")))
+}
+
+#[derive(serde::Deserialize)]
+pub struct QuoteQuery {
+    level: Option<String>,
+}
+
+/// GET /api/v1/ips/{addr}/scan/quote?level=: what a scan costs now, as a
+/// quote the device can spend once within `QUOTE_SECS`.
+async fn scan_quote(
+    ActAuth(device): ActAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(addr): Path<String>,
+    Query(q): Query<QuoteQuery>,
+) -> Response {
+    let level = match level_of(q.level.as_deref()) {
+        Ok(l) => l,
+        Err(r) => return *r,
+    };
+    let (ip, ip_id) = match row_of(&state, &addr).await {
+        Ok(r) => r,
+        Err(r) => return *r,
+    };
+    let price = match crate::admin::scan_buy::sale(&state, ip_id, level).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(n)) => return not_sold(n),
+        Err(e) => return internal(e),
+    };
+    let quote = match state
+        .store
+        .create_quote(&device.id, &ip.to_string(), level, price.floor_mc)
+        .await
+    {
+        Ok(q) => q,
+        Err(e) => return internal(e),
+    };
+    let (floor, floor_mc) = credits(price.floor_mc);
+    let (max, max_mc) = credits(price.max_mc);
+    Json(json!({
+        "quote_id": quote.id,
+        "credits": floor,
+        "credits_mc": floor_mc,
+        "credits_max": max,
+        "credits_max_mc": max_mc,
+        "expires_at": rfc3339(quote.expires_at.as_str()),
+        "offer": {"level": level, "about": crate::admin::scan_buy::about(level)},
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct BuyBody {
+    quote_id: String,
+}
+
+/// POST /api/v1/ips/{addr}/scan {quote_id}: buy exactly the quoted scan.
+/// The quote is spent first; every refusal after that queues and charges
+/// nothing (a scan is charged when a scanner runs its job).
+async fn scan_buy(
+    ActAuth(device): ActAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(addr): Path<String>,
+    body: Result<Json<BuyBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(b)) = body else {
+        return err(StatusCode::BAD_REQUEST, "invalid", "malformed body");
+    };
+    let Ok(ip) = addr.trim().parse::<IpAddr>() else {
+        return err(StatusCode::BAD_REQUEST, "invalid", "not an IP address");
+    };
+    let ip = crate::net::canonical(ip).to_string();
+    let quote = match state.store.spend_quote(&b.quote_id, &device.id).await {
+        Ok(Some(q)) => q,
+        Ok(None) => {
+            return err(
+                StatusCode::CONFLICT,
+                "quote_invalid",
+                "unknown, expired or already used quote",
+            );
+        }
+        Err(e) => return internal(e),
+    };
+    if quote.addr != ip {
+        return err(
+            StatusCode::CONFLICT,
+            "quote_mismatch",
+            "the quote is for another address",
+        );
+    }
+    let Some(level) = crate::scan::valid_level(quote.level) else {
+        return err(
+            StatusCode::CONFLICT,
+            "quote_invalid",
+            "the quote is unreadable",
+        );
+    };
+    let (_, ip_id) = match row_of(&state, &ip).await {
+        Ok(r) => r,
+        Err(r) => return *r,
+    };
+    match crate::admin::scan_buy::sale(&state, ip_id, level).await {
+        Ok(Ok(p)) if p.floor_mc == quote.credits_mc as u64 => {}
+        Ok(Ok(_)) => {
+            return err(
+                StatusCode::CONFLICT,
+                "price_changed",
+                "the price moved since the quote: get a new one",
+            );
+        }
+        Ok(Err(n)) => return not_sold(n),
+        Err(e) => return internal(e),
+    }
+    let id = match crate::admin::scan_buy::enqueue(&state, ip_id, level).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return err(
+                StatusCode::CONFLICT,
+                "not_queued",
+                "the scan queue did not take the job",
+            );
+        }
+        Err(e) => return internal(e),
+    };
+    let job_id = format!("s_{id}");
+    let mc = quote.credits_mc as u64;
+    if let Err(r) = audit(&state, &device, "scan", &ip, mc, &job_id).await {
+        return *r;
+    }
+    let (credits, credits_mc) = credits(mc);
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"job_id": job_id, "credits": credits, "credits_mc": credits_mc})),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/jobs/{job_id}: a job this device queued, by polling.
+async fn job(
+    ActAuth(device): ActAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(job_id): Path<String>,
+) -> Response {
+    let action = match state.store.device_action(&device.id, &job_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "not_found", "no such job"),
+        Err(e) => return internal(e),
+    };
+    let r = match action.action.as_str() {
+        "scan" => scan_job(&state, &job_id).await,
+        _ => probe_job(&state, &action.target, &job_id).await,
+    };
+    match r {
+        Ok((status, result)) => Json(json!({
+            "job_id": job_id,
+            "kind": action.action,
+            "ip": action.target,
+            "status": status,
+            "created_at": rfc3339(action.at.as_str()),
+            "result": result,
+        }))
+        .into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+/// A scan job's status and, once it landed, its result (the shape of
+/// `ip_detail`'s `scans[]`).
+async fn scan_job(state: &AdminState, job_id: &str) -> anyhow::Result<(&'static str, Value)> {
+    let id: i64 = job_id
+        .strip_prefix("s_")
+        .and_then(|i| i.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("unreadable scan job id {job_id}"))?;
+    let scan: Option<(i64, String)> = sqlx::query_as(
+        "SELECT s.id, s.finished_at FROM scans s JOIN scan_jobs j ON s.job_uid = j.uid
+         WHERE j.id = ? AND s.finished_at IS NOT NULL ORDER BY s.id DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.store.pool)
+    .await?;
+    let job = state.store.queue_job(id).await?;
+    let status = match job.as_ref().map(|j| j.status.as_str()) {
+        Some("queued") => "queued",
+        Some("running") => "running",
+        Some("done") => "done",
+        // The job row may be gone (pruned) while its scan stays.
+        None if scan.is_some() => "done",
+        _ => "failed",
+    };
+    let Some((scan_id, finished_at)) = scan else {
+        return Ok((status, Value::Null));
+    };
+    let ports: Vec<Value> = state
+        .store
+        .ports_for_scans(&[scan_id])
+        .await?
+        .remove(&scan_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.state == "open")
+        .map(|p| json!({"port": p.port, "service": p.service, "product": p.product}))
+        .collect();
+    Ok((
+        status,
+        json!({"scanned_at": rfc3339(finished_at.as_str()), "ports": ports}),
+    ))
+}
+
+/// A probe request's status (running while a vantage waits) and what each
+/// vantage said or saw so far, as the Probes section shows it.
+async fn probe_job(
+    state: &AdminState,
+    target: &str,
+    job_id: &str,
+) -> anyhow::Result<(&'static str, Value)> {
+    let group = job_id.strip_prefix("p_").unwrap_or(job_id);
+    let members = match state.store.ip_by_addr(target).await? {
+        Some(row) => crate::admin::probes::groups_for(state, row.id)
+            .await
+            .into_iter()
+            .find(|g| g.group == group)
+            .map(|g| g.members)
+            .unwrap_or_default(),
+        None => vec![],
+    };
+    let waiting = members
+        .iter()
+        .any(|m| matches!(m.state, "queued" | "running"));
+    let vantages: Vec<Value> = members
+        .iter()
+        .map(|m| {
+            json!({
+                "node": m.node_id,
+                "name": m.node,
+                "state": m.state,
+                "why": m.why,
+                "rtt_ms": m.rtt_ms,
+                "ports": m.ports.iter().map(|p| json!({
+                    "port": p.port,
+                    "protocol": p.protocol,
+                    "outcome": p.outcome,
+                    "detail": p.detail,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok((
+        if waiting { "running" } else { "done" },
+        json!({"vantages": vantages}),
+    ))
 }
 
 #[cfg(test)]
@@ -789,5 +1200,381 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["error"]["code"], "rate_limited", "{v}");
+    }
+
+    /// A device paired straight through the store: its token.
+    async fn device(state: &AdminState, scopes: &str, name: &str) -> String {
+        let code = state
+            .store
+            .mint_pairing_code(scopes, "admin")
+            .await
+            .unwrap();
+        let (_, token) = state
+            .store
+            .redeem_pairing_code(&code, name)
+            .await
+            .unwrap()
+            .unwrap();
+        token
+    }
+
+    fn authed_json(
+        method: &str,
+        path: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Scan jobs and audit entries: what a refused buy must leave as is.
+    async fn jobs_and_actions(state: &AdminState) -> (i64, i64) {
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs")
+            .fetch_one(&state.store.pool)
+            .await
+            .unwrap();
+        let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM device_actions")
+            .fetch_one(&state.store.pool)
+            .await
+            .unwrap();
+        (jobs, actions)
+    }
+
+    const SCAN_IP: &str = crate::admin::scan_buy::tests::IP;
+
+    #[tokio::test]
+    async fn act_endpoints_need_the_act_scope() {
+        let (state, _c, _id, _d) = crate::admin::scan_buy::tests::state().await;
+        let app = crate::admin::full_router(state.clone());
+        let read = device(&state, "read", "reader").await;
+        let calls = [
+            ("POST", format!("/api/v1/ips/{SCAN_IP}/probe")),
+            ("GET", format!("/api/v1/ips/{SCAN_IP}/scan/quote?level=2")),
+            ("POST", format!("/api/v1/ips/{SCAN_IP}/scan")),
+            ("GET", "/api/v1/jobs/s_1".to_string()),
+        ];
+        for (method, path) in &calls {
+            let (st, v) = send(
+                &app,
+                authed_json(method, path, &read, serde_json::json!({"quote_id": "q_x"})),
+            )
+            .await;
+            assert_eq!(st, 403, "{method} {path}: {v}");
+            assert_eq!(v["error"]["code"], "forbidden", "{v}");
+            let (st, _) = send(
+                &app,
+                Request::builder()
+                    .method(*method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(st, 401, "{method} {path} without a token");
+        }
+        assert_eq!(jobs_and_actions(&state).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_quoted_scan_is_bought_once_audited_and_polled() {
+        let (state, cookie, ip_id, _d) = crate::admin::scan_buy::tests::state().await;
+        let app = crate::admin::full_router(state.clone());
+        let token = device(&state, "read,act", "Pixel 8").await;
+        let (st, q) = send(
+            &app,
+            authed(
+                "GET",
+                &format!("/api/v1/ips/{SCAN_IP}/scan/quote?level=3"),
+                &token,
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{q}");
+        assert!(q["quote_id"].as_str().unwrap().starts_with("q_"));
+        // Standalone: free.
+        assert_eq!(q["credits"], "0.00");
+        assert_eq!(q["credits_mc"], 0);
+        assert_eq!(q["credits_max_mc"], 0);
+        assert_eq!(q["offer"]["level"], 3);
+        assert!(q["expires_at"].as_str().unwrap().ends_with('Z'), "{q}");
+        let buy = |quote: serde_json::Value| {
+            authed_json(
+                "POST",
+                &format!("/api/v1/ips/{SCAN_IP}/scan"),
+                &token,
+                serde_json::json!({"quote_id": quote}),
+            )
+        };
+        let (st, v) = send(&app, buy(q["quote_id"].clone())).await;
+        assert_eq!(st, 202, "{v}");
+        let job_id = v["job_id"].as_str().unwrap().to_string();
+        assert!(job_id.starts_with("s_"));
+        assert_eq!(v["credits_mc"], 0);
+        let jobs: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT level, manual FROM scan_jobs WHERE ip_id = ?")
+                .bind(ip_id)
+                .fetch_all(&state.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(jobs, vec![(3, 1)], "the marked job of the quoted level");
+        // The same quote again: spent.
+        let (st, v) = send(&app, buy(q["quote_id"].clone())).await;
+        assert_eq!(st, 409);
+        assert_eq!(v["error"]["code"], "quote_invalid", "{v}");
+        assert_eq!(jobs_and_actions(&state).await, (1, 1));
+        // A new quote while the job is on its way: none.
+        let (st, v) = send(
+            &app,
+            authed(
+                "GET",
+                &format!("/api/v1/ips/{SCAN_IP}/scan/quote?level=3"),
+                &token,
+            ),
+        )
+        .await;
+        assert_eq!(st, 409);
+        assert_eq!(v["error"]["code"], "on_its_way", "{v}");
+        // Polling: queued, no result yet.
+        let (st, v) = send(
+            &app,
+            authed("GET", &format!("/api/v1/jobs/{job_id}"), &token),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["kind"], "scan");
+        assert_eq!(v["ip"], SCAN_IP);
+        assert_eq!(v["status"], "queued");
+        assert!(v["result"].is_null());
+        // The scan lands: done, with its open ports.
+        sqlx::query(
+            "UPDATE scan_jobs SET status = 'done', finished_at = datetime('now') WHERE ip_id = ?",
+        )
+        .bind(ip_id)
+        .execute(&state.store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO scans (job_id, ip_id, level, started_at, finished_at, uid, origin, job_uid)
+             SELECT id, ip_id, level, datetime('now'), datetime('now'), 's1', NULL, uid
+             FROM scan_jobs WHERE ip_id = ?",
+        )
+        .bind(ip_id)
+        .execute(&state.store.pool)
+        .await
+        .unwrap();
+        let (st, v) = send(
+            &app,
+            authed("GET", &format!("/api/v1/jobs/{job_id}"), &token),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["status"], "done");
+        assert!(
+            v["result"]["scanned_at"].as_str().unwrap().ends_with('Z'),
+            "{v}"
+        );
+        assert!(v["result"]["ports"].is_array());
+        // Another device does not see it; an unknown id is 404 alike.
+        let other = device(&state, "read,act", "other").await;
+        for (t, id) in [(&other, job_id.as_str()), (&token, "s_999")] {
+            let (st, v) = send(&app, authed("GET", &format!("/api/v1/jobs/{id}"), t)).await;
+            assert_eq!(st, 404);
+            assert_eq!(v["error"]["code"], "not_found", "{v}");
+        }
+        // The audit entry, on the admin Devices page too.
+        let a = state.store.recent_device_actions(10).await.unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            (a[0].device_name.as_str(), a[0].paired_by.as_str()),
+            ("Pixel 8", "admin")
+        );
+        assert_eq!(
+            (a[0].action.as_str(), a[0].target.as_str()),
+            ("scan", SCAN_IP)
+        );
+        assert_eq!(
+            (a[0].credits_mc, a[0].job_id.as_str()),
+            (0, job_id.as_str())
+        );
+        let r = app
+            .clone()
+            .oneshot(
+                Request::get("/admin/devices")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let html = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&html);
+        assert!(
+            html.contains("Recent actions") && html.contains(&job_id) && html.contains("Pixel 8"),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_quote_queues_and_charges_nothing() {
+        let (state, _c, _ip_id, _d) = crate::admin::scan_buy::tests::state().await;
+        let other_ip = "203.0.113.41";
+        state
+            .store
+            .upsert_ip(other_ip.parse().unwrap())
+            .await
+            .unwrap();
+        let app = crate::admin::full_router(state.clone());
+        let token = device(&state, "read,act", "phone").await;
+        let other = device(&state, "read,act", "other").await;
+        let quote = |t: &str, ip: &str| {
+            let app = app.clone();
+            let t = t.to_string();
+            let ip = ip.to_string();
+            async move {
+                let (st, v) = send(
+                    &app,
+                    authed("GET", &format!("/api/v1/ips/{ip}/scan/quote?level=2"), &t),
+                )
+                .await;
+                assert_eq!(st, 200, "{v}");
+                v["quote_id"].as_str().unwrap().to_string()
+            }
+        };
+        let buy = |t: &str, ip: &str, q: &str| {
+            authed_json(
+                "POST",
+                &format!("/api/v1/ips/{ip}/scan"),
+                t,
+                serde_json::json!({"quote_id": q}),
+            )
+        };
+        let refused = |req: Request<Body>, code: &'static str| {
+            let app = app.clone();
+            let state = state.clone();
+            async move {
+                let (st, v) = send(&app, req).await;
+                assert_eq!(st, 409, "{v}");
+                assert_eq!(v["error"]["code"], code, "{v}");
+                // Nothing queued, so nothing charged (a scan is paid when a
+                // scanner runs its job), and nothing audited.
+                assert_eq!(jobs_and_actions(&state).await, (0, 0), "{code}");
+            }
+        };
+        // Unknown.
+        refused(buy(&token, SCAN_IP, "q_nope"), "quote_invalid").await;
+        // Another device's.
+        let q = quote(&other, SCAN_IP).await;
+        refused(buy(&token, SCAN_IP, &q), "quote_invalid").await;
+        // Expired.
+        let q = quote(&token, SCAN_IP).await;
+        sqlx::query("UPDATE scan_quotes SET expires_at = datetime('now', '-1 second')")
+            .execute(&state.store.pool)
+            .await
+            .unwrap();
+        refused(buy(&token, SCAN_IP, &q), "quote_invalid").await;
+        // For another address.
+        let q = quote(&token, other_ip).await;
+        refused(buy(&token, SCAN_IP, &q), "quote_mismatch").await;
+        // The price moved since the quote (here: the stored quote differs).
+        let q = quote(&token, SCAN_IP).await;
+        sqlx::query("UPDATE scan_quotes SET credits_mc = 1000 WHERE id = ?")
+            .bind(&q)
+            .execute(&state.store.pool)
+            .await
+            .unwrap();
+        refused(buy(&token, SCAN_IP, &q), "price_changed").await;
+        // A fresh result landed between quote and buy.
+        let q = quote(&token, SCAN_IP).await;
+        crate::scan::probe::gate::tests::scanned(
+            &state.store,
+            SCAN_IP,
+            &[(80, "open", Some("http"))],
+        )
+        .await;
+        let jobs_before = jobs_and_actions(&state).await;
+        let (st, v) = send(&app, buy(&token, SCAN_IP, &q)).await;
+        assert_eq!(st, 409, "{v}");
+        assert_eq!(v["error"]["code"], "fresh", "{v}");
+        assert!(v["error"]["scan_id"].as_i64().is_some(), "{v}");
+        assert_eq!(jobs_and_actions(&state).await, jobs_before);
+        // A bad level is 400, not a quote.
+        let (st, v) = send(
+            &app,
+            authed(
+                "GET",
+                &format!("/api/v1/ips/{SCAN_IP}/scan/quote?level=9"),
+                &token,
+            ),
+        )
+        .await;
+        assert_eq!(st, 400);
+        assert_eq!(v["error"]["code"], "invalid", "{v}");
+    }
+
+    #[tokio::test]
+    async fn a_probe_runs_is_audited_and_polled() {
+        use crate::admin::probes::tests::{IP, state, web};
+        let server = web().await;
+        let (state, _c, _id, _d) = state(Some(server.port()), "").await;
+        let app = crate::admin::full_router(state.clone());
+        let token = device(&state, "read,act", "phone").await;
+        let (st, v) = send(
+            &app,
+            authed("POST", &format!("/api/v1/ips/{IP}/probe"), &token),
+        )
+        .await;
+        assert_eq!(st, 202, "{v}");
+        let job_id = v["job_id"].as_str().unwrap().to_string();
+        assert!(job_id.starts_with("p_"));
+        assert_eq!(v["credits_mc"], 0, "standalone: free");
+        assert_eq!(v["vantages"], serde_json::json!([]));
+        let mut seen = serde_json::Value::Null;
+        for _ in 0..100 {
+            let (st, v) = send(
+                &app,
+                authed("GET", &format!("/api/v1/jobs/{job_id}"), &token),
+            )
+            .await;
+            assert_eq!(st, 200, "{v}");
+            assert_eq!(v["kind"], "probe");
+            seen = v;
+            if seen["status"] == "done" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(seen["status"], "done", "{seen}");
+        let vantage = &seen["result"]["vantages"][0];
+        assert_eq!(vantage["state"], "done", "{seen}");
+        assert!(!vantage["ports"].as_array().unwrap().is_empty(), "{seen}");
+        let a = state.store.recent_device_actions(10).await.unwrap();
+        assert_eq!((a.len(), a[0].action.as_str()), (1, "probe"));
+        // Not in the dataset: 404; refused by the gate: 422, nothing logged.
+        let (st, _) = send(
+            &app,
+            authed("POST", "/api/v1/ips/198.51.100.200/probe", &token),
+        )
+        .await;
+        assert_eq!(st, 404);
+        state
+            .store
+            .upsert_ip("10.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        let (st, v) = send(&app, authed("POST", "/api/v1/ips/10.0.0.1/probe", &token)).await;
+        assert_eq!(st, 422, "{v}");
+        assert_eq!(v["error"]["code"], "refused", "{v}");
+        assert_eq!(
+            state.store.recent_device_actions(10).await.unwrap().len(),
+            1
+        );
     }
 }

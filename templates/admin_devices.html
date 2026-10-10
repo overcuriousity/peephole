@@ -15,7 +15,7 @@
   {% else %}
   <form method="post" action="/admin/devices/pair" class="stack">
     <p class="muted">The <span class="mono">read</span> scope is always granted: every <span class="mono">GET</span> under <span class="mono">/api/v1</span> and <span class="mono">POST /api/v1/lookup</span>.</p>
-    <label><input type="checkbox" name="act" value="1"> Also grant <span class="mono">act</span> (reserved; no endpoint needs it yet)</label>
+    <label><input type="checkbox" name="act" value="1"> Also grant <span class="mono">act</span>: start probes and buy counter-scans, which spend credits</label>
     <div><button class="btn btn-primary" type="submit">Pair a device</button></div>
   </form>
   {% endif %}
@@ -35,6 +35,20 @@
             <form method="post" action="/admin/devices/revoke" class="actions"><input type="hidden" name="id" value="{{ d.id }}">
               <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Revoke</button></form></dialog>
         {% endif %}</td>
+      </tr>
+    {% endfor %}</tbody>
+  </table></div>{% endif %}
+</section>
+<section class="card">
+  <div class="card-head"><h2>Recent actions</h2></div>
+  {% if actions.is_empty() %}<p class="muted">No device has started a probe or bought a scan yet.</p>{% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>When</th><th>Device</th><th>Paired by</th><th>Action</th><th>Target</th><th>Credits</th><th>Job</th></tr></thead>
+    <tbody>{% for a in actions %}
+      <tr>
+        <td class="ts">{{ a.at }}</td><td title="{{ a.device_id }}">{{ a.device_name }}</td><td>{{ a.paired_by }}</td>
+        <td>{{ a.action }}</td><td class="mono"><a href="/ip/{{ a.target }}#actions">{{ a.target }}</a></td>
+        <td class="mono">{{ a.credits() }}</td><td class="mono">{{ a.job_id }}</td>
       </tr>
     {% endfor %}</tbody>
   </table></div>{% endif %}
