@@ -26,6 +26,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/api/v1/ips/{addr}", get(ip_detail))
         .route("/api/v1/lookup", post(lookup))
         .route("/api/v1/ips/{addr}/probe", post(probe))
+        .route("/api/v1/ips/{addr}/probe/vantages", get(probe_vantages))
         .route("/api/v1/ips/{addr}/scan/quote", get(scan_quote))
         .route("/api/v1/ips/{addr}/scan", post(scan_buy))
         .route("/api/v1/jobs/{job_id}", get(job))
@@ -515,6 +516,59 @@ async fn probe(
         })),
     )
         .into_response()
+}
+
+/// GET /api/v1/ips/{addr}/probe/vantages: what the Actions card offers
+/// (`probes::actions_for`), so the app can show the total before a probe.
+/// Spends nothing.
+async fn probe_vantages(
+    ActAuth(_device): ActAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(addr): Path<String>,
+) -> Response {
+    let (ip, _) = match row_of(&state, &addr).await {
+        Ok(r) => r,
+        Err(r) => return *r,
+    };
+    let a = crate::admin::probes::actions_for(&state, &ip).await;
+    // `probes::start` refuses these; the card does not check the prober.
+    let why_not = a.why_not.clone().or_else(|| {
+        (a.standalone && state.prober.is_none()).then(|| "this node does not probe".to_string())
+    });
+    if let Some(why) = why_not {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, "refused", why);
+    }
+    Json(json!({ "vantages": vantages_json(&a) })).into_response()
+}
+
+/// The card's vantages with their prices and default pick; standalone,
+/// the node itself, free.
+fn vantages_json(a: &crate::admin::probes::ActionsView) -> Vec<Value> {
+    if a.standalone {
+        let (credits, credits_mc) = credits(0);
+        return vec![json!({
+            "id": crate::scan::probe::gate::LOCAL.to_string(),
+            "name": "this node",
+            "country": null,
+            "credits": credits,
+            "credits_mc": credits_mc,
+            "default": true,
+        })];
+    }
+    a.vantages
+        .iter()
+        .map(|v| {
+            let (credits, credits_mc) = credits(v.price_mc as u64);
+            json!({
+                "id": v.id,
+                "name": v.name,
+                "country": v.country,
+                "credits": credits,
+                "credits_mc": credits_mc,
+                "default": a.ticked(&v.id),
+            })
+        })
+        .collect()
 }
 
 /// 409 for a scan that is not sold (`scan_buy::sale`).
@@ -1263,6 +1317,7 @@ mod tests {
         let read = device(&state, "read", "reader").await;
         let calls = [
             ("POST", format!("/api/v1/ips/{SCAN_IP}/probe")),
+            ("GET", format!("/api/v1/ips/{SCAN_IP}/probe/vantages")),
             ("GET", format!("/api/v1/ips/{SCAN_IP}/scan/quote?level=2")),
             ("POST", format!("/api/v1/ips/{SCAN_IP}/scan")),
             ("GET", "/api/v1/jobs/s_1".to_string()),
@@ -1689,5 +1744,85 @@ mod tests {
             state.store.recent_device_actions(10).await.unwrap().len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn probe_vantages_list_the_node_itself_standalone_and_spend_nothing() {
+        use crate::admin::probes::tests::{IP, state};
+        let (state, _c, _id, _d) = state(None, "").await;
+        let app = crate::admin::full_router(state.clone());
+        let token = device(&state, "read,act", "phone").await;
+        let path = |ip: &str| format!("/api/v1/ips/{ip}/probe/vantages");
+        let (st, v) = send(&app, authed("GET", &path(IP), &token)).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(
+            v["vantages"],
+            serde_json::json!([{
+                "id": crate::scan::probe::gate::LOCAL.to_string(),
+                "name": "this node",
+                "country": null,
+                "credits": crate::credits::show(0),
+                "credits_mc": 0,
+                "default": true,
+            }])
+        );
+        let (st, _) = send(&app, authed("GET", &path("198.51.100.200"), &token)).await;
+        assert_eq!(st, 404);
+        state
+            .store
+            .upsert_ip("10.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        let (st, v) = send(&app, authed("GET", &path("10.0.0.1"), &token)).await;
+        assert_eq!(st, 422, "{v}");
+        assert_eq!(v["error"]["code"], "refused", "{v}");
+        assert!(
+            state
+                .store
+                .recent_device_actions(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a read is not audited"
+        );
+    }
+
+    /// In a cluster the list is the card's vantages, ticked as the card
+    /// ticks them.
+    #[test]
+    fn probe_vantages_carry_the_cards_prices_and_default_pick() {
+        use crate::admin::probes::{ActionsView, VantageView};
+        let vantage = |id: &str, mc: u32| VantageView {
+            id: id.into(),
+            name: format!("node-{id}"),
+            country: Some("DE".into()),
+            price: crate::credits::show(mc as u64),
+            price_mc: mc,
+        };
+        let a = ActionsView {
+            guard_line: String::new(),
+            allowed: true,
+            why_not: None,
+            vantages: vec![vantage("a", 20), vantage("b", 30), vantage("c", 50)],
+            default: vec!["a".into(), "c".into()],
+            balance: None,
+            standalone: false,
+            scans: vec![],
+        };
+        let v = super::vantages_json(&a);
+        let ids: Vec<_> = v.iter().map(|v| v["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+        for (j, view) in v.iter().zip(&a.vantages) {
+            assert_eq!(j["default"], a.ticked(&view.id), "{j}");
+            assert_eq!(j["credits"], view.price, "{j}");
+            assert_eq!(j["credits_mc"], view.price_mc, "{j}");
+            assert_eq!(j["country"], "DE");
+        }
+        let total: u64 = v
+            .iter()
+            .filter(|j| j["default"] == true)
+            .map(|j| j["credits_mc"].as_u64().unwrap())
+            .sum();
+        assert_eq!(crate::credits::show(total), a.default_total());
     }
 }
