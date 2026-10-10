@@ -389,20 +389,29 @@ async fn lookup(
     let ask = f.asked();
     let text = f.ip.unwrap_or_default().trim().to_string();
     let cluster = state.recorder.node().is_some();
-    if text.parse::<IpAddr>().is_err() && is_list(&text) {
+    if text.parse::<IpAddr>().is_err() && !text.contains("://") && is_list(&text) {
         return bulk_page(&state, text).await;
     }
-    let Ok(ip) = text.parse::<IpAddr>() else {
-        let (names, results, error) = match crate::intel::dns::valid_name(&text) {
-            None => (None, vec![], Some("Not an IP address or host name.".into())),
-            Some(name) => match by_name(&state, &name, async |n: &str| {
-                crate::intel::dns::resolve_here(n).await
-            })
-            .await?
-            {
-                Ok((view, results)) => (Some(view), results, None),
-                Err(e) => (None, vec![], Some(e)),
-            },
+    let host = crate::intel::dns::host_of(&text);
+    let Some(crate::intel::dns::Host::Ip(ip)) = host else {
+        // A URL shows as its host: its userinfo is not echoed back.
+        let (names, results, error, text) = match host {
+            Some(crate::intel::dns::Host::Name(name)) => {
+                match by_name(&state, &name, async |n: &str| {
+                    crate::intel::dns::resolve_here(n).await
+                })
+                .await?
+                {
+                    Ok((view, results)) => (Some(view), results, None, name),
+                    Err(e) => (None, vec![], Some(e), name),
+                }
+            }
+            _ => (
+                None,
+                vec![],
+                Some("Not an IP address, host name or URL.".into()),
+                text,
+            ),
         };
         return render(&LookupPage {
             chrome: chrome(),
@@ -440,11 +449,28 @@ pub async fn by_name(
     name: &str,
     resolve: impl AsyncFn(&str) -> Result<Vec<IpAddr>, String>,
 ) -> AppResult<Result<(NamesView, Vec<LookupResult>), String>> {
-    use crate::intel::dns;
-    let (tally, record) = match dns::lookup_with(&state.recorder, &state.geo, name, resolve).await {
+    let (view, followed) = match resolve_name(state, name, resolve).await {
         Ok(x) => x,
         Err(e) => return Ok(Err(e)),
     };
+    let results = futures::future::join_all(followed.iter().map(|ip| run(state, *ip, &[], &[])))
+        .await
+        .into_iter()
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(Ok((view, results)))
+}
+
+/// Resolve `name` with several nodes (`resolve` standing in for this
+/// node's resolver) and store the record: the view of the votes, and the
+/// first [`crate::intel::dns::MAX_FOLLOWED`] addresses they agree on. The
+/// error: the name was not resolved or not stored.
+pub async fn resolve_name(
+    state: &AdminState,
+    name: &str,
+    resolve: impl AsyncFn(&str) -> Result<Vec<IpAddr>, String>,
+) -> Result<(NamesView, Vec<IpAddr>), String> {
+    use crate::intel::dns;
+    let (tally, record) = dns::lookup_with(&state.recorder, &state.geo, name, resolve).await?;
     let label = |id: &crate::cluster::identity::NodeId| match state.recorder.node() {
         Some(node) => match dns::describe(node, &state.geo, id) {
             (n, Some(c)) => format!("{n} ({c})"),
@@ -499,22 +525,14 @@ pub async fn by_name(
         Some(r) => r.answers.iter().map(|(id, _)| label(id)).collect(),
         None => tally.errors.iter().map(|(id, _)| label(id)).collect(),
     };
-    let agreed: Vec<IpAddr> = tally
+    let followed: Vec<IpAddr> = tally
         .votes
         .iter()
         .filter(|v| v.agreed)
+        .take(dns::MAX_FOLLOWED)
         .map(|v| v.addr)
         .collect();
-    let followed = futures::future::join_all(
-        agreed
-            .iter()
-            .take(dns::MAX_FOLLOWED)
-            .map(|ip| run(state, *ip, &[], &[])),
-    )
-    .await
-    .into_iter()
-    .collect::<AppResult<Vec<_>>>()?;
-    Ok(Ok((
+    Ok((
         NamesView {
             name: name.to_string(),
             note,
@@ -528,7 +546,7 @@ pub async fn by_name(
             also: past.iter().map(IpAddr::to_string).collect(),
         },
         followed,
-    )))
+    ))
 }
 
 fn age(secs: i64) -> String {
@@ -922,6 +940,18 @@ secure_cookies = false
 
         let (_, html) = send(&app, post(), "ip=2001:DB8::1").await;
         assert!(html.contains("2001:db8::1") && html.contains("not in the dataset"));
+
+        // A URL is looked up as its host; its userinfo is not shown.
+        let (_, html) = send(
+            &app,
+            post(),
+            "ip=https%3A%2F%2Fu%3Asecret%40%5B2001%3Adb8%3A%3A1%5D%3A8443%2Fx%3Fa%3D1%2C2",
+        )
+        .await;
+        assert!(html.contains("2001:db8::1") && html.contains("not in the dataset"));
+        assert!(!html.contains("secret"));
+        let (_, html) = send(&app, post(), "ip=http%3A%2F%2Fexample.com%3Ahttp%2F").await;
+        assert!(html.contains("Not an IP address, host name or URL"));
     }
 
     #[test]
