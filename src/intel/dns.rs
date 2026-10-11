@@ -71,6 +71,62 @@ pub fn valid_name(input: &str) -> Option<String> {
     ok.then_some(name)
 }
 
+/// What a typed address, host name or URL is to be looked up as.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Host {
+    Ip(IpAddr),
+    Name(String),
+}
+
+/// The host of `input`: an IP address, a host name ([`valid_name`]), or a
+/// URL (`scheme://[user@]host[:port][/path][?query][#frag]`, the scheme
+/// optional) reduced to its host. Userinfo is dropped; an IPv6 host is in
+/// brackets when it has a port or a path, and bare otherwise. None: no host
+/// can be read.
+pub fn host_of(input: &str) -> Option<Host> {
+    let text = input.trim();
+    if let Ok(ip) = text.parse::<IpAddr>() {
+        return Some(Host::Ip(crate::net::canonical(ip)));
+    }
+    let rest = match text.split_once("://") {
+        Some((scheme, rest))
+            if !scheme.is_empty()
+                && scheme
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b)) =>
+        {
+            rest
+        }
+        Some(_) => return None,
+        None => text,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if let Some(v6) = host_port.strip_prefix('[') {
+        let (addr, port) = v6.split_once(']')?;
+        let port_ok = port.is_empty()
+            || port
+                .strip_prefix(':')
+                .is_some_and(|p| p.parse::<u16>().is_ok());
+        return match (addr.parse::<std::net::Ipv6Addr>(), port_ok) {
+            (Ok(ip), true) => Some(Host::Ip(crate::net::canonical(IpAddr::V6(ip)))),
+            _ => None,
+        };
+    }
+    if let Ok(ip) = host_port.parse::<IpAddr>() {
+        return Some(Host::Ip(crate::net::canonical(ip)));
+    }
+    let host = match host_port.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => h,
+        Some(_) => return None,
+        None => host_port,
+    };
+    match host.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => Some(Host::Ip(IpAddr::V4(ip))),
+        Err(_) => valid_name(host).map(Host::Name),
+    }
+}
+
 /// RFC 3492 §6.3: the punycode of one label (without the `xn--`). None on
 /// overflow.
 fn punycode(input: &[char]) -> Option<String> {
@@ -698,6 +754,43 @@ mod tests {
         );
         assert_eq!(head(), before, "no receipt");
         assert_eq!(demand(), 1.0, "served free: demand");
+    }
+
+    #[test]
+    fn urls_are_reduced_to_their_host() {
+        let name = |n: &str| Some(Host::Name(n.to_string()));
+        let ip = |a: &str| Some(Host::Ip(a.parse().unwrap()));
+        for (input, want) in [
+            ("example.com", name("example.com")),
+            (" WWW.Example.COM. ", name("www.example.com")),
+            ("https://example.com", name("example.com")),
+            ("https://example.com/", name("example.com")),
+            ("http://example.com:8080/a/b?q=1#f", name("example.com")),
+            ("HTTPS://Example.com?q=a,b", name("example.com")),
+            ("example.com/path?q", name("example.com")),
+            ("example.com:443", name("example.com")),
+            ("https://user:pw@example.com/x", name("example.com")),
+            ("ftp://anon@files.example.org", name("files.example.org")),
+            ("https://bücher.example/", name("xn--bcher-kva.example")),
+            ("203.0.113.9", ip("203.0.113.9")),
+            ("http://203.0.113.9:8080/x", ip("203.0.113.9")),
+            ("203.0.113.9/login", ip("203.0.113.9")),
+            ("2001:db8::1", ip("2001:db8::1")),
+            ("http://[2001:db8::1]:8443/x", ip("2001:db8::1")),
+            ("[2001:db8::1]", ip("2001:db8::1")),
+            ("https://u:p@[2001:db8::1]/", ip("2001:db8::1")),
+            ("::ffff:203.0.113.9", ip("203.0.113.9")),
+            ("", None),
+            ("localhost", None),
+            ("http://", None),
+            ("https://example.com:http/", None),
+            ("http://[2001:db8::1", None),
+            ("http://[example.com]/", None),
+            ("ht tp://example.com", None),
+            ("not a host", None),
+        ] {
+            assert_eq!(host_of(input), want, "{input}");
+        }
     }
 
     #[test]

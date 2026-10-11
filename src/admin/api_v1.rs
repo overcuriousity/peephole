@@ -395,11 +395,20 @@ async fn ip_detail(
 
 #[derive(serde::Deserialize)]
 pub struct LookupBody {
+    #[serde(default)]
     ips: Vec<String>,
+    #[serde(default)]
+    names: Vec<String>,
 }
 
+/// Host names (or URLs) resolved in one `/api/v1/lookup`: each costs DNS
+/// round-trips, on several nodes in a cluster.
+pub const MAX_NAMES: usize = 10;
+
 /// Stored-data lookup for many addresses at once: the semantics and the cap
-/// of the admin bulk lookup, but JSON. No provider is asked.
+/// of the admin bulk lookup, but JSON. No provider is asked. `names` are
+/// resolved as on the admin lookup page, then their agreed addresses read
+/// the same way.
 async fn lookup(
     DeviceAuth(_): DeviceAuth,
     State(state): State<Arc<AdminState>>,
@@ -412,13 +421,104 @@ async fn lookup(
         Ok(r) => r,
         Err(e) => return internal(e),
     };
+    let names = match names_json(&state, &b.names, async |n: &str| {
+        crate::intel::dns::resolve_here(n).await
+    })
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => return internal(e),
+    };
     Json(json!({
         "results": read.rows.iter().map(summary_json).collect::<Vec<_>>(),
         "missing": read.missing,
         "unreadable": read.unreadable,
         "capped": read.capped,
+        "names": names,
     }))
     .into_response()
+}
+
+/// One entry per name, in order: its host, how it resolved (`resolve`),
+/// and the stored data on its agreed addresses — or a per-entry `error`.
+/// `resolve` stands in for this node's resolver. The input is not echoed:
+/// a URL may carry credentials.
+async fn names_json(
+    state: &AdminState,
+    names: &[String],
+    resolve: impl AsyncFn(&str) -> Result<Vec<IpAddr>, String> + Copy,
+) -> anyhow::Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(names.len());
+    for (i, input) in names.iter().enumerate() {
+        out.push(match i < MAX_NAMES {
+            true => name_json(state, input, resolve).await?,
+            false => entry_err("capped", "past the names cap of one request"),
+        });
+    }
+    Ok(out)
+}
+
+fn entry_err(code: &str, message: &str) -> Value {
+    json!({"error": {"code": code, "message": message}})
+}
+
+/// The stored summaries of `addrs`, and those not in the dataset.
+async fn read_addrs(
+    state: &AdminState,
+    addrs: &[IpAddr],
+) -> anyhow::Result<(Vec<Value>, Vec<String>)> {
+    let addrs: Vec<String> = addrs.iter().map(IpAddr::to_string).collect();
+    let r = crate::admin::lookup::bulk_read(state, addrs.iter().map(String::as_str)).await?;
+    Ok((r.rows.iter().map(summary_json).collect(), r.missing))
+}
+
+async fn name_json(
+    state: &AdminState,
+    input: &str,
+    resolve: impl AsyncFn(&str) -> Result<Vec<IpAddr>, String>,
+) -> anyhow::Result<Value> {
+    use crate::intel::dns::{Host, host_of};
+    let name = match host_of(input) {
+        None => return Ok(entry_err("invalid", "not an IP address, host name or URL")),
+        Some(Host::Ip(ip)) => {
+            let (results, missing) = read_addrs(state, &[ip]).await?;
+            return Ok(json!({"host": ip.to_string(), "results": results, "missing": missing}));
+        }
+        Some(Host::Name(name)) => name,
+    };
+    let (view, followed) = match crate::admin::lookup::resolve_name(state, &name, resolve).await {
+        Ok(x) => x,
+        Err(e) => {
+            let mut v = entry_err("unresolved", &e);
+            v["host"] = json!(name);
+            return Ok(v);
+        }
+    };
+    let mut v = json!({
+        "host": name,
+        "resolve": {
+            "note": view.note,
+            "votes": view.rows.iter().map(|r| json!({
+                "ip": r.ip, "agreed": r.agreed, "verdict": r.verdict,
+            })).collect::<Vec<_>>(),
+            "resolvers": view.resolvers,
+            "errors": view.errors.iter().map(|(node, why)| json!({
+                "node": node, "why": why,
+            })).collect::<Vec<_>>(),
+            "also": view.also,
+        },
+    });
+    if followed.is_empty() {
+        v["error"] = json!({
+            "code": "unresolved",
+            "message": view.note.as_deref().unwrap_or("no agreed address"),
+        });
+    } else {
+        let (results, missing) = read_addrs(state, &followed).await?;
+        v["results"] = json!(results);
+        v["missing"] = json!(missing);
+    }
+    Ok(v)
 }
 
 /// A path address and its dataset row id: 400 when it is not an address,
@@ -1234,6 +1334,84 @@ mod tests {
         )
         .await;
         assert_eq!(st, 401);
+    }
+
+    #[tokio::test]
+    async fn lookup_resolves_names_and_urls_per_entry() {
+        let (state, cookie, app, _d) = app().await;
+        seed_ip(&state, "203.0.113.9", "[]", 0).await;
+        let names: Vec<String> = [
+            "https://user:secret@www.example.com:8443/a?b=c",
+            "http://[2001:db8::1]:8080/",
+            "203.0.113.9/login",
+            "gone.example",
+            "garbage!!",
+        ]
+        .map(String::from)
+        .to_vec();
+        let v = super::names_json(&state, &names, async |n: &str| match n {
+            "www.example.com" => Ok(vec![
+                "203.0.113.9".parse().unwrap(),
+                "198.51.100.7".parse().unwrap(),
+                "10.0.0.1".parse().unwrap(),
+            ]),
+            _ => Err("NXDOMAIN".to_string()),
+        })
+        .await
+        .unwrap();
+        let v = serde_json::Value::from(v);
+        assert!(
+            !v.to_string().contains("secret"),
+            "userinfo is dropped: {v}"
+        );
+        let www = &v[0];
+        assert_eq!(www["host"], "www.example.com", "{v}");
+        assert_eq!(www["resolve"]["note"], "resolved locally, unverified");
+        let votes = www["resolve"]["votes"].as_array().unwrap();
+        assert_eq!(votes.len(), 2, "a private answer is dropped: {v}");
+        assert!(
+            votes
+                .iter()
+                .all(|x| x["agreed"] == true && x["verdict"] == "agreed by 1 of 1")
+        );
+        // Storing the resolution puts its addresses in the dataset.
+        let ips: Vec<&str> = www["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["ip"].as_str().unwrap())
+            .collect();
+        assert_eq!(ips, ["198.51.100.7", "203.0.113.9"], "{v}");
+        assert_eq!(www["missing"], serde_json::json!([]));
+        assert!(www.get("error").is_none());
+        // IP-literal hosts take the address path, unresolved.
+        assert_eq!(v[1]["host"], "2001:db8::1");
+        assert_eq!(v[1]["missing"], serde_json::json!(["2001:db8::1"]));
+        assert!(v[1].get("resolve").is_none());
+        assert_eq!(v[2]["host"], "203.0.113.9");
+        assert_eq!(v[2]["results"][0]["ip"], "203.0.113.9");
+        assert_eq!(v[3]["host"], "gone.example");
+        assert_eq!(v[3]["error"]["code"], "unresolved", "{v}");
+        assert_eq!(v[4]["error"]["code"], "invalid");
+
+        // Over HTTP: names past the cap are refused per entry, the batch
+        // and the `ips` part answer as before.
+        let (token, _) = pair(&app, &cookie).await;
+        let mut names = vec!["garbage!!"; super::MAX_NAMES];
+        names.push("example.com");
+        let mut r = post_json(
+            "/api/v1/lookup",
+            serde_json::json!({"ips": ["203.0.113.9"], "names": names}),
+        );
+        r.headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let (st, v) = send(&app, r).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["results"][0]["ip"], "203.0.113.9");
+        let names = v["names"].as_array().unwrap();
+        assert_eq!(names.len(), super::MAX_NAMES + 1);
+        assert_eq!(names[0]["error"]["code"], "invalid");
+        assert_eq!(names[super::MAX_NAMES]["error"]["code"], "capped", "{v}");
     }
 
     #[tokio::test]

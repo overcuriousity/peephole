@@ -5,8 +5,8 @@
 {% let sub = "lookup" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Lookup</h1><p class="muted">What the cluster knows about an address, and what every reachable provider says now.{% if cluster %} Provider answers are paid with credits.{% endif %}</p></div></div>
 <form class="lookup-bar card" method="post" action="/admin/lookup">
-  <label class="visually-hidden" for="lookup-q">IP address, host name, or a pasted list</label>
-  <textarea id="lookup-q" class="mono" name="ip" rows="1" data-enter-submits placeholder="203.0.113.7, 2001:db8::1, example.com, or a pasted list" required autofocus>{% if let Some(b) = bulk %}{{ b.text }}{% else %}{{ ip }}{% endif %}</textarea>
+  <label class="visually-hidden" for="lookup-q">IP address, host name, URL, or a pasted list</label>
+  <textarea id="lookup-q" class="mono" name="ip" rows="1" data-enter-submits placeholder="203.0.113.7, 2001:db8::1, example.com, a URL, or a pasted list" required autofocus>{% if let Some(b) = bulk %}{{ b.text }}{% else %}{{ ip }}{% endif %}</textarea>
   <button class="btn btn-primary" type="submit" data-busy="Looking up…">Look up{% if offer.balance.is_some() %} · up to <span class="num">{{ offer.total }}</span> credits{% if results.len() > 1 %} each{% endif %}{% endif %}</button>
   {% if let Some(b) = offer.balance %}
   <a class="balance-chip" href="/admin/cluster/credits" title="Credits{% if offer.fleet %} of all your nodes{% endif %}"><span class="label">Balance</span><b class="num">{{ b }}</b><span class="muted">this lookup up to {{ offer.total }}{% if results.len() > 1 %} each{% endif %}</span></a>

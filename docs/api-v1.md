@@ -207,7 +207,7 @@ the API serves stored data only).
 
 Stored-data lookup for several addresses at once — the same semantics and
 the same 500-address cap as the admin bulk lookup. No provider is asked; no
-credits are spent.
+credits are spent on `ips`. Host names and URLs go in `names` (below).
 
 ```json
 { "ips": ["203.0.113.9", "2001:db8::1", "198.51.100.0/24"] }
@@ -233,6 +233,59 @@ credits are spent.
 - `missing` — exact addresses not in the dataset; `unreadable` — entries
   that are neither an address nor a network; `capped` — more than 500
   stored rows matched, the list is truncated.
+- `names` — one entry per item of the optional `names` field, below
+  (`[]` when it is absent).
+
+#### Host names and URLs
+
+`names` takes host names and URLs, up to **10 per request** (each is a
+DNS resolution, on several nodes in a cluster); `ips` may then be left out.
+
+```json
+{ "names": ["example.com", "https://example.com:8443/login?x=1", "http://[2001:db8::1]/"] }
+```
+
+Each entry is reduced to its host: a URL
+(`scheme://[user@]host[:port][/path][?query][#fragment]`, or the same
+without the scheme, e.g. `example.com/path`) loses everything but the host;
+userinfo is dropped and neither echoed nor logged. An IP-literal host
+(`203.0.113.9`, `[2001:db8::1]`) is read like an `ips` entry. A host name is
+resolved exactly as the admin lookup page resolves it — by this node, and in
+a cluster by member resolvers that vote (a member may charge its `resolve`
+price, as on the admin page) — and the record is stored; its agreed
+addresses (the first 16) are then read from stored data like `ips`. No
+intelligence provider is asked.
+
+`names` in the answer is in request order; the input is not repeated:
+
+```json
+"names": [
+  { "host": "example.com",
+    "resolve": {
+      "note": null,
+      "votes": [ { "ip": "203.0.113.9", "agreed": true, "verdict": "agreed by 3 of 3" } ],
+      "resolvers": ["alice (DE)", "bob (NL)", "carol (FR)"],
+      "errors": [],
+      "also": []
+    },
+    "results": [ { "ip": "203.0.113.9", "…": "the per-IP summary" } ],
+    "missing": [] },
+  { "host": "2001:db8::1", "results": [], "missing": ["2001:db8::1"] },
+  { "host": "gone.example", "resolve": { "…": "…" },
+    "error": { "code": "unresolved", "message": "No resolver answered; nothing was stored." } },
+  { "error": { "code": "invalid", "message": "not an IP address, host name or URL" } }
+]
+```
+
+- `resolve` (host names only) — `votes`: every address answered, whether
+  it is agreed and by how many; `note`: how far the answer can be trusted
+  when not by a majority of several (`"resolved locally, unverified"`
+  standalone, `"unverified — single resolver"`), else `null`;
+  `resolvers`: the nodes asked; `errors`: `{node, why}` per node that did
+  not answer; `also`: agreed addresses past the first 16, not read.
+- A failed entry carries `error` with `code` `invalid` (no host can be
+  read), `unresolved` (no agreed address), or `capped` (past the 10th
+  name; not resolved). A failed entry never fails the request.
 
 ## Act endpoints
 

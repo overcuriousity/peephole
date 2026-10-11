@@ -7,6 +7,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Added
 
+- `POST /api/v1/lookup` takes host names and URLs in a new `names` field
+  (up to 10 per request): each is reduced to its host (userinfo dropped),
+  resolved as on the admin lookup page, and answered per entry with the
+  resolver votes and the stored data on the agreed addresses; a bad or
+  unresolvable name is a per-entry error. `{"ips": [...]}` is unchanged.
+  The admin lookup page accepts the same URL forms.
 - Scan level 5, sold on the Actions card at 256 times the level-1 price:
   nmap's `vuln` scripts (minus `external`) on the top 1000 ports. Only an
   admin's bought scan reaches it; the automatic queue stays within levels
