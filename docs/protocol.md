@@ -110,6 +110,13 @@ node that wrote it.
   Entries dated more than 5 minutes ahead of a node's clock wait there
   until it catches up, and a node's entries must be dated later than its
   previous one; older ones are kept in the log but take no effect.
+- Files dropped on the trap (`upload` entries) carry their signed SHA-256
+  and metadata. The bytes, at most 1 MiB, travel beside the entry,
+  unsigned, only when their origin newly stored them. Each receiver
+  recomputes the hash and keeps the bytes only within its own bounds: a
+  daily budget per origin (counted on the receiver's day), a ceiling on
+  all upload content, and a free-disk floor. The entry applies and is
+  relayed either way. The bytes never enter the log.
 - A standalone node that joins brings its history with it.
 - Every member sees everything the cluster records, including raw requests
   and false-positive claims with their optional contact address. Every
