@@ -412,6 +412,7 @@ pub async fn can_admit(node: &Node, member: &NodeId) -> Result<bool> {
         payload: None,
         sig: None,
         erased_by: None,
+        content: None,
     };
     Ok(may_sponsor(node, &mut conn, &probe, member, probe.hlc)
         .await?
