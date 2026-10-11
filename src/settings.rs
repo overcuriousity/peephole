@@ -443,7 +443,10 @@ impl Settings {
                 );
             }
         }
-        Ok((validate(s, &all, &none).unwrap_or(s), dropped))
+        let mut out = validate(s, &all, &none).unwrap_or(s);
+        // The upload bounds as the trap and `apply` read them: one source.
+        out.uploads = Limits::load(conn).await?;
+        Ok((out, dropped))
     }
 
     fn adopt(&self, s: Snapshot) {
