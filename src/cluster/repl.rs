@@ -163,6 +163,7 @@ fn from_row(r: LogRow) -> Result<WireEntry> {
         payload: r.5,
         sig: r.6,
         erased_by: r.7,
+        content: None,
     })
 }
 

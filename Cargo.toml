@@ -45,6 +45,8 @@ regex = "1"
 reqwest = { version = "0.13", features = ["rustls", "gzip", "json", "cookies", "form", "query"] }
 rpassword = "7"
 rustls = "0.23"
+# Free disk under the database, for the upload store's floor (statvfs).
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11.19"
 serde_ignored = "0.1.14"

@@ -24,6 +24,7 @@ pub mod recorder;
 pub mod requests;
 pub mod scans;
 pub mod stats;
+pub mod uploads;
 pub mod useragent;
 
 use anyhow::Context;
@@ -72,6 +73,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0031_stats_index.sql"),
     include_str!("migrations/0032_devices.sql"),
     include_str!("migrations/0033_device_actions.sql"),
+    include_str!("migrations/0034_uploads.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
