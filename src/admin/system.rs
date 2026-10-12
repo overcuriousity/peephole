@@ -284,6 +284,34 @@ async fn export_download(
         label: field("label").map(str::to_string),
         min_severity: field("min_severity").and_then(|s| s.parse().ok()),
     };
+    // The uploads table (MIK-121): metadata and hash only, Parquet only.
+    match q.get("table").map(String::as_str) {
+        None | Some("" | "requests") => {}
+        Some("uploads") => {
+            if q.get("format").map(String::as_str) != Some("parquet") {
+                return (StatusCode::BAD_REQUEST, "the uploads table is parquet only")
+                    .into_response();
+            }
+            return match crate::export::parquet::uploads(&state.store, &filter).await {
+                Ok(bytes) => (
+                    [
+                        (header::CONTENT_TYPE, "application/octet-stream"),
+                        (
+                            header::CONTENT_DISPOSITION,
+                            "attachment; filename=\"peephole-uploads.parquet\"",
+                        ),
+                    ],
+                    bytes,
+                )
+                    .into_response(),
+                Err(e) => {
+                    tracing::warn!(?e, "export: uploads");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            };
+        }
+        _ => return (StatusCode::BAD_REQUEST, "table must be requests|uploads").into_response(),
+    }
     use crate::export::Format;
     let (format, ext, mime) = match q.get("format").map(String::as_str) {
         Some("csv") => (Format::Csv, "csv", "text/csv"),

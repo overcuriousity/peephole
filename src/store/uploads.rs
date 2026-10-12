@@ -427,6 +427,89 @@ pub async fn answered_paths(
     Ok(rows)
 }
 
+/// One upload's metadata, as `/api/v1` and the Parquet export give it out.
+/// It has no content field: no query here reads `content`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UploadMeta {
+    pub id: i64,
+    pub uid: String,
+    pub request_uid: String,
+    /// The node that collected it (`origin`); None on a standalone node.
+    pub node_id: Option<Vec<u8>>,
+    pub ts: String,
+    pub ip: String,
+    pub kind: String,
+    /// The client's file name, as sent: attacker text.
+    pub filename: Option<String>,
+    pub sniffed_type: String,
+    pub size: i64,
+    pub truncated: bool,
+    pub sha256: Vec<u8>,
+    pub answered_path: String,
+    pub path_is_prefix: bool,
+    pub content_state: String,
+}
+
+/// Which uploads [`super::Store::uploads_meta`] reads. With `after`, the
+/// page runs oldest first from that id (the export); otherwise newest
+/// first, below `before` if given (the API).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UploadQuery<'a> {
+    pub before: Option<i64>,
+    pub after: Option<i64>,
+    pub sha256: Option<&'a [u8]>,
+    /// `ts` bounds, inclusive, in the stored `YYYY-MM-DD HH:MM:SS` form.
+    pub from: Option<&'a str>,
+    pub to: Option<&'a str>,
+    pub ip: Option<&'a str>,
+}
+
+impl super::Store {
+    /// Up to `limit` uploads' metadata matching `q`.
+    pub async fn uploads_meta(&self, q: &UploadQuery<'_>, limit: i64) -> Result<Vec<UploadMeta>> {
+        let mut w = String::new();
+        let (order, cursor) = match (q.after, q.before) {
+            (Some(a), _) => {
+                w.push_str(" AND u.id > ?");
+                ("ASC", Some(a))
+            }
+            (None, Some(b)) => {
+                w.push_str(" AND u.id < ?");
+                ("DESC", Some(b))
+            }
+            (None, None) => ("DESC", None),
+        };
+        for (on, clause) in [
+            (q.sha256.is_some(), " AND u.sha256 = ?"),
+            (q.from.is_some(), " AND u.ts >= ?"),
+            (q.to.is_some(), " AND u.ts <= ?"),
+            (q.ip.is_some(), " AND i.ip = ?"),
+        ] {
+            if on {
+                w.push_str(clause);
+            }
+        }
+        let sql = format!(
+            "SELECT u.id, u.uid, u.request_uid, u.origin AS node_id, u.ts, i.ip, u.kind,
+                    u.filename, u.sniffed_type, u.size, u.truncated, u.sha256,
+                    u.answered_path, u.path_is_prefix, u.content_state
+             FROM uploads u JOIN ips i ON i.id = u.ip_id
+             WHERE 1=1{w} ORDER BY u.id {order} LIMIT ?"
+        );
+        let mut query = sqlx::query_as::<_, UploadMeta>(sqlx::AssertSqlSafe(sql));
+        if let Some(c) = cursor {
+            query = query.bind(c);
+        }
+        if let Some(h) = q.sha256 {
+            query = query.bind(h);
+        }
+        for v in [q.from, q.to, q.ip].into_iter().flatten() {
+            query = query.bind(v);
+        }
+        Ok(query.bind(limit).fetch_all(&self.read).await?)
+    }
+}
+
 /// Daily maintenance: drop content no upload refers to any more, and
 /// budget days that are over. Returns how many blobs went.
 pub async fn gc_blobs(conn: &mut SqliteConnection) -> Result<u64> {
@@ -563,6 +646,48 @@ pub async fn content_for_export(
     .bind(uid)
     .fetch_optional(&mut *conn)
     .await?)
+}
+
+/// Test fixture: a `PUT` of `content` to `path` from `ip` (a fixture
+/// address), recorded as a request and its upload. Returns the upload's uid.
+#[cfg(test)]
+pub(crate) async fn seed_upload(
+    store: &super::Store,
+    ip: &str,
+    path: &str,
+    content: &[u8],
+) -> String {
+    let ip_id = store.upsert_ip(ip.parse().unwrap()).await.unwrap().id;
+    let id = store
+        .insert_request(&super::requests::NewRequest {
+            ip_id,
+            method: "PUT".into(),
+            path: path.into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (request_uid, ts): (String, String) =
+        sqlx::query_as("SELECT uid, ts FROM requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    let r = UploadRec {
+        request_uid,
+        ts,
+        ip: ip.into(),
+        kind: "put".into(),
+        filename: Some("s.php".into()),
+        sniffed_type: "php".into(),
+        size: content.len() as i64,
+        answered_path: path.into(),
+        ..Default::default()
+    };
+    let (_, _, uid) = store.local().record_upload(r, content, true).await.unwrap();
+    uid
 }
 
 #[cfg(test)]

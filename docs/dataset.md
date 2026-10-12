@@ -297,6 +297,32 @@ characters of the page token without dashes.
 A later row that carries a served canary (in a header, the path, the
 query or the body) lists the serving row in `canary_used_from`.
 
+## Uploads
+
+Files dropped on the trap have their own table, in Parquet only: "Table:
+Uploads" in the web form (`/admin/export/download?table=uploads&format=parquet`).
+One row per upload, oldest first. The time and IP filters apply; label
+and severity filters do not. **The file's content is never in it**: the
+table has no content column. Content leaves a node only through the
+admin's per-file zip.
+
+| Column | Meaning |
+|---|---|
+| `uid` | The upload's id. |
+| `request_uid` | The request that carried the file (`uid` in the main export). |
+| `node_id` | Hex id of the node that collected it; null on a standalone node. |
+| `ts` | When it was received (UTC). |
+| `ip` | The source address. |
+| `kind` | `put`, `wp_plugin`, `wp_theme`, `wp_media` or `script`. |
+| `filename` | The file name the client sent, as sent. Attacker text. |
+| `sniffed_type` | From the first bytes: `zip`, `gzip`, `elf`, `php`, `script`, `html`, `text` or `binary`. |
+| `size` | Full size as received. |
+| `truncated` | Only the first 1 MiB was kept. |
+| `sha256` | Lowercase hex SHA-256 of the kept bytes. |
+| `answered_path` | Where the trap told the uploader the file landed. |
+| `path_is_prefix` | `answered_path` is a folder (a plugin or theme). |
+| `content_state` | Whether this node holds the content: `held`, or why not (`dropped_rate`, `dropped_budget`, `dropped_ceiling`, `dropped_disk`, `dropped_mismatch`, `too_big`, `not_received`). |
+
 ## Two exports
 
 **Everything** (the default) includes GeoLite2 results and the API
