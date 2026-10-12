@@ -25,17 +25,39 @@ const VERBS: [&str; 21] = [
 ];
 
 /// This node's answered paths: exact, and prefixes (a plugin's or theme's
-/// folder), each to the uid of the latest upload answered there.
+/// folder), each to the uid of the latest upload recorded there.
 #[derive(Default)]
 pub struct PathMap(Mutex<Paths>);
 
 #[derive(Default)]
 struct Paths {
-    exact: HashMap<String, (u64, String)>,
-    prefix: HashMap<String, (u64, String)>,
+    exact: HashMap<String, Entry>,
+    prefix: HashMap<String, Entry>,
     /// Insertion order, for the bound: (seq, path, is prefix).
     order: VecDeque<(u64, String, bool)>,
     seq: u64,
+}
+
+/// A path is answered while it has a recorded upload or one not yet
+/// settled; an entry with neither is removed.
+#[derive(Default)]
+struct Entry {
+    /// Its latest answer, for the bound.
+    seq: u64,
+    /// The latest recorded upload's uid, and the seq it was reserved at.
+    uid: Option<(u64, String)>,
+    /// Uploads answered here and not yet settled.
+    pending: u32,
+}
+
+impl Paths {
+    fn map(&mut self, is_prefix: bool) -> &mut HashMap<String, Entry> {
+        if is_prefix {
+            &mut self.prefix
+        } else {
+            &mut self.exact
+        }
+    }
 }
 
 impl PathMap {
@@ -67,46 +89,52 @@ impl PathMap {
     /// Answer `path` from now on, before its upload is recorded (no uid
     /// yet); [`Self::settle`] then names the upload or takes it back.
     pub fn reserve(&self, path: &str, is_prefix: bool) -> u64 {
-        self.insert_bounded(path, is_prefix, "", MAX_PATHS)
+        self.answer(path, is_prefix, MAX_PATHS)
     }
 
     /// Settle what [`Self::reserve`] returned `seq` for: the recorded
-    /// upload's uid, or None to stop answering the path. A path answered
-    /// again since is left to its later entry.
+    /// upload's uid, or None when it was not recorded. The path stops
+    /// being answered only when no upload there is recorded or pending.
     pub fn settle(&self, path: &str, is_prefix: bool, seq: u64, uid: Option<&str>) {
         let mut p = self.0.lock().unwrap();
-        let map = if is_prefix {
-            &mut p.prefix
-        } else {
-            &mut p.exact
-        };
-        if map.get(path).is_none_or(|(at, _)| *at != seq) {
+        let map = p.map(is_prefix);
+        // Evicted since: the bound already dropped it.
+        let Some(e) = map.get_mut(path) else {
             return;
-        }
-        match uid {
-            Some(uid) => map.insert(path.to_string(), (seq, uid.to_string())),
-            None => map.remove(path),
         };
+        e.pending = e.pending.saturating_sub(1);
+        if let Some(uid) = uid
+            && e.uid.as_ref().is_none_or(|(at, _)| *at < seq)
+        {
+            e.uid = Some((seq, uid.to_string()));
+        }
+        if e.pending == 0 && e.uid.is_none() {
+            map.remove(path);
+        }
     }
 
-    fn insert_bounded(&self, path: &str, is_prefix: bool, uid: &str, max: usize) -> u64 {
+    fn insert_bounded(&self, path: &str, is_prefix: bool, uid: &str, max: usize) {
+        let seq = self.answer(path, is_prefix, max);
+        self.settle(path, is_prefix, seq, Some(uid));
+    }
+
+    /// Count one more unsettled upload at `path`, evicting the oldest
+    /// past `max`.
+    fn answer(&self, path: &str, is_prefix: bool, max: usize) -> u64 {
         let mut p = self.0.lock().unwrap();
         p.seq += 1;
         let seq = p.seq;
-        let map = if is_prefix {
-            &mut p.prefix
-        } else {
-            &mut p.exact
-        };
-        map.insert(path.to_string(), (seq, uid.to_string()));
+        let e = p.map(is_prefix).entry(path.to_string()).or_default();
+        e.seq = seq;
+        e.pending += 1;
         p.order.push_back((seq, path.to_string(), is_prefix));
         while p.order.len() > max {
             let Some((s, old, pre)) = p.order.pop_front() else {
                 break;
             };
-            let map = if pre { &mut p.prefix } else { &mut p.exact };
+            let map = p.map(pre);
             // A path answered again since is held by its later entry.
-            if map.get(&old).is_some_and(|(at, _)| *at == s) {
+            if map.get(&old).is_some_and(|e| e.seq == s) {
                 map.remove(&old);
             }
         }
@@ -114,18 +142,20 @@ impl PathMap {
     }
 
     /// The upload answered at `path`: the exact path, else the deepest
-    /// prefix folder (each ends in `/`) it lies under.
+    /// prefix folder (each ends in `/`) it lies under. Empty while only
+    /// unsettled uploads answer it.
     pub fn lookup(&self, path: &str) -> Option<String> {
         let p = self.0.lock().unwrap();
-        if let Some((_, uid)) = p.exact.get(path) {
-            return Some(uid.clone());
+        let uid = |e: &Entry| e.uid.as_ref().map(|(_, u)| u.clone()).unwrap_or_default();
+        if let Some(e) = p.exact.get(path) {
+            return Some(uid(e));
         }
         if p.prefix.is_empty() {
             return None;
         }
         path.rmatch_indices('/')
             .find_map(|(i, _)| p.prefix.get(&path[..=i]))
-            .map(|(_, uid)| uid.clone())
+            .map(uid)
     }
 
     pub fn len(&self) -> usize {
@@ -232,6 +262,22 @@ mod tests {
         assert_eq!(m.lookup("/c.php").as_deref(), Some(""));
         m.settle("/c.php", false, c2, Some("u2"));
         assert_eq!(m.lookup("/c.php").as_deref(), Some("u2"));
+        // An upload not recorded leaves the path to one that was.
+        let d1 = m.reserve("/d.php", false);
+        m.settle("/d.php", false, d1, Some("u3"));
+        let d2 = m.reserve("/d.php", false);
+        m.settle("/d.php", false, d2, None);
+        assert_eq!(m.lookup("/d.php").as_deref(), Some("u3"));
+        m.insert("/e.php", false, "u4");
+        let e = m.reserve("/e.php", false);
+        m.settle("/e.php", false, e, None);
+        assert_eq!(m.lookup("/e.php").as_deref(), Some("u4"));
+        // A settle out of order keeps the later upload's uid.
+        let f1 = m.reserve("/f.php", false);
+        let f2 = m.reserve("/f.php", false);
+        m.settle("/f.php", false, f2, Some("u6"));
+        m.settle("/f.php", false, f1, Some("u5"));
+        assert_eq!(m.lookup("/f.php").as_deref(), Some("u6"));
     }
 
     #[test]
