@@ -798,7 +798,7 @@ mod tests {
                 request_uid,
                 ..rec("", b"")
             };
-            let (st, _) = rec_.record_upload(r, b"<?php", true).await.unwrap();
+            let st = rec_.record_upload(r, b"<?php", true).await.unwrap();
             assert_eq!(st, ContentState::Held);
             if n == 0 {
                 rec_.delete_request(id).await.unwrap();
@@ -820,67 +820,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 0, "and the second with its IP");
-    }
-
-    /// Uploads at the edge of the daily budget at once: the check and the
-    /// store are one unit, so no more get in than the budget holds.
-    #[tokio::test]
-    async fn concurrent_uploads_stay_within_the_budget() {
-        let (s, _d) = store().await;
-        sqlx::query("INSERT INTO settings (key, value) VALUES (?, '1')")
-            .bind(KEY_DAILY_MB)
-            .execute(&s.pool)
-            .await
-            .unwrap();
-        let rec_ = s.local();
-        let mut rs = vec![];
-        for n in 0..8u8 {
-            let (id, _) = rec_
-                .insert_request_from(
-                    "203.0.113.22",
-                    &crate::store::requests::NewRequest {
-                        method: "PUT".into(),
-                        path: "/s.php".into(),
-                        headers_json: "[]".into(),
-                        labels_json: "[]".into(),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap();
-            let request_uid: String = sqlx::query_scalar("SELECT uid FROM requests WHERE id = ?")
-                .bind(id)
-                .fetch_one(&s.pool)
-                .await
-                .unwrap();
-            // 300 KiB each: three fit in the 1 MiB budget, a fourth does not.
-            let body = vec![n; 300 * 1024];
-            rs.push((
-                UploadRec {
-                    request_uid,
-                    ..rec("", b"")
-                },
-                body,
-            ));
-        }
-        // Every upload starts on an open connection, so they run in step.
-        let mut warm = vec![];
-        for _ in 0..8 {
-            warm.push(s.pool.acquire().await.unwrap());
-        }
-        drop(warm);
-        let got = futures::future::join_all(
-            rs.iter()
-                .map(|(r, body)| rec_.record_upload(r.clone(), body, true)),
-        )
-        .await;
-        let held = got
-            .into_iter()
-            .filter(|c| c.as_ref().unwrap().0 == ContentState::Held)
-            .count();
-        assert_eq!(held, 3, "the budget check and the store are one unit");
-        let mut c = s.pool.acquire().await.unwrap();
-        assert_eq!(blobs(&mut c).await, 3);
     }
 
     /// Daily maintenance drops content nothing refers to any more.

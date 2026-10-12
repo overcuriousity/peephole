@@ -21,9 +21,6 @@ use std::sync::Arc;
 /// Clock for standalone writes (LWW columns need an HLC there too).
 static LOCAL_HLC: Hlc = Hlc::new();
 
-/// Serializes this node's own uploads (see [`Recorder::record_upload`]).
-static ORIGIN_UPLOADS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 #[derive(Clone)]
 pub enum Recorder {
     Local(Store),
@@ -189,28 +186,22 @@ impl Recorder {
     /// Record a file dropped on the trap: its content within the store's
     /// bounds (`rate_ok`: the per-source rate allows it), then the record.
     /// `r.uid` is set here; `sha256`, `content_state` and `carries_content`
-    /// by [`uploads::insert_upload`]. Returns what became of the content,
-    /// and whether this upload brought it (it was not held before).
+    /// by [`uploads::insert_upload`]. Returns what became of the content.
     pub async fn record_upload(
         &self,
         mut r: UploadRec,
         content: &[u8],
         rate_ok: bool,
-    ) -> Result<(uploads::ContentState, bool)> {
+    ) -> Result<uploads::ContentState> {
         r.uid = self.uid();
         r.build = crate::COMMIT.into();
         let origin = self.node_id().map(|n| n.0.to_vec()).unwrap_or_default();
-        // One upload at a time from storing its content to writing its
-        // record: the log carries them in the order their content was
-        // decided. The store's check and insert are one write transaction,
-        // so no other writer slips past the bounds in between either.
-        let _one = ORIGIN_UPLOADS.lock().await;
-        let mut tx = self.store().pool.begin_with("BEGIN IMMEDIATE").await?;
-        let state = uploads::insert_upload(&mut tx, &origin, &mut r, content, rate_ok).await?;
-        tx.commit().await?;
-        let brought = r.carries_content;
+        let state = {
+            let mut conn = self.store().pool.acquire().await?;
+            uploads::insert_upload(&mut conn, &origin, &mut r, content, rate_ok).await?
+        };
         self.write(vec![Record::Upload(Box::new(r))]).await?;
-        Ok((state, brought))
+        Ok(state)
     }
 
     /// Record requests from `ip` that the flood gate answered without

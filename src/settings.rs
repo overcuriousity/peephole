@@ -344,12 +344,6 @@ impl Settings {
         }
     }
 
-    /// The upload bounds, kept current by every reload and write: the trap
-    /// reads them without the database.
-    pub fn shared_uploads(&self) -> Arc<RwLock<Limits>> {
-        self.uploads.clone()
-    }
-
     /// The config file's values: what a reset goes back to.
     pub fn defaults(&self) -> Snapshot {
         self.defaults
@@ -449,10 +443,7 @@ impl Settings {
                 );
             }
         }
-        let mut out = validate(s, &all, &none).unwrap_or(s);
-        // The upload bounds as the trap and `apply` read them: one source.
-        out.uploads = Limits::load(conn).await?;
-        Ok((out, dropped))
+        Ok((validate(s, &all, &none).unwrap_or(s), dropped))
     }
 
     fn adopt(&self, s: Snapshot) {
