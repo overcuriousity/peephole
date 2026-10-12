@@ -151,6 +151,23 @@ struct StatusPage {
     /// One line per address peers saw this node connect from; None on a
     /// standalone node.
     public_addrs: Option<Vec<String>>,
+    /// Dropped files' content held here, against the store's ceiling.
+    uploads: String,
+}
+
+/// The upload store, as System › Status says it.
+fn uploads_line(held: u64, ceiling_mb: u32) -> String {
+    const MIB: u64 = 1 << 20;
+    let ceiling = u64::from(ceiling_mb) * MIB;
+    let pct = (held * 100).checked_div(ceiling).unwrap_or(100);
+    let mut line = format!(
+        "{:.1} MiB held of a {ceiling_mb} MiB ceiling ({pct} %)",
+        held as f64 / MIB as f64
+    );
+    if held >= ceiling {
+        line.push_str(" · full: new files are kept by hash only");
+    }
+    line
 }
 
 /// The addresses peers saw this node connect from, as System › Status says
@@ -204,6 +221,14 @@ async fn status(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult
         None => None,
     };
     let rules = crate::admin::cluster::builtin_rules();
+    let uploads = {
+        let mut conn = st.store.read.acquire().await?;
+        let limits = crate::store::uploads::Limits::load(&mut conn).await?;
+        uploads_line(
+            crate::store::uploads::blob_bytes(&mut conn).await?,
+            limits.store_max_mb,
+        )
+    };
     render(&StatusPage {
         chrome: chrome(),
         intel: intel_status(&st).await?,
@@ -215,6 +240,7 @@ async fn status(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult
             .collect(),
         tarpit: st.tarpit.as_ref().map(|t| tarpit_line(t.status())),
         public_addrs: st.recorder.node().map(|n| public_addr_lines(n)),
+        uploads,
     })
 }
 
@@ -470,6 +496,22 @@ mod tests {
         assert_eq!(
             tarpit_line(s(256, 256, 1)),
             "256 of 256 connections held (100 %) · 1 source marked · full: new requests get the normal answer"
+        );
+    }
+
+    #[test]
+    fn the_upload_line_says_content_against_the_ceiling() {
+        assert_eq!(
+            uploads_line(256 << 20, 1024),
+            "256.0 MiB held of a 1024 MiB ceiling (25 %)"
+        );
+        assert_eq!(
+            uploads_line(1024 << 20, 1024),
+            "1024.0 MiB held of a 1024 MiB ceiling (100 %) · full: new files are kept by hash only"
+        );
+        assert_eq!(
+            uploads_line(0, 0),
+            "0.0 MiB held of a 0 MiB ceiling (100 %) · full: new files are kept by hash only"
         );
     }
 }
