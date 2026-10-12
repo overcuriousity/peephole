@@ -237,6 +237,19 @@ impl Store {
         level: u8,
         credits_mc: u64,
     ) -> Result<Quote> {
+        self.create_quote_at(device_id, addr, level as i64, credits_mc)
+            .await
+    }
+
+    /// [`Store::create_quote`] at any `level`: a lookup quote carries a
+    /// negative one (see `admin::api_v1`).
+    pub async fn create_quote_at(
+        &self,
+        device_id: &str,
+        addr: &str,
+        level: i64,
+        credits_mc: u64,
+    ) -> Result<Quote> {
         sqlx::query("DELETE FROM scan_quotes WHERE expires_at <= datetime('now')")
             .execute(&self.pool)
             .await?;
@@ -249,7 +262,7 @@ impl Store {
         .bind(&id)
         .bind(device_id)
         .bind(addr)
-        .bind(level as i64)
+        .bind(level)
         .bind(credits_mc as i64)
         .fetch_one(&self.pool)
         .await?)

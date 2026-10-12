@@ -30,6 +30,8 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/api/v1/ips/{addr}/scan/prices", get(scan_prices))
         .route("/api/v1/ips/{addr}/scan/quote", get(scan_quote))
         .route("/api/v1/ips/{addr}/scan", post(scan_buy))
+        .route("/api/v1/ips/{addr}/lookup/quote", get(lookup_quote))
+        .route("/api/v1/ips/{addr}/lookup", post(lookup_buy))
         .route("/api/v1/jobs/{job_id}", get(job))
         // Unknown API paths answer in the API's error shape, not the HTML 404.
         .route("/api/v1/{*rest}", axum::routing::any(not_found))
@@ -886,6 +888,328 @@ async fn scan_buy(
         .into_response()
 }
 
+/// One provider a fresh lookup asks, by whom and at what price.
+#[derive(Debug, Clone, PartialEq)]
+struct Priced {
+    provider: String,
+    node: String,
+    mc: u64,
+    /// This node serves it itself: asked by every lookup, free.
+    own: bool,
+}
+
+/// Every provider a fresh lookup could ask now, in the order of
+/// [`crate::intel::KNOWN_PROVIDERS`]: as the web lookup page offers them
+/// (this node's own quote, else the cheapest). Standalone: this node's
+/// ready providers, free.
+fn offered(state: &AdminState) -> Vec<Priced> {
+    let Some(node) = state.recorder.node() else {
+        return crate::intel::KNOWN_PROVIDERS
+            .iter()
+            .filter(|i| {
+                state
+                    .providers
+                    .iter()
+                    .any(|p| p.ready() && p.name() == i.name)
+            })
+            .map(|i| Priced {
+                provider: i.name.to_string(),
+                node: "this node".into(),
+                mc: 0,
+                own: true,
+            })
+            .collect();
+    };
+    priced(
+        node.id(),
+        &crate::credits::pay::quotes(node, &state.providers),
+    )
+}
+
+/// [`offered`] from the cluster's quotes (`me` is this node).
+fn priced(
+    me: crate::cluster::identity::NodeId,
+    all: &std::collections::HashMap<String, Vec<crate::credits::pay::Quote>>,
+) -> Vec<Priced> {
+    let cheap = crate::intel::lookup::cheap(me, all);
+    crate::intel::KNOWN_PROVIDERS
+        .iter()
+        .filter_map(|info| {
+            let q = all
+                .get(info.name)
+                .and_then(|l| l.iter().find(|q| q.server == me).or(l.first()))?;
+            Some(Priced {
+                provider: info.name.to_string(),
+                node: q.server_name.clone(),
+                mc: q.price_mc as u64,
+                own: cheap.iter().any(|c| c == info.name),
+            })
+        })
+        .collect()
+}
+
+/// Why a provider set cannot be quoted.
+#[derive(Debug, PartialEq)]
+enum Unpicked {
+    /// No such provider.
+    Unknown(String),
+    /// Known, but nobody offers it now.
+    NotOffered(String),
+}
+
+/// The lines of a fresh lookup of `chosen` (empty: every provider
+/// offered): this node's own providers always, the others when chosen.
+fn pick(offered: &[Priced], chosen: &[String]) -> Result<Vec<Priced>, Unpicked> {
+    for name in chosen {
+        if crate::intel::provider_info(name).is_none() {
+            return Err(Unpicked::Unknown(name.clone()));
+        }
+        if !offered.iter().any(|p| &p.provider == name) {
+            return Err(Unpicked::NotOffered(name.clone()));
+        }
+    }
+    Ok(offered
+        .iter()
+        .filter(|p| p.own || chosen.is_empty() || chosen.contains(&p.provider))
+        .cloned()
+        .collect())
+}
+
+/// A lookup quote lives in `scan_quotes` with a negative level: -1 minus
+/// the bit set of the bought (not own) providers, by their index in
+/// [`crate::intel::KNOWN_PROVIDERS`]. A scan level is 1-5, so neither kind
+/// of quote is spent as the other.
+fn lookup_level(lines: &[Priced]) -> i64 {
+    let mask = crate::intel::KNOWN_PROVIDERS
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| lines.iter().any(|p| !p.own && p.provider == i.name))
+        .fold(0i64, |m, (n, _)| m | (1 << n));
+    -1 - mask
+}
+
+/// The bought providers of a lookup quote's level; None: not a lookup quote.
+fn lookup_bought(level: i64) -> Option<Vec<String>> {
+    let mask = (-1i64).checked_sub(level).filter(|m| *m >= 0)?;
+    Some(
+        crate::intel::KNOWN_PROVIDERS
+            .iter()
+            .enumerate()
+            .filter(|(n, _)| mask & (1 << n) != 0)
+            .map(|(_, i)| i.name.to_string())
+            .collect(),
+    )
+}
+
+fn lines_json(lines: &[Priced]) -> Vec<Value> {
+    lines
+        .iter()
+        .map(|p| {
+            let (c, mc) = credits(p.mc);
+            json!({
+                "provider": p.provider,
+                "label": crate::intel::provider_info(&p.provider).map(|i| i.label).unwrap_or_default(),
+                "node": p.node,
+                "credits": c,
+                "credits_mc": mc,
+                "own": p.own,
+            })
+        })
+        .collect()
+}
+
+#[derive(serde::Deserialize)]
+pub struct LookupQuoteQuery {
+    providers: Option<String>,
+}
+
+/// GET /api/v1/ips/{addr}/lookup/quote?providers=a,b: what a fresh
+/// provider lookup costs now, as a quote the device can spend once within
+/// `QUOTE_SECS`. The address need not be in the dataset.
+async fn lookup_quote(
+    ActAuth(device): ActAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(addr): Path<String>,
+    Query(q): Query<LookupQuoteQuery>,
+) -> Response {
+    let Ok(ip) = addr.trim().parse::<IpAddr>() else {
+        return err(StatusCode::BAD_REQUEST, "invalid", "not an IP address");
+    };
+    let ip = crate::net::canonical(ip).to_string();
+    let chosen: Vec<String> = q
+        .providers
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect();
+    let lines = match pick(&offered(&state), &chosen) {
+        Ok(l) if !l.is_empty() => l,
+        Ok(_) => {
+            return err(
+                StatusCode::CONFLICT,
+                "no_provider",
+                "no provider can be asked now",
+            );
+        }
+        Err(Unpicked::Unknown(p)) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid",
+                format!("no provider {p}"),
+            );
+        }
+        Err(Unpicked::NotOffered(p)) => {
+            return err(
+                StatusCode::CONFLICT,
+                "not_offered",
+                format!("nobody offers {p} now"),
+            );
+        }
+    };
+    let total: u64 = lines.iter().map(|p| p.mc).sum();
+    let quote = match state
+        .store
+        .create_quote_at(&device.id, &ip, lookup_level(&lines), total)
+        .await
+    {
+        Ok(q) => q,
+        Err(e) => return internal(e),
+    };
+    let (c, mc) = credits(total);
+    Json(json!({
+        "quote_id": quote.id,
+        "credits": c,
+        "credits_mc": mc,
+        "expires_at": rfc3339(quote.expires_at.as_str()),
+        "providers": lines_json(&lines),
+    }))
+    .into_response()
+}
+
+/// POST /api/v1/ips/{addr}/lookup {quote_id}: ask the quoted providers
+/// now. The quote is spent first; every refusal after that asks and
+/// charges nothing. The audit entry (with the quoted credits, the most the
+/// lookup may charge) is written before any provider is asked.
+async fn lookup_buy(
+    ActAuth(device): ActAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(addr): Path<String>,
+    body: Result<Json<BuyBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(b)) = body else {
+        return err(StatusCode::BAD_REQUEST, "invalid", "malformed body");
+    };
+    let Ok(ip) = addr.trim().parse::<IpAddr>() else {
+        return err(StatusCode::BAD_REQUEST, "invalid", "not an IP address");
+    };
+    let ip = crate::net::canonical(ip);
+    let quote = match state.store.spend_quote(&b.quote_id, &device.id).await {
+        Ok(Some(q)) => q,
+        Ok(None) => {
+            return err(
+                StatusCode::CONFLICT,
+                "quote_invalid",
+                "unknown, expired or already used quote",
+            );
+        }
+        Err(e) => return internal(e),
+    };
+    let Some(bought) = lookup_bought(quote.level) else {
+        return err(
+            StatusCode::CONFLICT,
+            "quote_invalid",
+            "the quote is for a scan",
+        );
+    };
+    if quote.addr != ip.to_string() {
+        return err(
+            StatusCode::CONFLICT,
+            "quote_mismatch",
+            "the quote is for another address",
+        );
+    }
+    // Asked as quoted, or not at all: a provider gone or a price moved.
+    let now = match pick(&offered(&state), &bought) {
+        Ok(l) if lookup_level(&l) == quote.level => l,
+        _ => return price_changed(),
+    };
+    if now.iter().map(|p| p.mc).sum::<u64>() != quote.credits_mc as u64 {
+        return price_changed();
+    }
+    let quoted = quote.credits_mc as u64;
+    if let Err(r) = audit(
+        &state,
+        &device,
+        "lookup",
+        &ip.to_string(),
+        quoted,
+        &quote.id,
+    )
+    .await
+    {
+        return *r;
+    }
+    let out = crate::intel::lookup::run(&state.recorder, &state.providers, ip, &bought, &[]).await;
+    let now_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut intel = serde_json::Map::new();
+    let (mut declined, mut charges, mut charged) = (vec![], vec![], 0u64);
+    for a in &out.answers {
+        for f in &a.resp.findings {
+            if f.provider == crate::intel::TOR {
+                continue;
+            }
+            intel.insert(
+                f.provider.clone(),
+                json!({"source": "fresh", "node": a.node, "fetched_at": now_at, "data": f.data}),
+            );
+        }
+        for (p, why) in &a.resp.declined {
+            declined.push(json!({"provider": p, "node": a.node, "why": why}));
+        }
+        if a.charged_mc > 0 {
+            let (c, mc) = credits(a.charged_mc as u64);
+            charged += mc;
+            charges.push(json!({"node": a.node, "credits": c, "credits_mc": mc}));
+        }
+    }
+    for s in out
+        .stored
+        .iter()
+        .filter(|s| s.provider != crate::intel::TOR)
+    {
+        intel.entry(s.provider.clone()).or_insert_with(|| {
+            json!({
+                "source": "stored",
+                "node": s.node,
+                "fetched_at": rfc3339(s.fetched_at.as_str()),
+                "data": s.data,
+            })
+        });
+    }
+    let (c, mc) = credits(charged);
+    Json(json!({
+        "ip": ip.to_string(),
+        "credits": c,
+        "credits_mc": mc,
+        "charges": charges,
+        "intel": Value::Object(intel),
+        "declined": declined,
+        "kept": out.kept,
+    }))
+    .into_response()
+}
+
+fn price_changed() -> Response {
+    err(
+        StatusCode::CONFLICT,
+        "price_changed",
+        "the price moved since the quote: get a new one",
+    )
+}
+
 /// GET /api/v1/jobs/{job_id}: a job this device queued, by polling.
 async fn job(
     ActAuth(device): ActAuth,
@@ -899,6 +1223,8 @@ async fn job(
     };
     let r = match action.action.as_str() {
         "scan" => scan_job(&state, &job_id).await,
+        // A lookup answers at once: its entry is the receipt.
+        "lookup" => Ok(("done", Value::Null)),
         _ => probe_job(&state, &action.target, &job_id).await,
     };
     match r {
@@ -1536,6 +1862,8 @@ mod tests {
             ("GET", format!("/api/v1/ips/{SCAN_IP}/scan/prices")),
             ("GET", format!("/api/v1/ips/{SCAN_IP}/scan/quote?level=2")),
             ("POST", format!("/api/v1/ips/{SCAN_IP}/scan")),
+            ("GET", format!("/api/v1/ips/{SCAN_IP}/lookup/quote")),
+            ("POST", format!("/api/v1/ips/{SCAN_IP}/lookup")),
             ("GET", "/api/v1/jobs/s_1".to_string()),
         ];
         for (method, path) in &calls {
@@ -2073,5 +2401,208 @@ mod tests {
             .map(|j| j["credits_mc"].as_u64().unwrap())
             .sum();
         assert_eq!(crate::credits::show(total), a.default_total());
+    }
+
+    /// A provider that answers every address, offline.
+    struct Fake;
+    impl crate::intel::provider::Provider for Fake {
+        fn name(&self) -> &'static str {
+            crate::intel::ABUSEIPDB
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn lookup<'a>(
+            &'a self,
+            ips: &'a [String],
+        ) -> futures::future::BoxFuture<'a, Vec<crate::intel::provider::Finding>> {
+            Box::pin(async move {
+                ips.iter()
+                    .map(|ip| crate::intel::provider::Finding {
+                        ip: ip.clone(),
+                        source_version: None,
+                        data: serde_json::json!({"score": 87}),
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    #[test]
+    fn a_lookup_quote_prices_own_providers_always_and_the_rest_when_chosen() {
+        use crate::cluster::identity::NodeId;
+        use crate::credits::pay::Quote;
+        use crate::intel::{ABUSEIPDB, MAXMIND, SHODAN};
+        let (me, bob) = (NodeId([1; 32]), NodeId([2; 32]));
+        let q = |p: &str, server: NodeId, name: &str, mc: u32| Quote {
+            provider: p.into(),
+            server,
+            server_name: name.into(),
+            price_mc: mc,
+        };
+        let all = std::collections::HashMap::from([
+            (MAXMIND.to_string(), vec![q(MAXMIND, me, "this node", 0)]),
+            (ABUSEIPDB.to_string(), vec![q(ABUSEIPDB, bob, "bob", 100)]),
+            (SHODAN.to_string(), vec![q(SHODAN, bob, "bob", 250)]),
+        ]);
+        let offered = super::priced(me, &all);
+        let names = |l: &[super::Priced]| l.iter().map(|p| p.provider.clone()).collect::<Vec<_>>();
+        // Nothing chosen: everything, as "ask all" on the web page.
+        let every = super::pick(&offered, &[]).unwrap();
+        assert_eq!(every.iter().map(|p| p.mc).sum::<u64>(), 350);
+        let one = super::pick(&offered, &[ABUSEIPDB.into()]).unwrap();
+        assert_eq!(names(&one), [MAXMIND, ABUSEIPDB]);
+        assert_eq!(one[1].node, "bob");
+        assert!(one[0].own && !one[1].own);
+        // The bought set survives the quote's level; own ones are not in it.
+        assert_eq!(
+            super::lookup_bought(super::lookup_level(&one)).unwrap(),
+            [ABUSEIPDB]
+        );
+        assert_eq!(
+            super::lookup_bought(super::lookup_level(&every)).unwrap(),
+            [ABUSEIPDB, SHODAN]
+        );
+        assert_eq!(super::lookup_bought(-1).unwrap(), Vec::<String>::new());
+        // A scan level is not a lookup quote.
+        assert_eq!(super::lookup_bought(3), None);
+        assert_eq!(
+            super::pick(&offered, &["nope".into()]),
+            Err(super::Unpicked::Unknown("nope".into()))
+        );
+        assert_eq!(
+            super::pick(&offered, &[crate::intel::RDAP.into()]),
+            Err(super::Unpicked::NotOffered(crate::intel::RDAP.into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quoted_lookup_asks_once_is_audited_and_refuses_a_stale_quote() {
+        let (mut state, _c, _id, _d) = crate::admin::scan_buy::tests::state().await;
+        Arc::get_mut(&mut state).unwrap().providers = vec![Arc::new(Fake)];
+        let app = crate::admin::full_router(state.clone());
+        let token = device(&state, "read,act", "Pixel 8").await;
+        let device_id = state
+            .store
+            .validate_device_token(&token)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        // The address need not be in the dataset.
+        let ip = "198.51.100.7";
+        let (st, q) = send(
+            &app,
+            authed("GET", &format!("/api/v1/ips/{ip}/lookup/quote"), &token),
+        )
+        .await;
+        assert_eq!(st, 200, "{q}");
+        assert_eq!(q["credits"], "0.00", "standalone costs nothing: {q}");
+        assert_eq!(
+            q["providers"][0]["provider"],
+            crate::intel::ABUSEIPDB,
+            "{q}"
+        );
+        assert_eq!(q["providers"][0]["own"], true, "{q}");
+        assert!(q["expires_at"].as_str().unwrap().ends_with('Z'), "{q}");
+        let (st, v) = send(
+            &app,
+            authed(
+                "GET",
+                &format!("/api/v1/ips/{ip}/lookup/quote?providers=nope"),
+                &token,
+            ),
+        )
+        .await;
+        assert_eq!(
+            (st, v["error"]["code"].clone()),
+            (StatusCode::BAD_REQUEST, "invalid".into())
+        );
+        let buy = |addr: &str, id: &serde_json::Value| {
+            authed_json(
+                "POST",
+                &format!("/api/v1/ips/{addr}/lookup"),
+                &token,
+                serde_json::json!({"quote_id": id}),
+            )
+        };
+        // Another address than quoted: spent, nothing asked.
+        let (st, v) = send(&app, buy(SCAN_IP, &q["quote_id"])).await;
+        assert_eq!(
+            (st, v["error"]["code"].clone()),
+            (StatusCode::CONFLICT, "quote_mismatch".into())
+        );
+        assert_eq!(jobs_and_actions(&state).await, (0, 0));
+        let (_, q) = send(
+            &app,
+            authed("GET", &format!("/api/v1/ips/{ip}/lookup/quote"), &token),
+        )
+        .await;
+        let (st, v) = send(&app, buy(ip, &q["quote_id"])).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(
+            v["intel"][crate::intel::ABUSEIPDB]["source"],
+            "fresh",
+            "{v}"
+        );
+        assert_eq!(
+            v["intel"][crate::intel::ABUSEIPDB]["data"]["score"],
+            87,
+            "{v}"
+        );
+        assert_eq!(v["credits_mc"], 0, "{v}");
+        assert_eq!(jobs_and_actions(&state).await, (0, 1));
+        let (st, j) = send(
+            &app,
+            authed(
+                "GET",
+                &format!("/api/v1/jobs/{}", q["quote_id"].as_str().unwrap()),
+                &token,
+            ),
+        )
+        .await;
+        assert_eq!(
+            (st, j["kind"].clone(), j["status"].clone()),
+            (StatusCode::OK, "lookup".into(), "done".into()),
+            "{j}"
+        );
+        // Spent once.
+        let (st, v) = send(&app, buy(ip, &q["quote_id"])).await;
+        assert_eq!(
+            (st, v["error"]["code"].clone()),
+            (StatusCode::CONFLICT, "quote_invalid".into())
+        );
+        // A quote whose price no longer holds asks and charges nothing.
+        let stale = state
+            .store
+            .create_quote_at(&device_id, ip, -1, 500)
+            .await
+            .unwrap();
+        let (st, v) = send(&app, buy(ip, &serde_json::json!(stale.id))).await;
+        assert_eq!(
+            (st, v["error"]["code"].clone()),
+            (StatusCode::CONFLICT, "price_changed".into())
+        );
+        // A lookup quote buys no scan.
+        let other = state
+            .store
+            .create_quote_at(&device_id, SCAN_IP, -1, 0)
+            .await
+            .unwrap();
+        let (st, v) = send(
+            &app,
+            authed_json(
+                "POST",
+                &format!("/api/v1/ips/{SCAN_IP}/scan"),
+                &token,
+                serde_json::json!({"quote_id": other.id}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (st, v["error"]["code"].clone()),
+            (StatusCode::CONFLICT, "quote_invalid".into())
+        );
+        assert_eq!(jobs_and_actions(&state).await, (0, 1));
     }
 }
