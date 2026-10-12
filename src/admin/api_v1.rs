@@ -30,6 +30,8 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/api/v1/ips/{addr}/scan/quote", get(scan_quote))
         .route("/api/v1/ips/{addr}/scan", post(scan_buy))
         .route("/api/v1/jobs/{job_id}", get(job))
+        .route("/api/v1/uploads", get(uploads))
+        .route("/api/v1/uploads/{sha256}", get(upload_by_hash))
         // Unknown API paths answer in the API's error shape, not the HTML 404.
         .route("/api/v1/{*rest}", axum::routing::any(not_found))
 }
@@ -147,6 +149,122 @@ fn summary_json(s: &IpSummary) -> Value {
         "max_severity": s.max_severity,
         "abuse_score": s.abuse_score,
     })
+}
+
+/// One upload's metadata (MIK-121). Never its content: there is no field
+/// for it, and [`crate::store::uploads::UploadMeta`] holds none.
+fn upload_json(u: &crate::store::uploads::UploadMeta) -> Value {
+    let hex = |b: &[u8]| data_encoding::HEXLOWER.encode(b);
+    json!({
+        "uid": u.uid,
+        "request_uid": u.request_uid,
+        "node_id": u.node_id.as_deref().map(hex),
+        "ts": rfc3339(&u.ts),
+        "ip": u.ip,
+        "kind": u.kind,
+        "filename": u.filename,
+        "sniffed_type": u.sniffed_type,
+        "size": u.size,
+        "truncated": u.truncated,
+        "sha256": hex(&u.sha256),
+        "answered_path": u.answered_path,
+        "path_is_prefix": u.path_is_prefix,
+        "content_state": u.content_state,
+    })
+}
+
+#[derive(serde::Deserialize)]
+pub struct UploadsQuery {
+    cursor: Option<String>,
+    limit: Option<String>,
+}
+
+/// The uploads' continuation token: the id the next page starts below.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UploadsCursor {
+    before: i64,
+}
+
+async fn uploads(
+    DeviceAuth(_): DeviceAuth,
+    State(state): State<Arc<AdminState>>,
+    Query(q): Query<UploadsQuery>,
+) -> Response {
+    let limit = match q.limit.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => DEFAULT_LIMIT,
+        Some(v) => match v.parse::<i64>() {
+            Ok(n) if n >= 1 => n.min(MAX_LIMIT),
+            _ => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid",
+                    "limit must be a number, 1-100",
+                );
+            }
+        },
+    };
+    let before = match q.cursor.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(c) => match data_encoding::BASE64URL_NOPAD
+            .decode(c.as_bytes())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<UploadsCursor>(&b).ok())
+        {
+            Some(c) => Some(c.before),
+            None => return err(StatusCode::BAD_REQUEST, "invalid", "unreadable cursor"),
+        },
+    };
+    let query = crate::store::uploads::UploadQuery {
+        before,
+        ..Default::default()
+    };
+    let mut rows = match state.store.uploads_meta(&query, limit + 1).await {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    let more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let next_cursor = rows.last().filter(|_| more).map(|last| {
+        data_encoding::BASE64URL_NOPAD.encode(
+            &serde_json::to_vec(&UploadsCursor { before: last.id }).unwrap_or_default(),
+        )
+    });
+    Json(json!({
+        "items": rows.iter().map(upload_json).collect::<Vec<_>>(),
+        "next_cursor": next_cursor,
+    }))
+    .into_response()
+}
+
+/// Every upload of one file, newest first (at most [`MAX_LIMIT`]).
+async fn upload_by_hash(
+    DeviceAuth(_): DeviceAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(sha256): Path<String>,
+) -> Response {
+    let hash = match data_encoding::HEXLOWER_PERMISSIVE.decode(sha256.trim().as_bytes()) {
+        Ok(h) if h.len() == 32 => h,
+        _ => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid",
+                "not a SHA-256 (64 hex digits)",
+            );
+        }
+    };
+    let query = crate::store::uploads::UploadQuery {
+        sha256: Some(&hash),
+        ..Default::default()
+    };
+    match state.store.uploads_meta(&query, MAX_LIMIT).await {
+        Ok(rows) if rows.is_empty() => err(StatusCode::NOT_FOUND, "not_found", "no such upload"),
+        Ok(rows) => Json(json!({
+            "sha256": data_encoding::HEXLOWER.encode(&hash),
+            "uploads": rows.iter().map(upload_json).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => internal(e),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1172,6 +1290,86 @@ mod tests {
         let (st, v) = send(&app, authed("GET", "/api/v1/ips", &token)).await;
         assert_eq!(st, 401);
         assert_eq!(v["error"]["code"], "unauthorized", "{v}");
+    }
+
+    #[tokio::test]
+    async fn uploads_are_metadata_only_paged_and_found_by_hash() {
+        let (state, cookie, app, _d) = app().await;
+        let (token, _) = pair(&app, &cookie).await;
+        let marker = b"<?php echo 'MARK-api-5e2d'; ?>";
+        crate::store::uploads::seed_upload(&state.store, "203.0.113.60", "/a.php", marker).await;
+        crate::store::uploads::seed_upload(&state.store, "198.51.100.61", "/b.php", b"two").await;
+        let (st, v) = send(&app, authed("GET", "/api/v1/uploads?limit=1", &token)).await;
+        assert_eq!(st, 200, "{v}");
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["answered_path"], "/b.php", "newest first");
+        let keys: Vec<&str> = items[0].as_object().unwrap().keys().map(String::as_str).collect();
+        assert!(
+            keys.iter().all(|k| !k.contains("content") || *k == "content_state"),
+            "{keys:?}"
+        );
+        assert!(!keys.contains(&"body") && !keys.contains(&"bytes"), "{keys:?}");
+        let cursor = v["next_cursor"].as_str().unwrap().to_string();
+        let (st, v) = send(
+            &app,
+            authed("GET", &format!("/api/v1/uploads?limit=1&cursor={cursor}"), &token),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["items"][0]["answered_path"], "/a.php");
+        assert_eq!(v["items"][0]["ip"], "203.0.113.60");
+        assert_eq!(v["items"][0]["content_state"], "held");
+        assert!(v["next_cursor"].is_null(), "{v}");
+        assert!(!v.to_string().contains("MARK-api-5e2d"), "{v}");
+        // By hash.
+        use sha2::Digest;
+        let sha = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(marker));
+        let (st, v) = send(&app, authed("GET", &format!("/api/v1/uploads/{sha}"), &token)).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["sha256"], sha.as_str());
+        assert_eq!(v["uploads"].as_array().unwrap().len(), 1);
+        assert_eq!(v["uploads"][0]["sha256"], sha.as_str());
+        assert!(!v.to_string().contains("MARK-api-5e2d"), "{v}");
+        let (st, v) = send(&app, authed("GET", "/api/v1/uploads/abc", &token)).await;
+        assert_eq!((st, v["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")));
+        let none = "0".repeat(64);
+        let (st, v) = send(&app, authed("GET", &format!("/api/v1/uploads/{none}"), &token)).await;
+        assert_eq!((st, v["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("not_found")));
+        let (st, _) = send(&app, authed("GET", "/api/v1/uploads?cursor=%%%", &token)).await;
+        assert_eq!(st, 400);
+    }
+
+    #[tokio::test]
+    async fn uploads_refuse_a_revoked_device_and_the_session_cookie() {
+        let (state, cookie, app, _d) = app().await;
+        crate::store::uploads::seed_upload(&state.store, "203.0.113.62", "/a.php", b"x").await;
+        let (token, device_id) = pair(&app, &cookie).await;
+        let (st, _) = send(&app, authed("GET", "/api/v1/uploads", &token)).await;
+        assert_eq!(st, 200);
+        let r = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/devices/revoke")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("id={device_id}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::SEE_OTHER);
+        for path in ["/api/v1/uploads", &format!("/api/v1/uploads/{}", "0".repeat(64))] {
+            let (st, v) = send(&app, authed("GET", path, &token)).await;
+            assert_eq!(st, 401, "{path}");
+            assert_eq!(v["error"]["code"], "unauthorized", "{v}");
+            let (st, _) = send(
+                &app,
+                Request::get(path).header("cookie", &cookie).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(st, 401, "the admin session is not an API credential: {path}");
+        }
     }
 
     #[tokio::test]
