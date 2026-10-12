@@ -335,13 +335,6 @@ pub async fn entries_after(
             if old_peer && e.needs_economy_proto() {
                 break;
             }
-            // An upload's bytes ride beside the signed record, when its
-            // origin newly stored them and they are held here.
-            if e.kind == "upload"
-                && let Some(Record::Upload(u)) = e.record()
-            {
-                e.content = crate::store::uploads::content_for_relay(&mut conn, &u).await?;
-            }
             if e.payload.is_none() && e.erased_by.is_none() {
                 // Row-backed: rebuild the signed payload from the row.
                 let rebuilt = match &e.uid {
@@ -370,6 +363,14 @@ pub async fn entries_after(
             }
             if e.seq != next || full(&out, bytes) || taken >= limit {
                 break;
+            }
+            // An upload's bytes ride beside the signed record, when its
+            // origin newly stored them and they are held here; read only
+            // once the entry is sure to go.
+            if e.kind == "upload"
+                && let Some(Record::Upload(u)) = e.record()
+            {
+                e.content = crate::store::uploads::content_for_relay(&mut conn, &u).await?;
             }
             bytes += e.payload.as_ref().map_or(0, Vec::len)
                 + e.content.as_ref().map_or(0, Vec::len)

@@ -34,6 +34,9 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "http1", "h
 ipnet = { version = "2", features = ["serde"] }
 maxminddb = "0.32"
 md-5 = "0.11"
+# Multipart bodies of trap uploads (MIK-121), parsed from the buffered
+# body with size limits; the same parser axum's `multipart` feature uses.
+multer = "3"
 # Only the Arrow writer/reader, and zstd for the exported Parquet files.
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 quick-xml = "0.42"
