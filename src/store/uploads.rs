@@ -1100,9 +1100,24 @@ mod tests {
             ("later", "2026-10-01 00:00:05", "/s.php", &mine),
             ("theirs", "2026-10-01 00:00:06", "/s.php", &other),
             ("longer", "2026-10-01 00:00:07", "/s.phpx", &mine),
-            ("under", "2026-10-01 00:00:08", "/wp-content/plugins/wp_shell/x.php", &mine),
-            ("wildcard", "2026-10-01 00:00:09", "/wp-content/plugins/wpXshell/x.php", &mine),
-            ("no-slash", "2026-10-01 00:00:10", "/wp-content/plugins/wp_shell", &mine),
+            (
+                "under",
+                "2026-10-01 00:00:08",
+                "/wp-content/plugins/wp_shell/x.php",
+                &mine,
+            ),
+            (
+                "wildcard",
+                "2026-10-01 00:00:09",
+                "/wp-content/plugins/wpXshell/x.php",
+                &mine,
+            ),
+            (
+                "no-slash",
+                "2026-10-01 00:00:10",
+                "/wp-content/plugins/wp_shell",
+                &mine,
+            ),
         ] {
             sqlx::query(
                 "INSERT INTO requests (uid, ts, ip_id, method, path, headers_json, origin)
@@ -1119,7 +1134,10 @@ mod tests {
         let paths = |rows: Vec<TimelineRow>| rows.into_iter().map(|r| r.path).collect::<Vec<_>>();
         let a = get(&mut c, "a").await.unwrap().unwrap();
         assert!(a.request_id.is_some());
-        assert_eq!(paths(timeline(&mut c, &a).await.unwrap()), ["/s.php", "/s.php"]);
+        assert_eq!(
+            paths(timeline(&mut c, &a).await.unwrap()),
+            ["/s.php", "/s.php"]
+        );
         let b = get(&mut c, "b").await.unwrap().unwrap();
         assert_eq!(
             paths(timeline(&mut c, &b).await.unwrap()),
@@ -1143,7 +1161,11 @@ mod tests {
         assert!(content_for_export(&mut c, "g").await.unwrap().is_none());
         assert!(content_for_export(&mut c, "nope").await.unwrap().is_none());
         let page = list(&mut c, 1).await.unwrap();
-        let got: Vec<_> = page.items.iter().map(|u| (u.uid.as_str(), u.held)).collect();
+        let got: Vec<_> = page
+            .items
+            .iter()
+            .map(|u| (u.uid.as_str(), u.held))
+            .collect();
         assert_eq!(got, [("g", false), ("h", true)]);
     }
 }

@@ -171,9 +171,17 @@ mod tests {
             hlc: 1,
         };
         let day = "2026-10-01";
-        apply_at(&mut c, ctx, &r, Some(content), &Limits::default(), day, None)
-            .await
-            .unwrap();
+        apply_at(
+            &mut c,
+            ctx,
+            &r,
+            Some(content),
+            &Limits::default(),
+            day,
+            None,
+        )
+        .await
+        .unwrap();
         r
     }
 
@@ -188,7 +196,12 @@ mod tests {
         ] {
             let (status, h, body) = send(&app, Request::get(path), Body::empty()).await;
             assert_eq!(status, StatusCode::SEE_OTHER, "{path}");
-            assert!(h[axum::http::header::LOCATION].to_str().unwrap().starts_with("/login"));
+            assert!(
+                h[axum::http::header::LOCATION]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("/login")
+            );
             assert!(!body.contains("<?php"), "{path}");
         }
     }
@@ -212,7 +225,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("content not held") && body.contains("dropped_rate"));
         assert!(!body.contains("content.zip"));
-        let (status, _, _) = send(&app, get("/admin/uploads/gone/content.zip"), Body::empty()).await;
+        let (status, _, _) =
+            send(&app, get("/admin/uploads/gone/content.zip"), Body::empty()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _, _) = send(&app, get("/admin/uploads/nope"), Body::empty()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -247,7 +261,10 @@ mod tests {
         assert!(!zip.windows(content.len()).any(|w| w == content));
         let mut a = zip::ZipArchive::new(std::io::Cursor::new(zip.to_vec())).unwrap();
         assert_eq!(a.len(), 1);
-        assert!(a.by_index(0).is_err(), "no entry opens without the password");
+        assert!(
+            a.by_index(0).is_err(),
+            "no entry opens without the password"
+        );
         let mut f = a.by_index_decrypt(0, b"infected").unwrap();
         assert_eq!(f.name(), format!("{hash}.bin"));
         let mut got = vec![];
