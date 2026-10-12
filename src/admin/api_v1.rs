@@ -402,9 +402,11 @@ pub struct LookupBody {
     names: Vec<String>,
 }
 
-/// Host names (or URLs) resolved in one `/api/v1/lookup`: each costs DNS
-/// round-trips, on several nodes in a cluster.
-pub const MAX_NAMES: usize = 10;
+/// Host names (or URLs) of one `/api/v1/lookup` resolved at once. Each costs
+/// DNS round-trips, on several nodes in a cluster, so a long list is worked
+/// through a few at a time; its length is bounded only by the body limit and
+/// the per-client rate limit of `/api/*`.
+pub const NAMES_PARALLEL: usize = 4;
 
 /// Stored-data lookup for many addresses at once: the semantics and the cap
 /// of the admin bulk lookup, but JSON. No provider is asked. `names` are
@@ -449,14 +451,14 @@ async fn names_json(
     names: &[String],
     resolve: impl AsyncFn(&str) -> Result<Vec<IpAddr>, String> + Copy,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut out = Vec::with_capacity(names.len());
-    for (i, input) in names.iter().enumerate() {
-        out.push(match i < MAX_NAMES {
-            true => name_json(state, input, resolve).await?,
-            false => entry_err("capped", "past the names cap of one request"),
-        });
-    }
-    Ok(out)
+    use futures::{StreamExt, TryStreamExt};
+    // Built up front: a closure held across the await trips the `Send`
+    // check of the handler (higher-ranked lifetimes).
+    let entries: Vec<_> = names.iter().map(|n| name_json(state, n, resolve)).collect();
+    futures::stream::iter(entries)
+        .buffered(NAMES_PARALLEL)
+        .try_collect()
+        .await
 }
 
 fn entry_err(code: &str, message: &str) -> Value {
@@ -1431,11 +1433,11 @@ mod tests {
         assert_eq!(v[3]["error"]["code"], "unresolved", "{v}");
         assert_eq!(v[4]["error"]["code"], "invalid");
 
-        // Over HTTP: names past the cap are refused per entry, the batch
-        // and the `ips` part answer as before.
+        // Over HTTP: every name of a long list is answered, in order, and
+        // the `ips` part as before. Nothing is capped.
         let (token, _) = pair(&app, &cookie).await;
-        let mut names = vec!["garbage!!"; super::MAX_NAMES];
-        names.push("example.com");
+        let mut names = vec!["garbage!!"; 24];
+        names.push("203.0.113.9");
         let mut r = post_json(
             "/api/v1/lookup",
             serde_json::json!({"ips": ["203.0.113.9"], "names": names}),
@@ -1446,9 +1448,10 @@ mod tests {
         assert_eq!(st, 200, "{v}");
         assert_eq!(v["results"][0]["ip"], "203.0.113.9");
         let names = v["names"].as_array().unwrap();
-        assert_eq!(names.len(), super::MAX_NAMES + 1);
-        assert_eq!(names[0]["error"]["code"], "invalid");
-        assert_eq!(names[super::MAX_NAMES]["error"]["code"], "capped", "{v}");
+        assert_eq!(names.len(), 25);
+        assert!(names[..24].iter().all(|n| n["error"]["code"] == "invalid"), "{v}");
+        assert_eq!(names[24]["host"], "203.0.113.9", "{v}");
+        assert_eq!(names[24]["results"][0]["ip"], "203.0.113.9", "{v}");
     }
 
     #[tokio::test]
