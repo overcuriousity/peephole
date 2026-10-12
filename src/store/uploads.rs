@@ -565,6 +565,48 @@ pub async fn content_for_export(
     .await?)
 }
 
+/// Test fixture: a `PUT` of `content` to `path` from `ip` (a fixture
+/// address), recorded as a request and its upload. Returns the upload's uid.
+#[cfg(test)]
+pub(crate) async fn seed_upload(
+    store: &super::Store,
+    ip: &str,
+    path: &str,
+    content: &[u8],
+) -> String {
+    let ip_id = store.upsert_ip(ip.parse().unwrap()).await.unwrap().id;
+    let id = store
+        .insert_request(&super::requests::NewRequest {
+            ip_id,
+            method: "PUT".into(),
+            path: path.into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (request_uid, ts): (String, String) =
+        sqlx::query_as("SELECT uid, ts FROM requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    let r = UploadRec {
+        request_uid,
+        ts,
+        ip: ip.into(),
+        kind: "put".into(),
+        filename: Some("s.php".into()),
+        sniffed_type: "php".into(),
+        size: content.len() as i64,
+        answered_path: path.into(),
+        ..Default::default()
+    };
+    let (_, _, uid) = store.local().record_upload(r, content, true).await.unwrap();
+    uid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

