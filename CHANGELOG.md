@@ -10,6 +10,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - `GET /api/v1/ips/{addr}/scan/prices` lists every scan level's price
   range at once, so the app's level picker shows prices before a quote.
   It spends nothing and creates no quote.
+- Fresh provider lookups from a paired device:
+  `GET /api/v1/ips/{addr}/lookup/quote` prices the providers it would ask
+  (per provider and total, like the admin lookup page's offer) and
+  `POST /api/v1/ips/{addr}/lookup` spends the quote once. A stale quote
+  (a provider gone, a price moved) asks and charges nothing. Needs the
+  `act` scope.
 
 ### Changed
 

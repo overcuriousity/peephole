@@ -24,7 +24,7 @@ chars), and only their SHA-256 is stored. Each token carries scopes:
 | scope  | meaning                                          |
 | ------ | ------------------------------------------------ |
 | `read` | every `GET` under `/api/v1`, `POST /api/v1/lookup` |
-| `act`  | start probes, buy counter-scans, read their jobs (spends credits) |
+| `act`  | start probes, buy counter-scans and fresh provider lookups, read their jobs (spends credits) |
 
 `read` is always granted at pairing; `act` is optional (a checkbox on the
 pairing form). A missing or wrong scope is `403`.
@@ -154,8 +154,8 @@ AbuseIPDB score, `null` when none.
 ### `GET /api/v1/ips/{addr}`
 
 Everything the dataset holds on one address. `404` when the address is not
-in the dataset (a lookup that would ask providers stays an admin-UI action;
-the API serves stored data only).
+in the dataset (a lookup that asks providers is an
+[act endpoint](#get-apiv1ipsaddrlookupquoteproviders): quote, then spend).
 
 `200`:
 
@@ -289,8 +289,8 @@ intelligence provider is asked.
 
 ## Act endpoints
 
-Probes and paid counter-scans, the same actions as the Actions card on the
-admin IP page, and with the same checks (target rules, probes off, live
+Probes, paid counter-scans and fresh provider lookups, the same actions as
+the Actions card on the admin IP page and the admin lookup page, and with the same checks (target rules, probes off, live
 scanners, scan budget, a fresh or queued scan of the level): both run the
 shared code in `admin::probes::start` and `admin::scan_buy::sale`. Every
 endpoint here needs scope `act`; a `read`-only token is `403`. They sit
@@ -426,6 +426,75 @@ is charged when a scanner runs its job):
 | `fresh`, `on_its_way`, `no_price`, `no_budget` | as for the quote, now  |
 | `not_queued`     | the scan queue did not take the job (a queue budget)     |
 
+### `GET /api/v1/ips/{addr}/lookup/quote?providers=…`
+
+What a fresh provider lookup costs now, the offer of the admin lookup
+page: the providers it asks, by which node, at what price, and the total.
+The address need not be in the dataset. `providers` (optional) is a
+comma-separated list of provider names to buy; without it, every provider
+offered ("ask all"). This node's own providers are always asked and free.
+
+`200`:
+
+```json
+{
+  "quote_id": "q_…",
+  "credits": "0.35",
+  "credits_mc": 350,
+  "expires_at": "2026-10-10T16:05:00Z",
+  "providers": [
+    { "provider": "maxmind", "label": "MaxMind", "node": "this node", "credits": "0.00", "credits_mc": 0, "own": true },
+    { "provider": "abuseipdb", "label": "AbuseIPDB", "node": "bob", "credits": "0.10", "credits_mc": 100, "own": false }
+  ]
+}
+```
+
+- The quote is bound to the device, the address, the bought providers and
+  `credits_mc`. It lives 2 minutes and is spent once. Show `providers` and
+  the total before asking the user to confirm.
+- `credits` is the most the lookup charges: a provider that declines or
+  already has a fresh answer is not charged. Standalone everything is
+  `"0.00"`.
+- An unknown provider name is `400 invalid`; a known one nobody offers now
+  is `409 not_offered`; nothing to ask at all is `409 no_provider`.
+
+### `POST /api/v1/ips/{addr}/lookup`
+
+Body: `{ "quote_id": "q_…" }`. The quote is spent first (atomically,
+once), then the offer is priced again; the audit entry (with the quoted
+credits) is written before any provider is asked. The lookup answers at
+once, there is no job to poll.
+
+`200`:
+
+```json
+{
+  "ip": "203.0.113.9",
+  "credits": "0.10",
+  "credits_mc": 100,
+  "charges": [{ "node": "bob", "credits": "0.10", "credits_mc": 100 }],
+  "intel": { "abuseipdb": { "source": "fresh", "node": "bob", "fetched_at": "…", "data": { … } } },
+  "declined": [{ "provider": "shodan", "node": "bob", "why": "…" }],
+  "kept": true
+}
+```
+
+- `credits` is what was charged; `charges` splits it by node.
+- `intel` has one entry per provider, `source` `fresh` (asked now) or
+  `stored` (a fresh-enough stored answer the provider was not asked for).
+- `kept` is whether the answers were stored in the dataset.
+
+Each of these is `409` and **asks and charges nothing**:
+
+| code             | when                                                     |
+| ---------------- | -------------------------------------------------------- |
+| `quote_invalid`  | unknown, another device's, expired, already spent, or a scan quote |
+| `quote_mismatch` | the quote is for another address                         |
+| `price_changed`  | a quoted provider is gone or its price moved: get a new quote |
+
+A server older than this endpoint answers `404 not_found`: the app shows
+"server too old" and keeps the stored-data lookup.
+
 ### `GET /api/v1/jobs/{job_id}`
 
 A job this device queued. Any other id, another device's included, is
@@ -449,6 +518,8 @@ A job this device queued. Any other id, another device's included, is
   its audit entry could not be written) reports `failed`. `result` is
   `null` until the scan lands, then the shape of
   `scans[]` in `GET /api/v1/ips/{addr}`.
+- `lookup`: always `done` with `result` `null`; the `POST` already
+  answered (the job id is the quote id).
 - `probe`: `status` is `running` while a vantage is queued or running,
   then `done`. `result` is `{ "vantages": [{ "node", "name", "state",
   "why", "rtt_ms", "ports": [{ "port", "protocol", "outcome", "detail" }] }] }`;
