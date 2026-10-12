@@ -448,6 +448,123 @@ pub async fn gc_blobs(conn: &mut SqliteConnection) -> Result<u64> {
     Ok(n)
 }
 
+/// An upload as the admin lists it: metadata only, never the content.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UploadRow {
+    pub uid: String,
+    pub ts: String,
+    pub ip: String,
+    pub kind: String,
+    /// The client's file name, as sent (escaped wherever it is shown).
+    pub filename: Option<String>,
+    pub sniffed_type: String,
+    pub size: i64,
+    pub truncated: bool,
+    pub sha256: Vec<u8>,
+    pub answered_path: String,
+    pub path_is_prefix: bool,
+    pub content_state: String,
+    /// The content is in the store here, and can be exported.
+    pub held: bool,
+    /// The request that carried it, when this node holds it.
+    pub request_id: Option<i64>,
+    pub origin: Option<Vec<u8>>,
+}
+
+impl UploadRow {
+    pub fn hash(&self) -> String {
+        data_encoding::HEXLOWER.encode(&self.sha256)
+    }
+}
+
+/// A later request to where an upload was told it landed.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TimelineRow {
+    pub id: i64,
+    pub ts: String,
+    pub ip: String,
+    pub method: String,
+    pub path: String,
+    pub query: Option<String>,
+    pub status: Option<i64>,
+    pub answer: Option<String>,
+}
+
+/// Most requests an upload's timeline shows.
+pub const TIMELINE_MAX: i64 = 500;
+
+const UPLOAD_COLS: &str = "u.uid, u.ts, i.ip, u.kind, u.filename, u.sniffed_type, u.size,
+    u.truncated, u.sha256, u.answered_path, u.path_is_prefix, u.content_state,
+    EXISTS(SELECT 1 FROM upload_blobs b WHERE b.sha256 = u.sha256) AS held,
+    (SELECT r.id FROM requests r WHERE r.uid = u.request_uid) AS request_id, u.origin
+    FROM uploads u JOIN ips i ON i.id = u.ip_id";
+
+/// One page of uploads, newest first.
+pub async fn list(
+    conn: &mut SqliteConnection,
+    page: u32,
+) -> Result<super::browse::Page<UploadRow>> {
+    use super::browse::{PAGE_SIZE, Page, offset};
+    let page = page.max(1);
+    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {UPLOAD_COLS} ORDER BY u.id DESC LIMIT ? OFFSET ?"
+    )))
+    .bind(PAGE_SIZE + 1)
+    .bind(offset(page))
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(Page::from_rows(rows, page))
+}
+
+pub async fn get(conn: &mut SqliteConnection, uid: &str) -> Result<Option<UploadRow>> {
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {UPLOAD_COLS} WHERE u.uid = ?"
+    )))
+    .bind(uid)
+    .fetch_optional(&mut *conn)
+    .await?)
+}
+
+/// The requests the origin answered at the upload's path after it, oldest
+/// first: the same path, or (for a folder) any path under it. A query-time
+/// join, as the trap's own lookup: `substr`, not `LIKE`, so a `_` or `%`
+/// in the path is no wildcard (A2). Requests in the upload's own second
+/// count if they came after its request.
+pub async fn timeline(conn: &mut SqliteConnection, u: &UploadRow) -> Result<Vec<TimelineRow>> {
+    Ok(sqlx::query_as(
+        "SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.status, r.answer
+         FROM requests r JOIN ips i ON i.id = r.ip_id
+         WHERE r.origin IS ?1 AND r.path >= ?2
+           AND (r.path = ?2 OR (?3 AND substr(r.path, 1, length(?2)) = ?2))
+           AND (r.ts > ?4 OR (r.ts = ?4 AND r.id > ?5))
+         ORDER BY r.ts, r.id LIMIT ?6",
+    )
+    .bind(&u.origin)
+    .bind(&u.answered_path)
+    .bind(u.path_is_prefix)
+    .bind(&u.ts)
+    .bind(u.request_id.unwrap_or(i64::MAX))
+    .bind(TIMELINE_MAX)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
+/// An upload's held content, with its SHA-256, for the admin's encrypted
+/// download. The only reader of stored content besides replication
+/// ([`content_for_relay`]); nothing serves it on the trap.
+pub async fn content_for_export(
+    conn: &mut SqliteConnection,
+    uid: &str,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    Ok(sqlx::query_as(
+        "SELECT b.sha256, b.content FROM uploads u JOIN upload_blobs b ON b.sha256 = u.sha256
+         WHERE u.uid = ?",
+    )
+    .bind(uid)
+    .fetch_optional(&mut *conn)
+    .await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,5 +1076,74 @@ mod tests {
         assert_eq!(last, vec![("/s.php".into(), false, "c".into())]);
         let alone = answered_paths(&mut c, None, 10).await.unwrap();
         assert_eq!(alone, vec![("/standalone.php".into(), false, "d".into())]);
+    }
+
+    /// The timeline is the origin's later requests at the path, and under
+    /// it for a folder; a `_` in the slug matches only itself (A2).
+    #[tokio::test]
+    async fn the_timeline_is_later_requests_at_the_answered_path() {
+        let (s, _d) = store().await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let l = Limits::default();
+        let (mine, other) = (origin(), origin());
+        let a = rec("a", b"x");
+        let mut b = rec("b", b"y");
+        b.answered_path = "/wp-content/plugins/wp_shell/".into();
+        b.path_is_prefix = true;
+        receive(&mut c, &mine, &a, None, &l, DAY, None).await;
+        receive(&mut c, &mine, &b, None, &l, DAY, None).await;
+        let t0 = "2026-10-01 00:00:00";
+        for (uid, ts, path, o) in [
+            ("early", "2026-09-30 23:59:59", "/s.php", &mine),
+            ("r-a", t0, "/s.php", &mine),
+            ("same-second", t0, "/s.php", &mine),
+            ("later", "2026-10-01 00:00:05", "/s.php", &mine),
+            ("theirs", "2026-10-01 00:00:06", "/s.php", &other),
+            ("longer", "2026-10-01 00:00:07", "/s.phpx", &mine),
+            ("under", "2026-10-01 00:00:08", "/wp-content/plugins/wp_shell/x.php", &mine),
+            ("wildcard", "2026-10-01 00:00:09", "/wp-content/plugins/wpXshell/x.php", &mine),
+            ("no-slash", "2026-10-01 00:00:10", "/wp-content/plugins/wp_shell", &mine),
+        ] {
+            sqlx::query(
+                "INSERT INTO requests (uid, ts, ip_id, method, path, headers_json, origin)
+                 VALUES (?, ?, (SELECT id FROM ips LIMIT 1), 'GET', ?, '[]', ?)",
+            )
+            .bind(uid)
+            .bind(ts)
+            .bind(path)
+            .bind(&o.0[..])
+            .execute(&mut *c)
+            .await
+            .unwrap();
+        }
+        let paths = |rows: Vec<TimelineRow>| rows.into_iter().map(|r| r.path).collect::<Vec<_>>();
+        let a = get(&mut c, "a").await.unwrap().unwrap();
+        assert!(a.request_id.is_some());
+        assert_eq!(paths(timeline(&mut c, &a).await.unwrap()), ["/s.php", "/s.php"]);
+        let b = get(&mut c, "b").await.unwrap().unwrap();
+        assert_eq!(
+            paths(timeline(&mut c, &b).await.unwrap()),
+            ["/wp-content/plugins/wp_shell/x.php"]
+        );
+    }
+
+    /// Only held content is exported, with its hash; the list says which.
+    #[tokio::test]
+    async fn only_held_content_is_exported() {
+        let (s, _d) = store().await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let l = Limits::default();
+        let o = origin();
+        let held = rec("h", b"kept");
+        let gone = rec("g", b"not kept");
+        receive(&mut c, &o, &held, Some(b"kept"), &l, DAY, None).await;
+        receive(&mut c, &o, &gone, None, &l, DAY, None).await;
+        let (sha, bytes) = content_for_export(&mut c, "h").await.unwrap().unwrap();
+        assert_eq!((sha, bytes), (held.sha256.clone(), b"kept".to_vec()));
+        assert!(content_for_export(&mut c, "g").await.unwrap().is_none());
+        assert!(content_for_export(&mut c, "nope").await.unwrap().is_none());
+        let page = list(&mut c, 1).await.unwrap();
+        let got: Vec<_> = page.items.iter().map(|u| (u.uid.as_str(), u.held)).collect();
+        assert_eq!(got, [("g", false), ("h", true)]);
     }
 }
