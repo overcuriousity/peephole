@@ -633,9 +633,7 @@ impl Store {
         use futures::TryStreamExt;
         let (w, since) = r.ts_clause("r.ts");
         let w = w + &a.released("r");
-        let sql = format!(
-            "SELECT r.query, r.body FROM requests r WHERE r.answer = 'webshell'{w}"
-        );
+        let sql = format!("SELECT r.query, r.body FROM requests r WHERE r.answer = 'webshell'{w}");
         let mut rows = bind_since!(
             sqlx::query_as::<_, (Option<String>, Option<Vec<u8>>)>(sqlx::AssertSqlSafe(
                 sql.as_str()
@@ -1702,13 +1700,27 @@ mod tests {
         }
         webshell_hit(&s, None, Some(b"cmd=uname+-a")).await;
         let st = s.stats_as(Range::H24, Audience::Public).await.unwrap();
-        let got: Vec<_> = st.verbs.iter().map(|n| (n.name.as_str(), n.count)).collect();
+        let got: Vec<_> = st
+            .verbs
+            .iter()
+            .map(|n| (n.name.as_str(), n.count))
+            .collect();
         assert_eq!(
             got,
-            [("other", 2), ("id", 1), ("ls", 1), ("uname", 1), ("wget", 1)]
+            [
+                ("other", 2),
+                ("id", 1),
+                ("ls", 1),
+                ("uname", 1),
+                ("wget", 1)
+            ]
         );
         // Nothing the attacker typed shows unless it is a listed verb.
-        assert!(st.verbs.iter().all(|n| !n.name.contains('<') && n.name != "mimikatz.exe"));
+        assert!(
+            st.verbs
+                .iter()
+                .all(|n| !n.name.contains('<') && n.name != "mimikatz.exe")
+        );
     }
 
     #[tokio::test]

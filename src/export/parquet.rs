@@ -456,8 +456,16 @@ mod tests {
             .iter()
             .map(|f| f.name().clone())
             .collect();
-        assert!(names.iter().all(|n| !n.contains("content") || n == "content_state"), "{names:?}");
-        assert!(names.iter().all(|n| n != "body" && n != "bytes"), "{names:?}");
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.contains("content") || n == "content_state"),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().all(|n| n != "body" && n != "bytes"),
+            "{names:?}"
+        );
         assert!(names.contains(&"sha256".to_string()));
     }
 
@@ -487,7 +495,10 @@ mod tests {
             .value(0)
             .to_string();
         use sha2::Digest;
-        assert_eq!(sha, data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(marker)));
+        assert_eq!(
+            sha,
+            data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(marker))
+        );
         // The IP bound narrows it.
         let f = ExportFilter {
             ip: Some("198.51.100.41".into()),

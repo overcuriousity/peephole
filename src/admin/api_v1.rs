@@ -225,9 +225,8 @@ async fn uploads(
     let more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
     let next_cursor = rows.last().filter(|_| more).map(|last| {
-        data_encoding::BASE64URL_NOPAD.encode(
-            &serde_json::to_vec(&UploadsCursor { before: last.id }).unwrap_or_default(),
-        )
+        data_encoding::BASE64URL_NOPAD
+            .encode(&serde_json::to_vec(&UploadsCursor { before: last.id }).unwrap_or_default())
     });
     Json(json!({
         "items": rows.iter().map(upload_json).collect::<Vec<_>>(),
@@ -1304,16 +1303,29 @@ mod tests {
         let items = v["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["answered_path"], "/b.php", "newest first");
-        let keys: Vec<&str> = items[0].as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: Vec<&str> = items[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert!(
-            keys.iter().all(|k| !k.contains("content") || *k == "content_state"),
+            keys.iter()
+                .all(|k| !k.contains("content") || *k == "content_state"),
             "{keys:?}"
         );
-        assert!(!keys.contains(&"body") && !keys.contains(&"bytes"), "{keys:?}");
+        assert!(
+            !keys.contains(&"body") && !keys.contains(&"bytes"),
+            "{keys:?}"
+        );
         let cursor = v["next_cursor"].as_str().unwrap().to_string();
         let (st, v) = send(
             &app,
-            authed("GET", &format!("/api/v1/uploads?limit=1&cursor={cursor}"), &token),
+            authed(
+                "GET",
+                &format!("/api/v1/uploads?limit=1&cursor={cursor}"),
+                &token,
+            ),
         )
         .await;
         assert_eq!(st, 200, "{v}");
@@ -1325,17 +1337,31 @@ mod tests {
         // By hash.
         use sha2::Digest;
         let sha = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(marker));
-        let (st, v) = send(&app, authed("GET", &format!("/api/v1/uploads/{sha}"), &token)).await;
+        let (st, v) = send(
+            &app,
+            authed("GET", &format!("/api/v1/uploads/{sha}"), &token),
+        )
+        .await;
         assert_eq!(st, 200, "{v}");
         assert_eq!(v["sha256"], sha.as_str());
         assert_eq!(v["uploads"].as_array().unwrap().len(), 1);
         assert_eq!(v["uploads"][0]["sha256"], sha.as_str());
         assert!(!v.to_string().contains("MARK-api-5e2d"), "{v}");
         let (st, v) = send(&app, authed("GET", "/api/v1/uploads/abc", &token)).await;
-        assert_eq!((st, v["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")));
+        assert_eq!(
+            (st, v["error"]["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid"))
+        );
         let none = "0".repeat(64);
-        let (st, v) = send(&app, authed("GET", &format!("/api/v1/uploads/{none}"), &token)).await;
-        assert_eq!((st, v["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("not_found")));
+        let (st, v) = send(
+            &app,
+            authed("GET", &format!("/api/v1/uploads/{none}"), &token),
+        )
+        .await;
+        assert_eq!(
+            (st, v["error"]["code"].as_str()),
+            (StatusCode::NOT_FOUND, Some("not_found"))
+        );
         let (st, _) = send(&app, authed("GET", "/api/v1/uploads?cursor=%%%", &token)).await;
         assert_eq!(st, 400);
     }
@@ -1359,16 +1385,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::SEE_OTHER);
-        for path in ["/api/v1/uploads", &format!("/api/v1/uploads/{}", "0".repeat(64))] {
+        for path in [
+            "/api/v1/uploads",
+            &format!("/api/v1/uploads/{}", "0".repeat(64)),
+        ] {
             let (st, v) = send(&app, authed("GET", path, &token)).await;
             assert_eq!(st, 401, "{path}");
             assert_eq!(v["error"]["code"], "unauthorized", "{v}");
             let (st, _) = send(
                 &app,
-                Request::get(path).header("cookie", &cookie).body(Body::empty()).unwrap(),
+                Request::get(path)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
             )
             .await;
-            assert_eq!(st, 401, "the admin session is not an API credential: {path}");
+            assert_eq!(
+                st, 401,
+                "the admin session is not an API credential: {path}"
+            );
         }
     }
 

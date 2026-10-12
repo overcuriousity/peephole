@@ -1347,7 +1347,10 @@ show_labels = {show_labels}
         drop_webshell(&st, "/t.php", "mimikatz").await;
         let (_, after) = get_with(&app, "/?range=7d", None).await;
         assert!(after.contains("Webshells dropped"), "{after}");
-        assert!(after.contains("Commands sent to dropped webshells"), "{after}");
+        assert!(
+            after.contains("Commands sent to dropped webshells"),
+            "{after}"
+        );
         assert!(after.contains(">whoami<"), "{after}");
         assert!(after.contains(">other<"), "{after}");
         assert!(!after.contains("mimikatz"), "{after}");
