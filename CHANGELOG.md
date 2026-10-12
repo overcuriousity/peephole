@@ -5,6 +5,18 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Added
+
+- `GET /api/v1/ips/{addr}/scan/prices` lists every scan level's price
+  range at once, so the app's level picker shows prices before a quote.
+  It spends nothing and creates no quote.
+
+### Changed
+
+- The Actions card's scan level buttons show the full price range,
+  `{floor}–{max} credits` (one amount when both are equal), instead of
+  "from {floor} credits": the same text the app shows.
+
 ### Removed
 
 - Upload capture from 0.11.0 ("The trap keeps files dropped on it") is

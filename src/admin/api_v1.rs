@@ -27,6 +27,7 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/api/v1/lookup", post(lookup))
         .route("/api/v1/ips/{addr}/probe", post(probe))
         .route("/api/v1/ips/{addr}/probe/vantages", get(probe_vantages))
+        .route("/api/v1/ips/{addr}/scan/prices", get(scan_prices))
         .route("/api/v1/ips/{addr}/scan/quote", get(scan_quote))
         .route("/api/v1/ips/{addr}/scan", post(scan_buy))
         .route("/api/v1/jobs/{job_id}", get(job))
@@ -705,6 +706,42 @@ fn level_of(v: Option<&str>) -> Result<u8, Box<Response>> {
     v.and_then(|l| l.trim().parse::<i64>().ok())
         .and_then(crate::scan::valid_level)
         .ok_or_else(|| Box::new(err(StatusCode::BAD_REQUEST, "invalid", "level must be 1-5")))
+}
+
+/// GET /api/v1/ips/{addr}/scan/prices: every level's price range, the
+/// Actions card's level buttons, so the app's level picker shows them
+/// before a quote. Spends nothing.
+async fn scan_prices(
+    ActAuth(_device): ActAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(addr): Path<String>,
+) -> Response {
+    if let Err(r) = row_of(&state, &addr).await {
+        return *r;
+    }
+    let table = state.recorder.node().map(|n| n.price_table());
+    let levels: Vec<Value> = (1u8..=5)
+        .filter_map(|level| {
+            let p = match &table {
+                None => crate::admin::scan_buy::Price {
+                    floor_mc: 0,
+                    max_mc: 0,
+                },
+                Some(t) => crate::admin::scan_buy::price_range(&t.scanners, level)?,
+            };
+            let (floor, floor_mc) = credits(p.floor_mc);
+            let (max, max_mc) = credits(p.max_mc);
+            Some(json!({
+                "level": level,
+                "about": crate::admin::scan_buy::about(level),
+                "credits": floor,
+                "credits_mc": floor_mc,
+                "credits_max": max,
+                "credits_max_mc": max_mc,
+            }))
+        })
+        .collect();
+    Json(json!({ "levels": levels })).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -1496,6 +1533,7 @@ mod tests {
         let calls = [
             ("POST", format!("/api/v1/ips/{SCAN_IP}/probe")),
             ("GET", format!("/api/v1/ips/{SCAN_IP}/probe/vantages")),
+            ("GET", format!("/api/v1/ips/{SCAN_IP}/scan/prices")),
             ("GET", format!("/api/v1/ips/{SCAN_IP}/scan/quote?level=2")),
             ("POST", format!("/api/v1/ips/{SCAN_IP}/scan")),
             ("GET", "/api/v1/jobs/s_1".to_string()),
@@ -1520,6 +1558,39 @@ mod tests {
             assert_eq!(st, 401, "{method} {path} without a token");
         }
         assert_eq!(jobs_and_actions(&state).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn scan_prices_list_every_level_and_spend_nothing() {
+        let (state, _c, _id, _d) = crate::admin::scan_buy::tests::state().await;
+        let app = crate::admin::full_router(state.clone());
+        let token = device(&state, "read,act", "Pixel 8").await;
+        let (st, v) = send(
+            &app,
+            authed("GET", &format!("/api/v1/ips/{SCAN_IP}/scan/prices"), &token),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        let levels = v["levels"].as_array().unwrap();
+        assert_eq!(levels.len(), 5, "{v}");
+        for (i, l) in levels.iter().enumerate() {
+            assert_eq!(l["level"], i + 1, "{l}");
+            assert_eq!(l["about"], crate::admin::scan_buy::about(i as u8 + 1));
+            // Standalone: free.
+            assert_eq!(l["credits"], "0.00", "{l}");
+            assert_eq!(l["credits_max_mc"], 0, "{l}");
+        }
+        let quotes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_quotes")
+            .fetch_one(&state.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(quotes, 0, "no quote");
+        let (st, v) = send(
+            &app,
+            authed("GET", "/api/v1/ips/198.51.100.77/scan/prices", &token),
+        )
+        .await;
+        assert_eq!(st, 404, "{v}");
     }
 
     #[tokio::test]
