@@ -72,6 +72,7 @@ struct WallPage {
     asn_max: i64,
     port_max: i64,
     family_max: i64,
+    verb_max: i64,
     /// "Recent requests": the newest `[public] recent_rows` of `stats.recent`.
     recent: Vec<crate::store::stats::RecentRequest>,
     /// Shortest and longest publication delay, in minutes.
@@ -159,6 +160,7 @@ async fn wall(
         asn_max: max(&mut stats.top_asns.iter().map(|n| n.count)),
         port_max: max(&mut stats.ports.iter().map(|p| p.ips)),
         family_max: max(&mut stats.families.iter().map(|n| n.count)),
+        verb_max: max(&mut stats.verbs.iter().map(|n| n.count)),
         recent,
         delay_min: state.cfg.public.delay_minutes,
         delay_max: state.cfg.public.delay_minutes + state.cfg.public.jitter_minutes,
@@ -1311,6 +1313,61 @@ show_labels = {show_labels}
         let (_, body) = get_with(&app, "/?range=7d", None).await;
         assert!(!body.contains("What they asked our fake AI"), "{body}");
         assert!(!body.contains("llama3:70b"), "{body}");
+    }
+
+    async fn drop_webshell(st: &AdminState, path: &str, cmd: &str) {
+        crate::store::uploads::seed_upload(&st.store, "203.0.113.30", path, b"<?php x").await;
+        let ip = st
+            .store
+            .upsert_ip("198.51.100.30".parse().unwrap())
+            .await
+            .unwrap();
+        st.store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: path.into(),
+                query: Some(format!("cmd={cmd}")),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                answer: Some("webshell".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wall_shows_webshells_dropped_and_their_verbs() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, before) = get_with(&app, "/", None).await;
+        assert!(!before.contains("Webshells dropped"), "{before}");
+        drop_webshell(&st, "/s.php", "whoami").await;
+        drop_webshell(&st, "/t.php", "mimikatz").await;
+        let (_, after) = get_with(&app, "/?range=7d", None).await;
+        assert!(after.contains("Webshells dropped"), "{after}");
+        assert!(after.contains("Commands sent to dropped webshells"), "{after}");
+        assert!(after.contains(">whoami<"), "{after}");
+        assert!(after.contains(">other<"), "{after}");
+        assert!(!after.contains("mimikatz"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn wall_hides_webshells_while_they_await_their_publish_delay() {
+        let (st, _d) = state_with(true, "delay_minutes = 60\njitter_minutes = 0").await;
+        st.store
+            .set_publish_delay(
+                std::time::Duration::from_secs(3600),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let app = crate::admin::full_router(st.clone());
+        drop_webshell(&st, "/s.php", "whoami").await;
+        let (_, body) = get_with(&app, "/?range=7d", None).await;
+        assert!(!body.contains("Webshells dropped"), "{body}");
+        assert!(!body.contains("whoami"), "{body}");
     }
 
     #[tokio::test]
