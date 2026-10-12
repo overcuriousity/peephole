@@ -1449,7 +1449,10 @@ mod tests {
         assert_eq!(v["results"][0]["ip"], "203.0.113.9");
         let names = v["names"].as_array().unwrap();
         assert_eq!(names.len(), 25);
-        assert!(names[..24].iter().all(|n| n["error"]["code"] == "invalid"), "{v}");
+        assert!(
+            names[..24].iter().all(|n| n["error"]["code"] == "invalid"),
+            "{v}"
+        );
         assert_eq!(names[24]["host"], "203.0.113.9", "{v}");
         assert_eq!(names[24]["results"][0]["ip"], "203.0.113.9", "{v}");
     }
