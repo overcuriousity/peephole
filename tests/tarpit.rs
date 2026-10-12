@@ -36,7 +36,6 @@ tarpit_drip_every_secs = 1
     let store = Store::connect(&cfg.database_path).await.unwrap();
     let trusted = Arc::new(cfg.trusted_proxies.clone());
     let state = Arc::new(TrapState {
-        uploads: Default::default(),
         tarpit: Arc::new(trap::tarpit::Tarpit::of(&cfg)),
         ..TrapState::for_test(store.clone(), cfg)
     });

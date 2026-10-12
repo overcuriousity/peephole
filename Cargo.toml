@@ -34,9 +34,6 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "http1", "h
 ipnet = { version = "2", features = ["serde"] }
 maxminddb = "0.32"
 md-5 = "0.11"
-# Multipart bodies of trap uploads (MIK-121), parsed from the buffered
-# body with size limits; the same parser axum's `multipart` feature uses.
-multer = "3"
 # Only the Arrow writer/reader, and zstd for the exported Parquet files.
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 quick-xml = "0.42"
@@ -48,8 +45,6 @@ regex = "1"
 reqwest = { version = "0.13", features = ["rustls", "gzip", "json", "cookies", "form", "query"] }
 rpassword = "7"
 rustls = "0.23"
-# Free disk under the database, for the upload store's floor (statvfs).
-rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11.19"
 serde_ignored = "0.1.14"

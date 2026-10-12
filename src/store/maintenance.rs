@@ -19,8 +19,6 @@ const VACUUM_STEP: i64 = 2000;
 pub struct Report {
     pub tombstones: u64,
     pub pages_freed: u64,
-    /// Upload content no upload refers to any more.
-    pub blobs: u64,
 }
 
 /// Run until `shutdown` turns `true`. `standalone`: the node is not in a
@@ -44,7 +42,6 @@ pub async fn run(store: Store, standalone: bool, mut shutdown: tokio::sync::watc
                 Ok(r) => tracing::info!(
                     tombstones = r.tombstones,
                     pages_freed = r.pages_freed,
-                    blobs = r.blobs,
                     "database maintenance done"
                 ),
                 Err(e) => tracing::warn!(?e, "database maintenance failed"),
@@ -62,16 +59,11 @@ impl Store {
         } else {
             0
         };
-        let blobs = {
-            let mut conn = self.pool.acquire().await?;
-            super::uploads::gc_blobs(&mut conn).await?
-        };
         sqlx::query("PRAGMA optimize").execute(&self.pool).await?;
         let pages_freed = self.incremental_vacuum().await?;
         Ok(Report {
             tombstones,
             pages_freed,
-            blobs,
         })
     }
 

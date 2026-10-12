@@ -6,7 +6,6 @@ use crate::cluster::identity::NodeId;
 use crate::config::{Config, Roles};
 use crate::scan::pace::{self, Pace, SharedPace};
 use crate::store::Store;
-use crate::store::uploads::{self, Limits};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,16 +19,11 @@ const KEY_VERSION: &str = "settings.version";
 /// Every key a runtime override can use. Rows of keys earlier versions
 /// had (the hourly start cap, the scan timeout, the rescan cooldown) are
 /// ignored.
-pub const KEYS: [&str; 9] = [
+pub const KEYS: [&str; 4] = [
     pace::KEY_WORKERS,
     KEY_ROLE_LISTENER,
     KEY_ROLE_SCANNER,
     KEY_ROLE_WEB,
-    uploads::KEY_ENABLED,
-    uploads::KEY_PER_SOURCE,
-    uploads::KEY_DAILY_MB,
-    uploads::KEY_STORE_MAX_MB,
-    uploads::KEY_MIN_FREE_MB,
 ];
 
 /// A set of changes; absent fields stay as they are. Fields an earlier
@@ -40,17 +34,6 @@ pub struct Changes {
     pub listener: Option<bool>,
     pub scanner: Option<bool>,
     pub web: Option<bool>,
-    /// The bounds of the upload store (`store::uploads::Limits`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uploads_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upload_per_source: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upload_daily_mb: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upload_store_max_mb: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upload_min_free_mb: Option<u32>,
 }
 
 impl Changes {
@@ -74,19 +57,6 @@ impl Changes {
         if let Some(x) = self.web {
             v.push(format!("web={}", on(x)));
         }
-        if let Some(x) = self.uploads_enabled {
-            v.push(format!("uploads={}", on(x)));
-        }
-        for (name, x) in [
-            ("upload_per_source", self.upload_per_source),
-            ("upload_daily_mb", self.upload_daily_mb),
-            ("upload_store_max_mb", self.upload_store_max_mb),
-            ("upload_min_free_mb", self.upload_min_free_mb),
-        ] {
-            if let Some(x) = x {
-                v.push(format!("{name}={x}"));
-            }
-        }
         v.join(", ")
     }
 
@@ -96,38 +66,16 @@ impl Changes {
         self.listener = other.listener.or(self.listener);
         self.scanner = other.scanner.or(self.scanner);
         self.web = other.web.or(self.web);
-        self.uploads_enabled = other.uploads_enabled.or(self.uploads_enabled);
-        self.upload_per_source = other.upload_per_source.or(self.upload_per_source);
-        self.upload_daily_mb = other.upload_daily_mb.or(self.upload_daily_mb);
-        self.upload_store_max_mb = other.upload_store_max_mb.or(self.upload_store_max_mb);
-        self.upload_min_free_mb = other.upload_min_free_mb.or(self.upload_min_free_mb);
     }
 
     /// Which key is which field: the one place that says so, in the order
     /// of [`KEYS`].
-    fn fields(&mut self) -> [(&'static str, Field<'_>); 9] {
+    fn fields(&mut self) -> [(&'static str, Field<'_>); 4] {
         [
             (pace::KEY_WORKERS, Field::Number(&mut self.max_workers)),
             (KEY_ROLE_LISTENER, Field::Flag(&mut self.listener)),
             (KEY_ROLE_SCANNER, Field::Flag(&mut self.scanner)),
             (KEY_ROLE_WEB, Field::Flag(&mut self.web)),
-            (uploads::KEY_ENABLED, Field::Flag(&mut self.uploads_enabled)),
-            (
-                uploads::KEY_PER_SOURCE,
-                Field::Number(&mut self.upload_per_source),
-            ),
-            (
-                uploads::KEY_DAILY_MB,
-                Field::Number(&mut self.upload_daily_mb),
-            ),
-            (
-                uploads::KEY_STORE_MAX_MB,
-                Field::Number(&mut self.upload_store_max_mb),
-            ),
-            (
-                uploads::KEY_MIN_FREE_MB,
-                Field::Number(&mut self.upload_min_free_mb),
-            ),
         ]
     }
 
@@ -163,11 +111,6 @@ impl From<Snapshot> for Changes {
             listener: Some(s.roles.listener),
             scanner: Some(s.roles.scanner),
             web: Some(s.roles.web),
-            uploads_enabled: Some(s.uploads.enabled),
-            upload_per_source: Some(s.uploads.per_source),
-            upload_daily_mb: Some(s.uploads.daily_mb),
-            upload_store_max_mb: Some(s.uploads.store_max_mb),
-            upload_min_free_mb: Some(s.uploads.min_free_mb),
         }
     }
 }
@@ -239,14 +182,12 @@ impl Prereqs {
 pub struct Snapshot {
     pub pace: Pace,
     pub roles: Roles,
-    pub uploads: Limits,
     pub version: u64,
 }
 
 /// `current` with `c` applied, or why not. The version is left alone.
 pub fn validate(current: Snapshot, c: &Changes, prereqs: &Prereqs) -> Result<Snapshot, String> {
     let mut s = current;
-    s.uploads = s.uploads.with(c);
     if let Some(x) = c.max_workers {
         s.pace.max_workers = x as usize;
     }
@@ -290,7 +231,6 @@ pub struct Settings {
     defaults: Snapshot,
     prereqs: Arc<Prereqs>,
     roles: Arc<RwLock<Roles>>,
-    uploads: Arc<RwLock<Limits>>,
     version: Arc<AtomicU64>,
     changed: tokio::sync::watch::Sender<u64>,
     /// Serializes writers in this process.
@@ -303,7 +243,6 @@ fn defaults(cfg: &Config) -> Snapshot {
     Snapshot {
         pace: Pace::new(cfg.scan.max_workers),
         roles: cfg.roles,
-        uploads: Limits::default(),
         version: 0,
     }
 }
@@ -318,7 +257,6 @@ impl Settings {
             defaults: d,
             prereqs: Arc::new(Prereqs::default()),
             roles: Arc::new(RwLock::new(d.roles)),
-            uploads: Arc::new(RwLock::new(d.uploads)),
             version: Arc::new(AtomicU64::new(0)),
             changed: tokio::sync::watch::channel(0).0,
             lock: Default::default(),
@@ -339,15 +277,8 @@ impl Settings {
         Snapshot {
             pace: self.pace.get(),
             roles: self.roles(),
-            uploads: *self.uploads.read().unwrap(),
             version: self.version.load(Ordering::Relaxed),
         }
-    }
-
-    /// The upload bounds, kept current by every reload and write: the trap
-    /// reads them without the database.
-    pub fn shared_uploads(&self) -> Arc<RwLock<Limits>> {
-        self.uploads.clone()
     }
 
     /// The config file's values: what a reset goes back to.
@@ -449,16 +380,12 @@ impl Settings {
                 );
             }
         }
-        let mut out = validate(s, &all, &none).unwrap_or(s);
-        // The upload bounds as the trap and `apply` read them: one source.
-        out.uploads = Limits::load(conn).await?;
-        Ok((out, dropped))
+        Ok((validate(s, &all, &none).unwrap_or(s), dropped))
     }
 
     fn adopt(&self, s: Snapshot) {
         self.pace.replace(s.pace);
         *self.roles.write().unwrap() = s.roles;
-        *self.uploads.write().unwrap() = s.uploads;
         self.version.store(s.version, Ordering::Relaxed);
         self.changed.send_replace(s.version);
     }
@@ -635,7 +562,6 @@ mod tests {
                 scanner: roles.1,
                 web: roles.2,
             },
-            uploads: Limits::default(),
             version: 7,
         }
     }

@@ -343,37 +343,6 @@ fn wp_admin(word: &str) -> String {
     )
 }
 
-/// WordPress's page after a plugin or theme zip upload (`what`: `Plugin`
-/// or `Theme`). The upload sink's answer (`trap::upload`); it names no
-/// file, so nothing of the upload is in it.
-pub fn wp_installed(what: &str, word: &str) -> String {
-    let lower = what.to_ascii_lowercase();
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en-US">
-<head>
-<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
-<title>Update {what} &lsaquo; {word} &#8212; WordPress</title>
-<meta name="robots" content="noindex, noarchive">
-</head>
-<body class="wp-admin wp-core-ui no-js update-php">
-<div id="wpwrap"><div id="wpcontent"><div id="wpbody-content"><div class="wrap">
-<h1>Installing {what} from uploaded file</h1>
-<p>Unpacking the package&#8230;</p>
-<p>Installing the {lower}&#8230;</p>
-<p>{what} installed successfully.</p>
-</div></div></div></div>
-</body>
-</html>
-"#
-    )
-}
-
-/// WordPress's `async-upload.php` answer for a media file at `url`.
-pub fn wp_media_json(url: &str) -> String {
-    serde_json::json!({ "success": true, "data": { "url": url } }).to_string()
-}
-
 fn admin_page(word: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
