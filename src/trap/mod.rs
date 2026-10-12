@@ -9,6 +9,7 @@ pub mod raw_head;
 pub mod skiplog;
 pub mod tarpit;
 pub mod tls_hello;
+mod upload;
 
 pub use config::TrapConfig;
 
@@ -70,6 +71,9 @@ pub struct TrapState {
     pub panel_rate: RateLimiter,
     /// Runtime scan settings; the trap reads the rescan cooldown from it.
     pub pace: crate::scan::pace::SharedPace,
+    /// The upload store's bounds as set now ([`crate::settings::Settings`]
+    /// keeps them current), so telling an upload apart reads no database.
+    pub uploads: Arc<RwLock<crate::store::uploads::Limits>>,
     /// Flood protection for the recording path.
     pub guards: Guards,
     /// The slow answer for severity-4 sources; shared with the admin's
@@ -94,6 +98,8 @@ pub struct Guards {
     recording: RecordSlots,
     /// Bounds the bodies held from reading to recording.
     bodies: BodyBudget,
+    /// Which uploads may bring content (`uploads.per_source`).
+    uploads: flood::UploadGate,
 }
 
 /// Bytes of request bodies held at once, across the trap's listeners, from
@@ -373,6 +379,7 @@ impl TrapState {
             notifier: Default::default(),
             helper_rate: RateLimiter::default(),
             panel_rate: RateLimiter::default(),
+            uploads: Default::default(),
             guards: Guards::default(),
             // Off: a test's severity-4 request would hold the next one for
             // the whole hold. Tests of the tarpit set their own.
@@ -487,10 +494,30 @@ impl ReadBody {
     fn whole(&self) -> bool {
         self.hold.is_some() && self.received.is_none()
     }
+
+    /// Keep at most `max` bytes, as if read with that cap. What is let go
+    /// stays held against the budget until the request is recorded.
+    fn cut(&mut self, max: usize) {
+        if self.bytes.len() > max {
+            self.received.get_or_insert(self.bytes.len() as u64);
+            self.bytes.truncate(max);
+            self.bytes.shrink_to_fit();
+        }
+    }
 }
 
 /// Read a body (see [`ReadBody`]), holding what is kept against `budget`.
 async fn read_body(body: axum::body::Body, budget: &BodyBudget) -> ReadBody {
+    read_body_with(body, budget, MAX_BODY, MAX_BODY_DRAIN).await
+}
+
+/// [`read_body`] keeping up to `keep` bytes, and reading up to `drain`.
+async fn read_body_with(
+    body: axum::body::Body,
+    budget: &BodyBudget,
+    keep: usize,
+    drain: u64,
+) -> ReadBody {
     let mut stream = body.into_data_stream();
     let mut hold = budget.hold();
     let mut kept: Vec<u8> = Vec::new();
@@ -503,7 +530,7 @@ async fn read_body(body: axum::body::Body, budget: &BodyBudget) -> ReadBody {
             next = stream.next() => match next {
                 Some(Ok(chunk)) => {
                     seen += chunk.len() as u64;
-                    let take = MAX_BODY.saturating_sub(kept.len()).min(chunk.len());
+                    let take = keep.saturating_sub(kept.len()).min(chunk.len());
                     if !hold.grow(take) {
                         return ReadBody {
                             bytes: vec![],
@@ -512,7 +539,7 @@ async fn read_body(body: axum::body::Body, budget: &BodyBudget) -> ReadBody {
                         };
                     }
                     kept.extend_from_slice(&chunk[..take]);
-                    if seen >= MAX_BODY_DRAIN {
+                    if seen >= drain {
                         break;
                     }
                 }
@@ -798,8 +825,40 @@ async fn trap_handler(
 ) -> Response {
     let in_flight = state.guards.enter();
     let (parts, body) = req.into_parts();
-    let body = read_body(body, &state.guards.bodies).await;
-    trap(state, peer, in_flight, parts, body).await
+    // An upload is told apart before its body is read: only uploads keep
+    // more than `MAX_BODY`, and only while the sink is on.
+    let content_type = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    let kind = upload::detect(
+        parts.method.as_str(),
+        parts.uri.path(),
+        parts.uri.query(),
+        content_type,
+    );
+    let limits = kind
+        .map(|_| *state.uploads.read().unwrap())
+        .filter(|l| l.enabled);
+    let (Some(kind), Some(limits)) = (kind, limits) else {
+        let body = read_body(body, &state.guards.bodies).await;
+        return trap(state, peer, in_flight, parts, body, None).await;
+    };
+    let mut body = read_body_with(body, &state.guards.bodies, upload::KEEP, upload::DRAIN).await;
+    let upload = upload::take(
+        kind,
+        parts.uri.path(),
+        content_type,
+        &body.bytes,
+        body.received,
+        &uuid::Uuid::new_v4().to_string(),
+        &chrono::Utc::now().format("%Y/%m").to_string(),
+        limits.per_source,
+    )
+    .await;
+    // The request's own row keeps what any other request's does.
+    body.cut(MAX_BODY);
+    trap(state, peer, in_flight, parts, body, upload).await
 }
 
 /// [`trap_handler`] once the body is read; also where a helper endpoint
@@ -811,6 +870,7 @@ async fn trap(
     in_flight: InFlight,
     parts: axum::http::request::Parts,
     body: ReadBody,
+    upload: Option<upload::Upload>,
 ) -> Response {
     let ip = client_ip(&parts.headers, peer.ip(), &state.cfg.trusted_proxies);
     let page_token = uuid::Uuid::new_v4().to_string();
@@ -838,7 +898,9 @@ async fn trap(
     };
     // A canary presented is answered as always: its trace is worth more.
     // So is an AI decoy: `mcp-abuse` is severity 4, and the tarpit would
-    // cut the session it marks short.
+    // cut the session it marks short. An upload from a tarpitted source is
+    // kept as its request row only (to `MAX_BODY`), not as an upload: the
+    // source is severity 4 already, and its file is not worth the store.
     if presented == decoy::Presented::default()
         && ai.is_none()
         && let Some(hold) = state.tarpit.take(ip)
@@ -849,6 +911,31 @@ async fn trap(
     }
     let node_id = state.recorder.node_id();
     let word = crate::canary::site::word(node_id.as_ref().map(|n| &n.0[..]));
+    if let Some(u) = upload {
+        // A file dropped: told it landed, whatever else the request is.
+        let d = u.reply(host.as_deref(), word);
+        let slot = state.guards.slot().await;
+        tokio::spawn(record_trap(
+            state.clone(),
+            (in_flight, slot),
+            ip,
+            parts,
+            body,
+            Served {
+                page_token,
+                answer: d.name.clone(),
+                status: d.status,
+                now,
+                host,
+                decoy_v: None,
+                word,
+                decoy_in: None,
+                held_ms: None,
+                upload: Some(u),
+            },
+        ));
+        return decoy_response(d);
+    }
     let decoy_in = ai.as_ref().map(|(_, d)| d.to_json());
     let input = decoy::Input {
         v: crate::canary::DECOY_V,
@@ -942,26 +1029,32 @@ async fn trap(
             word,
             decoy_in,
             held_ms: None,
+            upload: None,
         },
     ));
     if let Some(d) = decoy {
-        let mut resp = (
-            StatusCode::from_u16(d.status).unwrap_or(StatusCode::OK),
-            d.body,
-        )
-            .into_response();
-        for (k, v) in d.headers {
-            if let Ok(v) = axum::http::HeaderValue::from_str(&v) {
-                resp.headers_mut().insert(k, v);
-            }
-        }
-        return resp;
+        return decoy_response(d);
     }
     (
         StatusCode::NOT_FOUND,
         Html(pages::trap_page(&page_token, &state.cfg.trap.helper_prefix)),
     )
         .into_response()
+}
+
+/// The response for a decoy answer.
+fn decoy_response(d: decoy::Decoy) -> Response {
+    let mut resp = (
+        StatusCode::from_u16(d.status).unwrap_or(StatusCode::OK),
+        d.body,
+    )
+        .into_response();
+    for (k, v) in d.headers {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&v) {
+            resp.headers_mut().insert(k, v);
+        }
+    }
+    resp
 }
 
 /// The legacy MCP stream: answered at once, recorded once it ends (with
@@ -1014,6 +1107,7 @@ fn sse_answer(
                 word,
                 held_ms,
                 decoy_in,
+                upload: None,
             },
         )
         .await;
@@ -1073,6 +1167,7 @@ fn tarpit_answer(
                 word,
                 decoy_in: None,
                 held_ms,
+                upload: None,
             },
         )
         .await;
@@ -1103,6 +1198,8 @@ struct Served {
     decoy_in: Option<String>,
     /// How long the tarpit held the client, in milliseconds.
     held_ms: Option<i64>,
+    /// The file the request dropped, recorded with it.
+    upload: Option<upload::Upload>,
 }
 
 /// The credential tokens whose canary would change this request's answer:
@@ -1234,6 +1331,7 @@ async fn record_trap(
                 body: (!classified.is_empty()).then_some(&classified[..]),
                 proxy_target,
             };
+            let ts = served.now.format("%Y-%m-%d %H:%M:%S").to_string();
             let capture = Capture {
                 ip,
                 view,
@@ -1241,7 +1339,7 @@ async fn record_trap(
                 body: (!body.is_empty()).then(|| body.clone()),
                 is_fp_claim: false,
                 page_token: served.page_token,
-                ts: served.now.format("%Y-%m-%d %H:%M:%S").to_string(),
+                ts: ts.clone(),
                 decoy_v: served.decoy_v,
                 decoy_site: served.decoy_v.map(|_| served.word.to_string()),
                 decoy_in: served.decoy_in,
@@ -1254,11 +1352,63 @@ async fn record_trap(
                     .get::<listen::ConnMeta>()
                     .map(|m| ConnCapture::of(m, parts.version)),
             };
-            if let Err(e) = record(&state, capture).await {
+            match record(&state, capture).await {
                 // Answered as always: an error page would tell a scanner it
                 // found something other than a missing route.
-                warn!(%ip, error = %e, "trap: recording the request failed");
+                Err(e) => warn!(%ip, error = %e, "trap: recording the request failed"),
+                Ok(rec) => {
+                    if let Some(u) = served.upload {
+                        record_upload(&state, ip, rec.request_id, ts, u).await;
+                    }
+                }
             }
+        }
+    }
+}
+
+/// Record the file a recorded request dropped. Only an upload whose
+/// request the flood gate admitted gets here; the per-source rate decides
+/// whether it may bring content, and counts only those that did.
+async fn record_upload(
+    state: &TrapState,
+    ip: IpAddr,
+    request_id: i64,
+    ts: String,
+    u: upload::Upload,
+) {
+    let request_uid: Option<String> = sqlx::query_scalar("SELECT uid FROM requests WHERE id = ?")
+        .bind(request_id)
+        .fetch_optional(&state.store.pool)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(%ip, error = %e, "trap: reading the upload's request failed");
+            None
+        });
+    let Some(request_uid) = request_uid else {
+        return;
+    };
+    let rate_ok = state.guards.uploads.allow(ip, u.per_source);
+    let r = crate::cluster::record::UploadRec {
+        request_uid,
+        ts,
+        ip: ip.to_string(),
+        kind: u.kind.as_str().into(),
+        filename: u.filename,
+        sniffed_type: u.sniffed.into(),
+        size: u.size,
+        truncated: u.truncated,
+        answered_path: u.answered_path,
+        path_is_prefix: u.path_is_prefix,
+        ..Default::default()
+    };
+    // Only content-bearing uploads use the source's hour: a spray of a file
+    // held already leaves room for the next new one.
+    match state.recorder.record_upload(r, &u.content, rate_ok).await {
+        Ok((_, true)) => {}
+        Ok((_, false)) => state.guards.uploads.refund(ip),
+        Err(e) => {
+            state.guards.uploads.refund(ip);
+            warn!(%ip, error = %e, "trap: recording the upload failed");
         }
     }
 }
@@ -1294,7 +1444,7 @@ async fn claim_handler(
     .then(|| serde_urlencoded::from_bytes::<ClaimForm>(&body.bytes).ok())
     .flatten();
     let Some(form) = form else {
-        return trap(state, peer, in_flight, parts, body).await;
+        return trap(state, peer, in_flight, parts, body, None).await;
     };
     drop(body);
     let headers = parts.headers;
@@ -1381,7 +1531,7 @@ async fn collect_handler(
         .then(|| serde_json::from_slice::<CollectPayload>(&body.bytes).ok())
         .flatten();
     let Some(payload) = payload else {
-        return trap(state, peer, in_flight, parts, body).await;
+        return trap(state, peer, in_flight, parts, body, None).await;
     };
     drop(body);
     // Recorded apart from the answer, as in `trap_handler`.
@@ -1480,7 +1630,7 @@ async fn panel_handler(
     let Some(token) = token else {
         let in_flight = state.guards.enter();
         let body = read_body(body, &state.guards.bodies).await;
-        return trap(state, peer, in_flight, parts, body).await;
+        return trap(state, peer, in_flight, parts, body, None).await;
     };
     match state.store.fingerprint_by_token(&token).await {
         Ok(Some((ip_id, hash, attrs, behavior))) => {

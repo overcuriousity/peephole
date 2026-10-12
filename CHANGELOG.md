@@ -20,15 +20,6 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   names per request and its per-entry `capped` error are gone; names are
   resolved four at a time instead.
 
-### Removed
-
-- Upload capture from 0.11.0 ("The trap keeps files dropped on it") is
-  withdrawn until roadmap #1 ships complete: uploads get the pre-0.11.0
-  handling again. Rows and blobs already stored in the `uploads` and
-  `upload_blobs` tables stay on disk untouched, and the `uploads.*`
-  runtime settings are ignored. Upload entries from 0.11.0 peers still
-  sync; their content is skipped.
-
 ## [0.11.0] - 2026-10-12
 
 ### Added

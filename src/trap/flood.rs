@@ -101,6 +101,53 @@ impl FloodGate {
     }
 }
 
+/// The window of [`UploadGate`].
+const UPLOAD_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Per source (IPv6 by /64), how many uploads may bring content per hour
+/// (MIK-121); past it an upload is recorded by hash only. A fixed window
+/// from the source's first upload. Only uploads that brought content count:
+/// one that did not ([`UploadGate::refund`]) leaves the allowance as it was.
+#[derive(Default)]
+pub struct UploadGate {
+    windows: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+}
+
+impl UploadGate {
+    /// Whether this upload from `ip` may bring content, at most `per_hour`
+    /// an hour. Counts it either way.
+    pub fn allow(&self, ip: IpAddr, per_hour: u32) -> bool {
+        self.allow_at(ip, per_hour, Instant::now())
+    }
+
+    fn allow_at(&self, ip: IpAddr, per_hour: u32, now: Instant) -> bool {
+        let ip = crate::net::source_key(ip);
+        let open = |start: &Instant| now.saturating_duration_since(*start) < UPLOAD_WINDOW;
+        let mut map = self.windows.lock().unwrap();
+        if map.len() >= MAX_TRACKED && !map.contains_key(&ip) {
+            map.retain(|_, (start, _)| open(start));
+            if map.len() >= MAX_TRACKED {
+                map.clear();
+            }
+        }
+        let w = map.entry(ip).or_insert((now, 0));
+        if !open(&w.0) {
+            *w = (now, 0);
+        }
+        w.1 = w.1.saturating_add(1);
+        w.1 <= per_hour
+    }
+
+    /// Give back what [`UploadGate::allow`] counted for an upload from `ip`
+    /// that brought no content (already held, or not stored).
+    pub fn refund(&self, ip: IpAddr) {
+        let ip = crate::net::source_key(ip);
+        if let Some(w) = self.windows.lock().unwrap().get_mut(&ip) {
+            w.1 = w.1.saturating_sub(1);
+        }
+    }
+}
+
 /// How long an intel result written for an IP is trusted to be current.
 const INTEL_TTL: Duration = Duration::from_secs(300);
 
@@ -255,5 +302,41 @@ mod tests {
             c.map.lock().unwrap().get_mut(&(ip, "tor")).unwrap().1 = old;
             assert!(!c.is_current(ip, "tor", &v));
         }
+    }
+
+    #[test]
+    fn uploads_bring_content_per_source_per_hour() {
+        let g = UploadGate::default();
+        let t0 = Instant::now();
+        let a = |s: &str| -> IpAddr { s.parse().unwrap() };
+        for i in 1..=6 {
+            assert!(g.allow_at(a(&format!("2001:db8:1:2::{i}")), 6, t0), "{i}");
+        }
+        // The 7th from the same /64, another address in it.
+        assert!(!g.allow_at(a("2001:db8:1:2::ff"), 6, t0));
+        // Another source is not affected.
+        assert!(g.allow_at(a("2001:db8:1:3::1"), 6, t0));
+        assert!(g.allow_at(a("203.0.113.7"), 6, t0));
+        // An hour later the window is new.
+        assert!(g.allow_at(a("2001:db8:1:2::1"), 6, t0 + UPLOAD_WINDOW));
+        // None allowed at 0.
+        assert!(!g.allow_at(a("198.51.100.1"), 0, t0));
+    }
+
+    #[test]
+    fn an_upload_without_content_is_given_back() {
+        let g = UploadGate::default();
+        let t0 = Instant::now();
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        for _ in 0..6 {
+            assert!(g.allow_at(a, 6, t0));
+        }
+        // One of them brought nothing (by another address in the /64).
+        g.refund("2001:db8:1:2::2".parse().unwrap());
+        assert!(g.allow_at(a, 6, t0));
+        assert!(!g.allow_at(a, 6, t0));
+        // A source never counted is left alone.
+        g.refund("203.0.113.7".parse().unwrap());
+        assert!(g.allow_at("203.0.113.7".parse().unwrap(), 1, t0));
     }
 }

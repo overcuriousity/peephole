@@ -656,6 +656,7 @@ impl RoleRunner {
             helper_rate: Default::default(),
             panel_rate: Default::default(),
             pace: self.settings.pace.clone(),
+            uploads: self.settings.shared_uploads(),
             guards: Default::default(),
             tarpit: self.tarpit.clone(),
             sse: self.sse.clone(),
