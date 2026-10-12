@@ -170,6 +170,7 @@ mod tests {
             payload: None,
             sig: None,
             erased_by: None,
+            content: None,
         }
     }
 

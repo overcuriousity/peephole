@@ -89,7 +89,7 @@ Column order is as listed.
 | `tls_client_hello` | binary? | The raw TLS ClientHello (HTTPS only) |
 | `ja4` | string? | JA4 fingerprint of that ClientHello |
 | `ja4h` | string? | JA4H fingerprint of `raw_head` (HTTP/1 only; null for plain HTTP from a trusted proxy, whose head is the proxy's request, not the client's): method, version, cookie and referer flags, header count, first `Accept-Language`, then hashes of the header names in order and of the sorted cookie names and pairs. An unknown method gives its first two letters |
-| `answer` | string? | What the trap sent: `not-found` (a 404), `decoy:<name>` (a believable fake: `decoy:dotenv`, `decoy:git-config`, `decoy:git-head`, `decoy:wp-login`, `decoy:wp-login-failed`, `decoy:phpinfo`; answers to a harvested canary: `decoy:wp-login-ok`, `decoy:wp-admin`, `decoy:admin`, `decoy:git-auth`, `decoy:git-refs`, `decoy:git-pack`), `claim` (the false-positive claim page), `tarpit` (a slow `200` that drips a few bytes at a time, for sources whose requests reached severity 4 in the hour before; see `held_ms`) |
+| `answer` | string? | What the trap sent: `not-found` (a 404), `decoy:<name>` (a believable fake: `decoy:dotenv`, `decoy:git-config`, `decoy:git-head`, `decoy:wp-login`, `decoy:wp-login-failed`, `decoy:phpinfo`; answers to a harvested canary: `decoy:wp-login-ok`, `decoy:wp-admin`, `decoy:admin`, `decoy:git-auth`, `decoy:git-refs`, `decoy:git-pack`), `claim` (the false-positive claim page), `webshell` (a request to a path an upload on this node was told it landed at: a canned reply to a few commands, else an empty `200`), `tarpit` (a slow `200` that drips a few bytes at a time, for sources whose requests reached severity 4 in the hour before; see `held_ms`) |
 | `decoy_v` | int? | Template version of a decoy answer (see Canaries); empty for other answers, and empty on a decoy row means version 0 |
 | `decoy_in` | string? | What an MCP or LLM decoy was rendered from (JSON); empty otherwise |
 | `canary_used_from` | list of string | The `uid`s of the rows whose served canaries this row carried (light rows as `<batch uid>#<n>`, `n` the row's position in its batch from 1); empty when none |
@@ -296,6 +296,32 @@ characters of the page token without dashes.
 
 A later row that carries a served canary (in a header, the path, the
 query or the body) lists the serving row in `canary_used_from`.
+
+## Uploads
+
+Files dropped on the trap have their own table, in Parquet only: "Table:
+Uploads" in the web form (`/admin/export/download?table=uploads&format=parquet`).
+One row per upload, oldest first. The time and IP filters apply; label
+and severity filters do not. **The file's content is never in it**: the
+table has no content column. Content leaves a node only through the
+admin's per-file zip.
+
+| Column | Meaning |
+|---|---|
+| `uid` | The upload's id. |
+| `request_uid` | The request that carried the file (`uid` in the main export). |
+| `node_id` | Hex id of the node that collected it; null on a standalone node. |
+| `ts` | When it was received (UTC). |
+| `ip` | The source address. |
+| `kind` | `put`, `wp_plugin`, `wp_theme`, `wp_media` or `script`. |
+| `filename` | The file name the client sent, as sent. Attacker text. |
+| `sniffed_type` | From the first bytes: `zip`, `gzip`, `elf`, `php`, `script`, `html`, `text` or `binary`. |
+| `size` | Full size as received. |
+| `truncated` | Only the first 1 MiB was kept. |
+| `sha256` | Lowercase hex SHA-256 of the kept bytes. |
+| `answered_path` | Where the trap told the uploader the file landed. |
+| `path_is_prefix` | `answered_path` is a folder (a plugin or theme). |
+| `content_state` | Whether this node holds the content: `held`, or why not (`dropped_rate`, `dropped_budget`, `dropped_ceiling`, `dropped_disk`, `dropped_mismatch`, `too_big`, `not_received`). |
 
 ## Two exports
 

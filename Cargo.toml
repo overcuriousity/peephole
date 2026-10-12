@@ -1,6 +1,6 @@
 [package]
 name = "peephole"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 # Oldest toolchain that builds this crate (sqlx 0.9 needs 1.94); CI checks it.
@@ -34,6 +34,9 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "http1", "h
 ipnet = { version = "2", features = ["serde"] }
 maxminddb = "0.32"
 md-5 = "0.11"
+# Multipart bodies of trap uploads (MIK-121), parsed from the buffered
+# body with size limits; the same parser axum's `multipart` feature uses.
+multer = "3"
 # Only the Arrow writer/reader, and zstd for the exported Parquet files.
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 quick-xml = "0.42"
@@ -45,6 +48,8 @@ regex = "1"
 reqwest = { version = "0.13", features = ["rustls", "gzip", "json", "cookies", "form", "query"] }
 rpassword = "7"
 rustls = "0.23"
+# Free disk under the database, for the upload store's floor (statvfs).
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11.19"
 serde_ignored = "0.1.14"
@@ -66,6 +71,9 @@ uuid = { version = "1", features = ["v4"] }
 # credential list — so the "attacker controls the state" risk does not apply.
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 x509-parser = "0.18"
+# The admin's export of dropped files: one deflated entry, ZipCrypto with
+# the password `infected` (a handling convention; nothing is ever read).
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 zstd = "0.14"
 
 [dev-dependencies]

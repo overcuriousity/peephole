@@ -5,11 +5,29 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-12
+
 ### Added
 
 - `GET /api/v1/ips/{addr}/scan/prices` lists every scan level's price
   range at once, so the app's level picker shows prices before a quote.
   It spends nothing and creates no quote.
+- Stateful web decoys (roadmap #1): a file dropped on the trap answers at
+  its path as the webshell the attacker expects. A later request there,
+  from any source, gets a canned reply to `id`, `whoami`, `uname -a`,
+  `pwd`, `hostname` or an `echo` of a plain marker, and an empty 200 for
+  anything else; replies are `text/plain` with `nosniff` and never come
+  from stored content. The node keeps at most 50,000 answered paths in
+  memory, loaded from its own uploads at start.
+- Admin → Uploads lists dropped files by hash, size, sniffed type and
+  client name; an upload's page shows the later requests at its path.
+  Held content leaves only as `<sha256>.zip` (ZipCrypto, password
+  `infected`), and each download is logged with who took which hash.
+  System → Status shows the content held against its ceiling.
+- A public "Webshells dropped" tile with the verbs sent to them, after the
+  public delay; the `uploads` table in the Parquet export (metadata and
+  hash only); `GET /api/v1/uploads` and `GET /api/v1/uploads/{sha256}`
+  (metadata only, see docs/api-v1.md).
 
 ### Changed
 
@@ -19,15 +37,6 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - `POST /api/v1/lookup` answers every host name it is sent. The cap of 10
   names per request and its per-entry `capped` error are gone; names are
   resolved four at a time instead.
-
-### Removed
-
-- Upload capture from 0.11.0 ("The trap keeps files dropped on it") is
-  withdrawn until roadmap #1 ships complete: uploads get the pre-0.11.0
-  handling again. Rows and blobs already stored in the `uploads` and
-  `upload_blobs` tables stay on disk untouched, and the `uploads.*`
-  runtime settings are ignored. Upload entries from 0.11.0 peers still
-  sync; their content is skipped.
 
 ## [0.11.0] - 2026-10-12
 
@@ -1004,6 +1013,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 First release.
 
+[0.12.0]: https://github.com/overcuriousity/peephole/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/overcuriousity/peephole/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/overcuriousity/peephole/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/overcuriousity/peephole/compare/v0.8.0...v0.9.0
