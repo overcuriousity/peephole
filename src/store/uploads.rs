@@ -407,6 +407,26 @@ pub(crate) async fn apply_at(
     Ok(Effect::Applied)
 }
 
+/// The paths this node answered its own latest `limit` uploads at, oldest
+/// first: `(answered_path, path_is_prefix, uid)`. `origin` is this node's
+/// id; None on a standalone node, whose uploads carry none.
+pub async fn answered_paths(
+    conn: &mut SqliteConnection,
+    origin: Option<&[u8]>,
+    limit: usize,
+) -> Result<Vec<(String, bool, String)>> {
+    let mut rows: Vec<(String, bool, String)> = sqlx::query_as(
+        "SELECT answered_path, path_is_prefix, uid FROM uploads
+         WHERE origin IS ? ORDER BY id DESC LIMIT ?",
+    )
+    .bind(origin)
+    .bind(limit as i64)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.reverse();
+    Ok(rows)
+}
+
 /// Daily maintenance: drop content no upload refers to any more, and
 /// budget days that are over. Returns how many blobs went.
 pub async fn gc_blobs(conn: &mut SqliteConnection) -> Result<u64> {
@@ -798,7 +818,7 @@ mod tests {
                 request_uid,
                 ..rec("", b"")
             };
-            let (st, _) = rec_.record_upload(r, b"<?php", true).await.unwrap();
+            let (st, _, _) = rec_.record_upload(r, b"<?php", true).await.unwrap();
             assert_eq!(st, ContentState::Held);
             if n == 0 {
                 rec_.delete_request(id).await.unwrap();
@@ -899,5 +919,45 @@ mod tests {
         assert_eq!(gc_blobs(&mut c).await.unwrap(), 1);
         assert!(!has_blob(&mut c, &sha2::Sha256::digest(b"a")).await.unwrap());
         assert!(has_blob(&mut c, &sha2::Sha256::digest(b"b")).await.unwrap());
+    }
+
+    /// The trap's answered paths are its own node's uploads only, oldest
+    /// first, and a standalone node's are those without an origin.
+    #[tokio::test]
+    async fn answered_paths_are_this_origins() {
+        let (s, _d) = store().await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let l = Limits::default();
+        let (mine, other) = (origin(), origin());
+        let mut a = rec("a", b"x");
+        a.answered_path = "/wp-content/plugins/hello/".into();
+        a.path_is_prefix = true;
+        let mut b = rec("b", b"x");
+        b.answered_path = "/theirs.php".into();
+        let c_ = rec("c", b"x");
+        receive(&mut c, &mine, &a, None, &l, DAY, None).await;
+        receive(&mut c, &other, &b, None, &l, DAY, None).await;
+        receive(&mut c, &mine, &c_, None, &l, DAY, None).await;
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        let mut d = rec("d", b"x");
+        d.answered_path = "/standalone.php".into();
+        apply_at(&mut c, ctx, &d, None, &l, DAY, None)
+            .await
+            .unwrap();
+        let got = answered_paths(&mut c, Some(&mine.0[..]), 10).await.unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("/wp-content/plugins/hello/".into(), true, "a".into()),
+                ("/s.php".into(), false, "c".into()),
+            ]
+        );
+        let last = answered_paths(&mut c, Some(&mine.0[..]), 1).await.unwrap();
+        assert_eq!(last, vec![("/s.php".into(), false, "c".into())]);
+        let alone = answered_paths(&mut c, None, 10).await.unwrap();
+        assert_eq!(alone, vec![("/standalone.php".into(), false, "d".into())]);
     }
 }

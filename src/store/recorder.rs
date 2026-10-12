@@ -190,13 +190,13 @@ impl Recorder {
     /// bounds (`rate_ok`: the per-source rate allows it), then the record.
     /// `r.uid` is set here; `sha256`, `content_state` and `carries_content`
     /// by [`uploads::insert_upload`]. Returns what became of the content,
-    /// and whether this upload brought it (it was not held before).
+    /// whether this upload brought it (it was not held before), and its uid.
     pub async fn record_upload(
         &self,
         mut r: UploadRec,
         content: &[u8],
         rate_ok: bool,
-    ) -> Result<(uploads::ContentState, bool)> {
+    ) -> Result<(uploads::ContentState, bool, String)> {
         r.uid = self.uid();
         r.build = crate::COMMIT.into();
         let origin = self.node_id().map(|n| n.0.to_vec()).unwrap_or_default();
@@ -208,9 +208,9 @@ impl Recorder {
         let mut tx = self.store().pool.begin_with("BEGIN IMMEDIATE").await?;
         let state = uploads::insert_upload(&mut tx, &origin, &mut r, content, rate_ok).await?;
         tx.commit().await?;
-        let brought = r.carries_content;
+        let (brought, uid) = (r.carries_content, r.uid.clone());
         self.write(vec![Record::Upload(Box::new(r))]).await?;
-        Ok((state, brought))
+        Ok((state, brought, uid))
     }
 
     /// Record requests from `ip` that the flood gate answered without

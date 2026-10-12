@@ -485,3 +485,98 @@ async fn only_new_content_counts_against_the_hourly_rate() {
     assert!(rows.iter().all(|r| r.content_state == "held"), "{rows:?}");
     assert_eq!(scalar(&store, "SELECT COUNT(*) FROM upload_blobs").await, 2);
 }
+
+/// A later request to an answered path gets the webshell's canned reply,
+/// from any source, and never anything the upload carried (slice 3).
+#[tokio::test]
+async fn a_dropped_path_answers_as_a_webshell() {
+    let (base, store, _dir, state) = serve(UNGATED, true).await;
+    let marker = "MARK7f3a91";
+    let r = send(
+        &base,
+        "PUT",
+        "/s.php",
+        "203.0.113.50",
+        None,
+        format!("<?php /* {marker} */ system($_GET['cmd']);").into_bytes(),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+
+    let r = send(&base, "GET", "/s.php?cmd=id", "198.51.100.9", None, vec![]).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "text/plain; charset=utf-8");
+    assert_eq!(r.headers()["x-content-type-options"], "nosniff");
+    let body = r.text().await.unwrap();
+    assert_eq!(
+        body,
+        "uid=33(www-data) gid=33(www-data) groups=33(www-data)\n"
+    );
+    // A form body carries the command too; an unknown one is an empty 200.
+    let form = Some("application/x-www-form-urlencoded");
+    let r = send(
+        &base,
+        "POST",
+        "/s.php",
+        "198.51.100.9",
+        form,
+        b"c=echo+abc_1".to_vec(),
+    )
+    .await;
+    assert_eq!(r.text().await.unwrap(), "abc_1\n");
+    for q in [
+        "/s.php",
+        "/s.php?cmd=cat+/etc/passwd",
+        "/s.php?cmd=echo+<script>",
+    ] {
+        let r = send(&base, "GET", q, "198.51.100.9", None, vec![]).await;
+        assert_eq!(r.status(), 200, "{q}");
+        let body = r.text().await.unwrap();
+        assert_eq!(body, "", "{q}");
+    }
+    let webshell: Vec<(String, i64)> =
+        sqlx::query_as("SELECT answer, status FROM requests WHERE method <> 'PUT' ORDER BY id")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(webshell.len(), 5);
+    assert!(webshell.iter().all(|(a, s)| a == "webshell" && *s == 200));
+
+    // Another path is not a webshell, nor is any with the sink off.
+    let r = send(&base, "GET", "/t.php?cmd=id", "198.51.100.9", None, vec![]).await;
+    assert_eq!(r.status(), 404);
+    state.uploads.write().unwrap().enabled = false;
+    let r = send(&base, "GET", "/s.php?cmd=id", "198.51.100.9", None, vec![]).await;
+    assert_ne!(r.status(), 200);
+    assert!(!r.text().await.unwrap().contains(marker));
+}
+
+/// A plugin's folder answers under its slug, and the trap finds this
+/// node's answered paths again when it starts.
+#[tokio::test]
+async fn a_plugin_folder_answers_and_is_loaded_again() {
+    let (base, store, _dir, _state) = serve(UNGATED, true).await;
+    let (ct, b) = multipart("pluginzip", "wp_shell.zip", b"PK\x03\x04plugin");
+    let r = send(
+        &base,
+        "POST",
+        "/wp-admin/update.php?action=upload-plugin",
+        "203.0.113.51",
+        Some(&ct),
+        b,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let row = &uploads(&store).await[0];
+    assert!(row.path_is_prefix);
+    let under = format!("{}shell.php?cmd=whoami", row.answered_path);
+    let r = send(&base, "GET", &under, "198.51.100.10", None, vec![]).await;
+    assert_eq!(r.text().await.unwrap(), "www-data\n");
+    let loaded = trap::webshell::PathMap::load(&store, None).await;
+    assert!(
+        loaded
+            .lookup(&format!("{}x.php", row.answered_path))
+            .is_some()
+    );
+    assert!(loaded.lookup("/wp-content/plugins/other/x.php").is_none());
+}

@@ -10,6 +10,7 @@ pub mod skiplog;
 pub mod tarpit;
 pub mod tls_hello;
 mod upload;
+pub mod webshell;
 
 pub use config::TrapConfig;
 
@@ -74,6 +75,9 @@ pub struct TrapState {
     /// The upload store's bounds as set now ([`crate::settings::Settings`]
     /// keeps them current), so telling an upload apart reads no database.
     pub uploads: Arc<RwLock<crate::store::uploads::Limits>>,
+    /// The paths this node's uploads were answered at, for the requests
+    /// that come to them after.
+    pub webshells: Arc<webshell::PathMap>,
     /// Flood protection for the recording path.
     pub guards: Guards,
     /// The slow answer for severity-4 sources; shared with the admin's
@@ -380,6 +384,7 @@ impl TrapState {
             helper_rate: RateLimiter::default(),
             panel_rate: RateLimiter::default(),
             uploads: Default::default(),
+            webshells: Default::default(),
             guards: Guards::default(),
             // Off: a test's severity-4 request would hold the next one for
             // the whole hold. Tests of the tarpit set their own.
@@ -936,6 +941,53 @@ async fn trap(
         ));
         return decoy_response(d);
     }
+    // A request to where a file was told it landed: the webshell's answer,
+    // from the command alone, never from what the upload carried.
+    if state.uploads.read().unwrap().enabled
+        && let Some(uid) = state.webshells.lookup(path)
+    {
+        let form = (body.whole()
+            && media_type(&parts.headers, |m| m == "application/x-www-form-urlencoded"))
+        .then_some(&body.bytes[..]);
+        let cmd = webshell::extract_command(parts.uri.query(), form).unwrap_or_default();
+        let (status, reply) = webshell::reply(&cmd, word);
+        debug!(%ip, upload = %uid, "trap: a request to a dropped file");
+        let slot = state.guards.slot().await;
+        tokio::spawn(record_trap(
+            state.clone(),
+            (in_flight, slot),
+            ip,
+            parts,
+            body,
+            Served {
+                page_token,
+                answer: "webshell".into(),
+                status,
+                now,
+                host,
+                decoy_v: None,
+                word,
+                decoy_in: None,
+                held_ms: None,
+                upload: None,
+            },
+        ));
+        let mut resp = (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+            reply,
+        )
+            .into_response();
+        let h = resp.headers_mut();
+        h.insert(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        h.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            axum::http::HeaderValue::from_static("nosniff"),
+        );
+        return resp;
+    }
     let decoy_in = ai.as_ref().map(|(_, d)| d.to_json());
     let input = decoy::Input {
         v: crate::canary::DECOY_V,
@@ -1388,6 +1440,7 @@ async fn record_upload(
         return;
     };
     let rate_ok = state.guards.uploads.allow(ip, u.per_source);
+    let (answered, prefix) = (u.answered_path.clone(), u.path_is_prefix);
     let r = crate::cluster::record::UploadRec {
         request_uid,
         ts,
@@ -1404,8 +1457,12 @@ async fn record_upload(
     // Only content-bearing uploads use the source's hour: a spray of a file
     // held already leaves room for the next new one.
     match state.recorder.record_upload(r, &u.content, rate_ok).await {
-        Ok((_, true)) => {}
-        Ok((_, false)) => state.guards.uploads.refund(ip),
+        Ok((_, brought, uid)) => {
+            state.webshells.insert(&answered, prefix, &uid);
+            if !brought {
+                state.guards.uploads.refund(ip);
+            }
+        }
         Err(e) => {
             state.guards.uploads.refund(ip);
             warn!(%ip, error = %e, "trap: recording the upload failed");

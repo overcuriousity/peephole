@@ -657,6 +657,13 @@ impl RoleRunner {
             panel_rate: Default::default(),
             pace: self.settings.pace.clone(),
             uploads: self.settings.shared_uploads(),
+            webshells: Arc::new(
+                trap::webshell::PathMap::load(
+                    &self.store,
+                    self.recorder.node_id().map(|n| n.0.to_vec()).as_deref(),
+                )
+                .await,
+            ),
             guards: Default::default(),
             tarpit: self.tarpit.clone(),
             sse: self.sse.clone(),
