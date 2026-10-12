@@ -468,42 +468,6 @@ pub struct IntelManifestRec {
     pub fetched_at: String,
 }
 
-/// A file dropped on the origin's trap (MIK-121), as `store::uploads`
-/// keeps it. Content is hostile and is never served, executed, rendered or
-/// unpacked anywhere.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct UploadRec {
-    pub uid: String,
-    /// The request that carried the file.
-    pub request_uid: String,
-    pub ts: String,
-    pub ip: String,
-    /// `put`, `wp_plugin`, `wp_theme`, `wp_media` or `script`.
-    pub kind: String,
-    /// The client's file name, as sent.
-    pub filename: Option<String>,
-    /// From the first bytes, never from the client's `Content-Type`.
-    pub sniffed_type: String,
-    /// Full size as received; more than the kept bytes when `truncated`.
-    pub size: i64,
-    pub truncated: bool,
-    /// SHA-256 of the kept bytes.
-    #[serde(with = "serde_bytes")]
-    pub sha256: Vec<u8>,
-    /// The path the trap answered with; later requests to it are linked.
-    pub answered_path: String,
-    /// `answered_path` is a directory: requests under it link too.
-    pub path_is_prefix: bool,
-    /// The origin's `uploads.content_state` for it.
-    pub content_state: String,
-    /// The origin newly stored the content with this upload: only then do
-    /// the bytes travel with the entry ([`WireEntry::content`]), and only
-    /// then does a receiver take them.
-    pub carries_content: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub build: String,
-}
-
 /// A delete by the node that created the listed records. Wherever it is
 /// applied, it only affects entries of the tombstone's own origin; uids of
 /// other nodes' records in the list are ignored.
@@ -607,7 +571,6 @@ pub enum Record {
     },
     ScanAudit(Box<ScanAuditRec>),
     ReachReport(ReachReportRec),
-    Upload(Box<UploadRec>),
 }
 
 /// Kinds whose payload is not stored in the log but rebuilt from their row
@@ -641,7 +604,6 @@ impl Record {
             Record::ForkProof { .. } => "fork_proof",
             Record::ScanAudit(_) => "scan_audit",
             Record::ReachReport(_) => "reach_report",
-            Record::Upload(_) => "upload",
         }
     }
 
@@ -660,7 +622,6 @@ impl Record {
             Record::Tombstone(r) => Some(r.uid.clone()),
             Record::SkipBatch(r) => Some(r.uid.clone()),
             Record::ScanAudit(r) => Some(r.scan.uid.clone()),
-            Record::Upload(r) => Some(r.uid.clone()),
             _ => None,
         }
     }
@@ -691,12 +652,6 @@ pub struct WireEntry {
     pub sig: Option<Vec<u8>>,
     /// The tombstone that erased this entry (payload and sig are gone).
     pub erased_by: Option<String>,
-    /// The content of an `upload` entry whose record `carries_content`,
-    /// when the sender holds it. Not signed: the record's signed `sha256`
-    /// authenticates it, and every receiver recomputes that before storing
-    /// it. Never stored in the log; older builds skip the field.
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
-    pub content: Option<Vec<u8>>,
 }
 
 fn signing_bytes(
@@ -745,7 +700,6 @@ impl WireEntry {
             payload: Some(payload),
             sig: Some(sig),
             erased_by: None,
-            content: None,
         })
     }
 
@@ -769,7 +723,6 @@ impl WireEntry {
             payload: Some(payload),
             sig: Some(sig),
             erased_by: None,
-            content: None,
         }
     }
 
@@ -1099,81 +1052,6 @@ mod tests {
         let mut e = WireEntry::sign(&me, 1, 1, &Record::MemberRevoke { id: me.id }).unwrap();
         e.kind = "from_the_future".into();
         assert_eq!(e.record(), None);
-    }
-
-    fn upload_entry(id: &Identity) -> WireEntry {
-        let r = Record::Upload(Box::new(UploadRec {
-            uid: format!("{}u1", id.id.uid_prefix()),
-            request_uid: format!("{}r1", id.id.uid_prefix()),
-            ts: "2026-10-01 00:00:00".into(),
-            ip: "203.0.113.21".into(),
-            kind: "put".into(),
-            sniffed_type: "php".into(),
-            size: 3,
-            sha256: vec![9; 32],
-            answered_path: "/s.php".into(),
-            content_state: "held".into(),
-            carries_content: true,
-            ..Default::default()
-        }));
-        let mut e = WireEntry::sign(id, 1, 1 << 16, &r).unwrap();
-        e.content = Some(b"abc".to_vec());
-        e
-    }
-
-    /// An upload survives the wire with the bytes beside it, which the
-    /// signature does not cover (the signed `sha256` does).
-    #[test]
-    fn an_upload_round_trips_with_its_content_unsigned() {
-        let id = Identity::generate().unwrap();
-        let e = upload_entry(&id);
-        assert_eq!(e.kind, "upload");
-        assert_eq!(e.uid, Some(format!("{}u1", id.id.uid_prefix())));
-        let back: WireEntry =
-            crate::cluster::rpc::cbor::decode(&crate::cluster::rpc::cbor::encode(&e).unwrap())
-                .unwrap();
-        assert_eq!(back, e);
-        assert!(matches!(back.record(), Some(Record::Upload(_))));
-        let mut other = e.clone();
-        other.content = Some(b"xyz".to_vec());
-        assert!(other.verify(), "content is not signed");
-        assert!(!ROW_BACKED.contains(&"upload"));
-    }
-
-    /// (h) Mixed versions: a build before uploads decodes the entry (the
-    /// `content` field skipped) and sees an unknown kind, which it keeps
-    /// and relays (`repl` tests); an entry from such a build, without the
-    /// field, decodes here with no content.
-    #[test]
-    fn uploads_cross_older_builds() {
-        #[derive(Serialize, Deserialize)]
-        struct OldWireEntry {
-            origin: NodeId,
-            seq: u64,
-            hlc: u64,
-            kind: String,
-            uid: Option<String>,
-            #[serde(with = "serde_bytes")]
-            payload: Option<Vec<u8>>,
-            #[serde(with = "serde_bytes")]
-            sig: Option<Vec<u8>>,
-            erased_by: Option<String>,
-        }
-        let id = Identity::generate().unwrap();
-        let e = upload_entry(&id);
-        let bytes = crate::cluster::rpc::cbor::encode(&e).unwrap();
-        let old: OldWireEntry = crate::cluster::rpc::cbor::decode(&bytes).unwrap();
-        assert_eq!(old.payload, e.payload);
-        let mut unknown = e.clone();
-        unknown.content = None;
-        unknown.kind = "upload_of_a_later_build".into();
-        assert_eq!(unknown.record(), None, "a kind a build does not know");
-        let from_old: WireEntry =
-            crate::cluster::rpc::cbor::decode(&crate::cluster::rpc::cbor::encode(&old).unwrap())
-                .unwrap();
-        assert_eq!(from_old.content, None);
-        assert!(from_old.verify());
-        assert!(matches!(from_old.record(), Some(Record::Upload(_))));
     }
 
     /// The credit kinds have no uid (no tombstone can erase a payment) and

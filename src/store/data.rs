@@ -61,17 +61,6 @@ pub fn new_uid() -> String {
 }
 
 pub async fn apply(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Result<Effect> {
-    apply_with(conn, ctx, r, None).await
-}
-
-/// [`apply`], with the bytes a replicated `upload` entry carried
-/// (`WireEntry::content`); other kinds ignore them.
-pub async fn apply_with(
-    conn: &mut SqliteConnection,
-    ctx: Ctx<'_>,
-    r: &Record,
-    content: Option<&[u8]>,
-) -> Result<Effect> {
     // Hides and blocks only exist in a cluster.
     if ctx.origin.is_some() && CONTENT_KINDS.contains(&r.kind()) {
         if origin_blocked(conn, ctx.origin).await? {
@@ -106,7 +95,6 @@ pub async fn apply_with(
         Record::IpName(r) => super::probes::apply_ip_name(conn, ctx, r).await,
         Record::RdnsName(r) => super::rdns::apply_rdns(conn, ctx, r).await,
         Record::ReachReport(r) => crate::credits::reach::apply(conn, ctx, r).await,
-        Record::Upload(r) => super::uploads::apply(conn, ctx, r, content).await,
         // Membership and credits are the cluster layer's (`members::apply`,
         // `credits::entries`, `cluster::seal`): no row of the dataset.
         Record::MemberAdd(_)
@@ -122,9 +110,8 @@ pub async fn apply_with(
 
 /// Record kinds a local hide or block keeps out of the tables. Membership,
 /// tombstones and scan-job state still apply, so the cluster stays in step.
-const CONTENT_KINDS: [&str; 12] = [
+const CONTENT_KINDS: [&str; 11] = [
     "request",
-    "upload",
     "skip_batch",
     "fingerprint",
     "fp_claim",
@@ -224,7 +211,7 @@ const EARLIEST_MS: i64 = 946_684_800_000;
 /// as a time), no earlier than [`EARLIEST_MS`], and no later than
 /// [`MAX_AHEAD`] from now (a fast clock would keep its rows "recent" and
 /// out of retention).
-pub(crate) fn row_ts(ts: &str) -> Option<String> {
+fn row_ts(ts: &str) -> Option<String> {
     let t = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").ok()?;
     let earliest = chrono::DateTime::from_timestamp_millis(EARLIEST_MS)?.naive_utc();
     let limit = chrono::Utc::now().naive_utc() + MAX_AHEAD;
@@ -1082,8 +1069,6 @@ async fn tombstone(conn: &mut SqliteConnection, ctx: Ctx<'_>, t: &TombstoneRec) 
         ("skipped_batches", "uid"),
         ("probes", "uid"),
         ("ip_names", "record_uid"),
-        ("uploads", "uid"),
-        ("uploads", "request_uid"),
     ] {
         let sql = format!("SELECT DISTINCT ip_id FROM {table} WHERE {col} IN ({{}})");
         for chunk in own.chunks(400) {
@@ -1123,10 +1108,7 @@ async fn tombstone(conn: &mut SqliteConnection, ctx: Ctx<'_>, t: &TombstoneRec) 
         &own,
     )
     .await?;
-    // An upload goes with the request that carried it.
-    for_uids(conn, "DELETE FROM uploads WHERE request_uid IN ({})", &own).await?;
     for table in [
-        "uploads",
         "scans",
         "fp_claims",
         "fingerprints",
@@ -1177,8 +1159,7 @@ pub(crate) async fn drop_orphan_ip(conn: &mut SqliteConnection, ip_id: i64) -> R
            AND NOT EXISTS (SELECT 1 FROM fingerprints WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM fp_claims WHERE ip_id = ?1)
            AND NOT EXISTS (SELECT 1 FROM skipped_batches WHERE ip_id = ?1)
-           AND NOT EXISTS (SELECT 1 FROM probes WHERE ip_id = ?1)
-           AND NOT EXISTS (SELECT 1 FROM uploads WHERE ip_id = ?1)",
+           AND NOT EXISTS (SELECT 1 FROM probes WHERE ip_id = ?1)",
     )
     .bind(ip_id)
     .execute(&mut *conn)
@@ -1260,7 +1241,6 @@ async fn remove_row(
         // probe_ports and the probe's host_keys cascade.
         "probe_result" => "probes",
         "ip_name" | "rdns_name" => "ip_names",
-        "upload" => "uploads",
         _ => return Ok(None),
     };
     // An ip_names row carries the uid of the newest lookup that set it.
@@ -1282,11 +1262,6 @@ async fn remove_row(
     }
     match kind {
         "request" => {
-            // The upload goes with the request that carried it.
-            sqlx::query("DELETE FROM uploads WHERE request_uid = ?")
-                .bind(uid)
-                .execute(&mut *conn)
-                .await?;
             sqlx::query("DELETE FROM fp_claims WHERE request_uid = ?")
                 .bind(uid)
                 .execute(&mut *conn)

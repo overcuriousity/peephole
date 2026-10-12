@@ -5,13 +5,12 @@ use super::Store;
 use super::data::{self, Ctx, new_uid, now_ts};
 use super::requests::NewRequest;
 use super::scans::{EnqueueOutcome, ScanJobRow};
-use super::uploads;
 use crate::cluster::Node;
 use crate::cluster::hlc::Hlc;
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{
     FingerprintRec, FpClaimRec, IpIntelRec, JobStatusRec, PortRec, Record, RequestRec, ScanJobRec,
-    ScanResultRec, TombstoneRec, UploadRec,
+    ScanResultRec, TombstoneRec,
 };
 use crate::scan::guard::{self, EnqueuePolicy};
 use crate::scan::nmap_xml::ScanResult;
@@ -181,27 +180,6 @@ impl Recorder {
             .fetch_optional(&self.store().pool)
             .await?
             .with_context(|| format!("requests {uid} was not stored"))
-    }
-
-    /// Record a file dropped on the trap: its content within the store's
-    /// bounds (`rate_ok`: the per-source rate allows it), then the record.
-    /// `r.uid` is set here; `sha256`, `content_state` and `carries_content`
-    /// by [`uploads::insert_upload`]. Returns what became of the content.
-    pub async fn record_upload(
-        &self,
-        mut r: UploadRec,
-        content: &[u8],
-        rate_ok: bool,
-    ) -> Result<uploads::ContentState> {
-        r.uid = self.uid();
-        r.build = crate::COMMIT.into();
-        let origin = self.node_id().map(|n| n.0.to_vec()).unwrap_or_default();
-        let state = {
-            let mut conn = self.store().pool.acquire().await?;
-            uploads::insert_upload(&mut conn, &origin, &mut r, content, rate_ok).await?
-        };
-        self.write(vec![Record::Upload(Box::new(r))]).await?;
-        Ok(state)
     }
 
     /// Record requests from `ip` that the flood gate answered without
@@ -1184,15 +1162,12 @@ impl Recorder {
         let (fps, their_fps) = self
             .split("fingerprints", "request_uid", Keys::Uids(&all))
             .await?;
-        let (ups, their_ups) = self
-            .split("uploads", "request_uid", Keys::Uids(&all))
-            .await?;
         let (deleted, hidden) = (reqs.len() as u64, foreign.len() as u64);
         // Children first, in both: a delete cut short between two
-        // tombstones leaves no claim, fingerprint or upload behind its
-        // request, and hiding a request unlinks its fingerprints.
-        self.bury([ups, fps, claims, reqs].concat()).await?;
-        self.hide([their_ups, their_fps, their_claims, foreign].concat())
+        // tombstones leaves no claim or fingerprint behind its request, and
+        // hiding a request unlinks its fingerprints.
+        self.bury([fps, claims, reqs].concat()).await?;
+        self.hide([their_fps, their_claims, foreign].concat())
             .await?;
         Ok(Deleted { deleted, hidden })
     }
@@ -1216,7 +1191,6 @@ impl Recorder {
             "scans",
             "skipped_batches",
             "probes",
-            "uploads",
         ] {
             let (o, f) = self.split(table, "ip_id", Keys::Ids(ids)).await?;
             own.extend(o);

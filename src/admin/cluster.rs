@@ -907,8 +907,6 @@ impl SettingsForm {
             listener: Some(self.listener.is_some()),
             scanner: Some(self.scanner.is_some()),
             web: Some(self.web.is_some()),
-            // The upload bounds are set from the CLI or by the owner.
-            ..Default::default()
         })
     }
 }
