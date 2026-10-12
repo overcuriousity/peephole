@@ -5,6 +5,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-12
+
 ### Added
 
 - `POST /api/v1/lookup` takes host names and URLs in a new `names` field
@@ -31,6 +33,19 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   buy queues and charges nothing), and poll the job. They run the Actions
   card's own checks. Every queued job is audited and listed under Recent
   actions on Admin → Devices.
+- `GET /api/v1/ips/{addr}/probe/vantages` lists the probe vantages the
+  Actions card offers for an address, with their prices and the default
+  pick (standalone: this node, free). Same gates as starting a probe; it
+  spends nothing.
+- The trap keeps files dropped on it: PUTs, WordPress plugin, theme and
+  media uploads and multipart POSTs to common upload scripts keep up to
+  1 MiB of the first file (name sanitised, type sniffed), stored once per
+  SHA-256 and replicated beside the entry to members. The client is told
+  the upload landed. Runtime settings `uploads.enabled`,
+  `uploads.per_source` (per hour, IPv6 by /64; past it only the hash is
+  kept), `uploads.daily_mb`, `uploads.store_max_mb` and
+  `uploads.min_free_mb` bound it; `uploads.enabled = false` restores the
+  old handling. Older builds skip the content.
 
 ### Changed
 
@@ -90,6 +105,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ### Fixed
 
+- Scans: two buys of the same address and level at once (Actions card or
+  `/api/v1`) queue one job, not two. An API scan whose audit entry cannot
+  be written is withdrawn and reports `failed`.
 - Scans: a standalone node ran a failed scan's retry at once instead of
   after its delay (10 minutes, doubling to 2 hours), so a broken nmap
   failed the same addresses several times a second for as long as it
@@ -962,6 +980,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 First release.
 
+[0.11.0]: https://github.com/overcuriousity/peephole/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/overcuriousity/peephole/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/overcuriousity/peephole/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/overcuriousity/peephole/compare/v0.7.0...v0.8.0
