@@ -64,7 +64,32 @@ impl PathMap {
         self.insert_bounded(path, is_prefix, uid, MAX_PATHS);
     }
 
-    fn insert_bounded(&self, path: &str, is_prefix: bool, uid: &str, max: usize) {
+    /// Answer `path` from now on, before its upload is recorded (no uid
+    /// yet); [`Self::settle`] then names the upload or takes it back.
+    pub fn reserve(&self, path: &str, is_prefix: bool) -> u64 {
+        self.insert_bounded(path, is_prefix, "", MAX_PATHS)
+    }
+
+    /// Settle what [`Self::reserve`] returned `seq` for: the recorded
+    /// upload's uid, or None to stop answering the path. A path answered
+    /// again since is left to its later entry.
+    pub fn settle(&self, path: &str, is_prefix: bool, seq: u64, uid: Option<&str>) {
+        let mut p = self.0.lock().unwrap();
+        let map = if is_prefix {
+            &mut p.prefix
+        } else {
+            &mut p.exact
+        };
+        if map.get(path).is_none_or(|(at, _)| *at != seq) {
+            return;
+        }
+        match uid {
+            Some(uid) => map.insert(path.to_string(), (seq, uid.to_string())),
+            None => map.remove(path),
+        };
+    }
+
+    fn insert_bounded(&self, path: &str, is_prefix: bool, uid: &str, max: usize) -> u64 {
         let mut p = self.0.lock().unwrap();
         p.seq += 1;
         let seq = p.seq;
@@ -85,6 +110,7 @@ impl PathMap {
                 map.remove(&old);
             }
         }
+        seq
     }
 
     /// The upload answered at `path`: the exact path, else the deepest
@@ -187,6 +213,26 @@ mod tests {
     use super::*;
 
     const WORD: &str = "orchid";
+
+    #[test]
+    fn a_reserved_path_answers_until_settled() {
+        let m = PathMap::default();
+        let a = m.reserve("/a.php", false);
+        assert_eq!(m.lookup("/a.php").as_deref(), Some(""));
+        m.settle("/a.php", false, a, Some("u1"));
+        assert_eq!(m.lookup("/a.php").as_deref(), Some("u1"));
+        let b = m.reserve("/b/", true);
+        assert_eq!(m.lookup("/b/x.php").as_deref(), Some(""));
+        m.settle("/b/", true, b, None);
+        assert_eq!(m.lookup("/b/x.php"), None);
+        // A later upload to the same path is not undone by an earlier one.
+        let c1 = m.reserve("/c.php", false);
+        let c2 = m.reserve("/c.php", false);
+        m.settle("/c.php", false, c1, None);
+        assert_eq!(m.lookup("/c.php").as_deref(), Some(""));
+        m.settle("/c.php", false, c2, Some("u2"));
+        assert_eq!(m.lookup("/c.php").as_deref(), Some("u2"));
+    }
 
     #[test]
     fn canned_commands() {

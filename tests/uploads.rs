@@ -277,11 +277,63 @@ async fn a_large_put_keeps_one_mib_and_its_full_size() {
         scalar(&store, "SELECT size FROM upload_blobs").await,
         MIB as i64
     );
-    // The request's own row keeps 64 KiB, as any other's.
+    // The request's own row keeps no body: an upload's content leaves only
+    // as the encrypted zip (plan §5.2), never as a request body.
     assert_eq!(
-        scalar(&store, "SELECT length(body) FROM requests").await,
-        64 * 1024
+        scalar(&store, "SELECT COUNT(*) FROM requests WHERE body IS NULL").await,
+        1
     );
+}
+
+#[tokio::test]
+async fn a_multipart_upload_keeps_no_request_body() {
+    let (base, store, _dir) = spawn(UNGATED).await;
+    let (ct, body) = multipart("async-upload", "x.php", b"<?php MARKd1 ?>");
+    let r = send(
+        &base,
+        "POST",
+        "/wp-admin/async-upload.php",
+        "203.0.113.42",
+        Some(&ct),
+        body,
+    )
+    .await;
+    assert!(r.status().is_success(), "{}", r.status());
+    assert_eq!(uploads(&store).await.len(), 1);
+    assert_eq!(
+        scalar(&store, "SELECT COUNT(*) FROM requests WHERE body IS NULL").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_path_answers_before_the_upload_is_written() {
+    // Answered as soon as the reply is ready, not once it is recorded: the
+    // path must answer as a webshell straight after the upload's reply.
+    let (base, _store, _dir, _state) = serve(UNGATED, false).await;
+    for i in 0..20 {
+        let path = format!("/r{i}.php");
+        let r = send(
+            &base,
+            "PUT",
+            &path,
+            "203.0.113.51",
+            None,
+            b"<?php ?>".to_vec(),
+        )
+        .await;
+        assert_eq!(r.status(), 201);
+        let r = send(
+            &base,
+            "GET",
+            &format!("{path}?cmd=id"),
+            "198.51.100.9",
+            None,
+            vec![],
+        )
+        .await;
+        assert_eq!(r.status(), 200, "{path}");
+    }
 }
 
 #[tokio::test]

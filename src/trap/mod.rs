@@ -919,6 +919,9 @@ async fn trap(
     if let Some(u) = upload {
         // A file dropped: told it landed, whatever else the request is.
         let d = u.reply(host.as_deref(), word);
+        // The path answers as a webshell from the reply on, not only once
+        // the upload is written; recording it names it or takes it back.
+        let seq = state.webshells.reserve(&u.answered_path, u.path_is_prefix);
         let slot = state.guards.slot().await;
         tokio::spawn(record_trap(
             state.clone(),
@@ -936,7 +939,7 @@ async fn trap(
                 word,
                 decoy_in: None,
                 held_ms: None,
-                upload: Some(u),
+                upload: Some((u, seq)),
             },
         ));
         return decoy_response(d);
@@ -1250,8 +1253,9 @@ struct Served {
     decoy_in: Option<String>,
     /// How long the tarpit held the client, in milliseconds.
     held_ms: Option<i64>,
-    /// The file the request dropped, recorded with it.
-    upload: Option<upload::Upload>,
+    /// The file the request dropped, recorded with it, and its path's
+    /// [`webshell::PathMap::reserve`].
+    upload: Option<(upload::Upload, u64)>,
 }
 
 /// The credential tokens whose canary would change this request's answer:
@@ -1344,6 +1348,11 @@ async fn record_trap(
                 (None, Some(held_ms)) => skiplog::SkipAnswer::Tarpit { held_ms },
                 (None, None) => skiplog::SkipAnswer::Plain,
             };
+            if let Some((u, seq)) = &served.upload {
+                state
+                    .webshells
+                    .settle(&u.answered_path, u.path_is_prefix, *seq, None);
+            }
             let full = state.guards.skips.note(
                 ip,
                 served.now.timestamp_millis(),
@@ -1388,7 +1397,10 @@ async fn record_trap(
                 ip,
                 view,
                 raw_headers: &raw,
-                body: (!body.is_empty()).then(|| body.clone()),
+                // An upload's content is never a request body: it leaves
+                // only as the encrypted zip (plan §5.2). The classifier
+                // above has seen it.
+                body: (served.upload.is_none() && !body.is_empty()).then(|| body.clone()),
                 is_fp_claim: false,
                 page_token: served.page_token,
                 ts: ts.clone(),
@@ -1404,14 +1416,20 @@ async fn record_trap(
                     .get::<listen::ConnMeta>()
                     .map(|m| ConnCapture::of(m, parts.version)),
             };
-            match record(&state, capture).await {
+            match (record(&state, capture).await, served.upload) {
+                (Ok(rec), Some((u, seq))) => {
+                    record_upload(&state, ip, rec.request_id, ts, u, seq).await;
+                }
+                (Ok(_), None) => {}
                 // Answered as always: an error page would tell a scanner it
                 // found something other than a missing route.
-                Err(e) => warn!(%ip, error = %e, "trap: recording the request failed"),
-                Ok(rec) => {
-                    if let Some(u) = served.upload {
-                        record_upload(&state, ip, rec.request_id, ts, u).await;
+                (Err(e), u) => {
+                    if let Some((u, seq)) = u {
+                        state
+                            .webshells
+                            .settle(&u.answered_path, u.path_is_prefix, seq, None);
                     }
+                    warn!(%ip, error = %e, "trap: recording the request failed");
                 }
             }
         }
@@ -1427,6 +1445,7 @@ async fn record_upload(
     request_id: i64,
     ts: String,
     u: upload::Upload,
+    seq: u64,
 ) {
     let request_uid: Option<String> = sqlx::query_scalar("SELECT uid FROM requests WHERE id = ?")
         .bind(request_id)
@@ -1436,11 +1455,12 @@ async fn record_upload(
             warn!(%ip, error = %e, "trap: reading the upload's request failed");
             None
         });
+    let (answered, prefix) = (u.answered_path.clone(), u.path_is_prefix);
     let Some(request_uid) = request_uid else {
+        state.webshells.settle(&answered, prefix, seq, None);
         return;
     };
     let rate_ok = state.guards.uploads.allow(ip, u.per_source);
-    let (answered, prefix) = (u.answered_path.clone(), u.path_is_prefix);
     let r = crate::cluster::record::UploadRec {
         request_uid,
         ts,
@@ -1458,12 +1478,13 @@ async fn record_upload(
     // held already leaves room for the next new one.
     match state.recorder.record_upload(r, &u.content, rate_ok).await {
         Ok((_, brought, uid)) => {
-            state.webshells.insert(&answered, prefix, &uid);
+            state.webshells.settle(&answered, prefix, seq, Some(&uid));
             if !brought {
                 state.guards.uploads.refund(ip);
             }
         }
         Err(e) => {
+            state.webshells.settle(&answered, prefix, seq, None);
             state.guards.uploads.refund(ip);
             warn!(%ip, error = %e, "trap: recording the upload failed");
         }
