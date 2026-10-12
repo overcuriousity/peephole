@@ -72,6 +72,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0031_stats_index.sql"),
     include_str!("migrations/0032_devices.sql"),
     include_str!("migrations/0033_device_actions.sql"),
+    // reserved for roadmap #1 (uploads); the code lands with the feature
+    include_str!("migrations/0034_uploads.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of

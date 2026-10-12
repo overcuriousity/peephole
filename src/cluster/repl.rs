@@ -2238,6 +2238,71 @@ mod tests {
         assert!(sent.verify(), "the origin's signature still holds");
     }
 
+    /// A peer on the interim `latest` that carried roadmap #1 S1+S2 (MIK-188)
+    /// sends `upload` entries with an unsigned `content` field beside the
+    /// signed fields. This build skips the field, keeps the entry as an
+    /// unknown kind and goes on with the origin's log; the sync does not fail.
+    #[tokio::test]
+    async fn an_upload_from_the_interim_build_does_not_fail_the_sync() {
+        #[derive(serde::Serialize)]
+        struct InterimWireEntry {
+            origin: NodeId,
+            seq: u64,
+            hlc: u64,
+            kind: String,
+            uid: Option<String>,
+            #[serde(with = "serde_bytes")]
+            payload: Option<Vec<u8>>,
+            #[serde(with = "serde_bytes")]
+            sig: Option<Vec<u8>>,
+            erased_by: Option<String>,
+            #[serde(with = "serde_bytes")]
+            content: Option<Vec<u8>>,
+        }
+        let (_d, node) = test_node(0).await;
+        let a = Identity::generate().unwrap();
+        super::append(&node, &[Record::MemberAdd(info(a.id, "a"))])
+            .await
+            .unwrap();
+        let payload = super::super::rpc::cbor::encode(&serde_json::json!({
+            "uid": "u1", "request_uid": "r1", "ts": "2026-10-11 19:30:00",
+            "ip": "203.0.113.21", "kind": "put", "sniffed_type": "php",
+            "size": 3, "truncated": false, "sha256": vec![9u8; 32],
+            "answered_path": "/s.php", "path_is_prefix": false,
+            "content_state": "held", "carries_content": true
+        }))
+        .unwrap();
+        let signed = WireEntry::sign_kind(&a, 1, now_hlc(1), "upload", payload);
+        let interim = InterimWireEntry {
+            origin: signed.origin,
+            seq: signed.seq,
+            hlc: signed.hlc,
+            kind: signed.kind.clone(),
+            uid: signed.uid.clone(),
+            payload: signed.payload.clone(),
+            sig: signed.sig.clone(),
+            erased_by: None,
+            content: Some(b"<?php".to_vec()),
+        };
+        let wire = super::super::rpc::cbor::encode(&interim).unwrap();
+        let got: WireEntry = super::super::rpc::cbor::decode(&wire).unwrap();
+        assert_eq!(got, signed, "the content field is skipped");
+        assert!(got.verify());
+        assert!(got.record().is_none(), "unknown here");
+        let st = super::apply_batch(&node, vec![got, request(&a, 2, "/after")])
+            .await
+            .unwrap();
+        assert_eq!((st.applied, st.rejected), (2, 0), "{st:?}");
+        let state: i64 =
+            sqlx::query_scalar("SELECT applied FROM repl_log WHERE origin = ? AND seq = 1")
+                .bind(&a.id.0[..])
+                .fetch_one(&node.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(state, super::UNKNOWN_KIND);
+        assert_eq!(paths(&node).await, ["/after"], "the origin's log goes on");
+    }
+
     /// One entry that fails stops neither the batch nor the other origins.
     /// Before, any error rolled back the whole batch; peers sent it again
     /// and again and sync stalled for every origin.
