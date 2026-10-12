@@ -798,7 +798,7 @@ mod tests {
                 request_uid,
                 ..rec("", b"")
             };
-            let st = rec_.record_upload(r, b"<?php", true).await.unwrap();
+            let (st, _) = rec_.record_upload(r, b"<?php", true).await.unwrap();
             assert_eq!(st, ContentState::Held);
             if n == 0 {
                 rec_.delete_request(id).await.unwrap();
@@ -876,7 +876,7 @@ mod tests {
         .await;
         let held = got
             .into_iter()
-            .filter(|c| *c.as_ref().unwrap() == ContentState::Held)
+            .filter(|c| c.as_ref().unwrap().0 == ContentState::Held)
             .count();
         assert_eq!(held, 3, "the budget check and the store are one unit");
         let mut c = s.pool.acquire().await.unwrap();

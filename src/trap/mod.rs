@@ -71,6 +71,9 @@ pub struct TrapState {
     pub panel_rate: RateLimiter,
     /// Runtime scan settings; the trap reads the rescan cooldown from it.
     pub pace: crate::scan::pace::SharedPace,
+    /// The upload store's bounds as set now ([`crate::settings::Settings`]
+    /// keeps them current), so telling an upload apart reads no database.
+    pub uploads: Arc<RwLock<crate::store::uploads::Limits>>,
     /// Flood protection for the recording path.
     pub guards: Guards,
     /// The slow answer for severity-4 sources; shared with the admin's
@@ -376,6 +379,7 @@ impl TrapState {
             notifier: Default::default(),
             helper_rate: RateLimiter::default(),
             panel_rate: RateLimiter::default(),
+            uploads: Default::default(),
             guards: Guards::default(),
             // Off: a test's severity-4 request would hold the next one for
             // the whole hold. Tests of the tarpit set their own.
@@ -833,10 +837,9 @@ async fn trap_handler(
         parts.uri.query(),
         content_type,
     );
-    let limits = match kind {
-        Some(_) => upload_limits(&state).await.filter(|l| l.enabled),
-        None => None,
-    };
+    let limits = kind
+        .map(|_| *state.uploads.read().unwrap())
+        .filter(|l| l.enabled);
     let (Some(kind), Some(limits)) = (kind, limits) else {
         let body = read_body(body, &state.guards.bodies).await;
         return trap(state, peer, in_flight, parts, body, None).await;
@@ -856,19 +859,6 @@ async fn trap_handler(
     // The request's own row keeps what any other request's does.
     body.cut(MAX_BODY);
     trap(state, peer, in_flight, parts, body, upload).await
-}
-
-/// The upload store's bounds as set now; None if they cannot be read (the
-/// request is then answered as any other).
-async fn upload_limits(state: &TrapState) -> Option<crate::store::uploads::Limits> {
-    let mut conn = state.store.pool.acquire().await.ok()?;
-    match crate::store::uploads::Limits::load(&mut conn).await {
-        Ok(l) => Some(l),
-        Err(e) => {
-            warn!(error = %e, "trap: reading the upload settings failed");
-            None
-        }
-    }
 }
 
 /// [`trap_handler`] once the body is read; also where a helper endpoint
@@ -908,7 +898,9 @@ async fn trap(
     };
     // A canary presented is answered as always: its trace is worth more.
     // So is an AI decoy: `mcp-abuse` is severity 4, and the tarpit would
-    // cut the session it marks short.
+    // cut the session it marks short. An upload from a tarpitted source is
+    // kept as its request row only (to `MAX_BODY`), not as an upload: the
+    // source is severity 4 already, and its file is not worth the store.
     if presented == decoy::Presented::default()
         && ai.is_none()
         && let Some(hold) = state.tarpit.take(ip)
@@ -1376,7 +1368,7 @@ async fn record_trap(
 
 /// Record the file a recorded request dropped. Only an upload whose
 /// request the flood gate admitted gets here; the per-source rate decides
-/// whether it may bring content.
+/// whether it may bring content, and counts only those that did.
 async fn record_upload(
     state: &TrapState,
     ip: IpAddr,
@@ -1409,8 +1401,15 @@ async fn record_upload(
         path_is_prefix: u.path_is_prefix,
         ..Default::default()
     };
-    if let Err(e) = state.recorder.record_upload(r, &u.content, rate_ok).await {
-        warn!(%ip, error = %e, "trap: recording the upload failed");
+    // Only content-bearing uploads use the source's hour: a spray of a file
+    // held already leaves room for the next new one.
+    match state.recorder.record_upload(r, &u.content, rate_ok).await {
+        Ok((_, true)) => {}
+        Ok((_, false)) => state.guards.uploads.refund(ip),
+        Err(e) => {
+            state.guards.uploads.refund(ip);
+            warn!(%ip, error = %e, "trap: recording the upload failed");
+        }
     }
 }
 

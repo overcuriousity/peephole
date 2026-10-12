@@ -6,6 +6,7 @@
 //! from its bytes: an answer depends on the kind, the request path and the
 //! sanitised client file name only.
 use super::decoy::{self, Decoy};
+use crate::canary::site;
 use crate::store::uploads::MAX_CONTENT;
 
 /// Most bytes of an upload request body read and kept: the file's cap
@@ -140,7 +141,13 @@ pub async fn parse_multipart(
     } else {
         Vec::new()
     };
-    // Room for the delimiter added to a cut body.
+    // The parser's bounds are the kept body's (plus the delimiter added to
+    // a cut body), not the 1 MiB content cap: at exactly 1 MiB multer fails
+    // a larger file without yielding any of it. The cap is applied as the
+    // file is read. Parsing holds a copy of the body and the file (about
+    // 2 MiB) only while it runs, outside `BODY_BUDGET`; the body it parses
+    // is held against that budget meanwhile, so at most `BODY_BUDGET / KEEP`
+    // parses run at once.
     let limits = multer::SizeLimit::new()
         .whole_stream((KEEP + close.len()) as u64)
         .per_field((KEEP + close.len()) as u64);
@@ -348,7 +355,9 @@ pub async fn take(
         }
     };
     let (answered_path, path_is_prefix) = match kind {
-        Kind::Put => (path.to_string(), false),
+        // One leading slash: `//host/x` would be a protocol-relative
+        // `Location`, pointing the client elsewhere.
+        Kind::Put => (format!("/{}", path.trim_start_matches('/')), false),
         Kind::WpPlugin => (format!("/wp-content/plugins/{}/", slug()), true),
         Kind::WpTheme => (format!("/wp-content/themes/{}/", slug()), true),
         Kind::WpMedia => (format!("/wp-content/uploads/{ym}/{}", name()), false),
@@ -377,10 +386,8 @@ impl Upload {
             Kind::WpPlugin => (200, HTML, decoy::wp_installed("Plugin", word), None),
             Kind::WpTheme => (200, HTML, decoy::wp_installed("Theme", word), None),
             Kind::WpMedia => {
-                let url = match host {
-                    Some(h) => format!("http://{h}{p}"),
-                    None => p.clone(),
-                };
+                let site = format!("{word}.internal");
+                let url = format!("http://{}{p}", site::return_host(host, &site));
                 (200, JSON, decoy::wp_media_json(&url), None)
             }
             Kind::Script => (200, TEXT, format!("{p}\n"), None),
@@ -702,9 +709,15 @@ mod tests {
         let r = u.reply(Some("example.test\"<x>"), "acme");
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         assert_eq!(v["success"], true);
+        // A Host no decoy would echo: the site's name instead.
         assert_eq!(
             v["data"]["url"],
-            "http://example.test\"<x>/wp-content/uploads/2026/10/a.php"
+            "http://acme.internal/wp-content/uploads/2026/10/a.php"
+        );
+        let r = u.reply(Some("203.0.113.7:8080"), "acme");
+        assert!(
+            r.body
+                .contains("http://203.0.113.7:8080/wp-content/uploads/2026/10/a.php")
         );
 
         let u = take(
@@ -727,6 +740,20 @@ mod tests {
                 .contains(&("x-content-type-options", "nosniff".into()))
         );
         assert_eq!(u.filename.as_deref(), Some("a.php"));
+        // Never a protocol-relative `Location`.
+        let u = take(
+            Kind::Put,
+            "//evil.example/x",
+            None,
+            b"x",
+            None,
+            "t",
+            "2026/10",
+            6,
+        )
+        .await
+        .unwrap();
+        assert_eq!(u.answered_path, "/evil.example/x");
 
         let (ct, body) = multipart(&[("file", Some(""), b"#!/bin/sh")]);
         let u = take(

@@ -32,6 +32,7 @@ async fn spawn_full(extra: &str, tarpit: bool) -> Spawned {
     let base = TrapState::for_test(store.clone(), cfg.clone());
     let state = Arc::new(if tarpit {
         TrapState {
+            uploads: Default::default(),
             tarpit: Arc::new(trap::tarpit::Tarpit::of(&cfg)),
             ..base
         }

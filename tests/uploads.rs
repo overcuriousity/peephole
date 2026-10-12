@@ -23,6 +23,13 @@ fn settled_router(state: Arc<TrapState>) -> axum::Router {
 /// A trap behind a trusted proxy at 127.0.0.1, with `extra` appended to
 /// the config.
 async fn spawn(extra: &str) -> (String, Store, tempfile::TempDir) {
+    let (base, store, dir, _) = serve(extra, true).await;
+    (base, store, dir)
+}
+
+/// [`spawn`], with the trap's state; `settled` answers once the records
+/// are written, else as soon as the answer is ready.
+async fn serve(extra: &str, settled: bool) -> (String, Store, tempfile::TempDir, Arc<TrapState>) {
     let dir = tempfile::tempdir().unwrap();
     let cfg_text = format!(
         r#"
@@ -41,7 +48,12 @@ web = false
     std::fs::write(&cfg_path, cfg_text).unwrap();
     let cfg = Config::load(&cfg_path).unwrap();
     let store = Store::connect(&cfg.database_path).await.unwrap();
-    let app = settled_router(Arc::new(TrapState::for_test(store.clone(), cfg)));
+    let state = Arc::new(TrapState::for_test(store.clone(), cfg));
+    let app = if settled {
+        settled_router(state.clone())
+    } else {
+        trap::router(state.clone())
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -52,7 +64,7 @@ web = false
         .await
         .unwrap()
     });
-    (format!("http://{addr}"), store, dir)
+    (format!("http://{addr}"), store, dir, state)
 }
 
 /// No flood gate: every request is recorded.
@@ -374,11 +386,8 @@ async fn a_request_the_flood_gate_skips_records_no_upload() {
 
 #[tokio::test]
 async fn with_the_sink_off_an_upload_is_any_request() {
-    let (base, store, _dir) = spawn(UNGATED).await;
-    sqlx::query("INSERT INTO settings (key, value) VALUES ('uploads.enabled', 'false')")
-        .execute(&store.pool)
-        .await
-        .unwrap();
+    let (base, store, _dir, state) = serve(UNGATED, true).await;
+    state.uploads.write().unwrap().enabled = false;
     let r = send(
         &base,
         "PUT",
@@ -407,4 +416,72 @@ async fn with_the_sink_off_an_upload_is_any_request() {
         scalar(&store, "SELECT MAX(length(body)) FROM requests").await,
         64 * 1024
     );
+}
+
+#[tokio::test]
+async fn an_upload_is_told_apart_without_the_database() {
+    let (base, store, _dir, _state) = serve(UNGATED, false).await;
+    // Every connection taken: the answer must not wait for one.
+    let n = store.pool.options().get_max_connections();
+    let mut held = Vec::new();
+    for _ in 0..n {
+        held.push(store.pool.acquire().await.unwrap());
+    }
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        send(
+            &base,
+            "PUT",
+            "/x/a.php",
+            "203.0.113.45",
+            None,
+            b"<?php".to_vec(),
+        ),
+    )
+    .await
+    .expect("answered without a pool connection");
+    assert_eq!(r.status(), 201);
+    drop(held);
+}
+
+#[tokio::test]
+async fn only_new_content_counts_against_the_hourly_rate() {
+    let (base, store, _dir) = spawn(UNGATED).await;
+    // Held already, from elsewhere.
+    send(
+        &base,
+        "PUT",
+        "/a.php",
+        "203.0.113.46",
+        None,
+        b"<?php shell".to_vec(),
+    )
+    .await;
+    // Six sprays of it use none of this source's hour (6 by default) ...
+    for i in 0..6 {
+        let path = format!("/s{i}.php");
+        send(
+            &base,
+            "PUT",
+            &path,
+            "203.0.113.47",
+            None,
+            b"<?php shell".to_vec(),
+        )
+        .await;
+    }
+    // ... so a new file is still held.
+    send(
+        &base,
+        "PUT",
+        "/n.php",
+        "203.0.113.47",
+        None,
+        b"<?php new".to_vec(),
+    )
+    .await;
+    let rows = uploads(&store).await;
+    assert_eq!(rows.len(), 8);
+    assert!(rows.iter().all(|r| r.content_state == "held"), "{rows:?}");
+    assert_eq!(scalar(&store, "SELECT COUNT(*) FROM upload_blobs").await, 2);
 }
