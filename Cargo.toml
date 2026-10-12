@@ -71,6 +71,9 @@ uuid = { version = "1", features = ["v4"] }
 # credential list — so the "attacker controls the state" risk does not apply.
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 x509-parser = "0.18"
+# The admin's export of dropped files: one deflated entry, ZipCrypto with
+# the password `infected` (a handling convention; nothing is ever read).
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 zstd = "0.14"
 
 [dev-dependencies]
