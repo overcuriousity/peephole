@@ -349,6 +349,31 @@ ignored; none left is `422`. Standalone the node probes itself and
 offers); a vantage that declines or lapses is not charged. `404` when the
 address is not in the dataset; `422 refused` when the gate refuses it.
 
+### `GET /api/v1/ips/{addr}/scan/prices`
+
+Every level's price range, as the Actions card's level buttons show it,
+so the app's level picker can show them before a quote. Spends nothing,
+creates no quote and writes no audit entry.
+
+`200`:
+
+```json
+{
+  "levels": [
+    { "level": 1, "about": "top 100 ports, light version detection",
+      "credits": "0.08", "credits_mc": 80, "credits_max": "0.32", "credits_max_mc": 320 }
+  ]
+}
+```
+
+- `credits` and `credits_max` are those of the quote (below) at this
+  moment; the quote stays the binding price.
+- Show `{credits}–{credits_max} credits`, or `{credits} credits` when
+  both strings are equal; the web shows the same.
+- Standalone every level is free (`"0.00"`). `levels` is empty when no
+  live scanner announces a price. `404` when the address is not in the
+  dataset.
+
 ### `GET /api/v1/ips/{addr}/scan/quote?level=1..5`
 
 `200`:
@@ -368,7 +393,7 @@ address is not in the dataset; `422 refused` when the gate refuses it.
 - The quote is bound to the device, the address, the level and
   `credits_mc`. It lives 2 minutes and is spent once.
 - `credits` is the floor: the cheapest live scanner's price × 4^(level-1),
-  the "from X credits" of the Actions card and what the scan budget must
+  the low end of the Actions card's range and what the scan budget must
   cover. The arbiter pays whichever scanner wins the job, so the charge
   lies between `credits` and `credits_max` (the dearest live scanner's
   price × the same factor). Show the range.

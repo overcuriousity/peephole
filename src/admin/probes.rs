@@ -1377,7 +1377,7 @@ secure_cookies = false
         crate::admin::scan_buy::ScanOffer {
             level,
             about: "some ports",
-            price: "from 0.06 credits".into(),
+            price: "0.06–0.24 credits".into(),
             fresh: None,
             fresh_id: None,
             waiting: None,
@@ -1438,7 +1438,7 @@ secure_cookies = false
             "the probe button carries the ticked total: {html}"
         );
         assert!(
-            html.contains(r#"<b>L1</b><span>from 0.06 credits</span>"#),
+            html.contains(r#"<b>L1</b><span>0.06–0.24 credits</span>"#),
             "{html}"
         );
         assert!(
