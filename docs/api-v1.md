@@ -284,8 +284,12 @@ intelligence provider is asked.
   `resolvers`: the nodes asked; `errors`: `{node, why}` per node that did
   not answer; `also`: agreed addresses past the first 16, not read.
 - A failed entry carries `error` with `code` `invalid` (no host can be
-  read), `unresolved` (no agreed address), or `capped` (past the 10th
-  name; not resolved). A failed entry never fails the request.
+  read) or `unresolved` (no agreed address). A failed entry never fails
+  the request.
+- Every name is answered: there is no count limit (0.11.0 and older
+  answered names past the 10th with `capped`). A few names are resolved at
+  a time; the request body limit and the per-client rate limit bound the
+  rest.
 
 ## Act endpoints
 

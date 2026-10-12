@@ -16,6 +16,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - The Actions card's scan level buttons show the full price range,
   `{floor}–{max} credits` (one amount when both are equal), instead of
   "from {floor} credits": the same text the app shows.
+- `POST /api/v1/lookup` answers every host name it is sent. The cap of 10
+  names per request and its per-entry `capped` error are gone; names are
+  resolved four at a time instead.
 
 ### Removed
 
