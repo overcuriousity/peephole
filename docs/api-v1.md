@@ -291,6 +291,63 @@ intelligence provider is asked.
   a time; the request body limit and the per-client rate limit bound the
   rest.
 
+### `GET /api/v1/uploads?cursor=&limit=`
+
+Files dropped on the trap, newest first: **metadata and hash only**. No
+field carries the file's content; content leaves a node only through the
+admin's per-file zip.
+
+- `cursor` — opaque continuation token from the previous page's
+  `next_cursor`.
+- `limit` — page size, default 50; above 100 it clamps to 100, and 0 or a
+  non-number is a `400`.
+
+`200`:
+
+```json
+{
+  "items": [
+    {
+      "uid": "01J…",
+      "request_uid": "01J…",
+      "node_id": "6f1c…",
+      "ts": "2026-10-12T07:14:03Z",
+      "ip": "203.0.113.9",
+      "kind": "put",
+      "filename": "s.php",
+      "sniffed_type": "php",
+      "size": 31,
+      "truncated": false,
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "answered_path": "/s.php",
+      "path_is_prefix": false,
+      "content_state": "held"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+- `kind`: `put`, `wp_plugin`, `wp_theme`, `wp_media` or `script`.
+- `filename`: as the client sent it — attacker text; escape it.
+- `sniffed_type`: from the first bytes, never the client's `Content-Type`.
+- `size`: full size as received; `truncated`: only the first 1 MiB kept.
+- `sha256`: lowercase hex, of the kept bytes.
+- `node_id`: hex id of the node that collected it; `null` standalone.
+- `content_state`: whether this node holds the content (`held`), or why
+  not (`dropped_rate`, `dropped_budget`, `dropped_ceiling`,
+  `dropped_disk`, `dropped_mismatch`, `too_big`, `not_received`).
+
+### `GET /api/v1/uploads/{sha256}`
+
+Every upload of one file (up to 100, newest first), by its SHA-256 in
+hex. `400` (`invalid`) when it is not 64 hex digits, `404` when no upload
+has it.
+
+```json
+{ "sha256": "9f86d0…0a08", "uploads": [ { "uid": "01J…", "…": "as above" } ] }
+```
+
 ## Act endpoints
 
 Probes and paid counter-scans, the same actions as the Actions card on the
@@ -479,5 +536,7 @@ A job this device queued. Any other id, another device's included, is
   spent by one `DELETE … RETURNING`, so a quote cannot be replayed or
   used by a second device. The audit log copies the device's name and
   pairing admin, so entries stay as they were after a revocation.
+- Uploads (MIK-121): the endpoints read `uploads` only, never
+  `upload_blobs`; their JSON has no content field (tested).
 - CSP is unchanged: the QR is rendered server-side as inline SVG in the
   pairing page (`img-src 'self' data:` already permits it), no new JS.

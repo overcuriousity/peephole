@@ -407,6 +407,109 @@ pub(crate) async fn apply_at(
     Ok(Effect::Applied)
 }
 
+/// The paths this node answered its own latest `limit` uploads at, oldest
+/// first: `(answered_path, path_is_prefix, uid)`. `origin` is this node's
+/// id; None on a standalone node, whose uploads carry none.
+pub async fn answered_paths(
+    conn: &mut SqliteConnection,
+    origin: Option<&[u8]>,
+    limit: usize,
+) -> Result<Vec<(String, bool, String)>> {
+    let mut rows: Vec<(String, bool, String)> = sqlx::query_as(
+        "SELECT answered_path, path_is_prefix, uid FROM uploads
+         WHERE origin IS ? ORDER BY id DESC LIMIT ?",
+    )
+    .bind(origin)
+    .bind(limit as i64)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.reverse();
+    Ok(rows)
+}
+
+/// One upload's metadata, as `/api/v1` and the Parquet export give it out.
+/// It has no content field: no query here reads `content`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UploadMeta {
+    pub id: i64,
+    pub uid: String,
+    pub request_uid: String,
+    /// The node that collected it (`origin`); None on a standalone node.
+    pub node_id: Option<Vec<u8>>,
+    pub ts: String,
+    pub ip: String,
+    pub kind: String,
+    /// The client's file name, as sent: attacker text.
+    pub filename: Option<String>,
+    pub sniffed_type: String,
+    pub size: i64,
+    pub truncated: bool,
+    pub sha256: Vec<u8>,
+    pub answered_path: String,
+    pub path_is_prefix: bool,
+    pub content_state: String,
+}
+
+/// Which uploads [`super::Store::uploads_meta`] reads. With `after`, the
+/// page runs oldest first from that id (the export); otherwise newest
+/// first, below `before` if given (the API).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UploadQuery<'a> {
+    pub before: Option<i64>,
+    pub after: Option<i64>,
+    pub sha256: Option<&'a [u8]>,
+    /// `ts` bounds, inclusive, in the stored `YYYY-MM-DD HH:MM:SS` form.
+    pub from: Option<&'a str>,
+    pub to: Option<&'a str>,
+    pub ip: Option<&'a str>,
+}
+
+impl super::Store {
+    /// Up to `limit` uploads' metadata matching `q`.
+    pub async fn uploads_meta(&self, q: &UploadQuery<'_>, limit: i64) -> Result<Vec<UploadMeta>> {
+        let mut w = String::new();
+        let (order, cursor) = match (q.after, q.before) {
+            (Some(a), _) => {
+                w.push_str(" AND u.id > ?");
+                ("ASC", Some(a))
+            }
+            (None, Some(b)) => {
+                w.push_str(" AND u.id < ?");
+                ("DESC", Some(b))
+            }
+            (None, None) => ("DESC", None),
+        };
+        for (on, clause) in [
+            (q.sha256.is_some(), " AND u.sha256 = ?"),
+            (q.from.is_some(), " AND u.ts >= ?"),
+            (q.to.is_some(), " AND u.ts <= ?"),
+            (q.ip.is_some(), " AND i.ip = ?"),
+        ] {
+            if on {
+                w.push_str(clause);
+            }
+        }
+        let sql = format!(
+            "SELECT u.id, u.uid, u.request_uid, u.origin AS node_id, u.ts, i.ip, u.kind,
+                    u.filename, u.sniffed_type, u.size, u.truncated, u.sha256,
+                    u.answered_path, u.path_is_prefix, u.content_state
+             FROM uploads u JOIN ips i ON i.id = u.ip_id
+             WHERE 1=1{w} ORDER BY u.id {order} LIMIT ?"
+        );
+        let mut query = sqlx::query_as::<_, UploadMeta>(sqlx::AssertSqlSafe(sql));
+        if let Some(c) = cursor {
+            query = query.bind(c);
+        }
+        if let Some(h) = q.sha256 {
+            query = query.bind(h);
+        }
+        for v in [q.from, q.to, q.ip].into_iter().flatten() {
+            query = query.bind(v);
+        }
+        Ok(query.bind(limit).fetch_all(&self.read).await?)
+    }
+}
+
 /// Daily maintenance: drop content no upload refers to any more, and
 /// budget days that are over. Returns how many blobs went.
 pub async fn gc_blobs(conn: &mut SqliteConnection) -> Result<u64> {
@@ -426,6 +529,165 @@ pub async fn gc_blobs(conn: &mut SqliteConnection) -> Result<u64> {
         .execute(&mut *conn)
         .await?;
     Ok(n)
+}
+
+/// An upload as the admin lists it: metadata only, never the content.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UploadRow {
+    pub uid: String,
+    pub ts: String,
+    pub ip: String,
+    pub kind: String,
+    /// The client's file name, as sent (escaped wherever it is shown).
+    pub filename: Option<String>,
+    pub sniffed_type: String,
+    pub size: i64,
+    pub truncated: bool,
+    pub sha256: Vec<u8>,
+    pub answered_path: String,
+    pub path_is_prefix: bool,
+    pub content_state: String,
+    /// The content is in the store here, and can be exported.
+    pub held: bool,
+    /// The request that carried it, when this node holds it.
+    pub request_id: Option<i64>,
+    pub origin: Option<Vec<u8>>,
+}
+
+impl UploadRow {
+    pub fn hash(&self) -> String {
+        data_encoding::HEXLOWER.encode(&self.sha256)
+    }
+}
+
+/// A later request to where an upload was told it landed.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TimelineRow {
+    pub id: i64,
+    pub ts: String,
+    pub ip: String,
+    pub method: String,
+    pub path: String,
+    pub query: Option<String>,
+    pub status: Option<i64>,
+    pub answer: Option<String>,
+}
+
+/// Most requests an upload's timeline shows.
+pub const TIMELINE_MAX: i64 = 500;
+
+const UPLOAD_COLS: &str = "u.uid, u.ts, i.ip, u.kind, u.filename, u.sniffed_type, u.size,
+    u.truncated, u.sha256, u.answered_path, u.path_is_prefix, u.content_state,
+    EXISTS(SELECT 1 FROM upload_blobs b WHERE b.sha256 = u.sha256) AS held,
+    (SELECT r.id FROM requests r WHERE r.uid = u.request_uid) AS request_id, u.origin
+    FROM uploads u JOIN ips i ON i.id = u.ip_id";
+
+/// One page of uploads, newest first.
+pub async fn list(
+    conn: &mut SqliteConnection,
+    page: u32,
+) -> Result<super::browse::Page<UploadRow>> {
+    use super::browse::{PAGE_SIZE, Page, offset};
+    let page = page.max(1);
+    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {UPLOAD_COLS} ORDER BY u.id DESC LIMIT ? OFFSET ?"
+    )))
+    .bind(PAGE_SIZE + 1)
+    .bind(offset(page))
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(Page::from_rows(rows, page))
+}
+
+pub async fn get(conn: &mut SqliteConnection, uid: &str) -> Result<Option<UploadRow>> {
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {UPLOAD_COLS} WHERE u.uid = ?"
+    )))
+    .bind(uid)
+    .fetch_optional(&mut *conn)
+    .await?)
+}
+
+/// The requests the origin answered at the upload's path after it, oldest
+/// first: the same path, or (for a folder) any path under it. A query-time
+/// join, as the trap's own lookup: `substr`, not `LIKE`, so a `_` or `%`
+/// in the path is no wildcard (A2). Requests in the upload's own second
+/// count if they came after its request.
+pub async fn timeline(conn: &mut SqliteConnection, u: &UploadRow) -> Result<Vec<TimelineRow>> {
+    Ok(sqlx::query_as(
+        "SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.status, r.answer
+         FROM requests r JOIN ips i ON i.id = r.ip_id
+         WHERE r.origin IS ?1 AND r.path >= ?2
+           AND (r.path = ?2 OR (?3 AND substr(r.path, 1, length(?2)) = ?2))
+           AND (r.ts > ?4 OR (r.ts = ?4 AND r.id > ?5))
+         ORDER BY r.ts, r.id LIMIT ?6",
+    )
+    .bind(&u.origin)
+    .bind(&u.answered_path)
+    .bind(u.path_is_prefix)
+    .bind(&u.ts)
+    .bind(u.request_id.unwrap_or(i64::MAX))
+    .bind(TIMELINE_MAX)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
+/// An upload's held content, with its SHA-256, for the admin's encrypted
+/// download. The only reader of stored content besides replication
+/// ([`content_for_relay`]); nothing serves it on the trap.
+pub async fn content_for_export(
+    conn: &mut SqliteConnection,
+    uid: &str,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    Ok(sqlx::query_as(
+        "SELECT b.sha256, b.content FROM uploads u JOIN upload_blobs b ON b.sha256 = u.sha256
+         WHERE u.uid = ?",
+    )
+    .bind(uid)
+    .fetch_optional(&mut *conn)
+    .await?)
+}
+
+/// Test fixture: a `PUT` of `content` to `path` from `ip` (a fixture
+/// address), recorded as a request and its upload. Returns the upload's uid.
+#[cfg(test)]
+pub(crate) async fn seed_upload(
+    store: &super::Store,
+    ip: &str,
+    path: &str,
+    content: &[u8],
+) -> String {
+    let ip_id = store.upsert_ip(ip.parse().unwrap()).await.unwrap().id;
+    let id = store
+        .insert_request(&super::requests::NewRequest {
+            ip_id,
+            method: "PUT".into(),
+            path: path.into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (request_uid, ts): (String, String) =
+        sqlx::query_as("SELECT uid, ts FROM requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    let r = UploadRec {
+        request_uid,
+        ts,
+        ip: ip.into(),
+        kind: "put".into(),
+        filename: Some("s.php".into()),
+        sniffed_type: "php".into(),
+        size: content.len() as i64,
+        answered_path: path.into(),
+        ..Default::default()
+    };
+    let (_, _, uid) = store.local().record_upload(r, content, true).await.unwrap();
+    uid
 }
 
 #[cfg(test)]
@@ -798,7 +1060,7 @@ mod tests {
                 request_uid,
                 ..rec("", b"")
             };
-            let (st, _) = rec_.record_upload(r, b"<?php", true).await.unwrap();
+            let (st, _, _) = rec_.record_upload(r, b"<?php", true).await.unwrap();
             assert_eq!(st, ContentState::Held);
             if n == 0 {
                 rec_.delete_request(id).await.unwrap();
@@ -899,5 +1161,136 @@ mod tests {
         assert_eq!(gc_blobs(&mut c).await.unwrap(), 1);
         assert!(!has_blob(&mut c, &sha2::Sha256::digest(b"a")).await.unwrap());
         assert!(has_blob(&mut c, &sha2::Sha256::digest(b"b")).await.unwrap());
+    }
+
+    /// The trap's answered paths are its own node's uploads only, oldest
+    /// first, and a standalone node's are those without an origin.
+    #[tokio::test]
+    async fn answered_paths_are_this_origins() {
+        let (s, _d) = store().await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let l = Limits::default();
+        let (mine, other) = (origin(), origin());
+        let mut a = rec("a", b"x");
+        a.answered_path = "/wp-content/plugins/hello/".into();
+        a.path_is_prefix = true;
+        let mut b = rec("b", b"x");
+        b.answered_path = "/theirs.php".into();
+        let c_ = rec("c", b"x");
+        receive(&mut c, &mine, &a, None, &l, DAY, None).await;
+        receive(&mut c, &other, &b, None, &l, DAY, None).await;
+        receive(&mut c, &mine, &c_, None, &l, DAY, None).await;
+        let ctx = Ctx {
+            origin: None,
+            hlc: 1,
+        };
+        let mut d = rec("d", b"x");
+        d.answered_path = "/standalone.php".into();
+        apply_at(&mut c, ctx, &d, None, &l, DAY, None)
+            .await
+            .unwrap();
+        let got = answered_paths(&mut c, Some(&mine.0[..]), 10).await.unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("/wp-content/plugins/hello/".into(), true, "a".into()),
+                ("/s.php".into(), false, "c".into()),
+            ]
+        );
+        let last = answered_paths(&mut c, Some(&mine.0[..]), 1).await.unwrap();
+        assert_eq!(last, vec![("/s.php".into(), false, "c".into())]);
+        let alone = answered_paths(&mut c, None, 10).await.unwrap();
+        assert_eq!(alone, vec![("/standalone.php".into(), false, "d".into())]);
+    }
+
+    /// The timeline is the origin's later requests at the path, and under
+    /// it for a folder; a `_` in the slug matches only itself (A2).
+    #[tokio::test]
+    async fn the_timeline_is_later_requests_at_the_answered_path() {
+        let (s, _d) = store().await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let l = Limits::default();
+        let (mine, other) = (origin(), origin());
+        let a = rec("a", b"x");
+        let mut b = rec("b", b"y");
+        b.answered_path = "/wp-content/plugins/wp_shell/".into();
+        b.path_is_prefix = true;
+        receive(&mut c, &mine, &a, None, &l, DAY, None).await;
+        receive(&mut c, &mine, &b, None, &l, DAY, None).await;
+        let t0 = "2026-10-01 00:00:00";
+        for (uid, ts, path, o) in [
+            ("early", "2026-09-30 23:59:59", "/s.php", &mine),
+            ("r-a", t0, "/s.php", &mine),
+            ("same-second", t0, "/s.php", &mine),
+            ("later", "2026-10-01 00:00:05", "/s.php", &mine),
+            ("theirs", "2026-10-01 00:00:06", "/s.php", &other),
+            ("longer", "2026-10-01 00:00:07", "/s.phpx", &mine),
+            (
+                "under",
+                "2026-10-01 00:00:08",
+                "/wp-content/plugins/wp_shell/x.php",
+                &mine,
+            ),
+            (
+                "wildcard",
+                "2026-10-01 00:00:09",
+                "/wp-content/plugins/wpXshell/x.php",
+                &mine,
+            ),
+            (
+                "no-slash",
+                "2026-10-01 00:00:10",
+                "/wp-content/plugins/wp_shell",
+                &mine,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO requests (uid, ts, ip_id, method, path, headers_json, origin)
+                 VALUES (?, ?, (SELECT id FROM ips LIMIT 1), 'GET', ?, '[]', ?)",
+            )
+            .bind(uid)
+            .bind(ts)
+            .bind(path)
+            .bind(&o.0[..])
+            .execute(&mut *c)
+            .await
+            .unwrap();
+        }
+        let paths = |rows: Vec<TimelineRow>| rows.into_iter().map(|r| r.path).collect::<Vec<_>>();
+        let a = get(&mut c, "a").await.unwrap().unwrap();
+        assert!(a.request_id.is_some());
+        assert_eq!(
+            paths(timeline(&mut c, &a).await.unwrap()),
+            ["/s.php", "/s.php"]
+        );
+        let b = get(&mut c, "b").await.unwrap().unwrap();
+        assert_eq!(
+            paths(timeline(&mut c, &b).await.unwrap()),
+            ["/wp-content/plugins/wp_shell/x.php"]
+        );
+    }
+
+    /// Only held content is exported, with its hash; the list says which.
+    #[tokio::test]
+    async fn only_held_content_is_exported() {
+        let (s, _d) = store().await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let l = Limits::default();
+        let o = origin();
+        let held = rec("h", b"kept");
+        let gone = rec("g", b"not kept");
+        receive(&mut c, &o, &held, Some(b"kept"), &l, DAY, None).await;
+        receive(&mut c, &o, &gone, None, &l, DAY, None).await;
+        let (sha, bytes) = content_for_export(&mut c, "h").await.unwrap().unwrap();
+        assert_eq!((sha, bytes), (held.sha256.clone(), b"kept".to_vec()));
+        assert!(content_for_export(&mut c, "g").await.unwrap().is_none());
+        assert!(content_for_export(&mut c, "nope").await.unwrap().is_none());
+        let page = list(&mut c, 1).await.unwrap();
+        let got: Vec<_> = page
+            .items
+            .iter()
+            .map(|u| (u.uid.as_str(), u.held))
+            .collect();
+        assert_eq!(got, [("g", false), ("h", true)]);
     }
 }
