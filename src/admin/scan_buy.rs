@@ -32,7 +32,7 @@ pub struct ScanOffer {
     pub level: u8,
     /// What the level scans, for the button's title.
     pub about: &'static str,
-    /// "from 1.23 credits" in a cluster, "free" standalone; empty when no
+    /// "1.23–4.56 credits" in a cluster, "free" standalone; empty when no
     /// live scanner announces a price.
     pub price: String,
     /// A finished scan of exactly this level under [`FRESH_HOURS`] old
@@ -99,7 +99,7 @@ pub async fn offers_for(state: &AdminState, ip_id: i64) -> Vec<ScanOffer> {
             let price = match &table {
                 None => "free".into(),
                 Some(t) => match price_range(&t.scanners, level) {
-                    Some(p) => format!("from {} credits", crate::credits::show(p.floor_mc)),
+                    Some(p) => p.text(),
                     None => String::new(),
                 },
             };
@@ -151,6 +151,21 @@ impl BuyForm {
 pub struct Price {
     pub floor_mc: u64,
     pub max_mc: u64,
+}
+
+impl Price {
+    /// "{floor}–{max} credits", or "{floor} credits" when both show the
+    /// same: the Actions card's level buttons and the app's `costText`
+    /// alike.
+    pub fn text(&self) -> String {
+        let floor = crate::credits::show(self.floor_mc);
+        let max = crate::credits::show(self.max_mc);
+        if max == floor {
+            format!("{floor} credits")
+        } else {
+            format!("{floor}–{max} credits")
+        }
+    }
 }
 
 /// Why no scan of a level is sold now.
@@ -426,6 +441,18 @@ secure_cookies = false
             .header("content-type", "application/x-www-form-urlencoded")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
+    }
+
+    #[test]
+    fn a_price_reads_as_its_range_or_one_amount() {
+        let p = |floor_mc, max_mc| Price { floor_mc, max_mc }.text();
+        assert_eq!(p(1280, 2560), "1.28–2.56 credits");
+        assert_eq!(p(1280, 1280), "1.28 credits");
+        assert_eq!(p(0, 0), "0.00 credits");
+        // Rounded to the cent, half up, like `credits::show`; equal once
+        // rounded is one amount.
+        assert_eq!(p(1005, 2994), "1.01–2.99 credits");
+        assert_eq!(p(1001, 1004), "1.00 credits");
     }
 
     #[test]
