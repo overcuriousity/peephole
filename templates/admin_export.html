@@ -5,6 +5,7 @@
 {% let subtab = "export" %}{% let tabs = crate::admin::views::SYSTEM_TABS %}{% let tabs_label = "System pages" %}{% include "_subtabs.html" %}
 <div class="page-head"><div><h1>Export</h1><p class="muted">Every request with all that is known about it. Claim e-mails are never exported. Shell: <code>peephole export</code> · <a href="https://github.com/overcuriousity/peephole/blob/master/docs/dataset.md">columns</a></p></div></div>
 <form class="filters card" method="get" action="/admin/export/download">
+  <label>Table <select name="table"><option value="requests">Requests</option><option value="uploads">Uploads: metadata and hash, Parquet only</option></select></label>
   <label>Format <select name="format"><option value="parquet">Parquet (typed)</option><option value="csv">CSV (Timesketch)</option><option value="jsonl">Timesketch JSONL</option></select></label>
   <label>Content <select name="mode"><option value="full">Everything</option><option value="redistributable">Redistributable: without GeoIP and API results</option></select></label>
   <label>From (UTC) <input name="from" type="datetime-local"></label>

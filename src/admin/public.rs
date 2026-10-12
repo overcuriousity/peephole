@@ -1465,6 +1465,22 @@ show_labels = {show_labels}
         assert!(!export.contains("198.51.100.5"));
     }
 
+    #[tokio::test]
+    async fn the_admin_export_gives_the_uploads_table_as_parquet_only() {
+        let (st, _d) = state(true).await;
+        crate::store::uploads::seed_upload(&st.store, "203.0.113.50", "/s.php", b"MARK-77ab").await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let url = "/admin/export/download?table=uploads&format=parquet";
+        let (status, pq) = get_with(&app, url, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(pq.starts_with("PAR1"), "{pq}");
+        assert!(!pq.contains("MARK-77ab"));
+        let csv = "/admin/export/download?table=uploads&format=csv";
+        assert_eq!(get_with(&app, csv, Some(&cookie)).await.0, 400);
+        assert_ne!(get_with(&app, url, None).await.0, 200);
+    }
+
     async fn get_with(app: &axum::Router, path: &str, cookie: Option<&str>) -> (u16, String) {
         let mut req = axum::http::Request::get(path);
         if let Some(c) = cookie {

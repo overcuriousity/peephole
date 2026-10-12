@@ -2,6 +2,8 @@
 //! per-IP JSON columns as text. Footer metadata names the format version,
 //! the mode and the filter.
 use super::{ExportFilter, ExportRow, Mode};
+use crate::store::Store;
+use crate::store::uploads::{UploadMeta, UploadQuery};
 use anyhow::Result;
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Int64Builder, ListBuilder, StringBuilder,
@@ -329,5 +331,175 @@ impl ParquetStream {
     pub fn finish(self) -> Result<Vec<u8>> {
         self.writer.close()?;
         Ok(self.out.take())
+    }
+}
+
+/// Version of the `uploads` file layout (`peephole.format_version`).
+pub const UPLOADS_FORMAT_VERSION: &str = "1";
+
+/// Uploads read per row group.
+const UPLOADS_PAGE: i64 = 5_000;
+
+/// The `uploads` table (MIK-121): metadata and hash only. It has no
+/// content column, and nothing that fills it reads content.
+pub fn uploads_schema() -> SchemaRef {
+    let s = |n: &str, null| Field::new(n, DataType::Utf8, null);
+    let flag = |n: &str| Field::new(n, DataType::Boolean, false);
+    Arc::new(Schema::new(vec![
+        s("uid", false),
+        s("request_uid", false),
+        s("node_id", true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            false,
+        ),
+        s("ip", false),
+        s("kind", false),
+        s("filename", true),
+        s("sniffed_type", false),
+        Field::new("size", DataType::Int64, false),
+        flag("truncated"),
+        s("sha256", false),
+        s("answered_path", false),
+        flag("path_is_prefix"),
+        s("content_state", false),
+    ]))
+}
+
+fn uploads_batch(schema: SchemaRef, rows: &[UploadMeta]) -> Result<RecordBatch> {
+    let hex = |b: &[u8]| data_encoding::HEXLOWER.encode(b);
+    let node: Vec<Option<String>> = rows.iter().map(|r| r.node_id.as_deref().map(hex)).collect();
+    let sha: Vec<String> = rows.iter().map(|r| hex(&r.sha256)).collect();
+    let mut ts = TimestampMillisecondBuilder::new().with_timezone("UTC");
+    for r in rows {
+        ts.append_value(super::millis(&r.ts));
+    }
+    let columns: Vec<ArrayRef> = vec![
+        strs(rows.iter().map(|r| Some(r.uid.as_str()))),
+        strs(rows.iter().map(|r| Some(r.request_uid.as_str()))),
+        strs(node.iter().map(|n| n.as_deref())),
+        Arc::new(ts.finish()),
+        strs(rows.iter().map(|r| Some(r.ip.as_str()))),
+        strs(rows.iter().map(|r| Some(r.kind.as_str()))),
+        strs(rows.iter().map(|r| r.filename.as_deref())),
+        strs(rows.iter().map(|r| Some(r.sniffed_type.as_str()))),
+        ints(rows.iter().map(|r| Some(r.size))),
+        bools(rows.iter().map(|r| Some(r.truncated))),
+        strs(sha.iter().map(|h| Some(h.as_str()))),
+        strs(rows.iter().map(|r| Some(r.answered_path.as_str()))),
+        bools(rows.iter().map(|r| Some(r.path_is_prefix))),
+        strs(rows.iter().map(|r| Some(r.content_state.as_str()))),
+    ];
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+/// The `uploads` table within `filter`'s time and IP bounds, as one
+/// Parquet file, oldest first. Labels and severity belong to requests and
+/// do not narrow it.
+pub async fn uploads(store: &Store, filter: &ExportFilter) -> Result<Vec<u8>> {
+    let out = Pending::default();
+    let schema = uploads_schema();
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
+        .set_key_value_metadata(Some(vec![
+            KeyValue::new(
+                "peephole.format_version".into(),
+                UPLOADS_FORMAT_VERSION.to_string(),
+            ),
+            KeyValue::new("peephole.table".into(), "uploads".to_string()),
+            KeyValue::new(
+                "peephole.version".into(),
+                env!("CARGO_PKG_VERSION").to_string(),
+            ),
+            KeyValue::new(
+                "peephole.exported_at".into(),
+                chrono::Utc::now().to_rfc3339(),
+            ),
+        ]))
+        .build();
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(out.clone(), schema.clone(), Some(props))?;
+    let mut after = 0;
+    loop {
+        let rows = store
+            .uploads_meta(
+                &UploadQuery {
+                    after: Some(after),
+                    from: filter.from.as_deref(),
+                    to: filter.to.as_deref(),
+                    ip: filter.ip.as_deref(),
+                    ..Default::default()
+                },
+                UPLOADS_PAGE,
+            )
+            .await?;
+        let Some(last) = rows.last() else { break };
+        after = last.id;
+        writer.write(&uploads_batch(schema.clone(), &rows)?)?;
+        if (rows.len() as i64) < UPLOADS_PAGE {
+            break;
+        }
+    }
+    writer.close()?;
+    Ok(out.take())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_uploads_schema_has_no_content_column() {
+        let names: Vec<_> = uploads_schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert!(names.iter().all(|n| !n.contains("content") || n == "content_state"), "{names:?}");
+        assert!(names.iter().all(|n| n != "body" && n != "bytes"), "{names:?}");
+        assert!(names.contains(&"sha256".to_string()));
+    }
+
+    #[tokio::test]
+    async fn uploads_export_is_metadata_and_hash_only() {
+        use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let marker = b"<?php echo 'MARK-9c1e4f'; ?>";
+        crate::store::uploads::seed_upload(&s, "203.0.113.40", "/a.php", marker).await;
+        crate::store::uploads::seed_upload(&s, "198.51.100.41", "/b.php", b"other").await;
+        let pq = uploads(&s, &ExportFilter::default()).await.unwrap();
+        assert!(
+            !pq.windows(11).any(|w| w == b"MARK-9c1e4f"),
+            "content leaked into the file"
+        );
+        let b = ParquetRecordBatchReaderBuilder::try_new(axum::body::Bytes::from(pq)).unwrap();
+        assert_eq!(b.schema().fields().len(), uploads_schema().fields().len());
+        let batches: Vec<_> = b.build().unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        let sha = batches[0]
+            .column_by_name("sha256")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string();
+        use sha2::Digest;
+        assert_eq!(sha, data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(marker)));
+        // The IP bound narrows it.
+        let f = ExportFilter {
+            ip: Some("198.51.100.41".into()),
+            ..Default::default()
+        };
+        let pq = uploads(&s, &f).await.unwrap();
+        let n: usize = ParquetRecordBatchReaderBuilder::try_new(axum::body::Bytes::from(pq))
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|r| r.unwrap().num_rows())
+            .sum();
+        assert_eq!(n, 1);
     }
 }
