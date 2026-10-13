@@ -192,6 +192,27 @@ fn can_pay_first(arbiters: Vec<NodeId>, can_pay: impl Fn(&NodeId) -> bool) -> Ve
     first
 }
 
+/// Whether a scanner announcing `my_proto` claims jobs from an arbiter
+/// announcing `arbiter` (None: not a member here). A scanner of the free
+/// market (protocol 9) only from arbiters of it: they pay its ask as it
+/// stands, where an older one caps it at its copy times
+/// `PRICE_TOLERANCE`. Older scanners from every arbiter, as before.
+pub(crate) fn claims_from(my_proto: u32, arbiter: Option<u32>) -> bool {
+    !crate::credits::pay::trades_market(my_proto)
+        || arbiter.is_some_and(crate::credits::pay::trades_market)
+}
+
+/// The least a scanner announcing `my_proto` and selling at `sell_mc`
+/// takes for a funded job: in the free market its ask, since its
+/// arbiters pay the ask uncapped ([`claims_from`]); below protocol 9 the
+/// ask less the arbiters' tolerance (`price::min_take`).
+fn least_taken(my_proto: u32, sell_mc: u32) -> u32 {
+    match crate::credits::pay::trades_market(my_proto) {
+        true => sell_mc,
+        false => crate::credits::price::min_take(sell_mc),
+    }
+}
+
 /// A grant at a level this scanner excluded from its claim: an arbiter
 /// older than `exclude_levels` ignored it. Handed back "later".
 fn over_share(level: i64, exclude: &[u8]) -> bool {
@@ -639,13 +660,17 @@ impl Source {
         .bind(serde_json::to_string(exclude)?)
         .fetch_all(&node.store.pool)
         .await?;
+        let me = node.id();
+        let members = node.members();
+        // In the free market, only arbiters of it: one below protocol 9
+        // would cap this scanner's ask.
         let arbiters: Vec<NodeId> = arbiters
             .into_iter()
             .filter_map(|(a, _)| NodeId::from_slice(&a).ok())
+            .filter(|a| *a == me || claims_from(node.proto.1, members.get(a).map(|m| m.proto_max)))
             .collect();
         // Arbiters that can pay this scanner's price first; this node's
         // own jobs pay from its own scan budget.
-        let me = node.id();
         // Before its first refresh it sells at 0, as its heartbeat says.
         let sell = crate::credits::price::own_scan_price(node, &node.price_table());
         // Without a book (or the self tally) no arbiter counts as able to
@@ -669,7 +694,6 @@ impl Source {
             }
             _ => 0,
         };
-        let members = node.members();
         let can_pay = |a: &NodeId| -> bool {
             let payer = Payer {
                 own: *a == me,
@@ -685,7 +709,7 @@ impl Source {
             can_pay(sell, own_left, &payer)
         };
         let arbiters = can_pay_first(arbiters, can_pay);
-        let min_mc = sell.map_or(0, crate::credits::price::min_take);
+        let min_mc = sell.map_or(0, |p| least_taken(node.proto.1, p));
         for arbiter in arbiters {
             // No scan work for or from a peer this node blocked.
             if node.is_blocked(&arbiter) {
@@ -2631,6 +2655,16 @@ license_key = "k"
             .await
             .unwrap();
         assert_eq!(r.err().map(|(s, _)| s), Some("declined"));
+    }
+
+    #[test]
+    fn a_v9_scanner_claims_only_from_v9_arbiters_and_takes_its_ask() {
+        assert!(claims_from(9, Some(9)));
+        assert!(!claims_from(9, Some(8)), "a v8 arbiter would cap it");
+        assert!(!claims_from(9, None), "not a member here");
+        assert!(claims_from(8, Some(8)) && claims_from(8, Some(9)) && claims_from(8, None));
+        assert_eq!(least_taken(9, 125), 125);
+        assert_eq!(least_taken(8, 125), 100);
     }
 
     #[test]

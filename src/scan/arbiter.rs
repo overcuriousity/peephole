@@ -17,6 +17,7 @@ use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::msg::{Grant, Msg};
 use crate::cluster::record::{JobStatusRec, Record};
+use crate::credits::jobs::Afford;
 use crate::store::data::now_ts;
 use crate::store::recorder::Recorder;
 use anyhow::Result;
@@ -430,6 +431,8 @@ impl Arbiter {
             .filter(|l| claims.iter().all(|c| c.exclude.contains(l)))
             .collect();
         let mut funding = crate::credits::jobs::Funding::default();
+        // Logged once a round: a refusal of an ask above the bid.
+        let mut refused = false;
         let mut offset = 0;
         'pages: while offset < ROUND_JOBS && !out.iter().all(Option::is_some) {
             let jobs = match self.queued(&nobody, &excluded, offset).await {
@@ -481,22 +484,45 @@ impl Arbiter {
                 bids.sort_by_key(|(_, b)| rank::order(b));
                 // The best claimant this round's book can pay; with none,
                 // the job waits for the next round.
+                // An ask above this node's bid makes the job wait too: one
+                // refusal per job and round.
                 let mut payee = None;
+                let mut over = None;
                 for (k, (ci, b)) in bids.iter().enumerate() {
-                    if let Some(p) = b.price
-                        && crate::credits::jobs::affordable(
-                            &self.node,
-                            &mut funding,
-                            claims[*ci].min_mc,
-                            p.saturating_mul(factor),
-                        )
-                        .await
+                    let Some(p) = b.price.map(|p| p.saturating_mul(factor)) else {
+                        continue;
+                    };
+                    match crate::credits::jobs::affordable(
+                        &self.node,
+                        &mut funding,
+                        &b.id,
+                        job.manual,
+                        claims[*ci].min_mc,
+                        p,
+                    )
+                    .await
                     {
-                        payee = Some(k);
-                        break;
+                        Afford::Yes => {
+                            payee = Some(k);
+                            break;
+                        }
+                        Afford::OverBid { bid } => {
+                            over.get_or_insert((p, bid));
+                        }
+                        Afford::No => {}
                     }
                 }
-                let Some(pick) = payee else { continue };
+                let Some(pick) = payee else {
+                    if let Some((ask, bid)) = over {
+                        self.node.market.over_bid(crate::credits::price::SCAN);
+                        if !refused {
+                            refused = true;
+                            info!(good = crate::credits::price::SCAN, ask, bid, job = %job.uid,
+                                "market: ask above bid, not bought");
+                        }
+                    }
+                    continue;
+                };
                 let top = bids[pick].1.clone();
                 let standby: Vec<Standby> = scanners
                     .iter()
@@ -668,6 +694,7 @@ impl Arbiter {
             funding,
             claim.id,
             &job.uid,
+            job.manual,
             claim.min_mc,
             price,
         )
@@ -694,8 +721,11 @@ impl Arbiter {
             },
         );
         if price > 0 {
+            let own = crate::credits::price::own_scan_price(&self.node, &self.node.price_table());
             info!(job = %job.uid, scanner = %claim.id.short(),
-                price = %crate::credits::show(price as u64), "scan job funded");
+                price = %crate::credits::show(price as u64),
+                own = %own.map_or("-".into(), |o| crate::credits::show(o as u64)),
+                "scan job funded");
         }
         Ok(Some(Grant {
             job_uid: job.uid.clone(),
@@ -1148,6 +1178,11 @@ mod tests {
 
     /// A bootstrapped node (a scanner too) with its arbiter running.
     async fn setup(dir: &std::path::Path) -> Setup {
+        setup_at(dir, 2).await
+    }
+
+    /// [`setup`] for a node announcing protocols up to `proto_max`.
+    async fn setup_at(dir: &std::path::Path, proto_max: u32) -> Setup {
         let store = crate::store::Store::connect(&dir.join("t.db"))
             .await
             .unwrap();
@@ -1167,7 +1202,7 @@ mod tests {
             },
             roles: Default::default(),
             store: store.clone(),
-            proto: (2, 2),
+            proto: (2, proto_max),
             data_dir: dir.to_path_buf(),
             retention_days: 0,
         })
@@ -1689,6 +1724,17 @@ mod tests {
     /// A member with `role`, heard from just now, announcing `price_mc`
     /// for a scan job.
     async fn remote_member(node: &Node, role: &str, price_mc: u32) -> NodeId {
+        remote_member_at(
+            node,
+            role,
+            price_mc,
+            crate::cluster::rpc::proto::ECONOMY_PROTO,
+        )
+        .await
+    }
+
+    /// [`remote_member`] announcing protocols up to `proto_max`.
+    async fn remote_member_at(node: &Node, role: &str, price_mc: u32, proto_max: u32) -> NodeId {
         let id = Identity::generate().unwrap().id;
         let now = crate::cluster::hlc::wall_ms() << 16;
         sqlx::query(
@@ -1698,7 +1744,7 @@ mod tests {
         )
         .bind(&id.0[..])
         .bind(format!("s-{price_mc}"))
-        .bind(crate::cluster::rpc::proto::ECONOMY_PROTO as i64)
+        .bind(proto_max as i64)
         .bind(now as i64)
         .bind(role)
         .execute(&node.store.pool)
@@ -2228,5 +2274,117 @@ mod tests {
         };
         assert_eq!(arbiter_of("q").await, live, "queued: waits for its arbiter");
         assert_eq!(arbiter_of("r").await, node.id(), "stale running: adopted");
+    }
+
+    /// The free market among scanners (MIK-251, slice 2): members `{arb
+    /// v8, arb v9, scanner v8, scanner v9}`, each scanner asking twice the
+    /// arbiter's copy. A v9 scanner claims nothing of a v8 arbiter, so no
+    /// v8 arbiter caps it; a v9 arbiter pays a v9 scanner its ask and caps
+    /// a v8 one at `PRICE_TOLERANCE`.
+    #[test]
+    fn a_v8_arbiter_never_grants_a_v9_scanner_and_a_v9_arbiter_caps_only_v8() {
+        let (copy, ask) = (100, 200);
+        let mut pairs = HashMap::new();
+        for arb in [8, 9] {
+            for scanner in [8, 9] {
+                if super::super::claims_from(scanner, Some(arb)) {
+                    let paid =
+                        crate::credits::jobs::scan_offer(arb, scanner, Some(ask), Some(copy));
+                    pairs.insert((arb, scanner), paid);
+                }
+            }
+        }
+        assert!(!pairs.contains_key(&(8, 9)), "v8 arbiter -> v9 scanner");
+        assert_eq!(pairs[&(9, 8)], Some(125), "capped at 1.25x");
+        assert_eq!(pairs[&(8, 8)], Some(125), "as before");
+        assert_eq!(pairs[&(9, 9)], Some(ask), "the ask as it stands");
+    }
+
+    /// A v9 arbiter with credits, wanting one scan job, and its bid.
+    async fn market_arbiter(dir: &std::path::Path) -> (Setup, u64) {
+        let s = setup_at(dir, crate::cluster::rpc::proto::MARKET_PROTO).await;
+        give_credits(&s.2, s.0.id()).await;
+        s.0.wants
+            .lock()
+            .unwrap()
+            .set(crate::credits::price::SCAN, 1);
+        let book = crate::credits::book_fresh(&s.0).await.unwrap();
+        let bid = crate::credits::price::own_bid(&s.0, &book, crate::credits::price::SCAN).await;
+        (s, bid)
+    }
+
+    /// The same round with a v8 and a v9 scanner, both asking twice this
+    /// v9 arbiter's own scan price: the v8 one is paid 1.25 times its copy,
+    /// the v9 one its ask ("different asks").
+    #[tokio::test]
+    async fn a_v9_arbiter_pays_a_v9_scanner_twice_its_own_price() {
+        use crate::cluster::rpc::proto::{ECONOMY_PROTO, MARKET_PROTO};
+        let dir = tempfile::tempdir().unwrap();
+        let ((node, arbiter, store, _tx), bid) = market_arbiter(dir.path()).await;
+        let own = 30;
+        assert!(bid >= 2 * own as u64, "bid {bid}");
+        let v8 = remote_member_at(&node, "scanner", 2 * own, ECONOMY_PROTO).await;
+        let v9 = remote_member_at(&node, "scanner", 2 * own, MARKET_PROTO).await;
+        references(&node, &[(v8, own, 100.0), (v9, own, 100.0)]);
+        let mut t = (*node.price_table()).clone();
+        t.sell_mc = Some(own);
+        node.set_price_table(Arc::new(t));
+        queue(&node, &store, 61, 2).await;
+        queue(&node, &store, 62, 2).await;
+        // Past the override: the dearer v9 scanner is not held for the v8.
+        sqlx::query("UPDATE scan_jobs SET queued_at = datetime('now', '-40 minutes')")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let got = arbiter
+            .round(&[claim_of(v8, &[]), claim_of(v9, &[])])
+            .await
+            .unwrap();
+        let price = |i: usize| got[i].as_ref().map(|g| g.price_mc);
+        assert_eq!(price(0), Some(own * 5 / 4), "v8: capped at 1.25x");
+        assert_eq!(price(1), Some(2 * own), "v9: its ask, twice the own price");
+    }
+
+    /// A v9 scanner asking above this arbiter's bid is not granted: the
+    /// job waits and the refusal is counted. At the bid it is granted.
+    #[tokio::test]
+    async fn an_ask_above_the_bid_waits_and_is_counted() {
+        use crate::cluster::rpc::proto::MARKET_PROTO;
+        use crate::credits::price::SCAN;
+        let dir = tempfile::tempdir().unwrap();
+        let ((node, arbiter, store, _tx), bid) = market_arbiter(dir.path()).await;
+        let bid = u32::try_from(bid).unwrap();
+        assert!(bid > 0);
+        let over = remote_member_at(&node, "scanner", bid + 1, MARKET_PROTO).await;
+        let at = remote_member_at(&node, "scanner", bid, MARKET_PROTO).await;
+        references(&node, &[(over, 1, 100.0), (at, 1, 100.0)]);
+        let uid = queue(&node, &store, 63, 2).await;
+        assert!(arbiter.next_job(over, &[], 0).await.is_none());
+        assert_eq!(status(&store, &uid).await, "queued");
+        assert_eq!(node.market.over_bids().get(SCAN), Some(&1));
+        let g = arbiter.next_job(at, &[], 0).await.unwrap();
+        assert_eq!((g.job_uid.as_str(), g.price_mc), (uid.as_str(), bid));
+        assert_eq!(node.market.over_bids().get(SCAN), Some(&1), "not again");
+    }
+
+    /// An operator's bought job is no automatic purchase: no bid bounds
+    /// it, as before the market.
+    #[tokio::test]
+    async fn a_bought_job_is_not_bounded_by_the_bid() {
+        use crate::cluster::rpc::proto::MARKET_PROTO;
+        let dir = tempfile::tempdir().unwrap();
+        let ((node, arbiter, store, _tx), bid) = market_arbiter(dir.path()).await;
+        let ask = u32::try_from(bid).unwrap() + 1;
+        let v9 = remote_member_at(&node, "scanner", ask, MARKET_PROTO).await;
+        references(&node, &[(v9, 1, 100.0)]);
+        let uid = queue(&node, &store, 64, 1).await;
+        sqlx::query("UPDATE scan_jobs SET manual = 1 WHERE uid = ?")
+            .bind(&uid)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let g = arbiter.next_job(v9, &[], 0).await.unwrap();
+        assert_eq!((g.job_uid.as_str(), g.price_mc), (uid.as_str(), ask));
+        assert!(node.market.over_bids().is_empty());
     }
 }
