@@ -1,6 +1,6 @@
-//! What a good costs here: one rule for every good. A good that sold in
-//! the last period gets dearer, one that sold nothing cheaper, by a
-//! bounded step an hour, down to nothing.
+//! What a good costs here: one rule for every good. A good whose demand
+//! in the last period reached [`PAID_TARGET`] of its supply gets dearer,
+//! any other cheaper, by a bounded step an hour, down to nothing.
 use super::Mc;
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
@@ -466,6 +466,15 @@ pub async fn granted_scans(pool: &sqlx::SqlitePool) -> Result<HashMap<NodeId, Ve
     Ok(out)
 }
 
+/// Whether a good other than a scan job rises, by the scanners' rule:
+/// the `demand` of a period of `hours` reaches [`PAID_TARGET`] of what it
+/// can serve in that period (`supply_per_hour`). A sale below that is no
+/// scarcity, so the price falls (MIK-249: rDNS sold once every few hours
+/// and still climbed 260-fold in two days).
+pub fn good_raises(demand: f64, hours: f64, supply_per_hour: f64) -> bool {
+    demand > 0.0 && demand >= PAID_TARGET * supply_per_hour.max(0.0) * hours.max(0.0)
+}
+
 /// Whether a scanner's price rises: a scan of a job granted to it ended
 /// in the last `period_ms`, or its granted scans of the past hour reach
 /// [`PAID_TARGET`] of what it can do (at capacity).
@@ -621,9 +630,15 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let none = vec![];
     let ann = |g: &str| announced.get(g).unwrap_or(&none).clone();
     let got = |g: &str| demand.get(g).copied().unwrap_or(0.0);
-    // A good that was asked for sold (a request beyond the supply is a
-    // sale too), so it rises; one nobody asked for falls.
-    let next = |cur: Mc, good: &str| as_mc(sales_step(cur, got(good) > 0.0, hours));
+    // A good rises when its demand reaches [`PAID_TARGET`] of its supply
+    // (a request beyond the supply counts too), and falls otherwise.
+    let next = |cur: Mc, good: &str, supply_per_hour: f64| {
+        as_mc(sales_step(
+            cur,
+            good_raises(got(good), hours, supply_per_hour),
+            hours,
+        ))
+    };
     let empty = vec![];
     let providers = node.lookup_providers().unwrap_or(&empty);
     let offer_per_day = node
@@ -637,14 +652,27 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         let cur = current(node, &old, p.name(), &ann(p.name())).await?;
         offers.push(Offer {
             provider: p.name().to_string(),
-            price_mc: next(cur, p.name()),
+            price_mc: next(cur, p.name(), on_demand as f64 / 24.0),
             on_demand,
         });
     }
-    let resolve_mc = next(current(node, &old, RESOLVE, &ann(RESOLVE)).await?, RESOLVE);
-    let rdns_mc = next(current(node, &old, RDNS, &ann(RDNS)).await?, RDNS);
+    let lookups_per_hour = offer_per_day as f64 / 24.0;
+    let resolve_mc = next(
+        current(node, &old, RESOLVE, &ann(RESOLVE)).await?,
+        RESOLVE,
+        lookups_per_hour,
+    );
+    let rdns_mc = next(
+        current(node, &old, RDNS, &ann(RDNS)).await?,
+        RDNS,
+        lookups_per_hour,
+    );
     let probe_mc = match node.prober() {
-        Some(_) => Some(next(current(node, &old, PROBE, &ann(PROBE)).await?, PROBE)),
+        Some(pr) => Some(next(
+            current(node, &old, PROBE, &ann(PROBE)).await?,
+            PROBE,
+            pr.slots() as f64 * PROBES_PER_SLOT_HOUR,
+        )),
         None => None,
     };
     // A relay sells leases; it is at capacity when every slot is leased.
@@ -653,7 +681,9 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
             let cur = current(node, &old, RELAY, &ann(RELAY)).await?;
             let full = node.relay_leases.current(crate::cluster::hlc::wall_ms())
                 >= node.cfg.relay_slots as usize;
-            Some(as_mc(sales_step(cur, got(RELAY) > 0.0 || full, hours)))
+            let slots = node.cfg.relay_slots as f64;
+            let raise = full || good_raises(got(RELAY), hours, slots);
+            Some(as_mc(sales_step(cur, raise, hours)))
         }
         None => None,
     };
@@ -938,6 +968,31 @@ mod tests {
             !scanner_raises(&[], now, 10 * min, 0.0),
             "a paused scanner sells nothing"
         );
+    }
+
+    #[test]
+    fn a_good_rises_only_when_its_demand_reaches_the_paid_target_of_its_supply() {
+        // rDNS on hermes (MIK-249): 1 request an hour against 41.7 an hour.
+        let supply = 1000.0 / 24.0;
+        assert!(!good_raises(1.0, 1.0, supply), "one sale an hour is no scarcity");
+        let mut p: Mc = 37_569;
+        for _ in 0..24 {
+            let next = as_mc(sales_step(p, good_raises(1.0, 1.0, supply), 1.0)) as Mc;
+            assert!(next < p, "falls every hour: {next} vs {p}");
+            p = next;
+        }
+        assert!(good_raises(PAID_TARGET * supply, 1.0, supply), "at the target");
+        assert!(good_raises(supply * 2.0, 1.0, supply), "beyond the supply");
+        assert!(
+            !good_raises(PAID_TARGET * supply, 2.0, supply),
+            "the same count over two hours is half the rate"
+        );
+        assert!(
+            good_raises(PAID_TARGET * supply / 6.0, 1.0 / 6.0, supply),
+            "a ten-minute period is judged against ten minutes of supply"
+        );
+        assert!(!good_raises(0.0, 1.0, 0.0), "nothing asked of nothing: no rise");
+        assert!(good_raises(1.0, 1.0, 0.0), "asked for what it cannot sell");
     }
 
     #[tokio::test]
