@@ -75,6 +75,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0033_device_actions.sql"),
     include_str!("migrations/0034_uploads.sql"),
     include_str!("migrations/0035_webshell_hits.sql"),
+    include_str!("migrations/0036_reset_good_prices.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
@@ -605,6 +606,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t2, 0, "partial migration must not persist");
+    }
+
+    #[tokio::test]
+    async fn migration_0036_resets_every_good_price_but_scanners() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        // A 0.13.0 database with the runaway rDNS price of hermes (MIK-249).
+        {
+            let opts = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+            check_application_id(&pool).await.unwrap();
+            migrate(&pool, &MIGRATIONS[..35]).await.unwrap();
+            for (k, v) in [
+                ("price:rdns", "37569"),
+                ("price:resolve", "12"),
+                ("price:abuseipdb", "900"),
+                ("price:probe", "40"),
+                ("price:relay", "7"),
+                ("price:scan:ed25519:abc", "26194@1791871261536"),
+                ("price:scan", "500"),
+                ("pool:day", "3"),
+            ] {
+                sqlx::query("INSERT INTO intel_meta (key, value) VALUES (?, ?)")
+                    .bind(k)
+                    .bind(v)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            pool.close().await;
+        }
+        let s = Store::connect(&path).await.unwrap();
+        for good in ["rdns", "resolve", "abuseipdb", "probe", "relay"] {
+            let key = format!("price:{good}");
+            assert_eq!(s.intel_get(&key).await.unwrap().as_deref(), Some("0"), "{key}");
+        }
+        for (k, v) in [
+            ("price:scan:ed25519:abc", "26194@1791871261536"),
+            ("price:scan", "500"),
+            ("pool:day", "3"),
+        ] {
+            assert_eq!(s.intel_get(k).await.unwrap().as_deref(), Some(v), "{k}");
+        }
     }
 
     #[tokio::test]
