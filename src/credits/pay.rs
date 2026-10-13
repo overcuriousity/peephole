@@ -117,6 +117,25 @@ pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
     out
 }
 
+/// [`quotes`] an automatic buyer may take up: this node's own, and those
+/// of members that trade in the free market asking at most `bid`. A
+/// member older than the market is not asked: its price follows rules
+/// this node's bid does not.
+pub fn within_bid(
+    node: &Node,
+    mut all: HashMap<String, Vec<Quote>>,
+    bid: Mc,
+) -> HashMap<String, Vec<Quote>> {
+    let me = node.id();
+    let members = node.members();
+    let market = |id: &NodeId| members.get(id).is_some_and(|m| trades_market(m.proto_max));
+    for list in all.values_mut() {
+        list.retain(|q| q.server == me || (market(&q.server) && q.price_mc as Mc <= bid));
+    }
+    all.retain(|_, list| !list.is_empty());
+    all
+}
+
 /// What an offer must have left of its 15 minutes to be served: the
 /// providers' time and some slack. A receipt written after the offer
 /// lapsed counts nowhere, so the server would answer unpaid. A paid
@@ -765,13 +784,15 @@ pub async fn offer_and_ask(
 }
 
 /// Ask the cheapest server of each quote group once more at its named
-/// price when it turned the first offer down for being too low.
+/// price when it turned the first offer down for being too low: within
+/// `bid` when an automatic buyer asks, else within [`retry_price`].
 async fn ask_server(
     node: &Arc<Node>,
     own: &Providers,
     ip: IpAddr,
     server: NodeId,
     quotes: &[Quote],
+    bid: Option<Mc>,
 ) -> LookupResp {
     let names: Vec<String> = quotes.iter().map(|q| q.provider.clone()).collect();
     let total: Mc = quotes.iter().map(|q| q.price_mc as Mc).sum();
@@ -780,7 +801,11 @@ async fn ask_server(
         return crate::intel::lookup::local(own, &ip, &names).await;
     }
     let first = offer_and_ask(node, ip, server, &names, total).await;
-    match retry_price(total, first.price_mc, first.findings.is_empty()) {
+    let again = match bid {
+        Some(b) => retry_within(total, first.price_mc, first.findings.is_empty(), b),
+        None => retry_price(total, first.price_mc, first.findings.is_empty()),
+    };
+    match again {
         // Its price moved since its heartbeat: offer that, once.
         Some(p) => offer_and_ask(node, ip, server, &names, p).await,
         None => first,
@@ -825,20 +850,27 @@ fn next_server<'a>(
 /// The asking side: for each provider in `wanted` that somebody serves,
 /// ask the cheapest server (and the next cheapest when it declines), and
 /// pay what each asks. Servers other than this node are asked only for
-/// the providers in `paid`. One answer per server asked.
+/// the providers in `paid`. One answer per server asked. An automatic
+/// buyer passes its `bid` (from its own book): then only members of the
+/// free market asking at most that are asked ([`within_bid`]), and none
+/// is offered more; a manual lookup passes None.
 pub async fn ask(
     node: &Arc<Node>,
     own: &Providers,
     ip: IpAddr,
     wanted: &[String],
     paid: &[String],
+    bid: Option<Mc>,
 ) -> Vec<NodeAnswer> {
     let me = node.id();
     let mut remaining: Vec<String> = wanted.to_vec();
     let mut tried: HashMap<String, HashSet<NodeId>> = HashMap::new();
     let mut out: Vec<NodeAnswer> = vec![];
     for _ in 0..MAX_ROUNDS {
-        let all = quotes(node, own);
+        let all = match bid {
+            Some(b) => within_bid(node, quotes(node, own), b),
+            None => quotes(node, own),
+        };
         // The cheapest server not yet tried, per provider still open.
         let mut by_server: Vec<(NodeId, String, Vec<Quote>)> = vec![];
         for p in &remaining {
@@ -861,7 +893,7 @@ pub async fn ask(
         // This node first, then by name: a stable order on the page.
         by_server.sort_by_key(|(s, name, _)| (*s != me, name.clone()));
         for (server, name, quotes) in by_server {
-            let resp = ask_server(node, own, ip, server, &quotes).await;
+            let resp = ask_server(node, own, ip, server, &quotes, bid).await;
             remaining.retain(|p| !resp.findings.iter().any(|f| &f.provider == p));
             out.push(NodeAnswer {
                 node: name,
