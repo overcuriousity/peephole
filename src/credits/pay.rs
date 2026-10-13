@@ -792,8 +792,20 @@ async fn ask_server(
 /// offer (one mc for a request without an offer). None: do not offer
 /// again (the next server is asked instead).
 pub(crate) fn retry_price(offered: Mc, named: Option<u32>, nothing_answered: bool) -> Option<Mc> {
-    let p = named? as Mc;
     let bound = offered.max(1).saturating_mul(RETRY_AT_MOST);
+    retry_within(offered, named, nothing_answered, bound)
+}
+
+/// Like [`retry_price`], at most `bound` instead: an automatic buyer
+/// passes its bid (`credits::bid`), so no refusal makes it pay more than
+/// its own book allows. A manual lookup keeps [`retry_price`].
+pub(crate) fn retry_within(
+    offered: Mc,
+    named: Option<u32>,
+    nothing_answered: bool,
+    bound: Mc,
+) -> Option<Mc> {
+    let p = named? as Mc;
     (nothing_answered && p > offered && p <= bound).then_some(p)
 }
 
@@ -1051,6 +1063,26 @@ mod tests {
             None,
             "something was answered"
         );
+    }
+
+    #[test]
+    fn an_automatic_buyer_offers_again_at_most_its_bid() {
+        use crate::credits::CREDIT;
+        let bid = CREDIT / 2;
+        let named = |c: u64| Some(c as u32);
+        assert_eq!(
+            retry_within(0, named(37 * CREDIT), true, bid),
+            None,
+            "37 credits named against a bid of 0.5"
+        );
+        assert_eq!(
+            retry_within(CREDIT / 10, named(4 * CREDIT / 10), true, bid),
+            Some(4 * CREDIT / 10),
+            "0.4 is within the bid, though four times the offer"
+        );
+        assert_eq!(retry_within(0, named(bid), true, bid), Some(bid));
+        assert_eq!(retry_within(0, named(bid + 1), true, bid), None);
+        assert_eq!(retry_within(0, named(bid), false, bid), None);
     }
 
     fn q(provider: &str, server: u8, price_mc: u32) -> Quote {
