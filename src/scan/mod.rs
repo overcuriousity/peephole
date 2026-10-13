@@ -661,7 +661,7 @@ impl Source {
             (Some(_), Some(book)) => {
                 match crate::credits::jobs::self_committed(&node.store.pool, &me).await {
                     Ok(self_mc) => {
-                        crate::credits::jobs::budget(&book.ledger, &me, node.scan_share(), self_mc)
+                        crate::credits::jobs::budget(&book.ledger, &me, self_mc)
                     }
                     Err(e) => {
                         debug!(?e, "own scan reservations not read");

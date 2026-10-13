@@ -297,7 +297,6 @@ pub struct Node {
     /// (`credits::jobs::announce_budget`).
     pub scan_budget_mc: std::sync::atomic::AtomicU32,
     pub scan_queued: std::sync::atomic::AtomicU32,
-    scan_share: std::sync::OnceLock<f64>,
     /// Offers a paid lookup is being served for right now: `(payer,
     /// sequence number)`. An offer is served once.
     pub(crate) serving_offers: Mutex<std::collections::HashSet<(NodeId, u64)>>,
@@ -385,7 +384,6 @@ impl Node {
             weights: Default::default(),
             scan_budget_mc: Default::default(),
             scan_queued: Default::default(),
-            scan_share: Default::default(),
             serving_offers: Mutex::new(Default::default()),
             spending: Default::default(),
             drawing: Default::default(),
@@ -595,15 +593,6 @@ impl Node {
     pub fn set_price_table(&self, t: Arc<crate::credits::price::Table>) {
         *self.price_table.write().unwrap() = t;
         self.publish_status();
-    }
-
-    /// `[credits] scan_share`: set once at start.
-    pub fn set_scan_share(&self, share: f64) {
-        let _ = self.scan_share.set(share.clamp(0.0, 1.0));
-    }
-
-    pub fn scan_share(&self) -> f64 {
-        self.scan_share.get().copied().unwrap_or(0.0)
     }
 
     /// The address this node would dial `id` at, if it has one.

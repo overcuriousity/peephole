@@ -285,7 +285,7 @@ audits and relay leases. The supply is fixed; prices follow sales.
 ### Scan jobs
 
 - **Scan jobs.** The arbiter (the node that queued the job) funds its jobs
-  from its own balance, up to `[credits] scan_share` (default 0.5) of it, and
+  from its own balance, up to all of it (no daily share), and
   hands each job to the scanner asking that is cheapest **per delivered
   result** at the job's level: its price divided by its success rate there,
   relative to the best live scanner with at least 5 scans at that level (the
@@ -315,7 +315,6 @@ audits and relay leases. The supply is fixed; prices follow sales.
   done, and nothing when it does not. A scan offer lapses
   after the longest scan (12 hours plus 2 minutes). Every grant is funded, at
   zero or above: a scanner priced at 0 is granted without an offer.
-  `scan_share = 0` funds only free scanners.
 
 ### Conformity and audits
 
@@ -389,8 +388,8 @@ audits and relay leases. The supply is fixed; prices follow sales.
   day, and each key must first pass the rules agreement; but a pool share
   goes to every verified listener, so listeners cost an address and 12
   reported hours a day.
-- A free rider (`scan_share = 0`) gets its attackers scanned only by
-  scanners priced at zero.
+- A free rider (a node with no credits) gets its attackers scanned only
+  by scanners priced at zero.
 - A scanner can announce a lower pace to look busier and raise its
   price; it then runs fewer scans than it could, and scans beyond its
   announced pace show in the log.
@@ -399,8 +398,8 @@ audits and relay leases. The supply is fixed; prices follow sales.
   the rule.
 - A scanner that fills itself with its own jobs, or with paid jobs of a
   second key of its operator, looks busy and its price rises: the same
-  as selling less of its capacity. Cheapest-scanner choice, `scan_share`
-  and the bounded rise protect others; with one scanner it is a
+  as selling less of its capacity. Cheapest-scanner choice and the
+  bounded rise protect others; with one scanner it is a
   monopoly.
 - Fleets are private, so a sibling of a scanner can rank among its
   auditors and approve what it is sent; the unpaid checks of other
