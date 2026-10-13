@@ -525,6 +525,96 @@ async fn newest_intel(
         .and_then(|v| v.as_object().cloned()))
 }
 
+/// `intel_meta` key holding this node's origin as upper-case hex, so a
+/// reader can tell this node's rows from the others' (`Node::open` sets it;
+/// absent standalone, where every row has the empty origin).
+pub const SELF_ORIGIN_KEY: &str = "self_origin";
+
+/// One origin's current RDAP row for an IP.
+#[derive(Debug, Clone)]
+pub struct RdapAnswer {
+    pub origin: Vec<u8>,
+    /// Its member's name, when known.
+    pub node: Option<String>,
+    pub fetched_at: String,
+    pub data: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Which RDAP answer an IP shows when origins differ (MIK-259): one is
+/// chosen, or none is and every distinct answer is shown as disputed.
+#[derive(Debug, Clone)]
+pub enum RdapPick {
+    Chosen(RdapAnswer),
+    Disputed(Vec<RdapAnswer>),
+}
+
+/// The pick among `rows` (newest first). All with the same tags: the newest.
+/// Otherwise this node's own row, else the tags most origins agree on (the
+/// newest of them), else disputed. An empty origin is this node's.
+pub fn pick_rdap(rows: Vec<RdapAnswer>, me: Option<&[u8]>) -> Option<RdapPick> {
+    let tags = |a: &RdapAnswer| crate::intel::rdap::tags(&a.data);
+    let first = rows.first()?;
+    if rows.iter().all(|r| tags(r) == tags(first)) {
+        return rows.into_iter().next().map(RdapPick::Chosen);
+    }
+    if let Some(i) = rows
+        .iter()
+        .position(|r| r.origin.is_empty() || Some(&r.origin[..]) == me)
+    {
+        return Some(RdapPick::Chosen(rows[i].clone()));
+    }
+    // One entry per distinct answer, in the order its newest row comes.
+    let mut groups: Vec<(Vec<String>, usize, usize)> = vec![];
+    for (i, r) in rows.iter().enumerate() {
+        let t = tags(r);
+        match groups.iter_mut().find(|g| g.0 == t) {
+            Some(g) => g.2 += 1,
+            None => groups.push((t, i, 1)),
+        }
+    }
+    let most = groups.iter().map(|g| g.2).max().unwrap_or(0);
+    let top: Vec<_> = groups.iter().filter(|g| g.2 == most).collect();
+    if let [g] = top[..] {
+        return Some(RdapPick::Chosen(rows[g.1].clone()));
+    }
+    Some(RdapPick::Disputed(
+        groups.iter().map(|g| rows[g.1].clone()).collect(),
+    ))
+}
+
+/// The RDAP pick for `ip` from every origin's current row.
+pub(crate) async fn rdap_pick(conn: &mut SqliteConnection, ip: &str) -> Result<Option<RdapPick>> {
+    let me: Option<String> = sqlx::query_scalar("SELECT value FROM intel_meta WHERE key = ?")
+        .bind(SELF_ORIGIN_KEY)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let me = me.and_then(|h| data_encoding::HEXUPPER.decode(h.as_bytes()).ok());
+    let rows: Vec<(Vec<u8>, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT origin, (SELECT name FROM members m WHERE m.id = origin), fetched_at, data_json
+         FROM ip_intel WHERE ip = ? AND provider = ? ORDER BY hlc DESC, origin DESC",
+    )
+    .bind(ip)
+    .bind(crate::intel::RDAP)
+    .fetch_all(&mut *conn)
+    .await?;
+    let rows = rows
+        .into_iter()
+        .filter_map(|(origin, node, fetched_at, raw)| {
+            let data = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()?
+                .as_object()
+                .cloned()?;
+            Some(RdapAnswer {
+                origin,
+                node,
+                fetched_at,
+                data,
+            })
+        })
+        .collect();
+    Ok(pick_rdap(rows, me.as_deref()))
+}
+
 /// Set the facts shown for an IP (country, ASN, Tor flag) from the newest
 /// result of each provider. Does nothing while the IP has no row yet.
 pub(crate) async fn refresh_ip_view(conn: &mut SqliteConnection, ip: &str) -> Result<()> {
@@ -566,10 +656,20 @@ pub(crate) async fn refresh_ip_view(conn: &mut SqliteConnection, ip: &str) -> Re
         .iter()
         .filter(|p| p.api && known)
     {
-        let Some(data) = newest_intel(conn, ip, p.name).await? else {
-            continue;
+        // RDAP: the pick among the origins (`pick_rdap`); the others newest.
+        let tags = if p.name == crate::intel::RDAP {
+            match rdap_pick(conn, ip).await? {
+                Some(RdapPick::Chosen(a)) => crate::intel::tags(p.name, &a.data),
+                Some(RdapPick::Disputed(_)) => vec!["disputed".to_string()],
+                None => continue,
+            }
+        } else {
+            let Some(data) = newest_intel(conn, ip, p.name).await? else {
+                continue;
+            };
+            crate::intel::tags(p.name, &data)
         };
-        for tag in crate::intel::tags(p.name, &data) {
+        for tag in tags {
             sqlx::query("INSERT OR IGNORE INTO ip_intel_tags (ip, tag) VALUES (?, ?)")
                 .bind(ip)
                 .bind(format!("{}:{tag}", p.tag_prefix))
@@ -1192,6 +1292,7 @@ pub(crate) async fn drop_orphan_ip(conn: &mut SqliteConnection, ip_id: i64) -> R
             "DELETE FROM ip_intel WHERE ip = ?",
             "DELETE FROM ip_intel_log WHERE ip = ?",
             "DELETE FROM ip_intel_tags WHERE ip = ?",
+            "DELETE FROM rdap_checks WHERE ip = ?",
         ] {
             sqlx::query(sql)
                 .bind(ip.as_str())
@@ -1914,6 +2015,113 @@ mod tests {
             .fetch_one(&mut *conn)
             .await
             .unwrap()
+    }
+
+    /// A store with one IP and the RDAP rows `(origin, hlc, data)`; `me`
+    /// recorded as this node's origin. Returns the IP's RDAP tags.
+    async fn rdap_tags(
+        rows: &[(&NodeId, u64, &str)],
+        me: Option<&NodeId>,
+    ) -> (Vec<String>, Option<RdapPick>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        if let Some(me) = me {
+            store
+                .intel_set(SELF_ORIGIN_KEY, &data_encoding::HEXUPPER.encode(&me.0))
+                .await
+                .unwrap();
+        }
+        let mut conn = store.pool.acquire().await.unwrap();
+        let first = rows[0].0;
+        let ctx = Ctx {
+            origin: Some(first),
+            hlc: 1,
+        };
+        apply(
+            &mut conn,
+            ctx,
+            &request(&format!("{}r", first.uid_prefix()), "/x"),
+        )
+        .await
+        .unwrap();
+        let ip = "203.0.113.7";
+        for (origin, hlc, data) in rows {
+            let ctx = Ctx {
+                origin: Some(origin),
+                hlc: *hlc,
+            };
+            apply(&mut conn, ctx, &intel(ip, crate::intel::RDAP, data))
+                .await
+                .unwrap();
+        }
+        let tags = sqlx::query_scalar("SELECT tag FROM ip_intel_tags WHERE ip = ? ORDER BY tag")
+            .bind(ip)
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        (tags, store.rdap_pick(ip).await.unwrap())
+    }
+
+    fn ids() -> (NodeId, NodeId, NodeId) {
+        (
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+            Identity::generate().unwrap().id,
+        )
+    }
+
+    #[tokio::test]
+    async fn rdap_prefers_this_nodes_own_row_when_origins_differ() {
+        let (a, b, _) = ids();
+        let rows = [
+            (&a, 10, r#"{"country":"DE"}"#),
+            (&b, 20, r#"{"country":"US"}"#),
+        ];
+        let (tags, pick) = rdap_tags(&rows, Some(&a)).await;
+        assert_eq!(tags, vec!["rdap:country:DE"]);
+        assert!(matches!(pick, Some(RdapPick::Chosen(p)) if p.origin == a.0.to_vec()));
+        // On the other node, b's own row.
+        let (tags, _) = rdap_tags(&rows, Some(&b)).await;
+        assert_eq!(tags, vec!["rdap:country:US"]);
+    }
+
+    #[tokio::test]
+    async fn rdap_takes_the_tags_most_origins_agree_on() {
+        let (a, b, c) = ids();
+        let rows = [
+            (&a, 10, r#"{"country":"DE"}"#),
+            (&b, 11, r#"{"country":"DE","name":"other"}"#),
+            (&c, 30, r#"{"country":"US"}"#),
+        ];
+        let (tags, pick) = rdap_tags(&rows, None).await;
+        assert_eq!(tags, vec!["rdap:country:DE"], "not the newest, US");
+        assert!(matches!(pick, Some(RdapPick::Chosen(p)) if p.origin == b.0.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn rdap_without_a_majority_is_disputed() {
+        let (a, b, _) = ids();
+        let rows = [
+            (&a, 10, r#"{"country":"DE"}"#),
+            (&b, 20, r#"{"country":"US"}"#),
+        ];
+        let (tags, pick) = rdap_tags(&rows, None).await;
+        assert_eq!(tags, vec!["rdap:disputed"]);
+        let Some(RdapPick::Disputed(all)) = pick else {
+            panic!("{pick:?}")
+        };
+        let mut countries: Vec<_> = all.iter().map(|a| a.data["country"].clone()).collect();
+        countries.sort_by_key(|c| c.to_string());
+        assert_eq!(countries, vec!["DE", "US"], "both answers");
+        // All agree: the newest, as for the other providers.
+        let rows = [
+            (&a, 10, r#"{"country":"DE"}"#),
+            (&b, 20, r#"{"country":"de"}"#),
+        ];
+        let (tags, pick) = rdap_tags(&rows, None).await;
+        assert_eq!(tags, vec!["rdap:country:DE"]);
+        assert!(matches!(pick, Some(RdapPick::Chosen(p)) if p.origin == b.0.to_vec()));
     }
 
     #[tokio::test]

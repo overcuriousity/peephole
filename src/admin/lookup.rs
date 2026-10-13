@@ -765,6 +765,7 @@ mod tests {
                 node: None,
             }),
             others: vec![],
+            disputed: vec![],
         }
     }
 

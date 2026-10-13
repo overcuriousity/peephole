@@ -55,11 +55,11 @@
 </section>
 <section class="card"><h2>Contributions</h2>
   <div class="table-wrap"><table>
-    <thead><tr><th></th><th class="num">Requests</th><th class="num">Flood-sampled</th><th class="num">Fingerprints</th><th class="num">Claims</th><th class="num">Scans</th><th class="num">IPs looked up</th><th class="num">Log entries</th><th class="num">Log size</th></tr></thead>
+    <thead><tr><th></th><th class="num">Requests</th><th class="num">Flood-sampled</th><th class="num">Fingerprints</th><th class="num">Claims</th><th class="num">Scans</th><th class="num">IPs looked up</th><th class="num" title="Its RDAP answers this node asked again; disputed: different twice">RDAP checked / disputed</th><th class="num">Log entries</th><th class="num">Log size</th></tr></thead>
     <tbody>{% for c in contrib %}<tr>
       <td>{% if c.key.is_empty() %}not shared yet{% else %}held here{% endif %}</td>
       <td class="num">{{ c.requests }}</td><td class="num">{{ c.skipped }}</td><td class="num">{{ c.fingerprints }}</td><td class="num">{{ c.claims }}</td>
-      <td class="num">{{ c.scans }}</td><td class="num">{{ c.lookups }}</td><td class="num">{{ c.log_entries }}</td><td class="num">{{ c.log_size }}</td>
+      <td class="num">{{ c.scans }}</td><td class="num">{{ c.lookups }}</td><td class="num">{{ c.rdap_checked }} / {{ c.rdap_disputes }}</td><td class="num">{{ c.log_entries }}</td><td class="num">{{ c.log_size }}</td>
     </tr>{% endfor %}</tbody>
   </table></div>
 </section>

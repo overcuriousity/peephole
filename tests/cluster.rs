@@ -4817,6 +4817,80 @@ async fn protocol_eight_and_nine_trade_side_by_side() {
     assert!(rows.iter().all(|r| r.bid_mc == 0), "{rows:?}");
 }
 
+/// An RDAP provider that answers every IP with the same data.
+struct FixedRdap(serde_json::Value);
+
+impl peephole::intel::provider::Provider for FixedRdap {
+    fn name(&self) -> &'static str {
+        peephole::intel::RDAP
+    }
+    fn ready(&self) -> bool {
+        true
+    }
+    fn lookup<'a>(
+        &'a self,
+        ips: &'a [String],
+    ) -> futures::future::BoxFuture<'a, Vec<peephole::intel::provider::Finding>> {
+        Box::pin(async move {
+            ips.iter()
+                .map(|ip| peephole::intel::provider::Finding {
+                    ip: ip.clone(),
+                    source_version: None,
+                    data: self.0.clone(),
+                })
+                .collect()
+        })
+    }
+}
+
+/// Protocol 8 and 9 (MIK-259): the node of 9 spot-checks the RDAP rows of
+/// the node of 8 as it does any member's, and the row it writes on a
+/// dispute reaches the node of 8 as an ordinary `ip_intel` row.
+#[tokio::test]
+async fn protocol_nine_spot_checks_the_rdap_rows_of_eight() {
+    use peephole::cluster::rpc::proto;
+    use peephole::intel::{check_pass, rdap_check};
+    let (ia, a) = new_node("node-nine");
+    let (ib, b) = new_node("node-eight");
+    let key = ia.derive_key(rdap_check::KEY_LABEL);
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let eight = Opts {
+        proto: Some((proto::PROTO_MIN, proto::MARKET_PROTO - 1)),
+        ..DEFAULT
+    };
+    let nb = boot(ib, &b, &[&a], eight).await;
+    let ip = (0..255u8)
+        .map(|i| format!("198.51.100.{i}"))
+        .find(|ip| rdap_check::designated(&key, ip))
+        .unwrap();
+    rec(&nb)
+        .record_lookup(&ip, "rdap", None, serde_json::json!({"country": "US"}))
+        .await
+        .unwrap();
+    let rdap_rows = "SELECT COUNT(*) FROM ip_intel WHERE provider = 'rdap'";
+    eventually("the row of 8 reaches 9", || async {
+        count(&na.node, rdap_rows).await == 1
+    })
+    .await;
+    let own = FixedRdap(serde_json::json!({"country": "DE"}));
+    let first = check_pass(&rec(&na), &own, &key, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(first.pending, 1, "{first:?}");
+    let second = check_pass(&rec(&na), &own, &key, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(second.disputed, 1, "{second:?}");
+    let counts = rdap_check::counts(&na.node.store.pool).await.unwrap();
+    assert_eq!(counts.get(b.id.0.as_slice()), Some(&(1, 1)));
+    eventually("the row of 9 reaches 8", || async {
+        count(&nb.node, rdap_rows).await == 2
+    })
+    .await;
+    // On 8 it is just another node's row: no check of its own runs there.
+    assert_eq!(count(&nb.node, "SELECT COUNT(*) FROM rdap_checks").await, 0);
+}
+
 /// Wall-clock milliseconds since the epoch.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()

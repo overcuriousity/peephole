@@ -156,6 +156,14 @@ impl Identity {
         Self::from_seed(seed)
     }
 
+    /// A secret of this node for one purpose (`label`), derived from its
+    /// key: nobody else can compute it.
+    pub fn derive_key(&self, label: &[u8]) -> [u8; 32] {
+        use aws_lc_rs::hmac;
+        let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &self.seed), label);
+        tag.as_ref().try_into().expect("HMAC-SHA256 is 32 bytes")
+    }
+
     pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
         self.pair.sign(msg).as_ref().to_vec()
     }

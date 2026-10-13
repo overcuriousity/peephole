@@ -5,6 +5,7 @@ pub mod geo;
 pub mod lookup;
 pub mod provider;
 pub mod rdap;
+pub mod rdap_check;
 pub mod rdns;
 pub mod share;
 pub mod shodan;
@@ -328,6 +329,14 @@ pub async fn enrich_loop(
             shutdown.clone(),
         ));
     }
+    if let (Some(node), Some(rdap)) = (rec.node(), providers.iter().find(|p| p.name() == RDAP)) {
+        tokio::spawn(check_loop(
+            rec.clone(),
+            rdap.clone(),
+            node.identity.derive_key(rdap_check::KEY_LABEL),
+            shutdown.clone(),
+        ));
+    }
     let mut shutdown = shutdown;
     loop {
         announce(&rec, &providers);
@@ -366,6 +375,153 @@ async fn provider_loop(
             Err(e) => warn!(provider = p.name(), ?e, "enrichment pass failed"),
         }
     }
+}
+
+/// How often the RDAP spot-check runs.
+const CHECK_TICK: Duration = Duration::from_secs(120);
+
+/// Spot-check other origins' RDAP rows until shutdown ([`check_pass`]).
+async fn check_loop(
+    rec: Recorder,
+    rdap: Arc<dyn provider::Provider>,
+    key: [u8; 32],
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(CHECK_TICK) => {}
+            _ = shutdown.changed() => break,
+        }
+        if !rdap.ready() {
+            continue;
+        }
+        match check_pass(&rec, rdap.as_ref(), &key, rdap_check::RECHECK_AFTER).await {
+            Ok(c) if c.disputed > 0 => {
+                warn!(
+                    ?c,
+                    "rdap spot-check: a member's registry answers differ from ours"
+                )
+            }
+            Ok(c) if c != Checked::default() => debug!(?c, "rdap spot-check"),
+            Ok(_) => {}
+            Err(e) => warn!(?e, "rdap spot-check failed"),
+        }
+    }
+}
+
+/// What one [`check_pass`] did.
+#[derive(Debug, Default, PartialEq)]
+pub struct Checked {
+    /// Same tags as this node's own query.
+    pub agreed: usize,
+    /// Different once: asked again after [`rdap_check::RECHECK_AFTER`].
+    pub pending: usize,
+    /// Different twice: this node wrote its own row, a dispute counted.
+    pub disputed: usize,
+}
+
+/// One RDAP spot-check pass: up to [`rdap_check::CHECK_BATCH`] RDAP rows
+/// that another origin wrote in the last [`rdap_check::CHECK_WINDOW_DAYS`]
+/// days, are [`rdap_check::designated`] for this node and are not checked
+/// yet, asked again through `rdap` (the provider the enrichment uses, so
+/// the same rate limits apply). Same tags: checked. Different: asked once
+/// more after `recheck_after`; still different, this node records its own
+/// row and the origin gets a dispute (`rdap_checks`, local). A dispute is
+/// only counted: blocking a member stays the operator's decision.
+pub async fn check_pass(
+    rec: &Recorder,
+    rdap: &dyn provider::Provider,
+    me_key: &[u8; 32],
+    recheck_after: Duration,
+) -> anyhow::Result<Checked> {
+    let me = rec.node_id().map(|id| id.0.to_vec()).unwrap_or_default();
+    let pool = &rec.store().pool;
+    // First mismatches that waited long enough, then new rows.
+    let mut todo: Vec<(String, Vec<u8>, bool)> = sqlx::query_as::<_, (String, Vec<u8>)>(
+        "SELECT ip, origin FROM rdap_checks
+         WHERE agreed IS NULL AND checked_at <= datetime('now', ?)
+         ORDER BY checked_at LIMIT ?",
+    )
+    .bind(format!("-{} seconds", recheck_after.as_secs()))
+    .bind(rdap_check::CHECK_BATCH)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(ip, origin)| (ip, origin, true))
+    .collect();
+    let fresh: Vec<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT i.ip, i.origin FROM ip_intel i
+         WHERE i.provider = ? AND i.origin != ? AND length(i.origin) > 0
+           AND i.fetched_at >= datetime('now', ?)
+           AND NOT EXISTS (SELECT 1 FROM rdap_checks c WHERE c.ip = i.ip AND c.origin = i.origin
+                             AND (c.agreed IS NOT 1 OR c.checked_at >= i.fetched_at))
+         ORDER BY i.fetched_at DESC",
+    )
+    .bind(RDAP)
+    .bind(&me)
+    .bind(format!("-{} days", rdap_check::CHECK_WINDOW_DAYS))
+    .fetch_all(pool)
+    .await?;
+    let room = (rdap_check::CHECK_BATCH as usize).saturating_sub(todo.len());
+    todo.extend(
+        fresh
+            .into_iter()
+            .filter(|(ip, _)| rdap_check::designated(me_key, ip))
+            .take(room)
+            .map(|(ip, origin)| (ip, origin, false)),
+    );
+    let mut out = Checked::default();
+    for (ip, origin, second) in todo {
+        let theirs: Option<String> = sqlx::query_scalar(
+            "SELECT data_json FROM ip_intel WHERE ip = ? AND provider = ? AND origin = ?",
+        )
+        .bind(&ip)
+        .bind(RDAP)
+        .bind(&origin)
+        .fetch_optional(pool)
+        .await?;
+        let Some(theirs) = theirs else { continue };
+        // Not answered now: asked again next pass.
+        let Some(own) = rdap
+            .lookup(std::slice::from_ref(&ip))
+            .await
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        let as_map = |v: serde_json::Value| v.as_object().cloned().unwrap_or_default();
+        let theirs = as_map(serde_json::from_str(&theirs).unwrap_or_default());
+        let agreed = rdap::tags(&as_map(own.data.clone())) == rdap::tags(&theirs);
+        let state = match (agreed, second) {
+            (true, _) => {
+                out.agreed += 1;
+                Some(true)
+            }
+            (false, false) => {
+                out.pending += 1;
+                None
+            }
+            (false, true) => {
+                rec.record_lookup(&ip, RDAP, own.source_version.as_deref(), own.data)
+                    .await?;
+                out.disputed += 1;
+                Some(false)
+            }
+        };
+        sqlx::query(
+            "INSERT INTO rdap_checks (ip, origin, checked_at, agreed) VALUES (?, ?, ?, ?)
+             ON CONFLICT(ip, origin) DO UPDATE SET
+               checked_at = excluded.checked_at, agreed = excluded.agreed",
+        )
+        .bind(&ip)
+        .bind(&origin)
+        .bind(crate::store::data::now_ts())
+        .bind(state)
+        .execute(pool)
+        .await?;
+    }
+    Ok(out)
 }
 
 fn is_stale_at(value: Option<&str>) -> bool {
@@ -789,6 +945,142 @@ async fn run_cluster(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An RDAP provider that answers every IP with `data`.
+    struct FixedRdap(serde_json::Value);
+
+    impl provider::Provider for FixedRdap {
+        fn name(&self) -> &'static str {
+            RDAP
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn lookup<'a>(
+            &'a self,
+            ips: &'a [String],
+        ) -> futures::future::BoxFuture<'a, Vec<provider::Finding>> {
+            Box::pin(async move {
+                ips.iter()
+                    .map(|ip| provider::Finding {
+                        ip: ip.clone(),
+                        source_version: None,
+                        data: self.0.clone(),
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    /// A store holding one RDAP row of another origin, for an IP `key`
+    /// designates; returns the IP and that origin.
+    async fn peer_rdap_row(key: &[u8; 32], data: &str) -> (Store, String, Vec<u8>) {
+        use crate::cluster::record::{IpIntelRec, Record};
+        use crate::store::data::{Ctx, apply};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        std::mem::forget(dir);
+        let store = Store::connect(&path).await.unwrap();
+        let ip = (0..255u8)
+            .map(|i| format!("198.51.100.{i}"))
+            .find(|ip| rdap_check::designated(key, ip))
+            .expect("one of 255 is designated");
+        let peer = crate::cluster::identity::Identity::generate().unwrap().id;
+        let rec = Record::IpIntel(IpIntelRec {
+            build: String::new(),
+            ip: ip.clone(),
+            provider: RDAP.into(),
+            fetched_at: crate::store::data::now_ts(),
+            source_version: None,
+            data_json: data.into(),
+        });
+        let mut conn = store.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: Some(&peer),
+            hlc: crate::cluster::hlc::Hlc::new().now(),
+        };
+        apply(&mut conn, ctx, &rec).await.unwrap();
+        (store, ip, peer.0.to_vec())
+    }
+
+    async fn rdap_rows(store: &Store) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM ip_intel WHERE provider = 'rdap'")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_wrong_country_is_disputed_after_a_second_query() {
+        let key = [7u8; 32];
+        let (store, ip, peer) = peer_rdap_row(&key, r#"{"country":"US"}"#).await;
+        let rec = store.local();
+        let own = FixedRdap(serde_json::json!({"country": "DE"}));
+        let first = check_pass(&rec, &own, &key, Duration::ZERO).await.unwrap();
+        assert_eq!(first.pending, 1, "{first:?}");
+        assert_eq!(
+            rdap_rows(&store).await,
+            1,
+            "nothing written after one query"
+        );
+        // Not due again before the wait is over.
+        let early = check_pass(&rec, &own, &key, Duration::from_secs(600))
+            .await
+            .unwrap();
+        assert_eq!(early, Checked::default());
+        let second = check_pass(&rec, &own, &key, Duration::ZERO).await.unwrap();
+        assert_eq!(second.disputed, 1, "{second:?}");
+        assert_eq!(rdap_rows(&store).await, 2, "this node's own row");
+        let counts = rdap_check::counts(&store.pool).await.unwrap();
+        assert_eq!(counts.get(&peer), Some(&(1, 1)), "disputes[origin] = 1");
+        let own_row: String = sqlx::query_scalar(
+            "SELECT data_json FROM ip_intel WHERE ip = ? AND provider = 'rdap' AND origin = x''",
+        )
+        .bind(&ip)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert!(own_row.contains("DE"), "{own_row}");
+        // Checked for good: not asked again.
+        let again = check_pass(&rec, &own, &key, Duration::ZERO).await.unwrap();
+        assert_eq!(again, Checked::default());
+    }
+
+    #[tokio::test]
+    async fn matching_tags_are_checked_and_write_nothing() {
+        let key = [9u8; 32];
+        let (store, _ip, peer) = peer_rdap_row(&key, r#"{"country":"de","fresh":false}"#).await;
+        let rec = store.local();
+        // Other fields may differ: only the tags count.
+        let own = FixedRdap(serde_json::json!({"country": "DE", "name": "X"}));
+        let c = check_pass(&rec, &own, &key, Duration::ZERO).await.unwrap();
+        assert_eq!(c.agreed, 1, "{c:?}");
+        assert_eq!(rdap_rows(&store).await, 1);
+        let counts = rdap_check::counts(&store.pool).await.unwrap();
+        assert_eq!(counts.get(&peer), Some(&(1, 0)));
+        let again = check_pass(&rec, &own, &key, Duration::ZERO).await.unwrap();
+        assert_eq!(again, Checked::default(), "checked once per row");
+    }
+
+    #[tokio::test]
+    async fn rows_not_designated_are_not_checked() {
+        let key = [7u8; 32];
+        let (store, _ip, _peer) = peer_rdap_row(&key, r#"{"country":"US"}"#).await;
+        let other = (0u8..)
+            .map(|i| [i; 32])
+            .find(|k| {
+                (0..255u8)
+                    .map(|i| format!("198.51.100.{i}"))
+                    .find(|ip| rdap_check::designated(&key, ip))
+                    .is_some_and(|ip| !rdap_check::designated(k, &ip))
+            })
+            .unwrap();
+        let own = FixedRdap(serde_json::json!({"country": "DE"}));
+        let c = check_pass(&store.local(), &own, &other, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(c, Checked::default());
+    }
 
     #[test]
     fn a_removed_provider_is_unknown() {

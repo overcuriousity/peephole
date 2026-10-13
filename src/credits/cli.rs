@@ -12,7 +12,8 @@ pub const USAGE: &str = "usage: peephole credits [CONFIG]                     ba
        peephole credits log [--days N] [CONFIG]     pool shares, spent, sent, received
        peephole credits members [CONFIG]            every member's balance and standing
        peephole credits uptime [CONFIG]             each member's reported hours up, 7 days
-       peephole credits market [CONFIG]             per good: own ask and bid, sold, bought, refused over bid
+       peephole credits market [CONFIG]             per good: own ask and bid, sold, bought, refused over bid;
+                                                    per member: RDAP rows checked, disputed
        peephole credits send NODE AMOUNT [CONFIG]   NODE: name, fingerprint or key";
 
 fn config_path(arg: &str) -> bool {
@@ -160,6 +161,19 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             for line in market_lines(&super::price::market(&node, &book).await?) {
                 println!("{line}");
             }
+            let mut checks: Vec<(String, i64, i64)> =
+                crate::intel::rdap_check::counts(&node.store.pool)
+                    .await?
+                    .into_iter()
+                    .filter_map(|(origin, (c, d))| {
+                        let id = crate::cluster::identity::NodeId::from_slice(&origin).ok()?;
+                        Some((name(&id), c, d))
+                    })
+                    .collect();
+            checks.sort();
+            for line in rdap_lines(&checks) {
+                println!("{line}");
+            }
         }
         ["send", who, amount] => {
             let mc = super::parse_amount(amount)
@@ -171,6 +185,23 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
         _ => bail!("{USAGE}"),
     }
     Ok(())
+}
+
+/// `peephole credits market`, after the goods: per member, its RDAP rows
+/// this node spot-checked and the disputes among them (`intel::rdap_check`).
+/// A dispute blocks nobody: `peephole cluster block` stays the operator's.
+pub fn rdap_lines(rows: &[(String, i64, i64)]) -> Vec<String> {
+    let mut out = vec![format!(
+        "{:<24} {:>12} {:>13}",
+        "member", "rdap_checked", "rdap_disputes"
+    )];
+    for (name, checked, disputes) in rows {
+        out.push(format!("{name:<24} {checked:>12} {disputes:>13}"));
+    }
+    if rows.is_empty() {
+        out.push("no RDAP rows of other members checked yet".into());
+    }
+    out
 }
 
 /// `peephole credits market`: one row per traded good, then the goods
@@ -196,4 +227,20 @@ pub fn market_lines(rows: &[super::price::MarketRow]) -> Vec<String> {
         out.push(format!("{good:<18} not traded"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn market_lists_each_members_rdap_checks_and_disputes() {
+        let lines = rdap_lines(&[("node-a".into(), 12, 0), ("node-b".into(), 7, 2)]);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("rdap_checked") && lines[0].contains("rdap_disputes"));
+        let cols = |l: &str| l.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(cols(&lines[1]), ["node-a", "12", "0"]);
+        assert_eq!(cols(&lines[2]), ["node-b", "7", "2"]);
+        assert_eq!(rdap_lines(&[]).len(), 2, "says none were checked");
+    }
 }
