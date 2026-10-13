@@ -5100,6 +5100,14 @@ async fn market_known(on: &TestNode, of: NodeId) {
     .await;
 }
 
+/// Count `n`'s queued scan jobs into what it wants bought now, as its
+/// next credits tick would: its bid for a scan job rises from 0.
+async fn wants_scans(n: &TestNode) {
+    peephole::credits::jobs::announce_budget(&n.node)
+        .await
+        .unwrap();
+}
+
 /// Raise `n`'s price of `good` to at least `at_least` mc, noting demand
 /// far above its supply before each refresh; returns the price.
 async fn priced(n: &TestNode, good: &str, at_least: u32) -> u32 {
@@ -5158,6 +5166,7 @@ async fn a_funded_scan_job_pays_the_scanner_its_price() {
     let cost = peephole::credits::jobs::price_for(&na.node, &b.id).unwrap() as u64;
     assert!(cost > 1, "{cost}");
     enqueue(&na, "198.51.100.41", 2).await;
+    wants_scans(&na).await;
     eventually_for(
         Duration::from_secs(40),
         "scanned, and both hold the offer and the receipt",
@@ -5286,6 +5295,7 @@ async fn a_job_is_granted_at_zero_and_funded_once_the_price_rises() {
     })
     .await;
     enqueue(&na, "198.51.100.44", 2).await;
+    wants_scans(&na).await;
     eventually_for(Duration::from_secs(40), "scanned and charged", || async {
         let book = credits::book_fresh(&na.node).await.unwrap();
         book.ledger.offers.iter().any(|o| {
@@ -5297,10 +5307,39 @@ async fn a_job_is_granted_at_zero_and_funded_once_the_price_rises() {
     .await;
 }
 
-/// A scanner that announces more than the rule gives is paid the
-/// arbiter's reference price, capped at PRICE_TOLERANCE.
+/// Protocol 8 and 9 scanners side by side (MIK-251): a scanner of 8 that
+/// announces more than the rule gives is paid the arbiter's reference
+/// price, capped at PRICE_TOLERANCE; one of 9 is paid its ask as it
+/// stands, and claims only from the arbiter of 9.
 #[tokio::test]
-async fn an_inflated_scanner_price_is_paid_at_the_reference() {
+async fn an_inflated_scanner_price_is_capped_only_below_protocol_nine() {
+    use peephole::cluster::rpc::proto;
+    let eight = inflated_scanner(Some((proto::PROTO_MIN, proto::MARKET_PROTO - 1))).await;
+    assert_eq!(
+        eight.paid,
+        (eight.reference as f64 * peephole::credits::price::PRICE_TOLERANCE).floor() as u32
+    );
+    assert!(eight.paid < eight.sell);
+    let nine = inflated_scanner(None).await;
+    assert!(
+        nine.sell > nine.reference,
+        "{} {}",
+        nine.sell,
+        nine.reference
+    );
+    assert_eq!(nine.paid, nine.sell, "the ask, uncapped");
+}
+
+struct Inflated {
+    sell: u32,
+    reference: u32,
+    paid: u32,
+}
+
+/// A scanner announcing `proto` (None: this build's) claims far more
+/// than its arbiter's copy: what it sells at, the copy, and what the
+/// arbiter of protocol 9 pays it.
+async fn inflated_scanner(proto: Option<(u32, u32)>) -> Inflated {
     use peephole::credits::{self, price};
     let tools = tempfile::tempdir().unwrap();
     let (ia, a) = new_node("node-alpha");
@@ -5312,6 +5351,7 @@ async fn an_inflated_scanner_price_is_paid_at_the_reference() {
         &[&a],
         Opts {
             scanner: Some(fake_nmap_args(tools.path())),
+            proto,
             ..DEFAULT
         },
     )
@@ -5337,11 +5377,11 @@ async fn an_inflated_scanner_price_is_paid_at_the_reference() {
     })
     .await;
     let paid = credits::jobs::price_for(&na.node, &b.id).unwrap();
-    assert_eq!(
+    Inflated {
+        sell,
+        reference,
         paid,
-        (reference as f64 * price::PRICE_TOLERANCE).floor() as u32
-    );
-    assert!(paid < sell);
+    }
 }
 
 /// With two scanners asking, the arbiter grants to the cheaper one.
@@ -5383,6 +5423,7 @@ async fn the_cheaper_scanner_gets_the_job() {
     })
     .await;
     enqueue(&na, "198.51.100.42", 1).await;
+    wants_scans(&na).await;
     eventually_for(Duration::from_secs(40), "scanned", || async {
         count(&na, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 1
     })
@@ -5402,6 +5443,7 @@ async fn the_cheaper_scanner_gets_the_job() {
     })
     .await;
     enqueue(&na, "198.51.100.43", 1).await;
+    wants_scans(&na).await;
     eventually_for(Duration::from_secs(40), "scanned again", || async {
         count(&na, "SELECT COUNT(*) FROM scan_jobs WHERE status = 'done'").await == 2
     })
@@ -8076,11 +8118,16 @@ async fn offers_written_at_once_are_each_covered() {
     pay::make_offer(&na.node, b.id, lots[0].1 - 5)
         .await
         .unwrap();
+    // One scan job wanted: the whole hour's budget is its bid.
+    na.node.wants.lock().unwrap().set("scan", 1);
     // A round of handing out jobs reads its book now.
     let mut funding = jobs::Funding::default();
-    assert!(jobs::affordable(&na.node, &mut funding, 0, 4).await);
+    assert_eq!(
+        jobs::affordable(&na.node, &mut funding, &b.id, false, 0, 4).await,
+        jobs::Afford::Yes
+    );
     let seqs = futures::future::join_all((0..8).map(|_| pay::make_offer(&na.node, b.id, 3))).await;
-    let (job_seq, price) = jobs::fund(&na.node, &mut funding, b.id, "job-x", 0, 4)
+    let (job_seq, price) = jobs::fund(&na.node, &mut funding, b.id, "job-x", false, 0, 4)
         .await
         .unwrap();
     assert_eq!(price, 4);

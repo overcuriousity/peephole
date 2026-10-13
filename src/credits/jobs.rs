@@ -50,27 +50,53 @@ pub async fn hold_self(pool: &sqlx::SqlitePool, job_uid: &str, mc: u32) -> Resul
 
 /// What this node, as arbiter, would pay `scanner` for a job now: its own
 /// scanner its selling price (0 before the first refresh); another
-/// scanner what it announces, at most [`price::PRICE_TOLERANCE`] times
-/// this node's copy, or an announced 0 while there is no copy yet. None:
-/// not a scanner of the market, or a price that cannot be capped yet; it
-/// cannot be granted the job.
+/// scanner what it announces. Between two members of the free market
+/// (protocol 9, [`super::pay::trades_market`]) that is the ask as it
+/// stands: the buyer's bid decides ([`affordable`]). A scanner below 9
+/// is paid at most [`price::PRICE_TOLERANCE`] times this node's copy, or
+/// an announced 0 while there is no copy yet. None: not a scanner of the
+/// market, or a price that cannot be capped yet; it cannot be granted the
+/// job.
 pub fn price_for(node: &Node, scanner: &NodeId) -> Option<u32> {
     let table = node.price_table();
     if *scanner == node.id() {
         return price::own_scan_price(node, &table);
     }
     let k = node.status.known(scanner)?;
-    if !node
-        .members()
-        .get(scanner)
-        .is_some_and(|m| super::pay::sells_scans(m.proto_max))
-    {
+    let proto = node.members().get(scanner).map(|m| m.proto_max)?;
+    scan_offer(
+        node.proto.1,
+        proto,
+        k.hb.scan_price_mc,
+        table.reference(scanner),
+    )
+}
+
+/// [`price_for`] another scanner: this node announcing `my_proto`, the
+/// scanner `proto`, its `announced` price and this node's copy of it.
+pub fn scan_offer(
+    my_proto: u32,
+    proto: u32,
+    announced: Option<u32>,
+    reference: Option<u32>,
+) -> Option<u32> {
+    if !super::pay::sells_scans(proto) {
         return None;
     }
-    match table.reference(scanner) {
-        Some(r) => price::offer_price(k.hb.scan_price_mc, Some(r)),
-        None => k.hb.scan_price_mc.filter(|p| *p == 0),
+    if under_bid(my_proto, proto) {
+        return announced;
     }
+    match reference {
+        Some(r) => price::offer_price(announced, Some(r)),
+        None => announced.filter(|p| *p == 0),
+    }
+}
+
+/// Whether this node (announcing `my_proto`) buys a scan from a scanner
+/// announcing `proto` at the scanner's ask, bounded by its own bid instead
+/// of a cap on its copy of the price: both are in the free market.
+pub fn under_bid(my_proto: u32, proto: u32) -> bool {
+    super::pay::trades_market(my_proto) && super::pay::trades_market(proto)
 }
 
 /// The factor a bought (manual) job's level scales its funding price by:
@@ -99,23 +125,60 @@ pub struct Funding {
     committed: Mc,
     /// What this node's own running and done-today jobs hold, read once.
     self_mc: Option<Mc>,
+    /// This node's bid for a scan job ([`super::bid`]), read once.
+    bid: Option<Mc>,
 }
 
-/// Whether this round's book can fund a grant at `price` to a scanner
+/// Whether a round can fund a grant ([`affordable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Afford {
+    Yes,
+    /// Under the scanner's least price, or no budget for it.
+    No,
+    /// The scanner's ask is above this node's bid for a scan job: the
+    /// job waits for a lower ask or a higher bid.
+    OverBid {
+        bid: Mc,
+    },
+}
+
+/// Whether a grant at `price` to `scanner` is bounded by this node's bid
+/// rather than only by its balance: an automatic job (not `manual`, which
+/// an operator bought) for another scanner of the free market. Paying
+/// oneself moves nothing; a scanner below protocol 9 is capped instead
+/// ([`price_for`]).
+fn bid_bounds(node: &Node, scanner: &NodeId, manual: bool) -> bool {
+    !manual
+        && *scanner != node.id()
+        && node
+            .members()
+            .get(scanner)
+            .is_some_and(|m| under_bid(node.proto.1, m.proto_max))
+}
+
+/// Whether this round's book can fund a grant at `price` to `scanner`
 /// taking no less than `min_mc`: a price of 0 always (it needs no book).
-/// Reads the book and the own-job tally into `funding` the first time;
-/// writes nothing.
-pub async fn affordable(node: &Arc<Node>, funding: &mut Funding, min_mc: u32, price: u32) -> bool {
+/// An automatic job for a scanner of the free market also needs `price`
+/// at most this node's bid ([`bid_bounds`]). Reads the book, the own-job
+/// tally and the bid into `funding` the first time; writes nothing.
+pub async fn affordable(
+    node: &Arc<Node>,
+    funding: &mut Funding,
+    scanner: &NodeId,
+    manual: bool,
+    min_mc: u32,
+    price: u32,
+) -> Afford {
     if price < min_mc {
-        return false;
+        return Afford::No;
     }
     if price == 0 {
-        return true;
+        return Afford::Yes;
     }
     let me = node.id();
     if funding.book.is_none() {
         let Ok(b) = super::book_fresh(node).await else {
-            return false;
+            return Afford::No;
         };
         funding.book = Some(b);
     }
@@ -123,31 +186,49 @@ pub async fn affordable(node: &Arc<Node>, funding: &mut Funding, min_mc: u32, pr
         Some(s) => s,
         None => {
             let Ok(s) = self_committed(&node.store.pool, &me).await else {
-                return false;
+                return Afford::No;
             };
             funding.self_mc = Some(s);
             s
         }
     };
     let Some(book) = &funding.book else {
-        return false;
+        return Afford::No;
     };
     let left = budget(&book.ledger, &me, self_mc).saturating_sub(funding.committed);
-    left >= price as Mc
+    if left < price as Mc {
+        return Afford::No;
+    }
+    if bid_bounds(node, scanner, manual) {
+        let bid = match funding.bid {
+            Some(b) => b,
+            None => {
+                let b = price::own_bid_in(node, book, price::SCAN).await;
+                funding.bid = Some(b);
+                b
+            }
+        };
+        if price as Mc > bid {
+            return Afford::OverBid { bid };
+        }
+    }
+    Afford::Yes
 }
 
 /// Fund the grant of `job_uid` to `scanner` at `price` (see [`price_for`]):
 /// `Some((Some(seq), price))` once the offer is written, `Some((None,
 /// price))` for an own job, which the self tally holds against the budget,
 /// and `Some((None, 0))` at a zero price: granted free, without an offer.
-/// None: a price under `min_mc`, no budget, or the offer could not be
-/// written; the job is not granted. `funding` carries the book and what
-/// was committed across the grants of one round.
+/// None: a price under `min_mc`, no budget, above the bid
+/// ([`affordable`]), or the offer could not be written; the job is not
+/// granted. `funding` carries the book and what was committed across the
+/// grants of one round.
 pub async fn fund(
     node: &Arc<Node>,
     funding: &mut Funding,
     scanner: NodeId,
     job_uid: &str,
+    manual: bool,
     min_mc: u32,
     price: u32,
 ) -> Option<(Option<u64>, u32)> {
@@ -164,7 +245,7 @@ pub async fn fund(
     if price == 0 {
         return Some((None, 0));
     }
-    if !affordable(node, funding, min_mc, price).await {
+    if affordable(node, funding, &scanner, manual, min_mc, price).await != Afford::Yes {
         return None;
     }
     if scanner == me {
@@ -254,14 +335,28 @@ pub async fn settle(node: &Arc<Node>, arbiter: NodeId, offer_seq: u64, charged_m
 }
 
 /// Compute and keep this node's scan budget left and queued jobs, for
-/// the heartbeat.
+/// the heartbeat; and the scan jobs it wants bought in the coming hour,
+/// for its bid ([`scan_wants`]).
 pub async fn announce_budget(node: &Arc<Node>) -> Result<()> {
-    let queued: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scan_jobs WHERE status = 'queued' AND arbiter = ?",
+    let (queued, grantable): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*),
+                COALESCE(SUM(NOT manual AND (retry_at IS NULL OR retry_at <= datetime('now'))), 0)
+         FROM scan_jobs WHERE status = 'queued' AND arbiter = ?",
     )
     .bind(&node.id().0[..])
     .fetch_one(&node.store.pool)
     .await?;
+    let can_do: f64 = node
+        .price_table()
+        .capacity
+        .scanners
+        .iter()
+        .map(|s| s.can_do)
+        .sum();
+    node.wants
+        .lock()
+        .unwrap()
+        .set(price::SCAN, scan_wants(grantable.max(0) as u64, can_do));
     let book = super::book(node).await?;
     let self_mc = self_committed(&node.store.pool, &node.id()).await?;
     let left = budget(&book.ledger, &node.id(), self_mc);
@@ -276,12 +371,62 @@ pub async fn announce_budget(node: &Arc<Node>) -> Result<()> {
     Ok(())
 }
 
+/// The scan jobs this node wants bought in the coming hour: its
+/// `grantable` queued jobs (automatic and due; an operator's bought job
+/// is no part of the bid), at most what the scanners `can_do` in an hour
+/// together, when that is known.
+pub fn scan_wants(grantable: u64, can_do: f64) -> u32 {
+    let units = match can_do > 0.0 {
+        true => grantable.min(can_do.ceil() as u64),
+        false => grantable,
+    };
+    units.min(u32::MAX as u64) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::credits::DAY_MS;
     use crate::credits::entries::{Entry, Kind, SealState};
     use crate::credits::ledger::{Earned, run};
+
+    #[test]
+    fn a_v9_arbiter_pays_a_v9_scanner_its_ask_and_caps_older_ones() {
+        // Copy 100, ask 200.
+        assert_eq!(scan_offer(9, 9, Some(200), Some(100)), Some(200));
+        assert_eq!(
+            scan_offer(9, 9, Some(200), None),
+            Some(200),
+            "no copy needed"
+        );
+        assert_eq!(scan_offer(9, 8, Some(200), Some(100)), Some(125));
+        assert_eq!(
+            scan_offer(8, 9, Some(200), Some(100)),
+            Some(125),
+            "below 9 here"
+        );
+        assert_eq!(scan_offer(9, 8, Some(200), None), None, "no copy to cap by");
+        assert_eq!(scan_offer(9, 8, Some(0), None), Some(0));
+        assert_eq!(
+            scan_offer(9, 6, Some(200), Some(100)),
+            None,
+            "sells no scans"
+        );
+        assert_eq!(
+            scan_offer(9, 9, None, Some(100)),
+            None,
+            "announces no price"
+        );
+    }
+
+    #[test]
+    fn the_scan_jobs_wanted_are_the_grantable_ones_an_hour_can_take() {
+        assert_eq!(scan_wants(0, 40.0), 0);
+        assert_eq!(scan_wants(12, 40.0), 12);
+        assert_eq!(scan_wants(500, 40.0), 40, "what the scanners do in an hour");
+        assert_eq!(scan_wants(500, 0.5), 1);
+        assert_eq!(scan_wants(500, 0.0), 500, "capacity unknown");
+    }
 
     #[test]
     fn the_level_factor_is_four_to_the_level_minus_one() {
@@ -471,22 +616,28 @@ mod tests {
         .unwrap();
         node.bootstrap().await.unwrap();
         let mut f = Funding::default();
-        assert!(
-            affordable(&node, &mut f, 0, 0).await,
-            "free, even with no credits"
-        );
-        assert!(!affordable(&node, &mut f, 0, 1).await, "no credits");
-        assert!(
-            !affordable(&node, &mut f, 5, 0).await,
-            "under the scanner's least"
-        );
         let other = crate::cluster::identity::Identity::generate().unwrap().id;
         assert_eq!(
-            fund(&node, &mut f, other, "job-1", 0, 0).await,
+            affordable(&node, &mut f, &other, false, 0, 0).await,
+            Afford::Yes,
+            "free, even with no credits"
+        );
+        assert_eq!(
+            affordable(&node, &mut f, &other, false, 0, 1).await,
+            Afford::No,
+            "no credits"
+        );
+        assert_eq!(
+            affordable(&node, &mut f, &other, false, 5, 0).await,
+            Afford::No,
+            "under the scanner's least"
+        );
+        assert_eq!(
+            fund(&node, &mut f, other, "job-1", false, 0, 0).await,
             Some((None, 0))
         );
         assert_eq!(
-            fund(&node, &mut f, node.id(), "job-2", 0, 0).await,
+            fund(&node, &mut f, node.id(), "job-2", false, 0, 0).await,
             Some((None, 0))
         );
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credit_entries")

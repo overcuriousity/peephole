@@ -59,7 +59,9 @@ pub const LOWER_PER_HOUR: f64 = 0.15;
 /// Reverse names of a source looked up for another member (`intel::rdns`).
 pub const RDNS: &str = "rdns";
 
-/// One step of a price `hours` after the last: up when the good sold in
+/// One step of a price `hours` after the last, by the local default
+/// every node ships with (protocol 9 lets each node ask what it likes;
+/// no peer checks this rule): up when the good sold in
 /// that period (or is at capacity), down when it sold nothing. A period
 /// shorter than an hour takes that share of the hour's step, a longer one
 /// a full step. The price moves by at least 1 mc, which is what lifts a
@@ -81,8 +83,9 @@ pub fn sales_step(price: Mc, raise: bool, hours: f64) -> Mc {
     }
 }
 
-/// Where a good's price starts here: the lower median of what members
-/// announce for it, free ones included; 0 when nobody does.
+/// Where a good's price starts here, by the local default: the lower
+/// median of what members announce for it, free ones included; 0 when
+/// nobody does.
 pub fn start(announced: &[u32]) -> Mc {
     let mut v = announced.to_vec();
     if v.is_empty() {
@@ -583,9 +586,7 @@ async fn keep_market(node: &Node, bids: &HashMap<&str, Mc>) -> Result<()> {
 /// This node's bid for each of [`MARKET_GOODS`] in the coming hour, from
 /// its own lots in `book` and what its buyer loops want.
 async fn own_bids(node: &Node, book: &super::Book) -> HashMap<&'static str, Mc> {
-    let me = node.id();
-    let lots = node.spending.lock().await.lots(book, &me);
-    let budget = super::bid::hourly_budget(&lots, book.ledger.today, book.now_ms);
+    let budget = hourly_budget(node, book).await;
     let wants = node.wants.lock().unwrap().clone();
     MARKET_GOODS
         .iter()
@@ -599,6 +600,22 @@ async fn own_bids(node: &Node, book: &super::Book) -> HashMap<&'static str, Mc> 
 pub async fn own_bid(node: &Node, good: &str) -> Result<Mc> {
     let book = super::book(node).await?;
     Ok(own_bids(node, &book).await.get(good).copied().unwrap_or(0))
+}
+
+/// [`own_bid`] from `book` (the one a round of grants reads): this
+/// node's bid for one unit of `good` in the coming hour, from its own
+/// lots and what its buyer loops want. Nothing a peer says enters it.
+pub async fn own_bid_in(node: &Node, book: &super::Book, good: &str) -> Mc {
+    let budget = hourly_budget(node, book).await;
+    let wants = node.wants.lock().unwrap().clone();
+    super::bid::bid(budget, &wants, good)
+}
+
+/// What this node can spend in the coming hour from its own lots in `book`.
+async fn hourly_budget(node: &Node, book: &super::Book) -> Mc {
+    let me = node.id();
+    let lots = node.spending.lock().await.lots(book, &me);
+    super::bid::hourly_budget(&lots, book.ledger.today, book.now_ms)
 }
 
 /// Where `good`'s next step starts: the last price here (of a table a
@@ -765,7 +782,9 @@ pub async fn load_kept(node: &Node) -> Result<()> {
 }
 
 /// Step this node's prices from the demand it counted and the supply it
-/// has, keep them, and announce them with the next heartbeat.
+/// has, keep them, and announce them with the next heartbeat. These asks
+/// are the local default ([`sales_step`] from [`start`]): from protocol
+/// 9 no peer caps them, and a buyer takes them only up to its own bid.
 pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let book = super::book_fresh(node).await?;
     let left_out: HashSet<NodeId> = book
