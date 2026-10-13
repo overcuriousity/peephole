@@ -239,6 +239,12 @@ impl Store {
         .await?)
     }
 
+    /// Which RDAP answer the IP page shows (`data::pick_rdap`).
+    pub async fn rdap_pick(&self, ip: &str) -> Result<Option<super::data::RdapPick>> {
+        let mut conn = self.read.acquire().await?;
+        super::data::rdap_pick(&mut conn, ip).await
+    }
+
     /// Provider tags present on any IP, most common first (admin filter).
     pub async fn intel_tags(&self) -> Result<Vec<String>> {
         Ok(sqlx::query_scalar(

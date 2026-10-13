@@ -407,6 +407,13 @@ impl Node {
             unserved: Default::default(),
             own_acked: Default::default(),
         });
+        // Readers tell this node's rows from the others' by it (RDAP).
+        node.store
+            .intel_set(
+                crate::store::data::SELF_ORIGIN_KEY,
+                &data_encoding::HEXUPPER.encode(&node.id().0),
+            )
+            .await?;
         // Our clock must not run behind anything already in the log, and
         // never behind our own entries: peers ignore an entry of ours that
         // is not later than the one before (see `repl`), also after the

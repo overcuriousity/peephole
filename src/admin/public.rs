@@ -734,6 +734,9 @@ pub struct IntelCard {
     pub name: String,
     pub newest: Option<IntelResult>,
     pub others: Vec<IntelResult>,
+    /// RDAP only: the nodes' answers, when they differ and none is chosen
+    /// ([`apply_rdap_pick`]); shown instead of `newest`.
+    pub disputed: Vec<IntelResult>,
 }
 
 fn fact(label: &str, value: impl Into<String>, mono: bool) -> IntelFact {
@@ -978,9 +981,45 @@ pub fn intel_cards(rows: Vec<IpIntelRow>, admin: bool) -> Vec<IntelCard> {
                 name,
                 newest,
                 others,
+                disputed: vec![],
             }
         })
         .collect()
+}
+
+/// The RDAP card as `data::pick_rdap` decides when the nodes' answers
+/// differ: the chosen answer first, or every answer marked disputed.
+pub fn apply_rdap_pick(cards: &mut [IntelCard], pick: Option<crate::store::data::RdapPick>) {
+    use crate::store::data::RdapPick;
+    let Some(card) = cards.iter_mut().find(|c| c.name == crate::intel::RDAP) else {
+        return;
+    };
+    let result = |a: crate::store::data::RdapAnswer| IntelResult {
+        facts: intel_facts(crate::intel::RDAP, &serde_json::Value::Object(a.data)),
+        fetched_at: a.fetched_at,
+        source_version: None,
+        node: a.node,
+    };
+    let same = |r: &IntelResult, a: &crate::store::data::RdapAnswer| {
+        r.fetched_at == a.fetched_at && r.node == a.node
+    };
+    match pick {
+        Some(RdapPick::Chosen(a)) => {
+            if card.newest.as_ref().is_some_and(|n| same(n, &a)) {
+                return;
+            }
+            let at = card.others.iter().position(|r| same(r, &a));
+            let chosen = match at {
+                Some(i) => card.others.remove(i),
+                None => result(a),
+            };
+            if let Some(old) = card.newest.replace(chosen) {
+                card.others.insert(0, old);
+            }
+        }
+        Some(RdapPick::Disputed(all)) => card.disputed = all.into_iter().map(result).collect(),
+        None => {}
+    }
 }
 
 /// Admin-only sections of the IP page. Loaded only with a session.
