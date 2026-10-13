@@ -39,6 +39,13 @@ pub fn pays_with(proto_max: u32) -> bool {
     proto_max >= crate::cluster::rpc::proto::ECONOMY_PROTO
 }
 
+/// Whether a member announcing `proto_max` trades in the free market: it
+/// sets its own asks and its automatic buyers pay at most their bid
+/// (`credits::bid`).
+pub fn trades_market(proto_max: u32) -> bool {
+    proto_max >= crate::cluster::rpc::proto::MARKET_PROTO
+}
+
 /// A node that could answer for a provider, and what it asks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Quote {
@@ -974,6 +981,14 @@ mod tests {
         };
         assert!(!pays_with(6) && !sells_scans(6));
         assert!(pays_with(7) && sells_scans(7));
+    }
+
+    #[test]
+    fn only_protocol_nine_trades_in_the_market() {
+        assert!(!trades_market(8));
+        assert!(trades_market(9));
+        // A member of protocol 8 is still paid and charged as before.
+        assert!(pays_with(8) && sells_scans(8));
     }
 
     #[test]
