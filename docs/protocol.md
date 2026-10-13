@@ -238,8 +238,11 @@ bought over the last 7 days, and how many asks above its bid it refused
 (`over bid`). RDAP is not traded by automatic buyers: the able nodes
 fetch it in turns and share the answer.
 
-- **Ask (seller, local).** The default ask follows sales, one rule for
-  every good, on each node every 10 minutes: a good that sold since the
+- **Ask (seller, local).** Each node's asks are its own; what follows
+  is the local default every node ships with, not a rule peers enforce.
+  A good's first ask is the lower median of what members announce for
+  it. The default then follows sales, one rule for every good, on each
+  node every 10 minutes: a good that sold since the
   last refresh (or whose every slot is taken) gets dearer by at most a
   factor of e^0.45 an hour; one that sold nothing gets cheaper by e^-0.15
   an hour; each step is scaled by the time since the last (so a 10-minute
@@ -260,6 +263,15 @@ fetch it in turns and share the answer.
   a higher price is offered again only up to the bid, never above it.
   Lookups an operator asks for by hand (the Lookup page, `/api/v1`) are
   not bound by the bid: the operator is the buyer.
+- **Scan jobs in the market.** An arbiter of protocol 9 pays a scanner of
+  9 its announced ask as it stands, with no cap, and grants it an
+  automatic job only when that ask is at most its scan bid; otherwise the
+  job waits and the refusal is counted. The scan jobs it wants in an hour
+  are its queued automatic jobs that are due, at most what the scanners
+  it counts can do in an hour together. A job an operator bought (Scan
+  page) is not bound by the bid. A scanner of 9 claims jobs only from
+  arbiters of 9 (and its own node) and takes no less than its ask, so no
+  arbiter below 9 caps it.
 - **What stays.** The currency (the daily pool of 1000 credits, 7-day
   lots), the offer, receipt and payment flow on the wire, audits and their
   payment rules, and the quorums for domains and reverse names are the
