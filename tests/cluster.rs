@@ -2515,7 +2515,8 @@ async fn a_tiny_or_stale_tor_list_is_not_copied_from_a_peer() {
 }
 
 /// A node without the databases gets GeoIP facts from one that has them;
-/// the database itself does not travel.
+/// the database itself does not travel. Protocol 9: the recorder buys them,
+/// the holder does not give a market member's source away.
 #[tokio::test]
 async fn geo_results_come_from_a_node_that_has_the_database() {
     use peephole::intel::provider::MaxMind;
@@ -2550,9 +2551,36 @@ async fn geo_results_come_from_a_node_that_has_the_database() {
         peephole::intel::enrich_once(&rec(&na), &providers)
             .await
             .unwrap(),
+        0,
+        "b's source is b's to buy"
+    );
+    na.node
+        .set_providers(vec![peephole::intel::MAXMIND.to_string()]);
+    na.node.set_lookup_providers(providers.clone());
+    na.node
+        .set_lookup_shares(peephole::credits::share::Shares::new(
+            na.store.clone(),
+            0.2,
+            1000,
+        ));
+    fund_listeners(&[&na, &nb], &[a.id, b.id]).await;
+    market_known(&na, b.id).await;
+    market_known(&nb, a.id).await;
+    nb.node
+        .wants
+        .lock()
+        .unwrap()
+        .set(peephole::intel::MAXMIND, 1);
+    let bid = peephole::credits::price::own_bid(&nb.node, peephole::intel::MAXMIND)
+        .await
+        .unwrap();
+    provider_asks(&na, &nb, peephole::intel::MAXMIND, (bid * 4 / 5) as u32).await;
+    assert_eq!(
+        peephole::intel::buy_pass(&nb.node, &nothing, 30.0, &mut Default::default())
+            .await
+            .unwrap(),
         1
     );
-    assert_eq!(na.providers(), [peephole::intel::MAXMIND]);
     eventually("b shows the country", || async {
         sqlx::query_scalar::<_, Option<String>>("SELECT country FROM ips")
             .fetch_one(&nb.store.pool)
