@@ -5,6 +5,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Changed
+
+- A node's scan jobs may hold or pay for its whole balance; the daily
+  share is gone. `[credits] scan_share` still loads, does nothing, and is
+  reported as an obsolete key.
+
 ## [0.13.0] - 2026-10-13
 
 ### Added
