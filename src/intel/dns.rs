@@ -425,6 +425,18 @@ pub fn choose(
     geo: &SharedGeo,
     good: &str,
 ) -> Vec<Resolver> {
+    choose_where(node, siblings, geo, good, |_| true)
+}
+
+/// [`choose`] among the members `keep` lets through only: the quorum is a
+/// majority of those.
+fn choose_where(
+    node: &Node,
+    siblings: &HashSet<NodeId>,
+    geo: &SharedGeo,
+    good: &str,
+    keep: impl Fn(&NodeId) -> bool,
+) -> Vec<Resolver> {
     use rand::seq::SliceRandom;
     let me = node.id();
     let resolver = |id: NodeId| {
@@ -439,7 +451,7 @@ pub fn choose(
     let mut others: Vec<NodeId> = node
         .live_members(crate::intel::LIVE_WINDOW)
         .into_iter()
-        .filter(|id| *id != me && !node.is_blocked(id) && node.can_call(id))
+        .filter(|id| *id != me && !node.is_blocked(id) && node.can_call(id) && keep(id))
         .collect();
     // Equal prices in random order, so no member is preferred.
     others.shuffle(&mut rand::rng());
@@ -550,6 +562,18 @@ pub fn tally(answers: &[(NodeId, Result<Vec<IpAddr>, String>)]) -> Tally {
     t
 }
 
+/// How a lookup pays the other resolvers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Buy {
+    /// An operator asked (admin, `/api/v1`): every priced member, a
+    /// refusal offered again up to `retry_price`'s bound. The human is the
+    /// bid.
+    Manual,
+    /// An automatic buyer: members of protocol 9 only, each at an ask up
+    /// to this bid (mc, from this node's own book), never above it.
+    Within(u64),
+}
+
 /// Ask the chosen resolvers (RPC `/rpc/v1/resolve`), build the record,
 /// write it (cluster: replicated; standalone: local), return the tally.
 /// Nothing is written when no resolver answered.
@@ -558,14 +582,19 @@ pub async fn lookup(
     geo: &SharedGeo,
     name: &str,
 ) -> Result<(Tally, Option<IpNameRec>), String> {
-    lookup_with(rec, geo, name, async |n: &str| resolve_here(n).await).await
+    lookup_with(rec, geo, name, Buy::Manual, async |n: &str| {
+        resolve_here(n).await
+    })
+    .await
 }
 
-/// [`lookup`], with `resolve` standing in for this node's resolver.
+/// [`lookup`], paying as `buy` says, with `resolve` standing in for this
+/// node's resolver.
 pub async fn lookup_with(
     rec: &Recorder,
     geo: &SharedGeo,
     name: &str,
+    buy: Buy,
     resolve: impl AsyncFn(&str) -> Result<Vec<IpAddr>, String>,
 ) -> Result<(Tally, Option<IpNameRec>), String> {
     let name = valid_name(name).ok_or("not a host name")?;
@@ -586,11 +615,18 @@ pub async fn lookup_with(
                 .into_iter()
                 .collect();
             let me = node.id();
+            let keep = |id: &NodeId| match buy {
+                Buy::Manual => true,
+                Buy::Within(_) => node
+                    .members()
+                    .get(id)
+                    .is_some_and(|m| crate::credits::pay::trades_market(m.proto_max)),
+            };
             let remote = futures::future::join_all(
-                choose(node, &siblings, geo, crate::credits::price::RESOLVE)
+                choose_where(node, &siblings, geo, crate::credits::price::RESOLVE, keep)
                     .into_iter()
                     .filter(|r| r.id != me)
-                    .map(|r| ask(node, r.id, &name)),
+                    .map(|r| ask(node, r.id, &name, buy)),
             );
             let (own, mut remote) = futures::join!(resolve(&name), remote);
             remote.insert(0, (me, own));
@@ -614,17 +650,53 @@ pub async fn lookup_with(
     Ok((t, Some(r)))
 }
 
+/// An ask of `ask` mc for `good` above this node's `bid`: not bought,
+/// and counted.
+fn above_bid(node: &Node, good: &str, ask: u64, bid: u64) -> String {
+    use crate::credits::show;
+    node.market.over_bid(good);
+    tracing::info!(good, ask, bid, "market: ask above bid, not bought");
+    format!(
+        "asks {} credits, above this node's bid of {}",
+        show(ask),
+        show(bid)
+    )
+}
+
 /// One member's answer: asked without an offer at a zero price, with one
-/// otherwise; a decline naming a higher price is offered that once.
-async fn ask(node: &Arc<Node>, id: NodeId, name: &str) -> (NodeId, Result<Vec<IpAddr>, String>) {
+/// otherwise; a decline naming a higher price is offered that once. An
+/// automatic buyer (`Buy::Within`) neither asks nor offers again above
+/// its bid.
+async fn ask(
+    node: &Arc<Node>,
+    id: NodeId,
+    name: &str,
+    buy: Buy,
+) -> (NodeId, Result<Vec<IpAddr>, String>) {
+    use crate::credits::{pay, price::RESOLVE};
     let Some(price) = resolver_price(node, &id) else {
         return (id, Err("announces no price for resolving".into()));
     };
-    let mut resp = ask_once(node, id, name, price as u64).await;
-    if let Ok(r) = &resp
-        && r.error.is_some()
-        && let Some(p) = crate::credits::pay::retry_price(price as u64, r.price_mc, true)
+    let price = price as u64;
+    if let Buy::Within(bid) = buy
+        && price > bid
     {
+        return (id, Err(above_bid(node, RESOLVE, price, bid)));
+    }
+    let mut resp = ask_once(node, id, name, price).await;
+    let retry = match (&resp, buy) {
+        (Ok(r), _) if r.error.is_none() => None,
+        (Err(_), _) => None,
+        (Ok(r), Buy::Manual) => pay::retry_price(price, r.price_mc, true),
+        (Ok(r), Buy::Within(bid)) => match r.price_mc.map(u64::from) {
+            Some(named) if named > bid => {
+                above_bid(node, RESOLVE, named, bid);
+                None
+            }
+            _ => pay::retry_within(price, r.price_mc, true, bid),
+        },
+    };
+    if let Some(p) = retry {
         // A declined offer comes with a receipt of nothing: fetch it, so
         // what the first offer held is free for the next one.
         if price > 0
@@ -640,6 +712,82 @@ async fn ask(node: &Arc<Node>, id: NodeId, name: &str) -> (NodeId, Result<Vec<Ip
         Ok(ResolveResp { addrs, .. }) => Ok(addrs),
     };
     (id, answer)
+}
+
+/// A name on this node's own sources is re-resolved once its last
+/// confirmation is this many days old.
+pub const REFRESH_DAYS: u32 = 7;
+
+/// Re-resolve the names on this node's own sources that are due
+/// ([`REFRESH_DAYS`]), a batch at a time, from itself and the resolve
+/// quorum of the members of protocol 9, each at an ask up to this node's
+/// bid for resolving (`credits::bid`, from its own book). It wants the
+/// names due, at most what it can do in an hour, paced as the
+/// reverse-name buyer (`intel::rdns`). Each name waits again, whatever
+/// was found. Returns how many names were handled.
+pub async fn refresh_pass(node: &Arc<Node>, geo: &SharedGeo) -> anyhow::Result<usize> {
+    use crate::credits::price;
+    use crate::intel::rdns::{BATCH, WANTED_AT_MOST};
+    let me = node.id();
+    let mut due = node
+        .store
+        .names_due_refresh(WANTED_AT_MOST, &me, REFRESH_DAYS)
+        .await?;
+    node.wants
+        .lock()
+        .unwrap()
+        .set(price::RESOLVE, due.len() as u32);
+    due.truncate(BATCH as usize);
+    let n = due.len();
+    let bid = match n {
+        0 => 0,
+        _ => price::own_bid(node, price::RESOLVE)
+            .await
+            .inspect_err(|e| tracing::debug!(?e, "resolve refresh: no bid, buys only what is free"))
+            .unwrap_or(0),
+    };
+    let rec = Recorder::Cluster(node.clone());
+    for name in due {
+        let found = lookup_with(&rec, geo, &name, Buy::Within(bid), async |n: &str| {
+            resolve_here(n).await
+        })
+        .await;
+        if let Err(e) = found {
+            tracing::debug!(%name, error = %e, "resolve refresh: not confirmed");
+        }
+        node.store.mark_name_refreshed(&name).await?;
+    }
+    Ok(n)
+}
+
+/// [`refresh_pass`] until shutdown, at the reverse-name buyer's pacing.
+pub async fn refresh_run(
+    node: Arc<Node>,
+    geo: SharedGeo,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use crate::intel::rdns::{AGAIN, BATCH, EVERY};
+    loop {
+        let wait = match refresh_pass(&node, &geo).await {
+            Ok(n) if n as i64 == BATCH => AGAIN,
+            Ok(0) => EVERY,
+            Ok(n) => {
+                tracing::debug!(names = n, "resolve refresh: re-resolved");
+                EVERY
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "resolve refresh: pass failed");
+                EVERY
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            r = shutdown.changed() => if r.is_err() { return },
+        }
+        if *shutdown.borrow() {
+            return;
+        }
+    }
 }
 
 /// One request to `id`, with an offer of `price` unless it is 0.

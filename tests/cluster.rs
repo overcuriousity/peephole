@@ -7677,6 +7677,164 @@ async fn reverse_names_trade_between_protocol_eight_and_nine() {
     assert_eq!(resp.charged_mc, 5);
 }
 
+/// `n` asks `mc` for resolving a name, and `on` heard it.
+async fn resolve_asks(n: &TestNode, on: &TestNode, mc: u32) {
+    use peephole::credits::price;
+    n.node.set_price_table(std::sync::Arc::new(price::Table {
+        resolve_mc: mc,
+        ..Default::default()
+    }));
+    n.node.refresh_heartbeat();
+    let id = n.node.id();
+    eventually("the ask is heard", || async {
+        peephole::intel::dns::resolver_price(&on.node, &id) == Some(mc)
+    })
+    .await;
+}
+
+/// `n`'s resolve bid for one wanted name, as its refresh computes it.
+async fn resolve_bid_for_one(n: &TestNode) -> u64 {
+    use peephole::credits::price;
+    n.node.wants.lock().unwrap().set(price::RESOLVE, 1);
+    let bid = price::own_bid(&n.node, price::RESOLVE).await.unwrap();
+    assert!(bid > 1, "a funded node bids: {bid}");
+    bid
+}
+
+/// `name` on `n`'s own source `ip`, last confirmed `days` ago. The
+/// system resolver reads "1.0x<n>" as the address 1.0.0.<n> (inet_aton),
+/// with no DNS: an answer on every host.
+async fn old_name(n: &TestNode, ip: &str, name: &str, days: u32) {
+    record(n, ip, "/x").await;
+    sqlx::query(
+        "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen, agreed)
+         SELECT id, ?2, 'rdns', datetime('now', ?3), datetime('now', ?3), 1
+         FROM ips WHERE ip = ?1",
+    )
+    .bind(ip)
+    .bind(name)
+    .bind(format!("-{days} days"))
+    .execute(&n.store.pool)
+    .await
+    .unwrap();
+}
+
+/// The forward lookups of `name` that `votes` resolvers agreed on.
+fn confirmed_by(name: &str, votes: u32) -> String {
+    format!(
+        "SELECT COUNT(*) FROM ip_names
+         WHERE name = '{name}' AND source = 'dns' AND agreed = 1 AND votes = {votes}"
+    )
+}
+
+/// The resolve refresh re-confirms a week-old name on an own source by
+/// the quorum, paying at most its own bid: an ask above it is not offered
+/// and counted as over bid; one below it is bought and the majority's
+/// answer stands.
+#[tokio::test]
+async fn the_resolve_refresh_reconfirms_old_names_within_its_bid() {
+    use peephole::credits::{self, price};
+    use peephole::intel::dns;
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    fund_listeners(&[&na, &nb], &[a.id, b.id]).await;
+    market_known(&na, b.id).await;
+    let bid = resolve_bid_for_one(&na).await;
+    let geo: peephole::intel::SharedGeo = Default::default();
+
+    resolve_asks(&nb, &na, (bid * 74) as u32).await;
+    old_name(&na, "198.51.100.95", "1.0x1", 10).await;
+    let offers = count(&na, OFFERS).await;
+    assert_eq!(dns::refresh_pass(&na.node, &geo).await.unwrap(), 1);
+    assert_eq!(na.node.market.over_bids().get(price::RESOLVE), Some(&1));
+    assert_eq!(count(&na, OFFERS).await, offers, "no offer above the bid");
+    let book = credits::book_fresh(&na.node).await.unwrap();
+    assert_eq!(book.ledger.held(&a.id), 0);
+    assert_eq!(count(&na, &confirmed_by("1.0x1", 1)).await, 1, "a alone");
+    assert_eq!(
+        dns::refresh_pass(&na.node, &geo).await.unwrap(),
+        0,
+        "it waits"
+    );
+
+    resolve_asks(&nb, &na, (bid * 4 / 5) as u32).await;
+    old_name(&na, "198.51.100.96", "1.0x2", 10).await;
+    assert_eq!(dns::refresh_pass(&na.node, &geo).await.unwrap(), 1);
+    assert_eq!(count(&na, OFFERS).await, offers + 1, "one offer, to b");
+    assert_eq!(na.node.market.over_bids().get(price::RESOLVE), Some(&1));
+    assert_eq!(count(&na, &confirmed_by("1.0x2", 2)).await, 1, "a and b");
+    assert!(
+        na.store
+            .names_due_refresh(10, &a.id, dns::REFRESH_DAYS)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Protocol 8 and 9 for the resolve refresh: a refresher of 9 asks only
+/// members of 9; a node of 8 still buys a resolution from one of 9 as
+/// before.
+#[tokio::test]
+async fn the_resolve_refresh_between_protocol_eight_and_nine() {
+    use peephole::cluster::rpc::proto;
+    use peephole::credits::{pay, price};
+    use peephole::intel::dns::{self, ResolveReq, ResolveResp};
+    let (ia, a) = new_node("node-nine");
+    let (ib, b) = new_node("node-eight");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let eight = Opts {
+        proto: Some((proto::PROTO_MIN, proto::MARKET_PROTO - 1)),
+        ..DEFAULT
+    };
+    let nb = boot(ib, &b, &[&a], eight).await;
+    fund_listeners(&[&na, &nb], &[a.id, b.id]).await;
+    eventually("each knows the other's protocol", || async {
+        na.members()
+            .get(&b.id)
+            .is_some_and(|m| m.proto_max == proto::MARKET_PROTO - 1)
+            && nb
+                .members()
+                .get(&a.id)
+                .is_some_and(|m| m.proto_max == proto::MARKET_PROTO)
+    })
+    .await;
+    let geo: peephole::intel::SharedGeo = Default::default();
+
+    // 9 refreshes beside 8: 8 is not asked, even at a free ask.
+    resolve_asks(&nb, &na, 0).await;
+    old_name(&na, "198.51.100.97", "1.0x3", 10).await;
+    let offers = count(&na, OFFERS).await;
+    assert_eq!(dns::refresh_pass(&na.node, &geo).await.unwrap(), 1);
+    assert_eq!(count(&na, OFFERS).await, offers);
+    assert_eq!(count(&na, &confirmed_by("1.0x3", 1)).await, 1, "a alone");
+    assert_eq!(na.node.market.over_bids().get(price::RESOLVE), None);
+
+    // 8 buys from 9 as before: an offer at 9's ask is served and charged.
+    resolve_asks(&na, &nb, 5).await;
+    let seq = pay::make_offer(&nb.node, a.id, 5).await.unwrap();
+    let resp: ResolveResp = nb
+        .call(
+            a.id,
+            &a.address(),
+            "/rpc/v1/resolve",
+            &ResolveReq {
+                name: "1.0x4".into(),
+                offer_seq: Some(seq),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.error, None, "{resp:?}");
+    assert_eq!(
+        resp.addrs,
+        vec!["1.0.0.4".parse::<std::net::IpAddr>().unwrap()]
+    );
+    assert_eq!(resp.charged_mc, 5);
+}
+
 /// `arbiter`'s offer funding `job` of `scanner` (sequence `seq`), and the
 /// scanner's receipt charging 5 mc for it a moment later, both dated just
 /// before the job's done status `done`, written on each of `on`: the job

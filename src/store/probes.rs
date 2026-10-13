@@ -5,6 +5,7 @@ use super::Store;
 use super::data::{Ctx, Effect, ensure_ip, erased_by};
 use super::hostkeys::insert_probe_keys;
 use super::requests::IpRow;
+use crate::cluster::identity::NodeId;
 use crate::cluster::record::{IpNameRec, ProbeResultRec};
 use crate::scan::hostkeys::{
     FAVICON, HASSH, HTTP_404, HTTP_BODY, HostKey, JARM, SSH_HOSTKEY, TLS_CERT,
@@ -340,6 +341,52 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Names on this node's own sources (as [`Store::rdns_due_own`] has
+    /// them) last confirmed more than `older_than_days` ago, the oldest
+    /// first: the newest `ip_names` row of the name, from any source and
+    /// any node, or this node's last refresh of it, whichever is newer.
+    pub async fn names_due_refresh(
+        &self,
+        limit: i64,
+        me: &NodeId,
+        older_than_days: u32,
+    ) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT name FROM (
+               SELECT n.name,
+                      max((SELECT max(m.last_seen) FROM ip_names m WHERE m.name = n.name),
+                          coalesce((SELECT f.at FROM name_refreshes f WHERE f.name = n.name), ''))
+                        AS confirmed
+               FROM ip_names n JOIN ips i ON i.id = n.ip_id
+               WHERE i.request_count > 0
+                 AND (SELECT r.origin IS NULL OR r.origin = ?1 FROM requests r
+                      WHERE r.ip_id = i.id ORDER BY r.id LIMIT 1)
+               GROUP BY n.name)
+             WHERE confirmed < datetime('now', ?2)
+             ORDER BY confirmed, name LIMIT ?3",
+        )
+        .bind(&me.0[..])
+        .bind(format!("-{older_than_days} days"))
+        .bind(limit)
+        .fetch_all(&self.read)
+        .await?)
+    }
+
+    /// This node re-resolved `name` now (whatever was found).
+    pub async fn mark_name_refreshed(&self, name: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO name_refreshes (name, at) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET at = excluded.at",
+        )
+        .bind(name)
+        .bind(super::data::now_ts())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,5 +701,55 @@ mod tests {
                 .unwrap(),
             Effect::Ignored
         );
+    }
+
+    /// A name on an own source confirmed 10 days ago is due a refresh, one
+    /// confirmed 3 days ago is not, nor one on another member's source; a
+    /// refresh makes the old one wait again.
+    #[tokio::test]
+    async fn only_names_confirmed_over_a_week_ago_on_own_sources_are_due() {
+        use crate::store::requests::NewRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let me = NodeId([1; 32]);
+        let other = NodeId([2; 32]);
+        let named = async |ip: &str, origin: NodeId, name: &str, days: u32| {
+            let row = s.upsert_ip(ip.parse().unwrap()).await.unwrap();
+            s.insert_request(&NewRequest {
+                ip_id: row.id,
+                method: "GET".into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            sqlx::query("UPDATE requests SET origin = ? WHERE ip_id = ?")
+                .bind(&origin.0[..])
+                .bind(row.id)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen, agreed)
+                 VALUES (?1, ?2, 'rdns', datetime('now', ?3), datetime('now', ?3), 1)",
+            )
+            .bind(row.id)
+            .bind(name)
+            .bind(format!("-{days} days"))
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        };
+        named("198.51.100.1", me, "old.example.net", 10).await;
+        named("198.51.100.2", me, "new.example.net", 3).await;
+        named("198.51.100.3", other, "theirs.example.net", 10).await;
+        assert_eq!(
+            s.names_due_refresh(10, &me, 7).await.unwrap(),
+            ["old.example.net"]
+        );
+        s.mark_name_refreshed("old.example.net").await.unwrap();
+        assert!(s.names_due_refresh(10, &me, 7).await.unwrap().is_empty());
     }
 }

@@ -285,6 +285,14 @@ disputed with every answer. The other providers show the newest result.
   page) is not bound by the bid. A scanner of 9 claims jobs only from
   arbiters of 9 (and its own node) and takes no less than its ask, so no
   arbiter below 9 caps it.
+- **Resolve refresh.** A node of 9 re-resolves the names on its own
+  sources once their last confirmation (the newest row of the name, or
+  its own last refresh) is 7 days old, paced like the reverse-name buyer.
+  It asks itself and the resolve quorum of the members of 9 only, each at
+  an ask at most its resolve bid; the names it wants in an hour are those
+  due, at most what it can do in an hour. The answers are an ordinary
+  name lookup, so a member of 8 reads them as before. A name waits
+  another 7 days whatever was found.
 - **What stays.** The currency (the daily pool of 1000 credits, 7-day
   lots), the offer, receipt and payment flow on the wire, audits and their
   payment rules, and the quorums for domains and reverse names are the
