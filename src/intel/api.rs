@@ -32,7 +32,7 @@ const SKIP_REJECTED: Duration = Duration::from_secs(24 * 3600);
 const SKIP_CAP: usize = 10_000;
 /// IPs asked per pass: about a minute of requests, so a pass ends before
 /// newer IPs have waited long.
-const BATCH: i64 = 60;
+pub(crate) const BATCH: i64 = 60;
 /// Back-off after failures: 1 min doubling up to 1 h.
 const BACKOFF_FIRST: i64 = 60;
 const BACKOFF_MAX: i64 = 3600;

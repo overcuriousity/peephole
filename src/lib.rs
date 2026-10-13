@@ -194,6 +194,18 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         "enrichment",
         intel::enrich_loop(recorder.clone(), providers.clone(), shutdown_rx.clone()),
     );
+    // Keyed providers' answers about this node's own sources, bought.
+    if let Some(n) = &node {
+        background.spawn(
+            "enrichment buyer",
+            intel::buy_loop(
+                n.clone(),
+                providers.clone(),
+                cfg.enrichment.refresh_after_days,
+                shutdown_rx.clone(),
+            ),
+        );
+    }
     // Reverse DNS of the sources, forward-confirmed, kept on this node.
     background.spawn(
         "reverse dns",
