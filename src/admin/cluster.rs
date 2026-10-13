@@ -552,6 +552,9 @@ pub struct ContribView {
     pub scans: i64,
     /// IPs it looked up with an enrichment provider.
     pub lookups: i64,
+    /// Its RDAP rows this node spot-checked, and the disputes among them.
+    pub rdap_checked: i64,
+    pub rdap_disputes: i64,
     pub log_entries: i64,
     pub log_size: String,
 }
@@ -608,6 +611,7 @@ async fn contributions(node: &Node) -> AppResult<Vec<ContribView>> {
         "SELECT origin, COUNT(DISTINCT ip) FROM ip_intel GROUP BY origin",
     )
     .await?;
+    let rdap = crate::intel::rdap_check::counts(&node.store.pool).await?;
     let usage: HashMap<Vec<u8>, (i64, i64)> =
         sqlx::query_as::<_, (Vec<u8>, i64, i64)>("SELECT origin, entries, bytes FROM origin_usage")
             .fetch_all(&node.store.pool)
@@ -618,6 +622,7 @@ async fn contributions(node: &Node) -> AppResult<Vec<ContribView>> {
     let row = |key: &[u8], name: String, short: String, id: String| {
         let get = |m: &Counts| m.get(key).copied().unwrap_or(0);
         let (log_entries, bytes) = usage.get(key).copied().unwrap_or((0, 0));
+        let (rdap_checked, rdap_disputes) = rdap.get(key).copied().unwrap_or((0, 0));
         ContribView {
             key: id,
             name,
@@ -628,6 +633,8 @@ async fn contributions(node: &Node) -> AppResult<Vec<ContribView>> {
             claims: get(&claims),
             scans: get(&scans),
             lookups: get(&lookups),
+            rdap_checked,
+            rdap_disputes,
             log_entries,
             log_size: size(bytes),
         }

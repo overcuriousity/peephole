@@ -238,6 +238,19 @@ bought over the last 7 days, and how many asks above its bid it refused
 (`over bid`). RDAP is not traded by automatic buyers: the able nodes
 fetch it in turns and share the answer.
 
+**RDAP spot-checks (local).** Each node asks the registry again for 10 %
+of the IPs whose RDAP row another member wrote in the last 7 days. Which
+IPs follows from a keyed hash of the IP under this node's own key, so a
+writer cannot tell which of its rows get checked. Same tags (`country`,
+`fresh`): checked. Different: asked once more after 10 minutes; still
+different, the node records its own `ip_intel` row (an ordinary row, also
+for a node of protocol 8) and counts a dispute against the writer. The
+counts (`rdap_checks`, not replicated) show per member on its cluster page
+and in `peephole credits market`; nothing blocks a member on its own, the
+operator decides. Where the members' RDAP tags differ, a node shows its
+own row, else the tags most members agree on, else the IP's RDAP as
+disputed with every answer. The other providers show the newest result.
+
 - **Ask (seller, local).** Each node's asks are its own; what follows
   is the local default every node ships with, not a rule peers enforce.
   A good's first ask is the lower median of what members announce for
