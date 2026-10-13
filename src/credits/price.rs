@@ -486,12 +486,14 @@ pub struct Tally {
     pub over_bid: u64,
 }
 
-/// What `me` sold and bought per good: one unit for each good a charged
-/// offer to or from it names (its receipt's `answered`).
+/// What `me` sold to and bought from other nodes per good: one unit for
+/// each good a charged offer names (its receipt's `answered`).
 pub fn traded(ledger: &super::ledger::Ledger, me: &NodeId) -> HashMap<String, Tally> {
     let mut out: HashMap<String, Tally> = HashMap::new();
     for o in &ledger.offers {
-        if !matches!(o.state, super::ledger::OfferState::Charged { charged } if charged > 0) {
+        if o.payer == o.to
+            || !matches!(o.state, super::ledger::OfferState::Charged { charged } if charged > 0)
+        {
             continue;
         }
         for good in &o.answered {
@@ -1305,6 +1307,8 @@ mod tests {
                 offer(other, me, OfferState::Charged { charged: 0 }, &[]),
                 offer(me, other, OfferState::Open, &[]),
                 offer(me, other, OfferState::Lapsed, &[]),
+                // Its own: no trade.
+                offer(me, me, OfferState::Charged { charged: 5 }, &[RDNS]),
             ],
             ..Default::default()
         };

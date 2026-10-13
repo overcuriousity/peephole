@@ -58,6 +58,11 @@
     <thead><tr><th>Provider served here</th><th class="num">Price (credits)</th><th class="num">Paid lookups a day</th></tr></thead>
     <tbody>{% for o in price.offers %}<tr><td>{{ o.0 }}</td><td class="num">{{ o.1 }}</td><td class="num">{{ o.2 }}</td></tr>{% endfor %}</tbody>
   </table></div>{% endif %}
+  <h3>Market <span class="muted small">this node's ask and bid as of the last hourly refresh; sold and bought over the last 7 days</span></h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Good</th><th class="num">Ask here</th><th class="num" title="The most this node's automatic buyers pay for one">Bid here</th><th class="num">Sold</th><th class="num">Bought</th><th class="num" title="Asks above the bid this node's automatic buyers refused">Over bid</th></tr></thead>
+    <tbody>{% for t in trades %}<tr><td>{{ t.good }}</td><td class="num">{{ t.ask }}</td><td class="num">{{ t.bid }}</td><td class="num">{{ t.sold }}</td><td class="num">{{ t.bought }}</td><td class="num">{{ t.over_bid }}</td></tr>{% endfor %}{% for g in not_traded %}<tr><td>{{ g }}</td><td colspan="5" class="muted">not traded</td></tr>{% endfor %}</tbody>
+  </table></div>
 </section>
 <div class="grid-2 market-split">
 <section class="card"><div class="card-head"><h2>Money flow</h2><span class="muted">this node, last 7 days (UTC)</span></div>

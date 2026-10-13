@@ -124,6 +124,16 @@ struct PriceView {
     offers: Vec<(String, String, String)>,
 }
 
+/// One good in this node's market: ask and bid here, its trades.
+struct TradeRow {
+    good: String,
+    ask: String,
+    bid: String,
+    sold: u64,
+    bought: u64,
+    over_bid: u64,
+}
+
 /// A scanner in the price table.
 struct ScannerRow {
     name: String,
@@ -252,6 +262,7 @@ fn shown_change(pct: f64) -> (String, &'static str) {
 fn good_label(good: &str) -> String {
     match good {
         credits::price::SCAN => "Scan job".into(),
+        credits::price::AUDIT => "Audit".into(),
         credits::price::PROBE => "Probe".into(),
         credits::price::RESOLVE => "Name resolution".into(),
         credits::price::RDNS => "Reverse names".into(),
@@ -290,6 +301,10 @@ struct CreditsPage {
     scan_change: Option<(String, &'static str)>,
     /// `{good: {label, points}}` for the price chart.
     market_json: String,
+    /// Every traded good: this node's ask and bid, its trades.
+    trades: Vec<TradeRow>,
+    /// Goods no node sells (`credits::price::NOT_TRADED`), by label.
+    not_traded: Vec<String>,
     /// This node's last 7 days of income and spending, oldest first.
     flow_json: String,
 }
@@ -621,6 +636,18 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         .filter(|m| m.active && m.id != me && !node.is_blocked(&m.id))
         .map(|m| (m.id.to_string(), m.name.clone()))
         .collect();
+    let trades = credits::price::market(node, &book)
+        .await?
+        .into_iter()
+        .map(|r| TradeRow {
+            good: good_label(r.good),
+            ask: r.ask_mc.map_or_else(|| "–".into(), show),
+            bid: show(r.bid_mc),
+            sold: r.tally.sold,
+            bought: r.tally.bought,
+            over_bid: r.tally.over_bid,
+        })
+        .collect();
     render(&CreditsPage {
         chrome: Chrome::new(true, "admin"),
         balance: show(book.balance(&me)),
@@ -638,6 +665,8 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         goods,
         scan_change,
         market_json,
+        trades,
+        not_traded: credits::price::NOT_TRADED.map(good_label).to_vec(),
         flow_json,
     })
 }
@@ -818,6 +847,15 @@ mod tests {
             goods: vec![],
             scan_change: None,
             market_json: "{}".into(),
+            trades: vec![TradeRow {
+                good: "Reverse names".into(),
+                ask: "37.00".into(),
+                bid: "0.50".into(),
+                sold: 0,
+                bought: 2,
+                over_bid: 3,
+            }],
+            not_traded: vec!["RDAP registry".into()],
             flow_json: "[]".into(),
         };
         // The template states these in words.
@@ -841,6 +879,8 @@ mod tests {
             "Reverse names cost <b>0.00</b>",
             "A relay lease (an hour) costs <b>0.01</b>",
             "checks 5 % of other nodes' fresh scans unpaid",
+            "<td>Reverse names</td><td class=\"num\">37.00</td><td class=\"num\">0.50</td><td class=\"num\">0</td><td class=\"num\">2</td><td class=\"num\">3</td>",
+            "<td>RDAP registry</td><td colspan=\"5\" class=\"muted\">not traded</td>",
         ] {
             assert!(html.contains(want), "{want} missing");
         }
