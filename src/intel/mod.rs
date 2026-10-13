@@ -36,6 +36,8 @@ pub struct ProviderInfo {
     /// Whether its terms allow passing its results on: only these stay in
     /// a redistributable export.
     pub redistributable: bool,
+    /// Whether it answers for IPv6 addresses.
+    pub ipv6: bool,
 }
 
 pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
@@ -46,6 +48,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: false,
         tag_prefix: "tor",
         redistributable: true,
+        ipv6: true,
     },
     ProviderInfo {
         name: MAXMIND,
@@ -54,6 +57,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: false,
         tag_prefix: "maxmind",
         redistributable: false,
+        ipv6: true,
     },
     ProviderInfo {
         name: ABUSEIPDB,
@@ -62,6 +66,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: true,
         tag_prefix: "abuseipdb",
         redistributable: false,
+        ipv6: true,
     },
     ProviderInfo {
         name: RDAP,
@@ -70,6 +75,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: true,
         tag_prefix: "rdap",
         redistributable: false,
+        ipv6: true,
     },
     ProviderInfo {
         name: SHODAN,
@@ -78,6 +84,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: true,
         tag_prefix: "shodan",
         redistributable: false,
+        ipv6: true,
     },
     ProviderInfo {
         name: INTERNETDB,
@@ -86,6 +93,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: true,
         tag_prefix: "internetdb",
         redistributable: false,
+        ipv6: false,
     },
 ];
 
@@ -95,6 +103,12 @@ pub const MAX_PEER_DATA_BYTES: usize = 32 * 1024;
 
 pub fn provider_info(name: &str) -> Option<&'static ProviderInfo> {
     KNOWN_PROVIDERS.iter().find(|p| p.name == name)
+}
+
+/// Whether `name` is asked about IPv6 addresses ([`ProviderInfo::ipv6`];
+/// a provider this version does not know is).
+pub fn asks_ipv6(name: &str) -> bool {
+    provider_info(name).is_none_or(|i| i.ipv6)
 }
 
 /// Tags of one result, for filtering the admin IP list (stored with the
@@ -270,6 +284,21 @@ async fn enrich_provider(
 ) -> anyhow::Result<usize> {
     let step = provider::step_in_secs(rank_for(rec, p.name()));
     let info = provider_info(p.name());
+    // Protocol 9: a provider the recorder buys is given away except for the
+    // sources of the other market members, who buy it.
+    let others: Vec<_> = rec
+        .node()
+        .filter(|n| bought_by_recorder(p.name()) && crate::credits::pay::trades_market(n.proto.1))
+        .map(|n| {
+            let me = n.id();
+            n.members()
+                .iter()
+                .filter(|(id, m)| **id != me && crate::credits::pay::trades_market(m.proto_max))
+                .map(|(id, _)| *id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let recorded_by = crate::store::requests::RecordedBy::NotBy(&others);
     let ips = if info.is_some_and(|i| i.api) {
         let mut step = step;
         let covered_by = (p.name() == INTERNETDB).then_some(SHODAN);
@@ -285,12 +314,13 @@ async fn enrich_provider(
                 ipv6: p.ipv6(),
                 skip: &skip,
                 covered_by,
+                recorded_by,
                 limit: p.batch(),
             })
             .await?
     } else {
         rec.store()
-            .ips_missing_intel(p.name(), step, p.batch())
+            .ips_missing_intel(p.name(), step, recorded_by, p.batch())
             .await?
     };
     if ips.is_empty() {
@@ -373,6 +403,159 @@ async fn provider_loop(
                 }
             }
             Err(e) => warn!(provider = p.name(), ?e, "enrichment pass failed"),
+        }
+    }
+}
+
+/// Whether the recorder of a source buys `name`'s answer about it
+/// (protocol 9): a provider traded in the market. RDAP and the rest are
+/// fetched by the able nodes in turns and shared for free.
+pub fn bought_by_recorder(name: &str) -> bool {
+    use crate::credits::price::{MARKET_GOODS, NOT_TRADED};
+    provider_info(name).is_some() && MARKET_GOODS.contains(&name) && !NOT_TRADED.contains(&name)
+}
+
+/// How often the recorder's buyer runs.
+const BUY_TICK: Duration = Duration::from_secs(60);
+/// Buyer passes an hour.
+const BUYS_PER_HOUR: i64 = 3600 / BUY_TICK.as_secs() as i64;
+/// How long a source asked for is not asked again: a bought answer reaches
+/// this node by replication, a declined one waits its turn.
+const BUY_PAUSE: Duration = Duration::from_secs(3600);
+
+/// Sources the buyer asked for lately, by provider and address.
+#[derive(Debug, Default)]
+pub struct Asked(std::collections::HashMap<(String, String), std::time::Instant>);
+
+impl Asked {
+    fn skip(&mut self, provider: &str) -> Vec<String> {
+        self.0.retain(|_, at| at.elapsed() < BUY_PAUSE);
+        self.0
+            .keys()
+            .filter(|(p, _)| p == provider)
+            .map(|(_, ip)| ip.clone())
+            .collect()
+    }
+}
+
+/// One pass of the recorder's buyer (protocol 9): for each provider of
+/// [`bought_by_recorder`] that `own` does not serve, the node's own
+/// sources that lack its answer (or are due again after
+/// `refresh_after_days`) are wanted, capped at what a provider asks in an
+/// hour; up to a batch of them is bought, each at most at this node's bid
+/// and only from members of the free market. The serving node writes the
+/// answer into the dataset (`pay::serve`), so data its terms keep from
+/// redistribution goes nowhere else. An ask above the bid is not offered
+/// and counted. Returns how many answers were bought.
+pub async fn buy_pass(
+    node: &Arc<crate::cluster::Node>,
+    own: &Providers,
+    refresh_after_days: f64,
+    asked: &mut Asked,
+) -> anyhow::Result<usize> {
+    use crate::credits::{pay, price};
+    if !pay::trades_market(node.proto.1) {
+        return Ok(0);
+    }
+    let me = node.id();
+    let mut bought = 0;
+    for info in KNOWN_PROVIDERS
+        .iter()
+        .filter(|i| bought_by_recorder(i.name))
+    {
+        let name = info.name;
+        if own.iter().any(|p| p.name() == name && p.ready()) {
+            node.wants.lock().unwrap().set(name, 0);
+            continue;
+        }
+        let members = node.members();
+        let Some(ask) = pay::quotes(node, own)
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|q| {
+                members
+                    .get(&q.server)
+                    .is_some_and(|m| pay::trades_market(m.proto_max))
+            })
+            .map(|q| q.price_mc as crate::credits::Mc)
+            .min()
+        else {
+            // No member of the market sells it: it takes no share of the
+            // budget from goods that can be bought.
+            node.wants.lock().unwrap().set(name, 0);
+            continue;
+        };
+        let skip = asked.skip(name);
+        let due = node
+            .store
+            .intel_candidates(&crate::store::requests::IntelCandidates {
+                provider: name,
+                step_secs: 0,
+                // A dataset like MaxMind's is looked up once, not refreshed.
+                refresh_after_days: if info.api { refresh_after_days } else { 0.0 },
+                ipv6: info.ipv6,
+                skip: &skip,
+                covered_by: None,
+                recorded_by: crate::store::requests::RecordedBy::Own(&me),
+                limit: api::BATCH * BUYS_PER_HOUR,
+            })
+            .await?;
+        node.wants.lock().unwrap().set(name, due.len() as u32);
+        if due.is_empty() {
+            continue;
+        }
+        let bid = match price::own_bid(node, name).await {
+            Ok(bid) => bid,
+            Err(e) => {
+                // Not a refusal: nothing is counted against the ask.
+                warn!(?e, provider = name, "market: no bid, nothing bought");
+                continue;
+            }
+        };
+        if ask > bid {
+            node.market.over_bid(name);
+            info!(good = name, ask, bid, "market: ask above bid, not bought");
+            continue;
+        }
+        let wanted = [name.to_string()];
+        for ip in due.into_iter().take(api::BATCH as usize) {
+            let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+                continue;
+            };
+            asked
+                .0
+                .insert((name.to_string(), ip), std::time::Instant::now());
+            let answers = pay::ask(node, own, addr, &wanted, &wanted, Some(bid)).await;
+            if answers
+                .iter()
+                .any(|a| a.resp.findings.iter().any(|f| f.provider == name))
+            {
+                bought += 1;
+            }
+        }
+    }
+    Ok(bought)
+}
+
+/// Buy the answers of keyed providers about this node's own sources
+/// ([`buy_pass`]) until shutdown.
+pub async fn buy_loop(
+    node: Arc<crate::cluster::Node>,
+    providers: Providers,
+    refresh_after_days: f64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut asked = Asked::default();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(BUY_TICK) => {}
+            _ = shutdown.changed() => break,
+        }
+        match buy_pass(&node, &providers, refresh_after_days, &mut asked).await {
+            Ok(0) => {}
+            Ok(n) => info!(n, "enrichment: answers bought"),
+            Err(e) => warn!(?e, "enrichment buyer pass failed"),
         }
     }
 }

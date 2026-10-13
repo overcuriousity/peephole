@@ -223,7 +223,7 @@ pub async fn run(
         .filter(|p| !stored.iter().any(|s| &s.provider == p))
         .collect();
     let paid: Vec<String> = ask.iter().chain(again).cloned().collect();
-    let mut answers = crate::credits::pay::ask(node, providers, ip, &wanted, &paid).await;
+    let mut answers = crate::credits::pay::ask(node, providers, ip, &wanted, &paid, None).await;
     if answers.is_empty() {
         answers.push(NodeAnswer {
             node: "this node".into(),

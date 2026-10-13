@@ -32,7 +32,7 @@ const SKIP_REJECTED: Duration = Duration::from_secs(24 * 3600);
 const SKIP_CAP: usize = 10_000;
 /// IPs asked per pass: about a minute of requests, so a pass ends before
 /// newer IPs have waited long.
-const BATCH: i64 = 60;
+pub(crate) const BATCH: i64 = 60;
 /// Back-off after failures: 1 min doubling up to 1 h.
 const BACKOFF_FIRST: i64 = 60;
 const BACKOFF_MAX: i64 = 3600;
@@ -42,7 +42,7 @@ pub trait Service: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     /// Whether the service answers for IPv6 addresses.
     fn ipv6(&self) -> bool {
-        true
+        super::asks_ipv6(self.name())
     }
     fn request(&self, client: &reqwest::Client, ip: &str) -> reqwest::RequestBuilder;
     /// The result for a 2xx or 404 answer (a 404 is "nothing known"). None
