@@ -230,9 +230,11 @@ audits and relay leases. The supply is fixed; prices follow sales.
 ### Prices
 
 - **Prices.** One rule for every good, on each node every 10 minutes: a
-  good that sold since the last refresh (or whose every slot is taken)
-  gets dearer by at most a factor of e^0.45 an hour; one that sold nothing
-  gets cheaper by e^-0.15 an hour; each step is scaled by the time since
+  good whose demand since the last refresh reached 90 % of what it can
+  serve in that time (or whose every slot is taken) gets dearer by at most
+  a factor of e^0.45 an hour; any other gets cheaper by e^-0.15 an hour
+  (a scanner's price rises on a granted scan in the period or at 90 % of
+  its capacity, see Scan jobs); each step is scaled by the time since
   the last (so a 10-minute refresh takes a sixth of an hourly step) and
   moves at least 0.001 credits. There is no floor: a good nobody buys
   becomes free, and a free good that is used costs 0.001 at the next
@@ -285,7 +287,7 @@ audits and relay leases. The supply is fixed; prices follow sales.
 ### Scan jobs
 
 - **Scan jobs.** The arbiter (the node that queued the job) funds its jobs
-  from its own balance, up to `[credits] scan_share` (default 0.5) of it, and
+  from its own balance, up to all of it (no daily share since 0.14.0), and
   hands each job to the scanner asking that is cheapest **per delivered
   result** at the job's level: its price divided by its success rate there,
   relative to the best live scanner with at least 5 scans at that level (the
@@ -315,7 +317,6 @@ audits and relay leases. The supply is fixed; prices follow sales.
   done, and nothing when it does not. A scan offer lapses
   after the longest scan (12 hours plus 2 minutes). Every grant is funded, at
   zero or above: a scanner priced at 0 is granted without an offer.
-  `scan_share = 0` funds only free scanners.
 
 ### Conformity and audits
 
@@ -389,8 +390,8 @@ audits and relay leases. The supply is fixed; prices follow sales.
   day, and each key must first pass the rules agreement; but a pool share
   goes to every verified listener, so listeners cost an address and 12
   reported hours a day.
-- A free rider (`scan_share = 0`) gets its attackers scanned only by
-  scanners priced at zero.
+- A free rider (a node with no credits) gets its attackers scanned only
+  by scanners priced at zero.
 - A scanner can announce a lower pace to look busier and raise its
   price; it then runs fewer scans than it could, and scans beyond its
   announced pace show in the log.
@@ -399,8 +400,8 @@ audits and relay leases. The supply is fixed; prices follow sales.
   the rule.
 - A scanner that fills itself with its own jobs, or with paid jobs of a
   second key of its operator, looks busy and its price rises: the same
-  as selling less of its capacity. Cheapest-scanner choice, `scan_share`
-  and the bounded rise protect others; with one scanner it is a
+  as selling less of its capacity. Cheapest-scanner choice and the
+  bounded rise protect others; with one scanner it is a
   monopoly.
 - Fleets are private, so a sibling of a scanner can rank among its
   auditors and approve what it is sent; the unpaid checks of other

@@ -101,8 +101,8 @@ credits.
 - **Where they come from.** A fixed pool of credits a day is split among
   the members anyone can reach that run a trap and were up for at least
   half of the day. Everything else is earned by selling.
-- **Prices follow sales.** A good that sells gets dearer, one that does not
-  gets cheaper, down to free. Every node computes every price and balance
+- **Prices follow scarcity.** A good that sells near its supply gets
+  dearer, any other gets cheaper, down to free. Every node computes every price and balance
   for itself, from its own copy of the log.
 - **Some answers are free.** What a node answers itself (its own providers,
   resolver, scanner) is free, and an answer under 24 hours old is served

@@ -5,6 +5,20 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-14
+
+### Changed
+
+- Every good but a scan job (names, reverse names, provider lookups,
+  probes, relay leases) gets dearer only while its demand reaches 90 % of
+  its supply, and cheaper otherwise. A sale or two an hour no longer
+  drives a price up: rDNS on one node went from 0.142 to 37.569 credits in
+  two days at about one sale an hour. On first start these prices begin
+  again at 0 (scanner prices and balances are kept).
+- A node's scan jobs may hold or pay for its whole balance; the daily
+  share is gone. `[credits] scan_share` still loads, does nothing, and is
+  reported as an obsolete key.
+
 ## [0.13.0] - 2026-10-13
 
 ### Added
@@ -1024,6 +1038,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 First release.
 
+[0.14.0]: https://github.com/overcuriousity/peephole/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/overcuriousity/peephole/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/overcuriousity/peephole/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/overcuriousity/peephole/compare/v0.10.0...v0.11.0
