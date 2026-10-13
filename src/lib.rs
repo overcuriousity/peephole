@@ -217,6 +217,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             shutdown_rx.clone(),
         ),
     );
+    // Names on this node's own sources, re-resolved by a quorum once a
+    // week old, at its bid (cluster only: a standalone node buys nothing).
+    if let Some(n) = node.as_ref().filter(|_| cfg.enrichment.reverse_dns) {
+        background.spawn(
+            "resolve refresh",
+            intel::dns::refresh_run(n.clone(), geo.clone(), shutdown_rx.clone()),
+        );
+    }
 
     // Observational probes, for members (paid) and this node's admin.
     let prober = (cfg.roles.scanner && cfg.probe.enabled).then(|| {
