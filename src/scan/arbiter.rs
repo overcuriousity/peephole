@@ -2309,7 +2309,7 @@ mod tests {
             .unwrap()
             .set(crate::credits::price::SCAN, 1);
         let book = crate::credits::book_fresh(&s.0).await.unwrap();
-        let bid = crate::credits::price::own_bid(&s.0, &book, crate::credits::price::SCAN).await;
+        let bid = crate::credits::price::own_bid_in(&s.0, &book, crate::credits::price::SCAN).await;
         (s, bid)
     }
 

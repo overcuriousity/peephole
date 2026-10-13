@@ -203,7 +203,7 @@ pub async fn affordable(
         let bid = match funding.bid {
             Some(b) => b,
             None => {
-                let b = price::own_bid(node, book, price::SCAN).await;
+                let b = price::own_bid_in(node, book, price::SCAN).await;
                 funding.bid = Some(b);
                 b
             }

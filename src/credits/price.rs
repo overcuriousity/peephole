@@ -594,10 +594,18 @@ async fn own_bids(node: &Node, book: &super::Book) -> HashMap<&'static str, Mc> 
         .collect()
 }
 
-/// This node's bid for one unit of `good` in the coming hour, from its
-/// own lots in `book` and what its buyer loops want. Nothing a peer says
+/// This node's bid for `good` now, from its own lots (the cached book)
+/// and what its buyer loops want ([`Node::wants`]); nothing a peer says
 /// enters it.
-pub async fn own_bid(node: &Node, book: &super::Book, good: &str) -> Mc {
+pub async fn own_bid(node: &Node, good: &str) -> Result<Mc> {
+    let book = super::book(node).await?;
+    Ok(own_bids(node, &book).await.get(good).copied().unwrap_or(0))
+}
+
+/// [`own_bid`] from `book` (the one a round of grants reads): this
+/// node's bid for one unit of `good` in the coming hour, from its own
+/// lots and what its buyer loops want. Nothing a peer says enters it.
+pub async fn own_bid_in(node: &Node, book: &super::Book, good: &str) -> Mc {
     let budget = hourly_budget(node, book).await;
     let wants = node.wants.lock().unwrap().clone();
     super::bid::bid(budget, &wants, good)
