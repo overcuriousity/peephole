@@ -285,6 +285,7 @@ async fn enrich_provider(
                 ipv6: p.ipv6(),
                 skip: &skip,
                 covered_by,
+                recorded_by: crate::store::requests::RecordedBy::Anyone,
                 limit: p.batch(),
             })
             .await?

@@ -1,4 +1,5 @@
 use super::Store;
+use crate::cluster::identity::NodeId;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::net::IpAddr;
@@ -103,7 +104,23 @@ pub struct IntelCandidates<'a> {
     pub ipv6: bool,
     pub skip: &'a [String],
     pub covered_by: Option<&'a str>,
+    pub recorded_by: RecordedBy<'a>,
     pub limit: i64,
+}
+
+/// Whose sources [`Store::intel_candidates`] picks, by the origin of each
+/// IP's first request (no origin: recorded here before the cluster).
+#[derive(Debug, Clone, Copy)]
+pub enum RecordedBy<'a> {
+    /// Every source.
+    Anyone,
+    /// Sources recorded by `me` or by one of `legacy` (protocol 9: a key
+    /// holder enriches for free only its own sources and those of members
+    /// older than the market; the others are bought by their recorder).
+    OwnOrLegacy {
+        me: &'a NodeId,
+        legacy: &'a [NodeId],
+    },
 }
 
 impl Store {
@@ -192,6 +209,17 @@ impl Store {
         let intervals: Vec<i64> = (0..REFRESH_STEPS)
             .map(|k| (q.refresh_after_days * 86400.0 * 1.5f64.powi(k)).min(1e12) as i64)
             .collect();
+        let (own, me, legacy) = match q.recorded_by {
+            RecordedBy::Anyone => (false, vec![], vec![]),
+            RecordedBy::OwnOrLegacy { me, legacy } => (
+                true,
+                me.0.to_vec(),
+                legacy
+                    .iter()
+                    .map(|id| data_encoding::HEXLOWER.encode(&id.0))
+                    .collect(),
+            ),
+        };
         Ok(sqlx::query_scalar(
             "WITH s AS (
                SELECT ip, COUNT(*) AS k, MAX(fetched_at) AS last_at
@@ -209,6 +237,9 @@ impl Store {
                AND i.ip NOT IN (SELECT value FROM json_each(?7))
                AND (?8 IS NULL OR NOT EXISTS (
                      SELECT 1 FROM ip_intel c WHERE c.ip = i.ip AND c.provider = ?8))
+               AND (NOT ?10 OR (SELECT r.origin IS NULL OR r.origin = ?11
+                                    OR lower(hex(r.origin)) IN (SELECT value FROM json_each(?12))
+                                FROM requests r WHERE r.ip_id = i.id ORDER BY r.id LIMIT 1))
              ORDER BY i.last_seen DESC, i.id DESC LIMIT ?9",
         )
         .bind(q.provider)
@@ -220,6 +251,9 @@ impl Store {
         .bind(serde_json::to_string(q.skip)?)
         .bind(q.covered_by)
         .bind(q.limit)
+        .bind(own)
+        .bind(me)
+        .bind(serde_json::to_string::<Vec<String>>(&legacy)?)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -276,6 +310,7 @@ mod tests {
             ipv6: true,
             skip,
             covered_by: None,
+            recorded_by: RecordedBy::Anyone,
             limit: 100,
         }
     }
@@ -393,6 +428,67 @@ mod tests {
             .await
             .unwrap();
         assert!(s.intel_candidates(&q).await.unwrap().is_empty());
+    }
+
+    /// Protocol 9: a key holder enriches for free its own sources and
+    /// those of members older than the market; a source a member of 9
+    /// recorded is that member's to buy.
+    #[tokio::test]
+    async fn a_market_member_s_source_is_not_a_free_candidate() {
+        use crate::cluster::identity::NodeId;
+        let s = test_store().await;
+        let (me, eight, nine) = (NodeId([1; 32]), NodeId([2; 32]), NodeId([3; 32]));
+        for (ip, origin) in [
+            ("198.51.100.11", Some(me)),
+            ("198.51.100.12", Some(eight)),
+            ("198.51.100.13", Some(nine)),
+            ("198.51.100.14", None),
+        ] {
+            let row = s.upsert_ip(ip.parse().unwrap()).await.unwrap();
+            let id = s
+                .insert_request(&NewRequest {
+                    ip_id: row.id,
+                    method: "GET".into(),
+                    path: "/".into(),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            sqlx::query("UPDATE requests SET origin = ? WHERE id = ?")
+                .bind(origin.map(|o| o.0.to_vec()))
+                .bind(id)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        let p = crate::intel::SHODAN;
+        let mut all = s.intel_candidates(&candidates(p, &[])).await.unwrap();
+        all.sort();
+        assert_eq!(all.len(), 4, "{all:?}");
+        let legacy = [eight];
+        let q = IntelCandidates {
+            recorded_by: RecordedBy::OwnOrLegacy {
+                me: &me,
+                legacy: &legacy,
+            },
+            ..candidates(p, &[])
+        };
+        let mut got = s.intel_candidates(&q).await.unwrap();
+        got.sort();
+        assert_eq!(got, ["198.51.100.11", "198.51.100.12", "198.51.100.14"]);
+        // Only its own: what a recorder buys.
+        let own = IntelCandidates {
+            recorded_by: RecordedBy::OwnOrLegacy {
+                me: &me,
+                legacy: &[],
+            },
+            ..candidates(p, &[])
+        };
+        let mut got = s.intel_candidates(&own).await.unwrap();
+        got.sort();
+        assert_eq!(got, ["198.51.100.11", "198.51.100.14"]);
     }
 
     #[tokio::test]
