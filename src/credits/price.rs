@@ -92,15 +92,19 @@ pub fn start(announced: &[u32]) -> Mc {
     v[(v.len() - 1) / 2] as Mc
 }
 
-/// Paid requests this node received since the last refresh, per good.
+/// Paid requests this node received since the last refresh, per good;
+/// and, since the node started counting, the asks above its bid its
+/// automatic buyers refused, per good.
 pub struct Demand {
     inner: std::sync::Mutex<(std::time::Instant, HashMap<String, f64>)>,
+    over_bid: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl Default for Demand {
     fn default() -> Self {
         Self {
             inner: std::sync::Mutex::new((std::time::Instant::now(), HashMap::new())),
+            over_bid: Default::default(),
         }
     }
 }
@@ -114,6 +118,30 @@ impl Demand {
             .1
             .entry(good.to_string())
             .or_default() += n as f64;
+    }
+
+    /// An ask for `good` above this node's bid, refused.
+    pub fn over_bid(&self, good: &str) {
+        *self
+            .over_bid
+            .lock()
+            .unwrap()
+            .entry(good.to_string())
+            .or_default() += 1;
+    }
+
+    /// Every good's refused asks so far.
+    pub fn over_bids(&self) -> HashMap<String, u64> {
+        self.over_bid.lock().unwrap().clone()
+    }
+
+    /// Start from the refusals kept across a restart; those counted since
+    /// add to them.
+    pub fn seed_over_bids(&self, kept: HashMap<String, u64>) {
+        let mut g = self.over_bid.lock().unwrap();
+        for (good, n) in kept {
+            *g.entry(good).or_default() += n;
+        }
     }
 
     /// The counts so far and the hours they cover, left in place: the
@@ -421,6 +449,150 @@ async fn kept_price(node: &Node, good: &str) -> Result<Option<Mc>> {
         .and_then(|v| v.parse::<Mc>().ok()))
 }
 
+/// The goods `peephole credits market` and the Credits page list, in
+/// order. An audit sells at the auditor's scan price.
+pub const MARKET_GOODS: [&str; 8] = [
+    SCAN,
+    AUDIT,
+    PROBE,
+    RDNS,
+    RESOLVE,
+    intel::ABUSEIPDB,
+    intel::SHODAN,
+    intel::MAXMIND,
+];
+/// Listed after [`MARKET_GOODS`]: no automatic buyer buys RDAP; the able
+/// nodes fetch it in turns and share the answer.
+pub const NOT_TRADED: [&str; 1] = [intel::RDAP];
+
+/// Kept across restarts: the asks for `good` this node refused as above
+/// its bid ([`Demand::over_bid`]).
+fn over_bid_key(good: &str) -> String {
+    format!("over_bid:{good}")
+}
+
+/// Kept at each refresh: this node's bid for `good` (`credits::bid`).
+fn bid_key(good: &str) -> String {
+    format!("bid:{good}")
+}
+
+/// One good's trades as this node counts them.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Tally {
+    /// Units this node sold for credits in the book's window.
+    pub sold: u64,
+    /// Units this node bought for credits in the book's window.
+    pub bought: u64,
+    /// Asks above this node's bid its automatic buyers refused.
+    pub over_bid: u64,
+}
+
+/// What `me` sold to and bought from other nodes per good: one unit for
+/// each good a charged offer names (its receipt's `answered`).
+pub fn traded(ledger: &super::ledger::Ledger, me: &NodeId) -> HashMap<String, Tally> {
+    let mut out: HashMap<String, Tally> = HashMap::new();
+    for o in &ledger.offers {
+        if o.payer == o.to
+            || !matches!(o.state, super::ledger::OfferState::Charged { charged } if charged > 0)
+        {
+            continue;
+        }
+        for good in &o.answered {
+            let t = out.entry(good.clone()).or_default();
+            if o.to == *me {
+                t.sold += 1;
+            }
+            if o.payer == *me {
+                t.bought += 1;
+            }
+        }
+    }
+    out
+}
+
+/// One good in this node's market: its ask and bid as of its last price
+/// refresh, its trades as of the book.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarketRow {
+    pub good: &'static str,
+    /// What this node asks; None: it does not sell the good.
+    pub ask_mc: Option<Mc>,
+    /// What its automatic buyers pay at most.
+    pub bid_mc: Mc,
+    pub tally: Tally,
+}
+
+/// Every good of [`MARKET_GOODS`], from `book` and what this node kept.
+/// Reads only the node's database, so it works from the shell while the
+/// daemon runs.
+pub async fn market(node: &Node, book: &super::Book) -> Result<Vec<MarketRow>> {
+    let me = node.id();
+    let traded = traded(&book.ledger, &me);
+    let scan_ask = node
+        .store
+        .intel_get(&scanner_key(&me))
+        .await?
+        .and_then(|v| parse_kept(&v))
+        .map(|(mc, _)| mc);
+    let kept = |k: String| async move {
+        Ok::<_, anyhow::Error>(
+            node.store
+                .intel_get(&k)
+                .await?
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0),
+        )
+    };
+    let mut rows = vec![];
+    for good in MARKET_GOODS {
+        let ask_mc = match good {
+            SCAN | AUDIT => scan_ask,
+            _ => kept_price(node, good).await?,
+        };
+        let t = traded.get(good).copied().unwrap_or_default();
+        rows.push(MarketRow {
+            good,
+            ask_mc,
+            bid_mc: kept(bid_key(good)).await?,
+            tally: Tally {
+                over_bid: kept(over_bid_key(good)).await?,
+                ..t
+            },
+        });
+    }
+    Ok(rows)
+}
+
+/// Keep this node's bids and refusals for [`market`], at a refresh.
+async fn keep_market(node: &Node, bids: &HashMap<&str, Mc>) -> Result<()> {
+    let refused = node.market.over_bids();
+    for good in MARKET_GOODS {
+        let bid = bids.get(good).copied().unwrap_or(0);
+        node.store
+            .intel_set(&bid_key(good), &bid.to_string())
+            .await?;
+        if let Some(n) = refused.get(good) {
+            node.store
+                .intel_set(&over_bid_key(good), &n.to_string())
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// This node's bid for each of [`MARKET_GOODS`] in the coming hour, from
+/// its own lots in `book` and what its buyer loops want.
+async fn own_bids(node: &Node, book: &super::Book) -> HashMap<&'static str, Mc> {
+    let me = node.id();
+    let lots = node.spending.lock().await.lots(book, &me);
+    let budget = super::bid::hourly_budget(&lots, book.ledger.today, book.now_ms);
+    let wants = node.wants.lock().unwrap().clone();
+    MARKET_GOODS
+        .iter()
+        .map(|g| (*g, super::bid::bid(budget, &wants, g)))
+        .collect()
+}
+
 /// Where `good`'s next step starts: the last price here (of a table a
 /// refresh made), the kept one, or what members announce.
 async fn current(node: &Node, old: &Table, good: &str, announced: &[u32]) -> Result<Mc> {
@@ -530,6 +702,18 @@ fn as_mc(p: Mc) -> u32 {
 /// Seed this node's table from the prices it kept, so a restart serves
 /// at them until the first refresh steps them.
 pub async fn load_kept(node: &Node) -> Result<()> {
+    let mut refused = HashMap::new();
+    for good in MARKET_GOODS {
+        if let Some(n) = node
+            .store
+            .intel_get(&over_bid_key(good))
+            .await?
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            refused.insert(good.to_string(), n);
+        }
+    }
+    node.market.seed_over_bids(refused);
     let mut t = Table {
         resolve_mc: kept_price(node, RESOLVE).await?.map_or(0, as_mc),
         rdns_mc: kept_price(node, RDNS).await?.map_or(0, as_mc),
@@ -792,6 +976,10 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     });
     node.set_price_table(table.clone());
     node.market.consume(&counted);
+    let bids = own_bids(node, &book).await;
+    if let Err(e) = keep_market(node, &bids).await {
+        tracing::debug!(?e, "credits: market counters not kept");
+    }
     Ok(table)
 }
 
@@ -1037,6 +1225,98 @@ mod tests {
         let t = node.price_table();
         assert_eq!(t.price_of(RESOLVE), Some(40));
         assert_eq!(t.price_of(RDNS), Some(7));
+    }
+
+    #[tokio::test]
+    async fn the_market_lists_every_good_and_rdap_as_not_traded() {
+        let (_dir, node) = test_node().await;
+        node.store
+            .intel_set(&price_key(RDNS), "37000")
+            .await
+            .unwrap();
+        node.store.intel_set(&bid_key(RDNS), "500").await.unwrap();
+        node.store
+            .intel_set(&over_bid_key(RDNS), "4")
+            .await
+            .unwrap();
+        // Refusals kept across a restart add to those counted since.
+        load_kept(&node).await.unwrap();
+        node.market.over_bid(RDNS);
+        assert_eq!(node.market.over_bids().get(RDNS), Some(&5));
+        let book = super::super::compute(&node).await.unwrap();
+        let rows = market(&node, &book).await.unwrap();
+        let rdns = rows.iter().find(|r| r.good == RDNS).unwrap();
+        assert_eq!(
+            (rdns.ask_mc, rdns.bid_mc, rdns.tally.over_bid),
+            (Some(37000), 500, 4)
+        );
+        let lines = crate::credits::cli::market_lines(&rows);
+        let goods: Vec<&str> = lines[1..]
+            .iter()
+            .map(|l| l.split_whitespace().next().unwrap())
+            .collect();
+        assert_eq!(
+            goods,
+            [
+                "scan",
+                "audit",
+                "probe",
+                "rdns",
+                "resolve",
+                "abuseipdb",
+                "shodan",
+                "maxmind-geolite2",
+                "rdap"
+            ]
+        );
+        assert!(lines.last().unwrap().ends_with("not traded"));
+        assert!(
+            lines[4].contains("37.00") && lines[4].contains("0.50"),
+            "{}",
+            lines[4]
+        );
+    }
+
+    #[test]
+    fn trades_are_read_from_charged_offers() {
+        use super::super::ledger::{Ledger, Offer, OfferState};
+        let (me, other) = (id(1), id(2));
+        let offer = |payer, to, state, answered: &[&str]| Offer {
+            payer,
+            seq: 1,
+            hlc: 0,
+            to,
+            offered: 10,
+            covered: 10,
+            held: vec![],
+            state,
+            answered: answered.iter().map(|s| s.to_string()).collect(),
+            job: None,
+            audit: None,
+        };
+        let ledger = Ledger {
+            offers: vec![
+                offer(other, me, OfferState::Charged { charged: 10 }, &[RDNS]),
+                offer(
+                    other,
+                    me,
+                    OfferState::Charged { charged: 10 },
+                    &["shodan", RDNS],
+                ),
+                offer(me, other, OfferState::Charged { charged: 5 }, &[RESOLVE]),
+                // Charged nothing, open or lapsed: no trade.
+                offer(other, me, OfferState::Charged { charged: 0 }, &[]),
+                offer(me, other, OfferState::Open, &[]),
+                offer(me, other, OfferState::Lapsed, &[]),
+                // Its own: no trade.
+                offer(me, me, OfferState::Charged { charged: 5 }, &[RDNS]),
+            ],
+            ..Default::default()
+        };
+        let t = traded(&ledger, &me);
+        assert_eq!((t[RDNS].sold, t[RDNS].bought), (2, 0));
+        assert_eq!((t["shodan"].sold, t[RESOLVE].bought), (1, 1));
+        assert_eq!(t.len(), 3);
     }
 
     #[test]

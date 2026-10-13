@@ -1853,7 +1853,11 @@ data_dir = "/tmp"
         let base = "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n";
         let cfg: Config = toml::from_str(base).unwrap();
         assert!(cfg.credits.scan_share.is_none());
-        assert!(!cfg.obsolete_notes().iter().any(|n| n.contains("scan_share")));
+        assert!(
+            !cfg.obsolete_notes()
+                .iter()
+                .any(|n| n.contains("scan_share"))
+        );
         for v in ["0.5", "0", "1.5"] {
             let cfg: Config =
                 toml::from_str(&format!("{base}[credits]\nscan_share = {v}\n")).unwrap();

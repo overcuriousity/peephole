@@ -12,6 +12,7 @@ pub const USAGE: &str = "usage: peephole credits [CONFIG]                     ba
        peephole credits log [--days N] [CONFIG]     pool shares, spent, sent, received
        peephole credits members [CONFIG]            every member's balance and standing
        peephole credits uptime [CONFIG]             each member's reported hours up, 7 days
+       peephole credits market [CONFIG]             per good: own ask and bid, sold, bought, refused over bid
        peephole credits send NODE AMOUNT [CONFIG]   NODE: name, fingerprint or key";
 
 fn config_path(arg: &str) -> bool {
@@ -154,6 +155,12 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 );
             }
         }
+        ["market"] => {
+            let book = super::compute(&node).await?;
+            for line in market_lines(&super::price::market(&node, &book).await?) {
+                println!("{line}");
+            }
+        }
         ["send", who, amount] => {
             let mc = super::parse_amount(amount)
                 .with_context(|| format!("`{amount}` is not an amount (like 1 or 0.25)"))?;
@@ -164,4 +171,29 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
         _ => bail!("{USAGE}"),
     }
     Ok(())
+}
+
+/// `peephole credits market`: one row per traded good, then the goods
+/// that are not traded. Sold and bought count the book's window
+/// (`LOT_DAYS`); ask and bid are as of the last hourly price refresh.
+pub fn market_lines(rows: &[super::price::MarketRow]) -> Vec<String> {
+    let mut out = vec![format!(
+        "{:<18} {:>10} {:>10} {:>6} {:>6} {:>8}",
+        "good", "ask", "bid", "sold", "bought", "over bid"
+    )];
+    for r in rows {
+        out.push(format!(
+            "{:<18} {:>10} {:>10} {:>6} {:>6} {:>8}",
+            r.good,
+            r.ask_mc.map_or_else(|| "-".to_string(), show),
+            show(r.bid_mc),
+            r.tally.sold,
+            r.tally.bought,
+            r.tally.over_bid
+        ));
+    }
+    for good in super::price::NOT_TRADED {
+        out.push(format!("{good:<18} not traded"));
+    }
+    out
 }

@@ -660,9 +660,7 @@ impl Source {
         let own_left = match (sell, &book) {
             (Some(_), Some(book)) => {
                 match crate::credits::jobs::self_committed(&node.store.pool, &me).await {
-                    Ok(self_mc) => {
-                        crate::credits::jobs::budget(&book.ledger, &me, self_mc)
-                    }
+                    Ok(self_mc) => crate::credits::jobs::budget(&book.ledger, &me, self_mc),
                     Err(e) => {
                         debug!(?e, "own scan reservations not read");
                         0

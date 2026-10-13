@@ -132,8 +132,7 @@ pub async fn affordable(node: &Arc<Node>, funding: &mut Funding, min_mc: u32, pr
     let Some(book) = &funding.book else {
         return false;
     };
-    let left =
-        budget(&book.ledger, &me, self_mc).saturating_sub(funding.committed);
+    let left = budget(&book.ledger, &me, self_mc).saturating_sub(funding.committed);
     left >= price as Mc
 }
 

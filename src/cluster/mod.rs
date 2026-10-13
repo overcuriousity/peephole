@@ -287,6 +287,9 @@ pub struct Node {
     pub reach: crate::credits::reach::Tracker,
     /// Paid requests counted for this node's prices (`credits::price`).
     pub market: crate::credits::price::Demand,
+    /// Units of each good this node's buyer loops want this hour, for its
+    /// bids (`credits::bid`).
+    pub wants: std::sync::Mutex<crate::credits::bid::Wants>,
     /// The relay leases this node sells to outbound-only members.
     pub relay_leases: relay::Leases,
     /// The relay leases this outbound-only node took.
@@ -379,6 +382,7 @@ impl Node {
             price_table: Default::default(),
             reach: Default::default(),
             market: Default::default(),
+            wants: Default::default(),
             relay_leases: Default::default(),
             leased: Default::default(),
             weights: Default::default(),
