@@ -461,7 +461,8 @@ pub const MARKET_GOODS: [&str; 8] = [
     intel::SHODAN,
     intel::MAXMIND,
 ];
-/// Listed after [`MARKET_GOODS`]: RDAP is answered by every node itself.
+/// Listed after [`MARKET_GOODS`]: no automatic buyer buys RDAP; the able
+/// nodes fetch it in turns and share the answer.
 pub const NOT_TRADED: [&str; 1] = [intel::RDAP];
 
 /// Kept across restarts: the asks for `good` this node refused as above

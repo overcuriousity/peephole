@@ -229,29 +229,59 @@ audits and relay leases. The supply is fixed; prices follow sales.
 
 ### Prices
 
-- **Prices.** One rule for every good, on each node every 10 minutes: a
-  good that sold since the last refresh (or whose every slot is taken)
-  gets dearer by at most a factor of e^0.45 an hour; one that sold nothing
-  gets cheaper by e^-0.15 an hour; each step is scaled by the time since
-  the last (so a 10-minute refresh takes a sixth of an hourly step) and
-  moves at least 0.001 credits. There is no floor: a good nobody buys
-  becomes free, and a free good that is used costs 0.001 at the next
-  refresh. A request may carry no offer: the server answers what it prices
-  at zero and declines the rest naming the price, which the asker may offer
-  once. Only what is paid for or answered free counts as a sale: asking
-  for a priced good without an offer moves no price. What a node answers itself is free (its own providers, prober,
+From protocol 9 a price is no longer a protocol rule: each node sets its
+own asks and its own bids, and two members trade only when the buyer's
+bid is at least the seller's ask. Nothing a member announces, answers or
+refuses moves another node's bid. `peephole credits market` and the
+Credits page list, per good, this node's ask and bid, what it sold and
+bought over the last 7 days, and how many asks above its bid it refused
+(`over bid`). RDAP is not traded by automatic buyers: the able nodes
+fetch it in turns and share the answer.
+
+- **Ask (seller, local).** The default ask follows sales, one rule for
+  every good, on each node every 10 minutes: a good that sold since the
+  last refresh (or whose every slot is taken) gets dearer by at most a
+  factor of e^0.45 an hour; one that sold nothing gets cheaper by e^-0.15
+  an hour; each step is scaled by the time since the last (so a 10-minute
+  refresh takes a sixth of an hourly step) and moves at least 0.001
+  credits. There is no floor: a good nobody buys becomes free, and a free
+  good that is used costs 0.001 at the next refresh. This is a local
+  strategy: between members of protocol 9 no peer checks or caps an ask,
+  and a node that prices otherwise stays conformant. Only what is paid
+  for or answered free counts as a sale: asking for a priced good without
+  an offer moves no price.
+- **Bid (buyer, local, from the balance).** Credits die 7 days after their
+  day, so keeping them gains nothing. Each hour a node spreads every lot it
+  holds evenly over the hours the lot has left and splits that hour's
+  budget equally over the goods its automatic buyers want; a good's share
+  is divided by the units wanted of it that hour. That is the most an
+  automatic buyer pays for one unit. With no balance, or no units wanted,
+  the bid is 0 and the node takes only what is free. A refusal that names
+  a higher price is offered again only up to the bid, never above it.
+  Lookups an operator asks for by hand (the Lookup page, `/api/v1`) are
+  not bound by the bid: the operator is the buyer.
+- **What stays.** The currency (the daily pool of 1000 credits, 7-day
+  lots), the offer, receipt and payment flow on the wire, audits and their
+  payment rules, and the quorums for domains and reverse names are the
+  same for every version. A request may carry no offer: the server
+  answers what it prices at zero and declines the rest naming the price.
+  What a node answers itself is free (its own providers, prober,
   resolver, scanner), though its own scan jobs use up its scan budget like
   jobs it buys. Scan prices are per scanner, computed by every node from
   the scans of jobs other arbiters granted it (its own jobs are no sales);
-  an arbiter pays at most 1.25 times its own figure. What another node
-  answers is paid, whoever owns it, the Tor exit list, RDAP, InternetDB
-  and GeoLite2 included; there is no free quota. A provider with an API
-  budget offers its on-demand share (`[enrichment] on_demand_share`); one
-  without, and name resolution, offer `[enrichment] offer_per_day`
-  (default 1000) a day. Askers go to the cheapest server first. The Lookup
-  page runs this node's own providers by itself and asks other nodes only
-  for the providers picked; an automatic lookup never buys from another
-  node.
+  towards a scanner below protocol 9 an arbiter pays at most 1.25 times
+  its own figure. What another node answers is paid, whoever owns it, the
+  Tor exit list, RDAP, InternetDB and GeoLite2 included; there is no free
+  quota.
+  A provider with an API budget offers its on-demand share (`[enrichment]
+  on_demand_share`); one without, and name resolution, offer
+  `[enrichment] offer_per_day` (default 1000) a day. Askers go to the
+  cheapest server first. The Lookup page runs this node's own providers
+  by itself and asks other nodes only for the providers picked.
+- **Members below protocol 9** trade by the rules of protocol 8 among
+  themselves and with members of 9: their asks follow the default rule,
+  an arbiter caps their scan price, and a refusal is offered again up to
+  the named price.
 
 ### Domains and reverse names
 
@@ -469,6 +499,15 @@ daily pool: only members anyone can reach do. It cannot issue invites: a joiner 
 Upgrade every member together when the protocol changes: each version
 below names what an older member misses.
 
+- **Protocol 9** is the free market (see [Prices](#prices)): each node
+  sets its own asks, and its automatic buyers bid from its own balance and
+  buy only at an ask at most their bid. Between members of protocol 9 no
+  ask is capped or checked; an arbiter still caps the scan price of a
+  scanner below protocol 9. Nothing changes on the wire or in the books:
+  no new record kind, the same offers and receipts, so a member of
+  protocol 8 still pays and is paid as before and meets a member of 9 at
+  protocol 8. Upgrade every member to trade in the market. Going back to
+  protocol 8 undoes nothing in the books: what was settled stays settled.
 - **Protocol 8** changes how the credits are counted, so upgrade all
   members together: a scanner charges before it reports a job done, and a
   scan receipt dated after the job's done status pays nothing (a scanner of
