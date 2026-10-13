@@ -12,16 +12,16 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 /// Sources looked up per pass.
-const BATCH: i64 = 50;
+pub(crate) const BATCH: i64 = 50;
 /// Lookups at a time.
 const PARALLEL: usize = 4;
 /// Between passes.
-const EVERY: Duration = Duration::from_secs(60);
+pub(crate) const EVERY: Duration = Duration::from_secs(60);
 /// Most sources this node wants looked up in an hour: a full batch every
 /// pass (its bid, `credits::bid::Wants`).
-const WANTED_AT_MOST: i64 = BATCH * (3600 / EVERY.as_secs()) as i64;
+pub(crate) const WANTED_AT_MOST: i64 = BATCH * (3600 / EVERY.as_secs()) as i64;
 /// After a full batch: more are likely due (the backlog after an upgrade).
-const AGAIN: Duration = Duration::from_secs(1);
+pub(crate) const AGAIN: Duration = Duration::from_secs(1);
 /// Longest error text kept in a record.
 const MAX_ERROR: usize = 200;
 
