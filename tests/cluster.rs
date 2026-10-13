@@ -4761,6 +4761,62 @@ async fn an_old_version_member_is_not_asked_for_paid_lookups() {
     assert_eq!(servers, vec![c.id], "only the member of the market");
 }
 
+/// Protocol 8 and 9 in one cluster: they meet at 8, each sees the other's
+/// version, the member of protocol 8 is still paid and asked for paid
+/// lookups as before, but only the one of 9 trades in the free market.
+/// The bid of the node of protocol 9 comes from its own book alone: a
+/// member's price does not move it.
+#[tokio::test]
+async fn protocol_eight_and_nine_trade_side_by_side() {
+    use peephole::cluster::rpc::proto;
+    use peephole::credits::{pay, price};
+    let (ia, a) = new_node("node-nine");
+    let (ib, b) = new_node("node-eight");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let eight = Opts {
+        proto: Some((proto::PROTO_MIN, proto::MARKET_PROTO - 1)),
+        ..DEFAULT
+    };
+    let nb = boot(ib, &b, &[&a], eight).await;
+    fund_listeners(&[&na, &nb], &[a.id, b.id]).await;
+    serves(&nb, &[("abuseipdb", Some(1000.0))], 0.2);
+    price::refresh(&nb.node).await.unwrap();
+    price_seen(&na, b.id, "abuseipdb").await;
+    eventually("each knows the other's protocol", || async {
+        na.members()
+            .get(&b.id)
+            .is_some_and(|m| m.proto_max == proto::MARKET_PROTO - 1)
+            && nb
+                .members()
+                .get(&a.id)
+                .is_some_and(|m| m.proto_max == proto::MARKET_PROTO)
+    })
+    .await;
+    let proto_of = |n: &TestNode, id: &NodeId| n.members().get(id).unwrap().proto_max;
+    assert!(
+        !pay::trades_market(proto_of(&na, &b.id)),
+        "8 is not of the market"
+    );
+    assert!(pay::trades_market(proto_of(&nb, &a.id)), "9 is");
+    assert!(pay::pays_with(proto_of(&na, &b.id)), "8 is still paid");
+    let none: peephole::intel::Providers = vec![];
+    let servers: Vec<_> = pay::quotes(&na.node, &none)
+        .remove("abuseipdb")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|q| q.server)
+        .collect();
+    assert_eq!(servers, vec![b.id], "8 is still asked for paid lookups");
+    // a has credits but its buyer loops want nothing yet: it bids nothing,
+    // whatever b asks.
+    price::refresh(&na.node).await.unwrap();
+    let book = peephole::credits::book_fresh(&na.node).await.unwrap();
+    assert!(book.balance(&a.id) > 0);
+    let rows = price::market(&na.node, &book).await.unwrap();
+    assert_eq!(rows.len(), price::MARKET_GOODS.len());
+    assert!(rows.iter().all(|r| r.bid_mc == 0), "{rows:?}");
+}
+
 /// Wall-clock milliseconds since the epoch.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
