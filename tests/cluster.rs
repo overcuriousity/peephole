@@ -7677,6 +7677,187 @@ async fn reverse_names_trade_between_protocol_eight_and_nine() {
     assert_eq!(resp.charged_mc, 5);
 }
 
+/// `n` asks `mc` for `provider`, and `on` heard it.
+async fn provider_asks(n: &TestNode, on: &TestNode, provider: &str, mc: u32) {
+    use peephole::credits::price;
+    n.node.set_price_table(std::sync::Arc::new(price::Table {
+        offers: vec![price::Offer {
+            provider: provider.into(),
+            price_mc: mc,
+            on_demand: 100,
+        }],
+        ..Default::default()
+    }));
+    n.node.refresh_heartbeat();
+    let id = n.node.id();
+    eventually("the ask is heard", || async {
+        on.status.known(&id).is_some_and(|k| {
+            k.hb.prices
+                .iter()
+                .any(|(p, price)| p == provider && *price == mc)
+        })
+    })
+    .await;
+}
+
+/// `on` holds the requests `of` recorded for `ip`.
+async fn holds_source(on: &TestNode, ip: &str) {
+    let q =
+        format!("SELECT COUNT(*) FROM requests r JOIN ips i ON i.id = r.ip_id WHERE i.ip = '{ip}'");
+    eventually("the source replicated", || async {
+        count(on, &q).await > 0
+    })
+    .await;
+}
+
+/// Protocol 9: the recorder of a source buys a keyed provider's answer
+/// about it. An ask above its bid is not offered and counted; one within
+/// it is bought from the key holder, who writes the answer into the
+/// dataset: one sale on each side.
+#[tokio::test]
+async fn a_recorder_buys_a_key_holders_answer_within_its_bid() {
+    use peephole::credits::{self, price};
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let asked = serves(&nb, &[("shodan", Some(1000.0))], 0.2);
+    fund_listeners(&[&na, &nb], &[a.id, b.id]).await;
+    market_known(&na, b.id).await;
+    market_known(&nb, a.id).await;
+    let ip = "198.51.100.95";
+    record(&na, ip, "/x").await;
+    holds_source(&nb, ip).await;
+    na.node.wants.lock().unwrap().set("shodan", 1);
+    let bid = price::own_bid(&na.node, "shodan").await.unwrap();
+    assert!(bid > 1, "a funded node bids: {bid}");
+    let none: peephole::intel::Providers = vec![];
+    let mut recent = peephole::intel::Asked::default();
+    let kept =
+        format!("SELECT COUNT(*) FROM ip_intel_log WHERE provider = 'shodan' AND ip = '{ip}'");
+
+    // The key holder does not give it away: a's source is a's to buy.
+    let holder: peephole::intel::Providers = vec![Arc::new(TestProvider {
+        name: "shodan",
+        per_day: None,
+        asked: asked.clone(),
+    })];
+    assert_eq!(
+        peephole::intel::enrich_once(&rec(&nb), &holder)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // Above the bid: no offer, counted.
+    provider_asks(&nb, &na, "shodan", (bid * 74) as u32).await;
+    let offers = count(&na, OFFERS).await;
+    let n = peephole::intel::buy_pass(&na.node, &none, 30.0, &mut recent)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+    assert_eq!(na.node.market.over_bids().get("shodan"), Some(&1));
+    assert_eq!(count(&na, OFFERS).await, offers, "no offer");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // Within it: bought, kept by the key holder, on both nodes.
+    provider_asks(&nb, &na, "shodan", (bid * 4 / 5) as u32).await;
+    let n = peephole::intel::buy_pass(&na.node, &none, 30.0, &mut recent)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(count(&na, OFFERS).await, offers + 1, "one offer, to b");
+    assert_eq!(na.node.market.over_bids().get("shodan"), Some(&1));
+    eventually("the answer is in both datasets", || async {
+        count(&na, &kept).await == 1 && count(&nb, &kept).await == 1
+    })
+    .await;
+    let by_b: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ip_intel_log WHERE origin = ?")
+        .bind(&b.id.0[..])
+        .fetch_one(&na.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(by_b, 1, "written by the key holder");
+    eventually("one sale on each side", || async {
+        let sold = |n: &TestNode, me: NodeId| {
+            let node = n.node.clone();
+            async move {
+                let book = credits::book_fresh(&node).await.unwrap();
+                price::traded(&book.ledger, &me)
+                    .get("shodan")
+                    .copied()
+                    .unwrap_or_default()
+            }
+        };
+        let (ta, tb) = (sold(&na, a.id).await, sold(&nb, b.id).await);
+        ta.bought == 1 && ta.sold == 0 && tb.sold == 1 && tb.bought == 0
+    })
+    .await;
+    // Asked for lately: not bought again while the answer travels.
+    assert_eq!(
+        peephole::intel::buy_pass(&na.node, &none, 30.0, &mut recent)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(count(&na, OFFERS).await, offers + 1);
+}
+
+/// Protocol 8 and 9 for provider enrichment: a key holder of 9 still
+/// enriches the source of a recorder of 8 for free, and the recorder of 8
+/// buys nothing on its own.
+#[tokio::test]
+async fn a_key_holder_of_nine_enriches_a_recorder_of_eight_for_free() {
+    use peephole::cluster::rpc::proto;
+    let (ia, a) = new_node("node-eight");
+    let (ib, b) = new_node("node-nine");
+    let eight = Opts {
+        proto: Some((proto::PROTO_MIN, proto::MARKET_PROTO - 1)),
+        ..DEFAULT
+    };
+    let na = boot(ia, &a, &[&b], eight).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let asked = serves(&nb, &[("shodan", Some(1000.0))], 0.2);
+    fund_listeners(&[&na, &nb], &[a.id, b.id]).await;
+    eventually("each knows the other's protocol", || async {
+        na.members()
+            .get(&b.id)
+            .is_some_and(|m| m.proto_max == proto::MARKET_PROTO)
+            && nb
+                .members()
+                .get(&a.id)
+                .is_some_and(|m| m.proto_max == proto::MARKET_PROTO - 1)
+    })
+    .await;
+    let ip = "198.51.100.96";
+    record(&na, ip, "/x").await;
+    holds_source(&nb, ip).await;
+    let none: peephole::intel::Providers = vec![];
+    let n = peephole::intel::buy_pass(&na.node, &none, 30.0, &mut Default::default())
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "8 does not buy");
+    let offers = count(&nb, OFFERS).await;
+    let holder: peephole::intel::Providers = vec![Arc::new(TestProvider {
+        name: "shodan",
+        per_day: None,
+        asked: asked.clone(),
+    })];
+    assert_eq!(
+        peephole::intel::enrich_once(&rec(&nb), &holder)
+            .await
+            .unwrap(),
+        1
+    );
+    let kept =
+        format!("SELECT COUNT(*) FROM ip_intel_log WHERE provider = 'shodan' AND ip = '{ip}'");
+    eventually("8's source is enriched", || async {
+        count(&na, &kept).await == 1
+    })
+    .await;
+    assert_eq!(count(&nb, OFFERS).await, offers, "for free");
+}
+
 /// `arbiter`'s offer funding `job` of `scanner` (sequence `seq`), and the
 /// scanner's receipt charging 5 mc for it a moment later, both dated just
 /// before the job's done status `done`, written on each of `on`: the job
