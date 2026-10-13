@@ -42,7 +42,7 @@ pub trait Service: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     /// Whether the service answers for IPv6 addresses.
     fn ipv6(&self) -> bool {
-        true
+        super::asks_ipv6(self.name())
     }
     fn request(&self, client: &reqwest::Client, ip: &str) -> reqwest::RequestBuilder;
     /// The result for a 2xx or 404 answer (a 404 is "nothing known"). None

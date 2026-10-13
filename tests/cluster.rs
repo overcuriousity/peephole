@@ -7736,12 +7736,20 @@ async fn a_recorder_buys_a_key_holders_answer_within_its_bid() {
     let kept =
         format!("SELECT COUNT(*) FROM ip_intel_log WHERE provider = 'shodan' AND ip = '{ip}'");
 
-    // The key holder does not give it away: a's source is a's to buy.
-    let holder: peephole::intel::Providers = vec![Arc::new(TestProvider {
-        name: "shodan",
-        per_day: None,
-        asked: asked.clone(),
-    })];
+    // The key holder gives neither Shodan nor MaxMind away: a's source is
+    // a's to buy.
+    let holder: peephole::intel::Providers = vec![
+        Arc::new(TestProvider {
+            name: "shodan",
+            per_day: None,
+            asked: asked.clone(),
+        }),
+        Arc::new(TestProvider {
+            name: peephole::intel::MAXMIND,
+            per_day: None,
+            asked: asked.clone(),
+        }),
+    ];
     assert_eq!(
         peephole::intel::enrich_once(&rec(&nb), &holder)
             .await
@@ -7804,8 +7812,8 @@ async fn a_recorder_buys_a_key_holders_answer_within_its_bid() {
 }
 
 /// Protocol 8 and 9 for provider enrichment: a key holder of 9 still
-/// enriches the source of a recorder of 8 for free, and the recorder of 8
-/// buys nothing on its own.
+/// enriches the source of a recorder of 8 for free, with Shodan and with
+/// MaxMind, and the recorder of 8 buys nothing on its own.
 #[tokio::test]
 async fn a_key_holder_of_nine_enriches_a_recorder_of_eight_for_free() {
     use peephole::cluster::rpc::proto;
@@ -7838,21 +7846,32 @@ async fn a_key_holder_of_nine_enriches_a_recorder_of_eight_for_free() {
         .unwrap();
     assert_eq!(n, 0, "8 does not buy");
     let offers = count(&nb, OFFERS).await;
-    let holder: peephole::intel::Providers = vec![Arc::new(TestProvider {
-        name: "shodan",
-        per_day: None,
-        asked: asked.clone(),
-    })];
+    let holder: peephole::intel::Providers = vec![
+        Arc::new(TestProvider {
+            name: "shodan",
+            per_day: None,
+            asked: asked.clone(),
+        }),
+        Arc::new(TestProvider {
+            name: peephole::intel::MAXMIND,
+            per_day: None,
+            asked: asked.clone(),
+        }),
+    ];
     assert_eq!(
         peephole::intel::enrich_once(&rec(&nb), &holder)
             .await
             .unwrap(),
-        1
+        2
     );
     let kept =
         format!("SELECT COUNT(*) FROM ip_intel_log WHERE provider = 'shodan' AND ip = '{ip}'");
+    let geo = format!(
+        "SELECT COUNT(*) FROM ip_intel WHERE provider = '{}' AND ip = '{ip}'",
+        peephole::intel::MAXMIND
+    );
     eventually("8's source is enriched", || async {
-        count(&na, &kept).await == 1
+        count(&na, &kept).await == 1 && count(&na, &geo).await == 1
     })
     .await;
     assert_eq!(count(&nb, OFFERS).await, offers, "for free");

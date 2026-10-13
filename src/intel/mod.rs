@@ -36,6 +36,8 @@ pub struct ProviderInfo {
     /// Whether its terms allow passing its results on: only these stay in
     /// a redistributable export.
     pub redistributable: bool,
+    /// Whether it answers for IPv6 addresses.
+    pub ipv6: bool,
 }
 
 pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
@@ -46,6 +48,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: false,
         tag_prefix: "tor",
         redistributable: true,
+        ipv6: true,
     },
     ProviderInfo {
         name: MAXMIND,
@@ -54,6 +57,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: false,
         tag_prefix: "maxmind",
         redistributable: false,
+        ipv6: true,
     },
     ProviderInfo {
         name: ABUSEIPDB,
@@ -62,6 +66,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: true,
         tag_prefix: "abuseipdb",
         redistributable: false,
+        ipv6: true,
     },
     ProviderInfo {
         name: RDAP,
@@ -70,6 +75,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: true,
         tag_prefix: "rdap",
         redistributable: false,
+        ipv6: true,
     },
     ProviderInfo {
         name: SHODAN,
@@ -78,6 +84,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: true,
         tag_prefix: "shodan",
         redistributable: false,
+        ipv6: true,
     },
     ProviderInfo {
         name: INTERNETDB,
@@ -86,6 +93,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: true,
         tag_prefix: "internetdb",
         redistributable: false,
+        ipv6: false,
     },
 ];
 
@@ -95,6 +103,12 @@ pub const MAX_PEER_DATA_BYTES: usize = 32 * 1024;
 
 pub fn provider_info(name: &str) -> Option<&'static ProviderInfo> {
     KNOWN_PROVIDERS.iter().find(|p| p.name == name)
+}
+
+/// Whether `name` is asked about IPv6 addresses ([`ProviderInfo::ipv6`];
+/// a provider this version does not know is).
+pub fn asks_ipv6(name: &str) -> bool {
+    provider_info(name).is_none_or(|i| i.ipv6)
 }
 
 /// Tags of one result, for filtering the admin IP list (stored with the
@@ -270,6 +284,21 @@ async fn enrich_provider(
 ) -> anyhow::Result<usize> {
     let step = provider::step_in_secs(rank_for(rec, p.name()));
     let info = provider_info(p.name());
+    // Protocol 9: a provider the recorder buys is given away except for the
+    // sources of the other market members, who buy it.
+    let others: Vec<_> = rec
+        .node()
+        .filter(|n| bought_by_recorder(p.name()) && crate::credits::pay::trades_market(n.proto.1))
+        .map(|n| {
+            let me = n.id();
+            n.members()
+                .iter()
+                .filter(|(id, m)| **id != me && crate::credits::pay::trades_market(m.proto_max))
+                .map(|(id, _)| *id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let recorded_by = crate::store::requests::RecordedBy::NotBy(&others);
     let ips = if info.is_some_and(|i| i.api) {
         let mut step = step;
         let covered_by = (p.name() == INTERNETDB).then_some(SHODAN);
@@ -277,29 +306,6 @@ async fn enrich_provider(
             step += INTERNETDB_DEFER_SECS;
         }
         let skip = p.skip_list();
-        // Protocol 9: a provider the recorder buys is given away only for
-        // this node's own sources and those of members older than the
-        // market, so they are not starved while the cluster upgrades.
-        let market = rec.node().filter(|n| {
-            bought_by_recorder(p.name()) && crate::credits::pay::trades_market(n.proto.1)
-        });
-        let me = market.map(|n| n.id());
-        let legacy: Vec<_> = market
-            .map(|n| {
-                n.members()
-                    .iter()
-                    .filter(|(_, m)| !crate::credits::pay::trades_market(m.proto_max))
-                    .map(|(id, _)| *id)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let recorded_by = match &me {
-            Some(me) => crate::store::requests::RecordedBy::OwnOrLegacy {
-                me,
-                legacy: &legacy,
-            },
-            None => crate::store::requests::RecordedBy::Anyone,
-        };
         rec.store()
             .intel_candidates(&crate::store::requests::IntelCandidates {
                 provider: p.name(),
@@ -314,7 +320,7 @@ async fn enrich_provider(
             .await?
     } else {
         rec.store()
-            .ips_missing_intel(p.name(), step, p.batch())
+            .ips_missing_intel(p.name(), step, recorded_by, p.batch())
             .await?
     };
     if ips.is_empty() {
@@ -402,12 +408,11 @@ async fn provider_loop(
 }
 
 /// Whether the recorder of a source buys `name`'s answer about it
-/// (protocol 9): an API provider traded in the market, whose quota costs
-/// its holder. Everything else is fetched by the able nodes in turns and
-/// shared for free.
+/// (protocol 9): a provider traded in the market. RDAP and the rest are
+/// fetched by the able nodes in turns and shared for free.
 pub fn bought_by_recorder(name: &str) -> bool {
-    provider_info(name).is_some_and(|i| i.api)
-        && crate::credits::price::MARKET_GOODS.contains(&name)
+    use crate::credits::price::{MARKET_GOODS, NOT_TRADED};
+    provider_info(name).is_some() && MARKET_GOODS.contains(&name) && !NOT_TRADED.contains(&name)
 }
 
 /// How often the recorder's buyer runs.
@@ -454,11 +459,11 @@ pub async fn buy_pass(
     }
     let me = node.id();
     let mut bought = 0;
-    for name in KNOWN_PROVIDERS
+    for info in KNOWN_PROVIDERS
         .iter()
-        .map(|i| i.name)
-        .filter(|n| bought_by_recorder(n))
+        .filter(|i| bought_by_recorder(i.name))
     {
+        let name = info.name;
         if own.iter().any(|p| p.name() == name && p.ready()) {
             node.wants.lock().unwrap().set(name, 0);
             continue;
@@ -487,14 +492,12 @@ pub async fn buy_pass(
             .intel_candidates(&crate::store::requests::IntelCandidates {
                 provider: name,
                 step_secs: 0,
-                refresh_after_days,
-                ipv6: name != SHODAN,
+                // A dataset like MaxMind's is looked up once, not refreshed.
+                refresh_after_days: if info.api { refresh_after_days } else { 0.0 },
+                ipv6: info.ipv6,
                 skip: &skip,
                 covered_by: None,
-                recorded_by: crate::store::requests::RecordedBy::OwnOrLegacy {
-                    me: &me,
-                    legacy: &[],
-                },
+                recorded_by: crate::store::requests::RecordedBy::Own(&me),
                 limit: api::BATCH * BUYS_PER_HOUR,
             })
             .await?;
@@ -502,10 +505,14 @@ pub async fn buy_pass(
         if due.is_empty() {
             continue;
         }
-        let bid = price::own_bid(node, name)
-            .await
-            .inspect_err(|e| debug!(?e, provider = name, "no bid, buys only what is free"))
-            .unwrap_or(0);
+        let bid = match price::own_bid(node, name).await {
+            Ok(bid) => bid,
+            Err(e) => {
+                // Not a refusal: nothing is counted against the ask.
+                warn!(?e, provider = name, "market: no bid, nothing bought");
+                continue;
+            }
+        };
         if ask > bid {
             node.market.over_bid(name);
             info!(good = name, ask, bid, "market: ask above bid, not bought");

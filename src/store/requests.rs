@@ -108,19 +108,62 @@ pub struct IntelCandidates<'a> {
     pub limit: i64,
 }
 
-/// Whose sources [`Store::intel_candidates`] picks, by the origin of each
-/// IP's first request (no origin: recorded here before the cluster).
+/// Whose sources [`Store::intel_candidates`] and
+/// [`Store::ips_missing_intel`] pick, by the origin of each IP's first
+/// request (no origin: recorded here before the cluster).
 #[derive(Debug, Clone, Copy)]
 pub enum RecordedBy<'a> {
     /// Every source.
     Anyone,
-    /// Sources recorded by `me` or by one of `legacy` (protocol 9: a key
-    /// holder enriches for free only its own sources and those of members
-    /// older than the market; the others are bought by their recorder).
-    OwnOrLegacy {
-        me: &'a NodeId,
-        legacy: &'a [NodeId],
-    },
+    /// Sources recorded by `me` or with no origin: what a recorder buys
+    /// (protocol 9).
+    Own(&'a NodeId),
+    /// Every source but those recorded by one of `members`: protocol 9, a
+    /// key holder gives away a provider's answer except for the sources of
+    /// the other market members, who buy it. Departed, unknown and legacy
+    /// recorders stay free, so their sources are not starved.
+    NotBy(&'a [NodeId]),
+}
+
+/// SQL condition of [`RecordedBy`] on the `ips i` row, with its three
+/// parameters numbered from `$n` (mode, me, not by); [`RecordedBy::binds`]
+/// gives their values.
+macro_rules! recorded_by_sql {
+    ($mode:literal, $me:literal, $not_by:literal) => {
+        concat!(
+            "(CASE ?",
+            $mode,
+            "
+                WHEN 1 THEN (SELECT r.origin IS NULL OR r.origin = ?",
+            $me,
+            "
+                             FROM requests r WHERE r.ip_id = i.id ORDER BY r.id LIMIT 1)
+                WHEN 2 THEN COALESCE((SELECT lower(hex(r.origin))
+                             FROM requests r WHERE r.ip_id = i.id ORDER BY r.id LIMIT 1), '')
+                             NOT IN (SELECT value FROM json_each(?",
+            $not_by,
+            "))
+                ELSE 1 END)"
+        )
+    };
+}
+
+impl RecordedBy<'_> {
+    fn binds(&self) -> Result<(i64, Vec<u8>, String)> {
+        Ok(match self {
+            RecordedBy::Anyone => (0, vec![], "[]".into()),
+            RecordedBy::Own(me) => (1, me.0.to_vec(), "[]".into()),
+            RecordedBy::NotBy(ids) => (
+                2,
+                vec![],
+                serde_json::to_string(
+                    &ids.iter()
+                        .map(|id| data_encoding::HEXLOWER.encode(&id.0))
+                        .collect::<Vec<_>>(),
+                )?,
+            ),
+        })
+    }
 }
 
 impl Store {
@@ -177,22 +220,29 @@ impl Store {
     }
 
     /// IPs first seen at least `older_than_secs` ago that have no result
-    /// from `provider`, oldest first.
+    /// from `provider`, oldest first, of the sources `recorded_by` picks.
     pub async fn ips_missing_intel(
         &self,
         provider: &str,
         older_than_secs: i64,
+        recorded_by: RecordedBy<'_>,
         limit: i64,
     ) -> Result<Vec<String>> {
-        Ok(sqlx::query_scalar(
+        let (mode, me, not_by) = recorded_by.binds()?;
+        Ok(sqlx::query_scalar(concat!(
             "SELECT i.ip FROM ips i
-             WHERE i.first_seen <= datetime('now', ?)
-               AND NOT EXISTS (SELECT 1 FROM ip_intel t WHERE t.ip = i.ip AND t.provider = ?)
-             ORDER BY i.id LIMIT ?",
-        )
+             WHERE i.first_seen <= datetime('now', ?1)
+               AND NOT EXISTS (SELECT 1 FROM ip_intel t WHERE t.ip = i.ip AND t.provider = ?2)
+               AND ",
+            recorded_by_sql!(4, 5, 6),
+            " ORDER BY i.id LIMIT ?3"
+        ))
         .bind(format!("-{older_than_secs} seconds"))
         .bind(provider)
         .bind(limit)
+        .bind(mode)
+        .bind(me)
+        .bind(not_by)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -209,18 +259,8 @@ impl Store {
         let intervals: Vec<i64> = (0..REFRESH_STEPS)
             .map(|k| (q.refresh_after_days * 86400.0 * 1.5f64.powi(k)).min(1e12) as i64)
             .collect();
-        let (own, me, legacy) = match q.recorded_by {
-            RecordedBy::Anyone => (false, vec![], vec![]),
-            RecordedBy::OwnOrLegacy { me, legacy } => (
-                true,
-                me.0.to_vec(),
-                legacy
-                    .iter()
-                    .map(|id| data_encoding::HEXLOWER.encode(&id.0))
-                    .collect(),
-            ),
-        };
-        Ok(sqlx::query_scalar(
+        let (mode, me, not_by) = q.recorded_by.binds()?;
+        Ok(sqlx::query_scalar(concat!(
             "WITH s AS (
                SELECT ip, COUNT(*) AS k, MAX(fetched_at) AS last_at
                FROM ip_intel_log WHERE provider = ?1 GROUP BY ip)
@@ -237,11 +277,10 @@ impl Store {
                AND i.ip NOT IN (SELECT value FROM json_each(?7))
                AND (?8 IS NULL OR NOT EXISTS (
                      SELECT 1 FROM ip_intel c WHERE c.ip = i.ip AND c.provider = ?8))
-               AND (NOT ?10 OR (SELECT r.origin IS NULL OR r.origin = ?11
-                                    OR lower(hex(r.origin)) IN (SELECT value FROM json_each(?12))
-                                FROM requests r WHERE r.ip_id = i.id ORDER BY r.id LIMIT 1))
-             ORDER BY i.last_seen DESC, i.id DESC LIMIT ?9",
-        )
+               AND ",
+            recorded_by_sql!(10, 11, 12),
+            " ORDER BY i.last_seen DESC, i.id DESC LIMIT ?9"
+        ))
         .bind(q.provider)
         .bind(format!("-{} seconds", q.step_secs))
         .bind(q.refresh_after_days)
@@ -251,9 +290,9 @@ impl Store {
         .bind(serde_json::to_string(q.skip)?)
         .bind(q.covered_by)
         .bind(q.limit)
-        .bind(own)
+        .bind(mode)
         .bind(me)
-        .bind(serde_json::to_string::<Vec<String>>(&legacy)?)
+        .bind(not_by)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -430,19 +469,25 @@ mod tests {
         assert!(s.intel_candidates(&q).await.unwrap().is_empty());
     }
 
-    /// Protocol 9: a key holder enriches for free its own sources and
-    /// those of members older than the market; a source a member of 9
-    /// recorded is that member's to buy.
+    /// Protocol 9: a key holder enriches for free every source but those
+    /// another market member recorded, which that member buys; a recorder
+    /// buys for its own sources.
     #[tokio::test]
     async fn a_market_member_s_source_is_not_a_free_candidate() {
         use crate::cluster::identity::NodeId;
         let s = test_store().await;
-        let (me, eight, nine) = (NodeId([1; 32]), NodeId([2; 32]), NodeId([3; 32]));
+        let (me, eight, nine, gone) = (
+            NodeId([1; 32]),
+            NodeId([2; 32]),
+            NodeId([3; 32]),
+            NodeId([4; 32]),
+        );
         for (ip, origin) in [
             ("198.51.100.11", Some(me)),
             ("198.51.100.12", Some(eight)),
             ("198.51.100.13", Some(nine)),
             ("198.51.100.14", None),
+            ("198.51.100.15", Some(gone)),
         ] {
             let row = s.upsert_ip(ip.parse().unwrap()).await.unwrap();
             let id = s
@@ -464,31 +509,50 @@ mod tests {
                 .unwrap();
         }
         let p = crate::intel::SHODAN;
-        let mut all = s.intel_candidates(&candidates(p, &[])).await.unwrap();
-        all.sort();
-        assert_eq!(all.len(), 4, "{all:?}");
-        let legacy = [eight];
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        let all = sorted(s.intel_candidates(&candidates(p, &[])).await.unwrap());
+        assert_eq!(all.len(), 5, "{all:?}");
+        // The key holder: not the other market member's (`nine`); the v8
+        // member's, the departed recorder's and the pre-cluster one stay free.
+        let members = [nine];
+        let free = [
+            "198.51.100.11",
+            "198.51.100.12",
+            "198.51.100.14",
+            "198.51.100.15",
+        ];
         let q = IntelCandidates {
-            recorded_by: RecordedBy::OwnOrLegacy {
-                me: &me,
-                legacy: &legacy,
-            },
+            recorded_by: RecordedBy::NotBy(&members),
             ..candidates(p, &[])
         };
-        let mut got = s.intel_candidates(&q).await.unwrap();
-        got.sort();
-        assert_eq!(got, ["198.51.100.11", "198.51.100.12", "198.51.100.14"]);
-        // Only its own: what a recorder buys.
-        let own = IntelCandidates {
-            recorded_by: RecordedBy::OwnOrLegacy {
-                me: &me,
-                legacy: &[],
-            },
+        assert_eq!(sorted(s.intel_candidates(&q).await.unwrap()), free);
+        let m = crate::intel::MAXMIND;
+        assert_eq!(
+            sorted(
+                s.ips_missing_intel(m, 0, RecordedBy::NotBy(&members), 100)
+                    .await
+                    .unwrap()
+            ),
+            free
+        );
+        // The recorder: only its own (and pre-cluster) sources, to buy.
+        let own = ["198.51.100.11", "198.51.100.14"];
+        let q = IntelCandidates {
+            recorded_by: RecordedBy::Own(&me),
             ..candidates(p, &[])
         };
-        let mut got = s.intel_candidates(&own).await.unwrap();
-        got.sort();
-        assert_eq!(got, ["198.51.100.11", "198.51.100.14"]);
+        assert_eq!(sorted(s.intel_candidates(&q).await.unwrap()), own);
+        assert_eq!(
+            sorted(
+                s.ips_missing_intel(m, 0, RecordedBy::Own(&me), 100)
+                    .await
+                    .unwrap()
+            ),
+            own
+        );
     }
 
     #[tokio::test]
