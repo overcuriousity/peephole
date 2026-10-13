@@ -1225,7 +1225,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (node, arbiter, store, _tx) = setup(dir.path()).await;
         give_credits(&store, node.id()).await;
-        node.set_scan_share(0.5);
         selling(&node, 300);
         let ip = store
             .upsert_ip("203.0.113.95".parse().unwrap())
@@ -1258,7 +1257,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (node, arbiter, store, _tx) = setup(dir.path()).await;
         give_credits(&store, node.id()).await;
-        node.set_scan_share(1.0);
         selling(&node, 300);
         let ip = store
             .upsert_ip("203.0.113.98".parse().unwrap())
@@ -1282,7 +1280,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (node, arbiter, store, _tx) = setup(dir.path()).await;
         give_credits(&store, node.id()).await;
-        node.set_scan_share(0.5);
         selling(&node, 300);
         let me = node.id();
         let rec = Recorder::Cluster(node.clone());
@@ -1321,7 +1318,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (node, arbiter, store, _tx) = setup(dir.path()).await;
         give_credits(&store, node.id()).await;
-        node.set_scan_share(0.5);
         selling(&node, 300);
         let ip = store
             .upsert_ip("203.0.113.98".parse().unwrap())
@@ -1826,7 +1822,6 @@ mod tests {
     /// level-4 scans and none at level 1. This node pays both.
     async fn fast_and_flaky(node: &Arc<Node>, store: &crate::store::Store) -> (NodeId, NodeId) {
         give_credits(store, node.id()).await;
-        node.set_scan_share(0.5);
         let fast = remote_scanner(node, 30).await;
         let flaky = remote_scanner(node, 20).await;
         references(node, &[(fast, 30, 100.0), (flaky, 20, 100.0)]);
@@ -1922,7 +1917,6 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (node, arbiter, store, _tx) = setup(dir.path()).await;
             give_credits(&store, node.id()).await;
-            node.set_scan_share(0.5);
             let fast = remote_scanner(&node, 30).await;
             let flaky = remote_scanner(&node, 20).await;
             let fast_can_do = match case {

@@ -1,37 +1,23 @@
 //! Paying for scan jobs. An arbiter funds a job it grants with an offer to
 //! the scanner that names the job; the scanner charges the offered price
 //! when it delivers the result, and nothing otherwise. What an arbiter
-//! commits to its own jobs is bounded by `[credits] scan_share`. Every
+//! commits to its own jobs is bounded by its balance. Every
 //! grant is funded: at the scanner's price, which may be 0 (then without
 //! an offer).
 use super::ledger::{self, Ledger, OfferState};
-use super::{Mc, day_of, price};
+use super::{Mc, price};
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::Record;
 use crate::cluster::{Node, repl};
 use anyhow::Result;
 use std::sync::Arc;
 
-/// What `me` may still hold in or pay for its scan jobs today: `share` of
-/// its balance plus what its scan offers hold and were charged today,
-/// minus those and what its own jobs (`self_mc`) hold. Paying oneself
-/// leaves the balance as it is, so `self_mc` is not added back.
-pub fn budget(l: &Ledger, me: &NodeId, share: f64, self_mc: Mc) -> Mc {
-    let (mut held, mut charged) = (0, 0);
-    for o in l
-        .offers
-        .iter()
-        .filter(|o| o.payer == *me && o.job.is_some())
-    {
-        match o.state {
-            OfferState::Open => held += o.held_now(),
-            OfferState::Charged { charged: c } if day_of(o.hlc) == l.today => charged += c,
-            _ => {}
-        }
-    }
-    let offered = held + charged;
-    let cap = ((l.balance(me) + offered) as f64 * share.clamp(0.0, 1.0)).floor() as Mc;
-    cap.saturating_sub(offered + self_mc)
+/// What `me` may still hold in or pay for its scan jobs: its whole
+/// balance (open offers are held out of it already) minus what its own
+/// jobs (`self_mc`) hold. Paying oneself leaves the balance as it is, so
+/// `self_mc` is held against it here. No daily share (MIK-249).
+pub fn budget(l: &Ledger, me: &NodeId, self_mc: Mc) -> Mc {
+    l.balance(me).saturating_sub(self_mc)
 }
 
 /// What this node's own jobs granted to its own scanner hold (running) or
@@ -147,7 +133,7 @@ pub async fn affordable(node: &Arc<Node>, funding: &mut Funding, min_mc: u32, pr
         return false;
     };
     let left =
-        budget(&book.ledger, &me, node.scan_share(), self_mc).saturating_sub(funding.committed);
+        budget(&book.ledger, &me, self_mc).saturating_sub(funding.committed);
     left >= price as Mc
 }
 
@@ -279,7 +265,7 @@ pub async fn announce_budget(node: &Arc<Node>) -> Result<()> {
     .await?;
     let book = super::book(node).await?;
     let self_mc = self_committed(&node.store.pool, &node.id()).await?;
-    let left = budget(&book.ledger, &node.id(), node.scan_share(), self_mc);
+    let left = budget(&book.ledger, &node.id(), self_mc);
     node.scan_budget_mc.store(
         left.min(u32::MAX as Mc) as u32,
         std::sync::atomic::Ordering::Relaxed,
@@ -326,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_is_a_share_of_what_was_there_today() {
+    fn the_budget_is_the_whole_balance() {
         let earned = [Earned {
             node: id(1),
             hlc: at(DAY, 0),
@@ -385,22 +371,21 @@ mod tests {
             &Default::default(),
             (DAY as u64 * DAY_MS) + 5 * 60_000,
         );
-        // balance 650, committed 300: half of 950 is 475, 175 left.
-        assert_eq!(budget(&l, &id(1), 0.5, 0), 175);
-        assert_eq!(budget(&l, &id(1), 0.0, 0), 0);
-        assert_eq!(budget(&l, &id(1), 1.0, 0), 650);
+        // 1000 earned, 200 charged, 150 held by open offers: 650, all of
+        // it for scan jobs (no daily half, MIK-249).
+        assert_eq!(budget(&l, &id(1), 0), 650);
     }
 
     #[test]
     fn the_budget_counts_own_jobs() {
-        // A balance of 1000 at share 0.5: 500. Own jobs holding 200 leave
-        // the balance as it is: 1000 x 0.5 - 200 = 300 left, as after
-        // paying 200 to another scanner ((800 + 200) x 0.5 - 200).
+        // A balance of 1000 funds jobs up to 1000. Own jobs holding 200
+        // leave the balance as it is: 800 left, as after paying 200 to
+        // another scanner.
         let l = ledger_with_balance(id(1), 1000);
-        assert_eq!(budget(&l, &id(1), 0.5, 0), 500);
-        assert_eq!(budget(&l, &id(1), 0.5, 200), 300);
-        // At share 1 own jobs use up the balance too.
-        assert_eq!(budget(&l, &id(1), 1.0, 1000), 0);
+        assert_eq!(budget(&l, &id(1), 0), 1000);
+        assert_eq!(budget(&l, &id(1), 200), 800);
+        assert_eq!(budget(&l, &id(1), 1000), 0);
+        assert_eq!(budget(&l, &id(1), 1500), 0);
     }
 
     #[tokio::test]
@@ -486,11 +471,10 @@ mod tests {
         .await
         .unwrap();
         node.bootstrap().await.unwrap();
-        node.set_scan_share(0.0);
         let mut f = Funding::default();
         assert!(
             affordable(&node, &mut f, 0, 0).await,
-            "free, even with a share of 0"
+            "free, even with no credits"
         );
         assert!(!affordable(&node, &mut f, 0, 1).await, "no credits");
         assert!(
