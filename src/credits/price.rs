@@ -593,6 +593,14 @@ async fn own_bids(node: &Node, book: &super::Book) -> HashMap<&'static str, Mc> 
         .collect()
 }
 
+/// This node's bid for `good` now, from its own lots (the cached book)
+/// and what its buyer loops want ([`Node::wants`]); nothing a peer says
+/// enters it.
+pub async fn own_bid(node: &Node, good: &str) -> Result<Mc> {
+    let book = super::book(node).await?;
+    Ok(own_bids(node, &book).await.get(good).copied().unwrap_or(0))
+}
+
 /// Where `good`'s next step starts: the last price here (of a table a
 /// refresh made), the kept one, or what members announce.
 async fn current(node: &Node, old: &Table, good: &str, announced: &[u32]) -> Result<Mc> {

@@ -17,6 +17,9 @@ const BATCH: i64 = 50;
 const PARALLEL: usize = 4;
 /// Between passes.
 const EVERY: Duration = Duration::from_secs(60);
+/// Most sources this node wants looked up in an hour: a full batch every
+/// pass (its bid, `credits::bid::Wants`).
+const WANTED_AT_MOST: i64 = BATCH * (3600 / EVERY.as_secs()) as i64;
 /// After a full batch: more are likely due (the backlog after an upgrade).
 const AGAIN: Duration = Duration::from_secs(1);
 /// Longest error text kept in a record.
@@ -204,21 +207,61 @@ async fn ask_once(
     }
 }
 
-/// One member's answer, with an offer unless its price is 0; a decline
-/// naming a higher price is offered that once.
+/// An ask of `ask` mc above this node's `bid`: not bought, and counted.
+fn above_bid(node: &crate::cluster::Node, ask: u64, bid: u64) -> String {
+    use crate::credits::{price, show};
+    node.market.over_bid(price::RDNS);
+    tracing::info!(
+        good = price::RDNS,
+        ask,
+        bid,
+        "market: ask above bid, not bought"
+    );
+    format!(
+        "asks {} credits, above this node's bid of {}",
+        show(ask),
+        show(bid)
+    )
+}
+
+/// One member's answer, with an offer unless its price is 0, and only
+/// when its price is at most this node's `bid` (from its own book); a
+/// decline naming a higher price is offered that once if it is within
+/// the bid. A member of protocol 9 is offered again up to the bid; one
+/// older also at most [`crate::credits::pay::retry_price`]'s bound, as
+/// before.
 async fn ask_rdns(
     node: &std::sync::Arc<crate::cluster::Node>,
     id: crate::cluster::identity::NodeId,
     ip: IpAddr,
+    bid: u64,
 ) -> Result<Vec<String>, String> {
-    use crate::credits::price;
+    use crate::credits::{pay, price};
     let Some(first) = crate::intel::dns::member_price(node, &id, price::RDNS) else {
         return Err("announces no price for reverse names".into());
     };
-    let mut resp = ask_once(node, id, ip, first as u64).await;
+    let first = first as u64;
+    if first > bid {
+        return Err(above_bid(node, first, bid));
+    }
+    let market = node
+        .members()
+        .get(&id)
+        .is_some_and(|m| pay::trades_market(m.proto_max));
+    let bound = match market {
+        true => bid,
+        false => bid.min(first.max(1).saturating_mul(pay::RETRY_AT_MOST)),
+    };
+    let mut resp = ask_once(node, id, ip, first).await;
     if let Ok(r) = &resp
         && r.error.is_some()
-        && let Some(p) = crate::credits::pay::retry_price(first as u64, r.price_mc, true)
+        && let Some(named) = r.price_mc.map(u64::from)
+        && named > bid
+    {
+        above_bid(node, named, bid);
+    } else if let Ok(r) = &resp
+        && r.error.is_some()
+        && let Some(p) = pay::retry_within(first, r.price_mc, true, bound)
     {
         // A declined offer comes with a receipt of nothing: fetch it, so
         // what the first offer held is free for the next one.
@@ -264,9 +307,22 @@ pub async fn buy_pass(
     geo: &crate::intel::SharedGeo,
 ) -> anyhow::Result<usize> {
     use crate::cluster::record::{RdnsRec, Record};
+    use crate::credits::price;
     let me = node.id();
-    let due = node.store.rdns_due_own(BATCH, &me).await?;
+    let mut due = node.store.rdns_due_own(WANTED_AT_MOST, &me).await?;
+    node.wants
+        .lock()
+        .unwrap()
+        .set(price::RDNS, due.len() as u32);
+    due.truncate(BATCH as usize);
     let n = due.len();
+    let bid = match n {
+        0 => 0,
+        _ => price::own_bid(node, price::RDNS)
+            .await
+            .inspect_err(|e| tracing::debug!(?e, "reverse DNS: no bid, buys only what is free"))
+            .unwrap_or(0),
+    };
     let siblings: std::collections::HashSet<_> =
         crate::cluster::owner::fleet::siblings(&node.store)
             .await
@@ -283,12 +339,12 @@ pub async fn buy_pass(
                 continue;
             }
         };
-        let chosen = crate::intel::dns::choose(node, &siblings, geo, crate::credits::price::RDNS);
+        let chosen = crate::intel::dns::choose(node, &siblings, geo, price::RDNS);
         let others = futures::future::join_all(
             chosen
                 .iter()
                 .filter(|r| r.id != me)
-                .map(|r| async { (r.id, ask_rdns(node, r.id, ip).await) }),
+                .map(|r| async { (r.id, ask_rdns(node, r.id, ip, bid).await) }),
         );
         let (own, mut answers) = futures::join!(lookup_here(node, ip), others);
         answers.insert(0, (me, own));
