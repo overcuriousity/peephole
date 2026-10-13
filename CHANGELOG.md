@@ -5,6 +5,17 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-13
+
+### Added
+
+- Fresh provider lookups from a paired device:
+  `GET /api/v1/ips/{addr}/lookup/quote` prices the providers it would ask
+  (per provider and total, like the admin lookup page's offer) and
+  `POST /api/v1/ips/{addr}/lookup` spends the quote once. A stale quote
+  (a provider gone, a price moved) asks and charges nothing. Needs the
+  `act` scope.
+
 ## [0.12.0] - 2026-10-12
 
 ### Added
@@ -1013,6 +1024,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 First release.
 
+[0.13.0]: https://github.com/overcuriousity/peephole/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/overcuriousity/peephole/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/overcuriousity/peephole/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/overcuriousity/peephole/compare/v0.9.0...v0.10.0
