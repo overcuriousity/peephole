@@ -5010,7 +5010,6 @@ async fn a_funded_scan_job_pays_the_scanner_its_price() {
     fund_listeners(&[&na, &nb], &[a.id]).await;
     market_known(&na, b.id).await;
     market_known(&nb, a.id).await;
-    na.node.set_scan_share(0.5);
     // A kept copy of b's price on both nodes, so it is more than the floor
     // and a's reference agrees with b's selling price.
     let key = format!("price:scan:{}", b.id);
@@ -5110,7 +5109,6 @@ async fn a_job_is_granted_at_zero_and_funded_once_the_price_rises() {
     fund_listeners(&[&na, &nb], &[a.id]).await;
     market_known(&na, b.id).await;
     market_known(&nb, a.id).await;
-    na.node.set_scan_share(0.5);
     let key = format!("price:scan:{}", b.id);
     for n in [&na, &nb] {
         n.store.intel_set(&key, "0").await.unwrap();
@@ -5191,7 +5189,6 @@ async fn an_inflated_scanner_price_is_paid_at_the_reference() {
     fund_listeners(&[&na, &nb], &[a.id]).await;
     market_known(&na, b.id).await;
     market_known(&nb, a.id).await;
-    na.node.set_scan_share(0.5);
     let key = format!("price:scan:{}", b.id);
     na.store.intel_set(&key, "1000").await.unwrap();
     nb.store.intel_set(&key, "50000").await.unwrap(); // b claims far more
@@ -5236,7 +5233,6 @@ async fn the_cheaper_scanner_gets_the_job() {
     for (n, of) in [(&na, b.id), (&na, c.id), (&nb, a.id), (&nc, a.id)] {
         market_known(n, of).await;
     }
-    na.node.set_scan_share(0.5);
     for (who, mc) in [(b.id, "3000"), (c.id, "1000")] {
         let key = format!("price:scan:{who}");
         for n in [&na, &nb, &nc] {
@@ -7794,7 +7790,6 @@ async fn offers_written_at_once_are_each_covered() {
         .await
         .unwrap();
     // A round of handing out jobs reads its book now.
-    na.node.set_scan_share(1.0);
     let mut funding = jobs::Funding::default();
     assert!(jobs::affordable(&na.node, &mut funding, 0, 4).await);
     let seqs = futures::future::join_all((0..8).map(|_| pay::make_offer(&na.node, b.id, 3))).await;
