@@ -163,6 +163,7 @@ fn from_row(r: LogRow) -> Result<WireEntry> {
         payload: r.5,
         sig: r.6,
         erased_by: r.7,
+        content: None,
     })
 }
 
@@ -363,7 +364,17 @@ pub async fn entries_after(
             if e.seq != next || full(&out, bytes) || taken >= limit {
                 break;
             }
-            bytes += e.payload.as_ref().map_or(0, Vec::len) + 128;
+            // An upload's bytes ride beside the signed record, when its
+            // origin newly stored them and they are held here; read only
+            // once the entry is sure to go.
+            if e.kind == "upload"
+                && let Some(Record::Upload(u)) = e.record()
+            {
+                e.content = crate::store::uploads::content_for_relay(&mut conn, &u).await?;
+            }
+            bytes += e.payload.as_ref().map_or(0, Vec::len)
+                + e.content.as_ref().map_or(0, Vec::len)
+                + 128;
             next += 1;
             taken += 1;
             out.push(e);
@@ -1074,7 +1085,15 @@ async fn park_or_refuse(
     untrusted: bool,
     st: &mut Applied,
 ) -> Result<()> {
-    let blob = super::rpc::cbor::encode(e)?;
+    // Upload bytes are not parked: they would skip the store's bounds.
+    let blob = if e.content.is_some() {
+        super::rpc::cbor::encode(&WireEntry {
+            content: None,
+            ..e.clone()
+        })?
+    } else {
+        super::rpc::cbor::encode(e)?
+    };
     if untrusted {
         let (n, bytes): (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*), COALESCE(SUM(length(entry)), 0) FROM repl_pending WHERE origin = ?",
@@ -1573,7 +1592,8 @@ pub async fn rematerialize(node: &Node) -> Result<usize> {
         "SELECT origin, seq FROM repl_log
          WHERE payload IS NOT NULL AND applied != 4
            AND kind IN ('request','scan_job','job_adopt','job_status','fp_claim',
-                        'fingerprint','scan_result','scan_audit','ip_intel','skip_batch')
+                        'fingerprint','scan_result','scan_audit','ip_intel','skip_batch',
+                        'upload')
          ORDER BY CASE kind WHEN 'request' THEN 0 WHEN 'scan_job' THEN 1
                             WHEN 'job_adopt' THEN 2 WHEN 'job_status' THEN 3 ELSE 4 END, hlc",
     )
@@ -1692,7 +1712,7 @@ async fn apply_record(
         origin: Some(&e.origin),
         hlc: at,
     };
-    match data::apply(conn, ctx, r).await? {
+    match data::apply_with(conn, ctx, r, e.content.as_deref()).await? {
         Effect::Deferred => {
             return Ok(Settled {
                 deferred: true,
@@ -2238,69 +2258,175 @@ mod tests {
         assert!(sent.verify(), "the origin's signature still holds");
     }
 
-    /// A peer on the interim `latest` that carried roadmap #1 S1+S2 (MIK-188)
-    /// sends `upload` entries with an unsigned `content` field beside the
-    /// signed fields. This build skips the field, keeps the entry as an
-    /// unknown kind and goes on with the origin's log; the sync does not fail.
-    #[tokio::test]
-    async fn an_upload_from_the_interim_build_does_not_fail_the_sync() {
-        #[derive(serde::Serialize)]
-        struct InterimWireEntry {
-            origin: NodeId,
-            seq: u64,
-            hlc: u64,
-            kind: String,
-            uid: Option<String>,
-            #[serde(with = "serde_bytes")]
-            payload: Option<Vec<u8>>,
-            #[serde(with = "serde_bytes")]
-            sig: Option<Vec<u8>>,
-            erased_by: Option<String>,
-            #[serde(with = "serde_bytes")]
-            content: Option<Vec<u8>>,
-        }
-        let (_d, node) = test_node(0).await;
+    fn upload(o: &Identity, seq: u64, hlc: u64, signed: &[u8], sent: Option<&[u8]>) -> WireEntry {
+        use sha2::Digest;
+        let r = Record::Upload(Box::new(super::super::record::UploadRec {
+            uid: format!("{}u{seq}", o.id.uid_prefix()),
+            request_uid: format!("{}r{seq}", o.id.uid_prefix()),
+            ts: "2026-10-01 00:00:00".into(),
+            ip: "203.0.113.21".into(),
+            kind: "put".into(),
+            sniffed_type: "php".into(),
+            size: signed.len() as i64,
+            sha256: sha2::Sha256::digest(signed).to_vec(),
+            answered_path: "/s.php".into(),
+            content_state: "held".into(),
+            carries_content: true,
+            ..Default::default()
+        }));
+        let mut e = WireEntry::sign(o, seq, hlc, &r).unwrap();
+        e.content = sent.map(<[u8]>::to_vec);
+        e
+    }
+
+    async fn upload_state(node: &super::Node, uid: &str) -> String {
+        sqlx::query_scalar("SELECT content_state FROM uploads WHERE uid = ?")
+            .bind(uid)
+            .fetch_one(&node.store.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn trusted_origin(node: &super::Node) -> Identity {
         let a = Identity::generate().unwrap();
-        super::append(&node, &[Record::MemberAdd(info(a.id, "a"))])
+        super::append(node, &[Record::MemberAdd(info(a.id, "a"))])
             .await
             .unwrap();
-        let payload = super::super::rpc::cbor::encode(&serde_json::json!({
-            "uid": "u1", "request_uid": "r1", "ts": "2026-10-11 19:30:00",
-            "ip": "203.0.113.21", "kind": "put", "sniffed_type": "php",
-            "size": 3, "truncated": false, "sha256": vec![9u8; 32],
-            "answered_path": "/s.php", "path_is_prefix": false,
-            "content_state": "held", "carries_content": true
-        }))
-        .unwrap();
-        let signed = WireEntry::sign_kind(&a, 1, now_hlc(1), "upload", payload);
-        let interim = InterimWireEntry {
-            origin: signed.origin,
-            seq: signed.seq,
-            hlc: signed.hlc,
-            kind: signed.kind.clone(),
-            uid: signed.uid.clone(),
-            payload: signed.payload.clone(),
-            sig: signed.sig.clone(),
-            erased_by: None,
-            content: Some(b"<?php".to_vec()),
-        };
-        let wire = super::super::rpc::cbor::encode(&interim).unwrap();
-        let got: WireEntry = super::super::rpc::cbor::decode(&wire).unwrap();
-        assert_eq!(got, signed, "the content field is skipped");
-        assert!(got.verify());
-        assert!(got.record().is_none(), "unknown here");
-        let st = super::apply_batch(&node, vec![got, request(&a, 2, "/after")])
+        a
+    }
+
+    /// An upload's bytes arrive beside the entry, are stored once checked,
+    /// and are relayed with it; the log keeps only the small signed record
+    /// (C4). Tampered bytes are not stored, and the entry still applies and
+    /// is relayed, without them (C1, C3).
+    #[tokio::test]
+    async fn upload_content_is_checked_stored_and_relayed() {
+        let (_d, node) = test_node(0).await;
+        let a = trusted_origin(&node).await;
+        let body = vec![b'A'; 300_000];
+        let good = upload(&a, 1, now_hlc(1), &body, Some(&body));
+        let bad = upload(&a, 2, now_hlc(2), b"signed", Some(b"tampered"));
+        let st = super::apply_batch(&node, vec![good.clone(), bad.clone()])
             .await
             .unwrap();
         assert_eq!((st.applied, st.rejected), (2, 0), "{st:?}");
-        let state: i64 =
-            sqlx::query_scalar("SELECT applied FROM repl_log WHERE origin = ? AND seq = 1")
-                .bind(&a.id.0[..])
-                .fetch_one(&node.store.pool)
+        assert_eq!(
+            upload_state(&node, good.uid.as_deref().unwrap()).await,
+            "held"
+        );
+        assert_eq!(
+            upload_state(&node, bad.uid.as_deref().unwrap()).await,
+            "dropped_mismatch"
+        );
+        let logged: i64 = sqlx::query_scalar(
+            "SELECT MAX(length(payload)) FROM repl_log WHERE origin = ? AND kind = 'upload'",
+        )
+        .bind(&a.id.0[..])
+        .fetch_one(&node.store.pool)
+        .await
+        .unwrap();
+        assert!(
+            logged < 4096,
+            "content never goes into the log ({logged} bytes)"
+        );
+
+        let batch = super::entries_after(&node.store, &[(a.id, 0)], 0, 100, 1 << 20, false)
+            .await
+            .unwrap();
+        let sent = |seq| {
+            batch
+                .entries
+                .iter()
+                .find(|e| e.seq == seq)
+                .expect("relayed")
+        };
+        assert_eq!(sent(1).content.as_deref(), Some(&body[..]));
+        assert!(sent(1).verify());
+        assert_eq!(sent(2).content, None, "nothing held, nothing attached");
+        assert!(sent(2).verify());
+        // The next node takes the relayed bytes as from the origin.
+        let (_d2, next) = test_node(0).await;
+        super::append(&next, &[Record::MemberAdd(info(a.id, "a"))])
+            .await
+            .unwrap();
+        super::apply_batch(&next, batch.entries).await.unwrap();
+        assert_eq!(
+            upload_state(&next, good.uid.as_deref().unwrap()).await,
+            "held"
+        );
+    }
+
+    /// C2: bytes attached to a record that does not carry content are
+    /// ignored, and a parked entry is kept without its bytes.
+    #[tokio::test]
+    async fn upload_bytes_need_the_signed_flag_and_are_not_parked() {
+        use sha2::Digest;
+        let (_d, node) = test_node(0).await;
+        let a = trusted_origin(&node).await;
+        let mut e = upload(&a, 1, now_hlc(1), b"x", None);
+        let Some(Record::Upload(mut r)) = e.record() else {
+            unreachable!()
+        };
+        r.carries_content = false;
+        e = WireEntry::sign(&a, 1, now_hlc(1), &Record::Upload(r)).unwrap();
+        e.content = Some(b"x".to_vec());
+        super::apply_batch(&node, vec![e.clone()]).await.unwrap();
+        assert_eq!(
+            upload_state(&node, e.uid.as_deref().unwrap()).await,
+            "not_received"
+        );
+        let mut c = node.store.pool.acquire().await.unwrap();
+        assert!(
+            !crate::store::uploads::has_blob(&mut c, &sha2::Sha256::digest(b"x"))
                 .await
-                .unwrap();
-        assert_eq!(state, super::UNKNOWN_KIND);
-        assert_eq!(paths(&node).await, ["/after"], "the origin's log goes on");
+                .unwrap()
+        );
+        // From an origin not trusted here yet: parked, bytes dropped.
+        let b = Identity::generate().unwrap();
+        let p = upload(&b, 1, now_hlc(1), b"y", Some(b"y"));
+        let st = super::apply_batch(&node, vec![p]).await.unwrap();
+        assert_eq!(st.parked, 1, "{st:?}");
+        let blob: Vec<u8> = sqlx::query_scalar("SELECT entry FROM repl_pending WHERE origin = ?")
+            .bind(&b.id.0[..])
+            .fetch_one(&mut *c)
+            .await
+            .unwrap();
+        let parked: WireEntry = super::super::rpc::cbor::decode(&blob).unwrap();
+        assert_eq!(parked.content, None);
+        assert!(parked.verify());
+    }
+
+    /// (g) A retention floor drops `upload` entries like requests, and
+    /// maintenance then drops the content nothing refers to.
+    #[tokio::test]
+    async fn retention_drops_uploads_and_gc_their_content() {
+        use sha2::Digest;
+        let (_d, node) = test_node(1).await;
+        let a = trusted_origin(&node).await;
+        let old = (super::hlc::wall_ms() - 3 * 86_400_000) << 16;
+        let up = upload(&a, 1, old, b"old", Some(b"old"));
+        let st = super::apply_batch(&node, vec![up.clone(), request(&a, 2, "/new")])
+            .await
+            .unwrap();
+        assert_eq!(st.applied, 2, "{st:?}");
+        assert_eq!(
+            upload_state(&node, up.uid.as_deref().unwrap()).await,
+            "held"
+        );
+        assert!(super::super::history::prune(&node).await.unwrap() >= 1);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM uploads")
+            .fetch_one(&node.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "the row went with its entry");
+        let report = node.store.daily_maintenance(false).await.unwrap();
+        assert_eq!(report.blobs, 1);
+        let mut c = node.store.pool.acquire().await.unwrap();
+        assert!(
+            !crate::store::uploads::has_blob(&mut c, &sha2::Sha256::digest(b"old"))
+                .await
+                .unwrap()
+        );
     }
 
     /// One entry that fails stops neither the batch nor the other origins.

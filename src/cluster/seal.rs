@@ -111,6 +111,7 @@ pub(crate) async fn digest_of(
         payload: Some(payload),
         sig,
         erased_by: None,
+        content: None,
     };
     // Only what the origin really signed counts.
     if !e.verify() {

@@ -27,6 +27,7 @@
   <div class="tile"><span class="label">Counter-scans</span><div class="value brand">{{ crate::admin::views::thousands(stats.scans_done) }}</div><div class="hint">{{ stats.scanned_ips }} sources</div></div>
   {% if let Some(c) = stats.canaries %}<div class="tile"><span class="label">Harvest to first use</span><div class="value">{{ crate::admin::views::duration(c.median_s) }}</div><div class="hint">median · {{ c.share_pct }} % of harvested credentials used again</div></div>{% endif %}
   {% if stats.tarpit_held_ms > 0 %}<div class="tile"><span class="label">Scanner time wasted</span><div class="value">{{ crate::admin::views::duration(stats.tarpit_held_ms / 1000) }}</div><div class="hint">held by the tarpit</div></div>{% endif %}
+  {% if stats.webshells_dropped > 0 %}<div class="tile"><span class="label">Webshells dropped</span><div class="value">{{ crate::admin::views::thousands(stats.webshells_dropped) }}</div><div class="hint">files uploaded to the trap, kept, never served</div></div>{% endif %}
 </div>
 
 <div class="stack">
@@ -71,6 +72,10 @@
       {% if !ai.models.is_empty() %}<h3>Models asked for</h3>
       <ol class="ranked">{% for n in ai.models %}<li><span class="ranked-name mono">{{ n.name }}</span><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = ai.models_max %}{% include "_bar.html" %}</li>{% endfor %}</ol>{% endif %}
       {% if !ai.apis.is_empty() %}<p class="muted">{% for n in ai.apis %}{{ n.name }} {{ n.count }}{% if !loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
+    </section>{% endif %}
+    {% if !stats.verbs.is_empty() %}<section class="card">
+      <div class="card-head"><h2>Commands sent to dropped webshells</h2><span class="muted">first word; anything off our list counts as other</span></div>
+      <ol class="ranked">{% for n in stats.verbs %}<li><span class="ranked-name mono">{{ n.name }}</span><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = verb_max %}{% include "_bar.html" %}</li>{% endfor %}</ol>
     </section>{% endif %}
   </div>
 

@@ -26,6 +26,7 @@ pub mod signals;
 pub mod sse;
 pub mod system;
 pub mod target;
+pub mod uploads;
 pub mod views;
 
 use crate::config::Config;
@@ -189,6 +190,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(cluster_owner::routes())
         .merge(credits::routes())
         .merge(devices::routes())
+        .merge(uploads::routes())
         .merge(api_v1::routes())
         .fallback(error::not_found)
         .layer(axum::middleware::from_fn_with_state(
