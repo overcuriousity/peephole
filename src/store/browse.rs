@@ -101,6 +101,8 @@ pub struct IpSummary {
     pub max_severity: i64,
     /// Newest AbuseIPDB score (admin pages only show it).
     pub abuse_score: Option<i64>,
+    /// No visit recorded: the row was made for a counter-scan (MIK-329).
+    pub unseen: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -264,7 +266,7 @@ fn ip_summary_select(a: Audience) -> String {
         "SELECT i.ip, i.country, i.asn, i.asn_org, i.is_tor_exit AS is_tor,
                 i.{p}first_seen AS first_seen, i.{p}last_seen AS last_seen,
                 i.{p}request_count AS request_count, i.{p}max_severity AS max_severity,
-                i.abuse_score
+                i.abuse_score, i.unseen
          FROM ips i"
     )
 }
@@ -870,7 +872,7 @@ impl Store {
             Audience::Public => {
                 "SELECT id, ip, pub_first_seen AS first_seen, pub_last_seen AS last_seen,
                         country, asn, asn_org, is_tor_exit, fp_claimed, notes,
-                        pub_request_count AS request_count, pub_max_severity AS max_severity
+                        pub_request_count AS request_count, pub_max_severity AS max_severity, unseen
                  FROM ips WHERE id = ? AND pub_request_count > 0"
             }
         };

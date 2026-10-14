@@ -57,6 +57,8 @@ pub struct IpRow {
     /// Read models kept by triggers (migration 0019).
     pub request_count: i64,
     pub max_severity: i64,
+    /// No visit recorded: the row was made for a counter-scan (MIK-329).
+    pub unseen: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -186,10 +188,15 @@ impl Store {
             // Results may have arrived before the IP did.
             super::data::refresh_ip_view(&mut conn, &s).await?;
         } else {
-            sqlx::query("UPDATE ips SET last_seen = datetime('now') WHERE ip = ?")
-                .bind(&s)
-                .execute(&mut *conn)
-                .await?;
+            sqlx::query(
+                "UPDATE ips SET last_seen = datetime('now'),
+                   first_seen = CASE unseen WHEN 1 THEN datetime('now') ELSE first_seen END,
+                   unseen = 0
+                 WHERE ip = ?",
+            )
+            .bind(&s)
+            .execute(&mut *conn)
+            .await?;
         }
         let row = sqlx::query_as::<_, IpRow>("SELECT * FROM ips WHERE ip = ?")
             .bind(&s)
