@@ -161,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
                 )
                 .init();
+            peephole::supervise::install_panic_hook();
             return peephole::run(config).await;
         }
     }
