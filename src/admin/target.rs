@@ -161,7 +161,11 @@ pub async fn load(
         week_json: serde_json::to_string(&ov.week).unwrap_or_else(|_| "[]".into()),
         calendar_json: serde_json::to_string(&ov.calendar).unwrap_or_else(|_| "[]".into()),
         family_max: ov.families.iter().map(|f| f.count).max().unwrap_or(0),
-        intel: intel_cards(state.store.intel_for_ip(&ip.ip).await?, authed),
+        intel: {
+            let mut cards = intel_cards(state.store.intel_for_ip(&ip.ip).await?, authed);
+            crate::admin::public::apply_rdap_pick(&mut cards, state.store.rdap_pick(&ip.ip).await?);
+            cards
+        },
         page: requests,
         admin,
         labels: crate::admin::public::labels_shown(state, authed),

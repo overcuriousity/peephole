@@ -470,7 +470,8 @@ pub async fn resolve_name(
     resolve: impl AsyncFn(&str) -> Result<Vec<IpAddr>, String>,
 ) -> Result<(NamesView, Vec<IpAddr>), String> {
     use crate::intel::dns;
-    let (tally, record) = dns::lookup_with(&state.recorder, &state.geo, name, resolve).await?;
+    let (tally, record) =
+        dns::lookup_with(&state.recorder, &state.geo, name, dns::Buy::Manual, resolve).await?;
     let label = |id: &crate::cluster::identity::NodeId| match state.recorder.node() {
         Some(node) => match dns::describe(node, &state.geo, id) {
             (n, Some(c)) => format!("{n} ({c})"),
@@ -765,6 +766,7 @@ mod tests {
                 node: None,
             }),
             others: vec![],
+            disputed: vec![],
         }
     }
 

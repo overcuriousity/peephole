@@ -236,7 +236,7 @@ pub async fn sale(
     };
     let book = crate::credits::book(node).await?;
     let self_mc = crate::credits::jobs::self_committed(&state.store.pool, &node.id()).await?;
-    let left = crate::credits::jobs::budget(&book.ledger, &node.id(), node.scan_share(), self_mc);
+    let left = crate::credits::jobs::budget(&book.ledger, &node.id(), self_mc);
     if (left as u64) < price.floor_mc {
         return Ok(Err(NotSold::NoBudget));
     }

@@ -133,25 +133,22 @@ pub struct CreditsConfig {
     /// them (0 to 1; 0: this node audits nothing).
     #[serde(default = "default_audit_share")]
     pub audit_share: f64,
-    /// Share of this node's credits its own scan jobs may hold or pay for
-    /// in a day (0 to 1; 0: only scanners priced at 0 take its jobs).
-    #[serde(default = "default_scan_share")]
-    pub scan_share: f64,
+    /// Obsolete and ignored since 0.14.0: a node's scan jobs may hold or
+    /// pay for its whole balance. Read only to say so
+    /// ([`Config::obsolete_notes`]).
+    #[serde(default)]
+    pub scan_share: Option<toml::Value>,
 }
 
 fn default_audit_share() -> f64 {
     0.05
 }
 
-fn default_scan_share() -> f64 {
-    0.5
-}
-
 impl Default for CreditsConfig {
     fn default() -> Self {
         Self {
             audit_share: default_audit_share(),
-            scan_share: default_scan_share(),
+            scan_share: None,
         }
     }
 }
@@ -160,9 +157,6 @@ impl CreditsConfig {
     pub fn check(&self) -> anyhow::Result<()> {
         if !(0.0..=1.0).contains(&self.audit_share) {
             anyhow::bail!("credits.audit_share must be between 0 and 1");
-        }
-        if !(0.0..=1.0).contains(&self.scan_share) {
-            anyhow::bail!("credits.scan_share must be between 0 and 1");
         }
         Ok(())
     }
@@ -658,7 +652,6 @@ const OPTIONAL_KEYS: &[(&str, &str, &str)] = &[
     ("enrichment", "offer_per_day", "1000"),
     ("enrichment", "reverse_dns", "true"),
     ("credits", "audit_share", "0.05"),
-    ("credits", "scan_share", "0.5"),
 ];
 
 /// Sections that are required when their role is on and unused otherwise.
@@ -689,6 +682,13 @@ impl Config {
             notes.push(
                 "note: `cluster.remote_config` is ignored: config keys were replaced by the \
                  ownership key (peephole owner new, peephole owner claim); remove the key"
+                    .into(),
+            );
+        }
+        if self.credits.scan_share.is_some() {
+            notes.push(
+                "note: `credits.scan_share` is ignored: a node's scan jobs may hold or pay for \
+                 its whole balance; remove the key"
                     .into(),
             );
         }
@@ -1846,19 +1846,27 @@ data_dir = "/tmp"
         }
     }
 
+    /// A 0.13 config's `scan_share` still loads and checks, whatever its
+    /// value, and is reported as ignored (MIK-249).
     #[test]
-    fn the_scan_share_defaults_to_half_and_is_a_share() {
+    fn the_scan_share_loads_and_is_reported_as_ignored() {
         let base = "database_path = \"/x\"\ndata_dir = \"/x\"\ntrap_listen = \"127.0.0.1:1\"\n";
         let cfg: Config = toml::from_str(base).unwrap();
-        assert_eq!(cfg.credits.scan_share, 0.5);
-        let cfg: Config = toml::from_str(&format!("{base}[credits]\nscan_share = 0\n")).unwrap();
-        assert_eq!(cfg.credits.scan_share, 0.0);
-        assert!(cfg.credits.check().is_ok());
-        for bad in ["-0.1", "1.5"] {
+        assert!(cfg.credits.scan_share.is_none());
+        assert!(
+            !cfg.obsolete_notes()
+                .iter()
+                .any(|n| n.contains("scan_share"))
+        );
+        for v in ["0.5", "0", "1.5"] {
             let cfg: Config =
-                toml::from_str(&format!("{base}[credits]\nscan_share = {bad}\n")).unwrap();
-            let err = cfg.credits.check().unwrap_err().to_string();
-            assert_eq!(err, "credits.scan_share must be between 0 and 1", "{bad}");
+                toml::from_str(&format!("{base}[credits]\nscan_share = {v}\n")).unwrap();
+            assert!(cfg.credits.check().is_ok(), "{v}");
+            let notes = cfg.obsolete_notes();
+            assert!(
+                notes.len() == 1 && notes[0].starts_with("note: `credits.scan_share` is ignored"),
+                "{notes:?}"
+            );
         }
     }
 

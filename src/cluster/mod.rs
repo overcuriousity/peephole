@@ -287,6 +287,9 @@ pub struct Node {
     pub reach: crate::credits::reach::Tracker,
     /// Paid requests counted for this node's prices (`credits::price`).
     pub market: crate::credits::price::Demand,
+    /// Units of each good this node's buyer loops want this hour, for its
+    /// bids (`credits::bid`).
+    pub wants: std::sync::Mutex<crate::credits::bid::Wants>,
     /// The relay leases this node sells to outbound-only members.
     pub relay_leases: relay::Leases,
     /// The relay leases this outbound-only node took.
@@ -297,7 +300,6 @@ pub struct Node {
     /// (`credits::jobs::announce_budget`).
     pub scan_budget_mc: std::sync::atomic::AtomicU32,
     pub scan_queued: std::sync::atomic::AtomicU32,
-    scan_share: std::sync::OnceLock<f64>,
     /// Offers a paid lookup is being served for right now: `(payer,
     /// sequence number)`. An offer is served once.
     pub(crate) serving_offers: Mutex<std::collections::HashSet<(NodeId, u64)>>,
@@ -380,12 +382,12 @@ impl Node {
             price_table: Default::default(),
             reach: Default::default(),
             market: Default::default(),
+            wants: Default::default(),
             relay_leases: Default::default(),
             leased: Default::default(),
             weights: Default::default(),
             scan_budget_mc: Default::default(),
             scan_queued: Default::default(),
-            scan_share: Default::default(),
             serving_offers: Mutex::new(Default::default()),
             spending: Default::default(),
             drawing: Default::default(),
@@ -405,6 +407,13 @@ impl Node {
             unserved: Default::default(),
             own_acked: Default::default(),
         });
+        // Readers tell this node's rows from the others' by it (RDAP).
+        node.store
+            .intel_set(
+                crate::store::data::SELF_ORIGIN_KEY,
+                &data_encoding::HEXUPPER.encode(&node.id().0),
+            )
+            .await?;
         // Our clock must not run behind anything already in the log, and
         // never behind our own entries: peers ignore an entry of ours that
         // is not later than the one before (see `repl`), also after the
@@ -595,15 +604,6 @@ impl Node {
     pub fn set_price_table(&self, t: Arc<crate::credits::price::Table>) {
         *self.price_table.write().unwrap() = t;
         self.publish_status();
-    }
-
-    /// `[credits] scan_share`: set once at start.
-    pub fn set_scan_share(&self, share: f64) {
-        let _ = self.scan_share.set(share.clamp(0.0, 1.0));
-    }
-
-    pub fn scan_share(&self) -> f64 {
-        self.scan_share.get().copied().unwrap_or(0.0)
     }
 
     /// The address this node would dial `id` at, if it has one.

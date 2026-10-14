@@ -5,6 +5,7 @@ pub mod geo;
 pub mod lookup;
 pub mod provider;
 pub mod rdap;
+pub mod rdap_check;
 pub mod rdns;
 pub mod share;
 pub mod shodan;
@@ -35,6 +36,8 @@ pub struct ProviderInfo {
     /// Whether its terms allow passing its results on: only these stay in
     /// a redistributable export.
     pub redistributable: bool,
+    /// Whether it answers for IPv6 addresses.
+    pub ipv6: bool,
 }
 
 pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
@@ -45,6 +48,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: false,
         tag_prefix: "tor",
         redistributable: true,
+        ipv6: true,
     },
     ProviderInfo {
         name: MAXMIND,
@@ -53,6 +57,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: false,
         tag_prefix: "maxmind",
         redistributable: false,
+        ipv6: true,
     },
     ProviderInfo {
         name: ABUSEIPDB,
@@ -61,6 +66,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: true,
         tag_prefix: "abuseipdb",
         redistributable: false,
+        ipv6: true,
     },
     ProviderInfo {
         name: RDAP,
@@ -69,6 +75,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: true,
         tag_prefix: "rdap",
         redistributable: false,
+        ipv6: true,
     },
     ProviderInfo {
         name: SHODAN,
@@ -77,6 +84,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: true,
         tag_prefix: "shodan",
         redistributable: false,
+        ipv6: true,
     },
     ProviderInfo {
         name: INTERNETDB,
@@ -85,6 +93,7 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         api: true,
         tag_prefix: "internetdb",
         redistributable: false,
+        ipv6: false,
     },
 ];
 
@@ -94,6 +103,12 @@ pub const MAX_PEER_DATA_BYTES: usize = 32 * 1024;
 
 pub fn provider_info(name: &str) -> Option<&'static ProviderInfo> {
     KNOWN_PROVIDERS.iter().find(|p| p.name == name)
+}
+
+/// Whether `name` is asked about IPv6 addresses ([`ProviderInfo::ipv6`];
+/// a provider this version does not know is).
+pub fn asks_ipv6(name: &str) -> bool {
+    provider_info(name).is_none_or(|i| i.ipv6)
 }
 
 /// Tags of one result, for filtering the admin IP list (stored with the
@@ -269,6 +284,21 @@ async fn enrich_provider(
 ) -> anyhow::Result<usize> {
     let step = provider::step_in_secs(rank_for(rec, p.name()));
     let info = provider_info(p.name());
+    // Protocol 9: a provider the recorder buys is given away except for the
+    // sources of the other market members, who buy it.
+    let others: Vec<_> = rec
+        .node()
+        .filter(|n| bought_by_recorder(p.name()) && crate::credits::pay::trades_market(n.proto.1))
+        .map(|n| {
+            let me = n.id();
+            n.members()
+                .iter()
+                .filter(|(id, m)| **id != me && crate::credits::pay::trades_market(m.proto_max))
+                .map(|(id, _)| *id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let recorded_by = crate::store::requests::RecordedBy::NotBy(&others);
     let ips = if info.is_some_and(|i| i.api) {
         let mut step = step;
         let covered_by = (p.name() == INTERNETDB).then_some(SHODAN);
@@ -284,12 +314,13 @@ async fn enrich_provider(
                 ipv6: p.ipv6(),
                 skip: &skip,
                 covered_by,
+                recorded_by,
                 limit: p.batch(),
             })
             .await?
     } else {
         rec.store()
-            .ips_missing_intel(p.name(), step, p.batch())
+            .ips_missing_intel(p.name(), step, recorded_by, p.batch())
             .await?
     };
     if ips.is_empty() {
@@ -325,6 +356,14 @@ pub async fn enrich_loop(
             rec.clone(),
             p.clone(),
             providers.clone(),
+            shutdown.clone(),
+        ));
+    }
+    if let (Some(node), Some(rdap)) = (rec.node(), providers.iter().find(|p| p.name() == RDAP)) {
+        tokio::spawn(check_loop(
+            rec.clone(),
+            rdap.clone(),
+            node.identity.derive_key(rdap_check::KEY_LABEL),
             shutdown.clone(),
         ));
     }
@@ -366,6 +405,306 @@ async fn provider_loop(
             Err(e) => warn!(provider = p.name(), ?e, "enrichment pass failed"),
         }
     }
+}
+
+/// Whether the recorder of a source buys `name`'s answer about it
+/// (protocol 9): a provider traded in the market. RDAP and the rest are
+/// fetched by the able nodes in turns and shared for free.
+pub fn bought_by_recorder(name: &str) -> bool {
+    use crate::credits::price::{MARKET_GOODS, NOT_TRADED};
+    provider_info(name).is_some() && MARKET_GOODS.contains(&name) && !NOT_TRADED.contains(&name)
+}
+
+/// How often the recorder's buyer runs.
+const BUY_TICK: Duration = Duration::from_secs(60);
+/// Buyer passes an hour.
+const BUYS_PER_HOUR: i64 = 3600 / BUY_TICK.as_secs() as i64;
+/// How long a source asked for is not asked again: a bought answer reaches
+/// this node by replication, a declined one waits its turn.
+const BUY_PAUSE: Duration = Duration::from_secs(3600);
+
+/// Sources the buyer asked for lately, by provider and address.
+#[derive(Debug, Default)]
+pub struct Asked(std::collections::HashMap<(String, String), std::time::Instant>);
+
+impl Asked {
+    fn skip(&mut self, provider: &str) -> Vec<String> {
+        self.0.retain(|_, at| at.elapsed() < BUY_PAUSE);
+        self.0
+            .keys()
+            .filter(|(p, _)| p == provider)
+            .map(|(_, ip)| ip.clone())
+            .collect()
+    }
+}
+
+/// One pass of the recorder's buyer (protocol 9): for each provider of
+/// [`bought_by_recorder`] that `own` does not serve, the node's own
+/// sources that lack its answer (or are due again after
+/// `refresh_after_days`) are wanted, capped at what a provider asks in an
+/// hour; up to a batch of them is bought, each at most at this node's bid
+/// and only from members of the free market. The serving node writes the
+/// answer into the dataset (`pay::serve`), so data its terms keep from
+/// redistribution goes nowhere else. An ask above the bid is not offered
+/// and counted. Returns how many answers were bought.
+pub async fn buy_pass(
+    node: &Arc<crate::cluster::Node>,
+    own: &Providers,
+    refresh_after_days: f64,
+    asked: &mut Asked,
+) -> anyhow::Result<usize> {
+    use crate::credits::{pay, price};
+    if !pay::trades_market(node.proto.1) {
+        return Ok(0);
+    }
+    let me = node.id();
+    let mut bought = 0;
+    for info in KNOWN_PROVIDERS
+        .iter()
+        .filter(|i| bought_by_recorder(i.name))
+    {
+        let name = info.name;
+        if own.iter().any(|p| p.name() == name && p.ready()) {
+            node.wants.lock().unwrap().set(name, 0);
+            continue;
+        }
+        let members = node.members();
+        let Some(ask) = pay::quotes(node, own)
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|q| {
+                members
+                    .get(&q.server)
+                    .is_some_and(|m| pay::trades_market(m.proto_max))
+            })
+            .map(|q| q.price_mc as crate::credits::Mc)
+            .min()
+        else {
+            // No member of the market sells it: it takes no share of the
+            // budget from goods that can be bought.
+            node.wants.lock().unwrap().set(name, 0);
+            continue;
+        };
+        let skip = asked.skip(name);
+        let due = node
+            .store
+            .intel_candidates(&crate::store::requests::IntelCandidates {
+                provider: name,
+                step_secs: 0,
+                // A dataset like MaxMind's is looked up once, not refreshed.
+                refresh_after_days: if info.api { refresh_after_days } else { 0.0 },
+                ipv6: info.ipv6,
+                skip: &skip,
+                covered_by: None,
+                recorded_by: crate::store::requests::RecordedBy::Own(&me),
+                limit: api::BATCH * BUYS_PER_HOUR,
+            })
+            .await?;
+        node.wants.lock().unwrap().set(name, due.len() as u32);
+        if due.is_empty() {
+            continue;
+        }
+        let bid = match price::own_bid(node, name).await {
+            Ok(bid) => bid,
+            Err(e) => {
+                // Not a refusal: nothing is counted against the ask.
+                warn!(?e, provider = name, "market: no bid, nothing bought");
+                continue;
+            }
+        };
+        if ask > bid {
+            node.market.over_bid(name);
+            info!(good = name, ask, bid, "market: ask above bid, not bought");
+            continue;
+        }
+        let wanted = [name.to_string()];
+        for ip in due.into_iter().take(api::BATCH as usize) {
+            let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+                continue;
+            };
+            asked
+                .0
+                .insert((name.to_string(), ip), std::time::Instant::now());
+            let answers = pay::ask(node, own, addr, &wanted, &wanted, Some(bid)).await;
+            if answers
+                .iter()
+                .any(|a| a.resp.findings.iter().any(|f| f.provider == name))
+            {
+                bought += 1;
+            }
+        }
+    }
+    Ok(bought)
+}
+
+/// Buy the answers of keyed providers about this node's own sources
+/// ([`buy_pass`]) until shutdown.
+pub async fn buy_loop(
+    node: Arc<crate::cluster::Node>,
+    providers: Providers,
+    refresh_after_days: f64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut asked = Asked::default();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(BUY_TICK) => {}
+            _ = shutdown.changed() => break,
+        }
+        match buy_pass(&node, &providers, refresh_after_days, &mut asked).await {
+            Ok(0) => {}
+            Ok(n) => info!(n, "enrichment: answers bought"),
+            Err(e) => warn!(?e, "enrichment buyer pass failed"),
+        }
+    }
+}
+
+/// How often the RDAP spot-check runs.
+const CHECK_TICK: Duration = Duration::from_secs(120);
+
+/// Spot-check other origins' RDAP rows until shutdown ([`check_pass`]).
+async fn check_loop(
+    rec: Recorder,
+    rdap: Arc<dyn provider::Provider>,
+    key: [u8; 32],
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(CHECK_TICK) => {}
+            _ = shutdown.changed() => break,
+        }
+        if !rdap.ready() {
+            continue;
+        }
+        match check_pass(&rec, rdap.as_ref(), &key, rdap_check::RECHECK_AFTER).await {
+            Ok(c) if c.disputed > 0 => {
+                warn!(
+                    ?c,
+                    "rdap spot-check: a member's registry answers differ from ours"
+                )
+            }
+            Ok(c) if c != Checked::default() => debug!(?c, "rdap spot-check"),
+            Ok(_) => {}
+            Err(e) => warn!(?e, "rdap spot-check failed"),
+        }
+    }
+}
+
+/// What one [`check_pass`] did.
+#[derive(Debug, Default, PartialEq)]
+pub struct Checked {
+    /// Same tags as this node's own query.
+    pub agreed: usize,
+    /// Different once: asked again after [`rdap_check::RECHECK_AFTER`].
+    pub pending: usize,
+    /// Different twice: this node wrote its own row, a dispute counted.
+    pub disputed: usize,
+}
+
+/// One RDAP spot-check pass: up to [`rdap_check::CHECK_BATCH`] RDAP rows
+/// that another origin wrote in the last [`rdap_check::CHECK_WINDOW_DAYS`]
+/// days, are [`rdap_check::designated`] for this node and are not checked
+/// yet, asked again through `rdap` (the provider the enrichment uses, so
+/// the same rate limits apply). Same tags: checked. Different: asked once
+/// more after `recheck_after`; still different, this node records its own
+/// row and the origin gets a dispute (`rdap_checks`, local). A dispute is
+/// only counted: blocking a member stays the operator's decision.
+pub async fn check_pass(
+    rec: &Recorder,
+    rdap: &dyn provider::Provider,
+    me_key: &[u8; 32],
+    recheck_after: Duration,
+) -> anyhow::Result<Checked> {
+    let me = rec.node_id().map(|id| id.0.to_vec()).unwrap_or_default();
+    let pool = &rec.store().pool;
+    // First mismatches that waited long enough, then new rows.
+    let mut todo: Vec<(String, Vec<u8>, bool)> = sqlx::query_as::<_, (String, Vec<u8>)>(
+        "SELECT ip, origin FROM rdap_checks
+         WHERE agreed IS NULL AND checked_at <= datetime('now', ?)
+         ORDER BY checked_at LIMIT ?",
+    )
+    .bind(format!("-{} seconds", recheck_after.as_secs()))
+    .bind(rdap_check::CHECK_BATCH)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(ip, origin)| (ip, origin, true))
+    .collect();
+    let fresh: Vec<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT i.ip, i.origin FROM ip_intel i
+         WHERE i.provider = ? AND i.origin != ? AND length(i.origin) > 0
+           AND i.fetched_at >= datetime('now', ?)
+           AND NOT EXISTS (SELECT 1 FROM rdap_checks c WHERE c.ip = i.ip AND c.origin = i.origin
+                             AND (c.agreed IS NOT 1 OR c.checked_at >= i.fetched_at))
+         ORDER BY i.fetched_at DESC",
+    )
+    .bind(RDAP)
+    .bind(&me)
+    .bind(format!("-{} days", rdap_check::CHECK_WINDOW_DAYS))
+    .fetch_all(pool)
+    .await?;
+    let room = (rdap_check::CHECK_BATCH as usize).saturating_sub(todo.len());
+    todo.extend(
+        fresh
+            .into_iter()
+            .filter(|(ip, _)| rdap_check::designated(me_key, ip))
+            .take(room)
+            .map(|(ip, origin)| (ip, origin, false)),
+    );
+    let mut out = Checked::default();
+    for (ip, origin, second) in todo {
+        let theirs: Option<String> = sqlx::query_scalar(
+            "SELECT data_json FROM ip_intel WHERE ip = ? AND provider = ? AND origin = ?",
+        )
+        .bind(&ip)
+        .bind(RDAP)
+        .bind(&origin)
+        .fetch_optional(pool)
+        .await?;
+        let Some(theirs) = theirs else { continue };
+        // Not answered now: asked again next pass.
+        let Some(own) = rdap
+            .lookup(std::slice::from_ref(&ip))
+            .await
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        let as_map = |v: serde_json::Value| v.as_object().cloned().unwrap_or_default();
+        let theirs = as_map(serde_json::from_str(&theirs).unwrap_or_default());
+        let agreed = rdap::tags(&as_map(own.data.clone())) == rdap::tags(&theirs);
+        let state = match (agreed, second) {
+            (true, _) => {
+                out.agreed += 1;
+                Some(true)
+            }
+            (false, false) => {
+                out.pending += 1;
+                None
+            }
+            (false, true) => {
+                rec.record_lookup(&ip, RDAP, own.source_version.as_deref(), own.data)
+                    .await?;
+                out.disputed += 1;
+                Some(false)
+            }
+        };
+        sqlx::query(
+            "INSERT INTO rdap_checks (ip, origin, checked_at, agreed) VALUES (?, ?, ?, ?)
+             ON CONFLICT(ip, origin) DO UPDATE SET
+               checked_at = excluded.checked_at, agreed = excluded.agreed",
+        )
+        .bind(&ip)
+        .bind(&origin)
+        .bind(crate::store::data::now_ts())
+        .bind(state)
+        .execute(pool)
+        .await?;
+    }
+    Ok(out)
 }
 
 fn is_stale_at(value: Option<&str>) -> bool {
@@ -789,6 +1128,142 @@ async fn run_cluster(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An RDAP provider that answers every IP with `data`.
+    struct FixedRdap(serde_json::Value);
+
+    impl provider::Provider for FixedRdap {
+        fn name(&self) -> &'static str {
+            RDAP
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn lookup<'a>(
+            &'a self,
+            ips: &'a [String],
+        ) -> futures::future::BoxFuture<'a, Vec<provider::Finding>> {
+            Box::pin(async move {
+                ips.iter()
+                    .map(|ip| provider::Finding {
+                        ip: ip.clone(),
+                        source_version: None,
+                        data: self.0.clone(),
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    /// A store holding one RDAP row of another origin, for an IP `key`
+    /// designates; returns the IP and that origin.
+    async fn peer_rdap_row(key: &[u8; 32], data: &str) -> (Store, String, Vec<u8>) {
+        use crate::cluster::record::{IpIntelRec, Record};
+        use crate::store::data::{Ctx, apply};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        std::mem::forget(dir);
+        let store = Store::connect(&path).await.unwrap();
+        let ip = (0..255u8)
+            .map(|i| format!("198.51.100.{i}"))
+            .find(|ip| rdap_check::designated(key, ip))
+            .expect("one of 255 is designated");
+        let peer = crate::cluster::identity::Identity::generate().unwrap().id;
+        let rec = Record::IpIntel(IpIntelRec {
+            build: String::new(),
+            ip: ip.clone(),
+            provider: RDAP.into(),
+            fetched_at: crate::store::data::now_ts(),
+            source_version: None,
+            data_json: data.into(),
+        });
+        let mut conn = store.pool.acquire().await.unwrap();
+        let ctx = Ctx {
+            origin: Some(&peer),
+            hlc: crate::cluster::hlc::Hlc::new().now(),
+        };
+        apply(&mut conn, ctx, &rec).await.unwrap();
+        (store, ip, peer.0.to_vec())
+    }
+
+    async fn rdap_rows(store: &Store) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM ip_intel WHERE provider = 'rdap'")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_wrong_country_is_disputed_after_a_second_query() {
+        let key = [7u8; 32];
+        let (store, ip, peer) = peer_rdap_row(&key, r#"{"country":"US"}"#).await;
+        let rec = store.local();
+        let own = FixedRdap(serde_json::json!({"country": "DE"}));
+        let first = check_pass(&rec, &own, &key, Duration::ZERO).await.unwrap();
+        assert_eq!(first.pending, 1, "{first:?}");
+        assert_eq!(
+            rdap_rows(&store).await,
+            1,
+            "nothing written after one query"
+        );
+        // Not due again before the wait is over.
+        let early = check_pass(&rec, &own, &key, Duration::from_secs(600))
+            .await
+            .unwrap();
+        assert_eq!(early, Checked::default());
+        let second = check_pass(&rec, &own, &key, Duration::ZERO).await.unwrap();
+        assert_eq!(second.disputed, 1, "{second:?}");
+        assert_eq!(rdap_rows(&store).await, 2, "this node's own row");
+        let counts = rdap_check::counts(&store.pool).await.unwrap();
+        assert_eq!(counts.get(&peer), Some(&(1, 1)), "disputes[origin] = 1");
+        let own_row: String = sqlx::query_scalar(
+            "SELECT data_json FROM ip_intel WHERE ip = ? AND provider = 'rdap' AND origin = x''",
+        )
+        .bind(&ip)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert!(own_row.contains("DE"), "{own_row}");
+        // Checked for good: not asked again.
+        let again = check_pass(&rec, &own, &key, Duration::ZERO).await.unwrap();
+        assert_eq!(again, Checked::default());
+    }
+
+    #[tokio::test]
+    async fn matching_tags_are_checked_and_write_nothing() {
+        let key = [9u8; 32];
+        let (store, _ip, peer) = peer_rdap_row(&key, r#"{"country":"de","fresh":false}"#).await;
+        let rec = store.local();
+        // Other fields may differ: only the tags count.
+        let own = FixedRdap(serde_json::json!({"country": "DE", "name": "X"}));
+        let c = check_pass(&rec, &own, &key, Duration::ZERO).await.unwrap();
+        assert_eq!(c.agreed, 1, "{c:?}");
+        assert_eq!(rdap_rows(&store).await, 1);
+        let counts = rdap_check::counts(&store.pool).await.unwrap();
+        assert_eq!(counts.get(&peer), Some(&(1, 0)));
+        let again = check_pass(&rec, &own, &key, Duration::ZERO).await.unwrap();
+        assert_eq!(again, Checked::default(), "checked once per row");
+    }
+
+    #[tokio::test]
+    async fn rows_not_designated_are_not_checked() {
+        let key = [7u8; 32];
+        let (store, _ip, _peer) = peer_rdap_row(&key, r#"{"country":"US"}"#).await;
+        let other = (0u8..)
+            .map(|i| [i; 32])
+            .find(|k| {
+                (0..255u8)
+                    .map(|i| format!("198.51.100.{i}"))
+                    .find(|ip| rdap_check::designated(&key, ip))
+                    .is_some_and(|ip| !rdap_check::designated(k, &ip))
+            })
+            .unwrap();
+        let own = FixedRdap(serde_json::json!({"country": "DE"}));
+        let c = check_pass(&store.local(), &own, &other, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(c, Checked::default());
+    }
 
     #[test]
     fn a_removed_provider_is_unknown() {

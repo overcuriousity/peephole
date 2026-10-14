@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Highest protocol version this build speaks.
-pub const PROTO_VERSION: u32 = 8;
+pub const PROTO_VERSION: u32 = 9;
 /// Lowest protocol version this build still speaks. Version 1 let any
 /// member revoke others and delete their records; it is not spoken.
 pub const PROTO_MIN: u32 = 2;
@@ -24,6 +24,11 @@ pub const ROUTED_PROTO: u32 = 6;
 /// older nodes refuse the grant as an invalid scan level, so the job would
 /// bounce instead of waiting for a capable scanner.
 pub const VULN_SCAN_PROTO: u32 = 8;
+/// First version of the free market: each node sets its own asks, and its
+/// automatic buyers bid from their own balance (`credits::bid`) and buy
+/// only at an ask at most their bid. Older members trade under the rules
+/// of protocol 7.
+pub const MARKET_PROTO: u32 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Hello {
@@ -54,5 +59,17 @@ mod tests {
         assert_eq!(negotiate((1, 3), (2, 5)), Some(3));
         assert_eq!(negotiate((1, 1), (1, 1)), Some(1));
         assert_eq!(negotiate((1, 2), (3, 4)), None);
+    }
+
+    #[test]
+    fn the_market_is_the_newest_protocol() {
+        assert_eq!(MARKET_PROTO, 9);
+        assert_eq!(PROTO_VERSION, MARKET_PROTO);
+        const { assert!(MARKET_PROTO > VULN_SCAN_PROTO) };
+        // A member of protocol 8 still meets one of 9, at 8.
+        assert_eq!(
+            negotiate((PROTO_MIN, VULN_SCAN_PROTO), (PROTO_MIN, PROTO_VERSION)),
+            Some(VULN_SCAN_PROTO)
+        );
     }
 }

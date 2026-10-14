@@ -194,6 +194,18 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         "enrichment",
         intel::enrich_loop(recorder.clone(), providers.clone(), shutdown_rx.clone()),
     );
+    // Keyed providers' answers about this node's own sources, bought.
+    if let Some(n) = &node {
+        background.spawn(
+            "enrichment buyer",
+            intel::buy_loop(
+                n.clone(),
+                providers.clone(),
+                cfg.enrichment.refresh_after_days,
+                shutdown_rx.clone(),
+            ),
+        );
+    }
     // Reverse DNS of the sources, forward-confirmed, kept on this node.
     background.spawn(
         "reverse dns",
@@ -205,6 +217,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             shutdown_rx.clone(),
         ),
     );
+    // Names on this node's own sources, re-resolved by a quorum once a
+    // week old, at its bid (cluster only: a standalone node buys nothing).
+    if let Some(n) = node.as_ref().filter(|_| cfg.enrichment.reverse_dns) {
+        background.spawn(
+            "resolve refresh",
+            intel::dns::refresh_run(n.clone(), geo.clone(), shutdown_rx.clone()),
+        );
+    }
 
     // Observational probes, for members (paid) and this node's admin.
     let prober = (cfg.roles.scanner && cfg.probe.enabled).then(|| {
@@ -278,7 +298,6 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // changes and takeover of silent arbiters' queues (scanners), then the
     // RPC listener and sync loops.
     if let Some(node) = &node {
-        node.set_scan_share(cfg.credits.scan_share);
         scan::arbiter::Arbiter::start(node.clone(), shutdown_rx.clone()).await?;
         cluster::remote::serve(node, settings.clone());
         cluster::owner::fleet::serve(node);

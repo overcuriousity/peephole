@@ -5,6 +5,45 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-13
+
+Protocol 9: a free market. Every node must upgrade to 0.14.0 to trade on
+it. A node of protocol 8 stays in the cluster and is still paid and
+charged under the protocol 8 rules, but only nodes of 9 set their own asks
+and bids.
+
+### Added
+
+- Each node sets its own asks and bids (docs/protocol.md). The default ask
+  starts at the lower median of the members' announced prices and follows
+  sales on every node every 10 minutes: dearer after a sale, cheaper
+  without one, with no floor. The bid spreads the node's credit lots over
+  the hours they have left and splits each hour over the goods its
+  automatic buyers want. Two members of 9 trade only when the bid is at
+  least the ask; a retry never goes above the bid. Lookups and scans an
+  operator asks for by hand are not bound by the bid.
+- `peephole credits market` and the Credits page list, per good, this
+  node's ask, bid, what it sold and bought over 7 days, and how many asks
+  above its bid it refused.
+- RDAP spot-checks: each node asks the registry again for 10 % of the IPs
+  whose RDAP row another member wrote in the last 7 days (picked by a keyed
+  hash), records its own row when the answer differs twice, and counts a
+  dispute against the writer, shown on the member's cluster page.
+- Resolve refresh: a node re-resolves the names on its own sources once
+  their last confirmation is 7 days old, within its resolve bid.
+
+### Changed
+
+- A node's scan jobs may hold or pay for its whole balance; the daily
+  share is gone. `[credits] scan_share` still loads, does nothing, and is
+  reported as an obsolete key.
+- Scan jobs, reverse names and keyed providers' answers (MaxMind included)
+  are bought at the seller's ask within the buyer's bid between members of
+  protocol 9. An arbiter of 9 grants an automatic scan job only when the
+  scanner's ask is at most its scan bid; a scanner of 9 claims jobs only
+  from arbiters of 9. A key holder gives away only its own sources and
+  those of protocol 8 members; other members buy them.
+
 ## [0.13.0] - 2026-10-13
 
 ### Added

@@ -39,6 +39,13 @@ pub fn pays_with(proto_max: u32) -> bool {
     proto_max >= crate::cluster::rpc::proto::ECONOMY_PROTO
 }
 
+/// Whether a member announcing `proto_max` trades in the free market: it
+/// sets its own asks and its automatic buyers pay at most their bid
+/// (`credits::bid`).
+pub fn trades_market(proto_max: u32) -> bool {
+    proto_max >= crate::cluster::rpc::proto::MARKET_PROTO
+}
+
 /// A node that could answer for a provider, and what it asks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Quote {
@@ -108,6 +115,25 @@ pub fn quotes(node: &Node, own: &Providers) -> HashMap<String, Vec<Quote>> {
         cheapest_first(list);
     }
     out
+}
+
+/// [`quotes`] an automatic buyer may take up: this node's own, and those
+/// of members that trade in the free market asking at most `bid`. A
+/// member older than the market is not asked: its price follows rules
+/// this node's bid does not.
+pub fn within_bid(
+    node: &Node,
+    mut all: HashMap<String, Vec<Quote>>,
+    bid: Mc,
+) -> HashMap<String, Vec<Quote>> {
+    let me = node.id();
+    let members = node.members();
+    let market = |id: &NodeId| members.get(id).is_some_and(|m| trades_market(m.proto_max));
+    for list in all.values_mut() {
+        list.retain(|q| q.server == me || (market(&q.server) && q.price_mc as Mc <= bid));
+    }
+    all.retain(|_, list| !list.is_empty());
+    all
 }
 
 /// What an offer must have left of its 15 minutes to be served: the
@@ -758,13 +784,15 @@ pub async fn offer_and_ask(
 }
 
 /// Ask the cheapest server of each quote group once more at its named
-/// price when it turned the first offer down for being too low.
+/// price when it turned the first offer down for being too low: within
+/// `bid` when an automatic buyer asks, else within [`retry_price`].
 async fn ask_server(
     node: &Arc<Node>,
     own: &Providers,
     ip: IpAddr,
     server: NodeId,
     quotes: &[Quote],
+    bid: Option<Mc>,
 ) -> LookupResp {
     let names: Vec<String> = quotes.iter().map(|q| q.provider.clone()).collect();
     let total: Mc = quotes.iter().map(|q| q.price_mc as Mc).sum();
@@ -773,7 +801,11 @@ async fn ask_server(
         return crate::intel::lookup::local(own, &ip, &names).await;
     }
     let first = offer_and_ask(node, ip, server, &names, total).await;
-    match retry_price(total, first.price_mc, first.findings.is_empty()) {
+    let again = match bid {
+        Some(b) => retry_within(total, first.price_mc, first.findings.is_empty(), b),
+        None => retry_price(total, first.price_mc, first.findings.is_empty()),
+    };
+    match again {
         // Its price moved since its heartbeat: offer that, once.
         Some(p) => offer_and_ask(node, ip, server, &names, p).await,
         None => first,
@@ -785,8 +817,20 @@ async fn ask_server(
 /// offer (one mc for a request without an offer). None: do not offer
 /// again (the next server is asked instead).
 pub(crate) fn retry_price(offered: Mc, named: Option<u32>, nothing_answered: bool) -> Option<Mc> {
-    let p = named? as Mc;
     let bound = offered.max(1).saturating_mul(RETRY_AT_MOST);
+    retry_within(offered, named, nothing_answered, bound)
+}
+
+/// Like [`retry_price`], at most `bound` instead: an automatic buyer
+/// passes its bid (`credits::bid`), so no refusal makes it pay more than
+/// its own book allows. A manual lookup keeps [`retry_price`].
+pub(crate) fn retry_within(
+    offered: Mc,
+    named: Option<u32>,
+    nothing_answered: bool,
+    bound: Mc,
+) -> Option<Mc> {
+    let p = named? as Mc;
     (nothing_answered && p > offered && p <= bound).then_some(p)
 }
 
@@ -806,20 +850,27 @@ fn next_server<'a>(
 /// The asking side: for each provider in `wanted` that somebody serves,
 /// ask the cheapest server (and the next cheapest when it declines), and
 /// pay what each asks. Servers other than this node are asked only for
-/// the providers in `paid`. One answer per server asked.
+/// the providers in `paid`. One answer per server asked. An automatic
+/// buyer passes its `bid` (from its own book): then only members of the
+/// free market asking at most that are asked ([`within_bid`]), and none
+/// is offered more; a manual lookup passes None.
 pub async fn ask(
     node: &Arc<Node>,
     own: &Providers,
     ip: IpAddr,
     wanted: &[String],
     paid: &[String],
+    bid: Option<Mc>,
 ) -> Vec<NodeAnswer> {
     let me = node.id();
     let mut remaining: Vec<String> = wanted.to_vec();
     let mut tried: HashMap<String, HashSet<NodeId>> = HashMap::new();
     let mut out: Vec<NodeAnswer> = vec![];
     for _ in 0..MAX_ROUNDS {
-        let all = quotes(node, own);
+        let all = match bid {
+            Some(b) => within_bid(node, quotes(node, own), b),
+            None => quotes(node, own),
+        };
         // The cheapest server not yet tried, per provider still open.
         let mut by_server: Vec<(NodeId, String, Vec<Quote>)> = vec![];
         for p in &remaining {
@@ -842,7 +893,7 @@ pub async fn ask(
         // This node first, then by name: a stable order on the page.
         by_server.sort_by_key(|(s, name, _)| (*s != me, name.clone()));
         for (server, name, quotes) in by_server {
-            let resp = ask_server(node, own, ip, server, &quotes).await;
+            let resp = ask_server(node, own, ip, server, &quotes, bid).await;
             remaining.retain(|p| !resp.findings.iter().any(|f| &f.provider == p));
             out.push(NodeAnswer {
                 node: name,
@@ -977,6 +1028,14 @@ mod tests {
     }
 
     #[test]
+    fn only_protocol_nine_trades_in_the_market() {
+        assert!(!trades_market(8));
+        assert!(trades_market(9));
+        // A member of protocol 8 is still paid and charged as before.
+        assert!(pays_with(8) && sells_scans(8));
+    }
+
+    #[test]
     fn an_offer_is_served_only_with_time_left_to_be_charged() {
         let min = 60 * 1000;
         let now = 1_000 * min;
@@ -1036,6 +1095,26 @@ mod tests {
             None,
             "something was answered"
         );
+    }
+
+    #[test]
+    fn an_automatic_buyer_offers_again_at_most_its_bid() {
+        use crate::credits::CREDIT;
+        let bid = CREDIT / 2;
+        let named = |c: u64| Some(c as u32);
+        assert_eq!(
+            retry_within(0, named(37 * CREDIT), true, bid),
+            None,
+            "37 credits named against a bid of 0.5"
+        );
+        assert_eq!(
+            retry_within(CREDIT / 10, named(4 * CREDIT / 10), true, bid),
+            Some(4 * CREDIT / 10),
+            "0.4 is within the bid, though four times the offer"
+        );
+        assert_eq!(retry_within(0, named(bid), true, bid), Some(bid));
+        assert_eq!(retry_within(0, named(bid + 1), true, bid), None);
+        assert_eq!(retry_within(0, named(bid), false, bid), None);
     }
 
     fn q(provider: &str, server: u8, price_mc: u32) -> Quote {

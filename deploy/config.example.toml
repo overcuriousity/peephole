@@ -119,10 +119,6 @@ refresh_after_days = 30
 # # again to check them, unpaid (0 = check nothing). Bought audits of
 # # designated scans do not depend on it.
 # audit_share = 0.05
-# # Cluster only. The share of this node's credits its own scan jobs may hold
-# # or pay for in a day: a funded job pays its scanner on delivery
-# # (0 = fund only scanners priced at zero).
-# scan_share = 0.5
 
 # [abuseipdb]
 # # Abuse reports per IP (https://www.abuseipdb.com/account/api).

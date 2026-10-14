@@ -118,10 +118,6 @@ impl Service for InternetDb {
         super::INTERNETDB
     }
 
-    fn ipv6(&self) -> bool {
-        false
-    }
-
     fn request(&self, client: &reqwest::Client, ip: &str) -> reqwest::RequestBuilder {
         client.get(format!("{}/{ip}", self.base))
     }

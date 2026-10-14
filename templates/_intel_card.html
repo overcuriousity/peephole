@@ -1,7 +1,13 @@
 {# One provider card (public::IntelCard `c`). `badge`: "" or the card's source ("Asked now", "From the dataset"); `verb`: "checked" or "looked up"; `again`: "" or the provider an "Ask again" button asks for `again_ip`, at `again_price` ("" when not known). #}
 <div class="intel">
   <div class="intel-head"><h3>{{ c.label }}</h3><span class="intel-id mono">{{ c.name }}</span>{% if !badge.is_empty() %}<span class="intel-badge" data-source="{{ badge }}">{{ badge }}</span>{% endif %}</div>
-  {% if let Some(x) = c.newest %}
+  {% if !c.disputed.is_empty() %}
+    <p class="intel-src"><span class="intel-badge" data-source="disputed">Disputed</span> the nodes' registry answers differ; none is shown as the answer.</p>
+    {% for o in c.disputed %}
+    <dl class="kv">{% for f in o.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
+    <p class="intel-src"><span class="mono">{{ crate::admin::views::when(Some(o.fetched_at.as_str())) }}</span>{% if let Some(n) = o.node %} · {{ n }}{% endif %}</p>
+    {% endfor %}
+  {% else if let Some(x) = c.newest %}
     <dl class="kv">{% for f in x.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
     <p class="intel-src">{{ verb }} <time datetime="{{ crate::admin::views::stamp(x.fetched_at.as_str()) }}" data-ago title="{{ x.fetched_at }}">{{ crate::admin::views::ago(x.fetched_at.as_str()) }}</time> ago{% if let Some(v) = x.source_version %} · data <span class="mono">{{ v }}</span>{% endif %}{% if let Some(n) = x.node %} · {{ n }}{% endif %}</p>
     {% if !c.others.is_empty() %}
