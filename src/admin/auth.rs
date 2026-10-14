@@ -70,22 +70,21 @@ pub async fn session_valid(state: &AdminState, jar: &CookieJar) -> bool {
 }
 
 /// First-run setup token (spec §8.4): printed to stdout, only its hash
-/// stored. Valid for 24 hours; while no key is enrolled, a start after it
-/// expired (or was used up) prints a new one. `peephole admin reset-token`
-/// issues one on demand.
+/// stored. Valid for 24 hours; while neither a password nor a key is set, a
+/// start after it expired (or was used up) prints a new one, and setting
+/// either ends it. `peephole admin reset-token` issues one on demand.
 pub async fn ensure_setup_token(
     store: &Store,
     _data_dir: &std::path::Path,
 ) -> Result<Option<String>> {
-    let creds = store.load_credentials().await?;
-    if !creds.is_empty() {
+    if store.password_hash().await?.is_some() || !store.load_credentials().await?.is_empty() {
         return Ok(None);
     }
     match store.setup_token_state().await? {
         // Issued earlier; console output is the only copy.
         SetupToken::Live => Ok(None),
         SetupToken::None | SetupToken::Expired => {
-            let token = store.issue_setup_token().await?;
+            let token = store.issue_first_run_token().await?;
             print_setup_token(&token);
             Ok(Some(token))
         }
@@ -763,6 +762,120 @@ secure_cookies = {secure}
         let (st, _, body) = send(&app, "POST", "/login/start", None, "").await;
         assert_eq!(st, StatusCode::FORBIDDEN);
         assert!(body.contains("security-key sign-in is off"), "{body}");
+    }
+
+    /// `POST /enroll/start` with a setup token; the status code.
+    async fn enroll_start_with(app: &axum::Router, token: &str) -> StatusCode {
+        let peer: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/enroll/start")
+            .extension(ConnectInfo(peer))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "setup_token": token }).to_string(),
+            ))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn a_fresh_node_gets_a_setup_token_that_enrolls() {
+        let (_d, state, app) = app().await;
+        let t = ensure_setup_token(&state.store, std::path::Path::new("/tmp"))
+            .await
+            .unwrap()
+            .expect("first run issues a token");
+        assert_eq!(enroll_start_with(&app, &t).await, StatusCode::OK);
+        assert!(
+            state
+                .store
+                .save_credential_with_setup_token(b"k", "{}", None, &token_hash(&t))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_password_ends_the_automatic_setup_token() {
+        let (_d, state, app) = app().await;
+        let t = ensure_setup_token(&state.store, std::path::Path::new("/tmp"))
+            .await
+            .unwrap()
+            .expect("first run issues a token");
+        set_pw(&state, PW).await;
+        // The live token issued before the password no longer enrolls a key.
+        assert_eq!(enroll_start_with(&app, &t).await, StatusCode::FORBIDDEN);
+        assert!(
+            !state
+                .store
+                .save_credential_with_setup_token(b"k", "{}", None, &token_hash(&t))
+                .await
+                .unwrap()
+        );
+        assert!(state.store.load_credentials().await.unwrap().is_empty());
+        // Once it expired, a restart issues (and prints) no new one.
+        state
+            .store
+            .intel_set(
+                "webauthn_setup_token_expires",
+                &(chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            ensure_setup_token(&state.store, std::path::Path::new("/tmp"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state.store.setup_token_state().await.unwrap(),
+            SetupToken::Expired
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_added_in_session_ends_the_automatic_setup_token() {
+        let (_d, state, app) = app().await;
+        let t = ensure_setup_token(&state.store, std::path::Path::new("/tmp"))
+            .await
+            .unwrap()
+            .expect("first run issues a token");
+        state
+            .store
+            .save_credential(b"k1", "{}", None)
+            .await
+            .unwrap();
+        assert_eq!(enroll_start_with(&app, &t).await, StatusCode::FORBIDDEN);
+        assert!(
+            !state
+                .store
+                .save_credential_with_setup_token(b"k2", "{}", None, &token_hash(&t))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cli_token_still_recovers_a_lost_key() {
+        let (_d, state, app) = app().await;
+        state
+            .store
+            .save_credential(b"lost", "{}", None)
+            .await
+            .unwrap();
+        set_pw(&state, PW).await;
+        let (t, keys) = crate::admin::cli::reset_token(&state.store).await.unwrap();
+        assert_eq!(keys, 1);
+        assert_eq!(enroll_start_with(&app, &t).await, StatusCode::OK);
+        assert!(
+            state
+                .store
+                .save_credential_with_setup_token(b"new", "{}", None, &token_hash(&t))
+                .await
+                .unwrap()
+        );
     }
 
     #[test]
